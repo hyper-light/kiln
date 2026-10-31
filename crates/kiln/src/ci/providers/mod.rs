@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use http::StatusCode;
-use rusqlite::{OptionalExtension as _, params};
+use crate::sql::{OptionalExtension as _, params};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -39,9 +39,20 @@ fn upstream(e: anyhow::Error) -> Fail {
 
 /// The providers a repository's CI runs on (W23-R07): KilnCI unless its settings say otherwise.
 pub async fn chosen(hub: &Hub, repo: &Repo) -> Vec<String> {
+    selection(hub, repo).await.unwrap_or_else(|_| vec![KILN.to_owned()])
+}
+
+/// W23-R07/U10: reads use the saved provider ownership or its error, never an inferred
+/// external-only policy. Only a repository with no saved selection defaults to KilnCI.
+pub(super) async fn selection(hub: &Hub, repo: &Repo) -> anyhow::Result<Vec<String>> {
     let id = repo.id.clone();
-    let saved: Option<String> = hub.store.call(move |c| Ok(c.query_row("SELECT providers FROM repo_ci WHERE repo_id = ?1", [&id], |r| r.get(0)).optional()?)).await.ok().flatten();
-    saved.and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok()).filter(|l| !l.is_empty()).unwrap_or_else(|| vec![KILN.to_owned()])
+    let saved: Option<String> = hub.store.call(move |c| Ok(c.query_row("SELECT providers FROM repo_ci WHERE repo_id = ?1", [&id], |r| r.get(0)).optional()?)).await
+        .map_err(|e| anyhow::anyhow!("{}: CI provider selection unavailable: {e:#}", repo.name))?;
+    let Some(saved) = saved else { return Ok(vec![KILN.to_owned()]) };
+    let selected: Vec<String> = serde_json::from_str(&saved).map_err(|e| anyhow::anyhow!("{}: invalid saved CI provider selection: {e}", repo.name))?;
+    anyhow::ensure!(!selected.is_empty(), "{}: saved CI provider selection is empty", repo.name);
+    anyhow::ensure!(selected.iter().all(|p| matches!(p.as_str(), KILN | GITHUB_ACTIONS | GITLAB_CI | BITBUCKET_PIPELINES)), "{}: saved CI provider selection contains an unsupported provider", repo.name);
+    Ok(selected)
 }
 
 /// The providers a repository may have: KilnCI always, and its host's CI where kiln reaches it.
@@ -163,6 +174,7 @@ pub async fn record(hub: &Hub, repo: &Repo, provider: &str, run: &ExtRun, jobs: 
                     if !ext.is_some_and(|e| listed.contains(&e)) {
                         tx.execute("DELETE FROM steps WHERE job_id = ?1", [&leg])?;
                         tx.execute("DELETE FROM jobs WHERE id = ?1", [&leg])?;
+                        super::logsearch::stage_pruned(&tx,&leg)?;
                     }
                 }
             }
@@ -194,6 +206,9 @@ pub async fn record(hub: &Hub, repo: &Repo, provider: &str, run: &ExtRun, jobs: 
                         params![leg, st.number.max(1) - 1, st.name, st.status, st.started_at, st.finished_at, st.conclusion, run.attempt],
                     )?;
                 }
+                // Only local Kiln source eligibility can enqueue file indexing; provider
+                // logs remain remote and must not become an empty 'indexed' local result.
+                super::logsearch::stage_finished(&tx,&leg)?;
             }
             tx.commit()?;
             Ok(id)
@@ -325,9 +340,9 @@ pub async fn approve(hub: &Hub, repo: &Repo, provider: &str, run: &str, environm
 }
 
 /// The repository's environments on its other providers, each with its latest deployment.
-pub async fn environments(hub: &Hub, repo: &Repo) -> Vec<Value> {
+pub async fn environments(hub: &Hub, repo: &Repo, selected: &[String]) -> Vec<Value> {
     let mut out = Vec::new();
-    for p in elsewhere(hub, repo).await {
+    for p in selected.iter().filter(|p| p.as_str() != KILN) {
         let got = match p.as_str() {
             GITHUB_ACTIONS => github_actions::environments(hub, repo).await,
             GITLAB_CI => gitlab_ci::environments(hub, repo).await,
@@ -486,6 +501,27 @@ pub type Settings = BTreeMap<String, Value>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn w23_r07_environment_read_refuses_malformed_provider_ownership() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub_with(|cfg| cfg.ci.enabled = false).await?;
+            let repo = hub.store.upsert_repo(Repo {
+                id: crate::util::new_id(), name: "acme/provider-ownership".into(), clone_url: String::new(),
+                branches: Vec::new(), poll_seconds: 30, enabled: false, created_at: 0,
+                last_polled_at: None, last_error: None, mode: "upstream".into(), default_branch: Some("main".into()), mirror: None,
+            }).await?;
+            let id = repo.id;
+            hub.store.call(move |c| {
+                c.execute("INSERT INTO repo_ci (repo_id, providers, updated_at) VALUES (?1, ?2, ?3)", params![id, "not JSON", 0])?;
+                Ok(())
+            }).await?;
+            let query = std::collections::HashMap::from([("repo".to_owned(), "acme/provider-ownership".to_owned())]);
+            let result = super::super::environments::route(&hub, &http::Method::GET, &[], &query, Value::Null, None).await;
+            assert!(matches!(result, Err((StatusCode::INTERNAL_SERVER_ERROR, message)) if message.contains("invalid saved CI provider selection")));
+            Ok(())
+        })
+    }
 
     #[test]
     fn w23_r09_states() {

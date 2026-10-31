@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The inner protocol's version; a peer with another is told so and the link ends.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// The largest message either side sends or accepts.
 pub const MAX_MESSAGE: usize = 4 << 20;
@@ -46,10 +46,12 @@ pub enum Ask {
     /// which can't read this either, ends it as it would on any garbage. Appended last: postcard
     /// encodes variants by index.
     Unread { what: String, code: crate::wire::unread::Code, why: String },
+    /// U01: appended; a receiver must claim this permit before spawning.
+    RunLeased { spec: Box<RunSpec>, permit: super::leases::Permit },
 }
 
 /// How many variants [`Ask`] has: a newer peer's past them is `unknown`.
-pub const ASK_VARIANTS: usize = 12;
+pub const ASK_VARIANTS: usize = 13;
 /// How many variants [`Say`] has.
 pub const SAY_VARIANTS: usize = 12;
 
@@ -270,21 +272,20 @@ mod tests {
         Ok(())
     }
 
-    /// Word that a message couldn't be read is appended last in both, after every older variant,
-    /// and the counts say so.
+    /// Main's unread messages keep their deployed ordinals; private extensions follow.
     #[test]
     fn word_of_an_unread_message_is_appended_last() -> anyhow::Result<()> {
         use crate::wire::unread::Code;
         let ask = postcard::to_allocvec(&Ask::Unread { what: "variant 12".into(), code: Code::Unknown, why: "Say has 12 variants".into() })?;
         let say = postcard::to_allocvec(&Say::Unread { what: "Ask".into(), code: Code::Malformed, why: "cut short".into() })?;
-        assert_eq!((ask.first().copied(), say.first().copied()), (u8::try_from(ASK_VARIANTS - 1).ok(), u8::try_from(SAY_VARIANTS - 1).ok()));
+        assert_eq!((ask.first().copied(), say.first().copied()), (Some(11), Some(11)));
         let mut d = Deframer::default();
         d.push(&frame(&Ask::Ping { at: 1 })?);
         assert_eq!(d.read::<Ask>(ASK_VARIANTS).ok().flatten(), Some(Ask::Ping { at: 1 }));
         // A newer peer's kind, one cut short inside its length, and one too large.
         let mut d = Deframer::default();
-        d.push(&[0, 0, 0, 1, 12]);
-        assert!(d.read::<Ask>(ASK_VARIANTS).is_err_and(|e| e.code() == Code::Unknown && e.what() == "variant 12"));
+        d.push(&[0, 0, 0, 1, 13]);
+        assert!(d.read::<Ask>(ASK_VARIANTS).is_err_and(|e| e.code() == Code::Unknown && e.what() == "variant 13"));
         let mut d = Deframer::default();
         d.push(&[0, 0, 0, 1, 2]);
         assert!(d.read::<Ask>(ASK_VARIANTS).is_err_and(|e| e.code() == Code::Malformed));
@@ -300,6 +301,15 @@ mod tests {
         let adopt = first(postcard::to_allocvec(&Ask::Adopt { id: 1, offset: 0, data: Vec::new(), last: true })?);
         let object = first(postcard::to_allocvec(&Ask::Object { id: 1, repo: "acme/app".into(), digest: "d".into(), offset: 0 })?);
         anyhow::ensure!(object == adopt.map(|i| i + 1), "Ask::Object comes right after Adopt");
+        // U01: leased execution grows the inner protocol without moving any old index.
+        let leased = first(postcard::to_allocvec(&Ask::RunLeased {
+            spec: Box::new(RunSpec::default()),
+            permit: super::super::leases::Permit { id: "reach-fixture".into(), token: "fixture".into(), epoch: "epoch".into(), host: "host".into() },
+        })?);
+        let unread = first(postcard::to_allocvec(&Ask::Unread { what: "Ask".into(), code: crate::wire::unread::Code::Unknown, why: "unknown".into() })?);
+        anyhow::ensure!(unread == object.map(|i| i + 1) && leased == unread.map(|i| i + 1), "Ask::RunLeased follows main's Unread without changing its ordinal");
+        anyhow::ensure!(leased == u8::try_from(ASK_VARIANTS - 1).ok(), "the count includes the last private extension");
+
         let adopted = first(postcard::to_allocvec(&Say::Adopted { id: 1, error: None })?);
         let data = first(postcard::to_allocvec(&Say::ObjectData { id: 1, offset: 0, data: vec![1], last: true })?);
         let missing = first(postcard::to_allocvec(&Say::ObjectMissing { id: 1 })?);

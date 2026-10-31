@@ -118,3 +118,32 @@ fn w24_r31_policies_as_people_write_them() {
     assert_eq!(parse_duration("90s"), Ok(90));
     assert!(parse_duration("1y").is_err());
 }
+
+#[test]
+fn u04_maintenance_uses_named_cron_and_wildcard_day_rule() -> Result<(), String> {
+    let at = |s: &str| s.parse::<jiff::Timestamp>().map(|t| t.as_second()).map_err(|e| e.to_string());
+    let named = parse_schedule(" 0  0 * JAN MON ")?;
+    assert_eq!(named, Schedule::Cron("0 0 * JAN MON".into()));
+    assert_eq!(next_after(&named, at("2026-01-01T00:00:00Z")?), Some(at("2026-01-05T00:00:00Z")?));
+    let wildcard = parse_schedule("0 0 */2 * MON")?;
+    // A wildcard-prefixed day field requires both sets: skip Friday the 9th and Monday the 12th.
+    assert_eq!(next_after(&wildcard, at("2026-01-06T00:00:00Z")?), Some(at("2026-01-19T00:00:00Z")?));
+    let restricted = parse_schedule("0 0 9 * MON")?;
+    assert_eq!(next_after(&restricted, at("2026-01-06T00:00:00Z")?), Some(at("2026-01-09T00:00:00Z")?));
+    let large = parse_schedule("1/4294967295 * * * *")?;
+    assert_eq!(next_after(&large, 60), Some(3660));
+    assert!(parse_schedule("1/4294967296 * * * *").is_err());
+    assert_eq!(next_after(&Schedule::Cron("0 0 31 FEB *".into()), 0), None);
+    // A completed leap-day reap must become due again, even across the non-leap century.
+    let leap = Policy { schedule: Some(parse_schedule("0 0 29 FEB *")?), ..Policy::default() };
+    let resolved = resolve(100 * GIB, &[(Scope::System, &leap)]);
+    let last = at("2096-02-29T00:00:00Z")?;
+    let next = at("2104-02-29T00:00:00Z")?;
+    assert_eq!(due(&resolved, resolved.floor, 0, 0, Some(last), next - 1), None);
+    assert_eq!(due(&resolved, resolved.floor, 0, 0, Some(last), next), Some(Trigger::Schedule));
+    // Interval representation and its existing minimum/saturating behavior stay compatible.
+    assert_eq!(parse_schedule("6h")?, Schedule::Every(21_600));
+    assert_eq!(next_after(&Schedule::Every(0), 0), Some(60));
+    assert_eq!(next_after(&Schedule::Every(u64::MAX), 1), Some(i64::MAX));
+    Ok(())
+}

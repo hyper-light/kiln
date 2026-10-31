@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use http::StatusCode;
 use kiln_ci::experiments::{self as ex, Criterion, Kind, Measurement, Results, Strategy, Variant};
-use rusqlite::OptionalExtension as _;
+use crate::sql::OptionalExtension as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 

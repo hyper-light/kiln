@@ -24,6 +24,10 @@ use super::wire::{self, CopySpec, CopyStatus, Joiner, MoveNews, Msg};
 use super::{Change, Decision, STEP_CHANGES, Step, Version};
 use crate::metrics;
 
+pub(super) mod metadata;
+mod controller;
+pub use controller::Controller;
+
 /// A log entry's bytes at the most (the log holds one up to 1 MiB).
 const ENTRY: usize = 900 << 10;
 /// A change of configuration not seen applied by then is proposed again.
@@ -33,8 +37,7 @@ const SWEEP: Duration = Duration::from_secs(600);
 const SWEEP_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
 /// How often the view the API shows is made again, at the most.
 const VIEW_EVERY: Duration = Duration::from_millis(500);
-/// How often new activity is saved, at the most, and the copies' gauges measured at the least.
-const SAVE_EVERY: Duration = Duration::from_secs(5);
+/// How often the copies' gauges are measured at the least.
 const GAUGE_EVERY: Duration = Duration::from_secs(5);
 /// The same trouble from the same machine shows in a repo's activity (and the log) once in this
 /// long; the metrics count every time.
@@ -44,7 +47,7 @@ const ARRIVED: usize = 4096;
 /// A copy's states, as the API and the metrics name them.
 const STATES: [&str; 7] = ["in step", "catching up", "fetching", "sending", "starting", "offline", "error"];
 
-/// A synced repo, as the server keeps it (`<data>/sync/repos.json`).
+/// A synced repo in Amphora (U17); `repos.json` is read-only import input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Repo {
     pub id: String,
@@ -187,11 +190,53 @@ pub enum Ask {
     Resolve { repo: String, path: String, keep: Keep },
 }
 
+/// U19: unavailable controllers are retryable; validation refusals retain conflict semantics.
+#[derive(Debug, Clone)]
+pub enum AskError { Unavailable(String), Refused(String) }
+impl std::fmt::Display for AskError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self { Self::Unavailable(why) | Self::Refused(why) => f.write_str(why) }
+    }
+}
+impl std::error::Error for AskError {}
+impl From<AskError> for String { fn from(error: AskError) -> Self { error.to_string() } }
+
+fn wait_contents(contents: &Contents, alive: &AtomicBool) {
+    let until = Instant::now() + super::contents::LOAD_WAIT;
+    while alive.load(Ordering::SeqCst) {
+        if contents.wait_loaded(Duration::from_secs(1)) { return; }
+        if Instant::now() >= until {
+            tracing::warn!(target: "kiln.blobs", event = "list", "sync's contents weren't listed in time: what's held is known as it comes");
+            return;
+        }
+    }
+}
+
+fn clear_incoming(dir: &Path) {
+    let incoming = dir.join("incoming");
+    if incoming.is_dir() && let Err(error) = std::fs::remove_dir_all(&incoming) {
+        tracing::warn!(target: "kiln.sync", error = %error, "old partial incoming contents could not be removed");
+    }
+}
+
+fn standby_view(state: Option<metadata::State>, view: &Mutex<View>, activity: &Mutex<Activity>) {
+    let repos = if let Some(state) = state {
+        *lock(activity) = state.activity;
+        state.repos.into_iter().map(|r| RepoView {
+            id: r.id, name: r.name, created: r.created, exclude: r.exclude, mode: r.mode, transient: r.transient,
+            copies: r.copies.into_iter().map(|c| CopyView { member: c.member, machine: c.machine, path: c.path, added: c.added, state: "offline", ..CopyView::default() }).collect(),
+            ..RepoView::default()
+        }).collect()
+    } else { Vec::new() };
+    *lock(view) = View { repos, error: Some("sync controller is in standby; committed control metadata only".into()) };
+}
+
 enum Input {
     Wake,
     From { machine: String, msg: Msg, raft: Vec<u8> },
     Machine { machine: String, up: bool },
-    Ask { ask: Ask, reply: futures::channel::oneshot::Sender<Result<String, String>> },
+    Send { machine: String, msg: Msg },
+    Ask { ask: Ask, reply: futures::channel::oneshot::Sender<Result<String, AskError>> },
     /// Save what isn't saved yet: the server is stopping.
     Flush(futures::channel::oneshot::Sender<()>),
 }
@@ -202,48 +247,88 @@ pub struct Sync {
     view: Arc<Mutex<View>>,
     activity: Arc<Mutex<Activity>>,
     out: async_channel::Receiver<Out>,
-    /// What others send a machine's syncing runner process on the sync lane (`crate::sync::tasks`).
-    say: async_channel::Sender<Out>,
     contents: Arc<Contents>,
     key: String,
+    ready: Arc<AtomicBool>,
+    controller: Arc<Controller>,
+    alive: Arc<AtomicBool>,
+}
+
+impl Drop for Sync {
+    fn drop(&mut self) { self.alive.store(false, Ordering::SeqCst); let _ = self.tx.send(Input::Wake); }
 }
 
 impl Sync {
     /// Starts the owner of the groups kept in `dir`, the contents their steps name in `contents`.
     /// Blob tokens are signed with `key`.
-    pub fn start(dir: PathBuf, key: String, contents: Arc<Contents>) -> Self {
-        // Contents half-sent when the server stopped (`<data>/sync/incoming`): none is under way
-        // before it listens.
-        let incoming = dir.join("incoming");
-        if incoming.is_dir()
-            && let Err(e) = std::fs::remove_dir_all(&incoming)
-        {
-            tracing::warn!(target: "kiln.sync", event = "sync.incoming", error = %e, "contents half-sent before the server stopped couldn't be removed");
-        }
+    pub fn start(dir: PathBuf, key: String, contents: Arc<Contents>, database: amphora::database::Database, source_host: String) -> anyhow::Result<Self> {
+        let controller = Controller::open(&dir)?;
+        Self::start_with_controller(dir, key, contents, database, source_host, controller)
+    }
+
+    pub fn start_with_controller(dir: PathBuf, key: String, contents: Arc<Contents>, database: amphora::database::Database, source_host: String, controller: Arc<Controller>) -> anyhow::Result<Self> {
+        anyhow::ensure!(controller.dir() == dir.canonicalize()?, "sync controller directory mismatch");
         let (tx, rx) = std::sync::mpsc::channel();
         let (out_tx, out) = async_channel::unbounded();
         let view = Arc::new(Mutex::new(View::default()));
         let activity = Arc::new(Mutex::new(Activity::default()));
-        let say = out_tx.clone();
-        let (v, a, wake_tx) = (view.clone(), activity.clone(), tx.clone());
-        let (k, c) = (key.clone(), Arc::clone(&contents));
-        let spawned = std::thread::Builder::new().name("kiln-sync".into()).spawn(move || {
-            // What's held is judged from the store's listing: the thread waits for it.
-            if !c.wait_loaded(super::contents::LOAD_WAIT) {
-                tracing::warn!(target: "kiln.blobs", event = "list", "sync's contents weren't listed in time: what's held is known as it comes");
+        let ready = Arc::new(AtomicBool::new(false));
+        let owner = if controller.active() {
+            let metadata = metadata::Metadata::from_controller(&database, &dir, source_host.clone(), controller.clone())?;
+            let owner = Owner::open(&dir, Arc::clone(&contents), out_tx.clone(), view.clone(), activity.clone(), (tx.clone(), key.clone()), metadata)?;
+            clear_incoming(&dir);
+            ready.store(true, Ordering::SeqCst);
+            Some(owner)
+        } else {
+            let state = metadata::Metadata::read_only(&database, &dir, source_host.clone(), controller.clone())?;
+            standby_view(state, &view, &activity);
+            None
+        };
+        let alive = Arc::new(AtomicBool::new(true));
+        let worker_alive = alive.clone();
+        let worker_controller = controller.clone();
+        let (c, v, a, r, wake_tx, k) = (contents.clone(), view.clone(), activity.clone(), ready.clone(), tx.clone(), key.clone());
+        std::thread::Builder::new().name("kiln-sync".into()).spawn(move || {
+            let controller = worker_controller;
+            if let Some(owner) = owner {
+                wait_contents(&c, &worker_alive);
+                owner.run(&rx, &worker_alive); r.store(false, Ordering::SeqCst); return;
             }
-            match Owner::open(&dir, c, out_tx, v.clone(), a, wake_tx, k) {
-                Ok(owner) => owner.run(&rx),
-                Err(e) => {
-                    tracing::warn!(error = %format!("{e:#}"), "repo sync is off");
-                    lock(&v).error = Some(format!("sync is off: {e:#}"));
+            let mut connected = HashSet::new();
+            let mut refresh = Instant::now();
+            loop {
+                if !worker_alive.load(Ordering::SeqCst) { return; }
+                match rx.recv_timeout(Duration::from_secs(1)) {
+                    Ok(Input::Machine { machine, up }) => { if up { if connected.len() < 4096 { connected.insert(machine); } } else { connected.remove(&machine); } }
+                    Ok(Input::Ask { reply, .. }) => { let _ = reply.send(Err(AskError::Unavailable("sync controller is in standby".into()))); }
+                    Ok(Input::Wake | Input::From { .. } | Input::Send { .. } | Input::Flush(_)) | Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => return,
+                }
+                if refresh.elapsed() < Duration::from_secs(1) { continue; }
+                refresh = Instant::now();
+                let activate = || -> anyhow::Result<Option<Owner>> {
+                    if !controller.try_activate()? {
+                        standby_view(metadata::Metadata::read_only(&database, &dir, source_host.clone(), controller.clone())?, &v, &a);
+                        return Ok(None);
+                    }
+                    // Re-read authority under the acquired lease before opening any transfer state.
+                    let metadata = metadata::Metadata::from_controller(&database, &dir, source_host.clone(), controller.clone())?;
+                    let mut owner = Owner::open(&dir, c.clone(), out_tx.clone(), v.clone(), a.clone(), (wake_tx.clone(), k.clone()), metadata)?;
+                    clear_incoming(&dir);
+                    owner.up = connected.clone();
+                    for machine in &connected { owner.tell_copies(machine); }
+                    owner.publish(); owner.send_committed();
+                    anyhow::ensure!(owner.failed.is_none(), "sync promotion commit failed");
+                    Ok(Some(owner))
+                };
+                match activate() {
+                    Ok(Some(owner)) => { wait_contents(&c, &worker_alive); r.store(true, Ordering::SeqCst); owner.run(&rx, &worker_alive); r.store(false, Ordering::SeqCst); return; }
+                    Ok(None) => {}
+                    Err(error) => { controller.fence(); lock(&v).error = Some(format!("sync activation failed: {error:#}")); return; }
                 }
             }
-        });
-        if let Err(e) = spawned {
-            lock(&view).error = Some(format!("sync is off: {e}"));
-        }
-        Self { tx, view, activity, out, say, contents, key }
+        })?;
+        Ok(Self { tx, view, activity, out, contents, key, ready, controller, alive })
     }
 
     pub fn view(&self) -> View {
@@ -272,13 +357,15 @@ impl Sync {
 
     /// What a machine's runner said of its copies (`AgentMsg::Sync`, decoded).
     pub fn from_runner(&self, machine: &str, msg: Msg, raft: Vec<u8>) {
+        if !self.ready.load(Ordering::SeqCst) || !self.controller.active() { return; }
         let _ = self.tx.send(Input::From { machine: machine.to_owned(), msg, raft });
     }
 
     /// Sends a machine's syncing runner process `msg` on the sync lane, after what is already on
     /// its way there.
     pub fn send(&self, machine: &str, msg: Msg) {
-        let _ = self.say.try_send(Out { machine: machine.to_owned(), msg, raft: Vec::new() });
+        if !self.ready.load(Ordering::SeqCst) || !self.controller.active() { return; }
+        let _ = self.tx.send(Input::Send { machine: machine.to_owned(), msg });
     }
 
     /// A machine has a syncing runner process connected now (`up`), or none any more.
@@ -286,10 +373,11 @@ impl Sync {
         let _ = self.tx.send(Input::Machine { machine: machine.to_owned(), up });
     }
 
-    pub async fn ask(&self, ask: Ask) -> Result<String, String> {
+    pub async fn ask(&self, ask: Ask) -> Result<String, AskError> {
+        if !self.ready.load(Ordering::SeqCst) || !self.controller.active() { return Err(AskError::Unavailable("sync controller is unavailable or in standby".into())); }
         let (reply, answer) = futures::channel::oneshot::channel();
-        self.tx.send(Input::Ask { ask, reply }).map_err(|_| "sync is not running".to_owned())?;
-        answer.await.unwrap_or_else(|_| Err("sync is not running".to_owned()))
+        self.tx.send(Input::Ask { ask, reply }).map_err(|_| AskError::Unavailable("sync is not running".into()))?;
+        answer.await.unwrap_or_else(|_| Err(AskError::Unavailable("sync is not running".into())))
     }
 
     /// What to send, as the owner makes it.
@@ -355,6 +443,11 @@ struct Group {
 
 pub struct Owner {
     dir: PathBuf,
+    metadata: metadata::Metadata,
+    resolutions: Vec<metadata::Resolution>,
+    failed: Option<String>,
+    metadata_dirty: bool,
+    pending: Mutex<Vec<Out>>,
     log: SyncLog,
     repos: Vec<Repo>,
     groups: HashMap<String, Group>,
@@ -372,9 +465,9 @@ pub struct Owner {
     key: String,
     start: Instant,
     swept: Instant,
-    /// What happened in each repo, shared with the API; saved now and then.
-    activity: Arc<Mutex<Activity>>,
-    saved: Instant,
+    /// U17: staged privately; only committed history is exposed to the API.
+    activity: Activity,
+    shared_activity: Arc<Mutex<Activity>>,
     /// The copies' gauges, last measured, and the repos (by name) this server published them for.
     gauged: Instant,
     gauged_repos: BTreeSet<String>,
@@ -397,22 +490,21 @@ pub struct Owner {
 }
 
 impl Owner {
-    fn open(dir: &Path, contents: Arc<Contents>, out: async_channel::Sender<Out>, view: Arc<Mutex<View>>, activity: Arc<Mutex<Activity>>, tx: Sender<Input>, key: String) -> anyhow::Result<Self> {
-        std::fs::create_dir_all(dir)?;
-        let repos: Vec<Repo> = match std::fs::read(dir.join("repos.json")) {
-            Ok(b) => serde_json::from_slice(&b)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(e) => return Err(e.into()),
-        };
+    fn open(dir: &Path, contents: Arc<Contents>, out: async_channel::Sender<Out>, view: Arc<Mutex<View>>, activity: Arc<Mutex<Activity>>, bootstrap: (Sender<Input>, String), metadata: (metadata::Metadata, metadata::State)) -> anyhow::Result<Self> {
+        let (tx, key) = bootstrap;
+        let (metadata, state) = metadata;
+        let metadata::State { repos, activity: loaded, away, recorded, resolutions } = state;
         let log = disk::open(&dir.join("sync.log"))?;
-        let loaded = Activity::load(dir, repos.iter().map(|r| r.id.as_str()));
-        let away = loaded.away();
-        let recorded = loaded.recorded();
-        *lock(&activity) = loaded;
+        *lock(&activity) = loaded.clone();
         let wakeup = Arc::new(Wakeup { tx, pending: AtomicBool::new(false) });
         let waker = Waker::from(wakeup.clone());
         let mut owner = Self {
             dir: dir.to_owned(),
+            metadata,
+            resolutions,
+            failed: None,
+            metadata_dirty: true,
+            pending: Mutex::new(Vec::new()),
             log,
             repos: Vec::new(),
             groups: HashMap::new(),
@@ -430,8 +522,8 @@ impl Owner {
             key,
             start: Instant::now(),
             swept: Instant::now(),
-            activity,
-            saved: Instant::now(),
+            activity: loaded,
+            shared_activity: activity,
             gauged: Instant::now(),
             gauged_repos: BTreeSet::new(),
             states: HashMap::new(),
@@ -459,27 +551,54 @@ impl Owner {
         r.campaign().map_err(|e| anyhow::anyhow!("{e:?}"))?;
         let compacted = r.applied().index;
         // What the log committed before now is replayed into the tree: no news.
+        self.metadata_dirty = true;
         let before = self.recorded.entry(repo.id.clone()).or_default();
         *before = (*before).max(r.durable_commit());
         self.groups.insert(repo.id.clone(), Group { r, out: Output::default(), compacted, next: HashMap::new(), changing: None, error: None, arrived: HashMap::new() });
         Ok(())
     }
 
-    fn save(&self) -> anyhow::Result<()> {
-        group::save_atomic(&self.dir.join("repos.json"), &serde_json::to_vec_pretty(&self.repos)?)?;
+    /// U17: any refused/ambiguous commit fences this controller until durable-state reload.
+    fn save(&mut self) -> anyhow::Result<()> {
+        if let Some(error) = &self.failed { return Err(anyhow::anyhow!(error.clone())); }
+        if !self.metadata.active() {
+            let why = "sync controller is unavailable or fenced".to_owned();
+            self.failed = Some(why.clone()); lock(&self.view).error = Some(why.clone());
+            return Err(anyhow::anyhow!(why));
+        }
+        if !self.metadata_dirty { return Ok(()); }
+        let state = metadata::Snapshot { repos: &self.repos, activity: &self.activity, away: &self.away, recorded: &self.recorded, resolutions: &self.resolutions };
+        if let Err(error) = self.metadata.save(state) {
+            let why = format!("sync metadata commit failed; controller stopped until restart: {error:#}");
+            self.metadata.fence();
+            self.failed = Some(why.clone());
+            lock(&self.view).error = Some(why.clone());
+            lock(&self.pending).clear();
+            return Err(anyhow::anyhow!(why));
+        }
+        self.metadata_dirty = false;
+        self.activity.publish_to(&mut lock(&self.shared_activity));
         Ok(())
     }
 
-    fn run(mut self, rx: &Receiver<Input>) {
+    fn send_committed(&mut self) {
+        if self.save().is_err() { return; }
+        for out in std::mem::take(&mut *lock(&self.pending)) { let _ = self.out.try_send(out); }
+    }
+
+    fn run(mut self, rx: &Receiver<Input>, alive: &AtomicBool) {
         let mut tick = Instant::now() + TICK;
         loop {
+            if !alive.load(Ordering::SeqCst) { return; }
             match rx.recv_timeout(tick.saturating_duration_since(Instant::now())) {
                 Ok(input) => self.input(input),
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return,
             }
+            if self.failed.is_some() { return; }
             while let Ok(input) = rx.try_recv() {
                 self.input(input);
+                if self.failed.is_some() { return; }
             }
             if Instant::now() >= tick {
                 tick = Instant::now() + TICK;
@@ -488,12 +607,19 @@ impl Owner {
                 }
             }
             self.drive();
+            if self.failed.is_some() { return; }
         }
     }
 
     fn input(&mut self, input: Input) {
+        if !self.metadata.active() {
+            let _ = self.save();
+            if let Input::Ask { reply, .. } = input { let _ = reply.send(Err(AskError::Unavailable("sync controller is fenced".into()))); }
+            return;
+        }
         match input {
             Input::Wake => {}
+            Input::Send { machine, msg } => self.send(&machine, msg, Vec::new()),
             Input::From { machine, msg, raft } => self.heard(&machine, msg, raft),
             Input::Machine { machine, up } => {
                 if up {
@@ -505,17 +631,19 @@ impl Owner {
                 self.changed = true;
             }
             Input::Ask { ask, reply } => {
-                let answer = self.ask(ask).map_err(|e| format!("{e:#}"));
+                let mut answer = self.ask(ask).map_err(|e| AskError::Refused(format!("{e:#}")));
                 // The view shows what was asked before the asker hears back (a task looks for the
                 // copy it just added).
                 self.publish();
+                self.send_committed();
+                if let Some(error) = &self.failed { answer = Err(AskError::Unavailable(error.clone())); }
                 let _ = reply.send(answer);
             }
             Input::Flush(reply) => {
-                self.save_activity();
-                let _ = reply.send(());
+                if self.save().is_ok() { let _ = reply.send(()); }
             }
         }
+        self.send_committed();
     }
 
     fn heard(&mut self, machine: &str, msg: Msg, raft: Vec<u8>) {
@@ -594,9 +722,11 @@ impl Owner {
     fn settled(&mut self, repo: &str, member: u64) {
         let Some(c) = self.repos.iter_mut().filter(|r| r.id == repo).flat_map(|r| r.copies.iter_mut()).find(|c| c.member == member && c.adopt.is_some()) else { return };
         c.adopt = None;
+        self.metadata_dirty = true;
         let machine = c.machine.clone();
         if let Err(e) = self.save() {
             tracing::warn!(error = %format!("{e:#}"), "the synced repos could not be saved");
+            return;
         }
         self.note(repo, Kind::Copy, &machine, Tone::Ok, format!("the new copy on {machine} has the repo's files: it syncs like the others now"));
     }
@@ -639,7 +769,7 @@ impl Owner {
     }
 
     fn send(&self, machine: &str, msg: Msg, raft: Vec<u8>) {
-        let _ = self.out.try_send(Out { machine: machine.to_owned(), msg, raft });
+        lock(&self.pending).push(Out { machine: machine.to_owned(), msg, raft });
     }
 
     /// Tells a machine every copy it holds.
@@ -666,7 +796,35 @@ impl Owner {
         self.send(machine, Msg::Copies { copies, token: token(&self.key, machine) }, Vec::new());
     }
 
+    /// U19: replay durable accepted resolutions until their exact server sequence is applied.
+    fn replay_resolutions(&mut self) {
+        let mut completed = HashSet::new();
+        for intent in &self.resolutions {
+            let Some(group) = self.groups.get_mut(&intent.repo) else { continue };
+            let applied = group.r.machine().tree.seqs.get(&SERVER).copied().unwrap_or(0);
+            if applied >= intent.step.seq { completed.insert(intent.id.clone()); continue; }
+            if group.next.get(&SERVER).copied().unwrap_or(0) > intent.step.seq { continue; }
+            if group.r.propose(Vec::new(), group::entry(&intent.step)).is_ok() {
+                group.next.insert(SERVER, intent.step.seq.saturating_add(1));
+                group.arrived.insert((SERVER, intent.step.seq), Instant::now());
+            }
+        }
+        self.retire_resolutions(&completed);
+    }
+
+    fn retire_resolutions(&mut self, completed: &HashSet<String>) {
+        if completed.is_empty() { return; }
+        for intent in std::mem::take(&mut self.resolutions) {
+            if completed.contains(&intent.id) {
+                self.note(&intent.repo, Kind::Resolved, "kiln", Tone::Ok, format!("resolution {} applied (step #{}): {}", intent.id, intent.step.seq, intent.text));
+            } else { self.resolutions.push(intent); }
+        }
+        self.metadata_dirty = true;
+    }
+
     fn drive(&mut self) {
+        if !self.metadata.active() { let _ = self.save(); return; }
+        self.replay_resolutions();
         self.wakeup.pending.store(false, Ordering::SeqCst);
         let now = u64::try_from(self.start.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let ids: Vec<String> = self.groups.keys().cloned().collect();
@@ -701,7 +859,7 @@ impl Owner {
                 let snapshot = m.msg_type == MessageType::MsgSnapshot;
                 self.part = self.part.wrapping_add(1);
                 for (msg, raft) in wire::frames(&repo.id, self.part, m.encode_to_vec()) {
-                    let _ = self.out.try_send(Out { machine: copy.machine.clone(), msg, raft });
+                    lock(&self.pending).push(Out { machine: copy.machine.clone(), msg, raft });
                 }
                 if snapshot {
                     let _ = g.r.report_snapshot(to, true);
@@ -734,26 +892,19 @@ impl Owner {
         if (self.changed && self.viewed.elapsed() >= VIEW_EVERY) || self.gauged.elapsed() >= GAUGE_EVERY {
             self.publish();
         }
-        if self.saved.elapsed() >= SAVE_EVERY {
-            self.save_activity();
-        }
-    }
-
-    /// Saves the repos' new activity.
-    fn save_activity(&mut self) {
-        self.saved = Instant::now();
-        if let Err(e) = lock(&self.activity).save(&self.dir) {
-            tracing::warn!(error = %e, "the synced repos' activity could not be saved");
-        }
+        self.send_committed();
     }
 
     /// Steps `repo`'s log committed, each with when it arrived (if the server saw it arrive): its
     /// counts, latency, conflicts, and its event in the repo's activity.
     fn committed(&mut self, repo: &Repo, taken: Vec<Taken>, arrived: &[Option<Instant>]) {
+        let completed: HashSet<String> = self.resolutions.iter().filter(|intent| intent.repo == repo.id && taken.iter().any(|t| t.step == intent.step)).map(|intent| intent.id.clone()).collect();
+        self.retire_resolutions(&completed);
         let m = metrics::sync();
         let name = repo.name.as_str();
         let on_record = self.recorded.get(&repo.id).copied().unwrap_or(0);
         if let Some(last) = taken.last() {
+            self.metadata_dirty = true;
             self.recorded.insert(repo.id.clone(), on_record.max(last.index));
         }
         for (t, came) in taken.iter().zip(arrived) {
@@ -792,19 +943,20 @@ impl Owner {
             s.conflicts += u64::try_from(step.conflicts).unwrap_or(u64::MAX);
             s.last_step = Some(now);
             let tone = if step.conflicts > 0 { Tone::Warn } else { Tone::Info };
-            lock(&self.activity).push(Event { seq: 0, repo: repo.id.clone(), at: now, kind: Kind::Step, machine: t.step.by.clone(), text: String::new(), tone, step: Some(step), state: None });
+            self.push_activity(Event { seq: 0, repo: repo.id.clone(), at: now, kind: Kind::Step, machine: t.step.by.clone(), text: String::new(), tone, step: Some(step), state: None });
         }
     }
 
     /// The view the API shows, made again now; each copy's change of state noted; the gauges
     /// measured.
     fn publish(&mut self) {
+        if self.failed.is_some() { return; }
         self.changed = false;
         self.viewed = Instant::now();
         self.gauged = Instant::now();
         let view = self.make_view();
         self.watch(&view);
-        *lock(&self.view) = view;
+        if self.save().is_ok() { *lock(&self.view) = view; }
     }
 
     /// Each copy's state, as the view has it: a change worth knowing of noted in its repo's
@@ -854,7 +1006,7 @@ impl Owner {
                     } else {
                         self.away.remove(&gone);
                     }
-                    lock(&self.activity).push(Event { seq: 0, repo: r.id.clone(), at: now_ms(), kind: Kind::State, machine: c.machine.clone(), text, tone, step: None, state: Some(c.state.to_owned()) });
+                    self.push_activity(Event { seq: 0, repo: r.id.clone(), at: now_ms(), kind: Kind::State, machine: c.machine.clone(), text, tone, step: None, state: Some(c.state.to_owned()) });
                 }
             }
         }
@@ -884,9 +1036,14 @@ impl Owner {
         self.stats.entry(repo.to_owned()).or_insert_with(|| RepoStats { since, ..RepoStats::default() })
     }
 
+    fn push_activity(&mut self, event: Event) {
+        self.metadata_dirty = true;
+        self.activity.push(event);
+    }
+
     /// Something happened in `repo`: in its activity.
-    fn note(&self, repo: &str, kind: Kind, machine: &str, tone: Tone, text: String) {
-        lock(&self.activity).push(Event { seq: 0, repo: repo.to_owned(), at: now_ms(), kind, machine: machine.to_owned(), text, tone, step: None, state: None });
+    fn note(&mut self, repo: &str, kind: Kind, machine: &str, tone: Tone, text: String) {
+        self.push_activity(Event { seq: 0, repo: repo.to_owned(), at: now_ms(), kind, machine: machine.to_owned(), text, tone, step: None, state: None });
     }
 
     /// As [`Owner::note`], once in [`QUIET`] for the same trouble (`what`) from the same machine:
@@ -942,7 +1099,16 @@ impl Owner {
         }
     }
 
+    fn forget_repo_control(&mut self, repo: &str) {
+        self.activity.forget_record(repo);
+        self.away.retain(|(id, _)| id != repo);
+        self.recorded.remove(repo);
+        self.resolutions.retain(|intent| intent.repo != repo);
+        self.metadata_dirty = true;
+    }
+
     fn ask(&mut self, ask: Ask) -> anyhow::Result<String> {
+        self.metadata_dirty = true;
         match ask {
             Ask::Create { name, copies, exclude, mode, transient } => {
                 let name = name.trim().to_owned();
@@ -994,15 +1160,15 @@ impl Owner {
             Ask::Delete { repo } => {
                 let at = self.repos.iter().position(|r| r.id == repo).ok_or_else(|| anyhow::anyhow!("no such synced repo"))?;
                 let r = self.repos.remove(at);
+                // U19: the first durable tombstone must remove every canonical reference; a
+                // crash or cleanup refusal below must still leave a valid restartable snapshot.
+                self.forget_repo_control(&r.id);
                 self.save()?;
                 self.groups.remove(&r.id);
                 disk::remove(&self.log, u128::from(r.group))?;
                 let _ = std::fs::remove_file(self.dir.join(format!("{}.tree.json", r.id)));
                 self.statuses.retain(|(id, _), _| *id != r.id);
-                lock(&self.activity).forget(&self.dir, &r.id);
                 self.stats.remove(&r.id);
-                self.away.retain(|(id, _)| *id != r.id);
-                self.recorded.remove(&r.id);
                 let machines: HashSet<String> = r.copies.iter().map(|c| c.machine.clone()).collect();
                 for m in machines {
                     self.tell_copies(&m);
@@ -1031,10 +1197,13 @@ impl Owner {
                 let taken = tree.seqs.get(&SERVER).copied().unwrap_or(0);
                 let seq = g.next.get(&SERVER).copied().unwrap_or(0).max(taken.saturating_add(1));
                 let step = Step { by: "kiln".into(), member: SERVER, seq, at: now_ms(), changes };
-                g.r.propose(Vec::new(), group::entry(&step)).map_err(|e| anyhow::anyhow!("the repo's log would not take it now: {e:?}"))?;
-                g.arrived.insert((SERVER, seq), Instant::now());
-                g.next.insert(SERVER, seq.saturating_add(1));
-                self.note(&repo, Kind::Resolved, "kiln", Tone::Ok, format!("a conflict resolved: {said}"));
+                anyhow::ensure!(!self.resolutions.iter().any(|intent| intent.repo == repo), "a resolution for this repo is still being applied");
+                anyhow::ensure!(group::entry(&step).len() <= ENTRY, "resolution exceeds transfer entry budget");
+                let id = crate::util::new_id();
+                self.resolutions.push(metadata::Resolution { id, repo: repo.clone(), step, text: said });
+                // U19: accept exact intent durably before replying; transfer replay uses its fixed
+                // member/sequence/changes, never a freshly re-evaluated conflict resolution.
+                self.save()?;
                 Ok(String::new())
             }
         }
@@ -1254,6 +1423,132 @@ impl std::fmt::Debug for Owner {
 mod tests {
     use super::*;
 
+    #[test]
+    fn u19_delete_commit_reopens_before_transfer_cleanup() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let dir = temp.path().join("sync");
+        let database = crate::store::Store::in_memory()?.database();
+        let metadata = metadata::Metadata::open(&database, &dir, "host".into())?;
+        let contents = Contents::empty(Arc::new(kiln_seams::blobs::SimBlobs::default()));
+        let (out, _) = async_channel::unbounded();
+        let (tx, _) = std::sync::mpsc::channel();
+        let mut owner = Owner::open(&dir, contents, out, Arc::new(Mutex::new(View::default())), Arc::new(Mutex::new(Activity::default())), (tx, "key".into()), metadata)?;
+        let id = owner.ask(Ask::Create { name: "repo".into(), copies: Vec::new(), exclude: Vec::new(), mode: super::super::Mode::Files, transient: None })?;
+        owner.away.insert((id.clone(), "runner".into()));
+        owner.recorded.insert(id.clone(), 12);
+        owner.resolutions.push(metadata::Resolution { id: "pending".into(), repo: id.clone(), step: Step { by: "kiln".into(), member: SERVER, seq: 1, at: 0, changes: Vec::new() }, text: "pending resolution".into() });
+        owner.save()?;
+        let next = owner.activity.next();
+        let checkpoint = dir.join(format!("{id}.tree.json"));
+        std::fs::write(&checkpoint, b"checkpoint before cleanup")?;
+        let at = owner.repos.iter().position(|r| r.id == id).ok_or_else(|| anyhow::anyhow!("missing repo"))?;
+        owner.repos.remove(at);
+        owner.forget_repo_control(&id);
+        owner.save()?; // Crash boundary: no transfer cleanup has happened.
+        assert!(owner.groups.contains_key(&id));
+        drop(owner);
+        let (_, state) = metadata::Metadata::open(&database, &dir, "host".into())?;
+        assert!(state.repos.is_empty() && state.resolutions.is_empty() && state.away.is_empty() && state.recorded.is_empty());
+        assert!(state.activity.since(0, None, 100).is_empty());
+        assert_eq!(state.activity.next(), next, "global sequence never rolls back on deletion");
+        assert_eq!(std::fs::read(checkpoint)?, b"checkpoint before cleanup");
+        Ok(())
+    }
+
+    #[test]
+    fn u19_overlap_is_readonly_standby_then_promotes_after_owner_exit() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let dir = temp.path().join("sync");
+        let database = crate::store::Store::in_memory()?.database();
+        let owner = metadata::Metadata::open(&database, &dir, "host".into())?;
+        std::fs::create_dir_all(dir.join("incoming"))?;
+        std::fs::write(dir.join("incoming/partial"), b"live transfer")?;
+        let contents = Contents::empty(Arc::new(kiln_seams::blobs::SimBlobs::default()));
+        let sync = Sync::start(dir.clone(), "key".into(), contents, database, "host".into())?;
+        let create = || Ask::Create { name: "repo".into(), copies: Vec::new(), exclude: Vec::new(), mode: super::super::Mode::Files, transient: None };
+        assert!(matches!(futures::executor::block_on(sync.ask(create())), Err(AskError::Unavailable(_))));
+        sync.send("runner", Msg::Look);
+        assert!(sync.outgoing().try_recv().is_err());
+        assert_eq!(std::fs::read(dir.join("incoming/partial"))?, b"live transfer");
+        assert!(!dir.join("sync.log").exists(), "standby never opens the transfer log");
+        drop(owner);
+        anyhow::ensure!(eventually(|| sync.ready.load(Ordering::SeqCst)), "standby did not promote");
+        assert!(!dir.join("incoming/partial").exists(), "cleanup belongs to acquired lease");
+        assert!(futures::executor::block_on(sync.ask(create())).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn u19_resolution_intent_is_durable_before_ack_and_replayed_after_restart() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let dir = temp.path().join("sync");
+        let database = crate::store::Store::in_memory()?.database();
+        let contents = Contents::empty(Arc::new(kiln_seams::blobs::SimBlobs::default()));
+        let open = || -> anyhow::Result<Owner> {
+            let metadata = metadata::Metadata::open(&database, &dir, "host".into())?;
+            let (out, _) = async_channel::unbounded();
+            let (tx, _) = std::sync::mpsc::channel();
+            Owner::open(&dir, contents.clone(), out, Arc::new(Mutex::new(View::default())), Arc::new(Mutex::new(Activity::default())), (tx, "key".into()), metadata)
+        };
+        let mut owner = open()?;
+        let id = owner.ask(Ask::Create { name: "repo".into(), copies: Vec::new(), exclude: Vec::new(), mode: super::super::Mode::Files, transient: None })?;
+        let path = "a.conflict-runner-20261029-120000.txt";
+        let group = owner.groups.get_mut(&id).ok_or_else(|| anyhow::anyhow!("no group"))?;
+        group.r.machine_mut().tree.files.insert("a.txt".into(), Version::Link { target: "original".into() });
+        group.r.machine_mut().tree.files.insert(path.into(), Version::Link { target: "conflict".into() });
+        let (reply, answer) = futures::channel::oneshot::channel();
+        owner.input(Input::Ask { ask: Ask::Resolve { repo: id.clone(), path: path.into(), keep: Keep::Name }, reply });
+        assert!(futures::executor::block_on(answer)?.is_ok());
+        let expected = owner.resolutions.first().ok_or_else(|| anyhow::anyhow!("no durable resolution intent"))?.clone();
+        assert!(!expected.id.is_empty());
+        assert!(owner.activity.since(0, None, 100).iter().all(|e| e.kind != Kind::Resolved), "acceptance is not an applied-resolution event");
+        drop(owner); // No drive: the accepted step has not been proposed to the transfer log.
+        let mut owner = open()?;
+        assert_eq!(owner.resolutions.first().map(|r| (&r.id, &r.step)), Some((&expected.id, &expected.step)));
+        anyhow::ensure!(eventually(|| { owner.drive(); owner.resolutions.is_empty() }), "accepted intent was not applied and retired");
+        assert!(owner.groups.get(&id).is_some_and(|g| g.r.machine().tree.seqs.get(&SERVER).copied().unwrap_or(0) >= expected.step.seq));
+        assert_eq!(owner.activity.since(0, None, 100).iter().filter(|e| e.kind == Kind::Resolved && e.text.contains(&expected.id)).count(), 1, "one applied-resolution event per durable intent");
+        drop(owner);
+        assert!(open()?.resolutions.is_empty(), "retirement survives restart");
+        Ok(())
+    }
+
+    #[test]
+    fn u17_commit_refusal_prevents_ack_publication_and_runner_notifications() -> anyhow::Result<()> {
+        use amphora_api::{Consistency, Records as _, Tx, Write};
+        let temp = tempfile::tempdir()?;
+        let dir = temp.path().join("sync");
+        let database = crate::store::Store::in_memory()?.database();
+        let metadata = metadata::Metadata::open(&database, &dir, "host".into())?;
+        let contents = Contents::empty(Arc::new(kiln_seams::blobs::SimBlobs::default()));
+        let (out, outgoing) = async_channel::unbounded();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let view = Arc::new(Mutex::new(View::default()));
+        let activity = Arc::new(Mutex::new(Activity::default()));
+        let mut owner = Owner::open(&dir, contents, out, view.clone(), activity.clone(), (tx, "key".into()), metadata)?;
+        let id = owner.ask(Ask::Create { name: "repo".into(), copies: Vec::new(), exclude: Vec::new(), mode: super::super::Mode::Files, transient: None })?;
+        owner.publish();
+        let before_next = lock(&activity).next();
+        owner.up.insert("runner".into());
+        let instance = std::fs::read_to_string(temp.path().join("instance.id"))?;
+        let records = database.namespace(&metadata::namespace(&instance))?;
+        let until = || Instant::now() + Duration::from_secs(30);
+        let header = records.get("control", b"import-v1", Consistency::Linearizable, until())?.ok_or_else(|| anyhow::anyhow!("missing header"))?;
+        records.commit(Tx { conds: vec![], writes: vec![Write::Put { family: "control".into(), key: b"import-v1".to_vec(), value: header.value }] }, until())?;
+        let (reply, answer) = futures::channel::oneshot::channel();
+        owner.input(Input::Ask { ask: Ask::AddCopy { repo: id, machine: "runner".into(), path: "/src/kiln".into(), adopt: false }, reply });
+        assert!(futures::executor::block_on(answer)?.is_err(), "no successful acknowledgment");
+        assert!(outgoing.try_recv().is_err(), "no runner notifications before commit");
+        assert!(owner.failed.is_some(), "no further reconciliation after ambiguous/refused commit");
+        assert!(lock(&view).error.is_some());
+        assert!(lock(&view).repos.iter().all(|r| r.copies.is_empty()), "uncommitted control is not published");
+        assert_eq!(lock(&activity).next(), before_next, "uncommitted activity is not published");
+        drop(owner);
+        let (_, state) = metadata::Metadata::open(&database, &dir, "host".into())?;
+        assert!(state.repos.iter().all(|r| r.copies.is_empty()), "restart sees committed control only");
+        Ok(())
+    }
+
     /// Whether `f` comes to hold within ten seconds.
     fn eventually(mut f: impl FnMut() -> bool) -> bool {
         let until = Instant::now() + Duration::from_secs(10);
@@ -1270,7 +1565,8 @@ mod tests {
     fn a_committed_step_shows_with_its_files_and_a_stray_one_as_let_go() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let contents = Contents::empty(Arc::new(kiln_seams::blobs::SimBlobs::default()));
-        let sync = Sync::start(dir.path().join("sync"), "key".into(), contents);
+        let database = crate::store::Store::in_memory()?.database();
+        let sync = Sync::start(dir.path().join("sync"), "key".into(), contents, database, "test-host".into())?;
         let name = "activity-test";
         let create = Ask::Create {
             name: name.into(),

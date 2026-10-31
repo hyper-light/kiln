@@ -631,7 +631,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// master key, the file the owner's alone).
 pub struct Tests {
     path: PathBuf,
-    master: PathBuf,
+    master: crate::secrets::crypto::Master,
     all: Mutex<BTreeMap<String, Test>>,
 }
 
@@ -640,14 +640,14 @@ fn aad(name: &str) -> Vec<u8> {
 }
 
 impl Tests {
-    pub fn open(dir: &Path, master: &Path) -> Self {
+    pub(crate) fn open(dir: &Path, master: crate::secrets::crypto::Master) -> Self {
         let path = dir.join("synthetics.json");
         let mut all: BTreeMap<String, Test> = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         for (name, t) in &mut all {
             if let Some(b) = t.bearer_mut()
                 && let Some(s) = b.as_deref().and_then(|s| s.strip_prefix(SEALED))
             {
-                *b = match unseal(master, name, s) {
+                *b = match unseal(&master, name, s) {
                     Ok(plain) => Some(plain),
                     Err(e) => {
                         tracing::warn!(test = %name, error = %format!("{e:#}"), "a synthetic test's token does not open: give it again");
@@ -656,7 +656,7 @@ impl Tests {
                 };
             }
         }
-        Self { path, master: master.to_owned(), all: Mutex::new(all) }
+        Self { path, master, all: Mutex::new(all) }
     }
 
     pub fn list(&self) -> Vec<(String, Test)> {
@@ -697,7 +697,7 @@ impl Tests {
             if let Some(b) = t.bearer_mut()
                 && let Some(plain) = b.as_deref()
             {
-                let (ct, nonce) = crate::ci::secrets::seal_with(&self.master, plain.as_bytes(), &aad(name))?;
+                let (ct, nonce) = self.master.seal(plain.as_bytes(), &aad(name))?;
                 let b64 = base64::engine::general_purpose::STANDARD_NO_PAD;
                 *b = Some(format!("{SEALED}{}:{}", b64.encode(nonce), b64.encode(ct)));
             }
@@ -707,10 +707,10 @@ impl Tests {
     }
 }
 
-fn unseal(master: &Path, name: &str, s: &str) -> anyhow::Result<String> {
+fn unseal(master: &crate::secrets::crypto::Master, name: &str, s: &str) -> anyhow::Result<String> {
     let b64 = base64::engine::general_purpose::STANDARD_NO_PAD;
     let (nonce, ct) = s.split_once(':').ok_or_else(|| anyhow::anyhow!("not a sealed token"))?;
-    let plain = crate::ci::secrets::open_with(master, &b64.decode(ct)?, &b64.decode(nonce)?, &aad(name))?;
+    let plain = master.open( &b64.decode(ct)?, &b64.decode(nonce)?, &aad(name))?;
     Ok(String::from_utf8(plain)?)
 }
 

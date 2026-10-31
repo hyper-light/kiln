@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use http::{Method, StatusCode, header};
-use rusqlite::{OptionalExtension, params};
+use crate::sql::{OptionalExtension, params};
 use serde_json::{Value, json};
 
 use super::{blob, cache_v1, cas};

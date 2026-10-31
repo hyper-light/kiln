@@ -54,10 +54,63 @@ pub fn token_path(cfg: &Config) -> PathBuf {
     cfg.server.admin_token_file.clone().unwrap_or_else(|| cfg.data("admin.token"))
 }
 
+/// U15: only the explicitly declared baseline source may restore retired SQL before the
+/// product takes replicated ownership. Pending/complete replica markers forbid local mutation.
+pub(crate) fn open_replica(log_path: &std::path::Path, legacy: &std::path::Path, config: &crate::replication::Config) -> anyhow::Result<amphora::database::Database> {
+    config.validate()?;
+    // U05: even attachment to a live owner must precede carrier activation with a valid
+    // durable format fence. This is inspection/fresh fencing, never exclusive import.
+    crate::store::Store::ensure_legacy_fence(legacy)?;
+    let parent = legacy.parent().filter(|path| !path.as_os_str().is_empty()).unwrap_or_else(|| std::path::Path::new("."));
+    let path = parent.join(crate::store::FILE);
+    let product = amphora_api::replication::ReplicaConfig {
+        node_id: config.id, voters: config.voters.clone(), learners: config.learners.clone(), bootstrap: config.bootstrap.clone(),
+    };
+    // U15/U17: a successor attaches to the live canonical owner before any exclusive
+    // marker/source inspection. SDK validation rejects a different replica configuration.
+    if let Some(database) = amphora::database::Database::attach_replicated(&path, log_path, product, crate::store::deadline())? {
+        return Ok(database);
+    }
+    let source = config.bootstrap.as_ref().is_some_and(|source| source.source_node == config.id);
+    let path = crate::store::Store::prepare_replicated(legacy, source)?;
+    // The product waits for the local owner's actual drain under its lease, then validates
+    // and replicates the explicitly declared full image before accepting page deltas.
+    crate::replication::open_database(&path, log_path, config)
+}
+
+/// U15/U17: discover every retained instance source before opening a canonical conversation
+/// writer. Missing instance roots are normal; other filesystem errors must stop migration.
+pub(crate) fn legacy_conversation_sources(state: &std::path::Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut sources = vec![state.join(crate::convo::FILE)];
+    let instances = state.join("instances");
+    match std::fs::read_dir(&instances) {
+        Ok(entries) => {
+            for (inspected, entry) in entries.enumerate() {
+                // Bound every inspected entry, including regular files and corrupt sources.
+                anyhow::ensure!(inspected < 4096, "U15: too many entries in retained legacy instances {}; source files retained and startup refused", instances.display());
+                let entry = entry.with_context(|| format!("read legacy instances in {}", instances.display()))?;
+                if std::fs::metadata(entry.path())?.is_dir() {
+                    anyhow::ensure!(sources.len() < 4096, "U15: too many retained legacy conversation sources in {}; source files retained", state.display());
+                    sources.push(entry.path().join(crate::convo::FILE));
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("read legacy instances in {}", instances.display())),
+    }
+    sources.sort();
+    sources.dedup();
+    Ok(sources)
+}
+
 pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     crate::os::start_reaper();
     crate::updates::warm_own_binary().await;
     let cfg = Arc::new(cfg);
+    if let Some(replica) = &cfg.cluster.replica {
+        replica.validate()?;
+        anyhow::ensure!(replica.id == replica.hub, "U15: server replica id must equal its declared hub id");
+    }
     std::fs::create_dir_all(&cfg.server.data_dir)
         .with_context(|| format!("create data dir {}", cfg.server.data_dir.display()))?;
     // Earlier builds' UI assets stay servable (pages loaded before this deploy); in the background.
@@ -68,13 +121,6 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         });
     }
     crate::password::seed_from_env(&crate::password::path(&cfg));
-    let store = if cfg.cluster.group { crate::store::Store::open_grouped(&cfg.data("kiln.db"), &cfg.data("cluster"))? } else { crate::store::Store::open(&cfg.data("kiln.db"))? };
-    tracing::info!(group = store.grouped(), "the store's writes go through the cluster group (docs/p2p.md P1)");
-    let runners_before = store.runners_before(RUNNERS_BEFORE_S).await.unwrap_or(0);
-    let requeued = store.recover().await?;
-    if requeued > 0 {
-        tracing::warn!(jobs = requeued, "jobs were running at last shutdown; waiting for their agents to reclaim them");
-    }
     let logs = crate::logs::Logs::new(cfg.data("logs"), cfg.retention.max_job_log_mb.saturating_mul(1 << 20));
     let pki = Arc::new(crate::pki::Pki::open(&cfg.data("pki"))?);
     let mut names = cfg.server.tls_names.clone();
@@ -90,16 +136,28 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     let join = crate::util::load_or_create_token(&cfg.data("join.token"))?;
 
     let quic_bind: SocketAddr = cfg.server.quic_addr.parse().with_context(|| format!("quic_addr {}", cfg.server.quic_addr))?;
-    // Revoked keys are refused from the first handshake on (W27-R01).
-    let revoked_keys = crate::identities::revoked_keys(&store).await?;
-    let (net, net_events) = crate::net::start(crate::net::Spec {
+    // W27/U15: a local Store loads policy before any handshake. A replicated Store needs its
+    // declared carrier first, so that network starts explicitly fenced for application traffic.
+    let mut local_store = if cfg.cluster.replica.is_none() {
+        let path=cfg.data("kiln.db");
+        Some(crate::rt::blocking(move || crate::store::Store::open(&path)).await??)
+    } else { None };
+    let revoked_keys = match local_store.as_ref() {
+        Some(store)=>crate::identities::revoked_keys(store).await?,
+        None=>Vec::new(), // Explicit replication-only bootstrap, never a serving fallback.
+    };
+    let spec = crate::net::Spec {
         bind: quic_bind,
         ca_der: pki.ca_der.clone(),
         leaf: leaf.clone(),
         server: true,
         dial_deadline: crate::net::DIAL_DEADLINE,
         revoked_keys,
-    })?;
+    };
+    let (net,net_events)=match cfg.cluster.replica.as_ref() {
+        Some(replica)=>crate::net::start_replication_bootstrap(spec,replica.peers.keys().cloned().collect())?,
+        None=>crate::net::start(spec)?,
+    };
     // A test build's faults (`KILN_CHAOS`): frames lost, sent twice or sent late below the channel,
     // which it makes up for.
     if let Some(c) = crate::runner::chaos::get() {
@@ -108,9 +166,41 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             net.command(crate::net::Out::Shed(rule.past(crate::wire::server_classes().len()))).await;
         }
     }
+    // U15: recovery opens without quorum; the independent carrier must be running before
+    // SQL migrations or host namespace imports submit their first replicated transaction.
+    let (store, net_events, carrier_active) = if let Some(replica) = cfg.cluster.replica.clone() {
+        let log_path = cfg.data("replica");
+        let config = replica.clone();
+        let legacy = cfg.data("kiln.db");
+        let database = crate::rt::blocking(move || open_replica(&log_path, &legacy, &config)).await??;
+        let (events, active) = crate::replication::carrier(database.clone(), replica, net.clone(), net_events, shutdown.clone())?;
+        crate::replication::wait_for_writer(&database, &shutdown).await?;
+        let legacy = cfg.data("kiln.db");
+        let store = crate::rt::blocking(move || crate::store::Store::from_database_with_legacy(database, &legacy)).await??;
+        (store, events, active)
+    } else {
+        (local_store.take().context("local canonical Store was not initialized")?, net_events, Arc::new(std::sync::atomic::AtomicBool::new(false)))
+    };
+    if cfg.cluster.replica.is_some() {
+        let revoked_keys=crate::identities::revoked_keys(&store).await?;
+        net.open_application(revoked_keys,crate::store::deadline()).await?;
+    }
+    tracing::info!(replicated = cfg.cluster.replica.is_some(), "record durability is owned by Amphora (U15)");
+    let runners_before = store.runners_before(RUNNERS_BEFORE_S).await.unwrap_or(0);
     // HTTPS on the HTTP port, when asked: the configured certificate, else the kiln CA's.
     let tls = if cfg.server.https { Some(server_tls(&cfg, &leaf)?) } else { None };
-    let hub = Hub::new(cfg.clone(), store, logs, net, pki.clone(), admin, join, shutdown.clone())?;
+    let hub = {
+        let (cfg, pki, shutdown) = (cfg.clone(), pki.clone(), shutdown.clone());
+        // U15: Hub construction imports Records and restores sessions before any Host writes.
+        crate::rt::blocking(move || Hub::new(cfg, store, logs, net, pki, admin, join, shutdown)).await??
+    };
+    // U09/U15: recover mutates shared agent state. Bootstrap validation and Hub imports must
+    // succeed first; keep the runner-count snapshot above and recovery before service loops.
+    let requeued = hub.store.recover().await?;
+    if requeued > 0 {
+        tracing::warn!(jobs = requeued, "jobs were running at last shutdown; waiting for their agents to reclaim them");
+    }
+    let _ = hub.replica_carrier_active.set(carrier_active);
     // The server's and CD's own signing identities (docs/ci.md W27-R01).
     if let Err(e) = crate::identities::own_identities(&hub.store, &pki).await {
         tracing::warn!(error = %format!("{e:#}"), "the server's and CD's identities weren't issued");
@@ -120,8 +210,6 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     crate::blobs::start(&hub).await;
     // The CI engine (docs/ci.md), when turned on.
     crate::ci::dispatch::spawn(hub.clone());
-    // Terminal sessions' names, kept across restarts.
-    hub.terminals.keep_names_in(cfg.server.data_dir.join("terminal-names.json"));
     // Runners' front doors: what the UI set, sent to each runner when it connects.
     hub.front_doors.load(&hub.store).await?;
     // How many agent sessions each machine runs at once, as the UI set it: sent to each runner as
@@ -160,7 +248,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             });
         }};
     }
-    child!("scheduler", h => h.scheduler_loop());
+    child!("job-maintenance", h => h.job_maintenance_loop());
     child!("commands", h => h.commands_loop());
     child!("blobs", h => crate::blobs::run(h));
     child!("transcripts", h => crate::harness::archive::run(h));
@@ -213,7 +301,6 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             child!("deploy", h => crate::deploy::run(h));
         }
         child!("sync", h => h.sync_loop());
-        child!("cluster", h => h.cluster_loop());
         child!("tailnet-dns", h => crate::frontdoor::tailnet::run(h));
         child!("in-step", h => crate::updates::in_step_loop(h));
         child!("ui-server", h => crate::uiserver::run(h));
@@ -258,7 +345,6 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         let issues = crate::observe::errors::Issues::open(&cfg.data("observe"));
         crate::observe::api::set_issues(issues.clone());
         crate::rt::spawn(issues.run(shutdown.clone()));
-        child!("observe", h => crate::observe::hub::send_loop(h));
         // Profilers' uploads (`crate::observe::profiles`), kept here alone: opened on a thread of their
         // own (their headers read), taken once it has.
         crate::observe::profiles::start(
@@ -287,7 +373,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         match crate::http::client::Client::public() {
             Ok(http) => {
                 let http = std::sync::Arc::new(http);
-                let clouds = crate::observe::cloud::Clouds::open(&cfg.data("observe"), &cfg.data("secrets").join("master.key"), http.clone(), shutdown.clone());
+                let clouds = crate::observe::cloud::Clouds::open(&cfg.data("observe"), hub.master_key.clone(), http.clone(), shutdown.clone());
                 crate::observe::api::set_clouds(clouds.clone());
                 clouds.start();
                 // Log archives, written with the cloud integrations' credentials. Its loop holds
@@ -306,7 +392,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         // its own.
         match crate::http::client::Client::public() {
             Ok(http) => {
-                let targets = std::sync::Arc::new(crate::observe::scrape::Targets::open(&cfg.data("observe"), &cfg.data("secrets").join("master.key")));
+                let targets = std::sync::Arc::new(crate::observe::scrape::Targets::open(&cfg.data("observe"), hub.master_key.clone()));
                 let all = targets.list();
                 crate::observe::scrape::start(crate::observe::scrape::SERVER, &crate::os::hostname(), std::sync::Arc::new(http), shutdown.clone()).set(&all);
                 if let Some(o) = crate::observe::api::get() {
@@ -317,7 +403,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             Err(e) => tracing::warn!(error = %format!("{e:#}"), "scrapes did not start: no HTTPS client"),
         }
         // Synthetic tests: kept here, the server's own run here, each runner told its own.
-        let tests = std::sync::Arc::new(crate::observe::synthetics::Tests::open(&cfg.data("observe"), &cfg.data("secrets").join("master.key")));
+        let tests = std::sync::Arc::new(crate::observe::synthetics::Tests::open(&cfg.data("observe"), hub.master_key.clone()));
         let all = tests.list();
         crate::observe::synthetics::start(crate::observe::synthetics::SERVER, shutdown.clone()).set(&all);
         if let Some(o) = crate::observe::api::get() {
@@ -325,13 +411,19 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         }
         crate::observe::api::set_synthetics(tests);
         // DogStatsD listeners: kept here, the server's own opened here, each runner told its own.
-        let listeners = std::sync::Arc::new(crate::observe::statsd::Listeners::open(&cfg.data("observe")));
-        let all = listeners.list();
-        crate::observe::statsd::start(crate::observe::statsd::SERVER, &crate::os::hostname(), shutdown.clone()).set(&all);
+        // U05/U06: enabled Observe refuses startup on ambiguous/corrupt canonical metadata,
+        // rather than claiming an empty listener configuration. Legacy JSON remains read-only.
+        let authority = crate::observe::statsd::ImportAuthority::server(cfg.cluster.replica.as_ref());
+        let listeners = std::sync::Arc::new(crate::observe::statsd::Listeners::open(hub.records.clone(), &cfg.data("observe"), authority, Some(std::sync::Arc::new(hub.bus.clone()))).await
+            .context("enabled Observe could not open/import canonical DogStatsD metadata")?);
+        let configuration = listeners.list().await.context("enabled Observe could not read canonical DogStatsD metadata")?;
+        crate::observe::statsd::start(crate::observe::statsd::SERVER, &crate::os::hostname(), shutdown.clone()).set(&configuration.listeners, Some(configuration.revision));
         if let Some(o) = crate::observe::api::get() {
-            o.set_statsd(all);
+            o.set_statsd(configuration);
         }
         crate::observe::api::set_statsd(listeners);
+        // The existing transport owner also reconciles canonical listener revisions.
+        child!("observe", h => crate::observe::hub::send_loop(h));
         // Log pipelines: kept here, applied here and by every runner.
         let pipelines = std::sync::Arc::new(crate::observe::pipeline::kept::Pipelines::open(&cfg.data("observe")));
         crate::observe::pipeline::kept::activate(&pipelines.defs());
@@ -551,6 +643,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             slots: cfg.local_agent.slots,
             work_dir: cfg.local_agent.work_dir.clone().unwrap_or_else(|| cfg.data("work")),
             state_dir: cfg.data("local-agent"),
+            shared_store: Some(hub.store.clone()),
             join_token: None,
             ephemeral: false,
             dedicated_job: None,
@@ -615,6 +708,25 @@ fn shutdown_child() -> Shutdown {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn u15_legacy_startup_requires_the_declared_source_before_creating_a_replica() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let legacy = dir.path().join("kiln.db");
+        let canonical = dir.path().join(crate::store::FILE);
+        let retained = b"retained legacy source, never opened as a writer";
+        std::fs::write(&legacy, retained)?;
+        let mut config = crate::replication::Config {
+            id: 2, hub: 1, voters: vec![1, 2], learners: Vec::new(),
+            peers: std::collections::BTreeMap::from([("runner".into(), 2)]), bootstrap: None,
+        };
+        assert!(open_replica(&dir.path().join("replica"), &legacy, &config).is_err());
+        config.bootstrap = Some(amphora_api::replication::Bootstrap { source_node: 1, source_id: [0; 32] });
+        assert!(open_replica(&dir.path().join("replica"), &legacy, &config).is_err());
+        assert!(!canonical.try_exists()?);
+        assert_eq!(std::fs::read(legacy)?, retained);
+        Ok(())
+    }
 
     #[test]
     fn hosts() {

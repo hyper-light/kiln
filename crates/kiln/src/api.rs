@@ -336,11 +336,10 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             let hash = (*hash).to_owned();
             return sync_blob_get(&hub, &hash, &req);
         }
-        // A copy of kiln.db for a runner's learner of the cluster group (docs/p2p.md, P2).
+        // U15: retired learner bootstrap endpoint, retained as an explicit 410 refusal.
         (&Method::GET, ["api", "cluster", "copy"]) => return boxed(|| cluster_copy(&hub, &req)).await,
-        // Whether a request's credentials are the owner's: a runner's front door answers the owner's
-        // reads from its replica, and passes everyone else's here (docs/p2p.md, P2).
-        (&Method::GET, ["api", "cluster", "owner"]) => return Ok(srv::json(StatusCode::OK, &json!({ "owner": authed(&hub, req.headers()) }))),
+        // U15: retired frontdoor authorization endpoint; no host-owned follower reads.
+        (&Method::GET, ["api", "cluster", "owner"]) => return Err(err(StatusCode::GONE, "Kiln frontdoor replica reads are retired; reads use Amphora consistency")),
         // The local store's presigned URLs (docs/blobs.md): the URL is the credential.
         (&Method::GET | &Method::HEAD | &Method::PUT, ["api", "blobs", _, ..]) => {
             let encoded = path.strip_prefix("/api/blobs/").unwrap_or_default().to_owned();
@@ -456,6 +455,12 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
     let Some(caller) = boxed(|| caller_of(&hub, req.headers())).await else {
         return Err(err(StatusCode::UNAUTHORIZED, "authentication required"));
     };
+    // U12: the descriptor decides routing, rights and whether this call is audited.
+    if crate::ops::owns_http(&method, &s) {
+        let cx = crate::ops::Cx { hub: Arc::clone(&hub), caller };
+        let query = srv::query(&req);
+        return boxed(|| crate::ops::http(cx, method, &s, &query, req)).await.map_err(|(c, m)| err(c, m));
+    }
     if method == Method::GET || method == Method::HEAD {
         return boxed(|| authorized(hub, caller, req)).await;
     }
@@ -610,7 +615,6 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             boxed(|| crate::authz::passwords::set(&hub, &caller, &body)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(s, m)| ApiError(s, m))
         }
         (&Method::GET, ["api", "system"]) => Ok(boxed(|| system(&hub)).await),
-        (&Method::GET, ["api", "audit"]) => boxed(|| audit(&hub, &q)).await,
         (&Method::GET, ["api", "updates"]) => Ok(boxed(|| updates_overview(&hub, false)).await),
         (&Method::POST, ["api", "updates", "check"]) => Ok(boxed(|| updates_overview(&hub, true)).await),
         (&Method::GET, ["api", "updates", "runners"]) => Ok(srv::json(StatusCode::OK, &boxed(|| crate::doctor::updates_for(&hub, &caller)).await)),
@@ -664,7 +668,6 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             job_logs_ws(hub.clone(), id, step, req)
         }
         (&Method::GET, ["api", "jobs", id, "artifacts"]) => boxed(|| get_artifacts(&hub, id)).await,
-        (&Method::GET, ["api", "agents"]) => Ok(srv::json(StatusCode::OK, &boxed(|| crate::doctor::runners_for(&hub, &caller)).await)),
         (&Method::GET, ["api", "reach", "runners"]) => {
             let want = srv::query(&req).get("want").cloned();
             reach_runners(&hub, want.as_deref())
@@ -718,17 +721,10 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             boxed(|| identity_revoke(&hub, req, &by)).await
         }
         // What's wrong with a runner, and repairs to it (`crate::doctor`, docs/releases.md).
-        (&Method::GET, ["api", "agents", name, "diagnose"]) => boxed(|| crate::doctor::diagnose(&hub, name)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(c, m)| err(c, m)),
-        (&Method::POST, ["api", "agents", name, "repair"]) => {
-            let name = (*name).to_owned();
-            let ask: crate::doctor::Ask = boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-            boxed(|| crate::doctor::repair(&hub, &name, &ask)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(c, m)| err(c, m))
-        }
         (&Method::POST, ["api", "agents", name, "drain"]) => {
             let name = (*name).to_owned();
             boxed(|| drain_agent(&hub, &name, req)).await
         }
-        (&Method::POST, ["api", "agents", name, "probe"]) => boxed(|| probe_agent(&hub, name)).await.map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["api", "front-doors"]) => front_door(boxed(|| crate::frontdoor::control::list(&hub)).await),
         (&Method::GET, ["api", "headroom"]) => front_door(boxed(|| crate::headroom::control::list(&hub)).await),
         (&Method::GET, ["api", "runners", name, "headroom"]) => front_door(boxed(|| crate::headroom::control::get(&hub, name)).await),
@@ -808,7 +804,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             Ok(srv::json(StatusCode::CREATED, &tasks))
         }
         (&Method::DELETE, ["api", "places", "tasks", id]) => {
-            if hub.tasks.dismiss(id) {
+            if hub.tasks.dismiss(id).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))? {
                 hub.emit(&crate::wire::events::ServerEvent::Places);
                 Ok(srv::status(StatusCode::NO_CONTENT))
             } else {
@@ -816,71 +812,8 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             }
         }
         // Agents attached to what they look after, and their incidents (docs/ci.md W20-R08 to R10).
-        (&Method::GET, ["api", "attachments"]) => boxed(|| own_op(&hub, &caller, "attachments.list", query_value(&q))).await,
-        (&Method::POST, ["api", "attachments", "pause"]) => {
-            let body = body_value(req).await?;
-            boxed(|| own_op(&hub, &caller, "attachments.pause", body)).await
-        }
-        (&Method::POST, ["api", "attachments"]) => {
-            let body = body_value(req).await?;
-            boxed(|| own_op(&hub, &caller, "attachments.save", body)).await
-        }
-        (&Method::GET, ["api", "attachments", a]) => boxed(|| own_op(&hub, &caller, "attachments.get", json!({ "attachment": a }))).await,
-        (&Method::PUT, ["api", "attachments", a]) => {
-            let a = (*a).to_owned();
-            let mut body = body_value(req).await?;
-            if let Some(o) = body.as_object_mut() {
-                o.insert("attachment".into(), json!(a));
-            }
-            boxed(|| own_op(&hub, &caller, "attachments.save", body)).await
-        }
-        (&Method::DELETE, ["api", "attachments", a]) => boxed(|| own_op(&hub, &caller, "attachments.remove", json!({ "attachment": a }))).await,
-        (&Method::GET, ["api", "incidents"]) => boxed(|| own_op(&hub, &caller, "incidents.list", query_value(&q))).await,
-        (&Method::GET, ["api", "incidents", i]) => boxed(|| own_op(&hub, &caller, "incidents.get", json!({ "incident": i }))).await,
-        (&Method::POST, ["api", "incidents", i, "report"]) => {
-            let i = (*i).to_owned();
-            let mut body = body_value(req).await?;
-            if let Some(o) = body.as_object_mut() {
-                o.insert("incident".into(), json!(i));
-            }
-            boxed(|| own_op(&hub, &caller, "incidents.report", body)).await
-        }
         // A plan run as one agent per step (docs/plans.md): its own page's routes.
         // Research (docs/research.md): each operation is its route.
-        (&Method::GET, ["api", "research"]) => boxed(|| own_op(&hub, &caller, "research.list", query_value(&q))).await,
-        (&Method::POST, ["api", "research"]) => {
-            let body = boxed(|| body_value(req)).await?;
-            boxed(|| own_op(&hub, &caller, "research.start", body)).await
-        }
-        (&Method::GET, ["api", "research", id]) => {
-            let mut input = query_value(&q);
-            if let Some(o) = input.as_object_mut() {
-                o.insert("id".into(), json!(id));
-            }
-            boxed(|| own_op(&hub, &caller, "research.get", input)).await
-        }
-        (&Method::POST, ["api", "research", id, "findings"]) => {
-            let id = (*id).to_owned();
-            let mut body = boxed(|| body_value(req)).await?;
-            if let Some(o) = body.as_object_mut() {
-                o.insert("id".into(), json!(id));
-            }
-            boxed(|| own_op(&hub, &caller, "research.add", body)).await
-        }
-        (&Method::GET, ["api", "harness", "conversations", "search"]) => boxed(|| own_op(&hub, &caller, "conversations.search", query_value(&q))).await,
-        (&Method::GET, ["api", "plans", "runs"]) => boxed(|| own_op(&hub, &caller, "plans.runs.list", query_value(&q))).await,
-        (&Method::GET, ["api", "plans", "runs", run]) => boxed(|| own_op(&hub, &caller, "plans.runs.get", json!({ "run": run }))).await,
-        (&Method::POST, ["api", "plans", "runs", run, "stop"]) => boxed(|| own_op(&hub, &caller, "plans.runs.stop", json!({ "run": run }))).await,
-        (&Method::POST, ["api", "plans", "runs", run, "steps", n, "retry"]) => {
-            // With the try it replaces, when the body says it (CP-T3.2).
-            let (run, n) = ((*run).to_owned(), (*n).to_owned());
-            let mut body = boxed(|| body_value(req)).await?;
-            if let Some(o) = body.as_object_mut() {
-                o.insert("run".into(), json!(run));
-                o.insert("step".into(), json!(n));
-            }
-            boxed(|| own_op(&hub, &caller, "plans.runs.retry", body)).await
-        }
         // Taking a step over, and saying it's met, are a person's: no operation does them.
         (&Method::POST, ["api", "plans", "runs", run, "steps", n, what @ ("take" | "met")]) => {
             let n: usize = n.parse().map_err(|_| err(StatusCode::BAD_REQUEST, "a step's number, from 1"))?;
@@ -888,40 +821,9 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let r = if *what == "take" { boxed(|| crate::plans::agents::take(&hub, run, n, &by)).await } else { boxed(|| crate::plans::agents::met(&hub, run, n, &by)).await };
             r.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err)
         }
-        (&Method::GET, ["api", "programs"]) => boxed(|| own_op(&hub, &caller, "programs.list", json!({}))).await,
-        (&Method::GET, ["api", "programs", id]) => boxed(|| own_op(&hub, &caller, "programs.get", json!({"program": id}))).await,
-        (&Method::PUT, ["api", "programs", id, "settings"]) => boxed(|| programs_op(&hub, &caller, "programs.set", json!({"program": id}), req)).await,
-        (&Method::PUT, ["api", "programs", id, "tracks", track]) => boxed(|| programs_op(&hub, &caller, "programs.assign", json!({"program": id, "track": track}), req)).await,
-        (&Method::GET, ["api", "plans"]) => boxed(|| plans_list(&hub, &q)).await,
-        (&Method::POST, ["api", "plans"]) => boxed(|| plans_create(&hub, req)).await,
-        (&Method::GET, ["api", "plans", id]) => boxed(|| crate::plans::get(&hub, id)).await.map(|p| srv::json(StatusCode::OK, &p)).map_err(plan_err),
-        (&Method::PATCH, ["api", "plans", id]) => boxed(|| plans_update(&hub, id, req)).await,
-        (&Method::DELETE, ["api", "plans", id]) => boxed(|| plans_delete(&hub, id)).await,
-        (&Method::GET, ["api", "plans", id, "versions"]) => boxed(|| crate::plans::versions(&hub, id)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err),
         (&Method::GET, ["api", "plans", id, "runs"]) => boxed(|| crate::plans::runs(&hub, id)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err),
         (&Method::POST, ["api", "plans", id, "restore"]) => boxed(|| plans_restore(&hub, id, req)).await,
-        (&Method::POST, ["api", "plans", id, "run"]) => {
-            let id = (*id).to_owned();
-            // Its idempotency key may come as the standard header (CP-T3.2).
-            let key = idempotency_key(&req);
-            let mut body = boxed(|| body_value(req)).await?;
-            if let Some(o) = body.as_object_mut() {
-                o.insert("id".into(), json!(id));
-                if let Some(k) = key.filter(|_| !o.contains_key("key")) {
-                    o.insert("key".into(), json!(k));
-                }
-            }
-            boxed(|| own_op(&hub, &caller, "plans.run", body)).await
-        }
         (&Method::POST, ["api", "plans", id, "share"]) => boxed(|| plans_share(&hub, id, req)).await,
-        (&Method::POST, ["api", "plans", id, "ready"]) => {
-            let id = (*id).to_owned();
-            let mut body = boxed(|| body_value(req)).await?;
-            if let Some(o) = body.as_object_mut() {
-                o.insert("id".into(), json!(id));
-            }
-            boxed(|| own_op(&hub, &caller, "plans.ready", body)).await
-        }
         (&Method::GET, ["api", "voice"]) => {
             Ok(srv::json(StatusCode::OK, &serde_json::json!({ "transcribe": hub.cfg.voice.enabled(), "language": hub.cfg.voice.language })))
         }
@@ -949,32 +851,6 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         }
         (&Method::GET, ["api", "terminal", "ws"]) => boxed(|| terminal_ws(hub.clone(), q, req)).await,
         // Agents that run agents (`agents.*`, docs/agents.md): each operation is its route.
-        (&Method::GET, ["api", "harness", "agents"]) => boxed(|| own_op(&hub, &caller, "agents.list", query_value(&q))).await,
-        (&Method::POST, ["api", "harness", "agents"]) => {
-            let body = boxed(|| body_value(req)).await?;
-            boxed(|| own_op(&hub, &caller, "agents.start", body)).await
-        }
-        (&Method::GET, ["api", "harness", "agents", "wait"]) => boxed(|| own_op(&hub, &caller, "agents.wait", query_value(&q))).await,
-        (&Method::GET, ["api", "harness", "agents", id]) => boxed(|| own_op(&hub, &caller, "agents.get", json!({ "agent": id }))).await,
-        (&Method::GET, ["api", "harness", "agents", id, what @ ("result" | "children")]) => {
-            let op = format!("agents.{what}");
-            boxed(|| own_op(&hub, &caller, &op, json!({ "agent": id }))).await
-        }
-        (&Method::GET, ["api", "harness", "changes"]) => boxed(|| own_op(&hub, &caller, "agents.changes", query_value(&q))).await,
-        (&Method::GET, ["api", "harness", "agents", id, "workspace"]) => boxed(|| own_op(&hub, &caller, "agents.workspace", json!({ "agent": id }))).await,
-        (&Method::POST, ["api", "harness", "agents", id, what @ ("send" | "interrupt" | "stop" | "change" | "land" | "about")]) => {
-            let (id, name) = ((*id).to_owned(), format!("agents.{what}"));
-            // A send's idempotency key may come as the standard header (CP-T3.2).
-            let key = idempotency_key(&req);
-            let mut body = boxed(|| body_value(req)).await?;
-            if let Some(o) = body.as_object_mut() {
-                o.insert("agent".into(), json!(id));
-                if let Some(k) = key.filter(|_| *what == "send" && !o.contains_key("key")) {
-                    o.insert("key".into(), json!(k));
-                }
-            }
-            boxed(|| own_op(&hub, &caller, &name, body)).await
-        }
         (&Method::GET, ["api", "harness", "kinds"]) => Ok(harness_kinds(&hub, &q)),
         (&Method::GET, ["api", "harness", "workspaces"]) => Ok(boxed(|| harness_workspaces(&hub)).await),
         (&Method::GET, ["api", "harness", "sessions"]) => Ok(srv::json(StatusCode::OK, &boxed(|| crate::harness::lineage::seen(&hub, &caller, hub.harness.list())).await)),
@@ -985,7 +861,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         },
         (&Method::DELETE, ["api", "harness", "sessions", id]) => {
             let id = (*id).to_owned();
-            if boxed(|| hub.harness.close(&hub, &id)).await {
+            if boxed(|| hub.harness.try_close(&hub, &id)).await.map_err(|error| err(StatusCode::SERVICE_UNAVAILABLE, format!("session close was not accepted: {error:#}")))? {
                 let _ = boxed(|| crate::goals::forget(&hub, &id)).await;
                 boxed(|| hub.copies.forget_agent(&hub, &id)).await;
                 boxed(|| hub.store.audit("admin".into(), "agent.close".into(), id)).await;
@@ -1061,45 +937,8 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
                 Err(err(StatusCode::NOT_FOUND, "no such stream"))
             }
         }
-        (&Method::GET, ["api", "harness", "sessions", id, "goals"]) => boxed(|| crate::goals::get(&hub, id)).await.map(|g| srv::json(StatusCode::OK, &g)).map_err(goals_err),
-        (&Method::PUT, ["api", "harness", "sessions", id, "goals"]) => boxed(|| goals_set(&hub, &caller, id, req)).await,
-        (&Method::POST, ["api", "harness", "sessions", id, "goals"]) => boxed(|| goals_add(&hub, &caller, id, req)).await,
         // Said met, split, one goal changed, or the stack started, paused (for a while, too) …: each
         // its operation (`goals.*`), the body its input.
-        (&Method::POST, ["api", "harness", "sessions", id, "goals", what]) => {
-            let (name, field) = match *what {
-                "done" => ("goals.done", None),
-                "order" => ("goals.order", None),
-                "split" => ("goals.split", None),
-                "plan" => ("goals.plan", None),
-                "settings" => ("goals.settings", None),
-                action => ("goals.control", Some(("action", (*action).to_owned()))),
-            };
-            // A control or an end asked for under its `Idempotency-Key` header: its key (CP-T3.2).
-            let header = idempotency_key(&req).filter(|_| matches!(name, "goals.control" | "goals.done"));
-            let mut body = boxed(|| body_value(req)).await?;
-            if let Some(o) = body.as_object_mut() {
-                o.insert("agent".into(), json!(id));
-                if let Some((k, v)) = field {
-                    o.insert(k.into(), json!(v));
-                }
-                if let Some(k) = header
-                    && !o.contains_key("key")
-                {
-                    o.insert("key".into(), json!(k));
-                }
-            }
-            boxed(|| own_op(&hub, &caller, name, body)).await
-        }
-        (&Method::PATCH, ["api", "harness", "sessions", id, "goals", goal]) => {
-            let (id, goal) = ((*id).to_owned(), (*goal).to_owned());
-            let mut body = boxed(|| body_value(req)).await?;
-            if let Some(o) = body.as_object_mut() {
-                o.insert("agent".into(), json!(id));
-                o.insert("id".into(), json!(goal));
-            }
-            boxed(|| own_op(&hub, &caller, "goals.update", body)).await
-        }
         (&Method::GET, ["api", "harness", "sessions", id, "terminals"]) => Ok(srv::json(StatusCode::OK, &crate::harness::screen::list(&hub, id))),
         (&Method::POST, ["api", "harness", "sessions", id, "terminals"]) => {
             let id = (*id).to_owned();
@@ -1109,7 +948,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::GET, ["api", "harness", "sessions", id, "events"]) => boxed(|| conversation_events(&hub, id, &q)).await,
         (&Method::GET, ["api", "conversations", "search"]) => boxed(|| conversation_search(&hub, &q)).await,
         // The runners that keep a copy of the server's conversation store (docs/conversations.md, "Mirrors").
-        (&Method::GET, ["api", "conversations", "mirrors"]) => Ok(srv::json(StatusCode::OK, &json!({ "mirrors": hub.harness.copies.as_ref().map(|m| m.view()).unwrap_or_default() }))),
+        (&Method::GET, ["api", "conversations", "mirrors"]) => Ok(srv::json(StatusCode::OK, &json!({ "mirrors": [], "retired": true, "reason": "Conversation replication is owned by Amphora." }))),
         // Restoring the server's conversation store from a mirror's copy (admins: unlisted in authz).
         (&Method::GET, ["api", "conversations", "restore"]) => Ok(srv::json(StatusCode::OK, &hub.harness.restore_view())),
         (&Method::POST, ["api", "conversations", "restore"]) => boxed(|| conversation_restore(&hub, req)).await,
@@ -1287,7 +1126,7 @@ async fn page(hub: &Arc<Hub>, id: &str, req: &Request) -> R {
     let missing = || err(StatusCode::NOT_FOUND, "no such page or file (its conversation may have closed)");
     let h = hub.clone();
     let id_owned = id.to_owned();
-    let v = crate::rt::blocking(move || h.harness.visuals.get(&id_owned)).await.ok().flatten().ok_or_else(missing)?;
+    let v = crate::rt::blocking(move || h.harness.visuals.get(&id_owned)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("page metadata storage: {e:#}")))?.map_err(|e| err(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")))?.ok_or_else(missing)?;
     let raw = req.uri().path();
     let rest = raw.strip_prefix(&format!("/v/{id}")).unwrap_or("");
     if rest.is_empty() || rest == "/" {
@@ -1381,7 +1220,10 @@ fn unsatisfiable(size: u64) -> Response {
 async fn harness_kept_file(hub: &Arc<Hub>, id: &str, sha: &str, req: &Request) -> R {
     use std::io::{Read as _, Seek as _, SeekFrom};
     let gone = || err(StatusCode::NOT_FOUND, "no such file in this conversation");
-    let kept = hub.harness.keeper.find(id, sha).ok_or_else(gone)?;
+    let (h, session, content) = (hub.clone(), id.to_owned(), sha.to_owned());
+    let kept = crate::rt::blocking(move || h.harness.keeper.find(&session, &content)).await
+        .map_err(|e| err(StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?
+        .map_err(|e| err(StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?.ok_or_else(gone)?;
     let blob = hub.harness.keeper.blob(sha).ok_or_else(gone)?;
     let meta = kept.meta.clone().unwrap_or_default();
     let etag = format!("\"{}\"", sha.to_ascii_lowercase());
@@ -1390,10 +1232,13 @@ async fn harness_kept_file(hub: &Arc<Hub>, id: &str, sha: &str, req: &Request) -
     }
     let Ok(range) = byte_range(req, meta.size) else { return Ok(unsatisfiable(meta.size)) };
     let (start, end) = range.unwrap_or((0, meta.size.saturating_sub(1)));
+    // Open before sending success: an unavailable copy is not an empty successful response.
+    let mut file = crate::rt::blocking(move || std::fs::File::open(&blob)).await
+        .map_err(|e| err(StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?
+        .map_err(|e| if e.kind() == std::io::ErrorKind::NotFound { gone() } else { err(StatusCode::SERVICE_UNAVAILABLE, e.to_string()) })?;
     let (tx, rx) = async_channel::bounded::<Bytes>(4);
     let size = meta.size;
     crate::rt::spawn(async move {
-        let Ok(Ok(mut file)) = crate::rt::blocking(move || std::fs::File::open(&blob)).await else { return };
         let mut at = start;
         while size > 0 && at <= end {
             let want = (end - at + 1).min(256 * 1024);
@@ -1423,7 +1268,11 @@ async fn harness_kept_file(hub: &Arc<Hub>, id: &str, sha: &str, req: &Request) -
 /// files), in pieces as the viewer takes it.
 async fn harness_file(hub: &Arc<Hub>, id: &str, path: Option<String>, req: &Request) -> R {
     let path = path.ok_or_else(|| err(StatusCode::BAD_REQUEST, "which file? (?path=…)"))?;
-    let location = hub.harness.mentioned_where(id, &path).ok_or_else(|| err(StatusCode::NOT_FOUND, "no message of this conversation mentions that file"))?;
+    let (h, session, name) = (hub.clone(), id.to_owned(), path.clone());
+    let location = crate::rt::blocking(move || h.harness.mentioned_where(&session, &name)).await
+        .map_err(|e| err(StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?
+        .map_err(|e| err(StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "no message of this conversation mentions that file"))?;
     serve_from(hub, id, location, path, req).await
 }
 
@@ -1443,7 +1292,7 @@ async fn recording_file(hub: &Arc<Hub>, id: &str, rid: &str, what: &str, req: &R
             let Ok(range) = byte_range(req, meta.size) else { return Ok(unsatisfiable(meta.size)) };
             let (start, end) = range.unwrap_or((0, meta.size.saturating_sub(1)));
             let key = crate::harness::streams::recording_key(id, rid, what);
-            let body = if meta.size == 0 { async_channel::bounded(1).1 } else { crate::blobs::io::read_stream(Arc::clone(&hub.blobs.blobs), key, None, start, end) };
+            let body = if meta.size == 0 { async_channel::bounded(1).1 } else { crate::blobs::io::read_stream(Arc::clone(&hub.blobs.blobs), key, None, meta.size, start, end) };
             file_response(meta, &path, &etag, false, range, srv::channel_body(body))
         }
         None => serve_from(hub, id, crate::harness::registry::Location::Machine(rec.machine.clone()), path.clone(), req).await?,
@@ -1515,8 +1364,14 @@ fn front_door(a: crate::frontdoor::control::Answer) -> R {
 
 /// The AI coding sessions running on every connected machine, most recently active first.
 fn ai_sessions(hub: &Hub, caller: &crate::authz::Caller) -> Response {
-    // Conversations kiln already runs as agent sessions (taken over, or resumed by hand there too).
-    let managed: HashMap<String, String> = hub.harness.list().into_iter().filter_map(|i| Some((i.harness_session?, i.id))).collect();
+    // U13: provider conversation ids are local to a harness on one machine. Only canonical
+    // runner targets and known kinds establish this projection; local/unknown scope stays visible.
+    let managed: HashMap<(String, &'static str, String), String> = hub.harness.list().into_iter().filter_map(|i| {
+        let machine = i.target.strip_prefix("agent:").filter(|m| !m.trim().is_empty())?;
+        let kind = crate::harness::kinds::Kind::get(&i.kind)?;
+        let session = i.harness_session.filter(|id| !id.trim().is_empty())?;
+        Some(((machine.to_owned(), kind.id, session), i.id))
+    }).collect();
     let mut out: Vec<serde_json::Value> = Vec::new();
     for (machine, sessions) in hub.ai_sessions.lock().iter() {
         // Only the machines whose terminal the caller may use (docs/agents.md, "Whose agents").
@@ -1534,7 +1389,10 @@ fn ai_sessions(hub: &Hub, caller: &crate::authz::Caller) -> Response {
                 }
                 o.insert("takeover".into(), json!(takeover_on(hub, machine, s.takeover(held))));
                 o.insert("fork".into(), json!(s.forkable() && forks_on(hub, machine)));
-                if let Some(agent) = managed.get(&s.id).filter(|_| !s.id.is_empty()) {
+                if !s.id.trim().is_empty()
+                    && let Some(kind) = crate::harness::kinds::Kind::get(&s.tool)
+                    && let Some(agent) = managed.get(&(machine.clone(), kind.id, s.id.clone()))
+                {
                     o.insert("managed_by".into(), json!(agent));
                 }
             }
@@ -1760,53 +1618,9 @@ fn sync_machine(req: &Request) -> String {
     srv::query(req).get("machine").cloned().unwrap_or_default()
 }
 
-/// Copies of kiln.db for learners are made one at a time (each reads the whole database).
-static CLUSTER_COPIES: async_lock::Semaphore = async_lock::Semaphore::new(1);
-
-/// A copy of kiln.db for a runner's learner, made now and streamed: for the runner's token for its
-/// machine (`?machine=`), or the admin token. The copy goes once sent.
-async fn cluster_copy(hub: &Hub, req: &Request) -> R {
-    let machine = srv::query(req).get("machine").cloned().unwrap_or_default();
-    let theirs = !machine.is_empty() && bearer(req.headers()).is_some_and(|t| crate::util::ct_eq(t.as_bytes(), crate::store::learner::token(&hub.admin_token, &machine).as_bytes()));
-    if !theirs && !authed(hub, req.headers()) {
-        return Err(err(StatusCode::UNAUTHORIZED, "bad cluster token"));
-    }
-    let dir = hub.cfg.data("cluster").join("copies");
-    let _one = CLUSTER_COPIES.acquire().await;
-    // Copies a stop left behind.
-    if let Ok(old) = std::fs::read_dir(&dir) {
-        for e in old.flatten() {
-            std::fs::remove_file(e.path()).ok();
-        }
-    }
-    std::fs::create_dir_all(&dir).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("making {}: {e}", dir.display())))?;
-    let path = dir.join(format!("{}.db", crate::util::new_id()));
-    let started = Instant::now();
-    if let Err(e) = hub.store.copy_for_learner(path.clone()).await {
-        std::fs::remove_file(&path).ok();
-        return Err(err(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")));
-    }
-    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-    tracing::info!(machine, bytes = size, took_ms = started.elapsed().as_millis() as u64, "a copy of kiln.db for a runner's learner");
-    let (tx, rx) = async_channel::bounded::<Bytes>(16);
-    crate::rt::spawn(async move {
-        let p = path.clone();
-        let _ = crate::rt::blocking(move || -> std::io::Result<()> {
-            use std::io::Read as _;
-            let mut f = std::fs::File::open(&p)?;
-            let mut buf = vec![0u8; 256 << 10];
-            loop {
-                let n = f.read(&mut buf)?;
-                if n == 0 || tx.send_blocking(Bytes::copy_from_slice(buf.get(..n).unwrap_or_default())).is_err() {
-                    return Ok(());
-                }
-            }
-        })
-        .await;
-        std::fs::remove_file(&path).ok();
-    });
-    let r = srv::response(StatusCode::OK, "application/octet-stream", srv::channel_body(rx));
-    Ok(srv::with_header(r, header::CONTENT_LENGTH, &size.to_string()))
+/// U15: old snapshot copies are not Amphora snapshots and cannot bootstrap a product replica.
+async fn cluster_copy(_hub: &Hub, _req: &Request) -> R {
+    Err(err(StatusCode::GONE, "Kiln learner copies are retired; use Amphora replication and recovery"))
 }
 
 /// One of the contents synced repos name (`HEAD`: whether the server has it).
@@ -1895,7 +1709,7 @@ async fn presigned(hub: &Arc<Hub>, encoded: &str, req: Request) -> R {
     let Ok(range) = byte_range(&req, meta.size) else { return Ok(unsatisfiable(meta.size)) };
     let (start, end) = range.unwrap_or((0, meta.size.saturating_sub(1)));
     let length = if meta.size == 0 { 0 } else { end.saturating_sub(start).saturating_add(1) };
-    let body = if req.method() == Method::HEAD || meta.size == 0 { async_channel::bounded(1).1 } else { crate::blobs::io::read_stream(blobs, key, Some(meta.etag.clone()), start, end) };
+    let body = if req.method() == Method::HEAD || meta.size == 0 { async_channel::bounded(1).1 } else { crate::blobs::io::read_stream(blobs, key, Some(meta.etag.clone()), meta.size, start, end) };
     let mut r = srv::response(if range.is_some() { StatusCode::PARTIAL_CONTENT } else { StatusCode::OK }, "application/octet-stream", srv::channel_body(body));
     r = srv::with_header(r, header::CONTENT_LENGTH, &length.to_string());
     r = srv::with_header(r, header::ACCEPT_RANGES, "bytes");
@@ -2021,6 +1835,12 @@ async fn known_machine(hub: &Hub, machine: &str) -> Result<(), ApiError> {
     }
 }
 
+// U19: standby/failed controllers are retryable; validation remains a conflict.
+fn sync_failure(error: crate::sync::server::AskError) -> ApiError {
+    let code = match &error { crate::sync::server::AskError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE, crate::sync::server::AskError::Refused(_) => StatusCode::CONFLICT };
+    err(code, error)
+}
+
 async fn sync_create(hub: &Hub, req: Request) -> R {
     let a: SyncCreateAsk = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     for c in &a.copies {
@@ -2028,7 +1848,7 @@ async fn sync_create(hub: &Hub, req: Request) -> R {
     }
     let what = format!("{} ({} copies)", a.name, a.copies.len());
     let ask = crate::sync::server::Ask::Create { name: a.name, copies: a.copies.into_iter().map(|c| (c.machine, c.path)).collect(), exclude: a.exclude, mode: a.mode, transient: None };
-    let id = hub.sync.ask(ask).await.map_err(|e| err(StatusCode::CONFLICT, e))?;
+    let id = hub.sync.ask(ask).await.map_err(sync_failure)?;
     hub.store.audit("admin".into(), "sync.create".into(), what).await;
     Ok(srv::json(StatusCode::CREATED, &serde_json::json!({ "id": id })))
 }
@@ -2037,7 +1857,7 @@ async fn sync_add_copy(hub: &Hub, id: &str, req: Request) -> R {
     let a: SyncCopyAsk = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     known_machine(hub, &a.machine).await?;
     let what = format!("{id}: {}:{}", a.machine, a.path);
-    let member = hub.sync.ask(crate::sync::server::Ask::AddCopy { repo: id.to_owned(), machine: a.machine, path: a.path, adopt: false }).await.map_err(|e| err(StatusCode::CONFLICT, e))?;
+    let member = hub.sync.ask(crate::sync::server::Ask::AddCopy { repo: id.to_owned(), machine: a.machine, path: a.path, adopt: false }).await.map_err(sync_failure)?;
     hub.store.audit("admin".into(), "sync.copy.add".into(), what).await;
     Ok(srv::json(StatusCode::CREATED, &serde_json::json!({ "member": member.parse::<u64>().unwrap_or(0) })))
 }
@@ -2051,13 +1871,13 @@ struct SyncResolveAsk {
 async fn sync_resolve(hub: &Hub, id: &str, req: Request) -> R {
     let a: SyncResolveAsk = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let what = format!("{id}: {} ({:?})", a.path, a.keep);
-    hub.sync.ask(crate::sync::server::Ask::Resolve { repo: id.to_owned(), path: a.path, keep: a.keep }).await.map_err(|e| err(StatusCode::CONFLICT, e))?;
+    hub.sync.ask(crate::sync::server::Ask::Resolve { repo: id.to_owned(), path: a.path, keep: a.keep }).await.map_err(sync_failure)?;
     hub.store.audit("admin".into(), "sync.resolve".into(), what).await;
     Ok(srv::status(StatusCode::NO_CONTENT))
 }
 
 async fn sync_ask(hub: &Hub, action: &str, id: &str, ask: crate::sync::server::Ask) -> R {
-    hub.sync.ask(ask).await.map_err(|e| err(StatusCode::CONFLICT, e))?;
+    hub.sync.ask(ask).await.map_err(sync_failure)?;
     hub.store.audit("admin".into(), action.to_owned(), id.to_owned()).await;
     Ok(srv::status(StatusCode::NO_CONTENT))
 }
@@ -2076,6 +1896,7 @@ fn bundle_machine(hub: &Hub, req: &Request) -> Option<String> {
 
 /// A batch's bundle, for a machine it goes to.
 fn sync_bundle_get(hub: &Hub, batch: &str, req: &Request) -> R {
+    if !hub.tasks.available() { return Err(err(StatusCode::SERVICE_UNAVAILABLE, "task controller is standby")); }
     let machine = bundle_machine(hub, req).ok_or_else(|| err(StatusCode::UNAUTHORIZED, "bad sync token"))?;
     let (file, _, _) = hub.tasks.may_fetch(batch, &machine).ok_or_else(|| err(StatusCode::NOT_FOUND, "no such bundle for that machine"))?;
     let body = crate::rt::file_source(file).map_err(|_| err(StatusCode::NOT_FOUND, "no such bundle"))?;
@@ -2086,6 +1907,7 @@ fn sync_bundle_get(hub: &Hub, batch: &str, req: &Request) -> R {
 /// the server's disk has less than [`SYNC_DISK_FLOOR`] free.
 async fn sync_bundle_put(hub: &Hub, batch: &str, req: Request) -> R {
     use sha2::Digest as _;
+    if !hub.tasks.available() { return Err(err(StatusCode::SERVICE_UNAVAILABLE, "task controller is standby")); }
     let machine = bundle_machine(hub, &req).ok_or_else(|| err(StatusCode::UNAUTHORIZED, "bad sync token"))?;
     if !hub.tasks.may_send(batch, &machine) {
         return Err(err(StatusCode::CONFLICT, format!("no bundle is wanted from {machine} for that")));
@@ -2118,6 +1940,7 @@ async fn sync_bundle_put(hub: &Hub, batch: &str, req: Request) -> R {
     };
     std::fs::rename(&tmp, &file).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let hash = hex::encode(h.finalize());
+    if !hub.tasks.available() { return Err(err(StatusCode::SERVICE_UNAVAILABLE, "task controller became unavailable")); }
     hub.tasks.sent(batch, hash.clone(), size);
     Ok(srv::json(StatusCode::CREATED, &json!({ "hash": hash, "size": size })))
 }
@@ -2156,34 +1979,6 @@ fn plan_err(e: crate::plans::Error) -> ApiError {
         crate::plans::Error::Refused(c, m) => err(c, m),
         crate::plans::Error::Other(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     }
-}
-
-async fn plans_list(hub: &Hub, q: &HashMap<String, String>) -> R {
-    let plans = crate::plans::list(hub, q.get("q").cloned(), q.get("tag").cloned()).await.map_err(plan_err)?;
-    // An agent's (`session`), and the plan each agent proposed (`proposed`), when asked.
-    let proposed = q.get("proposed").is_some_and(|p| p == "1" || p == "true");
-    let plans = crate::plans::of_source(plans, q.get("session").map(String::as_str).filter(|s| !s.is_empty()), proposed);
-    Ok(srv::json(StatusCode::OK, &plans))
-}
-
-async fn plans_create(hub: &Hub, req: Request) -> R {
-    let n: crate::plans::New = srv::body_json(req.into_body(), 512 * 1024).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    let p = crate::plans::create(hub, n, "admin").await.map_err(plan_err)?;
-    hub.store.audit("admin".into(), "plan.create".into(), p.title.clone()).await;
-    Ok(srv::json(StatusCode::CREATED, &p))
-}
-
-async fn plans_update(hub: &Hub, id: &str, req: Request) -> R {
-    let patch: crate::plans::Patch = srv::body_json(req.into_body(), 512 * 1024).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    let p = crate::plans::update(hub, id, patch, "admin").await.map_err(plan_err)?;
-    hub.store.audit("admin".into(), "plan.update".into(), format!("{} (v{})", p.title, p.version)).await;
-    Ok(srv::json(StatusCode::OK, &p))
-}
-
-async fn plans_delete(hub: &Hub, id: &str) -> R {
-    crate::plans::delete(hub, id).await.map_err(plan_err)?;
-    hub.store.audit("admin".into(), "plan.delete".into(), id.to_owned()).await;
-    Ok(srv::status(StatusCode::NO_CONTENT))
 }
 
 #[derive(Deserialize)]
@@ -2247,7 +2042,7 @@ async fn ai_view(hub: &Hub, machine: &str, pid: &str) -> R {
     let pid: u32 = pid.parse().map_err(|_| err(StatusCode::BAD_REQUEST, "bad pid"))?;
     match hub.ai_view(machine, pid).await {
         Ok(Some(view)) => Ok(srv::json(StatusCode::OK, &view)),
-        Ok(None) => Err(err(StatusCode::NOT_FOUND, "no view for that session (not Claude Code, or no transcript)")),
+        Ok(None) => Err(err(StatusCode::NOT_FOUND, "no view for that session (no supported transcript available)")),
         Err(e) => Err(err(StatusCode::BAD_GATEWAY, format!("{e:#}"))),
     }
 }
@@ -2539,10 +2334,6 @@ async fn system(hub: &Hub) -> Response {
     srv::json(StatusCode::OK, &v)
 }
 
-async fn audit(hub: &Hub, q: &HashMap<String, String>) -> R {
-    Ok(srv::json(StatusCode::OK, &crate::audit::list(&hub.store, q).await?))
-}
-
 fn history(hub: &Hub, q: &HashMap<String, String>) -> Response {
     let h = hub.history.lock();
     let mut out = serde_json::Map::new();
@@ -2689,7 +2480,14 @@ async fn run(hub: &Hub, id: &str, q: &HashMap<String, String>) -> R {
 }
 
 async fn cancel(hub: &Hub, id: &str) -> R {
-    hub.cancel_run(id, "cancelled by user").await?;
+    hub.cancel_run(id, "cancelled by user").await.map_err(|error| {
+        let status = match error {
+            crate::ci::dispatch::CancelError::AttemptChanged => StatusCode::CONFLICT,
+            crate::ci::dispatch::CancelError::Invalid(_) => StatusCode::BAD_REQUEST,
+            _ => StatusCode::SERVICE_UNAVAILABLE,
+        };
+        err(status, error.to_string())
+    })?;
     hub.store.audit("admin".into(), "run.cancel".into(), id.to_owned()).await;
     Ok(srv::status(StatusCode::NO_CONTENT))
 }
@@ -2706,11 +2504,11 @@ fn yes() -> bool {
 
 async fn retry(hub: &Hub, id: &str, req: Request) -> R {
     let only_failed = srv::body_json::<RetryReq>(req.into_body(), JSON_LIMIT).await.map(|r| r.only_failed).unwrap_or(true);
-    let n = hub.store.retry_run(id.to_owned(), only_failed).await?;
+    let attempt = crate::ci::retry::run(hub, id, only_failed, "admin").await.map_err(|(code, why)| err(code, &why))?;
+    let jobs = hub.store.jobs(id.to_owned(), false).await?.into_iter().filter(|j| !j.status.is_terminal()).count();
     hub.emit_run(id).await;
-    hub.wake.notify();
     hub.store.audit("admin".into(), "run.retry".into(), id.to_owned()).await;
-    Ok(srv::json(StatusCode::OK, &json!({ "jobs": n })))
+    Ok(srv::json(StatusCode::OK, &json!({ "jobs": jobs, "attempt": attempt })))
 }
 
 async fn job(hub: &Hub, id: &str) -> R {
@@ -2785,12 +2583,12 @@ async fn stream_logs(hub: Arc<Hub>, job: String, step: u32, socket: ws::WebSocke
                 Ok(LogEvent::Step { idx, status }) => {
                     tx.send(ws::text(LogDown::Step { idx, status: status.to_owned() }.text())).await?;
                 }
-                Ok(LogEvent::End) | Err(async_broadcast::RecvError::Closed) => {
+                Ok(LogEvent::End) | Err(crate::bus::RecvError::Closed | crate::bus::RecvError::Unavailable(_)) => {
                     tx.send(ws::text(LogDown::End.text())).await?;
                     tx.close(None).await.ok();
                     return Ok(());
                 }
-                Err(async_broadcast::RecvError::Overflowed(n)) => {
+                Err(crate::bus::RecvError::Overflowed(n)) => {
                     let note = format!("\r\n\x1b[33m[kiln] viewer fell behind; {n} chunks skipped (reload for the full log)\x1b[0m\r\n");
                     tx.send(ws::binary(note.into_bytes())).await?;
                 }
@@ -3163,7 +2961,9 @@ async fn enroll(hub: &Hub, req: Request) -> R {
     let persistent = crate::util::ct_eq(r.token.as_bytes(), hub.join_token.as_bytes());
     // A `k8s` pool's executor pod (docs/ci.md W13-R07): its runner is the pod's name and that
     // executor's, whatever it asks to be.
-    let pod = if persistent { None } else { hub.executor_tokens.lock().remove(&r.token).filter(|(_, _, exp)| *exp > std::time::Instant::now()) };
+    let pod = if persistent { None } else {
+        hub.enroll_executor(&r.token, &r.csr).await.map_err(|error| err(StatusCode::SERVICE_UNAVAILABLE, format!("executor enrollment: {error:#}")))?
+    };
     let ephemeral = pod.is_some() || (!persistent && hub.ephemeral_tokens.lock().remove(&r.token).is_some());
     let outpost = !persistent && !ephemeral && hub.outpost_invites.take(&r.token);
     if !persistent && !ephemeral && !outpost {
@@ -3171,10 +2971,7 @@ async fn enroll(hub: &Hub, req: Request) -> R {
         return Err(err(StatusCode::UNAUTHORIZED, "invalid join token"));
     }
     let name = match &pod {
-        Some((executor, pod_name, _)) => {
-            hub.pod_executors.lock().insert(pod_name.clone(), executor.clone());
-            pod_name.clone()
-        }
+        Some((identity, _)) => identity.name.clone(),
         None => crate::pki::sanitize_name(&r.name),
     };
     // An outpost never takes another machine's name: the same machine enrolling again keeps its
@@ -3187,7 +2984,13 @@ async fn enroll(hub: &Hub, req: Request) -> R {
     } else {
         365
     };
-    let cert = hub.pki.sign_csr(&r.csr, &name, days).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let (cert, executor_bootstrap) = match pod {
+        Some((identity, certificate)) => {
+            let certificate_sha256 = crate::pki::cert_info(&certificate).map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")))?.sha256;
+            (certificate, Some(crate::agent::ExecutorBootstrap { identity, certificate_sha256 }))
+        }
+        None => (hub.pki.sign_csr(&r.csr, &name, days).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?, None),
+    };
     crate::identities::record(&hub.store, "machine", &name, &cert).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     // Who enrolled it (W27-R01): the owner, whose join token or invite it brought; kiln for its
     // own pods.
@@ -3206,7 +3009,7 @@ async fn enroll(hub: &Hub, req: Request) -> R {
         hub.store.audit(name.clone(), what.into(), String::new()).await;
         tracing::info!(agent = %name, outpost, "agent enrolled");
     }
-    Ok(srv::json(StatusCode::OK, &EnrollResponse { cert_pem: cert, ca_pem: hub.pki.ca_pem.clone(), quic, name }))
+    Ok(srv::json(StatusCode::OK, &EnrollResponse { cert_pem: cert, ca_pem: hub.pki.ca_pem.clone(), quic, name, executor_bootstrap }))
 }
 
 /// `GET /api/reach/runners?want=linux/amd64`: reach's directory, ranked for `want` (every runner
@@ -3245,7 +3048,7 @@ async fn enroll_instance(hub: &Hub, req: Request) -> R {
     tracing::info!(agent = %name, "issued a certificate for a second runner process");
     Ok(srv::json(
         StatusCode::OK,
-        &crate::agent::EnrollResponse { cert_pem: cert, ca_pem: hub.pki.ca_pem.clone(), quic: hub.cfg.server.quic_advertise.clone(), name },
+        &crate::agent::EnrollResponse { cert_pem: cert, ca_pem: hub.pki.ca_pem.clone(), quic: hub.cfg.server.quic_advertise.clone(), name, executor_bootstrap: None },
     ))
 }
 
@@ -3684,7 +3487,7 @@ async fn download_build(hub: &Hub, target: &str, build: &str) -> R {
     if b.origin == "server" {
         return download_binary().await;
     }
-    let (kept, body) = crate::updates::stream(hub, target).filter(|(m, _)| m.build == build).ok_or_else(|| err(StatusCode::NOT_FOUND, format!("kiln has no build {build} for {target}")))?;
+    let (kept, body) = crate::updates::stream_build(hub, target, build).ok_or_else(|| err(StatusCode::NOT_FOUND, format!("kiln has no build {build} for {target}")))?;
     let r = srv::response(StatusCode::OK, "application/octet-stream", srv::channel_body(body));
     Ok(srv::with_header(r, header::CONTENT_LENGTH, &kept.size.to_string()))
 }
@@ -3830,13 +3633,40 @@ async fn build_every_platform(hub: &Hub) -> R {
 /// `POST /api/updates/runners/{name}`: upgrade that machine's runner (nothing it runs stops).
 #[derive(Deserialize, Default)]
 struct RunnerUpgrade {
-    /// "download" or "build"; by default whichever kiln can.
+    /// Historical choices both consume canonical CI artifacts (U16).
     #[serde(default)]
     way: Option<crate::updates::Way>,
+    /// Retry the failed lifecycle job with its original commit and pinned artifact.
+    #[serde(default)]
+    retry: Option<String>,
+    /// Deploy the retained artifact of this runner's successful CD release.
+    #[serde(default)]
+    rollback: Option<i64>,
 }
 
-/// `POST /api/updates/runners/{name}`, optionally `{"way": "download" | "build"}`: upgrade that
-/// machine's runner to the newest kiln now, that way (a retry too).
+impl RunnerUpgrade {
+    async fn start(self, hub: &Arc<Hub>, name: &str) -> R {
+        // U16: an explicit selector cannot be silently replaced by another action.
+        if usize::from(self.way.is_some()) + usize::from(self.retry.is_some()) + usize::from(self.rollback.is_some()) > 1 {
+            return Err(err(StatusCode::BAD_REQUEST, "choose only one of way, retry or rollback"));
+        }
+        if self.retry.as_deref().is_some_and(|id| id.trim().is_empty()) || self.rollback.is_some_and(|id| id <= 0) {
+            return Err(err(StatusCode::BAD_REQUEST, "retry needs a job id; rollback needs a positive CD release id"));
+        }
+        let result = match (self.retry, self.rollback) {
+            (Some(job), None) => crate::updates::coordinator::retry(hub, name, &job, "admin").await,
+            (None, Some(release)) => crate::updates::coordinator::rollback(hub, name, release, "admin").await,
+            _ => crate::updates::upgrade_runner(hub, name, self.way).await,
+        };
+        match result {
+            Ok(job) => Ok(srv::json(StatusCode::ACCEPTED, &job)),
+            Err(e) => Err(err(StatusCode::CONFLICT, format!("{e:#}"))),
+        }
+    }
+}
+
+/// U16: `POST /api/updates/runners/{name}` accepts a historical `way`, a failed job's `retry`
+/// id, or a successful CD release's `rollback` id. All enter the same persisted coordinator.
 async fn upgrade_runner(hub: &Arc<Hub>, name: &str, req: Request) -> R {
     let bytes = srv::body_bytes(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let b: RunnerUpgrade = if bytes.iter().all(u8::is_ascii_whitespace) {
@@ -3844,10 +3674,7 @@ async fn upgrade_runner(hub: &Arc<Hub>, name: &str, req: Request) -> R {
     } else {
         serde_json::from_slice(&bytes).map_err(|e| err(StatusCode::BAD_REQUEST, format!("the body isn't an upgrade: {e}")))?
     };
-    match crate::updates::upgrade_runner(hub, name, b.way).await {
-        Ok(job) => Ok(srv::json(StatusCode::ACCEPTED, &job)),
-        Err(e) => Err(err(StatusCode::CONFLICT, format!("{e:#}"))),
-    }
+    b.start(hub, name).await
 }
 
 /// `PUT` (the body's rules) or `DELETE` (none: the scope above's apply) the rules for the copies of
@@ -3870,7 +3697,7 @@ async fn keep_rules(hub: &Arc<Hub>, caller: &crate::authz::Caller, whose: crate:
 /// `POST /api/reach/keep/now`, `POST /api/reach/keep/runners/{name}/now`: that runner (or every
 /// one) lets go now of what its rules don't keep, within 20 seconds.
 async fn keep_now(hub: &Arc<Hub>, caller: &crate::authz::Caller, runner: Option<&str>) -> R {
-    let asked = hub.copies.ask(hub, runner);
+    let asked = hub.copies.ask(hub, runner).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     if asked.is_empty() {
         return Err(err(StatusCode::NOT_FOUND, runner.map_or_else(|| "no runner to ask".to_owned(), |r| format!("no runner {r}"))));
     }
@@ -4167,6 +3994,9 @@ async fn pump_events(hub: &Hub, socket: ws::WebSocket, sock: &ui::Socket, mut na
     use futures::FutureExt as _;
     let (mut tx, mut rx_ws) = socket.split();
     let mut rx = hub.events.subscribe();
+    // U13/U14: a snapshot may predate this first subscription. Subscribe before telling
+    // clients to refresh, so changes during that refresh remain queued on Quiver.
+    tx.send(ws::text(crate::wire::events::ServerEvent::Resync.text())).await?;
     hub.emit_queue();
     loop {
         futures::select_biased! {
@@ -4183,10 +4013,10 @@ async fn pump_events(hub: &Hub, socket: ws::WebSocket, sock: &ui::Socket, mut na
                         tx.send(ws::text(text.as_ref())).await?;
                     }
                 }
-                Err(async_broadcast::RecvError::Overflowed(_)) => {
+                Err(crate::bus::RecvError::Overflowed(_)) => {
                     tx.send(ws::text(crate::wire::events::ServerEvent::Resync.text())).await?;
                 }
-                Err(async_broadcast::RecvError::Closed) => return Ok(()),
+                Err(crate::bus::RecvError::Closed | crate::bus::RecvError::Unavailable(_)) => return Ok(()),
             },
             msg = rx_ws.next().fuse() => {
                 if hub.unread_only(sock, &mut tx, ui::came(msg), |r| crate::wire::events::ServerEvent::Refused(r).text()).await? {
@@ -4223,7 +4053,10 @@ struct TerminalName {
 async fn rename_terminal(hub: &Arc<Hub>, id: &str, req: Request) -> R {
     let t: TerminalName = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
     let (h, sid) = (Arc::clone(hub), id.to_owned());
-    if !crate::rt::blocking(move || h.terminals.rename(&sid, &t.name)).await.unwrap_or(false) {
+    let renamed = crate::rt::blocking(move || h.terminals.rename(&sid, &t.name)).await
+        .map_err(|error| err(StatusCode::SERVICE_UNAVAILABLE, format!("terminal name storage: {error:#}")))?
+        .map_err(|error| err(if error.downcast_ref::<crate::termsess::StorageError>().is_some() { StatusCode::SERVICE_UNAVAILABLE } else { StatusCode::INTERNAL_SERVER_ERROR }, format!("{error:#}")))?;
+    if !renamed {
         return Err(err(StatusCode::NOT_FOUND, "no such terminal session"));
     }
     hub.emit_terminals();
@@ -4298,7 +4131,7 @@ async fn leg_terminal_ws(hub: Arc<Hub>, id: &str, q: HashMap<String, String>, ca
     let row: Option<(Option<String>, Option<String>, String, Option<i64>)> = hub
         .store
         .call(move |c| {
-            use rusqlite::OptionalExtension as _;
+            use crate::sql::OptionalExtension as _;
             Ok(c.query_row("SELECT agent, executor, status, kept_until FROM jobs WHERE id = ?1 AND job_id IS NOT NULL", [&leg], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional()?)
         })
         .await?;
@@ -4385,6 +4218,7 @@ async fn terminal_attach(hub: Arc<Hub>, existing: Option<String>, target: String
     let result: anyhow::Result<()> = async {
         // Read after subscribing: a resize from here on also arrives as a live size frame.
         tx.send(ws::text(TerminalDown::Session { session: session.info() }.text())).await?;
+        tx.send(ws::text(TerminalDown::Size { cols: attachment.cols, rows: attachment.rows }.text())).await?;
         if !attachment.replay.is_empty() {
             tx.send(ws::binary(attachment.replay)).await?;
         }
@@ -4413,13 +4247,25 @@ async fn terminal_attach(hub: Arc<Hub>, existing: Option<String>, target: String
                         tx.send(ws::text(msg.text())).await.ok();
                         return Ok(());
                     }
-                    Err(async_broadcast::RecvError::Overflowed(_)) => {
-                        // This viewer fell behind; repaint it from the session's state.
+                    Err(crate::bus::RecvError::Overflowed(_)) => {
+                        // U14: the snapshot and replacement cursor share one boundary. Reset
+                        // the viewer before replay so its earlier output is not appended twice.
                         let a = session.attach();
                         session.detach();
+                        live = a.live;
+                        tx.send(ws::text(TerminalDown::Size { cols: a.cols, rows: a.rows }.text())).await?;
+                        tx.send(ws::binary(b"\x1bc".as_slice())).await?;
                         tx.send(ws::binary(a.replay)).await?;
+                        if let Some((code, error)) = a.ended {
+                            let msg = match error {
+                                Some(message) => TerminalDown::Error { message },
+                                None => TerminalDown::Exit { code },
+                            };
+                            tx.send(ws::text(msg.text())).await.ok();
+                            return Ok(());
+                        }
                     }
-                    Err(async_broadcast::RecvError::Closed) => return Ok(()),
+                    Err(crate::bus::RecvError::Closed | crate::bus::RecvError::Unavailable(_)) => return Ok(()),
                 },
                 m = rx.next().fuse() => match ui::came(m) {
                     // Keystrokes.
@@ -4579,59 +4425,6 @@ fn conversation_log(hub: &Hub, q: &HashMap<String, String>) -> R {
     Ok(srv::json(StatusCode::OK, &json!({ "at": crate::util::now_ms(), "total": total, "matched": matched, "lines": board.log(since, words, limit) })))
 }
 
-fn goals_err(e: crate::goals::Error) -> ApiError {
-    match e {
-        crate::goals::Error::Bad(m) => err(StatusCode::BAD_REQUEST, m),
-        crate::goals::Error::NoAgent => err(StatusCode::NOT_FOUND, "no such agent"),
-        crate::goals::Error::Other(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
-    }
-}
-
-#[derive(Deserialize)]
-struct GoalsSet {
-    goals: Vec<crate::goals::Given>,
-}
-
-/// Whether `caller` may change agent `id`'s goals: a person those of the agents they act on, an
-/// agent its own and those of the agents it started (`crate::harness::lineage::may_steer`).
-async fn may_steer_goals(hub: &Hub, caller: &crate::authz::Caller, id: &str) -> Result<(), ApiError> {
-    crate::harness::lineage::may_steer(hub, caller, id).await.map_err(|(c, m)| err(c, m))
-}
-
-/// An agent's goals not yet started, as they should be (`crate::goals::set`).
-async fn goals_set(hub: &Hub, caller: &crate::authz::Caller, id: &str, req: Request) -> R {
-    may_steer_goals(hub, caller, id).await?;
-    let b: GoalsSet = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    let s = crate::goals::set(hub, id, b.goals).await.map_err(goals_err)?;
-    hub.store.audit(caller.name.clone(), "goals.set".into(), id.to_owned()).await;
-    Ok(srv::json(StatusCode::OK, &s))
-}
-
-/// Goals lined up after the agent's others (`crate::goals::add_at`): `{goals, start?, parallel?, key?}`,
-/// each goal its words or `{text, needs}` (`crate::goals::ops::goals_of`). Its idempotency key
-/// (CP-T3.2; `key`, or its `Idempotency-Key` header): asked again under it, the goals it added are
-/// found, never added twice.
-async fn goals_add(hub: &Hub, caller: &crate::authz::Caller, id: &str, req: Request) -> R {
-    may_steer_goals(hub, caller, id).await?;
-    let header = idempotency_key(&req);
-    let b: serde_json::Value = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    let by = crate::goals::By::of(hub, caller, id);
-    let goals = crate::goals::ops::goals_of(&b, &by.name()).map_err(|m| err(StatusCode::BAD_REQUEST, m))?;
-    let start = b.get("start").and_then(serde_json::Value::as_bool).unwrap_or(false);
-    let key = match b.get("key") {
-        None | Some(serde_json::Value::Null) => header,
-        Some(serde_json::Value::String(k)) => Some(k.trim().to_owned()).filter(|k| !k.is_empty()).or(header),
-        Some(_) => return Err(err(StatusCode::BAD_REQUEST, "`key` is a string")),
-    };
-    if key.as_ref().is_some_and(|k| k.len() > crate::harness::ops::KEY_MAX || k.chars().any(char::is_control)) {
-        return Err(err(StatusCode::BAD_REQUEST, format!("a key is 1 to {} bytes with no control characters", crate::harness::ops::KEY_MAX)));
-    }
-    let goals = crate::goals::keyed(&crate::harness::ops::key_scope(caller), id, key.as_deref(), goals);
-    let s = crate::goals::add_at(hub, id, goals, start, &crate::goals::At::End).await.map_err(goals_err)?;
-    hub.store.audit(caller.name.clone(), "goals.add".into(), id.to_owned()).await;
-    Ok(srv::json(StatusCode::OK, &s))
-}
-
 /// A terminal beside an agent: a shell in its folder, or its harness's own screen
 /// (`crate::harness::screen`).
 async fn harness_terminal(hub: &Arc<Hub>, id: &str, req: Request) -> R {
@@ -4644,40 +4437,6 @@ async fn harness_terminal(hub: &Arc<Hub>, id: &str, req: Request) -> R {
     }
     let b = crate::harness::screen::open(hub, id, o).await.map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
     Ok(srv::json(StatusCode::CREATED, &b))
-}
-
-/// One of a program's changes (`programs.set`, `programs.assign`): the request's JSON
-/// object with `base` (the program, and the track) on it.
-async fn programs_op(hub: &Arc<Hub>, caller: &crate::authz::Caller, name: &str, base: serde_json::Value, req: Request) -> R {
-    let mut b: serde_json::Value = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    let (Some(o), Some(base)) = (b.as_object_mut(), base.as_object()) else { return Err(err(StatusCode::BAD_REQUEST, "the request is a JSON object")) };
-    o.extend(base.clone());
-    own_op(hub, caller, name, b).await
-}
-
-/// One of kiln's own operations (agents, plans, goal stacks) as its HTTP route, which the route
-/// table let through (and the audit trail records): `crate::ops::own`.
-async fn own_op(hub: &Arc<Hub>, caller: &crate::authz::Caller, name: &str, input: serde_json::Value) -> R {
-    let cx = crate::ops::Cx { hub: Arc::clone(hub), caller: caller.clone() };
-    crate::ops::run_own(cx, name, input).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(c, m)| err(c, m))
-}
-
-/// A query as an operation's input: each parameter a string.
-fn query_value(q: &HashMap<String, String>) -> serde_json::Value {
-    serde_json::Value::Object(q.iter().map(|(k, v)| (k.clone(), json!(v))).collect())
-}
-
-/// A request's JSON body as an operation's input (none: `{}`).
-async fn body_value(req: Request) -> Result<serde_json::Value, ApiError> {
-    let bytes = srv::body_bytes(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    if bytes.iter().all(u8::is_ascii_whitespace) {
-        return Ok(json!({}));
-    }
-    match serde_json::from_slice::<serde_json::Value>(&bytes) {
-        Ok(v) if v.is_object() => Ok(v),
-        Ok(_) => Err(err(StatusCode::BAD_REQUEST, "the body is a JSON object")),
-        Err(e) => Err(err(StatusCode::BAD_REQUEST, format!("the body isn't JSON: {e}"))),
-    }
 }
 
 #[derive(Deserialize)]
@@ -5059,7 +4818,7 @@ async fn preview_look(hub: &Arc<Hub>, id: &str, op: &str, personal_refused: Opti
 /// (its machine's Firefox; viewers' own browsers at their widths).
 async fn page_heights(hub: &Arc<Hub>, session: &str, page: &str) -> R {
     let (h, id) = (hub.clone(), page.to_owned());
-    let v = crate::rt::blocking(move || h.harness.visuals.get(&id)).await.ok().flatten().filter(|v| v.session == session).ok_or_else(|| err(StatusCode::NOT_FOUND, "no such page"))?;
+    let v = crate::rt::blocking(move || h.harness.visuals.get(&id)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("page metadata storage: {e:#}")))?.map_err(|e| err(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")))?.filter(|v| v.session == session).ok_or_else(|| err(StatusCode::NOT_FOUND, "no such page"))?;
     Ok(srv::json(StatusCode::OK, &serde_json::json!({"heights": v.heights, "engines": v.engines})))
 }
 
@@ -5074,7 +4833,7 @@ async fn page_seen(hub: &Arc<Hub>, session: &str, page: &str, req: Request) -> R
     crate::rt::blocking(move || h.harness.visuals.seen(&id, &s, &engine, width, height))
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
-        .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+        .map_err(|e| err(if e.downcast_ref::<crate::harness::visuals::StorageError>().is_some() { StatusCode::SERVICE_UNAVAILABLE } else { StatusCode::BAD_REQUEST }, format!("{e:#}")))?;
     Ok(srv::status(StatusCode::NO_CONTENT))
 }
 
@@ -5426,7 +5185,16 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
     // What it can't read of what its person sends, and what they can't read of what it sends,
     // shows on the agent's page.
     let sock = ui::Socket::of(Wire::SessionUp, Wire::SessionDown, &who, Some(Page::Session(id.clone())));
-    let Some(att) = hub.harness.attach_from(&id, takes.after) else {
+    let (h, session) = (hub.clone(), id.clone());
+    let attached = crate::rt::blocking(move || h.harness.attach_from(&session, takes.after)).await;
+    let attached = match attached {
+        Ok(Ok(attached)) => attached,
+        Ok(Err(error)) | Err(error) => {
+            tx.send(ws::text(session_error(format!("{error:#}")))).await?;
+            return Err(error);
+        }
+    };
+    let Some(att) = attached else {
         tx.send(ws::text(SessionDown::from(SessionFrame::Closed).text())).await?;
         return Ok(());
     };
@@ -5600,7 +5368,16 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
         if start_over {
             // What it missed since what it has (it begins with "resumed"), or all of it when the copy
             // can't tell (it begins with "open"); and the feed from where that is.
-            let Some((frames, from, now, rev)) = hub.harness.frames_since(&id, have) else {
+            let (h, session) = (hub.clone(), id.clone());
+            let resumed = crate::rt::blocking(move || h.harness.frames_since(&session, have)).await;
+            let resumed = match resumed {
+                Ok(Ok(resumed)) => resumed,
+                Ok(Err(error)) | Err(error) => {
+                    tx.send(ws::text(session_error(format!("{error:#}")))).await?;
+                    return Err(error);
+                }
+            };
+            let Some((frames, from, now, rev)) = resumed else {
                 tx.send(closed()).await?;
                 return Ok(());
             };
@@ -5681,15 +5458,8 @@ fn server_health(hub: &Hub) -> Response {
             // doesn't roll back to a build older than `min_reader`.
             "schema": { "epoch": crate::store::migrations::SCHEMA_EPOCH, "min_reader": crate::store::migrations::min_reader() },
             "runners": { "connected": connected, "before": before, "back": back(connected, before) },
-            // The cluster group (docs/p2p.md P1, P2): kiln.db's last write, the log's last entry,
-            // the runners holding a replica, and kiln.db's size (what a runner's copy takes).
-            "store": hub.store.group_standing().map_or(json!({ "group": false }), |(seq, applied)| json!({
-                "group": true,
-                "seq": seq,
-                "applied": applied,
-                "learners": hub.store.group().map_or(0, |g| g.point().1.learners.len()),
-                "bytes": hub.store.file_bytes(),
-            })),
+            // U15: report the product's state; transport presence never implies quorum durability.
+            "store": crate::replication::status(&hub.store.database(), hub.cfg.cluster.replica.is_some()),
         }),
     )
 }
@@ -5706,6 +5476,58 @@ fn back(connected: u64, before: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn u16_upgrade_api_rejects_ambiguous_actions_and_dispatches_retry_and_rollback() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            for ask in [json!({"retry":"job", "rollback":1}), json!({"way":"build", "retry":"job"}), json!({"rollback":0}), json!({"retry":" "})] {
+                let b: RunnerUpgrade = serde_json::from_value(ask)?;
+                let Err(e) = b.start(&hub, "fixture").await else { anyhow::bail!("ambiguous upgrade action accepted") };
+                assert_eq!(e.0, StatusCode::BAD_REQUEST);
+            }
+            let b: RunnerUpgrade = serde_json::from_value(json!({"retry":"missing-job"}))?;
+            let Err(e) = b.start(&hub, "fixture").await else { anyhow::bail!("missing retry succeeded") };
+            assert_eq!(e.0, StatusCode::CONFLICT);
+            assert!(e.1.contains("no upgrade intent missing-job"), "retry reached lifecycle lookup: {}", e.1);
+            let b: RunnerUpgrade = serde_json::from_value(json!({"rollback":123}))?;
+            let Err(e) = b.start(&hub, "fixture").await else { anyhow::bail!("missing rollback succeeded") };
+            assert_eq!(e.0, StatusCode::CONFLICT);
+            assert!(e.1.contains("no CD release 123"), "rollback reached canonical CD lookup: {}", e.1);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn u16_download_api_serves_the_pinned_ci_build_after_latest_changes() -> anyhow::Result<()> {
+        use http_body_util::BodyExt as _;
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let target = "x86_64-unknown-linux-musl";
+            let mut bytes = b"\x7fELF".to_vec(); bytes.resize(2 << 20, 1);
+            let mut tar = tar::Builder::new(Vec::new());
+            let mut h = tar::Header::new_gnu(); h.set_size(bytes.len() as u64); h.set_mode(0o755); h.set_cksum();
+            tar.append_data(&mut h, format!("dist/kiln-{target}"), bytes.as_slice())?;
+            let dir = tempfile::tempdir()?;
+            let path = dir.path().join("artifact.tar");
+            std::fs::write(&path, tar.into_inner()?)?;
+            let run = crate::store::Run {
+                id: "fixture-run".into(), repo_id: "fixture-repo".into(), repo_name: hub.cfg.updates.release_repo.clone(), number: 1,
+                pipeline: hub.cfg.updates.release_pipeline.clone(), event: "workflow_dispatch".into(), branch: "main".into(), sha: "0123456789abcdef0123456789abcdef01234567".into(),
+                message: String::new(), author: "person".into(), status: crate::store::Status::Succeeded, created_at: 0, started_at: None, finished_at: None, error: None, concurrency_group: None,
+            };
+            let pinned = crate::updates::adopt_into(&hub, &path, &run).await?.into_iter().next().ok_or_else(|| anyhow::anyhow!("CI artifact not retained"))?;
+            let mut newer = bytes.clone(); if let Some(last) = newer.last_mut() { *last = 2; }
+            crate::updates::store(&hub, target, newer, "upload").await?;
+            let response = download_build(&hub, target, &pinned.build).await.map_err(|e| anyhow::anyhow!("{}: {}", e.0, e.1))?;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await?.to_bytes();
+            assert_eq!(crate::util::sha256_hex(&body), pinned.sha256);
+            assert_eq!(body.as_ref(), bytes.as_slice());
+            Ok(())
+        })
+    }
+
 
     #[test]
     fn the_servers_own_machine_asking_for_its_local_agents_name_is_not_given_another_runner() {

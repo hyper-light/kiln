@@ -27,7 +27,7 @@ use aws_lc_rs::signature::{KeyPair as _, RSA_PKCS1_SHA256};
 use base64::Engine as _;
 use http::StatusCode;
 use kiln_ci::oidc::{self as rules, KeyTimes};
-use rusqlite::{OptionalExtension, params};
+use crate::sql::{OptionalExtension, params};
 use serde_json::{Value, json};
 
 use super::{Fail, secrets, token};

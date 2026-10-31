@@ -78,8 +78,11 @@ async fn lab_with(objects: [Option<Arc<crate::runner::work::store::Store>>; 2]) 
         adopt,
         objects: None,
     };
-    let (mac, mac_out) = node::start(Config { objects: mac_objects, ..cfg("mac", dirs.first().ok_or_else(|| anyhow::anyhow!("dir"))?, None) })?;
-    let (linux, linux_out) = node::start(Config { objects: linux_objects, ..cfg("linux", dirs.get(1).ok_or_else(|| anyhow::anyhow!("dir"))?, Some(adopt_tx)) })?;
+    let (mac, mac_out) = node::start_in(Config { objects: mac_objects, ..cfg("mac", dirs.first().ok_or_else(|| anyhow::anyhow!("dir"))?, None) }, crate::runner::processes::Admission::private(&tempfile::tempdir()?.keep())?).await?;
+    let (linux, linux_out) = node::start_in(Config { objects: linux_objects, ..cfg("linux", dirs.get(1).ok_or_else(|| anyhow::anyhow!("dir"))?, Some(adopt_tx)) }, crate::runner::processes::Admission::private(&tempfile::tempdir()?.keep())?).await?;
+    // U01: these are simulated hosts; production always requires restart-safe containment.
+    super::leases::simulate_receiver(&mac);
+    super::leases::simulate_receiver(&linux);
     let directory = Arc::new(Mutex::new(vec![info("mac", mac.fingerprint()), info("linux", linux.fingerprint())]));
     // Each runner's current connection, as the server would number them.
     let peers: Arc<Mutex<HashMap<&'static str, u64>>> = Arc::new(Mutex::new(HashMap::from([("mac", 10), ("linux", 20)])));
@@ -89,8 +92,11 @@ async fn lab_with(objects: [Option<Arc<crate::runner::work::store::Store>>; 2]) 
     let (m, l, e) = (mac.clone(), linux.clone(), Arc::clone(&ended));
     crate::rt::spawn(async move {
         let mut relay = Relay::default();
-        relay.announce("mac", Announce { fingerprint: m.fingerprint().into(), accept: true, version: 1 });
-        relay.announce("linux", Announce { fingerprint: l.fingerprint().into(), accept: true, version: 1 });
+        // The wire fixture's server simulates authenticated admission. Real Scheduler
+        // contention, durable recovery and ownership are tested in dispatch::admission.
+        let mut permits: HashMap<String, serde_json::Value> = HashMap::new();
+        relay.announce("mac", Announce { fingerprint: m.fingerprint().into(), accept: true, version: super::wire::VERSION });
+        relay.announce("linux", Announce { fingerprint: l.fingerprint().into(), accept: true, version: super::wire::VERSION });
         let handle_of = |n: &str| if n == "mac" { m.clone() } else { l.clone() };
         loop {
             use futures::FutureExt as _;
@@ -142,6 +148,32 @@ async fn lab_with(objects: [Option<Arc<crate::runner::work::store::Store>>; 2]) 
                     // An agent's question for kiln's operations comes back as what it asked.
                     let ask: serde_json::Value = serde_json::from_str(&asked).unwrap_or_default();
                     let answer = match ask.get("op").and_then(serde_json::Value::as_str) {
+                        Some("admission") => {
+                            use serde_json::json;
+                            let action = ask.get("action").and_then(serde_json::Value::as_str).unwrap_or_default();
+                            match action {
+                                "acquire" => {
+                                    let id = format!("reach-{}", crate::util::new_id());
+                                    let p = json!({ "ok": true, "id": id, "token": crate::util::new_id(), "epoch": "fixture", "host": ask.get("host"), "owner": from });
+                                    permits.insert(id, p.clone());
+                                    p
+                                }
+                                "claim" | "renew" => {
+                                    let id = ask.get("id").and_then(serde_json::Value::as_str).unwrap_or_default();
+                                    match permits.get(id) {
+                                        Some(p) if p.get("token") == ask.get("token") && p.get("host").and_then(serde_json::Value::as_str) == Some(from) => json!({ "ok": true }),
+                                        _ => json!({ "ok": false, "refusal": { "code": "owner" } }),
+                                    }
+                                }
+                                "end" | "abandon" => {
+                                    let id = ask.get("id").and_then(serde_json::Value::as_str).unwrap_or_default();
+                                    permits.remove(id);
+                                    json!({ "ok": true })
+                                }
+                                "recover" => json!({ "ok": true, "grants": [] }),
+                                _ => json!({ "ok": false }),
+                            }
+                        }
                         Some("call") => serde_json::json!({"ok": {"name": ask.get("name"), "input": ask.get("input"), "session": ask.get("session")}}),
                         _ => serde_json::json!({ "runners": *directory.lock() }),
                     };
@@ -245,16 +277,12 @@ fn an_agents_question_for_the_server_goes_through_its_runner_and_back() -> anyho
         }
         // Away from the server: refused at once, not left to wait.
         lab.ctl.send(Ctl::Drop("mac")).await?;
-        let mut refused = None;
-        for _ in 0..50 {
-            match lab.mac.query(ask.to_string()).await {
-                Err(e) => {
-                    refused = Some(format!("{e:#}"));
-                    break;
-                }
-                Ok(_) => crate::rt::sleep(Duration::from_millis(20)).await,
-            }
-        }
+        // Observe the disconnect before issuing a new query; an already admitted query
+        // correctly reports a dropped connection instead. Keep the original 50 × 20 ms budget.
+        let refused = crate::rt::timeout(Duration::from_secs(1), async {
+            while lab.mac.status().await?.get("server").and_then(serde_json::Value::as_bool) != Some(false) {}
+            Ok::<_, anyhow::Error>(lab.mac.query(ask.to_string()).await.err().map(|e| format!("{e:#}")))
+        }).await??;
         assert!(refused.as_deref().is_some_and(|e| e.contains("not connected")), "{refused:?}");
         Ok(())
     })
@@ -673,49 +701,79 @@ impl crate::runner::work::peers::Peers for Via {
 /// and nothing of it is kept.
 #[test]
 fn a_peers_1_gib_object_comes_over_the_link_and_a_corrupted_copy_is_refused() -> anyhow::Result<()> {
-    use std::io::Write as _;
+    use std::io::{Read as _, Seek as _, Write as _};
     use crate::runner::work::peers::fetch;
     use crate::runner::work::store::{Scope, Store};
-    crate::rt::block_on(async move {
-        let d = tempfile::tempdir()?;
-        let holder = Arc::new(Store::open(&d.path().join("linux"))?);
-        let big = d.path().join("big");
-        {
-            let mut f = std::fs::File::create(&big)?;
-            let block: Vec<u8> = (0..1u32 << 20).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
-            for n in 0..1024u32 {
-                let mut b = block.clone();
-                if let Some(head) = b.get_mut(..4) {
-                    head.copy_from_slice(&n.to_le_bytes());
-                }
-                f.write_all(&b)?;
+    // W24-R27: large fixture setup and cleanup belong to this test thread, off the
+    // runtime shards. Its owned directory keeps GiB-sized bytes out of shared RAM-backed /tmp.
+    let cache = crate::os::home_dir().join(".cache/kiln-unify");
+    std::fs::create_dir_all(&cache)?;
+    let d = tempfile::Builder::new().prefix("reach-1g-").tempdir_in(cache)?;
+    let holder = Arc::new(Store::open(&d.path().join("linux"))?);
+    let mac = Arc::new(Store::open(&d.path().join("mac"))?);
+    let other = Arc::new(Store::open(&d.path().join("other"))?);
+    let fresh = Arc::new(Store::open(&d.path().join("fresh"))?);
+    let big = d.path().join("big");
+    {
+        let mut f = std::fs::File::create(&big)?;
+        let block: Vec<u8> = (0..1u32 << 20).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
+        for n in 0..1024u32 {
+            let mut b = block.clone();
+            if let Some(head) = b.get_mut(..4) {
+                head.copy_from_slice(&n.to_le_bytes());
             }
+            f.write_all(&b)?;
         }
-        let (digest, size) = holder.put_file(&big)?;
-        anyhow::ensure!(size == 1 << 30, "{size}");
-        holder.hold(&Scope::new("acme/app", "trusted"), &digest)?;
+    }
+    let (digest, size) = holder.put_file(&big)?;
+    anyhow::ensure!(size == 1 << 30, "{size}");
+    let result = crate::rt::block_on(async move {
+        holder.hold_async(&Scope::new("acme/app", "trusted"), &digest).await?;
         let lab = lab_with([None, Some(Arc::clone(&holder))]).await?;
         let peers = Via(lab.mac.clone(), vec!["linux".to_owned()]);
-        let mac = Arc::new(Store::open(&d.path().join("mac"))?);
         let got = fetch(&mac, &peers, "acme/app", &digest).await?;
-        anyhow::ensure!(got.from.as_deref() == Some("linux") && got.refused.is_empty() && mac.has(&digest), "{got:?}");
+        let kept = crate::rt::blocking({ let (mac, digest) = (Arc::clone(&mac), digest.clone()); move || mac.has(&digest) }).await?;
+        anyhow::ensure!(got.from.as_deref() == Some("linux") && got.refused.is_empty() && kept, "{got:?}");
         // Another repository's ask finds nothing of it.
-        let other = Arc::new(Store::open(&d.path().join("other"))?);
         let none = fetch(&other, &peers, "acme/else", &digest).await?;
-        anyhow::ensure!(none.from.is_none() && !other.has(&digest), "{none:?}");
-        // The copy linux serves from, corrupted: refused, and not kept.
-        let served = holder.root().join("peers").join(digest.replace(':', "-"));
-        let mut bytes = std::fs::read(&served)?;
-        if let Some(b) = bytes.get_mut(12_345) {
-            *b ^= 0xff;
-        }
-        std::fs::write(&served, &bytes)?;
-        drop(bytes);
-        let fresh = Arc::new(Store::open(&d.path().join("fresh"))?);
+        let kept = crate::rt::blocking({ let (other, digest) = (Arc::clone(&other), digest.clone()); move || other.has(&digest) }).await?;
+        anyhow::ensure!(none.from.is_none() && !kept, "{none:?}");
+        // W24-R27/U07: peers now serve guarded shared chunks, not a permanent whole
+        // assembly under _cas/peers. Corrupt the actual first source chunk after proving
+        // the real GiB transfer succeeded; the next peer fetch must still refuse it.
+        let (source, object) = (Arc::clone(&holder), digest.clone());
+        let (corrupt_chunk, source_guard) = crate::rt::blocking(move || -> anyhow::Result<(String, crate::runner::cache::CacheGuard)> {
+            anyhow::ensure!(!source.root().join("peers").exists(), "U07 peer serving retained a secondary whole copy");
+            let (kept, guard) = source.guard_object(&object)?.ok_or_else(|| anyhow::anyhow!("GiB peer source disappeared before corruption"))?;
+            let crate::runner::work::store::Kept::Chunks(parts) = kept else { anyhow::bail!("GiB peer source was not chunked") };
+            let (chunk, size) = parts.first().ok_or_else(|| anyhow::anyhow!("GiB peer source has no chunks"))?;
+            anyhow::ensure!(*size > 12_345, "GiB peer source chunk is too short for corruption probe");
+            let served = source.local().path(chunk);
+            let mut file = std::fs::OpenOptions::new().read(true).write(true).open(&served).map_err(|error| anyhow::anyhow!("opening actual shared peer source {}: {error}", served.display()))?;
+            file.seek(std::io::SeekFrom::Start(12_345))?;
+            let mut byte = [0u8];
+            file.read_exact(&mut byte)?;
+            let [value] = &mut byte;
+            *value ^= 0xff;
+            file.seek(std::io::SeekFrom::Start(12_345))?;
+            file.write_all(&byte)?;
+            drop(file);
+            // Do not probe/clean the source before the real network sender reads it.
+            Ok((chunk.clone(), guard))
+        }).await??;
         let bad = fetch(&fresh, &peers, "acme/app", &digest).await?;
-        anyhow::ensure!(bad.from.is_none() && bad.refused == ["linux"] && !fresh.has(&digest), "{bad:?}");
+        let kept = crate::rt::blocking({ let (fresh, digest) = (Arc::clone(&fresh), digest.clone()); move || fresh.has(&digest) }).await?;
+        // Shared source verification refuses BEFORE transmission, so the receiver sees a
+        // miss rather than a transmitted wrong-digest copy in `refused`.
+        anyhow::ensure!(bad.from.is_none() && bad.refused.is_empty() && !kept, "{bad:?}");
+        crate::rt::blocking(move || -> anyhow::Result<()> {
+            anyhow::ensure!(holder.local().get_protected(&corrupt_chunk, &source_guard).is_none(), "U07 peer source accepted corrupted shared bytes after network refusal");
+            Ok(())
+        }).await??;
         Ok(())
-    })
+    });
+    drop(d);
+    result
 }
 
 /// What a runner's node says of `peer` now (`key`: its `link`, or the `error` its last link

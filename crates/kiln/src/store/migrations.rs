@@ -17,10 +17,10 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::bail;
-use rusqlite::{Connection, OptionalExtension as _, params};
+use crate::sql::{Connection, OptionalExtension as _, params};
 
 /// The newest schema epoch this build reads and writes: at least every shipped migration's.
-pub const SCHEMA_EPOCH: u32 = 1;
+pub const SCHEMA_EPOCH: u32 = 3;
 
 /// The database's `min_reader_epoch`, as last read or raised here (0: none said).
 static MIN_READER: AtomicU32 = AtomicU32::new(0);
@@ -53,7 +53,6 @@ pub fn check(conn: &Connection) -> anyhow::Result<()> {
 
 fn check_against(conn: &Connection, epoch: u32, list: &[(&str, &str)]) -> anyhow::Result<()> {
     let need = read_min_reader(conn)?;
-    MIN_READER.store(need, Ordering::Relaxed);
     if need > epoch {
         bail!(
             "kiln.db needs a kiln of schema epoch {need} or newer, and this is {epoch}: a newer kiln migrated it past what this one reads. Run the newer kiln again (roll forward); this one would fail on its data (docs/resilience.md, G2)"
@@ -72,34 +71,118 @@ fn check_against(conn: &Connection, epoch: u32, list: &[(&str, &str)]) -> anyhow
 
 include!(concat!(env!("OUT_DIR"), "/migrations.rs"));
 
-/// Applies every migration this connection has not seen yet; returns the names applied.
-pub fn apply(conn: &mut Connection) -> anyhow::Result<Vec<String>> {
-    apply_list(conn, MIGRATIONS)
+// U05/U15: each durable call exposes one existing migration boundary to the owner.
+// The baseline receipt lives outside the numbered ledger, whose shipped history is unchanged.
+const BASE_RECEIPT: &str = "store_base_schema_v1";
+const LEDGERS: &str = "CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY, applied_at INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS kiln_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);";
+
+#[derive(Clone, Copy)]
+enum Step {
+    Base(&'static str),
+    Migration(&'static str, &'static str),
 }
 
+impl Step {
+    fn receipt(self, conn: &Connection) -> anyhow::Result<bool> {
+        let (table, query, key) = match self {
+            Self::Base(_) => ("kiln_meta", "SELECT EXISTS(SELECT 1 FROM kiln_meta WHERE key=?1 AND value='1')", BASE_RECEIPT),
+            Self::Migration(name, _) => ("migrations", "SELECT EXISTS(SELECT 1 FROM migrations WHERE name=?1)", name),
+        };
+        let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)", [table], |r| r.get(0))?;
+        Ok(exists && conn.query_row(query, [key], |r| r.get(0))?)
+    }
+
+    fn run(self, conn: &mut Connection) -> anyhow::Result<u32> {
+        check(conn)?;
+        if !self.receipt(conn)? {
+            match self {
+                Self::Base(schema) => {
+                    conn.execute_batch(schema)?;
+                    conn.execute_batch(LEDGERS)?;
+                    conn.execute("INSERT INTO kiln_meta(key,value) VALUES(?1,'1')", [BASE_RECEIPT])?;
+                }
+                Self::Migration(name, sql) => { apply_one(conn, name, sql)?; }
+            }
+        }
+        read_min_reader(conn)
+    }
+}
+
+pub(super) fn initialize(database: &amphora::database::Database, schema: &'static str) -> anyhow::Result<()> {
+    // U05/U15: one fenced inventory serves warm frontends. It is only an optimization:
+    // another initializer may commit any missing step before our checked writer call.
+    let (base, names, need) = database.call(super::deadline(), move |conn| {
+        check(conn)?;
+        let has: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='migrations')", [], |r| r.get(0))?;
+        let names: std::collections::BTreeSet<String> = if has {
+            conn.prepare("SELECT name FROM migrations")?.query_map([], |r| r.get(0))?.collect::<crate::sql::Result<_>>()?
+        } else { Default::default() };
+        Ok((Step::Base(schema).receipt(conn)?, names, read_min_reader(conn)?))
+    })?;
+    MIN_READER.fetch_max(need, Ordering::Relaxed);
+    if !base { durable_step(database, Step::Base(schema))?; }
+    for &(name, sql) in MIGRATIONS {
+        if !names.contains(name) { durable_step(database, Step::Migration(name, sql))?; }
+    }
+    Ok(())
+}
+
+fn durable_step(database: &amphora::database::Database, step: Step) -> anyhow::Result<()> {
+    let outcome = database.call(super::deadline(), move |conn| step.run(conn));
+    finish_step(outcome, || database.call(super::deadline(), move |conn| {
+        check(conn)?;
+        Ok((step.receipt(conn)?, read_min_reader(conn)?))
+    }))
+}
+
+// U15: an expired reply is not a license to replay a FnOnce. Only an exact receipt read
+// through a new product ReadIndex can prove commit. Absence leaves startup unready; a later
+// explicit initialization may submit a new checked operation. Failed reconciliation stays failed.
+fn finish_step(
+    outcome: Result<u32, amphora_api::Refusal>,
+    reconcile: impl FnOnce() -> Result<(bool, u32), amphora_api::Refusal>,
+) -> anyhow::Result<()> {
+    let need = match outcome {
+        Ok(need) => need,
+        Err(amphora_api::Refusal::UnknownOutcome) => {
+            let (present, need) = reconcile()?;
+            anyhow::ensure!(present, "initialization outcome reconciled as absent; startup remains unready; resume initialization explicitly");
+            need
+        }
+        Err(error) => return Err(error.into()),
+    };
+    MIN_READER.fetch_max(need, Ordering::Relaxed);
+    Ok(())
+}
+
+#[cfg(test)]
 fn apply_list(conn: &mut Connection, list: &[(&str, &str)]) -> anyhow::Result<Vec<String>> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY, applied_at INTEGER NOT NULL);
-         CREATE TABLE IF NOT EXISTS kiln_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
-    )?;
+    conn.execute_batch(LEDGERS)?;
     let mut applied = Vec::new();
-    for (name, sql) in list {
-        let seen: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM migrations WHERE name = ?1)", params![name], |r| r.get(0))?;
-        if seen {
-            continue;
-        }
-        let tx = conn.transaction()?;
-        tx.execute_batch(sql).map_err(|e| anyhow::anyhow!("migration {name}: {e}"))?;
-        tx.execute("INSERT INTO migrations (name, applied_at) VALUES (?1, ?2)", params![name, crate::util::now_unix()])?;
-        if let Some(e) = epoch_of(sql) {
-            let need = read_min_reader(&tx)?.max(e);
-            tx.execute("INSERT INTO kiln_meta (key, value) VALUES ('min_reader_epoch', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value", params![need.to_string()])?;
-            MIN_READER.store(need, Ordering::Relaxed);
-        }
-        tx.commit()?;
-        applied.push((*name).to_owned());
+    for &(name, sql) in list {
+        if apply_one(conn, name, sql)? { applied.push(name.to_owned()); }
     }
     Ok(applied)
+}
+
+fn apply_one(conn: &mut Connection, name: &str, sql: &str) -> anyhow::Result<bool> {
+    check(conn)?;
+    let seen: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM migrations WHERE name = ?1)", params![name], |r| r.get(0))?;
+    if seen { return Ok(false); }
+    let tx = conn.transaction()?;
+    // U05: retain the shipped product SQL translation and exact numbered receipt.
+    let product_sql = if name.trim_end_matches(".sql") == "20261018-2100_w19_log_search" {
+        sql.replace("CREATE VIRTUAL TABLE IF NOT EXISTS ci_log_index USING fts5(text, leg UNINDEXED, step UNINDEXED, line UNINDEXED, tokenize = 'trigram');", "")
+    } else { sql.to_owned() };
+    tx.execute_batch(&product_sql).map_err(|e| anyhow::anyhow!("migration {name}: {e}"))?;
+    tx.execute("INSERT INTO migrations (name, applied_at) VALUES (?1, ?2)", params![name, crate::util::now_unix()])?;
+    if let Some(e) = epoch_of(sql) {
+        let need = read_min_reader(&tx)?.max(e);
+        tx.execute("INSERT INTO kiln_meta (key, value) VALUES ('min_reader_epoch', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value", params![need.to_string()])?;
+    }
+    tx.commit()?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -107,48 +190,113 @@ mod tests {
     use super::*;
 
     #[test]
+    fn u15_refused_ack_requires_exact_successful_reconciliation() -> anyhow::Result<()> {
+        use amphora_api::Refusal;
+        let mut reconciled = false;
+        finish_step(Err(Refusal::UnknownOutcome), || {
+            reconciled = true;
+            Ok((true, 0))
+        })?;
+        assert!(reconciled);
+        assert!(finish_step(Err(Refusal::UnknownOutcome), || Ok((false, 0))).is_err());
+        assert!(finish_step(Err(Refusal::UnknownOutcome), || Err(Refusal::UnknownOutcome)).is_err());
+        assert!(finish_step(Err(Refusal::UnknownOutcome), || Err(Refusal::Timeout)).is_err());
+        let mut unexpected = false;
+        assert!(finish_step(Err(Refusal::Timeout), || { unexpected = true; Ok((true, 0)) }).is_err());
+        assert!(!unexpected, "a definitive refusal must not trigger reconciliation or retry");
+        Ok(())
+    }
+
+    #[test]
+    fn u15_migration_boundaries_resume_without_reapplying_committed_prefix() -> anyhow::Result<()> {
+        let database = amphora::database::Database::in_memory(super::super::deadline())?;
+        durable_step(&database, Step::Base("CREATE TABLE boundary_rows(value INTEGER);"))?;
+        let first = Step::Migration("boundary_first", "INSERT INTO boundary_rows VALUES(1);");
+        durable_step(&database, first)?;
+        assert!(durable_step(&database, Step::Migration("boundary_failure", "-- kiln:epoch 2\nCREATE TABLE rolled_back(value INTEGER); THIS IS NOT SQL;")).is_err());
+        durable_step(&database, first)?;
+        database.call(super::super::deadline(), |conn| {
+            assert_eq!(conn.query_row("SELECT COUNT(*) FROM boundary_rows", [], |r| r.get::<_,i64>(0))?, 1);
+            assert!(!Step::Migration("boundary_failure", "").receipt(conn)?);
+            assert_eq!(read_min_reader(conn)?, 0);
+            assert!(!conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='rolled_back')", [], |r| r.get::<_,bool>(0))?);
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
     fn migrations_apply_in_order_and_are_idempotent() -> anyhow::Result<()> {
-        let mut c = Connection::open_in_memory()?;
-        let list = [("20260101-0000_t_a", "CREATE TABLE a (x INTEGER);"), ("20260101-0001_t_b", "INSERT INTO a VALUES (1);")];
-        assert_eq!(apply_list(&mut c, &list)?.len(), 2);
-        assert!(apply_list(&mut c, &list)?.is_empty(), "applying twice changes nothing");
-        let n: i64 = c.query_row("SELECT COUNT(*) FROM a", [], |r| r.get(0))?;
-        assert_eq!(n, 1);
-        // The shipped list applies cleanly to the baseline schema, twice.
-        let s = crate::store::Store::in_memory()?;
-        drop(s);
+        crate::sql::with_memory(|c| {
+            let list = [("20260101-0000_t_a", "CREATE TABLE a (x INTEGER);"), ("20260101-0001_t_b", "INSERT INTO a VALUES (1);")];
+            assert_eq!(apply_list(c, &list)?.len(), 2);
+            assert!(apply_list(c, &list)?.is_empty(), "applying twice changes nothing");
+            let n: i64 = c.query_row("SELECT COUNT(*) FROM a", [], |r| r.get(0))?;
+            assert_eq!(n, 1);
+            Ok(())
+        })?;
+        // The complete shipped history survives a real owner drain/reopen. Reapplying it
+        // changes neither schema nor receipts, and application rows remain intact.
+        type SchemaRow=(String,String,String,String);
+        type Snapshot=(Vec<(String,i64)>,Vec<SchemaRow>);
+        fn snapshot(c:&mut Connection<'_>)->anyhow::Result<Snapshot> {
+            let history=c.prepare("SELECT name,applied_at FROM migrations ORDER BY name")?.query_map([],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<crate::sql::Result<Vec<_>>>()?;
+            let schema=c.prepare("SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY type,name")?.query_map([],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?.collect::<crate::sql::Result<Vec<_>>>()?;
+            Ok((history,schema))
+        }
+        let directory=tempfile::tempdir()?;
+        let path=directory.path().join("kiln.db");
+        let store=crate::store::Store::open(&path)?;
+        let before=store.now(|c| {
+            c.execute("INSERT INTO kv(k,v) VALUES('migration-reopen','kept')",[])?;
+            assert!(apply_list(c, MIGRATIONS)?.is_empty(),"the complete shipped history reapplied a migration");
+            snapshot(c)
+        })?;
+        assert_eq!(before.0.iter().map(|(name,_)|name.as_str()).collect::<Vec<_>>(),MIGRATIONS.iter().map(|(name,_)|*name).collect::<Vec<_>>());
+        drop(store);
+        let reopened=crate::store::Store::open(&path)?;
+        let after=reopened.now(|c| {
+            assert!(apply_list(c, MIGRATIONS)?.is_empty(),"reopen reapplied a shipped migration");
+            assert_eq!(c.query_row("SELECT v FROM kv WHERE k='migration-reopen'",[],|r|r.get::<_,String>(0))?,"kept");
+            snapshot(c)
+        })?;
+        assert_eq!(after,before,"reopen changed the shipped schema or migration receipts");
+        assert!(!path.exists(),"a fresh Store must not create another SQLite database");
+        assert!(directory.path().join(crate::store::FILE).is_file());
         Ok(())
     }
 
     #[test]
     fn a_failing_migration_leaves_nothing_behind() -> anyhow::Result<()> {
-        let mut c = Connection::open_in_memory()?;
-        let list = [("20260101-0000_t_bad", "CREATE TABLE ok (x INTEGER); THIS IS NOT SQL;")];
-        assert!(apply_list(&mut c, &list).is_err());
-        let exists: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'ok')", [], |r| r.get(0))?;
-        assert!(!exists, "the transaction rolled back");
-        Ok(())
+        crate::sql::with_memory(|c| {
+            let list = [("20260101-0000_t_bad", "CREATE TABLE ok (x INTEGER); THIS IS NOT SQL;")];
+            assert!(apply_list(c, &list).is_err());
+            let exists: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'ok')", [], |r| r.get(0))?;
+            assert!(!exists, "the transaction rolled back");
+            Ok(())
+        })
     }
 
     /// A database a newer kiln migrated past what this build reads is refused, saying why; one
     /// that only gained what this build can live with opens (docs/resilience.md, G2).
     #[test]
     fn a_build_refuses_data_past_its_epoch() -> anyhow::Result<()> {
-        let mut c = Connection::open_in_memory()?;
-        let older = [("20260101-0000_t_a", "CREATE TABLE a (x INTEGER);")];
-        let additive = [older[0], ("20260101-0001_t_b", "CREATE TABLE b (y INTEGER);")];
-        let breaking = [additive[0], additive[1], ("20260101-0002_t_c", "-- kiln:epoch 2\nALTER TABLE a ADD COLUMN z INTEGER NOT NULL DEFAULT 0;")];
-        apply_list(&mut c, &additive)?;
-        check_against(&c, 1, &older)?;
-        apply_list(&mut c, &breaking)?;
-        assert_eq!(read_min_reader(&c)?, 2);
-        let refused = check_against(&c, 1, &older).err().map(|e| e.to_string()).unwrap_or_default();
-        assert!(refused.contains("needs a kiln of schema epoch 2 or newer, and this is 1"), "{refused}");
-        check_against(&c, 2, &breaking)?;
-        // An epoch is never lowered.
-        apply_list(&mut c, &[("20260101-0003_t_d", "-- kiln:epoch 1\nCREATE TABLE d (w INTEGER);")])?;
-        assert_eq!(read_min_reader(&c)?, 2);
-        Ok(())
+        crate::sql::with_memory(|c| {
+            let older = [("20260101-0000_t_a", "CREATE TABLE a (x INTEGER);")];
+            let additive = [older[0], ("20260101-0001_t_b", "CREATE TABLE b (y INTEGER);")];
+            let breaking = [additive[0], additive[1], ("20260101-0002_t_c", "-- kiln:epoch 2\nALTER TABLE a ADD COLUMN z INTEGER NOT NULL DEFAULT 0;")];
+            apply_list(c, &additive)?;
+            check_against(c, 1, &older)?;
+            apply_list(c, &breaking)?;
+            assert_eq!(read_min_reader(c)?, 2);
+            let refused = check_against(c, 1, &older).err().map(|e| e.to_string()).unwrap_or_default();
+            assert!(refused.contains("needs a kiln of schema epoch 2 or newer, and this is 1"), "{refused}");
+            check_against(c, 2, &breaking)?;
+            // An epoch is never lowered.
+            apply_list(c, &[("20260101-0003_t_d", "-- kiln:epoch 1\nCREATE TABLE d (w INTEGER);")])?;
+            assert_eq!(read_min_reader(c)?, 2);
+            Ok(())
+        })
     }
 
     /// W26-R03: diffs and change requests made before change identities each get one; their
@@ -156,30 +304,31 @@ mod tests {
     /// recorded; the epoch stays this build's.
     #[test]
     fn w26_r03_identities_are_backfilled() -> anyhow::Result<()> {
-        const MINE: &str = "20261026-1000_w26_change_identity";
-        let mut c = Connection::open_in_memory()?;
-        c.execute_batch(crate::store::SCHEMA)?;
-        let (before, after): (Vec<(&str, &str)>, Vec<(&str, &str)>) = MIGRATIONS.iter().copied().partition(|(n, _)| *n < MINE);
-        apply_list(&mut c, &before)?;
-        let row = "INSERT INTO diffs (id, repo_id, number, kind, change_id, title, author, author_kind, state, trunk, created_at, updated_at) VALUES (?1, 'r', ?2, ?3, ?4, 't', 'user:ada', 'human', ?5, 'main', 1, 1)";
-        for (id, n, kind, cid, state) in [("d1", 1, "diff", Some("I1111111111111111111111111111111111111111"), "landed"), ("d2", 2, "diff", Some("I2222222222222222222222222222222222222222"), "needs-review"), ("c3", 3, "change_request", None, "needs-review"), ("d4", 4, "diff", Some("I1111111111111111111111111111111111111111"), "draft")] {
-            c.execute(row, params![id, n, kind, cid, state])?;
-        }
-        apply_list(&mut c, &after)?;
-        let ids: Vec<(String, String)> = c.prepare("SELECT id, kiln_change FROM diffs ORDER BY number")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
-        assert_eq!(ids.len(), 4);
-        assert!(ids.iter().all(|(_, k)| kiln_ci::identity::is_kiln_change(k)), "{ids:?}");
-        let distinct: std::collections::BTreeSet<&String> = ids.iter().map(|(_, k)| k).collect();
-        assert_eq!(distinct.len(), 4, "each its own");
-        let change_of = |id: &str| ids.iter().find(|(d, _)| d == id).map(|(_, k)| k.clone()).unwrap_or_default();
-        let alias: String = c.query_row("SELECT change FROM change_aliases WHERE kind = 'change-id' AND alias = 'I1111111111111111111111111111111111111111'", [], |r| r.get(0))?;
-        assert_eq!(alias, change_of("d4"), "a Change-Id used twice points to the newest diff");
-        let numbers: Vec<String> = c.prepare("SELECT number FROM change_numbers WHERE host = 'kiln' ORDER BY number")?.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
-        assert_eq!(numbers, ["CR3", "D1", "D2", "D4"]);
-        let changes: i64 = c.query_row("SELECT COUNT(*) FROM changes", [], |r| r.get(0))?;
-        assert_eq!(changes, 4);
-        assert_eq!(read_min_reader(&c)?, 0, "no epoch raised: older builds still open it");
-        Ok(())
+        crate::sql::with_memory(|c| {
+            const MINE: &str = "20261026-1000_w26_change_identity";
+            c.execute_batch(crate::store::SCHEMA)?;
+            let (before, after): (Vec<(&str, &str)>, Vec<(&str, &str)>) = MIGRATIONS.iter().copied().partition(|(n, _)| *n < MINE);
+            apply_list(c, &before)?;
+            let row = "INSERT INTO diffs (id, repo_id, number, kind, change_id, title, author, author_kind, state, trunk, created_at, updated_at) VALUES (?1, 'r', ?2, ?3, ?4, 't', 'user:ada', 'human', ?5, 'main', 1, 1)";
+            for (id, n, kind, cid, state) in [("d1", 1, "diff", Some("I1111111111111111111111111111111111111111"), "landed"), ("d2", 2, "diff", Some("I2222222222222222222222222222222222222222"), "needs-review"), ("c3", 3, "change_request", None, "needs-review"), ("d4", 4, "diff", Some("I1111111111111111111111111111111111111111"), "draft")] {
+                c.execute(row, params![id, n, kind, cid, state])?;
+            }
+            apply_list(c, &after)?;
+            let ids: Vec<(String, String)> = c.prepare("SELECT id, kiln_change FROM diffs ORDER BY number")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+            assert_eq!(ids.len(), 4);
+            assert!(ids.iter().all(|(_, k)| kiln_ci::identity::is_kiln_change(k)), "{ids:?}");
+            let distinct: std::collections::BTreeSet<&String> = ids.iter().map(|(_, k)| k).collect();
+            assert_eq!(distinct.len(), 4, "each its own");
+            let change_of = |id: &str| ids.iter().find(|(d, _)| d == id).map(|(_, k)| k.clone()).unwrap_or_default();
+            let alias: String = c.query_row("SELECT change FROM change_aliases WHERE kind = 'change-id' AND alias = 'I1111111111111111111111111111111111111111'", [], |r| r.get(0))?;
+            assert_eq!(alias, change_of("d4"), "a Change-Id used twice points to the newest diff");
+            let numbers: Vec<String> = c.prepare("SELECT number FROM change_numbers WHERE host = 'kiln' ORDER BY number")?.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+            assert_eq!(numbers, ["CR3", "D1", "D2", "D4"]);
+            let changes: i64 = c.query_row("SELECT COUNT(*) FROM changes", [], |r| r.get(0))?;
+            assert_eq!(changes, 4);
+            assert_eq!(read_min_reader(c)?, 0, "no epoch raised: older builds still open it");
+            Ok(())
+        })
     }
 
     /// W27-R01: the identities and revocations tables keep each certificate issued (serial, kind,
@@ -187,27 +336,28 @@ mod tests {
     /// revocation naming neither is refused; applying again changes nothing; no epoch is raised.
     #[test]
     fn w27_r01_identities_and_revocations_tables() -> anyhow::Result<()> {
-        const MINE: &str = "20261026-1800_w27_identities";
-        let mut c = Connection::open_in_memory()?;
-        c.execute_batch(crate::store::SCHEMA)?;
-        let (before, after): (Vec<(&str, &str)>, Vec<(&str, &str)>) = MIGRATIONS.iter().copied().partition(|(n, _)| *n < MINE);
-        apply_list(&mut c, &before)?;
-        assert!(after.first().is_some_and(|(n, _)| *n == MINE), "{MINE} is shipped");
-        apply_list(&mut c, &after)?;
-        assert!(apply_list(&mut c, MIGRATIONS)?.is_empty(), "applying again changes nothing");
-        let columns = |table: &str| -> anyhow::Result<Vec<String>> { Ok(c.prepare(&format!("SELECT name FROM pragma_table_info('{table}') ORDER BY cid"))?.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?) };
-        assert_eq!(columns("identities")?, ["serial", "kind", "subject", "key_sha256", "not_before", "not_after", "issued_at", "cert_pem"]);
-        assert_eq!(columns("revocations")?, ["id", "serial", "key_sha256", "subject", "at", "reason", "by"]);
-        c.execute("INSERT INTO identities (serial, kind, subject, key_sha256, not_before, not_after, issued_at) VALUES ('0a', 'machine', 'fedora-2', 'k1', 1, 2, 1)", [])?;
-        assert!(c.execute("INSERT INTO identities (serial, kind, subject, key_sha256, not_before, not_after, issued_at) VALUES ('0a', 'machine', 'fedora-2', 'k2', 1, 2, 1)", []).is_err(), "a serial is issued once");
-        c.execute("INSERT INTO revocations (serial, subject, at, reason, by) VALUES ('0a', 'fedora-2', 1790000000, 'runner forgotten', 'ada')", [])?;
-        c.execute("INSERT INTO revocations (key_sha256, subject, at, reason, by) VALUES ('k1', 'fedora-2', 1790000001, 'key lost', 'sam')", [])?;
-        assert!(c.execute("INSERT INTO revocations (subject, at, reason, by) VALUES ('fedora-2', 1, 'x', 'ada')", []).is_err(), "a revocation names a serial or a key");
-        assert!(c.execute("INSERT INTO revocations (serial, subject, at, by) VALUES ('0a', 'fedora-2', 1, 'ada')", []).is_err(), "a revocation says why");
-        let (at, reason, by): (i64, String, String) = c.query_row("SELECT at, reason, by FROM revocations WHERE serial = '0a'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
-        assert_eq!((at, reason.as_str(), by.as_str()), (1_790_000_000, "runner forgotten", "ada"));
-        assert_eq!(read_min_reader(&c)?, 0, "no epoch raised: older builds still open it");
-        Ok(())
+        crate::sql::with_memory(|c| {
+            const MINE: &str = "20261026-1800_w27_identities";
+            c.execute_batch(crate::store::SCHEMA)?;
+            let (before, after): (Vec<(&str, &str)>, Vec<(&str, &str)>) = MIGRATIONS.iter().copied().partition(|(n, _)| *n < MINE);
+            apply_list(c, &before)?;
+            assert!(after.first().is_some_and(|(n, _)| *n == MINE), "{MINE} is shipped");
+            apply_list(c, &after)?;
+            assert!(apply_list(c, MIGRATIONS)?.is_empty(), "applying again changes nothing");
+            let columns = |table: &str| -> anyhow::Result<Vec<String>> { Ok(c.prepare(&format!("SELECT name FROM pragma_table_info('{table}') ORDER BY cid"))?.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?) };
+            assert_eq!(columns("identities")?, ["serial", "kind", "subject", "key_sha256", "not_before", "not_after", "issued_at", "cert_pem"]);
+            assert_eq!(columns("revocations")?, ["id", "serial", "key_sha256", "subject", "at", "reason", "by"]);
+            c.execute("INSERT INTO identities (serial, kind, subject, key_sha256, not_before, not_after, issued_at) VALUES ('0a', 'machine', 'fedora-2', 'k1', 1, 2, 1)", [])?;
+            assert!(c.execute("INSERT INTO identities (serial, kind, subject, key_sha256, not_before, not_after, issued_at) VALUES ('0a', 'machine', 'fedora-2', 'k2', 1, 2, 1)", []).is_err(), "a serial is issued once");
+            c.execute("INSERT INTO revocations (serial, subject, at, reason, by) VALUES ('0a', 'fedora-2', 1790000000, 'runner forgotten', 'ada')", [])?;
+            c.execute("INSERT INTO revocations (key_sha256, subject, at, reason, by) VALUES ('k1', 'fedora-2', 1790000001, 'key lost', 'sam')", [])?;
+            assert!(c.execute("INSERT INTO revocations (subject, at, reason, by) VALUES ('fedora-2', 1, 'x', 'ada')", []).is_err(), "a revocation names a serial or a key");
+            assert!(c.execute("INSERT INTO revocations (serial, subject, at, by) VALUES ('0a', 'fedora-2', 1, 'ada')", []).is_err(), "a revocation says why");
+            let (at, reason, by): (i64, String, String) = c.query_row("SELECT at, reason, by FROM revocations WHERE serial = '0a'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            assert_eq!((at, reason.as_str(), by.as_str()), (1_790_000_000, "runner forgotten", "ada"));
+            assert_eq!(read_min_reader(c)?, 0, "no epoch raised: older builds still open it");
+            Ok(())
+        })
     }
 
     #[test]

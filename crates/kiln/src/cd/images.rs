@@ -141,14 +141,14 @@ impl Cd {
             .hub
             .store
             .call(move |c| {
-                use rusqlite::OptionalExtension as _;
+                use crate::sql::OptionalExtension as _;
                 Ok(c.query_row(
                     "SELECT r.id, r.number, r.status, a.object, a.finalized = 1 FROM runs r
                      LEFT JOIN ci_artifacts a ON a.run_id = r.id AND a.name = ?3
                      WHERE r.repo_id = ?1 AND r.sha = ?2
                        AND (lower(r.pipeline) = lower(?4) OR r.workflow_id = ?4 OR r.workflow_id LIKE '%/' || ?4 || '.yml' OR r.workflow_id LIKE '%/' || ?4 || '.yaml')
                      ORDER BY r.created_at DESC, r.number DESC LIMIT 1",
-                    rusqlite::params![repo_id, sha, name, wf],
+                    crate::sql::params![repo_id, sha, name, wf],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
                 )
                 .optional()?)

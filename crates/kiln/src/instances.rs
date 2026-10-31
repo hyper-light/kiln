@@ -17,6 +17,39 @@ use crate::proto::{Hello, InstanceHello, ServerMsg};
 
 pub type PeerId = u64;
 
+#[derive(Clone)]
+struct ProcessNonce(String);
+impl std::fmt::Debug for ProcessNonce {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ProcessNonce(..)") }
+}
+
+/// U03/W13-R09: a checked process and its exact authenticated connection, captured together.
+#[derive(Clone, Debug)]
+pub struct CapturedRunner {
+    machine: String, peer: PeerId, process_nonce: ProcessNonce,
+    connection: crate::net::Connection, required: u64, wide: u64,
+}
+impl CapturedRunner {
+    pub fn peer(&self) -> PeerId { self.peer }
+    pub(crate) fn machine(&self) -> &str { &self.machine }
+    pub fn process_nonce(&self) -> &str { &self.process_nonce.0 }
+    pub fn connection_id(&self) -> String { self.connection.connection_id() }
+    pub fn wide_caps(&self) -> u64 { self.wide }
+    pub(crate) fn connection(&self) -> crate::net::Connection { self.connection }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum CaptureRefusal {
+    #[error("the selected runner is not connected")]
+    Disconnected,
+    #[error("the selected runner has not announced the required capabilities on this connection")]
+    Capabilities,
+    #[error("the selected runner's authenticated connection is not verified or has changed")]
+    Connection,
+    #[error("the selected runner's process identity is not verified or has changed")]
+    Process,
+}
+
 /// What an instance owns, by kind and id.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Owned {
@@ -96,11 +129,19 @@ pub struct Instance {
     /// What it can do past `caps`' 32 bits ([`crate::proto::AgentMsg::Caps`]:
     /// [`crate::proto::CAP_WIRE`] ...); 0 for runners from before.
     pub wide: u64,
+    connection: Option<crate::net::Connection>,
+    process_nonce: Option<ProcessNonce>,
     /// The kiln it says it runs ([`crate::proto::AgentMsg::Facts`]); `None` for runners from before.
     pub kiln: Option<kiln_ci::facts::KilnFacts>,
 }
 
 impl Instance {
+    /// Mutable config status requires this instance's declarations from the actual TLS origin;
+    /// a replacement socket cannot borrow the former connection's announced capabilities.
+    pub(crate) fn on_connection(&self, origin: Option<crate::net::Connection>) -> bool {
+        origin.is_some() && self.connection == origin
+    }
+
     /// Newer instances sort later; a legacy runner is the oldest of all.
     fn rank(&self) -> (i64, &str) {
         match &self.id {
@@ -136,9 +177,12 @@ pub struct InstanceView {
     pub can_upgrade: bool,
 }
 
+struct ConnectionState { epoch: u64, connection: Option<crate::net::Connection> }
+
 #[derive(Default)]
 pub struct Instances {
     by_peer: HashMap<PeerId, Instance>,
+    connections: HashMap<PeerId, ConnectionState>,
     announced: HashMap<PeerId, InstanceHello>,
     owners: HashMap<Owned, PeerId>,
 }
@@ -156,6 +200,64 @@ pub struct Joined {
 }
 
 impl Instances {
+    /// A new TLS connection invalidates a former connection's declarations until Hello/caps.
+    pub fn connected(&mut self, peer: PeerId, epoch: u64, binding: Option<[u8; 32]>) {
+        self.connections.insert(peer, ConnectionState { epoch, connection: binding.map(|binding|crate::net::Connection::new(peer,epoch,binding)) });
+    }
+    pub fn accepts_connection(&self, peer: PeerId, origin: Option<crate::net::Connection>) -> bool {
+        match self.connections.get(&peer) {
+            Some(current) => origin.is_some() && current.connection == origin,
+            // Direct in-process legacy fixtures have no TLS event; production always has one.
+            None => cfg!(test) && origin.is_none(),
+        }
+    }
+    pub fn accepts_close(&self, peer: PeerId, epoch: u64) -> bool {
+        self.connections.get(&peer).is_none_or(|current| current.epoch == epoch)
+    }
+    pub fn set_process(&mut self, peer: PeerId, nonce: String, origin: Option<crate::net::Connection>) -> Result<(), CaptureRefusal> {
+        if !crate::proto::valid_process_nonce(&nonce) { return Err(CaptureRefusal::Process); }
+        let connection = origin.ok_or(CaptureRefusal::Connection)?;
+        if !self.accepts_connection(peer,Some(connection)) { return Err(CaptureRefusal::Connection); }
+        let instance = self.by_peer.get_mut(&peer).ok_or(CaptureRefusal::Disconnected)?;
+        if instance.connection != Some(connection) { return Err(CaptureRefusal::Connection); }
+        if instance.process_nonce.as_ref().is_some_and(|old| old.0 != nonce) { return Err(CaptureRefusal::Process); }
+        instance.process_nonce = Some(ProcessNonce(nonce));
+        Ok(())
+    }
+    /// Shaped startup is eligible only after the process/caps declaration belongs to this live
+    /// connection. All older capability meanings remain unchanged.
+    pub fn effective_wide(&self, peer: PeerId) -> u64 {
+        let raw = self.by_peer.get(&peer).map_or(0,|instance|u64::from(instance.caps)|instance.wide);
+        let verified = self.connections.get(&peer).and_then(|state|state.connection).is_some_and(|connection|self.process_on(peer,Some(connection)).is_some());
+        if !verified || raw & crate::proto::CAP_WIRE == 0 { raw & !crate::proto::CAP_FIRECRACKER_SHAPE } else { raw }
+    }
+    fn capture_peer(&self, machine: &str, peer: PeerId, expected_nonce: Option<&str>, required: u64) -> Result<CapturedRunner, CaptureRefusal> {
+        let instance = self.by_peer.get(&peer).filter(|instance|instance.name==machine).ok_or(CaptureRefusal::Disconnected)?;
+        let connection = instance.connection.filter(|connection|self.connections.get(&peer).and_then(|current|current.connection)==Some(*connection)).ok_or(CaptureRefusal::Connection)?;
+        let process_nonce = instance.process_nonce.as_ref().ok_or(CaptureRefusal::Process)?;
+        if expected_nonce.is_some_and(|expected|expected!=process_nonce.0) { return Err(CaptureRefusal::Process); }
+        let wide = self.effective_wide(peer);
+        if wide & required != required { return Err(CaptureRefusal::Capabilities); }
+        Ok(CapturedRunner { machine: machine.into(), peer, process_nonce: process_nonce.clone(), connection, required, wide })
+    }
+    pub fn capture_newest_runner(&self, machine: &str, required: u64) -> Result<CapturedRunner, CaptureRefusal> {
+        self.capture_peer(machine,self.newest(machine).ok_or(CaptureRefusal::Disconnected)?,None,required)
+    }
+    pub fn capture_original_runner(&self, machine: &str, peer: PeerId, process_nonce: &str, required: u64) -> Result<CapturedRunner, CaptureRefusal> {
+        self.capture_peer(machine,peer,Some(process_nonce),required)
+    }
+    pub fn process_on(&self, peer: PeerId, origin: Option<crate::net::Connection>) -> Option<&str> {
+        let connection = origin?;
+        self.by_peer.get(&peer).filter(|instance|instance.connection==Some(connection)).and_then(|instance|instance.process_nonce.as_ref()).map(|nonce|nonce.0.as_str())
+    }
+    #[cfg(test)]
+    pub fn proves_process(&self, peer: PeerId, origin: Option<crate::net::Connection>, nonce: &str) -> bool {
+        self.process_on(peer,origin)==Some(nonce)
+    }
+    pub fn still_captured(&self, captured: &CapturedRunner) -> bool {
+        self.capture_peer(&captured.machine,captured.peer,Some(&captured.process_nonce.0),captured.required).is_ok_and(|current|current.connection==captured.connection)
+    }
+
     /// [`crate::proto::AgentMsg::Instance`], which precedes Hello.
     pub fn announce(&mut self, peer: PeerId, ih: InstanceHello) {
         self.announced.insert(peer, ih);
@@ -164,12 +266,15 @@ impl Instances {
     pub fn join(&mut self, peer: PeerId, name: &str, hello: Hello, now: i64) -> Joined {
         let ih = self.announced.remove(&peer);
         let id = ih.as_ref().map(|i| i.id.clone());
+        let connection = self.connections.get(&peer).and_then(|current|current.connection);
+        let process_nonce = self.by_peer.get(&peer).filter(|old| old.connection == connection).and_then(|old|old.process_nonce.clone());
         // The same instance (same id, or the one legacy runner) on another peer is a stale
         // connection it left behind.
         let stale: Vec<PeerId> =
             self.by_peer.iter().filter(|(p, i)| **p != peer && i.name == name && i.id == id).map(|(p, _)| *p).collect();
         for p in &stale {
             self.by_peer.remove(p);
+            self.connections.remove(p);
         }
         self.by_peer.insert(
             peer,
@@ -186,6 +291,8 @@ impl Instances {
                 build: None,
                 caps: 0,
                 wide: 0,
+                connection,
+                process_nonce,
                 kiln: None,
             },
         );
@@ -295,6 +402,7 @@ impl Instances {
 
     /// The connection went away. Returns the instance and what it owned.
     pub fn lost(&mut self, peer: PeerId) -> Option<(Instance, Vec<Owned>)> {
+        self.connections.remove(&peer);
         self.announced.remove(&peer);
         let i = self.by_peer.remove(&peer)?;
         let owned = self.owned_by(peer);
@@ -607,6 +715,57 @@ mod tests {
         m.own(Owned::Terminal("t".into()), 99);
         assert_eq!(m.route("box", &ServerMsg::TermInput { session: "t".into(), data: vec![] }), Some(1));
         assert_eq!(m.route("other", &ServerMsg::TermInput { session: "t".into(), data: vec![] }), None);
+    }
+
+    /// U03/W13-R09: selection, process nonce and TLS connection remain one authority.
+    #[test]
+    fn w13_r09_captured_startup_never_falls_back_on_reconnect_or_downgrade() -> anyhow::Result<()> {
+        let (peer, newer) = (1,2);
+        let (nonce, other_nonce) = ("a".repeat(43),"b".repeat(43));
+        let (a,b,c) = (crate::net::Connection::new(peer,1,[1;32]),crate::net::Connection::new(peer,2,[2;32]),crate::net::Connection::new(newer,1,[3;32]));
+        let caps = crate::proto::CAP_FIRECRACKER_SHAPE | crate::proto::CAP_WIRE;
+        let mut m = Instances::default();
+        m.connected(peer,1,Some([1;32]));
+        m.announce(peer,ih("original",1));
+        m.join(peer,"box",hello("capable"),1);
+        m.set_wide(peer,caps);
+        assert_eq!(m.effective_wide(peer)&crate::proto::CAP_FIRECRACKER_SHAPE,0,"caps without process association are not startup eligibility");
+        m.set_process(peer,nonce.clone(),Some(a))?;
+        assert_ne!(m.effective_wide(peer)&crate::proto::CAP_FIRECRACKER_SHAPE,0);
+        let captured = m.capture_newest_runner("box",caps)?;
+        assert!(m.still_captured(&captured));
+        m.connected(peer,2,Some([2;32]));
+        assert_eq!(m.effective_wide(peer)&crate::proto::CAP_FIRECRACKER_SHAPE,0,"replacement invalidates existing scheduler eligibility");
+        assert!(!m.accepts_connection(peer,Some(a)));
+        assert!(!m.still_captured(&captured));
+        assert!(!m.accepts_close(peer,1), "an old close cannot clear a replacement connection");
+        assert!(m.accepts_close(peer,2));
+        assert!(m.capture_newest_runner("box",caps).is_err());
+        assert!(m.set_process(peer,other_nonce.clone(),Some(a)).is_err());
+        m.announce(peer,ih("original",1));
+        m.join(peer,"box",hello("reconnected"),2);
+        m.set_process(peer,nonce.clone(),Some(b))?;
+        assert!(matches!(m.capture_original_runner("box",peer,&nonce,caps),Err(CaptureRefusal::Capabilities)));
+        m.set_wide(peer,caps);
+        let resumed = m.capture_original_runner("box",peer,&nonce,caps)?;
+        m.set_wide(peer,crate::proto::CAP_WIRE);
+        assert_eq!(m.effective_wide(peer)&crate::proto::CAP_FIRECRACKER_SHAPE,0,"downgraded caps immediately lose startup eligibility");
+        m.set_wide(peer,caps);
+        assert_ne!(captured.connection_id(),resumed.connection_id());
+        assert!(m.proves_process(peer,Some(b),&nonce));
+        assert!(!m.proves_process(peer,Some(a),&nonce));
+        assert!(m.set_process(peer,other_nonce.clone(),Some(b)).is_err());
+        m.join(peer,"box",hello("repeated hello"),3);
+        assert!(m.set_process(peer,other_nonce.clone(),Some(b)).is_err(),"Hello cannot reset the same connection's process identity");
+        m.set_wide(peer,caps);
+        m.connected(newer,1,Some([3;32]));
+        m.announce(newer,ih("newest",2));
+        m.join(newer,"box",hello("old binary"),4);
+        m.set_process(newer,other_nonce.clone(),Some(c))?;
+        assert!(matches!(m.capture_newest_runner("box",caps),Err(CaptureRefusal::Capabilities)),"newest capability loss must not select an older capable process");
+        assert!(m.capture_original_runner("box",peer,&nonce,caps).is_ok());
+        assert!(m.capture_original_runner("box",newer,&nonce,caps).is_err());
+        Ok(())
     }
 
     #[test]

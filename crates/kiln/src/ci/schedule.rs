@@ -20,7 +20,9 @@ use std::sync::Arc;
 use kiln_ci::trigger::cron::{self, Cron};
 use kiln_ci::trigger::{Event, Source, context};
 use kiln_ci::wf::ir::{Schedule, YVal};
-use rusqlite::{OptionalExtension, params};
+use crate::sql::{OptionalExtension, params};
+
+pub(crate) mod outbox;
 
 use super::events;
 use super::load;
@@ -31,6 +33,13 @@ use crate::store::Repo;
 #[derive(Default)]
 pub struct Cache {
     commits: HashMap<(String, String), Arc<load::Commit>>,
+}
+
+/// Compatibility helper for an intentionally skipped occurrence; every accepted fire still
+/// has a durable terminal explanation, rather than a send-after-claim gap (U04).
+#[cfg(test)]
+pub(crate) async fn claim(hub: &Hub, owner: &str, path: &str, entry: usize, minute: i64, cron: &str) -> anyhow::Result<bool> {
+    outbox::enqueue(hub, outbox::Occurrence { owner, path, entry, minute, cron }, outbox::Payload::Skipped { reason: "claim conformance fixture".into() }).await
 }
 
 impl Cache {
@@ -75,24 +84,21 @@ async fn repo_tick(hub: &Hub, repo: &Repo, minute: i64, cache: &mut Cache, live:
     let Some(sha) = refs.get(&head).cloned() else { return Ok(()) };
     live.push((repo.id.clone(), sha.clone()));
     let commit = cache.get(hub, repo, &sha).await?;
-    for (l, i, s) in entries(&commit, hub.cfg.ci.kiln_workflows) {
-        if let Err(e) = entry(hub, repo, &refs, &head, &sha, l, i, s, minute, cache, live).await {
+    for (l, i, s) in entries(&commit) {
+        if let Err(e) = entry(hub, repo, &refs, &head, &sha, l, i, s, minute, live).await {
             tracing::warn!(repo = %repo.name, workflow = %l.path, cron = %s.cron, error = %format!("{e:#}"), "a schedule could not run");
         }
     }
     Ok(())
 }
 
-/// The schedule entries of a commit's workflows the engine starts, each with its index in its
-/// workflow: GitHub's, and the kiln dialect's only once `[ci] kiln_workflows` takes them off v1,
-/// as for every other event (`events::on_trigger`). v1's scheduler fires them otherwise: with the
-/// engine on and `kiln_workflows` off, both did, and each `.kiln/` schedule ran twice (W28 step 3's
-/// replay: wire-lab's and sim's every night).
-fn entries(commit: &load::Commit, kiln_workflows: bool) -> Vec<(&load::Loaded, usize, &Schedule)> {
+/// Each runnable workflow's schedule entries, with their durable per-workflow indices (U04).
+/// Both dialects use this one path, as for every other event (`events::on_trigger`).
+fn entries(commit: &load::Commit) -> Vec<(&load::Loaded, usize, &Schedule)> {
     commit
         .workflows
         .iter()
-        .filter(|l| l.runs && !l.has_errors() && (l.dialect == kiln_ci::expr::Dialect::Gha || kiln_workflows))
+        .filter(|l| l.runs && !l.has_errors())
         .filter_map(|l| l.workflow.as_ref().map(|w| (l, w)))
         .flat_map(|(l, w)| w.on.iter().filter(|t| t.event == "schedule").flat_map(|t| t.schedules.iter()).enumerate().map(move |(i, s)| (l, i, s)))
         .collect()
@@ -113,7 +119,7 @@ fn due(c: &Cron, tz: &cron::TimeZone, s: &Schedule, seed: &str, minute: i64, las
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn entry(hub: &Hub, repo: &Repo, refs: &HashMap<String, String>, head: &str, head_sha: &str, l: &load::Loaded, i: usize, s: &Schedule, minute: i64, cache: &mut Cache, live: &mut Vec<(String, String)>) -> anyhow::Result<()> {
+async fn entry(hub: &Hub, repo: &Repo, refs: &HashMap<String, String>, head: &str, head_sha: &str, l: &load::Loaded, i: usize, s: &Schedule, minute: i64, live: &mut Vec<(String, String)>) -> anyhow::Result<()> {
     let c = Cron::parse(&s.cron).map_err(anyhow::Error::msg)?;
     let tz = cron::zone(s.timezone.as_deref()).map_err(anyhow::Error::msg)?;
     let (repo_id, path) = (repo.id.clone(), l.path.clone());
@@ -124,43 +130,53 @@ async fn entry(hub: &Hub, repo: &Repo, refs: &HashMap<String, String>, head: &st
     if !due(&c, &tz, s, &format!("{}/{}/{i}", repo.name, l.path), minute, last) {
         return Ok(());
     }
-    // Once per minute and entry, whatever restarts or races.
-    let (repo_id, path, cron_text) = (repo.id.clone(), l.path.clone(), s.cron.clone());
-    let fresh = hub
-        .store
-        .call(move |db| Ok(db.execute("INSERT OR IGNORE INTO ci_schedule_fires (repo_id, path, entry, minute, cron) VALUES (?1, ?2, ?3, ?4, ?5)", params![repo_id, path, i64::try_from(i).unwrap_or(0), minute, cron_text])? == 1))
-        .await?;
-    if !fresh {
-        return Ok(());
-    }
-    // `branch:` runs another branch's head, with that commit's version of the workflow.
-    let (git_ref, sha, loaded) = match &s.branch {
+    // Capture the immutable selected commit before acceptance; all network work occurs after
+    // this descriptor is durable, so a failed preparation cannot lose a claimed minute.
+    let (git_ref, sha, workflow) = match &s.branch {
         Some(b) => {
             let r = format!("refs/heads/{b}");
-            let Some(sha) = refs.get(&r).cloned() else { anyhow::bail!("no branch `{b}`") };
+            let Some(sha) = refs.get(&r).cloned() else {
+                outbox::enqueue(hub, outbox::Occurrence { owner: &repo.id, path: &l.path, entry: i, minute, cron: &s.cron }, outbox::Payload::Rejected { reason: format!("scheduled branch `{b}` does not exist") }).await?;
+                return Ok(());
+            };
             live.push((repo.id.clone(), sha.clone()));
-            let commit = cache.get(hub, repo, &sha).await?;
-            let Some(l2) = commit.workflows.iter().find(|x| x.path == l.path).cloned() else { anyhow::bail!("`{b}` has no {}", l.path) };
-            (r, sha, l2)
+            (r, sha, None)
         }
-        None => (head.to_owned(), head_sha.to_owned(), l.clone()),
+        None => (head.to_owned(), head_sha.to_owned(), l.workflow.clone()),
     };
     if s.skip_if_unchanged && last_success_sha(hub, repo, &l.path).await?.as_deref() == Some(sha.as_str()) {
-        tracing::info!(repo = %repo.name, workflow = %l.path, cron = %s.cron, "scheduled run skipped: nothing changed since the last successful one");
+        outbox::enqueue(hub, outbox::Occurrence { owner: &repo.id, path: &l.path, entry: i, minute, cron: &s.cron }, outbox::Payload::Skipped { reason: "nothing changed since the last successful scheduled run".into() }).await?;
         return Ok(());
     }
-    let f = events::facts(hub, repo).await;
-    let (message, _) = crate::gitops::commit_info(hub, repo, &sha).await;
-    let actor = last_author(hub, &f.mirror, &sha, &l.path).await;
-    let mut payload = context::schedule(&s.cron, &f.repo);
-    if !s.inputs.is_empty()
-        && let Some(o) = payload.as_object_mut()
-    {
-        o.insert("inputs".into(), serde_json::Value::Object(s.inputs.iter().map(|(k, v)| (k.clone(), yval_json(v))).collect()));
-    }
-    let e = Event { name: "schedule".into(), action: s.cron.clone(), repo: repo.name.clone(), git_ref, sha, actor, trusted: true, source: Source::Schedule, payload, message: Some(message.clone()), ..Event::default() };
-    events::start(hub, repo, &e, &loaded, &message, &e.actor, serde_json::Value::Null).await?;
+    let inputs = if s.inputs.is_empty() { serde_json::Value::Null } else { serde_json::Value::Object(s.inputs.iter().map(|(k, v)| (k.clone(), yval_json(v))).collect()) };
+    outbox::enqueue(hub, outbox::Occurrence { owner: &repo.id, path: &l.path, entry: i, minute, cron: &s.cron }, outbox::Payload::WorkflowSource(Box::new(outbox::WorkflowSource { repo: repo.clone(), git_ref, sha, path: l.path.clone(), cron: s.cron.clone(), inputs, workflow }))).await?;
     Ok(())
+}
+
+/// U04: reconstruct only from the accepted commit descriptor. A branch moving during a retry
+/// cannot change which code the accepted occurrence runs.
+pub(crate) async fn prepare(hub: &Hub, source: outbox::WorkflowSource) -> anyhow::Result<outbox::Workflow> {
+    let (workflow, error) = match source.workflow {
+        Some(workflow) => (workflow, None),
+        None => {
+            let commit = load::load(hub, &source.repo, &source.sha).await?;
+            match commit.workflows.into_iter().find(|l| l.path == source.path) {
+                Some(l) => {
+                    let error = l.has_errors().then(|| events::startup_error(&l));
+                    (l.workflow.unwrap_or_default(), error)
+                }
+                None => (kiln_ci::wf::Workflow::default(), Some(format!("{} has no {}", source.git_ref, source.path))),
+            }
+        }
+    };
+    let mirror = crate::gitops::ensure_commit(hub, &source.repo, &source.sha).await?;
+    let f = events::facts(hub, &source.repo).await;
+    let (message, _) = crate::gitops::commit_info(hub, &source.repo, &source.sha).await;
+    let actor = last_author(hub, &mirror.to_string_lossy(), &source.sha, &source.path).await;
+    let mut payload = context::schedule(&source.cron, &f.repo);
+    if !source.inputs.is_null() && let Some(o) = payload.as_object_mut() { o.insert("inputs".into(), source.inputs); }
+    let event = Event { name: "schedule".into(), action: source.cron, repo: source.repo.name.clone(), git_ref: source.git_ref, sha: source.sha, actor: actor.clone(), trusted: true, source: Source::Schedule, payload, message: Some(message.clone()), ..Event::default() };
+    Ok(outbox::Workflow { repo: source.repo, event, path: source.path, workflow, message, author: actor, actions: None, inputs: serde_json::Value::Null, error })
 }
 
 fn yval_json(y: &YVal) -> serde_json::Value {
@@ -204,6 +220,20 @@ mod tests {
     }
 
     #[test]
+    fn u04_workflows_and_attachments_claim_each_occurrence_once() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            for owner in ["repo-id", "attachment:agent-id"] {
+                let claims = futures::future::join_all((0..8).map(|_| claim(&hub, owner, "schedule", 0, 1_792_216_800, "0 6 * * *"))).await;
+                assert_eq!(claims.into_iter().collect::<anyhow::Result<Vec<_>>>()?.into_iter().filter(|fresh| *fresh).count(), 1);
+                assert!(!claim(&hub, owner, "schedule", 0, 1_792_216_800, "0 6 * * *").await?, "a replay does not fire twice");
+                assert!(claim(&hub, owner, "schedule", 0, 1_792_303_200, "0 6 * * *").await?, "the next occurrence still fires");
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
     fn w03_r10_due_now_with_jitter_and_catch_up() -> Result<(), String> {
         let c = Cron::parse("0 6 * * *")?;
         let tz = cron::zone(None)?;
@@ -228,11 +258,9 @@ mod tests {
         Ok(())
     }
 
-    /// W03-R10, found by W28 step 3's replay: a `.kiln/` workflow's schedule is the engine's only
-    /// once `[ci] kiln_workflows` takes the kiln dialect off v1, whose scheduler fires it before
-    /// that; GitHub's schedules are the engine's either way.
+    /// U04, W03-R10: kiln and GitHub schedules share the same indexed fire path.
     #[test]
-    fn w03_r10_a_kiln_schedule_is_v1s_until_kiln_workflows() -> Result<(), String> {
+    fn w03_r10_both_dialects_have_one_schedule_path() -> Result<(), String> {
         use kiln_ci::expr::Dialect;
         let read = |path: &str, text: &str, dialect: Dialect| {
             let (workflow, _) = kiln_ci::wf::parse_workflow(path, text, dialect);
@@ -248,10 +276,9 @@ mod tests {
         if let Some(l) = commit.workflows.iter().find(|l| l.has_errors()) {
             return Err(format!("{} didn't read", l.path));
         }
-        let fired = |kiln_workflows: bool| entries(&commit, kiln_workflows).into_iter().map(|(l, i, s)| (l.path.clone(), i, s.cron.clone())).collect::<Vec<_>>();
+        let fired: Vec<_> = entries(&commit).into_iter().map(|(l, i, s)| (l.path.clone(), i, s.cron.clone())).collect();
         let nightly = |i: usize, cron: &str| (".github/workflows/nightly.yml".to_owned(), i, cron.to_owned());
-        assert_eq!(fired(false), vec![nightly(0, "0 4 * * *"), nightly(1, "0 5 * * *")], "the kiln dialect's stays v1's");
-        assert_eq!(fired(true), vec![(".kiln/wire-lab.yaml".to_owned(), 0, "17 3 * * *".to_owned()), nightly(0, "0 4 * * *"), nightly(1, "0 5 * * *")]);
+        assert_eq!(fired, vec![(".kiln/wire-lab.yaml".to_owned(), 0, "17 3 * * *".to_owned()), nightly(0, "0 4 * * *"), nightly(1, "0 5 * * *")]);
         Ok(())
     }
 }

@@ -3,15 +3,13 @@
  * several at once. Shown when its host makes a choice possible.
  */
 import * as React from "react";
-import { ci, type CiProviders } from "@/api/ci";
+import { ci, CI_PROVIDER_NAMES, type CiProviders } from "@/api/ci";
 import { Button } from "@/components/ui/button";
 import { Link } from "@/lib/router";
 import { useRes, type Res } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 
 const providersRes = (repo: string): Res<CiProviders> => ({ key: `ci/providers/${repo}`, fetch: (s) => ci.providers(repo, s) });
-
-const NAMES: Record<string, string> = { kiln: "KilnCI", "github-actions": "GitHub Actions", "gitlab-ci": "GitLab CI/CD", "bitbucket-pipelines": "Bitbucket Pipelines" };
 
 const HOST: Record<string, string> = { "github-actions": "GitHub", "gitlab-ci": "GitLab", "bitbucket-pipelines": "Bitbucket" };
 
@@ -44,7 +42,7 @@ export function Providers({ repo }: { repo: string }) {
         {p.available.map((name) => (
           <label key={name} className="flex items-center gap-2 text-[13px] text-[#c5cdd8]">
             <input type="checkbox" checked={chosen.includes(name)} onChange={() => toggle(name)} disabled={busy} />
-            {NAMES[name] ?? name}
+            {CI_PROVIDER_NAMES[name] ?? name}
           </label>
         ))}
       </div>

@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use http::{Method, StatusCode, header};
 use kiln_ci::store::cache::{self, Entry};
-use rusqlite::{OptionalExtension, params};
+use crate::sql::{OptionalExtension, params};
 use serde::Deserialize;
 
 use super::blob::{self, Target};

@@ -119,6 +119,8 @@ impl Store {
             },
             // Driven by events: a commit nobody wrote yet is written at the first lull.
             quiet: Duration::ZERO,
+            // CP-T2.2: preserve the existing flush-proved group policy.
+            disk: hyper_durable::Disk::Flushed,
             elections: Elections::Suspicion,
         };
         let (tx, rx) = mpsc::channel();

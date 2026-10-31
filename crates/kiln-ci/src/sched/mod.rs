@@ -30,6 +30,7 @@ pub mod routing;
 pub mod sim;
 pub mod state;
 pub mod warm;
+pub mod vm;
 
 #[cfg(test)]
 mod tests;

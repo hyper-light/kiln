@@ -36,6 +36,8 @@ export interface ProvenanceRequirement {
 }
 
 export interface Gates {
+  /** One shared capacity for CI and release protected actions. */
+  concurrency_limit?: number;
   /** `staging@eu`: `staging` on the linked kiln server `eu` (§11). */
   after?: string[];
   soak?: string;
@@ -410,8 +412,14 @@ export const deployApi = {
   /** Refused while apps are registered there. */
   deleteEnvironment: (name: string) => request<void>("DELETE", `/api/deploy/environments/${enc(name)}`),
   /** A new environment: what isn't given is the server's default (no gates, one release at a time, no agents). */
-  createEnvironment: (e: { name: string; provider: string; release_repo: { host?: string; repo: string; branch: string; root: string }; targets: { kubernetes: string[] }; gates?: Gates; argocd?: { applications: boolean } }) =>
-    request<Environment>("POST", "/api/deploy/environments", e),
+  createEnvironment: (e: {
+    name: string;
+    provider: string;
+    release_repo: { host?: string; repo: string; branch: string; root: string };
+    targets: { kubernetes: string[] };
+    gates?: Gates;
+    argocd?: { applications: boolean };
+  }) => request<Environment>("POST", "/api/deploy/environments", e),
   /** kiln's GitHub App, through which release repositories on GitHub are made and written. */
   githubApp: (signal?: AbortSignal) => request<GithubApp>("GET", "/api/ci/github/app", undefined, { signal }),
   /** The git hosts release repositories may be on. */

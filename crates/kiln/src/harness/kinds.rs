@@ -403,6 +403,7 @@ impl Adapter {
     }
 
     pub fn command(&mut self, core: &mut Core, c: Command) {
+        core.queue_intent(&c);
         // A message waiting for one of its subagents is changed where it waits, or goes to it now.
         match super::subagent::queue_command(core, c) {
             super::subagent::Queued::Done => {}

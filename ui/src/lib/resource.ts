@@ -320,6 +320,18 @@ export function useSuspenseResource<T>(key: string, fetcher: Fetcher<T>, opts: R
   };
 }
 
+/** U13: observe the same cached entry as React readers, with its existing live/load lifecycle. */
+export function observeResource<T>(key: string, fetcher: Fetcher<T>, opts: ResourceOptions<T> = {}, listener: (data: T) => void): () => void {
+  const e = entry(key, fetcher as Fetcher<unknown>, opts);
+  const publish = () => {
+    if (e.snap.has) listener(e.snap.data as T);
+  };
+  const off = e.sub(publish);
+  publish();
+  if (!e.snap.has && !e.snap.failed && !e.promise) void load(e);
+  return off;
+}
+
 /**
  * Starts loading `key` now, without suspending. A section that reads several keys calls this for
  * each of them first, so their fetches run at once rather than one after another (each read

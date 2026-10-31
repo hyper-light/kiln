@@ -64,7 +64,7 @@ fn w24_r31_policies_by_scope_and_their_precedence() -> anyhow::Result<()> {
     for (scope, policy, why) in [
         ("repo:acme/app", json!({ "floor": "10%" }), "not a repository"),
         ("server", json!({ "ceiling": "120%" }), "between 0% and 100%"),
-        ("server", json!({ "schedule": "61 * * * *" }), "outside 0-59"),
+        ("server", json!({ "schedule": "61 * * * *" }), "minute field"),
         ("runner:box", json!({ "keep_forever": true }), "isn't a policy key"),
         ("cluster:x", json!({ "keep_last": 1 }), "isn't a scope"),
     ] {

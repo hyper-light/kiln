@@ -349,6 +349,16 @@ pub enum GroupEvent {
         /// The member it believed led, zero for none.
         leader: u64,
     },
+    /// The peer announced an orderly stop of its current run.
+    Stopped { peer: u64 },
+    /// The peer's process is alive and its disk was judged slow.
+    DiskSlow { peer: u64 },
+    /// A peer's disk caught up again.
+    DiskCaughtUp { peer: u64 },
+    /// The peer announces a different group disk mode; its heartbeat is refused.
+    ModeDiffers { peer: u64 },
+    /// The peer's group disk mode agrees again.
+    ModeAgrees { peer: u64 },
 }
 
 /// hyper-durable's budget over the node's memory: what the replica reserves before an input, from
@@ -358,6 +368,9 @@ pub enum GroupEvent {
 #[derive(Debug)]
 pub struct MemberBudget {
     budget: MemoryBudget,
+    // CP-T2.2: declared group ceilings, independent of other users' current reservations.
+    ordinary_limit: usize,
+    limit: usize,
     ordinary: Option<Allocation>,
     completion: Option<Allocation>,
     owed: u64,
@@ -365,8 +378,12 @@ pub struct MemberBudget {
 
 impl MemberBudget {
     fn new(budget: MemoryBudget) -> Self {
+        let ordinary_limit = budget.reservation_limit(BudgetLane::Ordinary);
+        let limit = budget.reservation_limit(BudgetLane::Completion);
         Self {
             budget,
+            ordinary_limit,
+            limit,
             ordinary: None,
             completion: None,
             owed: 0,
@@ -428,6 +445,23 @@ impl ReplicaBudget for MemberBudget {
     fn reserve(&mut self, bytes: u64) -> bool {
         self.settle_owed();
         self.owed == 0 && self.hold(BudgetLane::Ordinary, bytes)
+    }
+
+    // The upstream Budget contract asks for this replica's own allowance, not shared free
+    // memory. group_budget supplies the group's declared caps; only this ledger spends them.
+    fn room(&self) -> Option<usize> {
+        if self.owed != 0 {
+            return Some(0);
+        }
+        let ordinary = self.ordinary.as_ref().map_or(0, Allocation::bytes);
+        let completion = self.completion.as_ref().map_or(0, Allocation::bytes);
+        Some(
+            self.ordinary_limit.saturating_sub(ordinary).min(
+                self.limit
+                    .saturating_sub(ordinary)
+                    .saturating_sub(completion),
+            ),
+        )
     }
 
     fn charge(&mut self, bytes: u64) {
@@ -863,6 +897,8 @@ impl Member {
             // as it moves (`Member::restate_period`); before the stream schedules a heartbeat there
             // is none, and a commit that moved alone is written the moment no write is out.
             quiet: Duration::ZERO,
+            // CP-T2.2: preserve the group's existing flush-proved durability policy.
+            disk: hyper_durable::Disk::Flushed,
         };
         let replica = Replica::open(&shell, store, machine, MemberBudget::new(budget))
             .map_err(|_| BusError::Configuration("the part's replica could not be opened"))?;
@@ -1059,6 +1095,7 @@ impl Member {
                 peer,
                 lane,
                 frame,
+                ..
             } => {
                 self.publish(endpoint, peer, lane, frame.bytes());
                 endpoint.release(frame);
@@ -1585,6 +1622,26 @@ impl Member {
                     tell(&GroupEvent::Restarted { peer });
                     self.replica.restarted(peer)
                 }
+                Change::Stopped { .. } => {
+                    tell(&GroupEvent::Stopped { peer });
+                    self.replica.stopped(peer)
+                }
+                Change::DiskSlow { .. } => {
+                    tell(&GroupEvent::DiskSlow { peer });
+                    self.replica.disk_slow(peer)
+                }
+                Change::DiskCaughtUp { .. } => {
+                    tell(&GroupEvent::DiskCaughtUp { peer });
+                    self.replica.disk_caught_up(peer)
+                }
+                Change::ModeDiffers { .. } => {
+                    tell(&GroupEvent::ModeDiffers { peer });
+                    Ok(())
+                }
+                Change::ModeAgrees { .. } => {
+                    tell(&GroupEvent::ModeAgrees { peer });
+                    Ok(())
+                }
             };
         }
         self.asked.changes = changes;
@@ -1918,5 +1975,32 @@ mod tests {
         assert_eq!(stages.committed.count(), 4);
         assert_eq!(stages.uncommitted.len(), 0);
         assert_eq!(ms(stages.committed.quantile(500_000).unwrap()), 1);
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    /// CP-T2.2: another component's reservation cannot spend this replica's allowance.
+    #[test]
+    fn replica_room_counts_its_own_holds_and_debt() {
+        let budget = MemoryBudget::new(1024, 64).unwrap();
+        let mut replica = MemberBudget::new(budget.clone());
+        assert_eq!(replica.room(), Some(960));
+        let sibling = budget
+            .reserve(BudgetKind::Pending, BudgetLane::Ordinary, 800)
+            .unwrap()
+            .commit();
+        assert_eq!(replica.room(), Some(960));
+        assert!(replica.reserve(128));
+        assert_eq!(replica.room(), Some(832));
+        replica.release(128);
+        assert_eq!(replica.room(), Some(960));
+        replica.charge(256);
+        assert_eq!(replica.room(), Some(0));
+        drop(sibling);
+        replica.release(256);
+        assert_eq!(replica.room(), Some(960));
     }
 }

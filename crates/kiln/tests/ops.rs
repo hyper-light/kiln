@@ -33,7 +33,8 @@ fn w20_r01_operations_over_http_and_the_cli() -> anyhow::Result<()> {
     let (st, body) = http(s.port, "GET", "/api/audit?limit=1", &s.admin, None)?;
     anyhow::ensure!(st == 200, "{body}");
     let before = serde_json::from_str::<Value>(&body)?.pointer("/0/id").and_then(Value::as_i64).unwrap_or(0);
-    let (st, body) = http(s.port, "POST", "/api/ops/ci.variables.set", &s.admin, Some(&json!({ "scope": "server", "name": "REGION", "value": "eu" })))?;
+    // U12/W20-R01: an omitted scope uses the same server scope as its HTTP route.
+    let (st, body) = http(s.port, "POST", "/api/ops/ci.variables.set", &s.admin, Some(&json!({ "name": "REGION", "value": "eu" })))?;
     assert_eq!(st, 200, "{body}");
     let (_, body) = http(s.port, "GET", "/api/audit?limit=20", &s.admin, None)?;
     let rows: Vec<Value> = serde_json::from_str::<Vec<Value>>(&body)?.into_iter().filter(|r| r.get("id").and_then(Value::as_i64).is_some_and(|i| i > before)).collect();
@@ -60,7 +61,8 @@ fn w20_r01_operations_over_http_and_the_cli() -> anyhow::Result<()> {
     let doc: Value = serde_json::from_str(&body)?;
     let op = doc.pointer("/paths/~1api~1ops~1ci.variables.set/post").cloned().unwrap_or_default();
     assert!(op.get("summary").and_then(Value::as_str).is_some_and(|s| !s.is_empty()), "{op}");
-    assert_eq!(op.pointer("/requestBody/content/application~1json/schema/required"), Some(&json!(["scope", "name", "value"])), "{op}");
+    assert_eq!(op.pointer("/requestBody/content/application~1json/schema/required"), Some(&json!(["name", "value"])), "{op}");
+    assert_eq!(op.pointer("/requestBody/content/application~1json/schema/properties/scope/default"), Some(&json!("server")), "{op}");
 
     // `kiln op`: the list, what one takes, and one run.
     let url = format!("http://127.0.0.1:{}", s.port);
@@ -110,7 +112,7 @@ fn w20_r03_writes_say_what_they_do() -> anyhow::Result<()> {
         anyhow::ensure!(st == 200, "{st} {body}");
         Ok(serde_json::from_str(&body)?)
     };
-    let vm = pool(json!({ "name": "vm", "executor": "firecracker", "image": "kiln/runner-ubuntu-24.04", "labels": ["vm"], "min_idle": 1, "max": 2 }))?;
+    let vm = pool(json!({ "name": "vm", "executor": "firecracker", "image": "kiln/runner-ubuntu-24.04", "labels": ["vm"], "min_idle": 1, "max": 2, "resources": { "cpu": "2", "memory": "512Mi", "disk": "2Gi" }, "firecracker_overhead": { "cpu": "250m", "memory": "128Mi", "disk": "64Mi" } }))?;
     assert!(vm.to_string().contains("no runner connected now announces the firecracker executor"), "{vm}");
     assert_eq!(vm.pointer("/preview/heading_for"), Some(&json!(1)), "its minimum idle: {vm}");
     let mine = pool(json!({ "name": "mine", "executor": "docker", "image": "kiln/runner-ubuntu-24.04", "labels": ["local"], "max": 1 }))?;

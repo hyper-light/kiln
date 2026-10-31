@@ -25,7 +25,7 @@ use parking_lot::Mutex;
 use serde_json::{Value, json};
 
 use super::ops::{self, Fail};
-use super::{Cd, Resolved};
+use super::{Cd, Resolved, SourceRefresh};
 
 /// The most commits one plan takes.
 pub const MAX_COMMITS: usize = 100;
@@ -225,6 +225,8 @@ fn touches(def: &AppDef, deps: &[Vec<Dep>], in_stack: &[bool], changed: Option<&
 struct Stack {
     /// The repository's URL, as each app that deploys from it spells it.
     urls: Vec<String>,
+    /// U08: one operation owns all exact-URL readers, from locating through delayed renders.
+    sources: SourceRefresh,
     /// The branch it lands on.
     trunk: String,
     trunk_commit: String,
@@ -283,8 +285,8 @@ fn locate(m: &Mirror, want: &Want, fetch: bool) -> anyhow::Result<Option<String>
     }
 }
 
-fn mirror(cd: &Cd, url: &str) -> anyhow::Result<Mirror> {
-    Mirror::open(&cd.mirror_dir(url), url, cd.git_auth(url))
+fn mirror(cd: &Cd, url: &str, sources: &mut SourceRefresh) -> anyhow::Result<Mirror> {
+    sources.open_url(cd, url).map_err(anyhow::Error::msg)
 }
 
 /// Every repository an app deploys from, by name, its spellings together, and how many apps
@@ -311,13 +313,14 @@ fn repo_groups(cd: &Cd) -> BTreeMap<String, (Vec<String>, usize)> {
 /// deploy from it, its default branch, and its newest branches.
 pub async fn repos(cd: &Arc<Cd>) -> Result<Value, Fail> {
     let cd = cd.clone();
-    let list = crate::rt::blocking(move || {
+    let list = crate::rt::blocking_in(crate::rt::SHARE_GIT_MIRROR_IO, move || {
         repo_groups(&cd)
             .into_values()
             .filter_map(|(urls, apps)| {
                 let url = urls.first()?.clone();
                 // Only mirrors already fetched: listing never clones.
-                let m = cd.mirror_dir(&url).join("HEAD").exists().then(|| mirror(&cd, &url).ok()).flatten();
+                let source = cd.read_context(&url);
+                let m = source.dir().join("HEAD").exists().then(|| source.open().ok()).flatten();
                 let branches: Vec<Value> = m
                     .as_ref()
                     .and_then(|m| m.branches(MAX_BRANCHES).ok())
@@ -362,10 +365,11 @@ fn find(cd: &Cd, ask: &Ask) -> Result<Stack, Fail> {
     if matches!(want, Want::Pr(_)) && !fetch {
         return Err(bad("say which repository the pull request is in (repo)"));
     }
+    let mut sources = SourceRefresh::default();
     let mut found: Vec<(Vec<String>, Mirror, String)> = Vec::new();
     for (_, urls) in groups {
         let Some(first) = urls.first() else { continue };
-        let m = mirror(cd, first).map_err(failed)?;
+        let m = mirror(cd, first, &mut sources).map_err(failed)?;
         if let Some(head) = locate(&m, &want, fetch).map_err(failed)? {
             found.push((urls, m, head));
         }
@@ -384,7 +388,7 @@ fn find(cd: &Cd, ask: &Ask) -> Result<Stack, Fail> {
     };
     // The other spellings' mirrors need the commits too: their apps resolve from them.
     for u in urls.iter().skip(1) {
-        let other = mirror(cd, u).map_err(failed)?;
+        let other = mirror(cd, u, &mut sources).map_err(failed)?;
         if !other.has(&head) && other.fetch_one(&head).is_err() {
             other.fetch().map_err(failed)?;
         }
@@ -433,7 +437,7 @@ fn find(cd: &Cd, ask: &Ask) -> Result<Stack, Fail> {
             Err(_) => json!({"sha": c}),
         });
     }
-    Ok(Stack { urls, trunk, trunk_commit, default_branch, base, commits, shown, changed, notes })
+    Ok(Stack { urls, sources, trunk, trunk_commit, default_branch, base, commits, shown, changed, notes })
 }
 
 /// An app's sources resolved for trunk, the base and each commit of the stack.
@@ -445,6 +449,7 @@ struct Resolutions {
 
 fn resolutions(cd: &Cd, st: &Stack, def: &AppDef, kube_version: Option<&str>, api_versions: &[String]) -> anyhow::Result<Resolutions> {
     let moves = st.moves(def);
+    let readers = st.sources.readers(def)?;
     // Artifacts as a plan sees them: no registry is asked (a planned commit's image may not exist
     // yet).
     let with_artifacts = |mut r: Resolved| {
@@ -453,9 +458,9 @@ fn resolutions(cd: &Cd, st: &Stack, def: &AppDef, kube_version: Option<&str>, ap
         r.add_secrets(cd.planned_secrets(def));
         r
     };
-    let trunk = with_artifacts(cd.inputs_of(def, kube_version, api_versions, None)?);
+    let trunk = with_artifacts(Cd::inputs_from(def, kube_version, api_versions, None, &readers)?);
     let at = |c: &str| -> Vec<Option<String>> { trunk.commits.iter().zip(&moves).map(|(x, m)| if *m { Some(c.to_owned()) } else { x.clone() }).collect() };
-    let resolve = |c: &str| cd.inputs_of(def, kube_version, api_versions, Some(&at(c))).map(with_artifacts).map_err(|e| format!("{e:#}"));
+    let resolve = |c: &str| Cd::inputs_from(def, kube_version, api_versions, Some(&at(c)), &readers).map(with_artifacts).map_err(|e| format!("{e:#}"));
     // A step that changes nothing the app reads leaves its content as the step below had it.
     let same = |i: usize, below: &Resolved| !touches(def, &below.deps, &moves, st.changed.get(i).and_then(Option::as_ref));
     let base = st.base.as_deref().map(|b| if same(0, &trunk) { Ok(trunk.clone()) } else { resolve(b) });
@@ -592,7 +597,7 @@ async fn plan_app(cd: Arc<Cd>, st: Arc<Stack>, id: String, def: AppDef, brief: b
     };
     let res = {
         let (cd, st, def, kv, av) = (cd.clone(), st.clone(), def.clone(), kube_version.clone(), api_versions.clone());
-        crate::rt::blocking(move || resolutions(&cd, &st, &def, kv.as_deref(), &av)).await.and_then(|r| r).map_err(|e| format!("its sources can't be read: {e:#}"))?
+        crate::rt::blocking_in(crate::rt::SHARE_GIT_MIRROR_IO, move || resolutions(&cd, &st, &def, kv.as_deref(), &av)).await.and_then(|r| r).map_err(|e| format!("its sources can't be read: {e:#}"))?
     };
     // Each distinct content rendered once; renders are kept by key across plans.
     let mut kept: HashMap<u64, Result<Arc<Kept>, String>> = HashMap::new();
@@ -605,7 +610,7 @@ async fn plan_app(cd: Arc<Cd>, st: Arc<Stack>, id: String, def: AppDef, brief: b
             Some(k) => Ok(k),
             None => {
                 let (cd2, def2, r2, kv, av) = (cd.clone(), def.clone(), r.clone(), kube_version.clone(), api_versions.clone());
-                match crate::rt::blocking(move || cd2.render_app(&def2, &r2, r2.key, kv.as_deref(), &av)).await.and_then(|x| x) {
+                match crate::rt::blocking_in(crate::rt::SHARE_GIT_MIRROR_IO, move || cd2.render_app(&def2, &r2, r2.key, kv.as_deref(), &av)).await.and_then(|x| x) {
                     Ok((objects, children)) => {
                         let k = Arc::new(Kept::new(objects, children));
                         cd.plans.put(r.key, k.clone());
@@ -788,9 +793,9 @@ fn crd_kinds(objects: &[Value]) -> Vec<GroupKind> {
 
 /// Plans what `ask` names.
 pub async fn plan(cd: &Arc<Cd>, ask: Ask) -> Result<Value, Fail> {
-    let st = {
+    let mut st = {
         let (cd, ask) = (cd.clone(), ask.clone());
-        Arc::new(crate::rt::blocking(move || find(&cd, &ask)).await.map_err(failed)??)
+        crate::rt::blocking_in(crate::rt::SHARE_GIT_MIRROR_IO, move || find(&cd, &ask)).await.map_err(failed)??
     };
     // The apps the stack can move: those whose read paths it changes.
     let (mut affected, mut unaffected) = (Vec::new(), 0usize);
@@ -815,6 +820,17 @@ pub async fn plan(cd: &Arc<Cd>, ask: Ask) -> Result<Value, Fail> {
     let total = affected.len();
     let unplanned: Vec<String> = affected.iter().skip(ask.max_apps).map(|(id, _)| id.clone()).collect();
     affected.truncate(ask.max_apps);
+    // U08: capture additional value/source repositories before sharing the operation with
+    // parallel app planners. Keep failures per source; one app cannot prevent another's plan.
+    let urls: BTreeSet<String> = affected.iter().flat_map(|(_, def)| def.sources.iter().filter(|source| source.chart.is_none()).map(|source| source.repo.clone())).collect();
+    if !urls.is_empty() {
+        let cd2 = cd.clone();
+        st = crate::rt::blocking_in(crate::rt::SHARE_GIT_MIRROR_IO, move || {
+            for url in urls { let _ = st.sources.open_url(&cd2, &url); }
+            st
+        }).await.map_err(failed)?;
+    }
+    let st = Arc::new(st);
     let mut results = Vec::with_capacity(affected.len());
     for batch in affected.chunks(PARALLEL) {
         let runs = batch.iter().map(|(id, def)| plan_app(cd.clone(), st.clone(), id.clone(), def.clone(), ask.brief));

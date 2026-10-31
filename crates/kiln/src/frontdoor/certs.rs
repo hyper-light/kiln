@@ -2,7 +2,6 @@
 //!
 //! | File | What | Mode |
 //! | --- | --- | --- |
-//! | `settings.json` | the settings last pushed, so the front door is back at once after a restart | 0644 |
 //! | `kiln.key`, `kiln.pem` | the kiln CA's certificate in use and its key | 0600 |
 //! | `kiln.key.pending` | the key of the CSR waiting for the CA | 0600 |
 //! | `custom.key`, `custom.pem` | a certificate and key uploaded for the front door | 0600 |
@@ -14,9 +13,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 
-use super::{CertInfo, CustomCert, Settings};
+use super::{CertInfo, CustomCert};
 
-const SETTINGS: &str = "settings.json";
 const KILN_CERT: &str = "kiln.pem";
 const KILN_KEY: &str = "kiln.key";
 const PENDING_KEY: &str = "kiln.key.pending";
@@ -38,16 +36,6 @@ impl Store {
 
     pub fn dir(&self) -> &Path {
         &self.dir
-    }
-
-    pub fn load_settings(&self) -> Option<Settings> {
-        let text = read(&self.dir.join(SETTINGS))?;
-        serde_json::from_str::<Settings>(&text).ok().and_then(|s| s.validated().ok())
-    }
-
-    pub fn save_settings(&self, s: &Settings) -> anyhow::Result<()> {
-        let json = serde_json::to_vec_pretty(s)?;
-        crate::util::write_secret(&self.dir.join(SETTINGS), &json, 0o644).context("store the front door's settings")
     }
 
     /// The kiln CA's certificate in use and its key.
@@ -169,9 +157,6 @@ mod tests {
                 assert_eq!(std::fs::metadata(dir.path().join(f))?.permissions().mode() & 0o777, 0o600, "{f}");
             }
         }
-        let s = Settings { domain: "kiln.home".into(), ..Settings::default() };
-        store.save_settings(&s)?;
-        assert_eq!(store.load_settings(), Some(s));
         Ok(())
     }
 }

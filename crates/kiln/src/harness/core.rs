@@ -208,6 +208,9 @@ pub enum GoBackOp {
 /// Something only the session (which owns the process) can do, asked for by an adapter.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
+    /// U17: a processed local queue edit changes replay bytes; removal cancels the intent.
+    /// The session reports this to its existing pending owner after releasing the core lock.
+    QueueChanged { id: String, command: Option<Box<super::model::Command>> },
     /// Start the harness again, continuing its session from `resume_at` (a rewind).
     Restart { resume_at: Option<String> },
     /// The go-back (rewind, restore files, branch, fork) that `harness::goback` does where the
@@ -369,6 +372,30 @@ pub struct Frozen {
 
 
 impl Core {
+    /// U17: queue ownership is distinct from native acknowledgment. Keep effective replay bytes
+    /// in the existing host owner, without changing the original inbox acceptance receipt.
+    pub fn queue_intent(&mut self, command: &super::model::Command) {
+        use super::model::{Command, Delivery};
+        let (id, edited) = match command {
+            Command::QueueEdit { id, text, attachments } => (id, Some((text, attachments))),
+            Command::QueueRemove { id } => (id, None),
+            _ => return,
+        };
+        let queued = self.state.queue.iter().find(|q| &q.id == id).map(|q| (q, None))
+            .or_else(|| self.state.tasks.iter().find_map(|task| task.queue.iter().find(|q| &q.id == id).map(|q| (q, Some(task.id.clone())))));
+        let Some((q, task)) = queued else { return };
+        let effective = edited.map(|(text, attachments)| Command::Send {
+            id: id.clone(), text: text.clone(), mode: Default::default(),
+            attachments: attachments.as_ref().unwrap_or(&q.attachments).clone(),
+            overrides: q.overrides.clone(), reply_to: q.reply_to.clone(), task,
+        });
+        if effective.is_none() {
+            self.state.delivery.insert(id.clone(), Delivery::Cancelled);
+            self.touch_state();
+        }
+        self.effects.push(Effect::QueueChanged { id: id.clone(), command: effective.map(Box::new) });
+    }
+
     pub fn new() -> Self {
         Self {
             session_id: String::new(),

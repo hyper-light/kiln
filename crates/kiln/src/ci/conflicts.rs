@@ -20,7 +20,7 @@ use std::sync::Arc;
 use http::StatusCode;
 use kiln_ci::conflicts::{self, Kind, Merged, Side, Take, Text};
 use kiln_ci::review::State;
-use rusqlite::{OptionalExtension as _, params};
+use crate::sql::{OptionalExtension as _, params};
 use serde_json::{Value, json};
 
 use super::Fail;
@@ -82,7 +82,7 @@ pub struct Replay {
 
 const REPLAY_COLUMNS: &str = "id, version, commit_sha, onto, onto_name, tree, state, created_by, created_at, resolved_version, resolved_by, resolved_at";
 
-fn replay_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Replay> {
+fn replay_row(r: &crate::sql::Row<'_>) -> crate::sql::Result<Replay> {
     Ok(Replay {
         id: r.get(0)?,
         version: r.get(1)?,
@@ -136,7 +136,7 @@ fn lines_of(text: Option<String>) -> Option<Vec<String>> {
     text.and_then(|t| serde_json::from_str(&t).ok())
 }
 
-fn kept_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Kept> {
+fn kept_row(r: &crate::sql::Row<'_>) -> crate::sql::Result<Kept> {
     let take = |s: Option<String>| s.as_deref().and_then(Take::parse);
     Ok(Kept {
         id: r.get(0)?,

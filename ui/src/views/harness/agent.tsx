@@ -14,7 +14,7 @@ import { Link, Navigate, useNavigate, useParams, useSearchParams } from "@/lib/r
 import { ArrowLeft, ChevronRight, RotateCcw, X } from "lucide-react";
 import { harnessApi, lastTurnFrom, sessionStore, useSession, useSessionReady, useStopAt } from "@/api/harness";
 import type { AgentInfo, Command, FileChange, HEvent, Meta, SessionStore, Todo } from "@/api/harness";
-import { harnessSessionsRes, useRes } from "@/lib/data";
+import { useHarnessSessions } from "@/lib/data";
 import { kilnSubagentsOf } from "./tasks";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/dialog";
@@ -80,7 +80,7 @@ function AgentConsole({ id }: { id: string }) {
  */
 function InItsAgentsChat({ id, children }: { id: string; children: React.ReactNode }) {
   const [params] = useSearchParams();
-  const all = useRes(harnessSessionsRes).data;
+  const all = useHarnessSessions().data;
   const me = all.find((a) => a.id === id);
   const main = me?.subagent && me.parent && params.get("own") !== "1" ? all.find((a) => a.id === me.parent) : undefined;
   return main ? <Navigate to={`/agents/${main.id}?task=${encodeURIComponent(id)}`} replace /> : <>{children}</>;
@@ -101,7 +101,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
   const taskId = params.get("task");
   const taskInfo = useSession(store, (s) => (taskId ? s.state?.tasks.find((t) => t.id === taskId || t.tool_id === taskId) : undefined));
   // The subagents kiln started for its goals or plan steps: its, as its harness's own are.
-  const everyone = useRes(harnessSessionsRes).data;
+  const everyone = useHarnessSessions().data;
   const kiln = React.useMemo(() => kilnSubagentsOf(everyone, id), [everyone, id]);
   // One of those, its thread shown here: a session of its own.
   const sub = taskId ? (kiln.find((a) => a.id === taskId) ?? null) : null;

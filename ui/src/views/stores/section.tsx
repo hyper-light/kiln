@@ -222,10 +222,8 @@ function StoreKpis({ status, store }: { status: ConvoStatus; store: ConvoStore }
       </div>
       <div className="kpi">
         <div className="label">{store.role === "server" ? "Feeds in" : "Rows to come"}</div>
-        <div className="kpi-value">
-          {store.role === "server" ? perSec(status.stores.reduce((a, s) => a + (s.role === "runner" ? (s.rates.batches ?? 0) : 0), 0)) : behind == null ? "—" : countText(behind)}
-        </div>
-        <div className="kpi-foot">{store.role === "server" ? "batches taken" : store.state === "offline" ? "not linked" : stateText(store, status.at)}</div>
+        <div className="kpi-value">{store.role === "server" ? "Unknown" : behind == null ? "—" : countText(behind)}</div>
+        <div className="kpi-foot">{store.role === "server" ? "Amphora owns replication" : store.state === "offline" ? "not linked" : stateText(store, status.at)}</div>
       </div>
       <div className="kpi">
         <div className="label">On the wire</div>

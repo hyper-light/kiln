@@ -12,7 +12,7 @@ runs the same way on bare metal and on Kubernetes.
 | Rust / Python / Go / TypeScript (+ Erlang) | Toolchain presets pick images and caches; steps are plain shell so anything installed works. |
 | Heavy concurrent load | Async scheduler on hyper-rt (thread-per-core shards), HTTP/1.1 and HTTP/2 from kiln-http ([http.md](http.md)), bounded per-agent slots, per-repo concurrency groups, back-pressure. Logs go to disk segment files, never through the database. |
 | In-cluster **and** on-hardware jobs | One executor: the `kiln agent`. On bare metal it is a long-lived daemon; on Kubernetes the server launches an ephemeral agent pod per job. Jobs choose with `runs-on` labels (`k8s`, `baremetal`, `bench`, `gpu`, …). |
-| hyper-raft QUIC + TLS | Agent⇄server and CLI⇄server traffic runs over hyper-raft's QUIC transport with mutual TLS from hyper-tls. The store's writes go through one hyper-raft group, the store as its state machine ([p2p.md](p2p.md), P1): today a group of one voter, the server; runners hold replicas from P2 and vote from P3. The browser uses HTTPS + WebSocket (browsers cannot open raw QUIC). |
+| hyper-raft QUIC + TLS | Agent⇄server and CLI⇄server traffic runs over hyper-raft's QUIC transport with mutual TLS from hyper-tls. Amphora owns record replication through hyper-raft; transport connectivity does not confer record authority. The browser uses HTTPS + WebSocket (browsers cannot open raw QUIC). |
 | Rich, cheap telemetry | `/metrics` Prometheus endpoint; host/job samples read straight from `/proc` and cgroup files at a configurable low rate; agents ship samples as QUIC datagrams. No sidecars, no agents-of-agents. |
 | Grafana / Prometheus / ArgoCD | `deploy/` holds a Helm chart for kiln, a ServiceMonitor, Grafana dashboards as ConfigMaps, and ArgoCD Applications for the whole stack. |
 | Full machine control from the UI | PTY-backed terminal sessions (xterm.js + WebGL), full TTY semantics: resize, raw mode, alt-screen TUIs (k9s, htop, vim). |
@@ -26,7 +26,7 @@ runs the same way on bare metal and on Kubernetes.
 
 ```
                    ┌──────────────── kiln server ────────────────┐
- GitHub ◀─poll/ETag─┤ gitops   scheduler   store(SQLite/raft)     │
+ GitHub ◀─poll/ETag─┤ gitops   CI dispatch   Amphora Database     │
         ──webhook──▶│ api(HTTP+WS)  terminal(PTY)  metrics  logs  │
                    └───────▲──────────────▲──────────────▲───────┘
                      HTTPS/WS        QUIC + mTLS        QUIC + mTLS
@@ -90,12 +90,138 @@ jobs:
     artifacts: [target/criterion/**]
 ```
 
+### Ownership (U19)
+
+This maps current source ownership, not final acceptance or production activation. Final combined
+gates remain the acceptance boundary; individual checks do not establish whole-goal completion.
+Plans and goals live in kiln.
+
+| Concern | Canonical owner and source |
+| --- | --- |
+| Workflow parsing, planning, scheduling and routing | Pure `crates/kiln-ci` (`wf`, `plan`, `sched`); `crates/kiln/src/ci` supplies events, persists decisions and dispatches assignments. |
+| Shared CI/reach admission | `ci/dispatch.rs`, `ci/dispatch/admission.rs` and `kiln-ci::sched` own one capacity scheduler; reach reservations enter that scheduler rather than making independent placement decisions. |
+| Cron, ref/webhook ingress and outgoing fanout | `ci/schedule.rs`, `ci/events.rs`, `gitops.rs` and `ci/hooks.rs` accept immutable sources through the existing SQL outbox (`ci/schedule/outbox.rs`); `ci/webhooks.rs` freezes outgoing recipient fanout in the same materialization transaction. Quiver only wakes consumers. |
+| Cancellation acceptance | `ci/dispatch/cancellation.rs` acknowledges the captured attempt only after its existing `ci_plan_log` intent commits; retries/recovery retain that receipt. Physical stop proof remains the execution owner's responsibility. |
+| Step execution | `crates/kiln/src/runner/runtime.rs` executes workflow assignments using `kiln-ci` decisions; `runner/workspaces.rs` holds stable cross-process locks through cleanup and refuses failed claims. Legacy inputs adapt to this runtime rather than owning another scheduler or execution engine. |
+| SQL and Records | One host Amphora `Database`, injected from `Store.database()` across Hub, Host and agent (`store.rs`, `records.rs`), with SQL migrations and isolated Records namespaces; namespaces do not create independent databases or writers. `store/migrations.rs` initializes schema through checked durable per-migration steps, using one fenced inventory read on warm startup. After `UnknownOutcome`, only an exact receipt from a fresh fenced read proves commit; absent or failed reconciliation leaves startup unready. |
+| Structured sessions and conversations | `harness/registry.rs` injects per-host server/machine Records namespaces, global `registry` control and `visuals`; `convo::from_host_sources` binds legacy origins to that same database for conversation data and feeds. Persistent local `harness/host.rs` start/stop ledgers own acceptance; remote close succeeds only on durable runner `Taken`, never in-memory `Sent`/`Parked` (`harness/registry.rs`). |
+| CD control | The pure `kiln-cd` engine decides; `cd` performs effects and persists control in the shared database (`cd/store.rs`, canonical Records in the `cd-engine` namespace). |
+| Secrets | `secrets/{mod,kiln,crypto}.rs` own versioned storage and encryption; `ci/secrets.rs` applies CI scope, trust and broker policy against that shared service. `secrets/crypto/bootstrap.rs` validates/caches the master before other Hub effects and `Store::recover`, detects the actual replicated owner, requires an existing key plus trusted pin where appropriate, and uses an immutable verifier to refuse rebinding. This correction is frozen/source-ready; migration is described in [ci.md](ci.md). |
+| Environment gates | `kiln-ci::env` decides protection policy; `ci/environments/{source,policy,actions}.rs` adapts definitions, approvals and transitions, with CD consuming the same environment boundary. `ci/runs.rs` validates exact deployment/run/leg/attempt/environment/repository/SHA context before committing deployment control; `ci/notify.rs` publishes afterward. |
+| Kubernetes access | `kubernetes.rs` owns configuration, credentials and connections; `kubeapi.rs` and `cd/kube.rs` adapt typed executor and CD operations through kiln HTTP. |
+| Operations and agent UI | `ops.rs` registers shared authorized operations; `harness/ops.rs`, `api.rs` and `ui/src/views/harness` expose structured ownership without becoming separate control stores. `ui/src/lib/data.ts` owns `harnessSessionsRes`; waiting cards project that same roster through `observeResource` (`ui/src/views/harness/waiting.ts`), without another fetch/event owner or markup change. |
+| Runner CI/CD upgrades | `updates.rs` and `updates/coordinator.rs` persist lifecycle state and consume immutable `build_commit` artifacts with signed provenance; `cd/runners.rs` submits release-commit work through CI. `upgrade.rs` supplies physical replacement mechanics. |
+| Host control metadata | Sync places/tasks and reach copy inventory/requests use host-scoped SQL control cells (`sync/places/control.rs`, `reach/copies.rs`); keeper state (`reach/keeper.rs`), runner clone provenance (`sync/runner.rs`), agent-limit policy (`harness/limit.rs`) and front-door policy/import receipts (`frontdoor/settings.rs`) use the existing machine Records namespace from the host database. Front-door `settings.json` is read-only legacy input; certificate/key files remain physical. |
+| Kept files and terminal names | `harness/kept.rs` owns file-list metadata and `termsess.rs` owns terminal names in Records injected from the same Amphora database; byte files and terminal processes remain physical resources. |
+| Notifications | `bus.rs` uses Quiver for event delivery; notifications are separate from canonical records and their replication. |
+| Record replication | Amphora's hyper-raft integration is the sole record replication authority. `replication/carrier.rs` polls bounded queued-receive receipts while driving egress: transport admission is not a processed or committed acknowledgment. Reach links and front-door routing do not add another record log. |
+| Cache/object metadata and bytes | `ci/services/{cache_v1,cas,chunks}.rs` and `blobs` own cache/object access; durable metadata belongs to the shared Amphora store, while content bytes remain in object storage and runner caches (`runner/cache.rs`). The runner shares one optional bounded chunk tier (`runner/cache.rs`, `runner/work/store.rs`), with canonical Amphora accounting and temporary OS-owned operation guards; logical holdings never promise byte residency. Its physical mutation fence covers publication versus trim; `ci/registry/{mod,proxy,mirror}.rs` retain staging until the last writer/owner releases it. These resource fixes are frozen, not final-gate acceptance. |
+| Git mirror/fetch | `git.rs` adapts credentials, timeouts and cancellation to `kiln-cd/src/git.rs`'s shared read-mirror engine; physical mirrors are keyed by source and effective credential identity, not independent control records. `cd/mod.rs` bounds credential prefixes by authority and repository path; that fix is ready. Shared read-mirror mutations use a stable sibling `.kiln-read.lock` across processes alongside the in-process gate; lock waits use the bounded `git-mirror-lock` blocking-pool share. Source implementation is present; final integration/native validation remains pending. |
+| Files, logs and blobs | Synctree, sync logs, object stores and reach carry bytes and checkpoints. Their transport positions describe byte availability, not accepted control intent. `harness/kept.rs`'s cross-process `.publication.lock` fences physical blob publication/GC through metadata commit; the lock is not a metadata authority. |
+| Session persistence versus physical controls | `harness/registry.rs`, `harness/host.rs` and `harness/session.rs` persist structured intent through injected stores; `harness/survivors.rs`, `os/contain_*` and `runner/kept.rs` manage process identity, kernel/container fences, journals and locks as local proof/bootstrap, not canonical accepted intent. |
+
+Legacy SQLite/Turso and JSON sidecars are read-only import inputs. Imports are checked and
+restartable; ambiguous or partial ownership fails closed, without falling back to a legacy writer.
+Local bootstrap material and physical locks remain where the operating system needs them.
+
+Runner upgrades (`updates.rs`, U16) consume immutable CI artifacts from `build_commit` with signed
+provenance; `cd/runners.rs` routes CD work through CI at its release commit. Ad hoc scripts are not
+an alternative release authority. `upgrade.rs` supplies replacement mechanics; the person still
+controls runner replacement and timing. This mapping does not report an upgrade performed.
+
+Coding-agent discovery (`aisessions.rs`, U18) uses the shared Tool registry across harnesses.
+External interactive processes are observations without control ownership. Structured sessions and
+their descendants belong to the structured host: a verified `KILN_AGENT` session mark and bounded
+process ancestry establish that ownership, never a bare reusable PID.
+
+### Runner cache policy and cutover (U07)
+
+The runner stores each cached digest once under `<work>/_cache`; derived assembly manifests
+remain under `_cas/objects`. Scoped logical ledger metadata stays in the existing canonical
+Amphora database and Records/ledger boundary. Physical accounting uses three relational record
+sets in that same database: `runner_cache_tiers` (root identity, budget and cursors),
+`runner_cache_chunks` (chunks and `manifest:<digest>` inventory), and `runner_cache_intents`
+(publication reservations). These are not another Records backend or a business reference graph.
+`_cas/index.log` and `_cas/ledger.db` are read-only migration inputs, not live metadata writers.
+
+All idle chunks and manifests share an LRU, including bytes named by current holdings, replaced
+or deleted entries, failed publications and historical results. Canonical history survives byte
+eviction; authorization does not imply residency. Missing or corrupt optional bytes require
+refetch/recomputation. Verified corrupt copies are discarded rather than retained in an uncharged
+quarantine. `[agent] cache_max` (default 10 GiB) charges unique chunks, derived manifests and owned
+publication/repair staging. Reserve the complete footprint before writing; repair charges the
+old bytes plus replacement peak. Lowered limits or imported overage can need multiple bounded
+maintenance passes; growth is refused until used plus reserved plus requested bytes fit.
+
+Only active operations protect bytes. The engineering limits are 64 OS-owned lock/header slots
+per physical root, at most 65,536 digests per operation, and a fixed header bound of the format
+prefix plus 65 bytes per digest. Clones and covered nested reads reuse ownership through dispatched
+IO and cancellation; process death releases it. Stale headers and old permanent pins establish no
+liveness; malformed active headers refuse eviction. Assembly manifests are limited to 8 MiB.
+Typed `Capacity`, `MaintenancePending` and `GuardCapacity` permit optional-cache bypass where
+supported; mutation Busy uses bounded caller retry/bypass. IO, metadata/commit, format and invalid
+publication errors remain failures. An optional cache decline never acknowledges unpublished work.
+
+Workfill/transport input staging is separately bounded to 16 GiB per transfer, not charged-tier
+residency and not a global concurrent-staging budget. Plan free disk for concurrent transfers,
+cache publication peaks and database/workspace use together. Peer reads use guarded shared chunks
+without permanent whole-object peer copies. Neither this limit nor `cache_max` bounds the entire
+work directory.
+
+The following is a reviewable activation procedure, not authorization or automatic activation.
+U07 source is frozen and source-reviewed; compile, profile/performance and native validation remain
+pending. No runtime or gate PASS is claimed here.
+
+1. Before approval, attach exact-source validation and a recovery/rollback drill to the release
+   review. Inventory each work root, its canonical database identity, budget, legacy inputs and
+   live agents/terminals/jobs. Preserve consistent canonical metadata and any pinned source needed
+   by an incomplete metadata import; external recovery copies are not active cache residency.
+2. Leave runner replacement and timing to the person under the existing release procedure.
+   Before pre-format writer cutover, an operator must verify that **all** old writers sharing the
+   root are quiescent and cannot resume during migration. Age, absent new locks or old pin files
+   are not proof. Only then may the authorized operator create `<work>/_cache/.u07-quiescent`
+   containing these exact UTF-8 bytes, including the final LF:
+
+   ```text
+   U07: all pre-format cache writers are quiescent
+   ```
+
+3. Initialization performs a restartable, idempotent, paged one-time inventory of chunks and
+   manifests before new admission. The physical fence protects inventory/publication; the
+   `.u07-format` identity binds the root to the canonical database. Do not erase a mismatched
+   format binding or import receipt to force readiness. A fresh empty tier needs no attestation;
+   legacy bytes, manifests, staging or pins require the offline proof.
+4. Quiescent cleanup removes only recognized legacy digest-named pins, corrupt/peer copies,
+   32-hex `_cas/tmp` files and known digest/publication-ID temporary files. Unknown entries refuse
+   readiness and need explicit identification, never speculative deletion. Old `_cas/chunks` and
+   whole-object sources are verified and copied into the charged tier or discarded on typed
+   admission decline; corrupt optional sources are discarded. Whole legacy sources above their
+   8 MiB format contract refuse import. No permanent uncharged legacy cache floor is retained.
+5. On interruption, reopen with the same database and supported import/recovery path. Preserve
+   pinned metadata sources until their receipts finish; do not resume legacy writers as fallback.
+   Canonical intents retain reservation credit until fenced recovery reconciles files. Before
+   admitting work, review readiness, used/reserved bytes, deferred maintenance and free space.
+   Wrong binding, unknown files, IO or metadata errors require diagnosis. A binary downgrade is
+   not a proven rollback: old writers do not understand the new fences or accounting.
+
+### SQL format cutover and rollback
+
+A SQLite-era `kiln.db` cannot activate automatically beside the canonical Amphora owner.
+`kiln store cutover --data-dir <explicit-directory> --offline` is the supervised offline entry:
+all old SQL/group/backup producers and their automatic restart must actually remain disabled
+through interruption. The assertion and file lock do not establish that authority. It preserves
+the read-only source inside a directory at `kiln.db`, which blocks both old SQLite opens and old
+replica rename-over replacement. New acceptance requires that fence and the exact completed
+Amphora restore identity. Windows cutover is currently typed unsupported before mutation because
+this implementation cannot prove durable directory publication there. Follow the
+[SQL cutover train](trains/unification-sql-cutover.md); a SQLite-era binary is a roll-forward-only
+boundary, not a safe image rollback after canonical writes.
+
 ### Run lifecycle
 
-`queued → scheduled → running → (succeeded | failed | cancelled | timed_out)`. The scheduler holds
-a ready queue keyed by labels; an agent offers capacity (`slots`) over its QUIC session and the
-scheduler assigns the oldest matching job. A lost agent (missed heartbeats) requeues its jobs up to
-`retries`.
+CI records workflow runs and attempts; `kiln-ci::sched` decides assignments, waits, concurrency,
+resource routing and retry policy from supplied events. Server dispatch carries out those commands,
+and runner events advance the durable state. Capacity is selected by capabilities and resources.
 
 ### Fault tolerance layers
 
@@ -103,7 +229,7 @@ scheduler assigns the oldest matching job. A lost agent (missed heartbeats) requ
    log; a healthy period resets the backoff.
 2. **Subsystem**: in-process supervisor restarts failed tasks (poller, scheduler, listeners).
 3. **Job**: retries, agent-loss requeue, timeouts, cancellation that kills the whole process group.
-4. **State**: SQLite in WAL mode with `synchronous=NORMAL`; recovery on start marks orphaned runs.
+4. **State**: Amphora owns atomic commit, flush and record replication; recovery reconciles durable intent with runner evidence.
 
 ## Agent transport
 

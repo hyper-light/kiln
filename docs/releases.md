@@ -3,14 +3,14 @@
 kiln builds and ships itself: every push to the release branch (`main`) runs `.kiln/release.yaml`,
 which builds every platform's binary from that commit, all at once, each on a machine of its own
 platform where kiln has one. By the time that commit is deployed, its binaries are usually ready,
-and every runner upgrades as soon as the server runs it. The server also starts the pipeline on
+and runners with an explicitly automatic update policy can upgrade when the server runs it. The server also starts the pipeline on
 its own commit when a platform's binary is missing (below), and it runs from **System → Builds →
 Build every platform** (or the Runners page, when a machine's platform has no build yet), on a tag
 (`v*`), or by hand. A newer push replaces a build still under way.
 
 1. Three jobs, at once, each building the UI first, then its binaries with `ci/release/build.sh`:
-   - `linux`, on the server's own Linux runner: x86_64 and aarch64, static musl.
-   - `windows`, on the same runner: x86_64, cross-built with zig.
+   - `linux`, on a Linux runner with the declared tools: x86_64 and aarch64, static musl.
+   - `windows`, on a Linux runner with the declared tools: x86_64, cross-built with zig.
    - `macos`, on a Mac: Apple silicon only (kiln doesn't run on Intel Macs), built natively with
      the Mac's own toolchain and SDK, minimum macOS 11. It `requires` a Mac with cargo and node,
      so it waits for one rather than going to a Mac without developer tools. On Linux, `build.sh` can cross-build them too (zig, linking against
@@ -27,7 +27,7 @@ Build every platform** (or the Runners page, when a machine's platform has no bu
 3. Every runner can then be upgraded remotely, from the Runners page or System → Updates; the
    server also serves the binaries at `/dl/kiln/<target>`, so `install.sh` / `install.ps1` install
    from it on any machine, with no GitHub involved. A runner of the server's own platform gets the
-   server's own build.
+   verified artifact from the same CI release workflow.
 
 **Each runner has an update policy, and nothing is forced.** System → Updates sets it for one
 runner, any selection of them, or all:
@@ -63,15 +63,27 @@ a change kiln couldn't read (an unknown key, a wrong type) before writing anythi
 each runner's state as Prometheus gauges: `kiln_runner_up`, `kiln_runner_behind`,
 `kiln_runner_update_policy{policy}` and `kiln_runner_version_info{version}`.
 
-A runner with no binary of the server's commit yet doesn't wait on another machine: it waits only
-while its own platform's job is building, and otherwise the commit is built from the server's
-source right away. No checkout of kiln is needed anywhere. A machine with the tools (cargo and
-node, as its runner reports them) builds the commit itself; a Mac's build is kept, so the other
-Macs download it. A Mac without them (no developer tools) gets its build over the wire: a Mac
-that has them builds the commit natively, else a Linux machine cross-builds it
-(`ci/release/build.sh`: zig, against the macOS stubs). The binary comes back to the server, and the
-Mac downloads it in the same upgrade. One build of a commit serves every Mac: while one is under
-way, the other Macs wait for it rather than start another.
+**U16: one CI/CD lifecycle.** An upgrade request is saved through the existing Store before
+any command is dispatched. Missing binaries are built by the configured release workflow through
+the canonical CI engine; concurrent requests reuse its run. CI chooses builders by declared
+requirements. Each release job attests its binary subjects, and the coordinator verifies the signed
+provenance, successful source run, repository, commit, workflow, branch, digest and platform before
+creating the native runner deployment. Both historical `download` and `build` choices enter this
+same path. There are no hidden build/install terminals or generated upgrade scripts.
+
+The coordinator records a canonical CD release with its pinned artifact, requester, CI run and
+native handover outcome. Immutable artifact bytes and metadata are retained separately from the
+latest platform pointer, so a pending rollout can still fetch its exact build after another build
+finishes. Runner checksums and download size limits remain enforced. A runner predating native
+upgrade commands is explicitly refused, even if it supports terminals; bootstrapping a compatible
+runner requires the person's separate authorization.
+
+Intent, dispatch fencing, bounded logs, build receipt and blue/green handover evidence survive a
+server restart. Recovery resumes CI waits and observes dispatched upgrades; it does not repeat an
+ambiguous install command. A failure before dispatch can be retried explicitly. If the server
+stopped between recording dispatch and sending it, recovery eventually reports the timeout and
+leaves retry timing to the person. Automatic upgrading remains opt-in through the existing fleet
+and per-runner policies.
 
 ## How a runner is upgraded: blue/green
 
@@ -141,8 +153,7 @@ before the server's own (its first parents), by sha, under two tolerances:
   `skew_full` before it does everything.
 - **Upgrade** (`skew_upgrade`, 1000 by default, never less than `skew_full`): a runner on one of
   the commits past those, within `skew_upgrade`, connects so it can be brought up to date. Until
-  it is, it takes no new work: no jobs or legs, no new agents, no new terminals (kiln's own, for
-  upgrading it, still open).
+  it is, it takes no new work: no jobs or legs, no new agents, no new terminals. Native upgrade commands remain available.
 - Further behind, a runner is **refused**: it's told how far behind it is and how to catch up
   (`kiln install --agent --upgrade` with a newer kiln, or a larger upgrade tolerance), and it
   tries again a minute later.
@@ -208,12 +219,9 @@ row reads *upgrade failed* or *build failed*, with the upgrade's output under it
 
 - **Retry** tries the same way again now, without waiting for kiln's next automatic try (a failed
   automatic upgrade is tried again after 30 minutes, twice per commit).
-- **Download instead** / **Build it instead**: the other way, when it's open. A download needs a
-  binary of the newest kiln for the machine's platform. A build needs a machine with the tools to
-  make it: the runner's own, or for a Mac without them, another Mac (or a Linux machine,
-  cross-building) whose build it then downloads. A way that can't be taken now says why (no binary
-  yet, a release run still building one, no machine with the tools for it, terminals turned off),
-  so a runner kiln is waiting on can still be upgraded the other way.
+- **Download instead** / **Build it instead** both use the canonical CI release and native CD
+  backend. A missing binary waits on CI's declared builders; no runner builds or installs from a
+  hidden terminal. Missing or invalid provenance is reported as a refusal.
 - **Diagnose** (on every connected runner) looks at it, and lists in its row what's wrong, worst
   first, each with the repair that fixes it when kiln can make it (below).
 - **Ask an agent**, under a diagnosis, fills Mission control's composer on that machine with a first message
@@ -226,8 +234,11 @@ row reads *upgrade failed* or *build failed*, with the upgrade's output under it
 
 `POST /api/updates/runners/{name}` with `{"way": "download" | "build"}` does the same as the
 buttons (no body: the way kiln picks). `GET /api/updates` lists each runner's `ways`, each with `ok`
-and `why`, and for a build another machine makes, `on` (that machine); an upgrade job made that way
-carries `on` too.
+and `why`. Build placement and logs belong to the linked canonical CI run. U16 also accepts
+`{"retry":"<failed-upgrade-job-id>"}` to retry its original version, or
+`{"rollback":<successful-runner-CD-release-id>}` to deploy that retained artifact again. Choose
+one selector per request. The existing upgrade authorization applies to all three actions; a
+rollback must name a successful native release belonging to the requested runner.
 
 ### Diagnosing and repairing a runner
 

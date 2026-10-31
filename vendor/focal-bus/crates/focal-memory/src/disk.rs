@@ -278,7 +278,7 @@ impl DiskBudget {
             let _ = self
                 .0
                 .free
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
                     (free != UNKNOWN).then(|| free.saturating_sub(bytes))
                 });
         }

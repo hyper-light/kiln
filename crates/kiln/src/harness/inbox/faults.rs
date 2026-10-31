@@ -335,6 +335,8 @@ fn a_runner_restarted_before_its_session_took_in_the_ids_it_brought_takes_a_retr
 /// messages to it all the same).
 async fn hub_and_session() -> anyhow::Result<(Arc<crate::hub::Hub>, String, tempfile::TempDir)> {
     let hub = crate::hub::tests::scratch_hub_with(|c| c.conversations.off = true).await?;
+    // U17: canonical restoration finishes before this fixture starts a session.
+    crate::harness::registry::Registry::initialize_local(&hub).await?;
     let h = Arc::clone(&hub);
     crate::rt::spawn(async move {
         let _ = crate::harness::registry::Registry::run_local(h).await;
@@ -511,14 +513,16 @@ fn a_hand_over_sent_again_after_its_session_left_is_answered_as_taken_and_not_ta
     use std::time::Duration;
     crate::rt::block_on(async move {
         for leaves in ["ended there", "went on elsewhere"] {
+            // U19: containment belongs to the session; parallel tests and both scenarios need distinct owners.
+            let session = crate::util::new_id();
             let dir = tempfile::tempdir()?;
             let (heard, program) = (dir.path().join("heard.jsonl"), dir.path().join("answering-claude"));
             answering_claude(&program, &heard)?;
-            // What box-a hands over: session s1, a message waiting in its queue.
+            // What box-a hands over: one session, a message waiting in its queue.
             let cwd = dir.path().to_string_lossy().into_owned();
             let mut state = State::default();
             state.queue.push(QueueItem { id: "q1".into(), text: "carry on with the migration".into(), at: 0, attachments: Vec::new(), overrides: None, reply_to: None });
-            let mut pkg = pack("s1", Spec { kind: "claude".into(), cwd: Some(cwd.clone()), ..Spec::default() }, &cwd, "box-a", &cwd, Carry::Nothing, Vec::new(), state);
+            let mut pkg = pack(&session, Spec { kind: "claude".into(), cwd: Some(cwd.clone()), ..Spec::default() }, &cwd, "box-a", &cwd, Carry::Nothing, Vec::new(), state);
             pkg.spec.program = Some(program.to_string_lossy().into_owned());
             let bytes = serde_json::to_vec(&pkg)?;
             let (tx, _rx) = async_channel::unbounded();
@@ -527,18 +531,18 @@ fn a_hand_over_sent_again_after_its_session_left_is_answered_as_taken_and_not_ta
             b.adopt("box-a", &bytes).map_err(anyhow::Error::msg)?;
             until("q1 reached box-b's harness", || prompts(&heard).iter().any(|p| p == "q1")).await?;
             if leaves == "ended there" {
-                anyhow::ensure!(b.close("s1"), "no session to end");
+                anyhow::ensure!(b.close(&session), "no session to end");
             } else {
-                anyhow::ensure!(b.let_go("s1"), "no session to let go");
+                anyhow::ensure!(b.let_go(&session), "no session to let go");
             }
-            until("box-b let s1 go", || b.get("s1").is_none()).await?;
+            until("box-b let the session go", || b.get(&session).is_none()).await?;
             // box-a asks again with the same package.
             let again = b.adopt("box-a", &bytes);
             crate::rt::sleep(Duration::from_millis(1500)).await;
             let reached = prompts(&heard).iter().filter(|p| *p == "q1").count();
-            anyhow::ensure!(again.is_ok(), "s1 {leaves} on box-b; box-a's hand-over sent again was answered {again:?}");
-            anyhow::ensure!(b.get("s1").is_none(), "s1 {leaves} on box-b, and runs there again from the old package");
-            anyhow::ensure!(reached == 1, "s1 {leaves} on box-b; q1 reached a harness {reached} times");
+            anyhow::ensure!(again.is_ok(), "{session} {leaves} on box-b; box-a's hand-over sent again was answered {again:?}");
+            anyhow::ensure!(b.get(&session).is_none(), "{session} {leaves} on box-b, and runs there again from the old package");
+            anyhow::ensure!(reached == 1, "{session} {leaves} on box-b; q1 reached a harness {reached} times");
         }
         Ok(())
     })

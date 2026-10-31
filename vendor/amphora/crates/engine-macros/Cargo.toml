@@ -1,0 +1,22 @@
+# Copyright 2024 the Limbo authors. All rights reserved. MIT license.
+# Amphora's engine's macros, since Turso 3e09a82 (../engine/ORIGIN.md).
+
+[package]
+name = "amphora-engine-macros"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Amphora's engine's macros"
+
+[lib]
+proc-macro = true
+
+[features]
+
+[dependencies]
+quote = "1.0.38"
+proc-macro2 = "1.0.93"
+syn = { version = "2.0.96", features = ["full", "clone-impls", "visit-mut"] }

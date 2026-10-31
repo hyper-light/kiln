@@ -47,45 +47,12 @@ fn result(gate: &str, passed: bool, detail: impl Into<String>, evidence: Value) 
 /// The person a caller is or acts for, as reviewers name people: `user:ada`, a token of hers
 /// (`pat:<id> of user:ada`) and an agent acting for her (`agent:fix for user:ada`) are `ada`; the
 /// owner is `admin`.
-pub fn person(name: &str) -> &str {
-    let name = name.rsplit_once(" for ").or_else(|| name.rsplit_once(" of ")).map_or(name, |(_, who)| who);
-    name.strip_prefix("user:").unwrap_or(name)
-}
+pub use kiln_ci::env::person;
 
-/// Whether a deny window holds now, or no allow window is open: when it opens again, and why.
+/// U10: all deployment boundaries use the canonical window evaluator. Preserve the release
+/// surface's existing refusal text, including its noun, for clients and recorded evidence.
 fn closed(windows: &[Window], now: i64) -> Result<Option<(i64, String)>, String> {
-    let mut allow_open = None::<bool>;
-    let mut next_allow: Option<i64> = None;
-    for w in windows {
-        let (schedule, deny) = match (&w.allow, &w.deny) {
-            (Some(s), None) => (s, false),
-            (None, Some(s)) => (s, true),
-            _ => return Err("a window is either `allow: <cron>` or `deny: <cron>`".into()),
-        };
-        let cron = kiln_ci::trigger::cron::Cron::parse(schedule).map_err(|e| format!("window `{schedule}`: {e}"))?;
-        let tz = kiln_ci::trigger::cron::zone(w.timezone.as_deref())?;
-        let secs = kiln_ci::trigger::cron::seconds(&w.duration).and_then(|s| i64::try_from(s).ok()).filter(|s| *s > 0).ok_or_else(|| format!("window `{schedule}`: `{}` isn't a duration (`90m`, `2h`, `1d`)", w.duration))?;
-        // Open now when it opened within its duration.
-        let opened = cron.fires_in(now - secs, now, &tz, 10_000).last().copied();
-        match (deny, opened) {
-            (true, Some(at)) => return Ok(Some((at + secs, format!("a deny window (`{schedule}`, {}) holds releases until {}", w.duration, super::repo::rfc3339(at + secs))))),
-            (true, None) => {}
-            (false, Some(_)) => allow_open = Some(true),
-            (false, None) => {
-                allow_open.get_or_insert(false);
-                if let Some(at) = cron.fires_in(now, now + 60 * 24 * 3600, &tz, 1).first().copied() {
-                    next_allow = Some(next_allow.map_or(at, |n| n.min(at)));
-                }
-            }
-        }
-    }
-    Ok(match allow_open {
-        Some(false) => {
-            let until = next_allow.unwrap_or(now + 3600);
-            Some((until, format!("no allow window is open: the next opens at {}", super::repo::rfc3339(until))))
-        }
-        _ => None,
-    })
+    kiln_ci::env::closed(windows, now).map(|closed| closed.map(|(until, why)| (until, why.replace("holds deployments until", "holds releases until"))))
 }
 
 /// An external check (a URL or a workflow), as described.
@@ -123,9 +90,50 @@ async fn checks_of(d: &Deploy, env: &Environment, app: &App) -> anyhow::Result<V
 
 /// What the gates say of `r` now.
 pub async fn evaluate(d: &Deploy, r: &Release, env: &Environment, app: &App) -> anyhow::Result<Verdict> {
+    use crate::ci::environments::{actions,policy};
     let checks = checks_of(d, env, app).await?;
-    let v = judge(d, r, env, app, &checks).await?;
-    Ok(keep(v, r, &checks))
+    let identity=kiln_ci::env::EnvironmentId{scope:kiln_ci::env::EnvironmentScope::Server,name:env.name.clone()};
+    let shared=match r.provider.get("protected_action").and_then(Value::as_str) {
+        Some(id)=>Some(actions::get(&d.hub.store,id).await?.ok_or_else(||anyhow::anyhow!("protected Flow no longer exists"))?),None=>None,
+    };
+    let decisions=if let Some(flow)=&shared {
+        // U10/U19: a shared action cannot outlive an unreadable policy authority.
+        let Some(repo)=d.hub.store.repos().await?.into_iter().find(|repo|repo.id==flow.repo) else {
+            return Ok(Verdict::Refuse{results:Vec::new(),why:"protected Flow repository no longer exists".into()});
+        };
+        if let Err(error)=crate::ci::environments::source_ready(&d.hub,&repo).await {
+            return Ok(Verdict::Refuse{results:Vec::new(),why:format!("{error:#}")});
+        }
+        if flow.environment.key()?!=identity.key()? || flow.app!=r.app || Some(flow.version.as_str())!=r.version.as_deref() || r.kind!=Kind::Deploy {
+            return Ok(Verdict::Refuse{results:Vec::new(),why:"protected Flow does not authorize this environment/app/version".into()});
+        }
+        if let actions::FlowBinding::Refused(why)=actions::bind_release(&d.hub.store,flow,&identity,&r.app,r.version.as_deref(),r.id,&r.artifacts).await? {return Ok(Verdict::Refuse{results:Vec::new(),why});}
+        actions::reviews(&d.hub.store,&flow.id).await?
+    }else{r.approvals.iter().map(|a|kiln_ci::env::Review{by:a.by.clone(),approved:a.approved,comment:a.note.clone().unwrap_or_default(),at:a.at}).collect()};
+    if let Some(review)=decisions.iter().find(|r|!r.approved) {
+        return Ok(Verdict::Refuse{results:Vec::new(),why:format!("rejected by {}{}",review.by,if review.comment.is_empty(){String::new()}else{format!(": {}",review.comment)})});
+    }
+    let actor=shared.as_ref().map_or(r.requested_by.as_str(),|f|f.actor.as_str());
+    let v = keep(judge(d, r, env, app, &checks,&decisions,actor).await?,r,&checks);
+    if let Verdict::Go(mut results)=v {
+        if r.id>0 {
+            actions::restore_release_holders(&d.hub.store,&*d.records,&env.name).await?;
+            actions::reap_releases(&d.hub.store,&*d.records).await?;
+            let capacity=policy::get(&*d.records,&identity).await?.and_then(|p|p.concurrency);
+            let action=shared.as_ref().map_or_else(||format!("release:{}",r.id),|f|format!("flow:{}",f.id));
+            match actions::reserve(&d.hub.store,&identity,&action,"release",&r.id.to_string(),&store::environment_policy(env)?.protection,crate::util::now_unix()).await? {
+                actions::Admission::Granted=>{},
+                actions::Admission::Held(detail)=>{
+                    let why=format!("{}: {detail}",env.name);
+                    results.push(result("concurrency",false,why.clone(),json!({"limit":capacity})));
+                    return Ok(Verdict::Hold{results,why,approval:false,until:Some(crate::util::now_unix()+AGAIN_SECS)});
+                }
+                actions::Admission::Refused(why)=>return Ok(Verdict::Refuse{results,why}),
+            }
+        }
+        return Ok(Verdict::Go(results));
+    }
+    Ok(v)
 }
 
 /// An external check's earlier result stays with the release while a gate before it holds the
@@ -154,7 +162,7 @@ fn keep(v: Verdict, r: &Release, checks: &[Check]) -> Verdict {
     }
 }
 
-async fn judge(d: &Deploy, r: &Release, env: &Environment, app: &App, checks: &[Check]) -> anyhow::Result<Verdict> {
+async fn judge(d: &Deploy, r: &Release, env: &Environment, app: &App, checks: &[Check], decisions:&[kiln_ci::env::Review], approval_actor:&str) -> anyhow::Result<Verdict> {
     let g = &env.gates;
     let now = crate::util::now_unix();
     let mut results = Vec::new();
@@ -241,11 +249,10 @@ async fn judge(d: &Deploy, r: &Release, env: &Environment, app: &App, checks: &[
                     evidence.insert("release".into(), json!(x.release));
                     evidence.insert("since".into(), json!(x.since));
                     results.push(result(&gate, true, format!("{version} runs in {upstream} (release {})", x.release), Value::Object(evidence)));
-                    if let Some(s) = soak
-                        && now - x.since < s
-                        && soaking.as_ref().is_none_or(|(until, _)| x.since + s > *until)
+                    if let kiln_ci::env::PrerequisiteGate::Waiting { until: Some(until), .. } = kiln_ci::env::prerequisite_gate(&kiln_ci::env::Prerequisite::Running { since: x.since }, g.soak.as_deref(), now).map_err(anyhow::Error::msg)?
+                        && soaking.as_ref().is_none_or(|(previous, _)| until > *previous)
                     {
-                        soaking = Some((x.since + s, upstream.clone()));
+                        soaking = Some((until, upstream.clone()));
                     }
                 }
                 None => {
@@ -318,20 +325,16 @@ async fn judge(d: &Deploy, r: &Release, env: &Environment, app: &App, checks: &[
 
     if let Some(a) = &g.approvals {
         let count = a.count.max(1);
-        let valid: Vec<&super::model::Approval> = r
-            .approvals
-            .iter()
-            .filter(|x| a.self_approve || person(&x.by) != person(&r.requested_by))
-            .filter(|x| a.reviewers.is_empty() || a.reviewers.iter().any(|rv| rv == person(&x.by)))
-            .collect();
-        let mut people: Vec<&str> = valid.iter().map(|x| person(&x.by)).collect();
-        people.sort_unstable();
-        people.dedup();
+        let people = kiln_ci::env::approved_people(a, approval_actor, decisions.iter().filter(|x|x.approved).map(|x| x.by.as_str()));
         let have = u32::try_from(people.len()).unwrap_or(u32::MAX);
         let evidence = json!({ "count": count, "approved_by": people, "reviewers": a.reviewers, "self_approve": a.self_approve });
-        if have < count {
+        // U10: the common gate engine decides counted approval admission. This service
+        // retains the release's evidence and its established refusal/waiting messages.
+        let policy = kiln_ci::env::Protection { approvals: Some(a.clone()), ..Default::default() };
+        let reviews: Vec<kiln_ci::env::Review> = people.iter().map(|by| kiln_ci::env::Review { by: (*by).to_owned(), approved: true, comment: String::new(), at: now }).collect();
+        if !matches!(kiln_ci::env::gate(&env.name, &policy, "", r.created_at, now, &reviews), kiln_ci::env::Gate::Open) {
             let who = if a.reviewers.is_empty() { "anyone who may approve releases here".to_owned() } else { a.reviewers.join(", ") };
-            let why = format!("waits for {} more approval{} from {who}", count - have, if count - have == 1 { "" } else { "s" });
+            let why = format!("waits for {} more approval{} from {who}", count.saturating_sub(have), if count.saturating_sub(have) == 1 { "" } else { "s" });
             results.push(result("approvals", false, why.clone(), evidence));
             return Ok(Verdict::Hold { results, why, approval: true, until: None });
         }
@@ -455,6 +458,7 @@ pub fn holding(s: State) -> bool {
 /// knows, a provenance requirement it can check. Said when they're put, not when a release meets
 /// them.
 pub async fn check(d: &Deploy, g: &Gates) -> Result<(), String> {
+    if g.concurrency_limit==Some(0) {return Err("an environment concurrency limit is 1 or more".into());}
     check_checks(d, &g.checks).await?;
     for upstream in &g.after {
         let Some((there, server)) = upstream.split_once('@') else { continue };
@@ -591,6 +595,65 @@ mod tests {
         Ok(serde_json::from_value(json!({ "id": id, "app": "web", "environment": env, "kind": "deploy", "state": "waiting", "version": version, "artifacts": artifacts, "requested_by": "user:ada", "created_at": 0 }))?)
     }
 
+    /// U10: canonical admission reads the numbered release in the same database as policy.
+    async fn numbered(d: &Deploy, release: &Release) -> anyhow::Result<Release> {
+        let (recorded, new) = store::insert_release(&*d.records, release).await?;
+        anyhow::ensure!(new, "a fresh fixture release is numbered");
+        Ok(recorded)
+    }
+
+    #[test]
+    fn u10_combined_ci_to_release_flow_requires_both_scopes_and_prompts_only_once()->anyhow::Result<()> {
+        crate::rt::block_on(async {
+            use crate::ci::environments::{self,actions};
+            use crate::authz::{Caller,Grant,Rights};
+            let d=deploy_with(|_|{}).await?;
+            let env=environment("release-prod",json!({"approvals":{"count":1,"reviewers":["alice"]},"concurrency_limit":1}))?;
+            store::put_environment(&*d.records,&env).await?;
+            let app=app("web")?;
+            store::put_app(&*d.records,&app).await?;
+            store::put_registration(&*d.records,&Registration{app:"web".into(),environment:env.name.clone(),enabled:true,paused:false,running:None,created_at:0,degraded:None}).await?;
+            d.hub.store.call(|c|{
+                c.execute("INSERT INTO repos(id,name,clone_url,created_at) VALUES('flow-repo','acme/flow','local',0)",[])?;
+                c.execute("INSERT INTO runs(id,repo_id,number,pipeline,event,branch,sha,status,created_at,actor) VALUES('flow-run','flow-repo',1,'ship','push','main','sha','queued',0,'builder')",[])?;
+                c.execute("INSERT INTO jobs(id,run_id,key,display,status,labels,needs,spec) VALUES('flow-job','flow-run','ship','ship','queued','[]','[]',?1)",crate::sql::params![r#"{"environment":{"name":"prod"}}"#])?;
+                c.execute("INSERT INTO ci_environments(repo_id,name,protection,source,created_at,created_by) VALUES('flow-repo','prod',?1,'kiln',0,'admin')",crate::sql::params![r#"{"policy":{"scope":{"kind":"server"},"name":"release-prod"}}"#])?;
+                Ok(())
+            }).await?;
+            // U10/U19: establish a readable default tree with explicit config absence.
+            let hosted=super::super::host::Hosted::new(&crate::ci::hosting::root(&d.hub));
+            hosted.ensure("acme/flow","main")?;
+            hosted.commit("acme/flow","main",None,&[super::super::host::Change{path:"README.md".into(),content:Some(b"Flow fixture".to_vec())}],"U10 source fixture",&super::super::host::Author::default()).map_err(|e|anyhow::anyhow!("{e}"))?;
+            d.hub.store.call(|c|{c.execute("UPDATE repos SET mode='native' WHERE id='flow-repo'",[])?;Ok(())}).await?;
+            let query=std::collections::HashMap::from([("repo".into(),"flow-repo".into())]);
+            let owner=Caller::owner();
+            let created=environments::route(&d.hub,&http::Method::POST,&["prod","flows"],&query,json!({"run":"flow-run","app":"web","version":"v1"}),Some(&owner)).await.map_err(|e|anyhow::anyhow!("{}: {}",e.0,e.1))?;
+            assert_eq!(created.status(),http::StatusCode::CREATED);
+            let flow=actions::for_job(&d.hub.store,"flow-run","prod").await?.ok_or_else(||anyhow::anyhow!("declared Flow"))?;
+            let caller=|both:bool|->anyhow::Result<Caller>{
+                let mut grants=vec![Grant::parse("runs.approve@environment:acme/flow:prod").map_err(anyhow::Error::msg)?];
+                if both{grants.push(Grant::parse("runs.approve@server").map_err(anyhow::Error::msg)?);}
+                Ok(Caller::with(crate::authz::gate::Kind::User,"user:alice",Some(Rights{grants,..Default::default()}),None))
+            };
+            let review=json!({"environments":["prod"]});
+            let denied=environments::approve(&d.hub,"flow-run",review.clone(),Some(&caller(false)?)).await;
+            assert!(matches!(denied,Err((http::StatusCode::FORBIDDEN,_))));
+            assert!(actions::reviews(&d.hub.store,&flow.id).await?.is_empty());
+            environments::approve(&d.hub,"flow-run",review,Some(&caller(true)?)).await.map_err(|e|anyhow::anyhow!("{}: {}",e.0,e.1))?;
+            let mut requested=release(0,"release-prod","v1","")?;
+            requested.provider=json!({"protected_action":flow.id});
+            let (bound_release,_)=store::insert_release(&*d.records,&requested).await?;
+            let repo=d.hub.store.repos().await?.into_iter().find(|r|r.id=="flow-repo").ok_or_else(||anyhow::anyhow!("repository"))?;
+            let def=environments::defs(&d.hub,&repo).await?.remove("prod").ok_or_else(||anyhow::anyhow!("bound environment"))?;
+            let identity=actions::identity(&repo.id,&def);
+            assert_eq!(actions::reserve(&d.hub.store,&identity,&format!("flow:{}",flow.id),"job","flow-job",&def.protection,1).await?,actions::Admission::Granted);
+            assert!(matches!(evaluate(&d,&bound_release,&env,&app).await?,Verdict::Go(_)),"the release reuses the authorized Flow review and capacity");
+            let unrelated=release(0,"release-prod","v1","")?;
+            assert!(matches!(evaluate(&d,&unrelated,&env,&app).await?,Verdict::Hold{approval:true,..}),"another release cannot inherit the Flow review");
+            Ok(())
+        })
+    }
+
     fn claims_of(jwt: &str) -> anyhow::Result<Value> {
         let body = jwt.split('.').nth(1).ok_or_else(|| anyhow::anyhow!("not a JWT"))?;
         Ok(serde_json::from_slice(&base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(body)?)?)
@@ -640,6 +703,7 @@ mod tests {
             serve(tcp, Arc::clone(&asked));
             let url = format!("http://{addr}/check");
             let env = environment("production", json!({ "checks": ["no-snapshots", { "name": "smoke", "http": { "url": url } }] }))?;
+            store::put_environment(&*d.records, &env).await?;
             let web = app("web")?;
             // Asked for: it waits for its check, which is asked once the release is recorded.
             let mut r = release(0, "production", "1.2.0", "")?;
@@ -647,11 +711,11 @@ mod tests {
             anyhow::ensure!(why == "its checks run: smoke", "{why}");
             anyhow::ensure!(asked.asked.lock().is_empty(), "not asked before the release is recorded");
             // Recorded: asked, and held while the URL says pending.
-            r.id = 7;
+            r = numbered(&d, &r).await?;
             let Verdict::Hold { results, why, until, .. } = evaluate(&d, &r, &env, &web).await? else { anyhow::bail!("held while pending") };
             anyhow::ensure!(why.contains("the smoke test said pending") && until.is_some(), "{why}");
             let (auth, body) = asked.asked.lock().first().cloned().ok_or_else(|| anyhow::anyhow!("not asked"))?;
-            anyhow::ensure!(body.pointer("/release/id") == Some(&json!(7)) && body.pointer("/release/version") == Some(&json!("1.2.0")) && body.get("check") == Some(&json!("smoke")), "{body}");
+            anyhow::ensure!(body.pointer("/release/id") == Some(&json!(r.id)) && body.pointer("/release/version") == Some(&json!("1.2.0")) && body.get("check") == Some(&json!("smoke")), "{body}");
             let token = claims_of(auth.strip_prefix("Bearer ").unwrap_or_default())?;
             anyhow::ensure!(token.get("aud") == Some(&json!(url)) && token.get("sub") == Some(&json!("deploy:production:web")), "kiln's token for that URL: {token}");
             // It passes: the release goes, the URL's answer its evidence.
@@ -664,21 +728,25 @@ mod tests {
             r.gates = results;
             *asked.said.lock() = "fail".into();
             let frozen = environment("production", json!({ "freeze": "an incident", "checks": [{ "name": "smoke", "http": { "url": url } }] }))?;
+            store::put_environment(&*d.records, &frozen).await?;
             let Verdict::Hold { results: held, .. } = evaluate(&d, &r, &frozen, &web).await? else { anyhow::bail!("frozen") };
             anyhow::ensure!(held.iter().any(|g| g.gate == "check:smoke" && g.passed), "its answer stays with it: {held:?}");
+            store::put_environment(&*d.records, &env).await?;
             anyhow::ensure!(matches!(evaluate(&d, &r, &env, &web).await?, Verdict::Go(_)));
             anyhow::ensure!(asked.asked.lock().len() == 2, "asked twice: pending, then pass");
             // Another release it fails is refused.
-            let Verdict::Refuse { why, .. } = evaluate(&d, &release(8, "production", "1.2.1", "")?, &env, &web).await? else { anyhow::bail!("refused on fail") };
+            let Verdict::Refuse { why, .. } = evaluate(&d, &numbered(&d, &release(0, "production", "1.2.1", "")?).await?, &env, &web).await? else { anyhow::bail!("refused on fail") };
             anyhow::ensure!(why.contains("the check `smoke` failed: the smoke test said fail"), "{why}");
             // Report only: recorded, and the release goes.
             let noted = environment("production", json!({ "checks": [{ "name": "smoke", "http": { "url": url }, "report_only": true }] }))?;
-            let Verdict::Go(results) = evaluate(&d, &release(9, "production", "1.2.1", "")?, &noted, &web).await? else { anyhow::bail!("report only lets it go") };
+            store::put_environment(&*d.records, &noted).await?;
+            let Verdict::Go(results) = evaluate(&d, &numbered(&d, &release(0, "production", "1.2.1", "")?).await?, &noted, &web).await? else { anyhow::bail!("report only lets it go") };
             anyhow::ensure!(results.iter().any(|g| g.gate == "check:smoke" && !g.passed && g.detail.ends_with("(report only)")), "{results:?}");
             // A URL that can't be reached holds it, saying so.
             let closed = SocketAddr::from((Ipv4Addr::LOCALHOST, crate::frontdoor::test_port()?));
             let away = environment("production", json!({ "checks": [{ "name": "smoke", "http": { "url": format!("http://{closed}/check"), "timeout": "2s" } }] }))?;
-            let Verdict::Hold { why, .. } = evaluate(&d, &release(10, "production", "1.2.1", "")?, &away, &web).await? else { anyhow::bail!("held while it can't be asked") };
+            store::put_environment(&*d.records, &away).await?;
+            let Verdict::Hold { why, .. } = evaluate(&d, &numbered(&d, &release(0, "production", "1.2.1", "")?).await?, &away, &web).await? else { anyhow::bail!("held while it can't be asked") };
             anyhow::ensure!(why.starts_with("can't ask"), "{why}");
             Ok(())
         })
@@ -693,6 +761,7 @@ mod tests {
             let d = deploy_with(|_| {}).await?;
             let web = app("web")?;
             let env = environment("production", json!({ "require_provenance": { "workflows": [".kiln/build.yaml"], "branches": ["main"] } }))?;
+            store::put_environment(&*d.records, &env).await?;
             let base = d.hub.cfg.server.public_url.trim_end_matches('/').to_owned();
             let built = |branch: &str| kiln_ci::attest::Facts {
                 builder_id: format!("{base}/ci@v1"),
@@ -705,8 +774,9 @@ mod tests {
             let image = |hex: &str| kiln_ci::attest::Subject { name: "registry.example/acme/web".into(), digest: [("sha256".to_owned(), hex.to_owned())].into() };
             let (a, b) = ("a".repeat(64), "b".repeat(64));
             // None yet: it waits (the build that attests it may still run), for half an hour.
-            let mut r = release(7, "production", "1.2.0", &format!("sha256:{a}"))?;
+            let mut r = release(0, "production", "1.2.0", &format!("sha256:{a}"))?;
             r.created_at = crate::util::now_unix();
+            let r = numbered(&d, &r).await?;
             let Verdict::Hold { why, .. } = evaluate(&d, &r, &env, &web).await? else { anyhow::bail!("waits for its provenance") };
             anyhow::ensure!(why.contains("waits for kiln's provenance of web"), "{why}");
             let stale = Release { created_at: r.created_at - 3600, ..r.clone() };
@@ -719,18 +789,20 @@ mod tests {
             anyhow::ensure!(p.passed && p.evidence.pointer("/artifacts/web/attestation") == Some(&json!(id)), "{p:?}");
             // Built from another branch: refused at once.
             crate::ci::attest::keep_provenance(&d.hub, &[image(&b)], &built("feature")).await?;
-            let Verdict::Refuse { why, .. } = evaluate(&d, &release(8, "production", "1.2.1", &format!("sha256:{b}"))?, &env, &web).await? else { anyhow::bail!("refused") };
+            let Verdict::Refuse { why, .. } = evaluate(&d, &numbered(&d, &release(0, "production", "1.2.1", &format!("sha256:{b}"))?).await?, &env, &web).await? else { anyhow::bail!("refused") };
             anyhow::ensure!(why.contains("doesn't meet") && why.contains("refs/heads/feature"), "{why}");
             // Not pinned by digest, or nothing named: refused.
-            let mut loose = release(9, "production", "1.2.2", &format!("sha256:{a}"))?;
+            let mut loose = release(0, "production", "1.2.2", &format!("sha256:{a}"))?;
             if let Some(x) = loose.artifacts.get_mut("web") {
                 x.digest.clear();
             }
+            let loose = numbered(&d, &loose).await?;
             anyhow::ensure!(matches!(evaluate(&d, &loose, &env, &web).await?, Verdict::Refuse { ref why, .. } if why.contains("isn't pinned by digest")));
-            anyhow::ensure!(matches!(evaluate(&d, &release(10, "production", "1.2.3", "")?, &env, &web).await?, Verdict::Refuse { ref why, .. } if why.contains("names none")));
+            anyhow::ensure!(matches!(evaluate(&d, &numbered(&d, &release(0, "production", "1.2.3", "")?).await?, &env, &web).await?, Verdict::Refuse { ref why, .. } if why.contains("names none")));
             // A config release runs what passed before.
-            let mut config = release(11, "production", "1.2.3", "")?;
+            let mut config = release(0, "production", "1.2.3", "")?;
             config.kind = Kind::Config;
+            let config = numbered(&d, &config).await?;
             anyhow::ensure!(matches!(evaluate(&d, &config, &env, &web).await?, Verdict::Go(_)));
             Ok(())
         })
@@ -798,8 +870,9 @@ mod tests {
             let gates = json!({ "after": ["staging@eu"], "soak": "5m" });
             check(&d, &serde_json::from_value(gates.clone())?).await.map_err(anyhow::Error::msg)?;
             let env = environment("production", gates)?;
+            store::put_environment(&*d.records, &env).await?;
             let web = app("web")?;
-            let Verdict::Go(results) = evaluate(&d, &release(7, "production", "1.2.0", &digest)?, &env, &web).await? else { anyhow::bail!("1.2.0 runs there") };
+            let Verdict::Go(results) = evaluate(&d, &numbered(&d, &release(0, "production", "1.2.0", &digest)?).await?, &env, &web).await? else { anyhow::bail!("1.2.0 runs there") };
             let after = results.iter().find(|g| g.gate == "after:staging@eu").ok_or_else(|| anyhow::anyhow!("no result for staging@eu"))?;
             anyhow::ensure!(after.passed && after.evidence.get("release") == Some(&json!(ran.id)), "{after:?}");
             // Its evidence: the statement, signed by the issuer there for this server, checkable again.
@@ -825,29 +898,34 @@ mod tests {
             anyhow::ensure!(matches!(super::super::link::verify(&client, statement, &issuer, &here, now + 3600).await, Err(Unsure::Refused(ref why)) if why.contains("expired")));
             // Held for its soak there.
             let long = environment("production", json!({ "after": ["staging@eu"], "soak": "30m" }))?;
-            let Verdict::Hold { why, .. } = evaluate(&d, &release(8, "production", "1.2.0", &digest)?, &long, &web).await? else { anyhow::bail!("soaking") };
+            store::put_environment(&*d.records, &long).await?;
+            let Verdict::Hold { why, .. } = evaluate(&d, &numbered(&d, &release(0, "production", "1.2.0", &digest)?).await?, &long, &web).await? else { anyhow::bail!("soaking") };
             anyhow::ensure!(why.starts_with("soaking in staging@eu until"), "{why}");
+            store::put_environment(&*d.records, &env).await?;
             // Another version: refused. Other artifacts: refused. On its way there: held.
-            let Verdict::Refuse { why, .. } = evaluate(&d, &release(9, "production", "1.3.0", &digest)?, &env, &web).await? else { anyhow::bail!("1.3.0 doesn't run there") };
+            let Verdict::Refuse { why, .. } = evaluate(&d, &numbered(&d, &release(0, "production", "1.3.0", &digest)?).await?, &env, &web).await? else { anyhow::bail!("1.3.0 doesn't run there") };
             anyhow::ensure!(why.contains("1.3.0 doesn't run in staging@eu (1.2.0 does)"), "{why}");
             let other = format!("sha256:{}", "b".repeat(64));
-            anyhow::ensure!(matches!(evaluate(&d, &release(10, "production", "1.2.0", &other)?, &env, &web).await?, Verdict::Refuse { ref why, .. } if why.contains("with other artifacts")));
+            anyhow::ensure!(matches!(evaluate(&d, &numbered(&d, &release(0, "production", "1.2.0", &other)?).await?, &env, &web).await?, Verdict::Refuse { ref why, .. } if why.contains("with other artifacts")));
             let mut coming = release(0, "staging", "1.3.0", &digest)?;
             coming.state = State::Delivering;
             store::insert_release(&*up.records, &coming).await?;
-            let Verdict::Hold { why, .. } = evaluate(&d, &release(11, "production", "1.3.0", &digest)?, &env, &web).await? else { anyhow::bail!("waits for 1.3.0 there") };
+            let Verdict::Hold { why, .. } = evaluate(&d, &numbered(&d, &release(0, "production", "1.3.0", &digest)?).await?, &env, &web).await? else { anyhow::bail!("waits for 1.3.0 there") };
             anyhow::ensure!(why.contains("waits for staging@eu to run 1.3.0"), "{why}");
             // An app it doesn't have there.
-            let mut api = release(12, "production", "1.2.0", &digest)?;
+            let mut api = release(0, "production", "1.2.0", &digest)?;
             api.app = "api".into();
+            let api = numbered(&d, &api).await?;
             anyhow::ensure!(matches!(evaluate(&d, &api, &env, &app("api")?).await?, Verdict::Refuse { ref why, .. } if why.contains("api isn't registered in staging")));
             // A token it doesn't take; a server that can't be asked.
             integration("eu-guest", format!("http://{addr}"), "guest").await?;
             let guest = environment("production", json!({ "after": ["staging@eu-guest"] }))?;
-            anyhow::ensure!(matches!(evaluate(&d, &release(13, "production", "1.2.0", &digest)?, &guest, &web).await?, Verdict::Refuse { ref why, .. } if why.contains("may not read releases")));
+            store::put_environment(&*d.records, &guest).await?;
+            anyhow::ensure!(matches!(evaluate(&d, &numbered(&d, &release(0, "production", "1.2.0", &digest)?).await?, &guest, &web).await?, Verdict::Refuse { ref why, .. } if why.contains("may not read releases")));
             integration("away", format!("http://127.0.0.1:{}", crate::frontdoor::test_port()?), "reader").await?;
             let away = environment("production", json!({ "after": ["staging@away"] }))?;
-            anyhow::ensure!(matches!(evaluate(&d, &release(14, "production", "1.2.0", &digest)?, &away, &web).await?, Verdict::Hold { ref why, .. } if why.starts_with("can't ask away what runs in staging")));
+            store::put_environment(&*d.records, &away).await?;
+            anyhow::ensure!(matches!(evaluate(&d, &numbered(&d, &release(0, "production", "1.2.0", &digest)?).await?, &away, &web).await?, Verdict::Hold { ref why, .. } if why.starts_with("can't ask away what runs in staging")));
             Ok(())
         })
     }

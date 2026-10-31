@@ -1,6 +1,6 @@
 //! The work ledger behind one interface (docs/ci.md W24-R02): its rows in kiln's `work_records`
-//! table, or in the `Records` seam (kiln's own durable Records in its store, the simulator,
-//! Amphora once CP-T1.5 lands). The ledger's one path (`ci::work`: keying, recording, lookups,
+//! table in the shared Amphora database, or in the `Records` seam (the same store's durable
+//! Records or the simulator). The ledger's one path (`ci::work`: keying, recording, lookups,
 //! e-classes, trust, signatures, verification, test results, the reaper; W24-R30) is written once
 //! over [`Rows`], so it decides alike on either.
 //!
@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use kiln_seams::blobs::{self, Blobs};
 use kiln_seams::records::{self, Cond, Consistency, Records, Scan, Tx, Write};
-use rusqlite::{Connection, params};
+use crate::sql::{Connection, params};
 
 use super::{Family, Recorded};
 use crate::store::Store;
@@ -86,7 +86,7 @@ fn audit_on(c: &Connection, a: &Audit) -> anyhow::Result<()> {
 
 /// The ledger in kiln's `work_records` table (migration `20261025-0215_w24_work.sql`): a
 /// connection to kiln's store, each read and write made on it as it's asked.
-impl Rows for Connection {
+impl Rows for Connection<'_> {
     fn get(&self, family: Family, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
         Ok(super::get(self, family, key)?)
     }
@@ -154,7 +154,7 @@ macro_rules! rows_of_the_connection {
     )*};
 }
 
-rows_of_the_connection!(crate::store::Tx<'_>, rusqlite::Transaction<'_>);
+rows_of_the_connection!(crate::sql::Transaction<'_, '_>);
 
 // ----------------------------------------------------------------------------------- on Records
 
@@ -355,12 +355,13 @@ impl Rows for Pending<'_> {
 // ------------------------------------------------------------------------ for callers that wait
 
 /// The ledger for callers that wait (a service, such as the Remote Execution API's action cache):
-/// in the `work_records` table, through the store's calls, or in Records (W24-R02).
+/// production uses `work_records` in the shared Amphora database through the canonical Store.
+/// Records remains an implementation of the same interface for seam conformance (W24-R02).
 #[derive(Clone)]
 pub enum Ledger {
-    /// The `work_records` table in kiln's store.
+    /// The production `work_records` table in kiln's shared Amphora database.
     Table(Store),
-    /// Records (kiln's own, `hub.records`, or Amphora's), its audit rows in `audit`'s audit log.
+    /// Records (the canonical `hub.records` adapter or the simulator), with audits in `audit`.
     Records { records: Arc<dyn Records>, audit: Store },
 }
 

@@ -1,0 +1,123 @@
+Subject: CP-T2.2 frame connection provenance and exact TLS exporter
+Why: Authenticate queued control frames by their actual transport epoch rather than a certificate-stable peer replacement, retaining the existing connection owner and wire protocol
+
+diff --git a/crates/hyper-transport/src/endpoint.rs b/crates/hyper-transport/src/endpoint.rs
+index cdc35329f4de7580ec708dde96ab4aa477e73247..9e1af1da12ba139c4e8a2c0fde7c059210c1f601 100644
+--- a/crates/hyper-transport/src/endpoint.rs
++++ b/crates/hyper-transport/src/endpoint.rs
+@@ -1734,14 +1734,36 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C,
+         Ok(conn.epoch)
+     }
+ 
++    /// Keying material from exactly the live connection named by `peer` and `epoch`.
++    /// Unlike [`Self::export_keying_material`], this never selects the peer's current connection:
++    /// an owner authenticating a queued [`Event::Frame`] must use that frame's origin.
++    pub fn export_keying_material_at(
++        &self,
++        peer: PeerId,
++        epoch: Epoch,
++        label: &[u8],
++        context: &[u8],
++        out: &mut [u8],
++    ) -> Result<(), Refusal> {
++        let conn = self.connection_at(peer, epoch).ok_or(Refusal::NotConnected)?;
++        conn.quic
++            .crypto_session()
++            .export_keying_material(out, label, context)
++            .map_err(|_| Refusal::Configuration)
++    }
++
+     /// Whether the connection of `epoch` to `peer` is up. A peer may hold several connections at
+     /// once (its identity's, up to its admission bound), and only its current one's lifecycle is
+     /// an event ([`Event::Connected`], [`Event::Closed`]): an owner that keeps something for each
+     /// connection a request came on ([`Event::Request`]'s epoch) lets an older one's go by this.
+     pub fn connection_live(&self, peer: PeerId, epoch: Epoch) -> bool {
+-        self.conns.iter().flatten().any(|conn| {
++        self.connection_at(peer, epoch).is_some()
++    }
++
++    fn connection_at(&self, peer: PeerId, epoch: Epoch) -> Option<&Conn<C::Role>> {
++        self.conns.iter().flatten().find(|conn| {
+             !conn.lost && conn.epoch == epoch && conn.peer.is_some_and(|(of, _)| of == peer)
+-        })
++        }).map(Box::as_ref)
+     }
+
+     /// What the path to `peer` measures now.
+@@ -4882,6 +4904,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
+                 self.events.push_back(Waiting {
+                     event: Event::Frame {
+                         peer,
++                        epoch: conn.epoch,
+                         lane: lane_id,
+                         kind,
+                         frame,
+diff --git a/crates/hyper-transport/src/lib.rs b/crates/hyper-transport/src/lib.rs
+index b12bbb8087d69aaeb48bf28e7b099fe8f5f45bb0..45c80fdc22f584c8b130e141653733fc575f7d31 100644
+--- a/crates/hyper-transport/src/lib.rs
++++ b/crates/hyper-transport/src/lib.rs
+@@ -257,6 +257,8 @@ pub enum Event<C: Classes> {
+     Frame {
+         /// The peer.
+         peer: PeerId,
++        /// The connection the frame arrived on, even if another is current when it is polled.
++        epoch: Epoch,
+         /// The lane.
+         lane: LaneId,
+         /// The frame's kind.
+@@ -363,12 +365,13 @@ impl<C: Classes> Debug for Event<C> {
+             }
+             Self::Frame {
+                 peer,
++                epoch,
+                 lane,
+                 kind,
+                 frame,
+             } => write!(
+                 formatter,
+-                "Frame {{ peer: {peer}, lane: {lane}, kind: {kind:?}, bytes: {} }}",
++                "Frame {{ peer: {peer}, epoch: {epoch}, lane: {lane}, kind: {kind:?}, bytes: {} }}",
+                 frame.bytes().len()
+             ),
+             Self::Refused {
+diff --git a/crates/hyper-transport/tests/exchange.rs b/crates/hyper-transport/tests/exchange.rs
+index 6c622b4f6e6c0c0a67318a502cdc586c48bdaa4b..beee70913470cee062146101b204158dd75cd7da 100644
+--- a/crates/hyper-transport/tests/exchange.rs
++++ b/crates/hyper-transport/tests/exchange.rs
+@@ -2559,16 +2559,19 @@ fn a_peer_is_held_to_its_lanes_windows_across_its_connections() {
+     net.exchange();
+     // The old connection's frames and the peer's one lifecycle event, its new connection.
+     assert_eq!(frames_waiting(&net), seats + 1, "the new lane is not read");
+-    let Event::Frame { lane: 0, frame, .. } = net.b.poll_event().unwrap() else {
++    let Event::Frame { epoch, lane: 0, frame, .. } = net.b.poll_event().unwrap() else {
+         panic!("the first to wait is the old connection's first frame")
+     };
++    assert_eq!(epoch, 1, "queued frames retain their origin after reconnect");
+     net.b.release(frame);
+     assert_eq!(frames_waiting(&net), seats + 1, "one seat, one frame read");
+     let mut order = Vec::new();
+     while let Some(event) = net.b.poll_event() {
+         match event {
+-            Event::Frame { frame, .. } => {
+-                order.push(u32::from_be_bytes(frame.bytes().try_into().unwrap()));
++            Event::Frame { epoch, frame, .. } => {
++                let index = u32::from_be_bytes(frame.bytes().try_into().unwrap());
++                assert_eq!(epoch, if index < 8 { 1 } else { 2 });
++                order.push(index);
+                 net.b.release(frame);
+             }
+             Event::Connected { peer: 1, epoch, .. } => assert_eq!(epoch, 2),
+@@ -2625,6 +2628,13 @@ fn a_request_names_the_connection_it_came_on() {
+     assert!(!net.b.connection_live(1, 1), "the first connection went");
+     assert!(net.b.connection_live(1, 2), "the second is up");
+     assert!(!net.b.connection_live(1, 3), "no third");
++    let mut material = [0; 32];
++    assert!(net.b.export_keying_material_at(1, 1, b"origin", b"", &mut material).is_err());
++    assert!(net.b.export_keying_material_at(1, 3, b"origin", b"", &mut material).is_err());
++    net.b.export_keying_material_at(1, 2, b"origin", b"", &mut material).unwrap();
++    let mut current = [0; 32];
++    assert_eq!(net.b.export_keying_material(1, b"origin", b"", &mut current).unwrap(), 2);
++    assert!(material == current, "exact origin and current select the same live TLS session");
+ }
+ 
+ /// An owner that polls nothing holds each exchange's slot with its events: the peer's exchanges

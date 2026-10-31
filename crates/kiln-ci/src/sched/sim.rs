@@ -215,13 +215,19 @@ impl Sim {
                     }
                 }
                 Command::Timer { at } => self.at(at, Ev::Tick),
-                Command::StartExecutor { executor, runner, .. } => {
+                Command::StartExecutor { pool, executor, runner, .. } => {
                     self.executors_started.push((self.now, executor.clone(), runner.clone()));
                     let t = self.now + self.executor_start_ms;
                     if self.failing_hosts.contains(&runner) {
                         self.input(t, Input::ExecutorFailed { executor, error: format!("{runner} couldn't start it") });
                     } else if runner.is_empty() {
-                        // The server's executor (a `k8s` pool's pod): its own runner connects.
+                        // Model the configured launch shape, not an override inferred from
+                        // job demand. Only the real launch metadata can authorize an override.
+                        let request = self.sched.pool(&pool).map(|p| p.request).unwrap_or_default();
+                        let capacity = super::pools::PodCapacity { resource_version: "simulated-api-1".into(),
+                            cpu_request: Some(request.cpu), memory_request: Some(request.mem),
+                            ..super::pools::PodCapacity::default() };
+                        self.sched.bind_pod_capacity(&executor, capacity);
                         self.input(t, Input::RunnerUp(Box::new(RunnerIn { id: format!("pod-{executor}"), slots: 1, executor: Some(executor), ..RunnerIn::default() })));
                     } else {
                         self.input(t, Input::ExecutorReady { executor });

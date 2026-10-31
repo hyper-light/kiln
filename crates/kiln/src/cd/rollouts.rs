@@ -578,7 +578,7 @@ impl Cd {
                 targets::read(&cx, &rec.object).await
             };
             match read.await {
-                Ok(Some(o)) => cd.input(Input::Live { cluster: rec.target.as_str().into(), change: LiveChange::Upsert(o) }),
+                Ok(Some(o)) => { let _ = cd.input(Input::Live { cluster: rec.target.as_str().into(), change: LiveChange::Upsert(o) }).await; },
                 Ok(None) => {}
                 Err(e) => tracing::debug!(app = %rec.app, error = %format!("{e:#}"), "deployments: reading a rollout's object failed"),
             }

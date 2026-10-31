@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail};
-use rusqlite::{OptionalExtension as _, params};
+use crate::sql::{OptionalExtension as _, params};
 use serde_json::{Value, json};
 
 use super::{ExtJob, ExtRun, GITLAB_CI, kiln_status, unix};

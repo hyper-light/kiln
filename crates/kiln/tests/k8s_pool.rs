@@ -30,6 +30,15 @@ struct Seen {
     peak: usize,
     /// The pods alive now, by name: their processes, which go when the stand-in does.
     alive: BTreeMap<String, u32>,
+    /// U11: one bounded fault in this existing API stand-in, after it accepted the request.
+    reply_fault: Option<ReplyFault>,
+}
+
+struct ReplyFault {
+    method: &'static str,
+    path: String,
+    accepted: usize,
+    drop_next: bool,
 }
 
 struct Kube {
@@ -72,16 +81,42 @@ fn phase(p: &mut Pod) -> &'static str {
     match p.child.as_mut().map(Child::try_wait) {
         Some(Ok(None)) => "Running",
         Some(Ok(Some(s))) if s.success() => "Succeeded",
-        Some(_) => "Failed",
-        None => "Pending",
+        Some(Ok(Some(_))) => "Failed",
+        Some(Err(_)) | None => "Pending",
     }
 }
 
 fn with_status(p: &mut Pod) -> Value {
     let mut o = p.object.clone();
     let ph = phase(p);
+    let finished = matches!(ph, "Succeeded" | "Failed");
+    let at = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap_or_default();
+    let uid = o.pointer("/metadata/uid").and_then(Value::as_str).unwrap_or_default();
+    // U03/W13-R07: the stand-in is the kubelet too. Its API reports immutable container IDs
+    // and termination only after its owned job process exits; phase alone proves no cleanup.
+    let statuses = |field: &str, init: bool| -> Vec<Value> {
+        o.pointer(field).and_then(Value::as_array).into_iter().flatten().map(|c| {
+            let name = c.get("name").and_then(Value::as_str).unwrap_or_default();
+            let image = c.get("image").and_then(Value::as_str).unwrap_or_default();
+            let id = format!("fixture://{uid}/{name}");
+            // The tools init is modeled as already copied in. Native sidecars live with the job.
+            let done = finished || (init && c.get("restartPolicy").and_then(Value::as_str) != Some("Always") && ph != "Pending");
+            let state = if done {
+                json!({ "terminated": { "exitCode": i32::from(ph == "Failed" && !init), "containerID": id, "finishedAt": at } })
+            } else if ph == "Pending" {
+                json!({ "waiting": { "reason": "ContainerCreating" } })
+            } else {
+                json!({ "running": { "startedAt": at } })
+            };
+            json!({ "name": name, "image": image, "imageID": image, "ready": !done && ph == "Running", "restartCount": 0, "containerID": id, "state": state })
+        }).collect()
+    };
+    let status = json!({ "phase": ph, "containerStatuses": statuses("/spec/containers", false), "initContainerStatuses": statuses("/spec/initContainers", true) });
+    if let Some(metadata) = o.get_mut("metadata").and_then(Value::as_object_mut) {
+        metadata.insert("resourceVersion".into(), json!(if finished { "2" } else { "1" }));
+    }
     if let Some(m) = o.as_object_mut() {
-        m.insert("status".into(), json!({ "phase": ph }));
+        m.insert("status".into(), status);
     }
     o
 }
@@ -171,9 +206,19 @@ impl Kube {
                             .collect();
                         (200, json!({ "apiVersion": "v1", "kind": "PodList", "items": items }))
                     }
-                    ("POST", ["api", "v1", "namespaces", _, "pods"]) => {
-                        let object: Value = serde_json::from_str(&body).unwrap_or_default();
+                    ("POST", ["api", "v1", "namespaces", namespace, "pods"]) => {
+                        let mut object: Value = serde_json::from_str(&body).unwrap_or_default();
                         let name = object.pointer("/metadata/name").and_then(Value::as_str).unwrap_or_default().to_owned();
+                        // U03/W13-R07: Kubernetes assigns these before the job's enrollment can
+                        // bind a verified PodUID/node identity to its existing executor grant.
+                        if let Some(metadata) = object.get_mut("metadata").and_then(Value::as_object_mut) {
+                            metadata.insert("uid".into(), json!(uuid::Uuid::now_v7().to_string()));
+                            metadata.insert("namespace".into(), json!(namespace));
+                            metadata.insert("resourceVersion".into(), json!("1"));
+                        }
+                        if let Some(spec) = object.get_mut("spec").and_then(Value::as_object_mut) {
+                            spec.insert("nodeName".into(), json!("fixture-kubelet"));
+                        }
                         let child = run(&dir, &object);
                         if let Ok(mut s) = keep.lock() {
                             s.created.push(object.clone());
@@ -188,6 +233,11 @@ impl Kube {
                         Some(p) => (200, with_status(p)),
                         None => (404, json!({ "kind": "Status", "reason": "NotFound", "message": format!("pods \"{name}\" not found") })),
                     },
+                    ("DELETE", ["api", "v1", "namespaces", _, "pods", name]) if pods.get(*name).is_some_and(|p| {
+                        let options: Value = serde_json::from_str(&body).unwrap_or_default();
+                        let wanted = options.pointer("/preconditions/uid").and_then(Value::as_str);
+                        wanted.is_none() || wanted != p.object.pointer("/metadata/uid").and_then(Value::as_str)
+                    }) => (409, json!({ "kind": "Status", "reason": "Conflict", "message": "PodUID precondition does not match" })),
                     ("DELETE", ["api", "v1", "namespaces", _, "pods", name]) => match pods.remove(*name) {
                         Some(mut p) => {
                             if let Some(c) = p.child.as_mut() {
@@ -208,6 +258,12 @@ impl Kube {
                 if let Ok(mut s) = keep.lock() {
                     s.peak = s.peak.max(alive);
                 }
+                let drop_reply = keep.lock().map(|mut s| {
+                    let Some(fault) = s.reply_fault.as_mut().filter(|f| f.method == method && f.path == path) else { return false };
+                    fault.accepted += 1;
+                    std::mem::take(&mut fault.drop_next)
+                }).unwrap_or(false);
+                if drop_reply { continue; } // The API mutation above happened; its response is lost.
                 let text = answer.to_string();
                 let _ = stream.write_all(format!("HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}", text.len()).as_bytes());
             }
@@ -339,6 +395,62 @@ fn w13_r07_k8s_pool_runs_each_leg_in_a_pod() -> anyhow::Result<()> {
         let v: Value = serde_json::from_str(&body)?;
         let n = v.pointer("/pool/executors").or_else(|| v.get("executors")).and_then(Value::as_array).map_or(0, Vec::len);
         Ok((n > 0).then_some(body))
+    })?;
+    // U03/U11: delayed cleanup of an observed pod must not delete its same-name replacement.
+    // These inert API objects run no child and carry no pool labels or executor reservation.
+    let transport_seen = Arc::clone(&kube.seen);
+    kiln::rt::block_on(async move {
+        let api = kiln::kubeapi::KubeApi::from_kubeconfig_path(&kubeconfig, None, "ci")?;
+        // Another check's API object is not part of this receipt's cleanup, despite its label.
+        let other_name = "kiln-image-check-other-owner-fixture";
+        let other_request = serde_json::from_value(json!({ "apiVersion": "v1", "kind": "Pod", "metadata": { "name": other_name, "labels": { "kiln.dev/role": "image-check" } }, "spec": { "containers": [{ "name": "check", "image": "fixture" }] } }))?;
+        let other = api.create_pod(&other_request).await?;
+        let name = "kiln-uid-cleanup-fixture";
+        let requested = serde_json::from_value(json!({ "apiVersion": "v1", "kind": "Pod", "metadata": { "name": name }, "spec": { "containers": [{ "name": "job", "image": "fixture" }] } }))?;
+        let original = api.create_pod(&requested).await?;
+        api.delete_pod(&original).await?;
+        let replacement = api.create_pod(&requested).await?;
+        assert_ne!(original.metadata.uid, replacement.metadata.uid, "the API assigned distinct UIDs to the reused name");
+        let stale = api.delete_pod(&original).await.err().ok_or_else(|| anyhow::anyhow!("stale UID cleanup was accepted"))?;
+        let conflict = stale.downcast_ref::<kiln::kubeapi::ApiError>().ok_or_else(|| anyhow::anyhow!("stale UID cleanup returned no API status: {stale:#}"))?;
+        assert_eq!(conflict.code, 409);
+        let mut missing = replacement.clone();
+        missing.metadata.uid = None;
+        assert!(api.delete_pod(&missing).await.is_err(), "cleanup cannot acquire ownership by rereading a name");
+        let mut foreign = replacement.clone();
+        foreign.metadata.namespace = Some("another-namespace".into());
+        assert!(api.delete_pod(&foreign).await.is_err());
+        let survived = api.get_pod(name).await?.ok_or_else(|| anyhow::anyhow!("same-name replacement was deleted"))?;
+        assert_eq!(survived.metadata.uid, replacement.metadata.uid);
+        api.delete_pod(&replacement).await?;
+        assert!(api.get_pod(name).await?.is_none());
+        api.delete_pod(&original).await?; // 404 is idempotent cleanup, not a physical stop proof.
+        let retained = api.get_pod(other_name).await?.ok_or_else(|| anyhow::anyhow!("another image check's pod was deleted"))?;
+        assert_eq!(retained.metadata.uid, other.metadata.uid);
+        api.delete_pod(&other).await?; // The fixture cleans this second owner only by its own receipt.
+        // U11: a completed POST whose response vanishes must not submit another create.
+        let uncertain_name = "kiln-closed-create-fixture";
+        let create_path = "/api/v1/namespaces/ci/pods";
+        let uncertain = serde_json::from_value(json!({ "apiVersion": "v1", "kind": "Pod", "metadata": { "name": uncertain_name }, "spec": { "containers": [{ "name": "job", "image": "fixture" }] } }))?;
+        transport_seen.lock().map_err(|_| anyhow::anyhow!("poisoned"))?.reply_fault = Some(ReplyFault { method: "POST", path: create_path.into(), accepted: 0, drop_next: true });
+        let outcome = api.create_pod(&uncertain).await.err().ok_or_else(|| anyhow::anyhow!("a lost create response was replayed and reported success"))?;
+        assert!(outcome.to_string().contains(kiln::kubernetes::NO_ANSWER), "unknown create must report the transport failure: {outcome:#}");
+        let created = {
+            let seen = transport_seen.lock().map_err(|_| anyhow::anyhow!("poisoned"))?;
+            assert_eq!(seen.reply_fault.as_ref().map(|f| f.accepted), Some(1), "one accepted POST, despite its missing response");
+            let made: Vec<_> = seen.created.iter().filter(|p| p.pointer("/metadata/name").and_then(Value::as_str) == Some(uncertain_name)).cloned().collect();
+            assert_eq!(made.len(), 1, "the API must never observe a replacement create");
+            serde_json::from_value::<k8s_openapi::api::core::v1::Pod>(made.into_iter().next().ok_or_else(|| anyhow::anyhow!("accepted create missing from fixture"))?)?
+        };
+        // GET may reconnect. Reuse the same bounded fault and actual KubeApi client.
+        let read_path = format!("{create_path}/{uncertain_name}");
+        transport_seen.lock().map_err(|_| anyhow::anyhow!("poisoned"))?.reply_fault = Some(ReplyFault { method: "GET", path: read_path, accepted: 0, drop_next: true });
+        let observed = api.get_pod(uncertain_name).await?.ok_or_else(|| anyhow::anyhow!("accepted pod missing after read reconnect"))?;
+        assert_eq!(observed.metadata.uid, created.metadata.uid);
+        assert_eq!(transport_seen.lock().map_err(|_| anyhow::anyhow!("poisoned"))?.reply_fault.as_ref().map(|f| f.accepted), Some(2), "GET reconnects after a closed response");
+        // Cleanup is authorized by the stand-in's original accepted receipt, not a name lookup.
+        api.delete_pod(&created).await?;
+        Ok(())
     })?;
     Ok(())
 }

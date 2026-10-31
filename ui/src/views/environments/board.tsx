@@ -9,7 +9,7 @@ import * as React from "react";
 import { Link } from "@/lib/router";
 
 import { appHref, cdApi } from "@/api/cd";
-import { ci, waitSentence, type CiDeployment, type CiEnvironment, type CiPreview } from "@/api/ci";
+import { ci, CI_PROVIDER_NAMES, isProviderEnvironment, waitSentence, type CiDeployment, type CiEnvironment, type CiEnvironmentRow, type CiPreview, type CiProviderEnvironment } from "@/api/ci";
 import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
 import { Crumbs, EmptyState, Panel, SelectField } from "@/components/ui/misc";
@@ -25,7 +25,11 @@ import { deploymentStatus, ENV_EVENTS, environmentHref, kindLabel, previewOfHref
 import "@/views/deployments/deployments.css";
 import "./environments.css";
 
-export const boardRes: Res<{ environments: CiEnvironment[] }> = { key: "ci/environments/board", fetch: (s) => ci.environmentsBoard(s), opts: { on: ENV_EVENTS, pollMs: 15_000 } };
+export const boardRes: Res<{ environments: CiEnvironmentRow[]; providers?: Record<string, string[]> }> = {
+  key: "ci/environments/board",
+  fetch: (s) => ci.environmentsBoard(s),
+  opts: { on: ENV_EVENTS, pollMs: 15_000 },
+};
 
 /** A deployment, in a line: its state, commit and ref, who made it and when, its run and URL. */
 export function Deployed({ d }: { d: CiDeployment }) {
@@ -132,6 +136,75 @@ export function Waits({ e }: { e: CiEnvironment }) {
   );
 }
 
+const PROVIDER_DEPLOYMENT_STATUS: Record<string, string> = {
+  success: "succeeded",
+  successful: "succeeded",
+  succeeded: "succeeded",
+  failure: "failed",
+  failed: "failed",
+  error: "failed",
+  in_progress: "running",
+  inprogress: "running",
+  running: "running",
+  queued: "queued",
+  pending: "pending",
+  stopped: "cancelled",
+  cancelled: "cancelled",
+  skipped: "skipped",
+  timed_out: "timed_out",
+};
+
+/** Provider-owned rows expose its facts and links; local policy controls do not apply. */
+function ProviderRow({ e }: { e: CiProviderEnvironment }) {
+  const provider = CI_PROVIDER_NAMES[e.provider] ?? e.provider;
+  const d = e.deployment;
+  const state = d?.result ?? d?.state;
+  const status = state ? PROVIDER_DEPLOYMENT_STATUS[state.toLowerCase()] : undefined;
+  const environmentUrl = e.url && /^https?:\/\//i.test(e.url) ? e.url : null;
+  const deploymentUrl = d?.url && /^https?:\/\//i.test(d.url) ? d.url : null;
+  return (
+    <li className="env-row">
+      <div className="env-cell env-who">
+        {environmentUrl && e.name ? (
+          <a href={environmentUrl} target="_blank" rel="noreferrer" className="env-name">
+            {e.name}
+          </a>
+        ) : (
+          <span className="env-name">{e.name || "Environments"}</span>
+        )}
+        <span className="env-meta">{provider}</span>
+      </div>
+      <div className="env-cell">
+        <span className="env-label">{e.error ? "Unavailable" : "What runs"}</span>
+        {e.error ? (
+          <span className="env-meta" role="status">
+            {e.error}
+          </span>
+        ) : d ? (
+          <span className="env-deployed">
+            {status && <StatusDot status={status} title={state ?? undefined} />}
+            <span>{state || "No status reported"}</span>
+            {d.commit && <code>{shortSha(d.commit)}</code>}
+            {d.ref && <span>{d.ref}</span>}
+            {d.created_at != null && <RelTime ts={d.created_at} />}
+            {deploymentUrl && (
+              <a href={deploymentUrl} target="_blank" rel="noreferrer" className="env-link-quiet">
+                its deployment
+              </a>
+            )}
+          </span>
+        ) : (
+          <span className="env-quiet">No deployment reported</span>
+        )}
+      </div>
+      <div className="env-cell">
+        <span className="env-label">Ownership</span>
+        <span className="env-quiet">Deployment and protection are managed by {provider}.</span>
+      </div>
+    </li>
+  );
+}
+
 function Row({ e }: { e: CiEnvironment }) {
   const repo = e.repo ?? "";
   const where = whereWords(e);
@@ -194,13 +267,22 @@ function Starter({ repos }: { repos: string[] }) {
 }
 
 function BoardBody() {
-  const rows = useRes(boardRes).data.environments;
+  const board = useRes(boardRes).data;
+  const rows = board.environments;
   const repos = useRes(reposRes).data;
   const can = useAuth((s) => (s.kind === "authed" ? s.me?.can : undefined));
   const mayMake = !can || Boolean(can["environments.manage"]);
-  const byRepo = new Map<string, CiEnvironment[]>();
+  const byRepo = new Map<string, CiEnvironmentRow[]>();
   for (const e of rows) byRepo.set(e.repo ?? "", [...(byRepo.get(e.repo ?? "") ?? []), e]);
-  const starter = mayMake ? repos.map((r) => r.name).filter((n) => !["dev", "staging", "production"].every((x) => byRepo.get(n)?.some((e) => e.name.toLowerCase() === x))) : [];
+  const starter = mayMake
+    ? repos
+        .map((r) => r.name)
+        .filter(
+          (n) =>
+            (board.providers === undefined || board.providers[n]?.includes("kiln")) &&
+            !["dev", "staging", "production"].every((x) => byRepo.get(n)?.some((e) => !isProviderEnvironment(e) && e.name.toLowerCase() === x)),
+        )
+    : [];
   return (
     <>
       {starter.length > 0 && (
@@ -220,9 +302,7 @@ function BoardBody() {
         [...byRepo.entries()].map(([repo, list]) => (
           <Panel key={repo} eyebrow="Repository" title={repo} className="env-panel">
             <ul className="env-rows" aria-label={`${repo}'s environments`}>
-              {list.map((e) => (
-                <Row key={e.name} e={e} />
-              ))}
+              {list.map((e) => (isProviderEnvironment(e) ? <ProviderRow key={`${e.provider}:${e.name ?? "error"}`} e={e} /> : <Row key={`kiln:${e.name}`} e={e} />))}
             </ul>
           </Panel>
         ))

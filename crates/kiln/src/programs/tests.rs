@@ -148,10 +148,10 @@ fn a_lab_of_tracks_weighted_5_3_and_2_shares_30_goals_by_weight() {
 }
 
 /// A plan, as kiln keeps it, straight into its store.
-fn plan_row(c: &rusqlite::Connection, id: &str, title: &str, body: &str, tags: &[&str], at: i64) -> anyhow::Result<()> {
+fn plan_row(c: &crate::sql::Connection, id: &str, title: &str, body: &str, tags: &[&str], at: i64) -> anyhow::Result<()> {
     c.execute(
         "INSERT INTO plans (id, title, body, tags, items, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, '[]', ?5, ?5)",
-        rusqlite::params![id, title, body, serde_json::to_string(tags)?, at],
+        crate::sql::params![id, title, body, serde_json::to_string(tags)?, at],
     )?;
     Ok(())
 }
@@ -199,6 +199,8 @@ fn a_program_shows_each_track_s_worker_goal_pass_and_slot_and_holds_the_usage_ru
         })
         .await?;
         // What the sessions say of themselves reaches kiln's record of them.
+        // U17: complete restoration before this fixture accepts session starts.
+        crate::harness::registry::Registry::initialize_local(&hub).await?;
         let h = Arc::clone(&hub);
         crate::rt::spawn(async move {
             let _ = crate::harness::registry::Registry::run_local(h).await;
@@ -239,7 +241,7 @@ fn a_program_shows_each_track_s_worker_goal_pass_and_slot_and_holds_the_usage_ru
                 plan_row(c, "p4", "A program T4: Isolation, by machine", "", &["lab", "t4", "isolation"], 2)?;
                 plan_row(c, "p7", "A program T7: Hex, the scheduler", "", &["lab", "t7", "hex"], 2)?;
                 plan_row(c, "other", "Not the program's", "", &["elsewhere", "t9"], 1)?;
-                c.execute("INSERT INTO plan_runs (id, plan_id, version, session, mode, at, by) VALUES ('r1', 'm1', 1, ?1, 'goals', 5, 'admin')", rusqlite::params![c2])?;
+                c.execute("INSERT INTO plan_runs (id, plan_id, version, session, mode, at, by) VALUES ('r1', 'm1', 1, ?1, 'goals', 5, 'admin')", crate::sql::params![c2])?;
                 Ok(())
             })
             .await?;
@@ -249,10 +251,10 @@ fn a_program_shows_each_track_s_worker_goal_pass_and_slot_and_holds_the_usage_ru
         let (c3, s3) = (coordinator.clone(), sends.clone());
         hub.store
             .call(move |c| {
-                c.execute("UPDATE goal_items SET status = 'met' WHERE agent = ?1 AND text LIKE 'LAB-T7.1%'", rusqlite::params![c3])?;
-                c.execute("UPDATE goal_items SET status = 'active' WHERE agent = ?1 AND text LIKE 'LAB-M1%'", rusqlite::params![c3])?;
-                c.execute("UPDATE goal_items SET status = 'active' WHERE agent = ?1", rusqlite::params![s3])?;
-                c.execute("UPDATE goal_stacks SET state = 'running' WHERE agent = ?1", rusqlite::params![s3])?;
+                c.execute("UPDATE goal_items SET status = 'met' WHERE agent = ?1 AND text LIKE 'LAB-T7.1%'", crate::sql::params![c3])?;
+                c.execute("UPDATE goal_items SET status = 'active' WHERE agent = ?1 AND text LIKE 'LAB-M1%'", crate::sql::params![c3])?;
+                c.execute("UPDATE goal_items SET status = 'active' WHERE agent = ?1", crate::sql::params![s3])?;
+                c.execute("UPDATE goal_stacks SET state = 'running' WHERE agent = ?1", crate::sql::params![s3])?;
                 Ok(())
             })
             .await?;
@@ -415,7 +417,7 @@ fn a_program_shows_each_track_s_worker_goal_pass_and_slot_and_holds_the_usage_ru
         assert!(e.as_ref().is_some_and(|(c, m)| *c == http::StatusCode::CONFLICT && m.contains("isn't one still to come")), "{e:?}");
         ok(run(session(&coordinator), "programs.assign", json!({"program": "m1", "track": "T7", "goal": t7_3})).await)?;
         let (c4, g4) = (coordinator.clone(), t7_3.clone());
-        hub.store.call(move |c| Ok(c.execute("UPDATE goal_items SET status = 'met' WHERE agent = ?1 AND id = ?2", rusqlite::params![c4, g4])?)).await?;
+        hub.store.call(move |c| Ok(c.execute("UPDATE goal_items SET status = 'met' WHERE agent = ?1 AND id = ?2", crate::sql::params![c4, g4])?)).await?;
         ok(run(session(&coordinator), "programs.assign", json!({"program": "m1", "track": "T7", "agent": hex})).await)?;
         assert_eq!(assignments(&hub.store, "m1").await?.get("T7").map(|a| (a.agent.as_str(), a.goal.clone())), Some((hex.as_str(), None)));
         ok(run(session(&coordinator), "programs.assign", json!({"program": "m1", "track": "T7", "agent": null})).await)?;
@@ -427,7 +429,7 @@ fn a_program_shows_each_track_s_worker_goal_pass_and_slot_and_holds_the_usage_ru
 
         // A track whose goals all ended, met or not (T4's skipped), is done: no slot goes to it.
         let c5 = coordinator.clone();
-        hub.store.call(move |c| Ok(c.execute("UPDATE goal_items SET status = 'skipped' WHERE agent = ?1 AND text LIKE 'LAB-T4.%'", rusqlite::params![c5])?)).await?;
+        hub.store.call(move |c| Ok(c.execute("UPDATE goal_items SET status = 'skipped' WHERE agent = ?1 AND text LIKE 'LAB-T4.%'", crate::sql::params![c5])?)).await?;
         assert_eq!(track(&program().await?, "T4")?.slot, "done");
         // A program with no coordinator yet: the person assigning is whom its workers must work for.
         hub.store

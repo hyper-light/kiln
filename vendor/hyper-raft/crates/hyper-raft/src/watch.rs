@@ -16,15 +16,23 @@
 //!   ([`Timing::round`]) and a new draw; so does a voter that granted its vote and heard no leader
 //!   (Raft Figure 2: granting a vote resets the election timer).
 //! - **A member campaigns only while it and the members it trusts are a quorum** of each half of
-//!   its configuration: a campaign that cannot win is not run.
-//! - **A leader steps down** once its detectors suspect so many voters that it and those it trusts
-//!   are no quorum of either half (check-quorum from the detectors, Raft §6.2).
+//!   its configuration: a campaign that cannot win is not run. A pre-candidate left no such
+//!   quorum stops asking and follows the leader it left again: its campaign could win only by the
+//!   vote of a member it suspects.
+//! - **A leader its detectors leave no quorum** (it and those it trusts are no quorum of either
+//!   half; check-quorum from the detectors, Raft §6.2) leads on, and hands over only to a voter
+//!   that can be elected without it: it orders its heirs in turn to campaign where they and the
+//!   voters they trust, the leader apart, are a quorum. A step-down would hand its quorum to no
+//!   voter that can lead without it: a voter elected by its vote is one it hears and is heard by,
+//!   so it could lead as well (`docs/timing.md` §2.9, "A leader its detectors leave no quorum").
 //! - **A leader beats only while its group has work in flight** (`Raft::active`): a member behind
 //!   it, a commit a member has not said it holds, a read waiting, a transfer under way. Its beat is
 //!   a heartbeat round, sent once a round tail ([`Timing::round`], the retransmission timeout RFC
 //!   6298 §2 and RFC 9002 §6.2.1 compute: mean plus four deviations over the granularity) after the
 //!   last, which recovers what was lost. A group with nothing in flight is sent nothing and wakes
-//!   for nothing: no ticks (CockroachDB's quiescence; TiKV's hibernated regions).
+//!   for nothing: no ticks (CockroachDB's quiescence; TiKV's hibernated regions). A member it
+//!   suspects counts only while it and those it trusts are no quorum, when it commits only by some
+//!   of them.
 //! - **Pre-vote keeps its role**: a member that trusts its leader neither grants a pre-vote nor
 //!   moves its term for a vote request (Ongaro §9.6: no grant while a leader is heard; here, while
 //!   it is trusted). A leader asked for a vote by a member of its group tells it who leads, by a
@@ -34,6 +42,11 @@
 //!   asks, so the leader's appends, heartbeats and snapshots would make it a follower again and
 //!   end its asking; a leader that is up answers a pre-vote with a heartbeat, which can come
 //!   before every grant, ask after ask. They are dropped while it asks, as lost messages are.
+//! - **A member whose node announced its stop** ([`crate::RawNode::stopped`], hyper-liveness's
+//!   `Change::Stopped`) is suspected, and until its node starts again it is ordered to campaign
+//!   never, and its requests for votes and whatever it sends of a later term are dropped: its run
+//!   is ending, and what it sends meanwhile, or sent before and is still in flight, could only
+//!   take the group's leader from it (`docs/timing.md` §2.9, "A voter's stop announced").
 //! - **A leader that trusts a member again** takes what it sent it while it was suspected for lost,
 //!   as raft takes a report that a member is unreachable (`MsgUnreachable`: a window out is given
 //!   up and the member probed from what it is known to hold), and sends it a heartbeat, so a member
@@ -102,6 +115,8 @@ pub(crate) struct Watch {
     /// The members the owner's detectors suspect, in order; at most the members a configuration
     /// names ([`crate::Limits::members`]).
     suspected: Vec<NodeId>,
+    /// Of those, the members whose node announced its run ends (`Raft::stopped`), in order.
+    stopped: Vec<NodeId>,
     /// The span, the round tail and the expected election, nanoseconds, once the owner gave them.
     pub(crate) timing: Option<(u64, u64, u64)>,
     /// The owner's clock at the last wake, nanoseconds: what a learner's catch-up round is timed on
@@ -113,6 +128,13 @@ pub(crate) struct Watch {
     pub(crate) beat: Arm,
     /// When this leader gives up the transfer under way.
     pub(crate) transfer: Arm,
+    /// When this leader, its detectors leaving it no quorum, next orders an heir to campaign if it
+    /// can be elected without the leader's vote (`Raft::wake_leader`); off while they leave it one.
+    pub(crate) order: Arm,
+    /// The leader this member knew in its term when it began to ask for pre-votes, zero for none:
+    /// a pre-candidate its detectors leave no quorum stops asking and follows it again
+    /// (`Raft::stop_asking`).
+    pub(crate) left: NodeId,
     /// The delays this member drew since it opened: the next draw's index. Every arming of the
     /// campaign draws anew, so a member's delays are independent across elections, as Raft's
     /// randomized timeout is drawn anew at every reset (§5.2, §9.3) and as the law's split
@@ -122,9 +144,10 @@ pub(crate) struct Watch {
     /// often than the law says. Past `u32::MAX` it wraps, repeating this member's own sequence,
     /// which nothing else is drawn from.
     pub(crate) draws: u32,
-    /// The hand-overs this member made since it opened or last became leader: whose turn, among
-    /// every heir in the order `Raft::hand_over` takes them, the next one names. Past `u32::MAX`
-    /// it wraps, and the turn goes on from the first.
+    /// The hand-overs this member made since it opened, last became leader, or, leading, was last
+    /// left no quorum by its detectors: whose turn, among every heir in the order
+    /// `Raft::hand_over` takes them, the next one names. Past `u32::MAX` it wraps, and the turn goes
+    /// on from the first.
     pub(crate) handovers: u32,
     /// When this member last ordered a hand-over, on the owner's clock as of its latest wake: an
     /// order forces a campaign, and until the election the law expects has passed since
@@ -137,7 +160,28 @@ pub(crate) struct Watch {
     /// The owner holds this member's campaigns: its log may lack what it acknowledged, or it is
     /// stalled for room (`docs/durable.md` §5, §8).
     pub(crate) held: bool,
+    /// The terms this member last stood in as a candidate and when it asked for their votes, on
+    /// the owner's clock as of its latest wake, the latest last: a grant that comes after the
+    /// member moved on still tells how long a grant takes.
+    stood: [(u64, u64); STOOD],
+    /// The term of a grant taken since the last wake, which times it (`Watch::time_grant`): a
+    /// message is stepped on the clock of the wake before it.
+    pub(crate) heard_grant: Option<u64>,
+    /// How long a grant took lately, from the asking to its arrival, nanoseconds; zero before
+    /// one. A voter grants once its vote is durable, on its own disk, which the round
+    /// (`Timing::round`) does not count: the owner's ballot counts this member's writes. An
+    /// unresolved candidacy waits at least this long before the member asks again, as a reset
+    /// waits at least a round (`Raft::wake`). Asking sooner, a candidate whose voter wrote slower
+    /// than itself moved on before every grant came, and spent a term each time it asked: 113
+    /// terms for one leader's kill, 70 % of the grants coming after their candidate had moved on
+    /// (Quiver's lab, a candidate on an NVMe disk and voters on a loaded btrfs one; kiln's
+    /// CP-T2.2 step 7). A grant that took longer raises it to that; a quicker one brings it
+    /// halfway down.
+    pub(crate) grant_wait: u64,
 }
+
+/// The candidacies a member remembers for timing late grants (`Watch::stood`).
+const STOOD: usize = 4;
 
 /// `duration` in nanoseconds, saturating at `u64::MAX` (584 years).
 pub(crate) fn nanos(duration: Duration) -> u64 {
@@ -145,6 +189,65 @@ pub(crate) fn nanos(duration: Duration) -> u64 {
 }
 
 impl Watch {
+    /// The member stands as a candidate in `term`, asking for its votes now.
+    pub(crate) fn stand(&mut self, term: u64) {
+        self.stood.rotate_left(1);
+        if let Some(last) = self.stood.last_mut() {
+            *last = (term, self.now);
+        }
+    }
+    /// Times the grant taken since the last wake, if it is of a term this member stood in lately
+    /// (`Watch::grant_wait`).
+    pub(crate) fn time_grant(&mut self) {
+        let Some(term) = self.heard_grant.take() else {
+            return;
+        };
+        let Some(&(_, asked)) = self
+            .stood
+            .iter()
+            .rev()
+            .find(|(stood, _)| *stood == term && term != 0)
+        else {
+            return;
+        };
+        let took = self.now.saturating_sub(asked);
+        self.grant_wait = if took >= self.grant_wait {
+            took
+        } else {
+            self.grant_wait
+                .saturating_sub(self.grant_wait.saturating_sub(took) / 2)
+        };
+    }
+    /// The earliest the candidacy of `term` may be given up, if this member stood in it lately and
+    /// a grant has been timed: when it asked, and as long as a grant takes and a round more
+    /// (`Watch::grant_wait`).
+    pub(crate) fn candidacy_floor(&self, term: u64) -> Option<u64> {
+        if self.grant_wait == 0 {
+            return None;
+        }
+        let &(_, asked) = self
+            .stood
+            .iter()
+            .rev()
+            .find(|(stood, _)| *stood == term && term != 0)?;
+        Some(
+            asked
+                .saturating_add(self.grant_wait)
+                .saturating_add(self.round().unwrap_or(0)),
+        )
+    }
+    /// The candidacy of `term` under way, if the member is a candidate, timed before a grant told
+    /// how long one takes, waits that long all the same and a round more from when it asked
+    /// (`Watch::candidacy_floor`): given up sooner, the grant it asked for comes to the next
+    /// candidacy, which drops it.
+    pub(crate) fn hold_candidacy(&mut self, term: Option<u64>) {
+        if let (Arm::At(at), Some(floor)) = (
+            self.campaign,
+            term.and_then(|term| self.candidacy_floor(term)),
+        ) {
+            self.campaign = Arm::At(at.max(floor));
+        }
+    }
     /// Whether the owner's detectors suspect `member`.
     pub(crate) fn suspects(&self, member: NodeId) -> bool {
         self.suspected.binary_search(&member).is_ok()
@@ -166,8 +269,30 @@ impl Watch {
             }
         }
     }
-    /// The detectors trust `member` again. False when they did already.
+    /// Whether `member`'s node announced its run ends, and has not been heard since.
+    pub(crate) fn stopped(&self, member: NodeId) -> bool {
+        self.stopped.binary_search(&member).is_ok()
+    }
+    /// `member`'s node announced its run ends: kept until the detectors trust it again. Refused
+    /// past `members`, the most a configuration names.
+    pub(crate) fn stop(&mut self, member: NodeId, members: usize) -> crate::Result<()> {
+        if let Err(position) = self.stopped.binary_search(&member) {
+            if self.stopped.len() >= members {
+                return Err(crate::Error::Capacity("members stopped"));
+            }
+            self.stopped
+                .try_reserve(1)
+                .map_err(|_| crate::Error::Capacity("members stopped"))?;
+            self.stopped.insert(position, member);
+        }
+        Ok(())
+    }
+    /// The detectors trust `member` again, and what its node announced of a run is past. False
+    /// when they did already.
     pub(crate) fn trust(&mut self, member: NodeId) -> bool {
+        if let Ok(position) = self.stopped.binary_search(&member) {
+            self.stopped.remove(position);
+        }
         match self.suspected.binary_search(&member) {
             Ok(position) => {
                 self.suspected.remove(position);
@@ -180,6 +305,7 @@ impl Watch {
     /// configuration no longer names.
     pub(crate) fn forget_unnamed(&mut self, named: impl Fn(NodeId) -> bool) {
         self.suspected.retain(|member| named(*member));
+        self.stopped.retain(|member| named(*member));
     }
     /// The members suspected, in order.
     pub(crate) fn suspected(&self) -> &[NodeId] {
@@ -204,6 +330,17 @@ impl Watch {
         self.draws = self.draws.wrapping_add(1);
         Some(delay)
     }
+    /// A timer armed at `now`: due a round (when `round`) and `local`'s next draw after it, or to be
+    /// timed at a later wake while the owner has given no timing.
+    pub(crate) fn after(&mut self, now: u64, round: bool, local: u64) -> Arm {
+        match (self.round(), self.draw(local)) {
+            (Some(tail), Some(delay)) => Arm::At(
+                now.saturating_add(if round { tail } else { 0 })
+                    .saturating_add(delay),
+            ),
+            _ => Arm::Unset { round },
+        }
+    }
     /// When an armed timer is due, if it is timed.
     pub(crate) fn due(arm: Arm) -> Option<u64> {
         match arm {
@@ -216,6 +353,7 @@ impl Watch {
         std::mem::size_of::<Self>().saturating_add(
             self.suspected
                 .capacity()
+                .saturating_add(self.stopped.capacity())
                 .saturating_mul(std::mem::size_of::<NodeId>()),
         )
     }

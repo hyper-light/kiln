@@ -40,44 +40,45 @@ pub struct Fetched {
 /// `digest` for `repo` from the first of its holders whose copy is what its name says, kept in
 /// `store`.
 pub async fn fetch(store: &Arc<Store>, peers: &dyn Peers, repo: &str, digest: &str) -> anyhow::Result<Fetched> {
+    fetch_guarded(store, peers, repo, digest).await.map(|(f, _guard)| f)
+}
+
+pub(super) async fn fetch_guarded(store: &Arc<Store>, peers: &dyn Peers, repo: &str, digest: &str) -> anyhow::Result<(Fetched, Option<crate::runner::cache::CacheGuard>)> {
     let mut done = Fetched::default();
     if !is_digest(digest) {
-        return Ok(done);
+        return Ok((done, None));
     }
     for peer in peers.holders(repo, digest).await {
-        let tmp = store.temp();
-        let got = peers.get(&peer, repo, digest, &tmp).await;
+        let tmp = Arc::new(super::service::StagedFile(store.temp()));
+        let got = peers.get(&peer, repo, digest, &tmp.0).await;
         if !matches!(got, Ok(true)) {
-            let _ = std::fs::remove_file(&tmp);
             if let Err(e) = got {
                 tracing::debug!(target: "kiln.work", %peer, object = %digest, error = %format!("{e:#}"), "a peer couldn't send an object");
             }
             continue;
         }
         // Checked before it's kept: a wrong copy never enters the store, under any name.
-        let (s, t, want) = (Arc::clone(store), tmp.clone(), digest.to_owned());
-        let kept = crate::rt::blocking(move || -> anyhow::Result<bool> {
-            if crate::sync::blobs::hash_file(&t)? != want {
-                return Ok(false);
+        let (s, t, want) = (Arc::clone(store), Arc::clone(&tmp), digest.to_owned());
+        let kept = crate::rt::blocking(move || -> anyhow::Result<Option<super::store::Published>> {
+            if crate::sync::blobs::hash_file(&t.0)? != want {
+                return Ok(None);
             }
-            s.put_file(&t)?;
-            Ok(true)
+            Ok(Some(s.put_file_guarded(&t.0)?))
         })
         .await;
-        let _ = std::fs::remove_file(&tmp);
         match kept {
-            Ok(Ok(true)) => {
+            Ok(Ok(Some(publication))) => {
                 done.from = Some(peer);
-                return Ok(done);
+                return Ok((done, Some(publication.guard)));
             }
-            Ok(Ok(false)) => {
+            Ok(Ok(None)) => {
                 tracing::warn!(target: "kiln.work", %peer, object = %digest, "a peer's copy of an object wasn't what its name says: refused");
                 done.refused.push(peer);
             }
             Ok(Err(e)) | Err(e) => return Err(e),
         }
     }
-    Ok(done)
+    Ok((done, None))
 }
 
 /// Peers over reach's end-to-end links (W24-R27): the server's directory says which runners hold
@@ -97,7 +98,7 @@ impl Peers for Reach {
     fn get<'a>(&'a self, peer: &'a str, repo: &'a str, digest: &'a str, into: &'a Path) -> BoxFuture<'a, anyhow::Result<bool>> {
         Box::pin(async move {
             let node = crate::reach::node::global().ok_or_else(|| anyhow::anyhow!("this runner has no reach node"))?;
-            node.object(peer, repo, digest, into).await
+            node.object_bounded(peer, repo, digest, into, Some(super::service::MAX_OBJECT)).await
         })
     }
 }

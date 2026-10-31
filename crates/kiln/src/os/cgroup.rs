@@ -9,7 +9,37 @@
 //!   `memory.max_usage_in_bytes`; `oom_kill` of `memory.oom_control`.
 //! - Elsewhere: none.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+/// U01/C1a: a single native child-process domain's conservative kernel envelope.
+/// This is derived from an existing outer grant, never from host capacity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CpuMemoryLimit {
+    pub cpu_quota_us: u64,
+    pub cpu_period_us: u64,
+    pub memory_bytes: u64,
+}
+impl CpuMemoryLimit {
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn from_budget(cpu: f64, memory: u64, page: u64) -> anyhow::Result<Self> {
+        anyhow::ensure!(cpu.is_finite() && cpu > 0.0 && page.is_power_of_two(), "invalid original CPU/memory grant or kernel page size");
+        let period = 100_000;
+        let scaled = (cpu * period as f64).floor();
+        anyhow::ensure!(scaled.is_finite() && scaled > 0.0 && scaled < u64::MAX as f64, "CPU grant cannot be represented by a kernel quota");
+        let mut quota = scaled as u64;
+        // Floating-point multiplication may round across an integer boundary. The readback
+        // ratio may never exceed the Scheduler's original floating-point grant.
+        if quota as f64 / period as f64 > cpu { quota = quota.checked_sub(1).ok_or_else(|| anyhow::anyhow!("CPU grant rounds to zero"))?; }
+        let limits = Self { cpu_quota_us: quota, cpu_period_us: period, memory_bytes: memory / page * page };
+        limits.validate()?;
+        Ok(limits)
+    }
+
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.cpu_period_us == 100_000 && self.cpu_quota_us >= 1_000 && self.memory_bytes > 0, "invalid finite CPU/memory envelope");
+        Ok(())
+    }
+}
 
 /// A cgroup's memory.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -139,6 +169,14 @@ mod tests {
 
     #[test]
     fn a_containers_memory_from_cgroup_v2() {
+        let cpu = 1.234567;
+        let memory = (128 << 20) + 123;
+        let bound = CpuMemoryLimit::from_budget(cpu, memory, 65536);
+        assert!(bound.as_ref().is_ok_and(|b| b.cpu_quota_us as f64 / b.cpu_period_us as f64 <= cpu
+            && b.memory_bytes <= memory && memory - b.memory_bytes < 65536));
+        for (cpu, memory, page) in [(f64::NAN, memory, 4096), (0.0, memory, 4096), (1.0, 0, 4096), (1.0, memory, 0), (1.0, memory, 3)] {
+            assert!(CpuMemoryLimit::from_budget(cpu, memory, page).is_err());
+        }
         // As kiln's pod read on 2026-10-18 while its server was killed every minute.
         let stat = "anon 1803550720\nfile 412000256\nkernel 31000000\nactive_file 120000000\ninactive_file 292000256\n";
         let events = "low 0\nhigh 0\nmax 1290\noom 41\noom_kill 41\noom_group_kill 0\n";

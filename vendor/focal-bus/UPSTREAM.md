@@ -13,8 +13,9 @@ The bus Quiver is built on (docs/design/focal-bus.md, kiln's CP-T2.1).
   - `crates/focal-seal` and `crates/focal-platform`: the node log's keys and the files a part's
     image is installed through;
   - `crates/focal-timing`: the bus's tests' waits (a dev-dependency).
-- **What it builds on:** hyper-raft's shared crates at `25cf889` (hyper-raft's `main`), the revision
-  this commit of the bus takes (Focal's `vendor/README.md`), vendored apart at `vendor/hyper-raft`.
+- **What it builds on:** hyper-raft's shared crates at `4d72e19b`, vendored apart at
+  `vendor/hyper-raft`. This exact Focal base originally used `25cf889`; the recorded compatibility
+  patch below adapts its selected bus crates while preserving that ahead Focal base.
   Focal's own copies of them (its `vendor/hyper-*`) and its other vendored crates (`aws-lc-rs`, `aws-lc-sys`) are not taken:
   the bus names the shared crates as from crates.io, and Quiver's root `Cargo.toml` (kiln's, in kiln)
   points each name at its one copy with `[patch.crates-io]`.
@@ -33,6 +34,12 @@ alone (as the one below) isn't.
 |---|---|---|---|
 | `Cargo.toml` | The shared crates (`hyper-*`) named by version, without a path into Focal's `vendor/` | Quiver takes hyper-raft once, beside the bus (`vendor/hyper-raft`), and kiln holds one copy of each hyper-light product: whoever builds the bus points each name at its copy | `0001-the-shared-crates-by-name-at-the-copy-of-hyper-raft-beside.patch` |
 
+| `crates/focal-bus/src/{limits,member,node}.rs` | Required Hyper-Raft API compatibility: explicit Flushed disk mode and Decimated acknowledgement policy, own replica allowance, disk/liveness facts, and advisory path events | Advance the single shared Hyper-Raft pin without changing the Focal base, weakening durability, or treating shared free memory as the replica allowance | `0002-cp-t2-2-required-hyper-raft-api-compatibility.patch` |
+
+| `crates/focal-memory/src/{budget,disk,owner}.rs` and `benches/support/alloc_count.rs` | Use the MSRV-compatible atomic update name | Keep strict Rust 1.99 validation while preserving existing atomic behavior and Rust 1.98.1 support | `0003-cp-t2-2-use-msrv-compatible-atomic-update-name.patch` |
+
+| `crates/focal-bus/src/{node,member}.rs` | Accept the additive shared transport frame connection epoch | Keep the exact Focal base compatible without changing Publish semantics or duplicating the transport owner | `0004-cp-t2-2-retain-shared-transport-frame-provenance.patch` |
+
 ## Taking a newer upstream
 
 `python3 scripts/vendor.py focal-bus <commit>` takes these crates at that commit, re-applies the
@@ -40,4 +47,4 @@ changes above by three-way merge, refreshes them, and runs the gate. A change th
 stops it, naming the change and the files, with nothing changed here. A new edit here is recorded
 with `python3 scripts/vendor.py record focal-bus <title> --why <why>` and gets its row in the table;
 `python3 scripts/vendor.py check` (in the gate) fails while an edit isn't recorded. A newer commit of the
-bus may take hyper-raft at another revision: take hyper-raft at that revision with it.
+bus may take hyper-raft at another revision: coordinate the shared pin and its recorded compatibility changes with every consumer.

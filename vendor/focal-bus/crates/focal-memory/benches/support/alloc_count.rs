@@ -131,7 +131,7 @@ fn track_live_add(size: usize) {
 }
 
 fn track_live_sub(size: usize) {
-    let _ = LIVE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
+    let _ = LIVE.try_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
         Some(live.saturating_sub(size))
     });
 }
@@ -307,7 +307,7 @@ fn fold(rendered: &str) -> (u64, String) {
 
 fn sample(size: usize, realloc_from: Option<usize>) {
     if SAMPLE_BUDGET
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
             left.checked_sub(1)
         })
         .is_err()

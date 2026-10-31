@@ -1,6 +1,6 @@
 //! bench send_path (CP-T3.2, AC-T3.2.3): what a session's inbox adds to a send, on a real disk. It
-//! times `Inbox::accept`, a message's one durable commit on kiln's records store (Turso, every commit
-//! synced), and beside each take the baseline it's measured against: the same store's plain durable
+//! times `Inbox::accept`, a message's durable commit through kiln's production Amphora Records
+//! adapter, and beside each take the baseline it's measured against: the same store's plain durable
 //! commit of one record, which a send costs anyway once its session's record is journaled before
 //! it's acknowledged (CP-T3.1). What the inbox adds is, within each run, the p50, p99 and p99.9 of
 //! its takes less those of the plain commits (a difference of percentiles); the criterion reads the
@@ -16,8 +16,8 @@
 //!   alternating, so a take's check never rides in a plain commit's shared write: fresh sessions,
 //!   and sessions at their most ids tidying as the host does, each passing its bound once in its
 //!   takes, at its own point;
-//! - takes across a compaction of the store's history (pushed to its first by plain commits of
-//!   their own), its steps run between them;
+//! - takes across one explicit product compaction after 2,048 history overwrites; its complete
+//!   latency counts in the next take, and is also recorded separately;
 //! - a first take, its session's head not in memory (as after a start), on an inbox fresh each round.
 //!
 //! Beside them: a session's opening, its ids counted (once a process, on its lane, which a take
@@ -36,13 +36,18 @@
 //! ```
 //!
 //! `--any-load` records on a loaded machine too, marked so: a smoke run, never evidence.
+//! U06: unsupported engine write/apply/sync counters are omitted. This measures local durability,
+//! not replication/network latency. After each run all benchmark handles drop and the same
+//! Database is reopened in-process, verifying a receipt, its repeat and a plain journal row.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kiln::harness::inbox::{Inbox, KEEP, Limits, TRIM, digest};
-use kiln::records::turso::{COMPACT_EVERY, KEEP_REVS, Stats, TursoRecords};
+use amphora::database::Database;
+use kiln::records::StoreRecords;
+use kiln_seams::records::{Consistency, Refusal};
 use kiln_seams::Records as _;
 use serde_json::{Value, json};
 
@@ -84,17 +89,12 @@ fn args() -> anyhow::Result<Args> {
     Ok(a)
 }
 
-/// What the store did since `was` (its stats as they were): its durable writes, the commits they
-/// held, and the time they took to apply and to sync, each on average per write.
-fn store(now: &Stats, was: [u64; 4]) -> (Value, [u64; 4]) {
-    let get = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Acquire);
-    let cur = [get(&now.writes), get(&now.commits), get(&now.apply_ns), get(&now.sync_ns)];
-    let d: Vec<u64> = cur.iter().zip(was).map(|(c, w)| c.saturating_sub(w)).collect();
-    let (writes, commits, apply, sync) = (d.first().copied().unwrap_or(0), d.get(1).copied().unwrap_or(0), d.get(2).copied().unwrap_or(0), d.get(3).copied().unwrap_or(0));
-    #[allow(clippy::cast_precision_loss)]
-    let per = |x: u64| if writes == 0 { None } else { Some(x as f64 / writes as f64) };
-    let ms = |x: Option<f64>| x.map(|v| v / 1e6);
-    (json!({"writes": writes, "commits": commits, "commits_per_write": per(commits), "apply_ms_per_write": ms(per(apply)), "sync_ms_per_write": ms(per(sync))}), cur)
+/// CP-T3.2/U06: use the production adapter on one canonical host Database, with no legacy
+/// migration input or feature-specific writer. The namespace owns its Database handle.
+fn open_records(path: &Path) -> anyhow::Result<Arc<StoreRecords>> {
+    let until = Instant::now().checked_add(Duration::from_secs(30)).ok_or_else(|| anyhow::anyhow!("benchmark database deadline overflow"))?;
+    let database = Database::open(path, until)?;
+    Ok(Arc::new(kiln::records::from_database(&database, "host")?))
 }
 
 /// The disk's own floor: a 4 KiB append and `fdatasync`, 400 times.
@@ -118,6 +118,10 @@ const BUSY: [(&str, &str); 7] = [("busy1", "b1"), ("busy2", "b2"), ("busy3", "b3
 /// The cases, each read by the criterion: what the inbox adds to each.
 const CASES: [&str; 8] = ["sequential", "at_its_most", "a_busy_host", "a_long_history", "concurrent", "concurrent_at_their_most", "across_a_compaction", "a_first_take"];
 
+/// Benchmark workload size, independent of any engine's maintenance schedule.
+const HISTORY_COMMITS: usize = 2048;
+struct Compaction { before: u64, took: Option<Duration> }
+
 /// The plain commit a take is measured against: one record, synced (what a send writes anyway once
 /// its session's record is journaled).
 fn plain_commit(id: &str) -> kiln_seams::records::Tx {
@@ -140,11 +144,18 @@ async fn fill(inbox: &Inbox, session: &str, tag: &str, count: usize) -> anyhow::
 /// commit; past its bound its oldest go once a take's answer has gone, as the host tidies, and the
 /// next take waits for that (as the next message on its lane would): each take's time, its plain
 /// commit's, their difference, and each tidying's own time.
-async fn at_its_bound(inbox: &Inbox, turso: &TursoRecords, session: &str, prefix: &str, words: &str, count: usize) -> anyhow::Result<(Vec<Duration>, Vec<Duration>, Vec<f64>, Vec<Duration>)> {
+async fn at_its_bound(inbox: &Inbox, records: &StoreRecords, session: &str, prefix: &str, words: &str, count: usize, mut compact: Option<&mut Compaction>) -> anyhow::Result<(Vec<Duration>, Vec<Duration>, Vec<f64>, Vec<Duration>)> {
     let (mut took, mut base, mut paired, mut tidied) = (Vec::with_capacity(count), Vec::with_capacity(count), Vec::with_capacity(count), Vec::new());
     let mut owed = Duration::ZERO;
     for m in 0..count {
-        let (t, b, _) = pair(inbox, turso, session, format!("{prefix}-{m}"), words, m % 2 == 0).await?;
+        if let Some(compact) = compact.as_deref_mut().filter(|_| m == count / 2) {
+            let started = Instant::now();
+            records.compact(compact.before).await?;
+            let took = started.elapsed();
+            compact.took = Some(took);
+            owed = owed.saturating_add(took);
+        }
+        let (t, b, _) = pair(inbox, records, session, format!("{prefix}-{m}"), words, m % 2 == 0).await?;
         let t = t.saturating_add(std::mem::take(&mut owed));
         took.push(t);
         base.push(b);
@@ -160,7 +171,7 @@ async fn at_its_bound(inbox: &Inbox, turso: &TursoRecords, session: &str, prefix
 
 /// One message's take and its plain commit, the take first when `first` (else second): each's
 /// time, and the take less the plain commit (the paired difference, in milliseconds).
-async fn pair(inbox: &Inbox, turso: &TursoRecords, session: &str, id: String, words: &str, first: bool) -> anyhow::Result<(Duration, Duration, f64)> {
+async fn pair(inbox: &Inbox, records: &StoreRecords, session: &str, id: String, words: &str, first: bool) -> anyhow::Result<(Duration, Duration, f64)> {
     let plain = plain_commit(&id);
     let take = async {
         let t = Instant::now();
@@ -169,7 +180,7 @@ async fn pair(inbox: &Inbox, turso: &TursoRecords, session: &str, id: String, wo
     };
     let base = async {
         let t = Instant::now();
-        turso.commit(plain).await?;
+        records.commit(plain).await?;
         anyhow::Ok(t.elapsed())
     };
     let (took, base) = if first {
@@ -197,13 +208,13 @@ type Phased = (Vec<Duration>, Vec<Duration>, Vec<Duration>, Duration);
 /// each, their order alternating, so a take's check never rides in a plain commit's shared write.
 /// Tidying, each session tidies after each take, as the host does, and its next take in the phase
 /// waits for that (its time counts it).
-async fn phases(inbox: &Arc<Inbox>, turso: &Arc<TursoRecords>, sessions: &[String], prefix: &str, words: &str, shape: &Shape) -> anyhow::Result<Phased> {
+async fn phases(inbox: &Arc<Inbox>, records: &Arc<StoreRecords>, sessions: &[String], prefix: &str, words: &str, shape: &Shape) -> anyhow::Result<Phased> {
     let (mut takes, mut plains, mut tidied) = (Vec::new(), Vec::new(), Vec::new());
     let started = Instant::now();
     for r in 0..shape.rounds {
         for taking in if r % 2 == 0 { [true, false] } else { [false, true] } {
             let senders = sessions.iter().map(|session| {
-                let (inbox, turso) = (Arc::clone(inbox), Arc::clone(turso));
+                let (inbox, records) = (Arc::clone(inbox), Arc::clone(records));
                 let (session, words, prefix) = (session.clone(), words.to_owned(), format!("{prefix}-{r}"));
                 let (per, tidy) = (shape.per, shape.tidy);
                 async move {
@@ -221,7 +232,7 @@ async fn phases(inbox: &Arc<Inbox>, turso: &Arc<TursoRecords>, sessions: &[Strin
                                 tidies.push(owed);
                             }
                         } else {
-                            turso.commit(plain_commit(&id)).await?;
+                            records.commit(plain_commit(&id)).await?;
                             took.push(t.elapsed());
                         }
                     }
@@ -270,27 +281,26 @@ fn with(mut m: serde_json::Map<String, Value>, more: Value) -> Value {
     Value::Object(m)
 }
 
-/// One run: a fresh records file in `dir`, and on it each case (the module's doc), the repeats and
-/// the disk's floor.
+/// One run: a fresh canonical Amphora database in `dir`, and on it each case (the module's
+/// doc), the repeats and the disk's floor, then verification after reopening the same database.
 fn run(dir: &Path, messages: usize, sessions: usize, n: usize) -> anyhow::Result<Value> {
     let scratch = tempfile::Builder::new().prefix("send-path-").tempdir_in(dir)?;
-    let turso = Arc::new(TursoRecords::open(&scratch.path().join(kiln::records::FILE))?);
-    let inbox = Arc::new(Inbox::new(turso.clone(), Limits::default()));
-    let (_, mut was) = store(turso.stats(), [0; 4]);
+    let path = scratch.path().join("amphora.db");
+    let records = open_records(&path)?;
+    let inbox = Arc::new(Inbox::new(records.clone(), Limits::default()));
     let words = digest("a message of the size people send, more or less: deploy the fix to staging", &[]);
     let (keep, trim) = (usize::try_from(KEEP).unwrap_or(4096), usize::try_from(TRIM).unwrap_or(256));
-    futures::executor::block_on(async {
+    let reopened_words = words.clone();
+    let (mut report, receipt, head) = kiln::rt::block_on(async move {
         // One session, a message at a time.
         inbox.open("solo", 0).await?;
         let (mut alone, mut base_alone, mut paired_alone) = (Vec::with_capacity(messages), Vec::with_capacity(messages), Vec::with_capacity(messages));
         for m in 0..messages {
-            let (took, base, diff) = pair(&inbox, &turso, "solo", format!("r{n}-solo-{m}"), &words, m % 2 == 0).await?;
+            let (took, base, diff) = pair(&inbox, &records, "solo", format!("r{n}-solo-{m}"), &words, m % 2 == 0).await?;
             alone.push(took);
             base_alone.push(base);
             paired_alone.push(diff);
         }
-        let (alone_store, now) = store(turso.stats(), was);
-        was = now;
         // A repeat of each: answered with the first time's answer.
         let mut repeats = Vec::with_capacity(messages.min(500));
         for m in 0..messages.min(500) {
@@ -305,7 +315,7 @@ fn run(dir: &Path, messages: usize, sessions: usize, n: usize) -> anyhow::Result
         // Each arrival with its most ids, one at a time, timed (its first message waits for it).
         let mut arrived = vec![fill(&inbox, "full", &format!("r{n}-kept"), most).await?];
         let at_most = messages.min(1024);
-        let (full, base_full, paired_full, tidied) = at_its_bound(&inbox, &turso, "full", &format!("r{n}-full"), &words, at_most).await?;
+        let (full, base_full, paired_full, tidied) = at_its_bound(&inbox, &records, "full", &format!("r{n}-full"), &words, at_most, None).await?;
         // A busy host: more sessions at their most ids (and what their tidying left), the others
         // taking messages all along (and tidying, as the host does) while one is measured, each
         // take of its with its plain commit.
@@ -326,7 +336,7 @@ fn run(dir: &Path, messages: usize, sessions: usize, n: usize) -> anyhow::Result
             }
         });
         let measured = async {
-            let r = at_its_bound(&inbox, &turso, "busy1", &format!("r{n}-busy"), &words, at_most).await;
+            let r = at_its_bound(&inbox, &records, "busy1", &format!("r{n}-busy"), &words, at_most, None).await;
             measuring.store(false, std::sync::atomic::Ordering::Release);
             r
         };
@@ -343,9 +353,7 @@ fn run(dir: &Path, messages: usize, sessions: usize, n: usize) -> anyhow::Result
             inbox.import(long, &more, 0).await?;
             let _ = inbox.tidy(long).await;
         }
-        let (longer, base_long, paired_long, tidied_long) = at_its_bound(&inbox, &turso, long, &format!("r{n}-long-take"), &words, at_most).await?;
-        let (_, now) = store(turso.stats(), was);
-        was = now;
+        let (longer, base_long, paired_long, tidied_long) = at_its_bound(&inbox, &records, long, &format!("r{n}-long-take"), &words, at_most, None).await?;
         // Many sessions at once, each with one commit in flight, in whole phases apart.
         let rounds = 4usize;
         let per = messages.div_ceil(sessions).max(1).div_ceil(rounds).max(1);
@@ -353,9 +361,7 @@ fn run(dir: &Path, messages: usize, sessions: usize, n: usize) -> anyhow::Result
         for s in &fresh {
             inbox.open(s, 0).await?;
         }
-        let (together, base_together, _, wall) = phases(&inbox, &turso, &fresh, &format!("r{n}-s"), &words, &Shape { rounds, per, tidy: false }).await?;
-        let (together_store, now) = store(turso.stats(), was);
-        was = now;
+        let (together, base_together, _, wall) = phases(&inbox, &records, &fresh, &format!("r{n}-s"), &words, &Shape { rounds, per, tidy: false }).await?;
         let together_rate = rate(together.len().saturating_add(base_together.len()), wall);
         // Many sessions at once, each at its most ids, tidying as the host does: each passes its
         // bound once in its takes, at its own point (as a host's sessions do, not all at once).
@@ -367,40 +373,31 @@ fn run(dir: &Path, messages: usize, sessions: usize, n: usize) -> anyhow::Result
             async move { fill(&inbox, &session, &format!("r{n}-{session}-kept"), count).await.map(|_| ()) }
         });
         futures::future::try_join_all(fills).await?;
-        let (_, now) = store(turso.stats(), was);
-        was = now;
         let crowd_shape = Shape { rounds, per: trim.div_ceil(rounds).max(1), tidy: true };
-        let (crowded, base_crowded, tidied_crowded, crowd_wall) = phases(&inbox, &turso, &crowd, &format!("r{n}-c"), &words, &crowd_shape).await?;
-        let (crowd_store, now) = store(turso.stats(), was);
-        was = now;
+        let (crowded, base_crowded, tidied_crowded, crowd_wall) = phases(&inbox, &records, &crowd, &format!("r{n}-c"), &words, &crowd_shape).await?;
         let crowd_rate = rate(crowded.len().saturating_add(base_crowded.len()), crowd_wall);
-        // Across a compaction: the store's history pushed by plain commits of their own to just
-        // short of its first compaction, which begins under takes on a session at its most ids,
-        // each with its plain commit, its steps run between them.
-        let first = KEEP_REVS.saturating_add(COMPACT_EVERY);
-        let head = turso.head().await.map_err(|e| anyhow::anyhow!("{e}"))?;
-        let short = usize::try_from(first.saturating_sub(64).saturating_sub(head)).unwrap_or(0);
+        // CP-T3.2/U06: bounded overwrite history, then one explicit product compaction
+        // between accepted messages. Its whole time counts in that next take; no assumed
+        // engine maintenance schedule or fabricated background-compaction counter.
+        records.commit(kiln_seams::records::Tx { conds: Vec::new(), writes: vec![kiln_seams::records::Write::Put { family: "history".into(), key: b"overwritten".to_vec(), value: vec![b'h'; 60] }] }).await?;
         let pushers = (0..sessions).map(|s| {
-            let turso = Arc::clone(&turso);
-            let each = short / sessions.max(1);
+            let records = Arc::clone(&records);
             async move {
-                for m in 0..each {
-                    let w = kiln_seams::records::Write::Put { family: "history".into(), key: format!("r{n}-h{s}-{m}").into_bytes(), value: vec![b'h'; 60] };
-                    turso.commit(kiln_seams::records::Tx { conds: Vec::new(), writes: vec![w] }).await?;
+                for m in (s..HISTORY_COMMITS).step_by(sessions) {
+                    let mut value = vec![b'h'; 60];
+                    value.extend_from_slice(&m.to_le_bytes());
+                    let w = kiln_seams::records::Write::Put { family: "history".into(), key: b"overwritten".to_vec(), value };
+                    records.commit(kiln_seams::records::Tx { conds: Vec::new(), writes: vec![w] }).await?;
                 }
                 anyhow::Ok(())
             }
         });
         futures::future::try_join_all(pushers).await?;
-        let compactions = || turso.stats().compactions.load(std::sync::atomic::Ordering::Acquire);
-        let (before, history) = (compactions(), turso.head().await.map_err(|e| anyhow::anyhow!("{e}"))?);
-        let (_, now) = store(turso.stats(), was);
-        was = now;
-        let (compacting, base_compacting, paired_compacting, tidied_compacting) = at_its_bound(&inbox, &turso, "full", &format!("r{n}-compacting"), &words, at_most).await?;
-        let during = compactions().saturating_sub(before);
-        let (compacting_store, _) = store(turso.stats(), was);
-        // The one under way finished before what follows.
-        turso.compact(0).await;
+        let history = records.head().await?;
+        let mut compaction = Compaction { before: history, took: None };
+        let (compacting, base_compacting, paired_compacting, tidied_compacting) = at_its_bound(&inbox, &records, "full", &format!("r{n}-compacting"), &words, at_most, Some(&mut compaction)).await?;
+        let compacted = compaction.took.ok_or_else(|| anyhow::anyhow!("the measured compaction was not run"))?;
+        anyhow::ensure!(matches!(records.get("history", b"overwritten", Consistency::Snapshot(history.saturating_sub(1))).await, Err(Refusal::Compacted { .. })), "compaction did not advance the historical snapshot horizon");
         // A first take, its session's head not in memory (as after a start, or as another process
         // takes it): an inbox fresh each round over the same records, every session's first take
         // there with its plain commit.
@@ -411,9 +408,9 @@ fn run(dir: &Path, messages: usize, sessions: usize, n: usize) -> anyhow::Result
         let cold_rounds = at_most.div_ceil(every.len().max(1)).max(1);
         let (mut cold, mut base_cold, mut paired_cold) = (Vec::new(), Vec::new(), Vec::new());
         for r in 0..cold_rounds {
-            let fresh_inbox = Inbox::new(turso.clone(), Limits::default());
+            let fresh_inbox = Inbox::new(records.clone(), Limits::default());
             for (k, session) in every.iter().enumerate() {
-                let (t, b, d) = pair(&fresh_inbox, &turso, session, format!("r{n}-cold-{r}-{k}"), &words, (r + k) % 2 == 0).await?;
+                let (t, b, d) = pair(&fresh_inbox, &records, session, format!("r{n}-cold-{r}-{k}"), &words, (r + k) % 2 == 0).await?;
                 cold.push(t);
                 base_cold.push(b);
                 paired_cold.push(d);
@@ -421,7 +418,7 @@ fn run(dir: &Path, messages: usize, sessions: usize, n: usize) -> anyhow::Result
         }
         // Each session's ids counted once a process, as it opens (its lane's first tidy, which no
         // take waits on unless one comes that moment), on an inbox fresh for it: timed apart.
-        let counting = Inbox::new(turso.clone(), Limits::default());
+        let counting = Inbox::new(records.clone(), Limits::default());
         let mut opened = Vec::with_capacity(every.len());
         for session in &every {
             let t = Instant::now();
@@ -430,21 +427,47 @@ fn run(dir: &Path, messages: usize, sessions: usize, n: usize) -> anyhow::Result
             opened.push(t.elapsed());
         }
         let crowd_kept = |s: usize| keep.saturating_add(s.saturating_mul(2).saturating_add(1).saturating_mul(trim) / sessions.saturating_mul(2).max(1));
-        Ok(json!({
-            "sequential": with(case(alone, base_alone, Some(paired_alone)), json!({"store": alone_store})),
+        // Keep reopen verification outside every measured case, with its own known receipt.
+        inbox.open("reopen", 0).await?;
+        let receipt = inbox.accept("reopen", "before-reopen", &words, Some(0), 7).await?;
+        anyhow::ensure!(!receipt.repeat, "the reopen fixture was already accepted");
+        records.commit(plain_commit("reopen-journal")).await?;
+        let head = records.head().await?;
+        Ok((json!({
+            "sequential": case(alone, base_alone, Some(paired_alone)),
             "repeat": summary(repeats),
             "at_its_most": with(case(full, base_full, Some(paired_full)), json!({"kept_before": most, "tidied": {"what": "its oldest ids let go, after a take's answer has gone (the next take waits for it, and its time counts it)", "latency": summary(tidied)}})),
             "a_busy_host": with(case(busy, base_busy, Some(paired_busy)), json!({"sessions_at_their_most": BUSY.len() + 1, "kept_each": most, "others_taking": BUSY.len() - 1, "others_took": others_took, "tidied": {"latency": summary(tidied_busy)}})),
             "a_long_history": with(case(longer, base_long, Some(paired_long)), json!({"let_go_before": 100 * trim, "kept": most, "tidied": {"what": "its oldest ids let go, reading through what it let go before (the next take waits for it, and its time counts it)", "latency": summary(tidied_long)}})),
-            "concurrent": with(case(together, base_together, None), json!({"sessions": sessions, "per_session": per * rounds, "phases": "takes, and plain commits alone, in whole phases, their order alternating", "commits_per_second": together_rate, "store": together_store})),
-            "concurrent_at_their_most": with(case(crowded, base_crowded, None), json!({"sessions": sessions, "kept_each": format!("{} to {}", crowd_kept(0), crowd_kept(sessions.saturating_sub(1))), "takes_each": crowd_shape.per * rounds, "tidied": {"what": "each session's oldest ids let go once, as it passed its bound (its next take in the phase waits for it, and its time counts it)", "latency": summary(tidied_crowded)}, "commits_per_second": crowd_rate, "store": crowd_store})),
-            "across_a_compaction": with(case(compacting, base_compacting, Some(paired_compacting)), json!({"history_at": history, "compaction_at": first, "compactions_during": during, "tidied": {"latency": summary(tidied_compacting)}, "store": compacting_store})),
+            "concurrent": with(case(together, base_together, None), json!({"sessions": sessions, "per_session": per * rounds, "phases": "takes, and plain commits alone, in whole phases, their order alternating", "commits_per_second": together_rate})),
+            "concurrent_at_their_most": with(case(crowded, base_crowded, None), json!({"sessions": sessions, "kept_each": format!("{} to {}", crowd_kept(0), crowd_kept(sessions.saturating_sub(1))), "takes_each": crowd_shape.per * rounds, "tidied": {"what": "each session's oldest ids let go once, as it passed its bound (its next take in the phase waits for it, and its time counts it)", "latency": summary(tidied_crowded)}, "commits_per_second": crowd_rate})),
+            "across_a_compaction": with(case(compacting, base_compacting, Some(paired_compacting)), json!({"history_at": history, "history_overwrites": HISTORY_COMMITS, "compaction": {"mode": "one explicit product compact(history_at) between takes; its whole time counts in the next take", "latency": summary(vec![compacted])}, "tidied": {"latency": summary(tidied_compacting)}})),
             "a_first_take": with(case(cold, base_cold, Some(paired_cold)), json!({"sessions": every.len(), "rounds": cold_rounds})),
             "opened": {"what": "a session opened on an inbox fresh for it, its ids counted (its lane's first tidy: once a process, a take waiting on it only if one comes that moment)", "sessions": every.len(), "latency": summary(opened)},
             "arrived": {"what": "a session arriving with its most ids (4,352): its inbox opened, the ids it brought taken in (a read each, a synced commit each 400), counted; its first message here waits for it", "sessions": arrived.len(), "latency": summary(arrived)},
-            "disk_floor": floor(scratch.path())?,
-        }))
-    })
+        }), receipt, head))
+    })?;
+    // The timed future owns all first-open adapters/inboxes, so none survive this reopen.
+    let records = open_records(&path)?;
+    let reopened = kiln::rt::block_on(async move {
+        anyhow::ensure!(records.head().await? == head, "reopen changed the durable Records head");
+        let inbox = Inbox::new(records.clone(), Limits::default());
+        let mut repeated = inbox.accept("reopen", "before-reopen", &reopened_words, Some(0), 99).await?;
+        anyhow::ensure!(repeated.repeat, "reopen lost the accepted message's dedup receipt");
+        repeated.repeat = false;
+        anyhow::ensure!(repeated == receipt, "reopen changed the first acceptance's answer");
+        let journal = records.get("journal", b"reopen-journal", Consistency::Linearizable).await?;
+        anyhow::ensure!(journal.is_some_and(|row| row.value == vec![b'q'; 120]), "reopen lost the durable plain commit");
+        anyhow::ensure!(records.head().await? == head, "a repeated send after reopen wrote another receipt");
+        let next = inbox.accept("reopen", "after-reopen", &reopened_words, Some(0), 100).await?;
+        anyhow::ensure!(!next.repeat && next.seq > head, "a fresh send after reopen was not durably accepted");
+        Ok(json!({"mode": "all benchmark handles dropped; Database reopened in-process", "receipt_preserved": true, "journal_preserved": true, "fresh_send_accepted": true, "head_before": head, "fresh_receipt_at": next.seq}))
+    })?;
+    let fields = report.as_object_mut().ok_or_else(|| anyhow::anyhow!("benchmark report is not an object"))?;
+    fields.insert("reopened".into(), reopened);
+    // The raw synchronous fsync floor runs on this main thread, outside the runtime shard.
+    fields.insert("disk_floor".into(), floor(scratch.path())?);
+    Ok(report)
 }
 
 /// What `with` adds to `without`, at p50, p99 and p99.9, in milliseconds.
@@ -495,6 +518,8 @@ fn main() -> anyhow::Result<()> {
     let within = CASES.iter().all(|c| added_by.get(*c).and_then(|v| v.get("p99_ms")).and_then(Value::as_f64).is_some_and(|x| x <= 2.0));
     let record = json!({
         "bench": "send_path",
+        "backend": {"product": "Amphora", "adapter": "kiln::records::from_database", "namespace": "host", "mode": "local durable Database; replication and network latency are not measured"},
+        "engine_write_metrics": {"available": false, "why": "the public Amphora SDK does not expose durable-write batching, apply/sync timings or background-compaction counters"},
         "criterion": "AC-T3.2.3: added send latency from the inbox check, p99 <= 2 ms: in each case, each run's p99 of takes less its p99 of plain commits (interleaved, order alternating; for many at once, in phases apart), the median run; the cases: one session at a time, a session at its most ids, one on a busy host (8 sessions at their most, the others taking all along), one with a long history (25,600 ids let go before), 32 at once, 32 at once at their most ids tidying, across a compaction, and a first take with its head not in memory; beside them, a session's opening (its ids counted)",
         "commit": a.commit,
         "date": now(),

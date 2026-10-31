@@ -300,9 +300,11 @@ fn w24_r30_a_class_hit_names_its_class_and_source_run() -> anyhow::Result<()> {
     // The rule, on its witness: kiln's no-op rule's cases run both ways for real.
     let p = kiln::ci::rules::kiln().into_iter().find(|p| p.rule.name == "no-op").ok_or_else(|| anyhow::anyhow!("no no-op rule"))?;
     let w = kiln::ci::rules::witness(&p, &kiln::ci::rules::run)?;
-    let db = rusqlite::Connection::open(dir.path().join("data").join("kiln.db"))?;
-    db.busy_timeout(std::time::Duration::from_secs(10))?;
-    kiln::ci::work::register(&db, &kiln::ci::work::scope("acme/memo", "trusted"), &p.rule, &w)?;
+    // U05/W24: seed the same canonical work ledger the running server reads.
+    let store = kiln::store::Store::open(&dir.path().join("data").join("kiln.db"))?;
+    kiln::rt::block_on(async move {
+        store.call(move |db| kiln::ci::work::register(db, &kiln::ci::work::scope("acme/memo", "trusted"), &p.rule, &w)).await
+    })?;
     std::fs::write(work.join(".kiln/ci.yaml"), flow("          echo hello\n          true\n"))?;
     commit("two")?;
     let (_, second) = finished(&s, 2)?;

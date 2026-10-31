@@ -1,0 +1,191 @@
+# Amphora's requirement registry: the goals of track T1 of kiln's critical path (kiln plan
+# 01a157fdefba746a94a5fcd920a80d5a), each acceptance criterion (AC-T1.n.k) and test (T-T1.n.k) with its ID,
+# from the plan's version below on 2026-10-20. Code comments, commits, tests and benchmarks cite these IDs;
+# kiln's citation gate (CP-T6.6) reads them from kiln's vendored copy. Amphora's own IDs join them as
+# its design names them.
+
+plan = "01a157fdefba746a94a5fcd920a80d5a"
+plan_version = 1
+track = "CP-T1"
+
+[[goal]]
+id = "CP-T1.1"
+title = "Amphora set up; kiln's wrapper replaced: no drops, reads never behind writes"
+criteria = [
+  { id = "AC-T1.1.1", text = "Usable now: the conversation store drops no update and serves reads without waiting on writes, in a change request that passes the gate; Amphora's repository has its CLAUDE.md, STATUS.md and gate" },
+  { id = "AC-T1.1.2", text = "history-read p99 under K0's write load (32 writers) is at most 5 ms, measured by Amphora's bench on a quiet adacachy, against today's 279 ms" },
+  { id = "AC-T1.1.3", text = "durable writes per second at K0's load is at least 2000, measured by Amphora's bench, against today's 195" },
+  { id = "AC-T1.1.4", text = "write p99 at K0's load is at most 20 ms, measured by Amphora's bench, against today's 269 ms" },
+  { id = "AC-T1.1.5", text = "updates dropped in 1 hour at 10x the 2026-10-19 peak event rate is exactly 0, measured by the store's dropped meter in the soak bench" },
+  { id = "AC-T1.1.6", text = "The revision feed stays exact: a reader of changes() since any revision sees every committed row once, in order" },
+]
+tests = [
+  { id = "T-T1.1.1", text = "Crash injection at every write instruction under load, then recovery — passes when acknowledged writes lost over 10,000 seeds is exactly 0, measured by Amphora's simulator" },
+  { id = "T-T1.1.2", text = "Back-pressure: a stalled disk (2 s fsync) under a harness writing events — passes when the harness keeps running, state updates coalesce and no event is lost" },
+]
+
+[[goal]]
+id = "CP-T1.2"
+title = "Baselines, research and Amphora's design"
+criteria = [
+  { id = "AC-T1.2.1", text = "Usable now: Amphora's bench runs every named system and kiln's real workloads from one command, recording hardware, commit, date and load; anyone changing a store uses it" },
+  { id = "AC-T1.2.2", text = "A published table: each system's writes/s, p50/p99/p99.9, history reads and search, durable configurations stated, best of 3 on a quiet machine" },
+  { id = "AC-T1.2.3", text = "docs/design.md states every T1 decision (MVCC scheme, commit pipeline, I/O, placement, sharding, regions, client protocol) with its sources, its evidence and what would falsify it" },
+  { id = "AC-T1.2.4", text = "The design keeps one code path from a laptop to global multi-region, and lists what each step up in scale adds" },
+]
+tests = [
+  { id = "T-T1.2.1", text = "Reproduce: a second run of the bench on the same machine — passes when difference in p99 between runs is at most 10%, measured by the bench's own comparison" },
+]
+
+[[goal]]
+id = "CP-T1.3"
+title = "Turso multi-writer: MVCC, serializable"
+criteria = [
+  { id = "AC-T1.3.1", text = "Usable now: the conversation store commits from many writers at once, in a change request that passes the gate, every change to the engine (Amphora's own since 2026-10-20) in its design record" },
+  { id = "AC-T1.3.2", text = "durable single-row commits per second, 32 writers is at least 20000, measured by Amphora's bench on a quiet adacachy NVMe" },
+  { id = "AC-T1.3.3", text = "commit p99 at that load is at most 5 ms, measured by Amphora's bench" },
+  { id = "AC-T1.3.4", text = "commit p99.9 at that load is at most 15 ms, measured by Amphora's bench" },
+  { id = "AC-T1.3.5", text = "throughput with 32 writers over 1 writer, disjoint keys is at least 10x, measured by Amphora's bench" },
+  { id = "AC-T1.3.6", text = "isolation anomalies found is exactly 0, measured by an Elle-style history check over 10,000 seeds" },
+]
+tests = [
+  { id = "T-T1.3.1", text = "Crash at every write instruction, then recovery — passes when acknowledged commits lost over 10,000 seeds is exactly 0, measured by Amphora's simulator" },
+  { id = "T-T1.3.2", text = "Turso's own test suites — passes when they pass unchanged, plus Amphora's MVCC suites" },
+]
+
+[[goal]]
+id = "CP-T1.4"
+title = "Turso's WAL and I/O: group commit in the engine, checkpoints off the path"
+criteria = [
+  { id = "AC-T1.4.1", text = "Usable now: lower commit latency for every Amphora write in kiln, in a change request that passes the gate" },
+  { id = "AC-T1.4.2", text = "commit p99 at CP-T1.3's load falls by at least 50% compared with CP-T1.3's recorded p99, measured by Amphora's bench" },
+  { id = "AC-T1.4.3", text = "p99.9 commit latency added while a checkpoint runs is at most 1 ms, measured by Amphora's bench with forced checkpoints" },
+  { id = "AC-T1.4.4", text = "Each platform's durability primitive is stated and tested: power-cut tests on Linux and macOS lose nothing acknowledged" },
+]
+tests = [
+  { id = "T-T1.4.1", text = "A power-cut harness (dm-flakey on Linux; a VM power-off on macOS) at random points — passes when acknowledged commits lost over 1,000 cuts is exactly 0, measured by the harness's count" },
+]
+
+[[goal]]
+id = "CP-T1.5"
+title = "The Records API; goal stacks and plans on Amphora"
+criteria = [
+  { id = "AC-T1.5.1", text = "Usable now: goals and plans live in Amphora and the goal driver reacts to changes without polling, in a change request that passes the gate" },
+  { id = "AC-T1.5.2", text = "No kiln code reads or writes goals or plans except through Records (a grep gate)" },
+  { id = "AC-T1.5.3", text = "conformance cases passed by both Records implementations is at least 200, measured by the shared conformance suite" },
+  { id = "AC-T1.5.4", text = "time from a goal edit to the driver acting on it, p99 is at most 50 ms, measured by a bench of the driver on the change feed" },
+]
+tests = [
+  { id = "T-T1.5.1", text = "A goal stack driven across a server restart mid-reminder — passes when duplicate or lost reminders over 10,000 seeds is exactly 0, measured by kiln-sim" },
+  { id = "T-T1.5.2", text = "Migration from rusqlite: every goal and plan of a copy of production data, compared field by field after the move" },
+]
+
+[[goal]]
+id = "CP-T1.6"
+title = "Deploys and KilnCD on Amphora; leased work with fencing"
+criteria = [
+  { id = "AC-T1.6.1", text = "Usable now: deploy records are durable and concurrent, and a worker that lost its lease can't act, in a change request that passes the gate" },
+  { id = "AC-T1.6.2", text = "A deploy whose server dies at any instruction completes once on recovery or is reported failed, never applied twice or forgotten, over 10,000 seeds" },
+  { id = "AC-T1.6.3", text = "A fenced worker's late write is refused at every await, shown by a stale-lease test" },
+  { id = "AC-T1.6.4", text = "deploy API p99 rises by no more than 10% compared with main at the goal's start, measured by bench deploy_api" },
+]
+tests = [
+  { id = "T-T1.6.1", text = "The release lifecycle oracle under the nemesis (kiln-sim, 10,000 seeds)" },
+  { id = "T-T1.6.2", text = "KilnCD's own tests and a production-like canary deploy in the lab" },
+]
+
+[[goal]]
+id = "CP-T1.7"
+title = "Every other record on Amphora; rusqlite and JSON records retired"
+criteria = [
+  { id = "AC-T1.7.1", text = "Usable now: one store for every record kiln keeps, and an audit log that shows tampering, in a change request that passes the gate" },
+  { id = "AC-T1.7.2", text = "rusqlite databases opened or record JSON files written by kiln is exactly 0, measured by a grep gate plus a runtime assertion in tests" },
+  { id = "AC-T1.7.3", text = "The CI, sync (31 checks) and moves (28 checks) labs pass unchanged on Amphora" },
+  { id = "AC-T1.7.4", text = "Flipping any byte of the audit chain is detected on read" },
+]
+tests = [
+  { id = "T-T1.7.1", text = "Migrating a copy of production data, then reading every record back and comparing it to the source" },
+]
+
+[[goal]]
+id = "CP-T1.8"
+title = "Amphora replicated: hyper-raft groups, the Raft log as the WAL"
+criteria = [
+  { id = "AC-T1.8.1", text = "Usable now: every record kiln keeps survives the loss of any one machine, in a change request that passes the gate" },
+  { id = "AC-T1.8.2", text = "persisted quorum commit p99, 3 nodes on a LAN is at most 5 ms, measured by Amphora's bench across adacachy, fedora and jupiter" },
+  { id = "AC-T1.8.3", text = "replicated-class commit p99, 3 nodes on a LAN is at most 2 ms, measured by Amphora's bench" },
+  { id = "AC-T1.8.4", text = "leader failover p99 is at most 1000 ms, measured by a kill -9 bench" },
+  { id = "AC-T1.8.5", text = "acknowledged writes lost under kill -9 of any node is exactly 0, measured by the simulator over 10,000 seeds and a three-machine lab" },
+  { id = "AC-T1.8.6", text = "The same differential suite passes at 1 node and 3 nodes: one code path" },
+]
+tests = [
+  { id = "T-T1.8.1", text = "A laptop offline writes to its outbox, then reconnects — passes when every write commits, in order, with no duplicate" },
+]
+
+[[goal]]
+id = "CP-T1.9"
+title = "Placement and sharding with no operator choices"
+criteria = [
+  { id = "AC-T1.9.1", text = "Usable now: Amphora scales out and heals around a lost machine with no shard counts or split keys chosen by anyone, in a change request that passes the gate" },
+  { id = "AC-T1.9.2", text = "write pause at a split or move cutover, p99 is at most 250 ms, measured by bench reshard on a 10 GB partition under load" },
+  { id = "AC-T1.9.3", text = "writes lost across 1,000 automatic splits, merges and moves is exactly 0, measured by the simulator and the three-machine lab" },
+  { id = "AC-T1.9.4", text = "time to rebalance 1,000 groups onto a fifth node is at most 10 min, measured by the five-node lab" },
+]
+tests = [
+  { id = "T-T1.9.1", text = "A machine removed for good: its groups re-replicated elsewhere, with reads and writes continuing" },
+]
+
+[[goal]]
+id = "CP-T1.10"
+title = "Atomic across groups; follower reads; cluster-wide search"
+criteria = [
+  { id = "AC-T1.10.1", text = "Usable now: operations spanning groups stay atomic, and kiln's UI reads and searches across machines, in a change request that passes the gate" },
+  { id = "AC-T1.10.2", text = "cross-group transaction p99 on a LAN is at most 10 ms, measured by bench amphora_txn" },
+  { id = "AC-T1.10.3", text = "follower read p99 is at most 2 ms, measured by bench amphora_read" },
+  { id = "AC-T1.10.4", text = "search p50 over 1,000,000 events on 3 nodes is at most 30 ms, measured by bench amphora_search" },
+  { id = "AC-T1.10.5", text = "anomalies across groups is exactly 0, measured by an Elle-style check over 10,000 seeds" },
+]
+tests = [
+  { id = "T-T1.10.1", text = "A coordinator crash at every step of a cross-group transaction, then recovery — passes when it ends committed or aborted everywhere" },
+]
+
+[[goal]]
+id = "CP-T1.11"
+title = "Multi-region, on the same code path"
+criteria = [
+  { id = "AC-T1.11.1", text = "Usable now: kiln runs across regions with each region's records committed at that region's latency, in a change request that passes the gate" },
+  { id = "AC-T1.11.2", text = "region-local commit p99 is at most 10 ms, measured by a simulated 3-region lab at 60 ms between regions" },
+  { id = "AC-T1.11.3", text = "acknowledged multi-region-class writes lost when a region is lost is exactly 0, measured by the lab's region-loss drill" },
+  { id = "AC-T1.11.4", text = "The differential suite passes at one node, three nodes and three regions" },
+]
+tests = [
+  { id = "T-T1.11.1", text = "Lose one region; keep writing in the others; restore it — passes when it catches up and serves again, nothing acknowledged lost" },
+]
+
+[[goal]]
+id = "CP-T1.12"
+title = "Online schema changes; backups and point-in-time recovery to Mantle"
+criteria = [
+  { id = "AC-T1.12.1", text = "Usable now: kiln's schemas change without downtime, and any second within retention can be restored, in a change request that passes the gate" },
+  { id = "AC-T1.12.2", text = "cutover pause for a schema change of a 10,000,000-row table, p99 is at most 1000 ms, measured by bench online_ddl" },
+  { id = "AC-T1.12.3", text = "time to restore 100 GB from Mantle is at most 30 min, measured by a restore drill" },
+  { id = "AC-T1.12.4", text = "difference between a restored point and the source at that point is exactly 0 rows, measured by a row-by-row comparison" },
+]
+tests = [
+  { id = "T-T1.12.1", text = "A crash at every step of a schema change, then recovery — passes when the change either completes or leaves the old schema, never both or neither" },
+]
+
+[[goal]]
+id = "CP-T1.13"
+title = "Amphora's bar, Amphora on its own, and production on it"
+criteria = [
+  { id = "AC-T1.13.1", text = "Usable now: production kiln runs on distributed Amphora with its numbers published, and Amphora installs on its own" },
+  { id = "AC-T1.13.2", text = "durable writes per second across 3 machines is at least 12140, measured by Amphora's bench, 10x K0's Vitess 1,214" },
+  { id = "AC-T1.13.3", text = "write p99 at that load is at most 25 ms, measured by Amphora's bench, a third of K0's Vitess 74 ms" },
+  { id = "AC-T1.13.4", text = "history-read p99 is at most 6.5 ms, measured by Amphora's bench, K0's Vitess p99" },
+  { id = "AC-T1.13.5", text = "acknowledged records lost in the fire drills is exactly 0, measured by each drill's count" },
+]
+tests = [
+  { id = "T-T1.13.1", text = "Fire drills: a node powered off, a disk stalled for 10 s, a network partition, a region lost" },
+  { id = "T-T1.13.2", text = "A fresh machine to a working Amphora from its README alone, by a fresh subagent" },
+]

@@ -97,6 +97,15 @@ The server's commands to a runner process ride that process's command streams on
   runners need for the legs assigned to them at once. A link that drops before it's answered ends
   it `unanswered` (`unreachable` if it never went): sent again later, it would surprise.
 
+U01 executor Start and Stop use that same **Live** stream throughout their lifecycle. The existing pool owner synchronously queues each intent before command ACK, then
+one worker handles them in order. An ACK proves queue acceptance; it does not prove a VM is
+ready or physically stopped. Ready includes the original immutable grant shape and process
+identity. An ordered Stop barrier follows all older accepted Starts and proves exact physical
+retirement; its receipt commits to the existing retained outbox before that local owner is
+reclaimed. Reconnect keeps the original process owner and never reroutes an old queued item.
+Physical recovery proves kernel retirement, not producer-process retirement. The existing
+bounded-history/duplicate-ACK reclamation dependency remains open under U03/U14.
+
 A runner process that connects says whether it keeps the channel (its `Caps`, `CAP_WIRE`) right
 after its hello and its `Build`, before anything else on its control lane. Until then its commands
 wait for that, a live one too, rather than being refused as if it were away or going the old way.
@@ -448,10 +457,26 @@ takes a new bit, never one that means something already, even in the other direc
 | 37 | `CAP_AGENT_LIMIT` | `AgentMsg::Caps`, `ServerMsg::Caps` | the most agent sessions a machine has at work at once, set from the server: the runner takes it and says what it holds, the server takes that (`AgentLimit`; agents.md, "How many agents a machine runs") |
 | 38 | `CAP_IDENTITY` | `AgentMsg::Caps`, `ServerMsg::Caps` | identities: the runner asks for certificates for keys it makes and keeps, the server issues them (`Identity`; ci.md W27-R01) |
 | 39 | `CAP_HEADROOM` | `AgentMsg::Caps`, `ServerMsg::Caps` | headroom: the runner keeps its machine's from settings the server sends and says how it does, the server takes that (`Headroom`, `HeadroomStatus`; docs/headroom.md) |
-| 40 | `CAP_CHANGES_PATCH` | `ServerMsg::Caps` | the server takes a session's changeset as what changed in it (`Update::ChangesPatch`), so a runner sends the files an agent touched, not the whole changeset |
+| 40 | `CAP_CHANGES_PATCH` | `ServerMsg::Caps` | accepts patches to a session's changeset (`Update::ChangesPatch`), retaining the whole changeset in Amphora |
 | 41 | `CAP_UNREAD` | `AgentMsg::Caps`, `ServerMsg::Caps` | this side takes word that a frame of its couldn't be read (`Unread`, "What can't be read") |
+| 42 | `CAP_HARNESS_RELEASE` | `AgentMsg::Caps` | U15: release a stale session copy, independently of the retired conversation-feed capability |
+| 43 | `CAP_JOB_ATTEMPT` | `AgentMsg::Caps`, `ServerMsg::Caps` | exact job completion attempts and matching receipts |
+| 44 | `CAP_OPEN_ONCE` | `AgentMsg::Caps` | durable keyed session acceptance before Taken |
+| 45 | `CAP_RETAINED_RECEIVED` | `AgentMsg::Caps`, `ServerMsg::Caps` | retained evidence spooled in shared Amphora until its exact durable receipt |
+| 46 | `CAP_RESOURCE_OWNERSHIP` | `AgentMsg::Caps` | strict execution containment and sole-Scheduler resource ownership; required for new CI work |
+| 47 | `CAP_FIRECRACKER_SHAPE` | `AgentMsg::Caps`, `ServerMsg::Caps` | authenticated runner-process identity and immutable executor grant shapes in Ready and stopped receipts |
+| 48 | `CAP_AMPHORA` | `AgentMsg::Caps`, `ServerMsg::Caps` | U15: typed opaque Amphora transport; distinct from the retired learner bit |
+| 49 | `CAP_UNIFIED_LAYOUT` | `AgentMsg::Caps`, `ServerMsg::Caps` | U15: the unification wire layout appended after main's unread messages, independent of whether this peer currently carries Amphora traffic |
 
-Bits from 42 are free. Take the next one, and add its row here in the same change.
+Bits from 50 are free. Take the next one, and add its row here in the same change.
+
+Main's unread messages retain their deployed indices: runner messages 56 and 57, server
+messages 62 and 63, and reach ask 11. The private unification messages follow them. Both peers
+announce `CAP_UNIFIED_LAYOUT` even when their Amphora carrier is inactive. A peer advertising
+private bits 42 through 48 without this layout capability is refused before those extensions
+can be dispatched. Earlier experimental snapshots that used bit 41 for Amphora are incompatible;
+bit 41 alone means main's `CAP_UNREAD`. It cannot identify an earlier experimental codec or
+authorize replay of opaque persisted bytes from that codec.
 
 ## The lab
 
@@ -518,6 +543,7 @@ Four edges are left, and the lab steers clear of each:
 | `StepStarted` | stream | A v1 leg's steps, in order. | Not kept across a reconnect. |
 | `StepFinished` | stream | A v1 leg's steps, in order. | Not kept across a reconnect. |
 | `JobFinished` | stream | A leg's result: its stream's last item. | Kept until `Received` and sent again after a reconnect (`CAP_RECEIVED`). |
+| `JobFinishedV2` | stream | U03: a leg's result fenced to its assignment attempt. | Kept until matching `ReceivedV2` and replayed with its attempt (`CAP_JOB_ATTEMPT`); old peers use the legacy encoding. |
 | `JobSample` | telemetry | A running leg's memory and CPU. | As its class says. |
 | `Reject` | answer | The NACK of an `Assign`: the runner couldn't take the leg, and why. | Not acknowledged as a frame. |
 | `TermOutput` | stream | A terminal's output, in order. | On the channel: a stream per terminal (`t:<terminal>#<boot>.<gen>`), kept until the server has it, sent again after a cut, its viewer kept attached through it. A stream that starts over starts with the terminal's replay, and its viewer is repainted. Without the channel: not kept across a reconnect; a viewer attaches again (`TermAttach`). |
@@ -544,7 +570,7 @@ Four edges are left, and the lab steers clear of each:
 | `Reach` | carried (reach link) | A frame of a link between two runners, relayed. The link's ends frame it. | As its class says. |
 | `ReachHello` | state | This runner's reach identity. | Sent on every connect. |
 | `ReachAsk` | ask | A question for the server, answered by `ReachAnswer`. | As its class says. |
-| `Convo` | carried (conversation feed) | The runner's conversation store, fed to the server's. | Acknowledged and resent by number (`convo/feed.rs`). |
+| `Convo` | carried (conversation feed) | Retired U15 application feed shape, retained for append-only decoding. | Explicitly unsupported; no feed acknowledgement implies product durability. |
 | `UpdatePrefs` | state | Whether this machine takes upgrades. | Sent on every connect and change. |
 | `Power` | state | The machine's battery. | Sent on change and every 10 minutes. |
 | `Answer` | answer | Answers `Diagnose`, `Repair`, `Preview` or `Workspace`. | As its class says. |
@@ -559,7 +585,7 @@ Four edges are left, and the lab steers clear of each:
 | `Undeployed` | answer | Answers `Undeploy`. | As its class says. |
 | `Caps` | handshake | What the runner can do, in 64 bits (`Build`'s 32 ran out): `CAP_WIRE` says it keeps the channel, `CAP_INBOX` that its sessions have inboxes (CP-T3.2). | New: sent from plan step 3. |
 | `Wire` | carried (the channel) | A frame of the channel: numbered items carrying other messages, their ACKs and NACKs, wants, and what each side has after a reconnect. | New: `crate::wire::channel`. |
-| `Cluster` | carried (the cluster group) | The runner's learner of the cluster group (docs/p2p.md, P2): hyper-raft's messages, which it acknowledges and resends, and asks for where the server's records are before a read. | As its class says: a read whose ask goes unanswered in 2 s goes to the server. |
+| `Cluster` | carried (the cluster group) | Retired U15 Kiln learner wire shape, retained for append-only decoding. | Explicitly unsupported; the server tells older learners to leave. |
 | `NetDrops` | telemetry | What the runner's QUIC layer let go before it reached the wire, by lane and reason, counted from its start: each supersedes the last ("Loss below the channel"). | Sent with its samples once it changed, to a server announcing `CAP_NET_DROPS`. |
 | `HarnessHandOver` | stream | An agent session packed for the machine's newest runner process, in pieces: the server passes it on as `HarnessPackage`. | New: to a server announcing `CAP_HANDOVER`, on the conversation lane. |
 | `HarnessAdopted` | answer | Whether the runner took over a session an older process of its machine handed it: that process lets go of it, or goes on with it. | New: to a server announcing `CAP_HANDOVER`. |
@@ -569,6 +595,9 @@ Four edges are left, and the lab steers clear of each:
 | `Observe` | carried (observe's group) | The runner's replica of observe's group (docs/observe.md §5): hyper-raft's messages, which it acknowledges and resends, and the writes it takes, offered to the leader until they commit. | Only from a runner announcing `CAP_OBSERVE`, on lane 5. |
 | `Unread` | ack | A frame of the server's the runner couldn't read: on which wire, what it was, why, how many more went untold before it, and the agent session it was about, when that much of it could be read ("What can't be read"). The server notes it against the runner, and on that session's page too. | New: to a server announcing `CAP_UNREAD`. |
 | `LinkUnread` | ack | A message on a reach link the runner couldn't read: the runner that sent it (the link's other end), the link, what it was, a code and why ("What can't be read"). The server notes it against that runner, as the relay knows the link's ends, on both runners' pages. | New: to a server announcing `CAP_UNREAD`. |
+| `Amphora` | carried (Amphora) | U15: bounded opaque product transport, with authenticated member routes. | Amphora owns acknowledgement, resend, recovery and membership; Kiln only frames bytes. |
+| `RunnerProcess` | handshake | U01: one authenticated process identity, repeated when that process reconnects. It identifies the producer; it does not prove that a process or its executions stopped. | To a server announcing `CAP_FIRECRACKER_SHAPE`, under `CAP_UNIFIED_LAYOUT`. |
+
 
 ## Server to runner: `ServerMsg`
 
@@ -608,7 +637,7 @@ Four edges are left, and the lab steers clear of each:
 | `KeepExtend` | command, parked | Keep a kept leg longer. | On the channel ("Commands"): answered once applied. |
 | `JobRerunStep` | command, refused while away | Run a kept leg's step again. | On the channel ("Commands"): answered once applied; refused at once while away. |
 | `JobExec` | command, refused while away | Run a command in a leg's shell. | On the channel ("Commands"): answered once applied; refused at once while away. |
-| `Convo` | carried (conversation feed) | The feed's answers. | As its class says. |
+| `Convo` | carried (conversation feed) | Retired U15 application feed shape, retained for append-only decoding. | Explicitly unsupported; no feed acknowledgement implies product durability. |
 | `HarnessPackage` | command, refused while away | A moving session's package. A move goes only to a machine that's up. | On its runner's live command stream, in pieces of 768 KiB, each answered before the next goes. A move whose machine goes away midway says so. |
 | `HarnessRelease` | command, parked | A machine that comes back must let go of a session that went on elsewhere. | On its runner's parked command stream. |
 | `UpdateAvailable` | state | The newest kiln for this machine. | On the channel ("Commands"), parked: answered once taken. Sent once per commit. |
@@ -625,12 +654,14 @@ Four edges are left, and the lab steers clear of each:
 | `PortAck` | ack | Opens the runner's window on a port. | As its class says. |
 | `PortClose` | carried (port window) | A port's end. | As its class says. |
 | `Workspace` | ask | Answered by `Answer`. | As its class says. |
-| `Executor` | ask | Answered by `Executor`. | As its class says. |
+| `Executor` | command, refused while away | Start and Stop share the Live command stream. | ACK means synchronously queued intent; `Executor` Ready/Stopped proves the backend outcome. |
 | `Received` | ack | The server has a leg's result. | As its class says. |
+| `ReceivedV2` | ack | U03: the server durably has this leg's result for this exact attempt. | Clears only the matching attempt's completion and events (`CAP_JOB_ATTEMPT`). |
+| `RetainedReceived` | ack | U03: this exact retained execution or stopped-executor event committed on the server. | Retires only its matching shared Amphora outbox entry; independent of completion receipts (`CAP_RETAINED_RECEIVED`). |
 | `Undeploy` | command, parked | Take down a deployment. Answered by `Undeployed`. | On the channel ("Commands"): answered once taken, then by `Undeployed`. |
 | `Caps` | handshake | What the server can do, in 64 bits, to a runner that said `CAP_WIRE`. | New: sent from plan step 3. |
 | `Wire` | carried (the channel) | A frame of the channel, as the runner's. | New: `crate::wire::channel`. |
-| `Cluster` | carried (the cluster group) | To the runner's learner: join or leave the group (said again on every connect), hyper-raft's messages, and where the server's records are. | As its class says. |
+| `Cluster` | carried (the cluster group) | Retired U15 Kiln learner wire shape, retained for append-only decoding. | Explicitly unsupported; the server tells older learners to leave. |
 | `Kept` | state | What the server's copy of each of the runner's sessions has, said in digests, so a stream the runner starts sends only what the copy lacks ("Restarts", above). | Sent before `Welcome` to a runner that keeps the channel, 32 sessions a frame. |
 | `HarnessSend` | command, parked | A message (or a skill run) for an agent session, for the epoch the server last heard it's at: its id made once, its inbox takes it once, refuses it typed (a stale epoch named), and answers either way (CP-T3.2, docs/sends.md). To runners that say `CAP_INBOX` in their `Caps`. | T3: answered (`Update::Inbox`); while its runner is away it's refused at once, until CP-T3.3 parks it. |
 | `AgentLimit` | state | What a person set from the server for the most agent sessions the machine has at work at once, over its config's; none set, its config's (or kiln's default) holds (agents.md, "How many agents a machine runs"). | On the channel ("Commands"), parked: the newest goes, answered once taken. Sent as the runner says `CAP_AGENT_LIMIT` and whenever it changes; the runner keeps it for its restarts. |
@@ -638,6 +669,8 @@ Four edges are left, and the lab steers clear of each:
 | `Observe` | carried (observe's group) | To the runner's replica: hyper-raft's messages, and the leader's word on the writes it took. | Only to a runner announcing `CAP_OBSERVE`, on lane 5. |
 | `Unread` | ack | A frame of the runner's the server couldn't read: on which wire, what it was, why, and how many more went untold before it ("What can't be read"). | New: to runners announcing `CAP_UNREAD`. |
 | `ReachRefused` | carried (reach link) | A reach frame of the runner's the relay refused: its link, the runner it was for, why in a code (`taken`, `to_itself`, `too_many`, `not_offered`, `not_accepted`, `not_connected`, `closed`) and in words. | New: to runners announcing `CAP_UNREAD`, in place of `Reach`'s `close`. |
+| `Amphora` | carried (Amphora) | U15: bounded opaque product transport, with authenticated member routes. | Amphora owns acknowledgement, resend, recovery and membership; Kiln only frames bytes. |
+
 
 ## Commands to a session: `Command`
 

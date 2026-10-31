@@ -659,7 +659,15 @@ impl Fe<'_> {
                         s.cron = v.text().unwrap_or_default();
                         cron_range = v.range;
                     }
-                    "timezone" => s.timezone = v.text(),
+                    "timezone" => {
+                        s.timezone = v.text();
+                        let timezone_path = format!("{at}.timezone");
+                        if s.timezone.is_none() {
+                            self.err("KCI1011", "a schedule's `timezone` is an IANA time zone name", v.range, &timezone_path);
+                        } else if let Err(message) = crate::trigger::cron::zone(s.timezone.as_deref()) {
+                            self.err("KCI1019", message, v.range, &timezone_path);
+                        }
+                    }
                     "branch" => s.branch = v.text(),
                     "inputs" => s.inputs = v.as_map().map(|m| m.iter().map(|(a, b)| (a.text().unwrap_or_default(), self.yval(b))).collect()).unwrap_or_default(),
                     "jitter" => s.jitter = v.text(),
@@ -671,7 +679,7 @@ impl Fe<'_> {
             if s.cron.is_empty() {
                 self.err("KCI1014", "a schedule needs `cron`", x.range, &at);
             } else {
-                self.check_cron(&s.cron.clone(), cron_range, &at);
+                self.check_cron(&s.cron.clone(), cron_range, &format!("{at}.cron"));
             }
             out.push(s);
         }
@@ -679,8 +687,8 @@ impl Fe<'_> {
     }
 
     fn check_cron(&mut self, c: &str, range: Range, path: &str) {
-        if c.split_whitespace().count() != 5 {
-            self.err("KCI1019", format!("`{c}` is not a cron expression of five fields (minute hour day month weekday)"), range, path);
+        if let Err(message) = crate::trigger::cron::Cron::parse(c) {
+            self.err("KCI1019", message, range, path);
         }
     }
 

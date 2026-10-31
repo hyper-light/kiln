@@ -24,7 +24,7 @@ pub mod vercel;
 use std::collections::HashMap;
 
 use http::StatusCode;
-use rusqlite::{OptionalExtension, params};
+use crate::sql::{OptionalExtension, params};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -494,7 +494,7 @@ fn check_config(info: &KindInfo, config: &Value) -> Result<(), String> {
     Ok(())
 }
 
-fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Integration> {
+fn row(r: &crate::sql::Row<'_>) -> crate::sql::Result<Integration> {
     let config: String = r.get(3)?;
     let scope_kind: String = r.get(5)?;
     let scope_id: String = r.get(6)?;

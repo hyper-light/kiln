@@ -446,7 +446,8 @@ impl Agy {
         self.turn = Some(m.id.clone());
         self.said = false;
         self.tools.clear();
-        core.state.delivery.insert(m.id.clone(), Delivery::Started);
+        // U17/CP-T3.2: the pipe submission is not native acknowledgment of these words.
+        core.state.delivery.insert(m.id.clone(), Delivery::Sent);
         let (images, names) = super::model::attachment_summary(&m.attachments);
         core.note_sent(&m.id, &m.text);
         core.upsert(&m.id, None, Body::User { text: m.text.clone(), images, client_id: Some(m.id.clone()), origin: Some(super::core::origin_of(&m.id).into()), attachments: names, reply_to: m.reply_to.clone() });
@@ -556,13 +557,20 @@ impl Agy {
         core.touch_state();
     }
 
+    fn foreign_conversation(&self, frame: &Value) -> bool {
+        frame.get("conversation_id").and_then(Value::as_str).zip(self.conversation.as_deref()).is_some_and(|(incoming, own)| incoming != own)
+    }
+
     fn step(&mut self, core: &mut Core, s: &Value) {
+        if self.foreign_conversation(s) { return; }
         if let Some(c) = s.get("conversation_id").and_then(Value::as_str) {
             self.set_conversation(core, c);
         }
         let Some(index) = s.get("step_index").and_then(Value::as_u64) else { return };
         let state = s.get("state").and_then(Value::as_str).unwrap_or("");
         let done = state != "ACTIVE";
+        // Steps carry a conversation index, not the submitted prompt's identity. Historical
+        // replay can use the same indices, so it cannot retire this turn's pending payload.
         match s.get("step_type").and_then(Value::as_str).unwrap_or("") {
             "agent_response" => {
                 if let Some(u) = s.get("usage") {
@@ -646,6 +654,7 @@ impl Agy {
     }
 
     fn result(&mut self, core: &mut Core, r: &Value) {
+        if self.foreign_conversation(r) { return; }
         self.close_text(core);
         // A turn kiln stopped has ended already (its process is being ended).
         let Some(id) = self.turn.take() else { return };
@@ -900,6 +909,7 @@ mod tests {
         assert_eq!(w.first().and_then(|v| v.pointer("/message/content")).and_then(Value::as_str), Some("Run it"));
         assert_eq!(w.first().and_then(|v| v.get("event")).and_then(Value::as_str), Some("user"));
         assert_eq!(core.state.status, Status::Running);
+        assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Sent));
         // A second message waits for the turn (nothing gets into one under way).
         send(&mut a, &mut core, "m2", "then this", SendMode::Steer);
         assert_eq!(core.state.queue.len(), 1);
@@ -913,6 +923,7 @@ mod tests {
                 step(2, "ACTIVE", "tool", json!({"tool_name": "run_command", "tool_info": {"name": "run_command", "parameters": {"CommandLine": "echo hi"}}})),
             ],
         );
+        assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Sent), "streamed steps do not identify the submitted intent");
         assert_eq!(core.state.doing.as_deref(), Some("Running echo hi"));
         feed(
             &mut a,
@@ -935,6 +946,14 @@ mod tests {
         assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Completed));
         // The queued message went next; the reply isn't said twice.
         assert_eq!(written(&mut core).first().and_then(|v| v.pointer("/message/content")).and_then(Value::as_str), Some("then this"));
+        feed(&mut a, &mut core, &[
+            step(0, "DONE", "user_input", json!({})), // An old same-conversation step replayed after the next prompt.
+            json!({"event": "step_update", "step_update": {"conversation_id": "foreign", "step_index": 99, "state": "DONE", "step_type": "agent_response", "text_delta": "another conversation"}}),
+            json!({"event": "result", "result": {"conversation_id": "foreign", "status": "SUCCESS", "response": "another conversation"}}),
+        ]);
+        assert_eq!(core.state.delivery.get("m2"), Some(&Delivery::Sent), "historical or foreign steps/results cannot consume the new intent");
+        assert_eq!(a.turn.as_deref(), Some("m2"));
+        assert_eq!(core.state.harness_session.as_deref(), Some(CID));
         assert_eq!(core.events().filter(|e| matches!(&e.body, Body::Assistant { .. })).count(), 1);
     }
 
@@ -982,6 +1001,10 @@ mod tests {
         feed(&mut a, &mut core, &[json!({"event": "init", "conversation_id": CID, "init": {}})]);
         assert_eq!(written(&mut core).first().and_then(|v| v.pointer("/message/content")).and_then(Value::as_str), Some("hello"));
         assert!(core.state.queue.is_empty());
+        assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Sent));
+        // A native final result can acknowledge and retire a prompt without streamed steps.
+        feed(&mut a, &mut core, &[json!({"event": "result", "result": {"conversation_id": CID, "status": "SUCCESS", "response": "hello"}})]);
+        assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Completed));
     }
 
     /// A conversation carried in (from another harness, or one that moved here) goes in words with

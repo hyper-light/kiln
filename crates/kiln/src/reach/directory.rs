@@ -156,7 +156,7 @@ pub struct Want {
     #[serde(default)]
     pub name: Option<String>,
     /// What it must be and have: constraints on its facts and labels, and the room asked for, idle
-    /// and free on it now (reach holds nothing for the work).
+    /// and free on it now. U01: ranking is advisory; the CI Scheduler admits execution.
     #[serde(default)]
     pub needs: Needs,
     /// A harness it must have installed.

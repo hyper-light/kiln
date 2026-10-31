@@ -27,10 +27,10 @@ pub fn app_id(app: &App, env: &str) -> String {
 /// its files say (a kustomization, or manifests). Looked at in KilnCD's mirror of the repository.
 pub async fn git_chart(cd: &Arc<Cd>, package: &Package, version: &str) -> bool {
     let Package::Git { repo, path, .. } = package else { return false };
-    let (dir, auth, url, at) = (cd.mirror_dir(repo), cd.git_auth(repo), repo.clone(), version.to_owned());
+    let (source, at) = (cd.read_context(repo), version.to_owned());
     let chart = format!("{}Chart.yaml", if path.trim_matches('/').is_empty() { String::new() } else { format!("{}/", path.trim_matches('/')) });
-    let found = crate::rt::blocking(move || -> anyhow::Result<bool> {
-        let m = kiln_cd::git::Mirror::open(&dir, &url, auth)?;
+    let found = crate::rt::blocking_in(crate::rt::SHARE_GIT_MIRROR_IO, move || -> anyhow::Result<bool> {
+        let m = source.open()?;
         let commit = match m.resolve(&at) {
             Ok(c) => c,
             Err(_) => {
@@ -51,9 +51,9 @@ pub async fn git_chart(cd: &Arc<Cd>, package: &Package, version: &str) -> bool {
 /// Makes sure KilnCD's mirror of `repo` holds `commit`, fetching once if it doesn't: a render of
 /// it reads it.
 pub async fn fetched(cd: &Arc<Cd>, repo: &str, commit: &str) -> anyhow::Result<()> {
-    let (dir, auth, url, commit) = (cd.mirror_dir(repo), cd.git_auth(repo), repo.to_owned(), commit.to_owned());
-    crate::rt::blocking(move || -> anyhow::Result<()> {
-        let m = kiln_cd::git::Mirror::open(&dir, &url, auth)?;
+    let (source, commit) = (cd.read_context(repo), commit.to_owned());
+    crate::rt::blocking_in(crate::rt::SHARE_GIT_MIRROR_IO, move || -> anyhow::Result<()> {
+        let m = source.open()?;
         if !m.has(&commit) {
             m.fetch()?;
         }

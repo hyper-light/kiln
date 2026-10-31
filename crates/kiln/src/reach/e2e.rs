@@ -20,7 +20,7 @@
 use std::collections::BTreeMap;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use anyhow::Context as _;
 use hyper_quic::rustls::{self, DigitallySignedStruct, DistinguishedName, SignatureScheme};
@@ -145,63 +145,214 @@ pub enum Trust {
 /// The keys this runner pinned, by runner name (`pins.json` beside the identity).
 pub struct Pins {
     path: Option<PathBuf>,
-    pins: Mutex<BTreeMap<String, Pin>>,
+    pins: Mutex<PinState>,
+}
+
+enum PinState {
+    Verified(BTreeMap<String, Pin>),
+    Uncertain(String),
+    ReleaseFailed { why: String, _disk: std::fs::File },
+}
+
+struct LockedPins<'a> {
+    state: parking_lot::MutexGuard<'a, PinState>,
+    disk: Option<std::fs::File>,
+}
+
+impl LockedPins<'_> {
+    fn release(&mut self) -> anyhow::Result<()> {
+        self.release_with(std::fs::File::unlock)
+    }
+
+    fn release_with(&mut self, unlock: impl FnOnce(&std::fs::File) -> std::io::Result<()>) -> anyhow::Result<()> {
+        let Some(file) = self.disk.take() else { return Ok(()) };
+        // U09/U17: close alone leaves a fork's duplicate holding the physical lock.
+        // Unlock before RAM ownership ends, including when canonical reload failed.
+        if let Err(error) = unlock(&file) {
+            let prior = self.state.verified().err().map(|error| format!("; previous refusal: {error:#}")).unwrap_or_default();
+            let why = format!("reach pin lock release failed: {error}{prior}; ownership is retained and this instance refuses further access");
+            *self.state = PinState::ReleaseFailed { why: why.clone(), _disk: file };
+            return Err(error).context(why);
+        }
+        Ok(())
+    }
+
+    fn finish<T>(mut self, result: anyhow::Result<T>) -> anyhow::Result<T> {
+        if let Err(error) = self.release() {
+            return match result {
+                Ok(_) => Err(error),
+                Err(prior) => Err(error).with_context(|| format!("reach pin access also failed: {prior:#}")),
+            };
+        }
+        result
+    }
+}
+
+impl Drop for LockedPins<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.release() {
+            // Unwinding/early errors cannot return a second error; retain the descriptor
+            // in the fenced state and report it instead of claiming a successful release.
+            tracing::error!(error = %error, "reach pin lock ownership retained");
+        }
+    }
+}
+
+impl PinState {
+    fn verified(&self) -> anyhow::Result<&BTreeMap<String, Pin>> {
+        match self {
+            Self::Verified(pins) => Ok(pins),
+            Self::Uncertain(why) => Err(anyhow::anyhow!(why.clone())),
+            Self::ReleaseFailed { why, .. } => Err(anyhow::anyhow!(why.clone())),
+        }
+    }
 }
 
 impl Pins {
-    pub fn open(dir: &Path) -> Self {
-        let path = dir.join("pins.json");
-        let pins = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-        Self { path: Some(path), pins: Mutex::new(pins) }
+    pub fn open(dir: &Path) -> anyhow::Result<Self> {
+        let pins = Self { path: Some(dir.join("pins.json")), pins: Mutex::new(PinState::Verified(BTreeMap::new())) };
+        pins.locked()?.finish(Ok(()))?;
+        Ok(pins)
+    }
+
+    fn load(path: &Path) -> anyhow::Result<BTreeMap<String, Pin>> {
+        // U09/U17: an unreadable or corrupt trust anchor is never a new TOFU store.
+        let pins = match std::fs::read(path) {
+            Ok(bytes) => {
+                let pins = serde_json::from_slice(&bytes).with_context(|| format!("decode reach pins {}", path.display()))?;
+                // Reloading verifies the persisted map's durability too. An uncertain
+                // instance is fenced before reaching this path; only explicit open resets it.
+                #[cfg(unix)]
+                std::fs::File::open(path).and_then(|file| file.sync_all()).with_context(|| format!("sync reach pins {}", path.display()))?;
+                Self::sync_directory(path)?;
+                pins
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(e) => return Err(e).with_context(|| format!("read reach pins {}", path.display())),
+        };
+        Ok(pins)
+    }
+
+    /// U09/U17: one stable physical lock serializes only this access, across overlapping
+    /// runners too. The canonical bootstrap map is reloaded before any trust decision.
+    fn locked(&self) -> anyhow::Result<LockedPins<'_>> {
+        let state = self.pins.try_lock().ok_or_else(Self::busy)?;
+        state.verified()?;
+        let mut locked = LockedPins { state, disk: None };
+        if let Some(path) = &self.path {
+            let parent = path.parent().context("reach pins have no parent directory")?;
+            std::fs::create_dir_all(parent).with_context(|| format!("create reach pins directory {}", parent.display()))?;
+            let lock_path = parent.join(".pins.lock");
+            let file = crate::os::with_mode(std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false), 0o600)
+                .open(&lock_path).with_context(|| format!("open reach pins lock {}", lock_path.display()))?;
+            file.try_lock().map_err(|error| match error {
+                std::fs::TryLockError::WouldBlock => Self::busy(),
+                std::fs::TryLockError::Error(error) => error,
+            }).with_context(|| format!("lock reach pins {}", lock_path.display()))?;
+            locked.disk = Some(file);
+            match Self::load(path) {
+                Ok(pins) => *locked.state = PinState::Verified(pins),
+                Err(error) => return locked.finish(Err(error)),
+            }
+        }
+        Ok(locked)
+    }
+
+    fn busy() -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::WouldBlock, "reach pin store is busy; retry after its current access completes")
+    }
+
+    /// U09/U17: bootstrap filesystem work runs on the existing bounded blocking share.
+    /// The shared owner outlives cancellation; typed storage and busy errors pass through.
+    pub async fn access<T, F>(self: &Arc<Self>, work: F) -> anyhow::Result<T>
+    where T: Send + 'static, F: FnOnce(&Self) -> anyhow::Result<T> + Send + 'static {
+        let pins = Arc::clone(self);
+        crate::rt::blocking(move || work(&pins)).await?
     }
 
     /// Pins kept in memory only (tests).
     pub fn memory() -> Self {
-        Self { path: None, pins: Mutex::new(BTreeMap::new()) }
+        Self { path: None, pins: Mutex::new(PinState::Verified(BTreeMap::new())) }
     }
 
-    pub fn get(&self, name: &str) -> Option<Pin> {
-        self.pins.lock().get(name).cloned()
+    pub fn get(&self, name: &str) -> anyhow::Result<Option<Pin>> {
+        let locked = self.locked()?;
+        let result = locked.state.verified().map(|pins| pins.get(name).cloned());
+        locked.finish(result)
     }
 
-    pub fn all(&self) -> BTreeMap<String, Pin> {
-        self.pins.lock().clone()
+    pub fn all(&self) -> anyhow::Result<BTreeMap<String, Pin>> {
+        let locked = self.locked()?;
+        let result = locked.state.verified().cloned();
+        locked.finish(result)
     }
 
     /// Check `fingerprint` for `name`; an unknown runner's key is pinned (and saved).
-    pub fn check(&self, name: &str, fingerprint: &str) -> Trust {
-        let mut pins = self.pins.lock();
-        match pins.get(name) {
-            Some(p) if p.fingerprint == fingerprint => Trust::Known,
-            Some(p) => Trust::Changed { pinned: p.fingerprint.clone() },
-            None => {
-                pins.insert(name.to_owned(), Pin { fingerprint: fingerprint.to_owned(), since: crate::util::now_unix() });
-                self.save(&pins);
-                Trust::First
+    pub fn check(&self, name: &str, fingerprint: &str) -> anyhow::Result<Trust> {
+        let mut locked = self.locked()?;
+        let result = (|| {
+            let state = &mut *locked.state;
+            let pins = state.verified()?;
+            match pins.get(name) {
+                Some(p) if p.fingerprint == fingerprint => Ok(Trust::Known),
+                Some(p) => Ok(Trust::Changed { pinned: p.fingerprint.clone() }),
+                None => {
+                    let mut next = pins.clone();
+                    next.insert(name.to_owned(), Pin { fingerprint: fingerprint.to_owned(), since: crate::util::now_unix() });
+                    self.save(state, next)?;
+                    Ok(Trust::First)
+                }
             }
-        }
+        })();
+        locked.finish(result)
     }
 
     /// Forget `name`'s key (it was reinstalled): the next one it presents is pinned.
-    pub fn forget(&self, name: &str) -> bool {
-        let mut pins = self.pins.lock();
-        let had = pins.remove(name).is_some();
-        if had {
-            self.save(&pins);
-        }
-        had
+    pub fn forget(&self, name: &str) -> anyhow::Result<bool> {
+        let mut locked = self.locked()?;
+        let result = (|| {
+            let state = &mut *locked.state;
+            let pins = state.verified()?;
+            if !pins.contains_key(name) { return Ok(false) }
+            let mut next = pins.clone();
+            next.remove(name);
+            self.save(state, next)?;
+            Ok(true)
+        })();
+        locked.finish(result)
     }
 
-    fn save(&self, pins: &BTreeMap<String, Pin>) {
-        let Some(path) = &self.path else { return };
-        match serde_json::to_vec_pretty(pins) {
-            Ok(b) => {
-                if let Err(e) = crate::util::write_secret(path, &b, 0o600) {
-                    tracing::warn!(error = %e, "cannot save reach pins");
-                }
+    fn save(&self, state: &mut PinState, pins: BTreeMap<String, Pin>) -> anyhow::Result<()> {
+        self.save_with_directory_sync(state, pins, Self::sync_directory)
+    }
+
+    fn save_with_directory_sync(&self, state: &mut PinState, pins: BTreeMap<String, Pin>, sync: impl FnOnce(&Path) -> anyhow::Result<()>) -> anyhow::Result<()> {
+        state.verified()?;
+        if let Some(path) = &self.path {
+            let bytes = serde_json::to_vec_pretty(&pins).context("encode reach pins")?;
+            crate::util::write_secret(path, &bytes, 0o600).with_context(|| format!("persist reach pins {}", path.display()))?;
+            if let Err(error) = sync(path) {
+                // U09/U17: rename already committed. Err cannot imply rollback; stale RAM
+                // must never authorize trust or overwrite the now-unknown persisted map.
+                let why = format!("reach pin storage is uncertain after rename: {error:#}; trust and mutations are fenced until the on-disk pins are verified and reopened");
+                *state = PinState::Uncertain(why.clone());
+                anyhow::bail!("{why}");
             }
-            Err(e) => tracing::warn!(error = %e, "cannot encode reach pins"),
         }
+        *state = PinState::Verified(pins);
+        Ok(())
+    }
+
+    fn sync_directory(path: &Path) -> anyhow::Result<()> {
+        // U09/U17: the atomic rename must be durable before publishing a trust change.
+        #[cfg(unix)]
+        {
+            let parent = path.parent().context("reach pins have no parent directory")?;
+            std::fs::File::open(parent).and_then(|dir| dir.sync_all()).with_context(|| format!("sync reach pins directory {}", parent.display()))?;
+        }
+        #[cfg(not(unix))]
+        let _ = path;
+        Ok(())
     }
 }
 
@@ -515,17 +666,133 @@ mod tests {
     }
 
     #[test]
-    fn pins_trust_on_first_use_then_refuse_a_change() -> anyhow::Result<()> {
+    fn u09_u17_pins_trust_on_first_use_then_refuse_a_change() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let pins = Pins::open(dir.path());
-        assert_eq!(pins.check("linux", "aa"), Trust::First);
-        assert_eq!(pins.check("linux", "aa"), Trust::Known);
-        assert_eq!(pins.check("linux", "bb"), Trust::Changed { pinned: "aa".into() });
+        let pins = Pins::open(dir.path())?;
+        assert_eq!(pins.check("linux", "aa")?, Trust::First);
+        assert_eq!(pins.check("linux", "aa")?, Trust::Known);
+        assert_eq!(pins.check("linux", "bb")?, Trust::Changed { pinned: "aa".into() });
         // Kept on disk.
-        let reopened = Pins::open(dir.path());
-        assert_eq!(reopened.check("linux", "aa"), Trust::Known);
-        assert!(reopened.forget("linux"));
-        assert_eq!(reopened.check("linux", "bb"), Trust::First);
+        let path = dir.path().join("pins.json");
+        let kept = std::fs::read(&path)?;
+        // Refuse writes portably, including when tests run as root: block the atomic temp path.
+        let blocked = path.with_extension(format!("tmp.{}", std::process::id()));
+        std::fs::create_dir(&blocked)?;
+        assert!(pins.check("mac", "cc").is_err());
+        assert!(pins.get("mac")?.is_none(), "failed first-use persistence must not publish trust");
+        assert!(pins.forget("linux").is_err());
+        assert_eq!(pins.check("linux", "aa")?, Trust::Known, "failed forgetting retains its anchor");
+        assert_eq!(std::fs::read(&path)?, kept);
+        let reopened = Pins::open(dir.path())?;
+        assert_eq!(reopened.check("linux", "aa")?, Trust::Known);
+        assert!(reopened.get("mac")?.is_none());
+        std::fs::remove_dir(&blocked)?;
+        assert!(reopened.forget("linux")?);
+        assert!(!reopened.forget("linux")?);
+        assert!(Pins::open(dir.path())?.get("linux")?.is_none(), "successful forgetting survives restart");
+        assert_eq!(reopened.check("linux", "bb")?, Trust::First);
+        assert_eq!(Pins::open(dir.path())?.check("linux", "bb")?, Trust::Known);
+        // A post-rename sync error may already have removed the anchor from disk. Refuse
+        // every subsequent trust decision and write until a verified reopen reads that map.
+        let uncertain = Pins::open(dir.path())?;
+        {
+            let mut locked = uncertain.locked()?;
+            let mut next = locked.state.verified()?.clone();
+            next.remove("linux");
+            assert!(uncertain.save_with_directory_sync(&mut locked.state, next, |_| anyhow::bail!("injected directory sync failure")).is_err());
+        }
+        let persisted = std::fs::read(&path)?;
+        assert!(serde_json::from_slice::<BTreeMap<String, Pin>>(&persisted)?.is_empty(), "rename happened despite Err");
+        assert!(uncertain.get("linux").is_err());
+        assert!(uncertain.all().is_err());
+        assert!(uncertain.check("linux", "bb").is_err());
+        assert!(uncertain.check("mac", "cc").is_err());
+        assert!(uncertain.forget("linux").is_err());
+        assert_eq!(std::fs::read(&path)?, persisted, "fenced RAM cannot overwrite the persisted outcome");
+        assert_eq!(Pins::open(dir.path())?.check("linux", "bb")?, Trust::First, "verified reopen reads the committed map");
+        std::fs::write(&path, b"{corrupt pins")?;
+        assert!(Pins::open(dir.path()).is_err(), "a corrupt anchor must not become an empty store");
+        assert_eq!(std::fs::read(&path)?, b"{corrupt pins");
+        std::fs::remove_file(&path)?;
+        std::fs::create_dir(&path)?;
+        assert!(Pins::open(dir.path()).is_err(), "an unreadable existing anchor must not become an empty store");
         Ok(())
+    }
+
+    #[test]
+    fn u09_u17_overlapping_pin_instances_share_current_anchors_and_short_lock() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let left = Pins::open(dir.path())?;
+        let right = Pins::open(dir.path())?;
+        let probe = std::fs::OpenOptions::new().read(true).write(true).open(dir.path().join(".pins.lock"))?;
+        {
+            let _held = left.locked()?;
+            assert!(matches!(probe.try_lock(), Err(std::fs::TryLockError::WouldBlock)), "each access holds the common physical file lock");
+            for pins in [&left, &right] {
+                let error = pins.get("linux").err().context("contended pin access must refuse without waiting")?;
+                assert_eq!(error.downcast_ref::<std::io::Error>().map(std::io::Error::kind), Some(std::io::ErrorKind::WouldBlock));
+            }
+        }
+        probe.try_lock().map_err(|error| anyhow::anyhow!("access retained its lock: {error}"))?;
+        probe.unlock()?;
+        #[cfg(unix)]
+        {
+            let held = left.locked()?;
+            // U09/U17: dup shares the description just as fork does, without spawning.
+            let inherited = held.disk.as_ref().context("disk lock missing")?.try_clone()?;
+            drop(held);
+            probe.try_lock().map_err(|error| anyhow::anyhow!("duplicate retained the completed access lock: {error}"))?;
+            probe.unlock()?;
+            drop(inherited);
+        }
+        drop(probe);
+        assert_eq!(left.check("linux", "aa")?, Trust::First);
+        assert_eq!(right.check("linux", "bb")?, Trust::Changed { pinned: "aa".into() });
+        assert_eq!(right.check("mac", "cc")?, Trust::First);
+        assert_eq!(left.get("mac")?.map(|pin| pin.fingerprint), Some("cc".into()), "reads refresh the other instance's anchor");
+        assert!(right.forget("linux")?);
+        assert_eq!(left.check("windows", "dd")?, Trust::First);
+        assert!(right.get("linux")?.is_none(), "a stale writer cannot resurrect a forgotten anchor");
+        assert_eq!(right.get("windows")?.map(|pin| pin.fingerprint), Some("dd".into()));
+        let anchors = Pins::open(dir.path())?.all()?;
+        assert_eq!(anchors.len(), 2);
+        assert_eq!(anchors.get("mac").map(|pin| pin.fingerprint.as_str()), Some("cc"));
+        Ok(())
+    }
+
+    #[test]
+    fn u09_u17_failed_pin_unlock_retains_ownership_and_refuses_access() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pins = Pins::open(dir.path())?;
+        let probe = std::fs::File::options().read(true).write(true).open(dir.path().join(".pins.lock"))?;
+        {
+            let mut held = pins.locked()?;
+            let error = held.release_with(|_| Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "injected unlock failure")))
+                .err().context("unlock failure must be reported")?;
+            assert_eq!(error.downcast_ref::<std::io::Error>().map(std::io::Error::kind), Some(std::io::ErrorKind::PermissionDenied));
+        }
+        assert!(matches!(probe.try_lock(), Err(std::fs::TryLockError::WouldBlock)), "failed unlock retains the owned descriptor");
+        assert!(pins.get("linux").is_err());
+        assert!(pins.check("linux", "aa").is_err());
+        assert!(pins.forget("linux").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn u09_u17_async_pin_access_runs_off_shards_and_retains_typed_busy_errors() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let pins = Arc::new(Pins::memory());
+            let trust = pins.access(|pins| {
+                anyhow::ensure!(!crate::rt::on_shard(), "pin filesystem work must run off runtime shards");
+                pins.check("linux", "aa")
+            }).await?;
+            assert_eq!(trust, Trust::First);
+            let error = pins.access(|pins| {
+                let _held = pins.locked()?;
+                pins.get("linux")
+            }).await.err().context("busy error from blocking adapter")?;
+            assert_eq!(error.downcast_ref::<std::io::Error>().map(std::io::Error::kind), Some(std::io::ErrorKind::WouldBlock));
+            Ok(())
+        })
     }
 }

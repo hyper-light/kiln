@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use kiln_ci::mirror::{Cadence, Mirror, Want};
-use rusqlite::{OptionalExtension as _, params};
+use crate::sql::{OptionalExtension as _, params};
 use serde_json::{Value, json};
 
 use super::pulls::{self, On};
@@ -303,7 +303,7 @@ async fn refresh<F: Fetch>(store: &Store, r: &Mirrored, fetch: &F, st: &mut Stat
     let (repo, host, num, seen) = (r.repo_id.clone(), r.host.word(), i64::try_from(n).unwrap_or(i64::MAX), now / 1000);
     let open = store
         .call(move |c| {
-            let tx = c.savepoint()?;
+            let tx = crate::store::tx(c)?;
             if let Some(p) = &p {
                 tx.execute(
                     "INSERT INTO host_pulls (repo_id, host, number, title, author, state, url, base, requested, merged_sha, host_updated, first_seen) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)

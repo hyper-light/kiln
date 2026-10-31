@@ -71,7 +71,7 @@ test("an agent started through kiln's API is a top-level row; a subagent never i
   }
 });
 
-test("sessions found on the machines never list kiln's own agents or their subagents again", () => {
+test("U13 discovery keeps external sessions separate from structured ownership across harnesses", () => {
   const session = (id: string, managed_by?: string): AiSession => ({
     id,
     managed_by,
@@ -92,11 +92,50 @@ test("sessions found on the machines never list kiln's own agents or their subag
     transcript: true,
   });
   const all = [{ a: agent({ harness_session: "owner-session", subagents: [task()] }) }, { a: agent({ id: "child", parent: "owner", harness_session: "child-session" }) }];
-  const found = [session("owner-session"), session("child-session"), session("native-child"), session("other-managed", "other"), session("external")];
+  const found = [
+    session("owner-session", "owner"),
+    session("child-session", "child"),
+    // A native/merged task id has no independent provider or machine scope. It is not proof.
+    session("native-child"),
+    session("other-managed", "other"),
+    // A card helper has no visible roster row, but its API ownership still hides its discovered process.
+    session("helper-owned", "card-helper"),
+    session("external"),
+    { ...session("external-acp"), tool: "acp" },
+    { ...session("owned-acp", "owner"), tool: "acp" },
+    // The API leaves unrelated provider-local collisions and unverifiable scope unmarked.
+    { ...session("owner-session"), tool: "claude" },
+    { ...session("owner-session"), machine: "other-runner" },
+    { ...session("owner-session"), machine: "fedora-alias" },
+    { ...session("owner-session"), tool: "future-harness" },
+    { ...session("owner-session"), tool: "" },
+    { ...session("owner-session"), machine: "" },
+    session(""),
+  ];
   assert.deepEqual(
-    missionFoundSessions(found, all).map((s) => s.id),
-    ["external"],
+    missionFoundSessions(found, all).map((s) => [s.machine, s.tool, s.id]),
+    [
+      ["fedora", "codex", "native-child"],
+      ["fedora", "codex", "external"],
+      ["fedora", "acp", "external-acp"],
+      ["fedora", "claude", "owner-session"],
+      ["other-runner", "codex", "owner-session"],
+      ["fedora-alias", "codex", "owner-session"],
+      ["fedora", "future-harness", "owner-session"],
+      ["fedora", "", "owner-session"],
+      ["", "codex", "owner-session"],
+      ["fedora", "codex", ""],
+    ],
   );
+  assert.equal(all.some(({ a }) => a.id === "card-helper"), false, "a helper is absent from the listed roster");
+  assert.deepEqual(missionFoundSessions([session("helper-owned", "card-helper")], all), []);
+  assert.deepEqual(missionFoundSessions([session("helper-owned")], all).map((s) => s.id), ["helper-owned"], "closing its helper reveals the same discovery row");
+  // Every supported harness, and future metadata, follows the server's explicit projection.
+  for (const tool of ["claude", "codex", "devin", "gemini", "opencode", "goose", "amp", "antigravity", "future-harness"]) {
+    const owned = { ...session("same-id", "owner"), tool };
+    const external = { ...session("same-id"), tool };
+    assert.deepEqual(missionFoundSessions([owned, external], all), [external], tool);
+  }
 });
 
 test("the subagents kiln starts for an agent's goals or plan steps are on its row, not rows of their own", () => {

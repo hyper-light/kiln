@@ -1,0 +1,53 @@
+# Amphora's engine's SQL parser, since Turso 3e09a82 (../engine/ORIGIN.md).
+
+[package]
+name = "amphora-engine-parser"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Amphora's engine's SQL parser"
+
+# The engine's own lints, as it came with them: CLAUDE.md's rules hold for every line Amphora writes
+# here, and scripts/check-production.sh counts what is left of the inherited code that breaks them, a
+# count that may only fall.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(shuttle)', 'cfg(antithesis)', 'cfg(nightly)'] }
+# For now allow this for the allocator api migration
+unstable_name_collisions = "allow"
+
+[lints.clippy]
+await_holding_lock = "deny"
+or_fun_call = "deny"
+clear_with_drain = "deny"
+collection_is_never_read = "deny"
+naive_bytecount = "deny"
+stable_sort_primitive = "deny"
+large_stack_frames = "deny"
+large_types_passed_by_value = "deny"
+redundant_clone = "deny"
+assigning_clones = "deny"
+
+[lib]
+name = "amphora_engine_parser"
+
+[features]
+default = []
+serde = ["dep:serde", "bitflags/serde"]
+simulator = []
+codspeed = []
+
+[dependencies]
+bitflags = { workspace = true }
+miette = { workspace = true }
+strum = { workspace = true }
+strum_macros = {workspace = true }
+serde = { workspace = true , optional = true, features = ["derive", "rc"] }
+thiserror = { workspace = true }
+amphora-engine-macros = { workspace = true }
+memchr = "2.7.6"
+
+[dev-dependencies]
+fallible-iterator = { workspace = true }

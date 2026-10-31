@@ -1,0 +1,25 @@
+# Amphora's engine's extension interface, since Turso 3e09a82 (../engine/ORIGIN.md).
+
+[package]
+name = "amphora-engine-ext"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Amphora's engine's extension interface"
+
+[features]
+vfs = []
+core_only = []
+static = []
+
+[dependencies]
+amphora-engine-macros = { workspace = true }
+
+getrandom = { workspace = true }
+chrono = { workspace = true, default-features = true }
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { workspace = true , features = ["wasm_js"] }

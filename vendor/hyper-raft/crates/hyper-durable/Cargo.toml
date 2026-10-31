@@ -7,6 +7,15 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# A defect planted in the replica's core (`Replica::plant`, `hyper_raft::Mutant`), for a test build
+# that shows its checks catch it; no consumer enables it.
+mutants = ["hyper-raft/mutants"]
+# `RamStore`, a store whose writes complete as they're submitted, for tests alone: a dev-dependency
+# asks for it (this crate's own tests, below). Quiver's and kiln's copies make it so, as the
+# write-ahead log is mandatory there (Quiver's docs/design/focal-bus.md, "GroupStore mandated").
+test-store = []
+
 [dependencies]
 hyper-block = { path = "../hyper-block" }
 hyper-liveness = { path = "../hyper-liveness" }
@@ -14,12 +23,6 @@ hyper-log = { path = "../hyper-log" }
 hyper-raft = { path = "../hyper-raft" }
 hyper-timing = { path = "../hyper-timing" }
 thiserror.workspace = true
-
-[features]
-# `RamStore`, a store whose writes complete as they're submitted, for tests alone: a dev-dependency
-# asks for it (this crate's own tests, below). Quiver's and kiln's copies make it so, as the
-# write-ahead log is mandatory there (Quiver's docs/design/focal-bus.md, "GroupStore mandated").
-test-store = []
 
 [dev-dependencies]
 hyper-durable = { path = ".", features = ["test-store"] }

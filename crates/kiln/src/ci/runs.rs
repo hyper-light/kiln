@@ -5,10 +5,68 @@
 //! `job_id`).
 
 use kiln_ci::plan::LegSpec;
-use rusqlite::{OptionalExtension, params};
+use crate::sql::{OptionalExtension, params};
 
 use crate::hub::Hub;
 use crate::store::{Repo, Run, Status};
+
+/// U03: called after the hub authenticates the reporting process, before it sends Received.
+/// The first report for this owner and attempt wins, including across retries/reconnects.
+/// Legacy attempt numbers are normalized before import, so a result arriving during migration
+/// has the same identity after the workflow engine takes ownership.
+pub async fn stage_completion(hub: &Hub, agent: &str, result: &crate::proto::JobResult, expected_attempt: Option<u32>) -> anyhow::Result<Option<(String, u32)>> {
+    anyhow::ensure!(result.status.is_terminal(), "a job completion must have a terminal status");
+    let (agent, job, payload) = (agent.to_owned(), result.job.clone(), serde_json::to_string(result)?);
+    hub.store.call(move |c| {
+        let tx = crate::store::tx(c)?;
+        let row: Option<(Option<String>, String, u32, bool)> = tx.query_row("SELECT agent, status, attempt, job_id IS NULL FROM jobs WHERE id = ?1", [&job], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional()?;
+        let Some((owner, status, attempt, legacy)) = row else { return Ok(None) };
+        if owner.as_deref() != Some(agent.as_str()) { return Ok(None) }
+        let attempt = if legacy { attempt.saturating_add(1) } else { attempt.max(1) };
+        if expected_attempt.is_some_and(|expected| expected != attempt) { return Ok(None) }
+        let lost: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM ci_attempts WHERE leg_id = ?1 AND number = ?2 AND status = 'done' AND failure_class = 'runner-lost')", params![job, attempt], |r| r.get(0))?;
+        if lost { return Ok(None) }
+        if Status::parse(&status).is_terminal() {
+            // Received may itself have been lost after the plan committed and retired its
+            // receipt. Acknowledge only that durable owner/attempt; never enqueue it again.
+            let committed: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM ci_attempts WHERE leg_id = ?1 AND number = ?2 AND runner = ?3 AND status = 'done')", params![job, attempt, agent], |r| r.get(0))?;
+            return Ok(committed.then_some((job, attempt)));
+        }
+        if status != "running" { return Ok(None) }
+        tx.execute("INSERT INTO ci_completion_reports (job, attempt, agent, payload, received_at) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT (job, attempt, agent) DO NOTHING", params![job, attempt, agent, payload, crate::util::now_unix()])?;
+        tx.commit()?;
+        Ok(Some((job, attempt)))
+    }).await
+}
+
+pub(crate) async fn completion(hub: &Hub, job: &str, attempt: u32, agent: &str) -> anyhow::Result<Option<crate::proto::JobResult>> {
+    let (job, agent) = (job.to_owned(), agent.to_owned());
+    let payload: Option<String> = hub.store.call(move |c| Ok(c.query_row("SELECT payload FROM ci_completion_reports WHERE job = ?1 AND attempt = ?2 AND agent = ?3", params![job, attempt, agent], |r| r.get(0)).optional()?)).await?;
+    payload.map(|p| serde_json::from_str(&p).map_err(anyhow::Error::from)).transpose()
+}
+
+pub(crate) async fn pending_completions(hub: &Hub) -> anyhow::Result<Vec<(String, u32, String)>> {
+    hub.store.call(|c| {
+        let mut query = c.prepare("SELECT job, attempt, agent FROM ci_completion_reports ORDER BY received_at, job, attempt, agent LIMIT 128")?;
+        Ok(query.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<Vec<_>, _>>()?)
+    }).await
+}
+
+/// Forget the receipt only after durable job state contains its outcome or has moved to a
+/// newer owner/attempt. A failed write leaves the receipt available for recovery.
+pub(crate) async fn retire_completion(hub: &Hub, job: &str, attempt: u32, agent: &str) -> anyhow::Result<bool> {
+    let (job, agent) = (job.to_owned(), agent.to_owned());
+    hub.store.call(move |c| {
+        let tx = crate::store::tx(c)?;
+        let row: Option<(String, u32, Option<String>, bool)> = tx.query_row("SELECT status, attempt, agent, job_id IS NULL FROM jobs WHERE id = ?1", [&job], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional()?;
+        let done = row.is_none_or(|(status, now, owner, legacy)| Status::parse(&status).is_terminal() || (if legacy { now.saturating_add(1) } else { now.max(1) }) > attempt || owner.as_deref() != Some(agent.as_str()));
+        if done {
+            tx.execute("DELETE FROM ci_completion_reports WHERE job = ?1 AND attempt = ?2 AND agent = ?3", params![job, attempt, agent])?;
+        }
+        tx.commit()?;
+        Ok(done)
+    }).await
+}
 
 /// A run about to be created.
 #[derive(Debug, Clone, Default)]
@@ -36,10 +94,25 @@ pub struct NewRun {
 /// Creates the run's row, its event and its plan's inputs; returns its number and its numeric id
 /// (`github.run_id`).
 pub async fn create(hub: &Hub, repo: &Repo, n: NewRun) -> anyhow::Result<(i64, i64)> {
+    create_trigger(hub, repo, n, None).await
+}
+
+/// U04: materialization may repeat after a crash; only the persisted occurrence may reuse
+/// its own deterministic run id. Random/manual run creation retains collision refusal.
+pub(crate) async fn create_trigger(hub: &Hub, repo: &Repo, n: NewRun, trigger: Option<String>) -> anyhow::Result<(i64, i64)> {
     let repo_id = repo.id.clone();
     hub.store
         .call(move |c| {
             let tx = crate::store::tx(c)?;
+            if let Some(trigger) = &trigger {
+                let owned = super::schedule::outbox::validate(&tx, trigger, &repo_id, &n.workflow, &n.event, &n.sha, &n.model)?;
+                anyhow::ensure!(owned == n.id, "trigger {trigger} does not own run {}", n.id);
+                let existing: Option<(i64, i64, String, String, String, String, String)> = tx.query_row("SELECT r.number, r.rowid, r.repo_id, r.workflow_id, r.event, r.sha, p.workflow FROM runs r JOIN ci_plans p ON p.run_id = r.id WHERE r.id = ?1", [&n.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))).optional()?;
+                if let Some((number, rowid, repo, workflow, event, sha, model)) = existing {
+                    anyhow::ensure!(repo == repo_id && workflow == n.workflow && event == n.event && sha == n.sha && model == n.model, "trigger {trigger} collides with unrelated run metadata");
+                    return Ok((number, rowid));
+                }
+            }
             let now = crate::util::now_unix();
             let number: i64 = tx.query_row("SELECT COALESCE(MAX(number), 0) + 1 FROM runs WHERE repo_id = ?1", [&repo_id], |r| r.get(0))?;
             tx.execute(
@@ -148,10 +221,22 @@ pub async fn insert_leg(hub: &Hub, run: &str, id: &str, spec: &LegSpec, status: 
                 let st = if terminal { "skipped" } else { "pending" };
                 tx.execute("INSERT INTO steps (job_id, idx, name, status) VALUES (?1, ?2, ?3, ?4)", params![id, i64::try_from(i).unwrap_or(0), name, st])?;
             }
+            super::logsearch::stage_finished(&tx,&id)?;
             tx.commit()?;
             Ok(())
         })
         .await
+}
+
+/// U01: a dependency released an imported pending job. Its id, logs and prior attempts stay
+/// with it; only the shared planner may make it runnable now.
+pub async fn activate_imported(hub: &Hub, id: &str, spec: &LegSpec) -> anyhow::Result<u32> {
+    let (id, leg, job) = (id.to_owned(), serde_json::to_string(spec)?, spec.job.clone());
+    hub.store.call(move |c| {
+        let n = c.execute("UPDATE jobs SET status = 'queued', leg = ?2, job_id = ?3, queued_at = COALESCE(queued_at, ?4) WHERE id = ?1 AND status = 'pending'", params![id, leg, job, crate::util::now_unix()])?;
+        anyhow::ensure!(n == 1, "imported job {id} is no longer pending");
+        Ok(c.query_row("SELECT attempt FROM jobs WHERE id = ?1", [&id], |r| r.get(0))?)
+    }).await
 }
 
 /// The reason a leg waits, by its kind (`capacity`, `concurrency`, …); `scheduling` without one.
@@ -161,7 +246,7 @@ fn wait_kind(reason: Option<&str>) -> String {
 
 /// Ends a waiting leg's current wait (W19-R01): the seconds since it began go to its reason's
 /// total in `jobs.waits`, and the next wait begins now.
-fn close_wait(c: &rusqlite::Connection, leg: &str, now: i64) -> anyhow::Result<()> {
+fn close_wait(c: &crate::sql::Connection, leg: &str, now: i64) -> anyhow::Result<()> {
     let row: Option<(Option<String>, Option<i64>, Option<String>)> =
         c.query_row("SELECT wait_reason, COALESCE(wait_since, queued_at), waits FROM jobs WHERE id = ?1 AND status IN ('queued', 'pending', 'waiting')", [leg], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
     let Some((reason, Some(since), waits)) = row else { return Ok(()) };
@@ -182,6 +267,15 @@ pub async fn claim(hub: &Hub, leg: &str, agent: &str, executor: &str, attempt: u
         .call(move |c| {
             let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
+            // U03: any canonical assignment ends the imported execution's old-frame permit,
+            // even when a rejection/reassignment reuses its attempt number on the same host.
+            let saved: Option<(String, String)> = tx.query_row("SELECT p.run_id, p.input FROM ci_plans p JOIN jobs j ON j.run_id = p.run_id WHERE j.id = ?1", [&leg], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+            if let Some((run, saved)) = saved {
+                let mut input: serde_json::Value = serde_json::from_str(&saved)?;
+                if input.get_mut("legacy_running").and_then(serde_json::Value::as_object_mut).is_some_and(|running| running.remove(&leg).is_some()) {
+                    tx.execute("UPDATE ci_plans SET input = ?2 WHERE run_id = ?1", params![run, input.to_string()])?;
+                }
+            }
             close_wait(&tx, &leg, now)?;
             // The attempt (W19-R01); one before it that never reported ended with its runner.
             tx.execute("UPDATE ci_attempts SET status = 'done', conclusion = 'failure', failure_class = 'runner-lost', finished_at = ?3 WHERE leg_id = ?1 AND number < ?2 AND status = 'running'", params![leg, attempt, now])?;
@@ -216,18 +310,35 @@ pub struct AttemptEnd {
 }
 
 pub async fn attempt_finished(hub: &Hub, leg: &str, attempt: u32, end: AttemptEnd) -> anyhow::Result<()> {
+    attempt_end(hub, leg, attempt, end, false).await.map(|_| ())
+}
+
+/// The loss decision races a completion receipt in the same store transaction. Whichever was
+/// committed first owns the transition; a reconnect cannot overwrite a result already received.
+pub(crate) async fn attempt_lost(hub: &Hub, leg: &str, attempt: u32, end: AttemptEnd) -> anyhow::Result<bool> {
+    attempt_end(hub, leg, attempt, end, true).await
+}
+
+async fn attempt_end(hub: &Hub, leg: &str, attempt: u32, end: AttemptEnd, losing: bool) -> anyhow::Result<bool> {
     let leg = leg.to_owned();
-    crate::metrics::global().ci_attempts.inc(&[end.conclusion, end.class.unwrap_or("")]);
+    let labels = (end.conclusion, end.class.unwrap_or(""));
     let rss = end.peak_rss.and_then(|r| i64::try_from(r).ok());
-    hub.store
+    let recorded = hub.store
         .call(move |c| {
-            c.execute(
+            let tx = crate::store::tx(c)?;
+            if losing && tx.query_row("SELECT EXISTS(SELECT 1 FROM ci_completion_reports WHERE job = ?1 AND attempt = ?2)", params![leg, attempt], |r| r.get::<_, bool>(0))? {
+                return Ok(false);
+            }
+            tx.execute(
                 "UPDATE ci_attempts SET status = 'done', conclusion = ?3, failure_class = ?4, exit_code = ?5, error = ?6, peak_rss = ?7, cpu_seconds = ?8, finished_at = ?9 WHERE leg_id = ?1 AND number = ?2",
                 params![leg, attempt, end.conclusion, end.class, end.exit_code, end.error, rss, end.cpu_seconds, crate::util::now_unix()],
             )?;
-            Ok(())
+            tx.commit()?;
+            Ok(true)
         })
-        .await
+        .await?;
+    if recorded { crate::metrics::global().ci_attempts.inc(&[labels.0, labels.1]); }
+    Ok(recorded)
 }
 
 /// A leg waiting again: a retry, or a runner that refused it.
@@ -250,8 +361,8 @@ pub async fn requeue(hub: &Hub, leg: &str, attempt: u32, note: Option<String>) -
 pub async fn kept_legs(hub: &Hub) -> anyhow::Result<Vec<(String, String, i64)>> {
     hub.store
         .call(|c| {
-            let mut st = c.prepare("SELECT id, agent, kept_until FROM jobs WHERE kept_until > ?1 AND agent IS NOT NULL")?;
-            let rows = st.query_map([crate::util::now_unix()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            let mut st = c.prepare("SELECT id, agent, kept_until FROM jobs WHERE kept_until IS NOT NULL AND agent IS NOT NULL")?;
+            let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
         .await
@@ -293,12 +404,29 @@ pub async fn wait_reason(hub: &Hub, leg: &str, reason: &serde_json::Value) -> an
         .await
 }
 
-/// A leg done for good.
+/// W19-R06/U14: the actual deployment accepted after a leg passed protection, supplied by
+/// its dispatcher owner rather than inferred from an environment or historical deployment.
+pub(crate) struct LegDeployment {
+    pub id: i64,
+    pub run: String,
+    pub attempt: u32,
+    pub environment: String,
+}
+
+/// A leg done for good without an actual accepted deployment.
 pub async fn finish_leg(hub: &Hub, leg: &str, status: Status, conclusion: &str, outputs: Option<String>, error: Option<String>) -> anyhow::Result<()> {
+    finish_leg_with_deployment(hub,leg,status,conclusion,outputs,error,None).await
+}
+
+/// W19-R06/U14: completion and its exact deployment control share one acceptance transaction.
+pub(crate) async fn finish_leg_with_deployment(hub: &Hub, leg: &str, status: Status, conclusion: &str, outputs: Option<String>, error: Option<String>, deployment: Option<LegDeployment>) -> anyhow::Result<()> {
     let leg_id = leg.to_owned();
     let (leg, conclusion) = (leg.to_owned(), conclusion.to_owned());
+    let base = hub.cfg.server.public_url.clone();
     hub.store
         .call(move |c| {
+            let tx = crate::store::tx(c)?;
+            let c = &tx;
             let now = crate::util::now_unix();
             // One that never started waited until now; an attempt still open ends with it.
             close_wait(c, &leg, now)?;
@@ -308,13 +436,44 @@ pub async fn finish_leg(hub: &Hub, leg: &str, status: Status, conclusion: &str, 
                 params![leg, status.as_str(), conclusion, outputs, error, now],
             )?;
             c.execute("UPDATE steps SET status = 'skipped' WHERE job_id = ?1 AND status IN ('pending', 'running')", [&leg])?;
+            super::notify::stage_leg_control(c, &leg, status, &base, deployment.as_ref())?;
+            super::logsearch::stage_finished(&tx,&leg)?;
+            tx.commit()?;
             Ok(())
         })
         .await?;
+    super::schedule::outbox::kick(hub).await;
     crate::observe::kiln::leg_finished(hub, &leg_id).await;
     // Its logs go into the search index (W19-R04).
     super::logsearch::kick();
     Ok(())
+}
+
+/// U03: metadata-only input adapter for an execution imported while it was already running.
+/// Hub authenticates the exact reporting process. Old frames carry no name, outcome, outputs
+/// or attempt: preserve absent fields and require the original durable imported assignment.
+/// The provenance check and metadata write share one writer transaction with canonical claims.
+pub(crate) async fn imported_step(hub: &Hub, agent: &str, job: &str, idx: u32, status: Status, exit_code: Option<i32>) -> anyhow::Result<bool> {
+    anyhow::ensure!(status == Status::Running || status.is_terminal(), "invalid legacy step progress status");
+    let (agent, job) = (agent.to_owned(), job.to_owned());
+    hub.store.call(move |c| {
+        let tx = crate::store::tx(c)?;
+        let assigned: Option<(String, u32)> = tx.query_row("SELECT p.input, j.attempt FROM jobs j JOIN runs r ON r.id = j.run_id JOIN ci_plans p ON p.run_id = r.id JOIN ci_attempts a ON a.leg_id = j.id AND a.number = j.attempt WHERE j.id = ?1 AND j.agent = ?2 AND a.runner = ?2 AND j.status = 'running' AND a.status = 'running' AND p.done = 0 AND j.run_attempt = r.attempt AND r.status IN ('queued','pending','running') AND NOT EXISTS(SELECT 1 FROM ci_completion_reports c WHERE c.job = j.id AND c.attempt = j.attempt)", params![job, agent], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        let Some((input, attempt)) = assigned else { return Ok(false) };
+        let input: serde_json::Value = serde_json::from_str(&input)?;
+        let origin = input.get("legacy_running").and_then(|running| running.get(job.as_str()));
+        if input.get("legacy_import").and_then(serde_json::Value::as_bool) != Some(true)
+            || origin.and_then(|v| v.get("agent")).and_then(serde_json::Value::as_str) != Some(agent.as_str())
+            || origin.and_then(|v| v.get("attempt")).and_then(serde_json::Value::as_u64) != Some(u64::from(attempt)) { return Ok(false); }
+        let now = crate::util::now_unix();
+        let changed = if status == Status::Running {
+            tx.execute("UPDATE steps SET status = 'running', started_at = COALESCE(started_at, ?3) WHERE job_id = ?1 AND idx = ?2 AND status IN ('pending','running')", params![job, idx, now])?
+        } else {
+            tx.execute("UPDATE steps SET status = ?3, exit_code = ?4, finished_at = ?5, started_at = COALESCE(started_at, ?5) WHERE job_id = ?1 AND idx = ?2 AND status IN ('pending','running')", params![job, idx, status.as_str(), exit_code, now])?
+        };
+        tx.commit()?;
+        Ok(changed == 1)
+    }).await
 }
 
 /// A step started on the runner: its evaluated name replaces the planned one (or the step is new:
@@ -385,17 +544,23 @@ pub async fn summary(hub: &Hub, leg: &str, idx: u32, markdown: &str) -> anyhow::
 pub async fn finish_run(hub: &Hub, run: &str, status: Status, conclusion: &str, error: Option<String>) -> anyhow::Result<()> {
     let run_id = run.to_owned();
     let (run, conclusion) = (run.to_owned(), conclusion.to_owned());
+    let base = hub.cfg.server.public_url.clone();
     hub.store
         .call(move |c| {
+            let tx = crate::store::tx(c)?;
+            let c = &tx;
             let now = crate::util::now_unix();
             c.execute(
                 "UPDATE runs SET status = ?2, conclusion = ?3, error = COALESCE(?4, error), finished_at = ?5, started_at = COALESCE(started_at, ?5) WHERE id = ?1",
                 params![run, status.as_str(), conclusion, error, now],
             )?;
             c.execute("UPDATE ci_plans SET done = 1 WHERE run_id = ?1", [&run])?;
+            super::notify::stage_run_control(c, &run, status, &base)?;
+            tx.commit()?;
             Ok(())
         })
         .await?;
+    super::schedule::outbox::kick(hub).await;
     crate::observe::kiln::run_ended(hub, &run_id).await;
     Ok(())
 }
@@ -445,6 +610,7 @@ pub async fn keep_leg(hub: &Hub, run: &str, old: &str, id: &str) -> anyhow::Resu
                  SELECT ?1, idx, name, status, started_at, finished_at, exit_code, kind, step_id, action, outcome, conclusion, outputs, attempt FROM steps WHERE job_id = ?2",
                 params![id, old],
             )?;
+            super::logsearch::stage_finished(&tx,&id)?;
             tx.commit()?;
             Ok(())
         })
@@ -458,5 +624,67 @@ pub async fn run_of(hub: &Hub, leg: &str) -> anyhow::Result<Option<Run>> {
     match run {
         Some(r) => hub.store.run(r).await,
         None => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod deployment_control_tests {
+    use super::*;
+
+    /// W19-R06/U14: accepted deployment controls follow the live post-gate predicate, and
+    /// malformed/stale context rolls the whole finish transaction back before publication.
+    #[test]
+    fn w19_r06_deployment_control_requires_exact_accepted_current_leg_context() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub=crate::hub::tests::scratch_hub().await?;
+            hub.store.call(|c| {
+                c.execute("INSERT INTO repos(id,name,clone_url,created_at) VALUES('deploy-repo','acme/deploy','local',0)",[])?;
+                for (run,attempt) in [("current",1),("rerun",2)] {
+                    c.execute("INSERT INTO runs(id,repo_id,number,pipeline,event,branch,sha,status,created_at,attempt) VALUES(?1,'deploy-repo',?2,'ship','push','main','sha','running',0,?2)",params![run,attempt])?;
+                }
+                for (leg,run,enabled) in [("gated","current",true),("no-record","current",true),("disabled","current",false),("actual","current",true),("historical","current",true),("old-attempt","rerun",true),("timed-out","current",true),("cancelled","current",true)] {
+                    let spec=serde_json::json!({"environment":{"name":"prod","deployment":enabled}}).to_string();
+                    c.execute("INSERT INTO jobs(id,run_id,key,display,status,labels,needs,spec,leg,environment,attempt,run_attempt) VALUES(?1,?2,?1,?1,'running','[]','[]',?3,?3,'prod',3,1)",params![leg,run,spec])?;
+                }
+                for (id,leg,run) in [(10,"actual","current"),(11,"historical","current"),(12,"old-attempt","rerun"),(13,"disabled","current"),(14,"timed-out","current"),(15,"cancelled","current")] {
+                    c.execute("INSERT INTO ci_deployments(id,repo_id,environment,sha,git_ref,creator,run_id,leg_id,created_at,updated_at) VALUES(?1,'deploy-repo','prod','sha','main','person',?2,?3,0,0)",params![id,run,leg])?;
+                }
+                Ok(())
+            }).await?;
+            // An environment declaration (including deployment:false), refusal before the gate,
+            // or even a historical deployment row cannot substitute for the actual context.
+            for (leg,status) in [("gated",Status::Failed),("no-record",Status::TimedOut),("disabled",Status::Succeeded),("historical",Status::Succeeded)] {
+                finish_leg(&hub,leg,status,"failure",None,None).await?;
+            }
+            let controls=hub.store.call(|c|Ok(c.query_row("SELECT COUNT(*) FROM ci_trigger_outbox WHERE kind='control'",[],|r|r.get::<_,u32>(0))?)).await?;
+            assert_eq!(controls,0);
+            let context=|id,run:&str,attempt,environment:&str|Some(LegDeployment{id,run:run.into(),attempt,environment:environment.into()});
+            for (leg,deployment) in [
+                ("old-attempt",context(12,"rerun",3,"prod")),
+                ("no-record",context(10,"current",3,"prod")),
+                ("disabled",context(13,"current",3,"prod")),
+                ("actual",context(10,"current",2,"prod")),
+                ("actual",context(10,"current",3,"staging")),
+                ("actual",context(10,"another-run",3,"prod")),
+            ] {
+                assert!(finish_leg_with_deployment(&hub,leg,Status::Succeeded,"success",None,None,deployment).await.is_err());
+            }
+            let status=hub.store.call(|c|Ok(c.query_row("SELECT status FROM jobs WHERE id='actual'",[],|r|r.get::<_,String>(0))?)).await?;
+            assert_eq!(status,"running","invalid context rolls completion back");
+            finish_leg_with_deployment(&hub,"cancelled",Status::Cancelled,"cancelled",None,None,context(15,"current",3,"prod")).await?;
+            finish_leg_with_deployment(&hub,"actual",Status::Succeeded,"success",None,None,context(10,"current",3,"prod")).await?;
+            finish_leg_with_deployment(&hub,"actual",Status::Succeeded,"success",None,None,context(10,"current",3,"prod")).await?;
+            finish_leg_with_deployment(&hub,"timed-out",Status::TimedOut,"timed_out",None,None,context(14,"current",3,"prod")).await?;
+            let rows:Vec<(String,String)>=hub.store.call(|c|Ok(c.prepare("SELECT id,payload FROM ci_trigger_outbox WHERE kind='control' ORDER BY json_extract(payload,'$.descriptor.event.type') DESC")?.query_map([],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<Result<_,_>>()?)).await?;
+            let controls:Vec<(String,serde_json::Value)>=rows.into_iter().map(|(id,payload)|Ok((id,serde_json::from_str(&payload)?))).collect::<anyhow::Result<_>>()?;
+            assert_eq!(controls.len(),2,"only actual success and timeout deploy; duplicate acceptance is one source");
+            let (key,payload)=controls.first().ok_or_else(||anyhow::anyhow!("accepted deployment control"))?;
+            assert_eq!(key,&crate::util::sha256_hex(b"kiln/trigger/intent/v1/control/leg:actual:3:deployment"));
+            assert_eq!(payload.pointer("/descriptor/event/type"),Some(&serde_json::json!("deploy.succeeded")));
+            assert_eq!(payload.pointer("/descriptor/event/environments"),Some(&serde_json::json!(["prod"])));
+            assert_eq!(payload.pointer("/descriptor/event/attempt"),Some(&serde_json::json!(1)));
+            assert_eq!(controls.get(1).and_then(|(_,p)|p.pointer("/descriptor/event/type")),Some(&serde_json::json!("deploy.failed")));
+            Ok(())
+        })
     }
 }

@@ -114,6 +114,9 @@ fn null_is_default<'de, D: serde::Deserializer<'de>, T: Default + Deserialize<'d
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Gates {
+    /// U10: shared environment action capacity; CI and releases reserve from one ledger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency_limit: Option<u32>,
     /// Environments a new version runs in first: the same version, with the same artifacts,
     /// succeeded there and still runs there (txst's required environments). `staging@eu` is
     /// `staging` on the linked kiln server `eu` (§11), which signs what it says runs there.
@@ -180,41 +183,8 @@ impl Promote {
     }
 }
 
-/// People who approve a release before it goes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Approvals {
-    /// How many.
-    #[serde(default = "one")]
-    pub count: u32,
-    /// Who may, by name; anyone who may approve releases here (`runs.approve`) when none.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub reviewers: Vec<String>,
-    /// Whoever asked for the release may approve it too.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub self_approve: bool,
-}
-
-fn one() -> u32 {
-    1
-}
-
-/// A window: it opens at each time its schedule names, for `duration`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Window {
-    /// Releases go only while a window of these is open (five-field cron).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub allow: Option<String>,
-    /// Releases wait while it is open.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deny: Option<String>,
-    /// `90m`, `2h`, `1d`.
-    pub duration: String,
-    /// The schedule's time zone (`Europe/Berlin`); UTC when none.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timezone: Option<String>,
-}
+// U10: job and release windows/approval policies have one representation and evaluator.
+pub use kiln_ci::env::{Approvals, Window};
 
 /// A check a release passes (§9.1): one built in, by its name (`no-snapshots`), or one described.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

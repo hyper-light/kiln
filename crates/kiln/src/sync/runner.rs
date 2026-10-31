@@ -218,13 +218,13 @@ enum Transfer {
 impl Runner {
     /// Starts this machine's sync (`me`, its state under `state_dir`): contents fetched from and
     /// sent to `server` with `http`. What to tell the server comes out of the receiver.
-    pub fn start(state_dir: &Path, me: &str, http: Arc<Client>, server: String) -> (Self, async_channel::Receiver<AgentMsg>) {
+    pub async fn start(state_dir: &Path, me: &str, http: Arc<Client>, server: String, records: Arc<dyn kiln_seams::Records>) -> anyhow::Result<(Self, async_channel::Receiver<AgentMsg>)> {
         let dir = state_dir.join("sync");
         let (tx, rx) = std::sync::mpsc::channel();
         let (say_tx, say_rx) = async_channel::unbounded();
         let (job_tx, job_rx) = async_channel::unbounded::<(Transfer, String)>();
         // The machine's git repositories, and its part of tasks that move them (`super::repos`).
-        let repos = super::repos::start(dir.clone(), me.to_owned(), http.clone(), server.clone(), say_tx.clone());
+        let repos = super::repos::start(dir.clone(), me.to_owned(), http.clone(), server.clone(), say_tx.clone(), records).await?;
         let (owner_dir, owner_me, wake_tx) = (dir.clone(), me.to_owned(), tx.clone());
         let spawned = std::thread::Builder::new().name("kiln-sync".into()).spawn(move || match Owner::new(owner_dir, owner_me, say_tx, job_tx, wake_tx, repos) {
             Ok(owner) => owner.run(&rx),
@@ -255,7 +255,7 @@ impl Runner {
                 });
             }
         });
-        (Self { tx }, say_rx)
+        Ok((Self { tx }, say_rx))
     }
 
     /// What the server said (`ServerMsg::Sync`).

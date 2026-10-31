@@ -4,10 +4,10 @@
  */
 import * as React from "react";
 import { Crumbs } from "@/components/ui/misc";
-import { harnessSessionsRes, useRes } from "@/lib/data";
+import { useHarnessSessions } from "@/lib/data";
 
 function SessionName({ id }: { id: string }) {
-  const name = useRes(harnessSessionsRes).data.find((a) => a.id === id)?.name;
+  const name = useHarnessSessions().data.find((a) => a.id === id)?.name;
   return <>{name || `Agent ${id.slice(0, 8)}`}</>;
 }
 

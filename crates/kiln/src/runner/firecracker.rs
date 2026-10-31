@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::io::{BufRead as _, Read as _, Write as _};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -36,6 +36,7 @@ use super::guest::{self, FromGuest, ToGuest};
 use super::runtime::Leg;
 use crate::proto::JobResult;
 use crate::store::Status;
+use kiln_ci::sched::vm::{FirecrackerShape, GuestShape};
 
 /// A leg's scratch disk: sparse, so only what's written takes room.
 const SCRATCH: u64 = 32 << 30;
@@ -76,7 +77,9 @@ impl Machine {
 
     /// Firecracker's version (`v1.17.0`).
     pub fn version(&self) -> Option<String> {
-        let o = Command::new(&self.firecracker).arg("--version").stdin(Stdio::null()).output().ok()?;
+        let mut command = Command::new(&self.firecracker);
+        command.arg("--version").stdin(Stdio::null());
+        let o = super::processes::output_blocking(command).ok()?;
         String::from_utf8_lossy(&o.stdout).split_whitespace().find(|w| w.starts_with('v') && w.contains('.')).map(str::to_owned)
     }
 }
@@ -90,7 +93,8 @@ pub fn mkfs(m: &Machine, image: &Path, size: u64, label: &str, from: Option<&Pat
     if let Some(d) = from {
         cmd.arg("-d").arg(d);
     }
-    let o = cmd.arg(image).stdin(Stdio::null()).output().context("running mke2fs")?;
+    cmd.arg(image).stdin(Stdio::null());
+    let o = super::processes::output_blocking(cmd).context("running mke2fs")?;
     anyhow::ensure!(o.status.success(), "mke2fs {}: {}", image.display(), String::from_utf8_lossy(&o.stderr).trim());
     Ok(())
 }
@@ -142,15 +146,16 @@ pub struct Drive<'a> {
 /// written to `console.log` in `dir`, its vsock in `socks`. Its VMM runs in a jail of its own
 /// when this machine allows one (`jail.rs`), which has only these: there, each is where the jail
 /// puts it.
-pub fn boot(m: &Machine, dir: &Path, socks: &Socks, drives: &[Drive<'_>], mode: &str, vcpus: u32, memory_mib: u64) -> anyhow::Result<Vm> {
-    vmm(m, dir, socks, drives, Run::Boot { mode, vcpus, memory_mib, api: false, snapshot_to: None })
+pub fn boot(m: &Machine, dir: &Path, socks: &Socks, drives: &[Drive<'_>], mode: &str, shape: GuestShape) -> anyhow::Result<Vm> {
+    shape.validate().map_err(anyhow::Error::msg)?;
+    vmm(m, dir, socks, drives, Run::Boot { mode, shape, api: false, snapshot_to: None })
 }
 
 /// What a VMM does as it starts.
 enum Run<'a> {
     /// Boots kiln's disk into `kiln guest <mode>`; with its API socket when `api` (for a pause and
     /// a snapshot, written to `snapshot_to`, bound in at `/snap`).
-    Boot { mode: &'a str, vcpus: u32, memory_mib: u64, api: bool, snapshot_to: Option<&'a Path> },
+    Boot { mode: &'a str, shape: GuestShape, api: bool, snapshot_to: Option<&'a Path> },
     /// Waits, with its API socket, to restore the snapshot in `from` (bound in at `/snap`, read
     /// only): jailed, so the paths the snapshot names are this microVM's own.
     Restore { from: &'a Path },
@@ -164,14 +169,15 @@ fn vmm(m: &Machine, dir: &Path, socks: &Socks, drives: &[Drive<'_>], run: Run<'_
     let path = dir.join("vm.json");
     let mut args: Vec<String> = Vec::new();
     match &run {
-        Run::Boot { mode, vcpus, memory_mib, api, .. } => {
+        Run::Boot { mode, shape, api, .. } => {
+            shape.validate().map_err(anyhow::Error::msg)?;
             let config = serde_json::json!({
                 "boot-source": {
                     "kernel_image_path": at(&m.kernel, "/kernel".into()),
                     "boot_args": format!("console=ttyS0 reboot=k panic=1 pci=off quiet root=/dev/vda ro rootfstype=ext4 init=/kiln -- guest {mode}"),
                 },
                 "drives": drives.iter().map(|d| serde_json::json!({ "drive_id": d.id, "path_on_host": at(d.path, format!("/drives/{}", d.id)), "is_root_device": false, "is_read_only": d.read_only })).collect::<Vec<_>>(),
-                "machine-config": { "vcpu_count": vcpus, "mem_size_mib": memory_mib },
+                "machine-config": { "vcpu_count": shape.vcpus, "mem_size_mib": shape.memory_mib },
                 "vsock": { "guest_cid": 3, "uds_path": at(&socks.uds(), "/socks/v.sock".into()) },
                 "entropy": {},
             });
@@ -218,13 +224,22 @@ fn vmm(m: &Machine, dir: &Path, socks: &Socks, drives: &[Drive<'_>], run: Run<'_
         c.args(args);
         c
     };
-    let child = cmd.current_dir(dir).stdin(Stdio::null()).stdout(out.try_clone()?).stderr(out).spawn().with_context(|| format!("starting {}", m.firecracker.display()))?;
+    cmd.current_dir(dir).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = super::processes::spawn_blocking(cmd).with_context(|| format!("starting {}", m.firecracker.display()))?;
+    for pipe in [child.stdout.take(), child.stderr.take()].into_iter().flatten() {
+        let mut target = out.try_clone()?;
+        std::thread::Builder::new().name("vmm-console".into()).spawn(move || { let mut pipe = pipe; let _ = std::io::copy(&mut pipe, &mut target); })?;
+    }
     Ok(Vm { child: Some(child), console })
 }
 
 /// A call to a VMM's API (Firecracker's: HTTP over its Unix socket, there once the VMM is up),
 /// `method` `path` with `body`, within `within`: why not, when it refuses.
 fn api(sock: &Path, method: &str, path: &str, body: &serde_json::Value, within: Duration) -> anyhow::Result<()> {
+    api_response(sock, method, path, body, within).map(|_| ())
+}
+
+fn api_response(sock: &Path, method: &str, path: &str, body: &serde_json::Value, within: Duration) -> anyhow::Result<Vec<u8>> {
     let deadline = Instant::now() + within;
     let mut s = loop {
         match UnixStream::connect(sock) {
@@ -236,7 +251,7 @@ fn api(sock: &Path, method: &str, path: &str, body: &serde_json::Value, within: 
         }
     };
     s.set_read_timeout(Some(within))?;
-    let text = body.to_string();
+    let text = if method == "GET" { String::new() } else { body.to_string() };
     write!(s, "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{text}", text.len())?;
     // Its answer: the status line, the headers, the body they size.
     let mut r = std::io::BufReader::new(s);
@@ -255,15 +270,29 @@ fn api(sock: &Path, method: &str, path: &str, body: &serde_json::Value, within: 
             len = v.trim().parse().unwrap_or(0);
         }
     }
-    let mut said = vec![0u8; len.min(64 << 10)];
+    anyhow::ensure!(len <= 64 << 10, "{method} {path}: API response exceeds 64 KiB");
+    let mut said = vec![0u8; len];
     r.read_exact(&mut said)?;
     anyhow::ensure!((200..300).contains(&code), "{method} {path}: {code} {}", String::from_utf8_lossy(&said).trim());
+    Ok(said)
+}
+
+fn verify_guest(sock: &Path, shape: GuestShape) -> anyhow::Result<()> {
+    let bytes = api_response(sock, "GET", "/machine-config", &serde_json::Value::Null, BOOT)?;
+    let actual: serde_json::Value = serde_json::from_slice(&bytes).context("Firecracker machine configuration is not JSON")?;
+    check_guest(&actual, shape)
+}
+
+fn check_guest(actual: &serde_json::Value, shape: GuestShape) -> anyhow::Result<()> {
+    shape.validate().map_err(anyhow::Error::msg)?;
+    anyhow::ensure!(actual.get("vcpu_count").and_then(serde_json::Value::as_u64) == Some(u64::from(shape.vcpus))
+        && actual.get("mem_size_mib").and_then(serde_json::Value::as_u64) == Some(shape.memory_mib), "U01: Firecracker machine configuration differs from the persisted guest shape; request a new executor");
     Ok(())
 }
 
 /// A running microVM's VMM: killed if it's dropped before it ended.
 pub struct Vm {
-    child: Option<Child>,
+    child: Option<super::processes::Child>,
     pub console: PathBuf,
 }
 
@@ -300,6 +329,21 @@ impl Vm {
         while self.ended().is_none() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    /// Finish this phase without closing the original outer execution. A leader exit or
+    /// deadline starts retirement; only the existing kernel group's proof completes it.
+    pub async fn finish_owned(mut self, within: Duration) -> anyhow::Result<()> {
+        let deadline = Instant::now() + within;
+        while self.ended().is_none() && Instant::now() < deadline {
+            crate::rt::sleep(Duration::from_millis(50)).await;
+        }
+        self.retire().await
+    }
+
+    pub async fn retire(mut self) -> anyhow::Result<()> {
+        if let Some(child) = self.child.take() { child.retire().await.context("retiring the microVM's exact process group")?; }
+        Ok(())
     }
 }
 
@@ -405,7 +449,9 @@ fn make_kiln_disk(m: &Machine, cache: &Path) -> anyhow::Result<PathBuf> {
 /// What a dynamically linked `exe` loads, as `ldd` says: where it's looked for, and the file
 /// that is (the loader is asked for by the path the binary names). Nothing for a static build.
 fn libraries(exe: &Path) -> Vec<(PathBuf, PathBuf)> {
-    let Ok(o) = Command::new("ldd").arg(exe).stdin(Stdio::null()).output() else { return Vec::new() };
+    let mut command = Command::new("ldd");
+    command.arg(exe).stdin(Stdio::null());
+    let Ok(o) = super::processes::output_blocking(command) else { return Vec::new() };
     let text = String::from_utf8_lossy(&o.stdout);
     if !o.status.success() || text.contains("not a dynamic executable") || text.contains("statically linked") {
         return Vec::new();
@@ -468,32 +514,30 @@ pub async fn run(leg: Leg, ca: Option<Vec<u8>>) -> JobResult {
 
 async fn drive(leg: &Leg, ca: Option<Vec<u8>>) -> anyhow::Result<JobResult> {
     let a = &leg.a;
+    let parent = a.parent_binding.as_ref().context("U03: the guest assignment has no existing executor ownership")?;
+    super::processes::ParentExecution::verified(parent.clone(), &a.job_id, a.attempt)?;
     let image = a.executor.image.clone().filter(|i| !i.trim().is_empty()).unwrap_or_else(|| crate::pipeline::toolchain_image(None).to_owned());
     // Its pool's microVM, booted before it came (W13-R09), when that's of its image.
     let warm = a.executor.slot.as_deref().and_then(|s| WARM.lock().remove(s));
     let warm = match warm {
         Some(b) if b.image == image => Some(b),
         Some(b) => {
-            crate::rt::spawn(b.discard());
-            None
+            b.discard().await;
+            anyhow::bail!("U03: the reserved microVM image differs from the assignment; request a new executor")
         }
         None => None,
     };
-    let booted = match warm {
-        Some(b) => b,
-        None => {
-            let m = crate::rt::blocking(Machine::find)
-                .await?
-                .context("this runner can't run microVMs now: they need KVM, Firecracker, its guest kernel and e2fsprogs (`kiln runner setup firecracker`)")?;
-            let key = crate::util::sha256_hex(a.job_id.as_bytes()).get(..12).unwrap_or("leg").to_owned();
-            boot_for(&m, &leg.work_dir.join("_firecracker"), &key, &image, &super::rootfs::Pull::of(a)).await?
-        }
-    };
+    let booted = warm.context("U01: the exact shaped microVM is unavailable; request a new executor after verified stop instead of booting a replacement under its grant")?;
+    booted.shape.validate().map_err(anyhow::Error::msg)?;
     run_in(booted, leg, ca).await
 }
 
 /// A microVM booted for a leg, its guest dialled in and ready for one.
 pub struct Booted {
+    /// U03: the exact physical execution that booted this VMM, including warm pool startup.
+    execution: Arc<super::processes::Execution>,
+    grant: Option<(String, String)>,
+    shape: FirecrackerShape,
     vm: Vm,
     socks: Socks,
     dir: PathBuf,
@@ -513,33 +557,37 @@ pub struct Booted {
 impl Booted {
     /// Let go without a leg: its guest hung up on, its VMM stopped, its disks and sockets gone.
     async fn discard(self) {
-        let Booted { vm, socks, dir, conn, stop, .. } = self;
+        let Booted { vm, socks, dir, conn, stop, execution, .. } = self;
         stop.store(true, Ordering::Relaxed);
         drop(conn);
-        let _ = crate::rt::blocking(move || drop(vm)).await;
+        let _ = vm.retire().await;
+        execution.stop().await;
         drop(socks);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
 /// A microVM of `image`, booted and ready for a leg, as `key` (its directories' name).
-async fn boot_for(m: &Machine, cache: &Path, key: &str, image: &str, pull: &super::rootfs::Pull) -> anyhow::Result<Booted> {
+async fn boot_for(m: &Machine, cache: &Path, key: &str, image: &str, pull: &super::rootfs::Pull, shape: &FirecrackerShape) -> anyhow::Result<Booted> {
+    shape.validate().map_err(anyhow::Error::msg)?;
     let kiln = kiln_disk(m, cache).await.context("kiln's disk for the microVM")?;
-    let root = super::rootfs::prepare(m, cache, &kiln, image, pull).await.with_context(|| format!("the image {image}"))?;
-    boot_from(m, cache, key, &kiln, root, image).await
+    let root = super::rootfs::prepare(m, cache, &kiln, image, pull, shape.guest()).await.with_context(|| format!("the image {image}"))?;
+    boot_from(m, cache, key, &kiln, root, image, shape).await
 }
 
 /// [`boot_for`] with kiln's disk and the image's root file system made: its scratch disk, its
 /// ways out, its boot, and its guest's word that it's ready.
-async fn boot_from(m: &Machine, cache: &Path, key: &str, kiln: &Path, root: super::rootfs::Rootfs, image: &str) -> anyhow::Result<Booted> {
+async fn boot_from(m: &Machine, cache: &Path, key: &str, kiln: &Path, root: super::rootfs::Rootfs, image: &str, shape: &FirecrackerShape) -> anyhow::Result<Booted> {
+    shape.validate().map_err(anyhow::Error::msg)?;
+    let execution = super::processes::current().context("U03: booting a guest requires its existing physical executor ownership")?;
     let dir = cache.join("vms").join(key);
     let socks = Socks::new(key)?;
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
     let scratch = dir.join("scratch.ext4");
     {
-        let (m, scratch) = (m.clone(), scratch.clone());
-        crate::rt::blocking(move || mkfs(&m, &scratch, SCRATCH, "scratch", None)).await??;
+        let (m, scratch, bytes) = (m.clone(), scratch.clone(), shape.scratch_bytes());
+        crate::rt::blocking(move || mkfs(&m, &scratch, bytes, "scratch", None)).await??;
     }
     // Its ways out, pointed where they go once it has a leg.
     let stop = Arc::new(AtomicBool::new(false));
@@ -553,8 +601,7 @@ async fn boot_from(m: &Machine, cache: &Path, key: &str, kiln: &Path, root: supe
         &socks,
         &[Drive { id: "kiln", path: kiln, read_only: true }, Drive { id: "image", path: &root.path, read_only: true }, Drive { id: "scratch", path: &scratch, read_only: false }],
         "init",
-        pool_vcpus(),
-        POOL_MEMORY_MIB,
+        shape.guest(),
     )?;
     let (vm, conn) = crate::rt::blocking(move || {
         let mut vm = vm;
@@ -562,36 +609,19 @@ async fn boot_from(m: &Machine, cache: &Path, key: &str, kiln: &Path, root: supe
         (vm, conn)
     })
     .await?;
-    Ok(Booted { vm, socks, dir, conn: conn?, stop, proxy_to, server_to, image: image.to_owned(), env: root.env, restored: false })
+    let conn = match conn {
+        Ok(conn) => conn,
+        Err(error) => { vm.retire().await?; return Err(error); }
+    };
+    Ok(Booted { execution, grant: None, shape: shape.clone(), vm, socks, dir, conn, stop, proxy_to, server_to, image: image.to_owned(), env: root.env, restored: false })
 }
 
 /// W13-AC05: how soon a leg's microVM is ready here, cold (booted) and warm (restored from its
 /// image's snapshot, where VMMs are jailed): `runs` of each, each timed from its start to its
 /// guest's word that it's ready, kiln's disk, the image and its template made beforehand.
 pub async fn start_times(cache: &Path, image: &str, runs: usize) -> anyhow::Result<(Vec<f64>, Vec<f64>)> {
-    let m = crate::rt::blocking(Machine::find).await?.context("this machine runs no microVMs: KVM, Firecracker, its guest kernel and e2fsprogs")?;
-    let pull = super::rootfs::Pull::default();
-    let kiln = kiln_disk(&m, cache).await?;
-    let root = super::rootfs::prepare(&m, cache, &kiln, image, &pull).await?;
-    let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.0;
-    let mut cold = Vec::new();
-    for i in 0..runs {
-        let t = Instant::now();
-        let b = boot_from(&m, cache, &format!("bench-cold-{i}"), &kiln, root.clone(), image).await?;
-        cold.push(ms(t));
-        b.discard().await;
-    }
-    let mut warm = Vec::new();
-    if m.jail {
-        let made = template(&m, cache, image, &pull).await?;
-        for i in 0..runs {
-            let t = Instant::now();
-            let b = restore_from(&m, cache, &format!("bench-warm-{i}"), made.clone(), image).await?;
-            warm.push(ms(t));
-            b.discard().await;
-        }
-    }
-    Ok((cold, warm))
+    let _ = (cache, image, runs);
+    anyhow::bail!("U01: this benchmark has no per-run immutable Firecracker grant shapes; measure cold/restored startup through a declared CI pool instead of deriving authority from host CPU defaults")
 }
 
 /// What a guest dialling in says first, within `within`: ready, else why not.
@@ -616,90 +646,164 @@ struct Template {
     kiln: PathBuf,
     root: PathBuf,
     env: Vec<(String, String)>,
+    recipe: TemplateRecipe,
 }
 
-/// The size of a pool's microVMs, booted or restored.
-fn pool_vcpus() -> u32 {
-    u32::try_from(std::thread::available_parallelism().map_or(2, |n| n.get()).clamp(1, 4)).unwrap_or(2)
+/// U01: checked, shape-complete snapshot recipe. Immutable content publication/leases are U07.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InputStamp {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    bytes: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
 }
-const POOL_MEMORY_MIB: u64 = 2048;
 
-/// `image`'s template here: kept by all a snapshot depends on (kiln's disk, the image, the guest
-/// kernel, Firecracker's version, the microVM's size), made when there's none; one image's older
-/// ones go.
-async fn template(m: &Machine, cache: &Path, image: &str, pull: &super::rootfs::Pull) -> anyhow::Result<Template> {
+impl InputStamp {
+    fn of(path: &Path) -> anyhow::Result<Self> {
+        use std::os::unix::fs::MetadataExt as _;
+        let file = std::fs::File::open(path)?;
+        let metadata = file.metadata()?;
+        anyhow::ensure!(metadata.is_file(), "U01: Firecracker template input is not a regular file");
+        Ok(Self { path: path.to_path_buf(), device: metadata.dev(), inode: metadata.ino(), bytes: metadata.len(), modified: (metadata.mtime(), metadata.mtime_nsec()), changed: (metadata.ctime(), metadata.ctime_nsec()) })
+    }
+}
+
+/// Input stamps detect observed replacement/mutation; they are not a content-integrity lease.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TemplateRecipe {
+    version: u8,
+    image: String,
+    kiln: InputStamp,
+    kernel: InputStamp,
+    vmm: InputStamp,
+    vmm_version: String,
+    shape: FirecrackerShape,
+}
+
+impl TemplateRecipe {
+    fn key(&self) -> anyhow::Result<String> { Ok(crate::util::sha256_hex(&serde_json::to_vec(self)?)) }
+
+    fn check(&self, dir: &Path) -> anyhow::Result<()> {
+        self.shape.validate().map_err(anyhow::Error::msg)?;
+        let mut bytes = Vec::new();
+        std::fs::File::open(dir.join("recipe.json"))?.take((64 << 10) + 1).read_to_end(&mut bytes)?;
+        anyhow::ensure!(bytes.len() <= 64 << 10, "U01: template manifest exceeds 64 KiB");
+        let manifest: Self = serde_json::from_slice(&bytes).context("U01: template has no checked shape manifest")?;
+        anyhow::ensure!(&manifest == self, "U01: template recipe differs from its exact image/build/guest shape");
+        anyhow::ensure!(std::fs::metadata(dir.join("scratch.ext4"))?.len() == self.shape.scratch_bytes(), "U01: template scratch differs from its persisted shape");
+        anyhow::ensure!(std::fs::metadata(dir.join("memory"))?.len() == self.shape.guest_resources().mem, "U01: template memory differs from its persisted guest shape");
+        anyhow::ensure!(std::fs::metadata(dir.join("vmstate"))?.len() > 0, "U01: template has no VM state");
+        Ok(())
+    }
+}
+
+/// A snapshot recipe includes the actual guest shape and its outer/overhead relationship.
+/// Shared cache residency/publication peak enforcement remains the existing U07 follow-up.
+async fn template(m: &Machine, cache: &Path, image: &str, pull: &super::rootfs::Pull, shape: &FirecrackerShape) -> anyhow::Result<Template> {
+    shape.validate().map_err(anyhow::Error::msg)?;
     let kiln = kiln_disk(m, cache).await.context("kiln's disk for the microVM")?;
-    let root = super::rootfs::prepare(m, cache, &kiln, image, pull).await.with_context(|| format!("the image {image}"))?;
-    let version = {
-        let m = m.clone();
-        crate::rt::blocking(move || m.version()).await?.unwrap_or_default()
-    };
+    let root = super::rootfs::prepare(m, cache, &kiln, image, pull, shape.guest()).await.with_context(|| format!("the image {image}"))?;
+    let (k, machine) = (kiln.clone(), m.clone());
+    let (kiln_stamp, kernel_stamp, vmm_stamp, version) = crate::rt::blocking(move || -> anyhow::Result<_> {
+        Ok((InputStamp::of(&k)?, InputStamp::of(&machine.kernel)?, InputStamp::of(&machine.firecracker)?, machine.version().context("U01: Firecracker version unavailable; warm reuse requires a known build")?))
+    }).await??;
+    let recipe = TemplateRecipe { version: 1, image: root.digest.clone(), kiln: kiln_stamp, kernel: kernel_stamp, vmm: vmm_stamp, vmm_version: version, shape: shape.clone() };
     let image_dir = cache.join("snapshots").join(root.digest.trim_start_matches("sha256:").get(..16).unwrap_or("image"));
-    let key = crate::util::sha256_hex(format!("{}|{}|{}|{version}|{}|{POOL_MEMORY_MIB}", kiln.display(), root.digest, m.kernel.display(), pool_vcpus()).as_bytes());
-    let dir = image_dir.join(key.get(..16).unwrap_or("template"));
-    let t = Template { dir: dir.clone(), kiln, root: root.path.clone(), env: root.env.clone() };
+    let dir = image_dir.join(recipe.key()?);
+    let t = Template { dir: dir.clone(), kiln, root: root.path.clone(), env: root.env.clone(), recipe };
     let _one = super::rootfs::lock(&format!("snapshot-{}", dir.display())).await;
     if dir.join("done").is_file() {
+        let (recipe, path) = (t.recipe.clone(), dir.clone());
+        crate::rt::blocking(move || recipe.check(&path)).await??;
         return Ok(t);
     }
-    let (m, kiln, root) = (m.clone(), t.kiln.clone(), t.root.clone());
-    crate::rt::blocking(move || make_template(&m, &image_dir, &dir, &kiln, &root)).await??;
+    let execution = super::processes::current();
+    let made = async {
+        let (m, kiln, root, recipe) = (m.clone(), t.kiln.clone(), t.root.clone(), t.recipe.clone());
+        let (vm, socks, outcome) = crate::rt::blocking(move || make_template(&m, &dir, &kiln, &root, &recipe)).await??;
+        vm.retire().await?;
+        drop(socks);
+        outcome?;
+        let (dir, recipe) = (t.dir.clone(), t.recipe.clone());
+        crate::rt::blocking(move || publish_template(&dir, &recipe)).await?
+    }.await;
+    if made.is_err() && let Some(execution) = execution {
+        // Even a factory error after spawn must drain before the caller can retry startup.
+        execution.stop().await;
+    }
+    made?;
     Ok(t)
 }
 
-/// The template made in `dir`, the others of its image (`image_dir`) gone: booted with its API and
-/// nothing listening for its guest, which waits for the host; paused there and snapshotted.
-fn make_template(m: &Machine, image_dir: &Path, dir: &Path, kiln: &Path, root: &Path) -> anyhow::Result<()> {
-    if let Ok(entries) = std::fs::read_dir(image_dir) {
-        for e in entries.flatten().filter(|e| e.path() != dir) {
-            let _ = std::fs::remove_dir_all(e.path());
-        }
-    }
+/// Other shapes can still be leased by a live VM; their eviction belongs to the shared U07
+/// physical owner, never an incidental sibling-directory sweep during this build.
+fn make_template(m: &Machine, dir: &Path, kiln: &Path, root: &Path, recipe: &TemplateRecipe) -> anyhow::Result<(Vm, Socks, anyhow::Result<()>)> {
+    recipe.shape.validate().map_err(anyhow::Error::msg)?;
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir)?;
     let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let socks = Socks::new(&format!("t{}", name.get(..11).unwrap_or(&name)))?;
     let scratch = dir.join("scratch.ext4");
-    mkfs(m, &scratch, SCRATCH, "scratch", None)?;
+    mkfs(m, &scratch, recipe.shape.scratch_bytes(), "scratch", None)?;
     let drives = [Drive { id: "kiln", path: kiln, read_only: true }, Drive { id: "image", path: root, read_only: true }, Drive { id: "scratch", path: &scratch, read_only: false }];
-    let mut vm = vmm(m, dir, &socks, &drives, Run::Boot { mode: "init", vcpus: pool_vcpus(), memory_mib: POOL_MEMORY_MIB, api: true, snapshot_to: Some(dir) })?;
-    // Up once its guest says it waits.
-    let deadline = Instant::now() + BOOT;
-    while !std::fs::read_to_string(&vm.console).is_ok_and(|c| c.contains(guest::WAITING)) {
-        if let Some(status) = vm.ended() {
-            anyhow::bail!("the template's microVM ended ({status}) before its guest was up:\n{}", tail(&vm.console));
+    let mut vm = vmm(m, dir, &socks, &drives, Run::Boot { mode: "init", shape: recipe.shape.guest(), api: true, snapshot_to: Some(dir) })?;
+    let outcome = (|| {
+        // Up once its guest says it waits.
+        let deadline = Instant::now() + BOOT;
+        while !std::fs::read_to_string(&vm.console).is_ok_and(|c| c.contains(guest::WAITING)) {
+            if let Some(status) = vm.ended() {
+                anyhow::bail!("the template's microVM ended ({status}) before its guest was up:\n{}", tail(&vm.console));
+            }
+            anyhow::ensure!(Instant::now() < deadline, "the template's guest wasn't up within {BOOT:?}:\n{}", tail(&vm.console));
+            std::thread::sleep(Duration::from_millis(20));
         }
-        anyhow::ensure!(Instant::now() < deadline, "the template's guest wasn't up within {BOOT:?}:\n{}", tail(&vm.console));
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    api(&socks.api(), "PATCH", "/vm", &serde_json::json!({ "state": "Paused" }), BOOT)?;
-    api(&socks.api(), "PUT", "/snapshot/create", &serde_json::json!({ "snapshot_type": "Full", "snapshot_path": "/snap/vmstate", "mem_file_path": "/snap/memory" }), SHUTDOWN)?;
-    drop(vm);
+        verify_guest(&socks.api(), recipe.shape.guest())?;
+        api(&socks.api(), "PATCH", "/vm", &serde_json::json!({ "state": "Paused" }), BOOT)?;
+        api(&socks.api(), "PUT", "/snapshot/create", &serde_json::json!({ "snapshot_type": "Full", "snapshot_path": "/snap/vmstate", "mem_file_path": "/snap/memory" }), SHUTDOWN)
+    })();
+    Ok((vm, socks, outcome))
+}
+
+/// Publish only after the template VMM's whole physical group has retired.
+fn publish_template(dir: &Path, recipe: &TemplateRecipe) -> anyhow::Result<()> {
     for f in ["vm.json", "jail.json", "console.log"] {
         let _ = std::fs::remove_file(dir.join(f));
     }
     let _ = std::fs::remove_dir_all(dir.join("jail"));
+    std::fs::write(dir.join("recipe.json"), serde_json::to_vec(recipe)?)?;
+    recipe.check(dir)?;
     std::fs::write(dir.join("done"), b"")?;
     Ok(())
 }
 
 /// A pool's microVM restored from its image's template (W13-R09), as `key`: in a jail of its own,
 /// its scratch disk a copy of the template's, its guest dialling in as it runs again.
-async fn restore_for(m: &Machine, cache: &Path, key: &str, image: &str, pull: &super::rootfs::Pull) -> anyhow::Result<Booted> {
-    let t = template(m, cache, image, pull).await?;
-    restore_from(m, cache, key, t, image).await
+async fn restore_for(m: &Machine, cache: &Path, key: &str, image: &str, pull: &super::rootfs::Pull, shape: &FirecrackerShape) -> anyhow::Result<Booted> {
+    let t = template(m, cache, image, pull, shape).await?;
+    restore_from(m, cache, key, t, image, shape).await
 }
 
 /// [`restore_for`] with the template made: its scratch disk copied, its ways out, the restore, and
 /// its guest's word that it's ready.
-async fn restore_from(m: &Machine, cache: &Path, key: &str, t: Template, image: &str) -> anyhow::Result<Booted> {
+async fn restore_from(m: &Machine, cache: &Path, key: &str, t: Template, image: &str, shape: &FirecrackerShape) -> anyhow::Result<Booted> {
+    shape.validate().map_err(anyhow::Error::msg)?;
+    anyhow::ensure!(&t.recipe.shape == shape, "U01: restore changed its original guest shape");
+    let (recipe, path) = (t.recipe.clone(), t.dir.clone());
+    crate::rt::blocking(move || recipe.check(&path)).await??;
+    let execution = super::processes::current().context("U03: restoring a guest requires its existing physical executor ownership")?;
     let dir = cache.join("vms").join(key);
     let socks = Socks::new(key)?;
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
     let scratch = dir.join("scratch.ext4");
     // A copy of the template's: shared blocks where the file system can, holes kept.
-    let copied = Command::new("cp").arg("--reflink=auto").arg(t.dir.join("scratch.ext4")).arg(&scratch).stdin(Stdio::null()).output().context("copying the template's scratch disk")?;
+    let mut command = Command::new("cp");
+    command.arg("--reflink=auto").arg(t.dir.join("scratch.ext4")).arg(&scratch).stdin(Stdio::null());
+    let copied = super::processes::output_blocking(command).context("copying the template's scratch disk")?;
     anyhow::ensure!(copied.status.success(), "copying the template's scratch disk: {}", String::from_utf8_lossy(&copied.stderr).trim());
     let stop = Arc::new(AtomicBool::new(false));
     let (proxy_to, server_to) = (Arc::new(AtomicU16::new(0)), Arc::new(AtomicU16::new(0)));
@@ -709,27 +813,48 @@ async fn restore_from(m: &Machine, cache: &Path, key: &str, t: Template, image: 
     let drives = [Drive { id: "kiln", path: &t.kiln, read_only: true }, Drive { id: "image", path: &t.root, read_only: true }, Drive { id: "scratch", path: &scratch, read_only: false }];
     let vm = vmm(m, &dir, &socks, &drives, Run::Restore { from: &t.dir })?;
     let sock = socks.api();
+    let guest_shape = shape.guest();
     let (vm, conn) = crate::rt::blocking(move || {
         let mut vm = vm;
         let conn = api(
             &sock,
             "PUT",
             "/snapshot/load",
-            &serde_json::json!({ "snapshot_path": "/snap/vmstate", "mem_backend": { "backend_type": "File", "backend_path": "/snap/memory" }, "resume_vm": true }),
+            &serde_json::json!({ "snapshot_path": "/snap/vmstate", "mem_backend": { "backend_type": "File", "backend_path": "/snap/memory" }, "resume_vm": false }),
             BOOT,
         )
         .with_context(|| format!("restoring the snapshot:\n{}", tail(&vm.console)))
+        .and_then(|()| verify_guest(&sock, guest_shape))
+        .and_then(|()| api(&sock, "PATCH", "/vm", &serde_json::json!({ "state": "Resumed" }), BOOT))
         .and_then(|()| ready(&mut vm, &control, BOOT));
         (vm, conn)
     })
     .await?;
-    Ok(Booted { vm, socks, dir, conn: conn?, stop, proxy_to, server_to, image: image.to_owned(), env: t.env, restored: true })
+    let conn = match conn {
+        Ok(conn) => conn,
+        Err(error) => { vm.retire().await?; return Err(error); }
+    };
+    Ok(Booted { execution, grant: None, shape: shape.clone(), vm, socks, dir, conn, stop, proxy_to, server_to, image: image.to_owned(), env: t.env, restored: true })
 }
 
 /// A leg run in a microVM booted for it.
 async fn run_in(b: Booted, leg: &Leg, ca: Option<Vec<u8>>) -> anyhow::Result<JobResult> {
+    let execution = Arc::clone(&b.execution);
+    let result = run_owned_in(b, leg, ca).await;
+    // U03: this includes setup/transport errors, not only a guest's successful Done frame.
+    execution.stop().await;
+    result
+}
+
+async fn run_owned_in(b: Booted, leg: &Leg, ca: Option<Vec<u8>>) -> anyhow::Result<JobResult> {
     let a = &leg.a;
-    let Booted { vm, socks, dir, conn, stop, proxy_to, server_to, env, .. } = b;
+    let parent = a.parent_binding.clone().context("U03: the guest assignment has no existing executor ownership")?;
+    super::processes::ParentExecution::verified(parent.clone(), &a.job_id, a.attempt)?;
+    anyhow::ensure!(parent.physical_execution == b.execution.identity(), "U03: the assignment does not own this VMM's physical execution");
+    anyhow::ensure!(a.executor.slot.as_ref().is_none_or(|slot| slot == &parent.executor), "U03: the assignment does not own this pool executor");
+    let (execution, binding) = (Arc::clone(&b.execution), parent.clone());
+    crate::rt::blocking(move || execution.bind_parent(binding)).await??;
+    let Booted { execution, vm, socks, dir, conn, stop, proxy_to, server_to, env, .. } = b;
     // Its ways out: the leg's egress proxy here (W18-R08), and the server's own port when it's on
     // this machine's loopback.
     let allow = a.network.as_ref().map(|n| n.allow.clone()).unwrap_or_else(|| vec!["*".to_owned()]);
@@ -760,7 +885,7 @@ async fn run_in(b: Booted, leg: &Leg, ca: Option<Vec<u8>>) -> anyhow::Result<Job
     let now_ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
     let entropy = format!("{}{}", crate::util::random_token(), crate::util::random_token()).into_bytes();
     let start = guest::LegStart { assignment: serde_json::to_string(a)?, runner_name: leg.runner_name.clone(), cache_max: leg.cache_max, env, ca, server_port, now_ns, entropy };
-    to_tx.send(ToGuest::Leg(Box::new(start))).await.map_err(|_| anyhow::anyhow!("the microVM's guest hung up"))?;
+    to_tx.send(ToGuest::OwnedLeg { start: Box::new(start), parent }).await.map_err(|_| anyhow::anyhow!("the microVM's guest hung up"))?;
     // A cancel goes in; so does what the egress proxy refuses, as it does.
     let done = crate::rt::Shutdown::new();
     {
@@ -798,12 +923,14 @@ async fn run_in(b: Booted, leg: &Leg, ca: Option<Vec<u8>>) -> anyhow::Result<Job
         None
     })
     .await;
-    let end = End { job: a.job_id.clone(), up: leg.up.clone(), vm, socks, stop, dir, done };
+    let end = End { execution, job: a.job_id.clone(), up: leg.up.clone(), vm, socks, stop, dir, done };
     match relayed {
         Ok(Some(r)) => {
             // A kept leg (W17-R02) keeps its microVM, with its terminals and its reruns: what it
             // says still goes up until it lets go, and the microVM ends then.
-            crate::rt::spawn(async move {
+            // U03: Done is provisional. Keep this canonical attempt active until the guest
+            // releases its workspace and the parent proves the whole VMM domain stopped.
+            {
                 let _ = crate::rt::timeout(KEPT, async {
                     while let Ok(f) = from_rx.recv().await {
                         if matches!(f, FromGuest::Bye) {
@@ -814,7 +941,7 @@ async fn run_in(b: Booted, leg: &Leg, ca: Option<Vec<u8>>) -> anyhow::Result<Job
                 })
                 .await;
                 end.finish().await;
-            });
+            }
             Ok(r)
         }
         Ok(None) => {
@@ -832,14 +959,27 @@ async fn run_in(b: Booted, leg: &Leg, ca: Option<Vec<u8>>) -> anyhow::Result<Job
 async fn say(up: &crate::exec::Uplink, f: FromGuest) {
     use crate::exec::Up;
     match f {
-        FromGuest::Msg(m) => up.msg(m).await,
+        FromGuest::Msg(m) => {
+            if provisional_message(&m) { up.msg(m).await; }
+        }
         FromGuest::Log(c) => {
             let _ = up.0.send(Up::Log(c)).await;
         }
         FromGuest::Term(m) => {
-            let _ = up.0.send(Up::Term(m)).await;
+            if matches!(m, crate::proto::AgentMsg::TermOutput { .. } | crate::proto::AgentMsg::TermReplay { .. } | crate::proto::AgentMsg::TermExit { .. }) {
+                let _ = up.0.send(Up::Term(m)).await;
+            }
         }
         FromGuest::Ready | FromGuest::Done(_) | FromGuest::Built(_) | FromGuest::Bye | FromGuest::Health { .. } | FromGuest::Output(_) | FromGuest::Exited { .. } => {}
+    }
+}
+
+fn provisional_message(message: &crate::proto::AgentMsg) -> bool {
+    match message {
+        crate::proto::AgentMsg::JobSample { .. } => true,
+        crate::proto::AgentMsg::JobEvent { json, .. } => matches!(serde_json::from_str::<kiln_ci::wire::JobEventV2>(json), Ok(event) if !matches!(event, kiln_ci::wire::JobEventV2::KeptOwned { .. } | kiln_ci::wire::JobEventV2::KeptReleased { .. })),
+        // U03: nested JobFinished/Executor messages can never bypass the outer domain proof.
+        _ => false,
     }
 }
 
@@ -848,6 +988,7 @@ const KEPT: Duration = Duration::from_secs((super::kept::MAX_KEEP_MINUTES as u64
 
 /// A leg's microVM and what it holds, until it's done with.
 struct End {
+    execution: Arc<super::processes::Execution>,
     job: String,
     up: crate::exec::Uplink,
     vm: Vm,
@@ -877,6 +1018,9 @@ impl End {
         let console = self.vm.console.clone();
         let vm = self.vm;
         let _ = crate::rt::blocking(move || vm.finish(SHUTDOWN)).await;
+        // A leader exit alone cannot prove its physical domain empty. The original startup
+        // execution retains its existing grant until kernel containment cleanup completes.
+        self.execution.stop().await;
         self.stop.store(true, Ordering::Relaxed);
         let said = tail(&console);
         drop(self.socks);
@@ -888,43 +1032,64 @@ impl End {
 /// A `firecracker` pool's microVMs (W13-R09), booted and waiting for a leg each, by executor.
 static WARM: std::sync::LazyLock<parking_lot::Mutex<HashMap<String, Booted>>> = std::sync::LazyLock::new(Default::default);
 
+/// U03: Running and every cancellation timer must use the VMM's original physical owner.
+/// Inspect without taking the warm VM; drive adopts that same VM after Running is installed.
+pub(crate) async fn adopted_execution(a: &kiln_ci::wire::AssignmentV2) -> anyhow::Result<Arc<super::processes::Execution>> {
+    anyhow::ensure!(a.executor.kind == "firecracker", "U03: this assignment is not a Firecracker executor");
+    let slot = a.executor.slot.as_deref().context("U03: the Firecracker assignment has no reserved executor")?;
+    let (execution, parent) = {
+        let warm = WARM.lock();
+        let b = warm.get(slot).context("U03: the reserved microVM is unavailable; no replacement may use its grant")?;
+        b.shape.validate().map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(b.execution.vm_shape()? == b.shape, "U01: warm guest changed the physical owner's original shape");
+        let image = a.executor.image.as_deref().filter(|i| !i.trim().is_empty()).unwrap_or_else(|| crate::pipeline::toolchain_image(None));
+        anyhow::ensure!(b.image == image, "U03: the reserved microVM image differs from this assignment");
+        let (generation, allocation) = b.grant.as_ref().context("U03: the microVM has no startup grant")?;
+        let parent = super::pool::assignment_binding(a, slot, generation, allocation, b.execution.identity())?;
+        (Arc::clone(&b.execution), parent)
+    };
+    crate::rt::blocking(move || { execution.bind_parent(parent)?; Ok(execution) }).await?
+}
+
 /// Starts pool executor `ask.executor`: a microVM of the pool's image, booted and waiting for its
 /// leg, which starts at once when it comes.
 pub async fn start_warm(work: &Path, ask: &super::pool::Ask) -> anyhow::Result<()> {
+    let shape = ask.firecracker_shape()?;
+    let execution = super::processes::current().context("U01: Firecracker startup has no existing physical execution")?;
+    anyhow::ensure!(&execution.vm_shape()? == shape, "U01: startup shape differs from this exact physical owner's persisted grant");
     let m = crate::rt::blocking(Machine::find).await?.context("this runner can't run microVMs now: they need KVM, Firecracker, its guest kernel and e2fsprogs")?;
     let image = ask.image.clone().filter(|i| !i.trim().is_empty()).context("the pool names no image")?;
     let pull = super::rootfs::Pull { origin: ask.registry.clone().unwrap_or_default(), token: ask.pull_token.clone().unwrap_or_default(), mirrors: Vec::new() };
     let key = format!("p{}", crate::util::sha256_hex(ask.executor.as_bytes()).get(..11).unwrap_or("ool"));
     let cache = work.join("_firecracker");
-    // Restored from its image's snapshot where it can be (W13-R09), else booted.
-    let restored = if m.jail { Some(restore_for(&m, &cache, &key, &image, &pull).await) } else { None };
-    let b = match restored {
-        Some(Ok(b)) => b,
-        Some(Err(e)) => {
-            tracing::warn!(executor = %ask.executor, error = %format!("{e:#}"), "a pool's microVM couldn't be restored from a snapshot: booting it");
-            boot_for(&m, &cache, &key, &image, &pull).await?
-        }
-        None => boot_for(&m, &cache, &key, &image, &pull).await?,
+    // A failed restore is not permission to boot another VMM under the same grant. Its existing
+    // outer owner must first prove all startup groups stopped, then request a new executor.
+    let mut b = if m.jail {
+        restore_for(&m, &cache, &key, &image, &pull, shape).await.context("the shaped snapshot startup failed; retry with a new executor after verified stop")?
+    } else {
+        boot_for(&m, &cache, &key, &image, &pull, shape).await?
     };
+    b.grant = Some((ask.generation.clone().context("U03: startup generation missing")?, ask.allocation.clone().context("U03: startup allocation missing")?));
     tracing::info!(executor = %ask.executor, pool = %ask.pool, image = %image, restored = b.restored, "pool microVM ready");
     WARM.lock().insert(ask.executor.clone(), b);
     Ok(())
 }
 
 /// A pool's microVM let go (its pool stopped it).
-pub async fn discard_warm(id: &str) {
-    let b = WARM.lock().remove(id);
+pub async fn discard_warm(ask: &super::pool::Ask) -> anyhow::Result<Option<String>> {
+    let b = {
+        let mut warm = WARM.lock();
+        if let Some(b) = warm.get(&ask.executor) {
+            anyhow::ensure!(b.grant.as_ref().is_some_and(|(generation, allocation)| ask.generation.as_ref() == Some(generation) && ask.allocation.as_ref() == Some(allocation)), "U03: stale microVM stop grant");
+        }
+        warm.remove(&ask.executor)
+    };
     if let Some(b) = b {
+        let physical = b.execution.identity().to_owned();
         b.discard().await;
+        return Ok(Some(physical));
     }
-}
-
-/// Every pool microVM here let go: the server forgot them (a new connection).
-pub async fn drain_warm() {
-    let all: Vec<Booted> = WARM.lock().drain().map(|(_, b)| b).collect();
-    for b in all {
-        b.discard().await;
-    }
+    Ok(None)
 }
 
 /// The legs running (or kept) in microVMs here, by leg: what goes in to each.
@@ -1165,7 +1330,7 @@ pub async fn deploy(cache: &Path, d: Deployment, pull: &super::rootfs::Pull, sai
     let started = async {
         let kiln = kiln_disk(&m, cache).await.context("kiln's disk for the microVM")?;
         note(format!("Its image, {}", d.image));
-        let root = super::rootfs::prepare(&m, cache, &kiln, &d.image, pull).await.with_context(|| format!("the image {}", d.image))?;
+        let root = super::rootfs::prepare(&m, cache, &kiln, &d.image, pull, GuestShape { vcpus: d.vcpus.max(1), memory_mib: d.memory_mib.max(128) }).await.with_context(|| format!("the image {}", d.image))?;
         let kept = Kept { service: service_of(&d, &root), deployment: d.clone(), root: root.path };
         anyhow::ensure!(!kept.service.argv.is_empty(), "the image has no entrypoint or command: say what runs (`command`)");
         note(format!("Booting its microVM: {}", kept.service.argv.join(" ")));
@@ -1394,8 +1559,7 @@ async fn boot_deployment(m: &Machine, cache: &Path, kiln: &Path, kept: &Kept) ->
         &socks,
         &[Drive { id: "kiln", path: kiln, read_only: true }, Drive { id: "image", path: &kept.root, read_only: true }, Drive { id: "scratch", path: &scratch, read_only: false }],
         "serve",
-        d.vcpus.max(1),
-        d.memory_mib.max(128),
+        GuestShape { vcpus: d.vcpus.max(1), memory_mib: d.memory_mib.max(128) },
     )?;
     let service = kept.service.clone();
     let (vm, conn) = crate::rt::blocking(move || {
@@ -1438,6 +1602,49 @@ async fn boot_deployment(m: &Machine, cache: &Path, kiln: &Path, kept: &Kept) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn u01_firecracker_restore_requires_its_exact_declared_shape() -> anyhow::Result<()> {
+        use kiln_ci::sched::state::Resources;
+        let outer = Resources { cpu: 3.5, mem: 512 << 20, disk: 1 << 30, gpu: 0 };
+        let overhead = Resources { cpu: 0.25, mem: 128 << 20, disk: 64 << 20, gpu: 0 };
+        let shape = FirecrackerShape::derive(outer, overhead).map_err(anyhow::Error::msg)?;
+        let dir = tempfile::tempdir()?;
+        let input = dir.path().join("input");
+        std::fs::write(&input, b"build identity fixture")?;
+        let stamp = InputStamp::of(&input)?;
+        let recipe = TemplateRecipe { version: 1, image: "a".repeat(64), kiln: stamp.clone(), kernel: stamp.clone(), vmm: stamp, vmm_version: "v1.17.0".into(), shape: shape.clone() };
+        std::fs::write(dir.path().join("recipe.json"), serde_json::to_vec(&recipe)?)?;
+        std::fs::File::create(dir.path().join("scratch.ext4"))?.set_len(shape.scratch_bytes())?;
+        std::fs::File::create(dir.path().join("memory"))?.set_len(shape.guest_resources().mem)?;
+        std::fs::write(dir.path().join("vmstate"), b"native state fixture")?;
+        recipe.check(dir.path())?;
+        check_guest(&serde_json::json!({"vcpu_count": 3, "mem_size_mib": 384}), shape.guest())?;
+        for actual in [serde_json::json!({"vcpu_count": 4, "mem_size_mib": 384}), serde_json::json!({"vcpu_count": 3, "mem_size_mib": 512}), serde_json::json!({})] {
+            assert!(check_guest(&actual, shape.guest()).is_err(), "native snapshot configuration must agree before resume");
+        }
+        for changed in [Resources { cpu: 4.5, ..outer }, Resources { mem: 1 << 30, ..outer }, Resources { disk: 2 << 30, ..outer }] {
+            let changed = TemplateRecipe { shape: FirecrackerShape::derive(changed, overhead).map_err(anyhow::Error::msg)?, ..recipe.clone() };
+            assert_ne!(recipe.key()?, changed.key()?, "CPU/memory/scratch shapes cannot share a template recipe");
+            assert!(changed.check(dir.path()).is_err(), "a previous snapshot is not evidence for a new grant shape");
+        }
+        std::fs::File::options().write(true).open(dir.path().join("scratch.ext4"))?.set_len(shape.scratch_bytes() - 4096)?;
+        assert!(recipe.check(dir.path()).is_err(), "changed scratch extent refuses restore");
+        Ok(())
+    }
+
+    #[test]
+    fn u03_guest_messages_cannot_publish_parent_completion_or_release() -> anyhow::Result<()> {
+        use crate::proto::AgentMsg;
+        let result = JobResult { job: "job-one".into(), status: Status::Succeeded, exit_code: Some(0), error: None, peak_rss: None, cpu_seconds: None };
+        assert!(!provisional_message(&AgentMsg::JobFinished(result.clone())));
+        assert!(!provisional_message(&AgentMsg::JobFinishedV2 { result, attempt: 1 }));
+        assert!(!provisional_message(&AgentMsg::Executor { json: "{}".into() }));
+        let release = kiln_ci::wire::JobEventV2::KeptReleased { execution: "parent".into(), attempt: 1 };
+        assert!(!provisional_message(&AgentMsg::JobEvent { job: "job-one".into(), json: serde_json::to_string(&release)? }));
+        assert!(provisional_message(&AgentMsg::JobSample { job: "job-one".into(), rss: 1, cpu_seconds: 0.0 }));
+        Ok(())
+    }
 
     /// The server's loopback port is forwarded into the guest; a server elsewhere is reached
     /// through the egress proxy.

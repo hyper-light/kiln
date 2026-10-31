@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use http::{Method, StatusCode};
 use kiln_ci::store::cache::{self, Entry};
-use rusqlite::{OptionalExtension, params};
+use crate::sql::{OptionalExtension, params};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest as _, Sha256};

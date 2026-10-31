@@ -3,11 +3,14 @@
 //! coordinator reads its slots and each track's turn from, and assigns its tracks' workers with.
 //! Only a person changes the slots and weights.
 
-use http::{Method, StatusCode};
+use crate::authz::At as ScopeAt;
+use http::StatusCode;
 use serde_json::{Value, json};
 
 use super::{Notice, SLOTS, SLOTS_MAX, WEIGHT, WEIGHT_MAX};
-use crate::ops::{Cx, Fail, Input, Op, Out, path, text};
+use crate::ops::{Cx, Fail, Input, Op, Out, text, Definition, Part, Routes};
+
+
 
 fn json_of<T: serde::Serialize>(v: &T) -> Out {
     serde_json::to_value(v).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
@@ -221,7 +224,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: true,
             destructive: false,
             input: Input::of::<input::ProgramsList>(),
-            route: |_| Ok((Method::GET, path(&["api", "programs"]))),
+            route: Routes(vec![Definition::new("GET", &[Part::Literal("api"), Part::Literal("programs")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(list(cx, v)),
         },
         Op {
@@ -230,7 +233,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: true,
             destructive: false,
             input: Input::of::<input::ProgramsGet>(),
-            route: |v| Ok((Method::GET, path(&["api", "programs", &text(v, "program")?]))),
+            route: Routes(vec![Definition::new("GET", &[Part::Literal("api"), Part::Literal("programs"), Part::Field("program")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(get(cx, v)),
         },
         Op {
@@ -239,7 +242,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: false,
             input: Input::of::<input::ProgramsSet>(),
-            route: |v| Ok((Method::PUT, path(&["api", "programs", &text(v, "program")?, "settings"]))),
+            route: Routes(vec![Definition::new("PUT", &[Part::Literal("api"), Part::Literal("programs"), Part::Field("program"), Part::Literal("settings")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(set(cx, v)),
         },
         Op {
@@ -248,7 +251,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: false,
             input: Input::of::<input::ProgramsAssign>(),
-            route: |v| Ok((Method::PUT, path(&["api", "programs", &text(v, "program")?, "tracks", &text(v, "track")?]))),
+            route: Routes(vec![Definition::new("PUT", &[Part::Literal("api"), Part::Literal("programs"), Part::Field("program"), Part::Literal("tracks"), Part::Field("track")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(assign(cx, v)),
         },
     ]

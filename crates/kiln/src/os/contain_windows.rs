@@ -9,9 +9,14 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::os::windows::io::OwnedHandle;
 use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
+
+#[path = "leased_windows.rs"]
+mod leased;
+pub(crate) use leased::Child as LeasedChild;
 
 type Handle = *mut c_void;
 
@@ -113,10 +118,16 @@ impl Drop for Owned {
     }
 }
 
-/// The jobs of this runner's agents, by session: kept open while the runner runs (each ends with
-/// it), and asked whose a process is.
-fn jobs() -> &'static Mutex<HashMap<String, Arc<Owned>>> {
-    static JOBS: OnceLock<Mutex<HashMap<String, Arc<Owned>>>> = OnceLock::new();
+/// U01: job accounting can reach zero before a retained child's process handle signals.
+struct Job {
+    handle: Owned,
+    key: String,
+    children: Mutex<Vec<Arc<OwnedHandle>>>,
+}
+
+/// Named jobs this runner owns, with leased jobs in their own key namespace.
+fn jobs() -> &'static Mutex<HashMap<String, Arc<Job>>> {
+    static JOBS: OnceLock<Mutex<HashMap<String, Arc<Job>>>> = OnceLock::new();
     JOBS.get_or_init(Default::default)
 }
 
@@ -146,7 +157,7 @@ fn name_of(session: &str) -> Option<Vec<u16>> {
 #[derive(Clone)]
 pub struct Group {
     session: String,
-    job: Arc<Owned>,
+    job: Arc<Job>,
 }
 
 impl std::fmt::Debug for Group {
@@ -175,21 +186,72 @@ impl Group {
             tracing::warn!(session, "an agent's job couldn't be set to end with the runner: its processes have no group");
             return None;
         }
-        let job = Arc::new(job);
+        let job = Arc::new(Job { handle: job, key: session.to_owned(), children: Mutex::new(Vec::new()) });
         jobs().lock().insert(session.to_owned(), Arc::clone(&job));
         Some(Group { session: session.to_owned(), job })
     }
 
     /// The job `session` has already, without making one.
     pub fn existing(session: &str) -> Option<Group> {
+        let _ = name_of(session)?;
         let job = jobs().lock().get(session).cloned()?;
         Some(Group { session: session.to_owned(), job })
+    }
+
+    /// U01: opening the deterministic named job preserves any surviving old membership.
+    pub(crate) fn recover_leased(identity: &str, id: &str) -> std::io::Result<Group> {
+        if identity != format!("windows-job-global:{id}") { return Err(std::io::Error::other("invalid leased job identity")); }
+        Self::of_leased(id)
+    }
+
+    pub(crate) fn lease_identity(&self) -> String { format!("windows-job-global:{}", self.session) }
+
+    pub(crate) fn of_leased(session: &str) -> std::io::Result<Group> {
+        let _ = name_of(session).ok_or_else(|| std::io::Error::other("invalid leased job id"))?;
+        // U01: recovery must share pending child handles. Serialize lookup and creation so
+        // replacing the owner cannot discard its process-exit publication barrier.
+        let key = format!("lease:{session}");
+        let mut held = jobs().lock();
+        if let Some(job) = held.get(&key) { return Ok(Group { session: session.to_owned(), job: Arc::clone(job) }); }
+        let name: Vec<u16> = format!("Global\\kiln-lease-{session}").encode_utf16().chain(std::iter::once(0)).collect();
+        // Global job names retain identity when the runner reconnects in another Windows
+        // session. A job is destroyed only after its handles close and its processes end.
+        let job = Owned::new(unsafe { CreateJobObjectW(std::ptr::null(), name.as_ptr()) }).ok_or_else(std::io::Error::last_os_error)?;
+        let mut limits = ExtendedLimits::default();
+        limits.basic.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let size = u32::try_from(std::mem::size_of::<ExtendedLimits>()).unwrap_or(0);
+        if unsafe { SetInformationJobObject(job.0, JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, (&raw const limits).cast(), size) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let job = Arc::new(Job { handle: job, key: key.clone(), children: Mutex::new(Vec::new()) });
+        held.insert(key, Arc::clone(&job));
+        Ok(Group { session: session.to_owned(), job })
+    }
+
+    /// U01: errors querying kernel accounting are never an empty-process proof.
+    pub(crate) fn empty_proven(&self) -> std::io::Result<bool> {
+        // Atomic creation and handle registration take this same lock, so even an immediate
+        // child exit cannot fall between kernel creation and registration in this proof.
+        let mut children = self.job.children.lock();
+        #[repr(C)]
+        #[derive(Default)]
+        struct Accounting { times: [i64; 4], faults: u32, total: u32, active: u32, terminated: u32 }
+        let mut accounting = Accounting::default();
+        let size = u32::try_from(std::mem::size_of::<Accounting>()).unwrap_or(0);
+        let mut returned = 0;
+        // SAFETY: a valid job handle and an exactly sized JOBOBJECT_BASIC_ACCOUNTING_INFORMATION.
+        if unsafe { QueryInformationJobObject(self.job.handle.0, 1, (&raw mut accounting).cast(), size, &raw mut returned) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if returned != size { return Err(std::io::Error::other("incomplete Windows job accounting")); }
+        if accounting.active != 0 { return Ok(false); }
+        leased::children_empty(&mut children)
     }
 
     /// Puts process `process` (created suspended, so it has run nothing yet) in the job.
     pub(crate) fn assign(&self, process: Handle) -> bool {
         // SAFETY: the job's handle and a process handle its creator holds.
-        unsafe { AssignProcessToJobObject(self.job.0, process) != 0 }
+        unsafe { AssignProcessToJobObject(self.job.handle.0, process) != 0 }
     }
 
     /// Every process in it now.
@@ -199,7 +261,7 @@ impl Group {
         let len = u32::try_from(buf.len() * std::mem::size_of::<usize>()).unwrap_or(0);
         let mut returned = 0u32;
         // SAFETY: the job's handle and a buffer of `len` bytes.
-        if unsafe { QueryInformationJobObject(self.job.0, JOB_OBJECT_BASIC_PROCESS_ID_LIST, buf.as_mut_ptr().cast(), len, &raw mut returned) } == 0 {
+        if unsafe { QueryInformationJobObject(self.job.handle.0, JOB_OBJECT_BASIC_PROCESS_ID_LIST, buf.as_mut_ptr().cast(), len, &raw mut returned) } == 0 {
             return Vec::new();
         }
         // The counts are two DWORDs packed into the first pointer-sized slot on 64-bit Windows.
@@ -213,29 +275,21 @@ impl Group {
     fn holds(&self, process: &Owned) -> bool {
         let mut inside = 0i32;
         // SAFETY: a process handle opened for querying, and the job's handle.
-        unsafe { IsProcessInJob(process.0, self.job.0, &raw mut inside) != 0 && inside != 0 }
+        unsafe { IsProcessInJob(process.0, self.job.handle.0, &raw mut inside) != 0 && inside != 0 }
     }
 
     /// Ends every process in it at once.
     pub fn kill(&self) {
         // SAFETY: the job's handle.
-        unsafe { TerminateJobObject(self.job.0, 1) };
+        unsafe { TerminateJobObject(self.job.handle.0, 1) };
     }
 
     /// Lets go of it: once kiln's handle closes, nothing holds it and it goes (taking what's still
     /// in it, as every job kiln makes does).
     pub fn remove(&self) {
-        jobs().lock().remove(&self.session);
+        let mut held = jobs().lock();
+        if held.get(&self.job.key).is_some_and(|job| Arc::ptr_eq(job, &self.job)) { held.remove(&self.job.key); }
     }
-
-    /// CI jobs get no group of their own here ([`job_group`]).
-    pub fn release(&self) {}
-}
-
-/// A CI job's group of processes: Linux's alone (`crate::os::contain` there), where a kiln a step
-/// starts would otherwise take the runner's own cgroup as its.
-pub fn job_group(_job: &str) -> Option<Group> {
-    None
 }
 
 /// Calls `f` on every thread of the processes `pids` (one snapshot of the system's threads), and
@@ -288,7 +342,7 @@ pub fn sessions() -> Vec<String> {
 pub fn session_of(pid: u32) -> Option<String> {
     // SAFETY: opening a process for querying only.
     let process = Owned::new(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) })?;
-    let all: Vec<(String, Arc<Owned>)> = jobs().lock().iter().map(|(s, j)| (s.clone(), Arc::clone(j))).collect();
+    let all: Vec<(String, Arc<Job>)> = jobs().lock().iter().map(|(s, j)| (s.strip_prefix("lease:").unwrap_or(s).to_owned(), Arc::clone(j))).collect();
     all.into_iter().find(|(s, job)| Group { session: s.clone(), job: Arc::clone(job) }.holds(&process)).map(|(s, _)| s)
 }
 

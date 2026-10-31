@@ -71,6 +71,8 @@ pub fn settings(id: u64, depth: usize) -> Result<Settings, hyper_raft::Error> {
     let limits = Limits::derive(Stated { message: MESSAGE_BYTES, members: MEMBERS, memory: QUEUE_MEMORY, depth })?;
     Ok(Settings {
         core: Config { election_tick: ELECTION, heartbeat_tick: BEAT, max_size_per_msg: APPEND_BYTES, check_quorum: true, pre_vote: true, seed: id, ..Config::new(id, limits) },
+        // CP-T2.2: preserve the existing flush-proved group policy.
+        disk: hyper_durable::Disk::Flushed,
         elections: Elections::Ticks,
         // Woken by events: the commit is written alone at the first moment no write is out.
         quiet: Duration::ZERO,

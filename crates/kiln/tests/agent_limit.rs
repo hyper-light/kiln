@@ -129,11 +129,16 @@ fn only_agents_at_work_count_toward_a_runners_limit_set_on_the_server_over_its_c
     let go = dir.path().join("go");
     let go_path = go.display().to_string();
     let env = [("KILN_CONFIG", config_path.as_str()), ("FAKE_CLAUDE_GO", go_path.as_str()), ("FAKE_CLAUDE_FIRST_LINES", "1")];
+    // U17: agent-limit.json is read-only legacy input. Accepted policy, including a clear,
+    // lives in the host Amphora machine namespace; a stale import must never win again.
+    let legacy = dir.path().join("box-state/agent-limit.json");
+    std::fs::create_dir_all(dir.path().join("box-state"))?;
+    let legacy_bytes = br#"{"max_sessions":2}"#;
+    std::fs::write(&legacy, legacy_bytes)?;
     let (runner, log) = agents::runner_with(dir.path(), s.port, "box", None, TALK, &env)?;
     agents::connected(s.port, &s.admin, "box", &log, Duration::from_secs(120))?;
     let work = dir.path().join("work");
     std::fs::create_dir_all(&work)?;
-    let kept = dir.path().join("box-state/agent-limit.json");
 
     // Its config's 1: one at work, and a second refused, saying how many, its limit, and the way up.
     let v = holds(s.port, &s.admin, "box", (1, "config"), &log)?;
@@ -176,13 +181,13 @@ fn only_agents_at_work_count_toward_a_runners_limit_set_on_the_server_over_its_c
     }
     working(s.port, &s.admin, "box", 3, &log)?;
     refused(s.port, &s.admin, "box", &work, &full(3, 0, 3))?;
-    assert!(std::fs::read_to_string(&kept)?.contains('3'), "kept on the machine for its restarts");
+    assert_eq!(std::fs::read(&legacy)?, legacy_bytes.to_vec(), "U17: setting policy never rewrites its legacy input");
 
     // Taken away on the server: its config's 1 holds again, those at work go on, a new one waits.
     let (st, v) = put(s.port, &s.admin, "box", &json!({"max_sessions": null}))?;
     assert_eq!((st, v.get("max_sessions")), (200, Some(&Value::Null)), "{v}");
     holds(s.port, &s.admin, "box", (1, "config"), &log)?;
-    assert!(!kept.exists(), "nothing set: nothing kept");
+    assert_eq!(std::fs::read(&legacy)?, legacy_bytes.to_vec(), "U17: clearing policy never removes its legacy input");
     working(s.port, &s.admin, "box", 3, &log)?;
     refused(s.port, &s.admin, "box", &work, &full(3, 0, 1))?;
 
@@ -233,6 +238,7 @@ fn only_agents_at_work_count_toward_a_runners_limit_set_on_the_server_over_its_c
     let held_at = after.lines().position(|l| l.contains("at most this many at work at once") && l.contains("max_sessions=3") && l.contains("Server"));
     let connected_at = after.lines().position(|l| l.contains("connected to server"));
     assert!(held_at.is_some() && held_at < connected_at, "it held 3 before it connected:\n{after}");
+    assert_eq!(std::fs::read(&legacy)?, legacy_bytes.to_vec(), "U17: restart restores Amphora's 3 over the stale legacy 2");
     agents::connected(s.port, &s.admin, "box", &log, Duration::from_secs(120))?;
     holds(s.port, &s.admin, "box", (3, "server"), &log)?;
     let deadline = Instant::now() + Duration::from_secs(90);

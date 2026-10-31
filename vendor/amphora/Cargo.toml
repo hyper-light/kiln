@@ -1,0 +1,97 @@
+[workspace]
+members = ["crates/*"]
+# vendor/ holds what Amphora vendors (vendor/MANIFEST.toml), each project a workspace of its own.
+exclude = ["vendor", "bench"]
+resolver = "3"
+
+# The engine's dependencies (crates/engine*: what Turso was, taken at 3e09a82 and Amphora's own
+# since; crates/engine/ORIGIN.md), named by its crates' `workspace = true` keys.
+[workspace.dependencies]
+amphora-engine-ext = { path = "crates/engine-ext" }
+amphora-engine-macros = { path = "crates/engine-macros" }
+amphora-engine-parser = { path = "crates/engine-parser" }
+strum = { version = "0.26", features = ["derive"] }
+strum_macros = "0.26"
+serde = "1.0"
+serde_json = "1.0"
+rand = "0.9.2"
+rand_chacha = "0.9.0"
+tracing = "0.1.41"
+parking_lot = "0.12.4"
+tracing-subscriber = "0.3.20"
+thiserror = "2.0.16"
+tempfile = "3.20.0"
+miette = "7.6.0"
+bitflags = "2.9.4"
+fallible-iterator = "0.3.0"
+allocator-api2 = "0.4"
+getrandom = "0.4.2"
+chrono = { version = "0.4.42", default-features = false }
+hex = "0.4"
+antithesis_sdk = { version = "0.3.0", default-features = false }
+env_logger = { version = "0.11.6", default-features = false }
+regex = "1.11.1"
+regex-syntax = { version = "0.8.5", default-features = false }
+asserting = "0.16"
+either = { version = "1.15" }
+windows-sys = "0.61.2"
+loom = { version = "0.7" }
+shuttle = { version = "0.8.1" }
+# Amphora: the packed log's records (crates/engine/storage/packed.rs): pure Rust, decoding memory
+# safe on damaged input.
+lz4_flex = { version = "0.13", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.99.1"
+repository = "https://github.com/hyper-light/amphora"
+publish = false
+
+# The no-panic rule and the rest of CLAUDE.md as lints. Production code is checked again by
+# scripts/check-production.sh, without the test allowances.
+[workspace.lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+panic = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+unreachable = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+string_slice = "deny"
+cast_possible_truncation = "deny"
+cast_sign_loss = "deny"
+cast_possible_wrap = "deny"
+disallowed_macros = "deny"
+disallowed_methods = "deny"
+disallowed_types = "deny"
+undocumented_unsafe_blocks = "deny"
+mem_forget = "deny"
+exit = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+# A dependency's overflow unwinds to the boundary that contains it instead of wrapping into a wrong
+# value; Amphora's own arithmetic is checked and never reaches this.
+overflow-checks = true
+# Symbols for profilers; no effect on generated code.
+debug = "line-tables-only"
+
+[profile.bench]
+inherits = "release"
+
+[patch.crates-io]
+hyper-durable = { path = "vendor/hyper-raft/crates/hyper-durable" }
+hyper-raft = { path = "vendor/hyper-raft/crates/hyper-raft" }
+hyper-log = { path = "vendor/hyper-raft/crates/hyper-log" }
+hyper-block = { path = "vendor/hyper-raft/crates/hyper-block" }

@@ -69,16 +69,41 @@ pub struct Green {
 #[derive(Debug, Clone)]
 pub struct Supervisor {
     path: PathBuf,
+    owner: Option<ActivationOwner>,
+}
+
+/// U16: a route to the existing supervisor's owned process, not release approval or retirement proof.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub(crate) struct ActivationOwner {
+    pub pid: u32,
+    pub generation: u64,
 }
 
 impl Supervisor {
     pub fn from_env() -> Option<Self> {
-        std::env::var_os(SUPERVISOR_ENV).map(|p| Self { path: PathBuf::from(p) }).filter(|s| s.path.exists())
+        std::env::var_os(SUPERVISOR_ENV).map(|p| Self { path: PathBuf::from(p), owner: None }).filter(|s| s.path.exists())
+    }
+
+    /// U16: advertise only a live explicit backend for this exact supervised process.
+    /// An old supervisor refuses this read-only request; a path's existence proves nothing.
+    pub fn for_activation() -> Result<Self> {
+        let mut supervisor = Self::from_env().context(crate::updates::UpgradeRefusal::Backend)?;
+        let generation = std::env::var("KILN_GENERATION").ok().and_then(|s| s.parse::<u64>().ok()).filter(|g| *g > 0)
+            .context(crate::updates::UpgradeRefusal::Backend)?;
+        supervisor.owner = Some(ActivationOwner { pid: std::process::id(), generation });
+        supervisor.check_activation()?;
+        Ok(supervisor)
+    }
+
+    pub fn check_activation(&self) -> Result<()> {
+        let owner = self.owner.context(crate::updates::UpgradeRefusal::Backend)?;
+        self.ask(&serde_json::json!({ "op": "activation", "owner": owner }))
+            .context(crate::updates::UpgradeRefusal::Backend).map(|_| ())
     }
 
     /// Start `exe` with `args` beside this runner (it shares nothing with it but the machine).
     pub fn start(&self, exe: &Path, args: &[String], env: &[(String, String)]) -> Result<Green> {
-        let v = self.ask(&serde_json::json!({ "op": "start", "exe": exe, "args": args, "env": env }))?;
+        let v = self.ask(&serde_json::json!({ "op": "start", "exe": exe, "args": args, "env": env, "owner": self.owner }))?;
         let pid = v.get("pid").and_then(serde_json::Value::as_u64).and_then(|p| u32::try_from(p).ok()).context("the supervisor didn't say which process it started")?;
         Ok(Green { pid })
     }
@@ -104,6 +129,7 @@ impl Supervisor {
         use std::io::{BufRead as _, Write as _};
         let mut s = std::os::unix::net::UnixStream::connect(&self.path).with_context(|| format!("reach the supervisor at {}", self.path.display()))?;
         s.set_read_timeout(Some(Duration::from_secs(30)))?;
+        s.set_write_timeout(Some(Duration::from_secs(30)))?;
         let mut line = req.to_string();
         line.push('\n');
         s.write_all(line.as_bytes())?;

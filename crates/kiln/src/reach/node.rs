@@ -10,7 +10,7 @@
 //! Doing side: a run outlives its link. Its output waits (up to [`BUFFER`], then the command waits
 //! too) until the asker's session comes back on a new link, for as long as the run's linger allows.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -156,6 +156,8 @@ pub enum In {
     Synced { key: (String, String), say: SyncSay },
     /// Whether this runner took over what another handed it.
     Adopted { key: (String, String), id: u64, error: Option<String> },
+    /// U01: server claim completed outside this actor, which must keep reading answers.
+    Admitted { key: (String, String), spec: Box<RunSpec>, lease: Result<super::leases::Lease, String> },
     Tick,
 }
 
@@ -165,7 +167,7 @@ pub enum Local {
     /// Link up to `peer` (if it is not), answering with the machine it is.
     Connect { peer: String, reply: oneshot::Sender<anyhow::Result<Host>> },
     /// Run on `peer`; what the run says goes to `says`. Answers with its id.
-    Run { peer: String, spec: Box<RunSpec>, says: Says, reply: oneshot::Sender<u64> },
+    Run { peer: String, spec: Box<RunSpec>, permit: super::leases::Permit, says: Says, reply: oneshot::Sender<u64> },
     /// Something more for a run (input, a signal, Forget).
     Ask { peer: String, ask: Ask },
     /// Follow a sync of `key` on `peer` (what it says goes to `says`), then send it `asks`.
@@ -178,7 +180,7 @@ pub enum Local {
     Garble { peer: String, bytes: Vec<u8> },
     Status { reply: oneshot::Sender<Value> },
     /// Forget a runner's pinned key (it was reinstalled).
-    Forget { runner: String, reply: oneshot::Sender<bool> },
+    Forget { runner: String, reply: oneshot::Sender<anyhow::Result<bool>> },
     /// Follow a hand-over to `peer` (what it says goes to `says`); answers with its id.
     AdoptFollow { peer: String, says: Says, reply: oneshot::Sender<u64> },
     /// A question for the server (JSON), answered with its answer (JSON).
@@ -190,11 +192,13 @@ pub enum Local {
 /// tools wait their turn.
 #[derive(Clone)]
 pub struct Handle {
+    admission: crate::runner::processes::Admission,
     net: async_channel::Sender<In>,
     tx: async_channel::Sender<In>,
     announce: Announce,
     busy: Arc<AtomicU64>,
     name: String,
+    admission_instance: String,
 }
 
 static GLOBAL: std::sync::OnceLock<Handle> = std::sync::OnceLock::new();
@@ -209,6 +213,7 @@ pub fn global() -> Option<&'static Handle> {
 }
 
 impl Handle {
+    pub(super) fn admission_paths(&self) -> &crate::runner::processes::Admission { &self.admission }
     /// The frame announcing this runner's reach identity, for every (re)connect.
     pub fn hello(&self) -> AgentMsg {
         AgentMsg::ReachHello { json: serde_json::to_string(&self.announce).unwrap_or_default() }
@@ -249,7 +254,15 @@ impl Handle {
     }
 
     pub async fn run(&self, peer: &str, spec: RunSpec, says: Says) -> anyhow::Result<u64> {
-        self.ask(|reply| Local::Run { peer: peer.to_owned(), spec: Box::new(spec), says, reply }).await
+        self.run_needs(peer, spec, says, kiln_ci::sched::needs::Needs::default()).await
+    }
+
+    pub(crate) fn admission_sender(&self) -> async_channel::Sender<In> { self.tx.clone() }
+    pub(crate) fn admission_instance(&self) -> &str { &self.admission_instance }
+
+    pub(crate) async fn run_needs(&self, peer: &str, spec: RunSpec, says: Says, needs: kiln_ci::sched::needs::Needs) -> anyhow::Result<u64> {
+        let permit = self.admission().acquire(peer, needs).await?;
+        self.ask(|reply| Local::Run { peer: peer.to_owned(), spec: Box::new(spec), permit, says, reply }).await
     }
 
     pub async fn send(&self, peer: &str, ask: Ask) -> bool {
@@ -279,7 +292,7 @@ impl Handle {
     }
 
     pub async fn forget(&self, runner: &str) -> anyhow::Result<bool> {
-        self.ask(|reply| Local::Forget { runner: runner.to_owned(), reply }).await
+        self.ask(|reply| Local::Forget { runner: runner.to_owned(), reply }).await?
     }
 
     /// Ask the kiln server `json` ([`crate::proto::AgentMsg::ReachAsk`]: an agent's MCP server
@@ -330,6 +343,10 @@ impl Handle {
     /// `digest` for `repo` from `peer`'s cache (docs/ci.md W24-R27), written to `into`, a window at
     /// a time: whether `peer` had it. What it sent is checked by its digest by the caller.
     pub async fn object(&self, peer: &str, repo: &str, digest: &str, into: &std::path::Path) -> anyhow::Result<bool> {
+        self.object_bounded(peer, repo, digest, into, None).await
+    }
+
+    pub(crate) async fn object_bounded(&self, peer: &str, repo: &str, digest: &str, into: &std::path::Path, max: Option<u64>) -> anyhow::Result<bool> {
         use std::io::Write as _;
         self.connect(peer).await?;
         let (tx, rx) = async_channel::unbounded::<Say>();
@@ -343,8 +360,7 @@ impl Handle {
                 match crate::rt::timeout(Duration::from_secs(60), rx.recv()).await {
                     Ok(Ok(Say::ObjectData { offset: at, data, last, .. })) => {
                         anyhow::ensure!(at == offset, "{peer} sent {digest} out of order");
-                        file.write_all(&data)?;
-                        offset = offset.saturating_add(data.len() as u64);
+                        append_object_piece(&mut file, &mut offset, &data, max)?;
                         if last {
                             file.flush()?;
                             return Ok(true);
@@ -406,9 +422,13 @@ impl Handle {
 
 /// Start the node. Returns its handle and what it sends to the server (the agent forwards it on
 /// [`crate::proto::LANE_REACH`]).
-pub fn start(cfg: Config) -> anyhow::Result<(Handle, async_channel::Receiver<AgentMsg>)> {
-    let identity = Identity::load_or_create(&cfg.dir, &cfg.name)?;
-    let pins = Pins::open(&cfg.dir);
+pub async fn start(cfg: Config) -> anyhow::Result<(Handle, async_channel::Receiver<AgentMsg>)> { start_in(cfg, crate::runner::processes::Admission::production()).await }
+
+pub(crate) async fn start_in(cfg: Config, admission: crate::runner::processes::Admission) -> anyhow::Result<(Handle, async_channel::Receiver<AgentMsg>)> {
+    let (identity, pins) = crate::rt::blocking({
+        let (dir, name) = (cfg.dir.clone(), cfg.name.clone());
+        move || -> anyhow::Result<_> { Ok((Identity::load_or_create(&dir, &name)?, Arc::new(Pins::open(&dir)?))) }
+    }).await??;
     let announce = Announce { fingerprint: identity.fingerprint.clone(), accept: cfg.accept, version: wire::VERSION };
     let (net_tx, net_rx) = async_channel::unbounded::<In>();
     let (tx, rx) = async_channel::bounded::<In>(1024);
@@ -433,7 +453,11 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, async_channel::Receiver<Age
         cpus: u32::try_from(std::thread::available_parallelism().map(std::num::NonZero::get).unwrap_or(1)).unwrap_or(1),
     };
     tracing::info!(fingerprint = %e2e::short(&identity.fingerprint), accept = cfg.accept, "reach ready");
+    let admission_instance = crate::util::new_id();
     let node = Node {
+        admission: admission.clone(),
+        admission_instance: admission_instance.clone(),
+        admitting: HashSet::new(),
         cfg,
         identity,
         pins,
@@ -485,7 +509,7 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, async_channel::Receiver<Age
             counted.store(node.busy(), Ordering::Relaxed);
         }
     });
-    Ok((Handle { net: net_tx, tx, announce, busy, name: node_name }, out_rx))
+    Ok((Handle { admission, net: net_tx, tx, announce, busy, name: node_name, admission_instance }, out_rx))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -574,6 +598,7 @@ impl Peer {
 
 /// A run this side does for another runner.
 struct Served {
+    fence: Arc<std::sync::atomic::AtomicBool>,
     pid: Option<u32>,
     stdin: Option<async_channel::Sender<Vec<u8>>>,
     /// Output not yet acknowledged: (offset, stream, bytes).
@@ -613,9 +638,12 @@ enum Waiting {
 }
 
 struct Node {
+    admission: crate::runner::processes::Admission,
+    admission_instance: String,
+    admitting: HashSet<((String, String), u64)>,
     cfg: Config,
     identity: Identity,
-    pins: Pins,
+    pins: Arc<Pins>,
     host: Host,
     out: async_channel::Sender<AgentMsg>,
     tx: async_channel::Sender<In>,
@@ -661,6 +689,12 @@ impl Node {
                         let _ = reply.send(Err(anyhow::anyhow!("the connection to the kiln server dropped before it answered")));
                     }
                 } else {
+                    let client = super::leases::Client { tx: self.tx.clone(), instance: self.admission_instance.clone(), admission: self.admission.clone() };
+                    crate::rt::spawn(async move {
+                        if let Err(e) = client.recover().await {
+                            tracing::warn!(error = %e, "U01 receiver ownership could not reconcile");
+                        }
+                    });
                     // Back: everyone with something to do reconnects now.
                     let names: Vec<String> = self.peers.iter().filter(|(_, p)| p.busy()).map(|(n, _)| n.clone()).collect();
                     for n in names {
@@ -677,6 +711,13 @@ impl Node {
             In::Adopted { key, id, error } => {
                 if let Some(link) = self.served.get(&key).and_then(|s| s.link.clone()) {
                     self.say_on(&link, &Say::Adopted { id, error }).await;
+                }
+            }
+            In::Admitted { key, spec, lease } => {
+                self.admitting.remove(&(key.clone(), spec.id));
+                match lease {
+                    Ok(lease) => self.start_run(&key, *spec, lease).await,
+                    Err(why) => self.refuse_run(&key, spec.id, why).await,
                 }
             }
             In::Tick => self.tick().await,
@@ -727,9 +768,11 @@ impl Node {
 
     /// The key a runner must present: its pin, else the directory's. An error when the two
     /// disagree (the server says another key than the one met before) or neither knows it.
-    fn expected(&self, name: &str) -> Result<String, String> {
+    async fn expected(&self, name: &str) -> Result<String, String> {
         let listed = self.directory.as_ref().and_then(|(_, d)| d.iter().find(|r| r.name == name)).and_then(|r| r.fingerprint.clone());
-        match (self.pins.get(name), listed) {
+        let key = name.to_owned();
+        let pin = self.pins.access(move |pins| pins.get(&key)).await.map_err(|e| format!("{e:#}"))?;
+        match (pin, listed) {
             (Some(pin), Some(l)) if pin.fingerprint != l => Err(format!(
                 "{name}'s reach key changed (pinned {}, the server now says {}). If {name} was reinstalled, run `kiln reach forget {name}` on {} to trust its new key.",
                 e2e::short(&pin.fingerprint),
@@ -847,7 +890,7 @@ impl Node {
                     p.state = PeerState::Retry { at: Instant::now() + crate::sup::jitter(backoff), backoff };
                     p.error = Some(why.to_owned());
                     // Asks for a run never sent wait for the next link; acks and pings do not matter.
-                    p.queue.retain(|a| matches!(a, Ask::Run(_) | Ask::Stdin { .. } | Ask::StdinEnd { .. } | Ask::Signal { .. }));
+                    p.queue.retain(|a| matches!(a, Ask::Run(_) | Ask::RunLeased { .. } | Ask::Stdin { .. } | Ask::StdinEnd { .. } | Ask::Signal { .. }));
                     for w in p.waiters.drain(..) {
                         let _ = w.send(Err(anyhow::anyhow!("{why}")));
                     }
@@ -879,7 +922,16 @@ impl Node {
                 self.send_out(msg).await;
                 return;
             }
-            if self.fresh_directory().is_none() && self.pins.get(&from).is_none() {
+            let key = from.clone();
+            let pin = match self.pins.access(move |pins| pins.get(&key)).await {
+                Ok(pin) => pin,
+                Err(error) => {
+                    let msg = AgentMsg::Reach { to: from, link, open: false, data: Vec::new(), close: Some(format!("{error:#}")) };
+                    self.send_out(msg).await;
+                    return;
+                }
+            };
+            if self.fresh_directory().is_none() && pin.is_none() {
                 self.waiting.push((Instant::now(), Waiting::Accept { from, link, frames: vec![data] }));
                 self.fetch_directory().await;
                 return;
@@ -923,11 +975,27 @@ impl Node {
         let closed = l.tls.closed();
         // The handshake proved the key: pin it the first time.
         if ready && !l.pinned {
-            l.pinned = true;
             let (peer, fp) = (l.peer.clone(), l.fingerprint.clone());
-            if let Trust::First = self.pins.check(&peer, &fp) {
-                tracing::info!(runner = %peer, fingerprint = %e2e::short(&fp), "pinned a runner's reach key");
+            let checked = self.pins.access({
+                let (peer, fp) = (peer.clone(), fp.clone());
+                move |pins| pins.check(&peer, &fp)
+            }).await;
+            let refused = match checked {
+                Ok(Trust::First) => {
+                    tracing::info!(runner = %peer, fingerprint = %e2e::short(&fp), "pinned a runner's reach key");
+                    None
+                }
+                Ok(Trust::Known) => None,
+                Ok(Trust::Changed { .. }) => Some(format!("{peer}'s reach key changed during its handshake")),
+                Err(e) => Some(format!("cannot persist {peer}'s reach key: {e:#}")),
+            };
+            if let Some(why) = refused {
+                tracing::warn!(runner = %peer, error = %why, "reach key refused");
+                self.drop_link(&link, &why, true).await;
+                if role == Role::Asker { self.fail_peer(&peer, &why).await; }
+                return;
             }
+            if let Some(l) = self.links.get_mut(&link) { l.pinned = true; }
         }
         // Whatever the handshake left to say (its Finished, the held first message) goes with the
         // batch.
@@ -968,7 +1036,15 @@ impl Node {
             self.fail_peer(name, "not connected to the kiln server; waiting for it").await;
             return;
         }
-        if self.pins.get(name).is_none() && self.fresh_directory().is_none_or(|d| !d.iter().any(|r| r.name == name)) {
+        let key = name.to_owned();
+        let pin = match self.pins.access(move |pins| pins.get(&key)).await {
+            Ok(pin) => pin,
+            Err(error) => {
+                self.fail_peer(name, &format!("{error:#}")).await;
+                return;
+            }
+        };
+        if pin.is_none() && self.fresh_directory().is_none_or(|d| !d.iter().any(|r| r.name == name)) {
             if let Some(p) = self.peers.get_mut(name) {
                 p.state = PeerState::Resolving;
             }
@@ -980,7 +1056,7 @@ impl Node {
     }
 
     async fn connect_resolved(&mut self, name: &str) {
-        let fp = match self.expected(name) {
+        let fp = match self.expected(name).await {
             Ok(f) => f,
             Err(why) => {
                 self.fail_peer(name, &why).await;
@@ -1020,9 +1096,9 @@ impl Node {
             let _ = w.send(Err(anyhow::anyhow!("{why}")));
         }
         // Runs that never started there can't resume: they end here, with why.
-        let never: Vec<u64> = p.queue.iter().filter_map(|a| if let Ask::Run(s) = a { Some(s.id) } else { None }).collect();
+        let never: Vec<u64> = p.queue.iter().filter_map(|a| match a { Ask::Run(s) | Ask::RunLeased { spec: s, .. } => Some(s.id), _ => None }).collect();
         if p.host.is_none() || !never.is_empty() {
-            p.queue.retain(|a| !matches!(a, Ask::Run(_)));
+            p.queue.retain(|a| !matches!(a, Ask::Run(_) | Ask::RunLeased { .. }));
             for id in never {
                 if let Some(f) = p.follows.remove(&id) {
                     let _ = f.says.send(Say::Exit { id, code: None, signal: None, error: Some(why.to_owned()), end: f.got, lost: 0 }).await;
@@ -1165,7 +1241,7 @@ impl Node {
 
     async fn accept(&mut self, from: String, link: String, frames: Vec<Vec<u8>>) {
         let refuse = |why: String| AgentMsg::Reach { to: from.clone(), link: link.clone(), open: false, data: Vec::new(), close: Some(why) };
-        let fp = match self.expected(&from) {
+        let fp = match self.expected(&from).await {
             Ok(f) => f,
             Err(why) => {
                 tracing::warn!(runner = %from, why = %why, "refused a reach link");
@@ -1237,7 +1313,23 @@ impl Node {
         let key = (peer, session);
         match a {
             Ask::Hello { .. } => {}
-            Ask::Run(spec) => self.start_run(&key, *spec).await,
+            Ask::Run(spec) => self.refuse_run(&key, spec.id, "U01: unleased reach execution is no longer supported; use protocol version 2".into()).await,
+            Ask::RunLeased { spec, permit } => {
+                if self.served.get(&key).is_some_and(|s| s.runs.contains_key(&spec.id)) || self.admitting.contains(&(key.clone(), spec.id)) {
+                    return;
+                }
+                if permit.host != self.cfg.name || self.admitting.len() >= 4096 {
+                    self.refuse_run(&key, spec.id, "U01: wrong execution host or admission queue full".into()).await;
+                    return;
+                }
+                self.admitting.insert((key.clone(), spec.id));
+                let client = super::leases::Client { tx: self.tx.clone(), instance: self.admission_instance.clone(), admission: self.admission.clone() };
+                let (tx, key) = (self.tx.clone(), key.clone());
+                crate::rt::spawn(async move {
+                    let lease = client.claim(permit, &key.0).await.map_err(|e| format!("{e:#}"));
+                    let _ = tx.send(In::Admitted { key, spec, lease }).await;
+                });
+            }
             Ask::Stdin { id, data } => {
                 if let Some(tx) = self.served.get(&key).and_then(|s| s.runs.get(&id)).and_then(|r| r.stdin.clone())
                     && !data.is_empty()
@@ -1265,7 +1357,12 @@ impl Node {
                 self.pump(&key, id).await;
             }
             Ask::Signal { id, signal } => {
-                if let Some(pid) = self.served.get(&key).and_then(|s| s.runs.get(&id)).and_then(|r| r.pid) {
+                if signal == Signal::Kill && let Some(r) = self.served.get(&key).and_then(|s| s.runs.get(&id)) {
+                    r.fence.store(true, Ordering::Release);
+                }
+                if let Some(r) = self.served.get(&key).and_then(|s| s.runs.get(&id))
+                    && !r.fence.load(Ordering::Acquire) && let Some(pid) = r.pid
+                {
                     serve::signal_group(pid, signal);
                 }
             }
@@ -1303,7 +1400,7 @@ impl Node {
         }
     }
 
-    async fn start_run(&mut self, key: &(String, String), spec: RunSpec) {
+    async fn start_run(&mut self, key: &(String, String), spec: RunSpec, lease: super::leases::Lease) {
         let id = spec.id;
         let Some(s) = self.served.get_mut(key) else { return };
         if s.runs.contains_key(&id) {
@@ -1337,7 +1434,8 @@ impl Node {
         // A run in a copy holds it in use until the run's last event, noted as the agent's that
         // asked for it (docs/reach.md §5.1).
         let busy = spec.mirror.as_deref().map(|m| self.cfg.using.busy(&key.0, m, super::keeper::agent_of(&spec.env)));
-        let stdin = serve::start(spec.clone(), cwd, shell, extra, ev_tx);
+        let fence = lease.control();
+        let stdin = serve::start_leased(spec.clone(), cwd, shell, extra, ev_tx, lease);
         // Forward the run's events into the node, waiting while its asker has too much unread.
         let (tx, k, h, r) = (self.tx.clone(), key.clone(), Arc::clone(&held), Arc::clone(&room));
         crate::rt::spawn(async move {
@@ -1362,6 +1460,7 @@ impl Node {
         s.runs.insert(
             id,
             Served {
+                fence,
                 pid: None,
                 stdin: spec.stdin.then_some(stdin),
                 buf: VecDeque::new(),
@@ -1542,6 +1641,10 @@ impl Node {
                     let _ = reply.send(Err(anyhow::anyhow!("not connected to the kiln server")));
                     return;
                 }
+                if self.queries.len() >= 4096 {
+                    let _ = reply.send(Err(anyhow::anyhow!("bounded server query queue is full")));
+                    return;
+                }
                 let req = self.next_req;
                 self.next_req += 1;
                 self.queries.insert(req, (Instant::now(), reply));
@@ -1577,14 +1680,14 @@ impl Node {
                 }
                 self.ensure_link(&peer).await;
             }
-            Local::Run { peer, mut spec, says, reply } => {
+            Local::Run { peer, mut spec, permit, says, reply } => {
                 let p = self.peers.entry(peer.clone()).or_insert_with(Peer::new);
                 let id = p.next_id;
                 p.next_id += 1;
                 spec.id = id;
                 p.follows.insert(id, Follow { says, got: 0, exited: false });
                 let _ = reply.send(id);
-                self.send_or_queue(&peer, Ask::Run(spec)).await;
+                self.send_or_queue(&peer, Ask::RunLeased { spec, permit }).await;
             }
             Local::Ask { peer, ask } => {
                 if self.peers.contains_key(&peer) {
@@ -1622,10 +1725,11 @@ impl Node {
                 }
             }
             Local::Status { reply } => {
-                let _ = reply.send(self.status());
+                let _ = reply.send(self.status().await);
             }
             Local::Forget { runner, reply } => {
-                let _ = reply.send(self.pins.forget(&runner));
+                let result = self.pins.access(move |pins| pins.forget(&runner)).await;
+                let _ = reply.send(result);
             }
             Local::AdoptFollow { peer, says, reply } => {
                 let p = self.peers.entry(peer).or_insert_with(Peer::new);
@@ -1643,7 +1747,7 @@ impl Node {
         u64::try_from(doing + following).unwrap_or(u64::MAX)
     }
 
-    fn status(&self) -> Value {
+    async fn status(&self) -> Value {
         let peers: Vec<Value> = self
             .peers
             .iter()
@@ -1661,7 +1765,10 @@ impl Node {
             })
             .collect();
         let serving: Vec<Value> = self.served.iter().map(|((r, _), s)| json!({"runner": r, "runs": s.runs.len(), "linked": s.link.is_some()})).collect();
-        let pins: Vec<Value> = self.pins.all().into_iter().map(|(n, p)| json!({"runner": n, "fingerprint": p.fingerprint, "since": p.since})).collect();
+        let (pins, pins_error) = match self.pins.access(Pins::all).await {
+            Ok(pins) => (Some(pins.into_iter().map(|(n, p)| json!({"runner": n, "fingerprint": p.fingerprint, "since": p.since})).collect::<Vec<Value>>()), None),
+            Err(error) => (None, Some(format!("{error:#}"))),
+        };
         json!({
             "runner": self.cfg.name,
             "fingerprint": self.identity.fingerprint,
@@ -1670,6 +1777,7 @@ impl Node {
             "peers": peers,
             "serving": serving,
             "pins": pins,
+            "pins_error": pins_error,
         })
     }
 
@@ -1679,6 +1787,7 @@ impl Node {
         let now = Instant::now();
         // Questions and waits that went unanswered.
         self.asked.retain(|_, at| at.elapsed() < Duration::from_secs(10));
+        self.queries.retain(|_, (_, reply)| !reply.is_canceled());
         let late: Vec<u64> = self.queries.iter().filter(|(_, (at, _))| at.elapsed() >= QUERY_TIMEOUT).map(|(r, _)| *r).collect();
         for r in late {
             if let Some((_, reply)) = self.queries.remove(&r) {
@@ -1752,17 +1861,15 @@ impl Node {
                         None => {
                             r.timed_out = true;
                             r.stopping = Some(now);
-                            serve::signal_group(pid, Signal::Terminate);
+                            if !r.fence.load(Ordering::Acquire) { serve::signal_group(pid, Signal::Terminate); }
                         }
-                        Some(at) if now.duration_since(at) > Duration::from_secs(5) => serve::signal_group(pid, Signal::Kill),
+                        Some(at) if now.duration_since(at) > Duration::from_secs(5) => r.fence.store(true, Ordering::Release),
                         Some(_) => {}
                     }
                 }
                 match detached {
                     Some(d) if r.exit.is_none() && d > r.linger => {
-                        if let Some(pid) = r.pid {
-                            serve::signal_group(pid, Signal::Kill);
-                        }
+                        r.fence.store(true, Ordering::Release);
                         false
                     }
                     Some(d) if r.exit.is_some() && d > UNCOLLECTED => false,
@@ -1863,46 +1970,108 @@ fn sync_worker(root: PathBuf, key: String, session: (String, String), node: asyn
     tx
 }
 
+/// U07: enforce the optional work-cache transport ceiling before each physical write.
+fn append_object_piece(out: &mut impl std::io::Write, offset: &mut u64, data: &[u8], max: Option<u64>) -> anyhow::Result<()> {
+    let next = offset.checked_add(u64::try_from(data.len())?).ok_or_else(|| anyhow::anyhow!("peer object byte count overflow"))?;
+    anyhow::ensure!(max.is_none_or(|limit| next <= limit), "peer object exceeds the cache transfer limit");
+    out.write_all(data)?;
+    *offset = next;
+    Ok(())
+}
+
+
+
 /// The most of an object one piece carries (docs/ci.md W24-R27).
 const OBJECT_PIECE: usize = 1 << 20;
 
-/// What of `digest` this runner's cache holds for `repo`, from `offset`: at most a window, in
-/// pieces, the last saying so once the object's end is in it. `None` when it isn't held for that
-/// repository (a repository never learns through a peer what another stored). The object is put
-/// together once as a local file beside the cache, which later windows are read from.
+/// U07/W24-R27: one requested window from guarded shared-tier assembly. Authorization
+/// remains scoped; no unbudgeted permanent peer copy is created beside the cache.
 fn object_window(store: Option<&crate::runner::work::store::Store>, repo: &str, digest: &str, offset: u64) -> anyhow::Result<Option<Vec<(u64, Vec<u8>, bool)>>> {
-    use std::io::{Read as _, Seek as _, SeekFrom};
-    use crate::runner::work::store::{Scope, is_digest};
+    use crate::runner::work::store::{Kept, Scope, is_digest};
     let Some(store) = store else { return Ok(None) };
     let scopes: Vec<Scope> = ["trusted", "protected", "untrusted"].iter().map(|d| Scope::new(repo, d)).collect();
-    if !is_digest(digest) || store.holder(&scopes, digest).is_none() {
-        return Ok(None);
-    }
-    let dir = store.root().join("peers");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(digest.replace(':', "-"));
-    if !path.exists() {
-        let tmp = store.temp();
-        if !store.copy_to(digest, &tmp)? {
-            return Ok(None);
+    if !is_digest(digest) || store.holder(&scopes, digest).is_none() { return Ok(None); }
+    let Some((kept, guard)) = store.guard_object(digest)? else { return Ok(None) };
+    let local = store.local();
+    let size = match &kept {
+        Kept::Whole(_) => match local.path(digest).metadata() {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        },
+        Kept::Chunks(list) => list.iter().try_fold(0u64, |n, (_, size)| n.checked_add(*size)).ok_or_else(|| anyhow::anyhow!("peer object size overflow"))?,
+    };
+    let start = offset.min(size);
+    let end = offset.saturating_add(wire::WINDOW).min(size);
+    let mut window = Vec::with_capacity(usize::try_from(end - start)?);
+    match kept {
+        Kept::Whole(_) => {
+            let Some(data) = local.get_protected(digest, &guard) else { return Ok(None) };
+            let Some(piece) = data.get(usize::try_from(start)?..usize::try_from(end)?) else { return Ok(None) };
+            window.extend_from_slice(piece);
         }
-        std::fs::rename(&tmp, &path)?;
+        Kept::Chunks(list) => {
+            let mut base = 0u64;
+            for (hash, length) in list {
+                let next = base.checked_add(length).ok_or_else(|| anyhow::anyhow!("peer chunk offset overflow"))?;
+                if next > start && base < end {
+                    let Some(data) = local.get_protected(&hash, &guard).filter(|data| data.len() as u64 == length) else { return Ok(None) };
+                    let from = usize::try_from(start.saturating_sub(base))?;
+                    let to = usize::try_from(end.min(next) - base)?;
+                    let piece = data.get(from..to).ok_or_else(|| anyhow::anyhow!("invalid peer chunk window"))?;
+                    window.extend_from_slice(piece);
+                }
+                base = next;
+                if base >= end { break; }
+            }
+        }
     }
-    let mut f = std::fs::File::open(&path)?;
-    let size = f.metadata()?.len();
-    f.seek(SeekFrom::Start(offset.min(size)))?;
+    anyhow::ensure!(window.len() as u64 == end - start, "peer window assembly is incomplete");
+    if window.is_empty() { return Ok(Some(vec![(start, Vec::new(), true)])); }
     let mut out = Vec::new();
-    let (mut at, end) = (offset.min(size), offset.saturating_add(wire::WINDOW).min(size));
-    loop {
-        let n = usize::try_from(end.saturating_sub(at)).unwrap_or(OBJECT_PIECE).min(OBJECT_PIECE);
-        let mut data = vec![0u8; n];
-        f.read_exact(&mut data)?;
-        let next = at.saturating_add(n as u64);
-        out.push((at, data, next >= size));
+    let mut at = start;
+    for piece in window.chunks(OBJECT_PIECE) {
+        let next = at.checked_add(piece.len() as u64).ok_or_else(|| anyhow::anyhow!("peer response offset overflow"))?;
+        out.push((at, piece.to_vec(), next >= size));
         at = next;
-        if at >= end {
-            break;
-        }
     }
     Ok(Some(out))
+}
+
+#[cfg(test)]
+mod u07_object_transport_tests {
+    use super::append_object_piece;
+
+    #[test]
+    fn u07_peer_windows_use_shared_chunks_without_permanent_assembly_copies() -> anyhow::Result<()> {
+        use crate::runner::work::store::{Scope, Store, WHOLE_MAX};
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(dir.path())?;
+        let data = vec![7; usize::try_from(WHOLE_MAX)? + 1];
+        let publication = store.put_bytes_guarded(&data)?;
+        store.hold(&Scope::new("acme/app", "trusted"), &publication.digest)?;
+        let start = 17u64;
+        let pieces = super::object_window(Some(&store), "acme/app", &publication.digest, start)?.ok_or_else(|| anyhow::anyhow!("shared peer window missing"))?;
+        let bytes: Vec<u8> = pieces.iter().flat_map(|(_, data, _)| data.iter().copied()).collect();
+        let end = usize::try_from(start.saturating_add(super::wire::WINDOW))?.min(data.len());
+        assert_eq!(bytes.as_slice(), data.get(usize::try_from(start)?..end).ok_or_else(|| anyhow::anyhow!("test window invalid"))?);
+        assert!(!store.root().join("peers").exists());
+        assert!(super::object_window(Some(&store), "other/repo", &publication.digest, 0)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn u07_peer_object_limit_refuses_before_writing_the_crossing_piece() -> anyhow::Result<()> {
+        let mut bytes = Vec::new();
+        let mut offset = 0;
+        append_object_piece(&mut bytes, &mut offset, b"ab", Some(3))?;
+        assert!(append_object_piece(&mut bytes, &mut offset, b"cd", Some(3)).is_err());
+        assert_eq!((bytes.as_slice(), offset), (b"ab".as_slice(), 2));
+        append_object_piece(&mut bytes, &mut offset, b"cd", None)?;
+        assert_eq!(bytes, b"abcd");
+        let mut overflow = u64::MAX;
+        assert!(append_object_piece(&mut bytes, &mut overflow, b"x", None).is_err());
+        assert_eq!(bytes, b"abcd");
+        Ok(())
+    }
 }

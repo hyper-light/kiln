@@ -32,7 +32,8 @@ fn lines_of(store: &Store, session: &str, source: &str) -> anyhow::Result<Vec<St
             }
             out.push(line);
         }
-        if n < PAGE {
+        // U06: storage also bounds pages by bytes; a short nonempty page is not EOF.
+        if n == 0 {
             return Ok(out);
         }
     }

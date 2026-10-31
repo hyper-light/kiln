@@ -223,6 +223,7 @@ pub fn pack(id: &str, mut spec: Spec, cwd: &str, from: &str, from_cwd: &str, car
     spec.shell = None;
     spec.program = None;
     spec.takeover_pid = None;
+    spec.takeover_identity = None;
     spec.takeover_stop = false;
     spec.resume_at = None;
     spec.fork = false;

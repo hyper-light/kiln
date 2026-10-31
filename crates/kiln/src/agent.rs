@@ -7,8 +7,11 @@
 //!   bounded uplink buffer and are delivered after reconnecting.
 //! * Serves PTY terminals so the UI can drive this machine.
 
+pub(crate) mod retained;
+pub use retained::Receipt as RetainedReceipt;
+
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -42,6 +45,8 @@ pub struct Opts {
     pub slots: u32,
     pub work_dir: PathBuf,
     pub state_dir: PathBuf,
+    /// U05: the in-process runner shares its host's sole SQL/Records owner.
+    pub shared_store: Option<crate::store::Store>,
     pub join_token: Option<String>,
     pub ephemeral: bool,
     pub dedicated_job: Option<String>,
@@ -114,6 +119,56 @@ pub struct EnrollResponse {
     pub ca_pem: String,
     pub quic: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor_bootstrap: Option<ExecutorBootstrap>,
+}
+
+/// U03: enrollment's server-verified pod identity, bound to the issued certificate. This is
+/// input to the inherited-owner factory, never authority derived from environment variables.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExecutorBootstrap {
+    pub identity: crate::k8s::ExecutorIdentity,
+    pub certificate_sha256: String,
+}
+
+impl ExecutorBootstrap {
+    /// U03: the caller holds this credential-verified bootstrap. Assignment data alone cannot
+    /// select inherited ownership, and a mismatched parent never falls back to native execution.
+    pub(crate) fn execution_for(&self, admission: crate::runner::processes::Admission, assignment: &kiln_ci::wire::AssignmentV2, work: PathBuf) -> anyhow::Result<Arc<crate::runner::processes::Execution>> {
+        let binding = assignment.parent_binding.as_ref().context("U03 verified pod assignment lacks its parent binding")?;
+        let physical = self.identity.physical_execution()?;
+        anyhow::ensure!(binding.executor == self.identity.executor && binding.generation == self.identity.generation
+            && binding.allocation == self.identity.allocation && binding.physical_execution == physical
+            && binding.job == assignment.job_id && binding.attempt == assignment.attempt && assignment.attempt > 0,
+            "U03 assignment does not match the enrolled pod's immutable identity and existing grant");
+        anyhow::ensure!(assignment.executor.slot.as_deref().is_none_or(|slot| slot == self.identity.executor), "U03 assignment selected another executor slot");
+        let parent = crate::runner::processes::ParentExecution::verified(binding.clone(), &assignment.job_id, assignment.attempt)?;
+        crate::runner::processes::Execution::inherited_in(admission, work, assignment.job_id.clone(), assignment.attempt, parent)
+    }
+}
+
+/// U03: only this certificate's enrollment receipt may select inherited pod ownership.
+pub(crate) fn enrolled_executor(state_dir: &Path, leaf: &Leaf) -> anyhow::Result<Option<ExecutorBootstrap>> {
+    let path = state_dir.join("executor-bootstrap.json");
+    use std::io::Read as _;
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    };
+    let mut bytes = Vec::new();
+    file.take(16385).read_to_end(&mut bytes)?;
+    anyhow::ensure!(bytes.len() <= 16384, "U03 executor enrollment receipt exceeds its bound");
+    let bootstrap: Option<ExecutorBootstrap> = serde_json::from_slice(&bytes)?;
+    if let Some(bootstrap) = &bootstrap {
+        anyhow::ensure!(crate::pki::cert_info(&leaf.cert_pem)?.sha256 == bootstrap.certificate_sha256
+            && crate::pki::leaf_name(leaf).as_deref() == Some(bootstrap.identity.name.as_str()), "U03 executor bootstrap does not belong to this certificate");
+        for field in [&bootstrap.identity.namespace, &bootstrap.identity.name, &bootstrap.identity.uid, &bootstrap.identity.node,
+            &bootstrap.identity.executor, &bootstrap.identity.generation, &bootstrap.identity.allocation] {
+            anyhow::ensure!(!field.is_empty() && field.len() <= 512 && !field.chars().any(char::is_control), "U03 invalid executor bootstrap identity");
+        }
+    }
+    Ok(bootstrap)
 }
 
 fn ca_der(pem: &str) -> anyhow::Result<Vec<u8>> {
@@ -171,6 +226,8 @@ async fn credentials(o: &Opts, shutdown: &Shutdown) -> anyhow::Result<(Vec<u8>, 
         match r {
             Ok(resp) if resp.is_success() => {
                 let e: EnrollResponse = resp.json(1 << 20).await.context("enroll response")?;
+                // Persist the certificate-bound identity before making the new certificate usable.
+                crate::util::write_secret(&o.state_dir.join("executor-bootstrap.json"), &serde_json::to_vec(&e.executor_bootstrap)?, 0o600)?;
                 crate::util::write_secret(&key_p, key_pem.as_bytes(), 0o600)?;
                 crate::util::write_secret(&cert_p, e.cert_pem.as_bytes(), 0o644)?;
                 crate::util::write_secret(&ca_p, e.ca_pem.as_bytes(), 0o644)?;
@@ -238,7 +295,15 @@ async fn instance_credentials(o: &Opts, id: &str, shutdown: &Shutdown) -> anyhow
 const DIAL_TIMEOUT: Duration = Duration::from_secs(20);
 
 struct Running {
+    /// U01: stale local CI execution fences reach even across transport reconnects.
+    _admission: Option<std::fs::File>,
     cancel: Shutdown,
+    /// U03: execution identity survives completion and cancellation races.
+    attempt: Option<u32>,
+    /// U03: a completed execution cancels its pending grace cleanup.
+    grace_stop: Shutdown,
+    /// U03: exact containment identity shared by runtime and grace cleanup.
+    execution: Arc<crate::runner::processes::Execution>,
     /// It runs in a pool's executor, not in one of this runner's slots (docs/ci.md W13-R09).
     pooled: bool,
     /// What it holds of this runner (docs/ci.md W05-R03): a share of its CPUs and memory, the
@@ -292,6 +357,70 @@ fn admits(slots: u32, size: Option<kiln_ci::sched::state::Resources>, jobs: impl
     })
 }
 
+/// U03: keep the attempt in replay storage even when speaking to an old server.
+fn completion_wire(data: Vec<u8>, fenced: bool) -> Vec<u8> {
+    if !fenced && let Ok(AgentMsg::JobFinishedV2 { result, .. }) = proto::read_agent(&data) {
+        return proto::encode(&AgentMsg::JobFinished(result)).unwrap_or(data);
+    }
+    data
+}
+
+/// U03: a stale receipt cannot discard the current attempt's replay envelope.
+fn completion_receipt(data: &[u8], attempt: Option<u32>, fenced: bool) -> bool {
+    match proto::read_agent(data) {
+        Ok(AgentMsg::JobFinishedV2 { attempt: held, .. }) => attempt == Some(held) || (!fenced && attempt.is_none()),
+        Ok(AgentMsg::JobFinished(_)) => attempt.is_none(),
+        _ => false,
+    }
+}
+
+/// U03: main-loop producers cannot await the bounded channel that this loop consumes.
+/// At most one event's controls wait locally; pending controls force channel draining before
+/// another event is selected. The hard bound rejects an oversized event without silent loss.
+#[derive(Default)]
+struct DeferredControl { pending: VecDeque<Up> }
+impl DeferredControl {
+    const LIMIT: usize = 64;
+
+    fn enqueue(&mut self, tx: &async_channel::Sender<Up>, up: Up) -> anyhow::Result<()> {
+        self.flush(tx)?;
+        if self.pending.is_empty() {
+            match tx.try_send(up) {
+                Ok(()) => return Ok(()),
+                Err(async_channel::TrySendError::Full(up)) => self.pending.push_back(up),
+                Err(async_channel::TrySendError::Closed(_)) => anyhow::bail!("agent uplink is closed"),
+            }
+        } else {
+            anyhow::ensure!(self.pending.len() < Self::LIMIT, "one agent event exceeds the deferred control budget");
+            self.pending.push_back(up);
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self, tx: &async_channel::Sender<Up>) -> anyhow::Result<()> {
+        while let Some(up) = self.pending.pop_front() {
+            match tx.try_send(up) {
+                Ok(()) => {}
+                Err(async_channel::TrySendError::Full(up)) => { self.pending.push_front(up); break; }
+                Err(async_channel::TrySendError::Closed(_)) => anyhow::bail!("agent uplink is closed"),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Republish a bounded page of the same stopped owners into the canonical retained outbox.
+/// Successful receipt ACKs may remove a hint; an owner still awaiting its ordered Stop barrier
+/// emits it again on the existing sample. This introduces no second delivery registry.
+async fn publish_closed_executor_hints(execs: &crate::runner::pool::Executors, spool: &retained::Spool) -> anyhow::Result<()> {
+    for said in execs.closed_owner_hints() {
+        let json = serde_json::to_string(&said)?;
+        let receipt = retained::Receipt::executor(&json)?.ok_or_else(|| anyhow::anyhow!("closed executor has no stopped receipt"))?;
+        spool.publish(&receipt).await?;
+    }
+    Ok(())
+}
+
 /// How long a cancelled job has to end before the runner reports it over and lets it go.
 const CANCEL_GRACE: Duration = Duration::from_secs(120);
 
@@ -299,7 +428,7 @@ const CANCEL_GRACE: Duration = Duration::from_secs(120);
 enum Ev {
     Shutdown,
     Net(Option<NetEvent>),
-    Done(JobResult),
+    Done(JobResult, Option<u32>),
     Heartbeat,
     Sample,
     Watchdog,
@@ -497,213 +626,6 @@ async fn announce(sessions: Vec<proto::TermInfo>, harness: Option<&Arc<crate::ha
         && let Ok(json) = serde_json::to_string(&h.inventory())
     {
         uplink.0.send(Up::Term(AgentMsg::HarnessInventory { json })).await.ok();
-    }
-}
-
-/// Start this machine's replica of kiln's records with the server's newest word to join (`join`),
-/// trying again until it starts: the process before this one may hold the replica's files a
-/// while yet (an old build keeps them until its last job ends and it retires, minutes later). It
-/// stops once the server takes the replica away (`join` emptied by a Leave) or this runner is
-/// going (`going`). `wait`: how long before each try again ([`replica_wait`]).
-async fn start_replica<S, F, Fut>(join: &parking_lot::Mutex<Option<(u64, String)>>, going: impl Fn() -> bool, start: F, wait: fn(u32) -> Duration) -> anyhow::Result<(S, u64)>
-where
-    F: Fn(u64, String) -> Fut,
-    Fut: std::future::Future<Output = anyhow::Result<S>>,
-{
-    let mut tries = 0u32;
-    loop {
-        let Some((member, token)) = join.lock().clone() else {
-            anyhow::bail!("the server no longer asks this machine for a replica");
-        };
-        let e = match start(member, token).await {
-            Ok(s) => return Ok((s, member)),
-            Err(e) => e,
-        };
-        tries += 1;
-        if going() {
-            return Err(e);
-        }
-        if tries == REPLICA_PATIENCE {
-            tracing::warn!(error = %format!("{e:#}"), tries, "this machine's replica of kiln's records hasn't started yet; it's tried again every minute until it does");
-        } else {
-            tracing::debug!(error = %format!("{e:#}"), tries, "this machine's replica of kiln's records didn't start yet");
-        }
-        crate::rt::sleep(wait(tries)).await;
-    }
-}
-
-/// The tries a replica gets 15 s apart, before it's tried each minute instead (and said so).
-const REPLICA_PATIENCE: u32 = 5;
-
-/// How long a replica that didn't start waits before it's tried again, after `tries`.
-fn replica_wait(tries: u32) -> Duration {
-    Duration::from_secs(if tries < REPLICA_PATIENCE { 15 } else { 60 })
-}
-
-/// How often a runner checks that its replica follows the server, and how many checks running it
-/// may stay behind the server's last write before it's started again.
-const REPLICA_CHECK: Duration = Duration::from_secs(60);
-const REPLICA_BEHIND: u32 = 5;
-
-/// This machine's replica of kiln's records (docs/p2p.md, P2): where it's kept once started, and
-/// what starting it takes.
-#[derive(Clone)]
-struct ReplicaStart {
-    slot: Arc<parking_lot::Mutex<Option<Arc<crate::store::learner::Learner>>>>,
-    starting: Arc<std::sync::atomic::AtomicBool>,
-    /// The server's last word to join the group as a learner (`None` once it said Leave).
-    join: Arc<parking_lot::Mutex<Option<(u64, String)>>>,
-    up: async_channel::Sender<Up>,
-    dir: PathBuf,
-    me: String,
-    server: String,
-    http: Arc<Client>,
-}
-
-impl ReplicaStart {
-    /// Starts the replica with the server's newest word to join, unless one is starting already:
-    /// on a task of its own (fetching a first copy takes a while).
-    fn start(&self) {
-        use crate::store::learner::Learner;
-        if self.starting.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            return;
-        }
-        let r = self.clone();
-        crate::rt::spawn(async move {
-            let going = r.up.clone();
-            let (dir, me, server, http) = (r.dir.clone(), r.me.clone(), r.server.clone(), r.http.clone());
-            let started = start_replica(
-                &r.join,
-                move || going.is_closed(),
-                move |member, token| {
-                    let (dir, me, server, http) = (dir.clone(), me.clone(), server.clone(), http.clone());
-                    async move {
-                        // A thread of its own: fetching a copy takes minutes on a large store, and the
-                        // blocking pool is the runtime's.
-                        let (tx, rx) = async_channel::bounded(1);
-                        std::thread::Builder::new()
-                            .name("kiln-learner".into())
-                            .spawn(move || {
-                                let _ = tx.send_blocking(Learner::start(&dir, &me, member, http, &server, &token));
-                            })
-                            .map_err(|e| anyhow::anyhow!("starting the learner's thread: {e}"))?;
-                        rx.recv().await.map_err(|_| anyhow::anyhow!("the learner's thread ended"))?
-                    }
-                },
-                replica_wait,
-            )
-            .await;
-            match started {
-                Ok(((learner, said), member)) => {
-                    tracing::info!(member, "this machine holds a replica of kiln's records");
-                    let learner = Arc::new(learner);
-                    crate::store::learner::set_global(Some(Arc::clone(&learner)));
-                    *r.slot.lock() = Some(learner);
-                    let up = r.up.clone();
-                    crate::rt::spawn(async move {
-                        while let Ok(m) = said.recv().await {
-                            if up.send(Up::Sync(m)).await.is_err() {
-                                break;
-                            }
-                        }
-                    });
-                }
-                Err(e) => tracing::warn!(error = %format!("{e:#}"), "this machine's replica of kiln's records didn't start"),
-            }
-            r.starting.store(false, std::sync::atomic::Ordering::SeqCst);
-        });
-    }
-
-    /// Keeps the replica following the server: one whose group stopped, or that stays behind the
-    /// server's last write for [`REPLICA_BEHIND`] checks running, is stopped and started again with
-    /// the newest word to join. Nothing else would start it again, and its front door would leave
-    /// every read to the server for good (adacachy's, on 2026-10-25, applied nothing for hours after
-    /// the server restarted).
-    async fn watch(self) {
-        let mut behind = 0u32;
-        loop {
-            crate::rt::sleep(REPLICA_CHECK).await;
-            if self.up.is_closed() {
-                return;
-            }
-            let Some(learner) = self.slot.lock().clone() else {
-                behind = 0;
-                continue;
-            };
-            let why = if let Some(why) = learner.stopped() {
-                format!("its cluster group stopped: {why}")
-            } else if learner.current(Duration::from_secs(30)).await {
-                behind = 0;
-                continue;
-            } else {
-                behind += 1;
-                if behind < REPLICA_BEHIND {
-                    continue;
-                }
-                format!("it stayed behind the server's last write for {behind} checks running")
-            };
-            behind = 0;
-            let (seq, applied) = learner.standing();
-            drop(learner);
-            tracing::warn!(seq, applied, "this machine's replica of kiln's records stopped following the server and starts again: {why}");
-            // Taken away as at a Leave (its files let go, waiting for its thread), then started.
-            let old = self.slot.lock().take();
-            if let Some(old) = old {
-                crate::store::learner::set_global(None);
-                let _ = crate::rt::blocking(move || drop(old)).await;
-            }
-            self.start();
-        }
-    }
-}
-
-#[cfg(test)]
-mod replica_tests {
-    use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
-
-    /// A replica whose files another process holds is tried again until it starts, with the
-    /// server's newest word to join; it stops once the server takes the replica away, or the
-    /// runner goes. On adacachy on 2026-10-25 the old build held them for nine minutes, and five
-    /// tries gave up after four.
-    #[test]
-    fn a_replica_is_tried_again_until_it_starts() -> anyhow::Result<()> {
-        crate::rt::block_on(async {
-            let no_wait: fn(u32) -> std::time::Duration = |_| std::time::Duration::ZERO;
-            let join = parking_lot::Mutex::new(Some((7u64, "first".to_owned())));
-            let tries = AtomicU32::new(0);
-            let (got, member) = super::start_replica(
-                &join,
-                || false,
-                |_, token| {
-                    let n = tries.fetch_add(1, SeqCst) + 1;
-                    if n == 3 {
-                        *join.lock() = Some((8, "renewed".into()));
-                    }
-                    async move { if n < 9 { Err(anyhow::anyhow!("another process still has kiln.db open")) } else { Ok(token) } }
-                },
-                no_wait,
-            )
-            .await?;
-            anyhow::ensure!(got == "renewed" && member == 8 && tries.load(SeqCst) == 9, "{got} {member} after {} tries", tries.load(SeqCst));
-            // Taken away while it's tried: it stops.
-            let r = super::start_replica(&join, || false, |_, _| {
-                *join.lock() = None;
-                async { Err::<String, _>(anyhow::anyhow!("held")) }
-            }, no_wait)
-            .await;
-            anyhow::ensure!(r.as_ref().is_err_and(|e| e.to_string().contains("no longer asks")), "{:?}", r.err());
-            // The runner going: it stops.
-            *join.lock() = Some((7, "t".into()));
-            let n = AtomicU32::new(0);
-            let r = super::start_replica(&join, || n.load(SeqCst) >= 2, |_, _| {
-                n.fetch_add(1, SeqCst);
-                async { Err::<String, _>(anyhow::anyhow!("held")) }
-            }, no_wait)
-            .await;
-            anyhow::ensure!(r.is_err() && n.load(SeqCst) == 2, "{} tries", n.load(SeqCst));
-            anyhow::ensure!(super::replica_wait(1).as_secs() == 15 && super::replica_wait(super::REPLICA_PATIENCE).as_secs() == 60);
-            Ok(())
-        })
     }
 }
 
@@ -993,7 +915,222 @@ async fn sleep_until_opt(t: Option<Instant>) {
     }
 }
 
-pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
+/// U06/U17: keep each legacy revision space independent while sharing machine handovers.
+fn runner_records_namespace(name: &str, instance: Option<&str>) -> String {
+    use sha2::Digest as _;
+    // Product names allow 64 lowercase ASCII bytes; instance ids themselves are arbitrary.
+    // None and the explicit main instance address the same persistent scope and directory.
+    let id = instance.unwrap_or(crate::upgrade::MAIN);
+    let digest = hex::encode(sha2::Sha256::digest(format!("runner/{name}/{id}").as_bytes()));
+    format!("runner.{}", digest.chars().take(56).collect::<String>())
+}
+
+fn runner_machine_namespace(name: &str) -> String {
+    use sha2::Digest as _;
+    let digest = hex::encode(sha2::Sha256::digest(name.as_bytes()));
+    format!("machine.{}", digest.chars().take(56).collect::<String>())
+}
+
+fn agent_paths(o: &Opts, quic: &str) -> crate::tunnel::Paths {
+    if o.ephemeral {
+        crate::tunnel::Paths::new(&o.server_url, quic)
+    } else {
+        crate::tunnel::Paths::remembering(&o.server_url, quic, crate::upgrade::own_dir(&o.state_dir, o.instance.as_deref()).join("transport"))
+    }
+}
+
+/// U15: the replicated runner has one upstream dial owner, active before SQL bootstrap and
+/// throughout application startup. Every raw connection event reaches the carrier in order;
+/// the application never reconstructs connectivity from a partial startup snapshot.
+fn replicated_uplink(net: net::NetHandle, events: async_channel::Receiver<NetEvent>, mut paths: crate::tunnel::Paths, http: Arc<Client>, shutdown: Shutdown) -> async_channel::Receiver<NetEvent> {
+    let (tx, rx) = async_channel::bounded(1);
+    crate::rt::spawn(async move {
+        let mut connected = false;
+        let mut backoff = Duration::from_millis(500);
+        let mut redial = Some(Instant::now());
+        let mut dialing: Option<Instant> = None;
+        let mut tick = Instant::now() + Duration::from_secs(1);
+        loop {
+            enum Next { Stop, Dial, Tick, Event(Result<NetEvent, async_channel::RecvError>) }
+            let next = futures::select_biased! {
+                () = shutdown.cancelled().fuse() => Next::Stop,
+                () = tx.closed().fuse() => Next::Stop,
+                () = crate::rt::sleep_until(tick).fuse() => Next::Tick,
+                () = sleep_until_opt(redial).fuse() => Next::Dial,
+                event = events.recv().fuse() => Next::Event(event),
+            };
+            match next {
+                Next::Stop => break,
+                Next::Dial => {
+                    redial = None;
+                    let target = futures::select_biased! {
+                        () = shutdown.cancelled().fuse() => break,
+                        target = paths.target(&http, Instant::now()).fuse() => target,
+                    };
+                    match target {
+                        Ok(addr) => {
+                            dialing = Some(Instant::now());
+                            net.command(Out::Connect { addr }).await;
+                        }
+                        Err(error) => {
+                            tracing::warn!(error = %format!("{error:#}"), "U15: cannot resolve replicated upstream");
+                            redial = Some(Instant::now() + crate::sup::jitter(backoff));
+                            backoff = (backoff * 2).min(Duration::from_secs(30));
+                        }
+                    }
+                }
+                Next::Tick => {
+                    let now = Instant::now();
+                    tick = now + Duration::from_secs(1);
+                    if !connected && dialing.is_some_and(|at| now.saturating_duration_since(at) > DIAL_TIMEOUT) {
+                        dialing = None;
+                        net.command(Out::Rebuild).await;
+                        redial = Some(if paths.dial_failed(now) { now } else { now + crate::sup::jitter(backoff) });
+                        backoff = (backoff * 2).min(Duration::from_secs(30));
+                    }
+                    if paths.tick(connected, now) {
+                        connected = false;
+                        dialing = None;
+                        redial = Some(now);
+                    }
+                }
+                Next::Event(Ok(event)) => {
+                    let now = Instant::now();
+                    match &event {
+                        NetEvent::Connected { binding, .. } => {
+                            paths.connected(*binding, now);
+                            connected = true;
+                            dialing = None;
+                            redial = None;
+                            backoff = Duration::from_millis(500);
+                        }
+                        NetEvent::Closed { .. } | NetEvent::Unreachable { .. } => {
+                            let immediate = if connected { paths.disconnected(); false } else { paths.dial_failed(now) };
+                            connected = false;
+                            dialing = None;
+                            redial = Some(if immediate { now } else { now + crate::sup::jitter(backoff) });
+                            backoff = (backoff * 2).min(Duration::from_secs(30));
+                        }
+                        NetEvent::Frame { .. } => {}
+                    }
+                    // Keep one raw event in flight. The carrier buffers application startup
+                    // independently, so waiting here cannot wait on SQL or the application loop.
+                    let sent = futures::select_biased! {
+                        () = shutdown.cancelled().fuse() => break,
+                        sent = tx.send(event).fuse() => sent,
+                    };
+                    if sent.is_err() {
+                        shutdown.cancel();
+                        break;
+                    }
+                }
+                Next::Event(Err(_)) => { shutdown.cancel(); break; }
+            }
+        }
+    });
+    rx
+}
+
+/// U05: changing an existing aggregate's authority requires bounded reconciliation and
+/// old-producer drain, not an implicit import/merge into another host database.
+#[derive(Debug)]
+struct HostMigrationNeeded {
+    retained: PathBuf,
+    canonical: PathBuf,
+}
+impl std::fmt::Display for HostMigrationNeeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "U05 host database migration needed: retained authority {} differs from configured host {}; no database was opened or switched; quiesce producers and reconcile the preserved aggregate explicitly", self.retained.display(), self.canonical.display())
+    }
+}
+impl std::error::Error for HostMigrationNeeded {}
+
+/// Compare existing directory aliases without creating a destination or rebasing a relative
+/// Config path. A missing directory remains relative to the same process CWD as server startup.
+fn host_directory_identity(path: &Path) -> anyhow::Result<PathBuf> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(path.canonicalize()?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(std::path::absolute(path)?),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// U05: a bounded read-only path preflight. Existing aggregate authority is never treated as
+/// a generic legacy table import. This is not a concurrent-producer retirement proof.
+fn configured_host_database(config: &crate::config::Config, state: &Path, work: &Path) -> anyhow::Result<PathBuf> {
+    let canonical = host_directory_identity(&config.server.data_dir)?;
+    let mut roots = crate::server::legacy_conversation_sources(state)?.into_iter()
+        .filter_map(|path| path.parent().map(Path::to_path_buf)).collect::<Vec<_>>();
+    let legacy_cache = work.join("_cas");
+    roots.extend([work.to_path_buf(), legacy_cache.clone()]);
+    // Preserve every source role before deduplicating aliases: `_cas` can point at a
+    // state/instance root whose ledger marker must still be checked as cache authority.
+    let mut retained = std::collections::BTreeMap::new();
+    for root in roots {
+        let identity = host_directory_identity(&root)?;
+        let cache = root == legacy_cache;
+        // The cache role is evidence even when its directory is the configured destination.
+        // A retained directory/fence ledger is never absence of an importable SQLite file.
+        if cache {
+            let ledger = root.join("ledger.db");
+            match std::fs::symlink_metadata(&ledger) {
+                Ok(_) => if !std::fs::metadata(&ledger)?.is_file() {
+                    return Err(HostMigrationNeeded { retained: ledger, canonical: config.server.data_dir.clone() }.into());
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if identity == canonical { continue; }
+        let (_, is_cache) = retained.entry(identity).or_insert((root, false));
+        *is_cache |= cache;
+    }
+    let mut entries_seen = 0usize;
+    for (root, is_cache) in retained.into_values() {
+        let entries = match std::fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).with_context(|| format!("U05 inspect retained host authority {}", root.display())),
+        };
+        for entry in entries {
+            entries_seen = entries_seen.checked_add(1).context("U05 retained authority inventory overflow")?;
+            anyhow::ensure!(entries_seen <= 65_536, "U05 retained authority inventory exceeds its bound; all paths retained and startup refused");
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            // Include sidecars and interrupted aggregate cutovers. The raw SQLite ledger
+            // remains an input to the existing bounded cache importer, not a second writer.
+            let aggregate = name.starts_with("amphora.db") || name.starts_with("kiln.db") || name == "replica"
+                || (name == "cluster" && (entry.file_type()?.is_symlink() || match std::fs::symlink_metadata(entry.path().join("cluster.log")) {
+                    Ok(_) => true,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(error) => return Err(error.into()),
+                }))
+                || (is_cache && name == "ledger.db" && !std::fs::metadata(entry.path())?.is_file());
+            if aggregate {
+                return Err(HostMigrationNeeded { retained: entry.path(), canonical: config.server.data_dir.clone() }.into());
+            }
+        }
+    }
+    // Keep the exact configured relative-path semantics and the existing Store cutover API.
+    Ok(config.server.data_dir.join("kiln.db"))
+}
+
+pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> { run_in(o, shutdown, crate::runner::processes::Admission::production()).await }
+
+pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::runner::processes::Admission) -> anyhow::Result<()> {
+    anyhow::ensure!(o.instance.as_deref() != Some(crate::upgrade::MAIN), "U17: instance name main is reserved for the default runner; omit --instance (retained instance files are not moved)");
+    // U05: resolve local host configuration once, before creating any startup state or
+    // opening either database. Enrollment/work/instance directories retain their old meaning.
+    let standalone_host = if o.shared_store.is_none() {
+        let (state, work) = (o.state_dir.clone(), o.work_dir.clone());
+        let config_path = o.config.clone().unwrap_or_else(crate::config::default_config_path);
+        Some(crate::rt::blocking(move || -> anyhow::Result<_> {
+            let config = crate::config::Config::load(&config_path)?;
+            let legacy = configured_host_database(&config, &state, &work)?;
+            Ok((legacy, config.cluster.replica))
+        }).await??)
+    } else { None };
     crate::os::start_reaper();
     crate::updates::warm_own_binary().await;
     // A Mac set up for kiln signing: launchd's re-sign watcher as this kiln writes it.
@@ -1001,16 +1138,18 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         std::thread::spawn(crate::os::macsign::keep_watching);
     }
     std::fs::create_dir_all(&o.work_dir).with_context(|| format!("create {}", o.work_dir.display()))?;
-    // Where the runner's cache service opens once something asks for it (docs/ci.md W24-R08).
-    crate::runner::work::service::set_home(&o.work_dir);
-    let orphans = crate::exec::reap_orphans(&o.work_dir);
-    if orphans > 0 {
-        tracing::warn!(orphans, "killed job processes left over from a previous agent run");
-    }
     if let Some(max) = o.declared.cache_max.as_deref().filter(|m| crate::runner::cache::parse_size(m).is_none()) {
         tracing::warn!(cache_max = max, "[agent] cache_max isn't a size (`20G`, `512M`): kiln/cache keeps up to 10G");
     }
     let (ca, leaf, enrolled_quic) = credentials(&o, &shutdown).await?;
+    let executor_bootstrap = enrolled_executor(&o.state_dir, &leaf)?;
+    // U03: only authenticated pod enrollment can bypass native host containment recovery.
+    if executor_bootstrap.is_none() {
+        let orphans = crate::runner::processes::reap_in(&o.work_dir, &admission_paths).await?;
+        if orphans > 0 {
+            tracing::warn!(orphans, "killed job processes left over from a previous agent run");
+        }
+    }
     // This process's own files (a runner beside another one of the machine shares the state
     // directory, never a file).
     let own_dir = crate::upgrade::own_dir(&o.state_dir, o.instance.as_deref());
@@ -1035,6 +1174,15 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     if name != crate::pki::sanitize_name(&o.name) {
         tracing::info!(certificate = %name, requested = %o.name, "using the agent name from this agent's certificate");
     }
+    // U15: replication is explicit configuration, never inferred from a server capability.
+    // The server's in-process runner already has the host owner and its carrier.
+    let replica = standalone_host.as_ref().and_then(|(_, replica)| replica.clone());
+    if let Some(config) = &replica {
+        config.validate()?;
+        anyhow::ensure!(config.id != config.hub, "U15: standalone runner replica id must differ from the declared hub id");
+        anyhow::ensure!(config.source(&name, config.id), "U15: authenticated runner {name} does not match the configured route for replica {}", config.id);
+    }
+    let replicated_transport = replica.is_some();
     let quic_addr = o
         .quic
         .clone()
@@ -1045,16 +1193,6 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // A microVM's leg reaches the server as this runner does, so it trusts the same CA (W13-R05).
     #[cfg(target_os = "linux")]
     let microvm_ca = ca.clone();
-    // This machine's front door (DNS, HTTPS, a .local name), when the server gives it one. It runs
-    // from the settings it stored at once, and keeps running while the server is away.
-    let front_door = (!o.ephemeral && !o.outpost).then(|| {
-        crate::frontdoor::runner::start(
-            crate::frontdoor::runner::Ctx { dir: o.state_dir.join("front-door"), server_url: o.server_url.clone(), ca_der: ca.clone() },
-            &shutdown,
-        )
-    });
-    // What the server last heard of it on this connection.
-    let mut front_door_sent: Option<String> = None;
     // This machine's headroom (docs/headroom.md): started before any agent session resumes, so a
     // restart's sessions come back a few at a time; it runs from the settings it kept, server or not.
     let headroom = (!o.ephemeral && !o.outpost)
@@ -1062,7 +1200,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // What the server last heard of it, and whether this server takes it.
     let mut headroom_sent: Option<String> = None;
     let mut server_headroom = false;
-    let (net, events) = net::start(net::Spec { bind: "0.0.0.0:0".parse()?, ca_der: ca, leaf, server: false, dial_deadline: net::DIAL_DEADLINE, revoked_keys: Vec::new() })?;
+    let (net, events) = net::start(net::Spec { bind: "0.0.0.0:0".parse()?, ca_der: ca.clone(), leaf, server: false, dial_deadline: net::DIAL_DEADLINE, revoked_keys: Vec::new() })?;
     // A test build's faults: frames lost, sent twice or sent late below the channel, which it
     // makes up for.
     if let Some(c) = crate::runner::chaos::get() {
@@ -1076,16 +1214,56 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         }
     }
     // UDP to the QUIC address, or the HTTP tunnel when UDP gets no answer (see `crate::tunnel`).
-    let mut paths = if o.ephemeral {
-        crate::tunnel::Paths::new(&o.server_url, &quic_addr)
+    let mut paths = agent_paths(&o, &quic_addr);
+
+    let (host_store, events, carrier_active) = if let Some(config) = replica {
+        let legacy = standalone_host.as_ref().map(|(path, _)| path.clone()).context("U05 missing configured standalone host database")?;
+        let log_path = legacy.parent().context("U05 configured host database has no directory")?.join("replica");
+        let opening = config.clone();
+        let database = crate::rt::blocking(move || crate::server::open_replica(&log_path, &legacy, &opening)).await??;
+        // One dial owner for the whole lifetime, including quorum-dependent startup. Its event
+        // stream preserves connection transitions for both the carrier and application loop.
+        let incoming = replicated_uplink(net.clone(), events, agent_paths(&o, &quic_addr), http.clone(), shutdown.clone());
+        let (events, active) = crate::replication::carrier(database.clone(), config, net.clone(), incoming, shutdown.clone())?;
+        crate::replication::wait_for_writer(&database, &shutdown).await?;
+        let legacy = standalone_host.as_ref().map(|(path, _)| path.clone()).context("U05 missing configured standalone host database")?;
+        let store = crate::rt::blocking(move || crate::store::Store::from_database_with_legacy(database, &legacy)).await??;
+        (store, events, active)
     } else {
-        crate::tunnel::Paths::remembering(&o.server_url, &quic_addr, crate::upgrade::own_dir(&o.state_dir, o.instance.as_deref()).join("transport"))
+        let store = match &o.shared_store {
+            Some(store) => store.clone(),
+            None => {
+                let path = standalone_host.as_ref().map(|(path, _)| path.clone()).context("U05 missing configured standalone host database")?;
+                crate::rt::blocking(move || crate::store::Store::open(&path)).await??
+            }
+        };
+        (store, events, Arc::new(std::sync::atomic::AtomicBool::new(false)))
     };
+    let database = host_store.database();
+    // This machine's front door (DNS, HTTPS, a .local name), when the server gives it one. It runs
+    // from the settings it stored at once, and keeps running while the server is away.
+    let front_door = if !o.ephemeral && !o.outpost {
+        Some(crate::frontdoor::runner::start(
+            crate::frontdoor::runner::Ctx { dir: o.state_dir.join("front-door"), server_url: o.server_url.clone(), ca_der: ca.clone() },
+            Arc::new(crate::records::from_database(&database, &runner_machine_namespace(&name))?),
+            &shutdown,
+        ).await?)
+    } else { None };
+    // What the server last heard of it on this connection.
+    let mut front_door_sent: Option<String> = None;
+    let mut retained_spool = retained::Spool::new_in(Arc::new(crate::records::from_database(&database, &runner_machine_namespace(&name))?), admission_paths.clone());
+    crate::runner::work::service::set_home(&o.work_dir, host_store.clone(), &name, o.declared.cache_max.as_deref().and_then(crate::runner::cache::parse_size));
+    // U07/U15: finish canonical metadata imports before Hello can advertise runner work.
+    crate::runner::work::service::ensure_ready().await?;
 
     let (up_tx, up_rx) = async_channel::bounded::<Up>(8192);
+    let mut deferred_control = DeferredControl::default();
+    let mut retained_blocked: Option<(Up, Instant)> = None;
     // Repo sync: the copies of synced repos this machine holds (none in a job pod or an outpost).
-    let sync = (!o.ephemeral && !o.outpost).then(|| {
-        let (sync, said) = crate::sync::runner::Runner::start(&o.state_dir, &name, http.clone(), o.server_url.clone());
+    let sync = if !o.ephemeral && !o.outpost {
+        // U17: clone path provenance shares this host's authenticated machine namespace.
+        let clone_records = Arc::new(crate::records::from_database(&database, &runner_machine_namespace(&name))?);
+        let (sync, said) = crate::sync::runner::Runner::start(&o.state_dir, &name, http.clone(), o.server_url.clone(), clone_records).await?;
         // An agent session moving between machines asks it where its folder stands.
         crate::sync::runner::set_global(sync.clone());
         let up = up_tx.clone();
@@ -1096,8 +1274,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
             }
         });
-        sync
-    });
+        Some(sync)
+    } else { None };
     // Observe: this machine's replica of the observe group and its writes (none in a job pod).
     let observe = (o.observe && !o.ephemeral).then(|| {
         let obs = crate::observe::Observe::start(crate::observe::Settings {
@@ -1145,26 +1323,20 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         });
         obs
     });
-    // The cluster group's learner: this machine's replica of kiln's records (docs/p2p.md, P2),
-    // started once the server says which member it is (never in a job pod or an outpost).
-    let cluster: Arc<parking_lot::Mutex<Option<Arc<crate::store::learner::Learner>>>> = Arc::default();
-    let cluster_starting = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    // The server's last word to join the group as a learner (`None` once it said Leave): what a
-    // replica being started goes on with.
-    let cluster_join: Arc<parking_lot::Mutex<Option<(u64, String)>>> = Arc::default();
     // Reach: links to other runners, and the runs this machine does for them (none in a job pod).
     // Agent sessions other runners hand this one (a session moving here) are taken over by its
     // session host, once there is one (below).
     let (adopt_tx, adopt_rx) = async_channel::bounded::<crate::reach::node::Adoption>(4);
-    let reach = o.reach.filter(|_| !o.ephemeral).map(|accept| {
+    let keeper_records: Arc<dyn kiln_seams::Records> = Arc::new(crate::records::from_database(&database, &runner_machine_namespace(&name))?);
+    let reach = if let Some(accept) = o.reach.filter(|_| !o.ephemeral) {
         let cfg = crate::reach::node::Config { adopt: Some(adopt_tx.clone()), objects: None, ..crate::reach::node::Config::for_runner(&name, &o.state_dir, accept) };
-        (Arc::clone(&cfg.using), cfg.mirrors.clone(), crate::reach::node::start(cfg))
-    });
+        Some((Arc::clone(&cfg.using), cfg.mirrors.clone(), crate::reach::node::start_in(cfg, admission_paths.clone()).await))
+    } else { None };
     let reach = reach.and_then(|(using, mirrors, started)| match started {
         Ok((handle, said)) => {
             crate::reach::node::set_global(handle.clone());
             // What other runners' trees left here, kept as people's rules say (docs/reach.md §5.1).
-            crate::reach::keeper::start(handle.clone(), using, mirrors);
+            crate::reach::keeper::start(handle.clone(), using, mirrors, keeper_records.clone());
             let up = up_tx.clone();
             crate::rt::spawn(async move {
                 while let Ok(m) = said.recv().await {
@@ -1191,19 +1363,6 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         }
     });
     let uplink = Uplink(up_tx);
-    let replica = ReplicaStart {
-        slot: cluster.clone(),
-        starting: cluster_starting.clone(),
-        join: cluster_join.clone(),
-        up: uplink.0.clone(),
-        dir: o.state_dir.clone(),
-        me: name.clone(),
-        server: o.server_url.clone(),
-        http: http.clone(),
-    };
-    if !o.ephemeral && !o.outpost {
-        crate::rt::spawn(replica.clone().watch());
-    }
     // Agent sessions handed to this machine's newer runner process go by way of the server.
     crate::harness::handing::install(uplink.0.clone());
     // Its facts, probed again every 10 minutes (docs/ci.md W13-R01); once on each connection.
@@ -1216,7 +1375,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             }
         });
     }
-    let (done_tx, done_rx) = async_channel::unbounded::<JobResult>();
+    let (done_tx, done_rx) = async_channel::unbounded::<(JobResult, Option<u32>)>();
     let mut buffer: VecDeque<(u32, Kind, Vec<u8>)> = VecDeque::new();
     let mut buffered = 0usize;
     // Jobs' results the server hasn't said it has (`ServerMsg::Received`), each encoded, by job:
@@ -1228,12 +1387,15 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut journal: HashMap<String, (Instant, u64, Vec<Vec<u8>>)> = HashMap::new();
     let mut receipts = false;
     let mut connected = false;
+    // Frame origin belongs to this event owner; a delayed old TLS frame cannot revive a
+    // command incarnation after its receiver state was reclaimed.
+    let mut server_connection: Option<crate::net::Connection> = None;
     // The server has taken this connection's Hello (it said Welcome). Logs, on a lane of their own,
     // wait for that, or the server, not knowing whose they are yet, drops them; and jobs' messages
     // with them, to come after what was held.
     let mut welcomed = false;
     let mut dial_backoff = Duration::from_millis(500);
-    let mut redial: Option<Instant> = Some(Instant::now());
+    let mut redial: Option<Instant> = (!replicated_transport).then(Instant::now);
     let mut dialing_since: Option<Instant> = None;
     // A test build's faults (W22-AC04): the connection dropped every so often, and what's sent the
     // server late.
@@ -1247,10 +1409,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     };
     let mut jobs: HashMap<String, Running> = HashMap::new();
     // Pools' executors this runner started (docs/ci.md W13-R09).
-    let pool_execs = crate::runner::pool::Executors::default();
+    // Process identity survives transport reconnects, never a process restart or install/PID reuse.
+    let process_nonce = crate::util::random_token();
+    let pool_execs = crate::runner::pool::Executors::for_process_in(process_nonce.clone(), admission_paths.clone());
     crate::runner::pool::sweep(&o.work_dir);
     // And the containers and networks this runner left running when it last stopped.
-    crate::runner::docker::sweep(&o.work_dir).await;
+    crate::runner::docker::sweep(&o.work_dir).await?;
     // Its microVM deployments (W15-R02), booted again: they end with the runner.
     #[cfg(target_os = "linux")]
     crate::rt::spawn(crate::runner::firecracker::restore(o.work_dir.join("_firecracker")));
@@ -1264,25 +1428,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // has, with what was typed meanwhile.
     let mut shell_waits: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
     let (term_tx, term_rx) = async_channel::bounded::<(String, PtyOut)>(1024);
-    // Upgrades: a new binary on disk is taken up once no job runs, every terminal handed on so
-    // shells survive. On Linux this process re-executes itself (same pid). On macOS, where a
-    // process that re-executed itself loses the local network, it hands the terminals to its
-    // supervisor and exits, and the supervisor starts the new binary as a fresh process.
-    let exe = std::env::current_exe().ok();
-    let mut exe_mtime = exe.as_deref().and_then(binary_mtime);
-    let mut upgrade_pending = false;
-    // Only a `kiln agent` process upgrades itself: the server's in-process agent shares its
-    // process with the server, whose upgrades its supervisor handles.
-    let standalone = std::env::args().skip(1).find(|a| !a.starts_with('-')).as_deref() == Some("agent");
-    let started_as = adopt_handover(&o, &mut terms, &term_tx);
-    let successor = crate::os::UPGRADE_BY_SUCCESSOR && standalone && !o.ephemeral;
-    let channel = crate::os::supervise::has_supervisor_channel();
-    let supervised = std::env::var("KILN_SUPERVISED").is_ok_and(|v| v == "1");
-    // On macOS a supervised runner its supervisor can't hand over for (an older supervisor, or
-    // one an older kiln re-executed in place, which may have cut this process tree off from the
-    // local network) has launchd start it afresh, from its launcher, once it is idle.
-    let mut relaunch_wanted = successor && supervised && !channel && started_as == Start::ReExecuted;
-    let mut relaunch_asked: Option<Instant> = None;
+    // U16: upgrades are explicit CI/CD commands. Legacy terminal handovers are still
+    // adopted, but a changed executable pathname never selects or activates a runner build.
+    let standalone = crate::supervise::subcommand(&std::env::args().skip(1).collect::<Vec<_>>()) == Some("agent");
+    adopt_handover(&o, &mut terms, &term_tx);
+    #[cfg(unix)]
+    let mut activation: Option<crate::bluegreen::Supervisor> = None;
     // AI coding sessions running on this machine (job pods have none), reported as they change.
     let ai = (!o.ephemeral).then(|| crate::aisessions::Reporter::new(crate::os::home_dir()));
     // Kiln-native agent sessions on this machine (not in job pods, and not in the server's own
@@ -1297,6 +1448,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut sent_changes = SentChanges::default();
     // The server keeps the channel: it said so on this connection, before its Welcome.
     let mut server_wire = false;
+    let mut server_shaped_commands = false;
+    let mut server_activation: Option<crate::net::Connection> = None;
+    let mut server_layout: Option<crate::net::Connection> = None;
     // The server takes what this runner's QUIC layer dropped (`AgentMsg::NetDrops`), and what it
     // was last told of it on this connection.
     let mut server_drops = false;
@@ -1364,65 +1518,78 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // It took the sessions over (the runner it upgrades said that was everything).
     #[cfg(unix)]
     let mut took_over = false;
-    // Conversations kept on disk as they happen (docs/conversations.md), and sent to the server's
-    // store over this link (`crate::convo::feed`).
+    // U15: conversations share the host product database; no application feed ships records.
     let mut convo: Option<crate::convo::store::Store> = None;
     // How many agent sessions it has at work at once (docs/agents.md, "How many agents a machine
     // runs"): what was set for this machine from the server (kept here for its restarts), else its
     // config's, else kiln's default. What the server sets is taken as it says it, and the config is
     // read again as it changes.
-    let mut limit_asked = crate::harness::limit::kept(&o.state_dir);
+    // U17: loading accepted policy must succeed before Host restores or starts queued sessions.
+    let mut limit_policy = crate::harness::limit::RunnerPolicy::from_database(&database, &runner_machine_namespace(&name), &o.state_dir).await?;
+    let mut limit_asked = limit_policy.asked();
     let mut limit_config = o.declared.max_agent_sessions;
     // What the server was told this machine holds, on this connection; and whether it takes that.
     let mut limit_said: Option<crate::harness::limit::Held> = None;
     let mut server_limit = false;
-    let harness = (!o.ephemeral && o.terminal).then(|| {
-        // Agents' workspaces of their own: one place per machine, whichever runner process holds them.
+    let mut server_job_attempt = false;
+    let mut server_retained_received = false;
+    let harness = if !o.ephemeral && o.terminal {
+        // U05/U17: Records, conversations and the work ledger share this host owner. Opening or
+        // importing failure is a startup error; continuing empty would discard recovery state.
         crate::workspace::slates::init(&o.state_dir);
-        convo = crate::convo::open(&own_dir, crate::config::Conversations::default().upkeep());
-        let sink = convo.as_ref().map_or_else(|| harness_tx.clone(), |st| crate::convo::store::tee(harness_tx.clone(), st.clone(), 8192));
         let held = crate::harness::limit::held(limit_asked, limit_config);
         if held.from != crate::harness::limit::Source::Default {
             tracing::info!(max_sessions = held.max_sessions, from = ?held.from, "agent sessions: this machine has at most this many at work at once");
         }
         let limits = crate::harness::host::Limits { per_machine: held.max_sessions };
-        let h = crate::harness::host::Host::new(sink, Some(own_dir.join("harness.json")), limits);
-        // A new build taking over takes no messages till it's promoted (`Host::hold`).
-        if take_over_pending.is_some() {
-            h.hold(true);
-        }
-        h.restore_from(convo.as_ref());
-        h
-    });
+        let db = database.clone();
+        let dir = own_dir.clone();
+        let conversations_on = crate::convo::enabled();
+        let conversation_sources = if conversations_on { crate::server::legacy_conversation_sources(&o.state_dir)? } else { Vec::new() };
+        let conversation_host = name.clone();
+        let scope = format!("runner/{name}/{instance_id}");
+        let namespace = runner_records_namespace(&name, o.instance.as_deref());
+        let machine_namespace = runner_machine_namespace(&name);
+        let sink = harness_tx.clone();
+        let hold = take_over_pending.is_some();
+        // U15/U17: namespace import and Host restoration can wait for product quorum too;
+        // keep them off the shard running the independent transport carrier.
+        let (st, h) = crate::rt::blocking(move || -> anyhow::Result<_> {
+            crate::records::import_host_namespace(&db, &dir.join(crate::records::FILE), &namespace)?;
+            let storage = if conversations_on {
+                Some(crate::records::SessionStorage::from_host_database(db.clone(), &conversation_host, &conversation_sources, crate::config::Conversations::default().upkeep())?)
+            } else { None };
+            let st = storage.as_ref().map(crate::records::SessionStorage::conversations);
+            let sink = match &st {
+                Some(store) => crate::convo::store::tee(sink, store.clone(), 8192),
+                None => sink,
+            };
+            let machine: Arc<dyn kiln_seams::Records> = Arc::new(crate::records::from_database(&db, &machine_namespace)?);
+            let h = match storage {
+                Some(storage) => crate::harness::host::Host::try_with_session_namespace(sink, Some(dir.join("harness.json")), limits, crate::rt::clock(), storage.bind_namespace(&namespace, None)?, machine, &scope)?,
+                None => {
+                    let sessions: Arc<dyn kiln_seams::Records> = Arc::new(crate::records::from_database(&db, &namespace)?);
+                    crate::harness::host::Host::try_with_namespaces(sink, Some(dir.join("harness.json")), limits, crate::rt::clock(), (sessions, machine), &scope)?
+                }
+            };
+            if hold { h.hold(true); }
+            h.try_restore_from(st.as_ref())?;
+            Ok((st, h))
+        }).await??;
+        convo = st;
+        Some(h)
+    } else { None };
     // The harnesses its user's login shell finds are this machine's too
     // (`crate::harness::kinds::search_path`): that shell is asked now, and every ten minutes.
     if harness.is_some() {
         crate::rt::spawn(crate::reach::serve::login_env());
     }
-    // A copy of the server's store this runner keeps, if the server picks it (a mirror), and
-    // that copy sent back while the server restores its store from it.
-    let mut mirror: Option<crate::convo::feed::Intake> = None;
-    let mut mirror_store: Option<crate::convo::store::Store> = None;
-    let mut restoring: Option<(String, crate::convo::feed::Shipper)> = None;
-    let shipper = convo.clone().map(|st| {
-        // The harnesses' own records, followed into the store.
-        if let Some(h) = harness.clone() {
-            let follow = h;
-            if let Err(e) = crate::convo::record::Recorder::start(st.clone(), move || follow.record_sources()) {
-                tracing::warn!(error = %format!("{e:#}"), "the harnesses' records won't be kept in the conversation store");
-            }
-        }
-        let (shipper, said) = crate::convo::feed::Shipper::start(st);
-        let up = uplink.0.clone();
-        crate::rt::spawn(async move {
-            while let Ok((json, data)) = said.recv().await {
-                if up.send(Up::Convo(AgentMsg::Convo { json, data })).await.is_err() {
-                    break;
-                }
-            }
-        });
-        shipper
-    });
+    // U15: record sources enter the canonical product database; no application feed or mirror.
+    if let (Some(st), Some(h)) = (convo.clone(), harness.clone())
+        && let Err(e) = crate::convo::record::Recorder::start(st, move || h.record_sources())
+    {
+        tracing::warn!(error = %format!("{e:#}"), "the harnesses' records won't be kept in the conversation store");
+    }
     // What `kiln spawn` in this machine's terminals talks to.
     let harness_sock = harness.as_ref().and_then(|h| {
         let path = crate::harness::socket::path(&name, &o.state_dir);
@@ -1455,7 +1622,6 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             }
         });
     }
-    let mut harness_wait: Option<Instant> = None;
     // What it last told the server of its machine's say on upgrades, and the newer kiln it heard of.
     let mut accept_said: Option<bool> = None;
     // Its battery: when it was last read, and what was last said of it, when.
@@ -1491,12 +1657,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     };
 
     'events: loop {
+        deferred_control.flush(&uplink.0)?;
         if let Some((stream, seq, refusal)) = answer_after.take() {
             let a = match refusal {
                 Some((code, why)) => wire_in.refused(&stream, seq, code, why),
                 None => wire_in.took(&stream, seq),
             };
-            uplink.0.send(Up::Term(AgentMsg::Wire(a))).await.ok();
+            deferred_control.enqueue(&uplink.0, Up::Term(AgentMsg::Wire(a)))?;
         }
         if let Some(until) = lingering
             && ((crate::observe::collect::get().is_none_or(|c| c.stopped()) && crate::observe::last_written()) || Instant::now() >= until)
@@ -1505,7 +1672,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         }
         // Ephemeral agents leave once their one job is done and everything is delivered: its
         // result received, or given 30 s (a server older than receipts never says).
-        if o.ephemeral && served_dedicated && jobs.is_empty() && buffer.is_empty() && up_rx.is_empty() && unreceived.values().all(|(at, _)| at.elapsed() > Duration::from_secs(30)) {
+        if o.ephemeral && served_dedicated && jobs.is_empty() && buffer.is_empty() && retained_blocked.is_none() && deferred_control.pending.is_empty() && up_rx.is_empty() && unreceived.values().all(|(at, _)| at.elapsed() > Duration::from_secs(30)) {
             tracing::info!("ephemeral agent finished its job; exiting");
             crate::rt::sleep(Duration::from_millis(500)).await;
             return Ok(());
@@ -1531,10 +1698,23 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             crate::browser::driven::stop_all().await;
             return Ok(());
         }
-        let ev = futures::select_biased! {
+        let ev = if let Some(retry_at) = retained_blocked.as_ref().map(|(_, at)| *at) {
+            // U03: hold later local events behind a failed spool commit, but keep consuming
+            // server receipts and replay ticks so a full spool can make progress.
+            futures::select_biased! {
+                () = shutdown_or_tick(&shutdown, lingering.is_some()).fuse() => Ev::Shutdown,
+                ev = events.recv().fuse() => Ev::Net(ev.ok()),
+                () = sample_tick.tick().fuse() => Ev::Sample,
+                () = sleep_until_opt(Some(retry_at)).fuse() => match retained_blocked.take() {
+                    Some((up, _)) => Ev::Up(up),
+                    None => Ev::Watchdog,
+                },
+            }
+        } else if deferred_control.pending.is_empty() {
+            futures::select_biased! {
             () = shutdown_or_tick(&shutdown, lingering.is_some()).fuse() => Ev::Shutdown,
             ev = events.recv().fuse() => Ev::Net(ev.ok()),
-            r = done_rx.recv().fuse() => match r { Ok(r) => Ev::Done(r), Err(_) => Ev::Watchdog },
+            r = done_rx.recv().fuse() => match r { Ok((r, attempt)) => Ev::Done(r, attempt), Err(_) => Ev::Watchdog },
             () = heartbeat.tick().fuse() => Ev::Heartbeat,
             () = sample_tick.tick().fuse() => Ev::Sample,
             () = watchdog.tick().fuse() => Ev::Watchdog,
@@ -1556,6 +1736,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 Err(_) => Ev::Watchdog,
             },
             () = sleep_until_opt(retire_at.filter(|_| retiring && jobs.is_empty() && terms.is_empty())).fuse() => Ev::Watchdog,
+            }
+        } else {
+            // Free room and append pending controls behind all already queued job events.
+            futures::select_biased! {
+                () = shutdown_or_tick(&shutdown, lingering.is_some()).fuse() => Ev::Shutdown,
+                up = up_rx.recv().fuse() => match up { Ok(up) => Ev::Up(up), Err(_) => Ev::Watchdog },
+            }
         };
         match ev {
             Ev::Shutdown => {
@@ -1596,6 +1783,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 if connected {
                     chaos_down = chaos.and_then(|c| c.down_for).map(|d| Instant::now() + d);
                     tracing::warn!(down_for = ?chaos.and_then(|c| c.down_for), "chaos: dropping the connection to the server");
+                    server_connection = None;
+                    server_layout = None;
+                    server_activation = None;
                     net.command(Out::Disconnect { peer: SERVER_PEER }).await;
                 }
             }
@@ -1620,7 +1810,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             std::fs::create_dir_all(&idir)?;
                             crate::util::write_secret(&idir.join("instance.json"), &serde_json::to_vec_pretty(&rec)?, 0o644)?;
                             let listener = crate::bluegreen::Listener::bind(&sock)?;
-                            let sup = crate::bluegreen::Supervisor::from_env().context("this runner's supervisor can't start a new build beside it")?;
+                            let sup = activation.clone().context(crate::updates::UpgradeRefusal::Backend)?;
                             let green = crate::rt::blocking(move || sup.start(&exe, &args, &env)).await??;
                             Ok((green, listener))
                         }
@@ -1918,6 +2108,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             }
             Ev::Redial => {
                 redial = None;
+                if replicated_transport { continue; }
                 match paths.target(&http, Instant::now()).await {
                     Ok(addr) => {
                         dialing_since = Some(Instant::now());
@@ -1931,112 +2122,6 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
             }
             Ev::Watchdog => {
-                if !o.ephemeral && standalone && crate::os::IN_PLACE_UPGRADE && started.elapsed() > Duration::from_secs(5) {
-                    let now = exe.as_deref().and_then(binary_mtime);
-                    if !upgrade_pending && now.is_some() && now != exe_mtime {
-                        upgrade_pending = true;
-                        tracing::info!(jobs = jobs.len(), terminals = terms.len(), "new kiln binary on disk; taking it up once running jobs finish");
-                    }
-                    // In place, agent sessions go on across it with their processes, mid-turn
-                    // included (`Host::hand_over_all`). As a fresh process (macOS) they are stopped
-                    // and continue (resumed) there, so those mid-turn get up to ten minutes to
-                    // finish first. Reach runs (for other runners, or followed on them) get as long.
-                    let reach_busy = reach.as_ref().map_or(0, crate::reach::node::Handle::busy);
-                    let busy = if successor { harness.as_ref().map_or(0, |h| h.busy()) + reach_busy } else { reach_busy };
-                    if upgrade_pending && busy > 0 {
-                        harness_wait.get_or_insert_with(Instant::now);
-                    }
-                    let ready = busy == 0 || harness_wait.is_some_and(|t| t.elapsed() > Duration::from_secs(600));
-                    if upgrade_pending && !relaunch_wanted && jobs.is_empty() && ready && let Some(exe) = exe.as_deref() {
-                        if let Err(e) = binary_runs(exe).await {
-                            // Never switch to a binary that cannot start: keep this one until
-                            // the binary on disk changes again.
-                            tracing::error!(error = %format!("{e:#}"), exe = %exe.display(), "the new kiln binary does not run; staying on this one");
-                            upgrade_pending = false;
-                            exe_mtime = now;
-                        } else if !successor {
-                            if let Some(h) = &harness {
-                                let n = h.hand_over_all().await;
-                                tracing::info!(sessions = n, "agent sessions handed to the new image, their processes still running");
-                            }
-                            let err = upgrade_in_place(&o, exe, &terms);
-                            // Only reached when the exec failed: carry on with this binary, and
-                            // with the agent sessions just handed over.
-                            tracing::error!(error = %err, "in-place upgrade failed; continuing on the running binary");
-                            if let Some(h) = &harness {
-                                h.take_back();
-                            }
-                            upgrade_pending = false;
-                            exe_mtime = now;
-                        } else if channel {
-                            match write_handover(&o, &terms) {
-                                Ok(masters) => {
-                                    if let Some(h) = &harness {
-                                        h.stop_all();
-                                    }
-                                    match crate::os::supervise::to_supervisor(&masters) {
-                                        Ok(()) => {
-                                            tracing::info!(terminals = masters.len(), "handed over to the supervisor, which starts the new binary as a fresh process");
-                                            HANDED_OVER.store(true, std::sync::atomic::Ordering::SeqCst);
-                                            // The supervisor holds the terminals now: ending
-                                            // their sessions here would hang their shells up.
-                                            std::mem::forget(std::mem::take(&mut terms));
-                                            return Ok(());
-                                        }
-                                        Err(e) => {
-                                            let _ = std::fs::remove_file(handover_path(&o));
-                                            tracing::error!(error = %e, "could not hand over to the supervisor; continuing on the running binary");
-                                        }
-                                    }
-                                }
-                                Err(e) => tracing::error!(error = %format!("{e:#}"), "could not write the terminal handover; continuing on the running binary"),
-                            }
-                            upgrade_pending = false;
-                            exe_mtime = now;
-                        } else if supervised {
-                            relaunch_wanted = true;
-                        } else {
-                            // `kiln agent` run by hand: re-executing would cut it off from the
-                            // local network, and nothing would start it afresh.
-                            tracing::warn!("a new kiln binary is on disk; restart this runner to run it");
-                            upgrade_pending = false;
-                            exe_mtime = now;
-                        }
-                    }
-                    if relaunch_wanted && relaunch_asked.is_none() && jobs.is_empty() && ready {
-                        relaunch_asked = Some(Instant::now());
-                        // Nothing new starts here meanwhile; launchd stops this process shortly.
-                        upgrade_pending = true;
-                        if let Some(h) = &harness {
-                            h.stop_all();
-                        }
-                        let state_dir = o.state_dir.clone();
-                        let instance = o.instance.clone();
-                        match crate::rt::blocking(move || crate::install::relaunch_runner(&state_dir, instance.as_deref())).await {
-                            Ok(Ok(true)) => tracing::warn!("asked launchd to start this runner afresh from its launcher; it stops in a moment"),
-                            Ok(Ok(false)) => {
-                                tracing::warn!("no launchd job runs this runner; restart it yourself to take up the new kiln");
-                                relaunch_wanted = false;
-                            }
-                            Ok(Err(e)) | Err(e) => {
-                                tracing::error!(error = %format!("{e:#}"), "could not have launchd start this runner afresh; restart it yourself");
-                                relaunch_wanted = false;
-                            }
-                        }
-                        if !relaunch_wanted {
-                            upgrade_pending = false;
-                            exe_mtime = now;
-                        }
-                    }
-                    // launchd should have stopped this process long since: take jobs again.
-                    if relaunch_asked.is_some_and(|t| t.elapsed() > Duration::from_secs(600)) {
-                        tracing::error!("launchd never started this runner afresh; carrying on with this binary (restart it yourself)");
-                        relaunch_asked = None;
-                        relaunch_wanted = false;
-                        upgrade_pending = false;
-                        exe_mtime = now;
-                    }
-                }
                 // Terminals into legs close once their leg ends, or is let go when kept (W17-AC01).
                 let gone: Vec<String> = terms.iter().filter(|(_, (_, st))| st.target.strip_prefix("leg:").is_some_and(|job| !crate::runner::kept::live(job))).map(|(id, _)| id.clone()).collect();
                 for session in gone {
@@ -2046,9 +2131,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 // A dial that never resolves (no Connected / Closed / Unreachable) would leave the
                 // agent waiting forever, e.g. after dialing before the network existed at boot.
                 // Treat it as failed: rebuild the endpoint on a fresh socket and dial again.
-                if !connected && dialing_since.is_some_and(|t| t.elapsed() > DIAL_TIMEOUT) {
+                if !replicated_transport && !connected && dialing_since.is_some_and(|t| t.elapsed() > DIAL_TIMEOUT) {
                     tracing::warn!(server = %quic_addr, after = ?DIAL_TIMEOUT, "no answer from server; rebuilding transport and redialing");
                     dialing_since = None;
+                    server_connection = None;
+                    server_layout = None;
+                    server_activation = None;
                     net.command(Out::Rebuild).await;
                     let now = Instant::now();
                     redial = Some(if paths.dial_failed(now) { now } else { now + crate::sup::jitter(dial_backoff) });
@@ -2057,8 +2145,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 // Direct dials unanswered for too long: through the tunnel now. Tunnelled and UDP
                 // answers again: drop this connection (what is sent meanwhile waits in the buffer)
                 // and dial directly; the tunnel stays open until that connection is up.
-                if paths.tick(connected, Instant::now()) {
+                if !replicated_transport && paths.tick(connected, Instant::now()) {
                     connected = false;
+                    server_connection = None;
+                    server_layout = None;
+                    server_activation = None;
                     welcomed = false;
                     if let Some(s) = &sync {
                         s.connected(false);
@@ -2074,13 +2165,22 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
             }
             Ev::Net(None) => anyhow::bail!("transport stopped"),
-            Ev::Net(Some(NetEvent::Connected { binding, .. })) => {
-                tracing::info!(server = %quic_addr, via = %paths.via(), "connected to server");
+            Ev::Net(Some(NetEvent::Connected { peer, epoch, binding, .. })) => {
+                if peer == SERVER_PEER {
+                    server_connection = binding.map(|binding| crate::net::Connection::new(peer, epoch, binding));
+                    server_layout = None;
+                    server_activation = None;
+                }
+                if replicated_transport {
+                    tracing::info!(server = %quic_addr, "connected to server through the replicated upstream controller");
+                } else {
+                    tracing::info!(server = %quic_addr, via = %paths.via(), "connected to server");
+                }
                 chaos_drop = chaos.and_then(|c| c.drop_every).map(|d| Instant::now() + d);
                 // How long saying what it is takes (its build's probes, its facts), told below: the
                 // server's frames wait meanwhile.
                 let said_from = Instant::now();
-                paths.connected(binding, Instant::now());
+                if !replicated_transport { paths.connected(binding, Instant::now()); }
                 dialing_since = None;
                 dial_backoff = Duration::from_millis(500);
                 // Which process of this machine this is, then Hello (an older server skips the first).
@@ -2102,18 +2202,27 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 // Which build this is and that it takes upgrade commands (an older server skips it);
                 // an outpost says it's one instead. Its binary's hash was worked out as this runner
                 // started (`updates::warm_own_binary`), its engine's probes off the event loop.
+                #[cfg(unix)]
+                {
+                    activation = if standalone && !o.ephemeral && !o.outpost {
+                        crate::rt::blocking(crate::bluegreen::Supervisor::for_activation).await.ok().and_then(Result::ok)
+                    } else { None };
+                }
+                let explicit_activation = {
+                    #[cfg(unix)]
+                    { activation.is_some() }
+                    #[cfg(not(unix))]
+                    { let _ = standalone; false }
+                };
                 let building = Instant::now();
                 let mut build = if o.outpost { crate::updates::outpost_build() } else { crate::updates::runner_build().await };
                 let build_took = building.elapsed();
+                // U15: the legacy learner/feed bits are reserved, never advertised by this build.
                 if let AgentMsg::Build { caps, .. } = &mut build {
-                    // It sends its conversations' store: the server keeps them from that.
-                    if shipper.is_some() {
-                        *caps |= proto::CAP_CONVO;
-                    }
-                    // A runner that keeps no replica does not say it replicates.
-                    if observe.is_none() {
-                        *caps &= !proto::CAP_OBSERVE;
-                    }
+                    *caps &= !(proto::CAP_CONVO | proto::CAP_CLUSTER | proto::CAP_BLUE_GREEN);
+                    if explicit_activation { *caps |= proto::CAP_BLUE_GREEN; }
+                    // Observe is advertised only while this runner owns its replica.
+                    if observe.is_none() { *caps &= !proto::CAP_OBSERVE; }
                 }
                 if !o.ephemeral
                     && let Ok(b) = proto::encode(&build)
@@ -2124,12 +2233,17 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 // outpost aside, it says what it holds warm (docs/ci.md W24-R18); running agent
                 // sessions, it takes their limit from the server (docs/agents.md). A test build's
                 // `old` says nothing, as a runner from before the channel.
-                if !o.ephemeral && !crate::runner::chaos::get().is_some_and(|c| c.old) {
+                if !crate::runner::chaos::get().is_some_and(|c| c.old) {
                     let built = if let AgentMsg::Build { caps, .. } = &build { u64::from(*caps) } else { 0 };
                     let work = if o.outpost { 0 } else { proto::CAP_WORK };
                     let headroom_cap = if headroom.is_some() { proto::CAP_HEADROOM } else { 0 };
                     let limit = if harness.is_some() { proto::CAP_AGENT_LIMIT } else { 0 };
-                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit | proto::CAP_IDENTITY | headroom_cap | proto::CAP_UNREAD }) {
+                    let open_once = if harness.is_some() { proto::CAP_OPEN_ONCE } else { 0 };
+                    // The updated paths refuse work if strict containment/admission cannot be established.
+                    let ownership = if !o.outpost && cfg!(any(target_os = "linux", target_os = "macos", windows)) { proto::CAP_RESOURCE_OWNERSHIP } else { 0 };
+                    let firecracker_shape = if !o.outpost && cfg!(target_os = "linux") { proto::CAP_FIRECRACKER_SHAPE } else { 0 };
+                    let amphora = if carrier_active.load(std::sync::atomic::Ordering::Acquire) { proto::CAP_AMPHORA } else { 0 };
+                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | proto::CAP_HARNESS_RELEASE | proto::CAP_JOB_ATTEMPT | proto::CAP_RETAINED_RECEIVED | ownership | firecracker_shape | open_once | work | limit | proto::CAP_IDENTITY | headroom_cap | amphora | proto::CAP_UNREAD | proto::CAP_UNIFIED_LAYOUT | if explicit_activation { proto::CAP_EXPLICIT_ACTIVATION } else { 0 } }) {
                         net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                     }
                 }
@@ -2143,13 +2257,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     // The rest, probed: they take a moment (docs/ci.md W13-R01).
                     probe_facts(&uplink, &o.work_dir, &o.declared, &probing);
                 }
-                // The pools' executors were the last connection's: the server starts what it wants
-                // again (docs/ci.md W13-R09).
-                for w in pool_execs.drain() {
-                    crate::rt::spawn(crate::runner::pool::discard(w));
-                }
-                #[cfg(target_os = "linux")]
-                crate::rt::spawn(crate::runner::firecracker::drain_warm());
+                // A reconnect changes transport only. The existing durable grant and ordered
+                // executor owner retain every warm VM until an exact Stop proves it quiescent.
                 // Whether this machine takes upgrades (an older server skips it).
                 if !o.ephemeral && !o.outpost {
                     let accept = takes_updates(&o);
@@ -2173,9 +2282,6 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 if let Some(ob) = &observe {
                     ob.up("", true);
                 }
-                if let Some(f) = &shipper {
-                    f.link(crate::convo::feed::Link::Up);
-                }
                 // How the front door does, after everything older (an older server skips it).
                 front_door_sent = None;
                 if let Some(json) = front_door.as_ref().and_then(crate::frontdoor::runner::Handle::latest)
@@ -2193,18 +2299,26 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     tracing::debug!(took_ms, build_ms, facts_ms, "said what this runner is to the server");
                 }
             }
+            Ev::Net(Some(NetEvent::Closed { peer, epoch, .. })) if server_connection.is_some_and(|current| current.peer() != peer || current.epoch() != epoch) => {},
             Ev::Net(Some(NetEvent::Closed { reason, .. } | NetEvent::Unreachable { reason, .. })) => {
+                server_connection = None;
+                    server_layout = None;
+                    server_activation = None;
                 let now = Instant::now();
                 let mut at_once = false;
                 if connected {
                     tracing::warn!(%reason, "disconnected from server");
-                    paths.disconnected();
+                    if !replicated_transport { paths.disconnected(); }
                     // No word comes for agent sessions on their way to a newer process: they go on here.
                     crate::harness::handing::runner_link_lost();
                 } else {
-                    tracing::info!(%reason, via = %paths.via(), retry_in = ?dial_backoff, "dial failed");
+                    if replicated_transport {
+                        tracing::info!(%reason, "replicated upstream dial failed; its controller will retry");
+                    } else {
+                        tracing::info!(%reason, via = %paths.via(), retry_in = ?dial_backoff, "dial failed");
+                    }
                     // The path changed (to the tunnel, or back): dial that way now.
-                    at_once = paths.dial_failed(now);
+                    if !replicated_transport { at_once = paths.dial_failed(now); }
                 }
                 connected = false;
                 welcomed = false;
@@ -2219,6 +2333,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 work_said = None;
                 server_identity = false;
                 server_limit = false;
+                server_job_attempt = false;
+                server_retained_received = false;
                 limit_said = None;
                 if let Some(s) = &sync {
                     s.connected(false);
@@ -2226,11 +2342,6 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 if let Some(ob) = &observe {
                     ob.up("", false);
                 }
-                if let Some(f) = &shipper {
-                    f.link(crate::convo::feed::Link::Down);
-                }
-                // A copy being sent back stops: the server asks again if it still needs it.
-                restoring = None;
                 if let Some(r) = &reach {
                     r.feed(crate::reach::node::In::Server(false)).await;
                 }
@@ -2241,7 +2352,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
                 dial_backoff = (dial_backoff * 2).min(Duration::from_secs(30));
             }
-            Ev::Net(Some(NetEvent::Frame { data, .. })) | Ev::Forwarded(data) => {
+            event @ (Ev::Net(Some(NetEvent::Frame { .. })) | Ev::Forwarded(_)) => {
+                let (data, origin) = match event {
+                    Ev::Net(Some(NetEvent::Frame { data, connection, .. })) => (data, connection),
+                    Ev::Forwarded(data) => (data, None),
+                    _ => continue 'events,
+                };
+                let current_origin = origin.is_some() && origin == server_connection;
+                if origin.is_some() && !current_origin { continue 'events; }
                 let msg: ServerMsg = match proto::read_server(&data) {
                     Ok(m) => m,
                     // The server hears of it, when it takes word of it (docs/wire.md, "What can't
@@ -2261,6 +2379,27 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     match msg {
                         ServerMsg::Wire(crate::wire::channel::Frame::Item { stream, seq, low, body }) => {
                             use crate::wire::channel::{Arrival, Refusal};
+                            // Do not let an unproven/forwarded VM command alter Current or the
+                            // receiver before its actual TLS producer has been authenticated.
+                            if !current_origin && server_shaped_commands && crate::wire::commands::kind_of(&stream).is_some() { continue 'events; }
+                            // Read once before either generation or receiver admission changes.
+                            // An unbound/forwarded handshake or private item is dropped without
+                            // evicting valid channel state or disconnecting its current TLS peer.
+                            let inner = proto::read_server(&body);
+                            if let Ok(message) = &inner
+                                && let Err(reason) = server_layout_on(message, origin, server_connection, server_layout)
+                            {
+                                if !current_origin {
+                                    tracing::debug!(reason, "unbound server channel item supplies no layout authority");
+                                    continue 'events;
+                                }
+                                break 'item (ServerMsg::Refused { reason: reason.into() }, Vec::new());
+                            }
+                            if !current_origin
+                                && let Ok(ServerMsg::Executor { json }) = &inner
+                                && let Ok(ask) = crate::wire::payload::<crate::runner::pool::Ask>(crate::wire::unread::Wire::ServerPayload, "Executor", json)
+                                && pool_execs.requires_order(&ask)
+                            { continue 'events; }
                             // A command stream's newer generation: the ones before it are done with,
                             // and an item of one of those that comes late isn't taken again.
                             match wire_current.of(&stream) {
@@ -2269,7 +2408,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 crate::wire::commands::Stand::Current => {}
                             }
                             let answer = match wire_in.on_item(&stream, seq, low, body) {
-                                Arrival::Take(body) => match proto::read_server(&body) {
+                                Arrival::Take(body) => match inner {
                                     Ok(ServerMsg::Wire(_)) => {
                                         let why = "a channel frame inside a command";
                                         if server_unread && let Some(folded) = told.tell(Instant::now(), crate::wire::unread::Wire::ServerItem, crate::wire::unread::Code::Malformed, "Wire", why) {
@@ -2297,6 +2436,20 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             continue 'events;
                         }
                         m => (m, data),
+                    }
+                };
+                // Validate the semantic message after channel unwrapping. A forwarded inner
+                // Caps cannot establish a TLS connection's proof, nor can a former connection
+                // lend that proof to any private effect on a replacement.
+                let msg = match server_layout_on(&msg, origin, server_connection, server_layout) {
+                    Ok(()) => msg,
+                    Err(reason) if !current_origin => {
+                        tracing::debug!(reason, "unbound server message supplies no layout authority");
+                        continue 'events;
+                    }
+                    Err(reason) => {
+                        refuse(&mut answer_after, crate::wire::channel::Refusal::Unsupported, reason);
+                        ServerMsg::Refused { reason: reason.into() }
                     }
                 };
                 // About something handed to the new build (blue/green), or new while this runner
@@ -2333,10 +2486,18 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 };
                 let msg = match msg {
                     Carried::Nothing(m) => m,
+                    Carried::Read(FromServer::RetainedReceived(receipt)) => {
+                        if server_retained_received
+                            && let Err(error) = retained_spool.received(&receipt).await
+                        {
+                            tracing::warn!(error = %format!("{error:#}"), "retained receipt could not be committed; evidence remains for replay");
+                        }
+                        continue;
+                    }
+
                     Carried::Read(FromServer::HarnessOpen { session, spec }) => {
-                        use crate::wire::channel::Refusal;
-                        // As it was asked, for the updates that show it refused.
                         let asked = (*spec).clone();
+                        use crate::wire::channel::Refusal;
                         // How it fared, as its answer says it (a command on the channel).
                         let opened: Result<(), (Refusal, anyhow::Error)> = match (&harness, *spec) {
                             (None, _) => Err((Refusal::Unsupported, anyhow::anyhow!("agent sessions are not enabled on this runner"))),
@@ -2351,25 +2512,22 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                         spec.env = env;
                                     }
                                 }
-                                if crate::workspace::needs_preparing(&spec) {
-                                    // Its workspace first (a volume made and mounted), off this loop: then it starts there.
-                                    let (h, up, session, asked) = (Arc::clone(h), uplink.0.clone(), session.clone(), asked.clone());
-                                    crate::rt::spawn(async move {
-                                        let opened = match crate::workspace::prepare(&mut spec, &session).await {
-                                            Ok(()) => h.open(Some(session.clone()), spec).map(|_| ()),
-                                            Err(e) => Err(e.context("its workspace")),
-                                        };
-                                        if let Err(e) = opened {
-                                            for u in crate::harness::host::refusal(&session, &asked, &format!("{e:#}")) {
-                                                if let Ok(json) = serde_json::to_string(&u) {
-                                                    up.send(Up::Term(AgentMsg::Harness { session: session.clone(), json })).await.ok();
-                                                }
-                                            }
-                                        }
-                                    });
-                                    Ok(())
+                                // U04/U17: Taken is emitted after this arm returns. Preparation
+                                // and keyed input acceptance must both finish before that ACK.
+                                let prepared = if crate::workspace::needs_preparing(&spec) {
+                                    crate::workspace::prepare(&mut spec, &session).await.map_err(|e| e.context("its workspace"))
                                 } else {
-                                    h.open(Some(session.clone()), spec).map(|_| ()).map_err(|e| (Refusal::Refused, e))
+                                    Ok(())
+                                };
+                                match prepared {
+                                    Ok(()) => {
+                                        let (h, id) = (Arc::clone(h), session.clone());
+                                        // None means this id was accepted and ended: acknowledge
+                                        // the durable acceptance without launching it again.
+                                        crate::rt::blocking(move || h.open_once(&id, spec).map(|_| ())).await
+                                            .and_then(|opened| opened).map_err(|e| (Refusal::Refused, e))
+                                    }
+                                    Err(e) => Err((Refusal::Refused, e)),
                                 }
                             }
                         };
@@ -2465,96 +2623,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                         continue;
                     }
-                    Carried::Read(FromServer::Cluster { msg, raft }) => {
-                        use crate::store::learner::Msg;
-                        match *msg {
-                            Msg::Join { member, token } if !o.ephemeral && !o.outpost => {
-                                // A replica being started goes on with the newest word to join.
-                                *cluster_join.lock() = Some((member, token));
-                                if cluster.lock().is_some() {
-                                    continue;
-                                }
-                                replica.start();
-                            }
-                            Msg::Leave => {
-                                // A replica being started stops trying.
-                                *cluster_join.lock() = None;
-                                // Another process of this machine holds it now: its files are let go
-                                // (stopping it waits for its thread: not on this loop).
-                                if let Some(old) = cluster.lock().take() {
-                                    crate::store::learner::set_global(None);
-                                    crate::rt::spawn(async move {
-                                        let _ = crate::rt::blocking(move || drop(old)).await;
-                                    });
-                                }
-                            }
-                            m @ (Msg::Raft { .. } | Msg::At { .. }) => {
-                                let learner = cluster.lock().clone();
-                                if let Some(l) = learner {
-                                    l.heard(&m, raft);
-                                }
-                            }
-                            _ => {}
-                        }
-                        continue;
-                    }
-                    Carried::Read(FromServer::Convo { msg, data }) => {
-                        let m = *msg;
-                        if convo.as_ref().is_some_and(|st| st.id() == m.store()) {
-                            // The server's answer to this runner's own feed.
-                            if let Some(f) = &shipper {
-                                f.link(crate::convo::feed::Link::Heard(m));
-                            }
-                            continue;
-                        }
-                        // The server lost its store: the copy of it this runner keeps goes back.
-                        if let crate::convo::feed::Msg::Restore { .. } = &m {
-                            if mirror.is_none()
-                                && convo.is_some()
-                                && own_dir.join(crate::convo::MIRROR_FILE).exists()
-                                && let Some((st, intake)) = open_mirror(&own_dir, &uplink.0)
-                            {
-                                (mirror_store, mirror) = (Some(st), Some(intake));
-                            }
-                            if let Some(st) = &mirror_store {
-                                let (ship, out) = crate::convo::feed::Shipper::start_restore(st.clone());
-                                let up = uplink.0.clone();
-                                crate::rt::spawn(async move {
-                                    while let Ok((json, data)) = out.recv().await {
-                                        if up.send(Up::Convo(AgentMsg::Convo { json, data })).await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                });
-                                ship.link(crate::convo::feed::Link::Up);
-                                tracing::info!("the server lost its conversation store: sending back the copy this runner keeps");
-                                restoring = Some((st.id().to_owned(), ship));
-                            } else {
-                                let none = crate::convo::feed::encode(&crate::convo::feed::Msg::Restored { store: String::new(), rev: 0 });
-                                uplink.0.send(Up::Convo(AgentMsg::Convo { json: none, data: Vec::new() })).await.ok();
-                            }
-                            continue;
-                        }
-                        // The server's answers about the copy being sent back.
-                        if let Some((id, ship)) = &restoring
-                            && id == m.store()
-                        {
-                            ship.link(crate::convo::feed::Link::Heard(m));
-                            continue;
-                        }
-                        // The server's store, of which this runner keeps a copy (a mirror), beside
-                        // its own store; opened the first time the server sends it.
-                        if mirror.is_none()
-                            && convo.is_some()
-                            && let Some((st, intake)) = open_mirror(&own_dir, &uplink.0)
-                        {
-                            (mirror_store, mirror) = (Some(st), Some(intake));
-                        }
-                        if let Some(intake) = &mirror {
-                            intake.heard(SERVER_PEER, "server", m, data);
-                        }
-                        continue;
-                    }
+
+
                     // Pages streamed for whoever views one of its sessions (`crate::browser::stream`).
                     Carried::Read(FromServer::StreamOpen { stream, session, spec }) => {
                         crate::rt::spawn(crate::browser::stream::serve_open(o.state_dir.clone(), stream, session, *spec, uplink.0.clone()));
@@ -2601,8 +2671,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     }
                     Carried::Read(FromServer::FrontDoor(push)) => {
                         // Settings (and certificates) are never logged: an upload carries a key.
-                        if let Some(fd) = &front_door {
-                            fd.push(*push);
+                        let accepted = match &front_door {
+                            Some(fd) => fd.push(*push).await,
+                            None => Err(anyhow::anyhow!("front door is not enabled on this runner")),
+                        };
+                        if let Err(e) = accepted {
+                            refuse(&mut answer_after, crate::wire::channel::Refusal::Refused, format!("front door update was not accepted: {e:#}"));
                         }
                         continue;
                     }
@@ -2616,13 +2690,18 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     // runs at once (none: its config's holds): kept for its restarts, held from now
                     // on, and said back (docs/agents.md, "How many agents a machine runs").
                     Carried::Read(FromServer::AgentLimit(asked)) => {
-                        let dir = o.state_dir.clone();
-                        if let Err(e) = crate::rt::blocking(move || crate::harness::limit::keep(&dir, asked)).await.and_then(|r| r.map_err(anyhow::Error::from)) {
-                            tracing::warn!(error = %format!("{e:#}"), "what was set for this machine's agent limit couldn't be kept: started again, it holds its config's until the server says it again");
-                        }
-                        limit_asked = asked;
-                        if let Some(h) = &harness {
-                            hold_agent_limit(h, crate::harness::limit::held(limit_asked, limit_config), &mut limit_said, server_limit && welcomed, &uplink).await;
+                        match limit_policy.accept(asked).await {
+                            Ok(committed) => {
+                                limit_asked = committed;
+                                if let Some(h) = &harness {
+                                    hold_agent_limit(h, crate::harness::limit::held(limit_asked, limit_config), &mut limit_said, server_limit && welcomed, &uplink, &mut deferred_control)?;
+                                }
+                            }
+                            Err(e) => {
+                                let why = format!("agent limit was not accepted durably; the last held policy remains: {e:#}");
+                                tracing::warn!(error = %why, "agent limit update refused");
+                                refuse(&mut answer_after, crate::wire::channel::Refusal::Refused, why);
+                            }
                         }
                         continue;
                     }
@@ -2630,31 +2709,16 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     Carried::Read(FromServer::AssignV2(a)) => {
                         let mut a = *a;
                         let id = a.job_id.clone();
+                        let attempt = Some(a.attempt);
                         // A pool's leg runs in its executor, beside this runner's own slots.
                         let pooled = a.executor.slot.is_some();
                         let holds = kiln_ci::sched::state::Incoming::of(a.exclusive, &a.holds.unwrap_or_default());
                         let room = admits(o.slots, size, jobs.values().map(|j| (j.pooled, j.holds)), pooled, holds);
-                        if o.outpost || draining || upgrade_pending || room.is_err() || jobs.contains_key(&id) {
-                            let reason = if o.outpost { OUTPOST_TAKES_NO_JOBS } else if draining { "draining" } else if upgrade_pending { "upgrading" } else { room.err().unwrap_or("no free slot") };
+                        if o.outpost || draining || room.is_err() || jobs.contains_key(&id) {
+                            let reason = if o.outpost { OUTPOST_TAKES_NO_JOBS } else if draining { "draining" } else { room.err().unwrap_or("no free slot") };
                             uplink.msg(AgentMsg::Reject { job: id, reason: reason.into() }).await;
                             continue;
                         }
-                        // An ephemeral runner (a `k8s` pool's pod, docs/ci.md W13-R07) takes one leg,
-                        // then leaves.
-                        if o.ephemeral {
-                            served_dedicated = true;
-                        }
-                        // The leg's own identity: a key made here, outside anything its steps can
-                        // reach (docs/ci.md W27-R01).
-                        if server_identity {
-                            match crate::runner::identity::ask("leg", Some(&id), None) {
-                                Ok(json) => uplink.msg(AgentMsg::Identity { json }).await,
-                                Err(e) => tracing::warn!(job = %id, error = %format!("{e:#}"), "no identity asked for"),
-                            }
-                        }
-                        // A new attempt: its events count from one.
-                        journal.remove(&id);
-                        unreceived.remove(&id);
                         // Server-relative URLs go through the address this runner reached the server
                         // at (NAT, NodePorts and cluster DNS all differ).
                         let base = o.server_url.trim_end_matches('/').to_owned();
@@ -2682,27 +2746,64 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 act.url = format!("{base}{}", act.url);
                             }
                         }
+                        // U03: select and bind the exact physical owner before Running or its
+                        // cancellation timer exists. A canonical executor can never silently
+                        // fall back to a fresh root or acquire another host reservation.
+                        let selected: anyhow::Result<(Arc<crate::runner::processes::Execution>, Option<crate::runner::pool::Warm>, Option<std::fs::File>)> = async {
+                            if let Some(bootstrap) = &executor_bootstrap {
+                                return Ok((bootstrap.execution_for(admission_paths.clone(), &a, o.work_dir.clone())?, None, None));
+                            }
+                            let admission = crate::reach::leases::ci_guard(&admission_paths)?;
+                            if a.executor.slot.is_some() {
+                                if a.executor.kind == "docker" {
+                                    let warm = pool_execs.take_for(&a)?.context("the canonical Docker executor is unavailable")?;
+                                    match crate::runner::pool::adopted_execution(&a, &warm).await {
+                                        Ok(execution) => return Ok((execution, Some(warm), Some(admission))),
+                                        Err(error) => {
+                                            pool_execs.restore(warm)?;
+                                            return Err(error);
+                                        }
+                                    }
+                                }
+                                #[cfg(target_os = "linux")]
+                                if a.executor.kind == "firecracker" {
+                                    let execution = crate::runner::firecracker::adopted_execution(&a).await?;
+                                    return Ok((execution, None, Some(admission)));
+                                }
+                                anyhow::bail!("the canonical executor is unavailable or unsupported on this receiver");
+                            }
+                            anyhow::ensure!(a.parent_binding.is_none(), "parent-bound assignment has no verified enrolled or warm executor");
+                            anyhow::ensure!(!matches!(a.executor.kind.as_str(), "firecracker" | "k8s"), "a managed executor assignment requires its canonical startup identity");
+                            Ok((crate::runner::processes::Execution::new_in(admission_paths.clone(), o.work_dir.clone(), id.clone(), attempt), None, Some(admission)))
+                        }.await;
+                        let (execution, warm, admission) = match selected {
+                            Ok(selected) => selected,
+                            Err(error) => {
+                                deferred_control.enqueue(&uplink.0, Up::Msg(AgentMsg::Reject { job: id, reason: format!("U03 exact executor ownership: {error:#}") }))?;
+                                continue;
+                            }
+                        };
+                        if o.ephemeral { served_dedicated = true; }
+                        // W27-R01/U03: ask only after this exact physical assignment was accepted.
+                        if server_identity {
+                            match crate::runner::identity::ask("leg", Some(&id), None) {
+                                Ok(json) => uplink.msg(AgentMsg::Identity { json }).await,
+                                Err(e) => tracing::warn!(job = %id, error = %format!("{e:#}"), "no identity asked for"),
+                            }
+                        }
+                        journal.remove(&id);
+                        unreceived.remove(&id);
                         let cancel = Shutdown::new();
                         hold_cpus(&id, holds);
-                        jobs.insert(id.clone(), Running { cancel: cancel.clone(), pooled, holds });
+                        jobs.insert(id.clone(), Running { _admission: admission, cancel: cancel.clone(), attempt, grace_stop: Shutdown::new(), execution: Arc::clone(&execution), pooled, holds });
                         tracing::info!(job = %id, leg = %a.leg.name, "running leg");
-                        // Its pool's executor, when the leg can run in it as it is; else the leg
-                        // runs the usual way and the executor goes all the same.
-                        let warm = a.executor.slot.as_deref().and_then(|s| pool_execs.take(s));
-                        let warm = match warm {
-                            Some(w) if crate::runner::pool::adoptable(&a, &w) => Some(w),
-                            Some(w) => {
-                                crate::rt::spawn(crate::runner::pool::discard(w));
-                                None
-                            }
-                            None => None,
-                        };
-                        let leg = crate::runner::runtime::Leg { a, work_dir: o.work_dir.clone(), runner_name: name.clone(), up: uplink.clone(), cancel, http: http.clone(), warm: std::sync::Arc::new(parking_lot::Mutex::new(warm)), cache_max: o.declared.cache_max.as_deref().and_then(crate::runner::cache::parse_size) };
+                        let leg = crate::runner::runtime::Leg { a, work_dir: o.work_dir.clone(), runner_name: name.clone(), up: uplink.clone(), cancel, http: http.clone(), warm: std::sync::Arc::new(parking_lot::Mutex::new(warm)), cache_max: o.declared.cache_max.as_deref().and_then(crate::runner::cache::parse_size), legacy: None };
                         let done = done_tx.clone();
                         // On the `firecracker` executor, in a microVM of its own (W13-R05).
                         #[cfg(target_os = "linux")]
                         let microvm = (leg.a.executor.kind == "firecracker").then(|| microvm_ca.clone());
-                        crate::rt::spawn(async move {
+                        let scope = Arc::clone(&execution);
+                        crate::rt::spawn(scope.scope(async move {
                             #[cfg(target_os = "linux")]
                             let result = match microvm {
                                 Some(ca) => crate::runner::firecracker::run(leg, Some(ca)).await,
@@ -2710,15 +2811,26 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             };
                             #[cfg(not(target_os = "linux"))]
                             let result = leg.run().await;
-                            let _ = done.send(result).await;
-                        });
+                            execution.stop().await;
+                            let _ = done.send((result, attempt)).await;
+                        }));
                         continue;
                     }
                     // Start or stop a pool's executor (docs/ci.md W13-R09).
-                    Carried::Read(FromServer::Executor(ask)) => {
-                        let (execs, work, up) = (pool_execs.clone(), o.work_dir.clone(), uplink.clone());
+                    Carried::Read(FromServer::Executor { ask, bytes }) => {
+                        let ordered = current_origin && answer_after.as_ref().is_some_and(|(stream, _, _)| crate::wire::commands::kind_of(stream) == Some(crate::wire::commands::Kind::Live));
+                        let response = match pool_execs.enqueue(&o.work_dir, *ask, ordered, bytes) {
+                            Ok(response) => response,
+                            Err(error) => {
+                                refuse(&mut answer_after, crate::wire::channel::Refusal::Refused, format!("executor intent was not accepted: {error:#}"));
+                                continue 'events;
+                            }
+                        };
+                        let up = uplink.clone();
                         crate::rt::spawn(async move {
-                            if let Some(said) = crate::runner::pool::handle(&execs, &work, ask).await
+                            // Execution was registered synchronously above. This task only
+                            // forwards its result; it cannot reorder Start and Stop.
+                            if let Ok(Some(said)) = response.await
                                 && let Ok(json) = serde_json::to_string(&said)
                             {
                                 up.msg(AgentMsg::Executor { json }).await;
@@ -2755,6 +2867,16 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         server_kept.extend(sessions.into_iter().map(|k| (k.session.clone(), k)));
                     }
                     ServerMsg::Caps { caps } => {
+                        server_layout = origin.filter(|_| caps & proto::CAP_UNIFIED_LAYOUT != 0);
+                        server_activation = server_layout.filter(|_| caps & proto::CAP_EXPLICIT_ACTIVATION != 0);
+                        server_shaped_commands = caps & proto::CAP_FIRECRACKER_SHAPE != 0;
+                        if caps & (proto::CAP_FIRECRACKER_SHAPE | proto::CAP_EXPLICIT_ACTIVATION) != 0 && !o.outpost {
+                            // U16's process association also applies to a supervised macOS runner.
+                            deferred_control.enqueue(&uplink.0, Up::Term(AgentMsg::RunnerProcess { nonce: process_nonce.clone() }))?;
+                        }
+                        if caps & proto::CAP_FIRECRACKER_SHAPE != 0 && !o.outpost && cfg!(target_os = "linux") && let Err(error) = publish_closed_executor_hints(&pool_execs, &retained_spool).await {
+                            tracing::warn!(error = %format!("{error:#}"), "closed executor hints remain owned pending durable publication");
+                        }
                         // An identity of this process's own, for a key it made and keeps, certified
                         // on each connection (docs/ci.md W27-R01).
                         server_identity = caps & proto::CAP_IDENTITY != 0 && !o.ephemeral;
@@ -2775,6 +2897,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         server_drops = caps & proto::CAP_NET_DROPS != 0;
                         server_work = caps & proto::CAP_WORK != 0;
                         server_limit = caps & proto::CAP_AGENT_LIMIT != 0;
+                        server_job_attempt = caps & proto::CAP_JOB_ATTEMPT != 0;
+                        server_retained_received = caps & proto::CAP_RETAINED_RECEIVED != 0;
                         sent_changes.server(caps & proto::CAP_CHANGES_PATCH != 0);
                         server_headroom = caps & proto::CAP_HEADROOM != 0;
                         // How headroom does, now that this server takes it.
@@ -2790,7 +2914,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             r.feed(crate::reach::node::In::Unread(server_unread)).await;
                         }
                         if server_wire {
-                            uplink.0.send(Up::Term(AgentMsg::Wire(wire_in.have()))).await.ok();
+                            deferred_control.enqueue(&uplink.0, Up::Term(AgentMsg::Wire(wire_in.have())))?;
                         }
                     }
                     // The relay refused a frame of this runner's reach links: as a close, its code
@@ -2829,7 +2953,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 }
                             }
                         }
-                        flush_updates(&mut updates, &uplink).await;
+                        flush_updates(&mut updates, &uplink)?;
                     }
                     ServerMsg::Welcome { server_version, sample_seconds } => {
                         tracing::info!(%server_version, "server welcomed agent");
@@ -2848,7 +2972,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             }
                         }
                         for (_, data) in unreceived.values() {
-                            net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, data.clone()).await;
+                            let data = completion_wire(data.clone(), server_job_attempt);
+                            net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, data).await;
                         }
                         // Drained or not is the server's to say again on each connection (it sends
                         // Drain next when this one isn't the machine's newest).
@@ -2876,7 +3001,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // And what its agent sessions are held to, to a server that takes it.
                         limit_said = None;
                         if let Some(h) = &harness {
-                            hold_agent_limit(h, crate::harness::limit::held(limit_asked, limit_config), &mut limit_said, server_limit, &uplink).await;
+                            hold_agent_limit(h, crate::harness::limit::held(limit_asked, limit_config), &mut limit_said, server_limit, &uplink, &mut deferred_control)?;
                         }
                         // The server learns (again) which agent sessions run here, then what it lacks
                         // of each: over the channel only that (a session's stream not started yet
@@ -2915,7 +3040,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                     }
                                 }
                             }
-                            flush_updates(&mut updates, &uplink).await;
+                            flush_updates(&mut updates, &uplink)?;
                         }
                         sample_tick = Interval::new(Duration::from_secs(u64::from(sample_seconds.max(1))));
                         // A new build started to take over from the runner being upgraded (blue/green):
@@ -2941,6 +3066,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             anyhow::bail!("refused: {reason}");
                         }
                         connected = false;
+                        server_connection = None;
+                    server_layout = None;
+                    server_activation = None;
                         welcomed = false;
                         if let Some(s) = &sync {
                             s.connected(false);
@@ -2961,17 +3089,25 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         let id = a.job_id.clone();
                         let holds = crate::hub::v1_incoming(a.spec.exclusive, &a.spec.resources);
                         let room = admits(o.slots, size, jobs.values().map(|j| (j.pooled, j.holds)), false, holds);
-                        if o.outpost || draining || upgrade_pending || room.is_err() || jobs.contains_key(&id) {
-                            let reason = if o.outpost { OUTPOST_TAKES_NO_JOBS } else if draining { "draining" } else if upgrade_pending { "upgrading" } else { room.err().unwrap_or("no free slot") };
+                        if o.outpost || draining || room.is_err() || jobs.contains_key(&id) {
+                            let reason = if o.outpost { OUTPOST_TAKES_NO_JOBS } else if draining { "draining" } else { room.err().unwrap_or("no free slot") };
                             uplink.msg(AgentMsg::Reject { job: id, reason: reason.into() }).await;
                             continue;
                         }
                         if o.dedicated_job.as_deref() == Some(id.as_str()) {
                             served_dedicated = true;
                         }
+                        let admission = match crate::reach::leases::ci_guard(&admission_paths) {
+                            Ok(g) => g,
+                            Err(e) => {
+                                uplink.msg(AgentMsg::Reject { job: id, reason: format!("U01 execution fence: {e}") }).await;
+                                continue;
+                            }
+                        };
                         let cancel = Shutdown::new();
                         hold_cpus(&id, holds);
-                        jobs.insert(id.clone(), Running { cancel: cancel.clone(), pooled: false, holds });
+                        let execution = crate::runner::processes::Execution::new_in(admission_paths.clone(), o.work_dir.clone(), id.clone(), Some(a.attempt.saturating_add(1)));
+                        jobs.insert(id.clone(), Running { _admission: Some(admission), cancel: cancel.clone(), attempt: None, grace_stop: Shutdown::new(), execution: Arc::clone(&execution), pooled: false, holds });
                         tracing::info!(job = %id, key = %a.spec.key, "running job");
                         let exec = Exec {
                             assign: *a,
@@ -2982,7 +3118,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             http: http.clone(),
                         };
                         let done = done_tx.clone();
-                        crate::rt::spawn(async move {
+                        let scope = Arc::clone(&execution);
+                        crate::rt::spawn(scope.scope(async move {
                             let result = match std::panic::AssertUnwindSafe(exec.run()).catch_unwind().await {
                                 Ok(r) => r,
                                 Err(p) => JobResult {
@@ -2994,22 +3131,30 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                     cpu_seconds: None,
                                 },
                             };
-                            let _ = done.send(result).await;
-                        });
+                            execution.stop().await;
+                            let _ = done.send((result, None)).await;
+                        }));
                     }
                     ServerMsg::Cancel { job, reason } => {
                         if let Some(r) = jobs.get(&job) {
                             tracing::info!(%job, %reason, "cancelling job");
                             r.cancel.cancel();
-                            // A cancelled job that hasn't ended within the grace never will by
-                            // itself (a process that left its group holds its output, a wait
-                            // missed its wake-up): it is reported over, so it can't hold the
-                            // machine (an in-place upgrade waits for no job to finish).
-                            let (tx, j) = (done_tx.clone(), job.clone());
+                            // U03: bind grace cleanup to this execution before any await. A
+                            // normal completion cancels it before another attempt can start.
+                            let (tx, j, attempt, grace_stop, execution) = (done_tx.clone(), job.clone(), r.attempt, r.grace_stop.clone(), Arc::clone(&r.execution));
                             crate::rt::spawn(async move {
-                                crate::rt::sleep(CANCEL_GRACE).await;
-                                let error = format!("cancelled; it hadn't ended {}s later, so the runner let it go", CANCEL_GRACE.as_secs());
-                                let _ = tx.send(JobResult { job: j, status: Status::Cancelled, exit_code: None, error: Some(error), peak_rss: None, cpu_seconds: None }).await;
+                                futures::select_biased! {
+                                    () = grace_stop.cancelled().fuse() => return,
+                                    () = crate::rt::sleep(CANCEL_GRACE).fuse() => {}
+                                }
+                                // A stuck runtime keeps its slot until this exact execution is
+                                // fenced against new commands and every containment is empty.
+                                futures::select_biased! {
+                                    () = grace_stop.cancelled().fuse() => return,
+                                    () = execution.stop().fuse() => {}
+                                }
+                                let error = format!("cancelled; after {}s the runner proved its execution stopped", CANCEL_GRACE.as_secs());
+                                let _ = tx.send((JobResult { job: j, status: Status::Cancelled, exit_code: None, error: Some(error), peak_rss: None, cpu_seconds: None }, attempt)).await;
                             });
                         } else {
                             refuse(&mut answer_after, crate::wire::channel::Refusal::Unknown, format!("no job {job} runs here"));
@@ -3139,8 +3284,21 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     }
                     ServerMsg::HarnessClose { session } => {
                         // One this runner doesn't have is gone here already: said so (`unknown`).
-                        if !harness.as_ref().is_some_and(|h| h.close(&session)) {
-                            refuse(&mut answer_after, crate::wire::channel::Refusal::Unknown, format!("no session {session} here"));
+                        let closed = match harness.clone() {
+                            Some(host) => {
+                                let id = session.clone();
+                                crate::rt::blocking(move || host.try_close(&id)).await.and_then(|result| result)
+                            }
+                            None => Ok(false),
+                        };
+                        match closed {
+                            Ok(true) => {}
+                            Ok(false) => refuse(&mut answer_after, crate::wire::channel::Refusal::Unknown, format!("no session {session} here")),
+                            Err(error) => {
+                                // U17: storage refusal must never acknowledge an accepted close.
+                                refuse(&mut answer_after, crate::wire::channel::Refusal::Refused, format!("session stop was not committed: {error:#}"));
+                                continue;
+                            }
                         }
                         // What it had going live: its app, its streams.
                         crate::browser::apps::stop(&session);
@@ -3204,6 +3362,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         let error = Some("an outpost isn't installed, so the server doesn't upgrade it".to_owned());
                         uplink.msg(AgentMsg::UpgradeDone { job, ok: false, error }).await;
                     }
+                    ServerMsg::Upgrade { job, path, sha256, size } if !controlled_upgrade_on(origin, server_connection, server_activation) => {
+                        let _ = (path, sha256, size);
+                        let why = crate::updates::UpgradeRefusal::Coordinator.to_string();
+                        refuse(&mut answer_after, crate::wire::channel::Refusal::Unsupported, why.clone());
+                        uplink.msg(AgentMsg::UpgradeDone { job, ok: false, error: Some(why) }).await;
+                    }
                     ServerMsg::Upgrade { job, path, sha256, size } if !takes_updates(&o) => {
                         let _ = (path, sha256, size);
                         tracing::info!(%job, "an upgrade refused: this machine's kiln config says [updates] accept = false");
@@ -3217,14 +3381,23 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         uplink.msg(AgentMsg::UpgradeDone { job, ok: false, error }).await;
                     }
                     #[cfg(unix)]
-                    ServerMsg::Upgrade { job, path, sha256, size } if !o.ephemeral && crate::bluegreen::Supervisor::from_env().is_some() => {
+                    ServerMsg::Upgrade { job, path, sha256, size } if activation.is_some() => {
                         // Blue/green: the new build is fetched beside this one and started next to
                         // it by the supervisor; this runner goes on until it's ready.
                         tracing::info!(%job, %path, "upgrading this runner: blue/green");
                         let up = Uplink(uplink.0.clone());
                         let (http, server_url, state, tx) = (Arc::clone(&http), o.server_url.clone(), o.state_dir.clone(), bg_tx.clone());
+                        let supervisor = activation.clone();
                         crate::rt::spawn(async move {
                             let order = crate::updates::Order { job: &job, path: &path, sha256: &sha256, size };
+                            let checked = match supervisor {
+                                Some(sup) => crate::rt::blocking(move || sup.check_activation()).await.and_then(|r| r),
+                                None => Err(crate::updates::UpgradeRefusal::Backend.into()),
+                            };
+                            if let Err(e) = checked {
+                                up.msg(AgentMsg::UpgradeDone { job, ok: false, error: Some(format!("{e:#}")) }).await;
+                                return;
+                            }
                             match crate::updates::fetch_build(&http, &server_url, &order, &state, &up).await {
                                 Ok((exe, build)) => {
                                     let _ = tx.send(Bg::Fetched { job, exe, build }).await;
@@ -3245,23 +3418,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                     }
                     ServerMsg::Upgrade { job, path, sha256, size } => {
-                        // Fetch the new binary from the server and install it beside or over this
-                        // runner (`install --agent --upgrade`); nothing running here is stopped.
-                        tracing::info!(%job, %path, "upgrading this runner");
-                        let up = Uplink(uplink.0.clone());
-                        let http = Arc::clone(&http);
-                        let server_url = o.server_url.clone();
-                        let own = own_dir.clone();
-                        let service = crate::updates::runner_service(&o.state_dir, o.instance.as_deref());
-                        crate::rt::spawn(async move {
-                            let order = crate::updates::Order { job: &job, path: &path, sha256: &sha256, size };
-                            let res = crate::updates::run_on_runner(&http, &server_url, &order, &own, &service, &up).await;
-                            if let Err(e) = &res {
-                                tracing::warn!(%job, error = %format!("{e:#}"), "upgrade failed");
-                            }
-                            let error = res.err().map(|e| format!("{e:#}"));
-                            up.msg(AgentMsg::UpgradeDone { job, ok: error.is_none(), error }).await;
-                        });
+                        // U16: legacy/Windows/outpost/in-process backends have no explicit
+                        // activation owner. Refuse even an older server before fetch or install.
+                        let _ = (path, sha256, size);
+                        let why = crate::updates::UpgradeRefusal::Backend.to_string();
+                        refuse(&mut answer_after, crate::wire::channel::Refusal::Unsupported, why.clone());
+                        uplink.msg(AgentMsg::UpgradeDone { job, ok: false, error: Some(why) }).await;
                     }
                     ServerMsg::HarnessHistory { req, kind, limit } => match &ai {
                         Some(ai) => {
@@ -3347,6 +3509,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             let _ = up.send(Up::Term(AgentMsg::DirList { req, json })).await;
                         });
                     }
+                    ServerMsg::Amphora { .. } => {
+                        tracing::error!(target: "kiln.replication", event = "transport_refused", "Amphora transport requires its dedicated authenticated carrier lane; no product acknowledgement was made");
+                    }
                     ServerMsg::ProbeFacts => probe_facts(&uplink, &o.work_dir, &o.declared, &probing),
                     // A terminal into a running or kept leg (docs/ci.md W17-R01), or a command run
                     // there (W17-R05): its workspace and environment, or its container; the leg's
@@ -3392,15 +3557,36 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         let typed = shell_waits.remove(&session).unwrap_or_default();
                         let l = shell.launch(command.as_deref(), o.shell.as_deref());
                         let env: Vec<(&str, String)> = l.env.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
-                        match terminal::spawn_at(l.shell.as_deref(), l.command.as_deref(), l.program.as_deref(), l.cwd.as_deref(), cols, rows, &env) {
+                        // U03: a host debug PTY must belong to the exact active execution or
+                        // a child registered with the retained root before any raw PTY spawn.
+                        let (execution, retained_child) = if let Some(running) = jobs.get(&job) {
+                            (Arc::clone(&running.execution), false)
+                        } else if let Some(child) = crate::runner::kept::debug_child(&job) {
+                            if !crate::runner::kept::debug_execution(&job, &child) {
+                                crate::rt::spawn(async move { child.stop().await; });
+                                refuse(&mut answer_after, crate::wire::channel::Refusal::Refused, "retained execution is being released");
+                                continue;
+                            }
+                            (child, true)
+                        } else {
+                            refuse(&mut answer_after, crate::wire::channel::Refusal::Refused, "the job has no exact debug execution owner");
+                            continue;
+                        };
+                        match terminal::spawn_at_execution(l.shell.as_deref(), l.command.as_deref(), l.program.as_deref(), l.cwd.as_deref(), cols, rows, &env, Some(Arc::clone(&execution))) {
                             Ok((pty, rx)) => {
                                 let (tx, s, masked) = (term_tx.clone(), session.clone(), crate::runner::kept::masked(rx, &shell.masks));
                                 crate::rt::spawn(async move {
                                     while let Ok(out) = masked.recv().await {
-                                        if tx.send((s.clone(), out)).await.is_err() {
+                                        let exited = matches!(&out, PtyOut::Exit(_));
+                                        // The bridge proves its own group empty for live jobs.
+                                        // Only retained children may fence their whole scope;
+                                        // stopping a live job's root would kill unrelated steps.
+                                        if exited && retained_child { execution.stop().await; }
+                                        if tx.send((s.clone(), out)).await.is_err() || exited {
                                             break;
                                         }
                                     }
+                                    if retained_child { execution.stop().await; }
                                 });
                                 let state = crate::termsess::Session::detached(session.clone(), format!("leg:{job}"), None, cols, rows);
                                 for data in typed {
@@ -3409,6 +3595,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 terms.insert(session, (pty, state));
                             }
                             Err(e) => {
+                                if retained_child { crate::rt::spawn(async move { execution.stop().await; }); }
                                 uplink.0.send(Up::Term(AgentMsg::TermExit { session, code: None, error: Some(format!("{e:#}")) })).await.ok();
                             }
                         }
@@ -3431,7 +3618,16 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         crate::runner::kept::extend(&job, minutes);
                     }
                     ServerMsg::Received { job } if job.is_empty() => receipts = true,
+                    ServerMsg::RetainedReceived { .. } => {}
+                    ServerMsg::ReceivedV2 { job, attempt } => {
+                        if unreceived.get(&job).is_some_and(|(_, data)| completion_receipt(data, Some(attempt), server_job_attempt)) {
+                            unreceived.remove(&job);
+                            if let Some((_, _, events)) = journal.get_mut(&job) { events.clear(); }
+                        }
+                    }
                     ServerMsg::Received { job } => {
+                        // U03: an unfenced receipt cannot clear a fenced completion.
+                        if !unreceived.get(&job).is_some_and(|(_, data)| completion_receipt(data, None, server_job_attempt)) { continue; }
                         unreceived.remove(&job);
                         if let Some((_, _, events)) = journal.get_mut(&job) {
                             events.clear();
@@ -3522,13 +3718,32 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         updates.closing(&key);
                     }
                     if connected {
-                        flush_updates(&mut updates, &uplink).await;
+                        flush_updates(&mut updates, &uplink)?;
                     }
                 } else {
                     uplink.0.send(Up::Term(msg)).await.ok();
                 }
             }
             Ev::Up(mut up) => {
+                // U03: commit retained evidence before its first transmission. Completion
+                // receipts never clear this independent crash-replay outbox.
+                let retained_evidence = match &up {
+                    Up::Msg(AgentMsg::JobEvent { job, json }) => retained::Receipt::of(job, json)?,
+                    Up::Msg(AgentMsg::Executor { json }) => retained::Receipt::executor(json)?,
+                    _ => None,
+                };
+                if let Some(receipt) = retained_evidence
+                    && let Err(error) = retained_spool.publish(&receipt).await
+                {
+                    tracing::warn!(error = %format!("{error:#}"), "retained evidence is waiting for durable outbox acceptance");
+                    // Exactly one failed local event waits. Continue receiving server ACKs
+                    // and replaying the durable spool; later local events cannot overtake it.
+                    retained_blocked = Some((up, Instant::now() + Duration::from_secs(1)));
+                    continue 'events;
+                }
+                if let Up::Msg(AgentMsg::Executor { json }) = &up
+                    && let Ok(said) = serde_json::from_str::<crate::runner::pool::Said>(json)
+                { pool_execs.published(&said); }
                 // A job's event: numbered, and kept until the job's result is received.
                 let mut journaled = None;
                 if let Up::Msg(AgentMsg::JobEvent { job, json }) = &mut up {
@@ -3553,12 +3768,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     Up::Port(m) => (LANE_PORTS, Kind::Term, proto::encode(m)),
                 };
                 let Ok(data) = data else { continue };
+                let data = completion_wire(data, server_job_attempt);
                 if let Some((_, _, events)) = journaled.as_ref().and_then(|j| journal.get_mut(j)) {
                     events.push(data.clone());
                 }
                 // What the next connection sends again (a leg's result not yet received, its
                 // events once the server takes them again) needn't be kept for it.
-                let again = matches!(&up, Up::Msg(AgentMsg::JobFinished(r)) if unreceived.contains_key(&r.job)) || (receipts && journaled.is_some());
+                let again = matches!(&up, Up::Msg(AgentMsg::JobFinished(r)) if unreceived.contains_key(&r.job)) || matches!(&up, Up::Msg(AgentMsg::JobFinishedV2 { result, .. }) if unreceived.contains_key(&result.job)) || (receipts && journaled.is_some());
                 // Logs and jobs' messages wait for the Welcome too, and come after what waited.
                 if connected && (welcomed || (lane != LANE_LOGS && lane != LANE_CONTROL)) {
                     match &delay_line {
@@ -3616,7 +3832,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         if let (Some(kept), Some(s)) = (kept, harness.as_ref().and_then(|h| h.get(&session))) {
                             start_stream(&mut updates, &session, &s, Some(kept), &mut sent_changes);
                             if connected {
-                                flush_updates(&mut updates, &uplink).await;
+                                flush_updates(&mut updates, &uplink)?;
                             }
                             continue 'events;
                         }
@@ -3629,7 +3845,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         updates.closing(&key);
                     }
                     if connected {
-                        flush_updates(&mut updates, &uplink).await;
+                        flush_updates(&mut updates, &uplink)?;
                     }
                 } else if connected && welcomed {
                     // A server from before the channel: not kept across a disconnect, the
@@ -3640,19 +3856,26 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     }
                 }
             }
-            Ev::Done(r) => {
+            Ev::Done(r, attempt) => {
                 if retiring {
                     retire_at = Some(Instant::now() + Duration::from_secs(5)).max(retire_at);
                 }
-                if jobs.remove(&r.job).is_some() {
+                if jobs.get(&r.job).is_some_and(|j| j.attempt == attempt) {
+                    if let Some(running) = jobs.remove(&r.job) {
+                        running.grace_stop.cancel();
+                    }
                     crate::runner::cpus::pins().release(&r.job);
                     // The leg's key goes with it (docs/ci.md W27-R01).
                     crate::runner::identity::forget(&crate::runner::identity::slot("leg", Some(&r.job), None));
                     tracing::info!(job = %r.job, status = r.status.as_str(), "job finished");
-                    if let Ok(b) = proto::encode(&AgentMsg::JobFinished(r.clone())) {
+                    let msg = match attempt {
+                        Some(attempt) => AgentMsg::JobFinishedV2 { result: r.clone(), attempt },
+                        None => AgentMsg::JobFinished(r.clone()),
+                    };
+                    if let Ok(b) = proto::encode(&msg) {
                         unreceived.insert(r.job.clone(), (Instant::now(), b));
                     }
-                    uplink.msg(AgentMsg::JobFinished(r)).await;
+                    deferred_control.enqueue(&uplink.0, Up::Msg(msg))?;
                 } else {
                     // Reported over already: a cancelled job let go of after its grace that ended
                     // after all (or the grace's report, after the job's own).
@@ -3683,44 +3906,67 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             tracing::warn!(max_agent_sessions = n, "[agent] max_agent_sessions is from 1 to {}: passed over", crate::harness::limit::MAX);
                         }
                         limit_config = config;
-                        hold_agent_limit(h, crate::harness::limit::held(limit_asked, limit_config), &mut limit_said, server_limit && welcomed, &uplink).await;
+                        hold_agent_limit(h, crate::harness::limit::held(limit_asked, limit_config), &mut limit_said, server_limit && welcomed, &uplink, &mut deferred_control)?;
                     }
                 }
                 if connected {
-                    let free = if upgrade_pending || retiring { 0 } else { o.slots.saturating_sub(u32::try_from(jobs.len()).unwrap_or(0)) };
-                    uplink.msg(AgentMsg::Heartbeat { free_slots: free, running: jobs.keys().cloned().collect() }).await;
+                    let free = if retiring { 0 } else { o.slots.saturating_sub(u32::try_from(jobs.len()).unwrap_or(0)) };
+                    deferred_control.enqueue(&uplink.0, Up::Msg(AgentMsg::Heartbeat { free_slots: free, running: jobs.keys().cloned().collect() }))?;
                     // Its machine's say on upgrades, read again: a change goes to the server at once.
                     if !o.ephemeral && !o.outpost {
                         let accept = takes_updates(&o);
                         if accept_said != Some(accept) {
-                            uplink.msg(AgentMsg::UpdatePrefs { accept }).await;
+                            deferred_control.enqueue(&uplink.0, Up::Msg(AgentMsg::UpdatePrefs { accept }))?;
                             accept_said = Some(accept);
                         }
                     }
                 }
             }
             Ev::Sample => {
+                if let Err(error) = publish_closed_executor_hints(&pool_execs, &retained_spool).await {
+                    tracing::warn!(error = %format!("{error:#}"), "closed executor hints remain owned pending durable publication");
+                }
+                if let Err(error) = retained_spool.import_stopped(&o.work_dir).await {
+                    tracing::warn!(error = %format!("{error:#}"), "stopped execution evidence remains fenced pending durable outbox import");
+                }
+                if connected && welcomed && server_retained_received {
+                    match retained_spool.pending().await {
+                        Ok(pending) => for receipt in pending {
+                            if let Ok(message) = receipt.message() {
+                                // The local canonical importer already committed this exact Gate
+                                // proof. Keep the live producer's map until its ordered barrier.
+                                if let AgentMsg::Executor { json } = &message
+                                    && let Ok(said) = serde_json::from_str::<crate::runner::pool::Said>(json)
+                                { pool_execs.recovered(&said); }
+                                if let Ok(bytes) = proto::encode(&message) {
+                                    net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, bytes).await;
+                                }
+                            }
+                        },
+                        Err(error) => tracing::warn!(error = %format!("{error:#}"), "retained evidence replay is waiting for Amphora"),
+                    }
+                }
                 if connected && updates_on {
                     // Items whose answers are overdue (lost below the channel) go again.
-                    flush_updates(&mut updates, &uplink).await;
+                    flush_updates(&mut updates, &uplink)?;
                 }
                 // What it has of the server's commands, said again: one lost below the channel
                 // mustn't hold the server's commands up until the next connection.
                 if connected && server_wire {
-                    uplink.0.send(Up::Term(AgentMsg::Wire(wire_in.have()))).await.ok();
+                    deferred_control.enqueue(&uplink.0, Up::Term(AgentMsg::Wire(wire_in.have())))?;
                 }
                 if connected {
                     let s = sampler.sample();
-                    uplink.msg(AgentMsg::Sample(s)).await;
+                    deferred_control.enqueue(&uplink.0, Up::Msg(AgentMsg::Sample(s)))?;
                     // What its QUIC layer let go below the channel, for its page: once it changed.
                     let dropped = crate::metrics::net().counts();
                     if server_drops && welcomed && drops_said.as_ref() != Some(&dropped) {
-                        uplink.msg(AgentMsg::NetDrops { dropped: dropped.clone() }).await;
+                        deferred_control.enqueue(&uplink.0, Up::Msg(AgentMsg::NetDrops { dropped: dropped.clone() }))?;
                         drops_said = Some(dropped);
                     }
                     // What its agent sessions are held to, said again if the server lacks it.
                     if let Some(h) = &harness {
-                        hold_agent_limit(h, crate::harness::limit::held(limit_asked, limit_config), &mut limit_said, server_limit && welcomed, &uplink).await;
+                        hold_agent_limit(h, crate::harness::limit::held(limit_asked, limit_config), &mut limit_said, server_limit && welcomed, &uplink, &mut deferred_control)?;
                     }
                     // What it holds warm, for placement (docs/ci.md W24-R18): once it changed here,
                     // and every 10 minutes for what the machine's other runner processes changed.
@@ -3730,18 +3976,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         if let Ok(state) = crate::rt::blocking(move || crate::runner::warm::state(&dir)).await
                             && let Ok(json) = serde_json::to_string(&state)
                         {
-                            uplink.msg(AgentMsg::WorkState { json }).await;
+                            deferred_control.enqueue(&uplink.0, Up::Msg(AgentMsg::WorkState { json }))?;
                         }
                         work_said = Some((now_changes, Instant::now()));
-                    }
-                    // What its conversation stores are doing, for the server's board (a server from
-                    // before takes it for nothing). Never waits: a full link skips one.
-                    for (st, role, feed) in [(convo.as_ref(), "own", shipper.as_ref().map(crate::convo::feed::Shipper::stats)), (mirror_store.as_ref(), "mirror", None)] {
-                        if let Some(st) = st {
-                            let report = crate::convo::telemetry::Report { role: role.into(), version: crate::convo::telemetry::version(), store: st.report(), feed };
-                            let json = crate::convo::feed::encode(&crate::convo::feed::Msg::Stats { store: st.id().to_owned(), report: Box::new(report) });
-                            let _ = uplink.0.try_send(Up::Convo(AgentMsg::Convo { json, data: Vec::new() }));
-                        }
                     }
                     // Its battery, once a minute, when it has one: said when it changes, and every
                     // 10 minutes (a machine on battery sleeps when it runs out).
@@ -3751,13 +3988,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             && (power_said.as_ref().is_none_or(|(said, _)| said != &b) || power_said.as_ref().is_some_and(|(_, at)| at.elapsed() >= Duration::from_secs(600)))
                             && let Ok(json) = serde_json::to_string(&b)
                         {
-                            uplink.msg(AgentMsg::Power { json }).await;
+                            deferred_control.enqueue(&uplink.0, Up::Msg(AgentMsg::Power { json }))?;
                             power_said = Some((b, Instant::now()));
                         }
                     }
                     if let Some(ai) = &ai {
                         let shells = terms.iter().filter_map(|(id, (pty, _))| Some((pty.pid()?, id.clone()))).collect();
-                        ai.scan(shells, uplink.0.clone());
+                        let managed = harness.as_ref().map(|h| h.harness_pids()).unwrap_or_default();
+                        ai.scan(shells, managed, uplink.0.clone());
                     }
                     // A harness installed (or removed) since, or found once its user's login shell
                     // said its PATH (asked again every ten minutes): say so.
@@ -4021,6 +4259,20 @@ fn go_on(snapshot: Vec<crate::harness::core::Update>, kept: Option<&proto::KeptS
     (out, Some(d))
 }
 
+/// Capability negotiation and private extensions belong to the actual TLS connection that
+/// declared the reconciled layout. A forwarded command never supplies that proof.
+fn server_layout_on(msg: &ServerMsg, origin: Option<crate::net::Connection>, current: Option<crate::net::Connection>, layout: Option<crate::net::Connection>) -> Result<(), &'static str> {
+    let on_current = origin.is_some() && origin == current;
+    if let ServerMsg::Caps { caps } = msg {
+        if !on_current { return Err("capability declaration is not from the current authenticated server connection"); }
+        proto::check_unified_layout(*caps)?;
+    }
+    if proto::server_extension(msg) && (!on_current || layout != origin) {
+        return Err("private protocol extension before this connection validated its unified layout");
+    }
+    Ok(())
+}
+
 /// Notes a session's announcement in this process (and that it's gone, once closed).
 fn note_announced(announced: &mut std::collections::HashSet<String>, session: &str, u: &crate::harness::core::Update) {
     match u {
@@ -4059,10 +4311,18 @@ async fn ask_agent_identity(uplink: &Uplink, asked: &mut HashMap<String, (Instan
     }
 }
 
-async fn flush_updates(updates: &mut crate::wire::uplink::Updates, uplink: &Uplink) {
+/// Sends what the channel has to send now.
+fn flush_updates(updates: &mut crate::wire::uplink::Updates, uplink: &Uplink) -> anyhow::Result<()> {
     for f in updates.poll(Instant::now()) {
-        uplink.0.send(Up::Term(AgentMsg::Wire(f))).await.ok();
+        match uplink.0.try_send(Up::Term(AgentMsg::Wire(f))) {
+            Ok(()) => {}
+            // U03: Updates retains unacknowledged frames for its next retransmission poll.
+            // The main loop must consume this channel before it can send any more itself.
+            Err(async_channel::TrySendError::Full(_)) => break,
+            Err(async_channel::TrySendError::Closed(_)) => anyhow::bail!("agent uplink is closed"),
+        }
     }
+    Ok(())
 }
 
 /// Most of one agent-session update a frame carries. They go on the interactive lane, which
@@ -4304,11 +4564,6 @@ fn longest(v: &serde_json::Value, at: String, best: &mut (usize, String)) {
     }
 }
 
-/// The binary's modification time (an upgrade replaces the file).
-fn binary_mtime(p: &std::path::Path) -> Option<std::time::SystemTime> {
-    std::fs::metadata(p).and_then(|m| m.modified()).ok()
-}
-
 /// One terminal carried across an in-place upgrade.
 #[derive(Serialize, Deserialize)]
 struct HandedTerm {
@@ -4324,7 +4579,7 @@ struct HandedTerm {
 /// What this machine holds its agent sessions to (`crate::harness::limit`), held by its sessions'
 /// host from now on; and said to the server when `tell` (it takes it, on a connection it welcomed)
 /// and it changed since the server last heard it.
-async fn hold_agent_limit(h: &crate::harness::host::Host, held: crate::harness::limit::Held, said: &mut Option<crate::harness::limit::Held>, tell: bool, uplink: &Uplink) {
+fn hold_agent_limit(h: &crate::harness::host::Host, held: crate::harness::limit::Held, said: &mut Option<crate::harness::limit::Held>, tell: bool, uplink: &Uplink, deferred: &mut DeferredControl) -> anyhow::Result<()> {
     if h.set_max_sessions(held.max_sessions) {
         tracing::info!(max_sessions = held.max_sessions, from = ?held.from, "agent sessions: this machine has at most this many at work at once");
     }
@@ -4332,9 +4587,15 @@ async fn hold_agent_limit(h: &crate::harness::host::Host, held: crate::harness::
         && *said != Some(held)
         && let Ok(json) = serde_json::to_string(&held)
     {
-        uplink.msg(AgentMsg::AgentLimit { json }).await;
+        deferred.enqueue(&uplink.0, Up::Msg(AgentMsg::AgentLimit { json }))?;
         *said = Some(held);
     }
+    Ok(())
+}
+
+/// U16: the same authenticated server connection negotiated the controlled-upgrade law.
+fn controlled_upgrade_on(origin: Option<crate::net::Connection>, current: Option<crate::net::Connection>, announced: Option<crate::net::Connection>) -> bool {
+    origin.is_some() && origin == current && announced == origin
 }
 
 /// Whether this machine takes upgrades from its server: its config's `[updates] accept`, read
@@ -4355,77 +4616,20 @@ pub fn handed_over() -> bool {
     HANDED_OVER.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// Whether `exe` starts at all (`--version` succeeds, saying it is kiln): what an upgrade checks
-/// before switching to it.
-async fn binary_runs(exe: &std::path::Path) -> anyhow::Result<()> {
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg("--version");
-    let out = crate::os::proc::output(cmd, Duration::from_secs(30)).await?;
-    let said = String::from_utf8_lossy(&out.stdout);
-    anyhow::ensure!(out.status.success() && said.starts_with("kiln"), "`{} --version` gave {} ({})", exe.display(), out.status, said.trim());
-    Ok(())
-}
-
-/// Write every terminal's handover (what the process after this one needs to take it over) to
-/// the handover file; returns the PTY masters in the file's order. Terminals that cannot be
-/// handed over end with this upgrade.
-fn write_handover(o: &Opts, terms: &HashMap<String, (PtySession, Arc<crate::termsess::Session>)>) -> std::io::Result<Vec<i32>> {
-    use base64::Engine as _;
-    let mut handed = Vec::new();
-    for (id, (pty, state)) in terms {
-        let Some(handover) = pty.handover() else {
-            tracing::warn!(session = %id, "terminal cannot be handed over; it ends with this upgrade");
-            continue;
-        };
-        let info = state.info();
-        let a = state.attach();
-        state.detach();
-        handed.push(HandedTerm {
-            session: id.clone(),
-            command: state.command.clone(),
-            cols: info.cols,
-            rows: info.rows,
-            handover,
-            replay: base64::engine::general_purpose::STANDARD.encode(&a.replay),
-        });
-    }
-    let json = serde_json::to_vec(&handed).map_err(std::io::Error::other)?;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    crate::os::with_mode(&mut opts, 0o600);
-    use std::io::Write as _;
-    opts.open(handover_path(o))?.write_all(&json)?;
-    Ok(handed.iter().map(|h| h.handover.fd).collect())
-}
-
-/// Re-execute this process from `exe` (same pid), handing every terminal to the new image.
-/// Returns only if the exec failed.
-fn upgrade_in_place(o: &Opts, exe: &std::path::Path, terms: &HashMap<String, (PtySession, Arc<crate::termsess::Session>)>) -> std::io::Error {
-    let handed = match write_handover(o, terms) {
-        Ok(h) => h,
-        Err(e) => return e,
-    };
-    tracing::info!(terminals = handed.len(), exe = %exe.display(), "upgrading in place");
-    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-    let err = crate::os::reexec(exe, &args, &[]);
-    let _ = std::fs::remove_file(handover_path(o));
-    err
-}
-
 /// How this process started, as far as its terminals go.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Start {
     /// Nothing was handed over.
     Fresh,
-    /// A previous image of this process re-executed itself into this one ([`upgrade_in_place`]).
+    /// A previous image of this process re-executed itself into this one (the legacy in-place path).
     ReExecuted,
     /// The supervisor started this process with the terminals the runner before it handed over.
     Successor,
 }
 
 /// Take over the terminals handed over before this process started: by a previous image of it
-/// that re-executed itself ([`upgrade_in_place`], the masters kept at the numbers the handover
-/// file says), or by the runner process before it, through the supervisor ([`write_handover`],
+/// that re-executed itself (the legacy in-place path, the masters kept at the numbers the handover
+/// file says), or by the runner process before it, through the supervisor (the legacy handover file,
 /// the masters at the numbers the supervisor names, in the file's order). Reopen each PTY,
 /// rebuild its replay state, and keep it for the server, which re-adopts it from the next TermList.
 fn adopt_handover(
@@ -4492,32 +4696,230 @@ fn adopt_handover(
 }
 
 
-/// The copy of the server's conversation store this runner keeps (a mirror), beside its own, and
-/// the intake that takes the server's feed into it, its answers going up the link.
-fn open_mirror(dir: &std::path::Path, up: &async_channel::Sender<Up>) -> Option<(crate::convo::store::Store, crate::convo::feed::Intake)> {
-    let st = crate::convo::open_file(dir, crate::convo::MIRROR_FILE, crate::config::Conversations::default().upkeep())?;
-    match crate::convo::feed::Intake::start(st.clone(), crate::convo::feed::Brings::AsItSays, None) {
-        Ok((intake, out)) => {
-            let up = up.clone();
-            crate::rt::spawn(async move {
-                while let Ok(o) = out.recv().await {
-                    if up.send(Up::Convo(AgentMsg::Convo { json: o.json, data: Vec::new() })).await.is_err() {
-                        break;
-                    }
-                }
-            });
-            Some((st, intake))
-        }
-        Err(e) => {
-            tracing::warn!(error = %format!("{e:#}"), "this runner can't keep a copy of the conversation store");
-            None
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn u03_inherited_pod_factory_fences_uid_node_grant_and_job_attempt() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let work = dir.path().join("unopened-work");
+        let bootstrap = ExecutorBootstrap {
+            identity: crate::k8s::ExecutorIdentity { namespace: "jobs".into(), name: "executor".into(), uid: "pod-uid".into(), node: "node".into(), executor: "slot".into(), generation: "generation".into(), allocation: "existing-grant".into() },
+            certificate_sha256: "a".repeat(64),
+        };
+        let binding = kiln_ci::wire::ParentBinding {
+            executor: bootstrap.identity.executor.clone(), generation: bootstrap.identity.generation.clone(), allocation: bootstrap.identity.allocation.clone(),
+            physical_execution: bootstrap.identity.physical_execution()?, job: "leg".into(), attempt: 2,
+        };
+        let assignment = kiln_ci::wire::AssignmentV2 { job_id: "leg".into(), attempt: 2, parent_binding: Some(binding.clone()), ..Default::default() };
+        assert!(bootstrap.execution_for(crate::runner::processes::Admission::production(), &assignment, work.clone()).is_ok());
+        for changed in [
+            kiln_ci::wire::ParentBinding { executor: "another-slot".into(), ..binding.clone() },
+            kiln_ci::wire::ParentBinding { generation: "another-generation".into(), ..binding.clone() },
+            kiln_ci::wire::ParentBinding { allocation: "another-grant".into(), ..binding.clone() },
+            kiln_ci::wire::ParentBinding { physical_execution: "another-physical-owner".into(), ..binding.clone() },
+            kiln_ci::wire::ParentBinding { job: "another-leg".into(), ..binding.clone() },
+            kiln_ci::wire::ParentBinding { attempt: 1, ..binding },
+        ] {
+            let changed = kiln_ci::wire::AssignmentV2 { parent_binding: Some(changed), ..assignment.clone() };
+            assert!(bootstrap.execution_for(crate::runner::processes::Admission::production(), &changed, work.clone()).is_err());
+        }
+        let mut replaced = bootstrap.clone();
+        replaced.identity.uid = "replacement-uid".into();
+        assert!(replaced.execution_for(crate::runner::processes::Admission::production(), &assignment, work.clone()).is_err());
+        replaced = bootstrap.clone();
+        replaced.identity.node = "another-node".into();
+        assert!(replaced.execution_for(crate::runner::processes::Admission::production(), &assignment, work.clone()).is_err());
+        let absent = kiln_ci::wire::AssignmentV2 { parent_binding: None, ..assignment };
+        assert!(bootstrap.execution_for(crate::runner::processes::Admission::production(), &absent, work.clone()).is_err());
+        assert!(!work.try_exists()?);
+        Ok(())
+    }
+
+    #[test]
+    fn u03_executor_bootstrap_requires_the_exact_issued_certificate() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pki = crate::pki::Pki::open(&dir.path().join("pki"))?;
+        let leaf = pki.issue_local("executor")?;
+        let replacement = pki.issue_local("executor")?;
+        let bootstrap = ExecutorBootstrap {
+            identity: crate::k8s::ExecutorIdentity { namespace: "jobs".into(), name: "executor".into(), uid: "uid".into(), node: "node".into(), executor: "slot".into(), generation: "generation".into(), allocation: "existing-grant".into() },
+            certificate_sha256: crate::pki::cert_info(&leaf.cert_pem)?.sha256,
+        };
+        crate::util::write_secret(&dir.path().join("executor-bootstrap.json"), &serde_json::to_vec(&Some(bootstrap.clone()))?, 0o600)?;
+        assert_eq!(enrolled_executor(dir.path(), &leaf)?.map(|b| b.identity), Some(bootstrap.identity));
+        assert!(enrolled_executor(dir.path(), &replacement).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn u17_reserved_main_instance_refuses_before_opening_either_state_path() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = dir.path().join("state");
+        let work = dir.path().join("work");
+        let options = Opts {
+            server_url: "http://127.0.0.1:1".into(), quic: None, name: "runner".into(),
+            labels: Vec::new(), slots: 1, work_dir: work.clone(), state_dir: state.clone(),
+            shared_store: None, join_token: None, ephemeral: false, dedicated_job: None,
+            terminal: true, job_terminal: false, shell: None, credentials: None,
+            instance: Some(crate::upgrade::MAIN.into()), config: None, reach: None, observe: false,
+            outpost: false, declared: crate::runner::probe::Declared::default(),
+        };
+        let error = crate::rt::block_on(run(options, Shutdown::default())).err().ok_or_else(|| anyhow::anyhow!("reserved main instance unexpectedly started"))?;
+        assert!(error.to_string().contains("reserved"));
+        assert!(!state.try_exists()?);
+        assert!(!state.join("instances").join(crate::upgrade::MAIN).try_exists()?);
+        assert!(!work.try_exists()?);
+        Ok(())
+    }
+
+    #[test]
+    fn u17_instance_revision_namespaces_accept_arbitrary_ids_without_sharing_history() -> anyhow::Result<()> {
+        let first = super::runner_records_namespace("runner-a", Some("UPGRADE/实例"));
+        amphora_api::family(&first)?;
+        assert_eq!(first, super::runner_records_namespace("runner-a", Some("UPGRADE/实例")));
+        assert_ne!(first, super::runner_records_namespace("runner-a", Some("upgrade/实例")));
+        assert_ne!(first, super::runner_records_namespace("runner-b", Some("UPGRADE/实例")));
+        let main = super::runner_records_namespace("runner-a", None);
+        assert_ne!(first, main);
+        assert_eq!(super::runner_records_namespace("runner-a", Some(crate::upgrade::MAIN)), main);
+        assert_ne!("host", main);
+        amphora_api::family(&main)?;
+        let machine = super::runner_machine_namespace("runner-a");
+        amphora_api::family(&machine)?;
+        assert_ne!(machine, main);
+        assert_ne!(machine, super::runner_machine_namespace("runner-b"));
+        // U05: one configured host path, with retained state/work/instance import identities.
+        let root = tempfile::tempdir()?;
+        let (host, state, work) = (root.path().join("host"), root.path().join("retained"), root.path().join("work"));
+        let mut config = crate::config::Config::default();
+        config.server.data_dir = host.clone();
+        assert_eq!(configured_host_database(&config, &state, &work)?, host.join("kiln.db"));
+        assert!(!host.exists() && !state.exists() && !work.exists(), "path preflight creates nothing");
+        let instance = state.join("instances/upgrade");
+        std::fs::create_dir_all(&instance)?;
+        std::fs::create_dir_all(work.join("_cas"))?;
+        let imports = [state.join(crate::convo::FILE), state.join(crate::records::FILE), instance.join(crate::convo::FILE), instance.join(crate::records::FILE), work.join("_cas/ledger.db")];
+        for path in &imports { std::fs::write(path, b"retained legacy input")?; }
+        assert_eq!(configured_host_database(&config, &state, &work)?, host.join("kiln.db"));
+        for path in [state.join("kiln.db"), state.join("amphora.db"), instance.join("amphora.db"), work.join("_cas/amphora.db"), work.join("amphora.db")] {
+            std::fs::write(&path, b"distinct authoritative aggregate")?;
+            let refused = configured_host_database(&config, &state, &work).err().ok_or_else(|| anyhow::anyhow!("distinct aggregate accepted"))?;
+            assert!(refused.downcast_ref::<HostMigrationNeeded>().is_some());
+            assert_eq!(std::fs::read(&path)?, b"distinct authoritative aggregate");
+            assert!(!host.exists(), "migration refusal precedes canonical creation");
+            std::fs::remove_file(path)?;
+        }
+        for path in &imports { assert_eq!(std::fs::read(path)?, b"retained legacy input"); }
+        #[cfg(unix)]
+        {
+            let cluster = state.join("cluster");
+            std::fs::create_dir(&cluster)?;
+            std::os::unix::fs::symlink("missing-retained-log", cluster.join("cluster.log"))?;
+            let refused = configured_host_database(&config, &state, &work).err().ok_or_else(|| anyhow::anyhow!("dangling retained log accepted"))?;
+            assert!(refused.downcast_ref::<HostMigrationNeeded>().is_some());
+            assert!(std::fs::symlink_metadata(cluster.join("cluster.log"))?.file_type().is_symlink());
+            assert!(!host.exists());
+            std::fs::remove_file(cluster.join("cluster.log"))?;
+            std::fs::remove_dir(cluster)?;
+            // Cache authority must survive identity dedup with an earlier state root.
+            let alias_work = root.path().join("alias-work");
+            std::fs::create_dir(&alias_work)?;
+            std::os::unix::fs::symlink(&state, alias_work.join("_cas"))?;
+            std::fs::create_dir(state.join("ledger.db"))?;
+            let refused = configured_host_database(&config, &state, &alias_work).err().ok_or_else(|| anyhow::anyhow!("aliased fenced cache accepted"))?;
+            assert!(refused.downcast_ref::<HostMigrationNeeded>().is_some());
+            assert!(state.join("ledger.db").is_dir() && !host.exists());
+            std::fs::remove_dir(state.join("ledger.db"))?;
+        }
+        let canonical_cache_work = root.path().join("canonical-cache-work");
+        let canonical_cache = canonical_cache_work.join("_cas");
+        std::fs::create_dir_all(canonical_cache.join("ledger.db"))?;
+        config.server.data_dir = canonical_cache.clone();
+        let refused = configured_host_database(&config, &state, &canonical_cache_work).err().ok_or_else(|| anyhow::anyhow!("canonical cache hid retained ledger authority"))?;
+        assert!(refused.downcast_ref::<HostMigrationNeeded>().is_some());
+        assert!(canonical_cache.join("ledger.db").is_dir());
+        assert!(!canonical_cache.join("kiln.db").exists() && !canonical_cache.join("amphora.db").exists(), "refusal precedes fresh canonical creation");
+        config.server.data_dir = state.clone();
+        std::fs::write(state.join("amphora.db"), b"existing canonical aggregate")?;
+        assert_eq!(configured_host_database(&config, &state, &work)?, state.join("kiln.db"));
+        assert_eq!(std::fs::read(state.join("amphora.db"))?, b"existing canonical aggregate");
+        config.server.data_dir = PathBuf::from("u05-relative-configured-host");
+        assert_eq!(configured_host_database(&config, &root.path().join("fresh-state"), &root.path().join("fresh-work"))?, config.server.data_dir.join("kiln.db"), "relative config paths keep server CWD semantics");
+        Ok(())
+    }
+
     use super::*;
+
+    #[test]
+    fn u03_full_uplink_defers_completion_behind_retained_events_without_blocking() -> anyhow::Result<()> {
+        let (tx, rx) = async_channel::bounded(2);
+        for json in [r#"{"t":"kept_owned","execution":"exec","attempt":3,"until":10}"#, r#"{"t":"kept","until":10}"#] {
+            tx.try_send(Up::Msg(AgentMsg::JobEvent { job: "leg".into(), json: json.into() }))?;
+        }
+        let result = JobResult { job: "leg".into(), status: Status::Failed, exit_code: Some(1), error: None, peak_rss: None, cpu_seconds: None };
+        let completion = AgentMsg::JobFinishedV2 { result, attempt: 3 };
+        // Completion replay storage precedes enqueue, just as Ev::Done does.
+        let replay = proto::encode(&completion)?;
+        let mut deferred = DeferredControl::default();
+        deferred.enqueue(&tx, Up::Msg(completion.clone()))?;
+        deferred.enqueue(&tx, Up::Msg(AgentMsg::Heartbeat { free_slots: 1, running: vec![] }))?;
+        assert_eq!(deferred.pending.len(), 2);
+        assert!(matches!(rx.try_recv()?, Up::Msg(AgentMsg::JobEvent { json, .. }) if json.contains("kept_owned")));
+        deferred.flush(&tx)?;
+        assert!(matches!(rx.try_recv()?, Up::Msg(AgentMsg::JobEvent { json, .. }) if json.contains("kept")));
+        deferred.flush(&tx)?;
+        assert!(matches!(rx.try_recv()?, Up::Msg(AgentMsg::JobFinishedV2 { attempt: 3, .. })));
+        assert!(matches!(rx.try_recv()?, Up::Msg(AgentMsg::Heartbeat { .. })));
+        assert!(deferred.pending.is_empty());
+        assert_eq!(proto::read_agent(&replay).map_err(|e| anyhow::anyhow!("{}: {}", e.what(), e.why("AgentMsg")))?, completion);
+        Ok(())
+    }
+
+    /// U15/U03: a server's Caps wrapped in a forwarded item cannot claim an authenticated
+    /// layout, and a new TLS connection cannot reuse the old one's private receipt authority.
+    #[test]
+    fn u15_forwarded_caps_and_replaced_server_cannot_supply_private_layout() -> anyhow::Result<()> {
+        let current = crate::net::Connection::new(SERVER_PEER, 2, [2; 32]);
+        let former = crate::net::Connection::new(SERVER_PEER, 1, [1; 32]);
+        let body = proto::encode(&ServerMsg::Caps { caps: proto::CAP_UNIFIED_LAYOUT | proto::CAP_RETAINED_RECEIVED })?;
+        let inner = proto::read_server(&body).map_err(|e| anyhow::anyhow!("{}: {}", e.what(), e.why("ServerMsg")))?;
+        assert!(server_layout_on(&inner, None, Some(current), None).is_err(), "an unwrapped forwarded Caps supplies no TLS origin");
+        assert!(server_layout_on(&inner, Some(former), Some(current), Some(former)).is_err(), "old Caps cannot rebind proof");
+        assert!(server_layout_on(&inner, Some(current), Some(current), None).is_ok(), "the actual server may negotiate");
+        assert!(!controlled_upgrade_on(Some(current), Some(current), None), "an old server cannot activate a runner");
+        assert!(!controlled_upgrade_on(None, Some(current), Some(current)), "forwarded frames cannot acquire activation authority");
+        assert!(!controlled_upgrade_on(Some(former), Some(current), Some(former)), "a stale connection cannot activate");
+        assert!(!controlled_upgrade_on(Some(current), Some(current), Some(former)), "a new connection must negotiate again");
+        assert!(controlled_upgrade_on(Some(current), Some(current), Some(current)));
+        let receipt = ServerMsg::ReceivedV2 { job: "leg".into(), attempt: 3 };
+        assert!(server_layout_on(&receipt, Some(current), Some(current), Some(former)).is_err(), "a replacement cannot retire evidence on an old proof");
+        assert!(server_layout_on(&receipt, None, Some(current), Some(current)).is_err(), "a forwarded receipt has no current TLS origin");
+        assert!(server_layout_on(&receipt, Some(current), Some(current), Some(current)).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn u03_stale_receipt_cannot_clear_current_completion() -> anyhow::Result<()> {
+        let result = JobResult { job: "leg".into(), status: Status::Succeeded, exit_code: Some(0), error: None, peak_rss: None, cpu_seconds: None };
+        let kept = proto::encode(&AgentMsg::JobFinishedV2 { result, attempt: 9 })?;
+        assert!(!completion_receipt(&kept, Some(8), true));
+        assert!(!completion_receipt(&kept, None, true), "new servers cannot clear a fenced attempt with an old receipt");
+        assert!(completion_receipt(&kept, Some(9), true));
+        assert!(completion_receipt(&kept, None, false), "old servers still acknowledge their legacy encoding");
+        Ok(())
+    }
+
+    #[test]
+    fn u03_completion_replay_preserves_attempt_across_old_server_encoding() -> anyhow::Result<()> {
+        let result = JobResult { job: "leg".into(), status: Status::Succeeded, exit_code: Some(0), error: None, peak_rss: None, cpu_seconds: None };
+        let message = AgentMsg::JobFinishedV2 { result: result.clone(), attempt: 9 };
+        let kept = proto::encode(&message)?;
+        assert_eq!(proto::read_agent(&completion_wire(kept.clone(), false)).map_err(|e| anyhow::anyhow!("{}: {}", e.what(), e.why("AgentMsg")))?, AgentMsg::JobFinished(result));
+        assert_eq!(proto::read_agent(&completion_wire(kept.clone(), true)).map_err(|e| anyhow::anyhow!("{}: {}", e.what(), e.why("AgentMsg")))?, message);
+        assert_eq!(proto::read_agent(&kept).map_err(|e| anyhow::anyhow!("{}: {}", e.what(), e.why("AgentMsg")))?, message, "legacy transmission cannot erase replay identity");
+        Ok(())
+    }
+
 
     /// CP-T3.2 (the thirteenth adversarial check's): a rollback takes nothing back until the new
     /// build is seen gone. One its supervisor didn't stop (none found here) is killed, and seen gone.

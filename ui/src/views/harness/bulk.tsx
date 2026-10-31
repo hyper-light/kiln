@@ -31,7 +31,7 @@ interface Result {
   outcomes: Outcome[];
 }
 /** Does an action, saying what it's at meanwhile (`doing`), then how it went. */
-type Acting = (doing: string, go: () => Promise<Result>) => void;
+type RunBulkAction = (doing: string, go: () => Promise<Result>) => void;
 
 const outcome = (a: AgentInfo, result: Outcome["result"], reason?: string): Outcome => ({ id: a.id, name: agentLabel(a), machine: machineName(a.target), result, reason });
 /** The outcomes, with their line: `done` says what was done to how many. */
@@ -149,7 +149,7 @@ export function BulkBar({ agents, all, open, idle, onGone, onClear }: { agents: 
   if (ask !== asking) setAsk(asking);
   if (asking !== null && asking !== shownAsk) setShownAsk(asking);
 
-  const run: Acting = (doing, go) => {
+  const run: RunBulkAction = (doing, go) => {
     setBusy(doing);
     setSaidGoing(false);
     setAsk(null);
@@ -567,7 +567,7 @@ function ReachPick({
 }
 
 /** Their notifications muted for you on every device, or unmuted when they all are: where push is on here. */
-function MuteItem({ agents, disabled, run }: { agents: AgentInfo[]; disabled: boolean; run: Acting }) {
+function MuteItem({ agents, disabled, run }: { agents: AgentInfo[]; disabled: boolean; run: RunBulkAction }) {
   const push = useRes(pushStateRes);
   const muted = new Set(push.data.muted);
   const on = agents.filter((a) => muted.has(a.id));

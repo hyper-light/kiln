@@ -30,7 +30,7 @@ use std::time::Duration;
 use futures::future::BoxFuture;
 use kiln_seams::Clock;
 use kiln_seams::blobs::{self as seam, Access, Blobs, Cond, Listed, Listing, Meta, Method, Put, Range, Refusal};
-use rusqlite::{Connection, OptionalExtension as _, params};
+use crate::sql::{Connection, OptionalExtension as _, params};
 use sha2::{Digest as _, Sha256};
 
 use super::chunks::{self, Chunks};
@@ -139,7 +139,7 @@ fn unavailable(e: impl std::fmt::Display) -> Refusal {
     Refusal::Unavailable(e.to_string())
 }
 
-fn row(c: &Connection, key: &str) -> rusqlite::Result<Option<Row>> {
+fn row(c: &Connection, key: &str) -> crate::sql::Result<Option<Row>> {
     c.query_row("SELECT digest, size, modified_ms, file FROM blob_keys WHERE key = ?1", [key], |r| {
         Ok(Row { digest: r.get(0)?, size: u64::try_from(r.get::<_, i64>(1)?).unwrap_or(0), modified_ms: r.get(2)?, file: r.get(3)? })
     })
@@ -170,7 +170,7 @@ fn same_file(path: &str, size: u64, modified: i64) -> bool {
 /// What a key let go of. Held still by a key other than the CAS's, it stays pinned; else an older
 /// kiln may let it go as its own (used now); and once no key holds it, it's released now, for
 /// [`LocalBlobs::collect`] an hour later.
-fn released(c: &Connection, digest: &str, now_s: i64) -> rusqlite::Result<usize> {
+fn released(c: &Connection, digest: &str, now_s: i64) -> crate::sql::Result<usize> {
     c.execute(
         "UPDATE cas_objects SET last_used_at = ?2,
            released_at = CASE WHEN EXISTS (SELECT 1 FROM blob_keys WHERE digest = ?1) THEN NULL ELSE ?2 END
@@ -295,7 +295,7 @@ impl LocalBlobs {
                     let tx = crate::store::tx(c)?;
                     let gone: Vec<(String, String)> = {
                         let mut q = tx.prepare("SELECT key, digest FROM blob_keys WHERE file IS NULL AND digest NOT IN (SELECT digest FROM cas_objects) LIMIT ?1")?;
-                        q.query_map([page], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
+                        q.query_map([page], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<crate::sql::Result<_>>()?
                     };
                     for (key, digest) in &gone {
                         tx.execute("DELETE FROM blob_keys WHERE key = ?1", [key])?;
@@ -308,7 +308,7 @@ impl LocalBlobs {
                             "SELECT digest, size, created_at, last_used_at FROM cas_objects
                              WHERE digest NOT IN (SELECT digest FROM blob_keys) AND (released_at IS NULL OR last_used_at > released_at) LIMIT ?1",
                         )?;
-                        q.query_map([page], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<rusqlite::Result<_>>()?
+                        q.query_map([page], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<crate::sql::Result<_>>()?
                     };
                     let mut taken = 0usize;
                     for (digest, size, created, used) in &found {
@@ -345,7 +345,7 @@ impl LocalBlobs {
                 .store
                 .call(move |c| {
                     let mut q = c.prepare("SELECT key, file, size, modified_ms FROM blob_keys WHERE file IS NOT NULL AND key > ?1 ORDER BY key LIMIT ?2")?;
-                    Ok(q.query_map(params![a, page], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<rusqlite::Result<_>>()?)
+                    Ok(q.query_map(params![a, page], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<crate::sql::Result<_>>()?)
                 })
                 .await?;
             let Some((last, ..)) = files.last() else { break };
@@ -540,7 +540,7 @@ impl LocalBlobs {
                 let tx = crate::store::tx(c)?;
                 let stale: Vec<String> = {
                     let mut q = tx.prepare("SELECT id FROM blob_uploads WHERE started_ms < ?1")?;
-                    q.query_map([stale_before], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<_>>()?
+                    q.query_map([stale_before], |r| r.get::<_, String>(0))?.collect::<crate::sql::Result<_>>()?
                 };
                 for id in &stale {
                     tx.execute("DELETE FROM blob_parts WHERE upload = ?1", [id])?;
@@ -945,25 +945,42 @@ pub(crate) mod tests {
         Ok(out)
     }
 
-    /// CP-T10.1: a whole object read as a stream is checked against its SHA-256: with a bit of one
-    /// of its chunks flipped, the stream ends short of its last piece, never served as if whole.
+    /// U03/U14/U19, CP-T10.1: an immutable read accepts valid bytes, refuses a stale reference,
+    /// and never lets wrong-size metadata disable checksum verification of damaged chunks.
     #[test]
     fn a_damaged_object_streams_short_never_as_if_whole() -> anyhow::Result<()> {
         crate::rt::block_on(async {
             let Fixture { blobs, _dir, .. } = Fixture::new()?;
+            let blobs = Arc::new(blobs);
             let data = kiln_seams::blobs::noise(10 << 20, 41);
+            let meta = blobs.put("d", data.clone(), Put::default()).await?;
+            let reader: Arc<dyn Blobs> = blobs.clone();
+            let rx = crate::blobs::io::read_stream(reader.clone(), "d".into(), Some(meta.etag.clone()), meta.size, 0, meta.size.saturating_sub(1));
+            let mut valid = Vec::new();
+            while let Ok(piece) = rx.recv().await { valid.extend_from_slice(&piece); }
+            assert_eq!(valid, data, "the captured immutable reference reads back whole");
+            blobs.put("d", vec![0; data.len()], Put::default()).await?;
+            let rx = crate::blobs::io::read_stream(reader.clone(), "d".into(), Some(meta.etag.clone()), meta.size, 0, meta.size.saturating_sub(1));
+            assert!(rx.recv().await.is_err(), "a replacement must not satisfy the old reference");
             blobs.put("d", data.clone(), Put::default()).await?;
-            let chunk = walk(&blobs.root.join("chunks"))?.into_iter().next().ok_or_else(|| anyhow::anyhow!("no chunk"))?;
+            // A wrong reported size used to turn the whole-object hash off: the range still
+            // returned every requested byte, so corrupted content could look complete.
+            blobs.store.call(|c| Ok(c.execute("UPDATE blob_keys SET size = size + 1 WHERE key = 'd'", [])?)).await?;
+            // The fixture spans multiple CAS chunks: corrupt one named by its actual object.
+            let list: String = blobs.store.call({ let digest = meta.etag.clone(); move |c| Ok(c.query_row("SELECT chunks FROM cas_objects WHERE digest = ?1", [digest], |r| r.get(0))?) }).await?;
+            let chunks: Chunks = serde_json::from_str(&list)?;
+            let digest = chunks.first().map(|(digest, _)| digest).ok_or_else(|| anyhow::anyhow!("no chunk"))?;
+            let chunk = chunks::path(&blobs.root, digest);
             let mut bytes = std::fs::read(&chunk)?;
-            if let Some(b) = bytes.get_mut(100) {
-                *b ^= 1;
-            }
+            let byte = bytes.get_mut(100).ok_or_else(|| anyhow::anyhow!("the object's chunk has no corruption byte"))?;
+            *byte ^= 1;
             std::fs::write(&chunk, &bytes)?;
-            let rx = crate::blobs::io::read_stream(Arc::new(blobs), "d".into(), None, 0, data.len() as u64 - 1);
+            let rx = crate::blobs::io::read_stream(reader.clone(), "d".into(), Some(meta.etag.clone()), meta.size, 0, meta.size.saturating_sub(1));
+            assert!(rx.recv().await.is_err(), "wrong-size metadata cannot bypass verification even when all requested bytes exist");
+            blobs.store.call(|c| Ok(c.execute("UPDATE blob_keys SET size = size - 1 WHERE key = 'd'", [])?)).await?;
+            let rx = crate::blobs::io::read_stream(reader, "d".into(), None, meta.size, 0, meta.size.saturating_sub(1));
             let mut got = 0usize;
-            while let Ok(p) = rx.recv().await {
-                got = got.saturating_add(p.len());
-            }
+            while let Ok(p) = rx.recv().await { got = got.saturating_add(p.len()); }
             assert!(got < data.len(), "{got} bytes of a damaged object streamed");
             Ok(())
         })

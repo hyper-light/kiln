@@ -113,7 +113,7 @@ fn w08_ac01_the_published_storage_clients() -> anyhow::Result<()> {
     // Beside the build, not tmpfs: the 2 GiB upload is written twice.
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))?;
     // `node24` actions run on this Node, not one downloaded.
-    let bin = dir.path().join("work/_externals/node24/bin");
+    let bin = common::runner_work(dir.path()).join("_externals/node24/bin");
     std::fs::create_dir_all(&bin)?;
     std::os::unix::fs::symlink(&node, bin.join("node"))?;
     let s = start(dir.path(), &Options { agent: true, ci: "", extra: "" })?;
@@ -333,7 +333,7 @@ fn w08_ac09_cache_access_by_event_and_mode() -> anyhow::Result<()> {
         return Ok(());
     };
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))?;
-    let bin = dir.path().join("work/_externals/node24/bin");
+    let bin = common::runner_work(dir.path()).join("_externals/node24/bin");
     std::fs::create_dir_all(&bin)?;
     std::os::unix::fs::symlink(&node, bin.join("node"))?;
     let s = start(dir.path(), &Options { agent: true, ci: "", extra: "" })?;

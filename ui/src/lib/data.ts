@@ -6,12 +6,13 @@
  *
  * A section that reads several of them `warm`s them all first, so they load at once.
  */
+import { useMemo } from "react";
 import { create } from "zustand";
 import { api } from "@/api/client";
 import { events, useServerEvents } from "@/api/events";
 import { harnessApi, listed, type AgentInfo } from "@/api/harness";
 import type { Agent, AiSession, HostSample, MetricsHistory, Overview, Repo, Run, TerminalSessionInfo, UpdateJob, UpdatesOverview } from "@/api/types";
-import { loaded, preload, useSuspenseResource, type ResourceOptions } from "./resource";
+import { invalidate, loaded, preload, useSuspenseResource, type ResourceOptions } from "./resource";
 
 /** What a key loads, and how. */
 export interface Res<T> {
@@ -137,22 +138,36 @@ export function mergeJobs(data: UpdatesOverview, live: Record<string, UpdateJob>
   return Object.values(all).sort((a, b) => b.started_at - a.started_at);
 }
 
-/** The agents kiln runs (an older server without them: none), as their events change them. */
+/** U13: every authorized agent in one resource, including helpers whose ownership still affects discovered sessions. */
 export const harnessSessionsRes: Res<AgentInfo[]> = {
   key: "harness/sessions",
-  fetch: () => harnessApi.list().catch(() => []),
+  fetch: () => harnessApi.list({ includeHelpers: true }).catch(() => []),
   // Each event carries the agent's whole entry (or says it closed): applied, the list isn't loaded again.
   opts: {
     on: ["harness", "harness_closed"],
     apply: (list, ev) => {
-      if (ev.type === "harness_closed") return list.filter((a) => a.id !== ev.id);
-      if (ev.type !== "harness") return undefined;
-      if (!listed(ev.info)) return list.filter((a) => a.id !== ev.info.id);
-      const i = list.findIndex((a) => a.id === ev.info.id);
-      return i === -1 ? [...list, ev.info] : list.map((a, j) => (j === i ? ev.info : a));
+      if (ev.type !== "harness" && ev.type !== "harness_closed") return undefined;
+      const id = ev.type === "harness_closed" ? ev.id : ev.info.id;
+      const previous = list.find((a) => a.id === id);
+      const next = ev.type === "harness" ? ev.info : undefined;
+      // U13: only ownership tuple/membership changes stale the API's managed_by projection.
+      // Ordinary activity snapshots and repeated closes do not refetch either AI resource.
+      if (previous?.id !== next?.id || previous?.target !== next?.target || previous?.kind !== next?.kind || previous?.harness_session !== next?.harness_session) invalidate("ai-sessions");
+      if (!next) return previous ? list.filter((a) => a.id !== id) : list;
+      return previous ? list.map((a) => (a.id === id ? next : a)) : [...list, next];
     },
   },
 };
+
+/** A pure view of the same roster: a card's helper has no row, count or waiting card. */
+export const listedHarnessSessions = (list: readonly AgentInfo[]): AgentInfo[] => list.filter(listed);
+
+/** U13: views share the raw resource owner; a filtered view cannot replace its hidden entries through setData. */
+export function useHarnessSessions() {
+  const { data, refreshing, reload, refreshError } = useRes(harnessSessionsRes);
+  const visible = useMemo(() => listedHarnessSessions(data), [data]);
+  return { data: visible, refreshing, reload, refreshError };
+}
 
 /** The terminal sessions the server keeps (any device can attach to them). */
 export const terminalSessionsRes: Res<TerminalSessionInfo[]> = { key: "terminal/sessions", fetch: (s) => api.terminalSessions(s).catch(() => []), opts: { on: ["terminals"] } };

@@ -1,17 +1,16 @@
-//! Executes one assigned job on an agent: fetch source, run steps, stream output, sample the
-//! process tree, upload artifacts, clean up. Every failure becomes a job result; nothing here can
-//! take the agent down.
+//! U03: the legacy assignment wire adapter and the runner's upstream transport. All jobs use
+//! `runner::runtime::Leg` for their process tree, steps, masking, cancellation and cleanup. Only
+//! the old server's source/artifact endpoints and event spelling remain here.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use futures::FutureExt as _;
-
-use crate::proto::{AgentMsg, Assignment, JobResult, LOG_CHUNK, LogChunk};
-use crate::rt::{Interval, Shutdown};
+use kiln_ci::wire::{AssignmentV2, Contexts, ExecutorSpec, JobEventV2, LegInfo, Runtime, Secret};
+use crate::proto::{AgentMsg, Assignment, JobResult, LogChunk};
+use crate::rt::Shutdown;
 use crate::store::Status;
 
 /// What the executor sends upstream; the agent's uplink buffers it across reconnects.
@@ -76,242 +75,108 @@ pub struct Exec {
     pub http: Arc<crate::http::client::Client>,
 }
 
-#[derive(Default)]
-struct Usage {
-    peak_rss: u64,
-    cpu_seconds: f64,
-}
+fn have(bin: &str) -> bool { crate::os::have(bin) }
 
-enum Outcome {
-    Exit(Option<i32>),
-    Cancelled,
-    TimedOut,
-}
-
-/// One turn of a step's event loop (computed inside `select!`, handled after it).
-enum Ev {
-    Chunk(Option<Vec<u8>>),
-    Exit(Option<i32>),
-    Flush,
-    Sample,
-    Cancel,
-    Deadline,
-}
-
-/// The job's workspace: `<work>/w/<8 hex>`. Kept short on purpose: Unix socket paths are limited
-/// to 107 bytes, and test suites bind sockets several directories deep inside their workspace
-/// (`target/tmp/...`), so every byte of prefix counts.
-fn workspace(work_dir: &Path, job: &str) -> PathBuf {
-    let digest = crate::util::sha256_hex(job.as_bytes());
-    work_dir.join("w").join(digest.get(..8).unwrap_or("job"))
-}
-
-/// The job's private temp directory: a sibling of its workspace on the same volume.
-fn tmp_dir(ws: &Path) -> PathBuf {
-    let mut name = ws.file_name().map(std::ffi::OsStr::to_os_string).unwrap_or_default();
-    name.push(".tmp");
-    ws.with_file_name(name)
-}
-
-fn have(bin: &str) -> bool {
-    crate::os::have(bin)
-}
-
-fn mask(data: &[u8], secrets: &[(String, String)]) -> Vec<u8> {
-    let mut s = String::from_utf8_lossy(data).into_owned();
-    for (_, v) in secrets {
-        if v.len() >= 4 {
-            s = s.replace(v.as_str(), "***");
-        }
-    }
-    s.into_bytes()
-}
-
-fn slug(s: &str) -> String {
-    s.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect()
-}
-
-/// Pipes deliver LF; xterm wants CRLF.
-fn push_crlf(pending: &mut Vec<u8>, chunk: Vec<u8>) {
-    for b in chunk {
-        if b == b'\n' {
-            pending.push(b'\r');
-        }
-        pending.push(b);
-    }
-}
-
-/// `rx.recv()` while `enabled`, otherwise a future that never completes.
-async fn recv_if(rx: &async_channel::Receiver<Vec<u8>>, enabled: bool) -> Option<Vec<u8>> {
-    if enabled {
-        rx.recv().await.ok()
-    } else {
-        futures::future::pending().await
-    }
-}
+fn slug(s: &str) -> String { s.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect() }
 
 async fn fs<R: Send + 'static>(f: impl FnOnce() -> std::io::Result<R> + Send + 'static) -> anyhow::Result<R> {
     Ok(crate::rt::blocking(f).await??)
 }
 
+/// The accepted job's canonical process owner retires every Git subtree before returning.
+/// Mirror commands lend the SAME File custody; workspace reads lend their pinned selection.
+async fn git_owned<H: Send + 'static>(command: Command, custody: H) -> anyhow::Result<Vec<u8>> {
+    let out = crate::proc::output_with_custody(command, Duration::from_secs(1800), custody).await?;
+    if !out.status.success() {
+        return Err(kiln_cd::git::GitExit::new(out.status, crate::util::truncate(String::from_utf8_lossy(&out.stderr).trim(), 600).to_owned()).into());
+    }
+    Ok(out.stdout)
+}
+
+/// U08: only a known missing exact-commit lookup permits one targeted fetch. A local pin
+/// failure or unknown process outcome returns directly while the SAME operation stays owned.
+async fn select_owned<F, Fut>(operation: &mut kiln_cd::git::OwnedOperation, sha: &str, mut execute: F) -> anyhow::Result<kiln_cd::git::SelectedCommit>
+where
+    F: FnMut(Command) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Vec<u8>>>,
+{
+    match operation.retain_using(sha, &mut execute).await {
+        Ok(selected) => Ok(selected),
+        Err(error) if error.downcast_ref::<kiln_cd::git::MissingCommit>().is_some() => {
+            operation.fetch_one_using(sha, &mut execute).await?;
+            operation.retain_using(sha, &mut execute).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
 impl Exec {
+    fn require_native_execution(&self) -> anyhow::Result<()> {
+        let execution = crate::runner::processes::current().ok_or(crate::proc::CustodyRefusal::NoExecution)?;
+        execution.require_native_attempt(&self.assign.job_id, self.assign.attempt.saturating_add(1))
+    }
+
     pub async fn run(self) -> JobResult {
-        let job = self.assign.job_id.clone();
-        self.up.msg(AgentMsg::JobStarted { job: job.clone() }).await;
-        let ws = workspace(&self.work_dir, &job);
-        let tmp = tmp_dir(&ws);
-        let t = tmp.clone();
-        if let Err(e) = fs(move || std::fs::create_dir_all(t)).await {
-            tracing::warn!(error = %e, tmp = %tmp.display(), "cannot create job TMPDIR");
+        // The receiver retains the accepted slot/resources and exact physical owner through
+        // stop(). Do not let Leg::run manufacture a new unbudgeted scope for this adapter.
+        if let Err(error) = self.require_native_execution() {
+            return JobResult { job: self.assign.job_id.clone(), status: Status::Failed, exit_code: None,
+                error: Some(format!("legacy native execution: {error:#}")), peak_rss: None, cpu_seconds: None };
         }
-        let result = self.run_inner(&ws).await;
-        let t = tmp.clone();
-        let _ = fs(move || std::fs::remove_dir_all(t)).await;
-        let w = ws.clone();
-        if let Err(e) = crate::rt::blocking(move || std::fs::remove_dir_all(w)).await.map_err(|e| std::io::Error::other(e.to_string())).and_then(|r| r)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(error = %e, ws = %ws.display(), "workspace cleanup failed");
-        }
+        self.up.msg(AgentMsg::JobStarted { job: self.assign.job_id.clone() }).await;
+        let a = self.assignment();
+        let legacy = Arc::new(self);
+        let (tx, rx) = async_channel::bounded(128);
+        let upstream = legacy.up.clone();
+        let masks = a.secrets.iter().map(|s| s.value.clone()).chain(a.masks.iter().cloned()).collect::<Vec<_>>();
+        let bridge = crate::rt::spawn(async move { legacy_events(rx, upstream, masks).await });
+        let leg = crate::runner::runtime::Leg {
+            a, work_dir: legacy.work_dir.clone(), runner_name: legacy.agent_name.clone(), up: Uplink(tx),
+            cancel: legacy.cancel.clone(), http: Arc::clone(&legacy.http), warm: Default::default(), cache_max: None,
+            legacy: Some(legacy),
+        };
+        let result = leg.run().await;
+        let _ = bridge.await;
         result
     }
 
-    async fn run_inner(&self, ws: &Path) -> JobResult {
+    fn assignment(&self) -> AssignmentV2 {
         let a = &self.assign;
-        let job = a.job_id.clone();
-        let fail = |status: Status, error: String| JobResult {
-            job: job.clone(),
-            status,
-            exit_code: None,
-            error: Some(error),
-            peak_rss: None,
-            cpu_seconds: None,
-        };
-        self.up
-            .note(&job, 0, &format!(
-                "job {} · attempt {} · agent {} · {}@{}",
-                a.spec.display, a.attempt + 1, self.agent_name, a.repo, a.sha.get(..12).unwrap_or(&a.sha)
-            ))
-            .await;
-        let checked_out = futures::select_biased! {
-            () = self.cancel.cancelled().fuse() => Err(anyhow::anyhow!("cancelled during checkout")),
-            r = self.checkout(ws).fuse() => r,
-        };
-        if let Err(e) = checked_out {
-            let msg = format!("checkout failed: {e:#}");
-            self.up.log(&job, 0, format!("\x1b[31m[kiln] {msg}\x1b[0m\r\n").into_bytes()).await;
-            let status = if self.cancel.is_cancelled() { Status::Cancelled } else { Status::Failed };
-            return fail(status, msg);
-        }
-
-        let mut env: BTreeMap<String, String> = a.spec.env.clone();
-        for (k, v) in [
-            ("CI", "true".to_owned()),
-            ("KILN", "true".to_owned()),
-            ("KILN_REPO", a.repo.clone()),
-            ("KILN_SHA", a.sha.clone()),
-            ("KILN_BRANCH", a.branch.clone()),
-            ("KILN_EVENT", a.event.clone()),
-            ("KILN_RUN_ID", a.run_id.clone()),
-            ("KILN_RUN_NUMBER", a.run_number.to_string()),
-            ("KILN_JOB_ID", job.clone()),
-            ("KILN_JOB", a.spec.key.clone()),
-            ("KILN_ATTEMPT", a.attempt.to_string()),
-            ("KILN_WORKSPACE", ws.to_string_lossy().into_owned()),
-            // Temp space on the work volume, not tmpfs or a container's overlay layer: big
-            // build temporaries fit, and storage-sensitive tests see a real filesystem.
-            ("TMPDIR", tmp_dir(ws).to_string_lossy().into_owned()),
-            ("KILN_AGENT", self.agent_name.clone()),
-            ("TERM", "xterm-256color".to_owned()),
-            ("CARGO_TERM_COLOR", "always".to_owned()),
-            ("FORCE_COLOR", "1".to_owned()),
-        ] {
-            env.entry(k.to_owned()).or_insert(v);
-        }
-        if cfg!(windows) {
-            // Windows tools find their temp dir through TEMP / TMP rather than TMPDIR.
-            let tmp = tmp_dir(ws).to_string_lossy().into_owned();
-            for k in ["TEMP", "TMP"] {
-                env.entry(k.to_owned()).or_insert_with(|| tmp.clone());
-            }
-        }
-        for (k, v) in &a.secrets {
-            env.insert(k.clone(), v.clone());
-        }
-
-        let deadline = Instant::now() + Duration::from_secs(u64::from(a.spec.timeout_minutes) * 60);
-        let mut usage = Usage::default();
-        let mut failed: Option<(Status, Option<i32>, String)> = None;
-        for (i, step) in a.spec.steps.iter().enumerate() {
-            let idx = u32::try_from(i).unwrap_or(u32::MAX);
-            if failed.is_some() {
-                self.up.msg(AgentMsg::StepFinished { job: job.clone(), idx, status: Status::Skipped, exit_code: None }).await;
-                continue;
-            }
-            self.up.msg(AgentMsg::StepStarted { job: job.clone(), idx }).await;
-            let step_deadline = step
-                .timeout_minutes
-                .map(|m| (Instant::now() + Duration::from_secs(u64::from(m) * 60)).min(deadline))
-                .unwrap_or(deadline);
-            let mut step_env = env.clone();
-            step_env.extend(step.env.clone());
-            let cwd = match &step.working_directory {
-                Some(d) => ws.join(d),
-                None => ws.to_path_buf(),
-            };
-            let outcome = if step.tty {
-                self.run_pty(idx, &step.run, step.shell.as_deref(), &cwd, &step_env, step_deadline, &mut usage).await
-            } else {
-                self.run_piped(idx, &step.run, step.shell.as_deref(), &cwd, &step_env, step_deadline, &mut usage).await
-            };
-            let (status, code, err) = match outcome {
-                Ok(Outcome::Exit(Some(0))) => (Status::Succeeded, Some(0), None),
-                Ok(Outcome::Exit(code)) => (Status::Failed, code, Some(format!("step {} exited with {code:?}", idx + 1))),
-                Ok(Outcome::Cancelled) => (Status::Cancelled, None, Some("cancelled".to_owned())),
-                Ok(Outcome::TimedOut) => (Status::TimedOut, None, Some("timed out".to_owned())),
-                Err(e) => (Status::Failed, None, Some(format!("step {} could not start: {e:#}", idx + 1))),
-            };
-            if let Some(e) = &err {
-                self.up.log(&job, idx, format!("\r\n\x1b[31m[kiln] {e}\x1b[0m\r\n").into_bytes()).await;
-            }
-            self.up.msg(AgentMsg::StepFinished { job: job.clone(), idx, status, exit_code: code }).await;
-            if status != Status::Succeeded && !(step.continue_on_error && status == Status::Failed) {
-                failed = Some((status, code, err.unwrap_or_default()));
-            }
-        }
-
-        if !a.spec.artifacts.is_empty() && !self.cancel.is_cancelled() {
-            let last = u32::try_from(a.spec.steps.len().saturating_sub(1)).unwrap_or(0);
-            match self.upload_artifacts(ws).await {
-                Ok(n) if n > 0 => self.up.note(&job, last, &format!("uploaded {n} artifact files")).await,
-                Ok(_) => self.up.note(&job, last, "no files matched the artifact patterns").await,
-                Err(e) => {
-                    let why = format!("artifact upload failed: {e:#}");
-                    self.up.note(&job, last, &why).await;
-                    // A job whose artifacts didn't arrive didn't do what it's for (a release's
-                    // binaries are its artifacts).
-                    failed = failed.or(Some((Status::Failed, None, why)));
-                }
-            }
-        }
-
-        let (status, exit_code, error) = match failed {
-            None => (Status::Succeeded, Some(0), None),
-            Some((s, c, e)) => (s, c, Some(e)),
-        };
-        JobResult {
-            job,
-            status,
-            exit_code,
-            error,
-            peak_rss: Some(usage.peak_rss),
-            cpu_seconds: Some(usage.cpu_seconds),
+        let names = a.secrets.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>();
+        let job = crate::ci::legacy::job(&a.spec, Status::Running, &names);
+        let git_ref = format!("refs/{}/{}", if a.event == "tag" { "tags" } else { "heads" }, a.branch);
+        let base = a.server_url.trim_end_matches('/');
+        AssignmentV2 {
+            job_id: a.job_id.clone(), run_id: a.run_id.clone(), attempt: a.attempt.saturating_add(1),
+            repo: a.repo.clone(), sha: a.sha.clone(), git_ref: git_ref.clone(), dialect: "kiln".into(),
+            leg: LegInfo { job_id: a.spec.spec_id.clone(), name: a.spec.display.clone(), total: 1, ..LegInfo::default() },
+            executor: ExecutorSpec { kind: "host".into(), ..ExecutorSpec::default() },
+            steps: job.steps, job_env: job.env, job_defaults: job.defaults,
+            contexts: Contexts { github: serde_json::json!({
+                "repository": a.repo, "sha": a.sha, "ref": git_ref, "ref_name": a.branch,
+                "ref_type": if a.event == "tag" { "tag" } else { "branch" },
+                "event_name": match a.event.as_str() { "manual" => "workflow_dispatch", "tag" => "push", other => other },
+                "run_id": a.run_id, "run_number": a.run_number, "run_attempt": 1, "job": a.spec.key,
+                "server_url": base, "api_url": format!("{base}/api/v3"), "event": {},
+            }), ..Contexts::default() },
+            secrets: a.secrets.iter().map(|(name, value)| Secret { name: name.clone(), value: value.clone() }).collect(),
+            // v1 supplied every secret as an environment variable as well as masking it.
+            env_from: [("KILN_ATTEMPT".into(), a.attempt.to_string()), ("KILN_JOB".into(), a.spec.key.clone())].into_iter().chain(a.secrets.iter().cloned()).collect(), masks: vec![a.job_token.clone()],
+            timeout_minutes: a.spec.timeout_minutes.max(1), checkout: "auto".into(), trusted: true,
+            runtime: Runtime { results_url: base.into(), runtime_token: a.job_token.clone(), facade_url: base.into(),
+                api_url: format!("{base}/api/v3"), graphql_url: format!("{base}/api/graphql"), ..Runtime::default() },
+            exclusive: a.spec.exclusive, holds: match crate::hub::v1_incoming(a.spec.exclusive, &a.spec.resources) {
+                kiln_ci::sched::state::Incoming::Share(q) => Some(q), _ => None,
+            }, ..AssignmentV2::default()
         }
     }
 
     /// Prefer a git checkout (keeps `.git` for tools that need history), using a per-repo bare
     /// mirror cache; fall back to the server's source tarball (no git or GitHub access needed).
-    async fn checkout(&self, ws: &Path) -> anyhow::Result<()> {
+    pub(crate) async fn checkout(&self, ws: &Path, temp: &Path) -> anyhow::Result<()> {
+        // Refused/mismatched ownership is not an unavailable remote and must not fall through
+        // to another checkout path. Inherited scopes need real delegated child authority.
+        self.require_native_execution()?;
         let a = &self.assign;
         let job = &a.job_id;
         let w = ws.to_path_buf();
@@ -319,8 +184,11 @@ impl Exec {
         if have("git") && !a.clone_url.is_empty() {
             match self.git_checkout(ws).await {
                 Ok(()) => return Ok(()),
+                Err(error) if error.downcast_ref::<crate::proc::CustodyRefusal>().is_some() => return Err(error),
                 Err(e) => {
-                    self.up.note(job, 0, &format!("git checkout failed ({e:#}); using server source archive")).await;
+                    let values = a.secrets.iter().map(|(_, v)| v.as_str()).chain(std::iter::once(a.job_token.as_str())).collect::<Vec<_>>();
+                    let message = kiln_ci::runner::mask::Masker::new(&values).mask(&format!("git checkout failed ({e:#}); using server source archive"));
+                    self.up.note(job, 0, &message).await;
                     let w = ws.to_path_buf();
                     let _ = fs(move || std::fs::remove_dir_all(w)).await;
                     let w = ws.to_path_buf();
@@ -328,57 +196,72 @@ impl Exec {
                 }
             }
         }
-        self.tarball(ws).await
+        self.tarball(ws, temp).await
     }
 
-    async fn git(&self, args: &[&str]) -> anyhow::Result<()> {
+    async fn git(&self, args: &[&str], selected: &kiln_cd::git::SelectedCommit) -> anyhow::Result<()> {
         let mut cmd = Command::new("git");
         crate::os::git_no_prompts(cmd.args(args));
-        let out = crate::proc::output(cmd, Duration::from_secs(1800)).await?;
-        if !out.status.success() {
-            anyhow::bail!("git {}: {}", args.first().unwrap_or(&""), String::from_utf8_lossy(&out.stderr).trim());
-        }
+        git_owned(cmd, selected.clone()).await?;
         Ok(())
     }
 
     async fn git_checkout(&self, ws: &Path) -> anyhow::Result<()> {
+        self.require_native_execution()?;
+        // Reconcile the SAME durable owner before acquiring the mirror File. Each captured
+        // command revalidates again after acquisition, before pending native submission.
+        crate::proc::reconcile_custody_admission().await?;
         let a = &self.assign;
+        anyhow::ensure!(matches!(a.sha.len(), 40 | 64) && a.sha.bytes().all(|b| b.is_ascii_hexdigit()), "legacy checkout requires a full commit SHA");
         let cache = std::env::var_os("KILN_GIT_CACHE").map(PathBuf::from).unwrap_or_else(|| self.work_dir.join("git"));
-        let mirror = cache.join(format!("{}.git", slug(&a.repo)));
-        let m = mirror.to_string_lossy().to_string();
-        let lock_path = cache.join(format!("{}.lock", slug(&a.repo)));
-        let c = cache.clone();
-        fs(move || std::fs::create_dir_all(c)).await?;
-        // Serialise mirror updates across concurrent jobs (and processes) with a lock file.
-        let lock = FileLock::acquire(&lock_path).await?;
-        if mirror.join("HEAD").exists() {
-            self.git(&["-C", &m, "fetch", "--quiet", "--prune", "origin", "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"]).await?;
-        } else {
-            self.git(&["clone", "--quiet", "--bare", &a.clone_url, &m]).await?;
-        }
-        if self.git(&["-C", &m, "cat-file", "-e", &format!("{}^{{commit}}", a.sha)]).await.is_err() {
-            self.git(&["-C", &m, "fetch", "--quiet", "origin", &a.sha]).await?;
-        }
-        drop(lock);
+        let old = cache.join(format!("{}.git", slug(&a.repo)));
+        // U08: a logical repository name is not a source identity. Keep legacy mirrors as
+        // read-only imports, and separate upstream authorities/readers even when slugs collide.
+        // Hash the assignment credential only as a cache boundary; never forward it to Git.
+        let identity = crate::util::sha256_hex(&serde_json::to_vec(&(&a.server_url, &a.clone_url, &a.job_token))?);
+        let canonical = cache.join("read").join(format!("{identity}.git"));
+        let legacy = if old.join("kiln-runner-mirror").exists() { Vec::new() } else { vec![old.clone()] };
+        // The v1 adapter has no explicit credentials: preserve its ambient Git authentication.
+        // It must never borrow the host server's CI/CD credentials or the job's API token.
+        let mut operation = kiln_cd::git::Mirror::open_import_owned_using(
+            &canonical, &a.clone_url, kiln_cd::git::Auth::default(), kiln_cd::git::Options::default(), &legacy,
+            git_owned,
+        ).await?;
+        let selected = {
+            let custody = operation.custody();
+            select_owned(&mut operation, &a.sha, |command| git_owned(command, custody.clone())).await?
+        };
+        // The requested commit is permanently pinned. Release the mutation fence before
+        // workspace clone/submodules; those reads retain this exact captured selection.
+        let mirror = operation.into_mirror()?;
+        // U08: old warm discovery names become pointers, never additional mirror writers.
+        // Publish only after the requested commit is available and retained.
+        fs(move || {
+            std::fs::create_dir_all(&old)?;
+            let temp = old.join(format!("kiln-runner-mirror-{}", crate::util::new_id()));
+            std::fs::write(&temp, identity)?;
+            std::fs::rename(temp, old.join("kiln-runner-mirror"))
+        }).await?;
+        let m = mirror.dir.to_string_lossy().to_string();
         let w = ws.to_string_lossy().to_string();
-        self.git(&["clone", "--quiet", "--shared", "--no-checkout", &m, &w]).await?;
-        self.git(&["-C", &w, "checkout", "--quiet", "--detach", &a.sha]).await?;
-        self.git(&["-C", &w, "remote", "set-url", "origin", &a.clone_url]).await?;
+        self.git(&["clone", "--quiet", "--shared", "--no-checkout", &m, &w], &selected).await?;
+        self.git(&["-C", &w, "checkout", "--quiet", "--detach", selected.sha()], &selected).await?;
+        self.git(&["-C", &w, "remote", "set-url", "origin", &a.clone_url], &selected).await?;
         if ws.join(".gitmodules").exists() {
-            self.git(&["-C", &w, "submodule", "update", "--init", "--recursive", "--quiet"]).await?;
+            self.git(&["-C", &w, "submodule", "update", "--init", "--recursive", "--quiet"], &selected).await?;
         }
         Ok(())
     }
 
     /// Stream the server's `git archive` of the commit to disk, then unpack it.
-    async fn tarball(&self, ws: &Path) -> anyhow::Result<()> {
+    async fn tarball(&self, ws: &Path, temp: &Path) -> anyhow::Result<()> {
         let a = &self.assign;
         let url = format!("{}/api/jobs/{}/source", a.server_url.trim_end_matches('/'), a.job_id);
         let mut resp = self.http.get(&url).bearer(&a.job_token).timeout(Duration::from_secs(120)).send().await?;
         if !resp.is_success() {
             anyhow::bail!("source archive: HTTP {}", resp.status());
         }
-        let tar_path = tmp_dir(ws).join("source.tar");
+        let tar_path = temp.join("source.tar");
         let (sink, done) = crate::rt::file_sink(tar_path.clone(), 16 << 30)?;
         while let Some(chunk) = resp.chunk().await? {
             if sink.send(chunk).await.is_err() {
@@ -396,215 +279,7 @@ impl Exec {
         .await
     }
 
-    fn command_line(&self, shell: Option<&str>, script: &str) -> (String, Vec<String>) {
-        match shell.map(str::trim).filter(|s| !s.is_empty()) {
-            Some(custom) => {
-                let mut parts = custom.split_whitespace().map(str::to_owned);
-                let prog = parts.next().unwrap_or_else(|| "sh".into());
-                let mut args: Vec<String> = parts.collect();
-                if args.iter().any(|a| a == "{0}") {
-                    for a in &mut args {
-                        if a == "{0}" {
-                            *a = script.to_owned();
-                        }
-                    }
-                } else {
-                    args.extend(crate::os::script_args(&prog, script));
-                }
-                (prog, args)
-            }
-            None => crate::os::default_step_shell(script),
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn run_piped(
-        &self,
-        idx: u32,
-        script: &str,
-        shell: Option<&str>,
-        cwd: &Path,
-        env: &BTreeMap<String, String>,
-        deadline: Instant,
-        usage: &mut Usage,
-    ) -> anyhow::Result<Outcome> {
-        let (prog, args) = self.command_line(shell, script);
-        let mut cmd = Command::new(prog);
-        cmd.args(args).current_dir(cwd).envs(env);
-        let _job_group = crate::os::JobGroup::enter(&self.assign.job_id, &mut cmd);
-        // On the CPUs its job may use: its own share, or what no share holds (W05-R03).
-        let mut running = crate::runner::cpus::spawn_on(&self.assign.job_id, move || crate::proc::spawn_group(cmd))?;
-        let pgid = running.pgid;
-        let _guard = PgidRecord::new(&self.work_dir, &self.assign.job_id, pgid);
-        let _pinned = crate::runner::cpus::Step::new(&self.assign.job_id, pgid);
-        let mut pending: Vec<u8> = Vec::with_capacity(LOG_CHUNK);
-        let mut flush = Interval::new(Duration::from_millis(100));
-        let mut sample = Interval::new(Duration::from_secs(2));
-        let mut output_done = false;
-        let mut status: Option<Outcome> = None;
-        loop {
-            if output_done && status.is_some() {
-                break;
-            }
-            // Children that daemonise keep the pipes open: once the step itself exited, give
-            // output a moment to drain, then stop waiting for it.
-            if status.is_some() {
-                match crate::rt::timeout(Duration::from_secs(2), running.output.recv()).await {
-                    Ok(Ok(c)) => push_crlf(&mut pending, c),
-                    Ok(Err(_)) | Err(_) => output_done = true,
-                }
-                continue;
-            }
-            let ev = futures::select_biased! {
-                c = recv_if(&running.output, !output_done).fuse() => Ev::Chunk(c),
-                code = (&mut running.exit).fuse() => Ev::Exit(code.ok().flatten()),
-                () = self.cancel.cancelled().fuse() => Ev::Cancel,
-                () = crate::rt::sleep_until(deadline).fuse() => Ev::Deadline,
-                () = flush.tick().fuse() => Ev::Flush,
-                () = sample.tick().fuse() => Ev::Sample,
-            };
-            match ev {
-                Ev::Chunk(Some(c)) => {
-                    push_crlf(&mut pending, c);
-                    if pending.len() >= LOG_CHUNK {
-                        self.ship(idx, &mut pending).await;
-                    }
-                }
-                Ev::Chunk(None) => output_done = true,
-                Ev::Exit(code) => status = Some(Outcome::Exit(code)),
-                Ev::Flush => {
-                    if !pending.is_empty() {
-                        self.ship(idx, &mut pending).await;
-                    }
-                }
-                Ev::Sample => self.sample(pgid, usage).await,
-                Ev::Cancel => {
-                    crate::proc::terminate_group(&mut running, Duration::from_secs(10)).await;
-                    status = Some(Outcome::Cancelled);
-                }
-                Ev::Deadline => {
-                    crate::proc::terminate_group(&mut running, Duration::from_secs(10)).await;
-                    status = Some(Outcome::TimedOut);
-                }
-            }
-        }
-        // Reap anything the step left behind in its process group.
-        running.kill_group();
-        if !pending.is_empty() {
-            self.ship(idx, &mut pending).await;
-        }
-        Ok(status.unwrap_or(Outcome::Exit(None)))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn run_pty(
-        &self,
-        idx: u32,
-        script: &str,
-        shell: Option<&str>,
-        cwd: &Path,
-        env: &BTreeMap<String, String>,
-        deadline: Instant,
-        usage: &mut Usage,
-    ) -> anyhow::Result<Outcome> {
-        use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-        use std::io::Read as _;
-        let (prog, args) = self.command_line(shell, script);
-        let pty = native_pty_system().openpty(PtySize { rows: 50, cols: 160, pixel_width: 0, pixel_height: 0 })?;
-        let mut cmd = CommandBuilder::new(prog);
-        cmd.args(args);
-        cmd.cwd(cwd);
-        for (k, v) in env {
-            cmd.env(k, v);
-        }
-        let mut child = pty.slave.spawn_command(cmd)?;
-        drop(pty.slave);
-        let pgid = child.process_id().and_then(|p| i32::try_from(p).ok()).unwrap_or(0);
-        let _guard = PgidRecord::new(&self.work_dir, &self.assign.job_id, pgid);
-        let mut reader = pty.master.try_clone_reader()?;
-        let (tx, rx) = async_channel::bounded::<Vec<u8>>(64);
-        std::thread::Builder::new().name("kiln-pty-step".into()).spawn(move || {
-            let mut buf = vec![0u8; 16 * 1024];
-            while let Ok(n) = reader.read(&mut buf) {
-                if n == 0 || tx.send_blocking(buf.get(..n).map(<[u8]>::to_vec).unwrap_or_default()).is_err() {
-                    break;
-                }
-            }
-        })?;
-        let (done_tx, mut done_rx) = futures::channel::oneshot::channel();
-        std::thread::Builder::new().name("kiln-pty-wait".into()).spawn(move || {
-            let code = child.wait().ok().and_then(|s| i32::try_from(s.exit_code()).ok());
-            let _ = done_tx.send(code);
-        })?;
-        let mut pending = Vec::new();
-        let mut flush = Interval::new(Duration::from_millis(100));
-        let mut sample = Interval::new(Duration::from_secs(2));
-        let mut output_open = true;
-        let outcome = loop {
-            let ev = futures::select_biased! {
-                c = recv_if(&rx, output_open).fuse() => Ev::Chunk(c),
-                code = (&mut done_rx).fuse() => Ev::Exit(code.ok().flatten()),
-                () = self.cancel.cancelled().fuse() => Ev::Cancel,
-                () = crate::rt::sleep_until(deadline).fuse() => Ev::Deadline,
-                () = flush.tick().fuse() => Ev::Flush,
-                () = sample.tick().fuse() => Ev::Sample,
-            };
-            match ev {
-                Ev::Chunk(Some(c)) => {
-                    pending.extend(c);
-                    if pending.len() >= LOG_CHUNK {
-                        self.ship(idx, &mut pending).await;
-                    }
-                }
-                Ev::Chunk(None) => output_open = false,
-                Ev::Exit(code) => break Outcome::Exit(code),
-                Ev::Flush => {
-                    if !pending.is_empty() {
-                        self.ship(idx, &mut pending).await;
-                    }
-                }
-                Ev::Sample => self.sample(pgid, usage).await,
-                Ev::Cancel => {
-                    crate::proc::terminate_tree(pgid, Duration::from_secs(5)).await;
-                    break Outcome::Cancelled;
-                }
-                Ev::Deadline => {
-                    crate::proc::terminate_tree(pgid, Duration::from_secs(5)).await;
-                    break Outcome::TimedOut;
-                }
-            }
-        };
-        crate::os::pty::close_master(pty.master);
-        while let Ok(Ok(c)) = crate::rt::timeout(Duration::from_millis(300), rx.recv()).await {
-            pending.extend(c);
-        }
-        if !pending.is_empty() {
-            self.ship(idx, &mut pending).await;
-        }
-        Ok(outcome)
-    }
-
-    async fn ship(&self, idx: u32, pending: &mut Vec<u8>) {
-        let data = mask(pending, &self.assign.secrets);
-        pending.clear();
-        for chunk in data.chunks(LOG_CHUNK) {
-            self.up.log(&self.assign.job_id, idx, chunk.to_vec()).await;
-        }
-    }
-
-    async fn sample(&self, pgid: i32, usage: &mut Usage) {
-        if pgid <= 0 {
-            return;
-        }
-        let s = crate::rt::blocking(move || crate::host::process_group(pgid)).await.unwrap_or_default();
-        usage.peak_rss = usage.peak_rss.max(s.rss_bytes);
-        usage.cpu_seconds = usage.cpu_seconds.max(s.cpu_seconds);
-        self.up
-            .msg(AgentMsg::JobSample { job: self.assign.job_id.clone(), rss: s.rss_bytes, cpu_seconds: s.cpu_seconds })
-            .await;
-    }
-
-    async fn upload_artifacts(&self, ws: &Path) -> anyhow::Result<usize> {
+    pub(crate) async fn upload_artifacts(&self, ws: &Path) -> anyhow::Result<usize> {
         let patterns = self.assign.spec.artifacts.clone();
         let root = ws.to_path_buf();
         let (count, bytes) = crate::rt::blocking(move || -> anyhow::Result<(usize, Vec<u8>)> {
@@ -707,110 +382,271 @@ impl Exec {
     }
 }
 
-/// How big each piece of an upload in pieces is (`Exec::upload_pieces`): what one holds on its way
-/// is no more than this, and a piece that breaks off costs no more.
+/// Translate the shared runtime's events back to the old server without giving internal
+/// checkout/cleanup steps new durable v1 indices. The channel is bounded; it carries no state
+/// ownership and ends after the common runtime has drained all step output.
+async fn legacy_events(rx: async_channel::Receiver<Up>, up: Uplink, masks: Vec<String>) {
+    let mut indices = BTreeMap::new();
+    let mut next = 0_u32;
+    let masker = kiln_ci::runner::mask::Masker::new(&masks);
+    while let Ok(item) = rx.recv().await {
+        let item = match item {
+            Up::Msg(AgentMsg::JobEvent { job, json }) => {
+                let event = serde_json::from_str::<JobEventV2>(&json);
+                match event {
+                    Ok(JobEventV2::StepStarted { idx, kind, .. }) if kind == "run" => {
+                        let old = *indices.entry(idx).or_insert_with(|| { let old = next; next = next.saturating_add(1); old });
+                        Up::Msg(AgentMsg::StepStarted { job, idx: old })
+                    }
+                    Ok(JobEventV2::StepFinished { idx, outcome, conclusion, exit_code, .. }) => {
+                        let Some(old) = indices.get(&idx).copied() else { continue };
+                        let status = match conclusion {
+                            kiln_ci::wire::Conclusion::Success if outcome == kiln_ci::wire::Conclusion::Failure => Status::Failed,
+                            kiln_ci::wire::Conclusion::Success => Status::Succeeded,
+                            kiln_ci::wire::Conclusion::Failure => Status::Failed,
+                            kiln_ci::wire::Conclusion::Cancelled => Status::Cancelled,
+                            kiln_ci::wire::Conclusion::Skipped => Status::Skipped,
+                        };
+                        Up::Msg(AgentMsg::StepFinished { job, idx: old, status, exit_code })
+                    }
+                    Ok(JobEventV2::Annotation { idx, level, message, .. }) => Up::Log(LogChunk {
+                        job, idx: indices.get(&idx).copied().unwrap_or_else(|| next.saturating_sub(1)),
+                        data: format!("[kiln] {level}: {}\r\n", masker.mask(&message)).into_bytes(),
+                    }),
+                    // Old servers have no outputs or failure-classification protocol.
+                    _ => continue,
+                }
+            }
+            Up::Log(mut log) => {
+                log.idx = indices.get(&log.idx).copied().unwrap_or_else(|| next.saturating_sub(1));
+                Up::Log(log)
+            }
+            other => other,
+        };
+        if up.0.send(item).await.is_err() { return }
+    }
+}
+
+/// Each legacy artifact piece is bounded, and a broken upload resumes at its last acknowledged byte.
 const ARTIFACT_PIECE: usize = 8 << 20;
 
-/// Records a running step's process group on disk so that, if this agent dies without cleaning
-/// up (SIGKILL, power loss, server crash for the in-process agent), the next start can kill the
-/// orphans. Removed when the step ends normally.
-struct PgidRecord(Option<PathBuf>);
-
-impl PgidRecord {
-    fn new(work_dir: &Path, job: &str, pgid: i32) -> Self {
-        if pgid <= 0 {
-            return Self(None);
-        }
-        let dir = work_dir.join("pgids");
-        let path = dir.join(format!("{pgid}"));
-        let ok = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, job)).is_ok();
-        Self(ok.then_some(path))
-    }
-}
-
-impl Drop for PgidRecord {
-    fn drop(&mut self) {
-        if let Some(p) = self.0.take() {
-            let _ = std::fs::remove_file(p);
-        }
-    }
-}
-
-/// Kill process groups left behind by a previous incarnation of this agent. A group is only
-/// killed when its leader still carries `KILN_JOB_ID=<job>` in its environment, so a recycled pid
-/// is never touched, and its parent isn't a kiln still running: another runner process of this
-/// machine (an upgrade's new build beside the old one shares the work directory) runs it.
-pub fn reap_orphans(work_dir: &Path) -> usize {
-    let dir = work_dir.join("pgids");
-    let Ok(entries) = std::fs::read_dir(&dir) else { return 0 };
-    let mut killed = 0;
-    for e in entries.flatten() {
-        let path = e.path();
-        let pgid: i32 = e.file_name().to_string_lossy().parse().unwrap_or(0);
-        if u32::try_from(pgid).is_ok_and(parent_is_another_kiln) {
-            continue;
-        }
-        let job = std::fs::read_to_string(&path).unwrap_or_default();
-        let _ = std::fs::remove_file(&path);
-        if pgid <= 0 || job.is_empty() {
-            continue;
-        }
-        if crate::proc::kill_orphan_group(pgid, &format!("KILN_JOB_ID={job}")) {
-            killed += 1;
-        }
-    }
-    killed
-}
-
-/// Whether process `pid` was started by a kiln that still runs, other than this process.
-fn parent_is_another_kiln(pid: u32) -> bool {
-    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
-    let mut sys = System::new();
-    let p = Pid::from_u32(pid);
-    sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[p]), false, ProcessRefreshKind::nothing());
-    let Some(parent) = sys.process(p).and_then(sysinfo::Process::parent) else { return false };
-    if parent.as_u32() <= 1 || parent.as_u32() == std::process::id() {
-        return false;
-    }
-    sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[parent]), false, ProcessRefreshKind::nothing());
-    sys.process(parent).is_some_and(|pp| pp.name().to_string_lossy().starts_with("kiln"))
-}
-
-/// A lock file (`flock` on Unix, `LockFileEx` on Windows) so concurrent jobs, even in separate
-/// agent processes, update a shared git mirror one at a time. Released on drop (closing the file
-/// releases the lock).
-struct FileLock(#[allow(dead_code, reason = "held for its lock")] std::fs::File);
-
-impl FileLock {
-    async fn acquire(path: &Path) -> anyhow::Result<Self> {
-        let path = path.to_path_buf();
-        crate::rt::blocking(move || {
-            let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path)?;
-            f.lock().map_err(|e| anyhow::anyhow!("lock {}: {e}", path.display()))?;
-            Ok(Self(f))
-        })
-        .await?
-    }
-}
-
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::io::{Read as _, Write as _};
 
+    /// U03: old assignment frames use the common runtime while an old server still receives
+    /// its own source/artifact requests and original step indices. Secrets and interpolation
+    /// shaped literal data survive the wire conversion without being evaluated again.
     #[test]
-    fn workspaces_are_short_and_distinct() {
-        let base = Path::new("/home/someone/.local/share/kiln/agent/work");
-        let a = workspace(base, "01a146e7d7e972949d3537141e355b07");
-        let b = workspace(base, "01a146e7d7e972949d3537141e355b08");
-        assert_ne!(a, b);
-        assert_eq!(a.parent(), Some(base.join("w").as_path()));
-        // Leaves room for a socket several directories deep (e.g. cargo's target/tmp/...).
-        assert!(a.as_os_str().len() + "/target/tmp/slates-ipc-1623558/original/socket".len() <= 107);
-    }
+    fn u03_legacy_assignment_runs_through_shared_runtime_and_old_transports() -> anyhow::Result<()> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        listener.set_nonblocking(true)?;
+        let mut source = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.set_cksum();
+        source.append_data(&mut header, "seed.txt", std::io::empty())?;
+        let source = source.into_inner()?;
+        let server = std::thread::spawn(move || -> anyhow::Result<Vec<u8>> {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let mut artifact = Vec::new();
+            for _ in 0..3 {
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            anyhow::ensure!(std::time::Instant::now() < deadline, "legacy transport request timed out");
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                };
+                socket.set_read_timeout(Some(Duration::from_secs(10)))?;
+                let mut raw = Vec::new();
+                let split = loop {
+                    let mut buf = [0_u8; 4096];
+                    let n = socket.read(&mut buf)?;
+                    anyhow::ensure!(n > 0 && raw.len() < 1 << 20, "incomplete legacy request");
+                    raw.extend_from_slice(buf.get(..n).unwrap_or_default());
+                    if let Some(end) = raw.windows(4).position(|s| s == b"\r\n\r\n") { break end + 4 }
+                };
+                let head = String::from_utf8_lossy(raw.get(..split).unwrap_or_default()).into_owned();
+                anyhow::ensure!(head.to_ascii_lowercase().contains("authorization: bearer old-job-token"), "legacy request has its job token");
+                let length = head.lines().find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("content-length")).and_then(|(_, v)| v.trim().parse::<usize>().ok())).unwrap_or(0);
+                while raw.len() < split.saturating_add(length) {
+                    let mut buf = [0_u8; 4096];
+                    let n = socket.read(&mut buf)?;
+                    anyhow::ensure!(n > 0 && raw.len() < 1 << 20, "incomplete legacy body");
+                    raw.extend_from_slice(buf.get(..n).unwrap_or_default());
+                }
+                let (status, body) = if head.starts_with("GET /api/jobs/legacy/source ") {
+                    (200, source.as_slice())
+                } else if head.starts_with("GET /api/jobs/legacy/artifacts/upload ") {
+                    (404, b"old server".as_slice())
+                } else {
+                    anyhow::ensure!(head.starts_with("PUT /api/jobs/legacy/artifacts/upload "), "unexpected request: {}", head.lines().next().unwrap_or_default());
+                    artifact = raw.get(split..split.saturating_add(length)).unwrap_or_default().to_vec();
+                    (200, b"{}".as_slice())
+                };
+                write!(socket, "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len())?;
+                socket.write_all(body)?;
+            }
+            Ok(artifact)
+        });
+        let work = tempfile::tempdir()?;
+        let workflow = crate::pipeline::parse("name: ci\njobs:\n  job:\n    runs-on: [local]\n    artifacts: [result.txt]\n    env: { MY_SECRET: overridden }\n    steps:\n      - run: |\n          test -f seed.txt\n          printf '%s\\n' \"$MY_SECRET\"\n          printf '%s' '${{ still data }}' > result.txt\n      - run: exit 7\n        continue-on-error: true\n")?;
+        let spec = crate::pipeline::plan(&workflow, &crate::pipeline::Context::default())?.into_iter().next().ok_or_else(|| anyhow::anyhow!("no fixture job"))?;
+        // This is stored, already expanded v1 text, not a workflow expression to evaluate.
+        let mut spec = spec;
+        if let Some(step) = spec.steps.first_mut() {
+            step.run = "test -f seed.txt\nprintf '%s\\n' \"$MY_SECRET\"\nprintf '%s' '${{ still data }}' > result.txt\nsleep 2.2".into();
+        }
+        let (up, messages) = async_channel::unbounded();
+        let exec = Exec {
+            assign: Assignment { job_id: "legacy".into(), run_id: "run".into(), repo: "test/legacy".into(), clone_url: String::new(), sha: "saved".into(), branch: "main".into(), event: "manual".into(), run_number: 1, attempt: 0, spec,
+                secrets: vec![("MY_SECRET".into(), "masked-old-secret".into())], job_token: "old-job-token".into(), server_url: format!("http://{addr}") },
+            work_dir: work.path().into(), agent_name: "fixture".into(), up: Uplink(up), cancel: Shutdown::new(), http: Arc::new(crate::http::client::Client::public()?),
+        };
+        let unowned = work.path().join("unowned");
+        let native_work = tempfile::tempdir()?;
+        let mut native = Exec { assign: exec.assign.clone(), work_dir: native_work.path().into(), agent_name: exec.agent_name.clone(),
+            up: exec.up.clone(), cancel: Shutdown::new(), http: Arc::clone(&exec.http) };
+        let admission_dir = tempfile::tempdir()?;
+        let admission = crate::runner::processes::Admission::private(admission_dir.path())?;
+        let native_admission = admission.clone();
+        let execution = crate::runner::processes::Execution::new_in(admission, work.path().into(), "legacy".into(), Some(1));
+        let result = crate::rt::block_on(async move {
+            assert!(exec.checkout(&unowned, &exec.work_dir).await.is_err_and(|error| error.downcast_ref::<crate::proc::CustodyRefusal>() == Some(&crate::proc::CustodyRefusal::NoExecution)), "legacy checkout cannot manufacture an unbudgeted native owner");
+            assert!(!unowned.exists(), "refused ownership cannot create a workspace or enter archive fallback");
+            let result = execution.scope(exec.run()).await;
+            execution.stop().await;
+            Ok(result)
+        })?;
+        assert_eq!(result.status, Status::Succeeded, "{result:?}");
+        assert!(result.peak_rss.is_some_and(|rss| rss > 0), "the common sampler retains legacy memory metrics: {result:?}");
+        assert!(result.cpu_seconds.is_some_and(|cpu| cpu >= 0.0));
+        let artifact = server.join().map_err(|_| anyhow::anyhow!("legacy fixture server failed"))??;
+        let mut archive = tar::Archive::new(artifact.as_slice());
+        let mut contents = String::new();
+        for entry in archive.entries()? {
+            let mut entry = entry?;
+            if entry.path()?.as_ref() == Path::new("result.txt") { entry.read_to_string(&mut contents)?; }
+        }
+        assert_eq!(contents, "${{ still data }}");
+        let (mut logs, mut starts, mut ends) = (String::new(), Vec::new(), Vec::new());
+        while let Ok(item) = messages.try_recv() {
+            match item {
+                Up::Log(log) => logs.push_str(&String::from_utf8_lossy(&log.data)),
+                Up::Msg(AgentMsg::StepStarted { idx, .. }) => starts.push(idx),
+                Up::Msg(AgentMsg::StepFinished { idx, status, .. }) => ends.push((idx, status)),
+                Up::Msg(AgentMsg::JobEvent { .. }) => anyhow::bail!("old server received a new event frame"),
+                _ => {}
+            }
+        }
+        assert_eq!(starts, vec![0, 1]);
+        assert_eq!(ends, vec![(0, Status::Succeeded), (1, Status::Failed)]);
+        assert!(logs.contains("***") && !logs.contains("masked-old-secret"), "legacy logs preserve common masking");
+        let mut dirs = vec![work.path().to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(dir)? {
+                let entry = entry?;
+                assert_ne!(entry.file_name(), "result.txt", "the common runtime cleans its workspace");
+                if entry.file_type()?.is_dir() { dirs.push(entry.path()); }
+            }
+        }
 
-    #[test]
-    fn masks_secrets() {
-        let out = mask(b"token=hunter2-secret ok", &[("T".into(), "hunter2-secret".into())]);
-        assert_eq!(out, b"token=*** ok");
+        // The same consumer uses owned cold-open/selection/pinning on a native attempt. Once
+        // pinned, a second workspace still checks out with the original remote offline; it
+        // cannot depend on a duplicate implicit fetch or the server archive fallback.
+        let repository = tempfile::tempdir()?;
+        let source = repository.path().join("source");
+        std::fs::create_dir(&source)?;
+        let git = |dir: &Path, args: &[&str]| -> anyhow::Result<String> {
+            let output = Command::new("git").current_dir(dir).args(args).env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "fixture").env("GIT_AUTHOR_EMAIL", "fixture@test").env("GIT_COMMITTER_NAME", "fixture").env("GIT_COMMITTER_EMAIL", "fixture@test").output()?;
+            anyhow::ensure!(output.status.success(), "fixture git failed: {}", String::from_utf8_lossy(&output.stderr));
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        };
+        git(&source, &["init", "-q", "-b", "main"])?;
+        std::fs::write(source.join("seed.txt"), b"native pinned checkout")?;
+        git(&source, &["add", "."])?;
+        git(&source, &["commit", "-qm", "native checkout"])?;
+        native.assign.clone_url = source.to_string_lossy().into_owned();
+        native.assign.sha = git(&source, &["rev-parse", "HEAD"])?;
+
+        // The production retry helper distinguishes the lookup from publication even when
+        // both commands exit 1. The injected phases do not spawn their commands.
+        let missing_status = kiln_cd::git::command(Some(&source.join(".git")), None, &kiln_cd::git::Auth::default())
+            .args(["rev-parse", "--verify", "--quiet", "--end-of-options", "refs/heads/fixture-missing^{commit}"]).output()?.status;
+        assert_eq!(missing_status.code(), Some(1));
+        let selection_mirror = kiln_cd::git::Mirror::open(&repository.path().join("selection.git"), &native.assign.clone_url, kiln_cd::git::Auth::default())?;
+        let mut selection_operation = futures::executor::block_on(selection_mirror.operation())?;
+        let mut pin_fetches = 0;
+        let pin_failed = futures::executor::block_on(select_owned(&mut selection_operation, &native.assign.sha, |command| {
+            let result = if command.get_args().any(|arg| arg == "fetch") {
+                pin_fetches += 1;
+                Err(anyhow::anyhow!("pin failure must not fetch"))
+            } else if command.get_args().any(|arg| arg == "update-ref") {
+                Err(kiln_cd::git::GitExit::new(missing_status, "fixture pin refused".into()).into())
+            } else {
+                assert!(command.get_args().any(|arg| arg == "rev-parse"));
+                Ok(native.assign.sha.as_bytes().to_vec())
+            };
+            std::future::ready(result)
+        }));
+        assert!(pin_failed.is_err_and(|error| error.downcast_ref::<kiln_cd::git::GitExit>().is_some_and(|exit| exit.code() == Some(1))
+            && error.downcast_ref::<kiln_cd::git::MissingCommit>().is_none()), "pin exit 1 is not revision absence");
+        assert_eq!(pin_fetches, 0, "a present commit with a refused pin never triggers a network fetch");
+        let (mut lookups, mut missing_fetches, mut pins) = (0, 0, 0);
+        let fetch_spec = format!("{}:refs/kiln/pins/{}", native.assign.sha, native.assign.sha);
+        let selected = futures::executor::block_on(select_owned(&mut selection_operation, &native.assign.sha, |command| {
+            let result = if command.get_args().any(|arg| arg == "fetch") {
+                missing_fetches += 1;
+                assert!(command.get_args().any(|arg| arg == fetch_spec.as_str()));
+                Ok(Vec::new())
+            } else if command.get_args().any(|arg| arg == "update-ref") {
+                pins += 1;
+                Ok(Vec::new())
+            } else {
+                assert!(command.get_args().any(|arg| arg == "rev-parse"));
+                lookups += 1;
+                if lookups == 1 { Err(kiln_cd::git::GitExit::new(missing_status, "fixture commit absent".into()).into()) }
+                else { Ok(native.assign.sha.as_bytes().to_vec()) }
+            };
+            std::future::ready(result)
+        }))?;
+        assert_eq!(selected.sha(), native.assign.sha);
+        assert_eq!((lookups, missing_fetches, pins), (2, 1, 1), "only a missing lookup permits one targeted fetch before verification and pinning");
+        drop(selection_operation);
+
+        let native_execution = crate::runner::processes::Execution::new_in(native_admission.clone(), native_work.path().into(), "legacy".into(), Some(1));
+        crate::rt::block_on(async move {
+            let inherited = crate::runner::processes::Execution::inherited_in(native_admission.clone(), native_work.path().into(), "legacy".into(), 1,
+                crate::runner::processes::ParentExecution::verified(kiln_ci::wire::ParentBinding { executor: "parent".into(), generation: "generation".into(), allocation: "allocation".into(), physical_execution: "physical-parent".into(), job: "legacy".into(), attempt: 1 }, "legacy", 1)?)?;
+            inherited.scope(async {
+                assert!(native.checkout(&native_work.path().join("refused"), native_work.path()).await.is_err_and(|error| error.downcast_ref::<crate::proc::CustodyRefusal>() == Some(&crate::proc::CustodyRefusal::InheritedExecution)), "parent identity alone is not independent native child authority");
+            }).await;
+            let wrong = crate::runner::processes::Execution::new_in(native_admission, native_work.path().into(), "legacy".into(), Some(2));
+            wrong.scope(async { assert!(native.checkout(&native_work.path().join("refused"), native_work.path()).await.is_err(), "another attempt cannot lend its physical owner"); }).await;
+            wrong.stop().await;
+            assert!(!native_work.path().join("refused").exists());
+            let result = native_execution.scope(async {
+                let first = native_work.path().join("first");
+                native.checkout(&first, native_work.path()).await?;
+                assert_eq!(std::fs::read(first.join("seed.txt"))?, b"native pinned checkout");
+                std::fs::rename(&source, repository.path().join("offline"))?;
+                let second = native_work.path().join("second");
+                native.checkout(&second, native_work.path()).await?;
+                assert_eq!(std::fs::read(second.join("seed.txt"))?, b"native pinned checkout");
+                assert_eq!(std::fs::read_to_string(second.join(".git/HEAD"))?.trim(), native.assign.sha);
+                Ok::<(), anyhow::Error>(())
+            }).await;
+            native_execution.stop().await;
+            result
+        })?;
+        Ok(())
     }
 }

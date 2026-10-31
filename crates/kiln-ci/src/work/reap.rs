@@ -14,6 +14,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::trigger::cron::Cron;
+
 const GIB: u64 = 1 << 30;
 
 /// A size: bytes, or a share of the volume in basis points (`10%` is 1000).
@@ -179,96 +181,12 @@ pub fn due(r: &Resolved, free: u64, held: u64, incoming: u64, last: Option<i64>,
 }
 
 /// The schedule's next time after `t` (unix seconds); `None` for a cron expression that can't be
-/// read or never fires within a year.
+/// read or has no future occurrence within the supported timestamp range.
 pub fn next_after(s: &Schedule, t: i64) -> Option<i64> {
     match s {
         Schedule::Every(secs) => Some(t.saturating_add(i64::try_from((*secs).max(60)).unwrap_or(i64::MAX))),
-        Schedule::Cron(e) => Cron::parse(e).ok()?.next_after(t),
+        Schedule::Cron(e) => Cron::parse(e).ok()?.next_after_utc(t),
     }
-}
-
-/// A cron expression's five fields, as sets.
-struct Cron {
-    minute: BTreeSet<u32>,
-    hour: BTreeSet<u32>,
-    dom: BTreeSet<u32>,
-    month: BTreeSet<u32>,
-    dow: BTreeSet<u32>,
-    dom_any: bool,
-    dow_any: bool,
-}
-
-impl Cron {
-    fn parse(e: &str) -> Result<Cron, String> {
-        let f: Vec<&str> = e.split_whitespace().collect();
-        let [m, h, d, mo, w] = f.as_slice() else { return Err(format!("`{e}`: a cron expression has five fields")) };
-        let dow = field(w, 0, 7)?.into_iter().map(|d| d % 7).collect();
-        Ok(Cron { minute: field(m, 0, 59)?, hour: field(h, 0, 23)?, dom: field(d, 1, 31)?, month: field(mo, 1, 12)?, dow, dom_any: *d == "*", dow_any: *w == "*" })
-    }
-
-    fn next_after(&self, t: i64) -> Option<i64> {
-        let mut m = t.div_euclid(60).saturating_add(1);
-        for _ in 0..(366 * 24 * 60) {
-            let days = m.div_euclid(1440);
-            let (_, month, day) = civil(days);
-            let wd = (days + 4).rem_euclid(7) as u32;
-            let day_ok = match (self.dom_any, self.dow_any) {
-                (true, true) => true,
-                (false, true) => self.dom.contains(&day),
-                (true, false) => self.dow.contains(&wd),
-                (false, false) => self.dom.contains(&day) || self.dow.contains(&wd),
-            };
-            if !self.month.contains(&month) || !day_ok {
-                m = (days + 1) * 1440;
-                continue;
-            }
-            let min_of_day = m.rem_euclid(1440) as u32;
-            if !self.hour.contains(&(min_of_day / 60)) {
-                m = m - i64::from(min_of_day % 60) + 60;
-                continue;
-            }
-            if self.minute.contains(&(min_of_day % 60)) {
-                return Some(m * 60);
-            }
-            m += 1;
-        }
-        None
-    }
-}
-
-/// One cron field: `*`, `*/n`, `a`, `a-b`, `a-b/n`, and lists of them.
-fn field(s: &str, lo: u32, hi: u32) -> Result<BTreeSet<u32>, String> {
-    let mut out = BTreeSet::new();
-    for part in s.split(',') {
-        let (range, step) = part.split_once('/').map_or((part, "1"), |(r, st)| (r, st));
-        let step: u32 = step.parse().ok().filter(|s| *s > 0).ok_or_else(|| format!("`{part}`: a bad step"))?;
-        let (a, b) = if range == "*" {
-            (lo, hi)
-        } else if let Some((a, b)) = range.split_once('-') {
-            (a.parse().map_err(|_| format!("`{part}`"))?, b.parse().map_err(|_| format!("`{part}`"))?)
-        } else {
-            let v: u32 = range.parse().map_err(|_| format!("`{part}`"))?;
-            (v, if part.contains('/') { hi } else { v })
-        };
-        if a < lo || b > hi || a > b {
-            return Err(format!("`{part}` is outside {lo}-{hi}"));
-        }
-        out.extend((a..=b).step_by(step as usize));
-    }
-    Ok(out)
-}
-
-/// The civil date (year, month, day) of a day count since 1970-01-01 (Howard Hinnant's).
-fn civil(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (yoe + era * 400 + i64::from(m <= 2), m, d)
 }
 
 /// One entry of a cache.

@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use http::{Method, StatusCode};
-use rusqlite::{Connection, OptionalExtension as _, params};
+use crate::sql::{Connection, OptionalExtension as _, params};
 use serde::Serialize;
 
 use super::{At, Grant, SIGNED_IN, Scope};
@@ -350,14 +350,14 @@ pub async fn has_users(hub: &Hub) -> bool {
 }
 
 /// Custom roles, by name.
-fn custom_roles(c: &Connection) -> rusqlite::Result<HashMap<String, Vec<String>>> {
+fn custom_roles(c: &Connection) -> crate::sql::Result<HashMap<String, Vec<String>>> {
     let mut st = c.prepare("SELECT name, capabilities FROM roles")?;
     let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
     Ok(rows.filter_map(Result::ok).map(|(n, caps)| (n, serde_json::from_str(&caps).unwrap_or_default())).collect())
 }
 
 /// A live user's name and grants (`None`: no such user, or disabled).
-pub(super) fn user_rights(c: &Connection, id: &str) -> rusqlite::Result<Option<(String, Rights)>> {
+pub(super) fn user_rights(c: &Connection, id: &str) -> crate::sql::Result<Option<(String, Rights)>> {
     let Some(name) = c.query_row("SELECT name FROM users WHERE id = ?1 AND disabled_at IS NULL", [id], |r| r.get::<_, String>(0)).optional()? else {
         return Ok(None);
     };
@@ -544,7 +544,7 @@ async fn target(hub: &Hub, at: At, segs: &[&str], q: &HashMap<String, String>) -
             let (kind, number) = crate::ci::diffs::key_of(&key);
             let name = hub
                 .store
-                .call(move |c| Ok(c.query_row("SELECT p.name FROM diffs d JOIN repos p ON p.id = d.repo_id WHERE d.id = ?1 OR (d.number = ?2 AND (?3 IS NULL OR d.kind = ?3))", rusqlite::params![key, number, kind], |r| r.get::<_, String>(0)).optional()?))
+                .call(move |c| Ok(c.query_row("SELECT p.name FROM diffs d JOIN repos p ON p.id = d.repo_id WHERE d.id = ?1 OR (d.number = ?2 AND (?3 IS NULL OR d.kind = ?3))", crate::sql::params![key, number, kind], |r| r.get::<_, String>(0)).optional()?))
                 .await
                 .ok()
                 .flatten();
@@ -605,10 +605,15 @@ pub fn decide(caller: &Caller, rule: &super::Rule, target: Option<&Scope>) -> bo
 
 /// Whether `caller` may make this request (the owner always may); `Err` says what it lacks.
 pub async fn check(hub: &Hub, caller: &Caller, method: &Method, segs: &[&str], q: &HashMap<String, String>) -> Result<(), (StatusCode, String)> {
+    check_in(hub, caller, method, segs, q, super::rule(method, segs)).await
+}
+
+/// U12: operation dispatch supplies its declared policy; protocol adapters use
+/// `check` to resolve their compatibility route before entering the same evaluator.
+pub async fn check_in(hub: &Hub, caller: &Caller, method: &Method, segs: &[&str], q: &HashMap<String, String>, rule: &super::Rule) -> Result<(), (StatusCode, String)> {
     if caller.is_owner() {
         return Ok(());
     }
-    let rule = super::rule(method, segs);
     let scope = match rule.at {
         At::Anywhere | At::Own | At::Deploy => None,
         at => Some(target(hub, at, segs, q).await),
@@ -646,7 +651,10 @@ mod tests {
         let app = Scope::Repo { repo: "acme/app".into() };
         let other = Scope::Repo { repo: "acme/other".into() };
         let mut checked = 0;
-        for rule in ROUTES {
+        // U12: the existing role/token conformance suite covers descriptor-owned
+        // operations as well as protocol-only compatibility routes.
+        let registered = crate::ops::policies();
+        for rule in ROUTES.iter().chain(registered.iter().copied()) {
             for name in ROLES {
                 let caps = role(name).unwrap_or_default();
                 let has = |cap: &str| cap == SIGNED_IN || caps.contains(&cap);
@@ -675,7 +683,7 @@ mod tests {
                 assert!(!decide(&denied, rule, Some(&app)) && decide(&denied, rule, Some(&other)), "deny: {}", rule.pattern);
             }
         }
-        assert_eq!(checked, ROUTES.len() * ROLES.len());
+        assert_eq!(checked, (ROUTES.len() + registered.len()) * ROLES.len());
         // An owner's token without a grant is the owner; with one, it is held to it.
         assert!(Caller::with(Kind::Pat, "pat", None, None).is_owner());
         let reduced = Caller::with(Kind::Pat, "pat", None, Some(rights(&["runs.read@repo:acme/app"])));

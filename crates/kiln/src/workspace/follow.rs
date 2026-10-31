@@ -43,8 +43,8 @@ pub async fn follow_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
                         heard(&hub, kind, &v).await;
                     }
                 }
-                Err(async_broadcast::RecvError::Overflowed(_)) => {}
-                Err(async_broadcast::RecvError::Closed) => return Ok(()),
+                Err(crate::bus::RecvError::Overflowed(_)) => {}
+                Err(crate::bus::RecvError::Closed | crate::bus::RecvError::Unavailable(_)) => return Ok(()),
             },
         }
     }
@@ -157,6 +157,23 @@ pub async fn deliver(hub: &Hub, agent: &str, text: String) -> bool {
         tracing::info!(agent = %info.id, "a change request's news didn't reach its agent");
     }
     sent.went()
+}
+
+/// U17/U04: an outbox retires only after the session inbox durably accepts this stable
+/// command identity. Retry the same key and text after any uncertain transport result.
+pub async fn deliver_once(hub: &Hub, session: &str, text: String, key: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(!key.is_empty() && key.len() <= 4096, "U17 invalid delivery idempotency key");
+    let info = hub.harness.info(session).ok_or_else(|| anyhow::anyhow!("session {session} is not available for durable delivery"))?;
+    anyhow::ensure!(info.status != Status::Exited, "session {session} has ended");
+    let message = crate::util::derive_id(&["workspace/deliver_once", session, key]);
+    let sent = hub.harness.command(hub, session, Command::Send { id: message, text, mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None }).await;
+    match sent {
+        crate::harness::registry::Sent::Accepted(_) => {
+            crate::harness::wait::sent(session, info.last_turn.as_ref().map(|turn| turn.at));
+            Ok(())
+        }
+        other => anyhow::bail!("U17 notification is still pending a durable inbox receipt: {other:?}"),
+    }
 }
 
 /// Where a comment is: `src/a.rs lines 10–14`, `src/a.rs line 3`, or nothing for the change as a

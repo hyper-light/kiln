@@ -200,7 +200,7 @@ pub fn job(m: &Marker, template: &Value) -> Value {
         json!("--namespace"), json!(m.namespace), json!("--deployment"), json!(m.deployment), json!("--container"), json!(m.container),
         json!("--previous"), json!(m.from), json!("--expect"), json!(m.to), json!("--deadline"), json!(DEADLINE.as_secs().to_string()),
     ];
-    if m.watch.window_s > 0 {
+    if m.watch.window_s > 0 || !m.watch.rollout.is_null() {
         command.extend([json!("--watch"), json!(serde_json::to_string(&m.watch).unwrap_or_default())]);
     }
     let mut spec = json!({
@@ -643,6 +643,69 @@ fn schema_needs(report: &Value) -> Option<u32> {
     obj::get(report, &["schema", "min_reader"]).and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok())
 }
 
+/// U05/U09: image-only rollback preserves every other pod-template field. Sort object keys
+/// so the proof does not depend on Kubernetes' JSON field order; exclude ONLY this image.
+fn rollback_template(template: &Value, container: &str) -> Result<String> {
+    fn sorted(value: &Value) -> Value {
+        match value {
+            Value::Object(object) => { let ordered: BTreeMap<_, _> = object.iter().collect(); Value::Object(ordered.into_iter().map(|(key, value)| (key.clone(), sorted(value))).collect()) },
+            Value::Array(values) => Value::Array(values.iter().map(sorted).collect()),
+            other => other.clone(),
+        }
+    }
+    let mut value = template.clone();
+    let containers = value.pointer_mut("/spec/containers").and_then(Value::as_array_mut).context("rollback pod template has no containers")?;
+    let selected: Vec<_> = containers.iter_mut().filter(|value| value.get("name").and_then(Value::as_str) == Some(container)).collect();
+    anyhow::ensure!(selected.len() == 1, "rollback pod template has no unique target container");
+    for selected in selected { selected.as_object_mut().context("rollback target is not an object")?.remove("image"); }
+    Ok(crate::util::sha256_hex(&serde_json::to_vec(&sorted(&value))?))
+}
+
+/// These names do not prove unchanged mounted/key-ref contents. Until a full revision owner
+/// supplies that proof, only the same declared inline configuration supports image rollback.
+fn external_configuration(template: &Value) -> bool {
+    let Some(spec) = template.get("spec") else { return true };
+    if spec.get("volumes").is_some_and(|v| v.as_array().is_none_or(|v| !v.is_empty())) { return true }
+    if spec.get("imagePullSecrets").is_some_and(|v| v.as_array().is_none_or(|v| !v.is_empty())) { return true }
+    for key in ["serviceAccountName", "serviceAccount"] {
+        if spec.get(key).is_some_and(|v| v.as_str().is_none_or(|v| !v.is_empty())) { return true }
+    }
+    for kind in ["containers", "initContainers", "ephemeralContainers"] {
+        if let Some(containers) = spec.get(kind) {
+            let Some(containers) = containers.as_array() else { return true };
+            for container in containers {
+                if container.get("envFrom").is_some_and(|v| v.as_array().is_none_or(|v| !v.is_empty())) { return true }
+                if let Some(env) = container.get("env") {
+                    let Some(env) = env.as_array() else { return true };
+                    if env.iter().any(|v| v.get("valueFrom").is_some()) { return true }
+                }
+            }
+        }
+    }
+    false
+}
+
+fn rollback_schema_problem(need: Option<u32>, reads: u32) -> Option<String> {
+    match need {
+        None => Some("the data schema requirement is unknown; no health response does not prove that migration never ran".into()),
+        Some(need) if need > reads => Some(format!("the data needs schema epoch {need}, but the rollback image reads {reads}")),
+        Some(_) => None,
+    }
+}
+fn rollback_configuration_problem(watch: &Watch, template: &Value, container: &str) -> Option<String> {
+    if watch.rollout.get("rollback_configuration_known").and_then(Value::as_bool) != Some(true) || external_configuration(template) {
+        return Some("image-only rollback cannot prove compatibility with external/volume/key-reference configuration; use a reviewed complete revision or roll forward".into());
+    }
+    let Some(expected) = watch.rollout.get("rollback_template_sha256").and_then(Value::as_str) else {
+        return Some("the previous non-image pod-template identity is unknown; image-only rollback is held".into());
+    };
+    match rollback_template(template, container) {
+        Ok(actual) if actual == expected => None,
+        Ok(_) => Some("non-image pod-template fields changed; image-only rollback would keep the new configuration".into()),
+        Err(error) => Some(format!("rollback template compatibility is unknown: {error:#}")),
+    }
+}
+
 /// Puts `image` in kiln's container, with the guard's note.
 async fn put(c: &Cluster, a: &Args, image: &str, note: String) -> Result<()> {
     let body = json!({
@@ -658,10 +721,21 @@ async fn roll_back(c: &Cluster, a: &Args, reason: &str, checks: Vec<Value>, serv
     // The guard runs the previous image: what it reads is what the previous kiln reads. Data the
     // new one migrated past that would crash-loop it (docs/resilience.md, G2), so it stays.
     let reads = crate::store::migrations::SCHEMA_EPOCH;
-    if let Some(need) = Box::pin(data_needs(c, a)).await
-        && need > reads
-    {
-        let said = format!("{reason}; {} can't read its data (it needs schema epoch {need}, and {} reads {reads}), so it wasn't rolled back", a.expect, a.previous);
+    let mut blocked = rollback_schema_problem(Box::pin(data_needs(c, a)).await, reads);
+    if blocked.is_none() {
+        blocked = match Box::pin(read_deployment(c, a)).await {
+            Ok(Some(deployment)) => {
+                let template = obj::get(&deployment, &["spec", "template"]).unwrap_or(&Value::Null);
+                if image_of(template, Some(&a.container)).is_none_or(|(_, image)| image != a.expect) {
+                    Some("the Deployment no longer names the guarded image; no automatic patch is authorized".into())
+                } else { rollback_configuration_problem(&a.watch, template, &a.container) }
+            }
+            Ok(None) => Some("the current Deployment is unavailable; rollback compatibility is unknown".into()),
+            Err(error) => Some(format!("cannot verify rollback configuration: {error:#}")),
+        };
+    }
+    if let Some(blocked) = blocked {
+        let said = format!("{reason}; rollback from {} to {} is blocked: {blocked}", a.expect, a.previous);
         eprintln!("{said}");
         let _ = Box::pin(annotate(c, a, "rollback-blocked", &said, &checks, None)).await;
         bail!("{} didn't take: {said}", a.expect)
@@ -766,6 +840,8 @@ impl Cd {
             "app": app, "revision": revision, "previous_revision": previous,
             "environment": def.as_ref().and_then(|d| d.environment.clone()), "target": def.as_ref().map(|d| d.destination.cluster.clone()),
             "blue": from, "green": to, "weight": 100, "phase": "after", "against": "production",
+            "rollback_template_sha256": rollback_template(&template, &container)?,
+            "rollback_configuration_known": !external_configuration(&template),
         });
         let mut m = Marker {
             app,
@@ -895,9 +971,8 @@ impl Cd {
         }
         let _ = self.store.submit(Command::PutSetting(SETTING.into(), Value::Null)).await;
         // A failed one counts as attempted: automation doesn't deploy the same content again.
-        if let Some(content) = m.content {
-            self.input(Input::Remember { app: m.app.as_str().into(), content, succeeded });
-        }
+        if let Some(content) = m.content
+            && self.input(Input::Remember { app: m.app.as_str().into(), content, succeeded }).await.is_err() { return; }
         if succeeded {
             tracing::info!(app = %m.app, message = %message, "deployments: a self-deploy took");
         } else {
@@ -1161,7 +1236,7 @@ mod tests {
 
     /// How a self-deploy's record reads, from the Deployment and its guard's note.
     #[test]
-    fn how_a_self_deploy_went() {
+    fn how_a_self_deploy_went() -> Result<()> {
         let m = Marker { container: "kiln".into(), from: "kiln:old".into(), to: "kiln:new".into(), watch: Watch { window_s: 600, ..Watch::default() }, ..Marker::default() };
         let live = |image: &str, note: Value| json!({
             "metadata": { "annotations": { ANNOTATION: note.to_string() } },
@@ -1190,6 +1265,27 @@ mod tests {
         assert_eq!(outcome(&m, &blocked, None), (false, format!("kiln:new didn't take ({blocked_why}); the guard kept it")));
         assert_eq!(schema_needs(&json!({ "schema": { "epoch": 2, "min_reader": 2 } })), Some(2));
         assert_eq!(schema_needs(&json!({ "commit": "older, before epochs" })), None);
+        assert!(rollback_schema_problem(None, 3).is_some(), "missing health cannot authorize a data downgrade");
+        assert!(rollback_schema_problem(Some(3), 2).is_some());
+        assert!(rollback_schema_problem(Some(3), 3).is_none());
+        let template = json!({"spec":{"containers":[{"name":"kiln","image":"old","args":["server"]}],"initContainers":[{"name":"init","image":"init:old"}]}});
+        let watch = Watch { rollout: json!({"rollback_template_sha256":rollback_template(&template,"kiln")?,"rollback_configuration_known":true}), ..Watch::default() };
+        let mut changed = template.clone();
+        if let Some(image) = changed.pointer_mut("/spec/containers/0/image") { *image=json!("new"); }
+        assert!(rollback_configuration_problem(&watch,&changed,"kiln").is_none());
+        if let Some(image) = changed.pointer_mut("/spec/initContainers/0/image") { *image=json!("init:new"); }
+        assert!(rollback_configuration_problem(&watch,&changed,"kiln").is_some(), "other/init images remain part of configuration identity");
+        assert!(rollback_configuration_problem(&Watch::default(),&template,"kiln").is_some());
+        for (name, value) in [
+            ("volumes", json!([{"name":"config","configMap":{"name":"same-mutable-name"}}])),
+            ("imagePullSecrets", json!([{"name":"mutable-pull-key"}])),
+            ("serviceAccountName", json!("mutable-service-account")),
+            ("serviceAccount", json!("legacy-account-alias")),
+        ] {
+            let mut external = template.clone();
+            if let Some(spec)=external.get_mut("spec").and_then(Value::as_object_mut) { spec.insert(name.into(), value); }
+            assert!(rollback_configuration_problem(&watch,&external,"kiln").is_some(), "declared {name} contents/authority are external");
+        }
         let neither = live("kiln:old", json!({ "result": "rollback-failed", "to": "kiln:new", "reason": reason }));
         assert_eq!(outcome(&m, &neither, None), (false, format!("kiln:new didn't take ({reason}); the guard put kiln:old back")));
         let before_windows = Marker { watch: Watch::default(), ..m.clone() };
@@ -1199,6 +1295,7 @@ mod tests {
         assert_eq!(outcome(&unguarded, &live("kiln:new", json!({})), None), (true, "kiln restarted into kiln:new; auto-rollback is off (set for this app by ada), so no guard watched it".into()));
         let (ok, why) = outcome(&unguarded, &live("kiln:old", json!({})), None);
         assert!(!ok && why.contains("put back by hand") && !why.contains("the guard put"), "{why}");
+        Ok(())
     }
 
     /// A marker an older server kept, before auto-rollback could be off, reads as guarded.

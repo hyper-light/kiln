@@ -16,7 +16,7 @@ use kiln_ci::wf::ir::Step;
 use kiln_ci::wire::ActionRef;
 
 use kiln_ci::policy::Policy;
-use rusqlite::{OptionalExtension, params};
+use crate::sql::{OptionalExtension, params};
 use serde_json::{Value, json};
 
 use super::{Fail, token};
@@ -70,7 +70,11 @@ impl Remote {
 
     /// Its mirror: one of kiln's own repositories' apart from GitHub's of the same name.
     pub(crate) fn mirror(&self, hub: &Hub) -> PathBuf {
-        if self.native { hub.cfg.data("actions").join("kiln").join(format!("{}__{}.git", self.owner, self.repo)) } else { mirror(hub, &self.owner, &self.repo) }
+        crate::git::logical_path(hub, &self.legacy_mirror(hub))
+    }
+
+    fn legacy_mirror(&self, hub: &Hub) -> PathBuf {
+        if self.native { hub.cfg.data("actions").join("kiln").join(format!("{}__{}.git", self.owner, self.repo)) } else { legacy_mirror(hub, &self.owner, &self.repo) }
     }
 
     /// Where a leg downloads it at `sha`.
@@ -97,6 +101,10 @@ pub(crate) fn plain_name(s: &str) -> bool {
 }
 
 pub(crate) fn mirror(hub: &Hub, owner: &str, repo: &str) -> PathBuf {
+    crate::git::logical_path(hub, &legacy_mirror(hub, owner, repo))
+}
+
+fn legacy_mirror(hub: &Hub, owner: &str, repo: &str) -> PathBuf {
     hub.cfg.data("actions").join(format!("{owner}__{repo}.git"))
 }
 
@@ -126,7 +134,7 @@ async fn keep_tarball(hub: &Hub, key: &str, file: &std::path::Path) -> anyhow::R
     let (k, d) = (key.to_owned(), obj.digest.clone());
     hub.store
         .call(move |c| {
-            c.execute("INSERT INTO ci_action_tarballs (key, object, created_at) VALUES (?1, ?2, ?3) ON CONFLICT (key) DO UPDATE SET object = excluded.object", rusqlite::params![k, d, crate::util::now_unix()])?;
+            c.execute("INSERT INTO ci_action_tarballs (key, object, created_at) VALUES (?1, ?2, ?3) ON CONFLICT (key) DO UPDATE SET object = excluded.object", crate::sql::params![k, d, crate::util::now_unix()])?;
             Ok(())
         })
         .await?;
@@ -372,31 +380,22 @@ pub(crate) async fn pin(hub: &Hub, r: &Remote) -> anyhow::Result<String> {
 /// [`pin`], and the ref as GitHub writes it, which it was found as: `refs/tags/v1`,
 /// `refs/heads/main`, or the commit's SHA.
 pub(crate) async fn pin_ref(hub: &Hub, r: &Remote) -> anyhow::Result<(String, String)> {
-    let dir = r.mirror(hub);
-    let d = dir.to_string_lossy().to_string();
     let url = if r.native { native_source(hub, &r.owner, &r.repo)? } else { source(hub, &r.owner, &r.repo)? };
-    if dir.join("HEAD").exists() {
-        // The source may have moved (`[[ci.actions.sources]]` changed): fetch from where it is now.
-        let _ = gitops::run_git(hub, &["-C", &d, "remote", "set-url", "origin", &url], GIT_TIMEOUT).await;
-    } else {
-        if let Some(parent) = dir.parent() {
-            let p = parent.to_path_buf();
-            crate::rt::blocking(move || std::fs::create_dir_all(p)).await??;
-        }
-        // Treeless: every commit, and a commit's trees and files only when one is read (its
-        // `action.yml`, its tarball). An action repository that keeps its built code in every
-        // commit (codeql-action) mirrors in seconds, not minutes.
-        if let Err(e) = gitops::run_git(hub, &["clone", "--bare", "--quiet", "--filter=tree:0", &url, &d], GIT_TIMEOUT).await {
-            // What a failed clone leaves isn't a mirror.
-            let _ = crate::rt::blocking(move || std::fs::remove_dir_all(dir)).await;
-            anyhow::bail!("action source unreachable and not mirrored: {e:#}");
-        }
-    }
+    // U08: action and source mirrors share physical objects and one mutation gate. Cached
+    // ref resolution still works when a remote is unavailable.
+    let mirror = crate::git::open_read(
+        hub,
+        &r.legacy_mirror(hub),
+        &url,
+        kiln_cd::git::Options::default(),
+        GIT_TIMEOUT,
+    ).await.map_err(|e| anyhow::anyhow!("action source unreachable and not mirrored: {e:#}"))?;
+    let d = mirror.dir.to_string_lossy().to_string();
     let full_sha = r.git_ref.len() == 40 && r.git_ref.bytes().all(|b| b.is_ascii_hexdigit());
     let fetched = if full_sha {
-        gitops::run_git(hub, &["-C", &d, "fetch", "--quiet", "origin", &r.git_ref], GIT_TIMEOUT).await.or(Ok::<_, anyhow::Error>(Vec::new())).map(|_| ())
+        mirror.fetch_one_using(&r.git_ref, |cmd| crate::git::run(cmd, GIT_TIMEOUT)).await.or(Ok::<_, anyhow::Error>(()))
     } else {
-        gitops::run_git(hub, &["-C", &d, "fetch", "--quiet", "--force", "--prune", "origin", "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"], GIT_TIMEOUT).await.map(|_| ())
+        mirror.fetch_using(|cmd| crate::git::run(cmd, GIT_TIMEOUT)).await
     };
     if let Err(e) = fetched {
         tracing::warn!(action = %r.full(), error = %format!("{e:#}"), "action source unreachable; using the mirror");
@@ -405,6 +404,7 @@ pub(crate) async fn pin_ref(hub: &Hub, r: &Remote) -> anyhow::Result<(String, St
         if let Ok(o) = gitops::run_git(hub, &["-C", &d, "rev-parse", "--verify", "--quiet", &format!("{full}^{{commit}}")], GIT_TIMEOUT).await {
             let sha = String::from_utf8_lossy(&o).trim().to_owned();
             if sha.len() == 40 {
+                mirror.retain_using(&sha, |cmd| crate::git::run(cmd, GIT_TIMEOUT)).await?;
                 // A ref given as a commit stays the commit, as GitHub writes it.
                 let full = if full == r.git_ref && !full.starts_with("refs/") { sha.clone() } else { full };
                 return Ok((sha, full));

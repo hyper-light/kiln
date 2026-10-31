@@ -29,6 +29,55 @@ fn powerless(s: &Server) -> anyhow::Result<String> {
     serde_json::from_str::<Value>(&body)?.get("token").and_then(Value::as_str).map(str::to_owned).ok_or_else(|| anyhow::anyhow!("no token in {body}"))
 }
 
+/// U13/U14: a first event connection closes the snapshot/listen gap, then delivers the
+/// already-subscribed queue wakeup instead of replacing it with the recovery marker.
+#[test]
+fn u14_initial_event_connection_resyncs_before_delivering_queued_events() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options::default())?;
+    let mut socket = common::agents::socket(s.port, &s.admin, "/api/events")?;
+    socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let (opcode, payload) = common::agents::frame(&mut socket)?;
+    assert_eq!(opcode, 1);
+    assert_eq!(serde_json::from_slice::<Value>(&payload)?, json!({"type":"resync"}));
+    for _ in 0..32 {
+        let (opcode, payload) = common::agents::frame(&mut socket)?;
+        assert_eq!(opcode, 1);
+        let event: Value = serde_json::from_slice(&payload)?;
+        if event.get("type").and_then(Value::as_str) == Some("queue") {
+            assert!(event.get("queued").is_some() && event.get("running").is_some(), "{event}");
+            return Ok(());
+        }
+    }
+    anyhow::bail!("the subscribed queue wakeup did not follow the initial resync")
+}
+
+/// U15/U17: process policy disables only conversations, including irrelevant legacy probes;
+/// the canonical database and structured session controls remain available across restart.
+#[test]
+fn u15_conversations_off_skips_legacy_sources_without_disabling_host_storage() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let harness = dir.path().join("data/harness");
+    let runner = dir.path().join("data/local-agent");
+    std::fs::create_dir_all(&harness)?;
+    std::fs::create_dir_all(&runner)?;
+    let retained = b"invalid legacy conversation source retained while disabled";
+    std::fs::write(harness.join("conversations.db"), retained)?;
+    std::fs::write(runner.join("instances"), b"not a source inventory directory")?;
+    let mut s = common::start_env(dir.path(), &Options::default(), false, &[("KILN_CONVERSATIONS", " FaLsE ")])?;
+    let (status, body) = http(s.port, "PUT", "/api/ci/variables/U15_CONTROL?scope=server", &s.admin, Some(&json!({"value":"retained"})))?;
+    anyhow::ensure!(status == 204, "canonical write: {status} {body}");
+    s.restart()?;
+    let (status, body) = http(s.port, "GET", "/api/conversations/search?q=anything", &s.admin, None)?;
+    anyhow::ensure!(status == 404 && body.contains("keeps no conversations"), "conversations: {status} {body}");
+    let (status, body) = http(s.port, "GET", "/api/harness/sessions", &s.admin, None)?;
+    anyhow::ensure!(status == 200 && serde_json::from_str::<Value>(&body)?.is_array(), "session controls: {status} {body}");
+    let (status, body) = http(s.port, "GET", "/api/ci/variables?scope=server", &s.admin, None)?;
+    anyhow::ensure!(status == 200 && body.contains("U15_CONTROL") && body.contains("retained"), "canonical read: {status} {body}");
+    assert_eq!(std::fs::read(harness.join("conversations.db"))?, retained);
+    Ok(())
+}
+
 #[test]
 fn w22_ac07_every_route_refuses_a_powerless_token() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -273,8 +322,26 @@ jobs:
     assert!(logs.contains("plain: ***") && logs.contains("next step ***"), "{logs}");
     seen.push(("logs".into(), logs));
 
-    // W09-AC02: every read of the route table, its parameters the run's ids (and its `**` the
-    // tails reads have), and every read-only operation, as an MCP tool calls it.
+    // W09-AC02/U12: residual authorization rules and canonical operation GET aliases are
+    // one read inventory. Migrated aliases no longer appear in authz::ROUTES.
+    let finite_read = |pattern: &str| !pattern.ends_with("/ws") && !pattern.ends_with("/terminal") && pattern != "/api/events" && !pattern.starts_with("/api/updates");
+    let mut reads: std::collections::BTreeSet<String> = kiln::authz::ROUTES.iter()
+        .filter(|rule| rule.method.is_none_or(|method| method == "GET") && finite_read(rule.pattern))
+        .map(|rule| rule.pattern.to_owned()).collect();
+    for operation in kiln::ops::registry() {
+        for route in operation.definitions().iter().filter(|route| route.primary && route.method == "GET") {
+            let parts: Vec<&str> = route.parts.iter().map(|part| match part {
+                kiln::ops::Part::Literal(value) => *value,
+                kiln::ops::Part::Tail(_) => "**",
+                _ => "*",
+            }).collect();
+            let pattern = format!("/{}", parts.join("/"));
+            if finite_read(&pattern) { reads.insert(pattern); }
+        }
+    }
+    // All entries are GET: deduplication is by the exact (method, path pattern).
+    // Try each pattern with the run's ids and bounded tails, then call every read-only
+    // operation as an MCP tool would.
     let leg = legs.first().cloned().unwrap_or_default();
     let ids = [id.as_str(), leg.as_str(), "acme%2Fleak", "acme", "LEAKY", "leak", "0", "1"];
     let tails = [
@@ -305,15 +372,10 @@ jobs:
     // Each path bare, and with what reads of a scope, a repository or words take.
     let queries = ["", "?scope=repo%3Aacme%2Fleak", "?repo=acme%2Fleak", "?q=plain"];
     let (mut walked, mut answered, mut silent) = (0usize, 0usize, Vec::new());
-    for rule in kiln::authz::ROUTES {
-        // Streams and sockets aren't reads that end; updates ask the internet.
-        if rule.method.is_some_and(|m| m != "GET") || rule.pattern.ends_with("/ws") || rule.pattern.ends_with("/terminal") || rule.pattern == "/api/events" || rule.pattern.starts_with("/api/updates")
-        {
-            continue;
-        }
+    for pattern in &reads {
         walked += 1;
         let mut paths = vec![String::new()];
-        for seg in rule.pattern.split('/').filter(|s| !s.is_empty()) {
+        for seg in pattern.split('/').filter(|s| !s.is_empty()) {
             let options: Vec<&str> = match seg {
                 "*" => ids.to_vec(),
                 "**" => tails.to_vec(),
@@ -334,12 +396,25 @@ jobs:
         if any {
             answered += 1;
         } else {
-            silent.push(rule.pattern);
+            silent.push(pattern.as_str());
         }
     }
     // Where a value could be: each of these answered (a secret's own routes only write).
     for pattern in ["/api/ci/secrets", "/api/ci/variables", "/api/ci/runs/*", "/api/ci/runs/*/**", "/api/ci/legs/*", "/api/ci/legs/*/logs"] {
+        assert!(reads.contains(pattern), "{pattern} is missing from the read inventory");
         assert!(!silent.contains(&pattern), "{pattern} answered nothing");
+    }
+    for path in [
+        "/api/ci/secrets?scope=repo%3Aacme%2Fleak".to_owned(),
+        "/api/ci/variables?scope=repo%3Aacme%2Fleak".to_owned(),
+        format!("/api/ci/runs/{id}"),
+        format!("/api/ci/runs/{id}/annotations"),
+        format!("/api/ci/legs/{leg}"),
+        format!("/api/ci/legs/{leg}/logs?step=0"),
+    ] {
+        let (status, body) = http(s.port, "GET", &path, &s.admin, None)?;
+        assert_eq!(status, 200, "mandatory read {path}: {body}");
+        seen.push((format!("GET {path}"), body));
     }
     // (66 of 108 when written: the rest have nothing to show on this server.)
     assert!(walked > 90 && answered >= 55, "{answered} of {walked} reads answered; none did for {silent:?}");

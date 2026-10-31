@@ -130,6 +130,11 @@ pub fn open_unchangeable(path: &Path) -> io::Result<File> {
     OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(path)
 }
 
+/// U18: observe a held lock record without acquiring, releasing or writing its byte-range lock.
+pub fn read_locked_prefix(file: &File, limit: usize) -> io::Result<Vec<u8>> {
+    super::win32::read_locked_prefix(file, limit)
+}
+
 /// Read at `offset`. (`seek_read` also moves the handle's cursor; kiln never mixes it with
 /// cursor-based I/O on the same handle.)
 pub fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {

@@ -47,7 +47,7 @@ use kiln_ci::work::key::{Key, PathSet, Read, Unit};
 use kiln_ci::work::tests::{self as test_results, Choice};
 use kiln_ci::work::flight;
 use kiln_ci::work::memo::{self, Digest, Replay};
-use rusqlite::{OptionalExtension as _, params};
+use crate::sql::{OptionalExtension as _, params};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -537,7 +537,7 @@ struct RecordIn {
 
 /// An object an entry refers to, kept in the scope until `until` at least: of every result that
 /// refers to it, the one reusable longest says (so a tree's files are kept as long as it is).
-fn keep_object(c: &rusqlite::Connection, scope: &str, digest: &str, key: &Key, until: i64) -> rusqlite::Result<()> {
+fn keep_object(c: &crate::sql::Connection, scope: &str, digest: &str, key: &Key, until: i64) -> crate::sql::Result<()> {
     c.execute(
         "INSERT INTO work_records (family, key, value, at) VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT (family, key) DO UPDATE SET value = excluded.value, at = MAX(at, excluded.at)",

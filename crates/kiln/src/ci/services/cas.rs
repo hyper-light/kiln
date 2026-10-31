@@ -18,7 +18,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use kiln_seams::blobs::Refusal;
 use parking_lot::Mutex;
-use rusqlite::{OptionalExtension as _, params};
+use crate::sql::{OptionalExtension as _, params};
 use sha2::Digest as _;
 
 use crate::hub::Hub;
@@ -167,7 +167,7 @@ pub fn read(hub: &Hub, obj: &Object, start: u64, end: u64) -> async_channel::Rec
         let (_, rx) = async_channel::bounded(1);
         return rx;
     }
-    crate::blobs::io::read_stream(Arc::clone(&hub.blobs.blobs), key(&obj.digest), Some(obj.digest.clone()), start, end.saturating_sub(1))
+    crate::blobs::io::read_stream(Arc::clone(&hub.blobs.blobs), key(&obj.digest), Some(obj.digest.clone()), obj.size, start, end.saturating_sub(1))
 }
 
 // ---------------------------------------------------------------------------------------- chunks
@@ -305,7 +305,7 @@ pub async fn collect(hub: &Hub) -> anyhow::Result<Collected> {
         .call(move |c| {
             let mut q = c.prepare(&format!("SELECT digest FROM cas_index WHERE last_used_at < ?1 AND {UNREFERENCED} LIMIT ?2"))?;
             let rows = q.query_map(params![cutoff, i64::try_from(COLLECT_MAX).unwrap_or(i64::MAX)], |r| r.get::<_, String>(0))?;
-            Ok(rows.collect::<rusqlite::Result<_>>()?)
+            Ok(rows.collect::<crate::sql::Result<_>>()?)
         })
         .await?;
     let mut out = Collected::default();

@@ -24,17 +24,17 @@
 //! past its grace), `upgrade` (an upgrade failed) and `check` (kiln's checks of the machine found
 //! something failing).
 
-use std::collections::HashSet;
+use crate::authz::At as ScopeAt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use http::{Method, StatusCode};
+use http::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::authz::{Caller, Rights, Scope};
 use crate::hub::Hub;
-use crate::ops::{Cx, Fail, Input, Op, Out, path};
+use crate::ops::{Cx, Fail, Input, Op, Out, Definition, Part, Routes};
 use crate::store::Repo;
 
 /// What wakes an attachment.
@@ -241,11 +241,15 @@ pub struct Seen {
 // ------------------------------------------------------------------ keeping them
 
 /// Every attachment, by name.
-pub async fn all(hub: &Hub) -> Vec<Attachment> {
-    let mut v: Vec<Attachment> = hub.store.kv_prefix("attach/a/".to_owned()).await.unwrap_or_default().into_iter().filter_map(|(_, t)| serde_json::from_str(&t).ok()).collect();
-    v.extend(from_repos(hub).await);
+pub async fn all(hub: &Hub) -> Vec<Attachment> { all_checked(hub).await.unwrap_or_default() }
+
+// An unavailable Store is not an empty recipient set. Accepted controls must retry before
+// fanout commits; UI listings may still render their existing empty fallback.
+async fn all_checked(hub: &Hub) -> anyhow::Result<Vec<Attachment>> {
+    let mut v: Vec<Attachment> = hub.store.kv_prefix("attach/a/".to_owned()).await?.into_iter().map(|(_, t)| serde_json::from_str(&t)).collect::<Result<_,_>>()?;
+    v.extend(from_repos(hub).await?);
     v.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.on.cmp(&b.on)));
-    v
+    Ok(v)
 }
 
 /// Where kiln keeps whether an attachment kept in a repository is paused (the file says what it
@@ -262,14 +266,14 @@ static FROM_REPOS: parking_lot::Mutex<Option<std::collections::HashMap<std::path
 
 /// Attachments kept in repositories' `.kiln/agents.yaml` on trunk (docs/ci.md W20-R08), read
 /// like all of a repository's policy: from its trunk, never from a change.
-async fn from_repos(hub: &Hub) -> Vec<Attachment> {
+async fn from_repos(hub: &Hub) -> anyhow::Result<Vec<Attachment>> {
     let at = hub.cfg.server.data_dir.clone();
     let cached = FROM_REPOS.lock().get_or_insert_with(Default::default).get(&at).filter(|(t, _)| t.elapsed() < REPO_FRESH).map(|(_, v)| v.clone());
     let list = match cached {
         Some(v) => v,
         None => {
             let mut out = Vec::new();
-            for repo in hub.store.repos().await.unwrap_or_default().into_iter().filter(|r| r.enabled) {
+            for repo in hub.store.repos().await?.into_iter().filter(|r| r.enabled) {
                 let Some((file, text)) = trunk_agents(hub, &repo).await else { continue };
                 let (list, errors) = parse_file(&repo.name, &file, &String::from_utf8_lossy(&text));
                 for e in errors {
@@ -286,10 +290,10 @@ async fn from_repos(hub: &Hub) -> Vec<Attachment> {
     };
     let mut out = Vec::with_capacity(list.len());
     for mut a in list {
-        a.paused = hub.store.kv_get(paused_key(&a.id)).await.ok().flatten().is_some();
+        a.paused = hub.store.kv_get(paused_key(&a.id)).await?.is_some();
         out.push(a);
     }
-    out
+    Ok(out)
 }
 
 /// A repository's `.kiln/agents.yaml` on trunk: its name and contents.
@@ -496,10 +500,12 @@ async fn put(hub: &Hub, a: &Attachment) {
 }
 
 /// Incidents, newest first.
-pub async fn incidents(hub: &Hub) -> Vec<Incident> {
-    let mut v: Vec<Incident> = hub.store.kv_prefix("attach/i/".to_owned()).await.unwrap_or_default().into_iter().filter_map(|(_, t)| serde_json::from_str(&t).ok()).collect();
+pub async fn incidents(hub: &Hub) -> Vec<Incident> { incidents_checked(hub).await.unwrap_or_default() }
+
+async fn incidents_checked(hub: &Hub) -> anyhow::Result<Vec<Incident>> {
+    let mut v: Vec<Incident> = hub.store.kv_prefix("attach/i/".to_owned()).await?.into_iter().map(|(_, t)| serde_json::from_str(&t)).collect::<Result<_,_>>()?;
     v.sort_by_key(|i| std::cmp::Reverse((i.at, i.id.clone())));
-    v
+    Ok(v)
 }
 
 pub async fn incident(hub: &Hub, id: &str) -> Option<Incident> {
@@ -532,7 +538,12 @@ fn brief_was(i: &Incident) -> Value {
 async fn prune(hub: &Hub) {
     let all = incidents(hub).await;
     for i in all.iter().skip(KEEP) {
-        let _ = hub.store.kv_delete(ikey(&i.id)).await;
+        let (key, id) = (ikey(&i.id), i.id.clone());
+        if let Err(e) = hub.store.call(move |c| {
+            // U04: a pending scheduled effect still owns its incident, even past retention.
+            c.execute("DELETE FROM kv WHERE k = ?1 AND NOT EXISTS (SELECT 1 FROM ci_trigger_outbox WHERE kind = 'attachment' AND state IN ('pending', 'materialized') AND consumer_id = ?2)", crate::sql::params![key, id])?;
+            Ok(())
+        }).await { tracing::warn!(error = %format!("{e:#}"), "old incident could not be pruned"); }
     }
 }
 
@@ -663,7 +674,7 @@ pub async fn limit_for(hub: &Hub, session: &str) -> Option<Rights> {
 // ------------------------------------------------------------------ what wakes one
 
 /// What an event is about.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct About {
     pub repo: Option<String>,
     pub workflow: Option<String>,
@@ -721,6 +732,61 @@ pub struct Trigger {
     pub detail: String,
 }
 
+/// U04/U14: the frozen attachment input carried by the existing durable trigger outbox.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PersistedTrigger {
+    wake: String,
+    about: About,
+    signature: String,
+    title: String,
+    seen: Seen,
+    detail: String,
+}
+impl PersistedTrigger {
+    fn of(t: &Trigger) -> Self { Self { wake: t.wake.into(), about: t.about.clone(), signature: t.signature.clone(), title: t.title.clone(), seen: t.seen.clone(), detail: t.detail.clone() } }
+    fn read(self) -> anyhow::Result<Trigger> {
+        let wake = WAKES.iter().copied().find(|wake| *wake == self.wake).ok_or_else(|| anyhow::anyhow!("invalid attachment trigger wake"))?;
+        Ok(Trigger { wake, about: self.about, signature: self.signature, title: self.title, seen: self.seen, detail: self.detail })
+    }
+}
+
+/// Accepted control events prepare only durable child intents; no harness can start until the
+/// source and its exact recipient set have committed together in the shared outbox.
+pub(crate) async fn control(hub: &Arc<Hub>, event: &Value) -> anyhow::Result<Vec<(String, super::schedule::outbox::Payload)>> {
+    let mut children = Vec::new();
+    if event.get("type").and_then(Value::as_str) == Some("run.succeeded") {
+        for (a, t) in slow(hub, event).await? {
+            children.push((format!("attachment/{}/slow", a.id), super::schedule::outbox::Payload::AttachmentIntent { attachment: a.id, trigger: Box::new(PersistedTrigger::of(&t)) }));
+        }
+    } else {
+        let attached = all_checked(hub).await?;
+        for (index, t) in trigger_of(hub, event, &attached).await?.into_iter().enumerate() {
+            for a in &attached {
+                let called = if t.wake == "mention" { t.signature.starts_with(&format!("mention:{}:", a.id)) } else { looks_after(a, &t.about) };
+                if called && a.wake.iter().any(|wake| wake == t.wake) {
+                    children.push((format!("attachment/{}/{}/{index}", a.id, t.wake), super::schedule::outbox::Payload::AttachmentIntent { attachment: a.id.clone(), trigger: Box::new(PersistedTrigger::of(&t)) }));
+                }
+            }
+        }
+    }
+    Ok(children)
+}
+
+/// Terminal upgrade snapshots are durable sources, so restart never initializes a process-only
+/// `seen` set that silently treats an accepted failure as old news.
+pub(crate) async fn upgrade_control(hub: &Arc<Hub>, job: crate::updates::Job) -> anyhow::Result<Vec<(String, super::schedule::outbox::Payload)>> {
+    if job.kind != "runner" { return Ok(Vec::new()); }
+    if job.state == crate::updates::JobState::Done {
+        return Ok(through_news(&[job], &incidents_checked(hub).await?).into_iter().enumerate().map(|(index, (session, text))| (format!("upgrade-message/{index}/{session}"), super::schedule::outbox::Payload::Message { session, text })).collect());
+    }
+    if job.state != crate::updates::JobState::Failed { return Ok(Vec::new()); }
+    let labels = hub.agents.lock().get(&job.target).map(|a| a.labels.clone()).unwrap_or_default();
+    let error = job.error.clone().unwrap_or_else(|| "it gave no reason".into());
+    let tail: Vec<&str> = job.log.iter().rev().take(30).rev().map(String::as_str).collect();
+    let t = Trigger { wake: "upgrade", about: About { runner: Some(job.target.clone()), labels, ..About::default() }, signature: format!("upgrade:{}:{}", job.target, normalized(&error)), title: format!("Upgrading {} failed: {}", job.target, error.chars().take(140).collect::<String>()), seen: Seen { at: job.ended_at.unwrap_or(job.started_at), what: format!("upgrade {} ({})", job.id, job.method), url: None, run: None }, detail: format!("Upgrading runner {} ({} to {}, {}) failed: {error}\n\nThe upgrade's last lines:\n{}", job.target, job.from_build.as_deref().unwrap_or("?"), job.to_build.as_deref().unwrap_or("?"), job.method, tail.join("\n")) };
+    Ok(all_checked(hub).await?.into_iter().filter(|a| a.wake.iter().any(|wake| wake == "upgrade") && looks_after(a, &t.about)).map(|a| (format!("attachment/{}/upgrade", a.id), super::schedule::outbox::Payload::AttachmentIntent { attachment: a.id, trigger: Box::new(PersistedTrigger::of(&t)) })).collect())
+}
+
 /// A line with what makes it this time's taken out: numbers, hashes, paths, quoted values and
 /// addresses, so the same failure reads the same every time.
 pub fn normalized(line: &str) -> String {
@@ -748,12 +814,12 @@ fn s<'a>(v: &'a Value, p: &str) -> Option<&'a str> {
 }
 
 /// A run's failed jobs: id, name, key.
-async fn failed_jobs(hub: &Hub, run: &str) -> Vec<(String, String, String)> {
+async fn failed_jobs(hub: &Hub, run: &str, attempt: Option<u32>) -> Vec<(String, String, String)> {
     let run = run.to_owned();
     hub.store
         .call(move |c| {
-            let mut st = c.prepare("SELECT id, display, key FROM jobs WHERE run_id = ?1 AND status IN ('failed', 'timed_out') ORDER BY COALESCE(finished_at, 0), display LIMIT 20")?;
-            let rows = st.query_map([&run], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<Vec<_>, _>>()?;
+            let mut st = c.prepare("SELECT id, display, key FROM jobs WHERE run_id = ?1 AND (?2 IS NULL OR COALESCE(run_attempt, 1) = ?2) AND status IN ('failed', 'timed_out') ORDER BY COALESCE(finished_at, 0), display LIMIT 20")?;
+            let rows = st.query_map(crate::sql::params![run, attempt], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
         })
         .await
@@ -785,7 +851,7 @@ pub(crate) async fn failure_of(hub: &Hub, v: &Value, wake: &'static str) -> Trig
     if let Some(e) = &environment {
         detail.push_str(&format!(" Its deployment to {e} failed."));
     }
-    let jobs = failed_jobs(hub, &run).await;
+    let jobs = failed_jobs(hub, &run, v.get("attempt").and_then(Value::as_u64).and_then(|attempt| u32::try_from(attempt).ok())).await;
     let mut sig = String::new();
     let mut first_error = String::new();
     for (i, (leg, display, key)) in jobs.iter().take(JOBS).enumerate() {
@@ -824,13 +890,13 @@ async fn last_green(hub: &Hub, v: &Value, workflow: &str, branch: &str, run: &st
     let (wf, br, run) = (workflow.to_owned(), branch.to_owned(), run.to_owned());
     hub.store
         .call(move |c| {
-            use rusqlite::OptionalExtension as _;
+            use crate::sql::OptionalExtension as _;
             // Green before the failing run was made (a later push that already fixed it isn't
             // "the last green"), newest made first; a run green on a rerun counts.
             Ok(c.query_row(
                 "SELECT number, sha FROM runs WHERE repo_id = ?1 AND COALESCE(workflow_id, '') = ?2 AND branch = ?3 AND conclusion = 'success'
                  AND created_at < (SELECT created_at FROM runs WHERE id = ?4) ORDER BY created_at DESC LIMIT 1",
-                rusqlite::params![repo_id, wf, br, run],
+                crate::sql::params![repo_id, wf, br, run],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?)
@@ -841,9 +907,9 @@ async fn last_green(hub: &Hub, v: &Value, workflow: &str, branch: &str, run: &st
 }
 
 /// What `v` (one of kiln's events) wakes, when it wakes anything.
-async fn trigger_of(hub: &Hub, v: &Value) -> Vec<Trigger> {
+async fn trigger_of(hub: &Hub, v: &Value, attached: &[Attachment]) -> anyhow::Result<Vec<Trigger>> {
     let kind = v.get("type").and_then(Value::as_str).unwrap_or_default();
-    match kind {
+    Ok(match kind {
         "run.failed" => vec![failure_of(hub, v, "failure").await],
         "deploy.failed" => vec![failure_of(hub, v, "failure").await],
         "leg.flaky" => {
@@ -882,37 +948,9 @@ async fn trigger_of(hub: &Hub, v: &Value) -> Vec<Trigger> {
                 detail: format!("Runner {name} ({}) went away {} minutes ago and hasn't come back.", if labels.is_empty() { "no labels".to_owned() } else { labels.join(", ") }, gone / 60),
             }]
         }
-        "updates" => {
-            upgrades_through(hub).await;
-            upgrades_failed(hub).await
-        }
-        "comment" => mentions(hub, v).await,
+        "comment" => mentions(hub, v, attached).await?,
         _ => Vec::new(),
-    }
-}
-
-/// Upgrade jobs kiln has told attachments of, so each wakes them once.
-static UPGRADES_SEEN: parking_lot::Mutex<Option<HashSet<String>>> = parking_lot::Mutex::new(None);
-/// Upgrade jobs that went through, and that kiln has told incidents' agents of.
-static UPGRADES_THROUGH: parking_lot::Mutex<Option<HashSet<String>>> = parking_lot::Mutex::new(None);
-
-/// Runner upgrades that went through since kiln last looked: the agent of an incident about that
-/// runner's upgrading (open, or reported on) hears of it, to check and resolve it rather than
-/// wait on an upgrade that is over.
-async fn upgrades_through(hub: &Hub) {
-    let through: Vec<crate::updates::Job> = {
-        let mut seen = UPGRADES_THROUGH.lock();
-        let first = seen.is_none();
-        let seen = seen.get_or_insert_with(HashSet::new);
-        // Those that went through before the server started aren't news.
-        hub.updates.jobs().into_iter().filter(|j| j.kind == "runner" && j.state == crate::updates::JobState::Done).filter(|j| seen.insert(j.id.clone()) && !first).collect()
-    };
-    if through.is_empty() {
-        return;
-    }
-    for (agent, text) in through_news(&through, &incidents(hub).await) {
-        crate::workspace::follow::deliver(hub, &agent, text).await;
-    }
+    })
 }
 
 /// Whom upgrades `through` are news to, and what they hear: each agent of an incident about that
@@ -936,65 +974,31 @@ fn through_news(through: &[crate::updates::Job], all: &[Incident]) -> Vec<(Strin
     out
 }
 
-/// Runner upgrades that failed since kiln last looked.
-async fn upgrades_failed(hub: &Hub) -> Vec<Trigger> {
-    let jobs = hub.updates.jobs();
-    let mut seen = UPGRADES_SEEN.lock();
-    let first = seen.is_none();
-    let seen = seen.get_or_insert_with(HashSet::new);
-    let mut out = Vec::new();
-    for j in jobs.iter().filter(|j| j.kind == "runner" && j.state == crate::updates::JobState::Failed) {
-        // Those that failed before the server started aren't news.
-        if !seen.insert(j.id.clone()) || first {
-            continue;
-        }
-        let labels = hub.agents.lock().get(&j.target).map(|a| a.labels.clone()).unwrap_or_default();
-        let error = j.error.clone().unwrap_or_else(|| "it gave no reason".to_owned());
-        let tail: Vec<&str> = j.log.iter().rev().take(30).rev().map(String::as_str).collect();
-        out.push(Trigger {
-            wake: "upgrade",
-            about: About { runner: Some(j.target.clone()), labels, ..About::default() },
-            signature: format!("upgrade:{}:{}", j.target, normalized(&error)),
-            title: format!("Upgrading {} failed: {}", j.target, error.chars().take(140).collect::<String>()),
-            seen: Seen { at: crate::util::now_unix(), what: format!("upgrade {} ({})", j.id, j.method), url: None, run: None },
-            detail: format!(
-                "Upgrading runner {} ({} to {}, {}) failed: {error}\n\nThe upgrade's last lines:\n{}",
-                j.target,
-                j.from_build.as_deref().unwrap_or("?"),
-                j.to_build.as_deref().unwrap_or("?"),
-                j.method,
-                tail.join("\n")
-            ),
-        });
-    }
-    out
-}
-
 /// Attachments mentioned (`@name`) in a comment.
-async fn mentions(hub: &Hub, v: &Value) -> Vec<Trigger> {
+async fn mentions(hub: &Hub, v: &Value, attached: &[Attachment]) -> anyhow::Result<Vec<Trigger>> {
     let body = s(v, "/body").unwrap_or_default();
     if !body.contains('@') {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let diff = s(v, "/diff").unwrap_or_default();
     let by = s(v, "/author").unwrap_or("someone");
     // An attachment's own agent mentioning it isn't a call for it.
     if by.starts_with("agent:") {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let repo = match crate::ci::diffs::find(hub, diff).await {
-        Ok(Some(d)) => Some(d.repo),
-        _ => None,
+    let repo = match s(v,"/repo") {
+        Some(repo) if !repo.is_empty() => Some(repo.to_owned()),
+        _ => crate::ci::diffs::find(hub,diff).await?.map(|d| d.repo),
     };
     let url = format!("{}/diffs/{diff}", hub.cfg.server.public_url.trim_end_matches('/'));
     let mut out = Vec::new();
-    for a in all(hub).await {
+    for a in attached {
         let said = body.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '@')).any(|w| w.strip_prefix('@').is_some_and(|n| n.eq_ignore_ascii_case(&a.name)));
         if !said || !a.wake.iter().any(|w| w == "mention") {
             continue;
         }
         // One kept in a repository answers there only.
-        if a.source.is_some() && repo.is_some() && repo_of(&a) != repo {
+        if a.source.is_some() && repo.is_some() && repo_of(a) != repo {
             continue;
         }
         out.push(Trigger {
@@ -1006,7 +1010,7 @@ async fn mentions(hub: &Hub, v: &Value) -> Vec<Trigger> {
             detail: format!("{by} wrote, on {diff} ({url}):\n\n{body}"),
         });
     }
-    out
+    Ok(out)
 }
 
 // ------------------------------------------------------------------ waking
@@ -1017,12 +1021,32 @@ static WAKING: futures::lock::Mutex<()> = futures::lock::Mutex::new(());
 /// Wakes what `t` wakes.
 pub async fn fire(hub: &Arc<Hub>, t: &Trigger) {
     for a in all(hub).await {
-        // A mention calls the one it names; the rest wake what looks after what they're about.
         let called = if t.wake == "mention" { t.signature.starts_with(&format!("mention:{}:", a.id)) } else { looks_after(&a, &t.about) };
-        if called && a.wake.iter().any(|w| w == t.wake) {
-            wake(hub, &a, t).await;
+        if called && a.wake.iter().any(|wake| wake == t.wake) {
+            let key = match trigger_key(&a, t) {
+                Ok(key) => key,
+                Err(error) => { tracing::warn!(error = %format!("{error:#}"), "derived attachment input could not be encoded"); continue; }
+            };
+            let payload = super::schedule::outbox::Payload::AttachmentIntent { attachment: a.id, trigger: Box::new(PersistedTrigger::of(t)) };
+            if let Err(error) = super::schedule::outbox::accept(hub, key, payload).await { tracing::warn!(error = %format!("{error:#}"), "derived attachment input was not accepted"); }
         }
     }
+}
+
+fn trigger_key(a: &Attachment, t: &Trigger) -> anyhow::Result<String> {
+    Ok(format!("derived/{}/{}/{}/{}", a.id, t.wake, t.seen.at, crate::util::sha256_hex(&serde_json::to_vec(&PersistedTrigger::of(t))?)))
+}
+
+/// U03/U04: an explicit Ship handoff uses the same accepted intent and materializer as events.
+/// Its immediate response observes that incident; it never starts a parallel attachment owner.
+pub async fn wake(hub: &Arc<Hub>, a: &Attachment, t: &Trigger, request: &str) -> anyhow::Result<Option<Incident>> {
+    anyhow::ensure!(!request.is_empty() && request.len() <= 4096, "invalid explicit attachment request");
+    let key = format!("explicit/attachment/{}/{}", a.id, crate::util::sha256_hex(request.as_bytes()));
+    let id = super::schedule::outbox::accept(hub, key, super::schedule::outbox::Payload::AttachmentIntent { attachment: a.id.clone(), trigger: Box::new(PersistedTrigger::of(t)) }).await?;
+    super::schedule::outbox::deliver_accepted(hub, &id).await?;
+    let consumer: Option<String> = hub.store.call(move |c| Ok(c.query_row("SELECT consumer_id FROM ci_trigger_outbox WHERE id = ?1 AND kind = 'attachment'", [id], |r| r.get(0))?)).await?;
+    let Some(id) = consumer else { return Ok(None); };
+    Ok(incident(hub, &id).await)
 }
 
 /// A time's day, UTC (`2026-10-19`).
@@ -1034,93 +1058,6 @@ fn day_of(t: i64) -> String {
 fn today() -> i64 {
     let now = crate::util::now_unix();
     now - now.rem_euclid(86_400)
-}
-
-/// Attachment `a` is woken by `t`: the open incident with its signature hears of it again, or a
-/// new one gets its agent (within its limits).
-pub async fn wake(hub: &Arc<Hub>, a: &Attachment, t: &Trigger) -> Option<Incident> {
-    let _one = WAKING.lock().await;
-    let now = crate::util::now_unix();
-    let all = incidents(hub).await;
-    // The same cause, not yet resolved: one more time it happened, not another agent.
-    if let Some(mut i) = all.iter().find(|i| i.attachment == a.id && i.signature == t.signature && matches!(i.state.as_str(), "open" | "waiting" | "reported")).cloned() {
-        i.seen.push(t.seen.clone());
-        if i.seen.len() > SEEN {
-            i.seen.remove(0);
-        }
-        i.updated_at = now;
-        // Reported on, and back: its agent hears of it, and it's open again.
-        if i.state == "reported" {
-            i.state = "open".to_owned();
-            if let Some(agent) = i.agent.clone() {
-                let at = t.seen.url.as_deref().map(|u| format!(" ({u})")).unwrap_or_default();
-                crate::workspace::follow::deliver(hub, &agent, format!("It happened again: {}{at}. Incident {} is open again; report on it again once you know more.", t.seen.what, i.id)).await;
-            }
-        }
-        // A failure that keeps coming back from reruns: its agent stops rerunning it.
-        let again = t.seen.run.as_ref().map_or(0, |r| i.seen.iter().filter(|s| s.run.as_ref() == Some(r)).count());
-        if t.wake == "failure" && again > 1 && u32::try_from(again - 1).unwrap_or(u32::MAX) > a.limits.reruns_per_failure {
-            if let Some(agent) = i.agent.clone() {
-                crate::workspace::follow::deliver(
-                    hub,
-                    &agent,
-                    format!(
-                        "{} has failed again after {} reruns, past {}'s limit of {}: don't rerun it again. Say what you found with incidents.report (incident {}).",
-                        t.seen.what,
-                        again - 1,
-                        a.name,
-                        a.limits.reruns_per_failure,
-                        i.id
-                    ),
-                )
-                .await;
-            }
-            i.why = Some(format!("rerun {} times, past its limit of {}", again - 1, a.limits.reruns_per_failure));
-        }
-        put_incident(hub, &i).await;
-        return Some(i);
-    }
-    let mut i = Incident {
-        id: crate::util::new_id(),
-        attachment: a.id.clone(),
-        name: a.name.clone(),
-        on: a.on.clone(),
-        wake: t.wake.to_owned(),
-        signature: t.signature.clone(),
-        repo: t.about.repo.clone(),
-        runner: t.about.runner.clone(),
-        title: t.title.clone(),
-        state: "open".to_owned(),
-        seen: vec![t.seen.clone()],
-        at: now,
-        updated_at: now,
-        ..Incident::default()
-    };
-    let earlier: Vec<&Incident> = all.iter().filter(|x| x.attachment == a.id && x.signature == t.signature && x.report.is_some()).take(3).collect();
-    i.bundle = bundle(a, &i, t, &earlier);
-    let today = all.iter().filter(|x| x.attachment == a.id && x.agent.is_some() && x.at >= today()).count();
-    if a.paused {
-        i.state = "waiting".to_owned();
-        i.why = Some(format!("{} is paused", a.name));
-    } else if u32::try_from(today).unwrap_or(u32::MAX) >= a.limits.sessions_per_day {
-        i.state = "waiting".to_owned();
-        i.why = Some(format!("{} has taken on {today} incidents today, its limit: a person takes this one, or raises the limit", a.name));
-    } else if let Some(why) = over_budget(hub, a, &all).await {
-        i.state = "waiting".to_owned();
-        i.why = Some(why);
-    } else {
-        match start(hub, a, &i).await {
-            Ok(agent) => i.agent = Some(agent),
-            Err(why) => {
-                i.state = "waiting".to_owned();
-                i.why = Some(format!("its agent couldn't start: {why}"));
-            }
-        }
-    }
-    put_incident(hub, &i).await;
-    hub.store.audit(format!("attachment:{}", a.name), "incident.open".into(), format!("{} {}: {}{}", i.id, a.on, i.title, i.why.as_deref().map(|w| format!(" ({w})")).unwrap_or_default())).await;
-    prune(hub).await;
-    Some(i)
 }
 
 /// Whether `a`'s agents have spent today (UTC) what its limits give them, and how: the tokens of
@@ -1143,7 +1080,7 @@ async fn over_budget(hub: &Arc<Hub>, a: &Attachment, all: &[Incident]) -> Option
                     "SELECT COALESCE(SUM(j.finished_at - j.started_at), 0) FROM jobs j JOIN runs r ON r.id = j.run_id
                      WHERE j.job_id IS NOT NULL AND j.started_at >= ?2 AND j.finished_at IS NOT NULL
                        AND ((j.run_attempt = 1 AND r.actor LIKE ?1) OR EXISTS (SELECT 1 FROM ci_run_attempts t WHERE t.run_id = j.run_id AND t.attempt = j.run_attempt AND t.actor LIKE ?1))",
-                    rusqlite::params![like, since],
+                    crate::sql::params![like, since],
                     |r| r.get::<_, i64>(0),
                 )?;
             }
@@ -1195,19 +1132,34 @@ fn bundle(a: &Attachment, i: &Incident, t: &Trigger, earlier: &[&Incident]) -> S
     b
 }
 
+fn starter(a: &Attachment) -> crate::harness::lineage::Starter {
+    crate::harness::lineage::Starter { parent: None, opener: Some(a.by.clone()), actor: format!("attachment:{}", a.name), plan_run: None, asker: None }
+}
+
+fn planned_agent(a: &Attachment, key: &str) -> anyhow::Result<String> {
+    match &a.session {
+        Some(session) => Ok(session.clone()),
+        None => crate::harness::lineage::start_once_id(&starter(a),key).map_err(|(_, why)| anyhow::anyhow!(why)),
+    }
+}
+
+fn bind_agent(c: &crate::sql::Connection<'_>, agent: &str, attachment: &str) -> anyhow::Result<()> {
+    c.execute("INSERT INTO kv(k,v) VALUES(?1,?2) ON CONFLICT(k) DO UPDATE SET v = excluded.v", crate::sql::params![agent_key(agent),attachment])?;
+    Ok(())
+}
+
 /// Starts attachment `a`'s agent for incident `i` (or tells its live one): the agent's id.
-async fn start(hub: &Arc<Hub>, a: &Attachment, i: &Incident) -> Result<String, String> {
+async fn start(hub: &Arc<Hub>, a: &Attachment, i: &Incident, key: &str) -> Result<String, String> {
     if let Some(s) = &a.session {
         let info = hub.harness.info(s).ok_or_else(|| format!("its agent {s} isn't running"))?;
         if info.status == crate::harness::model::Status::Exited {
             return Err(format!("its agent {} has ended", info.name));
         }
-        crate::workspace::follow::deliver(hub, s, i.bundle.clone()).await;
-        let _ = hub.store.kv_set(agent_key(s), a.id.clone()).await;
+        crate::workspace::follow::deliver_once(hub, s, i.bundle.clone(), key).await.map_err(|e| format!("{e:#}"))?;
         return Ok(s.clone());
     }
     let h = a.harness.clone().ok_or_else(|| "it names no agent".to_owned())?;
-    let starter = crate::harness::lineage::Starter { parent: None, opener: Some(a.by.clone()), actor: format!("attachment:{}", a.name), plan_run: None, asker: None };
+    let starter = starter(a);
     let name: String = format!("{}: {}", a.name, i.title).chars().take(80).collect();
     let ask = crate::harness::lineage::Ask {
         kind: h.kind,
@@ -1221,21 +1173,203 @@ async fn start(hub: &Arc<Hub>, a: &Attachment, i: &Incident) -> Result<String, S
         count: Some(1),
         ..Default::default()
     };
-    let infos = crate::harness::lineage::start(hub, &starter, ask).await.map_err(|(_, m)| m)?;
+    let infos = crate::harness::lineage::start_once(hub, &starter, ask, key).await.map_err(|(_, m)| m)?;
     let id = infos.first().map(|x| x.id.clone()).ok_or_else(|| "no agent started".to_owned())?;
-    let _ = hub.store.kv_set(agent_key(&id), a.id.clone()).await;
     Ok(id)
+}
+
+/// U04: the durable outbox records the incident and the remaining effect together, before
+/// opening an agent or sending a message. Replaying a delivery never appends Seen twice.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "effect", rename_all = "snake_case")]
+enum ScheduledReceipt {
+    None { incident: String },
+    Start { incident: String, launch: Box<ScheduledLaunch> },
+    Message { incident: String, agent: String, text: String },
+}
+
+/// The effect's exact start request is frozen with its receipt. Editing an attachment while a
+/// transport result is uncertain must neither change start_once's identity nor its bound input.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ScheduledLaunch {
+    attachment: Attachment,
+    title: String,
+    bundle: String,
+}
+
+#[cfg(test)]
+async fn scheduled_receipt(hub: &Arc<Hub>, trigger: &str, a: &Attachment, minute: i64, cron: &str) -> anyhow::Result<Option<ScheduledReceipt>> {
+    let t = scheduled_trigger(a, minute, cron);
+    trigger_receipt(hub, trigger, a, &t).await
+}
+
+fn scheduled_trigger(a: &Attachment, minute: i64, cron: &str) -> Trigger {
+    Trigger { wake: "schedule", about: About::default(), signature: "schedule".into(), title: format!("{}'s schedule ({cron})", a.name), seen: Seen { at: minute, what: "its schedule".into(), url: None, run: None }, detail: format!("It's time for {}'s scheduled work ({cron}, UTC).", a.name) }
+}
+
+async fn trigger_receipt(hub: &Arc<Hub>, trigger: &str, a: &Attachment, t: &Trigger) -> anyhow::Result<Option<ScheduledReceipt>> {
+    use crate::sql::{OptionalExtension as _, params};
+    let _one = WAKING.lock().await;
+    let key = trigger.to_owned();
+    let saved: Option<String> = hub.store.call(move |c| Ok(c.query_row("SELECT receipt FROM ci_trigger_outbox WHERE id = ?1", [key], |r| r.get(0))?)).await?;
+    if let Some(saved) = saved {
+        return match serde_json::from_str(&saved) {
+            Ok(receipt) => Ok(Some(receipt)),
+            Err(e) => { super::schedule::outbox::finish(hub, trigger, true, Some(format!("invalid persisted attachment receipt: {e}"))).await?; Ok(None) }
+        };
+    }
+    let incident_rows = hub.store.kv_prefix("attach/i/".to_owned()).await?;
+    let mut all: Vec<Incident> = incident_rows.iter().map(|(_, text)| serde_json::from_str(text).map_err(anyhow::Error::from)).collect::<anyhow::Result<_>>()?;
+    all.sort_by_key(|i| std::cmp::Reverse((i.at, i.id.clone())));
+    let now = crate::util::now_unix();
+    let (mut incident, mut effect) = if let Some(mut i) = all.iter().find(|i| i.attachment == a.id && i.signature == t.signature && matches!(i.state.as_str(), "open" | "waiting" | "reported")).cloned() {
+        i.seen.push(t.seen.clone());
+        if i.seen.len() > SEEN { i.seen.remove(0); }
+        i.updated_at = now;
+        let mut effect = if i.state == "reported" {
+            i.state = "open".into();
+            i.agent.as_ref().map(|agent| ScheduledReceipt::Message { incident: i.id.clone(), agent: agent.clone(), text: format!("It happened again: {}. Incident {} is open again; report on it again once you know more.", t.seen.what, i.id) }).unwrap_or_else(|| ScheduledReceipt::None { incident: i.id.clone() })
+        } else { ScheduledReceipt::None { incident: i.id.clone() } };
+        let again = t.seen.run.as_ref().map_or(0, |run| i.seen.iter().filter(|seen| seen.run.as_ref() == Some(run)).count());
+        if t.wake == "failure" && again > 1 && u32::try_from(again - 1).unwrap_or(u32::MAX) > a.limits.reruns_per_failure {
+            i.why = Some(format!("rerun {} times, past its limit of {}", again - 1, a.limits.reruns_per_failure));
+            if let Some(agent) = &i.agent {
+                let text = format!("{} has failed again after {} reruns, past {}'s limit of {}: don't rerun it again. Say what you found with incidents.report (incident {}).", t.seen.what, again - 1, a.name, a.limits.reruns_per_failure, i.id);
+                if let ScheduledReceipt::Message { text: previous, .. } = &mut effect { previous.push_str(&format!("\n\n{text}")); }
+                else { effect = ScheduledReceipt::Message { incident: i.id.clone(), agent: agent.clone(), text }; }
+            }
+        }
+        (i, effect)
+    } else {
+        let mut i = Incident { id: super::schedule::outbox::run_id(trigger), attachment: a.id.clone(), name: a.name.clone(), on: a.on.clone(), wake: t.wake.into(), signature: t.signature.clone(), repo: t.about.repo.clone(), runner: t.about.runner.clone(), title: t.title.clone(), state: "open".into(), seen: vec![t.seen.clone()], at: now, updated_at: now, ..Incident::default() };
+        let earlier: Vec<&Incident> = all.iter().filter(|x| x.attachment == a.id && x.signature == t.signature && x.report.is_some()).take(3).collect();
+        i.bundle = bundle(a, &i, t, &earlier);
+        // U03/U04: a committed Start reserves a session before its external launch returns.
+        // Count the same incident once when launch later installs its agent.
+        let (attachment, since) = (a.id.clone(), today());
+        let today: i64 = hub.store.call(move |c| {
+            // One read snapshot covers the atomic pending-to-launched transition. Combining
+            // an older Incident vector with a later pending set can miss both sides of it.
+            Ok(c.query_row("SELECT COUNT(*) FROM kv i WHERE i.k LIKE 'attach/i/%' AND json_extract(i.v, '$.attachment') = ?1 AND json_extract(i.v, '$.at') >= ?2 AND (json_extract(i.v, '$.agent') IS NOT NULL OR EXISTS (SELECT 1 FROM ci_trigger_outbox o WHERE o.consumer_id = json_extract(i.v, '$.id') AND o.kind = 'attachment' AND o.state IN ('pending', 'materialized') AND json_extract(o.receipt, '$.effect') = 'start'))", params![attachment, since], |r| r.get(0))?)
+        }).await?;
+        let why = if a.paused { Some(format!("{} is paused", a.name)) }
+            else if u32::try_from(today).unwrap_or(u32::MAX) >= a.limits.sessions_per_day { Some(format!("{} has taken on {today} incidents today, its limit: a person takes this one, or raises the limit", a.name)) }
+            else { over_budget(hub, a, &all).await };
+        let effect = if let Some(why) = why {
+            i.state = "waiting".into(); i.why = Some(why);
+            ScheduledReceipt::None { incident: i.id.clone() }
+        } else { ScheduledReceipt::Start { incident: i.id.clone(), launch: Box::new(ScheduledLaunch { attachment: a.clone(), title: i.title.clone(), bundle: i.bundle.clone() }) } };
+        (i, effect)
+    };
+    // No partially materialized incident can escape this transaction. A competing owner must
+    // use the committed receipt, not run a second effect based on its own stale read.
+    let incident_key = ikey(&incident.id);
+    let expected = incident_rows.into_iter().find(|(key, _)| *key == incident_key).map(|(_, text)| text);
+    let (key, text, receipt, consumer) = (trigger.to_owned(), serde_json::to_string(&incident)?, serde_json::to_string(&effect)?, incident.id.clone());
+    // The first prompt may call tools immediately. Bind its attachment grants in this same
+    // receipt transaction, before lineage can open or deliver to the planned session (U17).
+    let binding = match &effect { ScheduledReceipt::Start { launch, .. } => Some((planned_agent(&launch.attachment,&format!("trigger:{trigger}"))?,launch.attachment.id.clone())), _ => None };
+    let actual: String = hub.store.call(move |c| {
+        let tx = crate::store::tx(c)?;
+        let saved: Option<String> = tx.query_row("SELECT receipt FROM ci_trigger_outbox WHERE id = ?1", [&key], |r| r.get(0))?;
+        if let Some(saved) = saved { return Ok(saved); }
+        let current: Option<String> = tx.query_row("SELECT v FROM kv WHERE k = ?1", [&incident_key], |r| r.get(0)).optional()?;
+        anyhow::ensure!(current == expected, "incident changed while preparing scheduled delivery; retry from its current state");
+        tx.execute("INSERT INTO kv (k, v) VALUES (?1, ?2) ON CONFLICT(k) DO UPDATE SET v = excluded.v", params![incident_key, text])?;
+        if let Some((agent, attachment)) = binding { bind_agent(&tx,&agent,&attachment)?; }
+        let changed = tx.execute("UPDATE ci_trigger_outbox SET receipt = ?2, state = 'materialized', updated_at = ?3, consumer_id = ?4 WHERE id = ?1 AND kind = 'attachment' AND state = 'pending' AND receipt IS NULL", params![key, receipt, now, consumer])?;
+        anyhow::ensure!(changed == 1, "attachment trigger no longer owns its pending effect");
+        tx.commit()?;
+        Ok(receipt)
+    }).await?;
+    effect = match serde_json::from_str(&actual) {
+        Ok(receipt) => receipt,
+        Err(e) => { super::schedule::outbox::finish(hub, trigger, true, Some(format!("invalid persisted attachment receipt: {e}"))).await?; return Ok(None); }
+    };
+    // Announce only after the database accepted the incident.
+    incident.updated_at = now;
+    hub.emit(&crate::wire::events::ServerEvent::Incident { incident: Box::new(crate::wire::events::IncidentBrief::of(&incident)) });
+    Ok(Some(effect))
+}
+
+pub(crate) async fn deliver_schedule(hub: &Arc<Hub>, trigger: &str, attachment: &str, minute: i64, cron: &str) -> anyhow::Result<()> {
+    let a = get(hub, attachment).await.ok_or_else(|| anyhow::anyhow!("scheduled attachment {attachment} is unavailable; its accepted trigger is retained"))?;
+    let t = scheduled_trigger(&a, minute, cron);
+    deliver_trigger(hub, trigger, attachment, PersistedTrigger::of(&t)).await
+}
+
+pub(crate) async fn deliver_trigger(hub: &Arc<Hub>, trigger: &str, attachment: &str, input: PersistedTrigger) -> anyhow::Result<()> {
+    use crate::sql::{OptionalExtension as _, params};
+    let t = match input.read() { Ok(t) => t, Err(e) => return super::schedule::outbox::finish(hub, trigger, true, Some(format!("invalid persisted attachment input: {e}"))).await };
+    let a = get(hub, attachment).await.ok_or_else(|| anyhow::anyhow!("attachment {attachment} is unavailable; its accepted trigger is retained"))?;
+    let Some(receipt) = trigger_receipt(hub, trigger, &a, &t).await? else { return Ok(()); };
+    match receipt {
+        ScheduledReceipt::None { .. } => { super::schedule::outbox::finish(hub, trigger, false, None).await?; prune(hub).await; Ok(()) },
+        ScheduledReceipt::Message { agent, text, .. } => {
+            if a.paused { anyhow::bail!("attachment {} is paused; its accepted effect is retained", a.name); }
+            crate::workspace::follow::deliver_once(hub, &agent, text, &format!("trigger:{trigger}")).await?;
+            super::schedule::outbox::finish(hub, trigger, false, None).await?;
+            prune(hub).await;
+            Ok(())
+        }
+        ScheduledReceipt::Start { incident: id, launch } => {
+            if a.paused { anyhow::bail!("attachment {} is paused; its accepted effect is retained", a.name); }
+            let key = ikey(&id);
+            let saved: Option<String> = hub.store.kv_get(key).await?;
+            let Some(saved) = saved else { return super::schedule::outbox::finish(hub, trigger, true, Some("the materialized incident was removed before its agent started".into())).await; };
+            let mut i: Incident = serde_json::from_str(&saved)?;
+            if !matches!(i.state.as_str(), "open" | "waiting") { return super::schedule::outbox::finish(hub, trigger, false, Some("the incident was closed before its agent started".into())).await; }
+            i.title = launch.title;
+            i.bundle = launch.bundle;
+            // Also repair receipts accepted by an older binary before pre-open binding existed.
+            let planned = planned_agent(&launch.attachment,&format!("trigger:{trigger}"))?;
+            let bound = launch.attachment.id.clone();
+            hub.store.call(move |c| bind_agent(c,&planned,&bound)).await?;
+            let agent = start(hub, &launch.attachment, &i, &format!("trigger:{trigger}")).await.map_err(anyhow::Error::msg)?;
+            let (trigger, attachment) = (trigger.to_owned(), a.id.clone());
+            let updated: Option<Incident> = hub.store.call(move |c| {
+                let tx = crate::store::tx(c)?;
+                let key = ikey(&id);
+                let saved: Option<String> = tx.query_row("SELECT v FROM kv WHERE k = ?1", [&key], |r| r.get(0)).optional()?;
+                let updated = if let Some(saved) = saved {
+                    let mut i: Incident = serde_json::from_str(&saved)?;
+                    anyhow::ensure!(i.agent.as_deref().is_none_or(|old| old == agent), "incident has another agent");
+                    i.agent = Some(agent.clone()); i.updated_at = crate::util::now_unix();
+                    tx.execute("UPDATE kv SET v = ?2 WHERE k = ?1", params![key, serde_json::to_string(&i)?])?;
+                    bind_agent(&tx,&agent,&attachment)?;
+                    Some(i)
+                } else { None };
+                tx.execute("UPDATE ci_trigger_outbox SET state = 'done', updated_at = ?2 WHERE id = ?1 AND kind = 'attachment' AND state IN ('pending', 'materialized')", params![trigger, crate::util::now_unix()])?;
+                tx.commit()?;
+                Ok(updated)
+            }).await?;
+            if let Some(i) = updated { hub.emit(&crate::wire::events::ServerEvent::Incident { incident: Box::new(crate::wire::events::IncidentBrief::of(&i)) }); }
+            prune(hub).await;
+            Ok(())
+        }
+    }
+}
+
+/// U04, W03-R10: the same cron language validates and fires attachment schedules.
+fn scheduled_minutes(schedule: &str, minutes: &[i64]) -> Vec<i64> {
+    use kiln_ci::trigger::cron::{Cron, TimeZone};
+    Cron::parse(schedule).map(|c| minutes.iter().copied().filter(|m| c.fires_at(*m, &TimeZone::UTC)).collect()).unwrap_or_default()
+}
+
+#[cfg(test)]
+fn scheduled(schedule: &str, minutes: &[i64]) -> bool {
+    !scheduled_minutes(schedule, minutes).is_empty()
 }
 
 /// Looks for stuck jobs, schedules due and failing checks, once a minute.
 async fn ticks(hub: Arc<Hub>) {
     let mut checked: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     // The last minute schedules were looked at: a tick that comes late still sees each minute once.
-    let mut looked = crate::util::now_unix() / 60;
+    let mut looked = crate::util::now_unix() / 60 - 1;
     while hub.shutdown.sleep(TICK).await {
         let attached = all(&hub).await;
         let minute = crate::util::now_unix() / 60;
-        let minutes: Vec<time::OffsetDateTime> = (looked.max(minute - 10) + 1..=minute).filter_map(|m| time::OffsetDateTime::from_unix_timestamp(m * 60).ok()).collect();
+        let minutes: Vec<i64> = (looked.max(minute - 10) + 1..=minute).map(|m| m * 60).collect();
         looked = minute;
         if attached.is_empty() {
             continue;
@@ -1243,17 +1377,15 @@ async fn ticks(hub: Arc<Hub>) {
         for a in attached.iter().filter(|a| !a.paused) {
             if a.wake.iter().any(|w| w == "schedule")
                 && let Some(cron) = a.schedule.as_deref()
-                && minutes.iter().any(|m| crate::gitops::cron_matches(cron, *m))
             {
-                let t = Trigger {
-                    wake: "schedule",
-                    about: About::default(),
-                    signature: "schedule".to_owned(),
-                    title: format!("{}'s schedule ({cron})", a.name),
-                    seen: Seen { at: crate::util::now_unix(), what: "its schedule".to_owned(), url: None, run: None },
-                    detail: format!("It's time for {}'s scheduled work ({cron}, UTC).", a.name),
-                };
-                wake(&hub, a, &t).await;
+                for at in scheduled_minutes(cron, &minutes) {
+                    if let Err(e) = super::schedule::outbox::enqueue(&hub,
+                        super::schedule::outbox::Occurrence { owner: &format!("attachment:{}", a.id), path: "schedule", entry: 0, minute: at, cron },
+                        super::schedule::outbox::Payload::Attachment { attachment: a.id.clone(), minute: at, cron: cron.to_owned() },
+                    ).await {
+                        tracing::warn!(attachment = %a.id, error = %format!("{e:#}"), "an attachment's schedule could not be accepted");
+                    }
+                }
             }
         }
         for t in stuck(&hub, &attached).await {
@@ -1350,30 +1482,31 @@ const SLOW_FEWEST: usize = 3;
 
 /// A run's critical path: how long it took, in seconds (each of its jobs from its first leg's
 /// start to its last's end), and its jobs.
-async fn critical_path(hub: &Hub, run: &str) -> Option<(i64, Vec<String>)> {
-    let g = super::runs_api::graph_json(&hub.store, run, None).await.ok()?;
-    let path: Vec<String> = g.get("critical_path")?.as_array()?.iter().filter_map(Value::as_str).map(str::to_owned).collect();
-    let nodes = g.get("nodes")?.as_array()?;
+async fn critical_path(hub: &Hub, run: &str) -> anyhow::Result<Option<(i64, Vec<String>)>> {
+    let g = super::runs_api::graph_json(&hub.store, run, None).await.map_err(|(_,message)| anyhow::anyhow!(message))?;
+    let Some(path) = g.get("critical_path").and_then(Value::as_array) else { return Ok(None); };
+    let path: Vec<String> = path.iter().filter_map(Value::as_str).map(str::to_owned).collect();
+    let Some(nodes) = g.get("nodes").and_then(Value::as_array) else { return Ok(None); };
     let span =
         |j: &str| nodes.iter().find(|n| n.get("job").and_then(Value::as_str) == Some(j)).and_then(|n| Some(n.get("finished_at")?.as_i64()? - n.get("started_at")?.as_i64()?)).unwrap_or(0).max(0);
     let took: i64 = path.iter().map(|j| span(j)).sum();
-    (took > 0).then_some((took, path))
+    Ok((took > 0).then_some((took, path)))
 }
 
 /// A green run (`run.succeeded`): the attachments that look after it and wake on `slow`, each with
 /// what wakes it, when its critical path took longer than the median of its workflow's last green
 /// runs on its branch by more than their margin (`slow_percent`).
-async fn slow(hub: &Hub, v: &Value) -> Vec<(Attachment, Trigger)> {
+async fn slow(hub: &Hub, v: &Value) -> anyhow::Result<Vec<(Attachment, Trigger)>> {
     let repo = s(v, "/repo/name").or_else(|| s(v, "/run/repo")).unwrap_or_default().to_owned();
     let workflow = s(v, "/run/workflow").unwrap_or_default().to_owned();
     let branch = s(v, "/run/branch").unwrap_or_default().to_owned();
     let about = About { repo: Some(repo.clone()), workflow: Some(workflow.clone()), branch: Some(branch.clone()), ..About::default() };
-    let watching: Vec<Attachment> = all(hub).await.into_iter().filter(|a| !a.paused && a.wake.iter().any(|w| w == "slow") && looks_after(a, &about)).collect();
-    let Some(run) = s(v, "/run/id").map(str::to_owned) else { return Vec::new() };
+    let watching: Vec<Attachment> = all_checked(hub).await?.into_iter().filter(|a| !a.paused && a.wake.iter().any(|w| w == "slow") && looks_after(a, &about)).collect();
+    let Some(run) = s(v, "/run/id").map(str::to_owned) else { return Ok(Vec::new()) };
     if watching.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let Some((took, path)) = critical_path(hub, &run).await else { return Vec::new() };
+    let Some((took, path)) = critical_path(hub, &run).await? else { return Ok(Vec::new()) };
     let (repo_id, wf, br, this) = (s(v, "/repo/id").unwrap_or_default().to_owned(), workflow.clone(), branch.clone(), run.clone());
     let before: Vec<String> = hub
         .store
@@ -1382,30 +1515,29 @@ async fn slow(hub: &Hub, v: &Value) -> Vec<(Attachment, Trigger)> {
                 "SELECT id FROM runs WHERE repo_id = ?1 AND COALESCE(workflow_id, '') = ?2 AND branch = ?3 AND conclusion = 'success' AND id != ?4
                    AND created_at < (SELECT created_at FROM runs WHERE id = ?4) ORDER BY created_at DESC LIMIT ?5",
             )?;
-            let rows = st.query_map(rusqlite::params![repo_id, wf, br, this, SLOW_RUNS], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+            let rows = st.query_map(crate::sql::params![repo_id, wf, br, this, SLOW_RUNS], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
             Ok(rows)
         })
-        .await
-        .unwrap_or_default();
+        .await?;
     let mut past: Vec<i64> = Vec::new();
     for r in &before {
-        if let Some((t, _)) = critical_path(hub, r).await {
+        if let Some((t, _)) = critical_path(hub, r).await? {
             past.push(t);
         }
     }
     if past.len() < SLOW_FEWEST {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     past.sort_unstable();
     let median = past.get(past.len() / 2).copied().unwrap_or(0);
     if median <= 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let over = (took - median) * 100 / median;
     let number = v.pointer("/run/number").and_then(Value::as_i64).unwrap_or_default();
     let name = s(v, "/run/name").unwrap_or(&workflow).to_owned();
     let url = s(v, "/run/url").map(str::to_owned);
-    watching
+    Ok(watching
         .into_iter()
         .filter(|a| over > i64::from(a.limits.slow_percent))
         .map(|a| {
@@ -1425,15 +1557,27 @@ async fn slow(hub: &Hub, v: &Value) -> Vec<(Attachment, Trigger)> {
             };
             (a, t)
         })
-        .collect()
+        .collect())
 }
 
 /// An app kiln CD deploys turned degraded (W15): what looks after `environment` of `repo` (whose
 /// deploy file makes the app) and wakes on `degraded` is woken.
+#[cfg(test)]
 pub async fn degraded(hub: &Arc<Hub>, repo: &str, app: &str, environment: &str, status: &Value) {
-    if environment.is_empty() || all(hub).await.is_empty() {
-        return;
+    match degraded_control(hub, repo, app, environment, status).await {
+        Ok(children) => {
+            for (key, payload) in children {
+                if let Err(error) = super::schedule::outbox::accept(hub, format!("degraded/{app}/{key}"), payload).await { tracing::warn!(error = %format!("{error:#}"), "degraded control was not accepted"); }
+            }
+        }
+        Err(error) => tracing::warn!(error = %format!("{error:#}"), "degraded control could not be prepared"),
     }
+}
+
+pub(crate) async fn degraded_control(hub: &Arc<Hub>, repo: &str, app: &str, environment: &str, status: &Value) -> anyhow::Result<Vec<(String, super::schedule::outbox::Payload)>> {
+    if environment.is_empty() { return Ok(Vec::new()); }
+    let attached = all_checked(hub).await?;
+    if attached.is_empty() { return Ok(Vec::new()); }
     let base = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
     let said = status.get("message").and_then(Value::as_str).filter(|m| !m.is_empty()).map(|m| format!(": {m}")).unwrap_or_default();
     let revision = status.get("revision").and_then(Value::as_str).map(|r| format!(" It runs revision {}.", r.get(..12).unwrap_or(r))).unwrap_or_default();
@@ -1447,7 +1591,7 @@ pub async fn degraded(hub: &Arc<Hub>, repo: &str, app: &str, environment: &str, 
             "kiln CD's app {app}, which {repo} deploys to {environment}, turned degraded{said}.{revision} Its resources and their health are on its page; CD's operations (`cd.apps.*`) say what it synced last."
         ),
     };
-    fire(hub, &t).await;
+    Ok(attached.into_iter().filter(|a| a.wake.iter().any(|wake| wake == "degraded") && looks_after(a, &t.about)).map(|a| (format!("attachment/{}/degraded", a.id), super::schedule::outbox::Payload::AttachmentIntent { attachment: a.id, trigger: Box::new(PersistedTrigger::of(&t)) })).collect())
 }
 
 /// How long a job may be unroutable before `unroutable` wakes on it: a runner that's on its way
@@ -1495,36 +1639,12 @@ async fn unroutable(hub: &Hub, attached: &[Attachment]) -> Vec<Trigger> {
         .collect()
 }
 
-/// Listens to kiln's events and wakes what they wake, for as long as the server runs.
+/// Periodic derived checks stay on their existing loop. Accepted domain events reach the
+/// shared durable outbox directly; Quiver's UI feed is no longer a control-input authority.
 pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
-    use futures::FutureExt as _;
     crate::rt::spawn(ticks(Arc::clone(&hub)));
-    // Upgrades that failed or went through before now aren't news.
-    let _ = upgrades_failed(&hub).await;
-    upgrades_through(&hub).await;
-    let mut rx = hub.events.subscribe();
-    loop {
-        futures::select_biased! {
-            () = hub.shutdown.cancelled().fuse() => return Ok(()),
-            m = rx.recv().fuse() => match m {
-                Ok(text) => {
-                    let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-                    let kind = v.get("type").and_then(Value::as_str).unwrap_or_default();
-                    if kind == "run.succeeded" {
-                        for (a, t) in slow(&hub, &v).await {
-                            wake(&hub, &a, &t).await;
-                        }
-                    } else if matches!(kind, "run.failed" | "deploy.failed" | "leg.flaky" | "land.ejected" | "runner.offline" | "updates" | "comment") && !all(&hub).await.is_empty() {
-                        for t in trigger_of(&hub, &v).await {
-                            fire(&hub, &t).await;
-                        }
-                    }
-                }
-                Err(async_broadcast::RecvError::Overflowed(_)) => {}
-                Err(async_broadcast::RecvError::Closed) => return Ok(()),
-            },
-        }
-    }
+    hub.shutdown.cancelled().await;
+    Ok(())
 }
 
 // ------------------------------------------------------------------ operations
@@ -1740,10 +1860,6 @@ async fn report(cx: Cx, v: Value) -> Out {
     Ok(json!({"incident": brief(&i)}))
 }
 
-fn key_of(v: &Value, k: &str) -> Result<String, Fail> {
-    crate::ops::text(v, k)
-}
-
 /// Attachments' and incidents' operations (kiln's own: `attachments.*`, `incidents.*`).
 pub fn list_ops() -> Vec<Op> {
     vec![
@@ -1753,7 +1869,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: true,
             destructive: false,
             input: Input::of::<input::AttachmentsList>(),
-            route: |_| Ok((Method::GET, path(&["api", "attachments"]))),
+            route: Routes(vec![Definition::new("GET", &[Part::Literal("api"), Part::Literal("attachments")], &[], "runs.read", ScopeAt::Anywhere)]),
             run: |cx, v| Box::pin(list(cx, v)),
         },
         Op {
@@ -1762,7 +1878,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: true,
             destructive: false,
             input: Input::of::<input::AttachmentsGet>(),
-            route: |v| Ok((Method::GET, path(&["api", "attachments", &key_of(v, "attachment")?]))),
+            route: Routes(vec![Definition::new("GET", &[Part::Literal("api"), Part::Literal("attachments"), Part::Field("attachment")], &[], "runs.read", ScopeAt::Anywhere)]),
             run: |cx, v| Box::pin(get_one(cx, v)),
         },
         Op {
@@ -1771,12 +1887,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: false,
             input: Input::of::<input::AttachmentsSave>(),
-            route: |v| {
-                Ok(match v.get("attachment").and_then(Value::as_str) {
-                    Some(k) => (Method::PUT, path(&["api", "attachments", k])),
-                    None => (Method::POST, path(&["api", "attachments"])),
-                })
-            },
+            route: Routes(vec![Definition::new("PUT", &[Part::Literal("api"), Part::Literal("attachments"), Part::Field("attachment")], &[], "agents.attach", ScopeAt::Anywhere).when("attachment", true), Definition::new("POST", &[Part::Literal("api"), Part::Literal("attachments")], &[], "agents.attach", ScopeAt::Anywhere).when("attachment", false)]),
             run: |cx, v| Box::pin(save(cx, v)),
         },
         Op {
@@ -1785,7 +1896,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: true,
             input: Input::of::<input::AttachmentsRemove>(),
-            route: |v| Ok((Method::DELETE, path(&["api", "attachments", &key_of(v, "attachment")?]))),
+            route: Routes(vec![Definition::new("DELETE", &[Part::Literal("api"), Part::Literal("attachments"), Part::Field("attachment")], &[], "agents.attach", ScopeAt::Anywhere)]),
             run: |cx, v| Box::pin(remove(cx, v)),
         },
         Op {
@@ -1794,7 +1905,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: false,
             input: Input::of::<input::AttachmentsPause>(),
-            route: |_| Ok((Method::POST, path(&["api", "attachments", "pause"]))),
+            route: Routes(vec![Definition::new("POST", &[Part::Literal("api"), Part::Literal("attachments"), Part::Literal("pause")], &[], "agents.attach", ScopeAt::Anywhere)]),
             run: |cx, v| Box::pin(pause(cx, v)),
         },
         Op {
@@ -1803,7 +1914,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: true,
             destructive: false,
             input: Input::of::<input::IncidentsList>(),
-            route: |_| Ok((Method::GET, path(&["api", "incidents"]))),
+            route: Routes(vec![Definition::new("GET", &[Part::Literal("api"), Part::Literal("incidents")], &[], "runs.read", ScopeAt::Anywhere)]),
             run: |cx, v| Box::pin(incidents_list(cx, v)),
         },
         Op {
@@ -1812,7 +1923,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: true,
             destructive: false,
             input: Input::of::<input::IncidentsGet>(),
-            route: |v| Ok((Method::GET, path(&["api", "incidents", &key_of(v, "incident")?]))),
+            route: Routes(vec![Definition::new("GET", &[Part::Literal("api"), Part::Literal("incidents"), Part::Field("incident")], &[], "runs.read", ScopeAt::Anywhere)]),
             run: |cx, v| Box::pin(incident_get(cx, v)),
         },
         Op {
@@ -1821,7 +1932,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: false,
             input: Input::of::<input::IncidentsReport>(),
-            route: |v| Ok((Method::POST, path(&["api", "incidents", &key_of(v, "incident")?, "report"]))),
+            route: Routes(vec![Definition::new("POST", &[Part::Literal("api"), Part::Literal("incidents"), Part::Field("incident"), Part::Literal("report")], &[], crate::authz::SIGNED_IN, ScopeAt::Server)]),
             run: |cx, v| Box::pin(report(cx, v)),
         },
     ]
@@ -1960,6 +2071,55 @@ mod tests {
         Attachment { name: "CI-Doctor".into(), on: on.into(), harness: Some(Harness { kind: "claude".into(), ..Harness::default() }), ..Attachment::default() }
     }
 
+    #[test]
+    fn u04_attachment_replay_keeps_one_incident_and_one_seen_before_launch() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let mut a = Attachment { id: "scheduled-doctor".into(), wake: vec!["schedule".into()], schedule: Some("0 6 * * *".into()), ..doctor("repo:test/cron") };
+            a.limits.sessions_per_day = 1;
+            let owner = format!("attachment:{}", a.id);
+            let minute = 1_792_216_800;
+            super::super::schedule::outbox::enqueue(&hub, super::super::schedule::outbox::Occurrence { owner: &owner, path: "schedule", entry: 0, minute, cron: "0 6 * * *" }, super::super::schedule::outbox::Payload::Attachment { attachment: a.id.clone(), minute, cron: "0 6 * * *".into() }).await?;
+            let key: String = hub.store.call(|c| Ok(c.query_row("SELECT id FROM ci_trigger_outbox WHERE kind = 'attachment'", [], |r| r.get(0))?)).await?;
+            let first = scheduled_receipt(&hub, &key, &a, minute, "0 6 * * *").await?;
+            let planned = planned_agent(&a,&format!("trigger:{key}"))?;
+            assert_eq!(hub.store.kv_get(agent_key(&planned)).await?.as_deref(),Some(a.id.as_str()),"the first prompt already has its attachment grants before external open");
+            assert!(hub.harness.info(&planned).is_none(),"grant binding itself does not launch an agent");
+            a.name = "renamed-doctor".into();
+            if let Some(harness) = &mut a.harness { harness.model = Some("edited-model".into()); }
+            let again = scheduled_receipt(&hub, &key, &a, minute, "0 6 * * *").await?;
+            assert!(matches!(&first, Some(ScheduledReceipt::Start { launch, .. }) if launch.attachment.name == "CI-Doctor"));
+            assert_eq!(serde_json::to_value(&first)?, serde_json::to_value(&again)?, "a crash resumes the same exact launch despite attachment edits");
+            let all = incidents(&hub).await;
+            assert_eq!(all.len(), 1);
+            assert_eq!(all.first().map(|i| i.seen.len()), Some(1));
+            assert!(all.first().is_some_and(|i| i.agent.is_none()), "bookkeeping commits before any external launch");
+            // A different cause arrives while the first launch is still pending. Its accepted
+            // Start already consumes the daily allowance, even though no agent is visible yet.
+            hub.store.kv_set(akey(&a.id), serde_json::to_string(&a)?).await?;
+            let mut input = scheduled_trigger(&a, minute, "0 6 * * *");
+            input.signature = "explicit-second-cause".into();
+            let outbox = super::super::schedule::outbox::accept(&hub, "explicit-budget-test".into(), super::super::schedule::outbox::Payload::AttachmentIntent { attachment: a.id.clone(), trigger: Box::new(PersistedTrigger::of(&input)) }).await?;
+            let original_title = input.title.clone();
+            input.title = "a later retry must not replace the accepted input".into();
+            input.seen.at += 1;
+            let retry = super::super::schedule::outbox::accept(&hub, "explicit-budget-test".into(), super::super::schedule::outbox::Payload::AttachmentIntent { attachment: a.id.clone(), trigger: Box::new(PersistedTrigger::of(&input)) }).await?;
+            assert_eq!(outbox, retry);
+            super::super::schedule::outbox::deliver_accepted(&hub, &retry).await?;
+            let second = incident(&hub, &super::super::schedule::outbox::run_id(&outbox)).await.ok_or_else(|| anyhow::anyhow!("second incident was not committed"))?;
+            assert_eq!(second.title, original_title, "delivery uses the first accepted descriptor");
+            assert_eq!(second.seen.first().map(|s| s.at), Some(minute));
+            assert!(second.state == "waiting" && second.agent.is_none() && second.why.as_deref().is_some_and(|why| why.contains("its limit")), "a pending Start reserves the only daily session");
+            let corrupt = key.clone();
+            hub.store.call(move |c| { c.execute("UPDATE ci_trigger_outbox SET receipt = '{bad' WHERE id = ?1", [corrupt])?; Ok(()) }).await?;
+            assert!(scheduled_receipt(&hub, &key, &a, minute, "0 6 * * *").await?.is_none(), "an unreadable consumer receipt is quarantined");
+            let state: (String, Option<String>) = hub.store.call(move |c| Ok(c.query_row("SELECT state, diagnostic FROM ci_trigger_outbox WHERE id = ?1", [key], |r| Ok((r.get(0)?, r.get(1)?)))?)).await?;
+            assert!(state.0 == "failed" && state.1.as_deref().is_some_and(|why| why.contains("invalid persisted attachment receipt")));
+            assert!(super::super::schedule::outbox::enqueue(&hub, super::super::schedule::outbox::Occurrence { owner: &owner, path: "schedule", entry: 0, minute: minute + 86_400, cron: "0 6 * * *" }, super::super::schedule::outbox::Payload::Attachment { attachment: a.id, minute: minute + 86_400, cron: "0 6 * * *".into() }).await?, "a quarantined occurrence does not suppress the next occurrence");
+            Ok(())
+        })
+    }
+
     /// An incident's brief is the JSON it was before it was a type (`wire::events::IncidentBrief`).
     #[test]
     fn brief_is_what_it_was() -> anyhow::Result<()> {
@@ -1994,6 +2154,23 @@ mod tests {
         assert!(refused(Attachment { harness: Some(Harness { kind: "nope".into(), ..Harness::default() }), ..doctor("repo:acme/app") }).contains("unknown harness"));
         assert!(refused(Attachment { name: "@doc".into(), ..doctor("repo:acme/app") }).contains("`name`"));
         assert!(refused(Attachment { limits: Limits { sessions_per_day: 0, ..Limits::default() }, ..doctor("repo:acme/app") }).contains("`limits`"));
+    }
+
+    /// U04, W03-R10: accepted named fields and restricted day fields actually wake attachments.
+    #[test]
+    fn w03_r10_attachment_schedules_fire_as_validated() -> anyhow::Result<()> {
+        let monday = time::macros::datetime!(2026-10-19 09:00 UTC).unix_timestamp();
+        let first = time::macros::datetime!(2026-11-01 09:00 UTC).unix_timestamp();
+        let other = time::macros::datetime!(2026-10-20 09:00 UTC).unix_timestamp();
+        for cron in ["0 9 * OCT MON", "0 9 1 * MON"] {
+            let mut a = Attachment { wake: vec!["schedule".into()], schedule: Some(cron.into()), ..doctor("repo:acme/app") };
+            check(&mut a).map_err(anyhow::Error::msg)?;
+            assert!(scheduled(cron, &[monday]));
+            assert!(!scheduled(cron, &[other]));
+        }
+        assert!(scheduled("0 9 1 * MON", &[first]), "either restricted day field matches");
+        assert!(!scheduled("61 9 * * MON", &[monday]), "invalid stored schedules never fire");
+        Ok(())
     }
 
     #[test]
@@ -2162,7 +2339,7 @@ mod end_to_end {
             let now = crate::util::now_unix();
             hub.store
                 .call(move |c| {
-                    c.execute("INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, status, created_at) VALUES ('run1', ?1, 7, 'ci', 'push', 'main', 'abc', 'running', ?2)", rusqlite::params![repo_id, now - 7200])?;
+                    c.execute("INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, status, created_at) VALUES ('run1', ?1, 7, 'ci', 'push', 'main', 'abc', 'running', ?2)", crate::sql::params![repo_id, now - 7200])?;
                     let legs: [(&str, i64, Option<i64>, Option<&str>); 4] = [
                         ("no-runner-yet", now - 1800, None, None),
                         ("awaiting-approval", now - 1800, None, Some(r#"{"reason":"approval","environment":"production"}"#)),
@@ -2172,7 +2349,7 @@ mod end_to_end {
                     for (leg, queued, since, reason) in legs {
                         c.execute(
                             "INSERT INTO jobs (id, run_id, key, display, status, labels, needs, spec, queued_at, wait_since, wait_reason) VALUES (?1, 'run1', ?1, ?1, 'queued', '[\"gpu\"]', '[]', '{}', ?2, ?3, ?4)",
-                            rusqlite::params![leg, queued, since, reason],
+                            crate::sql::params![leg, queued, since, reason],
                         )?;
                     }
                     Ok(())
@@ -2215,7 +2392,7 @@ mod end_to_end {
                 .call(move |c| {
                     c.execute(
                         "INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, status, created_at, workflow_id) VALUES ('run1', ?1, 7, 'ci', 'push', 'main', 'abc', 'running', ?2, '.github/workflows/ci.yml')",
-                        rusqlite::params![repo_id, now - 600],
+                        crate::sql::params![repo_id, now - 600],
                     )?;
                     let legs: [(&str, i64, &str); 3] = [
                         ("windows", now - 300, r#"{"reason":"unroutable","failing":["os == windows"]}"#),
@@ -2225,7 +2402,7 @@ mod end_to_end {
                     for (leg, since, reason) in legs {
                         c.execute(
                             "INSERT INTO jobs (id, run_id, key, display, status, labels, needs, spec, queued_at, wait_since, wait_reason, job_id) VALUES (?1, 'run1', ?1, ?1, 'queued', '[]', '[]', '{}', ?2, ?2, ?3, ?1)",
-                            rusqlite::params![leg, since, reason],
+                            crate::sql::params![leg, since, reason],
                         )?;
                     }
                     Ok(())
@@ -2258,12 +2435,12 @@ mod end_to_end {
                         let (run, at) = (format!("run{n}"), 10_000 * n);
                         c.execute(
                             "INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, status, conclusion, created_at, workflow_id) VALUES (?1, ?2, ?3, 'ci', 'push', 'main', 'abc', 'completed', 'success', ?4, '.github/workflows/ci.yml')",
-                            rusqlite::params![run, rid, n, at],
+                            crate::sql::params![run, rid, n, at],
                         )?;
                         for (job, start, took, needs) in [("build", at, 100, "[]"), ("lint", at, 50, "[]"), ("test", at + 100, test, r#"["build"]"#)] {
                             c.execute(
                                 "INSERT INTO jobs (id, run_id, key, display, status, conclusion, labels, needs, spec, queued_at, started_at, finished_at, job_id) VALUES (?1, ?2, ?3, ?3, 'completed', 'success', '[]', ?4, '{}', ?5, ?5, ?6, ?3)",
-                                rusqlite::params![format!("{run}-{job}"), run, job, needs, start, start + took],
+                                crate::sql::params![format!("{run}-{job}"), run, job, needs, start, start + took],
                             )?;
                         }
                     }
@@ -2274,17 +2451,17 @@ mod end_to_end {
             hub.store.kv_set(super::akey(&a.id), serde_json::to_string(&a)?).await?;
             let green = |n: i64| json!({"type": "run.succeeded", "repo": {"id": repo_id, "name": "acme/app"}, "run": {"repo": "acme/app", "id": format!("run{n}"), "number": n, "workflow": ".github/workflows/ci.yml", "name": "CI", "branch": "main", "url": format!("https://kiln.example/runs/run{n}")}});
             // Run 4: three runs before it, a median of 300 s; it took 300 s.
-            anyhow::ensure!(super::slow(&hub, &green(4)).await.is_empty(), "as long as usual");
+            anyhow::ensure!(super::slow(&hub, &green(4)).await?.is_empty(), "as long as usual");
             // Run 5: 430 s against a median of 300 s (runs 1 to 4), 43% over: past the 25% margin.
-            let found = super::slow(&hub, &green(5)).await;
+            let found = super::slow(&hub, &green(5)).await?;
             let [(woken, t)] = found.as_slice() else { anyhow::bail!("{found:?}") };
             anyhow::ensure!(woken.name == "ci-doctor" && t.wake == "slow" && t.title.contains("took 430 s, 43% over its median of 300 s"), "{t:?}");
             anyhow::ensure!(t.detail.contains("build → test") && !t.detail.contains("lint") && t.seen.run.as_deref() == Some("run5"), "{}", t.detail);
             // A wider margin: 43% is within it. Too few green runs before it: nothing to go by.
             let wide = super::Attachment { limits: super::Limits { slow_percent: 50, ..super::Limits::default() }, ..a };
             hub.store.kv_set(super::akey(&wide.id), serde_json::to_string(&wide)?).await?;
-            anyhow::ensure!(super::slow(&hub, &green(5)).await.is_empty(), "within its margin");
-            anyhow::ensure!(super::slow(&hub, &green(3)).await.is_empty(), "two runs before it say nothing");
+            anyhow::ensure!(super::slow(&hub, &green(5)).await?.is_empty(), "within its margin");
+            anyhow::ensure!(super::slow(&hub, &green(3)).await?.is_empty(), "two runs before it say nothing");
             Ok(())
         })
     }
@@ -2305,11 +2482,11 @@ mod end_to_end {
                         let run = format!("run{n}");
                         c.execute(
                             "INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, status, conclusion, created_at, workflow_id, actor) VALUES (?1, ?2, ?3, 'ci', 'push', 'main', 'abc', 'completed', 'failure', ?4, 'ci.yml', ?5)",
-                            rusqlite::params![run, repo_id, n, day, actor],
+                            crate::sql::params![run, repo_id, n, day, actor],
                         )?;
                         c.execute(
                             "INSERT INTO jobs (id, run_id, key, display, status, labels, needs, spec, queued_at, started_at, finished_at, job_id) VALUES (?1, ?2, 'test', 'test', 'completed', '[]', '[]', '{}', ?3, ?3, ?4, 'test')",
-                            rusqlite::params![format!("{run}-1"), run, day + 1, day + 1 + minutes * 60],
+                            crate::sql::params![format!("{run}-1"), run, day + 1, day + 1 + minutes * 60],
                         )?;
                     }
                     Ok(())
@@ -2325,7 +2502,7 @@ mod end_to_end {
                 .call(move |c| {
                     c.execute(
                         "INSERT INTO jobs (id, run_id, key, display, status, labels, needs, spec, queued_at, started_at, finished_at, job_id, run_attempt) VALUES ('run1-2', 'run1', 'test', 'test', 'completed', '[]', '[]', '{}', ?1, ?1, ?2, 'test', 2)",
-                        rusqlite::params![day + 1, day + 1 + 5 * 60],
+                        crate::sql::params![day + 1, day + 1 + 5 * 60],
                     )?;
                     Ok(())
                 })
@@ -2358,10 +2535,28 @@ mod end_to_end {
         ServerEvent::RunNotice(Box::new(RunNotice { kind: NoticeKind::RunFailed, repo: RepoRef { id: "r1".into(), name: "acme/app".into() }, run, environments: Vec::new() }))
     }
 
+    // U04/U14: acceptance survives a crash/overflow before UI publication. The durable
+    // descriptor is the authority, so this helper intentionally emits no ServerEvent.
+    async fn accept_control(hub: &Arc<Hub>, key: &str, event: crate::wire::events::ServerEvent) -> anyhow::Result<()> {
+        let key = key.to_owned();
+        let descriptor = json!({"consumer":"attachment", "event":event.value()});
+        hub.store.call(move |c| {
+            let tx = crate::store::tx(c)?;
+            super::super::schedule::outbox::control(&tx,&key,descriptor.clone())?;
+            super::super::schedule::outbox::control(&tx,&key,descriptor)?;
+            tx.commit()?;
+            Ok(())
+        }).await?;
+        super::super::schedule::outbox::kick(hub).await;
+        Ok(())
+    }
+
     #[test]
     fn w20_r08_what_happens_wakes_the_agent_attached_to_it() -> anyhow::Result<()> {
         within(async {
             let hub = crate::hub::tests::scratch_hub_with(|c| c.terminal.enabled = true).await?;
+            // W20-R08: session starts follow canonical local initialization.
+            crate::harness::registry::Registry::initialize_local(&hub).await?;
             let h = Arc::clone(&hub);
             crate::rt::spawn(async move {
                 let _ = crate::harness::registry::Registry::run_local(h).await;
@@ -2371,6 +2566,7 @@ mod end_to_end {
             crate::rt::spawn(async move {
                 let _ = super::run(h).await;
             });
+            super::super::schedule::outbox::spawn(Arc::clone(&hub));
             let cx = Cx { hub: Arc::clone(&hub), caller: Caller::owner() };
             let fail = |(c, m): crate::ops::Fail| anyhow::anyhow!("{c}: {m}");
             let folder = tempfile::tempdir()?;
@@ -2381,8 +2577,9 @@ mod end_to_end {
             anyhow::ensure!(dup.contains("called ci-doctor already"), "{dup}");
 
             // A failed run of what it looks after: an incident, and an agent with the bundle.
-            hub.emit(&failed(1, ".github/workflows/ci.yml"));
-            let first = wait_for(&hub, "for the failure", |i| i.name == "ci-doctor").await?;
+            accept_control(&hub, "failure:1", failed(1, ".github/workflows/ci.yml")).await?;
+            // W20-R08: materialization precedes launch; observe the committed agent binding.
+            let first = wait_for(&hub, "for the failure", |i| i.name == "ci-doctor" && i.agent.is_some()).await?;
             anyhow::ensure!(first.state == "open" && first.title.starts_with("CI failed on main") && first.bundle.contains("Find out why") && first.bundle.contains("incidents.report"), "{first:?}");
             let agent = first.agent.clone().ok_or_else(|| anyhow::anyhow!("no agent"))?;
             let info = hub.harness.info(&agent).ok_or_else(|| anyhow::anyhow!("its agent isn't listed"))?;
@@ -2396,7 +2593,7 @@ mod end_to_end {
             anyhow::ensure!(!caller.can("diffs.land", &app) && !caller.can("environments.deploy", &app) && !caller.can("runs.rerun", &other), "no more");
 
             // The same failure again is the same incident: no second agent.
-            hub.emit(&failed(2, ".github/workflows/ci.yml"));
+            accept_control(&hub, "failure:2", failed(2, ".github/workflows/ci.yml")).await?;
             for _ in 0..400 {
                 if incident(&hub, &first.id).await.is_some_and(|i| i.seen.len() == 2) {
                     break;
@@ -2417,18 +2614,18 @@ mod end_to_end {
 
             // Paused, the repository's next failure waits for a person.
             call(cx.clone(), "attachments.pause", json!({"on": "repo:acme/app"})).await.map_err(fail)?;
-            hub.emit(&failed(3, ".github/workflows/release.yml"));
+            accept_control(&hub, "failure:3", failed(3, ".github/workflows/release.yml")).await?;
             let paused = wait_for(&hub, "while paused", |i| i.title.contains("CI failed") && i.state == "waiting").await?;
             anyhow::ensure!(paused.agent.is_none() && paused.why.as_deref().is_some_and(|w| w.contains("paused")), "{paused:?}");
             call(cx.clone(), "attachments.pause", json!({"attachment": "ci-doctor", "paused": false})).await.map_err(fail)?;
 
             // A mention calls the one it names.
-            hub.emit(&crate::wire::events::ServerEvent::Comment(Box::new(crate::wire::events::Comment { diff: "D9".into(), author: "user:ada".into(), body: "@ci-doctor why is this red?".into(), ..Default::default() })));
-            let called = wait_for(&hub, "for the mention", |i| i.wake == "mention").await?;
+            accept_control(&hub, "mention:1", crate::wire::events::ServerEvent::Comment(Box::new(crate::wire::events::Comment { diff: "D9".into(), author: "user:ada".into(), body: "@ci-doctor why is this red?".into(), ..Default::default() }))).await?;
+            let called = wait_for(&hub, "for the mention", |i| i.wake == "mention" && i.agent.is_some()).await?;
             anyhow::ensure!(called.agent.is_some() && called.bundle.contains("why is this red?"), "{called:?}");
 
             // Its limit for the day reached (two agents), the next waits for a person.
-            hub.emit(&failed(4, ".github/workflows/nightly.yml"));
+            accept_control(&hub, "failure:4", failed(4, ".github/workflows/nightly.yml")).await?;
             let limited = wait_for(&hub, "past its limit", |i| i.state == "waiting" && i.why.as_deref().is_some_and(|w| w.contains("limit"))).await?;
             anyhow::ensure!(limited.agent.is_none(), "{limited:?}");
 
@@ -2436,8 +2633,8 @@ mod end_to_end {
             call(cx.clone(), "attachments.save", json!({"name": "runner-doctor", "on": "runners", "harness": {"kind": "claude", "on": "local", "cwd": cwd}, "can": ["diagnose", "manage-runners"]}))
                 .await
                 .map_err(fail)?;
-            hub.emit(&crate::wire::events::ServerEvent::RunnerOffline { runner: crate::wire::events::OfflineRunner { name: "metal-1".into(), labels: vec!["linux".into()], gone_for: 180 } });
-            let gone = wait_for(&hub, "for the runner", |i| i.name == "runner-doctor").await?;
+            accept_control(&hub, "offline:1", crate::wire::events::ServerEvent::RunnerOffline { runner: crate::wire::events::OfflineRunner { name: "metal-1".into(), labels: vec!["linux".into()], gone_for: 180 } }).await?;
+            let gone = wait_for(&hub, "for the runner", |i| i.name == "runner-doctor" && i.agent.is_some()).await?;
             anyhow::ensure!(gone.title == "Runner metal-1 is offline" && gone.agent.is_some() && gone.wake == "offline", "{gone:?}");
             let doc = crate::mcp::session_caller(&hub, gone.agent.as_deref().unwrap_or_default(), None).await.map_err(anyhow::Error::msg)?;
             anyhow::ensure!(doc.can("runners.manage", &Scope::Runner { runner: "metal-1".into() }) && !doc.can("runs.rerun", &app), "a runner doctor manages runners, not runs");
@@ -2453,7 +2650,7 @@ mod end_to_end {
             super::degraded(&hub, "acme/app", "app-staging", "staging", &json!({"health": "Degraded"})).await;
             super::degraded(&hub, "acme/app", "app-production", "production", &json!({"health": "Degraded", "message": "2 of 3 pods fail their readiness probe", "revision": "0123456789abcdef"}))
                 .await;
-            let sick = wait_for(&hub, "for the environment", |i| i.name == "deploy-doctor").await?;
+            let sick = wait_for(&hub, "for the environment", |i| i.name == "deploy-doctor" && i.agent.is_some()).await?;
             anyhow::ensure!(sick.wake == "degraded" && sick.title == "app-production is degraded in production" && sick.agent.is_some(), "{sick:?}");
             anyhow::ensure!(sick.bundle.contains("readiness probe") && sick.bundle.contains("revision 0123456789ab."), "{}", sick.bundle);
             anyhow::ensure!(incidents(&hub).await.iter().filter(|i| i.wake == "degraded").count() == 1, "staging isn't what it looks after");

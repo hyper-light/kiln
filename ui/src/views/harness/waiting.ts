@@ -1,20 +1,16 @@
 /**
- * The agents with something to show wherever you are in kiln (cards.ts: a request, goals paused for
- * you, a stop of their own, a usage limit), kept for the whole app: read once when first asked for,
- * then kept from the server's events, and read again whenever the event stream comes back (what
- * changed while it was away isn't told). Only a change in what the cards show tells the page; an
- * agent's other news doesn't. Only for a person who may see agents (`agents.run` on the server, as
- * the agents' routes need): one who may not gets no cards, and kiln isn't asked (it would refuse).
+ * U13: waiting cards project the shared harness roster. The resource owns fetching, live events
+ * and reconnects; this projection only notifies when the visible cards or their order change.
+ * Only a person with server-wide agents.run may subscribe to that roster here.
  */
-import { events } from "@/api/events";
-import { harnessApi, listed, type AgentInfo } from "@/api/harness";
+import type { AgentInfo } from "@/api/harness";
 import { useAuth } from "@/lib/auth";
+import { harnessSessionsRes, listedHarnessSessions } from "@/lib/data";
+import { observeResource } from "@/lib/resource";
 import { atLimit, notable, stoppedItself } from "./cards";
 
-const agents = new Map<string, AgentInfo>();
-/** What each waiting agent shows, so news that changes none of it says nothing. */
-const shown = new Map<string, string>();
 let waiting: AgentInfo[] = [];
+let signature = "[]";
 const listeners = new Set<() => void>();
 let stop: (() => void) | null = null;
 
@@ -31,16 +27,12 @@ const shownOf = (a: AgentInfo) =>
 /** Since when it has had something to show: its oldest request, else when it paused or stopped. */
 const since = (a: AgentInfo) => (a.approvals.length > 0 ? Math.min(...a.approvals.map((p) => p.at || a.last_activity)) : (a.held?.since ?? a.pause?.since ?? a.last_activity));
 
-function changed(a: AgentInfo | undefined, id: string): boolean {
-  const now = a && notable(a) ? shownOf(a) : undefined;
-  if (shown.get(id) === now) return false;
-  if (now === undefined) shown.delete(id);
-  else shown.set(id, now);
-  return true;
-}
-
-function publish() {
-  waiting = [...agents.values()].filter(notable).sort((x, y) => since(x) - since(y));
+function project(list: AgentInfo[]) {
+  const next = listedHarnessSessions(list).filter(notable).sort((x, y) => since(x) - since(y));
+  const key = JSON.stringify(next.map((a) => [a.id, shownOf(a), since(a)]));
+  if (signature === key) return;
+  signature = key;
+  waiting = next;
   listeners.forEach((l) => l());
 }
 
@@ -52,52 +44,21 @@ function mayRead(): boolean {
   return !can || can["agents.run"] === "server";
 }
 
-async function read() {
-  if (!mayRead()) return;
-  let list: AgentInfo[];
-  try {
-    list = await harnessApi.list();
-  } catch {
-    return;
-  }
-  const gone = new Set(agents.keys());
-  let any = false;
-  for (const a of list) {
-    gone.delete(a.id);
-    agents.set(a.id, a);
-    any = changed(a, a.id) || any;
-  }
-  for (const id of gone) {
-    agents.delete(id);
-    any = changed(undefined, id) || any;
-  }
-  if (any) publish();
-}
-
 function start() {
-  const offEvents = events.on((ev) => {
-    if (ev.type === "harness" && listed(ev.info)) {
-      agents.set(ev.info.id, ev.info);
-      if (changed(ev.info, ev.info.id)) publish();
-    } else if (ev.type === "harness_closed") {
-      agents.delete(ev.id);
-      if (changed(undefined, ev.id)) publish();
+  let offRoster: (() => void) | undefined;
+  const syncAuth = () => {
+    if (mayRead()) {
+      offRoster ??= observeResource(harnessSessionsRes.key, harnessSessionsRes.fetch, harnessSessionsRes.opts, project);
+    } else {
+      offRoster?.();
+      offRoster = undefined;
+      project([]);
     }
-  });
-  let was = events.getSnapshot().state;
-  const offState = events.subscribeState(() => {
-    const now = events.getSnapshot().state;
-    if (now === "open" && was !== "open") void read();
-    was = now;
-  });
-  // Read once the person is known, if that's after the cards were first asked for.
-  const offAuth = useAuth.subscribe((now, before) => {
-    if (now.kind === "authed" && before.kind !== "authed") void read();
-  });
-  void read();
+  };
+  const offAuth = useAuth.subscribe(syncAuth);
+  syncAuth();
   return () => {
-    offEvents();
-    offState();
+    offRoster?.();
     offAuth();
   };
 }

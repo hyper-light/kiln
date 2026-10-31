@@ -1,21 +1,20 @@
-//! What deployments keep durably, and the state machine that keeps it.
-//!
-//! Only what can't be recomputed is kept: apps made through the API (apps from git are read
-//! again from git), clusters, repositories, projects, settings, and each app's deployment
-//! history. Renders, live objects and comparisons are soft state the engine rebuilds. Every
-//! change is a [`Command`], replicated by hyper-raft through hyper-durable ([`crate::store`]) and
-//! applied here in log order on every member.
-//!
-//! The applied state is shared with readers under a lock ([`Data`]), never copied per change;
-//! [`Machine::persist`] writes it as an image so the log can be compacted behind it.
+//! Pure CD domain state, commands and observable changes. The server applies these commands
+//! through its shared Amphora Database (U15/B2). Legacy Raft snapshot machinery below is compiled
+//! only for compatibility fixture tests; production has no separate CD durability owner.
 
 use std::collections::{BTreeMap, VecDeque};
+#[cfg(test)]
 use std::io::Write as _;
+#[cfg(test)]
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::sync::Arc;
 
+#[cfg(test)]
 use hyper_durable::{EntryRef, Fatal, Point, StateMachine};
+#[cfg(test)]
 use hyper_raft::proto::{ConfChangeV2, ConfState};
+#[cfg(test)]
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -355,7 +354,7 @@ pub fn applied_key(group: &str, kind: &str, namespace: &str, name: &str) -> Stri
 }
 
 /// Something that changed, for whoever follows the store.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Change {
     /// An app was put (by id).
     App(String),
@@ -546,8 +545,10 @@ impl Data {
 }
 
 /// The answer to a proposal: its request id, and whether it applied.
+#[cfg(test)]
 pub type Answer = (u64, Result<(), String>);
 
+#[cfg(test)]
 #[derive(Serialize, Deserialize)]
 struct Configuration {
     voters: Vec<u64>,
@@ -557,6 +558,7 @@ struct Configuration {
     auto_leave: bool,
 }
 
+#[cfg(test)]
 impl From<&ConfState> for Configuration {
     fn from(c: &ConfState) -> Self {
         Self {
@@ -569,6 +571,7 @@ impl From<&ConfState> for Configuration {
     }
 }
 
+#[cfg(test)]
 impl From<Configuration> for ConfState {
     fn from(c: Configuration) -> Self {
         ConfState {
@@ -581,6 +584,7 @@ impl From<Configuration> for ConfState {
     }
 }
 
+#[cfg(test)]
 #[derive(Serialize, Deserialize)]
 struct Image {
     index: u64,
@@ -590,6 +594,7 @@ struct Image {
 }
 
 /// The state machine: [`Data`] in log order, persisted as an image file.
+#[cfg(test)]
 pub struct Machine {
     data: Arc<RwLock<Data>>,
     applied: Point,
@@ -599,6 +604,7 @@ pub struct Machine {
     changes: Vec<Change>,
 }
 
+#[cfg(test)]
 impl Machine {
     /// The machine whose image is at `file`, or a new one of `configuration` if there is none.
     pub fn open(file: &Path, configuration: ConfState) -> anyhow::Result<Machine> {
@@ -660,6 +666,7 @@ impl Machine {
     }
 }
 
+#[cfg(test)]
 #[derive(Serialize)]
 struct ImageRef<'a> {
     index: u64,
@@ -669,6 +676,7 @@ struct ImageRef<'a> {
 }
 
 /// The image holds credentials: only its owner reads it.
+#[cfg(test)]
 fn restrict(path: &Path) {
     #[cfg(unix)]
     {
@@ -679,6 +687,7 @@ fn restrict(path: &Path) {
     let _ = path;
 }
 
+#[cfg(test)]
 impl StateMachine for Machine {
     type Answer = Answer;
 

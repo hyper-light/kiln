@@ -98,9 +98,28 @@ async fn create(hub: &Arc<Hub>, leg: &str, repo_id: &str, req: Request) -> Resul
         ));
     }
     let Some(d) = crate::deploy::get() else { return Ok(msg(StatusCode::SERVICE_UNAVAILABLE, "the deploy service isn't running on this server")) };
+    // U10: derive the action from the authenticated live leg. A caller never chooses a Flow
+    // id here, and an old run attempt cannot borrow a newer attempt's protected action.
+    let (job,owner_repo)=(leg.to_owned(),repo_id.to_owned());
+    let run:Option<String>=hub.store.call(move|c| {
+        use crate::sql::OptionalExtension as _;
+        Ok(c.query_row("SELECT j.run_id FROM jobs j JOIN runs r ON r.id=j.run_id WHERE j.id=?1 AND r.repo_id=?2 AND j.run_attempt=r.attempt AND j.status='running'",crate::sql::params![job,owner_repo],|r|r.get(0)).optional()?)
+    }).await.map_err(internal)?;
+    let Some(run)=run else{return Ok(msg(StatusCode::FORBIDDEN,"the protected deployment belongs to a live job of the current run attempt"));};
+    let protected=super::environments::actions::for_job(&hub.store,&run,&ask.environment).await.map_err(internal)?;
+    let repo=hub.store.repos().await.map_err(internal)?.into_iter().find(|r|r.id==repo_id).ok_or_else(||(StatusCode::NOT_FOUND,"job repository no longer exists".into()))?;
+    let definition=super::environments::defs(hub,&repo).await.map_err(internal)?.remove(&ask.environment.to_ascii_lowercase()).ok_or_else(||(StatusCode::CONFLICT,"job environment no longer exists".into()))?;
+    let target=super::environments::actions::identity(repo_id,&definition);
+    let target_environment=if let Some(flow)=&protected {flow.environment.name.clone()}else if matches!(target.scope,kiln_ci::env::EnvironmentScope::Server) {
+        let (repo,local,key)=(repo_id.to_owned(),ask.environment.clone(),target.key().map_err(|e|(StatusCode::BAD_REQUEST,e.to_string()))?);
+        let delegated:bool=hub.store.call(move|c|Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM environment_policy_bindings WHERE repo_id=?1 AND local_environment=?2 COLLATE NOCASE AND environment_key=?3)",crate::sql::params![repo,local,key],|r|r.get(0))?)).await.map_err(internal)?;
+        if !delegated{return Ok(msg(StatusCode::FORBIDDEN,"this policy reference has no release delegation: save its binding with environments.deploy permission, or declare an authorized shared Flow"));}
+        target.name
+    }else{ask.environment.clone()};
+
     let app = match ask.app.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
         Some(a) => a.to_owned(),
-        None => match default_app(hub, &d, repo_id, &ask.environment).await? {
+        None => match default_app(hub, &d, repo_id, &target_environment).await? {
             Ok(a) => a,
             Err(why) => return Ok(msg(StatusCode::BAD_REQUEST, &why)),
         },
@@ -108,8 +127,9 @@ async fn create(hub: &Arc<Hub>, leg: &str, repo_id: &str, req: Request) -> Resul
     // The job passed its environment's protection before it started: nothing checked again.
     let who = crate::deploy::flow::Who::kiln(who(leg));
     let flow_ask = crate::deploy::flow::Ask {
+        protected_action: protected.map(|f|f.id),
         app: app.clone(),
-        environment: ask.environment.clone(),
+        environment: target_environment,
         version: ask.version.clone(),
         artifacts: ask.artifacts.clone(),
         values: None,

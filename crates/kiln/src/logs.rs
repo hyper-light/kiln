@@ -12,17 +12,15 @@ use std::sync::Arc;
 use bytes::Bytes;
 use parking_lot::Mutex;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum LogEvent {
     Data { idx: u32, data: Bytes },
-    Step { idx: u32, status: &'static str },
+    Step { idx: u32, status: String },
     End,
 }
 
 struct Live {
-    tx: async_broadcast::Sender<LogEvent>,
-    /// Keeps the channel open while nobody is watching.
-    _idle: async_broadcast::InactiveReceiver<LogEvent>,
+    tx: crate::bus::Broadcast<LogEvent>,
     files: HashMap<u32, std::fs::File>,
     /// Each step's `<step>.times`, open while it's written.
     times: HashMap<u32, std::fs::File>,
@@ -63,12 +61,7 @@ impl Logs {
     fn with_live<R>(&self, job: &str, f: impl FnOnce(&mut Live) -> R) -> R {
         let mut g = self.live.lock();
         let live = g.entry(job.to_owned()).or_insert_with(|| {
-            let (mut tx, rx) = async_broadcast::broadcast(1024);
-            // Slow viewers lose the oldest chunks (and are told so) instead of stalling writers.
-            tx.set_overflow(true);
-            tx.set_await_active(false);
-            let idle = rx.deactivate();
-            Live { tx, _idle: idle, files: HashMap::new(), times: HashMap::new(), bytes: 0, truncated: false }
+            Live { tx: crate::bus::Broadcast::new(1024), files: HashMap::new(), times: HashMap::new(), bytes: 0, truncated: false }
         });
         f(live)
     }
@@ -141,7 +134,9 @@ impl Logs {
                     tracing::warn!(error = %e, "log times write failed");
                 }
             }
-            let _ = live.tx.try_broadcast(LogEvent::Data { idx, data: Bytes::copy_from_slice(chunk) });
+            for part in chunk.chunks(64 * 1024) {
+                let _ = live.tx.send(LogEvent::Data { idx, data: Bytes::copy_from_slice(part) });
+            }
         });
     }
 
@@ -151,21 +146,21 @@ impl Logs {
                 live.files.remove(&idx);
                 live.times.remove(&idx);
             }
-            let _ = live.tx.try_broadcast(LogEvent::Step { idx, status });
+            let _ = live.tx.send(LogEvent::Step { idx, status: status.into() });
         });
     }
 
     /// The job is over: close files, tell viewers, drop the channel.
     pub fn finish(&self, job: &str) {
         if let Some(live) = self.live.lock().remove(job) {
-            let _ = live.tx.try_broadcast(LogEvent::End);
+            let _ = live.tx.send(LogEvent::End);
         }
     }
 
     /// Subscribe to a job's live output. Subscribe *before* reading the backlog so nothing falls
     /// in between (viewers may see a few bytes twice at the seam, never miss any).
-    pub fn subscribe(&self, job: &str) -> async_broadcast::Receiver<LogEvent> {
-        self.with_live(job, |live| live.tx.new_receiver())
+    pub fn subscribe(&self, job: &str) -> crate::bus::Receiver<LogEvent> {
+        self.with_live(job, |live| live.tx.subscribe())
     }
 
     pub fn is_live(&self, job: &str) -> bool {
@@ -175,6 +170,28 @@ impl Logs {
     pub async fn read(&self, job: &str, idx: u32) -> Vec<u8> {
         let p = self.step_path(job, idx);
         crate::rt::blocking(move || std::fs::read(p).unwrap_or_default()).await.unwrap_or_default()
+    }
+
+    /// The derived index reads a captured finite regular file, keeping only its normalized
+    /// prefix. Errors remain backlog; they never become an empty successful log. The source
+    /// byte count is the captured file size, even when the prefix needs only its beginning.
+    pub(crate) async fn index_text(&self, job: &str, idx: u32, limit: usize, source_limit: u64) -> anyhow::Result<Option<(String, u64)>> {
+        let path = self.step_path(job, idx);
+        let declared=self.max_bytes.saturating_add(1024);
+        crate::rt::blocking(move || -> anyhow::Result<Option<(String, u64)>> {
+            use std::io::Read as _;
+            let file = match std::fs::File::open(path) {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Some((String::new(), 0))),
+                Err(e) => return Err(e.into()),
+            };
+            let metadata = file.metadata()?;
+            anyhow::ensure!(metadata.is_file(), "log indexing requires a regular file");
+            let bytes = metadata.len();
+            anyhow::ensure!(bytes<=declared,"log file exceeds its declared job-log byte bound; left unindexed");
+            if bytes>source_limit{return Ok(None)}
+            Ok(Some((crate::ci::logsearch::plain_reader(file.take(bytes), limit)?, bytes)))
+        }).await?
     }
 
     /// When each piece of a step's log arrived, oldest first: its byte offset in the log and unix

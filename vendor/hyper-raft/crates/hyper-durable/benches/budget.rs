@@ -119,6 +119,7 @@ fn settings(id: u64) -> Settings {
         },
         quiet: Duration::from_millis(10),
         elections: hyper_raft::Elections::Suspicion,
+        disk: hyper_durable::Disk::Flushed,
     }
 }
 

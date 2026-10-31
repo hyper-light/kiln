@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use http::StatusCode;
 use kiln_ci::sched::pools::{Pool, PoolSpec};
 use kiln_ci::sched::reserve::Reservation;
-use rusqlite::params;
+use crate::sql::params;
 use serde_json::{Value, json};
 
 use super::Fail;
@@ -42,7 +42,20 @@ pub async fn sources(hub: &Hub) -> (Vec<Pool>, Vec<Reservation>) {
         .iter()
         .filter_map(|s| match s.pool() {
             // Its hosts' runners start executors when asked.
-            Ok(p) => Some(Pool { caps: u64::from(crate::proto::CAP_POOLS), ..p }),
+            Ok(mut p) => {
+                if p.hosted {
+                    // The launcher fills absent CPU/memory with these same defaults. This is
+                    // only a future shared-pod shape; chosen pods use their actual API grant.
+                    let mut resources = s.resources.clone().unwrap_or_default();
+                    resources.cpu.get_or_insert_with(|| hub.cfg.kubernetes.default_cpu.clone());
+                    resources.memory.get_or_insert_with(|| hub.cfg.kubernetes.default_memory.clone());
+                    match resources.resources() {
+                        Ok(request) => p.request = request,
+                        Err(error) => { tracing::warn!(pool = %s.name, %error, "a pool is left out"); return None; }
+                    }
+                }
+                Some(Pool { caps: u64::from(crate::proto::CAP_POOLS) | if p.executor == "firecracker" { crate::proto::CAP_FIRECRACKER_SHAPE | crate::proto::CAP_WIRE } else { 0 }, ..p })
+            },
             Err(e) => {
                 tracing::warn!(pool = %s.name, error = %e, "a pool is left out");
                 None
@@ -68,6 +81,16 @@ pub(crate) async fn specs(hub: &Hub) -> Vec<PoolSpec> {
             Ok(_) => {}
             Err(e) => tracing::warn!(error = %e, "a stored pool can't be read"),
         }
+    }
+    // U01, W02-R06: existing [kubernetes] jobs and generated workflows still ask for `k8s`.
+    // Their executor lifecycle belongs to the same scheduler as explicitly configured pools.
+    if hub.cfg.kubernetes.enabled && !specs.iter().any(|p| p.labels.iter().any(|l| l == "k8s")) && !specs.iter().any(|p| p.name == "kiln-kubernetes") {
+        specs.push(PoolSpec {
+            name: "kiln-kubernetes".into(), executor: "k8s".into(), labels: vec!["k8s".into()],
+            max: Some(usize::try_from(hub.cfg.kubernetes.max_pods).unwrap_or(usize::MAX)),
+            resources: Some(kiln_ci::sched::pools::ResourceSpec { cpu: Some(hub.cfg.kubernetes.default_cpu.clone()), memory: Some(hub.cfg.kubernetes.default_memory.clone()), ..Default::default() }),
+            ..PoolSpec::default()
+        });
     }
     specs
 }
@@ -243,9 +266,10 @@ pub fn start_ask(hub: &Hub, pool: &str, executor: &str, kind: &str, image: Optio
 
 
 /// Tells the dispatcher a pool's executor didn't start, and why.
-fn failed(hub: &Hub, executor: &str, error: String) {
-    let said = crate::runner::pool::Said { executor: executor.to_owned(), state: "failed".into(), error: Some(error) };
-    hub.ci.send(super::dispatch::Msg::Executor { agent: "kubernetes".into(), said });
+fn failed(hub: &Hub, grant: &super::dispatch::ExecutorGrant, error: String) {
+    // U11-F03: this completion belongs to the owner captured before the async work began.
+    let said = crate::runner::pool::Said { executor: grant.executor.clone(), state: "failed".into(), error: Some(error), generation: Some(grant.generation.clone()), allocation: Some(grant.allocation.clone()), physical_execution: grant.physical_execution.clone(), shape: None, process_nonce: None, stop_proof: None };
+    hub.ci.send(super::dispatch::Msg::Executor { agent: String::new(), said });
 }
 
 /// What a pod made for a leg holds (docs/ci.md W13-R07), evaluated: the job container's image
@@ -299,39 +323,41 @@ pub struct PodService {
 /// Starts a `k8s` pool's executor: its pod (docs/ci.md W13-R07), made for a leg when `pod` says
 /// what it holds, whose own runner says it's ready by connecting. Why one couldn't start fails the
 /// executor, as a host's failure does.
-pub async fn start_pod(hub: &std::sync::Arc<Hub>, pool: &str, executor: &str, kind: &str, pod: Option<LegPod>) {
+pub(crate) async fn start_pod(hub: &std::sync::Arc<Hub>, pool: &str, grant: super::dispatch::ExecutorGrant, kind: &str, pod: Option<LegPod>) {
+    let executor = grant.executor.as_str();
     if kind != "k8s" {
-        return failed(hub, executor, format!("a `{kind}` pool's executors are started by their hosts, not this server"));
+        return failed(hub, &grant, format!("a `{kind}` pool's executors are started by their hosts, not this server"));
     }
     let Some(k) = hub.k8s.get().and_then(Option::as_ref).cloned() else {
-        return failed(hub, executor, "this server starts no pods: its `[kubernetes]` isn't enabled".into());
+        return failed(hub, &grant, "this server starts no pods: its `[kubernetes]` isn't enabled".into());
     };
     let Some(spec) = specs(hub).await.into_iter().find(|p| p.name == pool) else {
-        return failed(hub, executor, format!("no pool `{pool}`"));
+        return failed(hub, &grant, format!("no pool `{pool}`"));
     };
-    match k.launch_executor(hub, executor, &spec, pod.as_ref()).await {
+    match k.launch_executor(hub, &grant, &spec, pod.as_ref()).await {
         Ok(pod) => tracing::info!(pool = %pool, executor = %executor, pod = %pod, "executor pod started"),
-        Err(e) => failed(hub, executor, format!("{e:#}")),
+        Err(e) => failed(hub, &grant, format!("{e:#}")),
     }
 }
 
 /// Stops a `k8s` pool's executor: its pod goes (its runner goes with it).
-pub async fn stop_pod(hub: &Hub, executor: &str, runner: &str) {
+pub(crate) async fn stop_pod(hub: &std::sync::Arc<Hub>, grant: super::dispatch::ExecutorGrant) {
     let Some(k) = hub.k8s.get().and_then(Option::as_ref).cloned() else { return };
-    let mut names: Vec<String> = Vec::new();
-    if !executor.is_empty() {
-        names.push(crate::k8s::executor_pod(executor));
+    // U03/U11-F03: preserve the exact captured grant; a name/index is no cleanup authority.
+    if let Err(e) = stop_pod_proven(hub, &k, &grant).await {
+        tracing::warn!(executor = %grant.executor, error = %format!("{e:#}"), "U03 executor pod remains fenced pending physical stopped proof");
     }
-    if runner.starts_with("kiln-x-") && !names.iter().any(|n| n == runner) {
-        names.push(runner.to_owned());
-    }
-    for n in names {
-        tracing::info!(pod = %n, executor = %executor, "an executor pod goes: its executor stopped");
-        hub.pod_executors.lock().remove(&n);
-        if let Err(e) = k.delete_pod(&n).await {
-            tracing::debug!(pod = %n, error = %format!("{e:#}"), "an executor pod couldn't be deleted");
-        }
-    }
+}
+
+async fn stop_pod_proven(hub: &std::sync::Arc<Hub>, _k: &crate::k8s::K8s, expected: &super::dispatch::ExecutorGrant) -> anyhow::Result<bool> {
+    // U11-F05: latest terminal/container status cannot prove whole-UID provider closure.
+    // Persist the original stopping fence before requesting its exact enrolled peer to drain;
+    // do not consume historical status-only proofs, delete evidence or release this grant.
+    let Some(grant) = super::dispatch::hold_pod_retirement(hub, expected).await? else { return Ok(false); };
+    if let Some(owner) = &grant.pod_identity { hub.drain_executor(owner).await?; }
+    tracing::debug!(executor = %grant.executor, generation = %grant.generation, allocation = %grant.allocation,
+        hold = ?grant.pod_retirement_hold(), "U11 pod physical debt retained pending original publisher and provider closure");
+    Ok(false)
 }
 
 /// The executors the scheduler has now.
@@ -350,17 +376,17 @@ async fn live_executors(hub: &Hub) -> Option<std::collections::HashSet<String>> 
     )
 }
 
-/// Every 15 s, the executor pods (docs/ci.md W13-R07): one that ended goes; one that can't start
-/// (its image can't be pulled, its container made) for two minutes goes, its executor failed with
-/// why; one whose executor the scheduler hasn't got (stopped, or from before a restart) goes.
+/// Every 15 s, revisit enrolled executor pods (docs/ci.md W13-R07). An exact observation may
+/// fail startup once or drive its pending stopped-proof cleanup. Unenrolled/stale objects stay
+/// quarantined and charged until pre-enrollment publication custody is available (U11-F01).
 pub async fn reap_pods(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
-    let mut stuck_since: HashMap<String, std::time::Instant> = HashMap::new();
+    let mut stuck_since: HashMap<(String, String, String, String), std::time::Instant> = HashMap::new();
     loop {
         if !hub.shutdown.sleep(std::time::Duration::from_secs(15)).await {
             return Ok(());
         }
         let Some(k) = hub.k8s.get().and_then(Option::as_ref).cloned() else { continue };
-        let pods = match k.executor_pods().await {
+        let pods = match k.executor_pod_observations().await {
             Ok(p) => p,
             Err(e) => {
                 tracing::debug!(error = %format!("{e:#}"), "executor pods couldn't be listed");
@@ -368,14 +394,46 @@ pub async fn reap_pods(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
             }
         };
         let Some(live) = live_executors(&hub).await else { continue };
-        stuck_since.retain(|n, _| pods.iter().any(|p| &p.name == n));
-        for p in pods.into_iter().filter(|p| !p.deleting) {
+        stuck_since.retain(|(namespace, uid, generation, allocation), _| pods.iter().any(|observation| {
+            let p = &observation.pod;
+            !p.deleting && p.valid_owner() && p.stuck.is_some()
+                && observation.binding == crate::k8s::PodBindingObservation::Bound
+                && &p.namespace == namespace && &p.uid == uid && &p.generation == generation && &p.allocation == allocation
+        }));
+        for observation in pods {
+            let p = observation.pod;
+            if !p.valid_owner() {
+                stuck_since.remove(&p.stuck_key());
+                tracing::debug!("U11 executor observation lacks bounded owner metadata; quarantined");
+                continue;
+            }
+            if observation.binding != crate::k8s::PodBindingObservation::Bound || p.deleting {
+                // A same-snapshot unbound/deleting UID is only a conditional-law candidate.
+                // R103 lacks original Create-UID custody, accepted-call producer closure,
+                // reviewed live provider contract and acknowledged UID+RV Delete support.
+                // Labels/name/RV/phase/absence cannot supply those authorities or a NoStart.
+                stuck_since.remove(&p.stuck_key());
+                tracing::debug!(pod = %p.name, namespace = %p.namespace, uid = %p.uid, resource_version = %p.resource_version,
+                    binding = ?observation.binding, "U11 conditional pod observation retains its original debt; no retirement authority");
+                continue;
+            }
+            let grant = match super::dispatch::executor_grant(&hub, &p.executor).await {
+                Ok(Some(grant)) if grant.observes(&p) => grant,
+                other => {
+                    // U11-F03: only an eligible enrolled owner keeps a startup timer. A
+                    // stale/unknown grant resets this diagnostic delay, never its allocation.
+                    stuck_since.remove(&p.stuck_key());
+                    tracing::debug!(pod = %p.name, namespace = %p.namespace, uid = %p.uid, resource_version = %p.resource_version,
+                        generation = %p.generation, allocation = %p.allocation, ?other, "U11 executor observation is not its enrolled grant; quarantined");
+                    continue;
+                }
+            };
             let ended = matches!(p.phase.as_str(), "Succeeded" | "Failed");
             let orphan = !live.contains(&p.executor);
-            let stuck = p.stuck.as_ref().filter(|_| stuck_since.entry(p.name.clone()).or_insert_with(std::time::Instant::now).elapsed() > std::time::Duration::from_secs(120));
+            let stuck = p.stuck.as_ref().filter(|_| stuck_since.entry(p.stuck_key()).or_insert_with(std::time::Instant::now).elapsed() > std::time::Duration::from_secs(120));
             if let Some(why) = stuck {
                 tracing::warn!(pod = %p.name, reason = %why, "an executor pod can't start");
-                failed(&hub, &p.executor, format!("pod {}: {why}", p.name));
+                if !grant.stopping() { failed(&hub, &grant, format!("pod {}: {why}", p.name)); }
             }
             if ended || orphan || stuck.is_some() {
                 let why = if ended {
@@ -385,10 +443,9 @@ pub async fn reap_pods(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
                 } else {
                     "it can't start"
                 };
-                tracing::info!(pod = %p.name, executor = %p.executor, phase = %p.phase, reason = why, "an executor pod goes");
-                hub.pod_executors.lock().remove(&p.name);
-                if let Err(e) = k.delete_pod(&p.name).await {
-                    tracing::debug!(pod = %p.name, error = %format!("{e:#}"), "an executor pod couldn't be deleted");
+                tracing::info!(pod = %p.name, executor = %p.executor, phase = %p.phase, reason = why, "an executor pod awaits authoritative retirement");
+                if let Err(e) = stop_pod_proven(&hub, &k, &grant).await {
+                    tracing::warn!(pod = %p.name, error = %format!("{e:#}"), "U03 executor pod retains ownership pending physical proof");
                 }
             }
         }

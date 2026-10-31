@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use http::StatusCode;
 use kiln_ci::insights::{Fact, Rollup};
-use rusqlite::params;
+use crate::sql::params;
 use serde_json::{Value, json};
 
 use super::Fail;
@@ -711,7 +711,7 @@ async fn critical(hub: &Hub, repo: &str, workflow: &str) -> anyhow::Result<Value
     let run: Option<(String, i64)> = hub
         .store
         .call(move |c| {
-            use rusqlite::OptionalExtension as _;
+            use crate::sql::OptionalExtension as _;
             Ok(c.query_row("SELECT id, number FROM runs WHERE repo_id = ?1 AND workflow_id = ?2 AND finished_at IS NOT NULL ORDER BY finished_at DESC LIMIT 1", params![repo, wf], |x| Ok((x.get(0)?, x.get(1)?))).optional()?)
         })
         .await?;

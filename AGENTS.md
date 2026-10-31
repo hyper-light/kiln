@@ -16,8 +16,9 @@ web UI embedded. Read this before you change it, then the documents it points to
   tokio-rustls. If hyper-rt lacks something, say so and ask.
 - **Deterministic cores.** Logic that decides lives in `crates/kiln-ci` and `crates/kiln-cd` as
   pure code: no clock, disk, network or randomness except what's passed in.
-- **SQLite is CI's system of record**, changed only by numbered migrations
-  (`crates/kiln/src/store/migrations`).
+- **Amphora is the host's system of record.** SQL, Records, sessions and conversation feeds share
+  one database; SQL schema changes use numbered migrations (`crates/kiln/src/store/migrations`).
+  Legacy SQLite/Turso inputs are read-only migration sources, never alternative live writers.
 - **The protocol only grows.** `crates/kiln/src/proto.rs` is postcard by variant index: new
   variants go after every existing one, and new capabilities are new bits.
 - **General hardware.** Pick machines by what they can do, never by name.

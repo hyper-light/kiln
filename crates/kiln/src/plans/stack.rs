@@ -255,7 +255,7 @@ async fn token(hub: &Hub, st: &Stack, agent: &str, opener: &str) -> Result<(Stri
 async fn revoke(hub: &Hub, ids: Vec<String>) {
     let now = crate::util::now_unix();
     for id in ids {
-        let _ = hub.store.call(move |c| Ok(c.execute("UPDATE tokens SET revoked_at = ?2 WHERE id = ?1", rusqlite::params![id, now])?)).await;
+        let _ = hub.store.call(move |c| Ok(c.execute("UPDATE tokens SET revoked_at = ?2 WHERE id = ?1", crate::sql::params![id, now])?)).await;
     }
 }
 
@@ -506,10 +506,10 @@ async fn diff_of(hub: &Hub, repo_id: &str, trunk: &str, id: &str) -> Option<(u32
     let (repo_id, trunk, id) = (repo_id.to_owned(), trunk.to_owned(), id.to_owned());
     hub.store
         .call(move |c| {
-            use rusqlite::OptionalExtension as _;
+            use crate::sql::OptionalExtension as _;
             Ok(c.query_row(
                 "SELECT d.number, (SELECT MAX(n) FROM diff_versions v WHERE v.diff_id = d.id), d.state FROM diffs d WHERE d.repo_id = ?1 AND d.trunk = ?2 AND (d.kiln_change = ?3 OR d.change_id = ?3) ORDER BY d.number DESC LIMIT 1",
-                rusqlite::params![repo_id, trunk, id],
+                crate::sql::params![repo_id, trunk, id],
                 |r| Ok((r.get::<_, u32>(0)?, r.get::<_, Option<u32>>(1)?.unwrap_or(1), r.get::<_, String>(2)?)),
             )
             .optional()?)
@@ -755,7 +755,7 @@ mod end_to_end {
                 std::fs::write(work.path().join(file), text)?;
                 anyhow::ensure!(hub.harness.set_changes(&agent, json!([{"path": format!("{cwd}/{file}"), "added": 1, "removed": 0}])), "no agent to set the changes of");
                 let a = agent.clone();
-                hub.store.call(move |c| Ok(c.execute("UPDATE goal_items SET status = 'met' WHERE agent = ?1", rusqlite::params![a])?)).await?;
+                hub.store.call(move |c| Ok(c.execute("UPDATE goal_items SET status = 'met' WHERE agent = ?1", crate::sql::params![a])?)).await?;
                 agents::advance(&hub, &run).await?;
                 let st = super::of(&hub, &run).await.ok_or_else(|| anyhow::anyhow!("no stack"))?;
                 let e = st.steps.get(i).cloned().unwrap_or_default();

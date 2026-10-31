@@ -3,7 +3,7 @@
 //! each rule that changes something is called by an agent token acting for a user, with ids
 //! where the pattern has wildcards. The token may do nothing, so no handler runs and nothing
 //! changes, yet each call writes its one row, refused. A change that's let through writes one row
-//! too, with what its handler recorded as its detail.
+//! too, naming its unified operation; any handler notes become its detail.
 
 #![cfg(unix)]
 
@@ -66,19 +66,24 @@ fn w19_ac04_every_change_writes_one_row() -> anyhow::Result<()> {
     assert!(checked > 40, "{checked} mutating routes");
     assert!(wrong.is_empty(), "{} of {checked} routes didn't write exactly one right row:\n{}", wrong.len(), wrong.join("\n"));
 
-    // A change let through writes one row too, with what its handler recorded.
+    // W19-AC04 / U12: a change let through writes one row naming the unified operation.
+    // Handler notes are optional; the operation need not repeat its action in detail.
     let before = last_id(&s)?;
     let (status, body) = http(s.port, "PUT", "/api/ci/variables/REGION?scope=server", &s.admin, Some(&json!({ "value": "eu" })))?;
-    anyhow::ensure!((200..300).contains(&status), "variable: {status} {body}");
+    anyhow::ensure!(status == 204, "variable: {status} {body}");
     let rows = rows_after(&s, before)?;
     assert_eq!(rows.len(), 1, "{rows:?}");
     let row = rows.first().cloned().unwrap_or_default();
     assert_eq!(row.get("principal").and_then(Value::as_str), Some("admin"));
-    assert!(row.get("detail").and_then(Value::as_str).is_some_and(|d| d.contains("ci.variable.set")), "{row}");
+    assert_eq!(row.get("on_behalf_of"), Some(&Value::Null), "{row}");
+    assert_eq!(row.get("token"), Some(&Value::Null), "{row}");
+    assert_eq!(row.get("action").and_then(Value::as_str), Some("PUT ci.variables.set"), "{row}");
+    assert_eq!(row.get("target").and_then(Value::as_str), Some("/api/ci/variables/REGION"), "{row}");
+    assert_eq!(row.get("result").and_then(Value::as_str), Some("204"), "{row}");
     assert_eq!(row.get("scope").and_then(Value::as_str), Some("server"));
     // Filters by any field.
     let (_, body) = http(s.port, "GET", "/api/audit?principal=agent:fixer&result=403&limit=5", &s.admin, None)?;
     let filtered: Vec<Value> = serde_json::from_str(&body)?;
-    assert!(!filtered.is_empty() && filtered.iter().all(|r| r.get("principal").and_then(Value::as_str) == Some("agent:fixer")), "{body}");
+    assert!(!filtered.is_empty() && filtered.iter().all(|r| r.get("principal").and_then(Value::as_str) == Some("agent:fixer") && r.get("result").and_then(Value::as_str) == Some("403")), "{body}");
     Ok(())
 }

@@ -10,7 +10,8 @@ import { Link, useNavigate, useParams, useSearchParams } from "@/lib/router";
 
 import { api } from "@/api/client";
 import { cdApi } from "@/api/cd";
-import { ci, type CiEnvironment, type CiEnvKind, type CiEnvTargets } from "@/api/ci";
+import { deployApi } from "@/api/deploy";
+import { ci, isProviderEnvironment, type CiEnvironment, type CiEnvKind, type CiEnvTargets } from "@/api/ci";
 import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
 import { Confirm, Crumbs, Facts, Panel, SelectField, TextField } from "@/components/ui/misc";
@@ -90,10 +91,67 @@ function IntegrationPicker({ value, onChange, disabled }: { value: string; onCha
   return <SelectField label="Integration" value={value} onChange={(v) => !disabled && onChange(v)} options={options} className="env-field" />;
 }
 
+/** U10: an explicit binding shares policy, never merely a matching display name. */
+function ServerPolicyPicker({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const environments = useSuspenseResource("deploy/environments", (s) => deployApi.environments(s)).data;
+  return (
+    <SelectField
+      label="Server environment"
+      value={value}
+      onChange={onChange}
+      options={[{ value: "", label: "Choose an environment…" }, ...environments.map((e) => ({ value: e.name, label: e.name }))]}
+    />
+  );
+}
+
+function SharedFlow({ repo, e }: { repo: string; e: CiEnvironment }) {
+  const [run, setRun] = React.useState("");
+  const [app, setApp] = React.useState("");
+  const [version, setVersion] = React.useState("");
+  const [id, setId] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+  if (e.protection.policy?.scope.kind !== "server") return null;
+  const create = async () => {
+    setBusy(true);
+    try {
+      const flow = await ci.createEnvironmentFlow(repo, e.name, { run, app, version });
+      setId(flow.id);
+      toast.success("Shared protected action declared");
+    } catch (error) {
+      toast.error("Couldn't declare the protected action", errorMessage(error));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <section className="env-group" aria-label="Shared protected action">
+      <h3 className="env-legend">One approval for a CI-to-release flow</h3>
+      <p className="env-quiet">
+        Declare the exact run, app and version before its environment job passes protection. Reviewers must be allowed to approve both the run and the release. Other releases keep their own approvals.
+      </p>
+      <div className="env-fields">
+        <TextField label="CI run" value={run} onChange={(ev) => setRun(ev.target.value)} />
+        <TextField label="Release app" value={app} onChange={(ev) => setApp(ev.target.value)} />
+        <TextField label="Exact release version" value={version} onChange={(ev) => setVersion(ev.target.value)} />
+      </div>
+      <Button size="sm" disabled={busy || !run.trim() || !app.trim() || !version.trim()} onClick={() => void create()}>
+        Declare shared action
+      </Button>
+      {id && (
+        <div role="status">
+          <TextField label="Release protected_action" value={id} readOnly hint="Pass this action to the release request. Its app, version and environment must match." />
+        </div>
+      )}
+    </section>
+  );
+}
+
 function EnvForm({ e, repo, others }: { e: CiEnvironment; repo: string; others: string[] }) {
   // A preview's are its `previews:` entry's, in the file too (W15-R07).
   const file = e.source === "file" || e.source === "preview";
   const p = e.protection;
+  const [binding, setBinding] = React.useState<"repository" | "server">(p.policy?.scope.kind === "server" ? "server" : "repository");
+  const [serverPolicy, setServerPolicy] = React.useState(p.policy?.scope.kind === "server" ? p.policy.name : "");
   const [kind, setKind] = React.useState<CiEnvKind | "none">(e.kind ?? "none");
   const [clusters, setClusters] = React.useState<string[]>(e.targets.clusters ?? []);
   const [namespace, setNamespace] = React.useState(e.targets.namespace ?? "");
@@ -116,21 +174,25 @@ function EnvForm({ e, repo, others }: { e: CiEnvironment; repo: string; others: 
     try {
       const targets: CiEnvTargets = { clusters, namespace: namespace.trim() || undefined, runners: runners.trim() || undefined, integration: integration || undefined };
       const r = await ci.saveEnvironment(repo, e.name, {
-        kind: kind === "none" ? null : kind,
-        targets,
+        kind: binding === "server" || kind === "none" ? null : kind,
+        targets: binding === "server" ? {} : targets,
         // Its windows and gates as they are: they're kept in `.kiln/environments.yaml`'s terms.
-        protection: {
-          ...p,
-          reviewers: names(reviewers),
-          "prevent-self-review": selfReview,
-          "wait-timer": Math.max(0, Number(waitTimer) || 0),
-          branches: names(branches).length ? names(branches) : null,
-          tags: names(tags).length ? names(tags) : null,
-          after: after || undefined,
-          soak: after && soak.trim() ? soak.trim() : undefined,
-        },
+        protection:
+          binding === "server"
+            ? { policy: { scope: { kind: "server" }, name: serverPolicy } }
+            : {
+                ...p,
+                policy: undefined,
+                reviewers: names(reviewers),
+                "prevent-self-review": selfReview,
+                "wait-timer": Math.max(0, Number(waitTimer) || 0),
+                branches: names(branches).length ? names(branches) : null,
+                tags: names(tags).length ? names(tags) : null,
+                after: after || undefined,
+                soak: after && soak.trim() ? soak.trim() : undefined,
+              },
         url: url.trim() || null,
-        concurrency: Number(concurrency) > 0 ? Math.floor(Number(concurrency)) : null,
+        concurrency: binding === "server" ? null : Number(concurrency) > 0 ? Math.floor(Number(concurrency)) : null,
       });
       setSaid({ warnings: (r.diagnostics ?? []).map((d) => d.message), trunk: r.preview ? `A deployment from ${r.preview.trunk} ${r.preview.a_deployment_from_the_trunk}.` : null });
       toast.success(`Saved ${e.name}`);
@@ -158,6 +220,29 @@ function EnvForm({ e, repo, others }: { e: CiEnvironment; repo: string; others: 
         </p>
       )}
       <fieldset className="env-group" disabled={file || busy}>
+        <legend className="env-legend">Policy identity</legend>
+        <SelectField
+          label="Policy owner"
+          value={binding}
+          onChange={(value) => setBinding(value === "server" ? "server" : "repository")}
+          options={[
+            { value: "repository", label: "This repository" },
+            { value: "server", label: "Shared server environment" },
+          ]}
+        />
+        {binding === "server" && (
+          <>
+            <Loadable label="server environment policies">
+              <ServerPolicyPicker value={serverPolicy} onChange={setServerPolicy} />
+            </Loadable>
+            <p className="env-quiet">
+              Targets, approvals, windows, prerequisites and capacity come from this one server policy. Saving replaces this repository's local rules with that explicit binding.
+            </p>
+            {serverPolicy && <Link to={`/deployments/releases/environments/${encodeURIComponent(serverPolicy)}`}>Edit the shared policy</Link>}
+          </>
+        )}
+      </fieldset>
+      <fieldset className="env-group" disabled={file || busy || binding === "server"}>
         <legend className="env-legend">Where it deploys</legend>
         <Segmented<CiEnvKind | "none">
           label="Kind"
@@ -196,7 +281,7 @@ function EnvForm({ e, repo, others }: { e: CiEnvironment; repo: string; others: 
           </Loadable>
         )}
       </fieldset>
-      <fieldset className="env-group" disabled={file || busy}>
+      <fieldset className="env-group" disabled={file || busy || binding === "server"}>
         <legend className="env-legend">Who may deploy, and when</legend>
         <div className="env-fields">
           <TextField
@@ -238,7 +323,7 @@ function EnvForm({ e, repo, others }: { e: CiEnvironment; repo: string; others: 
       </fieldset>
       {!file && (
         <div className="env-actions">
-          <Button type="submit" size="sm" disabled={busy}>
+          <Button type="submit" size="sm" disabled={busy || (binding === "server" && !serverPolicy)}>
             Save {e.name}
           </Button>
         </div>
@@ -323,7 +408,8 @@ function Remove({ e, repo }: { e: CiEnvironment; repo: string }) {
 function EnvBody({ repo, name }: { repo: string; name: string }) {
   const e = useSuspenseResource(`ci/environment/${repo}/${name}`, (s) => ci.environment(repo, name, s), { on: ENV_EVENTS, pollMs: 10_000 }).data;
   const others = useSuspenseResource(`ci/environment/${repo}/list`, (s) => ci.environments(repo, s), { on: ENV_EVENTS })
-    .data.environments.map((x) => x.name)
+    .data.environments.filter((x): x is CiEnvironment => !isProviderEnvironment(x))
+    .map((x) => x.name)
     .filter((n) => n.toLowerCase() !== e.name.toLowerCase());
   const where = whereWords(e);
   return (
@@ -335,6 +421,7 @@ function EnvBody({ repo, name }: { repo: string; name: string }) {
           { label: "Where", value: where ?? "—" },
           { label: "Rules", value: protectionWords(e.protection, e.concurrency).join(" · ") || "anyone may deploy, any ref" },
           { label: "Defined", value: SOURCE_WORDS[e.source] ?? e.source },
+          { label: "Policy owner", value: e.identity?.scope.kind === "server" ? `Server · ${e.identity.name}` : `Repository · ${repo} · ${e.name}` },
           ...(e.preview ? [{ label: "For", value: <PreviewOf p={e.preview} /> }] : []),
         ]}
       />
@@ -348,7 +435,8 @@ function EnvBody({ repo, name }: { repo: string; name: string }) {
         </Loadable>
       </Panel>
       <Panel eyebrow="Settings" title={`${e.name}'s settings`}>
-        <EnvForm key={`${e.source}/${e.kind ?? ""}`} e={e} repo={repo} others={others} />
+        <EnvForm key={`${e.source}/${e.kind ?? ""}/${e.protection.policy?.name ?? ""}`} e={e} repo={repo} others={others} />
+        <SharedFlow repo={repo} e={e} />
         <Remove e={e} repo={repo} />
       </Panel>
       <Panel eyebrow="History" title="Deployments">

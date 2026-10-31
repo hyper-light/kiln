@@ -4,9 +4,11 @@ kiln's events ride a bus: Quiver, the topic store (github.com/hyper-light/quiver
 `vendor/quiver`, its node in the server's process. kiln reaches it only through kiln-seams' `Bus`
 (docs/seams.md, "Bus"; `crate::bus`). Quiver keeps each topic's messages in memory, the ephemeral
 class of Focal's doc 33, each message a Focal batch charged to one memory budget, and a reader
-behind what a topic keeps is refused `Behind`, never skipped silently. It carries one thing so far,
-the live feed of every agent session (the critical path's CP-T2.1); kiln's CI and deploy events
-come next, on the persisted class (CP-T2.2).
+behind what a topic keeps is refused `Behind`, never skipped silently. Quiver carries session live feeds
+and typed process-local event fanout through `crate::bus` (U14), including the server's general
+events. Durable scheduling inputs, outbox receipts and session control remain in canonical Amphora;
+event delivery does not establish durable acceptance. Consumer lag or delivery refusal requires
+recovery from canonical state.
 
 ## The live feed
 

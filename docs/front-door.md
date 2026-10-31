@@ -263,10 +263,17 @@ Under `<state>/front-door/`:
 
 | File | What | Mode |
 | --- | --- | --- |
-| `settings.json` | the settings last pushed, so it serves at once after a restart | 0644 |
+| `settings.json` | read-only legacy import source; accepted policy now lives in the host machine Amphora namespace | 0644 |
 | `kiln.key`, `kiln.pem` | the self-signed certificate in use and its key | 0600 |
 | `kiln.key.pending` | the key of a certificate request kiln's root has not answered yet | 0600 |
 | `custom.key`, `custom.pem` | your own certificate (its chain's certificates only) and its key | 0600 |
+
+U17: startup loads the canonical policy before serving. A checked, bounded legacy import and its
+receipt commit together; later changes commit before they are applied or reported. Refused commits
+retain the settings in use. The runner awaits queue delivery and durable acceptance before its
+wire acknowledgment; closed channels and refused commits return a refusal. Certificate issue,
+upload and renew commands stay ordered and are never coalesced. Certificate and key bytes remain
+in the files above.
 
 The settings travel as JSON in `ServerMsg::FrontDoor`, and the runner's reports in
 `AgentMsg::FrontDoorStatus`, so either side can add fields. A runner announces it can run a front

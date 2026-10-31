@@ -1,18 +1,19 @@
 //! Each agent session's processes held together by the kernel: a cgroup (v2) of its own,
 //! `kiln-agents/<session>` under the cgroup the runner runs in (`kiln-agents-<pid>/<session>` for a
-//! runner that isn't the machine's installed one: [`prune_ended`]); and each CI job's steps on this
-//! machine, `kiln-jobs/<job>` ([`job_group`]). Its harness joins it between fork
+//! runner that isn't the machine's installed one: [`prune_ended`]). Its harness joins it between fork
 //! and exec, before it runs anything, so everything it starts is in it too, however that's
 //! parented later (a command that daemonized, `setsid`, a double fork): no process leaves its
 //! cgroup by forking. Listing an agent's processes is reading its `cgroup.procs`; whose a process
 //! is, one read of `/proc/<pid>/cgroup`; ending them all, one write to `cgroup.kill`. Nothing is
 //! scanned.
 //!
-//! Only membership is asked of the cgroups (no controllers), so the runner's own cgroup needs no
+//! Ordinary containment asks only membership (no controllers), so the runner's own cgroup needs no
 //! delegation: any cgroup v2 it may write will do (a systemd user unit, a container with its own
 //! cgroup namespace). Where there is none (cgroup v1, a read-only cgroup filesystem, a cgroup
 //! another user owns), agents have no group and their processes are found by their mark
 //! (`crate::harness::survivors`), as before.
+//! Enforced executor limits require the managed systemd-control-v1 layout: the supervisor
+//! stays in kiln-control, and only its declared empty service parent distributes controllers.
 
 use std::fs;
 use std::io::Write as _;
@@ -27,16 +28,19 @@ const ROOT: &str = "/sys/fs/cgroup";
 /// The folder under the runner's own cgroup that holds agents' groups (in tests, one of their own:
 /// tests often run in a live runner's cgroup).
 const AGENTS: &str = if cfg!(test) { "kiln-agents-test" } else { "kiln-agents" };
-/// The folder under the runner's own cgroup that holds its CI jobs' groups (never paced).
-const JOBS: &str = if cfg!(test) { "kiln-jobs-test" } else { "kiln-jobs" };
 /// How deep cgroups an agent's processes made of their own are followed.
 const DEPTH: usize = 8;
+const LAYOUT_ENV: &str = "KILN_CGROUP_LAYOUT";
+const LAYOUT: &str = "systemd-control-v1";
+const CONTROL: &str = "kiln-control";
 
 /// A folder of agents' groups: where it is, and its path as `/proc/<pid>/cgroup` names it.
 #[derive(Debug)]
 struct Base {
     dir: PathBuf,
     rel: String,
+    /// None only after this exact managed layout has enabled/read back both controllers.
+    limits_error: Option<String>,
 }
 
 impl Base {
@@ -46,8 +50,12 @@ impl Base {
         if !Path::new(ROOT).join("cgroup.controllers").is_file() {
             return None;
         }
-        let own = fs::read_to_string("/proc/self/cgroup").ok()?.lines().find_map(|l| l.strip_prefix("0::")).map(|p| p.trim().trim_end_matches('/').to_owned())?;
-        let rel = format!("{own}/{name}");
+        let own = unified_path(&fs::read_to_string("/proc/self/cgroup").ok()?).ok()?;
+        Self::under(name, &own, &own)
+    }
+
+    fn under(name: &str, parent: &str, source: &str) -> Option<Base> {
+        let rel = format!("{}/{name}", parent.trim_end_matches('/'));
         let dir = Path::new(ROOT).join(rel.trim_start_matches('/'));
         if let Err(e) = fs::create_dir(&dir)
             && e.kind() != std::io::ErrorKind::AlreadyExists
@@ -57,13 +65,29 @@ impl Base {
         }
         // Moving a process in needs write access to the folder's cgroup.procs and to the cgroup
         // it leaves (ours: its children start in it).
-        let own_procs = Path::new(ROOT).join(own.trim_start_matches('/')).join("cgroup.procs");
+        let own_procs = Path::new(ROOT).join(source.trim_start_matches('/')).join("cgroup.procs");
         let writable = |p: &Path| nix::unistd::access(p, nix::unistd::AccessFlags::W_OK).is_ok();
         if !writable(&dir.join("cgroup.procs")) || !writable(&own_procs) {
             tracing::info!(dir = %dir.display(), "agents' processes have no cgroups of their own here (not this process's to write): they're found by their mark");
             return None;
         }
-        Some(Base { dir, rel })
+        Some(Base { dir, rel, limits_error: Some("enforced Firecracker startup requires the managed systemd-control-v1 service layout; update this service through kiln's managed installer".into()) })
+    }
+
+    fn managed(name: &str, layout: &str) -> anyhow::Result<Base> {
+        let own = unified_path(&fs::read_to_string("/proc/self/cgroup")?)?;
+        let parent = managed_parent(&own, layout, crate::os::supervise::started_by_supervisor())?;
+        let supervisor = unified_path(&fs::read_to_string(format!("/proc/{}/cgroup", std::os::unix::process::parent_id()))?)?;
+        anyhow::ensure!(supervisor == own, "managed cgroup layout requires this runner and its actual supervisor in the same kiln-control leaf");
+        let service = Path::new(ROOT).join(parent.trim_start_matches('/'));
+        let source = Path::new(ROOT).join(own.trim_start_matches('/'));
+        anyhow::ensure!(fs::read_to_string(source.join("cgroup.type"))?.trim() == "domain", "managed control leaf must be a cgroup v2 domain");
+        require_writable(&source.join("cgroup.procs"))?;
+        enable_controllers(&service)?;
+        let mut base = Self::under(name, parent, &own).ok_or_else(|| anyhow::anyhow!("managed service cannot create/write kiln's containment Base"))?;
+        enable_controllers(&base.dir)?;
+        base.limits_error = None;
+        Ok(base)
     }
 
     fn group(&self, session: &str, make: bool) -> Option<Group> {
@@ -90,6 +114,46 @@ impl Base {
     }
 }
 
+fn unified_path(text: &str) -> anyhow::Result<String> {
+    let mut paths = text.lines().filter_map(|line| line.strip_prefix("0::"));
+    let path = paths.next().ok_or_else(|| anyhow::anyhow!("cgroup v2 unified membership is unavailable"))?;
+    anyhow::ensure!(paths.next().is_none() && path.starts_with('/')
+        && !path.chars().any(char::is_control)
+        && (path == "/" || path.split('/').skip(1).all(|part| !part.is_empty() && part != "." && part != "..")), "invalid cgroup v2 membership path");
+    Ok(path.to_owned())
+}
+
+/// The schema identifies exactly one immediate parent, never an ancestor search or a path
+/// supplied by configuration. A namespace-hidden parent cannot satisfy this contract.
+fn managed_parent<'a>(own: &'a str, layout: &str, supervised: bool) -> anyhow::Result<&'a str> {
+    anyhow::ensure!(layout == LAYOUT && supervised, "managed limits require systemd-control-v1 and the actual kiln supervisor");
+    anyhow::ensure!(Path::new(own).file_name().and_then(|name| name.to_str()) == Some(CONTROL), "managed limits require the actual kiln-control leaf (DelegateSubgroup needs systemd >=254)");
+    let parent = own.strip_suffix("/kiln-control").filter(|parent| !parent.is_empty()).ok_or_else(|| anyhow::anyhow!("managed service parent is hidden by the cgroup namespace"))?;
+    Ok(parent)
+}
+
+fn require_writable(path: &Path) -> anyhow::Result<()> {
+    anyhow::ensure!(nix::unistd::access(path, nix::unistd::AccessFlags::W_OK).is_ok(), "managed cgroup file is not delegated for writing: {}", path.display());
+    Ok(())
+}
+
+fn validate_empty_domain(dir: &Path) -> anyhow::Result<()> {
+    anyhow::ensure!(fs::read_to_string(dir.join("cgroup.type"))?.trim() == "domain", "managed cgroup parent must be a v2 domain");
+    anyhow::ensure!(fs::read_to_string(dir.join("cgroup.procs"))?.trim().is_empty(), "managed cgroup parent must be empty; kiln never relocates shared processes");
+    let controllers = fs::read_to_string(dir.join("cgroup.controllers"))?;
+    anyhow::ensure!(["cpu", "memory"].iter().all(|wanted| controllers.split_whitespace().any(|name| name == *wanted)), "managed cgroup parent lacks delegated cpu/memory controllers");
+    require_writable(&dir.join("cgroup.procs"))?;
+    require_writable(&dir.join("cgroup.subtree_control"))
+}
+
+fn enable_controllers(dir: &Path) -> anyhow::Result<()> {
+    validate_empty_domain(dir)?;
+    fs::write(dir.join("cgroup.subtree_control"), "+cpu +memory")?;
+    let enabled = fs::read_to_string(dir.join("cgroup.subtree_control"))?;
+    anyhow::ensure!(["cpu", "memory"].iter().all(|wanted| enabled.split_whitespace().any(|name| name == *wanted)), "managed cgroup controller distribution readback failed");
+    Ok(())
+}
+
 /// Whether this process holds agents' processes together: only the processes that start agents for
 /// kiln (the runner, the server) do, from [`hold_agents`] on. Anything else linking kiln (an
 /// integration test, a tool) that starts a harness leaves its processes where they are, so it never
@@ -100,6 +164,9 @@ static HOLDS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new
 /// from now on.
 pub fn hold_agents() {
     HOLDS.store(true, std::sync::atomic::Ordering::Relaxed);
+    // main calls this before server/agent startup and headroom access. Resolve the same
+    // immutable Base now; a reconnect never resets its layout or old physical identities.
+    let _ = base();
 }
 
 fn holds() -> bool {
@@ -114,14 +181,22 @@ fn base() -> Option<&'static Base> {
     }
     static B: OnceLock<Option<Base>> = OnceLock::new();
     B.get_or_init(|| {
-        if cfg!(test) || crate::os::supervise::started_by_supervisor() {
-            return Base::under_own(AGENTS);
+        let ordinary = || {
+            if cfg!(test) || crate::os::supervise::started_by_supervisor() { return Base::under_own(AGENTS); }
+            let b = Base::under_own(&format!("{AGENTS}-{}", std::process::id()))?;
+            if let Some(own) = b.dir.parent() { prune_ended(own); }
+            Some(b)
+        };
+        let Some(layout) = std::env::var_os(LAYOUT_ENV) else { return ordinary() };
+        match Base::managed(AGENTS, &layout.to_string_lossy()) {
+            Ok(base) => Some(base),
+            Err(error) => {
+                tracing::warn!(error = %error, "managed cgroup delegation unavailable; ordinary membership remains available, enforced Firecracker startup is refused");
+                let mut base = ordinary()?;
+                base.limits_error = Some(format!("managed cgroup delegation unavailable: {error}; reinstall with systemd >=254, Delegate=cpu memory and DelegateSubgroup=kiln-control through kiln's managed installer"));
+                Some(base)
+            }
         }
-        let b = Base::under_own(&format!("{AGENTS}-{}", std::process::id()))?;
-        if let Some(own) = b.dir.parent() {
-            prune_ended(own);
-        }
-        Some(b)
     })
     .as_ref()
 }
@@ -145,6 +220,9 @@ fn prune_ended(own: &Path) {
 
 /// Removes `dir` and the groups in it that nothing runs in, at once (a busy one stays).
 fn prune(dir: &Path, depth: usize) {
+    // Canonical CI domains retire only through their Group/Gate proof owner. A dead
+    // runner PID and an empty subtree do not authorize deleting its evidence.
+    if dir.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with("ci-")) { return; }
     if depth > 0 {
         for e in fs::read_dir(dir).into_iter().flatten().flatten() {
             if e.file_type().is_ok_and(|t| t.is_dir()) {
@@ -168,6 +246,62 @@ pub struct Group {
 }
 
 impl Group {
+    /// U01/C1a: an empty aggregate domain owned by one existing Execution. Only the
+    /// already-owned Base is changed; a missing delegation is never repaired in ancestors.
+    pub(crate) fn aggregate(session: &str) -> std::io::Result<Group> {
+        let base = base().ok_or_else(|| std::io::Error::other("Firecracker CPU/memory limits require writable delegated cgroup v2"))?;
+        if let Some(error) = &base.limits_error { return Err(std::io::Error::other(error.clone())); }
+        let name = name_of(session).ok_or_else(|| std::io::Error::other("invalid aggregate execution identity"))?;
+        let controllers = fs::read_to_string(base.dir.join("cgroup.controllers"))?;
+        if !["cpu", "memory"].iter().all(|wanted| controllers.split_whitespace().any(|c| c == *wanted))
+            || fs::read_to_string(base.dir.join("cgroup.type"))?.trim() != "domain"
+            || !fs::read_to_string(base.dir.join("cgroup.procs"))?.trim().is_empty()
+        {
+            return Err(std::io::Error::other("Firecracker CPU/memory limits require cpu and memory controllers delegated to kiln's empty cgroup parent; configure the service through the managed installer"));
+        }
+        fs::write(base.dir.join("cgroup.subtree_control"), "+cpu +memory")?;
+        let dir = base.dir.join(name);
+        fs::create_dir(&dir)?; // A fresh owner never adopts an arbitrary existing domain.
+        Ok(Self { dir })
+    }
+
+    pub(crate) fn set_limits(&self, limits: crate::os::cgroup::CpuMemoryLimit) -> anyhow::Result<()> {
+        limits.validate()?;
+        anyhow::ensure!(self.empty_proven_strict()?, "aggregate domain was populated before admission");
+        fs::write(self.dir.join("cpu.max"), format!("{} {}", limits.cpu_quota_us, limits.cpu_period_us))?;
+        fs::write(self.dir.join("memory.max"), limits.memory_bytes.to_string())?;
+        fs::write(self.dir.join("cgroup.subtree_control"), "+cpu +memory")?;
+        self.verify_limits(limits)
+    }
+
+    pub(crate) fn verify_limits(&self, limits: crate::os::cgroup::CpuMemoryLimit) -> anyhow::Result<()> {
+        limits.validate()?;
+        let cpu = fs::read_to_string(self.dir.join("cpu.max"))?;
+        let mut values = cpu.split_whitespace();
+        anyhow::ensure!(values.next().and_then(|v| v.parse::<u64>().ok()) == Some(limits.cpu_quota_us)
+            && values.next().and_then(|v| v.parse::<u64>().ok()) == Some(limits.cpu_period_us) && values.next().is_none(), "aggregate CPU quota readback differs from the original grant");
+        anyhow::ensure!(fs::read_to_string(self.dir.join("memory.max"))?.trim().parse::<u64>().ok() == Some(limits.memory_bytes), "aggregate memory limit readback differs from the original grant");
+        Ok(())
+    }
+
+    pub(crate) fn child(&self, id: &str, limits: crate::os::cgroup::CpuMemoryLimit) -> anyhow::Result<Group> {
+        self.verify_limits(limits)?;
+        let name = name_of(id).ok_or_else(|| std::io::Error::other("invalid aggregate child identity"))?;
+        let dir = self.dir.join(name);
+        fs::create_dir(&dir)?;
+        Ok(Self { dir })
+    }
+
+    /// Bound aggregate disappearance is unknown until its positive proof was persisted.
+    pub(crate) fn empty_proven_strict(&self) -> std::io::Result<bool> {
+        let events = fs::read_to_string(self.dir.join("cgroup.events"))?;
+        match events.lines().find_map(|l| l.strip_prefix("populated ")) {
+            Some("0") => Ok(true),
+            Some("1") => Ok(false),
+            _ => Err(std::io::Error::other("cgroup.events lacks a valid populated field")),
+        }
+    }
+
     /// Agent session `session`'s group: the one it has (it outlives the harness, and the runner
     /// process too), else a new one. `None` where this machine can't hold processes together.
     pub fn of(session: &str) -> Option<Group> {
@@ -204,6 +338,48 @@ impl Group {
         inside
     }
 
+    /// U01: leased commands must enter containment before exec or fail to start.
+    /// Unlike the harness compatibility path, this never falls back outside the cgroup.
+    pub(crate) fn enter_leased(&self, cmd: &mut Command) -> std::io::Result<()> {
+        let mut procs = fs::OpenOptions::new().write(true).open(self.dir.join("cgroup.procs"))?;
+        #[allow(unsafe_code)]
+        // SAFETY: only write(2) on an already open descriptor between fork and exec.
+        unsafe {
+            cmd.pre_exec(move || procs.write_all(b"0"));
+        }
+        Ok(())
+    }
+
+    /// U01: retain the exact containment identity across a runner moving cgroups on restart.
+    pub(crate) fn lease_identity(&self) -> String { self.dir.to_string_lossy().into_owned() }
+
+    pub(crate) fn recover_leased(identity: &str, id: &str) -> std::io::Result<Group> {
+        let path = PathBuf::from(identity);
+        let name = name_of(id).ok_or_else(|| std::io::Error::other("invalid lease group name"))?;
+        if !path.starts_with(ROOT) || path.file_name().and_then(|n| n.to_str()) != Some(name)
+            || path.components().any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir))
+        {
+            return Err(std::io::Error::other("invalid lease containment identity"));
+        }
+        Ok(Group { dir: path })
+    }
+
+    /// U01: kernel proof for all descendants, including child cgroups. Read failures are errors,
+    /// never interpreted as an empty group.
+    pub(crate) fn empty_proven(&self) -> std::io::Result<bool> {
+        // A cgroup can only be removed once no processes inhabit it or its descendants.
+        // Inspection failures remain errors; require the kernel mount before accepting absence.
+        if !self.dir.try_exists()? && Path::new(ROOT).join("cgroup.controllers").try_exists()? {
+            return Ok(true);
+        }
+        let events = fs::read_to_string(self.dir.join("cgroup.events"))?;
+        match events.lines().find_map(|l| l.strip_prefix("populated ")) {
+            Some("0") => Ok(true),
+            Some("1") => Ok(false),
+            _ => Err(std::io::Error::other("cgroup.events lacks a valid populated field")),
+        }
+    }
+
     /// Every process in it now, also in cgroups its processes made inside it.
     pub fn pids(&self) -> Vec<u32> {
         let mut out = Vec::new();
@@ -233,40 +409,6 @@ impl Group {
     pub fn remove(&self) {
         remove_tree(&self.dir, DEPTH);
     }
-
-    /// Removes it, and the groups its processes made in it, once nothing runs in them, on a thread
-    /// of its own (its last processes count for a moment after they're reaped): never waited for
-    /// here. What still runs keeps its group, which goes with the next runner's start.
-    pub fn release(&self) {
-        let dir = self.dir.clone();
-        if std::thread::Builder::new().name("kiln-group-release".into()).spawn(move || remove_tree(&dir, DEPTH)).is_err() {
-            prune(&self.dir, DEPTH);
-        }
-    }
-}
-
-/// CI job `job`'s group (`kiln-jobs/<job>` under the runner's cgroup), for its steps' processes on
-/// this machine. A kiln one of them starts (a test's or a lab's runner) takes the cgroup it runs in
-/// as its own, so it holds and paces its agents in this job's group, never in this runner's
-/// `kiln-agents`, whatever build it is (one from a branch older than `kiln-agents-<pid>` too).
-/// Headroom never paces it. `None` where agents get no groups (see [`Base::under_own`]).
-pub fn job_group(job: &str) -> Option<Group> {
-    if !holds() {
-        return None;
-    }
-    static B: OnceLock<Option<Base>> = OnceLock::new();
-    B.get_or_init(|| {
-        let b = Base::under_own(JOBS)?;
-        // Those of jobs that ended while the runner before this one ran.
-        for e in fs::read_dir(&b.dir).into_iter().flatten().flatten() {
-            if e.file_type().is_ok_and(|t| t.is_dir()) {
-                prune(&e.path(), DEPTH);
-            }
-        }
-        Some(b)
-    })
-    .as_ref()?
-    .group(job, true)
 }
 
 /// The folder that holds this runner's agents' groups (headroom paces them), when it has one.
@@ -323,12 +465,11 @@ fn remove_tree(dir: &Path, depth: usize) {
 /// touch the runner's: the processes it holds, whose they are, and ending them.
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     /// A runner that isn't the installed one never takes another's folder, and those of runners
     /// that ended go once empty (the 2026-10-29 outage: a lab runner paced production's agents).
     #[test]
     fn folders_of_ended_runners_go_once_empty_and_a_live_ones_stays() -> anyhow::Result<()> {
+        use super::*;
         let dead = {
             let mut c = Command::new("true").spawn()?;
             c.wait()?;
@@ -351,43 +492,68 @@ mod tests {
         Ok(())
     }
 
-    /// A CI step's kiln (a lab's runner) takes the cgroup it runs in as its own: in its job's
-    /// group, the agents' folder it makes is inside that group, never the runner's `kiln-agents`
-    /// (the 2026-10-29 outage). The job's group goes once its step has ended, and not before.
+    /// U01: only the kernel's explicit populated=0 is proof; unreadable or malformed
+    /// membership information cannot accidentally turn a live reservation into free capacity.
     #[test]
-    fn a_step_s_kiln_makes_its_agents_folder_inside_its_job_s_group() -> anyhow::Result<()> {
-        let Some(base) = Base::under_own(&format!("{JOBS}-{}", std::process::id())) else {
-            eprintln!("no cgroup v2 this test may write: skipped");
-            return Ok(());
-        };
-        let job = base.group("01a1job", true).ok_or_else(|| anyhow::anyhow!("no group under {}", base.dir.display()))?;
-        // The step: a shell that makes `kiln-agents` under its own cgroup, as any kiln does.
-        let mut cmd = Command::new("sh");
-        cmd.args(["-c", "own=$(sed -n 's/^0:://p' /proc/self/cgroup); mkdir /sys/fs/cgroup$own/kiln-agents && echo $own; sleep 30"]).stdout(std::process::Stdio::piped()).stdin(std::process::Stdio::null());
-        job.enter(&mut cmd);
-        let mut child = cmd.spawn()?;
-        let mut line = String::new();
-        if let Some(out) = child.stdout.take() {
-            use std::io::BufRead as _;
-            std::io::BufReader::new(out).read_line(&mut line)?;
+    fn u01_containment_proof_refuses_missing_and_malformed_kernel_state() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let group = super::Group { dir: dir.path().to_path_buf() };
+        let events = dir.path().join("cgroup.events");
+        assert!(group.empty_proven().is_err());
+        std::fs::write(&events, "populated 1\nfrozen 0\n")?;
+        assert!(!group.empty_proven()?);
+        std::fs::write(&events, "populated 0\nfrozen 0\n")?;
+        assert!(group.empty_proven()?);
+        std::fs::write(&events, "populated unknown\n")?;
+        assert!(group.empty_proven().is_err());
+        std::fs::remove_file(events)?;
+        assert!(group.empty_proven().is_err());
+        assert!(group.empty_proven_strict().is_err(), "aggregate absence is unknown, not physical proof");
+        let limits = crate::os::cgroup::CpuMemoryLimit { cpu_quota_us: 150000, cpu_period_us: 100000, memory_bytes: 128 << 20 };
+        std::fs::write(dir.path().join("cpu.max"), "150000 100000\n")?;
+        std::fs::write(dir.path().join("memory.max"), "134217728\n")?;
+        group.verify_limits(limits)?;
+        std::fs::write(dir.path().join("cpu.max"), "max 100000\n")?;
+        assert!(group.verify_limits(limits).is_err(), "unlimited CPU cannot attest the admitted envelope");
+        std::fs::write(dir.path().join("cpu.max"), "150000 100000\n")?;
+        std::fs::write(dir.path().join("memory.max"), "max\n")?;
+        assert!(group.verify_limits(limits).is_err(), "unlimited memory cannot attest the admitted envelope");
+        let old_base = dir.path().join("old-runner");
+        std::fs::create_dir_all(old_base.join("ci-exact-owner").join("ci-child"))?;
+        std::fs::create_dir_all(old_base.join("ordinary-session"))?;
+        prune(&old_base, 8);
+        assert!(old_base.join("ci-exact-owner").join("ci-child").is_dir(), "generic PID pruning cannot consume canonical Gate evidence");
+        assert!(!old_base.join("ordinary-session").exists());
+        let own = unified_path("0::/system.slice/kiln-agent.service/kiln-control\n")?;
+        assert_eq!(managed_parent(&own, LAYOUT, true)?, "/system.slice/kiln-agent.service");
+        let escaped = unified_path(r"0::/system.slice/kiln\x2dagent.service/kiln-control")?;
+        assert_eq!(escaped, r"/system.slice/kiln\x2dagent.service/kiln-control");
+        assert_eq!(managed_parent(&escaped, LAYOUT, true)?, r"/system.slice/kiln\x2dagent.service");
+        assert!(managed_parent(&own, LAYOUT, false).is_err());
+        assert!(managed_parent(&own, "unknown-v2", true).is_err());
+        for path in ["/", "/kiln-control", "/unit/.control", "/unit/not-control"] {
+            assert!(managed_parent(path, LAYOUT, true).is_err());
         }
-        let made = Path::new(ROOT).join(line.trim().trim_start_matches('/')).join("kiln-agents");
-        let inside = made.starts_with(&job.dir) && made.is_dir();
-        job.release();
-        let kept_while_running = job.dir.is_dir();
-        let _ = child.kill();
-        let _ = child.wait();
-        job.release();
-        let gone = (0..100).any(|_| {
-            std::thread::sleep(Duration::from_millis(30));
-            !job.dir.exists()
-        });
-        prune(&base.dir, 1);
-        anyhow::ensure!(inside, "the step's agents folder {} isn't inside its job's group {}", made.display(), job.dir.display());
-        anyhow::ensure!(kept_while_running, "the job's group went while its step ran");
-        anyhow::ensure!(gone, "the job's group stayed after its step ended");
+        for raw in ["0::/unit/../kiln-control\n", "0::/unit//kiln-control\n", "0::/unit/./kiln-control\n", "0::relative\n", "0::/unit/kiln-control\n0::/other\n"] {
+            assert!(unified_path(raw).is_err());
+        }
+        let declared = dir.path().join("declared-service");
+        fs::create_dir(&declared)?;
+        fs::write(declared.join("cgroup.type"), "domain\n")?;
+        fs::write(declared.join("cgroup.procs"), "123\n")?;
+        fs::write(declared.join("cgroup.controllers"), "cpu memory\n")?;
+        fs::write(declared.join("cgroup.subtree_control"), "")?;
+        assert!(validate_empty_domain(&declared).is_err(), "a populated service root is never repaired by moving processes");
+        fs::write(declared.join("cgroup.procs"), "")?;
+        fs::write(declared.join("cgroup.controllers"), "cpu\n")?;
+        assert!(validate_empty_domain(&declared).is_err(), "requested delegation is insufficient without actual memory availability");
+        fs::write(declared.join("cgroup.controllers"), "cpu memory\n")?;
+        fs::write(declared.join("cgroup.type"), "domain threaded\n")?;
+        assert!(validate_empty_domain(&declared).is_err());
         Ok(())
     }
+
+    use super::*;
 
     #[test]
     fn what_an_agent_starts_stays_in_its_group_however_it_s_parented() -> anyhow::Result<()> {

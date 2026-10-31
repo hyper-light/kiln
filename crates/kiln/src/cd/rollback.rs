@@ -17,7 +17,7 @@ use kiln_cd::rollback::{self, Ask, Decision, Refused, Scope, Setting};
 use kiln_cd::state::{Command, Deployment};
 use serde_json::{Value, json};
 
-use super::Cd;
+use super::{Cd, SourceRefresh};
 use super::ops::Fail;
 
 /// How long a repository's tags are kept before they're read again.
@@ -130,8 +130,8 @@ impl Cd {
         {
             return t.clone();
         }
-        let (dir, auth, u) = (self.mirror_dir(url), self.git_auth(url), url.to_owned());
-        let got = crate::rt::blocking(move || kiln_cd::git::Mirror::open(&dir, &u, auth)?.tags()).await.ok().and_then(Result::ok).unwrap_or_default();
+        let source = self.read_context(url);
+        let got = crate::rt::blocking_in(crate::rt::SHARE_GIT_MIRROR_IO, move || source.open()?.tags()).await.ok().and_then(Result::ok).unwrap_or_default();
         let got = Arc::new(got);
         let mut tags = self.live.tags.lock();
         if tags.len() > 256 {
@@ -142,9 +142,13 @@ impl Cd {
     }
 
     /// The commit a tag names in one of an app's git sources.
-    async fn tag_commit(self: &Arc<Self>, def: &AppDef, name: &str) -> Option<String> {
+    fn tag_commit(&self, sources: &mut SourceRefresh, def: &AppDef, name: &str) -> Option<String> {
         for s in def.sources.iter().filter(|s| s.chart.is_none()) {
-            if let Some((_, c)) = self.tags(&s.repo).await.iter().find(|(n, _)| n == name) {
+            // U08: a mutation's tag choice belongs to this operation's captured reader.
+            // The URL-only UI hint cache cannot select a deployment for another credential.
+            let Ok(mirror) = sources.open_url(self, &s.repo) else { continue };
+            let Ok(tags) = mirror.tags() else { continue };
+            if let Some((_, c)) = tags.iter().find(|(n, _)| n == name) {
                 return Some(c.clone());
             }
         }
@@ -162,22 +166,27 @@ fn refused(r: Refused) -> Fail {
 /// The deployment a rollback of `id` goes to: `to` by its id, `revision` by what it ran (a commit,
 /// a revision as recorded, or a tag of one of the app's git sources), else the one before what
 /// runs. With the tag, when a tag found it.
-pub(super) async fn target(cd: &Arc<Cd>, id: &str, def: &AppDef, history: &VecDeque<Deployment>, to: Option<u64>, revision: Option<&str>) -> Result<(u64, Option<String>), Fail> {
-    let sources = def.sources.len();
+pub(super) async fn target(cd: &Arc<Cd>, mut sources: SourceRefresh, id: &str, def: &AppDef, history: &VecDeque<Deployment>, to: Option<u64>, revision: Option<&str>) -> Result<(SourceRefresh, u64, Option<String>), Fail> {
+    let source_count = def.sources.len();
     let ask = match (to, revision) {
         (Some(_), Some(_)) => return Err((StatusCode::BAD_REQUEST, "name the deployment (`to`) or what it ran (`revision`), not both".into())),
         (Some(n), None) => Ask::Deployment(n),
         (None, Some(r)) => Ask::Revision(r),
         (None, None) => Ask::Previous,
     };
-    match rollback::pick(id, history, ask, sources) {
-        Ok(d) => Ok((d.id, None)),
+    match rollback::pick(id, history, ask, source_count) {
+        Ok(d) => Ok((sources, d.id, None)),
         // Not a commit or revision it ran: a tag, then, of the commit it ran.
         Err(Refused::Missing(why)) if revision.is_some() => {
             let name = revision.unwrap_or_default().trim();
-            let Some(commit) = cd.tag_commit(def, name).await else { return Err((StatusCode::NOT_FOUND, format!("{why}; nor is {name} a tag of its sources"))) };
-            match rollback::pick(id, history, Ask::Revision(&commit), sources) {
-                Ok(d) => Ok((d.id, Some(name.to_owned()))),
+            let (cd2, def2, name2) = (cd.clone(), def.clone(), name.to_owned());
+            let (sources, commit) = crate::rt::blocking_in(crate::rt::SHARE_GIT_MIRROR_IO, move || {
+                let commit = cd2.tag_commit(&mut sources, &def2, &name2);
+                (sources, commit)
+            }).await.map_err(|_| (StatusCode::NOT_FOUND, format!("{why}; nor is {name} a tag of its sources")))?;
+            let Some(commit) = commit else { return Err((StatusCode::NOT_FOUND, format!("{why}; nor is {name} a tag of its sources"))) };
+            match rollback::pick(id, history, Ask::Revision(&commit), source_count) {
+                Ok(d) => Ok((sources, d.id, Some(name.to_owned()))),
                 Err(Refused::Missing(_)) => Err((StatusCode::NOT_FOUND, format!("tag {name} is commit {}, which no deployment of {id} ran: kiln rolls back only to what it deployed", short(&commit)))),
                 Err(r) => Err(refused(r)),
             }

@@ -10,7 +10,7 @@
 //! (the App does that, W14-R10).
 
 use http::StatusCode;
-use rusqlite::{OptionalExtension, params};
+use crate::sql::{OptionalExtension, params};
 use serde_json::{Value, json};
 
 use super::repos::Site;
@@ -111,7 +111,7 @@ type CheckRow = (i64, String, String, String, Option<String>, Option<String>, Op
 
 const CHECK_SELECT: &str = "SELECT id, head_sha, name, status, conclusion, details_url, external_id, output, started_at, completed_at FROM ci_check_runs";
 
-fn check_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<CheckRow> {
+fn check_row(r: &crate::sql::Row<'_>) -> crate::sql::Result<CheckRow> {
     Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?))
 }
 
@@ -238,7 +238,7 @@ type ReleaseRow = (i64, String, String, Option<String>, Option<String>, bool, bo
 
 const RELEASE_SELECT: &str = "SELECT id, tag_name, target_commitish, name, body, draft = 1, prerelease = 1, author, created_at, published_at FROM ci_releases";
 
-fn release_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ReleaseRow> {
+fn release_row(r: &crate::sql::Row<'_>) -> crate::sql::Result<ReleaseRow> {
     Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?))
 }
 
@@ -445,7 +445,7 @@ pub async fn asset_content(s: &Site<'_>, by: AssetBy<'_>) -> Result<Response, Fa
         .hub
         .store
         .call(move |c| {
-            let get = |r: &rusqlite::Row<'_>| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?));
+            let get = |r: &crate::sql::Row<'_>| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?));
             Ok(match (id, tag, name) {
                 (Some(id), _, _) => c.query_row(&format!("{SELECT} AND a.id = ?2"), params![repo, id], get).optional()?,
                 (None, Some(t), Some(n)) => c.query_row(&format!("{SELECT} AND r.tag_name = ?2 AND a.name = ?3"), params![repo, t, n], get).optional()?,
@@ -559,7 +559,7 @@ pub async fn deployments(s: &Site<'_>, id: Option<&str>, q: &std::collections::H
     let f = |k: &str| q.get(k).filter(|v| !v.is_empty()).cloned();
     let (sha, git_ref, task, env) = (f("sha"), f("ref"), f("task"), f("environment"));
     let per_page = q.get("per_page").and_then(|p| p.parse::<i64>().ok()).unwrap_or(30).clamp(1, 100);
-    let rows: Vec<rusqlite::Result<Value>> = {
+    let rows: Vec<crate::sql::Result<Value>> = {
         let raw = s
             .hub
             .store
@@ -588,13 +588,13 @@ pub async fn deployments(s: &Site<'_>, id: Option<&str>, q: &std::collections::H
     }
 }
 
-fn value_of(v: rusqlite::types::ValueRef<'_>) -> Value {
+fn value_of(v: crate::sql::types::ValueRef<'_>) -> Value {
     match v {
-        rusqlite::types::ValueRef::Null => Value::Null,
-        rusqlite::types::ValueRef::Integer(i) => json!(i),
-        rusqlite::types::ValueRef::Real(f) => json!(f),
-        rusqlite::types::ValueRef::Text(t) => json!(String::from_utf8_lossy(t)),
-        rusqlite::types::ValueRef::Blob(_) => Value::Null,
+        crate::sql::types::ValueRef::Null => Value::Null,
+        crate::sql::types::ValueRef::Integer(i) => json!(i),
+        crate::sql::types::ValueRef::Real(f) => json!(f),
+        crate::sql::types::ValueRef::Text(t) => json!(String::from_utf8_lossy(t)),
+        crate::sql::types::ValueRef::Blob(_) => Value::Null,
     }
 }
 
@@ -701,7 +701,7 @@ pub async fn deployment_statuses(s: &Site<'_>, id: &str, body: Option<&Value>) -
     Ok(srv::json(StatusCode::OK, &Value::Array(rows.iter().map(|v| status_value(s, dep, &env, v)).collect())))
 }
 
-fn row_values(r: &rusqlite::Row<'_>) -> Vec<Value> {
+fn row_values(r: &crate::sql::Row<'_>) -> Vec<Value> {
     (0..7).map(|i| r.get_ref(i).map(value_of).unwrap_or(Value::Null)).collect()
 }
 

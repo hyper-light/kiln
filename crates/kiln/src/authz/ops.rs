@@ -3,12 +3,13 @@
 //! trail (`audit.list`). Each is its HTTP route, checked by the route table as the route is and
 //! run by the route's own handler, so an agent does through them exactly what its caller may.
 
+use crate::authz::At as ScopeAt;
 use std::collections::HashMap;
 
 use http::{Method, StatusCode};
 use serde_json::{Value, json};
 
-use crate::ops::{Cx, Input, Op, Out, path, text};
+use crate::ops::{Cx, Input, Op, Out, Reply, path, text, Definition, Part, Routes};
 
 /// Route `segs` of the identity routes, run for the caller, its answer as an operation's.
 async fn identity(cx: &Cx, method: Method, segs: &[String], q: HashMap<String, String>, body: Value) -> Out {
@@ -46,7 +47,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: true,
             destructive: false,
             input: Input::of::<input::UsersList>(),
-            route: |_| Ok((Method::GET, path(&["api", "users"]))),
+            route: Routes(vec![Definition::new("GET", &[Part::Literal("api"), Part::Literal("users")], &[], "users.manage", ScopeAt::Server)]),
             run: |cx, _| Box::pin(async move { identity(&cx, Method::GET, &path(&["api", "users"]), HashMap::new(), Value::Null).await }),
         },
         Op {
@@ -55,7 +56,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: false,
             input: Input::of::<input::UsersAdd>(),
-            route: |_| Ok((Method::POST, path(&["api", "users"]))),
+            route: Routes(vec![Definition::new("POST", &[Part::Literal("api"), Part::Literal("users")], &[], "users.manage", ScopeAt::Server).reply(Reply::Json(201))]),
             run: |cx, v| Box::pin(async move { identity(&cx, Method::POST, &path(&["api", "users"]), HashMap::new(), only(&v, &["name", "grants", "email"])).await }),
         },
         Op {
@@ -64,7 +65,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: true,
             input: Input::of::<input::UsersRemove>(),
-            route: |v| Ok((Method::DELETE, path(&["api", "users", &text(v, "user")?]))),
+            route: Routes(vec![Definition::new("DELETE", &[Part::Literal("api"), Part::Literal("users"), Part::Field("user")], &[], "users.manage", ScopeAt::Server).reply(Reply::Empty)]),
             run: |cx, v| Box::pin(async move { identity(&cx, Method::DELETE, &path(&["api", "users", &text(&v, "user")?]), HashMap::new(), Value::Null).await }),
         },
         Op {
@@ -73,7 +74,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: false,
             input: Input::of::<input::UsersLink>(),
-            route: |v| Ok((Method::POST, path(&["api", "users", &text(v, "user")?, "link"]))),
+            route: Routes(vec![Definition::new("POST", &[Part::Literal("api"), Part::Literal("users"), Part::Field("user"), Part::Literal("link")], &[], "users.manage", ScopeAt::Server)]),
             run: |cx, v| Box::pin(async move { identity(&cx, Method::POST, &path(&["api", "users", &text(&v, "user")?, "link"]), HashMap::new(), json!({})).await }),
         },
         Op {
@@ -82,7 +83,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: false,
             input: Input::of::<input::UsersSignOut>(),
-            route: |v| Ok((Method::POST, path(&["api", "users", &text(v, "user")?, "sign-out"]))),
+            route: Routes(vec![Definition::new("POST", &[Part::Literal("api"), Part::Literal("users"), Part::Field("user"), Part::Literal("sign-out")], &[], "users.manage", ScopeAt::Server).reply(Reply::Empty)]),
             run: |cx, v| Box::pin(async move { identity(&cx, Method::POST, &path(&["api", "users", &text(&v, "user")?, "sign-out"]), HashMap::new(), json!({})).await }),
         },
         Op {
@@ -91,7 +92,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: true,
             destructive: false,
             input: Input::of::<input::GrantsList>(),
-            route: |_| Ok((Method::GET, path(&["api", "grants"]))),
+            route: Routes(vec![Definition::new("GET", &[Part::Literal("api"), Part::Literal("grants")], &[], "users.manage", ScopeAt::Server)]),
             run: |cx, v| Box::pin(async move { identity(&cx, Method::GET, &path(&["api", "grants"]), query(&v, &["user"]), Value::Null).await }),
         },
         Op {
@@ -100,7 +101,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: false,
             input: Input::of::<input::GrantsAdd>(),
-            route: |_| Ok((Method::POST, path(&["api", "grants"]))),
+            route: Routes(vec![Definition::new("POST", &[Part::Literal("api"), Part::Literal("grants")], &[], "users.manage", ScopeAt::Server).reply(Reply::Json(201))]),
             run: |cx, v| Box::pin(async move { identity(&cx, Method::POST, &path(&["api", "grants"]), HashMap::new(), only(&v, &["user", "grant"])).await }),
         },
         Op {
@@ -109,7 +110,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: true,
             input: Input::of::<input::GrantsRemove>(),
-            route: |v| Ok((Method::DELETE, path(&["api", "grants", &text(v, "grant")?]))),
+            route: Routes(vec![Definition::new("DELETE", &[Part::Literal("api"), Part::Literal("grants"), Part::Field("grant")], &[], "users.manage", ScopeAt::Server).reply(Reply::Empty)]),
             run: |cx, v| Box::pin(async move { identity(&cx, Method::DELETE, &path(&["api", "grants", &text(&v, "grant")?]), HashMap::new(), Value::Null).await }),
         },
         Op {
@@ -118,7 +119,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: true,
             destructive: false,
             input: Input::of::<input::RolesList>(),
-            route: |_| Ok((Method::GET, path(&["api", "roles"]))),
+            route: Routes(vec![Definition::new("GET", &[Part::Literal("api"), Part::Literal("roles")], &[], crate::authz::SIGNED_IN, ScopeAt::Server)]),
             run: |cx, _| Box::pin(async move { identity(&cx, Method::GET, &path(&["api", "roles"]), HashMap::new(), Value::Null).await }),
         },
         Op {
@@ -127,7 +128,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: false,
             input: Input::of::<input::RolesSet>(),
-            route: |v| Ok((Method::PUT, path(&["api", "roles", &text(v, "name")?]))),
+            route: Routes(vec![Definition::new("PUT", &[Part::Literal("api"), Part::Literal("roles"), Part::Field("name")], &[], "users.manage", ScopeAt::Server)]),
             run: |cx, v| Box::pin(async move { identity(&cx, Method::PUT, &path(&["api", "roles", &text(&v, "name")?]), HashMap::new(), only(&v, &["capabilities"])).await }),
         },
         Op {
@@ -136,7 +137,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: true,
             input: Input::of::<input::RolesRemove>(),
-            route: |v| Ok((Method::DELETE, path(&["api", "roles", &text(v, "name")?]))),
+            route: Routes(vec![Definition::new("DELETE", &[Part::Literal("api"), Part::Literal("roles"), Part::Field("name")], &[], "users.manage", ScopeAt::Server).reply(Reply::Empty)]),
             run: |cx, v| Box::pin(async move { identity(&cx, Method::DELETE, &path(&["api", "roles", &text(&v, "name")?]), HashMap::new(), Value::Null).await }),
         },
         Op {
@@ -145,7 +146,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: true,
             destructive: false,
             input: Input::of::<input::TokensList>(),
-            route: |_| Ok((Method::GET, path(&["api", "tokens"]))),
+            route: Routes(vec![Definition::new("GET", &[Part::Literal("api"), Part::Literal("tokens")], &[], "tokens.manage", ScopeAt::Own)]),
             run: |cx, _| Box::pin(async move { identity(&cx, Method::GET, &path(&["api", "tokens"]), HashMap::new(), Value::Null).await }),
         },
         Op {
@@ -154,7 +155,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: false,
             input: Input::of::<input::TokensCreate>(),
-            route: |_| Ok((Method::POST, path(&["api", "tokens"]))),
+            route: Routes(vec![Definition::new("POST", &[Part::Literal("api"), Part::Literal("tokens")], &[], "tokens.manage", ScopeAt::Own).reply(Reply::Json(201))]),
             run: |cx, v| {
                 Box::pin(async move { identity(&cx, Method::POST, &path(&["api", "tokens"]), HashMap::new(), only(&v, &["kind", "agent", "user", "grants", "note", "expires_in_days"])).await })
             },
@@ -165,7 +166,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: true,
             input: Input::of::<input::TokensRevoke>(),
-            route: |v| Ok((Method::DELETE, path(&["api", "tokens", &text(v, "token")?]))),
+            route: Routes(vec![Definition::new("DELETE", &[Part::Literal("api"), Part::Literal("tokens"), Part::Field("token")], &[], "tokens.manage", ScopeAt::Own).reply(Reply::Empty)]),
             run: |cx, v| Box::pin(async move { identity(&cx, Method::DELETE, &path(&["api", "tokens", &text(&v, "token")?]), HashMap::new(), Value::Null).await }),
         },
         Op {
@@ -174,7 +175,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: false,
             input: Input::of::<input::TokensRotate>(),
-            route: |v| Ok((Method::POST, path(&["api", "tokens", &text(v, "token")?, "rotate"]))),
+            route: Routes(vec![Definition::new("POST", &[Part::Literal("api"), Part::Literal("tokens"), Part::Field("token"), Part::Literal("rotate")], &[], "tokens.manage", ScopeAt::Own)]),
             run: |cx, v| Box::pin(async move { identity(&cx, Method::POST, &path(&["api", "tokens", &text(&v, "token")?, "rotate"]), HashMap::new(), json!({})).await }),
         },
         Op {
@@ -183,7 +184,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: true,
             destructive: false,
             input: Input::of::<input::AuditList>(),
-            route: |_| Ok((Method::GET, path(&["api", "audit"]))),
+            route: Routes(vec![Definition::new("GET", &[Part::Literal("api"), Part::Literal("audit")], &[], "audit.read", ScopeAt::Server)]),
             run: |cx, v| Box::pin(async move { crate::audit::list(&cx.hub.store, &query(&v, AUDIT)).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))) }),
         },
     ]

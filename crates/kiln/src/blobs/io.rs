@@ -109,19 +109,23 @@ async fn send_parts(b: &dyn Blobs, upload: &str, path: &Path, size: u64) -> Resu
     Ok((parts, hex::encode(sha.finalize())))
 }
 
-/// Bytes `first` to `last` of `key`'s object as a stream of [`PIECE`]s, each got by its range, all
-/// of one version: the one whose etag is `etag` when it's given (the one its reader was told of),
-/// else the one the first piece is of. A piece of another, or a refusal, ends the stream early (the
-/// reader sees fewer bytes than it was promised), with a warning. A read of the whole object is
-/// checked against its SHA-256 (its etag): its last piece goes only once all of it hashes to it, so
-/// damaged bytes end the stream short too.
-pub fn read_stream(b: Arc<dyn Blobs>, key: String, etag: Option<String>, first: u64, last: u64) -> async_channel::Receiver<Bytes> {
+/// Bytes `first` to `last` of `key`'s object as a stream of [`PIECE`]s, all of the
+/// caller's expected `size` and, when supplied, SHA-256 `etag`. A historical recording without
+/// a stored digest pins the first response's etag. Every range must return its exact bytes and
+/// the same key, size and etag. A refusal or mismatch ends the HTTP stream short with a warning.
+/// U03/U14/U19: a whole-object hash is selected by the caller's range and expected size, never
+/// by returned metadata. Its last piece goes only after all bytes hash to the pinned etag.
+pub fn read_stream(b: Arc<dyn Blobs>, key: String, etag: Option<String>, size: u64, first: u64, last: u64) -> async_channel::Receiver<Bytes> {
     let (tx, rx) = async_channel::bounded::<Bytes>(4);
     crate::rt::spawn(async move {
+        if size == 0 { return; }
+        if first > last || last >= size {
+            tracing::warn!(target: "kiln.blobs", event = "get", key = %key, "the requested range exceeds its expected object; the read ends short");
+            return;
+        }
         let mut etag = etag;
         let mut at = first;
-        // The whole object's hash so far, when it's the whole that's read; the piece held back.
-        let mut whole: Option<Sha256> = None;
+        let mut whole = (first == 0 && last.checked_add(1) == Some(size)).then(Sha256::new);
         let mut held: Option<Bytes> = None;
         while at <= last {
             let end = at.saturating_add(PIECE.saturating_sub(1)).min(last);
@@ -132,15 +136,16 @@ pub fn read_stream(b: Arc<dyn Blobs>, key: String, etag: Option<String>, first: 
                     return;
                 }
             };
-            if etag.get_or_insert_with(|| meta.etag.clone()) != &meta.etag {
-                tracing::warn!(target: "kiln.blobs", event = "get", key = %key, "the object changed while it was read; the read ends short");
+            if meta.key != key || meta.size != size || kiln_seams::blobs::check_sha256(&meta.etag).is_err()
+                || etag.get_or_insert_with(|| meta.etag.clone()) != &meta.etag
+            {
+                tracing::warn!(target: "kiln.blobs", event = "get", key = %key, "the object differs from its expected key, size or etag; the read ends short");
                 return;
             }
-            if at == 0 && last.checked_add(1) == Some(meta.size) {
-                whole = Some(Sha256::new());
-            }
             let n = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-            if n == 0 {
+            let wanted = end.saturating_sub(at).saturating_add(1);
+            if n != wanted {
+                tracing::warn!(target: "kiln.blobs", event = "get", key = %key, got = n, wanted, "the object returned another range length; the read ends short");
                 return;
             }
             let bytes = Bytes::from(bytes);
@@ -266,7 +271,7 @@ mod tests {
             let b: Arc<dyn Blobs> = Arc::new(SimBlobs::new(crate::rt::clock(), SimLimits { object: 1 << 30, ..SimLimits::default() }));
             let meta = put_file(b.as_ref(), "big", &path, Some(&sha)).await?;
             assert_eq!((meta.size, meta.etag), (data.len() as u64, sha.clone()));
-            let rx = read_stream(Arc::clone(&b), "big".into(), None, 0, data.len() as u64 - 1);
+            let rx = read_stream(Arc::clone(&b), "big".into(), Some(sha.clone()), data.len() as u64, 0, data.len() as u64 - 1);
             let mut got = Vec::new();
             while let Ok(piece) = rx.recv().await {
                 got.extend_from_slice(&piece);
@@ -274,9 +279,9 @@ mod tests {
             assert!(got == data, "the stream gave {} of {} bytes", got.len(), data.len());
             // Told of one version, a stream gives nothing of another put since.
             b.put("big", b"replaced".to_vec(), Put::default()).await?;
-            let rx = read_stream(Arc::clone(&b), "big".into(), Some(sha.clone()), 0, 7);
+            let rx = read_stream(Arc::clone(&b), "big".into(), Some(sha.clone()), data.len() as u64, 0, 7);
             assert!(rx.recv().await.is_err(), "the version its reader was told of is gone");
-            let rx = read_stream(Arc::clone(&b), "big".into(), Some(crate::util::sha256_hex(b"replaced")), 0, 7);
+            let rx = read_stream(Arc::clone(&b), "big".into(), Some(crate::util::sha256_hex(b"replaced")), 8, 0, 7);
             assert_eq!(rx.recv().await.ok().as_deref(), Some(&b"replaced"[..]));
             let wrong = put_file(b.as_ref(), "wrong", &path, Some(&crate::util::sha256_hex(b"other"))).await;
             assert!(matches!(wrong, Err(Refusal::BadChecksum { .. })), "{wrong:?}");

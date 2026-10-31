@@ -9,7 +9,7 @@ pub mod criteria;
 pub mod ops;
 pub mod stack;
 
-use rusqlite::{OptionalExtension as _, params};
+use crate::sql::{OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 
 pub use criteria::{Criterion, Op, Test};
@@ -646,7 +646,7 @@ fn title_for(body: &str, items: &[Item]) -> String {
 
 const COLUMNS: &str = "p.id, p.title, p.body, p.tags, p.source, p.share, p.version, p.created_at, p.updated_at, (SELECT COUNT(*) FROM plan_runs r WHERE r.plan_id = p.id), p.items, p.phase, (SELECT x.id FROM research x WHERE x.plan_id = p.id ORDER BY x.created_at DESC LIMIT 1)";
 
-fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Plan> {
+fn row(r: &crate::sql::Row<'_>) -> crate::sql::Result<Plan> {
     let tags: String = r.get(3)?;
     let source: Option<String> = r.get(4)?;
     let body: String = r.get(2)?;
@@ -669,7 +669,7 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Plan> {
     })
 }
 
-fn get_in(c: &rusqlite::Connection, id: &str) -> rusqlite::Result<Option<Plan>> {
+fn get_in(c: &crate::sql::Connection, id: &str) -> crate::sql::Result<Option<Plan>> {
     c.query_row(&format!("SELECT {COLUMNS} FROM plans p WHERE p.id = ?1"), params![id], row).optional()
 }
 

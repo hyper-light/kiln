@@ -24,7 +24,7 @@ use http::StatusCode;
 use kiln_cd::journey::{self, Attempt, Author, Build, Check, Journey, Kinds, Land, Leg, Part, Platform, Production, Replant, Review, ReviewState, Runner, RunnerReplant, Staging};
 use kiln_ci::review::{Facts, Kind, Standing};
 use kiln_ci::turn;
-use rusqlite::{OptionalExtension, params};
+use crate::sql::{OptionalExtension, params};
 use serde_json::{Value, json};
 
 use crate::http::server::{self as srv, Response};
@@ -382,7 +382,7 @@ fn mark_json(m: &MarkRec) -> Value {
 }
 
 /// One commit's change, if it is a change's.
-fn load_change(c: &rusqlite::Connection, repo_id: &str, sha: &str) -> anyhow::Result<Option<ChangeRec>> {
+fn load_change(c: &crate::sql::Connection, repo_id: &str, sha: &str) -> anyhow::Result<Option<ChangeRec>> {
     let found: Option<(String, Option<u32>, bool, String)> = c
         .query_row(&format!("SELECT x.diff_id, x.n, x.head, x.host {}", CHANGE_OF.replace("o.repo_id", "?1").replace("o.item", "?2")), params![repo_id, sha], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
         .optional()?;
@@ -560,7 +560,7 @@ fn load_change(c: &rusqlite::Connection, repo_id: &str, sha: &str) -> anyhow::Re
 /// A host's pull request as a change (W26-R01, R20): from the mirror (`githost::mirror`). Its
 /// review state reads its reviews as kiln's would (changes asked by anyone's latest review, else
 /// approved by one), its asked reviewers join its turn when it's first seen.
-fn load_pull(c: &rusqlite::Connection, repo_id: &str, host: &str, number: i64, n: u32, head: bool) -> anyhow::Result<ChangeRec> {
+fn load_pull(c: &crate::sql::Connection, repo_id: &str, host: &str, number: i64, n: u32, head: bool) -> anyhow::Result<ChangeRec> {
     let (title, author, state, reviews, threads, said_by, said, merged, first_seen, requested): (String, String, String, String, i64, String, String, String, i64, String) = c.query_row(
         "SELECT title, author, state, reviews, threads, said_by, said, merged_sha, first_seen, requested FROM host_pulls WHERE repo_id = ?1 AND host = ?2 AND number = ?3",
         params![repo_id, host, number],
@@ -772,7 +772,7 @@ const DEPLOY_COLS: &str = "d.environment, (d.production = 1 OR lower(d.environme
      (SELECT s.description FROM ci_deployment_statuses s WHERE s.deployment_id = d.id ORDER BY s.id DESC LIMIT 1),
      (SELECT s.created_at FROM ci_deployment_statuses s WHERE s.deployment_id = d.id ORDER BY s.id DESC LIMIT 1)";
 
-fn deploy_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<DeployRec> {
+fn deploy_row(r: &crate::sql::Row<'_>) -> crate::sql::Result<DeployRec> {
     Ok(DeployRec {
         environment: r.get(0)?,
         production: r.get(1)?,
@@ -798,7 +798,7 @@ struct RepoCtx {
     cd: Vec<DeployRec>,
 }
 
-fn repo_ctx(c: &rusqlite::Connection, repo: &str, deploys: &[CdDeploy]) -> anyhow::Result<Option<RepoCtx>> {
+fn repo_ctx(c: &crate::sql::Connection, repo: &str, deploys: &[CdDeploy]) -> anyhow::Result<Option<RepoCtx>> {
     let found: Option<(String, String)> = c.query_row("SELECT id, name FROM repos WHERE name = ?1 OR id = ?1", [repo], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
     let Some((id, name)) = found else { return Ok(None) };
     let mut st = c.prepare(&format!(
@@ -832,7 +832,7 @@ fn repo_ctx(c: &rusqlite::Connection, repo: &str, deploys: &[CdDeploy]) -> anyho
 }
 
 /// Reads one commit's records (`sha`: the whole sha, or any unique prefix of seven or more).
-fn load(c: &rusqlite::Connection, repo: &str, sha: &str, deploys: &[CdDeploy]) -> anyhow::Result<Option<Records>> {
+fn load(c: &crate::sql::Connection, repo: &str, sha: &str, deploys: &[CdDeploy]) -> anyhow::Result<Option<Records>> {
     let Some(ctx) = repo_ctx(c, repo, deploys)? else { return Ok(None) };
     let found = ctx.commits.iter().find(|(s, _, _)| s == sha || (sha.len() >= 7 && s.starts_with(sha))).map(|(s, f, _)| (s.clone(), *f));
     match found {
@@ -842,7 +842,7 @@ fn load(c: &rusqlite::Connection, repo: &str, sha: &str, deploys: &[CdDeploy]) -
 }
 
 /// One commit's own records; what it shares with its repository comes from `ctx`.
-fn load_with(c: &rusqlite::Connection, ctx: &RepoCtx, sha: &str, first_row: i64) -> anyhow::Result<Records> {
+fn load_with(c: &crate::sql::Connection, ctx: &RepoCtx, sha: &str, first_row: i64) -> anyhow::Result<Records> {
     let (repo_id, sha) = (ctx.id.clone(), sha.to_string());
     let mut rec = Records { repo: ctx.name.clone(), sha: sha.clone(), first_row, ..Records::default() };
     let mut st = c.prepare("SELECT id, pipeline, branch, message, author, created_at FROM runs WHERE repo_id = ?1 AND sha = ?2 ORDER BY rowid")?;
@@ -1520,7 +1520,7 @@ impl ShipCache {
         let read = store
             .call(move |c| -> anyhow::Result<Read> {
                 // One snapshot: the seq read and every record loaded agree.
-                let tx = c.savepoint()?;
+                let tx = crate::store::tx(c)?;
                 let top: i64 = tx.query_row("SELECT n FROM ship_seq", [], |r| r.get(0))?;
                 let mut want: HashMap<String, (bool, std::collections::HashSet<String>)> = HashMap::new();
                 if !built {
@@ -1903,11 +1903,12 @@ async fn hand_off_in(hub: &std::sync::Arc<Hub>, caller: &crate::authz::Caller, b
     let Some(a) = crate::ci::attach::all(hub).await.into_iter().find(|a| crate::ci::attach::looks_after(a, &t.about)) else {
         return Err((StatusCode::CONFLICT, format!("No agent looks after {repo}: attach one on its page in Repos (an agent woken by failures), and Hand off gives it {at}")));
     };
-    let Some(i) = crate::ci::attach::wake(hub, &a, &t).await else {
+    let request = serde_json::to_string(&(&rec.repo, &rec.sha, &leg.run_id)).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let Some(i) = crate::ci::attach::wake(hub, &a, &t, &request).await.map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, format!("the handoff did not finish; retry the same handoff: {e:#}")))? else {
         return Err((StatusCode::CONFLICT, format!("{} didn't take {at}", a.name)));
     };
     let Some(agent) = i.agent.clone() else {
-        return Err((StatusCode::CONFLICT, format!("{} didn't take {at}: {}", a.name, i.why.unwrap_or_else(|| "its incident waits on a person".to_string()))));
+        return Err((StatusCode::CONFLICT, format!("{} didn't take {at}: {}", a.name, i.why.unwrap_or_else(|| "its agent is still starting".to_string()))));
     };
     keep(hub, &rec, &["checks"], &a.name, Some(&agent), Some(&i.id), None, &caller.name).await?;
     Ok(json!({ "handed": { "to": a.name, "agent": agent, "incident": i.id, "what": ["checks"] } }))
@@ -2731,7 +2732,7 @@ mod tests {
         crate::rt::block_on(async move {
             store
                 .call(|c| {
-                    let tx = c.savepoint()?;
+                    let tx = crate::store::tx(c)?;
                     tx.execute("INSERT INTO repos (id, name, clone_url, created_at) VALUES ('kiln', 'hyper-light/kiln', 'https://example.invalid/kiln.git', 1)", [])?;
                     let mut run = tx.prepare("INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, message, author, status, created_at, attempt) VALUES (?1, 'kiln', ?2, ?3, 'push', 'main', ?4, 'a change', 'ada', 'completed', ?5, 1)")?;
                     let mut leg = tx.prepare("INSERT INTO jobs (id, run_id, key, display, status, conclusion, labels, needs, spec, job_id, run_attempt) VALUES (?1, ?2, ?3, ?3, 'completed', 'success', '[]', '[]', '{}', ?3, 1)")?;

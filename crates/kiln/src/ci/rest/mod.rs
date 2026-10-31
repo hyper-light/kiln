@@ -22,7 +22,7 @@
 use std::sync::Arc;
 
 use http::{Method, StatusCode, header};
-use rusqlite::{OptionalExtension, params};
+use crate::sql::{OptionalExtension, params};
 use serde_json::{Value, json};
 
 use kiln_ci::plan::perms::Level;
@@ -349,7 +349,7 @@ type RunRow = (i64, i64, String, String, String, String, String, String, Option<
 
 const RUN_COLUMNS: &str = "rowid, number, COALESCE(workflow_id, ''), pipeline, event, branch, sha, status, conclusion, COALESCE(attempt, 1), created_at, started_at, finished_at, run_name";
 
-fn run_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
+fn run_row(r: &crate::sql::Row<'_>) -> crate::sql::Result<RunRow> {
     Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?, r.get(12)?, r.get(13)?))
 }
 
@@ -503,7 +503,7 @@ impl Artifact {
 const SELECT: &str = "SELECT a.id, a.name, COALESCE(a.size, 0), a.digest, a.created_at, a.expires_at, a.object IS NULL OR (a.expires_at IS NOT NULL AND a.expires_at <= ?1), r.rowid, r.branch, r.sha
      FROM ci_artifacts a JOIN runs r ON r.id = a.run_id WHERE a.finalized = 1";
 
-fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Artifact> {
+fn row(r: &crate::sql::Row<'_>) -> crate::sql::Result<Artifact> {
     Ok(Artifact { id: r.get(0)?, name: r.get(1)?, size: r.get(2)?, digest: r.get(3)?, created_at: r.get(4)?, expires_at: r.get(5)?, expired: r.get(6)?, run_rowid: r.get(7)?, branch: r.get(8)?, sha: r.get(9)? })
 }
 

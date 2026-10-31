@@ -2,8 +2,9 @@
 //!
 //! The asking side lists its tree ([`scan`]): a git repository's files as git sees them (tracked,
 //! and untracked but not ignored — so `target/` and `node_modules/` stay home) plus `.git` itself,
-//! so git works over there too (a worktree's `.git` becomes a repository of its own: the shared
-//! objects and refs, with the worktree's HEAD and index); any other folder, everything but the
+//! so git works over there too (a worktree becomes a repository of its own, with its HEAD and
+//! index). U08 carries full HEAD/upstream ancestry and refs merged into either, never unrelated
+//! histories, reflogs or physical Git caches; any other folder carries everything but the
 //! usual build output. The other
 //! side keeps a copy per tree and runner (`~/.kiln/reach/<runner>/<key>`), asks for the files whose
 //! size or modification time differ ([`need`]), writes them ([`Mirror::write`]) with the asker's
@@ -20,6 +21,9 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::Context as _;
 
 use super::wire::{Entry, EntryKind};
+
+#[path = "sync_git.rs"]
+mod sync_git;
 
 /// A tree may hold at most this many entries.
 pub const MAX_ENTRIES: usize = 500_000;
@@ -145,6 +149,8 @@ pub struct Tree {
     pub root: PathBuf,
     pub entries: Vec<Entry>,
     sources: HashMap<String, PathBuf>,
+    // U08: generated Git transport lives only as long as the transfer, never a global cache.
+    _git: Option<sync_git::Export>,
 }
 
 impl Tree {
@@ -155,6 +161,7 @@ impl Tree {
 }
 
 /// `git rev-parse <what>` in `root`, as an absolute path.
+#[cfg(test)]
 fn git_path(root: &Path, what: &str) -> Option<PathBuf> {
     let o = std::process::Command::new("git").arg("-C").arg(root).args(["rev-parse", what]).stderr(std::process::Stdio::null()).output().ok().filter(|o| o.status.success())?;
     let p = PathBuf::from(String::from_utf8(o.stdout).ok()?.trim_end_matches(['\n', '\r']));
@@ -162,54 +169,26 @@ fn git_path(root: &Path, what: &str) -> Option<PathBuf> {
     p.is_dir().then_some(p)
 }
 
-/// A worktree's git data as one repository's `.git`: the shared part (objects, refs, config; not
-/// the other worktrees), then the worktree's own (HEAD, index, logs) over it.
-fn worktree_git(root: &Path, out: &mut Vec<Entry>, sources: &mut HashMap<String, PathBuf>) -> anyhow::Result<bool> {
-    let (Some(own), Some(common)) = (git_path(root, "--absolute-git-dir"), git_path(root, "--git-common-dir")) else { return Ok(false) };
-    if own == common {
-        return Ok(false);
-    }
-    let mut layer = |dir: &Path, skip: &dyn Fn(&str) -> bool| -> anyhow::Result<()> {
-        let mut found = Vec::new();
-        walk(dir, Path::new(""), &|p| p == "worktrees", &mut found)?;
-        for mut e in found {
-            if skip(&e.path) {
-                continue;
-            }
-            let src = dir.join(&e.path);
-            e.path = format!(".git/{}", e.path);
-            sources.insert(e.path.clone(), src);
-            out.retain(|x| x.path != e.path);
-            out.push(e);
-        }
-        Ok(())
-    };
-    layer(&common, &|p| p.ends_with(".lock"))?;
-    layer(&own, &|p| matches!(p, "gitdir" | "commondir" | "locked") || p.ends_with(".lock"))?;
-    if let Some(d) = entry(root, Path::new(".git")) {
-        // `.git` is a folder over there.
-        out.retain(|x| x.path != ".git");
-        out.push(Entry { kind: EntryKind::Dir, size: 0, target: None, ..d });
-    }
-    Ok(true)
-}
-
 /// The tree at `root`, as the other side should have it.
 pub fn scan(root: &Path) -> anyhow::Result<Tree> {
     let mut out = Vec::new();
     let mut sources = HashMap::new();
+    let mut exported = None;
     let git = std::process::Command::new("git")
         .arg("-C")
         .arg(root)
-        .args(["ls-files", "-z", "--cached", "--others", "--exclude-standard"])
+        .args(["rev-parse", "--is-inside-work-tree"])
         .stderr(std::process::Stdio::null())
         .output()
         .ok()
         .filter(|o| o.status.success() && root.join(".git").exists());
     match git {
-        Some(o) => {
+        Some(_) => {
+            let export = sync_git::Export::new(root, &mut out, &mut sources)?;
+            let files = export.files(root)?;
+            exported = Some(export);
             let mut dirs: HashSet<String> = HashSet::new();
-            for name in o.stdout.split(|b| *b == 0).filter(|s| !s.is_empty()) {
+            for name in files.split(|b| *b == 0).filter(|s| !s.is_empty()) {
                 let rel = PathBuf::from(String::from_utf8_lossy(name).into_owned());
                 // Listed but deleted (or a submodule's folder): carried as it is on disk, if at all.
                 let Some(en) = entry(root, &rel) else { continue };
@@ -227,22 +206,16 @@ pub fn scan(root: &Path) -> anyhow::Result<Tree> {
                 out.push(en);
                 anyhow::ensure!(out.len() <= MAX_ENTRIES, "{} holds more than {MAX_ENTRIES} files; sync a smaller folder", root.display());
             }
-            // git itself, so `git status`, `git log` and `git diff` work over there.
-            if let Some(d) = entry(root, Path::new(".git")) {
-                if d.kind == EntryKind::Dir {
-                    out.push(d);
-                    walk(root, Path::new(".git"), &|_| false, &mut out)?;
-                } else if !worktree_git(root, &mut out, &mut sources)? {
-                    // A `.git` file git can't resolve (a submodule's elsewhere): carried as is.
-                    out.push(d);
-                }
-            }
+
         }
-        None => walk(root, Path::new(""), &|p| SKIP_DIRS.contains(&p.rsplit('/').next().unwrap_or(p)), &mut out)?,
+        None => {
+            anyhow::ensure!(!root.join(".git").exists(), "Git metadata exists but Git cannot read it; refusing to sync the physical Git cache");
+            walk(root, Path::new(""), &|p| SKIP_DIRS.contains(&p.rsplit('/').next().unwrap_or(p)), &mut out)?;
+        }
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     out.dedup_by(|a, b| a.path == b.path);
-    Ok(Tree { root: root.to_path_buf(), entries: out, sources })
+    Ok(Tree { root: root.to_path_buf(), entries: out, sources, _git: exported })
 }
 
 /// A piece of a file of the tree (read from `source`), for the other side.
@@ -433,6 +406,7 @@ impl Mirror {
             let _ = std::fs::remove_file(tmp);
         }
         let listed: HashSet<&str> = self.plan.iter().map(|e| e.path.as_str()).collect();
+        let kinds: HashMap<&str, EntryKind> = self.plan.iter().map(|e| (e.path.as_str(), e.kind)).collect();
         let sent = self.sent_before();
         // The folders holding something listed or sent before; any other folder was never sent,
         // and isn't even looked into.
@@ -457,7 +431,7 @@ impl Mirror {
         found.sort_by(|a, b| b.path.len().cmp(&a.path.len()).then_with(|| b.path.cmp(&a.path)));
         let mut removed = 0;
         for f in found {
-            if self.plan.iter().any(|e| e.path == f.path && e.kind == f.kind) {
+            if kinds.get(f.path.as_str()) == Some(&f.kind) {
                 continue;
             }
             let relisted = listed.contains(f.path.as_str());
@@ -711,3 +685,7 @@ mod tests {
         assert!(mirror_key("m", Path::new("/x/.hidden")).starts_with("hidden-"));
     }
 }
+
+#[cfg(test)]
+#[path = "sync_git_tests.rs"]
+mod sync_git_tests;

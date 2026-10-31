@@ -410,8 +410,8 @@ async fn list(dir: &Path, n: usize, runs: usize) -> Result<Vec<Measure>> {
                     let repo = ids.get(i % ids.len()).cloned().unwrap_or_default();
                     let (at, number) = (base + i64::try_from(i).unwrap_or(0), i64::try_from(i / ids.len()).unwrap_or(0) + 1);
                     let id = format!("run{i:09}");
-                    run.execute(rusqlite::params![id, repo, number, format!("{i:040x}"), at, at + 60])?;
-                    leg.execute(rusqlite::params![format!("leg{i:09}"), id])?;
+                    run.execute(crate::sql::params![id, repo, number, format!("{i:040x}"), at, at + 60])?;
+                    leg.execute(crate::sql::params![format!("leg{i:09}"), id])?;
                 }
             }
             tx.commit()?;
@@ -555,7 +555,7 @@ async fn restore_http(hub: &Arc<Hub>, obj: &crate::ci::services::cas::Object, ru
         .call(move |c| {
             c.execute(
                 "INSERT INTO ci_caches (repo_id, scope, key, version, object, size, created_at) VALUES ('bench', 'refs/heads/main', 'bench', ?1, ?2, ?3, ?4)",
-                rusqlite::params![crate::util::new_id(), digest, stored, now],
+                crate::sql::params![crate::util::new_id(), digest, stored, now],
             )?;
             Ok(c.last_insert_rowid())
         })

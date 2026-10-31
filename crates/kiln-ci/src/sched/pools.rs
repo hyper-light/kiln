@@ -40,6 +40,8 @@ pub struct Pool {
     pub idle_timeout_ms: i64,
     /// What each executor takes of its host, in resource mode.
     pub request: Resources,
+    /// Exact future host-owned shape; copied into the immutable executor grant at placement.
+    pub shape: Option<ExecutorShape>,
     /// Capabilities its hosts' runners need (their build starts a pool's executors).
     pub caps: u64,
     /// Its executors are the server's, each its own runner (`k8s`'s pods), not a host runner's.
@@ -62,6 +64,9 @@ pub struct PoolSpec {
     pub per_host_max: Option<usize>,
     pub idle_timeout: Option<String>,
     pub resources: Option<ResourceSpec>,
+    /// Required for Firecracker: VMM/startup memory and disk inside `resources`; CPU may be fractional.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub firecracker_overhead: Option<ResourceSpec>,
     /// Kept for matching legs in windows (W05-R12): `{ for, cron, duration, timezone }`.
     pub reserve: Option<super::reserve::ReservationSpec>,
     /// A `k8s` pool's Docker-capable sidecar in each of its pods, for Docker actions (W13-R07).
@@ -242,6 +247,18 @@ impl PoolSpec {
             None => 600.0,
         };
         let request = self.resources.clone().unwrap_or_default().resources().map_err(|e| format!("pool `{name}`: {e}"))?;
+        let shape = match (&*self.executor, &self.firecracker_overhead) {
+            ("firecracker", Some(overhead)) => {
+                if overhead.memory.is_none() || overhead.disk.is_none() {
+                    return Err(format!("pool `{name}`: `firecracker_overhead.memory` and `.disk` must declare VMM/startup capacity inside `resources`"));
+                }
+                let overhead = overhead.resources().map_err(|e| format!("pool `{name}`: `firecracker_overhead`: {e}"))?;
+                Some(ExecutorShape::Firecracker(super::vm::FirecrackerShape::derive(request, overhead).map_err(|e| format!("pool `{name}`: {e}"))?))
+            }
+            ("firecracker", None) => return Err(format!("pool `{name}`: declare `firecracker_overhead` memory and disk inside explicit pool resources; no host-derived VM defaults are permitted")),
+            (_, Some(_)) => return Err(format!("pool `{name}`: `firecracker_overhead` applies only to Firecracker executors")),
+            (_, None) => None,
+        };
         Ok(Pool {
             name: name.to_owned(),
             executor: self.executor.clone(),
@@ -253,6 +270,7 @@ impl PoolSpec {
             per_host_max: self.per_host_max.unwrap_or(max).max(1),
             idle_timeout_ms: (idle * 1000.0) as i64,
             request,
+            shape,
             caps: 0,
             hosted: self.executor == "k8s",
             docker: self.docker.is_some(),
@@ -261,6 +279,17 @@ impl PoolSpec {
 }
 
 impl Pool {
+    /// Capacity new jobs may actually use, after explicit startup overhead. Unknown FC shapes
+    /// cannot authorize a legacy fixed-size VM or jobs consuming the VMM's allowance.
+    pub fn job_capacity(&self) -> Option<Resources> {
+        match (&*self.executor, &self.shape) {
+            ("firecracker", Some(ExecutorShape::Firecracker(shape))) if shape.validate_grant(&self.request).is_ok() => Some(shape.guest_resources()),
+            ("firecracker", _) => None,
+            (_, None) => Some(self.request),
+            _ => None,
+        }
+    }
+
     /// Whether it serves a leg that asks for `labels`: every one is the pool's (`self-hosted`,
     /// which every kiln runner is, aside), and there is one.
     pub fn serves(&self, labels: &[String]) -> bool {
@@ -281,6 +310,99 @@ pub enum ExecState {
     Busy { leg: String },
 }
 
+/// U01: the admitted job container's resources, captured from the authenticated Kubernetes
+/// API and persisted with its existing executor grant. Missing requests are unknown, not an
+/// unlimited allowance. The outer host reservation remains separate (and zero for pods).
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize, Serialize)]
+pub struct PodCapacity {
+    pub resource_version: String,
+    pub cpu_request: Option<f64>,
+    pub cpu_limit: Option<f64>,
+    pub memory_request: Option<u64>,
+    pub memory_limit: Option<u64>,
+    pub ephemeral_storage_request: Option<u64>,
+    pub ephemeral_storage_limit: Option<u64>,
+}
+
+impl PodCapacity {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.resource_version.is_empty() || self.resource_version.len() > 512 || self.resource_version.chars().any(char::is_control)
+            || [self.cpu_request, self.cpu_limit].into_iter().flatten().any(|n| !n.is_finite() || n < 0.0) {
+            return Err("invalid authenticated pod capacity".into());
+        }
+        Ok(())
+    }
+
+    /// Status changes advance resourceVersion without resizing the admitted container.
+    pub fn same_resources(&self, other: &Self) -> bool {
+        self.cpu_request == other.cpu_request && self.cpu_limit == other.cpu_limit
+            && self.memory_request == other.memory_request && self.memory_limit == other.memory_limit
+            && self.ephemeral_storage_request == other.ephemeral_storage_request && self.ephemeral_storage_limit == other.ephemeral_storage_limit
+    }
+
+    fn cpu(&self) -> Option<f64> { self.cpu_request.map(|r| self.cpu_limit.map_or(r, |limit| r.min(limit))) }
+    fn memory(&self) -> Option<u64> { self.memory_request.map(|r| self.memory_limit.map_or(r, |limit| r.min(limit))) }
+
+    pub fn short(&self, q: &Resources) -> Vec<String> {
+        let mut short = Vec::new();
+        let cpu = self.cpu();
+        if !q.cpu.is_finite() || q.cpu < 0.0 { short.push("invalid CPU demand".into()); }
+        else if q.cpu > 0.0 {
+            match cpu {
+                None => short.push("CPU request is unknown in the admitted job container".into()),
+                Some(n) if q.cpu > n => short.push(format!("job container guarantees {n} CPU")),
+                Some(_) => {}
+            }
+        }
+        let mem = self.memory();
+        if q.mem > 0 {
+            match mem {
+                None => short.push("memory request is unknown in the admitted job container".into()),
+                Some(n) if q.mem > n => short.push(format!("job container guarantees {n} memory bytes")),
+                Some(_) => {}
+            }
+        }
+        // Requests are placement guarantees, not a bound on /work or cached volume growth.
+        // GPU devices likewise have no assignment contract in the current pod launcher.
+        if q.disk > 0 { short.push("pod workspace disk growth is unsupported by the current volume configuration".into()); }
+        if q.gpu > 0 { short.push("pod GPU assignment is unsupported by the current launcher".into()); }
+        short
+    }
+
+    pub fn fits(&self, q: &Resources) -> bool {
+        self.validate().is_ok() && q.cpu.is_finite() && q.cpu >= 0.0
+            && (q.cpu == 0.0 || self.cpu().is_some_and(|cpu| q.cpu <= cpu))
+            && (q.mem == 0 || self.memory().is_some_and(|mem| q.mem <= mem))
+            && q.disk == 0 && q.gpu == 0
+    }
+}
+
+/// U01: one backend shape under the existing outer physical grant. Legacy snapshots decode
+/// None; backend-specific admission must not invent capacity from an absent shape.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, Serialize)]
+#[serde(tag = "backend", content = "shape", rename_all = "lowercase")]
+pub enum ExecutorShape {
+    Kubernetes(PodCapacity),
+    Firecracker(super::vm::FirecrackerShape),
+}
+
+impl ExecutorShape {
+    pub fn validate_grant(&self, outer: &Resources) -> Result<(), String> {
+        match self {
+            Self::Kubernetes(capacity) => {
+                capacity.validate()?;
+                if outer != &Resources::default() { return Err("a delegated pod cannot inherit a host physical reservation".into()); }
+                Ok(())
+            }
+            Self::Firecracker(shape) => shape.validate_grant(outer),
+        }
+    }
+
+    pub fn pod(&self) -> Option<&PodCapacity> {
+        match self { Self::Kubernetes(capacity) => Some(capacity), Self::Firecracker(_) => None }
+    }
+}
+
 /// One of a pool's executors.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Executor {
@@ -294,6 +416,8 @@ pub struct Executor {
     /// What it holds of its host, in resource mode.
     #[serde(skip)]
     pub reserved: Resources,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shape: Option<ExecutorShape>,
     /// The leg it was made for (a `k8s` pod with that leg's `container:` and `services:`, W13-R07);
     /// else any of its pool's legs.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -322,12 +446,95 @@ pub struct PoolView {
     pub last_error: Option<(String, String)>,
 }
 
+/// U01: one queued leg per idle grant. Iterative layered augmenting paths find maximum
+/// coverage without recursion or storing a potentially dense resource-fit graph. Each phase
+/// visits each candidate pair at most twice; memory is linear in these active queue/grant
+/// counts. Callers order both sides stably and provide the same fit predicate as assignment.
+pub(super) fn coverage(legs: usize, executors: usize, fits: impl Fn(usize, usize) -> bool) -> Vec<Option<usize>> {
+    let mut matched = vec![None; legs];
+    if legs == 0 || executors == 0 { return matched; }
+    let mut owner: Vec<Option<usize>> = vec![None; executors];
+    let mut count = 0;
+    loop {
+        let mut distance = vec![usize::MAX; legs];
+        let mut pending = Vec::new();
+        for (leg, _) in matched.iter().enumerate().filter(|(_, assigned)| assigned.is_none()) {
+            if let Some(d) = distance.get_mut(leg) { *d = 0; }
+            pending.push(leg);
+        }
+        let (mut cursor, mut depth) = (0, None);
+        'breadth: while let Some(&leg) = pending.get(cursor) {
+            cursor += 1;
+            let d = distance.get(leg).copied().unwrap_or(usize::MAX);
+            for (executor, assigned) in owner.iter().enumerate() {
+                if !fits(leg, executor) { continue; }
+                match assigned {
+                    None => { depth = Some(d); break 'breadth; }
+                    Some(next) if distance.get(*next) == Some(&usize::MAX) => {
+                        if let Some(next_d) = distance.get_mut(*next) { *next_d = d.saturating_add(1); }
+                        pending.push(*next);
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+        let Some(depth) = depth else { break };
+        let mut next = vec![0; legs];
+        let mut progress = false;
+        for first in 0..legs {
+            if matched.get(first).is_none_or(Option::is_some) || distance.get(first) != Some(&0) { continue; }
+            let mut leg = first;
+            let mut path = Vec::new();
+            'search: loop {
+                let d = distance.get(leg).copied().unwrap_or(usize::MAX);
+                let mut descended = false;
+                while let Some(executor) = next.get(leg).copied().filter(|e| *e < executors) {
+                    if let Some(next) = next.get_mut(leg) { *next = executor + 1; }
+                    if !fits(leg, executor) { continue; }
+                    match owner.get(executor).copied().flatten() {
+                        None if d == depth => {
+                            if let Some(m) = matched.get_mut(leg) { *m = Some(executor); }
+                            if let Some(m) = owner.get_mut(executor) { *m = Some(leg); }
+                            while let Some((parent, executor)) = path.pop() {
+                                if let Some(m) = matched.get_mut(parent) { *m = Some(executor); }
+                                if let Some(m) = owner.get_mut(executor) { *m = Some(parent); }
+                            }
+                            count += 1;
+                            if count == executors { return matched; }
+                            progress = true;
+                            break 'search;
+                        }
+                        Some(child) if d < depth && distance.get(child) == Some(&d.saturating_add(1)) => {
+                            path.push((leg, executor));
+                            leg = child;
+                            descended = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                if descended { continue; }
+                if let Some(d) = distance.get_mut(leg) { *d = usize::MAX; }
+                let Some((parent, _)) = path.pop() else { break };
+                leg = parent;
+            }
+        }
+        if !progress { break; }
+    }
+    matched
+}
+
 /// How many more executors a pool should start: enough that its idle and starting ones cover the
 /// legs waiting for it and `min_idle`, within `max`.
 pub fn wanted(pool: &Pool, starting: usize, idle: usize, busy: usize, waiting: usize) -> usize {
+    wanted_for(pool, starting, idle, busy, waiting, idle)
+}
+
+/// U01: unfit idle grants still occupy max/min_idle, but cannot cover queued demand.
+pub(super) fn wanted_for(pool: &Pool, starting: usize, idle: usize, busy: usize, waiting: usize, usable_idle: usize) -> usize {
     let spare = starting + idle;
     let total = spare + busy;
-    let need = waiting.max(pool.min_idle).saturating_sub(spare);
+    let need = waiting.saturating_sub(starting + usable_idle.min(idle)).max(pool.min_idle.saturating_sub(spare));
     need.min(pool.max.saturating_sub(total))
 }
 

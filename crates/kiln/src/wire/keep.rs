@@ -86,7 +86,11 @@ pub struct Kept {
     pub pending: Vec<(Seq, Vec<u8>)>,
 }
 
-/// What a sender kept of its streams to `peer` (`Sender::restore` picks each up).
+/// What a sender kept of its streams to a peer (Sender::restore picks each up).
+/// These are opaque original bytes, not a codec migration. A caller must establish the
+/// writer's protocol layout before replay; unknown experimental layouts must be refused,
+/// preserving their bytes. Current runner completion journals are process-local, and the
+/// retained-event spool stores JSON receipts which are encoded afresh when sent.
 pub async fn load_out(r: &dyn Records, peer: &str) -> Result<Vec<Kept>, Refusal> {
     let mut prefix = part(peer, "a peer's name")?.to_vec();
     prefix.push(0);

@@ -10,18 +10,18 @@
 //!   config count as server scope, below stored ones.
 //! - **Uses (W09-R04).** Every delivery to a leg is recorded.
 //! - **Variables (W09-R09).** The same scopes, in plain text.
-//! - **Rotation.** [`rotate`] re-seals every value under a new data key.
+//! - **U09.** Values, versions, read history and rotation use `secrets::kiln`; CI retains only
+//!   scope/broker/delivery metadata. Legacy ciphertext is imported before its first use.
+//! - **Rotation.** [`rotate`] re-seals CI and deployment values under one new data key.
 
-use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::collections::BTreeMap;
 
-use aws_lc_rs::aead::{AES_256_GCM, Aad, LessSafeKey, NONCE_LEN, Nonce, UnboundKey};
-use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 use kiln_ci::secrets::{self as rules, ScopeKind, Used};
-use rusqlite::{OptionalExtension, params};
+use crate::sql::{OptionalExtension, params};
 
 use crate::hub::Hub;
 use crate::store::Repo;
+use crate::secrets::kiln as values;
 
 /// A scope, as stored: its kind and id (`""`, an owner, a repository id, `<repo id>:<path>` or
 /// `<repo id>:<environment>`).
@@ -32,6 +32,11 @@ pub struct Scope {
 }
 
 impl Scope {
+    pub(crate) fn key(&self) -> String {
+        format!("ci/{}/{}", self.kind.as_str(), self.id)
+    }
+
+    #[cfg(test)]
     fn aad(&self, name: &str) -> Vec<u8> {
         format!("kiln secret\0{}\0{}\0{name}", self.kind.as_str(), self.id).into_bytes()
     }
@@ -83,121 +88,12 @@ fn scopes_for(repo: &Repo, workflow: &str, environment: Option<&str>) -> Vec<Sco
 
 // ------------------------------------------------------------------ keys
 
-fn master_path(hub: &Hub) -> PathBuf {
-    hub.cfg.data("secrets").join("master.key")
-}
-
-fn random<const N: usize>() -> anyhow::Result<[u8; N]> {
-    let mut b = [0u8; N];
-    SystemRandom::new().fill(&mut b).map_err(|_| anyhow::anyhow!("the system's random source failed"))?;
-    Ok(b)
-}
-
-/// The master key, made at first use.
-fn master(hub: &Hub) -> anyhow::Result<[u8; 32]> {
-    master_at(&master_path(hub))
-}
-
-fn master_at(p: &std::path::Path) -> anyhow::Result<[u8; 32]> {
-    match std::fs::read(p) {
-        Ok(b) if b.len() == 32 => {
-            let mut k = [0u8; 32];
-            k.copy_from_slice(&b);
-            Ok(k)
-        }
-        Ok(_) => anyhow::bail!("{} is not a 32-byte key", p.display()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let k: [u8; 32] = random()?;
-            crate::util::write_secret(p, &k, 0o600)?;
-            Ok(k)
-        }
-        Err(e) => Err(e.into()),
-    }
-}
-
-/// A key of its own for `label`, from the master key: one kiln checks with and never stores (an
-/// inbound webhook's secret, W03-R02).
-pub(crate) fn derived(hub: &Hub, label: &str) -> anyhow::Result<String> {
-    Ok(crate::util::hmac_hex(&master(hub)?, label.as_bytes()))
-}
-
-fn key(bytes: &[u8; 32]) -> anyhow::Result<LessSafeKey> {
-    Ok(LessSafeKey::new(UnboundKey::new(&AES_256_GCM, bytes).map_err(|_| anyhow::anyhow!("bad key"))?))
-}
-
-/// Seals `plain` under `k`, bound to `aad`: `(ciphertext with tag, nonce)`.
-fn seal(k: &[u8; 32], plain: &[u8], aad: &[u8]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
-    let nonce: [u8; NONCE_LEN] = random()?;
-    let mut buf = plain.to_vec();
-    key(k)?.seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce), Aad::from(aad), &mut buf).map_err(|_| anyhow::anyhow!("sealing failed"))?;
-    Ok((buf, nonce.to_vec()))
-}
-
-fn open(k: &[u8; 32], sealed: &[u8], nonce: &[u8], aad: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let n: [u8; NONCE_LEN] = nonce.try_into().map_err(|_| anyhow::anyhow!("bad nonce"))?;
-    let mut buf = sealed.to_vec();
-    let plain = key(k)?.open_in_place(Nonce::assume_unique_for_key(n), Aad::from(aad), &mut buf).map_err(|_| anyhow::anyhow!("a secret doesn't decrypt: the master key or the database changed"))?;
-    Ok(plain.to_vec())
-}
-
-/// Seals `plain` under the master key, bound to `aad` (keys of other subsystems: OIDC, W10).
-pub(crate) fn seal_master(hub: &Hub, plain: &[u8], aad: &[u8]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
-    seal(&master(hub)?, plain, aad)
-}
-
-pub(crate) fn open_master(hub: &Hub, sealed: &[u8], nonce: &[u8], aad: &[u8]) -> anyhow::Result<Vec<u8>> {
-    open(&master(hub)?, sealed, nonce, aad)
-}
-
-/// Seals `plain` under the master key at `master` (`<data>/secrets/master.key`), bound to `aad`:
-/// for subsystems without the hub (observe's cloud credentials).
-pub(crate) fn seal_with(master: &std::path::Path, plain: &[u8], aad: &[u8]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
-    seal(&master_at(master)?, plain, aad)
-}
-
-pub(crate) fn open_with(master: &std::path::Path, sealed: &[u8], nonce: &[u8], aad: &[u8]) -> anyhow::Result<Vec<u8>> {
-    open(&master_at(master)?, sealed, nonce, aad)
-}
-
-/// The current data key: `(id, key)`, made (and wrapped) when there is none.
-async fn current_key(hub: &Hub) -> anyhow::Result<(String, [u8; 32])> {
-    let m = master(hub)?;
-    hub.store
-        .call(move |c| {
-            let row: Option<(String, Vec<u8>, Vec<u8>)> = c.query_row("SELECT id, wrapped, nonce FROM ci_keys WHERE retired_at IS NULL ORDER BY created_at DESC LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
-            if let Some((id, wrapped, nonce)) = row {
-                return Ok((id.clone(), unwrap_key(&m, &wrapped, &nonce, &id)?));
-            }
-            let (id, fresh) = new_key(c, &m)?;
-            Ok((id, fresh))
-        })
-        .await
-}
-
-fn new_key(c: &rusqlite::Connection, m: &[u8; 32]) -> anyhow::Result<(String, [u8; 32])> {
-    let id = crate::util::new_id();
-    let fresh: [u8; 32] = random()?;
-    let (wrapped, nonce) = seal(m, &fresh, format!("kiln data key\0{id}").as_bytes())?;
-    c.execute("INSERT INTO ci_keys (id, wrapped, nonce, created_at) VALUES (?1, ?2, ?3, ?4)", params![id, wrapped, nonce, crate::util::now_unix()])?;
-    Ok((id, fresh))
-}
-
-fn unwrap_key(m: &[u8; 32], wrapped: &[u8], nonce: &[u8], id: &str) -> anyhow::Result<[u8; 32]> {
-    let raw = open(m, wrapped, nonce, format!("kiln data key\0{id}").as_bytes())?;
-    raw.try_into().map_err(|_| anyhow::anyhow!("a data key is not 32 bytes"))
-}
-
-/// Every data key, unwrapped, by id.
-fn all_keys(c: &rusqlite::Connection, m: &[u8; 32]) -> anyhow::Result<HashMap<String, [u8; 32]>> {
-    let mut q = c.prepare("SELECT id, wrapped, nonce FROM ci_keys")?;
-    let rows = q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, Vec<u8>>(2)?)))?;
-    let mut out = HashMap::new();
-    for row in rows {
-        let (id, w, n) = row?;
-        out.insert(id.clone(), unwrap_key(m, &w, &n, &id)?);
-    }
-    Ok(out)
-}
+pub(crate) use crate::secrets::crypto::{derived, open_master, seal_master};
+use crate::secrets::crypto::master;
+#[cfg(test)]
+use crate::secrets::crypto::{open, seal};
+#[cfg(test)]
+use crate::secrets::crypto::random;
 
 // ------------------------------------------------------------------ secrets
 
@@ -225,21 +121,25 @@ async fn store_row(hub: &Hub, scope: &Scope, name: &str, value: &str, from: Opti
     if value.len() > rules::MAX_SECRET {
         return Err(format!("a secret is at most {} KiB", rules::MAX_SECRET >> 10));
     }
-    let (key_id, k) = current_key(hub).await.map_err(|e| format!("{e:#}"))?;
-    let (sealed, nonce) = seal(&k, value.as_bytes(), &scope.aad(&name)).map_err(|e| format!("{e:#}"))?;
+    let master = master(hub).map_err(|e| format!("{e:#}"))?;
+    let value = crate::secrets::Value::new(value.as_bytes().to_vec());
     let (s, by, size) = (scope.clone(), by.to_owned(), i64::try_from(value.len()).unwrap_or(0));
     hub.store
         .call(move |c| {
-            let n: i64 = c.query_row("SELECT COUNT(*) FROM ci_secrets WHERE scope_kind = ?1 AND scope_id = ?2 AND name != ?3", params![s.kind.as_str(), s.id, name], |r| r.get(0))?;
+            values::import_ci(&master, c)?;
+            let tx = crate::store::tx(c)?;
+            let n: i64 = tx.query_row("SELECT COUNT(*) FROM ci_secrets WHERE scope_kind = ?1 AND scope_id = ?2 AND name != ?3", params![s.kind.as_str(), s.id, name], |r| r.get(0))?;
             if usize::try_from(n).unwrap_or(usize::MAX) >= rules::MAX_PER_SCOPE {
                 anyhow::bail!("a scope holds at most {} secrets", rules::MAX_PER_SCOPE);
             }
             let now = crate::util::now_unix();
-            c.execute(
-                "INSERT INTO ci_secrets (id, scope_kind, scope_id, name, ciphertext, nonce, key_id, size, created_by, created_at, updated_at, broker) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11)
-                 ON CONFLICT (scope_kind, scope_id, name) DO UPDATE SET ciphertext = excluded.ciphertext, nonce = excluded.nonce, key_id = excluded.key_id, size = excluded.size, updated_at = excluded.updated_at, broker = excluded.broker",
-                params![crate::util::new_id(), s.kind.as_str(), s.id, name, sealed, nonce, key_id, size, by, now, from],
+            values::put_value(&master, &tx, &s.key(), &name, value, &by, from.as_deref())?;
+            tx.execute(
+                "INSERT INTO ci_secrets (id, scope_kind, scope_id, name, size, created_by, created_at, updated_at, broker) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8)
+                 ON CONFLICT (scope_kind, scope_id, name) DO UPDATE SET size = excluded.size, updated_at = excluded.updated_at, broker = excluded.broker",
+                params![crate::util::new_id(), s.kind.as_str(), s.id, name, size, by, now, from],
             )?;
+            tx.commit()?;
             Ok(())
         })
         .await
@@ -253,8 +153,17 @@ pub async fn set_brokered(hub: &Hub, scope: &Scope, name: &str, from: &str, by: 
 }
 
 pub async fn delete(hub: &Hub, scope: &Scope, name: &str) -> anyhow::Result<bool> {
-    let (s, name) = (scope.clone(), name.to_ascii_uppercase());
-    hub.store.call(move |c| Ok(c.execute("DELETE FROM ci_secrets WHERE scope_kind = ?1 AND scope_id = ?2 AND name = ?3", params![s.kind.as_str(), s.id, name])? > 0)).await
+    let (s, name, master) = (scope.clone(), name.to_ascii_uppercase(), master(hub)?);
+    hub.store.call(move |c| {
+        values::import_ci(&master, c)?;
+        let tx = crate::store::tx(c)?;
+        let changed = tx.execute("DELETE FROM ci_secrets WHERE scope_kind = ?1 AND scope_id = ?2 AND name = ?3", params![s.kind.as_str(), s.id, name])? > 0;
+        if changed {
+            values::delete_value(&tx, &s.key(), &name, "admin")?;
+        }
+        tx.commit()?;
+        Ok(changed)
+    }).await
 }
 
 pub async fn list(hub: &Hub, scope: &Scope) -> anyhow::Result<Vec<Meta>> {
@@ -271,28 +180,30 @@ pub async fn list(hub: &Hub, scope: &Scope) -> anyhow::Result<Vec<Meta>> {
 /// One secret's value, decrypted, for the server's own use: an integration's credential (W11),
 /// which lives in [`ScopeKind::Integration`] and is never resolved for a leg.
 pub(crate) async fn reveal(hub: &Hub, scope: &Scope, name: &str) -> anyhow::Result<Option<String>> {
-    let (s, name) = (scope.clone(), name.to_ascii_uppercase());
-    let m = master(hub)?;
-    hub.store
-        .call(move |c| {
-            let row: Option<(Vec<u8>, Vec<u8>, String)> = c
-                .query_row("SELECT ciphertext, nonce, key_id FROM ci_secrets WHERE scope_kind = ?1 AND scope_id = ?2 AND name = ?3", params![s.kind.as_str(), s.id, name], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-                .optional()?;
-            let Some((sealed, nonce, key_id)) = row else { return Ok(None) };
-            let keys = all_keys(c, &m)?;
-            let k = keys.get(&key_id).ok_or_else(|| anyhow::anyhow!("secret {name}: its data key is gone"))?;
-            let plain = open(k, &sealed, &nonce, &s.aad(&name))?;
-            Ok(Some(String::from_utf8_lossy(&plain).into_owned()))
-        })
-        .await
+    let (s, name, master) = (scope.clone(), name.to_ascii_uppercase(), master(hub)?);
+    hub.store.call(move |c| {
+        values::import_ci(&master, c)?;
+        let exists: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM ci_secrets WHERE scope_kind = ?1 AND scope_id = ?2 AND name = ?3)", params![s.kind.as_str(), s.id, name], |r| r.get(0))?;
+        if !exists { return Ok(None) }
+        let version = values::latest(c, &s.key(), &name)?.ok_or_else(|| anyhow::anyhow!("secret version is missing"))?;
+        let plain = values::read_value(&master, c, &s.key(), &name, version)?;
+        values::record_read(c, &s.key(), "integration", "credential broker", &format!("{name}@{version}"))?;
+        Ok(Some(String::from_utf8_lossy(plain.bytes()).into_owned()))
+    }).await
 }
 
 /// A resolved secret: its value, and its row (`None` for the config's).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Resolved {
     pub value: String,
     pub id: Option<String>,
     pub scope: ScopeKind,
+}
+
+impl std::fmt::Debug for Resolved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Resolved").field("value", &"<redacted>").field("id", &self.id).field("scope", &self.scope).finish()
+    }
 }
 
 /// The secrets a leg of `repo`'s `workflow` (bound to `environment`) may draw on, resolved by
@@ -302,20 +213,21 @@ pub struct Resolved {
 pub async fn for_leg(hub: &Hub, repo: &Repo, workflow: &str, environment: Option<&str>, wanted: &Used, w: &kiln_ci::oidc::Workload<'_>) -> anyhow::Result<(BTreeMap<String, Resolved>, Vec<(String, String)>)> {
     let scopes = scopes_for(repo, workflow, environment);
     let wanted = wanted.clone();
-    let m = master(hub)?;
+    let master = master(hub)?;
     let (all, names) = (wanted.all, wanted.names.clone());
+    let (by, purpose) = (w.actor.to_owned(), format!("CI resolution {} {workflow}", repo.name));
     let (mut stored, brokered): (BTreeMap<String, Resolved>, Vec<(String, String, String, ScopeKind)>) = hub
         .store
         .call(move |c| {
-            let keys = all_keys(c, &m)?;
+            values::import_ci(&master, c)?;
             let mut out: BTreeMap<String, Resolved> = BTreeMap::new();
             let mut brokered: Vec<(String, String, String, ScopeKind)> = Vec::new();
             // From the least specific up, so the most specific wins.
             for s in scopes.iter().rev() {
-                let mut q = c.prepare("SELECT id, name, ciphertext, nonce, key_id, broker FROM ci_secrets WHERE scope_kind = ?1 AND scope_id = ?2")?;
-                let rows = q.query_map(params![s.kind.as_str(), s.id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Vec<u8>>(2)?, r.get::<_, Vec<u8>>(3)?, r.get::<_, String>(4)?, r.get::<_, Option<String>>(5)?)))?;
+                let mut q = c.prepare("SELECT id, name, broker FROM ci_secrets WHERE scope_kind = ?1 AND scope_id = ?2")?;
+                let rows = q.query_map(params![s.kind.as_str(), s.id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?)))?;
                 for row in rows {
-                    let (id, name, sealed, nonce, key_id, broker) = row?;
+                    let (id, name, broker) = row?;
                     if !all && !names.contains(&name) {
                         continue;
                     }
@@ -327,9 +239,10 @@ pub async fn for_leg(hub: &Hub, repo: &Repo, workflow: &str, environment: Option
                         continue;
                     }
                     brokered.retain(|b| b.0 != name);
-                    let k = keys.get(&key_id).ok_or_else(|| anyhow::anyhow!("secret {name}: its data key is gone"))?;
-                    let plain = open(k, &sealed, &nonce, &s.aad(&name))?;
-                    out.insert(name, Resolved { value: String::from_utf8_lossy(&plain).into_owned(), id: Some(id), scope: s.kind });
+                    let version = values::latest(c, &s.key(), &name)?.ok_or_else(|| anyhow::anyhow!("secret version is missing"))?;
+                    let plain = values::read_value(&master, c, &s.key(), &name, version)?;
+                    values::record_read(c, &s.key(), &by, &purpose, &format!("{name}@{version}"))?;
+                    out.insert(name, Resolved { value: String::from_utf8_lossy(plain.bytes()).into_owned(), id: Some(id), scope: s.kind });
                 }
             }
             Ok((out, brokered))
@@ -432,30 +345,8 @@ pub async fn record_uses(hub: &Hub, leg: &str, ids: Vec<String>) -> anyhow::Resu
 
 /// Re-seals every secret under a new data key and retires the old ones: how many moved.
 pub async fn rotate(hub: &Hub) -> anyhow::Result<usize> {
-    let m = master(hub)?;
-    hub.store
-        .call(move |c| {
-            let tx = crate::store::tx(c)?;
-            let keys = all_keys(&tx, &m)?;
-            let (new_id, fresh) = new_key(&tx, &m)?;
-            let rows: Vec<(String, String, String, String, Vec<u8>, Vec<u8>, String)> = {
-                let mut q = tx.prepare("SELECT id, scope_kind, scope_id, name, ciphertext, nonce, key_id FROM ci_secrets")?;
-                let r = q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?;
-                r.collect::<Result<Vec<_>, _>>()?
-            };
-            for (id, kind, scope_id, name, sealed, nonce, key_id) in &rows {
-                let s = Scope { kind: ScopeKind::parse(kind).unwrap_or(ScopeKind::Server), id: scope_id.clone() };
-                let k = keys.get(key_id).ok_or_else(|| anyhow::anyhow!("secret {name}: its data key is gone"))?;
-                let plain = open(k, sealed, nonce, &s.aad(name))?;
-                let (resealed, n) = seal(&fresh, &plain, &s.aad(name))?;
-                tx.execute("UPDATE ci_secrets SET ciphertext = ?2, nonce = ?3, key_id = ?4 WHERE id = ?1", params![id, resealed, n, new_id])?;
-            }
-            tx.execute("UPDATE ci_keys SET retired_at = ?2 WHERE id != ?1 AND retired_at IS NULL", params![new_id, crate::util::now_unix()])?;
-            tx.execute("DELETE FROM ci_keys WHERE retired_at IS NOT NULL AND id NOT IN (SELECT key_id FROM ci_secrets)", [])?;
-            tx.commit()?;
-            Ok(rows.len())
-        })
-        .await
+    let master = master(hub)?;
+    hub.store.call(move |c| values::rotate_values(&master, c)).await
 }
 
 // ------------------------------------------------------------------ variables
@@ -622,6 +513,80 @@ pub async fn route(hub: &Hub, method: &http::Method, rest: &[&str], q: &std::col
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// U09: imported CI/integration ciphertext and app pins share one rotation owner.
+    #[test]
+    fn u09_import_scope_versions_rotation_and_redaction() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let scope = Scope { kind: ScopeKind::Integration, id: "broker-one".into() };
+            let master = master(&hub)?;
+            let old: [u8; 32] = random()?;
+            let (wrapped, key_nonce) = seal(&master, &old, b"kiln data key\0legacy")?;
+            let (sealed, nonce) = seal(&old, b"legacy-credential", b"kiln secret\0integration\0broker-one\0TOKEN")?;
+            hub.store.call(move |c| {
+                c.execute("INSERT INTO ci_keys (id, wrapped, nonce, created_at) VALUES ('legacy', ?1, ?2, 1)", params![wrapped, key_nonce])?;
+                c.execute("INSERT INTO ci_secrets (id, scope_kind, scope_id, name, ciphertext, nonce, key_id, size, created_by, created_at, updated_at) VALUES ('old', 'integration', 'broker-one', 'TOKEN', ?1, ?2, 'legacy', 17, 'ada', 1, 1)", params![sealed, vec![0u8]])?;
+                Ok(())
+            }).await?;
+            anyhow::ensure!(reveal(&hub, &scope, "TOKEN").await.is_err(), "corrupt import is refused");
+            hub.store.call(move |c| {
+                let copied: i64 = c.query_row("SELECT COUNT(*) FROM secret_versions", [], |r| r.get(0))?;
+                anyhow::ensure!(copied == 0, "failed import keeps no partial replacement");
+                c.execute("UPDATE ci_secrets SET nonce = ?1 WHERE id = 'old'", [nonce])?;
+                Ok(())
+            }).await?;
+            anyhow::ensure!(reveal(&hub, &scope, "TOKEN").await?.as_deref() == Some("legacy-credential"));
+            // Repeated reads do not import another version, and scopes cannot exchange values.
+            anyhow::ensure!(reveal(&hub, &scope, "TOKEN").await?.is_some());
+            let other = Scope { kind: ScopeKind::Integration, id: "other-broker".into() };
+            anyhow::ensure!(reveal(&hub, &other, "TOKEN").await?.is_none());
+            set(&hub, &scope, "TOKEN", "replacement-credential", "ada").await.map_err(anyhow::Error::msg)?;
+            let app = crate::secrets::Scope::of("web", "staging");
+            let service = crate::secrets::of(&hub);
+            let ada = crate::secrets::Caller { name: "ada".into(), agent: false };
+            service.put(&app, "TOKEN", crate::secrets::Value::new(b"app-credential".to_vec()), &ada).await?;
+            anyhow::ensure!(rotate(&hub).await? == 3, "both CI versions and the pinned app version rotate");
+            let scope_key = scope.key();
+            hub.store.call(move |c| {
+                let count: i64 = c.query_row("SELECT COUNT(*) FROM secret_versions WHERE scope = ?1", [&scope_key], |r| r.get(0))?;
+                anyhow::ensure!(count == 2, "one import, one update");
+                let keys: i64 = c.query_row("SELECT COUNT(*) FROM secret_keys", [], |r| r.get(0))?;
+                let legacy: i64 = c.query_row("SELECT COUNT(*) FROM ci_keys", [], |r| r.get(0))?;
+                let copies: i64 = c.query_row("SELECT COUNT(*) FROM ci_secrets WHERE ciphertext IS NOT NULL", [], |r| r.get(0))?;
+                anyhow::ensure!(keys == 1 && legacy == 0 && copies == 0, "only canonical encryption remains");
+                anyhow::ensure!(values::read_value(&master, c, &scope_key, "TOKEN", 1)?.bytes() == b"legacy-credential");
+                Ok(())
+            }).await?;
+            let why = crate::secrets::Use { by: "kilncd".into(), purpose: "pinned release".into() };
+            let pins = [("TOKEN".to_owned(), 1)];
+            let bundle = service.resolve(&app, &pins, &why).await?;
+            anyhow::ensure!(bundle.items.first().is_some_and(|(_, _, v)| v.bytes() == b"app-credential"));
+            anyhow::ensure!(!format!("{bundle:?}").contains("app-credential"));
+            let resolved = Resolved { value: "replacement-credential".into(), id: None, scope: ScopeKind::Server };
+            anyhow::ensure!(!format!("{resolved:?}").contains("replacement-credential"));
+            anyhow::ensure!(!serde_json::to_string(&list(&hub, &scope).await?)?.contains("credential"));
+            let repo = Repo { id: "repo-one".into(), name: "ada/web".into(), clone_url: String::new(), branches: vec![], poll_seconds: 0, enabled: true, created_at: 1, last_polled_at: None, last_error: None, mode: "native".into(), default_branch: None, mirror: None };
+            let w = kiln_ci::oidc::Workload { repository: "ada/web", environment: Some("prod"), git_ref: None, sha: None, actor: "ada", source: "job", app: None, deployment: None, trigger: None };
+            let server = Scope { kind: ScopeKind::Server, id: String::new() };
+            let env = Scope { kind: ScopeKind::Environment, id: "repo-one:prod".into() };
+            set(&hub, &server, "CHOICE", "server-value", "ada").await.map_err(anyhow::Error::msg)?;
+            set(&hub, &server, "UNREQUESTED", "never-delivered", "ada").await.map_err(anyhow::Error::msg)?;
+            set(&hub, &env, "CHOICE", "environment-value", "ada").await.map_err(anyhow::Error::msg)?;
+            let wanted = Used { names: ["CHOICE".to_owned()].into(), all: false };
+            let (delivered, failed) = for_leg(&hub, &repo, "build.yml", Some("prod"), &wanted, &w).await?;
+            anyhow::ensure!(failed.is_empty() && delivered.len() == 1 && delivered.get("CHOICE").is_some_and(|r| r.value == "environment-value"));
+            // A broker refusal never returns a lower scope's literal in its place.
+            set_brokered(&hub, &env, "CHOICE", "integration:not-granted", "ada").await.map_err(anyhow::Error::msg)?;
+            let (delivered, failed) = for_leg(&hub, &repo, "build.yml", Some("prod"), &wanted, &w).await?;
+            anyhow::ensure!(delivered.is_empty() && failed.len() == 1);
+            let (delivered, _) = for_leg(&hub, &repo, "build.yml", Some("prod"), &Used { all: true, names: Default::default() }, &w).await?;
+            anyhow::ensure!(!delivered.contains_key("TOKEN"), "integration credentials never enter job scopes");
+            anyhow::ensure!(delete(&hub, &scope, "TOKEN").await?);
+            anyhow::ensure!(reveal(&hub, &scope, "TOKEN").await?.is_none());
+            Ok(())
+        })
+    }
 
     #[test]
     fn w09_r03_sealed_values_open_only_where_they_were_sealed() -> anyhow::Result<()> {

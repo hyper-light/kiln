@@ -114,6 +114,19 @@ impl Contexts for Changed {
 fn w01_s08_kiln_changed_and_bare_names() -> Result<(), ExprError> {
     assert_eq!(ev_kiln("changed('crates/**') && branch == 'main'", &Changed)?, Value::Bool(true));
     assert_eq!(ev_kiln("event == \"push\" && repo == 'hyper-light/kiln' && sha == 'abc123'", &Changed)?, Value::Bool(true));
+    for (event, git_ref, ref_type, legacy) in [
+        ("push", "refs/tags/v1", "tag", "tag"),
+        ("push", "refs/tags/v1", "", "tag"),
+        ("push", "refs/heads/main", "branch", "push"),
+        ("workflow_dispatch", "refs/tags/v1", "tag", "manual"),
+        ("schedule", "refs/tags/v1", "tag", "schedule"),
+    ] {
+        let cx = MapContexts::default().with("github", obj(&[("event_name", Value::str(event)), ("ref", Value::str(git_ref)), ("ref_type", Value::str(ref_type))]));
+        assert_eq!(ev_kiln("EVENT", &cx)?, Value::str(legacy));
+        assert_eq!(ev_kiln("github.event_name", &cx)?, Value::str(event));
+        let overridden = cx.with("event", Value::str("pipeline"));
+        assert_eq!(ev_kiln("event", &overridden)?, Value::str("pipeline"), "an explicit context still owns its value");
+    }
     Ok(())
 }
 

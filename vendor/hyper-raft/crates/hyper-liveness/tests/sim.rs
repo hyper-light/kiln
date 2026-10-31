@@ -21,7 +21,7 @@
     missing_docs
 )]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 
 use hyper_liveness::{
@@ -310,10 +310,15 @@ struct Node {
     charged: u64,
     /// The disk's flush queue: one write at a time, as one device.
     disk_busy_until: u64,
+    /// The log writes out on the disk, oldest first: when each was submitted. What the owner tells
+    /// its stream is pending (`Liveness::on_pending`, Focal's 5a).
+    log_out: VecDeque<u64>,
     /// Every heartbeat sent: to whom and the message, at what time.
     log: Vec<(u64, PeerId, Heartbeat)>,
     /// Every durable completion: when.
     durable: Vec<u64>,
+    /// The liveness writes the node's stream asked for (`Output::flush`).
+    liveness_writes: u64,
     suspicions: Vec<Suspicion>,
     /// What the node fed its stream and what the stream told it, in order (`record`): every
     /// suspicion in it is traced to the detector's rule, and every count the stream reports is
@@ -321,6 +326,14 @@ struct Node {
     record: Record,
     /// The peers whose restart the node's stream reported.
     restarts: Vec<PeerId>,
+    /// The peers whose announced stop the node's stream reported, and when.
+    stops: Vec<(PeerId, u64)>,
+    /// Each disk verdict its stream gave (`Change::DiskSlow`, `DiskCaughtUp`): the peer, whether
+    /// slow, and the heartbeat's arrival.
+    disks: Vec<(PeerId, bool, u64)>,
+    /// Each change of a peer's disk mode the stream told: the peer, whether its heartbeats turned
+    /// to the other mode (`Change::ModeDiffers`) or back, and when.
+    modes: Vec<(PeerId, bool, u64)>,
     /// What the owner believes of each peer from the changes it was told: suspected or not. The
     /// owner trusts a peer until told otherwise, and a restarted one is trusted (`Change`).
     believed: BTreeMap<PeerId, bool>,
@@ -337,6 +350,17 @@ struct Node {
     /// freezes replayed so far.
     phase: u64,
     replayed: u64,
+}
+
+impl Node {
+    /// The owner took the answer to `write`: a log write leaves the disk's queue, oldest first, and
+    /// the stream is told what is pending after it.
+    fn taken_out(&mut self, write: Write) {
+        if write == Write::Log {
+            self.log_out.pop_front();
+            self.liveness.on_pending(self.log_out.front().copied());
+        }
+    }
 }
 
 struct Sim {
@@ -401,8 +425,10 @@ impl Sim {
                     disk_held_until: 0,
                     charged: 0,
                     disk_busy_until: 0,
+                    log_out: VecDeque::new(),
                     log: Vec::new(),
                     durable: Vec::new(),
+                    liveness_writes: 0,
                     suspicions: Vec::new(),
                     record: {
                         let mut record = Record::default();
@@ -410,6 +436,9 @@ impl Sim {
                         record
                     },
                     restarts: Vec::new(),
+                    stops: Vec::new(),
+                    disks: Vec::new(),
+                    modes: Vec::new(),
                     believed: BTreeMap::new(),
                     timer: None,
                     frozen_until: 0,
@@ -510,6 +539,11 @@ impl Sim {
         self.longest_write = self.longest_write.max(done - self.now);
         let started = self.now;
         self.writing += 1;
+        if write == Write::Log {
+            let n = &mut self.nodes[node];
+            n.log_out.push_back(started);
+            n.liveness.on_pending(n.log_out.front().copied());
+        }
         self.schedule(
             done,
             node,
@@ -571,6 +605,7 @@ impl Sim {
         n.believed.clear();
         n.alive = true;
         n.disk_busy_until = self.now;
+        n.log_out.clear();
     }
 
     fn drain(&mut self, node: usize) {
@@ -587,18 +622,36 @@ impl Sim {
                 .unwrap();
         }
         if std::mem::take(&mut self.nodes[node].owner.flush) {
+            self.nodes[node].liveness_writes += 1;
             self.submit(node, Write::Liveness);
         }
         self.arm(node);
         let changes = std::mem::take(&mut self.nodes[node].owner.changes);
         for change in changes {
             let n = &mut self.nodes[node];
-            n.believed
-                .insert(change.peer(), matches!(change, Change::Suspected(_)));
             match change {
-                Change::Suspected(suspicion) => n.suspicions.push(suspicion),
-                Change::Restarted { peer, .. } => n.restarts.push(peer),
-                Change::Trusted { .. } => {}
+                Change::Suspected(suspicion) => {
+                    n.believed.insert(suspicion.peer, true);
+                    n.suspicions.push(suspicion);
+                }
+                Change::Restarted { peer, .. } => {
+                    n.believed.insert(peer, false);
+                    n.restarts.push(peer);
+                }
+                Change::Trusted { peer, .. } => {
+                    n.believed.insert(peer, false);
+                }
+                // A disk's verdict leaves what the owner believes of the peer's process as it was.
+                Change::DiskSlow { peer, at_ns } => n.disks.push((peer, true, at_ns)),
+                Change::DiskCaughtUp { peer, at_ns } => n.disks.push((peer, false, at_ns)),
+                // A mode's mismatch leaves what the owner believes of the peer as it was.
+                Change::ModeDiffers { peer, at_ns } => n.modes.push((peer, true, at_ns)),
+                Change::ModeAgrees { peer, at_ns } => n.modes.push((peer, false, at_ns)),
+                // An announced stop: the peer held out as suspected until its next run (Mantle's).
+                Change::Stopped { peer, at_ns } => {
+                    n.believed.insert(peer, true);
+                    n.stops.push((peer, at_ns));
+                }
             }
         }
     }
@@ -910,6 +963,7 @@ impl Sim {
                 let n = &mut self.nodes[node];
                 n.durable.push(now);
                 n.liveness.on_durable(write, started, now);
+                n.taken_out(write);
                 self.polled(node);
                 self.drain(node);
                 // The groups keep the log busy: their next write as this one completes.
@@ -979,6 +1033,7 @@ impl Sim {
                     let n = &mut self.nodes[node];
                     n.durable.push(now);
                     n.liveness.on_durable(write, started, now);
+                    n.taken_out(write);
                     Some(write)
                 }
                 _ => None,
@@ -1190,8 +1245,54 @@ fn no_heartbeat_leaves_without_a_newer_flush() {
 /// last heartbeat's schedule (one clock in the simulation, so the peer's schedule is on it).
 #[test]
 fn a_killed_peer_is_suspected_within_the_stated_bound() {
+    killed_peer_is_suspected_within_its_bound(false);
+}
+
+/// CP-T2.2 step 2, Focal's condition 5: the stream bounds its own flushes' tail once one is reported
+/// (`Liveness::flush_tail`), RFC 6298's bound over them (`hyper_timing::FlushTail`), what its own
+/// writes and, in the disk mode, its peers' flush ages are judged against.
+#[test]
+fn the_stream_bounds_its_own_flushes_tail_once_it_has_one() {
+    let mut liveness = Liveness::new(Settings {
+        local: 1,
+        run: 1,
+        max_peers: 3,
+        history: Exposure::new(),
+        resolution: RESOLUTION,
+    })
+    .unwrap();
+    assert_eq!(
+        (liveness.flush_tail(), liveness.flush_smoothed()),
+        (None, None)
+    );
+    let mut tail = hyper_timing::FlushTail::new();
+    for (started, durable) in [
+        (0, 1_000_000),
+        (5_000_000, 6_200_000),
+        (9_000_000, 9_900_000),
+    ] {
+        liveness.on_durable(Write::Log, started, durable);
+        tail.on_flush(started, durable);
+    }
+    // No wait reported: the granularity is not measured, and the tail is the four deviations'.
+    assert_eq!(liveness.flush_smoothed(), tail.smoothed());
+    assert_eq!(liveness.flush_tail(), tail.tail(Duration::ZERO));
+    assert!(liveness.flush_tail() > liveness.flush_smoothed());
+}
+
+/// The same, every node judging each peer's process apart from its disk (kiln's CP-T2.2): a crash
+/// is suspected within its bound as before.
+#[test]
+fn judged_apart_a_killed_peer_is_suspected_within_the_stated_bound() {
+    killed_peer_is_suspected_within_its_bound(true);
+}
+
+fn killed_peer_is_suspected_within_its_bound(apart: bool) {
     for seed in seeds(3, 16) {
         let mut sim = Sim::new(4, MACOS, seed);
+        if apart {
+            sim.judge_apart();
+        }
         sim.run_until_configured();
         sim.run_until_doubled();
         let victim = 3usize;
@@ -1484,7 +1585,10 @@ fn a_superseded_runs_heartbeat_is_stale_and_its_restart_counts_once() {
         late_ns: 0,
         flushes,
         flush_age_ns: 0,
+        apart: false,
+        disk_slow: false,
         echo: None,
+        stopping: false,
     };
     let mut out = [0u8; MAX_BYTES];
     let mut feed = |node: &mut Liveness, owner: &mut Owner, beat: Heartbeat, at: u64| {
@@ -1547,7 +1651,10 @@ fn heartbeats_without_their_proof_are_refused() {
         late_ns: MS,
         flushes: 4,
         flush_age_ns: 2 * MS,
+        apart: false,
+        disk_slow: false,
         echo: None,
+        stopping: false,
     };
     let mut out = [0u8; MAX_BYTES];
     let send =
@@ -1570,6 +1677,8 @@ fn heartbeats_without_their_proof_are_refused() {
         seq: 1,
         flushes: 5,
         flush_age_ns: 12 * MS,
+        apart: false,
+        disk_slow: false,
         ..beat
     };
     assert_eq!(
@@ -1978,8 +2087,805 @@ fn a_node_that_hears_no_peer_keeps_its_streams_on_schedule() {
     }
 }
 
+/// RFC 8085 §3.1.3 (BCP 145): an application that "cannot maintain an RTT estimate for a
+/// destination, because the destination does not send return traffic", "SHOULD NOT send more than
+/// one UDP datagram every 3 seconds". A stream to a peer from which nothing had come stayed at its
+/// sender's floor, `E[flush] + G`, and asked a flush for each heartbeat for as long as the peer said
+/// nothing: a founder of mantle's three-node cell started alone flushed its log 10,000 times a
+/// second on an idle NVMe, its floor 80 to 115 µs. Do: one node of three, its peers never alive,
+/// for a minute of its clock, in the four worlds. Expect: to each peer, once a heartbeat states an
+/// interval of 3 s every later one does, none states more (every floor here is shorter), and the
+/// heartbeats are no more than the doublings from the shortest interval stated to 3 s and one each
+/// 3 s of the minute; the liveness writes the node asked are no more than the heartbeats they
+/// proved and its first.
+#[test]
+fn a_node_whose_peers_never_answer_backs_off_to_a_heartbeat_every_three_seconds() {
+    // Format: RFC 8085 §3.1.3, the second case's bound.
+    const BOUND: u64 = 3_000 * MS;
+    // Shape: the run, twenty bounds.
+    const SPAN: u64 = 60_000 * MS;
+    for world in [MACOS, BUSY, LINUX, WINDOWS] {
+        let name = world.name;
+        for seed in seeds(20, 8) {
+            let mut sim = Sim::new(3, world, seed);
+            sim.nodes[1].alive = false;
+            sim.nodes[2].alive = false;
+            sim.run_while(|_| true, Some(SPAN));
+            let node = &sim.nodes[0];
+            let mut sent = 0u64;
+            for peer in [2u64, 3] {
+                let beats: Vec<&Heartbeat> = node
+                    .log
+                    .iter()
+                    .filter(|(_, to, _)| *to == peer)
+                    .map(|(_, _, beat)| beat)
+                    .collect();
+                assert!(!beats.is_empty(), "{name} seed {seed}: nothing sent {peer}");
+                assert!(
+                    beats.iter().all(|beat| beat.floor_ns < BOUND),
+                    "{name} seed {seed}: a floor past the bound, which the stream keeps"
+                );
+                let stated: Vec<u64> = beats.iter().map(|beat| beat.interval_ns).collect();
+                assert!(
+                    stated.iter().all(|interval| *interval <= BOUND),
+                    "{name} seed {seed}: to {peer} an interval past 3 s: {stated:?}"
+                );
+                if let Some(first) = stated.iter().position(|interval| *interval == BOUND) {
+                    assert!(
+                        stated[first..].iter().all(|interval| *interval == BOUND),
+                        "{name} seed {seed}: to {peer} the bound left: {stated:?}"
+                    );
+                }
+                let shortest = stated.iter().copied().min().unwrap().max(1);
+                let doublings = u64::from((BOUND / shortest).max(1).ilog2()) + 1;
+                let most = doublings + SPAN / BOUND + 1;
+                assert!(
+                    beats.len() as u64 <= most,
+                    "{name} seed {seed}: {} heartbeats to {peer} in {} s, past {most}: the \
+                     doublings from {} µs to 3 s and one every 3 s",
+                    beats.len(),
+                    SPAN / 1_000 / MS,
+                    shortest / US
+                );
+                sent += beats.len() as u64;
+            }
+            assert!(
+                node.liveness_writes <= sent + 1,
+                "{name} seed {seed}: {} liveness writes for {sent} heartbeats",
+                node.liveness_writes
+            );
+        }
+    }
+}
+
+/// A stream backed off while its peer said nothing answers the peer's first heartbeat at once and
+/// leaves the back-off: the peer judges the node from its own start, and a backed-off slot would
+/// keep it waiting up to 3 s. Do: one node of two alone for twenty seconds, its stream to the
+/// other backed off to 3 s, then the other started. Expect: the alone node's first heartbeat after
+/// it took the other's first is sent within a poll's and a flush's lateness of taking it (the
+/// bound `a_node_that_hears_no_peer_keeps_its_streams_on_schedule` holds a stream on schedule to),
+/// every later one states an interval under 3 s, and both pairs configure.
+#[test]
+fn a_peer_heard_at_last_is_answered_at_once_and_its_stream_backs_off_no_more() {
+    // Format: RFC 8085 §3.1.3, the second case's bound.
+    const BOUND: u64 = 3_000 * MS;
+    // Shape: the time alone, long enough for the stream to reach the bound from any floor here.
+    const ALONE: u64 = 20_000 * MS;
+    for world in [MACOS, BUSY, LINUX, WINDOWS] {
+        let name = world.name;
+        for seed in seeds(21, 8) {
+            let mut sim = Sim::new(2, world, seed);
+            sim.nodes[1].alive = false;
+            sim.run_while(|_| true, Some(ALONE));
+            assert_eq!(
+                sim.nodes[0]
+                    .liveness
+                    .report(2)
+                    .and_then(|report| report.sending),
+                Some(Duration::from_nanos(BOUND)),
+                "{name} seed {seed}: the stream alone reached the bound"
+            );
+            let mut liveness = Liveness::new(Settings {
+                local: 2,
+                run: 1,
+                max_peers: 2,
+                history: Exposure::new(),
+                resolution: RESOLUTION,
+            })
+            .unwrap();
+            liveness.attach(1).unwrap();
+            sim.restart(1, liveness);
+            sim.poll(1);
+            let taken = |sim: &Sim| sim.nodes[0].liveness.report(2).map_or(0, |r| r.taken);
+            sim.run_while(|sim| taken(sim) == 0, None);
+            let heard = sim.now;
+            let sent_before = sim.nodes[0].log.len();
+            sim.run_while(|sim| sim.nodes[0].log.len() == sent_before, None);
+            let (answered, to, _) = sim.nodes[0].log[sent_before];
+            assert_eq!(to, 2);
+            let behind = sim.latest_late + sim.longest_freeze + sim.longest_write;
+            assert!(
+                answered - heard <= behind,
+                "{name} seed {seed}: answered {} ms after the first heartbeat, past the {} ms a \
+                 poll and a flush may take",
+                (answered - heard) / MS,
+                behind / MS
+            );
+            sim.run_until_configured();
+            let later: Vec<u64> = sim.nodes[0].log[sent_before + 1..]
+                .iter()
+                .map(|(_, _, beat)| beat.interval_ns)
+                .collect();
+            assert!(
+                !later.is_empty(),
+                "{name} seed {seed}: nothing sent after the answer"
+            );
+            assert!(
+                later.iter().all(|interval| *interval < BOUND),
+                "{name} seed {seed}: backed off after the peer was heard: {later:?}"
+            );
+        }
+    }
+}
+
+/// A node restarted where it hears no peer backs its streams off, and its peers, which hear it,
+/// expect each doubling: no suspicion of it is of a heartbeat its sender had not yet due (mantle's
+/// roll test restarts a founder so: at a new port, which its peers send to at its old one until
+/// they are told). Its streams state each gap and double it (`Pair::backed_off`), and a heartbeat
+/// that echoes nothing tells the peer to expect that (`unanswered_next`). Doubled from the floor, unforeseen, each doubling came a whole
+/// gap past the peers' freshness point: 49 to 91 suspicions of the live node a world, in 8 seeds of
+/// 8 over its 10 s deaf, where the node sending at its floor drew 0 to 2, each a late heartbeat of
+/// its own.
+#[test]
+fn a_restarted_node_that_hears_no_peer_is_not_suspected_for_its_back_off() {
+    // Shape: long enough for its streams to back off to the bound from any floor here.
+    const DEAF: u64 = 10_000 * MS;
+    // Format: RFC 8085 §3.1.3, the second case's bound.
+    const BOUND: u64 = 3_000 * MS;
+    for world in [MACOS, BUSY, LINUX, WINDOWS] {
+        let name = world.name;
+        for seed in seeds(22, 8) {
+            let mut sim = Sim::new(3, world, seed);
+            settled(&mut sim);
+            let before: Vec<usize> = (0..2)
+                .map(|node| sim.nodes[node].suspicions.len())
+                .collect();
+            let mut liveness = Liveness::new(Settings {
+                local: 3,
+                run: 2,
+                max_peers: 2,
+                history: Exposure::new(),
+                resolution: RESOLUTION,
+            })
+            .unwrap();
+            liveness.attach(1).unwrap();
+            liveness.attach(2).unwrap();
+            sim.restart(2, liveness);
+            sim.nodes[2].deaf = true;
+            let start = sim.now;
+            let logged = sim.nodes[2].log.len();
+            sim.poll(2);
+            sim.run_while(|_| true, Some(start + DEAF));
+            let sent = &sim.nodes[2].log[logged..];
+            assert!(
+                sent.iter().any(|(_, _, beat)| beat.interval_ns == BOUND),
+                "{name} seed {seed}: the restarted node never backed off to the bound"
+            );
+            for (node, taken_before) in before.iter().enumerate() {
+                let peer = node as u64 + 1;
+                for suspicion in sim.nodes[node].suspicions[*taken_before..]
+                    .iter()
+                    .filter(|suspicion| suspicion.peer == 3)
+                {
+                    let last = suspicion.last.expect("the run's heartbeats were taken").seq;
+                    // The slot after the last taken, by its sender's schedule: the next heartbeat
+                    // it sent, less the slots it skipped to it at its interval.
+                    let due = sent
+                        .iter()
+                        .find(|(_, to, beat)| *to == peer && beat.seq > last)
+                        .map(|(_, _, beat)| {
+                            beat.sent_ns - beat.late_ns - (beat.seq - last - 1) * beat.interval_ns
+                        });
+                    assert!(
+                        due.is_some_and(|due| due <= suspicion.at_ns),
+                        "{name} seed {seed}: node {peer} suspected the restarted node at {} ms, \
+                         its next heartbeat due at {:?} ms",
+                        (suspicion.at_ns - start) / MS,
+                        due.map(|due| (due - start) / MS)
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A run of a peer that has taken none of the node's heartbeats asks from no evidence of the node's
+/// stream, and its ask is not taken until it takes one: mantle's roll restarts a founder at a new
+/// port, which its peers send to at its old one until they are told, while its own heartbeats reach
+/// them asking no interval. Taken, that ask moved each peer's stream to its floor, a flush each,
+/// for as long as the founder heard nothing: in this simulation's worlds the peers' liveness writes
+/// went from 11–30 a second to 80–240 on macOS and Linux (mantle saw 40–200 against 1–2 on its busy
+/// CI runners). Do: three nodes settled; the third started again, deaf, for twenty seconds; then
+/// heard. Expect: each other node's heartbeats to it keep the interval its stream had before the
+/// restart, and number no more than the deaf time over it and two; its liveness writes no more than
+/// the heartbeats it sent and one; once heard, every pair configures, and no suspicion the restarted
+/// node makes of a live peer is of a heartbeat its sender did not yet have due.
+#[test]
+fn a_restarted_runs_ask_is_taken_once_it_has_taken_a_heartbeat() {
+    // Shape: long enough for a floor of a few milliseconds to send thousands of heartbeats.
+    const DEAF: u64 = 20_000 * MS;
+    for world in [MACOS, BUSY, LINUX, WINDOWS] {
+        let name = world.name;
+        for seed in seeds(23, 8) {
+            let mut sim = Sim::new(3, world, seed);
+            settled(&mut sim);
+            let before: Vec<u64> = (0..2)
+                .map(|node| {
+                    let report = sim.nodes[node].liveness.report(3).unwrap();
+                    report.sending.unwrap().as_nanos() as u64
+                })
+                .collect();
+            let mut liveness = Liveness::new(Settings {
+                local: 3,
+                run: 2,
+                max_peers: 2,
+                history: Exposure::new(),
+                resolution: RESOLUTION,
+            })
+            .unwrap();
+            liveness.attach(1).unwrap();
+            liveness.attach(2).unwrap();
+            sim.restart(2, liveness);
+            sim.nodes[2].deaf = true;
+            let start = sim.now;
+            let logged: Vec<usize> = (0..2).map(|node| sim.nodes[node].log.len()).collect();
+            let writes: Vec<u64> = (0..2).map(|node| sim.nodes[node].liveness_writes).collect();
+            sim.poll(2);
+            sim.run_while(|_| true, Some(start + DEAF));
+            for node in 0..2 {
+                let sent = &sim.nodes[node].log[logged[node]..];
+                let to_it: Vec<u64> = sent
+                    .iter()
+                    .filter(|(_, peer, _)| *peer == 3)
+                    .map(|(_, _, beat)| beat.interval_ns)
+                    .collect();
+                let shortest = to_it.iter().copied().min().unwrap_or(0);
+                assert!(
+                    shortest >= before[node],
+                    "{name} seed {seed}: node {} sent the deaf run {} heartbeats, down to {} µs \
+                     apart, where its stream was at {} µs",
+                    node + 1,
+                    to_it.len(),
+                    shortest / US,
+                    before[node] / US
+                );
+                let most = DEAF / before[node] + 2;
+                assert!(
+                    to_it.len() as u64 <= most,
+                    "{name} seed {seed}: node {} sent the deaf run {} heartbeats in {} s, past {most}",
+                    node + 1,
+                    to_it.len(),
+                    DEAF / 1_000 / MS
+                );
+                let written = sim.nodes[node].liveness_writes - writes[node];
+                assert!(
+                    written <= sent.len() as u64 + 1,
+                    "{name} seed {seed}: node {} made {written} liveness writes for {} heartbeats",
+                    node + 1,
+                    sent.len()
+                );
+            }
+            // Heard: its peers take its ask once it has taken one of their heartbeats.
+            let heard_from = sim.now;
+            let suspected_before = sim.nodes[2].suspicions.len();
+            sim.nodes[2].deaf = false;
+            sim.run_until_configured();
+            // No suspicion the restarted node made of a live peer once it heard them is of a
+            // heartbeat its sender did not yet have due by its schedule.
+            for suspicion in &sim.nodes[2].suspicions[suspected_before..] {
+                let peer = suspicion.peer;
+                let Some(last) = suspicion.last.filter(|last| last.arrival_ns >= heard_from) else {
+                    continue;
+                };
+                let sent = &sim.nodes[peer as usize - 1].log;
+                let due = sent
+                    .iter()
+                    .find(|(_, to, beat)| *to == 3 && beat.run == 1 && beat.seq > last.seq)
+                    .map(|(_, _, beat)| {
+                        beat.sent_ns - beat.late_ns - (beat.seq - last.seq - 1) * beat.interval_ns
+                    });
+                assert!(
+                    due.is_some_and(|due| due <= suspicion.at_ns),
+                    "{name} seed {seed}: the restarted node suspected node {peer} at {} ms, its \
+                     next heartbeat due at {:?} ms",
+                    (suspicion.at_ns - heard_from) / MS,
+                    due.map(|due| due.saturating_sub(heard_from) / MS)
+                );
+            }
+        }
+    }
+}
+
+/// A node that stops in order announces it to its peers (`Liveness::stop`), and its next run's
+/// start is no failure in their MTBF's evidence, nor is their letting go of the pair while they
+/// suspect it: the MTBF counts what a detector must catch, and an orderly stop handed over what it
+/// led first. Until its next run is heard, the announced run is sent nothing but the one heartbeat
+/// that answers the announcement, where each heartbeat to it asked a flush of its own; that run's
+/// first heartbeat is answered at once, numbered next.
+/// Do: three nodes settled; the third announces its stop and stops; its peers suspect it at the
+/// announcement; it starts again. Expect: the stopped run sent only the answer after its
+/// announcement was taken; the restart reported and counted no failure; the first heartbeat each
+/// peer sends the new run is numbered next and sent within a poll's and a flush's lateness of taking
+/// its first; and a node that lets go of an announced, suspected peer counts no failure.
+#[test]
+fn a_restart_after_an_announced_stop_is_no_failure_and_the_stopped_run_is_sent_nothing() {
+    for world in [MACOS, BUSY, LINUX, WINDOWS] {
+        let name = world.name;
+        for seed in seeds(24, 8) {
+            let mut sim = Sim::new(3, world, seed);
+            settled(&mut sim);
+            let failures: Vec<u64> = (0..2)
+                .map(|node| sim.nodes[node].liveness.history().failures())
+                .collect();
+            {
+                let now = sim.now;
+                let n = &mut sim.nodes[2];
+                n.liveness.stop(now, &mut n.owner);
+            }
+            sim.drain(2);
+            sim.nodes[2].alive = false;
+            let stopped_at = sim.now;
+            sim.run_until_suspected(2);
+            // Taken by both: each sent the stopped run its answer after it took the announcement, and
+            // nothing else.
+            let announced: Vec<u64> = (0..2)
+                .map(|node| {
+                    sim.nodes[node]
+                        .record
+                        .entries
+                        .iter()
+                        .find_map(|entry| match entry {
+                            record::Entry::Fed {
+                                peer: 3,
+                                beat,
+                                refused: None,
+                                ..
+                            } if beat.stopping => Some(beat.stamp),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| {
+                            panic!("{name} seed {seed}: node {node} took no announcement")
+                        })
+                })
+                .collect();
+            sim.run_while(|_| true, Some(sim.now + 10_000 * MS));
+            for (node, announced) in announced.iter().enumerate() {
+                let after: Vec<u64> = sim.nodes[node]
+                    .log
+                    .iter()
+                    .filter(|(at, peer, _)| *peer == 3 && at >= announced)
+                    .map(|(at, _, _)| *at)
+                    .collect();
+                assert!(
+                    after.len() == 1,
+                    "{name} seed {seed}: node {} sent the stopped run {} heartbeats after its \
+                     announcement, where it answers it once, the first {} ms after the stop",
+                    node + 1,
+                    after.len(),
+                    after.first().map_or(0, |at| (at - stopped_at) / MS)
+                );
+            }
+            let last_sent: Vec<u64> = (0..2)
+                .map(|node| {
+                    sim.nodes[node]
+                        .log
+                        .iter()
+                        .filter(|(_, peer, _)| *peer == 3)
+                        .map(|(_, _, beat)| beat.seq)
+                        .max()
+                        .unwrap()
+                })
+                .collect();
+            let mut liveness = Liveness::new(Settings {
+                local: 3,
+                run: 2,
+                max_peers: 2,
+                history: Exposure::new(),
+                resolution: RESOLUTION,
+            })
+            .unwrap();
+            liveness.attach(1).unwrap();
+            liveness.attach(2).unwrap();
+            sim.restart(2, liveness);
+            sim.poll(2);
+            let logged: Vec<usize> = (0..2).map(|node| sim.nodes[node].log.len()).collect();
+            sim.run_while(
+                |sim| (0..2).any(|node| sim.nodes[node].restarts.is_empty()),
+                None,
+            );
+            sim.run_while(
+                |sim| {
+                    (0..2).any(|node| {
+                        !sim.nodes[node].log[logged[node]..]
+                            .iter()
+                            .any(|(_, peer, _)| *peer == 3)
+                    })
+                },
+                None,
+            );
+            let behind = sim.latest_late + sim.longest_freeze + sim.longest_write;
+            for node in 0..2 {
+                assert_eq!(
+                    sim.nodes[node].restarts,
+                    vec![3],
+                    "{name} seed {seed}: node {} saw the restart once",
+                    node + 1
+                );
+                assert_eq!(
+                    sim.nodes[node].liveness.history().failures(),
+                    failures[node],
+                    "{name} seed {seed}: node {} counted the restart after an announced stop a \
+                     failure",
+                    node + 1
+                );
+                let heard = sim.nodes[node]
+                    .record
+                    .entries
+                    .iter()
+                    .find_map(|entry| match entry {
+                        record::Entry::Fed {
+                            peer: 3,
+                            beat,
+                            refused: None,
+                            ..
+                        } if beat.run == 2 => Some(beat.stamp),
+                        _ => None,
+                    })
+                    .expect("the new run was taken");
+                let (answered, _, beat) = *sim.nodes[node].log[logged[node]..]
+                    .iter()
+                    .find(|(_, peer, _)| *peer == 3)
+                    .unwrap();
+                assert_eq!(
+                    beat.seq,
+                    last_sent[node] + 1,
+                    "{name} seed {seed}: node {} skipped the stop's slots",
+                    node + 1
+                );
+                assert!(
+                    answered.saturating_sub(heard) <= behind,
+                    "{name} seed {seed}: node {} answered the new run {} ms after taking it, past \
+                     the {} ms a poll and a flush may take",
+                    node + 1,
+                    answered.saturating_sub(heard) / MS,
+                    behind / MS
+                );
+            }
+            sim.run_until_configured();
+        }
+    }
+    // Let go while suspected after an announced stop: no failure.
+    let mut sim = Sim::new(3, MACOS, 0);
+    settled(&mut sim);
+    {
+        let now = sim.now;
+        let n = &mut sim.nodes[2];
+        n.liveness.stop(now, &mut n.owner);
+    }
+    sim.drain(2);
+    sim.nodes[2].alive = false;
+    sim.run_until_suspected(2);
+    let failures = sim.nodes[0].liveness.history().failures();
+    sim.nodes[0].liveness.detach(3).unwrap();
+    assert!(
+        sim.nodes[0].liveness.report(3).is_none(),
+        "the pair was let go"
+    );
+    assert_eq!(sim.nodes[0].liveness.history().failures(), failures);
+}
+
+/// A stop announced is suspected at the announcement's arrival, where the stopped node was trusted
+/// until its freshness point passed, the detector's margin after its last heartbeat: a group's
+/// remaining voter that wrongly suspected its leader meanwhile counted the stopped voter in a
+/// quorum it trusted and asked for votes (mantle's roll; the window
+/// `docs/models/SuspicionStopUnannounced.cfg` finds). The stopped run is trusted never again: a
+/// heartbeat of it the announcement overtook is refused. Its next run is trusted at once.
+/// Do: three nodes settled; once both others took a heartbeat of the third, it announces its stop
+/// and stops; one of its run's heartbeats comes after the announcement; it starts again.
+/// Expect: each other node's owner told the stop at the announcement's arrival, before the point
+/// it held the third trusted to, and told no suspicion of it; the late heartbeat refused as stale,
+/// the third still suspected; the next run reported restarted and trusted.
+#[test]
+fn a_stop_announced_is_suspected_at_its_arrival_and_its_run_never_trusted_again() {
+    for world in [MACOS, BUSY, LINUX, WINDOWS] {
+        let name = world.name;
+        for seed in seeds(25, 8) {
+            let mut sim = Sim::new(3, world, seed);
+            settled(&mut sim);
+            // Both took a heartbeat of the third since: each holds it trusted a whole freshness on.
+            let fed: Vec<usize> = (0..2)
+                .map(|node| sim.nodes[node].record.entries.len())
+                .collect();
+            sim.run_while(
+                |sim| {
+                    (0..2).any(|node| {
+                        !sim.nodes[node].record.entries[fed[node]..]
+                            .iter()
+                            .any(|entry| {
+                                matches!(
+                                    entry,
+                                    record::Entry::Fed {
+                                        peer: 3,
+                                        refused: None,
+                                        ..
+                                    }
+                                )
+                            })
+                    })
+                },
+                None,
+            );
+            let until: Vec<u64> = (0..2)
+                .map(|node| match sim.nodes[node].liveness.trust(3) {
+                    Some(Trust::Trusted { until_ns }) => until_ns,
+                    other => panic!(
+                        "{name} seed {seed}: node {} holds node 3 {other:?}",
+                        node + 1
+                    ),
+                })
+                .collect();
+            let suspicions: Vec<usize> = (0..2)
+                .map(|node| sim.nodes[node].suspicions.len())
+                .collect();
+            let last = sim.nodes[2]
+                .log
+                .iter()
+                .rev()
+                .find(|(_, peer, _)| *peer == 1)
+                .map(|(_, _, beat)| *beat)
+                .expect("the third sent the first heartbeats");
+            {
+                let now = sim.now;
+                let n = &mut sim.nodes[2];
+                n.liveness.stop(now, &mut n.owner);
+            }
+            sim.drain(2);
+            sim.nodes[2].alive = false;
+            // Until both took the announcement, and nothing more.
+            sim.run_while(
+                |sim| {
+                    (0..2).any(|node| {
+                        !sim.nodes[node].record.entries.iter().any(|entry| {
+                            matches!(entry, record::Entry::Fed { peer: 3, beat, .. } if beat.stopping)
+                        })
+                    })
+                },
+                None,
+            );
+            for node in 0..2 {
+                let announced = sim.nodes[node]
+                    .record
+                    .entries
+                    .iter()
+                    .find_map(|entry| match entry {
+                        record::Entry::Fed {
+                            peer: 3,
+                            beat,
+                            refused: None,
+                            ..
+                        } if beat.stopping => Some(beat.stamp),
+                        _ => None,
+                    })
+                    .expect("the announcement was taken");
+                assert_eq!(
+                    sim.nodes[node].liveness.trust(3),
+                    Some(Trust::Suspected),
+                    "{name} seed {seed}: node {} holds the stopped node trusted",
+                    node + 1
+                );
+                assert_eq!(
+                    sim.nodes[node].stops,
+                    vec![(3, announced)],
+                    "{name} seed {seed}: node {} was not told the stop at its arrival",
+                    node + 1
+                );
+                assert!(
+                    announced < until[node],
+                    "{name} seed {seed}: node {} took the announcement at {announced} ns, past the \
+                     point {} ns it held node 3 trusted to: no window to close",
+                    node + 1,
+                    until[node]
+                );
+                assert!(
+                    sim.nodes[node].suspicions[suspicions[node]..]
+                        .iter()
+                        .all(|suspicion| suspicion.peer != 3),
+                    "{name} seed {seed}: node {} told a suspicion of the stopped node",
+                    node + 1
+                );
+            }
+            // A heartbeat of the stopped run after its announcement: refused, nothing told.
+            let late = Heartbeat {
+                seq: last.seq + 1,
+                sent_ns: last.sent_ns + last.interval_ns,
+                flushes: last.flushes + 1,
+                flush_age_ns: 0,
+                late_ns: 0,
+                echo: None,
+                stopping: false,
+                ..last
+            };
+            let mut bytes = [0u8; MAX_BYTES];
+            let length = late.encode(&mut bytes).len();
+            let now = sim.now;
+            assert_eq!(
+                sim.feed(0, 2, &bytes[..length], now),
+                Err(Refusal::Stale),
+                "{name} seed {seed}: the stopped run's late heartbeat was taken"
+            );
+            sim.drain(0);
+            assert_eq!(sim.nodes[0].liveness.trust(3), Some(Trust::Suspected));
+            // The next run is trusted at its first heartbeat.
+            let mut liveness = Liveness::new(Settings {
+                local: 3,
+                run: 2,
+                max_peers: 2,
+                history: Exposure::new(),
+                resolution: RESOLUTION,
+            })
+            .unwrap();
+            liveness.attach(1).unwrap();
+            liveness.attach(2).unwrap();
+            sim.restart(2, liveness);
+            sim.poll(2);
+            sim.run_while(
+                |sim| (0..2).any(|node| sim.nodes[node].restarts.is_empty()),
+                None,
+            );
+            for node in 0..2 {
+                assert_eq!(sim.nodes[node].restarts, vec![3]);
+                assert!(
+                    matches!(
+                        sim.nodes[node].liveness.trust(3),
+                        Some(Trust::Trusted { .. })
+                    ),
+                    "{name} seed {seed}: node {} holds the next run {:?}",
+                    node + 1,
+                    sim.nodes[node].liveness.trust(3)
+                );
+            }
+            sim.run_until_configured();
+        }
+    }
+}
+
+/// A stop announced is answered: each peer that takes the announcement sends the stopping run one
+/// heartbeat that echoes it, proven as any, and nothing else, and the stopping node, which runs on
+/// as an owner that announces before it hands over does, knows each peer took it
+/// (`Liveness::stop_taken`). An announcement lost on its way goes again at the stream's interval
+/// until the answer comes. Do: three nodes settled; the third announces its stop and runs on, its
+/// first announcement to the first node lost. Expect: the third knows both peers took it, the
+/// first only after an announcement sent again; each peer answered each announcement it took
+/// once, echoing one, and sent the third nothing else; the third sends no announcement after a
+/// peer's answer, and none to the second but the first.
+#[test]
+fn a_stop_announced_is_answered_once_and_the_stopping_node_knows_it_was_taken() {
+    for world in [MACOS, BUSY, LINUX, WINDOWS] {
+        let name = world.name;
+        for seed in seeds(26, 8) {
+            let mut sim = Sim::new(3, world, seed);
+            let freshness = settled(&mut sim);
+            let logged: Vec<usize> = (0..3).map(|node| sim.nodes[node].log.len()).collect();
+            {
+                let now = sim.now;
+                let n = &mut sim.nodes[2];
+                n.liveness.stop(now, &mut n.owner);
+                assert!(!n.liveness.stop_taken(1) && !n.liveness.stop_taken(2));
+                // Lost on its way to the first node: sent, and never delivered.
+                let now = sim.now;
+                let (lost, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut n.owner.sent)
+                    .into_iter()
+                    .partition(|(peer, _)| *peer == 1);
+                n.owner.sent = kept;
+                for (peer, bytes) in lost {
+                    let beat = Heartbeat::decode(&bytes).unwrap();
+                    n.log.push((now, peer, beat));
+                    n.record.sent(peer, beat.run, beat.seq);
+                }
+            }
+            sim.drain(2);
+            // Within the time an announcement sent again and its answer take: a freshness, which
+            // holds the stream's interval, for each, and what a host's freeze or a write held back.
+            let behind = sim.latest_late + sim.longest_freeze + sim.longest_write;
+            let until = sim.now + 4 * freshness + 2 * behind;
+            sim.run_while(
+                |sim| !(1..=2).all(|peer| sim.nodes[2].liveness.stop_taken(peer)),
+                Some(until),
+            );
+            for peer in 1..=2 {
+                assert!(
+                    sim.nodes[2].liveness.stop_taken(peer),
+                    "{name} seed {seed}: node {peer} did not answer the announcement within {} ms",
+                    (4 * freshness + 2 * behind) / MS
+                );
+            }
+            let first_ns = sim.nodes[2].log[logged[2]..]
+                .iter()
+                .map(|(_, _, beat)| beat.sent_ns)
+                .min()
+                .expect("the announcement went");
+            // Each announcement the stopping node sent each peer, and when the answer came.
+            for (node, peer) in [(0usize, 1u64), (1, 2)] {
+                let goodbyes: Vec<(u64, Heartbeat)> = sim.nodes[2].log[logged[2]..]
+                    .iter()
+                    .filter(|(_, to, _)| *to == peer)
+                    .map(|(at, _, beat)| (*at, *beat))
+                    .collect();
+                assert!(
+                    goodbyes.iter().all(|(_, beat)| beat.stopping),
+                    "{name} seed {seed}: the stopping node sent node {peer} a heartbeat"
+                );
+                let taken = sim.nodes[node]
+                    .record
+                    .entries
+                    .iter()
+                    .filter(|entry| {
+                        matches!(entry, record::Entry::Fed { peer: 3, beat, refused: None, .. }
+                            if beat.stopping)
+                    })
+                    .count();
+                let answers: Vec<Heartbeat> = sim.nodes[node].log[logged[node]..]
+                    .iter()
+                    .filter(|(_, to, _)| *to == 3)
+                    .map(|(_, _, beat)| *beat)
+                    .filter(|beat| beat.echo.is_some_and(|echo| echo.sent_ns >= first_ns))
+                    .collect();
+                assert!(
+                    taken >= 1 && answers.len() == taken,
+                    "{name} seed {seed}: node {peer} took {taken} announcements and answered {}",
+                    answers.len()
+                );
+                if peer == 1 {
+                    assert!(
+                        goodbyes.len() >= 2,
+                        "{name} seed {seed}: the announcement lost on its way went once"
+                    );
+                } else {
+                    assert_eq!(goodbyes.len(), 1, "{name} seed {seed}: sent node 2 again");
+                }
+            }
+            // Answered, the stopping node sends no more; the peers send it nothing more.
+            let counts: Vec<usize> = (0..3).map(|node| sim.nodes[node].log.len()).collect();
+            let until = sim.now + 4 * freshness;
+            sim.run_while(|_| true, Some(until));
+            for (node, count) in counts.iter().enumerate() {
+                let more: Vec<&(u64, PeerId, Heartbeat)> = sim.nodes[node].log[*count..]
+                    .iter()
+                    .filter(|(_, to, _)| node == 2 || *to == 3)
+                    .collect();
+                assert!(
+                    more.is_empty(),
+                    "{name} seed {seed}: node {} sent {} heartbeats after the answers",
+                    node + 1,
+                    more.len()
+                );
+            }
+        }
+    }
+}
+
 /// Runs `sim`, configured and doubled, until every live node trusts every live peer, and returns
 /// the longest freshness, `η + α`, any pair holds then.
+impl Sim {
+    /// Every node judges each peer's process apart from its disk (`Liveness::set_disk_apart`,
+    /// kiln's CP-T2.2), set before the first poll.
+    fn judge_apart(&mut self) {
+        for node in &mut self.nodes {
+            node.liveness.set_disk_apart(true);
+        }
+    }
+}
+
 fn settled(sim: &mut Sim) -> u64 {
     sim.run_until_configured();
     sim.run_until_doubled();
@@ -2061,6 +2967,387 @@ fn flushes_stalled_together_as_on_a_shared_volume_are_no_ones_failure() {
                     (until - from) / MS
                 );
             }
+        }
+    }
+}
+
+/// As every node's flushes come back from a stall they shared, for three times the longest
+/// freshness any pair holds, no node suspects another within a freshness of the stall's end: every
+/// judge's own proof returns with its peers', and each holds its peers to the margin past the end
+/// (`Local::judge`). CP-T2.2 step 1: Focal's doc 34 recorded a leader that suspected both followers
+/// over a shared disk's 0.6 s stall. Fails here in the busy world, a judge suspecting both peers as
+/// its own stall ends: what a stall every node shares leaves to CP-T2.2 step 2.
+#[test]
+#[ignore = "CP-T2.2 step 2: a judge suspects both peers as a stall every node shared ends"]
+fn flushes_stalled_together_draw_no_suspicion_as_they_end() {
+    for world in [MACOS, BUSY, LINUX] {
+        let name = world.name;
+        for seed in seeds(16, 8) {
+            let mut sim = Sim::new(3, world, seed);
+            let freshness = settled(&mut sim);
+            let from = sim.now;
+            let until = from + 3 * freshness;
+            for node in &mut sim.nodes {
+                node.disk_held_until = until;
+            }
+            let after = until + freshness;
+            sim.run_while(|_| true, Some(after));
+            for (index, node) in sim.nodes.iter().enumerate() {
+                let late: Vec<_> = node
+                    .suspicions
+                    .iter()
+                    .filter(|s| s.noticed_ns > until && s.noticed_ns <= after)
+                    .map(|s| (s.peer, (s.noticed_ns - from) / MS))
+                    .collect();
+                assert!(
+                    late.is_empty(),
+                    "{name} seed {seed}: node {} suspected {late:?} (peer, ms from the stall's start) \
+                     within {} ms of the end of a stall of every flush for {} ms",
+                    index + 1,
+                    freshness / MS,
+                    (until - from) / MS
+                );
+            }
+        }
+    }
+}
+
+/// What each node suspected from the moment a run of `world` and `seed`, every node judging each
+/// peer's process apart from its disk (kiln's CP-T2.2), settled, to `spans` freshnesses past it,
+/// with `hold` done to the run at that moment, given it and the freshness: each suspicion's node,
+/// peer and time from the moment, in order. A world's sources are drawn apart (`Streams`), so a
+/// run with and one without the hold see the same host freezes and the same network.
+fn judged_apart(
+    world: World,
+    seed: u64,
+    spans: u64,
+    hold: impl Fn(&mut Sim, u64, u64),
+) -> Vec<(usize, u64, u64)> {
+    let mut sim = Sim::new(3, world, seed);
+    sim.judge_apart();
+    let freshness = settled(&mut sim);
+    let from = sim.now;
+    hold(&mut sim, from, freshness);
+    sim.run_while(|_| true, Some(from + spans * freshness));
+    let mut seen: Vec<(usize, u64, u64)> = sim
+        .nodes
+        .iter()
+        .enumerate()
+        .flat_map(|(index, node)| {
+            node.suspicions
+                .iter()
+                .filter(|s| s.noticed_ns > from)
+                .map(move |s| (index + 1, s.peer, (s.noticed_ns - from) / MS))
+        })
+        .collect();
+    seen.sort_unstable();
+    seen
+}
+
+/// Judged apart from their disks (kiln's CP-T2.2), nodes whose flushes stall together, as on a
+/// volume they share, for three times the longest freshness any pair holds, suspect no one for the
+/// stall: what they suspect through it is what the same run without it suspects, a host's freeze
+/// among them, since no stream waits on a flush.
+#[test]
+fn judged_apart_flushes_stalled_together_draw_no_suspicion() {
+    for world in [MACOS, BUSY, LINUX] {
+        let name = world.name;
+        for seed in seeds(41, 8) {
+            let held = judged_apart(world, seed, 3, |sim, from, freshness| {
+                for node in &mut sim.nodes {
+                    node.disk_held_until = from + 3 * freshness;
+                }
+            });
+            let unheld = judged_apart(world, seed, 3, |_, _, _| {});
+            let added: Vec<_> = held.iter().filter(|s| !unheld.contains(s)).collect();
+            assert!(
+                added.is_empty(),
+                "{name} seed {seed}: a stall of every flush for three freshnesses added the \
+                 suspicions {added:?} (node, peer, ms from its start) to the run without it, {unheld:?}"
+            );
+        }
+    }
+}
+
+/// Judged apart from its disk (kiln's CP-T2.2), a node whose disk stops completing flushes goes on
+/// heartbeating, and for three times the longest freshness any pair holds no peer suspects it for
+/// the stall: what its peers suspect of it is what the same run without the stall shows, and they
+/// take its heartbeats throughout.
+#[test]
+fn judged_apart_a_stalled_disk_is_not_suspected() {
+    for world in [MACOS, BUSY, LINUX] {
+        let name = world.name;
+        for seed in seeds(42, 8) {
+            let stalled = 2usize;
+            let peer = stalled as u64 + 1;
+            let of_it = |seen: Vec<(usize, u64, u64)>| -> Vec<(usize, u64, u64)> {
+                seen.into_iter().filter(|s| s.1 == peer).collect()
+            };
+            let held = of_it(judged_apart(world, seed, 3, |sim, _, _| {
+                sim.nodes[stalled].disk_stalled = true;
+            }));
+            let unheld = of_it(judged_apart(world, seed, 3, |_, _, _| {}));
+            let added: Vec<_> = held.iter().filter(|s| !unheld.contains(s)).collect();
+            assert!(
+                added.is_empty(),
+                "{name} seed {seed}: a disk that stopped added the suspicions {added:?} (node, peer, \
+                 ms from its stop) of its node to the run without it, {unheld:?}"
+            );
+            let mut sim = Sim::new(3, world, seed);
+            sim.judge_apart();
+            let freshness = settled(&mut sim);
+            let from = sim.now;
+            let taken: Vec<u64> = (0..2)
+                .map(|node| sim.nodes[node].liveness.report(peer).unwrap().taken)
+                .collect();
+            sim.nodes[stalled].disk_stalled = true;
+            sim.run_while(|_| true, Some(from + 3 * freshness));
+            for (node, before) in taken.iter().enumerate() {
+                assert!(
+                    sim.nodes[node].liveness.report(peer).unwrap().taken > *before,
+                    "{name} seed {seed}: node {} took no heartbeat of the node whose disk stopped",
+                    node + 1
+                );
+            }
+        }
+    }
+}
+
+/// CP-T2.2 step 2, Focal's condition 5: judged apart from its disk, a node whose disk is held for
+/// three freshnesses is judged slow by each peer while the hold lasts, its heartbeats saying so
+/// (`Change::DiskSlow`), and caught up (`Change::DiskCaughtUp`) within a freshness of its end; what
+/// the peers trust of its process is what the stream believes throughout (the sim's own check, every
+/// step), and the others' disks are judged as healthy ones are
+/// (`judged_apart_healthy_disks_draw_no_lasting_verdict`). A disk is judged by what waits on it: in
+/// each world, idle (macOS's, Linux's: one log write left waiting on the held disk) and loaded (the
+/// busy one's log writes). An idle disk with nothing to do is no slow one
+/// (`judged_apart_an_idle_node_asks_no_flush_and_its_held_disk_draws_no_verdict`).
+#[test]
+fn judged_apart_a_held_disk_is_judged_slow_and_then_caught_up() {
+    for world in [MACOS, BUSY, LINUX] {
+        let name = world.name;
+        for seed in seeds(43, 8) {
+            let mut sim = Sim::new(3, world, seed);
+            sim.judge_apart();
+            let freshness = settled(&mut sim);
+            let from = sim.now;
+            let held = 2usize;
+            let peer = held as u64 + 1;
+            let end = from + 3 * freshness;
+            sim.nodes[held].disk_held_until = end;
+            if !world.busy {
+                sim.submit(held, Write::Log);
+            }
+            sim.run_while(|_| true, Some(end + 2 * freshness));
+            for judge in (0..3).filter(|j| *j != held) {
+                let verdicts: Vec<(PeerId, bool, u64)> = sim.nodes[judge]
+                    .disks
+                    .iter()
+                    .filter(|(_, _, at)| *at > from)
+                    .copied()
+                    .collect();
+                let slow = verdicts.iter().find(|(p, slow, _)| *p == peer && *slow);
+                let caught = verdicts
+                    .iter()
+                    .find(|(p, slow, at)| *p == peer && !*slow && *at >= end);
+                let others: Vec<(PeerId, bool, u64)> =
+                    verdicts.iter().filter(|v| v.0 != peer).copied().collect();
+                assert!(
+                    slow.is_some_and(|(_, _, at)| *at < end)
+                        && caught.is_some_and(|(_, _, at)| *at <= end + freshness)
+                        && caught_up_within(&others, freshness),
+                    "{name} seed {seed}: node {}'s verdicts on the disks (peer, slow, ms from the \
+                     hold's start) {:?}, the hold {} ms, the freshness {} ms",
+                    judge + 1,
+                    verdicts
+                        .iter()
+                        .map(|(p, s, at)| (*p, *s, (at - from) / MS))
+                        .collect::<Vec<_>>(),
+                    (end - from) / MS,
+                    freshness / MS
+                );
+            }
+        }
+    }
+}
+
+/// Focal's 5a on the disk mode (kiln CP-T2.2): judged apart from their disks, idle nodes ask no
+/// flush of their own, a heartbeat's slot in which nothing became durable asking no probe, and an
+/// idle node's disk held for three freshnesses with nothing written to it draws no verdict: a disk
+/// with nothing to do is no slow one. Today's group, for the contrast, asks its flush proofs over the
+/// same six freshnesses. In macOS's and Linux's idle worlds, 8 seeds each.
+#[test]
+fn judged_apart_an_idle_node_asks_no_flush_and_its_held_disk_draws_no_verdict() {
+    for world in [MACOS, LINUX] {
+        let name = world.name;
+        for seed in seeds(45, 8) {
+            let asked = |apart: bool| {
+                let mut sim = Sim::new(3, world, seed);
+                if apart {
+                    sim.judge_apart();
+                }
+                let freshness = settled(&mut sim);
+                let from = sim.now;
+                let before: Vec<u64> = sim.nodes.iter().map(|n| n.liveness_writes).collect();
+                sim.nodes[2].disk_held_until = from + 3 * freshness;
+                sim.run_while(|_| true, Some(from + 6 * freshness));
+                let asked: Vec<u64> = sim
+                    .nodes
+                    .iter()
+                    .zip(&before)
+                    .map(|(n, before)| n.liveness_writes - before)
+                    .collect();
+                let verdicts: Vec<(usize, PeerId, bool)> = sim
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(judge, n)| {
+                        n.disks
+                            .iter()
+                            .filter(|(_, _, at)| *at > from)
+                            .map(move |(peer, slow, _)| (judge + 1, *peer, *slow))
+                    })
+                    .collect();
+                (asked, verdicts)
+            };
+            let (apart, verdicts) = asked(true);
+            let (today, _) = asked(false);
+            assert!(
+                apart.iter().all(|asked| *asked == 0)
+                    && verdicts.is_empty()
+                    && today.iter().all(|asked| *asked > 0),
+                "{name} seed {seed}: over six freshnesses, flushes asked judged apart {apart:?} \
+                 (today's group {today:?}); verdicts (judge, peer, slow) {verdicts:?}"
+            );
+        }
+    }
+}
+
+/// CP-T2.2 step 2, Focal's condition 5: judged apart from their disks, healthy nodes, idle or
+/// loaded, over twenty freshnesses once the group has settled. A node's disk is slow only past its
+/// flushes' tail and its detectors' freshness, so the flushes macOS's traces hold (to 205 ms, under
+/// its freshness) are no verdict, idle or busy, host freezes and all; Linux's VM disk stalls past
+/// its freshness at times (its trace to 3.7 s), which is a verdict, and each is caught up within a
+/// freshness, the stall's end: no flap, no verdict that lingers past what caused it
+/// (`survey_of_disk_verdicts` has each world's).
+#[test]
+fn judged_apart_healthy_disks_draw_no_lasting_verdict() {
+    for world in [MACOS, BUSY, LINUX] {
+        let name = world.name;
+        for seed in seeds(44, 8) {
+            let mut sim = Sim::new(3, world, seed);
+            sim.judge_apart();
+            let freshness = settled(&mut sim);
+            let from = sim.now;
+            sim.run_while(|_| true, Some(from + 20 * freshness));
+            for (judge, node) in sim.nodes.iter().enumerate() {
+                let verdicts: Vec<(PeerId, bool, u64)> = node
+                    .disks
+                    .iter()
+                    .filter(|(_, _, at)| *at > from)
+                    .copied()
+                    .collect();
+                let none_where_none_stalls = world.name == LINUX.name || verdicts.is_empty();
+                assert!(
+                    none_where_none_stalls && caught_up_within(&verdicts, freshness),
+                    "{name} seed {seed}: node {} judged healthy disks (peer, slow, ms from the \
+                     group settling) {:?}, the freshness {} ms",
+                    judge + 1,
+                    verdicts
+                        .iter()
+                        .map(|(p, s, at)| (*p, *s, (at - from) / MS))
+                        .collect::<Vec<_>>(),
+                    freshness / MS
+                );
+            }
+        }
+    }
+}
+
+/// Whether every slow verdict in `verdicts` (a judge's, in order: peer, slow, arrival) is caught up
+/// within `within` of it.
+fn caught_up_within(verdicts: &[(PeerId, bool, u64)], within: u64) -> bool {
+    verdicts.iter().enumerate().all(|(i, (peer, slow, at))| {
+        !*slow
+            || verdicts[i + 1..]
+                .iter()
+                .find(|(p, ..)| p == peer)
+                .is_some_and(|(_, again, back)| !*again && *back <= at + within)
+    })
+}
+
+/// What healthy disks' verdicts are in each world, judged apart: per node, the slow verdicts its
+/// peers gave, how long the longest lasted, against the world's longest flush (its trace's maximum)
+/// and the node's own flush tail at the end. A survey, not a check: run with `--ignored
+/// --nocapture`.
+#[test]
+#[ignore = "a survey of disk verdicts, not a check"]
+fn survey_of_disk_verdicts() {
+    for world in [MACOS, BUSY, LINUX] {
+        let name = world.name;
+        let longest = world.flush[world.flush.len() - 1];
+        for seed in seeds(44, 8) {
+            let mut sim = Sim::new(3, world, seed);
+            sim.judge_apart();
+            let freshness = settled(&mut sim);
+            let from = sim.now;
+            let span = 20 * freshness;
+            sim.run_while(|_| true, Some(from + span));
+            let mut line = Vec::new();
+            for peer in 1..=3u64 {
+                let mut slow = 0;
+                let mut longest_verdict = 0u64;
+                for judge in sim.nodes.iter().filter(|n| n.owner.id != peer) {
+                    let mut since = None;
+                    for &(p, is_slow, at) in
+                        judge.disks.iter().filter(|d| d.0 == peer && d.2 > from)
+                    {
+                        let _ = p;
+                        if is_slow {
+                            slow += 1;
+                            since = Some(at);
+                        } else if let Some(began) = since.take() {
+                            longest_verdict = longest_verdict.max(at - began);
+                        }
+                    }
+                }
+                let tail = sim.nodes[(peer - 1) as usize]
+                    .liveness
+                    .flush_tail()
+                    .map_or(0, |t| t.as_nanos() as u64 / 1_000);
+                line.push(format!(
+                    "n{peer}: {slow} slow verdicts, the longest {} ms, tail {} us",
+                    longest_verdict / MS,
+                    tail
+                ));
+            }
+            println!(
+                "{name} seed {seed}: {} ms span, longest trace flush {} ms, freshness {} ms; {}",
+                span / MS,
+                longest / MS,
+                freshness / MS,
+                line.join("; ")
+            );
+        }
+    }
+}
+
+/// Today's group judges by the flush proof and no disk apart from it: a held disk gives no
+/// `Change::DiskSlow`.
+#[test]
+fn todays_group_gives_no_disk_verdict() {
+    for world in [MACOS, BUSY, LINUX] {
+        let name = world.name;
+        for seed in seeds(45, 4) {
+            let mut sim = Sim::new(3, world, seed);
+            let freshness = settled(&mut sim);
+            let from = sim.now;
+            sim.nodes[2].disk_held_until = from + 3 * freshness;
+            sim.run_while(|_| true, Some(from + 6 * freshness));
+            assert!(
+                sim.nodes.iter().all(|node| node.disks.is_empty()),
+                "{name} seed {seed}: a disk verdict in today's group"
+            );
         }
     }
 }
@@ -2304,7 +3591,10 @@ fn a_sender_that_skips_slots_is_late_not_lost() {
             late_ns: 0,
             flushes: slot + 1,
             flush_age_ns: 0,
+            apart: false,
+            disk_slow: false,
             echo: None,
+            stopping: false,
         };
         let bytes = beat.encode(&mut out).to_vec();
         let _ = node.on_heartbeat(2, &bytes, arrival, &mut owner);
@@ -2457,7 +3747,10 @@ fn a_wait_a_message_ends_past_its_wake_measures_the_wake() {
                 late_ns: 0,
                 flushes: seq + 1,
                 flush_age_ns: 0,
+                apart: false,
+                disk_slow: false,
                 echo: None,
+                stopping: false,
             };
             let bytes = beat.encode(&mut out).to_vec();
             outcomes.push(node.on_heartbeat(2, &bytes, came, &mut owner));
@@ -2472,6 +3765,179 @@ fn a_wait_a_message_ends_past_its_wake_measures_the_wake() {
                 outcomes.iter().all(|o| *o == Err(Refusal::Unmeasured)),
                 "{outcomes:?}"
             );
+        }
+    }
+}
+
+/// Focal's condition 1 on the disk mode (kiln's CP-T2.2): a heartbeat of the other mode is refused
+/// for its disk, typed, and its sender judged by its arrivals. Node 1 judges its peers apart from their disks, nodes 2
+/// and 3 do not. Through ten of the same-mode pair's freshnesses every heartbeat node 1 takes from
+/// the others, and they from it, is refused for its disk (`Refusal::OtherMode`, counted in each
+/// pair's report) and taken for its sender's process, and each pair across the modes judges its
+/// peer apart from its disk, by its arrivals alone: node 1, alone in its mode, from its own measure
+/// of the others' heartbeats. A pair so judged makes the mistakes any detector's margin allows, and
+/// no other: the record holds each suspicion to the arrivals it was made on, whichever the modes
+/// (over 256 seeds a world, node 1 suspected node 2, whose heartbeats wait on its flushes, for its
+/// silence at macos seed 197568495618, and node 2 node 1 in a stall of the world's at
+/// 197568495731). Nodes 2 and 3 judge each other as ever.
+/// Killed while it speaks the other mode, node 1 is suspected by both (the backstop: a dead
+/// process of either mode is suspected). Each pair across the modes is told the mismatch once, as it began
+/// (`Change::ModeDiffers`), and the pair of one mode never. Started again in their mode, node 1 is
+/// taken, its peers told once that its mode agrees again (`Change::ModeAgrees`), and killed after,
+/// it is suspected as any peer is.
+#[test]
+fn a_heartbeat_of_the_other_mode_is_refused_for_its_disk_and_its_sender_judged_by_its_arrivals() {
+    for world in [MACOS, BUSY, LINUX] {
+        let name = world.name;
+        for seed in seeds(46, 8) {
+            let mut sim = Sim::new(3, world, seed);
+            sim.nodes[0].liveness.set_disk_apart(true);
+            // The pair of one mode is judged; the pairs across the modes take nothing.
+            let judged = |sim: &Sim, node: usize, peer: PeerId| {
+                sim.nodes[node]
+                    .liveness
+                    .report(peer)
+                    .is_some_and(|r| r.judged)
+            };
+            sim.run_while(|sim| !(judged(sim, 1, 3) && judged(sim, 2, 2)), None);
+            let freshness = [(1usize, 3u64), (2, 2)]
+                .iter()
+                .filter_map(|&(node, peer)| sim.nodes[node].liveness.report(peer)?.freshness)
+                .max()
+                .map_or(0, |f| f.as_nanos() as u64);
+            let from = sim.now;
+            sim.run_while(|_| true, Some(from + 10 * freshness));
+            // The pairs across the modes judged too, within a minute: a node alone in the disk mode
+            // asks no probe, so its floor rests on its first flush, and its links take longer to be
+            // configured (macOS seed 197568495619: past ten freshnesses, judged by 20 s).
+            let across = [(0usize, 2u64), (0, 3), (1, 1), (2, 1)];
+            let limit = sim.now + 60_000 * MS;
+            sim.run_while(
+                |sim| !across.iter().all(|&(node, peer)| judged(sim, node, peer)),
+                Some(limit),
+            );
+            for (node, peer) in across {
+                let report = sim.nodes[node].liveness.report(peer).unwrap();
+                assert!(
+                    report.other_mode > 0 && report.taken > 0 && report.judged,
+                    "{name} seed {seed}: node {} of peer {peer} across the modes: refused for the \
+                     other mode {}, taken {}, judged {}, trust {:?}",
+                    node + 1,
+                    report.other_mode,
+                    report.taken,
+                    report.judged,
+                    sim.nodes[node].liveness.trust(peer)
+                );
+            }
+            // Each pair across the modes was told the mismatch once, as it began; a pair of one
+            // mode never.
+            let told = |sim: &Sim, node: usize, peer: PeerId| -> Vec<bool> {
+                sim.nodes[node]
+                    .modes
+                    .iter()
+                    .filter(|(of, ..)| *of == peer)
+                    .map(|(_, differs, _)| *differs)
+                    .collect()
+            };
+            for (node, peer) in [(0usize, 2u64), (0, 3), (1, 1), (2, 1)] {
+                assert_eq!(
+                    told(&sim, node, peer),
+                    vec![true],
+                    "{name} seed {seed}: node {} of peer {peer}: the mode's changes told",
+                    node + 1
+                );
+            }
+            for (node, peer) in [(1usize, 3u64), (2, 2)] {
+                assert!(
+                    told(&sim, node, peer).is_empty(),
+                    "{name} seed {seed}: node {} of peer {peer}, one mode, told a mode's change",
+                    node + 1
+                );
+            }
+            // The pair of one mode is judged by its own rules, today's flush proof: taken, never
+            // refused for its mode, and judged (trusted, or suspected for a disk that stalled, as
+            // today's mode suspects one: Linux's VM disk at seed 55).
+            for (node, peer) in [(1usize, 3u64), (2, 2)] {
+                let report = sim.nodes[node].liveness.report(peer).unwrap();
+                assert!(
+                    report.taken > 0 && report.other_mode == 0 && report.judged,
+                    "{name} seed {seed}: node {} of peer {peer}, one mode: taken {}, refused for \
+                     the other mode {}, judged {}",
+                    node + 1,
+                    report.taken,
+                    report.other_mode,
+                    report.judged
+                );
+            }
+            // Killed while it speaks the other mode, node 1 is suspected by both: they judge its
+            // process by its heartbeats' arrivals. Killed once both trust it, as below, so each
+            // suspicion is of the kill and not one its stalls had already drawn.
+            let trusted = |sim: &Sim| {
+                (1..3).all(|node| {
+                    matches!(
+                        sim.nodes[node].liveness.trust(1),
+                        Some(Trust::Trusted { until_ns }) if until_ns > sim.now
+                    )
+                })
+            };
+            sim.run_while(|sim| !trusted(sim), None);
+            let killed_other = sim.now;
+            sim.nodes[0].alive = false;
+            sim.run_until_suspected(0);
+            for node in 1..3 {
+                assert!(
+                    sim.nodes[node]
+                        .suspicions
+                        .iter()
+                        .any(|s| s.peer == 1 && s.at_ns >= killed_other),
+                    "{name} seed {seed}: node {} never suspected node 1, killed while it spoke \
+                     the other mode",
+                    node + 1
+                );
+            }
+            // Node 1 starts again in the others' mode: a new run, taken and judged as any.
+            let mut liveness = Liveness::new(Settings {
+                local: 1,
+                run: 2,
+                max_peers: 3,
+                history: Exposure::new(),
+                resolution: RESOLUTION,
+            })
+            .unwrap();
+            liveness.attach(2).unwrap();
+            liveness.attach(3).unwrap();
+            sim.restart(0, liveness);
+            sim.poll(0);
+            // Unbounded, as `killed_peer_is_suspected_within_its_bound` waits: a judge whose own
+            // flush proof is out judges no peer until it comes (Linux's VM disk at seed 55 held
+            // node 2's past twenty freshnesses), and the simulation's step budget bounds the run.
+            sim.run_while(|sim| !(judged(sim, 1, 1) && judged(sim, 2, 1)), None);
+            sim.run_while(|sim| !trusted(sim), None);
+            for node in 1..3 {
+                assert_eq!(
+                    told(&sim, node, 1),
+                    vec![true, false],
+                    "{name} seed {seed}: node {} of node 1 started again in its mode: the mode's \
+                     changes told",
+                    node + 1
+                );
+            }
+            let killed = sim.now;
+            sim.nodes[0].alive = false;
+            sim.run_until_suspected(0);
+            for node in 1..3 {
+                let found = sim.nodes[node]
+                    .suspicions
+                    .iter()
+                    .rfind(|s| s.peer == 1 && s.at_ns >= killed)
+                    .copied();
+                assert!(
+                    found.is_some(),
+                    "{name} seed {seed}: node {} never suspected node 1, killed after it started \
+                     again in its mode",
+                    node + 1
+                );
+            }
         }
     }
 }

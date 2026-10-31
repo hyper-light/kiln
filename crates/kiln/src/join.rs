@@ -898,7 +898,7 @@ pub async fn servers_in(table: &crate::discovery::Table, max: Duration) -> Vec<I
 /// `kiln up` on a machine that never ran a server: offer to join a kiln server on the network as an
 /// agent instead of starting another server. True when this machine joined.
 pub async fn offer_instead_of_server(config_path: &Path, cfg: &crate::config::Config) -> anyhow::Result<bool> {
-    let fresh = !config_path.exists() && !cfg.server.data_dir.join("kiln.db").exists();
+    let fresh = !config_path.exists() && !cfg.server.data_dir.join(crate::store::FILE).exists() && !cfg.server.data_dir.join("kiln.db").exists();
     if !fresh || !cfg.discovery.enabled || !interactive() {
         return Ok(false);
     }
@@ -926,7 +926,7 @@ pub async fn offer_instead_of_server(config_path: &Path, cfg: &crate::config::Co
         boot: crate::install::Boot::Auto,
         wait: 3,
     };
-    cli(args, shutdown).await?;
+    cli_with_config(args, shutdown, config_path.to_path_buf()).await?;
     Ok(true)
 }
 
@@ -966,6 +966,13 @@ pub struct JoinArgs {
 
 /// `kiln join`. Returns the agent to run in the foreground with `--no-install`.
 pub async fn cli(a: JoinArgs, shutdown: Shutdown) -> anyhow::Result<Option<crate::agent::Opts>> {
+    cli_with_config(a, shutdown, crate::config::default_config_path()).await
+}
+
+/// Retain the caller's local host authority through foreground or installed startup.
+pub async fn cli_with_config(a: JoinArgs, shutdown: Shutdown, config_path: std::path::PathBuf) -> anyhow::Result<Option<crate::agent::Opts>> {
+    let config_path = std::path::absolute(config_path)?;
+    crate::config::Config::load(&config_path)?;
     let interactive = interactive();
     let state_dir = crate::config::default_data_dir().join("agent");
     // This machine's runner, running: joining never starts a second one beside it, nor takes the
@@ -997,6 +1004,7 @@ pub async fn cli(a: JoinArgs, shutdown: Shutdown) -> anyhow::Result<Option<crate
             Ok(true) => {
                 anyhow::ensure!(!a.no_install, "this machine's runner ({units}) already works for {server}: one in the foreground would be a second one beside it");
                 say_stderr(&format!("This machine's runner ({units}) already works for {server}: this kiln takes it over (its name, labels and slots stay), rather than joining again beside it."));
+                anyhow::ensure!(config_path == std::path::absolute(crate::config::default_config_path())?, "runner takeover cannot preserve a non-default --config context; no takeover was started");
                 crate::upgrade::take_over(&state_dir, &server, &|m| say_stderr(&format!("  {m}"))).await?;
                 say_stderr(&format!("\nTaken over: this machine's runner of {server} is this kiln now."));
                 return Ok(None);
@@ -1029,6 +1037,7 @@ pub async fn cli(a: JoinArgs, shutdown: Shutdown) -> anyhow::Result<Option<crate
             slots: a.slots.unwrap_or_else(|| u32::try_from((cpus / 4).max(1)).unwrap_or(1)),
             work_dir: state_dir.join("work"),
             state_dir,
+            shared_store: None,
             join_token: None,
             ephemeral: false,
             dedicated_job: None,
@@ -1037,14 +1046,14 @@ pub async fn cli(a: JoinArgs, shutdown: Shutdown) -> anyhow::Result<Option<crate
             shell: None,
             credentials: None,
             instance: None,
-            config: None,
+            config: Some(config_path.clone()),
             reach: Some(true),
             observe: true,
             outpost: false,
             declared: crate::runner::probe::Declared::default(),
         }));
     }
-    crate::install::install(crate::install::InstallArgs {
+    crate::install::install_with_config(crate::install::InstallArgs {
         // At a terminal, Windows may ask for administrator rights to start kiln at boot.
         unattended: !interactive,
         system: false,
@@ -1065,7 +1074,7 @@ pub async fn cli(a: JoinArgs, shutdown: Shutdown) -> anyhow::Result<Option<crate
         image: None,
         registry: None,
         port: 7070,
-    })
+    }, config_path)
     .await?;
     // When it starts (at boot, or at sign-in) is the install's to say: it's the `boot` line above.
     say_stderr(&format!("\nJoined: this machine is agent \"{}\" of {}.", joined.name, joined.server));

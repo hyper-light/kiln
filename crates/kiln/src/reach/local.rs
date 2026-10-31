@@ -128,7 +128,7 @@ pub fn find_socket() -> anyhow::Result<PathBuf> {
 }
 
 /// Of the reach sockets `found`, the one a runner answers on: a file nothing answers on is one a
-/// runner left as it ended (`crate::harness::socket::sweep` removes them in time). Among several,
+/// runner left as it ended; discovery ignores it without deleting its path. Among several,
 /// the machine's installed runner's, whose state directory is the default (its name ends in
 /// `-<installed>.sock`), before a test's or a lab's.
 fn choose_socket(mut found: Vec<PathBuf>, installed: &str) -> anyhow::Result<PathBuf> {
@@ -298,7 +298,9 @@ async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &async_channel::S
     if peer == me {
         // This machine suits best: no copy, no link — the folder as it is.
         spec.cwd = req.cwd.clone().or(req.remote_cwd.clone());
-        return run_here(spec, ev, ctl).await;
+        let permit = handle.admission().acquire(&peer, Want::parse(&req.target)?.needs).await?;
+        let lease = handle.admission().claim(permit, me).await?;
+        return run_here(spec, ev, ctl, lease).await;
     }
     handle.connect(&peer).await?;
     if req.sync {
@@ -315,7 +317,7 @@ async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &async_channel::S
         spec.cwd = req.remote_cwd.clone();
     }
     let (says_tx, says) = async_channel::unbounded::<Say>();
-    let id = handle.run(&peer, spec, says_tx).await?;
+    let id = handle.run_needs(&peer, spec, says_tx, Want::parse(&req.target)?.needs).await?;
     // Set once the client went away: by then the run should have ended, else it is killed.
     let mut stop_by: Option<Instant> = None;
     loop {
@@ -373,11 +375,12 @@ async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &async_channel::S
 }
 
 /// Run on this machine (it suited best): the same events, no link.
-async fn run_here(spec: RunSpec, ev: &async_channel::Sender<Ev>, ctl: async_channel::Receiver<Req>) -> anyhow::Result<()> {
+async fn run_here(spec: RunSpec, ev: &async_channel::Sender<Ev>, ctl: async_channel::Receiver<Req>, lease: super::leases::Lease) -> anyhow::Result<()> {
     let cwd = super::serve::resolve_cwd(&spec, None)?;
     let (tx, rx) = async_channel::bounded::<super::serve::Event>(16);
     let shell = spec.shell.as_deref().map(|s| crate::os::home_dir().join(".kiln").join("reach").join("shells").join(s));
-    let stdin = super::serve::start(spec, cwd, shell, Vec::new(), tx);
+    let fence = lease.control();
+    let stdin = super::serve::start_leased(spec, cwd, shell, Vec::new(), tx, lease);
     let mut pid = None;
     loop {
         use futures::FutureExt as _;
@@ -397,12 +400,13 @@ async fn run_here(spec: RunSpec, ev: &async_channel::Sender<Ev>, ctl: async_chan
             c = ctl.recv().fuse() => match c {
                 Ok(Req::Input(d)) => { let _ = stdin.send(d).await; }
                 Ok(Req::InputEnd) => { let _ = stdin.send(Vec::new()).await; }
-                Ok(Req::Signal(s)) => if let Some(p) = pid { super::serve::signal_group(p, s); },
+                Ok(Req::Signal(s)) => {
+                    if s == Signal::Kill { fence.store(true, std::sync::atomic::Ordering::Release); }
+                    if !fence.load(std::sync::atomic::Ordering::Acquire) && let Some(p) = pid { super::serve::signal_group(p, s); }
+                },
                 Ok(_) => {}
                 Err(_) => {
-                    if let Some(p) = pid {
-                        super::serve::signal_group(p, Signal::Terminate);
-                    }
+                    fence.store(true, std::sync::atomic::Ordering::Release);
                     return Ok(());
                 }
             },
@@ -511,8 +515,11 @@ async fn connection(handle: Handle, me: String, fd: std::sync::Arc<std::os::fd::
             }
         },
         Req::Forget { runner } => {
-            let ok = handle.forget(&runner).await.unwrap_or(false);
-            let _ = ev_tx.send(Ev::Forgot(ok)).await;
+            let ev = match handle.forget(&runner).await {
+                Ok(forgot) => Ev::Forgot(forgot),
+                Err(e) => Ev::Error(format!("{e:#}")),
+            };
+            let _ = ev_tx.send(ev).await;
         }
         Req::Ask { json } => {
             let ev = match handle.query(json).await {

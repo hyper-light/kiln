@@ -1,11 +1,8 @@
-//! Replacing a machine's runner without a restart, for runners that cannot take a new binary in
-//! place (those from before in-place upgrades): `kiln install --agent --upgrade` starts a new
-//! runner *beside* the old one, as another process ("instance") of the same machine with its own
-//! certificate. The server sends all new work to the newest instance; the old one keeps every
-//! terminal, agent session and job it already runs. Once it holds nothing, the server tells the
-//! new instance, which stops and disables the old service (after checking the old process really
-//! has no terminals left). From then on the new runner upgrades in place (same process, terminals
-//! handed across the exec), so this is needed once per machine.
+//! Historical runner-instance state, service discovery and retirement.
+//!
+//! U16 runner upgrades enter the canonical CI/CD lifecycle. The old companion installer remains
+//! a typed compatibility refusal: it cannot select this CLI's image or publish a runner binary.
+//! Existing instance files and retirement duties remain readable for runners installed earlier.
 //!
 //! Per instance, under `<state>/instances/<id>/`: its certificate (`agent.pem`; the machine's key
 //! `agent.key` is shared), `instance.json` (when it was set up), `replaces.json` (the service it
@@ -14,7 +11,6 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
 
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
@@ -46,8 +42,8 @@ pub struct Replaces {
     pub system: bool,
     /// The unit / label / task name.
     pub unit: String,
-    /// The old service's binary, also the `kiln` command users run: brought up to date once the
-    /// old service is gone (it could not be replaced before: the old supervisor watches it).
+    /// The old service's CLI destination, retained for reading historical replacement records.
+    /// U16: only an explicit installation publishes CLI binaries; retirement records no authority.
     #[serde(default)]
     pub cli_bin: Option<PathBuf>,
     /// Set once the old service was stopped.
@@ -145,31 +141,23 @@ pub enum Retired {
 /// in is stopped and disabled once its processes hold no terminal (checked here as well as by the
 /// server), and never another one ([`retire_instance`]: a machine may have more than one older
 /// process, and one may hold agent sessions still). An instance here set up to replace that service
-/// ([`duties`]) notes it was, and when it's this one's, the `kiln` command is brought up to date.
+/// ([`duties`]) records that service retirement. CLI publication belongs to explicit installation.
 /// Blocking: runs the platform's service manager.
 pub fn retire(state_dir: &Path, me: &str, instance: &str) -> anyhow::Result<Retired> {
     let done = retire_instance(state_dir, instance)?;
     if let Retired::Stopped(unit) = &done {
-        for (i, path) in duties(state_dir, me).into_iter().enumerate() {
-            note_retired(&path, unit, i == 0);
+        for path in duties(state_dir, me) {
+            note_retired(&path, unit);
         }
     }
     Ok(done)
 }
 
-/// Service `unit` was retired: the `replaces.json` at `path` naming it says so. `own`: the duty
-/// was this instance's (it replaced that service itself).
-fn note_retired(path: &Path, unit: &str, own: bool) {
+/// Service `unit` was retired: the `replaces.json` at `path` naming it says so.
+fn note_retired(path: &Path, unit: &str) {
     let Some(mut r) = read_json::<Replaces>(path).filter(|r| r.unit == unit) else { return };
-    // The old supervisor no longer watches its binary: bring the `kiln` command up to date. Not for
-    // another instance's duty: that binary may be the one this runner's own supervisor runs, and
-    // replacing it would start an upgrade nobody asked for.
-    if let Some(bin) = r.cli_bin.as_ref().filter(|_| own) {
-        match std::env::current_exe().and_then(|exe| copy_atomic(&exe, bin)) {
-            Ok(()) => tracing::info!(path = %bin.display(), "updated the kiln command to this runner's version"),
-            Err(e) => tracing::warn!(error = %e, path = %bin.display(), "could not update the kiln command"),
-        }
-    }
+    // U16: a delayed retirement receipt has no CLI publication authority. Keep cli_bin as
+    // historical metadata so an older duty cannot overwrite a newer explicit installation.
     r.retired_at = Some(crate::util::now_unix());
     if let Err(e) = write_json(path, &r) {
         tracing::warn!(error = %format!("{e:#}"), path = %path.display(), "could not note the retired service");
@@ -250,16 +238,6 @@ fn unit_in_cgroup(cgroup: &str) -> Option<(String, bool)> {
     let path = cgroup.lines().find_map(|l| l.strip_prefix("0::"))?;
     let unit = path.split('/').rfind(|c| c.ends_with(".service") && !c.starts_with("user@"))?;
     Some((unit.trim_end_matches(".service").to_owned(), path.starts_with("/system.slice/")))
-}
-
-fn copy_atomic(from: &Path, to: &Path) -> std::io::Result<()> {
-    if from.canonicalize().ok() == to.canonicalize().ok() {
-        return Ok(());
-    }
-    let tmp = to.with_extension(format!("new.{}", std::process::id()));
-    std::fs::copy(from, &tmp)?;
-    crate::os::make_executable(&tmp)?;
-    std::fs::rename(&tmp, to)
 }
 
 fn output(cmd: &mut Command) -> Option<String> {
@@ -625,106 +603,11 @@ fn service_active(boot: &str, system: bool, unit: &str) -> bool {
     }
 }
 
-/// `kiln install --agent --upgrade`: run this binary as a new runner beside the installed one.
-/// Safe to re-run: an instance already set up is brought up to this binary (in place) instead.
-/// `server`: the URL the new runner reaches its server at, when not the one the installed runner
-/// does (`kiln join` names the server it was given: [`take_over`]).
-pub async fn install_alongside(unit: &str, server: Option<&str>, say: &(dyn Fn(String) + Sync)) -> anyhow::Result<()> {
-    let existing = find_existing(unit).ok_or_else(|| {
-        anyhow::anyhow!("no installed kiln agent service ({unit}) found to upgrade beside; install one with `kiln install --agent` first")
-    })?;
-    let to = server;
-    // launchd (macOS): the binary the job's runner runs is replaced (never its launcher, which
-    // macOS knows the job by), and the runner takes it up as a fresh process once its jobs are
-    // done, keeping its terminals; a runner from before launchers has launchd start it afresh,
-    // from a launcher, instead.
-    if existing.boot == "launchd" {
-        copy_atomic(&std::env::current_exe()?, &existing.bin).with_context(|| format!("install {}", existing.bin.display()))?;
-        say(format!("runner      {} (taken up once its jobs are done; it keeps its terminals)", existing.bin.display()));
-        return Ok(());
-    }
-    // Windows: the binary the runner's Scheduled Task (or Startup-folder script) starts is
-    // replaced, the running one moved aside as Windows allows; its supervisor sees it change and
-    // restarts the runner into it.
-    if existing.boot == "task" || existing.boot == "startup" {
-        crate::install::place_binary(&existing.bin)?;
-        say(format!("runner      {} (its supervisor restarts the runner into it)", existing.bin.display()));
-        return Ok(());
-    }
-    let state_dir = arg_value(&existing.args, "--state-dir").map_or_else(|| crate::config::default_data_dir().join("agent"), PathBuf::from);
-    let (machine_cert, key) = machine_credentials(&state_dir)?;
-    let server = to.map(str::to_owned).or_else(|| arg_value(&existing.args, "--server")).or_else(|| crate::join::stored(&state_dir, "server")).ok_or_else(|| {
-        anyhow::anyhow!("cannot tell which server the installed agent uses (no --server in {unit})")
-    })?;
-    let name = crate::pki::leaf_name(&crate::pki::Leaf { cert_pem: machine_cert.clone(), key_pem: String::new() })
-        .ok_or_else(|| anyhow::anyhow!("the machine's certificate names no machine"))?;
-    let runner_dir = crate::config::default_data_dir().join("runner");
-    let stable_bin = runner_dir.join(if cfg!(windows) { "kiln.exe" } else { "kiln" });
-    let exe = std::env::current_exe()?;
-
-    // Already set up: take this binary up in place (the new runner re-executes itself, keeping its
-    // terminals) and make sure its service runs.
-    if let Some((id, r)) = replacing(&state_dir, unit).into_iter().next() {
-        let new_unit = instance_unit(unit, &id);
-        copy_atomic(&exe, &stable_bin).with_context(|| format!("install {}", stable_bin.display()))?;
-        say(format!("runner      {} (instance {id}, service {new_unit})", stable_bin.display()));
-        if !service_active(&existing.boot, existing.system, &new_unit) {
-            let mut cmd = Command::new("systemctl");
-            if !existing.system {
-                cmd.arg("--user");
-            }
-            let _ = cmd.args(["enable", "--now", &format!("{new_unit}.service")]).status();
-        }
-        say(if r.retired_at.is_some() {
-            format!("status      the old runner ({unit}) is already retired")
-        } else {
-            format!("status      the old runner ({unit}) keeps what it runs and retires itself once that ends")
-        });
-        return Ok(());
-    }
-
-    // A new instance: its own certificate first (fails fast if the server says no).
-    let id = uuid::Uuid::now_v7().to_string();
-    let dir = instance_dir(&state_dir, &id);
-    std::fs::create_dir_all(&dir)?;
-    let ca = std::fs::read_to_string(state_dir.join("ca.pem")).ok();
-    let e = fetch_certificate(&server, ca.as_deref(), &name, &machine_cert, &key).await?;
-    crate::util::write_secret(&dir.join("agent.pem"), e.cert_pem.as_bytes(), 0o644)?;
-    write_json(&dir.join("instance.json"), &InstanceRecord { id: id.clone(), created_at: crate::util::now_unix() })?;
-    say(format!("instance    {id} (its own certificate for {name})"));
-
-    // Its binary: a versioned copy, and the stable path its service runs (replaced in place later).
-    std::fs::create_dir_all(runner_dir.join("versions"))?;
-    let versioned = runner_dir.join("versions").join(format!("kiln-{}-{}", env!("CARGO_PKG_VERSION"), id.get(..8).unwrap_or("x")));
-    copy_atomic(&exe, &versioned)?;
-    copy_atomic(&exe, &stable_bin)?;
-    say(format!("runner      {}", stable_bin.display()));
-
-    write_json(
-        &dir.join("replaces.json"),
-        &Replaces { boot: existing.boot.clone(), system: existing.system, unit: unit.to_owned(), cli_bin: Some(existing.bin.clone()), retired_at: None },
-    )?;
-
-    // Named for the machine's usual service, whatever the one it's beside is (itself an instance's).
-    let new_unit = instance_unit(base_unit(unit), &id);
-    // Its own instance, in place of the one the runner it's beside may have (itself set up by an
-    // upgrade before): `agent` takes `--instance` once.
-    let mut args = vec!["supervise".to_owned(), "--".to_owned()];
-    let run = with_instance(&existing.args, &id);
-    args.extend(match to {
-        Some(url) => with_server(&run, url, &quic_for(url, &e.quic)),
-        None => run,
-    });
-    crate::install::start_service(existing.system, &new_unit, &stable_bin, &args, &state_dir, &existing.env)?;
-    say(format!("service     {new_unit} started beside {unit}"));
-    // Wait until the new runner reached the server (its certificate and connection work).
-    let ok = wait_for_connect(&dir, Duration::from_secs(30)).await;
-    say(if ok {
-        "status      new terminals, agents and jobs go to the new runner; the old one keeps what it runs and retires itself once that ends".to_owned()
-    } else {
-        format!("status      started; check `journalctl --user -u {new_unit}` if it does not appear in Runners")
-    });
-    Ok(())
+/// U16: compatibility entrypoint only. Arbitrary CLI images cannot bypass the existing
+/// authorized CI/CD request and captured supervisor activation. Refuse before service discovery,
+/// publication, certificate enrollment or process launch in this backend.
+pub async fn install_alongside(_unit: &str, _server: Option<&str>, _say: &(dyn Fn(String) + Sync)) -> anyhow::Result<()> {
+    Err(crate::updates::UpgradeRefusal::LegacyInstaller.into())
 }
 
 /// A runner's arguments with `--instance` set to `id` (the new build runs as its own instance),
@@ -750,46 +633,6 @@ pub fn with_instance(args: &[String], id: &str) -> Vec<String> {
     out
 }
 
-/// A runner's arguments reaching its server at `server` (QUIC at `quic`) instead.
-pub fn with_server(args: &[String], server: &str, quic: &str) -> Vec<String> {
-    let mut out = Vec::with_capacity(args.len() + 4);
-    let mut skip = false;
-    for a in args {
-        if std::mem::take(&mut skip) {
-            continue;
-        }
-        if a == "--server" || a == "--quic" {
-            skip = true;
-            continue;
-        }
-        if a.starts_with("--server=") || a.starts_with("--quic=") {
-            continue;
-        }
-        out.push(a.clone());
-    }
-    out.extend(["--server".to_owned(), server.to_owned(), "--quic".to_owned(), quic.to_owned()]);
-    out
-}
-
-/// Where a runner reaching its server's HTTP at `server` dials QUIC: the address the server says
-/// (`advertised`) at the host it is reached at, when that host is an address (as `kiln join` has it).
-fn quic_for(server: &str, advertised: &str) -> String {
-    let port = advertised.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok());
-    match (crate::join::host_of(server), port) {
-        (Some(host), Some(port)) if host.parse::<std::net::IpAddr>().is_ok() => crate::join::host_port(&host, port),
-        _ => advertised.to_owned(),
-    }
-}
-
-/// The machine's usual service a unit is, or is an instance of (`kiln-agent-01a14794`:
-/// `kiln-agent`).
-fn base_unit(unit: &str) -> &str {
-    match unit.rsplit_once('-') {
-        Some((base, id)) if id.len() == 8 && id.chars().all(|c| c.is_ascii_alphanumeric()) && base.starts_with("kiln-agent") => base,
-        _ => unit,
-    }
-}
-
 /// One of this machine's kiln agent services, and whether it runs now.
 #[derive(Debug, Clone)]
 pub struct Here {
@@ -813,10 +656,8 @@ pub fn services_here(state_dir: &Path, unit: &str) -> Vec<Here> {
     here
 }
 
-/// `kiln join` on a machine whose runner works for that very server (reached at `server`): no
-/// second enrollment and no second runner beside it. The new kiln starts beside the runner as the
-/// machine's newest process ([`install_alongside`]); the runner hands it each agent session as
-/// its turn ends and retires once it holds nothing (`crate::handovers`).
+/// Historical same-server takeover caller. Its companion installer now refuses through
+/// [`install_alongside`]; it cannot silently translate this CLI image into a different CI release.
 pub async fn take_over(state_dir: &Path, server: &str, say: &(dyn Fn(String) + Sync)) -> anyhow::Result<()> {
     let here = services_here(state_dir, "kiln-agent");
     let current = here.iter().find(|h| h.running).or_else(|| here.first()).ok_or_else(|| anyhow::anyhow!("no kiln agent service is installed on this machine to take over from"))?;
@@ -834,19 +675,6 @@ pub fn stop_here(state_dir: &Path) -> anyhow::Result<Vec<String>> {
         stopped.push(e.unit);
     }
     Ok(stopped)
-}
-
-/// The new runner writes `connected` into its instance directory once the server welcomed it.
-async fn wait_for_connect(dir: &Path, timeout: Duration) -> bool {
-    let marker = dir.join("connected");
-    let deadline = std::time::Instant::now() + timeout;
-    while std::time::Instant::now() < deadline {
-        if marker.exists() {
-            return true;
-        }
-        crate::rt::sleep(Duration::from_millis(300)).await;
-    }
-    false
 }
 
 #[cfg(test)]
@@ -899,15 +727,14 @@ mod tests {
     }
 
     #[test]
-    fn a_take_over_reaches_the_server_where_it_was_joined() {
-        let args: Vec<String> = ["agent", "--server", "http://192.168.49.2:30070", "--name", "box", "--quic", "192.168.49.2:30071", "--instance", "a"].map(str::to_owned).to_vec();
-        let moved = with_server(&with_instance(&args, "b"), "http://192.168.1.77:7070", &quic_for("http://192.168.1.77:7070", "kiln.local:7071"));
-        assert_eq!(moved, ["agent", "--name", "box", "--instance", "b", "--server", "http://192.168.1.77:7070", "--quic", "192.168.1.77:7071"]);
-        // By name, the address the server says.
-        assert_eq!(quic_for("https://kiln.example", "kiln.example:7071"), "kiln.example:7071");
-        assert_eq!(base_unit("kiln-agent-01a14794"), "kiln-agent");
-        assert_eq!(base_unit("kiln-agent"), "kiln-agent");
-        assert_eq!(base_unit("kiln-agent-ci"), "kiln-agent-ci");
+    fn a_take_over_reaches_the_server_where_it_was_joined() -> anyhow::Result<()> {
+        // U16: the historical route refuses even an arbitrary unit before discovery or launch;
+        // it cannot use a caller-provided server to turn a local image into an upgrade request.
+        let refusal = crate::rt::block_on(async {
+            install_alongside("arbitrary-unit", Some("http://127.0.0.1:1"), &|_: String| {}).await
+        }).err().context("legacy companion installer accepted an arbitrary unit")?;
+        assert!(matches!(refusal.downcast_ref::<crate::updates::UpgradeRefusal>(), Some(crate::updates::UpgradeRefusal::LegacyInstaller)));
+        Ok(())
     }
 
     #[test]
@@ -999,6 +826,23 @@ mod tests {
         put("me", 40, None)?;
         let names: Vec<String> = duties(dir.path(), "me").iter().map(|p| p.parent().and_then(Path::file_name).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).collect();
         assert_eq!(names, ["me", "third", "second"], "its own first, then those not carried out, the newest first");
+        // U16: an old duty retains its CLI path, but retirement only records the retired service.
+        let cli = dir.path().join("kiln");
+        let installed = b"newer explicit installation".to_vec();
+        std::fs::write(&cli, &installed)?;
+        let path = instance_dir(dir.path(), "third").join("replaces.json");
+        let mut duty = read_json::<Replaces>(&path).ok_or_else(|| anyhow::anyhow!("missing replacement duty"))?;
+        duty.cli_bin = Some(cli.clone());
+        write_json(&path, &duty)?;
+        note_retired(&path, "another-service");
+        assert_eq!(read_json::<Replaces>(&path), Some(duty.clone()), "only the named retired service is recorded");
+        note_retired(&path, "kiln-agent-second");
+        let recorded = read_json::<Replaces>(&path).ok_or_else(|| anyhow::anyhow!("retired duty is missing"))?;
+        assert!(recorded.retired_at.is_some(), "the actual service retirement is recorded");
+        duty.retired_at = recorded.retired_at;
+        assert_eq!(recorded, duty, "retirement retains all historical metadata, including cli_bin");
+        assert!(std::fs::read(&cli)? == installed, "a delayed retirement must preserve the newer installed CLI bytes");
+        assert!(!duties(dir.path(), "me").contains(&path), "a completed duty leaves the pending retirement list");
         Ok(())
     }
 }

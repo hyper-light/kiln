@@ -19,6 +19,7 @@ import { clientId, harnessApi, sessionStore, type AgentInfo, type KindInfo, type
 import type { Agent, ReachRunner, TerminalSessionInfo } from "@/api/types";
 import { Loadable } from "@/components/ui/loading";
 import { Tip } from "@/components/ui/tooltip";
+import { harnessSessionsRes } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage, useLocalStorage, useNow } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
@@ -620,7 +621,8 @@ export function NewAgent({
         return;
       }
       setResult({ n: started.length, kind: s.kindName, machine: s.machine, first: first?.id ?? "" });
-      invalidate("harness/agents");
+      // CP-T3.2: refresh the shared roster after starting several agents in place.
+      invalidate(harnessSessionsRes.key);
     } catch (e) {
       setError(`Couldn't start: ${errorMessage(e)}`);
     } finally {

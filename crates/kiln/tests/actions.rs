@@ -411,7 +411,10 @@ fn w07_ac04_kinds() -> anyhow::Result<()> {
         return Ok(());
     }
     let dir = tempfile::tempdir()?;
-    let src = dir.path().join("src");
+    // W07-AC04: the former workspace-relative managed socket cannot fit a Unix sockaddr.
+    let deep = dir.path().join("deep-workspace-".repeat(10));
+    std::fs::create_dir_all(&deep)?;
+    let src = deep.join("src");
     commit(&src.join("kinds/js"), JS, Some("v1"))?;
     commit(&src.join("kinds/docker"), DOCKER, Some("v1"))?;
     commit(&src.join("kinds/stack"), STACK, Some("v1"))?;
@@ -421,15 +424,15 @@ fn w07_ac04_kinds() -> anyhow::Result<()> {
     if let Some(node) = std::env::var_os("PATH").and_then(|p| std::env::split_paths(&p).map(|d| d.join("node")).find(|n| n.is_file()))
         && Command::new(&node).arg("--version").output().is_ok_and(|v| String::from_utf8_lossy(&v.stdout).starts_with("v24."))
     {
-        let bin = dir.path().join("work/_externals/node24/bin");
+        let bin = common::runner_work(&deep).join("_externals/node24/bin");
         std::fs::create_dir_all(&bin)?;
         std::os::unix::fs::symlink(&node, bin.join("node"))?;
     }
-    let repo = dir.path().join("repo");
+    let repo = deep.join("repo");
     commit(&repo, &[("README.md", "kinds\n")], None)?;
     let ci = format!("\n[[ci.actions.sources]]\nowners = [\"kinds\"]\nurl = \"file://{}/{{owner}}/{{repo}}\"\n", src.display());
     let extra = format!("[[repos]]\nname = \"acme/kinds\"\nclone_url = \"file://{}\"\nbranches = [\"main\"]\npoll_seconds = 1\n", repo.display());
-    let s = start(dir.path(), &Options { agent: true, ci: &ci, extra: &extra })?;
+    let s = start(&deep, &Options { agent: true, ci: &ci, extra: &extra })?;
     // The first poll takes the repository as it is; the push after it runs.
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
@@ -541,6 +544,6 @@ fn w07_r05_musl_node_in_an_alpine_container() -> anyhow::Result<()> {
         assert!(all.contains(want), "{want:?} in no step:\n{all}");
     }
     // Kept where GitHub's runner keeps it, beside the glibc builds.
-    assert!(dir.path().join("work/_externals/node24_alpine/bin/node").is_file(), "{all}");
+    assert!(common::runner_work(dir.path()).join("_externals/node24_alpine/bin/node").is_file(), "{all}");
     Ok(())
 }

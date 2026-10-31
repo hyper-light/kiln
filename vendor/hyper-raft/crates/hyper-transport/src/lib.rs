@@ -47,6 +47,7 @@ mod lane;
 mod pool;
 mod progress;
 mod receive;
+mod restart;
 mod round;
 mod state;
 mod tally;
@@ -61,8 +62,8 @@ pub use credit::{
     socket_buffer_ask, stream_window_ceiling,
 };
 pub use endpoint::{
-    AskQueue, Config, Endpoint, Limits, PathFacts, Stats, StreamCredit, connection_charge,
-    state_charge,
+    Acknowledgement, AskQueue, Config, Endpoint, Limits, PathFacts, REPLY_ACK_DELAY, Stats,
+    StreamCredit, connection_charge, state_charge,
 };
 pub use error::Refusal;
 pub use frame::Embedded;
@@ -75,6 +76,7 @@ pub use hyper_timing::Lateness;
 pub use pool::PoolStats;
 pub use progress::{LEAST_PROGRESS, Progress};
 pub use receive::RECEIVE_CHUNK;
+pub use restart::RestartKey;
 pub use round::{Round, RoundEnd};
 pub use state::StateStats;
 pub use timing::spread;
@@ -255,6 +257,8 @@ pub enum Event<C: Classes> {
     Frame {
         /// The peer.
         peer: PeerId,
+        /// The connection the frame arrived on, even if another is current when it is polled.
+        epoch: Epoch,
         /// The lane.
         lane: LaneId,
         /// The frame's kind.
@@ -299,6 +303,26 @@ pub enum Event<C: Classes> {
         /// (the path, a timeout, a reset).
         refusal: Option<Refusal>,
     },
+    /// Nothing this side sent on its connection of `epoch` to `peer`, the one it dialed, was
+    /// acknowledged for four probe timeouts (hyper-quic's `PathDegrading`, quiche's default): the
+    /// peer, or the path to it, may be gone. The connection stays open, and its exchanges and lanes
+    /// with it; told once, and not again until the peer acknowledges ([`Event::Progressing`]). Its
+    /// close says more and replaces it. A dialer that can go elsewhere may ask another peer, as
+    /// Chromium's QUIC session moves to another path when told its path is degrading.
+    Degrading {
+        /// The peer.
+        peer: PeerId,
+        /// The epoch of the connection whose path is degrading.
+        epoch: Epoch,
+    },
+    /// The peer acknowledged again on the connection of `epoch` after [`Event::Degrading`] was
+    /// told of it.
+    Progressing {
+        /// The peer.
+        peer: PeerId,
+        /// The epoch of the connection that made progress.
+        epoch: Epoch,
+    },
 }
 
 impl<C: Classes> Debug for Event<C> {
@@ -341,12 +365,13 @@ impl<C: Classes> Debug for Event<C> {
             }
             Self::Frame {
                 peer,
+                epoch,
                 lane,
                 kind,
                 frame,
             } => write!(
                 formatter,
-                "Frame {{ peer: {peer}, lane: {lane}, kind: {kind:?}, bytes: {} }}",
+                "Frame {{ peer: {peer}, epoch: {epoch}, lane: {lane}, kind: {kind:?}, bytes: {} }}",
                 frame.bytes().len()
             ),
             Self::Refused {
@@ -370,6 +395,12 @@ impl<C: Classes> Debug for Event<C> {
                     formatter,
                     "Unreachable {{ peer: {peer}, refusal: {refusal:?} }}"
                 )
+            }
+            Self::Degrading { peer, epoch } => {
+                write!(formatter, "Degrading {{ peer: {peer}, epoch: {epoch} }}")
+            }
+            Self::Progressing { peer, epoch } => {
+                write!(formatter, "Progressing {{ peer: {peer}, epoch: {epoch} }}")
             }
         }
     }

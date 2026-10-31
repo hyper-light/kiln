@@ -13,6 +13,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::wf::ir::{Defaults, Step, Tpl};
 
+/// U01: the existing Scheduler executor grant and its authenticated physical owner.
+/// This is data, not authority: only a verified executor bootstrap may inherit its domain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParentBinding {
+    pub executor: String,
+    pub generation: String,
+    pub allocation: String,
+    pub physical_execution: String,
+    pub job: String,
+    pub attempt: u32,
+}
+
 /// One leg for a runner.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -22,6 +34,9 @@ pub struct AssignmentV2 {
     pub run_id: String,
     /// The leg's attempt (`KILN_ATTEMPT`); `github.run_attempt` is the run's.
     pub attempt: u32,
+    /// U01: inherited ownership of an already reserved executor; never a second reservation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_binding: Option<ParentBinding>,
     /// `owner/name`.
     pub repo: String,
     pub sha: String,
@@ -481,11 +496,30 @@ pub enum JobEventV2 {
         #[serde(default)]
         platforms: Vec<String>,
     },
+    /// U03: the retained execution's containers have been proven removed. The enclosing
+    /// AgentMsg::JobEvent identifies the leg; both identity fields fence its release evidence.
+    KeptReleased { execution: String, attempt: u32 },
+    /// U03: bind retained capacity to its exact execution before terminal completion. Legacy
+    /// Kept remains readable, but cannot supply this execution identity on its own.
+    KeptOwned { execution: String, attempt: u32, until: i64 },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn u01_parent_binding_is_optional_and_roundtrips_existing_grant_identity() -> Result<(), serde_json::Error> {
+        let old: AssignmentV2 = serde_json::from_str(r#"{"job_id":"job","attempt":2}"#)?;
+        assert!(old.parent_binding.is_none());
+        assert!(serde_json::to_value(&old)?.get("parent_binding").is_none());
+        let parent = ParentBinding { executor: "executor".into(), generation: "generation".into(), allocation: "existing-allocation".into(), physical_execution: "physical".into(), job: "job".into(), attempt: 2 };
+        let current = AssignmentV2 { parent_binding: Some(parent.clone()), ..old };
+        let restored: AssignmentV2 = serde_json::from_value(serde_json::to_value(&current)?)?;
+        assert_eq!(restored.parent_binding, Some(parent));
+        Ok(())
+    }
+
 
     /// What an exclusive leg holds travels with it; from an older server, neither field is there,
     /// and the leg is like any other; to an older runner, they're keys it doesn't read.

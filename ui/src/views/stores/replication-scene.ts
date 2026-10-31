@@ -27,6 +27,8 @@ export interface Cylinder {
 export type Tone = "ok" | "warn" | "off";
 
 export interface Cable {
+  /** U15: absent legacy feed observations do not establish a replication edge. */
+  known?: boolean;
   d: string;
   /** Its direction, a small chevron along it. */
   arrow: string;
@@ -144,7 +146,8 @@ const short = (text: string) => text.replace(" · catching up", "").replace(" ·
 
 /** What a runner's store is doing, in a few words, and its tone. */
 function sourceSub(s: ConvoStore, now: number): { text: string; tone?: Tone } {
-  const behind = s.feed?.behind ?? 0;
+  const behind = s.feed?.behind;
+  if (behind == null) return { text: "Amphora · status unknown", tone: "off" };
   if (!s.connected) return { text: s.heard ? `Offline · ${agoText(now - s.heard)}` : "Offline", tone: "off" };
   if (s.state === "behind") return { text: `${countText(behind)} behind · stalled`, tone: "warn" };
   if (behind > 0 && s.state === "catching_up") return { text: `${countText(behind)} behind · catching up`, tone: "warn" };
@@ -156,7 +159,8 @@ function sourceSub(s: ConvoStore, now: number): { text: string; tone?: Tone } {
 function mirrorSub(m: ConvoStore, now: number): { text: string; tone?: Tone } {
   const size = m.report?.file ? `${sizeText(m.report.file.bytes)} · ` : "";
   if (!m.connected) return { text: `${size}offline${m.heard ? ` ${agoText(now - m.heard)}` : ""}`, tone: "off" };
-  const behind = m.mirror?.behind ?? 0;
+  const behind = m.mirror?.behind;
+  if (behind == null) return { text: `${size}status unknown`, tone: "off" };
   if (behind > 0) return { text: `${size}${countText(behind)} behind`, tone: "warn" };
   return { text: `${size}current`, tone: "ok" };
 }
@@ -174,7 +178,7 @@ export function replicationScene(status: ConvoStatus, portrait: boolean): Replic
   const last = top + (n - 1) * step;
   const mid = (top + last) / 2;
   const level = (i: number) => (stores.length < 2 ? 0.5 : 0.1 + (i * 0.78) / (stores.length - 1));
-  const serverName = "conversations.db";
+  const serverName = "Amphora";
   const serverSize = server?.report?.file ? sizeText(server.report.file.bytes) : "—";
   const serverWrites = server?.rates.writes;
 
@@ -197,7 +201,7 @@ export function replicationScene(status: ConvoStatus, portrait: boolean): Replic
         sub: { text: sub.text, at: [30, ys[i]! + 16] as P, anchor: "start" as const, tone: sub.tone },
         hit: { x: 22, y: ys[i]! - 25, w: 262, h: 54 },
         title: `${s.machine}: its store, ${sub.text.toLowerCase()}`,
-        cable: curve(port(plate, "right"), port(sp, "left", level(i)), 76, 66, behind, paceOf(s, now), tone),
+        cable: { ...curve(port(plate, "right"), port(sp, "left", level(i)), 76, 66, behind, paceOf(s, now), tone), known: s.feed?.behind != null },
       };
     });
     // The server's and the mirror's headings just over their databases, on one line.
@@ -208,8 +212,12 @@ export function replicationScene(status: ConvoStatus, portrait: boolean): Replic
       headings: [
         { text: "RUNNER STORES", at: [30, 22], anchor: "start" },
         { text: "SERVER", at: [sp.x, heads], anchor: "middle" },
-        { text: "MIRROR", at: [mp.x, heads], anchor: "middle" },
-        { text: "MIRROR FEED", at: [(sp.x + sp.w * 0.68 + mp.x - mp.w * 0.68) / 2, sp.y - 32], anchor: "middle" },
+        ...(mirror
+          ? [
+              { text: "MIRROR", at: [mp.x, heads] as P, anchor: "middle" as const },
+              { text: "MIRROR FEED", at: [(sp.x + sp.w * 0.68 + mp.x - mp.w * 0.68) / 2, sp.y - 32] as P, anchor: "middle" as const },
+            ]
+          : []),
       ],
       sources,
       server: {
@@ -266,7 +274,7 @@ export function replicationScene(status: ConvoStatus, portrait: boolean): Replic
       sub: { text: short(sub.text), at: [20, ys[i]! + 16] as P, anchor: "start" as const, tone: sub.tone },
       hit: { x: 13, y: ys[i]! - 25, w: 160, h: 54 },
       title: `${s.machine}: its store, ${sub.text.toLowerCase()}`,
-      cable: curve(port(plate, "right"), port(sp, "left", level(i)), 28, 32, behind, paceOf(s, now), tone),
+      cable: { ...curve(port(plate, "right"), port(sp, "left", level(i)), 28, 32, behind, paceOf(s, now), tone), known: s.feed?.behind != null },
     };
   });
   let mirrorNode: ReplicationScene["mirror"] = null;
@@ -320,6 +328,7 @@ export function replicationScene(status: ConvoStatus, portrait: boolean): Replic
 export function healthOf(status: ConvoStatus): { text: string; tone: Tone } {
   const { runners, mirrors } = storesOf(status);
   const stores = runners.filter((s) => s.id);
+  if (stores.length === 0 || stores.some((s) => s.feed?.behind == null) || mirrors.some((s) => s.mirror?.behind == null)) return { text: "Amphora replication · status unknown", tone: "off" };
   const off = stores.find((s) => !s.connected);
   const stalled = stores.find((s) => s.connected && s.state === "behind");
   const catching = stores.find((s) => s.connected && s.state === "catching_up" && (s.feed?.behind ?? 0) > 0);
@@ -333,19 +342,44 @@ export function healthOf(status: ConvoStatus): { text: string; tone: Tone } {
 }
 
 /** The figure's three numbers: stores in sync of those connected, rows still to come, the mirror's copy. */
-export function metricsOf(status: ConvoStatus): { synced: number; of: number; pending: number; mirror: { text: string; tone: Tone } } {
+export function metricsOf(status: ConvoStatus): { synced: number | null; of: number; pending: number | null; mirror: { text: string; tone: Tone } } {
   const { runners, mirrors } = storesOf(status);
   const stores = runners.filter((s) => s.id);
-  const synced = stores.filter((s) => s.connected && (s.state === "in_sync" || (s.state === "catching_up" && (s.feed?.behind ?? 0) === 0))).length;
-  const pending = stores.reduce((a, s) => a + (s.connected ? (s.feed?.behind ?? 0) : 0), 0);
+  const known = stores.length > 0 && stores.every((s) => s.feed?.behind != null);
+  const synced = !known ? null : stores.filter((s) => s.connected && (s.state === "in_sync" || (s.state === "catching_up" && (s.feed?.behind ?? 0) === 0))).length;
+  const pending = !known ? null : stores.reduce((a, s) => a + (s.connected ? (s.feed?.behind ?? 0) : 0), 0);
   const m = mirrors[0];
   const behind = m?.mirror?.behind ?? 0;
   const mirror: { text: string; tone: Tone } = !m
     ? { text: "None", tone: "off" }
-    : !m.connected
-      ? { text: "Offline", tone: "off" }
-      : behind > 0
-        ? { text: `${countText(behind)} behind`, tone: "warn" }
-        : { text: "Current", tone: "ok" };
+    : m.mirror?.behind == null
+      ? { text: "Unknown", tone: "off" }
+      : !m.connected
+        ? { text: "Offline", tone: "off" }
+        : behind > 0
+          ? { text: `${countText(behind)} behind`, tone: "warn" }
+          : { text: "Current", tone: "ok" };
   return { synced, of: stores.length, pending, mirror };
+}
+
+/** U15: report product observations without inferring quorum, caught-up state or lag. */
+export function productStatusText(health: unknown): string {
+  const unknown = "Amphora replication · status unknown";
+  if (!health || typeof health !== "object" || !("store" in health)) return unknown;
+  const store = health.store;
+  if (!store || typeof store !== "object" || !("engine" in store) || store.engine !== "amphora") return unknown;
+  if ("group" in store && store.group === false) return "Amphora · local mode";
+  if (!("replication" in store) || !store.replication || typeof store.replication !== "object") return unknown;
+  const r = store.replication;
+  if ("fenced" in r && typeof r.fenced === "string") return "Amphora · fenced";
+  if (
+    "node_id" in r &&
+    "leader" in r &&
+    "applied" in r &&
+    "durable_commit" in r &&
+    [r.node_id, r.leader, r.applied, r.durable_commit].every((n) => typeof n === "number" && Number.isSafeInteger(n) && n >= 0)
+  ) {
+    return `Amphora · node ${r.node_id} · leader ${r.leader} · applied ${r.applied} · durable commit ${r.durable_commit}`;
+  }
+  return unknown;
 }

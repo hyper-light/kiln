@@ -21,7 +21,7 @@ use std::sync::{Arc, OnceLock};
 use http::StatusCode;
 use kiln_seams::search::{self as seam, File, Mode, Query, Refusal};
 use parking_lot::Mutex;
-use rusqlite::{OptionalExtension as _, params};
+use crate::sql::{OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 

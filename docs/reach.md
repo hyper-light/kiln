@@ -37,8 +37,11 @@ on their own lane (`LANE_REACH`, interactive class, so output never queues behin
 `+gpu` (a label), `tool:cargo`, `executor:docker`, `flag:avx2`, `binfmt:linux/arm64`, `cpus>=16`
 (cores in all), `mem>=32g` (memory free), any fact routing knows (`disk.free>=50Gi`,
 `custom.rack==a3`) — and the room it asks for, idle and free on the runner as it's picked:
-`cpus=8`, `mem=32g`, `disk=50g`, `gpus=1`; `exclusive` takes a runner with no CI work on it. Reach
-holds nothing for the work: the room is what's idle then. Words are separated by commas or spaces,
+`cpus=8`, `mem=32g`, `disk=50g`, `gpus=1`. U01: ranking is advisory; the common CI Scheduler
+must admit a reservation before execution. Explicit CPU, memory, disk and GPU quantities pack
+beside CI and other reach work through the same Scheduler accounting, in either scheduler mode.
+A request without quantities, or with `exclusive`, reserves the runner whole.
+A busy choice returns an explicit refusal. Words are separated by commas or spaces,
 and one that isn't a need is an error that names it (`memm=4g: no such need`). Aliases are
 understood (`amd64`, `x64` → `x86_64`; `arm64` → `aarch64`; `darwin`, `mac` → `macos`). The
 constraints are checked against the facts each runner reports (docs/ci.md W13-R01), its platform,
@@ -105,6 +108,37 @@ other: reach encrypts the runner-to-runner path, not the agent's transcript.
 - An agent's own permission mode applies: a reach tool call or a `kiln run` in its shell asks
   first, like any command, unless the person chose a mode that doesn't.
 
+### 3.4 Shared resource ownership (U01)
+
+The Hub delegates authenticated admission requests to the CI dispatcher. Reach enters the same
+pure Scheduler as externally executed legs, through its normal queue and assignment decision.
+Its bounded durable permit records authenticate the caller, receiver, epoch and containment;
+they do not make placement decisions. Offers expire after 30 seconds while unclaimed.
+The receiver durably claims before spawning and renews every five seconds.
+
+A claimed permit never frees capacity merely because a deadline or connection expired.
+Renewal failure fences execution; the receiver kills its containment and confirms it empty
+before ending ownership. A server restart changes the epoch and restores claimed reservations
+before admitting CI; old receivers must stop their work before releasing those reservations.
+OS locks exclude an old spawner during recovery. Bounded per-execution transport fences record
+the exact kernel containment identities, so a runner crash cannot let CI bypass unresolved
+reach processes. Live CI and reach executions share the host guard; their individual ownership
+locks allow unrelated admitted work to run together.
+
+CI and reach share one strict kernel containment API. Linux uses writable cgroup v2 and checks
+`cgroup.events` after termination. Windows assigns the child to a named job atomically at process
+creation and checks the job's active-process accounting. macOS uses a transient launchd job with
+its own inherited resource coalition: a gated helper waits for the durable claim, and kernel
+started/exited task counts prove that even reparented or `setsid` descendants have stopped. Its
+boot identity and coalition ID survive receiver restart; bootstrap retains the ownership locks
+until it finishes, so recovery cannot race a delayed job submission. macOS uses the logged-in
+GUI launchd domain when available and the per-user Background domain on headless runners. Missing containment permissions or platform facilities refuse before
+workload spawn; claimed capacity remains held whenever stopped proof is unavailable.
+
+Protocol version 2 adds `Ask::RunLeased` after all existing variants and refuses legacy unleased
+`Ask::Run`. New and old runners must therefore be upgraded deliberately before they can execute
+leased work together. No runner is upgraded or restarted automatically by these changes.
+
 ## 4. The link
 
 Inside the TLS stream: postcard messages behind a 4-byte length (`reach/wire.rs`). The side that
@@ -114,7 +148,7 @@ opened the link asks (`Ask`), the other does the work and answers (`Say`).
 asker                                         doer
   Hello{session, resume:[(run, from)]}  ──▶
                                         ◀──   Welcome{host, resumed, lost}
-  Run{id, command, cwd, mirror, env, …}  ──▶   (spawns: bash, its own process group, the login
+  RunLeased{spec, permit}               ──▶   (claims before spawning: bash, its own process group, the login
                                         ◀──    shell's environment)
                                         ◀──   Started{pid, cwd}
                                         ◀──   Output{id, offset, stream, bytes}   (window: 4 MiB unacked)
@@ -162,10 +196,18 @@ Signals: Ctrl-C on `kiln run` goes over as SIGINT; a client that goes away stops
 Before a run, the asker copies its working tree to the other runner (on by default inside a git
 repository, `--no-sync` to skip):
 
-- a git repository as git sees it: tracked files, untracked-but-not-ignored ones (so `target/`,
-  `node_modules/` stay home), and `.git` itself, so `git status`, `git diff`, `git log` agree over
-  there. A worktree becomes a repository of its own in the copy: the shared objects and refs, with
-  the worktree's HEAD, index and logs, and none of the other worktrees;
+- a selected git repository (`reach/sync_git.rs`, U08): tracked files, untracked-but-not-ignored
+  files and a portable Git export, rather than a physical `.git` copy (including a large shared
+  object cache). A worktree becomes an independent repository with its own HEAD and index,
+  including staged objects and conflict stages. The export carries full reachable ancestry of
+  HEAD and its configured upstream, plus branches, remote-tracking refs and tags merged into
+  either. This supports status/diff, log, describe, merge-base and ahead/behind within that
+  history; an already shallow source retains its existing boundaries, with no new depth limit.
+  Unrelated refs, stash/reflogs, other worktrees, hooks, alternates and physical object caches
+  are excluded. Git configuration is rebuilt from a small portable allowlist: remote URLs,
+  credential helpers and arbitrary local config are not copied. This does not redact secrets
+  committed in selected history or present in eligible working files. Missing objects or the
+  export's 60 s, 32 MiB metadata or 2 GiB pack bounds cause an error, not a full-directory fallback;
 - any other folder: everything but the usual build output.
 
 The copy lives at `~/.kiln/reach/<asking runner>/<tree>-<hash>` and is kept, so the next sync
@@ -179,8 +221,8 @@ match exactly, once. The command then runs in the copy's folder matching
 where the asker was. Paths are checked (relative, plain, never through a symlink) so a list can't
 write outside the copy.
 
-Measured on this repository (8,100 files, 36 MB, through the relay): first sync 2.5 s, an
-unchanged tree 0.5 s.
+Earlier relay measurements (8,100 files, 36 MB) were 2.5 s for a first sync and 0.5 s
+unchanged; they are not measurements of the current selected-history export.
 
 ### 5.1 Keeping copies
 
@@ -222,17 +264,21 @@ looks at its copies (`~/.kiln/reach/<runner>/<folder>`), measures those that cha
 room on their disk, and lets go of what the rules and their triggers say, oldest first: each copy
 is moved aside (`.letting-go`) under the lock a new sync or run takes, so none starts on it halfway
 (one that starts after makes a copy afresh), then deleted. A copy from before kiln kept records
-counts as used when its folder last changed. It keeps its records, the rules and the last 50 copies
-it let go, each with why and what made it go (`schedule`, `room`, `asked`), beside the copies
-(`.keep.json`), so the rules apply while the server is away and a late look catches up on a
-schedule (a day at most); one runner process of a machine keeps them at a time (`.keep.lock`), and
-one that handed everything to a newer build lets that one keep them.
+counts as used when its folder last changed. U17 stores its records, rules and last 50 deletions
+(with `schedule`, `room` or `asked` reasons) in the existing machine Records namespace:
+`keeper-state` holds the snapshot and `keeper-import` its atomic import receipt. `.keep.json` is
+read-only legacy input, imported once with validation; a bad source or inconsistent receipt stops
+recovery rather than enabling a fallback writer. Persisted rules still work while the server is
+away and a late look catches up on a schedule (a day at most). `.keep.lock` remains the physical
+single-process lock and `.letting-go` the physical deletion fence, not canonical control state.
+One runner process keeps copies at a time; one handing over to a newer build lets that one keep them.
 
 **With the server.** After each look the runner says what it holds and let go (a reach question,
 `{"op": "keep", "report": …}`) and the server answers with the rules it's to weigh (every runner's,
 its own, every repository's, those of the agents its copies were used by) and the last ask to let go
 now. A server from before this doesn't know the question: the runner goes on with the rules it kept.
-The server keeps what each runner last said (`<data>/reach/copies.json`), and shows ahead what each
+The server keeps what each runner last said in the shared host Amphora database
+(`reach/copies.rs`; `<data>/reach/copies.json` is read-only legacy import input), and shows ahead what each
 copy's rules say of it and what *Let go now* would let go, with the same function the runner decides
 with. Changes to the rules are audited (`reach.keep`, `reach.keep.now`).
 

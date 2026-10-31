@@ -3,6 +3,38 @@ use std::path::Path;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+/// An OS file lock owned by this Rust value, even while another thread spawns a child.
+/// Closing alone can leave an inherited descriptor holding the lock until that child execs.
+/// Keep shared ownership in an `Arc<FileLock>`; only its final owner unlocks.
+#[derive(Debug)]
+pub(crate) struct FileLock(std::fs::File);
+
+impl FileLock {
+    pub(crate) fn lock(file: std::fs::File) -> std::io::Result<Self> {
+        file.lock()?;
+        Ok(Self(file))
+    }
+
+    pub(crate) fn try_lock(file: std::fs::File) -> Result<Self, std::fs::TryLockError> {
+        file.try_lock()?;
+        Ok(Self(file))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_clone(&self) -> std::io::Result<std::fs::File> {
+        self.0.try_clone()
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        // No work retains this owner now. Explicit unlock also releases inherited duplicates.
+        if let Err(error) = self.0.unlock() {
+            tracing::warn!(%error, "an owned file lock could not be released");
+        }
+    }
+}
+
 pub fn now_unix() -> i64 {
     OffsetDateTime::now_utc().unix_timestamp()
 }
@@ -130,6 +162,24 @@ pub fn hmac_hex(key: &[u8], msg: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// U07/U17/U19: ownership ends when its final Rust owner leaves, even if a spawned child still
+    /// holds an inherited handle. A duplicated handle exercises that OS rule without forking.
+    #[test]
+    fn a_file_lock_releases_after_its_final_owner_with_a_duplicate_handle_alive() -> std::io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("owner.lock");
+        let open = || std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&path);
+        let owner = std::sync::Arc::new(super::FileLock::lock(open()?)?);
+        let shared = std::sync::Arc::clone(&owner);
+        let duplicate = owner.0.try_clone()?;
+        drop(owner);
+        assert!(matches!(super::FileLock::try_lock(open()?), Err(std::fs::TryLockError::WouldBlock)), "a shared owner still excludes a successor");
+        drop(shared);
+        let _successor = super::FileLock::try_lock(open()?)?;
+        drop(duplicate);
+        Ok(())
+    }
+
     /// CP-T3.2: an id made from a key is the same each time it's made from it, a UUID like any
     /// other id, and another for other parts (however they're split).
     #[test]

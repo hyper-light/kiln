@@ -35,18 +35,15 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use http::{Method, StatusCode};
-use kiln_http::Incoming;
+use http::StatusCode;
 use serde_json::{Value, json};
 
-use super::flow::{self, Ask, Fail, RollbackAsk, Who};
-use super::model::{App, Environment, Release, State, Template};
-use super::{Deploy, actions, argocd, kilncd, link, moves, reads, store};
-use crate::http::server::{self as srv, Request, Response};
+use super::flow::{self, Ask, Fail, Who};
+use super::model::{Release, State};
+use super::{Deploy, argocd, kilncd, link, store};
+use crate::http::server::{Request, Response};
 use crate::hub::Hub;
 use crate::secrets::{self, Scope};
-
-const LIMIT: usize = 4 << 20;
 
 fn bad(msg: impl Into<String>) -> Fail {
     (StatusCode::BAD_REQUEST, msg.into())
@@ -54,48 +51,6 @@ fn bad(msg: impl Into<String>) -> Fail {
 
 fn internal(e: anyhow::Error) -> Fail {
     (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
-}
-
-async fn body<T: serde::de::DeserializeOwned>(body: Incoming) -> Result<T, Fail> {
-    let bytes = srv::body_bytes(body, LIMIT).await.map_err(|e| bad(format!("{e:#}")))?;
-    let bytes = if bytes.is_empty() { &b"{}"[..] } else { &bytes[..] };
-    serde_json::from_slice(bytes).map_err(|e| bad(format!("the body doesn't read: {e}")))
-}
-
-fn ok(v: &impl serde::Serialize) -> Result<Response, Fail> {
-    Ok(srv::json(StatusCode::OK, v))
-}
-
-fn created(v: &impl serde::Serialize) -> Result<Response, Fail> {
-    Ok(srv::json(StatusCode::CREATED, v))
-}
-
-/// What an approval or a rejection says.
-#[derive(Default, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Note {
-    #[serde(default)]
-    note: Option<String>,
-}
-
-/// Which of a fleet change's proposals on kiln's own git server to merge (none named: each open).
-#[derive(Default, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MergeAsk {
-    #[serde(default)]
-    repo: Option<String>,
-}
-
-/// An app and an environment it's registered in.
-async fn registered(d: &Deploy, app: &str, env: &str) -> Result<(App, Environment), Fail> {
-    let a = store::app(&*d.records, app).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no app {app}")))?;
-    let environment = store::environment(&*d.records, env).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no environment {env}")))?;
-    store::registration(&*d.records, app, env).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("{app} isn't registered in {env}")))?;
-    Ok((a, environment))
-}
-
-fn release_id(s: &str) -> Result<i64, Fail> {
-    s.parse().map_err(|_| bad(format!("{s:?} isn't a release number")))
 }
 
 /// A future made and boxed in a frame of its own, so none of it lands on the stack of the function
@@ -111,222 +66,13 @@ pub fn route<'a>(hub: &'a Arc<Hub>, rest: &'a [&'a str], q: &'a HashMap<String, 
     boxed(move || routed(hub, rest, q, req))
 }
 
-async fn routed(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, req: Request) -> Result<Response, Fail> {
-    let d = super::get().ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, super::not_running()))?;
-    let who = req.extensions().get::<crate::authz::Caller>().map_or_else(|| Who::kiln("admin"), Who::of);
-    let actor = who.name.clone();
-    // A template that makes repositories is put by someone who may add them.
-    let adds_repos = req.extensions().get::<crate::authz::Caller>().is_none_or(|c| c.can("settings.manage", &crate::authz::Scope::Server));
-    let key = req.headers().get("idempotency-key").and_then(|v| v.to_str().ok()).map(str::to_owned);
+async fn routed(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, req: Request) -> Result<Response, Fail> {
+    // U12: all deploy URLs are aliases declared on their operation descriptors.
+    let caller = req.extensions().get::<crate::authz::Caller>().cloned().unwrap_or_else(crate::authz::Caller::owner);
     let method = req.method().clone();
-    let store = &*d.records;
-    match (&method, rest) {
-        (&Method::GET, ["environments"]) => ok(&json!({ "environments": store::environments(store).await.map_err(internal)? })),
-        (&Method::POST, ["environments"]) => {
-            let e: Environment = body(req.into_body()).await?;
-            created(&boxed(|| flow::put_environment(&d, &who, e)).await?)
-        }
-        (&Method::GET, ["environments", name]) => ok(&store::environment(store, name).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no environment {name}")))?),
-        (&Method::PUT, ["environments", name]) => {
-            let e: Environment = body(req.into_body()).await?;
-            if e.name != *name {
-                return Err(bad(format!("the body is environment {}, the path {name}", e.name)));
-            }
-            ok(&boxed(|| flow::put_environment(&d, &who, e)).await?)
-        }
-        (&Method::DELETE, ["environments", name]) => {
-            boxed(|| flow::delete_environment(&d, &actor, name)).await?;
-            Ok(srv::status(StatusCode::NO_CONTENT))
-        }
-        // Moving an environment between providers (§8.4).
-        (&Method::GET, ["environments", name, "move"]) => match moves::get(&d, name).await.map_err(internal)? {
-            Some(m) => ok(&m),
-            None => Err((StatusCode::NOT_FOUND, format!("{name} hasn't moved between providers"))),
-        },
-        (&Method::POST, ["environments", name, "move"]) => {
-            let ask: moves::Ask = body(req.into_body()).await?;
-            Ok(srv::json(StatusCode::ACCEPTED, &boxed(|| moves::start(&d, &who, name, ask)).await?))
-        }
-        (&Method::DELETE, ["environments", name, "move"]) => ok(&boxed(|| moves::cancel(&d, &who, name)).await?),
-
-        (&Method::GET, ["board"]) => ok(&boxed(|| board(&d)).await?),
-        (&Method::GET, ["metrics"]) => {
-            let days = q.get("days").and_then(|x| x.parse().ok()).unwrap_or(30i64).clamp(1, 365);
-            let list = store::releases(store, store::ReleaseQuery { app: q.get("app").cloned(), environment: q.get("environment").cloned(), limit: 1000, ..store::ReleaseQuery::default() })
-                .await
-                .map_err(internal)?;
-            let mut m = super::metrics::compute(&list, crate::util::now_unix(), days);
-            if let Some(o) = m.as_object_mut() {
-                o.insert("app".into(), json!(q.get("app")));
-                o.insert("environment".into(), json!(q.get("environment")));
-            }
-            ok(&m)
-        }
-        (&Method::GET, ["templates"]) => ok(&json!({ "templates": store::templates(store).await.map_err(internal)? })),
-        (&Method::POST, ["templates"]) => {
-            let t: Template = body(req.into_body()).await?;
-            created(&boxed(|| flow::put_template(&d, &actor, t, adds_repos)).await?)
-        }
-        (&Method::GET, ["templates", name]) => ok(&store::template(store, name).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no template {name}")))?),
-        (&Method::PUT, ["templates", name]) => {
-            let t: Template = body(req.into_body()).await?;
-            if t.name != *name {
-                return Err(bad(format!("the body is template {}, the path {name}", t.name)));
-            }
-            ok(&boxed(|| flow::put_template(&d, &actor, t, adds_repos)).await?)
-        }
-        (&Method::DELETE, ["templates", name]) => {
-            boxed(|| flow::delete_template(&d, &actor, name)).await?;
-            Ok(srv::status(StatusCode::NO_CONTENT))
-        }
-        (&Method::GET, ["app-names", name]) => ok(&boxed(|| flow::app_name_free(&d, name)).await?),
-
-        (&Method::GET, ["apps"]) => ok(&json!({ "apps": store::apps(store).await.map_err(internal)? })),
-        (&Method::POST, ["apps"]) => {
-            let ask: flow::AppAsk = body(req.into_body()).await?;
-            created(&boxed(|| flow::create_app(&d, &who, ask)).await?)
-        }
-        (&Method::PATCH, ["apps", name]) => {
-            let patch: flow::AppPatch = body(req.into_body()).await?;
-            ok(&boxed(|| flow::patch_app(&d, &who, name, patch)).await?)
-        }
-        (&Method::GET, ["apps", name, "catalog-info.yaml"]) => {
-            let a = store::app(store, name).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no app {name}")))?;
-            Ok(srv::response(StatusCode::OK, "application/yaml", srv::full(flow::catalog_info(&a))))
-        }
-        (&Method::GET, ["apps", name]) => ok(&boxed(|| app_json(&d, name)).await?),
-        (&Method::PUT, ["apps", name]) => {
-            let a: App = body(req.into_body()).await?;
-            if a.name != *name {
-                return Err(bad(format!("the body is app {}, the path {name}", a.name)));
-            }
-            ok(&boxed(|| flow::put_app(&d, &who, a)).await?)
-        }
-        (&Method::DELETE, ["apps", name]) => {
-            let yes = |k: &str| q.get(k).is_some_and(|v| v == "true" || v == "1");
-            boxed(|| flow::delete_app(&d, &who, name, yes("everywhere"), yes("keep"))).await?;
-            Ok(srv::status(StatusCode::NO_CONTENT))
-        }
-
-        (&Method::POST, ["apps", app, "environments", env]) => created(&boxed(|| flow::register(&d, &actor, app, env)).await?),
-        (&Method::GET, ["apps", app, "environments", env]) => ok(&boxed(|| registration_json(&d, app, env)).await?),
-        (&Method::DELETE, ["apps", app, "environments", env]) => {
-            let keep = q.get("keep").is_some_and(|v| v == "true" || v == "1");
-            boxed(|| flow::deregister(&d, &who, app, env, keep)).await?;
-            Ok(srv::status(StatusCode::NO_CONTENT))
-        }
-        (&Method::POST, ["apps", app, "environments", env, "pause"]) => ok(&boxed(|| flow::pause(&d, &actor, app, env, true)).await?),
-        (&Method::POST, ["apps", app, "environments", env, "resume"]) => ok(&boxed(|| flow::pause(&d, &actor, app, env, false)).await?),
-        (&Method::GET, ["apps", app, "environments", env, what @ ("resources" | "manifests" | "diff" | "logs")]) => {
-            let a = store::app(store, app).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no app {app}")))?;
-            let environment = store::environment(store, env).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no environment {env}")))?;
-            store::registration(store, app, env).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("{app} isn't registered in {env}")))?;
-            let version = q.get("version").filter(|v| !v.is_empty()).cloned();
-            let read = match *what {
-                "resources" => reads::Read::Resources,
-                "manifests" => reads::Read::Manifests { version },
-                "diff" => reads::Read::Diff { version },
-                _ => reads::Read::Logs {
-                    group: q.get("group").cloned(),
-                    kind: q.get("kind").cloned().ok_or_else(|| bad("logs of what? ?kind=Deployment&name=web"))?,
-                    name: q.get("name").cloned().ok_or_else(|| bad("logs of what? ?kind=Deployment&name=web"))?,
-                    namespace: q.get("namespace").cloned().or_else(|| Some(a.namespace().to_owned())),
-                    container: q.get("container").cloned(),
-                    tail: q.get("tail").and_then(|t| t.parse().ok()).unwrap_or(200).clamp(1, 10_000),
-                },
-            };
-            ok(&boxed(|| reads::read(&d, &a, &environment, read)).await?)
-        }
-        // What can be done to an object a registration runs, and doing it (§8.1).
-        (&Method::GET, ["apps", app, "environments", env, "actions"]) => {
-            let (a, environment) = registered(&d, app, env).await?;
-            let target = actions::Target {
-                group: q.get("group").cloned(),
-                kind: q.get("kind").cloned().ok_or_else(|| bad("actions on what? ?kind=Deployment&name=web"))?,
-                namespace: q.get("namespace").cloned().filter(|n| !n.is_empty()),
-                name: q.get("name").cloned().ok_or_else(|| bad("actions on what? ?kind=Deployment&name=web"))?,
-            };
-            ok(&json!({ "actions": boxed(|| actions::list(&d, &a, &environment, &target)).await? }))
-        }
-        (&Method::POST, ["apps", app, "environments", env, "actions"]) => {
-            let ask: actions::Ask = body(req.into_body()).await?;
-            let (a, environment) = registered(&d, app, env).await?;
-            boxed(|| flow::may_release(&d, &who, &a, &environment, "act on what runs of")).await?;
-            ok(&boxed(|| actions::run(&d, &who, &a, &environment, &ask)).await?)
-        }
-        (&Method::GET, ["apps", app, "environments", env, "versions"]) => ok(&json!({ "versions": boxed(|| versions(&d, app, env)).await? })),
-        (&Method::GET, ["apps", app, "environments", env, "secrets"]) => ok(&boxed(|| secrets_list(&d, &who, app, env)).await?),
-        (&Method::PUT, ["apps", app, "environments", env, "secrets", name]) => {
-            let value = secret_value(req.into_body()).await?;
-            let how = Change::of(q);
-            ok(&boxed(|| secret_put(&d, &who, app, env, name, value, how)).await?)
-        }
-        (&Method::DELETE, ["apps", app, "environments", env, "secrets", name]) => {
-            let how = Change::of(q);
-            ok(&boxed(|| secret_delete(&d, &who, app, env, name, how)).await?)
-        }
-        (&Method::GET, ["apps", app, "environments", env, "secrets", name, "versions"]) => ok(&boxed(|| secret_versions(&d, &who, app, env, name)).await?),
-        (&Method::POST, ["secret-keys", "rotate"]) => ok(&boxed(|| rotate_keys(&d, &who)).await?),
-        (&Method::GET, ["apps", app, "environments", env, "secret-uses"]) => {
-            let limit = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(100);
-            ok(&boxed(|| secret_uses(&d, &who, app, env, limit)).await?)
-        }
-        (&Method::GET, ["apps", app, "environments", env, "candidates"]) => ok(&json!({ "candidates": boxed(|| flow::candidates(&d, app, env)).await? })),
-        // For linked servers (§11): where this one is and what it signs with, and what runs of an
-        // app in one of its environments, signed for the server asking (`audience`, its issuer).
-        (&Method::GET, ["link"]) => ok(&link::about(&d.hub)),
-        // Where release repositories may be (§7): kiln's own git server, GitHub through kiln's App,
-        // each GitLab with the groups its token covers, Bitbucket with its workspaces.
-        (&Method::GET, ["git-hosts"]) => ok(&json!({ "hosts": boxed(|| git_hosts(&d.hub)).await })),
-        (&Method::GET, ["apps", app, "environments", env, "statement"]) => ok(&boxed(|| statement(&d, app, env, q.get("audience").map(String::as_str))).await?),
-
-        (&Method::GET, ["releases"]) => {
-            let state = match q.get("state") {
-                Some(s) => Some(State::parse(s).ok_or_else(|| bad(format!("{s:?} isn't a release state")))?),
-                None => None,
-            };
-            let query = store::ReleaseQuery {
-                app: q.get("app").cloned(),
-                environment: q.get("environment").cloned(),
-                state,
-                version: q.get("version").filter(|v| !v.is_empty()).cloned(),
-                limit: q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(50),
-            };
-            ok(&json!({ "releases": store::releases(store, query).await.map_err(internal)? }))
-        }
-        (&Method::POST, ["releases"]) => {
-            let mut ask: Ask = body(req.into_body()).await?;
-            ask.idempotency_key = ask.idempotency_key.or(key);
-            created(&boxed(|| flow::release(&d, &who, ask)).await?)
-        }
-        (&Method::POST, ["fleets"]) => {
-            let mut f: flow::FleetAsk = body(req.into_body()).await?;
-            f.idempotency_key = f.idempotency_key.or(key);
-            created(&boxed(|| flow::fleet(&d, &who, f)).await?)
-        }
-        (&Method::GET, ["fleets", id]) => ok(&boxed(|| flow::fleet_status(&d, id)).await?),
-        (&Method::POST, ["fleets", id, "merge"]) => {
-            let ask: MergeAsk = body(req.into_body()).await?;
-            ok(&boxed(|| super::sources::merge(&d, &who, id, ask.repo.as_deref())).await?)
-        }
-        (&Method::DELETE, ["fleets", id]) => ok(&boxed(|| super::sources::withdraw(&d, &who, id)).await?),
-        (&Method::GET, ["releases", id]) => ok(&store::release(store, release_id(id)?).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no release {id}")))?),
-        (&Method::POST, ["releases", id, verdict @ ("approve" | "reject")]) => {
-            let (id, note) = (release_id(id)?, body::<Note>(req.into_body()).await?.note);
-            ok(&boxed(|| flow::answer(&d, &who, id, *verdict == "approve", note)).await?)
-        }
-        (&Method::POST, ["releases", id, "cancel"]) => {
-            let id = release_id(id)?;
-            ok(&boxed(|| flow::cancel(&d, &who, id, key.is_some())).await?)
-        }
-        (&Method::POST, ["releases", id, "rollback"]) => {
-            let of = store::release(store, release_id(id)?).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no release {id}")))?;
-            let to: RollbackAsk = body(req.into_body()).await?;
-            let ask = Ask { app: of.app, environment: of.environment, rollback: Some(to), idempotency_key: key, ..Ask::default() };
-            created(&boxed(|| flow::release(&d, &who, ask)).await?)
-        }
-        _ => Err((StatusCode::NOT_FOUND, "not found".into())),
-    }
+    let mut path = vec!["api", "deploy"];
+    path.extend_from_slice(rest);
+    crate::ops::http(crate::ops::Cx { hub: Arc::clone(hub), caller }, method, &path, q, req).await
 }
 
 /// What runs of `app` in `env` and what's on its way, signed for the linked server whose issuer is
@@ -476,22 +222,6 @@ fn refused(r: secrets::Refused) -> Fail {
     }
 }
 
-/// A secret's value as sent: `{value}` (text) or `{base64}` (bytes). What doesn't read is refused
-/// without saying what it was, which may be the value.
-async fn secret_value(body: Incoming) -> Result<secrets::Value, Fail> {
-    #[derive(serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct Put {
-        #[serde(default)]
-        value: Option<String>,
-        #[serde(default)]
-        base64: Option<String>,
-    }
-    let bytes = srv::body_bytes(body, LIMIT).await.map_err(|e| bad(format!("{e:#}")))?;
-    let put: Put = serde_json::from_slice(&bytes).map_err(|_| bad("a secret is set with `{\"value\": \"…\"}`, or `{\"base64\": \"…\"}` for bytes"))?;
-    secret_value_of(put.value, put.base64)
-}
-
 /// A secret's value from its text (`value`) or its bytes (`base64`): one of them. What doesn't
 /// read is refused without saying what it was.
 pub(super) fn secret_value_of(value: Option<String>, base64: Option<String>) -> Result<secrets::Value, Fail> {
@@ -547,12 +277,6 @@ pub(super) struct Change {
     pub(super) revert: bool,
 }
 
-impl Change {
-    fn of(q: &HashMap<String, String>) -> Change {
-        let yes = |k: &str| q.get(k).is_none_or(|v| v != "false" && v != "0");
-        Change { release: yes("release"), revert: yes("revert") }
-    }
-}
 
 async fn released(d: &Deploy, who: &Who, app: &str, env: &str, what: String, how: Change) -> (Option<Release>, String) {
     let st = &*d.records;
@@ -605,6 +329,7 @@ pub(super) async fn secret_uses(d: &Deploy, who: &Who, app: &str, env: &str, lim
 
 #[cfg(test)]
 mod tests {
+    use super::super::model::{App, Environment};
     use super::*;
     use crate::deploy::model::{AgentPolicy, Contacts, KILNCD, Kind, Package, Registration};
 
@@ -667,8 +392,13 @@ mod tests {
             store::put_registration(st, &Registration { app: "web".into(), environment: "staging".into(), enabled: true, paused: false, running: Some(1), created_at: 0, degraded: None }).await?;
             let v = set(&d, "staging", "DB_PASSWORD", true).await?;
             let r: Release = serde_json::from_value(v.get("release").cloned().unwrap_or_default())?;
-            anyhow::ensure!(r.kind == Kind::Config && r.values.is_none() && r.secrets.as_deref() == Some("DB_PASSWORD v2") && r.state == State::Committing, "{r:?}");
+            anyhow::ensure!(r.kind == Kind::Config && r.values.is_none() && r.secrets.as_deref() == Some("DB_PASSWORD v2") && r.state == State::Waiting, "{r:?}");
 
+            // U10: numbered releases wait for canonical admission; establish the committing
+            // boundary explicitly before checking that a change cannot join it.
+            let mut committing = r.clone();
+            committing.state = State::Committing;
+            anyhow::ensure!(store::update_release(st, &committing, State::Waiting).await?);
             // While it commits, another change can't join it, and the environment takes one release at a time.
             let v = set(&d, "staging", "API_KEY", true).await?;
             anyhow::ensure!(v.get("release") == Some(&Value::Null) && next(&v).contains("in flight") && next(&v).contains("--secrets"), "{v}");

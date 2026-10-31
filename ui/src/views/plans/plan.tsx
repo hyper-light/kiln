@@ -18,7 +18,7 @@ import { Hold, RowsHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { Confirm, CopyButton, EmptyState, SelectField, TextField } from "@/components/ui/misc";
 import { useAuth } from "@/lib/auth";
-import { harnessSessionsRes, useRes, warm, type Res } from "@/lib/data";
+import { harnessSessionsRes, useRes, warm, type Res, useHarnessSessions } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
@@ -344,7 +344,7 @@ function RunHold() {
 /** Run the plan on an agent. */
 function RunPlan({ plan, dirty, picked, onPicked, onRan, focus }: { plan: Plan; dirty: boolean; picked: number[]; onPicked: (n: number[]) => void; onRan: () => void; focus?: boolean }) {
   warm(harnessSessionsRes, kindsRes);
-  const agents = useRes(harnessSessionsRes).data;
+  const agents = useHarnessSessions().data;
   const kinds = useRes(kindsRes).data;
   // On the agent it came from, while that agent runs; else a new one.
   const [where, setWhere] = React.useState(() => {
@@ -596,7 +596,7 @@ function Versions({ plan, onRestored }: { plan: Plan; onRestored: (p: Plan) => v
 
 function Runs({ plan }: { plan: Plan }) {
   const runs = useSuspenseResource(`plans/${plan.id}/runs`, (s) => plansApi.runs(plan.id, s)).data;
-  const agents = useRes(harnessSessionsRes).data;
+  const agents = useHarnessSessions().data;
   if (runs.length === 0) return null;
   const nameOf = (session: string) => agents.find((a) => a.id === session)?.name ?? `agent ${session.slice(-6)}`;
   return (

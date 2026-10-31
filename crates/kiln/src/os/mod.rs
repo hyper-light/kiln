@@ -66,32 +66,11 @@ pub mod contain;
 #[path = "contain_none.rs"]
 pub mod contain;
 
-/// A CI step's processes in its job's group ([`contain::job_group`]), let go of once the step ends
-/// (dropped): a kiln the step starts (a test's or a lab's runner) takes that group as its own
-/// cgroup, never the runner's, where the runner's agents are.
-pub struct JobGroup(Option<contain::Group>);
-
-impl JobGroup {
-    /// `cmd` joins job `job`'s group before it runs anything, where the machine has one (Linux).
-    pub fn enter(job: &str, cmd: &mut std::process::Command) -> Self {
-        let group = contain::job_group(job);
-        #[cfg(not(windows))]
-        if let Some(g) = &group {
-            g.enter(cmd);
-        }
-        #[cfg(windows)]
-        let _ = cmd;
-        Self(group)
-    }
-}
-
-impl Drop for JobGroup {
-    fn drop(&mut self) {
-        if let Some(g) = &self.0 {
-            g.release();
-        }
-    }
-}
+/// U01 strict macOS leased work uses kernel resource coalitions, separately from the
+/// best-effort harness descendant tracker.
+#[cfg(target_os = "macos")]
+#[path = "leased_macos.rs"]
+pub(crate) mod leased;
 
 /// PTY session I/O: [`crate::terminal`]'s plumbing.
 #[cfg(unix)]

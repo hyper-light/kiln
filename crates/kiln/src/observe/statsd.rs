@@ -1,5 +1,6 @@
 //! DogStatsD on the server and every runner (`docs/observe.md` §8.4): listeners the server keeps
-//! (`<observe>/statsd.json`) and tells each runner its own, as it tells scrape targets. A listener
+//! in the host Amphora Records namespace and tells each runner its own, as it tells scrape
+//! targets. `<observe>/statsd.json` is a read-only legacy import source. A listener
 //! listens where it says, over UDP (Datadog's Agent's `dogstatsd_port`, 8125 on 127.0.0.1) and on
 //! Unix over a datagram socket (its `dogstatsd_socket`), reads datagrams on a thread a socket, and
 //! aggregates them as the Agent does (`kiln_obs::statsd`): a bucket's points written once it is
@@ -9,9 +10,9 @@
 //! again (a minute of buckets and [`HELD_RECORDS`] records at the most; past that the oldest go,
 //! counted as dropped).
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
@@ -204,50 +205,9 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-// --------------------------------------------------------------------------------------- store
-
-/// The server's listeners by name, kept in `<observe>/statsd.json`.
-pub struct Listeners {
-    path: PathBuf,
-    all: Mutex<BTreeMap<String, Listener>>,
-}
-
-impl Listeners {
-    pub fn open(dir: &Path) -> Self {
-        let path = dir.join("statsd.json");
-        let all = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-        Self { path, all: Mutex::new(all) }
-    }
-
-    pub fn list(&self) -> Vec<(String, Listener)> {
-        lock(&self.all).iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-    }
-
-    pub fn put(&self, name: &str, l: Listener) -> Result<(), String> {
-        if name.is_empty() || name.len() > 64 || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) {
-            return Err("a listener's name is 1 to 64 letters, digits, '-', '_' and '.'".into());
-        }
-        l.check()?;
-        let mut all = lock(&self.all);
-        if !all.contains_key(name) && all.len() >= LISTENERS {
-            return Err(format!("{LISTENERS} listeners at the most"));
-        }
-        all.insert(name.to_owned(), l);
-        self.save(&all).map_err(|e| format!("{e:#}"))
-    }
-
-    pub fn delete(&self, name: &str) -> anyhow::Result<bool> {
-        let mut all = lock(&self.all);
-        let had = all.remove(name).is_some();
-        self.save(&all)?;
-        Ok(had)
-    }
-
-    fn save(&self, all: &BTreeMap<String, Listener>) -> anyhow::Result<()> {
-        crate::util::write_secret(&self.path, &serde_json::to_vec_pretty(all)?, 0o600)?;
-        Ok(())
-    }
-}
+// U05/U06: the existing host Records owner keeps configuration; JSON is import input only.
+mod kept;
+pub use kept::{Configuration, Error, ImportAuthority, Listeners};
 
 // ------------------------------------------------------------------------------------ listening
 
@@ -256,6 +216,7 @@ pub struct Statsd {
     machine: String,
     host: String,
     running: Mutex<HashMap<String, Running>>,
+    revision: Mutex<Option<u64>>,
     stop: crate::rt::Shutdown,
 }
 
@@ -270,7 +231,7 @@ static STATSD: OnceLock<Arc<Statsd>> = OnceLock::new();
 /// This process's listeners, started once: `machine` the name listeners give it (`server` for the
 /// server), `host` the host its metrics are of (unless a message's `host:` tag says).
 pub fn start(machine: &str, host: &str, stop: crate::rt::Shutdown) -> &'static Arc<Statsd> {
-    STATSD.get_or_init(|| Arc::new(Statsd { machine: machine.to_owned(), host: host.to_owned(), running: Mutex::new(HashMap::new()), stop }))
+    STATSD.get_or_init(|| Arc::new(Statsd { machine: machine.to_owned(), host: host.to_owned(), running: Mutex::new(HashMap::new()), revision: Mutex::new(None), stop }))
 }
 
 pub fn get() -> Option<&'static Arc<Statsd>> {
@@ -280,7 +241,11 @@ pub fn get() -> Option<&'static Arc<Statsd>> {
 impl Statsd {
     /// Listens as `all` (every machine's: those of this one kept) says from now: one unchanged goes
     /// on as it was, a changed one starts again, one gone stops.
-    pub fn set(&self, all: &[(String, Listener)]) {
+    pub fn set(&self, all: &[(String, Listener)], revision: Option<u64>) {
+        // U06: late async completion/reordered configuration cannot replace a newer canonical
+        // snapshot. Legacy peers have no revision until upgraded; never downgrade a proven one.
+        let mut applied = lock(&self.revision);
+        if applied.is_some_and(|old| revision.is_none_or(|new| new <= old)) { return; }
         let mine: HashMap<&str, &Listener> = all.iter().filter(|(_, l)| l.read_by(&self.machine)).map(|(n, l)| (n.as_str(), l)).collect();
         let mut running = lock(&self.running);
         running.retain(|name, r| {
@@ -298,7 +263,11 @@ impl Statsd {
             listen(name, l, &self.host, &r.stop, &self.stop, &r.state);
             running.insert(name.to_owned(), r);
         }
+        *applied = revision;
     }
+
+    /// Desired configuration accepted by this runtime; not proof every socket bound.
+    pub fn revision(&self) -> Option<u64> { *lock(&self.revision) }
 
     /// How each of this machine's listeners goes.
     pub fn states(&self) -> Vec<(String, State)> {

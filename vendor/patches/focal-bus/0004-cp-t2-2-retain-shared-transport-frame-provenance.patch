@@ -1,0 +1,27 @@
+Subject: CP-T2.2 retain shared transport frame provenance
+Why: Keep the exact Focal base source compatible with additive Hyper-Transport frame connection epochs while preserving existing Publish behavior
+
+diff --git a/crates/focal-bus/src/member.rs b/crates/focal-bus/src/member.rs
+index e63eefbc6f26ab461c87bb04bd720fe3ce1edbbe..3425370138cc891224b07f4608afb6a43121ecc1 100644
+--- a/crates/focal-bus/src/member.rs
++++ b/crates/focal-bus/src/member.rs
+@@ -1095,6 +1095,7 @@ impl Member {
+                 peer,
+                 lane,
+                 frame,
++                ..
+             } => {
+                 self.publish(endpoint, peer, lane, frame.bytes());
+                 endpoint.release(frame);
+diff --git a/crates/focal-bus/src/node.rs b/crates/focal-bus/src/node.rs
+index a282dbface2bbacf4c554b4c9232ac59f7bb301a..076532d5ec28a4296f5f5a8ddd10ab92827dbfef 100644
+--- a/crates/focal-bus/src/node.rs
++++ b/crates/focal-bus/src/node.rs
+@@ -276,6 +276,7 @@ impl Node {
+                 peer,
+                 lane,
+                 frame,
++                ..
+             } => {
+                 let stream = self.publish(endpoint, frame.bytes());
+                 endpoint.release(frame);

@@ -1,0 +1,53 @@
+[package]
+name = "amphora"
+description = "Amphora: the database kiln keeps every record in: KilnDB made a product"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "amphora"
+path = "src/main.rs"
+
+[dependencies]
+amphora-api = { path = "../api" }
+amphora-engine-parser.workspace = true
+anyhow = "1"
+thiserror.workspace = true
+tracing = "0.1"
+# The engine a store runs on (crates/engine: what Turso was at 3e09a82, Amphora's own since), pure
+# Rust (no simd, no C crypto, no fts: nothing compiled from C), each page of a new database
+# checksummed (XXH3), checked on every read (docs/design/store.md, decision 12).
+amphora-engine = { path = "../engine", default-features = false, features = ["fs", "json", "pure-rust-crypto", "checksum", "conn_raw_api"] }
+serde = { workspace = true, features = ["derive"] }
+postcard = { version = "1", features = ["alloc"] }
+# Mutual authentication of local owner and client; capability never crosses the socket.
+hmac = "0.12"
+sha2 = "0.10"
+getrandom = "0.4"
+# Private filesystem capabilities verify per-user ACLs on every supported platform.
+private-fs = "=0.2.1"
+# Windows safe exclusivity setter is pinned after its upstream merge; Unix uses the same socket shell.
+socket2 = { git = "https://github.com/rust-lang/socket2", rev = "8b8b96fdaa1301698fd2b6f4de188635df4a8bd1", features = ["all"] }
+hyper-durable = "0.1.0"
+hyper-raft = "0.1.0"
+hyper-log = "0.1.0"
+hyper-block = "0.1.0"
+
+[target.'cfg(unix)'.dependencies]
+# Safe filesystem identity and process access (also used by private filesystem validation).
+rustix = { version = "1.1", features = ["fs", "process"] }
+
+[target.'cfg(windows)'.dependencies]
+# Safe stable handle metadata, including hard-link count before engine bootstrap.
+winapi-util = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

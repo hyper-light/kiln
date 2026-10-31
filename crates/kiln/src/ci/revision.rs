@@ -4,7 +4,7 @@
 //! the commit is unsigned and [`Made`] says so; the machine's own git configuration never signs it
 //! with a key that isn't theirs. [`record`] keeps the revision's why with its version.
 
-use rusqlite::params;
+use crate::sql::params;
 
 use crate::hub::Hub;
 

@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use parking_lot::Mutex;
-use rusqlite::params;
+use crate::sql::params;
 use serde_json::{Value, json};
 
 use crate::authz::Caller;
@@ -130,12 +130,20 @@ pub async fn request<F, T>(hub: &Hub, r: Req<'_>, fut: F, status_of: impl Fn(&T)
 where
     F: Future<Output = T>,
 {
+    let decoded: Vec<String> = r.path.trim_matches('/').split('/').filter(|s| !s.is_empty()).map(crate::http::server::decode).collect();
+    let segs: Vec<&str> = decoded.iter().map(String::as_str).collect();
+    let rule = crate::authz::rule(r.method, &segs);
+    request_in(hub, r, rule, &segs, fut, status_of).await
+}
+
+/// U12: operation adapters already have the descriptor's policy and decoded scope
+/// bindings. Reuse the same audit writer without rematching an encoded target.
+pub async fn request_in<F, T>(hub: &Hub, r: Req<'_>, rule: &crate::authz::Rule, segs: &[&str], fut: F, status_of: impl Fn(&T) -> u16) -> T
+where F: Future<Output = T> {
     let Req { caller, method, path, q, ip } = r;
     let slot = Arc::new(Mutex::new(Slot::default()));
     let out = Scoped { inner: Box::pin(fut), slot: Arc::clone(&slot) }.await;
-    let segs: Vec<&str> = path.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
-    let rule = crate::authz::rule(method, &segs);
-    let scope = crate::authz::gate::scope_of(hub, rule, &segs, q).await.text();
+    let scope = crate::authz::gate::scope_of(hub, rule, segs, q).await.text();
     let (principal, on_behalf_of) = who(caller);
     let notes = std::mem::take(&mut slot.lock().notes);
     let action = if rule.pattern == crate::authz::UNNAMED.pattern { format!("{method} {path}") } else { format!("{method} {}", rule.pattern) };
@@ -154,7 +162,7 @@ where
 pub async fn list(store: &Store, q: &HashMap<String, String>) -> anyhow::Result<Value> {
     const FIELDS: &[&str] = &["principal", "on_behalf_of", "token", "scope", "action", "target", "result", "ip"];
     let mut clauses = Vec::new();
-    let mut args: Vec<rusqlite::types::Value> = Vec::new();
+    let mut args: Vec<crate::sql::types::Value> = Vec::new();
     for f in FIELDS {
         let Some(v) = q.get(*f).map(|v| v.trim()).filter(|v| !v.is_empty()) else { continue };
         let mut any = Vec::new();
@@ -187,7 +195,7 @@ pub async fn list(store: &Store, q: &HashMap<String, String>) -> anyhow::Result<
     store
         .call(move |c| {
             let mut st = c.prepare(&sql)?;
-            let rows = st.query_map(rusqlite::params_from_iter(args.iter()), |r| {
+            let rows = st.query_map(crate::sql::params_from_iter(args.iter()), |r| {
                 let principal: String = r.get(2)?;
                 let behalf: Option<String> = r.get(3)?;
                 Ok(json!({

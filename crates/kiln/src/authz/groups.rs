@@ -10,7 +10,7 @@
 //! | `PUT`, `DELETE /api/groups/{name}/members/{user}` | a member added, or taken out |
 
 use http::{Method, StatusCode};
-use rusqlite::{OptionalExtension as _, params};
+use crate::sql::{OptionalExtension as _, params};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -53,7 +53,7 @@ pub fn admin(caller: &Caller) -> bool {
     caller.is_owner() || caller.can("users.manage", &Scope::Server)
 }
 
-fn member_in(c: &rusqlite::Connection, user: &str, r: &str) -> rusqlite::Result<bool> {
+fn member_in(c: &crate::sql::Connection, user: &str, r: &str) -> crate::sql::Result<bool> {
     match r.split_once(':') {
         None => c.query_row("SELECT EXISTS(SELECT 1 FROM user_group_members m JOIN user_groups g ON g.name = m.group_name WHERE m.group_name = ?1 AND m.user_id = ?2)", params![r, user], |row| row.get(0)),
         // The provider's groups as they were when the person last signed in with it.
@@ -279,21 +279,22 @@ mod tests {
 
     #[test]
     fn membership_in_kiln_s_groups_and_a_provider_s() -> anyhow::Result<()> {
-        let c = rusqlite::Connection::open_in_memory()?;
-        c.execute_batch(
-            "CREATE TABLE user_groups (name TEXT PRIMARY KEY COLLATE NOCASE, description TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, created_by TEXT NOT NULL);
-             CREATE TABLE user_group_members (group_name TEXT NOT NULL COLLATE NOCASE, user_id TEXT NOT NULL, added_at INTEGER NOT NULL, added_by TEXT NOT NULL, PRIMARY KEY (group_name, user_id));
-             CREATE TABLE user_identities (provider TEXT NOT NULL, subject TEXT NOT NULL, user_id TEXT NOT NULL, groups TEXT NOT NULL DEFAULT '[]');
-             INSERT INTO user_groups VALUES ('Shop', '', 0, 'admin');
-             INSERT INTO user_group_members VALUES ('shop', 'u1', 0, 'admin');
-             INSERT INTO user_group_members VALUES ('gone', 'u1', 0, 'admin');
-             INSERT INTO user_identities VALUES ('github', '42', 'u2', '[\"acme\",\"acme/platform\"]');",
-        )?;
-        assert!(member_in(&c, "u1", "shop")? && member_in(&c, "u1", "SHOP")?, "a group's name in any case");
-        assert!(!member_in(&c, "u2", "shop")?);
-        assert!(!member_in(&c, "u1", "gone")?, "a membership of a group that isn't there any more");
-        assert!(member_in(&c, "u2", "github:acme/platform")? && member_in(&c, "u2", "github:ACME")?);
-        assert!(!member_in(&c, "u2", "github:acme/other")? && !member_in(&c, "u2", "gitlab:acme")?, "another team, another provider");
-        Ok(())
+        crate::sql::with_memory(|c| {
+            c.execute_batch(
+                "CREATE TABLE user_groups (name TEXT PRIMARY KEY COLLATE NOCASE, description TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, created_by TEXT NOT NULL);
+                 CREATE TABLE user_group_members (group_name TEXT NOT NULL COLLATE NOCASE, user_id TEXT NOT NULL, added_at INTEGER NOT NULL, added_by TEXT NOT NULL, PRIMARY KEY (group_name, user_id));
+                 CREATE TABLE user_identities (provider TEXT NOT NULL, subject TEXT NOT NULL, user_id TEXT NOT NULL, groups TEXT NOT NULL DEFAULT '[]');
+                 INSERT INTO user_groups VALUES ('Shop', '', 0, 'admin');
+                 INSERT INTO user_group_members VALUES ('shop', 'u1', 0, 'admin');
+                 INSERT INTO user_group_members VALUES ('gone', 'u1', 0, 'admin');
+                 INSERT INTO user_identities VALUES ('github', '42', 'u2', '[\"acme\",\"acme/platform\"]');",
+            )?;
+            assert!(member_in(c, "u1", "shop")? && member_in(c, "u1", "SHOP")?, "a group's name in any case");
+            assert!(!member_in(c, "u2", "shop")?);
+            assert!(!member_in(c, "u1", "gone")?, "a membership of a group that isn't there any more");
+            assert!(member_in(c, "u2", "github:acme/platform")? && member_in(c, "u2", "github:ACME")?);
+            assert!(!member_in(c, "u2", "github:acme/other")? && !member_in(c, "u2", "gitlab:acme")?, "another team, another provider");
+            Ok(())
+        })
     }
 }

@@ -44,6 +44,8 @@ pub fn settings(id: u64, depth: usize) -> anyhow::Result<Settings> {
         .map_err(|e| anyhow::anyhow!("the group's limits: {e:?}"))?;
     Ok(Settings {
         core: Config { election_tick: BEAT * 3, heartbeat_tick: BEAT, max_size_per_msg: APPEND, seed: id, ..Config::new(id, limits) },
+        // CP-T2.2: preserve the existing flush-proved group policy.
+        disk: hyper_durable::Disk::Flushed,
         elections: Elections::Ticks,
         // Woken by events: the commit is written alone at the first moment no write is out.
         quiet: Duration::ZERO,

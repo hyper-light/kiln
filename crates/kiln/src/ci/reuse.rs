@@ -12,7 +12,7 @@ use std::time::Duration;
 use kiln_ci::plan::LegSpec;
 use kiln_ci::plan::reuse::{Inputs, Spec};
 use kiln_ci::wire::ActionRef;
-use rusqlite::{OptionalExtension, params};
+use crate::sql::{OptionalExtension, params};
 use serde_json::{Value, json};
 use sha2::Digest as _;
 
@@ -148,7 +148,7 @@ pub fn work_unit(hash: &str, trusted: bool) -> kiln_ci::work::key::Unit {
 }
 
 /// Whether a succeeded leg can still be taken over: it's there, succeeded, and its artifacts all are.
-fn stands(c: &rusqlite::Connection, leg: &str, now: i64) -> rusqlite::Result<bool> {
+fn stands(c: &crate::sql::Connection, leg: &str, now: i64) -> crate::sql::Result<bool> {
     c.query_row(
         "SELECT EXISTS(SELECT 1 FROM jobs j WHERE j.id = ?1 AND j.status = 'succeeded'
            AND NOT EXISTS (SELECT 1 FROM ci_artifacts a WHERE a.leg_id = j.id AND (a.finalized = 0 OR (a.expires_at IS NOT NULL AND a.expires_at <= ?2))))",
@@ -250,6 +250,7 @@ pub async fn take_over(hub: &Hub, run: &str, source: &str, id: &str, hash: &str,
             )?;
             // The time it saved: what its source ran (W24-R28).
             let ran: Option<i64> = tx.query_row("SELECT finished_at - started_at FROM jobs WHERE id = ?1", [&id], |r| r.get(0)).optional()?.flatten();
+            super::logsearch::stage_finished(&tx,&id)?;
             tx.commit()?;
             if let Some(s) = ran.and_then(|s| u64::try_from(s).ok()) {
                 crate::metrics::global().work_saved_seconds.add(s);
@@ -292,6 +293,7 @@ pub async fn adopt_into(hub: &Hub, leg: &str, source: &str) -> anyhow::Result<Op
                 )
                 .optional()?
                 .flatten();
+            super::logsearch::stage_finished(&tx,&leg)?;
             tx.commit()?;
             Ok(report)
         })

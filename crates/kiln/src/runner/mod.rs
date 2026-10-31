@@ -1,6 +1,6 @@
 //! The runner side of CI (docs/ci.md §2.2): the GitHub-exact step runtime (W06), actions (W07),
-//! executors and facts (W13), job terminals (W17). `exec.rs` keeps running v1 assignments until
-//! the runtime here takes over `AssignV2`; each workstream adds its own submodule here.
+//! executors and facts (W13), job terminals (W17). Both assignment wire formats use the shared
+//! runtime; `exec.rs` only adapts the original server's endpoints and events.
 
 pub mod artifacts;
 pub mod attest;
@@ -25,6 +25,7 @@ pub mod jail;
 pub mod kept;
 pub mod observe;
 pub mod probe;
+pub mod processes;
 #[cfg(target_os = "linux")]
 pub mod rootfs;
 pub mod rustc;

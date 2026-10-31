@@ -113,7 +113,7 @@ fn with_id(prefix: Vec<u8>, id: [u8; 8]) -> Vec<u8> {
     k
 }
 
-fn release_key(id: i64) -> Vec<u8> {
+pub(crate) fn release_key(id: i64) -> Vec<u8> {
     newest_first(id).to_vec()
 }
 
@@ -171,20 +171,86 @@ async fn all<T: serde::de::DeserializeOwned>(store: Recs<'_>, family: &str, pref
 
 // ------------------------------------------------------------------ environments
 
+// U10: the compatibility record retains provider/repository settings. Shared policy and
+// targets live only in environment.policy; reads hydrate the old wire shape for API clients.
+fn environment_id(name: &str) -> kiln_ci::env::EnvironmentId {
+    kiln_ci::env::EnvironmentId { scope: kiln_ci::env::EnvironmentScope::Server, name: name.to_owned() }
+}
+
+pub(crate) fn environment_policy(e: &Environment) -> anyhow::Result<kiln_ci::env::EnvironmentPolicy> {
+    let mut targets = serde_json::to_value(&e.targets)?;
+    if let Some(targets) = targets.as_object_mut() && let Some(clusters) = targets.remove("kubernetes") {
+        targets.insert("clusters".into(), clusters);
+    }
+    Ok(kiln_ci::env::EnvironmentPolicy {
+        source: "release".into(),
+        fallback: None,
+        protection: kiln_ci::env::Protection {
+            approvals: e.gates.approvals.clone(), prerequisites: e.gates.after.clone(),
+            soak: e.gates.soak.clone(), windows: e.gates.windows.clone(), freeze: e.gates.freeze.clone(),
+            ..Default::default()
+        },
+        concurrency: e.gates.concurrency_limit, agents_approve: e.agents.approve, targets: serde_json::from_value(targets)?, kind: Some("kubernetes".into()),
+    })
+}
+
+async fn hydrate_environment(store: Recs<'_>, mut e: Environment) -> anyhow::Result<Environment> {
+    let p = crate::ci::environments::policy::import(store, &environment_id(&e.name), &environment_policy(&e)?).await?;
+    e.gates.concurrency_limit = p.concurrency;
+    e.gates.approvals = p.protection.approvals;
+    e.gates.after = p.protection.prerequisites;
+    e.gates.after.extend(p.protection.after);
+    e.gates.soak = p.protection.soak;
+    e.gates.windows = p.protection.windows;
+    e.gates.freeze = p.protection.freeze;
+    e.agents.approve = p.agents_approve;
+    let mut targets = serde_json::to_value(p.targets)?;
+    if let Some(targets) = targets.as_object_mut() && let Some(clusters) = targets.remove("clusters") {
+        targets.insert("kubernetes".into(), clusters);
+    }
+    e.targets = serde_json::from_value(targets)?;
+    Ok(e)
+}
+
 pub async fn put_environment(store: Recs<'_>, e: &Environment) -> anyhow::Result<()> {
-    put_json(store, ENV, e.name.clone().into_bytes(), e).await
+    let policy = environment_policy(e)?;
+    policy.protection.check().map_err(anyhow::Error::msg)?;
+    let mut metadata = e.clone();
+    metadata.gates.concurrency_limit = None;
+    metadata.gates.approvals = None;
+    metadata.gates.after.clear();
+    metadata.gates.soak = None;
+    metadata.gates.windows.clear();
+    metadata.gates.freeze = None;
+    metadata.targets = Default::default();
+    metadata.agents.approve = false;
+    store.commit(Tx { conds: Vec::new(), writes: vec![
+        crate::ci::environments::policy::write(&environment_id(&e.name), &policy)?,
+        put(ENV, e.name.clone().into_bytes(), to_json(&metadata)?),
+    ] }).await.map_err(refused)?;
+    Ok(())
 }
 
 pub async fn environment(store: Recs<'_>, name: &str) -> anyhow::Result<Option<Environment>> {
-    get_json(store, ENV, name.as_bytes()).await
+    match get_json(store, ENV, name.as_bytes()).await? {
+        Some(e) => Ok(Some(hydrate_environment(store, e).await?)),
+        None => Ok(None),
+    }
 }
 
 pub async fn environments(store: Recs<'_>) -> anyhow::Result<Vec<Environment>> {
-    all(store, ENV, b"").await
+    let mut out = Vec::new();
+    for e in all(store, ENV, b"").await? { out.push(hydrate_environment(store, e).await?); }
+    Ok(out)
 }
 
 pub async fn delete_environment(store: Recs<'_>, name: &str) -> anyhow::Result<bool> {
-    delete_row(store, ENV, name.as_bytes().to_vec()).await
+    if store.get(ENV, name.as_bytes(), Consistency::Linearizable).await.map_err(refused)?.is_none() { return Ok(false); }
+    store.commit(Tx { conds: Vec::new(), writes: vec![
+        del(ENV, name.as_bytes().to_vec()),
+        Write::Delete { family: "environment.policy".into(), key: environment_id(name).key()? },
+    ] }).await.map_err(refused)?;
+    Ok(true)
 }
 
 // ------------------------------------------------------------------ apps
@@ -630,6 +696,31 @@ async fn copy(store: Recs<'_>, old: &crate::store::Store) -> anyhow::Result<usiz
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn u10_release_policy_is_saved_once_and_legacy_records_hydrate_it() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let records = kiln_seams::records::SimRecords::new();
+            let legacy: Environment = serde_json::from_value(serde_json::json!({
+                "name": "production", "gates": { "after": ["staging"], "soak": "1m",
+                    "approvals": { "count": 2, "reviewers": ["alice", "bob"] } },
+                "targets": { "kubernetes": ["prod"] }, "agents": { "approve": true }
+            }))?;
+            // A legacy record imports on first read. Repeating the read keeps the same policy.
+            put_json(&records, ENV, b"production".to_vec(), &legacy).await?;
+            assert_eq!(environment(&records, "production").await?, Some(legacy.clone()));
+            let mut edited = legacy.clone();
+            edited.gates.freeze = Some("incident".into());
+            put_environment(&records, &edited).await?;
+            let raw: Environment = get_json(&records, ENV, b"production").await?.ok_or_else(|| anyhow::anyhow!("environment metadata"))?;
+            assert!(raw.gates.approvals.is_none() && raw.gates.after.is_empty() && raw.targets.kubernetes.is_empty());
+            assert_eq!(environment(&records, "production").await?, Some(edited.clone()));
+            // Interrupted old-data migration cannot overwrite the edited canonical policy.
+            put_json(&records, ENV, b"production".to_vec(), &legacy).await?;
+            assert_eq!(environment(&records, "production").await?, Some(edited));
+            Ok(())
+        })
+    }
 
     /// What kiln's tables held for deploy before its records moved onto the seam is copied once:
     /// each record, each release with its number, key, indexes and lease, and deploy's key-value

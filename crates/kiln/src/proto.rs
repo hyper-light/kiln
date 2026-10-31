@@ -52,7 +52,7 @@ pub fn lane_name(lane: u32) -> &'static str {
         LANE_LOGS => "logs",
         LANE_SYNC => "sync",
         LANE_REACH => "reach",
-        5 => "observe",
+        LANE_OBSERVE => "observe",
         LANE_CONVO => "convo",
         LANE_FILES => "files",
         LANE_STREAM => "stream",
@@ -216,9 +216,8 @@ pub enum AgentMsg {
     /// after a reconnect. Only once both sides announced [`CAP_WIRE`]. Appended last: postcard
     /// encodes variants by index.
     Wire(crate::wire::channel::Frame),
-    /// The cluster group (docs/p2p.md, P2, on [`LANE_SYNC`]): `json` a
-    /// `crate::store::learner::Msg`, `raft` the bytes of the hyper-raft message it carries (empty
-    /// when none) from this runner's learner. Only from runners announcing [`CAP_CLUSTER`].
+    /// Retired Kiln learner protocol, retained for append-only decoding. U15 explicitly
+    /// refuses it and tells old runners to leave. New replication uses `Amphora`.
     /// Appended last: postcard encodes variants by index.
     Cluster { json: String, raft: Vec<u8> },
     /// What this runner's QUIC layer let go before it reached the wire since it started, by lane
@@ -274,6 +273,13 @@ pub enum AgentMsg {
     /// notes it against `from`, on this runner's page too. Only to a server announcing
     /// [`CAP_UNREAD`]. Appended last: postcard encodes variants by index.
     LinkUnread { from: String, link: String, what: String, code: crate::wire::unread::Code, why: String },
+    /// U15: opaque product transport; appended to preserve all older postcard indices.
+    Amphora { frame: crate::replication::Frame },
+    /// U03: attempt-fenced completion; never extend the old postcard JobResult.
+    JobFinishedV2 { result: JobResult, attempt: u32 },
+    /// U01: one cryptographic identity per agent process, repeated on reconnect. Only to a
+    /// server advertising CAP_FIRECRACKER_SHAPE. Appended: no older postcard index changes.
+    RunnerProcess { nonce: String },
 }
 
 /// A leg's event as a runner sends it ([`AgentMsg::JobEvent`]'s JSON): the event, and its place in
@@ -292,6 +298,12 @@ pub struct JobEvent {
 pub struct SecretFor {
     pub name: String,
     pub value: String,
+}
+
+/// Existing random_token's 32-byte base64url encoding. This is a public identity, not a
+/// credential; its authenticated connection and original startup grant establish authority.
+pub(crate) fn valid_process_nonce(nonce: &str) -> bool {
+    nonce.len() == 43 && nonce.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-'))
 }
 
 /// Frames a QUIC layer let go of one lane, for one reason ([`AgentMsg::NetDrops`]).
@@ -436,7 +448,6 @@ pub const CAP_WORK: u64 = 1 << 36;
 /// says it takes [`ServerMsg::AgentLimit`] and says what it holds ([`AgentMsg::AgentLimit`]); a
 /// server that says it takes that.
 pub const CAP_AGENT_LIMIT: u64 = 1 << 37;
-
 /// [`AgentMsg::Caps`] and [`ServerMsg::Caps`] capability: identities (docs/ci.md W27-R01). A runner
 /// that says it asks for certificates for keys it makes and keeps ([`AgentMsg::Identity`]); a
 /// server that says it issues them ([`ServerMsg::Identity`]).
@@ -452,6 +463,53 @@ pub const CAP_HEADROOM: u64 = 1 << 39;
 /// (`crate::harness::core::Update::ChangesPatch`), merged into its copy, so a runner sends the files
 /// an agent touched rather than the whole changeset each time. Without it, a runner sends it whole.
 pub const CAP_CHANGES_PATCH: u64 = 1 << 40;
+
+/// U15: typed Amphora transport, independent of the retired Kiln learner protocol.
+pub const CAP_AMPHORA: u64 = 1 << 48;
+/// U15: takes HarnessRelease independently of the retired conversation-feed capability.
+pub const CAP_HARNESS_RELEASE: u64 = 1 << 42;
+/// U03: attempt-fenced job completions and receipts, supported by both peers.
+pub const CAP_JOB_ATTEMPT: u64 = 1 << 43;
+/// U04/U17: HarnessOpen acknowledges a stable session id only after durable keyed acceptance.
+pub const CAP_OPEN_ONCE: u64 = 1 << 44;
+/// U03: exact durable retained-event receipts, independent of completion and wire epochs.
+pub const CAP_RETAINED_RECEIVED: u64 = 1 << 45;
+/// U01/U03: strict execution containment and sole-Scheduler resource ownership.
+pub const CAP_RESOURCE_OWNERSHIP: u64 = 1 << 46;
+/// U01: authenticated process identity, immutable Firecracker shapes and matching Ready receipts.
+/// This bit does not imply the separate U07 cache or CPU/memory kernel limit contract.
+pub const CAP_FIRECRACKER_SHAPE: u64 = 1 << 47;
+/// This peer uses the unified extensions appended after main's unread protocol. Always
+/// advertised, even when it owns no Amphora replica. This is a codec layout, not ownership.
+/// The earlier private experimental layout is unsupported; it has no compatibility decoder.
+pub const CAP_UNIFIED_LAYOUT: u64 = 1 << 49;
+/// U16 controlled-upgrade law, on this authenticated connection: a server uses the sole
+/// CI/CD coordinator with pinned admission; a runner owns a live explicit activation backend.
+/// This is role-specific software capability, never cryptographic approval of a release/job.
+pub const CAP_EXPLICIT_ACTIVATION: u64 = 1 << 50;
+
+/// Refuse an identifiable unsupported private layout at its capability handshake, before
+/// dispatching extensions. Main's bit 41 means only CAP_UNREAD; it cannot prove Amphora.
+pub fn check_unified_layout(caps: u64) -> Result<(), &'static str> {
+    let extensions = CAP_HARNESS_RELEASE | CAP_JOB_ATTEMPT | CAP_OPEN_ONCE
+        | CAP_RETAINED_RECEIVED | CAP_RESOURCE_OWNERSHIP | CAP_FIRECRACKER_SHAPE | CAP_AMPHORA | CAP_EXPLICIT_ACTIVATION;
+    if caps & extensions != 0 && caps & CAP_UNIFIED_LAYOUT == 0 {
+        Err("unsupported private protocol layout; unified extensions require CAP_UNIFIED_LAYOUT")
+    } else {
+        Ok(())
+    }
+}
+
+/// These messages require a successfully checked layout declaration on this connection.
+pub fn agent_extension(msg: &AgentMsg) -> bool {
+    matches!(msg, AgentMsg::Amphora { .. } | AgentMsg::JobFinishedV2 { .. } | AgentMsg::RunnerProcess { .. })
+}
+
+/// These messages require a successfully checked layout declaration on this connection.
+pub fn server_extension(msg: &ServerMsg) -> bool {
+    matches!(msg, ServerMsg::Amphora { .. } | ServerMsg::ReceivedV2 { .. } | ServerMsg::RetainedReceived { .. })
+}
+
 
 /// What an [`AgentMsg::Identity`] asks for: a certificate for the key of `csr`, as `kind` says.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -636,8 +694,8 @@ pub enum ServerMsg {
     /// A piece of a session's package (`crate::harness::moving::Package`, JSON) for it to go on on
     /// this machine, made from the server's conversation store (`crate::convo::resume`): its
     /// machine is gone. Written at `offset`; on the last piece (`done`) the runner takes the
-    /// session over. On [`LANE_CONVO`]; only to runners announcing [`CAP_CONVO`]. Appended last:
-    /// postcard encodes variants by index.
+    /// session over. Sent as a command to runners announcing [`CAP_HANDOVER`] (older builds
+    /// used [`CAP_CONVO`]). Appended last: postcard encodes variants by index.
     HarnessPackage { session: String, offset: u64, data: Vec<u8>, done: bool },
     /// Let go of this session: it went on on another machine since (its copy here is from an
     /// earlier epoch). Its harness stops; it isn't closed. Only to runners announcing
@@ -758,6 +816,12 @@ pub enum ServerMsg {
     /// To runners announcing [`CAP_UNREAD`], in place of [`ServerMsg::Reach`]'s `close`. Appended
     /// last: postcard encodes variants by index.
     ReachRefused { from: String, link: String, code: crate::reach::relay::Refusal, why: String },
+    /// U15: opaque product transport; appended to preserve all older postcard indices.
+    Amphora { frame: crate::replication::Frame },
+    /// U03: receipt for exactly one attempt, negotiated with CAP_JOB_ATTEMPT.
+    ReceivedV2 { job: String, attempt: u32 },
+    /// U03: JSON exact retained evidence accepted durably by the server. Appended last.
+    RetainedReceived { json: String },
 }
 
 /// What the server's copy of one agent session has of its events, said in digests
@@ -1155,6 +1219,89 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn u15_amphora_transport_is_append_only_and_legacy_frames_still_decode() -> anyhow::Result<()> {
+        let frame = crate::replication::Frame { from: 1, to: 2, id: 3, part: 0, parts: 1, bytes: vec![4, 5] };
+        let agent = AgentMsg::Amphora { frame: frame.clone() };
+        let server = ServerMsg::Amphora { frame };
+        let a = encode(&agent)?;
+        let s = encode(&server)?;
+        assert_eq!(a.first(), Some(&58));
+        assert_eq!(s.first(), Some(&64));
+        assert_eq!(decode::<AgentMsg>(&a)?, agent);
+        assert_eq!(decode::<ServerMsg>(&s)?, server);
+        let legacy = ServerMsg::Cluster { json: r#"{"t":"leave"}"#.into(), raft: Vec::new() };
+        assert_eq!(decode::<ServerMsg>(&encode(&legacy)?)?, legacy);
+        assert_eq!(CAP_AMPHORA, 1 << 48);
+        assert_eq!(CAP_HARNESS_RELEASE, 1 << 42);
+        assert_eq!(CAP_HARNESS_RELEASE & CAP_AMPHORA, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn u03_retained_receipt_and_resource_caps_are_append_only() -> anyhow::Result<()> {
+        let receipt = ServerMsg::RetainedReceived { json: "{}".into() };
+        let bytes = encode(&receipt)?;
+        assert_eq!(bytes.first(), Some(&66));
+        assert_eq!(decode::<ServerMsg>(&bytes)?, receipt);
+        assert_eq!(CAP_RETAINED_RECEIVED, 1 << 45);
+        assert_eq!(CAP_RESOURCE_OWNERSHIP, 1 << 46);
+        assert_eq!(CAP_FIRECRACKER_SHAPE, 1 << 47);
+        let previous = encode(&AgentMsg::JobFinishedV2 { result: JobResult { job: "fixture".into(), status: Status::Succeeded, exit_code: Some(0), error: None, peak_rss: None, cpu_seconds: None }, attempt: 1 })?;
+        let process = AgentMsg::RunnerProcess { nonce: "a".repeat(43) };
+        let encoded = encode(&process)?;
+        assert_eq!(encoded.first().copied(), previous.first().map(|tag| tag + 1));
+        assert_eq!(decode::<AgentMsg>(&encoded)?, process);
+        assert!(valid_process_nonce(&crate::util::random_token()));
+        assert!(!valid_process_nonce("install-label-or-pid"));
+        assert!(CAP_FIRECRACKER_SHAPE.is_power_of_two());
+        assert_eq!(CAP_FIRECRACKER_SHAPE & (CAP_RESOURCE_OWNERSHIP | CAP_RETAINED_RECEIVED | CAP_OPEN_ONCE | CAP_JOB_ATTEMPT), 0);
+        assert_eq!(CAP_RESOURCE_OWNERSHIP & (CAP_RETAINED_RECEIVED | CAP_OPEN_ONCE | CAP_JOB_ATTEMPT), 0);
+        let current_main = CAP_UNREAD | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_AGENT_LIMIT | CAP_WORK | CAP_HANDOVER | CAP_INBOX | CAP_NET_DROPS | CAP_WIRE | u64::from(u32::MAX);
+        let unified = CAP_AMPHORA | CAP_HARNESS_RELEASE | CAP_JOB_ATTEMPT | CAP_OPEN_ONCE | CAP_RETAINED_RECEIVED | CAP_RESOURCE_OWNERSHIP;
+        assert_eq!(unified.count_ones(), 6);
+        assert_eq!(unified & current_main, 0, "unified capabilities follow the deployed main bits");
+        assert_eq!(CAP_UNIFIED_LAYOUT, 1 << 49);
+        assert_eq!(CAP_EXPLICIT_ACTIVATION, 1 << 50);
+        assert_eq!(CAP_EXPLICIT_ACTIVATION & (CAP_UNIFIED_LAYOUT | unified | CAP_FIRECRACKER_SHAPE | current_main), 0);
+        assert!(check_unified_layout(CAP_EXPLICIT_ACTIVATION).is_err());
+        assert!(check_unified_layout(CAP_UNIFIED_LAYOUT | CAP_EXPLICIT_ACTIVATION).is_ok());
+        assert_eq!(CAP_UNIFIED_LAYOUT & (unified | CAP_FIRECRACKER_SHAPE | current_main), 0);
+        assert!(check_unified_layout(CAP_UNREAD).is_ok(), "main's bit 41 remains unread only");
+        assert!(check_unified_layout(CAP_UNREAD | CAP_JOB_ATTEMPT).is_err(), "old experimental declarations are refused");
+        assert!(check_unified_layout(CAP_UNIFIED_LAYOUT | CAP_JOB_ATTEMPT).is_ok(), "a unified peer need not own a replica");
+        assert!(check_unified_layout(CAP_UNIFIED_LAYOUT | unified).is_ok());
+        assert!(check_unified_layout(CAP_AMPHORA).is_err());
+        assert!(agent_extension(&process));
+        assert!(server_extension(&receipt));
+        assert!(!agent_extension(&AgentMsg::Caps { caps: CAP_UNREAD }));
+        Ok(())
+    }
+
+    #[test]
+    fn u17_open_once_capability_is_a_new_bit() {
+        assert_eq!(CAP_OPEN_ONCE, 1 << 44);
+        assert!(CAP_OPEN_ONCE.is_power_of_two());
+        assert_eq!(CAP_OPEN_ONCE & (CAP_JOB_ATTEMPT | CAP_HARNESS_RELEASE | CAP_AMPHORA | CAP_WIRE), 0);
+    }
+
+    #[test]
+    fn u03_completion_attempt_is_appended_without_changing_legacy_postcard() -> anyhow::Result<()> {
+        let result = JobResult { job: "leg".into(), status: Status::Succeeded, exit_code: Some(0), error: None, peak_rss: None, cpu_seconds: None };
+        let legacy = encode(&AgentMsg::JobFinished(result.clone()))?;
+        assert_eq!(legacy.first(), Some(&6));
+        let completion = AgentMsg::JobFinishedV2 { result, attempt: 7 };
+        let bytes = encode(&completion)?;
+        assert_eq!(bytes.first(), Some(&59));
+        assert_eq!(decode::<AgentMsg>(&bytes)?, completion);
+        let receipt = ServerMsg::ReceivedV2 { job: "leg".into(), attempt: 7 };
+        let bytes = encode(&receipt)?;
+        assert_eq!(bytes.first(), Some(&65));
+        assert_eq!(decode::<ServerMsg>(&bytes)?, receipt);
+        assert_eq!(CAP_JOB_ATTEMPT, 1 << 43);
+        Ok(())
+    }
+
     /// A machine's agent limit comes after every older variant both ways (so a peer from before
     /// reads every older frame as it did), and its bit is a new one.
     #[test]
@@ -1229,7 +1376,7 @@ mod tests {
         assert_eq!(decode::<AgentMsg>(&encode(&up)?)?, up);
         assert_eq!(decode::<ServerMsg>(&encode(&down)?)?, down);
         // Step 5 appended `LinkUnread` (57) and `ReachRefused` (63) after them.
-        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (58, 64), "each table has every variant once");
+        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (61, 67), "each table has every variant once");
         assert!(CAP_UNREAD.is_power_of_two() && CAP_UNREAD == 1 << 41 && CAP_UNREAD & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH) == 0);
         Ok(())
     }

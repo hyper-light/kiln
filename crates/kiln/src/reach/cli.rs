@@ -352,6 +352,7 @@ pub fn reach(a: ReachArgs) -> anyhow::Result<()> {
                 println!("No key was pinned for {runner}.");
                 Ok(())
             }
+            Ev::Error(e) => anyhow::bail!("{e}"),
             other => anyhow::bail!("unexpected answer {other:?}"),
         },
     }

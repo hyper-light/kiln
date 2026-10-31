@@ -48,7 +48,10 @@
   margin-top: 6px;
   color: #a8c9bc;
   font-size: 12px;
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  min-width: 0;
+  max-width: 60%;
   transition: color 0.3s;
 }
 .rp-status::before {

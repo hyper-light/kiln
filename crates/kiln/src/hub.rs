@@ -1,8 +1,10 @@
-//! The server core: agent sessions, the scheduler, job bookkeeping and the UI event bus.
+//! The server core: agent sessions, job bookkeeping and the UI event bus.
 //!
 //! All network input arrives as [`NetEvent`]s from the QUIC thread and is handled here; every
 //! outcome is persisted through [`Store`] before it is broadcast, so a crash at any point loses
 //! at most in-flight log bytes, never job state.
+
+mod executor_enrollment;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -20,12 +22,26 @@ use crate::config::Config;
 use crate::logs::Logs;
 use crate::metrics::{self, HostSample};
 use crate::net::{Kind, NetEvent, NetHandle};
-use crate::pipeline::Context;
-use crate::proto::{self, AgentMsg, Assignment, Hello, JobResult, LANE_CONTROL, LANE_TERM, ServerMsg};
+use crate::proto::{self, AgentMsg, Hello, JobResult, LANE_CONTROL, LANE_TERM, ServerMsg};
 use crate::store::{AgentRow, Job, Status, Store};
+use crate::sql::OptionalExtension as _;
 use crate::wire::events::ServerEvent;
 use crate::wire::payload::{Carried, FromRunner};
 use crate::wire::unread::{Code, Wire};
+
+/// U17: marks a failed durable evidence write, distinct from validation/policy refusals.
+#[derive(Debug)]
+pub(crate) struct EvidenceStorageError(anyhow::Error);
+impl std::fmt::Display for EvidenceStorageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "durable runner evidence: {:#}", self.0) }
+}
+impl std::error::Error for EvidenceStorageError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(self.0.as_ref()) }
+}
+
+/// Apply only around storage operations; invalid requests must retain their final refusal.
+pub(crate) fn evidence_storage(error: anyhow::Error) -> anyhow::Error { EvidenceStorageError(error).into() }
+
 
 /// How long a persistent agent may be gone before its jobs are requeued.
 pub(crate) const AGENT_GRACE: Duration = Duration::from_secs(45);
@@ -43,19 +59,6 @@ pub const COMMAND_WITHIN: Duration = Duration::from_secs(30);
 const HAVE_AGAIN: Duration = Duration::from_secs(5);
 /// How many sessions' digests one `ServerMsg::Kept` carries at the most.
 const KEPT_A_FRAME: usize = 32;
-/// How soon a refused pod launch is tried again.
-const LAUNCH_RETRY: Duration = Duration::from_secs(15);
-
-/// Where a Kubernetes job's pod stands until its agent connects.
-#[derive(Debug, Clone, Copy)]
-pub enum Launch {
-    /// A pod was created (or adopted after a restart) at this instant.
-    Pod(Instant),
-    /// No pod is on its way: launch again from `at`. `check_pods` when the failed attempt may
-    /// have left a pod behind (an API timeout) or a dead one may hold the name.
-    Retry { at: Instant, check_pods: bool },
-}
-
 /// How long an outpost invite works ([`OutpostInvites`]).
 pub const OUTPOST_INVITE_TTL: Duration = Duration::from_secs(3600);
 
@@ -91,15 +94,7 @@ pub(crate) fn carries(labels: &[String], os: &str, arch: &str, name: &str, want:
     want == name || labels.iter().any(|l| l.eq_ignore_ascii_case(want)) || platform_labels(os, arch).iter().any(|l| l.eq_ignore_ascii_case(want))
 }
 
-/// Whether runner `a` meets every constraint of `job`'s `requires` (docs/ci.md W05-R22), against
-/// the facts it last reported. One that hasn't reported any meets none: a job that needs a tool
-/// waits for a runner known to have it, rather than going where it would fail (the release's
-/// macOS job on a Mac with no developer tools, 2026-10-24).
-fn meets(job: &Job, a: &AgentLive) -> bool {
-    job.spec.as_ref().is_none_or(|spec| facts_meet(&spec.requires, a.facts.as_deref(), &a.labels))
-}
-
-/// [`meets`]: each of `requires` holds for `facts` (none reported: none holds).
+/// Each constraint holds for the runner facts; absent facts satisfy no requirement.
 fn facts_meet(requires: &[String], facts: Option<&kiln_ci::facts::RunnerFacts>, labels: &[String]) -> bool {
     if requires.is_empty() {
         return true;
@@ -167,11 +162,6 @@ fn platform_labels<'a>(os: &'a str, arch: &'a str) -> Vec<&'a str> {
     }
     v.retain(|l| !l.is_empty());
     v
-}
-
-/// How hard a runner is pressed, by its last sample (none yet: unknown, not overloaded).
-fn strain_of(a: &AgentLive) -> crate::reach::directory::Strain {
-    a.sample.as_ref().map(|s| crate::reach::directory::strain(s.cpus, s.cpu_pct, s.load1, s.mem_total, s.mem_used)).unwrap_or_default()
 }
 
 /// An outpost (`kiln outpost`) says so with its label and no slots; a runner given the label by
@@ -392,11 +382,15 @@ pub enum TermOut {
 pub struct Hub {
     pub cfg: Arc<Config>,
     pub store: Store,
+    /// U09/U15: verified before every other Hub effect; raw key never enters canonical storage.
+    pub(crate) master_key: crate::secrets::crypto::Master,
     /// The records kiln keeps through the Records seam (docs/seams.md): kiln's own, in its store,
     /// until Amphora's (CP-T1.5) take their place. Deploying by API's are there.
     pub records: Arc<dyn kiln_seams::Records>,
     pub logs: Logs,
     pub net: NetHandle,
+    /// U15: advertise transport ownership only after the carrier coordinator installs it.
+    pub replica_carrier_active: std::sync::OnceLock<Arc<std::sync::atomic::AtomicBool>>,
     pub pki: Arc<crate::pki::Pki>,
     pub agents: Mutex<HashMap<String, AgentLive>>,
     /// The CI engine's dispatcher (docs/ci.md W05): its runs, legs and their messages.
@@ -432,7 +426,6 @@ pub struct Hub {
     file_requests: Mutex<HashMap<u64, futures::channel::oneshot::Sender<Result<(crate::harness::files::Answer, Vec<u8>), String>>>>,
     pub history: Mutex<HashMap<String, VecDeque<HostSample>>>,
     pub wake: Notify,
-    pub launching: Mutex<HashMap<String, Launch>>,
     pub started: Instant,
     pub generation: u64,
     /// Runners connected just before this server started ([`crate::store::Store::runners_before`]).
@@ -441,10 +434,7 @@ pub struct Hub {
     pub join_token: String,
     /// One-time enrollment tokens for pod agents: token → (job id, expiry).
     pub ephemeral_tokens: Mutex<HashMap<String, (String, Instant)>>,
-    /// One-time enrollment tokens for a `k8s` pool's executor pods (docs/ci.md W13-R07): token →
-    /// (executor, the pod's name, which the runner must take, expiry).
-    pub executor_tokens: Mutex<HashMap<String, (String, String, Instant)>>,
-    /// The executor each executor pod's runner is, by the name it enrolled with.
+    /// U03: authenticated index rebuilt from the durable pod/certificate receipt on Hello.
     pub pod_executors: Mutex<HashMap<String, String>>,
     /// One-time outpost invites (`POST /api/outposts/invite`).
     pub outpost_invites: OutpostInvites,
@@ -508,8 +498,6 @@ pub struct Hub {
     pub tasks: crate::sync::tasks::Tasks,
     /// Work kept in step between the machines that hold a repository (`crate::sync::share`).
     pub shares: crate::sync::share::Shares,
-    /// The runners' learners of the cluster group (docs/p2p.md, P2).
-    pub cluster: crate::store::learner::Learners,
     /// Notifications to people's devices (`crate::push`).
     pub push: crate::push::Service,
     /// Where kiln keeps its bytes (`crate::blobs`, docs/blobs.md): the server's data directory, or
@@ -552,37 +540,56 @@ impl Hub {
         join_token: String,
         shutdown: Shutdown,
     ) -> anyhow::Result<Arc<Self>> {
+        // U09/U15: this is the existing blocking construction path. Fail before recovery,
+        // sessions, controllers or handlers can derive secrets or seal with an untrusted key.
+        let master_key = crate::secrets::crypto::initialize(&cfg, &store)?;
         let blobs = crate::blobs::open(&cfg, &store, Arc::clone(&clock))?;
         let generation =
             std::env::var("KILN_GENERATION").ok().and_then(|g| g.parse().ok()).unwrap_or(1);
         let discovery = Arc::new(crate::discovery::Discovery::for_server(&cfg, &pki.ca_der));
         let harness_dir = cfg.data("harness");
+        let machine_name = crate::pki::sanitize_name(&cfg.local_agent_name());
+        // U19: Tasks recovery and Sync share one controller lease, including standby promotion.
+        let sync_controller = crate::sync::server::Controller::open(&cfg.data("sync"))?;
+        // U17: import host-affine sidecars before starting sync or task execution.
+        let places = crate::sync::places::Places::from_database(cfg.data("sync").join("places.json"), store.database(), &machine_name)?;
+        let tasks = crate::sync::tasks::Tasks::from_controller(&cfg.data("sync"), store.database(), &machine_name, sync_controller.clone())?;
+        let copies = crate::reach::copies::Copies::from_database(cfg.data("reach").join("copies.json"), store.database(), &machine_name)?;
+        // U15/U19: merge every retained local conversation source before Registry exposes a writer.
+        let conversation_sources = if !cfg.conversations.off && crate::convo::enabled() {
+            let mut sources = crate::server::legacy_conversation_sources(&cfg.data("local-agent"))?;
+            anyhow::ensure!(sources.len() < 4096, "U15: too many server legacy conversation sources; source files retained");
+            sources.insert(0, harness_dir.join(crate::convo::FILE));
+            sources
+        } else { Vec::new() };
         // The bus every session's live feed rides (docs/bus.md): Quiver's node, in this process.
         let bus = crate::bus::QuiverBus::open(&cfg.bus, Arc::clone(&clock))?;
         // The search across a change (W26-R07): an index per tree in the server's cache.
         let search: Arc<dyn kiln_seams::Search> = Arc::new(kiln_search::VorpalSearch::open(cfg.data("cache").join("search"), kiln_search::Limits::default()).map_err(anyhow::Error::msg)?);
-        let harness = crate::harness::registry::Registry::with(harness_dir, &cfg.conversations, Arc::clone(&clock), Arc::new(bus.clone()));
+        let harness = crate::harness::registry::Registry::from_database(harness_dir, &cfg.conversations, Arc::clone(&clock), Arc::new(bus.clone()), store.database(), &machine_name, &conversation_sources)?;
         let contents = crate::sync::contents::Contents::start(&blobs, cfg.data("sync").join("blobs"));
-        let sync = crate::sync::server::Sync::start(cfg.data("sync"), admin_token.clone(), contents);
-        let places = crate::sync::places::Places::open(cfg.data("sync").join("places.json"));
-        let tasks = crate::sync::tasks::Tasks::open(&cfg.data("sync"));
-        let copies = crate::reach::copies::Copies::open(cfg.data("reach").join("copies.json"));
+        let sync = crate::sync::server::Sync::start_with_controller(cfg.data("sync"), admin_token.clone(), contents, store.database(), machine_name.clone(), sync_controller.clone())?;
         let records: Arc<dyn kiln_seams::Records> = Arc::new(crate::records::StoreRecords::open(store.clone())?);
+        // U17: terminal control names share this host's existing database; PTYs remain local.
+        let terminal_namespace = format!("machine.{}", crate::util::sha256_hex(machine_name.as_bytes()).chars().take(56).collect::<String>());
+        let terminals = crate::termsess::Sessions::from_records(Arc::new(crate::records::from_database(&store.database(), &terminal_namespace)?), Some(&cfg.server.data_dir.join("terminal-names.json")))?;
         Ok(Arc::new(Self {
             cfg,
             store,
+            master_key,
             records,
             logs,
             net,
+            replica_carrier_active: std::sync::OnceLock::new(),
             pki,
             agents: Mutex::new(HashMap::new()),
             ci: crate::ci::dispatch::Handle::default(),
             peers: Mutex::new(HashMap::new()),
             pending_peers: Mutex::new(HashMap::new()),
             tunnels: Arc::default(),
-            events: Broadcast::new(4096),
+            events: Broadcast::on(Arc::new(bus.clone()), 4096)?,
             terms: Mutex::new(HashMap::new()),
-            terminals: crate::termsess::Sessions::new(),
+            terminals,
             harness,
             wire: crate::wire::link::Links::new(),
             // Named for this server process (53 bits, as JSON carries a number exactly), so a runner
@@ -596,14 +603,12 @@ impl Hub {
             file_requests: Mutex::new(HashMap::new()),
             history: Mutex::new(HashMap::new()),
             wake: Notify::new(),
-            launching: Mutex::new(HashMap::new()),
             started: Instant::now(),
             generation,
             runners_before: AtomicU64::new(0),
             admin_token,
             join_token,
             ephemeral_tokens: Mutex::new(HashMap::new()),
-            executor_tokens: Mutex::new(HashMap::new()),
             pod_executors: Mutex::new(HashMap::new()),
             outpost_invites: OutpostInvites::default(),
             k8s: std::sync::OnceLock::new(),
@@ -634,7 +639,6 @@ impl Hub {
             places,
             tasks,
             shares: crate::sync::share::Shares::default(),
-            cluster: crate::store::learner::Learners::default(),
             push: crate::push::Service::default(),
             blobs,
             bus,
@@ -701,88 +705,24 @@ impl Hub {
         Ok(())
     }
 
-    /// Sends the cluster group's messages to the runners' learners (the newest process of each
-    /// machine that holds one), on the sync lane; a learner whose runner is away misses them.
-    pub async fn cluster_loop(self: Arc<Self>) -> anyhow::Result<()> {
-        let Some(out) = self.store.group().map(crate::store::group::Group::outgoing) else { return Ok(()) };
-        while let Ok((member, bytes)) = out.recv().await {
-            let peer = self.cluster.machine(member).and_then(|m| self.instances.lock().newest_with(&m, proto::CAP_CLUSTER));
-            let Some(peer) = peer else {
-                if let Some(g) = self.store.group() {
-                    g.unreachable(member);
-                }
-                continue;
-            };
-            for (msg, raft) in self.cluster.frames(bytes) {
-                if let Ok(b) = proto::encode(&ServerMsg::Cluster { json: crate::store::learner::encode(&msg), raft }) {
-                    self.net.send(peer, proto::LANE_SYNC, Kind::Control, b).await;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// A runner process of `machine` that can hold a learner said so, or its newest process changed:
-    /// the newest such process holds the machine's (it's told its member and the token its copies
-    /// are fetched with), and every other one lets its go, so one process at a time has the
-    /// replica's files.
+    /// U15: an older runner must stop its retired learner, including its startup retry loop.
     async fn cluster_announced(&self, machine: &str) {
-        // The server's own runner, in its process, reads kiln.db as it is.
-        let own = self.cfg.local_agent.enabled && machine == crate::pki::sanitize_name(&self.cfg.local_agent_name());
-        let group = self.store.group().filter(|_| self.cfg.cluster.learners && !own);
-        let (newest, mut others) = self.instances.lock().holder_of(machine, proto::CAP_CLUSTER);
-        // With learners off, the newest lets its replica go too: its front door pipes to the
-        // server again rather than wait for a replica that no longer follows.
-        if group.is_none() {
-            others.extend(newest);
+        let (newest, mut peers) = self.instances.lock().holder_of(machine, proto::CAP_CLUSTER);
+        peers.extend(newest);
+        if let Ok(bytes) = proto::encode(&ServerMsg::Cluster { json: r#"{"t":"leave"}"#.into(), raft: Vec::new() }) {
+            for peer in peers { self.net.send(peer, proto::LANE_SYNC, Kind::Control, bytes.clone()).await; }
         }
-        let say = |m: &crate::store::learner::Msg| proto::encode(&ServerMsg::Cluster { json: crate::store::learner::encode(m), raft: Vec::new() });
-        if let Ok(b) = say(&crate::store::learner::Msg::Leave) {
-            for p in others {
-                self.net.send(p, proto::LANE_SYNC, Kind::Control, b.clone()).await;
-            }
-        }
-        let (Some(g), Some(peer)) = (group, newest) else { return };
-        let member = self.cluster.announced(g, machine);
-        let token = crate::store::learner::token(&self.admin_token, machine);
-        if let Ok(b) = say(&crate::store::learner::Msg::Join { member, token }) {
-            self.net.send(peer, proto::LANE_SYNC, Kind::Control, b).await;
-        }
-    }
-
-    /// The runners that could keep a copy of the conversation store, as they are now: the
-    /// mirrors are picked again from them, and fed (`crate::convo::mirror`).
-    fn mirrors_seen(&self) {
-        let Some(m) = &self.harness.copies else { return };
-        // One lock at a time: the machines first, then their runner processes.
-        let machines: Vec<(String, u64)> = self
-            .agents
-            .lock()
-            .values()
-            .filter(|a| a.connected && !a.ephemeral && !a.labels.iter().any(|l| l == proto::OUTPOST_LABEL))
-            .map(|a| (a.name.clone(), a.sample.as_ref().map_or(0, |s| s.disk_total.saturating_sub(s.disk_used))))
-            .collect();
-        let candidates: Vec<crate::convo::mirror::Candidate> = {
-            let inst = self.instances.lock();
-            machines
-                .into_iter()
-                .filter_map(|(machine, disk_free)| {
-                    let peer = inst.newest_with(&machine, proto::CAP_CONVO)?;
-                    let connected_at = inst.get(peer).map_or(0, |i| i.connected_at);
-                    Some(crate::convo::mirror::Candidate { machine, peer, connected_at, disk_free })
-                })
-                .collect()
-        };
-        m.connected(candidates);
     }
 
     /// What a machine's runner said on the sync lane: of its copies (to the groups), of the git
     /// repositories it holds, or of its part of a task.
-    fn sync_heard(&self, machine: &str, msg: crate::sync::wire::Msg, raft: Vec<u8>) {
+    async fn sync_heard(&self, machine: &str, msg: crate::sync::wire::Msg, raft: Vec<u8>) {
         match msg {
             crate::sync::wire::Msg::Repos(r) => {
-                if self.places.heard(machine, r) {
-                    self.emit(&ServerEvent::Places);
+                match self.places.heard(machine, r).await {
+                    Ok(true) => self.emit(&ServerEvent::Places),
+                    Ok(false) => {}
+                    Err(e) => { tracing::warn!(error = %format!("{e:#}"), "repository inventory could not commit"); return; }
                 }
                 // Said when it connects, and when what it holds changes: what it shares.
                 self.shares.arrange(self);
@@ -830,7 +770,7 @@ impl Hub {
     /// Sends `e` down every events socket (`GET /api/events`) and to kiln's own listeners.
     pub fn emit(&self, e: &ServerEvent) {
         if self.events.receiver_count() > 0 {
-            self.events.send(Arc::from(e.text()));
+            let _ = self.events.send(Arc::from(e.text()));
         }
     }
 
@@ -1405,9 +1345,15 @@ impl Hub {
     /// The runners' commands due now: those not sent yet on their link, and those whose answer is
     /// overdue (lost below the channel).
     async fn flush_commands(&self) {
-        let frames = self.cmds.lock().poll(Instant::now());
-        for (peer, f) in frames {
-            self.send_peer(peer, &ServerMsg::Wire(f)).await;
+        let frames = self.cmds.lock().poll_routed(Instant::now());
+        for (peer, f, connection) in frames {
+            match connection {
+                Some(connection) => match proto::encode(&ServerMsg::Wire(f)) {
+                    Ok(body) => { let _ = self.net.send_bound(connection, LANE_CONTROL, Kind::Control, body).await; }
+                    Err(error) => tracing::warn!(%error, "captured command could not be encoded; ownership remains pending"),
+                },
+                None => self.send_peer(peer, &ServerMsg::Wire(f)).await,
+            }
         }
     }
 
@@ -1524,7 +1470,7 @@ impl Hub {
         self.front_doors.forget(&self.store, agent).await;
         self.agent_limits.forget(&self.store, agent).await;
         self.headrooms.forget(&self.store, agent).await;
-        self.places.forget(agent);
+        self.places.forget(agent).await?;
         self.tailnet.wake.notify();
         self.update_slot_gauges();
         Ok(())
@@ -1587,14 +1533,27 @@ impl Hub {
     }
 
     async fn on_net(self: &Arc<Self>, ev: NetEvent) -> anyhow::Result<()> {
+        // W27/U15: queued bootstrap events never become eligible, and a fresh canonical
+        // revocation invalidates a buffered Hello before it can mutate application ownership.
+        if !self.net.application_admitted(&ev) { return Ok(()); }
+        if let NetEvent::Closed { peer, epoch, .. } = &ev
+            && !self.instances.lock().accepts_close(*peer,*epoch) { return Ok(()); }
         match ev {
-            NetEvent::Connected { peer, name, binding } => {
+            NetEvent::Connected { peer, epoch, name, binding,.. } => {
+                {
+                    let mut instances = self.instances.lock();
+                    instances.connected(peer, epoch, binding);
+                    // Transport proof is negotiated anew. This clears no process/grant,
+                    // ownership or physical-stop evidence and says nothing about their death.
+                    if let Some(instance) = instances.get_mut(peer) { instance.wide &= !proto::CAP_UNIFIED_LAYOUT; }
+                }
+                if let Some(agent) = self.agent_of(peer) { self.ci.send(crate::ci::dispatch::Msg::RunnerFacts { agent }); }
                 self.tunnels.connected(peer, binding);
                 if let Some(n) = name {
                     self.pending_peers.lock().insert(peer, n);
                 }
             }
-            NetEvent::Closed { peer, reason } | NetEvent::Unreachable { peer, reason } => {
+            NetEvent::Closed { peer, reason, .. } | NetEvent::Unreachable { peer, reason, .. } => {
                 self.tunnels.closed(peer);
                 // Its live commands not yet answered end; its parked ones wait for it.
                 self.cmds.lock().down(peer);
@@ -1609,9 +1568,6 @@ impl Hub {
                 let name = self.peers.lock().remove(&peer);
                 self.handovers_lost(peer).await;
                 let lost = self.instances.lock().lost(peer);
-                if let (Some(name), Some(m)) = (&name, &self.harness.copies) {
-                    m.disconnected(name, peer);
-                }
                 if let Some(name) = name {
                     // Sync moves to another runner process of the machine that syncs, if any.
                     let syncing = self.instances.lock().newest_with(&name, proto::CAP_SYNC).is_some();
@@ -1633,7 +1589,7 @@ impl Hub {
             }
             // Bulk frames are job output, but on the conversation feed's and the files' lanes
             // (messages, in bulk).
-            NetEvent::Frame { peer, kind: Kind::Log, lane, data } if lane != proto::LANE_CONVO && lane != proto::LANE_FILES => match proto::read_whole::<proto::LogChunk>(&data) {
+            NetEvent::Frame { peer, kind: Kind::Log, lane, data, .. } if lane != proto::LANE_CONVO && lane != proto::LANE_FILES => match proto::read_whole::<proto::LogChunk>(&data) {
                 Ok(chunk) => {
                     if self.owns_job(peer, &chunk.job) {
                         self.logs.append(&chunk.job, chunk.idx, &chunk.data);
@@ -1641,7 +1597,7 @@ impl Hub {
                 }
                 Err(e) => self.unreadable(peer, Wire::Runner, "a log chunk".to_owned(), e.code(), e.why("LogChunk"), true).await,
             },
-            NetEvent::Frame { peer, lane, data, .. } => match proto::read_agent(&data) {
+            NetEvent::Frame { peer, lane, data, connection, .. } => match proto::read_agent(&data) {
                 // Anything on its control lane before its Hello is out of order: Hello comes first
                 // there. On its other lanes a frame may come before its Hello is read (it sends them
                 // once it's connected): it's let go, as it was.
@@ -1653,7 +1609,7 @@ impl Hub {
                         tracing::debug!(peer, lane = proto::lane_name(lane), %what, "a runner's frame before its Hello, on a lane that may outrun it: let go");
                     }
                 }
-                Ok(msg) => self.on_runner_msg(peer, msg).await?,
+                Ok(msg) => self.on_agent_msg_from(peer, msg, connection).await?,
                 Err(e) => self.unreadable(peer, Wire::Runner, e.what(), e.code(), e.why("AgentMsg"), true).await,
             },
         }
@@ -1663,9 +1619,48 @@ impl Hub {
     /// A runner's message read whole off one of its lanes: what it carries read too
     /// (`crate::wire::payload_of`), then applied; or, when that can't be read, refused to it
     /// (`Unread`) and noted.
+    #[cfg(test)]
     async fn on_runner_msg(self: &Arc<Self>, peer: PeerId, msg: AgentMsg) -> anyhow::Result<()> {
+        self.on_agent_msg_from(peer, msg, None).await
+    }
+
+    #[cfg(test)]
+    async fn on_agent_msg(self: &Arc<Self>, peer: PeerId, msg: AgentMsg) -> anyhow::Result<()> {
+        self.on_agent_msg_from(peer, msg, None).await
+    }
+
+    // Metadata and private-layout proof are properties of this actual authenticated connection,
+    // checked before either the public payload reader or any private extension can affect state.
+    async fn accepts_layout(&self, peer: PeerId, msg: &AgentMsg, origin: Option<crate::net::Connection>) -> anyhow::Result<bool> {
+        let refusal = {
+            let instances = self.instances.lock();
+            let current = instances.accepts_connection(peer, origin);
+            if matches!(msg, AgentMsg::Hello(_) | AgentMsg::Instance(_) | AgentMsg::Build { .. } | AgentMsg::Caps { .. } | AgentMsg::RunnerProcess { .. }) || proto::agent_extension(msg) {
+                anyhow::ensure!(current, "runner identity/capability declaration or private extension came from a replaced or unverified connection");
+            }
+            let instance = instances.get(peer);
+            // Preserve the explicit existing no-TLS in-process fixture policy only in tests;
+            // production None origins never establish a negotiated private layout.
+            let joined = current && instance.is_some_and(|i| i.on_connection(origin) || (cfg!(test) && origin.is_none()));
+            match msg {
+                AgentMsg::Caps { .. } if !joined => Some("capability declaration precedes this connection's joined Hello"),
+                AgentMsg::Caps { caps } => proto::check_unified_layout(*caps).err(),
+                m if proto::agent_extension(m) && !(joined && instance.is_some_and(|i| i.wide & proto::CAP_UNIFIED_LAYOUT != 0)) => Some("private protocol extension before this connection validated its unified layout"),
+                _ => None,
+            }
+        };
+        if let Some(reason) = refusal {
+            self.send_peer(peer, &ServerMsg::Refused { reason: reason.to_owned() }).await;
+            self.net.command(crate::net::Out::Disconnect { peer }).await;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    async fn on_agent_msg_from(self: &Arc<Self>, peer: PeerId, msg: AgentMsg, origin: Option<crate::net::Connection>) -> anyhow::Result<()> {
+        if !self.accepts_layout(peer, &msg, origin).await? { return Ok(()); }
         match crate::wire::payload_of(msg) {
-            Ok(m) => self.on_agent_msg(peer, m).await,
+            Ok(m) => self.on_carried_msg_from(peer, m, origin).await,
             Err(e) => {
                 self.unreadable_payload(peer, e, true).await;
                 Ok(())
@@ -1756,16 +1751,94 @@ impl Hub {
         self.peers.lock().get(&peer).cloned()
     }
 
-    /// Whether `job` is one of the CI engine's legs: one it knows, or, while it rebuilds its runs
-    /// after a restart (knowing none yet), one the store has (its message waits for it then).
-    async fn ci_leg(&self, job: &str) -> bool {
-        self.ci.is_leg(job) || (self.ci.enabled() && self.ci.restored().is_none() && self.store.ci_legs(vec![job.to_owned()]).await.is_ok_and(|l| l.contains(job)))
-    }
-
     fn owns_job(&self, peer: PeerId, job: &str) -> bool {
         let Some(name) = self.agent_of(peer) else { return false };
-        // A failed leg it keeps: a step rerun in place reports as the leg (W17-R04).
+        // U03: machine identity is insufficient while runner processes overlap.
+        let instances = self.instances.lock();
+        if let Some(owner) = instances.owner(&crate::instances::Owned::Job(job.to_owned())) {
+            return owner == peer;
+        }
+        // Recovery before inventory restored ownership, or an explicitly kept leg (W17-R04).
+        // Only the machine's current process may use this fallback, and only for known work.
+        if instances.newest(&name) != Some(peer) { return false; }
+        drop(instances);
         self.agents.lock().get(&name).is_some_and(|a| a.running.iter().any(|j| j == job)) || self.ci.kept_by(job, &name)
+    }
+
+    /// U03: a prior host may retain an execution while this job id runs elsewhere. Only
+    /// identity-fenced retained events get this exception; ordinary job messages never do.
+    fn owns_retained_event(&self, peer: PeerId, agent: &str, event: &kiln_ci::wire::JobEventV2) -> bool {
+        self.instances.lock().newest(agent) == Some(peer)
+            && matches!(event, kiln_ci::wire::JobEventV2::KeptOwned { .. } | kiln_ci::wire::JobEventV2::KeptReleased { .. })
+    }
+
+    /// U03: storage failure propagates before a receipt; retries retain their attempt identity.
+    async fn runner_completion(&self, peer: PeerId, agent: &str, result: JobResult, attempt: Option<u32>) -> anyhow::Result<()> {
+        let job = result.job.clone();
+        let mut received = false;
+        if self.owns_job(peer, &job) {
+            let canonical = self.store.ci_legs(vec![job.clone()]).await?.contains(&job);
+            received = self.finish_owned_completion(peer, agent, &result, attempt, canonical).await?;
+        } else if let Some(attempt) = attempt {
+            // A durable receipt may outlive in-memory ownership across a server crash.
+            received = crate::ci::runs::completion(self, &job, attempt, agent).await?.is_some();
+            if !received {
+                let (job, agent) = (job.clone(), agent.to_owned());
+                received = self.store.call(move |c| {
+                    // Read-only: never stage work without authenticating the exact process.
+                    // A retired receipt is represented by the same durable terminal attempt.
+                    Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM jobs j JOIN ci_attempts a ON a.leg_id = j.id WHERE j.id = ?1 AND j.agent = ?3 AND a.runner = ?3 AND a.number = ?2 AND (CASE WHEN j.job_id IS NULL THEN j.attempt + 1 ELSE MAX(j.attempt, 1) END) = ?2 AND j.status IN ('succeeded', 'failed', 'cancelled', 'skipped') AND a.status = 'done' AND COALESCE(a.failure_class, '') != 'runner-lost')", crate::sql::params![job, attempt, agent], |r| r.get::<_, bool>(0))?)
+                }).await?;
+            }
+        }
+        if received {
+            if let Some(attempt) = attempt {
+                self.send_peer(peer, &ServerMsg::ReceivedV2 { job, attempt }).await;
+            } else if self.instances.lock().get(peer).is_some_and(|i| i.caps & proto::CAP_RECEIVED != 0) {
+                self.send_peer(peer, &ServerMsg::Received { job }).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// U01/U03: continue an authenticated completion after classification. A negative
+    /// classification is only advisory; the legacy writer must fence concurrent adoption.
+    async fn finish_owned_completion(&self, peer: PeerId, agent: &str, result: &JobResult, attempt: Option<u32>, mut canonical: bool) -> anyhow::Result<bool> {
+        let mut received = false;
+        if !canonical {
+            match self.job_done(agent, result.clone()).await {
+                Ok(()) => received = true,
+                // Adoption can commit after the negative lookup. The old transaction made
+                // no changes and released no ownership; use the original attempt fence.
+                Err(error) if error.is::<crate::store::CanonicalJobMutation>() => canonical = true,
+                Err(error) => return Err(error),
+            }
+        }
+        if canonical {
+            // U03: disabling ingress cannot let an attempt-capable process bypass fencing.
+            if attempt.is_none() && self.instances.lock().get(peer).is_some_and(|i| i.wide & proto::CAP_JOB_ATTEMPT != 0) { return Ok(false); }
+            if let Some((job, attempt)) = crate::ci::runs::stage_completion(self, agent, result, attempt).await? {
+                self.ci.send(crate::ci::dispatch::Msg::Completion { agent: agent.to_owned(), job, attempt });
+                received = true;
+            }
+        }
+        Ok(received)
+    }
+
+    /// U03: legacy transport is an input adapter, never a second canonical metadata writer.
+    async fn runner_step(&self, peer: PeerId, agent: &str, job: &str, idx: u32, status: Status, exit_code: Option<i32>) -> anyhow::Result<bool> {
+        if !self.owns_job(peer, job) { return Ok(false); }
+        match self.store.step_update(job.to_owned(), idx, status, exit_code).await {
+            Ok(()) => Ok(true),
+            Err(error) if error.is::<crate::store::CanonicalJobMutation>() => {
+                let accepted = crate::ci::runs::imported_step(self, agent, job, idx, status, exit_code).await?;
+                if !accepted {
+                    tracing::warn!(job, peer, "legacy step progress ignored: no live original imported assignment or active step; canonical assignments require their attempt-fenced event protocol");
+                }
+                Ok(accepted)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn agent_lost(&self, name: &str, reason: &str) {
@@ -1826,27 +1899,30 @@ impl Hub {
     }
 
     async fn requeue_agent_jobs(&self, name: &str, reason: &str) {
-        let jobs: Vec<String> = {
-            let mut g = self.agents.lock();
-            match g.get_mut(name) {
-                Some(a) => {
-                    a.busy = 0;
-                    a.exclusive = false;
-                    a.held.clear();
-                    std::mem::take(&mut a.running)
-                }
-                None => vec![],
+        let jobs = self.agents.lock().get(name).map(|a| a.running.clone()).unwrap_or_default();
+        let canonical = match self.store.ci_legs(jobs.clone()).await {
+            Ok(owned) => owned,
+            Err(error) => {
+                tracing::error!(%error, agent = name, "ownership lookup failed; runner loss is fenced");
+                return;
             }
         };
-        if jobs.iter().any(|j| self.ci.is_leg(j)) {
+        if self.ci.available() || !canonical.is_empty() {
             self.ci.send(crate::ci::dispatch::Msg::RunnerLost { agent: name.to_owned() });
+            return;
         }
-        for j in jobs.into_iter().filter(|j| !self.ci.is_leg(j)) {
+        for j in jobs {
             match self.store.requeue_job(j.clone(), format!("{reason} ({name})")).await {
                 Ok(true) => tracing::info!(job = %j, agent = name, "job requeued"),
                 Ok(false) => tracing::warn!(job = %j, agent = name, "job failed: out of retries"),
-                Err(e) => tracing::error!(error = %e, job = %j, "requeue failed"),
+                Err(e) => {
+                    if e.is::<crate::store::CanonicalJobMutation>() {
+                        self.ci.send(crate::ci::dispatch::Msg::RunnerLost { agent: name.to_owned() });
+                    } else { tracing::error!(error = %e, job = %j, "requeue failed"); }
+                    continue;
+                }
             }
+            self.release_slot(name, &j);
             self.logs.append(&j, 0, format!("\r\n\x1b[33m[kiln] {reason}; job requeued\x1b[0m\r\n").as_bytes());
             self.emit_job(&j).await;
         }
@@ -1856,7 +1932,7 @@ impl Hub {
 
     /// A frame of a runner's channel (docs/wire.md). An item is applied as the message it carries,
     /// then answered: taken, or refused saying why. Never answered before it's applied.
-    async fn on_wire(self: &Arc<Self>, peer: PeerId, agent: &str, frame: crate::wire::channel::Frame) {
+    async fn on_wire(self: &Arc<Self>, peer: PeerId, agent: &str, frame: crate::wire::channel::Frame, origin: Option<crate::net::Connection>) {
         use crate::wire::channel::{Arrival, Frame, Refusal};
         match frame {
             Frame::Item { stream, seq, low, body } => {
@@ -1868,14 +1944,37 @@ impl Hub {
                                 self.unreadable(peer, Wire::RunnerItem, "Wire".to_owned(), Code::Malformed, why.clone(), false).await;
                                 Some((Refusal::Malformed, why))
                             }
-                            Ok(inner) => match crate::wire::payload_of(inner) {
-                                Ok(m) => Box::pin(self.on_agent_msg(peer, m)).await.err().map(|e| (Refusal::Refused, format!("{e:#}"))),
+                            Ok(inner) => {
+                                let evidence = matches!(&inner, AgentMsg::JobEvent { .. } | AgentMsg::JobFinished(_) | AgentMsg::JobFinishedV2 { .. });
+                                match self.accepts_layout(peer, &inner, origin).await {
+                                    Ok(true) => {},
+                                    Ok(false) => {
+                                        self.wire.retry(agent, &stream, seq);
+                                        return;
+                                    }
+                                    Err(error) => {
+                                        self.wire.retry(agent, &stream, seq);
+                                        tracing::warn!(%agent, %stream, seq, error = %format!("{error:#}"), "runner connection evidence refused");
+                                        return;
+                                    }
+                                }
+                                match crate::wire::payload_of(inner) {
+                                Ok(m) => match Box::pin(self.on_carried_msg_from(peer, m, origin)).await {
+                                    Ok(()) => None,
+                                    Err(error) if evidence || error.is::<EvidenceStorageError>() => {
+                                        self.wire.retry(agent, &stream, seq);
+                                        tracing::warn!(%agent, %stream, seq, error = %format!("{error:#}"), "durable runner evidence remains unacknowledged for retry");
+                                        return;
+                                    }
+                                    Err(error) => Some((Refusal::Refused, format!("{error:#}"))),
+                                },
                                 // What it carries can't be read: its NACK says so, as for an item
                                 // that can't be read, and it's noted.
                                 Err(e) => {
                                     let refusal = (e.code.refusal(), e.why.clone());
                                     self.unreadable_payload(peer, e, false).await;
                                     Some(refusal)
+                                }
                                 }
                             },
                             // Its NACK says it: unsupported for a variant this build doesn't know.
@@ -1897,13 +1996,16 @@ impl Hub {
             // The runner's answers to the server's commands, its wants, and what it has of them
             // after a reconnect: what's due goes now.
             frame @ (Frame::Ack(_) | Frame::Want { .. } | Frame::Have(_)) => {
+                // Only the active connection may mutate its command stream's reconnect state.
+                // Immutable completion/retained evidence above remains independently admissible.
+                if !self.instances.lock().accepts_connection(peer,origin) { return; }
                 self.cmds.lock().on_frame(peer, frame);
                 self.flush_commands().await;
             }
         }
     }
 
-    async fn on_agent_msg(self: &Arc<Self>, peer: PeerId, msg: Carried<AgentMsg, FromRunner>) -> anyhow::Result<()> {
+    async fn on_carried_msg_from(self: &Arc<Self>, peer: PeerId, msg: Carried<AgentMsg, FromRunner>, origin: Option<crate::net::Connection>) -> anyhow::Result<()> {
         if let Carried::Nothing(AgentMsg::Hello(h)) = msg {
             return self.on_hello(peer, h).await;
         }
@@ -1934,7 +2036,7 @@ impl Hub {
         }
         let msg = match msg {
             Carried::Nothing(m) => m,
-            Carried::Read(read) => return self.on_read(peer, &agent, read).await,
+            Carried::Read(read) => return self.on_read(peer, &agent, read, origin).await,
         };
         match msg {
             AgentMsg::Hello(_) | AgentMsg::Instance(_) => {}
@@ -1976,15 +2078,13 @@ impl Hub {
                 self.ci.send(crate::ci::dispatch::Msg::RunnerSample { agent: agent.clone() });
             }
             AgentMsg::StepStarted { job, idx } => {
-                if self.owns_job(peer, &job) {
-                    self.store.step_update(job.clone(), idx, Status::Running, None).await?;
+                if self.runner_step(peer, &agent, &job, idx, Status::Running, None).await? {
                     self.logs.step(&job, idx, "running");
                     self.emit_job(&job).await;
                 }
             }
             AgentMsg::StepFinished { job, idx, status, exit_code } => {
-                if self.owns_job(peer, &job) {
-                    self.store.step_update(job.clone(), idx, status, exit_code).await?;
+                if self.runner_step(peer, &agent, &job, idx, status, exit_code).await? {
                     self.logs.step(&job, idx, status.as_str());
                     metrics::global().steps_finished.inc(&[status.as_str()]);
                     self.emit_job(&job).await;
@@ -1992,18 +2092,10 @@ impl Hub {
             }
             AgentMsg::JobSample { .. } => {}
             AgentMsg::JobFinished(r) => {
-                let job = r.job.clone();
-                if self.owns_job(peer, &r.job) {
-                    if self.ci_leg(&r.job).await {
-                        self.ci.send(crate::ci::dispatch::Msg::Finished { agent: agent.clone(), result: r });
-                    } else {
-                        self.job_done(&agent, r).await?;
-                    }
-                }
-                // Heard (taken, or not this runner's to give any more): it needn't send it again.
-                if self.instances.lock().get(peer).is_some_and(|i| i.caps & proto::CAP_RECEIVED != 0) {
-                    self.send_peer(peer, &ServerMsg::Received { job }).await;
-                }
+                self.runner_completion(peer, &agent, r, None).await?;
+            }
+            AgentMsg::JobFinishedV2 { result, attempt } => {
+                self.runner_completion(peer, &agent, result, Some(attempt)).await?;
             }
             AgentMsg::Reject { job, .. } if self.ci.is_leg(&job) => {
                 if self.owns_job(peer, &job) {
@@ -2012,9 +2104,16 @@ impl Hub {
             }
             AgentMsg::Reject { job, reason } => {
                 if self.owns_job(peer, &job) {
+                    match self.store.unclaim_job(job.clone(), format!("declined by {agent}: {reason}")).await {
+                        Ok(()) => {},
+                        Err(error) if error.is::<crate::store::CanonicalJobMutation>() => {
+                            self.ci.send(crate::ci::dispatch::Msg::Rejected { agent: agent.clone(), leg: job });
+                            return Ok(());
+                        }
+                        Err(error) => return Err(error),
+                    }
                     self.release_slot(&agent, &job);
                     self.declined.lock().insert((job.clone(), agent.clone()), Instant::now());
-                    self.store.unclaim_job(job.clone(), format!("declined by {agent}: {reason}")).await?;
                     self.emit_job(&job).await;
                     self.wake.notify();
                 }
@@ -2064,10 +2163,6 @@ impl Hub {
                 if caps & proto::CAP_CLUSTER != 0 {
                     self.cluster_announced(&agent).await;
                 }
-                if caps & proto::CAP_CONVO != 0 {
-                    self.mirrors_seen();
-                    self.harness.restore_due(self, &agent);
-                }
                 // What it can do decides which legs it may take.
                 self.ci.send(crate::ci::dispatch::Msg::RunnerUp { agent: agent.clone(), running: Vec::new() });
                 // Previews' deployments it's left to take down (docs/ci.md W15-R07).
@@ -2083,8 +2178,16 @@ impl Hub {
             }
             // What it can do past Build's 32 bits. One that keeps the channel too is told what the
             // server has of its streams, and sends from there (docs/wire.md).
+            AgentMsg::Amphora { .. } => {
+                self.send_peer(peer, &ServerMsg::Refused { reason: "Amphora transport requires its dedicated authenticated carrier lane".into() }).await;
+            }
+            AgentMsg::RunnerProcess { nonce } => {
+                self.instances.lock().set_process(peer,nonce,origin)?;
+                self.ci.send(crate::ci::dispatch::Msg::RunnerFacts { agent: agent.clone() });
+            }
             AgentMsg::Caps { caps } => {
                 self.instances.lock().set_wide(peer, caps);
+                self.ci.send(crate::ci::dispatch::Msg::RunnerFacts { agent: agent.clone() });
                 crate::headroom::control::on_caps(self, &agent, caps).await;
                 // One that takes hand-overs: its machine's older processes hand their sessions on.
                 if caps & proto::CAP_HANDOVER != 0 {
@@ -2101,7 +2204,7 @@ impl Hub {
                 // One that takes its agent limit from here is sent what's set for its machine.
                 crate::harness::limit::on_caps(self, &agent, peer, caps).await;
             }
-            AgentMsg::Wire(frame) => self.on_wire(peer, &agent, frame).await,
+            AgentMsg::Wire(frame) => self.on_wire(peer, &agent, frame, origin).await,
             AgentMsg::Reach { to, link, open, data, close } => {
                 // Job pods neither send nor receive reach links: one's frame is refused, and noted.
                 if self.agents.lock().get(&agent).is_none_or(|a| a.ephemeral) {
@@ -2138,7 +2241,7 @@ impl Hub {
             }
             // Hand-overs between a machine's runner processes (`crate::handovers`).
             AgentMsg::HarnessHandOver { session, offset, data, done } => self.handover_piece(&agent, peer, session, offset, data, done).await,
-            AgentMsg::HarnessAdopted { session, error } => self.handover_adopted(&agent, peer, session, error).await,
+            AgentMsg::HarnessAdopted { session, error } => self.handover_adopted(&agent, peer, session, error).await?,
             // A frame of the server's this runner couldn't read: noted against it, and on the page
             // of the session it was about when it holds that session now. (A send it couldn't read
             // its session's inbox there answers, as it answers any.) It's the runner's word, so
@@ -2163,8 +2266,8 @@ impl Hub {
                     self.unreadable(peer, Wire::Relay, "LinkUnread".to_owned(), Code::Malformed, why, true).await;
                 }
             }
-            AgentMsg::UpgradeLog { job, line } => self.updates.on_log(self, &job, line),
-            AgentMsg::UpgradeDone { job, ok, error } => self.updates.on_done(self, &job, ok, error),
+            AgentMsg::UpgradeLog { job, line } => self.updates.on_log(self, &agent, peer, &job, line).await?,
+            AgentMsg::UpgradeDone { job, ok, error } => self.updates.on_done(self, &agent, peer, &job, ok, error).await?,
             AgentMsg::TermReplay { session, data } => {
                 let key = format!("{agent}/{session}");
                 let tx = self.terms.lock().get(&key).cloned();
@@ -2187,7 +2290,7 @@ impl Hub {
 
     /// What a runner's message carried, read where its frame was (`crate::wire::payload_of`): each
     /// handler takes its value.
-    async fn on_read(self: &Arc<Self>, peer: PeerId, agent: &str, read: FromRunner) -> anyhow::Result<()> {
+    async fn on_read(self: &Arc<Self>, peer: PeerId, agent: &str, read: FromRunner, origin: Option<crate::net::Connection>) -> anyhow::Result<()> {
         match read {
             // One report per machine: its newest runner process's.
             FromRunner::AiSessions(_) if self.instances.lock().newest(agent).is_some_and(|n| n != peer) => {}
@@ -2232,51 +2335,39 @@ impl Hub {
                     live.control(self, &again).await;
                 }
             }
-            FromRunner::Sync { msg, raft } => self.sync_heard(agent, *msg, raft),
-            FromRunner::Cluster { msg, raft } => match (self.store.group(), *msg) {
-                // Where kiln.db stands, for a read the runner answers once its replica holds it.
-                (Some(g), crate::store::learner::Msg::Ask { id }) => {
-                    let at = crate::store::learner::Msg::At { id, seq: g.standing().0 };
-                    if let Ok(b) = proto::encode(&ServerMsg::Cluster { json: crate::store::learner::encode(&at), raft: Vec::new() }) {
-                        self.net.send(peer, proto::LANE_SYNC, Kind::Control, b).await;
-                    }
-                }
-                (Some(g), msg) => self.cluster.heard(g, agent, &msg, raft),
-                (None, _) => {}
-            },
-            FromRunner::Convo { msg, data } => {
-                // About the server's own store: a mirror's answer. A mirror's copy sent back to
-                // restore it from, when asked for. Else the runner's own store's feed.
-                match (&self.harness.copies, *msg) {
-                    // What a runner's store is doing, for the board.
-                    (_, crate::convo::feed::Msg::Stats { store, report }) => self.harness.board.heard(agent, &store, *report, crate::util::now_ms()),
-                    (_, crate::convo::feed::Msg::Hello { store, restore: true }) => {
-                        if self.harness.restore_accepts(agent, &store)
-                            && let Some(f) = &self.harness.feed
-                        {
-                            f.accept_restore(&store);
-                            f.heard(peer, agent, crate::convo::feed::Msg::Hello { store, restore: true }, data);
-                        }
-                    }
-                    (_, crate::convo::feed::Msg::Restored { store, .. }) => self.harness.restore_done(self, agent, &store),
-                    (Some(m), msg) if msg.store() == m.store_id() => m.heard(agent, msg),
-                    (_, msg) => {
-                        if let Some(f) = &self.harness.feed {
-                            f.heard(peer, agent, msg, data);
-                        }
-                    }
-                }
-            }
+            FromRunner::Sync { msg, raft } => self.sync_heard(agent, *msg, raft).await,
+
             FromRunner::FrontDoorStatus(status) => crate::frontdoor::control::on_status(self, peer, agent, *status).await,
             FromRunner::HeadroomStatus(status) => crate::headroom::control::on_status(self, peer, agent, status),
             // CI (docs/ci.md §2.5): the dispatcher's; facts are W13's.
-            FromRunner::JobEvent { job, event } => {
-                if self.owns_job(peer, &job) {
-                    self.ci.send(crate::ci::dispatch::Msg::Event { agent: agent.to_owned(), leg: job, event });
+            FromRunner::JobEvent { job, event, json } => {
+                if self.owns_job(peer, &job) || self.owns_retained_event(peer, agent, &event.event) {
+                    if self.ci.stage_retained_event(agent, &job, event.event.clone()).await.map_err(evidence_storage)? {
+                        if self.instances.lock().get(peer).is_some_and(|i| i.wide & proto::CAP_RETAINED_RECEIVED != 0)
+                            && let Some(receipt) = crate::agent::retained::Receipt::of(&job, &json)?
+                        {
+                            self.send_peer(peer, &ServerMsg::RetainedReceived { json: serde_json::to_string(&receipt)? }).await;
+                        }
+                    } else {
+                        self.ci.send(crate::ci::dispatch::Msg::Event { agent: agent.to_owned(), leg: job, event });
+                    }
                 }
             }
             // A pool's executor it was asked to start (docs/ci.md W13-R09).
-            FromRunner::Executor(said) => self.ci.send(crate::ci::dispatch::Msg::Executor { agent: agent.to_owned(), said }),
+            FromRunner::Executor { said, json } => {
+                let shaped_ready = said.state == "ready" && matches!(&said.shape, Some(kiln_ci::sched::pools::ExecutorShape::Firecracker(_)));
+                let declared_nonce = self.instances.lock().process_on(peer, origin).map(str::to_owned);
+                let stopped_hint = said.state == "stopped" && said.process_nonce.is_some();
+                if shaped_ready || stopped_hint {
+                    anyhow::ensure!(said.process_nonce.is_some() && said.process_nonce == declared_nonce, "executor readiness/stop hint has no matching process declaration on its actual authenticated connection");
+                }
+                self.ci.stage_executor_event(agent, *said, origin.map(|connection| crate::ci::dispatch::ExecutorOrigin { peer: connection.peer(), connection: connection.connection_id(), process_nonce: declared_nonce })).await.map_err(evidence_storage)?;
+                if self.instances.lock().get(peer).is_some_and(|i| i.wide & proto::CAP_RETAINED_RECEIVED != 0)
+                    && let Some(receipt) = crate::agent::retained::Receipt::executor(&json)?
+                {
+                    self.send_peer(peer, &ServerMsg::RetainedReceived { json: serde_json::to_string(&receipt)? }).await;
+                }
+            },
             // A preview's deployment it was asked to take down (docs/ci.md W15-R07).
             FromRunner::Undeployed(u) => crate::ci::previews::undeployed(self, agent, u).await,
             // What it holds warm, for placement (docs/ci.md W24-R18); a job's pod holds nothing.
@@ -2312,6 +2403,14 @@ impl Hub {
                 }
             }
             FromRunner::ReachAsk { req, ask } => match *ask {
+                crate::reach::Question::Admission { mut ask } => {
+                    ask.insert("op".into(), serde_json::json!("admission"));
+                    let (hub, runner) = (Arc::clone(self), agent.to_owned());
+                    crate::rt::spawn(async move {
+                        let answer = hub.ci.admission(runner, serde_json::Value::Object(ask)).await;
+                        hub.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
+                    });
+                }
                 crate::reach::Question::Directory => {
                     let answer = serde_json::json!({ "runners": self.reach_directory() });
                     self.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
@@ -2349,7 +2448,16 @@ impl Hub {
             // An identity it asks for, for a key it made and keeps (docs/ci.md W27-R01).
             FromRunner::Identity(ask) => crate::identities::on_ask(self, peer, agent, ask).await,
             // Its replica's word in observe's group (docs/observe.md §5).
-            FromRunner::Observe { msg, bytes } => crate::observe::hub::heard(agent, *msg, bytes),
+            FromRunner::Observe { msg, bytes } => {
+                if matches!(&*msg, crate::observe::wire::Msg::Status(_)) {
+                    let instances = self.instances.lock();
+                    if crate::observe::hub::current_status(&instances, agent, peer, origin) {
+                        crate::observe::hub::heard(agent, *msg, bytes);
+                    }
+                } else {
+                    crate::observe::hub::heard(agent, *msg, bytes);
+                }
+            },
             FromRunner::Harness { session, update } => match *update {
                 // A copy of a session that went on elsewhere since (an older epoch): its machine
                 // lets go of it, and nothing it says of it counts.
@@ -2357,7 +2465,7 @@ impl Hub {
                     tracing::info!(%agent, %session, epoch = info.epoch, "an agent session that went on elsewhere: this machine lets go of its copy");
                     // A runner from before letting go stops its copy instead (what it says of it
                     // doesn't count either way).
-                    let lets_go = self.instances.lock().get(peer).is_some_and(|i| i.caps & proto::CAP_CONVO != 0);
+                    let lets_go = self.instances.lock().get(peer).is_some_and(|i| i.wide & proto::CAP_HARNESS_RELEASE != 0 || i.caps & proto::CAP_CONVO != 0);
                     let msg = if lets_go { ServerMsg::HarnessRelease { session } } else { ServerMsg::HarnessClose { session } };
                     self.command_peers(agent, vec![peer], &msg).await.log_when_answered(LOG_WITHIN);
                 }
@@ -2372,39 +2480,44 @@ impl Hub {
                 u if !matches!(u, crate::harness::core::Update::Open { .. }) && !self.harness.runs_on(&session, agent) => {}
                 u => {
                     let closed = matches!(u, crate::harness::core::Update::Closed);
-                    // A runner process that sends its conversation store: the server keeps its
-                    // sessions from that.
-                    let shipped = self.instances.lock().get(peer).is_some_and(|i| i.caps & proto::CAP_CONVO != 0);
                     // Two processes of one machine never both run a session: of two that say they
                     // hold it, the newer keeps it and the older lets go (a hand-over whose word
                     // came late, `crate::handovers`).
                     let (holder, older) = {
-                        let mut inst = self.instances.lock();
+                        let inst = self.instances.lock();
                         let what = crate::instances::Owned::Agent(session.clone());
                         let other = inst.owner(&what).filter(|q| *q != peer && inst.hands_over(*q) && inst.hands_over(peer));
                         match other.and_then(|q| inst.newer_of(q, peer).map(|newer| (q, newer))) {
                             Some((q, newer)) if newer == q => (None, Some(peer)),
-                            pair => {
-                                if closed {
-                                    inst.disown(&what);
-                                } else if inst.owner(&what) != Some(peer) {
-                                    inst.own(what, peer);
-                                }
-                                (inst.get(peer).map(crate::instances::Instance::label).filter(|_| !closed), pair.map(|(q, _)| q))
-                            }
+                            pair => (inst.get(peer).map(crate::instances::Instance::label).filter(|_| !closed), pair.map(|(q, _)| q)),
                         }
                     };
+                    if older == Some(peer) {
+                        if !self.handovers.lock().going_to(&session, peer) {
+                            self.let_go_of(agent, peer, &session).await;
+                        }
+                        return Ok(());
+                    }
+                    // U17: commit ownership before routing or publishing the runner's update.
+                    if closed {
+                        self.harness.release_holder(&session).map_err(evidence_storage)?;
+                    } else if let Some(label) = holder {
+                        self.harness.held_by(&session, &label).map_err(evidence_storage)?;
+                    }
+                    {
+                        let mut inst = self.instances.lock();
+                        let what = crate::instances::Owned::Agent(session.clone());
+                        if closed {
+                            inst.disown(&what);
+                        } else if inst.owner(&what) != Some(peer) {
+                            inst.own(what, peer);
+                        }
+                    }
                     // Not one a hand-over is taking there now: the newer says so once it took it.
                     if let Some(older) = older.filter(|_| !self.handovers.lock().going_to(&session, peer)) {
                         self.let_go_of(agent, older, &session).await;
                     }
-                    if older == Some(peer) {
-                        return Ok(());
-                    }
-                    if let Some(label) = holder {
-                        self.harness.held_by(&session, &label);
-                    }
-                    self.harness.ingest_from(self, &crate::harness::registry::Location::Machine(agent.to_owned()), &session, u, shipped);
+                    self.harness.ingest_from(self, &crate::harness::registry::Location::Machine(agent.to_owned()), &session, u, false);
                     if closed {
                         self.check_retire().await;
                         self.check_handover().await;
@@ -2420,11 +2533,7 @@ impl Hub {
                 // the ones it holds (the registry forgets sessions a report leaves out), and
                 // so does one that isn't connected now (`Registry::holder`).
                 let (me, present, others) = {
-                    let mut inst = self.instances.lock();
-                    for id in &inv.sessions {
-                        inst.own(crate::instances::Owned::Agent(id.clone()), peer);
-                    }
-                    inst.reported(peer);
+                    let inst = self.instances.lock();
                     let others: Vec<String> = inst
                         .of(agent)
                         .into_iter()
@@ -2440,12 +2549,19 @@ impl Hub {
                 };
                 if let Some(me) = &me {
                     for id in &inv.sessions {
-                        self.harness.held_by(id, me);
+                        self.harness.held_by(id, me).map_err(evidence_storage)?;
                     }
                 }
                 let own = inv.sessions.clone();
                 inv.sessions.extend(others);
-                self.harness.inventory(self, agent, me.as_deref(), &present, inv);
+                self.harness.inventory(self, agent, me.as_deref(), &present, inv).map_err(evidence_storage)?;
+                {
+                    let mut inst = self.instances.lock();
+                    for id in &own {
+                        inst.own(crate::instances::Owned::Agent(id.clone()), peer);
+                    }
+                    inst.reported(peer);
+                }
                 // Hand-overs dropped as it went away get their word now it's back.
                 self.handovers_dropped(agent, peer, &own).await;
                 self.check_retire().await;
@@ -2467,6 +2583,11 @@ impl Hub {
         let name = crate::pki::sanitize_name(&h.name);
         if cert_name.as_deref() != Some(name.as_str()) {
             refuse(format!("hello name {name} does not match certificate {cert_name:?}")).await;
+            return Ok(());
+        }
+        // U03: bind this exact certificate to the verified pod UID/node before any registration.
+        if let Err(error) = self.verify_executor_peer(&name, peer).await {
+            refuse(format!("executor enrollment refused: {error:#}")).await;
             return Ok(());
         }
         let now = crate::util::now_unix();
@@ -2499,34 +2620,29 @@ impl Hub {
             .filter(|j| j.agent.as_deref() == Some(name.as_str()))
             .collect();
         let mut keep = Vec::new();
+        let canonical = self.store.ci_legs(h.running.iter().cloned().chain(db_running.iter().map(|j| j.id.clone())).collect()).await?;
         for j in &db_running {
+            if canonical.contains(&j.id) { continue; }
             if h.running.contains(&j.id) {
                 keep.push(j.id.clone());
             } else if held_by_other(&j.id) {
                 // Another runner process of this machine runs it.
             } else {
-                self.store
-                    .requeue_job(j.id.clone(), format!("agent {name} restarted without the job"))
-                    .await?;
-                self.emit_job(&j.id).await;
+                match self.store.requeue_job(j.id.clone(), format!("agent {name} restarted without the job")).await {
+                    Ok(_) => self.emit_job(&j.id).await,
+                    Err(error) if error.is::<crate::store::CanonicalJobMutation>() => {},
+                    Err(error) => return Err(error),
+                }
             }
         }
-        // Until the CI engine has rebuilt its runs after a restart it knows none of its legs: those
-        // the runner says it has are its own still, for the dispatcher to re-adopt or stop once it
-        // has (`dispatch::spawn`), never taken back as v1's jobs (which would cancel them).
-        let rebuilding = if self.ci.enabled() && self.ci.restored().is_none() {
-            let said: Vec<String> = h.running.iter().filter(|j| !keep.contains(j)).cloned().collect();
-            self.store.ci_legs(said).await.unwrap_or_default()
-        } else {
-            HashSet::new()
-        };
+        // U01/U03: canonical ownership survives disabled ingress and controller recovery.
         for j in &h.running {
             if keep.contains(j) {
                 continue;
             }
             // CI's legs are the dispatcher's to re-adopt, or to stop if they were given up while
             // the runner was away (`Msg::RunnerUp` below, W05-R05).
-            if self.ci.is_leg(j) || rebuilding.contains(j) {
+            if self.ci.is_leg(j) || canonical.contains(j) {
                 keep.push(j.clone());
                 continue;
             }
@@ -2534,9 +2650,16 @@ impl Hub {
             // take it back (claim) rather than throwing the work away. Only a job that has since
             // been taken by someone else (or settled) is cancelled on this agent.
             let executor = if h.ephemeral { "k8s" } else { "baremetal" };
-            if self.store.claim_job(j.clone(), name.clone(), executor.into()).await? {
+            let claimed = match self.store.claim_job(j.clone(), name.clone(), executor.into()).await {
+                Ok(claimed) => claimed,
+                Err(error) if error.is::<crate::store::CanonicalJobMutation>() => {
+                    keep.push(j.clone());
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if claimed {
                 tracing::info!(job = %j, agent = %name, "agent reclaimed a requeued job");
-                self.launching.lock().remove(j);
                 keep.push(j.clone());
                 self.emit_job(j).await;
             } else {
@@ -2548,7 +2671,7 @@ impl Hub {
             name: name.clone(),
             peer: Some(peer),
             labels: h.labels.clone(),
-            // An outpost takes no jobs: it keeps no slots (`pick_agent`, CI's dispatch).
+            // An outpost takes no jobs: it keeps no slots (CI's dispatch).
             slots: if outpost { 0 } else { h.slots.max(1) },
             outpost,
             hostname: h.hostname.clone(),
@@ -2622,12 +2745,10 @@ impl Hub {
         self.peers.lock().insert(peer, name.clone());
         self.pending_peers.lock().remove(&peer);
         self.agents.lock().insert(name.clone(), live.clone());
-        if let Some(j) = &h.dedicated_job {
-            self.launching.lock().remove(j);
-        }
         // It keeps the channel (docs/wire.md): said first, so a runner that keeps it too knows on
         // Welcome not to send its sessions whole. An older runner skips the frame.
-        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_HANDOVER | proto::CAP_WORK | proto::CAP_AGENT_LIMIT | proto::CAP_IDENTITY | proto::CAP_HEADROOM | proto::CAP_CHANGES_PATCH | proto::CAP_UNREAD }).await;
+        let amphora = if self.cfg.cluster.replica.is_some() && self.replica_carrier_active.get().is_some_and(|active| active.load(Ordering::Acquire)) { proto::CAP_AMPHORA } else { 0 };
+        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_HANDOVER | proto::CAP_WORK | proto::CAP_AGENT_LIMIT | proto::CAP_JOB_ATTEMPT | proto::CAP_RETAINED_RECEIVED | proto::CAP_IDENTITY | proto::CAP_HEADROOM | proto::CAP_CHANGES_PATCH | proto::CAP_FIRECRACKER_SHAPE | amphora | proto::CAP_UNREAD | proto::CAP_UNIFIED_LAYOUT | proto::CAP_EXPLICIT_ACTIVATION }).await;
         // What its sessions' copies have here, so a stream it starts sends only what they lack
         // (`crate::wire::sums`): a few dozen sessions a frame, each about a kilobyte.
         for part in self.harness.kept_on(&name).chunks(KEPT_A_FRAME) {
@@ -2732,6 +2853,7 @@ impl Hub {
         // took over from lets its own go. Until then that one held it, hearing nothing, until it
         // ended (its jobs finished), and the new build waited for its folder.
         crate::observe::hub::announced(self, name).await;
+        self.ci.send(crate::ci::dispatch::Msg::RunnerFacts { agent: name.to_owned() });
     }
 
     /// A machine's runner processes, while it has more than one, with what each holds.
@@ -2746,6 +2868,38 @@ impl Hub {
     /// them always; agent views only while a machine has more than one).
     /// What a machine's newest runner process says it can do ([`crate::proto::CAP_UPGRADE`] …);
     /// 0 for runners from before builds were announced.
+    /// U03/W13-R09: capability and process selection are one Instances snapshot.
+    pub fn capture_newest_runner(&self, machine: &str, required: u64) -> Result<crate::instances::CapturedRunner, crate::instances::CaptureRefusal> {
+        self.instances.lock().capture_newest_runner(machine,required | proto::CAP_WIRE)
+    }
+    pub fn capture_original_runner(&self, machine: &str, peer: PeerId, process_nonce: &str, required: u64) -> Result<crate::instances::CapturedRunner, crate::instances::CaptureRefusal> {
+        self.instances.lock().capture_original_runner(machine,peer,process_nonce,required | proto::CAP_WIRE)
+    }
+    /// U03: use the existing Live command seq/ACK owner, retaining the captured route on every retry.
+    /// Grant persistence authorizes NEW items after a reconnect; an old item never changes route.
+    pub async fn send_captured_runner(&self, captured: &crate::instances::CapturedRunner, msg: &ServerMsg) -> anyhow::Result<Pending> {
+        use crate::wire::commands::Answer;
+        if stream_of(msg) != Some(crate::wire::commands::Kind::Live) { anyhow::bail!("captured runner commands require the Live command stream"); }
+        let frame = proto::encode(msg)?;
+        let mut answer = {
+            let instances = self.instances.lock();
+            if !instances.still_captured(captured) {
+                return Ok(Pending { agent: captured.machine().to_owned(), what: crate::wire::server_name(msg), waits: Vec::new(), at_once: Answer::Unreachable { why: "its captured connection changed before command admission".into() }, away: false });
+            }
+            self.cmds.lock().push_bound(captured.connection(),frame,Instant::now())
+        };
+        // Preserve positive queue NACKs for the existing authoritative dispatcher lifecycle.
+        // Taken is an accepted ordered intent; only Said/physical proof establishes its result.
+        let mut waits = Vec::new();
+        let at_once = match answer.try_recv() {
+            Ok(Some(answer)) => answer,
+            Ok(None) => { waits.push(answer); Answer::Taken }
+            Err(_) => Answer::Unanswered { why: "the captured command owner ended without an answer".into() },
+        };
+        self.flush_commands().await;
+        Ok(Pending { agent: captured.machine().to_owned(), what: crate::wire::server_name(msg), waits, at_once, away: false })
+    }
+
     pub fn runner_caps(&self, name: &str) -> u32 {
         let inst = self.instances.lock();
         inst.newest(name).and_then(|p| inst.get(p)).map_or(0, |i| i.caps)
@@ -2755,7 +2909,7 @@ impl Hub {
     /// ([`proto::AgentMsg::Caps`]: [`proto::CAP_WIRE`] ...).
     pub fn runner_wide_caps(&self, name: &str) -> u64 {
         let inst = self.instances.lock();
-        inst.newest(name).and_then(|p| inst.get(p)).map_or(0, |i| u64::from(i.caps) | i.wide)
+        inst.newest(name).map_or(0, |peer| inst.effective_wide(peer))
     }
 
     /// The kiln a machine's newest runner process says it runs (`crate::fleet`).
@@ -2829,13 +2983,14 @@ impl Hub {
     }
 
     async fn job_done(&self, agent: &str, r: JobResult) -> anyhow::Result<()> {
-        self.release_slot(agent, &r.job);
-        self.cancel_sent.lock().remove(&r.job);
         let job = self.store.job(r.job.clone()).await?;
         let (run_id, settled) = self
             .store
             .finish_job(r.job.clone(), r.status, r.exit_code, r.error.clone(), r.peak_rss, r.cpu_seconds)
             .await?;
+        // U01/U03: only a committed legacy finish permits host ownership cleanup.
+        self.release_slot(agent, &r.job);
+        self.cancel_sent.lock().remove(&r.job);
         self.logs.finish(&r.job);
         let m = metrics::global();
         let run = self.store.run(run_id.clone()).await?;
@@ -2880,13 +3035,21 @@ impl Hub {
 
     // ------------------------------------------------------------ runs
 
-    pub async fn cancel_run(&self, run_id: &str, reason: &str) -> anyhow::Result<()> {
-        // The CI engine's runs are cancelled through their plans.
-        if self.ci.is_run(run_id) {
-            self.ci.send(crate::ci::dispatch::Msg::Cancel { run: run_id.to_owned(), reason: reason.to_owned() });
-            return Ok(());
+    pub async fn cancel_run(&self, run_id: &str, reason: &str) -> Result<(), crate::ci::dispatch::CancelError> {
+        use crate::ci::dispatch::CancelError;
+        // W05-R25/U03: durable ownership wins even while dispatch is rebuilding or fenced.
+        // Falling back on its transient live-run set could bypass the canonical replay log.
+        let id = run_id.to_owned();
+        let canonical: Option<(bool, u32, String)> = self.store.call(move |c| Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM ci_plans WHERE run_id = r.id), r.attempt, r.status FROM runs r WHERE r.id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?)).await.map_err(CancelError::commit)?;
+        if let Some((true, attempt, status)) = canonical {
+            if Status::parse(&status).is_terminal() { return Ok(()); }
+            return self.ci.cancel(run_id, attempt, reason).await;
         }
-        let running = self.store.cancel_run(run_id.to_owned(), reason.to_owned()).await?;
+        let running = self.store.cancel_run(run_id.to_owned(), reason.to_owned()).await.map_err(|error| {
+            if error.is::<crate::store::CanonicalRunCancellation>() {
+                CancelError::Unavailable("the workflow engine took ownership during cancellation")
+            } else { CancelError::commit(error) }
+        })?;
         for (job, agent) in running {
             if let Some(agent) = agent {
                 self.command_start(&agent, &ServerMsg::Cancel { job: job.clone(), reason: reason.into() }).await.log_when_answered(LOG_WITHIN);
@@ -2904,44 +3067,28 @@ impl Hub {
         Ok(())
     }
 
-    // ------------------------------------------------------------ scheduler
+    // ------------------------------------------------------------ job maintenance
 
-    /// Assign queued jobs to agents (or launch pods) until nothing more fits. Runs on every wake
-    /// and once a second as a safety net.
-    pub async fn scheduler_loop(self: Arc<Self>) -> anyhow::Result<()> {
-        let mut tick = Interval::new(Duration::from_secs(1));
-        let mut slow = Instant::now();
+    /// Maintain agent liveness and old running assignments. The CI dispatcher owns all new
+    /// placement, including jobs imported from the legacy workflow store.
+    pub async fn job_maintenance_loop(self: Arc<Self>) -> anyhow::Result<()> {
+        let mut tick = Interval::new(Duration::from_secs(5));
         loop {
             futures::select_biased! {
                 () = self.shutdown.cancelled().fuse() => return Ok(()),
-                () = self.wake.notified().fuse() => {}
                 () = tick.tick().fuse() => {}
             }
-            self.schedule_once().await?;
-            if slow.elapsed() >= Duration::from_secs(5) {
-                slow = Instant::now();
-                self.check_timeouts().await?;
-                self.check_lost_agents().await;
-                crate::ci::notify::runners_gone(&self);
-                crate::ci::notify::secrets_unused(&self);
-                crate::ci::notify::quarantined(&self);
-            }
+            self.check_timeouts().await?;
+            self.check_lost_agents().await;
+            crate::ci::notify::runners_gone(&self);
+            crate::ci::notify::secrets_unused(&self);
+            crate::ci::notify::quarantined(&self);
         }
     }
 
     /// The server's secrets, for the CI engine's trusted runs (docs/ci.md W09 narrows them).
     pub fn ci_secrets(&self) -> Vec<(String, String)> {
         self.secrets()
-    }
-
-    /// What a job's environment gets from the server: its secrets, and where each image kiln
-    /// publishes lives (`KILN_IMAGE_<NAME>`, docs/cd-targets.md §7.1), set in the UI.
-    fn job_secrets(&self) -> Vec<(String, String)> {
-        let mut s = self.secrets();
-        if let Some(cd) = crate::cd::get() {
-            s.extend(cd.image_env());
-        }
-        s
     }
 
     fn secrets(&self) -> Vec<(String, String)> {
@@ -2958,234 +3105,11 @@ impl Hub {
             .collect()
     }
 
-    async fn schedule_once(&self) -> anyhow::Result<()> {
-        let queued = self.store.queued_jobs(2000).await?;
-        metrics::global().jobs_queued.set(i64::try_from(queued.len()).unwrap_or(i64::MAX));
-        let running = i64::try_from(self.store.running_jobs().await?.len()).unwrap_or(0);
-        metrics::global().jobs_running.set(running);
-        if queued.is_empty() {
-            return Ok(());
-        }
-        let mut runs = HashMap::new();
-        let k8s = self.k8s.get().and_then(Option::as_ref);
-        let mut pods_live = None;
-        for job in queued {
-            let Some(spec) = job.spec.clone() else { continue };
-            if !runs.contains_key(&job.run_id) {
-                let r = self.store.run(job.run_id.clone()).await?;
-                runs.insert(job.run_id.clone(), r);
-            }
-            let Some(Some(run)) = runs.get(&job.run_id) else { continue };
-            // `if:` conditions are evaluated against the run.
-            if let Some(cond) = &spec.condition {
-                let mut ctx = Context::default();
-                ctx.set("branch", run.branch.clone());
-                ctx.set("event", run.event.clone());
-                ctx.set("sha", run.sha.clone());
-                ctx.set("repo", run.repo_name.clone());
-                if !ctx.eval(cond) {
-                    self.store.claim_job(job.id.clone(), "-".into(), "none".into()).await?;
-                    self.store.finish_job(job.id.clone(), Status::Skipped, None, Some(format!("if: {cond}")), None, None).await?;
-                    self.emit_job(&job.id).await;
-                    self.emit_run(&run.id).await;
-                    continue;
-                }
-            }
-            let chosen = self.pick_agent(&job);
-            match chosen {
-                Some(agent) => {
-                    let ephemeral = self.agents.lock().get(&agent).is_some_and(|a| a.ephemeral);
-                    let executor = if job.labels.iter().any(|l| l == "k8s") && ephemeral { "k8s" } else { "baremetal" };
-                    if !self.store.claim_job(job.id.clone(), agent.clone(), executor.into()).await? {
-                        continue;
-                    }
-                    {
-                        let mut g = self.agents.lock();
-                        if let Some(a) = g.get_mut(&agent) {
-                            a.running.push(job.id.clone());
-                            a.busy = u32::try_from(a.running.len()).unwrap_or(u32::MAX);
-                            hold_on(a, &job.id, v1_incoming(spec.exclusive, &spec.resources));
-                        }
-                    }
-                    if let Some(q) = job.queued_at {
-                        #[allow(clippy::cast_precision_loss)]
-                        metrics::global().queue_wait.observe((crate::util::now_unix() - q).max(0) as f64);
-                    }
-                    let clone_url = self
-                        .store
-                        .repos()
-                        .await?
-                        .into_iter()
-                        .find(|r| r.id == run.repo_id)
-                        .map(|r| r.clone_url)
-                        .unwrap_or_default();
-                    let assign = Assignment {
-                        job_id: job.id.clone(),
-                        run_id: run.id.clone(),
-                        repo: run.repo_name.clone(),
-                        clone_url,
-                        sha: run.sha.clone(),
-                        branch: run.branch.clone(),
-                        event: run.event.clone(),
-                        run_number: run.number,
-                        attempt: job.attempt,
-                        spec: spec.for_assignee(self.runner_caps(&agent), ephemeral),
-                        secrets: self.job_secrets(),
-                        job_token: crate::api::job_token(&self.admin_token, &job.id),
-                        server_url: self.server_url_for(&agent),
-                    };
-                    tracing::info!(job = %job.id, key = %job.key, agent = %agent, "job assigned");
-                    let _rx = self.logs.subscribe(&job.id); // create the live channel early
-                    // A live command: refused at once while its runner is away. Once taken, the leg's
-                    // own answer (JobStarted or Reject) says what came of it.
-                    let pending = self.command_start(&agent, &ServerMsg::Assign(Box::new(assign))).await;
-                    match pending.at_once() {
-                        Some(a) if *a != crate::wire::commands::Answer::Sent => {
-                            let why = format!("assignment could not be delivered: {}", a.words());
-                            self.release_slot(&agent, &job.id);
-                            self.store.requeue_job(job.id.clone(), why).await?;
-                        }
-                        _ => pending.log_when_answered(LOG_WITHIN),
-                    }
-                    self.emit_job(&job.id).await;
-                    self.emit_run(&run.id).await;
-                    self.update_slot_gauges();
-                }
-                None => {
-                    let Some(k) = k8s else { continue };
-                    if !job.labels.iter().any(|l| l == "k8s") {
-                        continue;
-                    }
-                    // A retry asked for a runner by name (W05-R28): a pod made for it isn't that one.
-                    if job.placement.as_ref().is_some_and(|p| p.runner.is_some()) {
-                        continue;
-                    }
-                    let timeout = Duration::from_secs(u64::from(self.cfg.kubernetes.start_timeout_seconds));
-                    let launch = self.launching.lock().get(&job.id).copied();
-                    match launch {
-                        Some(Launch::Pod(t)) if t.elapsed() < timeout => continue,
-                        Some(Launch::Retry { at, .. }) if Instant::now() < at => continue,
-                        // After a server restart the launch table is empty, but the job's pod may
-                        // already exist (Pending or about to connect): adopt it instead of duplicating.
-                        None => {
-                            if k.job_pod_alive(&job.id).await {
-                                self.launching.lock().insert(job.id.clone(), Launch::Pod(Instant::now()));
-                                continue;
-                            }
-                        }
-                        Some(Launch::Pod(_)) => {
-                            // Still Pending for capacity (or pulling a large image) is not a failure:
-                            // keep waiting instead of churning pods.
-                            if k.job_pod_alive(&job.id).await {
-                                self.launching.lock().insert(job.id.clone(), Launch::Pod(Instant::now()));
-                                continue;
-                            }
-                            tracing::warn!(job = %job.id, "pod agent did not connect in time; relaunching");
-                            k.delete_job_pods(&job.id).await;
-                            // Not again on the next pass if the launch below has to wait.
-                            self.launching
-                                .lock()
-                                .insert(job.id.clone(), Launch::Retry { at: Instant::now(), check_pods: false });
-                        }
-                        Some(Launch::Retry { check_pods: true, .. }) => {
-                            if k.job_pod_alive(&job.id).await {
-                                self.launching.lock().insert(job.id.clone(), Launch::Pod(Instant::now()));
-                                continue;
-                            }
-                            k.delete_job_pods(&job.id).await;
-                        }
-                        Some(Launch::Retry { check_pods: false, .. }) => {}
-                    }
-                    if pods_live.is_none() {
-                        pods_live = Some(self.launching.lock().values().filter(|l| matches!(l, Launch::Pod(_))).count());
-                    }
-                    let live = pods_live.unwrap_or(0);
-                    if u32::try_from(live).unwrap_or(u32::MAX) >= self.cfg.kubernetes.max_pods {
-                        continue;
-                    }
-                    match k.launch(self, &job, run).await {
-                        Ok(pod) => {
-                            tracing::info!(job = %job.id, pod, "launched agent pod");
-                            self.launching.lock().insert(job.id.clone(), Launch::Pod(Instant::now()));
-                            pods_live = Some(live + 1);
-                            metrics::global().k8s_pods_launched.inc(&["ok"]);
-                        }
-                        Err(e) => {
-                            metrics::global().k8s_pods_launched.inc(&["error"]);
-                            // Usually the jobs-namespace quota is full: retry soon rather than after
-                            // the full start timeout. Each job retries on its own, since a smaller
-                            // one may still fit where this one did not.
-                            let msg = format!("{e:#}");
-                            let quota = msg.contains("exceeded quota");
-                            if quota {
-                                tracing::debug!(job = %job.id, "job quota full; waiting for capacity");
-                            } else {
-                                tracing::error!(job = %job.id, error = %msg, "pod launch failed");
-                            }
-                            let now = Instant::now();
-                            let at = now.checked_add(LAUNCH_RETRY).unwrap_or(now);
-                            // A quota refusal created nothing, so its retry needs no pod checks.
-                            self.launching.lock().insert(job.id.clone(), Launch::Retry { at, check_pods: !quota });
-                        }
-                    }
-                }
-            }
-        }
-        self.emit_queue();
-        Ok(())
-    }
-
-    /// The HTTP base URL an agent should use: loopback for the in-process agent, the in-cluster
-    /// service for pods, the public URL for everyone else.
-    fn server_url_for(&self, agent: &str) -> String {
-        let local = crate::pki::sanitize_name(&self.cfg.local_agent_name());
-        if self.cfg.local_agent.enabled && agent == local {
-            let port = self.cfg.server.http_addr.rsplit_once(':').map_or("7070", |(_, p)| p);
-            return format!("http://127.0.0.1:{port}");
-        }
-        let ephemeral = self.agents.lock().get(agent).is_some_and(|a| a.ephemeral);
-        if ephemeral
-            && let Some(u) = &self.cfg.kubernetes.server_url {
-                return u.clone();
-            }
-        self.cfg.server.public_url.clone()
-    }
-
-    fn pick_agent(&self, job: &Job) -> Option<String> {
-        let declined = self.declined.lock().clone();
-        let g = self.agents.lock();
-        let incoming = job.spec.as_ref().map_or(kiln_ci::sched::state::Incoming::Ordinary, |s| v1_incoming(s.exclusive, &s.resources));
-        let asked = job.spec.as_ref().map(|s| v1_asked(&s.resources)).unwrap_or_default();
-        let (target, now) = (crate::ci::dispatch::target_use(&self.cfg.ci.scheduler), crate::util::now_ms());
-        let found = g
-            .values()
-            .filter(|a| a.connected && !a.draining && !a.exclusive && a.skew.takes_work())
-            .filter(|a| !a.running.contains(&job.id))
-            .filter(|a| {
-                declined
-                    .get(&(job.id.clone(), a.name.clone()))
-                    .is_none_or(|t| t.elapsed() >= DECLINE_BACKOFF)
-            })
-            .filter(|a| match &a.dedicated_job {
-                Some(d) => d == &job.id,
-                None => true,
-            })
-            .filter(|a| job.labels.iter().all(|l| carries(&a.labels, &a.os, &a.arch, &a.name, l)))
-            .filter(|a| meets(job, a))
-            // Where a person's retry asked it to run (docs/ci.md W05-R28).
-            .filter(|a| job.placement.as_ref().is_none_or(|p| p.allows(&a.name)))
-            .filter(|a| agent_room(a.slots, a.facts.as_deref(), &a.held, a.exclusive, a.running.len(), incoming))
-            // Not one that's overloaded (nearly out of memory, or loaded past twice its cores): the
-            // job goes to another, or waits for one (a pod made for it is its own).
-            .filter(|a| a.ephemeral || !strain_of(a).overloaded)
-            // By the engine's own rule (W05): within the target use, the most headroom left.
-            .map(|a| V1Candidate { name: &a.name, slots: a.slots, headroom: if a.ephemeral || !self.cfg.ci.scheduler.headroom { None } else { fresh_headroom(a, now) }, room: crate::reach::directory::room(strain_of(a), a.busy, a.slots) });
-        v1_best(found, &asked, target).map(str::to_owned)
-    }
-
     async fn check_timeouts(&self) -> anyhow::Result<()> {
+        if self.ci.restored().is_none() { return Ok(()); }
         let now = crate::util::now_unix();
         for job in self.store.running_jobs().await? {
+            if self.ci.is_leg(&job.id) { continue; }
             let Some(spec) = &job.spec else { continue };
             let Some(started) = job.started_at else { continue };
             let limit = i64::from(spec.timeout_minutes) * 60;
@@ -3202,14 +3126,12 @@ impl Hub {
                 }
                 Some(t) if t.elapsed() > Duration::from_secs(60) => {
                     // The agent did not report back: settle it ourselves.
-                    if let Some(agent) = &job.agent {
-                        self.release_slot(agent, &job.id);
-                    }
-                    self.cancel_sent.lock().remove(&job.id);
                     let (run_id, _) = self
                         .store
                         .finish_job(job.id.clone(), Status::TimedOut, None, Some(format!("exceeded {} min", spec.timeout_minutes)), None, None)
                         .await?;
+                    if let Some(agent) = &job.agent { self.release_slot(agent, &job.id); }
+                    self.cancel_sent.lock().remove(&job.id);
                     self.logs.finish(&job.id);
                     self.emit_job(&job.id).await;
                     self.emit_run(&run_id).await;
@@ -3222,6 +3144,7 @@ impl Hub {
     }
 
     async fn check_lost_agents(&self) {
+        if self.ci.restored().is_none() { return; }
         // Jobs of a runner process that went away while its machine stayed connected through
         // another one, and did not come back in time.
         let expired: Vec<(String, Vec<String>)> = {
@@ -3238,9 +3161,9 @@ impl Hub {
                 if !still {
                     continue;
                 }
-                self.release_slot(&name, &j);
                 match self.store.requeue_job(j.clone(), format!("runner process did not reconnect ({name})")).await {
-                    Ok(_) => self.emit_job(&j).await,
+                    Ok(_) => { self.release_slot(&name, &j); self.emit_job(&j).await; }
+                    Err(error) if error.is::<crate::store::CanonicalJobMutation>() => self.ci.send(crate::ci::dispatch::Msg::RunnerLost { agent: name.clone() }),
                     Err(e) => tracing::error!(error = %e, job = %j, "requeue failed"),
                 }
             }
@@ -3273,7 +3196,7 @@ impl Hub {
                     .flat_map(|a| a.running.clone())
                     .collect();
                 for j in running {
-                    if !known.contains(&j.id) && j.agent.as_deref() != Some("-")
+                    if !self.ci.is_leg(&j.id) && !known.contains(&j.id) && j.agent.as_deref() != Some("-")
                         && let Ok(true) = self.store.requeue_job(j.id.clone(), "orphaned after restart".into()).await {
                             self.emit_job(&j.id).await;
                         }
@@ -3281,7 +3204,6 @@ impl Hub {
             }
         // Expire unused pod enrollment tokens.
         self.ephemeral_tokens.lock().retain(|_, (_, exp)| *exp > Instant::now());
-        self.executor_tokens.lock().retain(|_, (_, _, exp)| *exp > Instant::now());
     }
 
     /// Sample the server host itself for the UI ("server" series).
@@ -3342,36 +3264,10 @@ fn v1_asked(resources: &crate::pipeline::Resources) -> kiln_ci::sched::state::Re
     kiln_ci::sched::pools::ResourceSpec { cpu: resources.cpu.clone(), memory: resources.memory.clone(), ..Default::default() }.resources().unwrap_or_default()
 }
 
-/// A runner as the v1 dispatcher's last choice weighs it ([`v1_best`]).
-pub(crate) struct V1Candidate<'a> {
-    pub name: &'a str,
-    pub slots: u32,
-    /// Its headroom by a fresh sample; none for a pod made for the job, or a runner without one.
-    pub headroom: Option<kiln_ci::sched::state::Headroom>,
-    /// Its room as reach measures it, for runners without a fresh sample.
-    pub room: f32,
-}
-
-/// Where a v1 job goes of the runners that could take it, by the engine's own rule (W05, the
-/// scheduler's headroom, [`kiln_ci::sched::place::place`]): within the target use by its live
-/// sample, the one with the most headroom left after it; ties, and runners without a fresh
-/// sample after those, by reach's room, then the most slots, then the name.
-pub(crate) fn v1_best<'a>(candidates: impl IntoIterator<Item = V1Candidate<'a>>, asked: &kiln_ci::sched::state::Resources, target: f64) -> Option<&'a str> {
-    let mut found: Vec<V1Candidate<'a>> = candidates.into_iter().collect();
-    found.sort_by(|a, b| b.room.total_cmp(&a.room).then(b.slots.cmp(&a.slots)).then(a.name.cmp(b.name)));
-    let nodes: Vec<kiln_ci::sched::place::Node<'a>> = found.iter().map(|c| kiln_ci::sched::place::Node { name: c.name, headroom: c.headroom }).collect();
-    kiln_ci::sched::place::place(asked, &nodes, target).ok()
-}
-
-/// A runner's headroom by its sample when it's fresh ([`kiln_ci::sched::state::SAMPLE_FRESH_MS`]).
-fn fresh_headroom(a: &AgentLive, now_ms: i64) -> Option<kiln_ci::sched::state::Headroom> {
-    let s = a.sample.as_ref().filter(|s| now_ms.saturating_sub(s.ts_ms) <= kiln_ci::sched::state::SAMPLE_FRESH_MS)?;
-    Some(kiln_ci::sched::state::Headroom::of(&crate::ci::dispatch::sample_of(s, a.facts.as_deref())))
-}
-
 /// Whether a runner has room for one more job or leg, by the rule the engine's scheduler and the
 /// runner's own admission use (`kiln_ci::sched::state::room`): its slots, its size as its facts
 /// give it, what's held of it and what runs.
+#[cfg(test)]
 pub(crate) fn agent_room(slots: u32, facts: Option<&kiln_ci::facts::RunnerFacts>, held: &[(String, kiln_ci::sched::state::Resources)], whole: bool, running: usize, incoming: kiln_ci::sched::state::Incoming) -> bool {
     let size = facts.and_then(|f| {
         let cpus = if f.cpu.threads > 0 { f.cpu.threads } else { f.cpu.cores };
@@ -3398,6 +3294,299 @@ pub(crate) fn hold_on(a: &mut AgentLive, job: &str, incoming: kiln_ci::sched::st
 pub(crate) mod tests {
     use super::*;
 
+    /// U15/U03: a replacement's current TLS origin cannot inherit the old joined instance's
+    /// Caps, and refusing that transport proof never releases its physical job ownership.
+    #[test]
+    fn u15_private_layout_is_bound_to_joined_current_connection() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = hub_with_runner(Arc::new(kiln_seams::clock::SimClock::new()), "box", 0).await?;
+            let (former, current) = (crate::net::Connection::new(1, 1, [1; 32]), crate::net::Connection::new(1, 2, [2; 32]));
+            hub.instances.lock().connected(1, 1, Some([1; 32]));
+            join_runner(&hub, 1, "box", proto::CAP_UNIFIED_LAYOUT | proto::CAP_JOB_ATTEMPT);
+            hub.instances.lock().own(crate::instances::Owned::Job("physical".into()), 1);
+            let completion = AgentMsg::JobFinishedV2 { result: JobResult { job: "physical".into(), status: Status::Succeeded, exit_code: Some(0), error: None, peak_rss: None, cpu_seconds: None }, attempt: 3 };
+            assert!(hub.accepts_layout(1, &completion, Some(former)).await?);
+            // Exercise the reproduced window directly: Connected changed the live connection
+            // map, but Hello has not replaced the old joined Instance (its bit49 is still set).
+            hub.instances.lock().connected(1, 2, Some([2; 32]));
+            assert!(!hub.accepts_layout(1, &completion, Some(current)).await?, "new current origin cannot borrow former joined proof");
+            assert!(hub.accepts_layout(1, &completion, Some(former)).await.is_err(), "stale origin cannot borrow cached proof");
+            let caps = AgentMsg::Caps { caps: proto::CAP_UNIFIED_LAYOUT | proto::CAP_JOB_ATTEMPT };
+            assert!(!hub.accepts_layout(1, &caps, Some(current)).await?, "Caps before a joined current Hello cannot modify the former Instance");
+            assert_eq!(hub.instances.lock().owner(&crate::instances::Owned::Job("physical".into())), Some(1), "layout refusal is no physical stop proof");
+            join_runner(&hub, 1, "box", 0);
+            assert!(!hub.accepts_layout(1, &completion, Some(current)).await?, "Hello alone carries no reconciled capability proof");
+            assert!(hub.accepts_layout(1, &caps, Some(current)).await?);
+            hub.instances.lock().set_wide(1, proto::CAP_UNIFIED_LAYOUT | proto::CAP_JOB_ATTEMPT);
+            assert!(hub.accepts_layout(1, &completion, Some(current)).await?);
+            Ok(())
+        })
+    }
+
+    async fn legacy_running_fixture() -> anyhow::Result<(Arc<Hub>, String, String)> {
+        let hub = scratch_hub_with(|cfg| cfg.ci.enabled = false).await?;
+        let repo = hub.store.upsert_repo(crate::store::Repo {
+            id: "adoption-repo".into(), name: "test/adoption".into(), clone_url: "file:///missing".into(),
+            branches: vec!["main".into()], poll_seconds: 60, enabled: true, created_at: 0,
+            last_polled_at: None, last_error: None, mode: "upstream".into(), default_branch: Some("main".into()), mirror: None,
+        }).await?;
+        let workflow = crate::pipeline::parse("name: ci\njobs:\n  build:\n    steps: [{run: echo build}]\n  dependent:\n    needs: [build]\n    steps: [{run: echo dependent}]\n")?;
+        hub.store.create_run(crate::store::Run {
+            id: "adoption-run".into(), repo_id: repo.id, repo_name: repo.name, number: 0,
+            pipeline: "ci".into(), event: "push".into(), branch: "main".into(), sha: "saved-sha".into(),
+            message: String::new(), author: String::new(), status: Status::Queued, created_at: 0,
+            started_at: None, finished_at: None, error: None, concurrency_group: None,
+        }, crate::pipeline::plan(&workflow, &crate::pipeline::Context::default())?).await?;
+        let jobs = hub.store.jobs("adoption-run".into(), true).await?;
+        let job = jobs.iter().find(|j| j.key == "build").map(|j| j.id.clone()).ok_or_else(|| anyhow::anyhow!("missing build"))?;
+        let dependent = jobs.iter().find(|j| j.key == "dependent").map(|j| j.id.clone()).ok_or_else(|| anyhow::anyhow!("missing dependent"))?;
+        assert!(hub.store.claim_job(job.clone(), "box".into(), "baremetal".into()).await?);
+        hub.pending_peers.lock().insert(77, "box".into());
+        hub.on_hello(77, Hello { protocol: proto::VERSION, name: "box".into(), labels: vec![], slots: 1, hostname: "box".into(), os: "linux".into(), arch: "x86_64".into(), version: String::new(), ephemeral: false, dedicated_job: None, running: vec![job.clone()], terminal: false }).await?;
+        if let Some(instance) = hub.instances.lock().get_mut(77) { instance.wide |= proto::CAP_JOB_ATTEMPT | proto::CAP_UNIFIED_LAYOUT; }
+        if let Some(runner) = hub.agents.lock().get_mut("box") {
+            runner.held = vec![(job.clone(), kiln_ci::sched::state::Resources { cpu: 2.0, mem: 4096, disk: 0, gpu: 0 })];
+        }
+        Ok((hub, job, dependent))
+    }
+
+    /// U03: old transport from an imported execution records only fields it actually carries.
+    /// Exact-process and original-assignment fences reject native, stale and other-owner frames.
+    #[test]
+    fn u03_imported_old_step_progress_preserves_canonical_metadata() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let (hub, job, dependent) = legacy_running_fixture().await?;
+            assert!(crate::ci::legacy::import_run(&hub, "adoption-run").await?);
+            let saved_job = job.clone();
+            let metadata: (String, Option<String>, Option<String>, Option<String>) = hub.store.call(move |c| {
+                c.execute(r#"UPDATE steps SET outcome = 'failure', conclusion = 'success', outputs = '{"saved":true}' WHERE job_id = ?1 AND idx = 0"#, [&saved_job])?;
+                Ok(c.query_row("SELECT name, outcome, conclusion, outputs FROM steps WHERE job_id = ?1 AND idx = 0", [&saved_job], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?)
+            }).await?;
+            hub.peers.lock().insert(78, "box".into());
+            assert!(!hub.runner_step(78, "box", &job, 0, Status::Running, None).await?, "same machine is not the exact owning process");
+            assert!(!crate::ci::runs::imported_step(&hub, "another-box", &job, 0, Status::Running, None).await?, "durable assignment also authenticates the runner");
+            assert!(hub.owns_job(77, &job));
+            hub.on_agent_msg(77, AgentMsg::StepStarted { job: job.clone(), idx: 0 }).await?;
+            assert_eq!(hub.store.job(job.clone()).await?.and_then(|j| j.steps.into_iter().find(|s| s.idx == 0)).map(|s| s.status), Some(Status::Running), "an attempt-capable process may report its proven original imported execution through the old frame");
+            hub.on_agent_msg(77, AgentMsg::StepFinished { job: job.clone(), idx: 0, status: Status::Failed, exit_code: Some(9) }).await?;
+            let step = hub.store.job(job.clone()).await?.and_then(|j| j.steps.into_iter().find(|s| s.idx == 0)).ok_or_else(|| anyhow::anyhow!("missing step"))?;
+            assert_eq!((step.status, step.exit_code), (Status::Failed, Some(9)));
+            assert!(step.started_at.is_some() && step.finished_at.is_some());
+            assert!(!hub.runner_step(77, "box", &job, 0, Status::Running, None).await?, "late starts cannot regress a terminal step");
+            let saved_job = job.clone();
+            let after: (String, Option<String>, Option<String>, Option<String>) = hub.store.call(move |c| Ok(c.query_row("SELECT name, outcome, conclusion, outputs FROM steps WHERE job_id = ?1 AND idx = 0", [&saved_job], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?)).await?;
+            assert_eq!(after, metadata, "old frames cannot invent names, outcome, conclusion or outputs");
+            assert_eq!(hub.store.job(job.clone()).await?.map(|j| j.status), Some(Status::Running));
+            assert_eq!(hub.store.job(dependent).await?.map(|j| j.status), Some(Status::Pending), "progress makes no dependency or lifecycle decisions");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn u03_old_step_frames_cannot_bypass_native_attempt_or_missing_import_provenance() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let (hub, job, _) = legacy_running_fixture().await?;
+            assert!(crate::ci::legacy::import_run(&hub, "adoption-run").await?);
+            let before = serde_json::to_value(hub.store.job(job.clone()).await?)?;
+            hub.peers.lock().insert(78, "box".into());
+            assert!(!hub.runner_step(78, "box", &job, 0, Status::Failed, Some(99)).await?, "same machine cannot replace the exact owning process");
+            assert!(!crate::ci::runs::imported_step(&hub, "another-box", &job, 0, Status::Failed, Some(99)).await?, "the metadata transaction also checks durable assignment");
+            let saved_job = job.clone();
+            hub.store.call(move |c| { c.execute("UPDATE jobs SET attempt = attempt + 1 WHERE id = ?1", [&saved_job])?; Ok(()) }).await?;
+            assert!(!hub.runner_step(77, "box", &job, 0, Status::Failed, Some(99)).await?, "stale imported tuple cannot authorize a different current attempt");
+            let saved_job = job.clone();
+            hub.store.call(move |c| { c.execute("UPDATE jobs SET attempt = attempt - 1 WHERE id = ?1", [&saved_job])?; Ok(()) }).await?;
+            assert_eq!(serde_json::to_value(hub.store.job(job.clone()).await?)?, before);
+            let saved_job = job.clone();
+            hub.store.call(move |c| { c.execute("UPDATE jobs SET status = 'succeeded' WHERE id = ?1", [&saved_job])?; Ok(()) }).await?;
+            assert!(!hub.runner_step(77, "box", &job, 0, Status::Failed, Some(99)).await?, "finished jobs cannot accept old progress");
+            let saved_job = job.clone();
+            hub.store.call(move |c| { c.execute("UPDATE jobs SET status = 'running' WHERE id = ?1", [&saved_job])?; Ok(()) }).await?;
+            // Native claim invalidates old transport even if it reuses machine and attempt.
+            crate::ci::runs::claim(&hub, &job, "box", "baremetal", 1).await?;
+            let native = serde_json::to_value(hub.store.job(job.clone()).await?)?;
+            assert!(!hub.runner_step(77, "box", &job, 0, Status::Failed, Some(99)).await?, "native attempt-capable frames cannot use old transport");
+            assert_eq!(serde_json::to_value(hub.store.job(job.clone()).await?)?, native);
+            // No backfill: an older saved input without provenance is safely ignored.
+            hub.store.call(|c| {
+                let saved: String = c.query_row("SELECT input FROM ci_plans WHERE run_id = 'adoption-run'", [], |r| r.get(0))?;
+                let mut input: serde_json::Value = serde_json::from_str(&saved)?;
+                if let Some(input) = input.as_object_mut() { input.remove("legacy_running"); }
+                c.execute("UPDATE ci_plans SET input = ?1 WHERE run_id = 'adoption-run'", [input.to_string()])?;
+                Ok(())
+            }).await?;
+            assert!(!hub.runner_step(77, "box", &job, 0, Status::Running, None).await?);
+            assert_eq!(serde_json::to_value(hub.store.job(job.clone()).await?)?, native);
+            assert!(hub.owns_job(77, &job));
+            assert_eq!(hub.agents.lock().get("box").map(|a| a.held.len()), Some(1));
+            Ok(())
+        })
+    }
+
+    /// U01/U03: pause at a real negative read, atomically adopt, then resume the stale
+    /// legacy continuations. No sleeps or injected storage faults choose the interleaving.
+    #[test]
+    fn u03_adoption_between_lookup_and_legacy_write_preserves_plan_and_execution() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let (hub, job, dependent) = legacy_running_fixture().await?;
+            // Both hello's inventory and completion classification were read before adoption.
+            let stale_inventory = hub.store.running_jobs().await?;
+            let canonical = hub.store.ci_legs(vec![job.clone(), dependent.clone()]).await?;
+            assert!(canonical.is_empty());
+            assert!(stale_inventory.iter().any(|j| j.id == job));
+            assert!(crate::ci::legacy::import_run(&hub, "adoption-run").await?);
+            let plan_before: (String, String, i64, i64) = hub.store.call(|c| Ok(c.query_row("SELECT workflow, input, done, (SELECT COUNT(*) FROM ci_plan_log WHERE run_id = p.run_id) FROM ci_plans p WHERE run_id = 'adoption-run'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?)).await?;
+            let before = serde_json::to_value((hub.store.jobs("adoption-run".into(), true).await?, hub.store.run("adoption-run".into()).await?))?;
+            let report = JobResult { job: job.clone(), status: Status::Succeeded, exit_code: Some(0), error: None, peak_rss: None, cpu_seconds: None };
+            let refused = [
+                hub.store.finish_job(job.clone(), Status::Succeeded, Some(0), None, None, None).await.err(),
+                hub.store.requeue_job(job.clone(), "stale hello".into()).await.err(),
+                hub.store.claim_job(dependent.clone(), "box".into(), "baremetal".into()).await.err(),
+                hub.store.unclaim_job(job.clone(), "stale rejection".into()).await.err(),
+                hub.store.step_update(job.clone(), 0, Status::Failed, Some(1)).await.err(),
+                hub.store.finish_job_less_run("adoption-run".into(), Status::Failed).await.err(),
+                hub.job_done("box", report.clone()).await.err(),
+            ];
+            assert!(refused.iter().all(|e| e.as_ref().is_some_and(|e| e.is::<crate::store::CanonicalJobMutation>())), "adoption refusal remains typed across Store::call");
+            assert_eq!(serde_json::to_value((hub.store.jobs("adoption-run".into(), true).await?, hub.store.run("adoption-run".into()).await?))?, before, "no legacy state machine, step reset, or dependency advance may run after adoption");
+            // Resume the exact completion continuation with its now-stale negative classification.
+            assert!(!hub.finish_owned_completion(77, "box", &report, None, false).await?, "old message variant cannot bypass attempt fencing after adoption");
+            assert!(!hub.finish_owned_completion(77, "box", &report, Some(2), false).await?, "wrong attempt cannot gain a receipt");
+            assert!(crate::ci::runs::pending_completions(&hub).await?.is_empty());
+            assert!(hub.finish_owned_completion(77, "box", &report, Some(1), false).await?, "the refused legacy finish reroutes through the durable canonical receipt");
+            assert_eq!(crate::ci::runs::completion(&hub, &job, 1, "box").await?, Some(report));
+            assert!(hub.owns_job(77, &job), "refusals and staged results do not disown the process");
+            let runner = hub.agents.lock().get("box").cloned().ok_or_else(|| anyhow::anyhow!("missing runner"))?;
+            assert_eq!(runner.busy, 1);
+            assert_eq!(runner.held.len(), 1, "host resource accounting stays until canonical lifecycle proof");
+            assert_eq!(serde_json::to_value((hub.store.jobs("adoption-run".into(), true).await?, hub.store.run("adoption-run".into()).await?))?, before);
+            let plan_after: (String, String, i64, i64) = hub.store.call(|c| Ok(c.query_row("SELECT workflow, input, done, (SELECT COUNT(*) FROM ci_plan_log WHERE run_id = p.run_id) FROM ci_plans p WHERE run_id = 'adoption-run'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?)).await?;
+            assert_eq!(plan_after, plan_before, "legacy writes cannot mutate or retire the canonical replay input");
+            Ok(())
+        })
+    }
+
+    /// U01/U03: disabled ingress never transfers durable workflow jobs to the old writer,
+    /// including imported rows and hellos arriving before dispatcher recovery.
+    #[test]
+    fn u03_disabled_ingress_hello_and_completion_keep_durable_ownership() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = scratch_hub_with(|cfg| cfg.ci.enabled = false).await?;
+            hub.store.call(|c| {
+                c.execute("INSERT INTO repos (id, name, clone_url, created_at) VALUES ('disabled-repo', 'disabled/repo', '', 0)", [])?;
+                c.execute("INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, status, created_at) VALUES ('disabled-run', 'disabled-repo', 1, 'ci', 'manual', 'main', 'sha', 'running', 0)", [])?;
+                c.execute("INSERT INTO ci_plans (run_id, workflow, input) VALUES ('disabled-run', '{}', '{}')", [])?;
+                for (id, job_id) in [("canonical-leg", Some("build")), ("imported-leg", None)] {
+                    c.execute("INSERT INTO jobs (id, run_id, key, display, status, labels, needs, spec, agent, attempt, job_id) VALUES (?1, 'disabled-run', ?1, ?1, 'running', '[]', '[]', '{}', 'box', 1, ?2)", crate::sql::params![id, job_id])?;
+                }
+                Ok(())
+            }).await?;
+            let running = vec!["canonical-leg".to_owned(), "imported-leg".to_owned()];
+            hub.pending_peers.lock().insert(77, "box".into());
+            hub.on_hello(77, Hello { protocol: proto::VERSION, name: "box".into(), labels: vec![], slots: 2, hostname: "box".into(), os: "linux".into(), arch: "x86_64".into(), version: String::new(), ephemeral: false, dedicated_job: None, running: running.clone(), terminal: false }).await?;
+            assert!(!hub.ci.enabled());
+            assert!(hub.ci.restored().is_none(), "hello precedes recovery");
+            if let Some(instance) = hub.instances.lock().get_mut(77) { instance.wide |= proto::CAP_JOB_ATTEMPT | proto::CAP_UNIFIED_LAYOUT; }
+            for job in running {
+                assert!(hub.owns_job(77, &job), "hello retains exact process ownership");
+                let attempt = if job == "imported-leg" { 2 } else { 1 };
+                let report = JobResult { job: job.clone(), status: Status::Succeeded, exit_code: Some(0), error: None, peak_rss: None, cpu_seconds: None };
+                hub.runner_completion(77, "box", report.clone(), None).await?;
+                assert!(crate::ci::runs::completion(&hub, &job, attempt, "box").await?.is_none(), "disabled ingress cannot bypass attempt fencing through JobFinished");
+                hub.runner_completion(77, "box", report.clone(), Some(attempt + 1)).await?;
+                assert!(crate::ci::runs::completion(&hub, &job, attempt, "box").await?.is_none(), "a different attempt cannot stage a receipt");
+                hub.runner_completion(77, "box", report.clone(), Some(attempt)).await?;
+                assert_eq!(crate::ci::runs::completion(&hub, &job, attempt, "box").await?, Some(report));
+                assert_eq!(hub.store.job(job.clone()).await?.map(|j| j.status), Some(Status::Running), "only the dispatcher may apply the staged report");
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn u03_superseded_process_cannot_report_another_process_job() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            let hello = Hello { protocol: proto::VERSION, name: "box".into(), labels: vec![], slots: 1, hostname: "box".into(), os: "linux".into(), arch: "x86_64".into(), version: String::new(), ephemeral: false, dedicated_job: None, running: vec!["leg".into()], terminal: false };
+            for (peer, id, created_at) in [(1, "old", 1), (2, "new", 2)] {
+                hub.peers.lock().insert(peer, "box".into());
+                let mut instances = hub.instances.lock();
+                instances.announce(peer, proto::InstanceHello { id: id.into(), created_at, pid: 1 });
+                instances.join(peer, "box", hello.clone(), created_at);
+            }
+            let mut runner = live_runner("box", "linux", "x86_64");
+            runner.running.push("leg".into());
+            hub.agents.lock().insert("box".into(), runner);
+            let job = crate::instances::Owned::Job("leg".into());
+            hub.instances.lock().own(job.clone(), 2);
+            assert!(!hub.owns_job(1, "leg"), "same machine does not grant ownership");
+            assert!(hub.owns_job(2, "leg"));
+            hub.instances.lock().own(job.clone(), 1);
+            assert!(hub.owns_job(1, "leg"), "an older process retains its own running work");
+            assert!(!hub.owns_job(2, "leg"), "newest cannot override an exact owner");
+            hub.instances.lock().disown(&job);
+            assert!(!hub.owns_job(1, "leg"), "recovery fallback excludes superseded processes");
+            assert!(hub.owns_job(2, "leg"), "known work recovers on current process");
+            assert!(!hub.owns_job(2, "unknown"), "being current does not grant unknown jobs");
+            hub.peers.lock().insert(3, "other-box".into());
+            let mut other = hello;
+            other.name = "other-box".into();
+            hub.instances.lock().join(3, "other-box", other, 3);
+            hub.instances.lock().own(job, 3);
+            hub.ci.keep("leg", Some(("box".into(), 0)));
+            let event = |json: &str| crate::wire::payload::<proto::JobEvent>(crate::wire::unread::Wire::RunnerPayload, "JobEvent", json)
+                .map(|event| event.event).map_err(|e| anyhow::anyhow!("{}", e.why));
+            let release = event(r#"{"t":"kept_released","execution":"old-execution","attempt":1}"#)?;
+            let legacy = event(r#"{"t":"kept","until":10}"#)?;
+            let ordinary = event(r#"{"t":"failure_class","class":"timeout"}"#)?;
+            assert!(!hub.owns_job(2, "leg"), "a retained host cannot report ordinary work for the replacement");
+            assert!(hub.owns_retained_event(2, "box", &release), "prior host can report exact retained release after reassignment");
+            assert!(!hub.owns_retained_event(1, "box", &release), "superseded process cannot use retained fallback");
+            assert!(!hub.owns_retained_event(2, "box", &legacy), "legacy retention lacks execution identity");
+            assert!(!hub.owns_retained_event(2, "box", &ordinary), "normal outputs do not inherit retained auth");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn u03_stale_attempt_is_refused_and_current_completion_survives_lost_owner() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            hub.store.call(|c| {
+                c.execute("INSERT INTO repos (id, name, clone_url, created_at) VALUES ('u03-repo', 'u03/repo', '', 0)", [])?;
+                c.execute("INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, status, created_at) VALUES ('u03-run', 'u03-repo', 1, 'ci', 'manual', 'main', 'sha', 'running', 0)", [])?;
+                c.execute("INSERT INTO jobs (id, run_id, key, display, status, labels, needs, spec, agent, attempt, job_id) VALUES ('u03-leg', 'u03-run', 'build', 'build', 'running', '[]', '[]', '{}', 'box', 2, 'build')", [])?;
+                Ok(())
+            }).await?;
+            let report = JobResult { job: "u03-leg".into(), status: Status::Succeeded, exit_code: Some(0), error: None, peak_rss: None, cpu_seconds: None };
+            assert!(crate::ci::runs::stage_completion(&hub, "box", &report, Some(1)).await?.is_none(), "same machine's old attempt cannot stage a result");
+            assert!(crate::ci::runs::completion(&hub, "u03-leg", 2, "box").await?.is_none());
+            assert!(crate::ci::runs::stage_completion(&hub, "another-box", &report, Some(2)).await?.is_none(), "the current attempt still requires its machine owner");
+            assert_eq!(crate::ci::runs::stage_completion(&hub, "box", &report, Some(2)).await?, Some(("u03-leg".into(), 2)));
+            let mut conflicting = report.clone();
+            conflicting.status = Status::Failed;
+            assert_eq!(crate::ci::runs::stage_completion(&hub, "box", &conflicting, Some(2)).await?, Some(("u03-leg".into(), 2)));
+            assert_eq!(crate::ci::runs::completion(&hub, "u03-leg", 2, "box").await?, Some(report.clone()), "retransmission cannot overwrite the first durable completion");
+            // A crash before the receipt reaches the runner loses in-memory ownership, but the
+            // exact durable completion remains enough to acknowledge its retransmission.
+            hub.peers.lock().insert(77, "box".into());
+            assert!(!hub.owns_job(77, "u03-leg"));
+            hub.runner_completion(77, "box", report.clone(), Some(2)).await?;
+            assert_eq!(crate::ci::runs::completion(&hub, "u03-leg", 2, "box").await?, Some(report.clone()));
+            hub.runner_completion(77, "box", report, Some(1)).await?;
+            assert!(crate::ci::runs::completion(&hub, "u03-leg", 1, "box").await?.is_none(), "retransmission cannot turn a stale attempt into a receipt");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn u17_only_marked_storage_failure_is_retryable_evidence() {
+        let storage = evidence_storage(anyhow::anyhow!("Amphora temporarily unavailable")).context("session ownership");
+        let policy = anyhow::anyhow!("session belongs to another machine");
+        assert!(storage.is::<EvidenceStorageError>(), "storage classification survives context");
+        assert!(!policy.is::<EvidenceStorageError>(), "policy refusal must remain final");
+    }
+
     fn unread(wire: crate::wire::unread::Wire, from: crate::wire::unread::Sender) -> crate::wire::unread::Unread {
         crate::wire::unread::Unread { wire, from, what: "variant 51".into(), code: crate::wire::unread::Code::Unknown, why: "AgentMsg has 51 variants".into() }
     }
@@ -3412,7 +3601,7 @@ pub(crate) mod tests {
             let hub = scratch_hub().await?;
             hub.peers.lock().insert(1, "fedora".into());
             hub.agents.lock().insert("fedora".into(), live_runner("fedora", "linux", "x86_64"));
-            let frame = |data: Vec<u8>, lane: u32| NetEvent::Frame { peer: 1, lane, kind: Kind::Control, data };
+            let frame = |data: Vec<u8>, lane: u32| NetEvent::Frame { peer: 1, lane, kind: Kind::Control, data, connection: None, admission: crate::net::ApplicationPermit::fixture() };
             // A newer runner's variant, and a known one cut short.
             hub.on_net(frame(vec![0xc8, 0x01, 7], proto::LANE_CONTROL)).await?;
             let adopted = proto::encode(&AgentMsg::HarnessAdopted { session: "s1".into(), error: None })?;
@@ -3428,8 +3617,8 @@ pub(crate) mod tests {
             // go as before (it may come before the Hello does).
             hub.pending_peers.lock().insert(2, "newbox".into());
             let facts = proto::encode(&AgentMsg::NetDrops { dropped: Vec::new() })?;
-            hub.on_net(NetEvent::Frame { peer: 2, lane: proto::LANE_TERM, kind: Kind::Term, data: facts.clone() }).await.ok();
-            hub.on_net(NetEvent::Frame { peer: 2, lane: proto::LANE_CONTROL, kind: Kind::Control, data: facts }).await?;
+            hub.on_net(NetEvent::Frame { peer: 2, lane: proto::LANE_TERM, kind: Kind::Term, data: facts.clone(), connection: None, admission: crate::net::ApplicationPermit::fixture() }).await.ok();
+            hub.on_net(NetEvent::Frame { peer: 2, lane: proto::LANE_CONTROL, kind: Kind::Control, data: facts, connection: None, admission: crate::net::ApplicationPermit::fixture() }).await?;
             let early: Vec<(String, String, String)> = hub
                 .store
                 .call(|c| {
@@ -3675,14 +3864,14 @@ pub(crate) mod tests {
 
     /// `msg`, from runner process `peer` on `lane`, as the net loop hears it.
     pub(crate) async fn hear(hub: &Arc<Hub>, peer: PeerId, lane: u32, msg: &AgentMsg) -> anyhow::Result<()> {
-        hub.on_net(NetEvent::Frame { peer, lane, kind: Kind::Control, data: proto::encode(msg)? }).await
+        hub.on_net(NetEvent::Frame { peer, lane, kind: Kind::Control, data: proto::encode(msg)?, connection: None, admission: crate::net::ApplicationPermit::fixture() }).await
     }
 
     /// `msg`, item `seq` of runner process `peer`'s channel stream `stream`, as the hub hears it.
     pub(crate) async fn hear_item(hub: &Arc<Hub>, peer: PeerId, stream: &str, seq: u64, msg: &AgentMsg) -> anyhow::Result<()> {
         let agent = hub.agent_of(peer).ok_or_else(|| anyhow::anyhow!("no runner as {peer}"))?;
         let body = proto::encode(msg)?;
-        hub.on_wire(peer, &agent, crate::wire::channel::Frame::Item { stream: stream.to_owned(), seq, low: seq.saturating_sub(1), body }).await;
+        hub.on_wire(peer, &agent, crate::wire::channel::Frame::Item { stream: stream.to_owned(), seq, low: seq.saturating_sub(1), body }, None).await;
         Ok(())
     }
 
@@ -3861,14 +4050,14 @@ pub(crate) mod tests {
         assert!(!invites.take("old"), "an expired invite doesn't work");
     }
 
-    /// The scheduler's headroom (W05, step 3): one rule places a CI leg, a v1 job and a command
+    /// The scheduler's headroom (W05/U01): one rule places a CI leg and a reach command
     /// alike. On one fleet (a at 80% of its CPUs, b at 30%, c at 10% with its disk under pressure),
     /// asking 4 CPUs and 2 GiB: a would pass the target use, c's disk counts against it, and the
-    /// engine, the v1 dispatcher and kiln run's ranking all pick b.
+    /// unified engine and kiln run's ranking both pick b.
     #[test]
-    fn one_headroom_rule_places_a_leg_a_v1_job_and_a_command_alike() -> anyhow::Result<()> {
+    fn one_headroom_rule_places_a_leg_and_a_command_alike() -> anyhow::Result<()> {
         use kiln_ci::sched::routing::{LegRoute, RunnerView};
-        use kiln_ci::sched::state::{Command, Config, Headroom, Input, LegIn, Resources, RunnerIn, Sample, Scheduler};
+        use kiln_ci::sched::state::{Command, Config, Input, LegIn, Resources, RunnerIn, Sample, Scheduler};
         const GIB: u64 = 1 << 30;
         let fleet = [("a", 0.8, 0.0), ("b", 0.3, 0.0), ("c", 0.1, 60.0)];
         let sample = |busy: f64, io: f64| Sample { cpus: 32, busy, load1: 0.0, mem_total: 64 * GIB, mem_used: 16 * GIB, io_full: Some(io) };
@@ -3886,8 +4075,6 @@ pub(crate) mod tests {
             Command::Assign { runner, .. } => Some(runner.clone()),
             _ => None,
         });
-        // The v1 dispatcher.
-        let by_v1 = v1_best(fleet.iter().map(|(name, busy, io)| V1Candidate { name, slots: 4, headroom: Some(Headroom::of(&sample(*busy, *io))), room: 0.0 }), &asked, 0.85);
         // kiln run.
         let info: Vec<crate::reach::directory::RunnerInfo> = fleet
             .iter()
@@ -3907,8 +4094,7 @@ pub(crate) mod tests {
             .collect();
         let (ranked, _) = crate::reach::directory::rank(&info, &crate::reach::directory::Want::parse("cpus=4,mem=2g")?, "elsewhere");
         let by_run = ranked.first().map(|c| c.runner.name.clone());
-        assert_eq!((by_engine.as_deref(), by_v1, by_run.as_deref()), (Some("b"), Some("b"), Some("b")), "{c:?} {ranked:?}");
+        assert_eq!((by_engine.as_deref(), by_run.as_deref()), (Some("b"), Some("b")), "{c:?} {ranked:?}");
         Ok(())
     }
 }
-

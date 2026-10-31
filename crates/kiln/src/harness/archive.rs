@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kiln_seams::blobs::{Cond, Put, Refusal};
-use rusqlite::params;
+use crate::sql::params;
 use serde::Serialize;
 
 use crate::hub::Hub;
@@ -137,7 +137,7 @@ pub async fn archived(hub: &Hub, session: &str) -> anyhow::Result<Vec<Piece>> {
                 let n = |i: usize| r.get::<_, i64>(i).map(|v| u64::try_from(v).unwrap_or(0));
                 Ok(Piece { source: r.get(0)?, first: n(1)?, last: n(2)?, key: r.get(3)?, lines: n(4)?, bytes: n(5)?, raw: n(6)? })
             })?;
-            Ok(rows.collect::<rusqlite::Result<_>>()?)
+            Ok(rows.collect::<crate::sql::Result<_>>()?)
         })
         .await
 }
@@ -164,7 +164,7 @@ async fn give_up(hub: &Hub, convo: &crate::convo::store::Store) -> anyhow::Resul
             let tx = crate::store::tx(c)?;
             let given: Vec<String> = {
                 let mut q = tx.prepare("SELECT session FROM transcript_archives WHERE done_ms IS NULL AND closed_ms < ?1 LIMIT ?2")?;
-                q.query_map(params![before, LET_GO_BATCH], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<_>>()?
+                q.query_map(params![before, LET_GO_BATCH], |r| r.get::<_, String>(0))?.collect::<crate::sql::Result<_>>()?
             };
             for s in &given {
                 tx.execute("UPDATE transcript_archives SET done_ms = 0 WHERE session = ?1", [s])?;
@@ -197,7 +197,7 @@ async fn let_go(hub: &Hub) -> anyhow::Result<()> {
         .store
         .call(move |c| {
             let mut q = c.prepare("SELECT session FROM transcript_archives WHERE done_ms IS NOT NULL AND due_ms < ?1 LIMIT ?2")?;
-            Ok(q.query_map(params![before, LET_GO_BATCH], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<_>>()?)
+            Ok(q.query_map(params![before, LET_GO_BATCH], |r| r.get::<_, String>(0))?.collect::<crate::sql::Result<_>>()?)
         })
         .await?;
     let mut gone = 0u64;
@@ -301,7 +301,7 @@ async fn pass(hub: &Hub, convo: &crate::convo::store::Store) -> anyhow::Result<(
         .call(move |c| {
             let mut q = c.prepare("SELECT session FROM transcript_archives WHERE done_ms IS NULL AND due_ms <= ?1 ORDER BY due_ms LIMIT ?2")?;
             let rows = q.query_map(params![now, BATCH], |r| r.get::<_, String>(0))?;
-            Ok(rows.collect::<rusqlite::Result<_>>()?)
+            Ok(rows.collect::<crate::sql::Result<_>>()?)
         })
         .await?;
     for session in due {
@@ -370,7 +370,6 @@ async fn pieces(hub: &Hub, convo: &crate::convo::store::Store, session: &str, so
         }
         let (c, s, src) = (convo.clone(), session.to_owned(), source.to_owned());
         let page = crate::rt::blocking(move || c.record(&s, &src, from, PAGE)).await??;
-        let full = page.len() >= PAGE;
         let Some(next) = page.last().map(|(n, _)| n.saturating_add(1)) else { break };
         from = next;
         // Each line into the piece being made; a full one is written and another begun.
@@ -400,9 +399,6 @@ async fn pieces(hub: &Hub, convo: &crate::convo::store::Store, session: &str, so
             write_piece(hub, session, source, m).await?;
             written = written.saturating_add(1);
             rest = more.into_iter().peekable();
-        }
-        if !full {
-            break;
         }
     }
     if let Some(m) = making.filter(|m| m.lines > 0) {

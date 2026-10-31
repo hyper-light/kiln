@@ -1,9 +1,9 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
-# Turso (the conversation store's engine) is vendored with its own workspace: vendor/turso/UPSTREAM.md;
+# Turso (a read-only legacy import dependency) has its own workspace: vendor/turso/UPSTREAM.md;
 # so are Quiver, Focal's bus, hyper-raft and vorpal (vendor/MANIFEST.toml), each a workspace of its own.
-exclude = ["vendor/turso", "vendor/quiver", "vendor/focal-bus", "vendor/hyper-raft", "vendor/vorpal", "bench/kilndb", "bench/http"]
+exclude = ["vendor/turso", "vendor/quiver", "vendor/focal-bus", "vendor/hyper-raft", "vendor/amphora", "vendor/socket2", "vendor/vorpal", "bench/kilndb", "bench/http"]
 
 [workspace.package]
 version = "0.2.0"
@@ -38,16 +38,20 @@ debug = "line-tables-only"
 [profile.dev.package.sha2]
 opt-level = 3
 
-# SQLite (the store's engine, built from C by rusqlite's libsqlite3-sys) optimized in dev and test
-# builds too: unoptimized, a store's migrations alone took a scratch hub 75 ms; optimized, about 20
-# (every test that opens a store, CP-M2's test timings among them).
+# U05: optimize the read-only SQLite migration source and legacy compatibility fixtures.
 [profile.dev.package.libsqlite3-sys]
 opt-level = 2
 
-# kiln's own crate in debug and test builds keeps line tables only (backtraces keep their files and
-# lines): with full debug info its library is one archive past 4 GiB (5.4 GB on Windows with observe
-# merged), and the COFF archive format MSVC's linker reads addresses members with 32 bits, so it
-# refuses the library (LNK4003) and nothing of kiln links there.
+# U05 / W24-AC10: the former C SQL backend already used this optimization level.
+# Keep equivalent native execution for Amphora's Rust engine and parser in dev/test builds.
+[profile.dev.package.amphora-engine]
+opt-level = 2
+
+[profile.dev.package.amphora-engine-parser]
+opt-level = 2
+
+# U19: full variable debug data grows kiln's native Windows archive past the MSVC
+# linker's supported archive index. Keep line information for useful stack traces.
 [profile.dev.package.kiln]
 debug = "line-tables-only"
 
@@ -60,6 +64,8 @@ panic = "unwind"
 # What kiln vendors, each name pointed at its one copy (vendor/MANIFEST.toml; docs/vendoring.md,
 # "Products and [patch]"): Quiver, Focal's bus, and hyper-raft's shared crates, which kiln takes too.
 [patch.crates-io]
+amphora = { path = "vendor/amphora/crates/amphora" }
+amphora-api = { path = "vendor/amphora/crates/api" }
 focal-bus = { path = "vendor/focal-bus/crates/focal-bus" }
 focal-memory = { path = "vendor/focal-bus/crates/focal-memory" }
 hyper-block = { path = "vendor/hyper-raft/crates/hyper-block" }
@@ -76,6 +82,10 @@ hyper-timing = { path = "vendor/hyper-raft/crates/hyper-timing" }
 hyper-transport = { path = "vendor/hyper-raft/crates/hyper-transport" }
 quiver = { path = "vendor/quiver/crates/quiver" }
 quiver-api = { path = "vendor/quiver/crates/quiver-api" }
+
+# CP-M1 / AC-M1.4: both consumers share the pinned source and Linux-only IUCV correction.
+socket2 = { path = "vendor/socket2" }
+
 # vorpal, the search across a change (docs/ci.md W26-R07): its crates, the tree-sitter runtime it
 # carries and the grammars kiln takes, each name at its copy under vendor/vorpal, as vorpal's own
 # root manifest points them.
@@ -99,3 +109,6 @@ tree-sitter-rust = { path = "vendor/vorpal/grammars/tree-sitter-rust" }
 tree-sitter-toml-ng = { path = "vendor/vorpal/grammars/tree-sitter-toml-ng" }
 tree-sitter-typescript = { path = "vendor/vorpal/grammars/tree-sitter-typescript" }
 tree-sitter-yaml = { path = "vendor/vorpal/grammars/tree-sitter-yaml" }
+
+[patch."https://github.com/rust-lang/socket2"]
+socket2 = { path = "vendor/socket2" }

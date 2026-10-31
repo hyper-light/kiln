@@ -106,9 +106,10 @@ crates (from upstream 3e09a82) are Amphora's `crates/engine*`, named `amphora-en
 `amphora-engine-parser`, `amphora-engine-macros` and `amphora-engine-ext`, and
 `crates/engine/ORIGIN.md` records where they came from and every change; Amphora's manifest has no
 `[projects.turso]`. When kiln vendors Amphora, the engine comes as part of it, under its own names,
-so it can't collide with kiln's `turso_core`. kiln's `vendor/turso` stays kiln's own copy, for
-kiln's conversation store, until that store moves onto Amphora (T1); then its entry, folder and
-patches go.
+so it can't collide with kiln's `turso_core`. All live SQL, Records and conversation storage
+uses Amphora. Kiln retains `vendor/turso` only for read-only imports of retired Records and
+conversation files, and compatibility fixtures; it never acknowledges a production write.
+Its entry, folder and patches can be removed when that historical import format is retired.
 
 ## The manifest
 
@@ -130,7 +131,7 @@ A hyper-light product depends on another by name and version, as if from crates.
 
 ```toml
 [patch.crates-io]
-amphora-api = { path = "vendor/amphora/crates/amphora-api" }
+amphora-api = { path = "vendor/amphora/crates/api" }
 ```
 
 kiln's root `Cargo.toml` patches the same names to kiln's copies, so a product kiln vendors builds

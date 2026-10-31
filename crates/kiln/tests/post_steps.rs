@@ -165,7 +165,7 @@ fn server_for(dir: &Path, src: &Path, repo: &Path) -> anyhow::Result<common::Ser
     if let Some(node) = std::env::var_os("PATH").and_then(|p| std::env::split_paths(&p).map(|d| d.join("node")).find(|n| n.is_file()))
         && Command::new(&node).arg("--version").output().is_ok_and(|v| String::from_utf8_lossy(&v.stdout).starts_with("v24."))
     {
-        let bin = dir.join("work/_externals/node24/bin");
+        let bin = common::runner_work(dir).join("_externals/node24/bin");
         std::fs::create_dir_all(&bin)?;
         std::os::unix::fs::symlink(&node, bin.join("node"))?;
     }

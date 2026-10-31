@@ -15,8 +15,8 @@ use kiln_ci::identity;
 use kiln_ci::review::{self, Known, Planned, State, Step};
 use kiln_ci::trigger::context::{self, PullRequest, Side};
 use kiln_ci::trigger::{Event, Source};
-use rusqlite::{OptionalExtension as _, params};
-use serde::Serialize;
+use crate::sql::{OptionalExtension as _, params};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::Fail;
@@ -304,7 +304,7 @@ pub(crate) fn new_kiln_change() -> String {
 }
 
 /// Records a new change of `repo`'s `trunk` and its number on kiln (`D41`, `CR4`).
-pub(crate) fn record_change(tx: &rusqlite::Connection, repo: &str, trunk: &str, change: &str, name: &str, split_from: Option<&str>, now: i64) -> rusqlite::Result<()> {
+pub(crate) fn record_change(tx: &crate::sql::Connection, repo: &str, trunk: &str, change: &str, name: &str, split_from: Option<&str>, now: i64) -> crate::sql::Result<()> {
     tx.execute("INSERT OR IGNORE INTO changes (repo_id, id, trunk, created_at, split_from) VALUES (?1, ?2, ?3, ?4, ?5)", params![repo, change, trunk, now, split_from])?;
     tx.execute("INSERT OR IGNORE INTO change_numbers (repo_id, change, host, number, created_at) VALUES (?1, ?2, 'kiln', ?3, ?4)", params![repo, change, name, now])?;
     Ok(())
@@ -312,7 +312,7 @@ pub(crate) fn record_change(tx: &rusqlite::Connection, repo: &str, trunk: &str, 
 
 /// Gives every diff of `repo` without an identity one (rows an older kiln made since the
 /// migration), with its Change-Id as an alias and its number.
-fn ensure_identities(c: &rusqlite::Connection, repo: &str) -> rusqlite::Result<()> {
+fn ensure_identities(c: &crate::sql::Connection, repo: &str) -> crate::sql::Result<()> {
     if c.execute("UPDATE diffs SET kiln_change = 'kc-' || lower(hex(randomblob(8))) WHERE repo_id = ?1 AND kiln_change IS NULL", [repo])? == 0 {
         return Ok(());
     }
@@ -364,7 +364,7 @@ const MOST_OPEN: usize = 200;
 
 /// What kiln's records say of `trunk`'s changes (each by identity, and each alias's change), and
 /// the latest versions of `author`'s open diffs there: (identity, name, title, patch id, commit).
-fn identities(c: &rusqlite::Connection, repo: &str, trunk: &str, author: &str) -> rusqlite::Result<(identity::Known, Vec<(String, String, String, String, String)>)> {
+fn identities(c: &crate::sql::Connection, repo: &str, trunk: &str, author: &str) -> crate::sql::Result<(identity::Known, Vec<(String, String, String, String, String)>)> {
     ensure_identities(c, repo)?;
     let mut known = identity::Known::default();
     let mut st = c.prepare("SELECT kiln_change, kind, number, state FROM diffs WHERE repo_id = ?1 AND trunk = ?2 AND kiln_change IS NOT NULL ORDER BY number")?;
@@ -388,7 +388,7 @@ fn identities(c: &rusqlite::Connection, repo: &str, trunk: &str, author: &str) -
          ORDER BY d.number DESC LIMIT ?4",
     )?;
     let most = i64::try_from(MOST_OPEN).unwrap_or(i64::MAX);
-    let open = st.query_map(params![repo, trunk, author, most], |r| Ok((r.get(0)?, format!("D{}", r.get::<_, u32>(1)?), r.get(2)?, r.get(3)?, r.get(4)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let open = st.query_map(params![repo, trunk, author, most], |r| Ok((r.get(0)?, format!("D{}", r.get::<_, u32>(1)?), r.get(2)?, r.get(3)?, r.get(4)?)))?.collect::<crate::sql::Result<Vec<_>>>()?;
     Ok((known, open))
 }
 
@@ -403,7 +403,7 @@ async fn open_versions(hub: &Hub, path: &str, rows: Vec<(String, String, String,
 
 /// A diff's latest version, by change, for each of `ids`: its row id and what [`review::plan`]
 /// needs.
-fn known(c: &rusqlite::Connection, repo: &str, trunk: &str, ids: &[String]) -> rusqlite::Result<BTreeMap<String, (String, Option<String>, Known)>> {
+fn known(c: &crate::sql::Connection, repo: &str, trunk: &str, ids: &[String]) -> crate::sql::Result<BTreeMap<String, (String, Option<String>, Known)>> {
     let mut out = BTreeMap::new();
     let mut st = c.prepare(
         "SELECT d.id, d.number, d.state, d.stack_id, v.n, v.commit_sha, v.parent, v.patch_id, v.message, v.base, (SELECT b.kiln_change FROM diffs b WHERE b.id = d.parent_diff)
@@ -459,7 +459,7 @@ pub(crate) struct Fresh {
 }
 
 /// A diff's labels, by name.
-pub(crate) fn label_names(c: &rusqlite::Connection, diff_id: &str) -> rusqlite::Result<Vec<String>> {
+pub(crate) fn label_names(c: &crate::sql::Connection, diff_id: &str) -> crate::sql::Result<Vec<String>> {
     let mut st = c.prepare("SELECT name FROM diff_labels WHERE diff_id = ?1 ORDER BY name")?;
     let rows = st.query_map([diff_id], |r| r.get(0))?;
     rows.collect()
@@ -612,7 +612,7 @@ pub async fn submit(hub: &Arc<Hub>, s: Submission<'_>) -> Result<Vec<Outcome>, S
                         let closed: Vec<String> = tx
                             .prepare("UPDATE diffs SET state = 'abandoned', updated_at = ?3 WHERE repo_id = ?1 AND kiln_change = ?2 AND state NOT IN ('landed', 'abandoned') RETURNING id")?
                             .query_map(params![repo_id, gone, now], |r| r.get(0))?
-                            .collect::<rusqlite::Result<_>>()?;
+                            .collect::<crate::sql::Result<_>>()?;
                         tx.execute("UPDATE changes SET absorbed_into = ?3 WHERE repo_id = ?1 AND id = ?2", params![repo_id, gone, p.change])?;
                         absorbed.extend(closed);
                     }
@@ -782,57 +782,85 @@ async fn start_at(hub: &Hub, repo: &Repo, e: &Event, sha: &str, message: &str, a
     Ok(())
 }
 
+/// U04/U14: the exact committed conversation, heads and version survive a lost UI event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct Conversation {
+    pub event: Value,
+    pub diff: Diff,
+    pub version: Version,
+    pub started_by: Option<Value>,
+    pub repo: Repo,
+    pub labels: Vec<String>,
+    pub default_ref: String,
+    pub default_sha: Option<String>,
+    pub trunk_sha: Option<String>,
+    pub accepted_at: i64,
+    pub numeric_id: u64,
+}
+
+pub(crate) async fn conversation_source(hub: &Hub, repo: Repo, d: Diff, latest: Version) -> Conversation {
+    let default_branch = match &repo.default_branch { Some(branch) => branch.clone(), None => super::events::facts(hub, &repo).await.default_branch };
+    let default_sha = tip(hub, &repo, &default_branch).await;
+    let trunk_sha = if default_branch == d.trunk { default_sha.clone() } else { tip(hub, &repo, &d.trunk).await };
+    Conversation { event: Value::Null, diff: d, started_by: latest.started_by.clone(), version: latest, repo, labels: Vec::new(), default_ref: format!("refs/heads/{default_branch}"), default_sha, trunk_sha, accepted_at: 0, numeric_id: 0 }
+}
+
+pub(crate) fn conversation_intent(c: &crate::sql::Connection<'_>, key: &str, mut source: Conversation, event: Value, numeric_id: i64) -> anyhow::Result<()> {
+    source.event = event;
+    source.labels = label_names(c, &source.diff.id)?;
+    source.accepted_at = crate::util::now_unix();
+    source.numeric_id = u64::try_from(numeric_id)?;
+    super::schedule::outbox::control(c, key, json!({"consumer":"conversation", "conversation": source}))?;
+    Ok(())
+}
+
 /// What the hub says happened in a diff's conversation (a `comment` published, a `review`), as
 /// workflow events (W03-R09, A.6). GitHub's: `issue_comment` for a comment on it as a whole, run
 /// from the default branch; `pull_request_review_comment` for one on its lines and
 /// `pull_request_review`, run from its latest version as `pull_request` is. kiln's: `comment`,
 /// from the trunk, with whom it mentions, and `review`, its state the action. Never for what a
 /// job's token did, as on GitHub.
-pub(crate) async fn conversation(hub: &Hub, v: &Value) -> anyhow::Result<()> {
+pub(crate) async fn conversation(hub: &Hub, source: Conversation) -> anyhow::Result<Vec<(String, super::schedule::outbox::Payload)>> {
+    let v = &source.event;
+    let mut children = Vec::new();
     let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
     let kind = s("type");
     let who = match kind.as_str() {
         "comment" => s("author"),
         "review" if s("action") != "resign" => s("reviewer"),
-        _ => return Ok(()),
+        _ => return Ok(children),
     };
     if who.is_empty() || by_job(&who) || !hub.ci.enabled() {
-        return Ok(());
+        return Ok(children);
     }
-    let Some(d) = find(hub, &s("diff")).await? else { return Ok(()) };
-    let Some(repo) = hub.store.repos().await?.into_iter().find(|r| r.name == d.repo) else { return Ok(()) };
-    let Some(latest) = versions(hub, &d).await?.pop() else { return Ok(()) };
-    let facts = super::events::facts(hub, &repo).await;
-    let f = Fresh { number: d.number, n: latest.n, sha: latest.commit.clone(), parent: latest.parent.clone(), title: d.title.clone(), summary: d.summary.clone(), message: String::new(), draft: d.state == "draft", rebase_only: latest.rebase_only, branch: d.branch.clone(), labels: labels(hub, &d.id).await, started_by: latest.started_by.clone() };
+    let d = source.diff;
+    let repo = source.repo;
+    let mut latest = source.version;
+    latest.started_by = source.started_by;
+    let mut facts = super::events::facts(hub, &repo).await;
+    facts.default_branch = source.default_ref.strip_prefix("refs/heads/").unwrap_or(&source.default_ref).to_owned();
+    facts.repo.default_branch.clone_from(&facts.default_branch);
+    let f = Fresh { number: d.number, n: latest.n, sha: latest.commit.clone(), parent: latest.parent.clone(), title: d.title.clone(), summary: d.summary.clone(), message: String::new(), draft: d.state == "draft", rebase_only: latest.rebase_only, branch: d.branch.clone(), labels: source.labels, started_by: latest.started_by.clone() };
     let author = (d.author.clone(), if d.author_kind == "agent" { "agent" } else { "human" });
     let counts = gitops::pr_counts(hub, &repo, &f.parent, &f.sha).await;
     let (pr, _) = events_of(&repo, &facts.repo, &d.trunk, &latest.base, &author, &f, None, counts);
     // `user:ada` is GitHub's `ada`; an agent's name is its first word.
     let login = who.split_once(':').map_or(who.as_str(), |(_, n)| n).split(' ').next().unwrap_or_default().to_owned();
-    let now = crate::deploy::repo::rfc3339(crate::util::now_unix());
-    // GitHub's numeric ids: the comment's row, or the reviewer's latest review's.
+    let now = crate::deploy::repo::rfc3339(source.accepted_at);
     let is_comment = kind == "comment";
-    let (did, item) = (d.id.clone(), s(if is_comment { "comment" } else { "reviewer" }));
-    let id: u64 = hub
-        .store
-        .call(move |c| {
-            let sql = if is_comment { "SELECT rowid FROM review_comments WHERE id = ?1 AND ?2 IS NOT NULL" } else { "SELECT rowid FROM reviews WHERE reviewer = ?1 AND diff_id = ?2 ORDER BY created_at DESC, rowid DESC LIMIT 1" };
-            Ok(c.query_row(sql, params![item, did], |r| r.get::<_, i64>(0)).optional()?.and_then(|n| u64::try_from(n).ok()).unwrap_or(0))
-        })
-        .await
-        .unwrap_or(0);
+    let id = source.numeric_id;
     if is_comment {
         let file = v.get("file").and_then(Value::as_str).map(str::to_owned);
         let c = context::Comment { id, body: s("body"), author: login.clone(), created_at: now, path: file.clone(), line: v.get("end_line").and_then(Value::as_u64), commit: Some(f.sha.clone()) };
         let as_issue = context::issue_comment(&pr.payload, &c, &login);
         if file.is_some() {
             let e = Event { name: "pull_request_review_comment".into(), action: "created".into(), actor: login.clone(), payload: context::pull_request_review_comment(&pr.payload, &c, &login), ..pr.clone() };
-            start_at(hub, &repo, &e, &f.sha, &d.title, &who).await?;
-        } else if let Some(t) = tip(hub, &repo, &facts.default_branch).await {
+            conversation_workflows(hub, &repo, &e, &f.sha, &d.title, &who, &mut children).await?;
+        } else if let Some(t) = &source.default_sha {
             let e = Event { name: "issue_comment".into(), action: "created".into(), actor: login.clone(), git_ref: format!("refs/heads/{}", facts.default_branch), sha: t.clone(), base_ref: None, head_ref: None, trusted: true, changed: None, payload: as_issue.clone(), started_by: None, ..pr.clone() };
-            start_at(hub, &repo, &e, &t, &d.title, &who).await?;
+            conversation_workflows(hub, &repo, &e, t, &d.title, &who, &mut children).await?;
         }
-        if let Some(t) = tip(hub, &repo, &d.trunk).await {
+        if let Some(t) = &source.trunk_sha {
             let mut payload = as_issue;
             if let Some(m) = payload.as_object_mut() {
                 let k = m.entry("kiln").or_insert_with(|| json!({}));
@@ -841,9 +869,9 @@ pub(crate) async fn conversation(hub: &Hub, v: &Value) -> anyhow::Result<()> {
                 }
             }
             let e = Event { name: "comment".into(), action: "created".into(), actor: login.clone(), git_ref: format!("refs/heads/{}", d.trunk), sha: t.clone(), trusted: true, changed: None, payload, started_by: None, ..pr.clone() };
-            start_at(hub, &repo, &e, &t, &d.title, &who).await?;
+            conversation_workflows(hub, &repo, &e, t, &d.title, &who, &mut children).await?;
         }
-        return Ok(());
+        return Ok(children);
     }
     let (state, kiln_state) = match s("action").as_str() {
         "accept" => ("approved", "accepted"),
@@ -853,9 +881,20 @@ pub(crate) async fn conversation(hub: &Hub, v: &Value) -> anyhow::Result<()> {
     let r = context::Review { id, state: state.into(), body: s("body"), author: login.clone(), submitted_at: now, commit: f.sha.clone() };
     let payload = context::pull_request_review(&pr.payload, &r, &login);
     let e = Event { name: "pull_request_review".into(), action: "submitted".into(), actor: login.clone(), payload: payload.clone(), ..pr.clone() };
-    start_at(hub, &repo, &e, &f.sha, &d.title, &who).await?;
+    conversation_workflows(hub, &repo, &e, &f.sha, &d.title, &who, &mut children).await?;
     let e = Event { name: "review".into(), action: kiln_state.into(), actor: login, payload, ..pr };
-    start_at(hub, &repo, &e, &f.sha, &d.title, &who).await
+    conversation_workflows(hub, &repo, &e, &f.sha, &d.title, &who, &mut children).await?;
+    Ok(children)
+}
+
+async fn conversation_workflows(hub: &Hub, repo: &Repo, event: &Event, sha: &str, message: &str, author: &str, children: &mut Vec<(String, super::schedule::outbox::Payload)>) -> anyhow::Result<()> {
+    let commit = super::load::load(hub, repo, sha).await?;
+    for loaded in commit.workflows.iter().filter(|l| l.runs) {
+        if loaded.has_errors() || loaded.workflow.as_ref().is_some_and(|workflow| kiln_ci::trigger::matches(workflow, event).is_ok()) {
+            children.push((format!("workflow/{}/{}", event.name, loaded.path), super::schedule::outbox::workflow(repo, event, loaded, message, author)));
+        }
+    }
+    Ok(())
 }
 
 /// A new version of `d` that kiln made (a restack onto a moved trunk, W14-R08): kept at its ref,
@@ -960,7 +999,7 @@ pub(crate) async fn activity(hub: &Hub, repo: &Repo, d: &Diff, action: &str, by:
 // ------------------------------------------------------------------ reads
 
 /// A diff as the API shows it.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Diff {
     pub id: String,
     /// `D12`.
@@ -993,7 +1032,7 @@ pub struct Diff {
     pub absorbed_into: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Version {
     pub n: u32,
     pub commit: String,
@@ -1020,7 +1059,7 @@ const DIFF_COLUMNS: &str = "d.id, d.number, d.kind, p.name, d.change_id, d.title
     (SELECT CASE s.kind WHEN 'change_request' THEN 'CR' ELSE 'D' END || s.number FROM changes ch JOIN diffs s ON s.repo_id = ch.repo_id AND s.kiln_change = ch.absorbed_into WHERE ch.repo_id = d.repo_id AND ch.id = d.kiln_change ORDER BY s.number LIMIT 1)";
 const DIFF_FROM: &str = "diffs d JOIN repos p ON p.id = d.repo_id LEFT JOIN diffs pd ON pd.id = d.parent_diff";
 
-fn diff_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Diff> {
+fn diff_row(r: &crate::sql::Row<'_>) -> crate::sql::Result<Diff> {
     let number: u32 = r.get(1)?;
     let kind: String = r.get(2)?;
     let parent: Option<u32> = r.get(12)?;

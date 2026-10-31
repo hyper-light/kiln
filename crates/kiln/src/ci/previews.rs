@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 
 use kiln_ci::wire::{PreviewOf, Undeploy, Undeployed};
 use parking_lot::Mutex;
-use rusqlite::{OptionalExtension as _, params};
+use crate::sql::{OptionalExtension as _, params};
 use serde_json::Value;
 
 use super::environments::{EnvDef, Preview, Targets, Template};
@@ -156,7 +156,7 @@ fn fill(text: &str, name: &str, id: &str) -> String {
 /// isn't there, and lasting its template's `ttl` from now. A closed change's run (its closing
 /// event's) binds to the preview it had, if it's still kept, and makes none.
 pub async fn bind(hub: &Hub, repo: &Repo, name: &str, payload: &Value) -> anyhow::Result<Bind> {
-    let templates = super::environments::templates(hub, repo).await;
+    let templates = super::environments::templates(hub, repo).await?;
     let Some(t) = templates.get(&name.to_ascii_lowercase()) else { return Ok(Bind::Not) };
     let Some(change) = change_of(payload) else {
         return Ok(Bind::Refuse(format!("`{}` is a preview, an environment of each diff, stack or pull request: this run is for none of them", t.name)));

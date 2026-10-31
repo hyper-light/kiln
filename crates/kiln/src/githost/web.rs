@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use http::{StatusCode, header};
-use rusqlite::{OptionalExtension as _, params};
+use crate::sql::{OptionalExtension as _, params};
 use serde_json::{Value, json};
 
 use super::github;

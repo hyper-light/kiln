@@ -33,6 +33,9 @@ use crate::driver::{Completion, Driver, DriverKind, Kick, nanos_since, refused};
 use crate::error::RtError;
 use crate::interests::Readiness;
 
+#[cfg(target_os = "macos")]
+use rustix::event::{FdSetElement, FdSetIter, fd_set_insert, fd_set_num_elements};
+
 /// Format: the identifier of the kick event on the queue.
 const KICK_IDENT: isize = 0;
 
@@ -59,7 +62,20 @@ pub struct KqueueDriver {
     /// A timed wait's timer (macOS).
     #[cfg(target_os = "macos")]
     timer: Timer,
+    /// Darwin's named FIFOs do not report empty-writer EOF through kqueue or poll.
+    /// They share this reactor's wait through unlimited select, including its kqueue FD.
+    #[cfg(target_os = "macos")]
+    fifos: Vec<Fifo>,
+    #[cfg(target_os = "macos")]
+    fifo_bound: usize,
+    #[cfg(target_os = "macos")]
+    reads: Vec<FdSetElement>,
+    #[cfg(target_os = "macos")]
+    writes: Vec<FdSetElement>,
 }
+
+#[cfg(target_os = "macos")]
+struct Fifo { raw: i32, want: Readiness, tag: u64, fired: Readiness }
 
 /// A timed wait's one-shot timer: whether one a wait armed has not yet fired.
 #[cfg(target_os = "macos")]
@@ -135,6 +151,14 @@ impl KqueueDriver {
             nops: Vec::new(),
             #[cfg(target_os = "macos")]
             timer: Timer::default(),
+            #[cfg(target_os = "macos")]
+            fifos: Vec::with_capacity(EVENTS_PER_WAIT),
+            #[cfg(target_os = "macos")]
+            fifo_bound: EVENTS_PER_WAIT,
+            #[cfg(target_os = "macos")]
+            reads: Vec::new(),
+            #[cfg(target_os = "macos")]
+            writes: Vec::new(),
         }
     }
 
@@ -188,11 +212,12 @@ impl KqueueDriver {
     /// and waits untimed, a zero timeout needs none, and an untimed wait removes the one an earlier
     /// wait left, which would end it.
     #[cfg(target_os = "macos")]
-    fn collect(
+    fn collect_kqueue(
         &mut self,
         timeout_ns: Option<u64>,
+        dont_wait: bool,
         out: &mut Vec<Completion>,
-    ) -> Result<(), RtError> {
+    ) -> Result<bool, RtError> {
         use std::os::fd::AsRawFd;
         let change = match timeout_ns {
             Some(0) => None,
@@ -204,7 +229,7 @@ impl KqueueDriver {
             tv_sec: 0,
             tv_nsec: 0,
         };
-        let timeout = if timeout_ns == Some(0) {
+        let timeout = if dont_wait || timeout_ns == Some(0) {
             std::ptr::from_ref(&zero)
         } else {
             std::ptr::null()
@@ -241,7 +266,7 @@ impl KqueueDriver {
         if outcome < 0 {
             let raw = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
             return match rustix::io::Errno::from_raw_os_error(raw) {
-                rustix::io::Errno::INTR => Ok(()),
+                rustix::io::Errno::INTR => Ok(true),
                 rustix::io::Errno::BADF => Err(RtError::DriverLost),
                 other => Err(refused("kevent", other)),
             };
@@ -278,7 +303,107 @@ impl KqueueDriver {
                 result: fired.bits(),
             });
         }
+        Ok(filled != 0)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn collect(&mut self, timeout_ns: Option<u64>, out: &mut Vec<Completion>) -> Result<(), RtError> {
+        let hybrid = !self.fifos.is_empty();
+        // Arm the existing critical timer before the combined wait. An already queued kick,
+        // timer or completion must return this wait without parking again.
+        let awake = self.collect_kqueue(timeout_ns, hybrid, out)?;
+        if hybrid {
+            self.select_fifos(timeout_ns == Some(0) || awake || !out.is_empty(), out)?;
+            self.collect_kqueue(Some(0), true, out)?;
+        }
         Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn select_fifos(&mut self, dont_wait: bool, out: &mut Vec<Completion>) -> Result<(), RtError> {
+        use std::os::fd::AsRawFd as _;
+        let queue = self.kq;
+        let result = queue.with(|queue| {
+            let nfds = self.fifo_sets(queue.as_raw_fd())?;
+            let zero = rustix::event::Timespec { tv_sec: 0, tv_nsec: 0 };
+            // SAFETY: readiness waiters retain their descriptors until withdrawal. KickFd
+            // pins the queue through this syscall; both sets cover every fd up to nfds.
+            // Rustix uses select$DARWIN_EXTSN$NOCANCEL, without the fixed FD_SETSIZE limit.
+            match unsafe { rustix::event::select(nfds, Some(&mut self.reads), Some(&mut self.writes), None, dont_wait.then_some(&zero)) } {
+                Ok(_) => Ok(true),
+                Err(rustix::io::Errno::INTR) => Ok(false),
+                Err(error) => Err(refused("select(FIFO)", error)),
+            }
+        }).ok_or(RtError::DriverLost)?;
+        if !result? { return Ok(()); }
+        mark_fifos(&self.reads, Readiness::READ, &mut self.fifos);
+        mark_fifos(&self.writes, Readiness::WRITE, &mut self.fifos);
+        self.fifos.retain(|fifo| {
+            if fifo.fired.is_empty() { return true; }
+            out.push(Completion { user_data: fifo.tag, result: fifo.fired.bits() });
+            false
+        });
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn fifo_sets(&mut self, raw_queue: i32) -> Result<i32, RtError> {
+        let highest = self.fifos.iter().map(|f| f.raw).max().unwrap_or(0);
+        let nfds = highest.max(raw_queue).checked_add(1).ok_or(RtError::Capacity { what: "FIFO descriptor range", bound: usize::try_from(i32::MAX).unwrap_or(usize::MAX) })?;
+        let elements = fd_set_num_elements(self.fifos.len().saturating_add(1), nfds);
+        reset_set(&mut self.reads, elements)?;
+        reset_set(&mut self.writes, elements)?;
+        fd_set_insert(&mut self.reads, raw_queue);
+        for fifo in &self.fifos {
+            if fifo.want.contains(Readiness::READ) { fd_set_insert(&mut self.reads, fifo.raw); }
+            if fifo.want.contains(Readiness::WRITE) { fd_set_insert(&mut self.writes, fifo.raw); }
+        }
+        Ok(nfds)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn arm_fifo(&mut self, raw: i32, want: Readiness, tag: u64) -> Result<bool, RtError> {
+        if want.is_empty() { self.disarm(raw); return Ok(true); }
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: the output pointer is valid and sized for stat. fstat accepts invalid raw
+        // descriptors as ordinary EBADF errors; do not construct an I/O-safe borrow first.
+        if unsafe { libc::fstat(raw, stat.as_mut_ptr()) } < 0 {
+            return Err(refused("fstat(readiness)", rustix::io::Errno::from_raw_os_error(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EBADF))));
+        }
+        // SAFETY: a successful fstat initialized every field of the output structure.
+        let stat = unsafe { stat.assume_init() };
+        if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Fifo {
+            self.fifos.retain(|fifo| fifo.raw != raw);
+            return Ok(false);
+        }
+        let fifo = Fifo { raw, want, tag, fired: Readiness::NONE };
+        match self.fifos.binary_search_by_key(&raw, |f| f.raw) {
+            Ok(index) => { if let Some(saved) = self.fifos.get_mut(index) { *saved = fifo; } },
+            Err(index) => {
+                if self.fifos.len() >= self.fifo_bound { return Err(RtError::Capacity { what: "FIFO readiness handles", bound: self.fifo_bound }); }
+                self.fifos.insert(index, fifo);
+            },
+        }
+        Ok(true)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn reset_set(set: &mut Vec<FdSetElement>, elements: usize) -> Result<(), RtError> {
+    if elements > set.len() {
+        set.try_reserve(elements.saturating_sub(set.len())).map_err(|_| RtError::Capacity { what: "FIFO descriptor set", bound: elements })?;
+        set.resize(elements, FdSetElement::default());
+    }
+    set.fill(FdSetElement::default());
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn mark_fifos(set: &[FdSetElement], direction: Readiness, fifos: &mut [Fifo]) {
+    for raw in FdSetIter::new(set) {
+        if let Ok(index) = fifos.binary_search_by_key(&raw, |f| f.raw)
+            && let Some(fifo) = fifos.get_mut(index)
+        { fifo.fired = fifo.fired.union(direction); }
     }
 }
 
@@ -317,6 +442,8 @@ impl Driver for KqueueDriver {
     }
 
     fn arm(&mut self, raw: i32, want: Readiness, tag: u64) -> Result<(), RtError> {
+        #[cfg(target_os = "macos")]
+        if self.arm_fifo(raw, want, tag)? { return Ok(()); }
         // One filter per direction, each its own registration (ident and filter), so arming one never
         // touches the other; a filter armed earlier and no longer wanted fires once, to no waiter.
         let udata = core::ptr::without_provenance_mut(usize::try_from(tag).unwrap_or(usize::MAX));
@@ -347,6 +474,16 @@ impl Driver for KqueueDriver {
         Ok(())
     }
 
+    #[cfg(target_os = "macos")]
+    fn disarm(&mut self, raw: i32) { self.fifos.retain(|fifo| fifo.raw != raw); }
+
+    #[cfg(target_os = "macos")]
+    fn reserve_handles(&mut self, handles: usize) -> Result<(), RtError> {
+        self.fifos.try_reserve(handles.saturating_sub(self.fifos.len())).map_err(|_| RtError::Capacity { what: "FIFO readiness handles", bound: handles })?;
+        self.fifo_bound = handles;
+        Ok(())
+    }
+
     fn has_pending(&self) -> bool {
         !self.nops.is_empty()
     }
@@ -365,6 +502,65 @@ impl Driver for KqueueDriver {
 )]
 mod tests {
     use super::*;
+
+    /// Empty named-FIFO EOF is not a kqueue event on Darwin. The same driver still wakes
+    /// for its kick/timer, withdraws stale waits, and reports data/EOF once per live owner.
+    #[test]
+    fn a_named_fifo_reports_eof_without_losing_kqueue_wakeups() -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::{Read as _, Write as _};
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::{ffi::OsStrExt as _, fs::OpenOptionsExt as _};
+        let parent = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir).join(".cache");
+        std::fs::create_dir_all(&parent)?;
+        let dir = parent.join(format!("hyper-rt-fifo-{}", std::process::id()));
+        std::fs::create_dir(&dir)?;
+        struct Remove(std::path::PathBuf);
+        impl Drop for Remove { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+        let _remove = Remove(dir.clone());
+        let path = std::ffi::CString::new(dir.join("output").as_os_str().as_bytes())?;
+        // SAFETY: private NUL-terminated fixture path, no existing FIFO is replaced.
+        if unsafe { libc::mkfifo(path.as_ptr(), 0o600) } != 0 { return Err(std::io::Error::last_os_error().into()); }
+        let mut reader = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(dir.join("output"))?;
+        let mut writer = std::fs::OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open(dir.join("output"))?;
+        let mut byte = [0u8; 1];
+        assert_eq!(reader.read(&mut byte).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        let kq = prepare()?;
+        let registration = crate::registry::register(2, 1, crate::runtime::register_kick(Some(kq)))?;
+        let kick = crate::registry::with_entry(registration.shard(), |entry| entry.kick).ok_or("missing fixture kick")?;
+        let Kick::Kqueue(fd) = kick else { return Err("wrong fixture driver".into()); };
+        let mut driver = KqueueDriver::from_prepared(fd);
+        driver.reserve_handles(2)?;
+        assert!(driver.arm(-1, Readiness::READ, 9).is_err(), "invalid descriptors remain typed refusals");
+        let raw = reader.as_raw_fd();
+        driver.arm(raw, Readiness::READ, 10)?;
+        let mut out = Vec::new();
+        kick.kick();
+        driver.wait(Some(1_000_000_000), &mut out)?;
+        assert!(out.is_empty() && driver.timer.armed, "the kick ends the hybrid wait without inventing FIFO data");
+        driver.wait(Some(WAIT_NS), &mut out)?;
+        assert!(out.is_empty() && !driver.timer.armed, "the existing critical timer still ends the combined wait");
+        driver.disarm(raw);
+        driver.arm(raw, Readiness::READ, 11)?;
+        writer.write_all(b"x")?;
+        driver.wait(Some(1_000_000_000), &mut out)?;
+        assert_eq!(out.len(), 1);
+        assert!(out.iter().all(|event| event.user_data == 11 && event.result == Readiness::READ.bits()));
+        assert_eq!(reader.read(&mut byte)?, 1);
+        assert_eq!(byte, *b"x");
+        out.clear();
+        driver.arm(raw, Readiness::READ, 12)?;
+        drop(writer);
+        driver.wait(Some(1_000_000_000), &mut out)?;
+        assert_eq!(out.len(), 1, "writer close is real EOF even when kqueue has no event");
+        assert!(out.iter().all(|event| event.user_data == 12 && event.result == Readiness::READ.bits()));
+        assert_eq!(reader.read(&mut byte)?, 0);
+        out.clear();
+        driver.wait(Some(0), &mut out)?;
+        assert!(out.is_empty(), "one-shot FIFO readiness cannot outlive its wait");
+        drop(driver);
+        drop(registration);
+        Ok(())
+    }
 
     /// Shape: a timed wait's timeout.
     const WAIT_NS: u64 = 5_000_000;

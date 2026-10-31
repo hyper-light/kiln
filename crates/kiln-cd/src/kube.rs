@@ -148,7 +148,7 @@ fn user_auth(user: &Value, dir: &Path) -> Result<Auth> {
     if let Some(t) = user.get("token").and_then(Value::as_str).filter(|t| !t.is_empty()) {
         return Ok(Auth::Token(t.to_owned()));
     }
-    if let Some(f) = user.get("tokenFile").and_then(Value::as_str).filter(|f| !f.is_empty()) {
+    if let Some(f) = user.get("tokenFile").or_else(|| user.get("token-file")).and_then(Value::as_str).filter(|f| !f.is_empty()) {
         return Ok(Auth::TokenFile(dir.join(f)));
     }
     let cert = file_or_data(user, "client-certificate-data", "client-certificate", dir)?;

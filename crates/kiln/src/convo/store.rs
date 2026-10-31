@@ -1,13 +1,17 @@
 //! A machine's conversation store (`docs/conversations.md`, "The store"): one writer thread owns the
-//! database; sessions' updates reach it by channel, never by lock, and are committed in batches, so
-//! an update is durable within [`COMMIT_MS`] of its flush. Reads go through the same thread, in
-//! turn with the writes.
+//! database; safe admission owns one immutable single-session batch and a durable ticket.
+//! Independent projection sessions can share the [`COMMIT_MS`] window without coalescing
+//! across admissions; Records/transcripts are ordered flush boundaries. Historical void
+//! admission remains a migration surface and does not provide the new no-drop contract.
+//! Only a successful selected-owner apply confirms durability. A failed batch stays with
+//! the writer; later reads and barriers fail until the owner is torn down, without retrying an
+//! unknown outcome. Reads go through the same thread, in turn with the writes.
 //!
 //! Every write gets the next number of the store (its revision), so another store can take what
 //! came after a number it has ([`Store::changes`], [`Store::take`]): that is how a runner's store
 //! reaches the server's (`super::feed`).
 //!
-//! The engine is behind [`Engine`]: Turso ([`super::turso`]).
+//! The engine is behind [`Engine`]: the host's shared Amphora database ([`super::amphora`]).
 
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc;
@@ -17,6 +21,8 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use super::rows::{self, EventRow, Row};
+use super::batch::{AdmissionRefusal, ApplyFailure, Batch, Committed, Completion, PendingSubmission, Rejected, Ticket, GROUP_MAX, WORK_MAX, group_command_cost};
+use event_listener::Listener as _;
 use super::telemetry::{CompactView, Compacted, Meter, Pruned, StoreReport, Upkeeping};
 use crate::harness::core::Update;
 use crate::harness::session::Sink;
@@ -25,8 +31,9 @@ use crate::harness::session::Sink;
 pub const COMMIT_MS: u64 = 50;
 /// Rows that make a commit at once, however soon.
 pub const COMMIT_ROWS: usize = 2048;
-/// Updates waiting for the writer, at most: one that can't keep up (a stuck disk) drops what
-/// comes, saying so, rather than holding sessions back or growing without bound.
+/// Historical/control channel slots and default maximum safe input reservations. Safe batches
+/// also have a retained-byte quota; typed Full returns input. Historical void writes still drop
+/// on refusal until the session owner migrates those production callers.
 pub const QUEUE: usize = 65_536;
 /// Longest a read waits for the writer.
 pub const READ_WAIT: Duration = Duration::from_secs(10);
@@ -209,6 +216,24 @@ pub trait Engine: Send + 'static {
     fn id(&self) -> String;
     /// The rows, in one transaction, each with the next number.
     fn apply(&mut self, rows: &[Row]) -> anyhow::Result<()>;
+    /// U05: one exact envelope; production Amphora composes its SQL and bound Records Tx.
+    fn apply_batch(&mut self, batch: &Batch) -> Result<Committed, ApplyFailure> {
+        if batch.records().is_some() {
+            return Err(ApplyFailure::Definite(amphora_api::invalid("conversation batch", "this fixture engine cannot compose Records")));
+        }
+        self.apply(batch.rows()).map_err(|e| ApplyFailure::Unknown(amphora_api::Refusal::Unavailable(format!("{e:#}"))))?;
+        Ok(Committed { conversation_rev: self.top(), records_rev: None })
+    }
+    /// Projection flush only: no Records, duplicate sessions or cross-admission coalescing.
+    /// Production overrides this to return each envelope's exact transaction revision.
+    fn apply_group(&mut self, batches: &[&Batch]) -> Result<Vec<Committed>, ApplyFailure> {
+        match batches {
+            [] => Ok(Vec::new()),
+            [batch] => self.apply_batch(batch).map(|answer| vec![answer]),
+            _ => Err(ApplyFailure::Definite(amphora_api::invalid("projection flush", "this fixture engine does not provide exact grouped revisions"))),
+        }
+    }
+
     /// What is kept of `session` (None: nothing). `last`: at most its last this many events.
     fn kept(&mut self, session: &str, last: usize) -> anyhow::Result<Option<Kept>>;
     /// A session's events before `before` (its event numbers), the newest `limit`, oldest first.
@@ -233,7 +258,8 @@ pub trait Engine: Send + 'static {
     fn peers(&mut self) -> anyhow::Result<Vec<(String, u64, i64)>>;
     /// Each file of `session`'s record kept, with its last line.
     fn marks(&mut self, session: &str) -> anyhow::Result<Vec<Mark>>;
-    /// `limit` lines of `session`'s record from `source`, from line `from` on: `(n, line)`.
+    /// Up to `limit` lines of `session`'s record from `source`, from line `from` on: `(n, line)`.
+    /// U06: pages also have a byte bound; advance after the last number until an empty page.
     fn record(&mut self, session: &str, source: &str, from: u64, limit: usize) -> anyhow::Result<Vec<(u64, String)>>;
     /// The sessions not ended, heard of since `since` (unix ms), oldest first.
     fn unended(&mut self, since: i64) -> anyhow::Result<Vec<Unended>>;
@@ -270,12 +296,84 @@ pub trait Engine: Send + 'static {
     fn look(&mut self, count: bool) -> anyhow::Result<Look>;
 }
 
-type Job = Box<dyn FnOnce(&mut dyn Engine) + Send>;
+type Job = Box<dyn FnOnce(Result<&mut dyn Engine, Arc<ApplyFailure>>) + Send>;
+
+/// U17/U19: admission and the first apply failure share one gate. Once a batch fails, no new
+/// message can add to the bounded channel or the writer's retained rows.
+type Failure = Arc<Mutex<Option<Arc<ApplyFailure>>>>;
+
+/// U05: admitted input custody, separately bounded from backend preparation scratch and RSS.
+#[derive(Debug, Clone, Copy)]
+pub struct AdmissionLimits { pub batches: usize, pub bytes: usize }
+impl Default for AdmissionLimits {
+    fn default() -> Self { Self { batches: QUEUE, bytes: 512 << 20 } }
+}
+
+#[derive(Default)]
+struct Used { batches: usize, bytes: usize, closed: bool }
+struct Capacity {
+    limits: AdmissionLimits,
+    used: Mutex<Used>,
+    changed: event_listener::Event,
+    meter: Arc<Meter>,
+}
+
+impl Capacity {
+    fn reserve(self: &Arc<Self>, bytes: usize) -> Result<Permit, AdmissionRefusal> {
+        let mut used = self.used.lock().unwrap_or_else(PoisonError::into_inner);
+        if used.closed { return Err(AdmissionRefusal::Closed); }
+        if bytes > self.limits.bytes { return Err(AdmissionRefusal::TooLarge { size: bytes, limit: self.limits.bytes }); }
+        let next = used.bytes.checked_add(bytes).filter(|n| *n <= self.limits.bytes);
+        if used.batches >= self.limits.batches || next.is_none() {
+            return Err(AdmissionRefusal::Full { limit_batches: self.limits.batches, limit_bytes: self.limits.bytes });
+        }
+        used.bytes = next.ok_or(AdmissionRefusal::TooLarge { size: usize::MAX, limit: self.limits.bytes })?;
+        used.batches += 1;
+        self.meter.admitted(bytes);
+        Ok(Permit { capacity: Arc::clone(self), bytes, wake: true })
+    }
+    fn close(&self) {
+        self.used.lock().unwrap_or_else(PoisonError::into_inner).closed = true;
+        self.changed.notify(usize::MAX);
+    }
+}
+
+/// Moves with accepted input through queue, pending, apply and terminal failure custody.
+/// It does not contain the Store sender and cannot keep its own writer alive.
+pub(crate) struct Permit { capacity: Arc<Capacity>, bytes: usize, wake: bool }
+impl Permit { pub(crate) fn abandoned(&self) { self.capacity.meter.abandoned_failure(); } }
+impl Drop for Permit {
+    fn drop(&mut self) {
+        let mut used = self.capacity.used.lock().unwrap_or_else(PoisonError::into_inner);
+        used.batches = used.batches.saturating_sub(1);
+        used.bytes = used.bytes.saturating_sub(self.bytes);
+        self.capacity.meter.released(self.bytes);
+        drop(used);
+        if self.wake { self.capacity.changed.notify(usize::MAX); }
+    }
+}
+struct WriterLife(Arc<Capacity>);
+impl Drop for WriterLife { fn drop(&mut self) { self.0.close(); } }
+struct Envelope { batch: Batch, completion: Completion, permit: Permit }
+
 
 enum Msg {
+    /// Historical migration surface only; production callers still need step6 migration.
     Rows(Vec<Row>),
+    Batch(Envelope),
+    Barrier(Completion, Permit),
     /// Run on the engine, between commits (whatever was sent before it is committed first).
     Run(Job),
+}
+
+impl Msg {
+    fn cancel_reservation(&mut self) {
+        match self {
+            Msg::Batch(envelope) => envelope.permit.wake = false,
+            Msg::Barrier(_, permit) => permit.wake = false,
+            Msg::Rows(_) | Msg::Run(_) => {}
+        }
+    }
 }
 
 /// Who wants to know that something was committed (a feed with nothing left to send waits on it).
@@ -289,6 +387,9 @@ fn notify(watchers: &Watchers) {
 #[derive(Clone)]
 pub struct Store {
     tx: mpsc::SyncSender<Msg>,
+    failure: Failure,
+    capacity: Arc<Capacity>,
+    identity: Arc<()>,
     id: Arc<str>,
     meter: Arc<Meter>,
     watchers: Watchers,
@@ -299,14 +400,127 @@ pub struct Store {
 impl Store {
     /// The store, its writer thread started on `engine`, looking after its file as `upkeep` says.
     pub fn start(engine: Box<dyn Engine>, upkeep: Upkeep) -> anyhow::Result<Self> {
-        let (tx, rx) = mpsc::sync_channel::<Msg>(QUEUE);
+        Self::start_with_limits(engine, upkeep, AdmissionLimits::default())
+    }
+
+    /// Limits bound safe admitted input, not historical migration calls or engine RSS.
+    pub fn start_with_limits(engine: Box<dyn Engine>, upkeep: Upkeep, limits: AdmissionLimits) -> anyhow::Result<Self> {
+        anyhow::ensure!(limits.batches > 0 && limits.bytes > 0, "conversation admission limits must be positive");
+        let (tx, rx) = mpsc::sync_channel::<Msg>(QUEUE.min(limits.batches));
         let id: Arc<str> = engine.id().into();
         let watchers: Watchers = Arc::default();
         let meter: Arc<Meter> = Arc::default();
         let hold = Arc::new(AtomicI64::new(i64::MAX));
-        let (w, m, h) = (watchers.clone(), meter.clone(), Arc::clone(&hold));
-        std::thread::Builder::new().name("kiln-convo".into()).spawn(move || writer(engine, &rx, &w, upkeep, &m, &h))?;
-        Ok(Self { tx, id, meter, watchers, hold })
+        let failure: Failure = Arc::default();
+        let capacity = Arc::new(Capacity { limits, used: Mutex::default(), changed: event_listener::Event::new(), meter: meter.clone() });
+        let identity = Arc::new(());
+        let life = WriterLife(capacity.clone());
+        let (w, m, h, f) = (watchers.clone(), meter.clone(), Arc::clone(&hold), failure.clone());
+        std::thread::Builder::new().name("kiln-convo".into()).spawn(move || { writer(engine, &rx, WriterContext { watchers: &w, upkeep, meter: &m, hold: &h, failure: &f, capacity: &life.0 }); drop(life); })?;
+        Ok(Self { tx, failure, capacity, identity, id, meter, watchers, hold })
+    }
+
+    /// Binding token only: no sender/Database clone is captured by an admitted Records batch.
+    pub(crate) fn identity(&self) -> Arc<()> { self.identity.clone() }
+
+    /// U05: bounded admission into this actor. Success returns a pending durable ticket;
+    /// refusal returns the exact unaccepted input. No application/flush runs under the gate.
+    pub fn try_admit(&self, batch: Batch) -> Result<Ticket, Rejected<Batch>> {
+        self.try_admit_inner(batch, true)
+    }
+
+    fn try_admit_inner(&self, batch: Batch, count: bool) -> Result<Ticket, Rejected<Batch>> {
+        let refused = |input, reason| {
+            if count { self.meter.refused(matches!(reason, AdmissionRefusal::Full { .. })); }
+            Rejected { input, reason }
+        };
+        if batch.records().is_some_and(|records| !records.belongs_to(&self.identity)) {
+            return Err(refused(batch, AdmissionRefusal::Invalid("Records and conversation batch belong to different host actors".into())));
+        }
+        let failure = self.failure.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(failure) = failure.as_ref() {
+            return Err(refused(batch, AdmissionRefusal::Fenced(failure.clone())));
+        }
+        let permit = match self.capacity.reserve(batch.retained_bytes()) {
+            Ok(permit) => permit,
+            Err(reason) => return Err(refused(batch, reason)),
+        };
+        let (ticket, completion) = Ticket::pending();
+        let message = Msg::Batch(Envelope { batch: batch.shared(), completion, permit });
+        match self.tx.try_send(message) {
+            Ok(()) => Ok(ticket),
+            Err(error) => {
+                let (mut message, reason) = match error {
+                    mpsc::TrySendError::Full(message) => (message, AdmissionRefusal::Full { limit_batches: self.capacity.limits.batches, limit_bytes: self.capacity.limits.bytes }),
+                    mpsc::TrySendError::Disconnected(message) => (message, AdmissionRefusal::Closed),
+                };
+                message.cancel_reservation();
+                // Suppress only this rolled-back reservation's wake. The admission gate is
+                // still held: another producer cannot observe the transient reservation.
+                drop(message);
+                Err(refused(batch, reason))
+            }
+        }
+    }
+
+    /// FIFO settlement/durability frontier, not a substitute for an effect's own ticket.
+    /// A frame that makes no rows can wait its preceding ticket or this explicit barrier;
+    /// a settled definite refusal is still a failed attempt and must be read from its ticket.
+    pub fn barrier(&self) -> Result<Ticket, AdmissionRefusal> {
+        let result = (|| {
+            let failure = self.failure.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(cause) = failure.as_ref() { return Err(AdmissionRefusal::Fenced(cause.clone())); }
+            let permit = self.capacity.reserve(4096)?;
+            let (ticket, completion) = Ticket::pending();
+            match self.tx.try_send(Msg::Barrier(completion, permit)) {
+                Ok(()) => Ok(ticket),
+                Err(error) => {
+                    let (mut message, reason) = match error {
+                        mpsc::TrySendError::Full(message) => (message, AdmissionRefusal::Full { limit_batches: self.capacity.limits.batches, limit_bytes: self.capacity.limits.bytes }),
+                        mpsc::TrySendError::Disconnected(message) => (message, AdmissionRefusal::Closed),
+                    };
+                    message.cancel_reservation();
+                    drop(message);
+                    Err(reason)
+                }
+            }
+        })();
+        if let Err(reason) = &result { self.meter.refused(matches!(reason, AdmissionRefusal::Full { .. })); }
+        result
+    }
+
+    /// Waits without consuming Prepared input on cancellation/timeout. A successful handoff
+    /// installs its ticket in the caller-owned slot before returning, without another await.
+    pub async fn admit_until(&self, pending: &mut PendingSubmission, until: Instant) -> Result<(), AdmissionRefusal> {
+        let result = super::batch::wait_for_admission(pending, until, &self.capacity.changed, |batch| self.try_admit_inner(batch, false)).await;
+        if let Err(reason) = &result { self.meter.refused(matches!(reason, AdmissionRefusal::Full { .. })); }
+        result
+    }
+
+    /// Dedicated blocking callers only; never wait for room on the shared reactor.
+    pub fn admit_blocking_until(&self, pending: &mut PendingSubmission, until: Instant) -> Result<(), AdmissionRefusal> {
+        loop {
+            if pending.ticket.is_some() { return Ok(()); }
+            if Instant::now() >= until { self.meter.refused(false); return Err(AdmissionRefusal::Deadline); }
+            let changed = self.capacity.changed.listen();
+            match self.admit_pending(pending) {
+                Ok(()) => return Ok(()),
+                Err(AdmissionRefusal::Full { .. }) => {}
+                Err(reason) => { self.meter.refused(false); return Err(reason); }
+            }
+            if changed.wait_deadline(until).is_none() {
+                self.meter.refused(false);
+                return Err(AdmissionRefusal::Deadline);
+            }
+        }
+    }
+
+    fn admit_pending(&self, pending: &mut PendingSubmission) -> Result<(), AdmissionRefusal> {
+        let batch = pending.batch.take().ok_or_else(|| AdmissionRefusal::Invalid("the submission has no prepared input".into()))?;
+        match self.try_admit_inner(batch, false) {
+            Ok(ticket) => { pending.ticket = Some(ticket); Ok(()) }
+            Err(Rejected { input, reason }) => { pending.batch = Some(input); Err(reason) }
+        }
     }
 
     /// Keeps the records of sessions that ended at or after `ended_ms` (unix ms), however long
@@ -333,29 +547,35 @@ impl Store {
         self.meter.report(&self.id)
     }
 
+    /// HISTORICAL migration surface. Void admission can lose updates; production step6 must
+    /// replace every caller with sealed batches/tickets before no-drop can be claimed.
     /// What `update` of `session` makes, to be committed with the next batch.
     pub fn send(&self, session: &str, update: &Update) {
         self.put(rows::of(session, update, crate::util::now_ms()));
     }
 
-    /// Rows to be committed with the next batch. Never blocks: when the writer can't keep up,
-    /// they're dropped and counted.
+    /// HISTORICAL migration surface, without the new safe admission contract.
+    /// Rows to be committed with the next batch. Doesn't wait for channel room: when full,
+    /// stopped or fenced by a failed batch, they're rejected and counted. Admission shares a
+    /// brief mutex with the first-failure latch; no engine work runs under that mutex.
     pub fn put(&self, rows: Vec<Row>) {
         if rows.is_empty() {
             return;
         }
-        if let Err(mpsc::TrySendError::Full(_)) = self.tx.try_send(Msg::Rows(rows)) {
+        if let Err(e) = self.enqueue(Msg::Rows(rows), false) {
             let n = self.meter.dropped();
             if (n - 1).is_power_of_two() {
-                tracing::warn!(dropped = n, "conversation store: the writer can't keep up; updates were dropped");
+                tracing::warn!(dropped = n, error = %e, "conversation store: updates couldn't be admitted");
             }
         }
     }
 
+    /// HISTORICAL migration surface; false consumes rejected rows and has no typed receipt.
     /// Rows to be committed with the next batch, waiting up to `READ_WAIT` for room: false when
-    /// they couldn't be handed over (whoever sends them sends them again). Blocking.
+    /// they couldn't be handed over. True is admission, never a commit receipt; false after a
+    /// failed batch doesn't authorize retrying that batch's unknown outcome. Blocking.
     pub fn put_wait(&self, rows: Vec<Row>) -> bool {
-        rows.is_empty() || self.tx.send_wait(Msg::Rows(rows)).is_ok()
+        rows.is_empty() || self.enqueue(Msg::Rows(rows), true).is_ok()
     }
 
     /// Run `f` on the engine once what was sent before is committed. Blocking, for `READ_WAIT` at
@@ -363,11 +583,9 @@ impl Store {
     fn run<T: Send + 'static>(&self, f: impl FnOnce(&mut dyn Engine) -> anyhow::Result<T> + Send + 'static) -> anyhow::Result<T> {
         let (rtx, rrx) = mpsc::channel();
         let asked = Instant::now();
-        self.tx
-            .send_wait(Msg::Run(Box::new(move |e| {
-                let _ = rtx.send(f(e));
-            })))
-            .map_err(|()| anyhow::anyhow!("the conversation store has stopped, or is full"))?;
+        self.enqueue(Msg::Run(Box::new(move |e| {
+            let _ = rtx.send(e.map_err(|e| anyhow::anyhow!("{e}")).and_then(f));
+        })), true)?;
         match rrx.recv_timeout(READ_WAIT) {
             Ok(answer) => {
                 self.meter.waited(asked.elapsed());
@@ -494,7 +712,8 @@ impl Store {
         self.run(move |e| e.marks(&s))
     }
 
-    /// Lines of `session`'s record from `source`, from line `from` on. Blocking.
+    /// Lines of `session`'s record from `source`, from line `from` on. Blocking. Pages may be
+    /// shorter than `limit` because of their byte bound; an empty page alone means EOF.
     pub fn record(&self, session: &str, source: &str, from: u64, limit: usize) -> anyhow::Result<Vec<(u64, String)>> {
         let (s, src) = (session.to_owned(), source.to_owned());
         self.run(move |e| e.record(&s, &src, from, limit))
@@ -515,7 +734,10 @@ impl Store {
         self.run(move |e| e.ended((at, &id), limit))
     }
 
-    /// Wait until everything sent so far is committed. Blocking.
+    /// FIFO settlement barrier. Prior successful safe batches are durable, but a typed definite
+    /// refusal is a settled failed attempt: each caller must inspect its own ticket. Unknown or
+    /// unobservable legacy failures remain errors/fences. This does not certify a refused batch
+    /// or a frame with no rows. Blocking; rejected historical put input is outside the barrier.
     pub fn sync(&self) -> anyhow::Result<()> {
         self.run(|_| Ok(()))
     }
@@ -529,38 +751,115 @@ impl Store {
     }
 }
 
-/// Sending that waits for room, up to `READ_WAIT` (a full queue means a writer behind).
-trait SendWait {
-    fn send_wait(&self, m: Msg) -> Result<(), ()>;
-}
-
-impl SendWait for mpsc::SyncSender<Msg> {
-    fn send_wait(&self, mut m: Msg) -> Result<(), ()> {
+impl Store {
+    /// Admission alone isn't a commit receipt. The gate prevents accepted rows from growing
+    /// after failure; the existing channel and pending batch retain everything already admitted.
+    fn enqueue(&self, mut msg: Msg, wait: bool) -> anyhow::Result<()> {
         let until = Instant::now() + READ_WAIT;
         loop {
-            match self.try_send(m) {
-                Ok(()) => return Ok(()),
-                Err(mpsc::TrySendError::Disconnected(_)) => return Err(()),
-                Err(mpsc::TrySendError::Full(back)) => {
-                    if Instant::now() >= until {
-                        return Err(());
-                    }
-                    m = back;
-                    std::thread::sleep(Duration::from_millis(5));
+            {
+                let failure = self.failure.lock().unwrap_or_else(PoisonError::into_inner);
+                if let Some(e) = failure.as_ref() {
+                    anyhow::bail!("{e}");
+                }
+                match self.tx.try_send(msg) {
+                    Ok(()) => return Ok(()),
+                    Err(mpsc::TrySendError::Disconnected(_)) => anyhow::bail!("the conversation store has stopped"),
+                    Err(mpsc::TrySendError::Full(back)) => msg = back,
                 }
             }
+            if !wait || Instant::now() >= until {
+                anyhow::bail!("the conversation store is full");
+            }
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
 }
 
+struct Settlement<'a> { failure: &'a Failure, capacity: &'a Capacity, meter: &'a Meter, watchers: &'a Watchers }
+struct WriterContext<'a> { watchers: &'a Watchers, upkeep: Upkeep, meter: &'a Meter, hold: &'a AtomicI64, failure: &'a Failure, capacity: &'a Capacity }
+
+fn block(envelope: Envelope, cause: &Arc<ApplyFailure>, retained: &mut Vec<Envelope>) {
+    envelope.completion.finish(Err(Arc::new(ApplyFailure::Blocked(cause.clone()))));
+    retained.push(envelope);
+}
+
+/// A flush retains each sealed envelope's meaning. A Records/Record envelope is a boundary;
+/// grouped projections contain each session once and fit the aggregate prepared-input bound.
+fn settle(engine: &mut Box<dyn Engine>, pending: &mut Vec<Envelope>, retained: &mut Vec<Envelope>, failed: &mut Option<Arc<ApplyFailure>>, context: &Settlement<'_>) {
+    let Settlement { failure, capacity, meter, watchers } = context;
+    if pending.is_empty() { return; }
+    if let Some(cause) = failed.as_ref() {
+        for envelope in std::mem::take(pending) { block(envelope, cause, retained); }
+        return;
+    }
+    let group = std::mem::take(pending);
+    let result = if let Some(envelope) = group.first().filter(|_| group.len() == 1) {
+        engine.apply_batch(&envelope.batch).map(|answer| vec![answer])
+    } else {
+        let batches = group.iter().map(|e| &e.batch).collect::<Vec<_>>();
+        engine.apply_group(&batches)
+    };
+    let result = result.and_then(|answers| {
+        if answers.len() == group.len() { Ok(answers) }
+        else { Err(ApplyFailure::Unknown(amphora_api::Refusal::Unavailable("conversation backend returned the wrong number of durable answers".into()))) }
+    });
+    match result {
+        Ok(answers) => {
+            meter.committed(group.iter().map(|e| e.batch.rows().len()).sum());
+            for (Envelope { batch, completion, permit }, answer) in group.into_iter().zip(answers) {
+                // The selected owner already returned its durable answer. No client wait/drop
+                // can release this permit before that point.
+                drop(batch);
+                drop(permit);
+                completion.finish(Ok(answer));
+            }
+            notify(watchers);
+        }
+        Err(error @ ApplyFailure::Definite(_)) => {
+            let cause = Arc::new(error);
+            for Envelope { batch, completion, permit } in group {
+                // A definitely failed attempt is settled, but its input stays in the ticket
+                // until take_failed or explicit abandonment of this terminal result.
+                completion.refused(batch, permit, cause.clone());
+            }
+        }
+        Err(error) => {
+            let cause = Arc::new(error);
+            *failure.lock().unwrap_or_else(PoisonError::into_inner) = Some(cause.clone());
+            capacity.changed.notify(usize::MAX);
+            for envelope in group {
+                envelope.completion.finish(Err(cause.clone()));
+                retained.push(envelope);
+            }
+            *failed = Some(cause);
+        }
+    }
+}
+
+fn boundary(batch: &Batch) -> bool {
+    batch.records().is_some() || batch.rows().iter().any(|row| matches!(row, Row::Record(_) | Row::RecordReset { .. }))
+}
+
+fn shares_flush(pending: &[Envelope], batch: &Batch) -> bool {
+    !pending.iter().any(|e| e.batch.session() == batch.session())
+        && pending.iter().try_fold(batch.prepared_bytes(), |n, e| n.checked_add(e.batch.prepared_bytes())).is_some_and(|n| n <= GROUP_MAX)
+        && group_command_cost(pending.iter().map(|e| &e.batch).chain(std::iter::once(batch))).is_some_and(|n| n <= WORK_MAX)
+}
+
 /// The writer: rows wait at most `COMMIT_MS` (or until `COMMIT_ROWS`) to share a commit; a job
 /// commits what waits first, so it sees everything sent before it.
-fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watchers, upkeep: Upkeep, meter: &Meter, hold: &AtomicI64) {
+fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, context: WriterContext<'_>) {
+    let WriterContext { watchers, upkeep, meter, hold, failure, capacity } = context;
+    let settlement = Settlement { watchers, meter, failure, capacity };
     let keep_closed = upkeep.keep_closed;
     // The hold on letting records go as it last looked: one moved later lets more go, so it looks
     // again.
     let mut held = hold.load(Ordering::Acquire);
     let mut pending: Vec<Row> = Vec::new();
+    let mut failed: Option<Arc<ApplyFailure>> = None;
+    let mut exact: Vec<Envelope> = Vec::new();
+    let mut retained: Vec<Envelope> = Vec::new();
     let mut since: Option<Instant> = None;
     // Lines kept before lines were compressed may be left: compressed while nothing else waits.
     let mut squeezing = true;
@@ -571,7 +870,7 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
     let mut compacting: Option<Instant> = None;
     // When it last looked at its file for its telemetry, and counted its sessions.
     let (mut looked, mut counted): (Option<Instant>, Option<Instant>) = (None, None);
-    let commit = |engine: &mut Box<dyn Engine>, pending: &mut Vec<Row>| {
+    let commit = |engine: &mut Box<dyn Engine>, pending: &mut Vec<Row>, failed: &mut Option<Arc<ApplyFailure>>| {
         if pending.is_empty() {
             return;
         }
@@ -581,33 +880,102 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
                 meter.committed(rows.len());
                 notify(watchers);
             }
-            Err(e) => tracing::warn!(error = %format!("{e:#}"), rows = rows.len(), "conversation store: a batch couldn't be written"),
+            Err(e) => {
+                let reason = Arc::new(ApplyFailure::Unknown(amphora_api::Refusal::Unavailable(format!("the conversation store's historical pending batch failed; its outcome may be unknown and it wasn't retried: {e:#}"))));
+                *failure.lock().unwrap_or_else(PoisonError::into_inner) = Some(reason.clone());
+                capacity.changed.notify(usize::MAX);
+                tracing::warn!(error = %reason, rows = rows.len(), "conversation store: a failed batch is retained; new work is refused");
+                // Preserve exactly what apply saw. No re-coalescing, later write or maintenance
+                // may supersede it while its outcome is unknown.
+                *pending = rows;
+                *failed = Some(reason);
+            }
         }
     };
     loop {
+        if let Some(e) = failed.as_ref() {
+            // Admission is closed under the same gate that latched this failure, so only the
+            // finite existing channel remains. Retain its rows after the failed batch; queued
+            // jobs receive failure without touching the engine. No retry, poll or upkeep runs.
+            let got = rx.recv();
+            if got.is_ok() { capacity.changed.notify(usize::MAX); }
+            match got {
+                Ok(Msg::Rows(rows)) => pending.extend(rows),
+                Ok(Msg::Batch(envelope)) => block(envelope, e, &mut retained),
+                Ok(Msg::Barrier(completion, _permit)) => completion.finish(Err(Arc::new(ApplyFailure::Blocked(e.clone())))),
+                Ok(Msg::Run(f)) => f(Err(e.clone())),
+                Err(_) => return,
+            }
+            continue;
+        }
         let idle = if squeezing || looking || compacting.is_some() { SQUEEZE_EVERY } else { look_at.saturating_duration_since(Instant::now()).max(SQUEEZE_EVERY).min(LOOK_FILE) };
         let wait = since.map_or(idle, |t| Duration::from_millis(COMMIT_MS).saturating_sub(t.elapsed()));
         let got = rx.recv_timeout(wait);
+        // Real channel room, including a historical/control dequeue, wakes safe waiters.
+        if got.is_ok() { capacity.changed.notify(usize::MAX); }
         let began = Instant::now();
         match got {
             Ok(Msg::Rows(rows)) => {
+                settle(&mut engine, &mut exact, &mut retained, &mut failed, &settlement);
                 pending.extend(rows);
                 since.get_or_insert_with(Instant::now);
-                if pending.len() >= COMMIT_ROWS {
-                    commit(&mut engine, &mut pending);
+                if failed.is_none() && pending.len() >= COMMIT_ROWS {
+                    commit(&mut engine, &mut pending, &mut failed);
                     since = None;
                 }
             }
-            Ok(Msg::Run(f)) => {
-                commit(&mut engine, &mut pending);
+            Ok(Msg::Batch(envelope)) => {
+                // Historical and safe admissions share FIFO ordering but never coalesce.
+                commit(&mut engine, &mut pending, &mut failed);
+                if let Some(cause) = failed.as_ref() {
+                    block(envelope, cause, &mut retained);
+                    continue;
+                }
+                let immediate = boundary(&envelope.batch);
+                if immediate || !shares_flush(&exact, &envelope.batch) {
+                    settle(&mut engine, &mut exact, &mut retained, &mut failed, &settlement);
+                    since = None;
+                }
+                if let Some(cause) = failed.as_ref() {
+                    block(envelope, cause, &mut retained);
+                    continue;
+                }
+                exact.push(envelope);
+                since.get_or_insert_with(Instant::now);
+                if immediate || exact.iter().map(|e| e.batch.rows().len()).sum::<usize>() >= COMMIT_ROWS {
+                    settle(&mut engine, &mut exact, &mut retained, &mut failed, &settlement);
+                    since = None;
+                }
+            }
+            Ok(Msg::Barrier(completion, _permit)) => {
+                commit(&mut engine, &mut pending, &mut failed);
+                settle(&mut engine, &mut exact, &mut retained, &mut failed, &settlement);
                 since = None;
-                f(engine.as_mut());
-                meter.ran();
+                match failed.as_ref() {
+                    Some(cause) => completion.finish(Err(Arc::new(ApplyFailure::Blocked(cause.clone())))),
+                    None => completion.finish(Ok(Committed { conversation_rev: engine.top(), records_rev: None })),
+                }
+            }
+            Ok(Msg::Run(f)) => {
+                commit(&mut engine, &mut pending, &mut failed);
+                settle(&mut engine, &mut exact, &mut retained, &mut failed, &settlement);
+                since = None;
+                match failed.as_ref() {
+                    Some(e) => f(Err(e.clone())),
+                    None => {
+                        f(Ok(engine.as_mut()));
+                        meter.ran();
+                    }
+                }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                let had = !pending.is_empty();
-                commit(&mut engine, &mut pending);
+                let had = !pending.is_empty() || !exact.is_empty();
+                commit(&mut engine, &mut pending, &mut failed);
+                settle(&mut engine, &mut exact, &mut retained, &mut failed, &settlement);
                 since = None;
+                if failed.is_some() {
+                    continue;
+                }
                 if squeezing && !had {
                     match engine.squeeze_some(SQUEEZE_BATCH) {
                         Ok(true) => {}
@@ -663,9 +1031,13 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                commit(&mut engine, &mut pending);
+                commit(&mut engine, &mut pending, &mut failed);
+                settle(&mut engine, &mut exact, &mut retained, &mut failed, &settlement);
                 return;
             }
+        }
+        if failed.is_some() {
+            continue;
         }
         // Its telemetry: every `LOOK_FILE`, whatever else it does, where its file stands; and how
         // long what it did held it.
@@ -720,7 +1092,8 @@ pub fn tee(sink: Sink, store: Store, room: usize) -> Sink {
 #[cfg(test)]
 pub fn scratch() -> anyhow::Result<(tempfile::TempDir, Store)> {
     let dir = tempfile::tempdir()?;
-    let store = Store::start(Box::new(super::turso::Turso::open(&dir.path().join(super::FILE))?), Upkeep::default())?;
+    let host = crate::store::Store::open(&dir.path().join("kiln.db"))?;
+    let store = super::from_database(host.database(), &dir.path().join(super::FILE), Upkeep::default())?;
     Ok((dir, store))
 }
 
@@ -728,7 +1101,9 @@ pub fn scratch() -> anyhow::Result<(tempfile::TempDir, Store)> {
 #[cfg(test)]
 pub fn stopped() -> Store {
     let (tx, _) = mpsc::sync_channel(1);
-    Store { tx, id: "stopped".into(), meter: Arc::default(), watchers: Arc::default(), hold: Arc::new(AtomicI64::new(i64::MAX)) }
+    let meter: Arc<Meter> = Arc::default();
+    let capacity = Arc::new(Capacity { limits: AdmissionLimits::default(), used: Mutex::new(Used { closed: true, ..Used::default() }), changed: event_listener::Event::new(), meter: meter.clone() });
+    Store { tx, failure: Arc::default(), capacity, identity: Arc::new(()), id: "stopped".into(), meter, watchers: Arc::default(), hold: Arc::new(AtomicI64::new(i64::MAX)) }
 }
 
 #[cfg(test)]
@@ -876,6 +1251,67 @@ mod tests {
         Ok(())
     }
 
+    /// U17/U19: a held SQL owner cannot be mistaken for a successful flush. Once apply fails,
+    /// even a later repair doesn't turn a new empty barrier into success or replay the batch.
+    #[test]
+    fn u17_u19_a_failed_held_flush_refuses_later_barriers_and_never_retries() -> anyhow::Result<()> {
+        let host = crate::store::Store::in_memory()?;
+        let database = host.database();
+        let engine = super::super::amphora::Amphora::from_database(database.clone())?;
+        let store = Store::start(Box::new(engine), Upkeep::default())?;
+        let committed = store.watch();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let held = std::thread::spawn(move || -> anyhow::Result<()> {
+            database.call(Instant::now() + READ_WAIT, move |c| {
+                // A real engine rejection, before any timeline row is written. The held call
+                // publishes this value only when released; apply must wait behind it.
+                c.execute("INSERT INTO convo_meta(key,value) VALUES ('rev',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", vec![amphora_api::Value::Text(u64::MAX.to_string())])?;
+                entered_tx.send(())?;
+                release_rx.recv_timeout(READ_WAIT)?;
+                Ok(())
+            })?;
+            Ok(())
+        });
+        entered_rx.recv_timeout(READ_WAIT)?;
+        store.send("held", &said("m1", 1, "must not disappear behind a successful flush"));
+        let (waiting_tx, waiting_rx) = mpsc::channel();
+        let (answer_tx, answer_rx) = mpsc::channel();
+        let flushing = store.clone();
+        let waiter = std::thread::spawn(move || {
+            let _ = waiting_tx.send(());
+            let _ = answer_tx.send(flushing.sync());
+        });
+        waiting_rx.recv_timeout(READ_WAIT)?;
+        assert!(matches!(answer_rx.try_recv(), Err(mpsc::TryRecvError::Empty)), "a held owner isn't a completed flush");
+        release_tx.send(())?;
+        held.join().map_err(|_| anyhow::anyhow!("the held SQL call's thread failed"))??;
+        let failed = answer_rx.recv_timeout(READ_WAIT)?;
+        waiter.join().map_err(|_| anyhow::anyhow!("the flush waiter's thread failed"))?;
+        let error = failed.err().ok_or_else(|| anyhow::anyhow!("a failed batch was reported as committed"))?;
+        assert!(format!("{error:#}").contains("conversation revision overflow"));
+        assert!(matches!(committed.try_recv(), Err(async_channel::TryRecvError::Empty)), "failed apply doesn't publish a commit");
+        assert_eq!(store.report().commits, 0);
+
+        // Repair the modeled cause through the same canonical SQL owner. The conversation
+        // wrapper still cannot decide whether an arbitrary apply error was a definite rollback.
+        host.now(|c| {
+            c.execute("UPDATE convo_meta SET value='0' WHERE key='rev'", [])?;
+            Ok(())
+        })?;
+        assert!(store.sync().is_err(), "an empty barrier must preserve the earlier failure");
+        assert!(store.kept("held", 10).is_err(), "a dependent read must not run past the failed write");
+        assert!(!store.put_wait(rows::of("later", &said("m2", 2, "not admitted"), 2)), "failure closes admission without accepting more rows");
+        let count = host.now(|c| {
+            let mut query = c.prepare("SELECT count(*) FROM convo_events")?;
+            let mut rows = query.query([])?;
+            let row = rows.next()?.ok_or_else(|| anyhow::anyhow!("missing event count"))?;
+            Ok(row.get::<_, i64>(0)?)
+        })?;
+        assert_eq!(count, 0, "repair cannot cause a blind retry or a later write");
+        Ok(())
+    }
+
     #[test]
     fn a_search_finds_words_newest_first() -> anyhow::Result<()> {
         let (_dir, store) = scratch()?;
@@ -933,4 +1369,125 @@ mod tests {
             Ok(())
         })
     }
+    #[test]
+    fn u05_room_cancellation_and_ticket_drop_keep_applying_input_in_custody() -> anyhow::Result<()> {
+        let host = crate::store::Store::in_memory()?;
+        let database = host.database();
+        let engine = super::super::amphora::Amphora::from_database(database.clone())?;
+        let store = Store::start_with_limits(Box::new(engine), Upkeep::default(), AdmissionLimits { batches: 1, bytes: 1 << 20 })?;
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let held = std::thread::spawn(move || database.call(Instant::now() + READ_WAIT, move |_connection| {
+            entered_tx.send(())?;
+            release_rx.recv_timeout(READ_WAIT)?;
+            Ok(())
+        }));
+        entered_rx.recv_timeout(READ_WAIT)?;
+        let batch = Batch::from_update("s", &said("m1", 1, "retained"), 1)?.ok_or_else(|| anyhow::anyhow!("missing projection"))?;
+        let ticket = store.try_admit(batch).map_err(|e| anyhow::anyhow!("{:?}", e.reason))?;
+        let next = Batch::from_update("later", &said("m2", 2, "caller owns this"), 2)?.ok_or_else(|| anyhow::anyhow!("missing later projection"))?;
+        let refused = store.try_admit(next).err().ok_or_else(|| anyhow::anyhow!("the applying batch released its count reservation"))?;
+        anyhow::ensure!(matches!(refused.reason, AdmissionRefusal::Full { .. }) && refused.input.session() == "later", "typed Full did not return its input");
+        anyhow::ensure!(ticket.try_result().is_none() && store.report().admission.batches == 1, "a held owner was reported durable or released custody");
+        let waiting_store = store.clone();
+        let waiting_ticket = ticket.clone();
+        let pending = crate::rt::block_on(async move {
+            anyhow::ensure!(waiting_ticket.wait_until(Instant::now()).await.is_err(), "a receipt wait timeout manufactured success");
+            let mut pending = PendingSubmission::new(refused.input);
+            let mut waiting = Box::pin(waiting_store.admit_until(&mut pending, Instant::now() + READ_WAIT));
+            anyhow::ensure!(futures::poll!(waiting.as_mut()).is_pending(), "full store did not hold admission");
+            drop(waiting);
+            anyhow::ensure!(pending.input().is_some() && pending.ticket().is_none(), "cancelling room wait consumed the input");
+            Ok(pending)
+        })?;
+        anyhow::ensure!(pending.into_input().is_some(), "caller could not recover unadmitted input");
+        drop(ticket);
+        anyhow::ensure!(store.report().admission.batches == 1, "dropping the final caller ticket cancelled applying input");
+        release_tx.send(())?;
+        held.join().map_err(|_| anyhow::anyhow!("held owner thread failed"))??;
+        store.sync()?;
+        anyhow::ensure!(store.report().admission.batches == 0 && store.kept("s", 10)?.is_some_and(|kept| kept.events.len() == 1), "durable completion did not release input or retain the event");
+        Ok(())
+    }
+
+    #[test]
+    fn u05_definite_refusal_returns_input_without_poisoning_unrelated_settlement() -> anyhow::Result<()> {
+        use crate::records::SessionBatches as _;
+        use kiln_seams::records::{Cond, Tx, Write};
+        let host = crate::store::Store::in_memory()?;
+        let storage = crate::records::SessionStorage::from_host_database(host.database(), "host", &[], Upkeep::default())?;
+        let (_, committer) = storage.namespace("session-test", None)?;
+        let store = storage.conversations();
+        let transaction = || Tx { conds: vec![Cond::Absent { family: "inbox".into(), key: b"same".to_vec() }], writes: vec![Write::Put { family: "inbox".into(), key: b"same".to_vec(), value: b"once".to_vec() }] };
+        let rows = rows::try_of("s", &said("m1", 1, "first"), 1)?;
+        let first = committer.batch("s".into(), rows, transaction()).map_err(|e| anyhow::anyhow!("{:?}", e.reason))?;
+        let first = committer.try_admit(first).map_err(|e| anyhow::anyhow!("{:?}", e.reason))?;
+        futures::executor::block_on(first.wait()).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let rows = rows::try_of("s", &said("m2", 2, "refused"), 2)?;
+        let stale = committer.batch("s".into(), rows, transaction()).map_err(|e| anyhow::anyhow!("{:?}", e.reason))?;
+        let stale = committer.try_admit(stale).map_err(|e| anyhow::anyhow!("{:?}", e.reason))?;
+        let answer = futures::executor::block_on(stale.wait());
+        anyhow::ensure!(matches!(answer, Err(cause) if matches!(cause.as_ref(), ApplyFailure::Definite(amphora_api::Refusal::Conflict { .. }))), "known CAS refusal was not typed");
+        anyhow::ensure!(store.report().admission.batches == 1, "failed input lost its reservation before take-back");
+        let other = Batch::from_update("other", &said("ok", 1, "unrelated"), 1)?.ok_or_else(|| anyhow::anyhow!("missing unrelated projection"))?;
+        let other = store.try_admit(other).map_err(|e| anyhow::anyhow!("{:?}", e.reason))?;
+        futures::executor::block_on(other.wait()).map_err(|e| anyhow::anyhow!("{e}"))?;
+        store.sync()?; // Settlement is not success of the failed attempt above.
+        let recovered = stale.take_failed().ok_or_else(|| anyhow::anyhow!("definite failed input was not returned"))?;
+        anyhow::ensure!(recovered.session() == "s" && recovered.rows().len() == 1 && stale.take_failed().is_none(), "failed input ownership did not transfer exactly once");
+        anyhow::ensure!(store.report().admission.batches == 0 && store.kept("s", 10)?.is_some_and(|kept| kept.events.len() == 1), "refused SQL was published or its quota never retired");
+        Ok(())
+    }
+
+    #[test]
+    fn u05_unknown_attempt_fences_barriers_and_keeps_input_after_ticket_drop() -> anyhow::Result<()> {
+        let host = crate::store::Store::in_memory()?;
+        let engine = super::super::amphora::Amphora::from_database(host.database())?;
+        let store = Store::start(Box::new(engine), Upkeep::default())?;
+        host.now(|c| {
+            let changed = c.execute("INSERT INTO convo_meta(key,value) VALUES ('rev',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", vec![amphora_api::Value::Text(u64::MAX.to_string())])?;
+            anyhow::ensure!(changed == 1, "the overflow fixture did not install its revision");
+            Ok(())
+        })?;
+        let batch = Batch::from_update("s", &said("m1", 1, "must not be blindly retried"), 1)?.ok_or_else(|| anyhow::anyhow!("missing projection"))?;
+        let ticket = store.try_admit(batch).map_err(|e| anyhow::anyhow!("{:?}", e.reason))?;
+        anyhow::ensure!(matches!(futures::executor::block_on(ticket.wait()), Err(cause) if matches!(cause.as_ref(), ApplyFailure::Unknown(_))), "ambiguous apply was called definite or durable");
+        anyhow::ensure!(ticket.take_failed().is_none(), "unknown input was returned for a blind retry");
+        drop(ticket);
+        anyhow::ensure!(store.report().admission.batches == 1 && matches!(store.barrier(), Err(AdmissionRefusal::Fenced(_))) && store.sync().is_err(), "unknown outcome lost custody or allowed a successful barrier");
+        Ok(())
+    }
+
+    #[test]
+    fn u05_channel_full_waits_for_a_real_dequeue_without_self_waking() -> anyhow::Result<()> {
+        let host = crate::store::Store::in_memory()?;
+        let engine = super::super::amphora::Amphora::from_database(host.database())?;
+        let store = Store::start_with_limits(Box::new(engine), Upkeep::default(), AdmissionLimits { batches: 1, bytes: 1 << 20 })?;
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        // Hold the existing actor after an actual control dequeue. Holding its SQL owner
+        // instead lets idle telemetry block before that dequeue and never fills this slot.
+        store.enqueue(Msg::Run(Box::new(move |_| {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv_timeout(READ_WAIT);
+        })), true)?;
+        entered_rx.recv_timeout(READ_WAIT)?;
+        anyhow::ensure!(store.put_wait(rows::try_of("old", &said("two", 2, "queued historical row"), 2)?), "could not fill the one-slot channel");
+        anyhow::ensure!(store.report().admission.batches == 0, "this scenario must be channel Full, not input-quota Full");
+        let waiting_store = store.clone();
+        crate::rt::block_on(async move {
+            let batch = Batch::from_update("safe", &said("three", 3, "safe after actual dequeue"), 3)?.ok_or_else(|| anyhow::anyhow!("missing safe projection"))?;
+            let mut pending = PendingSubmission::new(batch);
+            let mut waiting = Box::pin(waiting_store.admit_until(&mut pending, Instant::now() + READ_WAIT));
+            anyhow::ensure!(futures::poll!(waiting.as_mut()).is_pending(), "channel-full rollback woke itself instead of waiting");
+            release_tx.send(())?;
+            waiting.await?;
+            let ticket = pending.ticket().ok_or_else(|| anyhow::anyhow!("dequeue wake lost the ticket"))?;
+            ticket.wait().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok(())
+        })?;
+        anyhow::ensure!(store.kept("safe", 10)?.is_some_and(|kept| kept.events.len() == 1), "the real dequeue never admitted/durably completed the safe batch");
+        Ok(())
+    }
+
 }

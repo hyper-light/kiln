@@ -22,6 +22,14 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 
+pub(super) mod daemon;
+
+fn local_endpoint(endpoint: &str) -> anyhow::Result<PathBuf> {
+    let path = endpoint.strip_prefix("unix://").ok_or_else(|| anyhow::anyhow!("U03: the managed Docker leg proxy supports a local Unix endpoint; the configured transport requires an explicit adapter (TCP/SSH/npipe are not silently redirected)"))?;
+    anyhow::ensure!(Path::new(path).is_absolute(), "U03: the managed Docker Unix endpoint must be an absolute socket path");
+    Ok(PathBuf::from(path))
+}
+
 /// How long pulls and builds may take.
 const SLOW: Duration = Duration::from_secs(1800);
 /// How long any other call to the engine may take. Long: a busy machine's daemon can take
@@ -46,7 +54,9 @@ pub fn find() -> Option<String> {
             None => crate::os::which(bin),
         };
         let Some(full) = found else { continue };
-        let ok = std::process::Command::new(&full).args(["version", "--format", "{{.Server.Version}}"]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success());
+        let mut command = std::process::Command::new(&full);
+        command.args(["version", "--format", "{{.Server.Version}}"]);
+        let ok = super::processes::output_blocking(command).is_ok_and(|o| o.status.success());
         if ok {
             return Some(full.to_string_lossy().into_owned());
         }
@@ -125,7 +135,9 @@ pub fn rootless_engine() -> bool {
     PROBED.answer(|| {
         find().is_some_and(|bin| {
             let format = if is_podman(&bin) { "{{.Host.Security.Rootless}}" } else { "{{json .SecurityOptions}}" };
-            std::process::Command::new(&bin).args(["info", "--format", format]).stderr(std::process::Stdio::null()).output().is_ok_and(|o| {
+            let mut command = std::process::Command::new(&bin);
+            command.args(["info", "--format", format]);
+            super::processes::output_blocking(command).is_ok_and(|o| {
                 let out = String::from_utf8_lossy(&o.stdout);
                 o.status.success() && (out.trim() == "true" || out.contains("rootless"))
             })
@@ -234,13 +246,13 @@ fn after_mirror(image: &str, via: &str) -> (String, bool) {
 
 /// The group that owns the host's Docker socket.
 #[cfg(unix)]
-fn socket_group() -> Option<u32> {
+fn socket_group(socket: &Path) -> Option<u32> {
     use std::os::unix::fs::MetadataExt as _;
-    std::fs::metadata("/var/run/docker.sock").ok().map(|m| m.gid())
+    std::fs::metadata(socket).ok().map(|m| m.gid())
 }
 
 #[cfg(not(unix))]
-fn socket_group() -> Option<u32> {
+fn socket_group(_socket: &Path) -> Option<u32> {
     None
 }
 
@@ -547,22 +559,23 @@ pub fn owner_label(work: &Path) -> String {
 /// found by [`owner_label`]. A leg never outlives its runner (an upgrade waits for none to run),
 /// and this runs before it takes one. Left in place, a leg's network holds one of the engine's
 /// few address pools until no leg can start.
-pub async fn sweep(work: &Path) {
-    let Ok(Some(bin)) = crate::rt::blocking(find).await else { return };
+pub async fn sweep(work: &Path) -> anyhow::Result<()> {
+    let Some(bin) = crate::rt::blocking(find).await? else { return Ok(()) };
     let cli = Cli::new(&bin, work.join("_docker_config")).owned_by(work);
-    let Some(owner) = cli.owner.clone() else { return };
+    let Some(owner) = cli.owner.clone() else { return Ok(()) };
     // And what its legs made through their own sockets.
     let mut labels = vec![owner.clone()];
     labels.extend(super::docker_sock::runner_label(&owner));
-    let [containers, networks, volumes] = remove_labelled(&cli, &labels, SWEEP).await;
+    let [containers, networks, volumes] = remove_labelled(&cli, &labels, SWEEP).await?;
     if containers + networks + volumes > 0 {
         tracing::info!(containers, networks, volumes, "removed what this runner left running when it last stopped");
     }
+    Ok(())
 }
 
 /// Removes what has one of `labels` (`key=value`): the containers (their anonymous volumes with
 /// them), then the networks and volumes they may have used. How many of each it found.
-async fn remove_labelled(cli: &Cli, labels: &[String], wait: Duration) -> [usize; 3] {
+async fn remove_labelled(cli: &Cli, labels: &[String], wait: Duration) -> anyhow::Result<[usize; 3]> {
     let none = BTreeMap::new();
     let mut found = [0; 3];
     for (count, kind) in found.iter_mut().zip([None, Some("network"), Some("volume")]) {
@@ -570,7 +583,7 @@ async fn remove_labelled(cli: &Cli, labels: &[String], wait: Duration) -> [usize
         for label in labels {
             let mut ls = kind.map_or_else(|| vec![s("ps"), s("-aq")], |k| vec![s(k), s("ls"), s("-q")]);
             ls.extend([s("--filter"), format!("label={label}")]);
-            ids.extend(cli.run(&ls, &none, wait).await.unwrap_or_default().lines().map(str::to_owned).filter(|l| !l.is_empty()));
+            ids.extend(cli.run(&ls, &none, wait).await?.lines().map(str::to_owned).filter(|l| !l.is_empty()));
         }
         ids.sort();
         ids.dedup();
@@ -584,16 +597,86 @@ async fn remove_labelled(cli: &Cli, labels: &[String], wait: Duration) -> [usize
             Some(k) => vec![s(k), s("rm")],
         };
         rm.extend(ids);
-        if let Err(e) = cli.run(&rm, &none, wait).await {
-            tracing::warn!(error = %format!("{e:#}"), kind = kind.unwrap_or("container"), "what was left could not all be removed");
+        cli.run(&rm, &none, wait).await?;
+    }
+    for label in labels {
+        let remaining = cli.run(&[s("ps"), s("-aq"), s("--filter"), format!("label={label}")], &none, wait).await?;
+        anyhow::ensure!(remaining.trim().is_empty(), "containers labelled {label} still exist after cleanup");
+    }
+    Ok(found)
+}
+
+/// Durable identity of daemon-created work. The label is unique to this execution, so an old
+/// cleanup cannot remove a newer attempt's containers. It contains no credential values.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Ownership { pub bin: String, pub config: PathBuf, pub labels: Vec<String>, #[serde(default)] pub socket: Option<PathBuf>, #[serde(default)] pub daemon_id: Option<String> }
+impl Ownership {
+    pub(crate) fn journal(&self, admission: &super::processes::Admission) -> anyhow::Result<daemon::Journal> {
+        let label = self.labels.iter().find(|l| l.starts_with("kiln.execution=")).ok_or_else(|| anyhow::anyhow!("U03: daemon ownership lacks a unique execution identity; retaining its recovery fence"))?;
+        Ok(daemon::Journal::execution_in(admission.clone(), label))
+    }
+
+    pub(crate) fn quiesce(&self, admission: &super::processes::Admission) -> anyhow::Result<()> { self.journal(admission)?.quiesce() }
+
+    /// U03: safe local reconciliation summary, including only physical ownership metadata.
+    pub(crate) fn report(&self, admission: &super::processes::Admission) -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::json!({
+            "execution": self.labels.iter().find(|l| l.starts_with("kiln.execution=")),
+            "labels": self.labels,
+            "binary": self.bin,
+            "config_path": self.config,
+            "local_endpoint": self.socket,
+            "daemon_id": self.daemon_id,
+            "submission": self.journal(admission)?.report()?,
+            "capacity_release_proven": false,
+        }))
+    }
+
+    pub(crate) async fn stop_proven(&self, admission: &super::processes::Admission) -> anyhow::Result<()> {
+        self.quiesce(admission)?;
+        // U03: a daemon may commit a create after any number of negative lists. Only the
+        // operation's completed response discharges its durable submission evidence.
+        let mut cli = Cli::new(&self.bin, self.config.clone());
+        cli.admission = admission.clone();
+        cli.reconciling = true;
+        cli.pinned_socket = self.socket.clone();
+        let pin = cli.local_pin().await;
+        if let Some(pin) = &pin {
+            anyhow::ensure!(self.daemon_id.as_ref().is_none_or(|id| id == pin.generation.daemon_id()), "U03: the configured socket now serves a different Docker daemon; retaining the original endpoint's ownership fence");
+            let recovered = self.journal(admission)?.recover_generation(&pin.generation)?;
+            if recovered > 0 { tracing::warn!(recovered, labels = ?self.labels, "U03: verified local daemon host boot generation changed; reconciling durable labelled resources before capacity release"); }
+            cli.pinned_socket = Some(pin.path.clone());
+        } else {
+            anyhow::ensure!(self.daemon_id.is_none(), "U03: cannot verify the original local Docker daemon identity; retaining cleanup fence and recovery intent");
+        }
+        let drained_before_removal = self.journal(admission)?.drained();
+        remove_labelled(&cli, &self.labels, CALL).await?;
+        // If an operation completes during the sweep it may have committed after the
+        // sweep's list. Sweep again on the next recovery pass, after obtaining drain proof.
+        let _proof = drained_before_removal?;
+        self.journal(admission)?.drained()?;
+        Ok(())
+    }
+    pub(crate) async fn reconcile(&self, admission: &super::processes::Admission) {
+        let mut announced = false;
+        loop {
+            let execution = super::processes::Execution::cleanup(admission.clone(), self.config.parent().unwrap_or(&self.config).join("_cleanup"));
+            let stopped = execution.scope(self.stop_proven(admission)).await;
+            execution.stop().await;
+            match stopped {
+                Ok(()) => return,
+                Err(e) if !announced => { announced = true; tracing::error!(error = %format!("{e:#}"), labels = ?self.labels, "container cleanup retains its resource fence until the engine proves removal"); },
+                Err(_) => {},
+            }
+            crate::rt::sleep(Duration::from_secs(1)).await;
         }
     }
-    found
 }
 
 /// The CLI, with the leg's own credential store.
 #[derive(Debug, Clone)]
 pub struct Cli {
+    admission: super::processes::Admission,
     pub bin: String,
     config: PathBuf,
     /// kiln's registry (its host) and the registries it mirrors, `(upstream, prefix)`: images from
@@ -601,11 +684,17 @@ pub struct Cli {
     through: Option<(String, Vec<(String, String)>)>,
     /// The runner's [`owner_label`], on everything it starts.
     owner: Option<String>,
+    execution: Option<String>,
+    reconciling: bool,
+    socket: std::sync::Arc<std::sync::OnceLock<Result<PathBuf, String>>>,
+    pinned_socket: Option<PathBuf>,
+    pin: std::sync::Arc<std::sync::OnceLock<Option<std::sync::Arc<daemon::LocalPin>>>>,
 }
 
 impl Cli {
     pub fn new(bin: &str, config: PathBuf) -> Cli {
-        Cli { bin: bin.to_owned(), config, through: None, owner: None }
+        let execution = super::processes::current();
+        Cli { admission: execution.as_ref().map_or_else(super::processes::Admission::production, |e| e.admission().clone()), bin: bin.to_owned(), config, through: None, owner: None, execution: execution.map(|e| e.label()), reconciling: false, socket: Default::default(), pinned_socket: None, pin: Default::default() }
     }
 
     /// What it starts carries the label of the runner working in `work` ([`owner_label`]).
@@ -622,7 +711,104 @@ impl Cli {
 
     /// `--label <owner>`, for what it starts.
     pub fn owner_args(&self) -> Vec<String> {
-        self.owner.iter().flat_map(|o| [s("--label"), o.clone()]).collect()
+        // A retained debug invocation can create only child-owned resources. Reusing the
+        // original Cli for probes/exec keeps its root alias, without retagging that container.
+        let operation = self.for_current_operation().ok();
+        let execution = operation.as_ref().and_then(|c| c.execution.as_ref()).or(self.execution.as_ref());
+        self.owner.iter().chain(execution).flat_map(|o| [s("--label"), o.clone()]).collect()
+    }
+
+    /// U03: rebinding is available only inside the core's typed retained-debug invocation.
+    /// Its operation ID is unique, while all physical Groups keep the retained root lease.
+    pub(crate) fn for_current_operation(&self) -> anyhow::Result<Self> {
+        let mut cli = self.clone();
+        let Some(execution) = super::processes::current().filter(|e| e.operation_identity().is_some()) else { return Ok(cli) };
+        anyhow::ensure!(&self.admission == execution.admission(), "U03: a debug operation cannot change its admission owner");
+        let root = format!("kiln.execution={}", execution.identity());
+        let operation = execution.label();
+        anyhow::ensure!(self.execution.as_deref() == Some(root.as_str()) || self.execution.as_deref() == Some(operation.as_str()), "U03: a debug operation cannot borrow another execution's Docker client");
+        cli.execution = Some(operation);
+        Ok(cli)
+    }
+
+    pub(crate) async fn ownership(&self) -> anyhow::Result<Option<std::sync::Arc<super::processes::Group>>> {
+        if self.reconciling { return Ok(None) }
+        let (Some(execution), Some(label)) = (super::processes::current(), self.execution.clone()) else { return Ok(None) };
+        anyhow::ensure!(&self.admission == execution.admission(), "U03: Docker client and physical execution have different admission owners");
+        let socket = self.local_socket().await.ok();
+        let pin = self.local_pin().await;
+        let daemon_id = pin.as_ref().map(|p| p.generation.daemon_id().to_owned());
+        let owner = Ownership { bin: self.bin.clone(), config: self.config.clone(), labels: vec![label], socket, daemon_id };
+        Ok(Some(crate::rt::blocking(move || execution.docker(owner)).await??))
+    }
+
+    /// U03: call before exposing the existing CI leg proxy, never for arbitrary host jobs.
+    /// The returned Group is the execution's existing physical owner, not a new allocation.
+    pub(crate) async fn prepare_socket(&self) -> anyhow::Result<std::sync::Arc<super::processes::Group>> {
+        self.local_socket().await?;
+        let owner = self.ownership().await?.ok_or_else(|| anyhow::anyhow!("U03: a managed Docker leg proxy requires its existing execution owner before listen"))?;
+        self.journal().ok_or_else(|| anyhow::anyhow!("U03: managed Docker proxy lacks its execution journal"))?.ensure_open()?;
+        Ok(owner)
+    }
+
+    /// The existing proxy is an AF_UNIX stream proxy. Respect a configured endpoint; never
+    /// silently substitute the host's default daemon for a TCP, SSH or Windows named pipe.
+    pub(crate) async fn local_socket(&self) -> anyhow::Result<PathBuf> {
+        if let Some(socket) = &self.pinned_socket { return Ok(socket.clone()) }
+        if let Some(socket) = self.socket.get() { return socket.clone().map_err(anyhow::Error::msg) }
+        let resolved = self.resolve_local_socket().await.map_err(|e| format!("{e:#}"));
+        let _ = self.socket.set(resolved.clone());
+        resolved.map_err(anyhow::Error::msg)
+    }
+
+    async fn local_pin(&self) -> Option<std::sync::Arc<daemon::LocalPin>> {
+        if let Some(pin) = self.pin.get() { return pin.clone() }
+        // Native Podman can operate without a daemon. Do not claim its CLI mutations went
+        // through an API socket merely because a service also happens to be listening.
+        let podman = Path::new(&self.bin).file_stem().and_then(|p| p.to_str()) == Some("podman");
+        let pin = if podman { None } else {
+            match self.local_socket().await {
+                Ok(socket) => daemon::LocalPin::capture(&socket).await.ok().map(std::sync::Arc::new),
+                Err(_) => None,
+            }
+        };
+        let _ = self.pin.set(pin.clone());
+        pin
+    }
+
+    async fn resolve_local_socket(&self) -> anyhow::Result<PathBuf> {
+        let podman = Path::new(&self.bin).file_stem().and_then(|p| p.to_str()).is_some_and(|n| n == "podman");
+        if podman {
+            if let Some(host) = std::env::var("CONTAINER_HOST").ok().filter(|v| !v.is_empty()) { return local_endpoint(&host) }
+            if cfg!(target_os = "linux") && std::env::var_os("CONTAINER_CONNECTION").is_none() {
+                let rootless = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).map(|p| p.join("podman/podman.sock"));
+                if let Some(path) = rootless.filter(|p| p.exists()) { return Ok(path) }
+                let rootful = PathBuf::from("/run/podman/podman.sock");
+                anyhow::ensure!(rootful.exists(), "U03: local Podman has no API socket for the managed leg proxy; configure CONTAINER_HOST to its Unix API endpoint");
+                return Ok(rootful)
+            }
+            let out = crate::proc::output(self.command(&[s("system"), s("connection"), s("list"), s("--format=json")], &BTreeMap::new()), PROBE_WAIT).await?;
+            anyhow::ensure!(out.status.success(), "U03: cannot resolve the configured Podman API endpoint for the managed leg proxy");
+            let connections: serde_json::Value = serde_json::from_slice(&out.stdout)?;
+            let selected = std::env::var("CONTAINER_CONNECTION").ok();
+            let connection = connections.as_array().and_then(|a| a.iter().find(|c| selected.as_ref().map_or_else(|| c.get("Default").and_then(serde_json::Value::as_bool) == Some(true), |name| c.get("Name").and_then(serde_json::Value::as_str) == Some(name.as_str()))));
+            let uri = connection.and_then(|c| c.get("URI")).and_then(serde_json::Value::as_str).ok_or_else(|| anyhow::anyhow!("U03: Podman has no selected API endpoint for the managed leg proxy"))?;
+            return local_endpoint(uri)
+        }
+        if std::env::var_os("DOCKER_CONTEXT").is_none()
+            && let Some(host) = std::env::var("DOCKER_HOST").ok().filter(|v| !v.is_empty()) { return local_endpoint(&host) }
+        let out = crate::proc::output(self.command(&[s("context"), s("inspect"), s("--format"), s("{{.Endpoints.docker.Host}}")], &BTreeMap::new()), PROBE_WAIT).await?;
+        anyhow::ensure!(out.status.success(), "U03: cannot resolve the configured Docker context endpoint for the managed leg proxy");
+        local_endpoint(String::from_utf8_lossy(&out.stdout).trim())
+    }
+
+    pub(crate) fn execution_label(&self) -> Option<&str> { self.execution.as_deref() }
+
+    pub(crate) fn journal(&self) -> Option<daemon::Journal> { self.execution.as_deref().map(|label| daemon::Journal::execution_in(self.admission.clone(), label)) }
+
+    pub(crate) fn quiesce(&self) -> anyhow::Result<()> {
+        if let Some(journal) = self.journal() { journal.quiesce()?; }
+        Ok(())
     }
 
     /// Pulls go through kiln's mirrors at `host` for the registries it mirrors.
@@ -675,7 +861,9 @@ impl Cli {
     /// `image` saved and unpacked into `dir` as it streams (Docker's archive: `manifest.json`, the
     /// config and the layers, plain tar), never whole on disk. Blocking.
     pub fn save_into(&self, image: &str, dir: &Path) -> anyhow::Result<()> {
-        let mut child = self.command(&[s("save"), image.to_owned()], &BTreeMap::new()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn()?;
+        let mut command = self.command(&[s("save"), image.to_owned()], &BTreeMap::new());
+        command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        let mut child = super::processes::spawn_blocking(command)?;
         let out = child.stdout.take().ok_or_else(|| anyhow::anyhow!("{} save: no output", self.bin))?;
         let unpacked = tar::Archive::new(out).unpack(dir);
         let done = child.wait_with_output()?;
@@ -685,6 +873,11 @@ impl Cli {
 
     fn command(&self, args: &[String], env: &BTreeMap<String, String>) -> Command {
         let mut c = Command::new(&self.bin);
+        if let Some(socket) = &self.pinned_socket {
+            let podman = Path::new(&self.bin).file_stem().and_then(|p| p.to_str()) == Some("podman");
+            c.arg(if podman { "--url" } else { "--host" }).arg(format!("unix://{}", socket.display()));
+            c.env_remove(if podman { "CONTAINER_CONNECTION" } else { "DOCKER_CONTEXT" });
+        }
         c.args(args).envs(env).env("DOCKER_CONFIG", &self.config);
         c
     }
@@ -707,11 +900,79 @@ impl Cli {
 
     /// Runs the CLI: its standard output, or an error with its standard error.
     pub async fn run(&self, args: &[String], env: &BTreeMap<String, String>, timeout: Duration) -> anyhow::Result<String> {
-        let out = crate::proc::output(self.command(args, env), timeout).await?;
-        if !out.status.success() {
-            anyhow::bail!("{} {}: {}", self.bin, args.first().map(String::as_str).unwrap_or_default(), String::from_utf8_lossy(&out.stderr).trim());
+        // U03: these commands can leave new physical workloads. Probes, failed shell
+        // commands in an existing container, registry login and pulls cannot create one.
+        let creates = matches!(args.first().map(String::as_str), Some("create" | "run" | "build" | "start"))
+            || matches!((args.first().map(String::as_str), args.get(1).map(String::as_str)), (Some("network" | "volume"), Some("create")));
+        let operation_cli = creates.then(|| self.for_current_operation()).transpose()?;
+        let cli = operation_cli.as_ref().unwrap_or(self);
+        let _ownership = cli.ownership().await?;
+        let pin = if creates { cli.local_pin().await } else { None };
+        let operation = if !cli.reconciling && creates { cli.journal().map(|j| j.begin_with(pin.as_ref().map(|p| p.generation.clone()))).transpose()? } else { None };
+        let reply = if let Some(operation) = operation {
+            let mut pinned_cli = cli.clone();
+            if let Some(pin) = &pin { pinned_cli.pinned_socket = Some(pin.path.clone()); }
+            let command = pinned_cli.command(args, env);
+            let work = cli.config.parent().unwrap_or(&cli.config).join("_daemon_requests");
+            // Dropping the waiter detaches this task. Its independently contained CLI keeps
+            // draining, so normal cancellation does not permanently strand a pending marker.
+            let task = super::processes::within(None, || crate::rt::spawn(async move { let _pin = pin; daemon::drain(command, operation, work).await }));
+            crate::rt::timeout(timeout, task).await.map_err(|_| anyhow::anyhow!("U03: Docker caller timed out after {timeout:?}; its owned request continues draining and capacity stays fenced until completion"))?
+                .map_err(|_| anyhow::anyhow!("U03: Docker request owner stopped without drain proof; retained recovery intent"))??
+        } else {
+            let out = crate::proc::output(cli.command(args, env), timeout).await?;
+            daemon::Reply { success: out.status.success(), stdout: out.stdout, stderr: out.stderr }
+        };
+        if !reply.success {
+            anyhow::bail!("{} {}: {}", self.bin, args.first().map(String::as_str).unwrap_or_default(), String::from_utf8_lossy(&reply.stderr).trim());
         }
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        Ok(String::from_utf8_lossy(&reply.stdout).trim().to_owned())
+    }
+
+    /// U03: finish each mutating action request under its durable response owner before
+    /// exposing the ordinary, cancellable log watcher. The retained container supplies
+    /// its actual exit status and is removed by the existing execution-labelled sweep.
+    pub(crate) async fn prepare_action(&self, run_args: &[String], env: &BTreeMap<String, String>) -> anyhow::Result<Command> {
+        anyhow::ensure!(run_args.first().map(String::as_str) == Some("run") && run_args.get(1).map(String::as_str) == Some("--rm"), "U03: managed action requires generated run arguments");
+        let mut cli = self.for_current_operation()?;
+        let label = cli.execution_label().ok_or_else(|| anyhow::anyhow!("U03: managed action requires its execution journal"))?;
+        anyhow::ensure!(run_args.windows(2).any(|pair| pair.first().map(String::as_str) == Some("--label") && pair.get(1).map(String::as_str) == Some(label)), "U03: managed action arguments lack their exact operation label");
+        #[cfg(not(windows))]
+        let shell = crate::os::which("sh").ok_or_else(|| anyhow::anyhow!("U03: managed action log watcher requires the host's sh"))?;
+        #[cfg(windows)]
+        let shell = crate::os::which("pwsh").or_else(|| crate::os::which("powershell")).ok_or_else(|| anyhow::anyhow!("U03: managed action log watcher requires PowerShell"))?;
+        let endpoint = cli.local_socket().await?;
+        cli.pinned_socket = Some(endpoint.clone());
+        let mut create = vec![s("create")];
+        create.extend(run_args.iter().skip(2).cloned());
+        let container = cli.run(&create, env, CALL).await?;
+        anyhow::ensure!(!container.is_empty() && container.bytes().all(|b| b.is_ascii_hexdigit()), "U03: action create did not return a container identity; ownership remains fenced");
+        cli.run(&[s("start"), container.clone()], &BTreeMap::new(), CALL).await?;
+        #[cfg(not(windows))]
+        let script = r#"set -eu
+"$1" logs --follow "$2"
+code=$("$1" inspect --format '{{.State.ExitCode}}' "$2")
+case "$code" in ''|*[!0-9]*) exit 125;; esac
+exit "$code"
+"#;
+        let mut command = Command::new(shell);
+        #[cfg(not(windows))]
+        command.arg("-c").arg(script).arg("kiln-action-output").arg(&cli.bin).arg(&container);
+        #[cfg(windows)]
+        let watcher_args = crate::os::script_args(&command.get_program().to_string_lossy(), r#"
+& $env:KILN_ACTION_BINARY logs --follow $env:KILN_ACTION_CONTAINER
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+$code = & $env:KILN_ACTION_BINARY inspect --format '{{.State.ExitCode}}' $env:KILN_ACTION_CONTAINER
+if ($LASTEXITCODE -ne 0 -or "$code" -notmatch '^\d{1,3}$') { exit 125 }
+exit ([int]$code)
+"#);
+        #[cfg(windows)]
+        command.args(watcher_args).env("KILN_ACTION_BINARY", &cli.bin).env("KILN_ACTION_CONTAINER", &container);
+        command.env("DOCKER_CONFIG", &cli.config);
+        let podman = Path::new(&cli.bin).file_stem().and_then(|p| p.to_str()) == Some("podman");
+        command.env(if podman { "CONTAINER_HOST" } else { "DOCKER_HOST" }, format!("unix://{}", endpoint.display()));
+        command.env_remove(if podman { "CONTAINER_CONNECTION" } else { "DOCKER_CONTEXT" });
+        Ok(command)
     }
 
     /// The command for a step's process in a container (`docker exec`), its values by name.
@@ -728,6 +989,14 @@ impl Cli {
         a.push(prog.to_owned());
         a.extend(args.iter().cloned());
         self.command(&a, env)
+    }
+
+    /// U03: an explicit debug-child socket belongs inside the container environment;
+    /// the host CLI must still address the original daemon. Values remain passed by name.
+    pub(crate) fn with_exec_endpoint(&self, endpoint: &Path) -> Self {
+        let mut cli = self.clone();
+        cli.pinned_socket = Some(endpoint.to_owned());
+        cli
     }
 
     /// Sends `signal` (`INT`, `TERM`, `KILL`) to every process in `container` whose environment
@@ -993,6 +1262,7 @@ pub struct Containers {
     /// A contained leg's relay (W18-R08): the network its published port is on, and that port
     /// on the host's loopback.
     pub relay: Option<(String, u16)>,
+    ownership: Option<std::sync::Arc<super::processes::Group>>,
 }
 
 /// A leg whose network is contained (docs/ci.md W18-R08): the static kiln its relay runs, and the
@@ -1032,7 +1302,109 @@ fn s(x: &str) -> String {
     x.to_owned()
 }
 
+/// U03: one fixed workspace utility reserved under the original execution before its
+/// admission closes. It cannot reopen the journal or launch an arbitrary later command.
+pub(crate) struct WorkspaceCleanup {
+    prepared: Option<super::processes::PreparedCleanup>,
+    operation: Option<daemon::Operation>,
+    journal: daemon::Journal,
+    owner: std::sync::Arc<super::processes::Group>,
+    pin: Option<std::sync::Arc<daemon::LocalPin>>,
+    workspace: PathBuf,
+}
+
+impl WorkspaceCleanup {
+    pub(crate) async fn run(mut self) -> anyhow::Result<()> {
+        let prepared = self.prepared.take().ok_or_else(|| anyhow::anyhow!("U03: workspace cleanup was already consumed"))?;
+        let operation = self.operation.take().ok_or_else(|| anyhow::anyhow!("U03: workspace cleanup has no reserved daemon intent"))?;
+        let (journal, owner, pin, workspace) = (self.journal.clone(), self.owner.clone(), self.pin.clone(), self.workspace.clone());
+        // The response/intent owner survives cancellation of its waiter. PreparedCleanup
+        // executes in its precreated SAME-execution group and proves that group empty.
+        super::processes::within(None, || crate::rt::spawn(async move {
+            let (_owner, _pin) = (owner, pin);
+            journal.quiesce()?;
+            let mut announced = false;
+            loop {
+                match journal.drained_except_reserved(&operation) {
+                    Ok(_) => break,
+                    Err(e) if !announced => { announced = true; tracing::error!(error = %e, "U03: workspace cleanup retains the same allocation while earlier daemon requests drain"); },
+                    Err(_) => {},
+                }
+                crate::rt::sleep(Duration::from_millis(100)).await;
+            }
+            let output = prepared.run().await?;
+            anyhow::ensure!(output.status.success(), "U03: reserved workspace utility failed; retaining its daemon outcome evidence: {}", String::from_utf8_lossy(&output.stderr).trim());
+            operation.completed()?;
+            anyhow::ensure!(!workspace.try_exists()?, "U03: the workspace utility completed but {} still exists", workspace.display());
+            Ok::<_, anyhow::Error>(())
+        })).await.map_err(|_| anyhow::anyhow!("U03: workspace cleanup response owner stopped without proof; retaining recovery intent"))?
+    }
+}
+
+impl Drop for WorkspaceCleanup {
+    fn drop(&mut self) {
+        // No method can launch the fixed command without first taking both fields. This
+        // exact unused token is therefore concrete non-submission evidence, not absence.
+        if self.prepared.is_some() && let Some(operation) = self.operation.take() && let Err(e) = operation.not_submitted() {
+            tracing::error!(error = %e, "U03: unused workspace reservation retains its evidence after retirement failed");
+        }
+    }
+}
+
+impl Cli {
+    /// Run off-shard while the original execution still accepts work. The shell's parameters
+    /// are fixed data; all cleanup CLI children share the one preowned kernel capability.
+    pub(crate) fn prepare_workspace_cleanup(&self, ws: &Path) -> anyhow::Result<WorkspaceCleanup> {
+        let execution = super::processes::current().ok_or_else(|| anyhow::anyhow!("U03: workspace cleanup requires the existing execution lease"))?;
+        anyhow::ensure!(&self.admission == execution.admission() && self.execution_label() == Some(execution.label().as_str()), "U03: workspace cleanup cannot change execution ownership");
+        let socket = self.pinned_socket.clone().or_else(|| self.socket.get().and_then(|s| s.as_ref().ok().cloned())).ok_or_else(|| anyhow::anyhow!("U03: prepare the managed socket before reserving workspace cleanup"))?;
+        let pin = self.pin.get().cloned().flatten();
+        let owner = execution.docker(Ownership { bin: self.bin.clone(), config: self.config.clone(), labels: vec![execution.label()], socket: Some(socket.clone()), daemon_id: pin.as_ref().map(|p| p.generation.daemon_id().to_owned()) })?;
+        anyhow::ensure!(ws.is_absolute() && !ws.components().any(|c| matches!(c, std::path::Component::ParentDir)), "U03: workspace cleanup requires its fixed absolute workspace path");
+        let parent = ws.parent().ok_or_else(|| anyhow::anyhow!("U03: workspace cleanup has no parent directory"))?;
+        let name = ws.file_name().ok_or_else(|| anyhow::anyhow!("U03: workspace cleanup cannot remove a filesystem root"))?;
+        let journal = self.journal().ok_or_else(|| anyhow::anyhow!("U03: workspace cleanup lacks its original daemon journal"))?;
+        let script = r#"set -eu
+ids=$("$1" ps -aq --filter "label=$2")
+for id in $ids; do "$1" rm --force --volumes "$id"; done
+exec "$1" run --rm --network none --label "$2" --label "$3" --label "$8" -v "$5:/w" "$7" rm -rf -- "/w/$6"
+"#;
+        let mut command = Command::new(crate::os::which("sh").ok_or_else(|| anyhow::anyhow!("U03: the reserved workspace utility requires the host's sh"))?);
+        command.arg("-c").arg(script).arg("kiln-workspace-cleanup").arg(&self.bin).arg(execution.label()).arg("kiln.cleanup=workspace").arg("kiln.cleanup=workspace").arg(parent).arg(name).arg("alpine:3").arg(self.owner().unwrap_or("kiln.cleanup=workspace"));
+        command.env("DOCKER_CONFIG", &self.config);
+        let endpoint = pin.as_ref().map_or(socket.as_path(), |p| p.path.as_path());
+        let podman = Path::new(&self.bin).file_stem().and_then(|p| p.to_str()) == Some("podman");
+        command.env(if podman { "CONTAINER_HOST" } else { "DOCKER_HOST" }, format!("unix://{}", endpoint.display()));
+        command.env_remove(if podman { "CONTAINER_CONNECTION" } else { "DOCKER_CONTEXT" });
+        let operation = journal.reserve_workspace(ws.to_owned(), pin.as_ref().map(|p| p.generation.clone()))?;
+        let prepared = match execution.prepare_cleanup(command) {
+            Ok(prepared) => prepared,
+            Err(e) => { operation.not_submitted()?; return Err(e) }
+        };
+        Ok(WorkspaceCleanup { prepared: Some(prepared), operation: Some(operation), journal, owner, pin, workspace: ws.to_owned() })
+    }
+
+}
+
+/// W05-R03: the existing assignment's native Docker limits, without a new allocation.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ResourceLimits {
+    pub cpuset: Option<String>,
+    pub memory: Option<u64>,
+}
+
+impl ResourceLimits {
+    fn append_args(&self, args: &mut Vec<String>) {
+        if let Some(cpus) = &self.cpuset { args.extend([s("--cpuset-cpus"), cpus.clone()]); }
+        if let Some(bytes) = self.memory { args.extend([s("--memory"), bytes.to_string(), s("--memory-swap"), bytes.to_string()]); }
+    }
+}
+
 impl Containers {
+    pub(crate) fn prepare_workspace_cleanup(&self, ws: &Path) -> anyhow::Result<WorkspaceCleanup> {
+        self.cli.prepare_workspace_cleanup(ws)
+    }
+
     /// Each container's image as named and its content-addressed id, by role (`job`,
     /// `service <key>`), for comparing runs (docs/ci.md W19-R03).
     pub async fn images(&self) -> Vec<(String, String, String)> {
@@ -1053,6 +1425,8 @@ impl Containers {
     /// `say` reports progress for the leg's "Initialize containers" log.
     #[allow(clippy::too_many_arguments)]
     pub async fn start(cli: Cli, leg: &str, map: PathMap, workdir: &str, job: Option<Spec>, services: Vec<(String, Spec)>, egress: Option<&EgressSpec>, say: &(dyn Fn(String) + Sync)) -> anyhow::Result<Containers> {
+        let cli = cli.for_current_operation()?;
+        let ownership = cli.ownership().await?;
         // The whole leg id (ids made in the same instant share their start) and a suffix of this
         // start's own, so a retry never meets what an earlier attempt left.
         let start = crate::util::new_id();
@@ -1074,7 +1448,7 @@ impl Containers {
             create.push(network.clone());
             cli.run(&create, &none, CALL).await?;
         }
-        let mut c = Containers { cli, network, label, job: None, services: Vec::new(), relay: None };
+        let mut c = Containers { cli, network, label, job: None, services: Vec::new(), relay: None, ownership };
         // What a start that fails partway made goes with it: half a leg's containers and its
         // network would stay otherwise, the network holding one of the engine's few address pools.
         let filled = async {
@@ -1116,11 +1490,9 @@ impl Containers {
                 for v in &spec.volumes {
                     args.extend([s("-v"), v.clone()]);
                 }
-                // The leg's CPUs, which a hosted runner's services share with its job (W05-R03).
-                if let Some(cpus) = &spec.cpuset {
-                    args.extend([s("--cpuset-cpus"), cpus.clone()]);
-                }
                 args.extend(spec.options.as_deref().map(split_options).unwrap_or_default());
+                // W05-R03: assigned limits follow user options so options cannot lift them.
+                ResourceLimits { cpuset: spec.cpuset.clone(), memory: None }.append_args(&mut args);
                 args.push(image);
                 let id = c.cli.run(&args, &env, CALL).await?;
                 c.cli.run(&[s("start"), id.clone()], &none, CALL).await?;
@@ -1150,12 +1522,16 @@ impl Containers {
                         args.extend([s("--add-host"), format!("{}:127.0.0.1", svc.key)]);
                     }
                 }
-                if spec.docker_socket && Path::new("/var/run/docker.sock").exists() {
-                    let socket = spec.docker_proxy.as_ref().map_or_else(|| s("/var/run/docker.sock"), |p| p.to_string_lossy().into_owned());
-                    args.extend([s("-v"), format!("{socket}:/var/run/docker.sock")]);
+                if spec.docker_socket {
+                    let socket = match &spec.docker_proxy {
+                        Some(proxy) => proxy.clone(),
+                        None => c.cli.local_socket().await?,
+                    };
+                    anyhow::ensure!(socket.exists(), "U03: the selected Docker socket is unavailable; refusing a raw-daemon fallback for managed socket access");
+                    args.extend([s("-v"), format!("{}:/var/run/docker.sock", socket.display())]);
                     // The runner user reaches it through the socket's group, as the host's user does.
                     if user.is_some()
-                        && let Some(gid) = socket_group()
+                        && let Some(gid) = socket_group(&socket)
                     {
                         args.extend([s("--group-add"), gid.to_string()]);
                     }
@@ -1172,12 +1548,6 @@ impl Containers {
                 if let Some(bytes) = spec.workspace_size {
                     args.extend([s("--mount"), format!("type=tmpfs,destination={workdir},tmpfs-size={bytes},tmpfs-mode=1777")]);
                 }
-                if let Some(bytes) = spec.memory {
-                    args.extend([s("--memory"), bytes.to_string(), s("--memory-swap"), bytes.to_string()]);
-                }
-                if let Some(cpus) = &spec.cpuset {
-                    args.extend([s("--cpuset-cpus"), cpus.clone()]);
-                }
                 if !shared {
                     for p in &spec.ports {
                         args.extend([s("-p"), p.clone()]);
@@ -1191,6 +1561,8 @@ impl Containers {
                     args.extend([s("-v"), v.clone()]);
                 }
                 args.extend(spec.options.as_deref().map(split_options).unwrap_or_default());
+                // W05-R03: user options cannot override the existing assigned grant.
+                ResourceLimits { cpuset: spec.cpuset.clone(), memory: spec.memory }.append_args(&mut args);
                 args.extend([s("--entrypoint"), s("tail"), image.clone(), s("-f"), s("/dev/null")]);
                 let id = c.cli.run(&args, &env, CALL).await?;
                 c.cli.run(&[s("start"), id.clone()], &none, CALL).await?;
@@ -1370,12 +1742,7 @@ impl Containers {
     pub async fn hold(&self, cpus: Option<&str>, memory: Option<u64>) -> anyhow::Result<()> {
         let Some(job) = &self.job else { return Ok(()) };
         let mut args = vec![s("update")];
-        if let Some(c) = cpus {
-            args.extend([s("--cpuset-cpus"), c.to_owned()]);
-        }
-        if let Some(bytes) = memory {
-            args.extend([s("--memory"), bytes.to_string(), s("--memory-swap"), bytes.to_string()]);
-        }
+        ResourceLimits { cpuset: cpus.map(str::to_owned), memory }.append_args(&mut args);
         if args.len() > 1 {
             args.push(job.id.clone());
             self.cli.run(&args, &BTreeMap::new(), CALL).await?;
@@ -1386,10 +1753,46 @@ impl Containers {
     /// Removes the leg's containers and networks (the relay's among them, all labelled the leg's)
     /// and what the leg made through its own socket ([`super::docker_sock`]), as the end of a
     /// machine of its own would.
-    pub async fn stop(&self) {
-        let made = super::docker_sock::leg_label(self.label.strip_prefix("kiln.leg=").unwrap_or(&self.label));
-        remove_labelled(&self.cli, &[self.label.clone(), made], CALL).await;
+    pub(crate) fn quiesce(&self) -> anyhow::Result<()> {
+        if let Some(execution) = super::processes::current().filter(|e| e.operation_identity().is_some()) {
+            anyhow::ensure!(self.cli.execution_label() == Some(execution.label().as_str()), "U03: a debug child cannot stop its retained root container; retire only child-owned resources");
+        }
+        if let Some(execution) = super::processes::current()
+            && self.cli.execution_label() == Some(execution.label().as_str()) {
+            execution.fence();
+        }
+        self.cli.quiesce()
     }
+
+    pub async fn stop(&self) {
+        // U03: close socket/CLI submission admission before either daemon or kernel
+        // retirement starts. A failed durable close cannot become stopped evidence.
+        loop {
+            match self.quiesce() {
+                Ok(()) => break,
+                Err(e) => tracing::error!(error = %e, "U03: Docker cleanup cannot quiesce; retaining execution capacity and recovery intent"),
+            }
+            crate::rt::sleep(Duration::from_secs(1)).await;
+        }
+        if let Some(ownership) = &self.ownership { ownership.stop().await; return }
+        // Pool executors created before assignment have no job scope. They still cannot be
+        // returned to the pool while their engine cannot prove their workloads gone.
+        loop {
+            if self.stop_proven().await.is_ok() { return }
+            crate::rt::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    pub(crate) async fn stop_proven(&self) -> anyhow::Result<()> {
+        self.cli.quiesce()?;
+        let drained_before_removal = self.cli.journal().map(|j| j.drained()).transpose();
+        let made = super::docker_sock::leg_label(self.label.strip_prefix("kiln.leg=").unwrap_or(&self.label));
+        remove_labelled(&self.cli, &[self.label.clone(), made], CALL).await?;
+        let _proof = drained_before_removal?;
+        Ok(())
+    }
+
+    pub(crate) fn retain(&self) { if let Some(ownership) = &self.ownership { ownership.retain(); } }
 }
 
 /// Lines of `docker port`: `5432/tcp -> 0.0.0.0:49153` → `5432` → `49153` (the first host port).
@@ -1426,8 +1829,9 @@ pub async fn action_image(cli: &Cli, dir: &Path, image: &str, tag: &str, say: &(
 /// `docker run` for a Docker action's step, with GitHub's mounts: its arguments (the values
 /// come by name from `env`).
 #[allow(clippy::too_many_arguments)]
-pub fn action_run_args(
+pub(crate) fn action_run_args(
     name: &str,
+    limits: &ResourceLimits,
     labels: &[String],
     user: Option<&str>,
     network: Option<&str>,
@@ -1454,9 +1858,8 @@ pub fn action_run_args(
     } else if host_network() {
         a.extend([s("--network"), s("host")]);
     }
-    if Path::new("/var/run/docker.sock").exists() {
-        a.extend([s("-v"), s("/var/run/docker.sock:/var/run/docker.sock")]);
-    }
+    // U03: the caller supplies the managed proxy through its translated mounts. Never
+    // expose the raw host socket as a fallback around the execution's mutation journal.
     for m in mounts {
         a.extend([s("-v"), m.clone()]);
     }
@@ -1466,6 +1869,7 @@ pub fn action_run_args(
     if let Some(e) = entrypoint.filter(|e| !e.is_empty()) {
         a.extend([s("--entrypoint"), e.to_owned()]);
     }
+    limits.append_args(&mut a);
     a.push(image.to_owned());
     a.extend(args.iter().cloned());
     a
@@ -1474,6 +1878,16 @@ pub fn action_run_args(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn u03_proxy_endpoint_preserves_configured_unix_daemon_and_refuses_other_transports() -> anyhow::Result<()> {
+        assert_eq!(local_endpoint("unix:///run/user/1000/podman/podman.sock")?, PathBuf::from("/run/user/1000/podman/podman.sock"));
+        for endpoint in ["tcp://127.0.0.1:2375", "ssh://runner/run/podman.sock", "npipe:////./pipe/docker_engine", "unix://relative.sock"] {
+            assert!(local_endpoint(endpoint).is_err(), "unsupported transports cannot silently select a different daemon");
+        }
+        Ok(())
+    }
 
     /// A probe the engine hasn't answered in time is `false` for now, not for good: the one under
     /// way is waited for next time (not another started), and its answer is kept.
@@ -1876,6 +2290,14 @@ mod tests {
         assert_eq!(split_options("--cpus 1 -e 'A=b c'"), vec!["--cpus", "1", "-e", "A=b c"]);
         assert_eq!(split_options("--x ''"), vec!["--x", ""]);
         assert!(split_options("  ").is_empty());
+        // W05-R03: canonical assigned limits win after user options, before the image.
+        let limits = ResourceLimits { cpuset: Some("2,4".into()), memory: Some(268435456) };
+        let mut argv = split_options("--cpuset-cpus 0-99 --memory 999999999 --memory-swap -1");
+        limits.append_args(&mut argv);
+        argv.push("fixture-image".into());
+        assert_eq!(argv.iter().skip(6).map(String::as_str).collect::<Vec<_>>(), ["--cpuset-cpus", "2,4", "--memory", "268435456", "--memory-swap", "268435456", "fixture-image"]);
+        let action = action_run_args("fixture-action", &limits, &[], None, Some("fixture-net"), &[], None, &BTreeMap::new(), None, "fixture-image", &["--memory".into(), "application-argument".into()]);
+        assert_eq!(action.iter().rev().take(9).rev().map(String::as_str).collect::<Vec<_>>(), ["--cpuset-cpus", "2,4", "--memory", "268435456", "--memory-swap", "268435456", "fixture-image", "--memory", "application-argument"]);
     }
 
     #[test]

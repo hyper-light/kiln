@@ -61,7 +61,7 @@ fn w24_ac08_go_builds_twice_the_second_from_the_cache() -> anyhow::Result<()> {
         ],
     )?;
     kiln::rt::block_on(async move {
-        let svc = Service::open(&root.join("runner"))?;
+        let svc = Service::open_with_store(&root.join("runner"), kiln::store::Store::in_memory()?, "cache-tools")?;
         let at = svc.listen_tcp(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
         let token = svc.mint(&access("acme/app"))?;
         let r = root.clone();
@@ -152,7 +152,7 @@ fn w24_ac08_turborepo_builds_twice_the_second_from_the_cache() -> anyhow::Result
     git(&["add", "-A"])?;
     git(&["commit", "-qm", "fixture"])?;
     kiln::rt::block_on(async move {
-        let svc = Service::open(&root.join("runner"))?;
+        let svc = Service::open_with_store(&root.join("runner"), kiln::store::Store::in_memory()?, "cache-tools")?;
         let at = svc.listen_tcp(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
         let token = svc.mint(&access("acme/app"))?;
         let (first, second, out1, out2) = on_thread(move || -> anyhow::Result<(String, String, String, String)> {

@@ -6,6 +6,7 @@
 
 use std::io;
 use std::os::fd::{AsRawFd as _, OwnedFd};
+use std::os::unix::process::CommandExt as _;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::time::Duration;
 
@@ -123,29 +124,58 @@ async fn kill_and_reap(child: &mut Child) {
     let _ = crate::rt::timeout(Duration::from_secs(10), wait_child(child)).await;
 }
 
+/// U03: cancelling the future that captures a command must not detach its child. Reaping runs
+/// independently because Drop cannot wait; the kill happens before the caller releases capacity.
+struct CapturedChild(Option<Child>);
+
+impl Drop for CapturedChild {
+    fn drop(&mut self) {
+        let Some(mut child) = self.0.take() else { return };
+        if let Ok(pid) = i32::try_from(child.id()) {
+            let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
+        }
+        let _ = child.kill();
+        crate::rt::spawn(async move {
+            let _ = crate::rt::timeout(Duration::from_secs(10), wait_child(&mut child)).await;
+        });
+    }
+}
+
 /// Run to completion and capture stdout/stderr, killing the child if it outlives `timeout`.
 pub async fn output(mut cmd: Command, timeout: Duration) -> anyhow::Result<Output> {
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd.spawn().with_context(|| format!("spawn {:?}", cmd.get_program()))?;
+    if let Some(execution) = crate::runner::processes::current() {
+        return crate::runner::processes::output(cmd, timeout, execution).await;
+    }
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
+    let mut kept = CapturedChild(Some(cmd.spawn().with_context(|| format!("spawn {:?}", cmd.get_program()))?));
+    let child = kept.0.as_mut().context("the captured command has no child")?;
     let out = child.stdout.take().map(OwnedFd::from);
     let err = child.stderr.take().map(OwnedFd::from);
     let collected = crate::rt::timeout(timeout, async {
-        let (stdout, stderr, status) = futures::join!(read_to_end(out), read_to_end(err), wait_child(&mut child));
+        let (stdout, stderr, status) = futures::join!(read_to_end(out), read_to_end(err), wait_child(child));
         Ok::<_, io::Error>(Output { status: status?, stdout: stdout?, stderr: stderr? })
     })
     .await;
-    match collected {
-        Ok(r) => Ok(r?),
+    let result = match collected {
+        Ok(r) => r.map_err(anyhow::Error::from),
         Err(_) => {
-            kill_and_reap(&mut child).await;
-            anyhow::bail!("timed out after {timeout:?}")
+            if let Ok(pid) = i32::try_from(child.id()) {
+                let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
+            }
+            kill_and_reap(child).await;
+            Err(anyhow::anyhow!("timed out after {timeout:?}"))
         }
-    }
+    };
+    let _ = kept.0.take();
+    result
 }
 
 /// Stream a child's stdout (stderr discarded). The stream ends at EOF; if the consumer goes away
 /// first, the child is killed. The child is reaped either way.
 pub fn stdout_stream(mut cmd: Command) -> anyhow::Result<async_channel::Receiver<Bytes>> {
+    if let Some(execution) = crate::runner::processes::current() {
+        return crate::runner::processes::stdout_stream(cmd, &execution);
+    }
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = cmd.spawn().with_context(|| format!("spawn {:?}", cmd.get_program()))?;
     let out = OwnedFd::from(child.stdout.take().context("no stdout pipe")?);
@@ -177,11 +207,13 @@ pub struct Running {
     pub output: async_channel::Receiver<Vec<u8>>,
     /// Resolves with the exit code (`None`: killed by a signal) once the child is reaped.
     pub exit: oneshot::Receiver<Option<i32>>,
+    pub(crate) owned: Option<std::sync::Arc<crate::runner::processes::Group>>,
 }
 
 impl Running {
     /// Kill whatever is left in the child's process group (best effort).
     pub fn kill_group(&self) {
+        if let Some(group) = &self.owned { group.kill(); return }
         kill_group(self.pgid);
     }
 
@@ -193,6 +225,9 @@ impl Running {
 
 /// Spawn `cmd` in a new process group with piped output.
 pub fn spawn_group(mut cmd: Command) -> anyhow::Result<Running> {
+    if let Some(execution) = crate::runner::processes::current() {
+        return crate::runner::processes::spawn_group(cmd, &execution);
+    }
     use std::os::unix::process::CommandExt as _;
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
     let mut child = cmd.spawn().with_context(|| format!("spawn {:?}", cmd.get_program()))?;
@@ -220,7 +255,18 @@ pub fn spawn_group(mut cmd: Command) -> anyhow::Result<Running> {
         let code = wait_child(&mut child).await.ok().and_then(|s| s.code());
         let _ = exit_tx.send(code);
     });
-    Ok(Running { pgid, output: rx, exit: exit_rx })
+    Ok(Running { pgid, output: rx, exit: exit_rx, owned: None })
+}
+
+pub(crate) fn from_contained(duplex: Duplex, owned: std::sync::Arc<crate::runner::processes::Group>) -> Running {
+    duplex.stdin.close();
+    let (tx, rx) = async_channel::bounded(64);
+    for source in [duplex.stdout, duplex.stderr] {
+        let tx = tx.clone();
+        crate::rt::spawn(async move { while let Ok(chunk) = source.recv().await { if tx.send(chunk).await.is_err() { return } } });
+    }
+    drop(tx);
+    Running { pgid: i32::try_from(duplex.pid).unwrap_or(0), output: rx, exit: duplex.exit, owned: Some(owned) }
 }
 
 /// SIGTERM the group, give it `grace`, then SIGKILL whatever is left.
@@ -233,6 +279,7 @@ pub async fn terminate_group(running: &mut Running, grace: Duration) {
     if crate::rt::timeout(grace, running.wait()).await.is_err() {
         let _ = killpg(group, Signal::SIGKILL);
     }
+    if let Some(owned) = &running.owned { owned.stop().await; }
 }
 
 /// GitHub's cancel (docs/ci.md W05-R18): SIGINT to the group, SIGTERM after `int_grace`, SIGKILL
@@ -243,13 +290,13 @@ pub async fn interrupt_group(running: &mut Running, int_grace: Duration, term_gr
     }
     let group = Pid::from_raw(running.pgid);
     let _ = killpg(group, Signal::SIGINT);
-    if crate::rt::timeout(int_grace, running.wait()).await.is_ok() {
-        return;
+    if crate::rt::timeout(int_grace, running.wait()).await.is_err() {
+        let _ = killpg(group, Signal::SIGTERM);
+        if crate::rt::timeout(term_grace, running.wait()).await.is_err() {
+            let _ = killpg(group, Signal::SIGKILL);
+        }
     }
-    let _ = killpg(group, Signal::SIGTERM);
-    if crate::rt::timeout(term_grace, running.wait()).await.is_err() {
-        let _ = killpg(group, Signal::SIGKILL);
-    }
+    if let Some(owned) = &running.owned { owned.stop().await; }
 }
 
 /// Kill a whole process group immediately (best effort).
@@ -277,7 +324,19 @@ pub fn kill_orphan_group(pgid: i32, marker: &str) -> bool {
     if pgid <= 0 {
         return false;
     }
-    leader_has_env(pgid, marker) && killpg(Pid::from_raw(pgid), Signal::SIGKILL).is_ok()
+    let group = Pid::from_raw(pgid);
+    if killpg(group, None).is_err() { return false }
+    let owned = leader_has_env(pgid, marker) || {
+        // A step's shell may have exited while a background server in its group remains. The
+        // group is still owned only when a live member carries the original job marker.
+        use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+        let mut system = System::new();
+        system.refresh_processes_specifics(ProcessesToUpdate::All, false, ProcessRefreshKind::nothing());
+        system.processes().keys().any(|pid| i32::try_from(pid.as_u32()).is_ok_and(|pid| {
+            nix::unistd::getpgid(Some(Pid::from_raw(pid))).is_ok_and(|g| g == group) && leader_has_env(pid, marker)
+        }))
+    };
+    owned && killpg(group, Signal::SIGKILL).is_ok()
 }
 
 #[cfg(target_os = "linux")]
@@ -351,6 +410,13 @@ impl Detached {
 }
 
 impl Duplex {
+    /// Best-effort local cleanup inside a separately owned physical executor. This never
+    /// certifies that its containing VM or pod stopped.
+    pub(crate) fn group_killer(&self) -> std::sync::Arc<dyn Fn() + Send + Sync> {
+        let pid = i32::try_from(self.pid).unwrap_or(0);
+        std::sync::Arc::new(move || kill_group(pid))
+    }
+
     /// Let go of the process without stopping it, for this process's next image to take over
     /// ([`adopt_duplex`]): nothing more is read from its pipes (what was read is still in `stdout`
     /// and `stderr`, to drain), everything sent to its stdin is written, and its pipes' descriptors
@@ -397,7 +463,14 @@ impl Duplex {
 }
 
 /// Spawn `cmd` with piped stdin/stdout/stderr in a new process group.
-pub fn spawn_duplex(mut cmd: Command) -> anyhow::Result<Duplex> {
+pub fn spawn_duplex(cmd: Command) -> anyhow::Result<Duplex> {
+    if let Some(execution) = crate::runner::processes::current() {
+        return crate::runner::processes::spawn_duplex(cmd, &execution);
+    }
+    spawn_duplex_raw(cmd)
+}
+
+pub(crate) fn spawn_duplex_raw(mut cmd: Command) -> anyhow::Result<Duplex> {
     use std::os::unix::process::CommandExt as _;
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
     let mut child = cmd.spawn().with_context(|| format!("spawn {:?}", cmd.get_program()))?;
@@ -495,7 +568,7 @@ fn started_at(pid: u32) -> Option<u64> {
 }
 
 /// Serve a harness process's pipes: a reader for stdout and one for stderr, a writer for stdin.
-fn pump(pid: u32, input: OwnedFd, out: OwnedFd, err: OwnedFd, exit: oneshot::Receiver<Option<i32>>, foreign: bool) -> anyhow::Result<Duplex> {
+pub(crate) fn pump(pid: u32, input: OwnedFd, out: OwnedFd, err: OwnedFd, exit: oneshot::Receiver<Option<i32>>, foreign: bool) -> anyhow::Result<Duplex> {
     for fd in [&input, &out, &err] {
         nonblocking(fd)?;
     }
@@ -558,6 +631,36 @@ fn pump(pid: u32, input: OwnedFd, out: OwnedFd, err: OwnedFd, exit: oneshot::Rec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// U03: cancellation of the caller's future kills the captured process tree, including a
+    /// descendant still holding the pipes after its parent stops being awaited.
+    #[test]
+    fn u03_dropping_captured_output_stops_its_process_tree() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let marker = dir.path().join("orphan-ran");
+            let ready = dir.path().join("descendant-ready");
+            let release = dir.path().join("release-descendant");
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", "(printf ready > \"$1\"; while test ! -f \"$2\"; do sleep 0.01; done; printf orphan > \"$3\") & wait", "sh"]).arg(&ready).arg(&release).arg(&marker);
+            let mut capture = Box::pin(output(cmd, Duration::from_secs(30)));
+            // Observe an actual descendant before cancelling. A finite sleeping child can
+            // finish before an output-biased timeout is polled again on a busy shard.
+            use futures::FutureExt as _;
+            futures::select_biased! {
+                result = capture.as_mut().fuse() => anyhow::bail!("the fixture ended before its descendant was ready: {result:?}"),
+                result = crate::rt::timeout(Duration::from_secs(5), async {
+                    while !ready.exists() { crate::rt::sleep(Duration::from_millis(10)).await; }
+                }).fuse() => result?,
+            }
+            assert!(crate::rt::timeout(Duration::from_millis(100), capture.as_mut()).await.is_err());
+            drop(capture);
+            std::fs::write(release, b"go")?;
+            crate::rt::sleep(Duration::from_millis(650)).await;
+            assert!(!marker.exists(), "a dropped capture must stop its descendants before capacity is released");
+            Ok(())
+        })
+    }
 
     #[test]
     fn let_go_of_with_its_stdout_taken_a_process_is_read_to_the_end() -> anyhow::Result<()> {

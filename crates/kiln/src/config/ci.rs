@@ -1,21 +1,50 @@
 //! `[ci]`: CI settings (docs/ci.md). Each workstream adds its own section here as a field of
-//! [`Ci`] with its own struct below, every field defaulted, so a config without `[ci]` keeps
-//! today's behaviour.
+//! [`Ci`] with its own struct below, every field defaulted. The workflow engine handles CI for
+//! both dialects; optional policies remain off until declared.
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+// U19: engine selection and ingress opt-in are separate. Old configurations opted into
+// GitHub workflows with `enabled = true`; absent [ci] used only declared .kiln workflows.
+// Keep one field list so accepting a setting, its defaults and serialization cannot drift.
+macro_rules! ci_config {
+    ($(#[$outer:meta])* pub struct Ci { $($(#[$attr:meta])* pub $field:ident: $ty:ty,)* }) => {
+        $(#[$outer])*
+        #[derive(Debug, Clone, Serialize)]
+        pub struct Ci { $($(#[$attr])* pub $field: $ty,)* }
+        #[derive(Deserialize)]
+        #[serde(default, deny_unknown_fields)]
+        struct CiInput { $($(#[$attr])* pub $field: $ty,)* }
+        impl Default for CiInput {
+            fn default() -> Self { let d = Ci::default(); Self { $($field: d.$field,)* } }
+        }
+        impl<'de> Deserialize<'de> for Ci {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let mut value = serde_json::Value::deserialize(deserializer)?;
+                if let Some(fields) = value.as_object_mut() && !fields.contains_key("github_workflows") {
+                    let explicitly_enabled = fields.get("enabled").and_then(serde_json::Value::as_bool) == Some(true);
+                    fields.insert("github_workflows".into(), serde_json::Value::String(if explicitly_enabled { "auto" } else { "off" }.into()));
+                }
+                let wire: CiInput = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+                Ok(Self { $($field: wire.$field,)* })
+            }
+        }
+    };
+}
+
+ci_config! {
 pub struct Ci {
-    /// The CI engine runs GitHub workflows (docs/ci.md M1). Off until the engine is complete;
-    /// `.kiln/` pipelines keep running on v1 either way.
+    /// The workflow engine (U01, docs/ci.md W02-R06): both dialects run here. False disables CI;
+    /// it never selects another scheduler.
+    /// Before unification, explicit `enabled = false` only disabled the newer engine. Set true
+    /// to continue `.kiln` automation on upgrade. Disabled ingress preserves pending Git refs.
     pub enabled: bool,
     /// Whether `.github/workflows` run (docs/ci.md W02-R02): `auto` (when a commit has no
-    /// `.kiln/` workflow), `on` or `off`. Repositories will be able to override it.
+    /// `.kiln/` workflow), `on` or `off`. Defaults off unless explicitly enabled, preserving
+    /// existing automation opt-in when the shared workflow engine becomes the default.
     pub github_workflows: kiln_ci::wf::GithubWorkflows,
-    /// Run `.kiln/` workflows on the CI engine too (docs/ci.md W02-R06): the kiln dialect, with
-    /// its typed outputs, exports, implicit checkout and the rest. v1 then runs nothing for a
-    /// commit the engine took. Off by default: `.kiln/` pipelines stay on v1 until it's on.
+    /// Accepted for existing configurations (U01). Both dialects use the workflow engine
+    /// regardless of this former migration switch.
     pub kiln_workflows: bool,
     /// Route GitHub's hosted labels (`ubuntu-latest`, `macos-latest`, …) by OS and architecture
     /// (docs/ci.md W05-R21). Off by default: then such a label must be on a runner, as it must for
@@ -61,6 +90,8 @@ pub struct Ci {
     /// `[ci.work]`: the work ledger's quotas (docs/ci.md W24-R15, R21, AC12).
     pub work: Work,
     pub artifacts: Artifacts,
+    /// U09/U15: out-of-band master provisioning and trusted identity for the shared service.
+    pub secrets: Secrets,
     pub oidc: Oidc,
     pub actions: Actions,
     /// `[[ci.notify]]`: the server's notification rules (docs/ci.md W19-R06), before each
@@ -161,6 +192,53 @@ pub struct Ci {
     /// whatever names for runners its `runs-on` uses. Not a setting.
     #[serde(skip)]
     pub local: bool,
+}
+
+}
+
+impl Default for Ci {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            github_workflows: kiln_ci::wf::GithubWorkflows::Off,
+            kiln_workflows: true,
+            github_labels: false,
+            routing: Vec::new(),
+            pools: Vec::new(),
+            reservations: Vec::new(),
+            cache: Default::default(),
+            work: Default::default(),
+            artifacts: Default::default(),
+            secrets: Default::default(),
+            oidc: Default::default(),
+            actions: Default::default(),
+            notify: Vec::new(),
+            scheduler: Default::default(),
+            fairness: Default::default(),
+            insights: Default::default(),
+            untrusted: Default::default(),
+            allow_private_targets: Vec::new(),
+            github: Default::default(),
+            gitlab: Vec::new(),
+            bitbucket: None,
+            registry: Default::default(),
+            advisories: Default::default(),
+            attest: Default::default(),
+            land_signing: None,
+            local: false,
+        }
+    }
+}
+
+/// `[ci.secrets]`: the bootstrap key stays outside Amphora; only its verifier is canonical.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Secrets {
+    /// Existing 32-byte master, default `<data>/secrets/master.key`.
+    pub master_key_file: Option<std::path::PathBuf>,
+    /// U09/U15: lowercase SHA256 from the trusted original master, provisioned independently.
+    /// Required for replicated Hubs and initial binding of legacy protected state.
+    pub trusted_master_sha256: Option<String>,
 }
 
 /// `[ci.advisories]`'s settings.
@@ -760,6 +838,21 @@ pub struct Oidc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn u19_new_engine_preserves_github_workflow_opt_in() -> anyhow::Result<()> {
+        use kiln_ci::wf::GithubWorkflows::{Auto, Off, On};
+        for (text, enabled, github) in [("", true, Off), ("enabled = true", true, Auto), ("enabled = false", false, Off), ("github_workflows = 'auto'", true, Auto), ("github_workflows = 'on'", true, On), ("enabled = true\ngithub_workflows = 'off'", true, Off)] {
+            let ci: Ci = toml::from_str(text)?;
+            assert_eq!((ci.enabled, ci.github_workflows), (enabled, github), "{text}");
+            assert!(ci.kiln_workflows, "declared kiln workflows stay on the one engine");
+        }
+        assert_eq!(Ci::default().github_workflows, Off);
+        assert!(toml::from_str::<Ci>("unrecognized = true").is_err());
+        let round_trip: Ci = toml::from_str(&toml::to_string(&Ci::default())?)?;
+        assert_eq!(round_trip.github_workflows, Off, "saved engine default does not opt into GitHub workflows");
+        Ok(())
+    }
 
     /// W24-R19: `[ci.scheduler.admission]` as the scheduler takes it, its values checked, and the
     /// I/O weights admission scales by held to the `Sandbox` seam's.

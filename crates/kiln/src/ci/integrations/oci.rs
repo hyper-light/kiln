@@ -32,6 +32,9 @@ const DOCKER_HUB_AUTH_KEY: &str = "https://index.docker.io/v1/";
 
 /// The largest manifest read whole.
 const MANIFEST_LIMIT: usize = 4 << 20;
+/// Image configuration is bounded metadata, not an unbounded OCI layer.
+#[cfg(target_os = "linux")]
+pub(crate) const CONFIG_LIMIT: usize = MANIFEST_LIMIT;
 
 /// An image reference, normalized.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -407,6 +410,8 @@ pub struct Pulled {
     pub digest: String,
     /// Its config blob's digest.
     pub config: String,
+    /// Exact config extent from the verified manifest; never inferred after downloading.
+    pub config_size: u64,
     /// Its layers, bottom first: digest, media type, size.
     pub layers: Vec<(String, String, u64)>,
 }
@@ -437,13 +442,15 @@ pub async fn manifest_for(registry: &Registry, reference: &Reference, os: &str, 
         (digest, v)
     };
     let config = v.pointer("/config/digest").and_then(serde_json::Value::as_str).filter(|d| valid_digest(d)).with_context(|| format!("{reference}'s manifest names no config"))?.to_owned();
+    let config_size = v.pointer("/config/size").and_then(serde_json::Value::as_u64).with_context(|| format!("{reference}'s config requires a finite nonnegative descriptor size"))?;
     let mut layers = Vec::new();
     for l in v.get("layers").and_then(serde_json::Value::as_array).into_iter().flatten() {
         let d = l.get("digest").and_then(serde_json::Value::as_str).filter(|d| valid_digest(d)).with_context(|| format!("{reference}'s manifest has a layer without a digest"))?;
         let media = l.get("mediaType").and_then(serde_json::Value::as_str).unwrap_or_default();
-        layers.push((d.to_owned(), media.to_owned(), l.get("size").and_then(serde_json::Value::as_u64).unwrap_or(0)));
+        let size = l.get("size").and_then(serde_json::Value::as_u64).with_context(|| format!("{reference}'s layer {d} requires a finite nonnegative descriptor size"))?;
+        layers.push((d.to_owned(), media.to_owned(), size));
     }
-    Ok(Pulled { digest, config, layers })
+    Ok(Pulled { digest, config, config_size, layers })
 }
 
 /// A manifest as the registry has it: its digest (of the bytes read), media type and bytes.
@@ -460,22 +467,27 @@ async fn manifest_bytes(registry: &Registry, repository: &str, target: &str, sco
     Ok((format!("sha256:{}", crate::util::sha256_hex(&bytes)), media_type, bytes))
 }
 
-/// A blob of `repository` written to `path` (through a file beside it), checked against its
-/// digest as it comes; a redirect to the registry's storage followed. Its size.
-pub async fn blob_to(registry: &Registry, repository: &str, digest: &str, path: &std::path::Path) -> anyhow::Result<u64> {
-    use sha2::Digest as _;
+/// Open the existing authenticated/redirected blob stream. Storage's signed redirect never
+/// receives registry credentials. Both ordinary layers and bounded config publication use it.
+pub(crate) async fn blob_response(registry: &Registry, repository: &str, digest: &str) -> anyhow::Result<crate::http::client::Response> {
     anyhow::ensure!(valid_digest(digest), "`{digest}` is not a digest");
     let scope = format!("repository:{repository}:pull");
     let mut resp = call(registry, Method::Get, &format!("/v2/{repository}/blobs/{digest}"), &scope).await?;
     for _ in 0..5 {
-        if !matches!(resp.status(), 301 | 302 | 303 | 307 | 308) {
-            break;
-        }
+        if !matches!(resp.status(), 301 | 302 | 303 | 307 | 308) { break; }
         let to = resp.header("location").map(|l| absolute(registry, l)).context("a redirect without a location")?;
-        // Storage's own signed URL: no registry credentials go there.
         resp = client()?.get(&to).timeout(Duration::from_secs(3600)).send().await.with_context(|| format!("GET {to}"))?;
     }
     anyhow::ensure!(resp.is_success(), "{} answered {} for {repository}'s blob {digest}", registry.name, resp.status());
+    Ok(resp)
+}
+
+/// A blob of `repository` written to `path` (through a file beside it), checked against its
+/// digest as it comes; a redirect to the registry's storage followed. Its size. Layer output
+/// still has its legacy producer contract; native configuration uses bounded publication.
+pub async fn blob_to(registry: &Registry, repository: &str, digest: &str, path: &std::path::Path) -> anyhow::Result<u64> {
+    use sha2::Digest as _;
+    let mut resp = blob_response(registry, repository, digest).await?;
     let part = path.with_extension("part");
     let (tx, done) = crate::rt::file_sink(&part, u64::MAX)?;
     let mut hash = sha2::Sha256::new();
@@ -655,17 +667,25 @@ mod tests {
     /// token with the integration's credentials, then reads the tag's digest.
     #[test]
     fn a_tag_resolves_through_token_authentication() -> anyhow::Result<()> {
-        use std::sync::Arc;
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+
+        const CONFIG: &[u8] = br#"{"config":{"Env":["A=B"],"Cmd":["echo","hello"]}}"#;
 
         use crate::http::server::{self as srv, Request, Response};
 
         struct Fake {
             base: parking_lot::Mutex<String>,
+            blob_gets: AtomicUsize,
         }
         impl srv::Handler for Fake {
             async fn handle(self: Arc<Self>, req: Request) -> Response {
                 let path = req.uri().path().to_owned();
                 let auth = srv::header_str(&req, &http::header::AUTHORIZATION).unwrap_or("").to_owned();
+                // Signed storage redirects use the same downloader without registry credentials.
+                if path == "/storage" {
+                    return if auth.is_empty() { srv::response(http::StatusCode::OK, "application/octet-stream", srv::full(CONFIG.to_vec())) }
+                        else { srv::text(http::StatusCode::UNAUTHORIZED, "registry credentials leaked to storage") };
+                }
                 if path == "/token" {
                     let want = basic("acme", "s3cret");
                     if auth != want {
@@ -684,6 +704,22 @@ mod tests {
                         let r = srv::with_header(srv::status(http::StatusCode::OK), http::header::CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json");
                         srv::with_header(r, http::header::HeaderName::from_static("docker-content-digest"), &format!("sha256:{}", "b".repeat(64)))
                     }
+                    p if p.starts_with("/v2/acme/kiln/manifests/config-") => {
+                        let mut manifest = serde_json::json!({"schemaVersion":2,"config":{"digest":format!("sha256:{}",crate::util::sha256_hex(CONFIG)),"size":CONFIG.len()},"layers":[]});
+                        match p.trim_start_matches("/v2/acme/kiln/manifests/") {
+                            "config-missing" => { if let Some(config)=manifest.get_mut("config").and_then(serde_json::Value::as_object_mut) { config.remove("size"); } }
+                            "config-negative" => if let Some(size)=manifest.pointer_mut("/config/size") { *size=serde_json::json!(-1); },
+                            "config-layer-missing" => if let Some(layers)=manifest.get_mut("layers") { *layers=serde_json::json!([{"digest":format!("sha256:{}","d".repeat(64))}]); },
+                            "config-layer-negative" => if let Some(layers)=manifest.get_mut("layers") { *layers=serde_json::json!([{"digest":format!("sha256:{}","d".repeat(64)),"size":-1}]); },
+                            "config-layer-zero" => if let Some(layers)=manifest.get_mut("layers") { *layers=serde_json::json!([{"digest":format!("sha256:{}","d".repeat(64)),"size":0}]); },
+                            _ => {},
+                        }
+                        srv::json(http::StatusCode::OK, &manifest)
+                    }
+                    p if p.starts_with("/v2/acme/kiln/blobs/") => {
+                        self.blob_gets.fetch_add(1, Ordering::SeqCst);
+                        srv::with_header(srv::status(http::StatusCode::TEMPORARY_REDIRECT), http::header::LOCATION, &format!("{}/storage",self.base.lock()))
+                    }
                     _ => srv::status(http::StatusCode::NOT_FOUND),
                 }
             }
@@ -692,10 +728,11 @@ mod tests {
         crate::rt::block_on(async {
             let tcp = hyper_rt::tcp::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)), 16).map_err(|e| anyhow::anyhow!("{e}"))?;
             let addr = tcp.local_addr().map_err(|e| anyhow::anyhow!("{e}"))?;
-            let fake = Arc::new(Fake { base: parking_lot::Mutex::new(format!("http://{addr}")) });
+            let fake = Arc::new(Fake { base: parking_lot::Mutex::new(format!("http://{addr}")), blob_gets: AtomicUsize::new(0) });
+            let serving = Arc::clone(&fake);
             crate::rt::spawn(async move {
                 while let Ok(s) = tcp.accept().await {
-                    let (h, r) = (Arc::clone(&fake), s.peer_addr().ok());
+                    let (h, r) = (Arc::clone(&serving), s.peer_addr().ok());
                     crate::rt::spawn(srv::serve_connection(crate::http::io::RtIo::new(s), h, r));
                 }
             });
@@ -707,6 +744,69 @@ mod tests {
             // A tag that isn't there: none, not an error.
             assert_eq!(resolve(&registry, &parse_reference(&format!("{name}/acme/kiln:nope"))?).await?, None);
             assert!(verify(&registry, Some("acme/kiln")).await?.contains("accepted acme"));
+            // U07: config and layer extents come from the authenticated manifest, never guessed.
+            for tag in ["config-missing","config-negative","config-layer-missing","config-layer-negative"] {
+                let reference = parse_reference(&format!("{name}/acme/kiln:{tag}"))?;
+                let error = manifest_for(&registry,&reference,"linux","amd64").await.err().ok_or_else(||anyhow::anyhow!("invalid descriptor accepted: {tag}"))?;
+                assert!(format!("{error:#}").contains("finite nonnegative descriptor size"),"{error:#}");
+            }
+            let reference = parse_reference(&format!("{name}/acme/kiln:config-layer-zero"))?;
+            assert_eq!(manifest_for(&registry,&reference,"linux","amd64").await?.layers.first().map(|l|l.2),Some(0));
+            let reference = parse_reference(&format!("{name}/acme/kiln:config-good"))?;
+            let pulled = manifest_for(&registry,&reference,"linux","amd64").await?;
+            assert_eq!(pulled.config_size,u64::try_from(CONFIG.len())?);
+            #[cfg(target_os = "linux")]
+            {
+                use crate::runner::{cache::{Local,NativePlan},rootfs::configuration};
+                let base=crate::os::home_dir().join(".cache/kiln-tests/u07-oci");
+                std::fs::create_dir_all(&base)?;
+                let work=tempfile::tempdir_in(&base)?;
+                let local=Local::with_ledger(work.path(),crate::store::Store::in_memory()?,Some(pulled.config_size))?;
+                let cache=work.path().join("_firecracker");
+                let config=configuration(&cache,&registry,&reference,&pulled).await?;
+                assert_eq!(config.pointer("/config/Env"),Some(&serde_json::json!(["A=B"])));
+                assert_eq!(configuration(&cache,&registry,&reference,&pulled).await?,config);
+                assert_eq!(fake.blob_gets.load(Ordering::SeqCst),1,"verified reuse must not refetch");
+                assert!(!cache.join("blobs").exists(),"host config publication creates no legacy duplicate");
+                let plan=NativePlan::new(pulled.config.trim_start_matches("sha256:"),pulled.config_size)?;
+                assert_eq!(local.native_file(&plan)?.map(|f|f.len()),Some(pulled.config_size));
+                // Legacy config and interrupted legacy staging are read-only migration inputs.
+                for part in [false,true] {
+                    let work=tempfile::tempdir_in(&base)?;
+                    let local=Local::with_ledger(work.path(),crate::store::Store::in_memory()?,Some(pulled.config_size))?;
+                    let cache=work.path().join("_firecracker");
+                    let legacy=cache.join("blobs").join(pulled.config.trim_start_matches("sha256:"));
+                    let legacy=if part { legacy.with_extension("part") } else { legacy };
+                    std::fs::create_dir_all(legacy.parent().ok_or_else(||anyhow::anyhow!("legacy parent"))?)?;
+                    std::fs::write(&legacy,CONFIG)?;
+                    let error=configuration(&cache,&registry,&reference,&pulled).await.err().ok_or_else(||anyhow::anyhow!("legacy bytes adopted without cutover"))?;
+                    assert!(format!("{error:#}").contains("migration required"),"{error:#}");
+                    assert_eq!(std::fs::read(&legacy)?,CONFIG);
+                    assert!(local.native_file(&plan)?.is_none());
+                }
+                // These all fail before opening a body: no implicit DB, guessed capacity or oversize metadata.
+                let work=tempfile::tempdir_in(&base)?;
+                let cache=work.path().join("_firecracker");
+                assert!(configuration(&cache,&registry,&reference,&pulled).await.is_err());
+                assert!(!work.path().join("_cache").exists());
+                let local=Local::with_ledger(work.path(),crate::store::Store::in_memory()?,Some(0))?;
+                assert!(configuration(&cache,&registry,&reference,&pulled).await.is_err());
+                let mut oversized=pulled.clone(); oversized.config_size=u64::try_from(CONFIG_LIMIT)?+1;
+                let error=configuration(&cache,&registry,&reference,&oversized).await.err().ok_or_else(||anyhow::anyhow!("oversized metadata admitted"))?;
+                assert!(format!("{error:#}").contains("before transfer"),"{error:#}");
+                assert!(local.native_file(&plan)?.is_none());
+                assert_eq!(fake.blob_gets.load(Ordering::SeqCst),1);
+                // A body must fit BOTH its declared extent and digest before becoming a hit.
+                for (declared,digest,want) in [(pulled.config_size+1,crate::util::sha256_hex(&[CONFIG,b" "].concat()),"shorter than"),(pulled.config_size-1,"e".repeat(64),"body exceeds"),(pulled.config_size,"f".repeat(64),"differs from its admitted digest/size")] {
+                    let work=tempfile::tempdir_in(&base)?;
+                    let local=Local::with_ledger(work.path(),crate::store::Store::in_memory()?,Some(declared))?;
+                    let mut bad=pulled.clone(); bad.config_size=declared; bad.config=format!("sha256:{digest}");
+                    let error=configuration(&work.path().join("_firecracker"),&registry,&reference,&bad).await.err().ok_or_else(||anyhow::anyhow!("invalid config body published"))?;
+                    assert!(format!("{error:#}").contains(want),"{error:#}");
+                    assert!(local.native_file(&NativePlan::new(digest,declared)?)?.is_none(),"invalid bytes never published");
+                }
+                assert_eq!(fake.blob_gets.load(Ordering::SeqCst),4);
+            }
             // Wrong credentials: refused, with what to check.
             let wrong = Registry::for_name(&name, Some(("acme".into(), "wrong".into())), true);
             let err = resolve(&wrong, &parse_reference(&format!("{name}/acme/kiln:other"))?).await.err().map(|e| format!("{e:#}")).unwrap_or_default();

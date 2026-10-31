@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use http::StatusCode;
 use kiln_ci::compare::{LegSide, RunSide};
-use rusqlite::{OptionalExtension, params};
+use crate::sql::{OptionalExtension, params};
 use serde_json::{Value, json};
 
 use super::{Fail, token};

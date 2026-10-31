@@ -51,7 +51,7 @@ pub struct Config {
     /// Environment variables injected into every job (e.g. registry mirrors). Values starting with
     /// `file:` are read from that path at job dispatch time and masked in logs.
     pub secrets: BTreeMap<String, String>,
-    /// kiln's records through the cluster group (docs/p2p.md).
+    /// U15: product replication configuration and legacy cluster config compatibility.
     pub cluster: Cluster,
 }
 
@@ -59,19 +59,17 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Cluster {
-    /// The store's writes go through the cluster group (P1): one hyper-raft group with kiln.db as
-    /// its state machine, its log in `<data>/cluster`. Off (or `KILN_CLUSTER_GROUP=0`), writes go
-    /// straight to kiln.db, as before it; the database is whole either way.
+    /// Legacy configuration accepted for migration. Amphora owns durability in every mode.
     pub group: bool,
-    /// The runners hold learner replicas of the group (P2), each fed by the server over its link,
-    /// from a copy of kiln.db. Off (or `KILN_CLUSTER_LEARNERS=0`), none is added; the learners the
-    /// group has stay in it, lagging.
+    /// Legacy automatic Kiln learners are retired. Membership is explicit in `replica`.
     pub learners: bool,
+    /// U15: opt-in Amphora replication. Without this, use the product's one-node mode.
+    pub replica: Option<crate::replication::Config>,
 }
 
 impl Default for Cluster {
     fn default() -> Self {
-        Self { group: true, learners: true }
+        Self { group: true, learners: true, replica: None }
     }
 }
 

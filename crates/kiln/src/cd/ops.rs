@@ -6,8 +6,6 @@
 //! the `*_many` operations act on every app a selector matches, so an agent working on a fleet
 //! of 100,000 apps makes one call, not 100,000.
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use http::StatusCode;
@@ -18,14 +16,11 @@ use kiln_cd::obj::{self, ResKey};
 use kiln_cd::state::{self, ClusterAuth, ClusterDef, Command, RepoDef, RepoKind};
 use serde_json::{Value, json};
 
+use super::api::{from_query, res_input, with};
 use super::{AppEntry, Cd};
 use crate::hub::Hub;
 
-/// A failure: an HTTP status and why.
-pub type Fail = (StatusCode, String);
-/// An operation's answer.
-pub type Out = Result<Value, Fail>;
-pub(crate) type Fut = Pin<Box<dyn Future<Output = Out> + Send>>;
+pub use crate::ops::{Fail, Out};
 
 /// Who calls, and the services an operation works with.
 #[derive(Clone)]
@@ -38,20 +33,8 @@ pub struct Cx {
     pub actor: String,
 }
 
-/// One operation.
-pub struct Op {
-    /// Its name, dotted (`cd.apps.list`).
-    pub name: &'static str,
-    /// What it does, in a sentence.
-    pub summary: &'static str,
-    /// It changes nothing.
-    pub read_only: bool,
-    /// It can delete or overwrite something.
-    pub destructive: bool,
-    /// Its input's JSON Schema.
-    pub input: crate::ops::Input,
-    pub(crate) run: fn(Cx, Value) -> Fut,
-}
+/// U12: CD retains its service context as a handler adapter.
+pub type Op = crate::ops::Op<Cx, crate::ops::HttpRoutes>;
 
 fn bad(msg: impl Into<String>) -> Fail {
     (StatusCode::BAD_REQUEST, msg.into())
@@ -61,9 +44,32 @@ fn missing(msg: impl Into<String>) -> Fail {
     (StatusCode::NOT_FOUND, msg.into())
 }
 
+fn app(p: &str, n: &str) -> Value { json!({"app": format!("{p}/{n}")}) }
+
+macro_rules! segment {
+    ($literal:literal) => { $literal };
+    ($field:ident) => { "*" };
+}
+
+macro_rules! http {
+    ($method:ident, [$($segment:tt),*], $body:ident, |$q:ident, $value:ident| $input:expr) => {
+        crate::ops::HttpAlias {
+            method: stringify!($method), segments: &[$(segment!($segment)),*], body: crate::ops::Body::$body,
+            input: |rest, $q, $value| { let _ = (&$q, &$value); match rest {
+                [$($segment),*] => { let input = $input; Ok(input) },
+                _ => Err(bad("route does not match")),
+            } },
+        }
+    };
+}
+
 macro_rules! op {
-    ($name:literal, $summary:literal, ro: $ro:expr, destructive: $d:expr, input: $input:expr, run: $f:path) => {
-        Op { name: $name, summary: $summary, read_only: $ro, destructive: $d, input: $input, run: |cx, v| Box::pin($f(cx, v)) }
+    ($name:literal, $summary:literal, ro: $ro:expr, destructive: $d:expr, input: $input:expr, http: $http:expr, run: $f:path) => {
+        Op { name: $name, summary: $summary, read_only: $ro, destructive: $d, input: $input, route: crate::ops::HttpRoutes {
+            canonical: |_| Ok((if $ro { http::Method::GET } else { http::Method::POST }, crate::ops::path(&["api", "cd", "ops", $name]), Default::default())),
+            aliases: $http,
+            authorization: crate::authz::Rule { method: None, pattern: $name, capability: if $ro { "runs.read" } else { "environments.deploy" }, at: crate::authz::At::Server },
+        }, run: |cx, v| Box::pin($f(cx, v)) }
     };
 }
 
@@ -73,107 +79,202 @@ pub fn ops() -> &'static [Op] {
     OPS.get_or_init(|| {
         vec![
             op!("cd.summary", "Counts of apps by sync and health, and of clusters.", ro: true, destructive: false,
-                input: crate::ops::Input::of::<input::CdSummary>(), run: summary),
+                input: crate::ops::Input::of::<input::CdSummary>(), http: &[http!(GET, ["summary"], Ignore, |q, body| json!({}))],
+                run: summary),
             op!("cd.apps.list", "Apps matching filters, a page at a time (cursor), each with sync, health, resources and what differs.", ro: true, destructive: false,
-                input: crate::ops::Input::of::<input::CdAppsList>(), run: list),
+                input: crate::ops::Input::of::<input::CdAppsList>(), http: &[http!(GET, ["apps"], Ignore, |q, body| {
+            from_query(q, &["project", "cluster", "namespace", "environment", "sync", "health", "q", "limit", "cursor", "sort"])
+        })],
+                run: list),
             op!("cd.apps.facets", "How many apps each filter value would show (sync, health, cluster, project, namespace), given the other filters chosen, and how many match all of them.", ro: true, destructive: false,
-                input: crate::ops::Input::of::<input::CdAppsFacets>(), run: facets),
+                input: crate::ops::Input::of::<input::CdAppsFacets>(), http: &[http!(GET, ["facets"], Ignore, |q, body| from_query(q, &["project", "cluster", "namespace", "environment", "sync", "health", "q"]))],
+                run: facets),
             op!("cd.apps.get", "One app: definition, status, the last sync, source commits (the revision's author, time and message), children.", ro: true, destructive: false,
-                input: crate::ops::Input::of::<input::CdAppsGet>(), run: get),
+                input: crate::ops::Input::of::<input::CdAppsGet>(), http: &[http!(GET, ["apps", p, n], Ignore, |q, body| app(p, n))],
+                run: get),
             op!("cd.apps.tree", "An app's resource tree: its objects and every live object they own (ReplicaSets, Pods, Jobs, EndpointSlices…), each with uid, parents, health, sync (managed ones), age, ready counts, restarts, images and info. Read from the cluster, kept a few seconds.", ro: true, destructive: false,
                 input: crate::ops::Input::of::<input::CdAppsTree>(),
+                http: &[http!(GET, ["apps", p, n, "tree"], Ignore, |q, body| with(app(p, n), "fresh", json!(q.get("fresh").is_some_and(|v| v == "true" || v == "1"))))],
                 run: tree),
             op!("cd.apps.manifests", "The manifests an app renders now, as kiln applies them (Secrets masked).", ro: true, destructive: false,
-                input: crate::ops::Input::of::<input::CdAppsManifests>(), run: manifests),
+                input: crate::ops::Input::of::<input::CdAppsManifests>(), http: &[http!(GET, ["apps", p, n, "manifests"], Ignore, |q, body| app(p, n))],
+                run: manifests),
             op!("cd.apps.resource", "One object of an app's tree in depth: its node, live manifest, desired manifest and diff (managed objects), labels, annotations, conditions and owners. Secrets are masked.", ro: true, destructive: false,
-                input: crate::ops::Input::of::<input::CdAppsResource>(), run: resource),
+                input: crate::ops::Input::of::<input::CdAppsResource>(), http: &[http!(GET, ["apps", p, n, "resources", key], Ignore, |q, body| res_input(p, n, key, q, &[])?)],
+                run: resource),
             op!("cd.apps.resource_events", "An object's Kubernetes events, newest first.", ro: true, destructive: false,
-                input: crate::ops::Input::of::<input::CdAppsResourceEvents>(), run: resource_events),
+                input: crate::ops::Input::of::<input::CdAppsResourceEvents>(), http: &[http!(GET, ["apps", p, n, "resources", key, "events"], Ignore, |q, body| res_input(p, n, key, q, &[])?)],
+                run: resource_events),
             op!("cd.apps.resource_logs", "The last lines of a pod's log, or of the pods of a workload (merged by time, each line with its pod). Follow a log over `GET /api/cd/apps/:app/resources/:key/logs/ws`.", ro: true, destructive: false,
-                input: crate::ops::Input::of::<input::CdAppsResourceLogs>(), run: resource_logs),
+                input: crate::ops::Input::of::<input::CdAppsResourceLogs>(), http: &[http!(GET, ["apps", p, n, "resources", key, "logs"], Ignore, |q, body| {
+            res_input(p, n, key, q, &["container", "pod", "tail_lines", "since_seconds", "previous"])?
+        })],
+                run: resource_logs),
             op!("cd.apps.resources", "An app's resources, each with sync, health, and why it differs when it does.", ro: true, destructive: false,
                 input: crate::ops::Input::of::<input::CdAppsResources>(),
+                http: &[http!(GET, ["apps", p, n, "resources"], Ignore, |q, body| with(app(p, n), "out_of_sync", json!(q.get("out_of_sync").is_some_and(|v| v == "true"))))],
                 run: resources),
             op!("cd.apps.diff", "What a sync would change in an app: per resource that differs, the live YAML, what applying git makes of it (`predicted`), and the unified hunks between them. Fields the cluster fills in itself don't show.", ro: true, destructive: false,
-                input: crate::ops::Input::of::<input::CdAppsDiff>(), run: diff),
+                input: crate::ops::Input::of::<input::CdAppsDiff>(), http: &[http!(GET, ["apps", p, n, "diff"], Ignore, |q, body| app(p, n))],
+                run: diff),
             op!("cd.apps.history", "An app's deployments, newest first.", ro: true, destructive: false,
-                input: crate::ops::Input::of::<input::CdAppsHistory>(), run: history),
+                input: crate::ops::Input::of::<input::CdAppsHistory>(), http: &[http!(GET, ["apps", p, n, "history"], Ignore, |q, body| app(p, n))],
+                run: history),
             op!("cd.plans.get", "What a commit, or every diff of a stack, would deploy before it lands. For each app it touches: its own change (its render against the render of the diff below), the stack's change (against trunk), and the steps a sync would take against what runs, in order: what it creates, what it changes (live and predicted, with hunks), the hooks it runs, what it prunes and what Prune=false keeps. A diff fails when its sources can't be read or rendered, or it drops an object Prune=false keeps. Renders are kept by content, so planning again is cheap.", ro: true, destructive: false,
-                input: crate::ops::Input::of::<input::CdPlansGet>(), run: plan),
+                input: crate::ops::Input::of::<input::CdPlansGet>(), http: &[http!(GET, ["plans"], Ignore, |q, body| {
+            if q.contains_key("diff") {
+                return Err(bad("plans of kiln's own diffs (D123) come with its review, which isn't built yet: plan the commit (commit=) or the stack (head=, base=)"));
+            }
+            let keys = ["repo", "commit", "head", "base", "trunk", "pr", "brief", "max_apps", "project", "cluster", "namespace", "environment", "q"];
+            from_query(q, &keys)
+        }),
+                    http!(POST, ["plans"], Json, |q, body| body.clone())],
+                run: plan),
             op!("cd.plans.repos", "The repositories apps deploy from, for choosing what to plan: each with how many apps deploy from it, its default branch and its newest branches.", ro: true, destructive: false,
-                input: crate::ops::Input::of::<input::CdPlansRepos>(), run: plan_repos),
+                input: crate::ops::Input::of::<input::CdPlansRepos>(), http: &[http!(GET, ["plans", "repos"], Ignore, |q, body| json!({}))],
+                run: plan_repos),
             op!("cd.apps.sync", "Start a sync of an app (optionally only some resources, with pruning, as a dry run, with Argo CD sync options).", ro: false, destructive: true,
-                input: crate::ops::Input::of::<input::CdAppsSync>(), run: sync),
+                input: crate::ops::Input::of::<input::CdAppsSync>(), http: &[http!(POST, ["apps", p, n, "sync"], Json, |q, body| {
+            let mut b = body.clone();
+            if let Some(m) = b.as_object_mut() {
+                m.insert("app".into(), json!(format!("{p}/{n}")));
+            }
+            b
+        })],
+                run: sync),
             op!("cd.apps.sync_many", "Start a sync of every app a selector matches (at most `max`).", ro: false, destructive: true,
-                input: crate::ops::Input::of::<input::CdAppsSyncMany>(), run: sync_many),
+                input: crate::ops::Input::of::<input::CdAppsSyncMany>(), http: &[],
+                run: sync_many),
             op!("cd.apps.refresh", "Compare an app again; `hard` renders it again too.", ro: false, destructive: false,
-                input: crate::ops::Input::of::<input::CdAppsRefresh>(), run: refresh),
+                input: crate::ops::Input::of::<input::CdAppsRefresh>(), http: &[http!(POST, ["apps", p, n, "refresh"], Ignore, |q, body| with(app(p, n), "hard", json!(q.get("hard").is_some_and(|v| v == "true" || v == "1"))))],
+                run: refresh),
             op!("cd.apps.refresh_many", "Compare again every app a selector matches.", ro: false, destructive: false,
-                input: crate::ops::Input::of::<input::CdAppsRefreshMany>(), run: refresh_many),
-            op!("cd.apps.terminate", "Stop an app's running sync.", ro: false, destructive: false, input: crate::ops::Input::of::<input::CdAppsTerminate>(), run: terminate),
+                input: crate::ops::Input::of::<input::CdAppsRefreshMany>(), http: &[],
+                run: refresh_many),
+            op!("cd.apps.terminate", "Stop an app's running sync.", ro: false, destructive: false, input: crate::ops::Input::of::<input::CdAppsTerminate>(), http: &[http!(POST, ["apps", p, n, "terminate"], Ignore, |q, body| app(p, n))],
+                run: terminate),
             op!("cd.apps.take_over", "Stop shadowing an app adopted from Argo CD: kiln syncs it from now on.", ro: false, destructive: false,
-                input: crate::ops::Input::of::<input::CdAppsTakeOver>(), run: take_over),
+                input: crate::ops::Input::of::<input::CdAppsTakeOver>(), http: &[http!(POST, ["apps", p, n, "take-over"], Ignore, |q, body| app(p, n))],
+                run: take_over),
             op!("cd.apps.rollback", "Roll an app back to an earlier deployment that succeeded: by its id (`to`), or by what it ran (`revision`: a commit, 7 or more of its first hex digits, a tag of the app's git sources, or a chart version as recorded); by default the one before what runs now. kiln renders that deployment's commits again and syncs them; the app holds there until git changes it, then follows git again. cd.apps.rollback_targets lists what it can go back to.", ro: false, destructive: true,
-                input: crate::ops::Input::of::<input::CdAppsRollback>(), run: rollback),
+                input: crate::ops::Input::of::<input::CdAppsRollback>(), http: &[http!(POST, ["apps", p, n, "rollback"], Json, |q, body| {
+            let mut b = body.clone();
+            if let Some(m) = b.as_object_mut() {
+                m.insert("app".into(), json!(format!("{p}/{n}")));
+            }
+            b
+        })],
+                run: rollback),
             op!("cd.apps.rollback_targets", "What an app can be rolled back to, newest first: each deployment that succeeded and can be rendered again (what runs now and repeats of one render left out), with its commit (author, time, the whole message) and the tags that name it; and what runs now.", ro: true, destructive: false,
-                input: crate::ops::Input::of::<input::CdAppsRollbackTargets>(), run: rollback_targets),
+                input: crate::ops::Input::of::<input::CdAppsRollbackTargets>(), http: &[http!(GET, ["apps", p, n, "rollback-targets"], Ignore, |q, body| app(p, n))],
+                run: rollback_targets),
             op!("cd.apps.follow", "Let a rolled-back app follow git again (an automatic app then deploys what git says).", ro: false, destructive: false,
-                input: crate::ops::Input::of::<input::CdAppsFollow>(), run: follow),
+                input: crate::ops::Input::of::<input::CdAppsFollow>(), http: &[http!(POST, ["apps", p, n, "follow"], Ignore, |q, body| app(p, n))],
+                run: follow),
             op!("cd.apps.auto_rollback", "Whether kiln goes back on its own when one of an app's deploys fails (its rollout aborts, kiln's own restart doesn't take, a release fails after its commit), and who said so: `from` is `app` (set for it), `repo` (set for its repository), `deploy-file` (its rollout's `auto-rollback`) or `default` (on).", ro: true, destructive: false,
-                input: crate::ops::Input::of::<input::CdAppsAutoRollback>(), run: auto_rollback),
+                input: crate::ops::Input::of::<input::CdAppsAutoRollback>(), http: &[http!(GET, ["apps", p, n, "auto-rollback"], Ignore, |q, body| app(p, n))],
+                run: auto_rollback),
             op!("cd.apps.set_auto_rollback", "Turn auto-rollback on or off for one app (`on`: true or false), or clear it (`on`: null) to follow its repository's, then its deploy file's. The app's word beats both.", ro: false, destructive: false,
-                input: crate::ops::Input::of::<input::CdAppsSetAutoRollback>(), run: set_auto_rollback),
+                input: crate::ops::Input::of::<input::CdAppsSetAutoRollback>(), http: &[http!(PUT, ["apps", p, n, "auto-rollback"], Json, |q, body| with(body.clone(), "app", json!(format!("{p}/{n}"))))],
+                run: set_auto_rollback),
             op!("cd.repos.auto_rollback", "Auto-rollback by repository: every repository apps deploy from and every one people set it for, each with its setting (null: not set) and how many apps follow it.", ro: true, destructive: false,
-                input: crate::ops::Input::of::<input::CdReposAutoRollback>(), run: repo_auto_rollbacks),
+                input: crate::ops::Input::of::<input::CdReposAutoRollback>(), http: &[http!(GET, ["repos", "auto-rollback"], Ignore, |q, body| json!({}))],
+                run: repo_auto_rollbacks),
             op!("cd.repos.set_auto_rollback", "Turn auto-rollback on or off for every app a repository deploys (`on`: true or false), or clear it (`on`: null). An app's own setting beats its repository's. A person's to change.", ro: false, destructive: false,
-                input: crate::ops::Input::of::<input::CdReposSetAutoRollback>(), run: set_repo_auto_rollback),
+                input: crate::ops::Input::of::<input::CdReposSetAutoRollback>(), http: &[http!(PUT, ["repos", "auto-rollback"], Json, |q, body| body.clone())],
+                run: set_repo_auto_rollback),
             op!("cd.apps.rollout", "An app's rollouts on targets beyond Kubernetes (docs/cd-targets.md §5), the one under way first: each with where it stands (state, green's share, the step it's at), its steps, its checks and what they measured, what happened, and the approvals it waits for.", ro: true, destructive: false,
-                input: crate::ops::Input::of::<input::CdAppsRollout>(), run: rollouts),
+                input: crate::ops::Input::of::<input::CdAppsRollout>(), http: &[http!(GET, ["apps", p, n, "rollout"], Ignore, |q, body| app(p, n))],
+                run: rollouts),
             op!("cd.apps.rollout_act", "Act on an app's rollout: `promote` it past the step it waits at (`full`: past every step and check), `pause` or `resume` it, `abort` it (traffic back to blue; with auto-rollback the app goes back to the deployment before), `retry` an aborted one from its first step, or `approve` or `deny` an approval check it waits for (`check`).", ro: false, destructive: true,
-                input: crate::ops::Input::of::<input::CdAppsRolloutAct>(), run: rollout_act),
+                input: crate::ops::Input::of::<input::CdAppsRolloutAct>(), http: &[http!(POST, ["apps", p, n, "rollout", action], Json, |q, body| {
+            let b = body.clone();
+            with(with(b, "app", json!(format!("{p}/{n}"))), "action", json!(action))
+        })],
+                run: rollout_act),
             op!("cd.apps.create", "Create or replace an app kept in kiln (an AppDef).", ro: false, destructive: true,
                 input: crate::ops::Input::of::<input::CdAppsCreate>(),
+                http: &[http!(POST, ["apps"], Json, |q, body| json!({"definition": body.clone()}))],
                 run: create),
             op!("cd.apps.delete", "Delete an app; its objects too unless `cascade` is `orphan`.", ro: false, destructive: true,
                 input: crate::ops::Input::of::<input::CdAppsDelete>(),
+                http: &[http!(DELETE, ["apps", p, n], Ignore, |q, body| with(app(p, n), "cascade", q.get("cascade").map(|c| json!(c)).unwrap_or(Value::Null)))],
                 run: delete),
             op!("cd.import", "Import Argo CD manifests (Applications), which start in shadow mode.", ro: false, destructive: false,
                 input: crate::ops::Input::of::<input::CdImport>(),
+                http: &[http!(POST, ["import"], Text, |q, body| json!({"manifests": body}))],
                 run: import),
             op!("cd.clusters.list", "Clusters: connection, version, kinds served, labels.", ro: true, destructive: false,
-                input: crate::ops::Input::of::<input::CdClustersList>(), run: clusters),
+                input: crate::ops::Input::of::<input::CdClustersList>(), http: &[http!(GET, ["clusters"], Ignore, |q, body| json!({}))],
+                run: clusters),
             op!("cd.clusters.add", "Add a cluster from a kubeconfig context on the server.", ro: false, destructive: false,
                 input: crate::ops::Input::of::<input::CdClustersAdd>(),
+                http: &[http!(POST, ["clusters"], Json, |q, body| body.clone())],
                 run: add_cluster),
             op!("cd.clusters.remove", "Remove a cluster no app deploys to.", ro: false, destructive: true,
-                input: crate::ops::Input::of::<input::CdClustersRemove>(), run: remove_cluster),
+                input: crate::ops::Input::of::<input::CdClustersRemove>(), http: &[http!(DELETE, ["clusters", name], Ignore, |q, body| json!({"name": name}))],
+                run: remove_cluster),
             op!("cd.repos.list", "Repositories with credentials (secrets never shown).", ro: true, destructive: false,
-                input: crate::ops::Input::of::<input::CdReposList>(), run: repos),
+                input: crate::ops::Input::of::<input::CdReposList>(), http: &[http!(GET, ["repos"], Ignore, |q, body| json!({}))],
+                run: repos),
             op!("cd.repos.add", "Add credentials for a repository or URL prefix.", ro: false, destructive: false,
                 input: crate::ops::Input::of::<input::CdReposAdd>(),
+                http: &[http!(POST, ["repos"], Json, |q, body| body.clone())],
                 run: add_repo),
             op!("cd.repos.remove", "Remove a repository's credentials.", ro: false, destructive: true,
-                input: crate::ops::Input::of::<input::CdReposRemove>(), run: remove_repo),
+                input: crate::ops::Input::of::<input::CdReposRemove>(), http: &[http!(DELETE, ["repos"], Ignore, |q, body| json!({"url": q.get("url").cloned().unwrap_or_default()}))],
+                run: remove_repo),
             op!("cd.providers.list", "Every provider kiln deploys with (docs/cd-targets.md §3): its kinds, settings, place, capabilities, whether it's built, and the accounts (integrations) that could serve it.", ro: true, destructive: false,
-                input: crate::ops::Input::of::<input::CdProvidersList>(), run: super::targets::api::providers),
+                input: crate::ops::Input::of::<input::CdProvidersList>(), http: &[http!(GET, ["providers"], Ignore, |q, body| json!({}))],
+                run: super::targets::api::providers),
             op!("cd.targets.list", "The targets beyond Kubernetes apps deploy to (provider, account, place), each with its connection, its error if it can't be reached, and its apps.", ro: true, destructive: false,
-                input: crate::ops::Input::of::<input::CdTargetsList>(), run: super::targets::api::targets),
+                input: crate::ops::Input::of::<input::CdTargetsList>(), http: &[http!(GET, ["targets"], Ignore, |q, body| json!({}))],
+                run: super::targets::api::targets),
             op!("cd.discover", "What an account holds on a provider (ECS clusters and services, Lambda functions, …), for building or importing an app; with `name` (and `scope`, an ECS cluster), that one resource and the definition that adopts it as it runs.", ro: true, destructive: false,
                 input: crate::ops::Input::of::<input::CdDiscover>(),
+                http: &[http!(GET, ["discover"], Ignore, |q, body| from_query(q, &["provider", "account", "region", "project", "zone", "subscription", "resource-group", "environment", "scope", "name"]))],
                 run: super::targets::api::discover),
             op!("cd.validate", "A deploy file (and environments file) checked as kiln reads them: each app with where it deploys and, for a provider's app, the objects it renders now from `repo`'s files at trunk, its artifacts resolved.", ro: true, destructive: false,
                 input: crate::ops::Input::of::<input::CdValidate>(),
+                http: &[http!(POST, ["validate"], Json, |q, body| body.clone())],
                 run: super::targets::api::validate),
             op!("cd.apps.keep", "Keep in kiln the apps a deploy file (and environments file) defines, rather than in the repository: they read `repo`'s files as any app does, and are marked as kiln's own.", ro: false, destructive: false,
                 input: crate::ops::Input::of::<input::CdAppsKeep>(),
+                http: &[],
                 run: super::targets::api::keep),
             op!("cd.images.list", "Where each image kiln publishes lives: the local Docker that builds it (the default), or a registry repository.", ro: true, destructive: false,
-                input: crate::ops::Input::of::<input::CdImagesList>(), run: images_list),
+                input: crate::ops::Input::of::<input::CdImagesList>(), http: &[http!(GET, ["images"], Ignore, |q, body| json!({}))],
+                run: images_list),
             op!("cd.images.set", "Set where a published image lives: `local`, or a registry `repository` (with the `integration` that pulls it).", ro: false, destructive: false,
                 input: crate::ops::Input::of::<input::CdImagesSet>(),
+                http: &[http!(PUT, ["images", name], Json, |q, body| {
+            let mut b = body.clone();
+            if let Some(m) = b.as_object_mut() {
+                m.insert("name".into(), json!(name));
+            }
+            b
+        }),
+                    http!(DELETE, ["images", name], Ignore, |q, body| json!({"name": name, "kind": "local"}))],
                 run: images_set),
         ]
     })
+}
+
+/// U12: reject ambiguous aliases before reading a request body or invoking a handler.
+pub fn http_alias(method: &http::Method, rest: &[&str]) -> Result<(&'static Op, &'static crate::ops::HttpAlias), Fail> {
+    let mut found = ops().iter().flat_map(|op| op.route.aliases.iter().map(move |alias| (op, alias)))
+        .filter(|(_, alias)| alias.matches(method, rest));
+    let route = found.next().ok_or_else(|| missing("no such deployments route"))?;
+    if found.next().is_some() { return Err((StatusCode::INTERNAL_SERVER_ERROR, "ambiguous deployments route".to_owned())); }
+    Ok(route)
+}
+
+/// U12: both legacy HTTP aliases and named calls use the descriptor's policy.
+pub fn http_authorization(method: &http::Method, rest: &[&str]) -> Option<&'static crate::authz::Rule> {
+    if let ["ops", name] = rest {
+        return ops().iter().find(|op| op.name == *name).map(|op| &op.route.authorization);
+    }
+    http_alias(method, rest).ok().map(|(op, _)| &op.route.authorization)
 }
 
 /// What each of these operations takes (`crate::ops::Input`): its JSON Schema is generated from
@@ -714,6 +815,7 @@ pub mod input {
 pub async fn call(cx: Cx, name: &str, input: Value) -> Out {
     let op = ops().iter().find(|o| o.name == name).ok_or_else(|| missing(format!("no operation {name}")))?;
     let input = if input.is_null() { json!({}) } else { input };
+    op.input.fits(&input).map_err(|m| bad(m.said(name)))?;
     (op.run)(cx, input).await
 }
 
@@ -1475,7 +1577,7 @@ async fn sync(cx: Cx, v: Value) -> Out {
     agents_may(&cx, &id, "sync")?;
     ready_to_sync(&cx.cd, &id)?;
     let request = sync_request(&v, &cx.actor)?;
-    cx.cd.input(Input::Sync { app: id.as_str().into(), request });
+    cx.cd.input(Input::Sync { app: id.as_str().into(), request }).await.map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
     audit(&cx, "cd.sync", id.clone()).await;
     Ok(json!({"syncing": id}))
 }
@@ -1489,7 +1591,7 @@ async fn sync_many(cx: Cx, v: Value) -> Out {
     }
     let request = sync_request(&v, &cx.actor)?;
     for id in &ids {
-        cx.cd.input(Input::Sync { app: id.as_str().into(), request: request.clone() });
+        cx.cd.input(Input::Sync { app: id.as_str().into(), request: request.clone() }).await.map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
     }
     audit(&cx, "cd.sync_many", format!("{} apps", ids.len())).await;
     Ok(json!({"started": ids.len(), "apps": ids.iter().take(100).collect::<Vec<_>>(), "refused": refused.iter().take(100).collect::<Vec<_>>()}))
@@ -1498,7 +1600,7 @@ async fn sync_many(cx: Cx, v: Value) -> Out {
 async fn refresh(cx: Cx, v: Value) -> Out {
     let id = app_id(&v)?;
     exists(&cx.cd, &id)?;
-    cx.cd.input(Input::Refresh { app: id.as_str().into(), hard: v.get("hard").and_then(Value::as_bool).unwrap_or(false) });
+    cx.cd.input(Input::Refresh { app: id.as_str().into(), hard: v.get("hard").and_then(Value::as_bool).unwrap_or(false) }).await.map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
     cx.cd.kick();
     Ok(json!({"refreshing": id}))
 }
@@ -1507,7 +1609,7 @@ async fn refresh_many(cx: Cx, v: Value) -> Out {
     let ids = selected(&cx.cd, &v, 1_000_000);
     let hard = v.get("hard").and_then(Value::as_bool).unwrap_or(false);
     for id in &ids {
-        cx.cd.input(Input::Refresh { app: id.as_str().into(), hard });
+        cx.cd.input(Input::Refresh { app: id.as_str().into(), hard }).await.map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
     }
     cx.cd.kick();
     Ok(json!({"refreshing": ids.len()}))
@@ -1516,7 +1618,7 @@ async fn refresh_many(cx: Cx, v: Value) -> Out {
 async fn terminate(cx: Cx, v: Value) -> Out {
     let id = app_id(&v)?;
     exists(&cx.cd, &id)?;
-    cx.cd.input(Input::Terminate { app: id.as_str().into() });
+    cx.cd.input(Input::Terminate { app: id.as_str().into() }).await.map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
     audit(&cx, "cd.terminate", id.clone()).await;
     Ok(json!({"terminating": id}))
 }
@@ -1559,7 +1661,7 @@ pub(super) async fn roll_back(cd: &Arc<Cd>, id: &str, to: Option<u64>, revision:
     }
     not_syncing(cd, &id)?;
     let history = cd.store.read(|d| d.history.get(&id).cloned().unwrap_or_default());
-    let (n, tag) = super::rollback::target(cd, &id, &def, &history, to, revision).await?;
+    let (mut sources, n, tag) = super::rollback::target(cd, super::SourceRefresh::default(), &id, &def, &history, to, revision).await?;
     let target = history.iter().find(|d| d.id == n).ok_or_else(|| missing(format!("{id} has no deployment {n}")))?;
     // Each source's commit; entries kept before kiln recorded them carry the revision only
     // (`kiln_cd::rollback::renderable` let only a lone source's through).
@@ -1574,9 +1676,11 @@ pub(super) async fn roll_back(cd: &Arc<Cd>, id: &str, to: Option<u64>, revision:
         (cluster.version.read().clone(), cluster.discovery.read().api_versions.clone())
     };
     let (cd2, d2, at) = (cd.clone(), def.clone(), commits.clone());
-    let (head, mut back) = crate::rt::blocking(move || -> anyhow::Result<_> {
-        let head = cd2.inputs_of(&d2, kube_version.as_deref(), &api_versions, None)?;
-        let back = cd2.inputs_of(&d2, kube_version.as_deref(), &api_versions, Some(&at))?;
+    let (head, mut back) = crate::rt::blocking_in(crate::rt::SHARE_GIT_MIRROR_IO, move || -> anyhow::Result<_> {
+        sources.open_app(&cd2, &d2);
+        let readers = sources.readers(&d2)?;
+        let head = super::Cd::inputs_from(&d2, kube_version.as_deref(), &api_versions, None, &readers)?;
+        let back = super::Cd::inputs_from(&d2, kube_version.as_deref(), &api_versions, Some(&at), &readers)?;
         Ok((head, back))
     })
     .await
@@ -1594,9 +1698,9 @@ pub(super) async fn roll_back(cd: &Arc<Cd>, id: &str, to: Option<u64>, revision:
     // The held inputs and their sync as one step: nothing syncs the app in between.
     let request = SyncRequest { prune, by: Some(by.to_owned()), trigger: Some(Trigger::Rollback), ..SyncRequest::default() };
     {
-        let _gate = cd.inputs_gate.lock();
+        let _gate = cd.inputs_gate.lock().await;
         cd.keep_inputs(&id, &back);
-        cd.input(Input::SyncTo { app: id.as_str().into(), revision: back.revision.as_str().into(), key: back.key, content: back.content, request });
+        cd.input(Input::SyncTo { app: id.as_str().into(), revision: back.revision.as_str().into(), key: back.key, content: back.content, request }).await.map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
     }
     Ok(json!({"rolling_back": id, "to": target.id, "revision": target.revision, "commits": target.commits, "tag": tag}))
 }
@@ -1832,8 +1936,9 @@ async fn delete(cx: Cx, v: Value) -> Out {
         cx.cd.deleting.lock().remove(&id);
         return Err(e);
     }
-    cx.cd.unregister(&id, cascade);
+    let unregistered = cx.cd.unregister(&id, cascade).await;
     cx.cd.deleting.lock().remove(&id);
+    unregistered.map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
     audit(&cx, "cd.app.delete", format!("{id} cascade={cascade}")).await;
     Ok(json!({"deleted": id, "cascade": cascade}))
 }

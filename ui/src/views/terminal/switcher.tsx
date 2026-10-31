@@ -17,7 +17,7 @@ import {
   SquareTerminal,
   X,
 } from "lucide-react";
-import { harnessSessionsRes, useRes } from "@/lib/data";
+import { useHarnessSessions } from "@/lib/data";
 import { cn } from "@/lib/utils";
 import { HarnessMark, StatusPill } from "@/views/harness/parts";
 import { throughSubagents } from "@/views/harness/tasks";
@@ -120,7 +120,7 @@ function SwitcherSheet({
   onNewAgents: () => void;
 }) {
   const navigate = useNavigate();
-  const list = useRes(harnessSessionsRes).data;
+  const list = useHarnessSessions().data;
   const agents = list.slice().sort((a, b) => Number(b.approvals.length > 0) - Number(a.approvals.length > 0) || b.last_activity - a.last_activity);
   const done = (fn: () => void) => () => {
     onDone();
@@ -214,7 +214,7 @@ export function MobileBar({
   onRenameDone?: () => void;
 }) {
   const [sheet, setSheet] = React.useState(false);
-  const list = useRes(harnessSessionsRes).data;
+  const list = useHarnessSessions().data;
   const waiting = list.filter((a) => a.approvals.length > 0).length;
   const idx = tabs.findIndex((t) => t.id === activeId);
   const current = idx >= 0 ? tabs[idx] : null;

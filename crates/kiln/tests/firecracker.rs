@@ -238,7 +238,7 @@ fn w17_a_kept_leg_in_a_microvm() -> anyhow::Result<()> {
     // Released: the microVM ends, and its disks go.
     let (st, body) = http(s.port, "POST", &format!("/api/ci/legs/{leg}/release"), &s.admin, Some(&json!({})))?;
     anyhow::ensure!((200..300).contains(&st), "{st} {body}");
-    let vms = dir.path().join("work/_firecracker/vms");
+    let vms = common::runner_work(dir.path()).join("_firecracker/vms");
     until(&s, 60, "the microVM to end", || {
         let left: Vec<String> = std::fs::read_dir(&vms).map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default();
         Ok((!left.is_empty()).then(|| format!("{left:?}")))
@@ -265,7 +265,7 @@ fn w13_r09_a_firecracker_pool_keeps_a_microvm_ready() -> anyhow::Result<()> {
         return Ok(());
     };
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))?;
-    let pool = "\n[[ci.pools]]\nname = \"vms\"\nexecutor = \"firecracker\"\nimage = \"docker.io/library/alpine:3.20\"\nlabels = [\"vmpool\"]\nmin_idle = 1\nmax = 2\n";
+    let pool = "\n[[ci.pools]]\nname = \"vms\"\nexecutor = \"firecracker\"\nimage = \"docker.io/library/alpine:3.20\"\nlabels = [\"vmpool\"]\nmin_idle = 1\nmax = 2\nresources = { cpu = \"4\", memory = \"2560Mi\", disk = \"34Gi\" }\nfirecracker_overhead = { memory = \"512Mi\", disk = \"2Gi\" }\n";
     let (s, home, work, push) = vm_server(dir.path(), &fc, &kernel, pool)?;
     let mut first = Vec::new();
     until(&s, 900, "a microVM of the pool's, ready", || {

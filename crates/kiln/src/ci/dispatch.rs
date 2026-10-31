@@ -21,11 +21,21 @@ use kiln_ci::trigger::Event;
 use kiln_ci::wf::Workflow;
 use kiln_ci::wire::{self, AssignmentV2, JobEventV2};
 use parking_lot::Mutex;
-use rusqlite::OptionalExtension as _;
+use crate::sql::OptionalExtension as _;
+
+mod admission;
+mod cancellation;
+mod retained;
+mod executors;
+pub use cancellation::CancelError;
+pub use executors::ExecutorOrigin;
+pub(crate) use executors::{ExecutorGrant, executor_grant, bind_pod_enrollment, hold_pod_retirement};
+
+pub use retained::quarantine_run;
 
 use super::runs;
 use crate::hub::Hub;
-use crate::proto::{CAP_ACTIONS, CAP_CI2, CAP_DOCKER, JobResult, LANE_CONTROL, ServerMsg};
+use crate::proto::{CAP_ACTIONS, CAP_CI2, CAP_DOCKER, JobResult, ServerMsg};
 use crate::store::{Repo, Status};
 
 /// A run to start: a workflow that matched an event.
@@ -49,6 +59,8 @@ pub struct Start {
 /// What a run of a working tree (`kiln workflow run`, W17-R06) brings besides its event.
 #[derive(Debug, Clone, Default)]
 pub struct Given {
+    /// U04: internal persisted trigger correlation; never supplied by an API caller.
+    pub durable_trigger: Option<String>,
     /// Only these matrix combinations (`--matrix k=v`).
     pub only_matrix: Vec<(String, String)>,
     /// Secrets for this run only (`--secret-file`). They stay in the server's memory, never on
@@ -63,14 +75,24 @@ pub struct Given {
 /// What the dispatcher hears.
 #[derive(Debug)]
 pub enum Msg {
+    /// U01: one Scheduler owns both CI and externally executed reach reservations.
+    Admission { agent: String, ask: serde_json::Value, reply: async_channel::Sender<serde_json::Value> },
+    /// U01: exact ownership must be durable before the transport acknowledges a kept event.
+    RetainedStage { agent: String, job: String, event: JobEventV2, reply: async_channel::Sender<Result<(), String>> },
+    ExecutorStage { agent: String, event: crate::runner::pool::Said, connection: Option<ExecutorOrigin>, reply: async_channel::Sender<Result<(), String>> },
+    ExecutorCommand { executor: String, generation: String, allocation: String, operation: String, answer: crate::wire::commands::Answer },
+    ExecutorRetry { executor: String, generation: String, allocation: String },
     Start(Box<Start>),
+    /// U04: Quiver wakes recovery; only the compact persisted command key enters dispatch.
+    TriggerReady { id: String },
     /// A runner connected (or said what it can do); `running` are the legs it still runs.
     RunnerUp { agent: String, running: Vec<String> },
     RunnerLost { agent: String },
     /// A runner's probes reported (W13-R01): it is routed by what they found.
     RunnerFacts { agent: String },
     Event { agent: String, leg: String, event: Box<crate::proto::JobEvent> },
-    Finished { agent: String, result: JobResult },
+    /// U03: an authenticated completion durably staged before the runner is told Received.
+    Completion { agent: String, job: String, attempt: u32 },
     /// A repository deleted (its runs' records with it): its runs end here, their legs stopped
     /// where they run.
     RepoDeleted {
@@ -82,7 +104,10 @@ pub enum Msg {
     },
     Cancel {
         run: String,
+        attempt: u32,
         reason: String,
+        /// W05-R25/U03: resolves at the durable intent boundary, before physical stop proof.
+        reply: async_channel::Sender<Result<(), CancelError>>,
     },
     /// Why a leg waits, and how each runner measures up against it (W05-R11).
     Explain { leg: String, reply: async_channel::Sender<serde_json::Value> },
@@ -512,11 +537,12 @@ pub struct Handle {
     tx: async_channel::Sender<Msg>,
     rx: Mutex<Option<async_channel::Receiver<Msg>>>,
     on: AtomicBool,
+    workflow_on: AtomicBool,
     /// Legs the dispatcher owns, so the hub hands their messages here and not to v1.
     legs: Arc<Mutex<HashSet<String>>>,
     runs: Arc<Mutex<HashSet<String>>>,
     /// Failed legs kept to look into: the runner keeping each, and until when (W17-R02).
-    kept: Mutex<HashMap<String, (String, i64)>>,
+    kept: Mutex<HashMap<String, HashMap<String, i64>>>,
     /// The unfinished runs rebuilt as the dispatcher started (W05-R25, AC09).
     restored: Mutex<Option<Restored>>,
 }
@@ -532,7 +558,7 @@ pub struct Restored {
 impl Default for Handle {
     fn default() -> Self {
         let (tx, rx) = async_channel::unbounded();
-        Handle { tx, rx: Mutex::new(Some(rx)), on: AtomicBool::new(false), legs: Arc::default(), runs: Arc::default(), kept: Mutex::default(), restored: Mutex::default() }
+        Handle { tx, rx: Mutex::new(Some(rx)), on: AtomicBool::new(false), workflow_on: AtomicBool::new(false), legs: Arc::default(), runs: Arc::default(), kept: Mutex::default(), restored: Mutex::default() }
     }
 }
 
@@ -544,7 +570,73 @@ impl Handle {
         }
     }
 
+    /// U01: bounded request/reply adapter; the dispatcher remains the only reservation authority.
+    pub async fn admission(&self, agent: String, ask: serde_json::Value) -> serde_json::Value {
+        if !self.on.load(Ordering::Relaxed) {
+            return admission::refused(admission::Code::Unavailable, "the common resource scheduler is unavailable");
+        }
+        static PENDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        struct Pending;
+        impl Drop for Pending {
+            fn drop(&mut self) { PENDING.fetch_sub(1, Ordering::AcqRel); }
+        }
+        // Bound both live waiters and queued requests whose waiters may have timed out.
+        let mut pending = PENDING.load(Ordering::Acquire);
+        loop {
+            if self.tx.len() >= 128 || pending >= 128 {
+                return admission::refused(admission::Code::Limit, "the bounded resource admission queue is full");
+            }
+            match PENDING.compare_exchange_weak(pending, pending + 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(actual) => pending = actual,
+            }
+        }
+        let _pending = Pending;
+        if ask.to_string().len() > 65536 {
+            return admission::refused(admission::Code::Invalid, "resource admission request exceeds 64 KiB");
+        }
+        let (reply, rx) = async_channel::bounded(1);
+        self.send(Msg::Admission { agent, ask, reply });
+        match crate::rt::timeout(Duration::from_secs(10), rx.recv()).await {
+            Ok(Ok(v)) => v,
+            _ => admission::refused(admission::Code::Timeout, "the common resource scheduler did not answer in time"),
+        }
+    }
+
+    /// U01: startup/termination evidence must commit before framed or application receipt.
+    pub async fn stage_executor_event(&self, agent: &str, event: crate::runner::pool::Said, connection: Option<ExecutorOrigin>) -> anyhow::Result<()> {
+        anyhow::ensure!(self.tx.len() < 128, "U01 executor staging budget exceeded");
+        anyhow::ensure!(self.on.load(Ordering::Relaxed), "U01 ownership scheduler is unavailable");
+        let (reply, rx) = async_channel::bounded(1);
+        self.send(Msg::ExecutorStage { agent: agent.to_owned(), event, connection, reply });
+        match crate::rt::timeout(Duration::from_secs(10), rx.recv()).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(e))) => Err(anyhow::anyhow!(e)),
+            _ => Err(anyhow::anyhow!("U01 executor ownership staging timed out")),
+        }
+    }
+
+    /// U01: called by authenticated ingress before ACK, including the old JSON carrier.
+    pub async fn stage_retained_event(&self, agent: &str, job: &str, event: JobEventV2) -> anyhow::Result<bool> {
+        if !matches!(event, JobEventV2::Kept { .. } | JobEventV2::KeptOwned { .. } | JobEventV2::KeptReleased { .. }) { return Ok(false); }
+        anyhow::ensure!(self.on.load(Ordering::Relaxed), "U01 ownership scheduler is unavailable");
+        anyhow::ensure!(self.tx.len() < 128, "U01 ownership staging queue is full");
+        let (reply, rx) = async_channel::bounded(1);
+        self.send(Msg::RetainedStage { agent: agent.to_owned(), job: job.to_owned(), event, reply });
+        match crate::rt::timeout(Duration::from_secs(10), rx.recv()).await {
+            Ok(Ok(Ok(()))) => Ok(true),
+            Ok(Ok(Err(e))) => Err(anyhow::anyhow!(e)),
+            _ => Err(anyhow::anyhow!("U01 ownership staging did not commit before timeout")),
+        }
+    }
+
+    /// Workflow ingress policy; existing work keeps its controller when ingress is disabled.
     pub fn enabled(&self) -> bool {
+        self.available() && self.workflow_on.load(Ordering::Relaxed)
+    }
+
+    /// U01/U03: lifecycle ownership is independent of workflow ingress.
+    pub(crate) fn available(&self) -> bool {
         self.on.load(Ordering::Relaxed)
     }
 
@@ -564,7 +656,7 @@ impl Handle {
         let mut g = self.kept.lock();
         match kept {
             Some(k) => {
-                g.insert(job.to_owned(), k);
+                g.entry(job.to_owned()).or_default().insert(k.0, k.1);
             }
             None => {
                 g.remove(job);
@@ -574,7 +666,7 @@ impl Handle {
 
     /// Whether `agent` keeps `job` now.
     pub fn kept_by(&self, job: &str, agent: &str) -> bool {
-        self.kept.lock().get(job).is_some_and(|(a, until)| a == agent && *until > crate::util::now_unix())
+        self.kept.lock().get(job).is_some_and(|owners| owners.contains_key(agent))
     }
 
     /// Whether `run` is one of the engine's live runs.
@@ -604,6 +696,10 @@ struct RunSt {
     keys: HashMap<String, String>,
     /// Actions waiting for the run's concurrency group to let it start.
     held: Option<Vec<PlanAction>>,
+    /// Committed cancellation effects retried by this same dispatcher, never another owner.
+    cancellation: Option<cancellation::Pending>,
+    /// A product timeout can have committed; a held run cannot start until confirmation.
+    cancel_request: Option<cancellation::Request>,
     seq: i64,
     /// A rerun's legs that keep the last attempt's result, by key: the report and that leg.
     keep: HashMap<String, (LegReport, String)>,
@@ -672,6 +768,7 @@ fn association(e: &Event) -> Option<String> {
 }
 
 /// A leg the scheduler has.
+#[derive(Clone)]
 struct LegSt {
     run: String,
     key: String,
@@ -777,7 +874,7 @@ async fn gate_facts(hub: &Hub, repo: &Repo, sha: &str, p: &kiln_ci::env::Protect
             .call(move |c| {
                 Ok(c.query_row(
                     "SELECT MAX(s.created_at) FROM ci_deployments d JOIN ci_deployment_statuses s ON s.deployment_id = d.id WHERE d.repo_id = ?1 AND d.environment = ?2 AND d.sha = ?3 AND s.state = 'success'",
-                    rusqlite::params![repo_id, after, sha],
+                    crate::sql::params![repo_id, after, sha],
                     |r| r.get::<_, Option<i64>>(0),
                 )?)
             })
@@ -798,12 +895,12 @@ async fn gate_facts(hub: &Hub, repo: &Repo, sha: &str, p: &kiln_ci::env::Protect
                     .store
                     .call(move |c| {
                         let check: Option<(String, Option<String>)> = c
-                            .query_row("SELECT status, conclusion FROM ci_check_runs WHERE repo_id = ?1 AND head_sha = ?2 AND name = ?3 ORDER BY id DESC LIMIT 1", rusqlite::params![repo_id, sha, n], |r| Ok((r.get(0)?, r.get(1)?)))
+                            .query_row("SELECT status, conclusion FROM ci_check_runs WHERE repo_id = ?1 AND head_sha = ?2 AND name = ?3 ORDER BY id DESC LIMIT 1", crate::sql::params![repo_id, sha, n], |r| Ok((r.get(0)?, r.get(1)?)))
                             .optional()?;
                         if let Some((status, conclusion)) = check {
                             return Ok(Some((status == "completed", conclusion.unwrap_or_default())));
                         }
-                        let state: Option<String> = c.query_row("SELECT state FROM ci_statuses WHERE repo_id = ?1 AND sha = ?2 AND context = ?3 ORDER BY id DESC LIMIT 1", rusqlite::params![repo_id, sha, n], |r| r.get(0)).optional()?;
+                        let state: Option<String> = c.query_row("SELECT state FROM ci_statuses WHERE repo_id = ?1 AND sha = ?2 AND context = ?3 ORDER BY id DESC LIMIT 1", crate::sql::params![repo_id, sha, n], |r| r.get(0)).optional()?;
                         Ok(state.map(|s| (s != "pending", s)))
                     })
                     .await
@@ -866,6 +963,8 @@ async fn shard_files(hub: &Hub, repo: &Repo, sha: &str, wf: &Workflow, called: &
 }
 
 struct Dispatch {
+    admission: admission::State,
+    pending_losses: HashMap<String, (u32, String)>,
     hub: Arc<Hub>,
     sched: Scheduler,
     /// The routing rules by source (W05-R21); the scheduler holds them in order.
@@ -994,15 +1093,19 @@ fn status_of(c: PlanC) -> Status {
 
 /// Starts the dispatcher when the engine is on.
 pub fn spawn(hub: Arc<Hub>) {
-    if !hub.cfg.ci.enabled {
-        return;
-    }
+    // U01: reach uses the same Scheduler even when workflow ingress is disabled.
     let Some(rx) = hub.ci.rx.lock().take() else { return };
     hub.ci.on.store(true, Ordering::Relaxed);
-    super::services::spawn_maintenance(Arc::clone(&hub));
-    super::webhooks::spawn(Arc::clone(&hub));
-    super::insights::spawn(Arc::clone(&hub));
-    super::logsearch::spawn(Arc::clone(&hub));
+    hub.ci.workflow_on.store(hub.cfg.ci.enabled, Ordering::Relaxed);
+    super::schedule::outbox::spawn(Arc::clone(&hub));
+    if hub.cfg.ci.enabled {
+        super::services::spawn_maintenance(Arc::clone(&hub));
+        super::webhooks::spawn(Arc::clone(&hub));
+        super::insights::spawn(Arc::clone(&hub));
+        super::logsearch::spawn(Arc::clone(&hub));
+    } else {
+        tracing::warn!("CI is disabled for both .kiln and GitHub workflows; older enabled=false configurations kept .kiln pipelines active. Set [ci] enabled=true to continue automation. Git refs remain pending while disabled.");
+    }
     crate::rt::spawn(async move {
         // Legs kept to look into before a restart (W17-R02).
         match runs::kept_legs(&hub).await {
@@ -1018,6 +1121,8 @@ pub fn spawn(hub: Arc<Hub>) {
         let mut cfg = sched_config(&hub, rules);
         (cfg.pools, cfg.reservations) = super::pools::sources(&hub).await;
         let mut d = Dispatch {
+            admission: admission::State::default(),
+            pending_losses: HashMap::new(),
             hub: Arc::clone(&hub),
             sched: Scheduler::new(cfg),
             routing: sources,
@@ -1038,9 +1143,34 @@ pub fn spawn(hub: Arc<Hub>) {
             crate::rt::sleep(late).await;
         }
         let started = std::time::Instant::now();
-        if let Err(e) = d.restore().await {
-            tracing::warn!(error = %format!("{e:#}"), "the CI engine could not rebuild its runs");
+        // U01: durable external ownership is restored before any CI or RunnerUp can assign.
+        if let Err(e) = d.restore_admission().await {
+            hub.ci.on.store(false, Ordering::Relaxed);
+            tracing::error!(error = %format!("{e:#}"), "resource admission could not recover; dispatch is fenced");
+            return;
         }
+        if let Err(e) = d.restore_executors().await {
+            hub.ci.on.store(false, Ordering::Relaxed);
+            tracing::error!(error = %format!("{e:#}"), "executor ownership could not recover; dispatch is fenced");
+            return;
+        }
+        if let Err(e) = d.restore_retained().await {
+            hub.ci.on.store(false, Ordering::Relaxed);
+            tracing::error!(error = %format!("{e:#}"), "retained ownership could not recover; dispatch is fenced");
+            return;
+        }
+        if let Err(e) = d.restore().await {
+            hub.ci.on.store(false, Ordering::Relaxed);
+            tracing::error!(error = %format!("{e:#}"), "CI ownership could not rebuild; dispatch is fenced");
+            return;
+        }
+        if let Err(e) = d.restore_retained().await {
+            hub.ci.on.store(false, Ordering::Relaxed);
+            tracing::error!(error = %format!("{e:#}"), "retained ownership could not bind restored attempts; dispatch is fenced");
+            return;
+        }
+        // Receipts kept before a crash win over a hello that omits the already-finished job.
+        d.drain_completions().await;
         let restored = Restored { runs: d.runs.len(), legs: d.legs.len(), took: started.elapsed() };
         if restored.runs > 0 {
             tracing::info!(runs = restored.runs, legs = restored.legs, ms = restored.took.as_millis(), "the CI engine rebuilt its runs");
@@ -1077,7 +1207,44 @@ pub fn spawn(hub: Arc<Hub>) {
 impl Dispatch {
     async fn handle(&mut self, m: Msg) {
         let r = match m {
-            Msg::Start(s) => self.start(*s).await,
+            Msg::Admission { agent, ask, reply } => {
+                if reply.is_closed() { return; }
+                let answer = self.admission_ask(&agent, ask).await;
+                let _ = reply.try_send(answer);
+                Ok(())
+            }
+            Msg::RetainedStage { agent, job, event, reply } => {
+                let result = self.retained_event(&agent, &job, event).await.map_err(|e| format!("{e:#}"));
+                let _ = reply.try_send(result);
+                Ok(())
+            }
+            Msg::ExecutorCommand { executor, generation, allocation, operation, answer } => {
+                Box::pin(self.executor_command_answer(&executor, &generation, &allocation, &operation, answer)).await
+            }
+            Msg::ExecutorRetry { executor, generation, allocation } => {
+                Box::pin(self.retry_executor_intent(&executor, &generation, &allocation)).await
+            }
+            Msg::ExecutorStage { agent, event, connection, reply } => {
+                let result = Box::pin(self.executor_event_from(&agent, event, connection.as_ref())).await.map_err(|e| format!("{e:#}"));
+                let _ = reply.try_send(result);
+                Ok(())
+            }
+            Msg::TriggerReady { id } if self.hub.cfg.ci.enabled => {
+                match super::schedule::outbox::start(&self.hub, &id).await {
+                    Ok(Some(start)) => {
+                        match Box::pin(self.start(start)).await {
+                            Ok(()) => super::schedule::outbox::finish(&self.hub, &id, false, None).await,
+                            Err(e) => Err(e),
+                        }
+                    }
+                    Ok(None) => Ok(()),
+                    Err(e) => Err(e),
+                }
+            }
+            Msg::TriggerReady { .. } => Ok(()),
+            // U01: keep workflow-sized futures off the controller's message frame.
+            Msg::Start(s) if self.hub.cfg.ci.enabled => Box::pin(self.start(*s)).await,
+            Msg::Start(_) => Ok(()),
             Msg::RunnerUp { agent, running } => {
                 self.runner_up(&agent, &running).await;
                 Ok(())
@@ -1104,17 +1271,32 @@ impl Dispatch {
             Msg::Warm { agent, seq, held } => {
                 if self.warm.get(&agent).is_some_and(|(newest, _)| *newest == seq) {
                     let cmds = self.sched.handle(Input::Warm { runner: agent, held: *held }, now_ms());
-                    Box::pin(self.commands(cmds)).await;
+                    if let Some(cmds) = self.after(cmds) {
+                        Box::pin(self.commands(cmds)).await;
+                    }
                 }
                 Ok(())
             }
             Msg::RunnerLost { agent } => {
-                let cmds = self.sched.handle(Input::RunnerLost { runner: agent }, now_ms());
-                Box::pin(self.commands(cmds)).await;
+                let gone = self.legs.iter().filter(|(_, leg)| leg.agent.as_deref() == Some(agent.as_str())).map(|(id, leg)| (id.clone(), leg.attempt)).collect();
+                let cmds = self.lose(gone, "its runner was lost").await;
+                if let Some(cmds) = self.after(cmds) {
+                    Box::pin(self.commands(cmds)).await;
+                }
+                let deferred = self.legs.values().any(|leg| leg.agent.as_deref() == Some(agent.as_str()));
+                let input = if deferred { Input::RunnerDraining { runner: agent } } else { Input::RunnerLost { runner: agent } };
+                let cmds = self.sched.handle(input, now_ms());
+                if let Some(cmds) = self.after(cmds) {
+                    Box::pin(self.commands(cmds)).await;
+                }
                 Ok(())
             }
             Msg::Event { agent, leg, event } => self.event(&agent, &leg, *event).await,
-            Msg::Finished { agent, result } => self.finished(&agent, result).await,
+            Msg::Completion { agent, job, attempt } => {
+                let result = self.completion(&agent, &job, attempt).await;
+                if result.is_err() { self.timers.insert(now_ms().saturating_add(1_000)); }
+                result
+            }
             Msg::RepoDeleted { repo } => {
                 self.repo_deleted(&repo).await;
                 Ok(())
@@ -1125,10 +1307,18 @@ impl Dispatch {
                     l.agent = None;
                 }
                 let cmds = self.sched.handle(Input::Rejected { leg }, now_ms());
-                Box::pin(self.commands(cmds)).await;
+                if let Some(cmds) = self.after(cmds) {
+                    Box::pin(self.commands(cmds)).await;
+                }
                 Ok(())
             }
-            Msg::Cancel { run, reason } => self.cancel_run(&run, &reason).await,
+            Msg::Cancel { run, attempt, reason, reply } => {
+                let result = self.accept_cancel(&run, Some(attempt), &reason).await;
+                let committed = result.is_ok();
+                let _ = reply.try_send(result);
+                if committed { self.apply_cancellation(&run).await; }
+                Ok(())
+            }
             Msg::ApproveRun { run, by, approve, reply } => {
                 let r = self.approve_run(&run, &by, approve).await;
                 let _ = reply.try_send(*r.as_ref().unwrap_or(&false));
@@ -1155,22 +1345,14 @@ impl Dispatch {
                 Ok(())
             }
             Msg::Executor { agent, said } => {
-                let input = match said.state.as_str() {
-                    "ready" => Input::ExecutorReady { executor: said.executor },
-                    _ => {
-                        let error = said.error.unwrap_or_else(|| "it failed".into());
-                        tracing::warn!(runner = %agent, executor = %said.executor, error = %error, "a pool's executor didn't start");
-                        Input::ExecutorFailed { executor: said.executor, error }
-                    }
-                };
-                let cmds = self.sched.handle(input, now_ms());
-                Box::pin(self.commands(cmds)).await;
-                Ok(())
+                Box::pin(self.executor_event(&agent, said)).await
             }
             Msg::PoolsChanged => {
                 let (pools, reservations) = super::pools::sources(&self.hub).await;
                 let cmds = self.sched.handle(Input::PoolsChanged { pools, reservations }, now_ms());
-                Box::pin(self.commands(cmds)).await;
+                if let Some(cmds) = self.after(cmds) {
+                    Box::pin(self.commands(cmds)).await;
+                }
                 Ok(())
             }
             Msg::Pools { reply } => {
@@ -1195,7 +1377,7 @@ impl Dispatch {
                 Ok(())
             }
             Msg::Rerun { run, mode, debug, keep_failed, actions, no_reuse, cold, placed, by, reply } => {
-                let r = self.rerun(&run, &mode, debug, keep_failed, actions, no_reuse, cold, placed, &by).await.map_err(|e| format!("{e:#}"));
+                let r = Box::pin(self.rerun(&run, &mode, debug, keep_failed, actions, no_reuse, cold, placed, &by)).await.map_err(|e| format!("{e:#}"));
                 let _ = reply.try_send(r);
                 Ok(())
             }
@@ -1208,10 +1390,30 @@ impl Dispatch {
     /// Hands the scheduler the rules as they now stand: waiting legs are routed again.
     async fn rules_changed(&mut self) {
         let cmds = self.sched.handle(Input::RulesChanged(self.routing.effective()), now_ms());
-        Box::pin(self.commands(cmds)).await;
+        if let Some(cmds) = self.after(cmds) {
+            Box::pin(self.commands(cmds)).await;
+        }
     }
 
     async fn tick(&mut self) {
+        self.retry_cancellations().await;
+        self.drain_completions().await;
+        for (leg, (attempt, reason)) in std::mem::take(&mut self.pending_losses) {
+            let agent = self.legs.get(&leg).filter(|leg| leg.attempt == attempt).and_then(|leg| leg.agent.clone());
+            let Some(agent) = agent else { continue };
+            if self.hub.agents.lock().get(&agent).is_some_and(|runner| runner.connected && runner.running.contains(&leg)) { continue }
+            let cmds = Box::pin(self.lose(vec![(leg, attempt)], &reason)).await;
+            if let Some(cmds) = self.after(cmds) {
+                Box::pin(self.commands(cmds)).await;
+            }
+            if self.hub.agents.lock().get(&agent).is_none_or(|runner| !runner.connected) && !self.legs.values().any(|leg| leg.agent.as_deref() == Some(agent.as_str())) {
+                let cmds = self.sched.handle(Input::RunnerLost { runner: agent }, now_ms());
+                if let Some(cmds) = self.after(cmds) {
+                    Box::pin(self.commands(cmds)).await;
+                }
+            }
+        }
+        self.expire_admission().await;
         let now = now_ms();
         let mut woke = false;
         while self.timers.first().is_some_and(|t| *t <= now) {
@@ -1232,7 +1434,9 @@ impl Dispatch {
             }
         }
         let cmds = self.sched.handle(Input::Tick, now);
-        Box::pin(self.commands(cmds)).await;
+        if let Some(cmds) = self.after(cmds) {
+            Box::pin(self.commands(cmds)).await;
+        }
     }
 
     /// A runner as the scheduler sees it: what its probes found (W13-R01), else what its build
@@ -1258,7 +1462,7 @@ impl Dispatch {
             facts.executors.remove("firecracker");
         }
         facts.executors.entry("host".to_owned()).or_default();
-        RunnerView { name: a.name.clone(), labels: a.labels.clone(), pool: None, facts, caps: u64::from(caps) }
+        RunnerView { name: a.name.clone(), labels: a.labels.clone(), pool: None, facts, caps: self.hub.runner_wide_caps(&a.name) }
     }
 
     /// The `k8s` pool's executor a runner is (W13-R07): its pod's, by the name it enrolled
@@ -1283,11 +1487,31 @@ impl Dispatch {
         (cpus > 0).then(|| kiln_ci::sched::state::Resources { cpu: f64::from(cpus), mem: f.mem.total, disk: f.disk.free, gpu: u32::try_from(f.gpus.len()).unwrap_or(u32::MAX) })
     }
 
+    /// U01: trusted enrollment/reconnect committed the pod observation before publishing this
+    /// runner. Copy that existing grant metadata into the deterministic scheduler before Ready.
+    async fn sync_pod_capacity(&mut self, executor: Option<&str>) -> anyhow::Result<()> {
+        let Some(executor) = executor.filter(|e| !e.is_empty()) else { return Ok(()) };
+        let grant = executor_grant(&self.hub, executor).await?.ok_or_else(|| anyhow::anyhow!("U01 pod runner has no durable executor grant"))?;
+        anyhow::ensure!(matches!(grant.phase.as_str(), "ready" | "busy") && grant.pod_identity.is_some(), "U01 pod runner's existing grant is not ready or has been fenced");
+        let capacity = grant.snapshot.shape.and_then(|shape| shape.pod().cloned()).ok_or_else(|| anyhow::anyhow!("U01 pod capacity is unknown; authenticated same-UID observation is required"))?;
+        if self.sched.executor_snapshot(executor).is_some() {
+            anyhow::ensure!(self.sched.bind_pod_capacity(executor, capacity), "U01 pod capacity disagrees with its restored executor grant");
+        }
+        Ok(())
+    }
+
     async fn runner_facts(&mut self, agent: &str) {
         let Some(a) = self.hub.agents.lock().get(agent).cloned() else { return };
         let r = RunnerIn { id: agent.to_owned(), view: self.runner_view(&a), slots: work_slots(&a), capacity: self.capacity_of(&a), executor: self.hosted_executor(agent, a.ephemeral) };
+        if let Err(error) = self.sync_pod_capacity(r.executor.as_deref()).await {
+            tracing::warn!(agent, error = %error, "pod capacity could not be admitted");
+            return;
+        }
         let cmds = self.sched.handle(Input::RunnerChanged(Box::new(r)), now_ms());
-        Box::pin(self.commands(cmds)).await;
+        if let Some(cmds) = self.after(cmds) {
+            Box::pin(self.commands(cmds)).await;
+        }
+        if let Err(error) = self.replay_vm_intents(agent).await { tracing::warn!(agent, error = %format!("{error:#}"), "U01 VM recovery lookup failed; existing grants remain owned"); }
     }
 
     /// A runner's latest sample, to the engine ([`sample_of`]).
@@ -1302,7 +1526,9 @@ impl Dispatch {
         };
         let Some(sample) = sample else { return };
         let cmds = self.sched.handle(Input::RunnerSample { runner: agent.to_owned(), sample }, now_ms());
-        self.commands(cmds).await;
+        if let Some(cmds) = self.after(cmds) {
+            Box::pin(self.commands(cmds)).await;
+        }
     }
 
     async fn runner_up(&mut self, agent: &str, running: &[String]) {
@@ -1319,9 +1545,16 @@ impl Dispatch {
         }
         // The hub keeps at least 1 for runners that take jobs; 0 (an outpost) takes no legs.
         let r = RunnerIn { id: agent.to_owned(), view, slots: work_slots(&a), capacity: self.capacity_of(&a), executor: self.hosted_executor(agent, a.ephemeral) };
+        if let Err(error) = self.sync_pod_capacity(r.executor.as_deref()).await {
+            tracing::warn!(agent, error = %error, "pod capacity could not be admitted");
+            return;
+        }
         let mut cmds = self.sched.handle(Input::RunnerUp(Box::new(r)), now_ms());
         cmds.extend(self.lose(gone, "the runner lost it").await);
-        Box::pin(self.commands(cmds)).await;
+        if let Some(cmds) = self.after(cmds) {
+            Box::pin(self.commands(cmds)).await;
+        }
+        if let Err(error) = self.replay_vm_intents(agent).await { tracing::warn!(agent, error = %format!("{error:#}"), "U01 VM recovery lookup failed; existing grants remain owned"); }
     }
 
     /// The legs the rebuild after a restart found running on runners that haven't said hello
@@ -1334,7 +1567,9 @@ impl Dispatch {
         }
         tracing::warn!(legs = gone.len(), "legs' runners didn't come back after the restart: the legs were lost with them");
         let cmds = self.lose(gone, "its runner didn't come back after the server restarted").await;
-        Box::pin(self.commands(cmds)).await;
+        if let Some(cmds) = self.after(cmds) {
+            Box::pin(self.commands(cmds)).await;
+        }
     }
 
     /// `gone`'s legs (each with its attempt) lost with their runner: each attempt fails so, for the
@@ -1346,23 +1581,68 @@ impl Dispatch {
                 self.forget_gone(&leg, attempt).await;
                 continue;
             }
+            let reservation = if let Some(agent) = self.legs.get(&leg).and_then(|l| l.agent.clone()) {
+                match self.prepare_retained(&agent, &leg, attempt).await {
+                    Ok(reservation) => reservation,
+                    Err(e) => {
+                        tracing::error!(leg, error = %format!("{e:#}"), "U01 lost retained allocation cannot be released");
+                        self.pending_losses.insert(leg.clone(), (attempt, why.into()));
+                        self.timers.insert(now_ms().saturating_add(1_000));
+                        continue;
+                    }
+                }
+            } else { None };
             let end = runs::AttemptEnd { conclusion: "failure", class: Some(FailureClass::RunnerLost.as_str()), exit_code: None, error: Some(why.to_owned()), peak_rss: None, cpu_seconds: None };
-            if let Err(e) = runs::attempt_finished(&self.hub, &leg, attempt, end).await {
-                tracing::warn!(leg = %leg, error = %format!("{e:#}"), "the attempt could not be recorded");
+            match runs::attempt_lost(&self.hub, &leg, attempt, end).await {
+                Ok(true) => { self.pending_losses.remove(&leg); }
+                Ok(false) => {
+                    if let Some(agent) = self.legs.get(&leg).and_then(|l| l.agent.clone())
+                        && let Err(e) = Box::pin(self.completion(&agent, &leg, attempt)).await
+                    {
+                        tracing::warn!(leg = %leg, error = %format!("{e:#}"), "the saved completion could not be applied before reconciling its runner");
+                        self.timers.insert(now_ms().saturating_add(1_000));
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(leg = %leg, error = %format!("{e:#}"), "the lost attempt could not be recorded");
+                    self.pending_losses.insert(leg.clone(), (attempt, why.into()));
+                    self.timers.insert(now_ms().saturating_add(1_000));
+                    continue;
+                }
             }
-            cmds.extend(self.sched.handle(Input::AttemptFinished { leg, attempt, outcome: Outcome::Failed(Failed { class: FailureClass::RunnerLost, exit_code: None, log_hits: Vec::new() }) }, now_ms()));
+            let outcome = Outcome::Failed(Failed { class: FailureClass::RunnerLost, exit_code: None, log_hits: Vec::new() });
+            let input = match reservation {
+                Some(reservation) => Input::RetainedFinished { leg, attempt, reservation: Box::new(reservation), outcome },
+                None => Input::AttemptFinished { leg, attempt, outcome },
+            };
+            cmds.extend(self.sched.handle(input, now_ms()));
         }
         cmds
     }
 
     /// A workflow that matched an event becomes a run (W04-R01).
     async fn start(&mut self, mut s: Start) -> anyhow::Result<()> {
+        if let Some(trigger) = &s.given.durable_trigger
+            && super::schedule::outbox::materialized(&self.hub, trigger, &s).await?
+        {
+            let run = super::schedule::outbox::run_id(trigger);
+            // A complete input may have committed just before an earlier delivery failed.
+            // Reuse the same plan when this process has not adopted it yet, as restart does.
+            if !self.runs.contains_key(&run) {
+                let key = run.clone();
+                let saved: Option<(String, String)> = self.hub.store.call(move |c| Ok(c.query_row("SELECT p.workflow, p.input FROM ci_plans p JOIN runs r ON r.id = p.run_id WHERE p.run_id = ?1 AND p.done = 0 AND r.status IN ('queued', 'running')", [key], |r| Ok((r.get(0)?, r.get(1)?))).optional()?)).await?;
+                if let Some((model, input)) = saved { self.replay(&run, &model, &input).await?; }
+            }
+            if let Some(reply) = &s.given.reply { let _ = reply.try_send(run); }
+            return Ok(());
+        }
         // The repository's routing rules as its default branch has them now (W05-R21).
         let fresh = super::routing::repo_rules(&self.hub, &s.repo).await;
         if self.routing.set_repo(&s.repo.name, fresh) {
             self.rules_changed().await;
         }
-        let id = crate::util::new_id();
+        let id = s.given.durable_trigger.as_deref().map_or_else(crate::util::new_id, super::schedule::outbox::run_id);
         s.event.trusted = trusted_of(&self.hub.cfg.ci, &s.repo, &s.event);
         let trusted = s.event.trusted;
         // An outside contributor's run waits for a maintainer before any job starts (W18-R06).
@@ -1386,7 +1666,7 @@ impl Dispatch {
             model,
             input: String::new(),
         };
-        let (number, rowid) = runs::create(&self.hub, &s.repo, new).await?;
+        let (number, rowid) = runs::create_trigger(&self.hub, &s.repo, new, s.given.durable_trigger.clone()).await?;
         if let Some(r) = &s.given.reply {
             let _ = r.try_send(id.clone());
         }
@@ -1434,7 +1714,7 @@ impl Dispatch {
         let group = plan.concurrency.as_ref().map(|g| (format!("{}\0{}", s.repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
         let costs = super::insights::costs(&self.hub, &s.repo.id, &s.path).await;
         let sup = sup_of(&s.workflow, &s.repo, &s.path, &s.event.name, &github);
-        let mut st = RunSt { plan, repo: s.repo, event: s.event, path: s.path, created: crate::util::now_unix(), in_progress: false, files, wf: s.workflow, github, vars, trusted, actions: s.actions, keys: HashMap::new(), held: Some(actions), seq: 0, keep: HashMap::new(), debug: false, keep_failed: None, given: s.given, timing, tree, removed: 0, costs, awaiting: None, no_reuse: false, who: Who::default(), sup, cold: false, placed: HashMap::new() };
+        let mut st = RunSt { plan, repo: s.repo, event: s.event, path: s.path, created: crate::util::now_unix(), in_progress: false, files, wf: s.workflow, github, vars, trusted, actions: s.actions, keys: HashMap::new(), held: Some(actions), cancellation: None, cancel_request: None, seq: 0, keep: HashMap::new(), debug: false, keep_failed: None, given: s.given, timing, tree, removed: 0, costs, awaiting: None, no_reuse: false, who: Who::default(), sup, cold: false, placed: HashMap::new() };
         st.who = who_of(&self.hub, &st).await;
         self.workflow_run(&st, "requested", None);
         if approval {
@@ -1452,7 +1732,9 @@ impl Dispatch {
         let cmds = self.run_queued(&id, group, Arrival::New);
         // Boxed, as each step of the commands-actions-queue cycle is: its futures otherwise nest
         // in one another's frames, past a shard's stack in a debug build.
-        Box::pin(self.commands(cmds)).await;
+        if let Some(cmds) = self.after(cmds) {
+            Box::pin(self.commands(cmds)).await;
+        }
         Ok(())
     }
 
@@ -1494,7 +1776,9 @@ impl Dispatch {
         if approve {
             self.hub.emit_run(run).await;
             let cmds = self.run_queued(run, waiting.group, Arrival::New);
-            Box::pin(self.commands(cmds)).await;
+            if let Some(cmds) = self.after(cmds) {
+                Box::pin(self.commands(cmds)).await;
+            }
         } else {
             self.cancel_run(run, &format!("{by} didn't approve it")).await?;
         }
@@ -1657,7 +1941,14 @@ impl Dispatch {
         let (debug, keep_failed) = debug;
         let json = serde_json::json!({ "github": input.github, "inputs": input.inputs, "vars": input.vars, "changed": input.changed.as_deref(), "trusted": input.trusted, "actions": actions, "event": event, "debug": debug, "keep_failed": keep_failed, "keep": keep, "default_permissions": settings.get("default_permissions"), "only_matrix": settings.get("only_matrix"), "timing": settings.get("timing"), "tree": settings.get("tree"), "no_reuse": settings.get("no_reuse"), "graph": settings.get("graph"), "cold": settings.get("cold"), "placed": settings.get("placed") }).to_string();
         let run = run.to_owned();
-        self.hub.store.call(move |c| Ok(c.execute("UPDATE ci_plans SET input = ?2 WHERE run_id = ?1", rusqlite::params![run, json]).map(|_| ())?)).await
+        self.hub.store.call(move |c| {
+            let tx = crate::store::tx(c)?;
+            tx.execute("UPDATE ci_plans SET input = ?2 WHERE run_id = ?1", crate::sql::params![run, json])?;
+            // The complete replay input and its recovery handoff share one transaction.
+            tx.execute("UPDATE ci_trigger_outbox SET state = 'materialized', updated_at = ?2 WHERE run_id = ?1 AND kind = 'workflow' AND state = 'pending'", crate::sql::params![run, crate::util::now_unix()])?;
+            tx.commit()?;
+            Ok(())
+        }).await
     }
 
     /// The `github` context (W03-R07, W06-R03), with GitHub's URLs for repositories hosted there
@@ -1686,12 +1977,27 @@ impl Dispatch {
 
     /// Carries out what a plan decided (W04-R02).
     async fn actions(&mut self, run: &str, actions: Vec<PlanAction>) -> anyhow::Result<()> {
-        for a in actions {
+        // U01/W05-R17: a reused result can release another reused prerequisite. Process
+        // those follow-ups before the remaining actions without recursively polling the plan.
+        enum Work { Action(PlanAction), SaveRemoved }
+        let mut todo: std::collections::VecDeque<Work> = actions.into_iter().map(Work::Action).collect();
+        todo.push_back(Work::SaveRemoved);
+        while let Some(work) = todo.pop_front() {
+            let a = match work {
+                Work::Action(action) => action,
+                Work::SaveRemoved => { self.save_removed(run).await?; continue; }
+            };
             match a {
                 PlanAction::Queue(spec) => {
                     // A rerun's leg that isn't run again keeps the last attempt's result.
-                    match self.runs.get_mut(run).and_then(|r| r.keep.remove(&spec.key)) {
-                        Some((report, old)) => Box::pin(self.keep(run, *spec, report, &old)).await?,
+                    match self.runs.get(run).and_then(|r| r.keep.get(&spec.key)).cloned() {
+                        Some((report, old)) => {
+                            if let Some(next) = self.keep(run, *spec, report, &old).await? {
+                                // The original nested call saved removals after its subtree.
+                                todo.push_front(Work::SaveRemoved);
+                                for action in next.into_iter().rev() { todo.push_front(Work::Action(action)); }
+                            }
+                        }
                         None => Box::pin(self.queue(run, *spec)).await?,
                     }
                 }
@@ -1703,8 +2009,10 @@ impl Dispatch {
                             self.hub.emit_job(&id).await;
                         }
                         None => {
-                            let id = crate::util::new_id();
-                            runs::insert_leg(&self.hub, run, &id, &leg, status_of(conclusion), Some(reason)).await?;
+                            let id = self.cancellation_job_id(run, &leg.key).unwrap_or_else(crate::util::new_id);
+                            if !self.cancellation_saved(run, &leg.key, &id, status_of(conclusion)).await? {
+                                runs::insert_leg(&self.hub, run, &id, &leg, status_of(conclusion), Some(reason)).await?;
+                            }
                             if let Some(r) = self.runs.get_mut(run) {
                                 r.keys.insert(leg.key.clone(), id.clone());
                             }
@@ -1714,10 +2022,18 @@ impl Dispatch {
                 }
                 PlanAction::Job { job, conclusion, reason } => {
                     // A job decided before it had legs still shows on the run, as GitHub shows it.
+                    if let Some(id) = self.runs.get(run).and_then(|r| r.keys.get(&job)).cloned() {
+                        runs::finish_leg(&self.hub, &id, status_of(conclusion), conclusion.as_str(), None, Some(reason)).await?;
+                        self.hub.emit_job(&id).await;
+                        continue;
+                    }
                     if let Some(r) = self.runs.get(run) {
                         let spec = placeholder_spec(&r.wf, &job);
-                        let id = crate::util::new_id();
-                        runs::insert_leg(&self.hub, run, &id, &spec, status_of(conclusion), Some(reason)).await?;
+                        let id = self.cancellation_job_id(run, &spec.key).unwrap_or_else(crate::util::new_id);
+                        if !self.cancellation_saved(run, &spec.key, &id, status_of(conclusion)).await? {
+                            runs::insert_leg(&self.hub, run, &id, &spec, status_of(conclusion), Some(reason)).await?;
+                        }
+                        if let Some(r) = self.runs.get_mut(run) { r.keys.insert(job, id.clone()); }
                         self.hub.emit_job(&id).await;
                     }
                 }
@@ -1725,8 +2041,9 @@ impl Dispatch {
                     let id = self.runs.get(run).and_then(|r| r.keys.get(&leg).cloned());
                     if let Some(id) = id {
                         // Held for its environment: it never reached the scheduler, and ends here.
-                        if self.held.remove(&id).is_some() {
+                        if self.held.contains_key(&id) {
                             Box::pin(self.settled(&id, Outcome::Cancelled, Some(reason))).await?;
+                            self.held.remove(&id);
                             continue;
                         }
                         let cmds = self.sched.handle(Input::LegCancelled { leg: id, reason }, now_ms());
@@ -1763,7 +2080,7 @@ impl Dispatch {
                 }
             }
         }
-        self.save_removed(run).await
+        Ok(())
     }
 
     /// The combinations the run's plan removed (`exclude`, `where`), by job, with why, saved when
@@ -1776,15 +2093,23 @@ impl Dispatch {
         }
         r.removed = n;
         let (run, json) = (run.to_owned(), serde_json::to_string(r.plan.removed()).unwrap_or_default());
-        self.hub.store.call(move |c| Ok(c.execute("UPDATE ci_plans SET removed = ?2 WHERE run_id = ?1", rusqlite::params![run, json]).map(|_| ())?)).await
+        self.hub.store.call(move |c| Ok(c.execute("UPDATE ci_plans SET removed = ?2 WHERE run_id = ?1", crate::sql::params![run, json]).map(|_| ())?)).await
     }
 
     /// A leg of a rerun that keeps the last attempt's result: its copy, and its report to the plan.
-    async fn keep(&mut self, run: &str, spec: LegSpec, report: LegReport, old: &str) -> anyhow::Result<()> {
-        let id = crate::util::new_id();
-        runs::keep_leg(&self.hub, run, old, &id).await?;
+    async fn keep(&mut self, run: &str, spec: LegSpec, report: LegReport, old: &str) -> anyhow::Result<Option<Vec<PlanAction>>> {
+        let cleanup = self.cancellation_job_id(run, &spec.key);
+        let id = cleanup.clone().unwrap_or_else(crate::util::new_id);
+        let saved = if cleanup.is_some() { self.hub.store.job(id.clone()).await? } else { None };
+        if let Some(saved) = saved {
+            anyhow::ensure!(saved.run_id == run && saved.key == spec.key, "the cancellation cleanup id belongs to another leg");
+        } else {
+            runs::keep_leg(&self.hub, run, old, &id).await?;
+        }
         self.hub.emit_job(&id).await;
-        let Some(r) = self.runs.get_mut(run) else { return Ok(()) };
+        if self.cancellation_result(run, &spec.key, &id, &report).await? { return Ok(None); }
+        let Some(r) = self.runs.get_mut(run) else { return Ok(None) };
+        r.keep.remove(&spec.key);
         r.keys.insert(spec.key.clone(), id);
         r.seq += 1;
         let seq = r.seq;
@@ -1793,7 +2118,7 @@ impl Dispatch {
         let tree = Arc::clone(&r.tree);
         let acts = r.plan.on_leg_finished(&spec.key, report.clone(), &Source { files: &files, timing: &timing, tree: &tree });
         runs::log(&self.hub, run, seq, "leg", Some(spec.key.clone()), Some(report_json(&report))).await?;
-        self.actions(run, acts).await
+        Ok(Some(acts))
     }
 
     /// A new attempt of a finished run (W05-R17): the same run, `github.run_attempt` one more,
@@ -1874,14 +2199,16 @@ impl Dispatch {
         let costs = super::insights::costs(&self.hub, &repo.id, &path).await;
         // A maintainer reruns it: that is approval enough, as on GitHub.
         let sup = sup_of(&wf, &repo, &path, &event.name, &github);
-        let mut st = RunSt { plan, repo, event, path, created: crate::util::now_unix(), in_progress: false, files, wf, github, vars: input.vars, trusted: input.trusted, actions, keys: HashMap::new(), held: Some(acts), seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), tree: Arc::clone(&tree), removed: 0, costs, awaiting: None, no_reuse, who: Who::default(), sup, cold, placed };
+        let mut st = RunSt { plan, repo, event, path, created: crate::util::now_unix(), in_progress: false, files, wf, github, vars: input.vars, trusted: input.trusted, actions, keys: HashMap::new(), held: Some(acts), cancellation: None, cancel_request: None, seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), tree: Arc::clone(&tree), removed: 0, costs, awaiting: None, no_reuse, who: Who::default(), sup, cold, placed };
         st.who = who_of(&self.hub, &st).await;
         self.workflow_run(&st, "requested", None);
         self.runs.insert(run.to_owned(), st);
         self.hub.ci.runs.lock().insert(run.to_owned());
         self.hub.emit_run(run).await;
         let cmds = self.run_queued(run, group, Arrival::Rerun);
-        Box::pin(self.commands(cmds)).await;
+        if let Some(cmds) = self.after(cmds) {
+            Box::pin(self.commands(cmds)).await;
+        }
         Ok(attempt)
     }
 
@@ -1894,6 +2221,13 @@ impl Dispatch {
             self.held.remove(id);
             return Ok(());
         };
+        // U10/U19: a failed source read is not a deliberate removal of protection.
+        if let Err(error)=super::environments::source_ready(&self.hub,&repo).await {
+            self.held.remove(id);
+            let reason=format!("{env}: {error:#}");
+            runs::annotation(&self.hub,id,None,"error",None,&reason,None,None,None,None,None).await?;
+            return Box::pin(self.settled(id,Outcome::Failed(Failed{class:FailureClass::Failure,exit_code:None,log_hits:Vec::new()}),Some(reason))).await;
+        }
         let records = self.legs.get(id).and_then(|l| l.spec.environment.as_ref()).is_none_or(|e| e.deployment);
         // A preview's leg deploys to it only while kiln keeps it (W15-R07): one that's gone isn't
         // made again as an environment with no rules.
@@ -1925,19 +2259,32 @@ impl Dispatch {
         } else if p.gates.iter().any(|g| g.workflow.as_deref() == Some(path.as_str())) {
             kiln_ci::env::Gate::Refused(format!("{}'s gate {path} is the workflow deploying to it: it can't pass before this job runs", def.name))
         } else {
-            let found = if p.after.is_some() || !p.gates.is_empty() { gate_facts(&self.hub, &repo, &sha, p).await } else { kiln_ci::env::Found::default() };
+            let mut found = if p.after.is_some() || !p.gates.is_empty() { gate_facts(&self.hub, &repo, &sha, p).await } else { kiln_ci::env::Found::default() };
+            if !p.prerequisites.is_empty() {
+                found.prerequisites = super::environments::prerequisite_facts(&self.hub, &repo, &sha, p).await?;
+            }
             kiln_ci::env::gate_with(&def.name, p, &git_ref, ready_at, now, &reviews, &found)
         };
         match verdict {
             kiln_ci::env::Gate::Open => {
                 // Its environment's concurrency limit (W15-R01): at most that many deployments
                 // past the gate at once; the rest wait their turn, in the order they got ready.
-                if let Some(limit) = def.concurrency
-                    && self.deploying(&repo.id, &def.name, id) >= usize::try_from(limit).unwrap_or(usize::MAX)
-                {
-                    runs::wait_reason(&self.hub, id, &serde_json::json!({ "reason": "concurrency", "environment": def.name, "limit": limit })).await?;
-                    self.hub.emit_job(id).await;
-                    return Ok(());
+                let identity=super::environments::actions::identity(&repo.id,&def);
+                let flow=super::environments::actions::for_job(&self.hub.store,&run,&def.name).await?;
+                let action=flow.map_or_else(||format!("job:{id}"),|f|format!("flow:{}",f.id));
+                super::environments::actions::reap_releases(&self.hub.store,&*self.hub.records).await?;
+                match super::environments::actions::reserve(&self.hub.store,&identity,&action,"job",id,&def.protection,now).await? {
+                    super::environments::actions::Admission::Granted=>{},
+                    super::environments::actions::Admission::Held(why)=>{
+                        runs::wait_reason(&self.hub,id,&serde_json::json!({"reason":"concurrency","environment":def.name,"limit":def.concurrency,"detail":why})).await?;
+                        self.hub.emit_job(id).await;
+                        self.timers.insert(now.saturating_add(GATE_AGAIN_SECS).saturating_mul(1000));
+                        return Ok(());
+                    }
+                    super::environments::actions::Admission::Refused(why)=>{
+                        self.held.remove(id);
+                        return Box::pin(self.settled(id,Outcome::Failed(Failed{class:FailureClass::Failure,exit_code:None,log_hits:Vec::new()}),Some(why))).await;
+                    }
                 }
                 let Some(mut h) = self.held.remove(id) else { return Ok(()) };
                 runs::wait_reason(&self.hub, id, &serde_json::Value::Null).await?;
@@ -1994,15 +2341,6 @@ impl Dispatch {
         Ok(())
     }
 
-    /// How many of `repo`'s legs (other than `except`) are past `env`'s gate and not done: its
-    /// deployments under way.
-    fn deploying(&self, repo: &str, env: &str, except: &str) -> usize {
-        self.legs
-            .iter()
-            .filter(|(id, l)| id.as_str() != except && !self.held.contains_key(id.as_str()) && l.spec.environment.as_ref().is_some_and(|e| e.name.eq_ignore_ascii_case(env)) && self.runs.get(&l.run).is_some_and(|r| r.repo.id == repo))
-            .count()
-    }
-
     /// A deployment to `repo`'s `env` ended: the legs held there are gated again, in the order
     /// they got ready, so the next under its concurrency limit goes (W15-R01).
     async fn next_deployments(&mut self, repo: &str, env: &str) -> anyhow::Result<()> {
@@ -2021,6 +2359,22 @@ impl Dispatch {
 
     /// A leg the plan queued: its row, then the scheduler.
     async fn queue(&mut self, run: &str, mut spec: LegSpec) -> anyhow::Result<()> {
+        // U01: imported jobs already have durable ids. A plan replay may repeat a Queue for a
+        // job already queued, running or done; only a still-pending row is released here.
+        let existing = self.runs.get(run).and_then(|r| r.keys.get(&spec.key)).cloned();
+        let mut resumed_attempt = None;
+        if let Some(id) = &existing {
+            let row = self.hub.store.job(id.clone()).await?;
+            match row {
+                Some(row) if row.status == Status::Pending => {}
+                Some(row) if row.status == Status::Queued && !self.legs.contains_key(id) => {
+                    // A committed cancellation can queue an always() cleanup leg. If a later
+                    // metadata write failed, retry that same durable id before admitting it.
+                    resumed_attempt = Some(row.attempt.max(1));
+                }
+                _ => return Ok(()),
+            }
+        }
         // W08-R10: a job that opted in takes an earlier leg's result for the same inputs.
         let reuse = self.reuse_hash(run, &spec).await;
         if let Some((hash, max_age)) = &reuse {
@@ -2053,8 +2407,29 @@ impl Dispatch {
                 Err(err) => unbound = Some((false, format!("its preview couldn't be made: {err:#}"))),
             }
         }
-        let id = crate::util::new_id();
-        runs::insert_leg(&self.hub, run, &id, &spec, Status::Queued, None).await?;
+        let (id, attempt) = match existing {
+            Some(id) => {
+                let attempt = match resumed_attempt {
+                    Some(attempt) => attempt,
+                    None => runs::activate_imported(&self.hub, &id, &spec).await?,
+                };
+                (id, attempt)
+            }
+            None => {
+                let cleanup = self.cancellation_job_id(run, &spec.key);
+                let id = cleanup.clone().unwrap_or_else(crate::util::new_id);
+                let saved = if cleanup.is_some() { self.hub.store.job(id.clone()).await? } else { None };
+                let attempt = if let Some(saved) = saved {
+                    anyhow::ensure!(saved.run_id == run && saved.key == spec.key && saved.status == Status::Queued, "the cleanup leg id belongs to another effect");
+                    saved.attempt.max(1)
+                } else {
+                    runs::insert_leg(&self.hub, run, &id, &spec, Status::Queued, None).await?;
+                    1
+                };
+                (id, attempt)
+            }
+        };
+        if let Some(r) = self.runs.get_mut(run) { r.keys.insert(spec.key.clone(), id.clone()); }
         if let Some((hash, _)) = &reuse {
             super::reuse::set_hash(&self.hub, &id, hash).await?;
         }
@@ -2065,13 +2440,14 @@ impl Dispatch {
         r.keys.insert(spec.key.clone(), id.clone());
         self.hub.ci.legs.lock().insert(id.clone());
         let mut leg = leg_in(r, run, &id, &spec, &self.hub.cfg.ci, &self.warm);
+        leg.initial_attempt = attempt;
         // W28-R46: a run that adopts gives its legs work, keyed by W08-R10's input hash.
         leg.work = work_of(r, &spec, reuse.as_ref().map(|(h, _)| h.clone()));
         leg.finish_within = r.sup.as_ref().map(|s| s.finish_within);
         let dockerless = dockerless_pod(&self.sched, r, &spec, &leg.route);
         self.legs.insert(
             id.clone(),
-            LegSt { run: run.to_owned(), key: spec.key.clone(), spec, attempt: 1, agent: None, report: LegReport::default(), class: None, deployment: None, env_url: None, seq: 0, gone: false },
+            LegSt { run: run.to_owned(), key: spec.key.clone(), spec, attempt, agent: None, report: LegReport::default(), class: None, deployment: None, env_url: None, seq: 0, gone: false },
         );
         self.hub.emit_job(&id).await;
         if let Some(m) = dockerless {
@@ -2121,9 +2497,17 @@ impl Dispatch {
     /// A leg that takes `source`'s result over (W08-R10): its copy in this run, and its report to
     /// the plan.
     async fn take_over(&mut self, run: &str, spec: LegSpec, source: &str, hash: &str, report: LegReport, class: Option<String>) -> anyhow::Result<()> {
-        let id = crate::util::new_id();
-        super::reuse::take_over(&self.hub, run, source, &id, hash, class).await?;
+        let cleanup = self.cancellation_job_id(run, &spec.key);
+        let id = cleanup.clone().unwrap_or_else(crate::util::new_id);
+        let saved = if cleanup.is_some() { self.hub.store.job(id.clone()).await? } else { None };
+        if let Some(saved) = saved {
+            // Reuse copies the source's stored key, which may differ from this plan's key.
+            anyhow::ensure!(saved.run_id == run && saved.status.is_terminal(), "the cancellation reuse id belongs to another effect");
+        } else {
+            super::reuse::take_over(&self.hub, run, source, &id, hash, class).await?;
+        }
         self.hub.emit_job(&id).await;
+        if self.cancellation_result(run, &spec.key, &id, &report).await? { return Ok(()); }
         let Some(r) = self.runs.get_mut(run) else { return Ok(()) };
         r.keys.insert(spec.key.clone(), id);
         r.seq += 1;
@@ -2139,9 +2523,12 @@ impl Dispatch {
     /// A leg queued only to be reused, with no result of its inputs to take (W24-R06): skipped for
     /// what its `if` (or `when`) said, and saying so; its report to the plan.
     async fn unaffected(&mut self, run: &str, spec: LegSpec, why: String) -> anyhow::Result<()> {
-        let id = crate::util::new_id();
-        runs::insert_leg(&self.hub, run, &id, &spec, Status::Skipped, Some(format!("{why}: the change doesn't affect it, and no earlier result of its inputs is there to reuse"))).await?;
+        let id = self.cancellation_job_id(run, &spec.key).unwrap_or_else(crate::util::new_id);
+        if !self.cancellation_saved(run, &spec.key, &id, Status::Skipped).await? {
+            runs::insert_leg(&self.hub, run, &id, &spec, Status::Skipped, Some(format!("{why}: the change doesn't affect it, and no earlier result of its inputs is there to reuse"))).await?;
+        }
         self.hub.emit_job(&id).await;
+        if self.cancellation_result(run, &spec.key, &id, &LegReport::of(PlanC::Skipped)).await? { return Ok(()); }
         let Some(r) = self.runs.get_mut(run) else { return Ok(()) };
         r.keys.insert(spec.key.clone(), id);
         r.seq += 1;
@@ -2181,16 +2568,32 @@ impl Dispatch {
         self.in_commands = true;
         let mut todo: std::collections::VecDeque<Command> = cmds.into();
         while let Some(c) = todo.pop_front() {
+            let cancelled = match &c {
+                Command::Settled { leg, outcome: Outcome::Cancelled, reason } => self.legs.get(leg)
+                    .filter(|l| self.runs.get(&l.run).is_some_and(|r| r.cancellation.is_some()))
+                    .map(|l| (l.run.clone(), leg.clone(), reason.clone())),
+                _ => None,
+            };
             let r = match c {
+                // U01: these legs execute over reach. Scheduler already made their placement
+                // and accounting decision; they must never enter the CI assignment runtime.
+                Command::Assign { ref leg, .. } | Command::Wait { ref leg, .. } | Command::Settled { ref leg, .. }
+                    if leg.starts_with("reach-") || leg.starts_with("retained-") => Ok(()),
+                Command::StartRun { ref run } if self.runs.get(run).is_some_and(|r| r.cancel_request.is_some()) => {
+                    self.timers.insert(now_ms().saturating_add(1_000));
+                    Ok(())
+                }
                 Command::StartRun { run } => {
                     let held = self.runs.get_mut(&run).and_then(|r| r.held.take()).unwrap_or_default();
                     Box::pin(self.actions(&run, held)).await
                 }
                 Command::CancelRun { run, reason } => self.cancel_run(&run, &reason).await,
+                Command::StartExecutor { .. } if !self.admission.ready => Err(anyhow::anyhow!("U01 resource ownership is fenced")),
+                Command::Assign { .. } if !self.admission.ready => Err(anyhow::anyhow!("U01 resource ownership is fenced")),
                 Command::Assign { leg, runner, attempt, executor, image, docker, slot } => self.assign(&leg, &runner, attempt, Placement { executor, image, docker, slot }).await,
                 // A `k8s` pool's executor is this server's: its pod (W13-R07), made for a leg with
                 // its containers in it when it has them.
-                Command::StartExecutor { pool, executor, runner, kind, leg, .. } if runner.is_empty() => {
+                Command::StartExecutor { pool, executor, runner, kind, image, leg } if runner.is_empty() => {
                     match leg.as_deref().map(|l| (l.to_owned(), self.leg_pod(l))) {
                         // Its containers can't be said: the leg fails, saying why, and the executor
                         // made for it goes.
@@ -2199,29 +2602,37 @@ impl Dispatch {
                             self.next.extend(self.sched.handle(Input::ExecutorFailed { executor: executor.clone(), error: why.clone() }, now_ms()));
                             self.fail_unstarted(&l, attempt, "k8s", why).await
                         }
-                        made => {
-                            let pod = made.and_then(|(_, p)| p.ok());
-                            self.pods.insert(executor.clone());
-                            let hub = Arc::clone(&self.hub);
-                            crate::rt::spawn(async move { super::pools::start_pod(&hub, &pool, &executor, &kind, pod).await });
-                            Ok(())
+                        made => match self.start_executor_grant(&executor, executors::ExecutorStartup { kind: kind.clone(), image: image.clone(), peer: None, process_nonce: None }).await {
+                            Ok(executors::ExecutorGrantAdmission::Granted(grant)) => {
+                                let pod = made.and_then(|(_, p)| p.ok());
+                                self.pods.insert(executor.clone());
+                                let hub = Arc::clone(&self.hub);
+                                crate::rt::spawn(async move { super::pools::start_pod(&hub, &pool, grant, &kind, pod).await });
+                                Ok(())
+                            }
+                            Ok(executors::ExecutorGrantAdmission::Full(refused)) => self.refuse_executor_grant(refused),
+                            Err(error) => {
+                                self.admission.ready = false;
+                                Err(error.context("U01 executor startup ownership could not commit; resource admission is fenced"))
+                            }
                         }
                     }
                 }
-                Command::StopExecutor { executor, runner } if self.pods.remove(&executor) || runner.starts_with("kiln-x-") => {
+                Command::StopExecutor { executor, runner } if self.pods.contains(&executor) || runner.starts_with("kiln-x-") => {
+                    let grant = match self.stop_executor_grant(&executor).await {
+                        Ok(Some(grant)) => grant,
+                        Ok(None) => continue,
+                        Err(e) => { self.admission.ready = false; tracing::error!(error = %format!("{e:#}"), "U01 pod stop ownership could not commit"); continue; }
+                    };
                     let hub = Arc::clone(&self.hub);
-                    crate::rt::spawn(async move { super::pools::stop_pod(&hub, &executor, &runner).await });
+                    crate::rt::spawn(async move { super::pools::stop_pod(&hub, grant).await });
                     Ok(())
                 }
                 Command::StartExecutor { pool, executor, runner, kind, image, .. } => {
-                    let ask = super::pools::start_ask(&self.hub, &pool, &executor, &kind, image.as_deref());
-                    self.hub.send_to_agent(&runner, LANE_CONTROL, &ServerMsg::Executor { json: ask.to_string() }).await;
-                    Ok(())
+                    self.start_host_executor(&pool, &executor, &runner, &kind, image.as_deref()).await
                 }
                 Command::StopExecutor { executor, runner } => {
-                    let ask = serde_json::json!({ "op": "stop", "executor": executor });
-                    self.hub.send_to_agent(&runner, LANE_CONTROL, &ServerMsg::Executor { json: ask.to_string() }).await;
-                    Ok(())
+                    self.stop_host_executor(&executor, &runner).await
                 }
                 Command::Cancel { leg, reason, .. } => {
                     if let Some(agent) = self.legs.get(&leg).and_then(|l| l.agent.clone()) {
@@ -2263,6 +2674,12 @@ impl Dispatch {
                 Command::Adopted { leg, from, outcome } => self.adopted(&leg, &from, outcome).await,
             };
             if let Err(e) = r {
+                if let Some((run, leg, reason)) = cancelled
+                    && let Some(pending) = self.runs.get_mut(&run).and_then(|r| r.cancellation.as_mut())
+                {
+                    pending.settles.insert(leg, reason);
+                    self.timers.insert(now_ms().saturating_add(1_000));
+                }
                 tracing::warn!(error = %format!("{e:#}"), "CI dispatcher command");
             }
             // What it left to do comes next, before the rest: as if it had done it itself.
@@ -2440,6 +2857,9 @@ impl Dispatch {
         // only (W13-R04).
         if let Some(d) = docker.filter(|_| r.trusted && a.executor.kind == "docker") {
             a.executor.options = with_docker(std::mem::take(&mut a.executor.options), &d);
+        }
+        if let Some(executor) = slot.as_deref().map(str::to_owned).or_else(|| self.hub.pod_executors.lock().get(runner).cloned()) {
+            a.parent_binding = Some(self.executor_parent(&executor, leg, attempt).await?);
         }
         a.executor.slot = slot;
         // Needed jobs' secret outputs, as masked environment only (W04-R22).
@@ -2636,6 +3056,7 @@ impl Dispatch {
             job_id: leg.to_owned(),
             run_id: l.run.clone(),
             attempt,
+            parent_binding: None,
             repo: r.repo.name.clone(),
             sha: r.event.sha.clone(),
             git_ref: r.event.git_ref.clone(),
@@ -2790,9 +3211,8 @@ impl Dispatch {
                     l.report.secret_outputs = secret_outputs;
                 }
             }
-            JobEventV2::Kept { until } => {
-                runs::kept(&self.hub, leg, Some(until)).await?;
-                self.hub.ci.keep(leg, Some((agent.to_owned(), until)));
+            e @ (JobEventV2::Kept { .. } | JobEventV2::KeptOwned { .. } | JobEventV2::KeptReleased { .. }) => {
+                self.retained_event(agent, leg, e).await?;
             }
             JobEventV2::FailureClass { class } => {
                 if let Some(l) = self.legs.get_mut(leg) {
@@ -2870,12 +3290,8 @@ impl Dispatch {
                 Err(e) => super::results::annotate(&self.hub, &r.job, "warning", "bench-gate", &e).await,
             }
         }
-        if let Some(l) = self.legs.get_mut(&r.job) {
-            l.agent = None;
-            if let Some(e) = &r.error {
-                l.report.outputs.retain(|_| true);
-                tracing::info!(leg = %r.job, error = %e, "leg ended with an error");
-            }
+        if let Some(e) = &r.error {
+            tracing::info!(leg = %r.job, error = %e, "leg ended with an error");
         }
         let (conclusion, class) = match &outcome {
             Outcome::Success => ("success", None),
@@ -2883,21 +3299,80 @@ impl Dispatch {
             Outcome::Failed(f) => (if f.class == FailureClass::Timeout { "timed_out" } else { "failure" }, Some(f.class.as_str())),
         };
         let end = runs::AttemptEnd { conclusion, class, exit_code: r.exit_code, error: r.error.clone(), peak_rss: r.peak_rss, cpu_seconds: r.cpu_seconds };
-        if let Err(e) = runs::attempt_finished(&self.hub, &r.job, attempt, end).await {
-            tracing::warn!(leg = %r.job, error = %format!("{e:#}"), "the attempt could not be recorded");
+        // U01: commit the transfer before terminal state or retry can free physical capacity.
+        let reservation = self.prepare_retained(agent, &r.job, attempt).await?;
+        runs::attempt_finished(&self.hub, &r.job, attempt, end).await?;
+        if let Some(l) = self.legs.get_mut(&r.job) { l.agent = None; }
+        let input = match reservation {
+            Some(reservation) => Input::RetainedFinished { leg: r.job.clone(), attempt, reservation: Box::new(reservation), outcome },
+            None => Input::AttemptFinished { leg: r.job.clone(), attempt, outcome },
+        };
+        let cmds = self.sched.handle(input, now_ms());
+        if let Some(cmds) = self.after(cmds) {
+            Box::pin(self.commands(cmds)).await;
         }
-        let cmds = self.sched.handle(Input::AttemptFinished { leg: r.job.clone(), attempt, outcome }, now_ms());
-        Box::pin(self.commands(cmds)).await;
+        self.prune_released().await?;
         Ok(())
+    }
+
+    async fn completion(&mut self, agent: &str, job: &str, attempt: u32) -> anyhow::Result<()> {
+        let Some(result) = runs::completion(&self.hub, job, attempt, agent).await? else { return Ok(()) };
+        if self.legs.get(job).is_some_and(|l| l.attempt == attempt && l.agent.as_deref() == Some(agent)) {
+            self.finished(agent, result).await?;
+        }
+        // The scheduler settled it but writing the plan's durable report failed. Retry the
+        // persistence boundary directly; feeding AttemptFinished to a done scheduler is inert.
+        if self.legs.get(job).is_some_and(|l| l.attempt == attempt && l.agent.is_none()) {
+            let (job_owned, agent_owned) = (job.to_owned(), agent.to_owned());
+            let conclusion: Option<String> = self.hub.store.call(move |c| Ok(c.query_row("SELECT conclusion FROM ci_attempts WHERE leg_id = ?1 AND number = ?2 AND runner = ?3 AND status = 'done'", crate::sql::params![job_owned, attempt, agent_owned], |r| r.get(0)).optional()?)).await?;
+            if let Some(conclusion) = conclusion { self.concluded(job, conclusion_of(Some(&conclusion)), None).await?; }
+        }
+        let persisted = self.legs.get(job).is_none_or(|l| l.attempt != attempt || l.agent.as_deref().is_some_and(|owner| owner != agent));
+        if !persisted || !runs::retire_completion(&self.hub, job, attempt, agent).await? {
+            self.timers.insert(now_ms().saturating_add(1_000));
+        }
+        Ok(())
+    }
+
+    async fn drain_completions(&mut self) {
+        match runs::pending_completions(&self.hub).await {
+            Ok(reports) => {
+                if reports.len() == 128 { self.timers.insert(now_ms().saturating_add(1_000)); }
+                for (job, attempt, agent) in reports {
+                    if let Err(e) = self.completion(&agent, &job, attempt).await {
+                        tracing::warn!(job, attempt, error = %format!("{e:#}"), "a saved job completion could not be applied");
+                        self.timers.insert(now_ms().saturating_add(1_000));
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "saved job completions could not be read");
+                self.timers.insert(now_ms().saturating_add(1_000));
+            }
+        }
     }
 
     /// A leg gone with its repository that ended (or was lost with its runner): out of the
     /// dispatcher, and its slot the scheduler's to give.
     async fn forget_gone(&mut self, leg: &str, attempt: u32) {
+        let reservation = if let Some(agent) = self.legs.get(leg).and_then(|l| l.agent.clone()) {
+            match self.prepare_retained(&agent, leg, attempt).await {
+                Ok(reservation) => reservation,
+                Err(e) => {
+                    tracing::error!(leg, error = %format!("{e:#}"), "U01 deleted retained execution keeps its physical owner");
+                    return;
+                }
+            }
+        } else { None };
         self.legs.remove(leg);
         self.hub.ci.legs.lock().remove(leg);
         self.hub.logs.finish(leg);
-        let cmds = self.sched.handle(Input::AttemptFinished { leg: leg.to_owned(), attempt, outcome: Outcome::Cancelled }, now_ms());
+        let outcome = Outcome::Cancelled;
+        let input = match reservation {
+            Some(reservation) => Input::RetainedFinished { leg: leg.to_owned(), attempt, reservation: Box::new(reservation), outcome },
+            None => Input::AttemptFinished { leg: leg.to_owned(), attempt, outcome },
+        };
+        let cmds = self.sched.handle(input, now_ms());
         if let Some(cmds) = self.after(cmds) {
             Box::pin(self.commands(cmds)).await;
         }
@@ -2913,7 +3388,9 @@ impl Dispatch {
             for leg in legs {
                 // Its runner hears the cancel while the leg still says where it runs.
                 let cmds = self.sched.handle(Input::LegGone { leg: leg.clone() }, now_ms());
-                Box::pin(self.commands(cmds)).await;
+                if let Some(cmds) = self.after(cmds) {
+                    Box::pin(self.commands(cmds)).await;
+                }
                 match self.legs.get_mut(&leg) {
                     // Running: kept until its runner says it ended (its slot is the runner's until then).
                     Some(l) if l.agent.is_some() => l.gone = true,
@@ -2927,7 +3404,9 @@ impl Dispatch {
             self.runs.remove(&run);
             self.hub.ci.runs.lock().remove(&run);
             let cmds = self.sched.handle(Input::RunFinished { run }, now_ms());
-            Box::pin(self.commands(cmds)).await;
+            if let Some(cmds) = self.after(cmds) {
+                Box::pin(self.commands(cmds)).await;
+            }
         }
     }
 
@@ -2945,12 +3424,9 @@ impl Dispatch {
     /// A leg's end, concluded `c` (a skip too: a stack's lower diff deploys nothing to its
     /// preview, W15-R07): its deployment's last status, its row, and the plan told.
     async fn concluded(&mut self, leg: &str, c: PlanC, reason: Option<String>) -> anyhow::Result<()> {
-        let Some(l) = self.legs.remove(leg) else { return Ok(()) };
-        self.decisions.remove(leg);
+        let Some(l) = self.legs.get(leg).cloned() else { return Ok(()) };
         // A deployment ends here: the next its environment holds may go (W15-R01).
-        if let Some((env, repo)) = l.spec.environment.as_ref().map(|e| e.name.clone()).zip(self.runs.get(&l.run).map(|r| r.repo.id.clone())) {
-            Box::pin(self.next_deployments(&repo, &env)).await?;
-        }
+        let next = l.spec.environment.as_ref().map(|e| e.name.clone()).zip(self.runs.get(&l.run).map(|r| r.repo.id.clone()));
         // A preview that went while this leg deployed to it: what it made there goes too (W15-R07).
         if let (Some(e), Some(runner), Some(repo)) = (l.spec.environment.as_ref().filter(|e| e.preview.is_some()), l.agent.as_deref(), self.runs.get(&l.run).map(|r| r.repo.clone())) {
             super::previews::leg_ended(&self.hub, &repo, &e.name, runner).await;
@@ -2967,15 +3443,19 @@ impl Dispatch {
             if let Err(e) = super::environments::status(&self.hub, d, state, l.env_url.clone(), None, "github-actions[bot]").await {
                 tracing::warn!(leg = %leg, error = %format!("{e:#}"), "a deployment's status could not be recorded");
             }
-            // W19-R06: `deploy.succeeded` or `deploy.failed`.
-            if matches!(c, PlanC::Success | PlanC::Failure | PlanC::TimedOut)
-                && let Some(env) = l.spec.environment.as_ref().map(|e| e.name.clone())
-            {
-                crate::rt::spawn(super::notify::deployed(Arc::clone(&self.hub), l.run.clone(), env, c == PlanC::Success));
-            }
         }
         // A timeout stays `timed_out` on the leg (W06-R12); its dependants see a failure.
-        runs::finish_leg(&self.hub, leg, status_of(c), c.as_str(), outputs, reason).await?;
+        runs::finish_leg_with_deployment(&self.hub, leg, status_of(c), c.as_str(), outputs, reason,
+            l.deployment.zip(l.spec.environment.as_ref()).map(|(id, environment)| runs::LegDeployment {
+                id, run: l.run.clone(), attempt: l.attempt, environment: environment.name.clone(),
+            })).await?;
+        // W19-R06: the existing live deployment notification follows its canonical control
+        // descriptor in finish_leg; failed acceptance cannot publish a completion early.
+        if l.deployment.is_some() && matches!(c, PlanC::Success | PlanC::Failure | PlanC::TimedOut)
+            && let Some(env) = l.spec.environment.as_ref().map(|e| e.name.clone())
+        {
+            crate::rt::spawn(super::notify::deployed(Arc::clone(&self.hub), l.run.clone(), env, c == PlanC::Success));
+        }
         self.hub.emit_job(leg).await;
         let report = LegReport { conclusion: Some(c), ..l.report };
         // W08-R10: a success of a job that opted in is kept for the legs with its inputs, in the work
@@ -2997,40 +3477,52 @@ impl Dispatch {
                 }
             });
         }
+        let Some(seq) = self.runs.get(&l.run).map(|run| run.seq.saturating_add(1)) else {
+            self.legs.remove(leg);
+            return Ok(());
+        };
+        // Persist the report before advancing either in-memory owner. A failed write retains
+        // the leg and its staged completion so a later tick can retry this boundary.
+        if self.runs.get(&l.run).is_some_and(|r| r.cancellation.is_some()) {
+            self.cancellation_report(&l.run, seq, &l.key, report_json(&report)).await?;
+        } else {
+            runs::log(&self.hub, &l.run, seq, "leg", Some(l.key.clone()), Some(report_json(&report))).await?;
+        }
+        self.legs.remove(leg);
+        self.decisions.remove(leg);
         let Some(run) = self.runs.get_mut(&l.run) else { return Ok(()) };
-        run.seq += 1;
-        let seq = run.seq;
+        run.seq = seq;
         let files = Arc::clone(&run.files);
         let timing = Arc::clone(&run.timing);
         let tree = Arc::clone(&run.tree);
         let acts = run.plan.on_leg_finished(&l.key, report.clone(), &Source { files: &files, timing: &timing, tree: &tree });
-        runs::log(&self.hub, &l.run, seq, "leg", Some(l.key.clone()), Some(report_json(&report))).await?;
+        let cancelling = if let Some(pending) = run.cancellation.as_mut() {
+            pending.actions.extend(acts.iter().cloned());
+            self.timers.insert(now_ms().saturating_add(1_000));
+            true
+        } else { false };
+        if let Some((env, repo)) = next { Box::pin(self.next_deployments(&repo, &env)).await?; }
+        if cancelling { return Ok(()); }
         self.actions(&l.run, acts).await
     }
 
     async fn cancel_run(&mut self, run: &str, reason: &str) -> anyhow::Result<()> {
-        let Some(r) = self.runs.get_mut(run) else { return Ok(()) };
-        if r.held.is_some() {
-            // It never started: it ends here.
-            r.held = None;
-            let acts = vec![PlanAction::Finish(PlanC::Cancelled)];
-            return Box::pin(self.actions(run, acts)).await;
-        }
-        r.seq += 1;
-        let seq = r.seq;
-        let files = Arc::clone(&r.files);
-        let timing = Arc::clone(&r.timing);
-        let tree = Arc::clone(&r.tree);
-        let acts = r.plan.on_cancel(&Source { files: &files, timing: &timing, tree: &tree });
-        runs::log(&self.hub, run, seq, "cancel", None, Some(serde_json::json!({ "reason": reason }).to_string())).await?;
-        Box::pin(self.actions(run, acts)).await
+        self.accept_cancel(run, None, reason).await?;
+        self.apply_cancellation(run).await;
+        Ok(())
     }
 
     /// Rebuilds unfinished runs by replaying their plans' logs (W05-R25); legs that were running
     /// wait for their runner to say it still has them.
     async fn restore(&mut self) -> anyhow::Result<()> {
+        if !self.admission.ready { self.restore_admission().await?; }
+        super::legacy::import_all(&self.hub).await?;
+        self.restore_retained().await?;
+        super::environments::actions::restore_running(&self.hub).await?;
         let rows: Vec<(String, String, String)> = self.hub.store.call(|c| {
-            let mut st = c.prepare("SELECT p.run_id, p.workflow, p.input FROM ci_plans p WHERE p.done = 0")?;
+            // An accepted trigger whose complete replay input was not committed resumes from
+            // the canonical trigger outbox. Other incomplete/corrupt plans fail explicitly.
+            let mut st = c.prepare("SELECT p.run_id, p.workflow, p.input FROM ci_plans p WHERE p.done = 0 AND NOT (p.input = '' AND EXISTS (SELECT 1 FROM ci_trigger_outbox o WHERE o.run_id = p.run_id AND o.kind = 'workflow' AND o.state = 'pending'))")?;
             Ok(st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<Vec<_>, _>>()?)
         })
         .await?;
@@ -3038,6 +3530,8 @@ impl Dispatch {
             let r = self.replay(&run, &model, &input).await;
             if let Err(e) = r {
                 tracing::warn!(run, error = %format!("{e:#}"), "a CI run could not be rebuilt; it fails");
+                quarantine_run(&self.hub, &run).await?;
+                self.restore_retained().await?;
                 runs::finish_run(&self.hub, &run, Status::Failed, "failure", Some(format!("The run could not be rebuilt after a restart: {e:#}"))).await?;
             }
         }
@@ -3047,6 +3541,7 @@ impl Dispatch {
     async fn replay(&mut self, run: &str, model: &str, input: &str) -> anyhow::Result<()> {
         let wf: Arc<Workflow> = Arc::new(serde_json::from_str(model)?);
         let v: serde_json::Value = serde_json::from_str(input)?;
+        let imported = v.get("legacy_import").and_then(serde_json::Value::as_bool).unwrap_or(false);
         let changed: Option<Vec<String>> = v.get("changed").and_then(|c| serde_json::from_value(c.clone()).ok());
         let input = RunInput {
             github: v.get("github").cloned().unwrap_or_default(),
@@ -3065,6 +3560,7 @@ impl Dispatch {
             None => super::graphs::of_run(&self.hub, &repo, &row.sha, &wf, &files).await,
         };
         let (mut plan, initial) = RunPlan::start(Arc::clone(&wf), input.clone(), self.settings_with(&v), &Graphed { source: Source { files: &files, timing: &timing, tree: &tree }, graph }).map_err(|e| anyhow::anyhow!(e))?;
+        let mut recovered = initial.clone();
         let run_owned = run.to_owned();
         let (log, last_seq): (Vec<(i64, String, Option<String>, Option<String>)>, i64) = self.hub.store.call(move |c| {
             let mut st = c.prepare("SELECT seq, kind, leg, report FROM ci_plan_log WHERE run_id = ?1 AND attempt = (SELECT attempt FROM runs WHERE id = ?1) ORDER BY seq")?;
@@ -3078,33 +3574,43 @@ impl Dispatch {
         let seq = last_seq;
         let logged = !log.is_empty();
         let mut reported: HashSet<String> = HashSet::new();
-        // The legs a cancel in the log cancelled. The scheduler, rebuilt below, hears it again
-        // for those not ended yet: a leg that was running ends cancelled however it ends (lost
-        // with its runner across the restart, say), not run again.
-        let mut cancelled: Vec<(String, String)> = Vec::new();
-        for (_, kind, leg, report) in log {
+        let mut cancelled = false;
+        let mut cancel_seq = 0;
+        let mut held_cancel = false;
+        let mut cancelled_keys = HashSet::new();
+        for (logged_seq, kind, leg, report) in log {
             match kind.as_str() {
                 "cancel" => {
-                    for act in plan.on_cancel(&Source { files: &files, timing: &timing, tree: &tree }) {
-                        if let PlanAction::Cancel { leg, reason, .. } = act {
-                            cancelled.push((leg, reason));
-                        }
+                    cancelled = true;
+                    cancel_seq = logged_seq;
+                    held_cancel = cancellation::was_held(report.as_deref())?;
+                    if held_cancel {
+                        // Its initial actions never started. Replaying them would launch work
+                        // after an acknowledged cancellation of a held/approval-waiting run.
+                        recovered = vec![PlanAction::Finish(PlanC::Cancelled)];
+                    } else {
+                        let acts = plan.on_cancel(&Source { files: &files, timing: &timing, tree: &tree });
+                        cancelled_keys.extend(acts.iter().filter_map(|a| match a { PlanAction::Cancel { leg, .. } => Some(leg.clone()), _ => None }));
+                        recovered.extend(acts);
                     }
                 }
                 _ => {
                     let rep = report.as_deref().map(report_from_json).unwrap_or_default();
                     let key = leg.unwrap_or_default();
-                    let _ = plan.on_leg_finished(&key, rep, &Source { files: &files, timing: &timing, tree: &tree });
+                    let acts = plan.on_leg_finished(&key, rep, &Source { files: &files, timing: &timing, tree: &tree });
+                    recovered.extend(acts);
                     reported.insert(key);
                 }
             }
         }
         // The legs as the store has them.
         let run_owned = run.to_owned();
-        type Row = (String, String, String, Option<String>, u32, Option<String>, Option<String>, Option<String>);
+        type Row = (String, String, String, Option<String>, u32, Option<String>, Option<String>, Option<String>, Option<String>);
         let rows: Vec<Row> = self.hub.store.call(move |c| {
-            let mut st = c.prepare("SELECT id, key, status, agent, attempt, leg, conclusion, outputs FROM jobs WHERE run_id = ?1 AND job_id IS NOT NULL AND run_attempt = (SELECT attempt FROM runs WHERE id = ?1)")?;
-            Ok(st.query_map([&run_owned], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)))?.collect::<Result<Vec<_>, _>>()?)
+            // U01/W05-AC09/W28-R46: recover each input hash in this same durable read,
+            // avoiding one replicated read barrier per leg during queue reconstruction.
+            let mut st = c.prepare("SELECT id, key, status, agent, attempt, leg, conclusion, outputs, input_hash FROM jobs WHERE run_id = ?1 AND job_id IS NOT NULL AND run_attempt = (SELECT attempt FROM runs WHERE id = ?1)")?;
+            Ok(st.query_map([&run_owned], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?)))?.collect::<Result<Vec<_>, _>>()?)
         })
         .await?;
         // Legs that ended before their report reached the log (the server stopped in between):
@@ -3118,7 +3624,23 @@ impl Dispatch {
                 (r.1.clone(), LegReport { conclusion: Some(conclusion_of(r.6.as_deref())), outputs, ..LegReport::default() })
             })
             .collect();
-        let legs: Vec<(String, String, String, Option<String>, u32, Option<String>)> = rows.into_iter().map(|r| (r.0, r.1, r.2, r.3, r.4, r.5)).collect();
+        let legs: Vec<(String, String, String, Option<String>, u32, Option<String>, Option<String>)> = rows.into_iter().map(|r| (r.0, r.1, r.2, r.3, r.4, r.5, r.8)).collect();
+        let pending: HashSet<String> = legs.iter().filter(|l| !Status::parse(&l.2).is_terminal()).map(|l| l.1.clone()).collect();
+        let materialized: HashSet<String> = legs.iter().map(|l| l.1.clone()).collect();
+        // A cancellation may have committed after an earlier leg insertion failed. Never
+        // launch that absent leg during replay just to cancel it immediately afterwards.
+        let mut absent = Vec::new();
+        for action in &mut recovered {
+            if let PlanAction::Queue(spec) = action
+                && cancelled_keys.contains(&spec.key) && !materialized.contains(&spec.key)
+            {
+                absent.push(spec.key.clone());
+                *action = PlanAction::Settle { leg: spec.clone(), conclusion: PlanC::Cancelled, reason: "the run was cancelled".into() };
+            }
+        }
+        for key in absent {
+            recovered.extend(plan.on_leg_finished(&key, LegReport::of(PlanC::Cancelled), &Source { files: &files, timing: &timing, tree: &tree }));
+        }
         let event = v.get("event").and_then(|e| serde_json::from_value::<Event>(e.clone()).ok()).unwrap_or_else(|| Event { name: row.event.clone(), sha: row.sha.clone(), git_ref: input.github.get("ref").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned(), trusted: input.trusted, ..Event::default() });
         let actions = v.get("actions").and_then(|a| serde_json::from_value(a.clone()).ok()).unwrap_or_default();
         let path = run_path(&input.github);
@@ -3149,19 +3671,23 @@ impl Dispatch {
         let sup = sup_of(&wf, &repo, &path, &event.name, &input.github);
         // Where a person's retry asked its legs to run (W05-R28), those queued after a restart too.
         let placed = v.get("placed").and_then(|p| serde_json::from_value(p.clone()).ok()).unwrap_or_default();
-        let mut st = RunSt { plan, repo: repo.clone(), event, path, created: row.created_at, in_progress: !unapproved, files: Arc::clone(&files), wf: Arc::clone(&wf), github: input.github.clone(), vars: input.vars.clone(), trusted: input.trusted, actions, keys: HashMap::new(), held, seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), tree: Arc::clone(&tree), removed: 0, costs, awaiting, no_reuse: v.get("no_reuse").and_then(serde_json::Value::as_bool).unwrap_or(false), who: Who::default(), sup, cold: v.get("cold").and_then(serde_json::Value::as_bool).unwrap_or(false), placed };
+        let mut st = RunSt { plan, repo: repo.clone(), event, path, created: row.created_at, in_progress: !unapproved, files: Arc::clone(&files), wf: Arc::clone(&wf), github: input.github.clone(), vars: input.vars.clone(), trusted: input.trusted, actions, keys: HashMap::new(), held, cancellation: cancelled.then(|| cancellation::Pending { seq: cancel_seq, ..Default::default() }), cancel_request: None, seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), tree: Arc::clone(&tree), removed: 0, costs, awaiting, no_reuse: v.get("no_reuse").and_then(serde_json::Value::as_bool).unwrap_or(false), who: Who::default(), sup, cold: v.get("cold").and_then(serde_json::Value::as_bool).unwrap_or(false), placed };
         st.who = who_of(&self.hub, &st).await;
         let mut queued = Vec::new();
-        for (id, key, status, agent, attempt, leg) in legs {
+        for (id, key, status, agent, attempt, leg, input_hash) in legs {
             st.keys.insert(key.clone(), id.clone());
             let s = Status::parse(&status);
             if s.is_terminal() {
+                continue;
+            }
+            if imported && s == Status::Pending {
                 continue;
             }
             // The leg as the replayed plan made it (environment, permissions, concurrency, a
             // called workflow's steps and all), else as its row kept it.
             let spec = match st.plan.spec_of(&key) {
                 Some(s) => s.clone(),
+                None if imported => continue,
                 None => {
                     let Some(v) = leg.and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok()) else { continue };
                     rebuild_spec(&wf, &v)
@@ -3185,8 +3711,9 @@ impl Dispatch {
                 },
             );
             let mut li = leg_in(&st, run, &id, &spec, &self.hub.cfg.ci, &self.warm);
+            li.initial_attempt = attempt.max(1);
             // Its work again, from the input hash it was queued with (W28-R46, W05-R25).
-            li.work = work_of(&st, &spec, super::reuse::hash_of(&self.hub, &id).await.ok().flatten());
+            li.work = work_of(&st, &spec, input_hash);
             li.finish_within = st.sup.as_ref().map(|s| s.finish_within);
             match (s, agent) {
                 // Running on `a` as the store has it; `a` says whether it still is. A runner that
@@ -3203,6 +3730,11 @@ impl Dispatch {
         self.hub.ci.runs.lock().insert(run.to_owned());
         let waits = st.awaiting.is_some();
         self.runs.insert(run.to_owned(), st);
+        if held_cancel {
+            if let Some(pending) = self.runs.get_mut(run).and_then(|r| r.cancellation.as_mut()) { pending.actions.extend(recovered); }
+            self.apply_cancellation(run).await;
+            return Ok(());
+        }
         if waits {
             // Still waiting for a maintainer: nothing goes to the scheduler until then.
             return Ok(());
@@ -3210,7 +3742,9 @@ impl Dispatch {
         // Its demand again, so withdrawals are worked out afresh in creation order (W28-R46). It has
         // started already.
         let cmds: Vec<Command> = self.run_queued(run, None, Arrival::Restore).into_iter().filter(|c| !matches!(c, Command::StartRun { .. })).collect();
-        Box::pin(self.commands(cmds)).await;
+        if let Some(cmds) = self.after(cmds) {
+            Box::pin(self.commands(cmds)).await;
+        }
         for li in queued {
             // Held for its environment before the restart: held again, its wait counted from then.
             if let Some(env) = self.legs.get(&li.id).and_then(|l| l.spec.environment.as_ref()).map(|e| e.name.clone()).filter(|n| !n.is_empty()) {
@@ -3224,27 +3758,46 @@ impl Dispatch {
                 continue;
             }
             let cmds = self.sched.handle(Input::LegQueued(Box::new(li)), now_ms());
-            Box::pin(self.commands(cmds)).await;
-        }
-        for (key, reason) in cancelled {
-            let Some(id) = self.runs.get(run).and_then(|r| r.keys.get(&key).cloned()).filter(|id| self.legs.contains_key(id)) else { continue };
-            if self.held.remove(&id).is_some() {
-                Box::pin(self.settled(&id, Outcome::Cancelled, Some(reason))).await?;
-                continue;
+            if let Some(cmds) = self.after(cmds) {
+                Box::pin(self.commands(cmds)).await;
             }
-            let cmds = self.sched.handle(Input::LegCancelled { leg: id, reason }, now_ms());
-            Box::pin(self.commands(cmds)).await;
+        }
+        if !unapproved {
+            recovered.retain(|a| match a {
+                PlanAction::Queue(s) => pending.contains(&s.key) || !materialized.contains(&s.key),
+                PlanAction::Settle { leg, .. } => pending.contains(&leg.key) || !materialized.contains(&leg.key),
+                PlanAction::Job { job, .. } => pending.contains(job) || !materialized.contains(job),
+                PlanAction::Cancel { leg, .. } => pending.contains(leg),
+                PlanAction::Finish(_) => true,
+                _ => false,
+            });
+            if cancelled {
+                if let Some(pending) = self.runs.get_mut(run).and_then(|r| r.cancellation.as_mut()) { pending.actions.extend(recovered); }
+                self.apply_cancellation(run).await;
+            } else {
+                self.actions(run, recovered).await?;
+            }
         }
         for (key, report) in late {
+            let Some(r) = self.runs.get(run) else { break };
+            let seq = r.seq.saturating_add(1);
+            if r.cancellation.is_some() {
+                self.cancellation_report(run, seq, &key, report_json(&report)).await?;
+            } else {
+                runs::log(&self.hub, run, seq, "leg", Some(key.clone()), Some(report_json(&report))).await?;
+            }
             let Some(r) = self.runs.get_mut(run) else { break };
-            r.seq += 1;
-            let seq = r.seq;
+            r.seq = seq;
             let files = Arc::clone(&r.files);
             let timing = Arc::clone(&r.timing);
             let tree = Arc::clone(&r.tree);
             let acts = r.plan.on_leg_finished(&key, report.clone(), &Source { files: &files, timing: &timing, tree: &tree });
-            runs::log(&self.hub, run, seq, "leg", Some(key), Some(report_json(&report))).await?;
-            self.actions(run, acts).await?;
+            if let Some(pending) = r.cancellation.as_mut() {
+                pending.actions.extend(acts);
+                self.apply_cancellation(run).await;
+            } else {
+                self.actions(run, acts).await?;
+            }
         }
         Ok(())
     }
@@ -3331,7 +3884,7 @@ async fn seal_secret_outputs(hub: &Hub, run: &str, leg: &str, values: &std::coll
             for (name, sealed, nonce) in rows {
                 tx.execute(
                     "INSERT INTO ci_secret_outputs (run_id, leg_id, name, sealed, nonce) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(leg_id, name) DO UPDATE SET sealed = excluded.sealed, nonce = excluded.nonce",
-                    rusqlite::params![run, leg, name, sealed, nonce],
+                    crate::sql::params![run, leg, name, sealed, nonce],
                 )?;
             }
             tx.commit()?;
@@ -3351,7 +3904,7 @@ async fn secret_outputs_for(hub: &Hub, l: &LegSt, r: &RunSt) -> Vec<(String, Str
             .store
             .call({
                 let (producer, name) = (producer.clone(), name.clone());
-                move |c| Ok(c.query_row("SELECT sealed, nonce FROM ci_secret_outputs WHERE leg_id = ?1 AND name = ?2", rusqlite::params![producer, name], |x| Ok((x.get(0)?, x.get(1)?))).optional()?)
+                move |c| Ok(c.query_row("SELECT sealed, nonce FROM ci_secret_outputs WHERE leg_id = ?1 AND name = ?2", crate::sql::params![producer, name], |x| Ok((x.get(0)?, x.get(1)?))).optional()?)
             })
             .await
             .unwrap_or_default();
@@ -3500,6 +4053,151 @@ pub(crate) fn sample_of(s: &crate::metrics::HostSample, facts: Option<&kiln_ci::
 
 #[cfg(test)]
 mod tests {
+    /// U01/U03: one malformed historical run cannot stop recovery. A running assignment is
+    /// adopted once, then its result releases the dependent's original durable job id.
+    #[test]
+    fn u01_legacy_recovery_adopts_work_and_keeps_dependencies_after_a_bad_run() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            use super::*;
+            use crate::store::{Repo, Run};
+            let hub = crate::hub::tests::scratch_hub_with(|cfg| cfg.ci.enabled = false).await?;
+            let repo = hub.store.upsert_repo(Repo {
+                id: "legacy-repo".into(), name: "test/legacy".into(), clone_url: "file:///missing".into(),
+                branches: vec!["main".into()], poll_seconds: 60, enabled: true, created_at: 0,
+                last_polled_at: None, last_error: None, mode: "upstream".into(), default_branch: Some("main".into()), mirror: None,
+            }).await?;
+            let workflow = crate::pipeline::parse("name: ci\njobs:\n  z:\n    runs-on: [local]\n    steps: [{run: echo prepared}]\n  b:\n    needs: [z]\n    runs-on: [local]\n    steps: [{run: echo running}]\n  a:\n    needs: [b]\n    runs-on: [local]\n    steps: [{run: echo dependent}]\n")?;
+            for id in ["damaged", "recoverable"] {
+                let jobs = crate::pipeline::plan(&workflow, &crate::pipeline::Context::default())?;
+                hub.store.create_run(Run {
+                    id: id.into(), repo_id: repo.id.clone(), repo_name: repo.name.clone(), number: 0,
+                    pipeline: "ci".into(), event: "manual".into(), branch: "main".into(), sha: "saved-sha".into(),
+                    message: String::new(), author: "person".into(), status: Status::Queued, created_at: 0,
+                    started_at: None, finished_at: None, error: None, concurrency_group: None,
+                }, jobs).await?;
+            }
+            hub.store.call(|c| {
+                c.execute("UPDATE jobs SET spec = '{broken', status = 'running', agent = 'quarantined-runner' WHERE run_id = 'damaged' AND key = 'z'", [])?;
+                c.execute("UPDATE jobs SET status = 'succeeded', finished_at = 1 WHERE run_id = 'recoverable' AND key = 'z'", [])?;
+                c.execute("UPDATE jobs SET status = 'running', agent = 'old-runner', started_at = 1 WHERE run_id = 'recoverable' AND key = 'b'", [])?;
+                Ok(())
+            }).await?;
+            let before = hub.store.jobs("recoverable".into(), false).await?;
+            let id = |key: &str| before.iter().find(|j| j.key == key).map(|j| j.id.clone()).ok_or_else(|| anyhow::anyhow!("missing fixture job {key}"));
+            let (running, dependent) = (id("b")?, id("a")?);
+            let report = JobResult { job: running.clone(), status: Status::Succeeded, exit_code: Some(0), error: None, peak_rss: Some(4096), cpu_seconds: Some(0.5) };
+            assert!(runs::stage_completion(&hub, "another-runner", &report, Some(1)).await?.is_none());
+            assert!(runs::stage_completion(&hub, "old-runner", &report, Some(2)).await?.is_none());
+            let receipt = runs::stage_completion(&hub, "old-runner", &report, Some(1)).await?.ok_or_else(|| anyhow::anyhow!("completion was not staged"))?;
+            assert_eq!(receipt.1, 1, "a legacy report has its canonical attempt before import");
+            let mut duplicate = report.clone();
+            duplicate.status = Status::Failed;
+            runs::stage_completion(&hub, "old-runner", &duplicate, Some(1)).await?;
+            let dispatcher = || Dispatch {
+                hub: Arc::clone(&hub), sched: Scheduler::new(sched_config(&hub, Vec::new())), routing: Default::default(),
+                held: HashMap::new(), runs: HashMap::new(), legs: HashMap::new(), timers: BTreeSet::new(), next: Vec::new(),
+                in_commands: false, pods: HashSet::new(), absent_after: None, decisions: HashMap::new(), warm: HashMap::new(), warm_seq: 0, admission: admission::State::default(), pending_losses: HashMap::new(),
+            };
+            let mut d = dispatcher();
+            d.restore().await?;
+            let damaged = hub.store.run("damaged".into()).await?.ok_or_else(|| anyhow::anyhow!("missing damaged run"))?;
+            assert_eq!(damaged.status, Status::Failed);
+            assert!(damaged.error.as_deref().is_some_and(|e| e.contains("stored specification")), "{damaged:?}");
+            assert!(hub.store.jobs("damaged".into(), false).await?.iter().all(|j| j.status.is_terminal()));
+            let quarantined: bool = hub.store.call(|c| Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM ci_retained_ownership h JOIN jobs j ON j.id = h.job WHERE j.run_id = 'damaged' AND h.agent = 'quarantined-runner' AND h.transferred = 1 AND h.released = 0)", [], |r| r.get(0))?)).await?;
+            assert!(quarantined && !d.admission.retained.is_empty(), "damaged source cannot free a host whose running execution lacks stop proof");
+            assert_eq!(d.legs.get(&running).and_then(|l| l.agent.as_deref()), Some("old-runner"));
+            assert!(d.sched.allocation(&running, 1, "recovered".into()).is_some(), "U01: disabled ingress retains the running reservation in the shared scheduler");
+            assert!(!d.legs.contains_key(&dependent), "the dependency still waits for the running job");
+            let lost = runs::AttemptEnd { conclusion: "failure", class: Some(FailureClass::RunnerLost.as_str()), exit_code: None, error: Some("runner disconnected".into()), peak_rss: None, cpu_seconds: None };
+            assert!(!runs::attempt_lost(&hub, &running, receipt.1, lost).await?, "a loss decision cannot overwrite an earlier durable completion");
+            // The server acknowledged the durable receipt, then crashed before its dispatcher
+            // applied it. The runner no longer needs to resend its finished job.
+            drop(d);
+            let mut d = dispatcher();
+            d.restore().await?;
+            d.drain_completions().await;
+            let after = hub.store.jobs("recoverable".into(), false).await?;
+            assert_eq!(after.len(), before.len(), "replay never duplicates historical jobs");
+            assert_eq!(after.iter().find(|j| j.id == dependent).map(|j| j.status), Some(Status::Queued));
+            assert!(d.legs.contains_key(&dependent), "the shared dispatcher owns the released job");
+            assert_eq!(after.iter().find(|j| j.id == running).map(|j| j.status), Some(Status::Succeeded));
+            assert!(runs::pending_completions(&hub).await?.is_empty(), "the receipt is retired after its outcome is durable");
+            assert_eq!(runs::stage_completion(&hub, "old-runner", &report, Some(1)).await?, Some(receipt.clone()), "a lost acknowledgement is safe after the plan has committed");
+            assert!(runs::stage_completion(&hub, "old-runner", &report, Some(2)).await?.is_none(), "a receipt never acknowledges a different attempt");
+            assert!(runs::pending_completions(&hub).await?.is_empty(), "terminal retries do not reapply completion");
+            d.completion("old-runner", &running, receipt.1).await?;
+            assert_eq!(hub.store.jobs("recoverable".into(), false).await?.len(), before.len(), "receipt replay is idempotent");
+            assert!(!super::super::legacy::import_run(&hub, "recoverable").await?, "migration is idempotent");
+            // A canonical run can crash after saving the prerequisite's plan report and before
+            // inserting its next leg. Replay must execute that missing durable action as well.
+            let absent = dependent.clone();
+            hub.store.call(move |c| {
+                let saved: String = c.query_row("SELECT input FROM ci_plans WHERE run_id = 'recoverable'", [], |r| r.get(0))?;
+                let mut input: serde_json::Value = serde_json::from_str(&saved)?;
+                if let Some(input) = input.as_object_mut() { input.insert("legacy_import".into(), serde_json::Value::Bool(false)); }
+                c.execute("UPDATE ci_plans SET input = ?1 WHERE run_id = 'recoverable'", [input.to_string()])?;
+                c.execute("DELETE FROM steps WHERE job_id = ?1", [&absent])?;
+                c.execute("DELETE FROM jobs WHERE id = ?1", [&absent])?;
+                Ok(())
+            }).await?;
+            drop(d);
+            let mut d = dispatcher();
+            d.restore().await?;
+            let resumed = hub.store.jobs("recoverable".into(), false).await?;
+            assert_eq!(resumed.len(), before.len());
+            assert_eq!(resumed.iter().find(|j| j.key == "a").map(|j| j.status), Some(Status::Queued));
+            Ok(())
+        })
+    }
+
+    /// U01/U03: exercise the production startup path, not just replay directly.
+    #[test]
+    fn u01_disabled_ingress_startup_recovers_canonical_work_without_new_ingress() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            use super::*;
+            let hub = crate::hub::tests::scratch_hub_with(|cfg| cfg.ci.enabled = false).await?;
+            let repo = hub.store.upsert_repo(Repo {
+                id: "disabled-repo".into(), name: "test/disabled".into(), clone_url: "file:///missing".into(),
+                branches: vec!["main".into()], poll_seconds: 60, enabled: true, created_at: 0,
+                last_polled_at: None, last_error: None, mode: "upstream".into(), default_branch: Some("main".into()), mirror: None,
+            }).await?;
+            let (workflow, diagnostics) = kiln_ci::wf::parse_workflow(".kiln/disabled.yaml", "name: disabled\non: push\njobs:\n  build:\n    runs-on: [missing-runner]\n    steps: [{run: echo build}]\n", kiln_ci::expr::Dialect::Kiln);
+            let workflow = Arc::new(workflow.ok_or_else(|| anyhow::anyhow!("{diagnostics:?}"))?);
+            runs::create(&hub, &repo, runs::NewRun {
+                id: "disabled-run".into(), workflow: ".kiln/disabled.yaml".into(), name: "disabled".into(),
+                event: "push".into(), branch: "main".into(), sha: "saved-sha".into(), trusted: true,
+                model: serde_json::to_string(&workflow)?,
+                input: serde_json::json!({ "github": { "ref": "refs/heads/main", "run_attempt": "1" }, "trusted": true, "inputs": {}, "vars": {} }).to_string(),
+                ..runs::NewRun::default()
+            }).await?;
+            spawn(Arc::clone(&hub));
+            crate::rt::timeout(Duration::from_secs(5), async {
+                while hub.ci.restored().is_none() { crate::rt::sleep(Duration::from_millis(10)).await; }
+            }).await.map_err(|_| anyhow::anyhow!("disabled-ingress recovery did not finish"))?;
+            assert!(hub.ci.available(), "the common controller stays available");
+            assert!(!hub.ci.enabled(), "workflow ingress stays disabled");
+            let jobs = hub.store.jobs("disabled-run".into(), false).await?;
+            assert_eq!(jobs.len(), 1);
+            assert!(jobs.iter().all(|j| hub.ci.is_leg(&j.id)), "production startup restores canonical legs");
+            let trigger = crate::gitops::Trigger { event: "push", branch: "main".into(), sha: "new-sha".into(), before: None, pipeline: None, payload: None };
+            assert!(crate::ci::events::on_trigger(&hub, &repo, &trigger).await?.is_empty());
+            // A reply request is a queue barrier: disabled Start consumes it without a run id.
+            let (reply, rx) = async_channel::bounded(1);
+            hub.ci.send(Msg::Start(Box::new(Start {
+                repo, event: Event::default(), path: ".kiln/disabled.yaml".into(), workflow,
+                message: String::new(), author: String::new(), actions: Default::default(), inputs: Default::default(),
+                given: Given { reply: Some(reply), ..Given::default() },
+            })));
+            assert!(matches!(crate::rt::timeout(Duration::from_secs(5), rx.recv()).await, Ok(Err(_))), "disabled ingress drops Start without creating a run");
+            let count: u32 = hub.store.call(|c| Ok(c.query_row("SELECT COUNT(*) FROM runs", [], |r| r.get(0))?)).await?;
+            assert_eq!(count, 1, "recovery never admits another workflow");
+            hub.shutdown.cancel();
+            hub.ci.tx.close();
+            Ok(())
+        })
+    }
+
     /// W05-R17: a rerun's `github.triggering_actor` is whoever reran it, as GitHub names people; an
     /// agent's is the person it acts for.
     #[test]
@@ -3549,6 +4247,77 @@ mod tests {
         assert_eq!(super::request_of(Some(&job("")?), &cfg), fallback);
         assert_eq!(super::request_of(None, &cfg), fallback);
         Ok(())
+    }
+
+    /// U01/W05-R28: a historical retry enters the real dispatcher, keeps the successful
+    /// prerequisite's result and queues a canonical leg before releasing its dependent.
+    #[test]
+    fn u01_historical_retry_uses_canonical_attempt_and_preserves_dependencies() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            use crate::store::{Repo, Run, Status};
+            let hub = crate::hub::tests::scratch_hub_with(|cfg| { cfg.ci.enabled = true; cfg.conversations.off = true; }).await?;
+            let repo = hub.store.upsert_repo(Repo {
+                id: "retry-repo".into(), name: "test/historical-retry".into(), clone_url: "file:///missing".into(),
+                branches: vec!["main".into()], poll_seconds: 60, enabled: true, created_at: 0,
+                last_polled_at: None, last_error: None, mode: "upstream".into(), default_branch: Some("main".into()), mirror: None,
+            }).await?;
+            let workflow = crate::pipeline::parse("name: ci\njobs:\n  prepare:\n    steps: [{run: echo prepare}]\n  fails:\n    needs: [prepare]\n    steps: [{run: echo fails}]\n  dependent:\n    needs: [fails]\n    steps: [{run: echo dependent}]\n")?;
+            hub.store.create_run(Run {
+                id: "historical-retry".into(), repo_id: repo.id, repo_name: repo.name, number: 0,
+                pipeline: "ci".into(), event: "push".into(), branch: "main".into(), sha: "saved-sha".into(),
+                message: String::new(), author: "person".into(), status: Status::Queued, created_at: 0,
+                started_at: None, finished_at: None, error: None, concurrency_group: None,
+            }, crate::pipeline::plan(&workflow, &crate::pipeline::Context::default())?).await?;
+            hub.store.call(|c| {
+                c.execute("UPDATE runs SET status = 'failed', started_at = 1, finished_at = 2 WHERE id = 'historical-retry'", [])?;
+                c.execute("UPDATE jobs SET status = CASE key WHEN 'prepare' THEN 'succeeded' WHEN 'fails' THEN 'failed' ELSE 'skipped' END, finished_at = 2 WHERE run_id = 'historical-retry'", [])?;
+                Ok(())
+            }).await?;
+            let original = hub.store.jobs("historical-retry".into(), false).await?;
+            let old = |key: &str| original.iter().find(|j| j.key == key).ok_or_else(|| anyhow::anyhow!("missing fixture job {key}"));
+            let failed = old("fails")?.id.clone();
+            let prepared = old("prepare")?.id.clone();
+            crate::ci::dispatch::spawn(std::sync::Arc::clone(&hub));
+            let result = async {
+                crate::rt::timeout(std::time::Duration::from_secs(5), async {
+                    while hub.ci.restored().is_none() { crate::rt::sleep(std::time::Duration::from_millis(10)).await; }
+                }).await.map_err(|_| anyhow::anyhow!("retry dispatcher did not restore"))?;
+                // No direct import or rerun helper: the person's public handler must adopt v1.
+                let response = crate::ci::retry::retry(&hub, &failed, &serde_json::json!({}), "user:person").await
+                    .map_err(|(status, why)| anyhow::anyhow!("historical retry refused: {status} {why}"))?;
+                assert_eq!(response.status(), http::StatusCode::CREATED);
+                type Row = (String, String, String, Option<String>, u32, Option<String>);
+                let (attempt, rows, model): (u32, Vec<Row>, String) = hub.store.call(|c| {
+                    let attempt = c.query_row("SELECT attempt FROM runs WHERE id = 'historical-retry'", [], |r| r.get(0))?;
+                    let mut q = c.prepare("SELECT id, key, status, job_id, run_attempt, reused_from FROM jobs WHERE run_id = 'historical-retry' ORDER BY rowid")?;
+                    let rows = q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?.collect::<Result<Vec<_>, _>>()?;
+                    let model = c.query_row("SELECT workflow FROM ci_plans WHERE run_id = 'historical-retry'", [], |r| r.get(0))?;
+                    Ok((attempt, rows, model))
+                }).await?;
+                assert_eq!(attempt, 2);
+                assert_eq!(rows.len(), 5, "three historical legs, one reused prerequisite and one queued retry");
+                for j in &original {
+                    let row = rows.iter().find(|r| r.0 == j.id).ok_or_else(|| anyhow::anyhow!("historical job disappeared"))?;
+                    assert_eq!((&row.1, row.2.as_str(), row.4), (&j.key, j.status.as_str(), 1), "historical outcome stays in attempt one");
+                }
+                let current: Vec<&Row> = rows.iter().filter(|r| r.4 == 2).collect();
+                let prerequisite = current.iter().find(|r| r.1 == "prepare").ok_or_else(|| anyhow::anyhow!("successful prerequisite not reused"))?;
+                assert_eq!((prerequisite.2.as_str(), prerequisite.5.as_deref()), ("succeeded", Some(prepared.as_str())));
+                let retried = current.iter().find(|r| r.1 == "fails").ok_or_else(|| anyhow::anyhow!("canonical retry leg missing"))?;
+                assert_ne!(retried.0, failed);
+                assert_eq!((retried.2.as_str(), retried.3.as_deref(), retried.5.as_deref()), ("queued", Some("fails"), None));
+                assert!(hub.ci.is_leg(&retried.0), "the shared dispatcher owns the queued retry");
+                assert!(rows.iter().all(|r| r.3.is_some()), "retry produces no legacy executable jobs");
+                assert!(!current.iter().any(|r| r.1 == "dependent"), "dependent waits for the retried job instead of reusing its old skip");
+                let saved: kiln_ci::wf::Workflow = serde_json::from_str(&model)?;
+                let dependent = saved.jobs.iter().find(|j| j.id == "dependent").ok_or_else(|| anyhow::anyhow!("dependency missing from imported workflow"))?;
+                assert_eq!(dependent.needs.iter().map(|n| n.job()).collect::<Vec<_>>(), vec!["fails"]);
+                Ok(())
+            }.await;
+            hub.shutdown.cancel();
+            hub.ci.tx.close();
+            result
+        })
     }
 
     /// The scheduler's headroom (W05): a runner's sample reaches the engine as it says, its I/O

@@ -14,7 +14,7 @@ pub mod score;
 
 use std::sync::Arc;
 
-use rusqlite::{OptionalExtension as _, params};
+use crate::sql::{OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -237,7 +237,7 @@ fn clip(s: &str, n: usize) -> String {
     if t.chars().count() > n { format!("{}…", t.chars().take(n).collect::<String>()) } else { t.to_owned() }
 }
 
-fn load(c: &rusqlite::Connection, id: &str) -> anyhow::Result<Option<Research>> {
+fn load(c: &crate::sql::Connection, id: &str) -> anyhow::Result<Option<Research>> {
     c.query_row("SELECT id, question, agent, by, plan_id, sources, findings, skipped, created_at, updated_at FROM research WHERE id = ?1", params![id], |r| {
         let json = |i: usize| r.get::<_, String>(i);
         Ok(Research {
@@ -257,7 +257,7 @@ fn load(c: &rusqlite::Connection, id: &str) -> anyhow::Result<Option<Research>> 
     .map_err(Into::into)
 }
 
-fn save(c: &rusqlite::Connection, r: &Research) -> anyhow::Result<()> {
+fn save(c: &crate::sql::Connection, r: &Research) -> anyhow::Result<()> {
     c.execute(
         "UPDATE research SET sources = ?2, findings = ?3, skipped = ?4, plan_id = ?5, updated_at = ?6 WHERE id = ?1",
         params![r.id, serde_json::to_string(&r.sources)?, serde_json::to_string(&r.findings)?, serde_json::to_string(&r.skipped)?, r.plan, r.updated_at],
@@ -770,6 +770,8 @@ mod checked_tests {
                     c.conversations.off = true;
                 })
                 .await?;
+                // U17: complete restoration before this fixture accepts session starts.
+                crate::harness::registry::Registry::initialize_local(&hub).await?;
                 let h = Arc::clone(&hub);
                 crate::rt::spawn(async move {
                     let _ = crate::harness::registry::Registry::run_local(h).await;

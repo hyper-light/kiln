@@ -67,7 +67,7 @@ use kiln_ci::work::tests::{Binary, Choice, Context, Kept, Marks, Ran};
 use kiln_ci::work::trust::{self, Comparison, Domain, Found, Outcome, Passed, Quotas, Usage};
 use kiln_ci::work::verify::{self, Verdict};
 use ledger::{Audit, Rows};
-use rusqlite::{Connection, OptionalExtension as _, params};
+use crate::sql::{Connection, OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 
 /// The ledger's families (W24-R02).
@@ -210,7 +210,7 @@ pub fn digest(r: &Recorded) -> String {
 }
 
 /// A row, written or replaced.
-pub fn put(c: &Connection, family: Family, key: &str, value: &[u8], at: i64) -> rusqlite::Result<()> {
+pub fn put(c: &Connection, family: Family, key: &str, value: &[u8], at: i64) -> crate::sql::Result<()> {
     c.execute(
         "INSERT INTO work_records (family, key, value, at) VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT (family, key) DO UPDATE SET value = excluded.value, at = excluded.at",
@@ -221,24 +221,24 @@ pub fn put(c: &Connection, family: Family, key: &str, value: &[u8], at: i64) -> 
 
 /// A row written only where its key holds none (W24-R22: an entry is never overwritten), and
 /// whether it was: the database itself refuses the second write, however the writers race.
-pub fn put_new(c: &Connection, family: Family, key: &str, value: &[u8], at: i64) -> rusqlite::Result<bool> {
+pub fn put_new(c: &Connection, family: Family, key: &str, value: &[u8], at: i64) -> crate::sql::Result<bool> {
     let n = c.execute("INSERT INTO work_records (family, key, value, at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT (family, key) DO NOTHING", params![family.name(), key, value, at])?;
     Ok(n > 0)
 }
 
 /// A row's value.
-pub fn get(c: &Connection, family: Family, key: &str) -> rusqlite::Result<Option<Vec<u8>>> {
+pub fn get(c: &Connection, family: Family, key: &str) -> crate::sql::Result<Option<Vec<u8>>> {
     c.query_row("SELECT value FROM work_records WHERE family = ?1 AND key = ?2", params![family.name(), key], |r| r.get(0)).optional()
 }
 
 /// A row gone.
-pub fn delete(c: &Connection, family: Family, key: &str) -> rusqlite::Result<()> {
+pub fn delete(c: &Connection, family: Family, key: &str) -> crate::sql::Result<()> {
     c.execute("DELETE FROM work_records WHERE family = ?1 AND key = ?2", params![family.name(), key])?;
     Ok(())
 }
 
 /// The rows whose keys start with `prefix`, highest `at` first.
-pub fn scan(c: &Connection, family: Family, prefix: &str) -> rusqlite::Result<Vec<(String, Vec<u8>, i64)>> {
+pub fn scan(c: &Connection, family: Family, prefix: &str) -> crate::sql::Result<Vec<(String, Vec<u8>, i64)>> {
     let mut q = c.prepare_cached("SELECT key, value, at FROM work_records WHERE family = ?1 AND key >= ?2 AND key < ?3 ORDER BY at DESC, key")?;
     let rows = q.query_map(params![family.name(), prefix, format!("{prefix}\u{10FFFF}")], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
     rows.collect()
@@ -1420,7 +1420,7 @@ mod tests {
     #[test]
     fn w24_ac10_lookup_p99_under_5ms() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let s = crate::store::Store::open(&dir.path().join("kiln.db"))?;
+        let s = crate::store::Store::open(&dir.path().join("kiln.db")).context("W24-AC10: open and initialize on-disk Store")?;
         let units: u64 = 5_000;
         crate::rt::block_on(async move {
             s.call(move |c| {
@@ -1434,7 +1434,7 @@ mod tests {
                 tx.commit()?;
                 Ok(())
             })
-            .await?;
+            .await.context("W24-AC10: seed 20,000 results under 5,000 weak keys")?;
             // Up to three rounds of each, the best one's p99 held to 5 ms: what else runs on the
             // machine (ci/gate.sh runs the workspace's tests at once) only adds time, so one slow
             // round says little, and a lookup that is slow is slow in every round.
@@ -1445,7 +1445,7 @@ mod tests {
                 for i in 0..units {
                     let n = (i * 7_919) % units;
                     let started = std::time::Instant::now();
-                    let hit = s.call(move |c| lookup(c, &scope("acme/app", "trusted"), &unit(n), &same)).await?;
+                    let hit = s.call(move |c| lookup(c, &scope("acme/app", "trusted"), &unit(n), &same)).await.with_context(|| format!("W24-AC10: own-key lookup round {round}, index {i}, unit {n}"))?;
                     took.push(started.elapsed());
                     anyhow::ensure!(hit.is_some_and(|h| h.class.is_none()), "unit {n} has results under its own key");
                 }
@@ -1458,14 +1458,14 @@ mod tests {
             }
             anyhow::ensure!(best < limit, "p99 {best:?} is 5 ms or more in each of 3 rounds");
             let (no_op, witness) = rule("drop-true", Rewrite::Drop { op: Pattern::Is("true".into()) }, "make\ntrue", "make");
-            s.call(move |c| register(c, &scope("acme/app", "trusted"), &no_op, &witness)).await?;
+            s.call(move |c| register(c, &scope("acme/app", "trusted"), &no_op, &witness)).await.context("W24-AC10: register drop-true rule before by-class lookups")?;
             let mut best = std::time::Duration::MAX;
             for round in 1..=3 {
                 let mut took = Vec::new();
                 for i in 0..units {
                     let n = (i * 7_919) % units;
                     let started = std::time::Instant::now();
-                    let hit = s.call(move |c| lookup(c, &scope("acme/app", "trusted"), &Unit { definition: format!("{}\ntrue", unit(n).definition), ..unit(n) }, &same)).await?;
+                    let hit = s.call(move |c| lookup(c, &scope("acme/app", "trusted"), &Unit { definition: format!("{}\ntrue", unit(n).definition), ..unit(n) }, &same)).await.with_context(|| format!("W24-AC10: by-class lookup round {round}, index {i}, unit {n}"))?;
                     took.push(started.elapsed());
                     anyhow::ensure!(hit.is_some_and(|h| h.class.is_some()), "unit {n}, rewritten, is found by class");
                 }
@@ -2424,7 +2424,7 @@ mod tests {
             let kq = record(c, &sc, &quick, &reads(60, 0), &rec(10_000, "sha256:a1"))?;
             let ks = record(c, &sc, &slow, &reads(61, 0), &rec(100_000, "sha256:b1"))?;
             for (k, obj) in [(&kq, "o1"), (&ks, "o2")] {
-                c.execute("INSERT INTO work_records (family, key, value, at) VALUES ('work.object', ?1, ?2, 0)", rusqlite::params![format!("{sc}{obj}"), k.hex().as_bytes()])?;
+                c.execute("INSERT INTO work_records (family, key, value, at) VALUES ('work.object', ?1, ?2, 0)", crate::sql::params![format!("{sc}{obj}"), k.hex().as_bytes()])?;
             }
             let held: u64 = scan(c, Family::Result, "acme/app|")?.iter().map(|(_, v, _)| (v.len() as u64).saturating_add(1 << 20)).sum();
             let tight = Quotas { trusted: held - 1, protected: u64::MAX, untrusted: u64::MAX, person: u64::MAX };
@@ -2459,7 +2459,7 @@ mod tests {
                 let rec = Recorded { provenance: Provenance { ms, ..Provenance::default() }, size: 1 << 30, ..made("trusted", "", &[("bin", "sha256:aa")]) };
                 let k = record(c, &sc, &unit(n), &reads(n, 0), &rec)?;
                 let key = format!("{sc}{}", k.hex());
-                c.execute("UPDATE work_records SET at = ?1 WHERE family = 'work.result' AND key = ?2", rusqlite::params![now - age_days * 86_400, key])?;
+                c.execute("UPDATE work_records SET at = ?1 WHERE family = 'work.result' AND key = ?2", crate::sql::params![now - age_days * 86_400, key])?;
                 keys.push(key);
             }
             let volume = 100u64 << 30;
@@ -2509,7 +2509,7 @@ mod tests {
                     let sc = scope(repo, "trusted");
                     let rec = Recorded { provenance: Provenance { ms: 1_000 * n, ..Provenance::default() }, size: 2 << 30, ..made("trusted", "", &[("bin", "sha256:aa")]) };
                     let k = record(c, &sc, &unit(n), &reads(n, 0), &rec)?;
-                    c.execute("UPDATE work_records SET at = ?1 WHERE family = 'work.result' AND key = ?2", rusqlite::params![now, format!("{sc}{}", k.hex())])?;
+                    c.execute("UPDATE work_records SET at = ?1 WHERE family = 'work.result' AND key = ?2", crate::sql::params![now, format!("{sc}{}", k.hex())])?;
                     n += 1;
                 }
                 let held = |c: &Connection| -> anyhow::Result<u64> { Ok(scan(c, Family::Result, "")?.iter().map(|(_, v, _)| (v.len() as u64).saturating_add(2 << 30)).sum()) };

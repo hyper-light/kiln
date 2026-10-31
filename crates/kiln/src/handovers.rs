@@ -298,9 +298,16 @@ impl Hub {
 
     /// The newest process took an agent session over, or couldn't (`error`): the older process
     /// that handed it over lets go of it, or goes on with it, or (the newest can't say) asks again.
-    pub(crate) async fn handover_adopted(&self, agent: &str, peer: PeerId, session: String, error: Option<String>) {
-        let pending = self.handovers.lock().adopted(&session, peer);
+    pub(crate) async fn handover_adopted(&self, agent: &str, peer: PeerId, session: String, error: Option<String>) -> anyhow::Result<()> {
         let itself = error.is_none();
+        if itself {
+            let Some(label) = self.instances.lock().get(peer).map(crate::instances::Instance::label) else {
+                anyhow::bail!("session hand-over from runner process {peer} that is no longer connected");
+            };
+            // U17: a failed commit leaves the pending hand-over and its routing unchanged.
+            self.harness.held_by(&session, &label).map_err(crate::hub::evidence_storage)?;
+        }
+        let pending = self.handovers.lock().adopted(&session, peer);
         let Some(h) = pending else {
             // Taken over by that process itself, by a hand-over the server no longer remembers (it
             // was dropped as the older process went away, or the server started again): its word
@@ -309,12 +316,9 @@ impl Hub {
             if itself {
                 tracing::info!(%agent, %session, to = peer, "a runner process of this machine took over an agent session whose hand-over the server had lost track of");
                 self.instances.lock().own(Owned::Agent(session.clone()), peer);
-                if let Some(label) = self.instances.lock().get(peer).map(crate::instances::Instance::label) {
-                    self.harness.held_by(&session, &label);
-                }
                 self.handovers.lock().dropped_in(agent, std::slice::from_ref(&session));
             }
-            return;
+            return Ok(());
         };
         let word = Word::from_newest(error);
         match (&word, itself) {
@@ -322,9 +326,6 @@ impl Hub {
             (Word::Taken, true) => {
                 tracing::info!(%agent, %session, from = h.from, to = peer, "this machine's newest runner process took an agent session over");
                 self.instances.lock().own(Owned::Agent(session.clone()), peer);
-                if let Some(label) = self.instances.lock().get(peer).map(crate::instances::Instance::label) {
-                    self.harness.held_by(&session, &label);
-                }
             }
             // Taken over on the machine before, by another of its processes: the older one lets go,
             // and this one isn't its holder.
@@ -334,6 +335,7 @@ impl Hub {
         }
         self.handed_over(agent, h.from, &session, word).await;
         self.check_retire().await;
+        Ok(())
     }
 
     /// Runner process `peer` of `agent` says it holds agent sessions `held` (its inventory): those

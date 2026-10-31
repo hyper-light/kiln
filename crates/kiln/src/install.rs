@@ -87,13 +87,11 @@ pub struct InstallArgs {
     pub labels: Vec<String>,
     #[arg(long)]
     pub slots: Option<u32>,
-    /// Agent: start this version beside the installed agent instead of restarting it. The old
-    /// runner keeps its terminals, agent sessions and jobs until they end, then retires itself;
-    /// everything new goes to this one. Needs no token or password (the machine proves itself
-    /// with its own certificate). Safe to re-run.
+    /// Retired companion-upgrade option. An authorized caller requests upgrades through CI/CD
+    /// with `kiln updates upgrade <runner>`.
     #[arg(long, requires = "agent")]
     pub upgrade: bool,
-    /// Agent: the installed agent's service (unit, launchd label or task name) for --upgrade.
+    /// Legacy --upgrade service identifier, retained for command compatibility.
     #[arg(long, default_value = "kiln-agent")]
     pub service: String,
     /// Where a server goes: Kubernetes (the default where a kubeconfig names a cluster: its current
@@ -274,6 +272,11 @@ fn put_on_path(bin: &Path) -> Option<crate::os::PathAdded> {
 }
 
 pub async fn install(a: InstallArgs) -> anyhow::Result<()> {
+    install_with_config(a, crate::config::default_config_path()).await
+}
+
+/// Keep a local install's selected config file through enrollment, elevation and boot.
+pub async fn install_with_config(a: InstallArgs, config_path: PathBuf) -> anyhow::Result<()> {
     match a.target()? {
         On::Kubernetes => {
             eprintln_header("Installing kiln on Kubernetes");
@@ -288,6 +291,9 @@ pub async fn install(a: InstallArgs) -> anyhow::Result<()> {
         }
         On::Machine => {}
     }
+    let config_path = std::path::absolute(config_path)?;
+    crate::config::Config::load(&config_path)?;
+    validate_boot_config(&config_path, Boot::None)?;
     if a.system && cfg!(windows) {
         anyhow::bail!("--system is not supported on Windows: kiln installs per user and needs no administrator rights");
     }
@@ -298,7 +304,14 @@ pub async fn install(a: InstallArgs) -> anyhow::Result<()> {
         if a.unattended {
             cmd.arg("-n");
         }
-        cmd.arg("--preserve-env=KILN_JOIN_TOKEN,KILN_SERVER").arg(exe).args(std::env::args().skip(1));
+        // Carry the resolved filename, not a relative argv spelling or sudo's defaults.
+        let mut original = std::env::args_os().skip(1);
+        let mut forwarded = Vec::new();
+        while let Some(arg) = original.next() {
+            if arg == "--config" { let _ = original.next(); }
+            else if !arg.to_str().is_some_and(|arg| arg.starts_with("--config=")) { forwarded.push(arg); }
+        }
+        cmd.arg("--preserve-env=KILN_JOIN_TOKEN,KILN_SERVER").arg(exe).arg("--config").arg(&config_path).args(forwarded);
         let st = cmd.status().context("run sudo")?;
         if !st.success() {
             anyhow::bail!(
@@ -313,6 +326,7 @@ pub async fn install(a: InstallArgs) -> anyhow::Result<()> {
         return Ok(());
     }
     if a.agent && a.upgrade {
+        anyhow::ensure!(config_path == std::path::absolute(crate::config::default_config_path())?, "companion upgrade cannot preserve a non-default --config context; no upgrade was started");
         eprintln_header("Upgrading the kiln agent beside the running one");
         return crate::upgrade::install_alongside(&a.service, None, &|m| say(m)).await;
     }
@@ -330,6 +344,7 @@ pub async fn install(a: InstallArgs) -> anyhow::Result<()> {
             let units = beside.join(", ");
             return match crate::upgrade::knows_machine(&server, &state_dir).await {
                 Ok(true) => {
+                    anyhow::ensure!(config_path == std::path::absolute(crate::config::default_config_path())?, "runner takeover cannot preserve a non-default --config context; no takeover was started");
                     eprintln_header("Taking over this machine's kiln agent");
                     say(format!("runner      {units} works for {server} already: this kiln takes it over (its name, labels and slots stay)"));
                     crate::upgrade::take_over(&state_dir, &server, &|m| say(m)).await
@@ -341,7 +356,6 @@ pub async fn install(a: InstallArgs) -> anyhow::Result<()> {
     }
     let system = a.system || is_root();
     let bin = bin_path(system);
-    let config_path = crate::config::default_config_path();
     // A server installed where none was: a failure takes back what it made, and nothing else may
     // answer on its port (the check would ask that instead).
     let fresh = !a.agent && !config_path.exists();
@@ -394,7 +408,7 @@ async fn install_here(a: &InstallArgs, system: bool, bin: &Path, config_path: &P
 
     let mut state_dir = crate::config::default_data_dir().join("agent");
     let (unit, args): (&str, Vec<String>) = if a.agent {
-        ("kiln-agent", agent_setup(a).await?)
+        ("kiln-agent", agent_setup(a, config_path).await?)
     } else {
         if !config_path.exists() {
             let cfg = crate::config::Config::default();
@@ -430,7 +444,7 @@ async fn install_here(a: &InstallArgs, system: bool, bin: &Path, config_path: &P
         } else {
             running = start_replacing(&boot, || {
                 let mut cmd = Command::new(bin);
-                cmd.arg("supervise").arg("--detach").args(sup_args.iter().skip(1));
+                cmd.args(boot.detach_args());
                 run(&mut cmd)?;
                 say("started     kiln supervise (detached)");
                 Ok(true)
@@ -492,7 +506,7 @@ fn eprintln_header(s: &str) {
 }
 
 /// Enroll now (so the boot command carries no secret) and return the agent's run arguments.
-async fn agent_setup(a: &InstallArgs) -> anyhow::Result<Vec<String>> {
+async fn agent_setup(a: &InstallArgs, config_path: &Path) -> anyhow::Result<Vec<String>> {
     let server = a.server.clone().ok_or_else(|| anyhow::anyhow!("--server is required for an agent"))?;
     let name = a.name.clone().unwrap_or_else(crate::config::Config::hostname);
     let labels = if a.labels.is_empty() { vec!["baremetal".to_owned()] } else { a.labels.clone() };
@@ -505,6 +519,7 @@ async fn agent_setup(a: &InstallArgs) -> anyhow::Result<Vec<String>> {
         slots: a.slots.unwrap_or(1),
         work_dir: state_dir.join("work"),
         state_dir: state_dir.clone(),
+        shared_store: None,
         join_token: a.token.clone(),
         ephemeral: false,
         dedicated_job: None,
@@ -513,7 +528,7 @@ async fn agent_setup(a: &InstallArgs) -> anyhow::Result<Vec<String>> {
         shell: None,
         credentials: None,
         instance: None,
-        config: None,
+        config: Some(config_path.to_path_buf()),
         reach: Some(true),
         observe: true,
         outpost: false,
@@ -579,6 +594,11 @@ impl Install<'_> {
     fn detach_args(&self) -> Vec<String> {
         let mut v = vec!["supervise".to_owned(), "--detach".to_owned()];
         v.extend(self.args.iter().skip(1).cloned());
+        // Keep the wrapper/agent prefixes readable by existing service discovery, and keep
+        // this global flag in Existing.args when a later install rewrites the service.
+        if crate::upgrade::arg_value(self.args, "--config").is_none() {
+            v.push(format!("--config={}", self.config.display()));
+        }
         v
     }
 
@@ -586,6 +606,53 @@ impl Install<'_> {
     fn detach_command_line(&self) -> String {
         self.detach_args().iter().map(|a| win_quote(a)).collect::<Vec<_>>().join(" ")
     }
+}
+
+/// Quote one Environment value identically for a fresh unit and a retained service rewrite.
+fn systemd_environment(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"").replace('%', "%%")
+}
+
+/// Canonical systemd definition, also used for companion runner units. systemd >=254
+/// places ExecStart in the control leaf; runtime validates the actual kernel layout.
+fn systemd_body(i: &Install<'_>) -> String {
+    let (system, unit) = (i.system, i.unit);
+    let exec = format!("{} {}", i.bin.display(), i.args.iter().map(|s| shell_quote(s)).collect::<Vec<_>>().join(" "));
+    let env = match i.env {
+        Some(list) => list.iter().filter(|kv| !kv.starts_with("KILN_CGROUP_LAYOUT=")).map(|kv| format!("Environment=\"{}\"\n", systemd_environment(kv))).collect::<String>(),
+        None => format!(
+            "Environment=\"KILN_CONFIG={cfg}\"\n\
+             # The installing user's PATH, so jobs find the same toolchains (nvm, cargo, uv, go).\n\
+             Environment=\"PATH={path}\"\n",
+            cfg = systemd_environment(&i.config.to_string_lossy()),
+            path = std::env::var("PATH").unwrap_or_default().replace('%', "%%").replace('"', ""),
+        ),
+    };
+    format!(
+        "[Unit]\nDescription=kiln {unit} (self-supervising CI/CD job server)\nAfter=network-online.target\nWants=network-online.target\n\n\
+         [Service]\nType=simple\n{env}Environment=KILN_CGROUP_LAYOUT=systemd-control-v1\n\
+         Delegate=cpu memory\nDelegateSubgroup=kiln-control\nExecStart={exec}\n\
+         # kiln supervises and restarts its own server; this only covers the supervisor itself.\n\
+         Restart=always\nRestartSec=5\nKillMode=mixed\nTimeoutStopSec=30\nLimitNOFILE=1048576\n\n\
+         [Install]\nWantedBy={target}\n",
+        target = if system { "multi-user.target" } else { "default.target" },
+    )
+}
+
+/// The existing text boot renderers must either retain a filename or refuse it explicitly.
+/// This is pure validation; it neither probes the host nor installs/starts anything.
+fn validate_boot_config(path: &Path, boot: Boot) -> anyhow::Result<()> {
+    let path = path.to_str().context("boot config filename must be UTF-8")?;
+    anyhow::ensure!(!path.chars().any(char::is_control), "boot config filename contains control characters");
+    match boot {
+        // Rediscovery currently preserves escaped Environment text, so a second rendering
+        // would double % again. Refuse this filename until that legacy grammar is qualified.
+        Boot::Systemd => anyhow::ensure!(!path.contains('%'), "systemd boot cannot preserve a config filename containing % across service rediscovery; choose another boot mechanism"),
+        Boot::Cron => anyhow::ensure!(!path.contains('%'), "cron boot cannot preserve a config filename containing %; choose another boot mechanism"),
+        Boot::Xdg => anyhow::ensure!(path.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:=,@".contains(c)), "XDG boot cannot preserve this config filename with its existing command renderer; choose another boot mechanism"),
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Returns true when the boot mechanism also started the service now.
@@ -600,32 +667,18 @@ fn setup_boot(boot: Boot, i: &Install<'_>) -> anyhow::Result<bool> {
         Boot::Auto => Boot::None,
         b => b,
     };
-    let (system, unit, bin, args, config) = (i.system, i.unit, i.bin, i.args, i.config);
-    let exec = format!(
-        "{} {}",
-        bin.display(),
-        args.iter().map(|s| shell_quote(s)).collect::<Vec<_>>().join(" ")
-    );
+    validate_boot_config(i.config, boot)?;
+    // A companion/rewrite retains its existing service environment rather than this caller's
+    // default config field. Validate that actual filename as well before writing a boot unit.
+    if let Some(env) = i.env {
+        for config in env.iter().filter_map(|entry| entry.strip_prefix("KILN_CONFIG=")) {
+            validate_boot_config(Path::new(config), boot)?;
+        }
+    }
+    let (system, unit, bin) = (i.system, i.unit, i.bin);
     match boot {
         Boot::Systemd => {
-            let env = match i.env {
-                Some(list) => list.iter().map(|kv| format!("Environment=\"{}\"\n", kv.replace('"', "").replace('%', "%%"))).collect::<String>(),
-                None => format!(
-                    "Environment=KILN_CONFIG={cfg}\n\
-                     # The installing user's PATH, so jobs find the same toolchains (nvm, cargo, uv, go).\n\
-                     Environment=\"PATH={path}\"\n",
-                    cfg = config.display(),
-                    path = std::env::var("PATH").unwrap_or_default().replace('%', "%%").replace('"', ""),
-                ),
-            };
-            let body = format!(
-                "[Unit]\nDescription=kiln {unit} (self-supervising CI/CD job server)\nAfter=network-online.target\nWants=network-online.target\n\n\
-                 [Service]\nType=simple\n{env}ExecStart={exec}\n\
-                 # kiln supervises and restarts its own server; this only covers the supervisor itself.\n\
-                 Restart=always\nRestartSec=5\nKillMode=mixed\nTimeoutStopSec=30\nLimitNOFILE=1048576\n\n\
-                 [Install]\nWantedBy={target}\n",
-                target = if system { "multi-user.target" } else { "default.target" },
-            );
+            let body = systemd_body(i);
             let (path, user_flag): (PathBuf, &[&str]) = if system {
                 (PathBuf::from(format!("/etc/systemd/system/{unit}.service")), &[])
             } else {
@@ -654,7 +707,7 @@ fn setup_boot(boot: Boot, i: &Install<'_>) -> anyhow::Result<bool> {
             Ok(true)
         }
         Boot::Cron => {
-            let line = format!("@reboot {} supervise --detach {}", bin.display(), args.iter().skip(1).map(|s| shell_quote(s)).collect::<Vec<_>>().join(" "));
+            let line = format!("@reboot {} {}", shell_quote(&bin.display().to_string()), i.detach_args().iter().map(|s| shell_quote(s)).collect::<Vec<_>>().join(" "));
             let current = Command::new("crontab").arg("-l").output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
             if !current.lines().any(|l| l.trim() == line) {
                 let mut child = Command::new("crontab").arg("-").stdin(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn()?;
@@ -669,8 +722,8 @@ fn setup_boot(boot: Boot, i: &Install<'_>) -> anyhow::Result<bool> {
                     // busybox's crontab refuses anyone but root unless it's setuid.
                     let why = String::from_utf8_lossy(&out.stderr).trim().to_owned();
                     say(format!(
-                        "boot        none: crontab refused it ({why}); start it with kiln supervise --detach -- {}",
-                        args.iter().skip(2).map(|s| shell_quote(s)).collect::<Vec<_>>().join(" ")
+                        "boot        none: crontab refused it ({why}); start it with kiln {}",
+                        i.detach_args().iter().map(|s| shell_quote(s)).collect::<Vec<_>>().join(" ")
                     ));
                     return Ok(false);
                 }
@@ -681,9 +734,9 @@ fn setup_boot(boot: Boot, i: &Install<'_>) -> anyhow::Result<bool> {
         Boot::Xdg => {
             let path = home().join(format!(".config/autostart/{unit}.desktop"));
             let body = format!(
-                "[Desktop Entry]\nType=Application\nName=kiln {unit}\nExec={} supervise --detach {}\nX-GNOME-Autostart-enabled=true\nNoDisplay=true\n",
+                "[Desktop Entry]\nType=Application\nName=kiln {unit}\nExec={} {}\nX-GNOME-Autostart-enabled=true\nNoDisplay=true\n",
                 bin.display(),
-                args.iter().skip(1).map(|s| shell_quote(s)).collect::<Vec<_>>().join(" ")
+                i.detach_args().iter().map(|s| shell_quote(s)).collect::<Vec<_>>().join(" ")
             );
             crate::util::write_secret(&path, body.as_bytes(), 0o644)?;
             say(format!("boot        XDG autostart {} (starts at login)", path.display()));
@@ -1451,9 +1504,27 @@ fn parse_task(xml: &str) -> Option<TaskDefinition> {
     Some(TaskDefinition { command: field("Command")?, arguments: field("Arguments").unwrap_or_default(), at_boot: xml.contains("<BootTrigger") })
 }
 
+/// Only the Startup-folder fallback is parsed by CMD. Its filename must not expand or
+/// become another command, including when inherited delayed expansion is enabled.
+fn validate_startup_config(i: &Install<'_>) -> anyhow::Result<()> {
+    let check = |path: &str| -> anyhow::Result<()> {
+        anyhow::ensure!(!path.chars().any(|c| c.is_control() || "%!^&|<>()\"".contains(c)), "Startup-folder fallback cannot preserve this config filename in CMD; choose a Scheduled Task or another boot mechanism");
+        Ok(())
+    };
+    check(i.config.to_str().context("Startup-folder config filename must be UTF-8")?)?;
+    // Existing service arguments can carry a config different from the renderer's fallback.
+    let captured = crate::upgrade::arg_value(&i.detach_args(), "--config").context("Startup-folder command lacks its captured config filename")?;
+    check(&captured)?;
+    if let Some(env) = i.env {
+        for config in env.iter().filter_map(|entry| entry.strip_prefix("KILN_CONFIG=")) { check(config)?; }
+    }
+    Ok(())
+}
+
 /// The last resort when Task Scheduler refuses: a `.cmd` in the user's Startup folder, which the
 /// desktop runs at sign-in.
 fn startup_folder(i: &Install<'_>, why: &str) -> anyhow::Result<bool> {
+    validate_startup_config(i)?;
     let path = startup_script(i.unit);
     let body = format!(
         "@echo off\r\nrem kiln {}: start kiln's supervisor at logon (installed by `kiln install`).\r\nstart \"\" /B {} {}\r\n",
@@ -1471,13 +1542,17 @@ fn startup_folder(i: &Install<'_>, why: &str) -> anyhow::Result<bool> {
 fn install_command(i: &Install<'_>) -> String {
     // `supervise -- <subcommand> …`
     let mut rest = i.args.iter().skip_while(|a| *a != "--").skip(1);
-    let mut words = vec!["kiln".to_owned(), "install".to_owned()];
+    let config = crate::upgrade::arg_value(i.args, "--config").unwrap_or_else(|| i.config.display().to_string());
+    let mut words = vec!["kiln".to_owned(), ps_quote(&format!("--config={config}")), "install".to_owned()];
     if rest.next().is_some_and(|sub| sub == "agent") {
         words.push("--agent".to_owned());
     } else {
         words.extend(["--on".to_owned(), "machine".to_owned()]);
     }
-    words.extend(rest.map(|a| ps_quote(a)));
+    while let Some(arg) = rest.next() {
+        if arg == "--config" { let _ = rest.next(); }
+        else if !arg.starts_with("--config=") { words.push(ps_quote(arg)); }
+    }
     words.join(" ")
 }
 
@@ -1795,6 +1870,20 @@ mod tests {
             env: None,
             ask: false,
         };
+        // Rendering must cover the same server, runner and companion install owner without
+        // invoking systemctl. Inherited service environment cannot replace the layout schema.
+        let inherited = ["PATH=/tool/bin".to_owned(), "KILN_CGROUP_LAYOUT=old-layout".to_owned()];
+        for (unit, subcommand, system) in [("kiln", "server", true), ("kiln-agent", "agent", false), ("kiln-agent-other", "agent", false)] {
+            let command = ["supervise", "--", subcommand].map(str::to_owned);
+            let service = Install { unit, args: &command, system, env: Some(&inherited), ..i };
+            let body = systemd_body(&service);
+            assert!(body.contains("Delegate=cpu memory\nDelegateSubgroup=kiln-control\n"));
+            assert!(body.contains("Environment=KILN_CGROUP_LAYOUT=systemd-control-v1\n"));
+            assert_eq!(body.matches("KILN_CGROUP_LAYOUT=").count(), 1);
+            assert!(body.contains("Environment=\"PATH=/tool/bin\""));
+            assert!(body.contains(&format!("supervise -- {subcommand}")));
+            assert!(body.contains(if system { "WantedBy=multi-user.target" } else { "WantedBy=default.target" }));
+        }
         let plist = launchd_body(&i, Path::new("/tmp/kiln.log"), None);
         assert!(plist.contains("<string>io.github.hyper-light.kiln-agent</string>"));
         assert!(plist.contains("<string>supervise</string>\n    <string>--</string>\n    <string>agent</string>"));
@@ -1821,7 +1910,7 @@ mod tests {
         assert_eq!(crate::upgrade::parse_plist(&launchd_body(&again, Path::new("/tmp/kiln.log"), Some(launcher)), "kiln-agent", false).map(|e| e.env), Some(env));
         for start in [TaskStart::Boot, TaskStart::SignIn] {
             let xml = task_xml(&i, start);
-            assert!(xml.contains("<Arguments>supervise --detach -- agent --name &quot;box &lt;1&gt; &amp; co&quot;</Arguments>"));
+            assert!(xml.contains("<Arguments>supervise --detach -- agent --name &quot;box &lt;1&gt; &amp; co&quot; --config=/Users/me/.config/kiln/kiln.toml</Arguments>"));
             assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
             assert!(xml.contains("<RunLevel>LeastPrivilege</RunLevel>"), "never elevated");
             assert!(xml.contains("<LogonTrigger>"), "both start at sign-in");
@@ -1835,6 +1924,51 @@ mod tests {
         assert!(boot.contains("<BootTrigger>") && boot.contains("<LogonType>S4U</LogonType>"));
         let sign_in = task_xml(&i, TaskStart::SignIn);
         assert!(!sign_in.contains("<BootTrigger>") && sign_in.contains("<LogonType>InteractiveToken</LogonType>"));
+        // A captured custom filename survives the existing boot grammars that support it.
+        let quoted = Install { config: Path::new("/Users/me/config O'Brien box.toml"), ..i };
+        for boot in [Boot::Systemd, Boot::Launchd, Boot::Task, Boot::Cron, Boot::None] {
+            validate_boot_config(quoted.config, boot)?;
+        }
+        validate_startup_config(&quoted)?;
+        let percent_task = Install { config: Path::new(r"C:\cfg\%USERNAME%.toml"), ..i };
+        validate_boot_config(percent_task.config, Boot::Task)?;
+        assert!(parse_task(&task_xml(&percent_task, TaskStart::SignIn)).context("percent task XML not parsed")?.runs(&percent_task), "Task XML codec retains percent; provider execution is not exercised");
+        let fallback_error = "Startup-folder fallback cannot preserve this config filename in CMD; choose a Scheduled Task or another boot mechanism";
+        for marker in ["%USERNAME%", "!", "^", "&", "|", "<", ">", "(", ")", "\"", "\n"] {
+            let filename = format!("C:\\cfg\\a{marker}b.toml");
+            let unsafe_config = Install { config: Path::new(&filename), ..i };
+            assert_eq!(validate_startup_config(&unsafe_config).err().context("CMD fallback accepted metacharacter")?.to_string(), fallback_error);
+        }
+        let captured_args = ["supervise", "--", "agent", r"--config=C:\cfg\a&b.toml"].map(str::to_owned);
+        assert_eq!(validate_startup_config(&Install { args: &captured_args, ..i }).err().context("CMD fallback ignored captured config")?.to_string(), fallback_error);
+        let retained_env = [r"KILN_CONFIG=C:\cfg\a!b.toml".to_owned()];
+        assert_eq!(validate_startup_config(&Install { env: Some(&retained_env), ..i }).err().context("CMD fallback ignored retained config env")?.to_string(), fallback_error);
+        let task = parse_task(&task_xml(&quoted, TaskStart::SignIn)).context("quoted config task not parsed")?;
+        assert!(task.runs(&quoted));
+        let unit = crate::upgrade::parse_unit(&systemd_body(&quoted), "kiln-agent", false).context("quoted config unit not parsed")?;
+        assert!(unit.env.contains(&"KILN_CONFIG=/Users/me/config O'Brien box.toml".to_owned()));
+        let job = crate::upgrade::parse_plist(&launchd_body(&quoted, Path::new("/tmp/kiln.log"), None), "kiln-agent", false).context("quoted config plist not parsed")?;
+        assert!(job.env.contains(&"KILN_CONFIG=/Users/me/config O'Brien box.toml".to_owned()));
+        // Rediscovery and a companion rewrite must preserve the exact representable filename.
+        let escaped = Install { config: Path::new("/config/a\"b\\c.toml"), ..i };
+        validate_boot_config(escaped.config, Boot::Systemd)?;
+        let first = crate::upgrade::parse_unit(&systemd_body(&escaped), "kiln-agent", false).context("escaped config unit not parsed")?;
+        let expected = format!("KILN_CONFIG={}", escaped.config.display());
+        assert!(first.env.contains(&expected));
+        let retained = Install { env: Some(&first.env), ..escaped };
+        let second = crate::upgrade::parse_unit(&systemd_body(&retained), "kiln-agent", false).context("rewritten config unit not parsed")?;
+        assert!(second.env.contains(&expected), "service rewrite must retain quote and backslash bytes");
+        assert_eq!(second.env.iter().filter(|entry| entry.starts_with("KILN_CONFIG=")).count(), 1);
+        assert_eq!(validate_boot_config(Path::new("/config/100%.toml"), Boot::Systemd).err().context("systemd accepted percent")?.to_string(), "systemd boot cannot preserve a config filename containing % across service rediscovery; choose another boot mechanism");
+        assert_eq!(validate_boot_config(Path::new("/config/100%.toml"), Boot::Cron).err().context("cron accepted percent")?.to_string(), "cron boot cannot preserve a config filename containing %; choose another boot mechanism");
+        assert_eq!(validate_boot_config(quoted.config, Boot::Xdg).err().context("XDG accepted unsupported filename")?.to_string(), "XDG boot cannot preserve this config filename with its existing command renderer; choose another boot mechanism");
+        assert_eq!(validate_boot_config(Path::new("/config/line\nbreak.toml"), Boot::None).err().context("boot accepted control character")?.to_string(), "boot config filename contains control characters");
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            let non_utf8 = Path::new(std::ffi::OsStr::from_bytes(b"/config/\xff.toml"));
+            assert_eq!(validate_boot_config(non_utf8, Boot::None).err().context("boot accepted non-UTF-8")?.to_string(), "boot config filename must be UTF-8");
+        }
         let other = Install { args: &["supervise".to_owned(), "--".to_owned(), "agent".to_owned()], ..i };
         let read = parse_task(&boot).ok_or_else(|| anyhow::anyhow!("not parsed"))?;
         assert!(!read.runs(&other), "another kiln's task");
@@ -1858,7 +1992,7 @@ mod tests {
             anyhow::ensure!(read.runs(&i) && !read.at_boot, "read back as {read:?}");
             // What `kiln install --agent --upgrade` finds to replace.
             let found = crate::upgrade::find_existing(&unit).ok_or_else(|| anyhow::anyhow!("an upgrade finds no {unit}"))?;
-            anyhow::ensure!(found.boot == "task" && found.bin == bin && found.args == ["agent", "--name", "box <1> & co"], "an upgrade finds {found:?}");
+            anyhow::ensure!(found.boot == "task" && found.bin == bin && found.args == ["agent", "--name", "box <1> & co", "--config=kiln.toml"], "an upgrade finds {found:?}");
             match create_task(&i, TaskStart::Boot, false) {
                 Ok(()) => {
                     anyhow::ensure!(crate::os::elevated(), "registered at boot without administrator rights");
@@ -1874,9 +2008,9 @@ mod tests {
         result
     }
 
-    /// An upgrade for real (Windows, by hand): the binary a task starts is replaced while it runs,
-    /// the running one moved aside, as `kiln install --agent --upgrade` does to a runner. Only a
-    /// throwaway task and binary of its own (a copy of `ping`, standing in for the runner).
+    /// Explicit installer backend for real (Windows, by hand): the binary a task starts is
+    /// replaced while it runs, the running one moved aside. The retired companion upgrade route
+    /// is not used. Only a throwaway task and binary of its own (a copy of `ping`).
     #[test]
     #[ignore = "drives this machine's Task Scheduler"]
     fn an_upgrade_replaces_the_binary_a_task_starts_while_it_runs() -> anyhow::Result<()> {
@@ -1888,8 +2022,7 @@ mod tests {
         let i = Install { system: false, unit: &unit, bin: &bin, args: &args, config: Path::new("kiln.toml"), state_dir: dir.path(), env: None, ask: false };
         create_task(&i, TaskStart::SignIn, false).map_err(anyhow::Error::msg)?;
         let mut runner = Command::new(&bin).args(["-n", "60", "127.0.0.1"]).stdout(Stdio::null()).spawn()?;
-        let owned = unit.clone();
-        let upgraded = crate::rt::block_on(async move { crate::upgrade::install_alongside(&owned, None, &|_: String| {}).await });
+        let upgraded = place_binary(&bin);
         let _ = runner.kill();
         let _ = runner.wait();
         remove_task(&unit);
@@ -1931,9 +2064,12 @@ mod tests {
         // PowerShell would take a bare `a,b,c` for a list, and `'` ends a quoted string.
         assert_eq!(
             install_command(&i),
-            "kiln install --agent --server http://10.0.0.2:7070 --name 'O''Brien box' --labels 'baremetal,windows,x86_64'"
+            "kiln --config=kiln.toml install --agent --server http://10.0.0.2:7070 --name 'O''Brien box' --labels 'baremetal,windows,x86_64'"
         );
+        let unusual = Install { config: Path::new("config O'Brien box.toml"), ..i };
+        assert!(install_command(&unusual).starts_with("kiln '--config=config O''Brien box.toml' install "));
+        assert_eq!(unusual.detach_args().last().map(String::as_str), Some("--config=config O'Brien box.toml"));
         let server = ["supervise", "--", "server"].map(str::to_owned);
-        assert_eq!(install_command(&Install { unit: "kiln", args: &server, ..i }), "kiln install --on machine");
+        assert_eq!(install_command(&Install { unit: "kiln", args: &server, ..i }), "kiln --config=kiln.toml install --on machine");
     }
 }

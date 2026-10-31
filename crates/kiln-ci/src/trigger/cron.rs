@@ -8,7 +8,7 @@
 //! twice (clocks back) runs once, the first time. The tz database is built in, so every host
 //! decides alike.
 
-use jiff::civil::DateTime;
+use jiff::civil::{Date, DateTime};
 pub use jiff::tz::TimeZone;
 use jiff::{Span, Timestamp};
 
@@ -60,7 +60,9 @@ fn field(src: &str, lo: u32, hi: u32, names: &[&str], what: &str) -> Result<u64,
         let mut v = a;
         while v <= b {
             bits |= 1u64 << v;
-            v += step;
+            // U04: a large positive step still names the first value, then terminates.
+            let Some(next) = v.checked_add(step) else { break };
+            v = next;
         }
     }
     Ok(bits)
@@ -92,11 +94,58 @@ impl Cron {
     pub fn names(&self, dt: DateTime) -> bool {
         let bit32 = |set: u32, v: i8| u32::try_from(v).ok().is_some_and(|v| v < 32 && set & (1 << v) != 0);
         let minute = u32::try_from(dt.minute()).ok().is_some_and(|m| self.minutes & (1u64 << m) != 0);
+        minute && bit32(self.hours, dt.hour()) && self.names_date(dt)
+    }
+
+    fn names_date(&self, dt: DateTime) -> bool {
         let month = u32::try_from(dt.month()).ok().is_some_and(|m| u32::from(self.months) & (1 << m) != 0);
-        let dom = bit32(self.days, dt.day());
+        let dom = u32::try_from(dt.day()).ok().is_some_and(|d| self.days & (1 << d) != 0);
         let dow = u32::try_from(dt.weekday().to_sunday_zero_offset()).ok().is_some_and(|d| u32::from(self.weekdays) & (1 << d) != 0);
         let day = if self.any_day || self.any_weekday { dom && dow } else { dom || dow };
-        minute && bit32(self.hours, dt.hour()) && month && day
+        month && day
+    }
+
+    /// U04: the first UTC occurrence strictly after `t`, within the timestamp range.
+    /// Gregorian dates and weekdays repeat every 400 years; a full cycle proves an impossible
+    /// schedule. Skip unselected months and dates, then select a minute from the clock bitsets.
+    pub fn next_after_utc(&self, t: i64) -> Option<i64> {
+        let start = Timestamp::from_second(t).ok()?.to_zoned(TimeZone::UTC).datetime();
+        let end = start.date().checked_add(Span::new().years(400)).unwrap_or(Date::MAX);
+        for year in start.year()..=end.year() {
+            for month in 1..=12 {
+                if self.months & (1u16 << month) == 0 {
+                    continue;
+                }
+                for day in 1..=31 {
+                    // When either day field starts with `*`, both day sets must match.
+                    // Otherwise a weekday may match even an impossible day-of-month.
+                    if (self.any_day || self.any_weekday) && self.days & (1u32 << day) == 0 {
+                        continue;
+                    }
+                    let Ok(date) = Date::new(year, month, day) else { continue };
+                    if date < start.date() {
+                        continue;
+                    }
+                    if date > end {
+                        return None;
+                    }
+                    if !self.names_date(date.at(0, 0, 0, 0)) {
+                        continue;
+                    }
+                    for hour in 0..24 {
+                        if self.hours & (1u32 << hour) == 0 || (date == start.date() && hour < start.hour()) {
+                            continue;
+                        }
+                        let minutes = if date == start.date() && hour == start.hour() { self.minutes & (u64::MAX << (start.minute() + 1)) } else { self.minutes };
+                        if minutes != 0 {
+                            let minute = i8::try_from(minutes.trailing_zeros()).ok()?;
+                            return TimeZone::UTC.to_timestamp(date.at(hour, minute, 0, 0)).ok().map(|ts| ts.as_second());
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Whether the schedule runs at the minute starting at `t` (unix seconds), read in `tz`.
@@ -209,6 +258,11 @@ mod tests {
         let c = Cron::parse("0 9 * * MON-FRI")?;
         assert!(c.fires_at(at("2026-10-16T09:00:00Z"), &utc), "a Friday");
         assert!(!c.fires_at(at("2026-10-17T09:00:00Z"), &utc), "a Saturday");
+        // Canonical `a/n` reaches the field end, including `/1`; the old v1 matcher differed.
+        let c = Cron::parse("5/1 * * * *")?;
+        assert!(!c.fires_at(at("2026-01-01T00:04:00Z"), &utc));
+        assert!(c.fires_at(at("2026-01-01T00:06:00Z"), &utc) && c.fires_at(at("2026-01-01T00:59:00Z"), &utc));
+        assert_eq!(c.next_after_utc(at("2026-01-01T00:05:00Z")), Some(at("2026-01-01T00:06:00Z")));
         // Both day fields restricted: either matches.
         let c = Cron::parse("0 0 1 * MON")?;
         assert!(c.fires_at(at("2026-10-01T00:00:00Z"), &utc), "the 1st, a Thursday");
@@ -221,6 +275,52 @@ mod tests {
         for bad in ["@daily", "60 * * * *", "* * * *", "0 0 L * *", "0 0 * * 8", "*/0 * * * *", "0 0 32 * *", "0 5-3 * * *"] {
             assert!(Cron::parse(bad).is_err(), "{bad}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn u04_large_steps_are_bounded_and_malformed_steps_refused() -> Result<(), String> {
+        let c = Cron::parse("1/4294967295 * * * *")?;
+        assert!(c.fires_at(at("2026-01-01T00:01:00Z"), &TimeZone::UTC));
+        assert!(!c.fires_at(at("2026-01-01T00:02:00Z"), &TimeZone::UTC));
+        assert_eq!(c.next_after_utc(at("2026-01-01T00:01:00Z")), Some(at("2026-01-01T01:01:00Z")));
+        for bad in ["1/4294967296 * * * *", "1/0 * * * *", "1/-1 * * * *", "1/2/3 * * * *"] {
+            assert!(Cron::parse(bad).is_err(), "{bad}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn u04_next_utc_boundaries_and_gregorian_cycle() -> Result<(), String> {
+        let minute = Cron::parse("* * * * *")?;
+        for (from, want) in [(-61, -60), (-60, 0), (-1, 0), (0, 60), (59, 60), (60, 120)] {
+            assert_eq!(minute.next_after_utc(from), Some(want));
+        }
+        assert_eq!(minute.next_after_utc(i64::MIN), None);
+        assert_eq!(minute.next_after_utc(i64::MAX), None);
+        let first = Timestamp::MIN.as_second();
+        assert_eq!(minute.next_after_utc(first), Some(first - first.rem_euclid(60) + 60));
+        assert_eq!(minute.next_after_utc(Timestamp::MAX.as_second()), None);
+        let annual = Cron::parse("0 0 1 JAN *")?;
+        assert_eq!(annual.next_after_utc(at("2023-12-31T23:59:59Z")), Some(at("2024-01-01T00:00:00Z")));
+        // Annual schedules still continue across a leap year.
+        assert_eq!(annual.next_after_utc(at("2024-01-01T00:00:00Z")), Some(at("2025-01-01T00:00:00Z")));
+        let leap = Cron::parse("0 0 29 FEB *")?;
+        assert_eq!(leap.next_after_utc(at("2024-02-28T23:59:59Z")), Some(at("2024-02-29T00:00:00Z")));
+        for (from, want) in [
+            ("2023-01-01T00:00:00Z", "2024-02-29T00:00:00Z"),
+            ("2024-02-29T00:00:00Z", "2028-02-29T00:00:00Z"),
+            ("2025-03-01T00:00:00Z", "2028-02-29T00:00:00Z"),
+            ("2096-02-29T00:00:00Z", "2104-02-29T00:00:00Z"),
+            ("2396-02-29T00:00:00Z", "2400-02-29T00:00:00Z"),
+        ] {
+            assert_eq!(leap.next_after_utc(at(from)), Some(at(want)), "{from}");
+        }
+        for impossible in ["0 0 30 FEB *", "0 0 31 FEB *", "0 0 31 APR *"] {
+            assert_eq!(Cron::parse(impossible)?.next_after_utc(0), None, "{impossible}");
+        }
+        // A restricted weekday still matches when the restricted day-of-month cannot.
+        assert_eq!(Cron::parse("0 0 31 FEB MON")?.next_after_utc(at("2026-01-31T00:00:00Z")), Some(at("2026-02-02T00:00:00Z")));
         Ok(())
     }
 

@@ -26,7 +26,7 @@ use kiln_seams::harness::SimHarness;
 use kiln_seams::spawn::spawn;
 use kiln_sim::net::Node;
 use kiln_sim::{Queue, Rng, Trace, World};
-use rusqlite::params;
+use crate::sql::params;
 use serde_json::{Value, json};
 
 use super::{Driver, REMIND_MS, touch};

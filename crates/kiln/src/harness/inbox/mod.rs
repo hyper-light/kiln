@@ -376,6 +376,12 @@ impl Inbox {
     /// same id; `epoch` is the one it was sent for (none from a sender that doesn't say); `at` is
     /// the host's time (unix ms). A take is one write.
     pub async fn accept(&self, session: &str, message: &str, digest: &str, epoch: Option<u64>, at: i64) -> Result<Answer, Refusal> {
+        self.accept_with(session, message, digest, epoch, at, Tx::default()).await
+    }
+
+    /// U17: the durable session command/snapshot commits with its deduplication receipt.
+    /// Additional CAS failures are refusals, never retried with an obsolete snapshot.
+    pub async fn accept_with(&self, session: &str, message: &str, digest: &str, epoch: Option<u64>, at: i64, extra: Tx) -> Result<Answer, Refusal> {
         check_session(session)?;
         // What it brought from where it was first: a retry of one of those is its repeat here.
         self.take_in(session, at).await?;
@@ -392,8 +398,10 @@ impl Inbox {
             }
             let kept = Kept { epoch: c.head.epoch, at, digest: digest.to_owned(), n: 0 };
             let key = message_key(session, message);
-            let conds = vec![Cond::Absent { family: MESSAGES.into(), key: key.clone() }];
-            let writes = vec![Write::Put { family: MESSAGES.into(), key, value: json(session, &kept)? }];
+            let mut conds = vec![Cond::Absent { family: MESSAGES.into(), key: key.clone() }];
+            conds.extend(extra.conds.clone());
+            let mut writes = vec![Write::Put { family: MESSAGES.into(), key, value: json(session, &kept)? }];
+            writes.extend(extra.writes.clone());
             // A session with no head here yet (none opened it) gets one with its first take.
             let head = c.rev.is_none().then(|| c.head.clone());
             match self.commit(session, &c, conds, writes, head).await {

@@ -19,6 +19,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -136,10 +137,13 @@ struct Inner {
 /// Every task, under way or done lately (`<data>/sync/tasks.json`), and the bundles batches hold
 /// (`<data>/sync/bundles`).
 pub struct Tasks {
-    file: PathBuf,
+    control: super::places::control::Control,
+    controller: Arc<super::server::Controller>,
+    recovered: AtomicBool,
     dir: PathBuf,
     inner: Mutex<Inner>,
     changed: event_listener::Event,
+    changing: async_lock::Mutex<()>,
 }
 
 /// What to do: from where, to which machines and folders.
@@ -184,28 +188,99 @@ fn prune(tasks: &mut Vec<Task>, now: i64) -> bool {
 
 impl Tasks {
     /// The tasks kept in `dir`; any a restart cut short failed.
-    pub fn open(dir: &Path) -> Self {
-        let file = dir.join("tasks.json");
-        let mut tasks: Vec<Task> = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-        let now = crate::util::now_unix();
-        let mut cut = false;
-        for t in tasks.iter_mut().filter(|t| !t.over()) {
-            t.state = "failed".into();
-            t.error = Some("the server restarted while it was under way: start it again".into());
-            t.updated = now;
-            cut = true;
-        }
-        let pruned = prune(&mut tasks, now);
+    pub fn from_database(dir: &Path, database: amphora::database::Database, host: &str) -> anyhow::Result<Self> {
+        let controller = super::server::Controller::open(dir)?;
+        Self::from_controller(dir, database, host, controller)
+    }
+
+    pub fn from_controller(dir: &Path, database: amphora::database::Database, host: &str, controller: Arc<super::server::Controller>) -> anyhow::Result<Self> {
+        anyhow::ensure!(dir.canonicalize()? == controller.dir(), "task controller lease belongs to another transfer directory");
+        let active = controller.active();
+        let (control, mut tasks): (_, Vec<Task>) = if active {
+            super::places::control::Control::open(database, host, "tasks", &dir.join("tasks.json"), |tasks: &Vec<Task>| {
+                let mut ids = HashSet::new();
+                anyhow::ensure!(tasks.iter().all(|t| !t.id.is_empty() && ids.insert(t.id.clone())), "U17 ambiguous duplicate or empty task identity");
+                Ok(())
+            })?
+        } else {
+            // An SDK frontend sharing a live owner may inspect committed work, but must never
+            // interpret opening the view as a restart or mutate the owner's bundle directory.
+            super::places::control::Control::attach(database, host, "tasks")?
+        };
         let bundles = dir.join("bundles");
-        let _ = std::fs::remove_dir_all(&bundles);
-        let _ = std::fs::create_dir_all(&bundles);
-        let me = Self { file, dir: bundles, inner: Mutex::new(Inner { tasks, ..Inner::default() }), changed: event_listener::Event::new() };
-        // Written again only when the restart failed one under way, or forgot ones kept long
-        // enough: unchanged, the file stands.
-        if cut || pruned {
-            me.save();
+        if active { tasks = Self::recover(&control, &controller, &bundles)?; }
+        Ok(Self { control, controller, recovered: AtomicBool::new(active), dir: bundles, inner: Mutex::new(Inner { tasks, ..Inner::default() }), changed: event_listener::Event::new(), changing: async_lock::Mutex::new(()) })
+    }
+
+    fn recover(control: &super::places::control::Control, controller: &super::server::Controller, bundles: &Path) -> anyhow::Result<Vec<Task>> {
+        anyhow::ensure!(controller.active(), "task controller unavailable: another owner is active");
+        let (tasks, ()) = control.change(|tasks: &mut Vec<Task>| {
+            let now = crate::util::now_unix();
+            for t in tasks.iter_mut().filter(|t| !t.over()) {
+                t.state = "failed".into();
+                t.error = Some("the server restarted while it was under way: start it again".into());
+                t.updated = now;
+            }
+            prune(tasks, now);
+            Ok(())
+        })?;
+        anyhow::ensure!(controller.active(), "task controller became unavailable during recovery");
+        if bundles.exists() { std::fs::remove_dir_all(bundles)?; }
+        std::fs::create_dir_all(bundles)?;
+        Ok(tasks)
+    }
+
+    // Called only with the async mutation gate held. No parking_lot guard crosses the await.
+    async fn recover_if_active(&self) -> Result<(), String> {
+        if !self.controller.active() { return Err("task controller unavailable: this frontend is standby".into()); }
+        if !self.recovered.load(Ordering::Acquire) {
+            let (control, controller, dir) = (self.control.clone(), self.controller.clone(), self.dir.clone());
+            let tasks = crate::rt::blocking_in(crate::rt::SHARE_STORE, move || Self::recover(&control, &controller, &dir)).await
+                .map_err(|e| format!("{e:#}"))?.map_err(|e| format!("{e:#}"))?;
+            self.inner.lock().tasks = tasks;
+            self.recovered.store(true, Ordering::Release);
         }
-        me
+        Ok(())
+    }
+
+    pub async fn snapshot(&self) -> Result<Vec<Task>, String> {
+        let _changing = self.changing.lock().await;
+        if self.controller.active() { self.recover_if_active().await?; }
+        let control = self.control.clone();
+        let tasks = crate::rt::blocking_in(crate::rt::SHARE_STORE, move || control.snapshot::<Vec<Task>>()).await
+            .map_err(|e| format!("{e:#}"))?.map_err(|e| format!("{e:#}"))?;
+        self.inner.lock().tasks = tasks;
+        Ok(self.list())
+    }
+
+    async fn change<R: Send + 'static>(&self, f: impl FnOnce(&mut Vec<Task>) -> anyhow::Result<R> + Send + 'static) -> Result<R, String> {
+        let _changing = self.changing.lock().await;
+        self.recover_if_active().await?;
+        let controller = self.controller.clone();
+        let (next, answer) = self.control.change_async(move |tasks| {
+            anyhow::ensure!(controller.active(), "task controller unavailable: this frontend is standby");
+            let answer = f(tasks)?;
+            prune(tasks, crate::util::now_unix());
+            Ok(answer)
+        }).await.map_err(|e| format!("{e:#}"))?;
+        self.inner.lock().tasks = next;
+        Ok(answer)
+    }
+
+    #[cfg(test)]
+    async fn insert(&self, tasks: Vec<Task>) -> Result<(), String> { self.insert_replacing(tasks, None).await }
+
+    async fn insert_replacing(&self, tasks: Vec<Task>, retire: Option<String>) -> Result<(), String> {
+        self.change(move |all| {
+            if let Some(id) = retire {
+                anyhow::ensure!(all.iter().any(|t| t.id == id && t.state == "failed"), "only a failed task is started again");
+                all.retain(|t| t.id != id);
+            }
+            let mut ids: HashSet<String> = all.iter().map(|t| t.id.clone()).collect();
+            anyhow::ensure!(tasks.iter().all(|t| ids.insert(t.id.clone())), "U17 duplicate task identity");
+            all.extend(tasks);
+            Ok(())
+        }).await
     }
 
     /// The tasks, newest first.
@@ -220,17 +295,13 @@ impl Tasks {
     }
 
     /// A task over is forgotten.
-    pub fn dismiss(&self, id: &str) -> bool {
-        let gone = {
-            let mut inner = self.inner.lock();
-            let before = inner.tasks.len();
-            inner.tasks.retain(|t| t.id != id || !t.over());
-            before != inner.tasks.len()
-        };
-        if gone {
-            self.save();
-        }
-        gone
+    pub async fn dismiss(&self, id: &str) -> Result<bool, String> {
+        let id = id.to_owned();
+        self.change(move |tasks| {
+            let before = tasks.len();
+            tasks.retain(|t| t.id != id || !t.over());
+            Ok(before != tasks.len())
+        }).await
     }
 
     /// What a machine said of its part of a task (or of a batch's bundle).
@@ -243,81 +314,49 @@ impl Tasks {
         self.inner.lock().news.get(&(id.to_owned(), machine.to_owned())).cloned()
     }
 
-    fn save(&self) {
-        let bytes = {
-            let mut inner = self.inner.lock();
-            prune(&mut inner.tasks, crate::util::now_unix());
-            serde_json::to_vec(&inner.tasks).unwrap_or_default()
-        };
-        if let Err(e) = super::group::save_atomic(&self.file, &bytes) {
-            tracing::warn!(error = %e, "tasks could not be saved");
-        }
-    }
-
     /// Changes a task, keeps it, and tells the console.
-    fn update(&self, hub: &Hub, id: &str, f: impl FnOnce(&mut Task)) {
-        let found = {
-            let mut inner = self.inner.lock();
-            match inner.tasks.iter_mut().find(|t| t.id == id) {
-                Some(t) => {
-                    let before = (t.state.clone(), t.detail.clone(), t.error.clone());
-                    f(t);
-                    t.updated = crate::util::now_unix();
-                    if (t.state.clone(), t.detail.clone(), t.error.clone()) != before {
-                        let text = match &t.error {
-                            Some(e) if t.state == "failed" => format!("failed: {e}"),
-                            _ => format!("{}: {}", t.state, t.detail),
-                        };
-                        if t.notes.last().is_none_or(|n| n.text != text) {
-                            t.notes.push(Note { at: t.updated, text });
-                            if t.notes.len() > NOTES {
-                                t.notes.remove(0);
-                            }
-                        }
-                    }
-                    true
+    async fn update(&self, hub: &Hub, id: &str, f: impl FnOnce(&mut Task) + Send + 'static) -> Result<(), String> {
+        let id = id.to_owned();
+        self.change(move |tasks| {
+            let t = tasks.iter_mut().find(|t| t.id == id).ok_or_else(|| anyhow::anyhow!("task is no longer kept"))?;
+            let before = (t.state.clone(), t.detail.clone(), t.error.clone());
+            f(t);
+            t.updated = crate::util::now_unix();
+            if (t.state.clone(), t.detail.clone(), t.error.clone()) != before {
+                let text = match &t.error {
+                    Some(e) if t.state == "failed" => format!("failed: {e}"),
+                    _ => format!("{}: {}", t.state, t.detail),
+                };
+                if t.notes.last().is_none_or(|n| n.text != text) {
+                    t.notes.push(Note { at: t.updated, text });
+                    if t.notes.len() > NOTES { t.notes.remove(0); }
                 }
-                None => false,
             }
-        };
-        if found {
-            self.save();
-            self.changed.notify(usize::MAX);
-            hub.emit(&crate::wire::events::ServerEvent::Places);
-        }
+            Ok(())
+        }).await?;
+        self.changed.notify(usize::MAX);
+        hub.emit(&crate::wire::events::ServerEvent::Places);
+        Ok(())
     }
 
-    fn set(&self, hub: &Hub, id: &str, state: &str, detail: impl Into<String>) {
-        let detail = detail.into();
-        self.update(hub, id, |t| {
-            if !t.over() {
-                state.clone_into(&mut t.state);
-                t.detail = detail;
-            }
-        });
+    async fn set(&self, hub: &Hub, id: &str, state: &str, detail: impl Into<String>) -> Result<(), String> {
+        let (state, detail) = (state.to_owned(), detail.into());
+        self.update(hub, id, move |t| { if !t.over() { t.state = state; t.detail = detail; } }).await
     }
 
-    fn fail(&self, hub: &Hub, id: &str, error: impl Into<String>) {
+    async fn fail(&self, hub: &Hub, id: &str, error: impl Into<String>) -> Result<(), String> {
         let error = error.into();
-        self.update(hub, id, |t| {
-            if !t.over() {
-                t.state = "failed".into();
-                t.error = Some(error);
-            }
-        });
+        self.update(hub, id, move |t| { if !t.over() { t.state = "failed".into(); t.error = Some(error); } }).await
     }
 
-    fn done(&self, hub: &Hub, id: &str, detail: impl Into<String>) {
+    async fn done(&self, hub: &Hub, id: &str, detail: impl Into<String>) -> Result<(), String> {
         let detail = detail.into();
-        self.update(hub, id, |t| {
-            if !t.over() {
-                t.state = "done".into();
-                t.detail = detail;
-            }
-        });
+        self.update(hub, id, move |t| { if !t.over() { t.state = "done".into(); t.detail = detail; } }).await
     }
 
     // -------------------------------------------------------------------------- bundles
+
+    pub fn available(&self) -> bool { self.controller.active() }
 
     /// Where a batch's bundle is kept.
     pub fn bundle_file(&self, batch: &str) -> Option<PathBuf> {
@@ -327,11 +366,13 @@ impl Tasks {
 
     /// Whether `machine` is to send the batch's bundle, and hasn't.
     pub fn may_send(&self, batch: &str, machine: &str) -> bool {
+        if !self.controller.active() { return false; }
         self.inner.lock().bundles.get(batch).is_some_and(|b| b.from.as_deref() == Some(machine) && b.hash.is_none())
     }
 
     /// The bundle came, whole: its SHA-256 and size.
     pub fn sent(&self, batch: &str, hash: String, size: u64) {
+        if !self.controller.active() { return; }
         if let Some(b) = self.inner.lock().bundles.get_mut(batch) {
             b.hash = Some(hash);
             b.size = size;
@@ -341,6 +382,7 @@ impl Tasks {
 
     /// The batch's bundle, its SHA-256 and size, for a machine it goes to.
     pub fn may_fetch(&self, batch: &str, machine: &str) -> Option<(PathBuf, String, u64)> {
+        if !self.controller.active() { return None; }
         let inner = self.inner.lock();
         let b = inner.bundles.get(batch).filter(|b| b.to.contains(machine))?;
         Some((self.bundle_file(batch)?, b.hash.clone()?, b.size))
@@ -353,6 +395,7 @@ impl Tasks {
     /// A bundle `from` sends to batch `batch` for the machines `to` (`crate::sync::share`): kept
     /// as it is when it's there already, its machines then `to`.
     pub fn open_bundle(&self, batch: &str, from: &str, to: HashSet<String>) {
+        if !self.controller.active() { return; }
         let mut inner = self.inner.lock();
         match inner.bundles.get_mut(batch) {
             Some(b) => b.to = to,
@@ -364,12 +407,14 @@ impl Tasks {
 
     /// `machine` may fetch batch `batch`'s bundle too.
     pub fn allow(&self, batch: &str, machine: &str) {
+        if !self.controller.active() { return; }
         if let Some(b) = self.inner.lock().bundles.get_mut(batch) {
             b.to.insert(machine.to_owned());
         }
     }
 
     pub fn drop_bundle(&self, batch: &str) {
+        if !self.controller.active() { return; }
         self.inner.lock().bundles.remove(batch);
         if let Some(f) = self.bundle_file(batch) {
             let _ = std::fs::remove_file(f);
@@ -407,13 +452,15 @@ fn row_of(view: &super::places::View, key: &str) -> Result<Row, String> {
 }
 
 /// Starts what `ask` says: its tasks, under way at once.
-pub async fn start(hub: &Arc<Hub>, ask: Ask) -> Result<Vec<Task>, String> {
+pub async fn start(hub: &Arc<Hub>, ask: Ask) -> Result<Vec<Task>, String> { start_replacing(hub, ask, None).await }
+
+async fn start_replacing(hub: &Arc<Hub>, ask: Ask, retire: Option<String>) -> Result<Vec<Task>, String> {
     let view = super::places::now(hub).await.map_err(|e| format!("{e:#}"))?;
     let row = row_of(&view, &ask.key)?;
     let machine = |name: &str| view.machines.iter().find(|m| m.name == name);
     let place = |m: &str, p: &str| row.places.iter().find(|x| x.machine == m && x.path == p);
     if ask.kind == Kind::Remove {
-        return remove(hub, &row, &ask, &view).await;
+        return remove(hub, &row, &ask, &view, retire).await;
     }
     anyhow_free(!ask.to.is_empty(), "choose a machine for it to go to")?;
     if ask.kind == Kind::Move {
@@ -510,11 +557,7 @@ pub async fn start(hub: &Arc<Hub>, ask: Ask) -> Result<Vec<Task>, String> {
             mode: if ask.kind == Kind::Sync { ask.mode } else { super::Mode::Files },
         })
         .collect();
-    {
-        let mut inner = hub.tasks.inner.lock();
-        inner.tasks.extend(tasks.iter().cloned());
-    }
-    hub.tasks.save();
+    hub.tasks.insert_replacing(tasks.clone(), retire).await?;
     hub.emit(&crate::wire::events::ServerEvent::Places);
     let b = Batch {
         id: batch,
@@ -542,7 +585,7 @@ fn anyhow_free(ok: bool, why: &str) -> Result<(), String> {
 
 /// A place given up (`ask.from`, a machine's folder): a copy leaves its group, a clone kiln made
 /// is forgotten, and with `delete` the folder goes.
-async fn remove(hub: &Arc<Hub>, row: &Row, ask: &Ask, view: &super::places::View) -> Result<Vec<Task>, String> {
+async fn remove(hub: &Arc<Hub>, row: &Row, ask: &Ask, view: &super::places::View, retire: Option<String>) -> Result<Vec<Task>, String> {
     let Some(Source::Machine { machine, path }) = ask.from.clone() else { return Err("which place to give up".into()) };
     let place = row.places.iter().find(|p| p.machine == machine && p.path == path).cloned().ok_or_else(|| format!("{machine} has no copy of {} at {path}", row.name))?;
     let m = view.machines.iter().find(|m| m.name == machine);
@@ -573,15 +616,14 @@ async fn remove(hub: &Arc<Hub>, row: &Row, ask: &Ask, view: &super::places::View
         head: None,
         mode: super::Mode::Files,
     };
-    hub.tasks.inner.lock().tasks.push(task.clone());
-    hub.tasks.save();
+    hub.tasks.insert_replacing(vec![task.clone()], retire).await?;
     let (h, t) = (hub.clone(), task.clone());
     let copy = place.copy.clone();
     let origin = place.git.as_ref().and_then(|g| g.origin.clone());
     crate::rt::spawn(async move {
         let out: Result<String, String> = async {
             if let Some(c) = &copy {
-                h.tasks.set(&h, &t.id, "leaving", format!("{machine} stops syncing it"));
+                h.tasks.set(&h, &t.id, "leaving", format!("{machine} stops syncing it")).await?;
                 h.sync.ask(super::server::Ask::RemoveCopy { repo: c.repo.clone(), member: c.member }).await?;
             }
             if t.delete {
@@ -594,16 +636,18 @@ async fn remove(hub: &Arc<Hub>, row: &Row, ask: &Ask, view: &super::places::View
             }
         }
         .await;
-        match out {
-            Ok(d) => h.tasks.done(&h, &t.id, d),
-            Err(e) => h.tasks.fail(&h, &t.id, e),
-        }
+        let recorded = match out {
+            Ok(d) => h.tasks.done(&h, &t.id, d).await,
+            Err(e) => h.tasks.fail(&h, &t.id, e).await,
+        };
+        if let Err(e) = recorded { tracing::warn!(error = %e, "task completion could not commit"); }
     });
     Ok(vec![task])
 }
 
 /// Starts a failed task again, with what it asked; what it did already is found and kept.
 pub async fn retry(hub: &Arc<Hub>, id: &str) -> Result<Vec<Task>, String> {
+    hub.tasks.snapshot().await?;
     let t = hub.tasks.get(id).ok_or_else(|| "no such task".to_owned())?;
     anyhow_free(t.state == "failed", "only a failed task is started again")?;
     let ask = Ask {
@@ -615,9 +659,7 @@ pub async fn retry(hub: &Arc<Hub>, id: &str) -> Result<Vec<Task>, String> {
         delete: t.delete,
         mode: t.mode,
     };
-    let started = start(hub, ask).await?;
-    hub.tasks.dismiss(id);
-    Ok(started)
+    start_replacing(hub, ask, Some(id.to_owned())).await
 }
 
 // ------------------------------------------------------------------------------ driving
@@ -625,7 +667,7 @@ pub async fn retry(hub: &Arc<Hub>, id: &str) -> Result<Vec<Task>, String> {
 async fn drive(hub: Arc<Hub>, b: Batch) {
     if let Err(e) = drive_batch(&hub, &b).await {
         for (id, _, _) in &b.tasks {
-            hub.tasks.fail(&hub, id, e.clone());
+            if let Err(error) = hub.tasks.fail(&hub, id, e.clone()).await { tracing::warn!(error = %error, "task failure could not commit"); }
         }
     }
     hub.tasks.drop_bundle(&b.id);
@@ -653,7 +695,7 @@ async fn drive_batch(hub: &Arc<Hub>, b: &Batch) -> Result<(), String> {
     let source = match &b.from {
         Source::Kiln { repo } => {
             for id in &ids {
-                hub.tasks.set(hub, id, "bundling", format!("kiln bundles its mirror of {}", b.name));
+                hub.tasks.set(hub, id, "bundling", format!("kiln bundles its mirror of {}", b.name)).await?;
             }
             hub.tasks.inner.lock().bundles.insert(b.id.clone(), Bundle { from: None, to, hash: None, size: 0 });
             let (hash, size) = mirror_bundle(hub, repo, &b.id).await.map_err(|e| format!("bundling kiln's mirror: {e:#}"))?;
@@ -662,7 +704,7 @@ async fn drive_batch(hub: &Arc<Hub>, b: &Batch) -> Result<(), String> {
         }
         Source::Machine { machine, path } if b.source_git => {
             for id in &ids {
-                hub.tasks.set(hub, id, "bundling", format!("{machine} bundles its commits"));
+                hub.tasks.set(hub, id, "bundling", format!("{machine} bundles its commits")).await?;
             }
             hub.tasks.inner.lock().bundles.insert(b.id.clone(), Bundle { from: Some(machine.clone()), to, hash: None, size: 0 });
             hub.sync.send(machine, Msg::Bundle { task: b.id.clone(), path: path.clone() });
@@ -677,37 +719,31 @@ async fn drive_batch(hub: &Arc<Hub>, b: &Batch) -> Result<(), String> {
     // machine's is: a slow one keeps no other waiting.
     if b.kind == Kind::Clone {
         let source = &source;
-        futures::future::join_all(b.tasks.iter().map(|(id, m, p)| async move {
+        let recorded = futures::future::join_all(b.tasks.iter().map(|(id, m, p)| async move {
             match clone_on(hub, b, id, m, p, source).await {
                 Ok((head, _)) => {
-                    hub.tasks.update(hub, id, |t| t.head.clone_from(&head));
-                    hub.tasks.done(hub, id, format!("cloned into {p} on {m}"));
+                    hub.tasks.update(hub, id, move |t| t.head = head).await?;
+                    hub.tasks.done(hub, id, format!("cloned into {p} on {m}")).await?;
                 }
-                Err(e) => hub.tasks.fail(hub, id, e),
+                Err(e) => hub.tasks.fail(hub, id, e).await?,
             }
-        }))
-        .await;
+            Ok::<(), String>(())
+        })).await;
+        for result in recorded { result?; }
         return Ok(());
     }
     let clones = futures::future::join_all(b.tasks.iter().map(|(id, m, p)| clone_on(hub, b, id, m, p, &source))).await;
     // 3. The group each new folder joins.
-    let cloned: Vec<(&String, &String, &String, bool)> = b
-        .tasks
-        .iter()
-        .zip(clones)
-        .filter_map(|((id, m, p), r)| match r {
-            // Only a folder this batch cloned takes the group's files; one kiln made before joins
-            // as it is, so nothing changed in it since is lost.
+    let mut cloned: Vec<(&String, &String, &String, bool)> = Vec::new();
+    for ((id, m, p), result) in b.tasks.iter().zip(clones) {
+        match result {
             Ok((head, fresh)) => {
-                hub.tasks.update(hub, id, |t| t.head.clone_from(&head));
-                Some((id, m, p, fresh))
+                hub.tasks.update(hub, id, move |t| t.head = head).await?;
+                cloned.push((id, m, p, fresh));
             }
-            Err(e) => {
-                hub.tasks.fail(hub, id, e);
-                None
-            }
-        })
-        .collect();
+            Err(e) => hub.tasks.fail(hub, id, e).await?,
+        }
+    }
     if cloned.is_empty() {
         return Ok(());
     }
@@ -727,7 +763,7 @@ async fn drive_batch(hub: &Arc<Hub>, b: &Batch) -> Result<(), String> {
         // A sync of clones from kiln's mirror or a remote: the first starts the group.
         _ => {
             let Some(&(id, m, p, _)) = cloned.first() else { return Ok(()) };
-            hub.tasks.set(hub, id, "joining", format!("{} starts syncing", m));
+            hub.tasks.set(hub, id, "joining", format!("{} starts syncing", m)).await?;
             let repo = hub.sync.ask(super::server::Ask::Create { name: unique_name(hub, &b.name), copies: vec![(m.clone(), p.clone())], exclude: Vec::new(), mode: b.mode, transient: None }).await?;
             let member = member_at(hub, &repo, m, p).ok_or_else(|| "the new synced repo has no copy".to_owned())?;
             joined.push((id, m, p, repo.clone(), member));
@@ -740,13 +776,13 @@ async fn drive_batch(hub: &Arc<Hub>, b: &Batch) -> Result<(), String> {
         if first.as_ref() == Some(id) {
             continue;
         }
-        hub.tasks.set(hub, id, "joining", format!("{m} joins the sync"));
+        hub.tasks.set(hub, id, "joining", format!("{m} joins the sync")).await?;
         let member = match member_at(hub, &group, m, p) {
             Some(member) => member,
             None => match hub.sync.ask(super::server::Ask::AddCopy { repo: group.clone(), machine: m.clone(), path: p.clone(), adopt: cloned_here }).await {
                 Ok(member) => member.parse().unwrap_or(0),
                 Err(e) => {
-                    hub.tasks.fail(hub, id, e);
+                    hub.tasks.fail(hub, id, String::from(e)).await?;
                     continue;
                 }
             },
@@ -754,25 +790,26 @@ async fn drive_batch(hub: &Arc<Hub>, b: &Batch) -> Result<(), String> {
         joined.push((id, m, p, group.clone(), member));
     }
     let caught = futures::future::join_all(joined.iter().map(|(id, m, _, repo, member)| async move {
-        hub.tasks.update(hub, id, |t| t.synced = Some(repo.clone()));
+        let syncing = repo.clone();
+        hub.tasks.update(hub, id, move |t| t.synced = Some(syncing)).await?;
         wait_in_step(hub, repo, *member, std::slice::from_ref(*id), &format!("the copy on {m}")).await
     }))
     .await;
     // 5. Synced: done. Moved: the old copy leaves, the old folder goes if asked.
     for ((id, m, p, _, _), r) in joined.iter().zip(caught) {
         if let Err(e) = r {
-            hub.tasks.fail(hub, id, e);
+            hub.tasks.fail(hub, id, e).await?;
             continue;
         }
         if b.kind == Kind::Sync {
-            hub.tasks.done(hub, id, format!("in step at {p} on {m}"));
+            hub.tasks.done(hub, id, format!("in step at {p} on {m}")).await?;
             continue;
         }
         let Source::Machine { machine: om, path: op } = &b.from else { continue };
         let out = leave(hub, b, id, &group, transient, om, op).await;
         match out {
-            Ok(()) => hub.tasks.done(hub, id, format!("moved to {p} on {m}")),
-            Err(e) => hub.tasks.fail(hub, id, e),
+            Ok(()) => hub.tasks.done(hub, id, format!("moved to {p} on {m}")).await?,
+            Err(e) => hub.tasks.fail(hub, id, e).await?,
         }
     }
     Ok(())
@@ -783,7 +820,7 @@ async fn drive_batch(hub: &Arc<Hub>, b: &Batch) -> Result<(), String> {
 async fn leave(hub: &Arc<Hub>, b: &Batch, id: &str, group: &str, transient: bool, machine: &str, path: &str) -> Result<(), String> {
     if let Some(member) = member_at(hub, group, machine, path) {
         wait_in_step(hub, group, member, &[id.to_owned()], &format!("the old copy on {machine}")).await?;
-        hub.tasks.set(hub, id, "leaving", format!("{machine} stops syncing it"));
+        hub.tasks.set(hub, id, "leaving", format!("{machine} stops syncing it")).await?;
         if transient {
             hub.sync.ask(super::server::Ask::Delete { repo: group.to_owned() }).await?;
         } else {
@@ -799,7 +836,7 @@ async fn leave(hub: &Arc<Hub>, b: &Batch, id: &str, group: &str, transient: bool
 /// Deletes a folder on its machine: the runner checks it is the repository (`origin`) and nowhere
 /// it must not delete.
 async fn delete_on(hub: &Arc<Hub>, id: &str, machine: &str, path: &str, origin: Option<&str>) -> Result<(), String> {
-    hub.tasks.set(hub, id, "deleting", format!("{machine} deletes {path}"));
+    hub.tasks.set(hub, id, "deleting", format!("{machine} deletes {path}")).await?;
     hub.sync.send(machine, Msg::Delete { task: id.to_owned(), path: path.to_owned(), origin: origin.map(str::to_owned) });
     wait_news(hub, id, machine, &[id.to_owned()]).await.map(|_| ())
 }
@@ -807,7 +844,7 @@ async fn delete_on(hub: &Arc<Hub>, id: &str, machine: &str, path: &str, origin: 
 /// A group from a folder (`transient`: for a move alone), once that copy is in step.
 async fn seed(hub: &Arc<Hub>, b: &Batch, machine: &str, path: &str, transient: bool, ids: &[String]) -> Result<String, String> {
     for id in ids {
-        hub.tasks.set(hub, id, "joining", format!("{machine} starts syncing {path}"));
+        hub.tasks.set(hub, id, "joining", format!("{machine} starts syncing {path}")).await?;
     }
     let name = if transient { unique_name(hub, &format!("{} (moving)", b.name)) } else { unique_name(hub, &b.name) };
     let mode = if transient { super::Mode::Files } else { b.mode };
@@ -845,7 +882,7 @@ async fn clone_on(hub: &Arc<Hub>, b: &Batch, id: &str, machine: &str, path: &str
         Commits::Bundle { hash, size } => (Some(b.id.clone()), Some(hash.clone()), *size, None),
         Commits::Url(u) => (None, None, 0, Some(u.clone())),
     };
-    hub.tasks.set(hub, id, "cloning", format!("{machine} clones into {path}"));
+    hub.tasks.set(hub, id, "cloning", format!("{machine} clones into {path}")).await?;
     let order = CloneOrder {
         task: id.to_owned(),
         key: b.key.clone(),
@@ -877,7 +914,7 @@ async fn wait_news(hub: &Arc<Hub>, id: &str, machine: &str, ids: &[String]) -> R
                 said = Some(news.clone());
                 if !news.over() {
                     for t in ids {
-                        hub.tasks.set(hub, t, &news.state, news.detail.clone().unwrap_or_default());
+                        hub.tasks.set(hub, t, &news.state, news.detail.clone().unwrap_or_default()).await?;
                     }
                 }
             }
@@ -926,7 +963,7 @@ async fn wait_in_step(hub: &Arc<Hub>, repo: &str, member: u64, ids: &[String], w
         };
         if detail != said {
             for t in ids {
-                hub.tasks.set(hub, t, "catching up", detail.clone());
+                hub.tasks.set(hub, t, "catching up", detail.clone()).await?;
             }
             said = detail;
         }
@@ -966,6 +1003,7 @@ mod tests {
 
     #[test]
     fn tasks_cut_short_by_a_restart_failed_and_old_ones_go() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
         let dir = tempfile::tempdir()?;
         let now = crate::util::now_unix();
         let task = |id: &str, state: &str, updated: i64| Task {
@@ -993,16 +1031,58 @@ mod tests {
         std::fs::write(dir.path().join("tasks.json"), serde_json::to_vec(&saved)?)?;
         std::fs::create_dir_all(dir.path().join("bundles"))?;
         std::fs::write(dir.path().join("bundles/old.bundle"), "x")?;
-        let t = Tasks::open(dir.path());
+        let store = crate::store::Store::in_memory()?;
+        let t = Tasks::from_database(dir.path(), store.database(), "host-one")?;
         let list = t.list();
         assert_eq!(list.len(), 2, "a task over a week ago is gone");
         let cut = list.iter().find(|t| t.id == "running").map(|t| (t.state.as_str(), t.error.is_some()));
         assert_eq!(cut, Some(("failed", true)));
         assert!(!dir.path().join("bundles/old.bundle").exists(), "a restart's leftovers go");
-        assert!(t.dismiss("done") && !t.dismiss("nope"));
+        assert!(t.dismiss("done").await.map_err(anyhow::Error::msg)? && !t.dismiss("nope").await.map_err(anyhow::Error::msg)?);
         assert_eq!(t.bundle_file("../etc"), None);
         assert!(t.bundle_file("0199aa").is_some());
+        // U17: the file is import input only; a complete canonical cell survives stale JSON.
+        let imported = std::fs::read(dir.path().join("tasks.json"))?;
+        let mut blocked = t.inner.lock().tasks.clone();
+        blocked.push(task("rejected", "queued", now));
+        let blocked = serde_json::to_vec(&blocked)?;
+        store.now(move |c| {
+            c.execute("INSERT INTO host_controls (host, kind, version, source, source_digest, value) VALUES ('blocker', 'tasks', 1, 'test', 'absent', ?1)", [blocked])?;
+            c.execute_batch("CREATE UNIQUE INDEX u17_reject_control_value ON host_controls(value)")?;
+            Ok(())
+        })?;
+        assert!(t.insert(vec![task("rejected", "queued", now)]).await.is_err(), "a write refusal cannot accept a task");
+        assert!(t.get("rejected").is_none(), "failed write publishes no speculative state");
+        assert_eq!(std::fs::read(dir.path().join("tasks.json"))?, imported, "legacy input is never rewritten");
+        store.now(|c| { c.execute_batch("DROP INDEX u17_reject_control_value")?; Ok(()) })?;
+        t.insert(vec![task("accepted", "queued", now)]).await.map_err(anyhow::Error::msg)?;
+        // U19: a second frontend is a read view, never a restart of the live controller.
+        let bundle = t.bundle_file("accepted").ok_or_else(|| anyhow::anyhow!("bundle path"))?;
+        std::fs::write(&bundle, b"live owner bytes")?;
+        let before: Vec<u8> = store.now(|c| Ok(c.query_row("SELECT value FROM host_controls WHERE host = 'host-one' AND kind = 'tasks'", [], |r| r.get(0))?))?;
+        let standby = Tasks::from_database(dir.path(), store.database(), "host-one")?;
+        assert!(!standby.available());
+        assert!(standby.get("accepted").is_some_and(|t| t.state == "queued"));
+        assert!(standby.insert(vec![task("standby-write", "queued", now)]).await.is_err(), "standby mutations explicitly refuse");
+        standby.drop_bundle("accepted");
+        assert_eq!(std::fs::read(&bundle)?, b"live owner bytes", "standby cannot clean another owner's files");
+        let after: Vec<u8> = store.now(|c| Ok(c.query_row("SELECT value FROM host_controls WHERE host = 'host-one' AND kind = 'tasks'", [], |r| r.get(0))?))?;
+        assert_eq!(before, after, "standby constructor and refused writes change no canonical task state");
+        assert!(!standby.controller.try_activate()?, "a live owner is never displaced");
+        std::fs::write(dir.path().join("tasks.json"), b"retired JSON is not authority")?;
+        drop(t);
+        assert!(standby.controller.try_activate()?, "OS lease proves the previous controller has released ownership");
+        let rows = standby.snapshot().await.map_err(anyhow::Error::msg)?;
+        assert!(rows.iter().any(|t| t.id == "accepted" && t.state == "failed"), "only promotion performs interrupted-task recovery");
+        assert!(!bundle.exists(), "bundle cleanup waits for proven ownership");
+        drop(standby);
+        let recovered = Tasks::from_database(dir.path(), store.database(), "host-one")?;
+        assert!(recovered.get("accepted").is_some_and(|t| t.state == "failed" && t.error.is_some()), "accepted task survives restart with the existing explicit retry contract");
+        store.now(|c| { c.execute("UPDATE host_controls SET version = 0 WHERE host = 'host-one' AND kind = 'tasks'", [])?; Ok(()) })?;
+        assert!(Tasks::from_database(dir.path(), store.database(), "host-one").is_err(), "partial marker fails startup");
+
         Ok(())
+        })
     }
 
     /// Whether `ok` holds within ten seconds.
@@ -1041,7 +1121,7 @@ mod tests {
                 head: None,
                 mode: crate::sync::Mode::Files,
             };
-            hub.tasks.inner.lock().tasks.extend([task("quick", "laptop"), task("slow", "busy-box")]);
+            hub.tasks.insert(vec![task("quick", "laptop"), task("slow", "busy-box")]).await.map_err(anyhow::Error::msg)?;
             let b = Batch {
                 id: "b1".into(),
                 kind: Kind::Clone,

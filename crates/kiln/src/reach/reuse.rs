@@ -172,9 +172,14 @@ pub async fn lookup(svc: &Service, scope: &str, unit: Unit) -> anyhow::Result<Op
 pub async fn record(svc: &Service, k: &Keyed, pieces: &[(bool, Vec<u8>)], ms: u64) -> anyhow::Result<()> {
     let log = encode(pieces);
     let store = std::sync::Arc::clone(svc.store());
-    let (digest, _) = crate::rt::blocking(move || store.put_bytes(&log)).await??;
+    let publication = match crate::rt::blocking(move || store.put_bytes_guarded(&log)).await? {
+        Ok(p) => p,
+        Err(e) if crate::runner::cache::Local::declined(&e) => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let digest = publication.digest;
     let person = person();
-    svc.store().hold(&Scope::new(REPO, &person), &digest)?;
+    svc.store().hold_async_guarded(&Scope::new(REPO, &person), &digest, publication.guard.clone()).await?;
     let result = Recorded {
         outcome: "success".to_owned(),
         exit: Some(0),
@@ -184,7 +189,10 @@ pub async fn record(svc: &Service, k: &Keyed, pieces: &[(bool, Vec<u8>)], ms: u6
         ..Recorded::default()
     };
     let (scope, unit) = (k.scope.clone(), k.unit.clone());
-    svc.store().ledger().call(move |c| crate::ci::work::record(c, &scope, &unit, &PathSet::new(), &result).map(|_| ())).await
+    svc.store().ledger().call(move |c| {
+        crate::ci::work::record(c, &scope, &unit, &PathSet::new(), &result)?;
+        Ok(publication.guard)
+    }).await.map(|_guard| ())
 }
 
 fn ago(secs: i64) -> String {

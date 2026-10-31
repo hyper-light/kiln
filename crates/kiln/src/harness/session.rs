@@ -71,6 +71,9 @@ pub struct Spec {
     /// ended): the harness starts only once the process is gone, never beside it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub takeover_pid: Option<u32>,
+    /// U18/U03: exact observed OS process; a bare PID grants no stop authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub takeover_identity: Option<crate::aisessions::ProcessIdentity>,
     /// With `takeover_pid`: that session runs outside kiln, so kiln ends its process itself (asks
     /// it to quit, then kills it) rather than only waiting for it to end.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -133,6 +136,7 @@ impl Default for Spec {
             resume_at: None,
             fork: false,
             takeover_pid: None,
+            takeover_identity: None,
             takeover_stop: false,
             reach: None,
             parent: None,
@@ -523,6 +527,9 @@ pub type FenceFor = Arc<dyn Fn(String, bool) -> futures::future::BoxFuture<'stat
 /// ([`super::host::Host::settle`]).
 pub type SettleFor = Arc<dyn Fn(String, String, bool) -> futures::future::BoxFuture<'static, Result<Option<super::host::Decided>, String>> + Send + Sync>;
 
+/// Effective queue edits reach the existing durable pending owner outside the core lock.
+pub type QueueChanged = Arc<dyn Fn(&str, Option<Command>) + Send + Sync>;
+
 #[derive(Clone)]
 pub struct Files {
     pub dir: std::path::PathBuf,
@@ -545,10 +552,12 @@ pub struct Files {
     /// How it stands for its machine's agent limit now, and whether anything waits to go to its
     /// harness (`super::host::Host::stands`).
     pub work: Arc<dyn Fn(Work, bool) + Send + Sync>,
+    pub queue_changed: Option<QueueChanged>,
 }
 
 /// What a session that moved here starts from (`super::moving`): its timeline and state as they
 /// were, and for a harness that takes one, the history of its new thread.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Seed {
     pub events: Vec<super::model::Event>,
     pub state: State,
@@ -727,7 +736,7 @@ pub struct Session {
     /// it takes none here (CP-T3.2). A message is checked against it and handed over under this
     /// lock, and a move sets it and gathers what it was sent under it too: none slips in between.
     moving: Mutex<bool>,
-    prompted: std::sync::atomic::AtomicBool,
+    initial_consumed: std::sync::atomic::AtomicBool,
 }
 
 impl Session {
@@ -761,6 +770,19 @@ impl Session {
             return false;
         }
         self.ctl.try_send(Ctl::Cmd(Box::new(c))).is_ok()
+    }
+
+    /// U17: hold the move fence from the durable commit through channel delivery. A move's
+    /// gather therefore includes every command whose acceptance was acknowledged.
+    pub(crate) fn command_committed(&self, c: Command, accept: impl FnOnce() -> Result<super::inbox::Answer, super::inbox::Refusal>) -> Result<super::inbox::Answer, super::inbox::Refusal> {
+        let moving = self.moving.lock();
+        if *moving { return Err(super::inbox::Refusal::Moved { session: self.id.clone(), epoch: self.epoch() }); }
+        if self.ctl.is_closed() { return Err(super::inbox::Refusal::NoSession { session: self.id.clone() }); }
+        let answer = accept()?;
+        if !answer.repeat && self.ctl.try_send(Ctl::Cmd(Box::new(c))).is_err() {
+            return Err(super::inbox::Refusal::Unavailable { session: self.id.clone(), why: "committed command waits for session recovery".into() });
+        }
+        Ok(answer)
     }
 
     pub fn close(&self) {
@@ -850,6 +872,26 @@ impl Session {
         Some(crate::convo::record::Source { session: self.id.clone(), kind, env, harness_session })
     }
 
+    // U17/CP-T3.2: an attempted write is not durable consumption of the initial intent.
+    // Latch model-observed delivery so pruning old delivery rows cannot resurrect that prompt.
+    fn initial_prompt_observed(&self, state: &State) -> bool {
+        let id = initial_prompt_id(&self.id);
+        if matches!(state.delivery.get(&id), Some(super::model::Delivery::Started | super::model::Delivery::Completed | super::model::Delivery::Cancelled)) {
+            self.initial_consumed.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.initial_consumed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn pending_initial_prompt(&self, spec: &Spec, core: &Core, carry: &[Command]) -> Option<Command> {
+        if self.initial_prompt_observed(&core.state) { return None; }
+        let id = initial_prompt_id(&self.id);
+        // A restored durable queue owns these words already. Decide before adapter.start can
+        // drain that queue, so it cannot also be sent directly to this same process.
+        if core.state.queue.iter().chain(core.state.tasks.iter().flat_map(|task| task.queue.iter())).any(|q| q.id == id)
+            || carry.iter().any(|command| matches!(command, Command::Send { id: carried, .. } if carried == &id)) { return None; }
+        initial_prompt(&self.id, spec)
+    }
+
     pub fn resume_spec(&self) -> Spec {
         let mut s = self.spec.lock().clone();
         let core = self.core.lock();
@@ -857,7 +899,7 @@ impl Session {
             s.resume = Some(h);
         }
         // Where it is now, not where it started: its own session, settings as last chosen.
-        if self.prompted.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.initial_prompt_observed(&core.state) {
             s.prompt = None;
         }
         s.resume_at = None;
@@ -966,11 +1008,16 @@ pub fn start_handed(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
     let h = *h;
     let core = Core::thaw(h.core);
     let adopt = Adopt { process: h.process, adapter: super::kinds::Adapter::thaw(h.adapter), partial: base64::engine::general_purpose::STANDARD.decode(h.partial).unwrap_or_default() };
-    begin(id, spec, kind, core, sink, on_change, files, None, Some(adopt))
+    begin(id, spec, kind, core, sink, on_change, files, None, Some(adopt), |_| {})
 }
 
 /// Start a session, seeded with what it had on another machine when it moved here.
 pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, seed: Option<Seed>) -> anyhow::Result<Arc<Session>> {
+    start_seeded_with(id, spec, sink, on_change, files, seed, |_| {})
+}
+
+/// U17: prepare complete cold-restored ownership before a ready adapter can drain its queue.
+pub(super) fn start_seeded_with(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, seed: Option<Seed>, before_start: impl FnOnce(&Session)) -> anyhow::Result<Arc<Session>> {
     let kind = Kind::get(&spec.kind).ok_or_else(|| anyhow::anyhow!("unknown harness {:?}", spec.kind))?;
     let cwd = resolve_cwd(spec.cwd.as_deref());
     let mut core = Core::new();
@@ -990,7 +1037,7 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
     } else if let Some(sd) = seed {
         core.adopt(sd.events, sd.state);
         // A new writer of its conversation: what the machine it left still says no longer counts.
-        core.state.epoch += 1;
+        core.state.epoch = core.state.epoch.checked_add(1).ok_or_else(|| anyhow::anyhow!("session epoch is exhausted"))?;
         core.state.model = spec.model.clone().unwrap_or_default();
         core.state.mode = spec.mode.clone().unwrap_or_default();
         core.harness = Some(kind.name.to_owned());
@@ -1015,13 +1062,13 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
         core.state.arriving = sd.synced;
     }
     core.state.reach.clone_from(&spec.reach);
-    begin(id, spec, kind, core, sink, on_change, files, items, None)
+    begin(id, spec, kind, core, sink, on_change, files, items, None, before_start)
 }
 
 /// A session with this core, its task started (`adopt`: going on with a harness process the
 /// previous image of this process handed over).
 #[allow(clippy::too_many_arguments)]
-fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, items: Option<Vec<serde_json::Value>>, adopt: Option<Adopt>) -> anyhow::Result<Arc<Session>> {
+fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, items: Option<Vec<serde_json::Value>>, adopt: Option<Adopt>, before_start: impl FnOnce(&Session)) -> anyhow::Result<Arc<Session>> {
     let now = crate::util::now_ms();
     core.session_id.clone_from(&id);
     core.state.max_subagents = core.state.max_subagents.or(spec.max_subagents);
@@ -1100,8 +1147,9 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         ran: Mutex::new((None, Vec::new())),
         left: Mutex::new(Vec::new()),
         moving: Mutex::new(false),
-        prompted: std::sync::atomic::AtomicBool::new(false),
+        initial_consumed: std::sync::atomic::AtomicBool::new(false),
     });
+    before_start(&s);
     let run = Arc::clone(&s);
     crate::rt::spawn(async move {
         let id = run.id.clone();
@@ -1110,6 +1158,16 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         }
     });
     Ok(s)
+}
+
+/// U17/CP-T3.2: one stable, harness-agnostic identity for the initial accepted prompt.
+pub(super) fn initial_prompt_id(session: &str) -> String {
+    crate::util::derive_id(&["first-prompt", session])
+}
+
+pub(super) fn initial_prompt(session: &str, spec: &Spec) -> Option<Command> {
+    let text = spec.prompt.as_ref().filter(|p| !p.trim().is_empty())?.clone();
+    Some(Command::Send { id: initial_prompt_id(session), text, mode: Default::default(), attachments: Vec::new(), overrides: None, reply_to: None, task: None })
 }
 
 /// A message for the agent (what a session's inbox takes once, CP-T3.2), not a command to kiln.
@@ -1192,6 +1250,7 @@ struct Jobs {
 async fn flush(s: &Session, sink: &Sink, stdin: Option<&async_channel::Sender<Vec<u8>>>) -> Jobs {
     let (updates, writes, previews, changes) = {
         let mut core = s.core.lock();
+        s.initial_prompt_observed(&core.state);
         let u = core.take_out();
         (u, core.take_writes(), std::mem::take(&mut core.previews), core.take_change_jobs())
     };
@@ -1454,12 +1513,18 @@ async fn gone(pid: u32, wait: Duration) -> bool {
 /// `takeover_stop` kiln ends it): an error to show when it has not, `None` once it is gone (and
 /// the spec forgets it).
 async fn takeover_ready(s: &Session, sink: &Sink, wait: Duration) -> Option<String> {
-    let (pid, stop, kind) = {
+    let (pid, stop, kind, identity) = {
         let sp = s.spec.lock();
-        (sp.takeover_pid?, sp.takeover_stop, sp.kind.clone())
+        (sp.takeover_pid?, sp.takeover_stop, sp.kind.clone(), sp.takeover_identity.clone())
     };
-    // Only the harness it was found as: never whatever has since been given its pid.
-    let stop = stop && crate::aisessions::runs(pid, &kind);
+    let stop = stop && crate::os::pid_alive(pid);
+    // U18/U03: keep one OS handle through TERM and escalation; no bare-PID fallback.
+    let process = if stop {
+        match crate::aisessions::TakeoverProcess::bind(pid, identity.as_ref()) {
+            Ok(process) => Some(process),
+            Err(error) => return Some(format!("Cannot safely end takeover process {pid}: {error}. Quit it, then restart this agent.")),
+        }
+    } else { None };
     // Said in the session's state, not its timeline (which its history fills once it is free).
     let waiting = stop || crate::os::pid_alive(pid);
     if waiting {
@@ -1474,9 +1539,19 @@ async fn takeover_ready(s: &Session, sink: &Sink, wait: Duration) -> Option<Stri
         }
         flush(s, sink, None).await;
     }
-    // Asked to quit first (it keeps its conversation); killed, with what it started, if it won't.
-    if stop && !(crate::aisessions::end(pid, false) && gone(pid, TAKEOVER_QUIT).await) {
-        crate::aisessions::end(pid, true);
+    // Revalidate identity, harness and unmanaged ownership immediately before each signal.
+    if let Some(process) = process {
+        let result = match process.signal(&kind, false) {
+            Ok(()) if gone(pid, TAKEOVER_QUIT).await => Ok(()),
+            Ok(()) => process.signal(&kind, true),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            let mut core = s.core.lock();
+            core.state.doing = None;
+            core.touch_state();
+            return Some(format!("Cannot safely end takeover process {pid}: {error}. Quit it, then restart this agent."));
+        }
     }
     let free = gone(pid, wait).await;
     if waiting {
@@ -1487,6 +1562,7 @@ async fn takeover_ready(s: &Session, sink: &Sink, wait: Duration) -> Option<Stri
     if free {
         let mut sp = s.spec.lock();
         sp.takeover_pid = None;
+        sp.takeover_identity = None;
         sp.takeover_stop = false;
         return None;
     }
@@ -1502,6 +1578,12 @@ impl Done {
     }
 }
 
+#[cfg(test)]
+pub(super) fn test_effects(s: &Arc<Session>, kind: &'static Kind, files: &Files) -> Option<Option<String>> {
+    let (done, _rx) = async_channel::unbounded();
+    effects(s, kind, files, &done)
+}
+
 /// Carry out what the adapter asked for. A branch starts another session; runs, reads and fetches
 /// go off the event loop and come back on `done`. A restart is the caller's: its point (the
 /// harness's own resume point, if any) is returned.
@@ -1510,6 +1592,9 @@ fn effects(s: &Arc<Session>, kind: &'static Kind, files: &Files, done: &async_ch
     let mut restart = None;
     for e in effects {
         match e {
+            super::core::Effect::QueueChanged { id, command } => {
+                if let Some(changed) = &files.queue_changed { changed(&id, command.map(|command| *command)); }
+            }
             super::core::Effect::Branch { resume, resume_at } => {
                 let mut b = s.resume_spec();
                 b.resume = Some(resume);
@@ -2058,6 +2143,7 @@ async fn carry_over(s: &Arc<Session>, from: &'static Kind, sw: Switch, left: usi
         // A program of its own was the old harness's.
         sp.program = None;
         sp.takeover_pid = None;
+        sp.takeover_identity = None;
         sp.takeover_stop = false;
     }
     {
@@ -2824,9 +2910,6 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
     // Going on with the process the previous image of this process ran: its timeline came with it.
     let mut adopt = adopt;
     let handed = adopt.is_some();
-    if handed {
-        s.prompted.store(true, std::sync::atomic::Ordering::Relaxed);
-    }
     // Taking over a session: its transcript is read once it has ended (checked again before each
     // start while it has not).
     if !handed {
@@ -3041,12 +3124,9 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     core.state.exit = None;
                     core.set_status(Status::Starting);
                     core.touch_state();
+                    let initial = s.pending_initial_prompt(&spec, &core, &carry);
                     adapter.start(&mut core);
-                    if !s.prompted.swap(true, std::sync::atomic::Ordering::Relaxed) && let Some(prompt) = spec.prompt.clone().filter(|p| !p.trim().is_empty()) {
-                        // Its id is the session's own (CP-T3.2): made once, the same if it's ever made again.
-                        let id = crate::util::derive_id(&["first-prompt", &s.id]);
-                        adapter.command(&mut core, Command::Send { id, text: prompt, mode: Default::default(), attachments: Vec::new(), overrides: None, reply_to: None, task: None });
-                    }
+                    if let Some(command) = initial { adapter.command(&mut core, command); }
                     for c in carry.drain(..) {
                         adapter.command(&mut core, c);
                     }
@@ -3724,7 +3804,7 @@ mod tests {
             ran: Mutex::new((None, Vec::new())),
             left: Mutex::new(Vec::new()),
             moving: Mutex::new(false),
-            prompted: std::sync::atomic::AtomicBool::new(false),
+            initial_consumed: std::sync::atomic::AtomicBool::new(false),
         };
         (s, rx)
     }
@@ -3735,11 +3815,27 @@ mod tests {
 
     #[test]
     fn a_first_message_its_harness_never_got_stays_in_what_resumes_it_until_it_goes() {
-        let (s, _rx) = idle("never-started");
-        *s.spec.lock() = Spec { kind: "claude".into(), prompt: Some("fix the flaky test".into()), ..Spec::default() };
-        assert_eq!(s.resume_spec().prompt.as_deref(), Some("fix the flaky test"));
-        s.prompted.store(true, std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(s.resume_spec().prompt, None);
+        for kind in Kind::all() {
+            let (s, _rx) = idle("never-started");
+            *s.spec.lock() = Spec { kind: kind.id.into(), prompt: Some("fix the flaky test".into()), ..Spec::default() };
+            let id = initial_prompt_id(&s.id);
+            for delivery in [None, Some(super::super::model::Delivery::Sent), Some(super::super::model::Delivery::Queued)] {
+                s.core.lock().state.delivery = delivery.into_iter().map(|d| (id.clone(), d)).collect();
+                assert_eq!(s.resume_spec().prompt.as_deref(), Some("fix the flaky test"), "{}: an attempt or locally queued write is not consumption", kind.id);
+                let spec = s.resume_spec();
+                assert_eq!(s.pending_initial_prompt(&spec, &s.core.lock(), &[]), initial_prompt(&s.id, &spec), "{}: a new process retries the same stable identity", kind.id);
+            }
+            s.core.lock().state.queue.push(super::super::model::QueueItem { id: id.clone(), text: "fix the flaky test".into(), at: 0, attachments: Vec::new(), overrides: None, reply_to: None });
+            let spec = s.resume_spec();
+            assert!(s.pending_initial_prompt(&spec, &s.core.lock(), &[]).is_none(), "{}: its durable queue already owns the prompt", kind.id);
+            s.core.lock().state.queue.clear();
+            let carried = initial_prompt(&s.id, &spec).into_iter().collect::<Vec<_>>();
+            assert!(s.pending_initial_prompt(&spec, &s.core.lock(), &carried).is_none(), "{}: a queue item carried across restart cannot also be sent from the spec", kind.id);
+            s.core.lock().state.delivery.insert(id.clone(), super::super::model::Delivery::Started);
+            assert_eq!(s.resume_spec().prompt, None, "{}: observed delivery transfers recovery to the harness", kind.id);
+            s.core.lock().state.delivery.clear();
+            assert_eq!(s.resume_spec().prompt, None, "{}: pruning delivery history never repeats the initial prompt", kind.id);
+        }
     }
 
     /// CP-T3.2: a move gathers what a session was sent and hasn't taken (carried while its harness

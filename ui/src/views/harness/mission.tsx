@@ -16,7 +16,7 @@ import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
 import { PageIntro, SelectField, Skeleton } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
-import { useAgentsLive } from "@/lib/data";
+import { harnessSessionsRes, useAgentsLive, useHarnessSessions } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage, useLocalStorage, useMediaQuery, useNow } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
@@ -37,7 +37,6 @@ import { missionFoundSessions, missionRows, subagentsLine, type MissionRow, type
 import { NewAgent } from "./new-agent";
 import { MISSION_DRAFT } from "./new-agent-draft";
 import { useDrafts } from "./state";
-import { useAgentList, useAgents } from "./use-agents";
 import { both, touchSelect, type TouchSelect } from "./touch-select";
 import { answer, asAnswered, useAnswered } from "./answered";
 import { PushOffer } from "./push-offer";
@@ -285,7 +284,7 @@ function RowsLoading() {
 
 /** How your agents stand, in a row of its own under the page's head (stands.tsx). */
 function StandsNow() {
-  const list = useAgentList();
+  const list = useHarnessSessions().data;
   const seen = useSeen();
   const done = useAnswered();
   const rows = React.useMemo(() => standsOf(list, seen, done), [list, seen, done]);
@@ -411,7 +410,7 @@ function RecoverMachine({ machine, count, since, others }: { machine: string; co
           tone: "running",
         });
       else toast.error(`${machine}'s agents couldn't go on elsewhere`, failed[0]?.error ?? "");
-      invalidate("harness/agents");
+      invalidate(harnessSessionsRes.key);
     } catch (e) {
       toast.error(`${machine}'s agents couldn't go on elsewhere`, errorMessage(e));
     } finally {
@@ -495,7 +494,8 @@ function MissionComposer({
 }
 
 function Agents() {
-  const { list, reload } = useAgents();
+  // U13: every view reads one agent roster, with resource.ts batching its live events.
+  const { data: list, reload } = useHarnessSessions();
   const seen = useSeen();
   const [showEnded, setShowEnded] = useLocalStorage<boolean>("kiln.agents.showEnded", false);
   const [selected, setSelected] = React.useState<ReadonlySet<string>>(new Set());

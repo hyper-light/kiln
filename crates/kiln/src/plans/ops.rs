@@ -3,11 +3,12 @@
 //! code mode's `kiln.plans.*`. Each is one of the console's `/api/plans` routes, which call the
 //! same functions.
 
-use http::{Method, StatusCode};
+use crate::authz::At as ScopeAt;
+use http::StatusCode;
 use serde_json::{Value, json};
 
 use super::{Error, Mode, New, Patch, Target};
-use crate::ops::{Cx, Fail, Input, Op, Out, path};
+use crate::ops::{Cx, Fail, Input, Op, Out, Definition, Part, Routes, Payload, Reply};
 
 fn fail(e: Error) -> Fail {
     match e {
@@ -291,7 +292,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: true,
             destructive: false,
             input: Input::of::<input::PlansList>(),
-            route: |_| Ok((Method::GET, path(&["api", "plans"]))),
+            route: Routes(vec![Definition::new("GET", &[Part::Literal("api"), Part::Literal("plans")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(list(cx, v)),
         },
         Op {
@@ -300,7 +301,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: true,
             destructive: false,
             input: Input::of::<input::PlansGet>(),
-            route: |v| Ok((Method::GET, path(&["api", "plans", &id_of(v)?]))),
+            route: Routes(vec![Definition::new("GET", &[Part::Literal("api"), Part::Literal("plans"), Part::Field("id")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(get(cx, v)),
         },
         Op {
@@ -309,7 +310,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: false,
             input: Input::of::<input::PlansCreate>(),
-            route: |_| Ok((Method::POST, path(&["api", "plans"]))),
+            route: Routes(vec![Definition::new("POST", &[Part::Literal("api"), Part::Literal("plans")], &[], "agents.run", ScopeAt::Server).reply(Reply::Json(201))]),
             run: |cx, v| Box::pin(create(cx, v)),
         },
         Op {
@@ -318,7 +319,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: false,
             input: Input::of::<input::PlansUpdate>(),
-            route: |v| Ok((Method::PATCH, path(&["api", "plans", &id_of(v)?]))),
+            route: Routes(vec![Definition::new("PATCH", &[Part::Literal("api"), Part::Literal("plans"), Part::Field("id")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(update(cx, v)),
         },
         Op {
@@ -327,7 +328,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: false,
             input: Input::of::<input::PlansReady>(),
-            route: |v| Ok((Method::POST, path(&["api", "plans", &id_of(v)?, "ready"]))),
+            route: Routes(vec![Definition::new("POST", &[Part::Literal("api"), Part::Literal("plans"), Part::Field("id"), Part::Literal("ready")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(ready(cx, v)),
         },
         Op {
@@ -336,7 +337,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: true,
             destructive: false,
             input: Input::of::<input::PlansVersions>(),
-            route: |v| Ok((Method::GET, path(&["api", "plans", &id_of(v)?, "versions"]))),
+            route: Routes(vec![Definition::new("GET", &[Part::Literal("api"), Part::Literal("plans"), Part::Field("id"), Part::Literal("versions")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(versions(cx, v)),
         },
         Op {
@@ -345,7 +346,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: false,
             input: Input::of::<input::PlansRun>(),
-            route: |v| Ok((Method::POST, path(&["api", "plans", &id_of(v)?, "run"]))),
+            route: Routes(vec![Definition::new("POST", &[Part::Literal("api"), Part::Literal("plans"), Part::Field("id"), Part::Literal("run")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(run(cx, v)),
         },
         Op {
@@ -354,7 +355,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: true,
             destructive: false,
             input: Input::of::<input::PlansRunsList>(),
-            route: |_| Ok((Method::GET, path(&["api", "plans", "runs"]))),
+            route: Routes(vec![Definition::new("GET", &[Part::Literal("api"), Part::Literal("plans"), Part::Literal("runs")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(runs_list(cx, v)),
         },
         Op {
@@ -363,7 +364,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: true,
             destructive: false,
             input: Input::of::<input::PlansRunsGet>(),
-            route: |v| Ok((Method::GET, path(&["api", "plans", "runs", &run_of(v)?]))),
+            route: Routes(vec![Definition::new("GET", &[Part::Literal("api"), Part::Literal("plans"), Part::Literal("runs"), Part::Field("run")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(runs_get(cx, v)),
         },
         Op {
@@ -372,7 +373,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: true,
             input: Input::of::<input::PlansRunsStop>(),
-            route: |v| Ok((Method::POST, path(&["api", "plans", "runs", &run_of(v)?, "stop"]))),
+            route: Routes(vec![Definition::new("POST", &[Part::Literal("api"), Part::Literal("plans"), Part::Literal("runs"), Part::Field("run"), Part::Literal("stop")], &[], "agents.run", ScopeAt::Server).payload(Payload::Ignored)]),
             run: |cx, v| Box::pin(runs_stop(cx, v)),
         },
         Op {
@@ -381,7 +382,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: false,
             input: Input::of::<input::PlansRunsRetry>(),
-            route: |v| Ok((Method::POST, path(&["api", "plans", "runs", &run_of(v)?, "steps", &step_of(v)?.to_string(), "retry"]))),
+            route: Routes(vec![Definition::new("POST", &[Part::Literal("api"), Part::Literal("plans"), Part::Literal("runs"), Part::Field("run"), Part::Literal("steps"), Part::Unsigned("step"), Part::Literal("retry")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(runs_retry(cx, v)),
         },
         Op {
@@ -390,7 +391,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: true,
             input: Input::of::<input::PlansDelete>(),
-            route: |v| Ok((Method::DELETE, path(&["api", "plans", &id_of(v)?]))),
+            route: Routes(vec![Definition::new("DELETE", &[Part::Literal("api"), Part::Literal("plans"), Part::Field("id")], &[], "agents.run", ScopeAt::Server).reply(Reply::Empty)]),
             run: |cx, v| Box::pin(delete(cx, v)),
         },
     ]

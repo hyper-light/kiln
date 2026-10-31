@@ -430,14 +430,14 @@ async fn check(hub: Arc<Hub>, id: &str) {
         return;
     }
     match job.status {
-        Status::Failed | Status::TimedOut | Status::Cancelled => match hub.store.retry_run(job.run_id.clone(), true).await {
+        Status::Failed | Status::TimedOut | Status::Cancelled => match crate::ci::retry::run(&hub, &job.run_id, true, &fix.by).await {
             Ok(_) => {
                 hub.emit_run(&job.run_id).await;
                 hub.wake.notify();
                 hub.store.audit(fix.by.clone(), "run.retry".into(), format!("{} (after an agent installed {} on {})", job.run_id, fix.tools.join(", "), fix.runner)).await;
                 set(&hub, id, "retried", None).await;
             }
-            Err(e) => set(&hub, id, "still_missing", Some(format!("couldn't run it again: {e:#}"))).await,
+            Err(e) => set(&hub, id, "still_missing", Some(format!("couldn't run it again: {}", e.1))).await,
         },
         Status::Queued | Status::Pending => {
             hub.wake.notify();

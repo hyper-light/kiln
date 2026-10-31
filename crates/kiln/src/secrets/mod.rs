@@ -1,5 +1,7 @@
 //! The secrets service (docs/deploy-api.md §3.5): an app's secrets for an environment, their
-//! versions, who set each, and every read of their values for a delivery.
+//! versions, who set each, and every read of their values for a delivery. U09 also routes CI
+//! scopes through the same versioned store and encryption/key lifecycle (`kiln`); the CI adapter
+//! retains scope precedence, workload trust and just-in-time broker policy.
 //!
 //! Callers (`/api/deploy`, `kiln`, delivery through KilnCD) talk to [`Secrets`]: the policy is
 //! here, the same whatever keeps the values (names, sizes, limits, who may, agents never setting
@@ -8,6 +10,7 @@
 //! changing. Every backend is a module of kiln's one binary: no other process or store.
 
 pub mod kiln;
+pub(crate) mod crypto;
 
 use std::future::Future;
 use std::pin::Pin;

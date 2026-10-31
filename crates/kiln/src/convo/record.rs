@@ -267,7 +267,14 @@ mod tests {
 
     fn rows_of(store: &Store, session: &str, source: &str) -> anyhow::Result<Vec<(u64, String)>> {
         store.sync()?;
-        store.record(session, source, 0, 10_000)
+        let mut rows = Vec::new();
+        let mut from = 0;
+        loop {
+            let page = store.record(session, source, from, 10_000)?;
+            let Some((last, _)) = page.last() else { return Ok(rows) };
+            from = last.checked_add(1).ok_or_else(|| anyhow::anyhow!("record page line number overflow"))?;
+            rows.extend(page);
+        }
     }
 
     #[test]

@@ -1,6 +1,5 @@
-//! A finished job run again, here or elsewhere (docs/ci.md W05-R28): a leg of the CI engine (a
-//! new attempt of its run: that leg, and the jobs that need it), a `.kiln/` pipeline's job (v1: in
-//! its run again, with the jobs that need it), or another provider's job (its provider reruns it).
+//! A finished job run again through the CI dispatcher. Historical pipeline jobs first import
+//! their saved plan; jobs owned by another provider are rerun by that provider.
 //! On any runner that can run it, on any but the one its last attempt ran on (`elsewhere`), or on
 //! one named (`runner`).
 //!
@@ -12,13 +11,13 @@ use std::time::Duration;
 
 use http::StatusCode;
 use kiln_ci::sched::Placement;
-use rusqlite::OptionalExtension as _;
+use crate::sql::OptionalExtension as _;
 use serde_json::{Value, json};
 
 use super::Fail;
 use crate::http::server::{self as srv, Response};
 use crate::hub::Hub;
-use crate::store::{JobRetry, Status};
+use crate::store::Status;
 
 fn internal(e: anyhow::Error) -> Fail {
     (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
@@ -119,7 +118,7 @@ fn why_not(hub: &Hub, j: &Job) -> Option<String> {
     }
     match j.kind() {
         "pipeline" if j.status == Status::Skipped => Some("it was skipped: retry the job it needs, or the run".into()),
-        "ci" if !hub.ci.enabled() => Some("the CI engine is off ([ci] enabled)".into()),
+        "ci" | "pipeline" if !hub.ci.enabled() => Some("the CI engine is off ([ci] enabled)".into()),
         "ci" if !j.latest => Some("it's of an earlier attempt of its run: retry it in the latest".into()),
         "ci" if !j.run_done => Some("its run is still in progress: cancel it or wait for it to finish".into()),
         _ => None,
@@ -199,15 +198,6 @@ fn said(p: Option<&Placement>) -> String {
     }
 }
 
-/// A line in each of a job's step logs where its last attempt ends: a pipeline's job retried in
-/// place keeps its logs, and the next attempt's follow.
-async fn mark(hub: &Hub, job: &str, line: &str) {
-    let steps = hub.store.job(job.to_owned()).await.ok().flatten().map(|j| j.steps).unwrap_or_default();
-    for s in steps {
-        hub.logs.mark(job, s.idx, line).await;
-    }
-}
-
 /// `GET /api/ci/legs/:id/runners`: where a finished job could run again (W05-R28): the runners
 /// of their own, each able to run it or why not; the one its last attempt ran on (`ran_on`), and
 /// whether that one can be avoided (`elsewhere`); and whether it can be retried now.
@@ -234,30 +224,18 @@ pub async fn runners(hub: &Hub, id: &str) -> Result<Response, Fail> {
 /// run for real: none takes an earlier result over); a pipeline's job runs again in its run, with
 /// the jobs that need it; another provider's is rerun by that provider.
 pub async fn retry(hub: &Hub, id: &str, body: &Value, by: &str) -> Result<Response, Fail> {
-    let j = job_of(hub, id).await?;
+    let mut j = job_of(hub, id).await?;
+    if j.kind() == "pipeline" {
+        if !hub.ci.enabled() { return Err(conflict("the CI engine is off ([ci] enabled)")); }
+        super::legacy::import_run(hub, &j.run).await.map_err(internal)?;
+        j = job_of(hub, id).await?;
+    }
     if let Some(why) = why_not(hub, &j) {
         return Err(conflict(why));
     }
     let placement = placement_of(hub, id, &j, body).await?;
     let said = said(placement.as_ref());
     match j.kind() {
-        "pipeline" => match hub.store.retry_job(id.to_owned(), placement.clone()).await.map_err(internal)? {
-            JobRetry::NoSuchJob => Err((StatusCode::NOT_FOUND, "no such job".into())),
-            JobRetry::Refused(why) => Err(conflict(why)),
-            JobRetry::Again { run, attempt, waiting } => {
-                mark(hub, id, &format!("retried by {by}{said}: its next attempt follows")).await;
-                for w in &waiting {
-                    mark(hub, w, &format!("run again with {}'s retry: its next attempt follows", j.key)).await;
-                }
-                for w in std::iter::once(id).chain(waiting.iter().map(String::as_str)) {
-                    hub.emit_job(w).await;
-                }
-                hub.emit_run(&run).await;
-                hub.wake.notify();
-                hub.store.audit(by.to_owned(), "ci.legs.retry".into(), format!("{id}{said}")).await;
-                Ok(srv::json(StatusCode::CREATED, &json!({ "kind": "pipeline", "run": run, "job": id, "attempt": attempt, "waiting": waiting, "placement": placement })))
-            }
-        },
         "ci" => {
             let mode = super::dispatch::RerunMode::Leg { job: j.job.clone().unwrap_or_default(), key: j.key.clone() };
             let placed: HashMap<String, Placement> = placement.clone().map(|p| (j.key.clone(), p)).into_iter().collect();
@@ -277,5 +255,25 @@ pub async fn retry(hub: &Hub, id: &str, body: &Value, by: &str) -> Result<Respon
             let v = super::providers::rerun(hub, &repo, &provider, &ext, "job", Some(id)).await?;
             Ok(srv::json(StatusCode::CREATED, &json!({ "kind": provider, "run": j.run, "rerun": v })))
         }
+    }
+}
+
+/// Compatibility for the original run-retry endpoint and tool repair. Historical pipelines
+/// acquire a canonical saved plan first; every retry goes through the same dispatcher.
+pub async fn run(hub: &Hub, id: &str, only_failed: bool, by: &str) -> Result<u32, Fail> {
+    if !hub.ci.enabled() { return Err(conflict("the CI engine is off ([ci] enabled)")); }
+    let row = hub.store.run(id.to_owned()).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, "no such run".into()))?;
+    if !row.status.is_terminal() { return Err(conflict("the run is still in progress; cancel it or wait for it to finish")); }
+    super::legacy::import_run(hub, id).await.map_err(internal)?;
+    let (tx, rx) = async_channel::bounded(1);
+    hub.ci.send(super::dispatch::Msg::Rerun {
+        run: id.to_owned(), mode: if only_failed { super::dispatch::RerunMode::Failed } else { super::dispatch::RerunMode::All },
+        debug: false, keep_failed: None, actions: None, no_reuse: true, cold: false,
+        placed: HashMap::new(), by: by.to_owned(), reply: tx,
+    });
+    match crate::rt::timeout(Duration::from_secs(60), rx.recv()).await {
+        Ok(Ok(Ok(attempt))) => Ok(attempt),
+        Ok(Ok(Err(e))) => Err(conflict(e)),
+        _ => Err((StatusCode::GATEWAY_TIMEOUT, "the dispatcher didn't answer".into())),
     }
 }

@@ -41,7 +41,7 @@ use http_body_util::BodyExt as _;
 use kiln_ci::work::key::{Kind, PathSet, Platform, Unit};
 use kiln_ci::work::trust::Domain;
 use pb::{Digest, Method};
-use rusqlite::{OptionalExtension as _, params};
+use crate::sql::{OptionalExtension as _, params};
 use sha2::Digest as _;
 
 use super::ledger::Ledger;

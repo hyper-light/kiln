@@ -1,0 +1,219 @@
+# Copyright 2023-2025 the Turso authors. All rights reserved. MIT license.
+# Amphora's engine since Turso 3e09a82 (ORIGIN.md).
+
+[package]
+name = "amphora-engine"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Amphora's SQL engine: what Turso was at 3e09a82, Amphora's own since"
+
+# The engine's own lints, as it came with them: CLAUDE.md's rules hold for every line Amphora writes
+# here, and scripts/check-production.sh counts what is left of the inherited code that breaks them, a
+# count that may only fall.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(shuttle)', 'cfg(antithesis)', 'cfg(nightly)'] }
+# For now allow this for the allocator api migration
+unstable_name_collisions = "allow"
+
+[lints.clippy]
+await_holding_lock = "deny"
+or_fun_call = "deny"
+clear_with_drain = "deny"
+collection_is_never_read = "deny"
+naive_bytecount = "deny"
+stable_sort_primitive = "deny"
+large_stack_frames = "deny"
+large_types_passed_by_value = "deny"
+redundant_clone = "deny"
+assigning_clones = "deny"
+
+[lib]
+name = "amphora_engine"
+path = "lib.rs"
+
+[features]
+# Amphora's: no `simd` (simsimd compiles C), pure-Rust crypto (aegis compiles C otherwise), each page
+# checksummed (Amphora's docs/design/store.md, decision 12). Workspace builds unify these with what
+# Amphora asks, so the engine's own tests run as Amphora runs it, and nothing is compiled from C.
+default = [
+    "fs",
+    "uuid",
+    "time",
+    "json",
+    "series",
+    "encryption",
+    "percentile",
+    "autovacuum",
+    "pure-rust-crypto",
+    "checksum",
+]
+tracing_release = ["tracing/release_max_level_info"]
+conn_raw_api = []
+# Harness-side observability: turns on aristo's instrument surface so the
+# logical-log conformance DTs can read private LogicalLog state (header
+# version, pending running CRC) and construct LogRecords. Off by default;
+# production builds carry zero instrumentation.
+aristo-instr = ["aristo/aristo_instrument"]
+fs = ["amphora-engine-ext/vfs"]
+json = []
+uuid = []
+io_uring = ["dep:io-uring", "rustix/io_uring"]
+experimental_win_iocp = []
+time = []
+fuzz = []
+autovacuum = []
+simulator = ["fuzz", "serde", "io_memory_yield", "allocation_metric"]
+allocation_metric = []
+# Test only: exposed to testing/stress and the simulator, never to regular library users.
+io_memory_yield = []
+serde = ["dep:serde"]
+series = []
+encryption = []
+pure-rust-crypto = ["aegis/pure-rust"]
+checksum = []
+cli_only = []
+test_helper = []
+bench = []
+nanosecond-bench = ["bench"]
+fts = ["dep:tantivy", "dep:tantivy-common", "dep:serde", "dep:serde_json", "dep:crc32fast"]
+codspeed = ["bench"]
+optimizer_params = ["serde", "dep:serde_json"]
+stacker = ["dep:stacker"]
+percentile = []
+simd = ["dep:simsimd"]
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_System_IO",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+    "Win32_System_Diagnostics_Debug",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { version = "0.7.5", optional = true }
+libc = { version = "0.2.172" }
+
+[target.'cfg(target_family = "unix")'.dependencies]
+polling = "3.7.4"
+rustix = { version = "1.0.5", features = ["fs"] }
+libc = { version = "0.2.172" }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+libloading = "0.8.6"
+tantivy = { version = "0.26.2", optional = true }
+tantivy-common = { version = "0.11.0", optional = true }
+crc32fast = { version = "1", optional = true }
+
+[dependencies]
+# aristo SDK from crates.io (0.4.x — latest; also carries the aristo::instrument
+# surface behind the `aristo_instrument` feature, for future state-exposure
+# accessors). Was a local sibling path (../../aristo) pre-OSS; the conformance
+# harness resolves aristo + aristo-macros from crates.io, so no vendored mount
+# / path-rewrite is needed.
+aristo = "0.4"
+amphora-engine-ext = { workspace = true, features = ["core_only"] }
+lz4_flex = { workspace = true }
+cfg_block = "0.1.1"
+fallible-iterator = { workspace = true }
+allocator-api2 = { workspace = true }
+hex = { workspace = true }
+icu_collator = "2.2.0"
+icu_locale = "2.2.0"
+thiserror = { workspace = true }
+regex = { workspace = true }
+regex-syntax = { workspace = true, default-features = false, features = [
+    "unicode",
+] }
+chrono = { workspace = true, default-features = false, features = ["clock"] }
+rand = { workspace = true }
+libm = "0.2"
+amphora-engine-macros = { workspace = true }
+miette = { workspace = true }
+strum = { workspace = true }
+parking_lot = { workspace = true, features = ["arc_lock"] }
+crossbeam-epoch = "0.9.18"
+crossbeam-utils = "0.8.21"
+tracing = { workspace = true }
+uncased = "0.9.10"
+strum_macros = { workspace = true }
+bitflags = { workspace = true }
+serde = { workspace = true, optional = true, features = ["derive"] }
+serde_json = { workspace = true, optional = true }
+pastey = "0.2.1"
+uuid = { version = "1.11.0", features = ["v4", "v5", "v7"] }
+tempfile = { workspace = true }
+pack1 = { version = "1.0.0", features = ["bytemuck"] }
+bytemuck = "1.23.1"
+aes-gcm = { version = "0.10.3" }
+aes = { version = "0.8.4" }
+amphora-engine-parser = { workspace = true }
+twox-hash = "2.1.1"
+intrusive-collections = "0.9.7"
+roaring = "0.11.2"
+arc-swap = "1.7"
+rustc-hash = "2.0"
+either = { workspace = true }
+tracing-subscriber.workspace = true
+rapidhash = "4.1.1"
+simdutf8 = "0.1.5"
+branches = { version = "0.4.3", default-features = false }
+bumpalo = { version = "3", features = ["collections"] }
+smallvec = "1.15.1"
+memchr = "2.7.6"
+fastbloom = { version = "0.14.1", default-features = false }
+crc32c = "0.6.8"
+bigdecimal = "0.4"
+num-bigint = "0.4"
+num-traits = "0.2"
+stacker = { version = "0.1", optional = true }
+
+[target.'cfg(not(any(target_family = "wasm", all(target_os = "windows", target_arch = "aarch64"))))'.dependencies]
+simsimd = { version = "6.5.3", optional = true }
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+# From fastbloom/rand
+getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
+# From  aes-gcm
+getrandom03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+uuid = { version = "1.11.0", features = ["js"] }
+
+[target.'cfg(antithesis)'.dependencies]
+antithesis_sdk = { workspace = true, features = ["full"] }
+serde_json = { workspace = true }
+
+[target.'cfg(loom)'.dependencies]
+loom = { workspace = true }
+
+[target.'cfg(shuttle)'.dependencies]
+shuttle = { workspace = true }
+
+# Use pure-rust for Android and MacOS to avoid C cross-compilation issues.
+# Other targets can opt in via the `pure-rust-crypto` feature.
+[target.'cfg(any(target_os = "android", target_os = "macos"))'.dependencies]
+aegis = { version = "0.9.8", features = ["pure-rust"] }
+
+[target.'cfg(not(any(target_os = "android", target_os = "macos")))'.dependencies]
+aegis = { version = "0.9.8" }
+
+[build-dependencies]
+cfg_aliases = "0.2.1"
+
+[dev-dependencies]
+asserting = { workspace = true }
+memory-stats = "1.2.0"
+serde_json = { workspace = true }
+rstest = "0.18.2"
+quickcheck = { version = "1.0", default-features = false }
+quickcheck_macros = { version = "1.0", default-features = false }
+rand_chacha = { workspace = true }
+env_logger = { workspace = true }
+test-log = { version = "0.2.17", features = ["trace"] }
+sorted-vec = "0.8.6"

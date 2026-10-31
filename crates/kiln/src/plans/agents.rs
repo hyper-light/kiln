@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
-use rusqlite::{OptionalExtension as _, params};
+use crate::sql::{OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -371,7 +371,7 @@ struct Head {
     config: Config,
 }
 
-fn load(c: &rusqlite::Connection, run: &str) -> anyhow::Result<Option<(Head, Vec<Row>)>> {
+fn load(c: &crate::sql::Connection, run: &str) -> anyhow::Result<Option<(Head, Vec<Row>)>> {
     let head = c
         .query_row(
             "SELECT plan_id, version, COALESCE(state, ''), reason, note, at, ended_at, by, COALESCE(config, '{}') FROM plan_runs WHERE id = ?1 AND mode = 'agents'",
@@ -930,6 +930,8 @@ mod tests {
         std::thread::spawn(move || {
             let r = crate::rt::block_on(async {
                 let hub = crate::hub::tests::scratch_hub_with(|c| c.terminal.enabled = true).await?;
+                // U17: complete restoration before this fixture accepts session starts.
+                crate::harness::registry::Registry::initialize_local(&hub).await?;
                 let h = Arc::clone(&hub);
                 crate::rt::spawn(async move {
                     let _ = crate::harness::registry::Registry::run_local(h).await;
@@ -1004,6 +1006,8 @@ mod tests {
         std::thread::spawn(move || {
             let r = crate::rt::block_on(async {
                 let hub = crate::hub::tests::scratch_hub_with(|c| c.terminal.enabled = true).await?;
+                // U17: complete restoration before this fixture accepts session starts.
+                crate::harness::registry::Registry::initialize_local(&hub).await?;
                 let offering = |ids: &[&str]| {
                     crate::harness::kinds::offered()
                         .into_iter()
@@ -1054,6 +1058,8 @@ mod tests {
         std::thread::spawn(move || {
             let r = crate::rt::block_on(async {
                 let hub = crate::hub::tests::scratch_hub_with(|c| c.terminal.enabled = true).await?;
+                // U17: complete restoration before this fixture accepts session starts.
+                crate::harness::registry::Registry::initialize_local(&hub).await?;
                 let h = Arc::clone(&hub);
                 crate::rt::spawn(async move {
                     let _ = crate::harness::registry::Registry::run_local(h).await;

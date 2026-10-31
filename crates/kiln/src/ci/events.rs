@@ -8,19 +8,19 @@ use std::sync::Arc;
 
 use kiln_ci::trigger::context::{self, Commit, Person, PullRequest, Side};
 use kiln_ci::trigger::{Event, Source, ZERO_SHA};
-use rusqlite::OptionalExtension as _;
+use crate::sql::OptionalExtension as _;
 
 use super::dispatch::{Msg, Start};
 use super::load;
 use crate::gitops::{self, LS_REMOTE_TIMEOUT, Trigger};
 use crate::hub::Hub;
-use crate::store::{Repo, Status};
+use crate::store::{Repo, Run, Status};
 
-/// What the engine did with a trigger: whether the commit has GitHub workflows that run, so v1's
-/// auto-detected pipelines stand aside (W02-R02).
-pub async fn on_trigger(hub: &Hub, repo: &Repo, t: &Trigger) -> anyhow::Result<bool> {
+/// Runs created by a trigger (U01, W02-R06). Both dialects and generated workflows use this
+/// engine; a load or dispatch error is returned to the caller, never retried through v1.
+pub async fn on_trigger(hub: &Hub, repo: &Repo, t: &Trigger) -> anyhow::Result<Vec<Run>> {
     if !hub.ci.enabled() {
-        return Ok(false);
+        return Ok(Vec::new());
     }
     // A host's pull request closed: its preview goes (W15-R07), whichever CI runs its workflows.
     if t.event == "pull_request"
@@ -32,7 +32,7 @@ pub async fn on_trigger(hub: &Hub, repo: &Repo, t: &Trigger) -> anyhow::Result<b
     }
     // A repository whose CI runs elsewhere (W23-R07): KilnCI stands aside.
     if !super::providers::kiln_runs(hub, repo).await {
-        return Ok(true);
+        return Ok(Vec::new());
     }
     let commit = load::load(hub, repo, &t.sha).await?;
     // A push to the trunk (its commit here now): the tests it took into quarantine (W16-R05,
@@ -43,19 +43,66 @@ pub async fn on_trigger(hub: &Hub, repo: &Repo, t: &Trigger) -> anyhow::Result<b
         super::notify::trunk_moved(hub, repo, &t.branch, before, &t.sha).await;
     }
     // A manual run of one pipeline runs that one only.
-    let wanted = |l: &load::Loaded| t.pipeline.as_deref().is_none_or(|p| l.path == p || l.workflow.as_ref().and_then(|w| w.name.as_deref()) == Some(p));
-    // GitHub's workflows; the kiln dialect's too once `[ci] kiln_workflows` takes them off v1.
-    let engine_runs = |l: &load::Loaded| l.dialect == kiln_ci::expr::Dialect::Gha || hub.cfg.ci.kiln_workflows;
-    let running: Vec<&load::Loaded> = commit.workflows.iter().filter(|l| l.runs && engine_runs(l) && wanted(l)).collect();
+    let wanted = |l: &load::Loaded| t.pipeline.as_deref().is_none_or(|p| names(l, p));
+    let running: Vec<&load::Loaded> = commit.workflows.iter().filter(|l| l.runs && wanted(l)).collect();
     if running.is_empty() {
-        return Ok(false);
+        return Ok(Vec::new());
     }
     let event = event(hub, repo, t).await;
     let (message, author) = gitops::commit_info(hub, repo, &t.sha).await;
+    let mut runs = Vec::new();
     for l in running {
-        start(hub, repo, &event, l, &message, &author, serde_json::Value::Null).await?;
+        let (tx, rx) = async_channel::bounded(1);
+        let given = super::dispatch::Given { reply: Some(tx), ..super::dispatch::Given::default() };
+        if start_given(hub, repo, &event, l, (&message, &author), serde_json::Value::Null, given).await? {
+            let id = created(rx, &l.path).await?;
+            let run = hub.store.run(id.clone()).await?.ok_or_else(|| anyhow::anyhow!("created workflow run {id} was not recorded"))?;
+            runs.push(run);
+        }
     }
-    Ok(true)
+    Ok(runs)
+}
+
+/// W03-R07/R14: preparation has no acceptance side effect. A load failure leaves the source
+/// retryable; successful acceptance freezes the event and workflow model before ref/delivery ACK.
+pub(crate) async fn ingress(hub: &Hub, repo: &Repo, mut event: Event) -> anyhow::Result<super::schedule::outbox::Payload> {
+    use super::schedule::outbox::{Ingress, Payload};
+    let mut workflows = Vec::new();
+    if super::providers::kiln_runs(hub, repo).await {
+        let commit = load::load(hub, repo, &event.sha).await?;
+        let (message, author) = gitops::commit_info(hub, repo, &event.sha).await;
+        if event.message.is_none() { event.message = Some(message.clone()); }
+        for l in commit.workflows.iter().filter(|l| l.runs) {
+            let Payload::Workflow(w) = super::schedule::outbox::workflow(repo, &event, l, &message, &author) else { continue };
+            workflows.push(*w);
+        }
+    }
+    anyhow::ensure!(workflows.len() <= 4096, "ingress exceeds 4096 workflows");
+    let payload = Payload::Ingress(Box::new(Ingress { repo: repo.clone(), event, workflows, trunk_before: None }));
+    anyhow::ensure!(serde_json::to_vec(&payload)?.len() <= 8 << 20, "ingress exceeds 8 MiB");
+    Ok(payload)
+}
+
+pub(crate) async fn ref_ingress(hub: &Hub, repo: &Repo, t: &Trigger) -> anyhow::Result<super::schedule::outbox::Payload> {
+    gitops::ensure_commit(hub, repo, &t.sha).await?;
+    let mut source = ingress(hub, repo, event(hub, repo, t).await).await?;
+    if t.event == "push" && super::providers::kiln_runs(hub, repo).await
+        && let super::schedule::outbox::Payload::Ingress(source) = &mut source
+    {
+        source.trunk_before = t.before.clone().filter(|b| b != ZERO_SHA);
+    }
+    Ok(source)
+}
+
+fn names(l: &load::Loaded, wanted: &str) -> bool {
+    let file = l.path.rsplit('/').next().unwrap_or(&l.path);
+    l.path == wanted || file == wanted || file.strip_suffix(".yaml").or_else(|| file.strip_suffix(".yml")) == Some(wanted) || l.workflow.as_ref().and_then(|w| w.name.as_deref()) == Some(wanted)
+}
+
+async fn created(rx: async_channel::Receiver<String>, workflow: &str) -> anyhow::Result<String> {
+    crate::rt::timeout(std::time::Duration::from_secs(30), rx.recv()).await
+        .map_err(|_| anyhow::anyhow!("workflow {workflow}: the dispatcher did not record a run within 30 seconds"))?
+        .map_err(|_| anyhow::anyhow!("workflow {workflow}: the dispatcher stopped before recording its run"))
 }
 
 /// [`on_trigger`] for the one workflow `t` names (its path or name), asked for by kiln itself
@@ -67,8 +114,7 @@ pub async fn start_one(hub: &Hub, repo: &Repo, t: &Trigger) -> anyhow::Result<Op
         return Ok(None);
     }
     let commit = load::load(hub, repo, &t.sha).await?;
-    let engine_runs = |l: &load::Loaded| l.dialect == kiln_ci::expr::Dialect::Gha || hub.cfg.ci.kiln_workflows;
-    let Some(l) = commit.workflows.iter().find(|l| l.runs && engine_runs(l) && (l.path == p || l.workflow.as_ref().and_then(|w| w.name.as_deref()) == Some(p))) else { return Ok(None) };
+    let Some(l) = commit.workflows.iter().find(|l| l.runs && names(l, p)) else { return Ok(None) };
     let event = event(hub, repo, t).await;
     let (message, author) = gitops::commit_info(hub, repo, &t.sha).await;
     let (tx, rx) = async_channel::bounded(1);
@@ -76,7 +122,7 @@ pub async fn start_one(hub: &Hub, repo: &Repo, t: &Trigger) -> anyhow::Result<Op
     if !start_given(hub, repo, &event, l, (&message, &author), serde_json::Value::Null, given).await? {
         return Ok(None);
     }
-    Ok(crate::rt::timeout(std::time::Duration::from_secs(30), rx.recv()).await.ok().and_then(Result::ok))
+    Ok(Some(created(rx, &l.path).await?))
 }
 
 /// Starts workflow `l` for `event` when it matches (W03-R03), with its remote actions pinned
@@ -99,13 +145,8 @@ pub async fn start_given(hub: &Hub, repo: &Repo, event: &Event, l: &load::Loaded
         tracing::debug!(workflow = %l.path, %why, "workflow not run");
         return Ok(false);
     }
-    match super::actions::resolve(hub, repo, &event.sha, w).await {
+    match resolve_actions(hub, repo, event, &l.path, w).await {
         Ok(actions) => {
-            // Every resolution is audited (W07-R04): who, which ref, which commit.
-            if !actions.is_empty() {
-                let list: Vec<String> = actions.iter().map(|(u, a)| format!("{u} → {}", a.error.as_ref().map_or_else(|| a.sha.clone(), |e| format!("unresolved ({e})")))).collect();
-                hub.store.audit(event.actor.clone(), "ci.actions.resolve".into(), format!("{} {} at {}: {}", repo.name, l.path, event.sha, list.join(", "))).await;
-            }
             hub.ci.send(Msg::Start(Box::new(Start {
                 repo: repo.clone(),
                 event: event.clone(),
@@ -126,6 +167,17 @@ pub async fn start_given(hub: &Hub, repo: &Repo, event: &Event, l: &load::Loaded
         }
     }
     Ok(true)
+}
+
+/// One pinning and audit boundary for immediate ingress and durable trigger replay (U04,
+/// W07-R02/R04). The durable caller stores its answer before publishing a command.
+pub(crate) async fn resolve_actions(hub: &Hub, repo: &Repo, event: &Event, path: &str, workflow: &kiln_ci::wf::Workflow) -> Result<std::collections::BTreeMap<String, kiln_ci::wire::ActionRef>, String> {
+    let actions = super::actions::resolve(hub, repo, &event.sha, workflow).await?;
+    if !actions.is_empty() {
+        let list: Vec<String> = actions.iter().map(|(u, a)| format!("{u} → {}", a.error.as_ref().map_or_else(|| a.sha.clone(), |e| format!("unresolved ({e})")))).collect();
+        hub.store.audit(event.actor.clone(), "ci.actions.resolve".into(), format!("{} {path} at {}: {}", repo.name, event.sha, list.join(", "))).await;
+    }
+    Ok(actions)
 }
 
 /// What events need to know about a repository: how payloads describe it, its default branch
@@ -189,7 +241,7 @@ async fn pushed_by(hub: &Hub, repo: &str, git_ref: &str, sha: &str) -> Option<se
         .call(move |c| {
             Ok(c.query_row(
                 "SELECT started_by FROM ci_pushes WHERE repo_id = ?1 AND ref = ?2 AND (sha = ?3 OR ref LIKE 'refs/tags/%') ORDER BY ts DESC LIMIT 1",
-                rusqlite::params![r, g, s],
+                crate::sql::params![r, g, s],
                 |x| x.get::<_, String>(0),
             )
             .optional()?)
@@ -305,9 +357,12 @@ async fn commits(hub: &Hub, mirror: &str, before: Option<&str>, after: &str) -> 
 
 /// A workflow that can't run: one failed run, its diagnostics as the error (W02-AC09).
 async fn startup_failure(hub: &Hub, repo: &Repo, e: &Event, l: &load::Loaded, message: &str, author: &str) -> anyhow::Result<String> {
+    fail_run(hub, repo, e, l, message, author, startup_error(l)).await
+}
+
+pub(crate) fn startup_error(l: &load::Loaded) -> String {
     let lines: Vec<String> = l.diagnostics.iter().filter(|d| d.severity == kiln_ci::wf::Severity::Error).map(|d| format!("{}:{}:{}: {} {}", l.path, d.range.start.line, d.range.start.col, d.code, d.message)).collect();
-    let error = if lines.is_empty() { format!("{} could not be read", l.path) } else { lines.join("\n") };
-    fail_run(hub, repo, e, l, message, author, error).await
+    if lines.is_empty() { format!("{} could not be read", l.path) } else { lines.join("\n") }
 }
 
 /// A run that fails before any job, saying why. Its id.

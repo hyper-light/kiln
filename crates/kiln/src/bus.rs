@@ -12,6 +12,9 @@ use kiln_seams::bus::{Batch, Bus, Class, Message, Offset, Refusal, Topic};
 use quiver_api::Topics as _;
 use serde::{Deserialize, Serialize};
 
+mod fanout;
+pub use fanout::{Broadcast, Receiver, RecvError};
+
 /// `[bus]` in kiln.toml.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]

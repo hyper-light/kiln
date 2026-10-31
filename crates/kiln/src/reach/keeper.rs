@@ -3,7 +3,7 @@
 //! agent ([`Using`], as the node's syncs and runs say), looks at them every 20 seconds with the room
 //! left on their disk, lets go of what the rules ([`keep`]) don't keep when a trigger says, and tells
 //! the server what it holds, what it let go and why. The rules come back in the server's answer and
-//! are kept beside the copies, so they apply while the server is away. One runner process of a
+//! are kept in the shared runner ledger, so they apply while the server is away. One runner process of a
 //! machine keeps them at a time (it holds `.keep.lock` beside them); one that handed everything to
 //! a newer build lets the newer one keep them ([`retire`]).
 
@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use futures::FutureExt as _;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use kiln_seams::records::{Cond, Consistency, Records, Tx, Write};
 
 use super::keep::{self, Disk, Gone, Look, Report, Set, Step, TreeCopy};
 use super::node::Handle;
@@ -33,13 +34,22 @@ const AGENTS_KEPT: usize = 4;
 const SIZE_EVERY_S: i64 = 600;
 /// What measuring copies may take of one look (the first copy measured always is).
 const SIZE_BUDGET: Duration = Duration::from_secs(5);
-/// The keeper's file is written when it changes, and at least this often.
-const SAVE_EVERY_S: i64 = 600;
 /// How long the server has to answer.
 const ASK_WAIT: Duration = Duration::from_secs(20);
-/// Beside the copies: the keeper's file, its lock, and where copies are moved before they're
-/// deleted (a deletion cut short is finished there).
+/// Beside the copies: the read-only legacy import source, the physical owner lock, and where
+/// copies are moved before deletion (a deletion cut short is finished there).
 const SAVED: &str = ".keep.json";
+// U19: leave half the product request budget for keys, conditions, manifest and receipt.
+// Every segment fits VALUE_MAX; the whole replacement is one bounded atomic transaction.
+const SNAPSHOT_MAX: usize = amphora_api::REQUEST_MAX / 2;
+const SEGMENT_BYTES: usize = amphora_api::VALUE_MAX;
+const MANIFEST_PREFIX: &[u8] = b"keeper-segments-v1\n";
+
+#[derive(Serialize, Deserialize)]
+struct Manifest {
+    bytes: usize,
+    segments: usize,
+}
 const LOCK: &str = ".keep.lock";
 const ASIDE: &str = ".letting-go";
 /// The folder `kiln run`'s named shells keep their state in, beside the copies: not a runner's.
@@ -155,7 +165,7 @@ struct Record {
     sized: i64,
 }
 
-/// The keeper's file beside the copies.
+/// U17: the keeper snapshot in the shared runner Records ledger.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 struct Saved {
@@ -168,25 +178,27 @@ struct Saved {
     /// Each copy's record, by `<runner>/<folder>`.
     records: BTreeMap<String, Record>,
     gone: Vec<Gone>,
+    /// U17: deletion intent survives a crash between moving bytes and recording history.
+    pending: Option<Gone>,
 }
 
 struct Keeper {
     base: PathBuf,
+    ledger: Arc<dyn Records>,
+    revision: Option<u64>,
+    segments: usize,
     using: Arc<Using>,
     handle: Handle,
-    lock: Option<std::fs::File>,
+    lock: Option<crate::util::FileLock>,
     saved: Saved,
-    /// As last written, and when.
-    written: Option<Saved>,
-    written_at: i64,
     error: Option<String>,
 }
 
 /// Keep the copies under `base` (`~/.kiln/reach`), as the node at `handle` notes their uses in
 /// `using`.
-pub fn start(handle: Handle, using: Arc<Using>, base: PathBuf) {
+pub fn start(handle: Handle, using: Arc<Using>, base: PathBuf, ledger: Arc<dyn Records>) {
     crate::rt::spawn(async move {
-        let mut k = Keeper { base, using, handle, lock: None, saved: Saved::default(), written: None, written_at: 0, error: None };
+        let mut k = Keeper { base, ledger, revision: None, segments: 0, using, handle, lock: None, saved: Saved::default(), error: None };
         while !RETIRING.load(Ordering::Relaxed) {
             let again = std::panic::AssertUnwindSafe(k.look()).catch_unwind().await.unwrap_or_else(|_| {
                 crate::metrics::global().panics_caught.inc();
@@ -206,15 +218,22 @@ impl Keeper {
     /// once (the server passed on an ask to let go now).
     async fn look(&mut self) -> bool {
         let now = crate::util::now_unix();
-        if !self.base.is_dir() {
-            // No copies here yet: nothing to keep, but the server hears so, and has its rules ready.
-            self.saved.done = self.saved.asked;
-            return self.report(now, disk_of(&self.base), Vec::new()).await;
-        }
         if !self.hold().await {
             return false;
         }
-        let (base, records, using) = (self.base.clone(), std::mem::take(&mut self.saved.records), self.using.snapshot());
+        // U17: a durable barrier precedes cleanup or retention side effects, even offline.
+        if !self.save(now).await {
+            return false;
+        }
+        if let Some(pending) = self.saved.pending.take() {
+            if !self.base.join(&pending.from).join(&pending.key).exists() {
+                self.saved.records.remove(&format!("{}/{}", pending.from, pending.key));
+                self.saved.gone.insert(0, pending);
+                self.saved.gone.truncate(GONE_KEPT);
+            }
+            if !self.save(now).await { return false; }
+        }
+        let (base, records, using) = (self.base.clone(), self.saved.records.clone(), self.using.snapshot());
         let found = crate::rt::blocking(move || inventory(&base, records, &using, now)).await;
         let mut copies = match found {
             Ok(Ok((copies, records))) => {
@@ -232,12 +251,15 @@ impl Keeper {
         self.error = None;
         for step in keep::plan(&self.saved.set, &Look { now, since, disk, asked, copies: &copies }) {
             let copy = copies.iter().position(|c| c.from == step.from && c.key == step.key);
-            if let Some(g) = self.let_go(&step, copy.and_then(|i| copies.get(i)), now).await {
+            let gone = self.let_go(&step, copy.and_then(|i| copies.get(i)), now).await;
+            if self.lock.is_none() { return false; }
+            if let Some(g) = gone {
                 if let Some(i) = copy {
                     copies.remove(i);
                 }
                 self.saved.gone.insert(0, g);
                 self.saved.gone.truncate(GONE_KEPT);
+                if !self.save(now).await { return false; }
             }
         }
         self.saved.since = now;
@@ -246,17 +268,17 @@ impl Keeper {
         }
         measured(&copies);
         let disk = disk_of(&self.base);
-        let again = self.report(now, disk, copies).await;
-        self.save(now).await;
-        again
+        if !self.save(now).await { return false; }
+        self.report(now, disk, copies).await
     }
 
-    async fn failed(&mut self, now: i64, why: String) -> bool {
+    async fn failed(&mut self, _now: i64, why: String) -> bool {
         if self.error.as_deref() != Some(why.as_str()) {
             tracing::warn!(target: "kiln.reach", event = "keep_failed", error = %why, "the keeper of copies couldn't look at them");
         }
         self.error = Some(why);
-        self.report(now, disk_of(&self.base), Vec::new()).await
+        // U17: no acknowledgement from a partially recovered or failed look.
+        false
     }
 
     /// Whether this process keeps the copies: the one holding `.keep.lock` beside them. Taking it,
@@ -266,32 +288,30 @@ impl Keeper {
             return true;
         }
         let base = self.base.clone();
-        let got = crate::rt::blocking(move || -> std::io::Result<Option<(std::fs::File, Saved)>> {
+        let got = crate::rt::blocking(move || -> std::io::Result<Option<(crate::util::FileLock, PathBuf)>> {
+            std::fs::create_dir_all(&base)?;
+            let base = std::fs::canonicalize(base)?;
             let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(base.join(LOCK))?;
-            if f.try_lock().is_err() {
-                return Ok(None);
-            }
-            let saved = std::fs::read(base.join(SAVED)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-            for e in std::fs::read_dir(base.join(ASIDE)).into_iter().flatten().flatten() {
-                let _ = remove_all(&e.path());
-            }
-            Ok(Some((f, saved)))
-        })
-        .await;
+            let Ok(lock) = crate::util::FileLock::try_lock(f) else { return Ok(None) };
+            Ok(Some((lock, base)))
+        }).await;
         match got {
-            Ok(Ok(Some((f, saved)))) => {
-                tracing::info!(target: "kiln.reach", base = %self.base.display(), "this runner process keeps the copies of other runners' trees");
+            Ok(Ok(Some((f, base)))) => {
+                // U17: aliases of one mirror root share one ledger identity and owner lock.
+                self.base = base;
                 self.lock = Some(f);
-                self.written = Some(saved.clone());
-                // What the rules said, what was asked, and the records: as kept, with what this
-                // process heard from the server meanwhile, if it did.
-                let heard = (self.saved.set != Set::default()).then(|| (self.saved.set.clone(), self.saved.asked));
-                self.saved = saved;
-                if let Some((set, asked)) = heard {
-                    self.saved.set = set;
-                    self.saved.asked = self.saved.asked.max(asked);
+                match self.load().await {
+                    Ok(saved) => {
+                        self.saved = saved;
+                        true
+                    }
+                    Err(e) => {
+                        self.error = Some(format!("keeper ledger recovery failed: {e:#}"));
+                        tracing::warn!(target: "kiln.reach", error = ?self.error, "keeper stopped before retention");
+                        self.lock = None;
+                        false
+                    }
                 }
-                true
             }
             Ok(Ok(None)) => false,
             Ok(Err(e)) => {
@@ -350,6 +370,12 @@ impl Keeper {
         {
             return None;
         }
+        self.saved.pending = Some(Gone {
+            from: step.from.clone(), key: step.key.clone(), repo: copy.and_then(|c| c.repo.clone()),
+            agent: copy.and_then(|c| c.agent().map(str::to_owned)), bytes: copy.and_then(|c| c.bytes),
+            at: now, trigger: step.trigger, why: step.why.clone(), error: None,
+        });
+        if !self.save(now).await { return None; }
         let (root, folder) = (self.base.join(&step.from).join(&step.key), self.base.join(&step.from));
         let aside = self.base.join(ASIDE).join(format!("{}--{}--{}", step.from, step.key, crate::util::now_ms()));
         let (using, from, key) = (Arc::clone(&self.using), step.from.clone(), step.key.clone());
@@ -382,6 +408,7 @@ impl Keeper {
                 return None;
             }
         };
+        self.saved.pending = None;
         self.saved.records.remove(&format!("{}/{}", step.from, step.key));
         let g = Gone {
             from: step.from.clone(),
@@ -416,32 +443,141 @@ impl Keeper {
             return false;
         }
         let Ok(a) = serde_json::from_value::<keep::Answer>(v) else { return false };
-        self.saved.set = a.set;
-        self.saved.asked = a.asked;
-        self.saved.asked > self.saved.done
+        self.accept(a, now).await
     }
 
-    /// Write the keeper's file beside the copies when it changed (its last look aside), and now and
-    /// then for that.
-    async fn save(&mut self, now: i64) {
-        if self.lock.is_none() {
-            return;
+    async fn accept(&mut self, a: keep::Answer, now: i64) -> bool {
+        if check_set(&a.set).is_err() { return false; }
+        self.saved.set = a.set;
+        self.saved.asked = self.saved.asked.max(a.asked);
+        // U17: an accepted ask must survive restart before it can cause deletion.
+        self.save(now).await && self.saved.asked > self.saved.done
+    }
+
+    fn key(&self) -> Vec<u8> {
+        // U17: the authenticated machine namespace plus stable host and canonical physical
+        // root separates hosts sharing the same path; preserve non-UTF-8 path bytes too.
+        [self.handle.name().as_bytes(), b"\0", self.base.as_os_str().as_encoded_bytes()].concat()
+    }
+
+    // U17: snapshot and one-time import receipt are one atomic Records transaction. The
+    // physical lock fences runner handoffs; CAS also refuses stale durable writers.
+    async fn load(&mut self) -> anyhow::Result<Saved> {
+        let key = self.key();
+        let row = self.ledger.get("keeper-state", &key, Consistency::Linearizable).await?;
+        let marker = self.ledger.get("keeper-import", &key, Consistency::Linearizable).await?;
+        if let Some(row) = row {
+            anyhow::ensure!(marker.is_some(), "keeper snapshot has no import receipt");
+            let saved = if let Some(manifest) = row.value.strip_prefix(MANIFEST_PREFIX) {
+                let manifest: Manifest = serde_json::from_slice(manifest)?;
+                anyhow::ensure!(manifest.bytes > 0 && manifest.bytes <= SNAPSHOT_MAX, "keeper snapshot exceeds its durable budget");
+                anyhow::ensure!(manifest.segments == manifest.bytes.div_ceil(SEGMENT_BYTES), "invalid keeper segment count");
+                let mut bytes = Vec::with_capacity(manifest.bytes);
+                for index in 0..manifest.segments {
+                    let part = self.ledger.get("keeper-segments", &segment_key(&key, index), Consistency::Snapshot(row.rev)).await?
+                        .ok_or_else(|| anyhow::anyhow!("keeper snapshot segment {index} is missing"))?;
+                    let expected = (manifest.bytes - bytes.len()).min(SEGMENT_BYTES);
+                    anyhow::ensure!(part.value.len() == expected, "invalid keeper segment length");
+                    bytes.extend_from_slice(&part.value);
+                }
+                self.segments = manifest.segments;
+                serde_json::from_slice(&bytes)?
+            } else {
+                // U19: bounded compatibility with the earlier single-value ledger snapshot.
+                self.segments = 0;
+                serde_json::from_slice(&row.value)?
+            };
+            self.revision = Some(row.rev);
+            return Ok(saved);
         }
-        let same = self.written.as_ref().is_some_and(|w| Saved { since: 0, ..w.clone() } == Saved { since: 0, ..self.saved.clone() });
-        if same && now.saturating_sub(self.written_at) < SAVE_EVERY_S {
-            return;
-        }
-        let Ok(bytes) = serde_json::to_vec(&self.saved) else { return };
+        anyhow::ensure!(marker.is_none(), "keeper import receipt has no snapshot");
         let path = self.base.join(SAVED);
-        match crate::rt::blocking(move || crate::sync::group::save_atomic(&path, &bytes)).await {
-            Ok(Ok(())) => {
-                self.written = Some(self.saved.clone());
-                self.written_at = now;
+        let saved = crate::rt::blocking(move || -> anyhow::Result<Saved> {
+            use std::io::Read as _;
+            match std::fs::File::open(&path) {
+                Ok(file) => {
+                    let mut bytes = Vec::new();
+                    file.take(SNAPSHOT_MAX as u64 + 1).read_to_end(&mut bytes)?;
+                    anyhow::ensure!(bytes.len() <= SNAPSHOT_MAX, "legacy keeper metadata exceeds its durable snapshot budget");
+                    Ok(serde_json::from_slice(&bytes)?)
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Saved::default()),
+                Err(e) => Err(e.into()),
             }
-            Ok(Err(e)) => tracing::warn!(target: "kiln.reach", error = %e, "the keeper of copies couldn't write its file"),
-            Err(e) => tracing::warn!(target: "kiln.reach", error = %format!("{e:#}"), "the keeper of copies couldn't write its file"),
+        }).await??;
+        check_set(&saved.set).map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(saved.done <= saved.asked, "legacy keeper completion exceeds accepted ask");
+        for (key, record) in &saved.records {
+            let (runner, folder) = key.split_once('/').ok_or_else(|| anyhow::anyhow!("invalid keeper copy key"))?;
+            anyhow::ensure!(!runner.is_empty() && runner != "." && runner != ".." && !runner.contains('\\') && is_key(folder), "invalid keeper copy key");
+            anyhow::ensure!(record.agents.len() <= AGENTS_KEPT, "invalid keeper agent history");
+        }
+        anyhow::ensure!(saved.gone.len() <= GONE_KEPT, "invalid keeper deletion history");
+        // U19: segments, manifest and one-time receipt become visible together.
+        self.persist(&saved, true).await?;
+        Ok(saved)
+    }
+
+    async fn persist(&mut self, saved: &Saved, importing: bool) -> anyhow::Result<()> {
+        let value = serde_json::to_vec(saved)?;
+        anyhow::ensure!(value.len() <= SNAPSHOT_MAX, "keeper snapshot exceeds its durable snapshot budget ({SNAPSHOT_MAX} bytes)");
+        let key = self.key();
+        anyhow::ensure!(segment_key(&key, 0).len() <= amphora_api::KEY_MAX, "keeper root identity exceeds Records key budget");
+        let segments = value.len().div_ceil(SEGMENT_BYTES);
+        let mut manifest = MANIFEST_PREFIX.to_vec();
+        manifest.extend(serde_json::to_vec(&Manifest { bytes: value.len(), segments })?);
+        let mut tx = Tx::default();
+        tx.conds.push(if importing {
+            Cond::Absent { family: "keeper-state".into(), key: key.clone() }
+        } else {
+            Cond::At { family: "keeper-state".into(), key: key.clone(), rev: self.revision.ok_or_else(|| anyhow::anyhow!("keeper snapshot has no revision"))? }
+        });
+        for (index, bytes) in value.chunks(SEGMENT_BYTES).enumerate() {
+            tx.writes.push(Write::Put { family: "keeper-segments".into(), key: segment_key(&key, index), value: bytes.to_vec() });
+        }
+        for index in segments..self.segments {
+            tx.writes.push(Write::Delete { family: "keeper-segments".into(), key: segment_key(&key, index) });
+        }
+        tx.writes.push(Write::Put { family: "keeper-state".into(), key: key.clone(), value: manifest });
+        if importing {
+            tx.conds.push(Cond::Absent { family: "keeper-import".into(), key: key.clone() });
+            tx.writes.push(Write::Put { family: "keeper-import".into(), key, value: b"1".to_vec() });
+        }
+        anyhow::ensure!(tx.writes.len() <= amphora_api::TX_MAX, "keeper snapshot exceeds Records transaction budget");
+        self.revision = Some(self.ledger.commit(tx).await?);
+        self.segments = segments;
+        Ok(())
+    }
+
+    async fn save(&mut self, _now: i64) -> bool {
+        if self.lock.is_none() { return false; }
+        if self.revision.is_none() { return false; }
+        let saved = self.saved.clone();
+        match self.persist(&saved, false).await {
+            Ok(()) => true,
+            Err(e) => {
+                // Unknown outcomes are reconciled by load under the physical lock, never
+                // retried from speculative memory. No report or next deletion follows failure.
+                self.error = Some(format!("keeper durable commit failed: {e}"));
+                tracing::warn!(target: "kiln.reach", error = ?self.error, "keeper stopped before acknowledgement");
+                self.lock = None;
+                self.revision = None;
+                false
+            }
         }
     }
+}
+
+fn segment_key(root: &[u8], index: usize) -> Vec<u8> {
+    // U19: fixed-width suffix avoids ambiguous root/segment boundaries.
+    [root, &(index as u64).to_be_bytes()].concat()
+}
+
+fn check_set(set: &Set) -> Result<(), String> {
+    for rules in std::iter::once(&set.system).chain(std::iter::once(&set.runner)).chain(set.repos.values()).chain(set.agents.values()) {
+        rules.check()?;
+    }
+    Ok(())
 }
 
 /// The copies under `base`, each with its record (one seen first gets one from its folder's
@@ -663,7 +799,7 @@ mod tests {
     }
 
     #[test]
-    fn the_keeper_lets_go_what_its_rules_dont_keep_when_its_schedule_comes_and_says_why() -> anyhow::Result<()> {
+    fn u17_keeper_offline_retention_accepted_ask_restart_and_commit_failure() -> anyhow::Result<()> {
         crate::rt::block_on(async move {
             let (dir, state) = (tempfile::tempdir()?, tempfile::tempdir()?);
             let base = dir.path().to_path_buf();
@@ -676,17 +812,26 @@ mod tests {
             // last look a while ago, and when each copy was last used (the one in use is used now,
             // so it's the newest).
             let record = |days: i64| Record { created: now - days * 86_400, used: now - days * 86_400, read: now, ..Record::default() };
-            let saved = Saved {
+            let mut saved = Saved {
                 since: now - 120,
                 set: Set { system: keep::Rules { newest: Some(2), schedule: Some("* * * * *".into()), ..keep::Rules::default() }, ..Set::default() },
                 records: BTreeMap::from([("mac/old-0123456789".into(), record(30)), ("mac/new-0123456789".into(), record(1)), ("mac/busy-0123456789".into(), record(40))]),
                 ..Saved::default()
             };
+            // U19: a real legacy inventory exceeds one Records value, including individual
+            // usage/agent checkpoints; importing and rewriting it must remain durable.
+            for index in 0..6000 {
+                saved.records.insert(format!("mac/history-{index:010x}"), Record {
+                    agents: vec!["agent-checkpoint".into()], repo: Some(format!("example.org/{}", "r".repeat(128))),
+                    ..record(30)
+                });
+            }
+            assert!(serde_json::to_vec(&saved)?.len() > amphora_api::VALUE_MAX);
             std::fs::write(base.join(SAVED), serde_json::to_vec(&saved)?)?;
             let using = Arc::new(Using::default());
             let _busy = using.busy("mac", "busy-0123456789", None);
             // A node that never reached the server: the rules kept apply.
-            let (handle, _out) = super::super::node::start(super::super::node::Config {
+            let (handle, _out) = super::super::node::start_in(super::super::node::Config {
                 name: "linux".into(),
                 dir: state.path().join("reach"),
                 accept: false,
@@ -694,9 +839,27 @@ mod tests {
                 adopt: None,
                 using: Arc::clone(&using),
                 objects: None,
-            })?;
-            let mut k = Keeper { base: base.clone(), using, handle, lock: None, saved: Saved::default(), written: None, written_at: 0, error: None };
+            }, crate::runner::processes::Admission::private(&tempfile::tempdir()?.keep())?).await?;
+            let ledger: Arc<dyn Records> = Arc::new(crate::records::from_database(&crate::store::Store::in_memory()?.database(), "keeper-test")?);
+            let mut k = Keeper { base: base.clone(), ledger: ledger.clone(), revision: None, segments: 0, using, handle, lock: None, saved: Saved::default(), error: None };
+            std::fs::write(base.join(SAVED), b"broken legacy metadata")?;
             assert!(!k.look().await);
+            assert!(base.join("mac/old-0123456789/src/a.rs").is_file(), "bad import cannot delete copies");
+            assert!(ledger.get("keeper-import", &k.key(), Consistency::Linearizable).await?.is_none());
+            std::fs::write(base.join(SAVED), serde_json::to_vec(&saved)?)?;
+            assert!(k.hold().await, "multi-value legacy import succeeds atomically");
+            assert_eq!(k.saved, saved);
+            assert!(k.segments > 1);
+            assert!(k.save(now).await, "live multi-value rewrite succeeds");
+            k.lock = None;
+            k.saved = Saved::default();
+            assert!(k.hold().await, "multi-value snapshot survives ownership restart");
+            assert_eq!(k.saved, saved);
+            let segment = ledger.get("keeper-segments", &segment_key(&k.key(), 0), Consistency::Linearizable).await?
+                .ok_or_else(|| anyhow::anyhow!("missing first segment"))?;
+            assert_eq!(segment.value.len(), amphora_api::VALUE_MAX);
+            assert!(!k.look().await);
+            assert!(ledger.get("keeper-segments", &segment_key(&k.key(), 1), Consistency::Linearizable).await?.is_none(), "shrinking snapshot atomically retires old segments");
             assert!(!base.join("mac/old-0123456789").exists(), "not kept: let go");
             assert!(base.join("mac/new-0123456789/src/a.rs").is_file(), "the newest stays");
             assert!(base.join("mac/busy-0123456789/src/a.rs").is_file(), "in use, it stays whatever the rules say");
@@ -704,12 +867,45 @@ mod tests {
             assert_eq!((gone.key.as_str(), gone.trigger, gone.error.as_deref()), ("old-0123456789", keep::Trigger::Schedule, None));
             assert!(gone.why.contains("its schedule came round") && gone.why.contains("not one of the newest 2"), "{}", gone.why);
             assert!(std::fs::read_dir(base.join(ASIDE)).map(|d| d.count()).unwrap_or(0) == 0, "nothing left aside");
-            // What it did is kept beside the copies, for the next look and the next process.
-            let written: Saved = serde_json::from_slice(&std::fs::read(base.join(SAVED))?)?;
+            // U17: history is durable in Records; the legacy source stays unchanged.
+            let written = k.load().await?;
             assert!(written.since >= now && !written.records.contains_key("mac/old-0123456789") && written.gone.len() == 1);
             // Its schedule doesn't come round again within the same minute: nothing more goes.
             assert!(!k.look().await);
             assert_eq!(k.saved.gone.len(), 1);
+            let mut contender = Keeper {
+                base: base.clone(), ledger: ledger.clone(), revision: None, segments: 0, using: k.using.clone(),
+                handle: k.handle.clone(), lock: None, saved: Saved::default(), error: None,
+            };
+            assert!(!contender.hold().await, "one process owns the physical copies");
+            // U17: accepted manual ask, used/agent checkpoints and rules survive owner restart.
+            assert!(k.accept(keep::Answer { set: k.saved.set.clone(), asked: 42 }, now).await);
+            k.lock = None;
+            k.saved = Saved::default();
+            assert!(contender.hold().await, "successor acquires ownership after release");
+            assert_eq!(contender.saved.asked, 42);
+            contender.lock = None;
+            assert!(k.hold().await);
+            assert_eq!(k.saved.asked, 42);
+            assert!(k.saved.done < 42);
+            // The imported file is never read again, even if the legacy source is damaged.
+            std::fs::write(base.join(SAVED), b"invalid legacy JSON")?;
+            k.lock = None;
+            assert!(k.hold().await);
+            assert_eq!(k.saved.asked, 42);
+            assert!(!k.look().await);
+            assert_eq!(k.saved.done, 42, "the restored ask completes durably while offline");
+            k.saved.asked = 43;
+            assert!(k.save(now).await);
+            // U17: stale durable revision refuses a commit; no deletion or completion follows.
+            let key = k.key();
+            ledger.commit(Tx { conds: vec![], writes: vec![Write::Put {
+                family: "keeper-state".into(), value: ledger.get("keeper-state", &key, Consistency::Linearizable).await?.ok_or_else(|| anyhow::anyhow!("missing manifest"))?.value, key,
+            }] }).await?;
+            assert!(!k.look().await);
+            assert!(k.lock.is_none());
+            assert!(base.join("mac/new-0123456789/src/a.rs").is_file());
+            assert_eq!(k.saved.done, 42);
             Ok(())
         })
     }

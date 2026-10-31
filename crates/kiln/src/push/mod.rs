@@ -193,11 +193,11 @@ pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
     loop {
         let text = match rx.recv().await {
             Ok(t) => t,
-            Err(async_broadcast::RecvError::Overflowed(n)) => {
+            Err(crate::bus::RecvError::Overflowed(n)) => {
                 tracing::warn!(missed = n, "notifications fell behind the agents' changes");
                 continue;
             }
-            Err(async_broadcast::RecvError::Closed) => return Ok(()),
+            Err(crate::bus::RecvError::Closed | crate::bus::RecvError::Unavailable(_)) => return Ok(()),
         };
         if !(text.contains("\"type\":\"harness") || text.contains("\"type\":\"machine.battery_low\"")) {
             continue;

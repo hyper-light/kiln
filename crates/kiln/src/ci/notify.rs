@@ -32,7 +32,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use http::StatusCode;
-use rusqlite::{OptionalExtension, params};
+use crate::sql::{OptionalExtension, params};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -1107,6 +1107,48 @@ async fn subject(hub: &Hub, run: &str) -> anyhow::Result<Option<(Repo, Subject)>
     )))
 }
 
+/// U04/U14: freeze the control-facing run snapshot in the same transaction as its terminal
+/// state. Later retries of the run cannot rewrite the already-accepted occurrence.
+fn control_subject(c: &crate::sql::Connection<'_>, run: &str, base: &str) -> anyhow::Result<Option<(u32, Value)>> {
+    let row: Option<(String, String, i64, String, String, String, String, String, String, Option<String>, u32)> = c.query_row("SELECT p.id, p.name, r.number, COALESCE(r.workflow_id, ''), COALESCE(r.run_name, r.pipeline, ''), r.branch, r.sha, r.message, COALESCE(r.actor, ''), r.conclusion, r.attempt FROM runs r JOIN repos p ON p.id = r.repo_id WHERE r.id = ?1", [run], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?))).optional()?;
+    Ok(row.map(|(repo, name, number, workflow, display, branch, sha, message, actor, conclusion, attempt)| (attempt, json!({"repo":{"id":repo,"name":name}, "run":{"repo":name,"id":run,"number":number,"workflow":workflow,"name":display,"branch":branch,"sha":sha,"message":message,"actor":actor,"conclusion":conclusion,"url":format!("{}/runs/{run}",base.trim_end_matches('/'))}, "attempt":attempt,"environments":[]}))))
+}
+
+pub(crate) fn stage_run_control(c: &crate::sql::Connection<'_>, run: &str, status: crate::store::Status, base: &str) -> anyhow::Result<()> {
+    let Some((attempt, mut event)) = control_subject(c, run, base)? else { return Ok(()); };
+    let kind = match status { crate::store::Status::Succeeded => Some("run.succeeded"), crate::store::Status::Failed | crate::store::Status::TimedOut => Some("run.failed"), _ => None };
+    if let Some(kind) = kind {
+        event.as_object_mut().ok_or_else(|| anyhow::anyhow!("invalid control event object"))?.insert("type".into(), json!(kind));
+        super::schedule::outbox::control(c, &format!("run:{run}:{attempt}:{kind}"), json!({"consumer":"attachment","event":event}))?;
+    }
+    let rows: Vec<(String, String, String, i64)> = c.prepare("SELECT k.suite || ' ' || k.name, t.leg_key, t.outcome, t.retried FROM test_results t JOIN test_cases k ON k.repo_id = t.repo_id AND k.id = t.case_id WHERE t.run_id = ?1 AND t.attempt = ?2")?.query_map(params![run, attempt], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?.collect::<Result<_, _>>()?;
+    let tests = super::results::flaky_rows(rows);
+    if !tests.is_empty() {
+        let shown: Vec<&str> = tests.iter().take(10).map(String::as_str).collect();
+        let more = if tests.len() > shown.len() { format!(" and {} more", tests.len() - shown.len()) } else { String::new() };
+        event.as_object_mut().ok_or_else(|| anyhow::anyhow!("invalid control event object"))?.insert("type".into(), json!("leg.flaky"));
+        event.get_mut("run").and_then(Value::as_object_mut).ok_or_else(|| anyhow::anyhow!("invalid control run object"))?.insert("message".into(), json!(format!("flaky: {}{more}", shown.join(", "))));
+        super::schedule::outbox::control(c, &format!("run:{run}:{attempt}:leg.flaky"), json!({"consumer":"attachment","event":event}))?;
+    }
+    Ok(())
+}
+
+/// W19-R06/U14: only the dispatcher's actual accepted deployment can create this source.
+/// Correlate its exact ID with the current run/leg attempt; old deployment rows are not proof.
+pub(crate) fn stage_leg_control(c: &crate::sql::Connection<'_>, leg: &str, status: crate::store::Status, base: &str, deployment: Option<&super::runs::LegDeployment>) -> anyhow::Result<()> {
+    if !matches!(status, crate::store::Status::Succeeded | crate::store::Status::Failed | crate::store::Status::TimedOut) { return Ok(()); }
+    let Some(deployment)=deployment else {return Ok(());};
+    let row: Option<(String,u32)> = c.query_row(
+        "SELECT j.run_id,j.attempt FROM jobs j JOIN runs r ON r.id=j.run_id JOIN ci_deployments d ON d.id=?2 WHERE j.id=?1 AND j.run_id=?3 AND j.attempt=?4 AND j.run_attempt=r.attempt AND d.run_id=j.run_id AND d.leg_id=j.id AND d.repo_id=r.repo_id AND d.sha=r.sha AND d.environment=?5 COLLATE NOCASE AND COALESCE(j.environment,json_extract(j.leg,'$.environment.name'),json_extract(j.spec,'$.environment.name'))=?5 COLLATE NOCASE AND COALESCE(json_extract(j.leg,'$.environment.deployment'),json_extract(j.spec,'$.environment.deployment'),1)!=0",
+        params![leg,deployment.id,deployment.run,deployment.attempt,deployment.environment], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+    let (run,attempt)=row.ok_or_else(||anyhow::anyhow!("deployment completion does not match the current run/leg attempt and environment"))?;
+    let Some((_, mut event)) = control_subject(c, &run, base)? else { return Ok(()); };
+    event.as_object_mut().ok_or_else(|| anyhow::anyhow!("invalid control event object"))?.insert("type".into(), json!(if status == crate::store::Status::Succeeded { "deploy.succeeded" } else { "deploy.failed" }));
+    event.as_object_mut().ok_or_else(|| anyhow::anyhow!("invalid control event object"))?.insert("environments".into(), json!([deployment.environment]));
+    super::schedule::outbox::control(c, &format!("leg:{leg}:{attempt}:deployment"), json!({"consumer":"attachment","event":event}))?;
+    Ok(())
+}
+
 /// A run ended (W19-R06): `run.failed`, `run.cancelled`, or `run.succeeded` and, after failures
 /// on its branch, `run.fixed`.
 pub async fn run_finished(hub: Arc<Hub>, run: String) {
@@ -1149,6 +1191,20 @@ pub async fn deployed(hub: Arc<Hub>, run: String, environment: String, succeeded
     let Ok(Some((repo, mut s))) = subject(&hub, &run).await else { return };
     s.environments = vec![environment];
     emit(&hub, &repo, if succeeded { "deploy.succeeded" } else { "deploy.failed" }, &s).await;
+}
+
+/// U04/U14: the ejection and its accepted attachment intent are one SQL transaction.
+/// Later diff edits/deletion or a lost notification cannot change or erase this source.
+pub(crate) fn stage_land_control(c: &crate::sql::Connection<'_>, entry: &str, diffs: &[String], reason: &str, base: &str) -> anyhow::Result<()> {
+    let mut rows: Vec<(String,String,i64,String,String,String,String)> = Vec::new();
+    for diff in diffs {
+        if let Some(row) = c.query_row("SELECT p.id,p.name,d.number,d.kind,d.title,d.trunk,d.author FROM diffs d JOIN repos p ON p.id = d.repo_id WHERE d.id = ?1",[diff],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))).optional()? { rows.push(row); }
+    }
+    let Some((repo_id,repo,_,_,title,trunk,author)) = rows.first() else { return Ok(()); };
+    let names: Vec<String> = rows.iter().map(|(_,_,number,kind,..)| format!("{}{number}",if kind == "diff" { "D" } else { "CR" })).collect();
+    let subject = Subject { repo:repo.clone(), name:format!("{} ({title})",names.join(", ")), branch:trunk.clone(), message:reason.into(), actor:author.clone(), conclusion:"ejected".into(), url:format!("{}/diffs/{}",base.trim_end_matches('/'),names.first().map(String::as_str).unwrap_or_default()), ..Subject::default() };
+    super::schedule::outbox::control(c,&format!("land.ejected:{entry}"),json!({"consumer":"attachment","event":{"type":"land.ejected","repo":{"id":repo_id,"name":repo},"run":subject.run_ref(),"environments":[]}}))?;
+    Ok(())
 }
 
 /// A land queue's entry was ejected (W19-R06): `land.ejected`, about its diffs (`D12 title`, the
@@ -1320,6 +1376,24 @@ pub async fn runner_offline(hub: Arc<Hub>, name: String, gone_for: u64) {
     };
     let offline = crate::wire::events::OfflineRunner { name: name.clone(), labels: labels.clone(), gone_for };
     let runner = serde_json::to_value(&offline).unwrap_or(Value::Null);
+    let (source_name, event) = (name.clone(), json!({"type":"runner.offline", "runner":runner}));
+    let accepted = hub.store.call(move |c| {
+        let generation: Option<(bool,i64)> = c.query_row("SELECT connected,last_seen FROM agents WHERE name = ?1", [&source_name], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+        if generation.is_some_and(|(connected, _)| connected) { return Ok(false); }
+        let generation = generation.map_or(0, |(_, generation)| generation);
+        super::schedule::outbox::control(c, &format!("runner.offline:{source_name}:{generation}"), json!({"consumer":"attachment", "event":event}))?;
+        Ok(true)
+    }).await;
+    match accepted {
+        Ok(true) => {},
+        Ok(false) => return,
+        Err(error) => {
+            if let Some(told) = OFFLINE.lock().as_mut() { told.remove(&name); }
+            tracing::warn!(runner = %name, error = %format!("{error:#}"), "offline control intent was not accepted; the sweep will retry");
+            return;
+        }
+    }
+    super::schedule::outbox::kick(&hub).await;
     hub.emit(&crate::wire::events::ServerEvent::RunnerOffline { runner: offline });
     let url = format!("{}/runners/{name}", hub.cfg.server.public_url.trim_end_matches('/'));
     let title = format!("⚠ runner {name} is offline");

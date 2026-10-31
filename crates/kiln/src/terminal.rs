@@ -6,6 +6,9 @@
 use anyhow::Context as _;
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
+mod ci_pty;
+pub use ci_pty::helper_main;
+
 #[derive(Debug)]
 pub enum PtyOut {
     Data(Vec<u8>),
@@ -14,6 +17,8 @@ pub enum PtyOut {
 
 pub struct PtySession {
     input: async_channel::Sender<Vec<u8>>,
+    /// U03: a PTY child adapter in the exact CI execution's physical domain.
+    bridge: Option<ci_pty::Bridge>,
     /// portable-pty's side, for sessions this process started (None once adopted across an exec).
     master: Option<Box<dyn MasterPty + Send>>,
     killer: Option<Box<dyn ChildKiller + Send + Sync>>,
@@ -126,6 +131,33 @@ pub fn spawn_at(
     rows: u16,
     env: &[(&str, String)],
 ) -> anyhow::Result<(PtySession, async_channel::Receiver<PtyOut>)> {
+    spawn_at_execution(shell, command, program, cwd, cols, rows, env, None)
+}
+
+/// U03/W17-R01: CI terminals borrow an already-registered debug execution. Ordinary user and
+/// harness terminals keep their existing platform owner and never enter this adapter.
+#[allow(clippy::too_many_arguments)] // Existing terminal parameters plus its borrowed CI owner.
+pub(crate) fn spawn_at_execution(
+    shell: Option<&str>,
+    command: Option<&str>,
+    program: Option<&[String]>,
+    cwd: Option<&std::path::Path>,
+    cols: u16,
+    rows: u16,
+    env: &[(&str, String)],
+    execution: Option<std::sync::Arc<crate::runner::processes::Execution>>,
+) -> anyhow::Result<(PtySession, async_channel::Receiver<PtyOut>)> {
+    if let Some(execution) = execution {
+        return ci_pty::spawn(shell, command, program, cwd, cols, rows, env, execution);
+    }
+    spawn_native(shell, command, program, cwd, cols, rows, env, false)
+}
+
+#[allow(clippy::too_many_arguments)] // Keep the public terminal launch parameters together.
+fn spawn_native(
+    shell: Option<&str>, command: Option<&str>, program: Option<&[String]>,
+    cwd: Option<&std::path::Path>, cols: u16, rows: u16, env: &[(&str, String)], bounded: bool,
+) -> anyhow::Result<(PtySession, async_channel::Receiver<PtyOut>)> {
     let pty = native_pty_system().openpty(size(cols, rows))?;
     let shell = default_shell(shell);
     let mut cmd = match program.and_then(|p| p.split_first()) {
@@ -167,10 +199,10 @@ pub fn spawn_at(
     let pid = child.process_id();
     let handle = pid.map(|pid| io.handle(pid));
     let (tx, rx) = async_channel::bounded::<PtyOut>(256);
-    let (in_tx, in_rx) = async_channel::unbounded::<Vec<u8>>();
+    let (in_tx, in_rx) = if bounded { async_channel::bounded::<Vec<u8>>(32) } else { async_channel::unbounded::<Vec<u8>>() };
     io.start(child, tx, in_rx);
     crate::metrics::global().terminal_sessions.add(1);
-    Ok((PtySession { input: in_tx, master: Some(pty.master), killer: Some(killer), handle, pid }, rx))
+    Ok((PtySession { input: in_tx, bridge: None, master: Some(pty.master), killer: Some(killer), handle, pid }, rx))
 }
 
 /// Take over a session handed across this process's re-exec ([`PtySession::handover`]). `None`
@@ -181,6 +213,7 @@ pub fn adopt(h: Handover) -> Option<(PtySession, async_channel::Receiver<PtyOut>
     // One expression: on Windows the descriptor and the handle are both `()`.
     let session = PtySession {
         input: in_tx,
+        bridge: None,
         master: None,
         killer: None,
         handle: Some(crate::os::pty::adopt(crate::os::reclaim_fd(h.fd)?, h.pid, h.foreign, tx, in_rx)),
@@ -196,10 +229,14 @@ impl PtySession {
     }
 
     pub fn write(&self, data: Vec<u8>) {
-        let _ = self.input.try_send(data);
+        if self.input.try_send(data).is_err() && let Some(bridge) = &self.bridge { bridge.stop(); }
     }
 
     pub fn resize(&self, cols: u16, rows: u16) {
+        if let Some(bridge) = &self.bridge {
+            bridge.resize(cols, rows);
+            return;
+        }
         if let Some(master) = &self.master {
             if let Err(e) = master.resize(size(cols, rows)) {
                 tracing::debug!(error = %e, "pty resize failed");

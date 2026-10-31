@@ -166,6 +166,9 @@ fn limits(identities: usize, lanes: u32) -> Result<Limits, BusError> {
         // Every seat's handshake may be under way at once, the places the seats: the rule of half
         // of them holds.
         retry_bytes: None,
+        // Preserve the previous connection policy while adopting the required fields.
+        acknowledgement: hyper_transport::Acknowledgement::Decimated,
+        fec_window: None,
     })
 }
 

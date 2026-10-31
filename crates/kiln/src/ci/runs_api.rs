@@ -12,7 +12,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use http::StatusCode;
-use rusqlite::{OptionalExtension, params};
+use crate::sql::{OptionalExtension, params};
 use serde_json::{Value, json};
 
 use super::Fail;
@@ -28,7 +28,7 @@ fn missing(m: impl Into<String>) -> Fail {
 }
 
 /// A run's row as the API shows it.
-fn run_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
+fn run_row(r: &crate::sql::Row<'_>) -> crate::sql::Result<Value> {
     Ok(json!({
         "id": r.get::<_, String>(0)?, "number": r.get::<_, i64>(1)?, "repo": r.get::<_, String>(2)?, "workflow": r.get::<_, Option<String>>(3)?,
         "name": r.get::<_, String>(4)?, "run_name": r.get::<_, Option<String>>(5)?, "event": r.get::<_, String>(6)?, "branch": r.get::<_, String>(7)?,
@@ -105,7 +105,7 @@ async fn legs(store: &crate::store::Store, run: &str, attempt: Option<i64>) -> R
                  FROM jobs WHERE run_id = ?1 AND job_id IS NOT NULL AND run_attempt = COALESCE(?2, (SELECT attempt FROM runs WHERE id = ?1)) ORDER BY rowid",
             )?;
             let rows = st.query_map(params![run, attempt], |r| {
-                let json_col = |i: usize| -> rusqlite::Result<Value> { Ok(r.get::<_, Option<String>>(i)?.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null)) };
+                let json_col = |i: usize| -> crate::sql::Result<Value> { Ok(r.get::<_, Option<String>>(i)?.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null)) };
                 let work = reused_report(r.get(17)?, r.get(20)?, r.get(21)?, r.get(7)?, r.get(12)?, r.get(13)?).map(|w| through(w, r.get::<_, Option<String>>(22).ok().flatten()));
                 let mut leg = json!({
                     "id": r.get::<_, String>(0)?, "key": r.get::<_, String>(1)?, "name": r.get::<_, Option<String>>(2)?, "job": r.get::<_, Option<String>>(3)?,
@@ -524,7 +524,14 @@ pub async fn cancel(hub: &Hub, id: &str) -> Result<Response, Fail> {
         let v = super::providers::cancel(hub, &repo, &provider, &ext).await?;
         return Ok(srv::json(StatusCode::ACCEPTED, &v));
     }
-    hub.cancel_run(id, "cancelled from the API").await.map_err(internal)?;
+    hub.cancel_run(id, "cancelled from the API").await.map_err(|error| {
+        let status = match error {
+            super::dispatch::CancelError::AttemptChanged => StatusCode::CONFLICT,
+            super::dispatch::CancelError::Invalid(_) => StatusCode::BAD_REQUEST,
+            _ => StatusCode::SERVICE_UNAVAILABLE,
+        };
+        (status, error.to_string())
+    })?;
     Ok(srv::status(StatusCode::ACCEPTED))
 }
 
@@ -538,6 +545,8 @@ pub async fn rerun(hub: &Hub, id: &str, body: &Value, by: &str) -> Result<Respon
         let v = super::providers::rerun(hub, &repo, &provider, &ext, mode, body.get("job").and_then(Value::as_str)).await?;
         return Ok(srv::json(StatusCode::CREATED, &v));
     }
+    if !hub.ci.enabled() { return Err((StatusCode::CONFLICT, "the CI engine is off ([ci] enabled)".into())); }
+    super::legacy::import_run(hub, id).await.map_err(internal)?;
     let mode = match body.get("mode").and_then(Value::as_str).unwrap_or("all") {
         "all" => RerunMode::All,
         "failed" => RerunMode::Failed,
@@ -742,7 +751,7 @@ pub async fn exec(hub: &std::sync::Arc<Hub>, id: &str, body: &Value, caller: Opt
                 break;
             }
             Ok(Ok(Frame::Size { .. })) => {}
-            Ok(Err(async_broadcast::RecvError::Overflowed(_))) => truncated = true,
+            Ok(Err(crate::bus::RecvError::Overflowed(_))) => truncated = true,
             Ok(Err(_)) => break,
             Err(_) => {
                 timed_out = true;

@@ -326,7 +326,7 @@ pub async fn open(hub: &Arc<Hub>, actor: &str, info: &Info, want: Want) -> Resul
     if let Some(id) = &token_id {
         let id = id.clone();
         let now = crate::util::now_unix();
-        let _ = hub.store.call(move |c| Ok(c.execute("UPDATE tokens SET revoked_at = ?2 WHERE id = ?1", rusqlite::params![id, now])?)).await;
+        let _ = hub.store.call(move |c| Ok(c.execute("UPDATE tokens SET revoked_at = ?2 WHERE id = ?1", crate::sql::params![id, now])?)).await;
     }
     let pushed = pushed?;
     let made: super::git::Made = serde_json::from_value(pushed.get("made").cloned().unwrap_or_default()).map_err(|e| fail(StatusCode::BAD_GATEWAY, format!("the machine's answer: {e}")))?;

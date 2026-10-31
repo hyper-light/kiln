@@ -1,0 +1,82 @@
+Subject: CP-T2.2: use MSRV-compatible atomic update name
+Why: Rust 1.99 deprecates fetch_update in favor of try_update. The declared Focal MSRV 1.98.1 supports both names, verified by a tiny installed-toolchain API typecheck. Preserve every atomic type, ordering, closure and return path; no lint or runtime policy is relaxed.
+
+diff --git a/crates/focal-memory/benches/support/alloc_count.rs b/crates/focal-memory/benches/support/alloc_count.rs
+index 1c086ee97ef599a3c263c38e0ebee094b3410f9d..11f1d21e124c5b33de5cfb650d32d03a4676bea1 100644
+--- a/crates/focal-memory/benches/support/alloc_count.rs
++++ b/crates/focal-memory/benches/support/alloc_count.rs
+@@ -131,7 +131,7 @@ fn track_live_add(size: usize) {
+ }
+ 
+ fn track_live_sub(size: usize) {
+-    let _ = LIVE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
++    let _ = LIVE.try_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
+         Some(live.saturating_sub(size))
+     });
+ }
+@@ -307,7 +307,7 @@ fn fold(rendered: &str) -> (u64, String) {
+ 
+ fn sample(size: usize, realloc_from: Option<usize>) {
+     if SAMPLE_BUDGET
+-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
++        .try_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+             left.checked_sub(1)
+         })
+         .is_err()
+diff --git a/crates/focal-memory/src/budget.rs b/crates/focal-memory/src/budget.rs
+index 6dfeca6c9c0c78540da27e31591240014656c976..55e99f126e9acfa5bf62b9bf5eb403a00d9cc2ec 100644
+--- a/crates/focal-memory/src/budget.rs
++++ b/crates/focal-memory/src/budget.rs
+@@ -232,7 +232,7 @@ impl Levels {
+             Some(index) => usize::try_from(index).map_err(|_| full.clone())?,
+             None => self
+                 .fresh
+-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
++                .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                     next.checked_add(1).filter(|next| {
+                         SEGMENT
+                             .checked_mul(SEGMENTS)
+@@ -464,7 +464,7 @@ impl Backing {
+     /// or reclassifying ancestors. Failure changes no counter.
+     fn acquire(&self, bytes: usize) -> Result<(), MemoryError> {
+         self.available
+-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
++            .try_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+                 available.checked_sub(bytes)
+             })
+             .map(|_| ())
+@@ -1185,7 +1185,7 @@ fn child_metadata() -> usize {
+ 
+ fn reserve_counter(counter: &AtomicUsize, limit: usize, bytes: usize) -> Result<(), MemoryError> {
+     counter
+-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
++        .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+             used.checked_add(bytes).filter(|next| *next <= limit)
+         })
+         .map(|_| ())
+diff --git a/crates/focal-memory/src/disk.rs b/crates/focal-memory/src/disk.rs
+index 622367ee35708468641afc795f8d862807483a94..278dd47010e0a4c7175e75bb729d019cbbe742c6 100644
+--- a/crates/focal-memory/src/disk.rs
++++ b/crates/focal-memory/src/disk.rs
+@@ -278,7 +278,7 @@ impl DiskBudget {
+             let _ = self
+                 .0
+                 .free
+-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
++                .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+                     (free != UNKNOWN).then(|| free.saturating_sub(bytes))
+                 });
+         }
+diff --git a/crates/focal-memory/src/owner.rs b/crates/focal-memory/src/owner.rs
+index d0964899cde695ba33ef4f8245b4b86cfaf9cf02..99d6611d46cc9ef7e320b9117cf27f02dad02501 100644
+--- a/crates/focal-memory/src/owner.rs
++++ b/crates/focal-memory/src/owner.rs
+@@ -15,7 +15,7 @@ impl OwnerId {
+ }
+ fn next(counter: &AtomicU64) -> Result<u64, MemoryError> {
+     counter
+-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
++        .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+             value.checked_add(1)
+         })
+         .map_err(|_| MemoryError::CounterExhausted("owner identity"))?

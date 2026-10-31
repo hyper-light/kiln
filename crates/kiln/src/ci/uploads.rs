@@ -316,7 +316,7 @@ pub async fn start_runs(hub: &Hub, repo: &Repo, ask: &Ask, trusted: bool, actor:
             continue;
         }
         let (tx, rx) = async_channel::bounded(1);
-        let given = Given { only_matrix: only_matrix.clone(), secrets: Arc::clone(&secrets), vars: Arc::clone(&vars), reply: Some(tx) };
+        let given = Given { durable_trigger: None, only_matrix: only_matrix.clone(), secrets: Arc::clone(&secrets), vars: Arc::clone(&vars), reply: Some(tx) };
         super::events::start_given(hub, &repo, &event, &loaded, (&message, &author), typed, given).await.map_err(|e| internal(&e))?;
         match crate::rt::timeout(std::time::Duration::from_secs(60), rx.recv()).await {
             Ok(Ok(id)) => runs.push(json!({ "id": id, "workflow": l.path })),

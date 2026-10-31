@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ConvoStatus, ConvoStore } from "../src/api/types.ts";
 import { ACTIVE_MS, plateName, stateText } from "../src/views/stores/scene.ts";
-import { cylinder, healthOf, marksOf, metricsOf, paceOf, periodOf, replicationScene } from "../src/views/stores/replication-scene.ts";
+import { cylinder, healthOf, marksOf, metricsOf, paceOf, periodOf, productStatusText, replicationScene } from "../src/views/stores/replication-scene.ts";
 
 const NOW = 1_800_000_000_000;
 
@@ -190,4 +190,32 @@ test("a machine's name is cut to fit and still tells machines apart", () => {
   const farm = Array.from({ length: 9 }, (_, i) => runner(`build-farm-0${i + 1}`));
   const names = replicationScene(status(farm), true).sources.map((n) => n.name.text);
   assert.equal(new Set(names).size, 9, names.join());
+});
+
+test("U15 absent feed and null lag stay unknown across desktop and phone", () => {
+  for (const feed of [undefined, { rev: 0, top: null, behind: null, at: 0, intake: null, ship: null }]) {
+    const board = { ...status([runner("external", { state: "live", feed })]), mirrors_wanted: 0 };
+    assert.equal(healthOf(board).text, "Amphora replication · status unknown");
+    assert.equal(metricsOf(board).pending, null);
+    assert.equal(metricsOf(board).synced, null);
+    assert.equal(stateText(board.stores[1]!, NOW), "live · replication unknown");
+    for (const portrait of [false, true]) {
+      const source = replicationScene(board, portrait).sources[0]!;
+      assert.equal(source.sub.text, "Amphora · status unknown");
+      assert.equal(source.cable.period, null);
+      assert.deepEqual(source.cable.marks, []);
+    }
+  }
+  assert.notEqual(healthOf({ ...status([]), mirrors_wanted: 0 }).tone, "ok");
+  assert.equal(metricsOf(status([mirror({ mirror: undefined })])).mirror.text, "Unknown");
+});
+
+test("U15 product status reports observations without inventing quorum or lag", () => {
+  for (const value of [null, {}, { store: { engine: "amphora", group: true, replication: { unavailable: "offline" } } }]) {
+    assert.equal(productStatusText(value), "Amphora replication · status unknown");
+  }
+  assert.equal(productStatusText({ store: { engine: "amphora", group: false } }), "Amphora · local mode");
+  const replication = { node_id: 2, leader: 1, applied: 4, durable_commit: 5, fenced: null };
+  assert.equal(productStatusText({ store: { engine: "amphora", group: true, replication } }), "Amphora · node 2 · leader 1 · applied 4 · durable commit 5");
+  assert.equal(productStatusText({ store: { engine: "amphora", replication: { ...replication, fenced: "disk failed" } } }), "Amphora · fenced");
 });

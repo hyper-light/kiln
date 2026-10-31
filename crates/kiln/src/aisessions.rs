@@ -1,5 +1,6 @@
-//! Live AI coding-agent sessions on this machine: the Claude Code, Codex, Devin and Gemini CLI processes
-//! running right now, summarized from the transcripts those tools write.
+//! Live AI coding-agent sessions on this machine: harnesses from the shared registry, with
+//! provider-specific transcript readers where available. Managed ownership is independent of the
+//! harness and its command-line protocol (U18).
 //!
 //! - Claude Code keeps a `~/.claude/sessions/<pid>.json` record per running session (its id,
 //!   directory, name, busy or idle); the transcript is `~/.claude/projects/<dir>/<id>.jsonl`.
@@ -26,6 +27,8 @@ use serde_json::Value;
 use sysinfo::{Pid, Process, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 mod devin;
+mod takeover;
+pub use takeover::{ProcessIdentity, TakeoverProcess};
 #[cfg(all(test, unix))]
 mod live_tests;
 
@@ -69,6 +72,7 @@ enum Tool {
     Codex,
     Devin,
     Gemini,
+    Registered(&'static str),
 }
 
 impl Tool {
@@ -78,6 +82,7 @@ impl Tool {
             Tool::Codex => "codex",
             Tool::Devin => "devin",
             Tool::Gemini => "gemini",
+            Tool::Registered(id) => id,
         }
     }
 }
@@ -87,7 +92,7 @@ impl Tool {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct PastSession {
-    /// The harness (`"claude"`, `"codex"`, `"devin"`).
+    /// The harness's registry id.
     pub kind: String,
     /// The harness's own conversation id.
     pub id: String,
@@ -111,7 +116,7 @@ pub struct PastSession {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct AiSession {
-    /// "claude", "codex", "devin" or "gemini".
+    /// The harness's registry id, independent of its adapter protocol.
     pub tool: String,
     /// The tool's own session id (empty when it has none).
     pub id: String,
@@ -124,6 +129,9 @@ pub struct AiSession {
     pub model: String,
     /// Unix seconds the process started.
     pub started_at: i64,
+    /// U18/U03: OS identity observed with this process; absent on older runners.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_identity: Option<ProcessIdentity>,
     /// Unix seconds of the last transcript write (the start when there is none).
     pub last_activity: i64,
     /// "working" (mid-turn), "waiting" (the turn ended: waiting for the user), "starting" (not a
@@ -182,6 +190,7 @@ impl AiSession {
         let t = self.takeover(held);
         matches!(t, TakeOver::Ready | TakeOver::Stop).then(|| crate::harness::session::Spec {
             takeover_pid: Some(self.pid),
+            takeover_identity: self.process_identity.clone(),
             takeover_stop: t == TakeOver::Stop,
             ..self.continued()
         })
@@ -238,6 +247,30 @@ pub struct Entry {
     pub text: String,
     /// RFC 3339, when the record has one.
     pub at: String,
+}
+
+/// U18: the common conversation-only view for providers without richer transcript replay.
+/// Tool summaries are observations, not calls with an invented result or approval state.
+fn normalized_view(entries: &[Entry], cwd: &str) -> Option<Value> {
+    use crate::harness::model::{Body, Event, Level, State};
+
+    let events: Vec<Event> = entries.iter().enumerate().filter_map(|(i, entry)| {
+        let body = match entry.role.as_str() {
+            "user" => Body::User { text: entry.text.clone(), images: 0, client_id: None, origin: None, attachments: Vec::new(), reply_to: None },
+            "assistant" => Body::Assistant { text: entry.text.clone(), streaming: false },
+            "tool" => Body::Notice { level: Level::Info, text: entry.text.clone() },
+            _ => return None,
+        };
+        let at = time::OffsetDateTime::parse(&entry.at, &time::format_description::well_known::Rfc3339)
+            .ok().and_then(|t| i64::try_from(t.unix_timestamp_nanos() / 1_000_000).ok()).unwrap_or(0);
+        Some(Event { id: format!("discovery:{i}"), seq: u64::try_from(i).ok()?, at, parent: None, by: None, body })
+    }).collect();
+    if events.is_empty() {
+        return None;
+    }
+    // As in transcript history replay, Starting does not claim live adapter state.
+    let state = State { cwd: cwd.to_owned(), ..Default::default() };
+    Some(serde_json::json!({"events": events, "state": state, "changes": []}))
 }
 
 /// What a transcript says besides its messages.
@@ -297,14 +330,19 @@ impl Reporter {
 
     /// Scan in the background and send the sessions when they changed. `terminals` maps each
     /// kiln terminal's shell pid to its session id.
-    pub fn scan(&self, terminals: HashMap<u32, String>, up: async_channel::Sender<crate::exec::Up>) {
+    pub fn scan(&self, terminals: HashMap<u32, String>, managed: Vec<(String, Option<u32>)>, up: async_channel::Sender<crate::exec::Up>) {
         if self.scanning.swap(true, Ordering::AcqRel) {
             return;
         }
         let me = self.clone();
         crate::rt::spawn(async move {
             let scanner = Arc::clone(&me.scanner);
-            let sessions = crate::rt::blocking(move || scanner.lock().scan(&terminals)).await;
+            let sessions = crate::rt::blocking(move || {
+                let mut scanner = scanner.lock();
+                scanner.managed_pids = managed.iter().filter_map(|(_, pid)| pid.map(Pid::from_u32)).collect();
+                scanner.managed = managed.into_iter().map(|(id, _)| id).collect();
+                scanner.scan(&terminals)
+            }).await;
             me.scanning.store(false, Ordering::Release);
             let Some(json) = sessions.ok().and_then(|s| serde_json::to_string(&s).ok()) else { return };
             {
@@ -355,15 +393,17 @@ struct Proc {
     pid: u32,
     /// Unix seconds.
     start: u64,
+    identity: Option<ProcessIdentity>,
     cwd: String,
     args: Vec<String>,
 }
 
 impl Proc {
-    fn of(p: &Process) -> Self {
+    fn of(p: &Process, observed: &HashMap<u32, ProcessIdentity>) -> Self {
         Self {
             pid: p.pid().as_u32(),
             start: p.start_time(),
+            identity: observed.get(&p.pid().as_u32()).filter(|identity| takeover::observe(p.pid().as_u32()).as_ref() == Some(*identity)).cloned(),
             cwd: p.cwd().map(|c| c.to_string_lossy().into_owned()).unwrap_or_default(),
             args: args_of(p),
         }
@@ -388,6 +428,10 @@ pub struct Scanner {
     codex: PathBuf,
     devin: PathBuf,
     sys: System,
+    /// This host's structured sessions, regardless of which harness implements them. The mark is
+    /// checked against a session id, never against a bare pid that the OS may have reused.
+    managed: HashSet<String>,
+    managed_pids: Vec<Pid>,
     /// Summaries by transcript, with the length and mtime they were read at.
     summaries: HashMap<PathBuf, (u64, SystemTime, Summary)>,
     /// Claude Code transcripts by session id, once found.
@@ -414,6 +458,8 @@ impl Scanner {
             codex: dir("CODEX_HOME", ".codex"),
             devin: if cfg!(windows) { dir("LOCALAPPDATA", "AppData/Local") } else { dir("XDG_DATA_HOME", ".local/share") }.join("devin/cli"),
             sys: System::new(),
+            managed: HashSet::new(),
+            managed_pids: Vec::new(),
             summaries: HashMap::new(),
             claude_files: HashMap::new(),
             codex_files: HashMap::new(),
@@ -428,6 +474,8 @@ impl Scanner {
     /// The sessions running now, most recently active first. `terminals` maps the shell pid of
     /// each kiln terminal on this machine to its session id.
     pub fn scan(&mut self, terminals: &HashMap<u32, String>) -> Vec<AiSession> {
+        // U18/U03: bracket metadata reads; a replacement cannot inherit an older observation.
+        let identities = takeover::snapshot();
         // sysinfo keeps names across exec even when the PID and start time stay the same.
         self.sys = System::new();
         // Names, parents and command lines of everything; working directories only of the tools.
@@ -436,7 +484,10 @@ impl Scanner {
             true,
             ProcessRefreshKind::nothing().with_cmd(UpdateKind::OnlyIfNotSet).with_exe(UpdateKind::OnlyIfNotSet).without_tasks(),
         );
-        let tools: Vec<Pid> = self.sys.processes().iter().filter(|(_, p)| tool_of(p).is_some()).map(|(pid, _)| *pid).collect();
+        let mut tools: Vec<Pid> = self.sys.processes().iter().filter(|(_, p)| tool_of(p).is_some()).map(|(pid, _)| *pid).collect();
+        tools.extend(self.managed_pids.iter().copied());
+        tools.sort_unstable();
+        tools.dedup();
         if !tools.is_empty() {
             self.sys.refresh_processes_specifics(
                 ProcessesToUpdate::Some(&tools),
@@ -460,12 +511,15 @@ impl Scanner {
         for r in claude_records(&records_dir) {
             // The pid may since belong to something else.
             let Some(sp) = self.sys.process(Pid::from_u32(r.pid)).filter(|p| tool_of(p) == Some(Tool::Claude)) else { continue };
+            if managed_process(&self.sys, sp.pid(), &self.managed) {
+                continue;
+            }
             // A run a program drives (`claude -p`: kiln's own agents, the Agent SDK's) is that
             // program's to show, though its record says "interactive" all the same.
             if r.kind.as_deref().is_some_and(|k| k != "interactive") || !interactive(Tool::Claude, &args_of(sp)) {
                 continue;
             }
-            let p = Proc::of(sp);
+            let p = Proc::of(sp, &identities);
             seen.insert(r.pid);
             let file = self.claude_file(&r.session_id, &r.cwd);
             let summary = file.as_deref().and_then(|f| self.summary(Tool::Claude, f));
@@ -490,7 +544,7 @@ impl Scanner {
         let mut found: Vec<(Tool, Proc)> = Vec::new();
         for (pid, p) in self.sys.processes() {
             let Some(tool) = tool_of(p) else { continue };
-            if seen.contains(&pid.as_u32()) || !interactive(tool, &args_of(p)) {
+            if seen.contains(&pid.as_u32()) || managed_process(&self.sys, *pid, &self.managed) || !interactive(tool, &args_of(p)) {
                 continue;
             }
             // Claude Code writes its record once the session starts (after the folder-trust
@@ -503,7 +557,7 @@ impl Scanner {
             if p.parent().and_then(|pp| self.sys.process(pp)).and_then(tool_of) == Some(tool) {
                 continue;
             }
-            found.push((tool, Proc::of(p)));
+            found.push((tool, Proc::of(p, &identities)));
         }
         // Newest first, so two sessions in one directory each claim their own transcript.
         found.sort_by_key(|(_, p)| std::cmp::Reverse(p.start));
@@ -513,8 +567,7 @@ impl Scanner {
             let file = match tool {
                 Tool::Codex => self.codex_file(&p, &taken),
                 Tool::Claude => self.claude_file_by_cwd(&p, &taken),
-                Tool::Gemini => None,
-                Tool::Devin => None,
+                Tool::Gemini | Tool::Devin | Tool::Registered(_) => None,
             };
             if let Some(f) = &file {
                 taken.insert(f.clone());
@@ -561,16 +614,74 @@ impl Scanner {
         out
     }
 
-    /// The normalized view of the session running as `pid` (Claude Code; as of the last scan).
+    /// U18: a read-only normalized view of a discovered session (as of the last scan).
     pub fn view(&self, pid: u32) -> Option<Value> {
-        let (tool, file) = self.open.get(&pid)?;
-        if *tool != Tool::Claude {
-            return None;
-        }
         let p = self.sys.process(Pid::from_u32(pid));
         let cwd = p.and_then(|p| p.cwd()).map(|c| c.to_string_lossy().into_owned()).unwrap_or_default();
-        let started = p.and_then(|p| i64::try_from(p.start_time()).ok());
-        crate::harness::transcript::view(file, &cwd, started)
+        if let Some((Tool::Claude, file)) = self.open.get(&pid) {
+            let started = p.and_then(|p| i64::try_from(p.start_time()).ok());
+            return crate::harness::transcript::view(file, &cwd, started);
+        }
+        if let Some((Tool::Codex, file)) = self.open.get(&pid) {
+            return normalized_view(&self.codex_view_entries(file)?, &cwd);
+        }
+        // Reuse each provider's bounded reader, including Devin's read-only main chain.
+        // No adapter/controller is attached to an external process.
+        normalized_view(&self.transcript(pid)?, &cwd)
+    }
+
+    /// U18: use Codex's existing rewind/compaction-aware history, with a total byte bound.
+    fn codex_view_entries(&self, file: &Path) -> Option<Vec<Entry>> {
+        use crate::harness::handoff;
+        let head = head_line(file)?;
+        let (meta, _) = parse_codex(&[head]);
+        let mut files = if meta.id.is_empty() { vec![file.to_owned()] } else { handoff::codex_files(&self.codex, &meta.id) };
+        if !files.iter().any(|f| f == file) {
+            files.push(file.to_owned());
+        }
+        // Too many segments cannot be assembled faithfully within this discovery budget.
+        if files.len() > MAX_SESSIONS {
+            return None;
+        }
+        // Recent conversation only: bounded tails plus each segment's first metadata line.
+        // Reserve the head read already used to identify this thread as well.
+        let mut budget = OPEN_TAIL_MAX.saturating_sub(64 * 1024);
+        let count = files.len();
+        let mut segments = Vec::new();
+        for (i, f) in files.into_iter().enumerate() {
+            let remaining = u64::try_from(count.saturating_sub(i)).ok()?;
+            let allowance = budget.checked_div(remaining)?;
+            let bytes = allowance.saturating_sub(64 * 1024).min(OPEN_TAIL);
+            if bytes == 0 {
+                return None;
+            }
+            budget = budget.saturating_sub(bytes + 64 * 1024);
+            let mut lines = tail_lines(&f, bytes)?;
+            if std::fs::metadata(&f).ok()?.len() > bytes {
+                // U18: a lost compaction barrier could otherwise resurrect an earlier segment.
+                // Absence is safer than presenting discarded entries as this conversation.
+                if count > 1 {
+                    return None;
+                }
+                // The history base must survive a tail cut for codex_history's rewind filter.
+                let head = head_line(&f)?;
+                let record: Value = serde_json::from_str(&head).ok()?;
+                if str_at(&record, "type") != Some("session_meta") {
+                    return None;
+                }
+                lines.insert(0, head);
+            }
+            segments.push(lines);
+        }
+        let conversation = handoff::codex_of_lines(&segments, &meta.id)?;
+        let mut entries: Vec<Entry> = conversation.entries.into_iter().map(|e| match e {
+            handoff::Entry::User { text, .. } => entry("user", &text, ""),
+            handoff::Entry::Assistant(text) => entry("assistant", &text, ""),
+            handoff::Entry::Call(call) => entry("tool", &tool_line(&call.name, &call.input), ""),
+        }).collect();
+        let skip = entries.len().saturating_sub(OPEN_ENTRIES);
+        entries.drain(..skip);
+        Some(entries)
     }
 
     /// Recent messages of the transcript of the session running as `pid` (as of the last scan).
@@ -616,6 +727,7 @@ impl Scanner {
             branch: summary.meta.branch,
             model: summary.meta.model,
             started_at,
+            process_identity: p.identity.clone(),
             last_activity: modified.map_or(started_at, unix_secs).max(started_at),
             state: state.to_owned(),
             last_prompt: clip(&summary.last_prompt, SNIPPET),
@@ -929,12 +1041,17 @@ fn args_of(p: &Process) -> Vec<String> {
 
 /// Which tool a process is, if any: by its name, or by the script a Node or Bun process runs.
 fn tool_of(p: &Process) -> Option<Tool> {
-    let by_name = |n: &str| match n {
-        "claude" => Some(Tool::Claude),
-        "codex" => Some(Tool::Codex),
-        "devin" => Some(Tool::Devin),
-        "gemini" => Some(Tool::Gemini),
-        _ => None,
+    let by_name = |n: &str| {
+        let kind = crate::harness::kinds::Kind::all().iter().find(|k| {
+            k.program == n || k.screen.first().is_some_and(|s| *s == n)
+        })?;
+        Some(match kind.id {
+            "claude" => Tool::Claude,
+            "codex" => Tool::Codex,
+            "devin" => Tool::Devin,
+            "gemini" => Tool::Gemini,
+            id => Tool::Registered(id),
+        })
     };
     let name = crate::os::program_stem(&p.name().to_string_lossy());
     if let Some(t) = by_name(&name) {
@@ -957,6 +1074,28 @@ fn tool_of(p: &Process) -> Option<Tool> {
         return by_name(&crate::os::program_stem(&script));
     }
     None
+}
+
+/// U18: structured sessions and their descendants belong to their host for every harness. A
+/// verified session mark also works after a daemon reparents; bounded ancestry covers children
+/// that cleared their environment. No bare pid establishes ownership after pid reuse.
+fn managed_process(sys: &System, pid: Pid, sessions: &HashSet<String>) -> bool {
+    if sessions.is_empty() {
+        return false;
+    }
+    let prefix = format!("{}=", crate::harness::survivors::MARK);
+    let mut at = pid;
+    for _ in 0..64 {
+        let Some(p) = sys.process(at) else { break };
+        if p.environ().iter().filter_map(|v| v.to_str()).filter_map(|v| v.strip_prefix(prefix.as_str())).any(|id| sessions.contains(id)) {
+            return true;
+        }
+        match p.parent() {
+            Some(parent) if parent != at => at = parent,
+            _ => break,
+        }
+    }
+    false
 }
 
 /// A native Devin REPL owns its ACP child's lock. A nested agent's lock and a process with
@@ -1004,38 +1143,6 @@ pub fn runs(pid: u32, kind: &str) -> bool {
     sys.process(p).and_then(tool_of).is_some_and(|t| t.name() == kind)
 }
 
-/// Ends a session running outside kiln, for a take-over: asks its process to quit (SIGTERM;
-/// Windows has no such ask, so there it is `false`), or with `force` kills it and everything it
-/// started, never kiln itself. Whether that was done.
-pub fn end(pid: u32, force: bool) -> bool {
-    let root = Pid::from_u32(pid);
-    let ours = Pid::from_u32(std::process::id());
-    if pid <= 1 || root == ours {
-        return false;
-    }
-    let mut sys = System::new();
-    if !force {
-        sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[root]), true, ProcessRefreshKind::nothing().without_tasks());
-        return sys.process(root).and_then(|p| p.kill_with(sysinfo::Signal::Term)).unwrap_or(false);
-    }
-    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing().without_tasks());
-    // Its tree, parents first, leaving out kiln's own (were kiln started from inside it).
-    let mut tree = vec![root];
-    let mut i = 0;
-    while let Some(&parent) = tree.get(i) {
-        let kids: Vec<Pid> = sys.processes().iter().filter(|(c, p)| p.parent() == Some(parent) && **c != ours && !tree.contains(*c)).map(|(c, _)| *c).collect();
-        tree.extend(kids);
-        i += 1;
-    }
-    let ended = sys.process(root).is_some_and(Process::kill);
-    for c in tree.iter().skip(1) {
-        if let Some(p) = sys.process(*c) {
-            p.kill();
-        }
-    }
-    ended
-}
-
 /// An interactive session rather than a one-shot or helper run of the tool.
 fn interactive(tool: Tool, args: &[String]) -> bool {
     // A Node-hosted CLI's own arguments follow its script.
@@ -1058,6 +1165,26 @@ fn interactive(tool: Tool, args: &[String]) -> bool {
                     a if a.starts_with("--print=") || a.starts_with("-p") => return false,
                     a if a.starts_with('-') => {}
                     a => return !["acp", "auth", "mcp", "models", "doctor", "rules", "skills", "plugins", "cloud", "desktop", "list", "ls", "rm", "ssh", "forward", "update", "version", "migrate", "sandbox", "setup", "uninstall", "help"].contains(&a),
+                }
+            }
+            true
+        }
+        Tool::Registered(id) => {
+            let Some(kind) = crate::harness::kinds::Kind::get(id) else { return false };
+            if rest.iter().any(|a| matches!(*a, "-p" | "--print" | "--prompt" | "--headless" | "--input-format" | "-h" | "--help" | "-V" | "--version")) {
+                return false;
+            }
+            if rest.first().is_some_and(|a| matches!(*a, "mcp" | "mcp-server" | "login" | "logout" | "auth" | "doctor" | "completion" | "help" | "version" | "update")) {
+                return false;
+            }
+            if let crate::harness::kinds::Protocol::Acp(adapter) = kind.protocol {
+                if adapter.is_empty() {
+                    // An ACP-only executable is a helper, while its separately named screen is
+                    // an external interactive session (for example amp-acp versus amp).
+                    return args.first().is_some_and(|a| crate::os::program_stem(a) != kind.program);
+                }
+                if rest.windows(adapter.len()).any(|w| w == adapter) {
+                    return false;
                 }
             }
             true
@@ -1225,7 +1352,7 @@ fn parse(tool: Tool, lines: &[String]) -> (Meta, Vec<Entry>) {
     match tool {
         Tool::Claude => parse_claude(lines),
         Tool::Codex => parse_codex(lines),
-        Tool::Gemini | Tool::Devin => (Meta::default(), Vec::new()),
+        Tool::Gemini | Tool::Devin | Tool::Registered(_) => (Meta::default(), Vec::new()),
     }
 }
 
@@ -1399,7 +1526,76 @@ mod tests {
     }
 
     #[test]
-    fn kiln_s_own_agents_are_not_sessions_found_elsewhere() {
+    fn u18_external_views_preserve_provider_conversations() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let file = home.path().join("transcript.jsonl");
+        let mut scanner = Scanner::new(home.path().to_owned());
+        let pid = u32::MAX;
+        for (tool, records) in [
+            (Tool::Codex, r#"{"type":"response_item","timestamp":"2026-10-29T00:00:00Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"question"}]}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}}
+{"type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{}"}}"#),
+            (Tool::Claude, r#"{"type":"user","uuid":"u","message":{"role":"user","content":"question"}}
+{"type":"assistant","uuid":"a","parentUuid":"u","message":{"id":"m","role":"assistant","content":[{"type":"text","text":"answer"}]}}"#),
+        ] {
+            std::fs::write(&file, records)?;
+            scanner.open.insert(pid, (tool, file.clone()));
+            let view = scanner.view(pid).ok_or_else(|| anyhow::anyhow!("missing {} view", tool.name()))?;
+            let events = view.get("events").and_then(Value::as_array).ok_or_else(|| anyhow::anyhow!("missing events"))?;
+            for (kind, text) in [("user", "question"), ("assistant", "answer")] {
+                assert!(events.iter().any(|e| e.get("kind").and_then(Value::as_str) == Some(kind) && e.get("text").and_then(Value::as_str) == Some(text)));
+            }
+            assert_eq!(view.pointer("/state/status").and_then(Value::as_str), Some("starting"));
+            assert_eq!(view.get("changes"), Some(&serde_json::json!([])));
+            if tool == Tool::Codex {
+                assert!(events.iter().any(|e| e.get("kind").and_then(Value::as_str) == Some("notice")));
+                assert_eq!(events.first().and_then(|e| e.get("at")).and_then(Value::as_i64), Some(0));
+            }
+        }
+        scanner.open.insert(pid, (Tool::Gemini, file.clone()));
+        assert!(scanner.view(pid).is_none());
+        scanner.open.insert(pid, (Tool::Codex, file.clone()));
+        std::fs::write(&file, "malformed\n")?;
+        assert!(scanner.view(pid).is_none());
+        scanner.open.clear();
+        assert!(scanner.view(pid).is_none());
+        // The shared read-only model also accepts the native database reader's messages.
+        assert!(normalized_view(&[entry("assistant", "native answer", "")], "/work").is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn u18_codex_view_excludes_rewound_segments() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let root = home.path().join("sessions");
+        std::fs::create_dir_all(&root)?;
+        let old = root.join("rollout-old-thread.jsonl");
+        let new = root.join("rollout-new-thread.jsonl");
+        std::fs::write(&old, r#"{"type":"session_meta","ordinal":0,"payload":{"id":"thread"}}
+{"type":"response_item","ordinal":1,"payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"kept"}]}}
+{"type":"response_item","ordinal":2,"payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"discarded"}]}}"#)?;
+        std::fs::write(&new, r#"{"type":"session_meta","ordinal":3,"payload":{"id":"thread","history_base":{"end_ordinal_exclusive":2}}}
+{"type":"response_item","ordinal":4,"payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"replacement"}]}}"#)?;
+        let mut scanner = Scanner::new(home.path().to_owned());
+        scanner.codex = home.path().to_owned();
+        scanner.open.insert(u32::MAX, (Tool::Codex, new.clone()));
+        let view = scanner.view(u32::MAX).ok_or_else(|| anyhow::anyhow!("no rewound view"))?;
+        let text = view.to_string();
+        assert!(text.contains("kept") && text.contains("replacement") && !text.contains("discarded"));
+        // A compaction barrier before a tail cut must not resurrect the old segment's words.
+        std::fs::write(&new, [r#"{"type":"session_meta","ordinal":3,"payload":{"id":"thread","history_base":{"end_ordinal_exclusive":2}}}
+{"type":"compacted","payload":{"replacement_history":[]}}
+"#, &" ".repeat(usize::try_from(OPEN_TAIL)?), "\n", r#"{"type":"response_item","ordinal":4,"payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"recent"}]}}"#].concat())?;
+        assert!(scanner.view(u32::MAX).is_none(), "truncated segments cannot safely retain prior prefixes");
+        // A single segment's recent tail cannot resurrect a prefix from another segment.
+        std::fs::remove_file(&old)?;
+        let recent = scanner.view(u32::MAX).ok_or_else(|| anyhow::anyhow!("no bounded recent view"))?.to_string();
+        assert!(recent.contains("recent") && !recent.contains("kept") && !recent.contains("discarded"));
+        Ok(())
+    }
+
+    #[test]
+    fn batch_invocations_are_not_external_interactive_sessions() {
         // Claude Code records the sessions kiln drives as "interactive" too: their `-p` tells.
         let spec = crate::harness::session::Spec { kind: "claude".into(), mode: Some("bypassPermissions".into()), ..Default::default() };
         let mut bin = vec!["/usr/local/bin/claude".to_owned()];
@@ -1409,6 +1605,61 @@ mod tests {
         assert!(!interactive(Tool::Claude, &bin) && !interactive(Tool::Claude, &node));
         // One you started in a terminal is yours to take over.
         assert!(interactive(Tool::Claude, &["claude".to_owned(), "--resume".to_owned(), "01a14a73".to_owned()]));
+    }
+
+    /// U18: ownership comes from the host's session identity, including harnesses without a
+    /// provider-specific transcript parser. No signed-in model or paid request is involved.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn u18_managed_session_discovery_is_harness_agnostic() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::process::Stdio;
+
+        struct Running(std::process::Child);
+        impl Drop for Running {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let home = tempfile::tempdir()?;
+        for name in ["claude", "gemini", "opencode", "agy"] {
+            let program = home.path().join(name);
+            std::fs::write(&program, "#!/bin/sh\nread -r stop\n")?;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))?;
+            let child = Running(std::process::Command::new(&program).env(crate::harness::survivors::MARK, "owned-session").stdin(Stdio::piped()).stdout(Stdio::null()).spawn()?);
+            let pid = child.0.id();
+            let mut scanner = Scanner::new(home.path().to_owned());
+            let mut found = false;
+            for _ in 0..50 {
+                if scanner.scan(&HashMap::new()).iter().any(|s| s.pid == pid) {
+                    found = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(found, "external {name} is discoverable through its registry entry");
+            scanner.managed.insert("owned-session".into());
+            scanner.managed_pids.push(Pid::from_u32(pid));
+            assert!(!scanner.scan(&HashMap::new()).iter().any(|s| s.pid == pid), "managed {name} belongs to its structured host");
+            assert!(scanner.view(pid).is_none(), "managed {name} has no external view");
+            // A runner/other session's marker is not this host's ownership. In particular a
+            // pid that has been reused must not inherit a stale bare-pid exclusion.
+            scanner.managed.clear();
+            scanner.managed.insert("another-session".into());
+            assert!(scanner.scan(&HashMap::new()).iter().any(|s| s.pid == pid), "{name} does not inherit ownership from a bare pid");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn u18_registered_harnesses_distinguish_their_screen_and_protocol_helpers() {
+        let is = |id, args: &[&str]| interactive(Tool::Registered(id), &args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>());
+        assert!(is("opencode", &["opencode"]) && !is("opencode", &["opencode", "acp"]));
+        assert!(is("goose", &["goose", "session"]) && !is("goose", &["goose", "acp"]));
+        assert!(is("amp", &["amp"]) && !is("amp", &["amp-acp"]));
+        assert!(is("antigravity", &["agy"]) && !is("antigravity", &["agy", "--input-format", "stream-json"]));
     }
 
     #[test]
@@ -1582,7 +1833,7 @@ mod tests {
         let locks = root.join("session_locks");
         std::fs::create_dir_all(&locks)?;
         let program = home.path().join("devin");
-        std::fs::write(&program, "#!/bin/sh\nsleep 30\n")?;
+        std::fs::write(&program, "#!/bin/sh\nread answer\n")?;
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))?;
         let db = rusqlite::Connection::open(root.join("sessions.db"))?;
         db.execute_batch("CREATE TABLE sessions (id TEXT PRIMARY KEY, working_directory TEXT, model TEXT, title TEXT, created_at INTEGER, last_activity_at INTEGER, main_chain_id INTEGER, hidden INTEGER); CREATE TABLE message_nodes (session_id TEXT, node_id INTEGER, parent_node_id INTEGER, chat_message TEXT, UNIQUE(session_id, node_id));")?;
@@ -1591,7 +1842,7 @@ mod tests {
         for (id, parent, role, text) in [(1, None, "user", "native question"), (2, Some(1), "assistant", "native answer")] {
             db.execute("INSERT INTO message_nodes VALUES ('native', ?1, ?2, ?3)", params![id, parent, serde_json::json!({"role": role, "content": text}).to_string()])?;
         }
-        let mut child = std::process::Command::new(&program).env("KILN_TERM_SESSION", "native-terminal").spawn()?;
+        let mut child = std::process::Command::new(&program).stdin(std::process::Stdio::piped()).env("KILN_TERM_SESSION", "native-terminal").spawn()?;
         let mut lock = std::fs::File::create(locks.join("native.lock"))?;
         writeln!(lock, "{}", child.id())?;
         lock.lock()?;
@@ -1606,7 +1857,7 @@ mod tests {
         let entries = sc.transcript(child.id());
         let active_history = sc.history(Some("devin"), 10, &HashSet::new());
         let ambiguous = devin_owners(&sc.sys, &[(child.id(), "native".into()), (child.id(), "another".into())]);
-        let _ = end(child.id(), true);
+        let _ = child.kill();
         let _ = child.wait();
         let past = sc.history(Some("devin"), 10, &HashSet::new());
         let found = found.ok_or_else(|| anyhow::anyhow!("native session not found"))?;
@@ -1636,7 +1887,7 @@ mod tests {
         let mut sc = Scanner::new(dir.path().to_owned());
         sc.codex = dir.path().to_owned();
         let start = u64::try_from(now.unix_timestamp()).unwrap_or(0).saturating_sub(5);
-        let p = Proc { pid: 4242, start, cwd: "/work".into(), args: vec!["codex".into()] };
+        let p = Proc { pid: 4242, start, identity: None, cwd: "/work".into(), args: vec!["codex".into()] };
         // A thread that began before the process did, still written to (another session in the
         // same folder, ending): not its.
         rollout("other-1", "/work", now - time::Duration::minutes(3))?;
@@ -1650,10 +1901,10 @@ mod tests {
         assert_eq!(sc.codex_file(&p, &HashSet::new()).as_ref(), Some(&own));
         assert_eq!(sc.codex_files.get(&(4242, start)), Some(&own));
         // Resumed from Codex's menu: an older thread, nobody's for sure.
-        let q = Proc { pid: 4343, start, cwd: "/work".into(), args: vec!["codex".into(), "resume".into()] };
+        let q = Proc { pid: 4343, start, identity: None, cwd: "/work".into(), args: vec!["codex".into(), "resume".into()] };
         assert_eq!(sc.codex_file(&q, &HashSet::from([own.clone()])), None);
         // Resumed by id: that one.
-        let r = Proc { pid: 4444, start, cwd: "/work".into(), args: vec!["codex".into(), "resume".into(), "other-1".into()] };
+        let r = Proc { pid: 4444, start, identity: None, cwd: "/work".into(), args: vec!["codex".into(), "resume".into(), "other-1".into()] };
         assert!(sc.codex_file(&r, &HashSet::new()).is_some_and(|f| f.to_string_lossy().ends_with("other-1.jsonl")));
         Ok(())
     }
@@ -1734,6 +1985,7 @@ mod tests {
         assert_eq!((spec.kind.as_str(), spec.cwd.as_deref(), spec.resume.as_deref(), spec.takeover_pid), ("claude", Some("/work"), Some("8b2c"), Some(4242)));
         assert_eq!((spec.model.as_deref(), spec.name.as_deref()), (Some("claude-opus-5-5"), Some("fix the build")));
         assert!(!spec.takeover_stop && !spec.fork);
+        assert_eq!(spec.takeover_identity, s.process_identity);
         // kiln does not hold its terminal (any more), or it runs outside kiln: kiln ends it first.
         assert_eq!(s.takeover(false), TakeOver::Stop);
         assert_eq!(AiSession { terminal: None, ..s.clone() }.takeover(true), TakeOver::Stop);
@@ -1764,22 +2016,5 @@ mod tests {
         assert_eq!(serde_json::to_value(TakeOver::Stop).ok(), Some(serde_json::json!("stop")));
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn a_session_taken_over_from_outside_is_asked_to_quit_then_killed() -> anyhow::Result<()> {
-        use std::os::unix::process::ExitStatusExt as _;
-        let mut asked = std::process::Command::new("sleep").arg("30").spawn()?;
-        // Not a harness, whatever it was found as: a take-over leaves it alone.
-        assert!(!runs(asked.id(), "claude"));
-        assert!(end(asked.id(), false));
-        assert_eq!(asked.wait()?.signal(), Some(15));
-        // Killed, with what it started.
-        let mut killed = std::process::Command::new("sh").args(["-c", "sleep 30; true"]).spawn()?;
-        std::thread::sleep(Duration::from_millis(200));
-        assert!(end(killed.id(), true));
-        assert_eq!(killed.wait()?.signal(), Some(9));
-        // Never kiln itself.
-        assert!(!end(std::process::id(), true) && !end(1, false));
-        Ok(())
-    }
+
 }

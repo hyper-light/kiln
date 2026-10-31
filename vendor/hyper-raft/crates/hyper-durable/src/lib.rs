@@ -45,6 +45,7 @@ mod machine;
 #[cfg(any(test, feature = "test-store"))]
 mod memory;
 mod owner;
+mod patience;
 mod replica;
 mod store;
 
@@ -56,5 +57,7 @@ pub use machine::{Fatal, StateMachine};
 #[cfg(any(test, feature = "test-store"))]
 pub use memory::RamStore;
 pub use owner::{Full, Handle, Owner};
-pub use replica::{Cause, Driven, OpenError, Output, Replica, ReplicaError, Settings, Writes};
+pub use replica::{
+    Cause, Disk, Driven, OpenError, Output, Replica, ReplicaError, Settings, Writes,
+};
 pub use store::{Entries, EntryRef, Fault, Health, LogStore, Point, StoreView, Write};

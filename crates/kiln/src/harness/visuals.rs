@@ -23,7 +23,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::Mutex;
+use kiln_seams::records::{Cond, Consistency, Records, Refusal, Rev, Row, Scan, Tx, Write};
+use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -464,39 +465,177 @@ const SEEN_WIDTHS: usize = 24;
 
 /// Published pages, kept beside the files conversations keep (one store of content).
 pub struct Visuals {
-    dir: PathBuf,
     blobs: PathBuf,
-    cache: Mutex<HashMap<String, Visual>>,
-    /// A page's heights changed one at a time (its machine's, its viewers').
-    heights: Mutex<()>,
+    records: Arc<dyn Records>,
 }
 
-impl Visuals {
-    pub fn new(harness_dir: &Path) -> Self {
-        Self { dir: harness_dir.join("visuals"), blobs: harness_dir.join("files").join("blobs"), cache: Mutex::default(), heights: Mutex::default() }
-    }
+const PAGES: &str = "pages";
+const IMPORTS: &str = "legacy-imports";
+// U19: preflight bounds apply before reading payloads; only one page is resident at a time.
+const IMPORT_FILES: usize = 4096;
+const IMPORT_BYTES: u64 = 64 << 20;
+const PAGE_METADATA_BYTES: usize = kiln_seams::records::VALUE_MAX;
 
-    fn file(&self, id: &str) -> Option<PathBuf> {
-        (id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())).then(|| self.dir.join(format!("{id}.json")))
-    }
-
-    pub fn get(&self, id: &str) -> Option<Visual> {
-        if let Some(v) = self.cache.lock().get(id) {
-            return Some(v.clone());
+struct MetadataBytes(Vec<u8>);
+impl std::io::Write for MetadataBytes {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > PAGE_METADATA_BYTES.saturating_sub(self.0.len()) {
+            return Err(std::io::Error::other("U19 page metadata exceeds Records value budget"));
         }
-        let v: Visual = serde_json::from_slice(&std::fs::read(self.file(id)?).ok()?).ok()?;
-        self.cache.lock().insert(id.to_owned(), v.clone());
-        Some(v)
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+
+/// U17: distinguish an unavailable/corrupt canonical store from a missing page.
+#[derive(Debug, thiserror::Error)]
+#[error("page metadata storage: {0:#}")]
+pub struct StorageError(anyhow::Error);
+fn storage(e: impl Into<anyhow::Error>) -> anyhow::Error { StorageError(e.into()).into() }
+
+fn valid_id(id: &str) -> bool { id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()) }
+
+impl Visuals {
+    /// U17: the caller injects a namespace of the existing shared Database; bytes stay separate.
+    pub fn new(harness_dir: &Path, records: Arc<dyn Records>, import_source: &str) -> anyhow::Result<Self> {
+        let this = Self { blobs: harness_dir.join("files").join("blobs"), records };
+        this.import(&harness_dir.join("visuals"), import_source)?;
+        Ok(this)
+    }
+
+    fn row(&self, family: &str, key: &[u8]) -> anyhow::Result<Option<Row>> {
+        futures::executor::block_on(self.records.get(family, key, Consistency::Linearizable)).map_err(storage)
+    }
+
+    fn commit(&self, family: &str, key: &[u8], rev: Option<Rev>, value: Option<Vec<u8>>) -> Result<Rev, Refusal> {
+        let family = family.to_owned();
+        let key = key.to_vec();
+        let cond = match rev { Some(rev) => Cond::At { family: family.clone(), key: key.clone(), rev }, None => Cond::Absent { family: family.clone(), key: key.clone() } };
+        let write = match value { Some(value) => Write::Put { family, key, value }, None => Write::Delete { family, key } };
+        futures::executor::block_on(self.records.commit(Tx { conds: vec![cond], writes: vec![write] }))
+    }
+
+    fn import(&self, dir: &Path, import_source: &str) -> anyhow::Result<()> {
+        self.import_bounded(dir, import_source, IMPORT_FILES, IMPORT_BYTES)
+    }
+
+    fn import_bounded(&self, dir: &Path, import_source: &str, max_files: usize, max_bytes: u64) -> anyhow::Result<()> {
+        use std::io::Read as _;
+        // U19: retain bounded identifiers/sizes only. Reject count/aggregate/file budgets
+        // before any payload allocation or page transaction, including on resumed imports.
+        let mut inputs = Vec::new();
+        let mut total = 0u64;
+        match std::fs::read_dir(dir) {
+            Ok(entries) => for entry in entries {
+                let entry = entry?;
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) != Some("json") { continue; }
+                anyhow::ensure!(inputs.len() < max_files, "U19 legacy visuals file count exceeds {max_files} at {}", dir.display());
+                anyhow::ensure!(entry.file_type()?.is_file(), "U17 legacy visual is not a regular file: {}", path.display());
+                let size = entry.metadata()?.len();
+                anyhow::ensure!(size <= PAGE_METADATA_BYTES as u64, "U19 legacy visual {} exceeds {PAGE_METADATA_BYTES}-byte file budget ({size} bytes)", path.display());
+                anyhow::ensure!(size <= max_bytes.saturating_sub(total), "U19 legacy visuals aggregate byte budget {max_bytes} exceeded at {}", path.display());
+                total += size;
+                let id = path.file_stem().and_then(|s| s.to_str()).ok_or_else(|| anyhow::anyhow!("U17 invalid legacy visual filename"))?.to_owned();
+                anyhow::ensure!(valid_id(&id), "U17 invalid legacy visual id {id:?}");
+                inputs.push((id, size));
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+            Err(e) => return Err(e.into()),
+        }
+        inputs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let source = hex::encode(Sha256::digest(serde_json::to_vec(&(import_source, dir))?));
+        let done = format!("{source}/done");
+        let completed = self.row(IMPORTS, done.as_bytes())?;
+        // Fixed-width ids and digests make a compact, unambiguous streaming manifest.
+        let mut manifest = Sha256::new();
+        manifest.update(b"U19-visual-import-v1");
+        manifest.update((inputs.len() as u64).to_be_bytes());
+        for (id, size) in inputs {
+            let path = dir.join(format!("{id}.json"));
+            let file = std::fs::File::open(&path).with_context(|| format!("U19 opening legacy visual {}", path.display()))?;
+            let metadata = file.metadata()?;
+            anyhow::ensure!(metadata.is_file(), "U19 legacy visual is not a regular file: {}", path.display());
+            anyhow::ensure!(metadata.len() == size, "U19 legacy visual changed size during import: {}", path.display());
+            // Read at most the preflight size plus one, refusing growth without unbounded reads.
+            let mut raw = Vec::new();
+            raw.try_reserve_exact(usize::try_from(size + 1)?)?;
+            file.take(size + 1).read_to_end(&mut raw).with_context(|| format!("U19 reading legacy visual {}", path.display()))?;
+            anyhow::ensure!(raw.len() as u64 == size, "U19 legacy visual changed size during import: {}", path.display());
+            let digest = Sha256::digest(&raw);
+            manifest.update(id.as_bytes());
+            manifest.update(digest);
+            let hash = hex::encode(digest);
+            let v: Visual = serde_json::from_slice(&raw).with_context(|| format!("U17 corrupt legacy visual {}", path.display()))?;
+            anyhow::ensure!(v.id == id, "U17 legacy visual filename/id collision at {}", path.display());
+            let value = Self::encode(&v).with_context(|| format!("U19 legacy visual {}", path.display()))?;
+            if completed.is_some() { continue; }
+            let receipt = format!("{source}/{id}").into_bytes();
+            if let Some(row) = self.row(IMPORTS, &receipt)? {
+                anyhow::ensure!(row.value == hash.as_bytes(), "U17 legacy visual fingerprint changed for {id}");
+                continue;
+            }
+            let existing = self.row(PAGES, id.as_bytes())?;
+            anyhow::ensure!(existing.as_ref().is_none_or(|r| r.value == value), "U17 legacy visual collision for {id}; fingerprint {hash}");
+            let cond = match &existing { Some(r) => Cond::At { family: PAGES.into(), key: id.as_bytes().to_vec(), rev: r.rev }, None => Cond::Absent { family: PAGES.into(), key: id.as_bytes().to_vec() } };
+            let mut writes = vec![Write::Put { family: IMPORTS.into(), key: receipt.clone(), value: hash.as_bytes().to_vec() }];
+            if existing.is_none() { writes.push(Write::Put { family: PAGES.into(), key: id.as_bytes().to_vec(), value }); }
+            let tx = Tx { conds: vec![cond, Cond::Absent { family: IMPORTS.into(), key: receipt.clone() }], writes };
+            match futures::executor::block_on(self.records.commit(tx)) {
+                Ok(_) => {},
+                Err(Refusal::Conflict { .. }) if self.row(IMPORTS, &receipt)?.is_some_and(|r| r.value == hash.as_bytes()) => {},
+                Err(e) => return Err(storage(e)),
+            }
+        }
+        let manifest = format!("U19-v1:{}", hex::encode(manifest.finalize())).into_bytes();
+        if let Some(row) = completed {
+            anyhow::ensure!(row.value == manifest, "U17 legacy visuals fingerprint changed for {}", dir.display());
+            return Ok(());
+        }
+        match self.commit(IMPORTS, done.as_bytes(), None, Some(manifest.clone())) {
+            Ok(_) => Ok(()),
+            Err(Refusal::Conflict { .. }) if self.row(IMPORTS, done.as_bytes())?.is_some_and(|r| r.value == manifest) => Ok(()),
+            Err(e) => Err(storage(e)),
+        }
+    }
+
+    pub fn get(&self, id: &str) -> anyhow::Result<Option<Visual>> {
+        if !valid_id(id) { return Ok(None); }
+        self.row(PAGES, id.as_bytes())?.map(|r| Self::decode(&r)).transpose()
+    }
+
+    fn decode(row: &Row) -> anyhow::Result<Visual> {
+        let v: Visual = serde_json::from_slice(&row.value).map_err(storage)?;
+        if row.key != v.id.as_bytes() { return Err(storage(anyhow::anyhow!("mismatched page id"))); }
+        Ok(v)
+    }
+
+    fn encode(v: &Visual) -> anyhow::Result<Vec<u8>> {
+        let mut bytes = MetadataBytes(Vec::new());
+        serde_json::to_writer(&mut bytes, v).context("U19 page metadata exceeds Records value budget or cannot be encoded")?;
+        Ok(bytes.0)
     }
 
     fn save(&self, v: &Visual) -> anyhow::Result<()> {
-        let path = self.file(&v.id).ok_or_else(|| anyhow::anyhow!("not a page's id"))?;
-        std::fs::create_dir_all(&self.dir)?;
-        let tmp = path.with_extension("json.part");
-        std::fs::write(&tmp, serde_json::to_vec(v)?)?;
-        std::fs::rename(&tmp, &path)?;
-        self.cache.lock().insert(v.id.clone(), v.clone());
+        anyhow::ensure!(valid_id(&v.id), "not a page's id");
+        self.commit(PAGES, v.id.as_bytes(), None, Some(Self::encode(v)?)).map_err(storage)?;
         Ok(())
+    }
+
+    fn edit<T>(&self, id: &str, edit: impl Fn(&mut Visual) -> anyhow::Result<T>) -> anyhow::Result<T> {
+        anyhow::ensure!(valid_id(id), "no such page");
+        for _ in 0..32 {
+            let row = self.row(PAGES, id.as_bytes())?.ok_or_else(|| anyhow::anyhow!("no such page"))?;
+            let mut v = Self::decode(&row)?;
+            let out = edit(&mut v)?;
+            match self.commit(PAGES, id.as_bytes(), Some(row.rev), Some(Self::encode(&v)?)) {
+                Ok(_) => return Ok(out),
+                Err(Refusal::Conflict { .. }) => continue,
+                Err(e) => return Err(storage(e)),
+            }
+        }
+        Err(storage(anyhow::anyhow!("concurrent page metadata edits; retry")))
     }
 
     /// Where content `sha` is kept.
@@ -519,18 +658,28 @@ impl Visuals {
 
     /// The heights the agent's machine measured, for its own session's page.
     pub fn measured(&self, id: &str, session: &str, heights: Vec<(u32, u32)>, engines: std::collections::BTreeMap<String, Vec<(u32, u32)>>) -> anyhow::Result<Visual> {
-        let _one = self.heights.lock();
-        let mut v = self.get(id).ok_or_else(|| anyhow::anyhow!("no such page"))?;
-        anyhow::ensure!(v.session == session, "that page is another conversation's");
-        let sane = |hs: Vec<(u32, u32)>| {
-            let mut hs: Vec<(u32, u32)> = hs.into_iter().filter(|(w, h)| *w > 0 && *w <= 10_000 && *h > 0 && *h <= 100_000).take(24).collect();
-            hs.sort_unstable();
-            hs
-        };
-        v.heights = sane(heights);
-        v.engines = engines.into_iter().filter(|(e, _)| matches!(e.as_str(), "firefox" | "webkit")).map(|(e, hs)| (e, sane(hs))).filter(|(_, hs)| !hs.is_empty()).collect();
-        self.save(&v)?;
-        Ok(v)
+        self.edit(id, |v| {
+            anyhow::ensure!(v.session == session, "that page is another conversation's");
+            let sane = |hs: Vec<(u32, u32)>| {
+                let mut hs: Vec<(u32, u32)> = hs.into_iter().filter(|(w, h)| *w > 0 && *w <= 10_000 && *h > 0 && *h <= 100_000).take(24).collect();
+                hs.sort_unstable();
+                hs
+            };
+            v.heights = sane(heights.clone());
+            // U17: refreshing the machine's measurements must retain other viewer widths
+            // read at this CAS revision, including observations committed by another replica.
+            for (engine, heights) in &engines {
+                if !matches!(engine.as_str(), "firefox" | "webkit") { continue; }
+                let measured = sane(heights.clone());
+                if measured.is_empty() { continue; }
+                let hs = v.engines.entry(engine.clone()).or_default();
+                hs.retain(|(w, _)| !measured.iter().any(|(mw, _)| mw == w));
+                hs.extend(measured);
+                hs.sort_unstable();
+                hs.truncate(SEEN_WIDTHS);
+            }
+            Ok(v.clone())
+        })
     }
 
     /// A height a viewer's own browser measured of its conversation's page at its width (`engine`:
@@ -541,46 +690,53 @@ impl Visuals {
     pub fn seen(&self, id: &str, session: &str, engine: &str, width: u32, height: u32) -> anyhow::Result<()> {
         anyhow::ensure!(matches!(engine, "firefox" | "webkit"), "heights are kept for firefox and webkit, not {engine:?}");
         anyhow::ensure!((200..=10_000).contains(&width) && (1..=100_000).contains(&height), "not a page's width and height");
-        let _one = self.heights.lock();
-        let mut v = self.get(id).ok_or_else(|| anyhow::anyhow!("no such page"))?;
-        anyhow::ensure!(v.session == session, "that page is another conversation's");
-        let hs = v.engines.entry(engine.to_owned()).or_default();
-        if hs.contains(&(width, height)) {
-            return Ok(());
-        }
-        hs.retain(|(w, _)| *w != width);
-        hs.push((width, height));
-        hs.sort_unstable();
-        while hs.len() > SEEN_WIDTHS {
-            let at = hs.iter().position(|(w, _)| *w == width).unwrap_or(0);
-            let left = at.checked_sub(1).and_then(|i| hs.get(i).map(|n| (i, width.abs_diff(n.0))));
-            let right = hs.get(at + 1).map(|n| (at + 1, width.abs_diff(n.0)));
-            let Some((i, _)) = [left, right].into_iter().flatten().min_by_key(|(_, d)| *d) else { break };
-            hs.remove(i);
-        }
-        self.save(&v)
+        self.edit(id, |v| {
+            anyhow::ensure!(v.session == session, "that page is another conversation's");
+            let hs = v.engines.entry(engine.to_owned()).or_default();
+            if hs.contains(&(width, height)) {
+                return Ok(());
+            }
+            hs.retain(|(w, _)| *w != width);
+            hs.push((width, height));
+            hs.sort_unstable();
+            while hs.len() > SEEN_WIDTHS {
+                let at = hs.iter().position(|(w, _)| *w == width).unwrap_or(0);
+                let left = at.checked_sub(1).and_then(|i| hs.get(i).map(|n| (i, width.abs_diff(n.0))));
+                let right = hs.get(at + 1).map(|n| (at + 1, width.abs_diff(n.0)));
+                let Some((i, _)) = [left, right].into_iter().flatten().min_by_key(|(_, d)| *d) else { break };
+                hs.remove(i);
+            }
+            Ok(())
+        })
     }
 
     /// Every content kept for a page (the keeper's sweep leaves these).
-    pub fn shas(&self) -> HashSet<String> {
-        let mut out = HashSet::new();
-        for e in std::fs::read_dir(&self.dir).into_iter().flatten().flatten() {
-            if let Ok(v) = serde_json::from_slice::<Visual>(&std::fs::read(e.path()).unwrap_or_default()) {
-                out.extend(v.files.into_iter().map(|f| f.sha));
-            }
-        }
-        out
+    pub fn shas(&self) -> anyhow::Result<HashSet<String>> {
+        Ok(self.rows()?.iter().map(Self::decode).collect::<anyhow::Result<Vec<_>>>()?.into_iter().flat_map(|v| v.files.into_iter().map(|f| f.sha)).collect())
     }
 
-    /// A conversation that's closed: its pages go (their content, at the keeper's next sweep).
-    pub fn forget(&self, session: &str) {
-        for e in std::fs::read_dir(&self.dir).into_iter().flatten().flatten() {
-            if serde_json::from_slice::<Visual>(&std::fs::read(e.path()).unwrap_or_default()).is_ok_and(|v| v.session == session) {
-                let _ = std::fs::remove_file(e.path());
+    fn rows(&self) -> anyhow::Result<Vec<Row>> {
+        let at = Consistency::Snapshot(futures::executor::block_on(self.records.head()).map_err(storage)?);
+        let mut out = Vec::new();
+        let mut after = None;
+        loop {
+            let page = futures::executor::block_on(self.records.scan(PAGES, Scan { prefix: vec![], after, limit: 256, at })).map_err(storage)?;
+            after = page.rows.last().map(|r| r.key.clone());
+            out.extend(page.rows);
+            if !page.more { return Ok(out); }
+        }
+    }
+
+    /// U17: deletion is conditional, so it never removes a concurrently edited page silently.
+    pub fn forget(&self, session: &str) -> anyhow::Result<()> {
+        for row in self.rows()? {
+            if Self::decode(&row)?.session == session {
+                self.commit(PAGES, &row.key, Some(row.rev), None).map_err(storage)?;
             }
         }
-        self.cache.lock().retain(|_, v| v.session != session);
+        Ok(())
     }
+
 }
 
 /// What an agent's MCP server asks of its conversation's pages (`crate::mcp::runner_ask`, op
@@ -631,6 +787,7 @@ struct Kept {
 /// full paths and web addresses in them rewritten to where their copies are served, kiln's bridge
 /// put in.
 pub async fn publish(hub: &Arc<Hub>, session: &str, title: &str, entry: &str, html: &str, loaded: &crate::browser::preview::Loaded) -> anyhow::Result<Visual> {
+    let publication = hub.harness.keeper.publication().await?; // U17: physical byte-root lock through metadata commit.
     anyhow::ensure!(html.len() <= MOST_PAGE, "the page is {} KB; a page may be up to {} KB (its pictures and files go beside it, by path)", html.len() / 1024, MOST_PAGE / 1024);
     let location = hub.harness.location(session).ok_or_else(|| anyhow::anyhow!("no such agent session"))?;
     let id = hex::encode(rand::random::<[u8; 16]>());
@@ -673,8 +830,8 @@ pub async fn publish(hub: &Arc<Hub>, session: &str, title: &str, entry: &str, ht
     while let Some((t, quoted)) = queue.pop_front() {
         anyhow::ensure!(kept.len() < MOST_USED, "the page uses more than {MOST_USED} files");
         let got = match &t {
-            Target::Local(path) => local_file(hub, &location, session, path).await,
-            Target::Web(url) => web_file(hub, url).await,
+            Target::Local(path) => local_file(hub, &location, session, path, &publication).await,
+            Target::Web(url) => web_file(hub, url, &publication).await,
         };
         let k = match got {
             Ok(k) => k,
@@ -745,6 +902,7 @@ pub async fn publish(hub: &Arc<Hub>, session: &str, title: &str, entry: &str, ht
     let h = hub.clone();
     let entry_from = entry.to_owned();
     crate::rt::blocking(move || -> anyhow::Result<Visual> {
+        let _publication = publication; // U17: cancellation must not unlock before this commit finishes.
         let visuals = &h.harness.visuals;
         let mut v = v;
         for (i, text) in rewritten {
@@ -771,13 +929,16 @@ impl Kept {
 }
 
 /// A file of the agent's into the store (its text kept to look into, for a page's code and styles).
-async fn local_file(hub: &Arc<Hub>, location: &super::registry::Location, session: &str, path: &str) -> anyhow::Result<Kept> {
-    let (sha, meta) = super::kept::store_file(hub, location, session, path, MOST_FILE).await?;
+async fn local_file(hub: &Arc<Hub>, location: &super::registry::Location, session: &str, path: &str, publication: &super::kept::Publication) -> anyhow::Result<Kept> {
+    let (sha, meta) = super::kept::store_file(hub, location, session, path, MOST_FILE, publication).await?;
     let mime = served_type(path, &meta.mime);
     let text = match text_kind(&mime) {
         Some(kind) => {
-            let blob = hub.harness.visuals.blob(&sha);
-            Some((kind, crate::rt::blocking(move || std::fs::read_to_string(blob)).await??))
+            let (blob, held) = (hub.harness.visuals.blob(&sha), publication.clone());
+            Some((kind, crate::rt::blocking(move || {
+                let _publication = held;
+                std::fs::read_to_string(blob)
+            }).await??))
         }
         None => None,
     };
@@ -786,7 +947,7 @@ async fn local_file(hub: &Arc<Hub>, location: &super::registry::Location, sessio
 
 /// A file from the web (a library a page loads), fetched once by the server and kept. Only from
 /// the public internet: never this machine, its networks, or a cloud's metadata service.
-async fn web_file(hub: &Arc<Hub>, url: &str) -> anyhow::Result<Kept> {
+async fn web_file(hub: &Arc<Hub>, url: &str, publication: &super::kept::Publication) -> anyhow::Result<Kept> {
     let client = crate::http::client::Client::public()?;
     let reach = crate::http::io::Reach::default();
     let mut at = url.to_owned();
@@ -802,8 +963,11 @@ async fn web_file(hub: &Arc<Hub>, url: &str) -> anyhow::Result<Kept> {
         let body = resp.bytes(usize::try_from(MOST_FILE).unwrap_or(usize::MAX)).await?;
         let size = body.len() as u64;
         let text = text_kind(&mime).map(|k| (k, String::from_utf8_lossy(&body).into_owned()));
-        let h = hub.clone();
-        let sha = crate::rt::blocking(move || h.harness.visuals.store(&body)).await??;
+        let (h, held) = (hub.clone(), publication.clone());
+        let sha = crate::rt::blocking(move || {
+            let _publication = held;
+            h.harness.visuals.store(&body)
+        }).await??;
         return Ok(Kept { from: Target::Web(url.to_owned()), sha, mime, size, text });
     }
     anyhow::bail!("{url} sent elsewhere too many times")
@@ -852,17 +1016,145 @@ fn joined(from: &str, to: &str) -> String {
 mod tests {
     use super::*;
 
+    fn sample() -> Visual {
+        Visual { id: "0123456789abcdef0123456789abcdef".into(), session: "s1".into(), title: "t".into(), entry: "/p.html".into(), files: vec![], heights: vec![], engines: Default::default(), at: 0 }
+    }
+
+    #[test]
+    fn u17_visuals_concurrent_metadata_and_reopen() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("kiln.db");
+        let id = sample().id;
+        {
+            let store = crate::store::Store::open(&path)?;
+            let records: Arc<dyn Records> = Arc::new(crate::records::from_database(&store.database(), "visuals")?);
+            let a = Visuals::new(dir.path(), records.clone(), "test")?;
+            let b = Visuals::new(dir.path(), records, "test")?;
+            a.save(&sample())?;
+            let stale = b.row(PAGES, id.as_bytes())?.ok_or_else(|| anyhow::anyhow!("missing fixture"))?;
+            a.measured(&id, "s1", vec![(390, 510)], Default::default())?;
+            assert!(matches!(b.commit(PAGES, id.as_bytes(), Some(stale.rev), Some(stale.value)), Err(Refusal::Conflict { .. })));
+            std::thread::scope(|scope| -> anyhow::Result<()> {
+                let left = scope.spawn(|| {
+                    a.measured(&id, "s1", vec![(390, 510)], Default::default())?;
+                    a.seen(&id, "s1", "webkit", 390, 520)
+                });
+                let right = scope.spawn(|| b.seen(&id, "s1", "firefox", 800, 600));
+                left.join().map_err(|_| anyhow::anyhow!("viewer thread failed"))??;
+                right.join().map_err(|_| anyhow::anyhow!("viewer thread failed"))??;
+                Ok(())
+            })?;
+            assert_eq!(a.get(&id)?, b.get(&id)?);
+        }
+        let store = crate::store::Store::open(&path)?;
+        let reopened = Visuals::new(dir.path(), Arc::new(crate::records::from_database(&store.database(), "visuals")?), "test")?;
+        let v = reopened.get(&id)?.ok_or_else(|| anyhow::anyhow!("page lost on reopen"))?;
+        assert_eq!(v.heights, vec![(390, 510)]);
+        assert_eq!(v.engines.get("webkit"), Some(&vec![(390, 520)]));
+        assert_eq!(v.engines.get("firefox"), Some(&vec![(800, 600)]));
+        Ok(())
+    }
+
+    #[test]
+    fn u17_visuals_checked_import_is_idempotent_and_never_resurrects() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let legacy = dir.path().join("visuals");
+        std::fs::create_dir(&legacy)?;
+        let v = sample();
+        let file = legacy.join(format!("{}.json", v.id));
+        let raw = serde_json::to_vec(&v)?;
+        std::fs::write(&file, &raw)?;
+        let store = crate::store::Store::in_memory()?;
+        let records: Arc<dyn Records> = Arc::new(crate::records::from_database(&store.database(), "visuals")?);
+        // U19: reject preflight limits before importing any page, without allocating file bytes.
+        let preflight = Visuals { blobs: dir.path().join("files/blobs"), records: records.clone() };
+        for (count, bytes, diagnostic) in [(0, IMPORT_BYTES, "file count"), (IMPORT_FILES, raw.len() as u64 - 1, "aggregate byte budget")] {
+            let error = preflight.import_bounded(&legacy, "test", count, bytes).err().ok_or_else(|| anyhow::anyhow!("accepted unbounded import"))?;
+            assert!(error.to_string().contains(diagnostic), "{error:#}");
+            assert!(preflight.get(&v.id)?.is_none(), "preflight must precede page writes");
+        }
+        let oversized = legacy.join("ffffffffffffffffffffffffffffffff.json");
+        std::fs::File::create(&oversized)?.set_len(PAGE_METADATA_BYTES as u64 + 1)?;
+        let error = preflight.import(&legacy, "test").err().ok_or_else(|| anyhow::anyhow!("accepted oversized legacy file"))?;
+        assert!(error.to_string().contains("file budget"), "{error:#}");
+        assert!(preflight.get(&v.id)?.is_none());
+        std::fs::remove_file(oversized)?;
+        let mut huge = v.clone();
+        huge.title = "x".repeat(PAGE_METADATA_BYTES);
+        let error = preflight.save(&huge).err().ok_or_else(|| anyhow::anyhow!("accepted oversized encoded metadata"))?;
+        assert!(error.to_string().contains("value budget"), "{error:#}");
+        assert!(preflight.get(&v.id)?.is_none());
+        let a = Visuals::new(dir.path(), records.clone(), "test")?;
+        let source = hex::encode(Sha256::digest(serde_json::to_vec(&("test", &legacy))?));
+        let completion = a.row(IMPORTS, format!("{source}/done").as_bytes())?.ok_or_else(|| anyhow::anyhow!("missing completion receipt"))?;
+        assert!(completion.value.len() < 100, "manifest must have constant size");
+        a.seen(&v.id, "s1", "webkit", 390, 520)?;
+        let b = Visuals::new(dir.path(), records.clone(), "test")?;
+        assert_eq!(a.get(&v.id)?, b.get(&v.id)?);
+        b.forget("s1")?;
+        assert!(Visuals::new(dir.path(), records.clone(), "test")?.get(&v.id)?.is_none());
+        assert_eq!(std::fs::read(&file)?, raw, "import is read-only");
+        std::fs::write(&file, b"broken")?;
+        assert!(Visuals::new(dir.path(), records.clone(), "test").is_err());
+        let mut changed = v.clone();
+        changed.title = "changed".into();
+        std::fs::write(&file, serde_json::to_vec(&changed)?)?;
+        let error = Visuals::new(dir.path(), records.clone(), "test").err().ok_or_else(|| anyhow::anyhow!("accepted changed fingerprint"))?;
+        assert!(error.to_string().contains("fingerprint"));
+        // A fresh source cannot overwrite canonical data belonging to the same page id.
+        let other = tempfile::tempdir()?;
+        std::fs::create_dir(other.path().join("visuals"))?;
+        std::fs::write(other.path().join("visuals").join(format!("{}.json", v.id)), serde_json::to_vec(&changed)?)?;
+        a.save(&v)?;
+        let error = Visuals::new(other.path(), records, "test").err().ok_or_else(|| anyhow::anyhow!("accepted colliding legacy page"))?;
+        assert!(error.to_string().contains("collision"));
+        Ok(())
+    }
+
+    #[test]
+    fn u17_visuals_resume_partial_import_and_surface_corrupt_metadata() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let legacy = dir.path().join("visuals");
+        std::fs::create_dir(&legacy)?;
+        let v = sample();
+        let raw = serde_json::to_vec(&v)?;
+        std::fs::write(legacy.join(format!("{}.json", v.id)), &raw)?;
+        let store = crate::store::Store::in_memory()?;
+        let records: Arc<dyn Records> = Arc::new(crate::records::from_database(&store.database(), "visuals")?);
+        let a = Visuals { blobs: dir.path().join("files/blobs"), records: records.clone() };
+        // Simulate interruption after the per-file transaction, before the directory receipt.
+        a.save(&v)?;
+        let source = hex::encode(Sha256::digest(serde_json::to_vec(&("test", &legacy))?));
+        let receipt = format!("{source}/{}", v.id);
+        a.commit(IMPORTS, receipt.as_bytes(), None, Some(hex::encode(Sha256::digest(&raw)).into_bytes()))?;
+        a.seen(&v.id, "s1", "webkit", 390, 520)?;
+        let mut remaining = sample();
+        remaining.id = "ffffffffffffffffffffffffffffffff".into();
+        std::fs::write(legacy.join(format!("{}.json", remaining.id)), serde_json::to_vec(&remaining)?)?;
+        let b = Visuals::new(dir.path(), records, "test")?;
+        assert_eq!(b.get(&remaining.id)?, Some(remaining), "resume must import remaining pages");
+        assert_eq!(a.get(&v.id)?, b.get(&v.id)?);
+        assert!(b.get("bad id")?.is_none());
+        let row = a.row(PAGES, v.id.as_bytes())?.ok_or_else(|| anyhow::anyhow!("missing fixture"))?;
+        a.commit(PAGES, v.id.as_bytes(), Some(row.rev), Some(b"broken".to_vec()))?;
+        assert!(b.get(&v.id).is_err(), "corruption is not absence");
+        assert!(b.shas().is_err(), "a failed keep set must stop sweeping");
+        Ok(())
+    }
+
     #[test]
     fn a_viewers_own_engine_measures_its_page_at_its_width() -> anyhow::Result<()> {
-        let dir = std::env::temp_dir().join(format!("kiln-visuals-seen-{}", rand::random::<u64>()));
-        let vs = Visuals::new(&dir);
+        let folder = tempfile::tempdir()?;
+        let dir = folder.path().to_path_buf();
+        let store = crate::store::Store::in_memory()?;
+        let vs = Visuals::new(&dir, Arc::new(crate::records::from_database(&store.database(), "visuals")?), "test")?;
         let id = "0123456789abcdef0123456789abcdef".to_owned();
         vs.save(&Visual { id: id.clone(), session: "s1".into(), title: "t".into(), entry: "/p.html".into(), files: Vec::new(), heights: vec![(390, 500)], engines: std::collections::BTreeMap::new(), at: 0 })?;
         vs.seen(&id, "s1", "webkit", 390, 512)?;
         vs.seen(&id, "s1", "webkit", 1000, 300)?;
         // The same width again: the newer.
         vs.seen(&id, "s1", "webkit", 390, 520)?;
-        assert_eq!(vs.get(&id).map(|v| v.engines.get("webkit").cloned()), Some(Some(vec![(390, 520), (1000, 300)])));
+        assert_eq!(vs.get(&id)?.map(|v| v.engines.get("webkit").cloned()), Some(Some(vec![(390, 520), (1000, 300)])));
         // Not Chromium's (its machine measured those), not nonsense, not another conversation's.
         assert!(vs.seen(&id, "s1", "chromium", 390, 1).is_err());
         assert!(vs.seen(&id, "s1", "webkit", 390, 0).is_err() && vs.seen(&id, "s1", "webkit", 20, 100).is_err());
@@ -871,7 +1163,7 @@ mod tests {
         for w in 0..30u32 {
             vs.seen(&id, "s1", "firefox", 300 + w * 10, 100 + w)?;
         }
-        let ff = vs.get(&id).and_then(|v| v.engines.get("firefox").cloned()).unwrap_or_default();
+        let ff = vs.get(&id)?.and_then(|v| v.engines.get("firefox").cloned()).unwrap_or_default();
         assert_eq!(ff.len(), SEEN_WIDTHS);
         assert!(ff.contains(&(590, 129)) && ff.windows(2).all(|p| p.first().map(|a| a.0) < p.get(1).map(|b| b.0)), "{ff:?}");
         let _ = std::fs::remove_dir_all(&dir);

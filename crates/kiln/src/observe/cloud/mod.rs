@@ -731,7 +731,7 @@ pub fn message(mut m: String) -> String {
 /// under the master key, the file the owner's alone), each pulled by its own task.
 pub struct Clouds {
     path: PathBuf,
-    master: PathBuf,
+    master: crate::secrets::crypto::Master,
     http: Arc<Client>,
     all: Mutex<BTreeMap<String, Cloud>>,
     running: Mutex<HashMap<String, Running>>,
@@ -756,10 +756,10 @@ fn aad(name: &str, field: &str) -> Vec<u8> {
 }
 
 impl Clouds {
-    /// The integrations kept in `dir`, their secrets opened with the master key at `master`; none
+    /// The integrations kept in `dir`, their secrets opened with the Hub's accepted `master`; none
     /// pulled until [`Clouds::start`]. A secret that does not open leaves its integration failing,
     /// said, until it is given again.
-    pub fn open(dir: &Path, master: &Path, http: Arc<Client>, stop: crate::rt::Shutdown) -> Arc<Self> {
+    pub(crate) fn open(dir: &Path, master: crate::secrets::crypto::Master, http: Arc<Client>, stop: crate::rt::Shutdown) -> Arc<Self> {
         let path = dir.join("clouds.json");
         let mut all: BTreeMap<String, Cloud> = BTreeMap::new();
         let mut broken: Vec<(String, String)> = Vec::new();
@@ -769,7 +769,7 @@ impl Clouds {
                     for (name, mut c) in read {
                         for (field, v) in c.secrets_mut() {
                             if let Some(s) = v.as_deref().and_then(|s| s.strip_prefix(SEALED)) {
-                                match unseal(master, &name, field, s) {
+                                match unseal(&master, &name, field, s) {
                                     Ok(plain) => *v = Some(plain),
                                     Err(e) => {
                                         *v = None;
@@ -784,7 +784,7 @@ impl Clouds {
                 Err(e) => tracing::error!(path = %path.display(), error = %e, "observe's cloud integrations could not be read"),
             }
         }
-        let clouds = Arc::new(Self { path, master: master.to_owned(), http, all: Mutex::new(all), running: Mutex::new(HashMap::new()), kept: Mutex::new(HashMap::new()), stop });
+        let clouds = Arc::new(Self { path, master, http, all: Mutex::new(all), running: Mutex::new(HashMap::new()), kept: Mutex::new(HashMap::new()), stop });
         for (name, why) in broken {
             let status = Status { state: "failing", error: Some(why), ..Status::default() };
             lock(&clouds.running).insert(name, Running { stop: crate::rt::Shutdown::new(), now: Arc::new(crate::rt::Notify::new()), status: Arc::new(Mutex::new(status)) });
@@ -903,7 +903,7 @@ impl Clouds {
         for (name, c) in &mut sealed {
             for (field, v) in c.secrets_mut() {
                 if let Some(plain) = v.as_deref() {
-                    let (ct, nonce) = crate::ci::secrets::seal_with(&self.master, plain.as_bytes(), &aad(name, field))?;
+                    let (ct, nonce) = self.master.seal(plain.as_bytes(), &aad(name, field))?;
                     let b64 = base64::engine::general_purpose::STANDARD_NO_PAD;
                     *v = Some(format!("{SEALED}{}:{}", b64.encode(nonce), b64.encode(ct)));
                 }
@@ -937,10 +937,10 @@ impl Clouds {
     }
 }
 
-fn unseal(master: &Path, name: &str, field: &str, s: &str) -> anyhow::Result<String> {
+fn unseal(master: &crate::secrets::crypto::Master, name: &str, field: &str, s: &str) -> anyhow::Result<String> {
     let b64 = base64::engine::general_purpose::STANDARD_NO_PAD;
     let (nonce, ct) = s.split_once(':').ok_or_else(|| anyhow::anyhow!("not a sealed secret"))?;
-    let plain = crate::ci::secrets::open_with(master, &b64.decode(ct)?, &b64.decode(nonce)?, &aad(name, field))?;
+    let plain = master.open( &b64.decode(ct)?, &b64.decode(nonce)?, &aad(name, field))?;
     Ok(String::from_utf8(plain)?)
 }
 
@@ -1294,8 +1294,9 @@ mod tests {
     fn secrets_are_sealed_at_rest_hidden_when_shown_and_kept_when_left_out() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let master = dir.path().join("secrets").join("master.key");
+        crate::util::write_secret(&master, &[3u8; 32], 0o600)?;
         let http = Arc::new(Client::public()?);
-        let clouds = Clouds::open(dir.path(), &master, http.clone(), crate::rt::Shutdown::new());
+        let clouds = Clouds::open(dir.path(), crate::secrets::crypto::Master::from_existing(&master)?, http.clone(), crate::rt::Shutdown::new());
         {
             let mut all = lock(&clouds.all);
             all.insert("prod".into(), aws(Some("s3cr3t-key")));
@@ -1309,7 +1310,7 @@ mod tests {
             anyhow::ensure!(std::fs::metadata(dir.path().join("clouds.json"))?.permissions().mode() & 0o077 == 0);
         }
         // Read again, the secret opens; shown, it is hidden; a change that leaves it out keeps it.
-        let again = Clouds::open(dir.path(), &master, http.clone(), crate::rt::Shutdown::new());
+        let again = Clouds::open(dir.path(), crate::secrets::crypto::Master::from_existing(&master)?, http.clone(), crate::rt::Shutdown::new());
         anyhow::ensure!(again.get("prod") == Some(aws(Some("s3cr3t-key"))));
         let shown = again.list();
         anyhow::ensure!(shown.first().and_then(|v| v.get("secret_access_key")).and_then(Value::as_str) == Some(HIDDEN), "{shown:?}");
@@ -1324,7 +1325,7 @@ mod tests {
         anyhow::ensure!(matches!(other, Cloud::Gcp(gcp::Config { service_account: None, .. })), "another cloud's secrets are not taken");
         // Under another master key the secret does not open: said, not used.
         std::fs::write(&master, [7u8; 32])?;
-        let other_key = Clouds::open(dir.path(), &master, http, crate::rt::Shutdown::new());
+        let other_key = Clouds::open(dir.path(), crate::secrets::crypto::Master::from_existing(&master)?, http, crate::rt::Shutdown::new());
         anyhow::ensure!(other_key.get("prod") == Some(aws(None)));
         let s = other_key.list();
         let status = s.first().and_then(|v| v.get("status")).cloned().unwrap_or(Value::Null);

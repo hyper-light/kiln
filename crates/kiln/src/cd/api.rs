@@ -34,14 +34,14 @@ async fn json_body(body: Incoming) -> Result<Value, Fail> {
     serde_json::from_slice(&bytes).map_err(|e| bad(format!("the body is not JSON: {e}")))
 }
 
-fn with(mut v: Value, k: &str, x: Value) -> Value {
+pub(super) fn with(mut v: Value, k: &str, x: Value) -> Value {
     if let Some(m) = v.as_object_mut() {
         m.insert(k.into(), x);
     }
     v
 }
 
-fn from_query(q: &HashMap<String, String>, keys: &[&str]) -> Value {
+pub(super) fn from_query(q: &HashMap<String, String>, keys: &[&str]) -> Value {
     let mut m = serde_json::Map::new();
     for k in keys {
         if let Some(v) = q.get(*k) {
@@ -72,7 +72,7 @@ pub fn parse_key(seg: &str) -> Option<ResKey> {
     ok(k, n).then(|| ResKey::new(g, k, ns, n))
 }
 
-fn res_input(p: &str, n: &str, key: &str, q: &HashMap<String, String>, keys: &[&str]) -> Result<Value, Fail> {
+pub(super) fn res_input(p: &str, n: &str, key: &str, q: &HashMap<String, String>, keys: &[&str]) -> Result<Value, Fail> {
     let k = parse_key(key).ok_or_else(|| bad(format!("{key} is not an object's key: <group>~<kind>~<namespace>~<name>")))?;
     let mut v = from_query(q, keys);
     if let Some(m) = v.as_object_mut() {
@@ -142,97 +142,28 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         let input = res_input(p, n, key, q, &["container", "pod", "tail_lines", "since_seconds"])?;
         return follow_logs(Arc::clone(hub), cd, input, req);
     }
+    // U12: legacy URLs retain the same caller identity and agent restrictions as
+    // the named HTTP/MCP operation, including the domain's own audit records.
+    let actor = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "admin".to_owned(), |caller| caller.name.clone());
     let body: Incoming = req.into_body();
-    let cx = Cx { hub: hub.clone(), cd, actor: "admin".into() };
-    let app = |p: &str, n: &str| json!({"app": format!("{p}/{n}")});
-    let (name, input) = match (&method, rest) {
-        (&Method::GET, ["ops"]) => {
-            let list: Vec<Value> = ops::ops()
-                .iter()
-                .map(|o| json!({"name": o.name, "summary": o.summary, "read_only": o.read_only, "destructive": o.destructive, "input": o.input.schema()}))
-                .collect();
-            return Ok(srv::json(StatusCode::OK, &json!({"ops": list})));
-        }
-        (&Method::POST, ["ops", name]) => ((*name).to_owned(), json_body(body).await?),
-        (&Method::GET, ["summary"]) => ("cd.summary".into(), json!({})),
-        (&Method::GET, ["apps"]) => {
-            ("cd.apps.list".into(), from_query(q, &["project", "cluster", "namespace", "environment", "sync", "health", "q", "limit", "cursor", "sort"]))
-        }
-        (&Method::GET, ["facets"]) => ("cd.apps.facets".into(), from_query(q, &["project", "cluster", "namespace", "environment", "sync", "health", "q"])),
-        (&Method::POST, ["apps"]) => ("cd.apps.create".into(), json!({"definition": json_body(body).await?})),
-        (&Method::POST, ["import"]) => {
-            let bytes = srv::body_bytes(body, LIMIT).await.map_err(|e| bad(format!("{e:#}")))?;
-            ("cd.import".into(), json!({"manifests": String::from_utf8_lossy(&bytes)}))
-        }
-        (&Method::GET, ["apps", p, n]) => ("cd.apps.get".into(), app(p, n)),
-        (&Method::DELETE, ["apps", p, n]) => ("cd.apps.delete".into(), with(app(p, n), "cascade", q.get("cascade").map(|c| json!(c)).unwrap_or(Value::Null))),
-        (&Method::GET, ["apps", p, n, "resources"]) => ("cd.apps.resources".into(), with(app(p, n), "out_of_sync", json!(q.get("out_of_sync").is_some_and(|v| v == "true")))),
-        (&Method::GET, ["apps", p, n, "diff"]) => ("cd.apps.diff".into(), app(p, n)),
-        (&Method::GET, ["apps", p, n, "tree"]) => ("cd.apps.tree".into(), with(app(p, n), "fresh", json!(q.get("fresh").is_some_and(|v| v == "true" || v == "1")))),
-        (&Method::GET, ["apps", p, n, "manifests"]) => ("cd.apps.manifests".into(), app(p, n)),
-        (&Method::GET, ["apps", p, n, "resources", key]) => ("cd.apps.resource".into(), res_input(p, n, key, q, &[])?),
-        (&Method::GET, ["apps", p, n, "resources", key, "events"]) => ("cd.apps.resource_events".into(), res_input(p, n, key, q, &[])?),
-        (&Method::GET, ["apps", p, n, "resources", key, "logs"]) => {
-            ("cd.apps.resource_logs".into(), res_input(p, n, key, q, &["container", "pod", "tail_lines", "since_seconds", "previous"])?)
-        }
-        (&Method::GET, ["apps", p, n, "history"]) => ("cd.apps.history".into(), app(p, n)),
-        (&Method::POST, ["apps", p, n, "sync"]) => {
-            let mut b = json_body(body).await?;
-            if let Some(m) = b.as_object_mut() {
-                m.insert("app".into(), json!(format!("{p}/{n}")));
+    let cx = Cx { hub: hub.clone(), cd, actor };
+    if method == Method::GET && rest == ["ops"] {
+        let list: Vec<Value> = ops::ops().iter().map(|o| json!({"name": o.name, "summary": o.summary, "read_only": o.read_only, "destructive": o.destructive, "input": o.input.schema()})).collect();
+        return Ok(srv::json(StatusCode::OK, &json!({"ops": list})));
+    }
+    let (name, input) = if let (&Method::POST, ["ops", name]) = (&method, rest) {
+        ((*name).to_owned(), json_body(body).await?)
+    } else {
+        let (op, alias) = ops::http_alias(&method, rest)?;
+        let value = match alias.body {
+            crate::ops::Body::Ignore => json!({}),
+            crate::ops::Body::Json => json_body(body).await?,
+            crate::ops::Body::Text => {
+                let bytes = srv::body_bytes(body, LIMIT).await.map_err(|e| bad(format!("{e:#}")))?;
+                json!(String::from_utf8_lossy(&bytes))
             }
-            ("cd.apps.sync".into(), b)
-        }
-        (&Method::POST, ["apps", p, n, "refresh"]) => ("cd.apps.refresh".into(), with(app(p, n), "hard", json!(q.get("hard").is_some_and(|v| v == "true" || v == "1")))),
-        (&Method::POST, ["apps", p, n, "terminate"]) => ("cd.apps.terminate".into(), app(p, n)),
-        (&Method::POST, ["apps", p, n, "take-over"]) => ("cd.apps.take_over".into(), app(p, n)),
-        (&Method::POST, ["apps", p, n, "rollback"]) => {
-            let mut b = json_body(body).await?;
-            if let Some(m) = b.as_object_mut() {
-                m.insert("app".into(), json!(format!("{p}/{n}")));
-            }
-            ("cd.apps.rollback".into(), b)
-        }
-        (&Method::GET, ["apps", p, n, "rollback-targets"]) => ("cd.apps.rollback_targets".into(), app(p, n)),
-        (&Method::POST, ["apps", p, n, "follow"]) => ("cd.apps.follow".into(), app(p, n)),
-        (&Method::GET, ["apps", p, n, "auto-rollback"]) => ("cd.apps.auto_rollback".into(), app(p, n)),
-        (&Method::PUT, ["apps", p, n, "auto-rollback"]) => ("cd.apps.set_auto_rollback".into(), with(json_body(body).await?, "app", json!(format!("{p}/{n}")))),
-        (&Method::GET, ["repos", "auto-rollback"]) => ("cd.repos.auto_rollback".into(), json!({})),
-        (&Method::PUT, ["repos", "auto-rollback"]) => ("cd.repos.set_auto_rollback".into(), json_body(body).await?),
-        (&Method::GET, ["apps", p, n, "rollout"]) => ("cd.apps.rollout".into(), app(p, n)),
-        (&Method::POST, ["apps", p, n, "rollout", action]) => {
-            let b = json_body(body).await?;
-            ("cd.apps.rollout_act".into(), with(with(b, "app", json!(format!("{p}/{n}"))), "action", json!(action)))
-        }
-        (&Method::GET, ["plans"]) => {
-            if q.contains_key("diff") {
-                return Err(bad("plans of kiln's own diffs (D123) come with its review, which isn't built yet: plan the commit (commit=) or the stack (head=, base=)"));
-            }
-            let keys = ["repo", "commit", "head", "base", "trunk", "pr", "brief", "max_apps", "project", "cluster", "namespace", "environment", "q"];
-            ("cd.plans.get".into(), from_query(q, &keys))
-        }
-        (&Method::POST, ["plans"]) => ("cd.plans.get".into(), json_body(body).await?),
-        (&Method::GET, ["plans", "repos"]) => ("cd.plans.repos".into(), json!({})),
-        (&Method::GET, ["clusters"]) => ("cd.clusters.list".into(), json!({})),
-        (&Method::POST, ["clusters"]) => ("cd.clusters.add".into(), json_body(body).await?),
-        (&Method::DELETE, ["clusters", name]) => ("cd.clusters.remove".into(), json!({"name": name})),
-        (&Method::GET, ["repos"]) => ("cd.repos.list".into(), json!({})),
-        (&Method::POST, ["repos"]) => ("cd.repos.add".into(), json_body(body).await?),
-        (&Method::DELETE, ["repos"]) => ("cd.repos.remove".into(), json!({"url": q.get("url").cloned().unwrap_or_default()})),
-        (&Method::GET, ["providers"]) => ("cd.providers.list".into(), json!({})),
-        (&Method::GET, ["targets"]) => ("cd.targets.list".into(), json!({})),
-        (&Method::GET, ["discover"]) => ("cd.discover".into(), from_query(q, &["provider", "account", "region", "project", "zone", "subscription", "resource-group", "environment", "scope", "name"])),
-        (&Method::POST, ["validate"]) => ("cd.validate".into(), json_body(body).await?),
-        (&Method::GET, ["images"]) => ("cd.images.list".into(), json!({})),
-        (&Method::PUT, ["images", name]) => {
-            let mut b = json_body(body).await?;
-            if let Some(m) = b.as_object_mut() {
-                m.insert("name".into(), json!(name));
-            }
-            ("cd.images.set".into(), b)
-        }
-        (&Method::DELETE, ["images", name]) => ("cd.images.set".into(), json!({"name": name, "kind": "local"})),
-        _ => return Err((StatusCode::NOT_FOUND, "no such deployments route".into())),
+        };
+        (op.name.to_owned(), (alias.input)(rest, q, &value)?)
     };
     let out = ops::call(cx, &name, input).await?;
     Ok(srv::json(StatusCode::OK, &out))
@@ -241,6 +172,35 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn u12_cd_aliases_dispatch_and_authorize_from_their_descriptors() -> Result<(), Fail> {
+        for op in ops::ops() {
+            for alias in op.route.aliases {
+                let method = Method::from_bytes(alias.method.as_bytes()).map_err(|e| bad(e.to_string()))?;
+                let rest: Vec<&str> = alias.segments.iter().map(|segment| if *segment == "*" { "sample" } else { *segment }).collect();
+                assert_eq!(ops::http_alias(&method, &rest)?.0.name, op.name);
+                let mut full = vec!["api", "cd"];
+                full.extend(&rest);
+                assert_eq!(crate::authz::rule(&method, &full).capability, op.route.authorization.capability);
+                assert_eq!(crate::authz::rule(&Method::POST, &["api", "cd", "ops", op.name]).capability, op.route.authorization.capability);
+            }
+        }
+        let (op, alias) = ops::http_alias(&Method::POST, &["apps", "team", "web", "sync"])?;
+        assert_eq!(op.name, "cd.apps.sync");
+        let input = (alias.input)(&["apps", "team", "web", "sync"], &HashMap::new(), &json!({"app": "other/app", "prune": true}))?;
+        assert_eq!(input, json!({"app": "team/web", "prune": true}));
+        let (read, alias) = ops::http_alias(&Method::GET, &["apps", "team", "web"])?;
+        assert_eq!((alias.input)(&["apps", "team", "web"], &HashMap::new(), &Value::Null)?, json!({"app": "team/web"}));
+        let reader = crate::authz::Caller::with(crate::authz::gate::Kind::User, "reader", Some(crate::authz::Rights {
+            grants: vec![crate::authz::Grant::parse("runs.read").map_err(bad)?], custom: HashMap::new(),
+        }), None);
+        assert!(crate::authz::gate::decide(&reader, &read.route.authorization, Some(&crate::authz::Scope::Server)));
+        assert!(!crate::authz::gate::decide(&reader, &op.route.authorization, Some(&crate::authz::Scope::Server)));
+        let doc = crate::authz::openapi("test", &crate::ops::listed(true));
+        assert_eq!(doc.pointer("/paths/~1api~1cd~1apps~1{segment_1}~1{segment_2}~1sync/post/x-kiln-operation"), Some(&json!("cd.apps.sync")));
+        Ok(())
+    }
 
     #[test]
     fn keys_read_in_both_forms() {

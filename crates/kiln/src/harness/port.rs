@@ -130,7 +130,7 @@ mod tests {
         fn close<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<(), String>> {
             Box::pin(async move {
                 let hub = &self.port.hub;
-                if hub.harness.close(hub, &self.port.real(name)).await { Ok(()) } else { Err(format!("{name} wasn't closed")) }
+                if hub.harness.try_close(hub, &self.port.real(name)).await.map_err(|error| format!("{name} close was not accepted: {error:#}"))? { Ok(()) } else { Err(format!("{name} wasn't found")) }
             })
         }
         fn say(&self, text: &str) -> Command {
@@ -164,6 +164,7 @@ mod tests {
             let mut hubs: std::collections::VecDeque<Arc<Hub>> = hubs.into_iter().collect::<anyhow::Result<_>>()?;
             // Each takes what its own sessions say (their inboxes' answers among it), as a server does.
             for hub in &hubs {
+                crate::harness::registry::Registry::initialize_local(hub).await?;
                 let h = Arc::clone(hub);
                 crate::rt::spawn(async move {
                     let _ = crate::harness::registry::Registry::run_local(h).await;

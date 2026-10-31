@@ -20,7 +20,7 @@ use aws_lc_rs::rand::SystemRandom;
 use aws_lc_rs::rsa::KeyPair;
 use aws_lc_rs::signature::RSA_PKCS1_SHA256;
 use base64::Engine as _;
-use rusqlite::{OptionalExtension as _, params};
+use crate::sql::{OptionalExtension as _, params};
 use serde_json::{Value, json};
 
 use super::{Author, ChangeRef, ChangeState, CommitError, CommitStatus, Committed, Push, Reader};
@@ -686,8 +686,8 @@ pub async fn checks_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
                         tracing::warn!(run = %id, error = %format!("{e:#}"), "GitHub's check run didn't follow the run");
                     }
                 }
-                Err(async_broadcast::RecvError::Overflowed(_)) => reconcile(&hub).await,
-                Err(async_broadcast::RecvError::Closed) => return Ok(()),
+                Err(crate::bus::RecvError::Overflowed(_)) => reconcile(&hub).await,
+                Err(crate::bus::RecvError::Closed | crate::bus::RecvError::Unavailable(_)) => return Ok(()),
             },
             () = crate::rt::sleep(Duration::from_secs(60)).fuse() => reconcile(&hub).await,
         }

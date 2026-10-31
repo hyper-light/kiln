@@ -70,6 +70,12 @@ changes and admission under contention. Nothing calls `sup::jitter` any more.
 
 **G2. The old version may not run on today's data.**
 
+The SQLite-to-Amphora format transition additionally needs the directory pathname fence and
+supervised offline protocol in [the cutover train](trains/unification-sql-cutover.md). An epoch
+only inside Amphora cannot fence an older SQLite owner. Unknown schema or configuration
+compatibility holds image-only rollback, even when the new version stopped answering health.
+
+
 - **Design:** schema epochs, and every schema change goes through migrations.
   - **Every change is a migration.** All DDL lives in `store/migrations.rs`. A test fails the
     build if `ALTER TABLE` or `CREATE TABLE` appears anywhere else (group.rs:749 moves into a

@@ -156,7 +156,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// key, the file the owner's alone).
 pub struct Targets {
     path: PathBuf,
-    master: PathBuf,
+    master: crate::secrets::crypto::Master,
     all: Mutex<BTreeMap<String, Target>>,
 }
 
@@ -165,12 +165,12 @@ fn aad(name: &str) -> Vec<u8> {
 }
 
 impl Targets {
-    pub fn open(dir: &Path, master: &Path) -> Self {
+    pub(crate) fn open(dir: &Path, master: crate::secrets::crypto::Master) -> Self {
         let path = dir.join("scrapes.json");
         let mut all: BTreeMap<String, Target> = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         for (name, t) in &mut all {
             if let Some(s) = t.bearer.as_deref().and_then(|s| s.strip_prefix(SEALED)) {
-                t.bearer = match unseal(master, name, s) {
+                t.bearer = match unseal(&master, name, s) {
                     Ok(plain) => Some(plain),
                     Err(e) => {
                         tracing::warn!(target = %name, error = %format!("{e:#}"), "a scrape target's token does not open: give it again");
@@ -179,7 +179,7 @@ impl Targets {
                 };
             }
         }
-        Self { path, master: master.to_owned(), all: Mutex::new(all) }
+        Self { path, master, all: Mutex::new(all) }
     }
 
     pub fn list(&self) -> Vec<(String, Target)> {
@@ -215,7 +215,7 @@ impl Targets {
         let mut sealed = all.clone();
         for (name, t) in &mut sealed {
             if let Some(plain) = t.bearer.as_deref() {
-                let (ct, nonce) = crate::ci::secrets::seal_with(&self.master, plain.as_bytes(), &aad(name))?;
+                let (ct, nonce) = self.master.seal(plain.as_bytes(), &aad(name))?;
                 let b64 = base64::engine::general_purpose::STANDARD_NO_PAD;
                 t.bearer = Some(format!("{SEALED}{}:{}", b64.encode(nonce), b64.encode(ct)));
             }
@@ -225,10 +225,10 @@ impl Targets {
     }
 }
 
-fn unseal(master: &Path, name: &str, s: &str) -> anyhow::Result<String> {
+fn unseal(master: &crate::secrets::crypto::Master, name: &str, s: &str) -> anyhow::Result<String> {
     let b64 = base64::engine::general_purpose::STANDARD_NO_PAD;
     let (nonce, ct) = s.split_once(':').ok_or_else(|| anyhow::anyhow!("not a sealed token"))?;
-    let plain = crate::ci::secrets::open_with(master, &b64.decode(ct)?, &b64.decode(nonce)?, &aad(name))?;
+    let plain = master.open( &b64.decode(ct)?, &b64.decode(nonce)?, &aad(name))?;
     Ok(String::from_utf8(plain)?)
 }
 
@@ -514,11 +514,11 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let master = dir.path().join("master.key");
         std::fs::write(&master, [7u8; 32])?;
-        let ts = Targets::open(dir.path(), &master);
+        let ts = Targets::open(dir.path(), crate::secrets::crypto::Master::from_existing(&master)?);
         ts.put("node", Target { bearer: Some("s3cret".into()), ..target("http://h:9100/metrics") }).map_err(anyhow::Error::msg)?;
         let raw = std::fs::read_to_string(dir.path().join("scrapes.json"))?;
         assert!(!raw.contains("s3cret") && raw.contains(SEALED), "{raw}");
-        assert_eq!(Targets::open(dir.path(), &master).get("node").and_then(|t| t.bearer), Some("s3cret".into()));
+        assert_eq!(Targets::open(dir.path(), crate::secrets::crypto::Master::from_existing(&master)?).get("node").and_then(|t| t.bearer), Some("s3cret".into()));
         // Given again without it, the token stays.
         ts.put("node", target("http://h:9100/metrics")).map_err(anyhow::Error::msg)?;
         assert_eq!(ts.get("node").and_then(|t| t.bearer), Some("s3cret".into()));

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use kiln_ci::expr::Dialect;
 use kiln_ci::wf::diag::StoredDiag;
 use kiln_ci::wf::{self, FileKind, GithubWorkflows, Workflow};
-use rusqlite::{OptionalExtension, params};
+use crate::sql::{OptionalExtension, params};
 
 use crate::gitops::{self, LS_REMOTE_TIMEOUT};
 use crate::hub::Hub;
@@ -53,12 +53,11 @@ pub fn ref_ok(r: &str) -> bool {
 /// mirror doesn't know it. `None` when the repository has no such ref.
 pub async fn resolve(hub: &Hub, repo: &Repo, r: &str) -> anyhow::Result<Option<String>> {
     anyhow::ensure!(ref_ok(r), "`{r}` is not a branch, tag or commit");
-    let path = gitops::mirror_path(hub, &repo.name);
-    let p = path.to_string_lossy().to_string();
     for fetch in [false, true] {
-        if fetch {
-            gitops::sync_mirror(hub, repo).await?;
-        }
+        // U08: a cold sync publishes a canonical mirror behind the legacy discovery entry.
+        // Keep the mirror the fetch returned, rather than retrying the old directory.
+        let path = if fetch { gitops::sync_mirror(hub, repo).await? } else { gitops::mirror_path(hub, &repo.name) };
+        let p = path.to_string_lossy().to_string();
         if !path.join("HEAD").exists() {
             continue;
         }
@@ -97,7 +96,28 @@ pub async fn load(hub: &Hub, repo: &Repo, sha: &str) -> anyhow::Result<Commit> {
     let src = Mirror { hub, repo, dir: mirror.to_string_lossy().into_owned() };
     // The repository's own setting, else the server's (W02-R02).
     let setting = super::repo_config::load(hub, repo).await.github_workflows.unwrap_or(hub.cfg.ci.github_workflows);
-    load_from(&src, sha, setting).await
+    let mut commit = load_from(&src, sha, setting).await?;
+    // U02: autodetection supplies YAML to the same front end. An explicit runnable workflow,
+    // including one with errors, takes precedence: invalid input never falls back to a generator.
+    if hub.cfg.gitops.auto_pipelines && !commit.workflows.iter().any(|l| l.runs) {
+        let root = gitops::run_git(hub, &["-C", &src.dir, "ls-tree", "--name-only", sha], LS_REMOTE_TIMEOUT).await?;
+        let files: Vec<String> = String::from_utf8_lossy(&root).lines().map(str::to_owned).collect();
+        if let Some(yaml) = crate::autodetect::pipeline_for(&files) {
+            let path = ".kiln/auto.yaml";
+            let key = crate::util::sha256_hex(yaml.as_bytes());
+            let loaded = match src.cached(path, &key).await? {
+                Some(l) => l,
+                None => {
+                    let (workflow, diags) = crate::rt::blocking(move || wf::parse_workflow(path, &yaml, Dialect::Kiln)).await?;
+                    let l = Loaded { path: path.into(), dialect: Dialect::Kiln, runs: true, workflow, diagnostics: stored(&diags) };
+                    src.remember(&key, &l).await?;
+                    l
+                }
+            };
+            commit.workflows.push(loaded);
+        }
+    }
+    Ok(commit)
 }
 
 /// [`load`], reading through `src`.
@@ -224,4 +244,57 @@ async fn remember(hub: &Hub, repo: &str, key: &str, l: &Loaded) -> anyhow::Resul
             Ok(())
         })
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> anyhow::Result<String> {
+        let out = std::process::Command::new("git").arg("-C").arg(dir).args(["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false"]).args(args).output()?;
+        anyhow::ensure!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+    }
+
+    /// U02, W02-R06: generated YAML uses the same persisted workflow model, and an invalid
+    /// explicit workflow suppresses autodetection rather than silently replacing it.
+    #[test]
+    fn u02_autodetection_and_explicit_workflows_share_the_loader() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname='fixture'\nversion='0.1.0'\n")?;
+            git(dir.path(), &["init", "-q", "-b", "main"])?;
+            git(dir.path(), &["add", "."])?;
+            git(dir.path(), &["commit", "-qm", "project"])?;
+            let sha = git(dir.path(), &["rev-parse", "HEAD"])?;
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let repo = hub.store.upsert_repo(Repo {
+                id: crate::util::new_id(), name: "acme/generated".into(), clone_url: format!("file://{}", dir.path().display()),
+                branches: Vec::new(), poll_seconds: 60, enabled: true, created_at: 0, last_polled_at: None, last_error: None,
+                mode: "upstream".into(), default_branch: None, mirror: None,
+            }).await?;
+            // U08: resolve's own cache-miss fetch must read the new physical mirror.
+            assert!(!gitops::mirror_path(&hub, &repo.name).join("HEAD").exists(), "the first resolution starts without a mirror");
+            assert_eq!(resolve(&hub, &repo, "main").await?, Some(sha.clone()), "a cold existing branch resolves on its first request");
+            let generated = load(&hub, &repo, &sha).await?;
+            let workflow = generated.workflows.first().ok_or_else(|| anyhow::anyhow!("no generated workflow"))?;
+            anyhow::ensure!(!workflow.has_errors(), "{:?}", workflow.diagnostics);
+            assert_eq!(workflow.path, ".kiln/auto.yaml");
+            assert!(workflow.workflow.as_ref().is_some_and(|w| w.job("rust").is_some()));
+            assert_eq!(load(&hub, &repo, &sha).await?.workflows.len(), 1);
+            let count: i64 = hub.store.call(|c| Ok(c.query_row("SELECT count(*) FROM ci_workflows WHERE path = '.kiln/auto.yaml'", [], |r| r.get(0))?)).await?;
+            assert_eq!(count, 1, "generated workflow content is recorded once");
+
+            std::fs::create_dir(dir.path().join(".kiln"))?;
+            std::fs::write(dir.path().join(".kiln/ci.yaml"), "on: push\njobs: invalid\n")?;
+            git(dir.path(), &["add", "."])?;
+            git(dir.path(), &["commit", "-qm", "explicit workflow"])?;
+            let sha = git(dir.path(), &["rev-parse", "HEAD"])?;
+            let explicit = load(&hub, &repo, &sha).await?;
+            assert_eq!(explicit.workflows.len(), 1);
+            assert_eq!(explicit.workflows.first().map(|l| l.path.as_str()), Some(".kiln/ci.yaml"));
+            assert!(explicit.workflows.first().is_some_and(Loaded::has_errors));
+            Ok(())
+        })
+    }
 }

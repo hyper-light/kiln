@@ -1,0 +1,5 @@
+[toolchain]
+# U05/U19: match Amphora's required compiler on local, native and CI builds.
+channel = "1.99.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

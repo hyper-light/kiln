@@ -371,7 +371,7 @@ pub async fn collaborator_permission(s: &Site<'_>, login: &str) -> Result<Respon
             .hub
             .store
             .call(move |c| {
-                use rusqlite::OptionalExtension as _;
+                use crate::sql::OptionalExtension as _;
                 Ok(c.query_row("SELECT id FROM users WHERE name = ?1 COLLATE NOCASE AND disabled_at IS NULL", [&name], |r| r.get(0)).optional()?)
             })
             .await

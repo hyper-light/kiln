@@ -122,6 +122,9 @@ pub async fn wait_pid_exit<S>(_pid: u32, mut try_wait: impl FnMut() -> io::Resul
 
 /// Run to completion and capture stdout/stderr, killing the job if it outlives `timeout`.
 pub async fn output(mut cmd: Command, timeout: Duration) -> anyhow::Result<Output> {
+    if let Some(execution) = crate::runner::processes::current() {
+        return crate::runner::processes::output(cmd, timeout, execution).await;
+    }
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = spawn_job(&mut cmd, false).with_context(|| format!("spawn {:?}", cmd.get_program()))?;
     let out = collect("kiln-pipe", child.inner().stdout.take())?;
@@ -145,6 +148,9 @@ pub async fn output(mut cmd: Command, timeout: Duration) -> anyhow::Result<Outpu
 /// Stream a child's stdout (stderr discarded). The stream ends at EOF; if the consumer goes away
 /// first, the child's job is killed. The child is reaped either way.
 pub fn stdout_stream(mut cmd: Command) -> anyhow::Result<async_channel::Receiver<Bytes>> {
+    if let Some(execution) = crate::runner::processes::current() {
+        return crate::runner::processes::stdout_stream(cmd, &execution);
+    }
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = spawn_job(&mut cmd, false).with_context(|| format!("spawn {:?}", cmd.get_program()))?;
     let out = child.inner().stdout.take().context("no stdout pipe")?;
@@ -179,13 +185,15 @@ pub struct Running {
     pub output: async_channel::Receiver<Vec<u8>>,
     /// Resolves with the exit code once the child is reaped.
     pub exit: oneshot::Receiver<Option<i32>>,
-    job: Arc<Mutex<GroupChild>>,
+    job: Option<Arc<Mutex<GroupChild>>>,
+    pub(crate) owned: Option<Arc<crate::runner::processes::Group>>,
 }
 
 impl Running {
     /// Kill everything left in the child's job (best effort).
     pub fn kill_group(&self) {
-        let _ = self.job.lock().kill();
+        if let Some(group) = &self.owned { group.kill(); }
+        else if let Some(job) = &self.job { let _ = job.lock().kill(); }
     }
 
     /// The exit code (`None` when the wait failed).
@@ -196,6 +204,9 @@ impl Running {
 
 /// Spawn `cmd` in a new job object with piped output.
 pub fn spawn_group(mut cmd: Command) -> anyhow::Result<Running> {
+    if let Some(execution) = crate::runner::processes::current() {
+        return crate::runner::processes::spawn_group(cmd, &execution);
+    }
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = spawn_job(&mut cmd, true).with_context(|| format!("spawn {:?}", cmd.get_program()))?;
     let pgid = i32::try_from(child.id()).unwrap_or(0);
@@ -218,13 +229,25 @@ pub fn spawn_group(mut cmd: Command) -> anyhow::Result<Running> {
         let code = wait_shared(&waiter).await.ok().and_then(|s| s.code());
         let _ = exit_tx.send(code);
     });
-    Ok(Running { pgid, output: rx, exit: exit_rx, job })
+    Ok(Running { pgid, output: rx, exit: exit_rx, job: Some(job), owned: None })
+}
+
+pub(crate) fn from_contained(duplex: Duplex, owned: Arc<crate::runner::processes::Group>) -> Running {
+    duplex.stdin.close();
+    let (tx, rx) = async_channel::bounded(64);
+    for source in [duplex.stdout, duplex.stderr] {
+        let tx = tx.clone();
+        crate::rt::spawn(async move { while let Ok(chunk) = source.recv().await { if tx.send(chunk).await.is_err() { return } } });
+    }
+    drop(tx);
+    Running { pgid: i32::try_from(duplex.pid).unwrap_or(0), output: rx, exit: duplex.exit, job: None, owned: Some(owned) }
 }
 
 /// Windows has no SIGTERM for a job: kill it at once, then wait up to `grace` for the reap.
 pub async fn terminate_group(running: &mut Running, grace: Duration) {
     running.kill_group();
     let _ = crate::rt::timeout(grace, running.wait()).await;
+    if let Some(owned) = &running.owned { owned.stop().await; }
 }
 
 /// GitHub's cancel sequence has no Windows equivalent for a job object: kill it, then wait.
@@ -280,6 +303,7 @@ pub struct Duplex {
 enum Held {
     Own(GroupChild),
     Agent(std::process::Child, crate::os::contain::Group),
+    Leased(crate::os::contain::LeasedChild, crate::os::contain::Group),
 }
 
 impl Held {
@@ -292,6 +316,7 @@ impl Held {
                 g.kill();
                 let _ = c.kill();
             }
+            Held::Leased(c, g) => { g.kill(); let _ = c.kill(); }
         }
     }
 
@@ -299,6 +324,7 @@ impl Held {
         match self {
             Held::Own(c) => c.try_wait(),
             Held::Agent(c, _) => c.try_wait(),
+            Held::Leased(c, _) => c.try_wait(),
         }
     }
 }
@@ -323,6 +349,12 @@ impl Detached {
 }
 
 impl Duplex {
+    /// Best-effort local cleanup inside a separately owned physical executor.
+    pub(crate) fn group_killer(&self) -> Arc<dyn Fn() + Send + Sync> {
+        let job = Arc::clone(&self.job);
+        Arc::new(move || job.lock().kill())
+    }
+
     /// Windows has no SIGTERM for a job: kill it at once.
     pub fn terminate(&self, _grace: Duration) {
         self.job.lock().kill();
@@ -357,8 +389,22 @@ pub fn spawn_duplex_in(mut cmd: Command, group: Option<&crate::os::contain::Grou
     serve(pid, stdin, stdout, stderr, Held::Agent(child, group.clone()))
 }
 
+/// U01: the process is born in its reservation's named job, without a suspended orphan gap.
+pub(crate) fn spawn_duplex_leased(cmd: Command, group: &crate::os::contain::Group) -> anyhow::Result<Duplex> {
+    let mut child = group.spawn_leased(cmd)?;
+    let (stdin, stdout, stderr) = (child.stdin.take(), child.stdout.take(), child.stderr.take());
+    serve(child.pid, stdin, stdout, stderr, Held::Leased(child, group.clone()))
+}
+
 /// Spawn `cmd` with piped stdin/stdout/stderr in its own job.
-pub fn spawn_duplex(mut cmd: Command) -> anyhow::Result<Duplex> {
+pub fn spawn_duplex(cmd: Command) -> anyhow::Result<Duplex> {
+    if let Some(execution) = crate::runner::processes::current() {
+        return crate::runner::processes::spawn_duplex(cmd, &execution);
+    }
+    spawn_duplex_raw(cmd)
+}
+
+pub(crate) fn spawn_duplex_raw(mut cmd: Command) -> anyhow::Result<Duplex> {
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = spawn_job(&mut cmd, true).with_context(|| format!("spawn {:?}", cmd.get_program()))?;
     let pid = child.id();

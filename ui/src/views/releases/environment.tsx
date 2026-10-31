@@ -10,7 +10,23 @@ import { Link, useNavigate, useParams } from "@/lib/router";
 import { ArrowRightLeft, Plus, Snowflake, Sun, Trash2 } from "lucide-react";
 
 import { api } from "@/api/client";
-import { boardHref, checkName, deployApi, describe, diffsOf, providerName, releaseAppHref, releaseHref, releaseRepoUrl, type Check, type CheckSpec, type Environment, type Gates, type Move, type ProvenanceRequirement } from "@/api/deploy";
+import type { Move } from "@/api/wire";
+import {
+  boardHref,
+  checkName,
+  deployApi,
+  describe,
+  diffsOf,
+  providerName,
+  releaseAppHref,
+  releaseHref,
+  releaseRepoUrl,
+  type Check,
+  type CheckSpec,
+  type Environment,
+  type Gates,
+  type ProvenanceRequirement,
+} from "@/api/deploy";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/dialog";
 import { Loadable } from "@/components/ui/loading";
@@ -115,6 +131,7 @@ function Settings({ e }: { e: Environment }) {
   const [windows, setWindows] = React.useState<WindowRow[]>(
     (g.windows ?? []).map((w) => ({ kind: w.allow ? "allow" : "deny", cron: w.allow ?? w.deny ?? "", duration: w.duration, timezone: w.timezone ?? "" })),
   );
+  const [capacity, setCapacity] = React.useState(g.concurrency_limit ? String(g.concurrency_limit) : "");
   const [concurrency, setConcurrency] = React.useState(e.concurrency);
   const [agents, setAgents] = React.useState(e.agents);
   const [ownersRelease, setOwnersRelease] = React.useState(e.owners?.release ?? false);
@@ -124,15 +141,17 @@ function Settings({ e }: { e: Environment }) {
   const onHost = e.release_repo.host !== "kiln";
   const count = Number(approvals);
   const wrong =
-    !Number.isInteger(count) || count < 0
-      ? "Approvals: a whole number, 0 for none."
-      : pulls && count > 0
-        ? "With pull requests, merging one is the approval: set approvals to 0 (who may merge is the branch's protection on its host)."
-      : windows.some((w) => !w.cron.trim() || !w.duration.trim())
-        ? "Each window needs its schedule and how long it lasts."
-        : external.some((r) => !r.name.trim() || (r.kind === "http" ? !r.url.trim() : !r.repository.trim() || !r.workflow.trim()))
-          ? "Each check needs its name, and its URL, or its repository and workflow."
-          : null;
+    capacity.trim() && (!Number.isInteger(Number(capacity)) || Number(capacity) < 1)
+      ? "Shared capacity: a whole number, 1 or more."
+      : !Number.isInteger(count) || count < 0
+        ? "Approvals: a whole number, 0 for none."
+        : pulls && count > 0
+          ? "With pull requests, merging one is the approval: set approvals to 0 (who may merge is the branch's protection on its host)."
+          : windows.some((w) => !w.cron.trim() || !w.duration.trim())
+            ? "Each window needs its schedule and how long it lasts."
+            : external.some((r) => !r.name.trim() || (r.kind === "http" ? !r.url.trim() : !r.repository.trim() || !r.workflow.trim()))
+              ? "Each check needs its name, and its URL, or its repository and workflow."
+              : null;
   const setWindow = (i: number, patch: Partial<WindowRow>) => setWindows((ws) => ws.map((w, j) => (j === i ? { ...w, ...patch } : w)));
   const setCheck = (i: number, patch: Partial<CheckRow>) => setExternal((xs) => xs.map((x, j) => (j === i ? { ...x, ...patch } : x)));
   const save = async () => {
@@ -140,6 +159,7 @@ function Settings({ e }: { e: Environment }) {
     const gates: Gates = {
       // What this form doesn't show is kept as it is.
       ...g,
+      concurrency_limit: capacity.trim() ? Number(capacity) : undefined,
       after: names(after),
       soak: soak.trim() || undefined,
       promote: promote === "auto" && names(after).length ? "auto" : undefined,
@@ -168,6 +188,13 @@ function Settings({ e }: { e: Environment }) {
     <Panel eyebrow="Settings" title="How releases go here" description="Each release passes these gates in order; a person changes what agents may do.">
       <div className="cd-new-grid">
         <TextField label="After" placeholder="staging" value={after} spellCheck={false} onChange={(ev) => setAfter(ev.target.value)} hint="Environments a version runs in first." />
+        <TextField
+          label="Shared capacity"
+          value={capacity}
+          onChange={(ev) => setCapacity(ev.target.value)}
+          inputMode="numeric"
+          hint="Active protected actions across bound CI jobs and releases; empty for unlimited."
+        />
         <TextField label="Soak" placeholder="30m" value={soak} spellCheck={false} onChange={(ev) => setSoak(ev.target.value)} hint="How long it runs there first." />
         <TextField label="Approvals" inputMode="numeric" value={approvals} onChange={(ev) => setApprovals(ev.target.value)} hint="How many people approve; 0 for none." />
         <TextField label="Reviewers" placeholder="ada, grace" value={reviewers} onChange={(ev) => setReviewers(ev.target.value)} hint="Who may approve; anyone who approves releases when empty." />
@@ -193,8 +220,22 @@ function Settings({ e }: { e: Environment }) {
       </div>
       {provenance && (
         <div className="cd-new-grid">
-          <TextField label="Built by" placeholder=".kiln/build.yaml" value={provWorkflows} spellCheck={false} onChange={(ev) => setProvWorkflows(ev.target.value)} hint="The workflows it may come from; any when empty." />
-          <TextField label="From branches" placeholder="main" value={provBranches} spellCheck={false} onChange={(ev) => setProvBranches(ev.target.value)} hint="The branches it may be built from; any when empty." />
+          <TextField
+            label="Built by"
+            placeholder=".kiln/build.yaml"
+            value={provWorkflows}
+            spellCheck={false}
+            onChange={(ev) => setProvWorkflows(ev.target.value)}
+            hint="The workflows it may come from; any when empty."
+          />
+          <TextField
+            label="From branches"
+            placeholder="main"
+            value={provBranches}
+            spellCheck={false}
+            onChange={(ev) => setProvBranches(ev.target.value)}
+            hint="The branches it may be built from; any when empty."
+          />
         </div>
       )}
       <div className="rel-windows">
@@ -530,7 +571,13 @@ function DeleteEnvironment({ e }: { e: Environment }) {
   };
   return (
     <>
-      <Button size="sm" variant="ghost-danger" disabled={apps.length > 0} title={apps.length ? `Registered here: ${apps.join(", ")}. Deregister them first.` : undefined} onClick={() => setAsking(true)}>
+      <Button
+        size="sm"
+        variant="ghost-danger"
+        disabled={apps.length > 0}
+        title={apps.length ? `Registered here: ${apps.join(", ")}. Deregister them first.` : undefined}
+        onClick={() => setAsking(true)}
+      >
         <Trash2 /> Delete
       </Button>
       <ConfirmDialog

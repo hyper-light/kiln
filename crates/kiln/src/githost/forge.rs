@@ -107,7 +107,7 @@ impl Held for StoreHeld {
                 .call(move |db| {
                     db.execute(
                         "INSERT INTO review_held (repo, number, author, body, path, line, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                        rusqlite::params![repo, n, c.author, c.body, c.line.as_ref().map(|l| l.path.clone()), c.line.as_ref().map(|l| l.line), at],
+                        crate::sql::params![repo, n, c.author, c.body, c.line.as_ref().map(|l| l.path.clone()), c.line.as_ref().map(|l| l.line), at],
                     )?;
                     Ok(db.last_insert_rowid())
                 })
@@ -124,7 +124,7 @@ impl Held for StoreHeld {
                 .store
                 .call(move |db| {
                     let mut q = db.prepare("SELECT id, author, body, path, line FROM review_held WHERE repo = ?1 AND number = ?2 AND author = ?3 ORDER BY id")?;
-                    let rows = q.query_map(rusqlite::params![repo, n, by], |r| {
+                    let rows = q.query_map(crate::sql::params![repo, n, by], |r| {
                         let (path, line): (Option<String>, Option<u32>) = (r.get(3)?, r.get(4)?);
                         Ok(Comment {
                             id: u64::try_from(r.get::<_, i64>(0)?).unwrap_or_default(),

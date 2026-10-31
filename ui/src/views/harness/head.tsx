@@ -21,7 +21,7 @@ import { modelIn, RunSettings, type RunSettingsProps } from "./run-settings";
 import { NameField, type useAgentActions } from "./actions";
 import { formatThought } from "./signals";
 import { kilnAtWork, kilnSubagentsOf, subagentsAtWork, subagentTasksAtWork, workingThrough } from "./tasks";
-import { harnessSessionsRes, useRes } from "@/lib/data";
+import { useHarnessSessions } from "@/lib/data";
 import "./console.css";
 
 export type BorderState = "active" | "needs" | "stopped" | "finished" | "ready" | "disconnected";
@@ -125,7 +125,7 @@ export function AgentHeader({
   const plan = state?.plan ?? info?.plan;
   const unavailable = status === "disconnected" || conn !== "open";
   // The subagents kiln started for its goals or plan steps at work, beside its harness's own.
-  const everyone = useRes(harnessSessionsRes).data;
+  const everyone = useHarnessSessions().data;
   const kiln = info ? kilnAtWork(kilnSubagentsOf(everyone, info.id)).length : 0;
   const signal = turnSignal(status, conn, state, info, kiln);
   // Stop can use HTTP while its socket reconnects; keep that escape available.

@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use http::StatusCode;
 use kiln_ci::results::{self, Case, Flakiness, Format, Outcome, Seen, quarantine};
-use rusqlite::{OptionalExtension, params};
+use crate::sql::{OptionalExtension, params};
 use serde_json::{Value, json};
 
 use super::services::{blob, cas};
@@ -262,11 +262,15 @@ pub async fn flaky_in_run(hub: &Hub, run: &str) -> anyhow::Result<Vec<String>> {
     let rows: Vec<(String, String, String, i64)> = hub
         .store
         .call(move |c| {
-            let mut st = c.prepare("SELECT k.suite || ' ' || k.name, t.leg_key, t.outcome, t.retried FROM test_results t JOIN test_cases k ON k.repo_id = t.repo_id AND k.id = t.case_id WHERE t.run_id = ?1")?;
+            let mut st = c.prepare("SELECT k.suite || ' ' || k.name, t.leg_key, t.outcome, t.retried FROM test_results t JOIN test_cases k ON k.repo_id = t.repo_id AND k.id = t.case_id WHERE t.run_id = ?1 AND t.attempt = (SELECT attempt FROM runs WHERE id = ?1)")?;
             let rows = st.query_map([&r], |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?)))?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
         .await?;
+    Ok(flaky_rows(rows))
+}
+
+pub(crate) fn flaky_rows(rows: Vec<(String, String, String, i64)>) -> Vec<String> {
     // (passed, failed) per test and leg; a retry's pass is flaky at once.
     let mut seen: BTreeMap<(String, String), (bool, bool)> = BTreeMap::new();
     let mut flaky: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -283,7 +287,7 @@ pub async fn flaky_in_run(hub: &Hub, run: &str) -> anyhow::Result<Vec<String>> {
         }
     }
     flaky.extend(seen.into_iter().filter(|(_, (p, f))| *p && *f).map(|((name, _), _)| name));
-    Ok(flaky.into_iter().collect())
+    flaky.into_iter().collect()
 }
 
 fn flaky_json(f: Option<&Flakiness>) -> Value {

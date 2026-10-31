@@ -7,7 +7,10 @@
 //! (`github.com/hyper-light/kiln`), so a clone over ssh and one over https are the same
 //! repository. One with no remote is a place of its own.
 
+pub(crate) mod control;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use amphora::database::Database;
 use std::path::PathBuf;
 
 use parking_lot::Mutex;
@@ -80,31 +83,31 @@ pub struct Held {
     pub at: i64,
 }
 
-/// Every machine's repositories, as each last said (`<data>/sync/places.json`).
+/// U17: host-affine observations in the shared Database; JSON is read-only import input.
 pub struct Places {
-    file: PathBuf,
+    control: control::Control,
     held: Mutex<BTreeMap<String, Held>>,
+    changing: async_lock::Mutex<()>,
 }
 
 impl Places {
-    pub fn open(file: PathBuf) -> Self {
-        let held = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-        Self { file, held: Mutex::new(held) }
+    pub fn from_database(file: PathBuf, database: Database, host: &str) -> anyhow::Result<Self> {
+        let (control, held) = control::Control::open(database, host, "places", &file, |_| Ok(()))?;
+        Ok(Self { control, held: Mutex::new(held), changing: async_lock::Mutex::new(()) })
     }
 
-    /// What a machine said; true when it changed anything.
-    pub fn heard(&self, machine: &str, r: Repos) -> bool {
+    /// What a machine said, committed before the view changes or work uses its paths.
+    pub async fn heard(&self, machine: &str, r: Repos) -> anyhow::Result<bool> {
         let held = Held { home: r.home, repos: r.repos, error: r.error, at: r.at };
-        let changed = {
-            let mut all = self.held.lock();
-            let same = all.get(machine).is_some_and(|h| Held { at: held.at, ..h.clone() } == held);
-            all.insert(machine.to_owned(), held);
-            !same
-        };
-        if changed {
-            self.save();
-        }
-        changed
+        let machine = machine.to_owned();
+        let _changing = self.changing.lock().await;
+        let (next, changed) = self.control.change_async(move |all: &mut BTreeMap<String, Held>| {
+            let same = all.get(&machine).is_some_and(|h| Held { at: held.at, ..h.clone() } == held);
+            all.insert(machine, held);
+            Ok(!same)
+        }).await?;
+        *self.held.lock() = next;
+        Ok(changed)
     }
 
     /// Each machine's repositories that have a remote, by key (`crate::sync::share`).
@@ -113,10 +116,12 @@ impl Places {
     }
 
     /// A machine kiln forgot.
-    pub fn forget(&self, machine: &str) {
-        if self.held.lock().remove(machine).is_some() {
-            self.save();
-        }
+    pub async fn forget(&self, machine: &str) -> anyhow::Result<()> {
+        let machine = machine.to_owned();
+        let _changing = self.changing.lock().await;
+        let (next, ()) = self.control.change_async(move |all: &mut BTreeMap<String, Held>| { all.remove(&machine); Ok(()) }).await?;
+        *self.held.lock() = next;
+        Ok(())
     }
 
     pub fn of(&self, machine: &str) -> Option<Held> {
@@ -153,12 +158,6 @@ impl Places {
         (whole && plain && out.len() > 1).then(|| out.trim_end_matches(['/', '\\']).to_owned())
     }
 
-    fn save(&self) {
-        let bytes = serde_json::to_vec(&*self.held.lock()).unwrap_or_default();
-        if let Err(e) = super::group::save_atomic(&self.file, &bytes) {
-            tracing::warn!(error = %e, "what machines hold could not be saved");
-        }
-    }
 }
 
 // ------------------------------------------------------------------------------ the one list
@@ -352,7 +351,7 @@ pub async fn now(hub: &crate::hub::Hub) -> anyhow::Result<View> {
         .filter(|a| !a.ephemeral)
         .map(|a| Machine { caps: hub.runner_caps(&a.name), name: a.name, os: a.os, arch: a.arch, labels: a.labels, connected: a.connected })
         .collect();
-    Ok(view(&built, &hub.sync.view(), &machines, &hub.places.all(), hub.tasks.list()))
+    Ok(view(&built, &hub.sync.view(), &machines, &hub.places.all(), hub.tasks.snapshot().await.map_err(anyhow::Error::msg)?))
 }
 
 #[cfg(test)]
@@ -387,11 +386,13 @@ mod tests {
     }
 
     #[test]
-    fn a_path_resolves_on_its_own_machine() {
+    fn a_path_resolves_on_its_own_machine() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
         let dir = std::env::temp_dir().join(format!("kiln-places-{}", crate::util::new_id()));
-        let p = Places::open(dir.join("places.json"));
-        p.heard("mac", Repos { home: "/Users/ada".into(), ..Repos::default() });
-        p.heard("win", Repos { home: "C:\\Users\\ada".into(), ..Repos::default() });
+        let store = crate::store::Store::in_memory()?;
+        let p = Places::from_database(dir.join("places.json"), store.database(), "host-one")?;
+        p.heard("mac", Repos { home: "/Users/ada".into(), ..Repos::default() }).await?;
+        p.heard("win", Repos { home: "C:\\Users\\ada".into(), ..Repos::default() }).await?;
         assert_eq!(p.resolve("mac", "~/Projects/kiln").as_deref(), Some("/Users/ada/Projects/kiln"));
         assert_eq!(p.resolve("win", "~/Projects/kiln").as_deref(), Some("C:\\Users\\ada\\Projects\\kiln"));
         assert_eq!(p.resolve("mac", "/opt/kiln/").as_deref(), Some("/opt/kiln"));
@@ -399,7 +400,17 @@ mod tests {
         assert_eq!(p.resolve("mac", "Projects/kiln"), None, "a whole path or ~");
         assert_eq!(p.resolve("mac", "/a/../etc"), None);
         assert_eq!(p.resolve("mac", "/"), None);
+        let reopened = Places::from_database(dir.join("places.json"), store.database(), "host-one")?;
+        assert_eq!(reopened.resolve("mac", "~/Projects/kiln"), p.resolve("mac", "~/Projects/kiln"));
+        let other = Places::from_database(dir.join("places.json"), store.database(), "host-two")?;
+        assert!(other.all().is_empty(), "U17 inventory is host-affine");
+        p.forget("mac").await?;
+        let reopened = Places::from_database(dir.join("places.json"), store.database(), "host-one")?;
+        assert!(reopened.of("mac").is_none(), "U17 acknowledged removal survives reopening");
+
         let _ = std::fs::remove_dir_all(dir);
+        Ok(())
+        })
     }
 
     fn found(path: &str, origin: Option<&str>, kiln: bool) -> Found {

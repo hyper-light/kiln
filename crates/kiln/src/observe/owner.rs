@@ -46,7 +46,7 @@ const CHANGE_AGAIN: Duration = Duration::from_secs(10);
 /// costs a scan of the series' newest times otherwise (some microseconds a thousand series).
 const RETAIN_EVERY: Duration = Duration::from_secs(60);
 /// How often a runner says how its replica is doing, and the maintenance thread looks unasked.
-const STATUS_EVERY: Duration = Duration::from_secs(10);
+pub(super) const STATUS_EVERY: Duration = Duration::from_secs(10);
 /// How often the room left on observe's disk is looked at, and what is kept free besides what a
 /// cut needs: a cut writes the head as blocks before the log can be trimmed, and blocks hold no
 /// more than the log entries they come of, so room for the log's compactable bytes, and this,
@@ -119,6 +119,24 @@ pub struct Out {
     pub machine: String,
     pub msg: Msg,
     pub bytes: Vec<u8>,
+    pub(super) queued: Option<QueuedStatsd>,
+}
+
+/// A lease on one existing output item, not an ACK/durable receipt. It returns same-owner
+/// queue room on success, refusal, cancellation or drop, including transport-loop restart.
+#[derive(Debug)]
+pub(super) struct QueuedStatsd {
+    input: Option<Sender<Input>>,
+    machine: String,
+    revision: u64,
+    ticket: Arc<()>,
+}
+impl Drop for QueuedStatsd {
+    fn drop(&mut self) {
+        if let Some(input) = &self.input {
+            let _ = input.send(Input::StatsdQueueReleased { machine: self.machine.clone(), revision: self.revision, ticket: self.ticket.clone() });
+        }
+    }
 }
 
 /// What the API shows of the group.
@@ -159,6 +177,8 @@ pub struct View {
     pub digest_at: u64,
     pub verified: Option<(u64, u64)>,
     pub error: Option<String>,
+    /// Canonical listener reconciliation health, independent of bulk telemetry replication.
+    pub metadata_error: Option<String>,
     /// Bytes free on observe's disk, and whether that is too little for the next cut (exporters
     /// are refused until a cut frees room).
     pub disk_free: Option<u64>,
@@ -214,7 +234,10 @@ enum Input {
     Synthetics(Vec<(String, super::synthetics::Test)>),
     RunSynthetic(String),
     /// The server's DogStatsD listeners, all of them: each runner is told those it opens.
-    Statsd(Vec<(String, super::statsd::Listener)>),
+    Statsd(super::statsd::Configuration),
+    StatsdRetry,
+    StatsdQueueReleased { machine: String, revision: u64, ticket: Arc<()> },
+    StatsdUnavailable(String),
     /// A profiler's upload this node's Agent took, to send on to the server
     /// (`super::profiles::pack`'d).
     Profile(Vec<u8>),
@@ -516,9 +539,13 @@ impl Observe {
 
     /// The server's DogStatsD listeners now: each runner is told those it opens, now and when it
     /// connects.
-    pub fn set_statsd(&self, all: Vec<(String, super::statsd::Listener)>) {
-        let _ = self.tx.send(Input::Statsd(all));
+    pub fn set_statsd(&self, configuration: super::statsd::Configuration) {
+        let _ = self.tx.send(Input::Statsd(configuration));
     }
+
+    pub(super) fn retry_statsd(&self) { let _ = self.tx.send(Input::StatsdRetry); }
+    pub(super) fn statsd_unavailable(&self, error: String) { let _ = self.tx.send(Input::StatsdUnavailable(error)); }
+
 
     /// Asks every runner that runs test `name` to run it now.
     pub fn run_synthetic(&self, name: &str) {
@@ -849,6 +876,9 @@ struct Owner {
     scrapes: Vec<(String, super::scrape::Target)>,
     synthetics: Vec<(String, super::synthetics::Test)>,
     statsd: Vec<(String, super::statsd::Listener)>,
+    statsd_revision: Option<u64>,
+    statsd_queued: HashMap<String, (u64, Arc<()>)>,
+    metadata_error: Option<String>,
     log_sources: Vec<(String, super::collect::Source)>,
     pipelines: Vec<super::pipeline::PipelineDef>,
     scanner: (Vec<super::scanner::GroupDef>, String),
@@ -931,6 +961,9 @@ impl Owner {
             scrapes: Vec::new(),
             synthetics: Vec::new(),
             statsd: Vec::new(),
+            statsd_revision: None,
+            statsd_queued: HashMap::new(),
+            metadata_error: None,
             log_sources: Vec::new(),
             pipelines: Vec::new(),
             scanner: (Vec::new(), String::new()),
@@ -1155,13 +1188,22 @@ impl Owner {
                     self.send_synthetics(&machine);
                 }
             }
-            Input::Statsd(all) => {
-                self.statsd = all;
-                let up: Vec<String> = self.up.iter().cloned().collect();
-                for machine in up {
-                    self.send_statsd(&machine);
+            Input::Statsd(configuration) => {
+                if self.statsd_revision.is_some_and(|old| configuration.revision < old) { return; }
+                self.statsd_revision = Some(configuration.revision);
+                self.statsd = configuration.listeners;
+                self.retry_statsd();
+            }
+            Input::StatsdRetry => self.retry_statsd(),
+            Input::StatsdQueueReleased { machine, revision, ticket } => {
+                if self.statsd_queued.get(&machine).is_some_and(|(pending_revision, pending)| *pending_revision == revision && Arc::ptr_eq(pending, &ticket)) {
+                    self.statsd_queued.remove(&machine);
+                    // Coalesce newer canonical revisions behind an already queued/inflight item.
+                    // An unchanged unacked revision retries only on the normal periodic cadence.
+                    if self.up.contains(&machine) && self.statsd_revision.is_some_and(|current| current > revision) { self.send_statsd(&machine); }
                 }
             }
+            Input::StatsdUnavailable(error) => self.metadata_error = Some(error),
             Input::RunSynthetic(name) => {
                 let up: Vec<String> = self.up.iter().filter(|m| self.synthetics.iter().any(|(n, t)| *n == name && t.run_by(m))).cloned().collect();
                 for machine in up {
@@ -1269,6 +1311,9 @@ impl Owner {
             return;
         }
         self.up.insert(machine.to_owned());
+        // A new selected connection must acknowledge for itself, even if the previous process
+        // accepted the same revision. Hub serializes accepted Status enqueue with Instances.
+        if let Some(status) = self.statuses.get_mut(machine) { status.statsd_revision = None; }
         let member = match self.members.machines.get(machine) {
             Some(&m) => m,
             None => {
@@ -1339,10 +1384,43 @@ impl Owner {
         self.send(machine, Msg::Synthetics { tests }, Vec::new());
     }
 
+    fn retry_statsd(&mut self) {
+        self.metadata_error = None;
+        // Canonical desired state remains owed through queue/network loss. A revision ACK from
+        // the selected current connection (Hub admission) suppresses only redundant resend.
+        let up: Vec<String> = self.up.iter().cloned().collect();
+        for machine in up {
+            let remote = self.statuses.get(&machine).and_then(|s| s.statsd_revision);
+            if remote.zip(self.statsd_revision).is_some_and(|(remote, local)| remote > local) {
+                tracing::debug!(%machine, ?remote, local = ?self.statsd_revision, "runner reports a higher listener revision; canonical Records remains authoritative");
+            }
+            if remote.is_none() || remote != self.statsd_revision { self.send_statsd(&machine); }
+        }
+    }
+
     /// Tells `machine` the DogStatsD listeners it opens.
     fn send_statsd(&mut self, machine: &str) {
+        // Never enqueue invented empty state before strict canonical initialization. One pending
+        // item per destination coalesces arbitrarily many revisions/cadences without cloning them.
+        let Some(revision) = self.statsd_revision else { return };
+        if self.statsd_queued.contains_key(machine) { return; }
         let listeners: Vec<(String, super::statsd::Listener)> = self.statsd.iter().filter(|(_, l)| l.read_by(machine)).cloned().collect();
-        self.send(machine, Msg::Statsd { listeners }, Vec::new());
+        let ticket = Arc::new(());
+        // Register the actual item's lifetime before try_send can publish/drop its receipt.
+        // Reconnect leaves this lease intact; stale feedback cannot clear another attempt at
+        // the same canonical revision, because its Arc allocation is still held by that feedback.
+        self.statsd_queued.insert(machine.to_owned(), (revision, ticket.clone()));
+        let queued = QueuedStatsd { input: Some(self.input.clone()), machine: machine.to_owned(), revision, ticket: ticket.clone() };
+        let item = Out { machine: machine.to_owned(), msg: Msg::Statsd { listeners, revision: Some(revision) }, bytes: Vec::new(), queued: Some(queued) };
+        match self.out.try_send(item) {
+            Ok(()) => {}
+            Err(error) => {
+                if self.statsd_queued.get(machine).is_some_and(|(_, pending)| Arc::ptr_eq(pending, &ticket)) { self.statsd_queued.remove(machine); }
+                // It never occupied queue room, so no release event/retry loop is necessary.
+                let mut item = error.into_inner();
+                if let Some(queued) = item.queued.as_mut() { queued.input = None; }
+            }
+        }
     }
 
     /// Tells `machine` the log sources it reads.
@@ -1592,9 +1670,9 @@ impl Owner {
                     r.run_now(&name);
                 }
             }
-            Msg::Statsd { listeners } => {
+            Msg::Statsd { listeners, revision } => {
                 if let Some(s) = super::statsd::get() {
-                    s.set(&listeners);
+                    s.set(&listeners, revision);
                 }
             }
             Msg::Write { .. } | Msg::Status(_) | Msg::Profile { .. } => {}
@@ -1628,7 +1706,7 @@ impl Owner {
     // ------------------------------------------------------------------------------ both
 
     fn send(&self, machine: &str, msg: Msg, bytes: Vec<u8>) {
-        let _ = self.out.try_send(Out { machine: machine.to_owned(), msg, bytes });
+        let _ = self.out.try_send(Out { machine: machine.to_owned(), msg, bytes, queued: None });
     }
 
     /// A profiler's upload sent on to the server (kept here, on the server): one the server is not
@@ -1892,12 +1970,13 @@ impl Owner {
         s.collect = super::collect::get().map(|c| c.states()).unwrap_or_default();
         s.synthetics = super::synthetics::runner().map(|r| r.states()).unwrap_or_default();
         s.statsd = super::statsd::get().map(|r| r.states()).unwrap_or_default();
+        s.statsd_revision = super::statsd::get().and_then(|r| r.revision());
         s
     }
 
     fn make_view(&self) -> View {
         let (waiting, _) = self.batcher.backlog();
-        let mut v = View { role: if self.is_server() { "server" } else { "runner" }, waiting, dropped: self.batcher.dropped + self.admission.refused.load(Ordering::Relaxed), written: self.batcher.written, ahead: self.batcher.ahead, error: self.error.clone(), ..View::default() };
+        let mut v = View { role: if self.is_server() { "server" } else { "runner" }, waiting, dropped: self.batcher.dropped + self.admission.refused.load(Ordering::Relaxed), written: self.batcher.written, ahead: self.batcher.ahead, error: self.error.clone(), metadata_error: self.metadata_error.clone(), ..View::default() };
         if let Some(rep) = &self.rep {
             let store = rep.r.machine().read();
             v.member = rep.r.id();
@@ -2129,6 +2208,78 @@ fn dir_bytes(dir: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// U06/U14: drive the same canonical refresh + owner retry used by the existing periodic
+    /// transport branch. Discard its Quiver hint and saturate its real output queue so the first
+    /// changed configuration is lost; the next periodic step still delivers the committed state.
+    #[test]
+    fn u06_listener_periodic_reconciliation_survives_lost_wake_and_first_frame() -> anyhow::Result<()> {
+        use futures::FutureExt as _;
+        use kiln_seams::records::SimRecords;
+        let (dir, initial, committed, fresh, latest, listener) = crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let records = Arc::new(SimRecords::new());
+            let bus: Arc<dyn kiln_seams::Bus> = Arc::new(kiln_seams::bus::SimBus::default());
+            let kept = super::super::statsd::Listeners::open(records, dir.path(), super::super::statsd::ImportAuthority::server(None), Some(bus)).await?;
+            let mut wake = kept.subscribe().ok_or_else(|| anyhow::anyhow!("metadata hint not available"))?;
+            let initial = kept.list().await?;
+            let known = initial.revision;
+            let listener = super::super::statsd::Listener { listen: vec!["udp://127.0.0.1:8125".into()], tags: vec![], histogram_aggregates: None, histogram_percentiles: None, on: "box".into() };
+            let committed = kept.put("canonical", listener.clone()).await?;
+            wake.recv().now_or_never().ok_or_else(|| anyhow::anyhow!("commit failed to publish a wake"))??; // Deliberately lost.
+            let fresh = kept.refresh(Some(known)).await?.ok_or_else(|| anyhow::anyhow!("periodic probe missed commit"))?;
+            anyhow::ensure!(fresh.revision == committed.revision);
+            anyhow::ensure!(kept.refresh(Some(committed.revision)).await?.is_none());
+            let latest = kept.delete("canonical").await?.ok_or_else(|| anyhow::anyhow!("canonical listener disappeared"))?;
+            Ok((dir, initial, committed, fresh, latest, listener))
+        })?;
+        let (output, received) = async_channel::bounded(1);
+        let (input, input_rx) = std::sync::mpsc::channel();
+        let settings = Settings { dir: dir.path().join("observe"), role: Role::Server { key: "fixture".into() }, metrics_retention: Duration::from_secs(60), logs_retention: Duration::from_secs(60), spans_retention: Duration::from_secs(60), max_series: 0 };
+        let mut owner = Owner::new(settings, Arc::new(Mutex::new(None)), Arc::new(Mutex::new(View::default())), output, input, Arc::new(Admission::default()), Feed::new(), None);
+        owner.send_statsd("box");
+        anyhow::ensure!(received.try_recv().is_err(), "uninitialized owner queued invented empty configuration");
+        owner.input(Input::Statsd(initial));
+        owner.input(Input::Up { machine: "box".into(), up: true }); // Member occupies output.
+        owner.input(Input::Statsd(fresh)); // First changed frame cannot enter full queue.
+        anyhow::ensure!(matches!(received.try_recv()?.msg, Msg::Member { .. }));
+        anyhow::ensure!(received.try_recv().is_err(), "first config did not actually drop");
+        // The unchanged-revision periodic probe above avoided reloading values; this same
+        // owner hook still owes the frame after its first send was lost.
+        owner.input(Input::StatsdRetry);
+        let frame = received.try_recv()?;
+        anyhow::ensure!(matches!(frame.msg, Msg::Statsd { ref listeners, revision: Some(rev) } if rev == committed.revision && *listeners == vec![("canonical".into(), listener)]));
+        let latest_revision = latest.revision;
+        owner.input(Input::Statsd(latest)); // A newer canonical commit coalesces behind this item.
+        for _ in 0..4 { owner.input(Input::StatsdRetry); }
+        anyhow::ensure!(received.try_recv().is_err(), "queued/inflight metadata was duplicated");
+        drop(frame); // Same RAII feedback as a canceled/no-peer/completed actual send.
+        while let Ok(input) = input_rx.try_recv() { owner.input(input); }
+        let newest = received.try_recv()?;
+        anyhow::ensure!(matches!(newest.msg, Msg::Statsd { ref listeners, revision: Some(rev) } if rev == latest_revision && listeners.is_empty()));
+        let old_ticket = newest.queued.as_ref().map(|queued| queued.ticket.clone()).ok_or_else(|| anyhow::anyhow!("missing queued receipt"))?;
+        drop(newest);
+        while let Ok(input) = input_rx.try_recv() { owner.input(input); }
+        owner.input(Input::StatsdRetry);
+        let retry = received.try_recv()?;
+        // Delayed feedback from the previous attempt must not release a newer attempt at the
+        // SAME canonical revision, including across reconnect/cancellation.
+        owner.input(Input::StatsdQueueReleased { machine: "box".into(), revision: latest_revision, ticket: old_ticket });
+        owner.input(Input::StatsdRetry);
+        anyhow::ensure!(received.try_recv().is_err(), "stale release cleared newer same-revision queue ownership");
+        drop(retry);
+        while let Ok(input) = input_rx.try_recv() { owner.input(input); }
+        owner.heard_from_runner("box", Msg::Status(Status { statsd_revision: Some(latest_revision), ..Status::default() }), vec![]);
+        owner.input(Input::StatsdRetry);
+        anyhow::ensure!(received.try_recv().is_err(), "current ACK did not suppress redundant frame");
+        // Reconnect clears only the existing desired-config ACK. The old process's ACK
+        // cannot settle its replacement; old frames are independently gated in Hub.
+        owner.input(Input::Up { machine: "box".into(), up: true });
+        anyhow::ensure!(matches!(received.try_recv()?.msg, Msg::Member { .. }));
+        owner.input(Input::StatsdRetry);
+        anyhow::ensure!(matches!(received.try_recv()?.msg, Msg::Statsd { revision: Some(rev), .. } if rev == latest_revision));
+        Ok(())
+    }
 
     #[test]
     fn spans_read_as_people_say_them() {

@@ -911,8 +911,20 @@ impl Acp {
             self.compact_prompt = Some(m.id.clone());
             core.compacting(None);
         }
-        self.show(core, &m, Delivery::Started);
+        // U17/CP-T3.2: submission is not the agent's acknowledgment of these words.
+        self.show(core, &m, Delivery::Sent);
         self.settle(core);
+    }
+
+    fn prompt_activity(&self, core: &mut Core) {
+        // Session-wide updates acknowledge the main prompt, not concurrent steering requests.
+        // Each steering request is retired by its own native response instead.
+        if let Some(id) = &self.prompting
+            && core.state.delivery.get(id) == Some(&Delivery::Sent)
+        {
+            core.state.delivery.insert(id.clone(), Delivery::Started);
+            core.touch_state();
+        }
     }
 
     fn show(&mut self, core: &mut Core, m: &QueueItem, d: Delivery) {
@@ -1020,6 +1032,14 @@ impl Acp {
         };
         let method = v.get("method").and_then(Value::as_str).map(str::to_owned);
         let params = v.get("params").cloned().unwrap_or(Value::Null);
+        // U17: only this native session can acknowledge its prompt. Older agents omit the id;
+        // those frames retain the established single-session process contract.
+        if matches!(method.as_deref(), Some("session/update" | "session/request_permission"))
+            && params.get("sessionId").and_then(Value::as_str)
+                .zip(self.session.as_deref().or(self.resume.as_deref())).is_some_and(|(incoming, own)| incoming != own)
+        {
+            return;
+        }
         match (method, v.get("id").cloned()) {
             (Some(m), Some(id)) => self.agent_request(core, &m, id, params),
             (Some(m), None) => {
@@ -1313,6 +1333,7 @@ impl Acp {
             core.write(&json!({"jsonrpc": "2.0", "id": rpc, "error": {"code": -32601, "message": format!("kiln does not provide {method}")}}));
             return;
         }
+        self.prompt_activity(core);
         let id = match &rpc {
             Value::String(s) => s.clone(),
             other => other.to_string(),
@@ -1409,6 +1430,7 @@ impl Acp {
                 if text.is_empty() {
                     return;
                 }
+                self.prompt_activity(core);
                 let slot = match kind {
                     "agent_message_chunk" => &mut self.cur_agent,
                     "agent_thought_chunk" => &mut self.cur_thought,
@@ -1447,6 +1469,7 @@ impl Acp {
             "tool_call" | "tool_call_update" => {
                 self.close_streams(core);
                 let Some(tid) = u.get("toolCallId").and_then(Value::as_str).map(str::to_owned) else { return };
+                self.prompt_activity(core);
                 let known = core.get(&tid).and_then(|e| match &e.body {
                     Body::Tool(t) => Some(t.as_ref().clone()),
                     _ => None,
@@ -1927,17 +1950,33 @@ mod tests {
         let prompt = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("session/prompt")).cloned().unwrap_or_default();
         assert_eq!(prompt.pointer("/params/prompt/0/text").and_then(Value::as_str), Some("refactor"));
         let pid = prompt.get("id").cloned().unwrap_or_default();
+        assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Sent));
+        feed(&mut a, &mut core, &[
+            json!({"method": "session/update", "params": {"sessionId": "foreign", "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "another session"}}}}),
+            json!({"id": 99, "method": "session/request_permission", "params": {"sessionId": "foreign", "toolCall": {"toolCallId": "foreign-tool"}}}),
+        ]);
+        assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Sent), "foreign activity cannot consume this session's pending intent");
+        assert!(core.state.approvals.is_empty());
+        assert!(written(&mut core).is_empty());
+        assert!(!core.events().any(|event| matches!(&event.body, Body::Assistant { text, .. } if text == "another session")));
+        // Restored history is not acknowledgment of the newly submitted intent.
+        a.replaying = true;
+        a.update(&mut core, &json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "old answer"}}));
+        a.replaying = false;
+        assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Sent));
         feed(
             &mut a,
             &mut core,
             &[
-                json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "s1", "update": {"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "Let me look."}}}}),
+                // Older single-session agents omit sessionId; their actual activity still counts.
+                json!({"jsonrpc": "2.0", "method": "session/update", "params": {"update": {"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "Let me look."}}}}),
                 json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "s1", "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Editing "}}}}),
                 json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "s1", "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "main.rs."}}}}),
                 json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "s1", "update": {"sessionUpdate": "tool_call", "toolCallId": "t1", "title": "Edit main.rs", "kind": "edit", "status": "pending", "locations": [{"path": "/w/main.rs"}], "content": [{"type": "diff", "path": "/w/main.rs", "oldText": "fn a() {}\n", "newText": "fn b() {}\n"}]}}}),
                 json!({"jsonrpc": "2.0", "id": 7, "method": "session/request_permission", "params": {"sessionId": "s1", "toolCall": {"toolCallId": "t1"}, "options": [{"optionId": "once", "name": "Allow", "kind": "allow_once"}, {"optionId": "ever", "name": "Always allow edits", "kind": "allow_always"}, {"optionId": "no", "name": "Reject", "kind": "reject_once"}]}}),
             ],
         );
+        assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Started));
         assert!(matches!(core.events().find(|e| e.id.starts_with("acp-agent_message")).map(|e| e.body.clone()), Some(Body::Assistant { text, streaming: false }) if text == "Editing main.rs."));
         let ap = core.state.approvals.first().cloned().ok_or_else(|| anyhow::anyhow!("no approval"))?;
         assert_eq!((ap.tool, ap.always.len()), (ToolKind::Edit, 1));
@@ -2006,7 +2045,9 @@ mod tests {
         assert_eq!(core.state.usage.context_tokens, Some(120));
         assert_eq!(core.state.usage.input_tokens, 0);
         let response = json!({"id": 3, "result": {"stopReason": "end_turn", "usage": {"inputTokens": 100, "outputTokens": 20, "cachedReadTokens": 10}}});
+        assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Sent));
         feed(&mut a, &mut core, &[response.clone(), response]);
+        assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Completed));
         assert_eq!((core.state.usage.input_tokens, core.state.usage.output_tokens, core.state.usage.cache_read_tokens, core.state.usage.turns), (100, 20, 10, 1));
         a.update(&mut core, &json!({"sessionUpdate": "usage_update", "used": 80, "size": 2000, "cost": {"amount": 999, "currency": "credits"}}));
         assert_eq!(core.state.usage.context_tokens, Some(80));
@@ -2114,10 +2155,14 @@ mod tests {
             assert_eq!(a.prompting.as_deref(), Some("main"));
             assert_eq!(core.state.turn_started, started);
             for id in ["main", "steer", "queued-steer"] {
-                assert_eq!(core.state.delivery.get(id), Some(&Delivery::Started));
+                assert_eq!(core.state.delivery.get(id), Some(&Delivery::Sent));
                 assert_eq!(core.events().filter(|e| matches!(&e.body, Body::User { client_id: Some(client), .. } if client == id)).count(), 1);
             }
             a.update(&mut core, &json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "answer"}}));
+            assert_eq!(core.state.delivery.get("main"), Some(&Delivery::Started));
+            for id in ["steer", "queued-steer"] {
+                assert_eq!(core.state.delivery.get(id), Some(&Delivery::Sent));
+            }
             for (i, id) in replies.into_iter().enumerate() {
                 feed(&mut a, &mut core, &[json!({"id": id, "result": {"stopReason": "end_turn", "usage": {"inputTokens": 100, "outputTokens": 20, "cachedReadTokens": 30}}})]);
                 if i < 2 {

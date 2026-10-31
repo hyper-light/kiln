@@ -899,9 +899,20 @@ pub struct Server {
     env: Vec<(String, String)>,
     /// What its runner left in Docker stays when it's dropped ([`Server::crash`]).
     leave: bool,
+    /// U10/U12: explicit CD opt-in also determines this fixture's readiness.
+    cd: bool,
 }
 
 impl Server {
+    /// U10/U12: supervised CD services initialize after HTTP starts. Use their read APIs
+    /// within the same startup deadline, so a fixture never mistakes liveness for readiness.
+    fn cd_ready(&self, deadline: Instant) -> bool {
+        !self.cd || ["/api/cd/clusters", "/api/deploy/environments"].into_iter().all(|path| {
+            let within = deadline.saturating_duration_since(Instant::now());
+            !within.is_zero() && matches!(http_within(self.port, "GET", path, &self.admin, None, within), Ok((200, _)))
+        })
+    }
+
     /// Stopped (killed, as a crash or a host's restart would), then started again on its ports and
     /// its data: its log goes on in `server.log`.
     #[allow(dead_code)]
@@ -916,7 +927,9 @@ impl Server {
             self.child = cmd.spawn()?;
             // Up once it answers; its ports may take a moment to be free again.
             while self.child.try_wait()?.is_none() {
-                if let Ok((200, _)) = http(self.port, "GET", "/healthz", "", None) {
+                if let Ok((200, _)) = http(self.port, "GET", "/healthz", "", None)
+                    && self.cd_ready(deadline)
+                {
                     return Ok(());
                 }
                 anyhow::ensure!(Instant::now() < deadline, "the server didn't start again");
@@ -952,7 +965,7 @@ impl Drop for Server {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let work = self.dir.join("work");
+        let work = runner_work(&self.dir);
         if !self.leave && work.is_dir() {
             sweep(&work);
         }
@@ -982,10 +995,15 @@ fn sweep(work: &Path) {
     }
 }
 
+/// U07: the local runner owns this tree, apart from the test user's checkout at `<dir>/work`.
+pub fn runner_work(dir: &Path) -> std::path::PathBuf {
+    dir.join("local-agent-work")
+}
+
 /// What a test server has besides the defaults.
 #[derive(Default)]
 pub struct Options<'a> {
-    /// Its own runner (labels `local`), working under `<dir>/work`.
+    /// Its own runner (labels `local`), working under [`runner_work`].
     pub agent: bool,
     /// More of `[ci]`.
     pub ci: &'a str,
@@ -1057,7 +1075,7 @@ fn server_command(dir: &Path, log: std::fs::File) -> anyhow::Result<Command> {
 fn start_once(dir: &Path, o: &Options<'_>, https: bool, cd: bool, env: &[(&str, &str)]) -> anyhow::Result<Result<Server, String>> {
     let (port, quic) = (free_port()?, free_udp_port()?);
     let data = dir.join("data");
-    let work = dir.join("work");
+    let work = runner_work(dir);
     // Runners' live samples place nothing (W05-R03's headroom): a test's runners share the machine
     // running the tests, whose load isn't theirs to wait for. A test that says otherwise has
     // `headroom` in a `[ci.scheduler]` of its own.
@@ -1121,13 +1139,16 @@ enabled = true
         // And pods (a `k8s` pool's: docs/ci.md W13-R07).
         kubernetes = if o.extra.contains("[kubernetes]") { "" } else { "[kubernetes]\nenabled = false\n" },
     );
+    // Respect an explicit [cd] section as well as start_cd's generated one, including
+    // Config::Cd's default when that section omits enabled.
+    let cd = toml::from_str::<toml::Value>(&config)?.get("cd").and_then(|cd| cd.get("enabled")).and_then(toml::Value::as_bool).unwrap_or(true);
     std::fs::write(dir.join("kiln.toml"), config)?;
     // Its log, for a test that wants to say why it failed (`Server::log`).
     let log = std::fs::File::create(dir.join("server.log"))?;
     let mut cmd = server_command(dir, log)?;
     cmd.envs(env.iter().copied());
     let child = cmd.spawn()?;
-    let mut server = Server { child, port, quic, admin: String::new(), dir: dir.to_path_buf(), env: env.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect(), leave: false };
+    let mut server = Server { child, port, quic, admin: String::new(), dir: dir.to_path_buf(), env: env.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect(), leave: false, cd };
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         if let Some(status) = server.child.try_wait()? {
@@ -1146,7 +1167,9 @@ enabled = true
                         return Ok(Err(format!("another server holds its QUIC port {quic}")));
                     }
                     server.admin = t;
-                    return Ok(Ok(server));
+                    if server.cd_ready(deadline) {
+                        return Ok(Ok(server));
+                    }
                 }
                 Ok((401, _)) => return Ok(Err(format!("another server answers on port {port}"))),
                 _ => {}

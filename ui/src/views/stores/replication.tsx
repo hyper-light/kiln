@@ -15,8 +15,8 @@ import { fileStamp, saveFile } from "@/lib/download";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
-import { cylinder, frontArc, healthOf, metricsOf, replicationScene, wall, type Cable, type Node, type Plate, type ReplicationScene } from "./replication-scene";
-import { countText, sizeText } from "./scene";
+import { cylinder, frontArc, metricsOf, productStatusText, replicationScene, wall, type Cable, type Node, type Plate, type ReplicationScene } from "./replication-scene";
+import { sizeText } from "./scene";
 import "./replication.css";
 
 /** A database, as the figure draws one: a glass cylinder, its rings, its cap, and on the server's
@@ -55,6 +55,7 @@ function Database({ plate, big, id }: { plate: Plate; big: boolean; id: string }
 /** A cable: its line, its direction, rows to come waiting at its start, and while batches move on
  * it, light flowing along it, about one comet arriving a batch. */
 function CableView({ cable, dim, delay, kind }: { cable: Cable; dim: boolean; delay: number; kind: "in" | "out" }) {
+  if (cable.known === false) return null;
   const style = cable.period ? ({ "--rp-period": `${cable.period}s`, "--rp-delay": `${-delay}s` } as React.CSSProperties) : undefined;
   return (
     <g className="rp-cable" data-tone={cable.tone} data-dim={dim || undefined}>
@@ -120,7 +121,7 @@ function SceneView({ scene, className, selected, onSelect }: { scene: Replicatio
       className={cn("rp-scene", className)}
       viewBox={`0 0 ${scene.width} ${scene.height}`}
       role="group"
-      aria-label="Replication: each runner's store sends batches to the server's; the server's sends what it committed to its mirror. Pick a store for what it is doing."
+      aria-label="Store observations. Connections do not establish Amphora replication progress. Pick a store for its operational counters."
     >
       <defs>
         <linearGradient id={`${id}-prism`} x1="0" y1="0" x2="1" y2=".8">
@@ -165,49 +166,32 @@ function SceneView({ scene, className, selected, onSelect }: { scene: Replicatio
   );
 }
 
-const rate = (v: number | null | undefined) => (v == null ? "—" : `${v < 10 ? v.toFixed(1) : Math.round(v).toLocaleString("en-US")}`);
-
 /** What the readout says: of a picked store, or of replication as a whole. */
 function readoutOf(status: ConvoStatus, selected: string | null): { title: string; note: string } {
   const s = selected ? status.stores.find((x) => x.key === selected) : null;
-  if (s?.role === "server") {
-    const f = s.report?.file;
-    return { title: `Server · conversations.db · ${f ? sizeText(f.bytes) : "—"}`, note: `Takes each runner's records, ${rate(s.rates.writes)} writes/s; feeds the whole store to its mirror.` };
-  }
-  if (s?.role === "mirror") {
-    const f = s.report?.file;
-    const behind = s.mirror?.behind ?? 0;
-    return {
-      title: `Mirror · ${s.machine} · ${f ? sizeText(f.bytes) : "—"}`,
-      note: !s.connected
-        ? "Offline. The server's store waits to send it what it lacks."
-        : behind > 0
-          ? `${countText(behind)} rows behind the server's store, catching up.`
-          : "A current copy of the server's store, on another machine.",
-    };
-  }
-  if (s) {
-    const f = s.report?.file;
-    const behind = s.feed?.behind ?? 0;
-    return {
-      title: `${s.machine} · ${f ? sizeText(f.bytes) : "keeps no store"}`,
-      note: !s.connected
-        ? "Offline. Its history stays kept; its cable comes back with the runner."
-        : `${rate(s.rates.writes)} writes/s · ${countText(behind)} to come · ${s.state === "behind" ? "stalled" : behind > 0 ? "catching up" : "in sync"}`,
-    };
-  }
-  const m = metricsOf(status);
-  const health = healthOf(status);
-  if (m.pending > 0) return { title: `${countText(m.pending)} rows still to arrive.`, note: "New writes go on while the backlog drains." };
-  if (health.tone === "off") return { title: `${health.text}. Its history stays kept.`, note: "The others go on sending; the mirror stays current." };
-  return { title: "Local writes become one shared history.", note: "Batches arrive, commit, then go on to the mirror." };
+  // U15: this board measures local operations, not product replication progress.
+  return {
+    title: s ? `${s.machine} · ${s.report?.file ? sizeText(s.report.file.bytes) : "store size unknown"}` : "Replication belongs to Amphora.",
+    note: "Local writes and runner connections do not establish quorum, replica progress or lag. Replication status is unknown on this board.",
+  };
 }
 
 /** The figure. `selected`: the store picked (here or in the table), its dashboard shown below. */
 export function ReplicationFigure({ status, selected, onSelect }: { status: ConvoStatus; selected: string | null; onSelect: (key: string | null) => void }) {
   const landscape = React.useMemo(() => replicationScene(status, false), [status]);
   const portrait = React.useMemo(() => replicationScene(status, true), [status]);
-  const health = healthOf(status);
+  const product = useSuspenseResource(
+    "amphora/replication-status",
+    async (signal) => {
+      try {
+        const response = await fetch("/healthz/server", { signal });
+        return response.ok ? ((await response.json()) as unknown) : null;
+      } catch {
+        return null;
+      }
+    },
+    { pollMs: 5_000 },
+  ).data;
   const m = metricsOf(status);
   const said = readoutOf(status, selected);
   const id = React.useId();
@@ -222,8 +206,8 @@ export function ReplicationFigure({ status, selected, onSelect }: { status: Conv
               Replication
             </h3>
           </div>
-          <span className="rp-status" data-tone={health.tone} role="status">
-            {health.text}
+          <span className="rp-status" data-tone="off" role="status">
+            {productStatusText(product)}
           </span>
         </header>
         <div className="rp-stage">
@@ -257,14 +241,14 @@ export function ReplicationFigure({ status, selected, onSelect }: { status: Conv
           <div>
             <dt>Sources in sync</dt>
             <dd>
-              {m.synced}
+              {m.synced ?? "Unknown"}
               <span className="rp-slash">/</span>
               {m.of}
             </dd>
           </div>
           <div>
             <dt>Pending rows</dt>
-            <dd data-tone={m.pending > 0 ? "warn" : undefined}>{m.pending.toLocaleString("en-US")}</dd>
+            <dd data-tone={m.pending != null && m.pending > 0 ? "warn" : undefined}>{m.pending?.toLocaleString("en-US") ?? "Unknown"}</dd>
           </div>
           <div>
             <dt>Mirror copy</dt>
@@ -276,7 +260,7 @@ export function ReplicationFigure({ status, selected, onSelect }: { status: Conv
       </figure>
       <p className="rp-foot">
         <span>Live from this server, every 2 seconds. Pick a store to see its flow and its dashboard.</span>
-        <span>Light follows batches · idle cables stay still</span>
+        <span>Replication progress requires Amphora status</span>
       </p>
     </>
   );
@@ -325,7 +309,7 @@ export function ReplicationLog() {
         <SearchField label="Search the replication log" placeholder="Search by machine, store, or words…" value={q} onChange={setQ} />
       </FilterBar>
       {log.lines.length === 0 ? (
-        <EmptyState title={words ? "No lines match." : "Nothing has moved yet."}>{!words && <p>Lines come as the stores send batches, sampled every 5 seconds.</p>}</EmptyState>
+        <EmptyState title={words ? "No lines match." : "No operational notes yet."}>{!words && <p>Operational notes appear when stores report changes. Amphora owns replication.</p>}</EmptyState>
       ) : (
         <ol className="rp-log-lines" aria-label="Replication log, newest first">
           {log.lines.map((l) => (

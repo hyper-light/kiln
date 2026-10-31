@@ -14,17 +14,18 @@
 //! while an upgrade builds from it. A repair that would need a person at the machine (setting up
 //! signing on a Mac, which macOS asks about) says so instead of offering itself.
 
+use crate::authz::At as ScopeAt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use http::{Method, StatusCode};
+use http::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::authz::{Caller, Scope};
 use crate::hub::Hub;
-use crate::ops::{Cx, Fail, Input, Op, Out, path, text};
+use crate::ops::{Cx, Fail, Input, Op, Out, text, Definition, Part, Routes, Reply};
 use crate::proto::{self, ServerMsg};
 
 /// How much a finding matters.
@@ -648,7 +649,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: true,
             destructive: false,
             input: Input::of::<input::RunnersList>(),
-            route: |_| Ok((Method::GET, path(&["api", "agents"]))),
+            route: Routes(vec![Definition::new("GET", &[Part::Literal("api"), Part::Literal("agents")], &[], "runners.read", ScopeAt::Anywhere)]),
             run: |cx, _| Box::pin(async move { serde_json::to_value(runners_for(&cx.hub, &cx.caller).await).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())) }),
         },
         Op {
@@ -657,7 +658,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: true,
             destructive: false,
             input: Input::of::<input::RunnersDiagnose>(),
-            route: |v| Ok((Method::GET, path(&["api", "agents", &runner_of(v)?, "diagnose"]))),
+            route: Routes(vec![Definition::new("GET", &[Part::Literal("api"), Part::Literal("agents"), Part::Field("runner"), Part::Literal("diagnose")], &[], "runners.read", ScopeAt::Runner(2))]),
             run: |cx, v| Box::pin(async move { diagnose(&cx.hub, &runner_of(&v)?).await }),
         },
         Op {
@@ -666,7 +667,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: false,
             input: Input::of::<input::RunnersRepair>(),
-            route: |v| Ok((Method::POST, path(&["api", "agents", &runner_of(v)?, "repair"]))),
+            route: Routes(vec![Definition::new("POST", &[Part::Literal("api"), Part::Literal("agents"), Part::Field("runner"), Part::Literal("repair")], &[], "runners.manage", ScopeAt::Runner(2))]),
             run: |cx, v| {
                 Box::pin(async move {
                     let ask = Ask { action: text(&v, "action")?, way: v.get("way").and_then(Value::as_str).map(str::to_owned) };
@@ -680,7 +681,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: true,
             destructive: false,
             input: Input::of::<input::UpdatesList>(),
-            route: |_| Ok((Method::GET, path(&["api", "updates", "runners"]))),
+            route: Routes(vec![Definition::new("GET", &[Part::Literal("api"), Part::Literal("updates"), Part::Literal("runners")], &[], "runners.read", ScopeAt::Anywhere)]),
             run: |cx, _| Box::pin(async move { Ok(updates_for(&cx.hub, &cx.caller).await) }),
         },
         Op {
@@ -689,7 +690,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: false,
             input: Input::of::<input::UpdatesRetry>(),
-            route: |v| Ok((Method::POST, path(&["api", "updates", "runners", &runner_of(v)?]))),
+            route: Routes(vec![Definition::new("POST", &[Part::Literal("api"), Part::Literal("updates"), Part::Literal("runners"), Part::Field("runner")], &[], "runners.manage", ScopeAt::Runner(3)).reply(Reply::Protocol)]),
             run: |cx, v| {
                 Box::pin(async move {
                     let ask = Ask { action: "retry-upgrade".to_owned(), way: v.get("way").and_then(Value::as_str).map(str::to_owned) };
@@ -703,7 +704,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: false,
             input: Input::of::<input::UpdatesPolicy>(),
-            route: |v| Ok((Method::PUT, path(&["api", "updates", "runners", &runner_of(v)?]))),
+            route: Routes(vec![Definition::new("PUT", &[Part::Literal("api"), Part::Literal("updates"), Part::Literal("runners"), Part::Field("runner")], &[], "runners.manage", ScopeAt::Runner(3)).reply(Reply::Protocol)]),
             run: |cx, v| Box::pin(set_policy(cx, v)),
         },
     ]
@@ -793,6 +794,7 @@ async fn set_policy(cx: Cx, v: Value) -> Out {
 
 #[cfg(test)]
 mod tests {
+    use http::Method;
     use super::*;
 
     fn job(state: crate::updates::JobState, method: &'static str, error: Option<&str>) -> LastUpgrade {
@@ -906,7 +908,7 @@ mod tests {
     fn every_operation_names_a_route_and_reads_exactly_when_it_gets() {
         for op in list_ops() {
             let v = json!({"runner": "mac", "action": "prune-versions", "policy": "auto"});
-            let (method, segs) = (op.route)(&v).unwrap_or((Method::OPTIONS, Vec::new()));
+            let (method, segs, _) = op.route.build(&v).unwrap_or((Method::OPTIONS, Vec::new(), Default::default()));
             assert!(!segs.is_empty(), "{} has no route", op.name);
             assert_eq!(op.read_only, method == Method::GET, "{}", op.name);
         }

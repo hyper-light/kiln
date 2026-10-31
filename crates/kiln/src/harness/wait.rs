@@ -251,8 +251,8 @@ pub async fn wait(hub: &Hub, ids: &[String], until: Until, any: bool, timeout: D
                 Ok(Ok(ev)) if ids.iter().map(String::as_str).chain(waiter.map(|w| w.id.as_str())).any(|id| ev.contains(id)) => break,
                 Ok(Ok(_)) => {}
                 // Dropped some (a busy server): look again.
-                Ok(Err(async_broadcast::RecvError::Overflowed(_))) => break,
-                Ok(Err(async_broadcast::RecvError::Closed)) => {
+                Ok(Err(crate::bus::RecvError::Overflowed(_))) => break,
+                Ok(Err(crate::bus::RecvError::Closed | crate::bus::RecvError::Unavailable(_))) => {
                     crate::rt::sleep(rest).await;
                     break;
                 }

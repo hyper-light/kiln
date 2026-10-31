@@ -482,7 +482,8 @@ export const harnessApi = {
   planLanding: (id: string) => call<LandingPlan>("POST", `/api/harness/agents/${encodeURIComponent(id)}/land`, {}),
   /** Write it exactly as the plan whose manifest this is (a person's go-ahead); if it changed since, nothing is written and the new plan comes back. */
   land: (id: string, manifest: string) => call<{ landed?: unknown } & Partial<LandingPlan> & { changed?: boolean }>("POST", `/api/harness/agents/${encodeURIComponent(id)}/land`, { manifest }),
-  list: () => call<AgentInfo[]>("GET", "/api/harness/sessions").then((all) => all.filter(listed)),
+  // U13: the shared roster retains helpers for ownership changes; ordinary callers still list only visible agents.
+  list: (options?: { includeHelpers?: boolean }) => call<AgentInfo[]>("GET", "/api/harness/sessions").then((all) => (options?.includeHelpers ? all : all.filter(listed))),
   /** An agent's goal stack. */
   goals: (id: string) => call<GoalStack>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/goals`),
   /** Its goals still to go, as they should be (existing ones by id; the one under way among them puts it back or rewords it). */

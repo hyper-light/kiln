@@ -27,7 +27,7 @@
 //! - [`rollout`]: canary, linear and blue/green rollouts with checks, as a state machine.
 //! - [`engine`]: the controller.
 //! - [`tree`]: an app's resource tree: its objects and the live objects they own.
-//! - [`state`] and [`store`]: what is kept durably, replicated by hyper-raft on hyper-log.
+//! - [`state`]: pure domain commands/data; the server persists them through shared Amphora.
 //! - [`sim`] and [`harness`]: simulated clusters, and the engine driven against them on a
 //!   simulated clock (tests and `kiln cd bench`).
 
@@ -51,6 +51,8 @@ pub mod rollback;
 pub mod rollout;
 pub mod sim;
 pub mod state;
+// U15/B2: the retired CD Raft writer is available only to legacy fixture tests.
+#[cfg(test)]
 pub mod store;
 pub mod sync;
 pub mod tree;

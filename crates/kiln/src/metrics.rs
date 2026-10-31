@@ -1015,17 +1015,8 @@ pub fn set_convo(status: &crate::convo::board::Status) {
         .filter(|s| s.id.is_some())
         .map(|s| {
             let r = s.report.as_ref();
-            let behind = s.feed.as_ref().and_then(|f| f.behind).or(s.mirror.as_ref().and_then(|m| m.behind));
-            let (batches, bytes) = match (&s.feed, &s.mirror) {
-                (Some(f), _) => (f.intake.as_ref().map(|i| i.batches), f.intake.as_ref().map(|i| i.bytes)),
-                (None, Some(m)) => (Some(m.ship.batches), Some(m.ship.bytes)),
-                // The server's: what it took from every feed.
-                (None, None) => {
-                    let feeds = status.stores.iter().filter_map(|x| x.feed.as_ref()?.intake.as_ref());
-                    let (b, w) = feeds.fold((0, 0), |(b, w), i| (b + i.batches, w + i.bytes));
-                    (Some(b), Some(w))
-                }
-            };
+            // U15: retired application feeds cannot measure Amphora replication.
+            let (behind, batches, bytes): (Option<u64>, Option<u64>, Option<u64>) = (None, None, None);
             (
                 [s.key.clone(), s.role.to_owned(), s.machine.clone()],
                 [

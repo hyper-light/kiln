@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rusqlite::OptionalExtension as _;
+use crate::sql::OptionalExtension as _;
 use serde_json::Value;
 
 use super::{CommitStatus, GitHost};
@@ -95,8 +95,8 @@ pub async fn statuses_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
                         let _ = hub.store.kv_set(format!("ci/host-status/{id}"), "unreported".into()).await;
                     }
                 }
-                Err(async_broadcast::RecvError::Overflowed(_)) => reconcile(&hub).await,
-                Err(async_broadcast::RecvError::Closed) => return Ok(()),
+                Err(crate::bus::RecvError::Overflowed(_)) => reconcile(&hub).await,
+                Err(crate::bus::RecvError::Closed | crate::bus::RecvError::Unavailable(_)) => return Ok(()),
             },
             () = crate::rt::sleep(Duration::from_secs(60)).fuse() => reconcile(&hub).await,
         }

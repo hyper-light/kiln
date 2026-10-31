@@ -19,7 +19,7 @@
 use std::sync::Arc;
 
 use http::StatusCode;
-use rusqlite::{OptionalExtension, params};
+use crate::sql::{OptionalExtension, params};
 use serde_json::{Value, json};
 
 use super::blob::{self, Target};

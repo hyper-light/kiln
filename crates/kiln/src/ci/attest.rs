@@ -24,7 +24,7 @@ use aws_lc_rs::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair
 use base64::Engine as _;
 use http::StatusCode;
 use kiln_ci::attest::{self as a, Subject};
-use rusqlite::{OptionalExtension, params};
+use crate::sql::{OptionalExtension, params};
 use serde_json::{Value, json};
 
 use super::{Fail, token};

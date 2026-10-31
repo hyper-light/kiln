@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use http::{Method, StatusCode};
-use rusqlite::{OptionalExtension as _, params};
+use crate::sql::{OptionalExtension as _, params};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -339,7 +339,7 @@ fn manages(caller: &Caller) -> bool {
     caller.can("tokens.manage", &Scope::Server)
 }
 
-fn token_json(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
+fn token_json(r: &crate::sql::Row<'_>) -> crate::sql::Result<Value> {
     let (id, kind, principal, behalf, scopes): (String, String, String, Option<String>, String) = (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?);
     let note = serde_json::from_str::<Value>(&scopes).ok().and_then(|v| v.get("note").and_then(Value::as_str).map(str::to_owned));
     let prefix = if kind == "agent" { AGENT_PREFIX } else { PAT_PREFIX };

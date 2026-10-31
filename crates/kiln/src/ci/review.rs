@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashMap};
 use http::StatusCode;
 use kiln_ci::land::{self, Action, Facts, OwnerRule, Policy};
 use kiln_ci::review::{Gate, Kind, State};
-use rusqlite::{OptionalExtension as _, params};
+use crate::sql::{OptionalExtension as _, params};
 use serde_json::{Value, json};
 
 use super::Fail;
@@ -200,6 +200,11 @@ pub async fn comment(hub: &std::sync::Arc<Hub>, d: &Diff, caller: &Caller, body:
     if file.is_some() != start.is_some() {
         return Err(bad("a comment on code names its `file` and `start_line`"));
     }
+    let control = if publish {
+        let repo = hub.store.repos().await.map_err(fail)?.into_iter().find(|repo| repo.name == d.repo).ok_or_else(|| bad("the diff's repository no longer exists"))?;
+        let latest = versions.last().cloned().ok_or_else(|| bad("the diff has no version"))?;
+        Some(super::diffs::conversation_source(hub, repo, d.clone(), latest).await)
+    } else { None };
     // A new thread's kind (W26-R11): a question unless it says otherwise.
     let kind = match body.get("kind").and_then(Value::as_str) {
         None => Kind::Question,
@@ -210,15 +215,16 @@ pub async fn comment(hub: &std::sync::Arc<Hub>, d: &Diff, caller: &Caller, body:
     let (tid, cid) = hub
         .store
         .call(move |c| {
+            let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             let tid = match thread {
                 Some(t) => {
-                    let ok: Option<String> = c.query_row("SELECT id FROM review_threads WHERE id = ?1 AND diff_id = ?2", params![t, diff_id], |r| r.get(0)).optional()?;
+                    let ok: Option<String> = tx.query_row("SELECT id FROM review_threads WHERE id = ?1 AND diff_id = ?2", params![t, diff_id], |r| r.get(0)).optional()?;
                     ok.ok_or_else(|| anyhow::anyhow!("no such thread on this diff"))?
                 }
                 None => {
                     let id = crate::util::new_id();
-                    c.execute(
+                    tx.execute(
                         "INSERT INTO review_threads (id, diff_id, version, file, side, start_line, end_line, state, created_by, created_at, kind) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'open', ?8, ?9, ?10)",
                         params![id, diff_id, version, file, side, start, end.or(start), me2, now, kind],
                     )?;
@@ -226,15 +232,24 @@ pub async fn comment(hub: &std::sync::Arc<Hub>, d: &Diff, caller: &Caller, body:
                 }
             };
             let cid = crate::util::new_id();
-            c.execute(
+            tx.execute(
                 "INSERT INTO review_comments (id, thread_id, author, body, suggestion, created_at, updated_at, published) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7)",
                 params![cid, tid, me2, text, suggestion, now, publish],
             )?;
+            if let Some(source) = control {
+                let diff = &source.diff;
+                let (version, file, side, start, end): (u32, Option<String>, Option<String>, Option<u32>, Option<u32>) = tx.query_row("SELECT version, file, side, start_line, end_line FROM review_threads WHERE id = ?1", [&tid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?;
+                let numeric: i64 = tx.query_row("SELECT rowid FROM review_comments WHERE id = ?1", [&cid], |r| r.get(0))?;
+                let event = json!({"type":"comment", "repo":diff.repo, "diff":diff.name, "version":version, "thread":tid, "comment":cid, "author":me2, "body":text, "file":file, "side":side.unwrap_or_else(|| "new".into()), "start_line":start, "end_line":end, "diff_author":diff.author, "diff_author_for":diff.author_for});
+                super::diffs::conversation_intent(&tx, &format!("comment:{cid}"), source, event, numeric)?;
+            }
+            tx.commit()?;
             Ok((tid, cid))
         })
         .await
         .map_err(|e| bad(format!("{e:#}")))?;
     if publish {
+        super::schedule::outbox::kick(hub).await;
         hub.store.audit(caller.name.clone(), "diffs.comment".into(), format!("{} {} thread {tid}", d.repo, d.name)).await;
         // For whoever follows a diff's conversation (an agent's queue, the inbox).
         hub.emit(&crate::wire::events::ServerEvent::Comment(Box::new(crate::wire::events::Comment {
@@ -612,6 +627,9 @@ pub async fn review(hub: &std::sync::Arc<Hub>, d: &Diff, caller: &Caller, body: 
     };
     let versions = super::diffs::versions(hub, d).await.map_err(fail)?;
     let latest = versions.last().map_or(1, |v| v.n);
+    let control_repo = hub.store.repos().await.map_err(fail)?.into_iter().find(|repo| repo.name == d.repo).ok_or_else(|| bad("the diff's repository no longer exists"))?;
+    let control_version = versions.last().cloned().ok_or_else(|| bad("the diff has no version"))?;
+    let control = super::diffs::conversation_source(hub, control_repo, d.clone(), control_version).await;
     let (id, me2, text2) = (d.id.clone(), me.clone(), text.clone());
     let (published, drafts) = hub
         .store
@@ -619,15 +637,25 @@ pub async fn review(hub: &std::sync::Arc<Hub>, d: &Diff, caller: &Caller, body: 
             let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             // What the review publishes, for whom it's news (W19-R06).
-            let drafts: Vec<(String, String)> = {
-                let mut st = tx.prepare("SELECT c.thread_id, c.body FROM review_comments c JOIN review_threads t ON t.id = c.thread_id WHERE t.diff_id = ?1 AND c.author = ?2 AND c.published = 0 ORDER BY c.created_at")?;
-                st.query_map(params![id, me2], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<Vec<_>, _>>()?
+            let draft_events: Vec<(String, String, String, u32, Option<String>, Option<String>, Option<u32>, Option<u32>)> = {
+                let mut st = tx.prepare("SELECT c.id, c.thread_id, c.body, t.version, t.file, t.side, t.start_line, t.end_line FROM review_comments c JOIN review_threads t ON t.id = c.thread_id WHERE t.diff_id = ?1 AND c.author = ?2 AND c.published = 0 ORDER BY c.created_at, c.id")?;
+                st.query_map(params![id, me2], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)))?.collect::<Result<Vec<_>, _>>()?
             };
+            let drafts: Vec<(String, String)> = draft_events.iter().map(|(_, thread, body, ..)| (thread.clone(), body.clone())).collect();
             let published = tx.execute("UPDATE review_comments SET published = 1, updated_at = ?3 WHERE author = ?2 AND published = 0 AND thread_id IN (SELECT id FROM review_threads WHERE diff_id = ?1)", params![id, me2, now])?;
+            let review = crate::util::new_id();
             tx.execute(
                 "INSERT INTO reviews (id, diff_id, version, reviewer, reviewer_kind, action, body, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![crate::util::new_id(), id, latest, me2, if agent { "agent" } else { "human" }, action.as_str(), text2, now],
+                params![review, id, latest, me2, if agent { "agent" } else { "human" }, action.as_str(), text2, now],
             )?;
+            for (comment, thread, body, version, file, side, start, end) in draft_events {
+                let numeric: i64 = tx.query_row("SELECT rowid FROM review_comments WHERE id = ?1", [&comment], |r| r.get(0))?;
+                let event = json!({"type":"comment", "repo":control.diff.repo, "diff":control.diff.name, "version":version, "thread":thread, "comment":comment, "author":me2, "body":body, "file":file, "side":side.unwrap_or_else(|| "new".into()), "start_line":start, "end_line":end, "diff_author":control.diff.author, "diff_author_for":control.diff.author_for});
+                super::diffs::conversation_intent(&tx, &format!("comment:{comment}"), control.clone(), event, numeric)?;
+            }
+            let numeric: i64 = tx.query_row("SELECT rowid FROM reviews WHERE id = ?1", [&review], |r| r.get(0))?;
+            let event = json!({"type":"review", "repo":control.diff.repo, "diff":control.diff.name, "version":latest, "review":review, "reviewer":me2, "action":action.as_str(), "body":text2, "published":published, "state":control.diff.state, "diff_author":control.diff.author, "diff_author_for":control.diff.author_for});
+            super::diffs::conversation_intent(&tx, &format!("review:{review}"), control, event, numeric)?;
             match action {
                 Action::Resign => {
                     tx.execute("DELETE FROM diff_reviewers WHERE diff_id = ?1 AND reviewer = ?2", params![id, me2])?;
@@ -649,6 +677,7 @@ pub async fn review(hub: &std::sync::Arc<Hub>, d: &Diff, caller: &Caller, body: 
         })
         .await
         .map_err(fail)?;
+    super::schedule::outbox::kick(hub).await;
     tell(hub, d, &me, drafts);
     if !text.is_empty() {
         let named = kiln_ci::trigger::context::mentions(&text);
@@ -951,8 +980,8 @@ pub async fn apply_suggestion(hub: &std::sync::Arc<Hub>, id: &str, caller: &Call
 
 /// Says when a run on a diff's or change request's version finishes (`diff_run`): which version,
 /// how it ended, its failed legs (with where their failure excerpts are), and whose it is, for
-/// whoever follows the diff (an agent that wrote it, its person). And raises the workflow events
-/// of a diff's conversation (its comments and reviews). For as long as the server runs.
+/// whoever follows the diff (an agent that wrote it, its person). Accepted conversation controls
+/// are owned by Amphora's trigger outbox; this UI projection asks clients to resync on overflow.
 pub async fn runs_loop(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
     use futures::FutureExt as _;
     let mut rx = hub.events.subscribe();
@@ -962,16 +991,8 @@ pub async fn runs_loop(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
             m = rx.recv().fuse() => match m {
                 Ok(text) => {
                     let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-                    // A diff's conversation raises its workflow events (W03-R09).
-                    if matches!(v.get("type").and_then(Value::as_str), Some("comment" | "review"))
-                        && let Err(e) = super::diffs::conversation(&hub, &v).await
-                    {
-                        tracing::warn!(diff = %v.get("diff").and_then(serde_json::Value::as_str).unwrap_or_default(), error = %format!("{e:#}"), "a diff's conversation started no workflows");
-                    }
-                    // CD's apps moving raise kiln's `deploy` (W03-R09, W15-R06).
-                    if v.get("type").and_then(Value::as_str) == Some("cd_apps") {
-                        super::cd_events::observe(&hub, &v).await;
-                    }
+                    // Accepted conversation and CD control intents are recovered by the
+                    // canonical outbox. This listener only publishes derived UI run summaries.
                     let finished = v.get("type").and_then(Value::as_str) == Some("run")
                         && v.pointer("/run/status").and_then(Value::as_str).is_some_and(|s| matches!(s, "succeeded" | "failed" | "cancelled" | "timed_out" | "skipped"));
                     if finished
@@ -981,8 +1002,10 @@ pub async fn runs_loop(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
                         tracing::debug!(run = %id, error = %format!("{e:#}"), "a diff's run event");
                     }
                 }
-                Err(async_broadcast::RecvError::Overflowed(_)) => {}
-                Err(async_broadcast::RecvError::Closed) => return Ok(()),
+                Err(crate::bus::RecvError::Overflowed(_)) => {
+                    hub.emit(&crate::wire::events::ServerEvent::Resync);
+                }
+                Err(crate::bus::RecvError::Closed | crate::bus::RecvError::Unavailable(_)) => return Ok(()),
             },
         }
     }

@@ -33,15 +33,17 @@ export function agoText(ms: number): string {
 /** What a store's state says, in a few words. */
 export function stateText(s: ConvoStore, now: number): string {
   const behind = s.feed?.behind ?? s.mirror?.behind ?? null;
+  // U15: operational liveness is not replication progress.
+  if (s.connected && s.state !== "no_store" && behind == null) return "live · replication unknown";
   switch (s.state) {
     case "live":
       return "live";
     case "in_sync":
       return "in sync";
     case "catching_up":
-      return `${countText(behind ?? 0)} behind · catching up`;
+      return `${behind == null ? "unknown" : countText(behind)} behind · catching up`;
     case "behind":
-      return `${countText(behind ?? 0)} behind`;
+      return `${behind == null ? "unknown" : countText(behind)} behind`;
     case "feeding":
       return "feeding · older kiln";
     case "no_store":

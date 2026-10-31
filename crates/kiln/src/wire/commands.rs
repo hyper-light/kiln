@@ -107,6 +107,8 @@ struct Waiting {
     answer: oneshot::Sender<Answer>,
     body: Vec<u8>,
     at: Instant,
+    // U03/W13-R09: immutable routing metadata follows this SAME seq through every retry/ACK.
+    connection: Option<crate::net::Connection>,
 }
 
 struct Stream {
@@ -244,9 +246,23 @@ impl Commands {
     /// receiver. A live command to a runner that's away (its link down), or one past the room, is
     /// answered at once; one to a runner that has just connected goes once it has said what it has.
     pub fn push(&mut self, peer: PeerId, kind: Kind, body: Vec<u8>, now: Instant) -> oneshot::Receiver<Answer> {
+        self.push_on(peer, kind, body, now, None)
+    }
+
+    /// A captured Live command remains on this exact connection for its entire seq/ACK lifetime.
+    /// A reconnect never updates this route; an authoritative caller may queue a NEW command.
+    pub(crate) fn push_bound(&mut self, connection: crate::net::Connection, body: Vec<u8>, now: Instant) -> oneshot::Receiver<Answer> {
+        self.push_on(connection.peer(), Kind::Live, body, now, Some(connection))
+    }
+
+    fn push_on(&mut self, peer: PeerId, kind: Kind, body: Vec<u8>, now: Instant, connection: Option<crate::net::Connection>) -> oneshot::Receiver<Answer> {
         let (tx, rx) = oneshot::channel();
         let born = self.born;
         let p = self.peer(peer);
+        if connection.is_some() && (!p.link || !p.wire) {
+            let _ = tx.send(Answer::Unreachable { why: "its captured runner does not have a live command channel".into() });
+            return rx;
+        }
         if kind == Kind::Live && !p.link && p.coming.is_none() {
             let _ = tx.send(Answer::Unreachable { why: "its runner is away".into() });
             return rx;
@@ -262,7 +278,7 @@ impl Commands {
         };
         match p.tx.push(&stream.name(born), body.clone()) {
             Ok(seq) => {
-                stream.waiting.insert(seq, Waiting { answer: tx, body, at: now });
+                stream.waiting.insert(seq, Waiting { answer: tx, body, at: now, connection });
             }
             Err(_) => {
                 let _ = tx.send(Answer::Unreachable { why: "too many commands wait for its runner already".into() });
@@ -340,7 +356,13 @@ impl Commands {
 
     /// What to send now, to whom: commands not yet sent on their link, and those whose answer is
     /// overdue. Parked commands waiting past [`PARK_FOR`] end unreachable.
+    #[cfg(test)]
     pub fn poll(&mut self, now: Instant) -> Vec<(PeerId, Frame)> {
+        self.poll_routed(now).into_iter().map(|(peer, frame, _)| (peer, frame)).collect()
+    }
+
+    /// Carries the item's original route through every Sender poll, including Want/patience retries.
+    pub(crate) fn poll_routed(&mut self, now: Instant) -> Vec<(PeerId, Frame, Option<crate::net::Connection>)> {
         let born = self.born;
         let mut out = Vec::new();
         for (peer, p) in &mut self.peers {
@@ -354,7 +376,14 @@ impl Commands {
                 }
                 restart(p, Kind::Parked, born, true);
             }
-            out.extend(p.tx.poll(now).into_iter().map(|f| (*peer, f)));
+            out.extend(p.tx.poll(now).into_iter().filter_map(|f| {
+                let connection = match &f {
+                    // A missing owner never turns a formerly bound item into ordinary peer routing.
+                    Frame::Item { stream, seq, .. } if *stream == p.live.name(born) => p.live.waiting.get(seq)?.connection,
+                    _ => None,
+                };
+                Some((*peer, f, connection))
+            }));
         }
         out
     }
@@ -408,6 +437,11 @@ pub fn prefix_of(stream: &str) -> Option<&'static str> {
 }
 
 /// A command stream's kind, its server's incarnation and its generation, from its name.
+/// A fully parsed command stream's kind; malformed prefixes never authorize Live work.
+pub fn kind_of(stream: &str) -> Option<Kind> {
+    named(stream).map(|(prefix, _, _)| if prefix == "l" { Kind::Live } else { Kind::Parked })
+}
+
 fn named(stream: &str) -> Option<(&'static str, u64, u64)> {
     let prefix = prefix_of(stream)?;
     let (born, generation) = stream.split_once(':')?.1.split_once('.')?;
@@ -835,6 +869,17 @@ mod tests {
         }
         assert_eq!(answer(&mut d), Some(Answer::Taken));
         assert_eq!(r.took.len(), 3);
+        let original = crate::net::Connection::new(1, 1, [11; 32]);
+        let mut bound = c.push_bound(original, b"captured startup".to_vec(), t(base, 140));
+        let first = c.poll_routed(t(base, 140));
+        assert_eq!(first.len(), 1);
+        assert_eq!(first.first().and_then(|(_, _, route)| *route), Some(original));
+        let retry = c.poll_routed(t(base, 250));
+        assert_eq!(first, retry, "the same item and route survive answer loss");
+        assert_eq!(answer(&mut bound), None, "a transport drop is not an ACK");
+        for a in r.deliver(retry.into_iter().map(|(p, f, _)| (p, f)).collect(), |_| false) { c.on_frame(1, a); }
+        assert_eq!(answer(&mut bound), Some(Answer::Taken));
+        assert_eq!(c.waiting(), 0);
     }
 
     #[test]

@@ -328,12 +328,12 @@ impl Cd {
             match self.try_connect_target(&name).await {
                 Ok(conn) => {
                     tracing::info!(target = %name, provider = conn.def.name, "deployments: target connected");
-                    self.input(Input::UpsertCluster { name: name.as_str().into(), qps: Some(1.0 / GAP.as_secs_f64()), inflight: Some(4) });
+                    if self.input(Input::UpsertCluster { name: name.as_str().into(), qps: Some(1.0 / GAP.as_secs_f64()), inflight: Some(4) }).await.is_err() { return; }
                     for k in conn.def.kinds {
-                        self.input(Input::Scope { cluster: name.as_str().into(), kind: GroupKind::new(k.group, k.kind), namespaced: k.namespaced });
+                        if self.input(Input::Scope { cluster: name.as_str().into(), kind: GroupKind::new(k.group, k.kind), namespaced: k.namespaced }).await.is_err() { return; }
                     }
                     self.targets.write().insert(name.clone(), conn);
-                    self.input(Input::ClusterReachable { name: name.as_str().into(), reachable: true });
+                    if self.input(Input::ClusterReachable { name: name.as_str().into(), reachable: true }).await.is_err() { return; }
                     self.connecting.lock().remove(&name);
                     self.kick();
                     return;
@@ -341,7 +341,7 @@ impl Cd {
                 Err(e) => {
                     tracing::warn!(target = %name, error = %format!("{e:#}"), "deployments: can't reach a target yet");
                     self.target_errors.lock().insert(name.clone(), format!("{e:#}"));
-                    self.input(Input::ClusterReachable { name: name.as_str().into(), reachable: false });
+                    if self.input(Input::ClusterReachable { name: name.as_str().into(), reachable: false }).await.is_err() { return; }
                 }
             }
             // Gone with its last app: stop trying.
@@ -451,15 +451,14 @@ impl Cd {
                     let now: HashMap<ResKey, u64> = objects.iter().map(|o| (key_of(o), obj::hash_value(o))).collect();
                     match &seen {
                         // The first read lists the kind; later ones send what changed.
-                        None => self.input(Input::Live { cluster: name.clone(), change: LiveChange::Listed { kind: kind.clone(), objects } }),
+                        None => { if self.input(Input::Live { cluster: name.clone(), change: LiveChange::Listed { kind: kind.clone(), objects } }).await.is_err() { return; } },
                         Some(before) => {
                             for o in objects {
-                                if before.get(&key_of(&o)) != Some(&obj::hash_value(&o)) {
-                                    self.input(Input::Live { cluster: name.clone(), change: LiveChange::Upsert(o) });
-                                }
+                                if before.get(&key_of(&o)) != Some(&obj::hash_value(&o))
+                                    && self.input(Input::Live { cluster: name.clone(), change: LiveChange::Upsert(o) }).await.is_err() { return; }
                             }
                             for k in before.keys().filter(|k| !now.contains_key(*k)) {
-                                self.input(Input::Live { cluster: name.clone(), change: LiveChange::Delete(k.clone()) });
+                                if self.input(Input::Live { cluster: name.clone(), change: LiveChange::Delete(k.clone()) }).await.is_err() { return; }
                             }
                         }
                     }

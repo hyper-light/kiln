@@ -139,7 +139,7 @@ async fn agent_of(host: &Host, peer: Option<u32>) -> Option<String> {
 
 /// Answer a request from process `peer`: an agent's go to the server (what it starts are its
 /// children; it steers only its own), and so do kiln's operations; the rest is this machine's.
-pub async fn answer(host: &Host, req: Request, peer: Option<u32>, forward: Option<&Forward>) -> Value {
+pub async fn answer(host: &Arc<Host>, req: Request, peer: Option<u32>, forward: Option<&Forward>) -> Value {
     let agent = agent_of(host, peer).await;
     let as_agent = |name: &'static str, input: Value| {
         let a = agent.clone().map(Asker::Agent);
@@ -179,7 +179,14 @@ pub async fn answer(host: &Host, req: Request, peer: Option<u32>, forward: Optio
         Request::Stop { id: Some(id), .. } if agent.is_some() => as_agent("agents.stop", json!({"agent": id})).await,
         Request::Interrupt { id: Some(id), .. } if agent.is_some() => as_agent("agents.interrupt", json!({"agent": id})).await,
         Request::Stop { id: None, .. } | Request::Interrupt { id: None, .. } if agent.is_some() => json!({"ok": false, "error": "say which agent (its id): an agent stops only the agents it started"}),
-        other => handle(host, other),
+        other => {
+            // U17: local start/stop acceptance writes synchronous canonical metadata.
+            let host = Arc::clone(host);
+            match crate::rt::blocking(move || handle(&host, other)).await {
+                Ok(answer) => answer,
+                Err(error) => json!({"ok": false, "error": format!("{error:#}")}),
+            }
+        }
     }
 }
 
@@ -210,8 +217,7 @@ pub fn path(name: &str, home: &std::path::Path) -> PathBuf {
     runtime_path(&format!("harness-{safe}-{}.sock", tag_of(home)))
 }
 
-/// What a socket's name says of the state directory `home` it was made for, so two kiln processes
-/// on one machine (a server and runners, or test instances) never share one.
+/// The state-directory tag shared by harness and reach socket names.
 pub(crate) fn tag_of(home: &std::path::Path) -> String {
     crate::util::sha256_hex(home.to_string_lossy().as_bytes()).get(..8).unwrap_or("0").to_owned()
 }
@@ -228,7 +234,7 @@ pub fn runtime_path(file: &str) -> PathBuf {
     }
 }
 
-/// Answer one request against `host`.
+/// Answer one request against `host`. Blocking: start/stop acceptance commits storage.
 pub fn handle(host: &Host, req: Request) -> Value {
     let pick = |id: &Option<String>, shell: &Option<String>| -> Vec<String> {
         host.list()
@@ -276,7 +282,14 @@ pub fn handle(host: &Host, req: Request) -> Value {
         }
         Request::Stop { id, shell } => {
             let ids = pick(&id, &shell);
-            let n = ids.iter().filter(|i| host.close(i)).count();
+            let mut n = 0;
+            for id in ids {
+                match host.try_close(&id) {
+                    Ok(true) => n += 1,
+                    Ok(false) => {}
+                    Err(error) => return json!({"ok": false, "error": format!("{error:#}"), "stopped": n}),
+                }
+            }
             json!({"ok": true, "stopped": n})
         }
         Request::Interrupt { id, shell } => {
@@ -323,18 +336,18 @@ fn file_id(path: &std::path::Path) -> Option<(u64, u64)> {
     std::fs::symlink_metadata(path).ok().map(|m| (m.dev(), m.ino()))
 }
 
-/// Whether a live process answers at `path`. Without waiting: a connection the listener hasn't
-/// taken yet (its queue full) is a live one's.
+/// Whether a socket may still be served. Only explicit absence or connection refusal
+/// establishes a dead endpoint; local descriptor limits or other probe errors preserve it.
 #[cfg(unix)]
 pub(crate) fn answers(path: &std::path::Path) -> bool {
     use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr};
     use std::os::fd::AsRawFd as _;
-    let Ok(addr) = UnixAddr::new(path) else { return false };
-    let Ok(fd) = nix::sys::socket::socket(AddressFamily::Unix, SockType::Stream, SockFlag::empty(), None) else { return false };
+    let Ok(addr) = UnixAddr::new(path) else { return true };
+    let Ok(fd) = nix::sys::socket::socket(AddressFamily::Unix, SockType::Stream, SockFlag::empty(), None) else { return true };
     if nix::fcntl::fcntl(&fd, nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK)).is_err() {
-        return false;
+        return true;
     }
-    matches!(nix::sys::socket::connect(fd.as_raw_fd(), &addr), Ok(()) | Err(nix::errno::Errno::EAGAIN | nix::errno::Errno::EINPROGRESS))
+    !matches!(nix::sys::socket::connect(fd.as_raw_fd(), &addr), Err(nix::errno::Errno::ENOENT | nix::errno::Errno::ECONNREFUSED))
 }
 
 /// Where `path` stands for a process that bound the file `ours` there (`None`: it bound none).
@@ -344,61 +357,6 @@ pub(crate) fn held(path: &std::path::Path, ours: Option<(u64, u64)>) -> Held {
         Some(f) if Some(f) == ours => Held::Ours,
         Some(_) if answers(path) => Held::Theirs,
         _ => Held::Dead,
-    }
-}
-
-/// How old a socket's file must be before a sweep may take it as left behind: a process binds its
-/// file a moment before it listens on it.
-#[cfg(unix)]
-const LEFT_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
-/// How often a process sweeps its sockets' folder while it runs.
-#[cfg(unix)]
-const SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
-
-/// Removes the kiln sockets in `dir` (`harness-*.sock`, `reach-*.sock`) nothing answers on whose
-/// files are older than `min_age`: each was left by a process that ended without removing it, as a
-/// test's or a lab's runner does when it's killed, and nothing binds its path again. A socket a live
-/// process serves answers, so it stays. How many went.
-#[cfg(unix)]
-pub(crate) fn sweep(dir: &std::path::Path, min_age: std::time::Duration) -> usize {
-    use std::os::unix::fs::FileTypeExt as _;
-    let mut gone = 0;
-    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        if !(name.starts_with("harness-") || name.starts_with("reach-")) || !name.ends_with(".sock") {
-            continue;
-        }
-        let path = e.path();
-        let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
-        let old = meta.modified().ok().and_then(|m| m.elapsed().ok()).is_some_and(|age| age >= min_age);
-        if meta.file_type().is_socket() && old && !answers(&path) && std::fs::remove_file(&path).is_ok() {
-            gone += 1;
-        }
-    }
-    gone
-}
-
-/// [`sweep`] of the folder `path` is in, on a thread of its own, at most once per [`SWEEP_EVERY`]
-/// in this process: when it first binds a socket, then while it serves them.
-#[cfg(unix)]
-fn sweep_now_and_then(path: &std::path::Path) {
-    static LAST: parking_lot::Mutex<Option<std::time::Instant>> = parking_lot::Mutex::new(None);
-    {
-        let mut last = LAST.lock();
-        if last.is_some_and(|t| t.elapsed() < SWEEP_EVERY) {
-            return;
-        }
-        *last = Some(std::time::Instant::now());
-    }
-    let Some(dir) = path.parent().map(std::path::Path::to_path_buf) else { return };
-    let spawned = std::thread::Builder::new().name("kiln-socket-sweep".into()).spawn(move || {
-        let gone = sweep(&dir, LEFT_AFTER);
-        if gone > 0 {
-            tracing::info!(dir = %dir.display(), gone, "removed the sockets of kiln processes that ended without removing them");
-        }
-    });
-    if let Err(e) = spawned {
-        tracing::debug!(error = %e, "the socket sweep couldn't start; it's tried again later");
     }
 }
 
@@ -452,7 +410,6 @@ impl Kept {
     /// log.
     pub(crate) fn new(path: PathBuf, take: bool, what: &'static str) -> anyhow::Result<Self> {
         let bound = bind(&path, take)?;
-        sweep_now_and_then(&path);
         if bound.is_none() {
             tracing::info!(path = %path.display(), "{what}: another kiln process serves this machine's socket; this one serves it once that one stops");
         }
@@ -470,7 +427,6 @@ impl Kept {
         if self.looked.elapsed() < if self.theirs { LOOK_THEIRS } else { LOOK } {
             return false;
         }
-        sweep_now_and_then(&self.path);
         self.look()
     }
 
@@ -589,31 +545,6 @@ pub fn serve_with(_host: &Arc<Host>, _path: PathBuf, _forward: Option<Forward>, 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The 2026-10-29 outage left 1,532 sockets of ended test and lab runners in the runtime
-    /// folder: a sweep takes those nothing answers on, and leaves a live one, a young one (bound,
-    /// not yet listening), and anything not a kiln socket.
-    #[cfg(unix)]
-    #[test]
-    fn sockets_nothing_answers_on_are_swept_and_live_ones_stay() -> anyhow::Result<()> {
-        use std::os::unix::net::UnixListener;
-        let dir = tempfile::tempdir()?;
-        let ended = |name: &str| -> anyhow::Result<PathBuf> {
-            let p = dir.path().join(name);
-            drop(UnixListener::bind(&p)?);
-            Ok(p)
-        };
-        let (dead_reach, dead_harness) = (ended("reach-lab-0-deadbeef.sock")?, ended("harness-lab-0-deadbeef.sock")?);
-        let live = dir.path().join("reach-adacachy-4b48ed43.sock");
-        let _listening = UnixListener::bind(&live)?;
-        let (foreign, notes) = (ended("someone-else.sock")?, dir.path().join("reach-notes.sock"));
-        std::fs::write(&notes, "not a socket")?;
-        anyhow::ensure!(sweep(dir.path(), std::time::Duration::from_secs(3600)) == 0, "a young socket went");
-        anyhow::ensure!(sweep(dir.path(), std::time::Duration::ZERO) == 2, "not just the two ended kiln sockets went");
-        anyhow::ensure!(!dead_reach.exists() && !dead_harness.exists(), "an ended runner's socket stayed");
-        anyhow::ensure!(live.exists() && foreign.exists() && notes.exists(), "a live socket, another program's or a plain file went");
-        Ok(())
-    }
 
     /// One request on the socket at `path`, from this process (on the blocking pool: the socket is
     /// served on the runtime). Linux's, as the one test that asks is (on macOS it was never used,

@@ -18,7 +18,7 @@ use std::io::Read as _;
 
 use base64::Engine as _;
 use http::StatusCode;
-use rusqlite::{OptionalExtension, params};
+use crate::sql::{OptionalExtension, params};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
@@ -289,9 +289,9 @@ pub async fn analyses(s: &Site<'_>, q: &std::collections::HashMap<String, String
 const ALERT_COLUMNS: &str = "number, git_ref, tool, category, rule_id, rule_name, rule_description, severity, security_severity, message, path, start_line, end_line, start_column, end_column,
     commit_sha, state, created_at, updated_at, fixed_at";
 
-fn alert_json(api: &str, html: &str, r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
+fn alert_json(api: &str, html: &str, r: &crate::sql::Row<'_>) -> crate::sql::Result<Value> {
     let number: i64 = r.get(0)?;
-    let at = |i: usize| -> rusqlite::Result<Option<String>> { Ok(r.get::<_, Option<i64>>(i)?.map(rfc3339)) };
+    let at = |i: usize| -> crate::sql::Result<Option<String>> { Ok(r.get::<_, Option<i64>>(i)?.map(rfc3339)) };
     Ok(json!({
         "number": number,
         "created_at": at(17)?,

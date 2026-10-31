@@ -217,7 +217,7 @@ pub async fn mint_job(hub: &Hub, leg: &str, run: &str, repo: &str, permissions: 
             let now = crate::util::now_unix();
             c.execute(
                 "INSERT INTO tokens (id, kind, principal, on_behalf_of, hash, scopes, created_at, expires_at) VALUES (?1, 'job', ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![crate::util::new_id(), leg, run, hash, scopes, now, now + ttl],
+                crate::sql::params![crate::util::new_id(), leg, run, hash, scopes, now, now + ttl],
             )?;
             Ok(())
         })
@@ -233,17 +233,17 @@ pub async fn job_of(hub: &Hub, token: &str) -> Option<Job> {
     let hash = crate::util::sha256_hex(token.trim().as_bytes());
     hub.store
         .call(move |c| {
-            use rusqlite::OptionalExtension as _;
+            use crate::sql::OptionalExtension as _;
             let now = crate::util::now_unix();
             let row: Option<(String, String, String, String)> = c
                 .query_row(
                     "SELECT id, principal, COALESCE(on_behalf_of, ''), scopes FROM tokens WHERE hash = ?1 AND kind = 'job' AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?2)",
-                    rusqlite::params![hash, now],
+                    crate::sql::params![hash, now],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                 )
                 .optional()?;
             let Some((id, leg, run, scopes)) = row else { return Ok(None) };
-            c.execute("UPDATE tokens SET last_used_at = ?2 WHERE id = ?1", rusqlite::params![id, now])?;
+            c.execute("UPDATE tokens SET last_used_at = ?2 WHERE id = ?1", crate::sql::params![id, now])?;
             let v: serde_json::Value = serde_json::from_str(&scopes).unwrap_or_default();
             let permissions = v.get("permissions").and_then(|p| serde_json::from_value(p.clone()).ok()).unwrap_or_default();
             let repo = v.get("repo").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
@@ -263,7 +263,7 @@ pub async fn job_of_request(hub: &Hub, headers: &http::HeaderMap) -> Option<Job>
 /// Revokes a leg's job tokens: its attempt ended (W10-R03).
 pub async fn revoke_leg(hub: &Hub, leg: &str) -> anyhow::Result<()> {
     let leg = leg.to_owned();
-    hub.store.call(move |c| Ok(c.execute("UPDATE tokens SET revoked_at = ?2 WHERE kind = 'job' AND principal = ?1 AND revoked_at IS NULL", rusqlite::params![leg, crate::util::now_unix()]).map(|_| ())?)).await
+    hub.store.call(move |c| Ok(c.execute("UPDATE tokens SET revoked_at = ?2 WHERE kind = 'job' AND principal = ?1 AND revoked_at IS NULL", crate::sql::params![leg, crate::util::now_unix()]).map(|_| ())?)).await
 }
 
 /// Drops job tokens that ended over a day ago.
@@ -271,7 +271,7 @@ pub async fn prune(hub: &Hub) -> anyhow::Result<usize> {
     hub.store
         .call(|c| {
             let before = crate::util::now_unix() - 86_400;
-            Ok(c.execute("DELETE FROM tokens WHERE kind = 'job' AND (revoked_at < ?1 OR expires_at < ?1)", rusqlite::params![before])?)
+            Ok(c.execute("DELETE FROM tokens WHERE kind = 'job' AND (revoked_at < ?1 OR expires_at < ?1)", crate::sql::params![before])?)
         })
         .await
 }

@@ -96,9 +96,7 @@ impl Class {
 const FEED: Class = Class::Carried("conversation feed");
 /// Repo sync's Raft (`crate::sync`): hyper-raft acknowledges and resends its own messages.
 const RAFT: Class = Class::Carried("repo sync's Raft");
-/// The cluster group (`crate::store::learner`, docs/p2p.md P2): its Raft is hyper-raft's, which
-/// acknowledges and resends; a runner's learner is told to join on every connect, and a read that
-/// can't learn where the server is in time goes to the server.
+/// Retired Kiln learner protocol retained only for compatibility refusal (U15).
 const CLUSTER: Class = Class::Carried("the cluster group");
 /// Observe's group (`crate::observe`, docs/observe.md §5): its Raft is hyper-raft's, which
 /// acknowledges and resends, and a write a runner takes is offered to the leader until it commits.
@@ -156,6 +154,7 @@ classes! {
         AgentMsg::StepStarted { .. } => Class::Stream,
         AgentMsg::StepFinished { .. } => Class::Stream,
         AgentMsg::JobFinished(..) => Class::Stream,
+        AgentMsg::JobFinishedV2 { .. } => Class::Stream,
         AgentMsg::JobSample { .. } => Class::Telemetry,
         AgentMsg::Reject { .. } => Class::Answer,
         AgentMsg::TermOutput { .. } => Class::Stream,
@@ -196,8 +195,10 @@ classes! {
         AgentMsg::Executor { .. } => Class::Answer,
         AgentMsg::Undeployed { .. } => Class::Answer,
         AgentMsg::Caps { .. } => Class::Handshake,
+        AgentMsg::RunnerProcess { .. } => Class::Handshake,
         AgentMsg::Wire(..) => CHANNEL,
         AgentMsg::Cluster { .. } => CLUSTER,
+        AgentMsg::Amphora { .. } => Class::Carried("Amphora"),
         AgentMsg::NetDrops { .. } => Class::Telemetry,
         AgentMsg::HarnessHandOver { .. } => Class::Stream,
         AgentMsg::HarnessAdopted { .. } => Class::Answer,
@@ -264,12 +265,17 @@ classes! {
         ServerMsg::PortAck { .. } => Class::Ack,
         ServerMsg::PortClose { .. } => PORTS,
         ServerMsg::Workspace { .. } => Class::Ask,
-        ServerMsg::Executor { .. } => Class::Ask,
+        // Both Start and Stop share one current live stream; a parked Stop cannot prove
+        // that all accepted earlier startup intents have quiesced.
+        ServerMsg::Executor { .. } => REFUSED,
         ServerMsg::Received { .. } => Class::Ack,
+        ServerMsg::ReceivedV2 { .. } => Class::Ack,
+        ServerMsg::RetainedReceived { .. } => Class::Ack,
         ServerMsg::Undeploy { .. } => PARKED,
         ServerMsg::Caps { .. } => Class::Handshake,
         ServerMsg::Wire(..) => CHANNEL,
         ServerMsg::Cluster { .. } => CLUSTER,
+        ServerMsg::Amphora { .. } => Class::Carried("Amphora"),
         ServerMsg::Kept { .. } => Class::State,
         ServerMsg::HarnessSend { .. } => PARKED,
         ServerMsg::AgentLimit { .. } => Class::State,
@@ -558,6 +564,7 @@ mod contract {
     #[test]
     fn class_of_gives_the_plans_examples() {
         assert_eq!(class_of(&ServerMsg::HarnessClose { session: "s".into() }), Class::Command(Away::Park));
+        assert_eq!(class_of(&ServerMsg::Executor { json: "{}".into() }), Class::Command(Away::Refuse), "executor Start and Stop share the same live command stream");
         assert_eq!(class_of(&ServerMsg::TermInput { session: "s".into(), data: vec![b'y'] }), Class::Command(Away::Refuse));
         assert_eq!(class_of(&AgentMsg::Harness { session: "s".into(), json: "{}".into() }), Class::Stream);
         assert_eq!(class_of(&AgentMsg::FrontDoorStatus { json: "{}".into() }), Class::State);

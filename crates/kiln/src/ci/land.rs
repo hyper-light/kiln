@@ -24,7 +24,7 @@ use http::StatusCode;
 use kiln_ci::land::{self, Strategy};
 use kiln_ci::review::State;
 use kiln_ci::trigger::{Event, Source};
-use rusqlite::{OptionalExtension as _, params};
+use crate::sql::{OptionalExtension as _, params};
 use serde_json::{Value, json};
 
 use super::Fail;
@@ -89,7 +89,7 @@ struct Entry {
     started_by: Option<Value>,
 }
 
-fn entry_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Entry> {
+fn entry_row(r: &crate::sql::Row<'_>) -> crate::sql::Result<Entry> {
     let diffs: String = r.get(1)?;
     let strategy: String = r.get(2)?;
     let started: Option<String> = r.get(7)?;
@@ -179,8 +179,15 @@ async fn queue_event(hub: &Hub, ids: &[String], action: &str, reason: Option<&st
 /// Takes an entry out of the queue, saying why (`code`: GitHub's reason, for `dequeued`); its
 /// diffs go back to their review state.
 async fn eject(hub: &Arc<Hub>, e: &Entry, reason: &str, code: &str) -> anyhow::Result<()> {
-    let (id, why) = (e.id.clone(), reason.to_owned());
-    hub.store.call(move |c| Ok(c.execute("UPDATE land_queue SET state = 'ejected', reason = ?2, updated_at = ?3 WHERE id = ?1", params![id, why, crate::util::now_unix()]).map(|_| ())?)).await?;
+    let (id, why, diffs, base) = (e.id.clone(), reason.to_owned(), e.diffs.clone(), hub.cfg.server.public_url.clone());
+    hub.store.call(move |c| {
+        let tx = crate::store::tx(c)?;
+        let changed = tx.execute("UPDATE land_queue SET state = 'ejected', reason = ?2, updated_at = ?3 WHERE id = ?1", params![id, why, crate::util::now_unix()])?;
+        if changed != 0 { super::notify::stage_land_control(&tx,&id,&diffs,&why,&base)?; }
+        tx.commit()?;
+        Ok(())
+    }).await?;
+    super::schedule::outbox::kick(hub).await;
     set_diff_state(hub, &e.diffs, State::Accepted).await?;
     hub.store.audit("kiln".into(), "queue.eject".into(), format!("{}: {reason}", e.id)).await;
     tell(hub, e, "ejected", Some(reason)).await;

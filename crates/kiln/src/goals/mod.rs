@@ -38,7 +38,7 @@ use std::time::Duration;
 
 use kiln_seams::HarnessPort;
 use kiln_seams::harness::Sent;
-use rusqlite::{OptionalExtension as _, params};
+use crate::sql::{OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -386,7 +386,7 @@ async fn stack_of(store: &crate::store::Store, agent: &str) -> R<Stack> {
     Ok(store.call(move |c| load(c, &agent)).await?)
 }
 
-fn load(c: &rusqlite::Connection, agent: &str) -> anyhow::Result<Stack> {
+fn load(c: &crate::sql::Connection, agent: &str) -> anyhow::Result<Stack> {
     let head: Option<(String, Option<String>, i64, i64, i64, i64, Option<String>, bool, bool, Option<String>)> = c
         .query_row(
             "SELECT state, reason, updated_at, dropped_at, COALESCE(json_array_length(cleared), 0), resume_at, held_for, COALESCE(plan_big, 1), COALESCE(side_by_side, 1), asked FROM goal_stacks WHERE agent = ?1",
@@ -606,7 +606,7 @@ struct Noted<'a> {
 }
 
 /// Notes goals `ids` as `n` says.
-fn note(c: &rusqlite::Connection, ids: &[String], n: Noted<'_>) -> anyhow::Result<()> {
+fn note(c: &crate::sql::Connection, ids: &[String], n: Noted<'_>) -> anyhow::Result<()> {
     let step = n.step;
     for id in ids {
         c.execute(
@@ -710,7 +710,7 @@ fn check_needs(items: &[Item], changes: &[(String, Vec<String>)]) -> R<()> {
 
 /// Goals of `items` taken out of the stack (`gone`) leave the goals that waited for them waiting
 /// for what they waited for, so the order they kept holds.
-fn rewire(c: &rusqlite::Connection, items: &[Item], gone: &[String]) -> anyhow::Result<()> {
+fn rewire(c: &crate::sql::Connection, items: &[Item], gone: &[String]) -> anyhow::Result<()> {
     if gone.is_empty() {
         return Ok(());
     }
@@ -760,7 +760,7 @@ fn added(s: &Stack, before: &[String]) -> Vec<String> {
 
 /// Puts the goals done first (as they were), then the one under way, then those to come (each as
 /// they were): after a goal's status changed where it stood.
-fn renumber(c: &rusqlite::Connection, agent: &str) -> anyhow::Result<()> {
+fn renumber(c: &crate::sql::Connection, agent: &str) -> anyhow::Result<()> {
     let mut st = c.prepare("SELECT id FROM goal_items WHERE agent = ?1 ORDER BY CASE status WHEN 'pending' THEN 2 WHEN 'active' THEN 1 ELSE 0 END, pos")?;
     let ids = st.query_map(params![agent], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
     for (pos, id) in ids.iter().enumerate() {
@@ -769,7 +769,7 @@ fn renumber(c: &rusqlite::Connection, agent: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn touch(c: &rusqlite::Connection, agent: &str, state: Option<&str>, reason: Option<&str>, now: i64) -> anyhow::Result<()> {
+fn touch(c: &crate::sql::Connection, agent: &str, state: Option<&str>, reason: Option<&str>, now: i64) -> anyhow::Result<()> {
     c.execute(
         "INSERT INTO goal_stacks (agent, state, reason, created_at, updated_at) VALUES (?1, COALESCE(?2, 'paused'), ?3, ?4, ?4)
          ON CONFLICT(agent) DO UPDATE SET state = COALESCE(?2, state), reason = CASE WHEN ?2 IS NULL THEN reason ELSE ?3 END,
@@ -1272,7 +1272,7 @@ async fn update_counted(hub: &Hub, agent: &str, id: &str, change: Change, by: &B
 }
 
 /// Notes what goals wait for (`changes`: a goal's id, and the goals it waits for), as `who` says.
-fn set_needs(c: &rusqlite::Connection, changes: &[(String, Vec<String>)], who: &str) -> anyhow::Result<()> {
+fn set_needs(c: &crate::sql::Connection, changes: &[(String, Vec<String>)], who: &str) -> anyhow::Result<()> {
     for (id, needs) in changes {
         c.execute("UPDATE goal_items SET needs = ?2, needs_by = ?3 WHERE id = ?1", params![id, serde_json::to_string(needs)?, who])?;
     }
@@ -1547,7 +1547,7 @@ async fn control_counted(hub: &Hub, agent: &str, action: Action, by: &By, pausin
 
 /// The stack's state as what's left of it says: done with nothing left, else as it is (its goal
 /// under way left as it was: on its way to the agent already).
-fn settle(c: &rusqlite::Connection, agent: &str, now: i64) -> anyhow::Result<()> {
+fn settle(c: &crate::sql::Connection, agent: &str, now: i64) -> anyhow::Result<()> {
     let left = c.query_row("SELECT COUNT(*) FROM goal_items WHERE agent = ?1 AND status IN ('pending', 'active')", params![agent], |r| r.get::<_, i64>(0))?;
     if left == 0 {
         touch(c, agent, Some("done"), None, now)?;
@@ -1572,7 +1572,7 @@ pub fn asked_id(scope: &str, agent: &str, what: &str, goal: Option<&str>, key: O
 }
 
 /// `asked` noted among `agent`'s stack's newest [`ASKED_MAX`].
-fn note_asked(c: &rusqlite::Connection, agent: &str, asked: &str) -> anyhow::Result<()> {
+fn note_asked(c: &crate::sql::Connection, agent: &str, asked: &str) -> anyhow::Result<()> {
     let was: Option<String> = c.query_row("SELECT asked FROM goal_stacks WHERE agent = ?1", params![agent], |r| r.get(0)).optional()?.flatten();
     let mut all: Vec<String> = was.and_then(|w| serde_json::from_str(&w).ok()).unwrap_or_default();
     all.retain(|a| a != asked);
@@ -1615,7 +1615,7 @@ fn asked_again(items: &[Item], reason: &str, worded: bool, by: &By, info: &Info,
 /// once (its last send forgotten: the pause since it started is long over), reminders starting
 /// over, a verdict from before (`said_at`: what its harness last said of its goal) not counting;
 /// with nothing left, it's done. A pause for a while is over.
-fn run_from_here(c: &rusqlite::Connection, agent: &str, said_at: i64, now: i64) -> anyhow::Result<()> {
+fn run_from_here(c: &crate::sql::Connection, agent: &str, said_at: i64, now: i64) -> anyhow::Result<()> {
     c.execute("UPDATE goal_items SET reminded_at = 0, reminders = 0, busy_at = 0, prior_at = MAX(prior_at, ?2) WHERE agent = ?1 AND status = 'active'", params![agent, said_at])?;
     let left = c.query_row("SELECT COUNT(*) FROM goal_items WHERE agent = ?1 AND status IN ('pending', 'active')", params![agent], |r| r.get::<_, i64>(0))?;
     touch(c, agent, Some(if left > 0 { "running" } else { "done" }), None, now)?;
@@ -1639,7 +1639,7 @@ struct Cleared {
 
 /// Empties an agent's stack and pauses it, at `now`, keeping its goals as they were to bring back
 /// ([`restore`]: the last clear's; clearing none keeps those).
-fn clear(c: &rusqlite::Connection, agent: &str, now: i64) -> anyhow::Result<()> {
+fn clear(c: &crate::sql::Connection, agent: &str, now: i64) -> anyhow::Result<()> {
     let items = load(c, agent)?.items;
     touch(c, agent, Some("paused"), None, now)?;
     if !items.is_empty() {
@@ -1652,7 +1652,7 @@ fn clear(c: &rusqlite::Connection, agent: &str, now: i64) -> anyhow::Result<()> 
 }
 
 /// Brings back the goals cleared last (`merged` says where) and runs the stack, at `now`.
-fn restore(c: &rusqlite::Connection, agent: &str, said_at: i64, now: i64) -> anyhow::Result<()> {
+fn restore(c: &crate::sql::Connection, agent: &str, said_at: i64, now: i64) -> anyhow::Result<()> {
     let kept: Option<String> = c.query_row("SELECT cleared FROM goal_stacks WHERE agent = ?1", params![agent], |r| r.get(0)).optional()?.flatten();
     let back: Vec<Cleared> = serde_json::from_str(kept.as_deref().unwrap_or("[]"))?;
     let back = back.into_iter().map(|k| Item { send_id: k.send_id, ended_turn: k.ended_turn, ..k.item }).collect();
@@ -3114,6 +3114,8 @@ mod tests {
     fn a_goal_skipped_said_met_or_taken_out_counts_as_ended_once() -> anyhow::Result<()> {
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub_with(|c| c.conversations.off = true).await?;
+            // U17: complete restoration before this fixture accepts session starts.
+            crate::harness::registry::Registry::initialize_local(&hub).await?;
             let dir = tempfile::tempdir()?;
             let spec = crate::harness::session::Spec {
                 kind: "claude".into(),
@@ -3340,6 +3342,8 @@ mod tests {
         }
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub_with(|c| c.conversations.off = true).await?;
+            // U17: complete restoration before this fixture accepts session starts.
+            crate::harness::registry::Registry::initialize_local(&hub).await?;
             let h = Arc::clone(&hub);
             crate::rt::spawn(async move {
                 let _ = crate::harness::registry::Registry::run_local(h).await;
@@ -3428,6 +3432,8 @@ mod tests {
         }
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub_with(|c| c.conversations.off = true).await?;
+            // U17: complete restoration before this fixture accepts session starts.
+            crate::harness::registry::Registry::initialize_local(&hub).await?;
             let h = Arc::clone(&hub);
             crate::rt::spawn(async move {
                 let _ = crate::harness::registry::Registry::run_local(h).await;
@@ -3516,11 +3522,13 @@ mod tests {
         }
         async fn item(hub: &Hub) -> anyhow::Result<Option<(String, Option<String>)>> {
             hub.store
-                .call(|c| Ok(rusqlite::OptionalExtension::optional(c.query_row("SELECT status, send_id FROM goal_items WHERE id = 'kept-g1'", [], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))))?))
+                .call(|c| Ok(crate::sql::OptionalExtension::optional(c.query_row("SELECT status, send_id FROM goal_items WHERE id = 'kept-g1'", [], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))))?))
                 .await
         }
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub_with(|c| c.conversations.off = true).await?;
+            // U17: complete restoration before this fixture accepts session starts.
+            crate::harness::registry::Registry::initialize_local(&hub).await?;
             let h = Arc::clone(&hub);
             crate::rt::spawn(async move {
                 let _ = crate::harness::registry::Registry::run_local(h).await;
@@ -4225,6 +4233,8 @@ mod stack_tests {
                 c.conversations.off = true;
             })
             .await?;
+            // U17: complete restoration before this fixture accepts session starts.
+            crate::harness::registry::Registry::initialize_local(&hub).await?;
             let h = Arc::clone(&hub);
             crate::rt::spawn(async move {
                 let _ = crate::harness::registry::Registry::run_local(h).await;
@@ -4470,6 +4480,8 @@ mod stack_tests {
                 c.conversations.off = true;
             })
             .await?;
+            // U17: complete restoration before this fixture accepts session starts.
+            crate::harness::registry::Registry::initialize_local(&hub).await?;
             let h = Arc::clone(&hub);
             crate::rt::spawn(async move {
                 let _ = crate::harness::registry::Registry::run_local(h).await;
@@ -4651,6 +4663,8 @@ mod stack_tests {
             c.conversations.off = true;
         })
         .await?;
+        // U17: complete restoration before this fixture accepts session starts.
+        crate::harness::registry::Registry::initialize_local(&hub).await?;
         let h = Arc::clone(&hub);
         crate::rt::spawn(async move {
             let _ = crate::harness::registry::Registry::run_local(h).await;
@@ -5024,6 +5038,8 @@ mod stack_tests {
         use crate::harness::model::{Body, Event, Given, QueueItem, State};
         use crate::harness::registry::Location;
         let hub = crate::hub::tests::scratch_hub().await?;
+        // U17: complete restoration before this fixture accepts session starts.
+        crate::harness::registry::Registry::initialize_local(&hub).await?;
         let port = RegistryPort { hub: Arc::clone(&hub), sent: parking_lot::Mutex::new(Vec::new()) };
         let there = Location::Machine("box".into());
         let info = Info { id: id.into(), kind: "claude".into(), status: Status::Running, epoch: 1, ..Info::default() };

@@ -3,11 +3,12 @@
 //! `kiln.goals.*`. Each is one of the console's `/api/harness/sessions/:id/goals` routes, which call
 //! the same functions.
 
-use http::{Method, StatusCode};
+use crate::authz::At as ScopeAt;
+use http::StatusCode;
 use serde_json::{Value, json};
 
 use super::{Action, At, By, Change, Error, Given, Need, NewGoal, Pausing};
-use crate::ops::{Cx, Fail, Input, Op, Out, path};
+use crate::ops::{Cx, Fail, Input, Op, Out, Definition, Part, Routes};
 
 fn fail(e: Error) -> Fail {
     match e {
@@ -149,7 +150,7 @@ async fn order(cx: Cx, v: Value) -> Out {
 async fn set(cx: Cx, v: Value) -> Out {
     let agent = agent_of(&v)?;
     crate::harness::lineage::may_steer(&cx.hub, &cx.caller, &agent).await?;
-    let given: Vec<Given> = serde_json::from_value(v.get("goals").cloned().unwrap_or_else(|| json!([]))).map_err(|e| (StatusCode::BAD_REQUEST, format!("`goals`: {e}")))?;
+    let given: Vec<Given> = serde_json::from_value(v.get("goals").cloned().ok_or_else(|| (StatusCode::BAD_REQUEST, "`goals` is required".to_owned()))?).map_err(|e| (StatusCode::BAD_REQUEST, format!("`goals`: {e}")))?;
     let s = super::set(&cx.hub, &agent, given).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "goals.set".into(), agent).await;
     json_of(&s)
@@ -313,7 +314,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: true,
             destructive: false,
             input: Input::of::<input::GoalsGet>(),
-            route: |v| Ok((Method::GET, path(&["api", "harness", "sessions", &agent_of(v)?, "goals"]))),
+            route: Routes(vec![Definition::new("GET", &[Part::Literal("api"), Part::Literal("harness"), Part::Literal("sessions"), Part::Field("agent"), Part::Literal("goals")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(get(cx, v)),
         },
         Op {
@@ -322,7 +323,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: false,
             input: Input::of::<input::GoalsAdd>(),
-            route: |v| Ok((Method::POST, path(&["api", "harness", "sessions", &agent_of(v)?, "goals"]))),
+            route: Routes(vec![Definition::new("POST", &[Part::Literal("api"), Part::Literal("harness"), Part::Literal("sessions"), Part::Field("agent"), Part::Literal("goals")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(add(cx, v)),
         },
         Op {
@@ -331,7 +332,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: true,
             input: Input::of::<input::GoalsSet>(),
-            route: |v| Ok((Method::PUT, path(&["api", "harness", "sessions", &agent_of(v)?, "goals"]))),
+            route: Routes(vec![Definition::new("PUT", &[Part::Literal("api"), Part::Literal("harness"), Part::Literal("sessions"), Part::Field("agent"), Part::Literal("goals")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(set(cx, v)),
         },
         Op {
@@ -340,7 +341,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: false,
             input: Input::of::<input::GoalsControl>(),
-            route: |v| Ok((Method::POST, path(&["api", "harness", "sessions", &agent_of(v)?, "goals", v.get("action").and_then(Value::as_str).unwrap_or("start")]))),
+            route: Routes(vec![Definition::new("POST", &[Part::Literal("api"), Part::Literal("harness"), Part::Literal("sessions"), Part::Field("agent"), Part::Literal("goals"), Part::Default("action", "start")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(control(cx, v)),
         },
         Op {
@@ -349,7 +350,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: false,
             input: Input::of::<input::GoalsDone>(),
-            route: |v| Ok((Method::POST, path(&["api", "harness", "sessions", &agent_of(v)?, "goals", "done"]))),
+            route: Routes(vec![Definition::new("POST", &[Part::Literal("api"), Part::Literal("harness"), Part::Literal("sessions"), Part::Field("agent"), Part::Literal("goals"), Part::Literal("done")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(done(cx, v)),
         },
         Op {
@@ -358,7 +359,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: true,
             input: Input::of::<input::GoalsUpdate>(),
-            route: |v| Ok((Method::PATCH, path(&["api", "harness", "sessions", &agent_of(v)?, "goals", &opt(v, "id").unwrap_or_default()]))),
+            route: Routes(vec![Definition::new("PATCH", &[Part::Literal("api"), Part::Literal("harness"), Part::Literal("sessions"), Part::Field("agent"), Part::Literal("goals"), Part::Default("id", "")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(update(cx, v)),
         },
         Op {
@@ -367,7 +368,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: false,
             input: Input::of::<input::GoalsOrder>(),
-            route: |v| Ok((Method::POST, path(&["api", "harness", "sessions", &agent_of(v)?, "goals", "order"]))),
+            route: Routes(vec![Definition::new("POST", &[Part::Literal("api"), Part::Literal("harness"), Part::Literal("sessions"), Part::Field("agent"), Part::Literal("goals"), Part::Literal("order")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(order(cx, v)),
         },
         Op {
@@ -376,7 +377,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: false,
             input: Input::of::<input::GoalsPlan>(),
-            route: |v| Ok((Method::POST, path(&["api", "harness", "sessions", &agent_of(v)?, "goals", "plan"]))),
+            route: Routes(vec![Definition::new("POST", &[Part::Literal("api"), Part::Literal("harness"), Part::Literal("sessions"), Part::Field("agent"), Part::Literal("goals"), Part::Literal("plan")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(plan(cx, v)),
         },
         Op {
@@ -385,7 +386,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: false,
             input: Input::of::<input::GoalsSettings>(),
-            route: |v| Ok((Method::POST, path(&["api", "harness", "sessions", &agent_of(v)?, "goals", "settings"]))),
+            route: Routes(vec![Definition::new("POST", &[Part::Literal("api"), Part::Literal("harness"), Part::Literal("sessions"), Part::Field("agent"), Part::Literal("goals"), Part::Literal("settings")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(settings(cx, v)),
         },
         Op {
@@ -394,7 +395,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: false,
             input: Input::of::<input::GoalsSplit>(),
-            route: |v| Ok((Method::POST, path(&["api", "harness", "sessions", &agent_of(v)?, "goals", "split"]))),
+            route: Routes(vec![Definition::new("POST", &[Part::Literal("api"), Part::Literal("harness"), Part::Literal("sessions"), Part::Field("agent"), Part::Literal("goals"), Part::Literal("split")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(split(cx, v)),
         },
     ]
@@ -684,6 +685,8 @@ mod tests {
                 c.conversations.off = true;
             })
             .await?;
+            // U17: complete restoration before this fixture accepts session starts.
+            crate::harness::registry::Registry::initialize_local(&hub).await?;
             let h = Arc::clone(&hub);
             crate::rt::spawn(async move {
                 let _ = crate::harness::registry::Registry::run_local(h).await;
@@ -754,6 +757,8 @@ mod tests {
                 c.conversations.off = true;
             })
             .await?;
+            // U17: complete restoration before this fixture accepts session starts.
+            crate::harness::registry::Registry::initialize_local(&hub).await?;
             let h = Arc::clone(&hub);
             crate::rt::spawn(async move {
                 let _ = crate::harness::registry::Registry::run_local(h).await;
@@ -798,6 +803,8 @@ mod tests {
             c.conversations.off = true;
         })
         .await?;
+        // U17: complete restoration before this fixture accepts session starts.
+        crate::harness::registry::Registry::initialize_local(&hub).await?;
         let h = Arc::clone(&hub);
         crate::rt::spawn(async move {
             let _ = crate::harness::registry::Registry::run_local(h).await;
@@ -945,6 +952,8 @@ mod tests {
                 c.conversations.off = true;
             })
             .await?;
+            // U17: complete restoration before this fixture accepts session starts.
+            crate::harness::registry::Registry::initialize_local(&hub).await?;
             let h = Arc::clone(&hub);
             crate::rt::spawn(async move {
                 let _ = crate::harness::registry::Registry::run_local(h).await;
@@ -1072,6 +1081,8 @@ mod tests {
                 c.conversations.off = true;
             })
             .await?;
+            // U17: complete restoration before this fixture accepts session starts.
+            crate::harness::registry::Registry::initialize_local(&hub).await?;
             let h = Arc::clone(&hub);
             crate::rt::spawn(async move {
                 let _ = crate::harness::registry::Registry::run_local(h).await;
@@ -1136,6 +1147,8 @@ mod tests {
                 c.conversations.off = true;
             })
             .await?;
+            // U17: complete restoration before this fixture accepts session starts.
+            crate::harness::registry::Registry::initialize_local(&hub).await?;
             let h = Arc::clone(&hub);
             crate::rt::spawn(async move {
                 let _ = crate::harness::registry::Registry::run_local(h).await;

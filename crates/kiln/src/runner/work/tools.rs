@@ -76,11 +76,11 @@ async fn entry_request(svc: &Arc<Service>, c: &Claims, req: Request, ns: &str, n
             if let Some(r) = may_write(c) {
                 return Ok(r);
             }
-            let (digest, size) = match svc.take_body(req.into_body(), None).await? {
+            let publication = match svc.take_body(req.into_body(), None).await? {
                 Ok(k) => k,
                 Err(r) => return Ok(r),
             };
-            svc.set(c, ns, name, &digest, size, meta).await?;
+            svc.set(c, ns, name, &publication, meta).await?;
             Ok(srv::status(StatusCode::CREATED))
         }
         Method::DELETE => {
@@ -189,11 +189,11 @@ async fn bazel(svc: &Arc<Service>, req: Request, rest: &[&str]) -> anyhow::Resul
             if let Some(r) = may_write(&c) {
                 return Ok(r);
             }
-            let (digest, size) = match svc.take_body(req.into_body(), Some(&hash)).await? {
+            let publication = match svc.take_body(req.into_body(), Some(&hash)).await? {
                 Ok(k) => k,
                 Err(r) => return Ok(r),
             };
-            svc.hold(&c, &digest, size)?;
+            svc.hold(&c, &publication).await?;
             Ok(srv::status(StatusCode::CREATED))
         }
         _ => Ok(srv::with_header(msg(StatusCode::METHOD_NOT_ALLOWED, "not a method of Bazel's cache"), header::ALLOW, "GET, HEAD, PUT")),
@@ -243,11 +243,11 @@ async fn turbo(svc: &Arc<Service>, req: Request, rest: &[&str]) -> anyhow::Resul
             if let Some(r) = may_write(&c) {
                 return Ok(r);
             }
-            let (digest, size) = match svc.take_body(req.into_body(), None).await? {
+            let publication = match svc.take_body(req.into_body(), None).await? {
                 Ok(k) => k,
                 Err(r) => return Ok(r),
             };
-            svc.set(&c, "turbo", hash, &digest, size, meta).await?;
+            svc.set(&c, "turbo", hash, &publication, meta).await?;
             Ok(srv::json(StatusCode::ACCEPTED, &json!({ "urls": [hash] })))
         }
         (&Method::GET | &Method::HEAD, ["artifacts", hash]) => entry_request(svc, &c, req, "turbo", hash, BTreeMap::new()).await,

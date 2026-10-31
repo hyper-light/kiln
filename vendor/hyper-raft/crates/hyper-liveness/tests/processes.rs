@@ -638,6 +638,21 @@ fn record_lines(me: u64, entries: &[Entry], liveness: &Liveness, out: &mut Strin
             Entry::Told(Change::Restarted { peer, at_ns }) => {
                 writeln!(out, "r {me} n {peer} {at_ns}")
             }
+            Entry::Told(Change::Stopped { peer, at_ns }) => {
+                writeln!(out, "r {me} x {peer} {at_ns}")
+            }
+            Entry::Told(Change::DiskSlow { peer, at_ns }) => {
+                writeln!(out, "r {me} ds {peer} {at_ns}")
+            }
+            Entry::Told(Change::DiskCaughtUp { peer, at_ns }) => {
+                writeln!(out, "r {me} du {peer} {at_ns}")
+            }
+            Entry::Told(Change::ModeDiffers { peer, at_ns }) => {
+                writeln!(out, "r {me} md {peer} {at_ns}")
+            }
+            Entry::Told(Change::ModeAgrees { peer, at_ns }) => {
+                writeln!(out, "r {me} ma {peer} {at_ns}")
+            }
             Entry::Holds { peer, trust } => {
                 writeln!(out, "r {me} h {peer} {}", trust_field(trust))
             }
@@ -673,6 +688,8 @@ fn parse_record(fields: &[&str]) -> Option<(u64, Entry, Option<u64>)> {
                     stamp: number(5)?,
                     due: number(6)?,
                     sent: number(7)?,
+                    // The member processes stop by a signal, never in order.
+                    stopping: false,
                 },
                 refused: parse_refusal(fields.get(8)?)?,
                 holds: parse_trust(fields.get(9)?)?,
@@ -724,6 +741,41 @@ fn parse_record(fields: &[&str]) -> Option<(u64, Entry, Option<u64>)> {
         ),
         "n" => (
             Entry::Told(Change::Restarted {
+                peer: number(2)?,
+                at_ns: number(3)?,
+            }),
+            None,
+        ),
+        "x" => (
+            Entry::Told(Change::Stopped {
+                peer: number(2)?,
+                at_ns: number(3)?,
+            }),
+            None,
+        ),
+        "ds" => (
+            Entry::Told(Change::DiskSlow {
+                peer: number(2)?,
+                at_ns: number(3)?,
+            }),
+            None,
+        ),
+        "du" => (
+            Entry::Told(Change::DiskCaughtUp {
+                peer: number(2)?,
+                at_ns: number(3)?,
+            }),
+            None,
+        ),
+        "md" => (
+            Entry::Told(Change::ModeDiffers {
+                peer: number(2)?,
+                at_ns: number(3)?,
+            }),
+            None,
+        ),
+        "ma" => (
+            Entry::Told(Change::ModeAgrees {
                 peer: number(2)?,
                 at_ns: number(3)?,
             }),

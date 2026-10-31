@@ -26,6 +26,48 @@ pub struct RunnerArgs {
 pub enum RunnerCmd {
     /// The one-time privileged steps an executor needs on this machine.
     Setup(SetupArgs),
+    /// Inspect legacy process ownership; reconcile only with exact cold-boot evidence.
+    Reconcile(ReconcileArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ReconcileArgs {
+    /// Clear unchanged legacy process evidence only after a proven kernel boot change.
+    /// Persistent daemon ownership must already be resolved. This never restarts a runner.
+    #[arg(long)]
+    pub after_cold_boot: bool,
+}
+
+const RECONCILE_INSPECT: crate::ops::local::Op<(), super::processes::migration::Report> = crate::ops::local::Op {
+    name: "runner.reconcile.inspect",
+    summary: "Inspect local legacy CI ownership evidence without changing it.",
+    read_only: true,
+    destructive: false,
+    input: crate::ops::Input::of::<crate::ops::local::Empty>(),
+    route: crate::ops::local::Only,
+    run: |(), input| Box::pin(async move {
+        anyhow::ensure!(input.as_object().is_some_and(serde_json::Map::is_empty), "an empty input object is required");
+        crate::rt::blocking(|| super::processes::migration::run(RECONCILE_INSPECT.name, false)).await?
+    }),
+};
+const RECONCILE_COLD: crate::ops::local::Op<(), super::processes::migration::Report> = crate::ops::local::Op {
+    name: "runner.reconcile.after_cold_boot",
+    summary: "Reconcile unchanged legacy process evidence after an exact kernel boot change.",
+    read_only: false,
+    destructive: true,
+    input: crate::ops::Input::of::<crate::ops::local::Empty>(),
+    route: crate::ops::local::Only,
+    run: |(), input| Box::pin(async move {
+        anyhow::ensure!(input.as_object().is_some_and(serde_json::Map::is_empty), "an empty input object is required");
+        crate::rt::blocking(|| super::processes::migration::run(RECONCILE_COLD.name, true)).await?
+    }),
+};
+
+async fn reconcile_cli(args: ReconcileArgs) -> anyhow::Result<()> {
+    let operation = if args.after_cold_boot { &RECONCILE_COLD } else { &RECONCILE_INSPECT };
+    let report = crate::ops::local::invoke(operation, (), serde_json::json!({})).await?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
 }
 
 #[derive(clap::Args, Debug)]
@@ -275,7 +317,10 @@ async fn fetch_firecracker(to: &Path) -> anyhow::Result<String> {
 
 /// `kiln runner setup <executor>`.
 pub async fn cli(a: RunnerArgs) -> anyhow::Result<()> {
-    let RunnerCmd::Setup(s) = a.cmd;
+    let s = match a.cmd {
+        RunnerCmd::Setup(s) => s,
+        RunnerCmd::Reconcile(args) => return reconcile_cli(args).await,
+    };
     let bin = s.bin_dir.clone().unwrap_or_else(|| crate::os::home_dir().join(".kiln").join("bin"));
     let m = crate::rt::blocking({
         let bin = bin.clone();

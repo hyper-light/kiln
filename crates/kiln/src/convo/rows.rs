@@ -131,6 +131,64 @@ impl Row {
         }
     }
 
+    /// Heap capacity owned by this row, excluding its enclosing Row slot. Checked accounting
+    /// covers identifiers and optional fields as well as payloads; it is not process RSS.
+    pub fn retained_bytes(&self) -> Option<usize> {
+        let sum = |values: &[usize]| values.iter().try_fold(0usize, |n, v| n.checked_add(*v));
+        let opt = |s: &Option<String>| s.as_ref().map_or(0, String::capacity);
+        match self {
+            Row::Session { session, info, meta, state, changes, .. } => sum(&[session.capacity(), opt(info), opt(meta), opt(state), opt(changes)]),
+            Row::Event(e) => sum(&[std::mem::size_of::<EventRow>(), e.session.capacity(), e.id.capacity(), opt(&e.parent), opt(&e.by), e.kind.capacity(), opt(&e.level), opt(&e.tool), opt(&e.status), e.text.capacity(), e.body.capacity()]),
+            Row::Record(r) => sum(&[std::mem::size_of::<RecordRow>(), r.session.capacity(), r.source.capacity(), r.line.capacity(), r.kept.as_ref().map_or(0, Vec::capacity)]),
+            Row::RecordReset { session, source, .. } => sum(&[session.capacity(), source.capacity()]),
+            Row::Machine { session, machine } => sum(&[session.capacity(), machine.capacity()]),
+            Row::Reset { session, .. } | Row::Closed { session, .. } => Some(session.capacity()),
+        }
+    }
+
+    /// Conservative final SQL input, after staging large transcript lines. A compressed legacy
+    /// line may decode to any valid inline length; never budget its compressed length alone.
+    pub fn prepared_bytes(&self) -> Option<usize> {
+        let mut strings = vec![self.session()];
+        let extra = match self {
+            Row::Session { info, meta, state, changes, .. } => {
+                strings.extend([info, meta, state, changes].into_iter().filter_map(|s| s.as_deref()));
+                0
+            }
+            Row::Event(e) => {
+                strings.extend([e.id.as_str(), e.kind.as_str(), e.text.as_str(), e.body.as_str()]);
+                strings.extend([&e.parent, &e.by, &e.level, &e.tool, &e.status].into_iter().filter_map(|s| s.as_deref()));
+                0
+            }
+            Row::Record(r) => {
+                strings.push(&r.source);
+                match &r.kept {
+                    Some(kept) if kept.first() == Some(&3) => 41,
+                    Some(_) => 512 << 10,
+                    None if r.line.len() > 512 << 10 => 41,
+                    None => r.line.len(),
+                }
+            }
+            Row::RecordReset { source, .. } => { strings.push(source); 0 }
+            Row::Machine { machine, .. } => { strings.push(machine); 0 }
+            Row::Reset { .. } | Row::Closed { .. } => 0,
+        };
+        strings.into_iter().try_fold(512usize.checked_add(extra)?, |n, s| n.checked_add(64)?.checked_add(s.len()))
+    }
+
+    /// U05: conservative selected-owner session exchanges at canonical Amphora e2e67247.
+    /// A prior staged Record can read512parts:522 total exchanges, rounded up to600.
+    pub fn command_cost(&self) -> usize {
+        match self {
+            Row::Session { .. } => 4,
+            Row::Event(_) => 2,
+            Row::Reset { .. } => 4,
+            Row::RecordReset { .. } => 5,
+            Row::Machine { .. } | Row::Closed { .. } => 2,
+            Row::Record(_) => 600,
+        }
+    }
+
     /// Its size as a feed sends it, near enough.
     pub fn bytes(&self) -> usize {
         match self {
@@ -144,11 +202,22 @@ impl Row {
 
 /// The rows one update of `session` makes, at `now`. Streaming text and replies to one viewer make
 /// none: an event's text is kept as its update says once it's whole, and a reply is no one else's.
+/// Historical fixture/migration conversion. New admitted batches use [`try_of`] and surface
+/// encoding errors; this compatibility helper does not provide the no-drop contract.
 pub fn of(session: &str, update: &Update, now: i64) -> Vec<Row> {
+    try_of(session, update, now).unwrap_or_default()
+}
+
+/// Historical fixture helper; new conversion keeps every event or returns its encoding error.
+pub fn event(session: &str, e: &Event) -> Option<EventRow> {
+    try_event(session, e).ok()
+}
+
+pub fn try_of(session: &str, update: &Update, now: i64) -> Result<Vec<Row>, serde_json::Error> {
     let s = || session.to_owned();
-    match update {
+    Ok(match update {
         Update::Open { info, since } => {
-            let open = Row::Session { session: s(), info: json(info.as_ref()), meta: None, state: None, changes: None, epoch: None, open: true, at: now };
+            let open = Row::Session { session: s(), info: Some(serde_json::to_string(info.as_ref())?), meta: None, state: None, changes: None, epoch: None, open: true, at: now };
             // Going on from what the copy has (a runner that started again): its events after
             // that go, and those its machine has come again.
             match since {
@@ -156,22 +225,22 @@ pub fn of(session: &str, update: &Update, now: i64) -> Vec<Row> {
                 None => vec![open],
             }
         }
-        Update::State { state } => vec![Row::Session { session: s(), info: None, meta: None, state: json(state.as_ref()), changes: None, epoch: Some(state.epoch), open: false, at: now }],
-        Update::Meta { meta } => vec![Row::Session { session: s(), info: None, meta: json(meta.as_ref()), state: None, changes: None, epoch: None, open: false, at: now }],
-        Update::Changes { files } => vec![Row::Session { session: s(), info: None, meta: None, state: None, changes: json(files), epoch: None, open: false, at: now }],
-        Update::Events { events } => events.iter().filter_map(|e| event(session, e)).map(|e| Row::Event(Box::new(e))).collect(),
+        Update::State { state } => vec![Row::Session { session: s(), info: None, meta: None, state: Some(serde_json::to_string(state.as_ref())?), changes: None, epoch: Some(state.epoch), open: false, at: now }],
+        Update::Meta { meta } => vec![Row::Session { session: s(), info: None, meta: Some(serde_json::to_string(meta.as_ref())?), state: None, changes: None, epoch: None, open: false, at: now }],
+        Update::Changes { files } => vec![Row::Session { session: s(), info: None, meta: None, state: None, changes: Some(serde_json::to_string(files)?), epoch: None, open: false, at: now }],
+        Update::Events { events } => events.iter().map(|e| try_event(session, e).map(|e| Row::Event(Box::new(e)))).collect::<Result<Vec<_>, _>>()?,
         Update::Reset { from } => vec![Row::Reset { session: s(), from: *from, at: now }],
         Update::Closed => vec![Row::Closed { session: s(), at: now }],
         Update::Stream { .. } | Update::Reply { .. } | Update::Inbox { .. } => Vec::new(),
         // Only what changed: whoever takes it in stores the whole changeset it makes (the server's
         // copy, `harness::registry`). A session's own core never makes one.
         Update::ChangesPatch { .. } => Vec::new(),
-    }
+    })
 }
 
 /// An event's row.
-pub fn event(session: &str, e: &Event) -> Option<EventRow> {
-    let body = serde_json::to_string(e).ok()?;
+pub fn try_event(session: &str, e: &Event) -> Result<EventRow, serde_json::Error> {
+    let body = serde_json::to_string(e)?;
     let (kind, level, tool, status, text) = match &e.body {
         Body::User { text, attachments, .. } => {
             let mut t = text.clone();
@@ -193,7 +262,7 @@ pub fn event(session: &str, e: &Event) -> Option<EventRow> {
             ("tool", Some(json_word(&t.tool)), Some(t.name.clone()), Some(status_word(t.status)), words)
         }
     };
-    Some(EventRow {
+    Ok(EventRow {
         session: session.to_owned(),
         id: e.id.clone(),
         seq: e.seq,
@@ -323,11 +392,6 @@ fn status_word(s: ToolStatus) -> String {
 /// An enum's word as serde writes it ("shell", "error"…).
 fn json_word<T: Serialize>(v: &T) -> String {
     serde_json::to_value(v).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default()
-}
-
-/// A model value as JSON.
-fn json<T: Serialize + ?Sized>(v: &T) -> Option<String> {
-    serde_json::to_string(v).ok()
 }
 
 #[cfg(test)]

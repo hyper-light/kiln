@@ -248,7 +248,7 @@ impl Remote {
 
     /// git's settings for one call to the host with credentials for this repository (`write`: one
     /// that pushes), set through its environment.
-    async fn auth(&self, write: bool) -> anyhow::Result<[(String, String); 3]> {
+    async fn auth(&self, write: bool) -> anyhow::Result<kiln_cd::git::Auth> {
         let header = match &self.host {
             Host::Github(app) => {
                 let perms: BTreeMap<String, String> = [("contents".to_owned(), (if write { "write" } else { "read" }).to_owned()), ("metadata".to_owned(), "read".to_owned())].into();
@@ -266,24 +266,15 @@ impl Remote {
                 format!("{k}: {v}")
             }
         };
-        Ok([
-            ("GIT_CONFIG_COUNT".into(), "1".into()),
-            ("GIT_CONFIG_KEY_0".into(), format!("http.{}/.extraheader", self.host.web())),
-            ("GIT_CONFIG_VALUE_0".into(), header),
-        ])
+        Ok(kiln_cd::git::Auth { headers: vec![(format!("{}/", self.host.web()), header)], isolated: true, ..Default::default() })
     }
 
     /// git in the mirror, talking to the host: what it said, whether it succeeded or not. It reads
     /// no global or system configuration: a URL rewrite or a credential helper there would have it
     /// fetch or push as whoever runs kiln rather than with kiln's credentials.
     async fn remote(&self, args: &[&str], write: bool) -> anyhow::Result<std::process::Output> {
-        let mut cmd = std::process::Command::new("git");
-        crate::os::git_no_prompts(&mut cmd);
-        cmd.env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1");
-        cmd.arg("-C").arg(self.dir()?).args(args).stdin(std::process::Stdio::null());
-        for (k, v) in self.auth(write).await? {
-            cmd.env(k, v);
-        }
+        let mut cmd = kiln_cd::git::command(Some(&self.dir()?), Some(&self.url()), &self.auth(write).await?);
+        cmd.args(args).stdin(std::process::Stdio::null());
         crate::proc::output(cmd, NETWORK).await.with_context(|| format!("git {}", args.first().copied().unwrap_or("")))
     }
 
@@ -497,14 +488,9 @@ impl Remote {
     /// Pushes `refspec` of the git repository at `dir` to it, with credentials that write it (in
     /// git's environment, as every call to the host is).
     pub async fn push_from(&self, dir: &Path, refspec: &str) -> anyhow::Result<()> {
-        let mut cmd = std::process::Command::new("git");
-        crate::os::git_no_prompts(&mut cmd);
-        cmd.env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1");
+        let mut cmd = kiln_cd::git::command(None, Some(&self.url()), &self.auth(true).await?);
         let url = self.url();
         cmd.arg("-C").arg(dir).args(["push", "--quiet", "--", &url, refspec]).stdin(std::process::Stdio::null());
-        for (k, v) in self.auth(true).await? {
-            cmd.env(k, v);
-        }
         let out = crate::proc::output(cmd, NETWORK).await.context("git push")?;
         anyhow::ensure!(out.status.success(), "git push to {url}: {}", said(&out));
         Ok(())

@@ -37,7 +37,7 @@ use parking_lot::Mutex;
 use serde_json::{Value, json};
 
 use super::peers::Peers;
-use super::store::{Entry, Kept, Scope, Store, WHOLE_MAX, is_digest};
+use super::store::{Entry, Kept, Published, Scope, Store, WHOLE_MAX, is_digest};
 use super::token::{Claims, Keyring, known_domain};
 use super::upstream::{Up, Upstream};
 use crate::http::server::{self as srv, Incoming, Request, Response};
@@ -46,6 +46,8 @@ use crate::http::server::{self as srv, Incoming, Request, Response};
 pub const MAX_OBJECT: u64 = 16 << 30;
 /// Uploads to the server under way at once.
 const UPLOADERS: usize = 4;
+/// W24-R08: bound retries for physical contention, not the duration of an admitted write.
+const PUBLICATION_CONTENTION: Duration = Duration::from_secs(30);
 
 /// What a token is minted for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +78,7 @@ impl Endpoints {
 /// An upload to the server, and the grant it's for.
 struct Job {
     up: Up,
+    _guard: crate::runner::cache::CacheGuard,
     grant: String,
     upstream: Arc<dyn Upstream>,
 }
@@ -157,9 +160,10 @@ impl std::fmt::Debug for Service {
 
 static RUNNING: OnceLock<Arc<Service>> = OnceLock::new();
 /// Where this runner's work is ([`set_home`]).
-static HOME: OnceLock<PathBuf> = OnceLock::new();
-/// The one start of the service on demand ([`ensure`]), and whether it worked.
-static STARTED: async_lock::OnceCell<bool> = async_lock::OnceCell::new();
+struct Home { work: PathBuf, ledger: crate::store::Store, host_key: String, max: Option<u64> }
+static HOME: OnceLock<Home> = OnceLock::new();
+/// Serializes startup and remembers success; a refused or transient failure remains retryable.
+static STARTED: async_lock::OnceCell<()> = async_lock::OnceCell::new();
 
 /// This runner's service, once it serves one.
 pub fn running() -> Option<&'static Arc<Service>> {
@@ -177,39 +181,43 @@ pub fn set_running(s: Arc<Service>) {
 
 /// Where this runner's work is (`<work>`): its service opens there the first time something asks
 /// for it ([`ensure`]), and until then nothing of it exists.
-pub fn set_home(work: &Path) {
-    let _ = HOME.set(work.to_path_buf());
+pub fn set_home(work: &Path, ledger: crate::store::Store, host_key:&str, max: Option<u64>) {
+    let _ = HOME.set(Home {work:work.to_path_buf(),ledger,host_key:host_key.to_owned(),max});
 }
 
-/// This runner's service: the one it serves, else opened under its work folder now and served on
-/// loopback and on `<work>/_cas/cas.sock` (the first `kiln run --reuse` on a runner starts it).
-/// `None` outside a runner, or when it can't open (said once).
-pub async fn ensure() -> Option<&'static Arc<Service>> {
-    if let Some(s) = RUNNING.get() {
-        return Some(s);
-    }
-    let work = HOME.get()?;
-    let started = STARTED
-        .get_or_init(|| async move {
-            match serve_at(work).await {
-                Ok(svc) => {
-                    tracing::info!(target: "kiln.work", at = ?svc.endpoints(), "the runner's cache service is serving");
-                    set_running(svc);
-                    true
-                }
-                Err(e) => {
-                    tracing::warn!(target: "kiln.work", error = %format!("{e:#}"), "the runner's cache service couldn't start");
-                    false
-                }
+/// U05/U07: startup waits for metadata imports and socket binding before advertising readiness.
+/// A missing source or refused migration remains an error rather than an empty cache fallback.
+pub async fn ensure_ready()->anyhow::Result<&'static Arc<Service>> {
+    if let Some(service)=RUNNING.get() { return Ok(service); }
+    let home=HOME.get().ok_or_else(||anyhow::anyhow!("the runner cache home and authenticated host owner are not configured"))?;
+    STARTED.get_or_try_init(||async move {
+        match serve_at(&home.work,home.ledger.clone(),&home.host_key,home.max).await {
+            Ok(service)=> {
+                tracing::info!(target:"kiln.work",at=?service.endpoints(),"the runner's cache service is serving");
+                set_running(service);
+                Ok(())
             }
-        })
-        .await;
-    if *started { RUNNING.get() } else { None }
+            Err(error)=> {
+                let why=format!("{error:#}");
+                tracing::warn!(target:"kiln.work",error=%why,"the runner's cache service couldn't start");
+                Err(why)
+            }
+        }
+    }).await.map_err(anyhow::Error::msg)?;
+    RUNNING.get().ok_or_else(||anyhow::anyhow!("runner cache initialization returned no service"))
+}
+
+/// Optional consumers outside a runner have no service. Runner startup calls `ensure_ready`
+/// directly and must propagate its error before accepting work.
+pub async fn ensure()->Option<&'static Arc<Service>> {
+    if HOME.get().is_none()&&RUNNING.get().is_none() { return None; }
+    ensure_ready().await.ok()
 }
 
 /// The service over `<work>/_cas`, listening on a free loopback port and, on Unix, its socket.
-async fn serve_at(work: &Path) -> anyhow::Result<Arc<Service>> {
-    let svc = Service::open(work)?;
+async fn serve_at(work: &Path, ledger: crate::store::Store,host_key:&str,max:Option<u64>) -> anyhow::Result<Arc<Service>> {
+    let (work,host_key)=(work.to_path_buf(),host_key.to_owned());
+    let svc=crate::rt::blocking_in(crate::rt::SHARE_STORE,move||Service::open_with_store_max(&work,ledger,&host_key,max)).await??;
     svc.listen_tcp(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
     #[cfg(unix)]
     if let Err(e) = svc.listen_unix(&svc.store().root().join("cas.sock")).await {
@@ -221,8 +229,19 @@ async fn serve_at(work: &Path) -> anyhow::Result<Arc<Service>> {
 impl Service {
     /// The service over the store under `work` (`<work>/_cas`), its tokens signed with the key kept
     /// there.
+    #[cfg(test)]
     pub fn open(work: &Path) -> anyhow::Result<Arc<Service>> {
-        let store = Arc::new(Store::open(work)?);
+        let ledger=crate::store::Store::open(&work.join("kiln.db"))?;
+        Self::open_with_store(work,ledger,"standalone")
+    }
+
+    /// U05/U07: the host supplies its one SQL/Records database to the cache service.
+    pub fn open_with_store(work:&Path,ledger:crate::store::Store,host_key:&str)->anyhow::Result<Arc<Service>> {
+        Self::open_with_store_max(work, ledger, host_key, None)
+    }
+
+    pub fn open_with_store_max(work:&Path,ledger:crate::store::Store,host_key:&str,max:Option<u64>)->anyhow::Result<Arc<Service>> {
+        let store = Arc::new(Store::with_ledger_max(work,ledger,host_key,max)?);
         let keys = Keyring::open(store.root())?;
         Ok(Service::with(store, keys))
     }
@@ -246,8 +265,8 @@ impl Service {
     /// kept here then, in the token's own scope. Whether it came.
     async fn fetch_from_peers(&self, c: &Claims, digest: &str) -> bool {
         let Some(peers) = self.peers.lock().clone() else { return false };
-        match super::peers::fetch(&self.store, peers.as_ref(), &c.repo, digest).await {
-            Ok(f) if f.from.is_some() => match self.store.hold(&c.scope(), digest) {
+        match super::peers::fetch_guarded(&self.store, peers.as_ref(), &c.repo, digest).await {
+            Ok((f, Some(guard))) if f.from.is_some() => match self.store.hold_async_guarded(&c.scope(), digest, guard).await {
                 Ok(_) => {
                     let (repo, d) = (c.repo.clone(), digest.to_owned());
                     crate::rt::spawn(async move { super::peers::announce(&repo, &d).await });
@@ -408,21 +427,19 @@ impl Service {
         // the server can't put an entry where trusted builds would read it).
         let own = c.scope();
         for scope in &scopes {
-            let tmp = self.store.temp();
-            let got = upstream.get(scope, ns, name, &tmp).await;
+            let tmp = Arc::new(StagedFile(self.store.temp()));
+            let got = upstream.get(scope, ns, name, &tmp.0).await;
             if !matches!(got, Ok(true)) {
-                let _ = std::fs::remove_file(&tmp);
                 if let Err(e) = got {
                     tracing::debug!(target: "kiln.work", error = %format!("{e:#}"), %scope, ns, "the server couldn't be asked for a cache entry");
                 }
                 continue;
             }
-            let (store, t) = (Arc::clone(&self.store), tmp.clone());
-            let kept = crate::rt::blocking(move || store.put_file(&t)).await;
-            let _ = std::fs::remove_file(&tmp);
-            let (digest, size) = kept??;
-            let e = Entry { digest, size, at: crate::util::now_unix(), meta: BTreeMap::new() };
-            self.store.set_entry(&own, ns, name, e.clone()).await?;
+            let (store, t) = (Arc::clone(&self.store), Arc::clone(&tmp));
+            let kept = crate::rt::blocking(move || store.put_file_guarded(&t.0)).await;
+            let publication = kept??;
+            let e = Entry { digest: publication.digest.clone(), size: publication.size, at: crate::util::now_unix(), meta: BTreeMap::new() };
+            self.store.set_entry_guarded(&own, ns, name, e.clone(), publication.guard.clone()).await?;
             return Ok(Some((own, e)));
         }
         Ok(None)
@@ -445,20 +462,19 @@ impl Service {
         let Some((_, upstream)) = self.upstream_of(c) else { return Ok(None) };
         let own = c.scope();
         for scope in &scopes {
-            let tmp = self.store.temp();
-            if !matches!(upstream.get(scope, "cas", digest, &tmp).await, Ok(true)) {
-                let _ = std::fs::remove_file(&tmp);
+            let tmp = Arc::new(StagedFile(self.store.temp()));
+            if !matches!(upstream.get(scope, "cas", digest, &tmp.0).await, Ok(true)) {
                 continue;
             }
-            let (store, t) = (Arc::clone(&self.store), tmp.clone());
-            let kept = crate::rt::blocking(move || store.put_file(&t)).await;
-            let _ = std::fs::remove_file(&tmp);
-            let (got, _) = kept??;
+            let (store, t) = (Arc::clone(&self.store), Arc::clone(&tmp));
+            let kept = crate::rt::blocking(move || store.put_file_guarded(&t.0)).await;
+            let publication = kept??;
+            let got = &publication.digest;
             if got != digest {
                 tracing::warn!(target: "kiln.work", object = %digest, got = %got, "the server's copy of an object wasn't what its name says: refused");
                 continue;
             }
-            self.store.hold(&own, digest)?;
+            self.store.hold_async_guarded(&own, digest, publication.guard.clone()).await?;
             return Ok(Some(own));
         }
         Ok(None)
@@ -467,8 +483,10 @@ impl Service {
     /// The object as a response: its bytes (none for `head`), `extra` headers added.
     pub(crate) async fn object_response(&self, digest: &str, head: bool, extra: &[(HeaderName, String)]) -> anyhow::Result<Option<Response>> {
         let (store, d) = (Arc::clone(&self.store), digest.to_owned());
-        let kept = crate::rt::blocking(move || store.kept(&d)).await?;
-        let Some(kept) = kept else { return Ok(None) };
+        // W24-R08/U07: readers contend with physical publication too. Admit the exact
+        // guard with the same bounded fence-only retry; slot capacity remains terminal.
+        let kept = publish(move || store.guard_object(&d)).await?;
+        let Some((kept, guard)) = kept else { return Ok(None) };
         let mut r = match (kept, head) {
             (Kept::Whole(path), true) => {
                 let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
@@ -477,7 +495,7 @@ impl Service {
             (Kept::Chunks(list), true) => srv::with_header(srv::status(StatusCode::OK), header::CONTENT_LENGTH, &list.iter().map(|(_, n)| n).sum::<u64>().to_string()),
             (Kept::Whole(_), false) => {
                 let (store, d) = (Arc::clone(&self.store), digest.to_owned());
-                let Some(data) = crate::rt::blocking(move || store.read(&d)).await?? else { return Ok(None) };
+                let Some(data) = crate::rt::blocking(move || { store.read_protected(&d, &guard) }).await?? else { return Ok(None) };
                 srv::response(StatusCode::OK, "application/octet-stream", srv::full(Bytes::from(data)))
             }
             (Kept::Chunks(list), false) => {
@@ -485,11 +503,13 @@ impl Service {
                 let (tx, rx) = async_channel::bounded::<Bytes>(2);
                 let store = Arc::clone(&self.store);
                 crate::rt::spawn(async move {
+                    let guard = guard;
                     for (d, _) in list {
                         let s = Arc::clone(&store);
                         // A chunk that's gone or wrong ends the body early: the reader sees fewer
                         // bytes than promised, never wrong ones.
-                        let Ok(Some(piece)) = crate::rt::blocking(move || s.chunk(&d)).await else { return };
+                        let read_guard = guard.clone();
+                        let Ok(Some(piece)) = crate::rt::blocking(move || { s.chunk_protected(&d, &read_guard) }).await else { return };
                         if tx.send(Bytes::from(piece)).await.is_err() {
                             return;
                         }
@@ -521,7 +541,7 @@ impl Service {
 
     /// Takes a request's body into the store: the object's digest and size. `want`: the digest it
     /// must have (else nothing is kept and the answer says why).
-    pub(crate) async fn take_body(&self, body: Incoming, want: Option<&str>) -> anyhow::Result<Result<(String, u64), Response>> {
+    pub(crate) async fn take_body(&self, body: Incoming, want: Option<&str>) -> anyhow::Result<Result<Published, Response>> {
         let got = match receive(&self.store, body).await {
             Ok(g) => g,
             Err(e) => return Ok(Err(msg(StatusCode::BAD_REQUEST, &format!("{e:#}")))),
@@ -529,48 +549,43 @@ impl Service {
         let store = Arc::clone(&self.store);
         let kept = match got {
             Received::Bytes(b) => {
-                let w = want.map(str::to_owned);
-                crate::rt::blocking(move || -> anyhow::Result<Result<(String, u64), String>> {
-                    let digest = crate::util::sha256_hex(&b);
-                    if let Some(w) = w.filter(|w| *w != digest) {
-                        return Ok(Err(format!("the bytes hash to sha256:{digest}, not sha256:{w}")));
-                    }
-                    Ok(Ok(store.put_bytes(&b)?))
-                })
-                .await??
+                let (digest, b) = crate::rt::blocking(move || (crate::util::sha256_hex(&b), b)).await?;
+                if let Some(w) = want.filter(|w| *w != digest) {
+                    Err(format!("the bytes hash to sha256:{digest}, not sha256:{w}"))
+                } else {
+                    Ok(publish(move || store.put_bytes_guarded(&b)).await?)
+                }
             }
             Received::File(path) => {
-                let (p, w) = (path.clone(), want.map(str::to_owned));
-                let r = crate::rt::blocking(move || -> anyhow::Result<Result<(String, u64), String>> {
-                    let digest = crate::sync::blobs::hash_file(&p)?;
-                    if let Some(w) = w.filter(|w| *w != digest) {
-                        return Ok(Err(format!("the bytes hash to sha256:{digest}, not sha256:{w}")));
-                    }
-                    Ok(Ok(store.put_file(&p)?))
-                })
-                .await;
-                let _ = std::fs::remove_file(&path);
-                r??
+                let p = Arc::clone(&path);
+                let digest = crate::rt::blocking(move || crate::sync::blobs::hash_file(&p.0)).await??;
+                if let Some(w) = want.filter(|w| *w != digest) {
+                    Err(format!("the bytes hash to sha256:{digest}, not sha256:{w}"))
+                } else {
+                    Ok(publish(move || store.put_file_guarded(&path.0)).await?)
+                }
             }
         };
         Ok(kept.map_err(|why| msg(StatusCode::BAD_REQUEST, &why)))
     }
 
     /// `ns`/`name` set to the object `digest` in the token's scope, and sent up through its grant.
-    pub(crate) async fn set(&self, c: &Claims, ns: &str, name: &str, digest: &str, size: u64, meta: BTreeMap<String, String>) -> anyhow::Result<Entry> {
+    pub(crate) async fn set(&self, c: &Claims, ns: &str, name: &str, publication: &Published, meta: BTreeMap<String, String>) -> anyhow::Result<Entry> {
+        let (digest, size, guard) = (publication.digest.as_str(), publication.size, &publication.guard);
         let scope = c.writes().ok_or_else(|| anyhow::anyhow!("this token doesn't write"))?;
         let e = Entry { digest: digest.to_owned(), size, at: crate::util::now_unix(), meta };
-        if self.store.set_entry(&scope, ns, name, e.clone()).await? {
-            self.send_up(c, Up { scope, ns: ns.to_owned(), name: name.to_owned(), digest: digest.to_owned(), size });
+        if self.store.set_entry_guarded(&scope, ns, name, e.clone(), guard.clone()).await? {
+            self.send_up(c, Up { scope, ns: ns.to_owned(), name: name.to_owned(), digest: digest.to_owned(), size }, guard.clone());
         }
         Ok(e)
     }
 
     /// The object `digest` held by the token's scope, and sent up through its grant.
-    pub(crate) fn hold(&self, c: &Claims, digest: &str, size: u64) -> anyhow::Result<()> {
+    pub(crate) async fn hold(&self, c: &Claims, publication: &Published) -> anyhow::Result<()> {
+        let (digest, size, guard) = (publication.digest.as_str(), publication.size, &publication.guard);
         let scope = c.writes().ok_or_else(|| anyhow::anyhow!("this token doesn't write"))?;
-        if self.store.hold(&scope, digest)? {
-            self.send_up(c, Up { scope, ns: "cas".to_owned(), name: digest.to_owned(), digest: digest.to_owned(), size });
+        if self.store.hold_async_guarded(&scope, digest, guard.clone()).await? {
+            self.send_up(c, Up { scope, ns: "cas".to_owned(), name: digest.to_owned(), digest: digest.to_owned(), size }, guard.clone());
         }
         // Its peers may ask it for it now (W24-R27).
         let (repo, d) = (c.repo.clone(), digest.to_owned());
@@ -578,10 +593,10 @@ impl Service {
         Ok(())
     }
 
-    fn send_up(&self, c: &Claims, up: Up) {
+    fn send_up(&self, c: &Claims, up: Up, guard: crate::runner::cache::CacheGuard) {
         let Some((grant, upstream)) = self.upstream_of(c) else { return };
         self.pending.add(&grant);
-        if let Err(e) = self.jobs.try_send(Job { up, grant: grant.clone(), upstream }) {
+        if let Err(e) = self.jobs.try_send(Job { up, _guard: guard, grant: grant.clone(), upstream }) {
             self.pending.done(&grant);
             tracing::warn!(target: "kiln.work", error = %e, "a cache write couldn't be queued for the server");
         }
@@ -632,11 +647,12 @@ impl Service {
                 if !is_digest(d) {
                     return Ok(msg(StatusCode::BAD_REQUEST, "an object is named by its SHA-256, in lowercase hex"));
                 }
-                let (digest, size) = match self.take_body(req.into_body(), Some(d)).await? {
+                let publication = match self.take_body(req.into_body(), Some(d)).await? {
                     Ok(k) => k,
                     Err(r) => return Ok(r),
                 };
-                self.hold(&c, &digest, size)?;
+                self.hold(&c, &publication).await?;
+                let Published { digest, size, .. } = publication;
                 Ok(srv::json(StatusCode::CREATED, &json!({ "digest": digest, "size": size })))
             }
             (&Method::POST, ["missing"]) => {
@@ -658,11 +674,12 @@ impl Service {
                 if c.writes().is_none() {
                     return Ok(msg(StatusCode::FORBIDDEN, "this token doesn't write"));
                 }
-                let (digest, size) = match self.take_body(req.into_body(), None).await? {
+                let publication = match self.take_body(req.into_body(), None).await? {
                     Ok(k) => k,
                     Err(r) => return Ok(r),
                 };
-                self.set(&c, ns, &name.join("/"), &digest, size, BTreeMap::new()).await?;
+                self.set(&c, ns, &name.join("/"), &publication, BTreeMap::new()).await?;
+                let Published { digest, size, .. } = publication;
                 Ok(srv::json(StatusCode::CREATED, &json!({ "digest": digest, "size": size })))
             }
             (&Method::DELETE, ["entries", ns, name @ ..]) if !name.is_empty() => {
@@ -679,6 +696,7 @@ impl srv::Handler for Service {
     async fn handle(self: Arc<Self>, req: Request) -> Response {
         match self.route(req).await {
             Ok(r) => r,
+            Err(e) if crate::runner::cache::Local::declined(&e) => msg(StatusCode::INSUFFICIENT_STORAGE, &format!("{e:#}")),
             Err(e) => msg(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e:#}")),
         }
     }
@@ -687,28 +705,15 @@ impl srv::Handler for Service {
 /// Sends queued writes up until the service is gone.
 async fn uploader(store: Arc<Store>, rx: async_channel::Receiver<Job>, pending: Arc<Pending>) {
     while let Ok(job) = rx.recv().await {
-        let (s, d) = (Arc::clone(&store), job.up.digest.clone());
-        let kept = crate::rt::blocking(move || s.kept(&d)).await.ok().flatten();
-        // A whole object goes from where it is; a chunked one is put together first.
-        let (path, temp) = match kept {
-            Some(Kept::Whole(p)) => (Some(p), None),
-            Some(Kept::Chunks(_)) => {
-                let (s, d, t) = (Arc::clone(&store), job.up.digest.clone(), store.temp());
-                let to = t.clone();
-                match crate::rt::blocking(move || s.copy_to(&d, &to)).await {
-                    Ok(Ok(true)) => (Some(t.clone()), Some(t)),
-                    _ => (None, Some(t)),
-                }
-            }
-            None => (None, None),
-        };
-        let result = match &path {
-            Some(p) => job.upstream.put(&job.up, p).await,
+        let (s, d, guard) = (Arc::clone(&store), job.up.digest.clone(), job._guard.clone());
+        let kept = crate::rt::blocking(move || { let _guard = guard; s.kept(&d) }).await.ok().flatten();
+        // U07: stream existing assembly directly. The same queued operation guard reaches
+        // every source worker; no second slot or unaccounted whole-object copy is needed.
+        let local = store.local();
+        let result = match &kept {
+            Some(kept) => job.upstream.put(&job.up, &local, kept, job._guard.clone()).await,
             None => Err(anyhow::anyhow!("the object is no longer on this runner")),
         };
-        if let Some(t) = temp {
-            let _ = std::fs::remove_file(t);
-        }
         match result {
             Ok(_) => {
                 pending.sent.fetch_add(1, Ordering::Relaxed);
@@ -725,7 +730,53 @@ async fn uploader(store: Arc<Store>, rx: async_channel::Receiver<Job>, pending: 
 /// A request's body: in memory when small, in a file of the store's when large.
 enum Received {
     Bytes(Bytes),
-    File(PathBuf),
+    File(Arc<StagedFile>),
+}
+
+/// W24-R08: an admitted blocking hash/publication owns the staged file through completion,
+/// even if its HTTP waiter is cancelled before the worker opens or finishes reading it.
+pub(super) struct StagedFile(pub(super) PathBuf);
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_file(&self.0)
+            && error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(target: "kiln.work", path = %self.0.display(), %error, "a staged cache body could not be removed");
+        }
+    }
+}
+
+/// W24-R08, U07: a busy shared tier has not admitted publication or a read guard. Defer
+/// only its physical lock refusal, with one contention deadline from the first refusal.
+/// Always observe an admitted attempt to completion; no new IO wall-clock cutoff.
+async fn publish<T: Send + 'static>(write: impl Fn() -> anyhow::Result<T> + Send + Sync + 'static) -> anyhow::Result<T> {
+    let write = Arc::new(write);
+    let mut until = None;
+    let mut delay = Duration::from_millis(1);
+    loop {
+        let (attempt, admitted_until) = (Arc::clone(&write), until);
+        let result = crate::rt::blocking(move || {
+            // Pool admission can itself wait. Do not start a retry whose contention budget
+            // expired in the queue; once started, keep its body and observe its real outcome.
+            if admitted_until.is_some_and(|until| std::time::Instant::now() >= until) { return Err(publication_timeout()); }
+            attempt()
+        }).await?;
+        match result {
+            Err(error) if super::store::publication_busy(&error) => {
+                let deadline = *until.get_or_insert_with(|| std::time::Instant::now() + PUBLICATION_CONTENTION);
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() { return Err(publication_timeout()); }
+                crate::rt::sleep(delay.min(remaining)).await;
+                if std::time::Instant::now() >= deadline { return Err(publication_timeout()); }
+                delay = (delay * 2).min(Duration::from_millis(50));
+            }
+            result => return result,
+        }
+    }
+}
+
+fn publication_timeout() -> anyhow::Error {
+    std::io::Error::new(std::io::ErrorKind::TimedOut, "shared chunk publication contention budget expired").into()
 }
 
 /// Takes `body`: up to [`WHOLE_MAX`] in memory, more into a file (at most [`MAX_OBJECT`]).
@@ -736,8 +787,8 @@ async fn receive(store: &Store, mut body: Incoming) -> anyhow::Result<Received> 
         size = size.saturating_add(chunk.len() as u64);
         held.push(chunk);
         if size > WHOLE_MAX {
-            let path = store.temp();
-            let (tx, done) = crate::rt::file_sink(path.clone(), MAX_OBJECT)?;
+            let staged = Arc::new(StagedFile(store.temp()));
+            let (tx, done) = crate::rt::file_sink(staged.0.clone(), MAX_OBJECT)?;
             let sent = async {
                 for b in held.drain(..) {
                     tx.send(b).await.map_err(|_| anyhow::anyhow!("the body couldn't be written"))?;
@@ -750,11 +801,8 @@ async fn receive(store: &Store, mut body: Incoming) -> anyhow::Result<Received> 
             .await;
             drop(tx);
             let written = done.await;
-            if let Err(e) = sent.and(written.map(|_| ())) {
-                let _ = std::fs::remove_file(&path);
-                return Err(e);
-            }
-            return Ok(Received::File(path));
+            sent.and(written.map(|_| ()))?;
+            return Ok(Received::File(staged));
         }
     }
     if held.len() == 1 {
@@ -935,6 +983,125 @@ pub(crate) mod tests {
         Ok((svc, at))
     }
 
+    #[test]
+    fn u07_capacity_refusal_never_acknowledges_unpublished_work() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().to_path_buf();
+        crate::rt::block_on(async move {
+            let ledger = crate::store::Store::open(&root.join("kiln.db"))?;
+            let svc = Service::open_with_store_max(&root, ledger, "standalone", Some(4))?;
+            let at = svc.listen_tcp(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+            let token = svc.mint(&access("acme/app", "trusted", true, true))?;
+            let bytes = b"too large for this declared cache";
+            let digest = crate::util::sha256_hex(bytes);
+            let refused = on_thread(move || call(&mut conn(at), "PUT", &format!("/_kiln/cas/v1/objects/{digest}"), Some(&token), bytes)).await??;
+            assert_eq!(refused.status, 507);
+            let digest = crate::util::sha256_hex(bytes);
+            assert!(!svc.store().has(&digest));
+            assert!(svc.store().holder(&[Scope::new("acme/app", "trusted")], &digest).is_none());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn w24_r08_publication_waits_for_shared_tier_and_preserves_other_errors() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Arc::new(Store::open(dir.path())?);
+        let tier = crate::runner::cache::Local::new(dir.path(), None);
+        let held = std::fs::OpenOptions::new().read(true).write(true).open(tier.dir.join(".mutation.lock"))?;
+        held.try_lock()?;
+        crate::rt::block_on(async move {
+            let (busy, observed) = futures::channel::oneshot::channel();
+            let busy = Mutex::new(Some(busy));
+            let writer = Arc::clone(&store);
+            let publication = publish(move || {
+                let result = writer.put_bytes(b"Go remote output");
+                if result.as_ref().err().and_then(|e| e.downcast_ref::<std::io::Error>()).is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock)
+                    && let Some(busy) = busy.lock().take() { let _ = busy.send(()); }
+                result
+            });
+            let release = async move {
+                observed.await.map_err(|_| anyhow::anyhow!("publication never observed the held shared tier"))?;
+                drop(held);
+                anyhow::Ok(())
+            };
+            let ((digest, _), ()) = futures::try_join!(publication, release)?;
+            anyhow::ensure!(store.read(&digest)?.as_deref() == Some(b"Go remote output".as_slice()));
+            let attempts = Arc::new(AtomicU64::new(0));
+            let counted = Arc::clone(&attempts);
+            let failed = publish(move || {
+                counted.fetch_add(1, Ordering::Relaxed);
+                Err::<(), _>(std::io::Error::from(std::io::ErrorKind::InvalidInput).into())
+            }).await;
+            anyhow::ensure!(failed.is_err() && attempts.load(Ordering::Relaxed) == 1, "only shared-tier contention is deferred");
+            let os_error = publish(|| Err::<(), _>(std::io::Error::from_raw_os_error(11).into())).await;
+            anyhow::ensure!(os_error.err().and_then(|e| e.downcast::<std::io::Error>().ok()).and_then(|e| e.raw_os_error()) == Some(11), "an OS error is preserved rather than treated as the tier's logical refusal");
+            Ok(())
+        })
+    }
+
+    /// W24-R08/U07: concurrent cache hits must wait for a publisher's physical fence,
+    /// rather than returning the transient Busy as HTTP 500 or bypassing protection.
+    #[test]
+    fn u07_concurrent_object_reads_wait_for_physical_publication() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let svc = Service::open(dir.path())?;
+        let (digest, _) = svc.store().put_bytes(b"concurrent Go cache output")?;
+        let tier = crate::runner::cache::Local::new(dir.path(), None);
+        let held = std::fs::OpenOptions::new().read(true).write(true).open(tier.dir.join(".mutation.lock"))?;
+        held.try_lock()?;
+        crate::rt::block_on(async move {
+            let reads = futures::future::try_join(svc.object_response(&digest, false, &[]), svc.object_response(&digest, false, &[]));
+            let reads = Box::pin(reads);
+            match futures::future::select(reads, Box::pin(crate::rt::sleep(Duration::from_millis(50)))).await {
+                futures::future::Either::Left((result, _)) => {
+                    result?;
+                    anyhow::bail!("cache reads completed while the physical publication fence was held");
+                }
+                futures::future::Either::Right(((), pending)) => {
+                    drop(held);
+                    let (a, b) = crate::rt::timeout(Duration::from_secs(2), pending).await.map_err(|_| anyhow::anyhow!("cache reads did not resume after physical publication"))??;
+                    anyhow::ensure!(a.is_some_and(|r| r.status() == StatusCode::OK) && b.is_some_and(|r| r.status() == StatusCode::OK), "concurrent protected cache hits were refused");
+                }
+            }
+            anyhow::ensure!(svc.store().read(&digest)?.as_deref() == Some(b"concurrent Go cache output".as_slice()));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn w24_r08_cancelled_publication_keeps_its_admitted_file() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("accepted-body");
+        std::fs::write(&path, b"accepted Go output")?;
+        crate::rt::block_on(async move {
+            let staged = Arc::new(StagedFile(path.clone()));
+            let (entered, started) = futures::channel::oneshot::channel();
+            let (done, finished) = futures::channel::oneshot::channel();
+            let (release, waiting) = std::sync::mpsc::channel();
+            let (entered, done, waiting) = (Mutex::new(Some(entered)), Mutex::new(Some(done)), Mutex::new(waiting));
+            let publication = publish(move || {
+                if let Some(entered) = entered.lock().take() { let _ = entered.send(()); }
+                waiting.lock().recv()?;
+                let bytes = std::fs::read(&staged.0);
+                if let Some(done) = done.lock().take() { let _ = done.send(bytes); }
+                Ok(())
+            });
+            let publication = Box::pin(publication);
+            match futures::future::select(started, publication).await {
+                futures::future::Either::Left((started, pending)) => {
+                    started?;
+                    drop(pending); // Cancel the HTTP waiter after its attempt was admitted.
+                }
+                futures::future::Either::Right((result, _)) => { result?; anyhow::bail!("publication ended before its admission was observed"); }
+            }
+            anyhow::ensure!(path.is_file(), "cancellation unlinked the admitted worker's body");
+            release.send(())?;
+            anyhow::ensure!(finished.await?? == b"accepted Go output", "the admitted worker must still open and read its body");
+            Ok(())
+        })
+    }
+
     pub(crate) fn conn(at: SocketAddr) -> Conn {
         Conn::new(Endpoint::Tcp { addr: at.to_string(), prefix: String::new() })
     }
@@ -966,9 +1133,20 @@ pub(crate) mod tests {
     }
 
     impl Upstream for Recorder {
-        fn put<'a>(&'a self, up: &'a Up, path: &'a Path) -> BoxFuture<'a, anyhow::Result<bool>> {
+        fn put<'a>(&'a self, up: &'a Up, local: &'a crate::runner::cache::Local, kept: &'a Kept, guard: crate::runner::cache::CacheGuard) -> BoxFuture<'a, anyhow::Result<bool>> {
             Box::pin(async move {
-                let data = std::fs::read(path)?;
+                let data = match kept {
+                    Kept::Whole(path) => std::fs::read(path)?,
+                    Kept::Chunks(list) => {
+                        let mut data = Vec::new();
+                        for (d, n) in list {
+                            let piece = local.get_protected(d, &guard).ok_or_else(|| anyhow::anyhow!("missing guarded upload chunk"))?;
+                            anyhow::ensure!(piece.len() as u64 == *n, "wrong upload chunk size");
+                            data.extend_from_slice(&piece);
+                        }
+                        data
+                    }
+                };
                 anyhow::ensure!(crate::util::sha256_hex(&data) == up.digest, "sent the wrong bytes");
                 self.sent.lock().push(up.clone());
                 self.held.lock().insert((up.scope.clone(), up.ns.clone(), up.name.clone()), data);
@@ -1118,7 +1296,9 @@ pub(crate) mod tests {
         let root = dir.path().to_path_buf();
         crate::rt::block_on(async move {
             let (svc, _) = serve(&root).await?;
-            let sock = svc.listen_unix(&root.join("cas.sock")).await?;
+            // W24-R08: keep cache data in the owned TMPDIR, only the tiny UDS path is short.
+            let socket_dir = crate::runner::docker_sock::managed_directory(&root)?;
+            let sock = svc.listen_unix(&socket_dir.path().join("s")).await?;
             let t = svc.mint(&access("acme/app", "trusted", true, true))?;
             on_thread(move || -> anyhow::Result<()> {
                 let mut c = Conn::new(Endpoint::Unix(sock));

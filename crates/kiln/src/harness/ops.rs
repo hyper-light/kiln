@@ -10,7 +10,8 @@
 //! other agents sent it rather than leave them behind its turn. No operation answers what waits on
 //! a person: an agent's approvals, questions and plans are for people, in kiln.
 
-use http::{Method, StatusCode};
+use crate::authz::At as ScopeAt;
+use http::StatusCode;
 use serde_json::{Value, json};
 
 use super::lineage::{self, Ask, Starter};
@@ -18,7 +19,8 @@ use super::model::{Command, SendMode};
 use super::registry::Sent;
 use super::session::Info;
 use super::wait::{self, Until};
-use crate::ops::{Cx, Fail, Input, Op, Out, path, text};
+use crate::ops::{Cx, Fail, Input, Op, Out, text, Definition, Part, Routes};
+
 
 fn agent_of(v: &Value) -> Result<String, Fail> {
     text(v, "agent")
@@ -514,12 +516,20 @@ async fn interrupt(cx: Cx, v: Value) -> Out {
 
 /// Ends agent `id` for good, its goal stack with it (and is audited by `actor`).
 pub async fn end(hub: &crate::hub::Hub, id: &str, actor: &str) -> bool {
-    if !hub.harness.close(hub, id).await {
-        return false;
+    match try_end(hub, id, actor).await {
+        Ok(found) => found,
+        Err(error) => { tracing::warn!(%error, session = id, "agent close refused"); false }
+    }
+}
+
+/// U17: acknowledging operations distinguish absence from refused durable acceptance.
+async fn try_end(hub: &crate::hub::Hub, id: &str, actor: &str) -> anyhow::Result<bool> {
+    if !hub.harness.try_close(hub, id).await? {
+        return Ok(false);
     }
     let _ = crate::goals::forget(hub, id).await;
     hub.store.audit(actor.to_owned(), "agent.close".into(), id.to_owned()).await;
-    true
+    Ok(true)
 }
 
 async fn stop(cx: Cx, v: Value) -> Out {
@@ -532,14 +542,16 @@ async fn stop(cx: Cx, v: Value) -> Out {
         let mut kids = lineage::descendants(&cx.hub.harness.list(), &id);
         kids.reverse();
         for k in kids {
-            if end(&cx.hub, &k.id, &cx.caller.name).await {
+            if try_end(&cx.hub, &k.id, &cx.caller.name).await.map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, format!("agent close was not accepted: {error:#}")))? {
                 ended.push(k.id);
             }
         }
     }
-    super::about::ended(&id);
-    if end(&cx.hub, &id, &cx.caller.name).await {
+    if try_end(&cx.hub, &id, &cx.caller.name).await.map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, format!("agent close was not accepted: {error:#}")))? {
+        super::about::ended(&id);
         ended.push(id);
+    } else {
+        return Err((StatusCode::NOT_FOUND, format!("no agent {id}")));
     }
     Ok(json!({"ended": ended}))
 }
@@ -579,7 +591,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: true,
             destructive: false,
             input: Input::of::<input::AgentsList>(),
-            route: |_| Ok((Method::GET, path(&["api", "harness", "agents"]))),
+            route: Routes(vec![Definition::new("GET", &[Part::Literal("api"), Part::Literal("harness"), Part::Literal("agents")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(list(cx, v)),
         },
         Op {
@@ -588,7 +600,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: true,
             destructive: false,
             input: Input::of::<input::AgentsGet>(),
-            route: |v| Ok((Method::GET, path(&["api", "harness", "agents", &agent_of(v)?]))),
+            route: Routes(vec![Definition::new("GET", &[Part::Literal("api"), Part::Literal("harness"), Part::Literal("agents"), Part::Field("agent")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(get(cx, v)),
         },
         Op {
@@ -597,7 +609,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: false,
             input: Input::of::<input::AgentsStart>(),
-            route: |_| Ok((Method::POST, path(&["api", "harness", "agents"]))),
+            route: Routes(vec![Definition::new("POST", &[Part::Literal("api"), Part::Literal("harness"), Part::Literal("agents")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(start(cx, v)),
         },
         Op {
@@ -606,7 +618,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: false,
             input: Input::of::<input::AgentsAbout>(),
-            route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "about"]))),
+            route: Routes(vec![Definition::new("POST", &[Part::Literal("api"), Part::Literal("harness"), Part::Literal("agents"), Part::Field("agent"), Part::Literal("about")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(about(cx, v)),
         },
         Op {
@@ -615,7 +627,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: false,
             input: Input::of::<input::AgentsSend>(),
-            route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "send"]))),
+            route: Routes(vec![Definition::new("POST", &[Part::Literal("api"), Part::Literal("harness"), Part::Literal("agents"), Part::Field("agent"), Part::Literal("send")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(send(cx, v)),
         },
         Op {
@@ -624,7 +636,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: true,
             destructive: false,
             input: Input::of::<input::AgentsWait>(),
-            route: |_| Ok((Method::GET, path(&["api", "harness", "agents", "wait"]))),
+            route: Routes(vec![Definition::new("GET", &[Part::Literal("api"), Part::Literal("harness"), Part::Literal("agents"), Part::Literal("wait")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(wait_for(cx, v)),
         },
         Op {
@@ -633,7 +645,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: true,
             destructive: false,
             input: Input::of::<input::AgentsResult>(),
-            route: |v| Ok((Method::GET, path(&["api", "harness", "agents", &agent_of(v)?, "result"]))),
+            route: Routes(vec![Definition::new("GET", &[Part::Literal("api"), Part::Literal("harness"), Part::Literal("agents"), Part::Field("agent"), Part::Literal("result")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(result(cx, v)),
         },
         Op {
@@ -642,7 +654,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: true,
             destructive: false,
             input: Input::of::<input::AgentsChildren>(),
-            route: |v| Ok((Method::GET, path(&["api", "harness", "agents", &agent_of(v)?, "children"]))),
+            route: Routes(vec![Definition::new("GET", &[Part::Literal("api"), Part::Literal("harness"), Part::Literal("agents"), Part::Field("agent"), Part::Literal("children")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(children(cx, v)),
         },
         Op {
@@ -651,7 +663,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: false,
             input: Input::of::<input::AgentsInterrupt>(),
-            route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "interrupt"]))),
+            route: Routes(vec![Definition::new("POST", &[Part::Literal("api"), Part::Literal("harness"), Part::Literal("agents"), Part::Field("agent"), Part::Literal("interrupt")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(interrupt(cx, v)),
         },
         Op {
@@ -660,7 +672,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: false,
             input: Input::of::<input::AgentsChange>(),
-            route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "change"]))),
+            route: Routes(vec![Definition::new("POST", &[Part::Literal("api"), Part::Literal("harness"), Part::Literal("agents"), Part::Field("agent"), Part::Literal("change")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(change(cx, v)),
         },
         Op {
@@ -669,7 +681,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: true,
             destructive: false,
             input: Input::of::<input::AgentsWorkspace>(),
-            route: |v| Ok((Method::GET, path(&["api", "harness", "agents", &agent_of(v)?, "workspace"]))),
+            route: Routes(vec![Definition::new("GET", &[Part::Literal("api"), Part::Literal("harness"), Part::Literal("agents"), Part::Field("agent"), Part::Literal("workspace")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(workspace(cx, v)),
         },
         Op {
@@ -678,7 +690,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: true,
             input: Input::of::<input::AgentsLand>(),
-            route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "land"]))),
+            route: Routes(vec![Definition::new("POST", &[Part::Literal("api"), Part::Literal("harness"), Part::Literal("agents"), Part::Field("agent"), Part::Literal("land")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(land(cx, v)),
         },
         Op {
@@ -687,7 +699,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: true,
             destructive: false,
             input: Input::of::<input::AgentsChanges>(),
-            route: |_| Ok((Method::GET, path(&["api", "harness", "changes"]))),
+            route: Routes(vec![Definition::new("GET", &[Part::Literal("api"), Part::Literal("harness"), Part::Literal("changes")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(changes(cx, v)),
         },
         Op {
@@ -696,7 +708,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: true,
             input: Input::of::<input::AgentsStop>(),
-            route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "stop"]))),
+            route: Routes(vec![Definition::new("POST", &[Part::Literal("api"), Part::Literal("harness"), Part::Literal("agents"), Part::Field("agent"), Part::Literal("stop")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(stop(cx, v)),
         },
     ]
@@ -1016,6 +1028,8 @@ mod end_to_end {
             f(c);
         })
         .await?;
+        // U17: canonical restoration finishes before this fixture starts a session.
+        crate::harness::registry::Registry::initialize_local(&hub).await?;
         let h = Arc::clone(&hub);
         crate::rt::spawn(async move {
             let _ = crate::harness::registry::Registry::run_local(h).await;

@@ -44,6 +44,7 @@ pub mod headroom;
 pub mod identity;
 pub mod insights;
 pub mod land;
+pub mod logsearch;
 pub mod mirror;
 pub mod oidc;
 pub mod plan;

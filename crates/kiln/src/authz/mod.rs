@@ -352,7 +352,6 @@ pub static ROUTES: &[Rule] = &[
     r("DELETE", "/api/me/chat/*/*", SIGNED_IN, At::Server),
     r("GET", "/api/peers/open", SIGNED_IN, At::Server),
     r("POST", "/api/peers/*/frame", SIGNED_IN, At::Server),
-    r("GET", "/api/ci/schema/*", SIGNED_IN, At::Server),
     // A person of some repositories gets theirs (W10).
     r("GET", "/api/overview", "runs.read", At::Anywhere),
     r("GET", "/api/system", "runners.read", At::Server),
@@ -362,25 +361,15 @@ pub static ROUTES: &[Rule] = &[
     // Every conversation store and its series (docs/conversations.md, "Telemetry").
     r("GET", "/api/conversations/status", "runners.read", At::Server),
     r("GET", "/api/conversations/series", "runners.read", At::Server),
-    r("GET", "/api/audit", "audit.read", At::Server),
     // Repositories, runs and jobs (v1's routes; the engine's legs are jobs too).
     r("GET", "/api/repos", "runs.read", At::Anywhere),
     r("POST", "/api/repos/*/trigger", "runs.trigger", At::Repo(2)),
     r("POST", "/api/repos/*/poll", "runs.trigger", At::Repo(2)),
     // Diffs and stacks (W14).
-    r("GET", "/api/repos/*/diffs", "diffs.read", At::Repo(2)),
-    r("GET", "/api/diffs/*", "diffs.read", At::Diff(2)),
     r("GET", "/api/diffs/*/**", "diffs.read", At::Diff(2)),
-    r("POST", "/api/diffs/*/ready", "diffs.submit", At::Diff(2)),
-    r("POST", "/api/diffs/*/abandon", "diffs.submit", At::Diff(2)),
-    r("POST", "/api/diffs/*/reclaim", "diffs.submit", At::Diff(2)),
-    r("POST", "/api/diffs/*/commandeer", "diffs.submit", At::Diff(2)),
     r("PATCH", "/api/diffs/*", "diffs.submit", At::Diff(2)),
     r("POST", "/api/diffs/*/labels", "diffs.review", At::Diff(2)),
     r("DELETE", "/api/diffs/*/labels/*", "diffs.review", At::Diff(2)),
-    r("GET", "/api/stacks/*", "diffs.read", At::Stack(2)),
-    r("POST", "/api/diffs/*/comments", "diffs.review", At::Diff(2)),
-    r("POST", "/api/diffs/*/review", "diffs.review", At::Diff(2)),
     r("POST", "/api/diffs/*/viewed", "diffs.read", At::Diff(2)),
     r("POST", "/api/diffs/*/land", "diffs.land", At::Diff(2)),
     // Conflicts resolved where they fall, then committed as a revision (W26-R12): code, as Apply is.
@@ -390,16 +379,9 @@ pub static ROUTES: &[Rule] = &[
     r("PATCH", "/api/comments/*", "diffs.review", At::Comment(2)),
     r("DELETE", "/api/comments/*", "diffs.review", At::Comment(2)),
     r("POST", "/api/comments/*/apply", "diffs.submit", At::Comment(2)),
-    r("POST", "/api/repos/*/submit", "diffs.submit", At::Repo(2)),
-    r("GET", "/api/review/inbox", "diffs.read", At::Anywhere),
     // The caller's own notifications, marked read (W19-R06).
     r("POST", "/api/review/inbox/read", "diffs.read", At::Anywhere),
-    r("GET", "/api/repos/*/queue", "diffs.read", At::Repo(2)),
-    r("DELETE", "/api/queue/*", "queue.manage", At::Entry(2)),
     // Change requests (W14-R04), as diffs.
-    r("GET", "/api/repos/*/change-requests", "diffs.read", At::Repo(2)),
-    r("POST", "/api/repos/*/change-requests", "diffs.submit", At::Repo(2)),
-    r("GET", "/api/change-requests/*", "diffs.read", At::Diff(2)),
     r("GET", "/api/change-requests/*/**", "diffs.read", At::Diff(2)),
     r("POST", "/api/change-requests/*/comments", "diffs.review", At::Diff(2)),
     r("POST", "/api/change-requests/*/review", "diffs.review", At::Diff(2)),
@@ -416,9 +398,6 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/change-requests/*/labels", "diffs.review", At::Diff(2)),
     r("DELETE", "/api/change-requests/*/labels/*", "diffs.review", At::Diff(2)),
     // Experiments (W20-R11): each checked against its repository by its handler.
-    r("GET", "/api/experiments", "runs.read", At::Anywhere),
-    r("GET", "/api/experiments/*", "runs.read", At::Anywhere),
-    r("POST", "/api/experiments", "experiments.run", At::Anywhere),
     r("POST", "/api/experiments/*/*", "experiments.run", At::Anywhere),
     // Lists narrowed row by row to the repositories the caller may read (W10).
     r("GET", "/api/runs", "runs.read", At::Anywhere),
@@ -431,37 +410,16 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/jobs/*/tools/fix", "runs.rerun", At::Job(2)),
     r("GET", "/api/jobs/*/logs", "logs.read", At::Job(2)),
     r("GET", "/api/jobs/*/logs/ws", "logs.read", At::Job(2)),
+    r("GET", "/api/jobs/*/logs/times", "logs.read", At::Job(2)),
     r("GET", "/api/jobs/*/artifacts", "artifacts.read", At::Job(2)),
     // The CI engine.
-    r("POST", "/api/ci/validate", "runs.read", At::Anywhere),
-    r("POST", "/api/ci/images/validate", "runs.read", At::Anywhere),
-    r("POST", "/api/ci/images/build", "runs.trigger", At::RepoQuery),
-    r("POST", "/api/ci/images", "diffs.submit", At::RepoQuery),
     r("POST", "/api/ci/attestations/verify", "runs.read", At::Anywhere),
-    r("GET", "/api/ci/images", "runs.read", At::RepoQuery),
-    r("GET", "/api/ci/registry/mirrors", "runners.read", At::Server),
-    r("GET", "/api/ci/pools", "runners.read", At::Server),
-    r("GET", "/api/ci/pools/*", "runners.read", At::Server),
-    r("GET", "/api/ci/pools/*/history", "runners.read", At::Server),
-    r("PUT", "/api/ci/pools/*", "pools.manage", At::Server),
-    r("DELETE", "/api/ci/pools/*", "pools.manage", At::Server),
-    r("POST", "/api/ci/plan-preview", "runs.read", At::Anywhere),
-    r("GET", "/api/ci/runs", "runs.read", At::Anywhere),
-    r("GET", "/api/ci/runs/*", "runs.read", At::Run(3)),
-    r("GET", "/api/ci/runs/*/artifacts/*/download", "artifacts.read", At::Run(3)),
     r("GET", "/api/ci/runs/*/**", "runs.read", At::Run(3)),
-    r("POST", "/api/ci/runs/*/cancel", "runs.cancel", At::Run(3)),
     // Who may review is the environment's to say too: the handler checks its reviewers.
-    r("POST", "/api/ci/runs/*/approve", "runs.approve", At::Anywhere),
-    r("POST", "/api/ci/runs/*/rerun", "runs.rerun", At::Run(3)),
     // Bisecting a failure is diagnosing it (W20-R09's `diagnose`).
-    r("POST", "/api/ci/runs/*/bisect", "runs.debug", At::Run(3)),
-    r("GET", "/api/ci/legs/*", "runs.read", At::Job(3)),
     r("GET", "/api/ci/legs/*/logs", "logs.read", At::Job(3)),
     r("GET", "/api/ci/legs/*/logs/*", "logs.read", At::Job(3)),
-    r("GET", "/api/ci/logs/search", "logs.read", At::RepoQuery),
     // A finished job (a leg, a pipeline's job) again, here or elsewhere (W05-R28).
-    r("POST", "/api/ci/legs/*/retry", "runs.rerun", At::Job(3)),
     // A terminal into a leg, and keeping or releasing a failed one (W17); on the `host` executor
     // the terminal also needs `runners.terminal` on its runner, which the handler checks.
     r("GET", "/api/ci/legs/*/terminal", "runs.debug", At::Job(3)),
@@ -469,58 +427,32 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/ci/legs/*/**", "runs.read", At::Job(3)),
     r("GET", "/api/ci/repos/*/names", "workflows.edit", At::Repo(3)),
     // W23: a repository's CI providers, and its host's pull requests.
-    r("PUT", "/api/ci/repos/*/providers", "settings.manage", At::Repo(3)),
-    r("POST", "/api/ci/repos/*/providers/sync", "runs.read", At::Repo(3)),
-    r("GET", "/api/ci/repos/*/pulls", "diffs.read", At::Repo(3)),
-    r("GET", "/api/ci/repos/*/pulls/*", "diffs.read", At::Repo(3)),
-    r("POST", "/api/ci/repos/*/pulls/*/comments", "diffs.review", At::Repo(3)),
-    r("POST", "/api/ci/repos/*/pulls/*/reviews", "diffs.review", At::Repo(3)),
-    r("POST", "/api/ci/repos/*/pulls/*/merge", "diffs.land", At::Repo(3)),
-    r("POST", "/api/ci/repos/*/hooks", "secrets.manage", At::Repo(3)),
-    r("DELETE", "/api/ci/repos/*/hooks/*", "secrets.manage", At::Repo(3)),
     r("GET", "/api/ci/repos/*/**", "runs.read", At::Repo(3)),
-    r("DELETE", "/api/ci/repos/*/caches/*", "caches.write", At::Repo(3)),
-    r("POST", "/api/ci/repos/*/workflows/**/edit", "workflows.edit", At::Repo(3)),
     r("POST", "/api/ci/repos/*/**", "runs.trigger", At::Repo(3)),
     // What notification rules sent (W19-R06), every repository's.
-    r("GET", "/api/ci/notify/deliveries", "settings.manage", At::Server),
     any("/api/ci/secrets", "secrets.manage", At::ScopeQuery),
     any("/api/ci/secrets/**", "secrets.manage", At::ScopeQuery),
     any("/api/ci/variables", "variables.manage", At::ScopeQuery),
     any("/api/ci/variables/**", "variables.manage", At::ScopeQuery),
-    r("GET", "/api/ci/actions", "runs.read", At::Anywhere),
     r("GET", "/api/ci/actions/policy", "runs.read", At::RepoQuery),
     any("/api/ci/actions/policy", "settings.manage", At::RepoQuery),
     any("/api/ci/actions/**", "settings.manage", At::Server),
-    r("GET", "/api/ci/oidc/subject", "runs.read", At::ScopeQuery),
     any("/api/ci/oidc/subject", "settings.manage", At::ScopeQuery),
     any("/api/ci/oidc", "settings.manage", At::Server),
     // An agent kiln started, its own workload token (W10-R11); the handler refuses anyone else.
-    r("POST", "/api/ci/oidc/token", "agents.run", At::Server),
     any("/api/ci/oidc/**", "settings.manage", At::Server),
     // Every repository's environments the caller may read (W15-R09): it narrows by itself.
-    r("GET", "/api/ci/environments/board", "runs.read", At::Anywhere),
-    r("GET", "/api/ci/environments", "runs.read", At::RepoQuery),
     r("GET", "/api/ci/environments/**", "runs.read", At::RepoQuery),
     // The store, verified or collected (W08-R01): the server's own.
     r("POST", "/api/ci/store/*", "settings.manage", At::Server),
     // A deployment by hand: the workflow that deploys there, dispatched (W15, §4.1).
-    r("POST", "/api/ci/environments/*/deploy", "environments.deploy", At::RepoQuery),
     any("/api/ci/environments", "environments.manage", At::RepoQuery),
     any("/api/ci/environments/**", "environments.manage", At::RepoQuery),
-    r("POST", "/api/ci/routing/explain", "runs.read", At::Anywhere),
-    r("GET", "/api/ci/work/reap/policies", "runs.read", At::Anywhere),
     // W24-R31: a scope's reaper policy, changed with caches.write there (a session's: the server's).
-    r("PUT", "/api/ci/work/reap/policies", "caches.write", At::ScopeQuery),
     any("/api/ci/routing/rules", "routing.manage", At::ScopeQuery),
-    r("GET", "/api/ci/integrations/kinds", "runs.read", At::Anywhere),
     any("/api/ci/integrations", "integrations.manage", At::Server),
     any("/api/ci/integrations/**", "integrations.manage", At::Server),
     any("/api/ci/webhooks/**", "integrations.manage", At::Server),
-    r("GET", "/api/ci/insights/repos", "runs.read", At::Server),
-    r("GET", "/api/ci/insights/repos/*", "runs.read", At::Repo(4)),
-    r("GET", "/api/ci/insights/workflows/*", "runs.read", At::Repo(4)),
-    r("GET", "/api/ci/insights/runners", "runners.read", At::Server),
     r("GET", "/api/ci/insights/runners/*", "runners.read", At::Server),
     // Deployments (docs/cd.md).
     r("GET", "/api/cd/**", "runs.read", At::Server),
@@ -584,20 +516,13 @@ pub static ROUTES: &[Rule] = &[
     // A row's Hand off: the handler checks `runs.rerun` on the repository its body names (W26-R18).
     r("POST", "/api/ship/hand-off", "runs.rerun", At::Anywhere),
     // Releases are a deployer's in their environment, or an owner team's where it lets owners.
-    r("POST", "/api/deploy/releases", "environments.deploy", At::Deploy),
-    r("POST", "/api/deploy/fleets", "environments.deploy", At::Anywhere),
-    r("POST", "/api/deploy/releases/*/approve", "runs.approve", At::Server),
-    r("POST", "/api/deploy/releases/*/reject", "runs.approve", At::Server),
     r("POST", "/api/deploy/releases/*/**", "environments.deploy", At::Deploy),
     // Acting on what runs (a restart, a scale, a pod deleted) is a deployer's.
-    r("POST", "/api/deploy/apps/*/environments/*/actions", "environments.deploy", At::Deploy),
     // An app's secrets (§3.5) are read as the rest of it (names and versions: no value is read
     // back), and set or deleted by those who manage secrets.
     any("/api/deploy/apps/*/environments/*/secrets/*", "secrets.manage", At::Server),
-    r("POST", "/api/deploy/secret-keys/rotate", "secrets.manage", At::Server),
     any("/api/deploy/**", "environments.manage", At::Server),
     // Runners and machines. The list is of the runners the caller may read (`crate::doctor::readable`).
-    r("GET", "/api/agents", "runners.read", At::Anywhere),
     r("GET", "/api/reach/runners", "runners.read", At::Server),
     // The copies of runners' trees other runners keep (docs/reach.md §5.1): read with the runners,
     // a runner's rules and asking it to let go now its managers'; every runner's rules and a
@@ -614,10 +539,7 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/headroom", "runners.read", At::Server),
     r("GET", "/api/runners/*/headroom", "runners.read", At::Runner(2)),
     any("/api/runners/*/**", "runners.manage", At::Runner(2)),
-    r("GET", "/api/agents/*/diagnose", "runners.read", At::Runner(2)),
-    r("POST", "/api/agents/*/repair", "runners.manage", At::Runner(2)),
     r("POST", "/api/agents/*/drain", "runners.manage", At::Runner(2)),
-    r("POST", "/api/agents/*/probe", "runners.manage", At::Runner(2)),
     r("DELETE", "/api/agents/*", "runners.manage", At::Runner(2)),
     // Identities kiln's CA issued (W27-R01): revocations read by those who read runners, made by
     // those who manage settings.
@@ -628,7 +550,6 @@ pub static ROUTES: &[Rule] = &[
     any("/api/terminal/**", "runners.terminal", At::Server),
     r("GET", "/api/updates", "runners.read", At::Server),
     // The runners the caller may read against the newest kiln (`updates.list`).
-    r("GET", "/api/updates/runners", "runners.read", At::Anywhere),
     r("POST", "/api/updates/binaries", "binaries.publish", At::Server),
     // A runner upgraded now, or its policy (`crate::doctor`'s `updates.retry` and `updates.policy`).
     r("POST", "/api/updates/runners/*", "runners.manage", At::Runner(3)),
@@ -640,13 +561,8 @@ pub static ROUTES: &[Rule] = &[
     // Attached agents and their incidents (docs/ci.md W20-R08 to R10): the handlers narrow by
     // what each attachment looks after; reporting is an incident's agent's, or a person's who may
     // attach there.
-    r("GET", "/api/attachments", "runs.read", At::Anywhere),
-    r("GET", "/api/attachments/*", "runs.read", At::Anywhere),
     any("/api/attachments", "agents.attach", At::Anywhere),
     any("/api/attachments/**", "agents.attach", At::Anywhere),
-    r("POST", "/api/incidents/*/report", SIGNED_IN, At::Server),
-    r("GET", "/api/incidents", "runs.read", At::Anywhere),
-    r("GET", "/api/incidents/*", "runs.read", At::Anywhere),
     any("/api/plans", "agents.run", At::Server),
     any("/api/plans/**", "agents.run", At::Server),
     // Multi-stack programs (docs/programs.md): the handler keeps their settings to a person.
@@ -665,7 +581,6 @@ pub static ROUTES: &[Rule] = &[
     // Identity (W10).
     any("/api/tokens", "tokens.manage", At::Own),
     any("/api/tokens/**", "tokens.manage", At::Own),
-    r("GET", "/api/roles", SIGNED_IN, At::Server),
     any("/api/roles/**", "users.manage", At::Server),
     any("/api/users", "users.manage", At::Server),
     any("/api/users/**", "users.manage", At::Server),
@@ -699,8 +614,16 @@ fn matches(pattern: &str, segs: &[&str]) -> bool {
 
 /// The rule for a request: the first that matches, else [`UNNAMED`].
 pub fn rule(method: &Method, segs: &[&str]) -> &'static Rule {
+    // U12: migrated operations own the policy for their named and legacy routes.
     // HEAD asks what GET would answer.
-    let method = if method == Method::HEAD { "GET" } else { method.as_str() };
+    let normalized = if method == Method::HEAD { &Method::GET } else { method };
+    if let Some(rule) = crate::ops::http_policy(normalized, segs) { return rule; }
+    if let ["api", "cd", rest @ ..] = segs
+        && let Some(rule) = crate::cd::ops::http_authorization(normalized, rest)
+    {
+        return rule;
+    }
+    let method = normalized.as_str();
     ROUTES.iter().find(|r| r.method.is_none_or(|m| m == method) && matches(r.pattern, segs)).unwrap_or(&UNNAMED)
 }
 
@@ -722,11 +645,42 @@ pub fn openapi(version: &str, ops: &[crate::ops::Info]) -> serde_json::Value {
                 "summary": o.summary,
                 "x-kiln-read-only": o.read_only,
                 "x-kiln-destructive": o.destructive,
+                "x-kiln-authorization": crate::ops::authorization_metadata(o.name),
                 "requestBody": { "required": false, "content": { "application/json": { "schema": o.input.schema() } } },
                 "security": [{ "bearer": [] }, { "session": [] }],
                 "responses": { "200": { "description": "its answer" }, "400": { "description": "the input isn't right" }, "403": { "description": "its route's capability is missing in that scope" }, "404": { "description": "no such operation, or what it names" } },
             } }),
         );
+    }
+    // U12: CD's aliases, effects and policy come from its operation declarations.
+    // Protocol body adapters retain their historical input; canonical input is documented
+    // once on /api/ops/<name>, linked here rather than pretending the shapes are identical.
+    for op in crate::cd::ops::ops() {
+        if !ops.iter().any(|listed| listed.name == op.name) { continue; }
+        for alias in op.route.aliases {
+            let segments: Vec<String> = alias.segments.iter().enumerate().map(|(i, segment)| {
+                if *segment == "*" { format!("{{segment_{i}}}") } else { (*segment).to_owned() }
+            }).collect();
+            let path = format!("/api/cd/{}", segments.join("/"));
+            let parameters: Vec<serde_json::Value> = alias.segments.iter().enumerate().filter(|(_, segment)| **segment == "*").map(|(i, _)| {
+                serde_json::json!({"name": format!("segment_{i}"), "in": "path", "required": true, "schema": {"type": "string"}})
+            }).collect();
+            let entry = paths.entry(path).or_insert_with(|| serde_json::json!({}));
+            if let Some(methods) = entry.as_object_mut() {
+                methods.insert(alias.method.to_ascii_lowercase(), serde_json::json!({
+                    "summary": op.summary,
+                    "x-kiln-operation": op.name,
+                    "x-kiln-canonical-route": format!("/api/ops/{}", op.name),
+                    "x-kiln-read-only": op.read_only,
+                    "x-kiln-destructive": op.destructive,
+                    "x-kiln-capability": op.route.authorization.capability,
+                    "x-kiln-scope": op.route.authorization.at,
+                    "parameters": parameters,
+                    "security": [{"bearer": []}, {"session": []}],
+                    "responses": {"200": {"description": "its answer"}, "403": {"description": "the operation's capability is missing"}}
+                }));
+            }
+        }
     }
     for r in ROUTES {
         // A parameter is named for the segment before it: `/runs/{run}`, `/repos/{repo}`.
@@ -762,6 +716,7 @@ pub fn openapi(version: &str, ops: &[crate::ops::Info]) -> serde_json::Value {
             }
         }
     }
+    crate::ops::document_http(&mut paths, ops);
     serde_json::json!({
         "openapi": "3.1.0",
         "info": { "title": "kiln", "version": version, "description": "Every route of kiln's API behind sign-in, with the capability each needs (docs/ci.md W10). Routes not listed need settings.manage." },
@@ -859,7 +814,12 @@ mod tests {
             let concrete: Vec<&str> = rule.pattern.trim_matches('/').split('/').map(|s| if s == "*" || s == "**" { "x" } else { s }).collect();
             let method = rule.method.map_or(Method::PATCH, |m| Method::from_bytes(m.as_bytes()).unwrap_or(Method::GET));
             let found = super::rule(&method, &concrete);
-            assert!(std::ptr::eq(found, rule), "{method} {} finds {} first", rule.pattern, found.pattern);
+            if let Some(registered) = crate::ops::http_policy(&method, &concrete) {
+                assert!(std::ptr::eq(found, registered), "registered policy owns {}", rule.pattern);
+                assert_eq!((found.capability, found.at), (rule.capability, rule.at), "migration preserves {}", rule.pattern);
+            } else {
+                assert!(std::ptr::eq(found, rule), "{method} {} finds {} first", rule.pattern, found.pattern);
+            }
             assert!(rule.capability == SIGNED_IN || CAPABILITIES.contains(&rule.capability), "{} names no capability", rule.pattern);
         }
         for (m, p, cap) in [
@@ -893,7 +853,7 @@ mod tests {
 
     #[test]
     fn w10_r05_the_openapi_document_comes_from_the_table() {
-        let doc = openapi("0.1.0", &[]);
+        let doc = openapi("0.1.0", &crate::ops::listed(true));
         assert_eq!(doc.pointer("/paths/~1api~1ci~1runs~1{run}~1rerun/post/x-kiln-capability").and_then(serde_json::Value::as_str), Some("runs.rerun"));
         assert_eq!(doc.pointer("/paths/~1api~1tokens/delete/x-kiln-capability").and_then(serde_json::Value::as_str), Some("tokens.manage"));
         assert_eq!(doc.get("openapi").and_then(serde_json::Value::as_str), Some("3.1.0"));

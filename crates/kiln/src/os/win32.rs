@@ -106,6 +106,9 @@ unsafe extern "system" {
     fn GetStdHandle(which: u32) -> *mut c_void;
     fn GetConsoleMode(console: *mut c_void, mode: *mut u32) -> i32;
     fn SetConsoleMode(console: *mut c_void, mode: u32) -> i32;
+    fn CreateFileMappingW(file: *mut c_void, attributes: *const c_void, protect: u32, maximum_high: u32, maximum_low: u32, name: *const u16) -> *mut c_void;
+    fn MapViewOfFile(mapping: *mut c_void, access: u32, offset_high: u32, offset_low: u32, length: usize) -> *mut c_void;
+    fn UnmapViewOfFile(view: *const c_void) -> i32;
 }
 
 #[link(name = "advapi32")]
@@ -157,6 +160,35 @@ fn shell_execute_ex() -> Option<ShellExecuteExFn> {
 /// `STD_ERROR_HANDLE`: `(DWORD)-12`.
 const STD_ERROR_HANDLE: u32 = -12i32 as u32;
 const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+
+/// U18: Windows locks exclude ReadFile through another handle, but not read-only mapped views
+/// (LockFileEx's documented contract). Map only the requested prefix and copy it immediately.
+pub fn read_locked_prefix(file: &std::fs::File, limit: usize) -> io::Result<Vec<u8>> {
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+    const PAGE_READONLY: u32 = 0x02;
+    const FILE_MAP_READ: u32 = 0x04;
+    let length = usize::try_from(file.metadata()?.len()).unwrap_or(usize::MAX).min(limit);
+    if length == 0 { return Ok(Vec::new()) }
+    let mut bytes = Vec::with_capacity(length);
+    // SAFETY: the borrowed file stays open. Zero maximum size uses its current length, and
+    // PAGE_READONLY cannot extend or modify it. No name or inherited mapping is created.
+    let mapping = unsafe { CreateFileMappingW(file.as_raw_handle(), std::ptr::null(), PAGE_READONLY, 0, 0, std::ptr::null()) };
+    if mapping.is_null() { return Err(io::Error::last_os_error()) }
+    // SAFETY: a non-null mapping handle returned above, owned exactly once from here.
+    let mapping = unsafe { OwnedHandle::from_raw_handle(mapping) };
+    // SAFETY: zero offset is aligned; success proves `length` readable mapped bytes. A file
+    // that shrank before the mapping/view was established yields an error instead.
+    let view = unsafe { MapViewOfFile(mapping.as_raw_handle(), FILE_MAP_READ, 0, 0, length) };
+    if view.is_null() { return Err(io::Error::last_os_error()) }
+    for offset in 0..length {
+        // SAFETY: the mapped view remains live and pins this file region. Read individual
+        // bytes without creating a Rust reference to storage another process may update.
+        bytes.push(unsafe { view.cast::<u8>().add(offset).read_volatile() });
+    }
+    // SAFETY: this exact successful view is unmapped once, after its final read.
+    if unsafe { UnmapViewOfFile(view) } == 0 { return Err(io::Error::last_os_error()) }
+    Ok(bytes)
+}
 
 /// Whether the console standard error writes to takes VT escapes (colour, moving the cursor),
 /// turned on here when it's off and the console can (Windows 10 and later). `false` when

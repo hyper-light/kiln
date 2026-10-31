@@ -738,7 +738,11 @@ fn check_built(b: &Built, platforms: &Value) -> anyhow::Result<()> {
         assert_eq!(g.status, 200, "{tag}: {}", String::from_utf8_lossy(&g.body));
         assert_eq!(g.header("docker-content-digest"), digest, "{tag}");
     }
-    let (_, body) = common::http(port, "GET", "/api/ci/images?repo=acme/images&name=other", &b.s.admin, None)?;
+    let (status, body) = common::http(port, "GET", "/api/ci/images?repo=acme/images&name=tools", &b.s.admin, None)?;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(serde_json::from_str::<Value>(&body)?.get("images"), Some(&json!([image])), "{body}");
+    let (status, body) = common::http(port, "GET", "/api/ci/images?repo=acme/images&name=other", &b.s.admin, None)?;
+    assert_eq!(status, 200, "{body}");
     assert_eq!(serde_json::from_str::<Value>(&body)?.get("images"), Some(&json!([])), "{body}");
     Ok(())
 }

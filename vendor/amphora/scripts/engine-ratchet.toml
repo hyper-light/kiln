@@ -1,0 +1,22 @@
+# What is left in the engine's production code (crates/engine*) that breaks CLAUDE.md §1, lint by
+# lint, as scripts/check-production.sh counts it, for each host the gate runs on (what is compiled
+# differs by platform): each line may only fall, and is lowered as it does. Counted 2026-10-20, when
+# the engine became Amphora's own (Rust 1.99.1).
+[left.x86_64-unknown-linux-gnu]
+"clippy::panic" = 201
+"clippy::unwrap_used" = 452
+"clippy::expect_used" = 873
+"clippy::unreachable" = 463
+"clippy::todo" = 11
+"clippy::unimplemented" = 0
+"clippy::indexing_slicing" = 3214
+"clippy::arithmetic_side_effects" = 3406
+"clippy::string_slice" = 101
+"clippy::cast_possible_truncation" = 560
+"clippy::cast_sign_loss" = 254
+"clippy::cast_possible_wrap" = 688
+"clippy::disallowed_macros" = 783
+"clippy::disallowed_methods" = 40
+"clippy::disallowed_types" = 0
+"clippy::dbg_macro" = 0
+"clippy::exit" = 0

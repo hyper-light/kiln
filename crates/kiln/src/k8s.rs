@@ -29,6 +29,129 @@ const JOB_LABEL: &str = "kiln.dev/job";
 /// A `k8s` pool's executor pods (docs/ci.md W13-R07): their label, and their executor's id.
 pub const EXECUTOR_PODS: &str = "app.kubernetes.io/managed-by=kiln,app.kubernetes.io/name=kiln-executor";
 const EXECUTOR_ANNOTATION: &str = "kiln.dev/executor";
+const EXECUTOR_GENERATION: &str = "kiln.dev/executor-generation";
+const EXECUTOR_ALLOCATION: &str = "kiln.dev/executor-allocation";
+
+/// U03: captured from the authenticated API, then bound to the executor's enrollment and
+/// existing allocation. A pod name alone can be reused after force deletion.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ExecutorIdentity {
+    pub namespace: String,
+    pub name: String,
+    pub uid: String,
+    pub node: String,
+    pub executor: String,
+    pub generation: String,
+    pub allocation: String,
+}
+
+/// Capacity is separate from ExecutorIdentity: adding it to that JSON would change the
+/// physical execution hash used by existing stop and retained-ownership proofs.
+pub(crate) struct ExecutorBootstrap {
+    pub identity: ExecutorIdentity,
+    pub capacity: kiln_ci::sched::pools::PodCapacity,
+}
+
+/// Parse the API's quantities once. Missing values stay unknown; malformed or nonfinite
+/// values are refused rather than turning into zero or an unlimited allowance.
+fn pod_quantity(value: Option<&Quantity>) -> anyhow::Result<Option<f64>> {
+    value.map(|q| {
+        let n = kiln_cd::diff::quantity(&serde_json::Value::String(q.0.clone())).ok_or_else(|| anyhow::anyhow!("U01 invalid pod resource quantity"))?;
+        anyhow::ensure!(n.is_finite() && n >= 0.0, "U01 invalid pod resource quantity");
+        Ok(n)
+    }).transpose()
+}
+
+fn pod_bytes(value: Option<&Quantity>) -> anyhow::Result<Option<u64>> {
+    pod_quantity(value)?.map(|n| {
+        // Integers through 2^53 are exactly representable by the shared quantity parser.
+        // Refuse larger byte counts instead of saturating or inventing rounded-up capacity.
+        anyhow::ensure!(n <= 9_007_199_254_740_992.0, "U01 pod byte quantity exceeds exact representation");
+        Ok(n.floor() as u64)
+    }).transpose()
+}
+
+fn pod_capacity(pod: &Pod) -> anyhow::Result<kiln_ci::sched::pools::PodCapacity> {
+    let spec = pod.spec.as_ref().ok_or_else(|| anyhow::anyhow!("U01 pod spec is absent"))?;
+    let mut jobs = spec.containers.iter().filter(|c| c.name == "job");
+    let job = jobs.next().ok_or_else(|| anyhow::anyhow!("U01 pod job container is absent"))?;
+    anyhow::ensure!(jobs.next().is_none(), "U01 duplicate pod job containers");
+    let requests = job.resources.as_ref().and_then(|r| r.requests.as_ref());
+    let limits = job.resources.as_ref().and_then(|r| r.limits.as_ref());
+    let capacity = kiln_ci::sched::pools::PodCapacity {
+        resource_version: pod.metadata.resource_version.clone().unwrap_or_default(),
+        cpu_request: pod_quantity(requests.and_then(|r| r.get("cpu")))?, cpu_limit: pod_quantity(limits.and_then(|r| r.get("cpu")))?,
+        memory_request: pod_bytes(requests.and_then(|r| r.get("memory")))?, memory_limit: pod_bytes(limits.and_then(|r| r.get("memory")))?,
+        ephemeral_storage_request: pod_bytes(requests.and_then(|r| r.get("ephemeral-storage")))?, ephemeral_storage_limit: pod_bytes(limits.and_then(|r| r.get("ephemeral-storage")))?,
+    };
+    capacity.validate().map_err(anyhow::Error::msg)?;
+    Ok(capacity)
+}
+
+impl ExecutorIdentity {
+    /// U03: bounded immutable physical identity for ParentBinding; retain the full API identity
+    /// alongside the grant for enrollment and stop-proof verification.
+    pub fn physical_execution(&self) -> anyhow::Result<String> {
+        Ok(format!("pod-{}", crate::util::sha256_hex(&serde_json::to_vec(self)?)))
+    }
+}
+
+/// U03/U11: latest reported container exits, not whole-UID retirement authority.
+/// Neither terminal phase nor restartCount=0 closes the kubelet worker or historical sandboxes.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ExecutorStopped {
+    pub owner: ExecutorIdentity,
+    pub resource_version: String,
+    pub containers: BTreeMap<String, String>,
+}
+
+impl ExecutorStopped {
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.resource_version.is_empty() && self.resource_version.len() <= 512 && !self.containers.is_empty() && self.containers.len() <= 256, "U03: invalid pod stopped evidence");
+        for (name, id) in &self.containers {
+            anyhow::ensure!(!name.is_empty() && name.len() <= 253 && !id.is_empty() && id.len() <= 512 && !name.chars().chain(id.chars()).any(char::is_control), "U03: invalid stopped container identity");
+        }
+        Ok(())
+    }
+}
+
+fn executor_identity(pod: &Pod, namespace: &str, executor: &str, generation: &str, allocation: &str) -> Option<ExecutorIdentity> {
+    let annotations = pod.metadata.annotations.as_ref()?;
+    let spec = pod.spec.as_ref()?;
+    if annotations.get(EXECUTOR_ANNOTATION)?.as_str() != executor || annotations.get(EXECUTOR_GENERATION)?.as_str() != generation || annotations.get(EXECUTOR_ALLOCATION)?.as_str() != allocation || pod.metadata.namespace.as_deref()? != namespace || spec.restart_policy.as_deref() != Some("Never") { return None }
+    let owner = ExecutorIdentity { namespace: namespace.into(), name: pod.metadata.name.clone()?, uid: pod.metadata.uid.clone()?, node: spec.node_name.clone()?, executor: executor.into(), generation: generation.into(), allocation: allocation.into() };
+    [&owner.namespace, &owner.name, &owner.uid, &owner.node, &owner.executor, &owner.generation, &owner.allocation].iter().all(|s| !s.is_empty() && s.len() <= 512 && !s.chars().any(char::is_control)).then_some(owner)
+}
+
+fn executor_stopped(pod: &Pod, owner: &ExecutorIdentity) -> Option<ExecutorStopped> {
+    if executor_identity(pod, &owner.namespace, &owner.executor, &owner.generation, &owner.allocation).as_ref() != Some(owner) { return None }
+    let status = pod.status.as_ref()?;
+    if !matches!(status.phase.as_deref(), Some("Succeeded" | "Failed")) || matches!(status.reason.as_deref(), Some("NodeLost" | "Shutdown")) { return None }
+    let spec = pod.spec.as_ref()?;
+    // A restart means this snapshot cannot enumerate every previously owned container ID.
+    // Keep it fenced until the node supplies complete evidence; never infer death from phase.
+    let mut containers = BTreeMap::new();
+    let sets = [
+        (spec.containers.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), status.container_statuses.as_deref().unwrap_or_default()),
+        (spec.init_containers.iter().flatten().map(|c| c.name.as_str()).collect(), status.init_container_statuses.as_deref().unwrap_or_default()),
+        (spec.ephemeral_containers.iter().flatten().map(|c| c.name.as_str()).collect(), status.ephemeral_container_statuses.as_deref().unwrap_or_default()),
+    ];
+    for (names, states) in sets {
+        if names.len() != states.len() { return None }
+        for name in names {
+            let state = states.iter().find(|s| s.name == name)?;
+            if state.restart_count != 0 { return None }
+            let terminated = state.state.as_ref()?.terminated.as_ref()?;
+            let id = state.container_id.as_ref()?;
+            if id.is_empty() || terminated.container_id.as_ref() != Some(id) || terminated.finished_at.is_none() || containers.insert(name.into(), id.clone()).is_some() { return None }
+        }
+    }
+    if containers.is_empty() { return None }
+    let resource_version = pod.metadata.resource_version.clone().filter(|v| !v.is_empty())?;
+    let proof = ExecutorStopped { owner: owner.clone(), resource_version, containers };
+    proof.validate().ok()?;
+    Some(proof)
+}
 /// Where a pod's state stops it starting: its image can't be pulled, or its container made.
 const FATAL: &[&str] = &["ErrImagePull", "ImagePullBackOff", "InvalidImageName", "CreateContainerConfigError", "CreateContainerError"];
 
@@ -42,13 +165,68 @@ pub fn executor_pod(executor: &str) -> String {
 }
 
 /// One executor pod, as the reaper sees it.
+#[derive(Clone, Debug)]
 pub struct ExecutorPod {
+    pub namespace: String,
     pub name: String,
+    pub uid: String,
+    pub resource_version: String,
     pub executor: String,
+    pub generation: String,
+    pub allocation: String,
     pub phase: String,
     /// Why it can't start, when it can't.
     pub stuck: Option<String>,
     pub deleting: bool,
+}
+
+impl ExecutorPod {
+    /// U11-F03: labels and the reusable name select diagnostics, never cleanup authority.
+    /// resourceVersion is retained evidence, not an ordering number or immutable identity.
+    pub(crate) fn valid_owner(&self) -> bool {
+        [&self.namespace, &self.name, &self.uid, &self.resource_version, &self.executor, &self.generation, &self.allocation]
+            .iter().all(|s| !s.is_empty() && s.len() <= 512 && !s.chars().any(char::is_control))
+    }
+
+    pub(crate) fn observes(&self, owner: &ExecutorIdentity) -> bool {
+        self.valid_owner() && self.namespace == owner.namespace && self.name == owner.name && self.uid == owner.uid
+            && self.executor == owner.executor && self.generation == owner.generation && self.allocation == owner.allocation
+    }
+
+    pub(crate) fn stuck_key(&self) -> (String, String, String, String) {
+        (self.namespace.clone(), self.uid.clone(), self.generation.clone(), self.allocation.clone())
+    }
+}
+
+/// U11-F05: one atomic API snapshot's binding shape, never an actionable NeverBound
+/// receipt. Original Create-UID custody, reviewed provider/version, producer closure and
+/// (for an unbound nondeleting snapshot) acknowledged UID+RV deletion are separate premises.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PodBindingObservation {
+    Unknown,
+    ExcludedMirror,
+    Bound,
+    Unbound { deleting: bool },
+}
+
+pub(crate) struct ExecutorPodObservation {
+    pub pod: ExecutorPod,
+    pub binding: PodBindingObservation,
+}
+
+fn pod_binding_observation(pod: &Pod) -> PodBindingObservation {
+    if pod.metadata.annotations.as_ref().is_some_and(|annotations| annotations.contains_key("kubernetes.io/config.mirror")) {
+        return PodBindingObservation::ExcludedMirror;
+    }
+    let Some(spec) = &pod.spec else { return PodBindingObservation::Unknown; };
+    // Keep absence/incomplete identity unknown. ResourceVersion is an opaque equality token,
+    // not a numeric order; the same snapshot's exact UID+RV remain in ExecutorPod.
+    if [&pod.metadata.namespace, &pod.metadata.name, &pod.metadata.uid, &pod.metadata.resource_version].iter()
+        .any(|value| value.as_deref().is_none_or(|value| value.is_empty() || value.len() > 512 || value.chars().any(char::is_control))) {
+        return PodBindingObservation::Unknown;
+    }
+    if spec.node_name.as_deref().is_some_and(|node| !node.is_empty()) { PodBindingObservation::Bound }
+    else { PodBindingObservation::Unbound { deleting: pod.metadata.deletion_timestamp.is_some() } }
 }
 
 pub struct K8s {
@@ -59,6 +237,26 @@ pub struct K8s {
 }
 
 impl K8s {
+    /// U03: use this API identity at enrollment; the token's pod name is insufficient.
+    pub(crate) async fn executor_bootstrap(&self, executor: &str, generation: &str, allocation: &str) -> anyhow::Result<Option<ExecutorBootstrap>> {
+        let Some(pod) = self.api.get_pod(&executor_pod(executor)).await? else { return Ok(None) };
+        let Some(identity) = executor_identity(&pod, &self.api.namespace, executor, generation, allocation) else { return Ok(None) };
+        Ok(Some(ExecutorBootstrap { identity, capacity: pod_capacity(&pod)? }))
+    }
+
+    /// U03/U11: this reports current exact-UID instance exits only. API 404, replaced UID,
+    /// terminal phase and complete latest statuses never prove provider/producer closure.
+    pub async fn executor_stopped(&self, owner: &ExecutorIdentity) -> anyhow::Result<Option<ExecutorStopped>> {
+        anyhow::ensure!(owner.namespace == self.api.namespace, "the executor belongs to another namespace");
+        let Some(pod) = self.api.get_pod(&owner.name).await? else { return Ok(None) };
+        Ok(executor_stopped(&pod, owner))
+    }
+
+    pub async fn delete_executor(&self, owner: &ExecutorIdentity) -> anyhow::Result<()> {
+        anyhow::ensure!(owner.namespace == self.api.namespace, "the executor belongs to another namespace");
+        self.api.delete_pod_uid(&owner.name, &owner.uid).await
+    }
+
     pub async fn connect(cfg: &KCfg) -> anyhow::Result<Self> {
         let api = KubeApi::discover(&cfg.namespace)?;
         // Probe permissions now so a broken RBAC setup is reported at startup.
@@ -84,15 +282,19 @@ impl K8s {
     /// a one-time token bound to the executor and the pod's name.
     ///
     /// A pool with `warm` keeps its runners' warm workspaces on their nodes ([`warm`], W24-R14).
-    pub async fn launch_executor(&self, hub: &Hub, executor: &str, pool: &kiln_ci::sched::pools::PoolSpec, pod: Option<&crate::ci::pools::LegPod>) -> anyhow::Result<String> {
+    pub(crate) async fn launch_executor(&self, hub: &Hub, grant: &crate::ci::dispatch::ExecutorGrant, pool: &kiln_ci::sched::pools::PoolSpec, pod: Option<&crate::ci::pools::LegPod>) -> anyhow::Result<String> {
+        let executor = grant.executor.as_str();
+        anyhow::ensure!(grant.snapshot.runner.is_empty() && grant.phase == "starting" && grant.physical_execution.is_none(), "U03: pod startup does not own an unstarted server executor grant");
         let warm = self.warm_for(hub, pool);
         let name = executor_pod(executor);
-        let token = crate::util::random_token();
         let ttl = Duration::from_secs(u64::from(self.cfg.start_timeout_seconds) + 120);
-        hub.executor_tokens.lock().insert(token.clone(), (executor.to_owned(), name.clone(), Instant::now() + ttl));
+        let token = hub.mint_executor_token(grant, &name, ttl).await?;
         let server_url = self.cfg.server_url.clone().unwrap_or_else(|| hub.cfg.server.public_url.clone());
         let server_quic = self.cfg.server_quic.clone().unwrap_or_else(|| hub.cfg.server.quic_advertise.clone());
         let mut made = pool_pod(&self.cfg, executor, &name, &token, (&server_url, &server_quic), pool, pod);
+        let annotations = made.metadata.annotations.get_or_insert_with(BTreeMap::new);
+        annotations.insert(EXECUTOR_GENERATION.into(), grant.generation.clone());
+        annotations.insert(EXECUTOR_ALLOCATION.into(), grant.allocation.clone());
         if let Some(w) = &warm {
             apply_warm(&mut made, w);
         }
@@ -116,6 +318,12 @@ impl K8s {
     /// The `k8s` pools' executor pods there are. A warm pool's pods on a node are remembered, the
     /// pool's next pods drawn there (W24-R14).
     pub async fn executor_pods(&self) -> anyhow::Result<Vec<ExecutorPod>> {
+        Ok(self.executor_pod_observations().await?.into_iter().map(|observation| observation.pod).collect())
+    }
+
+    /// Retain node/deletion shape with the exact same bounded UID/version observation.
+    /// The existing reaper consumes it; this adds no client/controller or release authority.
+    pub(crate) async fn executor_pod_observations(&self) -> anyhow::Result<Vec<ExecutorPodObservation>> {
         let list = self.api.list_pods(EXECUTOR_PODS).await?;
         {
             let mut nodes = self.warm_nodes.lock();
@@ -135,13 +343,17 @@ impl K8s {
                     let r = w.reason.clone().unwrap_or_default();
                     FATAL.contains(&r.as_str()).then(|| format!("{r}: {}", w.message.clone().unwrap_or_default()))
                 });
-                Some(ExecutorPod { name, executor, phase: status.phase.unwrap_or_default(), stuck, deleting: p.metadata.deletion_timestamp.is_some() })
+                let annotation = |key: &str| p.metadata.annotations.as_ref().and_then(|a| a.get(key)).cloned().unwrap_or_default();
+                let binding = pod_binding_observation(&p);
+                let pod = ExecutorPod {
+                    namespace: p.metadata.namespace.clone().unwrap_or_default(), name, uid: p.metadata.uid.clone().unwrap_or_default(),
+                    resource_version: p.metadata.resource_version.clone().unwrap_or_default(), executor,
+                    generation: annotation(EXECUTOR_GENERATION), allocation: annotation(EXECUTOR_ALLOCATION),
+                    phase: status.phase.unwrap_or_default(), stuck, deleting: p.metadata.deletion_timestamp.is_some(),
+                };
+                Some(ExecutorPodObservation { pod, binding })
             })
             .collect())
-    }
-
-    pub async fn delete_pod(&self, name: &str) -> anyhow::Result<()> {
-        self.api.delete_pod(name).await
     }
 
     /// Is a pod for this job still legitimately on its way (Pending waiting for capacity or
@@ -180,8 +392,8 @@ impl K8s {
         match self.api.list_pods(&format!("{MANAGED},{JOB_LABEL}={job}")).await {
             Ok(list) => {
                 for p in list {
-                    if let Some(n) = p.metadata.name
-                        && let Err(e) = self.api.delete_pod(&n).await {
+                    if let Some(n) = p.metadata.name.as_deref()
+                        && let Err(e) = self.api.delete_pod(&p).await {
                             tracing::warn!(pod = %n, error = %e, "pod delete failed");
                         }
                 }
@@ -213,7 +425,7 @@ impl K8s {
                     None => true,
                 };
                 if phase == "Succeeded" || phase == "Failed" || job_terminal {
-                    if let Err(e) = self.api.delete_pod(&name).await {
+                    if let Err(e) = self.api.delete_pod(&pod).await {
                         tracing::debug!(pod = %name, error = %e, "reap delete failed");
                     }
                     continue;
@@ -236,8 +448,7 @@ impl K8s {
                     let since = *pending_since.entry(name.clone()).or_insert_with(Instant::now);
                     if since.elapsed() > Duration::from_secs(120) {
                         tracing::warn!(pod = %name, %reason, "pod cannot start; failing job");
-                        let _ = self.api.delete_pod(&name).await;
-                        hub.launching.lock().remove(&job_id);
+                        let _ = self.api.delete_pod(&pod).await;
                         if let Ok(Some(j)) = hub.store.job(job_id.clone()).await
                             && j.status == Status::Queued {
                                 hub.store.claim_job(job_id.clone(), name.clone(), "k8s".into()).await?;
@@ -651,6 +862,51 @@ mod tests {
     use crate::ci::pools::{LegPod, kiln_pod};
     use kiln_ci::sched::pools::{PodWarm, PoolSpec};
     use serde_json::{Value, json};
+
+    #[test]
+    fn u03_executor_proof_requires_exact_uid_and_all_container_terminations() -> anyhow::Result<()> {
+        let mut pod: Pod = serde_json::from_value(serde_json::json!({
+            "metadata": { "name": "kiln-x-test", "namespace": "jobs", "uid": "uid-one", "resourceVersion": "42", "annotations": { "kiln.dev/executor": "executor-one", "kiln.dev/executor-generation": "generation-one", "kiln.dev/executor-allocation": "existing-grant" } },
+            "spec": { "restartPolicy": "Never", "nodeName": "node-one", "containers": [{ "name": "job", "image": "fixture", "resources": { "requests": { "cpu": "500m", "memory": "64Mi", "ephemeral-storage": "2Gi" }, "limits": { "cpu": "250m", "memory": "32Mi", "ephemeral-storage": "4Gi" } } }], "initContainers": [{ "name": "tools", "image": "fixture" }] },
+            "status": { "phase": "Succeeded", "containerStatuses": [{ "name": "job", "image": "fixture", "imageID": "fixture", "ready": false, "restartCount": 0, "containerID": "containerd://job-one", "state": { "terminated": { "exitCode": 0, "containerID": "containerd://job-one", "finishedAt": "2026-10-29T00:00:00Z" } } }], "initContainerStatuses": [{ "name": "tools", "image": "fixture", "imageID": "fixture", "ready": false, "restartCount": 0, "containerID": "containerd://tools-one", "state": { "terminated": { "exitCode": 0, "containerID": "containerd://tools-one", "finishedAt": "2026-10-29T00:00:00Z" } } }] }
+        }))?;
+        let owner = executor_identity(&pod, "jobs", "executor-one", "generation-one", "existing-grant").ok_or_else(|| anyhow::anyhow!("fixture identity missing"))?;
+        let capacity = pod_capacity(&pod)?;
+        assert_eq!((capacity.cpu_request, capacity.cpu_limit, capacity.memory_request, capacity.memory_limit), (Some(0.5), Some(0.25), Some(64 * 1024 * 1024), Some(32 * 1024 * 1024)));
+        assert_eq!((capacity.ephemeral_storage_request, capacity.ephemeral_storage_limit), (Some(2 * 1024 * 1024 * 1024), Some(4 * 1024 * 1024 * 1024)));
+        assert!(capacity.fits(&kiln_ci::sched::Resources { cpu: 0.25, mem: 32 * 1024 * 1024, ..Default::default() }));
+        assert!(!capacity.fits(&kiln_ci::sched::Resources { cpu: 0.5, ..Default::default() }), "actual limit caps the request");
+        assert!(!capacity.fits(&kiln_ci::sched::Resources { disk: 1, ..Default::default() }), "ephemeral placement request does not bound workspace/cache growth");
+        assert!(pod_quantity(Some(&Quantity("-1".into()))).is_err());
+        assert!(pod_quantity(Some(&Quantity("NaN".into()))).is_err());
+        assert!(pod_bytes(Some(&Quantity("1Ei".into()))).is_err());
+        let unknown = pod_capacity(&Pod { spec: Some(PodSpec { containers: vec![Container { name: "job".into(), ..Default::default() }], ..Default::default() }), metadata: pod.metadata.clone(), ..Default::default() })?;
+        assert_eq!(unknown.cpu_request, None);
+        assert!(unknown.short(&kiln_ci::sched::Resources { cpu: 0.1, ..Default::default() }).iter().any(|s| s.contains("unknown")));
+        let proof = executor_stopped(&pod, &owner).ok_or_else(|| anyhow::anyhow!("fixture termination proof missing"))?;
+        assert_eq!(proof.containers.len(), 2);
+        assert_eq!(pod_binding_observation(&pod), PodBindingObservation::Bound, "complete latest exits do not turn a bound UID into NeverBound");
+        let mut unbound = pod.clone();
+        unbound.spec.as_mut().ok_or_else(|| anyhow::anyhow!("fixture spec missing"))?.node_name = None;
+        assert_eq!(pod_binding_observation(&unbound), PodBindingObservation::Unbound { deleting: false });
+        unbound.metadata.deletion_timestamp = Some(serde_json::from_value(serde_json::json!("2026-10-29T00:00:01Z"))?);
+        assert_eq!(pod_binding_observation(&unbound), PodBindingObservation::Unbound { deleting: true }, "same-snapshot deleting metadata is conditional evidence only, not original custody or closure");
+        let incomplete = Pod { spec: None, ..unbound.clone() };
+        assert_eq!(pod_binding_observation(&incomplete), PodBindingObservation::Unknown);
+        unbound.metadata.annotations.get_or_insert_with(BTreeMap::new).insert("kubernetes.io/config.mirror".into(), "mirror".into());
+        assert_eq!(pod_binding_observation(&unbound), PodBindingObservation::ExcludedMirror);
+        pod.metadata.uid = Some("uid-replacement".into());
+        assert!(executor_stopped(&pod, &owner).is_none());
+        pod.metadata.uid = Some(owner.uid.clone());
+        let status = pod.status.as_mut().ok_or_else(|| anyhow::anyhow!("fixture status missing"))?;
+        status.reason = Some("NodeLost".into());
+        assert!(executor_stopped(&pod, &owner).is_none());
+        let status = pod.status.as_mut().ok_or_else(|| anyhow::anyhow!("fixture status missing"))?;
+        status.reason = None;
+        status.init_container_statuses = None;
+        assert!(executor_stopped(&pod, &owner).is_none(), "phase alone does not prove the init container stopped");
+        Ok(())
+    }
 
     fn cfg() -> KCfg {
         KCfg { cache_pvc: Some("kiln-cache".into()), priority_class: Some("kiln-jobs".into()), ..KCfg::default() }

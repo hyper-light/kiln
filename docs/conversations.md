@@ -1,7 +1,8 @@
 # Conversations: durable, replicated, searchable
 
 > **Phase 2 of usage limits and durability (2026-10-18).** The status table at the end says what
-> is built. Phase 1, pausing at a usage limit and going on at the reset, is in
+> records historical implementation evidence, not current unified-source acceptance. Phase 1,
+> pausing at a usage limit and going on at the reset, is in
 > [agents.md](agents.md) ("Usage limits: pause and resume").
 
 An agent's conversation is kept per event, on disk, as it happens. Each runner keeps its own
@@ -32,19 +33,19 @@ For each agent session (kiln's id):
   `State::cleared` holds that line's number. The events before it stay in the store, where search
   finds them, but a timeline taken up again from the store (after a restart, a move, or in the
   server's list of agents whose machine is away) leaves them out.
-- **Transcripts are kept compressed.** They are nearly all of what a store holds: on the first
-  server, 5.4 GB of 6.5 GB, in 15 transcripts of long-running agents. A line of 256 bytes or more
-  is kept brotli-compressed (quality 5) when that saves a tenth or more, about 3× overall. Lines
-  kept before that are compressed in the background, a few thousand at a time while the store has
-  nothing else to do, under the same numbers, so no feed sends them again. Feed batches travel
-  compressed too, to a taker that says it takes them (`zip` in its answer), and a compressed line
-  goes as it is kept to a taker that says it takes lines so (`kept`): it is never decompressed on
-  one side and compressed again on the other. A store from before says neither, and gets text.
+- **Historical Turso compression evidence:** on the earlier server, transcripts occupied 5.4 GB
+  of 6.5 GB across 15 long-running agents. That implementation kept lines of at least 256 bytes
+  brotli-compressed at quality 5 when it saved a tenth, about 3× overall on that dataset, and
+  compressed older lines in the background under the same numbers. Its retired feed negotiated
+  compressed batches and kept lines with `zip`/`kept`. These are historical measurements and
+  codec behavior, not current Amphora compression claims. Canonical Amphora decodes legacy kept
+  bytes and prepares ordinary text up to 512 KiB, staging larger raw records outside the SQL call;
+  it does not run the former background squeeze. No current compression ratio is established.
 - **An ended agent's transcript goes after `keep_closed_days`** (30 unless set). Its events stay,
   where search finds them; only the harness's record of it is let go, as nothing reads that once
   the agent has ended. Each store lets go by its own clock, a few thousand lines at a time while
-  it has nothing else to do, and writes no drop, so no feed carries it: the server's store keeps
-  them as long as `[conversations] keep_closed_days` says, runners and mirrors the 30 days.
+  it has nothing else to do. The old no-drop/feed behavior and mirrors' 30-day retention describe
+  the retired controller; active server retention follows `[conversations] keep_closed_days`.
   Claude Code keeps its own transcripts 30 days by default too. On the server, a transcript is also
   archived in kiln's store of bytes once its agent ends (docs/blobs.md, `transcripts/`), and the
   store lets no record go before that: it holds back every session that ended since the oldest
@@ -58,83 +59,57 @@ For each agent session (kiln's id):
   taken to have nothing of the file, which was read from its top and sent again: 1.88M rows on
   adas-macbook-pro-2 after a restart on 2026-10-25, its store too busy to answer in time.
 
-## The store: Turso, per machine
+## The store: canonical Amphora (U06/U15)
 
-Each machine keeps its conversations in a [Turso](https://github.com/tursodatabase/turso) database:
-the SQLite-compatible engine in Rust, embedded in kiln's binary and vendored in `vendor/turso`
-(`UPSTREAM.md` lists the commit, the features kiln builds it with, and the changes). Rust only: no
-C, no SIMD, no FTS.
+Conversations and their persisted feeds use the host's canonical Amphora database, shared with
+SQL and Records (`convo/amphora.rs`, `convo/amphora_sql.rs`). Production does not open a separate
+live Turso conversation database. Legacy runner `<state>/conversations.db` and server
+`<data_dir>/harness/conversations.db` files are checked, restartable import sources; authenticated
+origins remain distinct during import. Retain required source snapshots until their import
+receipts complete. The former SQLite-file copy/open instructions do not apply to canonical storage.
 
-- **Where:**
-  - A runner's store is `<state>/conversations.db` and holds its own sessions. A runner beside
-    another one of its machine (`<state>/instances/<id>/`) has a store of its own.
-  - The server's store is `<data_dir>/harness/conversations.db` and holds every session, from every
-    machine.
-- **Reading it by hand:** the file is SQLite's format. kiln holds it open exclusively, so `sqlite3`
-  reads it when kiln isn't running, or reads a copy of it together with its `-wal`.
-- **Turning it off:** `KILN_CONVERSATIONS=off` turns the store off on a machine, which then runs as
-  it did without one.
-- **Per event.** Every update a session flushes also goes to the machine's store writer, which
-  commits in batches. An update is durable within `COMMIT_MS` (50 ms) of its flush, or as soon as a
-  batch reaches `COMMIT_ROWS`. One writer thread owns the database; sessions reach it by channel,
-  never by lock.
-- **Revisions.** Every write gets the store's next number (`rev`). That is what a feed sends: what
-  came after a number (see Replication). Each reset of a session's events is a row of its own in
-  `drops`, numbered like the writes, so a feed sends it in its place. An event or a record line
-  that comes again as it is kept writes nothing and gets no number: a timeline or a transcript
-  read again, or a runner's new store sending what the server has from its old one, costs a
-  lookup each, not a write, and no feed sends it again (the mirrors' included). The server counts
-  them (`same`, in its intake's view of each store).
-- **Schema** (`convo/sql.rs`, migrations by number; one that shipped is never edited):
-  - `sessions(id, info, meta, state, changes, updated_at, closed_at, epoch, rev, machine)`. The JSON
-    columns hold the model as it serializes. `machine` is the machine whose feed brought the
-    session (the server's store).
-  - `events(session, id, seq, at, parent, by, kind, level, tool, status, text, body, rev)`, keyed by
-    `(session, id)`. `text` holds what a search matches: a message's words, a tool's title and
-    output, a notice's text.
-  - `records(session, source, n, line_end, line, rev)`: the harness's record. `source` is Claude
-    Code's session id, or a Codex rollout's file name.
-  - `drops(rev, session, what, source, n, at)`: what was dropped.
-  - `peers(peer, rev, at)`: through where this store has each peer's feed.
-- **Restarts.** A session restored after a restart (`host::restore`) takes its timeline and state
-  from the store (`Core::adopt`), as a move does, instead of rebuilding them from the harness's
-  transcript. The harness still resumes its own conversation.
+- **Turning it off:** `KILN_CONVERSATIONS=off` disables conversation-history storage on that
+  machine; `0`, `false` and `no` are also accepted, ignoring case and surrounding whitespace.
+  Canonical session-control Records continue to persist; this is not an opt-out from durable
+  session control. Source restoration is ready; compile/runtime validation remains pending.
+- **Writing:** session updates reach the conversation writer by a bounded channel and are batched
+  at `COMMIT_MS` (50 ms) or `COMMIT_ROWS` (2048 rows). These are batching thresholds, not a durable
+  acknowledgment deadline: Amphora owns the transaction outcome and durability. Reads share the
+  writer's request path, with bounded waits; a stalled writer does not imply an empty history.
+- **Revisions and invariants:** writes have monotonically increasing store revisions. Events are
+  keyed by session and event id; transcript lines by session, source and line number. Unchanged
+  events or record lines do not allocate another revision. Resets retain ordered drop history;
+  epochs fence stale session writers. These application invariants do not create a second
+  replication log.
+- **Schema and source history:** canonical `convo_*` tables retain session info/meta/state/changes,
+  timestamps, epoch and origin machine; event sequence, parent, kind, searchable text and JSON
+  body; transcript source, line number/end and revision; and drop/peer history. Transcript source
+  identities distinguish Claude Code sessions and Codex rollout files. Historical feed cursors
+  and origin/import receipts preserve source history without restarting the retired controller.
+  Canonical SQL and numbered schema versions are in `convo/amphora_sql.rs`; `convo/sql.rs` is the
+  historical schema used by legacy fixtures. Shipped migrations are not rewritten.
+- **Bounded reads and codecs:** indexed queries retain explicit limits and paging; change pages
+  stop at their byte budget. Transcript records retain their line numbering; legacy compressed
+  bytes are decoded during bounded preparation. Canonical records use text up to 512 KiB or raw
+  staged large records referenced through the adapter, rather than the historical compressed
+  representation or background squeeze. The
+  retired feed's `zip`/`kept` negotiation is not a production replication mechanism.
+- **Restarts:** a restored session (`host::restore`) takes its timeline and state from the store
+  (`Core::adopt`), as a move does, rather than rebuilding them from the harness transcript. The
+  harness still resumes its own conversation.
 
-## Replication: the feed
+## Replication ownership (U15)
 
-A runner's store sends the server's what it wrote after the number the server has, oldest first
-(`convo/feed.rs`). The server takes each batch in one transaction, with that number kept beside
-what it took, and says through where it has it.
+Amphora owns record durability and replication through hyper-raft. Quiver owns event delivery;
+its notifications and transport delivery are not committed record acknowledgments.
 
-- **The link.** The feed travels on the runner's link to the server: hyper-QUIC
-  (hyper-transport on hyper-rt), on a lane of its own (`LANE_CONVO`, bulk frames). There are no new
-  ports and no HTTP. The runner announces it with `CAP_CONVO`.
-- **The exchange:**
-  1. When the link comes up, the runner says hello with its store's id.
-  2. The server answers with the number it has (0 for a store it hasn't seen), and how it takes
-     batches (`zip`, `kept`).
-  3. The runner sends batches from there, two ahead of what the server has acknowledged. A batch
-     larger than a frame goes in parts, so a transcript line of any size arrives whole. Reading a
-     batch reads no more of the store than the batch takes: a page of rows stops at its bytes.
-  4. A batch that doesn't follow what the server has, or doesn't come whole, is answered with the
-     number the server has and the batch it answers (`about`). The runner goes on from there, unless
-     the batch that starts there is on its way already and the answer is about one sent before it
-     (which didn't follow either) or is a hello's answer come late. An answer about a batch it sent
-     since says those before it were lost, and it goes on from there. Each batch says where the
-     runner was last told to go on from (`told`). A runner from before says neither and goes on
-     from every answer, so the server tells it once until a batch of it is taken. Answered each
-     time, such a runner sent the same batches again for every answer, and each was answered the
-     same: on 2026-10-24 a store on a busy server took nothing for 12 minutes.
-- **Nothing is lost.** A runner killed, a server killed mid-turn, or a runner away for days: the
-  server's number says where to go on, and the runner's store still has everything after it.
-  Applying is idempotent: events upsert by id, record lines by number.
-- **What the server keeps from where.** A runner that sends its store is the one source of its
-  sessions in the server's store. The server stops keeping them from their updates, which a
-  reconnect sends again in full. A runner from before the feed is kept from its updates, as in C1.
-- **Why not a Raft group per session.** The server is the one voter, so Raft would add a second log
-  beside the store and whole-store images, without making anything safer. The feed gives the same
-  guarantees: ordered delivery, catching up, and fencing. Raft (hyper-raft) is the plan for
-  replicating the server itself.
+Production retains bounded read-only compatibility decoding of retired conversation control
+frames in `convo/feed_compat.rs`: JSON controls are at most 64 KiB, store identities at most 256
+bytes, and batch coordinates are validated (at most 128 parts). The append-only postcard envelope
+remains readable. Decoding does not start a feed, mirror, recovery or write controller. The old
+`convo/feed.rs` and `convo/mirror.rs` controllers are test fixtures only. Their former hello,
+acknowledgment, retransmission and mirror-selection exchanges describe source history, not an
+alternative live replication path or durability guarantee.
 
 ## Fencing: epochs
 
@@ -142,13 +117,16 @@ A session's `epoch` (`State::epoch`, also in its `Info`) counts the times it wen
 machine. A move raises it as the session is taken over, and so does a resume from the server's
 store.
 
-- **In the server's store:** a session's rows from a lower epoch than the one it has are left out.
-  These are a former writer's late rows, after it went on elsewhere.
+- **Historical feed-row behavior:** the former feed controller rejected lower-epoch session
+  rows. Canonical SQL retains the maximum numeric session epoch while applying supplied snapshots;
+  event and record rows carry no epoch. Production stale-owner fencing occurs in the Registry
+  before persistence, rather than through per-row epoch rejection in the store.
 - **In the registry:** a machine that announces a copy of a session from a lower epoch (it was away
   when the session went on elsewhere) is told to let go of it (`HarnessRelease`). Its harness stops,
   and the session isn't closed. A runner from before letting go has its copy closed instead.
-  Nothing a copy left behind says counts. Its updates, its inventory and its feed rows are left
-  out, and it never takes the session's messages from the machine it runs on.
+  Nothing a copy left behind says counts. Its stale updates and inventory are rejected, and it
+  does not take the session's messages. The former feed-row filtering was part of the retired
+  conversation feed controller; epoch fencing remains an application invariant of canonical state.
 
 ## Resuming on another machine
 
@@ -165,7 +143,8 @@ the server's store (`convo/resume.rs`):
      (`handoff::as_words`): the harness there starts a new conversation and is given it, once, with
      the first message it gets. The timeline shows that message as the person wrote it.
 2. It raises the session's epoch, here and in its store.
-3. It sends the package to the target runner in pieces on the feed's lane (`HarnessPackage`).
+3. It sends the package to the target runner in pieces (`HarnessPackage`). This handover transport
+   does not restart the retired conversation feed or establish another record replication owner.
 4. That runner installs the record where its harness looks for it, and takes the session over under
    the same id, as it does a moved one.
 
@@ -189,49 +168,27 @@ days) are listed from the store, as away, with their recent timeline, so they ca
 machine that comes back says what it has, and that wins. Removing an away agent ends it in the store
 too.
 
-## Mirrors
+## Recovery (U15)
 
-Other runners keep a copy of the server's whole store (`convo/mirror.rs`). A conversation then
-outlives the server's disk and its own machine both.
-
-- **How.** The server sends each mirror its store the way a runner sends the server its own: the
-  same feed, the other way, on the same lane. A mirror keeps the copy beside its own store, in
-  `<state>/mirror.db`, with where each session runs.
-- **Which runners.** `[conversations] mirrors` says how many (1 unless set; 0 for none). The server
-  picks them among the connected runners that keep a store:
-  1. those named in `mirror_on` (one named takes the place of one that wasn't);
-  2. then the ones connected the longest (a machine that sleeps reconnects often);
-  3. then the most free disk.
-
-  A mirror away for a day is replaced; its copy stays where it is.
-- **Seeing them.** `GET /api/conversations/mirrors` returns `{mirrors: [{machine, connected,
-  chosen_at, last_seen}]}`.
-- **Restoring the server's store from a mirror.** A mirror sends its copy back the way it got it,
-  over the same feed, and the server takes it as a fill: a session the server has nothing of
-  comes back as it was, listed away on the machine it ran on; a session the server has anything
-  of from elsewhere (its own machine, still there, sent it again) keeps what it has, and one whose
-  machine comes back while the copy is being taken goes on with what its machine says. What the
-  copy dropped stays dropped. The copy goes through what it held when it began, then the mirror
-  says so (`Restored`), and the sessions it brought back are listed at once, no restart needed.
-  What the copy brought isn't sent back to that mirror: the server notes the numbers it wrote it
-  under, and the mirror's feed goes through them without sending them.
-  - **By itself:** a server that starts with an empty store while `mirrors.json` still names its
-    mirrors (the store was lost, the rest wasn't) asks the first of them to connect.
-  - **On demand:** `POST /api/conversations/restore {"from": "<machine>"}` asks that runner;
-    `GET /api/conversations/restore` says where it stands (`idle`, `asked`, `copying`, `done` with
-    how many sessions came back, or `failed` and why). A runner that keeps no copy says so.
-  - **By hand,** as before: stop the server, copy the mirror's `<state>/mirror.db` with its `-wal`
-    to `<data_dir>/harness/conversations.db`, start the server.
+Conversation mirror stores and their application-level replication controller are retired from
+production. Recover canonical records through Amphora's supported recovery procedure. Legacy
+`mirror.db` files are not live replicas or directly swappable canonical databases; the former
+copy-and-restart instructions do not apply. Preserve legacy sources required by an incomplete
+import and resolve origin/receipt mismatches through the supported migration path. This ownership
+change does not authorize a production stop, restart or restore.
 
 ## Filtering and search
 
 - `GET /api/conversations/search?q=&kind=&tool=&status=&agent=&since=&until=&limit=` returns
   matching events across every agent, newest first: `{agent, name, machine, event}`. The server
   answers from its store. Words match anywhere, in any case, all of them.
-  - It looks at events newest first by an index (across agents by time, in one agent's by number),
-    so nothing is sorted and it stops once it has as many as asked: a word many events say is
-    found in milliseconds.
-  - It looks a slice at a time, each slice holding the store for about 50 ms (how many events a
+  - **Historical Turso baseline, not Amphora acceptance:** the following query-plan description
+    and timings are from the pre-unification implementation/labs. They do not establish current
+    native Amphora index use, latency or read/write fairness; that iteration remains under review.
+    It looked at events newest first by an index (across agents by time, in one agent's by number),
+    avoiding a full sort and stopping once enough matches were found: common-word matches took
+    milliseconds in that lab.
+  - **Same historical baseline:** it looked a slice at a time, each slice holding the store for about 50 ms (how many events a
     slice holds follows how quick the disk is), and the store's other reads and writes go between
     slices. A word few events say means looking at all of them: on a store of 1M events about
     5 s, the store answering everything else meanwhile in tens of milliseconds. Past 8 s it
@@ -255,6 +212,11 @@ outlives the server's disk and its own machine both.
     history.
 
 ## Telemetry
+
+The feed/mirror reporting and board descriptions below document the historical controller and
+its UI/lab baseline. Compatibility decoding of old reports does not activate those controllers;
+these descriptions are not acceptance evidence for current Amphora replication or query latency.
+
 
 What every store is doing, live: on the System page (*02 Conversations*), on `/metrics`, and from
 the API. Nothing of it asks a store's writer for anything.
@@ -335,20 +297,32 @@ the API. Nothing of it asks a store's writer for anything.
 
 ## Settings
 
-- `KILN_CONVERSATIONS`, the same on every machine: `off` turns the store off. Replication to the
-  server needs no setting: a runner with a store sends it.
+- `KILN_CONVERSATIONS`, on server and runner startup: `off`, `0`, `false` or `no` disables
+  conversation history (case-insensitive, with surrounding whitespace ignored). Canonical
+  session-control Records still persist. Record replication belongs to Amphora/hyper-raft;
+  this switch does not enable the retired runner feed.
 - The server's `kiln.toml`:
 
 ```toml
 [conversations]
-mirrors = 1          # runners that keep a copy of the server's store; 0: none
-mirror_on = []       # runners to pick first, by name
 keep_closed_days = 30  # days an ended agent's transcript is kept (its events stay); 0: for good
 keep_archived_days = 365  # days its archive in kiln's store of bytes is kept after its last close; 0: for good
-compact = true       # make the store's file compact once a third of it is free (runners and mirrors too)
+compact = true       # compatibility upkeep flag; Amphora adapter does not run legacy file-copy compaction
 ```
 
-## Milestones
+`mirrors` and `mirror_on` remain accepted by the config parser for compatibility, but production
+no longer uses them to select conversation mirrors or start feed replication. Retention options
+above remain active: days are converted to durations, with zero meaning indefinite retention.
+`compact` still reaches the upkeep interface; the canonical Amphora adapter returns
+`Compacting::Not`, so it does not invoke the historical copy-and-swap algorithm below.
+
+## Milestones (historical, before unification)
+
+The following milestones, risks and status receipts describe the earlier Turso/feed/mirror
+implementation and its dated lab evidence. They are preserved as source history, not current
+production behavior, recovery instructions or certification of the unified source. The canonical
+Amphora, replication ownership and recovery sections above govern the current implementation;
+new-source runtime/performance/native acceptance remains pending.
 
 | | What | Done when |
 |---|---|---|
@@ -358,7 +332,12 @@ compact = true       # make the store's file compact once a third of it is free 
 | C4 | Search in the console: the filter box and the find bar | search across agents, newest first, by words; a match opens its agent where the words are |
 | C5 | Mirrors: other runners keep a copy of the server's store | the server's store lost and a runner gone too: nothing lost |
 
-## Risks
+## Risks (historical implementation)
+
+These are the earlier implementation's risks and mitigations, including its retired Turso engine,
+feed and file-copy compactor. Lock ordering, bounded work and disk headroom remain useful design
+constraints; the old SQLite recovery and mirror/upgrade procedures are not current instructions.
+
 
 - **Turso is pre-1.0** (0.9.0-pre.1). The store is a copy, never the only record: the harness keeps
   its transcript, and the server holds a replica. The file is SQLite's, so it can be recovered with
@@ -394,7 +373,12 @@ compact = true       # make the store's file compact once a third of it is free 
   reads it all and sends it (609k rows from adacachy on 2026-10-25). A mirror's new copy takes
   the server's whole store again (5.7 GB). Neither store goes on with its upgrade yet.
 
-## Status
+## Status (historical receipts)
+
+“Live”, “built”, “pass” and deployment references in this table apply only to the named historical
+commits, dates and labs. They do not establish the unified Amphora source's deployment or test
+status, or reactivate the retired conversation feed/mirror controllers.
+
 
 | Part | State |
 |---|---|

@@ -3,7 +3,7 @@
 //! The engine is a state machine with no clock, disk or network (`kiln_cd::engine`). It runs
 //! on a thread of its own, since its work is CPU work and hyper-rt shards are never preempted;
 //! what it asks for is done here, on the runtime: renders on the blocking pool, watches and API
-//! requests as tasks, records into the durable store (hyper-raft, `kiln_cd::store`). Sources are
+//! requests as tasks, records into the shared Amphora Database (`store`, U15/B2). Sources are
 //! polled from bare mirrors, and an app's render key is the content address of what its render
 //! reads, so a commit that doesn't touch an app doesn't render it again.
 //!
@@ -24,10 +24,12 @@ pub mod rollback;
 pub mod rollouts;
 pub mod runners;
 pub mod targets;
+pub mod store;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
@@ -38,7 +40,7 @@ use kiln_cd::model::Tracking;
 use kiln_cd::obj::{self, GroupKind, ResKey};
 use kiln_cd::render::{self, Dep, Kind, Tools};
 use kiln_cd::state::{ClusterAuth, ClusterDef, Command, Deployment};
-use kiln_cd::store::Store;
+use self::store::Store;
 use parking_lot::{Mutex, RwLock};
 use serde_json::{Value, json};
 
@@ -66,6 +68,21 @@ pub enum ToEngine {
     /// Health rules: Argo CD's Lua library, and these settings' scripts
     /// (`resource.customizations.health.<group>_<kind>`, the script).
     Health(Vec<(String, String)>),
+    /// A coalescible hint: the engine reads its current clock when it processes this.
+    Tick,
+}
+
+const ENGINE_QUEUE: usize = 128;
+
+/// U04/U14: only the existing pure engine owns deadlines. This adapter wakes its blocked
+/// thread at that deadline without another polling thread or an unbounded timer queue.
+struct EngineClock { deadline: AtomicU64, changed: crate::rt::Notify }
+impl EngineClock {
+    fn new() -> Self { Self { deadline: AtomicU64::new(u64::MAX), changed: crate::rt::Notify::new() } }
+    fn update(&self, engine: &Engine) {
+        self.deadline.store(engine.deadline().unwrap_or(u64::MAX), Ordering::Release);
+        self.changed.notify();
+    }
 }
 
 /// The settings that carry health scripts (Argo CD's `resource.customizations.health.*`).
@@ -116,6 +133,9 @@ pub struct Resolved {
     pub pull_secrets: Vec<PullSecret>,
     /// Its secrets, at the versions its definition pins (docs/deploy-api.md §3.5).
     pub secrets: Option<AppSecrets>,
+    /// U08: use the same captured readers when artifacts finish and this key renders later.
+    /// A handle preserves reader identity, not reachability of objects after Git collection.
+    readers: HashMap<String, Mirror>,
 }
 
 /// Keeps `r` as its key's resolution, the newest of `list` (eight at the most): what a deploy of
@@ -130,6 +150,10 @@ fn keep_resolved(list: &mut VecDeque<Resolved>, r: &Resolved) {
 }
 
 impl Resolved {
+    fn reader(&self, url: &str) -> Result<&Mirror> {
+        self.readers.get(url).context("this resolution has no captured source reader")
+    }
+
     /// Makes `artifacts` part of what this resolution stands for: they move its key and content
     /// as a source's files do, so a new digest renders (and syncs) again, and an unchanged one
     /// doesn't.
@@ -186,7 +210,7 @@ pub struct Cd {
     hub: Arc<Hub>,
     /// What is kept durably.
     pub store: Store,
-    engine: std::sync::mpsc::Sender<ToEngine>,
+    engine: async_channel::Sender<ToEngine>,
     /// Every app, by id.
     pub apps: RwLock<BTreeMap<String, AppEntry>>,
     /// Connected clusters, by name.
@@ -202,7 +226,7 @@ pub struct Cd {
     connecting: Mutex<BTreeSet<String>>,
     /// Held while an app's inputs are checked against its pin and sent, so the source poll and a
     /// rollback never interleave.
-    inputs_gate: Mutex<()>,
+    inputs_gate: async_lock::Mutex<()>,
     dir: PathBuf,
     tools: Tools,
     poll: Duration,
@@ -234,10 +258,180 @@ pub struct Cd {
     pub rollouts: rollouts::Drivers,
 }
 
+/// U08: resolve repository credentials once, so its mirror path and every command use the
+/// same selection even if RepoDef changes while the operation waits for I/O. This captures
+/// Auth's existing values; a private-key path is not a snapshot of mutable key-file bytes.
+#[derive(Clone)]
+pub(crate) struct ReadContext {
+    dir: PathBuf,
+    url: String,
+    auth: GitAuth,
+    legacy: Vec<PathBuf>,
+}
+
+impl ReadContext {
+    fn new(hub: &Hub, url: &str, auth: GitAuth, legacy: Vec<PathBuf>) -> Self {
+        Self { dir: crate::git::read_path(hub, url, &auth), url: url.to_owned(), auth, legacy }
+    }
+
+    pub(crate) fn dir(&self) -> &std::path::Path { &self.dir }
+
+    pub(crate) fn open(&self) -> Result<Mirror> {
+        Mirror::open(&self.dir, &self.url, self.auth.clone())
+    }
+
+    fn open_import(&self) -> Result<Mirror> {
+        Mirror::open_import(&self.dir, &self.url, self.auth.clone(), &self.legacy)
+    }
+
+    fn remember(&self) -> Result<()> {
+        for old in &self.legacy { crate::git::remember(old, &self.dir)?; }
+        Ok(())
+    }
+}
+
+/// U08: discovery and application resolution capture each URL once per refresh. The
+/// existing per-reader fetch result retains its actual mirror, including failures: resolving
+/// and rendering cannot select different credentials or cold-clone another mirror after I/O.
+/// Explicit captures with different credentials still fetch separate, isolated mirrors.
+#[derive(Default)]
+struct SourceRefresh {
+    mirrors: HashMap<PathBuf, SourceReader>,
+    sources: HashMap<String, ReadContext>,
+}
+
+/// One operation's result for an effective reader. Opening a cached source does not refresh
+/// it; only callers that already request a fetch record that separate result.
+struct SourceReader {
+    opened: Result<Mirror, String>,
+    fetched: Option<Result<(), String>>,
+}
+
+impl SourceRefresh {
+    fn capture(&mut self, url: &str, capture: impl FnOnce() -> ReadContext) -> ReadContext {
+        self.sources.entry(url.to_owned()).or_insert_with(capture).clone()
+    }
+
+    fn open(&mut self, source: ReadContext) -> Result<Mirror, String> {
+        let key = source.dir.clone();
+        let reader = self.mirrors.entry(key).or_insert_with(|| SourceReader {
+            opened: (|| -> Result<Mirror> {
+                let mirror = source.open_import()?;
+                source.remember()?;
+                Ok(mirror)
+            })().map_err(|error| format!("{error:#}")),
+            fetched: None,
+        });
+        reader.opened.clone()
+    }
+
+    fn open_url(&mut self, cd: &Cd, url: &str) -> Result<Mirror, String> {
+        let source = self.capture(url, || cd.read_context(url));
+        self.open(source)
+    }
+
+    fn open_app(&mut self, cd: &Cd, def: &AppDef) {
+        for source in def.sources.iter().filter(|source| source.chart.is_none()) {
+            // Keep this source's failure in the same owner. Other apps may still resolve.
+            let _ = self.open_url(cd, &source.repo);
+        }
+    }
+
+    async fn fetch(&mut self, source: ReadContext) -> Result<Mirror, String> {
+        let key = source.dir.clone();
+        if let Some(reader) = self.mirrors.get(&key) {
+            if let Some(result) = &reader.fetched {
+                return result.clone().and(reader.opened.clone());
+            }
+            if let Err(error) = &reader.opened { return Err(error.clone()); }
+        }
+        let opened = self.mirrors.get(&key).map(|reader| reader.opened.clone());
+        let result = crate::rt::blocking_in(crate::rt::SHARE_GIT_MIRROR_IO, move || {
+            let opened = opened.unwrap_or_else(|| (|| -> Result<Mirror> {
+                let mirror = source.open_import()?;
+                source.remember()?;
+                Ok(mirror)
+            })().map_err(|error| format!("{error:#}")));
+            let fetched = match &opened {
+                Ok(mirror) => mirror.fetch().map_err(|error| format!("{error:#}")),
+                Err(error) => Err(error.clone()),
+            };
+            (opened, fetched)
+        }).await;
+        let (opened, fetched) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                let error = format!("{error:#}");
+                let opened = self.mirrors.get(&key).map(|reader| reader.opened.clone()).unwrap_or_else(|| Err(error.clone()));
+                (opened, Err(error))
+            }
+        };
+        let result = fetched.clone().and(opened.clone());
+        self.mirrors.insert(key, SourceReader { opened, fetched: Some(fetched) });
+        result
+    }
+
+    fn error(&self, url: &str) -> Option<&String> {
+        self.sources.get(url).and_then(|source| self.mirrors.get(&source.dir)).and_then(|reader| {
+            reader.opened.as_ref().err().or_else(|| reader.fetched.as_ref().and_then(|result| result.as_ref().err()))
+        })
+    }
+
+    fn readers(&self, def: &AppDef) -> Result<HashMap<String, Mirror>> {
+        let mut readers = HashMap::new();
+        for source in def.sources.iter().filter(|source| source.chart.is_none()) {
+            let capture = self.sources.get(&source.repo).context("a source was not captured for this operation")?;
+            let mirror = self.mirrors.get(&capture.dir).context("a source was not opened for this operation")?
+                .opened.as_ref().map_err(|error| anyhow::Error::msg(error.clone()))?;
+            readers.insert(source.repo.clone(), mirror.clone());
+        }
+        Ok(readers)
+    }
+}
+
+/// U08: credential templates must stay within one authority and repository path boundary.
+/// Compare the original authority (including an explicit port) without normalizing scopes.
+/// SSH/scp, local paths and ambiguous URLs retain exact-match support only.
+fn credential_template_matches(template: &str, repository: &str) -> bool {
+    fn parsed(value: &str) -> Option<http::Uri> {
+        if value.bytes().any(|b| b.is_ascii_whitespace() || b.is_ascii_control() || b == b'\\') {
+            return None;
+        }
+        let uri = value.parse::<http::Uri>().ok()?;
+        if !matches!(uri.scheme_str(), Some("http" | "https")) || uri.query().is_some() {
+            return None;
+        }
+        let authority = uri.authority()?;
+        if authority.host().is_empty() || authority.as_str().contains('@') {
+            return None;
+        }
+        // Never turn encoded separators or traversal into a broader credential scope.
+        if uri.path().contains('%') || uri.path().split('/').any(|part| part == "." || part == "..") {
+            return None;
+        }
+        Some(uri)
+    }
+    if template.is_empty() { return false; }
+    let (Some(scope), Some(target)) = (parsed(template), parsed(repository)) else {
+        return template == repository;
+    };
+    if scope.scheme_str() != target.scheme_str() || scope.authority() != target.authority() {
+        return false;
+    }
+    let path = scope.path().trim_end_matches('/');
+    target.path() == path || target.path().strip_prefix(path).is_some_and(|rest| rest.starts_with('/'))
+}
+
 impl Cd {
     /// Gives the engine an input.
-    pub fn input(&self, input: Input) {
-        let _ = self.engine.send(ToEngine::Input(Box::new(input)));
+    pub async fn input(&self, input: Input) -> Result<()> {
+        self.send(ToEngine::Input(Box::new(input))).await
+    }
+
+    async fn send(&self, message: ToEngine) -> Result<()> {
+        let result = self.engine.send(message).await.map_err(|_| anyhow::anyhow!("the deployments engine stopped before accepting its input"));
+        if result.is_err() && !self.hub.shutdown.is_cancelled() { tracing::warn!("deployments: engine input refused because its receiver closed"); }
+        result
     }
 
     /// Asks the engine something.
@@ -246,7 +440,7 @@ impl Cd {
         let job: Box<dyn FnOnce(&Engine) + Send> = Box::new(move |e| {
             let _ = tx.send(f(e));
         });
-        self.engine.send(ToEngine::Query(job)).ok()?;
+        self.send(ToEngine::Query(job)).await.ok()?;
         rx.await.ok()
     }
 
@@ -255,16 +449,24 @@ impl Cd {
         self.kick.notify();
     }
 
-    pub(crate) fn mirror_dir(&self, url: &str) -> PathBuf {
+    pub(crate) fn read_context(&self, url: &str) -> ReadContext {
+        ReadContext::new(&self.hub, url, self.git_auth(url), self.legacy_imports(url))
+    }
+
+    fn legacy_mirror(&self, url: &str) -> PathBuf {
         self.dir.join("git").join(format!("{:016x}.git", obj::hash_bytes(url.as_bytes())))
     }
 
-    pub(crate) fn git_auth(&self, url: &str) -> GitAuth {
+    fn legacy_imports(&self, url: &str) -> Vec<PathBuf> {
+        crate::git::legacy(&self.hub, &self.legacy_mirror(url))
+    }
+
+    fn git_auth(&self, url: &str) -> GitAuth {
         // The longest matching repository entry's credentials (Argo CD's credential templates).
         self.store.read(|d| {
             d.repos
                 .values()
-                .filter(|r| url.starts_with(r.url.trim_end_matches('/')))
+                .filter(|r| credential_template_matches(&r.url, url))
                 .max_by_key(|r| r.url.len())
                 .map(|r| GitAuth {
                     header: match (&r.username, &r.password) {
@@ -277,13 +479,16 @@ impl Cd {
                     },
                     ssh_key: None,
                     insecure: r.insecure,
+                    isolated: true,
+                    ..GitAuth::default()
                 })
-                .unwrap_or_default()
+                // Sharing the mirror engine does not grant CD access to CI's host-wide tokens.
+                .unwrap_or_else(|| GitAuth { isolated: true, ..GitAuth::default() })
         })
     }
 
     /// Registers (or replaces) an app and tells the engine.
-    pub fn register(&self, def: AppDef) {
+    pub async fn register(&self, def: AppDef) -> Result<()> {
         let id = def.id();
         let mut cfg = def.config();
         cfg.read_only = is_shadow(&def);
@@ -305,24 +510,31 @@ impl Cd {
                 entry.resolved.clear();
             }
         }
-        self.input(Input::UpsertApp(cfg));
+        self.input(Input::UpsertApp(cfg)).await?;
         // The last sync from before a restart: automation goes on from it, not from scratch.
         let last = self.store.read(|d| d.history.get(&id).and_then(|h| h.back()).and_then(|h| Some((h.content?, h.succeeded))));
         if let Some((content, succeeded)) = last {
-            self.input(Input::Remember { app: id.as_str().into(), content, succeeded });
+            self.input(Input::Remember { app: id.as_str().into(), content, succeeded }).await?;
         }
         self.kick();
+        Ok(())
     }
 
     /// Forgets an app (and its children); with `cascade`, deletes its objects.
-    pub fn unregister(&self, id: &str, cascade: bool) {
-        let children = self.apps.write().remove(id).map(|e| e.children).unwrap_or_default();
-        self.statuses.write().remove(id);
-        self.input(Input::RemoveApp { id: id.into(), cascade: cascade.then_some(kiln_cd::model::Propagation::Foreground) });
-        for child in children {
-            self.unregister(&child, cascade);
+    pub async fn unregister(&self, id: &str, cascade: bool) -> Result<()> {
+        let mut pending = vec![(id.to_owned(), false)];
+        while let Some((id, removed)) = pending.pop() {
+            if removed {
+                self.hub.emit(&crate::wire::events::ServerEvent::CdAppDeleted { app: id });
+                continue;
+            }
+            let children = self.apps.write().remove(&id).map(|e| e.children).unwrap_or_default();
+            self.statuses.write().remove(&id);
+            self.input(Input::RemoveApp { id: id.as_str().into(), cascade: cascade.then_some(kiln_cd::model::Propagation::Foreground) }).await?;
+            pending.push((id, true));
+            for child in children.into_iter().rev() { pending.push((child, false)); }
         }
-        self.hub.emit(&crate::wire::events::ServerEvent::CdAppDeleted { app: id.to_owned() });
+        Ok(())
     }
 
     // ---------------------------------------------------------------- sources
@@ -343,7 +555,7 @@ impl Cd {
     /// registered when its definition changed, and removed (with its objects, as deleting an app
     /// does) when the file no longer defines it. A file that doesn't read, or a repository that
     /// can't be fetched, changes nothing: its apps stay as they were.
-    async fn refresh_deploy_files(self: &Arc<Self>) {
+    async fn refresh_deploy_files(self: &Arc<Self>, refresh: &mut SourceRefresh) {
         let repos = match self.hub.store.repos().await {
             Ok(r) => r,
             Err(e) => {
@@ -353,11 +565,17 @@ impl Cd {
         };
         self.repo_names.write().extend(repos.iter().map(|r| (r.clone_url.clone(), r.name.clone())));
         for repo in repos.into_iter().filter(|r| r.enabled) {
+            let source = refresh.capture(&repo.clone_url, || self.read_context(&repo.clone_url));
+            let m = match refresh.fetch(source).await {
+                Ok(mirror) => mirror,
+                Err(error) => {
+                    tracing::debug!(repo = %repo.name, %error, "deployments: can't fetch the repository's deploy file");
+                    continue;
+                }
+            };
             let trunk = repo.branches.first().cloned().unwrap_or_else(|| "main".into());
-            let (dir, auth, url, t) = (self.mirror_dir(&repo.clone_url), self.git_auth(&repo.clone_url), repo.clone_url.clone(), trunk.clone());
-            let read = crate::rt::blocking(move || -> Result<(String, Option<String>, Option<String>)> {
-                let m = Mirror::open(&dir, &url, auth)?;
-                m.fetch()?;
+            let t = trunk.clone();
+            let read = crate::rt::blocking_in(crate::rt::SHARE_GIT_MIRROR_IO, move || -> Result<(String, Option<String>, Option<String>)> {
                 let commit = m.resolve(&t)?;
                 let text = |p: &str| -> Result<Option<String>> { Ok(m.read(&commit, p)?.map(|b| String::from_utf8_lossy(&b).into_owned())) };
                 let deploy = text(".kiln/deploy.yaml")?;
@@ -413,7 +631,7 @@ impl Cd {
                 let kept = self.store.read(|d| d.apps.get(&def.id()).is_some_and(|k| *k != def));
                 if changed {
                     tracing::info!(app = %def.id(), repo = %repo.name, commit = %short(&commit), "deployments: an app from a deploy file");
-                    self.register(def.clone());
+                    if self.register(def.clone()).await.is_err() { return; }
                 }
                 if kept {
                     tracing::info!(app = %def.id(), repo = %repo.name, commit = %short(&commit), "deployments: the copy kept in kiln follows the deploy file");
@@ -434,7 +652,7 @@ impl Cd {
             for id in gone {
                 tracing::info!(app = %id, repo = %repo.name, "deployments: the deploy file no longer defines an app; removing it");
                 let cascade = self.apps.read().get(&id).is_some_and(|e| e.def.cascade);
-                self.unregister(&id, cascade);
+                if self.unregister(&id, cascade).await.is_err() { return; }
             }
         }
     }
@@ -457,40 +675,32 @@ impl Cd {
     }
 
     async fn refresh_sources(self: &Arc<Self>) {
-        self.refresh_deploy_files().await;
+        let mut refresh = SourceRefresh::default();
+        self.refresh_deploy_files(&mut refresh).await;
         self.connect_targets().await;
         let apps: Vec<AppEntry> = self.apps.read().values().cloned().collect();
-        // Each repository is fetched once a round.
+        // Sources discovery already read are current for this round too.
         let mut urls: BTreeSet<String> = BTreeSet::new();
         for a in &apps {
             for s in a.def.sources.iter().filter(|s| s.chart.is_none()) {
                 urls.insert(s.repo.clone());
             }
         }
-        let mut fetched: HashMap<String, Result<(), String>> = HashMap::new();
         for url in urls {
-            let (dir, auth) = (self.mirror_dir(&url), self.git_auth(&url));
-            let u = url.clone();
-            let r = crate::rt::blocking(move || -> Result<()> {
-                let m = Mirror::open(&dir, &u, auth)?;
-                m.fetch()
-            })
-            .await
-            .and_then(|r| r)
-            .map_err(|e| format!("{e:#}"));
+            let source = refresh.capture(&url, || self.read_context(&url));
+            let r = refresh.fetch(source).await;
             if let Err(e) = &r {
                 tracing::warn!(repo = %url, error = %e, "deployments: fetching a source failed");
             }
-            fetched.insert(url, r);
         }
         for a in apps {
             let id = a.def.id();
-            let failed = a.def.sources.iter().find_map(|s| fetched.get(&s.repo).and_then(|r| r.as_ref().err()).cloned());
+            let failed = a.def.sources.iter().find_map(|s| refresh.error(&s.repo).cloned());
             if let Some(e) = failed {
                 self.set_source_error(&id, Some(e));
                 continue;
             }
-            let this = self.clone();
+            let readers = refresh.readers(&a.def);
             let def = a.def.clone();
             let def_for_artifacts = a.def.clone();
             // Renders read the cluster's version and API versions (Helm's .Capabilities), so an
@@ -501,12 +711,13 @@ impl Cd {
             let pin = self.store.read(|d| d.pins.get(&id).cloned());
             let mut seen = pin.clone();
             let facts = (kube_version.clone(), api_versions.clone());
-            let result = crate::rt::blocking(move || -> Result<(Resolved, Option<Resolved>)> {
-                let head = this.inputs_of(&def, kube_version.as_deref(), &api_versions, None)?;
+            let result = crate::rt::blocking_in(crate::rt::SHARE_GIT_MIRROR_IO, move || -> Result<(Resolved, Option<Resolved>)> {
+                let readers = readers?;
+                let head = Self::inputs_from(&def, kube_version.as_deref(), &api_versions, None, &readers)?;
                 // A rolled-back app holds its deployment's commits until git changes what it
                 // renders; then it follows git again.
                 let held = match &pin {
-                    Some(p) if p.head == head.content => Some(this.inputs_of(&def, kube_version.as_deref(), &api_versions, Some(&p.commits))?),
+                    Some(p) if p.head == head.content => Some(Self::inputs_from(&def, kube_version.as_deref(), &api_versions, Some(&p.commits), &readers)?),
                     _ => None,
                 };
                 Ok((head, held))
@@ -520,7 +731,7 @@ impl Cd {
                         Ok(r) => r,
                         // The head's artifacts aren't built yet (pushes come faster than its image
                         // builds): the newest commit since what runs whose are takes its place.
-                        Err(e) => match self.newest_built(&def_for_artifacts, &id, &head.revision, facts).await {
+                        Err(e) => match self.newest_built(&def_for_artifacts, &id, &head.revision, &head.readers, facts).await {
                             Some((built, a, p)) => {
                                 head = built;
                                 (a, p)
@@ -554,10 +765,9 @@ impl Cd {
                     }
                     // A rollback may have pinned the app (or let go of it) meanwhile: then its
                     // inputs stand, and the next poll starts from them.
-                    let _gate = self.inputs_gate.lock();
-                    if self.store.read(|d| d.pins.get(&id).cloned()) == seen {
-                        self.use_inputs(&id, held.unwrap_or(head));
-                    }
+                    let _gate = self.inputs_gate.lock().await;
+                    if self.store.read(|d| d.pins.get(&id).cloned()) == seen
+                        && self.use_inputs(&id, held.unwrap_or(head)).await.is_err() { return; }
                 }
                 Err(e) => self.set_source_error(&id, Some(format!("{e:#}"))),
             }
@@ -567,7 +777,7 @@ impl Cd {
     /// The newest commit from `head` back to the one the app runs whose artifacts are built (the
     /// head's aren't): its inputs and artifacts, in the head's place until the head's are. `None`:
     /// none of them is, or the head doesn't lead from what runs (then it waits for the head's).
-    async fn newest_built(self: &Arc<Self>, def: &AppDef, id: &str, head: &str, (kube_version, api_versions): (Option<String>, Vec<String>)) -> Option<(Resolved, Vec<ArtifactRef>, Vec<PullSecret>)> {
+    async fn newest_built(self: &Arc<Self>, def: &AppDef, id: &str, head: &str, readers: &HashMap<String, Mirror>, (kube_version, api_versions): (Option<String>, Vec<String>)) -> Option<(Resolved, Vec<ArtifactRef>, Vec<PullSecret>)> {
         // What runs: its last deployment that succeeded (kept, so known after a restart too, before
         // the app is compared), else what its status says.
         let runs = self
@@ -577,15 +787,15 @@ impl Cd {
         // The source whose commit is the app's revision.
         let i = def.sources.iter().position(|s| s.chart.is_none() && s.as_ref.is_none())?;
         let source = def.sources.get(i)?;
-        let (dir, url, auth, from, to) = (self.mirror_dir(&source.repo), source.repo.clone(), self.git_auth(&source.repo), runs.clone(), head.to_owned());
-        let stack = crate::rt::blocking(move || Mirror::open(&dir, &url, auth)?.stack(Some(&from), &to, NEWEST_BUILT)).await.ok()?.ok()?;
+        let (source, from, to) = (readers.get(&source.repo)?.clone(), runs.clone(), head.to_owned());
+        let stack = crate::rt::blocking_in(crate::rt::SHARE_GIT_MIRROR_IO, move || source.stack(Some(&from), &to, NEWEST_BUILT)).await.ok()?.ok()?;
         for commit in in_place_of_head(stack, &runs) {
             if self.resolve_artifacts(def, &commit).await.is_err() {
                 continue;
             }
             let at: Vec<Option<String>> = (0..def.sources.len()).map(|j| (j == i).then(|| commit.clone())).collect();
-            let (this, d, (kv, av)) = (Arc::clone(self), def.clone(), (kube_version.clone(), api_versions.clone()));
-            let built = crate::rt::blocking(move || this.inputs_of(&d, kv.as_deref(), &av, Some(&at))).await.ok()?.ok()?;
+            let (d, readers, (kv, av)) = (def.clone(), readers.clone(), (kube_version.clone(), api_versions.clone()));
+            let built = crate::rt::blocking_in(crate::rt::SHARE_GIT_MIRROR_IO, move || Self::inputs_from(&d, kv.as_deref(), &av, Some(&at), &readers)).await.ok()?.ok()?;
             let (a, p) = self.resolve_artifacts(def, &built.revision).await.ok()?;
             if commit != runs {
                 tracing::info!(app = %id, head = %head.get(..7).unwrap_or(head), commit = %commit.get(..7).unwrap_or(&commit), "deployments: the head's artifacts aren't built yet; the newest commit whose are takes its place");
@@ -605,10 +815,11 @@ impl Cd {
     }
 
     /// Makes `r` an app's inputs, telling the engine when they moved.
-    fn use_inputs(&self, id: &str, r: Resolved) {
+    async fn use_inputs(&self, id: &str, r: Resolved) -> Result<()> {
         if self.keep_inputs(id, &r) {
-            self.input(Input::Inputs { app: id.into(), revision: r.revision.into(), key: r.key, content: r.content });
+            self.input(Input::Inputs { app: id.into(), revision: r.revision.into(), key: r.key, content: r.content }).await?;
         }
+        Ok(())
     }
 
     /// Records `r` as an app's inputs (renders read their commits from here); whether they moved.
@@ -628,6 +839,14 @@ impl Cd {
     /// source reads. `at` holds sources at given commits (a rollback); the others resolve their
     /// revisions.
     fn inputs_of(&self, def: &AppDef, kube_version: Option<&str>, api_versions: &[String], at: Option<&[Option<String>]>) -> Result<Resolved> {
+        // Explicit plans/rollbacks are separate operations. Capture each URL once here too;
+        // the refresh owner supplies its already-fetched readers to the same resolver below.
+        let mut sources = SourceRefresh::default();
+        sources.open_app(self, def);
+        Self::inputs_from(def, kube_version, api_versions, at, &sources.readers(def)?)
+    }
+
+    fn inputs_from(def: &AppDef, kube_version: Option<&str>, api_versions: &[String], at: Option<&[Option<String>]>, readers: &HashMap<String, Mirror>) -> Result<Resolved> {
         let mut key = blake(&[serde_json::to_vec(&def.sources)?.as_slice(), def.destination.namespace.as_bytes(), def.name.as_bytes()]);
         // Only Helm and plugins read the cluster's version and API versions. Other renders come out
         // alike anywhere, so a CRD installed on the cluster moves none of their keys.
@@ -641,12 +860,12 @@ impl Cd {
         let mut ref_commits: HashMap<String, (Mirror, String)> = HashMap::new();
         for (i, s) in def.sources.iter().enumerate() {
             if let (Some(name), None) = (&s.as_ref, &s.chart) {
-                let m = Mirror::open(&self.mirror_dir(&s.repo), &s.repo, self.git_auth(&s.repo))?;
+                let m = readers.get(&s.repo).context("a source reader was not captured for this resolution")?;
                 let commit = match held(i) {
                     Some(c) => c,
                     None => m.resolve(&s.revision)?,
                 };
-                ref_commits.insert(name.clone(), (m, commit));
+                ref_commits.insert(name.clone(), (m.clone(), commit));
             }
         }
         for (i, s) in def.sources.iter().enumerate() {
@@ -655,11 +874,11 @@ impl Cd {
                 commits.push(None);
                 // A chart from a Helm repository: its version is its content (ref value files below).
                 let deps = render::deps(s, Kind::Helm, &|_| None);
-                key ^= self.ref_dep_hashes(&deps, &ref_commits)?.rotate_left((i % 61) as u32);
+                key ^= Self::ref_dep_hashes(&deps, &ref_commits)?.rotate_left((i % 61) as u32);
                 all_deps.push(deps);
                 continue;
             }
-            let m = Mirror::open(&self.mirror_dir(&s.repo), &s.repo, self.git_auth(&s.repo))?;
+            let m = readers.get(&s.repo).context("a source reader was not captured for this resolution")?;
             let commit = match held(i) {
                 Some(c) => c,
                 None => m.resolve(&s.revision)?,
@@ -691,7 +910,7 @@ impl Cd {
                 h = h.wrapping_add(blake(&[p.as_bytes(), hash.as_deref().unwrap_or("-").as_bytes()]));
             }
             key ^= h.rotate_left((i % 61) as u32);
-            key ^= self.ref_dep_hashes(&refs, &ref_commits)?.rotate_left(((i + 31) % 61) as u32);
+            key ^= Self::ref_dep_hashes(&refs, &ref_commits)?.rotate_left(((i + 31) % 61) as u32);
             let mut deps: Vec<Dep> = own.into_iter().map(|path| Dep { source: None, path }).collect();
             deps.extend(refs);
             commits.push(Some(commit));
@@ -704,10 +923,10 @@ impl Cd {
         if reads_cluster {
             key ^= cluster;
         }
-        Ok(Resolved { revision, key, content, commits, deps: all_deps, ..Resolved::default() })
+        Ok(Resolved { revision, key, content, commits, deps: all_deps, readers: readers.clone(), ..Resolved::default() })
     }
 
-    fn ref_dep_hashes(&self, deps: &[Dep], refs: &HashMap<String, (Mirror, String)>) -> Result<u64> {
+    fn ref_dep_hashes(deps: &[Dep], refs: &HashMap<String, (Mirror, String)>) -> Result<u64> {
         let mut h = 0u64;
         for d in deps {
             let Some(name) = &d.source else { continue };
@@ -909,7 +1128,7 @@ impl Cd {
     async fn render(self: Arc<Self>, key: u64, app: String) {
         let entry = self.apps.read().get(&app).cloned();
         let Some(entry) = entry else {
-            self.input(Input::Rendered { key, result: Err(format!("no app {app}")) });
+            let _ = self.input(Input::Rendered { key, result: Err(format!("no app {app}")) }).await;
             return;
         };
         let cluster = self.clusters.read().get(&entry.def.destination.cluster).cloned();
@@ -917,24 +1136,23 @@ impl Cd {
             Some(c) => (c.version.read().clone(), c.discovery.read().api_versions.clone()),
             None => (None, Vec::new()),
         };
-        // The commits this key stands for, even if git moved since it was resolved.
-        let inputs = entry.resolved.iter().find(|r| r.key == key).cloned().unwrap_or_else(|| Resolved {
-            key,
-            commits: entry.commits.clone(),
-            deps: entry.deps.clone(),
-            ..Resolved::default()
-        });
+        // U08: only that key's complete captured resolution can render it. Substituting the
+        // entry's current commits for an expired key would cache different bytes under it.
+        let Some(inputs) = entry.resolved.iter().find(|r| r.key == key).cloned() else {
+            let _ = self.input(Input::Rendered { key, result: Err(format!("source resolution {key:016x} for {app} is no longer retained; refresh the app's sources before rendering")) }).await;
+            return;
+        };
         let this = self.clone();
         let def = entry.def.clone();
-        let result = crate::rt::blocking(move || this.render_app(&def, &inputs, key, kube_version.as_deref(), &api_versions)).await.and_then(|r| r);
+        let result = crate::rt::blocking_in(crate::rt::SHARE_GIT_MIRROR_IO, move || this.render_app(&def, &inputs, key, kube_version.as_deref(), &api_versions)).await.and_then(|r| r);
         match result {
             Ok((objects, children)) => {
-                self.adopt_children(&app, children);
-                self.input(Input::Rendered { key, result: Ok(objects) });
+                if self.adopt_children(&app, children).await.is_err() { return; }
+                let _ = self.input(Input::Rendered { key, result: Ok(objects) }).await;
             }
             Err(e) => {
                 tracing::warn!(app = %app, error = %format!("{e:#}"), "deployments: render failed");
-                self.input(Input::Rendered { key, result: Err(format!("{e:#}")) });
+                let _ = self.input(Input::Rendered { key, result: Err(format!("{e:#}")) }).await;
             }
         }
     }
@@ -955,7 +1173,7 @@ impl Cd {
         };
         let secrets = self.app_secrets(&def).await?;
         let cd = Arc::clone(self);
-        crate::rt::blocking(move || {
+        crate::rt::blocking_in(crate::rt::SHARE_GIT_MIRROR_IO, move || {
             let mut r = cd.inputs_of(&def, kube_version.as_deref(), &api_versions, None)?;
             let (artifacts, pull_secrets) = cd.planned_artifacts(&def, &r.revision);
             r.add_artifacts(artifacts, pull_secrets);
@@ -980,7 +1198,7 @@ impl Cd {
             let Some(name) = &s.as_ref else { continue };
             let commit = inputs.commits.get(i).cloned().flatten().context("a ref source's commit is unknown")?;
             let wanted: Vec<String> = inputs.deps.iter().flatten().filter(|d| d.source.as_deref() == Some(name)).map(|d| d.path.clone()).collect();
-            let m = Mirror::open(&self.mirror_dir(&s.repo), &s.repo, self.git_auth(&s.repo))?;
+            let m = inputs.reader(&s.repo)?;
             let root = views.join(format!("ref-{name}"));
             let wanted: Vec<&str> = wanted.iter().map(String::as_str).collect();
             m.extract(&commit, &wanted, &root)?;
@@ -996,7 +1214,7 @@ impl Cd {
             let root = views.join(format!("src-{i}"));
             let commit = inputs.commits.get(i).cloned().flatten().unwrap_or_else(|| s.revision.clone());
             if s.chart.is_none() {
-                let m = Mirror::open(&self.mirror_dir(&s.repo), &s.repo, self.git_auth(&s.repo))?;
+                let m = inputs.reader(&s.repo)?;
                 let own: Vec<&str> = inputs.deps.get(i).into_iter().flatten().filter(|d| d.source.is_none()).map(|d| d.path.as_str()).collect();
                 m.extract(&commit, &own, &root)?;
             }
@@ -1050,7 +1268,7 @@ impl Cd {
     /// Registers the Applications an app rendered as its children, and forgets the ones it no
     /// longer renders. One kept in kiln (taken over, or made through the API) is kiln's own: the
     /// parent rendering it changes nothing, and it is never the parent's to forget.
-    fn adopt_children(&self, parent: &str, children: Vec<Value>) {
+    async fn adopt_children(&self, parent: &str, children: Vec<Value>) -> Result<()> {
         let (clusters, kept) = self.store.read(|d| (d.clusters.clone(), d.apps.keys().cloned().collect::<BTreeSet<String>>()));
         let by_url = |url: &str| clusters.values().find(|c| c.server.trim_end_matches('/') == url.trim_end_matches('/')).map(|c| c.name.clone());
         let defs: Vec<AppDef> = children
@@ -1064,19 +1282,20 @@ impl Cd {
         let defs = rendered_children(defs, &kept);
         let ids: BTreeSet<String> = defs.iter().map(AppDef::id).collect();
         for def in defs {
-            self.register(def);
+            self.register(def).await?;
         }
         let (gone, prune) = {
             let mut apps = self.apps.write();
-            let Some(p) = apps.get_mut(parent) else { return };
+            let Some(p) = apps.get_mut(parent) else { return Ok(()) };
             let gone = forgotten(&p.children, &ids, &kept);
             p.children = ids;
             (gone, p.def.sync.prune)
         };
         for g in gone {
             let cascade = prune && self.apps.read().get(&g).is_some_and(|e| e.def.cascade);
-            self.unregister(&g, cascade);
+            self.unregister(&g, cascade).await?;
         }
+        Ok(())
     }
 
     // ---------------------------------------------------------------- clusters
@@ -1149,12 +1368,12 @@ impl Cd {
             match attempt.await {
                 Ok((cluster, d)) => {
                     tracing::info!(cluster = %def.name, kinds = d.kinds.len(), version = ?cluster.version.read(), "deployments: cluster connected");
-                    self.input(Input::UpsertCluster { name: def.name.as_str().into(), qps: def.qps, inflight: def.inflight });
+                    if self.input(Input::UpsertCluster { name: def.name.as_str().into(), qps: def.qps, inflight: def.inflight }).await.is_err() { return; }
                     for (gk, r) in &d.kinds {
-                        self.input(Input::Scope { cluster: def.name.as_str().into(), kind: gk.clone(), namespaced: r.namespaced });
+                        if self.input(Input::Scope { cluster: def.name.as_str().into(), kind: gk.clone(), namespaced: r.namespaced }).await.is_err() { return; }
                     }
                     self.clusters.write().insert(def.name.clone(), cluster.clone());
-                    self.input(Input::ClusterReachable { name: def.name.as_str().into(), reachable: true });
+                    if self.input(Input::ClusterReachable { name: def.name.as_str().into(), reachable: true }).await.is_err() { return; }
                     // kiln's own cluster: a self-deploy in flight before this start finishes here.
                     if def.name == apps::IN_CLUSTER {
                         let this = self.clone();
@@ -1166,7 +1385,7 @@ impl Cd {
                 }
                 Err(e) => {
                     tracing::warn!(cluster = %def.name, error = %format!("{e:#}"), "deployments: can't reach a cluster yet");
-                    self.input(Input::ClusterReachable { name: def.name.as_str().into(), reachable: false });
+                    if self.input(Input::ClusterReachable { name: def.name.as_str().into(), reachable: false }).await.is_err() { return; }
                 }
             }
             if !self.hub.shutdown.sleep(wait).await {
@@ -1210,7 +1429,7 @@ impl Cd {
                 // The cluster serves no such kind (yet), so none of it exists: say so, or what
                 // waits for the kind to be read waits forever. Look again later: its CRD may be
                 // what a sync is about to apply.
-                self.input(Input::Live { cluster: name.clone(), change: LiveChange::Listed { kind: kind.clone(), objects: Vec::new() } });
+                if self.input(Input::Live { cluster: name.clone(), change: LiveChange::Listed { kind: kind.clone(), objects: Vec::new() } }).await.is_err() { return; }
                 if !self.hub.shutdown.sleep(wait).await {
                     return;
                 }
@@ -1231,7 +1450,7 @@ impl Cd {
                 }
             };
             wait = Duration::from_secs(1);
-            self.input(Input::Live { cluster: name.clone(), change: LiveChange::Listed { kind: kind.clone(), objects } });
+            if self.input(Input::Live { cluster: name.clone(), change: LiveChange::Listed { kind: kind.clone(), objects } }).await.is_err() { return; }
             // Watch from the list's version; a dropped stream resumes from the last version seen,
             // and only a 410 lists again.
             'watch: loop {
@@ -1266,14 +1485,14 @@ impl Cd {
                                 if let Some(r) = obj::str_at(&v, &["metadata", "resourceVersion"]) {
                                     rv = r.to_owned();
                                 }
-                                self.input(Input::Live { cluster: name.clone(), change: LiveChange::Upsert(v) });
+                                if self.input(Input::Live { cluster: name.clone(), change: LiveChange::Upsert(v) }).await.is_err() { return; }
                             }
                             Some(kiln_cd::kube::WatchEvent::Delete(v)) => {
                                 if let Some(r) = obj::str_at(&v, &["metadata", "resourceVersion"]) {
                                     rv = r.to_owned();
                                 }
                                 let key = ResKey::new(obj::group(&v), obj::kind(&v), obj::namespace(&v), obj::name(&v));
-                                self.input(Input::Live { cluster: name.clone(), change: LiveChange::Delete(key) });
+                                if self.input(Input::Live { cluster: name.clone(), change: LiveChange::Delete(key) }).await.is_err() { return; }
                             }
                             Some(kiln_cd::kube::WatchEvent::Bookmark(r)) => rv = r,
                             Some(kiln_cd::kube::WatchEvent::Expired) => break 'watch,
@@ -1306,7 +1525,7 @@ impl Cd {
                 match c.discover().await {
                     Ok(d) => {
                         for (gk, r) in &d.kinds {
-                            self.input(Input::Scope { cluster: c.name.as_str().into(), kind: gk.clone(), namespaced: r.namespaced });
+                            if self.input(Input::Scope { cluster: c.name.as_str().into(), kind: gk.clone(), namespaced: r.namespaced }).await.is_err() { return false; }
                         }
                         if c.knows(kind) {
                             return true;
@@ -1336,14 +1555,14 @@ impl Cd {
                     let this = self.clone();
                     crate::rt::spawn(async move {
                         let result = this.target_apply(&cluster, &object, dry_run).await;
-                        this.input(Input::Answer { id, result });
+                        let _ = this.input(Input::Answer { id, result }).await;
                     });
                 }
                 Action::Delete { id, cluster, key, .. } if kiln_cd::providers::is_target(&cluster) => {
                     let this = self.clone();
                     crate::rt::spawn(async move {
                         let result = this.target_delete(&cluster, &key).await.map(|()| None);
-                        this.input(Input::Answer { id, result });
+                        let _ = this.input(Input::Answer { id, result }).await;
                     });
                 }
                 Action::Apply { id, cluster, object, dry_run, manager, .. } => {
@@ -1368,7 +1587,7 @@ impl Cd {
                             }
                             None => Err(format!("cluster {cluster} is not connected")),
                         };
-                        this.input(Input::Answer { id, result });
+                        let _ = this.input(Input::Answer { id, result }).await;
                     });
                 }
                 Action::Delete { id, cluster, key, propagation } => {
@@ -1379,11 +1598,25 @@ impl Cd {
                             Some(c) => c.delete(&key, propagation.as_str()).await.map(|_| None).map_err(|e| format!("{e:#}")),
                             None => Err(format!("cluster {cluster} is not connected")),
                         };
-                        this.input(Input::Answer { id, result });
+                        let _ = this.input(Input::Answer { id, result }).await;
                     });
                 }
                 Action::Status(s) => {
                     let app = s.app.to_string();
+                    let definition = self.apps.read().get(&app).map(|entry| entry.def.clone());
+                    if let Some(definition) = definition {
+                        let status = summary_json(&s);
+                        // U04/U14: preserve the serial engine transition before UI batching.
+                        // Refused persistence retains this exact action for retry; accepting a
+                        // newer status first would erase failures/degradation on overflow.
+                        loop {
+                            match crate::ci::cd_events::accept_status(&self.hub, self.store.controller_scope(), &definition, status.clone()).await {
+                                Ok(()) => break,
+                                Err(error) => tracing::warn!(app = %app, error = %error, "CD status control was not accepted; retaining it before publication"),
+                            }
+                            if !self.hub.shutdown.sleep(Duration::from_secs(5)).await { return; }
+                        }
+                    }
                     let before = self.statuses.write().insert(app.clone(), s.clone());
                     crate::observe::kiln::cd_status(before.as_ref(), &s);
                     self.dirty.lock().insert(app);
@@ -1404,7 +1637,7 @@ impl Cd {
         if !succeeded {
             tracing::info!(app = %app, op, message = %message, "deployments: a sync failed");
         }
-        let (limit, commits, artifacts, dora) = {
+        let (limit, commits, artifacts, accepted_app, dora) = {
             let apps = self.apps.read();
             let e = apps.get(app.as_ref());
             let r = key.and_then(|k| e.and_then(|e| e.resolved.iter().find(|r| r.key == k)));
@@ -1416,7 +1649,7 @@ impl Cd {
                 let source = e.def.sources.iter().zip(commits.iter()).find_map(|(s, c)| c.clone().map(|c| (s.repo.clone(), c)));
                 (e.def.environment.clone(), source, e.def.labels.get("team").cloned())
             });
-            (e.map(|e| e.def.history_limit).unwrap_or(10), commits, artifacts, dora)
+            (e.map(|e| e.def.history_limit).unwrap_or(10), commits, artifacts, e.map(|e| e.def.clone()), dora)
         };
         let started_ms = self.started.lock().get(app.as_ref()).filter(|s| s.op == op).map(|s| s.at_ms);
         let d = Deployment {
@@ -1440,7 +1673,7 @@ impl Cd {
         if let Some((env, source, team)) = &dora {
             crate::observe::dora::cd_deployed(&d, started_ms, env.as_deref(), source.as_ref().map(|(r, c)| (r.as_str(), c.as_str())), team.as_deref());
         }
-        let rx = self.store.submit(Command::Deployed { deployment: Box::new(d), limit });
+        let rx = self.store.submit_with_app(Command::Deployed { deployment: Box::new(d), limit }, accepted_app);
         crate::rt::spawn(async move {
             if let Ok(Err(e)) = rx.await {
                 tracing::warn!(error = %e, "deployments: recording a deployment failed");
@@ -1557,33 +1790,52 @@ pub fn kubeconfig_endpoint(path: &str, context: &str) -> Result<kiln_cd::kube::E
     kiln_cd::kube::kubeconfig(&text, context, path.parent().unwrap_or(std::path::Path::new(".")))
 }
 
-fn engine_thread(rx: std::sync::mpsc::Receiver<ToEngine>, out: async_channel::Sender<Action>, cfg: EngineConfig) {
-    use std::sync::mpsc::RecvTimeoutError;
+fn engine_thread(rx: async_channel::Receiver<ToEngine>, out: async_channel::Sender<Action>, cfg: EngineConfig, clock: Arc<EngineClock>) {
     let mut engine = Engine::new(cfg);
-    let mut actions = Vec::new();
+    while let Ok(message) = rx.recv_blocking() {
+        match message {
+            ToEngine::Input(i) => engine.handle(now_ms(), *i),
+            ToEngine::Query(f) => { engine.handle(now_ms(), Input::Tick); f(&engine); }
+            ToEngine::Health(settings) => { set_health(&mut engine, &settings); engine.handle(now_ms(), Input::Tick); }
+            ToEngine::Tick => engine.handle(now_ms(), Input::Tick),
+        }
+        // U04/U14: finish this input's actions before consuming another accepted input.
+        // Backpressure cannot accumulate thousands of input batches in a second Vec here.
+        while let Some(action) = engine.poll() {
+            if out.send_blocking(action).is_err() { return; }
+        }
+        clock.update(&engine);
+    }
+}
+
+async fn engine_ticks(tx: async_channel::Sender<ToEngine>, clock: Arc<EngineClock>, shutdown: crate::rt::Shutdown) {
+    use futures::FutureExt as _;
     loop {
-        let wait = engine.deadline().map(|d| d.saturating_sub(now_ms())).unwrap_or(1_000).clamp(1, 1_000);
-        match rx.recv_timeout(Duration::from_millis(wait)) {
-            Ok(ToEngine::Input(i)) => engine.handle(now_ms(), *i),
-            Ok(ToEngine::Query(f)) => f(&engine),
-            Ok(ToEngine::Health(settings)) => set_health(&mut engine, &settings),
-            Err(RecvTimeoutError::Timeout) => engine.handle(now_ms(), Input::Tick),
-            Err(RecvTimeoutError::Disconnected) => return,
-        }
-        // Take whatever else is waiting before answering, so bursts are handled together.
-        for _ in 0..4096 {
-            match rx.try_recv() {
-                Ok(ToEngine::Input(i)) => engine.handle(now_ms(), *i),
-                Ok(ToEngine::Query(f)) => f(&engine),
-                Ok(ToEngine::Health(settings)) => set_health(&mut engine, &settings),
-                Err(_) => break,
+        let deadline = clock.deadline.load(Ordering::Acquire);
+        if deadline == u64::MAX {
+            futures::select_biased! {
+                () = shutdown.cancelled().fuse() => return,
+                () = tx.closed().fuse() => return,
+                () = clock.changed.notified().fuse() => continue,
             }
         }
-        engine.drain(&mut actions);
-        for a in actions.drain(..) {
-            if out.send_blocking(a).is_err() {
-                return;
-            }
+        let wait = Duration::from_millis(deadline.saturating_sub(now_ms()).max(1));
+        futures::select_biased! {
+            () = shutdown.cancelled().fuse() => return,
+            () = tx.closed().fuse() => return,
+            () = clock.changed.notified().fuse() => continue,
+            () = crate::rt::sleep(wait).fuse() => {}
+        }
+        match tx.try_send(ToEngine::Tick) {
+            Ok(()) | Err(async_channel::TrySendError::Full(_)) => {}
+            Err(async_channel::TrySendError::Closed(_)) => return,
+        }
+        // An already queued input advances timers too. Full queues coalesce only this hint;
+        // wait for the engine to advance before another hint, even while its output stalls.
+        futures::select_biased! {
+            () = shutdown.cancelled().fuse() => return,
+            () = tx.closed().fuse() => return,
+            () = clock.changed.notified().fuse() => {}
         }
     }
 }
@@ -1602,13 +1854,21 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
     let cfg = hub.cfg.cd.clone();
     let dir = hub.cfg.server.data_dir.join("cd");
     let store_dir = dir.join("store");
-    let store = crate::rt::blocking(move || Store::open(&store_dir, 1, &[1])).await??;
+    let source = hub.cfg.cluster.replica.as_ref().map_or(store::SourceConfig::Local, |replica| store::SourceConfig::Replica {
+        member: replica.id, source: replica.bootstrap.as_ref().map(|bootstrap| bootstrap.source_node),
+    });
+    let store = Store::open_from(hub.store.database(), &store_dir, Arc::new(hub.bus.clone()), hub.shutdown.clone(), source).await?;
     let changes = store.changes();
-    let (etx, erx) = std::sync::mpsc::channel();
-    let (atx, arx) = async_channel::unbounded();
+    let (etx, erx) = async_channel::bounded(ENGINE_QUEUE);
+    // U04/U14: SQL acceptance can stall status publication. Keep this carrier bounded and
+    // preserve every action in order: send_blocking backpressures only the engine's own thread.
+    let (atx, arx) = async_channel::bounded(ENGINE_QUEUE);
     let ecfg = EngineConfig { wave_delay_ms: cfg.wave_delay_ms, cluster_qps: cfg.qps, cluster_burst: cfg.qps * 2.0, ..EngineConfig::default() };
-    let _ = etx.send(ToEngine::Health(health_settings(&store)));
-    std::thread::Builder::new().name("kiln-cd-engine".into()).spawn(move || engine_thread(erx, atx, ecfg))?;
+    etx.send(ToEngine::Health(health_settings(&store))).await.map_err(|_| anyhow::anyhow!("deployments input closed during startup"))?;
+    let clock = Arc::new(EngineClock::new());
+    let thread_clock = clock.clone();
+    std::thread::Builder::new().name("kiln-cd-engine".into()).spawn(move || engine_thread(erx, atx, ecfg, thread_clock))?;
+    crate::rt::spawn(engine_ticks(etx.clone(), clock, hub.shutdown.clone()));
     let tools = Tools {
         helm: cfg.helm.clone().into(),
         kubectl: cfg.kubectl.clone().into(),
@@ -1634,7 +1894,7 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
         deleting: Mutex::new(BTreeMap::new()),
         watched: Mutex::new(BTreeSet::new()),
         connecting: Mutex::new(BTreeSet::new()),
-        inputs_gate: Mutex::new(()),
+        inputs_gate: async_lock::Mutex::new(()),
         dir,
         tools,
         poll: Duration::from_secs(cfg.poll_seconds.max(5)),
@@ -1654,54 +1914,77 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
         rollouts: rollouts::Drivers::default(),
     });
     *CD.write() = Some(cd.clone());
+    // Both queues are bounded: the consumer must be live before startup can fill either.
+    crate::rt::spawn(cd.clone().dispatch(arx));
     // Apps kept in kiln, then the clusters they deploy to.
     let kept: Vec<AppDef> = cd.store.read(|d| d.apps.values().cloned().collect());
-    for def in kept {
-        cd.register(def);
+    for def in &kept {
+        cd.register(def.clone()).await?;
     }
     cd.connect_clusters().await;
-    crate::rt::spawn(cd.clone().dispatch(arx));
     crate::rt::spawn(cd.clone().poll_loop());
     crate::rt::spawn(cd.clone().flush_loop());
     cd.resume_rollouts();
-    // The store's changes (from this server or, later, other members) reach the registry.
-    if let Some(changes) = changes {
-        let (ctx, crx) = async_channel::unbounded();
-        std::thread::Builder::new().name("kiln-cd-changes".into()).spawn(move || {
-            while let Ok(c) = changes.recv() {
-                if ctx.send_blocking(c).is_err() {
-                    return;
+    // U15/B2: Quiver delivers store changes; a missed event rebuilds from Amphora's snapshot.
+    let c2 = cd.clone();
+    let mut known_apps: BTreeSet<String> = kept.iter().map(AppDef::id).collect();
+    let mut known_clusters = c2.store.read(|d| d.clusters.keys().cloned().collect::<BTreeSet<_>>());
+    crate::rt::spawn(async move {
+        use futures::FutureExt as _;
+        let mut changes = changes;
+        loop {
+            let more = match c2.store.drain_controls(&c2.hub.store).await {
+                Ok(more) => more,
+                Err(error) => { tracing::warn!(error = %error, "CD control transfer will retry from its durable pending source"); false }
+            };
+            let next = futures::select_biased! {
+                () = c2.hub.shutdown.cancelled().fuse() => return,
+                change = changes.recv().fuse() => change,
+                () = crate::rt::sleep(if more { Duration::ZERO } else { Duration::from_secs(5) }).fuse() => continue,
+            };
+            let change = match next {
+                Ok(change) => change,
+                Err(crate::bus::RecvError::Closed) => return,
+                Err(error) => {
+                    tracing::warn!(error = %error, "CD changes require a canonical resnapshot");
+                    let (apps, clusters) = c2.store.read(|d| (d.apps.values().cloned().collect::<Vec<_>>(), d.clusters.keys().cloned().collect::<BTreeSet<_>>()));
+                    let next_apps = apps.iter().map(AppDef::id).collect::<BTreeSet<_>>();
+                    for id in known_apps.difference(&next_apps) {
+                        let cascade = c2.deleting.lock().remove(id).unwrap_or(false);
+                        if c2.unregister(id, cascade).await.is_err() { return; }
+                    }
+                    for app in apps { if c2.register(app).await.is_err() { return; } }
+                    for name in known_clusters.difference(&clusters) { c2.clusters.write().remove(name); }
+                    known_apps = next_apps;
+                    known_clusters = clusters;
+                    c2.connect_clusters().await;
+                    c2.kick();
+                    if c2.send(ToEngine::Health(health_settings(&c2.store))).await.is_err() { return; }
+                    continue;
                 }
-            }
-        })?;
-        let c2 = cd.clone();
-        crate::rt::spawn(async move {
-            while let Ok(change) = crx.recv().await {
-                match change {
-                    kiln_cd::state::Change::App(id) => {
-                        if let Some(def) = c2.store.read(|d| d.apps.get(&id).cloned()) {
-                            c2.register(def);
-                        }
-                    }
-                    kiln_cd::state::Change::AppDeleted(id) => {
-                        let cascade = c2.deleting.lock().remove(&id).unwrap_or(false);
-                        c2.unregister(&id, cascade);
-                    }
-                    kiln_cd::state::Change::Cluster(_) => c2.connect_clusters().await,
-                    kiln_cd::state::Change::ClusterDeleted(name) => {
-                        c2.clusters.write().remove(&name);
-                    }
-                    kiln_cd::state::Change::Pinned(_) => c2.kick(),
-                    kiln_cd::state::Change::Setting(k) if k.starts_with(HEALTH_SETTINGS) => {
-                        let _ = c2.engine.send(ToEngine::Health(health_settings(&c2.store)));
-                    }
-                    _ => {}
+            };
+            match change {
+                kiln_cd::state::Change::App(id) => {
+                    known_apps.insert(id.clone());
+                    if let Some(def) = c2.store.read(|d| d.apps.get(&id).cloned())
+                        && c2.register(def).await.is_err() { return; }
                 }
+                kiln_cd::state::Change::AppDeleted(id) => {
+                    known_apps.remove(&id);
+                    let cascade = c2.deleting.lock().remove(&id).unwrap_or(false);
+                    if c2.unregister(&id, cascade).await.is_err() { return; }
+                }
+                kiln_cd::state::Change::Cluster(name) => { known_clusters.insert(name); c2.connect_clusters().await; }
+                kiln_cd::state::Change::ClusterDeleted(name) => { known_clusters.remove(&name); c2.clusters.write().remove(&name); }
+                kiln_cd::state::Change::Pinned(_) => c2.kick(),
+                kiln_cd::state::Change::Setting(k) if k.starts_with(HEALTH_SETTINGS) && c2.send(ToEngine::Health(health_settings(&c2.store))).await.is_err() => { return; }
+                _ => {}
             }
-        });
-    }
+        }
+    });
     tracing::info!(apps = cd.apps.read().len(), "deployments ready");
     let _ = hub.shutdown.cancelled().await;
+    cd.engine.close();
     *CD.write() = None;
     Ok(())
 }
@@ -1709,6 +1992,156 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn u08_credential_templates_require_authority_and_path_boundaries() {
+        let cases = [
+            ("https://git.example/", "https://git.example.evil/repo", false),
+            ("https://git.example/", "https://git.example@evil.example/repo", false),
+            ("https://git.example/team", "https://git.example/team-other/repo", false),
+            ("https://git.example/team", "http://git.example/team/repo", false),
+            ("https://git.example/team", "https://git.example:443/team/repo", false),
+            ("https://git.example:8443/team", "https://git.example:9443/team/repo", false),
+            ("https://git.example/", "https://git.example/team/repo", true),
+            ("https://git.example/team/", "https://git.example/team", true),
+            ("https://git.example/team", "https://git.example/team/repo", true),
+            ("https://git.example:8443/team", "https://git.example:8443/team/repo", true),
+            ("https://git.example/team", "https://git.example/team/../other", false),
+            ("https://git.example/team", "https://git.example/team/%2e%2e/other", false),
+            ("git@git.example:team", "git@git.example:team/repo", false),
+            ("git@git.example:team/repo", "git@git.example:team/repo", true),
+            ("ssh://git@git.example/team", "ssh://git@git.example/team/repo", false),
+            ("ssh://git@git.example/team/repo", "ssh://git@git.example/team/repo", true),
+            ("", "https://git.example/team/repo", false),
+        ];
+        for (index, (scope, target, expected)) in cases.into_iter().enumerate() {
+            // Diagnostics carry only a case number, never URL userinfo or credential values.
+            assert_eq!(credential_template_matches(scope, target), expected, "U08 scope case {index}");
+        }
+        let scopes = ["https://git.example/", "https://git.example/team", "https://git.example/team/repo-other"];
+        let selected = scopes.into_iter().filter(|scope| credential_template_matches(scope, "https://git.example/team/repo/subpath")).max_by_key(|scope| scope.len());
+        assert_eq!(selected, Some("https://git.example/team"));
+    }
+
+    /// U04/U14: a stalled status consumer backpressures the producer without losing accepted
+    /// inputs. Resuming it preserves command/action order, including commands awaiting space.
+    #[test]
+    fn u04_cd_engine_backpressure_preserves_inputs_and_recovers_without_a_queue_cycle() -> Result<()> {
+        crate::rt::block_on(async {
+            async fn send(tx: &async_channel::Sender<ToEngine>, value: ToEngine) -> Result<()> {
+                tx.send(value).await.map_err(|_| anyhow::anyhow!("fixture engine closed"))
+            }
+            let (tx, rx) = async_channel::bounded(1);
+            let (actions, out) = async_channel::bounded(1);
+            let worker = std::thread::Builder::new().name("cd-backpressure-fixture".into()).spawn(move || engine_thread(rx, actions, EngineConfig::default(), Arc::new(EngineClock::new())))?;
+            let result = crate::rt::timeout(Duration::from_secs(5), async {
+                for app in ["first", "second"] {
+                    send(&tx, ToEngine::Input(Box::new(Input::UpsertApp(kiln_cd::model::AppConfig::new(app, "fixture", "fixture"))))).await?;
+                }
+                let (answer, queried) = futures::channel::oneshot::channel();
+                send(&tx, ToEngine::Query(Box::new(move |engine| { let _ = answer.send(engine.app_count()); }))).await?;
+                let waiting = tx.send(ToEngine::Input(Box::new(Input::RemoveApp { id:"first".into(), cascade:None })));
+                futures::pin_mut!(waiting);
+                assert!(futures::poll!(waiting.as_mut()).is_pending(), "a full input carrier must await capacity instead of accepting or dropping another command");
+                let first = out.recv().await?;
+                assert!(matches!(first, Action::Status(status) if status.app.as_ref() == "first"));
+                waiting.await.map_err(|_| anyhow::anyhow!("waiting command refused"))?;
+                assert_eq!(queried.await?, 2, "the earlier accepted query runs before the waiting removal");
+                let second = out.recv().await?;
+                assert!(matches!(second, Action::Status(status) if status.app.as_ref() == "second"));
+                let (answer, queried) = futures::channel::oneshot::channel();
+                send(&tx, ToEngine::Query(Box::new(move |engine| { let _ = answer.send(engine.app_count()); }))).await?;
+                assert_eq!(queried.await?, 1, "the command awaiting capacity executes after recovery");
+                Ok::<_, anyhow::Error>(())
+            }).await;
+            // Always release the fixture's own thread, including a failed/timeout scenario.
+            tx.close(); out.close();
+            crate::rt::blocking(move || worker.join().map_err(|_| anyhow::anyhow!("fixture engine thread panicked"))).await??;
+            result??;
+            Ok(())
+        })
+    }
+
+    /// U08: discovery and apps use one captured reader; a failed round retries next time.
+    /// Real source resolution and delayed extraction keep that reader across auth changes.
+    #[test]
+    fn u08_discovery_and_apps_fetch_a_source_once_and_retry_next_round() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let source = dir.path().join("source");
+            let away = dir.path().join("away");
+            let hub = crate::hub::tests::scratch_hub().await?;
+            std::fs::create_dir(&source)?;
+            let git = |args: &[&str]| -> anyhow::Result<String> {
+                let out = std::process::Command::new("git").arg("-C").arg(&source).args(args).output()?;
+                anyhow::ensure!(out.status.success(), "git: {}", String::from_utf8_lossy(&out.stderr));
+                Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+            };
+            git(&["init", "-b", "main"])?;
+            std::fs::create_dir(source.join("fixture"))?;
+            let manifest = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: fixture\ndata:\n  value: first\n";
+            std::fs::write(source.join("fixture/config.yaml"), manifest)?;
+            git(&["add", "fixture"])?;
+            git(&["-c", "user.name=kiln", "-c", "user.email=kiln@example.invalid", "commit", "--allow-empty", "-m", "first"])?;
+            let first = git(&["rev-parse", "HEAD"])?;
+            let url = source.to_string_lossy().into_owned();
+            let source_read = ReadContext::new(&hub, &url, GitAuth { header: Some("Bearer first-reader".into()), isolated: true, ..GitAuth::default() }, vec![]);
+            let mut round = SourceRefresh::default();
+            let captured = round.capture(&url, || source_read.clone());
+            round.fetch(captured).await.map_err(anyhow::Error::msg)?;
+            let mut manual = SourceRefresh::default();
+            let captured = manual.capture(&url, || source_read.clone());
+            manual.open(captured).map_err(anyhow::Error::msg)?;
+            std::fs::rename(&source, &away)?;
+            // Discovery fetched it; app resolution must not need the remote again this round.
+            round.fetch(source_read.clone()).await.map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(source_read.open()?.resolve("main")? == first, "the round changed its source snapshot");
+            // A RepoDef change during the fetch wait must not choose a cold mirror for this
+            // URL. The actual production resolver must still read the captured files offline.
+            let selected = round.capture(&url, || ReadContext::new(&hub, &url, GitAuth { header: Some("Bearer changed-during-refresh".into()), isolated: true, ..GitAuth::default() }, vec![]));
+            round.fetch(selected).await.map_err(anyhow::Error::msg)?;
+            let mut def = child("fixture").map_err(anyhow::Error::msg)?;
+            for source in &mut def.sources { source.repo = url.clone(); }
+            let inputs = Cd::inputs_from(&def, None, &[], None, &round.readers(&def)?)?;
+            anyhow::ensure!(inputs.revision == first && inputs.commits == vec![Some(first.clone())], "production input resolution changed its captured reader");
+            // Manual plans/rollback open without an implicit refresh. Their successive input
+            // resolutions keep the same reader even after credential selection has changed.
+            let selected = manual.capture(&url, || ReadContext::new(&hub, &url, GitAuth { header: Some("Bearer changed-between-manual-steps".into()), isolated: true, ..GitAuth::default() }, vec![]));
+            manual.open(selected).map_err(anyhow::Error::msg)?;
+            let readers = manual.readers(&def)?;
+            let head = Cd::inputs_from(&def, None, &[], None, &readers)?;
+            let back = Cd::inputs_from(&def, None, &[], Some(&[Some(first.clone())]), &readers)?;
+            anyhow::ensure!(head.revision == first && back.revision == first && head.commits == back.commits, "manual source resolutions reopened with another reader");
+            let mut failed = SourceRefresh::default();
+            let error = failed.fetch(source_read.clone()).await.err();
+            anyhow::ensure!(error.is_some(), "an unreachable source appeared fetched");
+            std::fs::rename(&away, &source)?;
+            anyhow::ensure!(failed.fetch(source_read.clone()).await.err() == error, "apps retried a failed discovery fetch in the same round");
+            git(&["-c", "user.name=kiln", "-c", "user.email=kiln@example.invalid", "commit", "--allow-empty", "-m", "next"])?;
+            let next = git(&["rev-parse", "HEAD"])?;
+            let mut recovered = SourceRefresh::default();
+            recovered.fetch(source_read.clone()).await.map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(source_read.open()?.resolve("main")? == next, "a new round didn't fetch the new commit");
+            // A new RepoDef selection for this URL must not reuse the first reader's cached
+            // success or repopulate its mirror. Both captures remain usable while offline.
+            let other_read = ReadContext::new(&hub, &url, GitAuth { header: Some("Bearer next-reader".into()), isolated: true, ..GitAuth::default() }, vec![]);
+            git(&["-c", "user.name=kiln", "-c", "user.email=kiln@example.invalid", "commit", "--allow-empty", "-m", "other reader"])?;
+            let other = git(&["rev-parse", "HEAD"])?;
+            recovered.fetch(other_read.clone()).await.map_err(anyhow::Error::msg)?;
+            std::fs::rename(&source, &away)?;
+            recovered.fetch(source_read.clone()).await.map_err(anyhow::Error::msg)?;
+            recovered.fetch(other_read.clone()).await.map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(source_read.open()?.resolve("main")? == next, "new credentials changed the captured reader's mirror");
+            anyhow::ensure!(other_read.open()?.resolve("main")? == other, "a new credential identity reused another reader's fetch result");
+            // A delayed render extracts the earlier resolved commit using its retained reader,
+            // after another round and another credential identity have moved forward offline.
+            let view = dir.path().join("captured-view");
+            let paths: Vec<&str> = inputs.deps.iter().flatten().filter(|dep| dep.source.is_none()).map(|dep| dep.path.as_str()).collect();
+            inputs.reader(&url)?.extract(&inputs.revision, &paths, &view)?;
+            anyhow::ensure!(std::fs::read_to_string(view.join("fixture/config.yaml"))? == manifest, "delayed extraction changed the captured source bytes");
+            Ok(())
+        })
+    }
 
     /// An app's status is the JSON it was before it was a type (`wire::events::CdStatus`).
     #[test]

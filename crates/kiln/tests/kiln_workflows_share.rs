@@ -80,14 +80,14 @@ const MAC: Where = Where { os: "macos", arch: "aarch64", executor: "host", image
 #[test]
 #[ignore = "ci.yaml and release.yaml leave their memo out until the kiln deployed reads it (e12f35881b), as image.yaml does"]
 fn w28_ac77_one_ui_build_per_tree_across_ci_release_and_image() -> anyhow::Result<()> {
-    // image.yaml's UI step leaves its memo out until the kiln deployed reads it (see there).
-    let jobs: [(&str, &str, &Where); 6] = [
+    let jobs: [(&str, &str, &Where); 7] = [
         ("ci.yaml", "ui", &K8S),
         ("ci.yaml", "ui-checks", &UI_CHECKS),
         ("ci.yaml", "release-binary", &Where { needs: Some("rust,ui"), ..OTHER_LINUX }),
         ("release.yaml", "linux", &OTHER_LINUX),
         ("release.yaml", "windows", &ADACACHY),
         ("release.yaml", "macos", &MAC),
+        ("image.yaml", "image", &ADACACHY),
     ];
     let mut keys = BTreeSet::new();
     for (file, job, at) in jobs {

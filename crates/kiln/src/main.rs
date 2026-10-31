@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use kiln::rt::Shutdown;
 
 use kiln::{config, install, supervise};
@@ -23,10 +23,95 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: CommandTree,
 }
 
-#[derive(Subcommand)]
+// G-18: eager command builders need separate frames on Windows' native 1 MiB stack.
+// One declaration supplies both parsing and each small builder, so local argument metadata
+// exists before clap propagates globals. Deferring the root changes overlapping local flags.
+macro_rules! command_tree {
+    (enum $name:ident {
+        $( $(#[$attr:meta])* $variant:ident
+            $(($payload:ty))?
+            $({ $( $(#[$field_attr:meta])* $field:ident: $field_type:ty ),* $(,)? })?
+        ),* $(,)?
+    }) => {
+        #[derive(Subcommand)]
+        enum $name {
+            $( $(#[$attr])* $variant $(($payload))?
+                $({ $( $(#[$field_attr])* $field: $field_type ),* })? ),*
+        }
+
+        // These enums supply builders only; parsing and updating use the original enum.
+        #[allow(dead_code, unused_imports)]
+        mod command_builders {
+            use super::*;
+            $(
+                #[derive(Subcommand)]
+                #[allow(clippy::enum_variant_names)]
+                pub(super) enum $variant {
+                    $(#[$attr])* $variant $(($payload))?
+                        $({ $( $(#[$field_attr])* $field: $field_type ),* })?
+                }
+                impl $variant {
+                    #[inline(never)]
+                    pub(super) fn build(command: clap::Command) -> clap::Command {
+                        <Self as clap::Subcommand>::augment_subcommands(command)
+                    }
+                    #[inline(never)]
+                    pub(super) fn build_for_update(command: clap::Command) -> clap::Command {
+                        <Self as clap::Subcommand>::augment_subcommands_for_update(command)
+                    }
+                }
+            )*
+        }
+
+        struct CommandTree($name);
+
+        impl clap::Subcommand for CommandTree {
+            #[inline(never)]
+            fn augment_subcommands(mut command: clap::Command) -> clap::Command {
+                let builders: &[fn(clap::Command) -> clap::Command] = &[
+                    $(command_builders::$variant::build),*
+                ];
+                for builder in builders {
+                    command = builder(command);
+                }
+                command
+            }
+            #[inline(never)]
+            fn augment_subcommands_for_update(mut command: clap::Command) -> clap::Command {
+                let builders: &[fn(clap::Command) -> clap::Command] = &[
+                    $(command_builders::$variant::build_for_update),*
+                ];
+                for builder in builders {
+                    command = builder(command);
+                }
+                command
+            }
+            fn has_subcommand(name: &str) -> bool {
+                <$name as clap::Subcommand>::has_subcommand(name)
+            }
+        }
+
+        impl clap::FromArgMatches for CommandTree {
+            fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+                <$name as clap::FromArgMatches>::from_arg_matches(matches).map(Self)
+            }
+            fn from_arg_matches_mut(matches: &mut clap::ArgMatches) -> Result<Self, clap::Error> {
+                <$name as clap::FromArgMatches>::from_arg_matches_mut(matches).map(Self)
+            }
+            fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+                clap::FromArgMatches::update_from_arg_matches(&mut self.0, matches)
+            }
+            fn update_from_arg_matches_mut(&mut self, matches: &mut clap::ArgMatches) -> Result<(), clap::Error> {
+                clap::FromArgMatches::update_from_arg_matches_mut(&mut self.0, matches)
+            }
+        }
+    };
+}
+
+command_tree! {
 enum Cmd {
     /// Run the server (UI, API, scheduler, GitOps, QUIC agent transport).
     Server,
@@ -276,6 +361,8 @@ enum Cmd {
     },
 }
 
+}
+
 /// Which server a CLI command talks to. By default kiln finds it: the cluster bootstrap's
 /// credentials, then the local server; every admin token is checked against the server first.
 #[derive(clap::Args, Clone, Default)]
@@ -491,6 +578,11 @@ fn thread_stacks() {
 
 fn main() -> ExitCode {
     thread_stacks();
+    // U03/W17-R01: the existing CI kernel launcher owns this PTY adapter before entry.
+    // Keep its private framed stdout free of CLI parsing, logging and configuration output.
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--internal-ci-pty")) {
+        return kiln::terminal::helper_main();
+    }
     // A microVM's init (docs/ci.md W13-R05): before anything else starts, as PID 1 forks.
     #[cfg(target_os = "linux")]
     if std::env::args().nth(1).as_deref() == Some("guest") {
@@ -533,10 +625,21 @@ fn main() -> ExitCode {
             }
         };
     }
-    let cli = Cli::parse();
+    // Preserve Clap's distinction between an explicit choice and an inherited env default.
+    // A detached supervisor's captured child config may override the latter, not the former.
+    let mut matches = Cli::command().get_matches();
+    let config_from_argv = matches.value_source("config") == Some(clap::parser::ValueSource::CommandLine);
+    let cli = match Cli::from_arg_matches_mut(&mut matches) {
+        Ok(cli) => cli,
+        Err(error) => {
+            let code = u8::try_from(error.exit_code()).unwrap_or(2);
+            let _ = error.print();
+            return ExitCode::from(code);
+        }
+    };
     // `kiln gocacheprog` answers the go command on stdout (W24-R08): nothing else may write there,
     // logs included, and it needs no runtime.
-    if let Cmd::Gocacheprog(a) = &cli.cmd {
+    if let Cmd::Gocacheprog(a) = &cli.cmd.0 {
         return match kiln::runner::work::gocacheprog::main(a.clone()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -548,16 +651,16 @@ fn main() -> ExitCode {
     // `kiln workflow run` runs a server of its own in this process: its logs are the runs', and
     // the server says only what goes wrong unless asked for more. `kiln setup` says what it does
     // itself, the same way.
-    let quiet = matches!(cli.cmd, Cmd::Workflow(_) | Cmd::Setup(_)) && cli.log == "info" && std::env::var_os("KILN_LOG").is_none();
+    let quiet = matches!(cli.cmd.0, Cmd::Workflow(_) | Cmd::Setup(_)) && cli.log == "info" && std::env::var_os("KILN_LOG").is_none();
     init_tracing(if quiet { "warn" } else { &cli.log }, cli.json);
     install_panic_hook();
     // Everything runs on hyper-rt, hyper-raft's thread-per-core runtime, sized for the role.
-    kiln::rt::configure(match &cli.cmd {
+    kiln::rt::configure(match &cli.cmd.0 {
         Cmd::Server | Cmd::Up | Cmd::Workflow(_) => kiln::rt::Profile::server(),
         Cmd::Agent(_) | Cmd::Join(_) | Cmd::Outpost(_) => kiln::rt::Profile::agent(),
         _ => kiln::rt::Profile::tool(),
     });
-    match kiln::rt::block_on(real_main(cli)) {
+    match kiln::rt::block_on(real_main(cli, config_from_argv)) {
         Ok(()) => ExitCode::SUCCESS,
         // `kiln run`: the command's own exit status, nothing more to say.
         Err(ref e) if let Some(kiln::reach::cli::ExitWith(code)) = e.downcast_ref::<kiln::reach::cli::ExitWith>() => ExitCode::from(*code),
@@ -575,15 +678,17 @@ fn boxed<'a, F: Future + Send + 'a>(make: impl FnOnce() -> F) -> Pin<Box<dyn Fut
     Box::pin(make())
 }
 
-async fn real_main(cli: Cli) -> anyhow::Result<()> {
-    let config_path = cli.config.clone().unwrap_or_else(config::default_config_path);
+async fn real_main(cli: Cli, config_from_argv: bool) -> anyhow::Result<()> {
+    // Resolve the config filename before any child/service changes its working directory.
+    // Config::load still interprets relative server.data_dir in the current process CWD.
+    let config_path = std::path::absolute(cli.config.clone().unwrap_or_else(config::default_config_path))?;
     // Make the resolved config path visible to children (supervise → server).
     let shutdown = Shutdown::new();
     let _ = kiln::SHUTDOWN.set(shutdown.clone());
     // A test build's faults, for this process's runner (a server's own runner reads KILN_CHAOS).
     #[cfg(feature = "chaos")]
     {
-        let spec = match &cli.cmd {
+        let spec = match &cli.cmd.0 {
             Cmd::Agent(a) => a.chaos.clone(),
             _ => std::env::var("KILN_CHAOS").ok(),
         };
@@ -591,7 +696,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
             kiln::runner::chaos::set(kiln::runner::chaos::parse(&spec)?);
         }
     }
-    match cli.cmd {
+    match cli.cmd.0 {
         Cmd::Server => {
             let cfg = config::Config::load(&config_path)?;
             shutdown_on_signals(shutdown.clone());
@@ -663,6 +768,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
                 slots: a.slots.unwrap_or_else(|| u32::try_from((cpus / 4).max(1)).unwrap_or(1)),
                 work_dir: a.work_dir.unwrap_or_else(|| state_dir.join("work")),
                 state_dir,
+                shared_store: None,
                 join_token: a.token,
                 ephemeral: a.ephemeral,
                 dedicated_job: a.job,
@@ -708,6 +814,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
                 slots: 0,
                 work_dir: state_dir.join("work"),
                 state_dir,
+                shared_store: None,
                 join_token: token,
                 ephemeral: false,
                 dedicated_job: None,
@@ -716,7 +823,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
                 shell: a.shell,
                 credentials: None,
                 instance: None,
-                config: None,
+                config: Some(config_path.clone()),
                 // It runs no other machine's commands (reach), and for now sends none.
                 reach: None,
                 // Not of the fleet: no replica of the observe group.
@@ -737,7 +844,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
                     waiting = w;
                 }
             }
-            let joined = boxed(|| kiln::join::cli(j, shutdown.clone())).await;
+            let joined = boxed(|| kiln::join::cli_with_config(j, shutdown.clone(), config_path.clone())).await;
             if let Some(w) = waiting {
                 boxed(|| w.end()).await;
             }
@@ -747,16 +854,25 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
             }
         }
         Cmd::Supervise { detach, exe, args } => {
-            let cfg = config::Config::load(&config_path).unwrap_or_default();
-            let state_dir = if args.first().is_some_and(|a| a == "agent") {
+            // Detached supervisors re-enter with the child's config in `args`.
+            // Keep that authority and do not prepend a different default/duplicate flag.
+            let child_config = kiln::upgrade::arg_value(&args, "--config");
+            let config_path = if let Some(path) = &child_config {
+                let path = PathBuf::from(path);
+                anyhow::ensure!(path.is_absolute(), "a supervised child config filename must be absolute; give relative --config before supervise instead");
+                anyhow::ensure!(!config_from_argv || path == config_path, "supervisor and child selected different config files; nothing was started");
+                path
+            } else { config_path.clone() };
+            let cfg = config::Config::load(&config_path)?;
+            let state_dir = if supervise::subcommand(&args) == Some("agent") {
                 // The agent's own state directory, when it has one of its own.
                 kiln::upgrade::arg_value(&args, "--state-dir").map_or_else(|| config::default_data_dir().join("agent"), PathBuf::from)
             } else {
                 cfg.server.data_dir.clone()
             };
             let mut args = args;
-            if cli.config.is_some() {
-                args.insert(0, format!("--config={}", config_path.display()));
+            if child_config.is_none() {
+                args.insert(0, format!("--config={}", config_path.to_str().ok_or_else(|| anyhow::anyhow!("supervise requires a UTF-8 config filename"))?));
             }
             if detach {
                 return supervise::detach(&args, &state_dir, exe.as_deref());
@@ -769,10 +885,14 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
             if boxed(|| kiln::join::offer_instead_of_server(&config_path, &cfg)).await? {
                 return Ok(());
             }
-            boxed(|| supervise::run(supervise::Options { args: vec!["server".into()], state_dir: cfg.server.data_dir, exe: None })).await
+            let config_arg = format!("--config={}", config_path.to_str().ok_or_else(|| anyhow::anyhow!("up requires a UTF-8 config filename"))?);
+            boxed(|| supervise::run(supervise::Options { args: vec![config_arg, "server".into()], state_dir: cfg.server.data_dir, exe: None })).await
         }
-        Cmd::Setup(a) => boxed(|| kiln::setup::cli(a)).await,
-        Cmd::Install(a) => boxed(|| install::install(a)).await,
+        Cmd::Setup(a) => {
+            anyhow::ensure!(config_path == std::path::absolute(config::default_config_path())?, "setup cannot preserve a non-default --config context; run join/install with that --config explicitly instead");
+            boxed(|| kiln::setup::cli(a)).await
+        }
+        Cmd::Install(a) => boxed(|| install::install_with_config(a, config_path.clone())).await,
         Cmd::Uninstall { agent } => install::uninstall(agent),
         Cmd::Login { print, certificate, link, name, password_stdin, server } => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
@@ -1118,6 +1238,92 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
 mod tests {
     use clap::Parser as _;
 
+    #[test]
+    fn g18_deferred_cli_help_version_and_errors() -> anyhow::Result<()> {
+        use clap::error::ErrorKind;
+        for (args, kind, text) in [
+            (vec!["kiln", "--version"], ErrorKind::DisplayVersion, "kiln "),
+            (vec!["kiln", "--help"], ErrorKind::DisplayHelp, "server"),
+            (vec!["kiln", "cd", "--help"], ErrorKind::DisplayHelp, "sync"),
+            (vec!["kiln", "cd", "sync", "--help"], ErrorKind::DisplayHelp, "--option"),
+            (vec!["kiln", "validate", "--help"], ErrorKind::DisplayHelp, "--json"),
+            (vec!["kiln", "cd", "sync"], ErrorKind::MissingRequiredArgument, "<ID>"),
+        ] {
+            let err = match super::Cli::try_parse_from(args) {
+                Err(err) => err,
+                Ok(_) => anyhow::bail!("expected {kind:?}"),
+            };
+            assert_eq!(err.kind(), kind);
+            assert!(err.to_string().contains(text), "{err}");
+        }
+        let mut cli = super::Cli::try_parse_from(["kiln", "server"])?;
+        assert!(matches!(cli.cmd.0, super::Cmd::Server));
+        cli.try_update_from(["kiln", "cd", "sync", "default/web", "--option", "ServerSideApply=true"])?;
+        assert!(matches!(cli.cmd.0, super::Cmd::Cd(_)));
+        let cli = super::Cli::try_parse_from(["kiln", "cd", "sync", "default/web", "--option", "ServerSideApply=true"])?;
+        assert!(matches!(cli.cmd.0, super::Cmd::Cd(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn g18_deferred_cli_normal_and_update_builders() -> anyhow::Result<()> {
+        use clap::{CommandFactory as _, Subcommand as _};
+        for mut command in [
+            super::Cli::command(),
+            super::Cli::command_for_update(),
+            super::CommandTree::augment_subcommands(clap::Command::new("kiln")),
+            super::CommandTree::augment_subcommands_for_update(clap::Command::new("kiln")),
+        ] {
+            // Explicit full-tree introspection must materialize deferred arguments too.
+            command.build();
+            let cd = command.find_subcommand("cd").ok_or_else(|| anyhow::anyhow!("missing cd"))?;
+            let json = cd.get_arguments().find(|arg| arg.get_id() == "json").ok_or_else(|| anyhow::anyhow!("missing cd json"))?;
+            assert_eq!(json.get_help().map(ToString::to_string).as_deref(), Some("Print JSON"));
+            let sync = cd.find_subcommand("sync").ok_or_else(|| anyhow::anyhow!("missing cd sync"))?;
+            assert!(sync.get_arguments().any(|arg| arg.get_long() == Some("option")));
+            let repo = cd.find_subcommand("repo").ok_or_else(|| anyhow::anyhow!("missing cd repo"))?;
+            for name in ["add", "rm"] {
+                let operation = repo.find_subcommand(name).ok_or_else(|| anyhow::anyhow!("missing repo {name}"))?;
+                let url = operation.get_arguments().find(|arg| arg.get_id() == "url").ok_or_else(|| anyhow::anyhow!("missing repo URL"))?;
+                assert!(url.is_positional());
+                assert_eq!(url.get_long(), None);
+            }
+            let matches = command.try_get_matches_from(["kiln", "cd", "--token", "-fixture", "sync", "default/web", "--prune", "--option", "ServerSideApply=true"])?;
+            let cd = matches.subcommand_matches("cd").ok_or_else(|| anyhow::anyhow!("missing cd matches"))?;
+            assert_eq!(cd.get_one::<String>("token").map(String::as_str), Some("-fixture"));
+            let sync = cd.subcommand_matches("sync").ok_or_else(|| anyhow::anyhow!("missing sync matches"))?;
+            assert!(sync.get_flag("prune"));
+            assert_eq!(sync.get_one::<String>("id").map(String::as_str), Some("default/web"));
+            assert_eq!(sync.get_many::<String>("options").map(|values| values.map(String::as_str).collect::<Vec<_>>()), Some(vec!["ServerSideApply=true"]));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn g18_deferred_cd_globals_before_and_after_subcommands() -> anyhow::Result<()> {
+        use clap::CommandFactory as _;
+        for command in [super::Cli::command(), super::Cli::command_for_update()] {
+            for args in [
+                vec!["kiln", "--json", "cd", "--url", "http://api.invalid", "--token", "-fixture", "sync", "default/web"],
+                vec!["kiln", "cd", "sync", "default/web", "--json", "--url", "http://api.invalid", "--token", "-fixture"],
+            ] {
+                let matches = command.clone().try_get_matches_from(args)?;
+                assert!(matches.get_flag("json"));
+                let cd = matches.subcommand_matches("cd").ok_or_else(|| anyhow::anyhow!("missing cd matches"))?;
+                let sync = cd.subcommand_matches("sync").ok_or_else(|| anyhow::anyhow!("missing sync matches"))?;
+                for scope in [cd, sync] {
+                    assert!(scope.get_flag("json"));
+                    assert_eq!(scope.get_one::<String>("url").map(String::as_str), Some("http://api.invalid"));
+                    assert_eq!(scope.get_one::<String>("token").map(String::as_str), Some("-fixture"));
+                }
+            }
+            let matches = command.try_get_matches_from(["kiln", "cd", "repo", "add", "https://git.invalid/repo"])?;
+            let add = matches.subcommand_matches("cd").and_then(|cd| cd.subcommand_matches("repo")).and_then(|repo| repo.subcommand_matches("add")).ok_or_else(|| anyhow::anyhow!("missing repo add matches"))?;
+            assert_eq!(add.get_one::<String>("url").map(String::as_str), Some("https://git.invalid/repo"));
+        }
+        Ok(())
+    }
+
     /// A token may begin with `-` (base64url): `--token <it>` takes it as the value, not a flag.
     #[test]
     fn a_token_that_begins_with_a_dash_is_taken_as_the_token() {
@@ -1132,7 +1338,7 @@ mod tests {
     #[test]
     fn an_instance_given_twice_is_the_last() -> anyhow::Result<()> {
         let cli = super::Cli::try_parse_from(["kiln", "agent", "--server", "http://x:7070", "--instance", "01a14c4f", "--instance", "01a1576c"])?;
-        let super::Cmd::Agent(a) = cli.cmd else { anyhow::bail!("not the agent") };
+        let super::Cmd::Agent(a) = cli.cmd.0 else { anyhow::bail!("not the agent") };
         assert_eq!(a.instance.as_deref(), Some("01a1576c"));
         Ok(())
     }

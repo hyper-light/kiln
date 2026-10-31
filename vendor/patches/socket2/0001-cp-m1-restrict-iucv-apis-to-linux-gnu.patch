@@ -1,0 +1,63 @@
+Subject: CP-M1: restrict IUCV APIs to Linux GNU
+Why: Windows GNU selects Linux-only IUCV APIs; preserve Linux GNU IUCV and the pinned Windows exclusive-address setter
+
+diff --git a/src/lib.rs b/src/lib.rs
+index 95404d6981ed2266591d480f63741f7faea08307..9b48f00bb0d1f72a38819ca72eb7800479b4a459 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -227,6 +227,7 @@ impl Domain {
+     /// Domain for IUCV socket communication, corresponding to `AF_IUCV`.
+     #[cfg(all(
+         feature = "all",
++        target_os = "linux",
+         any(target_arch = "x86_64", target_arch = "s390x"),
+         target_env = "gnu"
+     ))]
+diff --git a/src/sockaddr.rs b/src/sockaddr.rs
+index 370b3856897ff42b12ac7455f844c8ff08b779db..5d59b849a6a908a627dc09ea90fbf73c6e84838d 100644
+--- a/src/sockaddr.rs
++++ b/src/sockaddr.rs
+@@ -229,6 +229,7 @@ impl SockAddr {
+     /// Returns an error if the path is too long.
+     #[cfg(all(
+         feature = "all",
++        target_os = "linux",
+         any(target_arch = "x86_64", target_arch = "s390x"),
+         target_env = "gnu"
+     ))]
+@@ -299,6 +300,7 @@ impl SockAddr {
+     /// Returns true if this address is of an IUCV socket, false otherwise
+     #[cfg(all(
+         feature = "all",
++        target_os = "linux",
+         any(target_arch = "x86_64", target_arch = "s390x"),
+         target_env = "gnu"
+     ))]
+diff --git a/src/sys/unix.rs b/src/sys/unix.rs
+index 8027d325d89f21feda446248122f1f3962502cbb..10a4a87cf760de5a8814c26d6e84bc3e84867f35 100644
+--- a/src/sys/unix.rs
++++ b/src/sys/unix.rs
+@@ -82,6 +82,7 @@ pub(crate) use libc::{AF_INET, AF_INET6};
+ 
+ #[cfg(all(
+     feature = "all",
++    target_os = "linux",
+     any(target_arch = "x86_64", target_arch = "s390x"),
+     target_env = "gnu"
+ ))]
+@@ -785,6 +786,7 @@ pub(crate) fn unix_sockaddr(path: &Path) -> io::Result<SockAddr> {
+ 
+ #[cfg(all(
+     feature = "all",
++    target_os = "linux",
+     any(target_arch = "x86_64", target_arch = "s390x"),
+     target_env = "gnu"
+ ))]
+@@ -809,6 +811,7 @@ fn copy_and_pad_with_spaces(src: &str, target: &mut [libc::c_char; 8]) -> io::Re
+ 
+ #[cfg(all(
+     feature = "all",
++    target_os = "linux",
+     any(target_arch = "x86_64", target_arch = "s390x"),
+     target_env = "gnu"
+ ))]

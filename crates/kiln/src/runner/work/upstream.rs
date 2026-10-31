@@ -12,7 +12,8 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 
-use super::store::Scope;
+use super::store::{Kept, Scope};
+use crate::runner::cache::{CacheGuard, Local};
 use crate::http::client::Client;
 
 /// An object written in a scope, to send up.
@@ -27,8 +28,8 @@ pub struct Up {
 
 /// Where a scope's writes go and its misses are looked for.
 pub trait Upstream: Send + Sync + 'static {
-    /// Sends `up` (its bytes in the file at `path`); whether the server kept it (`false`: it had it).
-    fn put<'a>(&'a self, up: &'a Up, path: &'a Path) -> BoxFuture<'a, anyhow::Result<bool>>;
+    /// Sends guarded physical assembly directly; no extra whole-object staging copy.
+    fn put<'a>(&'a self, up: &'a Up, local: &'a Local, kept: &'a Kept, guard: CacheGuard) -> BoxFuture<'a, anyhow::Result<bool>>;
 
     /// The entry `name` of `ns` in `scope`, written to `into` when the server holds one the
     /// holder may read: whether it did.
@@ -74,10 +75,13 @@ impl Leg {
 }
 
 impl Upstream for Leg {
-    fn put<'a>(&'a self, up: &'a Up, path: &'a Path) -> BoxFuture<'a, anyhow::Result<bool>> {
+    fn put<'a>(&'a self, up: &'a Up, local: &'a Local, kept: &'a Kept, guard: CacheGuard) -> BoxFuture<'a, anyhow::Result<bool>> {
         Box::pin(async move {
             let Some(scope) = server_scope(&up.scope.domain) else { return Ok(false) };
-            let saved = crate::runner::cache::save(&self.service(), &server_key(&up.ns, &up.name), &server_version(), scope, None, path).await?;
+            let saved = match kept {
+                Kept::Whole(path) => crate::runner::cache::save_guarded(&self.service(), &server_key(&up.ns, &up.name), &server_version(), scope, None, path, Some(guard)).await?,
+                Kept::Chunks(list) => crate::runner::cache::save_local_chunks(&self.service(), &server_key(&up.ns, &up.name), &server_version(), scope, &up.digest, up.size, list, local, guard).await?,
+            };
             Ok(saved.is_some())
         })
     }
@@ -85,7 +89,7 @@ impl Upstream for Leg {
     fn get<'a>(&'a self, scope: &'a Scope, ns: &'a str, name: &'a str, into: &'a Path) -> BoxFuture<'a, anyhow::Result<bool>> {
         Box::pin(async move {
             let Some(server) = server_scope(&scope.domain) else { return Ok(false) };
-            let found = crate::runner::cache::restore(&self.service(), &[server_key(ns, name)], &server_version(), server, None, into, false).await?;
+            let found = crate::runner::cache::restore_bounded(&self.service(), &[server_key(ns, name)], &server_version(), server, None, into, false, Some(super::service::MAX_OBJECT)).await?;
             Ok(found.is_some())
         })
     }

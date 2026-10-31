@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use http::StatusCode;
 use kiln_ci::sched::routing::{self, Constraint, LegRoute, Rule};
 use parking_lot::Mutex;
-use rusqlite::params;
+use crate::sql::params;
 use serde_json::{Value, json};
 
 use super::Fail;

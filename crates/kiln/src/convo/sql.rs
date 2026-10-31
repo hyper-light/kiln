@@ -1,5 +1,5 @@
-//! The store's schema and statements, as SQL any SQLite-compatible engine runs (Turso on a
-//! machine). Migrations go by number: each runs once, in order, recorded in `meta`.
+//! Historical schema and queries for the legacy fixture engine. Production uses the fixed
+//! canonical identifiers in `amphora_sql.rs`; imported source files are never migrated in place.
 
 /// The migrations, in order. Never edit one that shipped: add the next.
 pub const MIGRATIONS: &[&str] = &[
@@ -75,6 +75,28 @@ pub const MIGRATIONS: &[&str] = &[
     // 3: the sessions a mirror's copy brought back into this store while it restores from it:
     // the copy fills those in, and leaves alone what the store has from anywhere else.
     "CREATE TABLE IF NOT EXISTS copied (session TEXT PRIMARY KEY);",
+    // 4 (U06/U15): bounded transcript segments and restartable legacy import cursors. These
+    // application tables share the host Amphora database; no feature file is created.
+    "CREATE TABLE IF NOT EXISTS convo_segments (
+        session TEXT NOT NULL, source TEXT NOT NULL, n INTEGER NOT NULL,
+        part INTEGER NOT NULL, value BLOB NOT NULL,
+        PRIMARY KEY(session,source,n,part)
+    );
+    CREATE TABLE IF NOT EXISTS convo_import (
+        source TEXT NOT NULL, table_name TEXT NOT NULL, cursor INTEGER NOT NULL,
+        done INTEGER NOT NULL, fingerprint TEXT NOT NULL,
+        PRIMARY KEY(source,table_name)
+    );",
+    // 5 (U06/U15): immutable chunks stage in bounded transactions before a small record
+    // manifest and its revision/import cursor publish atomically. Codec 2 remains readable.
+    "CREATE TABLE IF NOT EXISTS convo_chunks (
+        digest BLOB NOT NULL, part INTEGER NOT NULL, value BLOB NOT NULL,
+        PRIMARY KEY(digest,part)
+    );
+    CREATE TABLE IF NOT EXISTS convo_chunk_manifests (
+        digest BLOB PRIMARY KEY, size INTEGER NOT NULL, parts INTEGER NOT NULL,
+        ready INTEGER NOT NULL
+    );",
 ];
 
 /// Where the migrations done so far are counted.

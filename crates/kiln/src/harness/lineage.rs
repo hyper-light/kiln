@@ -428,7 +428,7 @@ pub fn live_descendants(all: &[Info], id: &str) -> Vec<Info> {
 }
 
 /// What an agent asks to start (`agents.start`).
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Ask {
     /// The harness (`claude`, `codex`, …).
@@ -789,7 +789,23 @@ pub async fn hold(hub: &Hub, parent: &Info, ask: &Ask, target: &str, count: usiz
 /// Start agents for `by`: checked against its parent when it's an agent, on the machine picked,
 /// each recorded with whom it acts for and who started it.
 pub async fn start(hub: &Hub, by: &Starter, ask: Ask) -> Result<Vec<Info>, Refused> {
-    start_as(hub, by, ask, |_| {}).await
+    start_as(hub, by, ask, None, |_| {}).await
+}
+
+/// U17/U04: one durable start request and one controller identity for an outbox occurrence.
+/// The first prompt's command id is derived from this session id by session::drive.
+pub async fn start_once(hub: &Hub, by: &Starter, ask: Ask, key: &str) -> Result<Vec<Info>, Refused> {
+    let id = start_once_id(by, key)?;
+    if ask.count.unwrap_or(1) != 1 { return Err(bad("a keyed start opens one agent session")); }
+    let request = json!({ "ask": &ask, "helper": &ask.helper, "actor": &by.actor, "opener": &by.opener, "parent": by.parent.as_ref().map(|parent| &parent.id), "plan_run": &by.plan_run });
+    hub.harness.bind_start_request(&id, request).map_err(|error| (StatusCode::CONFLICT, format!("{error:#}")))?;
+    start_as(hub, by, ask, Some(&id), |_| {}).await
+}
+
+/// U17/U04: bind grants to the accepted session before opening its first prompt.
+pub(crate) fn start_once_id(by: &Starter, key: &str) -> Result<String, Refused> {
+    if key.is_empty() || key.len() > 4096 { return Err(bad("invalid start idempotency key")); }
+    Ok(crate::util::derive_id(&["lineage/start_once", &by.actor, key]))
 }
 
 /// The machine `parent` runs on, as a target (`local`, `agent:<machine>`).
@@ -843,7 +859,7 @@ pub async fn start_subagent(hub: &Hub, by: &Starter, ask: Ask) -> Result<Info, R
     let parent = by.parent.clone().ok_or_else(|| bad("a subagent is an agent's: kiln starts one only for an agent"))?;
     let state = hub.harness.state(&parent.id);
     let (ask, speed, most) = as_its_parent(ask, &parent, state.as_ref());
-    let infos = start_as(hub, by, ask, |spec| {
+    let infos = start_as(hub, by, ask, None, |spec| {
         spec.subagent = true;
         spec.speed = speed;
         spec.max_subagents = most;
@@ -922,56 +938,80 @@ pub async fn settle_settings(hub: &Hub) {
 }
 
 /// [`start`], the spec made for the ask then tuned by `tune` before anything starts.
-async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec) + Send) -> Result<Vec<Info>, Refused> {
+async fn start_as(hub: &Hub, by: &Starter, ask: Ask, once: Option<&str>, tune: impl FnOnce(&mut Spec) + Send) -> Result<Vec<Info>, Refused> {
     let kind = harness(&ask.kind)?;
-    let volume = match ask.workspace.as_deref().map(str::trim) {
-        None | Some("" | "folder") => false,
-        Some("volume") => true,
-        Some(w) => return Err(bad(format!("`workspace` is \"folder\" (its folder itself) or \"volume\" (a Slates volume of its own over the folder), not {w:?}"))),
-    };
     let count = ask.count.unwrap_or(1).clamp(1, 16);
-    let default_target = by.parent.as_ref().map(target_of);
-    let target = pick(hub, ask.on.as_deref(), kind.id, default_target.as_deref())?;
-    if let Some(asker) = &by.asker {
-        may_run_on(asker, &target, "start an agent there")?;
-    }
-    if lacks(hub, &target, kind).await {
-        return Err(not_installed(hub, &target, kind));
-    }
-    if volume {
-        workspaces_on(hub, &target).await.map_err(|why| (StatusCode::CONFLICT, format!("an agent can't have a workspace of its own there: {why}")))?;
-    }
-    if target == "local" && !hub.cfg.terminal.enabled {
-        return Err(refuse("terminals (and so agents) are off on the server: pick a runner with `on`"));
-    }
-    let (mode, reach, allow_bypass) = match &by.parent {
-        Some(p) => {
-            let (mode, reach) = hold(hub, p, &ask, &target, count).await?;
-            (mode, reach, !p.no_bypass)
-        }
-        None => (ask.mode.clone().filter(|m| !m.trim().is_empty()), None, true),
+    let planned = match once {
+        Some(id) => hub.harness.planned_open(id).map_err(|error| (StatusCode::CONFLICT, format!("{error:#}")))?,
+        None => None,
     };
-    // Its folder: the one asked for, else its parent's where they share a machine, else home.
-    let cwd = ask.cwd.clone().filter(|c| !c.trim().is_empty()).or_else(|| by.parent.as_ref().filter(|p| same_machine(p, &target)).map(|p| p.cwd.clone()).filter(|c| !c.is_empty()));
-    let mut spec = Spec {
-        kind: kind.id.to_owned(),
-        cwd,
-        model: ask.model.clone().filter(|m| !m.trim().is_empty()),
-        mode,
-        prompt: ask.prompt.clone().filter(|p| !p.trim().is_empty()),
-        name: ask.name.clone().filter(|n| !n.trim().is_empty()),
-        effort: ask.effort.clone().filter(|e| !e.trim().is_empty()),
-        allow_bypass,
-        reach,
-        parent: by.parent.as_ref().map(|p| p.id.clone()),
-        plan_run: by.plan_run.clone(),
-        helper: ask.helper.clone(),
-        workspace: volume.then(|| crate::workspace::Workspace { kind: "volume".to_owned(), ..Default::default() }),
-        ..Spec::default()
+    let (target, mut spec) = if let Some((target, spec)) = planned {
+        if let Some(asker) = &by.asker { may_run_on(asker, &target, "retry an agent start there")?; }
+        (target, spec)
+    } else {
+        let volume = match ask.workspace.as_deref().map(str::trim) {
+            None | Some("" | "folder") => false,
+            Some("volume") => true,
+            Some(w) => return Err(bad(format!("`workspace` is \"folder\" (its folder itself) or \"volume\" (a Slates volume of its own over the folder), not {w:?}"))),
+        };
+        let default_target = by.parent.as_ref().map(target_of);
+        let target = pick(hub, ask.on.as_deref(), kind.id, default_target.as_deref())?;
+        if let Some(asker) = &by.asker {
+            may_run_on(asker, &target, "start an agent there")?;
+        }
+        if lacks(hub, &target, kind).await {
+            return Err(not_installed(hub, &target, kind));
+        }
+        if volume {
+            workspaces_on(hub, &target).await.map_err(|why| (StatusCode::CONFLICT, format!("an agent can't have a workspace of its own there: {why}")))?;
+        }
+        if target == "local" && !hub.cfg.terminal.enabled {
+            return Err(refuse("terminals (and so agents) are off on the server: pick a runner with `on`"));
+        }
+        let (mode, reach, allow_bypass) = match &by.parent {
+            Some(p) => {
+                let (mode, reach) = hold(hub, p, &ask, &target, count).await?;
+                (mode, reach, !p.no_bypass)
+            }
+            None => (ask.mode.clone().filter(|m| !m.trim().is_empty()), None, true),
+        };
+        // Its folder: the one asked for, else its parent's where they share a machine, else home.
+        let cwd = ask.cwd.clone().filter(|c| !c.trim().is_empty()).or_else(|| by.parent.as_ref().filter(|p| same_machine(p, &target)).map(|p| p.cwd.clone()).filter(|c| !c.is_empty()));
+        let spec = Spec {
+            kind: kind.id.to_owned(),
+            cwd,
+            model: ask.model.clone().filter(|m| !m.trim().is_empty()),
+            mode,
+            prompt: ask.prompt.clone().filter(|p| !p.trim().is_empty()),
+            name: ask.name.clone().filter(|n| !n.trim().is_empty()),
+            effort: ask.effort.clone().filter(|e| !e.trim().is_empty()),
+            allow_bypass,
+            reach,
+            parent: by.parent.as_ref().map(|p| p.id.clone()),
+            plan_run: by.plan_run.clone(),
+            helper: ask.helper.clone(),
+            workspace: volume.then(|| crate::workspace::Workspace { kind: "volume".to_owned(), ..Default::default() }),
+            ..Spec::default()
+        };
+        (target, spec)
     };
     tune(&mut spec);
     let what = if spec.subagent { format!("{} subagent", kind.name) } else { kind.name.to_owned() };
-    let infos = hub.harness.open(hub, &target, spec, count).await.map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
+    let infos = match once {
+        Some(id) => {
+            // Ownership is durable before an external harness can act for this person.
+            let person = by.asker.as_ref().and_then(person_of).or_else(|| by.opener.clone());
+            for (key, value) in [
+                (crate::mcp::opener_key(id), by.opener.clone()),
+                (crate::mcp::opened_by_key(id), person),
+                (parent_key(id), by.parent.as_ref().map(|parent| parent.id.clone())),
+            ] {
+                if let Some(value) = value { hub.store.kv_set(key, value).await.map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("could not persist agent ownership: {error:#}")))?; }
+            }
+            vec![hub.harness.open_once(hub, &target, spec, id).await.map_err(|error| (StatusCode::CONFLICT, format!("{error:#}")))?]
+        }
+        None => hub.harness.open(hub, &target, spec, count).await.map_err(|error| (StatusCode::CONFLICT, format!("{error:#}")))?,
+    };
     // Whose they are: the person who asked, whatever token they used; kiln's own starts are the
     // person they act for's.
     let person = by.asker.as_ref().and_then(person_of).or_else(|| by.opener.clone());
@@ -1195,8 +1235,8 @@ mod tests {
             hub.store
                 .call(|c| {
                     for (agent, state, status) in [("on", "running", "active"), ("next", "running", "pending"), ("held", "paused", "pending"), ("over", "running", "met")] {
-                        c.execute("INSERT INTO goal_stacks (agent, state, created_at, updated_at) VALUES (?1, ?2, 0, 0)", rusqlite::params![agent, state])?;
-                        c.execute("INSERT INTO goal_items (id, agent, pos, text, status) VALUES (?1, ?1, 0, 'a goal', ?2)", rusqlite::params![agent, status])?;
+                        c.execute("INSERT INTO goal_stacks (agent, state, created_at, updated_at) VALUES (?1, ?2, 0, 0)", crate::sql::params![agent, state])?;
+                        c.execute("INSERT INTO goal_items (id, agent, pos, text, status) VALUES (?1, ?1, 0, 'a goal', ?2)", crate::sql::params![agent, status])?;
                     }
                     Ok(())
                 })

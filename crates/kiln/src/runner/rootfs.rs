@@ -14,6 +14,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 
 use super::firecracker::{Drive, Machine};
+use kiln_ci::sched::vm::GuestShape;
 use super::guest::{self, FromGuest, Layer, ToGuest};
 use crate::ci::integrations::oci;
 
@@ -110,10 +111,11 @@ fn source(image: &str, pull: &Pull) -> anyhow::Result<(oci::Registry, oci::Refer
 }
 
 /// `image` as a root file system: kept already, or pulled and built now.
-pub async fn prepare(m: &Machine, cache: &Path, kiln: &Path, image: &str, pull: &Pull) -> anyhow::Result<Rootfs> {
+pub async fn prepare(m: &Machine, cache: &Path, kiln: &Path, image: &str, pull: &Pull, shape: GuestShape) -> anyhow::Result<Rootfs> {
+    shape.validate().map_err(anyhow::Error::msg)?;
     // kiln's own runner images are in no registry: built here with Docker, then saved.
     if super::docker::runner_dockerfile(image, None).is_some() {
-        return saved(m, cache, kiln, image).await;
+        return saved(m, cache, kiln, image, shape).await;
     }
     let (registry, reference) = source(image, pull)?;
     let arch = match std::env::consts::ARCH {
@@ -126,15 +128,12 @@ pub async fn prepare(m: &Machine, cache: &Path, kiln: &Path, image: &str, pull: 
     let images = cache.join("images");
     let (path, about) = (images.join(format!("{hex}.ext4")), images.join(format!("{hex}.json")));
     let _one = lock(&format!("image-{hex}")).await;
+    // The config is finite metadata in the existing shared physical tier. No native path
+    // escapes this host read; generated layer/rootfs/template outputs remain separate work.
+    let cfg = configuration(cache, &registry, &reference, &pulled).await?;
     let blobs = cache.join("blobs");
     std::fs::create_dir_all(&blobs)?;
     let blob = |d: &str| blobs.join(d.trim_start_matches("sha256:"));
-    // Its config: its environment, and what it runs.
-    let config = blob(&pulled.config);
-    if !config.is_file() {
-        oci::blob_to(&registry, &reference.repository, &pulled.config, &config).await.context("the image's config")?;
-    }
-    let cfg: serde_json::Value = serde_json::from_slice(&std::fs::read(&config)?).context("the image's config doesn't read")?;
     let runs = runs_of(&cfg);
     if path.is_file()
         && let Ok(text) = std::fs::read(&about)
@@ -168,7 +167,7 @@ pub async fn prepare(m: &Machine, cache: &Path, kiln: &Path, image: &str, pull: 
     let (m2, w2, k2, p2) = (m.clone(), work.clone(), kiln.to_path_buf(), part.clone());
     // Compressed layers hold some three times what they weigh.
     let size = (total.saturating_mul(6) + (1 << 30)).max(2 << 30);
-    let built = crate::rt::blocking(move || build(&m2, &w2, &k2, &p2, total, size, layers)).await?;
+    let built = build(m2, w2, k2, p2, total, size, layers, shape).await;
     let _ = std::fs::remove_dir_all(&work);
     if let Err(e) = built {
         let _ = std::fs::remove_file(&part);
@@ -179,11 +178,56 @@ pub async fn prepare(m: &Machine, cache: &Path, kiln: &Path, image: &str, pull: 
     Ok(Rootfs { path, env, digest: pulled.digest, runs })
 }
 
+/// Read the exact image configuration through the initialized host cache. The old per-VMM
+/// blob file is migration input only: neither a writable fallback nor quiescence evidence.
+pub(crate) async fn configuration(cache: &Path, registry: &oci::Registry, reference: &oci::Reference, pulled: &oci::Pulled) -> anyhow::Result<serde_json::Value> {
+    anyhow::ensure!(pulled.config_size <= oci::CONFIG_LIMIT as u64,
+        "OCI image config is {} bytes; metadata configs must fit the existing {}-byte OCI metadata bound before transfer", pulled.config_size, oci::CONFIG_LIMIT);
+    let digest = pulled.config.strip_prefix("sha256:").context("OCI config requires a SHA-256 descriptor")?;
+    let plan = super::cache::NativePlan::new(digest, pulled.config_size)?;
+    let _one = lock(&format!("oci-config-{digest}")).await;
+    let work = cache.parent().context("Firecracker cache has no host work directory")?.to_path_buf();
+    let local = crate::rt::blocking(move || super::cache::Local::initialized(&work)).await??;
+    let (hit_local, hit_plan) = (local.clone(), plan.clone());
+    let hit = crate::rt::blocking(move || hit_local.native_file(&hit_plan)).await??;
+    let file = match hit {
+        Some(file) => file,
+        None => {
+            let legacy = cache.join("blobs").join(digest);
+            crate::rt::blocking(move || -> anyhow::Result<()> {
+                let part = legacy.with_extension("part");
+                for path in [&legacy, &part] {
+                    match std::fs::symlink_metadata(path) {
+                        Ok(_) => anyhow::bail!("U07 OCI config migration required: {} remains in the legacy Firecracker cache; drain its writers and complete a verified cache cutover before retrying (the source is unchanged)", path.display()),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                Ok(())
+            }).await??;
+            // Reserve before opening the network body. The existing detached writer retains
+            // its exact guard through actual I/O even if this requesting future disappears.
+            let publication = crate::rt::blocking(move || local.reserve_native(plan)).await??;
+            let (tx, done) = crate::rt::blocking(move || publication.sink()).await??;
+            let mut response = oci::blob_response(registry, &reference.repository, &pulled.config).await?;
+            let mut received = 0_u64;
+            while let Some(chunk) = response.chunk().await? {
+                received = received.checked_add(u64::try_from(chunk.len())?).context("OCI config length overflow")?;
+                anyhow::ensure!(received <= pulled.config_size, "OCI config body exceeds its exact {}-byte descriptor", pulled.config_size);
+                tx.send(chunk).await.map_err(|_| anyhow::anyhow!("bounded OCI config publication stopped"))?;
+            }
+            drop(tx);
+            done.await.context("publishing the exact OCI config digest and extent")?
+        }
+    };
+    crate::rt::blocking(move || serde_json::from_reader(file.reader()).context("the image's canonical config does not read")).await?
+}
+
 /// One of kiln's runner images (`kiln/runner-*`, W13-R04) as a root file system. No registry has
 /// them, so they're built here with Docker, as the `docker` executor builds them (once per
 /// version), saved (`docker save`, unpacked as it streams), and their layers, plain tar, built
 /// into an ext4 as a pulled image's are. Kept by Docker's id for the image, with its config.
-async fn saved(m: &Machine, cache: &Path, kiln: &Path, image: &str) -> anyhow::Result<Rootfs> {
+async fn saved(m: &Machine, cache: &Path, kiln: &Path, image: &str, shape: GuestShape) -> anyhow::Result<Rootfs> {
     let bin = crate::rt::blocking(super::docker::find).await?.ok_or_else(|| anyhow::anyhow!("kiln's runner image {image} is built with Docker or Podman, and this runner has neither working"))?;
     let cli = super::docker::Cli::new(&bin, cache.join("docker-config"));
     let say = |m: String| tracing::info!(image, "{m}");
@@ -222,7 +266,7 @@ async fn saved(m: &Machine, cache: &Path, kiln: &Path, image: &str) -> anyhow::R
     // Plain layers weigh what they hold: room for that and a quarter more. Docker's containerd
     // image store saves them as it keeps them, compressed: room as for a pulled image's.
     let size = if compressed { (total.saturating_mul(6) + (1 << 30)).max(2 << 30) } else { (total + total / 4 + (1 << 30)).max(2 << 30) };
-    let built = crate::rt::blocking(move || build(&m2, &w2, &k2, &p2, total, size, layers)).await?;
+    let built = build(m2, w2, k2, p2, total, size, layers, shape).await;
     let _ = std::fs::remove_dir_all(&work);
     if let Err(e) = built {
         let _ = std::fs::remove_file(&part);
@@ -272,35 +316,50 @@ fn read_saved(save: &Path, layers_dir: &Path) -> anyhow::Result<Saved> {
 /// The build itself, in `work`: the layers' disk made (`total` bytes of them), an empty root file
 /// system of `size` bytes at `out`, and the builder microVM run to its end.
 #[allow(clippy::too_many_arguments)]
-fn build(m: &Machine, work: &Path, kiln: &Path, out: &Path, total: u64, size: u64, layers: Vec<Layer>) -> anyhow::Result<()> {
-    let disk = work.join("layers.ext4");
-    super::firecracker::mkfs(m, &disk, total + total / 8 + (64 << 20), "layers", Some(&work.join("layers")))?;
-    super::firecracker::mkfs(m, out, size, "image", None)?;
-    let key = work.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let socks = super::firecracker::Socks::new(&key)?;
-    let control = UnixListener::bind(socks.port(guest::CONTROL_PORT))?;
-    let mut vm = super::firecracker::boot(
-        m,
-        work,
-        &socks,
-        &[Drive { id: "kiln", path: kiln, read_only: true }, Drive { id: "layers", path: &disk, read_only: true }, Drive { id: "image", path: out, read_only: false }],
-        "build",
-        2,
-        1024,
-    )?;
-    let mut conn = vm.accept(&control, Duration::from_secs(120))?;
-    conn.set_read_timeout(Some(BUILD))?;
-    anyhow::ensure!(matches!(guest::recv::<FromGuest>(&mut conn)?, Some(FromGuest::Ready)), "the builder didn't say it was ready:\n{}", super::firecracker::tail(&vm.console));
-    guest::send(&mut conn, &ToGuest::Build(layers))?;
-    let said = guest::recv::<FromGuest>(&mut conn);
-    let console = vm.console.clone();
-    vm.finish(Duration::from_secs(30));
-    match said {
-        Ok(Some(FromGuest::Built(None))) => Ok(()),
-        Ok(Some(FromGuest::Built(Some(why)))) => anyhow::bail!("building its root file system: {why}"),
-        Ok(_) => anyhow::bail!("the builder ended without saying how it went:\n{}", super::firecracker::tail(&console)),
-        Err(e) => anyhow::bail!("the builder: {e:#}\n{}", super::firecracker::tail(&console)),
+async fn build(m: Machine, work: PathBuf, kiln: PathBuf, out: PathBuf, total: u64, size: u64, layers: Vec<Layer>, shape: GuestShape) -> anyhow::Result<()> {
+    let execution = super::processes::current();
+    let built = async {
+        let (vm, socks, outcome) = crate::rt::blocking(move || -> anyhow::Result<_> {
+            let disk = work.join("layers.ext4");
+            super::firecracker::mkfs(&m, &disk, total + total / 8 + (64 << 20), "layers", Some(&work.join("layers")))?;
+            super::firecracker::mkfs(&m, &out, size, "image", None)?;
+            let key = work.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let socks = super::firecracker::Socks::new(&key)?;
+            let control = UnixListener::bind(socks.port(guest::CONTROL_PORT))?;
+            let mut vm = super::firecracker::boot(
+                &m,
+                &work,
+                &socks,
+                &[Drive { id: "kiln", path: &kiln, read_only: true }, Drive { id: "layers", path: &disk, read_only: true }, Drive { id: "image", path: &out, read_only: false }],
+                "build",
+                shape,
+            )?;
+            // Preserve the VMM and its sockets even when the guest refuses or disconnects.
+            let outcome = (|| {
+                let mut conn = vm.accept(&control, Duration::from_secs(120))?;
+                conn.set_read_timeout(Some(BUILD))?;
+                anyhow::ensure!(matches!(guest::recv::<FromGuest>(&mut conn)?, Some(FromGuest::Ready)), "the builder didn't say it was ready:\n{}", super::firecracker::tail(&vm.console));
+                guest::send(&mut conn, &ToGuest::Build(layers))?;
+                match guest::recv::<FromGuest>(&mut conn) {
+                    Ok(Some(FromGuest::Built(None))) => Ok(()),
+                    Ok(Some(FromGuest::Built(Some(why)))) => anyhow::bail!("building its root file system: {why}"),
+                    Ok(_) => anyhow::bail!("the builder ended without saying how it went:\n{}", super::firecracker::tail(&vm.console)),
+                    Err(e) => anyhow::bail!("the builder: {e:#}\n{}", super::firecracker::tail(&vm.console)),
+                }
+            })();
+            Ok((vm, socks, outcome))
+        }).await??;
+        if outcome.is_ok() { vm.finish_owned(Duration::from_secs(30)).await?; }
+        else { vm.retire().await?; }
+        drop(socks);
+        outcome
+    }.await;
+    if built.is_err() && let Some(execution) = execution {
+        // A factory/scheduling failure may have left a partial owned launch. Fence and drain
+        // that same startup before prepare removes build files or any caller retries it.
+        execution.stop().await;
     }
+    built
 }
 
 #[cfg(test)]

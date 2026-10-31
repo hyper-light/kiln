@@ -474,8 +474,20 @@ clone_url = "http://127.0.0.1:{bb}/acme/bb.git"
     assert!(st == 200 && v.to_string().contains("gitlab-ci"), "{st} {v}");
     let (st, v) = call("GET", "/api/ci/repos/acme%2Fgl/providers/workflows", None)?;
     assert!(st == 200 && v.to_string().contains("script can't be blank"), "{st} {v}");
+    // W23-R05/R07: Bitbucket's environment read does not require a KilnCI Git mirror.
+    let mirror = dir.path().join("data/git/acme__bb.git");
+    assert!(!mirror.exists(), "the external-only fixture has no local mirror");
     let (st, v) = call("GET", "/api/ci/environments?repo=acme/bb", None)?;
     assert!(st == 200 && v.to_string().contains("Production") && v.to_string().contains("SUCCESSFUL"), "{st} {v}");
+    assert!(!mirror.exists(), "reading provider environments must not create a mirror");
+    let (st, v) = call("GET", "/api/ci/environments/board", None)?;
+    let shown = v.get("environments").and_then(Value::as_array).and_then(|rows| rows.iter().find(|e| e.get("repo") == Some(&json!("acme/bb")) && e.get("provider") == Some(&json!("bitbucket-pipelines")) && e.get("name") == Some(&json!("Production"))));
+    assert!(st == 200 && shown.is_some_and(|e| e.get("waiting") == Some(&json!([]))), "the board includes provider-owned environments without local waits: {st} {v}");
+    assert_eq!(v.pointer("/providers/acme~1bb"), Some(&json!(["bitbucket-pipelines"])), "the board declares the same selected owners: {v}");
+    let (st, v) = call("PUT", "/api/ci/repos/acme%2Fbb/providers", Some(&json!({ "providers": ["kiln", "bitbucket-pipelines"] })))?;
+    assert_eq!(st, 200, "{v}");
+    let (st, v) = call("GET", "/api/ci/environments?repo=acme/bb", None)?;
+    assert!(st == 500 && v.to_string().contains("environment configuration unavailable"), "mixed ownership requires the local policy: {st} {v}");
 
     // GitLab's webhook: its token, then the pipeline it names is kept at once.
     let pipeline_hook = json!({ "object_kind": "pipeline", "object_attributes": { "id": 62 }, "project": { "path_with_namespace": "acme/gl", "web_url": format!("http://127.0.0.1:{gl}/acme/gl") } }).to_string();

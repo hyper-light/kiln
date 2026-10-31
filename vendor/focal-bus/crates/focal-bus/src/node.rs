@@ -276,6 +276,7 @@ impl Node {
                 peer,
                 lane,
                 frame,
+                ..
             } => {
                 let stream = self.publish(endpoint, frame.bytes());
                 endpoint.release(frame);
@@ -301,6 +302,9 @@ impl Node {
                 self.holding.retain(|held| held.peer != peer);
                 self.release_unblocked(endpoint);
             }
+            // Advisory path changes leave stream/subscription ownership in place. Only a
+            // Closed event above retires the connection's state; liveness judges group peers.
+            Event::Degrading { .. } | Event::Progressing { .. } => {}
             Event::Connected { .. }
             | Event::Reply { .. }
             | Event::BodyReady { .. }

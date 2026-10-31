@@ -110,8 +110,10 @@ These hold for every line written under this spec.
   no clock, no disk, no network, no randomness except what is passed in. The kiln crate feeds it
   events and carries out its commands. This is how `kiln-cd`'s engine is built, and it is what makes
   the scheduler testable at full speed and benchmarkable (W22).
-- **SQLite is the system of record** for CI state (`crates/kiln/src/store.rs`, WAL). Schema
-  changes are numbered migrations (§2.4). Logs, caches and artifacts never go through SQLite.
+- **Amphora is the system of record** for CI and host state (`crates/kiln/src/store.rs`). SQL,
+  Records, sessions, conversation feeds and runner metadata share one logical database. SQL schema
+  changes are numbered migrations (§2.4); legacy SQLite/Turso files are read-only import sources.
+  Log, cache and artifact bytes stay in the shared object store; their metadata belongs to Amphora.
 - **The protocol only grows.** `proto.rs` is postcard-encoded by variant index: new variants go
   **after** every existing one, and new capabilities are new bits (§2.5). Structured payloads
   that will keep changing travel as JSON inside a variant, as the harness messages already do.
@@ -820,11 +822,13 @@ editor. Includes `kiln validate` and `POST /api/ci/validate`.
   | `.kiln/overlays/<stem>.yaml` | overlay for `.github/workflows/<stem>.y(a)ml` |
   | `.github/actions/**/action.y(a)ml`, `.kiln/actions/**/action.y(a)ml` | action metadata |
 
-- **W02-R02 Which ones run.** The repository setting `ci.github_workflows` is `auto` (default),
-  `on` or `off`. `auto` runs `.github/workflows` when the commit has no kiln-dialect workflow, and
-  ignores them otherwise; `on` runs both; `off` never runs them. The repository page and the run
-  list say which applies and why ("GitHub workflows not run: this commit has .kiln/ci.yaml"). When
-  neither dialect has a workflow, auto-detected pipelines run as today (`gitops.auto_pipelines`).
+- **W02-R02 Which ones run.** A repository may override the server's `ci.github_workflows` with
+  `auto`, `on` or `off`. `auto` runs `.github/workflows` when the commit has no kiln-dialect workflow,
+  and ignores them otherwise; `on` runs both; `off` never runs them. The server defaults to `off`:
+  selecting the unified engine does not opt repositories into new automation. Existing explicit
+  `[ci] enabled = true` configurations retain their implicit `auto` unless they declare another
+  `github_workflows` value. `.kiln/` workflows and declared `gitops.auto_pipelines` keep running on
+  the shared engine. The repository page and run list say which setting applies and why.
 - **W02-R03 YAML.** Files are parsed with a span-preserving YAML 1.2 parser (core schema), so every
   diagnostic points at a line and column. `on` is a string key (not YAML 1.1's boolean). Anchors
   and aliases resolve as GitHub resolves them. Duplicate keys are an error. Files over 1 MiB, nesting
@@ -959,10 +963,11 @@ references, lints and their fixes), `schema.rs` (JSON Schemas from `keys.rs`), `
   moves the value to `env:`.
 
 **Progress.** Done, except W02-AC09. That criterion needs runs (W03, W05); the loader already
-returns a broken file with its diagnostics for the run to show. `[ci] kiln_workflows` (off by
-default) lets the engine run `.kiln/` workflows too, v1 standing aside for a commit the engine
-took: the kiln dialect's outputs, exports and implicit checkout run on it end to end. kiln's own
-release pipeline runs there too (W28 step 3):
+returns a broken file with its diagnostics for the run to show. Both dialects now use one engine;
+`[ci] kiln_workflows` is accepted as an inert compatibility setting. Explicit `ci.enabled = false`
+disables workflow ingress, without enabling a legacy scheduler. The kiln dialect's outputs,
+exports and implicit checkout run on the shared engine end to end. kiln's own release pipeline
+runs there too (W28 step 3):
   - Each successful leg of it has its `artifacts-<key>` artifact (W08-R08) read, and the
     `kiln-<target>` binaries in it are checked and kept for runners to upgrade to (`[updates]`,
     docs/releases.md), as v1's jobs' tarballs are.
@@ -1190,9 +1195,17 @@ creates runs. The schedule loop moves to `ci/schedule.rs` with a time-zone-aware
       - `workflow_dispatch` and `repository_dispatch` (R11);
       - `workflow_run` (`requested`, `in_progress` and `completed`), with chains stopping at
         three levels (R13).
-    - `schedule.rs` (R10): every entry fires once a minute at most, recorded in
-      `ci_schedule_fires`, with kiln's opt-in `timezone`, `jitter`, `branch`, `inputs`,
-      `skip-if-unchanged` and `catch-up`.
+    - `schedule.rs` (R10): workflow and attachment occurrences use the same cron parser and
+      durable outbox. `ci_schedule_fires` and pending payload commit together in Amphora; Quiver
+      carries wakeups. Recovery replays stable run/session/command identities until their durable
+      consumer receipt commits. Delivery is at least once; a crash between acceptance and a
+      wakeup cannot silently lose an occurrence. Entries retain kiln's opt-in `timezone`,
+      `jitter`, `branch`, `inputs`, `skip-if-unchanged` and `catch-up`.
+      Published comments/reviews, terminal run/deployment outcomes, runner-offline notices and
+      runner-upgrade outcomes use this same outbox for accepted control intent. Domain changes
+      and their source descriptor commit together; CD Records acknowledges a source only after
+      its SQL descriptor commits. Immutable source snapshots prepare stable workflow/incident
+      children before any external effect. UI batching or overflow cannot acknowledge controls.
     - `hooks.rs`:
       - GitHub's webhooks with their payloads;
       - one trigger for a move a webhook and a poll both see, via a ref compare-and-set
@@ -2992,9 +3005,13 @@ the store to W07 (actions), W12 (registry blobs), W16 (test reports) and W18 (at
     into a staging directory before anything is replaced. The step sets `actions/cache`'s
     outputs, and its save runs after the job, unless an exact key hit, under `policy: pull |
     push | pull-push`.
-  - `local: true` keeps chunks in `<work>/_cache`, least recently used first out past the
-    runner's `[agent] cache_max` (10G by default), so a restore downloads only what the runner
-    lacks.
+  - `local: true` uses the shared optional runner tier at `<work>/_cache` (U07), so a restore
+    downloads only what the runner lacks. `[agent] cache_max` (10 GiB by default) charges unique
+    chunks, derived assembly manifests and publication/repair staging; all idle bytes share an
+    LRU. Current scoped holdings and historical results do not promise residency. Only exact
+    active-operation guards protect bytes. Typed admission declines can bypass optional local
+    caching; ordinary IO, metadata and publication errors remain failures. See the
+    [runner cache policy and cutover](architecture.md#runner-cache-policy-and-cutover-u07).
   - A job's `cache: [{ key, restore-keys, paths, scope, policy, local }]` is a `kiln/cache@v1`
     step before its own (`kiln_ci::store::cache::job_steps`).
   - Checked end to end:
@@ -3076,9 +3093,28 @@ become server-scope secrets).
   with `GITHUB_` (GitHub-exact) or `KILN_`. Values up to 64 KiB. Up to 1,000 per scope.
 - **W09-R03 Encryption.** AES-256-GCM (aws-lc-rs) with a fresh nonce per write, under a data key
   wrapped by the master key (`[ci.secrets] master_key_file`, default `<data>/secrets/master.key`,
-  32 random bytes, mode 0600, created at first start). `kiln secrets rotate-key` re-wraps in the
+  32 random bytes, mode 0600, created only for a fresh standalone service). `kiln secrets rotate-key` re-wraps in the
   background. The database never holds a plaintext value, and the API never returns one: reads give
   names, scopes, sizes, timestamps and last use.
+  **U09/U15 bootstrap prerequisite:** before starting a replicated serving Hub, provision the
+  same existing 32-byte master on each serving host and provision `<data>/secrets/master.sha256`
+  with its 64 lowercase hexadecimal SHA256 digits (optional LF or CRLF), obtained independently
+  from the trusted original source. This bounded nonsecret sidecar avoids adding a TOML field
+  which an older build cannot parse. `[ci.secrets] trusted_master_sha256` remains accepted; when
+  both sources exist they must agree. Malformed, oversized or unreadable sidecars refuse startup.
+  `master_key_file` may select the provisioned key file; the sidecar remains under `<data>/secrets`.
+  Configuration parse compatibility does not authorize a SQLite-era data rollback after cutover.
+  The pin is
+  an explicit operator assertion of the original master's identity, not permission to generate a
+  replacement. Initial binding of legacy encrypted or derived-webhook/chat state also requires
+  this trusted pin; review that prerequisite before migration, including when only derived state
+  remains and there is no ciphertext with which to prove the key. No running key is inspected or
+  distributed automatically. Hub construction atomically binds/verifies an immutable versioned
+  nonsecret verifier in the existing Amphora `kv`; a missing master, absent required pin, changed
+  key or conflicting verifier refuses readiness before sessions, handlers or dispatch start.
+  The validated master is cached for that Hub's lifetime; file changes cannot switch its key.
+  Later starts require the original file even in standalone mode. Data-key rotation leaves this
+  bootstrap identity unchanged; replacing/rebinding the master is not supported here.
 - **W09-R04 Delivery.** A leg receives only the secrets its expressions reference (W01-R12): in the
   workflow, in the reusable workflows it calls, and those its kiln actions declare. `GITHUB_TOKEN`
   is always available. Secrets go in `AssignV2` over the runner's mutually authenticated QUIC
@@ -3997,7 +4033,22 @@ support (G-11, G-18, G-25, G-27, G-28).
   per_host_max = 16
   idle_timeout = "10m"
   resources = { cpu = "4", memory = "8Gi", disk = "40Gi" }
+  firecracker_overhead = { cpu = "250m", memory = "512Mi", disk = "4Gi" } # declared VMM/startup allowance within resources
   ```
+
+  Firecracker's `resources` is the immutable outer grant. Its explicit overhead requires
+  positive memory and disk allowances; CPU overhead may be zero or a finite nonnegative
+  fraction. Usable guest capacity is the remainder, rounded down to whole vCPUs, MiB and
+  4096-byte scratch blocks. Jobs fit that guest capacity; startup/replay cannot grow the grant.
+  Runners must advertise shaped-start support and authenticate a once-per-process identity
+  before eligibility. Ready proves that same shape and owner. Legacy unknown shapes stay
+  fenced until exact physical reconciliation; an empty local map is never stop proof.
+
+  U01 physical acceptance remains open: shared U07 input/publication leases and startup peak
+  accounting, same-Execution kernel CPU/memory enforcement, and resident-versus-promised disk
+  accounting must also be completed. Shape support alone proves none of those limits. The old
+  `kiln ci bench --only firecracker` start-times path refuses until it is routed through declared
+  unified pool grants; the earlier timing measurements do not validate this change.
 
   The pool manager starts and stops ephemeral executors on the matching hosts when W05 asks
   (W05-R27). Each executor takes one leg and is discarded, so every leg starts clean. The `k8s`
@@ -5990,7 +6041,7 @@ rule-based notifications (G-30, G-31).
   - the slowest steps.
 
   Per runner: utilization and failure classes. Per repository: its fair share against its weight.
-- **W19-R02 Storage.** Hourly and daily rollups in SQLite (migration 9); Prometheus metrics for
+- **W19-R02 Storage.** Hourly and daily rollups in the canonical Amphora SQL database, using numbered migrations; Prometheus metrics for
   live values (extending `/metrics`); optional OpenTelemetry export (W11-R09).
 - **W19-R03 Compare runs.** For any two runs or legs: duration per step, environment differences,
   action SHAs, image digests, runner facts, cache hits, changed files between their commits. "What
@@ -7744,9 +7795,9 @@ its sources, is kiln research `01a16c5c4b6e760cb96b99da91863dad`.
   lineage, verifications and signatures. Families `work.result`, `work.weak` (a weak key's path
   sets, at most 8), `work.pathset`, `work.snapshot`, `work.lane`, `work.graph`, `work.test`,
   `work.verify` and `work.eclass` (e-classes and their merges, R30), keyed under
-  `owner/repo|domain|`. They live in SQLite through a numbered migration now and in Amphora through
-  the `Records` seam later. Bytes stay in the content-addressed store (`cas/<sha256>`, through
-  `Blobs`).
+  `owner/repo|domain|`. These families live in `work_records` in the injected canonical Amphora database,
+  through `crate::ci::work`'s existing ledger boundary. Legacy SQLite/Turso databases are read-only
+  import sources. Content bytes stay separate, in the content-addressed store through `Blobs`.
 - **W24-R03 Early cutoff.** A unit's key takes its upstream units' output digests, never their
   keys. A unit that reruns and produces byte-identical outputs leaves everything after it
   reusable.
@@ -7782,7 +7833,9 @@ its sources, is kiln research `01a16c5c4b6e760cb96b99da91863dad`.
   successes are recorded; a failure, a cancellation or a timeout never is.
 - **W24-R08 The runner's cache service.** Each runner serves one cache to its legs, its `kiln run`
   commands and its agents:
-  - a local store at `<work>/_cas`: whole files, content-defined chunks for large ones;
+  - one shared optional byte tier at `<work>/_cache`, with whole small objects and
+    content-defined chunks for large ones; derived assembly manifests under `<work>/_cas/objects`
+    share the same budget and idle LRU (U07), with scoped logical metadata in canonical Amphora;
   - endpoints on loopback and a unix socket, with tokens scoped to repository, domain and
     read or write;
   - writes going up to the server by scope, and existence checks scoped by repository, as
@@ -9306,11 +9359,14 @@ runner's cache service (ci-w24-m2-cache), merged in. Live counts wait for step 3
 
 **M2 (built 2026-10-25, awaiting review).**
 
-- **The runner's cache service** (R08, `crates/kiln/src/runner/work`): objects at `<work>/_cas`,
-  whole up to 8 MiB and in the store's content-defined chunks above; loopback and a unix socket;
-  tokens scoped to a repository, a domain and read or write; writes up to the server by scope (a
-  leg's grant), existence checks by repository. The tools' entries are on the work ledger
-  (`<work>/_cas/ledger.db`, `crate::ci::work`'s rows, recorded and looked up on its one path, R30).
+- **The runner's cache service** (R08, `crates/kiln/src/runner/work`): U07 consolidates object
+  bytes into `<work>/_cache`, whole up to 8 MiB and content-defined chunks above, with charged
+  assembly manifests under `_cas/objects`; loopback and a unix socket; tokens scoped to a
+  repository, a domain and read or write; writes up to the server by scope (a leg's grant),
+  existence checks by repository. The tools' entries use the injected canonical Amphora work
+  ledger (`crate::ci::work`, R30); `_cas/ledger.db` is a read-only migration input. U07 source is
+  frozen; runtime, profile/performance and native validation remain pending. The earlier M2
+  measurements below do not validate this frozen cache change.
   A runner opens it the first time something asks for it (`kiln run --reuse`); legs and agents
   aren't given it yet. Local hits under 1 MiB: p99 1.20 ms and 1.54 ms in two runs (p50 0.61 and
   0.76 ms; a debug build on a shared fedora).

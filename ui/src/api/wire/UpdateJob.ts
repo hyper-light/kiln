@@ -15,9 +15,8 @@ kind: string,
  */
 target: string, 
 /**
- * "native" (the runner's own upgrade command), "terminal" (through a terminal on an older
- * runner), "build" (the machine builds the newest kiln itself, `crate::fleet`), "restart"
- * (Kubernetes rollout) or "replace" (the server's binary).
+ * "native" (CI/CD runner lifecycle), "restart" (Kubernetes rollout), or "replace"
+ * (the server's binary). "build" remains readable for historical snapshots.
  */
 method: string, state: UpdateJobState, started_at: number, ended_at: number | null, from_build: string | null, to_build: string | null, 
 /**

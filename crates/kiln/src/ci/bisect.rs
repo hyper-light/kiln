@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use http::StatusCode;
-use rusqlite::OptionalExtension as _;
+use crate::sql::OptionalExtension as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -188,7 +188,7 @@ pub async fn start(hub: &Arc<Hub>, run: &str, body: &Value, by: &str) -> Result<
                 .call(move |c| {
                     Ok(c.query_row(
                         "SELECT sha FROM runs WHERE repo_id = ?1 AND workflow_id = ?2 AND branch = ?3 AND conclusion = 'success' AND id != ?5 AND created_at <= ?4 ORDER BY created_at DESC LIMIT 1",
-                        rusqlite::params![repo_id, wf, branch, at, this],
+                        crate::sql::params![repo_id, wf, branch, at, this],
                         |r| r.get::<_, String>(0),
                     )
                     .optional()?)

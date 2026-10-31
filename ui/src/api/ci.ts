@@ -128,7 +128,16 @@ export interface CiEnvTargets {
 }
 
 /** An environment's protection rules, as `.kiln/environments.yaml` writes them. */
+export interface EnvironmentIdentity {
+  scope: { kind: "server" } | { kind: "repository"; id: string };
+  name: string;
+}
+
 export interface CiProtection {
+  policy?: EnvironmentIdentity;
+  approvals?: { count: number; reviewers?: string[]; self_approve?: boolean };
+  prerequisites?: string[];
+  freeze?: string;
   reviewers?: string[];
   "prevent-self-review"?: boolean;
   "wait-timer"?: number;
@@ -180,6 +189,7 @@ export interface CiPreview {
 
 /** A repository's environment (W15). */
 export interface CiEnvironment {
+  identity?: EnvironmentIdentity;
   name: string;
   /** `file` (trunk's `.kiln/environments.yaml`), `kiln` (made here), `run` (named by a job), `preview` (one of the file's `previews:`, W15-R07). */
   source: "file" | "kiln" | "run" | "preview" | string;
@@ -195,6 +205,32 @@ export interface CiEnvironment {
   repo?: string;
   waiting?: CiEnvWait[];
 }
+
+/** W23: a provider owns this environment or explicitly reports why it could not read it.
+ * Its protection and deployment controls stay with that provider. */
+export interface CiProviderEnvironment {
+  provider: string;
+  name?: string;
+  error?: string;
+  kind?: string | null;
+  url?: string | null;
+  deployment?: {
+    state?: string | null;
+    result?: string | null;
+    commit?: string | null;
+    ref?: string | null;
+    pipeline?: string | null;
+    url?: string | null;
+    created_at?: number | null;
+  } | null;
+  repo?: string;
+  waiting?: CiEnvWait[];
+}
+
+export type CiEnvironmentRow = CiEnvironment | CiProviderEnvironment;
+export const isProviderEnvironment = (environment: CiEnvironmentRow): environment is CiProviderEnvironment => "provider" in environment;
+
+export const CI_PROVIDER_NAMES: Record<string, string> = { kiln: "KilnCI", "github-actions": "GitHub Actions", "gitlab-ci": "GitLab CI/CD", "bitbucket-pipelines": "Bitbucket Pipelines" };
 
 /** A run's data flow (W04-R23): its outputs from where they're made to who reads them, and its exports. */
 export interface CiFlow {
@@ -835,9 +871,10 @@ export const ci = {
     request<{ run: string; environments?: string[]; approval?: "run"; state: string }>("POST", `/api/ci/runs/${enc(id)}/approve`, { environments, state, comment }),
   cancel: (id: string) => request<void>("POST", `/api/ci/runs/${enc(id)}/cancel`, {}),
   /** A repository's environments (W15). */
-  environments: (repo: string, signal?: AbortSignal) => request<{ repo: string; environments: CiEnvironment[] }>("GET", `/api/ci/environments?repo=${enc(repo)}`, undefined, { signal }),
+  environments: (repo: string, signal?: AbortSignal) =>
+    request<{ repo: string; environments: CiEnvironmentRow[]; providers?: string[] }>("GET", `/api/ci/environments?repo=${enc(repo)}`, undefined, { signal }),
   /** Every environment of every repository the caller may read (W15-R09). */
-  environmentsBoard: (signal?: AbortSignal) => request<{ environments: CiEnvironment[] }>("GET", "/api/ci/environments/board", undefined, { signal }),
+  environmentsBoard: (signal?: AbortSignal) => request<{ environments: CiEnvironmentRow[]; providers?: Record<string, string[]> }>("GET", "/api/ci/environments/board", undefined, { signal }),
   environment: (repo: string, name: string, signal?: AbortSignal) => request<CiEnvironment>("GET", `/api/ci/environments/${enc(name)}?repo=${enc(repo)}`, undefined, { signal }),
   /** Makes an environment in kiln, or changes one made here; what it would meet now comes back with it. */
   saveEnvironment: (repo: string, name: string, body: { kind: CiEnvKind | null; targets: CiEnvTargets; protection: CiProtection; url: string | null; concurrency: number | null }) =>
@@ -846,6 +883,8 @@ export const ci = {
       `/api/ci/environments/${enc(name)}?repo=${enc(repo)}`,
       body,
     ),
+  createEnvironmentFlow: (repo: string, name: string, body: { run: string; app: string; version: string }) =>
+    request<{ id: string; environment: EnvironmentIdentity; run: string; app: string; version: string }>("POST", `/api/ci/environments/${enc(name)}/flows?repo=${enc(repo)}`, body),
   deleteEnvironment: (repo: string, name: string) => request<void>("DELETE", `/api/ci/environments/${enc(name)}?repo=${enc(repo)}`),
   /** A repository's dev, staging and production, each unless it has one of that name (W15-R08). */
   starterEnvironments: (repo: string) => request<{ repo: string; made: string[]; kept: string[] }>("POST", `/api/ci/environments/starter?repo=${enc(repo)}`, {}),

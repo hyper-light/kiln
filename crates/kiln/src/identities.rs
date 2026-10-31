@@ -7,7 +7,7 @@
 //! (`kiln_ci::identity::chain`).
 
 use kiln_ci::identity::chain::{Actor, Holder, Identity, Revocation};
-use rusqlite::{OptionalExtension as _, params};
+use crate::sql::{OptionalExtension as _, params};
 
 use crate::hub::Hub;
 use crate::instances::PeerId;
@@ -190,8 +190,8 @@ pub async fn certify_person(store: &Store, pki: &crate::pki::Pki, user: Option<&
     let (uid, subject, cert, fp) = (user.map(str::to_owned), uri.clone(), pem.clone(), f.clone());
     let refused = store
         .call(move |c| {
-            // A savepoint: the store may already run this inside its own transaction (the cluster group).
-            let tx = c.savepoint()?;
+            // U05: Amphora nests this session inside its own durable transaction.
+            let tx = crate::store::tx(c)?;
             if let Some(uid) = &uid
                 && !tx.query_row("SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1 AND disabled_at IS NULL)", [uid], |r| r.get::<_, bool>(0))?
             {
@@ -747,7 +747,7 @@ pub async fn revoke(store: &Store, target: Target, reason: &str, by: &str, at: i
     store
         .call(move |c| {
             // A savepoint: the store may already run this inside its own transaction (the cluster group).
-            let tx = c.savepoint()?;
+            let tx = crate::store::tx(c)?;
             // (serial, key, subject) of each row to write.
             let rows: Vec<(Option<String>, Option<String>, String)> = match &target {
                 Target::Certificates(s) => {

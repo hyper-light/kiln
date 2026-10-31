@@ -55,6 +55,16 @@ impl Paths {
         self
     }
 
+    /// U03: action aliases are known before its journalled start. Preserve the job root
+    /// and relay address while adding the action's deepest-first mount translations.
+    pub(crate) fn with_mounts(self, mounts: Vec<(PathBuf, PathBuf)>) -> Self {
+        let mut combined = mounts;
+        combined.extend(self.mounts);
+        let mut paths = Self::new(self.root, combined);
+        paths.server = self.server;
+        paths
+    }
+
     /// Whether the leg container's own files are the host's to mount.
     pub fn has_root(&self) -> bool {
         self.root.is_some()
@@ -295,6 +305,7 @@ const OWN_NETWORKS: &[&str] = &["bridge", "host", "none", "default", "podman", "
 /// came, and so does an id.
 #[derive(Debug, Default)]
 pub struct Names {
+    admission: Option<super::processes::Admission>,
     /// Its label's key ([`leg_label`]); empty for a socket whose names are the daemon's.
     key: String,
     suffix: String,
@@ -316,8 +327,12 @@ impl Names {
     pub fn for_leg(leg: &str, owner: Option<&str>) -> Names {
         let key = leg_label(leg);
         let mut labels = vec![(key.clone(), leg.to_owned())];
+        let execution = super::processes::current();
+        if let Some(execution) = &execution { labels.push(("kiln.execution".into(), execution.operation_identity().unwrap_or(execution.identity()).into())); }
         labels.extend(owner.and_then(runner_label).map(|r| (r, "1".to_owned())));
-        Names { key, suffix: format!("-{}", tag_of(leg)), labels, ..Names::default() }
+        // U03: a delayed named request from an old attempt cannot address a new attempt.
+        let suffix = execution.as_ref().map_or_else(|| tag_of(leg), |e| tag_of(e.operation_identity().unwrap_or(e.identity())));
+        Names { admission: execution.as_ref().map(|execution| execution.admission().clone()), key, suffix: format!("-{suffix}"), labels, ..Names::default() }
     }
 
     fn kind(&mut self, k: Kind) -> &mut HashSet<String> {
@@ -448,6 +463,22 @@ enum Answer {
     Events,
     /// The connection is taken over once it's through: an attach's or an exec's streams.
     Takeover,
+}
+
+#[derive(Debug)]
+struct Pending { answer: Answer, operation: Option<super::docker::daemon::Operation>, submitted: bool }
+impl From<Answer> for Pending {
+    fn from(answer: Answer) -> Self { Self { answer, operation: None, submitted: false } }
+}
+
+/// U03: own the resources already managed by the leg proxy. Explicit external deployments
+/// (for example Swarm services) remain passthrough, just as trusted host-job deployments do;
+/// they are not reclassified as CI infrastructure or entered into its resource allocation.
+fn managed_mutation(target: &str) -> bool {
+    let path = target.split('?').next().unwrap_or(target);
+    let (_, path) = versioned(path);
+    matches!(path, "/build" | "/build/prune" | "/auth" | "/commit" | "/session")
+        || ["/containers/", "/exec/", "/networks/", "/volumes/", "/images/"].iter().any(|prefix| path.starts_with(prefix))
 }
 
 /// Where a request goes: its target with the leg's names the daemon's (`None`: as it came), what
@@ -1083,6 +1114,8 @@ fn parse_head(buf: &[u8]) -> Option<Option<Head>> {
 struct Requests {
     buf: Vec<u8>,
     stage: Flow,
+    refused: Option<String>,
+    generation: Option<super::docker::daemon::Generation>,
 }
 
 #[derive(Debug, Default)]
@@ -1102,7 +1135,7 @@ enum Flow {
 impl Requests {
     /// Takes what the leg sent, `input`, and puts what goes on to the daemon in `out`, and what's
     /// to be done with each request's answer in `answers`.
-    fn feed(&mut self, input: &[u8], leg: &Leg, answers: &mut VecDeque<Answer>, out: &mut Vec<u8>) {
+    fn feed(&mut self, input: &[u8], leg: &Leg, answers: &mut VecDeque<Pending>, out: &mut Vec<u8>) {
         self.buf.extend_from_slice(input);
         loop {
             match std::mem::replace(&mut self.stage, Flow::Raw) {
@@ -1123,16 +1156,39 @@ impl Requests {
                         Some(Some(h)) => h,
                         // Not what was expected: the connection's rest goes on as it came, both ways.
                         None | Some(None) => {
-                            answers.push_back(Answer::Takeover);
+                            if leg.journal.is_some() {
+                                self.refused = Some("U03: unparseable Docker request cannot bypass daemon ownership".into());
+                                out.clear();
+                                return;
+                            }
+                            answers.push_back(Answer::Takeover.into());
                             continue;
                         }
                     };
                     self.buf.drain(..head.raw.len());
                     let route = route(&head.method, &head.target, &mut leg.names.lock());
-                    answers.push_back(if head.takeover { Answer::Takeover } else { route.answer });
+                    let operation = if managed_mutation(&head.target) && (head.takeover || !matches!(head.method.as_str(), "GET" | "HEAD" | "OPTIONS")) {
+                        match leg.journal.as_ref().map(|j| j.begin_with(self.generation.clone())).transpose() {
+                            Ok(operation) => operation,
+                            Err(e) => { self.refused = Some(format!("{e:#}")); out.clear(); return; }
+                        }
+                    } else { None };
+                    let submitted = head.body.is_none() || route.gather.is_none();
+                    answers.push_back(Pending { answer: if head.takeover { Answer::Takeover } else { route.answer }, operation, submitted });
                     let next = if head.takeover { Flow::Raw } else { Flow::Head };
                     self.stage = match (head.body.take(), route.gather) {
                         (Some(body), Some(gather)) => Flow::Gather { head: Box::new(head), target: route.target, gather, body, raw: Vec::new(), data: Vec::new() },
+                        (None, Some(gather)) if leg.journal.is_some() => {
+                            let new = rewrite(&gather, b"{}", &leg.paths.read(), &mut leg.names.lock(), None, &mut None);
+                            let Some(new) = new else {
+                                self.refused = Some("U03: bodyless Docker create cannot bypass ownership labels".into());
+                                out.clear();
+                                return;
+                            };
+                            head.write(route.target.as_deref(), Some(new.len()), out);
+                            out.extend_from_slice(&new);
+                            next
+                        }
                         (body, _) => {
                             head.write(route.target.as_deref(), None, out);
                             match body {
@@ -1156,6 +1212,11 @@ impl Requests {
                 }
                 Flow::Gather { head, target, gather, mut body, mut raw, mut data } => {
                     let Some((n, done)) = body.take(&self.buf, Some(&mut data)) else {
+                        if leg.journal.is_some() {
+                            self.refused = Some("U03: malformed Docker create body cannot bypass ownership labels".into());
+                            out.clear();
+                            return;
+                        }
                         // Not chunked as it says: on as it came.
                         head.write(target.as_deref(), None, out);
                         out.append(&mut raw);
@@ -1166,17 +1227,29 @@ impl Requests {
                         self.stage = Flow::Gather { head, target, gather, body, raw, data };
                         return;
                     }
+                    if leg.journal.is_some() && !done {
+                        self.refused = Some("U03: oversized Docker create cannot bypass ownership labels".into());
+                        out.clear();
+                        return;
+                    }
                     let (loopback, mut relayed) = (leg.loopback.read().clone(), None);
                     let rewritten = if done { rewrite(&gather, &data, &leg.paths.read(), &mut leg.names.lock(), loopback.as_ref(), &mut relayed) } else { None };
+                    if leg.journal.is_some() && rewritten.is_none() && !matches!(gather, Gather::NetworkMember(_)) {
+                        self.refused = Some("U03: invalid Docker create cannot bypass ownership labels".into());
+                        out.clear();
+                        return;
+                    }
                     if let (Some(name), Some(l)) = (relayed, loopback) {
                         crate::rt::spawn(loopback_relay(name, l, leg.stop.clone()));
                     }
                     match rewritten {
                         Some(new) => {
+                            if let Some(pending) = answers.back_mut() { pending.submitted = true; }
                             head.write(target.as_deref(), Some(new.len()), out);
                             out.extend_from_slice(&new);
                         }
                         None => {
+                            if let Some(pending) = answers.back_mut() { pending.submitted = true; }
                             head.write(target.as_deref(), None, out);
                             out.append(&mut raw);
                         }
@@ -1223,6 +1296,7 @@ fn parse_reply(buf: &[u8]) -> Option<Option<Reply>> {
 struct Answers {
     buf: Vec<u8>,
     stage: Back,
+    operation: Option<super::docker::daemon::Operation>,
 }
 
 #[derive(Debug, Default)]
@@ -1257,9 +1331,14 @@ fn chunk(data: &[u8], out: &mut Vec<u8>) {
 }
 
 impl Answers {
+    fn completed(&mut self) {
+        if let Some(operation) = self.operation.take() && let Err(e) = operation.completed() {
+            tracing::error!(error = %e, "U03: could not retire completed Docker submission evidence");
+        }
+    }
     /// Takes what the daemon answered, `input`, and puts what goes on to the leg in `out`;
     /// `pending` says what's done with each answer.
-    fn feed(&mut self, input: &[u8], names: &Mutex<Names>, pending: &mut VecDeque<Answer>, out: &mut Vec<u8>) {
+    fn feed(&mut self, input: &[u8], names: &Mutex<Names>, pending: &mut VecDeque<Pending>, out: &mut Vec<u8>) {
         self.buf.extend_from_slice(input);
         loop {
             match std::mem::replace(&mut self.stage, Back::Raw) {
@@ -1287,9 +1366,15 @@ impl Answers {
                         out.extend_from_slice(&reply.raw);
                         continue;
                     }
-                    let answer = pending.pop_front().unwrap_or(Answer::Plain);
+                    let next = pending.pop_front().unwrap_or_else(|| Answer::Plain.into());
+                    let answer = next.answer;
+                    self.operation = next.operation;
                     let body = match reply.framing {
                         _ if reply.status == 101 || answer == Answer::Takeover => {
+                            // The daemon has answered the attach/exec request. The resulting
+                            // process belongs to its labelled container; raw stream bytes are
+                            // stdin, and cannot submit another HTTP create on this connection.
+                            if (200..300).contains(&reply.status) || reply.status == 101 { self.completed(); }
                             out.extend_from_slice(&reply.raw);
                             self.stage = Back::Raw;
                             continue;
@@ -1306,6 +1391,7 @@ impl Answers {
                         }
                     };
                     let Some(body) = body else {
+                        self.completed();
                         out.extend_from_slice(&reply.raw);
                         continue;
                     };
@@ -1328,6 +1414,7 @@ impl Answers {
                     let Some((n, done)) = body.take(&self.buf, None) else { continue };
                     out.extend(self.buf.drain(..n));
                     self.stage = if done { Back::Head } else { Back::Pass(body) };
+                    if done { self.completed(); }
                     if !done {
                         return;
                     }
@@ -1354,6 +1441,7 @@ impl Answers {
                         }
                     }
                     self.stage = if done { Back::Head } else { Back::Pass(body) };
+                    if done { self.completed(); }
                 }
                 Back::Events { mut body, mut line } => {
                     let mut data = Vec::new();
@@ -1379,6 +1467,7 @@ impl Answers {
                     chunk(&line, out);
                     out.extend_from_slice(b"0\r\n\r\n");
                     self.stage = Back::Head;
+                    self.completed();
                 }
             }
         }
@@ -1406,6 +1495,7 @@ struct Leg {
     names: Mutex<Names>,
     loopback: RwLock<Option<Loopback>>,
     stop: crate::rt::Shutdown,
+    journal: Option<super::docker::daemon::Journal>,
 }
 
 impl std::fmt::Debug for Leg {
@@ -1414,11 +1504,70 @@ impl std::fmt::Debug for Leg {
     }
 }
 
+/// W07-AC04: allocation owns only a tiny socket, never execution journals or work bytes.
+#[cfg(unix)]
+pub(crate) fn managed_directory(preferred: &Path) -> anyhow::Result<tempfile::TempDir> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let mut last = None;
+    for base in [preferred, Path::new("/tmp")] {
+        let allocated = (|| -> anyhow::Result<tempfile::TempDir> {
+            let base = std::fs::canonicalize(base)?;
+            let metadata = std::fs::symlink_metadata(&base)?;
+            let mode = metadata.permissions().mode();
+            let uid = nix::unistd::geteuid().as_raw();
+            anyhow::ensure!(metadata.is_dir() && ((metadata.uid() == uid && mode & 0o022 == 0) || (metadata.uid() == 0 && mode & 0o1000 != 0)),
+                "managed Docker socket base must prevent other users replacing its private directory");
+            // Validate bytes against this target's sockaddr, including the random suffix.
+            std::os::unix::net::SocketAddr::from_pathname(base.join("kiln-d-XXXXXXXXXXXX/s"))?;
+            let dir = tempfile::Builder::new().prefix("kiln-d-").rand_bytes(12).permissions(std::fs::Permissions::from_mode(0o700)).tempdir_in(base)?;
+            let metadata = std::fs::symlink_metadata(dir.path())?;
+            anyhow::ensure!(metadata.is_dir() && metadata.uid() == nix::unistd::geteuid().as_raw() && metadata.permissions().mode() & 0o777 == 0o700,
+                "managed Docker socket directory must be private and owned by the effective user");
+            std::os::unix::net::SocketAddr::from_pathname(dir.path().join("s"))?;
+            Ok(dir)
+        })();
+        match allocated {
+            Ok(dir) => return Ok(dir),
+            Err(error) => last = Some(error),
+        }
+    }
+    anyhow::bail!("no safe short directory for a managed Docker socket: {}", last.map_or_else(|| "no candidate".into(), |e| format!("{e:#}")))
+}
+
+/// Aborting is asynchronous: the listener future retains its directory until it is dropped.
+struct SocketTask(crate::rt::JoinHandle<()>);
+
+impl Drop for SocketTask {
+    fn drop(&mut self) { self.0.abort(); }
+}
+
+/// W07-AC04/U03: close the listener before unlinking its pathname. Path removal is never
+/// evidence that daemon submissions drained or that physical admission may be released.
+struct SocketListener {
+    listener: Option<hyper_rt::local::LocalListener>,
+    path: PathBuf,
+    #[cfg(unix)]
+    directory: Option<tempfile::TempDir>,
+}
+
+impl Drop for SocketListener {
+    fn drop(&mut self) {
+        let bound = self.listener.is_some();
+        drop(self.listener.take());
+        #[cfg(unix)]
+        if let Some(directory) = self.directory.take() {
+            if let Err(error) = directory.close() { tracing::warn!(%error, "managed Docker socket directory cleanup failed"); }
+            return;
+        }
+        if bound { let _ = std::fs::remove_file(&self.path); }
+    }
+}
+
 /// A leg's socket, served until it's dropped.
 pub struct Socket {
     path: PathBuf,
     leg: Arc<Leg>,
-    task: crate::rt::JoinHandle<()>,
+    task: SocketTask,
 }
 
 impl std::fmt::Debug for Socket {
@@ -1427,28 +1576,79 @@ impl std::fmt::Debug for Socket {
     }
 }
 
+fn default_journal(names: &Names) -> Option<super::docker::daemon::Journal> {
+    names.labels.iter().find(|(k, _)| k == "kiln.execution").map(|(_, v)| {
+        let label = format!("kiln.execution={v}");
+        match &names.admission {
+            Some(admission) => super::docker::daemon::Journal::execution_in(admission.clone(), &label),
+            None => super::docker::daemon::Journal::execution(&label),
+        }
+    })
+}
+
+fn managed_journal(names: &Names, journal: &super::docker::daemon::Journal) -> anyhow::Result<()> {
+    let admission = names.admission.as_ref().ok_or_else(|| anyhow::anyhow!("U03: managed Docker names lack their captured admission owner"))?;
+    let mut labels = names.labels.iter().filter(|(key, _)| key == "kiln.execution");
+    let (_, execution) = labels.next().ok_or_else(|| anyhow::anyhow!("U03: managed Docker names lack their exact execution label"))?;
+    anyhow::ensure!(labels.next().is_none(), "U03: managed Docker names have ambiguous execution ownership");
+    journal.ensure_execution(admission, &format!("kiln.execution={execution}"))
+}
+
 impl Socket {
     /// Listens at `path` for a leg whose names are `names`, passing its connections on to the
     /// daemon at `daemon`.
     pub async fn listen(path: PathBuf, daemon: PathBuf, names: Names) -> anyhow::Result<Socket> {
-        let leg = Arc::new(Leg { paths: RwLock::new(Paths::default()), names: Mutex::new(names), ..Leg::default() });
+        let journal = default_journal(&names);
+        Self::listen_owned(path, daemon, names, journal, None).await
+    }
+
+    /// W07-AC04: an action's socket has a physical lifetime independent of its workspace depth.
+    #[cfg(unix)]
+    pub async fn listen_managed(daemon: PathBuf, names: Names) -> anyhow::Result<Socket> {
+        let candidate = crate::harness::socket::runtime_path("s");
+        let directory = managed_directory(candidate.parent().unwrap_or(Path::new("/tmp")))?;
+        let journal = default_journal(&names);
+        Self::listen_owned(directory.path().join("s"), daemon, names, journal, Some(directory)).await
+    }
+
+    /// The managed caller supplies the journal captured by its existing Docker client.
+    pub(crate) async fn listen_in(path: PathBuf, daemon: PathBuf, names: Names, journal: super::docker::daemon::Journal) -> anyhow::Result<Socket> {
+        managed_journal(&names, &journal)?;
+        Self::listen_owned(path, daemon, names, Some(journal), None).await
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn listen_managed_in(daemon: PathBuf, names: Names, journal: super::docker::daemon::Journal) -> anyhow::Result<Socket> {
+        managed_journal(&names, &journal)?;
+        let candidate = crate::harness::socket::runtime_path("s");
+        let directory = managed_directory(candidate.parent().unwrap_or(Path::new("/tmp")))?;
+        Self::listen_owned(directory.path().join("s"), daemon, names, Some(journal), Some(directory)).await
+    }
+
+    async fn listen_owned(path: PathBuf, daemon: PathBuf, names: Names, journal: Option<super::docker::daemon::Journal>, #[cfg(unix)] directory: Option<tempfile::TempDir>, #[cfg(not(unix))] _directory: Option<()>) -> anyhow::Result<Socket> {
+        if let Some(journal) = &journal { journal.ensure_open()?; }
+        let leg = Arc::new(Leg { paths: RwLock::new(Paths::default()), names: Mutex::new(names), journal, ..Leg::default() });
         let (bound, listening) = futures::channel::oneshot::channel::<Result<(), String>>();
         let (at, served) = (path.clone(), leg.clone());
-        let task = crate::rt::spawn(async move {
-            let listener = match hyper_rt::local::LocalListener::bind(&at, 64) {
-                Ok(l) => l,
+        // The future owns the reservation even if cancelled before its first poll.
+        let owner = SocketListener { listener: None, path: at.clone(), #[cfg(unix)] directory };
+        let task = SocketTask(crate::rt::spawn(async move {
+            let mut owner = owner;
+            owner.listener = match hyper_rt::local::LocalListener::bind(&at, 64) {
+                Ok(l) => Some(l),
                 Err(e) => {
                     let _ = bound.send(Err(e.to_string()));
                     return;
                 }
             };
-            let _ = bound.send(Ok(()));
+            if bound.send(Ok(())).is_err() { return; }
+            let Some(listener) = owner.listener.as_ref() else { return };
             while let Ok(stream) = listener.accept().await {
                 if let Err(e) = crate::rt::spawn_local(connection(stream, daemon.clone(), served.clone())) {
                     tracing::warn!("a leg's Docker connection was dropped: {e}");
                 }
             }
-        });
+        }));
         match listening.await {
             Ok(Ok(())) => Ok(Socket { path, leg, task }),
             Ok(Err(e)) => anyhow::bail!("listen at {}: {e}", path.display()),
@@ -1465,6 +1665,11 @@ impl Socket {
         *self.leg.paths.write() = paths;
     }
 
+    pub(crate) fn add_mounts(&self, mounts: Vec<(PathBuf, PathBuf)>) {
+        let mut paths = self.leg.paths.write();
+        *paths = std::mem::take(&mut *paths).with_mounts(mounts);
+    }
+
     /// What the BuildKit containers the leg makes get, to reach kiln by the GHES stand-in's name.
     pub fn set_loopback(&self, loopback: Loopback) {
         *self.leg.loopback.write() = Some(loopback);
@@ -1473,9 +1678,8 @@ impl Socket {
 
 impl Drop for Socket {
     fn drop(&mut self) {
-        self.task.abort();
+        self.task.0.abort();
         self.leg.stop.cancel();
-        let _ = std::fs::remove_file(&self.path);
         if let Some(config) = self.leg.loopback.read().as_ref().and_then(|l| l.buildkitd.as_ref()) {
             let _ = std::fs::remove_file(config);
         }
@@ -1483,19 +1687,78 @@ impl Drop for Socket {
 }
 
 /// One of the leg's connections: its requests on to the daemon, the daemon's answers back.
+/// A read-only identity probe on an already kernel-verified daemon connection. Reuses the
+/// proxy's existing HTTP framing parser and requires a fully drained bounded response.
+#[cfg(target_os = "linux")]
+pub(crate) async fn daemon_id(stream: &hyper_rt::local::LocalStream) -> anyhow::Result<String> {
+    crate::rt::timeout(std::time::Duration::from_secs(10), async {
+        stream.write_all(b"GET /info HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n").await?;
+        let (mut input, mut scratch) = (Vec::new(), vec![0u8; 16 << 10]);
+        let reply = loop {
+            if let Some(reply) = parse_reply(&input) { break reply.ok_or_else(|| anyhow::anyhow!("U03: daemon identity response has invalid HTTP framing"))? }
+            anyhow::ensure!(input.len() <= MAX_HEAD, "U03: daemon identity response head is too large");
+            let n = stream.read(&mut scratch).await?;
+            anyhow::ensure!(n > 0, "U03: daemon identity response ended before its head");
+            input.extend_from_slice(scratch.get(..n).unwrap_or_default());
+        };
+        anyhow::ensure!(reply.status == 200, "U03: daemon identity endpoint did not return success");
+        input.drain(..reply.raw.len());
+        let mut body = match reply.framing {
+            Framing::Length(n) => Body::Length(n),
+            Framing::Chunked => Body::Chunked(Chunked::default()),
+            Framing::None => anyhow::bail!("U03: daemon identity lacks bounded response framing"),
+        };
+        let mut data = Vec::new();
+        loop {
+            let (n, done) = body.take(&input, Some(&mut data)).ok_or_else(|| anyhow::anyhow!("U03: daemon identity body has invalid framing"))?;
+            input.drain(..n);
+            anyhow::ensure!(data.len() <= MAX_ANSWER, "U03: daemon identity response is too large");
+            if done { break }
+            let n = stream.read(&mut scratch).await?;
+            anyhow::ensure!(n > 0, "U03: daemon identity body was truncated");
+            input.extend_from_slice(scratch.get(..n).unwrap_or_default());
+        }
+        anyhow::ensure!(input.is_empty(), "U03: unexpected trailing daemon identity data");
+        let info: Value = serde_json::from_slice(&data)?;
+        let id = info.get("ID").and_then(Value::as_str).filter(|id| !id.is_empty() && id.len() <= 256).ok_or_else(|| anyhow::anyhow!("U03: daemon has no persistent engine identity"))?;
+        Ok(id.to_owned())
+    }).await.map_err(|_| anyhow::anyhow!("U03: daemon identity probe timed out; no boot-generation proof"))?
+}
+
+/// One of the leg's connections: its requests on to the daemon, the daemon's answers back.
 async fn connection(stream: hyper_rt::local::LocalStream, daemon: PathBuf, leg: Arc<Leg>) {
     use hyper_rt::tcp::Shutdown;
-    let Ok(up) = hyper_rt::local::LocalStream::connect(&daemon).await else { return };
+    let Ok(mut up) = hyper_rt::local::LocalStream::connect(&daemon).await else { return };
+    let generation = if leg.journal.is_some() {
+        match super::docker::daemon::verified_generation(&up, &daemon).await {
+            Ok(generation) => Some(generation),
+            Err(_) => {
+                // A failed read-only identity probe may have consumed part of a response.
+                // Start a clean stream; ordinary completion remains a supported proof.
+                let Ok(clean) = hyper_rt::local::LocalStream::connect(&daemon).await else { return };
+                up = clean;
+                None
+            }
+        }
+    } else { None };
     // What's done with each answer, in the order of the requests.
     let pending = Mutex::new(VecDeque::new());
     let requests = async {
-        let mut requests = Requests::default();
+        let mut requests = Requests { generation, ..Requests::default() };
         let (mut buf, mut out) = (vec![0u8; 64 << 10], Vec::new());
         while let Ok(n @ 1..) = stream.read(&mut buf).await {
             out.clear();
             requests.feed(buf.get(..n).unwrap_or_default(), &leg, &mut pending.lock(), &mut out);
+            if let Some(why) = &requests.refused { tracing::error!(reason = %why, "Docker socket refused daemon mutation"); break; }
             if !out.is_empty() && up.write_all(&out).await.is_err() {
                 break;
+            }
+        }
+        // A partially gathered create has never forwarded even its header. Retiring only
+        // these exact unsubmitted intents needs no daemon absence/timeout assumption.
+        for item in pending.lock().iter_mut().filter(|p| !p.submitted) {
+            if let Some(operation) = item.operation.take() && let Err(e) = operation.not_submitted() {
+                tracing::error!(error = %e, "U03: could not retire unsubmitted Docker request evidence");
             }
         }
         let _ = up.shutdown(Shutdown::Write);
@@ -1507,9 +1770,10 @@ async fn connection(stream: hyper_rt::local::LocalStream, daemon: PathBuf, leg: 
         while let Ok(n @ 1..) = up.read(&mut buf).await {
             out.clear();
             answers.feed(buf.get(..n).unwrap_or_default(), &leg.names, &mut pending.lock(), &mut out);
-            if !out.is_empty() && stream.write_all(&out).await.is_err() {
+            if open && !out.is_empty() && stream.write_all(&out).await.is_err() {
                 open = false;
-                break;
+                // U03: the client no longer wants the answer, but its owned daemon request
+                // still needs a completed response before cleanup can release capacity.
             }
         }
         out.clear();
@@ -1562,6 +1826,88 @@ fn snapshotter_root(info: &str, id: &str, mountinfo: &str) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn w07_ac04_managed_socket_deep_base_private_distinct_owners() -> anyhow::Result<()> {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let workspace = tempfile::tempdir()?;
+        let deep = workspace.path().join("é".repeat(80));
+        std::fs::create_dir(&deep)?;
+        let first = managed_directory(&deep)?;
+        let second = managed_directory(&deep)?;
+        assert_ne!(first.path(), second.path());
+        assert!(!first.path().starts_with(&deep));
+        let metadata = std::fs::symlink_metadata(first.path())?;
+        assert!(metadata.is_dir() && !metadata.file_type().is_symlink());
+        assert_eq!(metadata.uid(), nix::unistd::geteuid().as_raw());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        let at = first.path().to_owned();
+        drop(first);
+        assert!(!at.exists());
+        assert!(second.path().is_dir());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn w07_ac04_managed_socket_drop_cancel_and_failed_bind() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            use futures::FutureExt as _;
+            async fn removed(path: &Path) -> anyhow::Result<()> {
+                for _ in 0..200 {
+                    if !path.exists() { return Ok(()) }
+                    crate::rt::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                anyhow::bail!("managed socket directory survived listener shutdown: {}", path.display())
+            }
+            let admission = super::super::processes::Admission::private(&tempfile::tempdir()?.keep())?;
+            let other = super::super::processes::Admission::private(&tempfile::tempdir()?.keep())?;
+            let execution = super::super::processes::Execution::new_in(admission.clone(), admission.root().join("work"), "socket-fixture".into(), Some(1));
+            let names = || super::super::processes::within(Some(Arc::clone(&execution)), || Names::for_leg("socket-fixture", None));
+            let journal = super::super::docker::daemon::Journal::execution_in(admission.clone(), &execution.label());
+            let at = admission.root().join("s");
+            let wrong_domain = super::super::docker::daemon::Journal::execution_in(other, &execution.label());
+            assert!(Socket::listen_in(at.clone(), PathBuf::new(), names(), wrong_domain).await.is_err());
+            let wrong_label = super::super::docker::daemon::Journal::execution_in(admission.clone(), "kiln.execution=other");
+            assert!(Socket::listen_in(at.clone(), PathBuf::new(), names(), wrong_label).await.is_err());
+            assert!(Socket::listen_in(at.clone(), PathBuf::new(), Names::default(), journal.clone()).await.is_err());
+            assert!(!at.exists(), "mismatched/missing managed ownership never admits a listener");
+            let owned = Socket::listen_in(at.clone(), PathBuf::new(), names(), journal.clone()).await?;
+            drop(owned);
+            removed(&at).await?;
+            journal.quiesce()?;
+            assert!(Socket::listen(at.clone(), PathBuf::new(), names()).await.is_err(), "the default listener must honor the captured private owner's quiesced journal");
+            assert!(!at.exists(), "captured private ownership cannot fall back to production");
+            let first = Socket::listen_managed(PathBuf::from("/not-a-daemon"), Names::default()).await?;
+            let second = Socket::listen_managed(PathBuf::from("/not-a-daemon"), Names::default()).await?;
+            assert_ne!(first.path(), second.path());
+            // Actual connects exercise the existing listener, without a real Docker daemon.
+            drop(hyper_rt::local::LocalStream::connect(first.path()).await?);
+            let directory = first.path().parent().ok_or_else(|| anyhow::anyhow!("no socket parent"))?.to_owned();
+            drop(first);
+            removed(&directory).await?;
+            drop(hyper_rt::local::LocalStream::connect(second.path()).await?);
+            let directory = second.path().parent().ok_or_else(|| anyhow::anyhow!("no socket parent"))?.to_owned();
+            drop(second);
+            removed(&directory).await?;
+
+            let directory = managed_directory(Path::new("/tmp"))?;
+            let at = directory.path().to_owned();
+            // One poll spawns the listener but cannot receive its readiness on this shard yet.
+            let mut pending = Box::pin(Socket::listen_owned(at.join("s"), PathBuf::new(), Names::default(), None, Some(directory)));
+            assert!(pending.as_mut().now_or_never().is_none());
+            drop(pending);
+            removed(&at).await?;
+
+            let directory = managed_directory(Path::new("/tmp"))?;
+            let at = directory.path().to_owned();
+            std::fs::write(at.join("s"), b"occupied")?;
+            assert!(Socket::listen_owned(at.join("s"), PathBuf::new(), Names::default(), None, Some(directory)).await.is_err());
+            removed(&at).await?;
+            Ok(())
+        })
+    }
+
     use super::*;
 
     fn leg() -> Paths {
@@ -1677,6 +2023,54 @@ mod tests {
         r
     }
 
+    #[test]
+    fn u03_socket_create_owns_late_commit_until_complete_response() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?.keep();
+        let admission = super::super::processes::Admission::private(&root)?;
+        let journal = super::super::docker::daemon::Journal::at_in(root.join("daemon"), admission);
+        let leg = Leg { journal: Some(journal.clone()), names: Mutex::new(Names::for_leg("late-create", None)), ..Leg::default() };
+        let body = br#"{"Image":"fixture"}"#;
+        let request = format!("POST /containers/create?name=late HTTP/1.1\r\nContent-Length: {}\r\n\r\n{}", body.len(), String::from_utf8_lossy(body));
+        let (mut requests, mut pending, mut sent) = (Requests::default(), VecDeque::new(), Vec::new());
+        requests.feed(request.as_bytes(), &leg, &mut pending, &mut sent);
+        assert!(requests.refused.is_none());
+        assert!(!sent.is_empty());
+        journal.quiesce()?;
+        assert!(journal.drained().is_err(), "an empty cleanup list cannot discharge the delayed create");
+        let mut answers = Answers::default();
+        let mut received = Vec::new();
+        answers.feed(b"HTTP/1.1 201 Created\r\nContent-Length: 4\r\n\r\nnu", &leg.names, &mut pending, &mut received);
+        assert!(journal.drained().is_err(), "a partial response is still an owned active operation");
+        answers.feed(b"ll", &leg.names, &mut pending, &mut received);
+        journal.drained()?;
+        requests.feed(request.as_bytes(), &leg, &mut pending, &mut Vec::new());
+        assert!(requests.refused.is_some(), "quiesce rejects creates on already-open connections");
+        Ok(())
+    }
+
+    #[test]
+    fn u03_external_deployment_is_not_reclassified_as_ci_infrastructure() {
+        assert!(managed_mutation("/v1.45/containers/create?name=builder"));
+        assert!(managed_mutation("/v1.45/build?version=2"));
+        assert!(!managed_mutation("/v1.45/services/create"));
+        assert!(!managed_mutation("/v1.45/swarm/init"));
+    }
+
+    #[test]
+    fn u03_socket_disconnect_preserves_unknown_create_recovery() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?.keep();
+        let admission = super::super::processes::Admission::private(&root)?;
+        let journal = super::super::docker::daemon::Journal::at_in(root.join("daemon"), admission);
+        let leg = Leg { journal: Some(journal.clone()), names: Mutex::new(Names::for_leg("unknown-create", None)), ..Leg::default() };
+        let (mut requests, mut pending, mut sent) = (Requests::default(), VecDeque::new(), Vec::new());
+        requests.feed(b"POST /volumes/create HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}", &leg, &mut pending, &mut sent);
+        assert!(requests.refused.is_none());
+        drop(pending);
+        journal.quiesce()?;
+        assert!(journal.drained().is_err(), "losing the response cannot release capacity even if the daemon lists nothing yet");
+        Ok(())
+    }
+
     /// What `Requests` passes on for `input`, fed `step` bytes at a time.
     fn fed(input: &[u8], step: usize, leg: &Leg) -> Vec<u8> {
         fed_with(input, step, leg).0
@@ -1688,7 +2082,7 @@ mod tests {
         for piece in input.chunks(step.max(1)) {
             r.feed(piece, leg, &mut answers, &mut out);
         }
-        (out, answers)
+        (out, answers.into_iter().map(|p| p.answer).collect())
     }
 
     fn leg_of(paths: Paths, names: Names) -> Leg {
@@ -2158,7 +2552,7 @@ mod tests {
     /// What `Answers` gives the leg for `input`, fed `step` bytes at a time, its requests' answers
     /// `pending`.
     fn answered(input: &[u8], step: usize, names: &Mutex<Names>, pending: &[Answer]) -> Vec<u8> {
-        let (mut a, mut out, mut pending) = (Answers::default(), Vec::new(), pending.iter().copied().collect::<VecDeque<_>>());
+        let (mut a, mut out, mut pending) = (Answers::default(), Vec::new(), pending.iter().copied().map(Pending::from).collect::<VecDeque<_>>());
         for piece in input.chunks(step.max(1)) {
             a.feed(piece, names, &mut pending, &mut out);
         }
@@ -2257,6 +2651,7 @@ mod tests {
     /// The host's Docker through a leg's socket: what a container the leg runs mounts is the leg's
     /// own, found where the host has it, both ways; its output streams back as it does from the
     /// host's own socket.
+    #[cfg(unix)]
     #[test]
     fn w13_r04_docker_through_the_legs_socket() -> anyhow::Result<()> {
         let Some(bin) = super::super::docker::find() else { return Ok(()) };
@@ -2268,11 +2663,13 @@ mod tests {
         let root = tmp.path().join("root");
         std::fs::create_dir_all(root.join("home/runner/probe"))?;
         std::fs::write(root.join("home/runner/probe/f"), "the leg's own")?;
-        let (at, config) = (tmp.path().join("leg.sock"), tmp.path().join("config"));
+        let config = tmp.path().join("config");
         let user = super::super::docker::host_user().map(|(u, g)| format!("{u}:{g}")).unwrap_or_else(|| "0:0".to_owned());
         let leg_root = root.clone();
         let out = crate::rt::block_on(async move {
-            let socket = Socket::listen(at.clone(), PathBuf::from("/var/run/docker.sock"), Names::default()).await?;
+            // W13-R04: use the production owned socket allocation, independent of data depth.
+            let socket = Socket::listen_managed(PathBuf::from("/var/run/docker.sock"), Names::default()).await?;
+            let at = socket.path().to_path_buf();
             socket.set_paths(Paths::new(Some(leg_root), Vec::new()));
             let cli = super::super::docker::Cli::new(&bin, config);
             let env = std::collections::BTreeMap::from([("DOCKER_HOST".to_owned(), format!("unix://{}", at.display()))]);

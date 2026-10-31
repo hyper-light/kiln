@@ -1191,8 +1191,9 @@ turn (`harness/pause.rs`):
   (an older kiln: it stops again at its stop point as it resumes, or leaves a command it doesn't
   know) is said after a few seconds, with the way to upgrade it, and at a stop point with what
   works on it: resuming with the stop point off.
-- **Restarts.** A pause, its timer, its stop point and going on elsewhere are kept with the session
-  on its machine (the runner's `harness.json`, the server's `local.json`) and go on after a restart.
+- **Restarts.** A pause, its timer, its stop point and going on elsewhere persist with session
+  control in the host's canonical Amphora Records namespaces and recover after restart. Legacy
+  `harness.json` and `local.json` are migration inputs, not continuing control writers.
 - **Queued meanwhile.** While it is paused the composer queues (its words and button say so), and
   what is queued waits for the reset; nothing queued can jump the pause (no steer, no send now).
 

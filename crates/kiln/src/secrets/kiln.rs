@@ -1,15 +1,14 @@
 //! kiln's own secrets backend: versions in kiln's store, each value sealed with AES-256-GCM under
-//! a data key of this backend's own, the data keys wrapped by the server's master key (the one
-//! the secret store keeps, docs/ci.md W09). Each ciphertext is bound to its scope, name and
+//! the shared data key, wrapped by the server's master key (docs/ci.md W09, U09).
+//! CI scopes use this same value, key, version and rotation implementation. Each ciphertext is bound to its scope, name and
 //! version, so none can be moved to another row. The last [`KEPT_VERSIONS`] versions of a secret
 //! keep their values; older ones keep only their record. Each read for a delivery is recorded.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use aws_lc_rs::aead::{AES_256_GCM, Aad, LessSafeKey, NONCE_LEN, Nonce, UnboundKey};
-use aws_lc_rs::rand::{SecureRandom, SystemRandom};
-use rusqlite::{Connection, OptionalExtension, params};
+use super::crypto::{random, seal};
+use crate::sql::{Connection, OptionalExtension, params};
 
 use super::{Backend, Bundle, Fut, KEPT_VERSIONS, Meta, Read, Scope, Use, Value, Version};
 use crate::hub::Hub;
@@ -27,16 +26,6 @@ impl KilnBackend {
     }
 }
 
-fn random<const N: usize>() -> anyhow::Result<[u8; N]> {
-    let mut b = [0u8; N];
-    SystemRandom::new().fill(&mut b).map_err(|_| anyhow::anyhow!("the system's random source failed"))?;
-    Ok(b)
-}
-
-fn aead(k: &[u8; 32]) -> anyhow::Result<LessSafeKey> {
-    Ok(LessSafeKey::new(UnboundKey::new(&AES_256_GCM, k).map_err(|_| anyhow::anyhow!("a bad data key"))?))
-}
-
 /// What binds a value's ciphertext to its row.
 fn aad(scope: &str, name: &str, version: u32) -> Vec<u8> {
     format!("kiln secret\0{scope}\0{name}\0{version}").into_bytes()
@@ -46,28 +35,17 @@ fn key_aad(id: &str) -> Vec<u8> {
     format!("kiln secret key\0{id}").into_bytes()
 }
 
-fn seal(k: &[u8; 32], plain: &[u8], aad: &[u8]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
-    let nonce: [u8; NONCE_LEN] = random()?;
-    let mut buf = plain.to_vec();
-    aead(k)?.seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce), Aad::from(aad), &mut buf).map_err(|_| anyhow::anyhow!("sealing failed"))?;
-    Ok((buf, nonce.to_vec()))
-}
-
 fn open(k: &[u8; 32], sealed: &[u8], nonce: &[u8], aad: &[u8]) -> anyhow::Result<Value> {
-    let n: [u8; NONCE_LEN] = nonce.try_into().map_err(|_| anyhow::anyhow!("a bad nonce"))?;
-    let mut buf = sealed.to_vec();
-    let len = aead(k)?.open_in_place(Nonce::assume_unique_for_key(n), Aad::from(aad), &mut buf).map_err(|_| anyhow::anyhow!("a secret doesn't decrypt: the master key or the store changed"))?.len();
-    buf.truncate(len);
-    Ok(Value::new(buf))
+    Ok(Value::new(super::crypto::open(k, sealed, nonce, aad)?))
 }
 
 /// Every data key, unwrapped, by id.
-fn keys(hub: &Hub, c: &Connection) -> anyhow::Result<HashMap<String, [u8; 32]>> {
+fn keys(master: &[u8; 32], c: &Connection) -> anyhow::Result<HashMap<String, [u8; 32]>> {
     let mut q = c.prepare("SELECT id, wrapped, nonce FROM secret_keys")?;
     let rows = q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, Vec<u8>>(2)?)))?.collect::<Result<Vec<_>, _>>()?;
     let mut out = HashMap::new();
     for (id, wrapped, nonce) in rows {
-        let plain = crate::ci::secrets::open_master(hub, &wrapped, &nonce, &key_aad(&id))?;
+        let plain = super::crypto::open(master, &wrapped, &nonce, &key_aad(&id))?;
         let k: [u8; 32] = plain.as_slice().try_into().map_err(|_| anyhow::anyhow!("data key {id} isn't 32 bytes"))?;
         out.insert(id, k);
     }
@@ -75,24 +53,24 @@ fn keys(hub: &Hub, c: &Connection) -> anyhow::Result<HashMap<String, [u8; 32]>> 
 }
 
 /// A new data key, kept wrapped.
-fn new_key(hub: &Hub, c: &Connection) -> anyhow::Result<(String, [u8; 32])> {
+fn new_key(master: &[u8; 32], c: &Connection) -> anyhow::Result<(String, [u8; 32])> {
     let (id, k) = (crate::util::new_id(), random::<32>()?);
-    let (wrapped, nonce) = crate::ci::secrets::seal_master(hub, &k, &key_aad(&id))?;
+    let (wrapped, nonce) = super::crypto::seal(master, &k, &key_aad(&id))?;
     c.execute("INSERT INTO secret_keys (id, wrapped, nonce, created_at) VALUES (?1, ?2, ?3, ?4)", params![id, wrapped, nonce, crate::util::now_unix()])?;
     Ok((id, k))
 }
 
 /// The data key new values are sealed under: the newest not retired, made at first use.
-fn current_key(hub: &Hub, c: &Connection) -> anyhow::Result<(String, [u8; 32])> {
+fn current_key(master: &[u8; 32], c: &Connection) -> anyhow::Result<(String, [u8; 32])> {
     let row: Option<(String, Vec<u8>, Vec<u8>)> =
         c.query_row("SELECT id, wrapped, nonce FROM secret_keys WHERE retired_at IS NULL ORDER BY created_at DESC, id DESC LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
     match row {
         Some((id, wrapped, nonce)) => {
-            let plain = crate::ci::secrets::open_master(hub, &wrapped, &nonce, &key_aad(&id))?;
+            let plain = super::crypto::open(master, &wrapped, &nonce, &key_aad(&id))?;
             let k: [u8; 32] = plain.as_slice().try_into().map_err(|_| anyhow::anyhow!("data key {id} isn't 32 bytes"))?;
             Ok((id, k))
         }
-        None => new_key(hub, c),
+        None => new_key(master, c),
     }
 }
 
@@ -140,26 +118,11 @@ impl Backend for KilnBackend {
     fn put<'a>(&'a self, at: &'a Scope, name: &'a str, value: Value, by: &'a str) -> Fut<'a, Meta> {
         let (scope, name, by, hub) = (at.key(), name.to_owned(), by.to_owned(), Arc::clone(&self.hub));
         Box::pin(async move {
+            let master = super::crypto::master(&hub)?;
             self.hub
                 .store
                 .call(move |c| {
-                    let tx = crate::store::tx(c)?;
-                    let last: Option<u32> = tx.query_row("SELECT MAX(version) FROM secret_versions WHERE scope = ?1 AND name = ?2", params![scope, name], |r| r.get(0))?;
-                    let version = last.unwrap_or(0) + 1;
-                    let (key_id, k) = current_key(&hub, &tx)?;
-                    let (sealed, nonce) = seal(&k, value.bytes(), &aad(&scope, &name, version))?;
-                    let (size, now) = (value.len(), crate::util::now_unix());
-                    tx.execute(
-                        "INSERT INTO secret_versions (scope, name, version, ciphertext, nonce, key_id, size, set_by, set_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                        params![scope, name, version, sealed, nonce, key_id, i64::try_from(size).unwrap_or(0), by, now],
-                    )?;
-                    // Older versions than those kept keep their record, not their value.
-                    tx.execute(
-                        "UPDATE secret_versions SET ciphertext = NULL, nonce = NULL, key_id = NULL WHERE scope = ?1 AND name = ?2 AND version <= ?3 AND ciphertext IS NOT NULL",
-                        params![scope, name, version.saturating_sub(KEPT_VERSIONS)],
-                    )?;
-                    tx.commit()?;
-                    Ok(Meta { name, version, size, set_by: by, set_at: now })
+                    put_value(&master, c, &scope, &name, value, &by, None)
                 })
                 .await
         })
@@ -171,17 +134,7 @@ impl Backend for KilnBackend {
             self.hub
                 .store
                 .call(move |c| {
-                    let tx = crate::store::tx(c)?;
-                    let last: Option<(u32, bool)> = tx
-                        .query_row("SELECT version, deleted FROM secret_versions WHERE scope = ?1 AND name = ?2 ORDER BY version DESC LIMIT 1", params![scope, name], |r| Ok((r.get(0)?, r.get(1)?)))
-                        .optional()?;
-                    let Some((version, false)) = last else { return Ok(false) };
-                    tx.execute(
-                        "INSERT INTO secret_versions (scope, name, version, size, set_by, set_at, deleted) VALUES (?1, ?2, ?3, 0, ?4, ?5, 1)",
-                        params![scope, name, version + 1, by, crate::util::now_unix()],
-                    )?;
-                    tx.commit()?;
-                    Ok(true)
+                    delete_value(c, &scope, &name, &by)
                 })
                 .await
         })
@@ -190,30 +143,17 @@ impl Backend for KilnBackend {
     fn resolve<'a>(&'a self, at: &'a Scope, want: &'a [(String, u32)], why: &'a Use) -> Fut<'a, Bundle> {
         let (scope, hub, by, purpose, want) = (at.key(), Arc::clone(&self.hub), why.by.clone(), why.purpose.clone(), want.to_vec());
         Box::pin(async move {
+            let master = super::crypto::master(&hub)?;
             self.hub
                 .store
                 .call(move |c| {
-                    let keys = keys(&hub, c)?;
                     let mut items = Vec::with_capacity(want.len());
                     for (name, version) in want {
-                        let row: Option<(Option<Vec<u8>>, Option<Vec<u8>>, Option<String>)> = c
-                            .query_row("SELECT ciphertext, nonce, key_id FROM secret_versions WHERE scope = ?1 AND name = ?2 AND version = ?3", params![scope, name, version], |r| {
-                                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-                            })
-                            .optional()?;
-                        let Some(row) = row else { anyhow::bail!("secret {name} has no version {version}") };
-                        let (Some(sealed), Some(nonce), Some(key_id)) = row else {
-                            anyhow::bail!("secret {name} v{version}'s value is no longer kept (only the last {KEPT_VERSIONS} are): release again, to deliver its current version")
-                        };
-                        let k = keys.get(&key_id).ok_or_else(|| anyhow::anyhow!("secret {name}: its data key is gone"))?;
-                        items.push((name.clone(), version, open(k, &sealed, &nonce, &aad(&scope, &name, version))?));
+                        let value = read_value(&master, c, &scope, &name, version)?;
+                        items.push((name, version, value));
                     }
                     let bundle = Bundle { items, expires_at: None };
-                    c.execute("INSERT INTO secret_reads (scope, by_whom, purpose, versions, at) VALUES (?1, ?2, ?3, ?4, ?5)", params![scope, by, purpose, bundle.versions(), crate::util::now_unix()])?;
-                    c.execute(
-                        "DELETE FROM secret_reads WHERE scope = ?1 AND id <= (SELECT id FROM secret_reads WHERE scope = ?1 ORDER BY id DESC LIMIT 1 OFFSET ?2)",
-                        params![scope, KEPT_READS],
-                    )?;
+                    record_read(c, &scope, &by, &purpose, &bundle.versions())?;
                     Ok(bundle)
                 })
                 .await
@@ -258,28 +198,11 @@ impl Backend for KilnBackend {
     fn rotate(&self) -> Fut<'_, usize> {
         let hub = Arc::clone(&self.hub);
         Box::pin(async move {
+            let master = super::crypto::master(&hub)?;
             self.hub
                 .store
                 .call(move |c| {
-                    let tx = crate::store::tx(c)?;
-                    let old = keys(&hub, &tx)?;
-                    let (new_id, fresh) = new_key(&hub, &tx)?;
-                    let rows: Vec<(String, String, u32, Vec<u8>, Vec<u8>, String)> = {
-                        let mut q = tx.prepare("SELECT scope, name, version, ciphertext, nonce, key_id FROM secret_versions WHERE ciphertext IS NOT NULL")?;
-                        let r = q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?;
-                        r.collect::<Result<Vec<_>, _>>()?
-                    };
-                    for (scope, name, version, sealed, nonce, key_id) in &rows {
-                        let k = old.get(key_id).ok_or_else(|| anyhow::anyhow!("secret {name}: its data key is gone"))?;
-                        let ad = aad(scope, name, *version);
-                        let plain = open(k, sealed, nonce, &ad)?;
-                        let (resealed, n) = seal(&fresh, plain.bytes(), &ad)?;
-                        tx.execute("UPDATE secret_versions SET ciphertext = ?4, nonce = ?5, key_id = ?6 WHERE scope = ?1 AND name = ?2 AND version = ?3", params![scope, name, version, resealed, n, new_id])?;
-                    }
-                    tx.execute("UPDATE secret_keys SET retired_at = ?2 WHERE id != ?1 AND retired_at IS NULL", params![new_id, crate::util::now_unix()])?;
-                    tx.execute("DELETE FROM secret_keys WHERE retired_at IS NOT NULL AND id NOT IN (SELECT key_id FROM secret_versions WHERE key_id IS NOT NULL)", [])?;
-                    tx.commit()?;
-                    Ok(rows.len())
+                    rotate_values(&master, c)
                 })
                 .await
         })
@@ -307,6 +230,124 @@ impl Backend for KilnBackend {
                 .await
         })
     }
+}
+
+// U09: CI and deployments use this one transactional value/key lifecycle.
+pub(crate) fn put_value(master: &[u8; 32], c: &Connection, scope: &str, name: &str, value: Value, by: &str, broker: Option<&str>) -> anyhow::Result<Meta> {
+    let tx = crate::store::tx(c)?;
+    let last: Option<u32> = tx.query_row("SELECT MAX(version) FROM secret_versions WHERE scope = ?1 AND name = ?2", params![scope, name], |r| r.get(0))?;
+    let version = last.unwrap_or(0).checked_add(1).ok_or_else(|| anyhow::anyhow!("secret version exhausted"))?;
+    let (key_id, k) = current_key(master, &tx)?;
+    let (sealed, nonce) = seal(&k, value.bytes(), &aad(scope, name, version))?;
+    let (size, now) = (value.len(), crate::util::now_unix());
+    tx.execute(
+        "INSERT INTO secret_versions (scope, name, version, ciphertext, nonce, key_id, size, set_by, set_at, broker) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![scope, name, version, sealed, nonce, key_id, i64::try_from(size).unwrap_or(0), by, now, broker],
+    )?;
+    // Older versions than those kept keep their record, not their value.
+    tx.execute(
+        "UPDATE secret_versions SET ciphertext = NULL, nonce = NULL, key_id = NULL WHERE scope = ?1 AND name = ?2 AND version <= ?3 AND ciphertext IS NOT NULL",
+        params![scope, name, version.saturating_sub(KEPT_VERSIONS)],
+    )?;
+    tx.commit()?;
+    Ok(Meta { name: name.to_owned(), version, size, set_by: by.to_owned(), set_at: now })
+}
+
+// U09: CI and deployments use this one transactional value/key lifecycle.
+pub(crate) fn delete_value(c: &Connection, scope: &str, name: &str, by: &str) -> anyhow::Result<bool> {
+    let tx = crate::store::tx(c)?;
+    let last: Option<(u32, bool)> = tx
+        .query_row("SELECT version, deleted FROM secret_versions WHERE scope = ?1 AND name = ?2 ORDER BY version DESC LIMIT 1", params![scope, name], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    let Some((version, false)) = last else { return Ok(false) };
+    tx.execute(
+        "INSERT INTO secret_versions (scope, name, version, size, set_by, set_at, deleted) VALUES (?1, ?2, ?3, 0, ?4, ?5, 1)",
+        params![scope, name, version.checked_add(1).ok_or_else(|| anyhow::anyhow!("secret version exhausted"))?, by, crate::util::now_unix()],
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
+// U09: CI and deployments use this one transactional value/key lifecycle.
+pub(crate) fn rotate_values(master: &[u8; 32], c: &Connection) -> anyhow::Result<usize> {
+    import_ci(master, c)?;
+    let tx = crate::store::tx(c)?;
+    let old = keys(master, &tx)?;
+    let (new_id, fresh) = new_key(master, &tx)?;
+    let rows: Vec<(String, String, u32, Vec<u8>, Vec<u8>, String)> = {
+        let mut q = tx.prepare("SELECT scope, name, version, ciphertext, nonce, key_id FROM secret_versions WHERE ciphertext IS NOT NULL")?;
+        let r = q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?;
+        r.collect::<Result<Vec<_>, _>>()?
+    };
+    for (scope, name, version, sealed, nonce, key_id) in &rows {
+        let k = old.get(key_id).ok_or_else(|| anyhow::anyhow!("secret {name}: its data key is gone"))?;
+        let ad = aad(scope, name, *version);
+        let plain = open(k, sealed, nonce, &ad)?;
+        let (resealed, n) = seal(&fresh, plain.bytes(), &ad)?;
+        tx.execute("UPDATE secret_versions SET ciphertext = ?4, nonce = ?5, key_id = ?6 WHERE scope = ?1 AND name = ?2 AND version = ?3", params![scope, name, version, resealed, n, new_id])?;
+    }
+    tx.execute("UPDATE secret_keys SET retired_at = ?2 WHERE id != ?1 AND retired_at IS NULL", params![new_id, crate::util::now_unix()])?;
+    tx.execute("DELETE FROM secret_keys WHERE retired_at IS NOT NULL AND id NOT IN (SELECT key_id FROM secret_versions WHERE key_id IS NOT NULL)", [])?;
+    tx.commit()?;
+    Ok(rows.len())
+}
+
+/// U09: restartable ciphertext import, committed together with retiring the legacy copies.
+/// Scope encodings and legacy AAD are explicit; no row can cross a trust boundary on import.
+pub(crate) fn import_ci(master: &[u8; 32], c: &Connection) -> anyhow::Result<()> {
+    loop {
+        let pending: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM ci_secrets WHERE ciphertext IS NOT NULL)", [], |r| r.get(0))?;
+        if !pending {
+            c.execute("DELETE FROM ci_keys", [])?;
+            return Ok(());
+        }
+        let tx = crate::store::tx(c)?;
+        let (key_id, key) = current_key(master, &tx)?;
+        let rows = {
+            let mut q = tx.prepare("SELECT scope_kind, scope_id, name, ciphertext, nonce, key_id, size, created_by, updated_at, broker FROM ci_secrets WHERE ciphertext IS NOT NULL ORDER BY id LIMIT 128")?;
+            q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, Vec<u8>>(3)?, r.get::<_, Vec<u8>>(4)?, r.get::<_, String>(5)?, r.get::<_, i64>(6)?, r.get::<_, String>(7)?, r.get::<_, i64>(8)?, r.get::<_, Option<String>>(9)?)))?.collect::<Result<Vec<_>, _>>()?
+        };
+        for (kind, scope_id, name, sealed, nonce, old_id, size, by, at, broker) in rows {
+            anyhow::ensure!(kind == "integration" || kiln_ci::secrets::ScopeKind::parse(&kind).is_some(), "unknown legacy secret scope kind");
+            let scope = format!("ci/{kind}/{scope_id}");
+            let (wrapped, key_nonce): (Vec<u8>, Vec<u8>) = tx.query_row("SELECT wrapped, nonce FROM ci_keys WHERE id = ?1", [&old_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            let raw = Value::new(super::crypto::open(master, &wrapped, &key_nonce, format!("kiln data key\0{old_id}").as_bytes())?);
+            let old: &[u8; 32] = raw.bytes().try_into().map_err(|_| anyhow::anyhow!("legacy data key isn't 32 bytes"))?;
+            let plain = Value::new(super::crypto::open(old, &sealed, &nonce, format!("kiln secret\0{kind}\0{scope_id}\0{name}").as_bytes())?);
+            let (sealed, nonce) = seal(&key, plain.bytes(), &aad(&scope, &name, 1))?;
+            // A collision is refused rather than silently replacing an already versioned value.
+            tx.execute("INSERT INTO secret_versions (scope, name, version, ciphertext, nonce, key_id, size, set_by, set_at, broker) VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6, ?7, ?8, ?9)", params![scope, name, sealed, nonce, key_id, size, by, at, broker])?;
+            tx.execute("UPDATE ci_secrets SET ciphertext = NULL, nonce = NULL, key_id = NULL WHERE scope_kind = ?1 AND scope_id = ?2 AND name = ?3", params![kind, scope_id, name])?;
+        }
+        tx.execute("DELETE FROM ci_keys WHERE id NOT IN (SELECT key_id FROM ci_secrets WHERE key_id IS NOT NULL)", [])?;
+        tx.commit()?;
+    }
+}
+
+/// U09: decrypt a particular immutable version for both delivery adapters.
+pub(crate) fn read_value(master: &[u8; 32], c: &Connection, scope: &str, name: &str, version: u32) -> anyhow::Result<Value> {
+    let row: Option<(Option<Vec<u8>>, Option<Vec<u8>>, Option<String>)> = c.query_row(
+        "SELECT ciphertext, nonce, key_id FROM secret_versions WHERE scope = ?1 AND name = ?2 AND version = ?3", params![scope, name, version], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+    ).optional()?;
+    let Some(row) = row else { anyhow::bail!("secret {name} has no version {version}") };
+    let (Some(sealed), Some(nonce), Some(key_id)) = row else {
+        anyhow::bail!("secret {name} v{version}'s value is no longer kept (only the last {KEPT_VERSIONS} are): release again, to deliver its current version")
+    };
+    let (wrapped, key_nonce): (Vec<u8>, Vec<u8>) = c.query_row("SELECT wrapped, nonce FROM secret_keys WHERE id = ?1", [&key_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    let plain = Value::new(super::crypto::open(master, &wrapped, &key_nonce, &key_aad(&key_id))?);
+    let key: &[u8; 32] = plain.bytes().try_into().map_err(|_| anyhow::anyhow!("data key isn't 32 bytes"))?;
+    open(key, &sealed, &nonce, &aad(scope, name, version))
+}
+
+pub(crate) fn latest(c: &Connection, scope: &str, name: &str) -> anyhow::Result<Option<u32>> {
+    Ok(c.query_row("SELECT version FROM secret_versions WHERE scope = ?1 AND name = ?2 ORDER BY version DESC LIMIT 1", params![scope, name], |r| r.get(0)).optional()?)
+}
+
+/// U09: bounded metadata-only read history, shared by every delivery adapter.
+pub(crate) fn record_read(c: &Connection, scope: &str, by: &str, purpose: &str, versions: &str) -> anyhow::Result<()> {
+    c.execute("INSERT INTO secret_reads (scope, by_whom, purpose, versions, at) VALUES (?1, ?2, ?3, ?4, ?5)", params![scope, by, purpose, versions, crate::util::now_unix()])?;
+    c.execute("DELETE FROM secret_reads WHERE scope = ?1 AND id <= (SELECT id FROM secret_reads WHERE scope = ?1 ORDER BY id DESC LIMIT 1 OFFSET ?2)", params![scope, KEPT_READS])?;
+    Ok(())
 }
 
 #[cfg(test)]

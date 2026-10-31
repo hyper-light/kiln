@@ -18,7 +18,7 @@ pub struct Declared {
     pub facts: BTreeMap<String, String>,
     /// Commands whose output is read as a version (`cuda = "nvcc --version"`).
     pub probes: BTreeMap<String, String>,
-    /// The most `kiln/cache@v1`'s local tier keeps in `<work>/_cache` (`cache_max = "20G"`; 10G
+    /// The shared runner chunk budget in `<work>/_cache` (`cache_max = "20G"`; 10G
     /// when unset, docs/ci.md W08-R09).
     pub cache_max: Option<String>,
     /// The most agent sessions this machine has at work at once (`max_agent_sessions = 128`; from 1

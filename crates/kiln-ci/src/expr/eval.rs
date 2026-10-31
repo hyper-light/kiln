@@ -108,6 +108,21 @@ impl Evaluator<'_> {
                 _ => return Value::Null,
             };
             if let Some(Value::Object(o)) = self.cx.get(ctx) {
+                // The GitHub-shaped context stays normalized; v1's bare `event` keeps its
+                // documented vocabulary for both newly triggered and imported workflows.
+                if name.eq_ignore_ascii_case("event") {
+                    match o.get(key) {
+                        Some(Value::String(event)) if event.as_ref() == "workflow_dispatch" => return Value::str("manual"),
+                        Some(Value::String(event)) if event.as_ref() == "push" => {
+                            let tag = matches!(o.get("ref_type"), Some(Value::String(kind)) if kind.as_ref() == "tag")
+                                || matches!(o.get("ref"), Some(Value::String(git_ref)) if git_ref.starts_with("refs/tags/"));
+                            if tag {
+                                return Value::str("tag");
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 return o.get(key).cloned().unwrap_or(Value::Null);
             }
         }

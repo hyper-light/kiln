@@ -140,7 +140,7 @@ fn requested_mode_model_and_effort_are_applied_in_order_before_the_first_prompt(
     let prompt = request(&mut core, "session/prompt")?;
     assert_eq!(prompt.pointer("/params/prompt"), Some(&json!([{"type": "text", "text": "work m1"}])));
     assert_eq!((core.state.mode.as_str(), core.state.model.as_str(), core.state.effort.as_str()), ("plan", "careful", "high"));
-    assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Started));
+    assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Sent));
     Ok(())
 }
 
@@ -164,7 +164,7 @@ fn a_failed_initial_permission_change_keeps_all_prompts_waiting() -> anyhow::Res
     reply(&mut a, &mut core, &correction, json!({"configOptions": options("ask", "default", "low")}));
     let prompt = request(&mut core, "session/prompt")?;
     assert_eq!(prompt.pointer("/params/prompt/0/text"), Some(&json!("work m1")));
-    assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Started));
+    assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Sent));
     assert_eq!(core.state.delivery.get("m2"), Some(&Delivery::Queued));
     Ok(())
 }
@@ -301,7 +301,7 @@ fn generic_controls_keep_their_order_while_a_turn_is_running() -> anyhow::Result
     reply(&mut a, &mut core, &style, json!({"configOptions": config(true, "long")}));
     assert_eq!(core.state.control_values.get("acp:verbose"), Some(&json!(true)));
     assert_eq!(core.state.control_values.get("acp:style"), Some(&json!("long")));
-    assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Started));
+    assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Sent));
     Ok(())
 }
 
@@ -332,7 +332,7 @@ fn startup_checks_its_mode_after_successful_setters_and_allows_an_explicit_corre
         reply(&mut a, &mut core, &mode, json!({"configOptions": options("ask", model, "low")}));
         let _prompt = request(&mut core, "session/prompt")?;
         assert_eq!(core.state.mode, "ask");
-        assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Started));
+        assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Sent));
     }
     Ok(())
 }
@@ -448,7 +448,7 @@ fn old_frozen_startups_keep_prompts_until_the_session_is_open() -> anyhow::Resul
         let prompt = request(&mut core, "session/prompt")?;
         assert_eq!(prompt.pointer("/params/sessionId"), Some(&json!("s1")));
         assert_eq!(prompt.pointer("/params/prompt"), Some(&json!([{"type": "text", "text": "work m1"}])));
-        assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Started));
+        assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Sent));
     }
     Ok(())
 }
@@ -593,7 +593,7 @@ fn an_empty_unpersisted_session_gets_one_new_session_after_signing_in() -> anyho
     reply(&mut a, &mut core, &new, json!({"sessionId": "s2", "configOptions": options("ask", "careful", "low")}));
     let prompt = request(&mut core, "session/prompt")?;
     assert_eq!(prompt.pointer("/params/sessionId"), Some(&json!("s2")));
-    assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Started));
+    assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Sent));
     Ok(())
 }
 
@@ -611,7 +611,7 @@ fn a_failed_account_reload_holds_prompts_and_another_sign_in_can_retry() -> anyh
     assert_eq!(load.pointer("/params/sessionId"), Some(&json!("s1")));
     reply(&mut a, &mut core, &load, json!({"configOptions": options("ask", "careful", "high")}));
     let _prompt = request(&mut core, "session/prompt")?;
-    assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Started));
+    assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Sent));
     Ok(())
 }
 

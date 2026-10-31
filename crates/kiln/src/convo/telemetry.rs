@@ -4,7 +4,9 @@
 //! at any time without asking the writer: what the console's System page shows, and what its
 //! dashboards chart.
 
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, AtomicI64};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
@@ -55,9 +57,35 @@ pub struct Meter {
     /// How long reads waited for their answer ([`WAIT_BUCKETS`]).
     waits: [AtomicU64; WAIT_BUCKETS],
     file: Mutex<FileView>,
+    // Current reserved input, including the brief pre-handoff reservation. These are gauges,
+    // not lifetime admission counts; rollback and terminal ownership transfer subtract them.
+    admitted_batches: AtomicU64,
+    admitted_bytes: AtomicU64,
+    full: AtomicU64,
+    refused: AtomicU64,
+    abandoned_failures: AtomicU64,
 }
 
 impl Meter {
+    pub(crate) fn admitted(&self, bytes: usize) {
+        self.admitted_batches.fetch_add(1, Ordering::Relaxed);
+        self.admitted_bytes.fetch_add(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
+    pub(crate) fn released(&self, bytes: usize) {
+        self.admitted_batches.fetch_sub(1, Ordering::Relaxed);
+        self.admitted_bytes.fetch_sub(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
+    pub(crate) fn refused(&self, full: bool) {
+        self.refused.fetch_add(1, Ordering::Relaxed);
+        if full { self.full.fetch_add(1, Ordering::Relaxed); }
+    }
+
+    pub(crate) fn abandoned_failure(&self) {
+        self.abandoned_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn committed(&self, rows: usize) {
         self.commits.fetch_add(1, Ordering::Relaxed);
         self.rows.fetch_add(rows as u64, Ordering::Relaxed);
@@ -103,6 +131,13 @@ impl Meter {
             timeouts: self.timeouts.load(Ordering::Relaxed),
             waits: self.waits.iter().map(|w| w.load(Ordering::Relaxed)).collect(),
             file: self.file.lock().unwrap_or_else(PoisonError::into_inner).clone(),
+            admission: AdmissionReport {
+                batches: self.admitted_batches.load(Ordering::Relaxed),
+                bytes: self.admitted_bytes.load(Ordering::Relaxed),
+                refused: self.refused.load(Ordering::Relaxed),
+                full: self.full.load(Ordering::Relaxed),
+                abandoned_failures: self.abandoned_failures.load(Ordering::Relaxed),
+            },
         }
     }
 }
@@ -193,6 +228,19 @@ pub struct StoreReport {
     pub timeouts: u64,
     pub waits: Vec<u64>,
     pub file: FileView,
+    #[serde(default)]
+    pub admission: AdmissionReport,
+}
+
+/// U05: current reserved/accepted input custody, including brief channel-handoff attempts.
+/// These are gauges, not lifetime admissions. Legacy dropped updates remain distinct.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdmissionReport {
+    pub batches: u64,
+    pub bytes: u64,
+    pub refused: u64,
+    pub full: u64,
+    pub abandoned_failures: u64,
 }
 
 /// What a runner says of one of its stores, every few seconds ([`super::feed::Msg::Stats`]).
@@ -216,8 +264,9 @@ pub fn version() -> String {
     crate::api::COMMIT.get(..7).map_or_else(|| env!("CARGO_PKG_VERSION").to_owned(), str::to_owned)
 }
 
-/// Where a feed's sending side stands ([`super::feed::Shipper`]): bumped as it goes.
+/// Where a feed's sending side stands (the legacy sender): bumped as it goes.
 #[derive(Default)]
+#[cfg(test)]
 pub struct ShipStats {
     up: AtomicBool,
     /// What the taker has, plus one (0: it hasn't said, on this link).
@@ -235,6 +284,7 @@ pub struct ShipStats {
     stalls: AtomicU64,
 }
 
+#[cfg(test)]
 impl ShipStats {
     pub fn link(&self, up: bool) {
         self.up.store(up, Ordering::Relaxed);
@@ -314,7 +364,7 @@ pub struct ShipView {
     pub stalls: u64,
 }
 
-/// Where a feed's taking side stands, for one store that feeds it ([`super::feed::Intake`]).
+/// Where a feed's taking side stands, for one store that feeds it (the legacy receiver).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerView {
     pub machine: String,

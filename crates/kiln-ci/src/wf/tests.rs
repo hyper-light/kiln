@@ -202,6 +202,27 @@ fn w02_r06_v1_forms() {
 }
 
 #[test]
+fn u04_schedule_validation_uses_execution_cron_and_timezone_rules() {
+    for cron in ["0 25 * * *", "61 * * * *", "*/0 * * * *", "0 0 * * MON-SUN", "@daily"] {
+        let src = format!("on:\n  schedule:\n    - cron: '{cron}'\njobs:\n  a:\n    runs-on: linux\n    steps: [{{run: echo}}]\n");
+        for dialect in [Dialect::Gha, Dialect::Kiln] {
+            let (_, d) = parse_workflow("ci.yaml", &src, dialect);
+            let message = crate::trigger::cron::Cron::parse(cron).err().unwrap_or_default();
+            assert!(d.iter().any(|d| d.is_error() && d.code == "KCI1019" && d.path == "on.schedule[0].cron" && d.range.start.line == 3 && d.message == message), "{dialect:?} {cron}: {d:?}");
+        }
+    }
+    for (timezone, code) in [("Mars/Olympus", "KCI1019"), ("[UTC]", "KCI1011")] {
+        let src = format!("on:\n  schedule:\n    - cron: '0 3 * * MON-FRI'\n      timezone: {timezone}\njobs:\n  a: {{steps: [{{run: echo}}]}}\n");
+        let (_, d) = kiln(&src);
+        assert!(d.iter().any(|d| d.is_error() && d.code == code && d.path == "on.schedule[0].timezone" && d.range.start.line == 4), "{d:?}");
+    }
+    let (_, d) = kiln("on:\n  schedule:\n    - '0 0 * JAN MON'\n    - cron: '*/15 6-18 * * MON-FRI'\n      timezone: Europe/Berlin\njobs:\n  a: {steps: [{run: echo}]}\n");
+    assert!(errors(&d).is_empty(), "{d:?}");
+    let (_, d) = gha("on:\n  schedule:\n    - cron: '0 0 * * *'\n      timezone: UTC\njobs:\n  a:\n    runs-on: linux\n    steps: [{run: echo}]\n");
+    assert!(codes(&d).contains(&"KCI5002"), "GitHub workflow timezone restriction remains: {d:?}");
+}
+
+#[test]
 fn w02_ac05_overlays() {
     let base = "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        os: [linux, macos]\n    steps:\n      - id: test\n        run: make test\n";
     let (wf, d) = gha(base);

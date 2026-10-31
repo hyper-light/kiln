@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail};
-use rusqlite::{OptionalExtension as _, params};
+use crate::sql::{OptionalExtension as _, params};
 use serde_json::{Value, json};
 
 use super::{BITBUCKET_PIPELINES, ExtJob, ExtRun, kiln_status, unix};

@@ -158,8 +158,8 @@ fn s3_store(prefix: &str) -> anyhow::Result<kiln::blobs::s3::S3Blobs> {
     kiln::blobs::s3::S3Blobs::new(&cfg, kiln::rt::clock(), kiln::blobs::s3::Limits::default())
 }
 
-/// Whether the store a lab's server keeps its bytes in holds `key`, with `sha256` as its etag.
-fn held(store: Store, data: &Path, prefix: Option<&str>, key: &str, sha256: &str) -> anyhow::Result<bool> {
+/// Whether the configured store holds `key` with the expected SHA-256 identity.
+fn held(server: &common::Server, store: Store, data: &Path, prefix: Option<&str>, key: &str, sha256: &str) -> anyhow::Result<bool> {
     use kiln_seams::blobs::Blobs as _;
     match (store, prefix) {
         (Store::S3, Some(p)) => {
@@ -169,9 +169,25 @@ fn held(store: Store, data: &Path, prefix: Option<&str>, key: &str, sha256: &str
             Ok(etag.as_deref() == Some(sha256))
         }
         _ => {
-            let db = rusqlite::Connection::open_with_flags(data.join("kiln.db"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-            let digest: Option<String> = db.query_row("SELECT digest FROM blob_keys WHERE key = ?1", [key], |r| r.get(0)).ok();
-            Ok(digest.as_deref() == Some(sha256))
+            use kiln_seams::blobs::Access;
+            // U05: observe the running server through its object contract. Opening its live
+            // database here would create another writer owner in the test process.
+            let signing_key: [u8; 32] = std::fs::read(data.join("blobs.key"))?.try_into().map_err(|_| anyhow::anyhow!("blobs.key isn't 32 bytes"))?;
+            let signer = kiln::blobs::local::LocalBlobs::new(kiln::store::Store::in_memory()?, data.join("cas"), kiln::rt::clock(), kiln::blobs::local::Limits::default(), kiln::blobs::local::Presign { base: format!("http://127.0.0.1:{}/api/blobs", server.port), key: signing_key });
+            let key = key.to_owned();
+            let signed_key = key.clone();
+            let url = kiln::rt::block_on(async move { Ok(signer.presign(&signed_key, Access::Get, Duration::from_secs(60)).await?) })?;
+            // U07, CP-T10.1: the HTTP object contract sends no ETag. Verify canonical
+            // bytes through the key instead of assuming metadata or another storage root.
+            let result = send(server.port, "GET", &path_of(&url), &[], b"")?;
+            // Missing objects deliberately share the presigned route's 403 refusal. Other
+            // statuses are errors, so a failed transfer cannot prove deletion or rejection.
+            anyhow::ensure!(matches!(result.status, 200 | 403), "observing {key}: HTTP {}", result.status);
+            if result.status == 403 {
+                return Ok(false);
+            }
+            anyhow::ensure!(result.header("content-length").parse::<usize>()? == result.body.len(), "observing {key}: incomplete body");
+            Ok(hex::encode(Sha256::digest(&result.body)) == sha256)
         }
     }
 }
@@ -286,7 +302,7 @@ fn ci_lab(store: Store) -> anyhow::Result<()> {
     // Both are in the store, at cas/<sha256>, and the run ends green.
     for (what, bytes) in [("the cache", &archive), ("the artifact", &zip)] {
         let digest = sha256(bytes);
-        anyhow::ensure!(held(store, &dir.path().join("data"), prefix.as_deref(), &format!("cas/{digest}"), &digest)?, "{what} isn't in the {store:?} store");
+        anyhow::ensure!(held(&s, store, &dir.path().join("data"), prefix.as_deref(), &format!("cas/{digest}"), &digest)?, "{what} isn't in the {store:?} store");
     }
     std::fs::write(&done, b"done")?;
     let mut conclusion = String::new();
@@ -342,7 +358,7 @@ fn sync_lab(store: Store) -> anyhow::Result<()> {
         let digest = sha256(&content);
         let head = send(port, "HEAD", &format!("/api/sync/blobs/{digest}"), &[("Authorization", &format!("Bearer {}", s.admin))], b"")?;
         anyhow::ensure!(head.status == 200, "round {round}: the server holds its contents: {}", head.status);
-        anyhow::ensure!(held(store, &dir.path().join("data"), prefix.as_deref(), &format!("sync/{digest}"), &digest)?, "round {round}: the contents aren't in the {store:?} store");
+        anyhow::ensure!(held(&s, store, &dir.path().join("data"), prefix.as_deref(), &format!("sync/{digest}"), &digest)?, "round {round}: the contents aren't in the {store:?} store");
         let got = send(port, "GET", &format!("/api/sync/blobs/{digest}"), &[("Authorization", &format!("Bearer {}", s.admin))], b"")?;
         anyhow::ensure!(got.status == 200 && got.body == content, "round {round}: the contents served: {}", got.status);
     }
@@ -350,7 +366,7 @@ fn sync_lab(store: Store) -> anyhow::Result<()> {
     let wrong = sha256(b"not these bytes");
     let put = send(port, "PUT", &format!("/api/sync/blobs/{wrong}"), &[("Authorization", &format!("Bearer {}", s.admin))], b"other bytes")?;
     anyhow::ensure!(put.status == 400, "contents under another hash: {}", put.status);
-    anyhow::ensure!(!held(store, &dir.path().join("data"), prefix.as_deref(), &format!("sync/{wrong}"), &wrong)?, "kept under the wrong hash");
+    anyhow::ensure!(!held(&s, store, &dir.path().join("data"), prefix.as_deref(), &format!("sync/{wrong}"), &wrong)?, "kept under the wrong hash");
     Ok(())
 }
 
@@ -417,7 +433,7 @@ fn upgrade_lab(store: Store) -> anyhow::Result<()> {
         anyhow::ensure!(got.status == 200 && got.body == binary, "{path}: {} ({} bytes)", got.status, got.body.len());
     }
     let digest = sha256(&binary);
-    anyhow::ensure!(held(store, &data, prefix.as_deref(), &format!("binaries/kiln-{target}"), &digest)?, "the binary isn't in the {store:?} store");
+    anyhow::ensure!(held(&s, store, &data, prefix.as_deref(), &format!("binaries/kiln-{target}"), &digest)?, "the binary isn't in the {store:?} store");
     // The server again: the binary is still kept, read from the store.
     drop(s);
     let s = start(dir.path(), &Options { agent: false, ci: "", extra: &blobs })?;
@@ -429,7 +445,7 @@ fn upgrade_lab(store: Store) -> anyhow::Result<()> {
     // Removed, it's gone from the store; its platform's download is GitHub's release again.
     let r = send(s.port, "DELETE", &format!("/api/updates/binaries/{target}"), &[("Authorization", &auth)], b"")?;
     anyhow::ensure!(r.status == 204, "the delete: {}", r.status);
-    anyhow::ensure!(!held(store, &data, prefix.as_deref(), &format!("binaries/kiln-{target}"), &digest)?, "still in the store after it was removed");
+    anyhow::ensure!(!held(&s, store, &data, prefix.as_deref(), &format!("binaries/kiln-{target}"), &digest)?, "still in the store after it was removed");
     let got = send(s.port, "GET", &format!("/dl/kiln/{target}/{build}"), &[], b"")?;
     anyhow::ensure!(got.status == 404, "its build after the delete: {}", got.status);
     Ok(())
@@ -462,7 +478,7 @@ fn presigned_urls_grant_exactly_what_they_say_and_nothing_else() -> anyhow::Resu
     let data = dir.path().join("data");
     let key: [u8; 32] = std::fs::read(data.join("blobs.key"))?.try_into().map_err(|_| anyhow::anyhow!("blobs.key isn't 32 bytes"))?;
     let base = format!("http://127.0.0.1:{}/api/blobs", s.port);
-    let store = kiln::store::Store::open(&data.join("kiln.db"))?;
+    let store = kiln::store::Store::in_memory()?;
     let signer = std::sync::Arc::new(kiln::blobs::local::LocalBlobs::new(store, data.join("cas"), kiln::rt::clock(), kiln::blobs::local::Limits::default(), kiln::blobs::local::Presign { base, key }));
     let presign_for = |k: &str, a: Access, lasts: Duration| {
         let (signer, k) = (std::sync::Arc::clone(&signer), k.to_owned());
@@ -504,9 +520,10 @@ fn presigned_urls_grant_exactly_what_they_say_and_nothing_else() -> anyhow::Resu
         anyhow::ensure!(got.status == 403 && (got.status, got.body.clone()) == first, "{what}: {} {}", got.status, String::from_utf8_lossy(&got.body));
     }
     // What the refused puts sent isn't kept.
-    let blobs = kiln::store::Store::open(&data.join("kiln.db"))?;
-    let kept: i64 = kiln::rt::block_on(async move { blobs.call(|c| Ok(c.query_row("SELECT COUNT(*) FROM blob_keys WHERE key IN ('lab/long', 'lab/short')", [], |r| r.get(0))?)).await })?;
-    anyhow::ensure!(kept == 0, "refused puts kept {kept} objects");
+    for key in ["lab/long", "lab/short"] {
+        let response = send(s.port, "GET", &path_of(&presign(key, Access::Get)?), &[], b"")?;
+        anyhow::ensure!(response.status == 403, "refused put kept {key}");
+    }
     Ok(())
 }
 
@@ -549,6 +566,6 @@ fn a_server_moves_its_bytes_to_s3() -> anyhow::Result<()> {
     wait_for("sync's contents listed from S3", Duration::from_secs(30), || Ok(send(s.port, "HEAD", &format!("/api/sync/blobs/{digest}"), &[("Authorization", &auth)], b"")?.status == 200))?;
     let got = send(s.port, "GET", &format!("/api/sync/blobs/{digest}"), &[("Authorization", &auth)], b"")?;
     anyhow::ensure!(got.status == 200 && got.body == contents, "sync's contents, served from S3: {}", got.status);
-    anyhow::ensure!(held(Store::S3, &dir.path().join("data"), Some(&prefix), &format!("sync/{digest}"), &digest)?, "in the S3 store");
+    anyhow::ensure!(held(&s, Store::S3, &dir.path().join("data"), Some(&prefix), &format!("sync/{digest}"), &digest)?, "in the S3 store");
     Ok(())
 }

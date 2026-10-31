@@ -67,7 +67,7 @@ pub struct Ctx {
 }
 
 enum Command {
-    Push(Box<Push>),
+    Push(Box<Push>, futures::channel::oneshot::Sender<anyhow::Result<()>>),
     Ctx(Ctx),
 }
 
@@ -87,10 +87,11 @@ pub struct Handle {
 
 impl Handle {
     /// What the server sent (`ServerMsg::FrontDoor`).
-    pub fn push(&self, push: Push) {
-        if self.tx.try_send(Command::Push(Box::new(push))).is_err() {
-            tracing::warn!("front door: too many updates at once; one was dropped (the next connect sends it again)");
-        }
+    pub async fn push(&self, push: Push) -> anyhow::Result<()> {
+        let (reply, accepted) = futures::channel::oneshot::channel();
+        // U17: await capacity; certificate/renew commands must never be coalesced or dropped.
+        self.tx.send(Command::Push(Box::new(push), reply)).await.map_err(|_| anyhow::anyhow!("front door command channel is closed"))?;
+        accepted.await.map_err(|_| anyhow::anyhow!("front door stopped before accepting the command"))?
     }
 
     /// The newest status (JSON [`Status`]).
@@ -108,21 +109,31 @@ static RUNNING: LazyLock<Mutex<HashMap<PathBuf, Handle>>> = LazyLock::new(Defaul
 
 /// The front door of the runner whose state is under `ctx.dir`: started on first use (with the
 /// settings it stored, if any) and the same one afterwards.
-pub fn start(ctx: Ctx, shutdown: &Shutdown) -> Handle {
+pub async fn start(ctx: Ctx, records: Arc<dyn kiln_seams::Records>, shutdown: &Shutdown) -> anyhow::Result<Handle> {
+    // U17: canonical policy must load durably before any listener can serve.
+    let (policy, settings) = super::settings::Policy::open(records, &ctx.dir).await?;
+    let (handle, reused) = start_loaded(ctx.clone(), policy, settings, shutdown);
+    if reused {
+        handle.tx.send(Command::Ctx(ctx)).await.map_err(|_| anyhow::anyhow!("front door command channel is closed"))?;
+    }
+    Ok(handle)
+}
+
+fn start_loaded(ctx: Ctx, policy: super::settings::Policy, settings: Settings, shutdown: &Shutdown) -> (Handle, bool) {
     let mut running = RUNNING.lock();
     if let Some(h) = running.get(&ctx.dir)
         && !h.tx.is_closed()
     {
-        let _ = h.tx.try_send(Command::Ctx(ctx));
-        return h.clone();
+        return (h.clone(), true);
     }
     let (tx, rx) = async_channel::bounded(32);
     let latest = Arc::new(Latest::default());
     let handle = Handle { tx, latest: Arc::clone(&latest) };
     running.insert(ctx.dir.clone(), handle.clone());
     let sd = shutdown.clone();
-    crate::rt::spawn(async move { run(ctx, rx, latest, sd).await });
-    handle
+    let fd = FrontDoor::from_loaded(ctx, policy, settings);
+    crate::rt::spawn(async move { run(fd, rx, latest, sd).await });
+    (handle, false)
 }
 
 /// After `wait`, or never.
@@ -133,8 +144,7 @@ async fn soon(wait: Option<Duration>) {
     }
 }
 
-async fn run(ctx: Ctx, rx: async_channel::Receiver<Command>, latest: Arc<Latest>, shutdown: Shutdown) {
-    let mut fd = FrontDoor::new(ctx);
+async fn run(mut fd: FrontDoor, rx: async_channel::Receiver<Command>, latest: Arc<Latest>, shutdown: Shutdown) {
     let mut tick = Interval::new(TICK);
     // What Tailscale says about this machine changed: listen and report accordingly, at once.
     let tailnet_changes = fd.tailnet.changes();
@@ -158,7 +168,10 @@ async fn run(ctx: Ctx, rx: async_channel::Receiver<Command>, latest: Arc<Latest>
             () = soon(fd.retry_in()).fuse() => None,
         };
         match cmd {
-            Some(Command::Push(push)) => fd.on_push(*push),
+            Some(Command::Push(push, reply)) => {
+                let result = fd.on_push(*push).await;
+                let _ = reply.send(result);
+            },
             Some(Command::Ctx(c)) => {
                 fd.ctx = c;
                 fd.reconcile();
@@ -222,6 +235,7 @@ struct Failure {
 struct FrontDoor {
     ctx: Ctx,
     store: Store,
+    policy: super::settings::Policy,
     settings: Settings,
     standby: bool,
     ifaces: Vec<Iface>,
@@ -257,12 +271,18 @@ struct FrontDoor {
 }
 
 impl FrontDoor {
-    fn new(ctx: Ctx) -> Self {
+    #[cfg(test)]
+    async fn new(ctx: Ctx, records: Arc<dyn kiln_seams::Records>) -> anyhow::Result<Self> {
+        let (policy, settings) = super::settings::Policy::open(records, &ctx.dir).await?;
+        Ok(Self::from_loaded(ctx, policy, settings))
+    }
+
+    fn from_loaded(ctx: Ctx, policy: super::settings::Policy, settings: Settings) -> Self {
         let store = Store::new(ctx.dir.clone());
-        let settings = store.load_settings().unwrap_or_default();
         let mut fd = Self {
             ctx,
             store,
+            policy,
             settings,
             standby: false,
             ifaces: Vec::new(),
@@ -295,7 +315,15 @@ impl FrontDoor {
         fd
     }
 
-    fn on_push(&mut self, push: Push) {
+    async fn on_push(&mut self, push: Push) -> anyhow::Result<()> {
+        anyhow::ensure!(!(push.standby && push.renew), "front door cannot renew while on standby; retry on the active runner");
+        // U17: refuse policy before changing listeners, standby, certificates or status.
+        let accepted = if push.standby { None } else {
+            let settings = push.settings.validated().map_err(anyhow::Error::msg)?;
+            self.policy.save(&settings).await?;
+            Some(settings)
+        };
+        let mut effect_error = None;
         if let Some(issued) = &push.issued {
             match self.store.take_issued(issued) {
                 Ok(()) => {
@@ -304,7 +332,7 @@ impl FrontDoor {
                     self.asked = None;
                     self.renewing = false;
                 }
-                Err(e) => tracing::warn!(error = %format!("{e:#}"), "front door: the certificate from the server was not taken"),
+                Err(e) => effect_error = Some(e),
             }
         }
         if let Some(custom) = &push.custom {
@@ -313,7 +341,10 @@ impl FrontDoor {
                     tracing::info!(names = ?info.names, sha256 = %info.sha256, "front door: stored the uploaded certificate");
                     self.upload_error = None;
                 }
-                Err(e) => self.upload_error = Some(format!("The uploaded certificate was not taken: {e:#}")),
+                Err(e) => {
+                    self.upload_error = Some(format!("The uploaded certificate was not taken: {e:#}"));
+                    effect_error = Some(e);
+                },
             }
         }
         // Told to run it (as the newest process of an upgrade, or again): the one it takes over from
@@ -323,20 +354,16 @@ impl FrontDoor {
         }
         self.standby = push.standby;
         if !push.standby {
-            match push.settings.validated() {
-                Ok(s) => {
-                    if s != self.settings {
-                        tracing::info!(front_door = %s.summary(), "front door: new settings");
-                    }
-                    if let Err(e) = self.store.save_settings(&s) {
-                        tracing::warn!(error = %format!("{e:#}"), "front door: settings not stored; a restart starts without them");
-                    }
-                    self.settings = s;
+            if let Some(s) = accepted {
+                if s != self.settings {
+                    tracing::info!(front_door = %s.summary(), "front door: committed new settings");
                 }
-                Err(e) => tracing::warn!(error = %e, "front door: the server's settings do not validate here; keeping the ones in use"),
+                self.settings = s;
             }
-            if push.renew {
-                self.renew_now();
+            if push.renew
+                && let Err(e) = self.renew_now()
+            {
+                effect_error = Some(e);
             }
             // The clusters this one is peered with: their addresses are forwarded here.
             if let Some(t) = push.peers.clone() {
@@ -344,27 +371,27 @@ impl FrontDoor {
             }
         }
         self.reconcile();
+        match effect_error { Some(e) => Err(e), None => Ok(()) }
     }
 
     /// Renew the self-signed certificate now: a new key (the pending one, if any, is dropped) and
     /// a CSR for it at the next reconcile. The certificate in use keeps serving until the new one
     /// is in; then both it and its key are replaced.
-    fn renew_now(&mut self) {
+    fn renew_now(&mut self) -> anyhow::Result<()> {
         if !(self.settings.https.enabled && self.settings.cert.mode == CertMode::Kiln) {
-            return;
+            return Ok(());
         }
         if self.renewing {
             // Asked again before the new one came in: the same new key, asked for again at once.
             self.asked = None;
-            return;
+            return Ok(());
         }
-        if let Err(e) = self.store.forget_pending() {
-            tracing::warn!(error = %format!("{e:#}"), "front door: the pending key was not removed; renewing with it");
-        }
+        self.store.forget_pending()?;
         tracing::info!("front door: renewing its certificate now, with a new key");
         self.csr = None;
         self.asked = None;
         self.renewing = true;
+        Ok(())
     }
 
     fn stop(&mut self) {
@@ -781,8 +808,9 @@ mod tests {
         crate::rt::block_on(async {
             let dir = tempfile::tempdir()?;
             let pki = crate::pki::Pki::open(&dir.path().join("pki"))?;
+            let records: Arc<dyn kiln_seams::Records> = Arc::new(kiln_seams::records::SimRecords::new());
             let ctx = Ctx { dir: dir.path().join("front-door"), server_url: "http://127.0.0.1:9".into(), ca_der: pki.ca_der.clone() };
-            let mut fd = FrontDoor::new(ctx.clone());
+            let mut fd = FrontDoor::new(ctx.clone(), records.clone()).await?;
             let off = fd.status();
             assert_eq!((off.dns.state, off.https.state, off.mdns.state), (State::Off, State::Off, State::Off));
 
@@ -795,7 +823,7 @@ mod tests {
                 ..Settings::default()
             };
             let push = |s: &Settings, issued: Option<String>, standby: bool| Push { settings: s.clone(), standby, issued, custom: None, renew: false, peers: None };
-            fd.on_push(push(&settings, None, false));
+            fd.on_push(push(&settings, None, false)).await?;
             let st = fd.status();
             assert_eq!(st.settings, settings.fingerprint());
             assert_eq!(st.dns.state, State::On, "{:?}", st.dns);
@@ -811,7 +839,7 @@ mod tests {
 
             // The server signs it; HTTPS comes up with it.
             let issued = pki.sign_front_door(&csr, &st.want, crate::pki::FRONT_DOOR_DAYS)?;
-            fd.on_push(push(&settings, Some(issued), false));
+            fd.on_push(push(&settings, Some(issued), false)).await?;
             let st = fd.status();
             assert_eq!(st.https.state, State::On, "{:?}", st.https);
             assert_eq!(st.cert.state, State::On);
@@ -824,18 +852,18 @@ mod tests {
             crate::http::tls::TlsStream::connect(crate::http::io::RtFuturesIo::new(tcp), roots.config()?, crate::http::tls::server_name("www.kiln.test")?).await?;
 
             // Standby: everything stops, the settings stay.
-            fd.on_push(push(&Settings::default(), None, true));
+            fd.on_push(push(&Settings::default(), None, true)).await?;
             let st = fd.status();
             assert!(st.standby);
             assert_eq!((st.dns.state, st.https.state), (State::Waiting, State::Waiting));
             assert!(fd.dns.is_none() && fd.https.is_none());
-            assert_eq!(fd.store.load_settings(), Some(settings.clone()));
+            assert_eq!(super::super::settings::Policy::open(records.clone(), &ctx.dir).await?.1, settings);
 
             // A restarted runner starts from what it stored, certificate and all.
             drop(fd);
             let mut again = None;
             for _ in 0..50 {
-                let fd = FrontDoor::new(ctx.clone());
+                let fd = FrontDoor::new(ctx.clone(), records.clone()).await?;
                 if fd.status().https.state == State::On && fd.status().dns.state == State::On {
                     again = Some(fd);
                     break;
@@ -846,7 +874,7 @@ mod tests {
             assert!(fd.status().csr.is_none());
 
             // Turned off, it lets go of its ports.
-            fd.on_push(push(&Settings::default(), None, false));
+            fd.on_push(push(&Settings::default(), None, false)).await?;
             let st = fd.status();
             assert_eq!((st.dns.state, st.https.state), (State::Off, State::Off));
             Ok(())
@@ -871,6 +899,7 @@ mod tests {
         crate::rt::block_on(async {
             let dir = tempfile::tempdir()?;
             let pki = crate::pki::Pki::open(&dir.path().join("pki"))?;
+            let records: Arc<dyn kiln_seams::Records> = Arc::new(kiln_seams::records::SimRecords::new());
             let ctx = Ctx { dir: dir.path().join("front-door"), server_url: "http://127.0.0.1:9".into(), ca_der: pki.ca_der.clone() };
             let https_port = free_port()?;
             let settings = Settings {
@@ -880,17 +909,17 @@ mod tests {
                 ..Settings::default()
             };
             let push = |issued: Option<String>, standby: bool| Push { settings: settings.clone(), standby, issued, custom: None, renew: false, peers: None };
-            let mut fd = FrontDoor::new(ctx);
-            fd.on_push(push(None, false));
+            let mut fd = FrontDoor::new(ctx, records.clone()).await?;
+            fd.on_push(push(None, false)).await?;
             let st = fd.status();
             let csr = st.csr.clone().ok_or_else(|| anyhow::anyhow!("a CSR"))?;
             let issued = pki.sign_front_door(&csr, &st.want, crate::pki::FRONT_DOOR_DAYS)?;
-            fd.on_push(push(Some(issued), true));
+            fd.on_push(push(Some(issued), true)).await?;
             assert_eq!(fd.retry_in(), None, "standing by, nothing to try");
 
             // The other process holds the port when this one is told to run.
             let held = hold(https_port).await?;
-            fd.on_push(push(None, false));
+            fd.on_push(push(None, false)).await?;
             assert_eq!(fd.status().https.state, State::Error, "{:?}", fd.status().https);
             assert_eq!(fd.retry_in(), Some(RETRY_IN_USE));
 
@@ -909,9 +938,9 @@ mod tests {
             assert_eq!(fd.retry_in(), None);
 
             // Held for longer than the while: back to every TICK.
-            fd.on_push(push(None, true));
+            fd.on_push(push(None, true)).await?;
             let held = hold(https_port).await?;
-            fd.on_push(push(None, false));
+            fd.on_push(push(None, false)).await?;
             assert_eq!(fd.retry_in(), Some(RETRY_IN_USE));
             fd.retry_until = Some(Instant::now());
             fd.reconcile();
@@ -926,8 +955,9 @@ mod tests {
         crate::rt::block_on(async {
             let dir = tempfile::tempdir()?;
             let pki = crate::pki::Pki::open(&dir.path().join("pki"))?;
+            let records: Arc<dyn kiln_seams::Records> = Arc::new(kiln_seams::records::SimRecords::new());
             let ctx = Ctx { dir: dir.path().join("front-door"), server_url: "http://127.0.0.1:9".into(), ca_der: pki.ca_der.clone() };
-            let mut fd = FrontDoor::new(ctx);
+            let mut fd = FrontDoor::new(ctx, records.clone()).await?;
             let settings = Settings {
                 domain: "kiln.test".into(),
                 https: Https { enabled: true, port: free_port()?, http_port: 0, ..Https::default() },
@@ -935,14 +965,14 @@ mod tests {
                 ..Settings::default()
             };
             let push = |custom: Option<crate::frontdoor::CustomCert>| Push { settings: settings.clone(), standby: false, issued: None, custom, renew: false, peers: None };
-            fd.on_push(push(None));
+            fd.on_push(push(None)).await?;
             let st = fd.status();
             assert_eq!(st.cert.state, State::Error);
             assert!(st.csr.is_none(), "custom mode asks the CA for nothing");
             // One for another name: served, and the status says which names it misses.
             let key = crate::pki::new_key_pem()?;
             let other = pki.sign_front_door(&crate::pki::front_door_csr(&["other.test".to_owned()], &key)?, &["other.test".to_owned()], 30)?;
-            fd.on_push(push(Some(crate::frontdoor::CustomCert { cert_pem: other, key_pem: key })));
+            fd.on_push(push(Some(crate::frontdoor::CustomCert { cert_pem: other, key_pem: key }))).await?;
             let st = fd.status();
             assert_eq!((st.cert.state, st.https.state), (State::On, State::On));
             assert_eq!(st.cert.missing, ["kiln.test", "*.kiln.test"]);
@@ -951,7 +981,7 @@ mod tests {
             // certificate alone.
             let key2 = crate::pki::new_key_pem()?;
             let mine = pki.sign_front_door(&crate::pki::front_door_csr(&["kiln.test".to_owned()], &key2)?, &["kiln.test".to_owned(), "*.kiln.test".to_owned()], 30)?;
-            fd.on_push(push(Some(crate::frontdoor::CustomCert { cert_pem: format!("{mine}{key2}"), key_pem: key2.clone() })));
+            fd.on_push(push(Some(crate::frontdoor::CustomCert { cert_pem: format!("{mine}{key2}"), key_pem: key2.clone() }))).await?;
             let st = fd.status();
             assert_eq!((st.cert.state, st.https.state), (State::On, State::On));
             assert!(st.cert.missing.is_empty() && !st.cert.renewing);
@@ -959,12 +989,12 @@ mod tests {
             assert_eq!(pem, crate::pki::public_chain_pem(&mine)?);
             assert!(!serde_json::to_string(&st)?.contains("PRIVATE KEY"), "the status never carries the key");
             // A broken upload is refused, and the stored one stays.
-            fd.on_push(push(Some(crate::frontdoor::CustomCert { cert_pem: "junk".into(), key_pem: "junk".into() })));
+            assert!(fd.on_push(push(Some(crate::frontdoor::CustomCert { cert_pem: "junk".into(), key_pem: "junk".into() }))).await.is_err());
             let st = fd.status();
             assert_eq!(st.cert.state, State::On);
             assert!(st.cert.error.as_deref().is_some_and(|e| e.contains("not taken")), "{:?}", st.cert.error);
             // Renewing is for the self-signed certificate: here it changes nothing.
-            fd.on_push(Push { settings: settings.clone(), renew: true, ..Push::default() });
+            fd.on_push(Push { settings: settings.clone(), renew: true, ..Push::default() }).await?;
             let st = fd.status();
             assert!(st.csr.is_none() && !st.cert.renewing && st.cert.state == State::On);
             Ok(())
@@ -978,8 +1008,9 @@ mod tests {
         crate::rt::block_on(async {
             let dir = tempfile::tempdir()?;
             let pki = crate::pki::Pki::open(&dir.path().join("pki"))?;
+            let records: Arc<dyn kiln_seams::Records> = Arc::new(kiln_seams::records::SimRecords::new());
             let ctx = Ctx { dir: dir.path().join("front-door"), server_url: "http://127.0.0.1:9".into(), ca_der: pki.ca_der.clone() };
-            let mut fd = FrontDoor::new(ctx);
+            let mut fd = FrontDoor::new(ctx, records.clone()).await?;
             let settings = Settings {
                 domain: "kiln.dev".into(),
                 https: Https { enabled: true, port: free_port()?, http_port: 0, ..Https::default() },
@@ -990,8 +1021,8 @@ mod tests {
                 let csr = st.csr.clone().ok_or_else(|| anyhow::anyhow!("a CSR"))?;
                 pki.sign_front_door(&csr, &st.want, crate::pki::FRONT_DOOR_DAYS)
             };
-            fd.on_push(push(None, false));
-            fd.on_push(push(Some(issue(&fd.status())?), false));
+            fd.on_push(push(None, false)).await?;
+            fd.on_push(push(Some(issue(&fd.status())?), false)).await?;
             let st = fd.status();
             assert_eq!((st.cert.state, st.https.state), (State::On, State::On));
             let first = st.cert.info.clone().ok_or_else(|| anyhow::anyhow!("a certificate"))?;
@@ -1002,7 +1033,7 @@ mod tests {
             assert_eq!(fd.tls_leaf.as_deref(), Some(first.sha256.as_str()));
 
             // Renew: a CSR at once, for a key that is not the one in use; the old one still serves.
-            fd.on_push(push(None, true));
+            fd.on_push(push(None, true)).await?;
             let st = fd.status();
             assert!(st.cert.renewing && st.csr.is_some(), "{:?}", st.cert);
             assert_eq!((st.cert.state, st.https.state), (State::On, State::On));
@@ -1011,13 +1042,13 @@ mod tests {
             let pending = std::fs::read_to_string(fd.store.dir().join("kiln.key.pending"))?;
             assert!(crate::pki::cert_matches_key(&renewed, &pending) && !crate::pki::cert_matches_key(&renewed, &first_key), "a new key");
             // Asked again before it came in: asked again at once, for the same new key.
-            fd.on_push(push(None, true));
+            fd.on_push(push(None, true)).await?;
             let again = fd.status();
             assert!(again.cert.renewing && again.csr.is_some() && again.csr != st.csr);
             assert!(crate::pki::cert_matches_key(&issue(&again)?, &pending));
 
             // The new one comes in: served, stored with its key, the old pair gone.
-            fd.on_push(push(Some(renewed.clone()), false));
+            fd.on_push(push(Some(renewed.clone()), false)).await?;
             let st = fd.status();
             assert!(!st.cert.renewing && st.csr.is_none(), "{:?}", st.cert);
             assert_eq!((st.cert.state, st.https.state), (State::On, State::On));
@@ -1029,6 +1060,107 @@ mod tests {
             assert_eq!(pem, renewed);
             assert_eq!(key, pending);
             assert!(crate::pki::cert_matches_key(&pem, &key) && !fd.store.dir().join("kiln.key.pending").exists());
+            Ok(())
+        })
+    }
+}
+
+#[cfg(test)]
+mod u17_tests {
+    use super::*;
+    use futures::future::BoxFuture;
+    use kiln_seams::records::{Changes, Consistency, Page, Records, Refusal, Rev, Row, Scan, SimRecords, Tx};
+    use std::sync::atomic::AtomicBool;
+
+    struct Refusing {
+        inner: SimRecords,
+        refuse: AtomicBool,
+    }
+    impl Records for Refusing {
+        fn get<'a>(&'a self, family: &'a str, key: &'a [u8], at: Consistency) -> BoxFuture<'a, Result<Option<Row>, Refusal>> { self.inner.get(family, key, at) }
+        fn scan<'a>(&'a self, family: &'a str, scan: Scan) -> BoxFuture<'a, Result<Page, Refusal>> { self.inner.scan(family, scan) }
+        fn commit(&self, tx: Tx) -> BoxFuture<'_, Result<Rev, Refusal>> {
+            if self.refuse.load(Ordering::SeqCst) { Box::pin(async { Err(Refusal::Unavailable("U17 injected refusal".into())) }) } else { self.inner.commit(tx) }
+        }
+        fn changes<'a>(&'a self, family: &'a str, after: Rev, limit: usize) -> BoxFuture<'a, Result<Changes, Refusal>> { self.inner.changes(family, after, limit) }
+        fn wait<'a>(&'a self, family: &'a str, after: Rev) -> BoxFuture<'a, Result<Rev, Refusal>> { self.inner.wait(family, after) }
+        fn head(&self) -> BoxFuture<'_, Result<Rev, Refusal>> { self.inner.head() }
+    }
+
+    #[test]
+    fn u17_frontdoor_start_refuses_before_serving_when_import_cannot_commit() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let records = Arc::new(Refusing { inner: SimRecords::new(), refuse: AtomicBool::new(true) });
+            let ctx = Ctx { dir: dir.path().join("front-door"), server_url: "http://127.0.0.1:9".into(), ca_der: Vec::new() };
+            assert!(start(ctx.clone(), records.clone(), &Shutdown::new()).await.is_err());
+            assert!(!RUNNING.lock().contains_key(&ctx.dir));
+            assert_eq!(records.head().await?, 0);
+            assert!(!ctx.dir.exists());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn u17_frontdoor_commit_refusal_retains_policy_status_and_files() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let records = Arc::new(Refusing { inner: SimRecords::new(), refuse: AtomicBool::new(false) });
+            let ctx = Ctx { dir: dir.path().join("front-door"), server_url: "http://127.0.0.1:9".into(), ca_der: Vec::new() };
+            let mut fd = FrontDoor::new(ctx.clone(), records.clone()).await?;
+            let prior = Settings { domain: "committed.home".into(), ..Settings::default() };
+            fd.on_push(Push { settings: prior.clone(), ..Push::default() }).await?;
+            let head = records.head().await?;
+            records.refuse.store(true, Ordering::SeqCst);
+            let rejected = Push { settings: Settings { domain: "refused.home".into(), ..Settings::default() }, custom: Some(super::super::CustomCert { cert_pem: "unaccepted".into(), key_pem: "unaccepted".into() }), renew: true, ..Push::default() };
+            assert!(fd.on_push(rejected).await.is_err());
+            assert_eq!(fd.settings, prior);
+            assert_eq!(fd.status().settings, prior.fingerprint());
+            assert_eq!(records.head().await?, head);
+            assert!(!ctx.dir.exists(), "no certificate effects before a refused policy commit");
+            drop(fd);
+            let again = FrontDoor::new(ctx, records.clone()).await?;
+            assert_eq!(again.settings, prior);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn u17_frontdoor_handoff_waits_for_durable_acceptance_and_refuses_closed() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let records = Arc::new(Refusing { inner: SimRecords::new(), refuse: AtomicBool::new(false) });
+            let ctx = Ctx { dir: dir.path().join("front-door"), server_url: "http://127.0.0.1:9".into(), ca_der: Vec::new() };
+            let mut fd = FrontDoor::new(ctx.clone(), records.clone()).await?;
+            let (tx, rx) = async_channel::bounded(1);
+            let handle = Handle { tx, latest: Arc::new(Latest::default()) };
+            let first = Push { settings: Settings { domain: "first.home".into(), ..Settings::default() }, ..Push::default() };
+            let second = Push { settings: Settings { domain: "second.home".into(), ..Settings::default() }, renew: true, ..Push::default() };
+            let mut one = Box::pin(handle.push(first));
+            assert!(futures::poll!(&mut one).is_pending(), "queue admission is not acceptance");
+            let mut two = Box::pin(handle.push(second));
+            assert!(futures::poll!(&mut two).is_pending(), "full queue waits instead of dropping a renew command");
+            if let Command::Push(push, reply) = rx.recv().await? {
+                let _ = reply.send(fd.on_push(*push).await);
+            } else { anyhow::bail!("expected first policy command"); }
+            one.await?;
+            assert_eq!(super::super::settings::Policy::open(records.clone(), &ctx.dir).await?.1.domain, "first.home");
+            assert!(futures::poll!(&mut two).is_pending(), "second queued command still awaits acceptance");
+            records.refuse.store(true, Ordering::SeqCst);
+            if let Command::Push(push, reply) = rx.recv().await? {
+                assert!(push.renew, "noncoalescible effect retained");
+                let _ = reply.send(fd.on_push(*push).await);
+            } else { anyhow::bail!("expected second policy command"); }
+            assert!(two.await.is_err());
+            assert_eq!(fd.settings.domain, "first.home");
+            drop(rx);
+            assert!(handle.push(Push::default()).await.is_err());
+            let (tx, rx) = async_channel::bounded(1);
+            let handle = Handle { tx, latest: Arc::new(Latest::default()) };
+            let mut pending = Box::pin(handle.push(Push::default()));
+            assert!(futures::poll!(&mut pending).is_pending());
+            drop(rx.recv().await?); // The worker dies after dequeue but before a durable reply.
+            assert!(pending.await.is_err());
             Ok(())
         })
     }

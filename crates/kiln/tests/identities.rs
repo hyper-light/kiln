@@ -789,16 +789,16 @@ fn leg_on_a_test_runner(dir: &Path, workflow: &str, env: &[(&str, &str)]) -> any
 
 /// The leg's certificate as kiln issued it (its store's record of it), and kiln's root: DER.
 fn leg_certificate(dir: &Path) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
-    let db = rusqlite::Connection::open(dir.join("data/kiln.db"))?;
-    let pem: String = db.query_row("SELECT cert_pem FROM identities WHERE kind = 'leg' ORDER BY issued_at DESC LIMIT 1", [], |r| r.get(0))?;
+    let db = kiln::store::Store::open(&dir.join("data/kiln.db"))?;
+    let pem: String = db.now(|c| Ok(c.query_row("SELECT cert_pem FROM identities WHERE kind = 'leg' ORDER BY issued_at DESC LIMIT 1", [], |r| r.get(0))?))?;
     let root = std::fs::read_to_string(dir.join("data/pki/ca.pem"))?;
     Ok((kiln::pki::der_of(&pem)?, kiln::pki::der_of(&root)?))
 }
 
 /// The leg `e2e`'s timeout (minutes), as its spec in the store has it.
 fn leg_timeout(dir: &Path) -> anyhow::Result<i64> {
-    let db = rusqlite::Connection::open(dir.join("data/kiln.db"))?;
-    let spec: String = db.query_row("SELECT leg FROM jobs WHERE key = 'e2e'", [], |r| r.get(0))?;
+    let db = kiln::store::Store::open(&dir.join("data/kiln.db"))?;
+    let spec: String = db.now(|c| Ok(c.query_row("SELECT leg FROM jobs WHERE key = 'e2e'", [], |r| r.get(0))?))?;
     serde_json::from_str::<Value>(&spec)?.get("timeout_minutes").and_then(Value::as_i64).ok_or_else(|| anyhow::anyhow!("no timeout in {spec}"))
 }
 

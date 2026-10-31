@@ -374,6 +374,15 @@ mod tests {
             anyhow::ensure!(by_id(&first, 4).get("Err").is_some(), "{first:?}");
             anyhow::ensure!(first.last() == Some(&json!({ "ID": 5 })), "close is answered last: {first:?}");
             svc.settled().await;
+            // W24-AC08: close must leave the remote entry and its verified bytes available;
+            // distinguish publication failure from the fresh helper's protocol response.
+            let published = svc.store().entry(&[super::super::store::Scope::new("acme/app", "trusted")], NS, &hex::encode(action)).await?;
+            let Some((_, published)) = published else { anyhow::bail!("Go close completed without publishing its remote entry") };
+            anyhow::ensure!(published.digest == crate::util::sha256_hex(&body) && published.size == body.len() as u64, "Go published the wrong entry: {published:?}");
+            anyhow::ensure!(svc.store().holder(&[super::super::store::Scope::new("acme/app", "trusted")], &published.digest).is_some(), "Go published an entry without its scoped holding or available chunks");
+            let (store, digest) = (Arc::clone(svc.store()), published.digest);
+            let remote = crate::rt::blocking(move || store.read(&digest)).await??;
+            anyhow::ensure!(remote.as_deref() == Some(body.as_slice()), "Go published an entry without its verified remote bytes");
             // A fresh disk: the hit comes from the service.
             let (r2, ep2, tk2) = (root.clone(), endpoint.clone(), token.clone());
             let second = on_thread(move || -> anyhow::Result<Vec<Value>> {

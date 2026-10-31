@@ -11,7 +11,7 @@
 //!   comments and reviews made from kiln as that person.
 
 use http::StatusCode;
-use rusqlite::{OptionalExtension as _, params};
+use crate::sql::{OptionalExtension as _, params};
 use serde_json::{Value, json};
 
 use super::Grant;
@@ -227,7 +227,7 @@ pub fn mapped(cfg: &Provider, groups: &[String]) -> Vec<String> {
 }
 
 /// A user name for a new account: the login, made unique.
-fn name_for(c: &rusqlite::Connection, login: &str, provider: &str) -> rusqlite::Result<String> {
+fn name_for(c: &crate::sql::Connection, login: &str, provider: &str) -> crate::sql::Result<String> {
     let base: String = login.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')).collect();
     let base = if base.is_empty() { format!("{provider}-user") } else { base };
     for n in 0..100 {

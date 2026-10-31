@@ -326,6 +326,8 @@ struct Run {
     output: String,
     /// How much of `output` was handed out already.
     read: usize,
+    /// Positive shell-start observation; absence remains unknown.
+    started_pid: Option<u32>,
     exit: Option<Value>,
     error: Option<String>,
     signal: Option<std::os::unix::net::UnixStream>,
@@ -357,6 +359,7 @@ fn follow(mut client: Client, cell: Cell) {
                     r.why = why;
                 }
                 Ok(Some(Ev::Synced { root, sent, removed, bytes, ms })) => r.synced = Some(json!({"to": root, "files_sent": sent, "removed": removed, "bytes": bytes, "ms": ms})),
+                Ok(Some(Ev::Started { runner, pid, .. })) if pid > 0 && (runner.is_empty() || runner == r.runner) => r.started_pid = Some(pid),
                 Ok(Some(Ev::Output { data, .. })) => r.output.push_str(&String::from_utf8_lossy(&data)),
                 Ok(Some(Ev::Exit { code, error, lost })) => {
                     r.exit = Some(json!({"exit_code": code, "error": error, "output_dropped_bytes": lost}));
@@ -422,6 +425,7 @@ fn report(id: &str, cell: &Cell, secs: u64, fresh: bool, max: usize) -> (Value, 
     let done = r.exit.is_some() || r.error.is_some();
     let mut v = json!({"runner": r.runner, "output": clip(&out, max), "running": !done});
     if let Some(o) = v.as_object_mut() {
+        if let Some(pid) = r.started_pid { o.insert("started_pid".into(), json!(pid)); }
         if !done {
             o.insert("id".into(), json!(id));
         }

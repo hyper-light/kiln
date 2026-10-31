@@ -21,13 +21,79 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use http::{Method, StatusCode, header};
-use rusqlite::{OptionalExtension as _, params};
+use crate::sql::{OptionalExtension as _, params};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
 use self::auth::{Access, Action, Credentials};
 use crate::http::server::{self as srv, Request, Response};
 use crate::hub::Hub;
+
+/// U07/U08: physical staging ownership follows every writer, including submitted blocking
+/// work. The last owner retires bytes on cancellation; no detached cleanup task is needed.
+#[derive(Clone)]
+struct Staging(Arc<StagingPath>);
+
+struct StagingPath(parking_lot::Mutex<Option<PathBuf>>);
+
+impl StagingPath {
+    fn remove(&self) -> std::io::Result<()> {
+        let mut path = self.0.lock();
+        if let Some(p) = path.as_ref() {
+            match std::fs::remove_file(p) {
+                Ok(()) => {},
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+                Err(e) => return Err(e),
+            }
+            *path = None;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for StagingPath {
+    fn drop(&mut self) {
+        if let Err(error) = self.remove() {
+            tracing::error!(%error, "registry staging cleanup failed");
+        }
+    }
+}
+
+impl Staging {
+    fn new(path: PathBuf) -> Self {
+        Self(Arc::new(StagingPath(parking_lot::Mutex::new(Some(path)))))
+    }
+
+    async fn remove(self) -> anyhow::Result<()> {
+        crate::rt::blocking(move || {
+            // Early stream errors can return while a submitted write is still running.
+            // Its owner performs retirement after closing the final file handle.
+            if Arc::strong_count(&self.0) == 1 { self.0.remove() } else { Ok(()) }
+        }).await??;
+        Ok(())
+    }
+
+    fn sink(&self, path: PathBuf, max: u64) -> anyhow::Result<(async_channel::Sender<Bytes>, impl std::future::Future<Output = anyhow::Result<u64>> + Send + 'static)> {
+        // Field order closes the file before releasing its staging owner, on every platform.
+        struct Writer { file: std::fs::File, _staging: Staging }
+        if let Some(dir) = path.parent() { std::fs::create_dir_all(dir)?; }
+        let file = Arc::new(Writer { file: std::fs::File::create(path)?, _staging: self.clone() });
+        let (sink, chunks) = async_channel::bounded::<Bytes>(16);
+        let writer = crate::rt::spawn(async move {
+            let mut total = 0u64;
+            while let Ok(chunk) = chunks.recv().await {
+                let at = total;
+                total = total.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+                anyhow::ensure!(total <= max, "upload exceeds {max} bytes");
+                let held = file.clone();
+                crate::rt::blocking(move || crate::os::write_all_at(&held.file, &chunk, at)).await??;
+            }
+            crate::rt::blocking(move || file.file.sync_data()).await??;
+            Ok(total)
+        });
+        Ok((sink, async move { writer.await.map_err(|_| anyhow::anyhow!("file writer stopped"))? }))
+    }
+}
 
 const API_VERSION: &str = "registry/2.0";
 /// The biggest manifest kiln takes (the spec suggests at least 4 MiB).
@@ -947,16 +1013,19 @@ pub fn local_name(hub: &Hub, reference: &str) -> Option<String> {
 /// digest and size.
 async fn put_bytes(hub: &Hub, name: &str, bytes: &[u8]) -> anyhow::Result<(String, u64)> {
     let path = crate::ci::services::cas::staging(hub).join(format!("put-{}", crate::util::new_id()));
+    let staging = Staging::new(path.clone());
+    let held = staging.clone();
     let (p, b) = (path.clone(), bytes.to_vec());
     crate::rt::blocking(move || -> std::io::Result<()> {
         if let Some(dir) = p.parent() {
             std::fs::create_dir_all(dir)?;
         }
+        let _held = held;
         std::fs::write(&p, b)
     })
     .await??;
     let obj = crate::ci::services::cas::put_file(hub, &path).await;
-    let _ = crate::rt::blocking(move || std::fs::remove_file(path)).await;
+    staging.remove().await?;
     let obj = obj?;
     let digest = format!("sha256:{}", obj.digest);
     link(hub, name, &digest, obj.size).await.map_err(|e| anyhow::anyhow!("{}", e.message))?;
@@ -964,7 +1033,7 @@ async fn put_bytes(hub: &Hub, name: &str, bytes: &[u8]) -> anyhow::Result<(Strin
 }
 
 /// Whether `repo`'s tags are immutable (a release path's).
-fn immutable_in(c: &rusqlite::Connection, repo: &str) -> rusqlite::Result<bool> {
+fn immutable_in(c: &crate::sql::Connection, repo: &str) -> crate::sql::Result<bool> {
     Ok(c.query_row("SELECT immutable FROM registry_policies WHERE repo = ?1", [repo], |r| r.get::<_, bool>(0)).optional()?.unwrap_or(false))
 }
 
@@ -1222,6 +1291,27 @@ pub async fn handle(hub: &Arc<Hub>, req: Request) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn u07_u08_staging_retires_after_last_owner_and_retains_cleanup_failures() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("staging");
+        std::fs::write(&path, b"partial")?;
+        let staging = Staging::new(path.clone());
+        let writer = staging.clone();
+        drop(staging);
+        assert!(path.exists(), "a live writer still owns staging");
+        drop(writer);
+        assert!(!path.exists(), "the last writer retires staging");
+        std::fs::create_dir(&path)?;
+        let staging = Staging::new(path.clone());
+        assert!(staging.0.remove().is_err(), "real unlink failures are returned");
+        assert_eq!(staging.0.0.lock().as_ref(), Some(&path), "failed retirement retains its path");
+        std::fs::remove_dir(&path)?;
+        staging.0.remove()?;
+        assert!(staging.0.0.lock().is_none(), "missing staging is already retired");
+        Ok(())
+    }
 
     #[test]
     fn w12_r01_names_routes_digests() {

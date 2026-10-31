@@ -680,23 +680,13 @@ const UPLOADS_MAX: usize = 512 << 20;
 /// Pieces a file is sent to a machine in (lane frames are bounded).
 const FILE_CHUNK: usize = 512 * 1024;
 
-/// Restoring the conversation store from a mirror's copy of it (`docs/conversations.md`,
-/// "Mirrors"): `GET /api/conversations/restore`.
+/// Compatibility response for the retired application-level recovery API. U15 recovery is
+/// owned by the host's Amphora database, which never restores conversation rows independently.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum Restore {
-    Idle,
-    /// `from` was asked for its copy.
-    Asked { from: String, at: i64 },
-    /// `from` is sending its copy `store`.
-    Copying { from: String, store: String, at: i64 },
-    /// Done: `sessions` came back.
-    Done { from: String, sessions: usize, at: i64 },
-    Failed { from: String, error: String, at: i64 },
+    Retired { reason: &'static str },
 }
-
-/// A mirror asked for its copy that hasn't begun sending it after this long isn't answering.
-const RESTORE_ANSWER_MS: i64 = 120_000;
 
 pub struct Registry {
     mirrors: Mutex<HashMap<String, Mirror>>,
@@ -709,12 +699,6 @@ pub struct Registry {
     pub local: Arc<Host>,
     /// The server's conversation store (docs/conversations.md), when it's on.
     pub convo: Option<crate::convo::store::Store>,
-    /// What runners' feeds send into it (`crate::convo::feed`), and what to answer them.
-    pub feed: Option<crate::convo::feed::Intake>,
-    feed_out: Option<async_channel::Receiver<crate::convo::feed::Out>>,
-    /// The runners that keep a copy of it (`crate::convo::mirror`), and what to send them.
-    pub copies: Option<Arc<crate::convo::mirror::Mirrors>>,
-    copies_out: Option<async_channel::Receiver<(hyper_transport::PeerId, String, Vec<u8>)>>,
     /// Every store, as the server sees it: the System page's (`super::stores`).
     pub board: crate::convo::board::Board,
     local_rx: async_channel::Receiver<(String, Update)>,
@@ -726,31 +710,30 @@ pub struct Registry {
     dir: std::path::PathBuf,
     /// The server machine's transcripts, for its past sessions (made on first use).
     scanner: Arc<Mutex<Option<crate::aisessions::Scanner>>>,
-    /// Names people gave sessions, by id (the "rename" control), kept in `names.json`: a session
+    /// Names people gave sessions, by id (the "rename" control), kept in global Records: a session
     /// takes its name here at once, whatever its machine's runner knows of names (one from before
     /// kiln named sessions never reports it), and keeps it across restarts.
     names: Mutex<HashMap<String, String>>,
+    control_snapshot: Option<super::host::snapshot::Snapshot>,
+    control_commit: Mutex<()>,
+    control_baseline: Mutex<ControlState>,
+    local_restored: Mutex<bool>,
     /// Sessions kiln doesn't keep going when they stop part-way (`goals::keep`; the "keep_going"
-    /// control), kept in `keep-off.json` so it holds across restarts.
+    /// control), kept in global Records so it holds across restarts.
     keep_off: Mutex<std::collections::HashSet<String>>,
     /// The UI's commands by the ids their clients made, each taken once (`super::asked`).
     pub asked: super::asked::Asked,
     /// Which of its machine's runner processes holds each session on a machine (its instance:
-    /// `main`, a uuid, `legacy`), kept in `holders.json` so it holds across restarts: a process
+    /// `main`, a uuid, `legacy`), kept in global Records so it holds across restarts: a process
     /// that says what it holds speaks for its own sessions, never for another's that is away
     /// ([`Registry::inventory`]).
     holders: Mutex<HashMap<String, String>>,
     /// Each session's latest epoch (`State::epoch`) seen, those that went on on another machine at
-    /// least once, kept in `epochs.json`: a machine that announces an older copy lets go of it.
+    /// least once, kept in global Records: a machine that announces an older copy lets go of it.
     epochs: Mutex<HashMap<String, u64>>,
     /// The plan each session last proposed (plan mode), not yet kept as one of kiln's plans: the
     /// goals' driver keeps it ([`Self::take_proposed`], `crate::plans::keep_proposed`).
     proposed: Mutex<HashMap<String, String>>,
-    /// Restoring the conversation store from a mirror's copy of it.
-    restore: Mutex<Restore>,
-    /// The mirrors to ask for their copy as they connect: the store was found empty at start
-    /// while the server had mirrors (it was lost, the rest wasn't).
-    restore_auto: Mutex<Vec<String>>,
     /// Files finished messages mention, kept so they still show after they go (`super::kept`).
     pub keeper: Keeper,
     /// Pages agents show in their conversations (`super::visuals`).
@@ -817,16 +800,90 @@ async fn send_package(hub: &Hub, id: &str, to: &str, bytes: &[u8]) -> Result<(),
     Ok(())
 }
 
+/// U17: ownership and user control state commit at one Records revision.
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+struct ControlState {
+    #[serde(default)]
+    imported_hosts: std::collections::HashSet<String>,
+    #[serde(default)]
+    edited_names: std::collections::HashSet<String>,
+    #[serde(default)]
+    edited_holders: std::collections::HashSet<String>,
+    #[serde(default)]
+    edited_keep_going: std::collections::HashSet<String>,
+    #[serde(default)]
+    epoch_reservations: HashMap<String, EpochReservation>,
+    names: HashMap<String, String>,
+    keep_off: std::collections::HashSet<String>,
+    holders: HashMap<String, String>,
+    epochs: HashMap<String, u64>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct EpochReservation { source: u64, target: String }
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct OpenIntent {
+    target: String,
+    local_scope: Option<String>,
+    spec: Spec,
+    at: i64,
+    accepted: bool,
+}
+
+enum SharedControl { Name(Option<String>), KeepGoing(bool), Holder(String), Epoch(u64) }
+
+fn registry_namespace(prefix: &str, identity: &str) -> String {
+    use sha2::Digest as _;
+    let digest = hex::encode(sha2::Sha256::digest(identity.as_bytes()));
+    format!("{prefix}{}", digest.chars().take(56).collect::<String>())
+}
+
+fn read_control_legacy(dir: &std::path::Path) -> anyhow::Result<ControlState> {
+    fn read<T: serde::de::DeserializeOwned + Default>(dir: &std::path::Path, file: &str) -> anyhow::Result<T> {
+        match std::fs::read(dir.join(file)) {
+            Ok(raw) => Ok(serde_json::from_slice(&raw)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
+            Err(error) => Err(error.into()),
+        }
+    }
+    Ok(ControlState { imported_hosts: Default::default(), names: read(dir, "names.json")?, keep_off: read(dir, "keep-off.json")?, holders: read(dir, "holders.json")?, epochs: read(dir, "epochs.json")?, ..ControlState::default() })
+}
+
+fn merge_legacy_map(target: &mut HashMap<String, String>, source: HashMap<String, String>, edited: &std::collections::HashSet<String>, field: &str) -> anyhow::Result<()> {
+    for (id, value) in source {
+        if edited.contains(&id) { continue; }
+        anyhow::ensure!(target.get(&id).is_none_or(|old| old == &value), "U17 conflicting legacy registry {field} for session {id}; keep both sources for resolution");
+        target.insert(id, value);
+    }
+    Ok(())
+}
+
+fn apply_map_delta(target: &mut HashMap<String, String>, before: &HashMap<String, String>, after: &HashMap<String, String>) {
+    for (id, value) in after { if before.get(id) != Some(value) { target.insert(id.clone(), value.clone()); } }
+    // U17: background cleanup based on a replica's older cache cannot delete a newer
+    // name/holder another replica has committed. Explicit user clears use set_shared_control.
+    for id in before.keys() { if !after.contains_key(id) && target.get(id) == before.get(id) { target.remove(id); } }
+}
+
+fn changed_control_keys(before: &HashMap<String, String>, after: &HashMap<String, String>) -> std::collections::HashSet<String> {
+    before.keys().chain(after.keys()).filter(|id| before.get(*id) != after.get(*id)).cloned().collect()
+}
+
+fn control_conflict(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<kiln_seams::records::Refusal>().is_some_and(|refusal| matches!(refusal, kiln_seams::records::Refusal::Conflict { .. }))
+}
+
 impl Registry {
     /// A registry of tests: its store in `dir`, its feeds on the bus's simulator.
     #[cfg(test)]
-    pub fn new(dir: std::path::PathBuf) -> Self {
+    pub fn new(dir: std::path::PathBuf) -> anyhow::Result<Self> {
         Self::with(dir, &crate::config::Conversations::default(), crate::rt::clock(), Arc::new(kiln_seams::bus::SimBus::default()))
     }
 
-    /// The registry, its store in `dir`, its mirrors as `conversations` says, the server's own
-    /// sessions' host on `clock` (the hub's), its sessions' live feeds on `bus`.
-    pub fn with(dir: std::path::PathBuf, conversations: &crate::config::Conversations, clock: Arc<dyn kiln_seams::Clock>, bus: Arc<dyn kiln_seams::Bus>) -> Self {
+    /// Compatibility fixture with its host on `clock` and session updates on `bus`.
+    #[cfg(test)]
+    pub fn with(dir: std::path::PathBuf, conversations: &crate::config::Conversations, clock: Arc<dyn kiln_seams::Clock>, bus: Arc<dyn kiln_seams::Bus>) -> anyhow::Result<Self> {
         let (tx, rx) = async_channel::bounded(8192);
         // Every session's conversation, on every machine, kept on disk as it comes in
         // (docs/conversations.md): the server's own sessions' too, as they pass through `ingest`.
@@ -836,36 +893,48 @@ impl Registry {
         if let Some(c) = &convo {
             c.hold_prune(0);
         }
-        // Runners that keep a store send it here; the server keeps their sessions from that. What
-        // a mirror sends back to restore the store from isn't sent to it again.
-        let echoes = std::sync::Arc::new(crate::convo::feed::Echoes::default());
-        let (feed, feed_out) = match convo.as_ref().map(|st| crate::convo::feed::Intake::start(st.clone(), crate::convo::feed::Brings::TheirMachine, Some(echoes.clone()))) {
-            Some(Ok((i, o))) => (Some(i), Some(o)),
-            Some(Err(e)) => {
-                tracing::warn!(error = %format!("{e:#}"), "runners' conversation stores won't reach the server's");
-                (None, None)
-            }
-            None => (None, None),
-        };
-        let (copies, copies_out) = match convo.clone().filter(|_| conversations.mirrors > 0) {
-            Some(st) => {
-                let (m, out) = crate::convo::mirror::Mirrors::start(st, conversations.mirrors, conversations.mirror_on.clone(), dir.join("mirrors.json"), Some(echoes));
-                (Some(m), Some(out))
-            }
-            None => (None, None),
-        };
-        let restore_auto = match (&copies, &convo) {
-            (Some(m), Some(st)) if st.is_empty().unwrap_or(false) => m.chosen_machines(),
-            _ => Vec::new(),
-        };
-        if !restore_auto.is_empty() {
-            tracing::info!(mirrors = ?restore_auto, "the conversation store is empty: it is restored from a mirror's copy once one connects");
-        }
+        let visuals = super::visuals::Visuals::new(&dir, Arc::new(kiln_seams::records::SimRecords::default()), "registry-test")?;
+        let keeper = Keeper::new(&dir, Arc::new(kiln_seams::records::SimRecords::default()), "registry-test")?;
         let local = Host::with_clock(tx, Some(dir.join("local.json")), Limits::default(), clock);
+        Ok(Self::assemble(dir, bus, local, rx, convo, visuals, keeper))
+    }
+
+    /// U17/U06/U15: canonical startup uses the host's sole Database and propagates import/open
+    /// errors. Amphora owns replication; no conversation feed or mirror controller starts here.
+    pub fn from_database(dir: std::path::PathBuf, conversations: &crate::config::Conversations, clock: Arc<dyn kiln_seams::Clock>, bus: Arc<dyn kiln_seams::Bus>, database: amphora::database::Database, machine_name: &str, legacy_sources: &[std::path::PathBuf]) -> anyhow::Result<Self> {
+        anyhow::ensure!(!machine_name.is_empty(), "U17 server host identity is empty");
+        let scope = format!("server/{machine_name}/local");
+        let local_namespace = registry_namespace("server.", &scope);
+        let machine_namespace = registry_namespace("machine.", machine_name);
+        // U17: server-local inbox/process state is independent for each authenticated host;
+        // fleet names, keep-going choices, holders and epochs remain one global authority.
+        let records: Arc<dyn kiln_seams::Records> = Arc::new(crate::records::from_legacy_database(&database, &local_namespace, &dir.join(crate::records::FILE))?);
+        let machine: Arc<dyn kiln_seams::Records> = Arc::new(crate::records::from_database(&database, &machine_namespace)?);
+        let controls: Arc<dyn kiln_seams::Records> = Arc::new(crate::records::from_database(&database, "registry")?);
+        let visuals = super::visuals::Visuals::new(&dir, Arc::new(crate::records::from_database(&database, "visuals")?), machine_name)?;
+        let keeper = Keeper::new(&dir, Arc::new(crate::records::from_database(&database, "kept")?), machine_name)?;
+        let storage = if conversations.off || !crate::convo::enabled() { None } else {
+            let mut sources = legacy_sources.to_vec();
+            sources.push(dir.join(crate::convo::FILE));
+            sources.sort();
+            sources.dedup();
+            Some(crate::records::SessionStorage::from_host_database(database, machine_name, &sources, conversations.upkeep())?)
+        };
+        let convo = storage.as_ref().map(crate::records::SessionStorage::conversations);
+        if let Some(store) = &convo { store.hold_prune(0); }
+        let (tx, rx) = async_channel::bounded(8192);
+        let local = match storage {
+            Some(storage) => Host::try_with_session_namespace(tx, Some(dir.join("local.json")), Limits::default(), clock, storage.bind_namespace(&local_namespace, None)?, machine, &scope)?,
+            None => Host::try_with_namespaces(tx, Some(dir.join("local.json")), Limits::default(), clock, (records, machine), &scope)?,
+        };
+        let mut registry = Self::assemble(dir, bus, local, rx, convo, visuals, keeper);
+        registry.use_global_control_records(controls, "server/control", machine_name)?;
+        Ok(registry)
+    }
+
+    fn assemble(dir: std::path::PathBuf, bus: Arc<dyn kiln_seams::Bus>, local: Arc<Host>, rx: async_channel::Receiver<(String, Update)>, convo: Option<crate::convo::store::Store>, visuals: super::visuals::Visuals, keeper: Keeper) -> Self {
         // The server's own agents' workspaces of their own are kept beside their record.
         crate::workspace::slates::init(&dir);
-        let keeper = Keeper::new(&dir);
-        let visuals = super::visuals::Visuals::new(&dir);
         Self {
             mirrors: Mutex::new(HashMap::new()),
             bus,
@@ -873,14 +942,14 @@ impl Registry {
             kinds: Mutex::new(HashMap::new()),
             local,
             convo,
-            feed,
-            feed_out,
-            copies,
-            copies_out,
             board: crate::convo::board::Board::default(),
             local_rx: rx,
             local_sock: Mutex::new(None),
             local_shells: Mutex::new(HashMap::new()),
+            control_snapshot: None,
+            control_commit: Mutex::new(()),
+            control_baseline: Mutex::new(ControlState::default()),
+            local_restored: Mutex::new(false),
             names: Mutex::new(std::fs::read(dir.join("names.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
             keep_off: Mutex::new(std::fs::read(dir.join("keep-off.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
             asked: super::asked::Asked::default(),
@@ -889,8 +958,6 @@ impl Registry {
             proposed: Mutex::new(HashMap::new()),
             dir,
             scanner: Arc::new(Mutex::new(None)),
-            restore: Mutex::new(Restore::Idle),
-            restore_auto: Mutex::new(restore_auto),
             keeper,
             visuals,
             streams: super::streams::Relay::default(),
@@ -903,99 +970,180 @@ impl Registry {
         }
     }
 
+    /// U17: single-source compatibility fixture; canonical startup imports every host into
+    /// the shared fleet authority through use_global_control_records.
+    #[cfg(test)]
+    pub fn use_control_records(&mut self, records: Arc<dyn kiln_seams::Records>, scope: &str) -> anyhow::Result<()> {
+        fn legacy<T: serde::de::DeserializeOwned + Default>(dir: &std::path::Path, name: &str) -> anyhow::Result<T> {
+            match std::fs::read(dir.join(name)) {
+                Ok(raw) => Ok(serde_json::from_slice(&raw)?),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
+                Err(e) => Err(e.into()),
+            }
+        }
+        let (snapshot, state) = super::host::snapshot::Snapshot::import(records, scope, || Ok(ControlState {
+            imported_hosts: Default::default(),
+            names: legacy(&self.dir, "names.json")?,
+            keep_off: legacy(&self.dir, "keep-off.json")?,
+            holders: legacy(&self.dir, "holders.json")?,
+            epochs: legacy(&self.dir, "epochs.json")?,
+            ..ControlState::default()
+        }))?;
+        *self.control_baseline.get_mut() = state.clone();
+        *self.names.get_mut() = state.names;
+        *self.keep_off.get_mut() = state.keep_off;
+        *self.holders.get_mut() = state.holders;
+        *self.epochs.get_mut() = state.epochs;
+        self.control_snapshot = Some(snapshot);
+        Ok(())
+    }
+
+    fn use_global_control_records(&mut self, records: Arc<dyn kiln_seams::Records>, scope: &str, machine_name: &str) -> anyhow::Result<()> {
+        let (snapshot, _) = super::host::snapshot::Snapshot::import(records, scope, || Ok(ControlState::default()))?;
+        for _ in 0..3 {
+            let (revision, mut state) = snapshot.read_versioned::<ControlState>()?.ok_or_else(|| anyhow::anyhow!("U17 registry control state disappeared"))?;
+            if !state.imported_hosts.contains(machine_name) {
+                let legacy: ControlState = read_control_legacy(&self.dir)?;
+                merge_legacy_map(&mut state.names, legacy.names, &state.edited_names, "names")?;
+                merge_legacy_map(&mut state.holders, legacy.holders, &state.edited_holders, "holders")?;
+                let keep_off: Vec<String> = legacy.keep_off.into_iter().filter(|id| !state.edited_keep_going.contains(id)).collect();
+                state.keep_off.extend(keep_off);
+                for (id, epoch) in legacy.epochs { let old = state.epochs.entry(id).or_default(); *old = (*old).max(epoch); }
+                state.imported_hosts.insert(machine_name.to_owned());
+                match snapshot.save_at(&state, revision) {
+                    Ok(()) => {}
+                    Err(error) if control_conflict(&error) => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            *self.control_baseline.get_mut() = state.clone();
+            *self.names.get_mut() = state.names;
+            *self.keep_off.get_mut() = state.keep_off;
+            *self.holders.get_mut() = state.holders;
+            *self.epochs.get_mut() = state.epochs;
+            self.control_snapshot = Some(snapshot);
+            return Ok(());
+        }
+        anyhow::bail!("U17 registry control import kept changing; legacy state retained")
+    }
+
     /// Tests: sessions started here from now on run `program` instead of their harness.
     #[cfg(test)]
     pub fn set_test_program(&self, program: &str) {
         *self.test_program.lock() = Some(program.to_owned());
     }
 
-    /// Where restoring the conversation store from a mirror's copy stands.
+    /// U15: retained API readers report retirement; no application mirror controller exists.
     pub fn restore_view(&self) -> Restore {
-        let mut r = self.restore.lock();
-        if let Restore::Asked { from, at } = &*r
-            && crate::util::now_ms() - at > RESTORE_ANSWER_MS
-        {
-            *r = Restore::Failed { from: from.clone(), error: "no answer: its kiln may be too old to send its copy back".into(), at: crate::util::now_ms() };
-        }
-        r.clone()
+        Restore::Retired { reason: "Conversation recovery is owned by the host Amphora database." }
     }
 
-    /// Ask `machine`, a mirror, for its copy of the conversation store, to restore this one from:
-    /// what the copy brings fills in what the store lacks (`docs/conversations.md`, "Mirrors").
-    pub fn restore_from(&self, hub: &Arc<Hub>, machine: &str) -> anyhow::Result<()> {
-        let st = self.convo.as_ref().ok_or_else(|| anyhow::anyhow!("the conversation store is off"))?;
-        anyhow::ensure!(self.feed.is_some(), "this server takes no conversation feeds");
-        let peer = hub.instances.lock().newest_with(machine, crate::proto::CAP_CONVO).ok_or_else(|| anyhow::anyhow!("{machine} isn't connected, or keeps no conversation store"))?;
-        if matches!(self.restore_view(), Restore::Asked { .. } | Restore::Copying { .. }) {
-            anyhow::bail!("a restore is already under way");
-        }
-        *self.restore.lock() = Restore::Asked { from: machine.to_owned(), at: crate::util::now_ms() };
-        self.restore_auto.lock().clear();
-        tracing::info!(%machine, "asked a mirror for its copy of the conversation store, to restore this one from");
-        let json = crate::convo::feed::encode(&crate::convo::feed::Msg::Restore { store: st.id().to_owned() });
-        let h = Arc::clone(hub);
-        crate::rt::spawn(async move {
-            if let Ok(b) = crate::proto::encode(&crate::proto::ServerMsg::Convo { json, data: Vec::new() }) {
-                h.net.send(peer, crate::proto::LANE_CONVO, crate::net::Kind::Log, b).await;
-            }
-        });
-        Ok(())
+    pub fn restore_from(&self, _hub: &Arc<Hub>, _machine: &str) -> anyhow::Result<()> {
+        anyhow::bail!("U15: conversation mirror recovery is retired; recover the host Amphora database")
     }
 
-    /// Mirror `machine` begins sending back its copy `store`: whether it was asked for.
-    pub fn restore_accepts(&self, machine: &str, store: &str) -> bool {
-        let mut r = self.restore.lock();
-        match &*r {
-            Restore::Asked { from, .. } if from == machine => {
-                *r = Restore::Copying { from: machine.to_owned(), store: store.to_owned(), at: crate::util::now_ms() };
-                true
-            }
-            // Said again (it asks again after a silence).
-            Restore::Copying { from, store: s, .. } => from == machine && s == store,
-            _ => false,
+    /// Fleet control is shared across replicas; local maps are mutation baselines, not an
+    /// independent authority for another replica's names, routing holder or epoch fences.
+    fn persisted_control(&self) -> Option<ControlState> {
+        let snapshot = self.control_snapshot.as_ref()?;
+        match snapshot.read_versioned::<ControlState>() {
+            Ok(Some((_, state))) => Some(state),
+            Ok(None) => { tracing::error!("U17 canonical registry controls disappeared"); None }
+            Err(error) => { tracing::error!(%error, "U17 canonical registry controls unavailable; retaining last observed view"); None }
         }
     }
 
-    /// Mirror `machine` has sent back its copy `store` whole (an empty `store`: it has none):
-    /// the sessions it brought back are listed, away, on the machines they ran on.
-    pub fn restore_done(&self, hub: &Arc<Hub>, machine: &str, store: &str) {
-        let state = self.restore.lock().clone();
-        match state {
-            Restore::Asked { from, .. } if from == machine && store.is_empty() => {
-                *self.restore.lock() = Restore::Failed { from, error: format!("{machine} keeps no copy of the conversation store"), at: crate::util::now_ms() };
+    fn set_shared_control(&self, id: &str, action: SharedControl) -> anyhow::Result<bool> {
+        let Some(snapshot) = &self.control_snapshot else { return Ok(false) };
+        let _commit = self.control_commit.lock();
+        for _ in 0..3 {
+            let (revision, mut state) = snapshot.read_versioned::<ControlState>()?.ok_or_else(|| anyhow::anyhow!("U17 registry controls disappeared"))?;
+            match &action {
+                SharedControl::Name(Some(name)) => { state.names.insert(id.to_owned(), name.clone()); state.edited_names.insert(id.to_owned()); }
+                SharedControl::Name(None) => { state.names.remove(id); state.edited_names.insert(id.to_owned()); }
+                SharedControl::KeepGoing(true) => { state.keep_off.remove(id); state.edited_keep_going.insert(id.to_owned()); }
+                SharedControl::KeepGoing(false) => { state.keep_off.insert(id.to_owned()); state.edited_keep_going.insert(id.to_owned()); }
+                SharedControl::Holder(instance) => { state.holders.insert(id.to_owned(), instance.clone()); state.edited_holders.insert(id.to_owned()); }
+                SharedControl::Epoch(epoch) => { let current = state.epochs.entry(id.to_owned()).or_default(); *current = (*current).max(*epoch); }
             }
-            Restore::Copying { from, store: s, .. } if from == machine && s == store => {
-                let (h, st) = (Arc::clone(hub), self.convo.clone());
-                crate::rt::spawn(async move {
-                    let ended = match st {
-                        Some(st) => crate::rt::blocking(move || st.end_copy()).await.and_then(|r| r),
-                        None => Err(anyhow::anyhow!("the conversation store is off")),
-                    };
-                    let at = crate::util::now_ms();
-                    match ended {
-                        Ok(sessions) => {
-                            tracing::info!(machine = %from, sessions, "the conversation store was restored from a mirror's copy");
-                            Self::list_away(&h).await;
-                            *h.harness.restore.lock() = Restore::Done { from, sessions, at };
+            match snapshot.save_at(&state, revision) {
+                Ok(()) => {
+                    let mut baseline = self.control_baseline.lock();
+                    match action {
+                        SharedControl::Name(_) => {
+                            let mut local = self.names.lock();
+                            if let Some(name) = state.names.get(id) { local.insert(id.to_owned(), name.clone()); baseline.names.insert(id.to_owned(), name.clone()); }
+                            else { local.remove(id); baseline.names.remove(id); }
                         }
-                        Err(e) => *h.harness.restore.lock() = Restore::Failed { from, error: format!("{e:#}"), at },
+                        SharedControl::KeepGoing(_) => {
+                            if state.keep_off.contains(id) { self.keep_off.lock().insert(id.to_owned()); baseline.keep_off.insert(id.to_owned()); }
+                            else { self.keep_off.lock().remove(id); baseline.keep_off.remove(id); }
+                        }
+                        SharedControl::Holder(_) => {
+                            if let Some(instance) = state.holders.get(id) {
+                                self.holders.lock().insert(id.to_owned(), instance.clone());
+                                baseline.holders.insert(id.to_owned(), instance.clone());
+                            }
+                        }
+                        SharedControl::Epoch(_) => {
+                            if let Some(epoch) = state.epochs.get(id) {
+                                self.epochs.lock().insert(id.to_owned(), *epoch);
+                                baseline.epochs.insert(id.to_owned(), *epoch);
+                            }
+                        }
                     }
-                });
+                    return Ok(true);
+                }
+                Err(error) if control_conflict(&error) => continue,
+                Err(error) => return Err(error),
             }
-            _ => {}
         }
+        anyhow::bail!("U17 registry control kept changing; command was not committed")
     }
 
-    /// Runner `machine` keeping a store connected: asked for its copy when the store was found
-    /// empty at start and it is one of the server's mirrors.
-    pub fn restore_due(&self, hub: &Arc<Hub>, machine: &str) {
-        let due = self.restore_auto.lock().iter().any(|m| m == machine);
-        if due
-            && matches!(self.restore_view(), Restore::Idle)
-            && let Err(e) = self.restore_from(hub, machine)
-        {
-            tracing::warn!(%machine, error = %format!("{e:#}"), "couldn't ask a mirror for its copy of the conversation store");
+    /// U17: one destination per successor epoch. A retry to that same machine is safe because
+    /// its shared Handovers ledger takes the package once, across runner instances and restarts.
+    fn reserve_epoch(&self, id: &str, source: u64, target: &str) -> anyhow::Result<u64> {
+        let next = source.checked_add(1).ok_or_else(|| anyhow::anyhow!("U17 session epoch is exhausted"))?;
+        let _commit = self.control_commit.lock();
+        if let Some(snapshot) = &self.control_snapshot {
+            for _ in 0..3 {
+                let (revision, mut state) = snapshot.read_versioned::<ControlState>()?.ok_or_else(|| anyhow::anyhow!("U17 registry controls disappeared"))?;
+                if let Some(reservation) = state.epoch_reservations.get(id).filter(|reservation| reservation.source == source) {
+                    anyhow::ensure!(reservation.target == target && state.epochs.get(id) == Some(&next), "U17 session already reserved for {}; recover its current owner before changing destination", reservation.target);
+                    self.control_baseline.lock().epochs.insert(id.to_owned(), next);
+                    self.epochs.lock().insert(id.to_owned(), next);
+                    return Ok(next);
+                }
+                anyhow::ensure!(state.epochs.get(id).is_none_or(|epoch| *epoch <= source), "U17 session already advanced beyond epoch {source}; recover its current owner before resuming again");
+                state.epochs.insert(id.to_owned(), next);
+                state.epoch_reservations.insert(id.to_owned(), EpochReservation { source, target: target.to_owned() });
+                match snapshot.save_at(&state, revision) {
+                    Ok(()) => {
+                        self.control_baseline.lock().epochs.insert(id.to_owned(), next);
+                        self.epochs.lock().insert(id.to_owned(), next);
+                        return Ok(next);
+                    }
+                    Err(error) if control_conflict(&error) => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            anyhow::bail!("U17 registry epoch reservation kept changing; no package dispatched");
         }
+        let epochs = {
+            let mut epochs = self.epochs.lock();
+            anyhow::ensure!(epochs.get(id).is_none_or(|epoch| *epoch <= source), "U17 session already advanced beyond epoch {source}");
+            epochs.insert(id.to_owned(), next);
+            epochs.clone()
+        };
+        self.keep_json("epochs.json", &epochs)?;
+        Ok(next)
+    }
+
+    fn overlay_control(&self, info: &mut Info, state: &ControlState) {
+        if let Some(name) = state.names.get(&info.id) { info.name.clone_from(name); }
+        else if state.edited_names.contains(&info.id) || self.control_baseline.lock().names.contains_key(&info.id) { info.name.clone_from(&info.kind_name); }
+        info.keep_off = state.keep_off.contains(&info.id);
     }
 
     fn save_names(&self) {
@@ -1007,6 +1155,39 @@ impl Registry {
 
     /// `value` as `file` in the registry's folder, whole or not at all.
     fn keep_json(&self, file: &str, value: &impl serde::Serialize) -> anyhow::Result<()> {
+        if let Some(snapshot) = &self.control_snapshot {
+            let _commit = self.control_commit.lock();
+            let mut baseline = self.control_baseline.lock();
+            let local = ControlState { imported_hosts: Default::default(), names: self.names.lock().clone(), keep_off: self.keep_off.lock().clone(), holders: self.holders.lock().clone(), epochs: self.epochs.lock().clone(), ..ControlState::default() };
+            for _ in 0..3 {
+                let (revision, mut state) = snapshot.read_versioned::<ControlState>()?.ok_or_else(|| anyhow::anyhow!("U17 registry controls disappeared"))?;
+                match file {
+                    "names.json" => { state.edited_names.extend(changed_control_keys(&baseline.names, &local.names)); apply_map_delta(&mut state.names, &baseline.names, &local.names); }
+                    "holders.json" => { state.edited_holders.extend(changed_control_keys(&baseline.holders, &local.holders)); apply_map_delta(&mut state.holders, &baseline.holders, &local.holders); }
+                    "epochs.json" => for (id, epoch) in &local.epochs { let old = state.epochs.entry(id.clone()).or_default(); *old = (*old).max(*epoch); },
+                    "keep-off.json" => {
+                        for id in local.keep_off.difference(&baseline.keep_off) { state.keep_off.insert(id.clone()); state.edited_keep_going.insert(id.clone()); }
+                        for id in baseline.keep_off.difference(&local.keep_off) { state.keep_off.remove(id); state.edited_keep_going.insert(id.clone()); }
+                    }
+                    _ => anyhow::bail!("U17 unknown registry control snapshot {file}"),
+                }
+                match snapshot.save_at(&state, revision) {
+                    Ok(()) => {
+                        match file {
+                            "names.json" => baseline.names = local.names,
+                            "holders.json" => baseline.holders = local.holders,
+                            "epochs.json" => baseline.epochs = local.epochs,
+                            "keep-off.json" => baseline.keep_off = local.keep_off,
+                            _ => {}
+                        }
+                        return Ok(());
+                    }
+                    Err(error) if control_conflict(&error) => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            anyhow::bail!("U17 registry control state kept changing; update was not committed");
+        }
         let path = self.dir.join(file);
         std::fs::create_dir_all(&self.dir)?;
         let tmp = path.with_extension("json.part");
@@ -1017,26 +1198,23 @@ impl Registry {
 
     /// Whether kiln keeps a session going when it stops part-way (the "keep_going" control, from
     /// any device): kept here, so it holds across restarts whatever its machine's runner knows.
-    fn set_keep_going(&self, hub: &Hub, id: &str, on: bool) {
-        let off: Vec<String> = {
-            let mut g = self.keep_off.lock();
-            if on {
-                g.remove(id);
-            } else {
-                g.insert(id.to_owned());
-            }
-            g.iter().cloned().collect()
-        };
-        if let Err(e) = self.keep_json("keep-off.json", &off) {
-            tracing::warn!(error = %format!("{e:#}"), "couldn't keep which agents kiln doesn't keep going");
+    fn set_keep_going(&self, hub: &Hub, id: &str, on: bool) -> anyhow::Result<()> {
+        if !self.set_shared_control(id, SharedControl::KeepGoing(on))? {
+            let off: Vec<String> = {
+                let mut g = self.keep_off.lock();
+                if on { g.remove(id); } else { g.insert(id.to_owned()); }
+                g.iter().cloned().collect()
+            };
+            self.keep_json("keep-off.json", &off)?;
         }
         let info = {
             let mut g = self.mirrors.lock();
-            let Some(m) = g.get_mut(id) else { return };
+            let Some(m) = g.get_mut(id) else { return Ok(()) };
             m.info.keep_off = !on;
             m.info.clone()
         };
         hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info) });
+        Ok(())
     }
 
     /// The plans sessions proposed (plan mode) since the last look, by session, each its latest.
@@ -1083,20 +1261,19 @@ impl Registry {
 
     /// A session is given a name here (the "rename" control from any device; empty gives it its
     /// harness's name back): its page and every list show it at once.
-    fn rename(&self, hub: &Hub, id: &str, value: Option<&Value>) {
+    fn rename(&self, hub: &Hub, id: &str, value: Option<&Value>) -> anyhow::Result<()> {
         let name: String = value.and_then(Value::as_str).unwrap_or("").trim().chars().take(MAX_NAME).collect();
-        {
-            let mut g = self.names.lock();
-            if name.is_empty() {
-                g.remove(id);
-            } else {
-                g.insert(id.to_owned(), name.clone());
-            }
+        if !self.set_shared_control(id, SharedControl::Name((!name.is_empty()).then_some(name.clone())))? {
+            let names = {
+                let mut g = self.names.lock();
+                if name.is_empty() { g.remove(id); } else { g.insert(id.to_owned(), name.clone()); }
+                g.clone()
+            };
+            self.keep_json("names.json", &names)?;
         }
-        self.save_names();
         let info = {
             let mut g = self.mirrors.lock();
-            let Some(m) = g.get_mut(id) else { return };
+            let Some(m) = g.get_mut(id) else { return Ok(()) };
             m.info.name = if name.is_empty() { m.info.kind_name.clone() } else { name };
             if let Some(o) = m.state.as_object_mut() {
                 o.insert("name".into(), json!(m.info.name));
@@ -1107,6 +1284,7 @@ impl Registry {
             m.info.clone()
         };
         hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info) });
+        Ok(())
     }
 
     /// Environment for one of the server's own terminals, so `kiln spawn` there works.
@@ -1218,54 +1396,47 @@ impl Registry {
         }
     }
 
+    /// U17: await the local host's canonical recovery before accepting session starts. The same
+    /// once-only boundary serves supervised startup and callers that need explicit readiness.
+    pub(crate) async fn initialize_local(hub: &Arc<Hub>) -> anyhow::Result<()> {
+        // U17: restoration and its once-only startup guard take synchronous ownership/storage
+        // locks. Keep those waits off the shard which admits the session lanes they start.
+        let starting = Arc::clone(hub);
+        crate::rt::blocking(move || -> anyhow::Result<()> {
+            let hub = starting;
+            let mut restored = hub.harness.local_restored.lock();
+            if !*restored {
+                hub.harness.local.try_restore_from(hub.harness.convo.as_ref())?;
+                // Files finished messages mention, kept as they come.
+                crate::rt::spawn(Keeper::run(hub.clone()));
+                // The server's own sessions' harness records, followed into its store.
+                if let Some(st) = &hub.harness.convo {
+                    let local = hub.harness.local.clone();
+                    if let Err(e) = crate::convo::record::Recorder::start(st.clone(), move || local.record_sources()) {
+                        tracing::warn!(error = %format!("{e:#}"), "the harnesses' records won't be kept in the conversation store");
+                    }
+                }
+                // What the server's own terminals and agents ask of kiln (`kiln spawn --on`, `kiln
+                // agents wait`) is answered here.
+                let forward = Some(crate::harness::ops::forward(Arc::clone(&hub)));
+                match super::socket::serve_with(&hub.harness.local, super::socket::path("server", &hub.harness.dir), forward, false) {
+                    Ok(p) => *hub.harness.local_sock.lock() = Some(p.to_string_lossy().into_owned()),
+                    Err(e) => tracing::info!(error = %format!("{e:#}"), "`kiln spawn` will not be available in the server's own terminals"),
+                }
+                *restored = true;
+            }
+            Ok(())
+        }).await??;
+        Ok(())
+    }
+
     pub async fn run_local(hub: Arc<Hub>) -> anyhow::Result<()> {
-        static RESTORED: std::sync::Once = std::sync::Once::new();
         // Sessions of machines that are away: listed from the store.
         Self::list_away(&hub).await;
         let rx = hub.harness.local_rx.clone();
         let offered = crate::rt::blocking(super::kinds::offered).await.unwrap_or_default();
         hub.harness.kinds.lock().insert("local".to_owned(), offered);
-        RESTORED.call_once(|| {
-            // Files finished messages mention, kept as they come.
-            crate::rt::spawn(Keeper::run(hub.clone()));
-            hub.harness.local.restore_from(hub.harness.convo.as_ref());
-            // The server's own sessions' harness records, followed into its store.
-            if let Some(st) = &hub.harness.convo {
-                let local = hub.harness.local.clone();
-                if let Err(e) = crate::convo::record::Recorder::start(st.clone(), move || local.record_sources()) {
-                    tracing::warn!(error = %format!("{e:#}"), "the harnesses' records won't be kept in the conversation store");
-                }
-            }
-            // What the server sends its mirrors, on the feed's lane.
-            if let Some(out) = hub.harness.copies_out.clone() {
-                let h = hub.clone();
-                crate::rt::spawn(async move {
-                    while let Ok((peer, json, data)) = out.recv().await {
-                        if let Ok(b) = crate::proto::encode(&crate::proto::ServerMsg::Convo { json, data }) {
-                            h.net.send(peer, crate::proto::LANE_CONVO, crate::net::Kind::Log, b).await;
-                        }
-                    }
-                });
-            }
-            // What the server answers runners' feeds, on the feed's lane.
-            if let Some(out) = hub.harness.feed_out.clone() {
-                let h = hub.clone();
-                crate::rt::spawn(async move {
-                    while let Ok(o) = out.recv().await {
-                        if let Ok(b) = crate::proto::encode(&crate::proto::ServerMsg::Convo { json: o.json, data: Vec::new() }) {
-                            h.net.send(o.peer, crate::proto::LANE_CONVO, crate::net::Kind::Log, b).await;
-                        }
-                    }
-                });
-            }
-            // What the server's own terminals and agents ask of kiln (`kiln spawn --on`, `kiln
-            // agents wait`) is answered here.
-            let forward = Some(crate::harness::ops::forward(Arc::clone(&hub)));
-            match super::socket::serve_with(&hub.harness.local, super::socket::path("server", &hub.harness.dir), forward, false) {
-                Ok(p) => *hub.harness.local_sock.lock() = Some(p.to_string_lossy().into_owned()),
-                Err(e) => tracing::info!(error = %format!("{e:#}"), "`kiln spawn` will not be available in the server's own terminals"),
-            }
-        });
+        Self::initialize_local(&hub).await?;
         loop {
             let Ok((id, u)) = rx.recv().await else { return Ok(()) };
             hub.harness.ingest(&hub, &Location::Local, &id, u);
@@ -1274,6 +1445,7 @@ impl Registry {
 
     pub fn list(&self) -> Vec<Info> {
         let mut v: Vec<Info> = self.mirrors.lock().values().map(|m| m.info.clone()).collect();
+        if let Some(state) = self.persisted_control() { for info in &mut v { self.overlay_control(info, &state); } }
         v.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
         v
     }
@@ -1367,28 +1539,27 @@ impl Registry {
     /// A copy of session `id` at `epoch` is from before it went on elsewhere: its machine lets go
     /// of it.
     pub fn stale(&self, id: &str, epoch: u64) -> bool {
-        self.epochs.lock().get(id).is_some_and(|e| *e > epoch)
+        self.epochs.lock().get(id).is_some_and(|e| *e > epoch) || self.persisted_control().is_some_and(|state| state.epochs.get(id).is_some_and(|current| *current > epoch))
     }
 
     /// Session `id` is at `epoch` now (epochs only rise), kept when it changes.
-    fn raise_epoch(&self, id: &str, epoch: u64) {
+    fn raise_epoch(&self, id: &str, epoch: u64) -> anyhow::Result<()> {
+        if self.set_shared_control(id, SharedControl::Epoch(epoch))? { return Ok(()); }
         let snapshot = {
             let mut g = self.epochs.lock();
             let e = g.entry(id.to_owned()).or_insert(0);
             if *e >= epoch {
-                return;
+                return Ok(());
             }
             *e = epoch;
             g.clone()
         };
-        if let Err(e) = self.keep_json("epochs.json", &snapshot) {
-            tracing::warn!(error = %format!("{e:#}"), "couldn't keep the agents' epochs");
-        }
+        self.keep_json("epochs.json", &snapshot)
     }
 
-    /// An update of session `id` from `from`. `shipped`: its machine keeps it in a store it sends
-    /// the server's (`crate::convo::feed`), which keeps it from that, not from here.
-    pub fn ingest_from(&self, hub: &Hub, from: &Location, id: &str, u: Update, shipped: bool) {
+    /// U15: every accepted session update reaches the shared database; legacy feed capabilities
+    /// no longer suppress timeline persistence. Amphora owns any replication of the committed rows.
+    pub fn ingest_from(&self, hub: &Hub, from: &Location, id: &str, u: Update, _shipped: bool) {
         // What became of a message: for whoever waits for it, wherever it was taken or refused.
         let u = match u {
             Update::Inbox { said } => {
@@ -1397,6 +1568,12 @@ impl Registry {
             }
             other => other,
         };
+        if matches!(u, Update::Closed)
+            && let Err(error) = self.release_holder(id)
+        {
+            tracing::error!(%error, session = id, "U17 session close not published because metadata cleanup was not committed");
+            return;
+        }
         let mut changed: Option<Info> = None;
         let mut gone = false;
         // The copy's events went another way than its viewers have them: they start over from it.
@@ -1427,7 +1604,12 @@ impl Registry {
             other => other,
         };
         match &u {
-            Update::Open { info, .. } if info.epoch > 0 => self.raise_epoch(id, info.epoch),
+            Update::Open { info, .. } if info.epoch > 0 => {
+                if let Err(error) = self.raise_epoch(id, info.epoch) {
+                    tracing::error!(%error, session = id, "U17 session Open not accepted because its epoch was not committed");
+                    return;
+                }
+            }
             Update::Open { .. } => {}
             // Only the machine a session runs on speaks for it: a copy left behind where it went
             // on from says nothing more of it.
@@ -1438,7 +1620,7 @@ impl Registry {
             }
         }
         // A changeset's patch is stored as the whole changeset it makes, once taken in (below).
-        if let Some(store) = self.convo.as_ref().filter(|_| !shipped && !matches!(u, Update::ChangesPatch { .. })) {
+        if let Some(store) = self.convo.as_ref().filter(|_| !matches!(u, Update::ChangesPatch { .. })) {
             store.send(id, &u);
         }
         {
@@ -1568,7 +1750,7 @@ impl Registry {
                 Update::Changes { files } => m.take_changes(files.iter().filter_map(|f| serde_json::to_value(f).ok()).collect(), Vec::new(), true),
                 Update::ChangesPatch { set, gone } => {
                     m.take_changes(set.iter().filter_map(|f| serde_json::to_value(f).ok()).collect(), gone.iter().filter_map(|k| serde_json::to_value(k).ok()).collect(), false);
-                    if let Some(store) = self.convo.as_ref().filter(|_| !shipped) {
+                    if let Some(store) = self.convo.as_ref() {
                         let changes = serde_json::to_string(&m.changes).ok();
                         store.put(vec![crate::convo::rows::Row::Session { session: id.to_owned(), info: None, meta: None, state: None, changes, epoch: None, open: false, at: crate::util::now_ms() }]);
                     }
@@ -1641,9 +1823,9 @@ impl Registry {
             self.save_names();
         }
         if gone {
-            self.keeper.forget(id);
-            self.visuals.forget(id);
-            self.forget_holders(&[id.to_owned()]);
+            if let Err(error) = self.visuals.forget(id) {
+                tracing::warn!(session = id, error = %format!("{error:#}"), "U17: published page metadata could not be forgotten");
+            }
             self.opened.forget(id);
             self.asked.forget(id);
             super::archive::closed(hub, id);
@@ -1679,11 +1861,11 @@ impl Registry {
     /// runner process `instance` speaks for the sessions it holds: one another process of the
     /// machine holds ([`Registry::holder`]) stays, and while that process isn't among those
     /// connected (`present`), it is said to be away, as a machine's sessions are when it is.
-    pub fn inventory(&self, hub: &Hub, machine: &str, instance: Option<&str>, present: &[String], inv: Inventory) {
+    pub fn inventory(&self, hub: &Hub, machine: &str, instance: Option<&str>, present: &[String], inv: Inventory) -> anyhow::Result<()> {
         let keep: std::collections::HashSet<String> = inv.sessions.into_iter().collect();
         let (others, away): (std::collections::HashSet<String>, Vec<String>) = match instance {
             Some(me) => {
-                let g = self.holders.lock();
+                let g = self.persisted_control().map(|state| state.holders).unwrap_or_else(|| self.holders.lock().clone());
                 let others: std::collections::HashSet<String> = g.iter().filter(|(_, h)| h.as_str() != me).map(|(id, _)| id.clone()).collect();
                 let away = g.iter().filter(|(id, h)| h.as_str() != me && !present.contains(h) && !keep.contains(*id)).map(|(id, _)| id.clone()).collect();
                 (others, away)
@@ -1695,56 +1877,104 @@ impl Registry {
             let g = self.mirrors.lock();
             away.into_iter().filter(|id| g.get(id).is_some_and(|m| m.location == at && m.info.status != Status::Disconnected)).collect()
         };
-        if !away.is_empty() {
-            tracing::info!(%machine, sessions = away.len(), "agent sessions another runner process of this machine holds, which isn't connected: kept, away");
-            self.sessions_lost(hub, &away);
-        }
         let gone: Vec<String> = {
-            let mut g = self.mirrors.lock();
+            let g = self.mirrors.lock();
             // Not one this server opened there that the machine hasn't announced yet: the report
             // was made before the open got there.
-            let gone: Vec<String> = g
+            g
                 .iter()
                 .filter(|(id, m)| {
                     m.location == Location::Machine(machine.to_owned()) && !keep.contains(*id) && !others.contains(*id) && m.opened_at.is_none_or(|t| t.elapsed() > OPEN_GRACE)
                 })
                 .map(|(id, _)| id.clone())
-                .collect();
+                .collect()
+        };
+        self.forget_holders(&gone)?;
+        if !away.is_empty() {
+            tracing::info!(%machine, sessions = away.len(), "agent sessions another runner process of this machine holds, which isn't connected: kept, away");
+            self.sessions_lost(hub, &away);
+        }
+        {
+            let mut g = self.mirrors.lock();
             for id in &gone {
                 if let Some(mut m) = g.remove(id) {
                     // Its feed's topic goes with it once its viewers are told.
                     m.feed.publish(&Frame::of(crate::wire::ui::SessionFrame::Closed.into()));
                 }
             }
-            gone
-        };
+        }
         self.kinds.lock().insert(format!("agent:{machine}"), inv.kinds);
-        self.forget_holders(&gone);
         for id in gone {
             super::archive::closed(hub, &id);
             hub.emit(&crate::wire::events::ServerEvent::HarnessClosed { id: id.to_string() });
         }
+        Ok(())
     }
 
     /// Session `id` is held by runner process `instance` of its machine, as that process said:
     /// kept (across restarts too) once it changes.
-    pub fn held_by(&self, id: &str, instance: &str) {
+    pub fn held_by(&self, id: &str, instance: &str) -> anyhow::Result<()> {
+        if self.holders.lock().get(id).is_some_and(|holder| holder == instance)
+            && (self.control_snapshot.is_none() || self.persisted_control().is_some_and(|state| state.holders.get(id).is_some_and(|holder| holder == instance)))
+        { return Ok(()); }
+        if self.set_shared_control(id, SharedControl::Holder(instance.to_owned()))? { return Ok(()); }
+        let _commit = self.control_commit.lock();
+        let before = self.holders.lock().get(id).cloned();
         {
             let mut g = self.holders.lock();
             if g.get(id).is_some_and(|h| h == instance) {
-                return;
+                return Ok(());
             }
             g.insert(id.to_owned(), instance.to_owned());
         }
-        self.save_holders();
+        if let Err(error) = self.save_holders() {
+            let mut holders = self.holders.lock();
+            if let Some(previous) = before { holders.insert(id.to_owned(), previous); } else { holders.remove(id); }
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// The runner process of its machine that last said it holds session `id`, if one did.
     pub fn holder(&self, id: &str) -> Option<String> {
+        if let Some(state) = self.persisted_control() { return state.holders.get(id).cloned(); }
         self.holders.lock().get(id).cloned()
     }
 
-    fn forget_holders(&self, ids: &[String]) {
+    pub fn release_holder(&self, id: &str) -> anyhow::Result<()> {
+        // U17: Closed must not retire its mirror/holder before kept metadata is tombstoned.
+        self.keeper.forget(id)?;
+        self.forget_holders(&[id.to_owned()])
+    }
+
+    fn forget_holders(&self, ids: &[String]) -> anyhow::Result<()> {
+        if ids.is_empty() { return Ok(()); }
+        if let Some(snapshot) = &self.control_snapshot {
+            let _commit = self.control_commit.lock();
+            let expected: HashMap<String, String> = { let holders = self.holders.lock(); ids.iter().filter_map(|id| holders.get(id).map(|holder| (id.clone(), holder.clone()))).collect() };
+            if expected.is_empty() { return Ok(()); }
+            for _ in 0..3 {
+                let (revision, mut state) = snapshot.read_versioned::<ControlState>()?.ok_or_else(|| anyhow::anyhow!("U17 registry controls disappeared"))?;
+                for (id, holder) in &expected {
+                    if state.holders.get(id) == Some(holder) { state.holders.remove(id); state.edited_holders.insert(id.clone()); }
+                }
+                match snapshot.save_at(&state, revision) {
+                    Ok(()) => {
+                        let mut baseline = self.control_baseline.lock();
+                        let mut holders = self.holders.lock();
+                        for (id, previous) in &expected {
+                            if holders.get(id) == Some(previous) { holders.remove(id); baseline.holders.remove(id); }
+                        }
+                        return Ok(());
+                    }
+                    Err(error) if control_conflict(&error) => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            anyhow::bail!("U17 holder cleanup kept changing; inventory was not accepted");
+        }
+        let _commit = self.control_commit.lock();
+        let before = self.holders.lock().clone();
         let mut changed = false;
         {
             let mut g = self.holders.lock();
@@ -1752,16 +1982,13 @@ impl Registry {
                 changed |= g.remove(id).is_some();
             }
         }
-        if changed {
-            self.save_holders();
-        }
+        if changed && let Err(error) = self.save_holders() { *self.holders.lock() = before; return Err(error); }
+        Ok(())
     }
 
-    fn save_holders(&self) {
+    fn save_holders(&self) -> anyhow::Result<()> {
         let holders = self.holders.lock().clone();
-        if let Err(e) = self.keep_json("holders.json", &holders) {
-            tracing::warn!(error = %format!("{e:#}"), "couldn't keep which runner process holds each agent session");
-        }
+        self.keep_json("holders.json", &holders)
     }
 
     /// The machine went away: its sessions keep running there and come back when it reconnects.
@@ -1821,19 +2048,19 @@ impl Registry {
     }
 
     /// Join a session's stream. None when there is no such session.
-    pub fn attach(&self, id: &str) -> Option<Attachment> {
+    pub fn attach(&self, id: &str) -> anyhow::Result<Option<Attachment>> {
         self.attach_from(id, None)
     }
 
     /// Join a session's stream as a viewer that had it through revision `after` (`(born, rev)`):
     /// what it lacks if the copy can resume it (the same process, nothing started over since),
     /// else all of it. None when there is no such session.
-    pub fn attach_from(&self, id: &str, after: Option<(u64, u64)>) -> Option<Attachment> {
-        // What's kept is read before the mirrors are locked: the first time, off disk.
-        let files = self.keeper.frame(id);
+    pub fn attach_from(&self, id: &str, after: Option<(u64, u64)>) -> anyhow::Result<Option<Attachment>> {
+        // U17: read canonical metadata before taking the mirror lock.
+        let files = self.keeper.frame(id)?;
         let (parts, topic, at, viewer, refusals) = {
             let mut g = self.mirrors.lock();
-            let m = g.get_mut(id)?;
+            let Some(m) = g.get_mut(id) else { return Ok(None) };
             // The offset under the same lock as the parts: every publish takes it too.
             let (viewer, at) = m.feed.attach();
             let parts = after.filter(|(b, _)| *b == born()).and_then(|(_, rev)| m.parts_since(rev)).unwrap_or_else(|| m.parts());
@@ -1841,18 +2068,18 @@ impl Registry {
         };
         let rev = parts.rev;
         // Made into frames with the lock let go: no other session's publish waits on this one.
-        Some(Attachment { frames: parts.frames(files), topic, at, viewer, refusals, rev })
+        Ok(Some(Attachment { frames: parts.frames(files), topic, at, viewer, refusals, rev }))
     }
 
     /// Catch-up frames for a viewer that fell behind having had revision `rev`: what it missed (it
     /// begins with `resumed`), or all of it when that can't be told apart (`open`); where on the
     /// session's topic it reads on from, taken under the same lock, so it reads nothing twice; the
     /// feed's refusals then; and the copy's revision they bring it to. None when the session is gone.
-    pub fn frames_since(&self, id: &str, rev: u64) -> Option<(Vec<String>, Option<kiln_seams::bus::Offset>, u64, u64)> {
-        let files = self.keeper.frame(id);
-        let (parts, at, refusals) = self.mirrors.lock().get_mut(id).map(|m| (m.parts_since(rev).unwrap_or_else(|| m.parts()), m.feed.position(), m.feed.refusals()))?;
+    pub fn frames_since(&self, id: &str, rev: u64) -> anyhow::Result<Option<(Vec<String>, Option<kiln_seams::bus::Offset>, u64, u64)>> {
+        let files = self.keeper.frame(id)?;
+        let Some((parts, at, refusals)) = self.mirrors.lock().get_mut(id).map(|m| (m.parts_since(rev).unwrap_or_else(|| m.parts()), m.feed.position(), m.feed.refusals())) else { return Ok(None) };
         let now = parts.rev;
-        Some((parts.frames(files), at, refusals, now))
+        Ok(Some((parts.frames(files), at, refusals, now)))
     }
 
     /// Files a finished message mentioned, kept now (`super::kept`): its viewers hear of them.
@@ -1866,10 +2093,10 @@ impl Registry {
 
     /// Where a session runs, when one of its messages mentions `path` (a relative mention, in its
     /// folder): a viewer may read that file from its machine, and no other.
-    pub fn mentioned_where(&self, id: &str, path: &str) -> Option<Location> {
-        let listed = self.keeper.lists_path(id, path);
+    pub fn mentioned_where(&self, id: &str, path: &str) -> anyhow::Result<Option<Location>> {
+        let listed = self.keeper.lists_path(id, path)?;
         let g = self.mirrors.lock();
-        let m = g.get(id)?;
+        let Some(m) = g.get(id) else { return Ok(None) };
         let cwd = &m.info.cwd;
         let said = || {
             m.events
@@ -1879,11 +2106,12 @@ impl Registry {
                 .filter_map(|e| e.get("text").and_then(Value::as_str))
                 .any(|t| files::mentioned(t).iter().any(|p| files::resolve(p, cwd).as_deref() == Some(path)))
         };
-        (listed || said()).then(|| m.location.clone())
+        Ok((listed || said()).then(|| m.location.clone()))
     }
 
     /// Start sessions on `target`. Sessions on machines are named here and appear at once
     /// (starting); the machine fills them in.
+    /// U17: a caller that has a durable occurrence/outbox identity uses open_once instead.
     pub async fn open(&self, hub: &Hub, target: &str, spec: Spec, count: usize) -> anyhow::Result<Vec<Info>> {
         let count = count.clamp(1, 16);
         let loc = Location::of_target(target);
@@ -1918,7 +2146,13 @@ impl Registry {
                     // A workspace of its own first: a volume over its folder, mounted, its folder in it.
                     let id = crate::util::new_id();
                     crate::workspace::prepare(&mut spec, &id).await.map_err(|e| e.context("its workspace"))?;
-                    let s = self.local.open(Some(id), spec)?;
+                    let s = if self.local.persistent_scope().is_some() {
+                        let host = Arc::clone(&self.local);
+                        crate::rt::blocking(move || host.open_once(&id, spec)).await??.ok_or_else(|| anyhow::anyhow!("U17 new session identity was accepted before"))?
+                    } else {
+                        // The compatibility Registry fixture has no canonical persistence.
+                        self.local.open(Some(id), spec)?
+                    };
                     let mut info = s.info();
                     info.target = loc.target();
                     // Seed the mirror so the session lists before its first update arrives.
@@ -2006,6 +2240,91 @@ impl Registry {
             hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info.clone()) });
         }
         Ok(out)
+    }
+
+    fn open_scope(id: &str) -> anyhow::Result<String> {
+        anyhow::ensure!(!id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'), "U17 invalid stable session id");
+        Ok(format!("server/open/{id}"))
+    }
+
+    /// U17: consult before selecting another machine on an outbox retry. Target/spec stay
+    /// fixed once chosen, even when the load, parent settings or available machines change.
+    pub fn planned_open(&self, session_id: &str) -> anyhow::Result<Option<(String, Spec)>> {
+        let snapshot = self.control_snapshot.as_ref().ok_or_else(|| anyhow::anyhow!("U17 keyed starts require canonical registry persistence"))?;
+        let intent = super::host::snapshot::Snapshot::peek::<OpenIntent>(snapshot.records(), &Self::open_scope(session_id)?)?;
+        Ok(intent.map(|intent| (intent.target, intent.spec)))
+    }
+
+    pub(crate) fn bind_start_request(&self, session_id: &str, request: Value) -> anyhow::Result<()> {
+        let snapshot = self.control_snapshot.as_ref().ok_or_else(|| anyhow::anyhow!("U17 keyed starts require canonical registry persistence"))?;
+        let scope = format!("{}/request", Self::open_scope(session_id)?);
+        let (_, accepted) = super::host::snapshot::Snapshot::import(snapshot.records(), &scope, || Ok(request.clone()))?;
+        anyhow::ensure!(accepted == request, "U17 start key is already bound to a different request");
+        Ok(())
+    }
+
+    fn bind_open(&self, target: &str, spec: Spec, session_id: &str, at: i64) -> anyhow::Result<(super::host::snapshot::Snapshot, OpenIntent)> {
+        anyhow::ensure!(target == "local" || target.strip_prefix("agent:").is_some_and(|machine| !machine.is_empty()), "U17 keyed start needs a canonical target");
+        let controls = self.control_snapshot.as_ref().ok_or_else(|| anyhow::anyhow!("U17 keyed starts require canonical registry persistence"))?;
+        let local_scope = if target == "local" { Some(self.local.persistent_scope().ok_or_else(|| anyhow::anyhow!("U17 local session persistence is unavailable"))?) } else { None };
+        let (snapshot, intent) = super::host::snapshot::Snapshot::import(controls.records(), &Self::open_scope(session_id)?, || Ok(OpenIntent { target: target.to_owned(), local_scope, spec: spec.clone(), at, accepted: false }))?;
+        anyhow::ensure!(intent.spec == spec, "U17 session id {session_id} was already bound to a different start specification");
+        Ok((snapshot, intent))
+    }
+
+    /// U17: accept one controller identity before dispatch, and retry it with the same target
+    /// and spec. This does not promise exactly-once effects performed by an external model.
+    pub async fn open_once(&self, hub: &Hub, target: &str, spec: Spec, session_id: &str) -> anyhow::Result<Info> {
+        let (snapshot, mut intent) = self.bind_open(target, spec, session_id, hub.clock.unix_ms())?;
+        let loc = Location::of_target(&intent.target);
+        if !intent.accepted {
+            // U17: volume preparation changes the spec's mount metadata on replay. Keep the
+            // durable identity boundary explicit until that lifecycle can reuse its first input.
+            anyhow::ensure!(!crate::workspace::needs_preparing(&intent.spec), "U17 keyed starts currently require the session's folder; volume replay is not yet supported");
+            match &loc {
+                Location::Local => {
+                    anyhow::ensure!(intent.local_scope == self.local.persistent_scope(), "U17 keyed local session is bound to another server host; retry through its owner");
+                    let host = Arc::clone(&self.local);
+                    let (id, spec) = (session_id.to_owned(), intent.spec.clone());
+                    let _ = crate::rt::blocking(move || host.open_once(&id, spec)).await??;
+                }
+                Location::Machine(machine) => {
+                    anyhow::ensure!(hub.runner_wide_caps(machine) & crate::proto::CAP_OPEN_ONCE != 0, "{machine} has not advertised durable keyed session opens");
+                    if let Some(why) = hub.skew_holds(machine) { anyhow::bail!("{why}"); }
+                    let json = serde_json::to_string(&intent.spec)?;
+                    match hub.command(machine, &ServerMsg::HarnessOpen { session: session_id.to_owned(), json }, crate::hub::COMMAND_WITHIN).await {
+                        crate::wire::commands::Answer::Taken => {}
+                        other => anyhow::bail!("U17 keyed start for {session_id} is still pending durable acceptance: {other:?}"),
+                    }
+                }
+            }
+            for _ in 0..3 {
+                let (revision, mut current) = snapshot.read_versioned::<OpenIntent>()?.ok_or_else(|| anyhow::anyhow!("U17 keyed start intent disappeared"))?;
+                if current.accepted { intent = current; break; }
+                current.accepted = true;
+                match snapshot.save_at(&current, revision) {
+                    Ok(()) => { intent = current; break; }
+                    Err(error) if control_conflict(&error) => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            anyhow::ensure!(intent.accepted, "U17 keyed start acceptance kept changing; retry the same identity");
+        }
+        if let Some(info) = self.info(session_id) { return Ok(info); }
+        let spec = &intent.spec;
+        let kind = super::kinds::Kind::get(&spec.kind);
+        let info = Info {
+            id: session_id.to_owned(), kind: spec.kind.clone(),
+            kind_name: kind.map_or_else(|| spec.kind.clone(), |kind| kind.name.to_owned()),
+            target: intent.target, name: spec.name.clone().filter(|name| !name.trim().is_empty()).unwrap_or_else(|| default_name(&spec.kind)),
+            cwd: spec.cwd.clone().unwrap_or_default(), model: spec.model.clone().unwrap_or_default(), mode: spec.mode.clone().unwrap_or_default(),
+            created_at: intent.at, last_activity: intent.at, status: Status::Starting,
+            parent: spec.parent.clone(), plan_run: spec.plan_run.clone(), helper: spec.helper.clone(), subagent: spec.subagent,
+            no_bypass: !spec.allow_bypass, reach: spec.reach.clone(), workspace: spec.workspace.clone(), ..Info::default()
+        };
+        self.mirrors.lock().entry(session_id.to_owned()).or_insert_with(|| Mirror { opened_at: Some(std::time::Instant::now()), ..Mirror::new(info.clone(), loc, Arc::clone(&self.bus)) });
+        hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info.clone()) });
+        Ok(info)
     }
 
     /// Keep an uploaded file for the messages that refer to it (by the returned id): until it
@@ -2160,7 +2479,8 @@ impl Registry {
     /// The epoch the server last heard session `id` is at.
     pub fn epoch_of(&self, id: &str) -> u64 {
         let seen = self.mirrors.lock().get(id).map_or(0, |m| m.info.epoch);
-        self.epochs.lock().get(id).copied().unwrap_or(0).max(seen)
+        let shared = self.persisted_control().and_then(|state| state.epochs.get(id).copied()).unwrap_or(0);
+        self.epochs.lock().get(id).copied().unwrap_or(0).max(seen).max(shared)
     }
 
     /// Waits for the answer to message `message` sent to session `id`: none when too many wait
@@ -2293,7 +2613,9 @@ impl Registry {
         if let Sent::Refused(r) = &sent
             && let Some(current) = again_for(r)
         {
-            self.raise_epoch(id, current);
+            if let Err(error) = self.raise_epoch(id, current) {
+                return Sent::Unanswered(format!("session epoch was not committed: {error:#}"));
+            }
             return self.command_once(hub, id, c).await;
         }
         sent
@@ -2316,16 +2638,19 @@ impl Registry {
         if let Command::Control { id: control, value } = &c
             && control == "keep_going"
         {
-            self.set_keep_going(hub, id, value.as_ref().and_then(Value::as_bool).unwrap_or(true));
-            return Pending::Now(Sent::Ok);
+            return Pending::Now(match self.set_keep_going(hub, id, value.as_ref().and_then(Value::as_bool).unwrap_or(true)) {
+                Ok(()) => Sent::Ok,
+                Err(error) => Sent::Unanswered(format!("registry control was not acknowledged durable: {error:#}")),
+            });
         }
         // A name is kept here: the session takes it at once, whatever its machine can do (and
         // its harness names its conversation too, where it does).
         let renamed = matches!(&c, Command::Control { id: control, .. } if control == "rename");
         if let Command::Control { id: control, value } = &c
             && control == "rename"
+            && let Err(error) = self.rename(hub, id, value.as_ref())
         {
-            self.rename(hub, id, value.as_ref());
+            return Pending::Now(Sent::Unanswered(format!("registry name was not acknowledged durable: {error:#}")));
         }
         let c = match self.route_attachments(hub, id, &loc, c).await {
             Ok(c) => c,
@@ -2406,56 +2731,18 @@ impl Registry {
         }
     }
 
-    /// Stop a session for good.
-    /// Session `id` goes on on machine `to` (in folder `cwd`, else the one it worked in), from the
-    /// server's conversation store, because its own machine is gone (`docs/conversations.md`,
-    /// "Resuming on another machine"). From here on the copy on the machine it was on doesn't
-    /// count: that machine lets go of it if it comes back. Ok once the package is on its way.
-    pub async fn resume_on(&self, hub: &Hub, id: &str, to: &str, cwd: Option<String>) -> Result<(), String> {
-        let store = self.convo.clone().ok_or_else(|| "this server keeps no conversations (KILN_CONVERSATIONS is off)".to_owned())?;
-        let (from, epoch) = {
-            let g = self.mirrors.lock();
-            let m = g.get(id).ok_or_else(|| "no such agent session".to_owned())?;
-            (m.location.clone(), m.state.get("epoch").and_then(Value::as_u64).unwrap_or(0))
-        };
-        let from_name = match &from {
+    /// U17: a disconnected machine may still execute its harness. A higher Records epoch
+    /// fences reporting, not that external process; default offline resume requires stop proof.
+    pub async fn resume_on(&self, hub: &Hub, id: &str, _to: &str, _cwd: Option<String>) -> Result<(), String> {
+        let from = self.location(id).ok_or_else(|| "no such agent session".to_owned())?;
+        let machine = match from {
             Location::Local => return Err("it runs on the server itself, which is up: move it instead".into()),
-            Location::Machine(m) => m.clone(),
+            Location::Machine(machine) => machine,
         };
-        if hub.agents.lock().get(&from_name).is_some_and(|a| a.connected) {
-            return Err(format!("{from_name} is online: move the session from there instead"));
+        if hub.agents.lock().get(&machine).is_some_and(|agent| agent.connected) {
+            return Err(format!("{machine} is online: move the session from there instead"));
         }
-        if !hub.agents.lock().get(to).is_some_and(|a| a.connected) {
-            return Err(format!("{to} isn't connected"));
-        }
-        if hub.runner_caps(to) & crate::proto::CAP_CONVO == 0 {
-            return Err(format!("{to} runs a kiln too old to take a session from the server; upgrade it first"));
-        }
-        let (st, i, f, t) = (store.clone(), id.to_owned(), from_name.clone(), to.to_owned());
-        let pkg = crate::rt::blocking(move || crate::convo::resume::package(&st, &i, &f, &t, cwd.as_deref()))
-            .await
-            .map_err(|e| format!("{e:#}"))?
-            .map_err(|e| format!("{e:#}"))?;
-        let bytes = serde_json::to_vec(&pkg).map_err(|e| e.to_string())?;
-        // Its copy where it was doesn't count from now on: not here, not in the store (rows that
-        // machine still sends are left out).
-        let next = epoch.max(pkg.state.epoch) + 1;
-        self.raise_epoch(id, next);
-        store.put(vec![crate::convo::rows::Row::Session { session: id.to_owned(), info: None, meta: None, state: None, changes: None, epoch: Some(next), open: false, at: crate::util::now_ms() }]);
-        let info = {
-            let mut g = self.mirrors.lock();
-            g.get_mut(id).map(|m| {
-                m.location = Location::Machine(to.to_owned());
-                m.info.target = m.location.target();
-                m.info.status = Status::Starting;
-                m.info.clone()
-            })
-        };
-        if let Some(info) = info {
-            hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info.clone()) });
-        }
-        tracing::info!(session = %id, from = %from_name, %to, bytes = bytes.len(), "agent session goes on on another machine, from the server's store");
-        send_package(hub, id, to, &bytes).await
+        Err(format!("{machine} is disconnected, which does not prove its harness stopped. Offline resume is refused until source execution is proved stopped; reconnect and move it from its owner."))
     }
 
     pub fn never_started(&self, id: &str) -> bool {
@@ -2472,7 +2759,9 @@ impl Registry {
         if !hub.agents.lock().get(to).is_some_and(|a| a.connected) {
             return Err(format!("{to} isn't connected"));
         }
-        if hub.runner_caps(to) & crate::proto::CAP_CONVO == 0 {
+        // U15/U17: a package is a harness hand-over. New runners no longer advertise
+        // the retired conversation feed; older package-capable builds used that bit.
+        if hub.runner_wide_caps(to) & (crate::proto::CAP_HANDOVER | u64::from(crate::proto::CAP_CONVO)) == 0 {
             return Err(format!("{to} runs a kiln too old to take a session from the server; upgrade it first"));
         }
         let spec = s.resume_spec();
@@ -2481,13 +2770,13 @@ impl Registry {
             (core.events().cloned().collect::<Vec<_>>(), core.state.clone())
         };
         let had = self.mirrors.lock().get(id).and_then(|m| m.state.get("epoch").and_then(Value::as_u64)).unwrap_or(0);
-        let next = had.max(state.epoch) + 1;
-        state.epoch = next - 1;
+        let source_epoch = had.max(state.epoch);
+        state.epoch = source_epoch;
         let from_cwd = state.cwd.clone();
         let pkg = super::moving::pack(id, spec, cwd, "the kiln server", &from_cwd, super::moving::Carry::Nothing, events, state);
         let bytes = serde_json::to_vec(&pkg).map_err(|e| e.to_string())?;
+        let next = self.reserve_epoch(id, source_epoch, to).map_err(|error| format!("{error:#}"))?;
         send_package(hub, id, to, &bytes).await?;
-        self.raise_epoch(id, next);
         if let Some(store) = &self.convo {
             store.put(vec![crate::convo::rows::Row::Session { session: id.to_owned(), info: None, meta: None, state: None, changes: None, epoch: Some(next), open: false, at: crate::util::now_ms() }]);
         }
@@ -2509,26 +2798,35 @@ impl Registry {
         Ok(())
     }
 
+    /// Compatibility/best-effort cleanup. Acknowledging callers use `try_close`.
     pub async fn close(&self, hub: &Hub, id: &str) -> bool {
+        match self.try_close(hub, id).await {
+            Ok(found) => found,
+            Err(error) => { tracing::warn!(%error, session = id, "session close refused"); false }
+        }
+    }
+
+    /// U17: storage and explicit runner refusals remain errors through every front door.
+    pub async fn try_close(&self, hub: &Hub, id: &str) -> anyhow::Result<bool> {
         let loc = self.location(id);
         let ok = match &loc {
             None => false,
-            Some(Location::Local) => self.local.close(id),
-            // Closed there, or once its machine is back; one its machine doesn't run is gone there.
-            Some(Location::Machine(machine)) => {
-                use crate::wire::commands::Answer;
-                matches!(hub.command(machine, &ServerMsg::HarnessClose { session: id.to_owned() }, crate::hub::COMMAND_WITHIN).await, Answer::Taken | Answer::Sent | Answer::Parked)
-            }
+            Some(Location::Local) => {
+                let (host, stopped_id) = (Arc::clone(&self.local), id.to_owned());
+                crate::rt::blocking(move || host.try_close(&stopped_id)).await??
+            },
+            // U17: only the runner's durable stop acknowledgement accepts a remote close.
+            Some(Location::Machine(machine)) => remote_close_answer(machine, hub.command(machine, &ServerMsg::HarnessClose { session: id.to_owned() }, crate::hub::COMMAND_WITHIN).await)?,
         };
-        // A machine that is gone cannot confirm: forget it here; it is dropped there on reconnect.
-        // Ended in the store too, or it would be listed as away again after a restart.
+        // A missing session is cleaned up here too. Explicit command/storage refusal returned
+        // above retains metadata; unacknowledged commands keep their existing wire ownership.
         if loc.is_some() && (!ok || matches!(loc, Some(Location::Local))) {
+            self.keeper.forget(id)?;
+            self.visuals.forget(id)?;
             if let Some(mut m) = self.mirrors.lock().remove(id) {
                 // Its feed's topic goes with it once its viewers are told.
                 m.feed.publish(&Frame::of(crate::wire::ui::SessionFrame::Closed.into()));
             }
-            self.keeper.forget(id);
-            self.visuals.forget(id);
             self.streams.forget(hub, id).await;
             self.opened.forget(id);
             self.asked.forget(id);
@@ -2538,7 +2836,7 @@ impl Registry {
             super::archive::closed(hub, id);
             hub.emit(&crate::wire::events::ServerEvent::HarnessClosed { id: id.to_string() });
         }
-        ok || loc.is_some()
+        Ok(ok)
     }
 
     /// The parsed state of a session (for checks before acting on it).
@@ -2548,7 +2846,9 @@ impl Registry {
 
     /// A session as lists show it.
     pub fn info(&self, id: &str) -> Option<Info> {
-        self.mirrors.lock().get(id).map(|m| m.info.clone())
+        let mut info = self.mirrors.lock().get(id).map(|m| m.info.clone())?;
+        if let Some(state) = self.persisted_control() { self.overlay_control(&mut info, &state); }
+        Some(info)
     }
 
     /// What waits in session `id`'s queue, as its machine last said, the messages whole.
@@ -2597,9 +2897,41 @@ fn proposed_in(e: &super::model::Event) -> Option<String> {
     call.input.get("plan").and_then(Value::as_str).map(str::trim).filter(|p| !p.is_empty()).map(str::to_owned)
 }
 
+/// U17: wire ownership is process memory, not a durable close intent. Refusing acceptance
+/// here leaves pending command delivery alone and returns before any session metadata cleanup.
+fn remote_close_answer(machine: &str, answer: crate::wire::commands::Answer) -> anyhow::Result<bool> {
+    use crate::wire::commands::Answer;
+    match answer {
+        Answer::Taken => Ok(true),
+        Answer::Refused { code: crate::wire::channel::Refusal::Unknown, .. } => Ok(false),
+        Answer::Sent | Answer::Parked => anyhow::bail!("session close on {machine} is unavailable until its runner acknowledges a durable stop; retry the close (delivery may still be pending)"),
+        answer => anyhow::bail!("session close on {machine} was not accepted: {answer:?}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn u17_remote_close_requires_durable_runner_ack_not_memory_delivery() -> anyhow::Result<()> {
+        use crate::wire::{channel::Refusal, commands::Answer as CommandAnswer};
+        assert!(remote_close_answer("runner", CommandAnswer::Taken)?);
+        assert!(!remote_close_answer("runner", CommandAnswer::Refused { code: Refusal::Unknown, why: "session gone".into() })?);
+        for answer in [CommandAnswer::Sent, CommandAnswer::Parked] {
+            let error = remote_close_answer("runner", answer).err().ok_or_else(|| anyhow::anyhow!("memory-only delivery acknowledged a durable close"))?;
+            assert!(error.to_string().contains("unavailable"));
+            assert!(error.to_string().contains("retry the close"));
+        }
+        for answer in [
+            CommandAnswer::Refused { code: Refusal::Refused, why: "storage unavailable".into() },
+            CommandAnswer::Unreachable { why: "runner offline".into() },
+            CommandAnswer::Unanswered { why: "acknowledgement lost".into() },
+        ] {
+            assert!(remote_close_answer("runner", answer).is_err(), "refusal/uncertain delivery must retain metadata and surface an error");
+        }
+        Ok(())
+    }
 
     /// A viewer that takes state patches, and one that takes nothing as a patch.
     const STATE: Patches = Patches { state: true, changes: false };
@@ -2623,7 +2955,7 @@ mod tests {
         crate::rt::block_on(async {
             let dir = tempfile::tempdir()?;
             let conversations = crate::config::Conversations { off: true, ..Default::default() };
-            let r = Registry::with(dir.path().to_path_buf(), &conversations, Arc::new(kiln_seams::clock::SimClock::new()), sim_bus());
+            let r = Registry::with(dir.path().to_path_buf(), &conversations, Arc::new(kiln_seams::clock::SimClock::new()), sim_bus())?;
             let gone = r.wait_for("s1", "m1");
             let kept = r.wait_for("s1", "m1").ok_or_else(|| anyhow::anyhow!("not waited for"))?;
             drop(gone);
@@ -2650,7 +2982,7 @@ mod tests {
         crate::rt::block_on(async {
             let dir = tempfile::tempdir()?;
             let conversations = crate::config::Conversations { off: true, ..Default::default() };
-            let r = Registry::with(dir.path().to_path_buf(), &conversations, Arc::new(kiln_seams::clock::SimClock::new()), sim_bus());
+            let r = Registry::with(dir.path().to_path_buf(), &conversations, Arc::new(kiln_seams::clock::SimClock::new()), sim_bus())?;
             let first = r.wait_for("s1", "m1").ok_or_else(|| anyhow::anyhow!("not waited for"))?;
             let second = r.wait_for("s1", "m1").ok_or_else(|| anyhow::anyhow!("not waited for"))?;
             let taken = Said { message: "m1".into(), answer: Ok(inbox::Answer { session: "s1".into(), message: "m1".into(), epoch: 0, at: 1, seq: 7, repeat: false }) };
@@ -2901,8 +3233,8 @@ mod tests {
     }
 
     /// The ids of the events a viewer attaching to `id` gets, in order.
-    fn copy_of(hub: &Hub, id: &str) -> Vec<String> {
-        hub.harness.attach(id).map(|a| ids(&a.frames)).unwrap_or_default()
+    fn copy_of(hub: &Hub, id: &str) -> anyhow::Result<Vec<String>> {
+        Ok(hub.harness.attach(id)?.map(|a| ids(&a.frames)).unwrap_or_default())
     }
 
     /// What a live viewer was sent on its session's feed since it last looked (from `at`, moved past
@@ -2973,7 +3305,7 @@ mod tests {
             let names = |r: std::ops::RangeInclusive<u64>| r.map(|n| format!("m{n}")).collect::<Vec<_>>();
             hub.harness.ingest(&hub, &there, "s", open(None));
             hub.harness.ingest(&hub, &there, "s", Update::Events { events: (1..=10).map(said).collect() });
-            let attached = hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no copy"))?;
+            let attached = hub.harness.attach("s")?.ok_or_else(|| anyhow::anyhow!("no copy"))?;
             // Watching, so the feed publishes; and where on its topic the viewer reads from.
             let (_watching, topic, mut at) = (attached.viewer, attached.topic, attached.at.unwrap_or_default());
             let resync = |heard: &[String]| heard.iter().any(|f| f == crate::harness::live::RESYNC);
@@ -2982,16 +3314,16 @@ mod tests {
             hub.harness.ingest(&hub, &there, "s", Update::Events { events: vec![said(11)] });
             let heard = sent(&hub, &topic, &mut at);
             anyhow::ensure!(heard.len() == 1 && !heard.iter().any(|f| f.contains(r#""t":"open""#)) && !resync(&heard), "the viewer goes on: {heard:?}");
-            let had = hub.harness.attach("s").map(|a| a.rev).unwrap_or_default();
-            anyhow::ensure!(copy_of(&hub, "s") == names(1..=11));
+            let had = hub.harness.attach("s")?.map(|a| a.rev).unwrap_or_default();
+            anyhow::ensure!(copy_of(&hub, "s")? == names(1..=11));
             // Again, with only eight of them (its store hadn't kept the rest): the copy lets go of
             // nine and up, and its viewer starts over from the copy: told to by the feed, and what it
             // had can't be resumed, so it's sent the copy whole.
             hub.harness.ingest(&hub, &there, "s", open(Some(8)));
-            anyhow::ensure!(copy_of(&hub, "s") == names(1..=8));
+            anyhow::ensure!(copy_of(&hub, "s")? == names(1..=8));
             let heard = sent(&hub, &topic, &mut at);
             anyhow::ensure!(resync(&heard), "the viewer is sent back to a snapshot: {heard:?}");
-            let (again, ..) = hub.harness.frames_since("s", had).ok_or_else(|| anyhow::anyhow!("no copy"))?;
+            let (again, ..) = hub.harness.frames_since("s", had)?.ok_or_else(|| anyhow::anyhow!("no copy"))?;
             anyhow::ensure!(again.first().is_some_and(|f| f.contains(r#""t":"open""#)) && ids(&again) == names(1..=8), "the viewer starts over: {again:?}");
             let kept = hub.harness.kept_on("box");
             anyhow::ensure!(kept.len() == 1 && kept.iter().all(|k| (k.epoch, k.from, k.seq, k.last.len()) == (3, 1, 8, 8)), "{kept:?}");
@@ -3001,14 +3333,14 @@ mod tests {
             if let Some(slot) = want.get_mut(4) {
                 "other".clone_into(slot);
             }
-            anyhow::ensure!(copy_of(&hub, "s") == want, "{:?}", copy_of(&hub, "s"));
+            anyhow::ensure!(copy_of(&hub, "s")? == want, "{:?}", copy_of(&hub, "s")?);
             anyhow::ensure!(resync(&sent(&hub, &topic, &mut at)), "the viewer starts over");
             // One it lacks under a number before its newest: in among the others, by number.
             hub.harness.ingest(&hub, &there, "s", open(Some(8)));
             hub.harness.ingest(&hub, &there, "s", Update::Events { events: vec![said(12), said(14)] });
             hub.harness.ingest(&hub, &there, "s", Update::Events { events: vec![said(13)] });
             want.extend(names(12..=14));
-            anyhow::ensure!(copy_of(&hub, "s") == want, "{:?}", copy_of(&hub, "s"));
+            anyhow::ensure!(copy_of(&hub, "s")? == want, "{:?}", copy_of(&hub, "s")?);
             Ok(())
         })
     }
@@ -3024,9 +3356,9 @@ mod tests {
             let bus: Arc<dyn kiln_seams::Bus> = Arc::new(hub.bus.clone());
             hub.harness.mirrors.lock().insert("opened".into(), Mirror { opened_at: Some(std::time::Instant::now()), ..Mirror::new(info("opened"), there.clone(), bus) });
             hub.harness.ingest(&hub, &there, "announced", Update::Open { info: Box::new(info("announced")), since: None });
-            let att = hub.harness.attach("announced").ok_or_else(|| anyhow::anyhow!("no copy"))?;
+            let att = hub.harness.attach("announced")?.ok_or_else(|| anyhow::anyhow!("no copy"))?;
             let at = att.at.ok_or_else(|| anyhow::anyhow!("no feed"))?;
-            hub.harness.inventory(&hub, "box", None, &[], crate::harness::host::Inventory::default());
+            hub.harness.inventory(&hub, "box", None, &[], crate::harness::host::Inventory::default())?;
             let left: Vec<String> = hub.harness.mirrors.lock().keys().cloned().collect();
             anyhow::ensure!(left == vec!["opened".to_owned()], "{left:?}");
             // Its viewer hears it's gone: its feed's last frame.
@@ -3035,7 +3367,7 @@ mod tests {
             anyhow::ensure!(said.last().is_some_and(|t| t == super::super::live::closed()), "its viewer heard {said:?}");
             // Its machine announces it: from then on its reports count.
             hub.harness.ingest(&hub, &there, "opened", Update::Open { info: Box::new(info("opened")), since: None });
-            hub.harness.inventory(&hub, "box", None, &[], crate::harness::host::Inventory::default());
+            hub.harness.inventory(&hub, "box", None, &[], crate::harness::host::Inventory::default())?;
             anyhow::ensure!(hub.harness.mirrors.lock().is_empty());
             Ok(())
         })
@@ -3053,9 +3385,9 @@ mod tests {
             for id in ["old-1", "old-2", "mine"] {
                 hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(info(id)), since: None });
             }
-            hub.harness.held_by("old-1", "01a14794");
-            hub.harness.held_by("old-2", "01a14794");
-            hub.harness.held_by("mine", "main");
+            hub.harness.held_by("old-1", "01a14794")?;
+            hub.harness.held_by("old-2", "01a14794")?;
+            hub.harness.held_by("mine", "main")?;
             let report = |ids: &[&str]| crate::harness::host::Inventory { sessions: ids.iter().map(|s| (*s).to_owned()).collect(), ..Default::default() };
             let left = |hub: &crate::hub::Hub| {
                 let mut v: Vec<String> = hub.harness.mirrors.lock().keys().cloned().collect();
@@ -3063,18 +3395,19 @@ mod tests {
                 v
             };
             // `main` says what it holds while the other process is away.
-            hub.harness.inventory(&hub, "box", Some("main"), &["main".to_owned()], report(&["mine"]));
+            hub.harness.inventory(&hub, "box", Some("main"), &["main".to_owned()], report(&["mine"]))?;
             anyhow::ensure!(left(&hub) == ["mine", "old-1", "old-2"], "{:?}", left(&hub));
             let status = |id: &str| hub.harness.info(id).map(|i| i.status);
             anyhow::ensure!(status("old-1") == Some(Status::Disconnected) && status("old-2") == Some(Status::Disconnected), "away: {:?} {:?}", status("old-1"), status("old-2"));
             anyhow::ensure!(status("mine") != Some(Status::Disconnected), "{:?}", status("mine"));
             // The process that holds them says it holds one of them: the other ends.
-            hub.harness.inventory(&hub, "box", Some("01a14794"), &["main".to_owned(), "01a14794".to_owned()], report(&["old-1"]));
+            hub.harness.inventory(&hub, "box", Some("01a14794"), &["main".to_owned(), "01a14794".to_owned()], report(&["old-1"]))?;
             anyhow::ensure!(left(&hub) == ["mine", "old-1"], "{:?}", left(&hub));
             anyhow::ensure!(hub.harness.holder("old-2").is_none(), "its holder goes with it");
             // Who holds what is kept for the next start.
-            let kept: HashMap<String, String> = serde_json::from_slice(&std::fs::read(hub.harness.dir.join("holders.json"))?)?;
+            let kept = hub.harness.persisted_control().ok_or_else(|| anyhow::anyhow!("missing canonical holder state"))?.holders;
             anyhow::ensure!(kept.get("old-1").map(String::as_str) == Some("01a14794") && !kept.contains_key("old-2"), "{kept:?}");
+            anyhow::ensure!(!hub.harness.dir.join("holders.json").exists(), "canonical holder updates must not create a sidecar");
             Ok(())
         })
     }
@@ -3082,11 +3415,134 @@ mod tests {
     #[test]
     fn names_are_kept_across_restarts() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let r = Registry::new(dir.path().to_owned());
+        let r = Registry::new(dir.path().to_owned())?;
         r.names.lock().insert("s1".into(), "Mantle".into());
         r.save_names();
-        let again = Registry::new(dir.path().to_owned());
+        let again = Registry::new(dir.path().to_owned())?;
         assert_eq!(again.names.lock().get("s1").map(String::as_str), Some("Mantle"));
         Ok(())
     }
+
+    #[test]
+    fn u17_control_import_recovers_names_holders_epochs_together_and_ignores_old_sidecars() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("names.json"), br#"{"s":"named"}"#)?;
+        std::fs::write(dir.path().join("holders.json"), br#"{"s":"green"}"#)?;
+        std::fs::write(dir.path().join("epochs.json"), br#"{"s":7}"#)?;
+        let records: Arc<dyn kiln_seams::Records> = Arc::new(kiln_seams::records::SimRecords::default());
+        let mut registry = Registry::new(dir.path().to_owned())?;
+        registry.use_control_records(records.clone(), "server/control")?;
+        registry.names.lock().insert("s".into(), "new name".into());
+        registry.save_names();
+        std::fs::write(dir.path().join("holders.json"), b"broken legacy copy")?;
+        let mut again = Registry::new(dir.path().to_owned())?;
+        again.use_control_records(records, "server/control")?;
+        assert_eq!(again.names.lock().get("s").map(String::as_str), Some("new name"));
+        assert_eq!(again.holder("s").as_deref(), Some("green"));
+        assert_eq!(again.epochs.lock().get("s"), Some(&7));
+        Ok(())
+    }
+
+
+    #[test]
+    fn u17_fleet_controls_merge_replica_updates_without_splitting_registry() -> anyhow::Result<()> {
+        let first_dir = tempfile::tempdir()?;
+        let second_dir = tempfile::tempdir()?;
+        std::fs::write(first_dir.path().join("names.json"), br#"{"a":"first"}"#)?;
+        std::fs::write(second_dir.path().join("names.json"), br#"{"b":"second"}"#)?;
+        std::fs::write(first_dir.path().join("epochs.json"), br#"{"remote":8}"#)?;
+        std::fs::write(second_dir.path().join("epochs.json"), br#"{"remote":3}"#)?;
+        let records: Arc<dyn kiln_seams::Records> = Arc::new(kiln_seams::records::SimRecords::default());
+        let mut first = Registry::new(first_dir.path().to_owned())?;
+        let mut second = Registry::new(second_dir.path().to_owned())?;
+        first.use_global_control_records(records.clone(), "server/control", "server-a")?;
+        second.use_global_control_records(records.clone(), "server/control", "server-b")?;
+        first.names.lock().insert("a".into(), "first renamed".into());
+        first.save_names();
+        // This replica still has the older name for a; its unrelated edit must not overwrite it.
+        second.names.lock().insert("b".into(), "second renamed".into());
+        second.save_names();
+        second.held_by("remote", "green")?;
+        let state = first.persisted_control().ok_or_else(|| anyhow::anyhow!("no shared controls"))?;
+        assert_eq!(state.names.get("a").map(String::as_str), Some("first renamed"));
+        assert_eq!(state.names.get("b").map(String::as_str), Some("second renamed"));
+        assert_eq!(first.holder("remote").as_deref(), Some("green"));
+        assert!(second.stale("remote", 7));
+        assert_eq!(state.imported_hosts.len(), 2);
+        first.held_by("remote", "blue")?;
+        second.forget_holders(&["remote".to_owned()])?;
+        assert_eq!(first.holder("remote").as_deref(), Some("blue"), "stale inventory cleanup cannot erase another replica's newer holder");
+        second.held_by("remote", "green")?;
+        first.held_by("remote", "blue")?;
+        assert_eq!(second.holder("remote").as_deref(), Some("blue"), "a current holder report is committed even when this replica's cache already matched it");
+        second.set_shared_control("a", SharedControl::Name(None))?;
+        first.set_shared_control("remote", SharedControl::KeepGoing(false))?;
+        second.set_shared_control("remote", SharedControl::KeepGoing(true))?;
+        let state = first.persisted_control().ok_or_else(|| anyhow::anyhow!("shared controls disappeared"))?;
+        assert!(!state.names.contains_key("a"), "a replica can clear a name set elsewhere");
+        assert!(!state.keep_off.contains("remote"), "a replica can re-enable keep-going disabled elsewhere");
+        let late_dir = tempfile::tempdir()?;
+        std::fs::write(late_dir.path().join("names.json"), br#"{"a":"obsolete"}"#)?;
+        std::fs::write(late_dir.path().join("keep-off.json"), br#"["remote"]"#)?;
+        let mut late = Registry::new(late_dir.path().to_owned())?;
+        late.use_global_control_records(records, "server/control", "late-server")?;
+        let after = first.persisted_control().ok_or_else(|| anyhow::anyhow!("missing late replica state"))?;
+        assert!(!after.names.contains_key("a"), "legacy sidecar cannot resurrect an acknowledged name deletion");
+        assert!(!after.keep_off.contains("remote"), "legacy sidecar cannot undo acknowledged keep-going enablement");
+        let mut info = Info { id: "a".into(), name: "obsolete".into(), kind_name: "Harness".into(), ..Info::default() };
+        late.overlay_control(&mut info, &after);
+        assert_eq!(info.name, "Harness", "a replica joining after the clear also displays the committed default name");
+        assert_ne!(registry_namespace("server.", "server/server-a/local"), registry_namespace("server.", "server/server-b/local"));
+        Ok(())
+    }
+
+    #[test]
+    fn u17_keyed_open_keeps_chosen_target_and_spec_across_replica_retries() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let other_dir = tempfile::tempdir()?;
+        let records: Arc<dyn kiln_seams::Records> = Arc::new(kiln_seams::records::SimRecords::default());
+        let mut first = Registry::new(dir.path().to_owned())?;
+        first.use_global_control_records(records.clone(), "server/control", "server-a")?;
+        let spec = Spec { kind: "claude".into(), prompt: Some("same occurrence".into()), ..Spec::default() };
+        first.bind_start_request("stable", json!({"prompt": "same occurrence"}))?;
+        let (snapshot, first_intent) = first.bind_open("agent:chosen", spec.clone(), "stable", 10)?;
+        assert_eq!(first_intent.target, "agent:chosen");
+        assert!(!first_intent.accepted, "persisting a pending intent cannot acknowledge successful launch");
+        let mut replica = Registry::new(other_dir.path().to_owned())?;
+        replica.use_global_control_records(records, "server/control", "server-b")?;
+        let (_, retry) = replica.bind_open("agent:now-idlest", spec.clone(), "stable", 20)?;
+        assert!(replica.bind_start_request("stable", json!({"prompt": "changed occurrence"})).is_err());
+        assert_eq!(retry.target, "agent:chosen", "a retry cannot choose a second controller host");
+        assert_eq!(retry.at, 10);
+        assert_eq!(replica.planned_open("stable")?, Some(("agent:chosen".into(), spec.clone())));
+        let changed = Spec { prompt: Some("different occurrence".into()), ..spec };
+        assert!(replica.bind_open("agent:chosen", changed, "stable", 30).is_err());
+        assert!(!snapshot.read::<OpenIntent>()?.ok_or_else(|| anyhow::anyhow!("lost pending intent"))?.accepted, "failed request retries leave acceptance pending");
+        assert!(replica.planned_open("missing")?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn u17_replica_epoch_reservation_fences_competing_resume_and_survives_reopen() -> anyhow::Result<()> {
+        let first_dir = tempfile::tempdir()?;
+        let second_dir = tempfile::tempdir()?;
+        let records: Arc<dyn kiln_seams::Records> = Arc::new(kiln_seams::records::SimRecords::default());
+        let mut first = Registry::new(first_dir.path().to_owned())?;
+        let mut second = Registry::new(second_dir.path().to_owned())?;
+        first.use_global_control_records(records.clone(), "server/control", "server-a")?;
+        second.use_global_control_records(records.clone(), "server/control", "server-b")?;
+        first.raise_epoch("session", 8)?;
+        assert_eq!(first.reserve_epoch("session", 8, "destination-a")?, 9);
+        assert!(second.reserve_epoch("session", 8, "destination-b").is_err(), "two replicas cannot resume the same source epoch on different machines");
+        assert_eq!(second.reserve_epoch("session", 8, "destination-a")?, 9, "same destination retries keep the original epoch");
+        let mut reopened = Registry::new(first_dir.path().to_owned())?;
+        reopened.use_global_control_records(records, "server/control", "server-a")?;
+        assert_eq!(reopened.reserve_epoch("session", 8, "destination-a")?, 9);
+        assert!(reopened.reserve_epoch("session", 8, "destination-b").is_err());
+        reopened.raise_epoch("session", 10)?;
+        assert!(second.reserve_epoch("session", 8, "destination-a").is_err(), "a retry cannot revive a reservation after a later epoch");
+        assert!(reopened.reserve_epoch("exhausted", u64::MAX, "destination-a").is_err());
+        Ok(())
+    }
+
 }

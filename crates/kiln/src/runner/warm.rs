@@ -168,30 +168,22 @@ fn write_slot(lane: &Path, s: &Slot) -> std::io::Result<()> {
 }
 
 /// `path`'s lock, waiting for it.
-fn lock_file(path: &Path) -> std::io::Result<File> {
+fn lock_file(path: &Path) -> std::io::Result<crate::util::FileLock> {
     let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path)?;
-    f.lock()?;
-    Ok(f)
+    crate::util::FileLock::lock(f)
 }
 
 /// `path`'s lock, if no one holds it.
-fn try_lock_file(path: &Path) -> Option<File> {
+fn try_lock_file(path: &Path) -> Option<crate::util::FileLock> {
     let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path).ok()?;
-    f.try_lock().ok()?;
-    Some(f)
+    crate::util::FileLock::try_lock(f).ok()
 }
 
 /// Whether a leg, of this process or another, holds `dir`'s lease. A probe that takes it lets go
-/// at once, as a lease does (`Lease`'s drop).
+/// at once, as a lease does (its owned `FileLock`'s drop).
 fn held(dir: &Path) -> bool {
     let Ok(f) = File::open(lease_path(dir)) else { return false };
-    match f.try_lock() {
-        Ok(()) => {
-            let _ = f.unlock();
-            false
-        }
-        Err(e) => matches!(e, std::fs::TryLockError::WouldBlock),
-    }
+    matches!(crate::util::FileLock::try_lock(f), Err(std::fs::TryLockError::WouldBlock))
 }
 
 fn remove_any(p: &Path) -> std::io::Result<()> {
@@ -245,7 +237,9 @@ pub fn clones(dir: &Path) -> Clones {
 fn probe(dir: &Path) -> Clones {
     let id = crate::util::new_id();
     let (a, b) = (dir.join(format!(".clone-probe-{id}")), dir.join(format!(".clone-probe-{id}-b")));
-    let cloned = std::fs::write(&a, b"kiln").is_ok() && Command::new("cp").arg("--reflink=always").arg(&a).arg(&b).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
+    let mut command = Command::new("cp");
+    command.arg("--reflink=always").arg(&a).arg(&b).stdin(Stdio::null());
+    let cloned = std::fs::write(&a, b"kiln").is_ok() && super::processes::output_blocking(command).is_ok_and(|o| o.status.success());
     let _ = std::fs::remove_file(&a);
     let _ = std::fs::remove_file(&b);
     if cloned { Clones::Cow } else { Clones::No }
@@ -276,7 +270,8 @@ pub fn clone_tree(from: &Path, to: &Path) -> anyhow::Result<Duration> {
     } else {
         cp.args(["-a", "--reflink=always"]);
     }
-    let out = cp.arg(from).arg(to).stdin(Stdio::null()).output()?;
+    cp.arg(from).arg(to).stdin(Stdio::null());
+    let out = super::processes::output_blocking(cp)?;
     if !out.status.success() {
         if to.exists() {
             super::workspaces::remove(to);
@@ -362,7 +357,7 @@ fn lanes(work: &Path) -> Vec<PathBuf> {
 fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
     let mut cmd = Command::new("git");
     crate::os::git_no_prompts(cmd.arg("-C").arg(dir).args(args).stdin(Stdio::null()));
-    let out = cmd.output()?;
+    let out = super::processes::output_blocking(cmd)?;
     anyhow::ensure!(out.status.success(), "git {}: {}", args.first().copied().unwrap_or_default(), String::from_utf8_lossy(&out.stderr).trim());
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
@@ -386,6 +381,16 @@ pub fn mirror_of(work: &Path, repo: &str) -> Option<PathBuf> {
     let cache = std::env::var_os("KILN_GIT_CACHE").map_or_else(|| work.join("git"), PathBuf::from);
     let slug: String = repo.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
     let m = cache.join(format!("{slug}.git"));
+    // U08: v1 discovery follows the shared read mirror without refreshing the legacy bare
+    // repository. A published pointer never falls back to potentially stale private objects.
+    let pointer = m.join("kiln-runner-mirror");
+    if pointer.exists() {
+        let identity = std::fs::read_to_string(pointer).ok()?;
+        let identity = identity.trim();
+        if identity.len() != 64 || !identity.bytes().all(|b| b.is_ascii_hexdigit()) { return None; }
+        let canonical = cache.join("read").join(format!("{identity}.git"));
+        return canonical.join("HEAD").is_file().then_some(canonical);
+    }
     m.join("HEAD").is_file().then_some(m)
 }
 
@@ -482,16 +487,8 @@ pub struct Lease {
     n: Option<u32>,
     name: String,
     quarantine: bool,
-    _lock: File,
-}
-
-impl Drop for Lease {
-    /// Its lock let go of outright (W24-R18): closing it alone doesn't while a child of this
-    /// process holds a copy (a fork's descriptors live until its exec), and the lane's next leg
-    /// would find the slot leased and start cold.
-    fn drop(&mut self) {
-        let _ = self._lock.unlock();
-    }
+    release_head: Option<Box<super::processes::PreparedCleanup>>,
+    _lock: crate::util::FileLock,
 }
 
 /// What a lease gave.
@@ -616,7 +613,7 @@ pub fn lease_with(work: &Path, ask: &Ask, clones: Clones, budget: &Budget) -> an
         let warm = matches!(c.take, Take::Slot(_)) && s.base.is_some();
         write_slot(&lane, &Slot { state: State::Leased, holder: Some(ask.leg.clone()), ..s }).context("the slot's record")?;
         changed();
-        return Ok(Leased::Warm(Lease { dir, said, warm, lane, n: Some(n), name: ask.name.clone(), quarantine: false, _lock: lock }));
+        return Ok(Leased::Warm(Lease { dir, said, warm, lane, n: Some(n), name: ask.name.clone(), quarantine: false, release_head: None, _lock: lock }));
     }
     Ok(Leased::Cold("No warm workspace: the lane's workspaces are all held. The leg runs cold.".to_owned()))
 }
@@ -647,6 +644,7 @@ fn throwaway(work: &Path, lane: &Path, ask: &Ask, found: &[Slot], distance: &BTr
             n: None,
             name: ask.name.clone(),
             quarantine: false,
+            release_head: None,
             _lock: lock,
         }),
         Err(e) => {
@@ -739,12 +737,18 @@ fn recover_lane(work: &Path, lane: &Path, name: &str, now: i64) -> Vec<Slot> {
 /// for the lane's next leg (or quarantined, when it couldn't be checked out in place or cleared),
 /// its base the commit its repository has checked out; a throwaway clone goes, nothing of it
 /// kept. The slot to measure, when it was one.
-pub fn release(work: &Path, l: Lease) -> Option<(PathBuf, u32)> {
+pub fn release(work: &Path, mut l: Lease) -> Option<(PathBuf, u32)> {
     let Some(n) = l.n else {
         trash(work, &l.dir);
         return None;
     };
-    let base = head(&l.dir.join(&l.name));
+    let base = match l.release_head.take() {
+        Some(query) => crate::rt::block_on((*query).run_with_timeout(Duration::from_secs(1800))).ok().filter(|out| out.status.success())
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .map(|sha| sha.trim().to_owned())
+            .filter(|sha| matches!(sha.len(), 40 | 64) && sha.bytes().all(|b| b.is_ascii_hexdigit())),
+        None => head(&l.dir.join(&l.name)),
+    };
     let lane = l.lane.clone();
     let guard = lock_file(&lane.join(".lock"));
     let s = read_slots(&lane).into_iter().find(|s| s.n == n).unwrap_or(Slot { n, ..Slot::default() });
@@ -902,6 +906,29 @@ pub fn hold(work: &Path, lease: Lease) {
 pub fn quarantine(dir: &Path) {
     if let Some((_, l)) = HELD.lock().get_mut(dir) {
         l.quarantine = true;
+    }
+}
+
+/// Reserve the fixed baseline query before command admission closes. Its original physical
+/// owner stays held until release runs the query after ordinary commands have stopped.
+/// Merely moving release before `stop_commands` would let the next leg race live processes.
+pub(super) async fn prepare_release(dir: &Path) {
+    let repo = HELD.lock().get(dir)
+        .filter(|(_, lease)| lease.n.is_some() && !lease.quarantine && lease.release_head.is_none())
+        .map(|(_, lease)| lease.dir.join(&lease.name));
+    let (Some(repo), Some(execution)) = (repo, super::processes::current()) else { return };
+    let prepared = crate::rt::blocking(move || -> anyhow::Result<Option<super::processes::PreparedCleanup>> {
+        if !repo.join(".git").exists() { return Ok(None); }
+        let mut cmd = Command::new("git");
+        crate::os::git_no_prompts(cmd.arg("-C").arg(repo).args(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]).stdin(Stdio::null()));
+        execution.prepare_cleanup(cmd).map(Some)
+    }).await;
+    match prepared {
+        Ok(Ok(Some(query))) => {
+            if let Some((_, lease)) = HELD.lock().get_mut(dir) { lease.release_head = Some(Box::new(query)); }
+        }
+        Ok(Ok(None)) => {},
+        error => tracing::debug!(?error, "a warm workspace's final baseline query could not be reserved"),
     }
 }
 

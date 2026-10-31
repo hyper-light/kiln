@@ -5,7 +5,7 @@
 //! `workflow_dispatch` and deployment reviews sent to GitHub; environments and their deployments.
 
 use anyhow::{anyhow, bail};
-use rusqlite::{OptionalExtension as _, params};
+use crate::sql::{OptionalExtension as _, params};
 use serde_json::{Value, json};
 
 use super::{ExtJob, ExtRun, ExtStep, GITHUB_ACTIONS, kiln_status, unix};

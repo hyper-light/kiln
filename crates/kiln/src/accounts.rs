@@ -361,8 +361,8 @@ async fn follow(hub: &Hub, id: &str, session: &Session, terminal_queries: bool) 
                 Err(_) => break (None, Some("nobody finished signing in within 15 minutes".to_owned())),
                 Ok(Ok(Frame::Data(d))) => sign_in_output(&mut out, &mut terminal, session, &d),
                 Ok(Ok(Frame::Exit { code, error })) => break (code, exit_error(error)),
-                Ok(Ok(Frame::Size { .. }) | Err(async_broadcast::RecvError::Overflowed(_))) => {}
-                Ok(Err(async_broadcast::RecvError::Closed)) => break (None, Some("its terminal closed".to_owned())),
+                Ok(Ok(Frame::Size { .. }) | Err(crate::bus::RecvError::Overflowed(_))) => {}
+                Ok(Err(crate::bus::RecvError::Closed | crate::bus::RecvError::Unavailable(_))) => break (None, Some("its terminal closed".to_owned())),
             }
         },
     };
@@ -600,8 +600,8 @@ async fn collect(session: &Session, limit: Duration) -> anyhow::Result<(Option<i
                 Err(_) => break Err(anyhow::anyhow!("it didn't answer within {} s", limit.as_secs())),
                 Ok(Ok(Frame::Data(d))) => push(&mut out, &d),
                 Ok(Ok(Frame::Exit { code, error })) => break exit_error(error).map_or(Ok(code), |e| Err(anyhow::anyhow!(e))),
-                Ok(Ok(Frame::Size { .. }) | Err(async_broadcast::RecvError::Overflowed(_))) => {}
-                Ok(Err(async_broadcast::RecvError::Closed)) => break Err(anyhow::anyhow!("its terminal closed")),
+                Ok(Ok(Frame::Size { .. }) | Err(crate::bus::RecvError::Overflowed(_))) => {}
+                Ok(Err(crate::bus::RecvError::Closed | crate::bus::RecvError::Unavailable(_))) => break Err(anyhow::anyhow!("its terminal closed")),
             }
         },
     };

@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http::{Method, StatusCode, header};
-use rusqlite::{OptionalExtension as _, params};
+use crate::sql::{OptionalExtension as _, params};
 
 use crate::config::ci::Proxy;
 use crate::http::client::Method as Verb;
@@ -362,8 +362,9 @@ async fn put(hub: &Hub, name: &str, sub: &str, req: Request) -> Response {
         return srv::with_header(r, header::WWW_AUTHENTICATE, "Basic realm=\"kiln\"");
     }
     let tmp: PathBuf = crate::ci::services::cas::staging(hub).join(format!("proxy-{}", crate::util::new_id()));
+    let staging = super::Staging::new(tmp.clone());
     let stored = async {
-        let (sink, done) = crate::rt::file_sink(tmp.clone(), MAX_PACKAGE)?;
+        let (sink, done) = staging.sink(tmp.clone(), MAX_PACKAGE)?;
         let mut body = req.into_body();
         while let Some(frame) = http_body_util::BodyExt::frame(&mut body).await {
             if let Ok(data) = frame?.into_data()
@@ -379,8 +380,9 @@ async fn put(hub: &Hub, name: &str, sub: &str, req: Request) -> Response {
         anyhow::Ok(obj.size)
     }
     .await;
-    let t = tmp.clone();
-    let _ = crate::rt::blocking(move || std::fs::remove_file(t)).await;
+    if let Err(e) = staging.remove().await {
+        return fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"));
+    }
     match stored {
         Ok(size) => {
             tracing::info!(proxy = name, path = sub, size, "a binary package was kept");
@@ -446,7 +448,7 @@ async fn allowed(hub: &Hub, p: &Proxy, req: &Request) -> bool {
 
 /// The upstream's answer for `url` (a redirect followed, without credentials when it leaves the
 /// upstream's host), streamed into a file; its status and content type.
-async fn fetch(up: &Upstream<'_>, url: &str, accept: Option<&str>, to: &std::path::Path) -> anyhow::Result<(u16, String)> {
+async fn fetch(up: &Upstream<'_>, url: &str, accept: Option<&str>, to: &std::path::Path, staging: &super::Staging) -> anyhow::Result<(u16, String)> {
     let client = crate::http::client::github()?;
     let mut target = url.to_owned();
     for _ in 0..5 {
@@ -478,7 +480,7 @@ async fn fetch(up: &Upstream<'_>, url: &str, accept: Option<&str>, to: &std::pat
         if !(200..300).contains(&status) {
             return Ok((status, content_type));
         }
-        let (sink, done) = crate::rt::file_sink(to.to_path_buf(), MAX_PACKAGE)?;
+        let (sink, done) = staging.sink(to.to_path_buf(), MAX_PACKAGE)?;
         while let Some(chunk) = resp.chunk().await? {
             if sink.send(chunk).await.is_err() {
                 break;
@@ -489,7 +491,9 @@ async fn fetch(up: &Upstream<'_>, url: &str, accept: Option<&str>, to: &std::pat
         // An index sent gzipped (NuGet's registration pages) is kept plain, to be written over.
         if gzipped {
             let p = to.to_path_buf();
+            let held = staging.clone();
             crate::rt::blocking(move || -> anyhow::Result<()> {
+                let _held = held;
                 let raw = std::fs::read(&p)?;
                 let mut plain = Vec::new();
                 flate2::read::GzDecoder::new(raw.as_slice()).read_to_end(&mut plain)?;
@@ -567,7 +571,8 @@ pub async fn handle(hub: &Arc<Hub>, req: Request) -> Response {
         (have, false)
     } else if let Some(url) = url {
         let tmp: PathBuf = crate::ci::services::cas::staging(hub).join(format!("proxy-{}", crate::util::new_id()));
-        let got = fetch(&up, &url, accept.as_deref(), &tmp).await;
+        let staging = super::Staging::new(tmp.clone());
+        let got = fetch(&up, &url, accept.as_deref(), &tmp, &staging).await;
         let outcome = match got {
             Ok((st, ct)) if (200..300).contains(&st) => match crate::ci::services::cas::put_file(hub, &tmp).await {
                 Ok(obj) => match keep(hub, name, &key, &obj, &ct, immutable).await {
@@ -580,8 +585,9 @@ pub async fn handle(hub: &Arc<Hub>, req: Request) -> Response {
             Ok((st, _)) => Err(format!("{} answered {st}", up.base)),
             Err(e) => Err(format!("{e:#}")),
         };
-        let t = tmp.clone();
-        let _ = crate::rt::blocking(move || std::fs::remove_file(t)).await;
+        if let Err(e) = staging.remove().await {
+            return fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"));
+        }
         match outcome {
             Ok(Some(k)) => (Some(k), false),
             Ok(None) => return fail(StatusCode::NOT_FOUND, format!("{} has no {sub}", up.base)),

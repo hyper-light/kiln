@@ -19,6 +19,8 @@ use std::time::Duration;
 
 use kiln_seams::Clock;
 
+pub mod snapshot;
+
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
@@ -92,6 +94,16 @@ pub struct Inventory {
 /// harness process can't (a blue/green upgrade, `crate::bluegreen`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Saved {
+    /// U17: accepted payloads retained until native acknowledgment or processed local cancellation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending: Vec<Command>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tasks: Vec<super::model::Task>,
+    /// U17: control state and epoch survive even when conversation retention is disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    state: Option<super::model::State>,
+    #[serde(skip)]
+    observed: HashSet<String>,
     id: String,
     spec: Spec,
     #[serde(default)]
@@ -134,17 +146,53 @@ impl Saved {
     pub fn id(&self) -> &str {
         &self.id
     }
+    fn epoch(&self) -> u64 { self.state.as_ref().map_or(0, |state| state.epoch) }
+
+    // U17/CP-T3.2: a restart replays an unobserved first intent instead of inventing a second
+    // continuation for it. Other pending messages never suppress an older consumed turn.
+    fn initial_replay(&self, seed: Option<&super::model::State>) -> bool {
+        let id = session::initial_prompt_id(&self.id);
+        let states = [self.state.as_ref(), seed];
+        if states.into_iter().flatten().any(|state| matches!(state.delivery.get(&id), Some(super::model::Delivery::Started | super::model::Delivery::Completed | super::model::Delivery::Cancelled))) {
+            return false;
+        }
+        session::initial_prompt(&self.id, &self.spec).is_some()
+            || self.pending.iter().any(|command| matches!(command, Command::Send { id: pending, .. } if pending == &id))
+            || self.queue.iter().chain(self.tasks.iter().flat_map(|task| task.queue.iter())).any(|q| q.id == id)
+            || states.into_iter().flatten().any(|state| state.queue.iter().chain(state.tasks.iter().flat_map(|task| task.queue.iter())).any(|q| q.id == id))
+    }
 }
 
 /// `s` as it is kept: its spec to resume it by, its queue and pause, and whether a turn of its is
 /// under way. Takes the session's locks itself: never with one held.
 fn record(s: &Session) -> Saved {
     // resume_spec takes the session's lock itself: before this one, never inside it.
-    let spec = s.resume_spec();
+    let mut spec = s.resume_spec();
     let ran = s.ran.lock().clone();
     let core = s.core.lock();
     let st = &core.state;
+    // U17: start acceptance owns the first prompt too. Normalize it onto the same durable
+    // replay path as accepted Sends; a saved spec and pending must never both send it.
+    let initial = session::initial_prompt(&s.id, &spec);
+    spec.prompt = None;
+    let observed: HashSet<String> = st.delivery.iter().filter_map(|(id, delivery)| matches!(delivery, super::model::Delivery::Started | super::model::Delivery::Completed | super::model::Delivery::Cancelled).then_some(id.clone()))
+        .collect();
+    let mut pending: Vec<Command> = initial.filter(|command| message_of(command).is_none_or(|(id, _)| !observed.contains(&id))).into_iter().collect();
+    for (q, task) in st.queue.iter().map(|q| (q, None)).chain(st.tasks.iter().flat_map(|task| task.queue.iter().map(|q| (q, Some(task.id.clone()))))) {
+        // kiln's synthetic keep/continuation queue entries are not a second accepted inbox
+        // intent. Actual accepted Sends remain in Host.pending regardless of their name.
+        if observed.contains(&q.id) || q.id.starts_with(super::core::KEEP_ID) { continue; }
+        let command = Command::Send { id: q.id.clone(), text: q.text.clone(), mode: Default::default(), attachments: q.attachments.clone(), overrides: q.overrides.clone(), reply_to: q.reply_to.clone(), task };
+        replace_pending(&mut pending, command);
+    }
     Saved {
+        pending,
+        tasks: st.tasks.clone(),
+        state: Some(st.clone()),
+        // A locally rendered user event or Sent marker can precede the actual pipe write.
+        // Queue ownership suppresses dispatch but does not retire recovery payloads. Only
+        // native Started/Completed/Cancelled (or processed local cancellation) retires them.
+        observed,
         id: s.id.clone(),
         spec,
         queue: st.queue.clone(),
@@ -153,12 +201,31 @@ fn record(s: &Session) -> Saved {
         manual_resume: st.manual_resume,
         move_on_limit: st.move_on_limit,
         move_plan: st.move_plan.clone(),
-        cut: s.turn_open.load(Ordering::Relaxed),
+        cut: s.turn_open.load(Ordering::Relaxed) || st.delivery.values().any(|delivery| *delivery == super::model::Delivery::Started),
         harness: ran.0,
         ran: ran.1,
         inbox: Vec::new(),
         inbox_digests: Vec::new(),
     }
+}
+
+// U17: effective replay payloads share the original stable identity, not a second acceptance.
+fn pending_id(command: &Command) -> Option<&str> {
+    match command {
+        Command::Send { id, .. } | Command::SkillRun { id: Some(id), .. } if !id.is_empty() => Some(id),
+        _ => None,
+    }
+}
+
+fn replace_pending(pending: &mut Vec<Command>, command: Command) {
+    if let Some(id) = pending_id(&command)
+        && let Some(prior) = pending.iter_mut().find(|prior| pending_id(prior) == Some(id)) {
+        *prior = command;
+    } else if !pending.contains(&command) { pending.push(command); }
+}
+
+fn queued_ids(saved: &Saved) -> HashSet<String> {
+    saved.queue.iter().chain(saved.tasks.iter().flat_map(|task| task.queue.iter())).map(|q| q.id.clone()).collect()
 }
 
 /// What a runner answers a hand-over of a session it runs from before it ([`Host::adopt`]: a copy
@@ -227,7 +294,51 @@ pub const HANDOVERS_MAX: usize = 4096;
 /// taking it back), written and synced before it's said or acted on. So whatever word of it reaches
 /// the process that handed it over, from whichever try and however late, two of the machine's
 /// processes never run it (CP-T3.2, the nineteenth adversarial check's).
+/// U17: a committed takeover carries enough input to finish opening after a crash. It stays
+/// machine-wide until this owner's session snapshot commits, including its inbox imports.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Arrival {
+    owner: String,
+    id: String,
+    spec: Spec,
+    seed: session::Seed,
+    inbox: Vec<String>,
+    digests: Vec<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct SessionOwner {
+    scope: String,
+    epoch: u64,
+    /// U17: retirement fences stale snapshots and unfinished arrival/start recovery inputs.
+    #[serde(default)]
+    stopped: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct NativeArrival { owner: String, record: Saved }
+
+/// U17: the stable controller identity is accepted before any harness task can run. Completed
+/// inputs remain tombstones so a retry cannot reopen an ended or transferred session.
+#[derive(Clone, Serialize, Deserialize)]
+struct StartInput { owner: String, spec: Spec, complete: bool }
+
+#[derive(Default, Serialize, Deserialize)]
+struct HandoverState {
+    #[serde(default)]
+    owners: HashMap<String, SessionOwner>,
+    #[serde(default)]
+    native_arrivals: HashMap<String, NativeArrival>,
+    #[serde(default)]
+    arrivals: HashMap<String, Arrival>,
+    #[serde(default)]
+    starts: HashMap<String, StartInput>,
+    taken: HashMap<String, (u64, i64)>,
+    decided: HashMap<String, Decision>,
+}
+
 struct Handovers {
+    snapshot: Option<snapshot::Snapshot>,
     path: PathBuf,
     decided: PathBuf,
     unwritten: Mutex<HashMap<String, (u64, i64)>>,
@@ -240,7 +351,55 @@ struct Locked<'a> {
 }
 
 impl Locked<'_> {
+    fn start_once(&self, scope: &str, id: &str, spec: &Spec) -> anyhow::Result<bool> {
+        let snapshot = self.handovers.snapshot.as_ref().ok_or_else(|| anyhow::anyhow!("U17 canonical start ledger missing"))?;
+        let (revision, mut state) = self.handovers.control_versioned()?;
+        if let Some(start) = state.starts.get(id) {
+            anyhow::ensure!(&start.spec == spec, "U17 session id {id} was already accepted with a different start specification");
+            if start.complete { return Ok(false); }
+            anyhow::ensure!(start.owner == scope && !superseded(&state, scope, id, 0), "U17 pending session start awaits recovery by its original owner {}", start.owner);
+            return Ok(true);
+        }
+        anyhow::ensure!(!state.owners.contains_key(id), "U17 session id {id} already belongs to an existing session");
+        anyhow::ensure!(state.starts.len() < HANDOVERS_MAX && state.owners.len() < HANDOVERS_MAX, "U17 machine session identity ledger is full");
+        state.starts.insert(id.to_owned(), StartInput { owner: scope.to_owned(), spec: spec.clone(), complete: false });
+        state.owners.insert(id.to_owned(), SessionOwner { scope: scope.to_owned(), epoch: 0, stopped: false });
+        snapshot.save_at(&state, revision)?;
+        Ok(true)
+    }
+
+    /// U17: retire the current owner's identity before removing memory or stopping its process.
+    /// The machine lock serializes this with starts and both kinds of handover.
+    fn stop(&self, scope: &str, id: &str, epoch: u64) -> anyhow::Result<()> {
+        let snapshot = self.handovers.snapshot.as_ref().ok_or_else(|| anyhow::anyhow!("U17 canonical ownership metadata missing"))?;
+        let (revision, mut state) = self.handovers.control_versioned()?;
+        if let Some(owner) = state.owners.get(id) {
+            anyhow::ensure!(owner.scope == scope && owner.epoch <= epoch, "U17 session {id} no longer belongs to this host at epoch {epoch}");
+            if owner.stopped { return Ok(()); }
+        } else {
+            anyhow::ensure!(!superseded(&state, scope, id, epoch), "U17 session {id} has a newer owner");
+            anyhow::ensure!(state.owners.len() < HANDOVERS_MAX, "U17 machine session ownership ledger is full");
+        }
+        state.owners.insert(id.to_owned(), SessionOwner { scope: scope.to_owned(), epoch, stopped: true });
+        if let Some(start) = state.starts.get_mut(id) { start.complete = true; }
+        state.arrivals.remove(id);
+        state.native_arrivals.remove(id);
+        snapshot.save_at(&state, revision)
+    }
+
+    fn finish_starts(&self, ids: &[String]) -> anyhow::Result<()> {
+        let snapshot = self.handovers.snapshot.as_ref().ok_or_else(|| anyhow::anyhow!("U17 canonical start ledger missing"))?;
+        let (revision, mut state) = self.handovers.control_versioned()?;
+        let mut changed = false;
+        for id in ids {
+            if let Some(start) = state.starts.get_mut(id) { changed |= !start.complete; start.complete = true; }
+        }
+        if changed { snapshot.save_at(&state, revision)?; }
+        Ok(())
+    }
+
     fn decisions(&self) -> std::io::Result<HashMap<String, Decision>> {
+        if self.handovers.snapshot.is_some() { return Ok(self.handovers.control()?.decided); }
         match std::fs::read(&self.handovers.decided) {
             Ok(raw) => serde_json::from_slice(&raw).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
@@ -261,6 +420,23 @@ impl Locked<'_> {
     /// Try `attempt` at handing session `id` over went `how` (taken: to go on at `epoch`), at `at`:
     /// written and synced, its folder too.
     fn decide(&self, attempt: &str, id: &str, how: Decided, epoch: u64, at: i64) -> std::io::Result<()> {
+        if let Some(snapshot) = &self.handovers.snapshot {
+            let (revision, mut state) = self.handovers.control_versioned()?;
+            if let Some(previous) = state.decided.get(attempt) {
+                if previous.session != id || previous.taken != (how == Decided::Taken) || previous.epoch != epoch {
+                    return Err(std::io::Error::other("U17 handover decision is already final"));
+                }
+                return Ok(());
+            }
+            state.decided.insert(attempt.to_owned(), Decision { session: id.to_owned(), taken: how == Decided::Taken, epoch, at });
+            trim_decided(&mut state.decided);
+            if how == Decided::Taken {
+                let was = state.taken.get(id).map_or(0, |(epoch, _)| *epoch);
+                state.taken.insert(id.to_owned(), (was.max(epoch), at));
+                trim_taken(&mut state.taken);
+            }
+            return snapshot.save_at(&state, revision).map_err(std::io::Error::other);
+        }
         let mut all = self.decisions()?;
         all.insert(attempt.to_owned(), Decision { session: id.to_owned(), taken: how == Decided::Taken, epoch, at });
         if all.len() > HANDOVERS_MAX {
@@ -273,6 +449,73 @@ impl Locked<'_> {
         let json = serde_json::to_vec(&all).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         crate::util::write_secret(&self.handovers.decided, &json, 0o600)?;
         self.handovers.decided.parent().map_or(Ok(()), crate::blobs::chunks::sync_dir)
+    }
+
+    /// The takeover decision and its recovery input commit together before opening the session.
+    fn arrive(&self, attempt: Option<&str>, arrival: Arrival, epoch: u64, at: i64) -> std::io::Result<()> {
+        let snapshot = self.handovers.snapshot.as_ref().ok_or_else(|| std::io::Error::other("U17 canonical handover snapshot missing"))?;
+        let (revision, mut state) = self.handovers.control_versioned()?;
+        if state.owners.get(&arrival.id).is_some_and(|owner| owner.stopped || (owner.epoch >= epoch && owner.scope != arrival.owner)) {
+            return Err(std::io::Error::other("U17 arrival is superseded by another owner"));
+        }
+        if !state.owners.contains_key(&arrival.id) && state.owners.len() >= HANDOVERS_MAX {
+            return Err(std::io::Error::other("U17 machine session ownership ledger is full"));
+        }
+        if !state.arrivals.contains_key(&arrival.id) && state.arrivals.len() >= HANDOVERS_MAX {
+            return Err(std::io::Error::other("U17 too many unfinished session arrivals"));
+        }
+        if let Some(attempt) = attempt {
+            if state.decided.contains_key(attempt) { return Err(std::io::Error::other("U17 handover attempt is already decided")); }
+            state.decided.insert(attempt.to_owned(), Decision { session: arrival.id.clone(), taken: true, epoch, at });
+            if state.decided.len() > HANDOVERS_MAX {
+                let mut by_age: Vec<(String, i64)> = state.decided.iter().map(|(key, decision)| (key.clone(), decision.at)).collect();
+                by_age.sort_by_key(|(_, at)| *at);
+                for (key, _) in by_age.into_iter().take(state.decided.len().saturating_sub(HANDOVERS_MAX)) { state.decided.remove(&key); }
+            }
+        }
+        let was = state.taken.get(&arrival.id).map_or(0, |(epoch, _)| *epoch);
+        state.taken.insert(arrival.id.clone(), (was.max(epoch), at));
+        trim_taken(&mut state.taken);
+        state.owners.insert(arrival.id.clone(), SessionOwner { scope: arrival.owner.clone(), epoch, stopped: false });
+        state.arrivals.insert(arrival.id.clone(), arrival);
+        snapshot.save_at(&state, revision).map_err(std::io::Error::other)
+    }
+
+    fn finish_arrivals(&self, ids: &[String]) -> std::io::Result<()> {
+        let Some(snapshot) = &self.handovers.snapshot else { return Ok(()) };
+        let (revision, mut state) = self.handovers.control_versioned()?;
+        let mut changed = false;
+        for id in ids { changed |= state.arrivals.remove(id).is_some(); }
+        if changed { snapshot.save_at(&state, revision).map_err(std::io::Error::other)?; }
+        Ok(())
+    }
+
+    /// Native descriptor transfers keep their epoch. Persist an explicit owner and a Saved
+    /// recovery input before starting/acknowledging the receiver, as for package arrivals.
+    fn native_arrive(&self, scope: &str, record: Saved) -> std::io::Result<()> {
+        let snapshot = self.handovers.snapshot.as_ref().ok_or_else(|| std::io::Error::other("U17 native handover snapshot missing"))?;
+        let (revision, mut state) = self.handovers.control_versioned()?;
+        if state.owners.get(&record.id).is_some_and(|owner| owner.stopped || owner.epoch > record.epoch()) {
+            return Err(std::io::Error::other("U17 native handover is older than the current owner"));
+        }
+        if !state.owners.contains_key(&record.id) && state.owners.len() >= HANDOVERS_MAX {
+            return Err(std::io::Error::other("U17 machine session ownership ledger is full"));
+        }
+        if !state.native_arrivals.contains_key(&record.id) && state.native_arrivals.len() >= HANDOVERS_MAX {
+            return Err(std::io::Error::other("U17 too many unfinished native arrivals"));
+        }
+        state.owners.insert(record.id.clone(), SessionOwner { scope: scope.to_owned(), epoch: record.epoch(), stopped: false });
+        state.native_arrivals.insert(record.id.clone(), NativeArrival { owner: scope.to_owned(), record });
+        snapshot.save_at(&state, revision).map_err(std::io::Error::other)
+    }
+
+    fn finish_native(&self, ids: &[String]) -> std::io::Result<()> {
+        let Some(snapshot) = &self.handovers.snapshot else { return Ok(()) };
+        let (revision, mut state) = self.handovers.control_versioned()?;
+        let mut changed = false;
+        for id in ids { changed |= state.native_arrivals.remove(id).is_some(); }
+        if changed { snapshot.save_at(&state, revision).map_err(std::io::Error::other)?; }
+        Ok(())
     }
 
     /// [`Handovers::note`], with this lock held.
@@ -288,7 +531,28 @@ impl Handovers {
             Some(instances) if instances.file_name().is_some_and(|n| n == "instances") => instances.parent().unwrap_or(own_dir),
             _ => own_dir,
         };
-        Self { path: state.join("handovers-taken.json"), decided: state.join("handovers-decided.json"), unwritten: Mutex::new(HashMap::new()) }
+        Self { snapshot: None, path: state.join("handovers-taken.json"), decided: state.join("handovers-decided.json"), unwritten: Mutex::new(HashMap::new()) }
+    }
+
+    /// U17: import both legacy decisions and taken epochs together into the machine-wide
+    /// namespace. The lock file remains only a process coordination artifact.
+    fn with_records(own_dir: &std::path::Path, records: Arc<dyn kiln_seams::Records>) -> anyhow::Result<Self> {
+        let mut handovers = Self::of(own_dir);
+        let _lock = handovers.locked()?;
+        let (snapshot, _) = snapshot::Snapshot::import(records, "machine/handovers", || {
+            let decided = _lock.decisions()?;
+            Ok(HandoverState { taken: handovers.read()?, decided, ..HandoverState::default() })
+        })?;
+        drop(_lock);
+        handovers.snapshot = Some(snapshot);
+        Ok(handovers)
+    }
+
+    fn control(&self) -> std::io::Result<HandoverState> { Ok(self.control_versioned()?.1) }
+
+    fn control_versioned(&self) -> std::io::Result<(kiln_seams::records::Rev, HandoverState)> {
+        self.snapshot.as_ref().ok_or_else(|| std::io::Error::other("U17 handover snapshot missing"))?
+            .read_versioned().map_err(std::io::Error::other)?.ok_or_else(|| std::io::Error::other("U17 committed handover state disappeared"))
     }
 
     /// The machine's hand-overs, this process's (and this thread's) alone until what's returned is
@@ -305,6 +569,7 @@ impl Handovers {
     }
 
     fn read(&self) -> std::io::Result<HashMap<String, (u64, i64)>> {
+        if self.snapshot.is_some() { return Ok(self.control()?.taken); }
         match std::fs::read(&self.path) {
             Ok(raw) => serde_json::from_slice(&raw).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
@@ -353,6 +618,15 @@ impl Handovers {
 
     /// `new` written into the machine's hand-overs, their lock held.
     fn write_held(&self, new: &HashMap<String, (u64, i64)>) -> std::io::Result<()> {
+        if let Some(snapshot) = &self.snapshot {
+            let (revision, mut state) = self.control_versioned()?;
+            for (id, (epoch, at)) in new {
+                let was = state.taken.get(id).map_or(0, |(epoch, _)| *epoch);
+                state.taken.insert(id.clone(), (was.max(*epoch), *at));
+            }
+            trim_taken(&mut state.taken);
+            return snapshot.save_at(&state, revision).map_err(std::io::Error::other);
+        }
         let mut all = self.read()?;
         for (id, (epoch, at)) in new {
             let was = all.get(id).map_or(0, |(e, _)| *e);
@@ -372,6 +646,25 @@ impl Handovers {
     }
 }
 
+fn superseded(state: &HandoverState, scope: &str, id: &str, epoch: u64) -> bool {
+    state.owners.get(id).is_some_and(|owner| owner.stopped || (owner.scope != scope && owner.epoch >= epoch))
+        || state.taken.get(id).is_some_and(|(taken, _)| *taken > epoch)
+}
+
+fn trim_decided(all: &mut HashMap<String, Decision>) {
+    if all.len() <= HANDOVERS_MAX { return; }
+    let mut by_age: Vec<(String, i64)> = all.iter().map(|(key, decision)| (key.clone(), decision.at)).collect();
+    by_age.sort_by_key(|(_, at)| *at);
+    for (key, _) in by_age.into_iter().take(all.len().saturating_sub(HANDOVERS_MAX)) { all.remove(&key); }
+}
+
+fn trim_taken(all: &mut HashMap<String, (u64, i64)>) {
+    if all.len() <= HANDOVERS_MAX { return; }
+    let mut by_age: Vec<(String, i64)> = all.iter().map(|(k, (_, at))| (k.clone(), *at)).collect();
+    by_age.sort_by_key(|(_, at)| *at);
+    for (key, _) in by_age.into_iter().take(all.len().saturating_sub(HANDOVERS_MAX)) { all.remove(&key); }
+}
+
 /// What a session's hand-over or move hears when its host has gone (CP-T3.2): it stays, as its
 /// inbox's ids can't go with it.
 const HOST_GONE: &str = "this runner's host of its sessions is gone, so it stays here";
@@ -386,6 +679,15 @@ pub struct Host {
     /// at work at once can change as it runs (`super::limit`).
     room: Mutex<Room>,
     file: Option<PathBuf>,
+    snapshot: Option<snapshot::Snapshot>,
+    /// U05: same configured Records namespace and original conversation actor; none when off.
+    session_namespace: Option<crate::records::SessionNamespace>,
+    _owner_lock: Option<std::fs::File>,
+    save_lock: Mutex<()>,
+    restoring: AtomicBool,
+    restore_failed: AtomicBool,
+    pending: Mutex<HashMap<String, Vec<Command>>>,
+    outgoing: Mutex<HashMap<String, Saved>>,
     dirty: AtomicBool,
     /// What the sessions' harnesses run is being looked at (`watch`).
     watching: AtomicBool,
@@ -416,6 +718,16 @@ pub struct Host {
     /// The hand-overs this machine took (CP-T3.2), kept for every runner process of it: none
     /// without a record file.
     handovers: Option<Handovers>,
+}
+
+/// U17: an incomplete restore must never let a background save replace durable sessions
+/// with the subset that happened to open. A later explicit restore can retry the same input.
+struct RestoreAttempt<'a> { host: &'a Host, complete: bool }
+impl Drop for RestoreAttempt<'_> {
+    fn drop(&mut self) {
+        self.host.restore_failed.store(!self.complete, Ordering::Release);
+        self.host.restoring.store(false, Ordering::Release);
+    }
 }
 
 /// Most of what waits in one session's lane: past it, what's sent is refused (a message, `Full`).
@@ -464,15 +776,50 @@ impl Host {
     /// sessions' inboxes keeping their records beside its own record of them.
     pub fn counting_into(sink: Sink, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>, metrics: &'static crate::metrics::AgentMetrics) -> Arc<Self> {
         let records = file.as_ref().and_then(|f| f.parent()).and_then(open_records);
-        Self::build(sink, file, limits, clock, records, metrics)
+        Self::build(sink, file, limits, clock, records, None, metrics)
     }
 
     /// A host whose sessions' inboxes keep their records in `records` (none: no inboxes).
     pub fn with_records(sink: Sink, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>, records: Option<Arc<dyn kiln_seams::Records>>) -> Arc<Self> {
-        Self::build(sink, file, limits, clock, records, crate::metrics::agents())
+        Self::build(sink, file, limits, clock, records, None, crate::metrics::agents())
     }
 
-    fn build(sink: Sink, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>, records: Option<Arc<dyn kiln_seams::Records>>, metrics: &'static crate::metrics::AgentMetrics) -> Arc<Self> {
+    /// U17: canonical startup. The legacy path supplies attachments/bootstrap locations and is
+    /// imported once; no session JSON is written after this constructor succeeds.
+    pub fn try_with_records(sink: Sink, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>, records: Arc<dyn kiln_seams::Records>, scope: &str) -> anyhow::Result<Arc<Self>> {
+        Self::try_with_namespaces(sink, file, limits, clock, (records.clone(), records), scope)
+    }
+
+    /// U17: independent legacy revision spaces can become distinct namespaces of the same host
+    /// Database. Session receipts/snapshots use the first; every instance's handover decisions
+    /// use the second, machine-wide namespace. Both handles must share that one Database.
+    pub fn try_with_namespaces(sink: Sink, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>, records: (Arc<dyn kiln_seams::Records>, Arc<dyn kiln_seams::Records>), scope: &str) -> anyhow::Result<Arc<Self>> {
+        Self::try_with_storage(sink, file, limits, clock, records, scope, None)
+    }
+
+    /// U05: canonical production startup supplies the factory's sealed namespace pair.
+    /// This installs a capability only; producer admission/publication remains step6's owner.
+    pub fn try_with_session_namespace(sink: Sink, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>, namespace: crate::records::SessionNamespace, machine: Arc<dyn kiln_seams::Records>, scope: &str) -> anyhow::Result<Arc<Self>> {
+        let records = (namespace.records(), machine);
+        Self::try_with_storage(sink, file, limits, clock, records, scope, Some(namespace))
+    }
+
+    fn try_with_storage(sink: Sink, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>, records: (Arc<dyn kiln_seams::Records>, Arc<dyn kiln_seams::Records>), scope: &str, namespace: Option<crate::records::SessionNamespace>) -> anyhow::Result<Arc<Self>> {
+        let (sessions, machine) = records;
+        // U17: CAS fences writes, not already-started harness processes. Only one process may
+        // restore a host scope from its bootstrap directory at a time.
+        let owner_lock = file.as_ref().map(|path| -> anyhow::Result<std::fs::File> {
+            if let Some(dir) = path.parent() { std::fs::create_dir_all(dir)?; }
+            let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path.with_extension("owner.lock"))?;
+            lock.try_lock().map_err(|e| anyhow::anyhow!("U17 session host {scope} is already owned or cannot be locked: {e}"))?;
+            Ok(lock)
+        }).transpose()?;
+        let (snapshot, _) = snapshot::Snapshot::open::<Vec<Saved>>(sessions.clone(), scope, file.as_deref())?;
+        let handovers = file.as_ref().and_then(|f| f.parent()).map(|dir| Handovers::with_records(dir, machine.clone())).transpose()?;
+        Ok(Self::build(sink, file, limits, clock, Some(sessions), Some((snapshot, handovers, owner_lock, namespace)), crate::metrics::agents()))
+    }
+
+    fn build(sink: Sink, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>, records: Option<Arc<dyn kiln_seams::Records>>, persistence: Option<(snapshot::Snapshot, Option<Handovers>, Option<std::fs::File>, Option<crate::records::SessionNamespace>)>, metrics: &'static crate::metrics::AgentMetrics) -> Arc<Self> {
         // The models its harnesses' sessions list are kept beside its record of them.
         if let Some(dir) = file.as_ref().and_then(|f| f.parent()) {
             super::kinds::keep_models_in(dir.join("harness-models.json"));
@@ -483,12 +830,23 @@ impl Host {
             || std::env::temp_dir().join(format!("kiln-attachments-{}", crate::os::uid())),
             |d| d.join("attachments"),
         );
-        let handovers = file.as_ref().and_then(|f| f.parent()).map(Handovers::of);
+        let (snapshot, handovers, owner_lock, session_namespace) = match persistence {
+            Some((snapshot, handovers, owner_lock, namespace)) => (Some(snapshot), handovers, owner_lock, namespace),
+            None => (None, file.as_ref().and_then(|f| f.parent()).map(Handovers::of), None, None),
+        };
         Arc::new_cyclic(|me| Self {
             sessions: Mutex::new(HashMap::new()),
             sink,
             room: Mutex::new(Room { limits, ..Room::default() }),
             file,
+            snapshot,
+            session_namespace,
+            _owner_lock: owner_lock,
+            save_lock: Mutex::new(()),
+            restoring: AtomicBool::new(false),
+            restore_failed: AtomicBool::new(false),
+            pending: Mutex::new(HashMap::new()),
+            outgoing: Mutex::new(HashMap::new()),
             dirty: AtomicBool::new(false),
             watching: AtomicBool::new(false),
             me: me.clone(),
@@ -603,6 +961,8 @@ impl Host {
     pub fn inbox(&self) -> Option<&Arc<Inbox>> {
         self.inbox.as_ref()
     }
+
+    pub(crate) fn persistent_scope(&self) -> Option<String> { self.snapshot.as_ref().map(snapshot::Snapshot::scope) }
 
     /// Looks the watch has taken at what the harnesses run.
     pub fn looks(&self) -> u64 {
@@ -777,6 +1137,12 @@ impl Host {
         self.sessions.lock().get(id).cloned()
     }
 
+    /// U05: the existing host's namespace-bound capability, alongside its unchanged Records.
+    /// None preserves disabled/compatibility storage; it never creates an actor on demand.
+    pub fn session_batches(&self) -> Option<Arc<dyn crate::records::SessionBatches>> {
+        self.session_namespace.as_ref().map(crate::records::SessionNamespace::batches)
+    }
+
     /// Each session and its harness's process, where one runs (which agent a process is: a
     /// `kiln` command run by an agent's tool, `super::socket`). The sessions' own locks are taken
     /// after this host's is let go.
@@ -808,10 +1174,33 @@ impl Host {
     }
 
     /// Start a session (`id` keeps a known one's identity, e.g. one the server named). A subagent
-    /// opens as its parent runs here ([`Host::like_its_parent`]).
+    /// opens as its parent runs here ([`Host::like_its_parent`]). Blocking with persistence.
     pub fn open(&self, id: Option<String>, spec: Spec) -> anyhow::Result<Arc<Session>> {
+        if self.snapshot.is_some() {
+            // U17: even a local socket or branch start gets an identity before acceptance.
+            let id = id.unwrap_or_else(crate::util::new_id);
+            return self.open_once(&id, spec)?.ok_or_else(|| anyhow::anyhow!("U17 session {id} was accepted before and is no longer active here"));
+        }
         let spec = self.like_its_parent(spec);
         self.open_seeded(id, spec, None, None, Vec::new(), false, true)
+    }
+
+    /// U17: a keyed internal start, accepted durably before adapter spawn. None means this
+    /// machine accepted that identity before; it must never be launched as a fresh session.
+    pub fn open_once(&self, id: &str, spec: Spec) -> anyhow::Result<Option<Arc<Session>>> {
+        anyhow::ensure!(!id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'), "U17 invalid stable session id");
+        anyhow::ensure!(Kind::get(&spec.kind).is_some(), "unknown harness {:?}", spec.kind);
+        anyhow::ensure!(!self.restoring.load(Ordering::Acquire) && !self.restore_failed.load(Ordering::Acquire), "U17 session restoration must complete before accepting a start");
+        let (Some(snapshot), Some(handovers)) = (&self.snapshot, &self.handovers) else { anyhow::bail!("U17 keyed starts require canonical session persistence") };
+        let locked = handovers.locked()?;
+        if !locked.start_once(&snapshot.scope(), id, &spec)? { return Ok(self.get(id)); }
+        let session = match self.get(id) {
+            Some(session) => session,
+            None => self.open_seeded(Some(id.to_owned()), self.like_its_parent(spec), None, None, Vec::new(), false, true)?,
+        };
+        self.persist_now()?;
+        locked.finish_starts(&[id.to_owned()])?;
+        Ok(Some(session))
     }
 
     /// A subagent (`Spec::subagent`) whose parent runs on this machine takes what only the machine
@@ -870,7 +1259,7 @@ impl Host {
             Err(e) => return Err(Refused::NotTaken(format!("the session from {from} is unreadable: {e}"))),
         };
         // It goes on here an epoch up (`session::start_seeded`).
-        let epoch = pkg.state.epoch.saturating_add(1);
+        let epoch = pkg.state.epoch.checked_add(1).ok_or_else(|| Refused::NotTaken("session epoch is exhausted".into()))?;
         // One take at a time on the machine (CP-T3.2, the nineteenth adversarial check's): two of its
         // processes given one package (a try sent again, the newest gone meanwhile; a move's sent
         // again after a blue/green upgrade) take it over once, the second finding the first's note.
@@ -979,11 +1368,19 @@ impl Host {
         let seed = session::Seed { events: pkg.events, state: pkg.state, items, from: pkg.from, from_cwd: pkg.from_cwd, picks_up: pkg.picks_up, note, restored: false, synced: pkg.synced, local: pkg.handover };
         // Taken over, written so before anything of it runs here: no other process of the machine
         // takes this try over, and the one that handed it over doesn't go on with it.
-        taken(&id)?;
-        self.open_seeded(Some(pkg.id), pkg.spec, Some(seed), None, kept_pairs(pkg.inbox, pkg.inbox_digests), false, new).map_err(|e| Refused::NotTaken(format!("{e:#}")))?;
+        let canonical = self.snapshot.is_some();
+        if let Some(snapshot) = &self.snapshot {
+            let locked = locked.ok_or_else(|| Refused::Unsure("U17 machine handover lock unavailable".into()))?;
+            locked.arrive(attempt, Arrival { owner: snapshot.scope(), id: id.clone(), spec: pkg.spec.clone(), seed: seed.clone(), inbox: pkg.inbox.clone(), digests: pkg.inbox_digests.clone() }, epoch, self.clock.unix_ms())
+                .map_err(|e| Refused::Unsure(format!("U17 couldn't commit session arrival: {e}")))?;
+        } else { taken(&id)?; }
+        self.open_seeded(Some(pkg.id), pkg.spec, Some(seed), None, kept_pairs(pkg.inbox, pkg.inbox_digests), false, new).map_err(|e| if canonical { Refused::Unsure(format!("committed arrival waits for recovery: {e:#}")) } else { Refused::NotTaken(format!("{e:#}")) })?;
         // Its record written as it arrives, with the ids it brought until they're taken in: a
         // restart a moment later still has them (CP-T3.2).
-        self.save_now();
+        self.persist_now().map_err(|e| Refused::Unsure(format!("session arrival snapshot wasn't committed: {e:#}")))?;
+        if canonical && let Some(locked) = locked {
+            locked.finish_arrivals(std::slice::from_ref(&id)).map_err(|e| Refused::Unsure(format!("arrival cleanup wasn't committed: {e}")))?;
+        }
         // Kept past its end here, and past this runner process (blue/green), so this hand-over
         // sent again is answered as taken.
         let noted = match (locked, &self.handovers) {
@@ -1038,10 +1435,13 @@ impl Host {
             take: Arc::new(move |f: &str| me.upgrade().and_then(|h| h.take_file(f))),
             // A branch: another session on this machine.
             spawn: Arc::new(move |spec: Spec| {
-                if let Some(h) = me2.upgrade()
-                    && let Err(e) = h.open(None, spec)
-                {
-                    tracing::warn!(error = %format!("{e:#}"), "could not branch an agent session");
+                if let Some(h) = me2.upgrade() {
+                    crate::rt::spawn(async move {
+                        match crate::rt::blocking(move || h.open(None, spec)).await {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(e)) | Err(e) => tracing::warn!(error = %format!("{e:#}"), "could not branch an agent session"),
+                        }
+                    });
                 }
             }),
             release: Arc::new(move |id: &str| {
@@ -1080,6 +1480,24 @@ impl Host {
                 let (me, id) = (self.me.clone(), id.to_owned());
                 Arc::new(move || me.upgrade().is_none_or(|h| h.room_for(&id)))
             },
+            queue_changed: Some({
+                let (me, session) = (self.me.clone(), id.to_owned());
+                Arc::new(move |id, command| {
+                    if let Some(h) = me.upgrade() {
+                        // Called after Core.effects has been taken and its lock released. Never
+                        // record/persist here: those paths acquire the same core again.
+                        {
+                            let mut all = h.pending.lock();
+                            if let Some(command) = command { replace_pending(all.entry(session.clone()).or_default(), command); }
+                            else if let Some(pending) = all.get_mut(&session) {
+                                pending.retain(|command| pending_id(command) != Some(id));
+                                if pending.is_empty() { all.remove(&session); }
+                            }
+                        }
+                        h.mark_dirty();
+                    }
+                })
+            }),
             work: {
                 let (me, id) = (self.me.clone(), id.to_owned());
                 Arc::new(move |work, waits| {
@@ -1099,6 +1517,12 @@ impl Host {
     /// another of its runner processes) never is, whatever its limits say now (`super::limit`).
     #[allow(clippy::too_many_arguments, reason = "each says how the session comes to be here")]
     fn open_seeded(&self, id: Option<String>, spec: Spec, seed: Option<session::Seed>, handed: Option<Box<session::Handed>>, brought: Vec<(String, String)>, back: bool, new: bool) -> anyhow::Result<Arc<Session>> {
+        self.open_seeded_with(id, spec, seed, handed, brought, back, new, None)
+    }
+
+    #[allow(clippy::too_many_arguments, reason = "cold restoration initializes existing state before drive")]
+    fn open_seeded_with(&self, id: Option<String>, spec: Spec, seed: Option<session::Seed>, handed: Option<Box<session::Handed>>, brought: Vec<(String, String)>, back: bool, new: bool, before_start: Option<Box<dyn FnOnce(&Session) + '_>>) -> anyhow::Result<Arc<Session>> {
+        anyhow::ensure!(handed.is_none() || before_start.is_none(), "a live native handover cannot use cold initialization");
         if Kind::get(&spec.kind).is_none() {
             anyhow::bail!("unknown harness {:?}", spec.kind);
         }
@@ -1133,7 +1557,7 @@ impl Host {
         let files = self.files_for(&id);
         // What its timeline and queue show first, what its inbox took last (in its own order, the
         // newest last): past its inbox's bound, the newest are the ones its inbox here keeps.
-        let brought = match &seed {
+        let mut brought = match &seed {
             Some(sd) => {
                 let mut all = brought_ids(sd);
                 all.extend(brought);
@@ -1141,6 +1565,10 @@ impl Host {
             }
             None => brought,
         };
+        // The durable start accepted this identity and these bytes before any harness sends it.
+        // Import its digest with the pending payload so a client cannot send that identity again.
+        if let Some(command) = session::initial_prompt(&id, &spec)
+            && let Some(pair) = message_of(&command) { brought.push(pair); }
         // Whatever is sent to it waits until it's in and its lane is open, its first word there.
         let mut lanes = self.lanes.lock();
         // Started meanwhile (by another call, its lock first): that one.
@@ -1149,7 +1577,13 @@ impl Host {
         }
         let started = match handed {
             Some(h) => session::start_handed(id.clone(), spec, self.sink.clone(), on_change, files, h),
-            None => session::start_seeded(id.clone(), spec, self.sink.clone(), on_change, files, seed),
+            None => session::start_seeded_with(id.clone(), spec, self.sink.clone(), on_change, files, seed, |session| {
+                if let Some(initialize) = before_start { initialize(session); }
+                // Seed queues and initial prompts also need retained bytes before any adapter
+                // can drain them. This is the same pending owner used by accepted Sends.
+                let pending = self.recorded(session).pending;
+                if !pending.is_empty() { self.pending.lock().insert(session.id.clone(), pending); }
+            }),
         };
         let s = match started {
             Ok(s) => s,
@@ -1346,6 +1780,15 @@ impl Host {
             return;
         }
         let at = self.clock.unix_ms();
+        if self.snapshot.is_some() && message_of(&c).is_some() {
+            let Some(host) = self.me.upgrade() else { return };
+            let session_id = id.to_owned();
+            let message = message_of(&c).map(|(id, _)| id).unwrap_or_default();
+            let answer = crate::rt::blocking(move || host.take_durable(&session_id, c, epoch, at)).await
+                .unwrap_or_else(|e| Err(inbox::Refusal::Unavailable { session: id.to_owned(), why: e.to_string() }));
+            self.say(id, Said { message, answer }).await;
+            return;
+        }
         if let Some(said) = take_message(self.inbox.as_deref(), id, s.as_deref(), c, epoch, at).await {
             self.say(id, said).await;
             // Its answer gone: an inbox past its bound lets its oldest ids go now, off the answer's way.
@@ -1353,6 +1796,34 @@ impl Host {
                 let _ = inbox.tidy(id).await;
             }
         }
+    }
+
+    /// U17: the inbox receipt and replayable command share one CAS commit. Holding the host's
+    /// save lane prevents a coalesced save from overwriting a command still in the channel.
+    fn take_durable(&self, id: &str, command: Command, epoch: Option<u64>, at: i64) -> Result<Answer, inbox::Refusal> {
+        let unavailable = |why: String| inbox::Refusal::Unavailable { session: id.to_owned(), why };
+        let _saving = self.save_lock.lock();
+        if self.restoring.load(Ordering::Acquire) || self.restore_failed.load(Ordering::Acquire) { return Err(unavailable("session restoration hasn't completed".into())); }
+        let snapshot = self.snapshot.as_ref().ok_or_else(|| unavailable("canonical snapshot missing".into()))?;
+        let inbox = self.inbox.as_ref().ok_or_else(|| unavailable("canonical inbox missing".into()))?;
+        let session = self.get(id).ok_or_else(|| inbox::Refusal::NoSession { session: id.to_owned() })?;
+        let (message, digest) = message_of(&command).ok_or_else(|| unavailable("command has no message id".into()))?;
+        session.command_committed(command.clone(), || {
+            let mut saved = self.captured();
+            let state = saved.iter_mut().find(|s| s.id == id).ok_or_else(|| unavailable("session left before acceptance".into()))?;
+            state.pending.push(command.clone());
+            let answer = snapshot.update(&saved, |tx| {
+                let answer = futures::executor::block_on(inbox.accept_with(id, &message, &digest, epoch, at, tx));
+                let committed = answer.as_ref().ok().filter(|a| !a.repeat).map(|a| a.seq);
+                Ok((committed, answer))
+            }).map_err(|e| unavailable(e.to_string()))??;
+            if !answer.repeat {
+                self.pending.lock().entry(id.to_owned()).or_default().push(command.clone());
+                self.saves.fetch_add(1, Ordering::AcqRel);
+                self.metrics.harness_records_written.inc();
+            }
+            Ok(answer)
+        })
     }
 
     /// A message for session `id` this machine couldn't read, as its inbox answers it
@@ -1375,7 +1846,29 @@ impl Host {
         let _ = self.sink.send((id.to_owned(), Update::Inbox { said: Box::new(said) })).await;
     }
 
+    /// Blocking. A storage refusal leaves the session owned and reports no accepted stop.
     pub fn close(&self, id: &str) -> bool {
+        match self.try_close(id) {
+            Ok(found) => found,
+            Err(error) => {
+                tracing::error!(%error, session = id, "U17 session stop was not committed");
+                false
+            }
+        }
+    }
+
+    /// U17: accepted stops survive a crash before the coalesced snapshot removes the session.
+    /// Keep the machine lock through physical removal so a concurrent handover cannot revive it.
+    pub fn try_close(&self, id: &str) -> anyhow::Result<bool> {
+        let locked = if let Some(snapshot) = &self.snapshot {
+            anyhow::ensure!(!self.restoring.load(Ordering::Acquire) && !self.restore_failed.load(Ordering::Acquire), "U17 session restoration must complete before accepting a stop");
+            let handovers = self.handovers.as_ref().ok_or_else(|| anyhow::anyhow!("U17 canonical ownership metadata missing"))?;
+            let locked = handovers.locked()?;
+            let Some(session) = self.get(id) else { return Ok(false) };
+            locked.stop(&snapshot.scope(), id, session.epoch())?;
+            Some(locked)
+        } else { None };
+        self.outgoing.lock().remove(id);
         let s = self.sessions.lock().remove(id);
         self.end_lane(id, Lane::Forget);
         self.leave(id);
@@ -1392,7 +1885,8 @@ impl Host {
             });
         }
         self.mark_dirty();
-        found
+        drop(locked);
+        Ok(found)
     }
 
     /// Stop every harness process now (this process is about to end, and a fresh one continues
@@ -1480,7 +1974,7 @@ impl Host {
                 #[cfg(unix)]
                 let _ = crate::os::try_reap(pid);
             }
-            let mut rec = record(&s);
+            let mut rec = self.recorded(&s);
             // What its inbox took goes with it (its newest ids), and this one takes nothing more for
             // it. Its harness is handed over already, so it goes either way: its inbox unreadable
             // (tried a few times), it takes the ids it holds itself, said.
@@ -1503,6 +1997,9 @@ impl Host {
                 });
                 (rec.inbox, rec.inbox_digests) = split_kept(kept);
             }
+            // U17: keep the source recovery input until the receiving scope durably claims
+            // ownership. A delayed background save must not erase the only durable copy.
+            self.outgoing.lock().insert(s.id.clone(), rec.clone());
             self.sessions.lock().remove(&s.id);
             self.leave(&s.id);
             // A handover's fence: started again with its session (the handover never finished),
@@ -1517,13 +2014,49 @@ impl Host {
     /// Take over a session another runner process of this machine handed over (blue/green): with
     /// its process (its descriptors are this process's now), or started again from its record (a
     /// turn its stop cut short is picked up first).
-    pub fn move_in(&self, rec: Saved, handed: Option<Box<session::Handed>>) -> anyhow::Result<()> {
+    pub fn move_in(&self, mut rec: Saved, handed: Option<Box<session::Handed>>) -> anyhow::Result<()> {
+        if self.snapshot.is_some() && rec.state.is_none() {
+            // Older native Saved payloads had no epoch. A live Frozen core supplies it; without
+            // one, guessing zero could bypass another owner's fence. The structured package
+            // protocol carries an explicit State and remains the compatible fallback.
+            let handed = handed.as_ref().ok_or_else(|| anyhow::anyhow!("U17 legacy native handover has no recoverable epoch; use the structured session transfer or retain the old runner"))?;
+            #[derive(Deserialize)]
+            struct FrozenState { state: super::model::State }
+            let frozen: FrozenState = serde_json::from_slice(&serde_json::to_vec(&handed.core)?)?;
+            rec.state = Some(frozen.state);
+        }
+        let locked = if self.snapshot.is_some() { self.handovers.as_ref().map(Handovers::locked).transpose()? } else { None };
+        if self.get(&rec.id).is_some_and(|session| session.epoch() >= rec.epoch()) {
+            if let (Some(snapshot), Some(handovers)) = (&self.snapshot, &self.handovers) {
+                anyhow::ensure!(!superseded(&handovers.control()?, &snapshot.scope(), &rec.id, rec.epoch()), "U17 this native receiver has already lost ownership");
+                self.persist_now()?;
+                if let Some(locked) = &locked { locked.finish_native(std::slice::from_ref(&rec.id))?; }
+            }
+            // A repeated descriptor/fallback delivery must not stop the live harness while
+            // checking for an outlived source process, nor enqueue its commands a second time.
+            return Ok(());
+        }
+        if let (Some(snapshot), Some(locked)) = (&self.snapshot, &locked) {
+            locked.native_arrive(&snapshot.scope(), rec.clone())?;
+        }
+        let id = rec.id.clone();
+        self.move_in_memory(rec, handed)?;
+        self.outgoing.lock().remove(&id);
+        if self.snapshot.is_some() {
+            self.persist_now()?;
+            if let Some(locked) = locked { locked.finish_native(&[id])?; }
+        }
+        Ok(())
+    }
+
+    fn move_in_memory(&self, rec: Saved, handed: Option<Box<session::Handed>>) -> anyhow::Result<()> {
         match handed {
             Some(h) => {
-                let (harness, ran) = (rec.harness.clone(), rec.ran.clone());
+                let (harness, ran, pending) = (rec.harness.clone(), rec.ran.clone(), rec.pending.clone());
                 let session = self.open_seeded(Some(rec.id), rec.spec, None, Some(h), kept_pairs(rec.inbox, rec.inbox_digests), true, false)?;
                 // What its harness runs stays under it; the watch finds the rest again.
                 *session.ran.lock() = (harness, ran);
+                self.recover_pending(&session, pending, true);
                 Ok(())
             }
             None => {
@@ -1589,15 +2122,53 @@ impl Host {
     /// timeline and state as the conversation store kept them (`crate::convo`), when it kept any;
     /// otherwise as before (a Claude Code session's history from its transcript).
     pub fn restore_from(&self, store: Option<&crate::convo::store::Store>) {
+        if let Err(error) = self.try_restore_from(store) {
+            tracing::error!(%error, "U17 session restoration refused; durable state was retained");
+        }
+    }
+
+    /// U17: canonical startup propagates read/version/import failures to the caller.
+    pub fn try_restore_from(&self, store: Option<&crate::convo::store::Store>) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.restoring.swap(true, Ordering::AcqRel), "U17 session restoration already underway");
+        self.restore_failed.store(false, Ordering::Release);
+        let mut attempt = RestoreAttempt { host: self, complete: false };
         tracing::info!(how = %crate::os::contain::how(), "agents' processes are held together by");
-        let mut handed = self.take_handover();
-        let saved: Vec<Saved> = match self.file.as_ref().map(|f| (f, std::fs::read(f))) {
-            Some((file, Ok(raw))) => serde_json::from_slice(&raw).unwrap_or_else(|e| {
-                tracing::warn!(error = %e, file = %file.display(), "unreadable agent session record; starting without it");
-                Vec::new()
-            }),
+        let saved: Vec<Saved> = if let Some(snapshot) = &self.snapshot {
+            snapshot.read::<Vec<Saved>>()?.ok_or_else(|| anyhow::anyhow!("U17 committed session snapshot disappeared"))?
+        } else { match self.file.as_ref().map(|f| (f, std::fs::read(f))) {
+            Some((file, Ok(raw))) => serde_json::from_slice(&raw).map_err(|e| anyhow::anyhow!("unreadable agent session record {}: {e}", file.display()))?,
+            Some((_, Err(e))) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
             _ => Vec::new(),
-        };
+        }};
+        let machine_lock = if self.snapshot.is_some() { self.handovers.as_ref().map(Handovers::locked).transpose()? } else { None };
+        let mut saved = saved;
+        let mut legacy_fenced = HashSet::new();
+        for session in saved.iter_mut().filter(|session| session.state.is_none()) {
+            let mut state = store.and_then(|store| kept_seed(store, &session.id)).map(|seed| seed.state);
+            if let Some(inbox) = &self.inbox
+                && let Some((epoch, moved)) = futures::executor::block_on(inbox.epoch(&session.id))?
+            {
+                state.get_or_insert_with(super::model::State::default).epoch = epoch;
+                if moved { legacy_fenced.insert(session.id.clone()); }
+            }
+            session.state = state;
+        }
+        let saved_epochs: HashMap<String, u64> = saved.iter().map(|session| (session.id.clone(), session.epoch())).collect();
+        if let (Some(snapshot), Some(handovers)) = (&self.snapshot, &self.handovers) {
+            let control = handovers.control()?;
+            let scope = snapshot.scope();
+            saved.retain(|session| !superseded(&control, &scope, &session.id, session.epoch()));
+        }
+        for session in &saved {
+            anyhow::ensure!(!legacy_fenced.contains(&session.id), "U17 legacy session {} has a fenced inbox but no newer owner proof; retain state and recover the transfer explicitly", session.id);
+            anyhow::ensure!(Kind::get(&session.spec.kind).is_some(), "U17 cannot restore session {}: unknown harness {:?}; durable state retained", session.id, session.spec.kind);
+        }
+        let mut handed = self.take_handover();
+        if let (Some(snapshot), Some(handovers)) = (&self.snapshot, &self.handovers) {
+            let control = handovers.control()?;
+            let scope = snapshot.scope();
+            handed.retain(|id, _| !superseded(&control, &scope, id, saved_epochs.get(id).copied().unwrap_or(0)));
+        }
         // A harness that outlived the runner it ran under (a crash, the system stopping only the
         // runner) is stopped first, so no second one resumes its conversation beside it; what it
         // started is kept, and taken back over with the rest.
@@ -1619,6 +2190,7 @@ impl Host {
                     Ok(session) => {
                         // What its harness runs stays under it; the watch finds the rest again.
                         *session.ran.lock() = (s.harness.clone(), s.ran.clone());
+                        self.recover_pending(&session, s.pending.clone(), true);
                         continue;
                     }
                     Err(e) => {
@@ -1627,19 +2199,77 @@ impl Host {
                     }
                 }
             }
-            let seed = store.and_then(|st| kept_seed(st, &id));
+            let mut seed = store.and_then(|st| kept_seed(st, &id));
             let from_store = seed.is_some();
+            if let Some(mut state) = s.state.clone() {
+                if let Some(seed) = &mut seed {
+                    // U17/CP-T3.2: retain conversation metadata learned after an untitled
+                    // snapshot, without replacing durable control state or crossing writers.
+                    if state.title.is_empty() && state.epoch == seed.state.epoch {
+                        state.title.clone_from(&seed.state.title);
+                    }
+                    seed.state = state;
+                } else {
+                    seed = Some(session::Seed { events: Vec::new(), state, items: None, from: String::new(), from_cwd: String::new(), picks_up: false, note: None, restored: true, synced: None, local: false });
+                }
+            }
             let cut = s.cut;
             let apart = found.get(&id).map(|f| f.apart.clone()).unwrap_or_default();
             match self.open_record(s, seed, apart, now_s, false) {
                 Ok(left) => tracing::info!(session = %id, from_store, cut, left_running = left, "agent session continued after a restart"),
-                Err(e) => tracing::warn!(session = %id, error = %format!("{e:#}"), "could not continue an agent session"),
+                Err(e) => return Err(anyhow::anyhow!("U17 could not restore session {id}; durable state retained: {e:#}")),
             }
         }
         // Handed over without a record to go on from: nothing goes on with them.
         for h in handed.into_values() {
             stop_process(h.process.pid);
         }
+        drop(machine_lock);
+        self.restoring.store(false, Ordering::Release);
+        self.recover_arrivals()?;
+        attempt.complete = true;
+        Ok(())
+    }
+
+    fn recover_arrivals(&self) -> anyhow::Result<()> {
+        let (Some(snapshot), Some(handovers)) = (&self.snapshot, &self.handovers) else { return Ok(()) };
+        let locked = handovers.locked()?;
+        let state = handovers.control()?;
+        let scope = snapshot.scope();
+        let arrivals: Vec<Arrival> = state.arrivals.values().filter(|a| a.owner == scope && !superseded(&state, &scope, &a.id, a.seed.state.epoch.saturating_add(1))).cloned().collect();
+        let native: Vec<NativeArrival> = state.native_arrivals.values().filter(|a| a.owner == scope && !superseded(&state, &scope, &a.record.id, a.record.epoch())).cloned().collect();
+        let starts: Vec<(String, StartInput)> = state.starts.iter().filter(|(id, start)| !start.complete && start.owner == scope && !superseded(&state, &scope, id, 0)).map(|(id, start)| (id.clone(), start.clone())).collect();
+        if arrivals.is_empty() && native.is_empty() && starts.is_empty() { return Ok(()) }
+        let mut recovered_starts = Vec::new();
+        for (id, start) in starts {
+            if self.get(&id).is_none() {
+                // The runner can crash after spawn but before the first session snapshot. The
+                // committed identity lets us find its marked survivor before resuming it.
+                if let Some(harness) = super::survivors::scan(&[(id.clone(), None)]).get(&id).and_then(|seen| seen.harness.as_ref()) {
+                    super::survivors::stop(&[harness.pid]);
+                }
+                self.open_seeded(Some(id.clone()), self.like_its_parent(start.spec), None, None, Vec::new(), false, false)?;
+            }
+            recovered_starts.push(id);
+        }
+        let mut recovered_native = Vec::new();
+        for arrival in native {
+            let id = arrival.record.id.clone();
+            if self.get(&id).is_none() { self.move_in_memory(arrival.record, None)?; }
+            recovered_native.push(id);
+        }
+        let mut recovered = Vec::new();
+        for arrival in arrivals {
+            if self.get(&arrival.id).is_none() {
+                self.open_seeded(Some(arrival.id.clone()), arrival.spec, Some(arrival.seed), None, kept_pairs(arrival.inbox, arrival.digests), false, false)?;
+            }
+            recovered.push(arrival.id);
+        }
+        self.persist_now()?;
+        locked.finish_arrivals(&recovered)?;
+        locked.finish_native(&recovered_native)?;
+        locked.finish_starts(&recovered_starts)?;
+        Ok(())
     }
 
     /// Start a session again from its record: its queue and pause as they were and, when a turn of
@@ -1649,48 +2279,86 @@ impl Host {
     /// left running. How many such were found. `back`: this host takes it back (blue/green that
     /// never happened).
     fn open_record(&self, s: Saved, seed: Option<session::Seed>, apart: Vec<super::survivors::Ran>, now_s: u64, back: bool) -> anyhow::Result<usize> {
-        let cut = s.cut;
-        // What it started that still runs, taken back over (its stopped harness not among it).
+        self.open_record_with(s, seed, apart, now_s, back, |_| {}).map(|(survivors, _)| survivors)
+    }
+
+    fn open_record_with(&self, s: Saved, seed: Option<session::Seed>, apart: Vec<super::survivors::Ran>, now_s: u64, back: bool, before_drive: impl FnOnce(&Session)) -> anyhow::Result<(usize, usize)> {
+        let seed = seed.or_else(|| s.state.clone().map(|state| session::Seed { events: Vec::new(), state, items: None, from: String::new(), from_cwd: String::new(), picks_up: false, note: None, restored: true, synced: None, local: false }));
+        let cut = s.cut && !s.initial_replay(seed.as_ref().map(|seed| &seed.state));
+        let mut pending = s.pending.clone();
+        let initial = session::initial_prompt(&s.id, &s.spec);
+        if let Some(command) = &initial
+            && !pending.iter().any(|prior| pending_id(prior).is_some_and(|id| pending_id(command) == Some(id))) {
+            pending.push(command.clone());
+        }
+        self.pending.lock().insert(s.id.clone(), pending);
+        // Legacy records can still keep the initial words in Spec. The cold command channel
+        // now owns their replay, so drive must not also send that Spec.prompt directly.
+        let mut spec = s.spec.clone();
+        spec.prompt = None;
+        let mut brought: Vec<_> = initial.as_ref().and_then(message_of).into_iter().collect();
+        brought.extend(kept_pairs(s.inbox.clone(), s.inbox_digests.clone()));
         let mut alive = apart;
         for r in super::survivors::alive(&s.ran).into_iter().filter(|r| !super::survivors::login_agent(&r.command)) {
-            if !alive.iter().any(|a| a.pid == r.pid) {
-                alive.push(r);
-            }
+            if !alive.iter().any(|a| a.pid == r.pid) { alive.push(r); }
         }
-        if let Some(h) = &s.harness {
-            alive.retain(|r| r.pid != h.pid);
-        }
+        if let Some(h) = &s.harness { alive.retain(|r| r.pid != h.pid); }
         let trees = super::survivors::trees(&alive);
-        let session = self.open_seeded(Some(s.id), s.spec, seed, None, kept_pairs(s.inbox, s.inbox_digests), back, false)?;
-        let paused = s.pause.is_some() || s.pause_at.is_some() || s.manual_resume || s.move_on_limit;
-        if !trees.is_empty() {
-            session.ran.lock().1.clone_from(&alive);
-            *session.left.lock() = trees.iter().map(|(root, _)| root.clone()).collect();
-        }
-        // Shown once each, and what it showed as left running that has ended since, ended.
-        let apart = alive.iter().map(|r| r.pid).collect();
-        let mut core = session.core.lock();
-        if settle_left(&mut core.state.tasks, trees.iter().map(|(root, _)| super::survivors::task(root)).collect(), &apart, now_s) {
-            core.touch_state();
-        }
-        drop(core);
-        if !s.queue.is_empty() || paused || cut {
-            let mut core = session.core.lock();
-            core.state.queue = s.queue;
-            // A check under way when it stopped is asked again.
-            core.state.pause = s.pause.map(|p| super::model::Pause { checking: None, ..p });
-            core.state.pause_at = s.pause_at;
-            core.state.manual_resume = s.manual_resume;
-            core.state.move_on_limit = s.move_on_limit;
-            core.state.move_plan = s.move_plan;
-            // The turn the restart cut short goes on first, in kiln's words, with what it started
-            // that still runs.
-            if cut {
-                picks_up(&mut core.state.queue, &super::survivors::said(&trees, now_s));
+        let mut dispatched = 0;
+        let initialize = |session: &Session| {
+            if !trees.is_empty() {
+                session.ran.lock().1.clone_from(&alive);
+                *session.left.lock() = trees.iter().map(|(root, _)| root.clone()).collect();
             }
-            core.touch_state();
+            let apart = alive.iter().map(|r| r.pid).collect();
+            {
+                let mut core = session.core.lock();
+                if !s.tasks.is_empty() { core.state.tasks.clone_from(&s.tasks); }
+                settle_left(&mut core.state.tasks, trees.iter().map(|(root, _)| super::survivors::task(root)).collect(), &apart, now_s);
+                if !s.queue.is_empty() || s.pause.is_some() || s.pause_at.is_some() || s.manual_resume || s.move_on_limit || cut {
+                    core.state.queue.clone_from(&s.queue);
+                    // A check under way when it stopped is asked again.
+                    core.state.pause = s.pause.clone().map(|p| super::model::Pause { checking: None, ..p });
+                    core.state.pause_at = s.pause_at;
+                    core.state.manual_resume = s.manual_resume;
+                    core.state.move_on_limit = s.move_on_limit;
+                    core.state.move_plan.clone_from(&s.move_plan);
+                    if cut { picks_up(&mut core.state.queue, &super::survivors::said(&trees, now_s)); }
+                }
+                core.touch_state();
+            }
+            // Capture both owners before a ready adapter can drain anything. Queue ownership
+            // suppresses dispatch only; Sent must still retain the effective replay payload.
+            let ready = self.recorded(session);
+            dispatched = self.recover_pending(session, ready.pending, false);
+            before_drive(session);
+        };
+        self.open_seeded_with(Some(s.id.clone()), spec, seed, None, brought, back, false, Some(Box::new(initialize)))?;
+        Ok((trees.len(), dispatched))
+    }
+
+    fn recover_pending(&self, session: &Session, commands: Vec<Command>, live_handover: bool) -> usize {
+        let saved = record(session);
+        let queued = queued_ids(&saved);
+        let mut pending = commands;
+        for command in saved.pending {
+            if pending_id(&command).is_some_and(|id| queued.contains(id)) || !pending.iter().any(|prior| pending_id(prior).is_some_and(|id| pending_id(&command) == Some(id))) {
+                replace_pending(&mut pending, command);
+            }
         }
-        Ok(trees.len())
+        pending.retain(|command| pending_id(command).is_none_or(|id| !saved.observed.contains(id)));
+        self.pending.lock().insert(session.id.clone(), pending.clone());
+        // U17: Frozen writes own live Sent commands; cold queue ownership was captured before
+        // drive could drain it. Neither retires the durable payload before native acknowledgment.
+        let already_sent: HashSet<String> = if live_handover { session.core.lock().state.delivery.iter().filter_map(|(id, delivery)| (*delivery == super::model::Delivery::Sent).then_some(id.clone())).collect() } else { HashSet::new() };
+        let mut dispatched = 0usize;
+        for command in pending {
+            if pending_id(&command).is_some_and(|id| queued.contains(id) || already_sent.contains(id)) { continue; }
+            if session.command(command) { dispatched = dispatched.saturating_add(1); } else {
+                tracing::error!(session = %session.id, "U17 committed command could not reach restored session; it remains in the durable snapshot");
+            }
+        }
+        dispatched
     }
 
     /// Every [`WATCH_EVERY`] by its clock, what each session's harness runs: noted (and kept in the
@@ -1789,7 +2457,7 @@ impl Host {
     }
 
     fn mark_dirty(&self) {
-        if self.file.is_none() || self.dirty.swap(true, Ordering::AcqRel) {
+        if (self.file.is_none() && self.snapshot.is_none()) || self.dirty.swap(true, Ordering::AcqRel) {
             return;
         }
         let me = self.me.clone();
@@ -1809,6 +2477,17 @@ impl Host {
     /// where it was, sent again here, is still its repeat.
     fn recorded(&self, s: &Session) -> Saved {
         let mut rec = record(s);
+        let queued = queued_ids(&rec);
+        if let Some(pending) = self.pending.lock().get_mut(&s.id) {
+            pending.retain(|command| pending_id(command).is_none_or(|id| !rec.observed.contains(id)));
+            for command in pending {
+                // The snapshot's queue carries edits not yet delivered as lifecycle effects.
+                // Otherwise the existing pending owner has the effective (possibly edited) body.
+                if pending_id(command).is_none_or(|id| !queued.contains(id) || !rec.pending.iter().any(|candidate| pending_id(candidate) == Some(id))) {
+                    replace_pending(&mut rec.pending, command.clone());
+                }
+            }
+        }
         if let Some(inbox) = &self.inbox {
             let waiting = inbox.waiting(&s.id);
             if !waiting.is_empty() {
@@ -1818,22 +2497,39 @@ impl Host {
         rec
     }
 
-    fn save_now(&self) {
-        let Some(file) = &self.file else { return };
+    fn captured(&self) -> Vec<Saved> {
         let sessions: Vec<Arc<Session>> = self.sessions.lock().values().cloned().collect();
-        let saved: Vec<Saved> = sessions.iter().map(|s| self.recorded(s)).collect();
-        let Ok(json) = serde_json::to_vec_pretty(&saved) else { return };
-        let tmp = file.with_extension("tmp");
-        let wrote = file.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| crate::util::write_secret(&tmp, &json, 0o600)).and_then(|()| std::fs::rename(&tmp, file));
-        match wrote {
-            Ok(()) => {
-                self.saves.fetch_add(1, Ordering::AcqRel);
-                self.metrics.harness_records_written.inc();
-            }
-            Err(e) => tracing::warn!(error = %e, file = %file.display(), "could not record agent sessions"),
-        }
-        self.changed.notify(usize::MAX);
+        let mut saved: Vec<Saved> = sessions.iter().map(|session| self.recorded(session)).collect();
+        let present: HashSet<String> = saved.iter().map(|session| session.id.clone()).collect();
+        saved.extend(self.outgoing.lock().values().filter(|record| !present.contains(&record.id)).cloned());
+        saved
     }
+
+    fn save_now(&self) {
+        if let Err(error) = self.persist_now() {
+            tracing::error!(%error, "U17 session snapshot commit refused; durable state retained");
+        }
+    }
+
+    fn persist_now(&self) -> anyhow::Result<()> {
+        let _saving = self.save_lock.lock();
+        anyhow::ensure!(!self.restoring.load(Ordering::Acquire) && !self.restore_failed.load(Ordering::Acquire), "U17 refusing to overwrite durable sessions during incomplete restoration");
+        let saved = self.captured();
+        if let Some(snapshot) = &self.snapshot {
+            snapshot.save(&saved)?;
+        } else if let Some(file) = &self.file {
+            let json = serde_json::to_vec_pretty(&saved)?;
+            let tmp = file.with_extension("tmp");
+            if let Some(parent) = file.parent() { std::fs::create_dir_all(parent)?; }
+            crate::util::write_secret(&tmp, &json, 0o600)?;
+            std::fs::rename(&tmp, file)?;
+        } else { return Ok(()) }
+        self.saves.fetch_add(1, Ordering::AcqRel);
+        self.metrics.harness_records_written.inc();
+        self.changed.notify(usize::MAX);
+        Ok(())
+    }
+
 }
 
 /// The records a host's sessions' inboxes keep, in its folder `dir`: none when `KILN_INBOX` is off,
@@ -2797,6 +3493,512 @@ mod tests {
 
     fn message(id: &str, text: &str) -> Command {
         Command::Send { id: id.into(), text: text.into(), mode: Default::default(), attachments: Vec::new(), overrides: None, reply_to: None, task: None }
+    }
+
+    #[test]
+    fn u17_native_transfer_persists_pending_and_fences_source_restore_at_same_epoch() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let main_file = dir.path().join("harness.json");
+            let green_file = dir.path().join("instances").join("green").join("harness.json");
+            let machine: Arc<dyn kiln_seams::Records> = Arc::new(kiln_seams::records::SimRecords::default());
+            let main_records: Arc<dyn kiln_seams::Records> = Arc::new(kiln_seams::records::SimRecords::default());
+            let green_records: Arc<dyn kiln_seams::Records> = Arc::new(kiln_seams::records::SimRecords::default());
+            let (tx, _rx) = async_channel::unbounded();
+            let main = Host::try_with_namespaces(tx.clone(), Some(main_file.clone()), Limits::default(), Arc::new(SimClock::new()), (main_records.clone(), machine.clone()), "runner/main")?;
+            assert!(Host::try_with_namespaces(tx, Some(main_file), Limits::default(), Arc::new(SimClock::new()), (main_records, machine.clone()), "runner/main").is_err(), "two processes must not restore the same scope before CAS can fence them");
+            let session = main.open(Some("s".into()), no_harness(dir.path()))?;
+            session.core.lock().state.epoch = 4;
+            session.core.lock().state.manual_resume = true;
+            main.pending.lock().insert("s".into(), vec![message("pending", "keep these words")]);
+            main.persist_now()?;
+            let transfer = main.move_out().await;
+            let (record, _) = transfer.into_iter().next().ok_or_else(|| anyhow::anyhow!("no transfer"))?;
+            assert_eq!(record.pending.len(), 1, "native Saved must carry accepted but unapplied commands");
+            main.persist_now()?;
+            assert_eq!(main.snapshot.as_ref().ok_or_else(|| anyhow::anyhow!("no snapshot"))?.read::<Vec<Saved>>()?.unwrap_or_default().len(), 1, "source retains recovery input before receiver claims it");
+            let (tx, _rx) = async_channel::unbounded();
+            let green = Host::try_with_namespaces(tx, Some(green_file), Limits::default(), Arc::new(SimClock::new()), (green_records, machine), "runner/green")?;
+            green.move_in(record.clone(), None)?;
+            green.move_in(record, None)?; // A repeated fallback delivery is idempotent.
+            assert_eq!(green.get("s").ok_or_else(|| anyhow::anyhow!("receiver missing session"))?.epoch(), 4);
+            let saved = green.snapshot.as_ref().ok_or_else(|| anyhow::anyhow!("no receiver snapshot"))?.read::<Vec<Saved>>()?.unwrap_or_default();
+            assert!(saved.iter().any(|s| s.id == "s"), "native acceptance must commit before returning");
+            main.try_restore_from(None)?;
+            assert!(main.get("s").is_none(), "source must not resume a transferred session at the same epoch");
+            green.close("s");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn u17_native_arrival_recovers_after_owner_commit_before_process_start() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let machine: Arc<dyn kiln_seams::Records> = Arc::new(kiln_seams::records::SimRecords::default());
+            let records: Arc<dyn kiln_seams::Records> = Arc::new(kiln_seams::records::SimRecords::default());
+            let (tx, _rx) = async_channel::unbounded();
+            let source = with_inbox(tx.clone());
+            let session = source.open(Some("s".into()), no_harness(dir.path()))?;
+            session.core.lock().state.epoch = 6;
+            let record = record(&session);
+            source.close("s");
+            let file = dir.path().join("harness.json");
+            let receiver = Host::try_with_namespaces(tx.clone(), Some(file.clone()), Limits::default(), Arc::new(SimClock::new()), (records.clone(), machine.clone()), "runner/green")?;
+            receiver.handovers.as_ref().ok_or_else(|| anyhow::anyhow!("no handovers"))?.locked()?.native_arrive("runner/green", record)?;
+            drop(receiver);
+            let receiver = Host::try_with_namespaces(tx, Some(file), Limits::default(), Arc::new(SimClock::new()), (records, machine), "runner/green")?;
+            receiver.try_restore_from(None)?;
+            assert_eq!(receiver.get("s").ok_or_else(|| anyhow::anyhow!("native arrival not recovered"))?.epoch(), 6);
+            assert!(receiver.handovers.as_ref().ok_or_else(|| anyhow::anyhow!("no handovers"))?.control()?.native_arrivals.is_empty());
+            receiver.close("s");
+            Ok(())
+        })
+    }
+
+    mod acceptance_storage {
+        use kiln_seams::records::*;
+        use futures::future::BoxFuture;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[derive(Default)]
+        pub struct Switch { pub inner: SimRecords, pub refuse: AtomicBool }
+        impl Records for Switch {
+            fn get<'a>(&'a self, family: &'a str, key: &'a [u8], at: Consistency) -> BoxFuture<'a, Result<Option<Row>, Refusal>> { self.inner.get(family, key, at) }
+            fn scan<'a>(&'a self, family: &'a str, scan: Scan) -> BoxFuture<'a, Result<Page, Refusal>> { self.inner.scan(family, scan) }
+            fn commit<'a>(&'a self, tx: Tx) -> BoxFuture<'a, Result<Rev, Refusal>> {
+                if self.refuse.load(Ordering::Acquire) { Box::pin(async { Err(Refusal::Unavailable("U17 injected commit refusal".into())) }) } else { self.inner.commit(tx) }
+            }
+            fn changes<'a>(&'a self, family: &'a str, after: Rev, limit: usize) -> BoxFuture<'a, Result<Changes, Refusal>> { self.inner.changes(family, after, limit) }
+            fn wait<'a>(&'a self, family: &'a str, after: Rev) -> BoxFuture<'a, Result<Rev, Refusal>> { self.inner.wait(family, after) }
+            fn head(&self) -> BoxFuture<'_, Result<Rev, Refusal>> { self.inner.head() }
+        }
+    }
+
+    #[test]
+    fn u17_socket_storage_refusals_never_acknowledge_start_or_stop() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            use super::super::socket::{Request, answer};
+            let dir = tempfile::tempdir()?;
+            let machine = Arc::new(acceptance_storage::Switch::default());
+            let records: Arc<dyn kiln_seams::Records> = Arc::new(kiln_seams::records::SimRecords::default());
+            let (tx, _rx) = async_channel::unbounded();
+            let host = Host::try_with_namespaces(tx, Some(dir.path().join("harness.json")), Limits::default(), Arc::new(SimClock::new()), (records, machine.clone()), "runner/main")?;
+            let spec = no_harness(dir.path());
+            let spawn = || Request::Spawn { kind: spec.kind.clone(), count: None, prompt: None, model: None, mode: None, name: None, shell: None, cwd: spec.cwd.clone(), env: Vec::new(), program: spec.program.clone() };
+            machine.refuse.store(true, Ordering::Release);
+            let refused = answer(&host, spawn(), None, None).await;
+            assert_eq!(refused.get("ok"), Some(&serde_json::json!(false)));
+            assert!(host.list().is_empty(), "refused acceptance must not open a session");
+            machine.refuse.store(false, Ordering::Release);
+            let opened = answer(&host, spawn(), None, None).await;
+            let id = opened.pointer("/sessions/0/id").and_then(serde_json::Value::as_str).ok_or_else(|| anyhow::anyhow!("no accepted socket identity"))?.to_owned();
+            machine.refuse.store(true, Ordering::Release);
+            let refused = answer(&host, Request::Stop { id: Some(id.clone()), shell: None }, None, None).await;
+            assert_eq!(refused.get("ok"), Some(&serde_json::json!(false)));
+            assert_eq!(refused.get("stopped"), Some(&serde_json::json!(0)));
+            assert!(host.get(&id).is_some(), "refused retirement leaves ownership intact");
+            assert!(refused.get("error").and_then(serde_json::Value::as_str).is_some_and(|s| s.contains("injected commit refusal")));
+            machine.refuse.store(false, Ordering::Release);
+            assert_eq!(answer(&host, Request::Stop { id: Some(id.clone()), shell: None }, None, None).await.get("stopped"), Some(&serde_json::json!(1)));
+            assert!(host.get(&id).is_none());
+            Ok(())
+        })
+    }
+
+    /// U17: the actual non-agent socket path commits before returning, with the coalescing
+    /// clock frozen throughout. Retirement must fence even a snapshot still naming the session.
+    #[test]
+    fn u17_socket_start_and_stop_are_durable_before_delayed_save() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            use super::super::socket::{Request, answer};
+            let dir = tempfile::tempdir()?;
+            let records: Arc<dyn kiln_seams::Records> = Arc::new(kiln_seams::records::SimRecords::default());
+            let (tx, _rx) = async_channel::unbounded();
+            let host = Host::try_with_records(tx.clone(), Some(dir.path().join("harness.json")), Limits::default(), Arc::new(SimClock::new()), records.clone(), "runner/main")?;
+            let spec = no_harness(dir.path());
+            let spawned = answer(&host, Request::Spawn { kind: spec.kind.clone(), count: None, prompt: None, model: None, mode: None, name: None, shell: None, cwd: spec.cwd.clone(), env: Vec::new(), program: spec.program.clone() }, None, None).await;
+            assert_eq!(spawned.get("ok"), Some(&serde_json::json!(true)));
+            let id = spawned.pointer("/sessions/0/id").and_then(serde_json::Value::as_str).ok_or_else(|| anyhow::anyhow!("no accepted socket identity"))?.to_owned();
+            let snapshot = host.snapshot.as_ref().ok_or_else(|| anyhow::anyhow!("missing snapshot"))?;
+            let saved = snapshot.read::<Vec<Saved>>()?.ok_or_else(|| anyhow::anyhow!("missing committed sessions"))?;
+            assert!(saved.iter().any(|s| s.id == id), "start acknowledgement cannot depend on SAVE_AFTER");
+            let stopped = answer(&host, Request::Stop { id: Some(id.clone()), shell: None }, None, None).await;
+            assert_eq!(stopped.get("ok"), Some(&serde_json::json!(true)));
+            assert_eq!(stopped.get("stopped"), Some(&serde_json::json!(1)));
+            assert!(snapshot.read::<Vec<Saved>>()?.is_some_and(|s| s.iter().any(|s| s.id == id)), "frozen coalescing clock leaves the old snapshot in place");
+            let machine = host.handovers.as_ref().ok_or_else(|| anyhow::anyhow!("missing machine metadata"))?;
+            assert!(machine.control()?.owners.get(&id).is_some_and(|owner| owner.stopped));
+            // A fresh adapter reading the same committed data (including that stale snapshot).
+            let reopened = Host::try_with_records(tx, Some(dir.path().join("instances/reopened/harness.json")), Limits::default(), Arc::new(SimClock::new()), records, "runner/main")?;
+            reopened.try_restore_from(None)?;
+            assert!(reopened.list().is_empty(), "accepted stop must never resurrect from a stale snapshot");
+            assert!(reopened.open_once(&id, spec)?.is_none(), "duplicate start stays retired");
+            assert_eq!(answer(&host, Request::Stop { id: Some(id), shell: None }, None, None).await.get("stopped"), Some(&serde_json::json!(0)), "duplicate stop remains idempotent");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn u17_retirement_fences_pending_recovery_and_both_handover_kinds() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let records: Arc<dyn kiln_seams::Records> = Arc::new(kiln_seams::records::SimRecords::default());
+            let (tx, _rx) = async_channel::unbounded();
+            let host = Host::try_with_records(tx, Some(dir.path().join("harness.json")), Limits::default(), Arc::new(SimClock::new()), records, "runner/main")?;
+            let spec = no_harness(dir.path());
+            let session = host.open(None, spec.clone())?;
+            let id = session.id.clone();
+            let record = host.recorded(&session);
+            assert!(host.try_close(&id)?);
+            let machine = host.handovers.as_ref().ok_or_else(|| anyhow::anyhow!("missing machine metadata"))?;
+            let locked = machine.locked()?;
+            assert!(locked.native_arrive("runner/new", record.clone()).is_err(), "native move cannot revive retirement");
+            let seed = session::Seed { events: Vec::new(), state: record.state.clone().unwrap_or_default(), items: None, from: "old".into(), from_cwd: String::new(), picks_up: false, note: None, restored: false, synced: None, local: true };
+            let arrival = Arrival { owner: "runner/new".into(), id: id.clone(), spec: spec.clone(), seed, inbox: Vec::new(), digests: Vec::new() };
+            assert!(locked.arrive(None, arrival.clone(), 1, 1).is_err(), "structured arrival cannot revive retirement at a higher epoch");
+            // Simulate old committed inputs surviving alongside the tombstone. Recovery must
+            // filter all three kinds, even if cleanup of their payloads never happened.
+            let (revision, mut state) = machine.control_versioned()?;
+            state.starts.insert(id.clone(), StartInput { owner: "runner/main".into(), spec, complete: false });
+            state.arrivals.insert(id.clone(), Arrival { owner: "runner/main".into(), ..arrival });
+            state.native_arrivals.insert(id.clone(), NativeArrival { owner: "runner/main".into(), record });
+            machine.snapshot.as_ref().ok_or_else(|| anyhow::anyhow!("missing machine snapshot"))?.save_at(&state, revision)?;
+            assert!(superseded(&state, "runner/main", &id, 0));
+            drop(locked);
+            host.recover_arrivals()?;
+            assert!(host.get(&id).is_none(), "retired inputs cannot start a recovery harness");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn u17_keyed_start_recovers_before_spawn_and_never_reopens_retired_identity() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let records: Arc<dyn kiln_seams::Records> = Arc::new(kiln_seams::records::SimRecords::default());
+            let (tx, _rx) = async_channel::unbounded();
+            let file = dir.path().join("harness.json");
+            let spec = Spec { prompt: Some("keep the accepted initial words".into()), ..no_harness(dir.path()) };
+            let host = Host::try_with_records(tx.clone(), Some(file.clone()), Limits::default(), Arc::new(SimClock::new()), records.clone(), "runner/main")?;
+            host.handovers.as_ref().ok_or_else(|| anyhow::anyhow!("missing handovers"))?.locked()?.start_once("runner/main", "stable", &spec)?;
+            assert!(host.get("stable").is_none(), "acceptance commits before any session task exists");
+            drop(host);
+            let host = Host::try_with_records(tx, Some(file), Limits::default(), Arc::new(SimClock::new()), records, "runner/main")?;
+            host.hold(true);
+            host.try_restore_from(None)?;
+            let recovered = host.get("stable").ok_or_else(|| anyhow::anyhow!("committed start not recovered"))?;
+            let retry = host.open_once("stable", spec.clone())?.ok_or_else(|| anyhow::anyhow!("retry lost active session"))?;
+            assert!(Arc::ptr_eq(&recovered, &retry));
+            let saved = host.snapshot.as_ref().ok_or_else(|| anyhow::anyhow!("missing snapshot"))?.read::<Vec<Saved>>()?.unwrap_or_default();
+            let saved = saved.iter().find(|s| s.id == "stable").ok_or_else(|| anyhow::anyhow!("recovered start was not persisted"))?;
+            assert_eq!(saved.spec.prompt, None, "the persisted spec delegates the initial intent to pending");
+            assert_eq!(saved.pending, session::initial_prompt("stable", &spec).into_iter().collect::<Vec<_>>(), "start acceptance recovers its exact initial payload through the existing durable snapshot");
+            let mut changed = spec.clone();
+            changed.prompt = Some("different request".into());
+            assert!(host.open_once("stable", changed).is_err(), "reusing an identity for another request refuses");
+            host.close("stable");
+            host.persist_now()?;
+            assert!(host.open_once("stable", spec)?.is_none(), "an ended identity is acknowledged without relaunch");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn u17_rendered_sent_message_retains_recovery_payload_until_started() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let (tx, _rx) = async_channel::unbounded();
+            let host = with_inbox(tx);
+            let session = host.open(Some("s".into()), no_harness(dir.path()))?;
+            host.pending.lock().insert("s".into(), vec![message("m", "accepted words")]);
+            {
+                let mut core = session.core.lock();
+                core.state.delivery.insert("m".into(), super::super::model::Delivery::Sent);
+                core.upsert("m", None, Body::User { text: "accepted words".into(), images: 0, client_id: Some("m".into()), origin: None, attachments: Vec::new(), reply_to: None });
+            }
+            assert_eq!(host.recorded(&session).pending.len(), 1, "a rendered event may precede the actual pipe write");
+            assert_eq!(host.recover_pending(&session, vec![message("m", "accepted words")], true), 0, "live Frozen writes must not receive the same pending command again");
+            assert_eq!(host.recorded(&session).pending.len(), 1, "live sent command still needs durable crash recovery input");
+            session.core.lock().state.delivery.insert("m".into(), super::super::model::Delivery::Started);
+            assert!(host.recorded(&session).pending.is_empty(), "the persisted Started state transfers recovery to harness resume");
+            host.close("s");
+            // StartInput's initial words use this same durable replay path as an accepted Send.
+            let session = host.open(Some("initial".into()), Spec { prompt: Some("keep the initial words".into()), ..no_harness(dir.path()) })?;
+            let id = session::initial_prompt_id(&session.id);
+            let command = session::initial_prompt(&session.id, &session.resume_spec()).ok_or_else(|| anyhow::anyhow!("initial intent missing"))?;
+            session.core.lock().state.delivery.insert(id.clone(), super::super::model::Delivery::Sent);
+            session.turn_open.store(true, Ordering::Relaxed); // Running can precede native acknowledgment.
+            let saved: Saved = serde_json::from_slice(&serde_json::to_vec(&host.recorded(&session))?)?;
+            assert!(saved.cut);
+            assert_eq!(saved.spec.prompt, None, "the saved spec cannot also send the initial prompt");
+            assert_eq!(saved.pending, vec![command.clone()], "Sent before Started retains the exact initial bytes without waiting for SAVE_AFTER");
+            host.pending.lock().insert(session.id.clone(), saved.pending.clone());
+            assert_eq!(host.recorded(&session).pending, vec![command.clone()], "normalization and recovered pending never duplicate the same intent");
+            assert_eq!(host.recover_pending(&session, saved.pending.clone(), true), 0, "live handover retains Frozen writes instead of replaying them");
+            assert_eq!(host.recover_pending(&session, saved.pending.clone(), false), 1, "cold recovery hands the one accepted prompt to the existing command channel");
+            let restore = |record: Saved| -> anyhow::Result<(Arc<Host>, Arc<Session>)> {
+                let (tx, _rx) = async_channel::unbounded();
+                let again = with_inbox(tx);
+                again.open_record(record, None, Vec::new(), 0, false)?;
+                let restored = again.get(&session.id).ok_or_else(|| anyhow::anyhow!("initial session was not restored"))?;
+                Ok((again, restored))
+            };
+            for owner in ["pending", "queue", "task"] {
+                let mut replay = saved.clone();
+                if owner != "pending" {
+                    replay.pending.clear();
+                    let queued = QueueItem { id: id.clone(), text: "keep the initial words".into(), at: 0, attachments: Vec::new(), overrides: None, reply_to: None };
+                    if owner == "queue" { replay.queue.push(queued); } else {
+                        replay.tasks.push(super::super::model::Task { id: "native-task".into(), queue: vec![queued], ..super::super::model::Task::default() });
+                    }
+                    if let Some(state) = &mut replay.state { state.queue.clone_from(&replay.queue); state.tasks.clone_from(&replay.tasks); }
+                }
+                let (again, restored) = restore(replay)?;
+                let queue = restored.core.lock().state.queue.clone();
+                assert!(!queue.iter().any(|q| q.text.starts_with(CUT_BY_RESTART)), "{owner}: initial replay cannot also synthesize a continuation");
+                if owner == "pending" {
+                    assert_eq!(again.recorded(&restored).pending, vec![command.clone()]);
+                } else if owner == "queue" {
+                    assert!(queue.iter().any(|q| q.id == id && q.text == "keep the initial words"));
+                } else {
+                    assert!(restored.core.lock().state.tasks.iter().flat_map(|task| &task.queue).any(|q| q.id == id && q.text == "keep the initial words"));
+                }
+                again.close(&session.id);
+            }
+            // A ready native adapter can drain at the earliest startup boundary. Complete
+            // restoration and durable queue ownership must precede that drain, never follow it.
+            for (first, legacy) in [(true, false), (false, false), (true, true)] {
+                let mut ready = saved.clone();
+                if legacy { ready.spec.prompt = Some("keep the initial words".into()); }
+                let message_id = if first { id.clone() } else { "normal-queued".into() };
+                let words = if first { "keep the initial words" } else { "normal queued words" };
+                ready.pending.clear(); // Legacy queue-only snapshots also retain replay bytes.
+                ready.queue = vec![QueueItem { id: message_id.clone(), text: words.into(), at: 0, attachments: Vec::new(), overrides: None, reply_to: None }];
+                if let Some(state) = &mut ready.state { state.queue.clone_from(&ready.queue); state.delivery.clear(); }
+                ready.cut = false;
+                let (tx, _rx) = async_channel::unbounded();
+                let again = with_inbox(tx);
+                let mut prompts = Vec::new();
+                let (_, dispatched) = again.open_record_with(ready, None, Vec::new(), 0, false, |restored| {
+                    assert_eq!(restored.resume_spec().prompt, None, "cold legacy Spec cannot also own direct initial delivery");
+                    assert_eq!(restored.core.lock().state.queue.len(), 1, "queue must be restored before drive starts");
+                    assert!(again.pending.lock().get(&restored.id).is_some_and(|pending| pending.iter().any(|command| matches!(command, Command::Send { id, text, .. } if id == &message_id && text == words))));
+                    let mut adapter = super::super::acp::Acp::new(None);
+                    let mut core = restored.core.lock();
+                    adapter.start(&mut core);
+                    for response in [serde_json::json!({"id": 1, "result": {"agentCapabilities": {}}}), serde_json::json!({"id": 2, "result": {"sessionId": "ready-native"}})] {
+                        adapter.line(&mut core, &response.to_string());
+                    }
+                    prompts = core.take_writes().iter().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok()).filter(|v| v.get("method").and_then(serde_json::Value::as_str) == Some("session/prompt")).collect();
+                    assert!(core.state.queue.is_empty(), "ready adapter drained the restored queue");
+                    assert_eq!(core.state.delivery.get(&message_id), Some(&super::super::model::Delivery::Sent));
+                })?;
+                let restored = again.get(&session.id).ok_or_else(|| anyhow::anyhow!("ready session missing"))?;
+                assert_eq!(prompts.len(), 1);
+                assert_eq!(prompts.first().and_then(|v| v.pointer("/params/prompt/0/text")).and_then(serde_json::Value::as_str), Some(words));
+                assert!(restored.core.lock().state.queue.is_empty(), "returning from restore must not resurrect drained work");
+                assert_eq!(dispatched, 0, "captured queue ownership suppresses a second dispatch after the queue emptied");
+                assert!(again.recorded(&restored).pending.iter().any(|command| matches!(command, Command::Send { id, text, .. } if id == &message_id && text == words)), "Sent retains its recovery bytes after drain");
+                restored.core.lock().state.delivery.insert(message_id.clone(), super::super::model::Delivery::Started);
+                assert!(!again.recorded(&restored).pending.iter().any(|command| message_of(command).is_some_and(|(id, _)| id == message_id)));
+                again.close(&session.id);
+            }
+            let mut legacy = saved.clone();
+            legacy.spec.prompt = Some("keep the initial words".into());
+            legacy.pending.clear();
+            legacy.cut = false;
+            if let Some(state) = &mut legacy.state { state.delivery.clear(); }
+            let (tx, _rx) = async_channel::unbounded();
+            let again = with_inbox(tx);
+            let (_, dispatched) = again.open_record_with(legacy, None, Vec::new(), 0, false, |restored| {
+                assert_eq!(restored.resume_spec().prompt, None, "legacy cold words have one channel owner");
+                assert_eq!(again.recorded(restored).pending, vec![command.clone()]);
+            })?;
+            assert_eq!(dispatched, 1, "legacy Spec words enter the cold command channel once");
+            again.settled(&session.id).await;
+            let imported = again.inbox.as_ref().ok_or_else(|| anyhow::anyhow!("missing legacy inbox"))?;
+            let (_, digest) = message_of(&command).ok_or_else(|| anyhow::anyhow!("missing initial digest"))?;
+            assert!(imported.accept(&session.id, &id, &digest, Some(0), 1).await?.repeat, "legacy normalization carries the original first receipt");
+            assert!(matches!(imported.accept(&session.id, &id, &inbox::digest("different first words", &[]), Some(0), 2).await, Err(inbox::Refusal::Reused { .. })));
+            again.close(&session.id);
+            // Local queue controls share the same receipt. Edits refresh recovery bytes; a
+            // removal is terminal, even though neither is a new inbox message acceptance.
+            for task in [None, Some("queued-task".to_owned())] {
+                let local = host.open(Some(if task.is_some() { "queue-controls-task" } else { "queue-controls-main" }.into()), no_harness(dir.path()))?;
+                host.settled(&local.id).await;
+                let original = message("editable", "original accepted words");
+                let (_, original_digest) = message_of(&original).ok_or_else(|| anyhow::anyhow!("missing message digest"))?;
+                let inbox = host.inbox.as_ref().ok_or_else(|| anyhow::anyhow!("missing inbox"))?;
+                inbox.open(&local.id, 0).await?;
+                assert!(!inbox.accept(&local.id, "editable", &original_digest, Some(0), 1).await?.repeat);
+                host.pending.lock().insert(local.id.clone(), vec![original]);
+                let kind = Kind::get(if task.is_some() { "claude" } else { "gemini" }).ok_or_else(|| anyhow::anyhow!("test harness kind missing"))?;
+                let mut adapter = kind.adapter(&Spec::default());
+                let files = host.files_for(&local.id);
+                for command in [Command::QueueEdit { id: "editable".into(), text: "edited effective words".into(), attachments: None }, Command::QueueRemove { id: "editable".into() }] {
+                    {
+                        let mut core = local.core.lock();
+                        core.set_status(Status::Idle);
+                        if core.state.queue.is_empty() && core.state.tasks.iter().all(|t| t.queue.is_empty()) {
+                            let queued = QueueItem { id: "editable".into(), text: "original accepted words".into(), at: 0, attachments: Vec::new(), overrides: None, reply_to: None };
+                            if let Some(task) = &task { core.state.tasks.push(super::super::model::Task { id: task.clone(), tool_id: Some("native-agent-call".into()), status: "running".into(), class: Some("agent".into()), queue: vec![queued], ..Default::default() }); }
+                            else { core.state.queue.push(queued); }
+                        }
+                        adapter.command(&mut core, command.clone());
+                    } // The real lifecycle dispatcher invokes Host only after Core is unlocked.
+                    assert!(session::test_effects(&local, kind, &files).is_none());
+                    let mut snapshot = host.recorded(&local);
+                    if matches!(command, Command::QueueEdit { .. }) {
+                        assert!(snapshot.pending.iter().any(|c| matches!(c, Command::Send { text, task: target, .. } if text == "edited effective words" && target == &task)));
+                        // A cold import sees effective queue bytes but the original receipt wins
+                        // over digest-less timeline/queue IDs, never a second acceptance.
+                        (snapshot.inbox, snapshot.inbox_digests) = split_kept(host.carried(&local.id).await?);
+                        let (tx, _rx) = async_channel::unbounded();
+                        let again = with_inbox(tx);
+                        again.open_record(snapshot, None, Vec::new(), 0, false)?;
+                        again.settled(&local.id).await;
+                        let imported = again.inbox.as_ref().ok_or_else(|| anyhow::anyhow!("missing imported inbox"))?;
+                        assert!(imported.accept(&local.id, "editable", &original_digest, Some(0), 2).await?.repeat);
+                        assert!(matches!(imported.accept(&local.id, "editable", &inbox::digest("edited effective words", &[]), Some(0), 3).await, Err(inbox::Refusal::Reused { .. })));
+                        again.close(&local.id);
+                    } else {
+                        assert!(snapshot.pending.is_empty());
+                        assert_eq!(local.core.lock().state.delivery.get("editable"), Some(&super::super::model::Delivery::Cancelled));
+                    }
+                    assert!(inbox.accept(&local.id, "editable", &original_digest, Some(0), 2).await?.repeat, "original receipt stays a repeat after editing/removal");
+                    assert!(matches!(inbox.accept(&local.id, "editable", &inbox::digest("edited effective words", &[]), Some(0), 3).await, Err(inbox::Refusal::Reused { .. })), "edited bytes do not replace the original acceptance digest");
+                }
+                host.close(&local.id);
+            }
+            let mut consumed = saved;
+            consumed.pending.push(message("later", "an unrelated next message"));
+            if let Some(state) = &mut consumed.state { state.delivery.insert(id.clone(), super::super::model::Delivery::Started); }
+            let (again, restored) = restore(consumed)?;
+            assert!(restored.core.lock().state.queue.iter().any(|q| q.text.starts_with(CUT_BY_RESTART)), "native Started still resumes its cut turn despite unrelated pending input");
+            assert_eq!(again.recorded(&restored).pending, vec![message("later", "an unrelated next message")]);
+            again.close(&session.id);
+            session.core.lock().state.delivery.insert(id, super::super::model::Delivery::Started);
+            assert!(host.recorded(&session).pending.is_empty(), "observed Started retires the recovery payload");
+            host.close(&session.id);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn u17_failed_restore_cannot_overwrite_sessions_with_empty_configuration_fallback() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let file = dir.path().join("harness.json");
+        let unknown = Spec { kind: "unconfigured-harness".into(), ..Spec::default() };
+        std::fs::write(&file, serde_json::to_vec(&serde_json::json!([{ "id": "retained", "spec": unknown }]))?)?;
+        let records: Arc<dyn kiln_seams::Records> = Arc::new(kiln_seams::records::SimRecords::default());
+        let (tx, _rx) = async_channel::unbounded();
+        let host = Host::try_with_records(tx, Some(file), Limits::default(), Arc::new(SimClock::new()), records, "runner/main")?;
+        assert!(host.try_restore_from(None).is_err());
+        assert!(host.persist_now().is_err(), "failed startup must never save an empty host over durable state");
+        let kept = host.snapshot.as_ref().ok_or_else(|| anyhow::anyhow!("missing snapshot"))?.read::<Vec<Saved>>()?.unwrap_or_default();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept.first().map(Saved::id), Some("retained"));
+        Ok(())
+    }
+
+    #[test]
+    fn u17_handover_decision_and_taken_epoch_recover_together_across_instances() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let records: Arc<dyn kiln_seams::Records> = Arc::new(kiln_seams::records::SimRecords::default());
+        let first = Handovers::with_records(dir.path(), records.clone())?;
+        let green_dir = dir.path().join("instances").join("green");
+        let second = Handovers::with_records(&green_dir, records.clone())?;
+        first.locked()?.decide("attempt", "session", Decided::Taken, 8, 10)?;
+        assert_eq!(second.locked()?.decided("attempt")?, Some(Decided::Taken));
+        assert_eq!(second.taken("session")?, Some(8));
+        let state = second.control()?;
+        assert_eq!(state.decided.get("attempt").map(|d| d.epoch), state.taken.get("session").map(|(epoch, _)| *epoch));
+        assert!(!dir.path().join("handovers-taken.json").exists());
+        assert!(!dir.path().join("handovers-decided.json").exists());
+        std::fs::write(dir.path().join("handovers-decided.json"), b"obsolete corrupt copy")?;
+        let reopened = Handovers::with_records(&green_dir, records)?;
+        assert_eq!(reopened.locked()?.decided("attempt")?, Some(Decided::Taken));
+        Ok(())
+    }
+
+    #[test]
+    fn u17_taken_arrival_recovers_after_crash_before_session_open() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let records: Arc<dyn kiln_seams::Records> = Arc::new(kiln_seams::records::SimRecords::default());
+            let (tx, _rx) = async_channel::unbounded();
+            let host = Host::try_with_records(tx, Some(dir.path().join("harness.json")), Limits::default(), Arc::new(SimClock::new()), records.clone(), "runner/green")?;
+            let state = super::super::model::State { epoch: 2, manual_resume: true, ..Default::default() };
+            let arrival = Arrival {
+                owner: "runner/green".into(), id: "arriving".into(), spec: no_harness(dir.path()),
+                seed: session::Seed { events: Vec::new(), state, items: None, from: "old".into(), from_cwd: dir.path().to_string_lossy().into_owned(), picks_up: false, note: None, restored: false, synced: None, local: true },
+                inbox: vec!["already-accepted".into()], digests: vec!["digest".into()],
+            };
+            host.handovers.as_ref().ok_or_else(|| anyhow::anyhow!("missing handovers"))?.locked()?.arrive(Some("attempt"), arrival, 3, 1)?;
+            drop(host); // No session opened before the simulated crash.
+            let (tx, _rx) = async_channel::unbounded();
+            let again = Host::try_with_records(tx, Some(dir.path().join("harness.json")), Limits::default(), Arc::new(SimClock::new()), records, "runner/green")?;
+            again.try_restore_from(None)?;
+            again.settled("arriving").await;
+            let restored = again.get("arriving").ok_or_else(|| anyhow::anyhow!("committed arrival not recovered"))?;
+            assert_eq!(restored.epoch(), 3);
+            let handovers = again.handovers.as_ref().ok_or_else(|| anyhow::anyhow!("missing handovers"))?;
+            assert_eq!(handovers.locked()?.decided("attempt")?, Some(Decided::Taken));
+            assert!(handovers.control()?.arrivals.is_empty(), "arrival retires only after the host snapshot commits");
+            again.close("arriving");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn u17_acknowledged_command_recovers_before_session_channel_is_saved() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let file = dir.path().join("harness.json");
+            let records: Arc<dyn kiln_seams::Records> = Arc::new(kiln_seams::records::SimRecords::default());
+            let (tx, _rx) = async_channel::unbounded();
+            let host = Host::try_with_records(tx, Some(file.clone()), Limits::default(), Arc::new(SimClock::new()), records.clone(), "runner/test")?;
+            host.open(Some("s".into()), no_harness(dir.path()))?;
+            host.settled("s").await;
+            let running = host.get("s").ok_or_else(|| anyhow::anyhow!("session not opened"))?;
+            {
+                let mut core = running.core.lock();
+                core.state.epoch = 7;
+                core.state.manual_resume = true;
+            }
+            host.inbox.as_ref().ok_or_else(|| anyhow::anyhow!("missing inbox"))?.open("s", 7).await?;
+            let command = message("accepted-before-crash", "keep these words");
+            let accepting = host.clone();
+            let command_copy = command.clone();
+            let answer = crate::rt::blocking(move || accepting.take_durable("s", command_copy, None, 1)).await??;
+            assert!(!answer.repeat);
+            // Simulate loss before any coalesced save. The committed snapshot itself, rather
+            // than the running channel, must contain the words that were acknowledged.
+            let saved = host.snapshot.as_ref().ok_or_else(|| anyhow::anyhow!("missing snapshot"))?.read::<Vec<Saved>>()?.unwrap_or_default();
+            let session = saved.iter().find(|s| s.id == "s").ok_or_else(|| anyhow::anyhow!("missing durable session"))?;
+            assert_eq!(session.pending, vec![command.clone()]);
+            // Crash teardown is not an accepted stop: preserve the canonical ownership and
+            // inbox receipts, discarding only this adapter's memory and its missing harness.
+            running.close();
+            host.sessions.lock().remove("s");
+            host.lanes.lock().remove("s");
+            drop(running);
+            drop(host);
+            let (tx, _rx) = async_channel::unbounded();
+            let again = Host::try_with_records(tx, Some(file.clone()), Limits::default(), Arc::new(SimClock::new()), records, "runner/test")?;
+            again.try_restore_from(None)?;
+            again.settled("s").await;
+            let restored = again.get("s").ok_or_else(|| anyhow::anyhow!("session not restored"))?;
+            assert_eq!(restored.epoch(), 7, "epoch must survive without a conversation store");
+            assert!(restored.core.lock().state.manual_resume, "manual pause must survive without a conversation store");
+            let accepting = again.clone();
+            let repeat = crate::rt::blocking(move || accepting.take_durable("s", command, None, 2)).await??;
+            assert!(repeat.repeat, "restart must retain the acceptance receipt");
+            assert!(!file.exists(), "canonical persistence must not create the legacy sidecar");
+            again.close("s");
+            Ok(())
+        })
     }
 
     /// A host whose sessions' inboxes keep their records in the simulator's.
@@ -3868,4 +5070,3 @@ while True:
         })
     }
 }
-

@@ -8,13 +8,15 @@
 //! - a tag is asked of the upstream again after `tag_ttl` (five minutes);
 //! - when the upstream can't be reached, what kiln has is served, with a `Warning` saying so (R06).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, OnceLock, Weak};
 
 use http::{StatusCode, header};
-use rusqlite::{OptionalExtension as _, params};
+use crate::sql::{OptionalExtension as _, params};
 use sha2::{Digest as _, Sha256};
 
-use super::{Error, err, internal};
+use super::{Error, Staging, err, internal};
 use crate::ci::integrations::oci;
 use crate::config::ci::Mirror;
 use crate::http::client::Method;
@@ -45,6 +47,52 @@ fn registry(m: &Mirror) -> oci::Registry {
     r
 }
 
+/// U07 / W12-R02: bound live gate registrations as well as reclaiming dead keys. Admission
+/// precedes registration, so even a flood of distinct missing digests cannot grow the map.
+/// Both the permit and mutex guard are RAII: cancelling a leader or waiter releases its turn.
+struct Flights {
+    slots: async_lock::Semaphore,
+    keys: parking_lot::Mutex<HashMap<[u8; 32], Weak<async_lock::Mutex<()>>>>,
+}
+
+impl Flights {
+    fn new(limit: usize) -> Self {
+        Self { slots: async_lock::Semaphore::new(limit), keys: Default::default() }
+    }
+
+    async fn enter(&self, key: [u8; 32]) -> (async_lock::SemaphoreGuard<'_>, Arc<async_lock::Mutex<()>>) {
+        let permit = self.slots.acquire().await;
+        let mut keys = self.keys.lock();
+        keys.retain(|_, gate| gate.strong_count() > 0);
+        let gate = keys.get(&key).and_then(Weak::upgrade).unwrap_or_else(|| {
+            let gate = Arc::new(async_lock::Mutex::new(()));
+            keys.insert(key, Arc::downgrade(&gate));
+            gate
+        });
+        (permit, gate)
+    }
+}
+
+fn flights() -> &'static Flights {
+    static FLIGHTS: OnceLock<Flights> = OnceLock::new();
+    FLIGHTS.get_or_init(|| Flights::new(256))
+}
+
+/// Effective upstream credentials are snapshotted once for the key and the request. Only an
+/// opaque digest is retained; credentials, including passwords read from files, are never keys
+/// in logs. Blobs share a turn across repositories: the CAS is checked again before linking.
+fn flight_key(reg: &oci::Registry, repository: Option<&str>, reference: &str) -> [u8; 32] {
+    let mut key = Sha256::new();
+    for part in [Some(reg.name.as_str()), Some(reg.base.as_str()), reg.credentials.as_ref().map(|(u, _)| u.as_str()),
+        reg.credentials.as_ref().map(|(_, p)| p.as_str()), repository, Some(reference)] {
+        key.update([u8::from(part.is_some())]);
+        let bytes = part.unwrap_or_default().as_bytes();
+        key.update((bytes.len() as u64).to_le_bytes());
+        key.update(bytes);
+    }
+    key.finalize().into()
+}
+
 /// What a pull through the mirror found: the digest and whether it came from kiln's copy because
 /// the upstream was out of reach.
 pub struct Fetched {
@@ -56,6 +104,10 @@ pub struct Fetched {
 /// asked of the upstream when kiln hasn't got it, or the tag is older than its TTL. `None`: the
 /// upstream hasn't got it either.
 pub(super) async fn manifest(hub: &Hub, m: &Mirror, name: &str, upstream_name: &str, reference: &str) -> Result<Option<Fetched>, Error> {
+    let reg = registry(m);
+    let (_permit, gate) = flights().enter(flight_key(&reg, Some(upstream_name), reference)).await;
+    let _turn = gate.lock().await;
+    // Recheck after the preceding refresh has committed, keeping the turn through this commit.
     let by_digest = reference.contains(':');
     let (n, r) = (name.to_owned(), reference.to_owned());
     let kept: Option<(String, i64)> = hub
@@ -75,7 +127,6 @@ pub(super) async fn manifest(hub: &Hub, m: &Mirror, name: &str, upstream_name: &
     {
         return Ok(Some(Fetched { digest: digest.clone(), stale: false }));
     }
-    let reg = registry(m);
     let scope = format!("repository:{upstream_name}:pull");
     let got = oci::call(&reg, Method::Get, &format!("/v2/{upstream_name}/manifests/{reference}"), &scope).await;
     let resp = match got {
@@ -131,6 +182,9 @@ fn stale(kept: Option<(String, i64)>, why: &str) -> Result<Option<Fetched>, Erro
 /// Makes sure kiln has blob `digest` of `name`: from the upstream once (its redirect followed
 /// without kiln's credentials), checked against its digest, then kept in the store.
 pub(super) async fn blob(hub: &Hub, m: &Mirror, name: &str, upstream_name: &str, digest: &str) -> Result<bool, Error> {
+    let reg = registry(m);
+    let (_permit, gate) = flights().enter(flight_key(&reg, None, digest)).await;
+    let _turn = gate.lock().await;
     if super::linked(hub, name, digest).await?.is_some() {
         return Ok(true);
     }
@@ -140,7 +194,6 @@ pub(super) async fn blob(hub: &Hub, m: &Mirror, name: &str, upstream_name: &str,
         super::link(hub, name, digest, obj.size).await?;
         return Ok(true);
     }
-    let reg = registry(m);
     let scope = format!("repository:{upstream_name}:pull");
     let first = oci::call(&reg, Method::Get, &format!("/v2/{upstream_name}/blobs/{digest}"), &scope).await.map_err(|e| err(StatusCode::BAD_GATEWAY, "UNAVAILABLE", format!("{}: {e:#}", m.upstream)))?;
     let mut resp = match first.status() {
@@ -156,7 +209,8 @@ pub(super) async fn blob(hub: &Hub, m: &Mirror, name: &str, upstream_name: &str,
         return Err(err(StatusCode::BAD_GATEWAY, "UNAVAILABLE", format!("{digest} from {}: {}", m.upstream, resp.status())));
     }
     let path: PathBuf = crate::ci::services::cas::staging(hub).join(format!("mirror-{}", crate::util::new_id()));
-    let (sink, done) = crate::rt::file_sink(path.clone(), hub.cfg.ci.registry.max_blob_bytes()).map_err(internal)?;
+    let staging = Staging::new(path.clone());
+    let (sink, done) = staging.sink(path.clone(), hub.cfg.ci.registry.max_blob_bytes()).map_err(internal)?;
     while let Some(chunk) = resp.chunk().await.map_err(|e| err(StatusCode::BAD_GATEWAY, "UNAVAILABLE", format!("{digest} from {}: {e:#}", m.upstream)))? {
         if sink.send(chunk).await.is_err() {
             break;
@@ -172,8 +226,7 @@ pub(super) async fn blob(hub: &Hub, m: &Mirror, name: &str, upstream_name: &str,
         super::link(hub, name, digest, obj.size).await
     }
     .await;
-    let p = path.clone();
-    let _ = crate::rt::blocking(move || std::fs::remove_file(p)).await;
+    staging.remove().await.map_err(internal)?;
     kept.map(|()| true)
 }
 
@@ -250,6 +303,175 @@ pub fn warn_stale(r: crate::http::server::Response, upstream: &str) -> crate::ht
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// U07 / W12-R02: concurrent misses share upstream work, expired tags cannot publish in
+    /// reverse order, and a failed refresh does not poison the next attempt.
+    #[test]
+    fn u07_w12_r02_concurrent_mirror_pulls_and_failed_refresh_retry() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+        use crate::http::server::{self as srv, Request, Response};
+
+        #[derive(Default)]
+        struct Upstream {
+            manifests: AtomicUsize,
+            blobs: AtomicUsize,
+            fail: AtomicBool,
+            missing: AtomicBool,
+        }
+        impl srv::Handler for Upstream {
+            async fn handle(self: Arc<Self>, req: Request) -> Response {
+                if req.uri().path().contains("/blobs/") {
+                    self.blobs.fetch_add(1, SeqCst);
+                    crate::rt::sleep(std::time::Duration::from_millis(40)).await;
+                    return srv::text(StatusCode::OK, "one blob");
+                }
+                let request = self.manifests.fetch_add(1, SeqCst);
+                if self.fail.swap(false, SeqCst) { return srv::status(StatusCode::SERVICE_UNAVAILABLE); }
+                if self.missing.swap(false, SeqCst) { return srv::status(StatusCode::NOT_FOUND); }
+                // Without the turn, the newer response finishes first and is overwritten.
+                if request.is_multiple_of(2) { crate::rt::sleep(std::time::Duration::from_millis(40)).await; }
+                srv::json(StatusCode::OK, &serde_json::json!({"schemaVersion": 2, "generation": request}))
+            }
+        }
+        fn fetched(result: Result<Option<Fetched>, Error>) -> anyhow::Result<Fetched> {
+            result.map_err(|e| anyhow::anyhow!("{}", e.message))?.ok_or_else(|| anyhow::anyhow!("missing fixture manifest"))
+        }
+
+        crate::rt::block_on(async {
+            let tcp = hyper_rt::tcp::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)), 16).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let addr = tcp.local_addr().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let upstream = Arc::new(Upstream::default());
+            let serving = Arc::clone(&upstream);
+            crate::rt::spawn(async move {
+                while let Ok(stream) = tcp.accept().await {
+                    let (handler, remote) = (Arc::clone(&serving), stream.peer_addr().ok());
+                    crate::rt::spawn(srv::serve_connection(crate::http::io::RtIo::new(stream), handler, remote));
+                }
+            });
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let mut mirror = Mirror { upstream: format!("{addr}"), url: Some(format!("http://{addr}")), tag_ttl: Some(300), ..Mirror::default() };
+            let (a, b) = futures::join!(manifest(&hub, &mirror, "mirror/app", "app", "latest"), manifest(&hub, &mirror, "mirror/app", "app", "latest"));
+            assert_eq!(fetched(a)?.digest, fetched(b)?.digest);
+            assert_eq!(upstream.manifests.load(SeqCst), 1, "one upstream request for concurrent tag misses");
+
+            let digest = format!("sha256:{}", hex::encode(Sha256::digest(b"one blob")));
+            let (a, b) = futures::join!(blob(&hub, &mirror, "mirror/app", "app", &digest), blob(&hub, &mirror, "mirror/other", "other", &digest));
+            assert!(a.map_err(|e| anyhow::anyhow!("{}", e.message))?);
+            assert!(b.map_err(|e| anyhow::anyhow!("{}", e.message))?);
+            assert_eq!(upstream.blobs.load(SeqCst), 1, "one download, with the CAS rechecked before the other repository links it");
+            for name in ["mirror/app", "mirror/other"] {
+                assert!(super::super::linked(&hub, name, &digest).await.map_err(|e| anyhow::anyhow!("{}", e.message))?.is_some(), "both repositories keep their link");
+            }
+
+            // Force every caller to refresh. The later generation must remain the tag's value.
+            mirror.tag_ttl = Some(0);
+            upstream.manifests.store(0, SeqCst);
+            let (a, b) = futures::join!(manifest(&hub, &mirror, "mirror/app", "app", "latest"), manifest(&hub, &mirror, "mirror/app", "app", "latest"));
+            let (a, b) = (fetched(a)?, fetched(b)?);
+            assert_ne!(a.digest, b.digest);
+            let kept: String = hub.store.call(|c| Ok(c.query_row("SELECT digest FROM registry_tags WHERE repo = 'mirror/app' AND tag = 'latest'", [], |r| r.get(0))?)).await?;
+            let newest = serde_json::to_vec(&serde_json::json!({"schemaVersion": 2, "generation": 1}))?;
+            assert_eq!(kept, format!("sha256:{}", hex::encode(Sha256::digest(newest))), "the slow old response cannot roll the tag back");
+            upstream.fail.store(true, SeqCst);
+            assert!(fetched(manifest(&hub, &mirror, "mirror/app", "app", "latest").await)?.stale);
+            let recovered = fetched(manifest(&hub, &mirror, "mirror/app", "app", "latest").await)?;
+            assert!(!recovered.stale);
+            assert_ne!(recovered.digest, kept);
+            assert_eq!(upstream.manifests.load(SeqCst), 4, "failed refresh releases the turn for a fresh attempt");
+            upstream.missing.store(true, SeqCst);
+            let (a, b) = futures::join!(manifest(&hub, &mirror, "mirror/app", "app", "retry404"), manifest(&hub, &mirror, "mirror/app", "app", "retry404"));
+            let a = a.map_err(|e| anyhow::anyhow!("{}", e.message))?;
+            let b = b.map_err(|e| anyhow::anyhow!("{}", e.message))?;
+            assert_ne!(a.is_some(), b.is_some(), "a 404 is not cached as success; the waiter retries");
+            assert_eq!(upstream.manifests.load(SeqCst), 6);
+            Ok(())
+        })
+    }
+
+    /// U07: cancellation or an early stream error while the writer is active retires staging.
+    #[test]
+    fn u07_cancelled_blob_staging_is_removed_after_writer_closes() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let path = dir.path().join("mirror-cancelled");
+            for cancelled in [true, false] {
+                let staging = Staging::new(path.clone());
+                let (sink, _done) = staging.sink(path.clone(), 1024)?;
+                sink.send(bytes::Bytes::from_static(b"partial download")).await?;
+                let mut download = Box::pin(async move {
+                    let (_staging, _sink) = (staging, sink);
+                    if cancelled { std::future::pending::<()>().await; }
+                    Err::<(), _>(std::io::Error::other("fixture stream error"))
+                });
+                if cancelled {
+                    assert!(futures::poll!(download.as_mut()).is_pending());
+                    drop(download);
+                } else {
+                    assert!(download.await.is_err());
+                }
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while path.exists() {
+                    anyhow::ensure!(std::time::Instant::now() < deadline, "cancelled blob left its staging file behind");
+                    crate::rt::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// U07: bounded registration, reclamation and cancellation use the existing async locks.
+    #[test]
+    fn u07_mirror_flights_are_bounded_reclaimed_and_cancel_safe() -> anyhow::Result<()> {
+        use futures::FutureExt as _;
+        futures::executor::block_on(async {
+            let flights = Flights::new(2);
+            let (permit, gate) = flights.enter([0; 32]).await;
+            let turn = gate.lock().await;
+            let mut waiter = Box::pin(async {
+                let (_permit, gate) = flights.enter([0; 32]).await;
+                let _turn = gate.lock().await;
+            });
+            assert!(futures::poll!(waiter.as_mut()).is_pending());
+            assert!(flights.enter([1; 32]).now_or_never().is_none(), "waiting requests count toward the bound");
+            drop(waiter); // A cancelled waiter releases its admission slot.
+            let (other_permit, other) = flights.enter([1; 32]).await;
+            assert_eq!(flights.keys.lock().len(), 2);
+            drop((other, other_permit));
+            let mut follower = Box::pin(async {
+                let (_permit, gate) = flights.enter([0; 32]).await;
+                let _turn = gate.lock().await;
+            });
+            assert!(futures::poll!(follower.as_mut()).is_pending());
+            drop(turn); // A cancelled leader releases its turn to an existing waiter.
+            assert!(follower.as_mut().now_or_never().is_some(), "the existing waiter is not stranded");
+            drop(follower);
+            drop(gate);
+            drop(permit);
+            for byte in 2..20 {
+                let (_permit, gate) = flights.enter([byte; 32]).await;
+                assert!(gate.try_lock().is_some());
+                assert_eq!(flights.keys.lock().len(), 1, "dead identities do not accumulate");
+            }
+            let bounded = Flights::new(256);
+            let mut admitted = Vec::new();
+            for byte in 0..=255 { admitted.push(bounded.enter([byte; 32]).await); }
+            assert!(bounded.enter([0; 32]).now_or_never().is_none(), "the 257th request waits without another key allocation");
+            assert_eq!(bounded.keys.lock().len(), 256);
+            drop(admitted);
+            let (_permit, gate) = bounded.enter([0; 32]).await;
+            assert!(gate.try_lock().is_some(), "admission resumes after cancellation");
+            assert_eq!(bounded.keys.lock().len(), 1);
+            let mut reg = oci::Registry::for_name("example.invalid", None, false);
+            let anonymous = flight_key(&reg, Some("app"), "latest");
+            reg.credentials = Some(("fixture".into(), "reader-a".into()));
+            let reader = flight_key(&reg, Some("app"), "latest");
+            assert_ne!(anonymous, reader);
+            reg.credentials = Some(("fixture".into(), "reader-b".into()));
+            assert_ne!(reader, flight_key(&reg, Some("app"), "latest"));
+            assert_ne!(flight_key(&reg, Some("app"), "latest"), flight_key(&reg, Some("other"), "latest"));
+            Ok(())
+        })
+    }
 
     /// W12-R02: what a machine pulling through kiln is given: Docker's `registry-mirrors` for
     /// Docker Hub's own `listen`, and each mirror's containerd `hosts.toml` (its upstream's address,

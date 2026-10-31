@@ -1,0 +1,166 @@
+Subject: CP-T2.2: required hyper-raft API compatibility
+Why: The shared Hyper-Raft pin advances to fixed4d72 while preserving the ahead Focal f805 base. Explicit Flushed disk mode, Decimated acknowledgements and disabled FEC preserve existing policy. The bounded replica reports its own declared allowance and holds, forwards stopped/disk liveness facts to the existing Replica, and surfaces disk-mode mismatch; advisory transport progress does not release stream ownership.
+
+diff --git a/crates/focal-bus/src/limits.rs b/crates/focal-bus/src/limits.rs
+index cd67a5472e77e6aa4b2fd021505f73d3f1058a1e..70f24848a461568a129a5eabf46ea5b8f5dea1d3 100644
+--- a/crates/focal-bus/src/limits.rs
++++ b/crates/focal-bus/src/limits.rs
+@@ -166,6 +166,9 @@ fn limits(identities: usize, lanes: u32) -> Result<Limits, BusError> {
+         // Every seat's handshake may be under way at once, the places the seats: the rule of half
+         // of them holds.
+         retry_bytes: None,
++        // Preserve the previous connection policy while adopting the required fields.
++        acknowledgement: hyper_transport::Acknowledgement::Decimated,
++        fec_window: None,
+     })
+ }
+ 
+diff --git a/crates/focal-bus/src/member.rs b/crates/focal-bus/src/member.rs
+index c39b36df6a441e0746551137cd97f385a354c4d0..e63eefbc6f26ab461c87bb04bd720fe3ce1edbbe 100644
+--- a/crates/focal-bus/src/member.rs
++++ b/crates/focal-bus/src/member.rs
+@@ -349,6 +349,16 @@ pub enum GroupEvent {
+         /// The member it believed led, zero for none.
+         leader: u64,
+     },
++    /// The peer announced an orderly stop of its current run.
++    Stopped { peer: u64 },
++    /// The peer's process is alive and its disk was judged slow.
++    DiskSlow { peer: u64 },
++    /// A peer's disk caught up again.
++    DiskCaughtUp { peer: u64 },
++    /// The peer announces a different group disk mode; its heartbeat is refused.
++    ModeDiffers { peer: u64 },
++    /// The peer's group disk mode agrees again.
++    ModeAgrees { peer: u64 },
+ }
+ 
+ /// hyper-durable's budget over the node's memory: what the replica reserves before an input, from
+@@ -358,6 +368,9 @@ pub enum GroupEvent {
+ #[derive(Debug)]
+ pub struct MemberBudget {
+     budget: MemoryBudget,
++    // CP-T2.2: declared group ceilings, independent of other users' current reservations.
++    ordinary_limit: usize,
++    limit: usize,
+     ordinary: Option<Allocation>,
+     completion: Option<Allocation>,
+     owed: u64,
+@@ -365,8 +378,12 @@ pub struct MemberBudget {
+ 
+ impl MemberBudget {
+     fn new(budget: MemoryBudget) -> Self {
++        let ordinary_limit = budget.reservation_limit(BudgetLane::Ordinary);
++        let limit = budget.reservation_limit(BudgetLane::Completion);
+         Self {
+             budget,
++            ordinary_limit,
++            limit,
+             ordinary: None,
+             completion: None,
+             owed: 0,
+@@ -430,6 +447,23 @@ impl ReplicaBudget for MemberBudget {
+         self.owed == 0 && self.hold(BudgetLane::Ordinary, bytes)
+     }
+ 
++    // The upstream Budget contract asks for this replica's own allowance, not shared free
++    // memory. group_budget supplies the group's declared caps; only this ledger spends them.
++    fn room(&self) -> Option<usize> {
++        if self.owed != 0 {
++            return Some(0);
++        }
++        let ordinary = self.ordinary.as_ref().map_or(0, Allocation::bytes);
++        let completion = self.completion.as_ref().map_or(0, Allocation::bytes);
++        Some(
++            self.ordinary_limit.saturating_sub(ordinary).min(
++                self.limit
++                    .saturating_sub(ordinary)
++                    .saturating_sub(completion),
++            ),
++        )
++    }
++
+     fn charge(&mut self, bytes: u64) {
+         if !self.hold(BudgetLane::Completion, bytes) {
+             self.owed = self.owed.saturating_add(bytes);
+@@ -863,6 +897,8 @@ impl Member {
+             // as it moves (`Member::restate_period`); before the stream schedules a heartbeat there
+             // is none, and a commit that moved alone is written the moment no write is out.
+             quiet: Duration::ZERO,
++            // CP-T2.2: preserve the group's existing flush-proved durability policy.
++            disk: hyper_durable::Disk::Flushed,
+         };
+         let replica = Replica::open(&shell, store, machine, MemberBudget::new(budget))
+             .map_err(|_| BusError::Configuration("the part's replica could not be opened"))?;
+@@ -1585,6 +1621,26 @@ impl Member {
+                     tell(&GroupEvent::Restarted { peer });
+                     self.replica.restarted(peer)
+                 }
++                Change::Stopped { .. } => {
++                    tell(&GroupEvent::Stopped { peer });
++                    self.replica.stopped(peer)
++                }
++                Change::DiskSlow { .. } => {
++                    tell(&GroupEvent::DiskSlow { peer });
++                    self.replica.disk_slow(peer)
++                }
++                Change::DiskCaughtUp { .. } => {
++                    tell(&GroupEvent::DiskCaughtUp { peer });
++                    self.replica.disk_caught_up(peer)
++                }
++                Change::ModeDiffers { .. } => {
++                    tell(&GroupEvent::ModeDiffers { peer });
++                    Ok(())
++                }
++                Change::ModeAgrees { .. } => {
++                    tell(&GroupEvent::ModeAgrees { peer });
++                    Ok(())
++                }
+             };
+         }
+         self.asked.changes = changes;
+@@ -1920,3 +1976,30 @@ mod tests {
+         assert_eq!(ms(stages.committed.quantile(500_000).unwrap()), 1);
+     }
+ }
++
++#[cfg(test)]
++mod budget_tests {
++    use super::*;
++
++    /// CP-T2.2: another component's reservation cannot spend this replica's allowance.
++    #[test]
++    fn replica_room_counts_its_own_holds_and_debt() {
++        let budget = MemoryBudget::new(1024, 64).unwrap();
++        let mut replica = MemberBudget::new(budget.clone());
++        assert_eq!(replica.room(), Some(960));
++        let sibling = budget
++            .reserve(BudgetKind::Pending, BudgetLane::Ordinary, 800)
++            .unwrap()
++            .commit();
++        assert_eq!(replica.room(), Some(960));
++        assert!(replica.reserve(128));
++        assert_eq!(replica.room(), Some(832));
++        replica.release(128);
++        assert_eq!(replica.room(), Some(960));
++        replica.charge(256);
++        assert_eq!(replica.room(), Some(0));
++        drop(sibling);
++        replica.release(256);
++        assert_eq!(replica.room(), Some(960));
++    }
++}
+diff --git a/crates/focal-bus/src/node.rs b/crates/focal-bus/src/node.rs
+index d44846227632fc3e0e7f3bbca678f39556df730e..a282dbface2bbacf4c554b4c9232ac59f7bb301a 100644
+--- a/crates/focal-bus/src/node.rs
++++ b/crates/focal-bus/src/node.rs
+@@ -301,6 +301,9 @@ impl Node {
+                 self.holding.retain(|held| held.peer != peer);
+                 self.release_unblocked(endpoint);
+             }
++            // Advisory path changes leave stream/subscription ownership in place. Only a
++            // Closed event above retires the connection's state; liveness judges group peers.
++            Event::Degrading { .. } | Event::Progressing { .. } => {}
+             Event::Connected { .. }
+             | Event::Reply { .. }
+             | Event::BodyReady { .. }

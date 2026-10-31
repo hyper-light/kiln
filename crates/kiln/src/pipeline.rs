@@ -694,10 +694,10 @@ jobs:
       - run: cargo bench
 "#;
 
-    /// kiln's own `.kiln/*.yaml` read both ways: as v1 pipelines and in the CI engine's kiln
-    /// dialect, so neither grows a key the other refuses.
+    /// U01/U02, W02-R06: current workflows use the canonical kiln-ci parser; compatibility
+    /// translates old syntax into its IR without requiring v1 to accept modern workflow keys.
     #[test]
-    fn kilns_own_workflows_read_both_ways() -> anyhow::Result<()> {
+    fn u02_own_workflows_use_canonical_parser_and_preserve_u16_release_subjects() -> anyhow::Result<()> {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.kiln");
         let mut read = 0;
         for e in std::fs::read_dir(&dir)?.filter_map(Result::ok) {
@@ -711,10 +711,21 @@ jobs:
             if !text.lines().any(|l| l.starts_with("jobs:")) {
                 continue;
             }
-            parse(&text).map_err(|e| anyhow::anyhow!("{name} as v1: {e}"))?;
             let (wf, diags) = kiln_ci::wf::parse_workflow(&format!(".kiln/{name}"), &text, kiln_ci::expr::Dialect::Kiln);
             let errors: Vec<String> = diags.iter().filter(|d| d.is_error()).map(|d| format!("{d:?}")).collect();
-            anyhow::ensure!(wf.is_some() && errors.is_empty(), "{name} in the kiln dialect: {errors:?}");
+            anyhow::ensure!(errors.is_empty(), ".kiln/{name} in the canonical kiln dialect: {errors:?}");
+            let wf = wf.ok_or_else(|| anyhow::anyhow!(".kiln/{name}: canonical parser returned no workflow: {diags:?}"))?;
+            if name == "release.yaml" {
+                // U16: signed subjects and retained artifacts must survive parsing together.
+                assert_eq!(wf.jobs.len(), 3, ".kiln/{name}: expected all release platforms");
+                for id in ["linux", "windows", "macos"] {
+                    let job = wf.job(id).ok_or_else(|| anyhow::anyhow!(".kiln/{name}: missing release job {id}"))?;
+                    assert_eq!(job.kiln.artifacts, vec!["dist/*".to_owned()], ".kiln/{name}: {id} artifacts");
+                    let subjects = job.kiln.attest.as_ref().and_then(kiln_ci::wf::ir::YVal::as_seq)
+                        .map(|items| items.iter().map(kiln_ci::wf::ir::YVal::as_str).collect::<Vec<_>>());
+                    assert_eq!(subjects, Some(vec![Some("dist/kiln-*")]), ".kiln/{name}: {id} attestation subjects");
+                }
+            }
             read += 1;
         }
         anyhow::ensure!(read >= 3, "only {read} of kiln's own workflows read");

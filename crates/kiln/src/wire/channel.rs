@@ -454,6 +454,13 @@ impl Receiver {
         Arrival::Gap(Frame::Want { stream: stream.to_owned(), from })
     }
 
+    /// U03: application storage failed; leave the sequence unacknowledged and retryable.
+    pub fn retry(&mut self, stream: &str, seq: Seq) {
+        if let Some(state) = self.streams.get_mut(stream) && state.taking == Some(seq) {
+            state.taking = None;
+        }
+    }
+
     /// The item being applied was taken: the answer to send.
     pub fn took(&mut self, stream: &str, seq: Seq) -> Frame {
         self.done(stream, seq, None)
@@ -601,6 +608,20 @@ mod tests {
         assert_eq!(events.len(), 3, "the three taken are answered by what the receiver has: {events:?}");
         assert_eq!(items(&s.poll(base)), vec![4, 5]);
         Ok(())
+    }
+
+    #[test]
+    fn u03_storage_failure_replays_without_acknowledging_or_skipping() {
+        let mut receiver = Receiver::new();
+        let body = b"completion".to_vec();
+        assert_eq!(receiver.on_item("job", 1, 0, body.clone()), Arrival::Take(body.clone()));
+        receiver.retry("job", 2);
+        assert_eq!(receiver.on_item("job", 1, 0, body.clone()), Arrival::Answered(None));
+        receiver.retry("job", 1);
+        assert_eq!(receiver.state("job").upto, 0);
+        assert_eq!(receiver.on_item("job", 1, 0, body.clone()), Arrival::Take(body.clone()));
+        let answer = receiver.took("job", 1);
+        assert_eq!(receiver.on_item("job", 1, 0, body), Arrival::Answered(Some(answer)));
     }
 
     #[test]

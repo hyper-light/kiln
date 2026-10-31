@@ -109,20 +109,49 @@ struct Shown<'a> {
     runner: Option<&'a str>,
 }
 
+/// U17: import the old inventory map into the same canonical cell as durable request tokens.
+#[derive(Clone, Serialize)]
+struct ControlState {
+    version: u32,
+    heard: BTreeMap<String, Heard>,
+    asked: BTreeMap<String, u64>,
+}
+impl Default for ControlState {
+    fn default() -> Self { Self { version: 1, heard: BTreeMap::new(), asked: BTreeMap::new() } }
+}
+impl<'de> Deserialize<'de> for ControlState {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Input {
+            Current { version: u32, heard: BTreeMap<String, Heard>, asked: BTreeMap<String, u64> },
+            Legacy(BTreeMap<String, Heard>),
+        }
+        Ok(match Input::deserialize(d)? {
+            Input::Current { version, heard, asked } => Self { version, heard, asked },
+            Input::Legacy(heard) => Self { version: 1, heard, asked: BTreeMap::new() },
+        })
+    }
+}
+
 pub struct Copies {
-    file: PathBuf,
+    control: crate::sync::places::control::Control,
     /// The rules, read from the store once and kept as they change.
     rules: Mutex<Option<All>>,
     heard: Mutex<BTreeMap<String, Heard>>,
     /// Each runner's last ask to let go now.
     asked: Mutex<BTreeMap<String, u64>>,
+    changing: async_lock::Mutex<()>,
 }
 
 impl Copies {
     /// What runners said before, kept in `file`.
-    pub fn open(file: PathBuf) -> Self {
-        let heard = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-        Self { file, rules: Mutex::new(None), heard: Mutex::new(heard), asked: Mutex::new(BTreeMap::new()) }
+    pub fn from_database(file: PathBuf, database: amphora::database::Database, host: &str) -> anyhow::Result<Self> {
+        let (control, state): (_, ControlState) = crate::sync::places::control::Control::open(database, host, "reach-copies", &file, |s: &ControlState| {
+            anyhow::ensure!(s.version == 1, "U17 unsupported Reach control version");
+            Ok(())
+        })?;
+        Ok(Self { control, rules: Mutex::new(None), heard: Mutex::new(state.heard), asked: Mutex::new(state.asked), changing: async_lock::Mutex::new(()) })
     }
 
     /// Every scope's rules.
@@ -176,32 +205,42 @@ impl Copies {
             return json!({ "error": "a report of copies was expected" });
         };
         let set = self.all(hub).await.set_for(runner, &report.copies);
-        // What changes all the time (its clock, the room on its disk) is kept, but no change.
-        let changed = {
-            let mut heard = self.heard.lock();
-            let same = heard.get(runner).is_some_and(|h| Report { at: 0, disk: None, ..h.report.clone() } == Report { at: 0, disk: None, ..report.clone() });
-            heard.insert(runner.to_owned(), Heard { report, at: crate::util::now_unix() });
-            !same
+        let _changing = self.changing.lock().await;
+        let runner = runner.to_owned();
+        let commit = self.control.change_async(move |state: &mut ControlState| {
+            state.version = 1;
+            let same = state.heard.get(&runner).is_some_and(|h| Report { at: 0, disk: None, ..h.report.clone() } == Report { at: 0, disk: None, ..report.clone() });
+            state.heard.insert(runner.clone(), Heard { report, at: crate::util::now_unix() });
+            Ok((!same, state.asked.get(&runner).copied().unwrap_or(0)))
+        }).await;
+        let (state, (changed, token)) = match commit {
+            Ok(committed) => committed,
+            Err(_) => return json!({ "error": "copy inventory could not commit; retry the report" }),
         };
-        if changed {
-            self.save().await;
-            hub.emit(&crate::wire::events::ServerEvent::Keep);
-        }
-        let asked = self.asked.lock().get(runner).copied().unwrap_or(0);
-        serde_json::to_value(Answer { set, asked }).unwrap_or_default()
+        *self.heard.lock() = state.heard;
+        *self.asked.lock() = state.asked;
+        if changed { hub.emit(&crate::wire::events::ServerEvent::Keep); }
+        serde_json::to_value(Answer { set, asked: token }).unwrap_or_default()
     }
 
-    /// Ask `runner` (or every runner kiln knows) to let go now of what its rules don't keep: the
-    /// runners asked.
-    pub fn ask(&self, hub: &Hub, runner: Option<&str>) -> Vec<String> {
-        let known = self.runners(hub);
-        let names: Vec<String> = known.into_keys().filter(|n| runner.is_none_or(|r| r == n)).collect();
-        let token = u64::try_from(crate::util::now_ms()).unwrap_or(1).max(1);
-        let mut asked = self.asked.lock();
-        for n in &names {
-            asked.insert(n.clone(), token);
-        }
-        names
+    /// A request is committed before HTTP acceptance; tokens increase across restart and clocks.
+    pub async fn ask(&self, hub: &Hub, runner: Option<&str>) -> anyhow::Result<Vec<String>> {
+        let names: Vec<String> = self.runners(hub).into_keys().filter(|n| runner.is_none_or(|r| r == n)).collect();
+        self.ask_names(names).await
+    }
+
+    async fn ask_names(&self, names: Vec<String>) -> anyhow::Result<Vec<String>> {
+        let _changing = self.changing.lock().await;
+        let (state, names) = self.control.change_async(move |state: &mut ControlState| {
+            state.version = 1;
+            let floor = names.iter().map(|n| state.asked.get(n).copied().unwrap_or(0).max(state.heard.get(n).map_or(0, |h| h.report.done))).max().unwrap_or(0);
+            let token = floor.checked_add(1).ok_or_else(|| anyhow::anyhow!("Reach request token exhausted"))?.max(u64::try_from(crate::util::now_ms()).unwrap_or(1)).max(1);
+            for name in &names { state.asked.insert(name.clone(), token); }
+            Ok(names)
+        }).await?;
+        *self.heard.lock() = state.heard;
+        *self.asked.lock() = state.asked;
+        Ok(names)
     }
 
     /// Every runner kiln knows here, and whether it's connected: those that joined (job pods
@@ -275,13 +314,7 @@ impl Copies {
         json!({ "rules": all.agents.get(id).cloned().unwrap_or_default(), "copies": copies })
     }
 
-    async fn save(&self) {
-        let bytes = serde_json::to_vec(&*self.heard.lock()).unwrap_or_default();
-        let file = self.file.clone();
-        if let Ok(Err(e)) = crate::rt::blocking(move || crate::sync::group::save_atomic(&file, &bytes)).await {
-            tracing::warn!(target: "kiln.reach", error = %e, "what runners said of their copies couldn't be saved");
-        }
-    }
+
 }
 
 /// The rules a request's body says: an object of [`keep::FIELDS`], each within what kiln takes.
@@ -299,6 +332,37 @@ pub fn rules_of(body: &[u8]) -> Result<Rules, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn u17_copy_requests_survive_restart_increase_and_keep_host_affinity() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+        let dir = tempfile::tempdir()?;
+        let file = dir.path().join("copies.json");
+        let store = crate::store::Store::in_memory()?;
+        let done = u64::try_from(crate::util::now_ms()).unwrap_or(1).saturating_add(1_000_000_000);
+        let reports = BTreeMap::from([("runner".to_owned(), Heard { report: Report { done, ..Report::default() }, at: 1 })]);
+        let raw = serde_json::to_vec(&reports)?;
+        std::fs::write(&file, &raw)?;
+        let copies = Copies::from_database(file.clone(), store.database(), "host-one")?;
+        copies.ask_names(vec!["runner".into()]).await?;
+        let first = copies.asked.lock().get("runner").copied().unwrap_or(0);
+        assert!(first > done, "a request is newer than the runner's durable acknowledgment");
+        copies.ask_names(vec!["runner".into()]).await?;
+        let second = copies.asked.lock().get("runner").copied().unwrap_or(0);
+        assert!(second > first, "even when wall time is below both tokens");
+        drop(copies);
+        let copies = Copies::from_database(file.clone(), store.database(), "host-one")?;
+        assert_eq!(copies.asked.lock().get("runner"), Some(&second));
+        copies.ask_names(vec!["runner".into()]).await?;
+        assert!(copies.asked.lock().get("runner").is_some_and(|n| *n > second));
+        let other = Copies::from_database(file.clone(), store.database(), "host-two")?;
+        assert!(other.asked.lock().is_empty(), "inventory and request ownership remain host-affine");
+        assert_eq!(std::fs::read(&file)?, raw, "no JSON dual writer");
+        std::fs::write(&file, b"{\"runner\": {}, \"runner\": {}}")?;
+        assert!(Copies::from_database(file, store.database(), "new-host").is_err(), "ambiguous import is refused");
+        Ok(())
+        })
+    }
 
     #[test]
     fn a_runner_weighs_every_runners_rules_its_own_and_its_agents() {

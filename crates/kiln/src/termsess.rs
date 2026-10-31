@@ -27,7 +27,7 @@ const EXITED_LINGER: Duration = Duration::from_secs(60);
 const FANOUT: usize = 1024;
 
 /// What attached clients receive.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Frame {
     Data(Bytes),
     Exit { code: Option<i32>, error: Option<String> },
@@ -110,10 +110,13 @@ pub struct Session {
 
 /// What a client gets when it attaches.
 pub struct Attachment {
+    /// Geometry at the same boundary as replay and the live cursor.
+    pub cols: u16,
+    pub rows: u16,
     /// Bytes that bring a fresh terminal to the session's current state.
     pub replay: Vec<u8>,
     /// Everything after the replay.
-    pub live: async_broadcast::Receiver<Frame>,
+    pub live: crate::bus::Receiver<Frame>,
     /// Set when the session had already ended.
     pub ended: Option<(Option<i32>, Option<String>)>,
 }
@@ -194,7 +197,7 @@ impl Session {
             st.trimmed = true;
         }
         st.last_activity = Instant::now();
-        self.out.send(Frame::Data(Bytes::copy_from_slice(data)));
+        let _ = self.out.send(Frame::Data(Bytes::copy_from_slice(data)));
     }
 
     fn finish(&self, code: Option<i32>, error: Option<String>) {
@@ -204,7 +207,7 @@ impl Session {
         }
         st.exit = Some(Exit { code, error: error.clone(), at: Instant::now() });
         st.last_activity = Instant::now();
-        self.out.send(Frame::Exit { code, error });
+        let _ = self.out.send(Frame::Exit { code, error });
     }
 
     /// Join the session: the replay that reproduces its current state, then live output.
@@ -233,7 +236,7 @@ impl Session {
         }
         let ended = st.exit.as_ref().map(|e| (e.code, e.error.clone()));
         let live = self.out.subscribe();
-        Attachment { replay, live, ended }
+        Attachment { cols: st.cols, rows: st.rows, replay, live, ended }
     }
 
     pub fn detach(&self) {
@@ -257,7 +260,7 @@ impl Session {
                     st.cols = cols;
                     st.rows = rows;
                     st.screen.screen_mut().set_size(rows, cols);
-                    self.out.send(Frame::Size { cols, rows });
+                    let _ = self.out.send(Frame::Size { cols, rows });
                     Input::Resize { cols, rows }
                 }
                 data => data,
@@ -274,65 +277,76 @@ impl Session {
     }
 }
 
-/// Every terminal session on this server.
+/// Every terminal session on this server. Physical PTYs stay in this process; accepted names
+/// live in the injected host-qualified Records namespace.
 pub struct Sessions {
     map: Mutex<HashMap<String, Arc<Session>>>,
-    /// Names people gave sessions, by session id: kept in `names_file`, so they outlive this
-    /// server's restarts and a machine's reconnects (its sessions come back under their ids).
     names: Mutex<HashMap<String, String>>,
-    names_file: Mutex<Option<std::path::PathBuf>>,
+    names_snapshot: crate::harness::host::snapshot::Snapshot,
+    names_commit: Mutex<()>,
 }
 
 /// The longest name a terminal session takes.
 const MAX_NAME: usize = 80;
 
-impl Default for Sessions {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+/// U17: a missing physical session is distinct from unavailable/corrupt name persistence.
+#[derive(Debug, thiserror::Error)]
+#[error("terminal name storage: {0:#}")]
+pub struct StorageError(anyhow::Error);
+
+fn names_storage(error: impl Into<anyhow::Error>) -> anyhow::Error { StorageError(error.into()).into() }
 
 impl Sessions {
-    pub fn new() -> Self {
-        Self { map: Mutex::new(HashMap::new()), names: Mutex::new(HashMap::new()), names_file: Mutex::new(None) }
+    #[cfg(test)]
+    pub fn new() -> anyhow::Result<Self> {
+        Self::from_records(Arc::new(kiln_seams::records::SimRecords::default()), None)
     }
 
-    /// Keeps sessions' names in `file` (read now, written as they change).
-    pub fn keep_names_in(&self, file: std::path::PathBuf) {
-        if let Ok(raw) = std::fs::read(&file) {
-            match serde_json::from_slice::<HashMap<String, String>>(&raw) {
-                Ok(names) => *self.names.lock() = names,
-                Err(e) => tracing::warn!(file = %file.display(), error = %e, "unreadable terminal names; starting without them"),
-            }
-        }
-        *self.names_file.lock() = Some(file);
+    /// U17: legacy terminal-names.json is a checked, read-only input consumed only when the
+    /// canonical snapshot is absent. No sidecar remains a live writer after this constructor.
+    pub fn from_records(records: Arc<dyn kiln_seams::Records>, legacy: Option<&std::path::Path>) -> anyhow::Result<Self> {
+        let (snapshot, names) = crate::harness::host::snapshot::Snapshot::open(records, "terminal/names", legacy).map_err(names_storage)?;
+        Ok(Self { map: Mutex::new(HashMap::new()), names: Mutex::new(names), names_snapshot: snapshot, names_commit: Mutex::new(()) })
     }
 
-    /// Names a session ("" takes its name away, back to its window title). False when there is
-    /// no such session.
-    pub fn rename(&self, id: &str, name: &str) -> bool {
-        if self.get(id).is_none() {
-            return false;
-        }
+    /// False only when this process has no physical session with this identity. A name becomes
+    /// visible and acknowledged only after its Records commit succeeds.
+    pub fn rename(&self, id: &str, name: &str) -> anyhow::Result<bool> {
+        let sessions = self.map.lock();
+        if !sessions.contains_key(id) { return Ok(false); }
         let name: String = name.trim().chars().filter(|c| !c.is_control()).take(MAX_NAME).collect();
-        {
-            let mut names = self.names.lock();
-            if name.is_empty() {
-                names.remove(id);
-            } else {
-                names.insert(id.to_owned(), name);
-            }
-        }
-        self.save_names();
-        true
+        self.edit_name(id, (!name.is_empty()).then_some(name), None)?;
+        Ok(true)
     }
 
-    fn save_names(&self) {
-        let Some(file) = self.names_file.lock().clone() else { return };
-        let Ok(json) = serde_json::to_vec_pretty(&*self.names.lock()) else { return };
-        let tmp = file.with_extension("tmp");
-        if let Err(e) = std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, &file)) {
-            tracing::warn!(file = %file.display(), error = %e, "could not keep terminal names");
+    /// A fresh read and its exact revision bind each delta: another process's unrelated name
+    /// edits survive, and a reader cannot refresh the CAS revision of an older in-memory map.
+    fn edit_name(&self, id: &str, name: Option<String>, expected: Option<&str>) -> anyhow::Result<()> {
+        let _commit = self.names_commit.lock();
+        for _ in 0..3 {
+            let (revision, mut names) = self.names_snapshot.read_versioned::<HashMap<String, String>>().map_err(names_storage)?
+                .ok_or_else(|| names_storage(anyhow::anyhow!("canonical terminal names disappeared")))?;
+            // Lifecycle cleanup from an older process cannot erase a newer accepted rename.
+            if expected.is_some_and(|previous| names.get(id).map(String::as_str) != Some(previous)) {
+                *self.names.lock() = names;
+                return Ok(());
+            }
+            if let Some(name) = &name { names.insert(id.to_owned(), name.clone()); } else { names.remove(id); }
+            match self.names_snapshot.save_at(&names, revision) {
+                Ok(()) => { *self.names.lock() = names; return Ok(()); }
+                Err(error) if error.downcast_ref::<kiln_seams::records::Refusal>().is_some_and(|refusal| matches!(refusal, kiln_seams::records::Refusal::Conflict { .. })) => continue,
+                Err(error) => return Err(names_storage(error)),
+            }
+        }
+        Err(names_storage(anyhow::anyhow!("terminal names kept changing; rename was not committed")))
+    }
+
+    fn current_names(&self) -> HashMap<String, String> {
+        let _commit = self.names_commit.lock();
+        match self.names_snapshot.read_versioned::<HashMap<String, String>>() {
+            Ok(Some((_, names))) => { *self.names.lock() = names.clone(); names }
+            Ok(None) => { tracing::error!("U17 canonical terminal names disappeared; retaining last committed view"); self.names.lock().clone() }
+            Err(error) => { tracing::error!(%error, "U17 terminal names unavailable; retaining last committed view"); self.names.lock().clone() }
         }
     }
 
@@ -341,7 +355,7 @@ impl Sessions {
     }
 
     pub fn list(&self) -> Vec<Info> {
-        let names = self.names.lock().clone();
+        let names = self.current_names();
         let mut v: Vec<Info> = self
             .map
             .lock()
@@ -372,9 +386,11 @@ impl Sessions {
     }
 
     fn forget_name(&self, id: &str) {
-        let had = self.names.lock().remove(id).is_some();
-        if had {
-            self.save_names();
+        let previous = self.names.lock().get(id).cloned();
+        if let Some(previous) = previous
+            && let Err(error) = self.edit_name(id, None, Some(&previous))
+        {
+            tracing::error!(%error, session = id, "U17 terminal name cleanup not committed; durable name retained");
         }
     }
 
@@ -568,7 +584,7 @@ fn run_agent(hub: &Arc<Hub>, machine: String, s: Arc<Session>, input: async_chan
                     // The machine went away; the shell keeps running there and is adopted again
                     // when it reconnects. Attached browsers reconnect by session id.
                     h.terminals.remove(&s.id);
-                    s.out.send(Frame::Exit { code: None, error: Some("__reconnect__".to_owned()) });
+                    let _ = s.out.send(Frame::Exit { code: None, error: Some("__reconnect__".to_owned()) });
                     break;
                 }
                 // Commands (`crate::wire::commands`), in order, each answered, none waited for:
@@ -600,28 +616,57 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_name_outlives_restarts_and_goes_with_its_session() -> anyhow::Result<()> {
+    fn u17_terminal_names_survive_reopen_merge_and_refused_writes() -> anyhow::Result<()> {
+        use kiln_seams::records::{Records, Refusal, SimLimits, SimRecords, VALUE_MAX};
         let dir = tempfile::tempdir()?;
         let file = dir.path().join("terminal-names.json");
-        let reg = Sessions::new();
-        reg.keep_names_in(file.clone());
+        std::fs::write(&file, br#"{"t1":"legacy"}"#)?;
+        let records: Arc<dyn Records> = Arc::new(SimRecords::default());
+        let reg = Sessions::from_records(records.clone(), Some(&file))?;
         reg.insert(&Session::detached("t1".into(), "local".into(), None, 80, 24));
-        assert!(!reg.rename("nope", "x"), "no such session");
-        assert!(reg.rename("t1", "  builds\u{7}  "));
+        assert!(!reg.rename("nope", "x")?, "no such physical session");
+        assert!(reg.rename("t1", "  builds\u{7}  ")?);
         assert_eq!(reg.list().first().and_then(|i| i.name.clone()).as_deref(), Some("builds"));
-        // Another server reads it back when the session comes back under its id.
-        let again = Sessions::new();
-        again.keep_names_in(file.clone());
+        // The committed import ignores an obsolete source, including one that is now corrupt.
+        std::fs::write(&file, b"obsolete corrupt sidecar")?;
+        let again = Sessions::from_records(records.clone(), Some(&file))?;
         again.insert(&Session::detached("t1".into(), "local".into(), None, 80, 24));
-        assert_eq!(again.list().first().and_then(|i| i.name.clone()).as_deref(), Some("builds"));
-        // Emptied, it shows its title again; the session gone, so is its name.
-        assert!(again.rename("t1", ""));
-        assert_eq!(again.list().first().and_then(|i| i.name.clone()), None);
-        assert!(again.rename("t1", "deploys"));
+        again.insert(&Session::detached("t2".into(), "local".into(), None, 80, 24));
+        assert_eq!(again.list().iter().find(|i| i.id == "t1").and_then(|i| i.name.as_deref()), Some("builds"));
+        assert!(reg.rename("t1", "first edit")?);
+        assert!(again.rename("t2", "second edit")?);
+        assert_eq!(again.list().iter().find(|i| i.id == "t1").and_then(|i| i.name.as_deref()), Some("first edit"), "a stale instance's unrelated delta must not dump its old map over this name");
+        assert!(again.rename("t1", "")?);
+        assert_eq!(reg.list().first().and_then(|i| i.name.clone()), None, "reads observe another process's committed clear");
+        assert!(again.rename("t1", "deploys")?);
+        reg.remove("t1");
+        assert_eq!(again.list().iter().find(|i| i.id == "t1").and_then(|i| i.name.as_deref()), Some("deploys"), "stale cleanup cannot erase a newer rename");
         again.remove("t1");
-        let third = Sessions::new();
-        third.keep_names_in(file);
-        assert!(third.names.lock().is_empty());
+        let third = Sessions::from_records(records, Some(&file))?;
+        assert!(!third.names.lock().contains_key("t1"));
+        assert_eq!(third.names.lock().get("t2").map(String::as_str), Some("second edit"));
+        assert_eq!(std::fs::read(&file)?.as_slice(), b"obsolete corrupt sidecar", "canonical changes never rewrite the legacy input");
+        // A first import is checked and can resume after the actual corrupt input is repaired.
+        let fresh: Arc<dyn Records> = Arc::new(SimRecords::default());
+        assert!(Sessions::from_records(fresh.clone(), Some(&file)).is_err());
+        std::fs::write(&file, br#"{"t1":"repaired"}"#)?;
+        assert_eq!(Sessions::from_records(fresh, Some(&file))?.names.lock().get("t1").map(String::as_str), Some("repaired"));
+        // A rename that crosses the segment boundary needs more rows. The simulator refuses
+        // that write atomically; neither memory nor the acknowledged canonical value changes.
+        let mut large = HashMap::from([("t1".to_owned(), "old".to_owned()), ("padding".to_owned(), String::new())]);
+        let base = serde_json::to_vec(&serde_json::json!({"version":1,"state":&large}))?.len();
+        large.insert("padding".to_owned(), "x".repeat(VALUE_MAX.saturating_sub(base + 16)));
+        let legacy = serde_json::to_vec(&large)?;
+        std::fs::write(&file, &legacy)?;
+        let bounded: Arc<dyn Records> = Arc::new(SimRecords::with_limits(SimLimits { rows: 1, ..Default::default() }));
+        let limited = Sessions::from_records(bounded, Some(&file))?;
+        limited.insert(&Session::detached("t1".into(), "local".into(), None, 80, 24));
+        let refused = limited.rename("t1", &"n".repeat(MAX_NAME)).err().ok_or_else(|| anyhow::anyhow!("rename committed beyond the store's capacity"))?;
+        let storage = refused.downcast_ref::<StorageError>().ok_or_else(|| anyhow::anyhow!("storage refusal lost its type"))?;
+        assert!(matches!(storage.0.downcast_ref::<Refusal>(), Some(Refusal::Full { .. })));
+        assert_eq!(limited.names.lock().get("t1").map(String::as_str), Some("old"), "a refused write must not publish its name in memory");
+        assert_eq!(limited.list().first().and_then(|i| i.name.clone()).as_deref(), Some("old"));
+        assert_eq!(std::fs::read(&file)?, legacy);
         Ok(())
     }
 
@@ -670,7 +715,7 @@ mod tests {
         s.send(Input::Resize { cols: 120, rows: 40 }); // unchanged: no frame, nothing to the PTY
         s.send(Input::Resize { cols: 1, rows: 5000 });
         let mut sizes = Vec::new();
-        while let Ok(f) = a.live.try_recv() {
+        while let Some(Ok(f)) = a.live.recv().now_or_never() {
             if let Frame::Size { cols, rows } = f {
                 sizes.push((cols, rows));
             }
@@ -682,11 +727,14 @@ mod tests {
             sent.push((cols, rows));
         }
         assert_eq!(sent, vec![(120, 40), (2, 1000)]);
+        let snapshot = s.attach();
+        assert_eq!((snapshot.cols, snapshot.rows), (2, 1000));
+        s.detach();
     }
 
     #[test]
-    fn titles_exits_and_sweeping() {
-        let sessions = Sessions::new();
+    fn titles_exits_and_sweeping() -> anyhow::Result<()> {
+        let sessions = Sessions::new()?;
         let (s, _input) = Session::new("local".into(), None, 80, 24);
         sessions.insert(&s);
         feed(&s, b"\x1b]0;claude: fixing tests\x07ready");
@@ -704,5 +752,6 @@ mod tests {
         assert!(sessions.get(&s.id).is_none());
         let late = s.attach();
         assert_eq!(late.ended, Some((Some(0), None)));
+        Ok(())
     }
 }

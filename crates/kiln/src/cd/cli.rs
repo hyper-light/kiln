@@ -26,6 +26,10 @@ pub struct CdArgs {
 }
 
 #[derive(clap::Subcommand)]
+// G-18: defer operation arguments, not CdArgs's url/token/json overrides: inherited
+// globals arrive before deferred callbacks. This separates the large operation builders
+// from the root's frame on Windows, for normal/update parsing and full build().
+#[command(defer = true)]
 enum CdCmd {
     /// List apps: sync, health, resources.
     Apps {
@@ -711,4 +715,24 @@ pub fn what_differs(a: &Value) -> String {
         }
     }
     parts.join(" · ")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn g18_cd_deferred_normal_and_update_operations() -> anyhow::Result<()> {
+        use clap::Subcommand as _;
+        for (update, command) in [
+            (false, super::CdCmd::augment_subcommands(clap::Command::new("cd"))),
+            (true, super::CdCmd::augment_subcommands_for_update(clap::Command::new("cd"))),
+        ] {
+            let missing_id = command.clone().try_get_matches_from(["cd", "sync"]);
+            assert_eq!(missing_id.is_ok(), update);
+            let matches = command.try_get_matches_from(["cd", "sync", "default/web", "--option", "A", "--option", "B"])?;
+            let sync = matches.subcommand_matches("sync").ok_or_else(|| anyhow::anyhow!("missing sync matches"))?;
+            assert_eq!(sync.get_one::<String>("id").map(String::as_str), Some("default/web"));
+            assert_eq!(sync.get_many::<String>("options").map(|values| values.map(String::as_str).collect::<Vec<_>>()), Some(vec!["A", "B"]));
+        }
+        Ok(())
+    }
 }

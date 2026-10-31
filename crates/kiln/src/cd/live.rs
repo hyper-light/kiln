@@ -402,9 +402,9 @@ impl Live {
         if let Some(c) = self.commits.lock().get(&key) {
             return c.clone();
         }
-        let (dir, auth, url2, sha2) = (cd.mirror_dir(url), cd.git_auth(url), url.to_owned(), sha.to_owned());
-        let got = crate::rt::blocking(move || -> anyhow::Result<kiln_cd::git::Commit> {
-            kiln_cd::git::Mirror::open(&dir, &url2, auth)?.commit(&sha2)
+        let (source, sha2) = (cd.read_context(url), sha.to_owned());
+        let got = crate::rt::blocking_in(crate::rt::SHARE_GIT_MIRROR_IO, move || -> anyhow::Result<kiln_cd::git::Commit> {
+            source.open()?.commit(&sha2)
         })
         .await
         .ok()

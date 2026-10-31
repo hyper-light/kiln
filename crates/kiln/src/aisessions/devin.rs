@@ -3,6 +3,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
+#[cfg(not(windows))]
 use std::io::Read as _;
 use std::path::Path;
 use std::time::Duration;
@@ -181,8 +182,16 @@ pub(super) fn locks(root: &Path) -> Vec<(u32, String)> {
         if !matches!(file.try_lock_shared(), Err(std::fs::TryLockError::WouldBlock)) {
             continue;
         }
-        let mut pid = String::new();
-        if (&file).take(32).read_to_string(&mut pid).is_ok()
+        // U18: Windows range locks forbid ordinary reads through a second handle. Observe
+        // the same bounded PID record through a read-only view; never release its owner's lock.
+        #[cfg(windows)]
+        let pid = crate::os::read_locked_prefix(&file, 32).ok().and_then(|bytes| String::from_utf8(bytes).ok());
+        #[cfg(not(windows))]
+        let pid = {
+            let mut pid = String::new();
+            (&file).take(32).read_to_string(&mut pid).ok().map(|_| pid)
+        };
+        if let Some(pid) = pid
             && let Ok(pid) = pid.trim().parse::<u32>()
             && pid > 1
         {

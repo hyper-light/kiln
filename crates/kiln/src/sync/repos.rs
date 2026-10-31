@@ -22,6 +22,135 @@ use super::wire::{self, CloneOrder, Msg, Repos, ShareSlot, TaskNews, Work};
 use crate::http::client::Client;
 use crate::proto::AgentMsg;
 
+// U17: clone provenance shares the authenticated machine Records namespace. Only the
+// disposable read projection lives in git::Registry; no JSON writer remains.
+use kiln_seams::records::{Cond, Consistency, Records, Refusal, Row, Scan as RecordScan, Tx, Write};
+use serde::{Deserialize, Serialize};
+const CLONE_FAMILY: &str = "sync-clones";
+const CLONE_HEAD: &[u8] = b"owner-v1";
+const CLONE_MAX: usize = 900;
+const CLONE_BYTES: usize = 8 << 20;
+#[derive(Serialize, Deserialize)]
+struct CloneHead { version: u32, source_host: String, count: usize, bytes: usize }
+#[derive(Serialize, Deserialize)]
+struct CloneImport { version: u32, source_host: String, dir: String, digest: Option<String> }
+#[derive(Serialize, Deserialize)]
+struct ClonePath { path: String, kept: Kept }
+struct CloneRecords { records: Arc<dyn Records>, host: String, fenced: AtomicBool }
+fn clone_key(path: &str) -> Vec<u8> { format!("p/{}", crate::util::sha256_hex(path.as_bytes())).into_bytes() }
+fn clone_cond(key: &[u8], row: Option<&Row>) -> Cond {
+    row.map_or_else(|| Cond::Absent { family: CLONE_FAMILY.into(), key: key.to_vec() }, |r| Cond::At { family: CLONE_FAMILY.into(), key: key.to_vec(), rev: r.rev })
+}
+fn clone_put(key: Vec<u8>, value: Vec<u8>) -> Write { Write::Put { family: CLONE_FAMILY.into(), key, value } }
+fn clone_source(file: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+    use std::io::Read as _;
+    let mut f = match std::fs::File::open(file) { Ok(f) => f, Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None), Err(e) => return Err(e.into()) };
+    let len = usize::try_from(f.metadata()?.len())?;
+    anyhow::ensure!(len <= CLONE_BYTES, "legacy clone provenance exceeds 8 MiB import budget");
+    let mut bytes = Vec::new(); bytes.try_reserve_exact(len)?; bytes.resize(len, 0); f.read_exact(&mut bytes)?;
+    let mut more = [0u8; 1]; anyhow::ensure!(f.read(&mut more)? == 0, "legacy clone provenance changed while reading");
+    Ok(Some(bytes))
+}
+impl CloneRecords {
+    async fn open(records: Arc<dyn Records>, host: String, dir: PathBuf) -> anyhow::Result<(Self, Registry)> {
+        anyhow::ensure!(!host.trim().is_empty(), "clone provenance needs authenticated machine identity");
+        let dir = crate::rt::blocking_in(crate::rt::SHARE_STORE, move || -> anyhow::Result<PathBuf> { std::fs::create_dir_all(&dir)?; Ok(dir.canonicalize()?) }).await??;
+        let source_dir = dir.to_string_lossy().into_owned();
+        let marker_key = format!("i/{}", crate::util::sha256_hex(source_dir.as_bytes())).into_bytes();
+        let this = Self { records, host, fenced: AtomicBool::new(false) };
+        if let Some(row) = this.records.get(CLONE_FAMILY, &marker_key, Consistency::Linearizable).await? {
+            let marker: CloneImport = serde_json::from_slice(&row.value)?;
+            anyhow::ensure!(marker.version == 1 && marker.source_host == this.host && marker.dir == source_dir, "clone import belongs to another host/source");
+            let (_, _, projection) = this.snapshot().await?;
+            return Ok((this, projection));
+        }
+        let file = dir.join("clones.json");
+        let read = file.clone();
+        let bytes = crate::rt::blocking_in(crate::rt::SHARE_STORE, move || clone_source(&read)).await??;
+        let legacy: Registry = bytes.as_ref().map(|b| serde_json::from_slice(b)).transpose()?.unwrap_or_default();
+        legacy.validate()?;
+        let digest = bytes.as_ref().map(|b| crate::util::sha256_hex(b));
+        let marker = serde_json::to_vec(&CloneImport { version: 1, source_host: this.host.clone(), dir: source_dir.clone(), digest: digest.clone() })?;
+        for _ in 0..8 {
+            // Concurrent importers reconcile the single atomic marker instead of overwriting paths.
+            if let Some(row) = this.records.get(CLONE_FAMILY, &marker_key, Consistency::Linearizable).await? {
+                let m: CloneImport = serde_json::from_slice(&row.value)?;
+                anyhow::ensure!(m.version == 1 && m.source_host == this.host && m.dir == source_dir && m.digest == digest, "concurrent clone import source differs");
+                let (_, _, projection) = this.snapshot().await?; return Ok((this, projection));
+            }
+            let (row, mut head, existing) = this.snapshot().await?;
+            let mut conds = vec![clone_cond(CLONE_HEAD, row.as_ref()), clone_cond(&marker_key, None)];
+            let mut writes = Vec::new();
+            for (path, kept) in &legacy.clones {
+                if let Some(before) = existing.clones.get(path) { anyhow::ensure!(before == kept, "legacy clone path has different canonical provenance: {path}"); continue; }
+                let key = clone_key(path);
+                let value = serde_json::to_vec(&ClonePath { path: path.clone(), kept: kept.clone() })?;
+                anyhow::ensure!(value.len() <= 65536, "legacy clone path provenance exceeds row budget");
+                head.count = head.count.checked_add(1).ok_or_else(|| anyhow::anyhow!("clone count overflow"))?;
+                head.bytes = head.bytes.checked_add(value.len()).ok_or_else(|| anyhow::anyhow!("clone size overflow"))?;
+                anyhow::ensure!(head.count <= CLONE_MAX && head.bytes <= CLONE_BYTES, "clone provenance exceeds aggregate metadata budget");
+                conds.push(clone_cond(&key, None)); writes.push(clone_put(key, value));
+            }
+            writes.push(clone_put(CLONE_HEAD.to_vec(), serde_json::to_vec(&head)?));
+            writes.push(clone_put(marker_key.clone(), marker.clone()));
+            let check = file.clone();
+            let again = crate::rt::blocking_in(crate::rt::SHARE_STORE, move || clone_source(&check)).await??;
+            anyhow::ensure!(again.as_ref().map(|b| crate::util::sha256_hex(b)) == digest, "legacy clone provenance changed before import commit");
+            match this.records.commit(Tx { conds, writes }).await {
+                Ok(_) => { let (_, _, projection) = this.snapshot().await?; return Ok((this, projection)); }
+                Err(Refusal::Conflict { .. }) => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        anyhow::bail!("clone provenance import is busy; retry without changing its read-only source")
+    }
+    async fn snapshot(&self) -> anyhow::Result<(Option<Row>, CloneHead, Registry)> {
+        let row = self.records.get(CLONE_FAMILY, CLONE_HEAD, Consistency::Linearizable).await?;
+        let head: CloneHead = row.as_ref().map(|r| serde_json::from_slice(&r.value)).transpose()?.unwrap_or(CloneHead { version: 1, source_host: self.host.clone(), count: 0, bytes: 0 });
+        anyhow::ensure!(head.version == 1 && head.source_host == self.host && head.count <= CLONE_MAX && head.bytes <= CLONE_BYTES, "invalid or foreign clone provenance owner");
+        let rev = match &row { Some(r) => r.rev, None => self.records.head().await? };
+        let page = self.records.scan(CLONE_FAMILY, RecordScan { prefix: b"p/".to_vec(), after: None, limit: CLONE_MAX + 1, at: Consistency::Snapshot(rev) }).await?;
+        anyhow::ensure!(!page.more && page.rows.len() <= CLONE_MAX, "clone provenance exceeds bounded path count");
+        let mut projection = Registry::default(); let mut bytes = 0usize;
+        for row in page.rows {
+            bytes = bytes.checked_add(row.value.len()).ok_or_else(|| anyhow::anyhow!("clone metadata size overflow"))?;
+            anyhow::ensure!(bytes <= CLONE_BYTES && row.value.len() <= 65536, "clone metadata exceeds allocation budget");
+            let path: ClonePath = serde_json::from_slice(&row.value)?;
+            anyhow::ensure!(row.key == clone_key(&path.path) && projection.clones.insert(path.path, path.kept).is_none(), "invalid duplicate clone path identity");
+        }
+        projection.validate()?;
+        anyhow::ensure!(head.count == projection.clones.len() && head.bytes == bytes, "incomplete canonical clone provenance");
+        Ok((row, head, projection))
+    }
+    async fn change(&self, path: String, kept: Option<Kept>) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.fenced.load(Ordering::SeqCst), "clone metadata is fenced; restart to reconcile committed state");
+        Registry::validate_path(&path)?;
+        if let Some(kept) = &kept { Registry { clones: BTreeMap::from([(path.clone(), kept.clone())]) }.validate()?; }
+        let key = clone_key(&path);
+        let value = kept.map(|kept| serde_json::to_vec(&ClonePath { path: path.clone(), kept })).transpose()?;
+        anyhow::ensure!(value.as_ref().is_none_or(|v| v.len() <= 65536), "clone path provenance exceeds row budget");
+        for _ in 0..8 {
+            let header = self.records.get(CLONE_FAMILY, CLONE_HEAD, Consistency::Linearizable).await?.ok_or_else(|| anyhow::anyhow!("clone metadata not imported"))?;
+            let mut head: CloneHead = serde_json::from_slice(&header.value)?;
+            anyhow::ensure!(head.version == 1 && head.source_host == self.host, "foreign clone provenance owner");
+            let before = self.records.get(CLONE_FAMILY, &key, Consistency::Snapshot(header.rev)).await?;
+            if let Some(before) = &before { let old: ClonePath = serde_json::from_slice(&before.value)?; anyhow::ensure!(old.path == path, "clone path identity collision"); }
+            if before.as_ref().map(|r| &r.value) == value.as_ref() { return Ok(()); }
+            head.count = head.count.checked_sub(usize::from(before.is_some())).and_then(|n| n.checked_add(usize::from(value.is_some()))).ok_or_else(|| anyhow::anyhow!("clone count invalid"))?;
+            head.bytes = head.bytes.checked_sub(before.as_ref().map_or(0, |r| r.value.len())).and_then(|n| n.checked_add(value.as_ref().map_or(0, Vec::len))).ok_or_else(|| anyhow::anyhow!("clone size invalid"))?;
+            anyhow::ensure!(head.count <= CLONE_MAX && head.bytes <= CLONE_BYTES, "clone provenance exceeds aggregate metadata budget");
+            let mutation = match &value { Some(v) => clone_put(key.clone(), v.clone()), None => Write::Delete { family: CLONE_FAMILY.into(), key: key.clone() } };
+            let tx = Tx { conds: vec![clone_cond(CLONE_HEAD, Some(&header)), clone_cond(&key, before.as_ref())], writes: vec![clone_put(CLONE_HEAD.to_vec(), serde_json::to_vec(&head)?), mutation] };
+            match self.records.commit(tx).await {
+                Ok(_) => return Ok(()),
+                Err(Refusal::Conflict { .. }) => continue,
+                Err(error) => { self.fenced.store(true, Ordering::SeqCst); return Err(anyhow::anyhow!("clone provenance commit refused; metadata fenced until restart: {error}")); }
+            }
+        }
+        anyhow::bail!("clone provenance changed concurrently; retry this path mutation")
+    }
+}
+
 /// How often this machine looks at its repositories when nothing asks it to, and says so even if
 /// nothing changed.
 const LOOK_EVERY: Duration = Duration::from_secs(300);
@@ -77,6 +206,9 @@ struct Shared {
     token: Mutex<String>,
     news: Mutex<HashMap<String, (TaskNews, Instant)>>,
     registry: Mutex<Registry>,
+    metadata: CloneRecords,
+    metadata_error: Mutex<Option<String>>,
+    registry_gate: async_lock::Mutex<()>,
     /// The worker's own queue, to look again once a task is done.
     kick: async_channel::Sender<Job>,
     /// Folders a task is cloning into or deleting now: never two at once.
@@ -108,8 +240,16 @@ impl Shared {
         self.token.lock().clone()
     }
 
-    fn registry_file(&self) -> PathBuf {
-        self.dir.join("clones.json")
+    async fn persist_clone(&self, path: String, kept: Option<Kept>) -> anyhow::Result<()> {
+        let _gate = self.registry_gate.lock().await;
+        if let Err(error) = self.metadata.change(path.clone(), kept.clone()).await {
+            self.metadata.fenced.store(true, Ordering::SeqCst);
+            *self.metadata_error.lock() = Some(format!("clone metadata fenced; restart to reconcile {path}: {error:#}"));
+            return Err(error);
+        }
+        let mut projection = self.registry.lock();
+        match kept { Some(kept) => { projection.clones.insert(path, kept); }, None => { projection.clones.remove(&path); } }
+        Ok(())
     }
 
     fn bundle_file(&self, name: &str) -> PathBuf {
@@ -125,14 +265,15 @@ impl Shared {
 
 /// Starts this machine's worker (its state in `dir`, `<state>/sync`); what it says goes out through
 /// `say`. Hand it [`Job`]s.
-pub fn start(dir: PathBuf, me: String, http: Arc<Client>, server: String, say: async_channel::Sender<AgentMsg>) -> async_channel::Sender<Job> {
+pub async fn start(dir: PathBuf, me: String, http: Arc<Client>, server: String, say: async_channel::Sender<AgentMsg>, records: Arc<dyn Records>) -> anyhow::Result<async_channel::Sender<Job>> {
     let scan: Scan = Arc::new(|home, extra, kiln| Box::pin(git::look(home, extra, kiln)));
-    start_with(dir, me, http, server, say, crate::os::home_dir(), scan)
+    start_with(dir, me, http, server, say, (crate::os::home_dir(), scan), records).await
 }
 
-fn start_with(dir: PathBuf, me: String, http: Arc<Client>, server: String, say: async_channel::Sender<AgentMsg>, home: PathBuf, scan: Scan) -> async_channel::Sender<Job> {
+async fn start_with(dir: PathBuf, me: String, http: Arc<Client>, server: String, say: async_channel::Sender<AgentMsg>, scan: (PathBuf, Scan), records: Arc<dyn Records>) -> anyhow::Result<async_channel::Sender<Job>> {
+    let (home, scan) = scan;
     let (tx, rx) = async_channel::unbounded();
-    let registry = Registry::load(&dir.join("clones.json"));
+    let (metadata, registry) = CloneRecords::open(records, me.clone(), dir.clone()).await?;
     let shared = Arc::new(Shared {
         dir,
         me,
@@ -144,6 +285,9 @@ fn start_with(dir: PathBuf, me: String, http: Arc<Client>, server: String, say: 
         token: Mutex::new(String::new()),
         news: Mutex::new(HashMap::new()),
         registry: Mutex::new(registry),
+        metadata,
+        metadata_error: Mutex::new(None),
+        registry_gate: async_lock::Mutex::new(()),
         kick: tx.clone(),
         busy: Mutex::new(BTreeSet::new()),
         scan,
@@ -153,7 +297,7 @@ fn start_with(dir: PathBuf, me: String, http: Arc<Client>, server: String, say: 
         sharing: AtomicBool::new(false),
     });
     crate::rt::spawn(async move { Worker { s: shared, paths: Vec::new(), told: None, told_at: None, looked: None, looking: false, soon: true }.run(rx).await });
-    tx
+    Ok(tx)
 }
 
 struct Worker {
@@ -173,23 +317,23 @@ impl Worker {
     async fn run(mut self, rx: async_channel::Receiver<Job>) {
         loop {
             match crate::rt::timeout(Duration::from_secs(5), rx.recv()).await {
-                Ok(Ok(job)) => self.job(job),
+                Ok(Ok(job)) => self.job(job).await,
                 Ok(Err(_)) => return,
                 Err(_) => {}
             }
             while let Ok(job) = rx.try_recv() {
-                self.job(job);
+                self.job(job).await;
             }
             self.again();
             let due = self.looked.is_none_or(|t| t.elapsed() >= LOOK_EVERY);
             if self.s.connected.load(Ordering::SeqCst) && (self.soon || due) && !self.looking {
                 self.soon = false;
-                self.look();
+                self.look().await;
             }
         }
     }
 
-    fn job(&mut self, job: Job) {
+    async fn job(&mut self, job: Job) {
         match job {
             Job::Token(t) => *self.s.token.lock() = t,
             Job::Paths(p) => {
@@ -225,14 +369,11 @@ impl Worker {
                 crate::rt::spawn(async move { take_work(&s, *w).await });
             }
             Job::Order(Msg::Forget { path }) => {
-                let changed = self.s.registry.lock().clones.remove(&path).is_some();
-                if changed {
-                    let r = self.s.registry.lock().clone();
-                    if let Err(e) = r.save(&self.s.registry_file()) {
-                        tracing::warn!(error = %format!("{e:#}"), "the clones kiln made here could not be saved");
-                    }
-                    self.soon = true;
+                let path = git::expand(&path, &self.s.home).to_string_lossy().into_owned();
+                if let Err(error) = self.s.persist_clone(path.clone(), None).await {
+                    tracing::warn!(error = %format!("{error:#}"), %path, "clone provenance forget refused; no success published");
                 }
+                self.soon = true;
             }
             Job::Order(Msg::Bundle { task, path }) => {
                 let s = self.s.clone();
@@ -275,7 +416,16 @@ impl Worker {
 
     /// Starts looking at this machine's repositories. A look runs git in each one, which takes
     /// minutes on a busy machine with many: the orders that come meanwhile go on at once.
-    fn look(&mut self) {
+    async fn look(&mut self) {
+        let gate = self.s.registry_gate.lock().await;
+        match self.s.metadata.snapshot().await {
+            Ok((_, _, registry)) => *self.s.registry.lock() = registry,
+            Err(error) => {
+                self.s.metadata.fenced.store(true, Ordering::SeqCst);
+                *self.s.metadata_error.lock() = Some(format!("clone provenance read refused; metadata fenced: {error:#}"));
+                // Keep the last committed projection, visibly unavailable rather than empty.
+            }
+        }
         let (extra, kiln) = {
             let r = self.s.registry.lock();
             let kiln: BTreeSet<String> = r.clones.keys().cloned().collect();
@@ -283,6 +433,7 @@ impl Worker {
             extra.extend(self.paths.iter().map(|p| git::expand(p, &self.s.home)));
             (extra, kiln)
         };
+        drop(gate);
         self.looking = true;
         let (looking, kick) = ((self.s.scan)(self.s.home.clone(), extra, kiln), self.s.kick.clone());
         crate::rt::spawn(async move {
@@ -294,7 +445,7 @@ impl Worker {
     fn report(&mut self, looked: git::Looked) {
         self.looking = false;
         self.looked = Some(Instant::now());
-        let report = Repos { home: self.s.home.to_string_lossy().into_owned(), repos: looked.repos, error: looked.error, at: crate::util::now_unix() };
+        let report = Repos { home: self.s.home.to_string_lossy().into_owned(), repos: looked.repos, error: self.s.metadata_error.lock().clone().or(looked.error), at: crate::util::now_unix() };
         // Its folders of each repository with a remote, for sharing its work and taking others'.
         let mut folders: HashMap<String, Vec<(PathBuf, i64)>> = HashMap::new();
         for f in &report.repos {
@@ -446,6 +597,10 @@ async fn fetch_bundle(s: &Arc<Shared>, task: Option<&str>, batch: &str, hash: &s
 
 /// Clones what `order` says, and keeps the clone as kiln's.
 async fn clone(s: &Arc<Shared>, order: CloneOrder) {
+    if s.metadata.fenced.load(Ordering::SeqCst) {
+        s.tell(TaskNews::failed(&order.task, "clone metadata is fenced; restart to reconcile provenance before retrying"));
+        return;
+    }
     let task = order.task.clone();
     let path = git::expand(&order.path, &s.home).to_string_lossy().into_owned();
     let Some(_busy) = Busy::take(s, &path) else {
@@ -470,13 +625,10 @@ async fn clone(s: &Arc<Shared>, order: CloneOrder) {
     let _ = std::fs::remove_file(&bundle);
     match out {
         Ok((branch, head)) => {
-            let saved = {
-                let mut r = s.registry.lock();
-                r.clones.insert(path.clone(), Kept { key: order.key.clone(), task: task.clone(), at: crate::util::now_unix() });
-                r.clone()
-            };
-            if let Err(e) = saved.save(&s.registry_file()) {
-                tracing::warn!(error = %format!("{e:#}"), "the clones kiln made here could not be saved");
+            let kept = Kept { key: order.key.clone(), task: task.clone(), at: crate::util::now_unix() };
+            if let Err(error) = s.persist_clone(path.clone(), Some(kept)).await {
+                s.tell(TaskNews::failed(&task, format!("clone remains intact at {path}; provenance commit failed and metadata is fenced: {error:#}; restart to reconcile before retrying")));
+                return;
             }
             let what = match &branch {
                 Some(b) => format!("cloned {b} into {path}"),
@@ -602,7 +754,12 @@ async fn take_work(s: &Arc<Shared>, w: Work) {
 
 /// Deletes the folder of a repository moved away (or given up), if it is safe to.
 async fn delete(s: &Arc<Shared>, task: &str, path: &str, origin: Option<&str>) {
-    let Some(_busy) = Busy::take(s, path) else {
+    if s.metadata.fenced.load(Ordering::SeqCst) {
+        s.tell(TaskNews::failed(task, "clone metadata is fenced; restart to reconcile provenance before deleting"));
+        return;
+    }
+    let path = git::expand(path, &s.home).to_string_lossy().into_owned();
+    let Some(_busy) = Busy::take(s, &path) else {
         s.tell(TaskNews::failed(task, format!("another task is at {path} now")));
         return;
     };
@@ -610,16 +767,11 @@ async fn delete(s: &Arc<Shared>, task: &str, path: &str, origin: Option<&str>) {
     // Never kiln's own folders: its state, and where its binary is.
     let mut keep: Vec<PathBuf> = s.dir.parent().map(Path::to_path_buf).into_iter().collect();
     keep.extend(std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)));
-    match git::delete(&git::expand(path, &s.home), origin, &s.home, &keep).await {
+    match git::delete(Path::new(&path), origin, &s.home, &keep).await {
         Ok(()) => {
-            let saved = {
-                let mut r = s.registry.lock();
-                r.clones.remove(path).map(|_| r.clone())
-            };
-            if let Some(r) = saved
-                && let Err(e) = r.save(&s.registry_file())
-            {
-                tracing::warn!(error = %format!("{e:#}"), "the clones kiln made here could not be saved");
+            if let Err(error) = s.persist_clone(path.to_owned(), None).await {
+                s.tell(TaskNews::failed(task, format!("folder was deleted but clone provenance could not commit; metadata fenced until restart: {error:#}")));
+                return;
             }
             s.tell(TaskNews::new(task, "done", format!("deleted {path}")));
             let _ = s.kick.try_send(Job::Order(Msg::Look));
@@ -631,6 +783,93 @@ async fn delete(s: &Arc<Shared>, task: &str, path: &str, origin: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn u17_clone_provenance_import_restart_and_parallel_path_cas() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let file = dir.path().join("clones.json");
+        let original = dir.path().join("elsewhere/original").to_string_lossy().into_owned();
+        let kept = Kept { key: "example/repo".into(), task: "original-task".into(), at: 12 };
+        let bytes = serde_json::to_vec(&Registry { clones: BTreeMap::from([(original.clone(), kept.clone())]) })?;
+        std::fs::write(&file, &bytes)?;
+        let records: Arc<dyn Records> = Arc::new(crate::records::from_database(&crate::store::Store::in_memory()?.database(), "test-machine")?);
+        crate::rt::block_on(async move {
+            let (first, projection) = CloneRecords::open(records.clone(), "host".into(), dir.path().to_owned()).await?;
+            assert_eq!(projection.clones.get(&original), Some(&kept));
+            let (second, _) = CloneRecords::open(records.clone(), "host".into(), dir.path().to_owned()).await?;
+            let a = dir.path().join("arbitrary/a").to_string_lossy().into_owned();
+            let b = dir.path().join("arbitrary/b").to_string_lossy().into_owned();
+            let (one, two) = futures::join!(first.change(a.clone(), Some(kept.clone())), second.change(b.clone(), Some(kept.clone())));
+            one?; two?;
+            let (_, _, projection) = first.snapshot().await?;
+            assert_eq!(projection.clones.len(), 3, "concurrent path mutations preserve each other");
+            assert!(projection.clones.contains_key(&a) && projection.clones.contains_key(&b));
+            first.change(original.clone(), None).await?;
+            assert_eq!(std::fs::read(&file)?, bytes, "legacy input remains read-only");
+            std::fs::write(&file, b"obsolete malformed JSON")?;
+            let (_, projection) = CloneRecords::open(records.clone(), "host".into(), dir.path().to_owned()).await?;
+            assert!(!projection.clones.contains_key(&original) && projection.clones.len() == 2, "completed import never resurrects forgotten provenance");
+            assert!(CloneRecords::open(records.clone(), "foreign-host".into(), dir.path().to_owned()).await.is_err());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn u17_corrupt_or_duplicate_clone_import_never_becomes_empty_provenance() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let file = dir.path().join("clones.json");
+        let records: Arc<dyn Records> = Arc::new(crate::records::from_database(&crate::store::Store::in_memory()?.database(), "test-machine")?);
+        crate::rt::block_on(async move {
+            let before = records.head().await?;
+            std::fs::write(&file, b"broken")?;
+            assert!(CloneRecords::open(records.clone(), "host".into(), dir.path().to_owned()).await.is_err());
+            assert_eq!(records.head().await?, before);
+            let path = serde_json::to_string(&dir.path().join("clone").to_string_lossy())?;
+            let kept = serde_json::to_string(&Kept { key: "repo".into(), task: "task".into(), at: 1 })?;
+            std::fs::write(&file, format!("{{\"clones\":{{{path}:{kept},{path}:{kept}}}}}"))?;
+            assert!(CloneRecords::open(records.clone(), "host".into(), dir.path().to_owned()).await.is_err());
+            assert_eq!(records.head().await?, before, "no canonical rows or marker on corrupt import");
+            std::fs::write(&file, b"{\"clones\":{}}")?;
+            assert!(CloneRecords::open(records, "host".into(), dir.path().to_owned()).await.is_ok());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn u17_clone_commit_refusal_preserves_folder_and_reports_failure() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let src = dir.path().join("source");
+        std::fs::create_dir(&src)?;
+        for args in [&["init", "-q", "-b", "main"][..], &["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "first"]] {
+            let mut git = std::process::Command::new("git");
+            git.arg("-C").arg(&src).args(args).env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1");
+            anyhow::ensure!(git.status()?.success(), "git setup failed");
+        }
+        let records: Arc<dyn Records> = Arc::new(kiln_seams::records::SimRecords::with_limits(kiln_seams::records::SimLimits { rows: 2, ..Default::default() }));
+        crate::rt::block_on(async move {
+            let (metadata, projection) = CloneRecords::open(records.clone(), "host".into(), dir.path().join("state")).await?;
+            // Import consumed the two allowed rows (owner and marker): the clone's row is refused.
+            let (say, heard) = async_channel::unbounded();
+            let (kick, _) = async_channel::unbounded();
+            let scan: Scan = Arc::new(|_, _, _| Box::pin(async { git::Looked { repos: Vec::new(), error: None } }));
+            let s = Arc::new(Shared { dir: dir.path().join("state"), me: "host".into(), home: dir.path().to_owned(), http: Arc::new(Client::new(crate::http::client::Roots::WebPki, None)?), server: "http://127.0.0.1:9".into(), say, connected: AtomicBool::new(true), token: Mutex::new(String::new()), news: Mutex::new(HashMap::new()), registry: Mutex::new(projection), metadata, metadata_error: Mutex::new(None), registry_gate: async_lock::Mutex::new(()), kick, busy: Mutex::new(BTreeSet::new()), scan, slots: Mutex::new(Vec::new()), folders: Mutex::new(HashMap::new()), shared: Mutex::new(HashMap::new()), sharing: AtomicBool::new(false) });
+            let path = dir.path().join("clone");
+            let order = CloneOrder { task: "task".into(), key: "repo".into(), path: path.to_string_lossy().into_owned(), url: Some(src.to_string_lossy().into_owned()), ..CloneOrder::default() };
+            clone(&s, order).await;
+            assert!(path.join(".git").is_dir(), "successfully cloned folder is never removed for metadata refusal");
+            assert!(s.registry.lock().clones.is_empty(), "uncommitted provenance never enters read projection");
+            assert!(s.metadata.fenced.load(Ordering::SeqCst));
+            let mut completed = Vec::new();
+            while let Ok(AgentMsg::Sync { json, .. }) = heard.try_recv() {
+                if let Some(Msg::Task(news)) = wire::decode(&json) && news.over() { completed.push(news); }
+            }
+            assert_eq!(completed.len(), 1);
+            assert!(completed.iter().all(|n| n.state == "failed" && n.error.as_ref().is_some_and(|e| e.contains("remains intact") && e.contains("fenced"))));
+            let (_, _, registry) = s.metadata.snapshot().await?;
+            assert!(registry.clones.is_empty(), "refused transaction did not partially publish path metadata");
+            Ok(())
+        })
+    }
 
     #[test]
     fn an_order_goes_on_at_once_while_a_slow_look_is_under_way() -> anyhow::Result<()> {
@@ -657,7 +896,8 @@ mod tests {
             });
             let (say, heard) = async_channel::unbounded();
             let http = Arc::new(Client::new(crate::http::client::Roots::WebPki, None)?);
-            let jobs = start_with(dir.path().join("state"), "me".into(), http, "http://127.0.0.1:9".into(), say, home.clone(), scan);
+            let records: Arc<dyn Records> = Arc::new(crate::records::from_database(&crate::store::Store::in_memory()?.database(), "test-machine")?);
+            let jobs = start_with(dir.path().join("state"), "me".into(), http, "http://127.0.0.1:9".into(), say, (home.clone(), scan), records).await?;
             jobs.send(Job::Connected(true)).await?;
             crate::rt::timeout(Duration::from_secs(10), started.recv()).await??;
             let order = CloneOrder { task: "t1".into(), key: "k".into(), path: home.join("b").to_string_lossy().into_owned(), url: Some(src.to_string_lossy().into_owned()), ..CloneOrder::default() };

@@ -3,9 +3,11 @@
 //! log did with each) and what else happened to it: a copy added, going offline and coming back,
 //! errors, steps let go, contents asked for again, conflicts resolved, agent sessions moving with
 //! its files. The server's owner of the groups writes it; the API reads it. The newest [`KEEP`] of
-//! each repo are kept, saved beside its tree, so a restart doesn't blank it.
+//! each repo are kept in the host's Amphora Records (U17), so a restart doesn't blank it.
+//! Historical JSON beside the tree is read-only import input.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+#[cfg(test)]
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -184,11 +186,12 @@ pub fn step_event(index: u64, step: &Step, decisions: &[Decision], commit_ms: Op
 }
 
 /// Every synced repo's events.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Activity {
     repos: HashMap<String, VecDeque<Event>>,
     next: u64,
     /// Repos with events not saved yet.
+    #[serde(skip)]
     dirty: HashSet<String>,
 }
 
@@ -197,8 +200,63 @@ fn file(dir: &Path, repo: &str) -> PathBuf {
     dir.join(format!("{safe}.activity.json"))
 }
 
+pub(super) type SourceDigests = Vec<(String, Option<String>)>;
+
 impl Activity {
+    /// U17: checked read-only compatibility input; corruption must never become an empty history.
+    pub(super) fn import_checked(dir: &Path, ids: impl IntoIterator<Item = String>, mut budget: usize) -> anyhow::Result<(Self, SourceDigests)> {
+        let mut out = Self::default();
+        let mut sequences = HashSet::new();
+        let mut sources = Vec::new();
+        for id in ids {
+            let bytes = match crate::sync::server::metadata::read_source_with_budget(&file(dir, &id), budget) {
+                Ok(Some(bytes)) => bytes,
+                Err(e) => return Err(e),
+                Ok(None) => { sources.push((format!("{id}.activity.json"), None)); continue; },
+            };
+            budget = budget.checked_sub(bytes.len()).ok_or_else(|| anyhow::anyhow!("sync activity exceeds aggregate source budget"))?;
+            sources.push((format!("{id}.activity.json"), Some(crate::util::sha256_hex(&bytes))));
+            let events: VecDeque<Event> = serde_json::from_slice(&bytes)?;
+            anyhow::ensure!(events.len() <= KEEP, "sync history exceeds its per-repo bound");
+            let mut previous = None;
+            for e in &events {
+                anyhow::ensure!(e.repo == id && previous.is_none_or(|seq| e.seq > seq) && sequences.insert(e.seq), "invalid sync history identity or sequence");
+                out.next = out.next.max(e.seq.checked_add(1).ok_or_else(|| anyhow::anyhow!("sync activity sequence exhausted"))?);
+                previous = Some(e.seq);
+            }
+            out.dirty.insert(id.clone());
+            out.repos.insert(id, events);
+        }
+        Ok((out, sources))
+    }
+
+    /// U17: forget canonical history without modifying the read-only import source.
+    pub(super) fn forget_record(&mut self, repo: &str) { self.repos.remove(repo); self.dirty.insert(repo.to_owned()); }
+
+    pub(super) fn changed(&self) -> impl Iterator<Item = &String> { self.dirty.iter() }
+    pub(super) fn ring(&self, repo: &str) -> Option<&VecDeque<Event>> { self.repos.get(repo) }
+    pub(super) fn from_saved(repos: HashMap<String, VecDeque<Event>>, next: u64) -> anyhow::Result<Self> {
+        let mut sequences = HashSet::new();
+        for (id, ring) in &repos {
+            anyhow::ensure!(ring.len() <= KEEP, "canonical sync history exceeds bound");
+            let mut previous = None;
+            for e in ring {
+                anyhow::ensure!(&e.repo == id && e.seq < next && previous.is_none_or(|seq| e.seq > seq) && sequences.insert(e.seq), "invalid canonical sync history sequence");
+                previous = Some(e.seq);
+            }
+        }
+        Ok(Self { repos, next, dirty: HashSet::new() })
+    }
+    /// U19: copy only changed bounded rings into the API's committed snapshot.
+    pub(super) fn publish_to(&mut self, shared: &mut Self) {
+        for id in std::mem::take(&mut self.dirty) {
+            match self.repos.get(&id) { Some(ring) => { shared.repos.insert(id, ring.clone()); }, None => { shared.repos.remove(&id); } }
+        }
+        shared.next = self.next;
+    }
+
     /// The events saved under `dir` for the repos `ids`.
+    #[cfg(test)]
     pub fn load<'a>(dir: &Path, ids: impl IntoIterator<Item = &'a str>) -> Self {
         let mut out = Self::default();
         for id in ids {
@@ -225,6 +283,7 @@ impl Activity {
     }
 
     /// Saves the repos with new events.
+    #[cfg(test)]
     pub fn save(&mut self, dir: &Path) -> io::Result<()> {
         for repo in std::mem::take(&mut self.dirty) {
             let Some(ring) = self.repos.get(&repo) else { continue };
@@ -238,6 +297,7 @@ impl Activity {
     }
 
     /// A repo no longer synced: its events go, saved or not.
+    #[cfg(test)]
     pub fn forget(&mut self, dir: &Path, repo: &str) {
         self.repos.remove(repo);
         self.dirty.remove(repo);

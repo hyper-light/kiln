@@ -158,13 +158,13 @@ pub async fn validate(cx: Cx, v: Value) -> Out {
         None => (String::new(), "main".to_owned()),
     };
     // The repository at trunk, for what renders read.
-    let (dir, auth) = (cx.cd.mirror_dir(&url), cx.cd.git_auth(&url));
-    let (u, t) = (url.clone(), trunk.clone());
+    let source = cx.cd.read_context(&url);
+    let t = trunk.clone();
     let at = if url.is_empty() {
         None
     } else {
-        crate::rt::blocking(move || -> anyhow::Result<(Mirror, String)> {
-            let m = Mirror::open(&dir, &u, auth)?;
+        crate::rt::blocking_in(crate::rt::SHARE_GIT_MIRROR_IO, move || -> anyhow::Result<(Mirror, String)> {
+            let m = source.open()?;
             m.fetch()?;
             let c = m.resolve(&t)?;
             Ok((m, c))

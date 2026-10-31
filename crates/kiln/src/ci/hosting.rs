@@ -620,7 +620,7 @@ pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req:
         && crate::gitops::run_git(hub, &["-C", &p, "symbolic-ref", "HEAD", &format!("refs/heads/{first}")], crate::gitops::LS_REMOTE_TIMEOUT).await.is_ok()
     {
         let (id, branch) = (repo.id.clone(), first.to_owned());
-        if let Err(e) = hub.store.call(move |c| Ok(c.execute("UPDATE repos SET default_branch = ?2 WHERE id = ?1", rusqlite::params![id, branch])?)).await {
+        if let Err(e) = hub.store.call(move |c| Ok(c.execute("UPDATE repos SET default_branch = ?2 WHERE id = ?1", crate::sql::params![id, branch])?)).await {
             tracing::warn!(repo = %repo.name, error = %format!("{e:#}"), "the default branch could not be recorded");
         }
         said.push(format!("{first} is the repository's default branch: the first pushed"));
@@ -688,12 +688,12 @@ async fn keep_pushers(hub: &Hub, repo: &Repo, updates: &[Update], started_by: Op
             let now = crate::util::now_unix();
             let tx = crate::store::tx(c)?;
             for (r, sha) in moved {
-                tx.execute("DELETE FROM ci_pushes WHERE repo_id = ?1 AND ref = ?2", rusqlite::params![id, r])?;
+                tx.execute("DELETE FROM ci_pushes WHERE repo_id = ?1 AND ref = ?2", crate::sql::params![id, r])?;
                 // Whoever may use every secret leaves nothing to hold its runs to.
                 if let Some(b) = &by
                     && sha != ZERO
                 {
-                    tx.execute("INSERT OR REPLACE INTO ci_pushes (repo_id, ref, sha, started_by, ts) VALUES (?1, ?2, ?3, ?4, ?5)", rusqlite::params![id, r, sha, b, now])?;
+                    tx.execute("INSERT OR REPLACE INTO ci_pushes (repo_id, ref, sha, started_by, ts) VALUES (?1, ?2, ?3, ?4, ?5)", crate::sql::params![id, r, sha, b, now])?;
                 }
             }
             tx.execute("DELETE FROM ci_pushes WHERE ts < ?1", [now - 30 * 86_400])?;

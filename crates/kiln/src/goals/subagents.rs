@@ -28,7 +28,7 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use rusqlite::{OptionalExtension as _, params};
+use crate::sql::{OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 
 use super::{Action, At, By, CHANGING, Item, NewGoal, Pausing, Stack, descendants, renumber, touch};
@@ -207,7 +207,7 @@ pub(super) async fn graph_of(store: &crate::store::Store, stack: &Stack) -> anyh
 
 /// [`graph_of`], in the store: each run's plan version read once. A plan gone, or one whose steps
 /// say nothing of waiting, leaves its steps out (they go in the stack's order).
-fn graph_in(c: &rusqlite::Connection, steps: &[Item]) -> anyhow::Result<Graph> {
+fn graph_in(c: &crate::sql::Connection, steps: &[Item]) -> anyhow::Result<Graph> {
     let mut g = Graph::default();
     let mut runs: Vec<(String, i64, String)> = Vec::new();
     for s in steps.iter().filter_map(|i| i.step.as_ref()) {
@@ -760,6 +760,8 @@ mod hub_tests {
             c.conversations.off = true;
         })
         .await?;
+        // U17: complete restoration before this fixture accepts session starts.
+        crate::harness::registry::Registry::initialize_local(&hub).await?;
         let h = Arc::clone(&hub);
         crate::rt::spawn(async move {
             let _ = crate::harness::registry::Registry::run_local(h).await;

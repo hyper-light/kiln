@@ -51,7 +51,7 @@ kiln-search = { path = "../kiln-search" }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 anyhow = "1.0.104"
 base64 = "0.23.1"
-bytes = "1.12.1"
+bytes = { version = "1.12.1", features = ["serde"] }
 clap = { version = "4.6.7", features = ["derive", "env"] }
 futures = "0.3.34"
 glob = "0.3.4"
@@ -67,16 +67,19 @@ mime_guess = "2.0.5"
 parking_lot = "0.12.5"
 portable-pty = "0.9.0"
 rand = "0.10.3"
-rusqlite = { version = "0.40.2", features = ["bundled", "backup"] }
-# The conversation store's engine (docs/conversations.md): Turso, vendored (vendor/turso), Rust
-# only: no simd and pure-Rust crypto, so no C is compiled; no fts (it needs C on musl).
+# U05: SQLite remains only for read-only legacy/provider inputs.
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+amphora = "=0.1.0"
+amphora-api = "=0.1.0"
+# Read-only legacy imports and provider inputs: Turso, vendored (vendor/turso), Rust only.
+# No simd; pure-Rust crypto; no fts (it needs C on musl). Amphora owns live host storage.
 turso_core = { path = "../../vendor/turso/core", default-features = false, features = ["fs", "json", "pure-rust-crypto"] }
 rust-embed = "8.13.0"
 # kiln's own operations' inputs: their JSON Schemas generated from their Rust types (`crate::ops::Input`),
 # and where an input that doesn't fit went wrong.
 schemars = "1.2.3"
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.154"
+serde = { version = "1.0.229", features = ["derive", "rc"] }
+serde_json = { version = "1.0.154", features = ["raw_value"] }
 serde_path_to_error = "0.1.20"
 serde_yaml = "0.9.34"
 sha2 = "0.11.1"
@@ -100,7 +103,6 @@ http = "1.5.0"
 http-body = "1.1.0"
 http-body-util = "0.1.5"
 async-channel = "2.5.0"
-async-broadcast = "0.7.2"
 event-listener = "5.4.2"
 webpki-roots = "1.0.9"
 flate2 = "1.1.10"
@@ -137,6 +139,9 @@ winapi-util = "0.1.11"
 [lints]
 workspace = true
 
+[dependencies.tempfile]
+version = "3.27.0"
+
 [dev-dependencies]
 # The UI's wire types, rendered to ui/src/api/wire/ by `wire::ts` (test builds alone: the release
 # binary doesn't carry it).
@@ -144,7 +149,6 @@ ts-rs = { version = "12.0.1", features = ["serde-json-impl", "no-serde-warnings"
 kiln-ci = { path = "../kiln-ci", features = ["ts"] }
 kiln-cd = { path = "../kiln-cd", features = ["ts"] }
 kiln-sim = { path = "../kiln-sim" }
-tempfile = "3.27.0"
 # hyper-durable's RamStore, for sync's tests alone: kiln's copy compiles it only where a test asks
 # (vendor/hyper-raft/UPSTREAM.md).
 hyper-durable = { version = "=0.1.0", features = ["test-store"] }

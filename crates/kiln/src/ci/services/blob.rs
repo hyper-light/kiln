@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use http::{Method, StatusCode, header};
-use rusqlite::{OptionalExtension, params};
+use crate::sql::{OptionalExtension, params};
 
 use super::cas;
 use crate::ci::Fail;

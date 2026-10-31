@@ -1,5 +1,24 @@
 # kiln without a server
 
+> **U15 cutover (2026-10-29):** the Kiln preupdate capture, host-owned cluster group, learner
+> bootstrap copies, learner retry controller, conversation feed/mirror replication and frontdoor
+> catch-up reads described below are retired. Their wire indices remain reserved and decoded for
+> explicit compatibility refusal. Record durability, recovery, membership and consistency belong
+> to Amphora. Kiln's `Amphora` wire frames carry opaque product messages on authenticated routes;
+> neither receipt of a frame nor a connected replica is a durability acknowledgement. The
+> serverless topology below remains a design goal; hub-relayed transport alone cannot provide
+> availability while the hub is down.
+> Legacy import requires an offline cutover source. The pinned SQL source point is checked
+> against the retained legacy log's durable commit before import; a recoverable tail or uncertain
+> log requires offline recovery first. Neither a legacy log nor a partial product restore is
+> discarded to make startup succeed.
+> During an overlapping upgrade, an SDK client uses the existing product owner and passes
+> application traffic without claiming a replication route. Product `ensure_owner` decides when
+> that client can become the local owner; Kiln then starts one carrier and reconnects with its
+> actual transport capability. A successor waits for its predecessor's authenticated route to
+> close, with a bounded deadline, rather than displacing it because it connected more recently.
+
+
 > **Approved** (2026-10-22), with three decisions taken: three nodes by default on Kubernetes, the
 > CA and secrets sealed in shares two of three voters open, and the phases without a server first,
 > Amphora and Mantle under them after. How voters are chosen and elections held is

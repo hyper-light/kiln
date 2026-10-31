@@ -99,6 +99,9 @@ pub enum ToGuest {
     Serve(Box<Service>),
     /// The deployment is over: its service stopped, then the microVM.
     Stop,
+    /// U03: inherited execution arrives only over PID 1's host-vsock bootstrap. Keep this
+    /// appended: the existing variants and LegStart are postcard wire formats.
+    OwnedLeg { start: Box<LegStart>, parent: kiln_ci::wire::ParentBinding },
 }
 
 /// A leg for the guest's runner.
@@ -289,7 +292,7 @@ fn system(root: &str) -> anyhow::Result<()> {
 /// its own after.
 fn leg() -> anyhow::Result<()> {
     enter()?;
-    let (start, conn) = take_leg()?;
+    let (start, parent, conn) = take_leg()?;
     fresh(&start);
     #[allow(unsafe_code)]
     // SAFETY: PID 1 has one thread here (no runtime has started and nothing has spawned one), so
@@ -297,7 +300,7 @@ fn leg() -> anyhow::Result<()> {
     let forked = unsafe { nix::unistd::fork() }.context("starting the leg's runner")?;
     match forked {
         nix::unistd::ForkResult::Child => {
-            let code = runner(start, conn);
+            let code = runner(start, parent, conn);
             #[allow(clippy::exit)]
             std::process::exit(code)
         }
@@ -308,7 +311,8 @@ fn leg() -> anyhow::Result<()> {
 
 /// The host dialled (again and again until it listens: a snapshot's template waits here) and the
 /// leg taken.
-fn take_leg() -> anyhow::Result<(Box<LegStart>, UnixStream)> {
+fn take_leg() -> anyhow::Result<(Box<LegStart>, super::processes::ParentExecution, UnixStream)> {
+    anyhow::ensure!(std::process::id() == 1, "inherited guest execution requires PID 1's host bootstrap");
     // What's written so far is on its disk: a snapshot taken from here goes with that disk.
     nix::unistd::sync();
     eprintln!("{WAITING}");
@@ -319,8 +323,20 @@ fn take_leg() -> anyhow::Result<(Box<LegStart>, UnixStream)> {
         }
     };
     send(&mut conn, &FromGuest::Ready)?;
-    match recv::<ToGuest>(&mut conn)? {
-        Some(ToGuest::Leg(start)) => Ok((start, conn)),
+    let (start, parent) = owned_leg(recv::<ToGuest>(&mut conn)?)?;
+    Ok((start, parent, conn))
+}
+
+/// U03: only take_leg's PID 1 host-vsock connection supplies this envelope in production.
+fn owned_leg(frame: Option<ToGuest>) -> anyhow::Result<(Box<LegStart>, super::processes::ParentExecution)> {
+    match frame {
+        Some(ToGuest::OwnedLeg { start, parent }) => {
+            let a: kiln_ci::wire::AssignmentV2 = serde_json::from_str(&start.assignment).context("the inherited leg's assignment")?;
+            anyhow::ensure!(a.parent_binding.as_ref() == Some(&parent), "U03: the host envelope differs from the assignment's executor ownership");
+            let parent = super::processes::ParentExecution::verified(parent, &a.job_id, a.attempt)?;
+            Ok((start, parent))
+        }
+        Some(ToGuest::Leg(_)) => anyhow::bail!("U03: the host sent a leg without inherited executor ownership"),
         Some(other) => anyhow::bail!("the host sent {other:?} where a leg goes"),
         None => anyhow::bail!("the host hung up before sending the leg"),
     }
@@ -462,11 +478,11 @@ pub fn blocked() -> Option<async_channel::Receiver<String>> {
 
 /// The forked runner: dialled in, given its leg, then the leg run on a runtime of its own. Its
 /// exit code is 0 when it ran the leg to its result, whatever that was.
-fn runner(start: Box<LegStart>, conn: UnixStream) -> i32 {
+fn runner(start: Box<LegStart>, parent: super::processes::ParentExecution, conn: UnixStream) -> i32 {
     match prepare(&start) {
         Ok(()) => {
             crate::rt::configure(crate::rt::Profile::agent());
-            match crate::rt::block_on(run(*start, conn)) {
+            match crate::rt::block_on(run(*start, parent, conn)) {
                 Ok(()) => 0,
                 Err(e) => {
                     eprintln!("kiln guest: {e:#}");
@@ -579,8 +595,15 @@ enum Ev {
 /// The leg, run: frames to the host on a thread of their own, the host's on another. Its result
 /// goes once every event before it has; a kept leg keeps the microVM, its terminals and its reruns,
 /// until it's let go.
-async fn run(start: LegStart, conn: UnixStream) -> anyhow::Result<()> {
+async fn run(start: LegStart, parent: super::processes::ParentExecution, conn: UnixStream) -> anyhow::Result<()> {
     let a: kiln_ci::wire::AssignmentV2 = serde_json::from_str(&start.assignment).context("the leg's assignment")?;
+    let execution = super::processes::Execution::inherited(PathBuf::from(WORK), a.job_id.clone(), a.attempt, parent)?;
+    let result = execution.scope(run_owned(start, a, conn, Arc::clone(&execution))).await;
+    execution.stop().await;
+    result
+}
+
+async fn run_owned(start: LegStart, a: kiln_ci::wire::AssignmentV2, conn: UnixStream, execution: Arc<super::processes::Execution>) -> anyhow::Result<()> {
     let job = a.job_id.clone();
     let (out_tx, out_rx) = async_channel::unbounded::<FromGuest>();
     let (mut reader, mut writer) = (conn.try_clone()?, conn);
@@ -621,8 +644,12 @@ async fn run(start: LegStart, conn: UnixStream) -> anyhow::Result<()> {
         http,
         warm: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         cache_max: start.cache_max,
+        legacy: None,
     };
+    // U03: this child fences local spawns but owns no host grant or kernel domain. Its result
+    // is provisional; only the host can prove the VMM's physical domain has stopped.
     let result = leg.run().await;
+    execution.stop().await;
     let _ = result_tx.send(result).await;
     // Kept (W17-R02): here until its keep runs out or it's let go.
     while super::kept::kept_until(&job).is_some() {
@@ -770,7 +797,7 @@ async fn serve(
             Ev::Host(ToGuest::RerunStep { step, idx }) => {
                 let _ = super::runtime::rerun_step(&job, step, idx);
             }
-            Ev::Host(ToGuest::Leg(_) | ToGuest::Build(_) | ToGuest::Serve(_) | ToGuest::Stop) => {}
+            Ev::Host(ToGuest::Leg(_) | ToGuest::OwnedLeg { .. } | ToGuest::Build(_) | ToGuest::Serve(_) | ToGuest::Stop) => {}
             Ev::Pty(session, PtyOut::Data(data)) => {
                 if let Some((_, state)) = terms.get(&session) {
                     state.output(&data);
@@ -1377,6 +1404,25 @@ mod tests {
         assert!(matches!(recv::<ToGuest>(&mut r)?, Some(ToGuest::Blocked(b)) if b == "example.com:443"));
         assert!(matches!(recv::<FromGuest>(&mut r)?, Some(FromGuest::Built(Some(e))) if e == "no space"));
         assert!(recv::<ToGuest>(&mut r)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn u03_inherited_bootstrap_rejects_unowned_and_stale_attempts() -> anyhow::Result<()> {
+        let parent = kiln_ci::wire::ParentBinding { executor: "executor-one".into(), generation: "generation-one".into(), allocation: "existing-grant".into(), physical_execution: "host-execution".into(), job: "job-one".into(), attempt: 2 };
+        let a = kiln_ci::wire::AssignmentV2 { job_id: parent.job.clone(), attempt: parent.attempt, parent_binding: Some(parent.clone()), ..Default::default() };
+        let start = || -> anyhow::Result<Box<LegStart>> { Ok(Box::new(LegStart { assignment: serde_json::to_string(&a)?, ..Default::default() })) };
+        assert!(owned_leg(Some(ToGuest::Leg(start()?))).is_err());
+        let mut stale = parent.clone();
+        stale.attempt = 1;
+        assert!(owned_leg(Some(ToGuest::OwnedLeg { start: start()?, parent: stale })).is_err());
+        let mut other = parent.clone();
+        other.job = "job-two".into();
+        assert!(owned_leg(Some(ToGuest::OwnedLeg { start: start()?, parent: other })).is_err());
+        let mut bytes = Vec::new();
+        send(&mut bytes, &ToGuest::OwnedLeg { start: start()?, parent: parent.clone() })?;
+        let (_, verified) = owned_leg(recv(&mut io::Cursor::new(bytes))?)?;
+        assert_eq!(verified.binding(), &parent);
         Ok(())
     }
 }

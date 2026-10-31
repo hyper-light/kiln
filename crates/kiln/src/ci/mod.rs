@@ -34,6 +34,7 @@ pub mod insights;
 pub mod land;
 pub mod integrations;
 pub mod load;
+pub mod legacy;
 pub mod local;
 pub mod logsearch;
 pub mod notify;

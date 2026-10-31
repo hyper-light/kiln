@@ -21,7 +21,7 @@
 
 use http::{Method, StatusCode};
 use kiln_ci::plan::perms::Level;
-use rusqlite::{OptionalExtension as _, params};
+use crate::sql::{OptionalExtension as _, params};
 use serde_json::{Value, json};
 
 use super::repos::Site;
@@ -102,7 +102,7 @@ async fn counts(s: &Site<'_>, d: &Diff) -> (i64, i64) {
     s.hub
         .store
         .call(move |c| {
-            let n = |file: bool| -> rusqlite::Result<i64> {
+            let n = |file: bool| -> crate::sql::Result<i64> {
                 c.query_row(
                     &format!("SELECT COUNT(*) FROM review_comments c JOIN review_threads t ON t.id = c.thread_id WHERE t.diff_id = ?1 AND c.published = 1 AND c.deleted_at IS NULL AND t.file IS {} NULL", if file { "NOT" } else { "" }),
                     [&id],

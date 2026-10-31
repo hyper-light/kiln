@@ -3,11 +3,12 @@
 //! `kiln.research.*`, and the console's `/api/research` routes. And `conversations.search`: every
 //! agent's conversations, for what an agent looks into inside kiln.
 
-use http::{Method, StatusCode};
+use crate::authz::At as ScopeAt;
+use http::StatusCode;
 use serde_json::{Value, json};
 
 use super::{Add, Error, Research};
-use crate::ops::{Cx, Fail, Input, Op, Out, path};
+use crate::ops::{Cx, Fail, Input, Op, Out, Definition, Part, Routes};
 
 fn fail(e: Error) -> Fail {
     match e {
@@ -146,7 +147,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: false,
             input: Input::of::<input::ResearchStart>(),
-            route: |_| Ok((Method::POST, path(&["api", "research"]))),
+            route: Routes(vec![Definition::new("POST", &[Part::Literal("api"), Part::Literal("research")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(start(cx, v)),
         },
         Op {
@@ -155,7 +156,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: false,
             input: Input::of::<input::ResearchAdd>(),
-            route: |v| Ok((Method::POST, path(&["api", "research", &id_of(v)?, "findings"]))),
+            route: Routes(vec![Definition::new("POST", &[Part::Literal("api"), Part::Literal("research"), Part::Field("id"), Part::Literal("findings")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(add(cx, v)),
         },
         Op {
@@ -164,7 +165,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: true,
             destructive: false,
             input: Input::of::<input::ResearchGet>(),
-            route: |v| Ok((Method::GET, path(&["api", "research", &id_of(v)?]))),
+            route: Routes(vec![Definition::new("GET", &[Part::Literal("api"), Part::Literal("research"), Part::Field("id")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(get(cx, v)),
         },
         Op {
@@ -173,7 +174,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: true,
             destructive: false,
             input: Input::of::<input::ResearchList>(),
-            route: |_| Ok((Method::GET, path(&["api", "research"]))),
+            route: Routes(vec![Definition::new("GET", &[Part::Literal("api"), Part::Literal("research")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(list(cx, v)),
         },
         Op {
@@ -182,7 +183,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: true,
             destructive: false,
             input: Input::of::<input::ConversationsSearch>(),
-            route: |_| Ok((Method::GET, path(&["api", "harness", "conversations", "search"]))),
+            route: Routes(vec![Definition::new("GET", &[Part::Literal("api"), Part::Literal("harness"), Part::Literal("conversations"), Part::Literal("search")], &[], "agents.run", ScopeAt::Server)]),
             run: |cx, v| Box::pin(search(cx, v)),
         },
     ]

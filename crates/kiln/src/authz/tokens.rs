@@ -2,7 +2,7 @@
 //! Argo CD's read token for a release repository. It reads that repository over git
 //! (`git.read@repo:<name>`, which only git hosting honors) and nothing else: no push, no API.
 
-use rusqlite::params;
+use crate::sql::params;
 use serde_json::json;
 
 use super::{Grant, Scope};

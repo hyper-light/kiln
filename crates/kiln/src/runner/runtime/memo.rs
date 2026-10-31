@@ -618,8 +618,12 @@ impl Leg {
         let Some((store, scope)) = self.local_store().await else { return };
         let kept = crate::rt::blocking(move || -> anyhow::Result<()> {
             for p in paths {
-                let (digest, _) = store.put_file(&p)?;
-                store.hold(&scope, &digest)?;
+                let publication = match store.put_file_guarded(&p) {
+                    Ok(p) => p,
+                    Err(e) if crate::runner::cache::Local::declined(&e) => continue,
+                    Err(e) => return Err(e),
+                };
+                store.hold(&scope, &publication.digest)?;
             }
             Ok(())
         })
@@ -832,6 +836,7 @@ mod tests {
     use crate::exec::{Up, Uplink};
     use crate::proto::{AgentMsg, JobResult};
     use crate::rt::Shutdown;
+    use crate::runner::processes::Admission;
     use kiln_ci::wire::{AssignmentV2, JobEventV2};
     use std::sync::Arc;
 
@@ -871,7 +876,7 @@ mod tests {
     /// The first job of `workflow` (the kiln dialect), run as `leg` of `run` against the server at
     /// `base`, in a workspace holding `files` as one commit; what it sent goes into `hub`'s logs, as
     /// a server keeps them.
-    async fn run(hub: &crate::hub::Hub, base: &str, token: &str, (run, leg): (&str, &str), work: &Path, workflow: &str, files: &[(&str, &str)]) -> anyhow::Result<Sent> {
+    async fn run(hub: &crate::hub::Hub, base: &str, token: &str, (run, leg): (&str, &str), (work, admission): (&Path, &Admission), workflow: &str, files: &[(&str, &str)]) -> anyhow::Result<Sent> {
         let (w, d) = kiln_ci::wf::parse_workflow(".kiln/ci.yaml", workflow, kiln_ci::expr::Dialect::Kiln);
         anyhow::ensure!(d.iter().all(|x| !x.is_error()), "{d:?}");
         let job = w.and_then(|w| w.jobs.into_iter().next()).ok_or_else(|| anyhow::anyhow!("no job"))?;
@@ -901,8 +906,8 @@ mod tests {
             ..AssignmentV2::default()
         };
         let (tx, rx) = async_channel::unbounded();
-        let l = Leg { a, work_dir: work.to_path_buf(), runner_name: "runner-a".into(), up: Uplink(tx), cancel: Shutdown::new(), http: Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None };
-        let result = l.run().await;
+        let l = Leg { a, work_dir: work.to_path_buf(), runner_name: "runner-a".into(), up: Uplink(tx), cancel: Shutdown::new(), http: Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None, legacy: None };
+        let result = l.run_in(admission.clone()).await;
         let (mut logs, mut events) = (BTreeMap::<u32, String>::new(), Vec::new());
         while let Ok(m) = rx.try_recv() {
             match m {
@@ -948,8 +953,9 @@ jobs:
             let second_token = crate::ci::services::memo::tests::leg(&hub, "acme/app", "run2", "leg2", true).await?;
             let base = crate::ci::services::memo::tests::serve(Arc::clone(&hub))?;
             let work = tempfile::tempdir()?;
+            let admission = Admission::private(&tempfile::tempdir()?.keep())?;
             let files = [("src/version", "1\n"), ("README.md", "memo\n")];
-            let first = run(&hub, &base, &first_token, ("run1", "leg1"), work.path(), WORKFLOW, &files).await?;
+            let first = run(&hub, &base, &first_token, ("run1", "leg1"), (work.path(), &admission), WORKFLOW, &files).await?;
             anyhow::ensure!(first.result.status == crate::store::Status::Succeeded, "{:?}\n{:?}", first.result, first.logs);
             let built = first.log(0).lines().find(|l| l.starts_with("built 1 as ")).map(str::to_owned).ok_or_else(|| anyhow::anyhow!("it built: {:?}", first.logs))?;
             anyhow::ensure!(first.log(0).contains("memo: kept for reuse"), "{}", first.log(0));
@@ -957,7 +963,7 @@ jobs:
             anyhow::ensure!(first.log(2).contains("not kept for reuse") && first.finished(2).is_some_and(|f| f.0 == Conclusion::Failure), "{}", first.log(2));
             let checked = first.log(2).lines().find(|l| l.starts_with("checked as ")).map(str::to_owned).unwrap_or_default();
 
-            let second = run(&hub, &base, &second_token, ("run2", "leg2"), work.path(), WORKFLOW, &files).await?;
+            let second = run(&hub, &base, &second_token, ("run2", "leg2"), (work.path(), &admission), WORKFLOW, &files).await?;
             anyhow::ensure!(second.result.status == crate::store::Status::Succeeded, "{:?}\n{:?}", second.result, second.logs);
             // The memo step wasn't run: nothing it printed came from this leg, and it says where
             // its result came from; its log is the first leg's, its outputs the first's.

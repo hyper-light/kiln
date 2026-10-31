@@ -90,7 +90,13 @@ pub enum Msg {
     RunSynthetic { name: String },
     /// Server → runner: the DogStatsD listeners this machine opens (`super::statsd`), as scrape
     /// targets.
-    Statsd { listeners: Vec<(String, super::statsd::Listener)> },
+    Statsd {
+        listeners: Vec<(String, super::statsd::Listener)>,
+        /// U06: canonical collection revision. Older JSON peers ignore this optional field and
+        /// cannot enforce monotonic delivery; this does not claim Quiver migration/acceptance.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        revision: Option<u64>,
+    },
     /// Runner → server: a profiler's upload its Agent took (`super::profiles::pack`), whole or in
     /// parts as a raft message's.
     Profile {
@@ -169,6 +175,9 @@ pub struct Status {
     pub synthetics: Vec<(String, super::synthetics::State)>,
     /// How each DogStatsD listener it opens goes.
     pub statsd: Vec<(String, super::statsd::State)>,
+    /// Accepted desired configuration; separate from individual socket bind success.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub statsd_revision: Option<u64>,
 }
 
 pub fn encode(msg: &Msg) -> String {

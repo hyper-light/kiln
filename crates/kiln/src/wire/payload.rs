@@ -140,6 +140,22 @@ pub fn payload<T: DeserializeOwned + Serialize>(wire: Wire, of: &'static str, js
     Ok(read)
 }
 
+/// Reserved pre-unification formats never start a second persistence/replication owner.
+fn retired(of: &'static str) -> Box<Unreadable> {
+    Box::new(Unreadable { of, what: of.to_owned(), code: Code::Unknown,
+        why: "retired application replication protocol; use the negotiated Amphora carrier".into(),
+        session: None, waits: None })
+}
+
+/// Preserve the existing retained-evidence budget before parsing its exact JSON identity.
+fn evidence_budget(of: &'static str, job: Option<&str>, json: &str) -> Result<(), Box<Unreadable>> {
+    if json.len() > 65536 || job.is_some_and(|job| job.len() > 256) {
+        return Err(Box::new(Unreadable { of, what: of.to_owned(), code: Code::Malformed,
+            why: "retained evidence exceeds its budget".into(), session: None, waits: None }));
+    }
+    Ok(())
+}
+
 /// Why `T` couldn't be read from what came: a tag it doesn't know is `unknown`, the rest
 /// `malformed`, said without the values that came (a secret's, say).
 fn refused(of: &'static str, e: &serde_json::Error) -> Box<Unreadable> {
@@ -296,20 +312,20 @@ pub enum FromRunner {
     HarnessInventory(Box<crate::harness::host::Inventory>),
     Sync { msg: Box<crate::sync::wire::Msg>, raft: Vec<u8> },
     FrontDoorStatus(Box<crate::frontdoor::Status>),
-    JobEvent { job: String, event: Box<crate::proto::JobEvent> },
+    /// Original bounded JSON is retained only for the existing outbox's exact identity.
+    JobEvent { job: String, event: Box<crate::proto::JobEvent>, json: String },
     Facts(Box<kiln_ci::facts::RunnerFacts>),
     ReachHello(crate::reach::relay::Announce),
     /// `ReachAsk`: a question for the server.
     ReachAsk { req: u64, ask: Box<crate::reach::Question> },
-    Convo { msg: Box<crate::convo::feed::Msg>, data: Vec<u8> },
     Power(crate::os::battery::Battery),
     HarnessFileData { req: u64, answer: crate::harness::files::Answer, data: Vec<u8> },
     /// `StreamEvent`: what stream `stream` says (opened, navigated, loaded, focus, dialog, closed,
     /// error).
     StreamEvent { stream: String, event: Value },
-    Executor(crate::runner::pool::Said),
+    /// Original bounded JSON is retained only for the existing outbox's exact identity.
+    Executor { said: Box<crate::runner::pool::Said>, json: String },
     Undeployed(kiln_ci::wire::Undeployed),
-    Cluster { msg: Box<crate::store::learner::Msg>, raft: Vec<u8> },
     /// `WorkState`: what it holds warm, for placement (docs/ci.md W24-R18).
     WorkState(Box<kiln_ci::work::slots::WorkState>),
     /// `AgentLimit`: the most agent sessions its machine has at work at once, and where that comes
@@ -344,18 +360,24 @@ impl Carries for AgentMsg {
             AgentMsg::HarnessHistory { req, json } => FromRunner::Answer(Answer { of: "HarnessHistory", req, json }),
             AgentMsg::Sync { json, raft } => FromRunner::Sync { msg: payload(W, "Sync", &json)?, raft },
             AgentMsg::FrontDoorStatus { json } => FromRunner::FrontDoorStatus(payload(W, "FrontDoorStatus", &json)?),
-            AgentMsg::JobEvent { job, json } => FromRunner::JobEvent { job, event: payload(W, "JobEvent", &json)? },
+            AgentMsg::JobEvent { job, json } => {
+                evidence_budget("JobEvent", Some(&job), &json)?;
+                FromRunner::JobEvent { job, event: payload(W, "JobEvent", &json)?, json }
+            },
             AgentMsg::Facts { json } => FromRunner::Facts(payload(W, "Facts", &json)?),
             AgentMsg::ReachHello { json } => FromRunner::ReachHello(payload(W, "ReachHello", &json)?),
             AgentMsg::ReachAsk { req, json } => FromRunner::ReachAsk { req, ask: payload(W, "ReachAsk", &json).map_err(|e| e.waits(Waits::Asking(req)))? },
-            AgentMsg::Convo { json, data } => FromRunner::Convo { msg: payload(W, "Convo", &json)?, data },
+            AgentMsg::Convo { .. } => return Err(retired("Convo")),
             AgentMsg::Power { json } => FromRunner::Power(payload(W, "Power", &json)?),
             AgentMsg::Answer { req, json } => FromRunner::Answer(Answer { of: "Answer", req, json }),
             AgentMsg::HarnessFileData { req, json, data } => FromRunner::HarnessFileData { req, answer: payload(W, "HarnessFileData", &json).map_err(|e| e.waits(Waits::Answering(req)))?, data },
             AgentMsg::StreamEvent { stream, json } => FromRunner::StreamEvent { stream, event: payload(W, "StreamEvent", &json)? },
-            AgentMsg::Executor { json } => FromRunner::Executor(payload(W, "Executor", &json)?),
+            AgentMsg::Executor { json } => {
+                evidence_budget("Executor", None, &json)?;
+                FromRunner::Executor { said: payload(W, "Executor", &json)?, json }
+            },
             AgentMsg::Undeployed { json } => FromRunner::Undeployed(payload(W, "Undeployed", &json)?),
-            AgentMsg::Cluster { json, raft } => FromRunner::Cluster { msg: payload(W, "Cluster", &json)?, raft },
+            AgentMsg::Cluster { .. } => return Err(retired("Cluster")),
             AgentMsg::WorkState { json } => FromRunner::WorkState(payload(W, "WorkState", &json)?),
             AgentMsg::AgentLimit { json } => FromRunner::AgentLimit(payload(W, "AgentLimit", &json)?),
             AgentMsg::Identity { json } => FromRunner::Identity(payload(W, "Identity", &json)?),
@@ -368,6 +390,9 @@ impl Carries for AgentMsg {
             | AgentMsg::StepStarted { .. }
             | AgentMsg::StepFinished { .. }
             | AgentMsg::JobFinished(_)
+            | AgentMsg::JobFinishedV2 { .. }
+            | AgentMsg::RunnerProcess { .. }
+            | AgentMsg::Amphora { .. }
             | AgentMsg::JobSample { .. }
             | AgentMsg::Reject { .. }
             | AgentMsg::TermOutput { .. }
@@ -410,7 +435,6 @@ pub enum FromServer {
     SecretsFor { job: String, secrets: Vec<crate::proto::SecretFor> },
     /// `ReachAnswer`: the server's answer to a runner's `ReachAsk`.
     ReachAnswer { req: u64, answer: Value },
-    Convo { msg: Box<crate::convo::feed::Msg>, data: Vec<u8> },
     StreamOpen { stream: String, session: String, spec: Box<crate::browser::stream::Spec> },
     /// `StreamControl`: what a viewer asks of stream `stream` (`crate::browser::stream::Stream::control`).
     StreamControl { stream: String, session: String, control: Value },
@@ -418,9 +442,8 @@ pub enum FromServer {
     /// `Preview`: what a person opens live from agent session `session` (`{"op": "look"}`).
     Preview { req: u64, session: String, ask: Value },
     Workspace { req: u64, session: String, ask: Box<crate::workspace::Ask> },
-    Executor(crate::runner::pool::Ask),
+    Executor { ask: Box<crate::runner::pool::Ask>, bytes: usize },
     Undeploy(kiln_ci::wire::Undeploy),
-    Cluster { msg: Box<crate::store::learner::Msg>, raft: Vec<u8> },
     /// `AgentLimit`: what a person set from the server for the most agent sessions this machine
     /// has at work at once (none: its config's holds).
     AgentLimit(crate::harness::limit::Asked),
@@ -431,6 +454,8 @@ pub enum FromServer {
     Observe { msg: Box<crate::observe::wire::Msg>, bytes: Vec<u8> },
     /// `Headroom`: this machine's headroom settings (docs/headroom.md).
     Headroom(Box<crate::headroom::Push>),
+    /// The single existing retained-evidence receipt type, read at the boundary once.
+    RetainedReceived(Box<crate::agent::RetainedReceipt>),
 }
 
 impl Carries for ServerMsg {
@@ -460,7 +485,7 @@ impl Carries for ServerMsg {
             ServerMsg::AssignV2 { json } => FromServer::AssignV2(payload(W, "AssignV2", &json)?),
             ServerMsg::SecretsFor { job, json } => FromServer::SecretsFor { job, secrets: payload(W, "SecretsFor", &json)? },
             ServerMsg::ReachAnswer { req, json } => FromServer::ReachAnswer { req, answer: payload(W, "ReachAnswer", &json)? },
-            ServerMsg::Convo { json, data } => FromServer::Convo { msg: payload(W, "Convo", &json)?, data },
+            ServerMsg::Convo { .. } => return Err(retired("Convo")),
             ServerMsg::StreamOpen { stream, session, json } => match payload(W, "StreamOpen", &json) {
                 Ok(spec) => FromServer::StreamOpen { stream, session, spec },
                 Err(e) => return Err(e.about(&session).waits(Waits::Stream(stream))),
@@ -481,13 +506,20 @@ impl Carries for ServerMsg {
                 Ok(ask) => FromServer::Workspace { req, session, ask },
                 Err(e) => return Err(e.about(&session).waits(Waits::Asking(req))),
             },
-            ServerMsg::Executor { json } => FromServer::Executor(payload(W, "Executor", &json)?),
+            ServerMsg::Executor { json } => {
+                evidence_budget("Executor", None, &json)?;
+                FromServer::Executor { ask: payload(W, "Executor", &json)?, bytes: json.len() }
+            },
             ServerMsg::Undeploy { json } => FromServer::Undeploy(payload(W, "Undeploy", &json)?),
-            ServerMsg::Cluster { json, raft } => FromServer::Cluster { msg: payload(W, "Cluster", &json)?, raft },
+            ServerMsg::Cluster { .. } => return Err(retired("Cluster")),
             ServerMsg::AgentLimit { json } => FromServer::AgentLimit(payload(W, "AgentLimit", &json)?),
             ServerMsg::Identity { json } => FromServer::Identity(payload(W, "Identity", &json)?),
             ServerMsg::Observe { json, bytes } => FromServer::Observe { msg: payload(W, "Observe", &json)?, bytes },
             ServerMsg::Headroom { json } => FromServer::Headroom(payload(W, "Headroom", &json)?),
+            ServerMsg::RetainedReceived { json } => {
+                evidence_budget("RetainedReceived", None, &json)?;
+                FromServer::RetainedReceived(payload(W, "RetainedReceived", &json)?)
+            },
             m @ (ServerMsg::Welcome { .. }
             | ServerMsg::Refused { .. }
             | ServerMsg::Assign(_)
@@ -526,6 +558,8 @@ impl Carries for ServerMsg {
             | ServerMsg::PortAck { .. }
             | ServerMsg::PortClose { .. }
             | ServerMsg::Received { .. }
+            | ServerMsg::ReceivedV2 { .. }
+            | ServerMsg::Amphora { .. }
             | ServerMsg::Caps { .. }
             | ServerMsg::Wire(_)
             | ServerMsg::Kept { .. }
@@ -604,13 +638,11 @@ mod tests {
             case("Facts", |json| AgentMsg::Facts { json }, &kiln_ci::facts::RunnerFacts::default(), None),
             case("ReachHello", |json| AgentMsg::ReachHello { json }, &crate::reach::relay::Announce::default(), None),
             case("ReachAsk", |json| AgentMsg::ReachAsk { req: 3, json }, &crate::reach::Question::Directory, Some(r#"{"op":"teleport"}"#)),
-            case("Convo", |json| AgentMsg::Convo { json, data: Vec::new() }, &crate::convo::feed::Msg::Restore { store: "st".into() }, Some(r#"{"t":"teleport"}"#)),
             case("Power", |json| AgentMsg::Power { json }, &battery, None),
             case("HarnessFileData", |json| AgentMsg::HarnessFileData { req: 4, json, data: Vec::new() }, &crate::harness::files::Answer::default(), None),
             any("StreamEvent", |json| AgentMsg::StreamEvent { stream: "st1".into(), json }, r#"{"opened":{}}"#),
             case("Executor", |json| AgentMsg::Executor { json }, &crate::runner::pool::Said::default(), None),
             case("Undeployed", |json| AgentMsg::Undeployed { json }, &kiln_ci::wire::Undeployed::default(), None),
-            case("Cluster", |json| AgentMsg::Cluster { json, raft: Vec::new() }, &crate::store::learner::Msg::Leave, Some(r#"{"t":"teleport"}"#)),
             case("WorkState", |json| AgentMsg::WorkState { json }, &kiln_ci::work::slots::WorkState::default(), None),
             case("AgentLimit", |json| AgentMsg::AgentLimit { json }, &crate::harness::limit::Held { max_sessions: 8, from: crate::harness::limit::Source::Config, config: Some(8) }, None),
             case("Identity", |json| AgentMsg::Identity { json }, &crate::proto::IdentityAsk { kind: "runner".into(), csr: "csr".into(), ..Default::default() }, None),
@@ -632,18 +664,17 @@ mod tests {
             case("AssignV2", |json| ServerMsg::AssignV2 { json }, &kiln_ci::wire::AssignmentV2::default(), None),
             case("SecretsFor", |json| ServerMsg::SecretsFor { job: "leg-1".into(), json }, &Vec::<crate::proto::SecretFor>::new(), None),
             any("ReachAnswer", |json| ServerMsg::ReachAnswer { req: 5, json }, r#"{"runners":[]}"#),
-            case("Convo", |json| ServerMsg::Convo { json, data: Vec::new() }, &crate::convo::feed::Msg::Restore { store: "st".into() }, Some(r#"{"t":"teleport"}"#)),
             any("StreamControl", |json| ServerMsg::StreamControl { stream: "st1".into(), session: "s1".into(), json }, r#"{"resize":{"width":390}}"#),
             case("StreamInput", |json| ServerMsg::StreamInput { stream: "st1".into(), session: "s1".into(), json }, &Vec::<crate::browser::stream::Input>::new(), Some(r#"[{"t":"teleport"}]"#)),
             any("Preview", |json| ServerMsg::Preview { req: 6, session: "s1".into(), json }, r#"{"op":"look"}"#),
             Case { of: "Workspace", make: |json| ServerMsg::Workspace { req: 7, session: "s1".into(), json }, good: r#"{"op":"git"}"#.into(), unknown: Some(r#"{"op":"teleport"}"#), any: false },
             case("Executor", |json| ServerMsg::Executor { json }, &crate::runner::pool::Ask::default(), None),
             case("Undeploy", |json| ServerMsg::Undeploy { json }, &kiln_ci::wire::Undeploy::default(), None),
-            case("Cluster", |json| ServerMsg::Cluster { json, raft: Vec::new() }, &crate::store::learner::Msg::Leave, Some(r#"{"t":"teleport"}"#)),
             case("AgentLimit", |json| ServerMsg::AgentLimit { json }, &crate::harness::limit::Asked { max_sessions: Some(8) }, None),
             case("Identity", |json| ServerMsg::Identity { json }, &crate::proto::IdentityGiven { kind: "runner".into(), uri: "kiln://runner/m1".into(), ..Default::default() }, None),
             case("Observe", |json| ServerMsg::Observe { json, bytes: Vec::new() }, &crate::observe::wire::Msg::Release, Some(r#"{"kind":"teleport"}"#)),
             case("Headroom", |json| ServerMsg::Headroom { json }, &crate::headroom::Push::default(), None),
+            case("RetainedReceived", |json| ServerMsg::RetainedReceived { json }, &crate::agent::RetainedReceipt { job: "j".into(), event: serde_json::json!({"t":"kept_owned","attempt":1,"execution":"e"}) }, None),
         ];
         cases.push(Case { of: "StreamOpen", make: |json| ServerMsg::StreamOpen { stream: "st1".into(), session: "s1".into(), json }, good: r#"{"url":"https://example.com"}"#.into(), unknown: None, any: false });
         cases
@@ -664,7 +695,7 @@ mod tests {
         // since; W24's WorkState; a machine's agent limit, AgentLimit; W27's identities and
         // observe's group, Identity and Observe, each way; and headroom's, HeadroomStatus and
         // Headroom.
-        anyhow::ensure!(runner.len() + ANSWERS.len() == 27 && server.len() == 21, "{} and {} variants", runner.len() + ANSWERS.len(), server.len());
+        anyhow::ensure!(runner.len() + ANSWERS.len() == 25 && server.len() == 20, "{} and {} variants", runner.len() + ANSWERS.len(), server.len());
         fn check<M: Carries>(cases: Vec<Case<M>>) -> anyhow::Result<()> {
             for c in cases {
                 anyhow::ensure!(read((c.make)(c.good.clone())).map_err(|e| anyhow::anyhow!("{}: {e}", c.of))?, "{} came through as it was", c.of);
@@ -684,6 +715,17 @@ mod tests {
         }
         check(runner)?;
         check(server)?;
+        // Reserved old ordinals fail closed independently of their payload's shape.
+        for msg in [AgentMsg::Convo { json: "{".into(), data: Vec::new() }, AgentMsg::Cluster { json: "{}".into(), raft: Vec::new() }] {
+            anyhow::ensure!(payload_of(msg).is_err_and(|e| e.code == Code::Unknown), "retired runner protocol was interpreted");
+        }
+        for msg in [ServerMsg::Convo { json: "{}".into(), data: Vec::new() }, ServerMsg::Cluster { json: "{".into(), raft: Vec::new() }] {
+            anyhow::ensure!(payload_of(msg).is_err_and(|e| e.code == Code::Unknown), "retired server protocol was interpreted");
+        }
+        let raw = r#"{"seq":2,"t":"kept_owned","attempt":1,"execution":"e","until":123,"future":{"owner":"original"}}"#.to_owned();
+        let read = payload_of(AgentMsg::JobEvent { job: "j".into(), json: raw.clone() }).map_err(|e| anyhow::anyhow!("{e}"))?;
+        anyhow::ensure!(matches!(read, Carried::Read(FromRunner::JobEvent { json, .. }) if json == raw), "outbox identity changed while reading its typed event");
+        anyhow::ensure!(payload_of(AgentMsg::JobEvent { job: "j".into(), json: " ".repeat(65537) }).is_err_and(|e| e.code == Code::Malformed), "evidence budget was weakened");
         // The answers come through as they are: their question says what they're read as.
         for of in ANSWERS {
             let msg = match of {
@@ -946,7 +988,11 @@ mod tests {
     /// own (a file, a socket of its own, what it's about to send), each named here.
     #[test]
     fn no_handler_reads_a_payload_of_its_own() {
-        const OWN: [(&str, &str); 7] = [
+        const OWN: [(&str, &str); 11] = [
+            ("let frozen: FrozenState = serde_json::from_slice(&serde_json::to_vec(&handed.core)?)?;", "this machine's authenticated handed core, converted to its canonical frozen state"),
+            ("Some((file, Ok(raw))) => serde_json::from_slice(&raw).map_err(|e| anyhow::anyhow!(\"unreadable agent session record {}: {e}\", file.display()))?,", "legacy local session-snapshot file read during restoration"),
+            ("let bootstrap: Option<ExecutorBootstrap> = serde_json::from_slice(&bytes)?;", "this machine's validated local executor bootstrap file"),
+            ("&& let Ok(said) = serde_json::from_str::<crate::runner::pool::Said>(json)", "this runner's own outgoing or retained-spool replay event, never an incoming handler payload"),
             ("serde_json::from_slice(&json).ok()?", "a session handed back by this machine's newer build, on a socket of its own"),
             ("serde_json::from_value(cut_value(v, budget))", "its own event, cut to fit a frame before it's sent"),
             ("let handed: Vec<HandedTerm> = match serde_json::from_slice(&raw)", "terminals the runner before it handed over, in a file"),

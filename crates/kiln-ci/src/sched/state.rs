@@ -22,7 +22,7 @@ use super::demand::{self, Ask, Demand, Demands, End, Fate, Next, Running, Work};
 use super::admit::{self, Admit, Held, Skipped};
 use super::groups::{GroupAction, GroupConfig, Groups};
 use super::needs;
-use super::pools::{self, ExecState, Executor, Pool, PoolView};
+use super::pools::{self, ExecState, Executor, ExecutorShape, PodCapacity, Pool, PoolView};
 use super::reserve::Reservation;
 use super::retry::{self, Failed, FailureClass, RetryPolicy, RunnerChoice};
 use super::routing::{self, Check, LegRoute, Preference, Requirement, Rule, RunnerView};
@@ -119,6 +119,13 @@ impl Default for Config {
 /// A leg to schedule.
 #[derive(Debug, Clone, Default)]
 pub struct LegIn {
+    /// U01: externally executed work retains its assignment until its host proves termination.
+    /// A lost transport is not evidence that its process stopped.
+    pub external: bool,
+    /// U01: a terminal execution still owns this exact kind of physical allocation.
+    pub retained: Option<ReservationMode>,
+    /// U01: an authenticated physical executor already holding this attempt's allocation.
+    pub parent_binding: Option<crate::wire::ParentBinding>,
     pub id: String,
     pub run: String,
     pub repo: String,
@@ -132,6 +139,8 @@ pub struct LegIn {
     pub retry: Option<RetryPolicy>,
     /// Expected runner-seconds (history, W19).
     pub cost: Option<f64>,
+    /// U01, W05-R25: the next attempt when queued work is restored or imported. Zero starts at 1.
+    pub initial_attempt: u32,
     pub prefer: Vec<Preference>,
     /// It has a `container:` or `services:`, or is a kiln-dialect leg that sets `toolchain:`,
     /// `image:` or `resources:`: on a hosted pool (`k8s`), it runs in an executor made for it (a
@@ -172,6 +181,44 @@ pub struct LegIn {
     pub workflow_file: String,
     /// Where a person's retry asked it to run (W05-R28).
     pub placement: Placement,
+}
+
+/// U01: durable capacity ownership, independent of a terminal plan or its specification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReservationMode { Ordinary, Share, Whole }
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Allocation {
+    pub id: String,
+    pub runner: String,
+    pub request: Resources,
+    pub mode: ReservationMode,
+    pub repo: String,
+    pub actor: String,
+    pub lane: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_binding: Option<crate::wire::ParentBinding>,
+}
+
+/// U01: replay data for an executor reservation already placed by this Scheduler.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExecutorSnapshot {
+    pub executor: String,
+    pub pool: String,
+    pub runner: String,
+    pub reserved: Resources,
+    pub leg: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<crate::wire::ParentBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<ExecutorShape>,
+}
+
+impl Allocation {
+    pub fn leg(&self) -> LegIn {
+        LegIn { id: self.id.clone(), run: self.id.clone(), repo: self.repo.clone(), actor: self.actor.clone(), lane: self.lane.clone(),
+            request: self.request, retained: Some(self.mode), parent_binding: self.parent_binding.clone(), placement: Placement { runner: Some(self.runner.clone()), ..Placement::default() }, ..LegIn::default() }
+    }
 }
 
 /// Where a person's retry asked a leg to run (W05-R28): only on `runner`, or on any runner but
@@ -255,6 +302,12 @@ pub enum Input {
         attempt: u32,
         outcome: Outcome,
     },
+    /// U01: a durable kept intent forbids RunnerLost from releasing its live assignment.
+    RetainExecution { leg: String, attempt: u32 },
+    /// U01: authenticated kernel stop proof also removes the original attempt's loss fence.
+    ExecutionReleased { leg: String, attempt: u32 },
+    /// U01: terminalize an attempt while atomically preserving its physical allocation.
+    RetainedFinished { leg: String, attempt: u32, reservation: Box<Allocation>, outcome: Outcome },
     /// The runner refused the assignment (no free slot, draining): the leg goes back to its queue,
     /// the same attempt, and not to that runner.
     Rejected { leg: String },
@@ -532,6 +585,9 @@ enum Off {
 #[derive(Debug, Clone)]
 struct Leg {
     input: LegIn,
+    /// W05-R03/U01: the original job demand, apart from its executor's existing physical grant.
+    /// Headroom and CPU-time fairness use it even when the pooled incremental claim is zero.
+    runtime_request: Resources,
     req: Requirement,
     sig: String,
     state: State,
@@ -598,6 +654,17 @@ enum Claim {
 }
 
 fn claim(l: &LegIn, size: Option<Resources>) -> Option<Claim> {
+    if let Some(mode) = l.retained {
+        return match mode { ReservationMode::Ordinary => None, ReservationMode::Share => Some(Claim::Share(l.request)), ReservationMode::Whole => Some(Claim::Whole) };
+    }
+    // U01: externally executed work uses the same resource shares in either scheduler mode.
+    // Explicit exclusivity (or no quantities) retains whole-runner semantics. Memory/disk/GPU
+    // requests need not invent a CPU quantity to participate in common accounting.
+    if l.external {
+        let q = l.request;
+        let explicit = q.cpu > 0.0 || q.mem > 0 || q.disk > 0 || q.gpu > 0;
+        return Some(if !l.exclusive && explicit && size.is_some() { Claim::Share(q) } else { Claim::Whole });
+    }
     if !l.exclusive {
         return None;
     }
@@ -704,6 +771,10 @@ pub struct Scheduler {
     in_progress: HashMap<String, usize>,
     /// Pools' executors, by id.
     executors: BTreeMap<String, Executor>,
+    /// U01: a committed startup grant remains charged until its host proves termination.
+    owned_executors: BTreeSet<String>,
+    executor_bindings: BTreeMap<String, crate::wire::ParentBinding>,
+    retiring_executors: BTreeSet<String>,
     /// (pool, runner) left alone until, and the wait after the next failure.
     backoff: HashMap<(String, String), (i64, i64)>,
     /// Each pool's last failure to start an executor: (runner, error).
@@ -783,6 +854,16 @@ impl Scheduler {
             Input::LegCancelled { leg, reason } => self.cancel(&leg, reason, now, &mut out),
             Input::LegGone { leg } => self.gone(&leg, now, &mut out),
             Input::AttemptFinished { leg, attempt, outcome } => self.finished(&leg, attempt, outcome, now, &mut out),
+            Input::RetainExecution { leg, attempt } => {
+                let mode = self.allocation(&leg, attempt, String::new()).map(|a| a.mode);
+                if let Some(mode) = mode
+                    && let Some(l) = self.legs.get_mut(&leg).filter(|l| l.attempt == attempt)
+                { l.input.retained = Some(mode); }
+            }
+            Input::ExecutionReleased { leg, attempt } => {
+                if let Some(l) = self.legs.get_mut(&leg).filter(|l| l.attempt == attempt) { l.input.retained = None; }
+            }
+            Input::RetainedFinished { leg, attempt, reservation, outcome } => self.retained_finished(&leg, attempt, *reservation, outcome, now, &mut out),
             Input::Rejected { leg } => {
                 if let Some(runner) = self.release(&leg) {
                     self.stopped(&leg);
@@ -959,6 +1040,7 @@ impl Scheduler {
         if self.legs.get(&id).is_some_and(|l| l.state != State::Done) {
             return;
         }
+        let runtime_request = input.request;
         let mut req = self.requirement(&input);
         // A pool's leg takes what its executor holds already.
         if req.pool.is_some() {
@@ -968,9 +1050,10 @@ impl Scheduler {
         let sig = req.signature();
         self.ensure_sig(&sig, &req);
         let group = input.group.clone();
+        let attempt = input.initial_attempt.max(1);
         self.legs.insert(
             id.clone(),
-            Leg { input, req, sig, state: State::Pending, attempt: 1, queued_at: now, arrived: now, key: None, counted: false, reason: None, avoid: None, pin: None, last_runner: None, cancelling: None, gone: false, started: None, hold: None, held: false, ends: None },
+            Leg { input, runtime_request, req, sig, state: State::Pending, attempt, queued_at: now, arrived: now, key: None, counted: false, reason: None, avoid: None, pin: None, last_runner: None, cancelling: None, gone: false, started: None, hold: None, held: false, ends: None },
         );
         match group {
             Some((key, name, cfg)) => {
@@ -1091,9 +1174,15 @@ impl Scheduler {
         }
     }
 
-    fn adopt(&mut self, input: LegIn, runner: String, attempt: u32, now: i64, out: &mut Vec<Command>) {
+    fn adopt(&mut self, mut input: LegIn, runner: String, attempt: u32, now: i64, out: &mut Vec<Command>) {
         let id = input.id.clone();
+        let runtime_request = input.request;
         let req = self.requirement(&input);
+        // U01: the restored executor already owns its pool's footprint, just as at queue time.
+        // Counting its leg's request again would inflate both admission and retained ownership.
+        if req.pool.is_some() {
+            input.request = Resources::default();
+        }
         let sig = req.signature();
         self.ensure_sig(&sig, &req);
         if let Some((key, name, cfg)) = &input.group {
@@ -1106,6 +1195,7 @@ impl Scheduler {
             id.clone(),
             Leg {
                 input,
+                runtime_request,
                 req,
                 sig,
                 state: State::Assigned { runner: runner.clone() },
@@ -1145,6 +1235,14 @@ impl Scheduler {
                     self.adopted(&a, id.clone(), run.clone(), now, out);
                 }
             }
+        }
+    }
+
+    /// U01: reach can bring arbitrarily many distinct resource predicates over time. Retain
+    /// signatures only while some live leg uses them, rather than caching every ended call.
+    fn forget_external_signature(&mut self, leg: &Leg) {
+        if (leg.input.external || leg.input.retained.is_some()) && !self.legs.values().any(|l| l.sig == leg.sig) {
+            self.sigs.remove(&leg.sig);
         }
     }
 
@@ -1196,7 +1294,7 @@ impl Scheduler {
         let Some(leg) = self.legs.get(id) else { return };
         // What it costs its repository: its expected runner-seconds times the CPUs it asks, one at
         // the least, so repositories at equal weights get equal CPU-time, big legs or small (W05).
-        let cost = leg.input.cost.unwrap_or(self.config().default_cost) * leg.input.request.cpu.max(1.0);
+        let cost = leg.input.cost.unwrap_or(self.config().default_cost) * leg.runtime_request.cpu.max(1.0);
         let cadenced = leg.input.exclusive && leg.input.admission.as_ref().is_some_and(|a| a.cadence.is_some());
         self.count(id);
         // Start-time fair queuing across repositories (W05-R10), and inside each by actor and lane
@@ -1347,7 +1445,7 @@ impl Scheduler {
         order.sort_by(|(i, a), (j, b)| {
             let (sa, sb) = (scores.get(*i).copied().unwrap_or(0.0), scores.get(*j).copied().unwrap_or(0.0));
             let (ha, hb) = (headroom_of(a, self.now), headroom_of(b, self.now));
-            sb.total_cmp(&sa).then_with(|| super::place::before(&l.input.request, ha.as_ref(), hb.as_ref())).then_with(|| load(a).total_cmp(&load(b))).then_with(|| free(b).cmp(&free(a))).then_with(|| a.input.id.cmp(&b.input.id))
+            sb.total_cmp(&sa).then_with(|| super::place::before(&l.runtime_request, ha.as_ref(), hb.as_ref())).then_with(|| load(a).total_cmp(&load(b))).then_with(|| free(b).cmp(&free(a))).then_with(|| a.input.id.cmp(&b.input.id))
         });
         order.into_iter().map(|(_, r)| r.input.id.clone()).collect()
     }
@@ -1423,7 +1521,7 @@ impl Scheduler {
         if let Some(h) = self.holds.get(&r.input.id)
             && h.leg != l.input.id
             && self.now.saturating_add(ms(self.expected_s(l, &r.input.id))) > h.shadow
-            && !beside(&l.input.request, &h.extra)
+            && !beside(&l.runtime_request, &h.extra)
         {
             return false;
         }
@@ -1452,6 +1550,46 @@ impl Scheduler {
         true
     }
 
+    /// U01: one physical accounting view for mixed CI/reach work. In slots mode an ordinary
+    /// CI leg consumes at least its slot's CPU/memory share; explicit requests and already
+    /// reserved pool executors remain counted. This reads Scheduler ownership, never a ledger.
+    fn physical_used(&self, r: &Runner, capacity: Resources) -> Resources {
+        let mut used = r.used;
+        if !self.config().resources {
+            let divisor = u64::from(r.input.slots.max(1));
+            let cpu = capacity.cpu / divisor as f64;
+            let mem = capacity.mem / divisor;
+            for id in &r.running {
+                let Some(l) = self.legs.get(id) else {
+                    add(&mut used, &Resources { cpu, mem, ..Resources::default() });
+                    continue;
+                };
+                if l.req.pool.is_none() && claim(&l.input, Some(capacity)).is_none() {
+                    used.cpu += (cpu - l.input.request.cpu).max(0.0);
+                    used.mem = used.mem.saturating_add(mem.saturating_sub(l.input.request.mem));
+                }
+            }
+        }
+        used
+    }
+
+    fn has_external(&self, r: &Runner) -> bool {
+        self.executors.values().any(|e| e.runner == r.input.id && self.owned_executors.contains(&e.id)) || r.running.iter().any(|id| self.legs.get(id).is_some_and(|l| l.input.external || l.input.retained.is_some()))
+    }
+
+    fn physical_room(&self, r: &Runner, mut request: Resources, ordinary: bool) -> bool {
+        let Some(capacity) = size(r) else { return false };
+        if ordinary && !self.config().resources {
+            request.cpu = request.cpu.max(capacity.cpu / f64::from(r.input.slots.max(1)));
+            request.mem = request.mem.max(capacity.mem / u64::from(r.input.slots.max(1)));
+        }
+        let used = self.physical_used(r, capacity);
+        used.cpu + request.cpu <= capacity.cpu + 1e-9
+            && used.mem.checked_add(request.mem).is_some_and(|n| n <= capacity.mem)
+            && used.disk.checked_add(request.disk).is_some_and(|n| n <= capacity.disk)
+            && used.gpu.checked_add(request.gpu).is_some_and(|n| n <= capacity.gpu)
+    }
+
     /// Whether a runner has room for a leg now: none while an exclusive leg holds it whole; one of
     /// a pool's idle executors there for a pool's leg; for an exclusive leg, the whole runner
     /// empty when it asks for nothing, else a share of what no other share holds and the ordinary
@@ -1461,11 +1599,21 @@ impl Scheduler {
         if whole {
             return false;
         }
+        // U01: admitted reach quantities are hard reservation boundaries even when CI's
+        // ordinary policy allows overcommit. All four dimensions, and both arrival orders,
+        // use this same Scheduler view. New external whole-runner work also waits for pools.
+        if l.input.external || self.has_external(r) {
+            match claim(&l.input, size(r)) {
+                Some(Claim::Whole) => return r.running.is_empty() && !self.executors.values().any(|e| e.runner == r.input.id),
+                Some(Claim::Share(q)) => return self.physical_room(r, q, false),
+                None if !self.physical_room(r, l.input.request, l.req.pool.is_none()) => return false,
+                None => {}
+            }
+        }
         // A pool's leg runs in one of its idle executors on that host: one made for it when it
         // needs that (W13-R07).
         if let Some(pool) = &l.req.pool {
-            let own = self.own_leg(l);
-            return self.executors.values().any(|e| e.pool == *pool && e.runner == r.input.id && e.state == ExecState::Idle && e.leg.as_deref() == own);
+            return self.idle_executor(pool, &r.input.id, l).is_some();
         }
         let c = self.config();
         let size = size(r);
@@ -1576,6 +1724,16 @@ impl Scheduler {
     }
 
     fn assign(&mut self, id: &str, runner: &str, now: i64, out: &mut Vec<Command>) {
+        // U01: choose the actual fitting grant before changing the leg or any host accounting.
+        // Capacity and assignment must not choose different heterogeneous warm executors.
+        let Some(l) = self.legs.get(id) else { return };
+        let slot = match &l.req.pool {
+            Some(pool) => match self.idle_executor(pool, runner, l) {
+                Some(e) => Some(e.id.clone()),
+                None => return,
+            },
+            None => None,
+        };
         self.unqueue(id);
         let expected = self.legs.get(id).map(|l| self.expected_s(l, runner));
         let Some(l) = self.legs.get_mut(id) else { return };
@@ -1587,7 +1745,7 @@ impl Scheduler {
         l.started = Some(now);
         self.demands.started(id, now);
         let Some(l) = self.legs.get_mut(id) else { return };
-        let (attempt, request, repo, fair) = (l.attempt, l.input.request, l.input.repo.clone(), l.key.map_or(0, |k| k.1));
+        let (attempt, request, runtime_request, repo, fair) = (l.attempt, l.input.request, l.runtime_request, l.input.repo.clone(), l.key.map_or(0, |k| k.1));
         let req = l.req.clone();
         let (image, docker) = (req.image.clone(), req.docker.clone());
         self.vtime = self.vtime.max(fair as f64 / 1000.0);
@@ -1602,24 +1760,22 @@ impl Scheduler {
         if let Some(h) = self.holds.get_mut(runner)
             && now.saturating_add(ms(expected.unwrap_or(0.0))) > h.shadow
         {
-            sub(&mut h.extra, &request);
+            sub(&mut h.extra, &runtime_request);
         }
         let mut executor = None;
         if let Some(r) = self.runners.get_mut(runner) {
             r.running.push(id.to_owned());
             add(&mut r.used, &request);
             if r.sample.is_some() {
-                add(&mut r.since, &request);
+                add(&mut r.since, &runtime_request);
             }
             executor = req.executors.iter().find(|e| super::routing::usable(&req, &r.input.view.facts, e)).cloned();
         }
         // Its pool's idle executor there, which it alone uses.
-        let own = self.legs.get(id).and_then(|l| self.own_leg(l)).map(str::to_owned);
-        let slot = req.pool.as_ref().and_then(|p| self.executors.values_mut().find(|e| e.pool == *p && e.runner == runner && e.state == ExecState::Idle && e.leg == own)).map(|e| {
+        if let Some(e) = slot.as_deref().and_then(|id| self.executors.get_mut(id)) {
             e.state = ExecState::Busy { leg: id.to_owned() };
             e.since = now;
-            e.id.clone()
-        });
+        }
         out.push(Command::Assign { leg: id.to_owned(), runner: runner.to_owned(), attempt, executor, image, docker, slot });
     }
 
@@ -1649,6 +1805,116 @@ impl Scheduler {
         }
     }
 
+    pub fn executor_snapshot(&self, id: &str) -> Option<ExecutorSnapshot> {
+        let e = self.executors.get(id)?;
+        Some(ExecutorSnapshot { executor: e.id.clone(), pool: e.pool.clone(), runner: e.runner.clone(), reserved: e.reserved, leg: e.leg.clone(), binding: self.executor_bindings.get(id).cloned(), shape: e.shape.clone() })
+    }
+
+    /// U01: the adapter has committed this same-UID API observation to the existing grant
+    /// before RunnerUp. This attaches capacity only; it never changes physical reservations.
+    pub fn bind_pod_capacity(&mut self, id: &str, capacity: PodCapacity) -> bool {
+        if capacity.validate().is_err() { return false; }
+        let Some(e) = self.executors.get(id) else { return false; };
+        if !self.pool(&e.pool).is_some_and(|p| p.hosted) || e.reserved != Resources::default() || e.shape.as_ref().is_some_and(|old| old.pod().is_none_or(|old| !old.same_resources(&capacity))) { return false; }
+        if let Some(e) = self.executors.get_mut(id) { e.shape.get_or_insert(ExecutorShape::Kubernetes(capacity)); }
+        true
+    }
+
+    pub fn protect_executor(&mut self, id: &str) -> bool {
+        if !self.executors.contains_key(id) { return false; }
+        self.owned_executors.insert(id.to_owned());
+        true
+    }
+
+    /// U11: an acknowledged pre-write refusal returns only this exact, unprotected logical
+    /// startup. Stored/owned executors cannot enter this path or gain a physical refund.
+    pub fn refuse_executor_start(&mut self, snapshot: &ExecutorSnapshot, error: String, now: i64) -> Option<Vec<Command>> {
+        if self.owned_executors.contains(&snapshot.executor)
+            || !self.executors.get(&snapshot.executor).is_some_and(|executor| executor.state == ExecState::Starting)
+            || self.executor_snapshot(&snapshot.executor).as_ref() != Some(snapshot) { return None; }
+        let mut out = Vec::new();
+        self.executor_failed(&snapshot.executor, error, now, &mut out);
+        Some(out)
+    }
+
+    /// Restore before RunnerUp: its physical allocation stays occupied until the same grant
+    /// is recovered or fenced. Starting state prevents assigning an unverified warm executor.
+    pub fn restore_executor(&mut self, snapshot: ExecutorSnapshot, stopping: bool, now: i64) -> bool {
+        if self.executors.contains_key(&snapshot.executor) { return false; }
+        if !snapshot.runner.is_empty() {
+            let runner = snapshot.runner.clone();
+            let r = self.runners.entry(runner.clone()).or_insert_with(|| Runner { input: RunnerIn { id: runner, ..RunnerIn::default() }, running: Vec::new(), used: Resources::default(), connected: false, draining: false, sample: None, since: Resources::default() });
+            add(&mut r.used, &snapshot.reserved);
+        }
+        let id = snapshot.executor;
+        let state = if stopping { ExecState::Busy { leg: format!("retiring:{id}") } }
+            else if let Some(binding) = &snapshot.binding { ExecState::Busy { leg: binding.job.clone() } } else { ExecState::Starting };
+        if let Some(binding) = snapshot.binding { self.executor_bindings.insert(id.clone(), binding); }
+        self.executors.insert(id.clone(), Executor { id: id.clone(), pool: snapshot.pool, runner: snapshot.runner, reserved: snapshot.reserved, leg: snapshot.leg, shape: snapshot.shape,
+            state, since: now });
+        self.owned_executors.insert(id.clone());
+        if stopping { self.retiring_executors.insert(id); }
+        true
+    }
+
+    pub fn executor_stopped(&mut self, id: &str, now: i64) -> Vec<Command> {
+        let mut out = Vec::new();
+        let Some(e) = self.executors.get(id).cloned() else { return out };
+        self.remove_executor(id);
+        self.try_runner(&e.runner, now, &mut out);
+        self.scale(&e.pool, now, &mut out);
+        self.refresh_reasons(&mut out);
+        out
+    }
+
+    /// U01: attach the authenticated physical owner to an existing assignment. This changes
+    /// no resource reservation. The adapter first verifies the durable executor grant; the
+    /// core then rejects another attempt, another executor, or a changed physical owner.
+    pub fn bind_parent(&mut self, binding: crate::wire::ParentBinding) -> bool {
+        if binding.attempt == 0 || [&binding.executor, &binding.generation, &binding.allocation, &binding.physical_execution, &binding.job]
+            .iter().any(|v| v.is_empty() || v.len() > 512 || v.chars().any(char::is_control)) { return false; }
+        let Some(l) = self.legs.get(&binding.job) else { return false };
+        if l.attempt != binding.attempt || !matches!(l.state, State::Assigned { .. }) { return false; }
+        if l.req.pool.is_some() && !self.executors.values().any(|e| e.id == binding.executor
+            && (e.state == ExecState::Busy { leg: binding.job.clone() } || e.leg.as_deref() == Some(binding.job.as_str()))) { return false; }
+        if l.input.parent_binding.as_ref().is_some_and(|current| current != &binding) { return false; }
+        let Some(l) = self.legs.get_mut(&binding.job) else { return false };
+        l.input.parent_binding = Some(binding.clone());
+        self.executor_bindings.insert(binding.executor.clone(), binding);
+        true
+    }
+
+    /// U01: snapshot only an assigned attempt. Pool capacity transfers with its workload,
+    /// without issuing StopExecutor while the retained workload still uses that executor.
+    pub fn allocation(&self, id: &str, attempt: u32, reservation: String) -> Option<Allocation> {
+        let l = self.legs.get(id)?;
+        let State::Assigned { runner } = &l.state else { return None };
+        if l.attempt != attempt { return None; }
+        let mut a = Allocation { id: reservation, runner: runner.clone(), request: l.input.request,
+            mode: match claim(&l.input, self.runners.get(runner).and_then(size)) { None => ReservationMode::Ordinary, Some(Claim::Share(_)) => ReservationMode::Share, Some(Claim::Whole) => ReservationMode::Whole },
+            repo: l.input.repo.clone(), actor: l.input.actor.clone(), lane: l.input.lane.clone(), parent_binding: l.input.parent_binding.clone().or_else(|| self.executor_bindings.values().find(|b| b.job == id && b.attempt == attempt).cloned()) };
+        for e in self.executors.values().filter(|e| e.state == ExecState::Busy { leg: id.to_owned() } || e.leg.as_deref() == Some(id)) {
+            if !e.runner.is_empty() { a.runner = e.runner.clone(); }
+            add(&mut a.request, &e.reserved);
+            a.mode = ReservationMode::Share;
+        }
+        Some(a)
+    }
+
+    fn retained_finished(&mut self, id: &str, attempt: u32, allocation: Allocation, outcome: Outcome, now: i64, out: &mut Vec<Command>) {
+        if !self.legs.get(id).is_some_and(|l| l.attempt == attempt && matches!(l.state, State::Assigned { .. })) { return; }
+        // Durable replay may already have adopted the retained allocation before this receipt.
+        if !self.legs.contains_key(&allocation.id) {
+            self.adopt(allocation.leg(), allocation.runner.clone(), 1, now, out);
+        }
+        let transferred: Vec<String> = self.executors.values()
+            .filter(|e| e.state == ExecState::Busy { leg: id.to_owned() } || e.leg.as_deref() == Some(id)).map(|e| e.id.clone()).collect();
+        for executor in transferred { self.remove_executor(&executor); }
+        // No placement occurs between adoption and release; retry/quota/group handling then
+        // sees the retained reservation, including an ordinary slot and its original request.
+        self.finished(id, attempt, outcome, now, out);
+    }
+
     fn finished(&mut self, id: &str, attempt: u32, outcome: Outcome, now: i64, out: &mut Vec<Command>) {
         let Some(l) = self.legs.get(id) else { return };
         if l.attempt != attempt || l.state == State::Done {
@@ -1661,6 +1927,7 @@ impl Scheduler {
         let runner = self.release(id);
         self.stopped(id);
         self.discard_used(id, out);
+        if let Some(l) = self.legs.get_mut(id) { l.input.retained = None; l.input.parent_binding = None; }
         // Cancelled while it ran: a failure now (killed, its runner gone) is the cancel's doing.
         if let Some(why) = self.legs.get(id).and_then(|l| l.cancelling.clone()) {
             let (outcome, reason) = match outcome {
@@ -1725,6 +1992,7 @@ impl Scheduler {
         let gone = self.legs.remove(id);
         if let Some(l) = &gone {
             self.uncount(l);
+            self.forget_external_signature(l);
         }
         let group = gone.and_then(|l| l.input.group);
         self.decided.remove(id);
@@ -1893,6 +2161,7 @@ impl Scheduler {
         let gone = self.legs.remove(id);
         if let Some(l) = &gone {
             self.uncount(l);
+            self.forget_external_signature(l);
         }
         let group = gone.and_then(|l| l.input.group);
         self.decided.remove(id);
@@ -1958,6 +2227,7 @@ impl Scheduler {
         let gone = self.legs.remove(id);
         if let Some(l) = &gone {
             self.uncount(l);
+            self.forget_external_signature(l);
         }
         let group = gone.and_then(|l| l.input.group);
         self.decided.remove(id);
@@ -1998,13 +2268,25 @@ impl Scheduler {
         // A hosted executor's own runner: the executor is ready, there (W13-R07). One the
         // scheduler doesn't know is told to go.
         if let Some(e) = r.executor.clone() {
+            let expected = self.executors.get(&e).filter(|x| x.state == ExecState::Starting).and_then(|x| {
+                let p = self.pool(&x.pool)?;
+                let demand = x.leg.as_deref().and_then(|id| self.legs.get(id)).map(|l| l.runtime_request);
+                let expected = demand.unwrap_or(Resources { cpu: p.request.cpu, mem: p.request.mem, ..Resources::default() });
+                Some((demand, x.shape.as_ref().and_then(ExecutorShape::pod).is_some_and(|c| c.fits(&expected))))
+            });
+            if let Some((Some(demand), false)) = &expected {
+                // Even a restored starting pod must stop through its actual runner identity;
+                // its persisted outer grant remains server-owned and unchanged.
+                if let Some(x) = self.executors.get_mut(&e) { x.runner.clone_from(&id); }
+                self.executor_failed(&e, format!("admitted pod does not meet its own job demand: {}", needs::request_words(demand).join(", ")), now, out);
+            }
             match self.executors.get_mut(&e) {
                 Some(x) if x.state == ExecState::Starting => {
                     x.runner = id.clone();
                     x.state = ExecState::Idle;
                     x.since = now;
                     let pool = x.pool.clone();
-                    self.backoff.remove(&(pool.clone(), String::new()));
+                    if expected.as_ref().is_some_and(|(_, fits)| *fits) { self.backoff.remove(&(pool.clone(), String::new())); }
                     self.idle_timer(&pool, now, out);
                 }
                 Some(_) => {}
@@ -2073,6 +2355,11 @@ impl Scheduler {
             self.drop_executor(&e);
         }
         for leg in legs {
+            // U01: the receiver alone can end external execution ownership. Reconnection keeps
+            // this assignment even when its server-side permit has expired.
+            if self.legs.get(&leg).is_some_and(|l| l.input.external || l.input.retained.is_some()) {
+                continue;
+            }
             let attempt = self.legs.get(&leg).map_or(0, |l| l.attempt);
             self.finished(&leg, attempt, Outcome::Failed(Failed { class: FailureClass::RunnerLost, exit_code: None, log_hits: Vec::new() }), now, out);
         }
@@ -2152,7 +2439,7 @@ impl Scheduler {
     /// its memory both ([`super::place::fits`]). A runner with no fresh sample is placed as before
     /// samples were: within it.
     fn under_target(&self, r: &Runner, l: &Leg) -> bool {
-        super::place::fits(&l.input.request, headroom_of(r, self.now).as_ref(), self.config().target_use)
+        super::place::fits(&l.runtime_request, headroom_of(r, self.now).as_ref(), self.config().target_use)
     }
 
     /// Every runner as placement weighs it (kiln-seams' `Placement::nodes`): its headroom now,
@@ -2231,7 +2518,7 @@ impl Scheduler {
     fn hold_for(&self, id: &str, now: i64) -> Option<(String, RoomHold)> {
         let l = self.legs.get(id)?;
         let s = self.sigs.get(&l.sig)?;
-        let (q, target) = (l.input.request, self.config().target_use);
+        let (q, target) = (l.runtime_request, self.config().target_use);
         let mut best: Option<((i64, f64), String, RoomHold)> = None;
         for r in s.eligible.iter().filter_map(|r| self.runners.get(r)) {
             if !r.connected || r.draining || self.holds.contains_key(&r.input.id) || !self.admits(r, l) {
@@ -2239,7 +2526,7 @@ impl Scheduler {
             }
             let Some(mut free) = headroom_of(r, now) else { continue };
             let full = free.fullness(&q);
-            let mut ends: Vec<(i64, Resources)> = r.running.iter().filter_map(|x| self.legs.get(x)).map(|x| (x.ends.unwrap_or(i64::MAX), x.input.request)).collect();
+            let mut ends: Vec<(i64, Resources)> = r.running.iter().filter_map(|x| self.legs.get(x)).map(|x| (x.ends.unwrap_or(i64::MAX), x.runtime_request)).collect();
             ends.sort_by_key(|(at, _)| *at);
             let mut shadow = now;
             for (at, freed) in &ends {
@@ -2518,11 +2805,23 @@ impl Scheduler {
 
     // ------------------------------------------------------------------ pools (W13-R09)
 
-    fn pool(&self, name: &str) -> Option<&Pool> {
+    pub(super) fn pool(&self, name: &str) -> Option<&Pool> {
         self.cfg.pools.iter().find(|p| p.name == name)
     }
 
     fn drop_executor(&mut self, id: &str) {
+        if self.owned_executors.contains(id) {
+            self.retiring_executors.insert(id.to_owned());
+            if let Some(e) = self.executors.get_mut(id) { e.state = ExecState::Busy { leg: format!("retiring:{id}") }; e.leg = None; }
+            return;
+        }
+        self.remove_executor(id);
+    }
+
+    fn remove_executor(&mut self, id: &str) {
+        self.owned_executors.remove(id);
+        self.executor_bindings.remove(id);
+        self.retiring_executors.remove(id);
         if let Some(e) = self.executors.remove(id)
             && let Some(r) = self.runners.get_mut(&e.runner)
         {
@@ -2551,6 +2850,7 @@ impl Scheduler {
                     return None;
                 }
                 let c = self.config();
+                if self.has_external(r) && !self.physical_room(r, p.request, false) { return None; }
                 if let (true, Some(cap)) = (c.resources, r.input.capacity) {
                     // Beside what exclusive legs hold there, never in it.
                     let q = &p.request;
@@ -2571,27 +2871,113 @@ impl Scheduler {
         hosts.into_iter().map(|(_, h)| h).collect()
     }
 
+    /// U01: compare the actual chosen grant in both placement domains. A pod's zero outer
+    /// reservation is not its container capacity; only the authenticated API shape supplies it.
+    fn executor_fits(&self, e: &Executor, l: &Leg) -> bool {
+        self.pool(&e.pool).is_some_and(|p| Self::executor_fits_in(p, e, l))
+    }
+
+    fn executor_fits_in(p: &Pool, e: &Executor, l: &Leg) -> bool {
+        if p.hosted {
+            e.shape.as_ref().and_then(ExecutorShape::pod).is_some_and(|capacity| capacity.fits(&l.runtime_request))
+        } else {
+            match &e.shape {
+                Some(ExecutorShape::Firecracker(shape)) => p.executor == "firecracker"
+                    && shape.validate_grant(&e.reserved).is_ok() && grant_fits(&l.runtime_request, &shape.guest_resources()),
+                Some(ExecutorShape::Kubernetes(_)) => false,
+                // Legacy VM reservations remain owned but authorize no new work. Recovery
+                // retires unused instances through the existing physical stop-proof path.
+                None => p.executor != "firecracker" && grant_fits(&l.runtime_request, &e.reserved),
+            }
+        }
+    }
+
+    fn future_pod_fits(p: &Pool, l: &Leg) -> bool {
+        l.input.placement.runner.is_none() && l.runtime_request.disk == 0 && l.runtime_request.gpu == 0
+            && p.job_capacity().is_some_and(|capacity| grant_fits(&l.runtime_request, &capacity))
+    }
+
+    fn idle_executor(&self, pool: &str, runner: &str, l: &Leg) -> Option<&Executor> {
+        let own = self.own_leg(l);
+        self.executors.values().filter(|e| e.pool == pool && e.runner == runner
+            && e.state == ExecState::Idle && e.leg.as_deref() == own && self.executor_fits(e, l)).min_by(|a, b| a.id.cmp(&b.id))
+    }
+
+    /// Match actual idle grants to distinct active demands. A single small queued job cannot
+    /// make every small warm grant appear useful while a larger job is left uncovered.
+    fn idle_coverage<'a>(&self, p: &Pool, queued: &[&'a Leg]) -> (usize, BTreeSet<String>, Vec<&'a Leg>) {
+        let mut legs: Vec<&Leg> = queued.iter().copied().filter(|l| if p.hosted { Self::future_pod_fits(p, l) } else { p.job_capacity().is_some_and(|capacity| grant_fits(&l.runtime_request, &capacity)) }).collect();
+        legs.sort_by(|a, b| a.input.id.cmp(&b.input.id));
+        let mut idle: Vec<&Executor> = self.executors.values().filter(|e| e.pool == p.name && e.state == ExecState::Idle).collect();
+        idle.sort_by(|a, b| a.id.cmp(&b.id));
+        let matched = pools::coverage(legs.len(), idle.len(), |leg, executor| {
+            legs.get(leg).zip(idle.get(executor)).is_some_and(|(l, e)| e.leg.as_deref() == (p.hosted && l.input.own_executor).then_some(l.input.id.as_str())
+                && l.input.placement.allows(&e.runner) && self.sigs.get(&l.sig).is_some_and(|s| s.eligible.contains(&e.runner))
+                && self.runners.get(&e.runner).is_some_and(|r| r.connected && !r.draining) && Self::executor_fits_in(p, e, l))
+        });
+        let covered: BTreeSet<String> = matched.iter().flatten().filter_map(|i| idle.get(*i)).map(|e| e.id.clone()).collect();
+        let usable = if p.hosted { idle.iter().filter(|e| e.leg.is_none() && covered.contains(&e.id)).count() } else { covered.len() };
+        let uncovered = legs.into_iter().zip(matched).filter_map(|(leg, executor)| executor.is_none().then_some(leg)).collect();
+        (usable, covered, uncovered)
+    }
+
+    /// An older, smaller warm grant cannot permanently occupy the last place in a pool. Stop
+    /// only an idle executor left outside maximum queued coverage, when today's pool can serve
+    /// that work. Existing durable ownership holds the footprint until actual stop proof.
+    fn undersized_idle(&self, p: &Pool, waiting: &[&Leg], covered: &BTreeSet<String>, needed: usize) -> Vec<(String, String)> {
+        if needed == 0 { return Vec::new(); }
+        let mine: Vec<&Executor> = self.executors.values().filter(|e| e.pool == p.name).collect();
+        let mut per_host: HashMap<&str, usize> = HashMap::new();
+        for e in &mine { *per_host.entry(e.runner.as_str()).or_default() += 1; }
+        let mut stop: Vec<(String, String)> = mine.iter().filter(|e| e.state == ExecState::Idle && e.leg.is_none() && !covered.contains(&e.id)).filter(|e| {
+            if p.hosted {
+                return mine.len() >= p.max && waiting.iter().any(|l| Self::future_pod_fits(p, l));
+            }
+            let count = per_host.get(e.runner.as_str()).copied().unwrap_or(0);
+            if mine.len() < p.max && count < p.per_host_max { return false; }
+            let here = |l: &Leg| l.input.placement.allows(&e.runner) && self.runners.get(&e.runner).is_some_and(|r| self.routable(&l.req, r));
+            waiting.iter().any(|l| here(l) && p.job_capacity().is_some_and(|capacity| grant_fits(&l.runtime_request, &capacity)))
+        }).map(|e| (e.id.clone(), e.runner.clone())).collect();
+        stop.sort();
+        stop.truncate(needed);
+        stop
+    }
+
     /// Starts as many of `pool`'s executors as its waiting legs and `min_idle` want.
     fn scale(&mut self, pool: &str, now: i64, out: &mut Vec<Command>) {
         let Some(p) = self.pool(pool).cloned() else { return };
+        if p.executor == "firecracker" && p.job_capacity().is_none() { return; }
+        if p.hosted && self.backoff.get(&(p.name.clone(), String::new())).is_some_and(|(until, _)| *until > now) { return; }
+        // U01: only active queued IDs, collected once for this pool. Historical legs never
+        // participate in startup demand or replacement, and host counts are built once above.
+        let queued: Vec<&Leg> = self.sigs.values().filter(|s| s.req.pool.as_deref() == Some(pool))
+            .flat_map(|s| s.queue.values().flat_map(|sub| sub.iter().map(|(_, _, id)| id)))
+            .filter_map(|id| self.legs.get(id)).collect();
+        let waiting = queued.iter().filter(|l| if p.hosted { Self::future_pod_fits(&p, l) } else { p.job_capacity().is_some_and(|capacity| grant_fits(&l.runtime_request, &capacity)) }).count();
+        let (usable_idle, covered, uncovered) = self.idle_coverage(&p, &queued);
+        let starting = self.executors.values().filter(|e| e.pool == pool && e.state == ExecState::Starting).count();
+        let retiring = self.retiring_executors.iter().filter(|id| self.executors.get(*id).is_some_and(|e| e.pool == pool)).count();
+        let stop = self.undersized_idle(&p, &uncovered, &covered, uncovered.len().saturating_sub(starting + retiring));
+        let waiting_pods: Vec<(String, bool)> = if p.hosted { queued.iter().filter(|l| Self::future_pod_fits(&p, l)).map(|l| (l.input.id.clone(), l.input.own_executor)).collect() } else { Vec::new() };
+        if p.hosted && !stop.is_empty() {
+            self.startup_backoff(&p.name, "", "admitted pod capacity cannot serve uncovered demand; inspect the API shape and pool requests".into(), now, out);
+        }
+        for (id, runner) in stop {
+            self.drop_executor(&id);
+            out.push(Command::StopExecutor { executor: id, runner });
+        }
         let count = |s: fn(&ExecState) -> bool| self.executors.values().filter(|e| e.pool == pool && s(&e.state)).count();
         let (starting, idle, busy) = (count(|s| *s == ExecState::Starting), count(|s| *s == ExecState::Idle), count(|s| matches!(s, ExecState::Busy { .. })));
-        let mut want = pools::wanted(&p, starting, idle, busy, self.waiting_for(pool));
+        // Every grant still occupies max; only a fitting idle grant covers queued demand.
+        // An incompatible warm grant below max must not suppress a needed cold startup.
+        let mut want = pools::wanted_for(&p, starting, idle, busy, waiting, usable_idle);
         // The server's executors (a `k8s` pool's pods): started by it, each its own runner once
         // it connects; not while a failed start's backoff lasts.
         if p.hosted {
-            if self.backoff.get(&(p.name.clone(), String::new())).is_some_and(|(until, _)| *until > now) {
-                return;
-            }
+            if self.backoff.get(&(p.name.clone(), String::new())).is_some_and(|(until, _)| *until > now) { return; }
             // Each waiting leg that needs a pod of its own (W13-R07) gets one, within `max`; the
             // shared ones are for the others.
-            let waiting: Vec<(String, bool)> = self
-                .sigs
-                .values()
-                .filter(|s| s.req.pool.as_deref() == Some(pool))
-                .flat_map(|s| s.queue.values().flat_map(|sub| sub.iter().map(|(_, _, id)| id.clone())))
-                .filter_map(|id| self.legs.get(&id).map(|l| (id, l.input.own_executor)))
-                .collect();
+            let waiting = waiting_pods;
             let mut room = p.max.saturating_sub(self.executors.values().filter(|e| e.pool == pool).count());
             for (leg, _) in waiting.iter().filter(|(_, own)| *own) {
                 if room == 0 {
@@ -2606,7 +2992,8 @@ impl Scheduler {
             let shared = |s: fn(&ExecState) -> bool| self.executors.values().filter(|e| e.pool == pool && e.leg.is_none() && s(&e.state)).count();
             let (starting, idle, busy) = (shared(|s| *s == ExecState::Starting), shared(|s| *s == ExecState::Idle), shared(|s| matches!(s, ExecState::Busy { .. })));
             let others = waiting.iter().filter(|(_, own)| !*own).count();
-            for _ in 0..pools::wanted(&p, starting, idle, busy, others).min(room) {
+            let want = pools::wanted_for(&p, starting, idle, busy, others, usable_idle).min(room);
+            for _ in 0..want {
                 self.start_hosted(&p, None, now, out);
             }
             return;
@@ -2614,13 +3001,13 @@ impl Scheduler {
         while want > 0 {
             let Some(host) = self.hosts_for(&p, now).into_iter().next() else { break };
             self.seq += 1;
-            let id = format!("pool-{pool}-{now:x}-{:x}", self.seq);
-            self.executors.insert(id.clone(), Executor { id: id.clone(), pool: pool.to_owned(), runner: host.clone(), state: ExecState::Starting, since: now, reserved: p.request, leg: None });
+            let mut id = format!("pool-{pool}-{now:x}-{:x}", self.seq);
+            while self.executors.contains_key(&id) { self.seq += 1; id = format!("pool-{pool}-{now:x}-{:x}", self.seq); }
+            self.executors.insert(id.clone(), Executor { id: id.clone(), pool: pool.to_owned(), runner: host.clone(), state: ExecState::Starting, since: now, reserved: p.request, leg: None, shape: p.shape.clone() });
             if let Some(r) = self.runners.get_mut(&host) {
                 add(&mut r.used, &p.request);
-                if r.sample.is_some() {
-                    add(&mut r.since, &p.request);
-                }
+                // Pool resources reserve physical capacity; the job demand counts when assigned.
+                // Startup usage itself is observed in the runner's sample, not guessed from its grant.
             }
             out.push(Command::StartExecutor { pool: pool.to_owned(), executor: id, runner: host, kind: p.executor.clone(), image: p.image.clone(), leg: None });
             want -= 1;
@@ -2630,9 +3017,10 @@ impl Scheduler {
     /// One of a hosted pool's executors started by the server: made for `leg`, or for any.
     fn start_hosted(&mut self, p: &Pool, leg: Option<String>, now: i64, out: &mut Vec<Command>) {
         self.seq += 1;
-        let id = format!("pool-{}-{now:x}-{:x}", p.name, self.seq);
+        let mut id = format!("pool-{}-{now:x}-{:x}", p.name, self.seq);
+        while self.executors.contains_key(&id) { self.seq += 1; id = format!("pool-{}-{now:x}-{:x}", p.name, self.seq); }
         self.executors
-            .insert(id.clone(), Executor { id: id.clone(), pool: p.name.clone(), runner: String::new(), state: ExecState::Starting, since: now, reserved: Resources::default(), leg: leg.clone() });
+            .insert(id.clone(), Executor { id: id.clone(), pool: p.name.clone(), runner: String::new(), state: ExecState::Starting, since: now, reserved: Resources::default(), leg: leg.clone(), shape: None });
         out.push(Command::StartExecutor { pool: p.name.clone(), executor: id, runner: String::new(), kind: p.executor.clone(), image: p.image.clone(), leg });
     }
 
@@ -2660,6 +3048,7 @@ impl Scheduler {
         let (pool, runner) = (e.pool.clone(), e.runner.clone());
         self.backoff.remove(&(pool.clone(), runner.clone()));
         self.try_runner(&runner, now, out);
+        self.scale(&pool, now, out);
         self.idle_timer(&pool, now, out);
         self.refresh_reasons(out);
         self.review_admission(now, out);
@@ -2667,20 +3056,26 @@ impl Scheduler {
 
     fn executor_failed(&mut self, id: &str, error: String, now: i64, out: &mut Vec<Command>) {
         let Some(e) = self.executors.get(id).cloned() else { return };
+        if self.owned_executors.contains(id) { out.push(Command::StopExecutor { executor: id.to_owned(), runner: e.runner.clone() }); }
         self.drop_executor(id);
         // Gone under its leg: the leg's runner reports how the attempt ended.
         if matches!(e.state, ExecState::Busy { .. }) {
             return;
         }
-        // The host is left alone a while, longer each time it fails.
-        let key = (e.pool.clone(), e.runner.clone());
-        let delay = self.backoff.get(&key).map_or(pools::FIRST_BACKOFF_MS, |(_, d)| *d);
-        self.backoff.insert(key, (now + delay, (delay * 2).min(pools::MAX_BACKOFF_MS)));
-        self.pool_errors.insert(e.pool.clone(), (e.runner.clone(), error));
-        self.timers.entry(now + delay).or_default();
-        out.push(Command::Timer { at: now + delay });
+        // Hosted retries belong to the pool, never a fresh pod runner name each time.
+        let host = if self.pool(&e.pool).is_some_and(|p| p.hosted) { "" } else { e.runner.as_str() };
+        self.startup_backoff(&e.pool, host, error, now, out);
         self.scale(&e.pool, now, out);
         self.refresh_reasons(out);
+    }
+
+    fn startup_backoff(&mut self, pool: &str, host: &str, error: String, now: i64, out: &mut Vec<Command>) {
+        let key = (pool.to_owned(), host.to_owned());
+        let delay = self.backoff.get(&key).map_or(pools::FIRST_BACKOFF_MS, |(_, d)| *d);
+        self.backoff.insert(key, (now + delay, (delay * 2).min(pools::MAX_BACKOFF_MS)));
+        self.pool_errors.insert(pool.to_owned(), (host.to_owned(), error));
+        self.timers.entry(now + delay).or_default();
+        out.push(Command::Timer { at: now + delay });
     }
 
     /// A timer for when `pool`'s oldest idle executor passes its `idle_timeout`.
@@ -2766,6 +3161,24 @@ impl Scheduler {
         }
     }
 
+    /// W05-R03/U01: one explanation for a runnable place blocked only by its live CPU or
+    /// memory headroom. For pooled work room() requires an actual fitting idle executor.
+    fn headroom_reason(&self, eligible: &[&Runner], l: &Leg) -> Option<WaitReason> {
+        let mut past: Vec<String> = eligible.iter().filter(|r| r.connected && !r.draining && self.room(r, l) && !self.under_target(r, l)).map(|r| r.input.view.name.clone()).collect();
+        if past.is_empty() { return None; }
+        past.sort();
+        let name = |id: &str| self.runners.get(id).map_or_else(|| id.to_owned(), |r| r.input.view.name.clone());
+        let held = self.holds.iter().find(|(_, h)| h.leg == l.input.id);
+        Some(WaitReason::Headroom {
+            target: (self.config().target_use * 100.0).round() as u32,
+            runners: past,
+            request: needs::request_words(&l.runtime_request).join(" and "),
+            place: place_of(&l.req),
+            held: held.map(|(r, _)| name(r)),
+            room_at: held.map(|(_, h)| h.shadow),
+        })
+    }
+
     /// Why a queued leg waits (W05-R13).
     fn wait_reason(&self, id: &str) -> WaitReason {
         let Some(l) = self.legs.get(id) else { return WaitReason::Unroutable { failing: Vec::new() } };
@@ -2803,8 +3216,53 @@ impl Scheduler {
         {
             return WaitReason::OtherRunner { avoided: name(a), refused: false, asked: true };
         }
+        if let Some(p) = l.req.pool.as_deref().and_then(|p| self.pool(p)).filter(|p| p.hosted) {
+            let q = &l.runtime_request;
+            let mut short = Vec::new();
+            if q.disk > 0 { short.push("pod workspace disk growth is unsupported by the current volume configuration".into()); }
+            if q.gpu > 0 { short.push("pod GPU assignment is unsupported by the current launcher".into()); }
+            if short.is_empty() {
+                let own = self.own_leg(l);
+                let grants: Vec<&Executor> = self.executors.values().filter(|e| e.pool == p.name
+                    && e.leg.as_deref() == own && eligible.iter().any(|r| r.input.id == e.runner)).collect();
+                if !grants.is_empty() && !grants.iter().any(|e| self.executor_fits(e, l)) {
+                    short = grants.iter().map(|e| {
+                        let reason = e.shape.as_ref().and_then(ExecutorShape::pod).map_or_else(|| "capacity is unknown; authenticated same-UID observation is required".into(), |c| c.short(q).join("; "));
+                        format!("executor {}: {reason}{}", e.id, if self.retiring_executors.contains(&e.id) { "; replacement waits for verified stop" } else { "" })
+                    }).collect();
+                } else if grants.is_empty() && !Self::future_pod_fits(p, l) {
+                    short.push(format!("pool {} starts pods smaller than this job; increase its configured CPU/memory requests", p.name));
+                }
+            }
+            if !short.is_empty() {
+                short.sort();
+                return WaitReason::Oversized { asked: needs::request_words(q).join(", "), short };
+            }
+        }
         if let (Some(pool), false) = (&l.req.pool, eligible.is_empty()) {
             let mine: Vec<&Executor> = self.executors.values().filter(|e| e.pool == *pool).collect();
+            if let Some(p) = self.pool(pool).filter(|p| !p.hosted) {
+                let grants: Vec<&&Executor> = mine.iter().filter(|e| eligible.iter().any(|r| r.input.id == e.runner)).collect();
+                if !grants.iter().any(|e| self.executor_fits(e, l)) {
+                    let replacement = p.job_capacity().is_some_and(|capacity| grant_fits(&l.runtime_request, &capacity));
+                    let mut short: Vec<String> = grants.iter().map(|e| {
+                        let reserved = needs::request_words(&e.reserved).join(", ");
+                        format!("executor {} reserves {}{}", e.id, if reserved.is_empty() { "no resources" } else { &reserved },
+                            if self.retiring_executors.contains(&e.id) { "; replacement waits for verified stop" } else { "" })
+                    }).collect();
+                    if !replacement {
+                        let capacity = p.job_capacity().map(|q| needs::request_words(&q).join(", ")).unwrap_or_default();
+                        short.push(format!("pool {pool} provides {} for jobs after startup overhead; declare a usable shape or increase its resources to fit this job", if capacity.is_empty() { "no usable capacity" } else { &capacity }));
+                    }
+                    if !short.is_empty() {
+                        short.sort();
+                        return WaitReason::Oversized { asked: needs::request_words(&l.runtime_request).join(", "), short };
+                    }
+                }
+            }
+            if let Some(reason) = self.headroom_reason(&eligible, l) {
+                return reason;
+            }
             let starting: Vec<&&Executor> = mine.iter().filter(|e| e.state == ExecState::Starting).collect();
             if let Some(since) = starting.iter().map(|e| e.since).min() {
                 return WaitReason::Scaling { pool: pool.clone(), starting: starting.len(), since };
@@ -2838,18 +3296,8 @@ impl Scheduler {
                 return WaitReason::Exclusive;
             }
             // The runners with room for it all past the target use with it, by their samples (W05).
-            let mut past: Vec<String> = eligible.iter().filter(|r| r.connected && !r.draining && self.room(r, l) && !self.under_target(r, l)).map(|r| r.input.view.name.clone()).collect();
-            past.sort();
-            if !past.is_empty() {
-                let held = self.holds.iter().find(|(_, h)| h.leg == l.input.id);
-                return WaitReason::Headroom {
-                    target: (self.config().target_use * 100.0).round() as u32,
-                    runners: past,
-                    request: needs::request_words(&l.input.request).join(" and "),
-                    place: place_of(&l.req),
-                    held: held.map(|(r, _)| name(r)),
-                    room_at: held.map(|(_, h)| h.shadow),
-                };
+            if let Some(reason) = self.headroom_reason(&eligible, l) {
+                return reason;
             }
             let draining = eligible.iter().filter(|r| r.draining).count();
             let busy = eligible.iter().filter(|r| !r.draining && !self.fits(r, l)).count();
@@ -3044,6 +3492,13 @@ fn place_of(req: &Requirement) -> String {
     }
 }
 
+/// U01: quantities fit the actual immutable grant in every dimension. Zero reserves none.
+fn grant_fits(request: &Resources, reserved: &Resources) -> bool {
+    request.cpu.is_finite() && reserved.cpu.is_finite() && request.cpu >= 0.0 && reserved.cpu >= 0.0
+        && request.cpu <= reserved.cpu + 1e-9 && request.mem <= reserved.mem
+        && request.disk <= reserved.disk && request.gpu <= reserved.gpu
+}
+
 /// Whether `request` fits in what a hold leaves beside its leg.
 fn beside(request: &Resources, extra: &Resources) -> bool {
     request.cpu <= extra.cpu + 1e-9 && request.mem <= extra.mem
@@ -3065,4 +3520,26 @@ fn load(r: &Runner) -> f64 {
 
 fn free(r: &Runner) -> usize {
     (r.input.slots.max(1) as usize).saturating_sub(r.running.len())
+}
+
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    #[test]
+    fn u01_ended_external_requests_do_not_accumulate_scheduler_signatures() {
+        let mut scheduler = Scheduler::new(Config::default());
+        for i in 0..256 {
+            let id = format!("reach-{i}");
+            scheduler.handle(Input::LegQueued(Box::new(LegIn {
+                id: id.clone(), run: id.clone(), repo: "reach/caller".into(), external: true,
+                route: LegRoute { labels: vec![format!("unique-{i}")], ..LegRoute::default() },
+                ..LegIn::default()
+            })), i);
+            scheduler.handle(Input::LegGone { leg: id }, i);
+        }
+        assert!(scheduler.legs.is_empty());
+        assert!(scheduler.sigs.is_empty(), "ended calls must not leave an unbounded predicate cache");
+    }
 }

@@ -50,10 +50,9 @@ export function standOf(a: AgentInfo, seen: number | undefined): MissionStand {
 /** What an agent working through its subagents is doing: how many, and what each does. */
 export const subagentsLine = (subs: readonly SubagentBrief[]): string => [subs.length === 1 ? "1 subagent" : `${subs.length} subagents`, ...subs.map((s) => s.description)].join(" · ");
 
-/** Sessions kiln runs itself, and their subagents, aren't listed again as sessions found on the machines. */
-export function missionFoundSessions(found: AiSession[], managed: { a: AgentInfo }[]): AiSession[] {
-  const known = new Set(managed.flatMap(({ a }) => [a.harness_session, ...(a.subagents ?? []).map((task) => task.id)]).filter(Boolean));
-  return found.filter((session) => !session.managed_by && !known.has(session.id));
+/** U13: only the API's scoped ownership projection hides a found session; roster/task ids alone do not identify its harness or machine. */
+export function missionFoundSessions(found: AiSession[], _managed: { a: AgentInfo }[]): AiSession[] {
+  return found.filter((session) => !session.managed_by);
 }
 
 /** A subagent's events share its agent's conversation, but aren't Mission Control search results. */

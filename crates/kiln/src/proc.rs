@@ -14,6 +14,39 @@ pub async fn spawn_duplex_in_pool(cmd: std::process::Command, group: Option<crat
     crate::rt::blocking(move || spawn_duplex_in(cmd, group.as_ref())).await?
 }
 
+/// U08: an ordinary captured command cannot claim independently retired physical custody
+/// without the current native owner. Parent ownership is authenticated, but its local command
+/// finish is not a descendant-death receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CustodyRefusal { NoExecution, InheritedExecution }
+impl std::fmt::Display for CustodyRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NoExecution => "captured custody requires an existing physical execution owner",
+            Self::InheritedExecution => "the authenticated parent has no independently retired command child capability",
+        })
+    }
+}
+impl std::error::Error for CustodyRefusal {}
+
+/// U08: hold the caller's opaque resource in the existing physical command owner through
+/// cancellation and exact native retirement. The caller passes a clone of the SAME resource
+/// custody, not a new lock. The scope must already belong to a native Execution. Inherited
+/// execution is refused before submission; there is no raw-process fallback or new grant.
+pub async fn output_with_custody<H: Send + 'static>(cmd: std::process::Command, timeout: std::time::Duration, custody: H) -> anyhow::Result<std::process::Output> {
+    let execution = crate::runner::processes::current().ok_or(CustodyRefusal::NoExecution)?;
+    crate::runner::processes::captured::output(cmd, timeout, custody, execution).await
+}
+
+/// U08: reconcile the SAME host admission owner before acquiring an external resource fence.
+/// Every output_with_custody launch revalidates again while holding the supplied fence, so an
+/// owner dying while that File was awaited cannot turn a stale startup check into permission.
+/// Server/background integration must enter its existing native Execution scope first.
+pub async fn reconcile_custody_admission() -> anyhow::Result<()> {
+    let execution = crate::runner::processes::current().ok_or(CustodyRefusal::NoExecution)?;
+    crate::runner::processes::captured::reconcile(execution).await
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

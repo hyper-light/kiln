@@ -14,7 +14,7 @@ use std::collections::HashMap;
 
 use http::StatusCode;
 use kiln_ci::work::reap::{self, Policy, Scope};
-use rusqlite::params;
+use crate::sql::params;
 use serde_json::{Value, json};
 
 use super::Fail;
@@ -95,7 +95,7 @@ async fn load(hub: &Hub, wanted: Vec<(Scope, String)>) -> Result<Vec<(Scope, Str
 }
 
 /// The system's policy and each repository's, as stored (for the server's reaper, W24-R31).
-pub fn stored(c: &rusqlite::Connection) -> rusqlite::Result<(Policy, std::collections::BTreeMap<String, Policy>)> {
+pub fn stored(c: &crate::sql::Connection) -> crate::sql::Result<(Policy, std::collections::BTreeMap<String, Policy>)> {
     let mut system = Policy::default();
     let mut repos = std::collections::BTreeMap::new();
     let mut st = c.prepare("SELECT scope, target, policy FROM work_reap_policies WHERE scope IN ('system', 'repo')")?;

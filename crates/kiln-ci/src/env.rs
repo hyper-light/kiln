@@ -29,6 +29,17 @@ pub const MAX_REVIEWERS: usize = 6;
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct Protection {
+    /// U10: explicit canonical policy binding, never inferred from an environment name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy: Option<EnvironmentId>,
+    /// Counted approvals, shared with release gates. Legacy `reviewers` means one approval.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approvals: Option<Approvals>,
+    /// Additional prerequisites; legacy `after` remains accepted on import.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub prerequisites: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freeze: Option<String>,
     /// Required reviewers: people (`alice`) or teams (`team:web`); any one of them approves.
     pub reviewers: Vec<String>,
     /// The run's actor can't approve its own deployment.
@@ -75,6 +86,8 @@ impl CustomGate {
 pub struct Found {
     /// When its deployment to `after` succeeded, if it did.
     pub promoted_at: Option<i64>,
+    /// U10: observations of every canonical prerequisite, supplied by the domain service.
+    pub prerequisites: Vec<(String, Prerequisite)>,
     /// Each custom gate's name and result: passed, failed, or not yet (`None`).
     pub gates: Vec<(String, Option<bool>)>,
 }
@@ -126,14 +139,14 @@ pub fn closed(windows: &[Window], now: i64) -> Result<Option<(i64, String)>, Str
     for w in windows {
         let (cron, tz, secs, deny) = w.parts()?;
         // Open now when it opened within its length.
-        let opened = cron.fires_in(now - secs, now, &tz, 10_000).last().copied();
+        let opened = cron.fires_in(now.saturating_sub(secs), now, &tz, 10_000).last().copied();
         match (deny, opened) {
-            (true, Some(t)) => return Ok(Some((t + secs, format!("a deny window (`{}`, {}) holds deployments until {}", w.deny.as_deref().unwrap_or_default(), w.duration, at(t + secs))))),
+            (true, Some(t)) => return Ok(Some((t.saturating_add(secs), format!("a deny window (`{}`, {}) holds deployments until {}", w.deny.as_deref().unwrap_or_default(), w.duration, at(t.saturating_add(secs)))))),
             (true, None) => {}
             (false, Some(_)) => allow_open = Some(true),
             (false, None) => {
                 allow_open.get_or_insert(false);
-                if let Some(t) = cron.fires_in(now, now + 60 * 24 * 3600, &tz, 1).first().copied() {
+                if let Some(t) = cron.fires_in(now, now.saturating_add(60 * 24 * 3600), &tz, 1).first().copied() {
                     next_allow = Some(next_allow.map_or(t, |n| n.min(t)));
                 }
             }
@@ -141,7 +154,7 @@ pub fn closed(windows: &[Window], now: i64) -> Result<Option<(i64, String)>, Str
     }
     Ok(match allow_open {
         Some(false) => {
-            let until = next_allow.unwrap_or(now + 3600);
+            let until = next_allow.unwrap_or(now.saturating_add(3600));
             Some((until, format!("no allow window is open: the next opens at {}", at(until))))
         }
         _ => None,
@@ -165,7 +178,7 @@ impl Protection {
         }
         if let Some(t) = &self.soak {
             anyhow_free_seconds(t).ok_or_else(|| format!("`soak: {t}` isn't a duration (`30m`, `2h`, `1d`)"))?;
-            if self.after.is_none() {
+            if self.after.is_none() && self.prerequisites.is_empty() {
                 return Err("`soak` says how long a commit runs in the environment `after` names: say `after` too".into());
             }
         }
@@ -184,8 +197,172 @@ impl Protection {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.reviewers.is_empty() && self.wait_timer == 0 && self.branches.is_none() && self.tags.is_none() && self.windows.is_empty() && self.after.is_none() && self.gates.is_empty()
+        self.policy.is_none() && self.approvals.is_none() && self.prerequisites.is_empty() && self.freeze.is_none() && self.reviewers.is_empty() && self.wait_timer == 0 && self.branches.is_none() && self.tags.is_none() && self.windows.is_empty() && self.after.is_none() && self.gates.is_empty()
     }
+}
+
+/// U10: an environment name is meaningful only within its owner scope. Server release
+/// environments and repository job environments never collide merely because names match.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "id", rename_all = "kebab-case")]
+pub enum EnvironmentScope {
+    Server,
+    Repository(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvironmentId {
+    pub scope: EnvironmentScope,
+    pub name: String,
+}
+
+impl EnvironmentId {
+    /// A JSON tuple is unambiguous even when a repository id contains punctuation.
+    pub fn key(&self) -> Result<Vec<u8>, serde_json::Error> {
+        serde_json::to_vec(&(&self.scope, self.name.to_ascii_lowercase()))
+    }
+}
+
+/// U10: approvals authorize one protected action, never another job or release. A combined
+/// flow can use a single explicit action id; matching names or commits confer no authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "id", rename_all = "kebab-case")]
+pub enum ProtectedAction {
+    Job(String),
+    Release(String),
+    Flow(String),
+}
+
+/// The common approval policy. Callers still enforce capabilities, agent permission and team
+/// membership before recording a decision; the evaluator only receives eligible decisions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Approvals {
+    #[serde(default = "one_approval")]
+    pub count: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reviewers: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub self_approve: bool,
+}
+
+fn one_approval() -> u32 { 1 }
+
+/// Normalize the person behind a user, token or delegated agent principal.
+pub fn person(name: &str) -> &str {
+    let name = name.rsplit_once(" for ").or_else(|| name.rsplit_once(" of ")).map_or(name, |(_, who)| who);
+    name.strip_prefix("user:").unwrap_or(name)
+}
+
+/// Distinct eligible people who approved. Repeated durable decisions do not count twice.
+pub fn approved_people<'a>(policy: &Approvals, actor: &str, people: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
+    let mut people: Vec<&str> = people.into_iter().map(person)
+        .filter(|p| policy.self_approve || *p != person(actor))
+        .filter(|p| policy.reviewers.is_empty() || policy.reviewers.iter().any(|r| r == *p))
+        .collect();
+    people.sort_unstable();
+    people.dedup();
+    people
+}
+
+/// U10: shared admission limit; the owner supplies active observations and serializes admission.
+pub fn concurrency_available(limit: Option<u32>, active: usize) -> bool {
+    limit.is_none_or(|n| active < usize::try_from(n).unwrap_or(usize::MAX))
+}
+
+/// A successful prerequisite's soak deadline. Saturation keeps hostile timestamps from panicking.
+pub fn soak_until(since: i64, duration: Option<&str>, now: i64) -> Result<Option<i64>, String> {
+    let Some(duration) = duration else { return Ok(None) };
+    let seconds = anyhow_free_seconds(duration).ok_or_else(|| format!("soak `{duration}` isn't a duration (`30m`, `2h`, `1d`)"))?;
+    Ok(Some(since.saturating_add(seconds)).filter(|until| *until > now))
+}
+
+/// U10: what a domain observed upstream. Artifact equality, remote signatures and the
+/// definition of successful deployment belong to that domain, not to this policy engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Prerequisite {
+    Running { since: i64 },
+    Pending(String),
+    Refused(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrerequisiteGate {
+    Open,
+    Waiting { until: Option<i64>, why: String },
+    Refused(String),
+}
+
+pub fn prerequisite_gate(observed: &Prerequisite, soak: Option<&str>, now: i64) -> Result<PrerequisiteGate, String> {
+    Ok(match observed {
+        Prerequisite::Running { since } => match soak_until(*since, soak, now)? {
+            Some(until) => PrerequisiteGate::Waiting { until: Some(until), why: format!("soaking until {}", at(until)) },
+            None => PrerequisiteGate::Open,
+        },
+        Prerequisite::Pending(why) => PrerequisiteGate::Waiting { until: None, why: why.clone() },
+        Prerequisite::Refused(why) => PrerequisiteGate::Refused(why.clone()),
+    })
+}
+
+/// U10: canonical target identity; provider-specific execution consumes these declarations.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Targets {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub clusters: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runners: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integration: Option<String>,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub platforms: std::collections::BTreeMap<String, serde_json::Map<String, serde_json::Value>>,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub kilncd: std::collections::BTreeMap<String, String>,
+}
+
+impl Targets {
+    /// Restrict a declaration to the target kind it names.
+    pub fn of(self, kind: Option<&str>) -> Self {
+        match kind {
+            Some("kubernetes") => Self { clusters: self.clusters, namespace: self.namespace.filter(|n| !n.trim().is_empty()), kilncd: self.kilncd, ..Self::default() },
+            Some("host" | "container" | "microvm") => Self { runners: self.runners.map(|r| r.trim().to_owned()), ..Self::default() },
+            Some("platform") => Self { integration: self.integration.map(|i| i.trim().to_owned()), platforms: self.platforms, ..Self::default() },
+            _ => Self::default(),
+        }
+    }
+}
+
+/// U10: one persisted policy and target identity, independent of its job/release consumer.
+/// Consumer-specific provider settings and release observations remain outside this record.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EnvironmentPolicy {
+    /// The declared producer, so removing versioned configuration cannot leave stale rules.
+    pub source: String,
+    /// Prior saved definition while a versioned config explicitly overrides it. This is an
+    /// import/source snapshot, never another evaluated policy; removing that config restores it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<Box<EnvironmentPolicy>>,
+    pub protection: Protection,
+    pub concurrency: Option<u32>,
+    pub agents_approve: bool,
+    pub targets: Targets,
+    pub kind: Option<String>,
+}
+
+/// A durable decision's explicit protection boundary (U10).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionReview {
+    pub environment: EnvironmentId,
+    pub action: ProtectedAction,
+    pub review: Review,
+}
+
+/// Select only decisions for this exact action and owner. Rejections remain durable as well.
+pub fn action_reviews(environment: &EnvironmentId, action: &ProtectedAction, reviews: &[ActionReview]) -> Vec<Review> {
+    reviews.iter().filter(|r| r.environment.scope == environment.scope && r.environment.name.eq_ignore_ascii_case(&environment.name) && r.action == *action).map(|r| r.review.clone()).collect()
 }
 
 /// A reviewer's decision on a run's deployment to an environment.
@@ -220,6 +397,12 @@ pub fn gate(env: &str, p: &Protection, git_ref: &str, ready_at: i64, now: i64, r
 
 /// [`gate`], with what was found of the commit's promotion and custom gates.
 pub fn gate_with(env: &str, p: &Protection, git_ref: &str, ready_at: i64, now: i64, reviews: &[Review], found: &Found) -> Gate {
+    if let Err(why) = p.check() {
+        return Gate::Refused(why);
+    }
+    if let Some(why) = &p.freeze {
+        return Gate::Waiting { reviewers: Vec::new(), until: None, window: Some(format!("{env} is frozen: {why}")), promotion: None, gate: None };
+    }
     if p.branches.is_some() || p.tags.is_some() {
         let (what, name, patterns) = match git_ref.strip_prefix("refs/tags/") {
             Some(tag) => ("Tag", tag, &p.tags),
@@ -244,20 +427,40 @@ pub fn gate_with(env: &str, p: &Protection, git_ref: &str, ready_at: i64, now: i
     let (promotion, soaked) = match (&p.after, found.promoted_at) {
         (None, _) => (None, None),
         (Some(a), None) => (Some(format!("this commit to deploy to {a} first")), None),
-        (Some(a), Some(t)) => match p.soak.as_deref().and_then(anyhow_free_seconds).map(|s| t + s).filter(|until| *until > now) {
+        (Some(a), Some(t)) => match soak_until(t, p.soak.as_deref(), now).ok().flatten() {
             Some(until) => (Some(format!("this commit to soak in {a} until {}", at(until))), Some(until)),
             None => (None, None),
         },
     };
-    let approved = p.reviewers.is_empty() || reviews.iter().any(|r| r.approved);
-    let timer = (p.wait_timer > 0).then(|| ready_at + i64::from(p.wait_timer) * 60).filter(|t| *t > now);
+    // Review eligibility and self-review checks are enforced at the durable write boundary.
+    let approval_policy = Approvals { count: p.approvals.as_ref().map_or(1, |a| a.count.max(1)), reviewers: Vec::new(), self_approve: true };
+    let required = p.approvals.is_some() || !p.reviewers.is_empty();
+    let have = approved_people(&approval_policy, "", reviews.iter().filter(|r| r.approved).map(|r| r.by.as_str())).len();
+    let approved = !required || have >= usize::try_from(approval_policy.count).unwrap_or(usize::MAX);
+    let reviewers = p.approvals.as_ref().map_or(&p.reviewers, |a| &a.reviewers);
+    let mut prerequisite_wait = None;
+    let mut prerequisite_until = None;
+    for name in &p.prerequisites {
+        let missing = Prerequisite::Pending(format!("this commit to deploy to {name} first"));
+        let observed = found.prerequisites.iter().find(|(n, _)| n == name).map_or(&missing, |(_, o)| o);
+        match prerequisite_gate(observed, p.soak.as_deref(), now) {
+            Ok(PrerequisiteGate::Open) => {}
+            Ok(PrerequisiteGate::Waiting { until, why }) => {
+                prerequisite_wait.get_or_insert(format!("{name}: {why}"));
+                prerequisite_until = prerequisite_until.into_iter().chain(until).max();
+            }
+            Ok(PrerequisiteGate::Refused(why)) | Err(why) => return Gate::Refused(why),
+        }
+    }
+    let promotion = promotion.or(prerequisite_wait);
+    let timer = (p.wait_timer > 0).then(|| ready_at.saturating_add(i64::from(p.wait_timer) * 60)).filter(|t| *t > now);
     // A closed window holds it until it opens (rules that don't check out were refused earlier).
     let window = closed(&p.windows, now).ok().flatten();
     if approved && timer.is_none() && window.is_none() && promotion.is_none() && gate.is_none() {
         return Gate::Open;
     }
-    let until = [timer, window.as_ref().map(|(t, _)| *t), soaked].into_iter().flatten().max();
-    Gate::Waiting { reviewers: if approved { Vec::new() } else { p.reviewers.clone() }, until, window: window.map(|(_, why)| why), promotion, gate }
+    let until = [timer, window.as_ref().map(|(t, _)| *t), soaked, prerequisite_until].into_iter().flatten().max();
+    Gate::Waiting { reviewers: if approved { Vec::new() } else if reviewers.is_empty() { vec!["anyone who may approve here".into()] } else { reviewers.clone() }, until, window: window.map(|(_, why)| why), promotion, gate }
 }
 
 /// A job's `deploy: { app, environment, revision, wait, timeout, artifacts }` (kiln dialect,
@@ -273,6 +476,56 @@ pub fn deploy_step(v: &crate::wf::ir::YVal) -> Option<crate::wf::ir::Step> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn u10_approvals_are_bound_to_owner_environment_and_action() {
+        let environment = EnvironmentId { scope: EnvironmentScope::Repository("repo-a".into()), name: "production".into() };
+        let job = ProtectedAction::Job("run-1".into());
+        let release = ProtectedAction::Release("release-1".into());
+        let decisions = vec![ActionReview { environment: environment.clone(), action: job.clone(), review: review("alice", true, 10) }];
+        assert_eq!(action_reviews(&environment, &job, &decisions).len(), 1);
+        assert!(action_reviews(&environment, &release, &decisions).is_empty());
+        let other = EnvironmentId { scope: EnvironmentScope::Repository("repo-b".into()), ..environment.clone() };
+        assert!(action_reviews(&other, &job, &decisions).is_empty());
+        // One deliberately shared flow action reuses its durable decision at both boundaries.
+        let flow = ProtectedAction::Flow("ci-to-deploy-1".into());
+        let decisions = vec![ActionReview { environment: environment.clone(), action: flow.clone(), review: review("alice", true, 10) }];
+        let policy = Protection { reviewers: vec!["alice".into()], ..Protection::default() };
+        let selected = action_reviews(&environment, &flow, &decisions);
+        assert_eq!(gate("production", &policy, "refs/heads/main", 0, 10, &selected), Gate::Open);
+        assert!(matches!(gate("production", &policy, "refs/heads/main", 0, 10, &action_reviews(&environment, &release, &decisions)), Gate::Waiting { .. }));
+        assert!(action_reviews(&environment, &job, &decisions).is_empty());
+    }
+
+    #[test]
+    fn u10_counted_approvals_deduplicate_people_and_preserve_self_review() {
+        let policy = Approvals { count: 2, reviewers: vec!["alice".into(), "bob".into()], self_approve: false };
+        assert_eq!(approved_people(&policy, "user:alice", ["user:alice", "user:bob", "agent:fix for user:bob", "user:carol"]), ["bob"]);
+        let protection = Protection { approvals: Some(policy), ..Protection::default() };
+        assert!(matches!(gate("prod", &protection, "refs/heads/main", 0, 10, &[review("bob", true, 1), review("bob", true, 2)]), Gate::Waiting { .. }));
+        assert_eq!(gate("prod", &protection, "refs/heads/main", 0, 10, &[review("alice", true, 1), review("bob", true, 2)]), Gate::Open);
+    }
+
+    #[test]
+    fn u10_shared_prerequisite_soak_and_concurrency_decisions() -> Result<(), String> {
+        let policy = Protection { prerequisites: vec!["staging".into(), "canary".into()], soak: Some("1m".into()), ..Protection::default() };
+        let mut found = Found { prerequisites: vec![("staging".into(), Prerequisite::Running { since: 100 })], ..Found::default() };
+        assert!(matches!(gate_with("prod", &policy, "refs/heads/main", 0, 160, &[], &found), Gate::Waiting { promotion: Some(_), .. }));
+        found.prerequisites.push(("canary".into(), Prerequisite::Running { since: 120 }));
+        assert!(matches!(gate_with("prod", &policy, "refs/heads/main", 0, 160, &[], &found), Gate::Waiting { until: Some(180), .. }));
+        assert_eq!(gate_with("prod", &policy, "refs/heads/main", 0, 180, &[], &found), Gate::Open);
+        assert_eq!(prerequisite_gate(&Prerequisite::Refused("different artifacts".into()), Some("1m"), 180)?, PrerequisiteGate::Refused("different artifacts".into()));
+        assert!(concurrency_available(Some(2), 1));
+        assert!(!concurrency_available(Some(2), 2));
+        assert!(concurrency_available(None, usize::MAX));
+        Ok(())
+    }
+
+    #[test]
+    fn u10_invalid_persisted_policy_refuses_instead_of_opening() {
+        let policy = Protection { windows: vec![Window { allow: Some("bad cron".into()), deny: None, duration: "1h".into(), timezone: None }], ..Protection::default() };
+        assert!(matches!(gate("prod", &policy, "refs/heads/main", 0, 100, &[]), Gate::Refused(_)));
+    }
 
     fn review(by: &str, approved: bool, at: i64) -> Review {
         Review { by: by.into(), approved, comment: if approved { String::new() } else { "not now".into() }, at }
@@ -344,7 +597,7 @@ mod tests {
         let yaml = "after: staging\nsoak: 30m\ngates:\n  - workflow: .kiln/smoke.yaml\n  - check: security\n";
         let p: Protection = serde_yaml::from_str(yaml).unwrap_or_default();
         assert_eq!(p.check(), Ok(()));
-        let found = |promoted: Option<i64>, smoke: Option<bool>, security: Option<bool>| Found { promoted_at: promoted, gates: vec![(".kiln/smoke.yaml".into(), smoke), ("security".into(), security)] };
+        let found = |promoted: Option<i64>, smoke: Option<bool>, security: Option<bool>| Found { promoted_at: promoted, prerequisites: Vec::new(), gates: vec![(".kiln/smoke.yaml".into(), smoke), ("security".into(), security)] };
         let held = |g: Gate| match g {
             Gate::Waiting { promotion, gate, until, .. } => (promotion, gate, until),
             other => (Some(format!("{other:?}")), None, None),

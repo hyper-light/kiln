@@ -24,7 +24,7 @@ pub mod twirp;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rusqlite::params;
+use crate::sql::params;
 
 use crate::hub::Hub;
 

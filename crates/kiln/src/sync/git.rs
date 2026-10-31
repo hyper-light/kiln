@@ -263,11 +263,11 @@ pub async fn found_at(path: &Path) -> Option<Found> {
 
 // ------------------------------------------------------------------------------ the clones kiln made here
 
-/// The clones kiln made on this machine (`<state>/sync/clones.json`): looked at wherever they
-/// are, and deleted only by kiln when asked.
+/// U17: read projection of machine-scoped clone provenance in Amphora. Historical clones.json
+/// is checked read-only import input; worktrees and Git objects remain physical bytes.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Registry {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "clone_paths")]
     pub clones: BTreeMap<String, Kept>,
 }
 
@@ -282,18 +282,38 @@ pub struct Kept {
 }
 
 impl Registry {
-    pub fn load(file: &Path) -> Self {
-        std::fs::read(file).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    pub(super) fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.clones.len() <= 900, "clone provenance exceeds its 900-path import/metadata bound");
+        for (path, kept) in &self.clones {
+            Self::validate_path(path)?;
+            anyhow::ensure!(!kept.key.is_empty() && kept.key.len() <= 4096 && !kept.task.is_empty() && kept.task.len() <= 4096, "invalid clone path/key/task provenance");
+        }
+        Ok(())
     }
 
-    pub fn save(&self, file: &Path) -> anyhow::Result<()> {
-        super::group::save_atomic(file, &serde_json::to_vec_pretty(self)?)?;
-        Ok(())
+    pub(super) fn validate_path(path: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(plain(Path::new(path)) && path.len() <= 32768, "invalid clone provenance path"); Ok(())
     }
 
     pub fn paths(&self) -> impl Iterator<Item = PathBuf> + '_ {
         self.clones.keys().map(PathBuf::from)
     }
+}
+
+fn clone_paths<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<BTreeMap<String, Kept>, D::Error> {
+    struct Paths;
+    impl<'de> serde::de::Visitor<'de> for Paths {
+        type Value = BTreeMap<String, Kept>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("bounded, unique clone paths") }
+        fn visit_map<M: serde::de::MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+            let mut paths = BTreeMap::new();
+            while let Some((path, kept)) = map.next_entry::<String, Kept>()? {
+                if paths.len() >= 900 || paths.insert(path, kept).is_some() { return Err(serde::de::Error::custom("duplicate or excessive clone paths")); }
+            }
+            Ok(paths)
+        }
+    }
+    deserializer.deserialize_map(Paths)
 }
 
 // ------------------------------------------------------------------------------ cloning

@@ -93,7 +93,7 @@ fn tell(d: &Deploy, r: &Release, new: bool) {
         needs: waits.then(|| "approval".to_owned()),
         approvers: waits.then(|| approvers(r)),
     })));
-    d.changes.send(r.id);
+    let _ = d.changes.send(r.id);
     // The host's deployment of its commit, where the release repository is on another host (§7).
     remote::report(d, r);
     // Chat, paging and webhooks: the server's rules and the app's own channels, each message a
@@ -977,6 +977,9 @@ pub async fn pause(d: &Deploy, actor: &str, app_name: &str, env_name: &str, paus
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Ask {
+    /// U10: an explicitly declared CI-to-release Flow; never inferred from a commit or name.
+    #[serde(default)]
+    pub protected_action: Option<String>,
     pub app: String,
     pub environment: String,
     #[serde(default)]
@@ -1202,7 +1205,19 @@ pub async fn release(d: &Deploy, who: &Who, ask: Ask) -> Result<Release, Fail> {
     let _reg = registration(d, &ask.app, &ask.environment).await?;
     agents_may(who, &env, "release apps")?;
     may_release(d, who, &a, &env, "release").await?;
-    let key = ask.idempotency_key.as_deref().map(str::trim).filter(|k| !k.is_empty()).map(str::to_owned);
+    let flow = match ask.protected_action.as_deref() {
+        Some(id) => {
+            let flow=crate::ci::environments::actions::get(&d.hub.store,id).await.map_err(internal)?.ok_or_else(||bad("no such protected Flow"))?;
+            if flow.app!=ask.app || flow.environment.name!=ask.environment || !matches!(flow.environment.scope,kiln_ci::env::EnvironmentScope::Server) || Some(flow.version.as_str())!=ask.version.as_deref() { return Err(bad("protected Flow does not authorize this environment/app/version")); }
+            if let Some(caller)=&who.caller {
+                let repo=d.hub.store.repos().await.map_err(internal)?.into_iter().find(|r|r.id==flow.repo).ok_or_else(||bad("Flow repository no longer exists"))?;
+                if !caller.is_owner() && !caller.can("runs.read",&crate::authz::Scope::Repo{repo:repo.name}) {return Err((StatusCode::FORBIDDEN,"a Flow release needs read permission on its CI run".into()));}
+            }
+            Some(flow)
+        }
+        None=>None,
+    };
+    let key = flow.as_ref().map(|f|format!("flow:{}",f.id)).or_else(||ask.idempotency_key.as_deref().map(str::trim).filter(|k| !k.is_empty()).map(str::to_owned));
     if key.as_ref().is_some_and(|k| k.len() > 255) {
         return Err(bad("an idempotency key is at most 255 characters"));
     }
@@ -1231,7 +1246,7 @@ pub async fn release(d: &Deploy, who: &Who, ask: Ask) -> Result<Release, Fail> {
         rollback_of: None,
         rolled_back_by: None,
         keep: ask.keep,
-        provider: Value::Null,
+        provider: flow.as_ref().map_or(Value::Null,|flow|json!({"protected_action":flow.id})),
         gates: Vec::new(),
         approvals: Vec::new(),
         promoted_from: None,
@@ -1336,6 +1351,9 @@ pub async fn release(d: &Deploy, who: &Who, ask: Ask) -> Result<Release, Fail> {
         r.state = State::Waiting;
         r.message = Some(why);
     }
+    // U10: a numbered release reserves through the common gate before committing. The
+    // initial unnumbered preview can never acquire an untraceable reservation.
+    if r.state==State::Committing { r.state=State::Waiting; }
     let (r, new) = store::insert_release(&*d.records, &r).await.map_err(internal)?;
     if !new {
         return Ok(r);
@@ -1407,15 +1425,26 @@ pub async fn answer(d: &Deploy, who: &Who, id: i64, approved: bool, note: Option
     if !gates::holding(r.state) {
         return Err(conflict(format!("release {id} is {}: nothing waits for an answer", r.state.as_str())));
     }
+    let shared_flow=match r.provider.get("protected_action").and_then(Value::as_str) {
+        Some(id)=>Some(crate::ci::environments::actions::get(&d.hub.store,id).await.map_err(internal)?.ok_or_else(||bad("protected Flow no longer exists"))?),None=>None,
+    };
+    if let Some(flow)=&shared_flow {
+        let owner=crate::authz::Caller::owner();
+        crate::ci::environments::check_flow_review(&d.hub,flow,who.caller.as_ref().unwrap_or(&owner)).await?;
+    }
     let me = gates::person(&who.name).to_owned();
     if !rules.reviewers.is_empty() && !rules.reviewers.contains(&me) {
         return Err((StatusCode::FORBIDDEN, format!("{me} isn't one of {}'s reviewers ({})", env.name, rules.reviewers.join(", "))));
     }
-    if approved && !rules.self_approve && me == gates::person(&r.requested_by) {
+    if approved && !rules.self_approve && me == gates::person(shared_flow.as_ref().map_or(r.requested_by.as_str(),|flow|flow.actor.as_str())) {
         return Err((StatusCode::FORBIDDEN, format!("{me} asked for release {id}: someone else approves it")));
     }
     let now = crate::util::now_unix();
     let note = note.map(|n| n.trim().to_owned()).filter(|n| !n.is_empty());
+    if let Some(flow)=&shared_flow {
+        crate::ci::environments::actions::review(&d.hub.store,&flow.id,kiln_ci::env::Review{by:who.name.clone(),approved,comment:note.clone().unwrap_or_default(),at:now}).await.map_err(internal)?;
+        d.hub.ci.send(crate::ci::dispatch::Msg::Reviewed{run:flow.run.clone()});
+    }
     let was = r.state;
     r.approvals.retain(|x| gates::person(&x.by) != me);
     r.approvals.push(Approval { by: who.name.clone(), at: now, approved, note: note.clone() });
@@ -1488,6 +1517,12 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
         store::done(st, id).await?;
         return Ok(());
     };
+    // U16: the durable runner lifecycle owns native handover and its CD outcome. A queued
+    // native release must never be interpreted as a Helm/Kubernetes deployment by this worker.
+    if r.provider.get("backend").and_then(Value::as_str) == Some("runner-native") {
+        store::done(st, id).await?;
+        return Ok(());
+    }
     let now = crate::util::now_unix();
     let env = store::environment(st, &r.environment).await?;
     let timeout = env.as_ref().map_or(15 * 60, |e| i64::try_from(e.watch.timeout_secs).unwrap_or(900));
@@ -1615,6 +1650,7 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
                 if let Some(at) = unanswered_at {
                     note(&mut view, "unanswered_at", json!(at));
                 }
+                if let Some(action)=r.provider.get("protected_action") {note(&mut view,"protected_action",action.clone());}
                 (landed, view)
             });
             match looked {
@@ -2333,6 +2369,7 @@ async fn finish(d: &Deploy, mut r: Release, state: State, message: Option<String
     if !store::update_release(st, &r, was).await? {
         return Ok(());
     }
+    crate::ci::environments::actions::release(&d.hub.store,"release",&r.id.to_string()).await?;
     store::done(st, r.id).await?;
     if state == State::Succeeded
         && let Some(mut reg) = store::registration(st, &r.app, &r.environment).await?
@@ -2784,6 +2821,33 @@ async fn scan_git(d: &Deploy) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn u16_generic_cd_worker_releases_native_work_without_mutating_its_outcome() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let root = tempfile::tempdir()?;
+            let d = Deploy {
+                records: Arc::clone(&hub.records), stand_in: None, hosted: super::super::host::Hosted::new(root.path()), owner: "fixture".into(),
+                wake: crate::rt::Notify::new(), changes: crate::rt::Broadcast::new(16), argo: Default::default(), remote: Default::default(), hub,
+            };
+            // No Helm app or environment exists: the native lifecycle is the sole owner.
+            let mut native = failed_release(Kind::Deploy, Origin::Api);
+            native.id = 0;
+            native.app = "kiln-runner".into();
+            native.environment = "runner/fixture".into();
+            native.provider = json!({"backend":"runner-native", "upgrade_job":"fixture-job"});
+            let (native, _) = store::insert_release(&*d.records, &native).await?;
+            store::schedule(&*d.records, native.id, 0).await?;
+            assert_eq!(store::claim(&*d.records, "fixture", 0, 60, 1).await?, vec![native.id]);
+            step(&d, native.id).await?;
+            let kept = store::release(&*d.records, native.id).await?.ok_or_else(|| anyhow::anyhow!("native release vanished"))?;
+            assert_eq!(kept, native, "generic CD did not alter native status or evidence");
+            assert!(store::claim(&*d.records, "fixture", 61, 60, 1).await?.is_empty(), "obsolete generic work was removed");
+            Ok(())
+        })
+    }
+
     use crate::authz::gate::Kind as CallerKind;
 
     #[test]
@@ -3267,12 +3331,32 @@ mod tests {
     /// lands, with A's commit: one commit, handed over once, nothing done twice.
     #[test]
     fn a_server_killed_mid_release_has_its_release_finished_by_another() -> anyhow::Result<()> {
+        // U10: each controller derives Records from the same Amphora Store used for atomic
+        // admission. Local controller directories stay distinct; the bootstrap key is shared.
+        async fn hub(store: crate::store::Store, root: &std::path::Path, name: &str) -> anyhow::Result<Arc<crate::hub::Hub>> {
+            let mut cfg = crate::config::Config::default();
+            cfg.server.data_dir = root.join(name);
+            cfg.local_agent.name = Some(name.into());
+            cfg.terminal.enabled = false;
+            cfg.ci.secrets.master_key_file = Some(root.join("master.key"));
+            let pki = crate::rt::blocking({
+                let path = cfg.data("pki");
+                move || crate::pki::Pki::open_scratch(&path)
+            }).await??;
+            let leaf = pki.server_leaf(&[])?;
+            let pki = Arc::new(pki);
+            let (net, _events) = crate::net::start(crate::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: true, dial_deadline: crate::net::DIAL_DEADLINE, revoked_keys: Vec::new() })?;
+            let logs = crate::logs::Logs::new(cfg.data("logs"), 1 << 20);
+            crate::hub::Hub::new_on(crate::rt::clock(), Arc::new(cfg), store, logs, net, pki, "test-admin-token".into(), "test-join-token".into(), crate::rt::Shutdown::new())
+        }
+
         crate::rt::block_on(async {
-            let records: Arc<dyn kiln_seams::Records> = Arc::new(kiln_seams::records::SimRecords::new());
+            let database = crate::rt::blocking(crate::store::Store::in_memory).await??;
+            let controllers = tempfile::tempdir()?;
             let git = tempfile::tempdir()?;
             let cluster = Arc::new(Cluster::default());
             let server = |hub: Arc<crate::hub::Hub>, name: &str| Deploy {
-                records: Arc::clone(&records),
+                records: Arc::clone(&hub.records),
                 stand_in: Some(Arc::clone(&cluster) as Arc<dyn super::super::provider::StandIn>),
                 hosted: super::super::host::Hosted::new(git.path()),
                 owner: name.into(),
@@ -3282,8 +3366,9 @@ mod tests {
                 remote: Default::default(),
                 hub,
             };
-            let a = server(crate::hub::tests::scratch_hub().await?, "server-a");
-            let b = server(crate::hub::tests::scratch_hub().await?, "server-b");
+            let a = server(hub(database.clone(), controllers.path(), "server-a").await?, "server-a");
+            let b = server(hub(database, controllers.path(), "server-b").await?, "server-b");
+            let records = Arc::clone(&a.records);
             let st = &*records;
             // An app on a platform, in an environment that takes it: no gates, settled at once.
             let package = Package::Platform { provider: "aws-lambda".into(), spec: json!({ "function": "web" }), repo: None, path: String::new() };

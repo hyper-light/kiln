@@ -127,7 +127,7 @@ pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
         hosted,
         owner: format!("server-{}", crate::util::new_id()),
         wake: crate::rt::Notify::new(),
-        changes: crate::rt::Broadcast::new(256),
+        changes: crate::bus::Broadcast::on(Arc::new(hub.bus.clone()), 256)?,
         argo: argocd::Watches::default(),
         remote: Arc::default(),
         hub: Arc::clone(&hub),

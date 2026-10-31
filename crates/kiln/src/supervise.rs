@@ -6,7 +6,7 @@
 //! * forwards SIGTERM / SIGINT / SIGHUP and gives the child a grace period before SIGKILL (on
 //!   Windows: closes the child's stdin to ask it to stop, then kills its process tree),
 //! * reaps orphaned zombies so it is safe as PID 1 inside a container,
-//! * takes up the binary on disk when it changes: on Linux it re-executes itself and the runner
+//! * for server children, takes up the binary on disk when it changes: on Linux it re-executes itself and the runner
 //!   does the same (in-place upgrades); on macOS, where a process that re-executed itself loses
 //!   the local network, the runner hands its terminals over and exits, and the supervisor starts
 //!   the new binary as a fresh process ([`HANDOVER_EXIT`]); other children are restarted, and
@@ -75,8 +75,18 @@ fn spawn_pid_waiter(pid: u32) -> oneshot::Receiver<Ended> {
 }
 
 /// The supervised subcommand (the first argument that is not an option).
-fn subcommand(args: &[String]) -> Option<&str> {
-    args.iter().map(String::as_str).find(|a| !a.starts_with('-'))
+pub fn subcommand(args: &[String]) -> Option<&str> {
+    let mut args = args.iter().map(String::as_str);
+    while let Some(arg) = args.next() {
+        match arg {
+            // Global options may precede `agent`; their values are not the child role.
+            "--config" | "--log" => { let _ = args.next(); }
+            "--" => return args.next(),
+            a if !a.starts_with('-') => return Some(a),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// How a child takes up a new binary on disk.
@@ -196,6 +206,34 @@ pub fn detach(args: &[String], state_dir: &Path, child_exe: Option<&Path>) -> an
 struct ChildCmd {
     exe: PathBuf,
     args: Vec<String>,
+    /// U16: pin selected runner bytes across ordinary restarts. Legacy saved commands are
+    /// pinned once when the person starts this supervisor; this is not CI release approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sha256: Option<String>,
+}
+
+impl ChildCmd {
+    fn pin(&mut self) -> anyhow::Result<()> {
+        let (actual, _) = crate::updates::hash_file(&self.exe)?;
+        match &self.sha256 {
+            Some(expected) => anyhow::ensure!(*expected == actual, "U16: selected runner image changed; refusing restart; use the explicit CI/CD activation path"),
+            None => self.sha256 = Some(actual),
+        }
+        Ok(())
+    }
+}
+
+/// Check on the existing blocking lane. This pathname check detects replacement before spawn;
+/// it is not an atomic executed-file handle and does not certify concurrent replacement safety.
+async fn spawn_checked(cmd: &ChildCmd, generation: u64, ctl: Option<&Path>, env: &[(String, String)]) -> anyhow::Result<(std::process::Child, ChildControl)> {
+    if cmd.sha256.is_none() { return Ok(ChildControl::spawn(&mut spawn_cmd(cmd, generation, ctl, env))?); }
+    let mut selected = cmd.clone();
+    let selected = crate::rt::blocking(move || {
+        if selected.sha256.is_some() { selected.pin()?; }
+        anyhow::Ok(selected)
+    }).await??;
+    // No asynchronous launch submission: the existing supervisor immediately owns the child.
+    Ok(ChildControl::spawn(&mut spawn_cmd(&selected, generation, ctl, env))?)
 }
 
 /// A new build started beside the child for a blue/green upgrade (`crate::bluegreen`): it becomes
@@ -245,6 +283,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
     // The binary children run: `--exe` (a launcher keeps itself), else this one.
     let exe = opts.exe.clone().unwrap_or_else(|| std::env::current_exe().unwrap_or_else(|_| PathBuf::from("kiln")));
     let takes = takes_upgrade(&opts.args);
+    let runner = subcommand(&opts.args) == Some("agent");
     let signals = Signals::new(&[crate::rt::SIGTERM, crate::rt::SIGINT, crate::rt::SIGHUP])?;
     let mut backoff = MIN_BACKOFF;
     let mut generation: u64 = 0;
@@ -255,9 +294,15 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         Some((pid.parse().ok()?, generation.parse().ok()?))
     });
     // The child it runs: its own binary, or the build a runner was last promoted to.
-    let own = ChildCmd { exe: exe.clone(), args: opts.args.clone() };
+    let mut own = ChildCmd { exe: exe.clone(), args: opts.args.clone(), sha256: None };
+    if runner {
+        own = crate::rt::blocking(move || { own.pin()?; anyhow::Ok(own) }).await??;
+    }
     let saved = current_path(&opts.state_dir, &opts.args);
     let mut current = std::fs::read(&saved).ok().and_then(|b| serde_json::from_slice::<ChildCmd>(&b).ok()).filter(|c| c.exe.is_file()).unwrap_or_else(|| own.clone());
+    if runner {
+        current = crate::rt::blocking(move || { current.pin()?; anyhow::Ok(current) }).await??;
+    }
     let control_at = control_path(&opts.state_dir, &opts.args);
     let ctl = control::listen(&control_at).map_err(|e| tracing::warn!(error = %format!("{e:#}"), "no control socket: upgrades of the child aren't blue/green")).ok();
     let ctl_path = ctl.as_ref().map(|_| control_at.as_path());
@@ -297,7 +342,14 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
                     tracing::warn!(error = %e, "cannot pass the terminals on; they end with this upgrade");
                 }
             }
-            match ChildControl::spawn(&mut cmd) {
+            // The handover channel is prepared on cmd above; keep those inherited descriptors.
+            let selected = current.clone();
+            let checked = if runner { crate::rt::blocking(move || {
+                let mut checked = selected;
+                checked.pin()?;
+                anyhow::Ok(())
+            }).await.and_then(|r| r) } else { Ok(()) };
+            match checked.and_then(|()| ChildControl::spawn(&mut cmd).map_err(anyhow::Error::from)) {
                 Ok((child, control)) => {
                     if let Some(h) = &mut handover {
                         h.started();
@@ -384,7 +436,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
                         // minute. Then it is started once the old runner ends, as the child.
                         if c.promoted {
                             let again = respawned.is_none_or(|t: Instant| t.elapsed() >= Duration::from_secs(60));
-                            match again.then(|| ChildControl::spawn(&mut spawn_cmd(&c.cmd, generation, ctl_path, &[]))) {
+                            match if again { Some(spawn_checked(&c.cmd, generation, ctl_path, &[]).await) } else { None } {
                                 Some(Ok((child, control))) => {
                                     respawned = Some(Instant::now());
                                     let pid = child.id();
@@ -404,7 +456,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
                 Ev::Control(Some(stream)) => {
                     let req = stream.request().await;
                     let answer = match req {
-                        Ok(r) => handle(r, &mut candidate, &saved, generation, ctl_path).await,
+                        Ok(r) => handle(r, &mut candidate, &saved, generation, ctl_path, runner, if runner { control.pid().and_then(|p| u32::try_from(p).ok()) } else { None }).await,
                         Err(e) => serde_json::json!({ "ok": false, "error": format!("{e:#}") }),
                     };
                     stream.answer(&answer).await;
@@ -418,6 +470,9 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
                 Ev::Signal(_) => break Exit::Shutdown("terminate"),
                 // Runs a promoted build (blue/green): the kiln on disk changing (installed again by
                 // hand) is what it runs next time it starts, not now.
+                // U16: file replacement never selects or activates a runner image. Keep the
+                // current approved command, including its crash-restart pin and saved promotion.
+                Ev::UpgradeCheck if runner => {}
                 Ev::UpgradeCheck if current != own => {
                     if exe_mtime(&exe) != started_mtime && !std::mem::replace(&mut noticed, true) {
                         tracing::info!(exe = %exe.display(), "kiln was installed again; the runner runs it from its next start");
@@ -561,7 +616,11 @@ enum Request {
         args: Vec<String>,
         #[serde(default)]
         env: Vec<(String, String)>,
+        #[serde(default)]
+        owner: Option<crate::bluegreen::ActivationOwner>,
     },
+    /// U16: read-only evidence that this existing owner supports explicit activation.
+    Activation { owner: crate::bluegreen::ActivationOwner },
     Promote {
         pid: u32,
     },
@@ -573,16 +632,40 @@ enum Request {
     },
 }
 
-async fn handle(r: Request, candidate: &mut Option<Candidate>, saved: &Path, generation: u64, ctl: Option<&Path>) -> serde_json::Value {
+fn owns_activation(owner: crate::bluegreen::ActivationOwner, current: Option<u32>, candidate: &Option<Candidate>, generation: u64) -> bool {
+    owner.generation == generation && current.is_some() && (current == Some(owner.pid) || candidate.as_ref().is_some_and(|c| c.pid == owner.pid))
+}
+
+async fn handle(r: Request, candidate: &mut Option<Candidate>, saved: &Path, generation: u64, ctl: Option<&Path>, runner_role: bool, runner: Option<u32>) -> serde_json::Value {
     use serde_json::json;
     match r {
-        Request::Start { exe, args, env } => {
+        Request::Activation { owner } => {
+            let ok = cfg!(unix) && runner_role && owns_activation(owner, runner, candidate, generation);
+            json!({ "ok": ok, "error": if ok { "" } else { "U16: no explicit activation backend for this owned runner process" } })
+        }
+        Request::Start { exe, args, env, owner } => {
+            // U16/B1: role is explicit even if the process handle has no usable PID.
+            // A legacy Start can never activate a runner through a new supervisor.
+            let allowed = match owner {
+                Some(owner) => runner_role && owns_activation(owner, runner, candidate, generation),
+                None => !runner_role,
+            };
+            if !allowed {
+                return json!({ "ok": false, "error": "U16: activation route no longer belongs to this supervised runner" });
+            }
             if let Some(c) = candidate {
                 return json!({ "ok": false, "error": format!("a new build is already starting (pid {})", c.pid) });
             }
-            let cmd = ChildCmd { exe, args };
-            let mut spawn = spawn_cmd(&cmd, generation, ctl, &env);
-            match ChildControl::spawn(&mut spawn) {
+            let mut cmd = ChildCmd { exe, args, sha256: None };
+            // An explicit runner activation keeps exactly this selected artifact for restarts.
+            if runner_role {
+                let mut selected = cmd.clone();
+                match crate::rt::blocking(move || { selected.pin()?; anyhow::Ok(selected) }).await.and_then(|r| r) {
+                    Ok(selected) => cmd = selected,
+                    Err(e) => return json!({ "ok": false, "error": format!("U16: cannot pin selected runner artifact: {e:#}") }),
+                }
+            }
+            match spawn_checked(&cmd, generation, ctl, &env).await {
                 Ok((child, control)) => {
                     let pid = child.id();
                     tracing::info!(pid, exe = %cmd.exe.display(), "a new build started beside the runner");
@@ -743,26 +826,50 @@ mod tests {
             let saved = dir.path().join("supervise-x.json");
             let mut candidate = None;
             let ask = |json: &str| serde_json::from_str::<Request>(json).map_err(anyhow::Error::from);
-            let start = ask(r#"{"op":"start","exe":"/bin/sleep","args":["60"],"env":[["KILN_TAKE_OVER_FROM","/x.sock"]]}"#)?;
-            let v = handle(start, &mut candidate, &saved, 1, None).await;
+            let legacy = r#"{"op":"start","exe":"/bin/sleep","args":["60"]}"#;
+            let start = format!(r#"{{"op":"start","exe":"/bin/sleep","args":["60"],"env":[["KILN_TAKE_OVER_FROM","/x.sock"]],"owner":{{"pid":{},"generation":1}}}}"#, std::process::id());
+            for current in [Some(std::process::id()), None] {
+                let refused = handle(ask(legacy)?, &mut candidate, &saved, 1, None, true, current).await;
+                assert_eq!(refused.get("ok"), Some(&serde_json::Value::Bool(false)), "legacy Start cannot activate a runner, even with unknown PID");
+                assert!(candidate.is_none() && !saved.exists());
+            }
+            let unknown = handle(ask(&start)?, &mut candidate, &saved, 1, None, true, None).await;
+            assert_eq!(unknown.get("ok"), Some(&serde_json::Value::Bool(false)), "a claimed owner cannot replace the runner's missing physical handle");
+            assert!(candidate.is_none() && !saved.exists());
+            let v = handle(ask(&start)?, &mut candidate, &saved, 1, None, true, Some(std::process::id())).await;
             let pid = v.get("pid").and_then(serde_json::Value::as_u64).and_then(|p| u32::try_from(p).ok()).context("no pid")?;
             assert!(crate::os::pid_alive(pid));
             // One at a time.
-            let again = handle(ask(r#"{"op":"start","exe":"/bin/sleep","args":["60"]}"#)?, &mut candidate, &saved, 1, None).await;
+            let again = handle(ask(&start)?, &mut candidate, &saved, 1, None, true, Some(std::process::id())).await;
             assert_eq!(again.get("ok"), Some(&serde_json::Value::Bool(false)));
             // Only the process it started is promoted; that is remembered for the supervisor's next start.
-            let wrong = handle(ask(&format!(r#"{{"op":"promote","pid":{}}}"#, pid + 1))?, &mut candidate, &saved, 1, None).await;
+            let wrong = handle(ask(&format!(r#"{{"op":"promote","pid":{}}}"#, pid + 1))?, &mut candidate, &saved, 1, None, true, Some(std::process::id())).await;
             assert_eq!(wrong.get("ok"), Some(&serde_json::Value::Bool(false)));
-            let ok = handle(ask(&format!(r#"{{"op":"promote","pid":{pid}}}"#))?, &mut candidate, &saved, 1, None).await;
+            let ok = handle(ask(&format!(r#"{{"op":"promote","pid":{pid}}}"#))?, &mut candidate, &saved, 1, None, true, Some(std::process::id())).await;
             assert_eq!(ok.get("ok"), Some(&serde_json::Value::Bool(true)));
             let kept: ChildCmd = serde_json::from_slice(&std::fs::read(&saved)?)?;
-            assert_eq!(kept, ChildCmd { exe: "/bin/sleep".into(), args: vec!["60".into()] });
+            assert_eq!(kept.exe, PathBuf::from("/bin/sleep"));
+            assert_eq!(kept.args, vec!["60".to_owned()]);
+            assert!(kept.sha256.is_some());
+            let owner = crate::bluegreen::ActivationOwner { pid, generation: 1 };
+            assert!(owns_activation(owner, Some(std::process::id()), &candidate, 1));
+            assert!(!owns_activation(owner, Some(std::process::id()), &candidate, 2));
+            assert!(!owns_activation(owner, None, &candidate, 1), "a server child never advertises runner activation");
+            let answer = handle(Request::Activation { owner }, &mut candidate, &saved, 1, None, true, Some(std::process::id())).await;
+            assert_eq!(answer.get("ok"), Some(&serde_json::Value::Bool(true)));
             // A rollback kills it outright.
             let stop = ask(&format!(r#"{{"op":"stop","pid":{pid},"kill":true}}"#))?;
             assert!(matches!(stop, Request::Stop { kill: true, .. }));
-            let v = handle(stop, &mut candidate, &saved, 1, None).await;
+            let v = handle(stop, &mut candidate, &saved, 1, None, true, Some(std::process::id())).await;
             assert_eq!(v.get("ok"), Some(&serde_json::Value::Bool(true)));
             assert!(candidate.is_none() && !crate::os::pid_alive(pid));
+            // Server-role mechanical Start remains compatible with an older local caller.
+            let server = handle(ask(legacy)?, &mut candidate, &saved, 1, None, false, None).await;
+            let server_pid = server.get("pid").and_then(serde_json::Value::as_u64).and_then(|p| u32::try_from(p).ok()).context("no server pid")?;
+            assert!(candidate.as_ref().is_some_and(|c| c.cmd.sha256.is_none()));
+            let stopped = handle(Request::Stop { pid: server_pid, kill: true }, &mut candidate, &saved, 1, None, false, None).await;
+            assert_eq!(stopped.get("ok"), Some(&serde_json::Value::Bool(true)));
+            assert!(candidate.is_none() && !crate::os::pid_alive(server_pid));
             assert!(matches!(ask(r#"{"op":"stop","pid":1}"#)?, Request::Stop { kill: false, .. }));
             Ok(())
         })
@@ -801,10 +908,18 @@ mod tests {
         };
         assert!(until(true), "its sleep runs under it");
         assert!(!runs_old_binary(pid, &exe), "it runs the binary on disk");
+        let mut pinned = ChildCmd { exe: exe.clone(), args: Vec::new(), sha256: None };
+        pinned.pin()?;
         // A new binary installed where it was (a new file, renamed into place): the child runs the old one.
         let next = dir.path().join("prog.next");
         std::fs::copy("/bin/sh", &next)?;
+        // Same bytes at a new inode remain a permissible ordinary restart.
         std::fs::rename(&next, &exe)?;
+        pinned.pin()?;
+        // Different bytes never become an approved image merely because the path changed.
+        std::fs::write(&next, b"replacement without activation")?;
+        std::fs::rename(&next, &exe)?;
+        assert!(pinned.pin().is_err());
         assert!(runs_old_binary(pid, &exe));
         // It and its sleep, as a group.
         let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(i32::try_from(pid)?), nix::sys::signal::Signal::SIGKILL);
@@ -817,6 +932,10 @@ mod tests {
     fn how_children_take_up_a_new_binary() {
         let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
         assert_eq!(takes_upgrade(&args(&["server"])), Takes::Restart);
+        assert_ne!(subcommand(&args(&["server"])), Some("agent"), "server disk-change policy remains separate");
+        assert_eq!(subcommand(&args(&["--config=/c.toml", "agent", "--name", "x"])), Some("agent"));
+        assert_eq!(subcommand(&args(&["--config", "/c.toml", "--log", "info", "agent"])), Some("agent"));
+        assert_eq!(subcommand(&args(&["--config", "/c.toml", "server"])), Some("server"));
         // A runner keeps its terminals: in place on Linux, as a fresh process on macOS (where a
         // process that re-executed itself loses the local network), restarted on Windows.
         let runner = if cfg!(target_os = "macos") {

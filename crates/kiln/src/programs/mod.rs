@@ -24,7 +24,7 @@ pub mod ops;
 
 use std::collections::{BTreeMap, HashMap};
 
-use rusqlite::OptionalExtension as _;
+use crate::sql::OptionalExtension as _;
 use serde::{Deserialize, Serialize};
 
 use crate::harness::model::{Command, Limit, Status};
@@ -439,7 +439,7 @@ async fn masters(store: &crate::store::Store) -> anyhow::Result<Vec<Master>> {
                         (SELECT r.session FROM plan_runs r WHERE r.plan_id = p.id AND r.mode = 'goals' AND r.session != '' ORDER BY r.at DESC LIMIT 1)
                  FROM plans p WHERE p.tags LIKE '%\"master\"%' ORDER BY p.updated_at DESC LIMIT ?1",
             )?;
-            let rows = st.query_map(rusqlite::params![PROGRAMS_MAX], |r| {
+            let rows = st.query_map(crate::sql::params![PROGRAMS_MAX], |r| {
                 Ok(Master { id: r.get(0)?, title: r.get(1)?, tags: serde_json::from_str(&r.get::<_, String>(2)?).unwrap_or_default(), coordinator: r.get(3)? })
             })?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?.into_iter().filter(|m| m.tags.iter().any(|t| t == "master")).collect())
@@ -455,7 +455,7 @@ async fn track_plans(store: &crate::store::Store, master: &str, tag: &str) -> an
     store
         .call(move |c| {
             let mut st = c.prepare("SELECT id, title, tags FROM plans WHERE id != ?1 AND tags LIKE ?2 ESCAPE '\\' ORDER BY updated_at DESC LIMIT ?3")?;
-            let rows = st.query_map(rusqlite::params![master, pattern, TRACKS_MAX], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
+            let rows = st.query_map(crate::sql::params![master, pattern, TRACKS_MAX], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
             let mut out: Vec<(u32, String, String, Vec<String>)> = Vec::new();
             for row in rows {
                 let (id, title, tags) = row?;
@@ -516,7 +516,7 @@ async fn seeded(hub: &Hub, master: &str) -> anyhow::Result<Settings> {
         return Ok(s);
     }
     let id = master.to_owned();
-    let body: Option<String> = hub.store.call(move |c| Ok(c.query_row("SELECT body FROM plans WHERE id = ?1", rusqlite::params![id], |r| r.get(0)).optional()?)).await?;
+    let body: Option<String> = hub.store.call(move |c| Ok(c.query_row("SELECT body FROM plans WHERE id = ?1", crate::sql::params![id], |r| r.get(0)).optional()?)).await?;
     let weights = plan_weights(body.as_deref().unwrap_or_default());
     let found = !weights.is_empty();
     for (t, w) in weights {

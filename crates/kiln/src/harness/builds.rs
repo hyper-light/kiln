@@ -388,10 +388,16 @@ mod tests {
     /// machine has it.
     #[test]
     fn w24_r24_agents_get_the_cache_variables_under_their_persons_scope() -> anyhow::Result<()> {
-        // A short root: sccache's server socket must fit a Unix socket's path (SOCKET_PATH_MAX).
-        // Under a long TMPDIR (ci/gate.sh's, ~/.cache/kiln-gate/<tree>/tmp) the wrapper is rightly
-        // left out, and what this test holds is the wrapper where it fits.
-        let dir = if cfg!(unix) { tempfile::tempdir_in("/tmp")? } else { tempfile::tempdir()? };
+        // W24-R24: exercise the positive UDS policy without inheriting a gate's deep TMPDIR.
+        // Cache bytes remain under the user's cache; only tiny listeners may use /tmp.
+        #[cfg(unix)]
+        let dir = {
+            let base = PathBuf::from(std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME is required for the short cache fixture"))?).join(".cache");
+            std::fs::create_dir_all(&base)?;
+            tempfile::Builder::new().prefix("kiln-c-").tempdir_in(base)?
+        };
+        #[cfg(not(unix))]
+        let dir = tempfile::tempdir()?;
         let root = dir.path().to_path_buf();
         crate::rt::block_on(async move {
             let (svc, at) = serve(&root).await?;
@@ -399,25 +405,29 @@ mod tests {
             let ada = cache_env(&svc, "acme/app", "ada", &tools)?;
             let url = format!("http://{at}");
             let token = get(&ada, "KILN_CACHE_TOKEN").unwrap_or_default().to_owned();
-            anyhow::ensure!(get(&ada, "KILN_CACHE_URL") == Some(url.as_str()), "{ada:?}");
+            anyhow::ensure!(get(&ada, "KILN_CACHE_URL") == Some(url.as_str()), "agent cache URL");
             anyhow::ensure!(get(&ada, "SCCACHE_WEBDAV_ENDPOINT") == Some(format!("{url}/sccache").as_str()) && get(&ada, "SCCACHE_WEBDAV_TOKEN") == Some(token.as_str()));
             anyhow::ensure!(get(&ada, "TURBO_API") == Some(url.as_str()) && get(&ada, "TURBO_TOKEN") == Some(token.as_str()) && get(&ada, "TURBO_TEAM").is_some());
-            anyhow::ensure!(get(&ada, "GOCACHEPROG") == Some("'/opt/kiln dir/kiln' gocacheprog"), "{ada:?}");
+            anyhow::ensure!(get(&ada, "GOCACHEPROG") == Some("'/opt/kiln dir/kiln' gocacheprog"), "quoted Go cache command");
             anyhow::ensure!(get(&ada, "CCACHE_REMOTE_STORAGE") == Some(format!("http://kiln:{token}@{at}/ccache").as_str()));
-            // sccache's server listens on a socket of the scope's own: its wrapper only where that
-            // socket's path fits (a deep temporary folder may not).
-            let socket_fits = get(&ada, "SCCACHE_DIR").is_some_and(|d| Path::new(d).with_file_name("sccache.sock").as_os_str().len() <= SOCKET_PATH_MAX);
-            if cfg!(unix) && socket_fits {
-                anyhow::ensure!(get(&ada, "RUSTC_WRAPPER") == Some("/usr/bin/sccache") && get(&ada, "SCCACHE_SERVER_UDS").is_some(), "{ada:?}");
-            } else {
-                anyhow::ensure!(get(&ada, "RUSTC_WRAPPER").is_none() && get(&ada, "SCCACHE_SERVER_UDS").is_none(), "{ada:?}");
+            #[cfg(unix)]
+            {
+                let socket = scope_dir(&svc, "acme/app", "person:ada").join("sccache.sock");
+                anyhow::ensure!(socket.as_os_str().len() <= SOCKET_PATH_MAX, "positive cache fixture needs a short socket path");
+                std::os::unix::net::SocketAddr::from_pathname(&socket)?;
+                anyhow::ensure!(get(&ada, "RUSTC_WRAPPER") == Some("/usr/bin/sccache") && get(&ada, "SCCACHE_SERVER_UDS") == Some(socket.to_string_lossy().as_ref()), "short scope enables its own sccache server");
+                // A deep data root must retain HTTP caching and omit the unusable UDS/wrapper.
+                let (deep, _) = serve(&root.join("long".repeat(32))).await?;
+                let env = cache_env(&deep, "acme/app", "ada", &tools)?;
+                anyhow::ensure!(get(&env, "RUSTC_WRAPPER").is_none() && get(&env, "SCCACHE_SERVER_UDS").is_none(), "long scope disables the sccache wrapper");
+                anyhow::ensure!(get(&env, "KILN_CACHE_URL").is_some() && get(&env, "SCCACHE_WEBDAV_ENDPOINT").is_some(), "long scope retains HTTP cache access");
             }
             // Another person: another token and folders of their own; no sccache, no wrapper.
             let bob = cache_env(&svc, "acme/app", "person:bob", &Tools { sccache: None, kiln: tools.kiln.clone() })?;
             for k in ["KILN_GOCACHEPROG_DIR", "SCCACHE_DIR", "CCACHE_DIR", "KILN_CACHE_TOKEN"] {
                 anyhow::ensure!(get(&ada, k).is_some() && get(&ada, k) != get(&bob, k), "{k} is each scope's own");
             }
-            anyhow::ensure!(get(&bob, "RUSTC_WRAPPER").is_none() && get(&bob, "SCCACHE_SERVER_UDS").is_none(), "{bob:?}");
+            anyhow::ensure!(get(&bob, "RUSTC_WRAPPER").is_none() && get(&bob, "SCCACHE_SERVER_UDS").is_none(), "missing sccache disables the wrapper");
             anyhow::ensure!(cache_env(&svc, "acme/app", "person:", &tools).is_err() && cache_env(&svc, "acme/app", "", &tools).is_err(), "a person names someone");
             // sccache serves a scope of its own from 0.9 on: an older one isn't the wrapper.
             anyhow::ensure!(version_at_least("sccache 0.10.0\n", (0, 9)) && version_at_least("sccache 1.0.0", (0, 9)) && version_at_least("sccache 0.9.1", (0, 9)));

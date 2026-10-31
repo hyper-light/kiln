@@ -232,7 +232,7 @@ impl Levels {
             Some(index) => usize::try_from(index).map_err(|_| full.clone())?,
             None => self
                 .fresh
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                     next.checked_add(1).filter(|next| {
                         SEGMENT
                             .checked_mul(SEGMENTS)
@@ -464,7 +464,7 @@ impl Backing {
     /// or reclassifying ancestors. Failure changes no counter.
     fn acquire(&self, bytes: usize) -> Result<(), MemoryError> {
         self.available
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |available| {
                 available.checked_sub(bytes)
             })
             .map(|_| ())
@@ -1185,7 +1185,7 @@ fn child_metadata() -> usize {
 
 fn reserve_counter(counter: &AtomicUsize, limit: usize, bytes: usize) -> Result<(), MemoryError> {
     counter
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
             used.checked_add(bytes).filter(|next| *next <= limit)
         })
         .map(|_| ())

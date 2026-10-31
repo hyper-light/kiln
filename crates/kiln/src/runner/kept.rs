@@ -33,6 +33,14 @@ struct Kept {
     until: i64,
     ws: PathBuf,
     containers: Option<Containers>,
+    cleanup: Option<super::docker::WorkspaceCleanup>,
+}
+
+struct ReleaseReport {
+    execution: std::sync::Arc<super::processes::Execution>,
+    retained: super::processes::RetainedExecution,
+    attempt: u32,
+    up: crate::exec::Uplink,
 }
 
 #[derive(Default)]
@@ -40,7 +48,11 @@ struct Entry {
     shell: Shell,
     /// Containers a failed leg left running, until it's kept or let go.
     held: Option<Containers>,
+    cleanup: Option<super::docker::WorkspaceCleanup>,
+    workspace_released: bool,
     kept: Option<Kept>,
+    release_report: Option<ReleaseReport>,
+    debug_executions: Vec<std::sync::Weak<super::processes::Execution>>,
 }
 
 static LEGS: LazyLock<parking_lot::Mutex<HashMap<String, Entry>>> = LazyLock::new(Default::default);
@@ -152,31 +164,68 @@ pub fn live(job: &str) -> bool {
 }
 
 /// A failed leg to be kept leaves its containers running here instead of stopping them.
-pub fn hold(job: &str, containers: Containers) {
+pub(crate) fn hold(job: &str, containers: Containers, cleanup: Option<super::docker::WorkspaceCleanup>) {
     if let Some(e) = LEGS.lock().get_mut(job) {
+        containers.retain();
         e.held = Some(containers);
+        e.cleanup = cleanup;
     }
+}
+
+pub(super) fn hold_cleanup(job: &str, cleanup: super::docker::WorkspaceCleanup) {
+    LEGS.lock().entry(job.to_owned()).or_default().cleanup = Some(cleanup);
+}
+
+pub(super) fn workspace_released(job: &str) { LEGS.lock().entry(job.to_owned()).or_default().workspace_released = true; }
+
+/// The exact execution survives completion in its kept entry; an old expiry callback cannot
+/// report that a newer attempt's workloads stopped.
+pub(crate) async fn report_release(job: &str, execution: std::sync::Arc<super::processes::Execution>, attempt: u32, up: crate::exec::Uplink) -> bool {
+    let retained = loop {
+        if !execution.accepts_work() { return false }
+        let owning = std::sync::Arc::clone(&execution);
+        match crate::rt::blocking(move || owning.retain()).await {
+            Ok(Ok(retained)) => break retained,
+            Ok(Err(error)) => tracing::error!(error = %error, job, "debug ownership could not persist; completion remains fenced"),
+            Err(error) => tracing::error!(error = %error, job, "debug ownership persistence task failed; completion remains fenced"),
+        }
+        crate::rt::sleep(Duration::from_secs(1)).await;
+    };
+    LEGS.lock().entry(job.to_owned()).or_default().release_report = Some(ReleaseReport { execution, retained, attempt, up });
+    true
+}
+
+pub(crate) fn debug_child(job: &str) -> Option<std::sync::Arc<super::processes::Execution>> {
+    LEGS.lock().get(job)?.release_report.as_ref().map(|r| r.retained.debug_child())
+}
+
+pub(crate) fn debug_execution(job: &str, execution: &std::sync::Arc<super::processes::Execution>) -> bool {
+    let mut legs = LEGS.lock();
+    let Some(entry) = legs.get_mut(job).filter(|e| e.kept.is_some()) else { return false };
+    entry.debug_executions.retain(|e| e.strong_count() > 0);
+    entry.debug_executions.push(std::sync::Arc::downgrade(execution));
+    true
 }
 
 /// The leg ended: kept for `keep_minutes` (a failed leg's `keep-on-failure`), returning until
 /// when, or let go (its containers stopped, its workspace removed).
 pub async fn ended(job: &str, ws: PathBuf, keep_minutes: Option<u32>) -> Option<i64> {
-    let held = LEGS.lock().get_mut(job).and_then(|e| e.held.take());
+    let (held, cleanup, released) = LEGS.lock().get_mut(job).map(|e| (e.held.take(), e.cleanup.take(), e.workspace_released)).unwrap_or_default();
+    if !released { super::warm::prepare_release(&ws).await; }
     match keep_minutes.filter(|m| *m > 0) {
         Some(m) => {
             let until = crate::util::now_unix() + i64::from(m.min(MAX_KEEP_MINUTES)) * 60;
             super::workspaces::keep_until(&ws, until);
-            LEGS.lock().entry(job.to_owned()).or_default().kept = Some(Kept { until, ws, containers: held });
+            LEGS.lock().entry(job.to_owned()).or_default().kept = Some(Kept { until, ws, containers: held, cleanup });
             expire_at(job, until);
             Some(until)
         }
         None => {
             LEGS.lock().remove(job);
             super::runtime::unpark(job);
-            if let Some(c) = held {
-                c.stop().await;
-            }
-            super::workspaces::release(&ws).await;
+            if let Some(execution) = super::processes::current() { execution.stop_commands().await; }
+            if !released { super::workspaces::release_with_cleanup(&ws, cleanup).await; }
+            if let Some(c) = held { c.stop().await; }
             None
         }
     }
@@ -214,10 +263,15 @@ pub async fn release(job: &str) -> bool {
     super::runtime::unpark(job);
     let Some(e) = LEGS.lock().remove(job) else { return false };
     let Some(k) = e.kept else { return false };
-    if let Some(c) = k.containers {
-        c.stop().await;
+    for execution in e.debug_executions.into_iter().filter_map(|e| e.upgrade()) { execution.stop().await; }
+    if let Some(report) = &e.release_report { report.execution.stop_commands().await; }
+    super::workspaces::release_with_cleanup(&k.ws, k.cleanup).await;
+    if let Some(c) = k.containers { c.stop().await; }
+    if let Some(report) = e.release_report {
+        report.retained.release().await;
+        let event = kiln_ci::wire::JobEventV2::KeptReleased { execution: report.execution.identity().into(), attempt: report.attempt };
+        if let Ok(json) = serde_json::to_string(&event) { report.up.msg(crate::proto::AgentMsg::JobEvent { job: job.into(), json }).await; }
     }
-    super::workspaces::release(&k.ws).await;
     true
 }
 

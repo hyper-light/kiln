@@ -5,13 +5,15 @@
 //!   [`configure`] (server, agent or CLI). Shards never steal work and there is no preemption, so
 //!   anything CPU-heavy or blocking goes to the blocking pool ([`blocking`]).
 //! * [`spawn`] keeps a task on the calling shard (locality: sockets and timers stay where they were
-//!   registered); spawns from outside the runtime are spread round-robin over the shards.
+//!   registered), including nested spawns from its blocking helpers; other spawns from outside the
+//!   runtime are spread round-robin over the shards.
 //! * hyper-rt's leaf futures (timers, socket readiness, its sync channels) accept only the polling
 //!   task's own waker. Everything exported here works under any waker: timers fall back to a
 //!   helper task ([`Bridge`]) when polled through a combinator or library that substitutes its own
 //!   waker, and the cross-task primitives are built on `event-listener` / `async-channel` /
-//!   `async-broadcast`, which work with any executor.
+//!   Quiver's offset-based event topics, which work with any executor.
 
+use std::cell::Cell;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
@@ -100,6 +102,8 @@ pub fn runtime_config(shards: u16, tasks: usize) -> RuntimeConfig {
 /// The blocking pool's shares.
 pub const SHARE_FS: &str = "fs";
 pub const SHARE_STORE: &str = "store";
+/// U08: synchronous mirror callers cannot occupy fs slots needed by async Git owners.
+pub const SHARE_GIT_MIRROR_IO: &str = "git-mirror-io";
 
 struct Rt {
     /// Held for the life of the process: dropping it would stop the shards.
@@ -114,11 +118,15 @@ fn start() -> Result<Rt, String> {
     let p = PROFILE.get().copied().unwrap_or_else(Profile::tool).with_env_overrides();
     let (dns, store, fs) = p.pool;
     let pool = hyper_rt::blocking::Config {
-        workers: dns + store + fs,
+        // U08: reserve capacity for both mirror callers and their OS-lock waits without
+        // consuming fs workers needed by managed Git owners to launch/finish commands.
+        workers: dns + store + fs + fs + 1,
         shares: vec![
             hyper_rt::blocking::Share { name: hyper_rt::dns::SHARE, limit: dns, waiting: 256 },
             hyper_rt::blocking::Share { name: SHARE_STORE, limit: store, waiting: 16_384 },
             hyper_rt::blocking::Share { name: SHARE_FS, limit: fs, waiting: 8_192 },
+            hyper_rt::blocking::Share { name: SHARE_GIT_MIRROR_IO, limit: fs, waiting: 256 },
+            hyper_rt::blocking::Share { name: kiln_cd::git::LOCK_SHARE, limit: 1, waiting: 256 },
         ],
     };
     match hyper_rt::blocking::start(pool) {
@@ -147,6 +155,25 @@ pub fn on_shard() -> bool {
 
 type Boxed = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
+thread_local! {
+    /// A blocking helper's logical caller. A holder includes the registration generation,
+    /// so a later runtime occupying the same shard number cannot inherit its work.
+    static BLOCKING_ORIGIN: Cell<Option<SlotHolder>> = const { Cell::new(None) };
+}
+
+fn spawn_origin() -> Option<SlotHolder> {
+    hyper_rt::futures::shard_id().and_then(|id| hyper_rt::registry::holder_of(id.0)).or_else(|| BLOCKING_ORIGIN.with(Cell::get))
+}
+
+fn with_blocking_origin<T>(origin: Option<SlotHolder>, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<SlotHolder>);
+    impl Drop for Restore {
+        fn drop(&mut self) { BLOCKING_ORIGIN.with(|slot| slot.set(self.0)); }
+    }
+    let _restore = Restore(BLOCKING_ORIGIN.with(|slot| slot.replace(origin)));
+    f()
+}
+
 /// A future handed to the runtime through a slot, so a refused submission (full control queue,
 /// full arena) leaves it in place for the next attempt instead of dropping it.
 fn handoff(fut: Boxed) -> Arc<Mutex<Option<Boxed>>> {
@@ -163,9 +190,23 @@ fn bootstrap(slot: &Arc<Mutex<Option<Boxed>>>) -> impl Future<Output = ()> + Sen
     }
 }
 
+fn submit_to(holder: SlotHolder, slot: &Arc<Mutex<Option<Boxed>>>) -> bool {
+    let Ok(receipt) = hyper_rt::runtime::submit_to_holder(holder, bootstrap(slot)) else { return false };
+    // Only a cold caller may wait for the shard to drain its control queue. A refused
+    // bootstrap never took the future from `slot`, so another shard can still admit it.
+    on_shard() || matches!(receipt.wait_blocking(), Ok(hyper_rt::task::Admission::Admitted(_)))
+}
+
 fn submit(slot: &Arc<Mutex<Option<Boxed>>>) -> bool {
     // On a shard: keep the task here (no cross-thread hop; its sockets and timers stay local).
     if on_shard() && hyper_rt::futures::spawn_detached(bootstrap(slot)).is_ok() {
+        return true;
+    }
+    // Pipe pumps created by an offloaded command launcher belong with their caller's
+    // deadline, rather than behind unrelated synchronous work on another shard.
+    if !on_shard() && let Some(origin) = BLOCKING_ORIGIN.with(Cell::get)
+        && submit_to(origin, slot)
+    {
         return true;
     }
     submit_spread(slot)
@@ -177,7 +218,7 @@ fn submit_spread(slot: &Arc<Mutex<Option<Boxed>>>) -> bool {
     let start = rt.next.fetch_add(1, Ordering::Relaxed);
     for i in 0..n {
         if let Some(holder) = rt.holders.get(start.wrapping_add(i) % n)
-            && hyper_rt::runtime::submit_to_holder(*holder, bootstrap(slot)).is_ok()
+            && submit_to(*holder, slot)
         {
             return true;
         }
@@ -187,6 +228,10 @@ fn submit_spread(slot: &Arc<Mutex<Option<Boxed>>>) -> bool {
 
 /// Whether the runtime took the task (refused on every shard: dropped, and said so).
 fn spawn_boxed(fut: Boxed) -> bool {
+    let fut: Boxed = match crate::runner::processes::current() {
+        Some(execution) => Box::pin(crate::runner::processes::scoped_boxed(execution, fut)),
+        None => fut,
+    };
     let slot = handoff(fut);
     if submit(&slot) {
         return true;
@@ -227,7 +272,8 @@ impl<T> Future for JoinHandle<T> {
 }
 
 /// Run `fut` as its own task: on the current shard when called from one, otherwise on the next
-/// shard round-robin. A panic ends only that task (hyper-rt catches it; the handle reports `Err`).
+/// shard round-robin. A blocking helper retains its caller's shard for nested spawns. A panic
+/// ends only that task (hyper-rt catches it; the handle reports `Err`).
 pub fn spawn<F>(fut: F) -> JoinHandle<F::Output>
 where
     F: Future + Send + 'static,
@@ -260,7 +306,12 @@ impl kiln_seams::Spawn for RtSpawn {
 /// Run `fut` on the next shard round-robin wherever the caller is: spreads accepted connections
 /// over every shard. Falls back to the current shard when the others refuse.
 pub fn spawn_spread<F: Future<Output = ()> + Send + 'static>(fut: F) {
-    let slot = handoff(Box::pin(fut));
+    let fut: Boxed = Box::pin(fut);
+    let fut: Boxed = match crate::runner::processes::current() {
+        Some(execution) => Box::pin(crate::runner::processes::scoped_boxed(execution, fut)),
+        None => fut,
+    };
+    let slot = handoff(fut);
     if submit_spread(&slot) || submit(&slot) {
         return;
     }
@@ -269,7 +320,10 @@ pub fn spawn_spread<F: Future<Output = ()> + Send + 'static>(fut: F) {
 
 /// Run a `!Send` future as a task on the current shard. Refused off the runtime.
 pub fn spawn_local<F: Future<Output = ()> + 'static>(fut: F) -> Result<TaskId, RtError> {
-    hyper_rt::futures::spawn_detached(fut)
+    match crate::runner::processes::current() {
+        Some(execution) => hyper_rt::futures::spawn_detached(crate::runner::processes::scoped(Some(execution), fut)),
+        None => hyper_rt::futures::spawn_detached(fut),
+    }
 }
 
 /// Run `fut` to completion on the runtime, blocking the calling (non-runtime) thread: `main` and
@@ -309,7 +363,8 @@ where
 }
 
 /// Run `f` on a named share of the blocking pool. Waits (instead of failing) while the share's
-/// queue is full; if the pool is unavailable the job gets a thread of its own.
+/// queue is full; if the pool is unavailable the job gets a thread of its own. The bounded
+/// U08 mirror shares instead return the pool refusal and never create fallback threads.
 pub async fn blocking_in<R, F>(share: &'static str, f: F) -> anyhow::Result<R>
 where
     F: FnOnce() -> R + Send + 'static,
@@ -317,7 +372,10 @@ where
 {
     rt()?;
     let (tx, rx) = futures::channel::oneshot::channel::<R>();
-    let job: Arc<Mutex<Option<(F, futures::channel::oneshot::Sender<R>)>>> = Arc::new(Mutex::new(Some((f, tx))));
+    let execution = crate::runner::processes::current();
+    let origin = spawn_origin();
+    let f = move || with_blocking_origin(origin, || crate::runner::processes::within(execution, f));
+    let job = Arc::new(Mutex::new(Some((f, tx))));
     let mut delay = Duration::from_millis(1);
     loop {
         let j = Arc::clone(&job);
@@ -333,6 +391,7 @@ where
                 sleep(delay).await;
                 delay = (delay * 2).min(Duration::from_millis(100));
             }
+            Err(e) if share == SHARE_GIT_MIRROR_IO || share == kiln_cd::git::LOCK_SHARE => return Err(e.into()),
             Err(e) => {
                 tracing::warn!(error = %e, share, "blocking pool unavailable; running on a thread");
                 let j = Arc::clone(&job);
@@ -737,34 +796,8 @@ impl Notify {
 
 // ---------------------------------------------------------------------------------- broadcast
 
-/// Fan-out to every current subscriber; slow subscribers lose the oldest messages (they see
-/// `RecvError::Overflowed`) instead of holding up the sender.
-pub struct Broadcast<T: Clone> {
-    tx: async_broadcast::Sender<T>,
-    _keep_open: async_broadcast::InactiveReceiver<T>,
-}
-
-impl<T: Clone> Broadcast<T> {
-    pub fn new(capacity: usize) -> Self {
-        let (mut tx, rx) = async_broadcast::broadcast(capacity.max(1));
-        tx.set_overflow(true);
-        tx.set_await_active(false);
-        Self { tx, _keep_open: rx.deactivate() }
-    }
-
-    /// Deliver to the current subscribers (dropped when there are none).
-    pub fn send(&self, value: T) {
-        let _ = self.tx.try_broadcast(value);
-    }
-
-    pub fn subscribe(&self) -> async_broadcast::Receiver<T> {
-        self.tx.new_receiver()
-    }
-
-    pub fn receiver_count(&self) -> usize {
-        self.tx.receiver_count()
-    }
-}
+/// U14: retained as a runtime import for existing callers; Quiver owns all event delivery.
+pub use crate::bus::Broadcast;
 
 // --------------------------------------------------------------------------------------- files
 
@@ -824,7 +857,25 @@ pub fn file_sink(
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     }
-    let file = Arc::new(std::fs::File::create(&path).with_context(|| format!("create {}", path.display()))?);
+    let file = std::fs::File::create(&path).with_context(|| format!("create {}", path.display()))?;
+    Ok(file_sink_owned(file, max, ()))
+}
+
+// Field order closes the file reference before releasing its ownership, including errors.
+#[derive(Clone)]
+struct HeldSinkFile<H> { file: Arc<std::fs::File>, _hold: H }
+impl<H> HeldSinkFile<H> {
+    fn with_file<R>(&self, action: impl FnOnce(&std::fs::File) -> R) -> R { action(&self.file) }
+}
+
+/// U07: the writer and every dispatched blocking operation retain the exact lease even
+/// when the caller drops its completion future. This does not authorize external writers.
+pub(crate) fn file_sink_owned<H: Clone + Send + 'static>(
+    file: std::fs::File,
+    max: u64,
+    hold: H,
+) -> (async_channel::Sender<Bytes>, impl Future<Output = anyhow::Result<u64>> + Send + 'static) {
+    let owned = HeldSinkFile { file: Arc::new(file), _hold: hold };
     let (tx, rx) = async_channel::bounded::<Bytes>(16);
     let writer = spawn(async move {
         let mut total = 0u64;
@@ -841,25 +892,25 @@ pub fn file_sink(
                 }
             }
             let at = total;
-            total = total.saturating_add(u64::try_from(size).unwrap_or(u64::MAX));
+            total = total.checked_add(u64::try_from(size)?).context("file sink byte count overflow")?;
             anyhow::ensure!(total <= max, "upload exceeds {max} bytes");
-            let f = Arc::clone(&file);
-            blocking(move || {
+            let held = owned.clone();
+            blocking(move || held.with_file(|file| {
                 let mut off = at;
                 for chunk in &batch {
-                    crate::os::write_all_at(&f, chunk, off)?;
+                    crate::os::write_all_at(file, chunk, off)?;
                     off = off.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
                 }
                 Ok::<_, io::Error>(())
-            })
+            }))
             .await??;
         }
-        let f = Arc::clone(&file);
-        blocking(move || f.sync_data()).await??;
+        let held = owned.clone();
+        blocking(move || held.with_file(std::fs::File::sync_data)).await??;
         Ok(total)
     });
     let done = async move { writer.await.map_err(|_| anyhow::anyhow!("file writer stopped"))? };
-    Ok((tx, done))
+    (tx, done)
 }
 
 // ----------------------------------------------------------------------------------------- dns
@@ -947,6 +998,52 @@ impl Signals {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// U03: a blocking command launcher keeps its pipe tasks with the caller's deadline;
+    /// the worker context cannot escape a return, nested override, or unwind.
+    #[test]
+    fn u03_blocking_children_keep_caller_locality_and_restore_context() -> anyhow::Result<()> {
+        let origin = block_on(async {
+            let origin = spawn_origin().context("the fixture has no runtime holder")?;
+            let child = blocking(|| spawn(async { spawn_origin() })).await?;
+            assert_eq!(child.await.ok().flatten(), Some(origin));
+            Ok(origin)
+        })?;
+        assert!(spawn_origin().is_none());
+        with_blocking_origin(Some(origin), || {
+            assert_eq!(spawn_origin(), Some(origin));
+            with_blocking_origin(None, || assert!(spawn_origin().is_none()));
+            assert_eq!(spawn_origin(), Some(origin));
+            let unwound = std::panic::catch_unwind(|| with_blocking_origin(None, || std::panic::resume_unwind(Box::new("U03 scoped unwind"))));
+            assert!(unwound.is_err());
+            assert_eq!(spawn_origin(), Some(origin));
+        });
+        assert!(spawn_origin().is_none());
+        Ok(())
+    }
+
+    /// U03: a preferred shard's queued request may still be refused at admission. Keep
+    /// the caller's task intact and execute it once on available capacity elsewhere.
+    #[test]
+    fn u03_full_blocking_origin_falls_back_without_losing_or_duplicating_work() -> anyhow::Result<()> {
+        rt()?;
+        let isolated = Runtime::start(&runtime_config(1, 1))?;
+        let shard = isolated.shard_ids().first().copied().context("the capacity fixture has no shard")?;
+        let origin = isolated.holder_of(shard).context("the capacity fixture has no holder")?;
+        let occupied = hyper_rt::runtime::submit_to_holder(origin, std::future::pending())?.wait_blocking()?;
+        assert!(matches!(occupied, hyper_rt::task::Admission::Admitted(_)));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let child = with_blocking_origin(Some(origin), || spawn(async move {
+            observed.fetch_add(1, Ordering::Relaxed);
+            spawn_origin()
+        }));
+        let ran_on = block_on(async move { Ok(timeout(Duration::from_secs(5), child).await??) })?.context("the fallback task ran off-runtime")?;
+        assert_ne!(ran_on, origin);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        isolated.shutdown()?;
+        Ok(())
+    }
 
     /// `each` keeps the items' order, runs no more than `n` at once, runs them at once (four
     /// 50 ms waits take ~one), and polls them under the task's own waker: a hyper-rt connect inside
@@ -1085,7 +1182,7 @@ mod tests {
 
             let b = Broadcast::<u32>::new(4);
             let mut r = b.subscribe();
-            b.send(1);
+            b.send(1)?;
             assert_eq!(r.recv().await.ok(), Some(1));
 
             let v = blocking(|| 5 * 5).await?;
@@ -1170,6 +1267,19 @@ mod tests {
             drop(tx);
             assert!(done.await.is_err());
             assert!(file_source(dir.path().join("missing")).is_err());
+            // U07: dropping the completion handle detaches the writer, never its lease.
+            // Wait for its actual lease release, not an elapsed-time guess.
+            struct Ended(Option<futures::channel::oneshot::Sender<()>>);
+            impl Drop for Ended { fn drop(&mut self) { if let Some(tx) = self.0.take() { let _ = tx.send(()); } } }
+            let (ended, mut released) = futures::channel::oneshot::channel();
+            let path = dir.path().join("detached");
+            let (tx, done) = file_sink_owned(std::fs::File::create(&path)?, 10, Arc::new(Ended(Some(ended))));
+            drop(done);
+            assert!(released.try_recv()?.is_none(), "the admitted writer must retain its lease");
+            let _ = tx.send(Bytes::from_static(b"0123456789abc")).await;
+            drop(tx);
+            released.await?;
+            assert_eq!(std::fs::metadata(path)?.len(), 0, "an oversized batch is refused before its first write");
             Ok(())
         })
     }

@@ -6,7 +6,7 @@ use super::reserve::ReservationSpec;
 use super::retry::{FailureClass, RetryPolicy};
 use super::routing::{LegRoute, Preference, RunnerView, github_label_rules};
 use super::sim::Sim;
-use super::state::{Command, Config, Incoming, Input, LegIn, Outcome, Resources, RunnerIn, Scheduler, Supersede, WaitReason, room};
+use super::state::{Command, Config, Incoming, Input, LegIn, Outcome, Resources, RunnerIn, Sample, Scheduler, Supersede, WaitReason, room};
 use crate::facts::{Disk, RunnerFacts};
 
 const MIN: i64 = 60_000;
@@ -814,6 +814,125 @@ fn w13_r07_k8s_pool_pods_are_their_own_runners() -> Result<(), String> {
     sim.run(t + 4 * MIN);
     assert!(sim.executors_stopped.iter().any(|(_, e)| e == "pool-pods-old"), "{:?}", sim.executors_stopped);
     assert_ne!(sim.assigned.iter().find(|a| a.leg == "late").map(|a| a.runner.as_str()), Some("pod-old"));
+
+    // U01: a later job must fit the actual admitted container, including older grants after
+    // restart. A pod runner's host-shaped Facts/capacity and zero outer reservation prove none
+    // of its CPU/memory allowance. Legacy unknown capacity cannot take even a zero-demand leg.
+    let mut pool = pod_pool(0, 1)?;
+    pool.request = Resources { cpu: 1.0, mem: 128, ..Default::default() };
+    let small = super::pools::PodCapacity { resource_version: "api-1".into(), cpu_request: Some(0.25), memory_request: Some(32), ..Default::default() };
+    let restored = super::state::ExecutorSnapshot { executor: "old-pod".into(), pool: pool.name.clone(), runner: String::new(), reserved: Resources::default(), leg: None, binding: None, shape: Some(super::pools::ExecutorShape::Kubernetes(small.clone())) };
+    let mut s = Scheduler::new(Config { pools: vec![pool.clone()], ..Config::default() });
+    assert!(s.restore_executor(restored.clone(), false, 0));
+    let runner = RunnerIn { id: "pod-old-shape".into(), slots: 1, capacity: Some(Resources { cpu: 99.0, mem: 9999, disk: 9999, gpu: 8 }), executor: Some("old-pod".into()), ..RunnerIn::default() };
+    s.handle(Input::RunnerUp(Box::new(runner.clone())), 1);
+    let mut demand = pod_leg("larger");
+    demand.request = Resources { cpu: 0.5, mem: 64, ..Default::default() };
+    let commands = s.handle(Input::LegQueued(Box::new(demand.clone())), 2);
+    assert!(!commands.iter().any(|c| matches!(c, Command::Assign { .. })), "actual .25 CPU / 32-byte pod cannot take .5 CPU / 64-byte work");
+    assert!(commands.iter().any(|c| matches!(c, Command::StopExecutor { executor, .. } if executor == "old-pod")), "an undersized idle pod uses the existing replacement owner");
+    assert_eq!(s.executor_snapshot("old-pod").map(|e| (e.reserved, e.shape)), Some((Resources::default(), Some(super::pools::ExecutorShape::Kubernetes(small.clone())))), "outer reservation/capacity stay owned until verified stop");
+    let commands = s.executor_stopped("old-pod", 3);
+    assert!(!commands.iter().any(|c| matches!(c, Command::StartExecutor { .. })), "verified stop does not bypass the existing startup backoff");
+    let commands = s.handle(Input::Tick, 2 + super::pools::FIRST_BACKOFF_MS);
+    let replacement = commands.iter().find_map(|c| if let Command::StartExecutor { executor, .. } = c { Some(executor.clone()) } else { None }).ok_or("replacement did not start after proof")?;
+    let actual = super::pools::PodCapacity { cpu_request: Some(1.0), memory_request: Some(128), ..small.clone() };
+    assert!(s.bind_pod_capacity(&replacement, actual.clone()));
+    assert!(!s.bind_pod_capacity(&replacement, small.clone()), "captured shape cannot change under one grant");
+    let commands = s.handle(Input::RunnerUp(Box::new(RunnerIn { id: "pod-new-shape".into(), executor: Some(replacement.clone()), ..runner.clone() })), 3 + super::pools::FIRST_BACKOFF_MS);
+    assert!(commands.iter().any(|c| matches!(c, Command::Assign { leg, slot: Some(e), .. } if leg == "larger" && e == &replacement)), "fractional CPU/memory demand within the admitted shape is admitted");
+
+    let binding = crate::wire::ParentBinding { executor: replacement.clone(), generation: "generation".into(), allocation: "allocation".into(), physical_execution: "physical-pod".into(), job: "larger".into(), attempt: 1 };
+    assert!(s.bind_parent(binding.clone()));
+    let owned = s.executor_snapshot(&replacement).ok_or("assigned pod lost its grant")?;
+    let mut recovered = Scheduler::new(Config { pools: vec![pool.clone()], ..Config::default() });
+    assert!(recovered.restore_executor(owned, false, 0));
+    assert!(recovered.bind_pod_capacity(&replacement, actual.clone()));
+    let commands = recovered.handle(Input::RunnerUp(Box::new(RunnerIn { id: "pod-new-shape".into(), executor: Some(replacement.clone()), ..runner.clone() })), 1);
+    assert!(!commands.iter().any(|c| matches!(c, Command::StopExecutor { .. } | Command::Assign { .. })), "capacity reconciliation preserves restored busy ownership");
+    assert_eq!(recovered.executor_snapshot(&replacement).and_then(|e| e.binding), Some(binding));
+
+    // Unknown and zero differ, CPU limits constrain requests, and unsupported dimensions are
+    // never inferred from host Facts or from an ephemeral-storage placement request.
+    for (shape, request, says) in [
+        (None, Resources::default(), "unknown"),
+        (Some(super::pools::PodCapacity { cpu_request: Some(0.0), ..actual.clone() }), Resources { cpu: 0.1, ..Default::default() }, "guarantees 0 CPU"),
+        (Some(super::pools::PodCapacity { cpu_limit: Some(0.25), ..actual.clone() }), Resources { cpu: 0.5, ..Default::default() }, "guarantees 0.25 CPU"),
+        (Some(super::pools::PodCapacity { memory_limit: Some(16), ..actual.clone() }), Resources { mem: 32, ..Default::default() }, "guarantees 16 memory"),
+        (Some(actual.clone()), Resources { disk: 1, ..Default::default() }, "disk growth is unsupported"),
+        (Some(actual.clone()), Resources { gpu: 1, ..Default::default() }, "GPU assignment is unsupported"),
+    ] {
+        let mut p = pool.clone(); p.max = 2;
+        let mut s = Scheduler::new(Config { pools: vec![p], ..Config::default() });
+        assert!(s.restore_executor(super::state::ExecutorSnapshot { shape: shape.map(super::pools::ExecutorShape::Kubernetes), ..restored.clone() }, false, 0));
+        s.handle(Input::RunnerUp(Box::new(runner.clone())), 1);
+        let commands = s.handle(Input::LegQueued(Box::new(LegIn { request, ..pod_leg("bounded") })), 2);
+        assert!(!commands.iter().any(|c| matches!(c, Command::Assign { .. })), "{says}");
+        if request.disk == 0 && request.gpu == 0 {
+            assert!(commands.iter().any(|c| matches!(c, Command::StartExecutor { .. })), "{says}: unfit warm capacity below max cannot suppress a fitting future pod");
+            assert!(!commands.iter().any(|c| matches!(c, Command::StopExecutor { .. })), "{says}: use spare pool room without releasing the old grant");
+        }
+        assert!(matches!(s.reason("bounded"), Some(WaitReason::Oversized { short, .. }) if short.iter().any(|s| s.contains(says))), "{says}: {:?}", s.reason("bounded"));
+    }
+    // Three small idle pods cover one small queued job once, not three times. An uncovered
+    // larger job needs growth below max, or one redundant idle grant retired at max. Live
+    // headroom keeps the jobs queued so immediate assignment cannot hide this counterexample.
+    for max in [3, 4] {
+        let mut p = pool.clone(); p.max = max;
+        let mut s = Scheduler::new(Config { pools: vec![p], ..Config::default() });
+        for i in 0..3 {
+            let id = format!("warm-{i}"); let agent = format!("pod-warm-{i}");
+            assert!(s.restore_executor(super::state::ExecutorSnapshot { executor: id.clone(), ..restored.clone() }, false, 0));
+            s.handle(Input::RunnerUp(Box::new(RunnerIn { id: agent.clone(), executor: Some(id), ..runner.clone() })), 1);
+            s.handle(Input::RunnerSample { runner: agent, sample: Sample { cpus: 4, busy: 1.0, mem_total: 1024, ..Sample::default() } }, 1);
+        }
+        s.handle(Input::LegQueued(Box::new(LegIn { request: Resources { cpu: 0.1, mem: 16, ..Default::default() }, ..pod_leg("a-small") })), 2);
+        let commands = s.handle(Input::LegQueued(Box::new(LegIn { request: Resources { cpu: 0.5, mem: 16, ..Default::default() }, ..pod_leg("z-large") })), 3);
+        assert!(!commands.iter().any(|c| matches!(c, Command::Assign { .. })));
+        assert_eq!(commands.iter().filter(|c| matches!(c, Command::StartExecutor { .. })).count(), usize::from(max == 4));
+        assert_eq!(commands.iter().filter(|c| matches!(c, Command::StopExecutor { .. })).count(), usize::from(max == 3));
+        assert_eq!(s.pools().iter().flat_map(|p| &p.executors).count(), max, "every old or stopping grant remains counted");
+    }
+    // Maximum coverage must rematch a flexible job onto the memory-rich pod so the CPU-only
+    // fit can use the CPU-rich one; greedy distinct counting would launch an unnecessary pod.
+    let mut p = pool.clone(); p.max = 3; p.request = Resources { cpu: 2.0, mem: 2, ..Default::default() };
+    let mut s = Scheduler::new(Config { pools: vec![p], ..Config::default() });
+    for (id, cpu, mem) in [("a-cpu", 2.0, 1), ("b-memory", 1.0, 2)] {
+        let shape = super::pools::ExecutorShape::Kubernetes(super::pools::PodCapacity { cpu_request: Some(cpu), memory_request: Some(mem), ..small.clone() });
+        assert!(s.restore_executor(super::state::ExecutorSnapshot { executor: id.into(), shape: Some(shape), ..restored.clone() }, false, 0));
+        s.handle(Input::RunnerUp(Box::new(RunnerIn { id: id.into(), executor: Some(id.into()), ..runner.clone() })), 1);
+        s.handle(Input::RunnerSample { runner: id.into(), sample: Sample { cpus: 4, busy: 1.0, mem_total: 1024, ..Sample::default() } }, 1);
+    }
+    for (id, cpu) in [("a-flexible", 1.0), ("b-needs-cpu", 2.0)] {
+        let commands = s.handle(Input::LegQueued(Box::new(LegIn { request: Resources { cpu, mem: 1, ..Default::default() }, ..pod_leg(id) })), 2);
+        assert!(!commands.iter().any(|c| matches!(c, Command::StartExecutor { .. } | Command::StopExecutor { .. })), "a complete actual matching already covers both jobs");
+    }
+    // own_executor supplies identity/isolation, never a fabricated resource override.
+    let mut p = pool.clone(); p.request = Resources { cpu: 0.25, mem: 32, ..Default::default() };
+    let mut s = Scheduler::new(Config { pools: vec![p], ..Config::default() });
+    let own = LegIn { own_executor: true, request: Resources { cpu: 0.5, mem: 16, ..Default::default() }, ..pod_leg("own") };
+    assert!(!s.handle(Input::LegQueued(Box::new(own.clone())), 1).iter().any(|c| matches!(c, Command::StartExecutor { .. })));
+    assert!(matches!(s.reason("own"), Some(WaitReason::Oversized { short, .. }) if short.iter().any(|s| s.contains("configured CPU/memory"))));
+    // Persistent admitted reductions use the existing pool backoff, across fresh pod runner
+    // names. Neither Ready nor elapsed time releases an unproved physical owner.
+    let mut s = Scheduler::new(Config { pools: vec![pool.clone()], ..Config::default() });
+    let mut commands = s.handle(Input::LegQueued(Box::new(own)), 1);
+    let mut now = 2;
+    for delay in [super::pools::FIRST_BACKOFF_MS, super::pools::FIRST_BACKOFF_MS * 2] {
+        let id = commands.iter().find_map(|c| if let Command::StartExecutor { executor, .. } = c { Some(executor.clone()) } else { None }).ok_or("own-pod retry missing")?;
+        assert!(s.protect_executor(&id));
+        assert!(s.bind_pod_capacity(&id, small.clone()));
+        let failed = s.handle(Input::RunnerUp(Box::new(RunnerIn { id: format!("kiln-x-reduced-{now}"), executor: Some(id.clone()), ..runner.clone() })), now);
+        assert!(!failed.iter().any(|c| matches!(c, Command::Assign { .. })));
+        assert!(failed.iter().any(|c| matches!(c, Command::Timer { at } if *at == now + delay)), "reduced Ready cannot reset exponential backoff");
+        assert!(failed.iter().any(|c| matches!(c, Command::StopExecutor { executor, .. } if executor == &id)));
+        assert!(s.executor_snapshot(&id).is_some());
+        assert!(!s.handle(Input::Tick, now + delay - 1).iter().any(|c| matches!(c, Command::StartExecutor { .. } | Command::StopExecutor { .. })), "no extra retirement while physical stop is pending");
+        assert!(!s.executor_stopped(&id, now + delay - 1).iter().any(|c| matches!(c, Command::StartExecutor { .. })));
+        now += delay;
+        commands = s.handle(Input::Tick, now);
+        now += 1;
+    }
     Ok(())
 }
 
@@ -1821,6 +1940,302 @@ proptest! {
 }
 }
 
+
+/// U01: CI and reach share assignment and reconnect accounting.
+#[test]
+fn u01_reach_retains_capacity_until_host_end_across_disconnect_and_restore() {
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
+    let reach = LegIn { external: true, ..leg("reach", "reach/caller", 60) };
+    let assigned = s.handle(Input::LegQueued(Box::new(reach.clone())), 1);
+    assert!(assigned.iter().any(|c| matches!(c, Command::Assign { leg, .. } if leg == "reach")));
+    s.handle(Input::LegQueued(Box::new(leg("ci", "acme/x", 60))), 2);
+    let lost = s.handle(Input::RunnerLost { runner: "a".into() }, 3);
+    assert!(!lost.iter().any(|c| matches!(c, Command::Settled { leg, .. } if leg == "reach")));
+    let back = s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 4);
+    assert!(!back.iter().any(|c| matches!(c, Command::Assign { leg, .. } if leg == "ci")));
+    let end = s.handle(Input::AttemptFinished { leg: "reach".into(), attempt: 1, outcome: Outcome::Success }, 5);
+    assert!(end.iter().any(|c| matches!(c, Command::Assign { leg, .. } if leg == "ci")));
+
+    let mut restored = Scheduler::new(Config::default());
+    restored.handle(Input::LegRunning { leg: Box::new(reach), runner: "a".into(), attempt: 1 }, 6);
+    restored.handle(Input::LegQueued(Box::new(leg("ci", "acme/x", 60))), 7);
+    let back = restored.handle(Input::RunnerUp(Box::new(linux("a", 1))), 8);
+    assert!(!back.iter().any(|c| matches!(c, Command::Assign { leg, .. } if leg == "ci")));
+    let end = restored.handle(Input::AttemptFinished { leg: "reach".into(), attempt: 1, outcome: Outcome::Success }, 9);
+    assert!(end.iter().any(|c| matches!(c, Command::Assign { leg, .. } if leg == "ci")));
+}
+
+/// U01: explicit quantities pack in either mode, in both arrival orders. Each dimension is a
+/// physical reservation even when ordinary CI policy permits overcommit of unreserved room.
+#[test]
+fn u01_ci_and_reach_pack_cpu_memory_disk_gpu_in_both_scheduler_modes() {
+    for resources in [false, true] {
+        for reach_first in [false, true] {
+            let mut s = Scheduler::new(Config { resources, overcommit_cpu: 2.0, overcommit_mem: 2.0, overcommit_disk: 2.0, ..Config::default() });
+            let capacity = Resources { cpu: 8.0, mem: 80, disk: 100, gpu: 2 };
+            let runner = RunnerIn { capacity: Some(capacity), ..machine("a", 4, 8, 1) };
+            s.handle(Input::RunnerUp(Box::new(runner.clone())), 0);
+            let ci = LegIn { request: Resources { cpu: 2.0, mem: 20, disk: 30, gpu: 1 }, ..leg("ci", "acme/x", 60) };
+            let reach = LegIn { external: true, request: Resources { cpu: 2.0, mem: 20, disk: 40, gpu: 1 }, ..leg("reach-packed", "reach/caller", 60) };
+            let (first, second) = if reach_first { (reach.clone(), ci.clone()) } else { (ci.clone(), reach.clone()) };
+            assert_eq!(assigned(&s.handle(Input::LegQueued(Box::new(first.clone())), 1)), vec![first.id]);
+            assert_eq!(assigned(&s.handle(Input::LegQueued(Box::new(second.clone())), 2)), vec![second.id], "CI and reach share a runner: resources={resources}");
+            for (dimension, request) in [
+                ("cpu", Resources { cpu: 5.0, ..Resources::default() }),
+                ("mem", Resources { mem: 41, ..Resources::default() }),
+                ("disk", Resources { disk: 31, ..Resources::default() }),
+                ("gpu", Resources { gpu: 1, ..Resources::default() }),
+            ] {
+                let id = format!("reach-excess-{dimension}");
+                let blocked = LegIn { external: true, request, ..leg(&id, "reach/caller", 60) };
+                assert!(assigned(&s.handle(Input::LegQueued(Box::new(blocked)), 3)).is_empty(), "reserved {dimension} cannot be overcommitted");
+                s.handle(Input::LegGone { leg: id }, 4);
+            }
+            let other_ci = LegIn { request: Resources { cpu: 5.0, ..Resources::default() }, ..leg("ci-excess", "acme/x", 60) };
+            assert!(assigned(&s.handle(Input::LegQueued(Box::new(other_ci)), 5)).is_empty(), "later CI cannot consume the reserved share through overcommit");
+            s.handle(Input::LegGone { leg: "ci-excess".into() }, 6);
+            let whole = LegIn { external: true, exclusive: true, request: reach.request, ..leg("reach-whole", "reach/caller", 60) };
+            assert!(assigned(&s.handle(Input::LegQueued(Box::new(whole)), 7)).is_empty(), "explicit exclusivity still waits for an empty host");
+            s.handle(Input::LegGone { leg: "reach-whole".into() }, 8);
+
+            let mut restored = Scheduler::new(Config { resources, ..Config::default() });
+            restored.handle(Input::LegRunning { leg: Box::new(reach), runner: "a".into(), attempt: 1 }, 9);
+            restored.handle(Input::RunnerUp(Box::new(runner)), 10);
+            let remainder = LegIn { request: Resources { cpu: 6.0, mem: 60, disk: 60, gpu: 1 }, ..leg("ci-remainder", "acme/x", 60) };
+            assert_eq!(assigned(&restored.handle(Input::LegQueued(Box::new(remainder)), 11)), vec!["ci-remainder"], "restart restores the exact share, not a whole-host hold");
+            let excess = LegIn { external: true, request: Resources { mem: 1, ..Resources::default() }, ..leg("reach-memory-only", "reach/caller", 60) };
+            assert!(assigned(&restored.handle(Input::LegQueued(Box::new(excess)), 12)).is_empty(), "memory-only requests retain accounting after restore");
+        }
+    }
+}
+
+/// U01: warm CI executors and direct reach commands consume the same host quantities; an
+/// executor's busy leg consumes its already-reserved capacity once, and replacement cannot
+/// overcommit a reach share even when ordinary CI policy allows overcommit.
+#[test]
+fn u01_reach_packs_with_pool_reservations_without_losing_requested_resources() -> Result<(), String> {
+    for resources in [false, true] {
+        let mut p = pool(1, 2, 2, "1m")?;
+        p.request = Resources { cpu: 6.0, mem: 60, disk: 60, gpu: 1 };
+        let mut s = Scheduler::new(Config { resources, pools: vec![p], ..Config::default() });
+        let r = RunnerIn { slots: 4, capacity: Some(Resources { cpu: 8.0, mem: 80, disk: 100, gpu: 2 }), ..docker_host("a") };
+        let started = s.handle(Input::RunnerUp(Box::new(r)), 0);
+        let executor = started.iter().find_map(|c| match c { Command::StartExecutor { executor, .. } => Some(executor.clone()), _ => None }).ok_or("pool did not reserve its first executor")?;
+        s.handle(Input::ExecutorReady { executor }, 1);
+        let reach = LegIn { id: "reach-pool-peer".into(), run: "reach-pool-peer".into(), repo: "reach/caller".into(), external: true, request: Resources { cpu: 2.0, mem: 20, disk: 40, gpu: 1 }, ..LegIn::default() };
+        let admitted = s.handle(Input::LegQueued(Box::new(reach)), 2);
+        assert_eq!(assigned(&admitted), vec!["reach-pool-peer"], "reach uses the capacity beside the warm pool");
+        let busy = s.handle(Input::LegQueued(Box::new(pool_leg("ci-in-pool"))), 3);
+        assert_eq!(assigned(&busy), vec!["ci-in-pool"], "the executor's existing reservation is not counted twice");
+        assert!(!busy.iter().any(|c| matches!(c, Command::StartExecutor { .. })), "replacement executor cannot steal the active reach reservation");
+    }
+    Ok(())
+}
+
+/// U01: a kept terminal attempt owns precisely its former slot/share, including after a lost
+/// transport and replay. Logical completion never opens a capacity window for the waiting leg.
+#[test]
+fn u01_kept_terminal_transfers_same_allocation_and_only_proof_releases_it() -> Result<(), String> {
+    for resources in [false, true] {
+        let capacity = Resources { cpu: 4.0, mem: 40, disk: 40, gpu: 1 };
+        let runner = RunnerIn { capacity: Some(capacity), ..linux("a", 1) };
+        let mut s = Scheduler::new(Config { resources, ..Config::default() });
+        s.handle(Input::RunnerUp(Box::new(runner.clone())), 0);
+        let first = LegIn { request: Resources { cpu: 1.0, mem: 10, ..Resources::default() }, ..leg("ci-kept", "repo", 60) };
+        assert_eq!(assigned(&s.handle(Input::LegQueued(Box::new(first.clone())), 1)), vec!["ci-kept"]);
+        s.handle(Input::RetainExecution { leg: "ci-kept".into(), attempt: 1 }, 2);
+        s.handle(Input::RetainExecution { leg: "ci-kept".into(), attempt: 99 }, 2);
+        s.handle(Input::ExecutionReleased { leg: "ci-kept".into(), attempt: 99 }, 2);
+        assert!(!s.handle(Input::RunnerLost { runner: "a".into() }, 3).iter().any(|c| matches!(c, Command::Settled { leg, .. } if leg == "ci-kept")));
+        s.handle(Input::RunnerUp(Box::new(runner.clone())), 4);
+        let snapshot = s.allocation("ci-kept", 1, "retained-ci".into()).ok_or("missing original allocation")?;
+        let waiting = LegIn { request: capacity, ..leg("waiting", "other", 60) };
+        assert!(assigned(&s.handle(Input::LegQueued(Box::new(waiting.clone())), 5)).is_empty());
+        let ended = s.handle(Input::RetainedFinished { leg: "ci-kept".into(), attempt: 1, reservation: Box::new(snapshot.clone()), outcome: Outcome::Success }, 6);
+        assert!(ended.iter().any(|c| matches!(c, Command::Settled { leg, .. } if leg == "ci-kept")));
+        assert!(assigned(&ended).is_empty(), "logical terminal cannot free physical capacity");
+        let retained = s.allocation("retained-ci", 1, snapshot.id.clone()).ok_or("retained allocation missing")?;
+        assert_eq!(retained, snapshot, "ordinary slot/resource quantities survive exactly");
+        s.handle(Input::RunnerLost { runner: "a".into() }, 7);
+        assert!(assigned(&s.handle(Input::RunnerUp(Box::new(runner.clone())), 8)).is_empty());
+        let mut restored = Scheduler::new(Config { resources, ..Config::default() });
+        restored.handle(Input::LegRunning { leg: Box::new(snapshot.leg()), runner: snapshot.runner.clone(), attempt: 1 }, 9);
+        restored.handle(Input::LegQueued(Box::new(waiting)), 10);
+        assert!(assigned(&restored.handle(Input::RunnerUp(Box::new(runner)), 11)).is_empty());
+        assert_eq!(assigned(&restored.handle(Input::AttemptFinished { leg: snapshot.id.clone(), attempt: 1, outcome: Outcome::Success }, 12)), vec!["waiting"]);
+
+        // Crash after persisting transfer but before terminalizing the original attempt:
+        // replay initially adopts both, and its saved completion must transfer only once.
+        let mut replay = Scheduler::new(Config { resources, ..Config::default() });
+        replay.handle(Input::LegRunning { leg: Box::new(snapshot.leg()), runner: snapshot.runner.clone(), attempt: 1 }, 13);
+        replay.handle(Input::LegRunning { leg: Box::new(first), runner: snapshot.runner.clone(), attempt: 1 }, 14);
+        replay.handle(Input::RunnerUp(Box::new(RunnerIn { capacity: Some(capacity), ..linux("a", 1) })), 15);
+        replay.handle(Input::RetainedFinished { leg: "ci-kept".into(), attempt: 1, reservation: Box::new(snapshot.clone()), outcome: Outcome::Success }, 16);
+        replay.handle(Input::LegQueued(Box::new(LegIn { request: capacity, ..leg("replayed-waiting", "other", 60) })), 17);
+        assert!(replay.reason("replayed-waiting").is_some());
+        assert_eq!(assigned(&replay.handle(Input::AttemptFinished { leg: snapshot.id, attempt: 1, outcome: Outcome::Success }, 18)), vec!["replayed-waiting"], "replayed transfer does not duplicate or leak an allocation");
+    }
+    Ok(())
+}
+
+/// U01: retaining a workload transfers its executor footprint without stopping that executor
+/// or creating an unaccounted warm replacement next to reach's reservation.
+#[test]
+fn u01_kept_pool_footprint_transfers_without_stop_or_overcommit() -> Result<(), String> {
+    let mut p = pool(1, 2, 2, "1m")?;
+    p.request = Resources { cpu: 6.0, mem: 60, disk: 60, gpu: 1 };
+    let mut s = Scheduler::new(Config { resources: true, pools: vec![p], ..Config::default() });
+    let runner = RunnerIn { slots: 4, capacity: Some(Resources { cpu: 8.0, mem: 80, disk: 100, gpu: 2 }), ..docker_host("a") };
+    let start = s.handle(Input::RunnerUp(Box::new(runner)), 0);
+    let executor = start.iter().find_map(|c| match c { Command::StartExecutor { executor, .. } => Some(executor.clone()), _ => None }).ok_or("executor missing")?;
+    s.handle(Input::ExecutorReady { executor }, 1);
+    let reach = LegIn { external: true, request: Resources { cpu: 2.0, mem: 20, disk: 40, gpu: 1 }, ..LegIn { id: "reach-peer".into(), run: "reach-peer".into(), ..LegIn::default() } };
+    s.handle(Input::LegQueued(Box::new(reach)), 2);
+    assert_eq!(assigned(&s.handle(Input::LegQueued(Box::new(pool_leg("ci-pool-kept"))), 3)), vec!["ci-pool-kept"]);
+    let allocation = s.allocation("ci-pool-kept", 1, "retained-pool".into()).ok_or("allocation missing")?;
+    assert_eq!(allocation.request, Resources { cpu: 6.0, mem: 60, disk: 60, gpu: 1 });
+    let ended = s.handle(Input::RetainedFinished { leg: "ci-pool-kept".into(), attempt: 1, reservation: Box::new(allocation.clone()), outcome: Outcome::Success }, 4);
+    assert!(!ended.iter().any(|c| matches!(c, Command::StopExecutor { .. } | Command::StartExecutor { .. })), "retained executor is neither stopped nor replaced while capacity is owned");
+    assert_eq!(s.allocation("retained-pool", 1, allocation.id.clone()), Some(allocation));
+    Ok(())
+}
+
+/// U01: failed startup/disconnection is not a physical stop certificate. The existing pool
+/// grant stays charged, including after restart, until the owning backend proves it stopped.
+#[test]
+fn u01_executor_grant_failure_disconnect_restore_never_free_before_stopped() -> Result<(), String> {
+    let mut p = pool(1, 1, 1, "1m")?;
+    p.request = Resources { cpu: 6.0, mem: 60, disk: 60, gpu: 1 };
+    let cfg = Config { resources: true, pools: vec![p], ..Config::default() };
+    let runner = RunnerIn { capacity: Some(Resources { cpu: 8.0, mem: 80, disk: 100, gpu: 2 }), ..docker_host("a") };
+    let mut s = Scheduler::new(cfg.clone());
+    let start = s.handle(Input::RunnerUp(Box::new(runner.clone())), 0);
+    let id = start.iter().find_map(|c| match c { Command::StartExecutor { executor, .. } => Some(executor.clone()), _ => None }).ok_or("executor missing")?;
+    assert!(s.protect_executor(&id));
+    let snapshot = s.executor_snapshot(&id).ok_or("snapshot missing")?;
+    let waiting = LegIn { id: "reach-waiting".into(), run: "reach-waiting".into(), external: true, request: Resources { cpu: 8.0, ..Resources::default() }, ..LegIn::default() };
+    s.handle(Input::LegQueued(Box::new(waiting.clone())), 1);
+    let failed = s.handle(Input::ExecutorFailed { executor: id.clone(), error: "unknown launch outcome".into() }, 2);
+    assert!(assigned(&failed).is_empty());
+    assert!(s.executor_snapshot(&id).is_some());
+    s.handle(Input::RunnerLost { runner: "a".into() }, 3);
+    assert!(assigned(&s.handle(Input::RunnerUp(Box::new(runner.clone())), 4)).is_empty());
+    let mut restored = Scheduler::new(cfg);
+    assert!(restored.restore_executor(snapshot, true, 5));
+    restored.handle(Input::LegQueued(Box::new(waiting)), 6);
+    assert!(assigned(&restored.handle(Input::RunnerUp(Box::new(runner)), 7)).is_empty());
+    assert_eq!(assigned(&restored.executor_stopped(&id, 8)), vec!["reach-waiting"]);
+    assert!(restored.executor_snapshot(&id).is_none());
+    Ok(())
+}
+
+/// U01: recovering a bound busy executor cannot turn Ready into a second assignment. Its
+/// parent identity and original pool footprint transfer once into retained ownership.
+#[test]
+fn u01_busy_executor_binding_survives_restore_and_retained_transfer() -> Result<(), String> {
+    let mut p = pool(1, 1, 1, "1m")?;
+    p.request = Resources { cpu: 6.0, mem: 60, ..Resources::default() };
+    let cfg = Config { resources: true, pools: vec![p], ..Config::default() };
+    let runner = RunnerIn { capacity: Some(Resources { cpu: 8.0, mem: 80, ..Resources::default() }), ..docker_host("a") };
+    let mut s = Scheduler::new(cfg.clone());
+    let start = s.handle(Input::RunnerUp(Box::new(runner.clone())), 0);
+    let id = start.iter().find_map(|c| match c { Command::StartExecutor { executor, .. } => Some(executor.clone()), _ => None }).ok_or("executor missing")?;
+    s.protect_executor(&id);
+    s.handle(Input::ExecutorReady { executor: id.clone() }, 1);
+    let original = LegIn { request: Resources { cpu: 2.0, mem: 20, ..Resources::default() }, ..pool_leg("original") };
+    s.handle(Input::LegQueued(Box::new(original.clone())), 2);
+    let binding = crate::wire::ParentBinding { executor: id.clone(), generation: "generation".into(), allocation: "existing-grant".into(), physical_execution: "physical-owner".into(), job: "original".into(), attempt: 1 };
+    assert!(s.bind_parent(binding.clone()));
+    let snapshot = s.executor_snapshot(&id).ok_or("snapshot missing")?;
+    let mut restored = Scheduler::new(cfg);
+    restored.restore_executor(snapshot, false, 3);
+    restored.handle(Input::LegRunning { leg: Box::new(original), runner: "a".into(), attempt: 1 }, 4);
+    restored.handle(Input::RunnerUp(Box::new(runner)), 5);
+    restored.handle(Input::ExecutorReady { executor: id.clone() }, 6);
+    let reach = LegIn { external: true, request: Resources { cpu: 2.0, mem: 20, ..Resources::default() }, ..LegIn { id: "reach-beside-pool".into(), run: "reach-beside-pool".into(), ..LegIn::default() } };
+    assert_eq!(assigned(&restored.handle(Input::LegQueued(Box::new(reach)), 7)), vec!["reach-beside-pool"], "the restored pool keeps six CPUs, leaving two of the host's eight");
+    assert!(assigned(&restored.handle(Input::LegQueued(Box::new(pool_leg("waiting"))), 7)).is_empty(), "Ready cannot reuse an already busy physical domain");
+    let kept = restored.allocation("original", 1, "retained-original".into()).ok_or("allocation missing")?;
+    assert_eq!(kept.parent_binding, Some(binding));
+    assert_eq!(kept.request.cpu, 6.0);
+    restored.handle(Input::RetainedFinished { leg: "original".into(), attempt: 1, reservation: Box::new(kept.clone()), outcome: Outcome::Success }, 8);
+    assert!(restored.executor_snapshot(&id).is_none(), "same footprint transfers rather than double charging");
+    assert_eq!(restored.allocation("retained-original", 1, "retained-original".into()), Some(kept));
+    let waiting = LegIn { external: true, request: Resources { cpu: 1.0, ..Resources::default() }, ..LegIn { id: "reach-after-pool".into(), run: "reach-after-pool".into(), ..LegIn::default() } };
+    assert!(assigned(&restored.handle(Input::LegQueued(Box::new(waiting)), 9)).is_empty(), "the retained six CPUs and running reach's two remain charged");
+    assert_eq!(assigned(&restored.handle(Input::AttemptFinished { leg: "retained-original".into(), attempt: 1, outcome: Outcome::Success }, 10)), vec!["reach-after-pool"], "only the retained execution's stop proof frees its footprint");
+    // An older snapshot's actual grant, not a larger current pool setting, decides whether
+    // queued work can adopt it. Every dimension, including an explicit zero, is finite.
+    let demand = Resources { cpu: 2.0, mem: 20, disk: 30, gpu: 1 };
+    for resources in [false, true] {
+        for (dimension, small) in [
+            ("cpu", Resources { cpu: 0.0, ..demand }),
+            ("memory", Resources { mem: 0, ..demand }),
+            ("disk", Resources { disk: 0, ..demand }),
+            ("gpu", Resources { gpu: 0, ..demand }),
+        ] {
+            let mut p = pool(0, 1, 1, "1m")?;
+            p.request = demand;
+            let mut s = Scheduler::new(Config { resources, pools: vec![p.clone()], ..Config::default() });
+            let snapshot = super::state::ExecutorSnapshot { executor: "old-small".into(), pool: p.name.clone(), runner: "a".into(), reserved: small, leg: None, binding: None, shape: None };
+            assert!(s.restore_executor(snapshot, false, 0));
+            let runner = RunnerIn { capacity: Some(Resources { cpu: 8.0, mem: 80, disk: 120, gpu: 4 }), ..docker_host("a") };
+            s.handle(Input::RunnerUp(Box::new(runner.clone())), 1);
+            s.handle(Input::ExecutorReady { executor: "old-small".into() }, 2);
+            let commands = s.handle(Input::LegQueued(Box::new(LegIn { request: demand, ..pool_leg("requires-grant") })), 3);
+            assert!(assigned(&commands).is_empty(), "{dimension}: a restored zero reservation is not unlimited");
+            assert!(commands.iter().any(|c| matches!(c, Command::StopExecutor { executor, .. } if executor == "old-small")), "{dimension}: replace the idle incompatible grant through its existing owner");
+            assert!(!commands.iter().any(|c| matches!(c, Command::StartExecutor { .. })), "{dimension}: no capacity release before stopped proof");
+            assert_eq!(s.executor_snapshot("old-small").map(|e| e.reserved), Some(small), "{dimension}: stopping preserves the old reservation");
+            let mut grow_pool = p.clone(); grow_pool.max = 2; grow_pool.per_host_max = 2;
+            let mut grow = Scheduler::new(Config { resources, pools: vec![grow_pool], ..Config::default() });
+            assert!(grow.restore_executor(super::state::ExecutorSnapshot { executor: "warm-small".into(), pool: p.name.clone(), runner: "a".into(), reserved: small, leg: None, binding: None, shape: None }, false, 0));
+            grow.handle(Input::RunnerUp(Box::new(runner.clone())), 1);
+            grow.handle(Input::ExecutorReady { executor: "warm-small".into() }, 2);
+            let growth = grow.handle(Input::LegQueued(Box::new(LegIn { request: demand, ..pool_leg("grow") })), 3);
+            assert!(growth.iter().any(|c| matches!(c, Command::StartExecutor { .. })), "{dimension}: unusable idle grant below max must not suppress startup");
+            assert!(!growth.iter().any(|c| matches!(c, Command::StopExecutor { .. })), "{dimension}: growing retains the old physical grant");
+            assert!(matches!(s.reason("requires-grant"), Some(WaitReason::Oversized { asked, short }) if !asked.is_empty() && short.iter().any(|s| s.contains("old-small") && s.contains("verified stop"))), "{dimension}: wait reason identifies the actual grant and pending proof");
+            let stopped = s.executor_stopped("old-small", 4);
+            let replacement = stopped.iter().find_map(|c| match c { Command::StartExecutor { executor, .. } => Some(executor.clone()), _ => None }).ok_or("no replacement after stop proof")?;
+            assert_eq!(s.executor_snapshot(&replacement).map(|e| e.reserved), Some(demand));
+            let ready = s.handle(Input::ExecutorReady { executor: replacement.clone() }, 5);
+            assert!(ready.iter().any(|c| matches!(c, Command::Assign { leg, slot: Some(slot), .. } if leg == "requires-grant" && slot == &replacement)), "{dimension}: assignment uses that exact fitting grant");
+            assert_eq!(s.allocation("requires-grant", 1, "kept-grant".into()).map(|a| a.request), Some(demand), "{dimension}: one footprint remains");
+
+            // With heterogeneous idle snapshots on one host, capacity and actual selection
+            // must agree even though the incompatible older one is first by id.
+            p.max = 2;
+            p.per_host_max = 2;
+            let mut s = Scheduler::new(Config { resources, pools: vec![p.clone()], ..Config::default() });
+            for (id, reserved) in [("a-small", small), ("z-fitting", demand)] {
+                assert!(s.restore_executor(super::state::ExecutorSnapshot { executor: id.into(), pool: p.name.clone(), runner: "a".into(), reserved, leg: None, binding: None, shape: None }, false, 0));
+            }
+            s.handle(Input::RunnerUp(Box::new(runner)), 1);
+            for id in ["a-small", "z-fitting"] { s.handle(Input::ExecutorReady { executor: id.into() }, 2); }
+            let commands = s.handle(Input::LegQueued(Box::new(LegIn { request: demand, ..pool_leg("heterogeneous") })), 3);
+            assert!(commands.iter().any(|c| matches!(c, Command::Assign { leg, slot: Some(slot), .. } if leg == "heterogeneous" && slot == "z-fitting")), "{dimension}: never select an undersized sibling");
+            assert!(s.pools().iter().flat_map(|p| &p.executors).any(|e| e.id == "a-small" && e.state == super::pools::ExecState::Idle));
+
+            // A pool whose future grants are also too small should explain configuration,
+            // rather than repeatedly stop and recreate executors of the same inadequate size.
+            p.request = small;
+            p.max = 1;
+            p.per_host_max = 1;
+            let mut s = Scheduler::new(Config { resources, pools: vec![p.clone()], ..Config::default() });
+            assert!(s.restore_executor(super::state::ExecutorSnapshot { executor: "unchanged-small".into(), pool: p.name.clone(), runner: "a".into(), reserved: small, leg: None, binding: None, shape: None }, false, 0));
+            s.handle(Input::RunnerUp(Box::new(docker_host("a"))), 1);
+            s.handle(Input::ExecutorReady { executor: "unchanged-small".into() }, 2);
+            let commands = s.handle(Input::LegQueued(Box::new(LegIn { request: demand, ..pool_leg("too-big") })), 3);
+            assert!(assigned(&commands).is_empty());
+            assert!(!commands.iter().any(|c| matches!(c, Command::StopExecutor { .. } | Command::StartExecutor { .. })), "{dimension}: identical replacement would not help");
+            assert!(matches!(s.reason("too-big"), Some(WaitReason::Oversized { short, .. }) if short.iter().any(|s| s.contains("increase its resources"))), "{dimension}: explain the current pool limit");
+        }
+    }
+    Ok(())
+}
+
 /// The scheduler's headroom (W05): a runner's sample sets what it has free; what's placed there
 /// after counts against it until the next sample, which then has it; a sample older than a minute
 /// leaves the runner's headroom unknown, placed as before samples were.
@@ -2035,4 +2450,111 @@ fn a_hold_ends_with_its_runner_or_its_leg() {
     // big is cancelled: nothing is held.
     s.handle(Input::LegCancelled { leg: "big".into(), reason: "the run was cancelled".into() }, 64_000);
     assert!(s.held("b").is_none());
+}
+
+/// W05-R03/U01: a warm executor's physical reservation is not its job's runtime demand.
+/// Starting/idle executors add no guessed CPU use; each assigned job counts until a fresh sample.
+#[test]
+fn w05_r03_pool_runtime_demand_survives_its_existing_physical_reservation() -> Result<(), String> {
+    use super::state::Sample;
+    for (cpu, mem) in [(0.0, 0), (2.0, 20), (4.0, 20)] {
+        let mut p = pool(0, 1, 1, "1m")?;
+        p.request = Resources { cpu: 6.0, mem: 60, ..Resources::default() };
+        let mut s = Scheduler::new(Config { resources: true, pools: vec![p], ..Config::default() });
+        let runner = RunnerIn { capacity: Some(Resources { cpu: 8.0, mem: 80, ..Resources::default() }), ..docker_host("a") };
+        s.handle(Input::RunnerUp(Box::new(runner)), 0);
+        let sample = |busy| Sample { cpus: 8, busy, mem_total: 80, mem_used: 20, ..Sample::default() };
+        s.handle(Input::RunnerSample { runner: "a".into(), sample: sample(0.5) }, 1);
+        let commands = s.handle(Input::LegQueued(Box::new(LegIn { request: Resources { cpu, mem, ..Resources::default() }, ..pool_leg("work") })), 2);
+        let executor = commands.iter().find_map(|c| match c { Command::StartExecutor { executor, .. } => Some(executor.clone()), _ => None }).ok_or("pool did not start its executor")?;
+        assert!(assigned(&commands).is_empty(), "an executor still starting cannot run its job");
+        assert!(s.headroom("a").is_some_and(|h| (h.cpus - 4.0).abs() < 1e-9), "the six-CPU reservation is not six busy CPUs");
+        let ready = s.handle(Input::ExecutorReady { executor }, 3);
+        let free = if cpu > 2.0 {
+            assert!(assigned(&ready).is_empty(), "the job's four CPUs would pass the target on a half-busy host");
+            assert!(matches!(s.reason("work"), Some(WaitReason::Headroom { .. })));
+            let fresh = s.handle(Input::RunnerSample { runner: "a".into(), sample: sample(0.0) }, 4);
+            assert_eq!(assigned(&fresh), vec!["work"], "the idle warm executor takes its job once real headroom is available");
+            8.0 - cpu
+        } else {
+            assert_eq!(assigned(&ready), vec!["work"]);
+            4.0 - cpu
+        };
+        assert!(s.headroom("a").is_some_and(|h| (h.cpus - free).abs() < 1e-9), "the original job demand is counted once");
+        let allocation = s.allocation("work", 1, "kept".into()).ok_or("no allocation")?;
+        assert_eq!(allocation.request, Resources { cpu: 6.0, mem: 60, ..Resources::default() }, "headroom does not create another physical grant");
+        s.handle(Input::RunnerSample { runner: "a".into(), sample: sample(1.0 - free / 8.0) }, 5);
+        assert!(s.headroom("a").is_some_and(|h| (h.cpus - free).abs() < 1e-9), "a fresh sample replaces the prediction instead of counting it twice");
+    }
+    Ok(())
+}
+
+/// W05-AC04: a pooled job costs its requested CPU-time, as a host job does, despite its
+/// incremental physical claim being zero. Four-CPU work must not buy four times the fair share.
+#[test]
+fn w05_ac04_pool_fair_share_counts_its_jobs_cpu_time() -> Result<(), String> {
+    let mut p = pool(0, 1, 1, "1m")?;
+    p.request = Resources { cpu: 6.0, ..Resources::default() };
+    let mut s = Scheduler::new(Config { resources: true, pools: vec![p], ..Config::default() });
+    let runner = RunnerIn { capacity: Some(Resources { cpu: 8.0, mem: 80, ..Resources::default() }), ..docker_host("a") };
+    s.handle(Input::RunnerUp(Box::new(runner)), 0);
+    let mut executor = None;
+    for (id, repo, cpu) in [("large-first", "large", 4.0), ("large-next", "large", 4.0), ("small-first", "small", 1.0), ("small-next", "small", 1.0)] {
+        let commands = s.handle(Input::LegQueued(Box::new(LegIn { repo: repo.into(), request: Resources { cpu, ..Resources::default() }, ..pool_leg(id) })), 1);
+        executor = executor.or_else(|| commands.iter().find_map(|c| match c { Command::StartExecutor { executor, .. } => Some(executor.clone()), _ => None }));
+    }
+    let mut executor = executor.ok_or("pool did not start")?;
+    for (at, expected) in [(2, "large-first"), (4, "small-first"), (6, "small-next")] {
+        assert_eq!(assigned(&s.handle(Input::ExecutorReady { executor }, at)), vec![expected]);
+        let ended = s.handle(Input::AttemptFinished { leg: expected.into(), attempt: 1, outcome: Outcome::Success }, at + 1);
+        executor = ended.iter().find_map(|c| match c { Command::StartExecutor { executor, .. } => Some(executor.clone()), _ => None }).ok_or("pool did not replace the completed executor")?;
+    }
+    Ok(())
+}
+
+/// U01: an outer VM grant reserves startup overhead once, while only its derived guest can
+/// admit jobs. A pre-shape executor remains reserved until stop proof instead of being resized.
+#[test]
+fn u01_firecracker_pool_uses_guest_capacity_and_fences_legacy_grants() -> Result<(), String> {
+    use super::pools::{ExecutorShape, ResourceSpec};
+    let spec = PoolSpec { name: "vms".into(), executor: "firecracker".into(), image: Some("alpine".into()), labels: vec!["vm".into()],
+        min_idle: 1, max: Some(1), resources: Some(ResourceSpec { cpu: Some("4.5".into()), memory: Some("2560Mi".into()), disk: Some("34Gi".into()), ..Default::default() }),
+        firecracker_overhead: Some(ResourceSpec { cpu: Some("250m".into()), memory: Some("512Mi".into()), disk: Some("2Gi".into()), ..Default::default() }), ..Default::default() };
+    assert!(PoolSpec { firecracker_overhead: None, ..spec.clone() }.pool().is_err(), "missing policy cannot infer an old fixed VM");
+    assert!(PoolSpec { firecracker_overhead: Some(ResourceSpec { memory: Some("512Mi".into()), ..Default::default() }), ..spec.clone() }.pool().is_err(), "disk overhead must be explicit");
+    let p = spec.pool()?;
+    let Some(ExecutorShape::Firecracker(shape)) = &p.shape else { return Err("missing declared VM shape".into()); };
+    let usable = shape.guest_resources();
+    assert_eq!(usable, Resources { cpu: 4.0, mem: 2 << 30, disk: 32 << 30, gpu: 0 });
+    let job = |id: &str, request| LegIn { request, route: LegRoute { labels: vec!["vm".into()], ..Default::default() }, ..leg(id, "acme/vm", 50) };
+    let mut host = linux("host", 8);
+    host.capacity = Some(Resources { cpu: 8.0, mem: 8 << 30, disk: 80 << 30, gpu: 0 });
+    host.view.facts.executors.insert("firecracker".into(), crate::facts::Executor::default());
+    for resources in [false, true] {
+        let cfg = Config { resources, pools: vec![p.clone()], ..Default::default() };
+        let mut s = Scheduler::new(cfg.clone());
+        let started = s.handle(Input::RunnerUp(Box::new(host.clone())), 0);
+        let id = started.iter().find_map(|c| match c { Command::StartExecutor { executor, .. } => Some(executor.clone()), _ => None }).ok_or("VM not reserved")?;
+        let snapshot = s.executor_snapshot(&id).ok_or("missing VM reservation")?;
+        assert_eq!(snapshot.reserved, p.request);
+        assert_eq!(snapshot.shape, p.shape, "placement snapshots the immutable shape");
+        s.handle(Input::ExecutorReady { executor: id.clone() }, 1);
+        let too_large = s.handle(Input::LegQueued(Box::new(job("vmm-overhead-is-not-job-capacity", Resources { cpu: 4.25, ..usable }))), 2);
+        assert!(assigned(&too_large).is_empty(), "job may not consume the VMM allowance");
+        let fits = s.handle(Input::LegQueued(Box::new(job("guest-sized", usable))), 3);
+        assert_eq!(assigned(&fits), vec!["guest-sized"]);
+        let mut restored = Scheduler::new(cfg);
+        let legacy = super::state::ExecutorSnapshot { shape: None, ..snapshot };
+        assert!(restored.restore_executor(legacy.clone(), false, 4));
+        restored.handle(Input::RunnerUp(Box::new(host.clone())), 5);
+        restored.handle(Input::ExecutorReady { executor: id.clone() }, 6);
+        let blocked = restored.handle(Input::LegQueued(Box::new(job("wait-for-legacy-proof", usable))), 7);
+        assert!(assigned(&blocked).is_empty());
+        assert!(blocked.iter().any(|c| matches!(c, Command::StopExecutor { executor, .. } if executor == &id)), "legacy fixed VM retires through the same owner");
+        assert_eq!(restored.executor_snapshot(&id).map(|e| e.reserved), Some(p.request), "fencing keeps its entire physical grant");
+        let stopped = restored.executor_stopped(&id, 8);
+        let replacement = stopped.iter().find_map(|c| match c { Command::StartExecutor { executor, .. } => Some(executor), _ => None }).ok_or("missing shaped replacement after proof")?;
+        assert_eq!(restored.executor_snapshot(replacement).and_then(|e| e.shape), p.shape);
+    }
+    Ok(())
 }

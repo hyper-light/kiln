@@ -61,18 +61,21 @@ impl Host for Ops {
             o.entry("hand_over").or_insert(Value::Bool(false));
         }
         let (cx, name) = (self.0.clone(), name.to_owned());
-        // An input that doesn't fit the operation: refused saying where and why, and noted.
-        if let Some(m) = ops::misfit(&cx.caller, &name, &input) {
-            let (said, what) = (m.answer(&name), format!("code_run kiln.{name}"));
-            let mut a = crate::rt::block_on(async move { Ok::<_, anyhow::Error>(super::misfit(&cx.hub, crate::wire::unread::Wire::McpHttp, &cx.caller, &what, &name, &m, None).await) }).unwrap_or(said);
-            if let Some(o) = a.as_object_mut() {
-                o.insert("status".into(), json!(http::StatusCode::BAD_REQUEST.as_u16()));
-            }
-            return Err(a);
-        }
-        match crate::rt::block_on(async move { Ok(ops::call(cx, &name, input).await) }) {
-            Ok(Ok(v)) => Ok(v),
-            Ok(Err((status, msg))) => Err(json!({"error": msg, "status": status.as_u16()})),
+        match crate::rt::block_on(async move {
+            let result = match ops::call_checked(cx.clone(), &name, input).await {
+                Ok(v) => Ok(v),
+                Err(ops::CallError::Failed((status, msg))) => Err(json!({"error": msg, "status": status.as_u16()})),
+                Err(ops::CallError::Misfit(m)) => {
+                    let mut a = super::misfit(&cx.hub, crate::wire::unread::Wire::McpHttp, &cx.caller, &format!("code_run kiln.{name}"), &name, &m, None).await;
+                    if let Some(o) = a.as_object_mut() {
+                        o.insert("status".into(), json!(http::StatusCode::BAD_REQUEST.as_u16()));
+                    }
+                    Err(a)
+                }
+            };
+            Ok::<_, anyhow::Error>(result)
+        }) {
+            Ok(result) => result,
             Err(e) => Err(json!({"error": format!("the call could not run: {e:#}")})),
         }
     }

@@ -131,18 +131,28 @@ pub fn set_statsd(l: std::sync::Arc<super::statsd::Listeners>) {
     let _ = STATSD.set(l);
 }
 
+pub(crate) fn statsd_metadata() -> Option<std::sync::Arc<super::statsd::Listeners>> { STATSD.get().cloned() }
+
 fn statsd() -> Result<&'static std::sync::Arc<super::statsd::Listeners>, Fail> {
     STATSD.get().ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "DogStatsD listeners are kept by the server"))
 }
 
-/// The listeners now, applied: the server's own open from now, each runner told its own.
-fn apply_statsd(l: &super::statsd::Listeners) {
-    let all = l.list();
+fn statsd_fail(error: super::statsd::Error) -> Fail {
+    let status = match &error {
+        super::statsd::Error::Invalid(_) => StatusCode::BAD_REQUEST,
+        super::statsd::Error::Store(kiln_seams::records::Refusal::Conflict { .. }) => StatusCode::CONFLICT,
+        _ => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    fail(status, error.to_string())
+}
+
+/// Only a committed snapshot is applied. Both existing derived owners fence late revisions.
+pub(crate) fn apply_statsd(configuration: super::statsd::Configuration) {
     if let Some(s) = super::statsd::get() {
-        s.set(&all);
+        s.set(&configuration.listeners, Some(configuration.revision));
     }
     if let Some(o) = get() {
-        o.set_statsd(all);
+        o.set_statsd(configuration);
     }
 }
 
@@ -1149,8 +1159,8 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
                 }
             }
             let list: Vec<Value> = statsd()?
-                .list()
-                .into_iter()
+                .list().await.map_err(statsd_fail)?
+                .listeners.into_iter()
                 .map(|(name, l)| {
                     let mut v = serde_json::to_value(&l).unwrap_or(Value::Null);
                     if let Value::Object(o) = &mut v {
@@ -1166,18 +1176,18 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
             let name = (*name).to_owned();
             let l: super::statsd::Listener = read_json(req.into_body(), QUERY_BODY).await?;
             let store = statsd()?;
-            store.put(&name, l).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
-            apply_statsd(store);
+            let configuration = store.put(&name, l).await.map_err(statsd_fail)?;
+            apply_statsd(configuration);
             Ok(srv::status(StatusCode::NO_CONTENT))
         }
         (&Method::DELETE, ["statsd", name]) => {
             let store = statsd()?;
-            match store.delete(name).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))? {
-                true => {
-                    apply_statsd(store);
+            match store.delete(name).await.map_err(statsd_fail)? {
+                Some(configuration) => {
+                    apply_statsd(configuration);
                     Ok(srv::status(StatusCode::NO_CONTENT))
                 }
-                false => Err(fail(StatusCode::NOT_FOUND, "no such DogStatsD listener")),
+                None => Err(fail(StatusCode::NOT_FOUND, "no such DogStatsD listener")),
             }
         }
         (&Method::GET, ["synthetics"]) => {

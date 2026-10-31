@@ -6,7 +6,7 @@
 //! never stored: a new secret is a new hook.
 
 use http::StatusCode;
-use rusqlite::{OptionalExtension, params};
+use crate::sql::{OptionalExtension, params};
 use serde_json::{Value, json};
 
 use super::Fail;

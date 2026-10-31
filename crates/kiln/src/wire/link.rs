@@ -45,6 +45,13 @@ impl Links {
         rx.on_item(stream, seq, low, body)
     }
 
+    /// U03: a failed durable application produces no ACK and can be retransmitted.
+    pub fn retry(&self, runner: &str, stream: &str, seq: Seq) {
+        if let Some(receiver) = self.by_runner.lock().get_mut(runner) {
+            receiver.retry(stream, seq);
+        }
+    }
+
     /// The item being applied from `runner` was taken (`None`) or refused: the answer to send it.
     pub fn answer(&self, runner: &str, stream: &str, seq: Seq, refusal: Option<(Refusal, String)>) -> Frame {
         let mut g = self.by_runner.lock();

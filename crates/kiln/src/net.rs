@@ -21,7 +21,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures::FutureExt as _;
@@ -104,6 +104,36 @@ impl Classes for Kiln {
     }
 }
 
+/// W27/U15: one network owner retains revocations across endpoint/runtime rebuilds.
+#[derive(Default)]
+struct State {
+    last_dial: Option<SocketAddr>,
+    server: bool,
+    revoked_keys: HashMap<String,String>,
+    bootstrap_routes: Option<std::collections::HashSet<String>>,
+    opening: Option<(Instant,futures::channel::oneshot::Sender<Result<(),String>>)>,
+}
+type SharedState = Arc<Mutex<State>>;
+fn state_lock(state: &SharedState) -> anyhow::Result<std::sync::MutexGuard<'_,State>> {
+    state.lock().map_err(|_|anyhow::anyhow!("network policy owner is poisoned; application admission is fenced"))
+}
+fn fail_opening(state: &SharedState, reason: &str) {
+    if let Ok(mut state) = state.lock()
+        && let Some((_,answer)) = state.opening.take() { let _ = answer.send(Err(reason.to_owned())); }
+}
+
+/// Immutable admission facts of this emitted event. A bootstrap event never becomes eligible.
+#[derive(Clone)]
+pub struct ApplicationPermit { initialized: bool, key: Option<Arc<str>> }
+impl std::fmt::Debug for ApplicationPermit {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result { f.debug_struct("ApplicationPermit").field("initialized",&self.initialized).field("key_verified",&self.key.is_some()).finish() }
+}
+impl ApplicationPermit {
+    fn agent() -> Self { Self { initialized:true,key:None } }
+    #[cfg(test)]
+    pub(crate) fn fixture() -> Self { Self::agent() }
+}
+
 /// Server-side directory: any certificate the TLS layer accepted was signed by the kiln CA, so it
 /// is an enrolled agent. The peer id is derived from the certificate, and its SAN is the agent
 /// name the session is bound to.
@@ -114,8 +144,8 @@ pub struct ServerBook {
     /// Each peer's key (its SPKI's SHA-256, hex), and the keys revoked (W27-R01): recorded in the
     /// store, loaded at start, so a restart keeps them and re-enrolling a name doesn't undo them.
     /// Each revoked key maps to its refusal: when, why and by whom (`revoked at ... (why, by who)`).
-    keys: HashMap<PeerId, String>,
-    revoked_keys: HashMap<String, String>,
+    keys: HashMap<PeerId, Arc<str>>,
+    state: SharedState,
 }
 
 fn cert_name(der: &[u8]) -> Option<String> {
@@ -135,17 +165,20 @@ impl Directory for ServerBook {
         let der = a.certificate?;
         let name = cert_name(der)?;
         let key = crate::pki::key_sha256(der)?;
-        if let Some(why) = self.revoked_keys.get(&key) {
+        let state = self.state.lock().ok()?;
+        if let Some(why) = state.revoked_keys.get(&key) {
             tracing::warn!(agent = %name, key = %key, "refused a revoked certificate: {why}");
             return None;
         }
+        if state.bootstrap_routes.as_ref().is_some_and(|routes|!routes.contains(&name)) { return None; }
+        drop(state);
         // A machine named as the server (a certificate from before machines couldn't be) is none.
         if self.revoked.contains(&name) || crate::pki::reserved(&name) {
             return None;
         }
         let peer = peer_of(der);
         self.names.insert(peer, name);
-        self.keys.insert(peer, key);
+        self.keys.insert(peer, key.into());
         Some((peer, Role::Agent))
     }
 
@@ -171,10 +204,49 @@ impl Directory for AgentBook {
 /// The TLS exporter label (RFC 8446 §7.5) of a connection's binding ([`NetEvent::Connected`]).
 pub const BINDING_LABEL: &[u8] = b"EXPORTER-kiln-transport-binding";
 
+/// One authenticated TLS connection. Its exporter is never serialized or printed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Connection { peer: PeerId, epoch: u64, binding: [u8; 32] }
+impl std::fmt::Debug for Connection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.debug_struct("Connection").field("peer", &self.peer).finish_non_exhaustive() }
+}
+impl Connection {
+    pub(crate) fn new(peer: PeerId, epoch: u64, binding: [u8; 32]) -> Self { Self { peer, epoch, binding } }
+    pub(crate) fn peer(self) -> PeerId { self.peer }
+    pub(crate) fn epoch(self) -> u64 { self.epoch }
+    /// A public ownership identifier; it does not reveal TLS exporter material.
+    pub(crate) fn connection_id(self) -> String {
+        let mut input = b"kiln runner connection v1\0".to_vec();
+        input.extend_from_slice(&self.peer.to_le_bytes());
+        input.extend_from_slice(&self.binding);
+        crate::util::sha256_hex(&input)
+    }
+}
+
+/// Queue admission is not delivery or execution proof. An accepted frame may be lost on closure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundSend { NotSent, QueuedUnknown }
+
+/// Opaque ownership retained through the existing net input/Outbox lifetime, until endpoint
+/// admission or definitive drop. It proves queue release only, never remote delivery/ACK.
+/// Cloned chaos frames share the final hold; contents are never exposed or debug-printed.
+pub struct FrameHold(Arc<dyn Send + Sync>);
+impl FrameHold {
+    pub(crate) fn new(value: impl Send + Sync + 'static) -> Self { Self(Arc::new(value)) }
+}
+impl Clone for FrameHold {
+    fn clone(&self) -> Self { Self(Arc::clone(&self.0)) }
+}
+impl std::fmt::Debug for FrameHold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("FrameHold(..)") }
+}
+
 /// Commands into the net thread.
 #[derive(Debug)]
 pub enum Out {
     Frame { peer: PeerId, lane: u32, kind: Kind, data: Vec<u8> },
+    HeldFrame { peer: PeerId, lane: u32, kind: Kind, data: Vec<u8>, hold: FrameHold },
+    BoundFrame { connection: Connection, lane: u32, kind: Kind, data: Vec<u8> },
     Disconnect { peer: PeerId },
     Revoke { name: String },
     /// Accept that agent name again (an admin approved a new machine under it).
@@ -183,6 +255,8 @@ pub enum Out {
     /// connected with them (W27-R01). Never undone: a machine enrolling again has a new key. `why`
     /// is the refusal said for each (`crate::identities::refusal`).
     RevokeKeys { keys: Vec<String>, why: String },
+    /// Install the canonical bootstrap policy; ACK only after a fresh endpoint has it.
+    OpenApplication { keys: Vec<(String,String)>, until: Instant, answer: futures::channel::oneshot::Sender<Result<(),String>> },
     /// Agent side: dial the server.
     Connect { addr: SocketAddr },
     /// Drop the endpoint and build a new one (fresh socket and runtime); an agent re-dials.
@@ -353,25 +427,75 @@ fn sample<D: Directory<Role = Role> + Named>(ep: &Endpoint<Kiln, Fixed, D>) -> Q
 }
 
 /// Events out of the net thread.
-#[derive(Debug)]
 pub enum NetEvent {
     /// `binding`: the connection's TLS exporter value under [`BINDING_LABEL`], the same at both
     /// ends of one connection and unknowable to anyone else (see `crate::tunnel`).
-    Connected { peer: PeerId, name: Option<String>, binding: Option<[u8; 32]> },
-    Closed { peer: PeerId, reason: String },
-    Unreachable { peer: PeerId, reason: String },
-    Frame { peer: PeerId, lane: u32, kind: Kind, data: Vec<u8> },
+    Connected { peer: PeerId, epoch: u64, name: Option<String>, binding: Option<[u8; 32]>, admission: ApplicationPermit },
+    Closed { peer: PeerId, epoch: u64, reason: String, admission: ApplicationPermit },
+    Unreachable { peer: PeerId, reason: String, admission: ApplicationPermit },
+    Frame { peer: PeerId, lane: u32, kind: Kind, data: Vec<u8>, connection: Option<Connection>, admission: ApplicationPermit },
+}
+
+impl NetEvent {
+    pub(crate) fn application_ready(&self)->bool {
+        match self {
+            Self::Connected { admission,.. } | Self::Closed { admission,.. } | Self::Unreachable { admission,.. } | Self::Frame { admission,.. } => admission.initialized,
+        }
+    }
+    fn permit(&self)->&ApplicationPermit {
+        match self {
+            Self::Connected { admission,.. } | Self::Closed { admission,.. } | Self::Unreachable { admission,.. } | Self::Frame { admission,.. } => admission,
+        }
+    }
+}
+
+impl std::fmt::Debug for NetEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connected { peer,epoch,name,binding,.. } => f.debug_struct("Connected").field("peer",peer).field("epoch",epoch).field("name",name).field("binding_available",&binding.is_some()).finish(),
+            Self::Closed { peer,epoch,reason,.. } => f.debug_struct("Closed").field("peer",peer).field("epoch",epoch).field("reason",reason).finish(),
+            Self::Unreachable { peer,reason,.. } => f.debug_struct("Unreachable").field("peer",peer).field("reason",reason).finish(),
+            Self::Frame { peer,lane,kind,data,connection,.. } => f.debug_struct("Frame").field("peer",peer).field("lane",lane).field("kind",kind).field("bytes",&data.len()).field("connection",connection).finish(),
+        }
+    }
 }
 
 #[derive(Clone)]
 pub struct NetHandle {
     tx: async_channel::Sender<Out>,
+    state: SharedState,
 }
 
 impl NetHandle {
+    /// Linearization of application admission, immediately before the Hub accepts the event.
+    /// Revoked buffered events refuse; nonrevoked old immutable proof is not rejected for age.
+    pub(crate) fn application_admitted(&self,event:&NetEvent)->bool {
+        let Ok(state)=self.state.lock() else { return false; };
+        let permit=event.permit();
+        if !permit.initialized || state.bootstrap_routes.is_some() { return false; }
+        if !state.server || matches!(event,NetEvent::Closed {..}|NetEvent::Unreachable {..}) { return true; }
+        permit.key.as_ref().is_some_and(|key|!state.revoked_keys.contains_key(key.as_ref()))
+    }
+    pub(crate) async fn open_application(&self,keys:Vec<(String,String)>,until:Instant)->anyhow::Result<()> {
+        let (answer,receipt)=futures::channel::oneshot::channel();
+        crate::rt::timeout(until.saturating_duration_since(Instant::now()),self.tx.send(Out::OpenApplication {keys,until,answer})).await.map_err(|_|anyhow::anyhow!("network policy installation admission timed out"))?.map_err(|_|anyhow::anyhow!("network policy owner is closed"))?;
+        crate::rt::timeout(until.saturating_duration_since(Instant::now()),receipt).await.map_err(|_|anyhow::anyhow!("network policy installation outcome unknown; application owner remains unstarted"))?.map_err(|_|anyhow::anyhow!("network policy owner ended before installation ACK"))?.map_err(anyhow::Error::msg)
+    }
+
     /// Queue a frame; waits when the net thread is saturated (back-pressure).
     pub async fn send(&self, peer: PeerId, lane: u32, kind: Kind, data: Vec<u8>) -> bool {
         self.tx.send(Out::Frame { peer, lane, kind, data }).await.is_ok()
+    }
+
+    /// Retain opaque caller ownership across input admission and every existing Outbox retry.
+    /// A canceled/failed enqueue drops the hold; success transfers it to the same net owner.
+    pub(crate) async fn send_held(&self, peer: PeerId, lane: u32, kind: Kind, data: Vec<u8>, hold: FrameHold) -> bool {
+        self.tx.send(Out::HeldFrame { peer, lane, kind, data, hold }).await.is_ok()
+    }
+
+    /// U03/W13-R09: retain the selected connection through queueing and every LaneFull retry.
+    pub(crate) async fn send_bound(&self, connection: Connection, lane: u32, kind: Kind, data: Vec<u8>) -> BoundSend {
+        if self.tx.send(Out::BoundFrame { connection, lane, kind, data }).await.is_ok() { BoundSend::QueuedUnknown } else { BoundSend::NotSent }
     }
 
     /// Queue without waiting; returns false when full (callers drop or retry).
@@ -414,6 +538,8 @@ pub fn limits(server: bool) -> Limits {
         // pending places are taken (RFC 9000 §8.1.2), as before: kiln's places are a count, not
         // derived from its memory.
         retry_bytes: None,
+        acknowledgement: hyper_transport::Acknowledgement::Decimated,
+        fec_window: None,
         exchanges: if server { 4096 } else { 256 },
         // Eight lanes kiln has always had, and `proto::LANE_STREAM` and `proto::LANE_PORTS` past
         // them (a peer opens one only when the other side announced it takes it).
@@ -457,14 +583,26 @@ pub const DIAL_DEADLINE: Duration = Duration::from_secs(15);
 
 /// Start a net thread. Returns the command handle and the event stream.
 pub fn start(spec: Spec) -> anyhow::Result<(NetHandle, async_channel::Receiver<NetEvent>)> {
+    start_with(spec,None)
+}
+/// U15: authenticated declared replication only, until canonical policy is installed and ACKed.
+pub(crate) fn start_replication_bootstrap(spec:Spec,routes:std::collections::HashSet<String>)->anyhow::Result<(NetHandle,async_channel::Receiver<NetEvent>)> {
+    anyhow::ensure!(spec.server,"replication bootstrap admission is server-only");
+    start_with(spec,Some(routes))
+}
+fn start_with(spec:Spec,routes:Option<std::collections::HashSet<String>>)->anyhow::Result<(NetHandle,async_channel::Receiver<NetEvent>)> {
     // Validate the TLS material up front so misconfiguration fails loudly at startup.
     let _ = Tls::mutual(&credentials(&spec.ca_der, &spec.leaf)?, spec.server)
         .map_err(|r| anyhow::anyhow!("tls config: {r}"))?;
     let (tx, rx) = async_channel::bounded::<Out>(16_384);
     let (etx, erx) = async_channel::bounded::<NetEvent>(16_384);
     let name = if spec.server { "kiln-net-server" } else { "kiln-net-agent" };
-    std::thread::Builder::new().name(name.into()).spawn(move || thread_main(spec, rx, etx))?;
-    Ok((NetHandle { tx }, erx))
+    let mut policy=State {server:spec.server,bootstrap_routes:routes,..State::default()};
+    for (key,why) in &spec.revoked_keys { policy.revoked_keys.entry(key.clone()).or_insert_with(||why.clone()); }
+    let state=Arc::new(Mutex::new(policy));
+    let owner=Arc::clone(&state);
+    std::thread::Builder::new().name(name.into()).spawn(move || thread_main(spec, rx, etx,owner))?;
+    Ok((NetHandle { tx,state }, erx))
 }
 
 /// How one incarnation of the loop ended.
@@ -475,9 +613,8 @@ enum Exit {
     Rebuild { redial: bool },
 }
 
-fn thread_main(spec: Spec, rx: async_channel::Receiver<Out>, etx: async_channel::Sender<NetEvent>) {
+fn thread_main(spec: Spec, rx: async_channel::Receiver<Out>, etx: async_channel::Sender<NetEvent>,state:SharedState) {
     let spec = Arc::new(spec);
-    let last_dial: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
     // One shard: the loop, plus helpers for any wait polled under a foreign waker.
     let config = crate::rt::runtime_config(1, 1024);
     let mut backoff = Duration::from_millis(200);
@@ -486,16 +623,14 @@ fn thread_main(spec: Spec, rx: async_channel::Receiver<Out>, etx: async_channel:
         // A fresh runtime per incarnation: whatever a failed loop left behind goes with it.
         let outcome = match LocalRuntime::new(&config) {
             Ok(mut local) => local
-                .block_on(run_loop(Arc::clone(&spec), rx.clone(), etx.clone(), Arc::clone(&last_dial)))
+                .block_on(run_loop(Arc::clone(&spec), rx.clone(), etx.clone(), Arc::clone(&state)))
                 .map_err(|e| format!("{e}")),
             Err(e) => Err(format!("cannot start the net runtime: {e}")),
         };
         match outcome {
             Ok(Ok(Exit::Closed)) => return,
             Ok(Ok(Exit::Rebuild { redial })) => {
-                if !redial {
-                    *last_dial.lock().unwrap_or_else(PoisonError::into_inner) = None;
-                }
+                if !redial && let Ok(mut state)=state.lock() { state.last_dial=None; }
                 tracing::info!(redial, "rebuilding the QUIC endpoint");
                 std::thread::sleep(Duration::from_millis(50));
                 continue;
@@ -507,6 +642,7 @@ fn thread_main(spec: Spec, rx: async_channel::Receiver<Out>, etx: async_channel:
                 tracing::error!(error = %e, "net loop panicked; rebuilding endpoint");
             }
         }
+        fail_opening(&state,"network endpoint failed before policy installation ACK");
         if started.elapsed() > Duration::from_secs(60) {
             backoff = Duration::from_millis(200);
         }
@@ -541,7 +677,7 @@ macro_rules! with_driver {
 }
 
 /// Builds the endpoint and binds its socket; must run on the net thread's shard.
-fn build(spec: &Spec) -> anyhow::Result<AnyDriver> {
+fn build(spec: &Spec,state:SharedState) -> anyhow::Result<AnyDriver> {
     let tls = Tls::mutual(&credentials(&spec.ca_der, &spec.leaf)?, spec.server)
         .map_err(|r| anyhow::anyhow!("tls: {r}"))?;
     let budget = Fixed::new(if spec.server { 1 << 30 } else { 256 << 20 }, 256);
@@ -549,7 +685,8 @@ fn build(spec: &Spec) -> anyhow::Result<AnyDriver> {
     let now = Instant::now();
     if spec.server {
         let cfg = Config { tls, role: Role::Server, limits: limits(true), congestion: Default::default() };
-        let book = ServerBook { revoked_keys: spec.revoked_keys.iter().cloned().collect(), ..ServerBook::default() };
+        drop(state_lock(&state)?);
+        let book = ServerBook { state, ..ServerBook::default() };
         let ep = Endpoint::<Kiln, _, _>::new(cfg, budget, book, now)
             .map_err(|r| anyhow::anyhow!("endpoint: {r}"))?;
         let d = Driver::bind(ep, spec.bind, io).map_err(|e| anyhow::anyhow!("bind {}: {e}", spec.bind))?;
@@ -570,14 +707,17 @@ macro_rules! clock {
     };
 }
 
+#[derive(Clone)]
+struct QueuedFrame { kind: Kind, data: Vec<u8>, connection: Option<Connection>, _hold: Option<FrameHold> }
+
 #[derive(Default)]
 struct Outbox {
-    queues: HashMap<(PeerId, u32), VecDeque<(Kind, Vec<u8>)>>,
+    queues: HashMap<(PeerId, u32), VecDeque<QueuedFrame>>,
     /// A test build's faults, each with its draw's state, and the seed they draw from.
     faults: Vec<(Shed, u64)>,
     seed: u64,
     /// A frame each lane holds back to send late (`Act::Late`), and since when.
-    late: HashMap<(PeerId, u32), (Kind, Vec<u8>, Instant)>,
+    late: HashMap<(PeerId, u32), (QueuedFrame, Instant)>,
     /// A test build's copy of every frame handed to it (`Out::Copy`).
     copy: Option<std::fs::File>,
 }
@@ -592,11 +732,21 @@ enum Push {
 }
 
 impl Outbox {
-    fn push(&mut self, peer: PeerId, lane: u32, kind: Kind, mut data: Vec<u8>) -> Push {
+    fn push(&mut self, peer: PeerId, lane: u32, kind: Kind, data: Vec<u8>) -> Push {
+        self.push_frame(peer, lane, QueuedFrame { kind, data, connection: None, _hold: None })
+    }
+    fn push_held(&mut self, peer: PeerId, lane: u32, kind: Kind, data: Vec<u8>, hold: FrameHold) -> Push {
+        self.push_frame(peer, lane, QueuedFrame { kind, data, connection: None, _hold: Some(hold) })
+    }
+    fn push_bound(&mut self, connection: Connection, lane: u32, kind: Kind, data: Vec<u8>) -> Push {
+        self.push_frame(connection.peer(), lane, QueuedFrame { kind, data, connection: Some(connection), _hold: None })
+    }
+    fn push_frame(&mut self, peer: PeerId, lane: u32, mut frame: QueuedFrame) -> Push {
+        let data = &mut frame.data;
         if let Some(f) = &mut self.copy {
             use std::io::Write as _;
             let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
-            if let Err(e) = f.write_all(&lane.to_le_bytes()).and_then(|()| f.write_all(&len.to_le_bytes())).and_then(|()| f.write_all(&data)) {
+            if let Err(e) = f.write_all(&lane.to_le_bytes()).and_then(|()| f.write_all(&len.to_le_bytes())).and_then(|()| f.write_all(data)) {
                 tracing::warn!(error = %e, "chaos: can't copy a frame");
             }
         }
@@ -626,7 +776,7 @@ impl Outbox {
                     unreadable = true;
                 }
                 Act::Garble => {
-                    garble(&mut data, *draw);
+                    garble(data, *draw);
                     unreadable = true;
                 }
             }
@@ -635,48 +785,48 @@ impl Outbox {
         // copies go.
         if unreadable {
             let mut marked = MARK.to_vec();
-            marked.append(&mut data);
-            data = marked;
+            marked.append(data);
+            *data = marked;
             tracing::warn!(lane = crate::proto::lane_name(lane), copies = if twice { 2 } else { 1 }, "chaos: frames made unreadable");
         }
         // One held back goes after this one; this one waits for the next, when it's to be late.
         let held = self.late.remove(&(peer, lane));
         if late && held.is_none() {
-            self.late.insert((peer, lane), (kind, data, Instant::now()));
+            self.late.insert((peer, lane), (frame, Instant::now()));
             return Push::Queued;
         }
-        let mut pushed = self.queue(peer, lane, kind, data.clone());
+        let mut pushed = self.queue(peer, lane, frame.clone());
         if twice && pushed == Push::Queued {
-            pushed = self.queue(peer, lane, kind, data);
+            pushed = self.queue(peer, lane, frame);
         }
-        if let Some((kind, data, _)) = held
+        if let Some((frame, _)) = held
             && pushed == Push::Queued
         {
-            pushed = self.queue(peer, lane, kind, data);
+            pushed = self.queue(peer, lane, frame);
         }
         pushed
     }
 
     /// Frames held back to send late whose next never came within [`LATE_FOR`]: sent now.
     fn release_late(&mut self, now: Instant) {
-        let due: Vec<(PeerId, u32)> = self.late.iter().filter(|(_, (_, _, at))| now.saturating_duration_since(*at) >= LATE_FOR).map(|(k, _)| *k).collect();
+        let due: Vec<(PeerId, u32)> = self.late.iter().filter(|(_, (_, at))| now.saturating_duration_since(*at) >= LATE_FOR).map(|(k, _)| *k).collect();
         for (peer, lane) in due {
-            if let Some((kind, data, _)) = self.late.remove(&(peer, lane)) {
-                let _ = self.queue(peer, lane, kind, data);
+            if let Some((frame, _)) = self.late.remove(&(peer, lane)) {
+                let _ = self.queue(peer, lane, frame);
             }
         }
     }
 
-    fn queue(&mut self, peer: PeerId, lane: u32, kind: Kind, data: Vec<u8>) -> Push {
+    fn queue(&mut self, peer: PeerId, lane: u32, frame: QueuedFrame) -> Push {
         let q = self.queues.entry((peer, lane)).or_default();
         if q.len() >= OUTBOX_FRAMES {
-            if kind == Kind::Control {
+            if frame.kind == Kind::Control {
                 return Push::Stuck;
             }
             q.pop_front();
             crate::metrics::net().dropped(peer, lane, "shed", 1);
         }
-        q.push_back((kind, data));
+        q.push_back(frame);
         Push::Queued
     }
 
@@ -688,8 +838,8 @@ impl Outbox {
     /// of its frames, the most first, at most four.
     fn filled_with(&self, peer: PeerId, lane: u32) -> String {
         let mut n: HashMap<u8, usize> = HashMap::new();
-        for (_, data) in self.queues.get(&(peer, lane)).into_iter().flatten() {
-            *n.entry(data.first().copied().unwrap_or(0)).or_default() += 1;
+        for frame in self.queues.get(&(peer, lane)).into_iter().flatten() {
+            *n.entry(frame.data.first().copied().unwrap_or(0)).or_default() += 1;
         }
         let mut most: Vec<(u8, usize)> = n.into_iter().collect();
         most.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
@@ -718,6 +868,18 @@ impl Drop for Outbox {
     }
 }
 
+/// The endpoint owner alone selects the current connection. No event turn may split this check
+/// from enqueue/write selection, and every later retry checks the same immutable captured binding.
+fn connection_matches<C, B, D>(ep: &Endpoint<C, B, D>, connection: Connection) -> bool
+where
+    C: Classes<Kind = Kind>,
+    B: hyper_transport::Budget<C::Class>,
+    D: Directory<Role = C::Role>,
+{
+    let mut actual = [0u8; 32];
+    ep.export_keying_material(connection.peer(), BINDING_LABEL, b"", &mut actual).is_ok() && connection.binding == actual
+}
+
 fn flush_outbox<C, B, D>(ep: &mut Endpoint<C, B, D>, outbox: &mut Outbox) -> bool
 where
     C: Classes<Kind = Kind>,
@@ -729,8 +891,17 @@ where
     let mut sent_any = false;
     let mut dead = Vec::new();
     for ((peer, lane), q) in &mut outbox.queues {
-        while let Some((kind, data)) = q.front() {
-            match ep.send_frame(*peer, *lane, *kind, data) {
+        while let Some(frame) = q.front() {
+            if let Some(connection) = frame.connection
+                && !connection_matches(ep,connection) {
+                q.pop_front();
+                crate::metrics::net().dropped(*peer, *lane, "connection_changed", 1);
+                tracing::warn!(peer, lane, "captured frame not sent: its authenticated connection changed");
+                continue;
+            }
+            // No await or endpoint turn separates the exporter check from connection selection.
+            // send_frame owns the selected Conn's lane queue through subsequent QUIC writes.
+            match ep.send_frame(*peer, *lane, frame.kind, &frame.data) {
                 Ok(()) => {
                     q.pop_front();
                     sent_any = true;
@@ -759,9 +930,18 @@ async fn run_loop(
     spec: Arc<Spec>,
     rx: async_channel::Receiver<Out>,
     etx: async_channel::Sender<NetEvent>,
-    last_dial: Arc<Mutex<Option<SocketAddr>>>,
+    state: SharedState,
 ) -> anyhow::Result<Exit> {
-    let mut driver = build(&spec)?;
+    let mut driver = build(&spec,Arc::clone(&state))?;
+    // The replacement endpoint is built with the canonical policy before this ACK is emitted.
+    {
+        let mut policy=state_lock(&state)?;
+        if let Some((until,answer))=policy.opening.take() {
+            if Instant::now()>=until { let _=answer.send(Err("network policy installation deadline elapsed; admission remains fenced".into())); anyhow::bail!("network policy installation deadline elapsed"); }
+            anyhow::ensure!(answer.send(Ok(())).is_ok(),"network policy installation caller ended; admission remains fenced");
+            policy.bootstrap_routes=None;
+        }
+    }
     if let AnyDriver::Server(d) = &driver {
         tracing::info!(addr = ?d.local_addr(), "QUIC listening (hyper-transport on hyper-rt, mTLS)");
     }
@@ -769,7 +949,7 @@ async fn run_loop(
     // second `connect` while one is pending, so the loop tracks it to replace or abandon it.
     let mut dial = Dial::Idle;
     // After a rebuild, an agent re-dials where it was connected.
-    let redial = *last_dial.lock().unwrap_or_else(PoisonError::into_inner);
+    let redial = state_lock(&state)?.last_dial;
     if let (AnyDriver::Agent(d), Some(addr)) = (&mut driver, redial) {
         let now = clock!(d);
         match d.endpoint().connect(now, SERVER_PEER, addr) {
@@ -833,6 +1013,7 @@ async fn run_loop(
                         Err(_) => break,
                     }
                 }
+                let mut rebuilding=None;
                 for cmd in cmds {
                     match cmd {
                         Out::Frame { peer, lane, kind, data } => {
@@ -847,6 +1028,28 @@ async fn run_loop(
                                     let now = clock!(d);
                                     d.endpoint().disconnect(now, peer);
                                 });
+                            }
+                        }
+                        Out::HeldFrame { peer, lane, kind, data, hold } => {
+                            if outbox.push_held(peer, lane, kind, data, hold) == Push::Stuck {
+                                tracing::warn!(peer, lane, frames = OUTBOX_FRAMES, "held control lane is full: connection closes, delivery remains unknown");
+                                crate::metrics::net().dropped(peer, lane, "stuck", 1);
+                                outbox.forget(peer, "stuck");
+                                with_driver!(&mut driver, d => { let now = clock!(d); d.endpoint().disconnect(now, peer); });
+                            }
+                        }
+                        Out::BoundFrame { connection, lane, kind, data } => {
+                            let peer = connection.peer();
+                            // A stale command cannot fill and close its replacement's control queue.
+                            if !with_driver!(&mut driver, d => connection_matches(d.endpoint(),connection)) {
+                                crate::metrics::net().dropped(peer,lane,"connection_changed",1);
+                                continue;
+                            }
+                            if outbox.push_bound(connection, lane, kind, data) == Push::Stuck {
+                                tracing::warn!(peer, lane, frames = OUTBOX_FRAMES, "captured control lane is full: connection closes, delivery remains unknown");
+                                crate::metrics::net().dropped(peer, lane, "stuck", 1);
+                                outbox.forget(peer, "stuck");
+                                with_driver!(&mut driver, d => { let now = clock!(d); d.endpoint().disconnect(now, peer); });
                             }
                         }
                         Out::Shed(rule) => {
@@ -898,38 +1101,56 @@ async fn run_loop(
                             if let AnyDriver::Server(d) = &mut driver {
                                 let now = clock!(d);
                                 let book = d.endpoint().directory_mut();
-                                let peers: Vec<PeerId> = book.keys.iter().filter(|(_, k)| keys.contains(k)).map(|(p, _)| *p).collect();
+                                let peers: Vec<PeerId> = book.keys.iter().filter(|(_, k)| keys.iter().any(|key|key==k.as_ref())).map(|(p, _)| *p).collect();
                                 // The first revocation of a key is the one it's refused for.
                                 for k in keys {
-                                    book.revoked_keys.entry(k).or_insert_with(|| why.clone());
+                                    state_lock(&state)?.revoked_keys.entry(k).or_insert_with(|| why.clone());
                                 }
                                 for p in peers {
                                     d.endpoint().disconnect(now, p);
                                 }
                             }
                         }
+                        Out::OpenApplication { keys,until,answer } => {
+                            let mut policy=state_lock(&state)?;
+                            if !spec.server || policy.bootstrap_routes.is_none() || policy.opening.is_some() || Instant::now()>=until {
+                                let _=answer.send(Err("network policy installation is not an active bootstrap transition".into()));
+                                continue;
+                            }
+                            for (key,why) in keys { policy.revoked_keys.entry(key).or_insert(why); }
+                            policy.opening=Some((until,answer));
+                            drop(policy);
+                            if let AnyDriver::Server(d)=&mut driver {
+                                let peers:Vec<_>=d.endpoint().directory().names.keys().copied().collect();
+                                let now=clock!(d);
+                                for peer in peers { d.endpoint().disconnect(now,peer); }
+                                let _=d.flush();
+                            }
+                            rebuilding=Some(false);
+                        }
                         Out::Connect { addr } => {
-                            *last_dial.lock().unwrap_or_else(PoisonError::into_inner) = Some(addr);
+                            state_lock(&state)?.last_dial = Some(addr);
                             if let AnyDriver::Agent(d) = &mut driver {
                                 match dial {
                                     // Already dialing there: let that dial finish.
                                     Dial::Dialing { addr: pending, .. } if pending == addr => {}
                                     // Dialing elsewhere, or the owner believes the connection is
                                     // gone: a fresh endpoint dials the new address at once.
-                                    Dial::Dialing { .. } | Dial::Connected => return Ok(Exit::Rebuild { redial: true }),
+                                    Dial::Dialing { .. } | Dial::Connected => rebuilding=Some(true),
                                     Dial::Idle => {
                                         let now = clock!(d);
                                         match d.endpoint().connect(now, SERVER_PEER, addr) {
                                             Ok(()) => dial = Dial::Dialing { addr, since: Instant::now() },
-                                            Err(r) => events.push(NetEvent::Unreachable { peer: SERVER_PEER, reason: r.to_string() }),
+                                            Err(r) => events.push(NetEvent::Unreachable { peer: SERVER_PEER, reason: r.to_string(),admission:ApplicationPermit::agent() }),
                                         }
                                     }
                                 }
                             }
                         }
-                        Out::Rebuild => return Ok(Exit::Rebuild { redial: true }),
+                        Out::Rebuild => rebuilding=Some(true),
                     }
                 }
+                if let Some(redial)=rebuilding { return Ok(Exit::Rebuild {redial}); }
                 with_driver!(&mut driver, d => {
                     flush_outbox(d.endpoint(), &mut outbox);
                     if let Err(e) = d.flush() {
@@ -940,9 +1161,9 @@ async fn run_loop(
             Ev::Driver(ev) => {
                 let ev = ev.map_err(|e| anyhow::anyhow!("driver: {e}"))?;
                 with_driver!(&mut driver, d => {
-                    on_event(d.endpoint(), ev, &mut events, &mut outbox);
+                    on_event(d.endpoint(), ev, &mut events, &mut outbox,&state);
                     while let Some(ev) = d.endpoint().poll_event() {
-                        on_event(d.endpoint(), ev, &mut events, &mut outbox);
+                        on_event(d.endpoint(), ev, &mut events, &mut outbox,&state);
                     }
                     if !outbox.is_empty() {
                         flush_outbox(d.endpoint(), &mut outbox);
@@ -959,6 +1180,7 @@ async fn run_loop(
                     let _ = etx
                         .send(NetEvent::Unreachable {
                             peer: SERVER_PEER,
+                            admission:ApplicationPermit::agent(),
                             reason: format!("no answer from {addr} in {}s", spec.dial_deadline.as_secs()),
                         })
                         .await;
@@ -994,9 +1216,11 @@ async fn run_loop(
 
 trait PeerNames {
     fn name_of(&self, peer: PeerId) -> Option<String>;
+    fn key_of(&self,_peer:PeerId)->Option<Arc<str>> {None}
 }
 
 impl PeerNames for ServerBook {
+    fn key_of(&self,peer:PeerId)->Option<Arc<str>> {self.keys.get(&peer).cloned()}
     fn name_of(&self, peer: PeerId) -> Option<String> {
         self.names.get(&peer).cloned()
     }
@@ -1008,37 +1232,51 @@ impl PeerNames for AgentBook {
     }
 }
 
+fn permit_for<D:PeerNames>(directory:&D,peer:PeerId,state:&SharedState)->ApplicationPermit {
+    let initialized=state.lock().is_ok_and(|state|state.bootstrap_routes.is_none());
+    ApplicationPermit {initialized,key:directory.key_of(peer)}
+}
+
 fn on_event<B, D>(
     ep: &mut Endpoint<Kiln, B, D>,
     ev: Event<Kiln>,
     out: &mut Vec<NetEvent>,
     outbox: &mut Outbox,
+    state: &SharedState,
 ) where
     B: hyper_transport::Budget<Class>,
     D: Directory<Role = Role> + PeerNames,
 {
     match ev {
-        Event::Connected { peer, .. } => {
+        Event::Connected { peer, epoch, .. } => {
             let mut binding = [0u8; 32];
-            let binding = ep.export_keying_material(peer, BINDING_LABEL, b"", &mut binding).ok().map(|_| binding);
-            out.push(NetEvent::Connected { peer, name: ep.directory().name_of(peer), binding });
+            let binding = ep.export_keying_material_at(peer, epoch, BINDING_LABEL, b"", &mut binding).ok().map(|()| binding);
+            out.push(NetEvent::Connected { peer, epoch, name: ep.directory().name_of(peer), binding,admission:permit_for(ep.directory(),peer,state) });
         }
-        Event::Frame { peer, lane, kind, frame } => {
+        Event::Frame { peer, epoch, lane, kind, frame } => {
+            let mut binding = [0u8; 32];
+            let connection = ep.export_keying_material_at(peer, epoch, BINDING_LABEL, b"", &mut binding).ok().map(|()| Connection::new(peer, epoch, binding));
             crate::metrics::global().quic_streams.inc();
-            out.push(NetEvent::Frame { peer, lane, kind, data: frame.bytes().to_vec() });
+            out.push(NetEvent::Frame { peer, lane, kind, data: frame.bytes().to_vec(), connection,admission:permit_for(ep.directory(),peer,state) });
             ep.release(frame);
         }
-        Event::Closed { peer, refusal, .. } => {
+        Event::Closed { peer, epoch, refusal } => {
             outbox.forget(peer, "closed");
             out.push(NetEvent::Closed {
                 peer,
+                epoch,
+                admission:permit_for(ep.directory(),peer,state),
                 reason: refusal.map_or_else(|| "closed".to_owned(), |r| r.to_string()),
             });
         }
+        // Advisory path progress is observed without releasing ownership or reconnecting.
+        Event::Degrading { peer, epoch } => tracing::debug!(?peer, ?epoch, "QUIC path is degrading"),
+        Event::Progressing { peer, epoch } => tracing::debug!(?peer, ?epoch, "QUIC path is progressing"),
         Event::Unreachable { peer, refusal } => {
             outbox.forget(peer, "closed");
             out.push(NetEvent::Unreachable {
                 peer,
+                admission:permit_for(ep.directory(),peer,state),
                 reason: refusal.map_or_else(|| "unreachable".to_owned(), |r| r.to_string()),
             });
         }
@@ -1102,17 +1340,19 @@ mod tests {
     /// A frame a fault made unreadable goes marked, and its reader reads it as it was made: the
     /// mark comes off.
     #[test]
-    fn a_frame_made_unreadable_goes_marked_and_is_read_unmarked() {
+    fn a_frame_made_unreadable_goes_marked_and_is_read_unmarked() -> anyhow::Result<()> {
         let mut o = Outbox::default();
         let (peer, lane) = (7, crate::proto::LANE_TERM);
-        o.faults = vec![(Shed { lane, variant: Some(46), every: 1, act: Act::Unknown(60) }, 0x9e37_79b9_7f4a_7c15)];
+        let unknown = u8::try_from(crate::wire::agent_classes().len())?;
+        o.faults = vec![(Shed { lane, variant: Some(46), every: 1, act: Act::Unknown(unknown) }, 0x9e37_79b9_7f4a_7c15)];
         let frame = vec![46u8, 1, 2, 3];
         assert_eq!(o.push(peer, lane, Kind::Term, frame.clone()), Push::Queued);
-        let sent = o.queues.get(&(peer, lane)).and_then(|q| q.front()).map(|(_, d)| d.clone()).unwrap_or_default();
+        let sent = o.queues.get(&(peer, lane)).and_then(|q| q.front()).map(|frame| frame.data.clone()).unwrap_or_default();
         assert!(sent.starts_with(&MARK), "{sent:?}");
-        assert_eq!(unmarked(&sent), [60u8, 1, 2, 3], "its index one past, the mark off");
+        assert_eq!(unmarked(&sent), [unknown, 1, 2, 3], "its index one past, the mark off");
         assert_eq!(unmarked(&frame), frame, "one not made unreadable is read as it went");
-        assert!(matches!(crate::proto::read_agent(&sent), Err(crate::proto::Unreadable::Unknown { index: 60, .. })), "read as it was made");
+        assert!(matches!(crate::proto::read_agent(&sent), Err(crate::proto::Unreadable::Unknown { index, .. }) if index == u64::from(unknown)), "read as it was made");
+        Ok(())
     }
 
     async fn next_event(rx: &async_channel::Receiver<NetEvent>, deadline: Instant) -> anyhow::Result<NetEvent> {
@@ -1134,9 +1374,9 @@ mod tests {
         }
     }
 
-    /// W27-R01: a revoked key's certificate is dropped at once and refused when it comes back,
-    /// and a server started with it revoked refuses it from the first handshake; another key of
-    /// the same machine name (enrolled again) is welcome.
+    /// W27-R01/U15: canonical revocations invalidate queued application events and survive a
+    /// runtime rebuild. Replication bootstrap can connect declared members before SQL is ready,
+    /// but those application events stay fenced even after the canonical policy is installed.
     #[test]
     fn w27_r01_revoked_keys_are_refused_from_the_moment_and_after_a_restart() -> anyhow::Result<()> {
         crate::rt::block_on(async {
@@ -1144,30 +1384,83 @@ mod tests {
             let pki = crate::pki::Pki::open_scratch(dir.path())?;
             let (old, new) = (pki.issue_local("fedora-2")?, pki.issue_local("fedora-2")?);
             let old_key = crate::pki::fingerprints(&old.cert_pem)?.key;
+            let why = "revoked at 2026-10-26T21:00:00Z (runner forgotten, by ada)";
             let addr = |s: std::net::UdpSocket| s.local_addr();
             let a1 = addr(std::net::UdpSocket::bind("127.0.0.1:0")?)?;
             let (srv, srv_ev) = start(Spec { bind: a1, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() })?;
-            let (agent, _agent_ev) = start(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: old.clone(), server: false, dial_deadline: Duration::from_secs(2), revoked_keys: Vec::new() })?;
-            agent.command(Out::Connect { addr: a1 }).await;
-            let peer = connected_within(&srv_ev, Duration::from_secs(10)).await.ok_or_else(|| anyhow::anyhow!("never connected"))?;
-            srv.command(Out::RevokeKeys { keys: vec![old_key.clone()], why: "revoked at 2026-10-26T21:00:00Z (runner forgotten, by ada)".into() }).await;
+            let (agent, _agent_ev) = start(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: old, server: false, dial_deadline: Duration::from_secs(2), revoked_keys: Vec::new() })?;
+            anyhow::ensure!(agent.command(Out::Connect { addr: a1 }).await, "dial owner ended");
             let deadline = Instant::now() + Duration::from_secs(10);
+            let connected = loop {
+                let event = next_event(&srv_ev, deadline).await?;
+                if matches!(event, NetEvent::Connected { .. }) { break event; }
+            };
+            let peer = match &connected { NetEvent::Connected { peer, .. } => *peer, _ => return Err(anyhow::anyhow!("missing connection")) };
+            assert!(srv.application_admitted(&connected));
+            anyhow::ensure!(agent.send(SERVER_PEER, crate::proto::LANE_CONTROL, Kind::Control, b"queued hello".to_vec()).await, "send owner ended");
+            let queued = loop {
+                let event = next_event(&srv_ev, deadline).await?;
+                if matches!(&event, NetEvent::Frame { data, .. } if data == b"queued hello") { break event; }
+            };
+            assert!(srv.application_admitted(&queued));
+            anyhow::ensure!(srv.command(Out::RevokeKeys { keys: vec![old_key.clone()], why: why.into() }).await, "revocation owner ended");
             loop {
                 match next_event(&srv_ev, deadline).await? {
                     NetEvent::Closed { peer: p, .. } if p == peer => break,
                     _ => {}
                 }
             }
-            agent.command(Out::Connect { addr: a1 }).await;
-            assert_eq!(connected_within(&srv_ev, Duration::from_secs(3)).await, None, "a revoked key comes back: refused");
-            // A server started with the key revoked (a restart reading the store).
-            let a2 = addr(std::net::UdpSocket::bind("127.0.0.1:0")?)?;
-            let (_srv2, srv2_ev) = start(Spec { bind: a2, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: vec![(old_key, "revoked at 2026-10-26T21:00:00Z (runner forgotten, by ada)".into())] })?;
-            agent.command(Out::Connect { addr: a2 }).await;
-            assert_eq!(connected_within(&srv2_ev, Duration::from_secs(3)).await, None, "refused from the first handshake");
+            assert!(!srv.application_admitted(&connected), "a buffered connection cannot introduce a revoked runner");
+            assert!(!srv.application_admitted(&queued), "a buffered Hello cannot bypass the newly installed revocation");
+            // Rebuild the same network owner, then positively prove the endpoint is serving the
+            // re-enrolled key before checking that it still refuses the old certificate.
+            anyhow::ensure!(srv.command(Out::Rebuild).await, "rebuild owner ended");
             let (agent2, _ev2) = start(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: new, server: false, dial_deadline: Duration::from_secs(2), revoked_keys: Vec::new() })?;
-            agent2.command(Out::Connect { addr: a2 }).await;
+            anyhow::ensure!(agent2.command(Out::Connect { addr: a1 }).await, "dial owner ended");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let re_enrolled = loop {
+                let event = next_event(&srv_ev, deadline).await?;
+                if matches!(event, NetEvent::Connected { .. }) { break event; }
+            };
+            assert!(srv.application_admitted(&re_enrolled), "nonrevoked proof from an earlier connection remains admissible");
+            anyhow::ensure!(agent.command(Out::Connect { addr: a1 }).await, "dial owner ended");
+            assert_eq!(connected_within(&srv_ev, Duration::from_secs(3)).await, None, "a runtime rebuild must not forget the revoked key");
+            // A fresh server starts with the canonical store's policy already installed.
+            let a2 = addr(std::net::UdpSocket::bind("127.0.0.1:0")?)?;
+            let (srv2, srv2_ev) = start(Spec { bind: a2, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: vec![(old_key.clone(), why.into())] })?;
+            anyhow::ensure!(agent2.command(Out::Connect { addr: a2 }).await, "dial owner ended");
             assert!(connected_within(&srv2_ev, Duration::from_secs(10)).await.is_some(), "the same name with a new key connects");
+            assert!(srv.application_admitted(&re_enrolled), "a closed but nonrevoked connection does not invalidate immutable completion proof");
+            anyhow::ensure!(agent.command(Out::Connect { addr: a2 }).await, "dial owner ended");
+            assert_eq!(connected_within(&srv2_ev, Duration::from_secs(3)).await, None, "refused from the first handshake");
+            // A replicated owner needs its configured authenticated routes before SQL/quorum.
+            let a3 = addr(std::net::UdpSocket::bind("127.0.0.1:0")?)?;
+            let (bootstrap, bootstrap_ev) = start_replication_bootstrap(Spec { bind: a3, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() }, ["fedora-2".to_owned()].into_iter().collect())?;
+            anyhow::ensure!(agent.command(Out::Connect { addr: a3 }).await, "dial owner ended");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let early_connected = loop {
+                let event = next_event(&bootstrap_ev, deadline).await?;
+                if matches!(event, NetEvent::Connected { .. }) { break event; }
+            };
+            assert!(!early_connected.application_ready() && !bootstrap.application_admitted(&early_connected));
+            anyhow::ensure!(agent.send(SERVER_PEER, crate::proto::LANE_CONTROL, Kind::Control, b"bootstrap hello".to_vec()).await, "send owner ended");
+            let early_frame = loop {
+                let event = next_event(&bootstrap_ev, deadline).await?;
+                if matches!(&event, NetEvent::Frame { data, .. } if data == b"bootstrap hello") { break event; }
+            };
+            assert!(!early_frame.application_ready() && !bootstrap.application_admitted(&early_frame));
+            bootstrap.open_application(vec![(old_key, why.into())], deadline).await?;
+            assert!(!bootstrap.application_admitted(&early_connected) && !bootstrap.application_admitted(&early_frame), "pre-policy events never become eligible after installation ACK");
+            anyhow::ensure!(agent2.command(Out::Connect { addr: a3 }).await, "dial owner ended");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let admitted = loop {
+                let event = next_event(&bootstrap_ev, deadline).await?;
+                if matches!(event, NetEvent::Connected { .. }) { break event; }
+            };
+            assert!(admitted.application_ready() && bootstrap.application_admitted(&admitted), "ACK installs the canonical policy on a live endpoint");
+            anyhow::ensure!(agent.command(Out::Connect { addr: a3 }).await, "dial owner ended");
+            assert_eq!(connected_within(&bootstrap_ev, Duration::from_secs(3)).await, None, "bootstrap cannot reopen a revoked key");
+            drop(srv2);
             Ok(())
         })
     }
@@ -1177,7 +1470,7 @@ mod tests {
     #[test]
     fn a_fault_sends_frames_twice_or_late() {
         let (peer, bulk): (PeerId, u32) = (0xdead_0009, 13);
-        let queued = |o: &Outbox| -> Vec<Vec<u8>> { o.queues.get(&(peer, bulk)).into_iter().flatten().map(|(_, d)| d.clone()).collect() };
+        let queued = |o: &Outbox| -> Vec<Vec<u8>> { o.queues.get(&(peer, bulk)).into_iter().flatten().map(|frame| frame.data.clone()).collect() };
         // Let go of uncounted: the lane is "other" to the metric, which the test after this one
         // counts on alone.
         let done = |mut o: Outbox| o.queues.clear();
@@ -1215,6 +1508,41 @@ mod tests {
         assert_eq!(seen.len(), 200, "none lost");
         assert!(got.len() > 200 && !in_order, "some twice ({}), some late", got.len());
         done(o);
+
+        // U06/U14: ownership spans actual net input/Outbox retention, not just caller enqueue.
+        // Use Observe's lane so this case does not disturb the following "other" metric oracle.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Released(Arc<AtomicUsize>);
+        impl Drop for Released { fn drop(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); } }
+        let releases = Arc::new(AtomicUsize::new(0));
+        let hold = || FrameHold::new(Released(releases.clone()));
+        let lane = crate::proto::LANE_OBSERVE;
+        let mut held = Outbox::default();
+        held.faults = vec![(Shed { lane, variant: None, every: 1, act: Act::Twice }, seed)];
+        held.push_held(peer, lane, Kind::Control, vec![1], hold());
+        assert_eq!(releases.load(Ordering::SeqCst), 0);
+        if let Some(queue) = held.queues.get_mut(&(peer, lane)) { drop(queue.pop_front()); }
+        assert_eq!(releases.load(Ordering::SeqCst), 0, "first chaos copy released shared ownership");
+        if let Some(queue) = held.queues.get_mut(&(peer, lane)) { drop(queue.pop_front()); }
+        assert_eq!(releases.load(Ordering::SeqCst), 1, "last copy releases once");
+        held.faults = vec![(Shed { lane, variant: None, every: 1, act: Act::Late }, seed)];
+        held.push_held(peer, lane, Kind::Control, vec![2], hold());
+        assert_eq!(releases.load(Ordering::SeqCst), 1, "late frame still owns its hold");
+        held.release_late(Instant::now() + LATE_FOR);
+        assert_eq!(releases.load(Ordering::SeqCst), 1, "moving between queues does not release");
+        held.queues.clear();
+        assert_eq!(releases.load(Ordering::SeqCst), 2);
+        held.faults.clear();
+        for _ in 0..OUTBOX_FRAMES { held.push(peer, lane, Kind::Control, vec![]); }
+        assert_eq!(held.push_held(peer, lane, Kind::Control, vec![], hold()), Push::Stuck);
+        assert_eq!(releases.load(Ordering::SeqCst), 3, "full rejection drops only rejected hold");
+        held.queues.clear();
+        held.push_held(peer, lane, Kind::Control, vec![3], hold());
+        held.forget(peer, "closed");
+        assert_eq!(releases.load(Ordering::SeqCst), 4, "closed peer releases retained hold");
+        held.push_held(peer, lane, Kind::Control, vec![4], hold());
+        drop(held);
+        assert_eq!(releases.load(Ordering::SeqCst), 5, "endpoint rebuild/end releases retained hold");
     }
 
     /// What the outbox lets go is counted by lane and reason, and a control frame is never shed:
@@ -1490,16 +1818,25 @@ mod tests {
             let mut rebuilt = false;
             let mut logs = 0;
             let mut replies = 0;
+            let mut captured = None;
+            let mut live_capture_received = false;
             loop {
                 let ev = futures::select_biased! {
                     ev = next_event(&srv_ev, deadline).fuse() => (true, ev?),
                     ev = next_event(&agent_ev, deadline).fuse() => (false, ev?),
                 };
                 match ev {
-                    (true, NetEvent::Connected { peer, name, binding }) => {
+                    (true, NetEvent::Connected { peer, epoch, name, binding,.. }) => {
                         assert_eq!(name.as_deref(), Some("bench-1"));
                         assert!(binding.is_some());
-                        assert_ne!(binding, srv_binding, "a new connection has a new binding");
+                        assert!(binding != srv_binding, "a new connection has a new binding");
+                        if let Some(old) = captured {
+                            let current = Connection::new(peer,epoch,binding.ok_or_else(||anyhow::anyhow!("connection binding unavailable"))?);
+                            assert_eq!(srv.send_bound(old,0,Kind::Control,b"obsolete captured startup".to_vec()).await,BoundSend::QueuedUnknown);
+                            assert_eq!(srv.send_bound(current,0,Kind::Control,b"current captured startup".to_vec()).await,BoundSend::QueuedUnknown);
+                        } else {
+                            captured = binding.map(|binding|Connection::new(peer,epoch,binding));
+                        }
                         srv_binding = binding;
                         agent_peer = Some(peer);
                     }
@@ -1518,11 +1855,12 @@ mod tests {
                         agent.send(SERVER_PEER, 2, Kind::Log, vec![7u8; 1 << 20]).await;
                         agent.send(SERVER_PEER, 0, Kind::Control, b"hello server".to_vec()).await;
                     }
+                    (false, NetEvent::Frame { data, .. }) if data == b"current captured startup" => { live_capture_received = true; }
                     (false, NetEvent::Frame { data, .. }) => {
-                        assert_eq!(data, b"hello agent");
+                        assert_eq!(data, b"hello agent", "a captured startup must never reach a replacement connection");
                         assert!(agent_peer.is_some());
                         // Both ends derived the same binding for the connection that carried this.
-                        assert_eq!(srv_binding, agent_binding);
+                        assert!(srv_binding == agent_binding,"both ends derive the same connection binding");
                         replies += 1;
                     }
                     _ => {}
@@ -1534,7 +1872,7 @@ mod tests {
                     agent.command(Out::Rebuild).await;
                 }
                 // Both connections delivered the control round trip and the 1 MiB bulk frame.
-                if replies >= 2 && logs >= 2 {
+                if replies >= 2 && logs >= 2 && live_capture_received {
                     return Ok(());
                 }
             }

@@ -368,11 +368,31 @@ fn end_now(pgid: u32, group: Option<crate::os::contain::Group>) {
     }
 }
 
+/// U01: a leased process is fenced by containment identity, never a potentially reused PID.
+fn end_failed(pid: u32, group: Option<crate::os::contain::Group>, lease: Option<&super::leases::Lease>) {
+    if let Some(l) = lease {
+        l.control().store(true, std::sync::atomic::Ordering::Release);
+    } else {
+        end_now(pid, group);
+    }
+}
+
 /// Start `spec`; its events go to `events` in order, ending with Exit. `extra_env` comes last
 /// (who asked, the shell's state folder). Returns at once; a failure to start is an Exit with
 /// an error.
 pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_env: Vec<(String, String)>, events: async_channel::Sender<Event>) -> async_channel::Sender<Vec<u8>> {
+    start_inner(spec, cwd, shell_state, extra_env, events, None)
+}
+
+/// U01: the receiver claimed ownership before calling this. The guard survives client output
+/// backpressure, and its drop proves that this task cannot spawn another process.
+pub(crate) fn start_leased(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_env: Vec<(String, String)>, events: async_channel::Sender<Event>, lease: super::leases::Lease) -> async_channel::Sender<Vec<u8>> {
+    start_inner(spec, cwd, shell_state, extra_env, events, Some(lease))
+}
+
+fn start_inner(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_env: Vec<(String, String)>, events: async_channel::Sender<Event>, lease: Option<super::leases::Lease>) -> async_channel::Sender<Vec<u8>> {
     let (stdin_tx, stdin_rx) = async_channel::unbounded::<Vec<u8>>();
+    if let Some(l) = &lease { l.timeout(spec.timeout_ms); }
     crate::rt::spawn(async move {
         let env = login_env().await;
         if let Some(dir) = &shell_state
@@ -402,11 +422,30 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
         }
         // A group of its own where this machine holds processes together (`crate::os::contain`):
         // what it leaves running ends with it, however that's parented (a daemon, `setsid`).
-        let group = crate::os::contain::Group::of(&format!("run-{}", uuid::Uuid::now_v7().simple()));
-        let duplex = match crate::proc::spawn_duplex_in_pool(cmd, group.clone()).await {
+        let group = match &lease {
+            Some(l) => l.group(),
+            None => crate::os::contain::Group::of(&format!("run-{}", uuid::Uuid::now_v7().simple())),
+        };
+        // The lease stays with the actual spawner while joining a paced group can block.
+        // Cancelling this waiter cannot announce an ended spawn before that attempt finishes.
+        let (lease, started) = match lease {
+            Some(l) => match crate::rt::blocking(move || {
+                let started = l.spawn(cmd);
+                l.spawn_complete(started.as_ref().ok().map(|d| d.pid));
+                (Some(l), started)
+            }).await {
+                Ok(started) => started,
+                Err(e) => {
+                    let _ = events.send(Event::Exit { code: None, error: Some(format!("{e:#}")) }).await;
+                    return;
+                }
+            },
+            None => (None, crate::proc::spawn_duplex_in_pool(cmd, group.clone()).await),
+        };
+        let duplex = match started {
             Ok(d) => d,
             Err(e) => {
-                if let Some(g) = group {
+                if lease.is_none() && let Some(g) = group {
                     g.remove();
                 }
                 let _ = events.send(Event::Exit { code: None, error: Some(format!("{e:#}")) }).await;
@@ -415,8 +454,23 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
         };
         // (Windows' has more: its job object.)
         let crate::os::proc::Duplex { pid, stdin, stdout, stderr, exit, .. } = duplex;
+        // U01: shell exit fences descendants even when they inherited output pipes or the
+        // caller stopped reading. Waiting for pipe EOF first could otherwise hold capacity
+        // forever after `background-command &`.
+        let exit = if let Some(l) = &lease {
+            let fence = l.control();
+            let (done, waited) = futures::channel::oneshot::channel();
+            crate::rt::spawn(async move {
+                let code = exit.await.ok().flatten();
+                fence.store(true, std::sync::atomic::Ordering::Release);
+                let _ = done.send(code);
+            });
+            waited
+        } else {
+            exit
+        };
         if events.send(Event::Started { pid, cwd: cwd.to_string_lossy().into_owned() }).await.is_err() {
-            end_now(pid, group);
+            end_failed(pid, group, lease.as_ref());
             return;
         }
         // Input from the asker until it says the end (or the run ends).
@@ -446,7 +500,7 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
                     if err_open {
                         while let Ok(data) = stderr.recv().await {
                             if events.send(Event::Output { stream: Stream::Err, data }).await.is_err() {
-                                end_now(pid, group);
+                                end_failed(pid, group, lease.as_ref());
                                 return;
                             }
                         }
@@ -458,7 +512,7 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
                     if out_open {
                         while let Ok(data) = stdout.recv().await {
                             if events.send(Event::Output { stream: Stream::Out, data }).await.is_err() {
-                                end_now(pid, group);
+                                end_failed(pid, group, lease.as_ref());
                                 return;
                             }
                         }
@@ -467,7 +521,7 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
                 }
                 (stream, Some(data)) => {
                     if events.send(Event::Output { stream, data }).await.is_err() {
-                        end_now(pid, group);
+                        end_failed(pid, group, lease.as_ref());
                         return;
                     }
                 }
@@ -475,7 +529,12 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
         }
         let code = exit.await.ok().flatten();
         // What it left running (`nohup … &`, a daemon) ends with it, before it's said to have ended.
-        let _ = crate::rt::blocking(move || end_leftovers(pid, group)).await;
+        if lease.is_none() {
+            let _ = crate::rt::blocking(move || end_leftovers(pid, group)).await;
+        }
+        // A leased command's guard kills its entire containment and commits the stopped proof
+        // independently. Sending Exit cannot itself release Scheduler capacity.
+        drop(lease);
         let _ = events.send(Event::Exit { code, error: None }).await;
     });
     stdin_tx

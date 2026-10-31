@@ -2,7 +2,7 @@
 //! person turned them on for, the agents they muted, and what was last said of each agent. Every
 //! function here is one statement or two on a connection: call them inside `Store::call`.
 
-use rusqlite::{Connection, OptionalExtension as _, params};
+use crate::sql::{Connection, OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -126,7 +126,7 @@ pub fn check_new(n: &NewDevice, allow: &[String]) -> Result<(String, Vec<String>
 
 const COLUMNS: &str = "id, principal, endpoint, p256dh, auth, device, hears, created_at, last_ok_at, last_error, last_error_at";
 
-fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Device> {
+fn row(r: &crate::sql::Row<'_>) -> crate::sql::Result<Device> {
     let hears: String = r.get(6)?;
     Ok(Device {
         id: r.get(0)?,
@@ -304,21 +304,22 @@ mod tests {
 
     #[test]
     fn a_person_s_marks_are_theirs_kept_a_while_and_a_seen_one_keeps_the_latest() -> anyhow::Result<()> {
-        let c = Connection::open_in_memory()?;
-        c.execute_batch(include_str!("../store/migrations/20261023-1600_notice_marks.sql"))?;
-        let day = 86_400_000;
-        mark(&c, "owner", &["q1".to_owned(), "stopped:ag1:5".to_owned()], "away", 10 * day)?;
-        mark(&c, "user:u1", &["q1".to_owned()], "done", 10 * day)?;
-        mark(&c, "owner", &["seen:ag1".to_owned()], "seen", 12 * day)?;
-        mark(&c, "owner", &["seen:ag1".to_owned()], "seen", 11 * day)?;
-        let got = marked(&c, "owner", &["q1".to_owned(), "seen:ag1".to_owned(), "q9".to_owned()])?;
-        assert_eq!(got, vec![Mark { key: "q1".into(), how: "away".into(), at: 10 * day }, Mark { key: "seen:ag1".into(), how: "seen".into(), at: 12 * day }]);
-        assert_eq!(marks(&c, "user:u1")?.len(), 1, "each person's own");
-        // Past MARK_DAYS a person's marks go.
-        mark(&c, "owner", &["q2".to_owned()], "away", (12 + MARK_DAYS) * day)?;
-        let left: Vec<String> = marks(&c, "owner")?.into_iter().map(|m| m.key).collect();
-        assert_eq!(left, vec!["q2".to_owned(), "seen:ag1".to_owned()]);
-        Ok(())
+        crate::sql::with_memory(|c| {
+            c.execute_batch(include_str!("../store/migrations/20261023-1600_notice_marks.sql"))?;
+            let day = 86_400_000;
+            mark(c, "owner", &["q1".to_owned(), "stopped:ag1:5".to_owned()], "away", 10 * day)?;
+            mark(c, "user:u1", &["q1".to_owned()], "done", 10 * day)?;
+            mark(c, "owner", &["seen:ag1".to_owned()], "seen", 12 * day)?;
+            mark(c, "owner", &["seen:ag1".to_owned()], "seen", 11 * day)?;
+            let got = marked(c, "owner", &["q1".to_owned(), "seen:ag1".to_owned(), "q9".to_owned()])?;
+            assert_eq!(got, vec![Mark { key: "q1".into(), how: "away".into(), at: 10 * day }, Mark { key: "seen:ag1".into(), how: "seen".into(), at: 12 * day }]);
+            assert_eq!(marks(c, "user:u1")?.len(), 1, "each person's own");
+            // Past MARK_DAYS a person's marks go.
+            mark(c, "owner", &["q2".to_owned()], "away", (12 + MARK_DAYS) * day)?;
+            let left: Vec<String> = marks(c, "owner")?.into_iter().map(|m| m.key).collect();
+            assert_eq!(left, vec!["q2".to_owned(), "seen:ag1".to_owned()]);
+            Ok(())
+        })
     }
 
     fn browser(endpoint: &str) -> anyhow::Result<NewDevice> {

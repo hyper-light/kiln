@@ -10,7 +10,7 @@
 //! 1. what a person set for it from the server (Runners, the runner's own section; `PUT
 //!    /api/runners/:name/agent-limit`): kept in the server's `kv` table (`agent_limit/<runner>`),
 //!    sent to its runner as that says it takes it (`CAP_AGENT_LIMIT`) and whenever it changes
-//!    (`ServerMsg::AgentLimit`), and kept by the runner in its state folder for its restarts;
+//!    (`ServerMsg::AgentLimit`), and committed by the runner in its host Amphora machine namespace;
 //! 2. its config's `[agent] max_agent_sessions` (a `kiln agent`'s config file, read again within
 //!    seconds of a change; the server's own `kiln.toml` for the server's own agents, read as it
 //!    starts);
@@ -22,8 +22,11 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use anyhow::Context as _;
 use http::StatusCode;
+use kiln_seams::records::{Cond, Consistency, Records, Refusal, Tx, Write};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -87,28 +90,128 @@ pub fn held(asked: Asked, config: Option<usize>) -> Held {
 
 // ------------------------------------------------------------------------------ on the runner
 
-/// Where a machine keeps what was set for it from the server: its state folder, which each of its
-/// runner processes shares (a new build taking over reads it too).
+/// U17: retired read-only input; accepted policy now shares the host machine namespace.
 fn kept_path(state_dir: &Path) -> PathBuf {
     state_dir.join("agent-limit.json")
 }
 
-/// What was set for this machine from the server, as it kept it: none when nothing was, or it can't
-/// be read. Blocking.
-pub fn kept(state_dir: &Path) -> Asked {
-    std::fs::read(kept_path(state_dir)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+const POLICY_FAMILY: &str = "agent-limit";
+const POLICY_KEY: &[u8] = b"accepted-v1";
+const POLICY_BYTES: u64 = 4096;
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Accepted {
+    version: u32,
+    /// None records that the legacy file was absent; otherwise its exact SHA256.
+    legacy_sha256: Option<String>,
+    asked: Asked,
 }
 
-/// `asked` kept for this machine's restarts (none: what was kept goes). Blocking.
-pub fn keep(state_dir: &Path, asked: Asked) -> std::io::Result<()> {
-    let path = kept_path(state_dir);
-    if asked.max_sessions.is_none() {
-        return match std::fs::remove_file(&path) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
-            _ => Ok(()),
-        };
+fn checked(asked: Asked) -> anyhow::Result<Asked> {
+    if let Some(n) = asked.max_sessions { valid(n).map_err(anyhow::Error::msg)?; }
+    Ok(asked)
+}
+
+impl Accepted {
+    fn decode(bytes: &[u8]) -> anyhow::Result<Self> {
+        anyhow::ensure!(bytes.len() <= POLICY_BYTES as usize, "U17 agent limit record exceeds its bound");
+        let value: Self = serde_json::from_slice(bytes).context("U17 unreadable accepted agent limit")?;
+        anyhow::ensure!(value.version == 1, "U17 unsupported agent limit record version");
+        anyhow::ensure!(value.legacy_sha256.as_ref().is_none_or(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))), "U17 invalid agent limit import receipt");
+        checked(value.asked)?;
+        Ok(value)
     }
-    crate::util::write_secret(&path, &serde_json::to_vec(&asked)?, 0o644)
+}
+
+/// Bounded, strict and read-only: malformed policy must never become an empty policy.
+fn legacy_policy(path: &Path) -> anyhow::Result<(Asked, Option<String>)> {
+    use std::io::Read as _;
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Asked::default(), None)),
+        Err(e) => return Err(e).context("U17 cannot inspect legacy agent limit"),
+    };
+    anyhow::ensure!(metadata.is_file() && metadata.len() <= POLICY_BYTES, "U17 legacy agent limit must be a regular file of at most {POLICY_BYTES} bytes");
+    let file = std::fs::File::open(path).context("U17 cannot read legacy agent limit")?;
+    anyhow::ensure!(file.metadata()?.is_file(), "U17 legacy agent limit is not a regular file");
+    let mut bytes = Vec::new();
+    file.take(POLICY_BYTES + 1).read_to_end(&mut bytes)?;
+    anyhow::ensure!(bytes.len() <= POLICY_BYTES as usize, "U17 legacy agent limit exceeds {POLICY_BYTES} bytes");
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Legacy {
+        #[serde(default)]
+        max_sessions: Option<usize>,
+    }
+    let value: Legacy = serde_json::from_slice(&bytes).context("U17 unreadable legacy agent limit")?;
+    Ok((checked(Asked { max_sessions: value.max_sessions })?, Some(crate::util::sha256_hex(&bytes))))
+}
+
+/// U17: accepted runner projection, separate from the server's authoritative desired policy.
+/// The existing Records adapter moves every metadata call off the runtime shard.
+pub struct RunnerPolicy {
+    records: Arc<dyn Records>,
+    accepted: Asked,
+}
+
+impl RunnerPolicy {
+    /// Complete policy load/import before restoring sessions. No unreadable-state fallback.
+    pub async fn from_database(database: &amphora::database::Database, namespace: &str, state_dir: &Path) -> anyhow::Result<Self> {
+        Self::load(Arc::new(crate::records::from_database(database, namespace)?), kept_path(state_dir)).await
+    }
+
+    async fn load(records: Arc<dyn Records>, path: PathBuf) -> anyhow::Result<Self> {
+        for _ in 0..8 {
+            if let Some(row) = records.get(POLICY_FAMILY, POLICY_KEY, Consistency::Linearizable).await? {
+                return Ok(Self { accepted: Accepted::decode(&row.value)?.asked, records });
+            }
+            let source = path.clone();
+            let (asked, legacy_sha256) = crate::rt::blocking(move || legacy_policy(&source)).await??;
+            let source = path.clone();
+            let checked_source = crate::rt::blocking(move || legacy_policy(&source)).await??;
+            anyhow::ensure!(checked_source == (asked, legacy_sha256.clone()), "U17 legacy agent limit changed during import");
+            let value = serde_json::to_vec(&Accepted { version: 1, legacy_sha256, asked })?;
+            let tx = Tx {
+                conds: vec![Cond::Absent { family: POLICY_FAMILY.into(), key: POLICY_KEY.into() }],
+                writes: vec![Write::Put { family: POLICY_FAMILY.into(), key: POLICY_KEY.into(), value }],
+            };
+            // The import receipt and accepted value publish together; no partial import exists.
+            match records.commit(tx).await {
+                Ok(_) => return Ok(Self { records, accepted: asked }),
+                Err(Refusal::Conflict { .. }) => continue,
+                Err(e) => return Err(e).context("U17 agent limit import was not acknowledged"),
+            }
+        }
+        anyhow::bail!("U17 agent limit import conflicted repeatedly")
+    }
+
+    pub fn asked(&self) -> Asked { self.accepted }
+
+    /// Commit before publishing or acknowledging. Failure preserves this process's last held
+    /// policy, including an ambiguous commit outcome; a fresh load reconciles durable state.
+    pub async fn accept(&mut self, asked: Asked) -> anyhow::Result<Asked> {
+        let asked = checked(asked)?;
+        for _ in 0..8 {
+            let row = self.records.get(POLICY_FAMILY, POLICY_KEY, Consistency::Linearizable).await?.ok_or_else(|| anyhow::anyhow!("U17 accepted agent limit disappeared"))?;
+            let mut value = Accepted::decode(&row.value)?;
+            if value.asked != asked {
+                value.asked = asked;
+                let tx = Tx {
+                    conds: vec![Cond::At { family: POLICY_FAMILY.into(), key: POLICY_KEY.into(), rev: row.rev }],
+                    writes: vec![Write::Put { family: POLICY_FAMILY.into(), key: POLICY_KEY.into(), value: serde_json::to_vec(&value)? }],
+                };
+                match self.records.commit(tx).await {
+                    Ok(_) => {},
+                    Err(Refusal::Conflict { .. }) => continue,
+                    Err(e) => return Err(e).context("U17 agent limit update was not acknowledged"),
+                }
+            }
+            self.accepted = asked;
+            return Ok(asked);
+        }
+        anyhow::bail!("U17 agent limit update conflicted repeatedly")
+    }
 }
 
 /// The config file at `path`'s `[agent] max_agent_sessions` (`Some(None)`: it says none, or there's
@@ -357,6 +460,11 @@ pub async fn put(hub: &Hub, name: &str, req: Request) -> Answer {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use futures::future::BoxFuture;
+    use kiln_seams::records::{Changes, Page, Rev, Row, Scan, SimRecords};
+
     use super::*;
 
     /// What's set from the server wins over the config's, which wins over kiln's default; a number
@@ -399,20 +507,81 @@ mod tests {
         assert!(asked_of(&json!({"max_session": 128})).is_err_and(|e| e.contains("\"max_session\" isn't one")));
     }
 
-    /// What was set from the server is kept on the machine for its restarts, and goes once nothing
-    /// is set; what can't be read is nothing kept.
+    /// U17: import is read-only, and clearing policy remains durable across real host reopens;
+    /// the retired legacy value must never resurrect what the server has cleared.
     #[test]
-    fn a_machine_keeps_what_was_set_for_its_restarts() -> anyhow::Result<()> {
+    fn u17_agent_limit_a_machine_keeps_what_was_set_for_its_restarts() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        assert_eq!(kept(dir.path()), Asked::default(), "nothing kept yet");
-        keep(dir.path(), Asked { max_sessions: Some(200) })?;
-        assert_eq!(kept(dir.path()), Asked { max_sessions: Some(200) });
-        keep(dir.path(), Asked::default())?;
-        assert_eq!(kept(dir.path()), Asked::default());
-        keep(dir.path(), Asked::default())?;
-        std::fs::write(kept_path(dir.path()), "not json")?;
-        assert_eq!(kept(dir.path()), Asked::default());
+        let legacy = br#"{"max_sessions":200}"#;
+        std::fs::write(kept_path(dir.path()), legacy)?;
+        let path = dir.path().join("kiln.db");
+        let store = crate::store::Store::open(&path)?;
+        let state_dir = dir.path().to_owned();
+        crate::rt::block_on(async move {
+            let mut policy = RunnerPolicy::from_database(&store.database(), "machine.test-limit", &state_dir).await?;
+            assert_eq!(policy.asked(), Asked { max_sessions: Some(200) });
+            assert_eq!(policy.accept(Asked { max_sessions: Some(2) }).await?, Asked { max_sessions: Some(2) });
+            policy.accept(Asked::default()).await?;
+            anyhow::Ok(())
+        })?;
+        assert_eq!(std::fs::read(kept_path(dir.path()))?, legacy.to_vec(), "legacy input was never rewritten or removed");
+        let store = crate::store::Store::open(&path)?;
+        let state_dir = dir.path().to_owned();
+        crate::rt::block_on(async move {
+            let policy = RunnerPolicy::from_database(&store.database(), "machine.test-limit", &state_dir).await?;
+            assert_eq!(policy.asked(), Asked::default(), "clear is canonical even while old JSON still says 200");
+            anyhow::Ok(())
+        })?;
         Ok(())
+    }
+
+    #[test]
+    fn u17_agent_limit_bad_legacy_refuses_without_a_receipt() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let records = Arc::new(SimRecords::default());
+        crate::rt::block_on(async move {
+            for bad in ["not json".to_owned(), r#"{"max_sessions":0}"#.to_owned(), r#"{"max_sessions":4097}"#.to_owned(), r#"{"max_session":2}"#.to_owned(), r#"{"max_sessions":2,"max_sessions":3}"#.to_owned(), " ".repeat(POLICY_BYTES as usize + 1)] {
+                std::fs::write(kept_path(dir.path()), bad)?;
+                assert!(RunnerPolicy::load(records.clone(), kept_path(dir.path())).await.is_err());
+                assert_eq!(records.head().await?, 0, "invalid input must not publish an import receipt");
+            }
+            anyhow::Ok(())
+        })
+    }
+
+    /// A failed commit must leave the effective policy and the next process's loaded policy at
+    /// the last accepted value; even initial import failure must prevent policy construction.
+    #[test]
+    fn u17_agent_limit_commit_refusal_keeps_last_held_policy() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let records = Arc::new(RefusingCommits { inner: SimRecords::default(), fail: AtomicBool::new(true) });
+        crate::rt::block_on(async move {
+            assert!(RunnerPolicy::load(records.clone(), kept_path(dir.path())).await.is_err());
+            assert_eq!(records.head().await?, 0);
+            records.fail.store(false, Ordering::SeqCst);
+            let mut policy = RunnerPolicy::load(records.clone(), kept_path(dir.path())).await?;
+            let accepted = Asked { max_sessions: Some(2) };
+            policy.accept(accepted).await?;
+            records.fail.store(true, Ordering::SeqCst);
+            assert!(policy.accept(Asked { max_sessions: Some(200) }).await.is_err());
+            assert_eq!(policy.asked(), accepted);
+            assert_eq!(held(policy.asked(), None).max_sessions, 2);
+            let restarted = RunnerPolicy::load(records.clone(), kept_path(dir.path())).await?;
+            assert_eq!(restarted.asked(), accepted);
+            anyhow::Ok(())
+        })
+    }
+
+    struct RefusingCommits { inner: SimRecords, fail: AtomicBool }
+    impl Records for RefusingCommits {
+        fn get<'a>(&'a self, family: &'a str, key: &'a [u8], at: Consistency) -> BoxFuture<'a, Result<Option<Row>, Refusal>> { self.inner.get(family, key, at) }
+        fn scan<'a>(&'a self, family: &'a str, scan: Scan) -> BoxFuture<'a, Result<Page, Refusal>> { self.inner.scan(family, scan) }
+        fn commit(&self, tx: Tx) -> BoxFuture<'_, Result<Rev, Refusal>> {
+            if self.fail.load(Ordering::SeqCst) { Box::pin(async { Err(Refusal::Unavailable("injected policy commit failure".into())) }) } else { self.inner.commit(tx) }
+        }
+        fn changes<'a>(&'a self, family: &'a str, after: Rev, limit: usize) -> BoxFuture<'a, Result<Changes, Refusal>> { self.inner.changes(family, after, limit) }
+        fn wait<'a>(&'a self, family: &'a str, after: Rev) -> BoxFuture<'a, Result<Rev, Refusal>> { self.inner.wait(family, after) }
+        fn head(&self) -> BoxFuture<'_, Result<Rev, Refusal>> { self.inner.head() }
     }
 
     /// A runner's config is read again as it changes; one that can't be read keeps the last.

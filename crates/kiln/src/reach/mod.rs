@@ -9,6 +9,7 @@ pub mod e2e;
 pub mod keep;
 pub mod keeper;
 pub mod local;
+pub mod leases;
 #[cfg(unix)]
 pub mod mcp;
 pub mod node;
@@ -89,6 +90,12 @@ pub enum Question {
         code: crate::wire::unread::Code,
         #[serde(default)]
         why: String,
+    },
+    /// U01: the authenticated runner's resource request. The common CI Scheduler owns
+    /// action validation, admission, durable claim and termination proof.
+    Admission {
+        #[serde(flatten)]
+        ask: serde_json::Map<String, serde_json::Value>,
     },
 }
 

@@ -242,7 +242,7 @@ pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, ask: &crate::reach::Questi
         Question::Registry { session, terminal } | Question::Call { session, terminal, .. } => (session.as_str(), terminal.as_str()),
         Question::Page { session, .. } | Question::Stream { session, .. } => (session.as_str(), ""),
         // The hub answers these itself (`Hub::on_read`).
-        Question::Keep { .. } | Question::Holds { .. } | Question::Holders { .. } => return json!({"error": "not a question for kiln's operations"}),
+        Question::Admission { .. } | Question::Keep { .. } | Question::Holds { .. } | Question::Holders { .. } => return json!({"error": "not a question for kiln's operations"}),
     };
     // The person in one of its kiln shells (`kiln spawn --on`, `kiln agents wait`), for a call.
     let caller = if session.is_empty() && !terminal.is_empty() && matches!(ask, Question::Call { .. }) {
@@ -262,20 +262,18 @@ pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, ask: &crate::reach::Questi
             let tools: Vec<&str> = agent_ops().iter().map(|o| o.name).collect();
             json!({"registry": code::registry(hub), "skills": skills, "agent_tools": tools})
         }
-        Question::Call { name, input, .. } => match crate::ops::misfit(&caller, name, input) {
-            // An input that doesn't fit the operation: refused saying where and why, and noted,
-            // on the runner's page too.
-            Some(m) => {
+        Question::Call { name, input, .. } => match crate::ops::call_checked(crate::ops::Cx { hub: Arc::clone(hub), caller: caller.clone() }, name, input.clone()).await {
+            Ok(v) => json!({"ok": v}),
+            Err(crate::ops::CallError::Failed((status, msg))) => json!({"error": msg, "status": status.as_u16()}),
+            // Authorization and the canonical operation audit have completed before this
+            // protocol-specific note and structured answer are produced.
+            Err(crate::ops::CallError::Misfit(m)) => {
                 let mut a = misfit(hub, crate::wire::unread::Wire::McpReach, &caller, &format!("tools/call {}", tool_name(name)), name, &m, Some(crate::wire::unread::Page::Runner(runner.to_owned()))).await;
                 if let Some(o) = a.as_object_mut() {
                     o.insert("status".into(), json!(StatusCode::BAD_REQUEST.as_u16()));
                 }
                 a
             }
-            None => match crate::ops::call(crate::ops::Cx { hub: Arc::clone(hub), caller }, name, input.clone()).await {
-                Ok(v) => json!({"ok": v}),
-                Err((status, msg)) => json!({"error": msg, "status": status.as_u16()}),
-            },
         },
         // A page it shows in its conversation (`crate::harness::visuals`), or one it streams
         // live there (`crate::harness::streams`): its own session's, audited as the agent acting
@@ -309,7 +307,7 @@ pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, ask: &crate::reach::Questi
         }
         Question::Directory => json!({ "runners": hub.reach_directory() }),
         Question::Unread { session, what, code, why } => runner_unread(hub, runner, session, what, *code, why).await,
-        Question::Keep { .. } | Question::Holds { .. } | Question::Holders { .. } => json!({"error": "not a question for kiln's operations"}),
+        Question::Admission { .. } | Question::Keep { .. } | Question::Holds { .. } | Question::Holders { .. } => json!({"error": "not a question for kiln's operations"}),
     };
     let size = answer.to_string().len();
     if size > RUNNER_ANSWER_MAX {
@@ -697,14 +695,10 @@ impl Server {
                 let Some(op) = crate::ops::all(&self.hub).into_iter().find(|o| tool_name(o.name) == name) else {
                     return tool_error(&format!("no tool {name}"));
                 };
-                // An input that doesn't fit the operation: a tool error saying where and why, so
-                // the model can correct it; noted.
-                if let Some(m) = crate::ops::misfit(&self.caller, op.name, &args) {
-                    return tool_error_value(misfit(&self.hub, crate::wire::unread::Wire::McpHttp, &self.caller, &format!("tools/call {name}"), op.name, &m, None).await);
-                }
-                match crate::ops::call(cx, op.name, args).await {
+                match crate::ops::call_checked(cx, op.name, args).await {
                     Ok(v) => tool_ok(v),
-                    Err((_, e)) => tool_error(&e),
+                    Err(crate::ops::CallError::Failed((_, e))) => tool_error(&e),
+                    Err(crate::ops::CallError::Misfit(m)) => tool_error_value(misfit(&self.hub, crate::wire::unread::Wire::McpHttp, &self.caller, &format!("tools/call {name}"), op.name, &m, None).await),
                 }
             }
         }

@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 
 use http::StatusCode;
-use rusqlite::{OptionalExtension, params};
+use crate::sql::{OptionalExtension, params};
 use serde_json::{Value, json};
 
 use super::Fail;

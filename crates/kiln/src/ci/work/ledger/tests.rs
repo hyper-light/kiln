@@ -603,8 +603,8 @@ fn w24_ac10_results_copied_into_records_are_each_found() -> anyhow::Result<()> {
 /// AC10's 5 ms is held on the table (`ci::work`'s `w24_ac10_lookup_p99_under_5ms`), the ledger's
 /// system of record. A lookup on Records is its seam's calls one after another (the weak key's
 /// listing, a path set, a result, what's kept beside it, and its hit counted, a commit), each a
-/// trip to the store's thread. This holds it under twice AC10's bound, against regressions, until
-/// the ledger moves onto Records and Amphora's (CP-T1.5) is measured against AC10 itself.
+/// trip through the shared Amphora store. This holds the alternative seam implementation under
+/// twice AC10's bound against regressions; production remains the table in that same database.
 ///
 /// A latency benchmark: on a machine busy with other work (the gate runs at the lowest priority
 /// beside it, by design) a p99 says how busy the machine is (14 to 25 ms on adacachy, p50 under

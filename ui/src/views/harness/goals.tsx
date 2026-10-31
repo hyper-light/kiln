@@ -19,7 +19,7 @@ import { clientId, harnessApi, type GoalItem, type GoalStack, type SessionStore 
 import { Button } from "@/components/ui/button";
 import { toast } from "@/components/ui/toast";
 import { Loadable } from "@/components/ui/loading";
-import { harnessSessionsRes, useRes } from "@/lib/data";
+import { useHarnessSessions } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { ApiError } from "@/api/client";
 import { planHref, plansApi, runHref } from "@/api/plans";
@@ -120,7 +120,7 @@ function usePlanned(goal: GoalItem, items: GoalItem[], paused: boolean, agent: s
   const p = usePlan(goal.planned_as ?? "");
   const run = items.find((i) => i.part_of === goal.id && i.waits_on)?.waits_on;
   const view = useRunView(run);
-  const sessions = useRes(harnessSessionsRes).data;
+  const sessions = useHarnessSessions().data;
   const own = whoOf(sessions.find((x) => x.id === agent));
   if (!p || p === "gone") return null;
   const planning = p.phase === "planning" && !run && !items.some((i) => i.part_of === goal.id && i.part_kind === "plan");
@@ -198,7 +198,7 @@ function PlannedSteps({
   again?: React.ReactNode;
 }) {
   const planned = usePlanned(goal, items, paused, agent, planner);
-  const name = useRes(harnessSessionsRes).data.find((x) => x.id === agent)?.name || "the agent";
+  const name = useHarnessSessions().data.find((x) => x.id === agent)?.name || "the agent";
   if (!planned?.steps.length) return null;
   // The steps written: the subagent said so (its calls), or the plan has them.
   const wrote = (planner?.kind !== "asked" && planner?.wrote) || (planned.plan.items?.length ?? 0) > 0 || planned.plan.steps.length > 0;
@@ -219,7 +219,7 @@ const STEP_SAID = /^"[^"]*" \(step \d+ of the plan "[^"]*"\), /;
 
 /** The parts a goal was split into (or a plan step's criteria and tests), under it on its line, each in turn. */
 function PartSteps({ parts, items, paused, agent }: { parts: GoalItem[]; items: GoalItem[]; paused: boolean; agent: string }) {
-  const own = whoOf(useRes(harnessSessionsRes).data.find((x) => x.id === agent));
+  const own = whoOf(useHarnessSessions().data.find((x) => x.id === agent));
   const steps: GoalStep[] = parts.map((p, i) => ({
     n: i + 1,
     title: p.text.replace(STEP_SAID, ""),
@@ -241,7 +241,7 @@ function AgentLabel({ id }: { id: string }) {
 }
 
 function AgentName({ id }: { id: string }) {
-  const name = useRes(harnessSessionsRes).data.find((a) => a.id === id)?.name;
+  const name = useHarnessSessions().data.find((a) => a.id === id)?.name;
   return <>{name || `agent ${id.slice(0, 8)}`}</>;
 }
 
