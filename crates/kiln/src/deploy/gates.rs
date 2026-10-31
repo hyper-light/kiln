@@ -265,6 +265,10 @@ async fn judge(d: &Deploy, r: &Release, env: &Environment, app: &App, checks: &[
                         format!("{version} doesn't run in {upstream} ({there} does): release it there first")
                     };
                     evidence.insert("runs".into(), json!(there));
+                    // What runs there, by its images: what a promotion refused names (W27-R08).
+                    if let Some(x) = up.running.as_ref() {
+                        evidence.insert("artifacts".into(), json!(x.artifacts));
+                    }
                     results.push(result(&gate, false, why.clone(), Value::Object(evidence)));
                     return Ok(Verdict::Refuse { results, why });
                 }

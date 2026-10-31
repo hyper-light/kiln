@@ -96,6 +96,10 @@ struct State {
     receipts: BTreeMap<(String, u64), String>,
     outbox: VecDeque<String>,
     sent: VecDeque<String>,
+    /// The machine's runner role, handed to this process (a blue/green upgrade's new build) by the
+    /// one it took over from: its hand-on, to answer with this process's receipt once its own
+    /// identity is certified ([`role_due`]).
+    role: Option<Value>,
     /// What's sent once, not again after a reconnect: a hand-over's word refused here.
     once: VecDeque<String>,
 }
@@ -537,6 +541,75 @@ pub fn closed(session: &str) {
     st.handed.remove(session);
     st.running.remove(session);
     st.due.remove(session);
+}
+
+/// A machine's runner role, the thing a hand-over of it is about (docs/ci.md W27-R08; the
+/// Transfers plan's step 8): "runner role of <machine>", by a digest of its organization and
+/// machine, which the process handing it on and the one taking it work out alike.
+pub fn role(org: &str, machine: &str) -> Subject {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(format!("kiln-runner-role/{org}/{machine}").as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+    Subject { name: format!("runner role of {machine}"), digest: BTreeMap::from([("sha256".to_owned(), digest)]), ..Subject::default() }
+}
+
+/// (A blue/green upgrade's runner being upgraded.) Its hand-on of the machine's runner role to the
+/// new build, runner process `to` of this machine (its instance), signed as this process's runner
+/// identity: kept to send to the server, and given to the new build, which answers it with its
+/// receipt ([`role_taken`]). None when this process holds no certified identity, or (logged) its
+/// signature failed.
+#[cfg(unix)]
+pub fn role_hand_on(to: &str) -> Option<String> {
+    use kiln_ci::identity::chain::{Actor, Identity};
+    let by = identity::uri("runner")?;
+    let me = Identity::parse(&by).ok()?;
+    let Actor::Runner { enrolled_by, machine, .. } = &me.actor else { return None };
+    let green = Identity::new(me.org.clone(), Actor::Runner { enrolled_by: enrolled_by.clone(), machine: machine.clone(), instance: to.to_owned() }).uri().ok()?;
+    let b = Body { to: Some(green), why: format!("a blue/green upgrade of {machine}: its new build holds its runner role"), ..Body::new(Kind::HandedOn, "") };
+    match sign("runner", &by, &Statement { subject: vec![role(&me.org, machine)], ..Statement::new(to_value(&b)) }) {
+        Ok(bundle) => {
+            queue(&bundle);
+            Some(bundle.to_string())
+        }
+        Err(e) => {
+            tracing::warn!(target: "kiln.custody", error = %format!("{e:#}"), "the runner role's hand-on to the new build couldn't be signed");
+            None
+        }
+    }
+}
+
+/// (A blue/green upgrade's new build.) The machine's runner role, handed to this process by the one
+/// it took over from (`hand_on`, its bundle as JSON): answered with this process's receipt, signed
+/// as its runner identity once that's certified ([`role_due`]), both sent to the server.
+#[cfg(unix)]
+pub fn role_taken(hand_on: &str) {
+    let Ok(h) = serde_json::from_str::<Value>(hand_on) else {
+        tracing::warn!(target: "kiln.custody", "the runner role's hand-on from the runner taken over from can't be read: no receipt signed");
+        return;
+    };
+    STATE.lock().role = Some(h);
+    role_due();
+}
+
+/// The runner role's receipt, signed once this process's runner identity is certified (as it
+/// connects, and again on each connection): called as an identity is given, and on each beat.
+pub fn role_due() {
+    let Some(h) = STATE.lock().role.clone() else { return };
+    let Some(by) = identity::uri("runner") else { return };
+    let (Some(s), Some(from)) = (statement_of(&h), giver_of(&h)) else {
+        STATE.lock().role = None;
+        return;
+    };
+    let b = Body { from: Some(from), why: "this process holds the machine's runner role".into(), ..Body::new(Kind::Received, "") };
+    match sign("runner", &by, &Statement { subject: s.subject, follows: vec![digest_of(&h)], ..Statement::new(to_value(&b)) }) {
+        Ok(receipt) => {
+            let mut st = STATE.lock();
+            st.role = None;
+            st.outbox.push_back(h.to_string());
+            st.outbox.push_back(receipt.to_string());
+            tracing::info!(target: "kiln.custody", "signed for the machine's runner role, handed on by the runner taken over from");
+        }
+        Err(e) => tracing::warn!(target: "kiln.custody", error = %format!("{e:#}"), "the runner role's receipt couldn't be signed: tried again at the next beat"),
+    }
 }
 
 /// The records to send now, oldest first: each kept, to send again after a reconnect, but a

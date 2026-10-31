@@ -16,6 +16,8 @@
 //!   before its commit ([`external`]: the checks that ask a URL or run a workflow; [`link`]: linked
 //!   kiln servers, whose signed statements prove an `after`).
 //! - [`flow`]: releases, from request to landed, and the worker that follows them.
+//! - [`promotion`]: a promotion as a transfer, CD's hand-on for the environment it leaves and its
+//!   receipt for the one it reaches (docs/ci.md W27-R08).
 //! - [`scaffold`]: an app's source repository, made from its template's starter; [`init`]: its
 //!   chart on kiln's base chart (`kiln app init`).
 //! - [`api`], [`cli`], [`ops`]: `/api/deploy`, `kiln deploy` and `kiln app`, and the `deploy.*`
@@ -40,6 +42,7 @@ pub mod model;
 pub mod moves;
 pub mod ops;
 pub mod preflight;
+pub mod promotion;
 pub mod provider;
 pub mod reads;
 pub mod remote;

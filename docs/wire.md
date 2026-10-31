@@ -383,6 +383,7 @@ takes a new bit, never one that means something already, even in the other direc
 | 38 | `CAP_IDENTITY` | `AgentMsg::Caps`, `ServerMsg::Caps` | identities: the runner asks for certificates for keys it makes and keeps, the server issues them (`Identity`; ci.md W27-R01) |
 | 42 | `CAP_AGENT_GIT` | `ServerMsg::Caps` | the server gives an agent session its own git credential for kiln's repositories (`agents.credential`), so the runner sets its sessions' git to push as the agent (ci.md W27-R03) |
 | 43 | `CAP_LEG_SIGNS` | `AgentMsg::Caps`, `ServerMsg::Caps` | a leg signs as itself what it hands on: its results at its end, and the provenance kiln writes of what it built (`LegResults`, `SignAsLeg`, `LegSignature`; ci.md W27-R05, R06) |
+| 44 | `CAP_CUSTODY` | `AgentMsg::Caps`, `ServerMsg::Caps` | custody: the runner signs its sessions' hand-overs and acts and takes work handed to them signed, and checks the server's words on a hand-over; the server takes custody records and signed acts, signs its words and hands work on signed (`Custody` both ways, `ReachAsk`'s `act`, `HarnessCmd`'s `word`, `Identity`'s `hand_on` and `receipt`; ci.md W27-R08) |
 
 Bits from 44 are free. Take the next one, and add its row here in the same change.
 

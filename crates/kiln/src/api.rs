@@ -610,7 +610,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::POST, ["api", "updates", "binaries"]) => boxed(|| upload_binary(&hub, &q, req)).await,
         (&Method::DELETE, ["api", "updates", "binaries", target]) => boxed(|| delete_binary(&hub, target)).await,
         (&Method::GET, ["api", "updates", "jobs", id]) => match hub.updates.job(id) {
-            Some(j) => Ok(srv::json(StatusCode::OK, &j)),
+            Some(j) => boxed(|| update_job(&hub, j)).await,
             None => Err(err(StatusCode::NOT_FOUND, "no such upgrade")),
         },
         (&Method::GET, ["api", "metrics", "history"]) => Ok(history(&hub, &q)),
@@ -3864,6 +3864,21 @@ async fn set_skew(hub: &Arc<Hub>, req: Request) -> R {
     hub.store.audit("admin".into(), "upgrade.skew".into(), format!("full within {} commits, upgrade within {}", t.full, t.upgrade)).await;
     hub.emit(&crate::wire::events::ServerEvent::Updates);
     Ok(srv::status(StatusCode::NO_CONTENT))
+}
+
+/// `GET /api/updates/jobs/{id}`: the upgrade, and, a runner's blue/green one, its replant's record
+/// of what it handed on (docs/ci.md W27-R08; the Transfers plan's step 8): its machine's runner role
+/// and its agent sessions, each a transfer signed by both sides (`transfers`), and what moved
+/// without one (`moved_without_a_transfer`).
+async fn update_job(hub: &Arc<Hub>, j: crate::updates::Job) -> R {
+    let mut v = serde_json::to_value(&j).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if let Some((machine, since, sessions)) = crate::updates::Updates::replant(&j) {
+        let r = crate::custody::replanted(&hub.store, &hub.pki.ca_der, &hub.pki.organization(), &machine, since, &sessions).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+        if let (Some(o), Some(r)) = (v.as_object_mut(), r.as_object()) {
+            o.extend(r.clone());
+        }
+    }
+    Ok(srv::json(StatusCode::OK, &v))
 }
 
 /// `DELETE /api/updates/skew`: back to what kiln.toml says.

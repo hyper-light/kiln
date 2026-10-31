@@ -738,6 +738,59 @@ fn w27_r08_session_hand_overs() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// W27-R08 (the Transfers plan's step 8): a replant moves box-a's runner, blue/green, onto the
+/// server's build while it holds two agent sessions. The upgrade's record (its job) lists the
+/// machine's runner role, handed on by the process replaced and received by its new build, and each
+/// session, each a transfer signed by both sides; nothing moved without one.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "needs a release build: an upgrade downloads the server's own kiln, and a debug one is larger than kiln serves (updates::MAX_BINARY)")]
+fn w27_r08_replant() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))?;
+    let s = start(dir.path(), &Options::default())?;
+    let (port, admin) = (s.port, s.admin.as_str());
+    let _harnesses = Harnesses::new(&dir.path().join("work-here"), &dir.path().join("home"))?;
+    // box-a runs a build of its own (this one, a byte longer), so the server's is newer to it.
+    let before_build = dir.path().join("kiln-before");
+    let mut bytes = std::fs::read(env!("CARGO_BIN_EXE_kiln"))?;
+    bytes.push(0);
+    std::fs::write(&before_build, bytes)?;
+    std::fs::set_permissions(&before_build, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
+    let (_box_a, log) = supervised(dir.path(), port, "box-a", &before_build, &[])?;
+    agents::connected(port, admin, "box-a", &log, Duration::from_secs(60))?;
+    let cwd = dir.path().join("work-here");
+    std::fs::create_dir_all(&cwd)?;
+    let ids = [agents::open_session(port, admin, "box-a", &cwd, Duration::from_secs(60))?, agents::open_session(port, admin, "box-a", &cwd, Duration::from_secs(60))?];
+    // The replant: box-a moved onto the server's build.
+    let (st, body) = http(port, "POST", "/api/updates/runners/box-a", admin, None)?;
+    anyhow::ensure!(st == 202, "{st} {body}");
+    let job = serde_json::from_str::<Value>(&body)?.get("id").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let mut seen = Value::Null;
+    let v = until(Duration::from_secs(300), || {
+        let (st, body) = http(port, "GET", &format!("/api/updates/jobs/{job}"), admin, None)?;
+        let v: Value = if st == 200 { serde_json::from_str(&body)? } else { Value::Null };
+        seen = v.clone();
+        let n = v.get("transfers").and_then(Value::as_array).map_or(0, Vec::len);
+        Ok((field(&v, "state") == "done" && n == 1 + ids.len()).then_some(v))
+    })
+    .map_err(|e| {
+        let text = std::fs::read_to_string(dir.path().join("box-a.log")).unwrap_or_default();
+        let hits: Vec<&str> = text.lines().filter(|l| ["upgrad", "green", "hand", "custody", "role", "promot", "WARN", "ERROR"].iter().any(|w| l.contains(w))).collect();
+        anyhow::anyhow!("{e}\njob: {seen}\nbox-a:\n{}", hits.get(hits.len().saturating_sub(60)..).unwrap_or(&[]).join("\n"))
+    })?;
+    assert_eq!(v.get("moved_without_a_transfer"), Some(&json!([])), "{v}");
+    let transfers = v.get("transfers").and_then(Value::as_array).cloned().unwrap_or_default();
+    let of = |what: &str| transfers.iter().find(|t| field(t, "what") == what).cloned().unwrap_or_default();
+    let role = of("runner role of box-a");
+    assert!(field(&role, "from").ends_with("/machine/box-a/instance/main"), "the process replaced hands the role on: {v}");
+    assert!(field(&role, "to").contains("/machine/box-a/instance/") && !field(&role, "to").ends_with("/instance/main"), "its new build holds it: {v}");
+    for id in &ids {
+        let t = of(&format!("session {id}"));
+        assert!(field(&t, "from").contains(&format!("/agent/{id}/epoch/")) && field(&t, "from").ends_with("/machine/box-a/instance/main"), "{id} handed on by the process replaced: {v}");
+        assert!(field(&t, "to").contains(&format!("/agent/{id}/epoch/")) && !field(&t, "to").ends_with("/instance/main"), "{id} received by its new build: {v}");
+    }
+    Ok(())
+}
+
 /// The hand-overs kiln recorded as unsigned, for session `id`, once there are `n`.
 #[cfg(feature = "chaos")]
 fn unsigned_of(dir: &Path, port: u16, admin: &str, id: &str, n: usize) -> anyhow::Result<Vec<Value>> {

@@ -9235,6 +9235,18 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
   kiln's for them, as for work; an agent taker's receipt is asked of its runner. Once a change has
   changed hands, what its former author does as its author (a version pushed, an abandon, a give) is
   refused, saying who its author is now, and recorded with the transfer that superseded them.
+- *Promotions and the replant* (step 8): a deploy promoted from an environment of this server's
+  (its `after` passed there, or `promote_from` named it) is a transfer signed by CD for each
+  environment (`deploy::promotion`, docs/deploy-api.md §9.2): CD's hand-on for the one it leaves as
+  the release goes, naming its images by digest, kept on the release as its `promotion` gate, and
+  CD's receipt for the one it reaches as it lands, the same digests; each record names its
+  environment as its `component`. One whose version or images aren't what runs upstream is refused
+  as a promotion and recorded with both sides' digests. In a replant, each runner's blue/green
+  upgrade hands on its machine's runner role too: the runner upgraded signs its hand-on to the new
+  build as its runner process (`Frame::Role`, to a new build that says `Frame::Ready::role`), the
+  new build its receipt as its own once that identity is certified, both to the server; the
+  upgrade's job is the replant's record of the machine, listing each transfer (the runner role and
+  each session the machine held as it began) and what moved without one.
 - *A resume from the server's store* is kiln's take: signed with the server's own key for the
   identity kiln last certified the session as at that epoch (`identities::holder_at`), to the next,
   saying when kiln last heard from the machine; kiln keeps it at once, the package carries it, and
@@ -9278,7 +9290,13 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
   `w27_r08_change_hands` (D1 given by kim, taken by sam, commandeered by lee: two transfers, each
   with both sides; sam's version pushed afterwards, and his abandon, refused and recorded with the
   transfer) and `w27_r08_review_passed_on` (passed on and taken, the request moves with both sides;
-  passed on again and never taken, it stays). Simulation (the Transfers plan's step 9, W27-AC05):
+  passed on again and never taken, it stays); `deploy::flow::tests::w27_r08_promotion` (web 1.2.0
+  at digest A, ten minutes in staging, promoted to production: CD's hand-on for staging and receipt
+  for production, one transfer walking unbroken, both naming A; then 1.2.0 at digest B refused as a
+  promotion and recorded with both digests) and, in a release build, `w27_r08_replant` (box-a
+  upgraded blue/green with two sessions: its job lists the runner role, from the process replaced to
+  its new build, and both sessions, each a verified transfer, nothing without one). Simulation (the
+  Transfers plan's step 9, W27-AC05):
   `sim::transfers::tests::w27_ac05_no_stale_act_is_ever_applied` (docs/sim.md's transfers model:
   moves, resumes from kiln's copy while a machine is cut off, take-overs with the old process still
   acting, blue/green upgrades and their rollbacks, the server restarting with its count stale, under
@@ -9300,8 +9318,10 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
   signing plan's step 4); an agent kiln's server runs itself (`local`) signs no receipt of work
   handed to it yet, so its hand-on stays unanswered; an agent's give or pass is kiln's take for it
   (its signed act verified), not yet a hand-on its runner signs; approvals carried over a
-  rebase-only revision (step 7's last part, on the signing plan's signed verdicts); promotions and
-  replant (step 8); artifacts, machines and intermediaries (steps 11 to 16).
+  rebase-only revision (step 7's last part, on the signing plan's signed verdicts); a promotion
+  from a linked server's environment, which this server's CD doesn't sign for, nor KilnCD's apps'
+  syncs, which take no `after`; Ship's journey listing a replant's transfers beside its runners
+  (its job does); artifacts, machines and intermediaries (steps 11 to 16).
 
 ### W28 Demand-driven CI: adopt, cover, stagger, land by conflict graph
 

@@ -219,14 +219,32 @@ pub fn server_signed(pki: &crate::pki::Pki, s: &statement::Statement) -> anyhow:
 
 /// [`server_signed`], as `payload_type`.
 fn server_signed_as(pki: &crate::pki::Pki, payload_type: &str, s: &statement::Statement) -> anyhow::Result<Value> {
+    own_signed_as(pki, "server", &server_uri(&pki.organization()), payload_type, s)
+}
+
+/// kiln's CD's identity in organization `org`.
+pub fn cd_uri(org: &str) -> String {
+    Identity::new(org, Actor::Cd).uri().unwrap_or_default()
+}
+
+/// `s` signed by kiln's CD with its own signing key (`<data>/pki/cd-signing.key`, kept certified
+/// beside the server's), its body naming it: its bundle. CD signs a promotion's records (docs/ci.md
+/// W27-R07, R08: `crate::deploy::promotion`).
+pub fn cd_signed(pki: &crate::pki::Pki, s: &statement::Statement) -> anyhow::Result<Value> {
+    own_signed_as(pki, "cd", &cd_uri(&pki.organization()), PAYLOAD_CUSTODY, s)
+}
+
+/// `s` signed as `payload_type` with the key of kiln's own identity `kind` (`server`, `cd`), whose
+/// URI is `by`, its body naming it.
+fn own_signed_as(pki: &crate::pki::Pki, kind: &str, by: &str, payload_type: &str, s: &statement::Statement) -> anyhow::Result<Value> {
     use anyhow::Context as _;
     use rcgen::SigningKey as _;
-    let read = |f: &str| std::fs::read_to_string(pki.dir().join(f)).with_context(|| format!("kiln's server's {f}"));
-    let key = rcgen::KeyPair::from_pem(&read("server-signing.key")?)?;
-    let cert = read("server-signing.pem")?;
+    let read = |f: &str| std::fs::read_to_string(pki.dir().join(f)).with_context(|| format!("kiln's {kind}'s {f}"));
+    let key = rcgen::KeyPair::from_pem(&read(&format!("{kind}-signing.key"))?)?;
+    let cert = read(&format!("{kind}-signing.pem"))?;
     let mut s = s.clone();
     if let Some(o) = s.body.as_object_mut() {
-        o.insert("by".into(), Value::String(server_uri(&pki.organization())));
+        o.insert("by".into(), Value::String(by.to_owned()));
     }
     let payload = statement::payload(&s)?;
     let signature = key.sign(&statement::to_sign(payload_type, &payload))?;
@@ -1120,6 +1138,53 @@ pub async fn head_named(store: &Store, name: &str) -> anyhow::Result<Option<Stri
         .await
 }
 
+/// What a runner's blue/green upgrade on `machine`, under way since `since` (unix seconds), handed
+/// on, as a replant's record of it lists them (docs/ci.md W27-R08; the Transfers plan's step 8):
+/// the machine's runner role, from the process it replaced to its new build, and each of
+/// `sessions` (the agent sessions it held as the upgrade began), each a transfer kiln took since,
+/// signed by both sides and walking unbroken; and what moved without one.
+pub async fn replanted(store: &Store, root: &[u8], org: &str, machine: &str, since: i64, sessions: &[String]) -> anyhow::Result<Value> {
+    let (mut transfers, mut without) = (Vec::new(), Vec::new());
+    let things = std::iter::once((format!("runner role of {machine}"), format!("runner role of {machine}"))).chain(sessions.iter().map(|s| (format!("session {s}"), format!("session {s} at epoch *"))));
+    for (what, name) in things {
+        match transfer_since(store, root, org, &name, since).await? {
+            Some(mut t) => {
+                if let Some(o) = t.as_object_mut() {
+                    o.insert("what".into(), json!(what));
+                }
+                transfers.push(t);
+            }
+            None => without.push(what),
+        }
+    }
+    Ok(json!({ "transfers": transfers, "moved_without_a_transfer": without }))
+}
+
+/// The newest transfer of the thing named `name` (a trailing `*` matching any end) that kiln took
+/// since `since`: its receipt and the hand-on or take it follows, both signed, its chain walking
+/// unbroken. None otherwise.
+async fn transfer_since(store: &Store, root: &[u8], org: &str, name: &str, since: i64) -> anyhow::Result<Option<Value>> {
+    let Some(head) = head_named(store, name).await? else { return Ok(None) };
+    let Some(v) = chain(store, root, org, &head, crate::util::now_unix()).await? else { return Ok(None) };
+    if v.get("unbroken") != Some(&json!(true)) {
+        return Ok(None);
+    }
+    let hops = v.get("hops").and_then(Value::as_array).cloned().unwrap_or_default();
+    let s = |h: &Value, k: &str| h.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+    Ok(match (hops.first(), hops.get(1)) {
+        (Some(got), Some(gave))
+            if s(got, "kind") == "received"
+                && matches!(s(gave, "kind").as_str(), "handed-on" | "taken")
+                && !s(got, "signer").is_empty()
+                && !s(gave, "signer").is_empty()
+                && got.get("at").and_then(Value::as_i64).is_some_and(|at| at >= since) =>
+        {
+            Some(json!({ "record": s(got, "record"), "from": s(gave, "custodian"), "to": s(got, "custodian"), "at": got.get("at") }))
+        }
+        _ => None,
+    })
+}
+
 /// The digests of every record kiln has on custodian `custodian`'s stream `stream`.
 async fn on_stream(store: &Store, custodian: &str, stream: &str) -> anyhow::Result<Vec<String>> {
     let (who, s) = (custodian.to_owned(), stream.to_owned());
@@ -1166,6 +1231,8 @@ pub async fn chain(store: &Store, root: &[u8], org: &str, digest: &str, at: i64)
             "signer": c.map(|c| c.signer.to_string()),
             "to": b.as_ref().and_then(|b| b.to.clone()),
             "from": b.as_ref().and_then(|b| b.from.clone()),
+            // The part of its custodian that holds them: a promotion's environment.
+            "component": b.as_ref().and_then(|b| b.component.clone()),
             "why": b.as_ref().map(|b| b.why.clone()),
             "at": h.at,
             "subject": h.subject,
