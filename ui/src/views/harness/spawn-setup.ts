@@ -100,6 +100,67 @@ export function modeOf(modes: ModeOption[], { unchecked, remembered, fallback }:
   return modes.find((m) => !m.dangerous)?.id ?? "";
 }
 
+/** A permission mode as chosen: its id, and the harness whose id it is. */
+export interface Chosen {
+  kind: string;
+  id: string;
+}
+
+/**
+ * How much each harness's modes let the agent do by itself, as a switch to another harness carries
+ * them (handoff.rs `latitude`; Devin's and Antigravity's as lineage.rs `level` places them): 0 reads
+ * only, 1 asks, 2 edits files without asking, 3 goes ahead with what's safe, 4 skips every check.
+ */
+const LATITUDE: Record<string, Record<string, number>> = {
+  claude: { plan: 0, dontAsk: 0, default: 1, acceptEdits: 2, auto: 3, bypassPermissions: 4 },
+  codex: { "read-only": 0, untrusted: 1, auto: 2, "full-access": 4 },
+  devin: { plan: 0, ask: 1, "accept-edits": 2, smart: 3, bypass: 4 },
+  antigravity: { plan: 0, default: 1, "accept-edits": 2, bypass: 4 },
+};
+/** Claude Code's and Codex's mode at each latitude, as kiln names it (handoff.rs `mode_at`); another harness's is the first it offers there. */
+const AT: Record<string, string[]> = {
+  claude: ["plan", "default", "acceptEdits", "auto", "bypassPermissions"],
+  codex: ["read-only", "untrusted", "auto", "auto", "full-access"],
+};
+
+/**
+ * The mode harness `to` starts in for `mode` of harness `from`, of those it offers, as an agent's
+ * switch carries it (handoff.rs `mode_for`): the same one in the same harness; else the same
+ * latitude, never more, skipping every check only from a mode that already did, and the next one
+ * down where it has none there. A mode kiln doesn't know asks. "": none that low (its own default).
+ */
+export function carryMode(from: string, mode: string, to: string, offered: string[]): string {
+  if (from === to && offered.includes(mode)) return mode;
+  const named = AT[to];
+  for (let l = LATITUDE[from]?.[mode] ?? 1; l >= 0; l--) {
+    const at = named ? named[l] : offered.find((m) => LATITUDE[to]?.[m] === l);
+    if (at && offered.includes(at)) return at;
+    if (l <= 1) break;
+  }
+  return "";
+}
+
+/** Effort levels by rank, lowest first (handoff.rs `effort_rank`). */
+const EFFORT_RANKS = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
+
+/**
+ * The level of `levels` for effort `effort`, as an agent's switch carries it (handoff.rs
+ * `effort_for`): the same one where it's there, else the nearest by rank (the lower of two as
+ * near). "": none, the model's own.
+ */
+export function carryEffort(effort: string, levels: string[]): string {
+  if (!effort || levels.includes(effort)) return effort;
+  const want = EFFORT_RANKS.indexOf(effort);
+  if (want < 0) return "";
+  let best = { level: "", far: Infinity, rank: Infinity };
+  for (const level of levels) {
+    const rank = EFFORT_RANKS.indexOf(level);
+    const far = Math.abs(rank - want);
+    if (rank >= 0 && (far < best.far || (far === best.far && rank < best.rank))) best = { level, far, rank };
+  }
+  return best.level;
+}
+
 /** The model chosen, if the harness on that machine offers it (else none: the harness's own), and the one the line shows. */
 export function modelOf(k: KindInfo | undefined, chosen: string): { chosen: string; shown: string } {
   const models = k?.models ?? [];

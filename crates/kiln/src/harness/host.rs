@@ -2933,6 +2933,39 @@ while True:
         })
     }
 
+    /// A new agent's page names what it was started with from its first snapshot, before its
+    /// harness says anything (it may wait for room on its machine, then take seconds to start): its
+    /// permissions by their name, its effort, and the levels its model takes, from the lists Mission
+    /// control's composer chose them from. Its harness here never starts: that snapshot is all it says.
+    #[test]
+    fn a_new_session_names_its_settings_before_its_harness_says_anything() -> anyhow::Result<()> {
+        use super::super::core::Update;
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let (tx, rx) = async_channel::unbounded();
+            let host = sim(tx, None, Limits::default());
+            let spec = Spec { mode: Some("acceptEdits".into()), model: Some("opus".into()), effort: Some("max".into()), ..no_harness(dir.path()) };
+            host.open(Some("new".into()), spec)?;
+            let (mut state, mut meta) = (None, None);
+            let came = crate::rt::timeout(Duration::from_secs(30), async {
+                while state.is_none() || meta.is_none() {
+                    match rx.recv().await {
+                        Ok((_, Update::State { state: s })) if state.is_none() => state = Some(*s),
+                        Ok((_, Update::Meta { meta: m })) if meta.is_none() => meta = Some(*m),
+                        Ok(_) => {}
+                        Err(_) => return,
+                    }
+                }
+            })
+            .await;
+            let (Some(state), Some(meta)) = (state, meta) else { anyhow::bail!("its first snapshot never came (timed out: {})", came.is_err()) };
+            assert_eq!((state.mode.as_str(), state.model.as_str(), state.effort.as_str()), ("acceptEdits", "opus", "max"));
+            assert!(meta.modes.iter().any(|m| m.id == "acceptEdits" && m.label == "Accept edits"), "{:?}", meta.modes);
+            assert!(meta.efforts.iter().any(|e| e.id == "max"), "{:?}", meta.efforts);
+            Ok(())
+        })
+    }
+
     /// What a host says of the messages sent its sessions (`Update::Inbox`), the next `n` of them,
     /// whatever else it says between.
     async fn answers(rx: &async_channel::Receiver<(String, super::super::core::Update)>, n: usize) -> anyhow::Result<Vec<Said>> {
