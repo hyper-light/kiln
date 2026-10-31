@@ -210,6 +210,11 @@ pub fn apply(wf: &mut Workflow, ov: &Overlay) -> Vec<Diag> {
                 _ => diags.push(Diag::warning("KCI4010", format!("the overlay sets a matrix on job `{}`, which has no matrix of axes", oj.id), oj.range).at(format!("jobs.{}.strategy.matrix", oj.id))),
             }
         }
+        // A gang is two legs at least, all started at once (W05-R40): the job as the overlay
+        // leaves it.
+        if let Some(why) = super::front::gang_problem(job) {
+            diags.push(Diag::error("KCI1022", why, oj.range).at(format!("jobs.{}.together", oj.id)));
+        }
         if let Some(c) = job.concurrency.as_mut() {
             if oj.concurrency_limit.is_some() {
                 c.limit = oj.concurrency_limit;
@@ -246,6 +251,7 @@ fn merge_kiln(dst: &mut JobKiln, src: &JobKiln, set: &[String]) {
     for key in set {
         match key.as_str() {
             "exclusive" => dst.exclusive = src.exclusive,
+            "together" => dst.together = src.together,
             "resources" => dst.resources = src.resources.clone(),
             "requires" => dst.requires = src.requires.clone(),
             "prefer" => dst.prefer = src.prefer.clone(),

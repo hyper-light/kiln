@@ -3111,6 +3111,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         let pooled = a.executor.slot.is_some();
                         let holds = kiln_ci::sched::state::Incoming::of(a.exclusive, &a.holds.unwrap_or_default());
                         let room = admits(o.slots, size, jobs.values().map(|j| (j.pooled, j.holds)), pooled, holds);
+                        // A test build's `refuse=<job>`: refused as one with no room would refuse it.
+                        let room = room.and_then(|()| if crate::runner::chaos::refuses(&a.leg.job_id) { Err("no free slot") } else { Ok(()) });
                         if o.outpost || draining || upgrade_pending || room.is_err() || jobs.contains_key(&id) {
                             let reason = if o.outpost { OUTPOST_TAKES_NO_JOBS } else if draining { REFUSED_DRAINING } else if upgrade_pending { REFUSED_UPGRADING } else { room.err().unwrap_or("no free slot") };
                             // To a server that takes leases, naming the grant refused (W05-R34).

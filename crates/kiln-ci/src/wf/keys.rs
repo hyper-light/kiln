@@ -333,6 +333,7 @@ pub const JOB: &[Key] = &[
     kiln_only("toolchain", Ty::Str, "kiln: a preset image and caches (`rust`, `go`, `python`, `node`, `bun`, `erlang`)."),
     kiln_only("image", Ty::Tpl, "kiln: the image for container, microVM and Kubernetes legs."),
     kiln("exclusive", Ty::Bool, "kiln: the leg has its runner to itself."),
+    kiln("together", Ty::Bool, "kiln: the job's legs (its matrix) start together or not at all, one gang (W05-R40)."),
     kiln("resources", Ty::Any, "kiln: `cpu`, `memory`, `disk`, `gpu` (W05-R03)."),
     kiln("requires", Ty::StrList, "kiln: routing constraints (W05-R22)."),
     kiln("prefer", Ty::Any, "kiln: routing preferences (W05-R23)."),

@@ -2037,6 +2037,19 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   A gang that runs when the server restarts comes back as it ran (W05-R25). Commands can't be one
   of a gang until commands are placed by the engine (docs/needs.md E5): `kiln run --needs` and
   MCP's `run` refuse `together:`.
+  In a workflow (E4.4), a job's `together: true` (kiln's keys, beside `resources:`, `requires:` and
+  `exclusive:`; a GitHub workflow's from its overlay) makes its legs, its matrix, one gang, named
+  by the run and the job and as big as the job has legs. `kiln validate` reports a job it can't
+  make one at the key's line (KCI1022): one of fewer than two legs or more than 64, or with
+  `max-parallel`, which would hold some back; a matrix it can't count until the run is planned is
+  let be. Rerunning one of its legs (W05-R28) reruns its whole job. The dispatcher writes a gang's
+  grants together, in one transaction, before any of its Assigns goes (W05-R05 grown: G10, and a
+  gang's grants all or none, G4); a write that fails sends none of them and says each member is
+  not granted, so the gang goes back whole. A member taken back is stopped on its runner at once,
+  as a lost grant is (`Stop` naming its grant for a lease runner, a cancel for an older one), and
+  queued again, a notice on its leg (`gang`) saying why, as the refused member's says who refused
+  it. It goes again no sooner than the lock-delay (W05-R34), by which its runner has stopped it: a
+  runner refuses a leg it still runs, and the gang would go back again.
 
 **Design.** `crates/kiln-ci/src/sched/`: `state.rs` (runners, signatures, queues), `fair.rs`,
 `groups.rs`, `routing.rs` (constraint parser, rule matching, eligibility, scoring, explain),

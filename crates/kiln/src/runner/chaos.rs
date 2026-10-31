@@ -23,6 +23,8 @@
 //! - `stop=<job>`: the server's: the CI engine grants that job's legs as items that stop when their
 //!   lease is lost (`on_lease_loss: stop`), as no CI leg does, so their runner stops them at its
 //!   lease's end (W05-R37).
+//! - `refuse=<job>`: the runner's own admission refuses the first leg of that job it's sent, as one
+//!   with no room for it would (W05-R40: a gang's member refused at its runner).
 //! - `shed=<lane>[/<variant>]:<every>`: this process's QUIC layer drops about one frame in `every`
 //!   of `lane` (`control`, `term` ... or its number; of those whose first byte, a message's
 //!   variant index, is `variant`, when given), picked by a seeded draw, as a frame lost below the
@@ -68,6 +70,7 @@ pub struct Chaos {
     pub rebuild_after: Option<Duration>,
     pub claim_fails: Option<Duration>,
     pub stop_job: Option<String>,
+    pub refuse_job: Option<String>,
     /// What goes wrong below the channel: `shed`, `twice`, `late`, in the order given, drawn from
     /// `seed`.
     pub faults: Vec<crate::net::Shed>,
@@ -121,6 +124,7 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
             "rebuild" => c.rebuild_after = Some(d()?),
             "claim" => c.claim_fails = Some(d()?),
             "stop" if !v.is_empty() => c.stop_job = Some(v.to_owned()),
+            "refuse" if !v.is_empty() => c.refuse_job = Some(v.to_owned()),
             "shed" | "twice" | "late" => {
                 let act = match k {
                     "shed" => crate::net::Act::Drop,
@@ -132,7 +136,7 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
             "fanout" => c.fanout = Some(v.parse().ok().filter(|n: &usize| *n > 0).ok_or_else(|| anyhow::anyhow!("chaos `fanout` takes a number of frames, not `{v}`"))?),
             "old" => c.old = true,
             "seed" => c.seed = v.parse().map_err(|_| anyhow::anyhow!("chaos `seed` takes a number, not `{v}`"))?,
-            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, oom, disk, corrupt, fetch, platform, rebuild, claim, stop=<job>, shed, twice, late, seed, fanout or old"),
+            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, oom, disk, corrupt, fetch, platform, rebuild, claim, stop=<job>, refuse=<job>, shed, twice, late, seed, fanout or old"),
         }
     }
     Ok(c)
@@ -171,6 +175,15 @@ static CLAIM_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 /// The hold before a claim fails (`claim=`), for the first claim only.
 pub fn claim_fails() -> Option<Duration> {
     get().and_then(|c| c.claim_fails).filter(|_| !CLAIM_FAILED.swap(true, Ordering::Relaxed))
+}
+
+/// Whether the runner's first refusal `refuse=` makes is had (once a process).
+static REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the runner's admission refuses a leg of `job` (a job's id, its callers' before it:
+/// `call/test`) it's sent (`refuse=`): the first of that job's only.
+pub fn refuses(job: &str) -> bool {
+    get().and_then(|c| c.refuse_job.as_deref()).is_some_and(|j| job.rsplit('/').next() == Some(j)) && !REFUSED.swap(true, Ordering::Relaxed)
 }
 
 /// Kills chaos made as the OOM killer would, added to the kernel's count.
@@ -351,6 +364,7 @@ mod tests {
                 rebuild_after: None,
                 claim_fails: None,
                 stop_job: None,
+                refuse_job: None,
                 faults: Vec::new(),
                 seed: 0,
                 fanout: None,
@@ -364,6 +378,8 @@ mod tests {
         assert_eq!(parse("claim=3s")?.claim_fails, Some(Duration::from_secs(3)));
         assert_eq!(parse("stop=stopper")?.stop_job.as_deref(), Some("stopper"));
         assert!(parse("stop").is_err());
+        assert_eq!(parse("refuse=sim")?.refuse_job.as_deref(), Some("sim"));
+        assert!(parse("refuse").is_err());
         assert_eq!(parse("drop=5s,down=30s")?.down_for, Some(Duration::from_secs(30)));
         assert!(parse("platform=plan9/mips").is_err());
         assert!(parse("flood=1s").is_err_and(|e| e.to_string().contains("no fault `flood`")));

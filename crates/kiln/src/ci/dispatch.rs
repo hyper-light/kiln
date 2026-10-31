@@ -155,6 +155,17 @@ struct Placement {
     slot: Option<String>,
     /// Its grant (W05-R34): its fence, and what its runner does once its lease is lost.
     grant: Option<(Fence, kiln_ci::sched::LeaseLoss)>,
+    /// Its grant is in the store already, written with its gang's (W05-R40).
+    claimed: bool,
+}
+
+/// A gang member's `Assign` (W05-R40), as the scheduler made it: its leg, runner, attempt and
+/// where it runs.
+struct Member {
+    leg: String,
+    runner: String,
+    attempt: u32,
+    placed: Placement,
 }
 
 pub use kiln_ci::plan::rerun::Mode as RerunMode;
@@ -466,6 +477,7 @@ fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec, cfg: &crate::config::c
         workflow_file: r.path.clone(),
         prefer,
         placement: r.placed.get(&spec.key).cloned().unwrap_or_default(),
+        gang: gang_of(run, spec),
         // A CI leg runs to its end when its lease is lost (W05-R34); a test build's `stop=<job>`
         // makes that job's legs stop then, as stop items do (W05-R37).
         on_lease_loss: match crate::runner::chaos::get().and_then(|c| c.stop_job.as_deref()) {
@@ -474,6 +486,13 @@ fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec, cfg: &crate::config::c
         },
         ..LegIn::default()
     }
+}
+
+/// The gang a leg is a member of (W05-R40): a job's `together: true` makes its legs, its matrix,
+/// one, named by the run and the job, as big as the job's legs are many (two at least).
+fn gang_of(run: &str, spec: &LegSpec) -> Option<kiln_ci::sched::state::Gang> {
+    let size = spec.strategy.get("job-total").and_then(serde_json::Value::as_f64).map_or(0, |n| n as u32);
+    (spec.def().is_some_and(|j| j.kiln.together) && size >= 2).then(|| kiln_ci::sched::state::Gang { id: format!("{run}/{}", spec.job), size })
 }
 
 /// The scheduler's settings: `[ci.scheduler]`, `[ci.fairness]` and the routing rules.
@@ -589,6 +608,17 @@ async fn claim(hub: &Hub, leg: &str, runner: &str, executor: &str, attempt: u32,
         anyhow::bail!("the store couldn't write it (KILN_CHAOS claim)");
     }
     runs::claim(hub, leg, runner, executor, attempt, fence).await
+}
+
+/// [`runs::claim_all`]: a gang's grants in one transaction (W05-R40); in a test build with
+/// `claim=<duration>` (`KILN_CHAOS`), the first claim held back that long and then failed, as
+/// [`claim`] fails it.
+async fn claim_all(hub: &Hub, grants: &[(String, String, String, u32, Fence)]) -> anyhow::Result<()> {
+    if let Some(hold) = crate::runner::chaos::claim_fails() {
+        crate::rt::sleep(hold).await;
+        anyhow::bail!("the store couldn't write it (KILN_CHAOS claim)");
+    }
+    runs::claim_all(hub, grants).await
 }
 
 /// The hub's handle on the dispatcher.
@@ -1354,9 +1384,13 @@ impl Dispatch {
                         l.agent = None;
                     }
                 }
-                let cmds = self.sched.handle(Input::Rejected { leg, fence }, now_ms());
+                // A gang's member refused under its live grant takes its gang back (W05-R40): it's
+                // queued again, its records saying why, and the others are stopped.
+                let member = self.sched.gang(&leg).is_some() && self.sched.grant(&leg).and_then(|(_, g)| g).is_some_and(|(r, f)| r == agent && f == fence);
+                let cmds = self.sched.handle(Input::Rejected { leg: leg.clone(), fence }, now_ms());
+                let noted = if member { self.refused_member(&leg, &agent).await } else { Ok(()) };
                 self.commands(cmds).await;
-                Ok(())
+                noted
             }
             Msg::Cancel { run, reason } => self.cancel_run(&run, &reason).await,
             Msg::ApproveRun { run, by, approve, reply } => {
@@ -2402,11 +2436,32 @@ impl Dispatch {
                 }
                 Command::CancelRun { run, reason } => self.cancel_run(&run, &reason).await,
                 Command::Assign { leg, runner, attempt, executor, image, docker, slot, fence, lease_loss, .. } => {
-                    if let Some(l) = self.legs.get_mut(&leg) {
-                        l.fence = fence;
+                    let placed = Placement { executor, image, docker, slot, grant: Some((fence, lease_loss)), claimed: false };
+                    match self.sched.gang(&leg).map(|g| g.id.clone()) {
+                        // A gang's Assigns come together, out of one decision (W05-R40): its other
+                        // members' are taken from what's to do, and all go as one.
+                        Some(gang) => {
+                            let mut members = vec![Member { leg, runner, attempt, placed }];
+                            let mut rest = std::collections::VecDeque::with_capacity(todo.len());
+                            for c in todo.drain(..) {
+                                match c {
+                                    Command::Assign { leg, runner, attempt, executor, image, docker, slot, fence, lease_loss, .. } if self.sched.gang(&leg).is_some_and(|g| g.id == gang) => {
+                                        members.push(Member { leg, runner, attempt, placed: Placement { executor, image, docker, slot, grant: Some((fence, lease_loss)), claimed: false } });
+                                    }
+                                    other => rest.push_back(other),
+                                }
+                            }
+                            todo = rest;
+                            self.assign_gang(&gang, members).await
+                        }
+                        None => {
+                            if let Some(l) = self.legs.get_mut(&leg) {
+                                l.fence = fence;
+                            }
+                            self.regrant(&leg, Some((runner.clone(), attempt, fence))).await;
+                            self.assign(&leg, &runner, attempt, placed).await
+                        }
                     }
-                    self.regrant(&leg, Some((runner.clone(), attempt, fence))).await;
-                    self.assign(&leg, &runner, attempt, Placement { executor, image, docker, slot, grant: Some((fence, lease_loss)) }).await
                 }
                 // A `k8s` pool's executor is this server's: its pod (W13-R07), made for a leg with
                 // its containers in it when it has them.
@@ -2495,7 +2550,13 @@ impl Dispatch {
                     self.hub.release_slot(&runner, &leg);
                     self.regrant(&leg, None).await;
                     let end = runs::AttemptEnd { conclusion: "failure", class: Some(FailureClass::RunnerLost.as_str()), exit_code: None, error: Some(why.why().to_owned()), peak_rss: None, cpu_seconds: None };
-                    runs::attempt_finished(&self.hub, &leg, attempt, Some(fence), end).await.map(|_| ())
+                    let r = runs::attempt_finished(&self.hub, &leg, attempt, Some(fence), end).await.map(|_| ());
+                    if why == kiln_ci::sched::Loss::Gang {
+                        let stopped = self.stop_member(&leg, attempt, &runner, fence).await;
+                        r.and(stopped)
+                    } else {
+                        r
+                    }
                 }
             };
             if let Err(e) = r {
@@ -2592,8 +2653,83 @@ impl Dispatch {
         Ok(())
     }
 
+    /// The executor a grant's records name: in a `k8s` pool's pod a leg runs in the pod's own
+    /// container (W13-R07), so a terminal into it is an exec into the pod, not a shell on a machine
+    /// (W17-R01).
+    fn recorded(&self, runner: &str, executor: Option<&str>) -> String {
+        if self.hub.pod_executors.lock().contains_key(runner) { "k8s".into() } else { executor.unwrap_or("host").to_owned() }
+    }
+
+    /// A gang's Assigns (W05-R40): their grants written together, in one transaction, before any
+    /// of them goes (W05-R05 grown: a grant is in the store before anything acts on it, G10, and a
+    /// gang's all or none of them, G4); then each goes as [`Self::assign`] sends one. A write that
+    /// fails sends none, and tells the scheduler each member is `Ungranted`, so the gang goes back
+    /// to its queue whole.
+    async fn assign_gang(&mut self, gang: &str, members: Vec<Member>) -> anyhow::Result<()> {
+        let mut grants = Vec::with_capacity(members.len());
+        for m in &members {
+            let fence = m.placed.grant.map(|(f, _)| f).unwrap_or_default();
+            if let Some(l) = self.legs.get_mut(&m.leg) {
+                l.fence = fence;
+                grants.push((m.leg.clone(), m.runner.clone(), self.recorded(&m.runner, m.placed.executor.as_deref()), m.attempt, fence));
+            }
+            self.regrant(&m.leg, Some((m.runner.clone(), m.attempt, fence))).await;
+        }
+        if let Err(e) = claim_all(&self.hub, &grants).await {
+            tracing::warn!(gang, members = members.len(), error = %format!("{e:#}"), "a gang's grants couldn't be written: none of its Assigns is sent, and the gang goes back to its queue whole");
+            for m in &members {
+                self.regrant(&m.leg, None).await;
+                let fence = m.placed.grant.map(|(f, _)| f).unwrap_or_default();
+                let cmds = self.sched.handle(Input::Ungranted { leg: m.leg.clone(), fence }, now_ms());
+                self.next.extend(cmds);
+            }
+            return Ok(());
+        }
+        for m in members {
+            if let Err(e) = self.assign(&m.leg, &m.runner, m.attempt, Placement { claimed: true, ..m.placed }).await {
+                tracing::warn!(leg = %m.leg, error = %format!("{e:#}"), "CI dispatcher command");
+            }
+        }
+        Ok(())
+    }
+
+    /// A gang's member its runner refused (W05-R40), its gang taken back: queued again, its records
+    /// saying who refused it.
+    async fn refused_member(&mut self, leg: &str, runner: &str) -> anyhow::Result<()> {
+        let Some(attempt) = self.legs.get(leg).map(|l| l.attempt) else { return Ok(()) };
+        tracing::info!(leg, runner, attempt, "a member of its gang was refused: its gang goes again whole");
+        runs::annotation(&self.hub, leg, None, "notice", Some("gang".into()), &format!("Refused by {runner}: its gang goes again whole, together."), None, None, None, None, None).await?;
+        runs::requeue(&self.hub, leg, attempt, Some(format!("refused by {runner}: its gang goes again whole"))).await?;
+        self.hub.emit_job(leg).await;
+        Ok(())
+    }
+
+    /// A gang's member taken back with its gang (W05-R40), another member refused or lost: its
+    /// runner, which was sent it, is told to stop it now, as a grant lost is once its runner says
+    /// it holds it (W05-R25): `Stop` naming its grant for a lease runner, a cancel for an older
+    /// one. It's queued again, its records saying why. One whose `Assign` never went (its gang's
+    /// write failed) has nothing to stop or say.
+    async fn stop_member(&mut self, leg: &str, attempt: u32, runner: &str, fence: Fence) -> anyhow::Result<()> {
+        let Some(l) = self.legs.get_mut(leg).filter(|l| l.agent.as_deref() == Some(runner)) else { return Ok(()) };
+        l.agent = None;
+        l.report = LegReport::default();
+        l.class = None;
+        let why = kiln_ci::sched::Loss::Gang.why();
+        let msg = if self.hub.runner_wide_caps(runner) & CAP_LEASES != 0 && fence != Fence::default() {
+            ServerMsg::Stop { grant: crate::proto::Grant::of(leg, attempt, fence), reason: why.to_owned() }
+        } else {
+            ServerMsg::Cancel { job: leg.to_owned(), reason: why.to_owned() }
+        };
+        self.hub.command_start(runner, &msg).await.log_when_answered(crate::hub::LOG_WITHIN);
+        tracing::info!(leg, runner, attempt, "a member of its gang was refused or lost: this one is stopped, and its gang goes again whole");
+        runs::annotation(&self.hub, leg, None, "notice", Some("gang".into()), &format!("Stopped on {runner}: {why}."), None, None, None, None, None).await?;
+        runs::requeue(&self.hub, leg, attempt, Some(format!("stopped on {runner}: its gang goes again whole"))).await?;
+        self.hub.emit_job(leg).await;
+        Ok(())
+    }
+
     async fn assign(&mut self, leg: &str, runner: &str, attempt: u32, placed: Placement) -> anyhow::Result<()> {
-        let Placement { executor, image, docker, slot, grant } = placed;
+        let Placement { executor, image, docker, slot, grant, claimed } = placed;
         let Some(l) = self.legs.get(leg) else { return Ok(()) };
         let Some(r) = self.runs.get(&l.run) else { return Ok(()) };
         let (cache_mode, cache) = cache_access(&l.spec, r);
@@ -2694,13 +2830,14 @@ impl Dispatch {
         if let Err(e) = super::secrets::record_uses(&self.hub, leg, used_ids).await {
             tracing::warn!(leg, error = %format!("{e:#}"), "secret uses could not be recorded");
         }
-        // In a `k8s` pool's pod it runs in the pod's own container (W13-R07): a terminal into it is
-        // an exec into the pod, not a shell on a machine (W17-R01).
-        let recorded = if self.hub.pod_executors.lock().contains_key(runner) { "k8s" } else { executor.as_deref().unwrap_or("host") };
-        // The grant is written before its Assign goes (W05-R05, G10). One that couldn't be sends
-        // none: it ends here, and the leg goes back to its queue, the same attempt, a while later.
+        let recorded = self.recorded(runner, executor.as_deref());
+        // The grant is written before its Assign goes (W05-R05, G10), a gang's member's with its
+        // gang's already. One that couldn't be sends none: it ends here, and the leg goes back to
+        // its queue, the same attempt, a while later.
         let fence = grant.map(|(f, _)| f).unwrap_or_default();
-        if let Err(e) = claim(&self.hub, leg, runner, recorded, attempt, fence).await {
+        if !claimed
+            && let Err(e) = claim(&self.hub, leg, runner, &recorded, attempt, fence).await
+        {
             tracing::warn!(leg, runner, attempt, error = %format!("{e:#}"), "the grant couldn't be written: its Assign isn't sent, and the leg goes back to its queue");
             self.regrant(leg, None).await;
             let cmds = self.sched.handle(Input::Ungranted { leg: leg.to_owned(), fence }, now_ms());
@@ -4231,6 +4368,66 @@ mod tests {
         let cfg: crate::config::Config = toml::from_str("[sched]\nbackfill = true\n")?;
         assert!(cfg.sched.backfill);
         Ok(())
+    }
+
+    /// W05-R40, docs/needs.md E4.4: a gang's grants are written together, in one transaction,
+    /// before any of its Assigns goes. Three runners, a gang of three; the store fails the write at
+    /// the third member's row, after the first two were written in it: none of the three is in the
+    /// store, none was sent to a runner, and all three are taken back, queued again at their
+    /// attempts. Once the store writes again and they may go again, they're granted whole, their
+    /// grants written together.
+    #[test]
+    fn w05_r40_a_gang_s_grants_are_written_together() -> anyhow::Result<()> {
+        use kiln_ci::sched::state::Gang;
+        use kiln_ci::sched::{Input, LegIn, WaitReason};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let mut d = dispatcher(&hub);
+            for r in ["a", "b", "c"] {
+                hub.agents.lock().insert(r.into(), runner(r, 1));
+                d.runner_up(r, &[]).await;
+            }
+            hub.store
+                .call(|c| {
+                    Ok(c.execute_batch(
+                        "INSERT INTO repos (id, name, clone_url, created_at) VALUES ('r', 'acme/x', '', 0);
+                         INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, status, created_at) VALUES ('R', 'r', 1, 'ci', 'push', 'main', 'abc', 'queued', 0);
+                         INSERT INTO jobs (id, run_id, key, display, status, labels, needs, spec) VALUES ('m0', 'R', 'sim (a)', 'sim (a)', 'queued', '[]', '[]', '{}'), ('m1', 'R', 'sim (b)', 'sim (b)', 'queued', '[]', '[]', '{}'), ('m2', 'R', 'sim (c)', 'sim (c)', 'queued', '[]', '[]', '{}');
+                         CREATE TRIGGER gang_write_fails BEFORE INSERT ON ci_attempts WHEN NEW.leg_id = 'm2' BEGIN SELECT RAISE(ABORT, 'the store can''t write'); END;",
+                    )?)
+                })
+                .await?;
+            let members = ["m0", "m1", "m2"];
+            for m in members {
+                track(&mut d, m, "a");
+                if let Some(l) = d.legs.get_mut(m) {
+                    l.agent = None;
+                }
+                let route = kiln_ci::sched::routing::LegRoute { labels: vec!["kiln".into()], ..kiln_ci::sched::routing::LegRoute::default() };
+                let l = LegIn { id: m.into(), run: "R".into(), repo: "acme/x".into(), route, gang: Some(Gang { id: "R/sim".into(), size: 3 }), ..LegIn::default() };
+                let cmds = d.sched.handle(Input::LegQueued(Box::new(l)), super::now_ms());
+                d.commands(cmds).await;
+            }
+            let written = || hub.store.call(|c| Ok(c.prepare("SELECT leg_id, number FROM ci_attempts WHERE leg_id IN ('m0', 'm1', 'm2') ORDER BY leg_id")?.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?.collect::<Result<Vec<_>, _>>()?));
+            assert_eq!(written().await?, Vec::<(String, i64)>::new(), "none of the gang's grants is in the store");
+            for m in members {
+                assert_eq!(granted(&hub, m), None, "{m} is no runner's");
+                assert_eq!(d.sched.grant(m), Some((1, None)), "{m} queued again at its attempt");
+                assert!(d.legs.get(m).is_some_and(|l| l.agent.is_none()), "{m} was sent to no runner");
+            }
+            // Granted, then taken back: the two its first's `Ungranted` took back go again a while
+            // later, with it.
+            let again = members.iter().filter(|m| matches!(d.sched.reason(m), Some(WaitReason::Retry { .. }))).count();
+            assert_eq!(again, 2, "{:?}", members.map(|m| d.sched.reason(m).cloned()));
+            hub.store.call(|c| Ok(c.execute_batch("DROP TRIGGER gang_write_fails")?)).await?;
+            let cmds = d.sched.handle(Input::Tick, super::now_ms() + 16_000);
+            d.commands(cmds).await;
+            assert_eq!(written().await?, members.map(|m| (m.to_owned(), 1)), "the three grants written together");
+            for m in members {
+                assert!(granted(&hub, m).is_some_and(|g| g.1 == 1), "{m} granted whole, at its attempt");
+            }
+            Ok(())
+        })
     }
 
     /// W05-R17: a rerun's `github.triggering_actor` is whoever reran it, as GitHub names people; an

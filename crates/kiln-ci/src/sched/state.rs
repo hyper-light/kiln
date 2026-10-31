@@ -2712,6 +2712,8 @@ impl Scheduler {
             Outcome::Failed(f) if f.class == FailureClass::RunnerLost && l.input.on_lease_loss == LeaseLoss::Stop => Some(l.expires.unwrap_or(now).max(now).saturating_add(ms_i64(self.cfg.lock_delay))),
             _ => None,
         };
+        // A gang's member taken back waits for its runner to stop it (W05-R40).
+        let lock = lock.max(l.not_before.filter(|at| *at > now));
         // Out of its queue before it's queued again or settled, so it's queued once.
         if queued {
             self.unqueue(id);
@@ -3843,9 +3845,20 @@ impl Scheduler {
             }
             self.stopped(&p);
             self.discard_used(&p, out);
+            self.stopping(&p, now);
             self.enqueue(&p, now, out);
         }
         freed
+    }
+
+    /// A member taken back with its gang (W05-R40) goes again no sooner than the lock-delay, by
+    /// which its runner, told to stop the grant, has: a runner refuses a leg it still runs, and
+    /// the gang would go back again (W05-R34).
+    fn stopping(&mut self, id: &str, now: i64) {
+        let at = now.saturating_add(ms_i64(self.cfg.lock_delay));
+        if let Some(l) = self.legs.get_mut(id) {
+            l.not_before = Some(at);
+        }
     }
 
     /// A gang's member lost before any of its members' attempts ended (W05-R40): the others' grants
@@ -3867,6 +3880,7 @@ impl Scheduler {
         }
         self.finish(lost, attempt, outcome, again, now, out);
         for (p, a) in &peers {
+            self.stopping(p, now);
             self.finish(p, *a, Outcome::Failed(failed.clone()), again, now, out);
         }
         if again {
@@ -4330,6 +4344,12 @@ impl Scheduler {
     /// The current wait reason of a leg, if it waits.
     pub fn reason(&self, id: &str) -> Option<&WaitReason> {
         self.legs.get(id).and_then(|l| l.reason.as_ref())
+    }
+
+    /// The gang a leg is a member of (W05-R40), if it's one's: the dispatcher writes a gang's
+    /// grants together.
+    pub fn gang(&self, id: &str) -> Option<&Gang> {
+        self.legs.get(id).and_then(|l| l.input.gang.as_ref())
     }
 
     /// Where a leg stands as grants go (W05-R34): its attempt now and, while it runs under a grant,

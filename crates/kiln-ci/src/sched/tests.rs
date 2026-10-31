@@ -3067,7 +3067,7 @@ fn w05_r40_a_gang_starts_whole_or_reserves_whole() {
 
 /// W05-R40: a member refused by its runner takes its gang's other grants back (`Loss::Gang`), and
 /// the gang is queued again at the same attempts and granted whole, the refused member on another
-/// runner.
+/// runner, once the lock-delay has passed (E4.4: by then the others' runners have stopped them).
 #[test]
 fn w05_r40_a_refused_member_takes_its_gang_back() {
     let (mut s, grants) = gang_of_three();
@@ -3077,6 +3077,11 @@ fn w05_r40_a_refused_member_takes_its_gang_back() {
     let mut back = taken_back(&c);
     back.sort_by(|a, b| a.0.cmp(&b.0));
     assert_eq!(back, vec![("m0".to_owned(), super::state::Loss::Gang), ("m2".to_owned(), super::state::Loss::Gang)]);
+    // Their runners stop the other two meanwhile: the gang goes again once the lock-delay has passed.
+    assert_eq!(assigned(&c), Vec::<String>::new(), "{c:?}");
+    assert_eq!(s.check_grants(), Ok(()));
+    assert_eq!(assigned(&s.handle(Input::Tick, 15_001)), Vec::<String>::new());
+    let c = s.handle(Input::Tick, 15_002);
     let mut again = assigned(&c);
     again.sort();
     assert_eq!(again, vec!["m0", "m1", "m2"]);
@@ -3086,7 +3091,8 @@ fn w05_r40_a_refused_member_takes_its_gang_back() {
 }
 
 /// W05-R40: a member lost with its runner before any member's attempt has ended takes the others
-/// back, and the three go again together at their next attempts, once there's room for all three.
+/// back, and the three go again together at their next attempts, once there's room for all three
+/// and the others' runners have stopped them (the lock-delay, E4.4).
 #[test]
 fn w05_r40_a_member_lost_before_any_ended_takes_its_gang_to_the_next_attempts() {
     let (mut s, grants) = gang_of_three();
@@ -3097,8 +3103,11 @@ fn w05_r40_a_member_lost_before_any_ended_takes_its_gang_to_the_next_attempts() 
     assert_eq!(back.iter().filter(|(_, why)| *why == super::state::Loss::Gang).map(|(l, _)| l.as_str()).collect::<Vec<_>>(), vec!["m0", "m2"]);
     assert_eq!(["m0", "m1", "m2"].map(|m| s.grant(m)), [Some((2, None)); 3], "each at its next attempt, none running");
     assert_eq!(s.check_grants(), Ok(()));
-    // Two runners can't hold three: they wait whole until the third is back.
+    // Two runners can't hold three: they wait whole until the third is back, and the other two
+    // until their runners have stopped them, the lock-delay after.
     let c = s.handle(Input::RunnerUp(Box::new(linux(&runner, 1))), 3);
+    assert_eq!(assigned(&c), Vec::<String>::new(), "{c:?}");
+    let c = s.handle(Input::Tick, 15_002);
     let mut again = assigned(&c);
     again.sort();
     assert_eq!(again, vec!["m0", "m1", "m2"]);

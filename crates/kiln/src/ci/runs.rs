@@ -189,8 +189,32 @@ fn sql(n: u64) -> i64 {
 
 fn claim_on(c: &mut rusqlite::Connection, leg: &str, agent: &str, executor: &str, attempt: u32, fence: kiln_ci::sched::Fence, now: i64) -> anyhow::Result<()> {
     let tx = crate::store::tx(c)?;
+    claim_in(&tx, leg, agent, executor, attempt, fence, now)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// A gang's grants (W05-R40), each a leg, its runner, its executor, its attempt and its fence:
+/// written together, in one transaction, so all of them are in the store or none (W05-R05, G4).
+pub async fn claim_all(hub: &Hub, grants: &[(String, String, String, u32, kiln_ci::sched::Fence)]) -> anyhow::Result<()> {
+    let grants = grants.to_vec();
+    hub.store
+        .call(move |c| {
+            let tx = crate::store::tx(c)?;
+            let now = crate::util::now_unix();
+            for (leg, agent, executor, attempt, fence) in &grants {
+                claim_in(&tx, leg, agent, executor, *attempt, *fence, now)?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+}
+
+/// One grant's rows, in `tx` ([`claim`], [`claim_all`]).
+fn claim_in(tx: &crate::store::Tx<'_>, leg: &str, agent: &str, executor: &str, attempt: u32, fence: kiln_ci::sched::Fence, now: i64) -> anyhow::Result<()> {
     let (epoch, n) = (sql(fence.epoch), sql(fence.n));
-    close_wait(&tx, leg, now)?;
+    close_wait(tx, leg, now)?;
     // The attempt (W19-R01); one before it that never reported ended with its runner.
     tx.execute("UPDATE ci_attempts SET status = 'done', conclusion = 'failure', failure_class = 'runner-lost', finished_at = ?3 WHERE leg_id = ?1 AND number < ?2 AND status = 'running'", params![leg, attempt, now])?;
     tx.execute(
@@ -207,7 +231,6 @@ fn claim_on(c: &mut rusqlite::Connection, leg: &str, agent: &str, executor: &str
         "UPDATE runs SET status = 'running', started_at = COALESCE(started_at, ?2) WHERE id = (SELECT run_id FROM jobs WHERE id = ?1) AND status IN ('queued', 'pending')",
         params![leg, now],
     )?;
-    tx.commit()?;
     Ok(())
 }
 
