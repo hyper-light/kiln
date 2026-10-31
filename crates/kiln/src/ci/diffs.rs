@@ -1664,6 +1664,7 @@ pub async fn route(hub: &Arc<Hub>, method: &Method, segs: &[&str], q: &HashMap<S
         (&Method::POST, ["repos", repo, "submit"]) => ok(submit_patches(hub, repo, caller, body).await?),
         (&Method::POST, ["comments", id, "apply"]) => ok(super::review::apply_suggestion(hub, id, caller, body).await?),
         (&Method::GET, ["repos", repo, "queue"]) => ok(super::land::list(hub, repo).await?),
+        (&Method::GET, ["repos", repo, "lands", commit]) => ok(super::lands::get(hub, repo, commit).await?),
         (&Method::GET, ["stacks", id]) => ok(stack(hub, id).await?),
         (&Method::GET, ["review", "inbox"]) => {
             let mut v = super::review::inbox(hub, caller).await?;
@@ -1687,6 +1688,7 @@ pub async fn route(hub: &Arc<Hub>, method: &Method, segs: &[&str], q: &HashMap<S
         }
         (&Method::POST, ["review", "inbox", "read"]) => ok(super::inbox::read(hub, caller, body).await?),
         (&Method::PATCH, ["comments", id]) => ok(super::review::edit(hub, id, caller, body).await?),
+        (&Method::POST, ["comments", id, "statement"]) => ok(super::verdicts::edit_statement(hub, id, caller, body).await?),
         (&Method::DELETE, ["comments", id]) => ok(super::review::delete(hub, id, caller).await?),
         (&Method::DELETE, ["queue", id]) => ok(super::land::cancel(hub, id, caller).await?),
         (_, ["diffs" | "change-requests", key, rest @ ..]) => {
@@ -1745,6 +1747,8 @@ pub async fn route(hub: &Arc<Hub>, method: &Method, segs: &[&str], q: &HashMap<S
                 (&Method::POST, ["conflicts", id, "resolution"]) => ok(super::conflicts::resolve(hub, &d, id, caller, body).await?),
                 (&Method::DELETE, ["conflicts", id, "resolution"]) => ok(super::conflicts::undo(hub, &d, id, caller).await?),
                 (&Method::POST, ["review"]) => ok(super::review::review(hub, &d, caller, body).await?),
+                (&Method::POST, ["statement"]) => ok(super::verdicts::statement(hub, &d, caller, body).await?),
+                (&Method::GET, ["verdicts"]) => ok(super::verdicts::list(hub, &d).await?),
                 (&Method::POST, ["viewed"]) => ok(super::review::viewed(hub, &d, caller, body).await?),
                 (&Method::GET, ["land"]) => ok(super::review::readiness(hub, &d).await?),
                 (&Method::POST, ["land"]) => {

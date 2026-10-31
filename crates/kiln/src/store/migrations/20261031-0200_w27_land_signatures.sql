@@ -1,0 +1,14 @@
+-- Each land, signed as the queue that tested it (docs/ci.md W27-R07): the statement kiln signed as
+-- its server when its land queue moved the trunk to the candidate it tested, where the trunk was,
+-- its digest, and when.
+CREATE TABLE land_signatures (
+  repo_id TEXT NOT NULL,
+  trunk TEXT NOT NULL,
+  candidate TEXT NOT NULL,
+  base TEXT NOT NULL,
+  digest TEXT NOT NULL,
+  signer TEXT NOT NULL,
+  signed_at INTEGER NOT NULL,
+  bundle TEXT NOT NULL,
+  PRIMARY KEY (repo_id, trunk, candidate)
+);

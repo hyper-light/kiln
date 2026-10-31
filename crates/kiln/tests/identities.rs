@@ -1658,3 +1658,319 @@ fn w27_r06_provenance_verifies_as_the_leg_that_built_it() -> anyhow::Result<()> 
     assert!(field(&signed, "signer").starts_with(&format!("leg e2e of run 1 (attempt 1) at {short}, on runner fedora-2")), "{signed:#}");
     Ok(())
 }
+
+/// A personal access token for person `name`, as much as they may.
+fn token_of(s: &Server, name: &str) -> anyhow::Result<String> {
+    let (st, body) = http(s.port, "POST", "/api/tokens", &s.admin, Some(&serde_json::json!({ "kind": "pat", "user": name, "grants": ["owner"] })))?;
+    anyhow::ensure!((200..300).contains(&st), "{name}'s token: {st} {body}");
+    serde_json::from_str::<Value>(&body)?.get("token").and_then(Value::as_str).map(str::to_owned).ok_or_else(|| anyhow::anyhow!("no token in {body}"))
+}
+
+/// W27-AC04: a verdict verifies on its revision. Kim approves D1 on her laptop (`kiln review
+/// --accept`, signed with `kiln login`'s key over v2's commit and verbatim patch-id). Her
+/// approval holds on v5, after two rewords and a rebase onto a moved trunk (the same verbatim
+/// patch-id), and not on v6, which changed the code, saying so. Once the trunk's policy requires
+/// signatures, an unsigned verdict is refused, saying how to sign, and the gate counts only
+/// verdicts that hold on the version it judges: Kim's signed one, not Bob's unsigned one.
+#[test]
+fn w27_ac04_a_verdict_verifies_on_its_revision() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options::default())?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&serde_json::json!({"name": "acme/review", "mode": "native"})))?;
+    anyhow::ensure!(st == 200, "a repository kiln hosts: {st} {body}");
+    for name in ["sam", "kim", "bob"] {
+        add_person(&s, name)?;
+    }
+    let (sam, kim, bob) = (token_of(&s, "sam")?, token_of(&s, "kim")?, token_of(&s, "bob")?);
+    let laptop = Device::new(dir.path(), "kim-laptop")?;
+    let (ok, said) = laptop.kiln(&["login", "--link", &sign_in_link(&s, "kim")?], None)?;
+    anyhow::ensure!(ok, "kiln login --link: {said}");
+    let base = format!("http://127.0.0.1:{}", s.port);
+    let review = |args: &[&str]| -> anyhow::Result<String> {
+        let (ok, said) = laptop.kiln(&[&["review", "--url", base.as_str(), "--token", kim.as_str()][..], args].concat(), None)?;
+        anyhow::ensure!(ok, "kiln review {args:?}: {said}");
+        Ok(said)
+    };
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let url = |token: &str| format!("http://x:{token}@127.0.0.1:{}/git/acme/review.git", s.port);
+    let git = |at: &Path, args: &[&str]| -> anyhow::Result<String> {
+        let o = std::process::Command::new("git")
+            .args(["-c", "user.name=sam", "-c", "user.email=sam@example.com", "-c", "init.defaultBranch=main", "-c", "credential.helper="])
+            .args(args)
+            .current_dir(at)
+            .env("HOME", &home)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()?;
+        let said = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        anyhow::ensure!(o.status.success(), "git {args:?}: {said}");
+        Ok(said)
+    };
+    let verdicts = || -> anyhow::Result<Vec<Value>> {
+        let (st, body) = http(s.port, "GET", "/api/diffs/D1/verdicts", &s.admin, None)?;
+        anyhow::ensure!(st == 200, "verdicts: {st} {body}");
+        Ok(serde_json::from_str::<Value>(&body)?.get("verdicts").and_then(Value::as_array).cloned().unwrap_or_default())
+    };
+    let kims = || -> anyhow::Result<Value> { verdicts()?.into_iter().rev().find(|v| field(v, "reviewer") == "user:kim").ok_or_else(|| anyhow::anyhow!("no verdict of kim's")) };
+
+    git(dir.path(), &["clone", "-q", &url(&sam), "work"])?;
+    let work = dir.path().join("work");
+    std::fs::write(work.join("a.py"), "def f():\n    return 1\n")?;
+    std::fs::write(work.join("z.txt"), "far away\n")?;
+    git(&work, &["add", "."])?;
+    git(&work, &["commit", "-qm", "first"])?;
+    git(&work, &["push", "-q", "origin", "main"])?;
+    git(&work, &["checkout", "-qb", "d1"])?;
+    let message = "f returns two\n\nChange-Id: I4141414141414141414141414141414141414141\n";
+    std::fs::write(work.join("a.py"), "def f():\n    return 2\n")?;
+    git(&work, &["commit", "-qam", message])?;
+    git(&work, &["push", "origin", "HEAD:refs/for/main"])?;
+    std::fs::write(work.join("a.py"), "def f():\n    return 2  # two\n")?;
+    git(&work, &["commit", "-q", "--amend", "-a", "-m", message])?;
+    let said = git(&work, &["push", "origin", "HEAD:refs/for/main"])?;
+    anyhow::ensure!(said.contains("D1 v2"), "v2: {said}");
+
+    // Kim approves v2, signed on her laptop.
+    review(&["D1", "--accept", "-m", "looks right"])?;
+    let v = kims()?;
+    assert_eq!((field(&v, "signer"), field(&v, "standing"), v.get("version")), ("kiln://hyper-light/person/kim", "given", Some(&serde_json::json!(2))), "{v}");
+    // Two rewords and a rebase onto a moved trunk: the same verbatim patch-id, so it holds on v5.
+    for (n, words) in [(3, "f returns 2"), (4, "f returns two, as asked")] {
+        git(&work, &["commit", "-q", "--amend", "-m", &format!("{words}\n\nChange-Id: I4141414141414141414141414141414141414141\n")])?;
+        let said = git(&work, &["push", "origin", "HEAD:refs/for/main"])?;
+        anyhow::ensure!(said.contains(&format!("D1 v{n}")), "v{n}: {said}");
+    }
+    git(&work, &["checkout", "-q", "main"])?;
+    std::fs::write(work.join("z.txt"), "far away, moved\n")?;
+    git(&work, &["commit", "-qam", "the trunk moves"])?;
+    git(&work, &["push", "-q", &url(&s.admin), "HEAD:main"])?;
+    git(&work, &["checkout", "-q", "d1"])?;
+    git(&work, &["rebase", "-q", "main"])?;
+    let said = git(&work, &["push", "origin", "HEAD:refs/for/main"])?;
+    anyhow::ensure!(said.contains("D1 v5"), "v5: {said}");
+    let v = kims()?;
+    assert_eq!((field(&v, "standing"), v.get("on")), ("carried", Some(&serde_json::json!(5))), "carried to v5: {v}");
+    // v6 changes the code: her approval doesn't hold there, and says why.
+    std::fs::write(work.join("a.py"), "def f():\n    return 3\n")?;
+    git(&work, &["commit", "-q", "--amend", "-a", "-m", message])?;
+    let said = git(&work, &["push", "origin", "HEAD:refs/for/main"])?;
+    anyhow::ensure!(said.contains("D1 v6"), "v6: {said}");
+    let v = kims()?;
+    assert_eq!(field(&v, "standing"), "not", "on v6: {v}");
+    assert!(field(&v, "why").contains("v6 changed the code"), "{v}");
+
+    // Bob accepts v6 unsigned while the trunk only warns; then the trunk requires signatures.
+    let (st, body) = http(s.port, "POST", "/api/diffs/D1/review", &bob, Some(&serde_json::json!({ "action": "accept" })))?;
+    anyhow::ensure!(st == 200, "bob's unsigned accept, taken where signatures aren't required: {st} {body}");
+    git(&work, &["checkout", "-q", "main"])?;
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    std::fs::write(work.join(".kiln/review.yaml"), "signatures:\n  mode: required\n")?;
+    git(&work, &["add", ".kiln/review.yaml"])?;
+    git(&work, &["commit", "-qm", "signatures required"])?;
+    git(&work, &["push", "-q", &url(&s.admin), "HEAD:main"])?;
+    let (st, body) = http(s.port, "POST", "/api/diffs/D1/review", &s.admin, Some(&serde_json::json!({ "action": "comment", "body": "unsigned" })))?;
+    assert_eq!(st, 428, "an unsigned verdict where they're required: {body}");
+    assert!(body.contains("requires signatures") && body.contains("/statement"), "says how to sign: {body}");
+    review(&["D1", "--accept", "-m", "v6 too"])?;
+    let (st, body) = http(s.port, "GET", "/api/diffs/D1/land", &s.admin, None)?;
+    anyhow::ensure!(st == 200, "land: {st} {body}");
+    let land: Value = serde_json::from_str(&body)?;
+    assert_eq!(land.get("accepting"), Some(&serde_json::json!(["user:kim"])), "only the verdict that holds counts: {land}");
+
+    // Comments too: each signed by whoever gives it, with the key on Kim's laptop, and its words
+    // again when they're edited; one given by someone other than its signer is refused.
+    let key = rcgen::KeyPair::from_pem(&std::fs::read_to_string(laptop.file("identity.key"))?)?;
+    let cert = kiln::pki::der_of(&std::fs::read_to_string(laptop.file("identity.pem"))?)?;
+    let sign = |statement: &str, ask: &Value| -> anyhow::Result<Value> {
+        use base64::Engine as _;
+        use rcgen::SigningKey as _;
+        let (st, body) = http(s.port, "POST", statement, &kim, Some(ask))?;
+        anyhow::ensure!(st == 200, "what to sign: {st} {body}");
+        let t: Value = serde_json::from_str(&body)?;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let (payload, pae) = (b64.decode(field(&t, "payload"))?, b64.decode(field(&t, "pae"))?);
+        Ok(kiln_ci::identity::statement::bundle(field(&t, "payload_type"), &payload, &key.sign(&pae)?, &cert))
+    };
+    let said = serde_json::json!({ "body": "why 3?", "file": "a.py", "start_line": 2 });
+    let (st, body) = http(s.port, "POST", "/api/diffs/D1/comments", &kim, Some(&said))?;
+    assert_eq!(st, 428, "an unsigned comment where they're required: {body}");
+    let signed = sign("/api/diffs/D1/statement", &serde_json::json!({ "kind": "comment", "body": "why 3?", "file": "a.py", "start_line": 2 }))?;
+    let (st, body) = http(s.port, "POST", "/api/diffs/D1/comments", &bob, Some(&serde_json::json!({ "body": "why 3?", "file": "a.py", "start_line": 2, "signed": signed })))?;
+    assert_eq!(st, 403, "Kim's signature on Bob's comment: {body}");
+    let (st, body) = http(s.port, "POST", "/api/diffs/D1/comments", &kim, Some(&serde_json::json!({ "body": "why 3?", "file": "a.py", "start_line": 2, "signed": signed })))?;
+    assert_eq!(st, 200, "Kim's signed comment: {body}");
+    let comment = field(&serde_json::from_str::<Value>(&body)?, "id").to_owned();
+    let path = format!("/api/comments/{comment}");
+    let (st, body) = http(s.port, "PATCH", &path, &kim, Some(&serde_json::json!({ "body": "why 3, not 2?" })))?;
+    assert_eq!(st, 428, "new words unsigned: {body}");
+    let other = sign(&format!("{path}/statement"), &serde_json::json!({ "body": "why 3, not 4?" }))?;
+    let (st, body) = http(s.port, "PATCH", &path, &kim, Some(&serde_json::json!({ "body": "why 3, not 2?", "signed": other })))?;
+    assert_eq!(st, 422, "signed for other words: {body}");
+    let signed = sign(&format!("{path}/statement"), &serde_json::json!({ "body": "why 3, not 2?" }))?;
+    let (st, body) = http(s.port, "PATCH", &path, &kim, Some(&serde_json::json!({ "body": "why 3, not 2?", "signed": signed })))?;
+    assert_eq!(st, 200, "the new words, signed: {body}");
+    Ok(())
+}
+
+/// W27-R04: an agent's verdict is signed as the agent, by the runner holding its key, never by the
+/// server. The agent gives it as agents do, through its MCP server (`kiln reach mcp`'s `code_run`,
+/// `kiln.ci.diffs.review`): that server asks kiln what to sign and has the runner sign it for the
+/// session, as kiln-git-sign has its commits signed. The verdict kiln keeps verifies as the agent at
+/// its epoch on its runner, for its person.
+#[test]
+fn w27_r04_an_agents_verdict_is_signed_by_its_runner() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options::default())?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&serde_json::json!({"name": "acme/agent-review", "mode": "native"})))?;
+    anyhow::ensure!(st == 200, "a repository kiln hosts: {st} {body}");
+    add_person(&s, "sam")?;
+    let sam = token_of(&s, "sam")?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let git = |at: &Path, args: &[&str]| -> anyhow::Result<String> {
+        let o = std::process::Command::new("git")
+            .args(["-c", "user.name=sam", "-c", "user.email=sam@example.com", "-c", "init.defaultBranch=main", "-c", "credential.helper="])
+            .args(args)
+            .current_dir(at)
+            .env("HOME", &home)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()?;
+        let said = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        anyhow::ensure!(o.status.success(), "git {args:?}: {said}");
+        Ok(said)
+    };
+    git(dir.path(), &["clone", "-q", &format!("http://x:{sam}@127.0.0.1:{}/git/acme/agent-review.git", s.port), "work"])?;
+    let work = dir.path().join("work");
+    std::fs::write(work.join("a.py"), "def f():\n    return 1\n")?;
+    git(&work, &["add", "."])?;
+    git(&work, &["commit", "-qm", "first"])?;
+    git(&work, &["push", "-q", "origin", "main"])?;
+    std::fs::write(work.join("a.py"), "def f():\n    return 2\n")?;
+    git(&work, &["commit", "-qam", "f returns two\n\nChange-Id: I4242424242424242424242424242424242424242\n"])?;
+    let said = git(&work, &["push", "origin", "HEAD:refs/for/main"])?;
+    anyhow::ensure!(said.contains("D1 v1"), "D1: {said}");
+
+    // What the agent does with the message `review <its session's id>`: accept D1 through its MCP
+    // server (other messages, kiln's own first one, it leaves).
+    let cwd = dir.path().join("agent-here");
+    std::fs::create_dir_all(&cwd)?;
+    let act = dir.path().join("act.sh");
+    let call = serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "code_run", "arguments": {"program": "return await kiln.ci.diffs.review({diff: \"D1\", action: \"accept\", body: \"from the agent\"})"}}});
+    let init = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}}});
+    std::fs::write(
+        &act,
+        format!(
+            "#!/bin/sh\ntext=$(cat)\ncase \"$text\" in review\\ *) KILN_SESSION=${{text#review }} ;; *) exit 0 ;; esac\nexport KILN_SESSION\n{{ printf '%s\\n' '{init}' '{call}'; while ! grep -q '\"id\":2' mcp.out 2>/dev/null; do sleep 0.2; done; }} | '{}' reach mcp > mcp.out 2> mcp.err\necho done >> mcp.out\n",
+            env!("CARGO_BIN_EXE_kiln")
+        ),
+    )?;
+    std::fs::set_permissions(&act, std::fs::Permissions::from_mode(0o755))?;
+    let act_path = act.to_string_lossy().into_owned();
+    let (_main, log) = agents::runner_with(dir.path(), s.port, "box-a", None, TALK, &[("FAKE_CLAUDE_ACT", &act_path)])?;
+    agents::connected(s.port, &s.admin, "box-a", &log, Duration::from_secs(60))?;
+    let id = agents::open_session(s.port, &s.admin, "box-a", &cwd, Duration::from_secs(60))?;
+    let epoch = format!("/agent/{id}/epoch/");
+    until_identities(&s, "agent", Duration::from_secs(60), |l| l.iter().any(|i| field(i, "subject").contains(&epoch) && !field(i, "verified").is_empty()))?;
+    let (st, sent) = http(s.port, "POST", &format!("/api/harness/sessions/{id}/command"), &s.admin, Some(&serde_json::json!({"type": "send", "id": "review", "text": format!("review {id}")})))?;
+    anyhow::ensure!((200..300).contains(&st), "send: {st} {sent}");
+    let out = || std::fs::read_to_string(cwd.join("mcp.out")).unwrap_or_default();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !out().contains("done") {
+        anyhow::ensure!(Instant::now() < deadline, "the agent's MCP server never answered: {}\n{}", out(), std::fs::read_to_string(cwd.join("mcp.err")).unwrap_or_default());
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let (st, body) = http(s.port, "GET", "/api/diffs/D1/verdicts", &s.admin, None)?;
+    anyhow::ensure!(st == 200, "verdicts: {st} {body}");
+    let verdicts: Value = serde_json::from_str(&body)?;
+    let v = verdicts.get("verdicts").and_then(Value::as_array).and_then(|l| l.first()).cloned().ok_or_else(|| anyhow::anyhow!("no verdict: {body}\nthe agent's MCP server said: {}", out()))?;
+    assert_eq!((field(&v, "action"), field(&v, "standing")), ("accept", "given"), "{v}");
+    let signer = kiln_ci::identity::chain::Identity::parse(field(&v, "signer")).map_err(|e| anyhow::anyhow!("{e}: {v}"))?;
+    assert!(matches!(&signer.actor, kiln_ci::identity::chain::Actor::Agent { agent, held_by: Some(h), person, .. } if *agent == id && h.machine == "box-a" && person == "admin"), "as the agent, on its runner, for its person: {signer}");
+    Ok(())
+}
+
+/// W27-R07: a land is signed by its queue. D1, its `gate` check required, is approved by Kim (signed
+/// on her laptop) and landed through main's queue, which runs `gate` on the candidate. The land's
+/// statement verifies to kiln's root as kiln's server, names main's queue, the candidate that
+/// landed (main's new head) as its subject, D1 at its version with Kim's verdict, and the `gate`
+/// run with its legs' signed results.
+#[test]
+fn w27_r07_a_land_is_signed_by_its_queue() -> anyhow::Result<()> {
+    use kiln_ci::identity::{landing, statement};
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ..Options::default() })?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&serde_json::json!({"name": "acme/landed", "mode": "native"})))?;
+    anyhow::ensure!(st == 200, "a repository kiln hosts: {st} {body}");
+    for name in ["sam", "kim"] {
+        add_person(&s, name)?;
+    }
+    let (sam, kim) = (token_of(&s, "sam")?, token_of(&s, "kim")?);
+    let laptop = Device::new(dir.path(), "kim-laptop")?;
+    let (ok, said) = laptop.kiln(&["login", "--link", &sign_in_link(&s, "kim")?], None)?;
+    anyhow::ensure!(ok, "kiln login --link: {said}");
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let url = format!("http://x:{sam}@127.0.0.1:{}/git/acme/landed.git", s.port);
+    let git = |at: &Path, args: &[&str]| -> anyhow::Result<String> {
+        let o = std::process::Command::new("git")
+            .args(["-c", "user.name=sam", "-c", "user.email=sam@example.com", "-c", "init.defaultBranch=main", "-c", "credential.helper="])
+            .args(args)
+            .current_dir(at)
+            .env("HOME", &home)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()?;
+        let said = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        anyhow::ensure!(o.status.success(), "git {args:?}: {said}");
+        Ok(said)
+    };
+    git(dir.path(), &["clone", "-q", &url, "work"])?;
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    std::fs::create_dir_all(work.join(".github/workflows"))?;
+    std::fs::write(work.join(".kiln/review.yaml"), "land:\n  approvals: 1\n  checks: [gate]\n")?;
+    std::fs::write(work.join(".github/workflows/gate.yml"), "name: gate\non: [pull_request, merge_group]\njobs:\n  gate:\n    runs-on: local\n    steps:\n      - run: echo gated\n")?;
+    std::fs::write(work.join("a.py"), "def f():\n    return 1\n")?;
+    git(&work, &["add", "."])?;
+    git(&work, &["commit", "-qm", "first"])?;
+    git(&work, &["push", "-q", "origin", "main"])?;
+    std::fs::write(work.join("a.py"), "def f():\n    return 2\n")?;
+    git(&work, &["commit", "-qam", "f returns two\n\nChange-Id: I7777777777777777777777777777777777777777\n"])?;
+    let said = git(&work, &["push", "origin", "HEAD:refs/for/main"])?;
+    anyhow::ensure!(said.contains("D1 v1"), "D1: {said}");
+    let (ok, said) = laptop.kiln(&["review", "--url", &format!("http://127.0.0.1:{}", s.port), "--token", &kim, "D1", "--accept"], None)?;
+    anyhow::ensure!(ok, "kiln review: {said}");
+    let get = |path: &str| -> anyhow::Result<Value> {
+        let (st, body) = http(s.port, "GET", path, &s.admin, None)?;
+        anyhow::ensure!(st == 200, "{path}: {st} {body}");
+        Ok(serde_json::from_str(&body)?)
+    };
+    let deadline = Instant::now() + Duration::from_secs(240);
+    while get("/api/diffs/D1/land")?.get("blockers") != Some(&serde_json::json!([])) {
+        anyhow::ensure!(Instant::now() < deadline, "D1's gate: {}", get("/api/diffs/D1/land")?);
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let (st, body) = http(s.port, "POST", "/api/diffs/D1/land", &s.admin, Some(&serde_json::json!({})))?;
+    anyhow::ensure!(st == 200, "land: {st} {body}");
+    while field(&get("/api/diffs/D1")?, "state") != "landed" {
+        anyhow::ensure!(Instant::now() < deadline, "D1 never landed: {}", get("/api/repos/acme%2Flanded/queue")?);
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let tip = git(&work, &["ls-remote", "origin", "refs/heads/main"])?.split_whitespace().next().unwrap_or_default().to_owned();
+    let signed = get(&format!("/api/repos/acme%2Flanded/lands/{tip}"))?;
+    let bundle = signed.get("bundle").cloned().unwrap_or_default();
+    let checked = statement::verify(&bundle, &root(&s)?, &revocations_now(&s)?, signed.get("signed_at").and_then(Value::as_i64).unwrap_or_default())?;
+    assert_eq!(checked.custodian, "kiln://hyper-light/server", "signed as kiln's server, whose queue it is");
+    let land = landing::read(&checked.payload_type, &checked.statement).map_err(|e| anyhow::anyhow!(e))?;
+    assert_eq!((land.queue(), land.candidate.as_str()), ("acme/landed:main".to_owned(), tip.as_str()), "the candidate that landed: {land:?}");
+    let kims = get("/api/diffs/D1/verdicts")?.get("verdicts").and_then(Value::as_array).and_then(|l| l.first()).map(|v| field(v, "digest").to_owned()).unwrap_or_default();
+    let d1 = land.batch.first().ok_or_else(|| anyhow::anyhow!("an empty batch: {land:?}"))?;
+    assert_eq!((d1.diff.as_str(), d1.version, &d1.verdicts), ("D1", 1, &vec![kims]), "{land:?}");
+    let gate = land.checks.iter().find(|c| c.name == "gate").ok_or_else(|| anyhow::anyhow!("no gate run: {land:?}"))?;
+    assert_eq!(gate.conclusion, "success", "{land:?}");
+    assert!(!gate.results.is_empty(), "the gate's legs' signed results: {land:?}");
+    Ok(())
+}

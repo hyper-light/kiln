@@ -9020,10 +9020,87 @@ research `01a17947fdad71e5a4f15866e3541c41`.
   simulator and githost.
 - *Not yet.* A host's pull request isn't judged by `.kiln/review.yaml`'s `signatures:` on what its
   host verified; the mirror reads a pull request's first 100 commits, so later ones have no
-  verdict; verdicts (R04); lands (R07). A remote naming kiln's server by another name
+  verdict. A remote naming kiln's server by another name
   than those (another host name for it) keeps the person's credential. A job's push (its
   `GITHUB_TOKEN`) can't sign its commits, so it's refused where signatures are required. Agents
   the server runs itself hold no key of theirs, so what they commit is unsigned.
+
+**Built: verdicts and comments, signed by whoever gives them (R04, AC04).** Plan
+`01a17856b1b273268adf6ce8c4f78410` step 4.
+
+- *What's signed.* Each verdict and comment is a signed statement (`kiln_ci::identity::verdict`):
+  a verdict's `application/vnd.kiln.review.verdict+json`, a comment's
+  `application/vnd.kiln.review.comment+json`. Its subject is the diff's version it's given on, by
+  its commit and its verbatim patch-id (`git patch-id --verbatim`: context and whitespace kept; the
+  `--stable` one stays for finding changes). A verdict says its action and the SHA-256 of its
+  words; a comment says where it is (its thread, or its file's side and lines) and the SHA-256 of
+  its words and of its suggestion.
+- *Who signs.* kiln says what to sign, as whoever asks (`POST /api/diffs/:id/statement`; `POST
+  /api/comments/:id/statement` for an edit's new words; the `ci.diffs.statement` operation). The
+  giver signs it where their key is and gives it with the verdict or comment as `signed`:
+  - a person in a browser, with a key of the browser's own (WebCrypto's ECDSA P-256, never
+    extractable), made on their first verdict's or comment's click and kept in IndexedDB,
+    certified from its CSR as `kiln login`'s is (`POST /api/me/identity`) and again at half its
+    life; a page that isn't secure can't sign;
+  - a person at the command line, `kiln review`, with `kiln login`'s key;
+  - an agent, through its MCP server (`kiln reach mcp`), which has the runner holding the
+    session's key sign it, as kiln-git-sign has its commits signed (`kiln review` in its session
+    too); never with its person's key.
+- *Taken.* kiln checks a signature as of when it takes it (against its root and the revocations).
+  It must be by whoever gives it (the person signed in, or the agent session for its person), and
+  say what's asked, on the diff's latest version (a comment's, its own). Its envelope is kept beside
+  the verdict or comment (migration `w27_review_signatures`). An edit's new words replace their
+  comment's signature, or, given unsigned, drop it.
+- *Where a verdict holds.* On its own version, and on a later one with its verbatim patch-id (a
+  rebase that only moved the change; a replay's `same_patch`, W26-R16, is that same comparison);
+  never on one that changed the code, a whitespace-only change or one whose surrounding lines
+  changed included, saying why. `GET /api/diffs/:id/verdicts` says where each stands on the latest
+  version: given, carried, not, or unsigned.
+- *Where signatures are required* (its trunk's `.kiln/review.yaml` `signatures: mode`, else the
+  repository's own, as for pushes), an unsigned verdict or comment is refused (428, saying how to
+  sign it), and the gate counts only verdicts that hold on the version it judges: rebase-only
+  versions alone carry nothing. Elsewhere, unsigned ones are taken and count as before. A job's
+  reviews (through the GitHub-compatible API) are taken unsigned and never count where signatures
+  are required.
+- *Tests.* kiln-ci's `identity::verdict` (`w27_r04_a_verdict_reads_back_from_its_statement`,
+  `w27_r04_a_signed_verdict_is_held_to_what_its_request_asks`,
+  `w27_ac04_a_verdict_holds_on_its_revision_and_on_rebases_of_its_patch`: v2 checked on v5, v6, v6ws
+  and v5ctx) and `land` (`w27_r04_where_signatures_are_required_only_verdicts_that_hold_count`);
+  integration `w27_ac04_a_verdict_verifies_on_its_revision` (Kim's approval, signed on her laptop,
+  carried to v5 and not v6; then, required, an unsigned verdict and comment refused, the gate
+  counting only hers, comments and their edits signed) and
+  `w27_r04_an_agents_verdict_is_signed_by_its_runner`; `ci::verdicts`'s
+  `w27_r04_a_browsers_key_is_certified_and_what_it_signs_verifies` (a CSR and a signature the
+  browser's own code made, certified and verified by kiln) and the UI's `signing.test.ts`.
+- *Not yet.* Ship's marks don't name a verdict's signer yet (their `signer` stays null; the CI/CD
+  Integration agent's, its shape agreed: `signer`, and `signed`'s standing on approval marks). A
+  conflict resolution's acceptance (W26-R17's ladder) takes this verdict path once both are on one
+  branch. Jobs' reviews aren't signed as their legs.
+
+**Built: each land, signed as the queue that tested it (R07).** Plan
+`01a17856b1b273268adf6ce8c4f78410` step 6.
+
+- *What's signed.* When the land queue moves a trunk to the candidate it tested (its
+  compare-and-swap), kiln signs the land as its server, whose queue it is. The statement
+  (`kiln_ci::identity::landing`, `application/vnd.kiln.land+json`) is about the trunk at the
+  candidate that landed (`<repo>@refs/heads/<trunk>`, by `gitCommit`). It names its queue
+  (`<repo>:<trunk>`) and where the trunk was (`base`). It names the batch's diffs, each at the
+  version that landed, with the commit that carries it on the candidate and the signed accepts that
+  hold on it (their statements' digests, R04). And it names the checks run on the candidate, each
+  with its conclusion and its legs' signed results (their statements' digests, R05). A leg that
+  signs sends those as it ends, a moment before its job does, so the queue can see a check pass
+  first: the land's signing waits for them up to 10 seconds, then signs with what kiln has.
+- *Kept and read.* It's kept in `land_signatures` (migration `w27_land_signatures`). `GET
+  /api/repos/:repo/lands/:commit` reads it back: its trunk, base, signer, digest, when, what it says,
+  and its envelope. A land kiln can't sign stands, unsigned, and the log says so.
+- *Tests.* kiln-ci's `identity::landing` (`w27_r07_a_lands_statement_reads_back`,
+  `w27_r07_a_land_that_doesnt_hold_together_is_refused`), and integration
+  `w27_r07_a_land_is_signed_by_its_queue`. In it D1, approved by Kim on her laptop, lands through
+  main's queue with its `gate` run on the candidate. The statement verifies as kiln's server and
+  names main's queue, the candidate that landed, D1 at v1 with Kim's verdict, and `gate` with its
+  legs' signed results.
+- *Not yet.* The Merge Queues agent's queue signs its lands the same way (it has the statement's
+  shape). A land's statement isn't posted to hosts.
 
 **Built: a leg's results and provenance, signed as the leg (R05, R06).** Plan
 `01a17856b1b273268adf6ce8c4f78410` step 5, planned as `01a18b12f931749d83a2acdfbf55e67a` (research

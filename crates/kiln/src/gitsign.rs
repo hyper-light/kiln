@@ -95,8 +95,9 @@ fn sign(key: &str, payload: &[u8]) -> anyhow::Result<(String, String)> {
     Ok((armored, fingerprint))
 }
 
-/// An agent's signature: asked of the runner holding its session's key (`harness::socket`).
-fn by_the_runner(message: &[u8]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+/// An agent's signature: asked of the runner holding its session's key (`harness::socket`). Also
+/// its verdicts' and comments' (W27-R04).
+pub(crate) fn by_the_runner(message: &[u8]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     let b64 = base64::engine::general_purpose::STANDARD;
     let answer = crate::harness::cli::request(&crate::harness::socket::Request::Sign { message: b64.encode(message) }).context("the runner holding this agent's key didn't sign")?;
     let field = |k: &str| -> anyhow::Result<Vec<u8>> {
@@ -106,8 +107,9 @@ fn by_the_runner(message: &[u8]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     Ok((field("signature")?, field("certificate")?))
 }
 
-/// A person's signature, with `kiln login`'s key on this device.
-fn with_device_key(message: &[u8]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+/// A person's signature, with `kiln login`'s key on this device. Also their verdicts' and comments'
+/// (W27-R04).
+pub(crate) fn with_device_key(message: &[u8]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     use rcgen::SigningKey as _;
     let dir = crate::identities::device_dir();
     let key = std::fs::read_to_string(dir.join("identity.key")).with_context(|| format!("this device has no identity to sign with ({}): `kiln login` makes one", dir.display()))?;
