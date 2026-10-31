@@ -476,6 +476,10 @@ fn inputs(seed: u64) -> Vec<(Input, i64)> {
                 if d.below(4) == 0 {
                     l.on_lease_loss = super::state::LeaseLoss::Stop;
                 }
+                // A member of its run's gang of two (W05-R40).
+                if d.below(6) == 0 {
+                    l.gang = Some(super::state::Gang { id: format!("{}-gang", l.run), size: 2 });
+                }
                 if d.below(5) == 0 {
                     let coalesce = (d.below(2) == 0).then_some(super::admit::Coalesce { quiet: 5_000, max_wait: 60_000, always: d.below(2) == 0 });
                     l.admission = Some(super::admit::Demand { lane: "acme/x\0ci\0main".into(), unit: "test".into(), order: u64::try_from(legs.len()).unwrap_or(0), coalesce, cadence: None, speculative: false });
@@ -2989,4 +2993,146 @@ fn w05_r39_an_exclusive_leg_reserves_its_runner_whole() {
     assert_eq!(sim.started("short"), Some(2 * MIN));
     assert_eq!(sim.started("whole"), Some(10 * MIN));
     assert!(sim.started("long").is_some_and(|t| t >= 20 * MIN), "{:?}", sim.started("long"));
+}
+
+/// A leg of the gang `g` of `size` (W05-R40).
+fn member(id: &str, g: &str, size: u32) -> LegIn {
+    LegIn { gang: Some(super::state::Gang { id: g.into(), size }), ..leg(id, "acme/x", 60) }
+}
+
+/// The legs a handle's commands take back, and why.
+fn taken_back(c: &[Command]) -> Vec<(String, super::state::Loss)> {
+    c.iter().filter_map(|x| if let Command::Lost { leg, why, .. } = x { Some((leg.clone(), *why)) } else { None }).collect()
+}
+
+/// A gang of three on three one-slot runners, granted whole: the scheduler and each member's
+/// grant (its runner and fence).
+fn gang_of_three() -> (Scheduler, std::collections::BTreeMap<String, (String, Fence)>) {
+    let mut s = Scheduler::new(Config::default());
+    for r in ["a", "b", "c"] {
+        s.handle(Input::RunnerUp(Box::new(linux(r, 1))), 0);
+    }
+    for m in ["m0", "m1", "m2"] {
+        s.handle(Input::LegQueued(Box::new(member(m, "sim", 3))), 1);
+    }
+    let grants = ["m0", "m1", "m2"].into_iter().filter_map(|m| s.grant(m).and_then(|(_, g)| g.map(|(r, f)| (m.to_owned(), (r.to_owned(), f))))).collect();
+    (s, grants)
+}
+
+/// W05-R40, docs/needs.md E4.3: no member of a gang is granted before all its members are
+/// queued, each saying how many of how many are; then all are granted in one handle.
+#[test]
+fn w05_r40_a_gang_waits_for_all_its_members() {
+    let mut s = Scheduler::new(Config::default());
+    for r in ["a", "b", "c"] {
+        s.handle(Input::RunnerUp(Box::new(linux(r, 1))), 0);
+    }
+    for m in ["m0", "m1"] {
+        let c = s.handle(Input::LegQueued(Box::new(member(m, "sim", 3))), 1);
+        assert_eq!(assigned(&c), Vec::<String>::new());
+        assert_eq!(s.check_grants(), Ok(()));
+    }
+    assert_eq!(s.reason("m0"), Some(&WaitReason::Gang { gang: "sim".into(), have: 2, of: 3 }));
+    let c = s.handle(Input::LegQueued(Box::new(member("m2", "sim", 3))), 2);
+    assert_eq!(assigned(&c), vec!["m0", "m1", "m2"]);
+    assert_eq!(s.check_grants(), Ok(()));
+}
+
+/// W05-R40: room for two of three now, the third's runner busy until 10 minutes: with
+/// backfilling, none starts before then, each member's runner is kept for it from then, a leg
+/// that would run past then waits behind it, and the three start together then.
+#[test]
+fn w05_r40_a_gang_starts_whole_or_reserves_whole() {
+    let mut sim = Sim::new(Config { backfill: true, ..Config::default() });
+    for r in ["a", "b", "c"] {
+        sim.runner(0, linux(r, 1));
+    }
+    sim.leg(0, LegIn { p90: Some(10 * 60_000), ..leg("x", "acme/y", 60) }, 10 * MIN);
+    // x takes a; the gang's members come once it runs.
+    for m in ["m0", "m1", "m2"] {
+        sim.leg(MIN, LegIn { p90: Some(20 * 60_000), ..member(m, "sim", 3) }, 20 * MIN);
+    }
+    sim.leg(MIN, LegIn { p90: Some(30 * 60_000), ..leg("late", "acme/x", 60) }, 30 * MIN);
+    sim.run(5 * MIN);
+    assert_eq!(["m0", "m1", "m2"].map(|m| sim.started(m)), [None, None, None]);
+    for m in ["m0", "m1", "m2"] {
+        assert!(matches!(sim.last_wait(m), Some(WaitReason::Reserved { at, .. }) if *at == 10 * MIN), "{m}: {:?}", sim.last_wait(m));
+    }
+    assert!(matches!(sim.last_wait("late"), Some(WaitReason::Behind { at, .. }) if *at == 10 * MIN), "{:?}", sim.last_wait("late"));
+    assert_eq!(sim.sched.check_grants(), Ok(()));
+    sim.run(60 * MIN);
+    assert_eq!(["m0", "m1", "m2"].map(|m| sim.started(m)), [Some(10 * MIN); 3]);
+    assert!(sim.started("late").is_some_and(|t| t >= 30 * MIN), "{:?}", sim.started("late"));
+}
+
+/// W05-R40: a member refused by its runner takes its gang's other grants back (`Loss::Gang`), and
+/// the gang is queued again at the same attempts and granted whole, the refused member on another
+/// runner.
+#[test]
+fn w05_r40_a_refused_member_takes_its_gang_back() {
+    let (mut s, grants) = gang_of_three();
+    assert_eq!(grants.len(), 3);
+    let (runner, fence) = grants.get("m1").cloned().unwrap_or_default();
+    let c = s.handle(Input::Rejected { leg: "m1".into(), fence }, 2);
+    let mut back = taken_back(&c);
+    back.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(back, vec![("m0".to_owned(), super::state::Loss::Gang), ("m2".to_owned(), super::state::Loss::Gang)]);
+    let mut again = assigned(&c);
+    again.sort();
+    assert_eq!(again, vec!["m0", "m1", "m2"]);
+    assert_eq!(["m0", "m1", "m2"].map(|m| s.grant(m).map(|g| g.0)), [Some(1); 3], "the same attempts");
+    assert!(s.grant("m1").and_then(|g| g.1).is_some_and(|(r, _)| r != runner), "m1 on another runner");
+    assert_eq!(s.check_grants(), Ok(()));
+}
+
+/// W05-R40: a member lost with its runner before any member's attempt has ended takes the others
+/// back, and the three go again together at their next attempts, once there's room for all three.
+#[test]
+fn w05_r40_a_member_lost_before_any_ended_takes_its_gang_to_the_next_attempts() {
+    let (mut s, grants) = gang_of_three();
+    let (runner, _) = grants.get("m1").cloned().unwrap_or_default();
+    let c = s.handle(Input::RunnerLost { runner: runner.clone() }, 2);
+    let mut back = taken_back(&c);
+    back.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(back.iter().filter(|(_, why)| *why == super::state::Loss::Gang).map(|(l, _)| l.as_str()).collect::<Vec<_>>(), vec!["m0", "m2"]);
+    assert_eq!(["m0", "m1", "m2"].map(|m| s.grant(m)), [Some((2, None)); 3], "each at its next attempt, none running");
+    assert_eq!(s.check_grants(), Ok(()));
+    // Two runners can't hold three: they wait whole until the third is back.
+    let c = s.handle(Input::RunnerUp(Box::new(linux(&runner, 1))), 3);
+    let mut again = assigned(&c);
+    again.sort();
+    assert_eq!(again, vec!["m0", "m1", "m2"]);
+    assert_eq!(s.check_grants(), Ok(()));
+}
+
+/// W05-R40: once a member's attempt has ended, a member lost isn't tried again alone (its peers
+/// aren't there to meet it): it ends failed, runner-lost, and the rest run on.
+#[test]
+fn w05_r40_a_member_lost_after_another_ended_is_not_tried_alone() {
+    let (mut s, grants) = gang_of_three();
+    s.handle(Input::AttemptFinished { leg: "m0".into(), attempt: 1, outcome: Outcome::Success }, 2);
+    let (runner, _) = grants.get("m1").cloned().unwrap_or_default();
+    let c = s.handle(Input::RunnerLost { runner }, 3);
+    assert!(c.iter().any(|x| matches!(x, Command::Settled { leg, outcome: Outcome::Failed(f), .. } if leg == "m1" && f.class == FailureClass::RunnerLost)), "{c:?}");
+    assert!(!taken_back(&c).iter().any(|(l, _)| l == "m2"), "{c:?}");
+    assert!(s.grant("m2").and_then(|g| g.1).is_some(), "m2 runs on");
+    assert_eq!(s.check_grants(), Ok(()));
+}
+
+/// W05-R40: a gang running when the server restarts comes back as it ran, its members started
+/// together (W05-R25): one lost then takes the other back with it.
+#[test]
+fn w05_r40_a_restart_rebuilds_a_gang_as_it_ran() {
+    let mut s = Scheduler::with_epoch(Config::default(), 2);
+    for r in ["a", "b"] {
+        s.handle(Input::RunnerUp(Box::new(linux(r, 1))), 0);
+    }
+    for (m, r, n) in [("m0", "a", 1), ("m1", "b", 2)] {
+        s.handle(Input::LegRunning { leg: Box::new(member(m, "pair", 2)), runner: r.into(), attempt: 1, fence: Fence { epoch: 1, n } }, 1);
+    }
+    assert_eq!(s.check_grants(), Ok(()));
+    let c = s.handle(Input::RunnerLost { runner: "a".into() }, 2);
+    assert_eq!(taken_back(&c).into_iter().filter(|(_, why)| *why == super::state::Loss::Gang).map(|(l, _)| l).collect::<Vec<_>>(), vec!["m1"]);
+    assert_eq!(["m0", "m1"].map(|m| s.grant(m).map(|g| g.0)), [Some(2); 2]);
+    assert_eq!(s.check_grants(), Ok(()));
 }

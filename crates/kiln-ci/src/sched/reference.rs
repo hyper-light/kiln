@@ -99,7 +99,7 @@ enum Step {
     /// A runner connects, or comes back.
     Up(RunnerIn),
     Lost(String),
-    Queued(LegIn),
+    Queued(Box<LegIn>),
     Ended { leg: String, attempt: u32, outcome: Outcome },
     /// A runner refused the grant `fence` of the leg: the one it holds, or (a refusal come late)
     /// one that isn't the leg's any more.
@@ -120,7 +120,7 @@ impl Step {
         match self {
             Step::Up(r) => Input::RunnerUp(Box::new(r.clone())),
             Step::Lost(runner) => Input::RunnerLost { runner: runner.clone() },
-            Step::Queued(l) => Input::LegQueued(Box::new(l.clone())),
+            Step::Queued(l) => Input::LegQueued(l.clone()),
             Step::Ended { leg, attempt, outcome } => Input::AttemptFinished { leg: leg.clone(), attempt: *attempt, outcome: outcome.clone() },
             Step::Refused { leg, fence } => Input::Rejected { leg: leg.clone(), fence: *fence },
             Step::Renew { runner, held } => Input::Renewed { runner: runner.clone(), held: held.clone() },
@@ -408,7 +408,7 @@ impl Reference {
                 }
             }
             Step::Queued(l) => {
-                self.legs.insert(l.id.clone(), Leg { input: l.clone(), attempt: 1, at: At::Queued(Queued { class: l.class, own: 0, arrival: 0, look: None }), avoid: None });
+                self.legs.insert(l.id.clone(), Leg { input: (**l).clone(), attempt: 1, at: At::Queued(Queued { class: l.class, own: 0, arrival: 0, look: None }), avoid: None });
                 self.enqueue(&l.id, now);
             }
             // W05-R04's two looks, in their order: the leg that came back is offered to the runners
@@ -1026,7 +1026,7 @@ fn case(seed: u64) -> (Config, u64, Vec<(Step, i64)>) {
             0 | 1 => shapes.iter().find(|s| !up.contains(&s.id)).cloned().map(Step::Up),
             2..=4 if queued < most => {
                 queued += 1;
-                Some(Step::Queued(leg(&mut d, queued - 1)))
+                Some(Step::Queued(Box::new(leg(&mut d, queued - 1))))
             }
             5..=7 => d.pick(&running).and_then(|id| r.legs.get(id)).map(|l| {
                 let outcome = match d.below(4) {
@@ -1161,7 +1161,7 @@ fn run(cfg: &Config, epoch: u64, steps: &[(Step, i64)], mut tell: impl FnMut(&st
                 runners.insert(x.id.clone(), x.clone());
             }
             Step::Queued(l) => {
-                legs.insert(l.id.clone(), l.clone());
+                legs.insert(l.id.clone(), (**l).clone());
             }
             _ => {}
         }

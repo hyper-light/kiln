@@ -170,6 +170,9 @@ impl Want {
                 w.name = Some(word.to_owned());
             } else {
                 w.needs.add(word).map_err(|why| anyhow::anyhow!("{word}: {why}"))?;
+                if w.needs.together.is_some() {
+                    anyhow::bail!("{word}: {}", GANGS_LATER);
+                }
             }
         }
         Ok(w)
@@ -282,9 +285,15 @@ fn unmet(src: &str, c: &Constraint, f: &RunnerFacts, reported: bool) -> String {
 /// runner names in it): an error names its bad word. A runner older than the spelling reads a word it
 /// doesn't know as a runner's name, so it refuses the run rather than running it where it doesn't suit.
 pub fn target(on: &str, needs: &str) -> Result<String, String> {
-    needs::parse(needs)?;
+    if let Some(g) = needs::parse(needs)?.together {
+        return Err(format!("together:{}/{}: {GANGS_LATER}", g.id, g.size));
+    }
     Ok([on.trim(), needs.trim()].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(","))
 }
+
+/// Why a command can't be one of a gang yet (W05-R40): starting together is the engine's to
+/// decide, and commands go through it with docs/needs.md E5. Refused rather than run alone.
+const GANGS_LATER: &str = "commands can't start together yet: gangs of commands come with commands on the engine (docs/needs.md E5)";
 
 /// Where a command `kiln run --needs` (or MCP's `run` with `needs`) runs finds its needs, as they
 /// were written: `ci/gate.sh` holds itself to them.
@@ -489,10 +498,13 @@ mod tests {
         let both = Want::parse("cpus=8,mem=32g,linux/amd64,+gpu,tool:cargo,exclusive")?;
         assert_eq!(both.needs, needs::parse("cpus=8,mem=32g,linux/amd64,+gpu,tool:cargo,exclusive").map_err(anyhow::Error::msg)?);
         assert!(both.name.is_none());
-        for (bad, why) in [("plan9/amd64", "plan9/amd64: no such OS"), ("mem>=lots", "mem>=lots: not a size"), ("memm=4g", "memm=4g: no such need"), ("tol:cargo", "tol:cargo: no such need")] {
+        for (bad, why) in [("plan9/amd64", "plan9/amd64: no such OS"), ("mem>=lots", "mem>=lots: not a size"), ("memm=4g", "memm=4g: no such need"), ("tol:cargo", "tol:cargo: no such need"), ("together:g/3", "together:g/3: commands can't start together yet")] {
             let e = Want::parse(bad).err().map(|e| e.to_string()).unwrap_or_default();
             assert!(e.starts_with(why), "{bad}: {e}");
         }
+        // A gang of commands waits for commands on the engine (W05-R40, docs/needs.md E5): refused,
+        // not run alone.
+        assert!(target("", "cpus=2,together:g/3").is_err_and(|e| e.starts_with("together:g/3: commands can't start together yet")));
         Ok(())
     }
 

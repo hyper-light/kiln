@@ -19,3 +19,7 @@ test("a leg kept out of another's room says whose, where and until when (W05-R39
     `It would fit on fedora-2, but only in room kept there for r12/gate from ${clock}, past which it would still run.`,
   );
 });
+
+test("a gang's member waiting for the rest of its gang says how many are queued (W05-R40)", () => {
+  assert.equal(waitSentence({ reason: "gang", gang: "sim", have: 2, of: 3 }), "Waiting for the rest of its gang sim, which starts together: 2 of 3 queued.");
+});

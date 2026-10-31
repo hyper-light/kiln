@@ -17,6 +17,8 @@
 //! - `fact==value`, `fact!=value`, `fact>=n`, `fact<=n`, `fact>n`, `fact<n`: any fact routing knows
 //!   (`disk.free>=50Gi`, `os.distro==fedora`, `custom.rack==a3`).
 //! - `exclusive`: the runner whole, with nothing else beside the work.
+//! - `together:sim/3`: one of three items named `sim` that start together or not at all (a gang,
+//!   W05-R40), from 2 to 64 of them.
 //!
 //! Anything else is an error that names the word: `memm=4g: no such need`.
 
@@ -24,7 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use super::pools::{self, ResourceSpec};
 use super::routing::{self, Constraint};
-use super::state::{Cpus, Resources};
+use super::state::{Cpus, Gang, Resources};
 use crate::expr;
 use crate::wf::ir::{JobKiln, YVal};
 
@@ -38,7 +40,13 @@ pub struct Needs {
     pub requires: Vec<String>,
     /// The runner whole: nothing else runs beside the work.
     pub exclusive: bool,
+    /// Its gang (W05-R40): it starts with the rest of its gang or not at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub together: Option<Gang>,
 }
+
+/// The most items a gang has (W05-R40): enough for a cluster's nodes, few enough to place in one go.
+pub const GANG_MOST: u32 = 64;
 
 /// Reads the spelling (the module's docs). An error names the first word that isn't a need.
 pub fn parse(spec: &str) -> Result<Needs, String> {
@@ -56,7 +64,7 @@ pub fn of_job(k: &JobKiln) -> Result<Needs, String> {
         Some(v) => resource_spec(v).resources()?,
         None => Resources::default(),
     };
-    Ok(Needs { request, requires: k.requires.iter().map(|t| t.src.clone()).collect(), exclusive: k.exclusive })
+    Ok(Needs { request, requires: k.requires.iter().map(|t| t.src.clone()).collect(), exclusive: k.exclusive, ..Needs::default() })
 }
 
 /// A job's `resources:` (`{ cpu, memory, disk, gpu }`) as written.
@@ -82,6 +90,9 @@ impl Needs {
         if self.exclusive {
             parts.push("the runner whole".into());
         }
+        if let Some(g) = &self.together {
+            parts.push(format!("one of {} starting together ({})", g.size, g.id));
+        }
         if parts.is_empty() { "nothing in particular".into() } else { parts.join(", ") }
     }
 
@@ -101,14 +112,17 @@ impl Needs {
         if let Some(label) = w.strip_prefix('+') {
             return self.require(format!("label {}", quote(label)?));
         }
-        // Before `/`: `binfmt:linux/arm64` is one.
+        // Before `/`: `binfmt:linux/arm64` and `together:sim/3` are one.
         if let Some((kind, item)) = w.split_once(':') {
+            if kind.eq_ignore_ascii_case("together") {
+                return self.join(item);
+            }
             let fact = match kind.to_ascii_lowercase().as_str() {
                 "tool" => "tools",
                 "executor" => "executors",
                 "flag" => "cpu.flags",
                 "binfmt" => "binfmt",
-                _ => return Err("no such need (tool:, executor:, flag: or binfmt:)".into()),
+                _ => return Err("no such need (tool:, executor:, flag:, binfmt: or together:)".into()),
             };
             return self.require(format!("{fact} has {}", quote(item)?));
         }
@@ -150,6 +164,21 @@ impl Needs {
             _ => return Err("no such fact (os, arch, cpu.cores, mem.total, disk.free, tools, …, custom.<name>)".into()),
         };
         self.require(format!("{fact} {op} {}", quote(&value)?))
+    }
+
+    /// `together:<name>/<n>`: one of `n` items named `name` that start together or not at all
+    /// (W05-R40).
+    fn join(&mut self, item: &str) -> Result<(), String> {
+        let Some((name, size)) = item.split_once('/') else { return Err("a gang is its name and its size (together:sim/3)".into()) };
+        if name.is_empty() || name.contains(|c: char| c.is_whitespace() || c == ',') {
+            return Err("a gang needs a name (together:sim/3)".into());
+        }
+        let size: u32 = size.trim().parse().map_err(|_| "a gang's size is a number (together:sim/3)")?;
+        if !(2..=GANG_MOST).contains(&size) {
+            return Err(format!("a gang is 2 to {GANG_MOST} items"));
+        }
+        self.together = Some(Gang { id: name.to_owned(), size });
+        Ok(())
     }
 
     /// Adds a constraint once, as routing reads it.
@@ -285,7 +314,7 @@ mod tests {
     const GIB: u64 = 1 << 30;
 
     fn needs(request: Resources, requires: &[&str], exclusive: bool) -> Needs {
-        Needs { request, requires: requires.iter().map(|s| (*s).to_owned()).collect(), exclusive }
+        Needs { request, requires: requires.iter().map(|s| (*s).to_owned()).collect(), exclusive, ..Needs::default() }
     }
 
     #[test]
@@ -324,7 +353,7 @@ mod tests {
             ("linux/sparc", "linux/sparc: no such architecture (amd64, arm64, x86, arm, riscv64)"),
             ("fedora", "fedora: no such need"),
             ("cpu.coress>=8", "cpu.coress>=8: no such fact (os, arch, cpu.cores, mem.total, disk.free, tools, …, custom.<name>)"),
-            ("tol:cargo", "tol:cargo: no such need (tool:, executor:, flag: or binfmt:)"),
+            ("tol:cargo", "tol:cargo: no such need (tool:, executor:, flag:, binfmt: or together:)"),
             ("disk.free>=", "disk.free>=: a value is missing"),
             ("+", "+: a value is missing"),
         ];
@@ -432,5 +461,19 @@ mod tests {
         for (s, want) in [("32g", Some(32 * GIB)), ("32G", Some(32 * GIB)), ("32GB", Some(32 * GIB)), ("32Gi", Some(32 * GIB)), ("512m", Some(512 << 20)), ("1.5t", Some(3 << 39)), ("1024", Some(1024)), ("4h", None), ("lots", None), ("-1g", None)] {
             assert_eq!(size(s), want, "{s}");
         }
+    }
+
+    /// W05-R40, docs/needs.md E4.3: `together:<name>/<n>` is one of n items that start together
+    /// or not at all, 2 to 64 of them; any other spelling of it is an error naming the word.
+    #[test]
+    fn w05_r40_together_in_the_needs_grammar() -> Result<(), String> {
+        let n = parse("together:sim/3,cpus=4")?;
+        assert_eq!(n.together, Some(Gang { id: "sim".into(), size: 3 }));
+        assert_eq!(n.describe(), "4 CPUs, one of 3 starting together (sim)");
+        for bad in ["together:g/1", "together:g", "together:/3", "together:g/x", "together:g/65"] {
+            let why = parse(bad).err().unwrap_or_default();
+            assert!(why.starts_with(&format!("{bad}: ")), "{bad}: {why}");
+        }
+        Ok(())
     }
 }

@@ -1727,10 +1727,11 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   to hold it: R16's `runner: different`, or a runner that refused it; which), `adopted` (it waits for the same work in flight, W28-R42: which
   leg of which run), and admission's (W28-R60): `coalescing` (its lane, until when, at the latest
   when), `cadence` (its lane, its next start) and `speculation` (its lane, the window, how many are
-  in flight); and backfilling's (W05-R39): `reserved` (the first of its class that fits no runner
+  in flight); backfilling's (W05-R39): `reserved` (the first of its class that fits no runner
   now: the runner whose room is kept for it, and from when) and `behind` (it would fit, but only in
-  room kept for another and past its time: which leg, on which runner, from when). It is stored
-  (`jobs.wait_reason`), sent as an event, and shown on the leg.
+  room kept for another and past its time: which leg, on which runner, from when); and `gang` (a
+  gang's member waiting for the rest of its gang, W05-R40: which gang, how many of how many are
+  queued). It is stored (`jobs.wait_reason`), sent as an event, and shown on the leg.
 
 **Requirements: retries** (G-16)
 
@@ -2016,6 +2017,26 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   again from the grants it rebuilt. Preemptible items take kept room once runners can pause them
   (docs/needs.md E7); until then none does. The item says where and from when (`reserved`), and an
   item kept out of the room, with no room elsewhere, says behind what (`behind`; W05-R13).
+- **W05-R40 Gangs** (docs/needs.md §3 and §5, E4.3). `together:<name>/<n>` in the needs' spelling
+  (2 to 64) makes an item one of a gang: it starts with the rest of its gang or not at all (G4).
+  No member is granted before as many members as make the gang are queued; until then each says
+  how many of how many are (`gang`, W05-R13). A gang takes one place in its class's order, its
+  first member's, and when its turn comes it's granted whole, in one input: each member on a runner
+  that would take it with room for it beside the members put there before it (members may share
+  a runner), as the reservations there let it, the least loaded first, then by name, the members
+  before it put elsewhere where one has no room (at most 4,096 places tried). When no way is
+  found, none starts; with backfilling (W05-R39) the gang keeps room for each member on the
+  runner where its room frees soonest, all from the latest of their times, and those runners
+  take only what that lets them. A member refused (W05-R02) or not granted (W05-R05) takes the
+  others' grants back (`Lost`, why `gang`), and the gang is queued again at the same attempts. A
+  member lost while it ran, before any member's attempt ended, takes the others back too: every
+  member's attempt ends lost, and the gang goes again whole at the next attempts if each may be
+  tried again (W05-R16), or else every member ends failed. A gang's member is otherwise never tried
+  again alone: once one member's attempt has ended, a member lost ends failed, `runner-lost`, and
+  the others run on. A member that comes after its gang started waits for its gang's next start.
+  A gang that runs when the server restarts comes back as it ran (W05-R25). Commands can't be one
+  of a gang until commands are placed by the engine (docs/needs.md E5): `kiln run --needs` and
+  MCP's `run` refuse `together:`.
 
 **Design.** `crates/kiln-ci/src/sched/`: `state.rs` (runners, signatures, queues), `fair.rs`,
 `groups.rs`, `routing.rs` (constraint parser, rule matching, eligibility, scoring, explain),

@@ -73,6 +73,7 @@ fn line(c: &Command) -> String {
             let why = match why {
                 Loss::Expired => "expired",
                 Loss::RunnerLost => "runner-lost",
+                Loss::Gang => "gang",
             };
             format!("lost {} attempt={attempt} {} fence={}.{} {why}", q(leg), q(runner), fence.epoch, fence.n)
         }

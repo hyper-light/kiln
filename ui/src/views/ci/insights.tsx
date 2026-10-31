@@ -45,6 +45,7 @@ const REASONS: Record<string, string> = {
   exclusive: "Exclusive",
   reserved: "Room kept for it",
   behind: "Behind room kept for another",
+  gang: "Waiting for its gang",
   retry: "Retry backoff",
   approval: "Approval",
   "wait-timer": "Wait timer",
