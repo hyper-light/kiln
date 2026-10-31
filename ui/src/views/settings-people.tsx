@@ -14,6 +14,7 @@ import { reposRes, useRes, type Res } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
+import { copyText } from "@/views/terminal/clipboard";
 
 export const peopleRes: Res<Person[]> = { key: "people", fetch: (s) => people.list(s) };
 export const rolesRes: Res<Awaited<ReturnType<typeof people.roles>>> = { key: "people/roles", fetch: (s) => people.roles(s) };
@@ -186,7 +187,7 @@ export function Copyable({ label, value, help }: { label: string; value: string;
         <div className="field st-wide">
           <input aria-label={label} type="text" readOnly value={value} className="font-mono text-[12px]" onFocus={(e) => e.target.select()} />
         </div>
-        <Button type="button" size="xs" variant="secondary" onClick={() => void navigator.clipboard.writeText(value).then(() => setCopied(true))}>
+        <Button type="button" size="xs" variant="secondary" onClick={() => void copyText(value).then(setCopied)}>
           {copied ? "Copied" : "Copy"}
         </Button>
       </div>

@@ -3,31 +3,16 @@ import * as React from "react";
 import { Check, ChevronRight, Copy } from "lucide-react";
 import type { InstallOs } from "@/api/types";
 import { cn } from "@/lib/utils";
+import { copyText } from "@/views/terminal/clipboard";
 import { OS_NAME } from "./data";
 
-/** Put text on the clipboard. Servers reached over plain http have no Clipboard API: fall back to a selected textarea. */
-export async function copyText(text: string) {
-  try {
-    await navigator.clipboard.writeText(text);
-  } catch {
-    const ta = document.createElement("textarea");
-    ta.value = text;
-    ta.setAttribute("readonly", "");
-    ta.style.position = "fixed";
-    ta.style.opacity = "0";
-    document.body.appendChild(ta);
-    ta.select();
-    document.execCommand("copy");
-    ta.remove();
-  }
-}
-
-/** `copied` stays true for a moment after `copy`. */
+/** `copied` stays true for a moment after a `copy` that took. */
 export function useCopy(): [boolean, (text: string) => void] {
   const [copied, setCopied] = React.useState(false);
   const timer = React.useRef<number | null>(null);
   const copy = React.useCallback((text: string) => {
-    void copyText(text).then(() => {
+    void copyText(text).then((ok) => {
+      if (!ok) return;
       setCopied(true);
       if (timer.current !== null) window.clearTimeout(timer.current);
       timer.current = window.setTimeout(() => setCopied(false), 1600);
