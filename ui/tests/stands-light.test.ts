@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { cells, frame, HEIGHT, LIVE, LIVELINESS, MEDIUM, reachOf, SHORT_OF_MIDDLE, stretches, stringOf, type Shown } from "../src/views/harness/stands-light.ts";
+import { cells, COMPACTING, frame, HEIGHT, LIVE, LIVELINESS, MEDIUM, reachOf, SHORT_OF_MIDDLE, stretches, stringOf, type Shown } from "../src/views/harness/stands-light.ts";
 
 // Mission Control's status rule (stands-light.ts): the string, its particles and its stretches,
 // as stands.tsx draws them each frame.
@@ -169,6 +169,40 @@ test("a frame of every state on a desktop's rule is quick to make", () => {
   for (let t = 0; t < 1; t += 0.1) frame(parts, 920, t);
   const each = (performance.now() - begun) / 10;
   assert.ok(each < 40, `${each.toFixed(1)} ms a frame`);
+});
+
+test("a compaction's ribbon is working's light about three times as wide, turning face-on and edge-on along it, as many particles, all in the box", () => {
+  const parts = stretches(["working"], [1], W);
+  // How far most of each 10 points' fine points span across the string (a tenth either side left
+  // out), the tapered ends aside.
+  const spans = (f: ReturnType<typeof frame>) => {
+    const bins: number[][] = Array.from({ length: Math.floor(W / 10) }, () => []);
+    for (let k = 0; k < f.dots.length; k += 5) bins[Math.floor(f.dots[k]! / 10)]?.push(f.dots[k + 1]!);
+    return bins.slice(2, -2).map((ys) => {
+      ys.sort((a, b) => a - b);
+      return ys[Math.floor(0.9 * (ys.length - 1))]! - ys[Math.floor(0.1 * (ys.length - 1))]!;
+    });
+  };
+  const count = (f: ReturnType<typeof frame>) => f.dots.length / 5 + f.soft.length / 6;
+  for (const t of TIMES) {
+    const rule = frame(parts, W, t);
+    const ribbon = frame(parts, W, t, undefined, COMPACTING);
+    assert.ok(Math.abs(count(ribbon) - count(rule)) <= 0.01 * count(rule), `the rule's cost at ${t}s: ${count(ribbon)} particles to its ${count(rule)}`);
+    for (let k = 0; k < ribbon.dots.length; k += 5) {
+      const [y, r] = [ribbon.dots[k + 1]!, ribbon.dots[k + 2]!];
+      assert.ok(y - r >= 0 && y + r <= HEIGHT, `y ${y.toFixed(2)} in the box at ${t}s`);
+    }
+    for (let k = 0; k < ribbon.soft.length; k += 6) assert.ok(ribbon.soft[k + 1]! >= 0 && ribbon.soft[k + 1]! <= HEIGHT, `soft light in the box at ${t}s`);
+    const wide = Math.max(...spans(ribbon));
+    const rules = Math.max(...spans(rule));
+    assert.ok(wide > 2.2 * rules, `face-on ${wide.toFixed(1)} points across at ${t}s, the rule's ${rules.toFixed(1)}`);
+    assert.ok(Math.min(...spans(ribbon)) < wide / 4, `edge-on a knot at ${t}s: ${Math.min(...spans(ribbon)).toFixed(1)} points`);
+  }
+  const desktop = stretches(["working"], [1], 920);
+  const begun = performance.now();
+  for (let t = 0; t < 1; t += 0.1) frame(desktop, 920, t, undefined, COMPACTING);
+  const each = (performance.now() - begun) / 10;
+  assert.ok(each < 40, `${each.toFixed(1)} ms a frame across a desktop's conversation`);
 });
 
 test("a count keeps its room: 9 to 10 moves nothing beside it, and only a changed place rolls, the way the count goes", () => {
