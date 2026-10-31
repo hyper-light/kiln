@@ -67,7 +67,12 @@ async fn get(cx: Cx, v: Value) -> Out {
 }
 
 async fn list(cx: Cx, v: Value) -> Out {
-    json_of(&json!({"research": super::list(&cx.hub, text(&v, "plan"), text(&v, "agent")).await.map_err(fail)?}))
+    let all = super::list(&cx.hub, text(&v, "plan"), text(&v, "agent"), text(&v, "q")).await.map_err(fail)?;
+    // In brief, for a list that opens each on asking (an agent's Plan tab).
+    if v.get("brief").is_some_and(|b| b.as_bool().unwrap_or_else(|| matches!(b.as_str(), Some("1" | "true")))) {
+        return json_of(&json!({"research": all.iter().map(super::brief).collect::<Vec<_>>()}));
+    }
+    json_of(&json!({"research": all}))
 }
 
 /// The words of a conversation's event, shortened: what an agent reads of a hit.
@@ -169,7 +174,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "research.list",
-            summary: "Research, newest change first: a plan's (`plan`), an agent's (`agent`), or all.",
+            summary: "Research, newest change first (the last 100): a plan's (`plan`), an agent's (`agent`), or all; `q` keeps what holds its words (in its question, findings, quotes or sources), and `brief` gives each in brief (what was asked, what it comes to, its findings' grades and its strongest one's claim).",
             read_only: true,
             destructive: false,
             input: Input::of::<input::ResearchList>(),
@@ -325,6 +330,10 @@ pub mod input {
     pub struct ResearchList {
         pub plan: Option<String>,
         pub agent: Option<String>,
+        /// Words its question, findings, quotes or sources hold (any case).
+        pub q: Option<String>,
+        /// Each in brief: no sources or citations.
+        pub brief: Option<bool>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
