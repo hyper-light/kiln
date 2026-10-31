@@ -65,8 +65,9 @@ not deliver the ORDER BY's order, whichever is found first.
 SQLite's, the table in rowid order. The rest is the engine's speed through rows, a separate matter.
 
 **Falsified by.** A query where a candidate the model now prefers for its order does more work in
-measurement than the sorted alternative it beat (the model has no notion of LIMIT stopping an
-ordered scan early, nor of a sort spilling).
+measurement than the sorted alternative it beat. The model has no notion of a sort spilling. It
+has a notion of a LIMIT stopping an ordered scan early only for a one-table read under a literal
+LIMIT (decision 16).
 
 ## 3. A GLOB's literal prefix is a range of the index; a BLOB matches no GLOB or LIKE
 
@@ -632,10 +633,10 @@ QUERY PLAN words it as SQLite does: `(family,key,rev)>(?,?,?)`.
 What it leaves to the cost model and the filter, unlike SQLite: an automatic index and a skip-scan
 keep the bound on the first column, and the rowid is not one of an index's columns here (SQLite's
 `nColumn` counts it). A page that reads columns the index lacks seeks once ANALYZE has counted the
-table (4,000 versions: SQLite's search), but without statistics it is a scan and a sort: the cost
-model takes the table at a million rows whose pages the cache can't hold, prices each lookup a page
-read (decisions 5 and 11) and has no notion of a LIMIT stopping an ordered scan (decision 2), where
-SQLite seeks. The lexicographic OR chain (`a > ?1 OR (a = ?1 AND b > ?2) OR ...`) stays a filter,
+table (4,000 versions: SQLite's search). Without statistics it seeks too under a literal LIMIT,
+whose rows stop the read (decision 16). Under a LIMIT that is a parameter it is a scan and a sort,
+where SQLite seeks: the cost model takes the table at a million rows whose pages the cache can't
+hold and prices each lookup a page read (decisions 5 and 11). The lexicographic OR chain (`a > ?1 OR (a = ?1 AND b > ?2) OR ...`) stays a filter,
 as it does in SQLite: a keyset is written as the row value, its first page apart.
 
 **Why.** The unify audit's finding 3 (kiln goal 59833ddf373583f4ba3a6d9e4844f1a8): keyset
@@ -759,3 +760,60 @@ a row, and 7.7, 13.9, 27.3 and 56.4 ms, linear, where e2e67247 made 500,000 at 2
 **Falsified by.** A row a scan or search of the key misses, adds or misorders (the differential
 test and the oracles' checks would show it); a column read wrong through the table's cursor; a
 write planned through the key that loses its row; a key access slower than the scan it replaced.
+
+## 16. An ordered read under a literal LIMIT stops at its rows
+
+**Decision.** A read of one table has a row goal: the rows a literal LIMIT and a literal OFFSET
+keep (`JoinPlanningContext::row_goal`, set in `find_select_plan_form`). It has one only with no
+grouping, aggregate, window or DISTINCT between the read and the LIMIT. An index read in the
+query's order then costs a seek, and the goal's rows over what the remaining WHERE terms keep of
+them (`estimate_ordered_cost_to_goal`), rather than its whole range. An unordered candidate still
+pays for its whole read and its sort.
+
+The goal holds only when every WHERE term left to evaluate is one of the table's constraints, whose
+selectivity the model knows. A term it can't estimate could make the read reach its goal late or
+never, the trap a row goal sets in PostgreSQL, so such a read keeps the whole range's cost.
+`LIMIT ?` and `OFFSET ?` give no goal, and neither does a join, whose fan-out the goal doesn't
+measure.
+
+**Why.** The unify audit's E5 (kiln goal c64d544897cf8adca2c153ed05e2c528). On a rowid table keyed
+by (family, key, rev), through its primary key's autoindex or an explicit index on those columns,
+three reads planned as SCAN + USE SORTER FOR ORDER BY and read all 4,000 rows for 8:
+- `ORDER BY family, key, rev LIMIT 8` past a row value;
+- the same past a family;
+- the same from the start.
+SQLite 3.54.0 searches or scans the index for each.
+
+The model saw the index read's whole range and no LIMIT. Without statistics it takes the table at a
+million rows whose pages the cache can't hold, and the index lacked the value column, so each row's
+lookup cost a page read (decisions 5 and 11). The read cost about 371,709 past a bound and 929,109
+from the start, against 37,888 to 62,863 for a scan and a sort. The LIMIT reached only the output
+estimate (decision 13), and `find_table_access_plan` passed it to no access method but a custom
+index method's.
+
+**Sources.** PostgreSQL's planner (`src/backend/optimizer/plan/planner.c`) costs a query's paths
+for the rows a LIMIT retrieves. `grouping_planner`'s `tuple_fraction` is "the absolute number of
+tuples expected to be retrieved (ie, a LIMIT specification)" when it is 1 or more. It is set from
+`preprocess_limit`, and the final path is `get_cheapest_fractional_path(final_rel,
+tuple_fraction)`.
+
+SQLite's `whereSortingCost` (`src/where.c`) takes the LIMIT as its M where it is smaller ("Use the
+LIMIT for M if it is smaller"). SQLite reaches the index through its weights, where a lookup costs
+about as much as a row of a scan; Amphora's model prices a lookup as a page read, so it needs the
+goal to see the read stop. SQLite 3.54.0 plans the six reads on both indexes as `SEARCH rp USING
+INDEX sqlite_autoindex_rp_1 ((family,key,rev)>(?,?,?))`, `SCAN rp USING INDEX
+sqlite_autoindex_rp_1` and `SEARCH rp USING INDEX sqlite_autoindex_rp_1 (family>?)`, and alike on
+`ri_k`.
+
+**Evidence.** `crates/engine/tests/rowid_index_order.rs`,
+`an_ordered_read_under_a_limit_uses_a_rowid_tables_index`. It failed at 327a8f9 with
+`SCAN rp` and `USE SORTER FOR ORDER BY`, where SQLite searches `sqlite_autoindex_rp_1`. It now
+passes: the six plans are SQLite 3.54.0's word for word, at most 16 rows are read for the 8 (4,000
+before), and the answers are those of the same reads NOT INDEXED. `row_value_seek.rs`, `planner.rs`,
+`top_n.rs`, `implicit_rowid_seek.rs`, `without_rowid_seek.rs`, `without_rowid_dml.rs` and the
+engine's library tests pass unchanged.
+
+**Falsified by.** An ordered index read under a literal LIMIT that does more work in measurement
+than the scan and sort it beat. That happens if a constraint's selectivity is far from its rows,
+for instance one correlated with the index's order, so that the read passes far more rows than its
+goal before it fills the LIMIT.

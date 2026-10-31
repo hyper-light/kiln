@@ -112,3 +112,84 @@ explains port takeover with SO_REUSEADDR and the protection afforded by SO_EXCLU
 handle-relative operations, validation and refusal semantics. [RFC 2104](https://www.rfc-editor.org/rfc/rfc2104.html)
 specifies the HMAC construction; direction/domain labels and nonce binding are this protocol's
 choice, falsified by a reflected or replayed proof authenticating a new connection.
+
+## The tests' budgets (2026-10-31)
+
+None of the transport tests is about latency. Their budgets were real-clock guesses, and a loaded
+disk or a stopped process overran them:
+- the client's `until()`: five seconds in `transport/common.rs`, ten in `transport/watch.rs` and
+  `tests/transport.rs`;
+- the one-second session `wrong_capability_never_acquires_database` asked for in its `Hello`;
+- `serve`'s fixed two-second greeting.
+
+Once `compact_step_on` has sent a mutation, it answers UnknownOutcome for an answer read past its
+deadline. That is correct, since the mutation's fate is then unknown, but the test took it for a
+failure. At 2e7728d, stopping the test past its budget gave that failure, and so did the base
+327a8f9. Measured under load, the test failed 5 times in 200 runs at loads 24 to 37, each run
+inside its five seconds and past its one-second session.
+
+Every operation of these tests now waits under one hang guard, `HANG`: 120 seconds. It is a
+measured constant (CLAUDE.md section 5): twenty times the slowest whole run of any transport test,
+measured over 200 runs of each of the 12 tests at loads 19 to 39 (5,856 ms, kiln plan
+01a1905036ce70ebae3484dc384f8129 step 2). Each test's run bounds every operation in it. `HANG`
+replaces:
+- `transport/common.rs`: `until()` in `wrong_capability_never_acquires_database` (11 uses: the
+  greeting's writes and reads, the Capabilities request, `compact_step_on`);
+  `frame_length_is_refused_before_reading_payload` (5);
+  `stale_record_cannot_authenticate_a_reused_port` (4, `connect` and `read_limit`);
+  `a_stop_and_continue_leaves_a_waiting_read_whole` and `..._send_whole` (1 each). Their
+  deadline need only outlast their stop, which the test makes a fraction of a second.
+- `transport/watch.rs`: `until()` in `completion_before_poll_does_not_need_a_registered_waker` (2),
+  `registration_overflow_is_typed_and_drop_releases_capacity` (2) and
+  `sixty_four_dormant_watches_share_one_reactor_and_leave_sql_usable` (2).
+  `hostile_watch_batch_lengths_are_bounded_before_element_decode` has none.
+- `tests/transport.rs`: `until()` in
+  `independent_processes_share_cas_and_adaptive_sql_and_abort_disconnect` (14),
+  `sdk_client_keeps_ledger_and_becomes_owner_after_predecessor_exits` (12),
+  `separate_memory_databases_do_not_share_sql_or_records` (7) and the child half they start,
+  `transport_child` (10).
+
+A session can't be given `HANG`. `serve` refuses a session longer than `SESSION_MAX`, 30 s, the
+longest the protocol allows, and the production client asks for at most that. So the session
+`wrong_capability_never_acquires_database` asked for in its `Hello` (1,000 ms) is now
+`SESSION_MAX`: the protocol's own bound, five times the slowest run measured.
+
+`HANG` also bounds the tests' own waits:
+- `pair()`'s loopback connect (two seconds);
+- the send test's peer read (five seconds), whose timeout only keeps a short send from hanging the
+  read;
+- the waits that took their deadline from `until()`: `wait_asleep` polling a thread's state, the
+  watch fixture's wait for its notice, and `tests/transport.rs`'s wait for a replica to be ready.
+
+One clock read stays as it is: `successor.replica_status(Instant::now())`, in
+`sdk_client_keeps_ledger_and_becomes_owner_after_predecessor_exits`. Its deadline has already passed
+when it is read, the call must refuse with Timeout, and so it answers the same at any load.
+
+`serve` takes its greeting's budget from its caller. The owner passes `GREETING_MAX`, the two
+seconds to authenticate of the resource limits above: its bound on a peer that connects and says
+nothing. A test that runs `serve` itself passes `HANG`. The client gives the owner the same
+`GREETING_MAX`: its bound on a listener that accepts and says nothing, such as another program on a
+stale record's port. Both stay, because they are admission policy, and the tests that go through
+the production client or owner meet them: `stale_record_cannot_authenticate_a_reused_port`, the
+watch tests and `tests/transport.rs`. A greeting reads the owner's 34-byte record, connects over
+loopback, and exchanges three frames of at most 256 bytes with an HMAC each way. In the same
+measurement, the slowest whole run of the test that is little more than one greeting,
+`stale_record_cannot_authenticate_a_reused_port`, took 589 ms. A process stopped for longer than
+`GREETING_MAX` inside a greeting answers Timeout, as production must.
+
+This is not "a longer timeout" in CLAUDE.md section 4's sense. No test's verdict rests on `HANG`:
+each test's subject completes in milliseconds, and its assertion is about the outcome. The guard
+fires only when nothing has happened for twenty times the slowest run measured, which is a hang,
+not a slow disk. Its value is measured, not guessed.
+
+Evidence: kiln plan 01a1905036ce70ebae3484dc384f8129 and its research
+01a1905036d67622b5262d141422fdcf: the failure and its message at 16c8ed9 and 327a8f9, the budgets
+of the 13 tests, and the measured tails. Dean and Barroso, "The Tail at Scale" (CACM 56(2), 2013):
+on shared machines the slow tail, not the typical time, decides whether a budget holds.
+
+Falsified by:
+- a transport test that fails with Timeout or UnknownOutcome before its `HANG` has passed, unless
+  it was stopped for longer than `GREETING_MAX` inside a greeting;
+- a transport test whose outcome changes with the machine's load;
+- a measured whole run past a twentieth of `HANG`. That last one calls for measuring again, not for
+  a larger guard.

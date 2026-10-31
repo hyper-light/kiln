@@ -207,10 +207,20 @@ impl Db {
     /// Bound SQL VM work by the request's absolute deadline. The owning caller drops this guard
     /// before COMMIT/ROLLBACK cleanup, so cancellation cannot interrupt recovery of its session.
     pub(crate) fn deadline(&self, until: Instant) -> Deadline {
+        self.deadline_on(until, Instant::now)
+    }
+
+    /// [`Db::deadline`] on `clock`: a replicated owner's, which its shell gives it
+    /// (replication.md, "The owner's time").
+    pub(crate) fn deadline_on(
+        &self,
+        until: Instant,
+        clock: impl Fn() -> Instant + Send + Sync + 'static,
+    ) -> Deadline {
         // An administrative cancellation quantum, not a throughput tuning claim. A SQL VM can
         // execute at most 1024 further instructions between deadline checks.
         self.conn
-            .set_progress_handler(1024, Some(Box::new(move || Instant::now() >= until)));
+            .set_progress_handler(1024, Some(Box::new(move || clock() >= until)));
         Deadline {
             connection: Arc::clone(&self.conn),
         }

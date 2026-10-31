@@ -11,6 +11,12 @@ pub use common::{Client, Namespace, Owner};
 pub(crate) use endpoint::try_lease;
 pub use watch::Watch;
 
+/// The transport tests' hang guard, measured: twenty times the slowest whole run of any transport
+/// test, 5,856 ms over 200 runs of each at loads 19 to 39 (adacachy, 2026-10-31). No test's verdict
+/// rests on it (local-owner-transport.md, "The tests' budgets").
+#[cfg(test)]
+const HANG: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// The peer disappeared after submission: durability may already have completed.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

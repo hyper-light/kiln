@@ -463,7 +463,7 @@ mod tests {
     static SERIAL: Mutex<()> = Mutex::new(());
 
     fn until() -> Instant {
-        Instant::now() + Duration::from_secs(10)
+        Instant::now() + crate::transport::HANG
     }
 
     struct Fixture {

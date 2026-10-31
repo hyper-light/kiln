@@ -65,8 +65,8 @@ fn key_registers(comment: &str) -> Option<usize> {
 
 /// Do: plan the keyset page by a row value with each operator, its columns on either side, in both
 /// directions, a prefix of the key, an equality then a row value, both bounds, and reading the value
-/// column the key's index lacks through that index: named, and after ANALYZE unnamed (without
-/// statistics the cost model prices the index's lookups above a scan and a sort, decision 14).
+/// column the key's index lacks through that index: named, and after ANALYZE unnamed (decision 14;
+/// without statistics the literal LIMIT stops the read and it is sought too, decision 16).
 /// Expect: SQLite 3.54.0's plan for each, word for word (its EXPLAIN QUERY PLAN): a search of the
 /// key from the bound and no sort; and a program that seeks the key's index by the whole row, never
 /// rewinding it to filter from its first entry (AC-T1.13.4).

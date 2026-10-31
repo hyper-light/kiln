@@ -39,6 +39,20 @@ pub(super) struct Bound {
     pub token: [u8; 32],
     pub guard: Guard,
 }
+#[cfg(test)]
+impl Bound {
+    /// Names `port` in this owner's protected record, written as `bind` writes it: a test's
+    /// stale record whose port another listener holds, without freeing a port to take it again.
+    pub(super) fn name_port(&self, port: u16) -> Result<(), Refusal> {
+        let mut record = Vec::with_capacity(RECORD_BYTES);
+        record.extend_from_slice(&port.to_be_bytes());
+        record.extend_from_slice(&self.token);
+        self.guard
+            ._directory
+            .write_atomic(RECORD_NAME, &record)
+            .map_err(unavailable)
+    }
+}
 
 fn unavailable(error: impl std::fmt::Display) -> Refusal {
     Refusal::Unavailable(error.to_string())

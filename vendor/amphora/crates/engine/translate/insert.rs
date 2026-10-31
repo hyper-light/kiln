@@ -495,20 +495,35 @@ pub fn translate_insert(
     // trigger bodies see affinity-applied values. Affinity is idempotent, so
     // applying it here means we can skip the per-trigger Copy+Affinity in fire_trigger.
     if !ctx.table.is_strict {
-        let affinity = insertion
-            .col_mappings
-            .iter()
-            .filter(|cm| !cm.column.is_virtual_generated())
-            .map(|col_mapping| col_mapping.column.affinity());
-
-        // Only emit Affinity if there's meaningful affinity to apply
-        // (i.e., not all BLOB/NONE affinity)
-        if affinity.clone().any(|a| a != Affinity::Blob) {
-            if let Ok(count) = NonZeroUsize::try_from(insertion.num_non_virtual_cols) {
+        if let Ok(count) = NonZeroUsize::try_from(insertion.num_non_virtual_cols) {
+            // Amphora: each stored column's affinity goes at its own register. A WITHOUT ROWID
+            // table's columns take their registers in its key's order, not in declaration order,
+            // so an affinity string in declaration order gave a column its neighbour's affinity
+            // (the unify audit's E1 and E2: '1.0' in a TEXT column stored as '1').
+            let mut affinities = vec![Affinity::Blob; count.get()];
+            for col_mapping in insertion
+                .col_mappings
+                .iter()
+                .filter(|cm| !cm.column.is_virtual_generated())
+            {
+                let slot = col_mapping
+                    .register
+                    .checked_sub(insertion.first_col_register())
+                    .and_then(|offset| affinities.get_mut(offset))
+                    .ok_or_else(|| {
+                        crate::LimboError::InternalError(
+                            "a stored column's register lies outside its row's registers".into(),
+                        )
+                    })?;
+                *slot = col_mapping.column.affinity();
+            }
+            // Only emit Affinity if there's meaningful affinity to apply
+            // (i.e., not all BLOB/NONE affinity)
+            if affinities.iter().any(|a| *a != Affinity::Blob) {
                 program.emit_insn(Insn::Affinity {
                     start_reg: insertion.first_col_register(),
                     count,
-                    affinities: affinity.map(|a| a.aff_mask()).collect(),
+                    affinities: affinities.iter().map(|a| a.aff_mask()).collect(),
                 });
             }
         }
@@ -2127,11 +2142,29 @@ fn bind_insert(
     }
     if let ResolveType::Ignore = on_conflict {
         program.set_resolve_type(ResolveType::Ignore);
-        upsert.replace(Box::new(ast::Upsert {
+        // Amphora: OR IGNORE settles the uniqueness conflicts the statement's upsert doesn't name:
+        // a DO NOTHING without a target, after the upsert's own clauses. Replacing the clauses
+        // with it skipped an `ON CONFLICT(u) DO UPDATE` under OR IGNORE (the unify audit's E4;
+        // sqlite.org/lang_upsert.html). A chain that ends without a target already covers all.
+        let catch_all = Box::new(ast::Upsert {
             do_clause: UpsertDo::Nothing,
             index: None,
             next: None,
-        }));
+        });
+        match upsert.as_mut() {
+            None => upsert = Some(catch_all),
+            Some(first) => {
+                let mut last = first;
+                while last.next.is_some() {
+                    last = last.next.as_mut().ok_or_else(|| {
+                        crate::LimboError::InternalError("an upsert clause vanished".into())
+                    })?;
+                }
+                if last.index.is_some() {
+                    last.next = Some(catch_all);
+                }
+            }
+        }
     } else {
         program.set_resolve_type(on_conflict);
     }
@@ -3198,20 +3231,37 @@ fn emit_unique_index_check(
                 }
             }
         }
-        // No matching UPSERT handler so we emit constraint error
-        // (if conflict clause matched - VM will jump to later instructions and skip halt)
-        let raw_desc = format_unique_violation_desc(ctx.table.name.as_str(), index);
-        let (description, on_error) = halt_desc_and_on_error(
-            &raw_desc,
-            preflight.effective_on_conflict,
-            program.flags.has_statement_conflict(),
-        );
-        program.emit_insn(Insn::Halt {
-            err_code: SQLITE_CONSTRAINT_UNIQUE,
-            description,
-            on_error,
-            description_reg: None,
-        });
+        if preflight.on_replace {
+            // Amphora: no upsert covers this constraint and REPLACE settles it: delete the
+            // conflicting row. With an upsert, the commit phase writes every index entry, so none
+            // is written here (the unify audit's E4).
+            program.emit_insn(Insn::IdxRowId {
+                cursor_id: idx_cursor_id,
+                dest: ctx.conflict_rowid_reg,
+            });
+            emit_replace_delete_conflicting_row(
+                program,
+                resolver,
+                preflight.connection,
+                ctx,
+                preflight.table_references,
+            )?;
+        } else {
+            // No matching UPSERT handler so we emit constraint error
+            // (if conflict clause matched - VM will jump to later instructions and skip halt)
+            let raw_desc = format_unique_violation_desc(ctx.table.name.as_str(), index);
+            let (description, on_error) = halt_desc_and_on_error(
+                &raw_desc,
+                preflight.effective_on_conflict,
+                program.flags.has_statement_conflict(),
+            );
+            program.emit_insn(Insn::Halt {
+                err_code: SQLITE_CONSTRAINT_UNIQUE,
+                description,
+                on_error,
+                description_reg: None,
+            });
+        }
 
         // continue preflight with next constraint
         program.preassign_label_to_next_insn(next_check);
@@ -3326,18 +3376,28 @@ fn emit_preflight_constraint_checks(
             }
         };
         // REPLACE constraints must sort after all non-REPLACE ones
-        // (schema.rs:add_index + IPK deferral ensure this).
-        if effective == ResolveType::Replace {
-            seen_replace = true;
-        } else {
-            turso_assert!(
-                !seen_replace,
-                "non-REPLACE constraint after REPLACE constraint — sort order invariant violated"
-            );
+        // (schema.rs:add_index + IPK deferral ensure this). Amphora: a constraint an upsert
+        // covers sorts first and is settled by that upsert's DO UPDATE or DO NOTHING, never by its
+        // own clause (sqlite.org/lang_upsert.html), so the order doesn't count it: an upsert naming
+        // an INTEGER PRIMARY KEY ON CONFLICT REPLACE beside a UNIQUE column panicked here (the
+        // unify audit's E3).
+        let upserted = position.is_some() || constraints.upsert_catch_all_position.is_some();
+        if !upserted {
+            if effective == ResolveType::Replace {
+                seen_replace = true;
+            } else if seen_replace {
+                return Err(crate::LimboError::InternalError(
+                    "a constraint without REPLACE was ordered after one with it".into(),
+                ));
+            }
         }
 
-        let effective_on_replace =
-            matches!(effective, ResolveType::Replace) && preflight.upsert_actions.is_empty();
+        // Amphora: a constraint an upsert names, or its catch-all takes, is settled by that upsert;
+        // the others by their own algorithm, REPLACE included, as SQLite settles them. REPLACE was
+        // off for every constraint once a statement had an upsert, so `INSERT OR REPLACE ... ON
+        // CONFLICT(u) DO UPDATE` refused a conflict on another column (the unify audit's E4;
+        // sqlite.org/lang_upsert.html).
+        let effective_on_replace = matches!(effective, ResolveType::Replace) && !upserted;
         preflight.on_replace = effective_on_replace;
         preflight.effective_on_conflict = effective;
 
@@ -3675,8 +3735,8 @@ struct ConstraintsToCheck {
 struct PreflightCtx<'a, 'b> {
     /// UPSERT action handlers (target, label, upsert clause)
     upsert_actions: &'a [(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)],
-    /// Whether ON CONFLICT REPLACE is active globally (without UPSERT).
-    /// This is true when the statement has INSERT OR REPLACE (applies to all constraints).
+    /// Whether REPLACE settles the constraint being checked: its effective algorithm is REPLACE
+    /// and no upsert covers it. Set per constraint in emit_preflight_constraint_checks.
     on_replace: bool,
     /// The effective conflict resolution for the current constraint being checked.
     /// Updated per-constraint in emit_preflight_constraint_checks.
@@ -3751,23 +3811,31 @@ fn build_constraints_to_check(
     turso_debug_assert!(
         has_statement_conflict || {
             let mut saw_replace = false;
-            constraints_to_check.iter().all(|(c, _)| {
-                let mode = match c {
-                    ResolvedUpsertTarget::PrimaryKey => {
-                        rowid_alias_conflict_clause.unwrap_or(ResolveType::Abort)
+            let catch_all = matches!(
+                upsert_actions.last(),
+                Some((ResolvedUpsertTarget::CatchAll, ..))
+            );
+            // A constraint an upsert covers goes first and keeps no clause of its own.
+            constraints_to_check
+                .iter()
+                .filter(|(_, position)| position.is_none() && !catch_all)
+                .all(|(c, _)| {
+                    let mode = match c {
+                        ResolvedUpsertTarget::PrimaryKey => {
+                            rowid_alias_conflict_clause.unwrap_or(ResolveType::Abort)
+                        }
+                        ResolvedUpsertTarget::Index(idx) => {
+                            idx.on_conflict.unwrap_or(ResolveType::Abort)
+                        }
+                        ResolvedUpsertTarget::CatchAll => return true,
+                    };
+                    if mode == ResolveType::Replace {
+                        saw_replace = true;
+                        true
+                    } else {
+                        !saw_replace
                     }
-                    ResolvedUpsertTarget::Index(idx) => {
-                        idx.on_conflict.unwrap_or(ResolveType::Abort)
-                    }
-                    ResolvedUpsertTarget::CatchAll => return true,
-                };
-                if mode == ResolveType::Replace {
-                    saw_replace = true;
-                    true
-                } else {
-                    !saw_replace
-                }
-            })
+                })
         },
         "constraints must have all REPLACE entries at the end"
     );

@@ -52,6 +52,9 @@ pub(crate) struct JoinPlanningContext<'a> {
     pub cost_limit: Option<Cost>,
     /// Whether this table read may build an automatic index.
     pub allow_automatic_index: bool,
+    /// Amphora: the rows a literal LIMIT (and OFFSET) leaves a one-table read to produce before
+    /// it stops (`docs/design/planner.md` decision 16), None when it reads to its end.
+    pub row_goal: Option<f64>,
 }
 
 impl<'a> JoinPlanningContext<'a> {
@@ -62,6 +65,7 @@ impl<'a> JoinPlanningContext<'a> {
             maybe_order_target,
             cost_limit: None,
             allow_automatic_index: true,
+            row_goal: None,
         }
     }
 }

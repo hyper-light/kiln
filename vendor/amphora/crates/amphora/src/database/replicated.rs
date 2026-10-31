@@ -162,11 +162,20 @@ struct Actor {
     // At most COMMANDS admitted operations wait behind the sole prepared transaction.
     waiting: VecDeque<Envelope>,
     serial: u64,
+    // Every time this owner reads comes from this clock (replication.md, "The owner's time").
+    clock: Clock,
     started: Instant,
     ticked: Instant,
+    // The instant this owner last read from its clock: at its step's start, and again after a
+    // preparation, whose work takes time of its own.
+    at: Instant,
     published: u64,
     transferred: Option<(u64, Instant)>,
 }
+
+/// An owner's time, from its shell: the real clock for the owner thread, one its test moves for a
+/// test shell.
+type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
 
 fn fenced(reason: impl std::fmt::Display) -> Refusal {
     Refusal::Fenced(reason.to_string())
@@ -354,6 +363,33 @@ pub(super) fn start(
     lease: Arc<File>,
     until: Instant,
 ) -> Result<Client, Refusal> {
+    let (client, mut actor, receiver) = open(
+        path,
+        log_path,
+        config,
+        changed,
+        lease,
+        until,
+        Arc::new(Instant::now),
+    )?;
+    std::thread::Builder::new()
+        .name("amphora.replica".into())
+        .spawn(move || actor.run(receiver))
+        .map_err(unavailable)?;
+    Ok(client)
+}
+
+/// An owner and its handle, not yet running: `start` runs it on the owner thread, and a test
+/// shell steps it itself. `clock` is its shell's; the owner starts at its first reading.
+fn open(
+    path: &Path,
+    log_path: &Path,
+    config: ReplicaConfig,
+    changed: Arc<Changed>,
+    lease: Arc<File>,
+    until: Instant,
+    clock: Clock,
+) -> Result<(Client, Actor, mpsc::Receiver<Envelope>), Refusal> {
     if Instant::now() >= until {
         return Err(Refusal::Timeout);
     }
@@ -414,7 +450,7 @@ pub(super) fn start(
         status: Mutex::new(Ok(status(&replica))),
     });
     let (sender, receiver) = mpsc::sync_channel(COMMANDS);
-    let started = Instant::now();
+    let at = clock();
     let mut actor = Actor {
         published: replica.applied().index,
         replica,
@@ -427,23 +463,22 @@ pub(super) fn start(
         waiting: VecDeque::new(),
         serial: 0,
         transferred: None,
-        started,
-        ticked: started,
+        clock,
+        started: at,
+        ticked: at,
+        at,
     };
     actor.refresh()?;
     if Instant::now() >= until {
         return Err(Refusal::Timeout);
     }
-    std::thread::Builder::new()
-        .name("amphora.replica".into())
-        .spawn(move || actor.run(receiver))
-        .map_err(unavailable)?;
-    Ok(Client {
+    let client = Client {
         handle: ReplicaHandle {
             sender,
             shared: control,
         },
-    })
+    };
+    Ok((client, actor, receiver))
 }
 
 fn validate(config: &ReplicaConfig) -> Result<(), Refusal> {
@@ -531,7 +566,8 @@ fn status(replica: &Durable) -> ReplicaStatus {
 
 impl Actor {
     fn now(&self) -> Result<u64, Refusal> {
-        u64::try_from(self.started.elapsed().as_nanos()).map_err(unavailable)
+        u64::try_from(self.at.saturating_duration_since(self.started).as_nanos())
+            .map_err(unavailable)
     }
     fn refresh(&mut self) -> Result<(), Refusal> {
         if self.replica.machine().bootstrap_pending() {
@@ -581,58 +617,69 @@ impl Actor {
             }
         }
     }
+    /// The owner thread: each step after waiting up to `POLL` for an input.
     fn run_loop(&mut self, receiver: &mpsc::Receiver<Envelope>) -> Result<(), Refusal> {
         loop {
-            let now = Instant::now();
-            if now.saturating_duration_since(self.ticked) >= TICK {
-                // A delayed owner does not invent missed heartbeats or run an unbounded catchup.
-                self.ticked = now;
-                self.replica.tick().map_err(raft_error)?;
-            }
-            for _ in 0..DRIVE_QUANTUM {
-                let mut output = Output::default();
-                let nanos = self.now()?;
-                let driven = self
-                    .replica
-                    .drive(nanos, std::task::Waker::noop(), &mut output)
-                    .map_err(raft_error)?;
-                self.release(output)?;
-                if !driven.more {
-                    break;
-                }
-            }
-            if self.replica.applied().index != self.published {
-                self.refresh()?;
-            }
-            self.expire();
-            self.bootstrap()?;
-            if !self.replica.machine().bootstrap_pending()
-                && self.pending.is_none()
-                && self.replica.leader() != 0
-                && let Some(envelope) = self.waiting.pop_front()
-            {
-                self.receive(envelope)?;
-            }
-            if self.replica.machine().bootstrap_pending() && self.replica.is_stalled() {
-                return Err(fenced(
-                    "bootstrap exhausted replication log admission before publication",
-                ));
-            }
-            if !self.replica.machine().bootstrap_pending()
-                && (self.replica.compactable_bytes() >= 128 << 20 || self.replica.is_stalled())
-            {
-                let nanos = self.now()?;
-                self.replica
-                    .compact(0, nanos, std::task::Waker::noop())
-                    .map_err(raft_error)?;
-            }
-            *locked(&self.control.status)? = Ok(status(&self.replica));
-            match receiver.recv_timeout(POLL) {
-                Ok(envelope) => self.receive(envelope)?,
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            let input = match receiver.recv_timeout(POLL) {
+                Ok(envelope) => Some(envelope),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
                 Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            };
+            self.run_step(input)?;
+        }
+    }
+    /// One step at its clock's reading: the input first, then a tick if one is due, the core's
+    /// work, deadlines, and what waits.
+    fn run_step(&mut self, input: Option<Envelope>) -> Result<(), Refusal> {
+        let at = (self.clock)();
+        self.at = at;
+        if let Some(envelope) = input {
+            self.receive(envelope)?;
+        }
+        if at.saturating_duration_since(self.ticked) >= TICK {
+            // A delayed owner does not invent missed heartbeats or run an unbounded catchup.
+            self.ticked = at;
+            self.replica.tick().map_err(raft_error)?;
+        }
+        for _ in 0..DRIVE_QUANTUM {
+            let mut output = Output::default();
+            let nanos = self.now()?;
+            let driven = self
+                .replica
+                .drive(nanos, std::task::Waker::noop(), &mut output)
+                .map_err(raft_error)?;
+            self.release(output)?;
+            if !driven.more {
+                break;
             }
         }
+        if self.replica.applied().index != self.published {
+            self.refresh()?;
+        }
+        self.expire();
+        self.bootstrap()?;
+        if !self.replica.machine().bootstrap_pending()
+            && self.pending.is_none()
+            && self.replica.leader() != 0
+            && let Some(envelope) = self.waiting.pop_front()
+        {
+            self.receive(envelope)?;
+        }
+        if self.replica.machine().bootstrap_pending() && self.replica.is_stalled() {
+            return Err(fenced(
+                "bootstrap exhausted replication log admission before publication",
+            ));
+        }
+        if !self.replica.machine().bootstrap_pending()
+            && (self.replica.compactable_bytes() >= 128 << 20 || self.replica.is_stalled())
+        {
+            let nanos = self.now()?;
+            self.replica
+                .compact(0, nanos, std::task::Waker::noop())
+                .map_err(raft_error)?;
+        }
+        *locked(&self.control.status)? = Ok(status(&self.replica));
+        Ok(())
     }
     fn expire(&mut self) {
         // Expired callers relinquish queued operations even while a seed or proposal is held.
@@ -642,7 +689,8 @@ impl Actor {
             let Some(envelope) = self.waiting.pop_front() else {
                 break;
             };
-            let expired = matches!(&envelope.command, Input::Submit { until, .. } if Instant::now() >= *until);
+            let expired =
+                matches!(&envelope.command, Input::Submit { until, .. } if self.at >= *until);
             if expired {
                 if let Input::Submit { response, .. } = envelope.command {
                     answer(response, Err(Refusal::Timeout));
@@ -654,7 +702,7 @@ impl Actor {
         let Some(pending) = self.pending.as_ref() else {
             return;
         };
-        let expired = Instant::now() >= pending.until;
+        let expired = self.at >= pending.until;
         let changed_term = pending.term != self.replica.term()
             || pending.leader != self.replica.leader()
             || self.replica.leader() == 0;
@@ -695,7 +743,7 @@ impl Actor {
         let Some(response) = pending.response.take() else {
             return;
         };
-        if Instant::now() >= pending.until {
+        if self.at >= pending.until {
             answer(response, Err(Refusal::Timeout));
         } else if self.waiting.len() >= COMMANDS {
             answer(response, Err(Refusal::Full { limit: COMMANDS }));
@@ -723,7 +771,7 @@ impl Actor {
                 until,
                 response,
             } => {
-                let result = if Instant::now() >= until {
+                let result = if self.at >= until {
                     Err(Refusal::Timeout)
                 } else {
                     self.step(from, &bytes)
@@ -741,7 +789,7 @@ impl Actor {
                 until,
                 response,
             } => {
-                if Instant::now() >= until {
+                if self.at >= until {
                     answer(response, Err(Refusal::Timeout));
                 } else if self.replica.leader() == 0
                     || self.pending.is_some()
@@ -909,15 +957,15 @@ impl Actor {
             let period = TICK
                 .checked_mul(20)
                 .ok_or_else(|| fenced("tick period overflow"))?;
-            let due = self
-                .transferred
-                .is_none_or(|(term, at)| term != self.replica.term() || at.elapsed() >= period);
+            let due = self.transferred.is_none_or(|(term, at)| {
+                term != self.replica.term() || self.at.saturating_duration_since(at) >= period
+            });
             if due
                 && self.replica.leader() != 0
                 && (self.replica.is_leader() || source == self.replica.id())
             {
                 self.replica.transfer(source).map_err(raft_error)?;
-                self.transferred = Some((self.replica.term(), Instant::now()));
+                self.transferred = Some((self.replica.term(), self.at));
             }
             return Ok(());
         }
@@ -925,7 +973,8 @@ impl Actor {
         self.replica.read(context.clone()).map_err(raft_error)?;
         // One internal attempt has a finite lease; committed chunk progress survives its expiry.
         // User requests retain their own deadlines in the bounded waiting queue throughout.
-        let until = Instant::now()
+        let until = self
+            .at
             .checked_add(Duration::from_secs(60))
             .ok_or_else(|| fenced("bootstrap deadline overflow"))?;
         self.pending = Some(Pending {
@@ -970,7 +1019,7 @@ impl Actor {
             self.pending = Some(pending);
             return Ok(());
         }
-        if Instant::now() >= pending.until {
+        if self.at >= pending.until {
             if let Some(response) = pending.response.take() {
                 answer(response, Err(Refusal::Timeout));
             }
@@ -1046,10 +1095,11 @@ impl Actor {
                 .prepare_compaction(&pending.namespace, *before, pending.until, room)
                 .map(|(prepared, progress)| (prepared, Answer::Compacted(progress)))
         } else {
+            let clock = Arc::clone(&self.clock);
             self.replica.machine_mut().prepare_db(|db| {
                 // The guard ends with application evaluation, before prepare_pages rolls back its
                 // speculative transaction. Cleanup must run even after the SQL deadline elapsed.
-                let _deadline = db.deadline(pending.until);
+                let _deadline = db.deadline_on(pending.until, move || clock());
                 if restore::incomplete(db)? {
                     return Err(api::invalid("database", "restore is incomplete").into());
                 }
@@ -1064,6 +1114,9 @@ impl Actor {
                 }
             })
         };
+        // The preparation ran the caller's work, which takes time of its own: its deadline is
+        // judged at the clock's reading after it, never at the step's start.
+        self.at = (self.clock)();
         // A failed whole rollback poisons this machine. Stop its existing owner instead of
         // accepting another request against an unverified speculative base.
         if bounded && let Err(Refusal::Fenced(reason)) = &prepared {
@@ -1071,7 +1124,7 @@ impl Actor {
         }
         let result = match prepared {
             Ok((prepared, value)) => {
-                if Instant::now() >= pending.until {
+                if self.at >= pending.until {
                     Err(Refusal::Timeout)
                 } else if prepared.is_empty() {
                     Ok(value)
@@ -1089,7 +1142,7 @@ impl Actor {
                     }
                 }
             }
-            Err(error) => Err(if Instant::now() >= pending.until {
+            Err(error) => Err(if self.at >= pending.until {
                 Refusal::Timeout
             } else {
                 error
@@ -1105,64 +1158,8 @@ impl Actor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU64;
 
-    fn deadline() -> Instant {
-        Instant::now() + Duration::from_secs(5)
-    }
-    fn open(dir: &Path, voters: Vec<u64>) -> Client {
-        let path = dir.join("state.db");
-        let until = deadline();
-        // Wait for actual lease release, including the actor's log/machine destruction.
-        let lease = loop {
-            match exclusive_file(&path) {
-                Ok(lease) => break Arc::new(lease),
-                Err(error) => {
-                    assert!(Instant::now() < until, "owner did not drain: {error}");
-                    std::thread::park_timeout(POLL);
-                }
-            }
-        };
-        start(
-            &path,
-            &dir.join("raft.log"),
-            ReplicaConfig {
-                node_id: 1,
-                voters,
-                learners: Vec::new(),
-                bootstrap: None,
-            },
-            Arc::new(Changed::default()),
-            lease,
-            until,
-        )
-        .unwrap()
-    }
-    fn leader(client: &Client) {
-        let until = deadline();
-        loop {
-            let status = client.handle().status().unwrap();
-            if status.leader == status.node_id && status.applied > 0 {
-                return;
-            }
-            assert!(
-                Instant::now() < until,
-                "single voter did not elect: {status:?}"
-            );
-            std::thread::park_timeout(POLL);
-        }
-    }
-    fn call(
-        client: &Client,
-        f: impl FnOnce(&mut Db) -> anyhow::Result<Vec<u8>> + Send + 'static,
-    ) -> Result<Vec<u8>, Refusal> {
-        let operation = Operation::Call(Mutex::new(Some(Box::new(move |db| {
-            Ok(Box::new(f(db)?) as Box<dyn Any + Send>)
-        }))));
-        match client.submit(String::new(), operation, deadline())? {
-            Answer::Called(value) => Ok(*value.downcast::<Vec<u8>>().unwrap()),
-            _ => panic!("wrong actor reply"),
-        }
-    }
     fn value(db: &mut Db) -> anyhow::Result<Vec<u8>> {
         let mut value = Vec::new();
         db.query("SELECT value FROM actor_items", [], |row| {
@@ -1176,37 +1173,39 @@ mod tests {
         Ok(value)
     }
 
-    /// U15/CP-T1.8: the product owner must not run a closure before leadership and ReadIndex.
+    /// U15/CP-T1.8 on driven time: the product owner must not run a closure before leadership and
+    /// ReadIndex, and authentication binds a wire record to its sender. Do: call a lone member of
+    /// three, which has no leader, and step it with its clock a nanosecond before the call's
+    /// deadline, then at it. Expect: no answer before the deadline, Timeout at it, the closure never
+    /// run; then records whose claimed sender isn't the authenticated one, or isn't a member,
+    /// refused, and a drain past the outgoing bound refused too.
     #[test]
     fn unknown_leader_waits_to_deadline_without_evaluating_and_authentication_binds_wire_sender() {
         let dir = tempfile::tempdir().unwrap();
-        let client = open(dir.path(), vec![1, 2, 3]);
+        let mut driven = Driven::new();
+        let client = driven.open(dir.path(), 1, vec![1, 2, 3], None);
         let evaluated = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&evaluated);
-        let started = Instant::now();
-        let result = call(&client, move |_| {
+        let until = driven.until();
+        let answer = submit(&client, until, move |_| {
             count.fetch_add(1, Ordering::Relaxed);
             Ok(Vec::new())
         });
-        // The owner and synchronous receiver share the original five-second deadline. Either
-        // expiry observer may win; neither permits this isolated member to evaluate the closure.
-        assert!(matches!(
-            result,
-            Err(Refusal::Timeout | Refusal::UnknownOutcome)
-        ));
-        assert!(started.elapsed() >= Duration::from_secs(5));
+        let clock = driven.clock(0);
+        set(&clock, driven.base, until - Duration::from_nanos(1));
+        driven.step();
+        assert!(matches!(answer.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        set(&clock, driven.base, until);
+        driven.step();
+        assert!(matches!(answer.try_recv(), Ok(Err(Refusal::Timeout))));
         assert_eq!(evaluated.load(Ordering::Relaxed), 0);
-        let mut bytes = Vec::new();
+        let mut forged = Vec::new();
         Message {
             from: 2,
             to: 1,
             ..Message::default()
         }
-        .encode(&mut bytes);
-        assert!(matches!(
-            client.handle().receive(3, bytes, deadline()),
-            Err(Refusal::Invalid { .. })
-        ));
+        .encode(&mut forged);
         let mut foreign = Vec::new();
         Message {
             from: 4,
@@ -1214,23 +1213,37 @@ mod tests {
             ..Message::default()
         }
         .encode(&mut foreign);
-        assert!(matches!(
-            client.handle().receive(4, foreign, deadline()),
-            Err(Refusal::Invalid { .. })
-        ));
+        let mut receipts = [
+            client
+                .handle()
+                .admit_receive(3, forged, driven.until())
+                .unwrap(),
+            client
+                .handle()
+                .admit_receive(4, foreign, driven.until())
+                .unwrap(),
+        ];
+        driven.step();
+        for receipt in &mut receipts {
+            assert!(matches!(receipt.try_result(), Err(Refusal::Invalid { .. })));
+        }
         assert!(matches!(
             client.handle().drain(OUTGOING_MESSAGES + 1),
             Err(Refusal::TooLarge { .. })
         ));
     }
 
-    /// CP-T1.8: admitted application calls cannot consume replication's reserved byte capacity.
+    /// CP-T1.8 on driven time: admitted application calls cannot consume replication's reserved
+    /// byte capacity. Do: fill a leaderless member's queue with calls until it refuses one, then
+    /// admit a member's heartbeat and step the member. Expect: the refusal is the application
+    /// bound, the heartbeat processed, and no call run.
     #[test]
     fn unknown_leader_application_pressure_keeps_wire_admission_available() {
         let dir = tempfile::tempdir().unwrap();
-        let client = open(dir.path(), vec![1, 2, 3]);
+        let mut driven = Driven::new();
+        let client = driven.open(dir.path(), 1, vec![1, 2, 3], None);
         let handle = client.handle();
-        let until = deadline();
+        let until = driven.until();
         let evaluated = Arc::new(AtomicUsize::new(0));
         let mut replies = Vec::new();
         let mut refusal = None;
@@ -1267,7 +1280,9 @@ mod tests {
             ..Message::default()
         }
         .encode(&mut bytes);
-        handle.receive(2, bytes, until).unwrap();
+        let mut heartbeat = handle.admit_receive(2, bytes, until).unwrap();
+        driven.step();
+        assert!(matches!(heartbeat.try_result(), Ok(Some(()))));
         assert!(matches!(
             refusal,
             Some(Refusal::Full { limit }) if limit == QUEUED_BYTES - WIRE_BYTES
@@ -1280,21 +1295,28 @@ mod tests {
         assert_eq!(evaluated.load(Ordering::Relaxed), 0);
     }
 
-    /// U15/CP-T1.8: real DeviceFile log, product-driven election, once-only capture and reopen.
+    /// U15/CP-T1.8 on driven time: a real DeviceFile log, a product-driven election, a once-only
+    /// capture and bounded GC by the same owner, all kept through a durable restart. Do: a single
+    /// voter captures a random value, puts and deletes a record, compacts, then restarts. Expect:
+    /// the closure run once, the value and the deletion's change back after the restart, and a
+    /// second compaction with nothing left to visit.
     #[test]
     fn single_voter_actor_captures_once_and_reopens_durable_random_value() {
         let dir = tempfile::tempdir().unwrap();
-        let client = open(dir.path(), vec![1]);
-        leader(&client);
+        let mut driven = Driven::new();
+        let clients = vec![driven.open(dir.path(), 1, vec![1], None)];
+        let mut pump = Pump::new(&clients);
+        driven.elect(&mut pump, &clients, 0, 1);
+        let client = clients.first().unwrap();
         let evaluated = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&evaluated);
-        let chosen = call(&client, move |db| {
+        let chosen = driven.call(&mut pump, client, move |db| {
             count.fetch_add(1, Ordering::Relaxed);
             db.exec("CREATE TABLE actor_items(value BLOB DEFAULT(randomblob(32))); INSERT INTO actor_items DEFAULT VALUES")?;
             value(db)
         }).unwrap();
         assert_eq!(evaluated.load(Ordering::Relaxed), 1);
-        assert_eq!(call(&client, value).unwrap(), chosen);
+        assert_eq!(driven.call(&mut pump, client, value).unwrap(), chosen);
         // Bounded GC is captured by this same owner and survives its durable restart.
         for writes in [
             vec![Write::Put {
@@ -1307,107 +1329,68 @@ mod tests {
                 key: b"retired".to_vec(),
             }],
         ] {
-            client
-                .submit(
-                    "gc".into(),
-                    Operation::Mutation(Mutation::Records {
-                        namespace: "gc".into(),
-                        tx: Tx {
-                            conds: vec![],
-                            writes,
-                        },
-                    }),
-                    deadline(),
-                )
-                .unwrap();
+            let records = Operation::Mutation(Mutation::Records {
+                namespace: "gc".into(),
+                tx: Tx {
+                    conds: vec![],
+                    writes,
+                },
+            });
+            let answer = enqueue(client, driven.until(), "gc", records);
+            driven.answer(&mut pump, &answer).unwrap();
         }
-        let progress = client
-            .submit(
-                "gc".into(),
-                Operation::Mutation(Mutation::CompactStep {
-                    namespace: "gc".into(),
-                    before: 2,
-                }),
-                deadline(),
-            )
-            .unwrap();
-        let Answer::Compacted(progress) = progress else {
+        let step = Operation::Mutation(Mutation::CompactStep {
+            namespace: "gc".into(),
+            before: 2,
+        });
+        let answer = enqueue(client, driven.until(), "gc", step);
+        let Answer::Compacted(progress) = driven.answer(&mut pump, &answer).unwrap() else {
             panic!("wrong compaction answer")
         };
         assert_eq!(progress.completed, 2);
         assert_eq!(progress.feed, 1);
         let applied = client.handle().status().unwrap().applied;
-        drop(client);
-        let reopened = open(dir.path(), vec![1]);
-        leader(&reopened);
-        assert!(reopened.handle().status().unwrap().applied >= applied);
-        assert_eq!(call(&reopened, value).unwrap(), chosen);
-        let changes = reopened
-            .submit(
-                "gc".into(),
-                Operation::Changes("items".into(), 1, 10),
-                deadline(),
-            )
-            .unwrap();
-        let Answer::Changes(changes) = changes else {
+        // Past hyper-durable's quiet period, so the owner states its durable commit before it stops.
+        driven.advance(0, Duration::from_millis(60));
+        for _ in 0..8 {
+            driven.round(&mut pump);
+        }
+        driven.drain(&mut pump);
+        pump.finish();
+        drop(clients);
+        drop(driven);
+
+        let mut driven = Driven::new();
+        let reopened = vec![driven.open(dir.path(), 1, vec![1], None)];
+        let mut pump = Pump::new(&reopened);
+        driven.elect(&mut pump, &reopened, 0, applied);
+        let client = reopened.first().unwrap();
+        assert!(client.handle().status().unwrap().applied >= applied);
+        assert_eq!(driven.call(&mut pump, client, value).unwrap(), chosen);
+        let changes = enqueue(
+            client,
+            driven.until(),
+            "gc",
+            Operation::Changes("items".into(), 1, 10),
+        );
+        let Answer::Changes(changes) = driven.answer(&mut pump, &changes).unwrap() else {
             panic!("wrong changes answer")
         };
         assert_eq!(changes.changes.len(), 1);
         assert_eq!(changes.changes[0].value, None);
-        let progress = reopened
-            .submit(
-                "gc".into(),
-                Operation::Mutation(Mutation::CompactStep {
-                    namespace: "gc".into(),
-                    before: 2,
-                }),
-                deadline(),
-            )
-            .unwrap();
-        let Answer::Compacted(progress) = progress else {
+        let step = Operation::Mutation(Mutation::CompactStep {
+            namespace: "gc".into(),
+            before: 2,
+        });
+        let answer = enqueue(client, driven.until(), "gc", step);
+        let Answer::Compacted(progress) = driven.answer(&mut pump, &answer).unwrap() else {
             panic!("wrong recovered compaction answer")
         };
         assert_eq!(progress.completed, 2);
         assert_eq!(progress.visited, 0);
         assert_eq!(evaluated.load(Ordering::Relaxed), 1);
-    }
-    /// U15/CP-T1.8: a SQL deadline interrupts execution, rolls back capture and frees the driver.
-    #[test]
-    fn expired_sql_rolls_back_before_actor_continues() {
-        let dir = tempfile::tempdir().unwrap();
-        let client = open(dir.path(), vec![1]);
-        leader(&client);
-        let ran = Arc::new(AtomicUsize::new(0));
-        let counted = Arc::clone(&ran);
-        let operation = Operation::Call(Mutex::new(Some(Box::new(move |db| {
-            counted.fetch_add(1, Ordering::Relaxed);
-            db.exec("CREATE TABLE cancelled_actor_write(value); WITH RECURSIVE n(x) AS(VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1000000000) SELECT sum(x) FROM n")?;
-            Ok(Box::new(Vec::<u8>::new()) as Box<dyn Any + Send>)
-        }))));
-        let result = client.submit(
-            String::new(),
-            operation,
-            Instant::now() + Duration::from_millis(200),
-        );
-        assert!(matches!(
-            result,
-            Err(Refusal::Timeout | Refusal::UnknownOutcome)
-        ));
-        assert_eq!(ran.load(Ordering::Relaxed), 1);
-        let retained = call(&client, |db| {
-            let mut count = 0;
-            db.query(
-                "SELECT count(*) FROM sqlite_schema WHERE name='cancelled_actor_write'",
-                [],
-                |row| {
-                    count = row.get::<i64>(0).map_err(unavailable)?;
-                    Ok(false)
-                },
-            )?;
-            Ok(vec![u8::try_from(count)?])
-        })
-        .unwrap();
-        assert_eq!(retained, vec![0]);
+        driven.drain(&mut pump);
+        pump.finish();
     }
     struct PumpPacket {
         from: u64,
@@ -1417,6 +1400,7 @@ mod tests {
     struct PumpReceipt {
         receipt: ReceiveReceipt,
         bytes: usize,
+        proposal: bool,
     }
     enum PumpPhase {
         Relay,
@@ -1435,6 +1419,9 @@ mod tests {
         next_source: usize,
         records: usize,
         bytes: usize,
+        // A nemesis's elections: a leader handing off its lead refuses the proposals forwarded
+        // to it, and those refusals are counted here instead of failing the test.
+        refusals: Option<usize>,
     }
     impl<'a> Pump<'a> {
         fn new(clients: &'a [Client]) -> Self {
@@ -1446,6 +1433,7 @@ mod tests {
                 next_source: 0,
                 records: 0,
                 bytes: 0,
+                refusals: None,
             }
         }
         fn reap(&mut self) {
@@ -1460,6 +1448,13 @@ mod tests {
                 let pending = slot.take().unwrap();
                 self.records -= 1;
                 self.bytes -= pending.bytes;
+                if let (Some(refusals), true, Err(Refusal::Unavailable(why))) =
+                    (self.refusals.as_mut(), pending.proposal, &result)
+                    && why.contains("transferring its leadership")
+                {
+                    *refusals += 1;
+                    continue;
+                }
                 // Admission was not an ACK: expiry, validation and fencing must fail the test.
                 assert_eq!(result.unwrap(), Some(()));
             }
@@ -1470,6 +1465,8 @@ mod tests {
                 .get(usize::try_from(packet.message.to - 1).unwrap())
                 .unwrap();
             let bytes = packet.message.bytes.len();
+            let proposal = Message::decode(&packet.message.bytes).unwrap().msg_type
+                == hyper_raft::proto::MessageType::MsgPropose;
             let receipt = peer
                 .handle()
                 .admit_receive(packet.from, packet.message.bytes, packet.until)
@@ -1479,9 +1476,14 @@ mod tests {
                 .iter_mut()
                 .find(|slot| slot.is_none())
                 .unwrap();
-            *slot = Some(PumpReceipt { receipt, bytes });
+            *slot = Some(PumpReceipt {
+                receipt,
+                bytes,
+                proposal,
+            });
         }
-        fn drive(&mut self) -> usize {
+        /// One relay round, each record admitted with `until` as its receive deadline.
+        fn drive_until(&mut self, until: Instant) -> usize {
             self.reap();
             let first = self.next_source;
             self.next_source = (first + 1) % self.clients.len();
@@ -1511,7 +1513,7 @@ mod tests {
                         let packet = PumpPacket {
                             from,
                             message,
-                            until: deadline(),
+                            until,
                         };
                         self.records += 1;
                         self.bytes += packet.message.bytes.len();
@@ -1559,32 +1561,6 @@ mod tests {
             }
             self.reap();
         }
-        fn call(
-            &mut self,
-            origin: usize,
-            f: impl FnOnce(&mut Db) -> anyhow::Result<Vec<u8>> + Send + 'static,
-        ) -> Result<Vec<u8>, Refusal> {
-            let client = self.clients.get(origin).unwrap().clone();
-            let (sender, receiver) = mpsc::sync_channel(1);
-            let worker = std::thread::spawn(move || sender.send(call(&client, f)).unwrap());
-            let until = deadline();
-            let result = loop {
-                match receiver.try_recv() {
-                    Ok(result) => break result,
-                    Err(mpsc::TryRecvError::Empty) => {}
-                    Err(error) => panic!("actor caller ended: {error}"),
-                }
-                assert!(
-                    Instant::now() < until,
-                    "follower-origin command did not settle"
-                );
-                self.drive();
-                std::thread::park_timeout(POLL);
-            };
-            worker.join().unwrap();
-            self.reap();
-            result
-        }
         fn finish(mut self) {
             assert!(
                 matches!(self.phase, PumpPhase::Relay),
@@ -1616,116 +1592,445 @@ mod tests {
         }
     }
 
-    /// U15/CP-T1.8: follower calls use the real leader's ReadIndex and proposal forwarding.
+    /// Rounds a driven group may take for one call, election or settling before the test calls
+    /// it hung. A round with nothing to relay yields `POLL` to the disk, so this is a counted hang
+    /// guard of about a minute of disk waits (CLAUDE.md section 2), never a verdict on time.
+    const ROUNDS: usize = 60_000;
+
+    /// A test's own clocks and the owners it steps (replication.md, "The owner's time"). Each
+    /// owner reads its own clock, as a machine reads its own, and only the test moves it: between
+    /// steps, or from a call's work while the owner runs it. Its instants start an hour past the
+    /// real clock, so a real-clock check of a test deadline (a receipt's poll) holds for an hour:
+    /// a hang guard, never a verdict.
+    struct Driven {
+        owners: Vec<(Actor, mpsc::Receiver<Envelope>)>,
+        base: Instant,
+        // Each owner's clock: the nanoseconds it reads past `base`.
+        clocks: Vec<Arc<AtomicU64>>,
+    }
+    /// The time a driven clock reads past its shell's base.
+    fn offset(clock: &AtomicU64) -> Duration {
+        Duration::from_nanos(clock.load(Ordering::Acquire))
+    }
+    /// Moves a driven clock to `to`, its shell's `base` plus some offset.
+    fn set(clock: &AtomicU64, base: Instant, to: Instant) {
+        let nanos = u64::try_from(to.duration_since(base).as_nanos()).unwrap();
+        clock.store(nanos, Ordering::Release);
+    }
+    impl Driven {
+        fn new() -> Self {
+            Self {
+                owners: Vec::new(),
+                base: Instant::now() + Duration::from_secs(3600),
+                clocks: Vec::new(),
+            }
+        }
+        /// A call's or a record's budget on these clocks: it runs out only if the test moves a
+        /// clock past it.
+        fn until(&self) -> Instant {
+            self.base
+                + self
+                    .clocks
+                    .iter()
+                    .map(|clock| offset(clock))
+                    .max()
+                    .unwrap_or_default()
+                + Duration::from_secs(5)
+        }
+        fn advance(&mut self, owner: usize, by: Duration) {
+            let clock = self.clocks.get(owner).unwrap();
+            set(clock, self.base, self.base + offset(clock) + by);
+        }
+        /// Owner `owner`'s clock, for a call's work to move while the owner runs it.
+        fn clock(&self, owner: usize) -> Arc<AtomicU64> {
+            Arc::clone(self.clocks.get(owner).unwrap())
+        }
+        fn open(
+            &mut self,
+            dir: &Path,
+            node_id: u64,
+            voters: Vec<u64>,
+            bootstrap: Option<api::replication::Bootstrap>,
+        ) -> Client {
+            let path = dir.join(format!("state-{node_id}.db"));
+            let mut lease = None;
+            for _ in 0..ROUNDS {
+                match exclusive_file(&path) {
+                    Ok(file) => {
+                        lease = Some(Arc::new(file));
+                        break;
+                    }
+                    Err(_) => std::thread::park_timeout(POLL),
+                }
+            }
+            let lease = lease.expect("the previous owner kept its lease");
+            let reading = Arc::new(AtomicU64::new(0));
+            let (base, read) = (self.base, Arc::clone(&reading));
+            let (client, actor, receiver) = super::open(
+                &path,
+                &dir.join(format!("raft-{node_id}.log")),
+                ReplicaConfig {
+                    node_id,
+                    voters,
+                    learners: Vec::new(),
+                    bootstrap,
+                },
+                Arc::new(Changed::default()),
+                lease,
+                self.until(),
+                Arc::new(move || base + offset(&read)),
+            )
+            .unwrap();
+            self.owners.push((actor, receiver));
+            self.clocks.push(reading);
+            client
+        }
+        /// One round: every owner takes each input waiting for it, then steps once more, each at
+        /// its own clock's reading.
+        fn step(&mut self) {
+            for (owner, inputs) in &mut self.owners {
+                while let Ok(input) = inputs.try_recv() {
+                    owner.run_step(Some(input)).unwrap();
+                }
+                owner.run_step(None).unwrap();
+            }
+        }
+        /// One relay round and one step; a round with nothing to relay yields `POLL` to the disk.
+        fn round(&mut self, pump: &mut Pump<'_>) {
+            if pump.drive_until(self.until()) == 0 {
+                std::thread::park_timeout(POLL);
+            }
+            self.step();
+        }
+        /// Owner `first` campaigns now, every clock standing still, and rounds go on until every
+        /// owner follows one leader with at least `applied` applied. Returns the leader's index.
+        fn elect(
+            &mut self,
+            pump: &mut Pump<'_>,
+            clients: &[Client],
+            first: usize,
+            applied: u64,
+        ) -> usize {
+            self.owners
+                .get_mut(first)
+                .unwrap()
+                .0
+                .replica
+                .campaign()
+                .unwrap();
+            self.follow(pump, clients, applied)
+        }
+        /// Rounds, time standing still, until every owner follows one leader with at least
+        /// `applied` applied. Returns the leader's index.
+        fn follow(&mut self, pump: &mut Pump<'_>, clients: &[Client], applied: u64) -> usize {
+            for _ in 0..ROUNDS {
+                self.round(pump);
+                let states: Vec<_> = clients
+                    .iter()
+                    .map(|c| c.handle().status().unwrap())
+                    .collect();
+                let leader = states.first().unwrap().leader;
+                if leader != 0
+                    && states
+                        .iter()
+                        .all(|s| s.leader == leader && s.applied >= applied)
+                {
+                    return usize::try_from(leader - 1).unwrap();
+                }
+            }
+            panic!("no leader followed in {ROUNDS} driven rounds");
+        }
+        /// The lead moves from owner `from` to owner `to` now (`Replica::transfer`, which no lease
+        /// refuses), every clock standing still; rounds go on until every owner follows `to`.
+        fn transfer(&mut self, pump: &mut Pump<'_>, clients: &[Client], from: usize, to: usize) {
+            let id = u64::try_from(to + 1).unwrap();
+            self.owners
+                .get_mut(from)
+                .unwrap()
+                .0
+                .replica
+                .transfer(id)
+                .unwrap();
+            for _ in 0..ROUNDS {
+                self.round(pump);
+                if clients
+                    .iter()
+                    .all(|c| c.handle().status().unwrap().leader == id)
+                {
+                    return;
+                }
+            }
+            panic!("the lead did not move to {id} in {ROUNDS} driven rounds");
+        }
+        /// Rounds, time standing still, until `answer` comes.
+        fn answer(
+            &mut self,
+            pump: &mut Pump<'_>,
+            answer: &mpsc::Receiver<Result<Answer, Refusal>>,
+        ) -> Result<Answer, Refusal> {
+            for _ in 0..ROUNDS {
+                match answer.try_recv() {
+                    Ok(result) => return result,
+                    Err(mpsc::TryRecvError::Empty) => self.round(pump),
+                    Err(error) => panic!("owner ended: {error}"),
+                }
+            }
+            panic!("a driven operation was unanswered after {ROUNDS} rounds");
+        }
+        /// Rounds, time standing still, until the call's `answer` comes.
+        fn settle(
+            &mut self,
+            pump: &mut Pump<'_>,
+            answer: &mpsc::Receiver<Result<Answer, Refusal>>,
+        ) -> Result<Vec<u8>, Refusal> {
+            self.answer(pump, answer).map(called)
+        }
+        fn call(
+            &mut self,
+            pump: &mut Pump<'_>,
+            client: &Client,
+            f: impl FnOnce(&mut Db) -> anyhow::Result<Vec<u8>> + Send + 'static,
+        ) -> Result<Vec<u8>, Refusal> {
+            let answer = submit(client, self.until(), f);
+            self.settle(pump, &answer)
+        }
+        /// Rounds until every record the relay admitted has been taken, so the pump can finish.
+        fn drain(&mut self, pump: &mut Pump<'_>) {
+            for _ in 0..ROUNDS {
+                pump.reap();
+                if pump.records == 0 {
+                    return;
+                }
+                self.step();
+            }
+            panic!("admitted records still untaken after {ROUNDS} rounds");
+        }
+    }
+    /// Enqueues `operation` at `client` without waiting: its answer comes on the returned receiver.
+    fn enqueue(
+        client: &Client,
+        until: Instant,
+        namespace: &str,
+        operation: Operation,
+    ) -> mpsc::Receiver<Result<Answer, Refusal>> {
+        let (response, receiver) = mpsc::sync_channel(1);
+        client
+            .handle
+            .enqueue(
+                Input::Submit {
+                    namespace: namespace.into(),
+                    operation,
+                    until,
+                    response,
+                },
+                api::REQUEST_MAX,
+            )
+            .unwrap();
+        receiver
+    }
+    /// Enqueues the call `f` at `client` without waiting.
+    fn submit(
+        client: &Client,
+        until: Instant,
+        f: impl FnOnce(&mut Db) -> anyhow::Result<Vec<u8>> + Send + 'static,
+    ) -> mpsc::Receiver<Result<Answer, Refusal>> {
+        let operation = Operation::Call(Mutex::new(Some(Box::new(move |db| {
+            Ok(Box::new(f(db)?) as Box<dyn Any + Send>)
+        }))));
+        enqueue(client, until, "", operation)
+    }
+    fn called(answer: Answer) -> Vec<u8> {
+        match answer {
+            Answer::Called(value) => *value.downcast::<Vec<u8>>().unwrap(),
+            _ => panic!("wrong actor reply"),
+        }
+    }
+    fn terms(clients: &[Client]) -> Vec<u64> {
+        clients
+            .iter()
+            .map(|c| c.handle().status().unwrap().term)
+            .collect()
+    }
+
+    /// U15/CP-T1.8 on driven time (replication.md, "The owner's time"): a call whose own work
+    /// outlasts its deadline is refused and never proposed. Do: the call's work inserts a row,
+    /// then moves its owner's clock to the call's deadline, as slow work moves the real clock.
+    /// Expect: Timeout, no row on any owner, and no election.
+    #[test]
+    fn a_call_whose_work_outlasts_its_deadline_is_refused_and_never_proposed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        let elected = terms(&clients);
+        let origin = clients.get(leader).unwrap();
+        driven
+            .call(&mut pump, origin, |db| {
+                db.exec("CREATE TABLE slow_items(value)")?;
+                Ok(Vec::new())
+            })
+            .unwrap();
+        // The call's deadline is a second past its owner's clock, inside the relay's budget for
+        // the records it carries, so the clock reaching it expires the call alone.
+        let (clock, base) = (driven.clock(leader), driven.base);
+        let until = base + offset(&clock) + Duration::from_secs(1);
+        let answer = submit(origin, until, move |db| {
+            db.exec("INSERT INTO slow_items VALUES(1)")?;
+            set(&clock, base, until);
+            Ok(Vec::new())
+        });
+        assert_eq!(driven.settle(&mut pump, &answer), Err(Refusal::Timeout));
+        for client in &clients {
+            let rows = driven
+                .call(&mut pump, client, |db| {
+                    let mut count = 0;
+                    db.query("SELECT count(*) FROM slow_items", [], |row| {
+                        count = row.get::<i64>(0).map_err(unavailable)?;
+                        Ok(false)
+                    })?;
+                    Ok(vec![u8::try_from(count)?])
+                })
+                .unwrap();
+            assert_eq!(rows, vec![0]);
+        }
+        assert_eq!(
+            terms(&clients),
+            elected,
+            "an election happened during the scenario"
+        );
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// How many tables named cancelled_actor_write the database has.
+    fn cancelled_tables(db: &mut Db) -> anyhow::Result<u8> {
+        let mut count = 0;
+        db.query(
+            "SELECT count(*) FROM sqlite_schema WHERE name='cancelled_actor_write'",
+            [],
+            |row| {
+                count = row.get::<i64>(0).map_err(unavailable)?;
+                Ok(false)
+            },
+        )?;
+        Ok(u8::try_from(count)?)
+    }
+
+    /// U15/CP-T1.8 on driven time: a SQL deadline interrupts execution, rolls back its capture
+    /// and frees the owner. Do: the call's work creates a table, moves its owner's clock to the
+    /// call's deadline, as long work moves the real clock, then runs a query of ten million rows.
+    /// Expect: the query interrupted at its first deadline check, Timeout, the table rolled back,
+    /// and the owner's next call answered.
+    #[test]
+    fn expired_sql_rolls_back_before_actor_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients = vec![driven.open(dir.path(), 1, vec![1], None)];
+        let mut pump = Pump::new(&clients);
+        driven.elect(&mut pump, &clients, 0, 1);
+        let ran = Arc::new(AtomicUsize::new(0));
+        let created = Arc::new(AtomicUsize::new(0));
+        let interrupted = Arc::new(AtomicUsize::new(0));
+        let (counted, made, stopped) = (
+            Arc::clone(&ran),
+            Arc::clone(&created),
+            Arc::clone(&interrupted),
+        );
+        let (clock, base, until) = (driven.clock(0), driven.base, driven.until());
+        let answer = submit(clients.first().unwrap(), until, move |db| {
+            counted.fetch_add(1, Ordering::Relaxed);
+            db.exec("CREATE TABLE cancelled_actor_write(value)")?;
+            made.store(usize::from(cancelled_tables(db)?), Ordering::Relaxed);
+            set(&clock, base, until);
+            // Through the row runner, which reports an interrupt as one (the batch runner
+            // reports it as busy).
+            let result = db.query_owned("WITH RECURSIVE n(x) AS(VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10000000) SELECT sum(x) FROM n", [], |_| Ok(true));
+            if matches!(&result, Err(error) if format!("{error:#}").contains("interrupt")) {
+                stopped.fetch_add(1, Ordering::Relaxed);
+            }
+            result?;
+            Ok(Vec::new())
+        });
+        assert_eq!(driven.settle(&mut pump, &answer), Err(Refusal::Timeout));
+        assert_eq!(ran.load(Ordering::Relaxed), 1);
+        assert_eq!(created.load(Ordering::Relaxed), 1);
+        assert_eq!(interrupted.load(Ordering::Relaxed), 1);
+        let retained = driven
+            .call(&mut pump, clients.first().unwrap(), |db| {
+                Ok(vec![cancelled_tables(db)?])
+            })
+            .unwrap();
+        assert_eq!(retained, vec![0]);
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// U15/CP-T1.8 on driven time (replication.md, "The owner's time"): follower calls use the
+    /// real leader's ReadIndex and proposal forwarding, and no election happens during the scenario.
     #[test]
     fn follower_origin_captures_once_and_reads_after_local_durable_apply() {
         let dir = tempfile::tempdir().unwrap();
-        let mut clients = Vec::new();
-        for node_id in 1..=3 {
-            let path = dir.path().join(format!("state-{node_id}.db"));
-            let lease = Arc::new(exclusive_file(&path).unwrap());
-            clients.push(
-                start(
-                    &path,
-                    &dir.path().join(format!("raft-{node_id}.log")),
-                    ReplicaConfig {
-                        node_id,
-                        voters: vec![1, 2, 3],
-                        learners: Vec::new(),
-                        bootstrap: None,
-                    },
-                    Arc::new(Changed::default()),
-                    lease,
-                    deadline(),
-                )
-                .unwrap(),
-            );
-        }
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
         let mut pump = Pump::new(&clients);
-        let until = deadline();
-        let mut delivered = 0;
-        let leader = loop {
-            delivered += pump.drive();
-            let states: Vec<_> = clients
-                .iter()
-                .map(|c| c.handle().status().unwrap())
-                .collect();
-            let candidate = states.first().unwrap().leader;
-            if candidate != 0
-                && states
-                    .iter()
-                    .all(|s| s.leader == candidate && s.applied > 0)
-            {
-                break usize::try_from(candidate - 1).unwrap();
-            }
-            assert!(
-                Instant::now() < until,
-                "three product actors did not elect: {states:?}"
-            );
-            std::thread::park_timeout(POLL);
-        };
-        assert!(delivered > 0);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        let elected = terms(&clients);
         let origin = (leader + 1) % 3;
         let evaluated = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&evaluated);
-        let chosen = pump.call(origin, move |db| {
-            count.fetch_add(1, Ordering::Relaxed);
-            db.exec("CREATE TABLE actor_items(value BLOB DEFAULT(randomblob(32))); INSERT INTO actor_items DEFAULT VALUES")?;
-            value(db)
-        }).unwrap();
+        let chosen = driven
+            .call(&mut pump, clients.get(origin).unwrap(), move |db| {
+                count.fetch_add(1, Ordering::Relaxed);
+                db.exec("CREATE TABLE actor_items(value BLOB DEFAULT(randomblob(32))); INSERT INTO actor_items DEFAULT VALUES")?;
+                value(db)
+            })
+            .unwrap();
         assert_eq!(evaluated.load(Ordering::Relaxed), 1);
-        assert_eq!(pump.call((origin + 1) % 3, value).unwrap(), chosen);
+        assert_eq!(
+            driven
+                .call(&mut pump, clients.get((origin + 1) % 3).unwrap(), value)
+                .unwrap(),
+            chosen
+        );
         assert_eq!(evaluated.load(Ordering::Relaxed), 1);
 
-        // Hold both forwarded proposals in the pump so both captures use the same committed
-        // base. No owner waits for the other capture, and later records cannot overtake a hold.
-        // Exactly one page set may apply; the stale one's answer is refused.
+        // Both forwarded proposals are held, so both captures use the same committed base; exactly
+        // one page set may apply and the stale one's answer is refused.
         let captures = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
-        let (sender, receiver) = mpsc::sync_channel(2);
-        let mut workers = Vec::new();
-        for offset in 1..=2 {
-            let client = clients.get((leader + offset) % 3).unwrap().clone();
-            let captures = Arc::clone(&captures);
-            let sender = sender.clone();
-            workers.push(std::thread::spawn(move || {
-                let result = call(&client, move |db| {
-                    captures[offset - 1].fetch_add(1, Ordering::Relaxed);
-                    db.exec("INSERT INTO actor_items(value) VALUES(x'01')")?;
-                    Ok(vec![1])
-                });
-                sender.send(result).unwrap();
-            }));
-        }
-        drop(sender);
-        let until = deadline();
-        let mut outcomes = Vec::new();
         pump.begin_captures(leader);
-        while outcomes.len() < 2 {
-            if let Ok(outcome) = receiver.try_recv() {
-                outcomes.push(outcome);
+        let answers: Vec<_> = (1..=2usize)
+            .map(|offset| {
+                let captures = Arc::clone(&captures);
+                submit(
+                    clients.get((leader + offset) % 3).unwrap(),
+                    driven.until(),
+                    move |db| {
+                        captures[offset - 1].fetch_add(1, Ordering::Relaxed);
+                        db.exec("INSERT INTO actor_items(value) VALUES(x'01')")?;
+                        Ok(vec![1])
+                    },
+                )
+            })
+            .collect();
+        let mut outcomes: Vec<Option<Result<Vec<u8>, Refusal>>> = vec![None, None];
+        for _ in 0..ROUNDS {
+            for (answer, outcome) in answers.iter().zip(outcomes.iter_mut()) {
+                if outcome.is_none()
+                    && let Ok(result) = answer.try_recv()
+                {
+                    *outcome = Some(result.map(called));
+                }
             }
-            assert!(
-                Instant::now() < until,
-                "concurrent proposals did not settle"
-            );
-            pump.drive();
+            if outcomes.iter().all(Option::is_some) {
+                break;
+            }
+            driven.round(&mut pump);
             if pump.captures_ready() {
-                let first = clients
-                    .get((leader + 1) % 3)
-                    .unwrap()
-                    .handle()
-                    .status()
-                    .unwrap();
-                let second = clients
-                    .get((leader + 2) % 3)
-                    .unwrap()
-                    .handle()
-                    .status()
-                    .unwrap();
-                assert_eq!(first.applied, second.applied);
-                assert_eq!(first.term, second.term);
-                assert_eq!(first.leader, u64::try_from(leader + 1).unwrap());
-                assert_eq!(second.leader, first.leader);
                 assert!(
                     captures
                         .iter()
@@ -1733,11 +2038,8 @@ mod tests {
                 );
                 pump.release_captures();
             }
-            std::thread::park_timeout(POLL);
         }
-        for worker in workers {
-            worker.join().unwrap();
-        }
+        let outcomes: Vec<_> = outcomes.into_iter().map(Option::unwrap).collect();
         assert!(matches!(pump.phase, PumpPhase::Relay));
         assert!(
             captures
@@ -1750,9 +2052,8 @@ mod tests {
             "{outcomes:?}"
         );
         assert_eq!(outcomes.iter().filter(|r| matches!(r, Err(Refusal::Invalid { what, .. }) if what == "prepared transaction")).count(), 1, "{outcomes:?}");
-        assert!(clients.iter().all(|c| c.handle().status().is_ok()));
-        let count = pump
-            .call(origin, |db| {
+        let count = driven
+            .call(&mut pump, clients.get(origin).unwrap(), |db| {
                 db.exec("INSERT INTO actor_items(value) VALUES(x'03')")?;
                 let mut count = 0;
                 db.query("SELECT count(*) FROM actor_items", [], |row| {
@@ -1763,8 +2064,178 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, vec![3]);
+        assert_eq!(
+            terms(&clients),
+            elected,
+            "an election happened during the scenario"
+        );
+        driven.drain(&mut pump);
         pump.finish();
     }
+
+    /// U15/CP-T1.8 under a nemesis (replication.md, "The owner's time"): the follower-origin
+    /// scenario with the lead moved to another owner at each of its steps: while its first call
+    /// and the read after it are in flight, as the held captures go out, after the first capture
+    /// answers, and before the last call. Whatever the election: never two Oks for the two
+    /// captures and never two of their rows, every answer Ok, the stale capture's refusal or
+    /// UnknownOutcome, and a capture answered Ok has its row.
+    #[test]
+    fn follower_origin_captures_hold_through_an_election_at_each_step() {
+        for position in 0..5 {
+            let dir = tempfile::tempdir().unwrap();
+            let mut driven = Driven::new();
+            let clients: Vec<Client> = (1..=3)
+                .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+                .collect();
+            let mut pump = Pump::new(&clients);
+            pump.refusals = Some(0);
+            let leader = driven.elect(&mut pump, &clients, 0, 1);
+            let origin = (leader + 1) % 3;
+            // Positions 3 and 4: the lead moves while the first call, then the read after it, is
+            // in flight. Each answers Ok or UnknownOutcome, and the table holds what an Ok says.
+            let create = submit(clients.get(origin).unwrap(), driven.until(), |db| {
+                db.exec("CREATE TABLE actor_items(value BLOB DEFAULT(randomblob(32))); INSERT INTO actor_items DEFAULT VALUES")?;
+                value(db)
+            });
+            if position == 3 {
+                driven.transfer(&mut pump, &clients, leader, origin);
+            }
+            let created = driven.settle(&mut pump, &create);
+            assert!(
+                matches!(created, Ok(ref v) if v.len() == 32)
+                    || matches!(created, Err(Refusal::UnknownOutcome)),
+                "position {position}: {created:?}"
+            );
+            if position >= 3 {
+                let read = submit(
+                    clients.get((origin + 1) % 3).unwrap(),
+                    driven.until(),
+                    |db| {
+                        let mut tables = 0;
+                        db.query(
+                            "SELECT count(*) FROM sqlite_schema WHERE name = 'actor_items'",
+                            [],
+                            |row| {
+                                tables = row.get::<i64>(0).map_err(unavailable)?;
+                                Ok(false)
+                            },
+                        )?;
+                        Ok(if tables == 1 { value(db)? } else { Vec::new() })
+                    },
+                );
+                if position == 4 {
+                    let now = usize::try_from(
+                        clients.first().unwrap().handle().status().unwrap().leader - 1,
+                    )
+                    .unwrap();
+                    driven.transfer(&mut pump, &clients, now, (now + 1) % 3);
+                }
+                let after = driven.settle(&mut pump, &read);
+                match (&created, &after) {
+                    (Ok(chosen), Ok(seen)) => assert_eq!(seen, chosen, "position {position}"),
+                    (Err(_), Ok(seen)) => assert!(
+                        seen.is_empty() || seen.len() == 32,
+                        "position {position}: {seen:?}"
+                    ),
+                    (_, Err(refusal)) => assert!(
+                        matches!(refusal, Refusal::UnknownOutcome),
+                        "position {position}: {refusal:?}"
+                    ),
+                }
+                driven.drain(&mut pump);
+                pump.finish();
+                continue;
+            }
+            assert!(created.is_ok(), "position {position}: {created:?}");
+            pump.begin_captures(leader);
+            let answers: Vec<_> = (1..=2usize)
+                .map(|offset| {
+                    submit(
+                        clients.get((leader + offset) % 3).unwrap(),
+                        driven.until(),
+                        |db| {
+                            db.exec("INSERT INTO actor_items(value) VALUES(x'01')")?;
+                            Ok(vec![1])
+                        },
+                    )
+                })
+                .collect();
+            let mut outcomes: Vec<Option<Result<Vec<u8>, Refusal>>> = vec![None, None];
+            let mut moved = false;
+            for _ in 0..ROUNDS {
+                for (answer, outcome) in answers.iter().zip(outcomes.iter_mut()) {
+                    if outcome.is_none()
+                        && let Ok(result) = answer.try_recv()
+                    {
+                        *outcome = Some(result.map(called));
+                    }
+                }
+                if outcomes.iter().all(Option::is_some) {
+                    break;
+                }
+                if position == 1 && !moved && outcomes.iter().any(Option::is_some) {
+                    driven.transfer(&mut pump, &clients, leader, origin);
+                    moved = true;
+                }
+                driven.round(&mut pump);
+                if pump.captures_ready() {
+                    pump.release_captures();
+                    if position == 0 {
+                        driven.transfer(&mut pump, &clients, leader, origin);
+                        moved = true;
+                    }
+                }
+            }
+            let outcomes: Vec<_> = outcomes.into_iter().map(Option::unwrap).collect();
+            for outcome in &outcomes {
+                assert!(
+                    matches!(outcome, Ok(v) if v == &vec![1])
+                        || matches!(outcome, Err(Refusal::Invalid { what, .. }) if what == "prepared transaction")
+                        || matches!(outcome, Err(Refusal::UnknownOutcome)),
+                    "position {position}: {outcomes:?}"
+                );
+            }
+            let oks = outcomes.iter().filter(|r| r.is_ok()).count();
+            assert!(oks <= 1, "position {position}: {outcomes:?}");
+            if position == 2 {
+                let now = clients
+                    .iter()
+                    .map(|c| c.handle().status().unwrap().leader)
+                    .next()
+                    .unwrap();
+                let current = usize::try_from(now - 1).unwrap();
+                driven.transfer(&mut pump, &clients, current, (current + 1) % 3);
+            }
+            let rows = driven
+                .call(&mut pump, clients.get(origin).unwrap(), |db| {
+                    let mut rows = 0;
+                    db.query(
+                        "SELECT count(*) FROM actor_items WHERE value = x'01'",
+                        [],
+                        |row| {
+                            rows = row.get::<i64>(0).map_err(unavailable)?;
+                            Ok(false)
+                        },
+                    )?;
+                    Ok(vec![u8::try_from(rows)?])
+                })
+                .unwrap();
+            let rows = *rows.first().unwrap();
+            assert!(
+                rows <= 1,
+                "position {position}: {rows} rows for {outcomes:?}"
+            );
+            if oks == 1 {
+                assert_eq!(
+                    rows, 1,
+                    "position {position}: an Ok capture without its row, {outcomes:?}"
+                );
+            }
+            driven.drain(&mut pump);
+            pump.finish();
+        }
+    }
+
     /// U15/CP-T1.8: malformed membership and a source that cannot lead are refused at admission.
     #[test]
     fn malformed_initial_membership_is_refused() {
@@ -1808,57 +2279,6 @@ mod tests {
             assert!(matches!(validate(&config), Err(Refusal::Invalid { .. })));
         }
     }
-    fn seeded_nodes(dir: &Path, bootstrap: &api::replication::Bootstrap) -> Vec<Client> {
-        let mut clients = Vec::new();
-        for node_id in 1..=3 {
-            let path = dir.join(format!("state-{node_id}.db"));
-            let until = deadline();
-            let lease = loop {
-                match exclusive_file(&path) {
-                    Ok(lease) => break Arc::new(lease),
-                    Err(error) => {
-                        assert!(Instant::now() < until, "seed owner did not drain: {error}");
-                        std::thread::park_timeout(POLL);
-                    }
-                }
-            };
-            clients.push(
-                start(
-                    &path,
-                    &dir.join(format!("raft-{node_id}.log")),
-                    ReplicaConfig {
-                        node_id,
-                        voters: vec![1, 2, 3],
-                        learners: Vec::new(),
-                        bootstrap: Some(bootstrap.clone()),
-                    },
-                    Arc::new(Changed::default()),
-                    lease,
-                    until,
-                )
-                .unwrap(),
-            );
-        }
-        clients
-    }
-    fn known_leader(pump: &mut Pump<'_>) {
-        let until = deadline();
-        loop {
-            pump.drive();
-            if pump
-                .clients
-                .iter()
-                .all(|c| c.handle().status().unwrap().leader != 0)
-            {
-                return;
-            }
-            assert!(
-                Instant::now() < until,
-                "seed actors did not discover a leader"
-            );
-            std::thread::park_timeout(POLL);
-        }
-    }
     fn unchanged(db: &mut Db) -> anyhow::Result<Vec<u8>> {
         let mut value = Vec::new();
         db.query("SELECT value FROM baseline_items WHERE id = 1", [], |row| {
@@ -1871,7 +2291,10 @@ mod tests {
         })?;
         Ok(value)
     }
-    /// U15/CP-T1.8: a complete original image precedes every delta, including untouched pages.
+
+    /// U15/CP-T1.8 on driven time (replication.md, "The owner's time"): a complete original image
+    /// precedes every delta, including untouched pages, and the seed's transfer to its source is
+    /// the scenario's only election.
     #[test]
     fn autonomous_quorum_seed_preserves_unchanged_pages_then_delta_and_restart() {
         let dir = tempfile::tempdir().unwrap();
@@ -1883,25 +2306,58 @@ mod tests {
             unchanged(&mut db).unwrap()
         };
         let bootstrap = crate::replication::bootstrap::inspect_source(&source, 3).unwrap();
-        let clients = seeded_nodes(dir.path(), &bootstrap);
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], Some(bootstrap.clone())))
+            .collect();
         let mut pump = Pump::new(&clients);
-        known_leader(&mut pump);
-        // This can be admitted before the last seed chunk commits. The closure must wait in the
-        // product queue, while autonomous source transfer and seed application keep driving.
-        assert_eq!(pump.call(0, unchanged).unwrap(), original);
-        pump.call(1, |db| {
-            db.exec("UPDATE baseline_items SET value=x'03' WHERE id=2")?;
-            Ok(Vec::new())
-        })
-        .unwrap();
-        for origin in 0..3 {
-            assert_eq!(pump.call(origin, unchanged).unwrap(), original);
+        driven.elect(&mut pump, &clients, 0, 0);
+        // Admitted before the seed lands, the call waits in the product queue while the transfer
+        // to the source and the seed's application go on.
+        assert_eq!(
+            driven
+                .call(&mut pump, clients.first().unwrap(), unchanged)
+                .unwrap(),
+            original
+        );
+        let seeded = terms(&clients);
+        assert!(
+            clients
+                .iter()
+                .all(|c| c.handle().status().unwrap().leader == 3)
+        );
+        driven
+            .call(&mut pump, clients.get(1).unwrap(), |db| {
+                db.exec("UPDATE baseline_items SET value=x'03' WHERE id=2")?;
+                Ok(Vec::new())
+            })
+            .unwrap();
+        for client in &clients {
+            assert_eq!(driven.call(&mut pump, client, unchanged).unwrap(), original);
         }
+        assert_eq!(
+            terms(&clients),
+            seeded,
+            "an election happened after the seed's transfer"
+        );
+        // Past hyper-durable's quiet period, so each owner states its durable commit before it stops.
+        for owner in 0..3 {
+            driven.advance(owner, Duration::from_millis(60));
+        }
+        for _ in 0..8 {
+            driven.round(&mut pump);
+        }
+        driven.drain(&mut pump);
         pump.finish();
         drop(clients);
-        let reopened = seeded_nodes(dir.path(), &bootstrap);
+        drop(driven);
+
+        let mut driven = Driven::new();
+        let reopened: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], Some(bootstrap.clone())))
+            .collect();
         let mut pump = Pump::new(&reopened);
-        known_leader(&mut pump);
+        driven.elect(&mut pump, &reopened, 0, 0);
         for client in &reopened {
             let status = client.handle().status().unwrap();
             assert_eq!(status.voters, vec![1, 2, 3]);
@@ -1909,110 +2365,243 @@ mod tests {
             assert!(status.fenced.is_none());
             assert!(!status.bootstrapping);
         }
-        for origin in 0..3 {
+        let elected = terms(&reopened);
+        for client in &reopened {
             assert_eq!(
-                pump.call(origin, |db| {
-                    let mut value = Vec::new();
-                    db.query("SELECT value FROM baseline_items WHERE id=2", [], |row| {
-                        value = row.get_value(0).to_blob().unwrap().to_vec();
-                        Ok(false)
-                    })?;
-                    Ok(value)
-                })
-                .unwrap(),
+                driven
+                    .call(&mut pump, client, |db| {
+                        let mut value = Vec::new();
+                        db.query("SELECT value FROM baseline_items WHERE id=2", [], |row| {
+                            value = row.get_value(0).to_blob().unwrap().to_vec();
+                            Ok(false)
+                        })?;
+                        Ok(value)
+                    })
+                    .unwrap(),
                 vec![3]
             );
-            assert_eq!(pump.call(origin, unchanged).unwrap(), original);
+            assert_eq!(driven.call(&mut pump, client, unchanged).unwrap(), original);
         }
+        assert_eq!(
+            terms(&reopened),
+            elected,
+            "an election happened during the reopened scenario"
+        );
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
+    /// U15/CP-T1.8 under a nemesis (replication.md, "The owner's time"): the seeded group with
+    /// the lead moved while the delta's call is in flight, while a replica reads the seed's image,
+    /// and while the reopened group's reads are. The seed's own transfer to its source is its
+    /// first election. Whatever the election: the delta's answer is Ok or UnknownOutcome, every
+    /// replica reads one value for it (the new one if it answered Ok), and every replica keeps
+    /// the seed's original image.
+    #[test]
+    fn seed_and_delta_hold_through_an_election_at_each_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("state-3.db");
+        let original = {
+            let mut db = Db::open(&source).unwrap();
+            db.exec("CREATE TABLE baseline_items(id INTEGER PRIMARY KEY,value BLOB); INSERT INTO baseline_items VALUES(1,randomblob(9000)); INSERT INTO baseline_items VALUES(2,x'02')").unwrap();
+            db.flusher()().unwrap();
+            unchanged(&mut db).unwrap()
+        };
+        let bootstrap = crate::replication::bootstrap::inspect_source(&source, 3).unwrap();
+        let second = |db: &mut Db| -> anyhow::Result<Vec<u8>> {
+            let mut value = Vec::new();
+            db.query("SELECT value FROM baseline_items WHERE id=2", [], |row| {
+                value = row.get_value(0).to_blob().unwrap().to_vec();
+                Ok(false)
+            })?;
+            Ok(value)
+        };
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], Some(bootstrap.clone())))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        pump.refusals = Some(0);
+        driven.elect(&mut pump, &clients, 0, 0);
+        assert_eq!(
+            driven
+                .call(&mut pump, clients.first().unwrap(), unchanged)
+                .unwrap(),
+            original
+        );
+        // The delta goes in from n2 while the lead moves from the seed's source to n1.
+        let delta = submit(clients.get(1).unwrap(), driven.until(), |db| {
+            db.exec("UPDATE baseline_items SET value=x'03' WHERE id=2")?;
+            Ok(Vec::new())
+        });
+        driven.transfer(&mut pump, &clients, 2, 0);
+        let answered = driven.settle(&mut pump, &delta);
+        assert!(
+            matches!(answered, Ok(ref v) if v.is_empty())
+                || matches!(answered, Err(Refusal::UnknownOutcome)),
+            "{answered:?}"
+        );
+        let values: Vec<_> = clients
+            .iter()
+            .map(|client| driven.call(&mut pump, client, second).unwrap())
+            .collect();
+        assert!(
+            values.windows(2).all(|pair| pair.first() == pair.last()),
+            "{values:?}"
+        );
+        if answered.is_ok() {
+            assert_eq!(values.first().unwrap(), &vec![3]);
+        }
+        // The lead moves again while a replica reads the seed's original image.
+        let image = submit(clients.get(1).unwrap(), driven.until(), unchanged);
+        driven.transfer(&mut pump, &clients, 0, 1);
+        let read = driven.settle(&mut pump, &image);
+        assert!(
+            matches!(read, Ok(ref v) if v == &original)
+                || matches!(read, Err(Refusal::UnknownOutcome)),
+            "{read:?}"
+        );
+        for client in &clients {
+            assert_eq!(driven.call(&mut pump, client, unchanged).unwrap(), original);
+        }
+        for owner in 0..3 {
+            driven.advance(owner, Duration::from_millis(60));
+        }
+        for _ in 0..8 {
+            driven.round(&mut pump);
+        }
+        driven.drain(&mut pump);
+        pump.finish();
+        drop(clients);
+        drop(driven);
+
+        // Reopened, the group elects again and the lead moves while the replicas are read.
+        let mut driven = Driven::new();
+        let reopened: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], Some(bootstrap.clone())))
+            .collect();
+        let mut pump = Pump::new(&reopened);
+        pump.refusals = Some(0);
+        let leader = driven.elect(&mut pump, &reopened, 0, 0);
+        let read = submit(reopened.get(2).unwrap(), driven.until(), second);
+        driven.transfer(&mut pump, &reopened, leader, (leader + 1) % 3);
+        let after = driven.settle(&mut pump, &read);
+        assert!(
+            matches!(after, Ok(ref v) if v == values.first().unwrap())
+                || matches!(after, Err(Refusal::UnknownOutcome)),
+            "{after:?} after {values:?}"
+        );
+        for client in &reopened {
+            assert_eq!(
+                &driven.call(&mut pump, client, second).unwrap(),
+                values.first().unwrap()
+            );
+            assert_eq!(driven.call(&mut pump, client, unchanged).unwrap(), original);
+        }
+        driven.drain(&mut pump);
         pump.finish();
     }
 
     mod receive_receipts {
         use super::*;
 
-        fn finish(receipt: &mut ReceiveReceipt) -> Result<(), Refusal> {
-            let until = deadline();
-            loop {
+        /// Steps `driven` until `receipt` completes.
+        fn finish(driven: &mut Driven, receipt: &mut ReceiveReceipt) -> Result<(), Refusal> {
+            for _ in 0..ROUNDS {
                 match receipt.try_result() {
-                    Ok(None) => {}
+                    Ok(None) => driven.step(),
                     Ok(Some(())) => return Ok(()),
                     Err(error) => return Err(error),
                 }
-                assert!(Instant::now() < until, "receive receipt did not complete");
-                std::thread::park_timeout(POLL);
             }
+            panic!("a receive receipt was unanswered after {ROUNDS} rounds");
         }
 
-        /// CP-T1.8: admission must not wait behind a SQL capture or acknowledge validation.
+        /// CP-T1.8 on driven time: admission must not wait behind a SQL capture or acknowledge
+        /// validation. Do: from inside a call's work, while a single voter runs it, admit records
+        /// up to the queue's bound, one of them through the waiting `receive`. Expect: each
+        /// admission answered at once, the bound's refusal, the waiting `receive` still waiting;
+        /// then, once the owner runs again, each record's own refusal.
         #[test]
         fn admission_is_bounded_while_processed_receive_waits_and_errors_remain_observable() {
             let dir = tempfile::tempdir().unwrap();
-            let client = open(dir.path(), vec![1]);
-            leader(&client);
-            let (entered, entering) = mpsc::sync_channel(1);
-            let (release, released) = mpsc::sync_channel(1);
-            let caller = client.clone();
-            let capture = std::thread::spawn(move || {
-                call(&caller, move |_| {
-                    entered.send(())?;
-                    released.recv_timeout(Duration::from_secs(5))?;
-                    Ok(Vec::new())
-                })
+            let mut driven = Driven::new();
+            let clients = vec![driven.open(dir.path(), 1, vec![1], None)];
+            let mut pump = Pump::new(&clients);
+            driven.elect(&mut pump, &clients, 0, 1);
+            let handle = clients.first().unwrap().handle().clone();
+            let until = driven.until();
+            let (kept, taken) = mpsc::sync_channel(1);
+            let capture = submit(clients.first().unwrap(), until, move |_| {
+                // The owner is inside this capture: nothing admitted now can be processed yet.
+                let mut receipts = Vec::new();
+                for _ in 0..COMMANDS - 1 {
+                    receipts.push(handle.admit_receive(2, vec![0xff], until).unwrap());
+                }
+                assert!(
+                    receipts
+                        .iter_mut()
+                        .all(|r| matches!(r.try_result(), Ok(None)))
+                );
+                let legacy = handle.clone();
+                let (finished, finishing) = mpsc::sync_channel(1);
+                let processed = std::thread::spawn(move || {
+                    finished.send(legacy.receive(2, vec![0xff], until)).unwrap();
+                });
+                // Wait for the legacy record's actual queue reservation, not thread scheduling.
+                for _ in 0..ROUNDS {
+                    if handle.shared.admitted.load(Ordering::Acquire) == api::REQUEST_MAX + COMMANDS
+                    {
+                        break;
+                    }
+                    std::thread::park_timeout(POLL);
+                }
+                assert_eq!(
+                    handle.shared.admitted.load(Ordering::Acquire),
+                    api::REQUEST_MAX + COMMANDS
+                );
+                assert!(matches!(
+                    finishing.try_recv(),
+                    Err(mpsc::TryRecvError::Empty)
+                ));
+                assert!(matches!(
+                    handle.admit_receive(2, vec![0xff], until),
+                    Err(Refusal::Full { limit: COMMANDS })
+                ));
+                kept.send((receipts, finishing, processed)).unwrap();
+                Ok(Vec::new())
             });
-            entering.recv_timeout(Duration::from_secs(5)).unwrap();
-
-            let handle = client.handle();
-            let mut receipts = Vec::new();
-            for _ in 0..COMMANDS - 1 {
-                receipts.push(handle.admit_receive(2, vec![0xff], deadline()).unwrap());
-            }
-            assert!(
-                receipts
-                    .iter_mut()
-                    .all(|r| matches!(r.try_result(), Ok(None)))
-            );
-            let legacy = handle.clone();
-            let (finished, finishing) = mpsc::sync_channel(1);
-            let processed = std::thread::spawn(move || {
-                finished
-                    .send(legacy.receive(2, vec![0xff], deadline()))
-                    .unwrap();
-            });
-            let until = deadline();
-            // Wait for the legacy record's actual queue reservation, not thread scheduling.
-            while handle.shared.admitted.load(Ordering::Acquire) != api::REQUEST_MAX + COMMANDS {
-                assert!(Instant::now() < until, "processed receive was not admitted");
-                std::thread::park_timeout(POLL);
-            }
-            assert!(matches!(
-                finishing.try_recv(),
-                Err(mpsc::TryRecvError::Empty)
-            ));
-            assert!(matches!(
-                handle.admit_receive(2, vec![0xff], deadline()),
-                Err(Refusal::Full { limit: COMMANDS })
-            ));
-
-            release.send(()).unwrap();
-            assert!(capture.join().unwrap().is_ok());
+            assert_eq!(driven.settle(&mut pump, &capture), Ok(Vec::new()));
+            let (mut receipts, finishing, processed) = taken.try_recv().unwrap();
             for receipt in &mut receipts {
-                assert!(matches!(finish(receipt), Err(Refusal::Invalid { .. })));
+                assert!(matches!(
+                    finish(&mut driven, receipt),
+                    Err(Refusal::Invalid { .. })
+                ));
                 assert!(matches!(receipt.try_result(), Err(Refusal::Invalid { .. })));
             }
+            // The owner answered the legacy record with the others; its thread passes it on.
+            processed.join().unwrap();
             assert!(matches!(
-                finishing.recv_timeout(Duration::from_secs(5)).unwrap(),
+                finishing.try_recv().unwrap(),
                 Err(Refusal::Invalid { .. })
             ));
-            processed.join().unwrap();
+            driven.drain(&mut pump);
+            pump.finish();
         }
 
-        /// CP-T1.8: only processing a valid authenticated record completes a success receipt.
+        /// CP-T1.8 on driven time: only processing a valid authenticated record completes a
+        /// success receipt. Do: admit a member's heartbeat to a lone member of three, and poll its
+        /// receipt before and after stepping the member. Expect: pending before, done after, a
+        /// second poll of the completed receipt refused, and a record whose deadline has already
+        /// passed refused at admission.
         #[test]
         fn authenticated_heartbeat_completes_through_the_existing_actor_step() {
             fn send_sync<T: Send + Sync>() {}
             send_sync::<ReceiveReceipt>();
             let dir = tempfile::tempdir().unwrap();
-            let client = open(dir.path(), vec![1, 2, 3]);
+            let mut driven = Driven::new();
+            let client = driven.open(dir.path(), 1, vec![1, 2, 3], None);
             let mut bytes = Vec::new();
             Message {
                 msg_type: hyper_raft::proto::MessageType::MsgHeartbeat,
@@ -2022,8 +2611,12 @@ mod tests {
                 ..Message::default()
             }
             .encode(&mut bytes);
-            let mut receipt = client.handle().admit_receive(2, bytes, deadline()).unwrap();
-            assert!(finish(&mut receipt).is_ok());
+            let mut receipt = client
+                .handle()
+                .admit_receive(2, bytes, driven.until())
+                .unwrap();
+            assert!(matches!(receipt.try_result(), Ok(None)));
+            assert!(finish(&mut driven, &mut receipt).is_ok());
             assert!(matches!(receipt.try_result(), Err(Refusal::Invalid { .. })));
             assert!(matches!(
                 client.handle().admit_receive(2, Vec::new(), Instant::now()),
@@ -2052,10 +2645,11 @@ mod tests {
             assert!(matches!(receipt.try_result(), Err(Refusal::Timeout)));
             drop(sender);
 
+            // An owner gone before the deadline fences the receipt.
             let (sender, receiver) = mpsc::sync_channel(1);
             let mut receipt = ReceiveReceipt {
                 receiver: Mutex::new(receiver),
-                until: deadline(),
+                until: Instant::now() + Duration::from_secs(3600),
                 completed: false,
             };
             drop(sender);

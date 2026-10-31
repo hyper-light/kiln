@@ -62,7 +62,14 @@ fn transfer(stream: &mut Stream, bytes: &mut [u8], until: Instant) -> Result<(),
         let rest = bytes
             .get_mut(offset..)
             .ok_or_else(|| unavailable("frame offset"))?;
-        let n = stream.read(rest).map_err(transfer_error)?;
+        let n = match stream.read(rest) {
+            Ok(n) => n,
+            // A read with a timeout installed is never restarted after a signal's handler, nor
+            // after the process is stopped and continued: it ends EINTR having read nothing
+            // (signal(7)). It reads again, its wait still bounded by the deadline above.
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(transfer_error(error)),
+        };
         if n == 0 {
             return Err(unavailable("owner connection closed"));
         }
@@ -156,7 +163,13 @@ pub(super) fn send(stream: &mut Stream, encoded: &[u8], until: Instant) -> Resul
             stream
                 .set_write_timeout(Some(remaining(until)?))
                 .map_err(unavailable)?;
-            let n = stream.write(part).map_err(transfer_error)?;
+            let n = match stream.write(part) {
+                Ok(n) => n,
+                // As `transfer` reads again: a write with a timeout installed ends EINTR, having
+                // written nothing, after a signal's handler or a stop (signal(7)).
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(transfer_error(error)),
+            };
             if n == 0 {
                 return Err(unavailable("owner connection closed"));
             }
@@ -237,7 +250,7 @@ impl Owner {
                                 .name("amphora.client".into())
                                 .spawn(move || {
                                     let _permit = permit;
-                                    if let Err(error) = serve(stream, token, &*acquire, &waits) {
+                                    if let Err(error) = serve(stream, token, &*acquire, &waits, GREETING_MAX) {
                                         tracing::debug!(target: "amphora.transport", event = "connection_finished", %error);
                                     }
                                 });
@@ -303,7 +316,7 @@ impl Client {
         remaining(until)?;
         let auth_until = until.min(
             Instant::now()
-                .checked_add(Duration::from_secs(2))
+                .checked_add(GREETING_MAX)
                 .ok_or(Refusal::Timeout)?,
         );
         let (mut stream, token) = endpoint::connect(&self.path, auth_until)?;
@@ -625,11 +638,10 @@ fn serve(
     token: [u8; 32],
     acquire: &dyn Fn() -> Option<crate::database::Database>,
     waits: &Arc<AtomicUsize>,
+    greeting: Duration,
 ) -> Result<(), Refusal> {
     let started = Instant::now();
-    let greeting_until = started
-        .checked_add(Duration::from_secs(2))
-        .ok_or(Refusal::Timeout)?;
+    let greeting_until = started.checked_add(greeting).ok_or(Refusal::Timeout)?;
     let hello: Hello = read_limit(&mut stream, greeting_until, 256)?;
     if hello.version != 2 || hello.millis == 0 || Duration::from_millis(hello.millis) > SESSION_MAX
     {
@@ -1003,18 +1015,148 @@ impl Records for Namespace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::HANG;
     fn pair() -> (Stream, Stream) {
         let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let client = std::net::TcpStream::connect_timeout(
-            &listener.local_addr().unwrap(),
-            Duration::from_secs(2),
-        )
-        .unwrap();
+        let client =
+            std::net::TcpStream::connect_timeout(&listener.local_addr().unwrap(), HANG).unwrap();
         let (server, _) = listener.accept().unwrap();
         (client, server)
     }
     fn until() -> Instant {
-        Instant::now() + Duration::from_secs(5)
+        Instant::now() + HANG
+    }
+
+    /// Whether this is the child copy of the test binary that `test` runs alone, to be stopped
+    /// and continued without stopping the tests beside it; the parent runs it and checks it passed.
+    #[cfg(target_os = "linux")]
+    fn in_stopped_child(test: &str) -> bool {
+        if std::env::var_os("AMPHORA_TRANSPORT_STOPPED").is_some() {
+            return true;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env("AMPHORA_TRANSPORT_STOPPED", "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "{test} in a stopped child: {status}");
+        false
+    }
+
+    /// This thread's id within the process, from Linux's /proc/thread-self.
+    #[cfg(target_os = "linux")]
+    fn thread_id() -> u32 {
+        let link = std::fs::read_link("/proc/thread-self").unwrap();
+        link.file_name().unwrap().to_str().unwrap().parse().unwrap()
+    }
+
+    /// Waits until thread `id` of this process sleeps (state S): the threads here sleep only in
+    /// their socket call.
+    #[cfg(target_os = "linux")]
+    fn wait_asleep(id: u32) {
+        let deadline = until();
+        loop {
+            let stat = std::fs::read_to_string(format!("/proc/self/task/{id}/stat")).unwrap();
+            // The state follows the thread's name, which the stat's last ')' closes.
+            let state = stat
+                .rsplit_once(')')
+                .unwrap()
+                .1
+                .split_whitespace()
+                .next()
+                .unwrap();
+            if state == "S" {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "thread {id} never slept: {state}"
+            );
+            thread::park_timeout(Duration::from_millis(1));
+        }
+    }
+
+    /// Stops this process and continues it 200 ms later, from a shell outside it.
+    #[cfg(target_os = "linux")]
+    fn stop_and_continue() {
+        let pid = std::process::id().to_string();
+        let status = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "kill -STOP \"$0\"; sleep 0.2; kill -CONT \"$0\"",
+                &pid,
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    // Bug dc8ffe98: transport tests failed "Interrupted system call" in full runs. Do: wait in
+    // `transfer` for a frame's bytes while this process is stopped and continued; a read with a
+    // timeout ends EINTR after that (signal(7)). Expect: the bytes, not a refusal (CP-T1.5).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stop_and_continue_leaves_a_waiting_read_whole() {
+        if !in_stopped_child(
+            "transport::common::tests::a_stop_and_continue_leaves_a_waiting_read_whole",
+        ) {
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut stream = Stream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        let (send_id, id) = std::sync::mpsc::channel();
+        let reader = thread::spawn(move || {
+            send_id.send(thread_id()).unwrap();
+            let mut bytes = [0u8; 4];
+            transfer(&mut stream, &mut bytes, until()).map(|()| bytes)
+        });
+        wait_asleep(id.recv().unwrap());
+        stop_and_continue();
+        peer.write_all(b"ping").unwrap();
+        assert_eq!(reader.join().unwrap().unwrap(), *b"ping");
+    }
+
+    // Bug dc8ffe98. Do: `send` a frame larger than the sockets hold, so its write waits for
+    // room, while this process is stopped and continued. Expect: every byte arrives and `send`
+    // succeeds (CP-T1.5). Linux doesn't end a waiting write on a stop and continue, so this passed
+    // before `send` wrote again on EINTR too; a handled signal does end it (signal(7)), and
+    // aiming one at this thread alone would take unsafe code.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stop_and_continue_leaves_a_waiting_send_whole() {
+        if !in_stopped_child(
+            "transport::common::tests::a_stop_and_continue_leaves_a_waiting_send_whole",
+        ) {
+            return;
+        }
+        // Four times what the sockets of both ends may hold (the kernel's most for each), so the
+        // write waits for room until the peer reads.
+        let most = |path: &str| -> usize {
+            let limits = std::fs::read_to_string(path).unwrap();
+            limits.split_whitespace().last().unwrap().parse().unwrap()
+        };
+        let frame = 4 * (most("/proc/sys/net/ipv4/tcp_wmem") + most("/proc/sys/net/ipv4/tcp_rmem"));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut stream = Stream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        // A send cut short leaves the rest of the frame unread: the read refuses, never hangs.
+        peer.set_read_timeout(Some(HANG)).unwrap();
+        let (send_id, id) = std::sync::mpsc::channel();
+        let writer = thread::spawn(move || {
+            let bytes = vec![7u8; frame];
+            send_id.send(thread_id()).unwrap();
+            send(&mut stream, &bytes, until())
+        });
+        wait_asleep(id.recv().unwrap());
+        stop_and_continue();
+        let mut size = [0u8; 4];
+        peer.read_exact(&mut size).unwrap();
+        assert_eq!(u32::from_be_bytes(size), u32::try_from(frame).unwrap());
+        let mut bytes = vec![0u8; frame];
+        peer.read_exact(&mut bytes).unwrap();
+        assert!(bytes.iter().all(|byte| *byte == 7));
+        writer.join().unwrap().unwrap();
     }
 
     #[test]
@@ -1090,9 +1232,13 @@ mod tests {
         let path = directory.path().join("db");
         std::fs::File::create(&path).unwrap();
         let owner = endpoint::bind(&path).unwrap();
-        let address = owner.listener.local_addr().unwrap();
+        // The impostor listens first and the dead owner's record then names its port, so no port
+        // is freed for another socket to take before the impostor binds it.
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        owner
+            .name_port(listener.local_addr().unwrap().port())
+            .unwrap();
         drop(owner);
-        let listener = std::net::TcpListener::bind(address).unwrap();
         let fake = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let _hello: Hello = read_limit(&mut stream, until(), 256).unwrap();
@@ -1117,6 +1263,8 @@ mod tests {
     #[test]
     fn wrong_capability_never_acquires_database() {
         // U05/U06: authentication precedes writer/Records access.
+        // The longest session the protocol allows: it bounds the whole session, compaction included.
+        let millis = u64::try_from(SESSION_MAX.as_millis()).unwrap();
         let (mut client, server) = pair();
         let accessed = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&accessed);
@@ -1129,6 +1277,7 @@ mod tests {
                     None
                 },
                 &Arc::new(AtomicUsize::new(0)),
+                HANG,
             )
         });
         write(
@@ -1136,7 +1285,7 @@ mod tests {
             &Hello {
                 version: 2,
                 nonce: [2; 32],
-                millis: 1000,
+                millis,
             },
             until(),
         )
@@ -1145,7 +1294,7 @@ mod tests {
         let hello = Hello {
             version: 2,
             nonce: [2; 32],
-            millis: 1000,
+            millis,
         };
         let proof = auth::proof(&[9; 32], false, &hello, &challenge.nonce).unwrap();
         write(&mut client, &proof, until()).unwrap();
@@ -1169,12 +1318,13 @@ mod tests {
                         Some(db.clone())
                     },
                     &Arc::new(AtomicUsize::new(0)),
+                    HANG,
                 )
             });
             let hello = Hello {
                 version: 2,
                 nonce: [2; 32],
-                millis: 1000,
+                millis,
             };
             write(&mut client, &hello, until()).unwrap();
             let challenge: Challenge = read(&mut client, until()).unwrap();

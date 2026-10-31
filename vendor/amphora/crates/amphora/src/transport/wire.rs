@@ -11,6 +11,9 @@ pub(super) const WAIT_MAX: usize = 8;
 pub(super) const WATCH_BATCH_MAX: usize = 64;
 pub(super) const WATCH_REPLY_MAX: usize = 64 << 10;
 pub(super) const SESSION_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long each side gives the other to authenticate: admission policy, not a measured tuning
+/// claim (local-owner-transport.md, its resource limits).
+pub(super) const GREETING_MAX: std::time::Duration = std::time::Duration::from_secs(2);
 pub(super) const CAP_BOUNDED_COMPACTION: u64 = 1;
 
 #[derive(Serialize, Deserialize)]

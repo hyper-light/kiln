@@ -390,3 +390,89 @@ fn a_without_rowid_key_reads_every_column_where_its_columns_do_not_lead() {
         assert_eq!(bound_rows(&conn, &sought, &binds), want, "{sought}");
     }
 }
+
+/// Do: on WITHOUT ROWID keys that declare a collation (the column's own, and one named in the key
+/// alone), order by the key's columns in and out of that collation, range over them, and filter
+/// on a column outside the key under a LIMIT. Expect: the key read in its order only where the
+/// ORDER BY names the key's collation, a range sought only in the key's collation, a sort
+/// otherwise, and every answer as SQLite 3.54.0 gives it: rows ordered and compared by the
+/// collation each term names, the filter applied before the LIMIT (decision 15; AC-T1.13.4).
+#[test]
+fn a_without_rowid_keys_collation_decides_its_order_and_its_ranges() {
+    let conn = open();
+    conn.execute("CREATE TABLE n(k TEXT COLLATE NOCASE, v INTEGER, PRIMARY KEY(k)) WITHOUT ROWID")
+        .unwrap();
+    conn.execute("INSERT INTO n VALUES ('a',1),('B',2),('c',3),('D',4)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE p(k TEXT, r INTEGER, v TEXT, PRIMARY KEY(k COLLATE NOCASE, r)) WITHOUT ROWID",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO p VALUES ('a',1,'x'),('a',2,'y'),('B',1,'x'),('c',1,'y'),('c',2,'x')",
+    )
+    .unwrap();
+    let text = |sql: &str| -> Vec<String> {
+        rows(&conn, sql)
+            .into_iter()
+            .map(|row| {
+                row.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .collect()
+    };
+    let sorted = vec!["SCAN p", "USE SORTER FOR ORDER BY"];
+    for (sql, want_plan, want_rows) in [
+        (
+            "SELECT k FROM n ORDER BY k",
+            vec!["SCAN n"],
+            vec!["a", "B", "c", "D"],
+        ),
+        (
+            "SELECT k FROM n ORDER BY k COLLATE BINARY",
+            vec!["SCAN n", "USE SORTER FOR ORDER BY"],
+            vec!["B", "D", "a", "c"],
+        ),
+        (
+            "SELECT k FROM n ORDER BY k COLLATE NOCASE DESC",
+            vec!["SCAN n"],
+            vec!["D", "c", "B", "a"],
+        ),
+        (
+            "SELECT k FROM n WHERE k > 'b' ORDER BY k",
+            vec!["SEARCH n USING PRIMARY KEY (k>?)"],
+            vec!["c", "D"],
+        ),
+        (
+            "SELECT k FROM n WHERE k > 'b' COLLATE BINARY ORDER BY k",
+            vec!["SCAN n"],
+            vec!["c"],
+        ),
+        // The key's NOCASE is the key's alone: the column, and so its ORDER BY, is BINARY.
+        (
+            "SELECT k, r FROM p ORDER BY k, r",
+            sorted.clone(),
+            vec!["B|1", "a|1", "a|2", "c|1", "c|2"],
+        ),
+        (
+            "SELECT k, r FROM p WHERE (k, r) > ('a', 1) ORDER BY k, r LIMIT 3",
+            sorted.clone(),
+            vec!["a|2", "c|1", "c|2"],
+        ),
+        (
+            "SELECT k, r FROM p WHERE (k, r) > ('a', 1) AND v = 'x' ORDER BY k, r LIMIT 2",
+            sorted.clone(),
+            vec!["c|2"],
+        ),
+        (
+            "SELECT k, r FROM p WHERE k > 'a' AND v = 'x' ORDER BY k, r",
+            sorted,
+            vec!["c|2"],
+        ),
+    ] {
+        assert_eq!(plan(&conn, sql), want_plan, "{sql}");
+        assert_eq!(text(sql), want_rows, "{sql}");
+    }
+}

@@ -619,6 +619,43 @@ pub(super) fn estimate_skip_scan_cost(
     )
 }
 
+/// Amphora: what an index read in the query's order costs when it stops after `goal_rows`
+/// rows, the rows a literal LIMIT keeps over what the remaining terms keep of them
+/// (`docs/design/planner.md` decision 16): a seek, then at most `goal_rows` of its range.
+#[expect(clippy::too_many_arguments)]
+pub fn estimate_ordered_cost_to_goal(
+    index_info: IndexInfo,
+    constraints: &[Constraint],
+    usable_constraint_refs: &[RangeConstraintRef],
+    input_cardinality: f64,
+    base_row_count: RowCountEstimate,
+    goal_rows: f64,
+    params: &CostModelParams,
+    analyze_ctx: Option<&AnalyzeCtx>,
+) -> Cost {
+    let tree_depth = estimate_btree_depth(*base_row_count, params.rows_per_table_page);
+    let rows_per_seek = if is_unique_point_lookup(index_info, usable_constraint_refs) {
+        1.0
+    } else {
+        estimate_rows_per_seek(
+            index_info,
+            constraints,
+            usable_constraint_refs,
+            RowCountEstimate::AnalyzeStats(*base_row_count),
+            analyze_ctx,
+            params,
+        )
+    };
+    estimate_index_cost(
+        *base_row_count,
+        tree_depth,
+        index_info,
+        input_cardinality,
+        rows_per_seek.min(goal_rows.max(1.0)),
+        params,
+    )
+}
+
 /// Estimate the cost of a scan or seek operation.
 #[expect(clippy::too_many_arguments)]
 pub fn estimate_cost_for_scan_or_seek(

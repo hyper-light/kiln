@@ -37,8 +37,9 @@ use super::{
     },
     cost::{
         constraints_selectivity, estimate_btree_depth, estimate_cost_for_scan_or_seek,
-        estimate_ephemeral_index_build_cost, estimate_index_cost, estimate_rows_per_seek,
-        estimate_scan_cost, estimate_skip_scan_cost, AnalyzeCtx, Cost, IndexInfo,
+        estimate_ephemeral_index_build_cost, estimate_index_cost, estimate_ordered_cost_to_goal,
+        estimate_rows_per_seek, estimate_scan_cost, estimate_skip_scan_cost, AnalyzeCtx, Cost,
+        IndexInfo,
     },
     join::JoinPlanningContext,
     multi_index::{
@@ -257,6 +258,7 @@ pub(super) fn choose_best_btree_candidate(
     lhs_mask: &TableMask,
     rhs_table_idx: usize,
     maybe_order_target: Option<&OrderTarget>,
+    row_goal: Option<f64>,
     schema: &Schema,
     available_indexes: &AvailableIndexes,
     analyze_stats: &AnalyzeStats,
@@ -568,6 +570,30 @@ pub(super) fn choose_best_btree_candidate(
 
         // Adjusted output: lower means the loop delivers fewer rows downstream.
         let adjusted_output = residual_selectivity;
+
+        // Amphora: an index read in the query's order stops once it has the rows a literal LIMIT
+        // keeps, so it reads the goal's rows over what the remaining terms keep of them, not its
+        // whole range (decision 16; SQLite and PostgreSQL cost such a read to its row goal).
+        let cost = match (row_goal, is_index_ordered, skip_rows_per_value) {
+            (Some(goal), true, None) if residual_selectivity > 0.0 => {
+                let to_goal = estimate_ordered_cost_to_goal(
+                    index_info,
+                    &rhs_constraints.constraints,
+                    &usable_constraint_refs,
+                    input_cardinality,
+                    candidate_base_row_count,
+                    goal / residual_selectivity,
+                    params,
+                    Some(&analyze_ctx),
+                );
+                if to_goal < cost {
+                    to_goal
+                } else {
+                    cost
+                }
+            }
+            _ => cost,
+        };
 
         // Of an ordered and an unordered candidate, the unordered one pays for the sort,
         // whichever of the two came first; two of a kind compare as they are.
@@ -908,6 +934,7 @@ pub fn find_best_access_method_for_join_order(
             join_order,
             planning_context.maybe_order_target,
             planning_context.allow_automatic_index,
+            planning_context.row_goal,
             where_clause,
             ready_where,
             available_indexes,
@@ -966,6 +993,7 @@ fn find_best_access_method_for_btree(
     join_order: &[JoinOrderMember],
     maybe_order_target: Option<&OrderTarget>,
     allow_automatic_index: bool,
+    row_goal: Option<f64>,
     where_clause: &[WhereTerm],
     ready_where: &[(usize, usize)],
     available_indexes: &AvailableIndexes,
@@ -978,12 +1006,25 @@ fn find_best_access_method_for_btree(
     params: &CostModelParams,
 ) -> Result<Option<AccessMethod>> {
     let rhs_table_idx = join_order.last().unwrap().original_idx;
+    // Amphora: the goal holds only when every WHERE term left to evaluate is one of this table's
+    // constraints, whose selectivity is known. A term the planner can't estimate could make an
+    // ordered read reach its goal late or never, so it keeps the whole range's cost (decision 16).
+    let row_goal = row_goal.filter(|_| {
+        where_clause.iter().enumerate().all(|(pos, term)| {
+            term.consumed
+                || rhs_constraints
+                    .constraints
+                    .iter()
+                    .any(|constraint| constraint.where_clause_pos.0 == pos)
+        })
+    });
     let Some(best) = choose_best_btree_candidate(
         rhs_table,
         rhs_constraints,
         lhs_mask,
         rhs_table_idx,
         maybe_order_target,
+        row_goal,
         schema,
         available_indexes,
         analyze_stats,

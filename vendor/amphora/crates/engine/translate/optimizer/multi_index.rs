@@ -356,6 +356,7 @@ fn choose_multi_index_branch_access(
         lhs_mask,
         rhs_idx,
         None,
+        None,
         schema,
         available_indexes,
         analyze_stats,

@@ -1160,6 +1160,19 @@ fn find_select_plan_form(
     } else {
         None
     };
+    // Amphora: a read of one table, with no grouping, aggregate, window or DISTINCT between it
+    // and a literal LIMIT, may stop after the rows the LIMIT and OFFSET keep (decision 16, E5).
+    let row_goal = (plan.table_references.joined_tables().len() == 1
+        && plan.group_by.is_none()
+        && plan.aggregates.is_empty()
+        && plan.window.is_none()
+        && !plan.distinctness.is_distinct())
+    .then(|| plan.limit.as_deref().and_then(literal_limit_rows))
+    .flatten()
+    .and_then(|limit| match plan.offset.as_deref() {
+        None => Some(limit),
+        Some(offset) => literal_limit_rows(offset).map(|offset| limit + offset),
+    });
     let table_plan = find_table_access_plan(
         schema,
         resolver,
@@ -1176,6 +1189,7 @@ fn find_select_plan_form(
         plan.input_cardinality_hint.unwrap_or(1.0),
         cost_limit,
         hashed_aggregates,
+        row_goal,
     )?;
 
     if matches!(plan.simple_aggregate, Some(SimpleAggregate::MinMax(_)))
@@ -2695,6 +2709,7 @@ fn optimize_table_access(
         initial_input_cardinality,
         None,
         None,
+        None,
     )?
     else {
         return Ok(None);
@@ -2734,6 +2749,8 @@ fn find_table_access_plan(
     // Amphora: the aggregates of a GROUP BY that would group in a hash table were its rows not
     // read in its order (`docs/design/planner.md` decision 7), None for one that would sort.
     hashed_aggregates: Option<usize>,
+    // Amphora: the rows a one-table read may stop after (decision 16), None to read to the end.
+    row_goal: Option<f64>,
 ) -> Result<Option<TableAccessPlan>> {
     // When optimizer_params feature is enabled, use lazily-loaded params (cached process-wide).
     // Otherwise, use the compile-time static for zero overhead.
@@ -2944,6 +2961,7 @@ fn find_table_access_plan(
         maybe_order_target: maybe_order_target.as_ref(),
         cost_limit,
         allow_automatic_index: true,
+        row_goal,
     };
 
     let Some(best_join_order_result) = compute_best_join_order_with_context(
@@ -3157,6 +3175,7 @@ fn plan_unmatched_right_rows(
                 cost_limit: None,
                 // In SQLite, `WHERE_RIGHT_JOIN` mode disables automatic indexes.
                 allow_automatic_index: false,
+                row_goal: None,
             },
             &where_clause_for_unmatched_rows,
             // The result subroutine evaluates all WHERE terms after matching.

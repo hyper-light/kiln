@@ -16,8 +16,13 @@ use std::{
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
+/// The transport tests' hang guard, measured: twenty times the slowest whole run of any transport
+/// test, 5,856 ms over 200 runs of each at loads 19 to 39 (adacachy, 2026-10-31; the library's
+/// transport tests share it). No test's verdict rests on it (local-owner-transport.md, "The tests'
+/// budgets").
+const HANG: Duration = Duration::from_secs(120);
 fn until() -> Instant {
-    Instant::now() + Duration::from_secs(10)
+    Instant::now() + HANG
 }
 fn replica_config() -> api::replication::ReplicaConfig {
     api::replication::ReplicaConfig {
