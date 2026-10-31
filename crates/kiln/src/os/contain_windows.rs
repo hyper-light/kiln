@@ -227,6 +227,15 @@ impl Group {
     pub fn remove(&self) {
         jobs().lock().remove(&self.session);
     }
+
+    /// CI jobs get no group of their own here ([`job_group`]).
+    pub fn release(&self) {}
+}
+
+/// A CI job's group of processes: Linux's alone (`crate::os::contain` there), where a kiln a step
+/// starts would otherwise take the runner's own cgroup as its.
+pub fn job_group(_job: &str) -> Option<Group> {
+    None
 }
 
 /// Calls `f` on every thread of the processes `pids` (one snapshot of the system's threads), and

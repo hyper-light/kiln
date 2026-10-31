@@ -1177,8 +1177,8 @@ function Since({ since }: { since: number }) {
 }
 
 /** A compaction under way, where the turn's live line is: what it does, the context it compacts
- *  and for how long; the optic draws in, and the conversation's spectrum is condensed into the bar
- *  its marker keeps, in the same place, once it's done. */
+ *  and for how long; the optic draws in, and the particle ribbon turns about the line until it's
+ *  done, when the bar its marker keeps takes its place, in the same room. */
 function CompactingRow({ c }: { c: Compacting }) {
   return (
     <div className="hx-compaction" data-state="live" role="status">

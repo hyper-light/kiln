@@ -4,6 +4,8 @@ import "./signals.css";
 import { ChevronRight } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useNow } from "@/lib/hooks";
+import { useMotionPreference } from "@/components/shell/motion";
+import { COMPACTING, frame, HEIGHT, newFrame, paint } from "./stands-light";
 import { thinkingWords } from "./thinking";
 
 export type OpticState = "idle" | "thinking" | "tool" | "compacting" | "waiting" | "done" | "ended";
@@ -230,17 +232,83 @@ export function LoadingMark({ className }: { className?: string }) {
   );
 }
 
+/** The moment a still ribbon is drawn at (motion paused or reduced): turned partly toward you. */
+const STILL = 1.3;
+
 /**
- * A compaction's rule: the conversation's length as a hairline, the summary as the site's 30 px
- * prism bar. While it compacts (`live`) the whole spectrum is drawn in from the far end into the
- * bar, which the GPU does (only a transform and opacity move); after, the bar holds still as the
- * boundary it is, broken in the warning's tone where it didn't compact (`warn`).
+ * A compaction under way: Mission control's particle rule (stands-light.ts), working's light, on a
+ * wider ribbon turning without end (`COMPACTING`), wired to its canvas as the rule's is: drawn each
+ * frame (at most every 33 ms) while it's on screen and motion plays, still otherwise.
+ */
+function CondenseRibbon() {
+  const { paused } = useMotionPreference();
+  const attach = React.useCallback(
+    (canvas: HTMLCanvasElement | null) => {
+      const ctx = canvas?.getContext("2d");
+      if (!canvas || !ctx) return;
+      let raf = 0;
+      let last = -Infinity;
+      let visible = true;
+      let width = canvas.getBoundingClientRect().width;
+      const kept = newFrame();
+      const draw = (now: number) => {
+        if (width <= 0) return;
+        const dpr = Math.min(3, window.devicePixelRatio || 1);
+        const w = Math.round(width * dpr);
+        const h = Math.round(HEIGHT * dpr);
+        if (canvas.width !== w || canvas.height !== h) {
+          canvas.width = w;
+          canvas.height = h;
+        }
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, width, HEIGHT);
+        paint(ctx, frame([{ stand: "working", x0: 0, x1: width, r0: 0, r1: width }], width, paused ? STILL : now / 1000, kept, COMPACTING));
+      };
+      const tick = (now: number) => {
+        raf = 0;
+        if (!visible) return;
+        if (now - last >= 33) {
+          last = now;
+          draw(now);
+        }
+        if (!paused) raf = requestAnimationFrame(tick);
+      };
+      const start = () => {
+        if (!raf) raf = requestAnimationFrame(tick);
+      };
+      const sized = new ResizeObserver((entries) => {
+        width = entries[0]?.contentRect.width ?? width;
+        draw(performance.now());
+      });
+      const seen = new IntersectionObserver((entries) => {
+        visible = entries.some((e) => e.isIntersecting);
+        if (visible) start();
+      });
+      sized.observe(canvas);
+      seen.observe(canvas);
+      draw(performance.now());
+      start();
+      return () => {
+        cancelAnimationFrame(raf);
+        sized.disconnect();
+        seen.disconnect();
+      };
+    },
+    [paused],
+  );
+  return <canvas ref={attach} className="sg-condense-ribbon" />;
+}
+
+/**
+ * A compaction's rule. While it compacts (`live`), the particle ribbon turning about the line
+ * (`CondenseRibbon`); after, the conversation's length as a hairline and the summary as the site's
+ * 30 px prism bar, held still as the boundary it is, broken in the warning's tone where it didn't
+ * compact (`warn`).
  */
 export function Condense({ live = false, warn = false, className }: { live?: boolean; warn?: boolean; className?: string }) {
   return (
     <span className={cn("sg-condense", className)} data-live={live ? "true" : "false"} data-tone={warn ? "warn" : undefined} aria-hidden="true">
-      {live && <span className="sg-condense-light" />}
-      <span className="sg-condense-bar" />
+      {live ? <CondenseRibbon /> : <span className="sg-condense-bar" />}
     </span>
   );
 }
