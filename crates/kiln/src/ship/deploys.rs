@@ -2,11 +2,13 @@
 //! first; an opened app's pane (its components grouped by what owns them, a rollout's steps, its
 //! settings, its history of deploys and its source's commits); and the strip's verbs, each going to
 //! its CD operation as the caller, with that operation's rights and audit. Where each app stands is
-//! `kiln_cd::stands`'s to say: this reads KilnCD's state into it and shapes the JSON. Nothing is
-//! kept here but the source logs that say how far trunk is ahead, for half a minute.
+//! `kiln_cd::stands`'s to say: this reads KilnCD's state into it and shapes the JSON. The list is
+//! held in memory as Ship's commits are ([`Model`]), and gathered again once CD says something it
+//! reads changed.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::{Arc, LazyLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 
 use http::{Method, StatusCode};
@@ -188,6 +190,102 @@ async fn read_ahead(cd: &Arc<Cd>, facts: &mut [Facts]) {
         let (Some((_, repo, rev)), Some(runs)) = (f.own.clone(), f.running_commit()) else { continue };
         let Some(log) = logs.get(&(repo, rev)) else { continue };
         f.ahead = log.iter().position(|s| s.starts_with(&runs) || runs.starts_with(s.as_str())).and_then(|n| u32::try_from(n).ok());
+    }
+}
+
+/// Ship's Deploys in memory (W26-R24), as Ship's commits are: every app's facts as last gathered,
+/// kept until something they're read from changes, then gathered again by the next read. CD says
+/// so in its events (`cd_apps`, `cd_rollout` and `cd_app_deleted`, the ones the pages refetch on),
+/// and its store in its changes (a deployment recorded, an app held or let go, a setting set); so
+/// do Ship's own verbs. What neither says (how far trunk moved) is read again at most [`KEEP_FOR`]
+/// later. Where each app stands is worked out at each read, at its time: a soak ends with no event.
+#[derive(Debug, Default)]
+pub(crate) struct Model {
+    /// Changes heard: each of CD's events and store changes, and each of Ship's verbs done.
+    changes: AtomicU64,
+    held: Mutex<Option<Held>>,
+    listening: AtomicBool,
+}
+
+#[derive(Debug)]
+struct Held {
+    /// The changes heard when it was gathered.
+    changes: u64,
+    at: Instant,
+    facts: Arc<Vec<Facts>>,
+}
+
+/// The longest the model is kept with no change heard.
+const KEEP_FOR: Duration = Duration::from_secs(30);
+
+impl Model {
+    /// Something Ship's Deploys reads changed: the next read gathers again.
+    pub(crate) fn changed(&self) {
+        self.changes.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Hears `hub`'s events for as long as it runs, each of CD's a change; once.
+    fn listen(self: &Arc<Self>, hub: &Arc<Hub>) {
+        if self.listening.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let (me, hub) = (Arc::clone(self), Arc::clone(hub));
+        let mut rx = hub.events.subscribe();
+        crate::rt::spawn(async move {
+            use futures::FutureExt as _;
+            loop {
+                futures::select_biased! {
+                    () = hub.shutdown.cancelled().fuse() => return,
+                    m = rx.recv().fuse() => match m {
+                        Ok(text) => {
+                            if is_cds(&text) {
+                                me.changed();
+                            }
+                        }
+                        // Some went unheard: any of them may have been CD's.
+                        Err(async_broadcast::RecvError::Overflowed(_)) => me.changed(),
+                        Err(async_broadcast::RecvError::Closed) => return,
+                    },
+                }
+            }
+        });
+    }
+
+    /// Every app's facts: as held, unless a change was heard since or they're older than
+    /// [`KEEP_FOR`]; else gathered again from `cd`.
+    async fn facts(self: &Arc<Self>, hub: &Arc<Hub>, cd: &Arc<Cd>) -> Arc<Vec<Facts>> {
+        self.listen(hub);
+        // Read before gathering: a change heard meanwhile is gathered by the next read.
+        let heard = self.changes.load(Ordering::Acquire);
+        if let Some(h) = self.held.lock().as_ref().filter(|h| h.changes == heard && h.at.elapsed() < KEEP_FOR) {
+            return Arc::clone(&h.facts);
+        }
+        let mut facts = gather(cd, None);
+        read_ahead(cd, &mut facts).await;
+        let facts = Arc::new(facts);
+        *self.held.lock() = Some(Held { changes: heard, at: Instant::now(), facts: Arc::clone(&facts) });
+        facts
+    }
+}
+
+/// Whether an event, as the events socket sends it, is one of CD's that changes what Ship's
+/// Deploys shows. Its type comes first: the others are passed over on their first bytes.
+fn is_cds(text: &str) -> bool {
+    text.starts_with(r#"{"type":"cd_"#)
+        && serde_json::from_str::<Value>(text).ok().and_then(|v| v.get("type").and_then(Value::as_str).map(|t| matches!(t, "cd_apps" | "cd_rollout" | "cd_app_deleted"))).unwrap_or(false)
+}
+
+static MODEL: OnceLock<Arc<Model>> = OnceLock::new();
+
+/// The server's model of its KilnCD.
+fn model() -> Arc<Model> {
+    Arc::clone(MODEL.get_or_init(|| Arc::new(Model::default())))
+}
+
+/// CD's store changed (`cd::run` hears its changes): Ship's Deploys gathers again.
+pub(crate) fn heard() {
+    if let Some(m) = MODEL.get() {
+        m.changed();
     }
 }
 
@@ -387,14 +485,12 @@ fn now_ms() -> u64 {
 /// `GET /api/ship/deploys?q=`: every app, by project (W26-R24).
 pub async fn list(hub: &Arc<Hub>, q: &HashMap<String, String>, caller: &crate::authz::Caller) -> Result<Response, Fail> {
     may_read(hub, caller).await?;
-    Ok(srv::json(StatusCode::OK, &list_of(&cd()?, q.get("q").map(String::as_str), now_ms()).await))
+    Ok(srv::json(StatusCode::OK, &list_of(hub, &cd()?, &model(), q.get("q").map(String::as_str), now_ms()).await))
 }
 
-/// The list as `cd` holds it.
-async fn list_of(cd: &Arc<Cd>, q: Option<&str>, now_ms: u64) -> Value {
-    let mut facts = gather(cd, None);
-    read_ahead(cd, &mut facts).await;
-    list_json(&facts, q, now_ms)
+/// The list as `cd` holds it, from `model`.
+async fn list_of(hub: &Arc<Hub>, cd: &Arc<Cd>, model: &Arc<Model>, q: Option<&str>, now_ms: u64) -> Value {
+    list_json(&model.facts(hub, cd).await, q, now_ms)
 }
 
 /// `GET /api/ship/deploys/:project/:name`: an app's pane (W26-R24).
@@ -482,11 +578,11 @@ fn op_of(app: &str, verb: &str, body: &Value) -> Result<(&'static str, Value), F
 /// its environment lets agents deploy) and audited in this request's one row; it answers what the
 /// operation did, or why it couldn't.
 pub async fn act(hub: &Arc<Hub>, caller: &crate::authz::Caller, body: &Value) -> Result<Response, Fail> {
-    act_in(hub, caller, body, cd).await.map(|v| srv::json(StatusCode::OK, &v))
+    act_in(hub, caller, body, || Ok((cd()?, model()))).await.map(|v| srv::json(StatusCode::OK, &v))
 }
 
-/// [`act`] on the KilnCD `cd` gives, once the caller may.
-async fn act_in(hub: &Arc<Hub>, caller: &crate::authz::Caller, body: &Value, cd: impl FnOnce() -> Result<Arc<Cd>, Fail>) -> Result<Value, Fail> {
+/// [`act`] on the KilnCD (and its model) `on` gives, once the caller may.
+async fn act_in(hub: &Arc<Hub>, caller: &crate::authz::Caller, body: &Value, on: impl FnOnce() -> Result<(Arc<Cd>, Arc<Model>), Fail>) -> Result<Value, Fail> {
     let field = |k: &str| body.get(k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
     let (Some(app), Some(verb)) = (field("app"), field("verb")) else {
         return Err((StatusCode::BAD_REQUEST, "`app` and `verb`: the app, and what to do to it".to_string()));
@@ -496,8 +592,10 @@ async fn act_in(hub: &Arc<Hub>, caller: &crate::authz::Caller, body: &Value, cd:
     let method = if def.read_only { Method::GET } else { Method::POST };
     crate::authz::gate::check(hub, caller, &method, &["api", "cd", "ops", op], &HashMap::new()).await?;
     def.input.fits(&input).map_err(|m| (StatusCode::BAD_REQUEST, m.said(op)))?;
-    let cd = cd()?;
+    let (cd, model) = on()?;
     let done = crate::cd::ops::call(crate::cd::ops::Cx { hub: Arc::clone(hub), cd, actor: caller.name.clone() }, op, input).await?;
+    // What it did shows at once, whether or not CD says so in an event.
+    model.changed();
     Ok(json!({ "app": app, "verb": verb, "op": op, "done": done }))
 }
 
@@ -930,9 +1028,10 @@ mod tests {
             };
             submit(Command::Rollout { id: rid, record: Some(Box::new(rec)), expect: None }).await?;
             let now = left.now + 2 * stands::SOAK_MS;
+            let model = Arc::new(Model::default());
 
             // The list: by project, needs-you first, each row as defined.
-            let v = list_of(&cd, None, now).await;
+            let v = list_of(&hub, &cd, &model, None, now).await;
             let heads: Vec<(Value, Value)> = at(&v, "/projects").as_array().into_iter().flatten().map(|p| (at(p, "/project").clone(), at(p, "/say").clone())).collect();
             assert_eq!(heads, [(json!("hyper-light/kiln"), json!("2 apps · 1 out of sync")), (json!("hyper-light/quiver"), json!("2 apps · 1 waits on you"))]);
             let rows: Vec<(Value, Value, Value, Value)> = at(&v, "/projects")
@@ -979,8 +1078,8 @@ mod tests {
             let viewer = crate::authz::Caller::peer("vic", "viewer");
             let owner = crate::authz::Caller::owner();
             let act = |caller: &crate::authz::Caller, body: Value| {
-                let (hub, cd, caller) = (hub.clone(), cd.clone(), caller.clone());
-                async move { act_in(&hub, &caller, &body, || Ok(cd)).await }
+                let (hub, cd, model, caller) = (hub.clone(), cd.clone(), model.clone(), caller.clone());
+                async move { act_in(&hub, &caller, &body, || Ok((cd, model))).await }
             };
             for verb in ["sync", "refresh", "rollback", "stop", "follow", "promote", "abort", "approve", "deny", "auto_sync", "auto_rollback"] {
                 let refused = act(&viewer, json!({ "app": QC, "verb": verb, "on": true, "check": "release" })).await;
@@ -989,7 +1088,7 @@ mod tests {
             let done = act(&owner, json!({ "app": KP, "verb": "auto_sync", "on": true })).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
             assert_eq!((at(&done, "/op"), at(&done, "/done/on"), at(&done, "/done/from")), (&json!("cd.apps.set_auto_sync"), &json!(true), &json!("app")));
             // Now kiln syncs it by itself: it waits for that, no one else.
-            let v = list_of(&cd, Some("kiln-production"), now).await;
+            let v = list_of(&hub, &cd, &model, Some("kiln-production"), now).await;
             assert_eq!((at(&v, "/projects/0/apps/0/stand"), at(&v, "/projects/0/apps/0/auto_sync")), (&json!("waiting"), &json!(true)));
             let done = act(&owner, json!({ "app": KP, "verb": "refresh", "hard": true })).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
             assert_eq!(at(&done, "/done/refreshing"), &json!(KP));
@@ -1000,6 +1099,42 @@ mod tests {
             assert!(matches!(&refused, Err((StatusCode::NOT_FOUND, m)) if m.contains("has no rollout")), "{refused:?}");
             let refused = act(&owner, json!({ "app": KP, "verb": "rollback", "revision": k2 })).await;
             assert!(matches!(&refused, Err((StatusCode::SERVICE_UNAVAILABLE, m)) if m.contains("cluster dev is not connected")), "{refused:?}");
+
+            // Held until CD says something changed: its cd_apps event, then its cd_rollout event.
+            let row = |v: &Value, name: &str| {
+                at(v, "/projects").as_array().into_iter().flatten().flat_map(|p| at(p, "/apps").as_array().cloned().unwrap_or_default()).find(|r| at(r, "/name") == &json!(name)).map(|r| (at(&r, "/word").clone(), at(&r, "/line").clone()))
+            };
+            let heard = |model: &Arc<Model>, before: u64| {
+                let model = Arc::clone(model);
+                async move {
+                    for _ in 0..250 {
+                        if model.changes.load(Ordering::Acquire) > before {
+                            return true;
+                        }
+                        crate::rt::sleep(Duration::from_millis(20)).await;
+                    }
+                    false
+                }
+            };
+            let v = list_of(&hub, &cd, &model, None, now).await;
+            assert_eq!(row(&v, "kiln-staging"), Some((json!("Synced"), json!(format!("#1 runs {} · healthy", short(&k2))))));
+            let degraded = cd.statuses.write().get_mut(KS).map(|s| {
+                s.health = Health::Degraded;
+                s.clone()
+            });
+            assert_eq!(row(&list_of(&hub, &cd, &model, None, now).await, "kiln-staging").map(|r| r.0), Some(json!("Synced")), "held: CD said nothing yet");
+            let before = model.changes.load(Ordering::Acquire);
+            hub.emit(&crate::wire::events::ServerEvent::CdApps { apps: degraded.iter().map(crate::wire::events::CdStatus::of).collect() });
+            assert!(heard(&model, before).await, "the cd_apps event was never heard");
+            assert_eq!(row(&list_of(&hub, &cd, &model, None, now).await, "kiln-staging").map(|r| r.0), Some(json!("Degraded")));
+            submit(Command::Rollout { id: rollout_id("dev", "apps/Deployment/quiver-canary/web"), record: None, expect: None }).await?;
+            assert_eq!(row(&list_of(&hub, &cd, &model, None, now).await, "quiver-canary").map(|r| r.0), Some(json!("Needs you")), "held: CD said nothing yet");
+            let before = model.changes.load(Ordering::Acquire);
+            hub.emit(&crate::wire::events::ServerEvent::CdRollout { app: QC.into(), id: rollout_id("dev", "apps/Deployment/quiver-canary/web") });
+            assert!(heard(&model, before).await, "the cd_rollout event was never heard");
+            assert_eq!(row(&list_of(&hub, &cd, &model, None, now).await, "quiver-canary"), Some((json!("Synced"), json!(format!("#2 runs {} · healthy", short(&q2))))));
+            // Another of the server's events isn't CD's: nothing to gather again for it.
+            assert!(!is_cds(&crate::wire::events::ServerEvent::Terminals.text()) && is_cds(&crate::wire::events::ServerEvent::CdAppDeleted { app: KP.into() }.text()));
             Ok(())
         })
     }

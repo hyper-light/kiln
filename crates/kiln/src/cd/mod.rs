@@ -1701,6 +1701,8 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
         let c2 = cd.clone();
         crate::rt::spawn(async move {
             while let Ok(change) = crx.recv().await {
+                // Ship's Deploys reads what the store keeps (history, holds, settings).
+                crate::ship::deploys::heard();
                 match change {
                     kiln_cd::state::Change::App(id) => {
                         if let Some(def) = c2.store.read(|d| d.apps.get(&id).cloned()) {

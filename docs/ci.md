@@ -8631,7 +8631,9 @@ a time. The design was agreed on a live mock built on Ship's own prototype
   what runs (`GET /api/ship/deploys`). Where it stands is `kiln_cd::stands`'s to say, the first that
   holds: Argo CD's; can't read, render or compare; syncing; its rollout waits for a person, or rolls
   out; rolled back; its latest deploy failed; degraded or missing; out of sync (a person's to sync,
-  unless auto-sync syncs it); progressing or suspended; comparing; soaking; synced.
+  unless auto-sync syncs it); progressing or suspended; comparing; soaking; synced. The list is held
+  in memory as Ship's commits are, and gathered again once CD says something it reads changed (its
+  `cd_apps`, `cd_rollout` and `cd_app_deleted` events, its store's changes) or Ship acted.
   - An opened app (`GET /api/ship/deploys/:app`) has the jobs pane's anatomy: its components, each
     workload a group (its pods with their uptime and restarts, its ReplicaSets) and then the rest by
     what they are (network, config, storage, jobs, access), live from its cluster or else what
@@ -8732,7 +8734,7 @@ repository):
   of its own holding what the simulated cluster's engine left, its store's history, pin and rollout
   and its mirrors, Ship's list, panes and verbs read and do as defined for two projects: an app out
   of sync and trunk ahead of it, one synced, one whose rollout waits for an approval, one rolled
-  back. *`tests/ship_deploys.rs`
+  back; the list held until CD's `cd_apps` and `cd_rollout` events say what changed. *`tests/ship_deploys.rs`
   `w26_r24_ship_lists_cds_apps_by_project_and_each_verb_reaches_its_operation_as_the_caller`;
   `ship::deploys`
   `w26_r24_over_a_scratch_hub_with_the_simulated_cluster_ship_reads_what_cd_holds_and_acts_through_its_ops`
