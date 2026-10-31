@@ -1318,8 +1318,10 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
     json(res, 409, { error: "the mock starts no agents: use the demo ones" });
     return true;
   }
-  if (p === "/api/harness/agents/wait" && m === "GET") {
-    const ids = (url.searchParams.get("agents") ?? url.searchParams.get("agent") ?? "").split(",").filter(Boolean);
+  if (p === "/api/harness/agents/wait" && m === "POST") {
+    const q = await body<{ agents?: string[] | string; agent?: string }>(req);
+    const listed = Array.isArray(q.agents) ? q.agents : (q.agents ?? "").split(",");
+    const ids = [...listed, q.agent ?? ""].map((s) => s.trim()).filter(Boolean);
     json(res, 200, {
       done: true,
       timed_out: false,
