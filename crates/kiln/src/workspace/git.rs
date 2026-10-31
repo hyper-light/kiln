@@ -61,7 +61,7 @@ pub struct Made {
     pub files: Vec<String>,
 }
 
-fn git(dir: &Path) -> Command {
+pub(super) fn git(dir: &Path) -> Command {
     let mut c = Command::new("git");
     c.arg("-C").arg(dir);
     // Never a prompt: a question nobody sees would hang the call until its timeout.
@@ -70,7 +70,7 @@ fn git(dir: &Path) -> Command {
 }
 
 /// Runs `c`, its stdout trimmed; an error carries what git said.
-async fn run(c: Command, timeout: Duration) -> anyhow::Result<String> {
+pub(super) async fn run(c: Command, timeout: Duration) -> anyhow::Result<String> {
     let what = format!("{:?}", c.get_args().skip(2).collect::<Vec<_>>());
     let out = crate::proc::output(c, timeout).await?;
     if !out.status.success() {
