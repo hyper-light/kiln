@@ -54,9 +54,9 @@ pub struct Certified {
     pub chain: Vec<String>,
 }
 
-/// An entry in the log: its id, its number, when the log took it (unix seconds), its body as the
-/// log keeps it (base64 of its canonical JSON), and the log's whole answer for it (its promise and
-/// proof of inclusion).
+/// An entry in the log: its id, its number, when the log took it (unix seconds; 0 from a log that
+/// doesn't say), its body as the log keeps it (base64 of what its leaf hashes), the log's whole
+/// answer for it, and from that answer its proof of inclusion and the log's promise.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Logged {
     pub uuid: String,
@@ -64,6 +64,21 @@ pub struct Logged {
     pub integrated_time: i64,
     pub body: String,
     pub answer: Value,
+    pub proof: Option<Proof>,
+    /// The log's promise to include it (its signed entry timestamp), where it gives one: Rekor v1
+    /// does, v2 doesn't.
+    pub promise: Option<String>,
+}
+
+/// A log's proof that an entry is in its tree: the entry's index, the tree's size and root, the
+/// hashes along the entry's path (RFC 6962), and a checkpoint of that tree the log signed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Proof {
+    pub index: u64,
+    pub size: u64,
+    pub root: Vec<u8>,
+    pub hashes: Vec<Vec<u8>>,
+    pub checkpoint: String,
 }
 
 /// Why a request was refused.
@@ -385,21 +400,65 @@ impl SimSigstore {
         let at = usize::try_from(index).map_err(|_| Refusal::NotFound { index })?;
         let e = st.entries.get(at).ok_or(Refusal::NotFound { index })?;
         let size = st.leaves.len();
-        let hashes: Vec<String> = path(at, &st.leaves).iter().map(hex::encode).collect();
+        let hashes = path(at, &st.leaves);
         let root = tree_hash(&st.leaves);
-        let note = format!("{}\n{size}\n{}\n", k.origin, B64.encode(root));
-        let mut hinted = key_hint(LOG_NAME, k.log.public_key().as_ref());
-        hinted.extend_from_slice(k.log.sign(note.as_bytes()).as_ref());
-        let checkpoint = format!("{note}\n\u{2014} {LOG_NAME} {}\n", B64.encode(hinted));
+        let checkpoint = Self::checkpoint_of(k, size, &root);
         let answer = json!({
             "body": e.body, "integratedTime": e.integrated_time, "logID": hex::encode(k.log_id), "logIndex": index,
             "verification": {
-                "inclusionProof": { "checkpoint": checkpoint, "hashes": hashes, "logIndex": index, "rootHash": hex::encode(root), "treeSize": size },
+                "inclusionProof": { "checkpoint": checkpoint, "hashes": hashes.iter().map(hex::encode).collect::<Vec<_>>(), "logIndex": index, "rootHash": hex::encode(root), "treeSize": size },
                 "signedEntryTimestamp": e.promise,
             },
         });
-        Ok(Logged { uuid: e.uuid.clone(), index, integrated_time: e.integrated_time, body: e.body.clone(), answer })
+        let proof = Proof { index, size: size as u64, root: root.to_vec(), hashes: hashes.iter().map(|h| h.to_vec()).collect(), checkpoint };
+        Ok(Logged { uuid: e.uuid.clone(), index, integrated_time: e.integrated_time, body: e.body.clone(), answer, proof: Some(proof), promise: Some(e.promise.clone()) })
     }
+
+    /// The log's checkpoint of its tree at `size` with root `root`: a signed note.
+    fn checkpoint_of(k: &Keys, size: usize, root: &[u8; 32]) -> String {
+        let note = format!("{}\n{size}\n{}\n", k.origin, B64.encode(root));
+        let mut hinted = key_hint(LOG_NAME, k.log.public_key().as_ref());
+        hinted.extend_from_slice(k.log.sign(note.as_bytes()).as_ref());
+        format!("{note}\n\u{2014} {LOG_NAME} {}\n", B64.encode(hinted))
+    }
+
+    /// Its tree as a tiled front of it serves it (Rekor v2's): each leaf, each entry's body as its
+    /// leaf hashes it, and the log's checkpoint of the tree now.
+    pub fn tiled(&self) -> Result<(Vec<[u8; 32]>, Vec<Vec<u8>>, String), Refusal> {
+        let k = self.keys()?;
+        let st = self.st.lock();
+        let bodies = st.entries.iter().map(|e| B64.decode(&e.body).unwrap_or_default()).collect();
+        Ok((st.leaves.clone(), bodies, Self::checkpoint_of(k, st.leaves.len(), &tree_hash(&st.leaves))))
+    }
+
+    /// The log's ID: the SHA-256 of its public key.
+    pub fn log_id(&self) -> Result<Vec<u8>, Refusal> {
+        Ok(self.keys()?.log_id.to_vec())
+    }
+}
+
+/// Whether `hashes` lead from `leaf` at `index` of a tree of `size` to `root` (RFC 9162, 2.1.3.2).
+fn proves(index: u64, size: u64, leaf: &[u8; 32], hashes: &[Vec<u8>], root: &[u8]) -> bool {
+    let Some(last) = size.checked_sub(1).filter(|_| index < size) else { return false };
+    let (mut f, mut s) = (index, last);
+    let mut r = *leaf;
+    for p in hashes {
+        if s == 0 {
+            return false;
+        }
+        if f & 1 == 1 || f == s {
+            r = node(p, &r);
+            while f & 1 == 0 && f != 0 {
+                f >>= 1;
+                s >>= 1;
+            }
+        } else {
+            r = node(&r, p);
+        }
+        f >>= 1;
+        s >>= 1;
+    }
+    s == 0 && r.as_slice() == root
 }
 
 impl Sigstore for SimSigstore {
@@ -576,6 +635,14 @@ impl Asker {
 /// What a case needs: a fresh Fulcio and Rekor, and who asks of them.
 pub trait SigstoreFixture: Send + Sync {
     fn sigstore(&self) -> &dyn Sigstore;
+    /// The kinds of entry its Rekor takes: dsse and hashedrekord, or hashedrekord alone (Rekor v2).
+    fn kinds(&self) -> &'static [&'static str] {
+        &["dsse", "hashedrekord"]
+    }
+    /// Whether its Rekor promises each entry (a signed entry timestamp): v1 does, v2 doesn't.
+    fn promises(&self) -> bool {
+        true
+    }
     /// Who asks: a token the implementation takes, and a key of its own.
     fn asker(&self) -> Result<&Asker, Failure>;
 }
@@ -611,6 +678,16 @@ fn entry_of(a: &Asker, leaf: &str, n: u64) -> Value {
     let payload = json!({ "_type": "https://in-toto.io/Statement/v1", "predicate": { "n": n }, "predicateType": "https://kiln-seams.test/conformance", "subject": [] }).to_string();
     let envelope = json!({ "payload": B64.encode(&payload), "payloadType": IN_TOTO, "signatures": [{ "keyid": "", "sig": B64.encode(a.sign(&pae(IN_TOTO, payload.as_bytes()))) }] });
     json!({ "apiVersion": "0.0.1", "kind": "dsse", "spec": { "proposedContent": { "envelope": envelope.to_string(), "verifiers": [B64.encode(leaf)] } } })
+}
+
+/// An entry of `n`'s own for `f`'s log, signed by `a`, its verifier `leaf`: a dsse entry of a
+/// statement where the log takes them, else a hashedrekord of a message.
+fn an_entry<F: SigstoreFixture>(f: &F, a: &Asker, leaf: &str, n: u64) -> Value {
+    if f.kinds().contains(&"dsse") {
+        return entry_of(a, leaf, n);
+    }
+    let message = format!("kiln-seams conformance {n}");
+    hashed_of(a, leaf, message.as_bytes(), message.as_bytes())
 }
 
 fn c1<F: SigstoreFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
@@ -653,7 +730,7 @@ fn c2<F: SigstoreFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
 fn c3<F: SigstoreFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
         let leaf = verifier(f).await?;
-        let logged = fine("log", f.sigstore().log(entry_of(f.asker()?, &leaf, 3)).await)?;
+        let logged = fine("log", f.sigstore().log(an_entry(f, f.asker()?, &leaf, 3)).await)?;
         let again = fine("entry", f.sigstore().entry(logged.index).await)?;
         same("uuid", &again.uuid, &logged.uuid)?;
         same("body", &again.body, &logged.body)?;
@@ -666,7 +743,7 @@ fn c4<F: SigstoreFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
         let leaf = verifier(f).await?;
         let mut last: Option<(u64, i64)> = None;
         for n in 40..45 {
-            let l = fine("log", f.sigstore().log(entry_of(f.asker()?, &leaf, n)).await)?;
+            let l = fine("log", f.sigstore().log(an_entry(f, f.asker()?, &leaf, n)).await)?;
             if let Some((i, t)) = last {
                 ensure(l.index > i, || format!("index {} after {i}", l.index))?;
                 ensure(l.integrated_time >= t, || format!("time {} after {t}", l.integrated_time))?;
@@ -680,7 +757,7 @@ fn c4<F: SigstoreFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
 fn c5<F: SigstoreFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
         let leaf = verifier(f).await?;
-        let entry = entry_of(f.asker()?, &leaf, 5);
+        let entry = an_entry(f, f.asker()?, &leaf, 5);
         let first = fine("log", f.sigstore().log(entry.clone()).await)?;
         match refused("the same entry again", f.sigstore().log(entry).await)? {
             Refusal::Conflict { index } => same("the index named", index, first.index),
@@ -701,20 +778,21 @@ fn c6<F: SigstoreFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
 fn c7<F: SigstoreFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
         let leaf = verifier(f).await?;
-        let logged = fine("log", f.sigstore().log(entry_of(f.asker()?, &leaf, 70)).await)?;
-        fine("log", f.sigstore().log(entry_of(f.asker()?, &leaf, 71)).await)?;
+        let logged = fine("log", f.sigstore().log(an_entry(f, f.asker()?, &leaf, 70)).await)?;
+        fine("log", f.sigstore().log(an_entry(f, f.asker()?, &leaf, 71)).await)?;
         let again = fine("entry", f.sigstore().entry(logged.index).await)?;
         for (what, l) in [("as logged", &logged), ("as found again", &again)] {
-            let v = &l.answer;
-            ensure(v.pointer("/verification/signedEntryTimestamp").and_then(Value::as_str).is_some_and(|s| !s.is_empty()), || format!("{what}: no signed entry timestamp"))?;
-            let p = v.pointer("/verification/inclusionProof").ok_or_else(|| format!("{what}: no inclusion proof"))?;
-            same(&format!("{what}: the proof's index"), p.get("logIndex").and_then(Value::as_u64), Some(l.index))?;
-            let size = p.get("treeSize").and_then(Value::as_u64).unwrap_or(0);
-            ensure(size > l.index, || format!("{what}: a tree of {size} holding entry {}", l.index))?;
-            let root = p.get("rootHash").and_then(Value::as_str).and_then(|h| hex::decode(h).ok()).ok_or_else(|| format!("{what}: no root hash"))?;
-            let checkpoint: Vec<String> = p.get("checkpoint").and_then(Value::as_str).unwrap_or_default().lines().map(str::to_owned).collect();
-            same(&format!("{what}: the checkpoint's tree size"), checkpoint.get(1).cloned(), Some(size.to_string()))?;
-            same(&format!("{what}: the checkpoint's root"), checkpoint.get(2).cloned(), Some(B64.encode(&root)))?;
+            if f.promises() {
+                ensure(l.promise.as_deref().is_some_and(|s| !s.is_empty()), || format!("{what}: no signed entry timestamp"))?;
+            }
+            let p = l.proof.as_ref().ok_or_else(|| format!("{what}: no inclusion proof"))?;
+            same(&format!("{what}: the proof's index"), p.index, l.index)?;
+            ensure(p.size > l.index, || format!("{what}: a tree of {} holding entry {}", p.size, l.index))?;
+            let body = B64.decode(&l.body).map_err(|e| format!("{what}: its body isn't base64: {e}"))?;
+            ensure(proves(l.index, p.size, &leaf_hash(&body), &p.hashes, &p.root), || format!("{what}: its proof doesn't lead from its leaf to its root"))?;
+            let checkpoint: Vec<String> = p.checkpoint.lines().map(str::to_owned).collect();
+            same(&format!("{what}: the checkpoint's tree size"), checkpoint.get(1).cloned(), Some(p.size.to_string()))?;
+            same(&format!("{what}: the checkpoint's root"), checkpoint.get(2).cloned(), Some(B64.encode(&p.root)))?;
         }
         Ok(())
     })
@@ -724,8 +802,12 @@ fn c8<F: SigstoreFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
         let leaf = verifier(f).await?;
         let a = f.asker()?;
-        let envelope = json!({ "payload": B64.encode("{}"), "payloadType": IN_TOTO, "signatures": [{ "keyid": "", "sig": B64.encode(a.sign(b"another envelope")) }] });
-        let entry = json!({ "apiVersion": "0.0.1", "kind": "dsse", "spec": { "proposedContent": { "envelope": envelope.to_string(), "verifiers": [B64.encode(&leaf)] } } });
+        let entry = if f.kinds().contains(&"dsse") {
+            let envelope = json!({ "payload": B64.encode("{}"), "payloadType": IN_TOTO, "signatures": [{ "keyid": "", "sig": B64.encode(a.sign(b"another envelope")) }] });
+            json!({ "apiVersion": "0.0.1", "kind": "dsse", "spec": { "proposedContent": { "envelope": envelope.to_string(), "verifiers": [B64.encode(&leaf)] } } })
+        } else {
+            hashed_of(a, &leaf, b"an entry", b"another entry")
+        };
         match refused("an entry its verifier didn't sign", f.sigstore().log(entry).await)? {
             Refusal::Invalid { what, .. } => same("what's named", what, "entry"),
             other => Err(format!("refused {other:?}, want Invalid")),
@@ -769,7 +851,7 @@ pub fn cases<F: SigstoreFixture>() -> Vec<Case<F>> {
         Case { id: "SIGSTORE-6", says: "an index never logged is refused NotFound", check: c6::<F> },
         Case {
             id: "SIGSTORE-7",
-            says: "an entry comes with the log's promise and the proof of its inclusion: its index in a tree of more entries than that, the tree's root, and a checkpoint of that tree",
+            says: "an entry comes with the proof of its inclusion: its index in a tree of more entries than that, the hashes leading from it to the tree's root, and a checkpoint of that tree; and with the log's promise, where the log promises",
             check: c7::<F>,
         },
         Case { id: "SIGSTORE-8", says: "an entry whose signature isn't its verifier's is refused Invalid, naming the entry", check: c8::<F> },

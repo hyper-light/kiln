@@ -267,11 +267,24 @@ pub async fn checkpoints_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
 }
 
 /// The Rekor `[ci.attest] rekor_url` names, the trail's checkpoints anchored there: its URL and a
-/// client of it.
-fn rekor(hub: &Hub) -> anyhow::Result<Option<(String, crate::ci::signing::Remote)>> {
+/// client of it, of the API `rekor_api` says it speaks.
+fn rekor(hub: &Hub) -> anyhow::Result<Option<(String, Box<dyn kiln_seams::Sigstore>)>> {
     let Some(url) = hub.cfg.ci.attest.rekor_url.as_deref().map(|u| u.trim().trim_end_matches('/')).filter(|u| !u.is_empty()) else { return Ok(None) };
     let fulcio = hub.cfg.ci.attest.fulcio_url.as_deref().unwrap_or_default();
-    Ok(Some((url.to_owned(), crate::ci::signing::Remote::new(fulcio, url)?)))
+    let client: Box<dyn kiln_seams::Sigstore> = match hub.cfg.ci.attest.rekor_api {
+        crate::config::ci::RekorApi::V1 => Box::new(crate::ci::signing::Remote::new(fulcio, url)?),
+        crate::config::ci::RekorApi::V2 => Box::new(crate::ci::signing::RemoteV2::new(fulcio, url)?),
+    };
+    Ok(Some((url.to_owned(), client)))
+}
+
+/// The SHA-256 (hex) a Rekor entry's hashedrekord body names: v1's `data.hash.value`, or v2's
+/// `hashedRekordV002.data.digest` (base64).
+fn logged_hash(body: &Value) -> Option<String> {
+    if let Some(v) = body.pointer("/spec/data/hash/value").and_then(Value::as_str) {
+        return Some(v.to_ascii_lowercase());
+    }
+    body.pointer("/spec/hashedRekordV002/data/digest").and_then(Value::as_str).and_then(|d| B64.decode(d).ok()).map(hex::encode)
 }
 
 /// Anchors each checkpoint the configured Rekor hasn't yet (by its note: one signed anew at a size
@@ -279,7 +292,6 @@ fn rekor(hub: &Hub) -> anyhow::Result<Option<(String, crate::ci::signing::Remote
 /// text (its SHA-256, and the note's signature with the certificate it's signed under), Rekor's
 /// answer kept apart from the checkpoints. The sizes anchored now.
 pub async fn anchor(hub: &Hub) -> anyhow::Result<Vec<u64>> {
-    use kiln_seams::Sigstore as _;
     let Some((log, remote)) = rekor(hub)? else { return Ok(Vec::new()) };
     let l = log.clone();
     let pending: Vec<(i64, String, String)> = hub
@@ -342,18 +354,17 @@ pub async fn anchors(hub: &Hub) -> anyhow::Result<Value> {
 
 /// Whether anchor `idx` (checkpoint `note`, signed under `certificate`, anchored at `at`) holds.
 #[allow(clippy::too_many_arguments)]
-async fn held(hub: &Hub, remote: Option<&(String, crate::ci::signing::Remote)>, trust: &anyhow::Result<crate::ci::sigstore::TrustedRoot>, revocations: &[kiln_ci::identity::chain::Revocation], idx: i64, note: &str, certificate: &str, at: i64) -> anyhow::Result<()> {
-    use kiln_seams::Sigstore as _;
+async fn held(hub: &Hub, remote: Option<&(String, Box<dyn kiln_seams::Sigstore>)>, trust: &anyhow::Result<crate::ci::sigstore::TrustedRoot>, revocations: &[kiln_ci::identity::chain::Revocation], idx: i64, note: &str, certificate: &str, at: i64) -> anyhow::Result<()> {
     let cert = B64.decode(certificate)?;
     let (cp, _) = trail::verify_note(note, &hub.pki.organization(), &[&cert], &hub.pki.ca_der, revocations, at)?;
     let (text, _) = trail::open(note)?;
     let (log, client) = remote.ok_or_else(|| anyhow::anyhow!("kiln isn't configured with the Rekor that anchored checkpoint {}", cp.size))?;
     let logged = client.entry(u64::try_from(idx)?).await.map_err(|e| anyhow::anyhow!("entry {idx} of {log}: {e}"))?;
     let body: Value = match trust {
-        Ok(root) => crate::ci::sigstore::logged(&logged.answer, root)?,
+        Ok(root) => crate::ci::sigstore::proven(&logged, root)?,
         Err(_) => serde_json::from_slice(&B64.decode(&logged.body)?)?,
     };
-    anyhow::ensure!(body.pointer("/spec/data/hash/value").and_then(Value::as_str) == Some(crate::util::sha256_hex(text.as_bytes()).as_str()), "entry {idx} of {log} names another hash than checkpoint {}'s", cp.size);
+    anyhow::ensure!(logged_hash(&body) == Some(crate::util::sha256_hex(text.as_bytes())), "entry {idx} of {log} names another hash than checkpoint {}'s", cp.size);
     let size = cp.size;
     let kept = hub
         .store

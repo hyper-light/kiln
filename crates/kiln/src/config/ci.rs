@@ -378,11 +378,23 @@ pub struct Attest {
     /// `keyless`: Fulcio and Rekor, and the audience of kiln's identity token for Fulcio.
     pub fulcio_url: Option<String>,
     pub rekor_url: Option<String>,
+    /// Which of Rekor's APIs `rekor_url` speaks: `v1` (the default), or `v2` (rekor-tiles, which
+    /// takes hashedrekord entries alone: the trail's anchors, not keyless signing's DSSE entries).
+    pub rekor_api: RekorApi,
     pub audience: Option<String>,
     /// The Sigstore trusted root (`trusted_root.json`: its Fulcios, Rekors and CT logs) keyless
     /// bundles are verified against: the instance's kiln signs with, when that's its own.
     /// Without one, Sigstore's public instance's, through its TUF repository.
     pub trusted_root: Option<std::path::PathBuf>,
+}
+
+/// Which of Rekor's APIs kiln speaks to `[ci.attest] rekor_url` (docs/seams.md, "Sigstore").
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RekorApi {
+    #[default]
+    V1,
+    V2,
 }
 
 /// How landed commits are signed.

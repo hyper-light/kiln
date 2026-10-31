@@ -460,6 +460,25 @@ pub fn logged(answer: &Value, root: &TrustedRoot) -> anyhow::Result<Value> {
     serde_json::from_slice(&body).map_err(|e| anyhow::anyhow!("entry {index}'s body isn't JSON: {e}"))
 }
 
+/// An entry as a Rekor answered for it, checked against `root`: by its promise where the log made
+/// one ([`logged`]: Rekor v1), else by its proof of inclusion, leading to the root a checkpoint
+/// signed by a log the trusted root trusts names (Rekor v2, which promises nothing). What the
+/// entry's body says (its JSON).
+pub fn proven(l: &kiln_seams::sigstore::Logged, root: &TrustedRoot) -> anyhow::Result<Value> {
+    if l.promise.is_some() {
+        return logged(&l.answer, root);
+    }
+    let p = l.proof.as_ref().ok_or_else(|| anyhow::anyhow!("entry {} has neither a promise nor a proof", l.index))?;
+    let body = B64.decode(&l.body)?;
+    let mut leaf = vec![0u8];
+    leaf.extend_from_slice(&body);
+    anyhow::ensure!(p.index == l.index && merkle_root(p.index, p.size, &sha256(&leaf), &p.hashes)? == p.root, "entry {}'s inclusion proof doesn't lead to its root hash", l.index);
+    let now = crate::util::now_unix();
+    let (size, cp_root) = root.tlogs.iter().filter(|log| log.valid.holds(now)).find_map(|log| checkpoint(&p.checkpoint, log).ok()).ok_or_else(|| anyhow::anyhow!("entry {}'s checkpoint isn't signed by a log the trusted root trusts", l.index))?;
+    anyhow::ensure!(size == p.size && cp_root == p.root, "entry {}'s checkpoint is of another tree than its proof", l.index);
+    serde_json::from_slice(&body).map_err(|e| anyhow::anyhow!("entry {}'s body isn't JSON: {e}", l.index))
+}
+
 /// The certificate's DER in a PEM `verifier` (base64 of the PEM, as Rekor's bodies have it).
 fn verifier_der(b64_pem: &str) -> Option<Vec<u8>> {
     let pem = String::from_utf8(B64.decode(b64_pem).ok()?).ok()?;
