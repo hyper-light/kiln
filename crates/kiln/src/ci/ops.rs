@@ -545,10 +545,14 @@ pub fn ops() -> &'static [Op] {
                 input: Input::of::<input::CiRunsBisects>(),
                 route: |v| Ok((Method::GET, match v.get("bisect").and_then(Value::as_str) { Some(b) => path(&["runs", &text(v, "run")?, "bisects", b]), None => path(&["runs", &text(v, "run")?, "bisects"]) }, HashMap::new())),
                 run: |cx: Cx, v: Value| async move { answer(super::bisect::list(&cx.hub, &text(&v, "run")?, v.get("bisect").and_then(Value::as_str)).await).await }),
-            op!("experiments.start", "Start an experiment (W20-R11): options measured against each other and together on a base commit (the default branch's head by default). Each option is a `commit`, a `branch` or a `diff`; `strategy` makes the variants: each, all (every combination), pairs, greedy, or custom (`variants`); the baseline is one unless `baseline: false`. `criteria`: each `{name, kind: pipeline (workflow) | command (command, runs-on) | metric (metric, better: lower | higher), required, threshold: {at_most | at_least | better}}`, a metric read from the pipelines' and commands' runs. Each variant is measured `repetitions` times (3), interleaved, `max_parallel` at once (4), within `budget_minutes`. `decide`: ask (bring the results back) or auto (take the clear winner); the agent that asks is told.", base: "", ro: false, destructive: false,
+            op!("experiments.start", "Start an experiment (W20-R11): options measured against each other and together on a base commit (the default branch's head by default). Each option is a `commit`, a `branch` or a `diff`; `strategy` makes the variants: each, all (every combination), pairs, greedy, or custom (`variants`); the baseline is one unless `baseline: false`. `criteria`: each `{name, kind: command (command) | pipeline (workflow) | metric (metric, better: lower | higher), required, threshold: {at_most | at_least | better}}`, a metric read from what the commands and pipelines write to `$KILN_METRICS` (a JSON line each: {\"name\", \"value\"}). A command runs in each variant's own worktree beside the agent that asks, on its machine, without CI; a pipeline (or a command given `runs-on`) is a CI run, and needs CI's engine. Each variant is measured `repetitions` times (3), interleaved, `max_parallel` at once (4), within `budget_seconds` (or `budget_minutes`). `decide`: ask (bring the results back) or auto (take the clear winner); the agent that asks is told.", base: "", ro: false, destructive: false,
                 input: Input::of::<input::ExperimentsStart>(),
                 route: |_| Ok((Method::POST, path(&["experiments"]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move { answer(super::experiments::start(&cx.hub, &cx.caller, v).await).await }),
+            op!("experiments.suggest", "Before you ask the person to choose between options whose difference can be measured (faster, smaller, less memory, the tests still pass), say how to measure them: the person can run an experiment instead of answering (W20-R11), and its setup starts with what you suggest here, for them to change. `question`: as you'll ask it. `criteria`: each `{name, kind: command (command: run in each variant's own worktree; it passes when it exits 0) | metric (metric, better: lower | higher: a number your commands write to $KILN_METRICS, a JSON line each: {\"name\": \"p95_ms\", \"value\": 12.3}), required, threshold: {at_most | at_least | better (a fraction better than the baseline: 0.05 is 5%)}}`, at least one command among them.", base: "", ro: false, destructive: false,
+                input: Input::of::<input::ExperimentsSuggest>(),
+                route: |_| Ok((Method::POST, path(&["experiments", "suggest"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { answer(super::experiments::suggest(&cx.hub, &cx.caller, v).await).await }),
             op!("experiments.list", "Experiments you may read, newest first (one repository's with `repo`): each one's state, how many of its runs are measured, and its recommendation and decision.", base: "", ro: true, destructive: false,
                 input: Input::of::<input::ExperimentsList>(),
                 route: |v| Ok((Method::GET, path(&["experiments"]), query(v, &["repo"]))),
@@ -1822,11 +1826,23 @@ pub mod input {
         #[schemars(range(min = 1, max = 16))]
         pub max_parallel: Option<i64>,
         pub budget_minutes: Option<i64>,
+        /// Its time limit in seconds (instead of `budget_minutes`).
+        pub budget_seconds: Option<i64>,
         pub decide: Option<ExperimentsStartDecide>,
         /// The agent to tell (you, by default).
         pub agent: Option<String>,
         /// Where the agents implementing options run: {kind, on?, cwd?, model?}; yours by default.
         pub harness: Option<serde_json::Map<String, serde_json::Value>>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct ExperimentsSuggest {
+        /// The question it's for, as you'll ask it (your next, when left out).
+        pub question: Option<String>,
+        pub criteria: Vec<serde_json::Map<String, serde_json::Value>>,
+        /// The agent whose question it is (you, by default).
+        pub agent: Option<String>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
