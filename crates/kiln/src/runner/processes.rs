@@ -22,7 +22,7 @@ mod admission;
 pub(crate) use admission::Admission;
 pub(crate) mod captured;
 mod executions;
-pub(crate) use executions::{StoppedExecution, recovery_evidence, try_acknowledge_evidence};
+pub(crate) use executions::{StoppedExecution, recovery_evidence, try_acknowledge_evidence, OrdinaryClaim, claim_ordinary_evidence, ordinary_inventory_present};
 #[cfg(test)]
 pub(crate) use executions::acknowledge_evidence;
 
@@ -78,23 +78,39 @@ impl ParentExecution {
     pub(crate) fn binding(&self) -> &ParentBinding { &self.0 }
 }
 
-pub(crate) struct Execution { admission: Admission, work: PathBuf, job: String, _attempt: Option<u32>, identity: String, operation: Option<String>, reconciling: bool, parent: Option<ParentExecution>, executor_owner: Option<ExecutorOwner>, fenced: AtomicBool, state: Mutex<State> }
+pub(crate) struct Execution { admission: Admission, work: PathBuf, job: String, _attempt: Option<u32>, identity: String, operation: Option<String>, reconciling: bool, parent: Option<ParentExecution>, executor_owner: Option<ExecutorOwner>, ordinary_owner: Option<kiln_ci::wire::OrdinaryOwnerV1>, fenced: AtomicBool, state: Mutex<State> }
 impl Execution {
     pub(crate) fn new(work: PathBuf, job: String, attempt: Option<u32>) -> Arc<Self> { Self::new_in(Admission::production(), work, job, attempt) }
     pub(crate) fn new_in(admission: Admission, work: PathBuf, job: String, attempt: Option<u32>) -> Arc<Self> {
-        Arc::new(Self { admission, work, job, _attempt: attempt.map(|a| a.max(1)), identity: format!("ci-{}", crate::util::new_id()), operation: None, reconciling: false, parent: None, executor_owner: None, fenced: AtomicBool::new(false), state: Mutex::new(State::default()) })
+        Arc::new(Self { admission, work, job, _attempt: attempt.map(|a| a.max(1)), identity: format!("ci-{}", crate::util::new_id()), operation: None, reconciling: false, parent: None, executor_owner: None, ordinary_owner: None, fenced: AtomicBool::new(false), state: Mutex::new(State::default()) })
+    }
+    /// U01/U03: bind the server-selected native identity BEFORE any child can be prepared.
+    pub(crate) fn ordinary_in(admission: Admission, work: PathBuf, owner: kiln_ci::wire::OrdinaryOwnerV1) -> anyhow::Result<Arc<Self>> {
+        owner.validate().map_err(anyhow::Error::msg)?;
+        let execution = Arc::new(Self { admission, work, job: owner.job.clone(), _attempt: Some(owner.attempt), identity: owner.execution.clone(), operation: None, reconciling: false, parent: None, executor_owner: None, ordinary_owner: Some(owner), fenced: AtomicBool::new(false), state: Mutex::new(State::default()) });
+        { let mut state = execution.state.lock(); execution.gate(&mut state)?; }
+        Ok(execution)
+    }
+    /// Only called AFTER the SAME receiver's exact closed prefix committed in Amphora.
+    pub(crate) fn close_ordinary_admission(&self, no_start: bool) -> anyhow::Result<()> {
+        let owner = self.ordinary_owner.as_ref().context("execution has no ordinary grant")?;
+        let mut state = self.state.lock();
+        anyhow::ensure!(!no_start || (state.groups.is_empty() && state.docker.is_empty() && !state.closed), "NoStart cannot erase prior accepted work");
+        self.gate(&mut state)?.context("ordinary execution lacks its Gate")?.close_incoming(owner, no_start)?;
+        if no_start { state.closed = true; }
+        Ok(())
     }
     #[cfg(target_os = "linux")]
     pub(crate) fn inherited(work: PathBuf, job: String, attempt: u32, parent: ParentExecution) -> anyhow::Result<Arc<Self>> { Self::inherited_in(Admission::production(), work, job, attempt, parent) }
     pub(crate) fn inherited_in(admission: Admission, work: PathBuf, job: String, attempt: u32, parent: ParentExecution) -> anyhow::Result<Arc<Self>> {
         anyhow::ensure!(parent.0.job == job && parent.0.attempt == attempt, "the inherited executor does not own this job attempt");
-        Ok(Arc::new(Self { admission, work, job, _attempt: Some(attempt), identity: format!("ci-{}", crate::util::new_id()), operation: None, reconciling: false, parent: Some(parent), executor_owner: None, fenced: AtomicBool::new(false), state: Mutex::new(State::default()) }))
+        Ok(Arc::new(Self { admission, work, job, _attempt: Some(attempt), identity: format!("ci-{}", crate::util::new_id()), operation: None, reconciling: false, parent: Some(parent), executor_owner: None, ordinary_owner: None, fenced: AtomicBool::new(false), state: Mutex::new(State::default()) }))
     }
     /// ctl-9/U03: logical identity must be reachable by the existing Startup owner BEFORE
     /// any fallible physical-root preparation. This allocates no host/kernel resource.
     pub(super) fn allocate_executor(admission: Admission, work: PathBuf, executor: String, generation: String, allocation: String) -> anyhow::Result<Arc<Self>> {
         for value in [&executor, &generation, &allocation] { anyhow::ensure!(!value.is_empty() && value.len() <= 512 && !value.chars().any(char::is_control), "invalid existing executor grant"); }
-        Ok(Arc::new(Self { admission, work, job: format!("executor:{executor}"), _attempt: None, identity: format!("ci-{}", crate::util::new_id()), operation: None, reconciling: false, parent: None, executor_owner: Some(ExecutorOwner { executor, generation, allocation }), fenced: AtomicBool::new(false), state: Mutex::new(State::default()) }))
+        Ok(Arc::new(Self { admission, work, job: format!("executor:{executor}"), _attempt: None, identity: format!("ci-{}", crate::util::new_id()), operation: None, reconciling: false, parent: None, executor_owner: Some(ExecutorOwner { executor, generation, allocation }), ordinary_owner: None, fenced: AtomicBool::new(false), state: Mutex::new(State::default()) }))
     }
 
     pub(super) fn prepare_executor_root(&self) -> anyhow::Result<()> {
@@ -104,7 +120,7 @@ impl Execution {
         self.gate(&mut state)?;
         Ok(())
     }
-    pub(super) fn cleanup(admission: Admission, work: PathBuf) -> Arc<Self> { Arc::new(Self { admission, work, job: "executor-cleanup".into(), _attempt: None, identity: format!("ci-{}", crate::util::new_id()), operation: None, reconciling: true, parent: None, executor_owner: None, fenced: AtomicBool::new(false), state: Mutex::new(State::default()) }) }
+    pub(super) fn cleanup(admission: Admission, work: PathBuf) -> Arc<Self> { Arc::new(Self { admission, work, job: "executor-cleanup".into(), _attempt: None, identity: format!("ci-{}", crate::util::new_id()), operation: None, reconciling: true, parent: None, executor_owner: None, ordinary_owner: None, fenced: AtomicBool::new(false), state: Mutex::new(State::default()) }) }
     /// U01: bind only the Scheduler's existing executor shape, never infer from host capacity.
     pub(super) fn bind_vm_shape(&self, shape: kiln_ci::sched::vm::FirecrackerShape) -> anyhow::Result<()> {
         shape.validate().map_err(anyhow::Error::msg)?;
@@ -200,7 +216,9 @@ impl Execution {
     fn gate(&self, state: &mut State) -> anyhow::Result<Option<Arc<executions::Gate>>> {
         if self.reconciling { return Ok(None) }
         if let Some(gate) = &state.gate { return Ok(Some(Arc::clone(gate))) }
-        let gate = executions::Gate::create(self.admission.clone(), &self.identity, &self.job, self._attempt, &self.work, state.parent_binding.clone(), self.executor_owner.clone())?;
+        let gate = if self.ordinary_owner.is_some() {
+            executions::Gate::create_owned(self.admission.clone(), &self.identity, &self.job, self._attempt, &self.work, state.parent_binding.clone(), self.executor_owner.clone(), self.ordinary_owner.clone())?
+        } else { executions::Gate::create(self.admission.clone(), &self.identity, &self.job, self._attempt, &self.work, state.parent_binding.clone(), self.executor_owner.clone())? };
         state.gate = Some(Arc::clone(&gate));
         Ok(Some(gate))
     }
@@ -517,7 +535,7 @@ pub(super) struct RetainedExecution { execution: Arc<Execution>, host: Option<Ar
 impl RetainedExecution {
     pub(super) fn debug_child(&self) -> Arc<Execution> {
         let original = &self.execution;
-        Arc::new(Execution { admission: original.admission.clone(), work: original.work.clone(), job: original.job.clone(), _attempt: original._attempt, identity: original.identity.clone(), operation: Some(format!("ci-{}", crate::util::new_id())), reconciling: false, parent: original.parent.clone(), executor_owner: original.executor_owner.clone(), fenced: AtomicBool::new(false), state: Mutex::new(State { host: self.host.clone(), gate: self.gate.clone(), docker: self.docker.clone(), closed: true, ..State::default() }) })
+        Arc::new(Execution { admission: original.admission.clone(), work: original.work.clone(), job: original.job.clone(), _attempt: original._attempt, identity: original.identity.clone(), operation: Some(format!("ci-{}", crate::util::new_id())), reconciling: false, parent: original.parent.clone(), executor_owner: original.executor_owner.clone(), ordinary_owner: original.ordinary_owner.clone(), fenced: AtomicBool::new(false), state: Mutex::new(State { host: self.host.clone(), gate: self.gate.clone(), docker: self.docker.clone(), closed: true, ..State::default() }) })
     }
 
     pub(super) async fn release(self) {

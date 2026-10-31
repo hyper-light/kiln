@@ -27,7 +27,7 @@ impl std::fmt::Debug for ProcessNonce {
 #[derive(Clone, Debug)]
 pub struct CapturedRunner {
     machine: String, peer: PeerId, process_nonce: ProcessNonce,
-    connection: crate::net::Connection, required: u64, wide: u64,
+    connection: crate::net::Connection, required: u64, wide: u64, ordinary_epoch: Option<String>,
 }
 impl CapturedRunner {
     pub fn peer(&self) -> PeerId { self.peer }
@@ -35,6 +35,7 @@ impl CapturedRunner {
     pub fn process_nonce(&self) -> &str { &self.process_nonce.0 }
     pub fn connection_id(&self) -> String { self.connection.connection_id() }
     pub fn wide_caps(&self) -> u64 { self.wide }
+    pub(crate) fn ordinary_epoch(&self) -> Option<&str> { self.ordinary_epoch.as_deref() }
     pub(crate) fn connection(&self) -> crate::net::Connection { self.connection }
 }
 
@@ -131,6 +132,7 @@ pub struct Instance {
     pub wide: u64,
     connection: Option<crate::net::Connection>,
     process_nonce: Option<ProcessNonce>,
+    ordinary_domain: Option<(crate::net::Connection,String)>,
     /// The kiln it says it runs ([`crate::proto::AgentMsg::Facts`]); `None` for runners from before.
     pub kiln: Option<kiln_ci::facts::KilnFacts>,
 }
@@ -224,10 +226,19 @@ impl Instances {
         instance.process_nonce = Some(ProcessNonce(nonce));
         Ok(())
     }
+    /// U01/U03: registration belongs to this actual process/connection, never newest fallback.
+    pub(crate) fn set_ordinary_domain(&mut self, peer: PeerId, origin: crate::net::Connection, epoch: String) -> Result<(), CaptureRefusal> {
+        if self.process_on(peer,Some(origin)).is_none() { return Err(CaptureRefusal::Process); }
+        let instance = self.by_peer.get_mut(&peer).ok_or(CaptureRefusal::Disconnected)?;
+        if instance.ordinary_domain.as_ref().is_some_and(|(connection,old)| *connection == origin && old != &epoch) { return Err(CaptureRefusal::Process); }
+        instance.ordinary_domain = Some((origin,epoch));
+        Ok(())
+    }
     /// Shaped startup is eligible only after the process/caps declaration belongs to this live
     /// connection. All older capability meanings remain unchanged.
     pub fn effective_wide(&self, peer: PeerId) -> u64 {
         let raw = self.by_peer.get(&peer).map_or(0,|instance|u64::from(instance.caps)|instance.wide);
+        let raw = if self.by_peer.get(&peer).is_some_and(|instance| instance.ordinary_domain.as_ref().is_some_and(|(connection,_)| instance.connection == Some(*connection))) { raw } else { raw & !crate::proto::CAP_ORDINARY_EXECUTION_DEBT };
         let verified = self.connections.get(&peer).and_then(|state|state.connection).is_some_and(|connection|self.process_on(peer,Some(connection)).is_some());
         if !verified || raw & crate::proto::CAP_WIRE == 0 { raw & !crate::proto::CAP_FIRECRACKER_SHAPE } else { raw }
     }
@@ -238,7 +249,7 @@ impl Instances {
         if expected_nonce.is_some_and(|expected|expected!=process_nonce.0) { return Err(CaptureRefusal::Process); }
         let wide = self.effective_wide(peer);
         if wide & required != required { return Err(CaptureRefusal::Capabilities); }
-        Ok(CapturedRunner { machine: machine.into(), peer, process_nonce: process_nonce.clone(), connection, required, wide })
+        Ok(CapturedRunner { machine: machine.into(), peer, process_nonce: process_nonce.clone(), connection, required, wide, ordinary_epoch: instance.ordinary_domain.as_ref().filter(|(origin,_)| *origin == connection).map(|(_,epoch)| epoch.clone()) })
     }
     pub fn capture_newest_runner(&self, machine: &str, required: u64) -> Result<CapturedRunner, CaptureRefusal> {
         self.capture_peer(machine,self.newest(machine).ok_or(CaptureRefusal::Disconnected)?,None,required)
@@ -293,6 +304,7 @@ impl Instances {
                 wide: 0,
                 connection,
                 process_nonce,
+                ordinary_domain: None,
                 kiln: None,
             },
         );

@@ -197,6 +197,9 @@ impl Sender {
         Self { streams: BTreeMap::new(), room, patience, up: false }
     }
 
+    /// U01: inspect the next unconsumed slot under the SAME Commands mutex. This publishes nothing.
+    pub(crate) fn next_sequence(&self, stream: &str) -> Seq { self.streams.get(stream).map_or(1, |out| out.next) }
+
     /// Queues `body` as the next item of `stream`: its number, or [`Full`] while the stream
     /// keeps as much unanswered past its picture as it may.
     pub fn push(&mut self, stream: &str, body: Vec<u8>) -> Result<Seq, Full> {
@@ -410,10 +413,85 @@ pub enum Arrival {
     Gap(Frame),
 }
 
-/// The receiving side of the streams from one peer.
+// U01/U03: SAME Receiver owns bounded raw input and the distinct durable ACK frontier.
+const ORDINARY_PENDING: usize = 64;
+const ORDINARY_WINDOW: Seq = 4096;
+// Reserve the disposition BEFORE any effect, even when raw input fills ROOM. The
+// diagnostic may be shortened explicitly; its refusal code is never discarded.
+const ORDINARY_OUTCOME_ROOM: usize = 8192;
+const ORDINARY_WHY_MAX: usize = 1024;
+// Normal raw input cannot consume these SAME-owner emergency slots/bytes. Both
+// full-size controls fit; the finite reserve does not authorize effects past raw gaps.
+const ORDINARY_URGENT_PENDING: usize = 2;
+const ORDINARY_URGENT_ROOM: usize = ORDINARY_URGENT_PENDING*(super::commands::ITEM_MOST+ORDINARY_OUTCOME_ROOM);
+fn ordinary_reason(mut why: String) -> String {
+    const MARK: &str = " [truncated]";
+    if why.len()>ORDINARY_WHY_MAX {
+        let mut end=ORDINARY_WHY_MAX-MARK.len();
+        while !why.is_char_boundary(end) {end-=1;}
+        why.truncate(end);why.push_str(MARK);
+    }
+    why
+}
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub(crate) enum OrdinaryStageRefusal {
+    #[error("ordinary receiver needs its exact initialized origin/domain")] Domain,
+    #[error("ordinary receiver pending input/outcome budget is full")] Full,
+    #[error("ordinary command changed bytes or its already-owned disposition")] Conflict,
+}
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum OrdinaryArrival { Queued, Duplicate, Answered(Frame), Gap(Frame), AdmittedPending }
+#[derive(Clone)]
+pub(crate) struct OrdinaryTicket {
+    origin: crate::net::Connection, nonce: String, stream: String, seq: Seq,
+    body: std::sync::Arc<[u8]>, hash: String, authority: std::sync::Arc<()>,
+}
+impl OrdinaryTicket {
+    pub(crate) fn origin(&self) -> crate::net::Connection { self.origin }
+    pub(crate) fn nonce(&self) -> &str { &self.nonce }
+    pub(crate) fn stream(&self) -> &str { &self.stream }
+    pub(crate) fn seq(&self) -> Seq { self.seq }
+    pub(crate) fn body(&self) -> &[u8] { &self.body }
+    pub(crate) fn body_hash(&self) -> &str { &self.hash }
+    pub(crate) fn same_identity(&self,other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.authority,&other.authority) && self.origin==other.origin && self.nonce==other.nonce && self.stream==other.stream && self.seq==other.seq && self.hash==other.hash
+    }
+}
+#[derive(Clone)]
+pub(crate) struct OrdinaryClosure {
+    origin: crate::net::Connection, nonce: String, has: Has, low: Seq,
+    base: Seq, tickets: Vec<(Seq,String)>, authority: std::sync::Arc<()>,
+}
+impl OrdinaryClosure {
+    pub(crate) fn origin(&self) -> crate::net::Connection { self.origin }
+    pub(crate) fn nonce(&self) -> &str { &self.nonce }
+    pub(crate) fn has(&self) -> &Has { &self.has }
+    pub(crate) fn low(&self) -> Seq { self.low }
+}
+enum OrdinaryEffect { Queued, Claimed, AdmittedPending, Done(Option<(Refusal,String)>) }
+struct OrdinaryItem { ticket: OrdinaryTicket, effect: OrdinaryEffect, urgent: bool }
+struct OrdinaryIn {
+    origin: crate::net::Connection, nonce: String, stream: String, admitted: Seq,
+    low: Seq, bytes: usize, pending: BTreeMap<Seq,OrdinaryItem>, authority: std::sync::Arc<()>,
+}
+pub(crate) fn ordinary_has_valid(has: &Has) -> Result<(),OrdinaryStageRefusal> {
+    let name=has.stream.strip_prefix("l:").and_then(|s|s.split_once('.'));
+    if !name.is_some_and(|(b,g)|b.parse::<u64>().is_ok() && g.parse::<u64>().ok().is_some_and(|g|g>0 && g<u64::MAX)) || has.upto==u64::MAX || has.nacks.len()>NACKS_KEPT { return Err(OrdinaryStageRefusal::Domain); }
+    let mut last=0;
+    for nack in &has.nacks {
+        if nack.seq<=last || nack.seq>has.upto {return Err(OrdinaryStageRefusal::Conflict);}
+        last=nack.seq;
+    }
+    if serde_json::to_vec(has).map_err(|_|OrdinaryStageRefusal::Conflict)?.len()>kiln_seams::records::VALUE_MAX-4096 {return Err(OrdinaryStageRefusal::Full);}
+    Ok(())
+}
+
+/// The receiving side of the streams from one peer. Strict ownership stays in this owner;
+/// legacy upto/nacks remain the ONLY values which Have/ACK may expose.
 #[derive(Default)]
 pub struct Receiver {
     streams: BTreeMap<String, In>,
+    ordinary: Option<OrdinaryIn>,
 }
 
 impl Receiver {
@@ -422,7 +500,11 @@ impl Receiver {
     }
 
     /// An item came.
-    pub fn on_item(&mut self, stream: &str, seq: Seq, low: Seq, body: Vec<u8>) -> Arrival {
+    pub fn on_item(&mut self, stream: &str, seq: Seq, low: Seq, body: Vec<u8>) -> Arrival { self.on_item_inner(stream, seq, low, body, true) }
+    /// U01/U03: a sender low watermark cannot replace this receiver's durable admission.
+    pub(crate) fn on_item_strict(&mut self, stream: &str, seq: Seq, low: Seq, body: Vec<u8>) -> Arrival { self.on_item_inner(stream, seq, low, body, false) }
+    fn on_item_inner(&mut self, stream: &str, seq: Seq, low: Seq, body: Vec<u8>, allow_low: bool) -> Arrival {
+        if self.ordinary.as_ref().is_some_and(|o|o.stream==stream) { return Arrival::Answered(None); }
         let i = self.streams.entry(stream.to_owned()).or_default();
         i.nacks.retain(|n, _| *n > low);
         if i.taking == Some(seq) {
@@ -430,7 +512,7 @@ impl Receiver {
         }
         // Its sender has every answer through `low`: what this side doesn't know of them (it
         // started again since, and the stream went on) isn't missing.
-        if i.taking.is_none() && i.upto < low {
+        if allow_low && i.taking.is_none() && i.upto < low {
             i.upto = low;
         }
         if seq <= i.upto {
@@ -472,6 +554,7 @@ impl Receiver {
     }
 
     fn done(&mut self, stream: &str, seq: Seq, refusal: Option<(Refusal, String)>) -> Frame {
+        if self.ordinary.as_ref().is_some_and(|o|o.stream==stream) { return Frame::Ack(self.state(stream)); }
         let i = self.streams.entry(stream.to_owned()).or_default();
         if i.taking == Some(seq) {
             i.taking = None;
@@ -502,6 +585,7 @@ impl Receiver {
 
     /// Picks a durable stream up after a restart, from what it kept.
     pub fn restore(&mut self, has: Has) {
+        if self.ordinary.as_ref().is_some_and(|o|o.stream==has.stream) { return; }
         let i = self.streams.entry(has.stream.clone()).or_default();
         i.upto = has.upto;
         i.taking = None;
@@ -510,12 +594,185 @@ impl Receiver {
 
     /// Lets go of a stream that ended (a session closed, a sender's earlier incarnation).
     pub fn forget(&mut self, stream: &str) {
+        if self.ordinary.as_ref().is_some_and(|o|o.stream==stream) { return; }
         self.streams.remove(stream);
     }
 
     /// Lets go of every stream whose name `drop` picks.
     pub fn forget_where(&mut self, mut drop: impl FnMut(&str) -> bool) {
-        self.streams.retain(|s, _| !drop(s));
+        let protected=self.ordinary.as_ref().map(|o|o.stream.clone());
+        self.streams.retain(|s, _| protected.as_ref()==Some(s) || !drop(s));
+    }
+}
+
+impl Receiver {
+    /// Bind ONCE from the authoritative complete incoming state, before strict readiness.
+    pub(crate) fn bind_ordinary(&mut self,origin: crate::net::Connection,nonce: &str,durable: Has,admitted: Seq) -> Result<(),OrdinaryStageRefusal> {
+        ordinary_has_valid(&durable)?;
+        if !crate::proto::valid_process_nonce(nonce) || admitted<durable.upto || admitted==u64::MAX || admitted-durable.upto>ORDINARY_WINDOW || self.ordinary.is_some() {return Err(OrdinaryStageRefusal::Domain);}
+        if self.streams.get(&durable.stream).is_some_and(|i|i.taking.is_some() || (i.upto!=0 && i.has(&durable.stream)!=durable)) {return Err(OrdinaryStageRefusal::Conflict);}
+        self.restore(durable.clone());
+        self.ordinary=Some(OrdinaryIn {origin,nonce:nonce.into(),stream:durable.stream,admitted,low:0,bytes:0,pending:BTreeMap::new(),authority:std::sync::Arc::new(())});
+        Ok(())
+    }
+    /// Refresh SAME authority after a retained positive Gate closes admission. That
+    /// closure never fabricates a completed disposition or re-dispatches queued raw input.
+    pub(crate) fn refresh_ordinary(&mut self,origin: crate::net::Connection,nonce: &str,durable: Has,admitted: Seq) -> Result<(),OrdinaryStageRefusal> {
+        ordinary_has_valid(&durable)?;
+        let o=self.ordinary_owner(origin,nonce,&durable.stream)?;
+        if self.state(&durable.stream)!=durable || admitted<o.admitted || admitted<durable.upto || admitted==u64::MAX || admitted-durable.upto>ORDINARY_WINDOW {return Err(OrdinaryStageRefusal::Domain);}
+        let o=self.ordinary.as_mut().ok_or(OrdinaryStageRefusal::Domain)?;
+        for (_,item) in o.pending.range_mut(..=admitted) {
+            if matches!(&item.effect,OrdinaryEffect::Queued) {item.effect=OrdinaryEffect::AdmittedPending;}
+        }
+        o.admitted=admitted;Ok(())
+    }
+    fn ordinary_owner(&self,origin: crate::net::Connection,nonce: &str,stream: &str) -> Result<&OrdinaryIn,OrdinaryStageRefusal> {
+        self.ordinary.as_ref().filter(|o|o.origin==origin && o.nonce==nonce && o.stream==stream).ok_or(OrdinaryStageRefusal::Domain)
+    }
+    pub(crate) fn stage_ordinary(&mut self,origin: crate::net::Connection,nonce: &str,stream: &str,seq: Seq,low: Seq,body: Vec<u8>) -> Result<OrdinaryArrival,OrdinaryStageRefusal> {
+        self.stage_ordinary_inner(origin,nonce,stream,(seq,low,body),false)
+    }
+    /// ONLY an exactly parsed Interrupt/ForceStop may use the reserved class. Original
+    /// raw bytes stay unchanged; this reserves input, not permission to dispatch its effect.
+    pub(crate) fn stage_ordinary_urgent(&mut self,origin: crate::net::Connection,nonce: &str,stream: &str,seq: Seq,low: Seq,body: Vec<u8>) -> Result<OrdinaryArrival,OrdinaryStageRefusal> {
+        self.stage_ordinary_inner(origin,nonce,stream,(seq,low,body),true)
+    }
+    fn stage_ordinary_inner(&mut self,origin: crate::net::Connection,nonce: &str,stream: &str,item: (Seq,Seq,Vec<u8>),urgent: bool) -> Result<OrdinaryArrival,OrdinaryStageRefusal> {
+        let (seq,low,body)=item;
+        let o=self.ordinary_owner(origin,nonce,stream)?;
+        let has=self.state(stream);
+        if seq==0 || seq==u64::MAX {return Err(OrdinaryStageRefusal::Domain);}
+        if seq<=has.upto {
+            if let Some(o)=self.ordinary.as_mut() {o.low=o.low.max(low.min(has.upto));}
+            return Ok(OrdinaryArrival::Answered(Frame::Ack(has)));
+        }
+        if let Some(item)=o.pending.get(&seq) {
+            if item.ticket.body()!=body.as_slice() || item.urgent!=urgent {return Err(OrdinaryStageRefusal::Conflict);}
+            let unknown=matches!(&item.effect,OrdinaryEffect::AdmittedPending);
+            let o=self.ordinary.as_mut().ok_or(OrdinaryStageRefusal::Domain)?;
+            o.low=o.low.max(low.min(has.upto));
+            return Ok(if unknown {OrdinaryArrival::AdmittedPending} else {OrdinaryArrival::Duplicate});
+        }
+        // Admitted without a completed disposition is UNKNOWN, never Take or Taken.
+        let admitted=seq<=o.admitted;
+        let class_count=o.pending.values().filter(|i|i.urgent==urgent).count();
+        let class_bytes:usize=o.pending.values().filter(|i|i.urgent==urgent).map(|i|i.ticket.body.len()+ORDINARY_OUTCOME_ROOM).sum();
+        let class_full=if urgent {class_count>=ORDINARY_URGENT_PENDING} else {
+            class_count>=ORDINARY_PENDING-ORDINARY_URGENT_PENDING || class_bytes.saturating_add(body.len()).saturating_add(ORDINARY_OUTCOME_ROOM)>super::commands::ROOM-ORDINARY_URGENT_ROOM
+        };
+        let full=class_full || seq-has.upto>ORDINARY_WINDOW || body.len()>super::commands::ITEM_MOST || o.pending.len()>=ORDINARY_PENDING || o.bytes.saturating_add(body.len()).saturating_add(ORDINARY_OUTCOME_ROOM)>super::commands::ROOM;
+        let o=self.ordinary.as_mut().ok_or(OrdinaryStageRefusal::Domain)?;
+        o.low=o.low.max(low.min(has.upto));
+        if admitted {return Ok(OrdinaryArrival::AdmittedPending);}
+        if full {return Err(OrdinaryStageRefusal::Full);}
+        let hash=crate::util::sha256_hex(&body);
+        let ticket=OrdinaryTicket {origin,nonce:nonce.into(),stream:stream.into(),seq,body:body.into(),hash,authority:std::sync::Arc::clone(&o.authority)};
+        let o=self.ordinary.as_mut().ok_or(OrdinaryStageRefusal::Domain)?;
+        o.low=o.low.max(low.min(has.upto));o.bytes+=ticket.body.len()+ORDINARY_OUTCOME_ROOM;
+        o.pending.insert(seq,OrdinaryItem {ticket,effect:OrdinaryEffect::Queued,urgent});
+        let mut through=o.admitted.max(has.upto);
+        while through<u64::MAX-1 && o.pending.contains_key(&(through+1)) {through+=1;}
+        Ok(if seq>through {OrdinaryArrival::Gap(Frame::Want {stream:stream.into(),from:through+1})} else {OrdinaryArrival::Queued})
+    }
+    pub(crate) fn ordinary_head(&mut self,origin: crate::net::Connection,nonce: &str,stream: &str) -> Result<Option<OrdinaryTicket>,OrdinaryStageRefusal> {
+        self.ordinary_owner(origin,nonce,stream)?;
+        let mut seq=self.state(stream).upto.saturating_add(1);
+        let o=self.ordinary.as_mut().ok_or(OrdinaryStageRefusal::Domain)?;
+        while let Some(item)=o.pending.get_mut(&seq) {
+            match &item.effect {
+                OrdinaryEffect::Done(_) => seq=seq.saturating_add(1),
+                OrdinaryEffect::Claimed | OrdinaryEffect::AdmittedPending => return Ok(None),
+                OrdinaryEffect::Queued => {item.effect=OrdinaryEffect::Claimed;return Ok(Some(item.ticket.clone()));},
+            }
+        }
+        Ok(None)
+    }
+    /// Read-only discovery after an earlier raw gap arrives. Caller captures the exact
+    /// Session from SAME body, reserves this ticket, verifies identity, then effects it
+    /// without awaiting. No second raw queue or effect is created by peeking.
+    pub(crate) fn ordinary_peek_urgent(&self,origin: crate::net::Connection,nonce: &str,stream: &str) -> Result<Option<OrdinaryTicket>,OrdinaryStageRefusal> {
+        let o=self.ordinary_owner(origin,nonce,stream)?;
+        let mut through=o.admitted.max(self.state(stream).upto);
+        while through<u64::MAX-1 && o.pending.contains_key(&(through+1)) {through+=1;}
+        Ok(o.pending.range(..=through).find_map(|(_,item)|(item.urgent && matches!(&item.effect,OrdinaryEffect::Queued)).then(||item.ticket.clone())))
+    }
+    /// Caller classifies urgent control; SAME slot is reserved BEFORE its synchronous effect.
+    pub(crate) fn ordinary_urgent(&mut self,origin: crate::net::Connection,nonce: &str,stream: &str,seq: Seq) -> Result<Option<OrdinaryTicket>,OrdinaryStageRefusal> {
+        let o=self.ordinary_owner(origin,nonce,stream)?;
+        let mut through=o.admitted.max(self.state(stream).upto);
+        while through<u64::MAX-1 && o.pending.contains_key(&(through+1)) {through+=1;}
+        if seq>through {return Ok(None);}
+        let o=self.ordinary.as_mut().ok_or(OrdinaryStageRefusal::Domain)?;
+        let Some(item)=o.pending.get_mut(&seq) else {return Ok(None)};
+        if !item.urgent || !matches!(&item.effect,OrdinaryEffect::Queued) {return Ok(None);}
+        item.effect=OrdinaryEffect::Claimed;Ok(Some(item.ticket.clone()))
+    }
+    pub(crate) fn ordinary_admitted(&mut self,ticket: &OrdinaryTicket) -> Result<(),OrdinaryStageRefusal> {
+        self.ordinary_owner(ticket.origin,&ticket.nonce,&ticket.stream)?;
+        let o=self.ordinary.as_mut().ok_or(OrdinaryStageRefusal::Domain)?;
+        let item=o.pending.get(&ticket.seq).ok_or(OrdinaryStageRefusal::Domain)?;
+        if !item.ticket.same_identity(ticket) || !matches!(&item.effect,OrdinaryEffect::Claimed) || ticket.seq>o.admitted.saturating_add(1) {return Err(OrdinaryStageRefusal::Conflict);}
+        o.admitted=o.admitted.max(ticket.seq);Ok(())
+    }
+    pub(crate) fn ordinary_effect_done(&mut self,ticket: &OrdinaryTicket,refusal: Option<(Refusal,String)>) -> Result<(),OrdinaryStageRefusal> {
+        self.ordinary_owner(ticket.origin,&ticket.nonce,&ticket.stream)?;
+        let o=self.ordinary.as_mut().ok_or(OrdinaryStageRefusal::Domain)?;
+        let item=o.pending.get_mut(&ticket.seq).ok_or(OrdinaryStageRefusal::Domain)?;
+        if !item.ticket.same_identity(ticket) {return Err(OrdinaryStageRefusal::Conflict);}
+        let refusal=refusal.map(|(code,why)|(code,ordinary_reason(why)));
+        match &item.effect {
+            OrdinaryEffect::Done(old) if old==&refusal => return Ok(()),
+            OrdinaryEffect::Claimed => {},
+            _=>return Err(OrdinaryStageRefusal::Conflict),
+        }
+        item.effect=OrdinaryEffect::Done(refusal);Ok(())
+    }
+    pub(crate) fn ordinary_ready(&self,origin: crate::net::Connection,nonce: &str,stream: &str) -> Result<Option<OrdinaryClosure>,OrdinaryStageRefusal> {
+        let o=self.ordinary_owner(origin,nonce,stream)?;
+        let old=self.state(stream);let mut has=old.clone();has.nacks.retain(|n|n.seq>o.low);
+        let mut bytes=serde_json::to_vec(&has).map_err(|_|OrdinaryStageRefusal::Conflict)?.len();
+        let mut tickets=Vec::new();
+        while let Some(item)=o.pending.get(&has.upto.saturating_add(1)) {
+            let OrdinaryEffect::Done(refusal)=&item.effect else {break};
+            let nack=refusal.as_ref().map(|(code,why)|Nack {seq:item.ticket.seq,code:*code,why:why.clone()});
+            let added=nack.as_ref().map(|n|serde_json::to_vec(n).map(|v|v.len()+1)).transpose().map_err(|_|OrdinaryStageRefusal::Conflict)?.unwrap_or(0)+20;
+            if (nack.is_some() && has.nacks.len()>=NACKS_KEPT) || bytes.saturating_add(added)>kiln_seams::records::VALUE_MAX-4096 {
+                if tickets.is_empty() {return Err(OrdinaryStageRefusal::Full);}break;
+            }
+            bytes+=added;has.upto=item.ticket.seq;
+            if let Some(nack)=nack {has.nacks.push(nack);}
+            tickets.push((has.upto,item.ticket.hash.clone()));
+        }
+        if has.upto==old.upto {return Ok(None);}
+        ordinary_has_valid(&has)?;
+        Ok(Some(OrdinaryClosure {origin,nonce:nonce.into(),has,low:o.low,base:old.upto,tickets,authority:std::sync::Arc::clone(&o.authority)}))
+    }
+    /// Called ONLY for the exact captured closure whose Store success is known.
+    pub(crate) fn ordinary_committed(&mut self,closure: &OrdinaryClosure) -> Result<Frame,OrdinaryStageRefusal> {
+        self.ordinary_owner(closure.origin,&closure.nonce,&closure.has.stream)?;
+        if !self.ordinary.as_ref().is_some_and(|o|std::sync::Arc::ptr_eq(&o.authority,&closure.authority)) {return Err(OrdinaryStageRefusal::Domain);}
+        let old=self.state(&closure.has.stream);
+        if old==closure.has {return Ok(Frame::Ack(old));}
+        if old.upto!=closure.base {return Err(OrdinaryStageRefusal::Conflict);}
+        let o=self.ordinary.as_mut().ok_or(OrdinaryStageRefusal::Domain)?;
+        for (seq,hash) in &closure.tickets {
+            let item=o.pending.get(seq).ok_or(OrdinaryStageRefusal::Conflict)?;
+            if item.ticket.hash!=*hash || !matches!(&item.effect,OrdinaryEffect::Done(_)) {return Err(OrdinaryStageRefusal::Conflict);}
+        }
+        for (seq,_) in &closure.tickets {if let Some(item)=o.pending.remove(seq) {
+            o.bytes=o.bytes.saturating_sub(item.ticket.body.len()+ORDINARY_OUTCOME_ROOM);
+        }}
+        o.admitted=o.admitted.max(closure.has.upto);
+        let i=self.streams.get_mut(&closure.has.stream).ok_or(OrdinaryStageRefusal::Domain)?;
+        i.upto=closure.has.upto;i.nacks=closure.has.nacks.iter().map(|n|(n.seq,(n.code,n.why.clone()))).collect();
+        Ok(Frame::Ack(i.has(&closure.has.stream)))
+    }
+    /// Caller supplies actual original-route retirement, never sender-low or Current alone.
+    /// This discards no physical debt and cannot turn old pending work into success.
+    pub(crate) fn retire_ordinary(&mut self,origin: crate::net::Connection) -> bool {
+        if !self.ordinary.as_ref().is_some_and(|o|o.origin==origin) {return false;}
+        if let Some(o)=self.ordinary.take() {self.streams.remove(&o.stream);}true
     }
 }
 
@@ -659,6 +916,83 @@ mod tests {
                 Event::Answered { stream: "a".into(), seq: 2, outcome: Outcome::Taken },
             ]
         );
+        // U01/U03: held durability cannot block one urgent effect, nor advertise it.
+        let origin=crate::net::Connection::new(1,1,[1;32]);let nonce="a".repeat(43);let stream="l:7.1";
+        let mut staged=Receiver::new();
+        staged.bind_ordinary(origin,&nonce,Has {stream:stream.into(),upto:0,nacks:vec![]},0)?;
+        staged.stage_ordinary(origin,&nonce,stream,1,0,b"held Start".to_vec())?;
+        staged.stage_ordinary_urgent(origin,&nonce,stream,2,0,b"urgent".to_vec())?;
+        let held=staged.ordinary_head(origin,&nonce,stream)?.ok_or_else(||anyhow::anyhow!("held head missing"))?;
+        let urgent=staged.ordinary_urgent(origin,&nonce,stream,2)?.ok_or_else(||anyhow::anyhow!("urgent not reserved"))?;
+        assert!(staged.ordinary_urgent(origin,&nonce,stream,2)?.is_none(),"duplicate cannot dispatch ForceStop twice");
+        staged.ordinary_effect_done(&urgent,Some((Refusal::Unknown,"exact refusal".into())))?;
+        assert!(staged.ordinary_ready(origin,&nonce,stream)?.is_none(),"cannot ACK past unresolved head");
+        assert_eq!(staged.state(stream).upto,0);
+        assert_eq!(staged.have(),Frame::Have(vec![Has {stream:stream.into(),upto:0,nacks:vec![]} ]));
+        assert_eq!(staged.stage_ordinary_urgent(origin,&nonce,stream,2,100,b"urgent".to_vec())?,OrdinaryArrival::Duplicate);
+        assert!(staged.stage_ordinary_urgent(origin,&nonce,stream,2,0,b"changed".to_vec()).is_err());
+        staged.refresh_ordinary(origin,&nonce,staged.state(stream),1)?;
+        staged.ordinary_admitted(&held)?;
+        staged.ordinary_effect_done(&held,None)?;
+        let closure=staged.ordinary_ready(origin,&nonce,stream)?.ok_or_else(||anyhow::anyhow!("completed prefix missing"))?;
+        assert_eq!(staged.state(stream).upto,0,"preparing or holding a Store future is not commit");
+        let saved=closure.has().clone();let _lost=staged.ordinary_committed(&closure)?;
+        assert_eq!(saved.upto,2);assert_eq!(saved.nacks.len(),1);
+        let mut restored=Receiver::new();restored.bind_ordinary(origin,&nonce,saved.clone(),2)?;
+        assert_eq!(restored.stage_ordinary_urgent(origin,&nonce,stream,2,0,b"urgent".to_vec())?,OrdinaryArrival::Answered(Frame::Ack(saved)));
+        let mut unknown=Receiver::new();unknown.bind_ordinary(origin,&nonce,Has {stream:stream.into(),upto:0,nacks:vec![]},1)?;
+        assert_eq!(unknown.stage_ordinary(origin,&nonce,stream,1,0,b"Start".to_vec())?,OrdinaryArrival::AdmittedPending);
+        assert!(unknown.ordinary_head(origin,&nonce,stream)?.is_none());
+        let mut refreshed=Receiver::new();refreshed.bind_ordinary(origin,&nonce,Has {stream:stream.into(),upto:0,nacks:vec![]},0)?;
+        refreshed.stage_ordinary(origin,&nonce,stream,1,0,b"unexposed raw".to_vec())?;
+        refreshed.refresh_ordinary(origin,&nonce,refreshed.state(stream),1)?;
+        assert_eq!(refreshed.stage_ordinary(origin,&nonce,stream,1,0,b"unexposed raw".to_vec())?,OrdinaryArrival::AdmittedPending);
+        assert!(refreshed.ordinary_head(origin,&nonce,stream)?.is_none());
+        assert!(refreshed.refresh_ordinary(origin,&nonce,refreshed.state(stream),0).is_err());
+        assert_eq!(refreshed.state(stream).upto,0,"positive Gate admission is not wire Taken");
+        assert!(staged.retire_ordinary(origin));
+        assert!(staged.ordinary_committed(&closure).is_err(),"late original closure cannot ACK a replacement");
+        staged.bind_ordinary(origin,&nonce,Has {stream:stream.into(),upto:0,nacks:vec![]},0)?;
+        staged.stage_ordinary(origin,&nonce,stream,1,0,b"held Start".to_vec())?;
+        let rebound=staged.ordinary_head(origin,&nonce,stream)?.ok_or_else(||anyhow::anyhow!("rebound ticket missing"))?;
+        assert!(!held.same_identity(&rebound));assert!(held.same_identity(&held.clone()));
+        assert!(staged.ordinary_effect_done(&held,None).is_err(),"old opaque ticket cannot settle a later binding");
+        staged.ordinary_effect_done(&rebound,Some((Refusal::Malformed,"é".repeat(ORDINARY_WHY_MAX))))?;
+        let shortened=staged.ordinary_ready(origin,&nonce,stream)?.ok_or_else(||anyhow::anyhow!("bounded refusal missing"))?;
+        assert!(shortened.has().nacks.iter().all(|n|n.code==Refusal::Malformed && n.why.len()<=ORDINARY_WHY_MAX && n.why.ends_with(" [truncated]")));
+        let mut bounded=Receiver::new();bounded.bind_ordinary(origin,&nonce,Has {stream:stream.into(),upto:0,nacks:vec![]},0)?;
+        for seq in 1..=(ORDINARY_PENDING-ORDINARY_URGENT_PENDING) as u64 {bounded.stage_ordinary(origin,&nonce,stream,seq,0,vec![1])?;}
+        assert_eq!(bounded.stage_ordinary(origin,&nonce,stream,1000,0,vec![1]),Err(OrdinaryStageRefusal::Full));
+        bounded.stage_ordinary_urgent(origin,&nonce,stream,63,0,vec![2])?;bounded.stage_ordinary_urgent(origin,&nonce,stream,64,0,vec![3])?;
+        assert_eq!(bounded.stage_ordinary_urgent(origin,&nonce,stream,65,0,vec![4]),Err(OrdinaryStageRefusal::Full));
+        let mut bytes=Receiver::new();bytes.bind_ordinary(origin,&nonce,Has {stream:stream.into(),upto:0,nacks:vec![]},0)?;
+        bytes.stage_ordinary(origin,&nonce,stream,1,0,vec![0;super::super::commands::ITEM_MOST])?;
+        let remainder=super::super::commands::ROOM-ORDINARY_URGENT_ROOM-super::super::commands::ITEM_MOST-2*ORDINARY_OUTCOME_ROOM;
+        bytes.stage_ordinary(origin,&nonce,stream,2,0,vec![0;remainder])?;
+        assert_eq!(bytes.stage_ordinary(origin,&nonce,stream,5,0,vec![0]),Err(OrdinaryStageRefusal::Full));
+        let effect=bytes.ordinary_head(origin,&nonce,stream)?.ok_or_else(||anyhow::anyhow!("reserved outcome missing"))?;
+        bytes.stage_ordinary_urgent(origin,&nonce,stream,3,0,vec![0;super::super::commands::ITEM_MOST])?;
+        bytes.stage_ordinary_urgent(origin,&nonce,stream,4,0,vec![0;super::super::commands::ITEM_MOST])?;
+        assert_eq!(bytes.stage_ordinary_urgent(origin,&nonce,stream,5,0,vec![0]),Err(OrdinaryStageRefusal::Full));
+        let peek=bytes.ordinary_peek_urgent(origin,&nonce,stream)?.ok_or_else(||anyhow::anyhow!("reserved urgent missing"))?;
+        let urgent=bytes.ordinary_urgent(origin,&nonce,stream,peek.seq())?.ok_or_else(||anyhow::anyhow!("reserved urgent unavailable"))?;
+        assert!(peek.same_identity(&urgent));
+        assert_eq!(bytes.stage_ordinary_urgent(origin,&nonce,stream,3,0,vec![0;super::super::commands::ITEM_MOST])?,OrdinaryArrival::Duplicate);
+        assert!(bytes.ordinary_urgent(origin,&nonce,stream,3)?.is_none());
+        bytes.ordinary_effect_done(&urgent,None)?;
+        let second=bytes.ordinary_peek_urgent(origin,&nonce,stream)?.ok_or_else(||anyhow::anyhow!("second reserved urgent missing"))?;
+        assert_eq!(second.seq(),4);
+        let second_reserved=bytes.ordinary_urgent(origin,&nonce,stream,second.seq())?.ok_or_else(||anyhow::anyhow!("second reserved control unavailable"))?;
+        assert!(second.same_identity(&second_reserved));bytes.ordinary_effect_done(&second_reserved,None)?;
+        assert!(bytes.ordinary_ready(origin,&nonce,stream)?.is_none());
+        bytes.ordinary_effect_done(&effect,Some((Refusal::Refused,"x".repeat(ORDINARY_WHY_MAX*2))))?;
+        assert!(bytes.ordinary_ready(origin,&nonce,stream)?.is_some(),"full raw input already reserved its known outcome");
+        let mut gap=Receiver::new();gap.bind_ordinary(origin,&nonce,Has {stream:stream.into(),upto:0,nacks:vec![]},0)?;
+        gap.stage_ordinary(origin,&nonce,stream,1,0,b"held".to_vec())?;let _head=gap.ordinary_head(origin,&nonce,stream)?;
+        assert!(matches!(gap.stage_ordinary_urgent(origin,&nonce,stream,3,0,b"urgent".to_vec())?,OrdinaryArrival::Gap(_)));
+        assert!(gap.ordinary_peek_urgent(origin,&nonce,stream)?.is_none());
+        gap.stage_ordinary(origin,&nonce,stream,2,0,b"earlier raw".to_vec())?;
+        assert!(gap.ordinary_peek_urgent(origin,&nonce,stream)?.is_some(),"gap arrival exposes SAME retained urgent without resend");
         Ok(())
     }
 

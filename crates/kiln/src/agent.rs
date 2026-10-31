@@ -409,18 +409,6 @@ impl DeferredControl {
     }
 }
 
-/// Republish a bounded page of the same stopped owners into the canonical retained outbox.
-/// Successful receipt ACKs may remove a hint; an owner still awaiting its ordered Stop barrier
-/// emits it again on the existing sample. This introduces no second delivery registry.
-async fn publish_closed_executor_hints(execs: &crate::runner::pool::Executors, spool: &retained::Spool) -> anyhow::Result<()> {
-    for said in execs.closed_owner_hints() {
-        let json = serde_json::to_string(&said)?;
-        let receipt = retained::Receipt::executor(&json)?.ok_or_else(|| anyhow::anyhow!("closed executor has no stopped receipt"))?;
-        spool.publish(&receipt).await?;
-    }
-    Ok(())
-}
-
 /// How long a cancelled job has to end before the runner reports it over and lets it go.
 const CANCEL_GRACE: Duration = Duration::from_secs(120);
 
@@ -446,10 +434,95 @@ enum Ev {
     /// A server frame about something another runner process of this machine handed over (or a
     /// rollback took back), handled as if the server had sent it here.
     Forwarded(Vec<u8>),
+    /// Completion of the one retained ordinary durability operation. It never runs children.
+    Ordinary(Box<OrdinaryDone>),
+    /// An exact buffered receiver ticket whose admission exclusion is already durable.
+    OrdinaryInput(crate::wire::channel::OrdinaryTicket),
+    /// This SAME local event has already entered the retained outbox.
+    UpDurable(Up),
     /// A test build's fault: the connection drops (W22-AC04).
     ChaosDrop,
     /// A test build's fault: a frame held back, due now (W22-AC04).
     Delayed(crate::runner::chaos::Due),
+}
+
+// U01/U03: one retained operation, polled by every event-loop select. The future is kept
+// here when another event wins; no task-per-frame or detached command continuation exists.
+type OrdinaryIo = futures::future::BoxFuture<'static, OrdinaryDone>;
+type Incoming = crate::wire::keep::OrdinaryIncomingState;
+type OrdinaryTicket = crate::wire::channel::OrdinaryTicket;
+type OrdinaryClosure = crate::wire::channel::OrdinaryClosure;
+struct PendingOrdinary { ticket: OrdinaryTicket, job: Option<String>, cancelled: bool }
+/// At most two typed continuations, paired with the SAME Receiver's urgent reserve.
+/// Raw bytes remain solely in Receiver. A duplicate never captures a newer same-id session.
+struct OrdinaryUrgent {
+    origin:crate::net::Connection,nonce:String,stream:String,seq:u64,hash:String,
+    session:String,target:Option<Arc<crate::harness::session::Session>>,command:crate::harness::model::Command,
+}
+fn complete_ordinary_urgent<T:crate::harness::host::Taker+?Sized>(receiver:&mut crate::wire::channel::Receiver,ticket:&OrdinaryTicket,target:&T,command:crate::harness::model::Command)->anyhow::Result<()> {
+    anyhow::ensure!(matches!(command,crate::harness::model::Command::Interrupt|crate::harness::model::Command::ForceStop),"only typed emergency controls may use early dispatch");
+    let refusal=(!target.hand(command)).then(||(crate::wire::channel::Refusal::Refused,"the originally captured session did not take its emergency control".into()));
+    receiver.ordinary_effect_done(ticket,refusal)?;Ok(())
+}
+enum SpoolWork {
+    Publish { up: Up, receipt: retained::Receipt },
+    Ack(serde_json::Value),
+    Sample { hints: Vec<retained::Receipt>, work: PathBuf, ordinary: bool, legacy: bool, records:Arc<dyn kiln_seams::records::Records>, nonce:String },
+}
+enum OrdinaryDone {
+    Initialized { spool: retained::Spool, epoch: Result<String,String> },
+    Registered { origin: crate::net::Connection, result: Box<anyhow::Result<Incoming>> },
+    Admitted { ticket: OrdinaryTicket, execution: Option<Arc<crate::runner::processes::Execution>>, result: Box<anyhow::Result<Incoming>> },
+    Closed { ticket: OrdinaryTicket, execution: Arc<crate::runner::processes::Execution>, reason: String, result: anyhow::Result<()> },
+    Committed { closure: OrdinaryClosure, result: Box<anyhow::Result<Incoming>> },
+    Spool { spool: retained::Spool, work: Box<SpoolWork>, result: anyhow::Result<Vec<AgentMsg>>, incoming:Box<Option<anyhow::Result<Option<Incoming>>>> },
+}
+async fn ordinary_completion(io: &mut Option<OrdinaryIo>) -> OrdinaryDone {
+    match io.as_mut() { Some(io) => io.await, None => futures::future::pending().await }
+}
+fn spool_io(mut spool: retained::Spool, work: SpoolWork) -> OrdinaryIo {
+    async move {
+        let result = async {
+            match &work {
+                SpoolWork::Publish { receipt, .. } => { spool.publish(receipt).await?; Ok(Vec::new()) },
+                SpoolWork::Ack(value) => {
+                    match value.get("kind").and_then(serde_json::Value::as_str) {
+                        Some("ordinary_frontier") => spool.received_ordinary(&serde_json::from_value::<kiln_ci::wire::OrdinaryFrontierAckV1>(value.clone())?).await?,
+                        Some(_) => anyhow::bail!("unknown retained acknowledgement kind"),
+                        None if value.get("kind").is_some() => anyhow::bail!("malformed retained acknowledgement kind"),
+                        None => spool.received(&serde_json::from_value::<retained::Receipt>(value.clone())?).await?,
+                    }
+                    Ok(Vec::new())
+                },
+                SpoolWork::Sample { hints, work, ordinary, legacy, .. } => {
+                    for hint in hints { spool.publish(hint).await?; }
+                    spool.import_stopped(work).await?;
+                    let mut messages=Vec::new();
+                    if *ordinary { for publication in spool.pending_ordinary().await? {
+                        let job=publication.owner.job.clone();
+                        let json=serde_json::to_string(&kiln_ci::wire::JobEventV2::OrdinaryExecutionPublication{publication})?;
+                        messages.push(AgentMsg::JobEvent{job,json});
+                    } }
+                    if *legacy { for receipt in spool.pending().await? { messages.push(receipt.message()?); } }
+                    Ok(messages)
+                },
+            }
+        }.await;
+        // Positive Gate import may advance this SAME incoming admission row. Return its
+        // complete authoritative state before the event owner resumes another normal head.
+        let incoming=match &work {
+            SpoolWork::Sample{records,nonce,..}=>Some(crate::wire::keep::load_ordinary_incoming(&**records,nonce).await),
+            _=>None,
+        };
+        OrdinaryDone::Spool { spool,work:Box::new(work),result,incoming:Box::new(incoming) }
+    }.boxed()
+}
+fn close_ordinary_io(ticket:OrdinaryTicket, execution:Arc<crate::runner::processes::Execution>, reason:String) -> OrdinaryIo {
+    async move {
+        let held=Arc::clone(&execution);
+        let result=crate::rt::blocking(move || held.close_ordinary_admission(true)).await.map_err(anyhow::Error::from).and_then(|result|result);
+        OrdinaryDone::Closed{ticket,execution,reason,result}
+    }.boxed()
 }
 
 /// Blue/green upgrade steps (`crate::bluegreen`) done off the event loop, back to it (none on
@@ -1251,7 +1324,43 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
     } else { None };
     // What the server last heard of it on this connection.
     let mut front_door_sent: Option<String> = None;
-    let mut retained_spool = retained::Spool::new_in(Arc::new(crate::records::from_database(&database, &runner_machine_namespace(&name))?), admission_paths.clone());
+    let ordinary_records: Arc<dyn kiln_seams::records::Records> = Arc::new(crate::records::from_database(&database, &runner_machine_namespace(&name))?);
+    let spool = retained::Spool::new_in(Arc::clone(&ordinary_records), admission_paths.clone());
+    let mut retained_spool = None;
+    // Initialize the SAME producer before strict readiness, without holding session ingress.
+    // Physical pre-feature drain and old-writer quiescence remain external prerequisites.
+    let (inventory,records)=(admission_paths.clone(),Arc::clone(&ordinary_records));
+    let mut ordinary_io: Option<OrdinaryIo> = Some(async move {
+        let epoch = async {
+            let pristine=crate::rt::blocking(move || crate::runner::processes::ordinary_inventory_present(&inventory).map(|present|!present)).await??;
+            let present=crate::wire::keep::ordinary_incoming_present(&*records).await?;
+            spool.initialize_ordinary(&crate::util::new_id(),pristine && !present).await
+        }.await.map_err(|error:anyhow::Error|format!("{error:#}"));
+        OrdinaryDone::Initialized{spool,epoch}
+    }.boxed());
+    let mut ordinary_epoch: Result<String,String> = Err("ordinary producer initialization pending".into());
+    let mut ordinary_incoming: Option<Incoming> = None;
+    let mut ordinary_stream: Option<String> = None;
+    // One failed completion may retry only on the existing sample opportunity. Unknown
+    // admission keeps the exact Gate separately and never retries a fresh creation.
+    let mut ordinary_paused=false;
+    let mut ordinary_pending: Option<PendingOrdinary> = None;
+    let mut ordinary_answer: Option<OrdinaryTicket> = None;
+    let mut ordinary_urgents=VecDeque::<OrdinaryUrgent>::new();
+    let mut spool_publication_pending=false;
+    let mut ordinary_dispatch: Option<OrdinaryTicket> = None;
+    let mut ordinary_execution: Option<Arc<crate::runner::processes::Execution>> = None;
+    // Unknown preparation keeps its exact Execution/Gate, never a new attempt or NoStart.
+    let mut ordinary_unknown: Option<(OrdinaryTicket,Option<Arc<crate::runner::processes::Execution>>)> = None;
+    let mut spool_waits=VecDeque::<SpoolWork>::new();
+    let mut spool_sample_due=false;
+    let mut durable_up:Option<Up>=None;
+    let mut ordinary_registered: Option<crate::net::Connection> = None;
+    // Once advertised on a connection, strict input cannot fall back to volatile legacy
+    // ACKs merely because local readiness later fences. Only actual route retirement clears it.
+    let mut ordinary_strict:Option<crate::net::Connection>=None;
+    let mut server_ordinary = false;
+    let mut local_wide_caps = 0u64;
     crate::runner::work::service::set_home(&o.work_dir, host_store.clone(), &name, o.declared.cache_max.as_deref().and_then(crate::runner::cache::parse_size));
     // U07/U15: finish canonical metadata imports before Hello can advertise runner work.
     crate::runner::work::service::ensure_ready().await?;
@@ -1658,12 +1767,90 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
 
     'events: loop {
         deferred_control.flush(&uplink.0)?;
+        if ordinary_registered.is_some() && ordinary_registered!=server_connection {
+            if let Some(origin)=ordinary_registered.take() {wire_in.retire_ordinary(origin);ordinary_urgents.retain(|urgent|urgent.origin!=origin);}
+            ordinary_stream=None;
+            if let Some(pending)=&mut ordinary_pending {pending.cancelled=true;}
+        }
         if let Some((stream, seq, refusal)) = answer_after.take() {
-            let a = match refusal {
-                Some((code, why)) => wire_in.refused(&stream, seq, code, why),
-                None => wire_in.took(&stream, seq),
+            if let Some(ticket)=ordinary_answer.take() {
+                // The strict requirement and origin came from intake, never current mutable Caps.
+                if ticket.stream()==stream && ticket.seq()==seq {
+                    if let Some(execution)=ordinary_execution.take() {
+                        let reason=refusal.map(|(_,why)|why).unwrap_or_else(||"the prepared ordinary Start was not consumed by its original handler".into());
+                        ordinary_pending=Some(PendingOrdinary{job:None,ticket:ticket.clone(),cancelled:true});
+                        ordinary_io=Some(close_ordinary_io(ticket,execution,reason));
+                    } else if let Err(error)=wire_in.ordinary_effect_done(&ticket,refusal) {
+                        tracing::warn!(error=%error,"strict effect remains owned without an ACK");
+                    }
+                }
+            } else {
+                let a=match refusal {Some((code,why))=>wire_in.refused(&stream,seq,code,why),None=>wire_in.took(&stream,seq)};
+                deferred_control.enqueue(&uplink.0,Up::Term(AgentMsg::Wire(a)))?;
+            }
+        }
+        if let (Some(origin),Some(stream))=(ordinary_registered,ordinary_stream.as_deref())
+            && Some(origin)==server_connection
+            && wire_in.ordinary_peek_urgent(origin,&process_nonce,stream)?.is_some()
+        {
+            for urgent in ordinary_urgents.iter().take(2).filter(|urgent|urgent.origin==origin && urgent.stream==stream) {
+                let Some(target)=urgent.target.as_ref() else {continue;};
+                if let Some(ticket)=wire_in.ordinary_urgent(origin,&urgent.nonce,&urgent.stream,urgent.seq)? {
+                    if ticket.body_hash()!=urgent.hash {ordinary_paused=true;continue;}
+                    if let Err(error)=complete_ordinary_urgent(&mut wire_in,&ticket,&**target,urgent.command.clone()) {
+                        ordinary_paused=true;tracing::warn!(error=%format!("{error:#}"),"urgent disposition remains under its original receiver ticket");
+                    }
+                }
+            }
+        }
+        // Start normal effects in order. Buffered later ordinary frames do not wait for a
+        // three-second retransmit; urgent exact tickets remain selectable during this I/O.
+        if ordinary_io.is_none() && ordinary_pending.is_none() && ordinary_unknown.is_none() && !ordinary_paused
+            && spool_waits.is_empty() && !spool_sample_due
+            && let (Some(origin),Some(stream))=(ordinary_registered,ordinary_stream.as_deref())
+            && Some(origin)==server_connection
+        {
+            let ready=match wire_in.ordinary_ready(origin,&process_nonce,stream) {
+                Ok(ready)=>ready,
+                Err(error)=>{ordinary_paused=true;tracing::warn!(error=%error,"strict completion waits for bounded authoritative progress");None},
             };
-            deferred_control.enqueue(&uplink.0, Up::Term(AgentMsg::Wire(a)))?;
+            if let Some(closure)=ready {
+                let records=Arc::clone(&ordinary_records);
+                ordinary_io=Some(async move {
+                    let result=crate::wire::keep::commit_ordinary_incoming(&*records,&closure).await;
+                    OrdinaryDone::Committed{closure,result:Box::new(result)}
+                }.boxed());
+            } else if !ordinary_paused && let Some(ticket)=wire_in.ordinary_head(origin,&process_nonce,stream)? {
+                let owner=match proto::read_server(ticket.body()) {
+                    Ok(ServerMsg::AssignV2{json})=>serde_json::from_str::<kiln_ci::wire::AssignmentV2>(&json).ok().and_then(|a|a.ordinary_owner),
+                    _=>None,
+                };
+                ordinary_pending=Some(PendingOrdinary{job:owner.as_ref().map(|owner|owner.job.clone()),ticket:ticket.clone(),cancelled:false});
+                let (paths,work,records,nonce)=(admission_paths.clone(),o.work_dir.clone(),Arc::clone(&ordinary_records),ticket.nonce().to_owned());
+                ordinary_io=Some(async move {
+                    let mut execution=None;
+                    let result=async {
+                        if let Some(owner)=owner {
+                            execution=Some(crate::rt::blocking(move || crate::runner::processes::Execution::ordinary_in(paths,work,owner)).await??);
+                        }
+                        let state=crate::wire::keep::accept_ordinary_incoming_state(&*records,&nonce,ticket.origin(),ticket.stream(),ticket.seq()).await?;
+                        if let Some(execution)=&execution {
+                            let held=Arc::clone(execution);
+                            crate::rt::blocking(move || held.close_ordinary_admission(false)).await??;
+                        }
+                        Ok(state)
+                    }.await;
+                    OrdinaryDone::Admitted{ticket,execution,result:Box::new(result)}
+                }.boxed());
+            }
+        }
+        if ordinary_io.is_none() && ordinary_dispatch.is_none() && ordinary_answer.is_none() && ordinary_execution.is_none() && let Some(spool)=retained_spool.take() {
+            if let Some(work)=spool_waits.pop_front() { ordinary_io=Some(spool_io(spool,work)); }
+            else if spool_sample_due {
+                spool_sample_due=false;
+                let hints=pool_execs.closed_owner_hints().iter().map(|said|serde_json::to_string(said).map_err(anyhow::Error::from).and_then(|json|retained::Receipt::executor(&json)?.context("closed executor lacks receipt"))).collect::<anyhow::Result<Vec<_>>>()?;
+                ordinary_io=Some(spool_io(spool,SpoolWork::Sample{hints,work:o.work_dir.clone(),ordinary:connected && welcomed && server_retained_received && ordinary_registered==server_connection && ordinary_registered.is_some(),legacy:connected && welcomed && server_retained_received,records:Arc::clone(&ordinary_records),nonce:process_nonce.clone()}));
+            } else { retained_spool=Some(spool); }
         }
         if let Some(until) = lingering
             && ((crate::observe::collect::get().is_none_or(|c| c.stopped()) && crate::observe::last_written()) || Instant::now() >= until)
@@ -1698,11 +1885,19 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
             crate::browser::driven::stop_all().await;
             return Ok(());
         }
-        let ev = if let Some(retry_at) = retained_blocked.as_ref().map(|(_, at)| *at) {
+        let ev = if let Some(ticket)=ordinary_dispatch.take() { Ev::OrdinaryInput(ticket) } else if let Some(up)=durable_up.take() { Ev::UpDurable(up) } else if spool_publication_pending {
+            futures::select_biased! {
+                ()=shutdown_or_tick(&shutdown,lingering.is_some()).fuse()=>Ev::Shutdown,
+                result=ordinary_completion(&mut ordinary_io).fuse()=>Ev::Ordinary(Box::new(result)),
+                ev=events.recv().fuse()=>Ev::Net(ev.ok()),
+                ()=sample_tick.tick().fuse()=>Ev::Sample,
+            }
+        } else if let Some(retry_at) = retained_blocked.as_ref().map(|(_, at)| *at) {
             // U03: hold later local events behind a failed spool commit, but keep consuming
             // server receipts and replay ticks so a full spool can make progress.
             futures::select_biased! {
                 () = shutdown_or_tick(&shutdown, lingering.is_some()).fuse() => Ev::Shutdown,
+                result = ordinary_completion(&mut ordinary_io).fuse() => Ev::Ordinary(Box::new(result)),
                 ev = events.recv().fuse() => Ev::Net(ev.ok()),
                 () = sample_tick.tick().fuse() => Ev::Sample,
                 () = sleep_until_opt(Some(retry_at)).fuse() => match retained_blocked.take() {
@@ -1713,6 +1908,7 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
         } else if deferred_control.pending.is_empty() {
             futures::select_biased! {
             () = shutdown_or_tick(&shutdown, lingering.is_some()).fuse() => Ev::Shutdown,
+            result = ordinary_completion(&mut ordinary_io).fuse() => Ev::Ordinary(Box::new(result)),
             ev = events.recv().fuse() => Ev::Net(ev.ok()),
             r = done_rx.recv().fuse() => match r { Ok((r, attempt)) => Ev::Done(r, attempt), Err(_) => Ev::Watchdog },
             () = heartbeat.tick().fuse() => Ev::Heartbeat,
@@ -1738,14 +1934,126 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
             () = sleep_until_opt(retire_at.filter(|_| retiring && jobs.is_empty() && terms.is_empty())).fuse() => Ev::Watchdog,
             }
         } else {
-            // Free room and append pending controls behind all already queued job events.
+            // Free room without making retained durability block network urgency.
             futures::select_biased! {
                 () = shutdown_or_tick(&shutdown, lingering.is_some()).fuse() => Ev::Shutdown,
+                result = ordinary_completion(&mut ordinary_io).fuse() => Ev::Ordinary(Box::new(result)),
+                ev = events.recv().fuse() => Ev::Net(ev.ok()),
                 up = up_rx.recv().fuse() => match up { Ok(up) => Ev::Up(up), Err(_) => Ev::Watchdog },
             }
         };
         match ev {
+            Ev::Ordinary(done) => {
+                ordinary_io=None;
+                match *done {
+                    OrdinaryDone::Initialized{spool,epoch}=> {
+                        retained_spool=Some(spool);ordinary_epoch=epoch;
+                        if let Err(error)=&ordinary_epoch {tracing::warn!(error,"ordinary admission remains fenced; existing sessions retain their owners");}
+                    },
+                    OrdinaryDone::Registered{origin,result}=>match *result {
+                        Ok(state)=> {
+                            ordinary_incoming=Some(state);ordinary_paused=false;
+                            if server_connection==Some(origin) && server_ordinary {
+                                ordinary_registered=Some(origin);ordinary_strict=Some(origin);
+                                deferred_control.enqueue(&uplink.0,Up::Term(AgentMsg::Caps{caps:local_wide_caps|proto::CAP_ORDINARY_EXECUTION_DEBT}))?;
+                                deferred_control.enqueue(&uplink.0,Up::Term(AgentMsg::Wire(wire_in.have())))?;
+                            }
+                        },
+                        Err(error)=>tracing::warn!(error=%format!("{error:#}"),"incoming binding not registered; strict readiness remains fenced"),
+                    },
+                    OrdinaryDone::Admitted{ticket,execution,result}=>match *result {
+                        Ok(state)=> {
+                            ordinary_incoming=Some(state);
+                            let same=ordinary_pending.as_ref().is_some_and(|pending|pending.ticket.same_identity(&ticket)
+                                && pending.ticket.body_hash()==ticket.body_hash());
+                            let valid=same && !shutdown.is_cancelled() && Some(ticket.origin())==server_connection && ordinary_registered==Some(ticket.origin());
+                            let cancelled=ordinary_pending.as_ref().is_some_and(|pending|pending.cancelled);
+                            if valid && !cancelled && wire_in.ordinary_admitted(&ticket).is_ok() {
+                                ordinary_execution=execution;ordinary_dispatch=Some(ticket);
+                            } else if let Some(execution)=execution {
+                                ordinary_io=Some(close_ordinary_io(ticket,execution,"the original pending Start was cancelled or its incoming authority retired".into()));
+                            } else {ordinary_pending=None;}
+                        },
+                        Err(error)=> {
+                            tracing::warn!(error=%format!("{error:#}"),"original admission remains unknown; no effect or wire answer is invented");
+                            ordinary_unknown=Some((ticket,execution));ordinary_pending=None;
+                        },
+                    },
+                    OrdinaryDone::Closed{ticket,execution,reason,result}=> {
+                        match result {
+                            Ok(())=> {
+                                if Some(ticket.origin())==server_connection && ordinary_registered==Some(ticket.origin()) {
+                                    if let Err(error)=wire_in.ordinary_effect_done(&ticket,Some((crate::wire::channel::Refusal::Refused,reason))) {
+                                        tracing::debug!(error=%error,"retired incoming ticket has durable NoStart evidence; no successor ACK or effect");
+                                    }
+                                }
+                            },
+                            Err(error)=> {
+                                tracing::warn!(error=%format!("{error:#}"),"NoStart remains unknown under the original Gate");
+                                ordinary_unknown=Some((ticket,Some(execution)));
+                            },
+                        }
+                        ordinary_pending=None;
+                    },
+                    OrdinaryDone::Committed{closure,result}=>match *result {
+                        Ok(state)=> {
+                            ordinary_incoming=Some(state);
+                            if Some(closure.origin())==server_connection && ordinary_registered==Some(closure.origin()) {
+                                match wire_in.ordinary_committed(&closure) {
+                                    Ok(frame)=> {
+                                        ordinary_urgents.retain(|urgent|urgent.origin!=closure.origin() || urgent.stream!=closure.has().stream || urgent.seq>closure.has().upto);
+                                        deferred_control.enqueue(&uplink.0,Up::Term(AgentMsg::Wire(frame)))?;
+                                    },
+                                    Err(error)=>tracing::debug!(error=%error,"old incoming closure committed; retired opaque authority cannot ACK its successor"),
+                                }
+                            }
+                        },
+                        Err(error)=>{ordinary_paused=true;tracing::warn!(error=%format!("{error:#}"),"strict completion remains unacknowledged under its exact origin until the existing sample opportunity");},
+                    },
+                    OrdinaryDone::Spool{spool,work,result,incoming}=> {
+                        let (work,incoming)=(*work,*incoming);
+                        retained_spool=Some(spool);
+                        if matches!(&work,SpoolWork::Publish{..}) {spool_publication_pending=false;}
+                        if let Some(incoming)=incoming {
+                            match incoming {
+                                Ok(Some(state))=> {
+                                    if let (Some(origin),Some(stream))=(ordinary_registered,ordinary_stream.as_deref()) {
+                                        let refreshed=state.for_stream(origin,&process_nonce,stream).and_then(|(has,admitted)|wire_in.refresh_ordinary(origin,&process_nonce,has,admitted).map_err(anyhow::Error::from));
+                                        if let Err(error)=refreshed {
+                                            ordinary_paused=true;
+                                            tracing::warn!(error=%format!("{error:#}"),"import changed incoming authority; strict readiness fenced before further effects");
+                                            wire_in.retire_ordinary(origin);ordinary_urgents.retain(|urgent|urgent.origin!=origin);ordinary_registered=None;ordinary_stream=None;
+                                            if let Some(pending)=&mut ordinary_pending {pending.cancelled=true;}
+                                        }
+                                    }
+                                    ordinary_incoming=Some(state);
+                                },
+                                Ok(None) if ordinary_registered.is_some()=>{ordinary_paused=true;tracing::warn!("registered ordinary incoming metadata missing; no fresh state inferred");},
+                                Ok(None)=>{},
+                                Err(error)=>{ordinary_paused=true;tracing::warn!(error=%format!("{error:#}"),"incoming cache refresh unknown; normal heads remain held");},
+                            }
+                        }
+                        match (work,result) {
+                            (SpoolWork::Publish{up,..},Ok(_))=>durable_up=Some(up),
+                            (SpoolWork::Publish{up,..},Err(error))=> {
+                                tracing::warn!(error=%format!("{error:#}"),"retained local event still awaits durable publication");
+                                retained_blocked=Some((up,Instant::now()+Duration::from_secs(1)));
+                            },
+                            (_,Ok(messages))=>for message in messages {
+                                if let AgentMsg::JobEvent{json,..}=&message
+                                    && matches!(serde_json::from_str::<kiln_ci::wire::JobEventV2>(json),Ok(kiln_ci::wire::JobEventV2::OrdinaryExecutionPublication{..}))
+                                    && (ordinary_registered.is_none() || ordinary_registered!=server_connection) {continue;}
+                                if let AgentMsg::Executor{json}=&message && let Ok(said)=serde_json::from_str::<crate::runner::pool::Said>(json) {pool_execs.recovered(&said);}
+                                deferred_control.enqueue(&uplink.0,Up::Msg(message))?;
+                            },
+                            (_,Err(error))=>tracing::warn!(error=%format!("{error:#}"),"retained operation remains recoverable in its original owner"),
+                        }
+                    },
+                }
+            }
             Ev::Shutdown => {
+                draining=true;
+                if let Some(pending)=&mut ordinary_pending {pending.cancelled=true;}
                 if lingering.is_some() {
                     continue;
                 }
@@ -2167,7 +2475,12 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
             Ev::Net(None) => anyhow::bail!("transport stopped"),
             Ev::Net(Some(NetEvent::Connected { peer, epoch, binding, .. })) => {
                 if peer == SERVER_PEER {
+                    if let Some(old)=ordinary_registered.take() {wire_in.retire_ordinary(old);ordinary_urgents.retain(|urgent|urgent.origin!=old);}
+                    ordinary_stream=None;
+                    if let Some(pending)=&mut ordinary_pending {pending.cancelled=true;}
                     server_connection = binding.map(|binding| crate::net::Connection::new(peer, epoch, binding));
+                    ordinary_registered = None;ordinary_strict=None;ordinary_urgents.clear();
+                    server_ordinary = false;
                     server_layout = None;
                     server_activation = None;
                 }
@@ -2243,7 +2556,8 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                     let ownership = if !o.outpost && cfg!(any(target_os = "linux", target_os = "macos", windows)) { proto::CAP_RESOURCE_OWNERSHIP } else { 0 };
                     let firecracker_shape = if !o.outpost && cfg!(target_os = "linux") { proto::CAP_FIRECRACKER_SHAPE } else { 0 };
                     let amphora = if carrier_active.load(std::sync::atomic::Ordering::Acquire) { proto::CAP_AMPHORA } else { 0 };
-                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | proto::CAP_HARNESS_RELEASE | proto::CAP_JOB_ATTEMPT | proto::CAP_RETAINED_RECEIVED | ownership | firecracker_shape | open_once | work | limit | proto::CAP_IDENTITY | headroom_cap | amphora | proto::CAP_UNREAD | proto::CAP_UNIFIED_LAYOUT | if explicit_activation { proto::CAP_EXPLICIT_ACTIVATION } else { 0 } }) {
+                    local_wide_caps = built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | proto::CAP_HARNESS_RELEASE | proto::CAP_JOB_ATTEMPT | proto::CAP_RETAINED_RECEIVED | ownership | firecracker_shape | open_once | work | limit | proto::CAP_IDENTITY | headroom_cap | amphora | proto::CAP_UNREAD | proto::CAP_UNIFIED_LAYOUT | if explicit_activation { proto::CAP_EXPLICIT_ACTIVATION } else { 0 };
+                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: local_wide_caps }) {
                         net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                     }
                 }
@@ -2352,10 +2666,16 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                 }
                 dial_backoff = (dial_backoff * 2).min(Duration::from_secs(30));
             }
-            event @ (Ev::Net(Some(NetEvent::Frame { .. })) | Ev::Forwarded(_)) => {
+            event @ (Ev::Net(Some(NetEvent::Frame { .. })) | Ev::Forwarded(_) | Ev::OrdinaryInput(_)) => {
                 let (data, origin) = match event {
                     Ev::Net(Some(NetEvent::Frame { data, connection, .. })) => (data, connection),
                     Ev::Forwarded(data) => (data, None),
+                    Ev::OrdinaryInput(ticket) => {
+                        answer_after=Some((ticket.stream().into(),ticket.seq(),None));
+                        ordinary_pending=None;
+                        let pair=(ticket.body().to_vec(),Some(ticket.origin()));
+                        ordinary_answer=Some(ticket);pair
+                    },
                     _ => continue 'events,
                 };
                 let current_origin = origin.is_some() && origin == server_connection;
@@ -2365,6 +2685,7 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                     // The server hears of it, when it takes word of it (docs/wire.md, "What can't
                     // be read"), and notes it against this runner.
                     Err(e) => {
+                        if ordinary_answer.is_some() {refuse(&mut answer_after,e.code().refusal(),e.why("ServerMsg"));continue 'events;}
                         tracing::warn!(what = %e.what(), why = %e.why("ServerMsg"), "a frame from the server couldn't be read");
                         if server_unread && let Some(folded) = told.tell(Instant::now(), crate::wire::unread::Wire::Server, e.code(), &e.what(), &e.why("ServerMsg")) {
                             uplink.msg(AgentMsg::Unread { wire: crate::wire::unread::Wire::Server, what: e.what(), code: e.code(), why: e.why("ServerMsg"), folded, session: None }).await;
@@ -2375,7 +2696,10 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                 // A command on the channel (docs/wire.md, "Commands"): taken once, however often
                 // it comes, then applied as if it had come alone, and answered at the top of the
                 // next turn of the loop.
-                let (msg, data) = 'item: {
+                if ordinary_answer.is_some() && matches!(msg,ServerMsg::Wire(_)) {
+                    refuse(&mut answer_after,crate::wire::channel::Refusal::Malformed,"a channel frame inside a command");continue 'events;
+                }
+                let (msg, data) = if ordinary_answer.is_some() {(msg,data)} else { 'item: {
                     match msg {
                         ServerMsg::Wire(crate::wire::channel::Frame::Item { stream, seq, low, body }) => {
                             use crate::wire::channel::{Arrival, Refusal};
@@ -2400,6 +2724,60 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                                 && let Ok(ask) = crate::wire::payload::<crate::runner::pool::Ask>(crate::wire::unread::Wire::ServerPayload, "Executor", json)
                                 && pool_execs.requires_order(&ask)
                             { continue 'events; }
+                            let strict_ordinary = current_origin && ordinary_strict==origin && origin.is_some()
+                                && crate::wire::commands::kind_of(&stream) == Some(crate::wire::commands::Kind::Live);
+                            if let Ok(ServerMsg::AssignV2 { json }) = &inner {
+                                #[derive(Deserialize)]
+                                struct Header { #[serde(default)] ordinary_owner: Option<kiln_ci::wire::OrdinaryOwnerV1> }
+                                if let Ok(header) = serde_json::from_str::<Header>(json) && let Some(owner) = header.ordinary_owner {
+                                    let valid = owner.validate().is_ok() && strict_ordinary && owner.host == name && owner.process_nonce == process_nonce
+                                        && origin.is_some_and(|origin| owner.connection == origin.channel_id()) && owner.command.stream == stream && owner.command.seq == seq
+                                        && ordinary_epoch.as_ref().is_ok_and(|epoch| *epoch == owner.publication_epoch);
+                                    if !valid { tracing::warn!("ordinary Start refused before admission: original owner/stamp/domain mismatch"); continue 'events; }
+                                }
+                            }
+                            if strict_ordinary && let Some(actual)=origin {
+                                use crate::wire::channel::OrdinaryArrival;
+                                if ordinary_registered!=Some(actual) {continue 'events;}
+                                if ordinary_stream.as_deref()!=Some(stream.as_str()) {
+                                    let Some(state)=&ordinary_incoming else {continue 'events;};
+                                    let (has,admitted)=match state.for_stream(actual,&process_nonce,&stream) {
+                                        Ok(state)=>state,Err(error)=>{tracing::warn!(error=%format!("{error:#}"),"strict stream lacks cached authoritative admission");continue 'events;},
+                                    };
+                                    match wire_current.of(&stream) {
+                                        crate::wire::commands::Stand::Gone=>continue 'events,
+                                        crate::wire::commands::Stand::Newer(_)|crate::wire::commands::Stand::Current=>{},
+                                    }
+                                    wire_in.retire_ordinary(actual);ordinary_urgents.retain(|urgent|urgent.origin!=actual);
+                                    if let Some(pending)=&mut ordinary_pending {pending.cancelled=true;}
+                                    if let Err(error)=wire_in.bind_ordinary(actual,&process_nonce,has,admitted) {
+                                        ordinary_paused=true;tracing::warn!(error=%error,"strict receiver binding remains fenced");continue 'events;
+                                    }
+                                    ordinary_stream=Some(stream.clone());
+                                }
+                                let typed=match &inner {
+                                    Ok(ServerMsg::HarnessCmd{session,json})=>serde_json::from_str::<crate::harness::model::Command>(json).ok().filter(|command|matches!(command,crate::harness::model::Command::Interrupt|crate::harness::model::Command::ForceStop)).map(|command|(session.clone(),command)),
+                                    _=>None,
+                                };
+                                let capture=typed.as_ref().filter(|_|!ordinary_urgents.iter().any(|urgent|urgent.origin==actual && urgent.stream==stream && urgent.seq==seq)).map(|(session,command)|OrdinaryUrgent{
+                                    origin:actual,nonce:process_nonce.clone(),stream:stream.clone(),seq,hash:crate::util::sha256_hex(&body),session:session.clone(),target:harness.as_ref().and_then(|host|host.get(session)),command:command.clone(),
+                                });
+                                let staged=match if typed.is_some() {wire_in.stage_ordinary_urgent(actual,&process_nonce,&stream,seq,low,body)} else {wire_in.stage_ordinary(actual,&process_nonce,&stream,seq,low,body)} {
+                                    Ok(staged)=>staged,
+                                    Err(error)=>{tracing::warn!(error=%error,"strict input was not admitted; existing sender retains it");continue 'events;},
+                                };
+                                if matches!(&staged,OrdinaryArrival::Queued|OrdinaryArrival::Gap(_)) && let Some(capture)=capture {
+                                    // Core bounds TWO urgent items; this holds only their typed target
+                                    // custody, never another raw queue or a newest-target lookup.
+                                    anyhow::ensure!(ordinary_urgents.len()<2,"urgent continuation reserve diverged from its SAME receiver");
+                                    ordinary_urgents.push_back(capture);
+                                }
+                                match staged {
+                                    OrdinaryArrival::Answered(frame)|OrdinaryArrival::Gap(frame)=>deferred_control.enqueue(&uplink.0,Up::Term(AgentMsg::Wire(frame)))?,
+                                    OrdinaryArrival::Queued|OrdinaryArrival::Duplicate|OrdinaryArrival::AdmittedPending=>{},
+                                }
+                                continue 'events;
+                            }
                             // A command stream's newer generation: the ones before it are done with,
                             // and an item of one of those that comes late isn't taken again.
                             match wire_current.of(&stream) {
@@ -2407,12 +2785,19 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                                 crate::wire::commands::Stand::Newer(prefix) => wire_in.forget_where(|s| s != stream && crate::wire::commands::prefix_of(s) == Some(prefix)),
                                 crate::wire::commands::Stand::Current => {}
                             }
-                            let answer = match wire_in.on_item(&stream, seq, low, body) {
+                            let arrival = if strict_ordinary { wire_in.on_item_strict(&stream,seq,low,body) } else { wire_in.on_item(&stream,seq,low,body) };
+                            let answer = match arrival {
                                 Arrival::Take(body) => match inner {
                                     Ok(ServerMsg::Wire(_)) => {
                                         let why = "a channel frame inside a command";
                                         if server_unread && let Some(folded) = told.tell(Instant::now(), crate::wire::unread::Wire::ServerItem, crate::wire::unread::Code::Malformed, "Wire", why) {
                                             uplink.msg(AgentMsg::Unread { wire: crate::wire::unread::Wire::ServerItem, what: "Wire".to_owned(), code: crate::wire::unread::Code::Malformed, why: why.to_owned(), folded, session: None }).await;
+                                        }
+                                        if strict_ordinary {
+                                            // Refusal closes this SAME incoming sequence just like
+                                            // accepted work. Do not ACK a volatile-only prefix.
+                                            answer_after = Some((stream,seq,Some((Refusal::Malformed,why.into()))));
+                                            continue 'events;
                                         }
                                         wire_in.refused(&stream, seq, Refusal::Malformed, why)
                                     }
@@ -2426,6 +2811,10 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                                         if server_unread && let Some(folded) = told.tell(Instant::now(), crate::wire::unread::Wire::ServerItem, e.code(), &e.what(), &e.why("ServerMsg")) {
                                             uplink.msg(AgentMsg::Unread { wire: crate::wire::unread::Wire::ServerItem, what: e.what(), code: e.code(), why: e.why("ServerMsg"), folded, session: None }).await;
                                         }
+                                        if strict_ordinary {
+                                            answer_after = Some((stream,seq,Some((e.code().refusal(),e.why("ServerMsg")))));
+                                            continue 'events;
+                                        }
                                         wire_in.refused(&stream, seq, e.code().refusal(), e.why("ServerMsg"))
                                     }
                                 },
@@ -2437,7 +2826,7 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                         }
                         m => (m, data),
                     }
-                };
+                }};
                 // Validate the semantic message after channel unwrapping. A forwarded inner
                 // Caps cannot establish a TLS connection's proof, nor can a former connection
                 // lend that proof to any private effect on a replacement.
@@ -2487,10 +2876,32 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                 let msg = match msg {
                     Carried::Nothing(m) => m,
                     Carried::Read(FromServer::RetainedReceived(receipt)) => {
-                        if server_retained_received
-                            && let Err(error) = retained_spool.received(&receipt).await
-                        {
-                            tracing::warn!(error = %format!("{error:#}"), "retained receipt could not be committed; evidence remains for replay");
+                        if !server_retained_received || !current_origin { continue; }
+                        match receipt.get("kind").and_then(serde_json::Value::as_str) {
+                            Some("ordinary_domain")=> {
+                                if ordinary_registered==origin && origin.is_some() {continue;}
+                                let epoch=receipt.get("epoch").and_then(serde_json::Value::as_str);
+                                if receipt.get("version").and_then(serde_json::Value::as_u64)==Some(1) && server_ordinary
+                                    && ordinary_epoch.as_ref().is_ok_and(|own|Some(own.as_str())==epoch) && !o.outpost && executor_bootstrap.is_none()
+                                    && ordinary_io.is_none() && let Some(origin)=origin
+                                {
+                                    let (records,nonce)=(Arc::clone(&ordinary_records),process_nonce.clone());
+                                    ordinary_io=Some(async move {
+                                        let result=async {
+                                            let loaded=crate::wire::keep::load_ordinary_incoming(&*records,&nonce).await?;
+                                            crate::wire::keep::register_ordinary_incoming(&*records,&nonce,origin,loaded.as_ref()).await
+                                        }.await;
+                                        OrdinaryDone::Registered{origin,result:Box::new(result)}
+                                    }.boxed());
+                                }
+                            },
+                            Some("ordinary_frontier") if ordinary_registered!=origin || origin.is_none()=>tracing::warn!("ordinary frontier ACK lacks its registered origin"),
+                            _=> {
+                                // No proof is retired by dropping an unadmitted ACK: the same
+                                // bounded outbox replays and obtains it again. No ACK-of-ACK exists.
+                                if spool_waits.len()<64 && serde_json::to_vec(&*receipt).is_ok_and(|bytes|bytes.len()<=65_536) {spool_waits.push_back(SpoolWork::Ack(*receipt));}
+                                else {tracing::warn!("retained ACK ingress is full; original proof remains replayable");}
+                            },
                         }
                         continue;
                     }
@@ -2543,6 +2954,17 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                     }
                     Carried::Read(FromServer::HarnessCmd { session, command }) => {
                         use crate::wire::channel::Refusal;
+                        if let Some(ticket)=&ordinary_answer
+                            && let Some(urgent)=ordinary_urgents.iter().find(|urgent|urgent.origin==ticket.origin() && urgent.stream==ticket.stream() && urgent.seq==ticket.seq() && urgent.hash==ticket.body_hash())
+                        {
+                            match &urgent.target {
+                                Some(target)=> {
+                                    if !target.command(*command) {refuse(&mut answer_after,Refusal::Refused,"the originally captured session did not take its emergency control");}
+                                },
+                                None=>refuse(&mut answer_after,Refusal::Unknown,format!("no session {} existed at the original emergency intake",urgent.session)),
+                            }
+                            continue;
+                        }
                         let known = harness.as_ref().is_some_and(|h| h.get(&session).is_some());
                         match *command {
                             // The server's word on a hand-over to this machine's newer runner
@@ -2713,10 +3135,41 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                         // A pool's leg runs in its executor, beside this runner's own slots.
                         let pooled = a.executor.slot.is_some();
                         let holds = kiln_ci::sched::state::Incoming::of(a.exclusive, &a.holds.unwrap_or_default());
+                        let ordinary = if !pooled && executor_bootstrap.is_none() && !matches!(a.executor.kind.as_str(),"k8s" | "firecracker") {
+                            let owner = a.ordinary_owner.clone();
+                            let valid = owner.as_ref().is_some_and(|owner| owner.validate().is_ok() && owner.job == id && Some(owner.attempt) == attempt
+                                && owner.host == name && owner.process_nonce == process_nonce && ordinary_epoch.as_ref().is_ok_and(|epoch| *epoch == owner.publication_epoch)
+                                && current_origin && ordinary_registered == origin && origin.is_some_and(|origin| origin.channel_id() == owner.connection)
+                                && answer_after.as_ref().is_some_and(|(stream,seq,_)| stream == &owner.command.stream && *seq == owner.command.seq));
+                            if !valid { refuse(&mut answer_after,crate::wire::channel::Refusal::Unsupported,"ordinary assignment requires its initialized, registered original grant and Live stamp"); continue; }
+                            let owner = owner.context("ordinary checked owner disappeared")?;
+                            if jobs.get(&id).is_some_and(|job| job.execution.identity() == owner.execution) {
+                                // Across ALL deliveries this grant already started: never report NoStart.
+                                refuse(&mut answer_after,crate::wire::channel::Refusal::Refused,"the original ordinary grant is already accepted");
+                                continue;
+                            }
+                            match ordinary_execution.take() {
+                                Some(execution) if execution.identity()==owner.execution=>Some(execution),
+                                _=> {
+                                    // No raw or inherited fallback. The authoritative head must
+                                    // finish Gate/prefix/latch preparation before this continuation.
+                                    refuse(&mut answer_after,crate::wire::channel::Refusal::Refused,"ordinary Start lacks its exact prepared continuation");continue;
+                                },
+                            }
+                        } else {
+                            if a.ordinary_owner.is_some() { refuse(&mut answer_after,crate::wire::channel::Refusal::Refused,"ordinary grant cannot change to an inherited/managed executor"); continue; }
+                            None
+                        };
                         let room = admits(o.slots, size, jobs.values().map(|j| (j.pooled, j.holds)), pooled, holds);
-                        if o.outpost || draining || room.is_err() || jobs.contains_key(&id) {
-                            let reason = if o.outpost { OUTPOST_TAKES_NO_JOBS } else if draining { "draining" } else { room.err().unwrap_or("no free slot") };
-                            uplink.msg(AgentMsg::Reject { job: id, reason: reason.into() }).await;
+                        if o.outpost || draining || shutdown.is_cancelled() || room.is_err() || jobs.contains_key(&id) {
+                            let reason = if o.outpost { OUTPOST_TAKES_NO_JOBS } else if draining || shutdown.is_cancelled() { "draining" } else { room.err().unwrap_or("no free slot") };
+                            if let Some(execution)=ordinary {
+                                let ticket=ordinary_answer.take().context("ordinary refusal lost its exact ticket")?;
+                                answer_after=None;
+                                ordinary_pending=Some(PendingOrdinary{job:Some(id.clone()),ticket:ticket.clone(),cancelled:true});
+                                ordinary_io=Some(close_ordinary_io(ticket,execution,reason.into()));
+                            }
+                            uplink.msg(AgentMsg::Reject { job:id,reason:reason.into() }).await;
                             continue;
                         }
                         // Server-relative URLs go through the address this runner reached the server
@@ -2749,6 +3202,7 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                         // U03: select and bind the exact physical owner before Running or its
                         // cancellation timer exists. A canonical executor can never silently
                         // fall back to a fresh root or acquire another host reservation.
+                        let ordinary_refusal = ordinary.clone();
                         let selected: anyhow::Result<(Arc<crate::runner::processes::Execution>, Option<crate::runner::pool::Warm>, Option<std::fs::File>)> = async {
                             if let Some(bootstrap) = &executor_bootstrap {
                                 return Ok((bootstrap.execution_for(admission_paths.clone(), &a, o.work_dir.clone())?, None, None));
@@ -2774,11 +3228,17 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                             }
                             anyhow::ensure!(a.parent_binding.is_none(), "parent-bound assignment has no verified enrolled or warm executor");
                             anyhow::ensure!(!matches!(a.executor.kind.as_str(), "firecracker" | "k8s"), "a managed executor assignment requires its canonical startup identity");
-                            Ok((crate::runner::processes::Execution::new_in(admission_paths.clone(), o.work_dir.clone(), id.clone(), attempt), None, Some(admission)))
+                            Ok((ordinary.context("native assignment has no exact ordinary execution")?, None, Some(admission)))
                         }.await;
                         let (execution, warm, admission) = match selected {
                             Ok(selected) => selected,
                             Err(error) => {
+                                if let Some(execution)=ordinary_refusal {
+                                    let ticket=ordinary_answer.take().context("ordinary selection refusal lost its exact ticket")?;
+                                    answer_after=None;
+                                    ordinary_pending=Some(PendingOrdinary{job:Some(id.clone()),ticket:ticket.clone(),cancelled:true});
+                                    ordinary_io=Some(close_ordinary_io(ticket,execution,format!("U03 exact executor ownership: {error:#}")));
+                                }
                                 deferred_control.enqueue(&uplink.0, Up::Msg(AgentMsg::Reject { job: id, reason: format!("U03 exact executor ownership: {error:#}") }))?;
                                 continue;
                             }
@@ -2870,13 +3330,15 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                         server_layout = origin.filter(|_| caps & proto::CAP_UNIFIED_LAYOUT != 0);
                         server_activation = server_layout.filter(|_| caps & proto::CAP_EXPLICIT_ACTIVATION != 0);
                         server_shaped_commands = caps & proto::CAP_FIRECRACKER_SHAPE != 0;
-                        if caps & (proto::CAP_FIRECRACKER_SHAPE | proto::CAP_EXPLICIT_ACTIVATION) != 0 && !o.outpost {
+                        server_ordinary = caps & proto::CAP_ORDINARY_EXECUTION_DEBT != 0 && current_origin;
+                        if caps & (proto::CAP_FIRECRACKER_SHAPE | proto::CAP_EXPLICIT_ACTIVATION | proto::CAP_ORDINARY_EXECUTION_DEBT) != 0 && !o.outpost {
                             // U16's process association also applies to a supervised macOS runner.
                             deferred_control.enqueue(&uplink.0, Up::Term(AgentMsg::RunnerProcess { nonce: process_nonce.clone() }))?;
+                            if server_ordinary && executor_bootstrap.is_none() && let Ok(epoch) = &ordinary_epoch {
+                                deferred_control.enqueue(&uplink.0, Up::Term(AgentMsg::JobEvent { job: "@kiln/ordinary-domain".into(), json: serde_json::to_string(&kiln_ci::wire::JobEventV2::OrdinaryDomain { epoch: epoch.clone(), process_nonce: process_nonce.clone() })? }))?;
+                            }
                         }
-                        if caps & proto::CAP_FIRECRACKER_SHAPE != 0 && !o.outpost && cfg!(target_os = "linux") && let Err(error) = publish_closed_executor_hints(&pool_execs, &retained_spool).await {
-                            tracing::warn!(error = %format!("{error:#}"), "closed executor hints remain owned pending durable publication");
-                        }
+                        if caps & proto::CAP_FIRECRACKER_SHAPE != 0 && !o.outpost && cfg!(target_os="linux") {spool_sample_due=true;}
                         // An identity of this process's own, for a key it made and keeps, certified
                         // on each connection (docs/ci.md W27-R01).
                         server_identity = caps & proto::CAP_IDENTITY != 0 && !o.ephemeral;
@@ -3136,6 +3598,10 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                         }));
                     }
                     ServerMsg::Cancel { job, reason } => {
+                        if let Some(pending)=ordinary_pending.as_mut().filter(|pending|pending.job.as_deref()==Some(job.as_str())) {
+                            pending.cancelled=true;
+                            continue;
+                        }
                         if let Some(r) = jobs.get(&job) {
                             tracing::info!(%job, %reason, "cancelling job");
                             r.cancel.cancel();
@@ -3724,21 +4190,20 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                     uplink.0.send(Up::Term(msg)).await.ok();
                 }
             }
-            Ev::Up(mut up) => {
+            event @ (Ev::Up(_) | Ev::UpDurable(_)) => {
+                let (mut up,already_durable)=match event {Ev::Up(up)=>(up,false),Ev::UpDurable(up)=>(up,true),_=>continue};
                 // U03: commit retained evidence before its first transmission. Completion
                 // receipts never clear this independent crash-replay outbox.
                 let retained_evidence = match &up {
-                    Up::Msg(AgentMsg::JobEvent { job, json }) => retained::Receipt::of(job, json)?,
+                    Up::Msg(AgentMsg::JobEvent { job, json }) => retained::Receipt::of(job, json)?.filter(|receipt| receipt.event.get("ordinary_grant").is_none()),
                     Up::Msg(AgentMsg::Executor { json }) => retained::Receipt::executor(json)?,
                     _ => None,
                 };
-                if let Some(receipt) = retained_evidence
-                    && let Err(error) = retained_spool.publish(&receipt).await
-                {
-                    tracing::warn!(error = %format!("{error:#}"), "retained evidence is waiting for durable outbox acceptance");
-                    // Exactly one failed local event waits. Continue receiving server ACKs
-                    // and replaying the durable spool; later local events cannot overtake it.
-                    retained_blocked = Some((up, Instant::now() + Duration::from_secs(1)));
+                if !already_durable && let Some(receipt)=retained_evidence {
+                    if ordinary_io.is_none() && let Some(spool)=retained_spool.take() {
+                        spool_publication_pending=true;
+                        ordinary_io=Some(spool_io(spool,SpoolWork::Publish{up,receipt}));
+                    } else {retained_blocked=Some((up,Instant::now()+Duration::from_secs(1)));}
                     continue 'events;
                 }
                 if let Up::Msg(AgentMsg::Executor { json }) = &up
@@ -3923,29 +4388,16 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                 }
             }
             Ev::Sample => {
-                if let Err(error) = publish_closed_executor_hints(&pool_execs, &retained_spool).await {
-                    tracing::warn!(error = %format!("{error:#}"), "closed executor hints remain owned pending durable publication");
+                ordinary_paused=false;
+                if connected && welcomed && server_ordinary && ordinary_registered != server_connection && !o.outpost && executor_bootstrap.is_none()
+                    && let Ok(epoch) = &ordinary_epoch
+                {
+                    // Registration is idempotent and retried by this existing sample owner;
+                    // a lost ACK never promotes readiness or needs another controller.
+                    deferred_control.enqueue(&uplink.0, Up::Term(AgentMsg::RunnerProcess { nonce:process_nonce.clone() }))?;
+                    deferred_control.enqueue(&uplink.0, Up::Term(AgentMsg::JobEvent { job:"@kiln/ordinary-domain".into(),json:serde_json::to_string(&kiln_ci::wire::JobEventV2::OrdinaryDomain { epoch:epoch.clone(),process_nonce:process_nonce.clone() })? }))?;
                 }
-                if let Err(error) = retained_spool.import_stopped(&o.work_dir).await {
-                    tracing::warn!(error = %format!("{error:#}"), "stopped execution evidence remains fenced pending durable outbox import");
-                }
-                if connected && welcomed && server_retained_received {
-                    match retained_spool.pending().await {
-                        Ok(pending) => for receipt in pending {
-                            if let Ok(message) = receipt.message() {
-                                // The local canonical importer already committed this exact Gate
-                                // proof. Keep the live producer's map until its ordered barrier.
-                                if let AgentMsg::Executor { json } = &message
-                                    && let Ok(said) = serde_json::from_str::<crate::runner::pool::Said>(json)
-                                { pool_execs.recovered(&said); }
-                                if let Ok(bytes) = proto::encode(&message) {
-                                    net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, bytes).await;
-                                }
-                            }
-                        },
-                        Err(error) => tracing::warn!(error = %format!("{error:#}"), "retained evidence replay is waiting for Amphora"),
-                    }
-                }
+                spool_sample_due=true;
                 if connected && updates_on {
                     // Items whose answers are overdue (lost below the channel) go again.
                     flush_updates(&mut updates, &uplink)?;
@@ -4872,6 +5324,68 @@ mod tests {
         assert!(matches!(rx.try_recv()?, Up::Msg(AgentMsg::Heartbeat { .. })));
         assert!(deferred.pending.is_empty());
         assert_eq!(proto::read_agent(&replay).map_err(|e| anyhow::anyhow!("{}: {}", e.what(), e.why("AgentMsg")))?, completion);
+        crate::rt::block_on(async {
+            use crate::wire::channel::{Receiver,Has};
+            use crate::harness::model::Command;
+            struct Target(async_channel::Sender<Command>);
+            impl crate::harness::host::Taker for Target {
+                fn is_moving(&self)->bool {false}
+                fn epoch(&self)->u64 {7}
+                fn hand(&self,c:Command)->bool {self.0.try_send(c).is_ok()}
+            }
+            let origin=crate::net::Connection::new(SERVER_PEER,9,[9;32]);
+            let nonce="u".repeat(43);let stream="l:9.1";
+            let mut receiver=Receiver::new();
+            receiver.bind_ordinary(origin,&nonce,Has{stream:stream.into(),upto:0,nacks:vec![]},0)?;
+            receiver.stage_ordinary(origin,&nonce,stream,1,0,b"held Start".to_vec())?;
+            let head=receiver.ordinary_head(origin,&nonce,stream)?.context("ordinary test head missing")?;
+            receiver.stage_ordinary_urgent(origin,&nonce,stream,2,0,b"interrupt".to_vec())?;
+            receiver.stage_ordinary_urgent(origin,&nonce,stream,3,0,b"force stop".to_vec())?;
+            let (release,held)=futures::channel::oneshot::channel::<()>();
+            let mut io:Option<OrdinaryIo>=Some(async move {
+                let _=held.await;
+                OrdinaryDone::Registered{origin,result:Box::new(Err(anyhow::anyhow!("held storage result")))}
+            }.boxed());
+            let (controls,events)=async_channel::bounded(2);
+            controls.try_send(Command::Interrupt)?;controls.try_send(Command::ForceStop)?;
+            let (taken,applied)=async_channel::bounded(2);let target=Target(taken);
+            for seq in [2,3] {
+                // The exact production retained future stays in its slot when ingress wins.
+                let command=futures::select_biased! {
+                    _=ordinary_completion(&mut io).fuse()=>anyhow::bail!("held durability completed before release"),
+                    command=events.recv().fuse()=>command?,
+                };
+                let ticket=receiver.ordinary_urgent(origin,&nonce,stream,seq)?.context("urgent test ticket missing")?;
+                complete_ordinary_urgent(&mut receiver,&ticket,&target,command)?;
+                assert!(receiver.ordinary_urgent(origin,&nonce,stream,seq)?.is_none(),"replay cannot repeat Interrupt or ForceStop");
+            }
+            assert_eq!(applied.try_recv()?,Command::Interrupt);
+            assert_eq!(applied.try_recv()?,Command::ForceStop);
+            assert!(applied.is_empty());
+            assert_eq!(receiver.state(stream).upto,0,"neither Start nor urgent controls have a durable ACK");
+            assert!(receiver.ordinary_ready(origin,&nonce,stream)?.is_none(),"held Start cannot be bypassed by ACK/Have");
+            assert!(io.is_some(),"select did not drop the pending owner");
+            release.send(()).map_err(|_|anyhow::anyhow!("held storage owner disappeared"))?;
+            // A1: readiness is progress, even when ingress is also ready. The four
+            // production select modes use this SAME completion-before-Net ordering.
+            controls.try_send(Command::Interrupt)?;
+            let completed=futures::select_biased! {
+                result=ordinary_completion(&mut io).fuse()=>result,
+                _=events.recv().fuse()=>anyhow::bail!("ready ingress starved the ready retained owner"),
+            };
+            assert!(matches!(completed,OrdinaryDone::Registered{..}));
+            assert_eq!(events.len(),1,"known I/O completion did not consume urgent ingress");
+            assert_eq!(events.try_recv()?,Command::Interrupt);
+            assert!(applied.is_empty(),"servicing durability cannot fabricate another control effect");
+            // A known completion records the SAME head, then the contiguous prefix only.
+            receiver.ordinary_admitted(&head)?;receiver.ordinary_effect_done(&head,None)?;
+            let closure=receiver.ordinary_ready(origin,&nonce,stream)?.context("ordered completion missing")?;
+            assert_eq!(closure.has().upto,3);
+            receiver.retire_ordinary(origin);
+            receiver.bind_ordinary(origin,&nonce,Has{stream:"l:9.2".into(),upto:0,nacks:vec![]},0)?;
+            assert!(receiver.ordinary_committed(&closure).is_err(),"same-origin later generation cannot use old completion");
+            anyhow::Ok(())
+        })?;
         Ok(())
     }
 

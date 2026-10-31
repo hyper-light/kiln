@@ -269,6 +269,15 @@ fn stream_of(msg: &ServerMsg) -> Option<crate::wire::commands::Kind> {
     }
 }
 
+/// Keep the existing stream/away law. Only explicit emergency session controls can
+/// positively preempt a never-enqueued ordinary reservation in the SAME Commands owner.
+fn preempts_ordinary(msg: &ServerMsg) -> bool {
+    match msg {
+        ServerMsg::HarnessCmd { json, .. } => matches!(serde_json::from_str::<crate::harness::model::Command>(json),Ok(crate::harness::model::Command::Interrupt | crate::harness::model::Command::ForceStop)),
+        _ => false,
+    }
+}
+
 /// A question asked of a runner, waiting for its answer (by its `req`): what reads the answer as
 /// the type its asker wants (`crate::wire::payload`) and hands it over. An answer it can't read is
 /// refused to the runner that sent it: its error says why.
@@ -1252,6 +1261,7 @@ impl Hub {
             return at_once(Answer::Unreachable { why: format!("{agent} is not connected") });
         }
         let stream = stream_of(msg);
+        let preempt = preempts_ordinary(msg);
         let body = match proto::encode(msg) {
             Ok(b) => b,
             Err(e) => return at_once(Answer::Unreachable { why: format!("it couldn't be encoded: {e}") }),
@@ -1268,7 +1278,11 @@ impl Hub {
             match on_channel {
                 Some(kind) => {
                     away &= !self.cmds.lock().is_up(p);
-                    let mut rx = self.cmds.lock().push(p, kind, body.clone(), Instant::now());
+                    let mut rx = {
+                        let mut commands = self.cmds.lock();
+                        if kind == Stream::Live && preempt { commands.preempt_unexposed(p); }
+                        commands.push(p,kind,body.clone(),Instant::now())
+                    };
                     match rx.try_recv() {
                         Ok(Some(a)) => given.push(a),
                         _ => waits.push(rx),
@@ -1998,8 +2012,17 @@ impl Hub {
             frame @ (Frame::Ack(_) | Frame::Want { .. } | Frame::Have(_)) => {
                 // Only the active connection may mutate its command stream's reconnect state.
                 // Immutable completion/retained evidence above remains independently admissible.
-                if !self.instances.lock().accepts_connection(peer,origin) { return; }
-                self.cmds.lock().on_frame(peer, frame);
+                let ready_changed = {
+                    // SAME actual connection and Commands transition, in the capture lock
+                    // order. No stale Have can reopen an ordinary producer's readiness.
+                    let instances = self.instances.lock();
+                    if !instances.accepts_connection(peer,origin) { return; }
+                    let mut commands = self.cmds.lock();
+                    let before = commands.is_up(peer);
+                    commands.on_frame(peer, frame);
+                    before != commands.is_up(peer) && instances.effective_wide(peer) & proto::CAP_ORDINARY_EXECUTION_DEBT != 0
+                };
+                if ready_changed { self.ci.send(crate::ci::dispatch::Msg::RunnerFacts { agent: agent.to_owned() }); }
                 self.flush_commands().await;
             }
         }
@@ -2186,7 +2209,29 @@ impl Hub {
                 self.ci.send(crate::ci::dispatch::Msg::RunnerFacts { agent: agent.clone() });
             }
             AgentMsg::Caps { caps } => {
-                self.instances.lock().set_wide(peer, caps);
+                let waited = {
+                    // U01/U03: the first strict declaration ends the old Live generation
+                    // BEFORE capability/capture publication. Repeated strict declarations
+                    // retain the same prepared/published owner instead of rotating it again.
+                    let mut instances = self.instances.lock();
+                    anyhow::ensure!(instances.accepts_connection(peer,origin), "runner capability connection changed before acceptance");
+                    let strict = caps & proto::CAP_ORDINARY_EXECUTION_DEBT != 0;
+                    let repeated = strict && instances.effective_wide(peer) & (proto::CAP_ORDINARY_EXECUTION_DEBT | proto::CAP_WIRE) == (proto::CAP_ORDINARY_EXECUTION_DEBT | proto::CAP_WIRE);
+                    if strict {
+                        let paired = proto::CAP_UNIFIED_LAYOUT | proto::CAP_WIRE | proto::CAP_RESOURCE_OWNERSHIP | proto::CAP_JOB_ATTEMPT;
+                        anyhow::ensure!(caps & paired == paired, "ordinary capability requires paired ownership support");
+                        let nonce = instances.process_on(peer,origin).context("ordinary capability has no registered current process")?;
+                        let captured = instances.capture_original_runner(&agent,peer,nonce,proto::CAP_WIRE)?;
+                        anyhow::ensure!(captured.ordinary_epoch().is_some(), "ordinary capability precedes its registered publication domain");
+                    }
+                    let mut commands = self.cmds.lock();
+                    let waited = if caps & proto::CAP_WIRE != 0 {
+                        if !repeated { commands.connected(peer); }
+                        Vec::new()
+                    } else { commands.not_wire(peer) };
+                    instances.set_wide(peer,caps);
+                    waited
+                };
                 self.ci.send(crate::ci::dispatch::Msg::RunnerFacts { agent: agent.clone() });
                 crate::headroom::control::on_caps(self, &agent, caps).await;
                 // One that takes hand-overs: its machine's older processes hand their sessions on.
@@ -2195,12 +2240,8 @@ impl Hub {
                 }
                 self.wire.set_keeps(&agent, caps & proto::CAP_WIRE != 0);
                 if caps & proto::CAP_WIRE != 0 {
-                    self.cmds.lock().connected(peer);
                     self.send_peer(peer, &ServerMsg::Wire(self.wire.have(&agent))).await;
-                } else {
-                    let waited = self.cmds.lock().not_wire(peer);
-                    self.send_waited(peer, waited).await;
-                }
+                } else { self.send_waited(peer, waited).await; }
                 // One that takes its agent limit from here is sent what's set for its machine.
                 crate::harness::limit::on_caps(self, &agent, peer, caps).await;
             }
@@ -2341,7 +2382,31 @@ impl Hub {
             FromRunner::HeadroomStatus(status) => crate::headroom::control::on_status(self, peer, agent, status),
             // CI (docs/ci.md §2.5): the dispatcher's; facts are W13's.
             FromRunner::JobEvent { job, event, json } => {
-                if self.owns_job(peer, &job) || self.owns_retained_event(peer, agent, &event.event) {
+                if matches!(&event.event, kiln_ci::wire::JobEventV2::OrdinaryDomain { .. } | kiln_ci::wire::JobEventV2::OrdinaryExecutionPublication { .. }) {
+                    let actual = origin.context("ordinary evidence has no authenticated origin")?;
+                    let nonce = self.instances.lock().process_on(peer,Some(actual)).map(str::to_owned).context("ordinary evidence has no current authenticated process")?;
+                    let required = proto::CAP_UNIFIED_LAYOUT | proto::CAP_WIRE | proto::CAP_RESOURCE_OWNERSHIP | proto::CAP_JOB_ATTEMPT;
+                    anyhow::ensure!(self.instances.lock().effective_wide(peer) & required == required, "ordinary evidence requires paired ownership support");
+                    if matches!(&event.event,kiln_ci::wire::JobEventV2::OrdinaryExecutionPublication { .. }) {
+                        anyhow::ensure!(self.instances.lock().effective_wide(peer) & proto::CAP_ORDINARY_EXECUTION_DEBT != 0, "ordinary physical publication requires the same initialized, registered producer role");
+                    }
+                    let domain = match &event.event {
+                        kiln_ci::wire::JobEventV2::OrdinaryDomain { epoch, process_nonce } => {
+                            anyhow::ensure!(process_nonce == &nonce, "publication domain changed authenticated process");
+                            Some(epoch.clone())
+                        },
+                        _ => None,
+                    };
+                    let acknowledgement = self.ci.stage_ordinary_event(agent,&nonce,event.event).await.map_err(evidence_storage)?;
+                    let json = if let Some(epoch) = domain {
+                        self.instances.lock().set_ordinary_domain(peer,actual,epoch.clone())?;
+                        serde_json::json!({"kind":"ordinary_domain","version":1,"epoch":epoch}).to_string()
+                    } else {
+                        serde_json::to_string(&acknowledgement.context("ordinary proof has no committed frontier")?)?
+                    };
+                    // ACK only the same authenticated reporting route, never newest substitution.
+                    self.net.send_bound(actual,proto::LANE_CONTROL,crate::net::Kind::Control,proto::encode(&ServerMsg::RetainedReceived { json })?).await;
+                } else if self.owns_job(peer, &job) || self.owns_retained_event(peer, agent, &event.event) {
                     if self.ci.stage_retained_event(agent, &job, event.event.clone()).await.map_err(evidence_storage)? {
                         if self.instances.lock().get(peer).is_some_and(|i| i.wide & proto::CAP_RETAINED_RECEIVED != 0)
                             && let Some(receipt) = crate::agent::retained::Receipt::of(&job, &json)?
@@ -2748,7 +2813,7 @@ impl Hub {
         // It keeps the channel (docs/wire.md): said first, so a runner that keeps it too knows on
         // Welcome not to send its sessions whole. An older runner skips the frame.
         let amphora = if self.cfg.cluster.replica.is_some() && self.replica_carrier_active.get().is_some_and(|active| active.load(Ordering::Acquire)) { proto::CAP_AMPHORA } else { 0 };
-        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_HANDOVER | proto::CAP_WORK | proto::CAP_AGENT_LIMIT | proto::CAP_JOB_ATTEMPT | proto::CAP_RETAINED_RECEIVED | proto::CAP_IDENTITY | proto::CAP_HEADROOM | proto::CAP_CHANGES_PATCH | proto::CAP_FIRECRACKER_SHAPE | amphora | proto::CAP_UNREAD | proto::CAP_UNIFIED_LAYOUT | proto::CAP_EXPLICIT_ACTIVATION }).await;
+        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_HANDOVER | proto::CAP_WORK | proto::CAP_AGENT_LIMIT | proto::CAP_JOB_ATTEMPT | proto::CAP_RETAINED_RECEIVED | proto::CAP_IDENTITY | proto::CAP_HEADROOM | proto::CAP_CHANGES_PATCH | proto::CAP_FIRECRACKER_SHAPE | amphora | proto::CAP_UNREAD | proto::CAP_UNIFIED_LAYOUT | proto::CAP_EXPLICIT_ACTIVATION | proto::CAP_ORDINARY_EXECUTION_DEBT }).await;
         // What its sessions' copies have here, so a stream it starts sends only what they lack
         // (`crate::wire::sums`): a few dozen sessions a frame, each about a kilobyte.
         for part in self.harness.kept_on(&name).chunks(KEPT_A_FRAME) {
@@ -2870,23 +2935,57 @@ impl Hub {
     /// 0 for runners from before builds were announced.
     /// U03/W13-R09: capability and process selection are one Instances snapshot.
     pub fn capture_newest_runner(&self, machine: &str, required: u64) -> Result<crate::instances::CapturedRunner, crate::instances::CaptureRefusal> {
-        self.instances.lock().capture_newest_runner(machine,required | proto::CAP_WIRE)
+        let instances = self.instances.lock();
+        let captured = instances.capture_newest_runner(machine,required | proto::CAP_WIRE)?;
+        if required & proto::CAP_ORDINARY_EXECUTION_DEBT != 0 && !self.cmds.lock().is_up(captured.peer()) {
+            return Err(crate::instances::CaptureRefusal::Capabilities);
+        }
+        Ok(captured)
     }
     pub fn capture_original_runner(&self, machine: &str, peer: PeerId, process_nonce: &str, required: u64) -> Result<crate::instances::CapturedRunner, crate::instances::CaptureRefusal> {
-        self.instances.lock().capture_original_runner(machine,peer,process_nonce,required | proto::CAP_WIRE)
+        let instances = self.instances.lock();
+        let captured = instances.capture_original_runner(machine,peer,process_nonce,required | proto::CAP_WIRE)?;
+        if required & proto::CAP_ORDINARY_EXECUTION_DEBT != 0 && !self.cmds.lock().is_up(peer) {
+            return Err(crate::instances::CaptureRefusal::Capabilities);
+        }
+        Ok(captured)
     }
+    /// U01/U03: reserve the SAME captured command owner before any persistence wait.
+    pub(crate) fn prepare_ordinary_command(&self, captured: &crate::instances::CapturedRunner, grant: String) -> anyhow::Result<crate::wire::commands::PreparedCommand> {
+        let instances = self.instances.lock();
+        anyhow::ensure!(instances.still_captured(captured) && captured.ordinary_epoch().is_some(), "ordinary captured admission is not registered on this connection");
+        self.cmds.lock().prepare_bound(captured.connection(),grant).map_err(anyhow::Error::msg)
+    }
+    pub(crate) fn abort_ordinary_command(&self, token: &crate::wire::commands::PreparedCommand) -> bool { self.cmds.lock().abort_prepared(token) }
+    pub(crate) async fn publish_ordinary_command(&self, captured: &crate::instances::CapturedRunner, token: &crate::wire::commands::PreparedCommand, msg: &ServerMsg) -> anyhow::Result<Pending> {
+        let body = proto::encode(msg)?;
+        let answer = {
+            let instances = self.instances.lock();
+            if !instances.still_captured(captured) {
+                self.cmds.lock().abort_prepared(token);
+                anyhow::bail!("ordinary captured connection changed before exposure");
+            }
+            self.cmds.lock().publish_prepared(token,body,Instant::now()).map_err(anyhow::Error::msg)?
+        };
+        self.flush_commands().await;
+        Ok(Pending { agent: captured.machine().to_owned(), what: crate::wire::server_name(msg), waits: vec![answer], at_once: crate::wire::commands::Answer::Taken, away: false })
+    }
+
     /// U03: use the existing Live command seq/ACK owner, retaining the captured route on every retry.
     /// Grant persistence authorizes NEW items after a reconnect; an old item never changes route.
     pub async fn send_captured_runner(&self, captured: &crate::instances::CapturedRunner, msg: &ServerMsg) -> anyhow::Result<Pending> {
         use crate::wire::commands::Answer;
         if stream_of(msg) != Some(crate::wire::commands::Kind::Live) { anyhow::bail!("captured runner commands require the Live command stream"); }
         let frame = proto::encode(msg)?;
+        let preempt = preempts_ordinary(msg);
         let mut answer = {
             let instances = self.instances.lock();
             if !instances.still_captured(captured) {
                 return Ok(Pending { agent: captured.machine().to_owned(), what: crate::wire::server_name(msg), waits: Vec::new(), at_once: Answer::Unreachable { why: "its captured connection changed before command admission".into() }, away: false });
             }
-            self.cmds.lock().push_bound(captured.connection(),frame,Instant::now())
+            let mut commands = self.cmds.lock();
+            if preempt { commands.preempt_unexposed(captured.connection().peer()); }
+            commands.push_bound(captured.connection(),frame,Instant::now())
         };
         // Preserve positive queue NACKs for the existing authoritative dispatcher lifecycle.
         // Taken is an accepted ordered intent; only Said/physical proof establishes its result.
@@ -2909,7 +3008,13 @@ impl Hub {
     /// ([`proto::AgentMsg::Caps`]: [`proto::CAP_WIRE`] ...).
     pub fn runner_wide_caps(&self, name: &str) -> u64 {
         let inst = self.instances.lock();
-        inst.newest(name).map_or(0, |peer| inst.effective_wide(peer))
+        let Some(peer) = inst.newest(name) else { return 0 };
+        let wide = inst.effective_wide(peer);
+        // Other capability meanings remain unchanged. Strict new admission also needs
+        // this exact joined process/domain and its post-transition current Have.
+        if wide & proto::CAP_ORDINARY_EXECUTION_DEBT != 0
+            && (inst.capture_newest_runner(name,proto::CAP_WIRE | proto::CAP_ORDINARY_EXECUTION_DEBT).is_err() || !self.cmds.lock().is_up(peer))
+        { wide & !proto::CAP_ORDINARY_EXECUTION_DEBT } else { wide }
     }
 
     /// The kiln a machine's newest runner process says it runs (`crate::fleet`).
@@ -3319,6 +3424,56 @@ pub(crate) mod tests {
             assert!(hub.accepts_layout(1, &caps, Some(current)).await?);
             hub.instances.lock().set_wide(1, proto::CAP_UNIFIED_LAYOUT | proto::CAP_JOB_ATTEMPT);
             assert!(hub.accepts_layout(1, &completion, Some(current)).await?);
+            // A2: legacy Live can already be nonempty before the ordinary declaration.
+            // First strict publication must rotate before eligibility, then wait for the
+            // actual current Have; duplicate strict Caps must preserve the exact owner.
+            use crate::wire::channel::{Frame,Has,Arrival,Receiver};
+            use crate::wire::commands::{Answer,Kind as Stream};
+            let base = proto::CAP_UNIFIED_LAYOUT | proto::CAP_WIRE | proto::CAP_RESOURCE_OWNERSHIP | proto::CAP_JOB_ATTEMPT;
+            let strict = base | proto::CAP_ORDINARY_EXECUTION_DEBT;
+            let nonce = "r".repeat(43);
+            hub.instances.lock().set_process(1,nonce.clone(),Some(current))?;
+            assert!(hub.on_agent_msg_from(1,AgentMsg::Caps{caps:strict},Some(current)).await.is_err(), "premature raw51 cannot activate retroactively when a domain later arrives");
+            assert_eq!(hub.instances.lock().effective_wide(1) & proto::CAP_ORDINARY_EXECUTION_DEBT,0);
+            hub.on_agent_msg_from(1,AgentMsg::Caps{caps:base},Some(current)).await?;
+            hub.on_wire(1,"box",Frame::Have(Vec::new()),Some(current)).await;
+            let command = ServerMsg::HarnessCmd{session:"s".into(),json:serde_json::to_string(&crate::harness::model::Command::Interrupt)?};
+            assert_eq!(stream_of(&command),Some(Stream::Live));
+            let mut legacy_answer = hub.cmds.lock().push(1,Stream::Live,proto::encode(&command)?,Instant::now());
+            let legacy_frame = hub.cmds.lock().poll_routed(Instant::now()).into_iter().find_map(|(_,frame,_)|matches!(&frame,Frame::Item{..}).then_some(frame)).context("legacy Live frame missing")?;
+            let Frame::Item{stream:old_stream,seq,low,body}=legacy_frame else {anyhow::bail!("legacy Live item missing")};
+            let mut receiver=Receiver::new();assert!(matches!(receiver.on_item(&old_stream,seq,low,body),Arrival::Take(_)));
+            hub.on_wire(1,"box",receiver.took(&old_stream,seq),Some(current)).await;
+            assert_eq!(legacy_answer.try_recv()?,Some(Answer::Taken));assert!(receiver.state(&old_stream).upto>0);
+            // The real domain handler has already committed before declaring this SAME
+            // Instances registration. This fixture tests the subsequent channel boundary.
+            hub.instances.lock().set_ordinary_domain(1,current,"ordinary-ready".into())?;
+            hub.on_agent_msg_from(1,AgentMsg::Caps{caps:strict},Some(current)).await?;
+            assert_eq!(hub.runner_wide_caps("box") & proto::CAP_ORDINARY_EXECUTION_DEBT,0);
+            assert!(matches!(hub.capture_newest_runner("box",proto::CAP_ORDINARY_EXECUTION_DEBT),Err(crate::instances::CaptureRefusal::Capabilities)));
+            assert!(matches!(hub.capture_original_runner("box",1,&nonce,proto::CAP_ORDINARY_EXECUTION_DEBT),Err(crate::instances::CaptureRefusal::Capabilities)));
+            assert!(hub.capture_newest_runner("box",proto::CAP_RESOURCE_OWNERSHIP | proto::CAP_JOB_ATTEMPT).is_ok(), "managed/non51 capability meanings are unchanged");
+            hub.on_wire(1,"box",Frame::Have(Vec::new()),Some(former)).await;
+            assert_eq!(hub.runner_wide_caps("box") & proto::CAP_ORDINARY_EXECUTION_DEBT,0,"stale Have cannot open readiness");
+            hub.on_wire(1,"box",Frame::Have(Vec::new()),Some(current)).await;
+            assert_ne!(hub.runner_wide_caps("box") & proto::CAP_ORDINARY_EXECUTION_DEBT,0);
+            let captured=hub.capture_newest_runner("box",proto::CAP_ORDINARY_EXECUTION_DEBT)?;
+            let token=hub.prepare_ordinary_command(&captured,"retained-original".into())?;
+            assert_ne!(token.stamp().stream,old_stream,"first strict declaration uses a fresh Live generation");
+            hub.on_agent_msg_from(1,AgentMsg::Caps{caps:strict},Some(current)).await?;
+            assert!(!token.never_exposed(),"duplicate Caps cannot retire its private original token");
+            let mut answer=hub.cmds.lock().publish_prepared(&token,b"original bytes".to_vec(),Instant::now()).map_err(anyhow::Error::msg)?;
+            hub.on_agent_msg_from(1,AgentMsg::Caps{caps:strict},Some(current)).await?;
+            assert!(answer.try_recv()?.is_none(),"duplicate Caps cannot abandon an exposed original");
+            let frame=hub.cmds.lock().poll_routed(Instant::now()).into_iter().find_map(|(_,frame,route)|match frame {
+                Frame::Item{stream,seq,body,..} if stream==token.stamp().stream && seq==token.stamp().seq=>Some((stream,seq,body,route)),_=>None,
+            }).context("original command identity disappeared")?;
+            assert_eq!(frame.2.as_slice(),b"original bytes");assert_eq!(frame.3,Some(current));
+            hub.on_wire(1,"box",Frame::Ack(Has{stream:frame.0,upto:frame.1,nacks:Vec::new()}),Some(current)).await;
+            assert_eq!(answer.try_recv()?,Some(Answer::Taken));
+            hub.instances.lock().connected(1,3,Some([3;32]));
+            assert_eq!(hub.runner_wide_caps("box") & proto::CAP_ORDINARY_EXECUTION_DEBT,0,"replacement cannot borrow the former joined channel readiness");
+            assert_eq!(hub.instances.lock().owner(&crate::instances::Owned::Job("physical".into())),Some(1));
             Ok(())
         })
     }
@@ -3692,6 +3847,12 @@ pub(crate) mod tests {
         use crate::wire::commands::Kind as Stream;
         let cmd = |c: Command| ServerMsg::HarnessCmd { session: "s".into(), json: serde_json::to_string(&c).unwrap_or_default() };
         let send = |id: &str| Command::Send { id: id.into(), text: "hi".into(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None };
+        for urgent in [Command::Interrupt,Command::ForceStop] {
+            let urgent = cmd(urgent);
+            assert_eq!(stream_of(&urgent),Some(Stream::Live), "emergency away behavior is unchanged");
+            assert!(preempts_ordinary(&urgent));
+        }
+        assert!(!preempts_ordinary(&cmd(send("m1"))), "ordinary messages do not retire another grant");
         assert_eq!(stream_of(&cmd(send("m1"))), Some(Stream::Live), "a message with an id");
         assert_eq!(stream_of(&cmd(Command::SkillRun { name: "review".into(), args: None, id: Some("k1".into()), mode: Default::default() })), Some(Stream::Live), "a skill run with an id");
         assert_eq!(stream_of(&cmd(send(""))), Some(Stream::Parked), "a message without one");

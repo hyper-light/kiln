@@ -455,7 +455,7 @@ pub enum FromServer {
     /// `Headroom`: this machine's headroom settings (docs/headroom.md).
     Headroom(Box<crate::headroom::Push>),
     /// The single existing retained-evidence receipt type, read at the boundary once.
-    RetainedReceived(Box<crate::agent::RetainedReceipt>),
+    RetainedReceived(Box<serde_json::Value>),
 }
 
 impl Carries for ServerMsg {

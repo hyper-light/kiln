@@ -19,6 +19,7 @@ struct Record {
     execution: Option<String>,
     until: i64,
     allocation: Allocation,
+    ordinary: Option<super::ordinary::Journal>,
     transferred: bool,
     released: bool,
 }
@@ -51,9 +52,18 @@ async fn records(hub: &Hub) -> anyhow::Result<Vec<Record>> {
     }).await?;
     anyhow::ensure!(rows.len() <= LIMIT, "U01 retained ownership exceeds its record budget");
     let mut identities = std::collections::BTreeSet::new();
-    rows.into_iter().map(|(job, attempt, agent, execution, until, json, transferred, released)| {
-        anyhow::ensure!(json.len() <= 16384, "U01 allocation exceeds its byte budget");
-        let allocation: Allocation = serde_json::from_str(&json)?;
+    let mut records = Vec::new();
+    for (job,attempt,agent,execution,until,json,transferred,released) in rows {
+        let Some(allocation) = super::ordinary::allocation_json(&json)? else {
+            super::ordinary::validate_marker(&job,attempt,&agent,execution.as_deref(),until,transferred,released)?;
+            continue;
+        };
+        let ordinary = super::ordinary::journal_json(&json)?;
+        if let Some(journal) = &ordinary {
+            anyhow::ensure!(journal.owner.job == job && journal.owner.attempt == attempt && journal.owner.host == agent
+                && execution.as_deref() == Some(journal.owner.execution.as_str()) && released == (journal.physical != "pending")
+                && (!transferred || journal.logical != "running"), "ordinary SQL owner/phase changed its original journal");
+        }
         anyhow::ensure!(!job.is_empty() && job.len() <= 512 && !agent.is_empty() && agent.len() <= 256 && attempt > 0
             && execution.as_ref().is_none_or(|id| !id.is_empty() && id.len() <= 256), "U01 invalid durable execution owner");
         anyhow::ensure!(identities.insert(allocation.id.clone()), "U01 duplicate durable allocation identity");
@@ -62,8 +72,9 @@ async fn records(hub: &Hub) -> anyhow::Result<Vec<Record>> {
             && !allocation.runner.is_empty() && allocation.runner.len() <= 256
             && allocation.request.cpu.is_finite() && allocation.request.cpu >= 0.0,
             "U01 invalid durable retained allocation");
-        Ok(Record { job, attempt, agent, execution, until, allocation, transferred, released })
-    }).collect()
+        records.push(Record { job,attempt,agent,execution,until,allocation,ordinary,transferred,released });
+    }
+    Ok(records)
 }
 
 /// U01: source corruption is not process death. Called BEFORE legacy cancellation or
@@ -93,8 +104,30 @@ pub async fn quarantine_run(hub: &Hub, run: &str) -> anyhow::Result<()> {
     }).await
 }
 
+#[derive(Debug,thiserror::Error)]
+#[error("LegacyNativeAssignmentsRequireDrain: restored native Running work lacks original physical ownership; drain every pre-feature assignment and old writer before activation")]
+struct LegacyNativeAssignmentsRequireDrain;
+
 impl Dispatch {
+    /// Read-only migration boundary. No historical grant/footprint or stop proof is
+    /// invented from a job status, an empty receiver or a new-format marker.
+    async fn require_legacy_native_drain(&self, job: Option<&str>) -> anyhow::Result<()> {
+        let job = job.map(str::to_owned);
+        let unbound: bool = self.hub.store.call(move |c| {
+            let predicate = "j.status='running' AND COALESCE(j.executor,'host') IN ('host','docker') AND NOT EXISTS (SELECT 1 FROM ci_retained_ownership h WHERE h.job=j.id AND h.attempt=CASE WHEN j.job_id IS NULL THEN j.attempt+1 ELSE MAX(j.attempt,1) END)";
+            Ok(match job {
+                Some(job) => c.query_row(&format!("SELECT EXISTS(SELECT 1 FROM jobs j WHERE j.id=?1 AND {predicate})"),[job],|r|r.get(0))?,
+                None => c.query_row(&format!("SELECT EXISTS(SELECT 1 FROM jobs j WHERE {predicate})"),[],|r|r.get(0))?,
+            })
+        }).await?;
+        anyhow::ensure!(!unbound,LegacyNativeAssignmentsRequireDrain);
+        Ok(())
+    }
     pub(super) async fn restore_retained(&mut self) -> anyhow::Result<()> {
+        // Refuse before legacy restore/quarantine can claim the new ordinary law.
+        // Existing bootstrap aborts safely here; full physical drain is an operator
+        // deployment prerequisite, never certified by this SQL read.
+        self.require_legacy_native_drain(None).await?;
         // Old Kept rows have no execution identity. Restore them as whole-host quarantines;
         // even an elapsed UI deadline cannot establish that their processes disappeared.
         let runs = self.hub.store.call(|c| {
@@ -105,8 +138,10 @@ impl Dispatch {
         for run in runs { quarantine_run(&self.hub, &run).await?; }
         for record in records(&self.hub).await? {
             if record.released { continue; }
-            self.hub.ci.keep(&record.job, Some((record.agent.clone(), record.until)));
-            self.sched.handle(Input::RetainExecution { leg: record.job.clone(), attempt: record.attempt }, now_ms());
+            if record.ordinary.is_none() || record.transferred || record.until != 0 {
+                self.hub.ci.keep(&record.job, Some((record.agent.clone(), record.until)));
+                self.sched.handle(Input::RetainExecution { leg: record.job.clone(), attempt: record.attempt }, now_ms());
+            }
             if !record.transferred || self.admission.retained.contains(&record.allocation.id) { continue; }
             let commands = self.sched.handle(Input::LegRunning { leg: Box::new(record.allocation.leg()), runner: record.allocation.runner.clone(), attempt: 1 }, now_ms());
             self.next.extend(commands);
@@ -122,12 +157,14 @@ impl Dispatch {
         let retained = records(&self.hub).await?.into_iter().filter(|r| r.agent == agent && !r.released).map(|r| serde_json::json!({
             "job": r.job, "attempt": r.attempt, "execution": r.execution, "reservation": r.allocation.id,
             "physical_runner": r.allocation.runner, "transferred": r.transferred, "until": r.until,
+            "ordinary_owner": r.ordinary.as_ref().map(|journal| &journal.owner),
         })).collect::<Vec<_>>();
         Ok(serde_json::json!({ "ok": true, "retained": retained }))
     }
 
     pub(super) async fn retained_event(&mut self, agent: &str, job: &str, event: JobEventV2) -> anyhow::Result<()> {
         anyhow::ensure!(self.admission.ready, "U01 ownership admission is fenced");
+        if self.ordinary_kept(agent,job,event.clone()).await? { return Ok(()); }
         anyhow::ensure!(!agent.is_empty() && agent.len() <= 256 && !job.is_empty() && job.len() <= 512, "U01 invalid retained identity");
         let (execution, attempt, until, release) = match event {
             JobEventV2::KeptOwned { execution, attempt, until } => (Some(execution), attempt, until, false),
@@ -180,7 +217,7 @@ impl Dispatch {
             None => {
                 anyhow::ensure!(self.legs.get(job).is_some_and(|l| l.agent.as_deref() == Some(agent) && l.attempt == attempt), "U01 kept event has no assigned attempt");
                 let allocation = self.sched.allocation(job, attempt, format!("retained-{}", crate::util::new_id())).ok_or_else(|| anyhow::anyhow!("U01 assigned allocation unavailable"))?;
-                Record { job: job.to_owned(), attempt, agent: agent.to_owned(), execution: None, until, allocation, transferred: false, released: false }
+                Record { job: job.to_owned(), attempt, agent: agent.to_owned(), execution: None, until, allocation, ordinary: None, transferred: false, released: false }
             }
         };
         anyhow::ensure!(!record.released, "U01 kept phase was not previously accepted");
@@ -250,7 +287,7 @@ impl Dispatch {
         result
     }
 
-    async fn refresh_retained_owner(&self, job: &str, agent: &str) -> anyhow::Result<()> {
+    pub(super) async fn refresh_retained_owner(&self, job: &str, agent: &str) -> anyhow::Result<()> {
         let held = records(&self.hub).await?.iter().any(|r| r.job == job && r.agent == agent && !r.released);
         if !held {
             let mut kept = self.hub.ci.kept.lock();
@@ -273,9 +310,14 @@ impl Dispatch {
 
     pub(super) async fn prepare_retained(&mut self, agent: &str, job: &str, attempt: u32) -> anyhow::Result<Option<Allocation>> {
         anyhow::ensure!(self.admission.ready, "U01 ownership admission is fenced");
-        let Some(mut record) = records(&self.hub).await?.into_iter().find(|r| r.job == job && r.attempt == attempt) else { return Ok(None); };
+        let Some(mut record) = records(&self.hub).await?.into_iter().find(|r| r.job == job && r.attempt == attempt) else {
+            // A detectable old native assignment cannot fall through lose -> refund.
+            self.require_legacy_native_drain(Some(job)).await?;
+            return Ok(None);
+        };
         anyhow::ensure!(record.agent == agent, "U01 terminal attempt does not own retained allocation");
         if record.released { return Ok(None); }
+        anyhow::ensure!(record.ordinary.is_none(), "ordinary terminal transition must share its original attempt writer");
         record.transferred = true;
         self.commit_retained(&record, false).await?;
         self.admission.retained.insert(record.allocation.id.clone());
@@ -320,7 +362,7 @@ mod tests {
             d.sched.handle(Input::RunnerUp(Box::new(runner.clone())), 0);
             d.sched.handle(Input::LegQueued(Box::new(LegIn { id: job.clone(), run: "retained-run".into(), repo: "repo".into(), request: Resources { cpu: 2.0, mem: 20, ..Resources::default() }, ..LegIn::default() })), 1);
             let allocation = d.sched.allocation(&job, 1, "retained-test".into()).ok_or_else(|| anyhow::anyhow!("allocation missing"))?;
-            let record = Record { job: job.clone(), attempt: 1, agent: "host".into(), execution: Some("execution-one".into()), until: 0, allocation: allocation.clone(), transferred: false, released: false };
+            let record = Record { job: job.clone(), attempt: 1, agent: "host".into(), execution: Some("execution-one".into()), until: 0, allocation: allocation.clone(), ordinary: None, transferred: false, released: false };
             d.commit_retained(&record, false).await?;
             d.retained_event("host", &job, JobEventV2::KeptOwned { execution: "execution-one".into(), attempt: 1, until: 0 }).await?;
             assert!(hub.ci.kept_by(&job, "host"), "deadline does not expire proof authorization");
@@ -361,6 +403,74 @@ mod tests {
             assert!(records(&hub).await?.is_empty());
             assert!(replay.admission.retained.is_empty());
             assert!(!hub.ci.kept_by(&job, "host"));
+            // Same existing behavioral oracle now exercises ordinary pre-enqueue custody,
+            // proof/loss races, durable restart and permanent old-reader refusal.
+            let ordinary_hub = crate::hub::tests::scratch_hub().await?;
+            let mut ordinary = dispatcher(ordinary_hub);
+            ordinary.restore_admission().await?;
+            super::super::ordinary::exercise_oracle(&mut ordinary).await?;
+            // A2: native routing can select a runner before its asynchronous ordinary
+            // readiness. A known capture refusal requeues without a claim/failed attempt.
+            let readiness_hub=crate::hub::tests::scratch_hub().await?;
+            let readiness_job=fixture(&readiness_hub).await?;
+            let queued=readiness_job.clone();
+            readiness_hub.store.call(move|c|{c.execute("UPDATE jobs SET status='queued',agent=NULL,executor=NULL,attempt=0 WHERE id=?1",[queued])?;Ok(())}).await?;
+            // Use the real existing canonical conversion; it retains the original job ID,
+            // sets job_id and records its queued attempt1 before this deferral exercise.
+            assert!(crate::ci::legacy::import_run(&readiness_hub,"retained-run").await?);
+            let checked=readiness_job.clone();
+            let canonical:(bool,u32)=readiness_hub.store.call(move|c|Ok(c.query_row("SELECT job_id IS NOT NULL,attempt FROM jobs WHERE id=?1",[checked],|row|Ok((row.get(0)?,row.get(1)?)))?)).await?;
+            assert_eq!(canonical,(true,1));
+            let mut readiness=dispatcher(Arc::clone(&readiness_hub));readiness.restore_admission().await?;
+            readiness.sched.handle(Input::RunnerUp(Box::new(RunnerIn{id:"not-ready".into(),slots:1,..RunnerIn::default()})),0);
+            readiness.sched.handle(Input::LegQueued(Box::new(LegIn{id:readiness_job.clone(),run:"retained-run".into(),repo:"repo".into(),..LegIn::default()})),1);
+            assert!(readiness_hub.capture_newest_runner("not-ready",crate::proto::CAP_ORDINARY_EXECUTION_DEBT).is_err());
+            assert!(readiness.sched.allocation(&readiness_job,1,"before-ready".into()).is_some());
+            let before=super::super::now_ms();
+            readiness.defer_ordinary_unexposed(&readiness_job,1,"the original channel has not supplied Have".into()).await?;
+            let after=super::super::now_ms();
+            assert!(readiness.admission.ready,"known readiness gap does not fence unrelated admission");
+            let checked=readiness_job.clone();
+            let (status,attempt,attempts,running_attempts,intents)=readiness_hub.store.call(move|c|{
+                let (status,attempt):(String,u32)=c.query_row("SELECT status,attempt FROM jobs WHERE id=?1",[&checked],|row|Ok((row.get(0)?,row.get(1)?)))?;
+                let attempts:i64=c.query_row("SELECT count(*) FROM ci_attempts WHERE leg_id=?1",[&checked],|row|row.get(0))?;
+                let running_attempts:i64=c.query_row("SELECT count(*) FROM ci_attempts WHERE leg_id=?1 AND status='running'",[&checked],|row|row.get(0))?;
+                let intents:i64=c.query_row("SELECT count(*) FROM ci_retained_ownership WHERE job=?1",[&checked],|row|row.get(0))?;
+                Ok((status,attempt,attempts,running_attempts,intents))
+            }).await?;
+            assert_eq!((status.as_str(),attempt,attempts,running_attempts,intents),("queued",1,1,0,0),"deferral adds no attempt beyond the canonical imported queued attempt");
+            assert!(readiness.sched.allocation(&readiness_job,1,"while-deferred".into()).is_none());
+            let early=readiness.sched.handle(Input::Tick,before.saturating_add(14_999));
+            assert!(!early.iter().any(|command|matches!(command,kiln_ci::sched::Command::Assign{..})),"no immediate alternate-host retry");
+            let due=readiness.sched.handle(Input::Tick,after.saturating_add(15_001));
+            assert!(due.iter().any(|command|matches!(command,kiln_ci::sched::Command::Assign{leg,attempt:1,..} if leg==&readiness_job)),"same attempt resumes only on existing timer");
+            // Existing historical/running ownership cannot be relabelled a readiness Full.
+            let allocation=readiness.sched.allocation(&readiness_job,1,"older-owned".into()).ok_or_else(||anyhow::anyhow!("readiness retry allocation absent"))?;
+            readiness.commit_retained(&Record{job:readiness_job.clone(),attempt:1,agent:"not-ready".into(),execution:Some("older-execution".into()),until:0,allocation:allocation.clone(),ordinary:None,transferred:false,released:false},false).await?;
+            assert!(readiness.defer_ordinary_unexposed(&readiness_job,1,"not an admission refusal".into()).await.is_err());
+            assert!(!readiness.admission.ready);
+            assert_eq!(readiness.sched.allocation(&readiness_job,1,"older-owned".into()),Some(allocation),"unresolved original charge remains held");
+            // Already-cancelled SQL is not an eligible readiness disposition. The same
+            // atomic callback must leave it cancelled and keep the exact assigned charge.
+            let cancelled_hub=crate::hub::tests::scratch_hub().await?;
+            let cancelled_job=fixture(&cancelled_hub).await?;
+            let queued=cancelled_job.clone();
+            cancelled_hub.store.call(move|c|{c.execute("UPDATE jobs SET status='queued',agent=NULL,executor=NULL,attempt=0 WHERE id=?1",[queued])?;Ok(())}).await?;
+            assert!(crate::ci::legacy::import_run(&cancelled_hub,"retained-run").await?);
+            let cancelled=cancelled_job.clone();
+            cancelled_hub.store.call(move|c|{c.execute("UPDATE jobs SET status='cancelled' WHERE id=?1 AND job_id IS NOT NULL AND attempt=1",[cancelled])?;Ok(())}).await?;
+            let checked=cancelled_job.clone();
+            let canonical:bool=cancelled_hub.store.call(move|c|Ok(c.query_row("SELECT job_id IS NOT NULL FROM jobs WHERE id=?1",[checked],|row|row.get(0))?)).await?;
+            assert!(canonical,"cancelled refusal also exercises a native canonical row");
+            let mut cancelled_dispatch=dispatcher(Arc::clone(&cancelled_hub));cancelled_dispatch.restore_admission().await?;
+            cancelled_dispatch.sched.handle(Input::RunnerUp(Box::new(RunnerIn{id:"cancelled-host".into(),slots:1,..RunnerIn::default()})),0);
+            cancelled_dispatch.sched.handle(Input::LegQueued(Box::new(LegIn{id:cancelled_job.clone(),run:"retained-run".into(),repo:"repo".into(),..LegIn::default()})),1);
+            let cancelled_allocation=cancelled_dispatch.sched.allocation(&cancelled_job,1,"cancelled-owned".into()).ok_or_else(||anyhow::anyhow!("cancelled fixture allocation absent"))?;
+            assert!(cancelled_dispatch.defer_ordinary_unexposed(&cancelled_job,1,"not a retryable readiness gap".into()).await.is_err());
+            assert_eq!(cancelled_dispatch.sched.allocation(&cancelled_job,1,"cancelled-owned".into()),Some(cancelled_allocation));
+            let checked=cancelled_job.clone();
+            let status:String=cancelled_hub.store.call(move|c|Ok(c.query_row("SELECT status FROM jobs WHERE id=?1",[checked],|row|row.get(0))?)).await?;
+            assert_eq!(status,"cancelled");
             Ok(())
         })
     }
@@ -373,6 +483,12 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let job = fixture(&hub).await?;
             hub.store.call(|c| { c.execute("UPDATE jobs SET spec = '{broken' WHERE run_id = 'retained-run'", [])?; Ok(()) }).await?;
+            let mut unbound = dispatcher(Arc::clone(&hub));
+            unbound.restore_admission().await?;
+            let refused = unbound.restore_retained().await.expect_err("unbound pre-feature native work must require physical drain");
+            assert!(refused.is::<LegacyNativeAssignmentsRequireDrain>());
+            assert!(records(&hub).await?.is_empty(), "drain refusal must not fabricate a historical allocation");
+            assert!(unbound.prepare_retained("host",&job,1).await.is_err(), "loss cannot refund an unbound original native assignment");
             quarantine_run(&hub, "retained-run").await?;
             hub.store.call(|c| { c.execute("UPDATE jobs SET status = 'failed' WHERE run_id = 'retained-run'", [])?; Ok(()) }).await?;
             let mut d = dispatcher(Arc::clone(&hub));
@@ -407,7 +523,7 @@ mod tests {
             hub.store.call(|c| { c.execute("UPDATE jobs SET agent = 'other-host', attempt = 1 WHERE run_id = 'retained-run'", [])?; Ok(()) }).await?;
             let next = Record { job: job.clone(), attempt: 2, agent: "other-host".into(), execution: Some("newer".into()), until: 0,
                 allocation: Allocation { id: "retained-newer".into(), runner: "other-host".into(), request: Default::default(), mode: ReservationMode::Whole, repo: "repo".into(), actor: String::new(), lane: String::new(), parent_binding: None },
-                transferred: true, released: false };
+                ordinary: None, transferred: true, released: false };
             d.commit_retained(&next, false).await?;
             d.restore_retained().await?;
             assert!(hub.ci.kept_by(&job, "host") && hub.ci.kept_by(&job, "other-host"));

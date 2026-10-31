@@ -263,43 +263,48 @@ fn close_wait(c: &crate::sql::Connection, leg: &str, now: i64) -> anyhow::Result
 /// A leg the scheduler gave a runner.
 pub async fn claim(hub: &Hub, leg: &str, agent: &str, executor: &str, attempt: u32) -> anyhow::Result<()> {
     let (leg, agent, executor) = (leg.to_owned(), agent.to_owned(), executor.to_owned());
-    hub.store
-        .call(move |c| {
-            let tx = crate::store::tx(c)?;
-            let now = crate::util::now_unix();
-            // U03: any canonical assignment ends the imported execution's old-frame permit,
-            // even when a rejection/reassignment reuses its attempt number on the same host.
-            let saved: Option<(String, String)> = tx.query_row("SELECT p.run_id, p.input FROM ci_plans p JOIN jobs j ON j.run_id = p.run_id WHERE j.id = ?1", [&leg], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
-            if let Some((run, saved)) = saved {
-                let mut input: serde_json::Value = serde_json::from_str(&saved)?;
-                if input.get_mut("legacy_running").and_then(serde_json::Value::as_object_mut).is_some_and(|running| running.remove(&leg).is_some()) {
-                    tx.execute("UPDATE ci_plans SET input = ?2 WHERE run_id = ?1", params![run, input.to_string()])?;
-                }
-            }
-            close_wait(&tx, &leg, now)?;
-            // The attempt (W19-R01); one before it that never reported ended with its runner.
-            tx.execute("UPDATE ci_attempts SET status = 'done', conclusion = 'failure', failure_class = 'runner-lost', finished_at = ?3 WHERE leg_id = ?1 AND number < ?2 AND status = 'running'", params![leg, attempt, now])?;
-            tx.execute(
-                "INSERT INTO ci_attempts (id, leg_id, number, status, runner, executor, queued_at, started_at) VALUES (?1, ?2, ?3, 'running', ?4, ?5, (SELECT queued_at FROM jobs WHERE id = ?2), ?6)
-                 ON CONFLICT (leg_id, number) DO UPDATE SET status = 'running', runner = excluded.runner, executor = excluded.executor, queued_at = excluded.queued_at, started_at = excluded.started_at,
-                   conclusion = NULL, failure_class = NULL, finished_at = NULL, exit_code = NULL, error = NULL",
-                params![crate::util::new_id(), leg, attempt, agent, executor, now],
-            )?;
-            tx.execute(
-                "UPDATE jobs SET status = 'running', agent = ?2, executor = ?3, attempt = ?4, started_at = ?5, finished_at = NULL, exit_code = NULL, error = NULL, wait_reason = NULL, wait_since = NULL WHERE id = ?1",
-                params![leg, agent, executor, attempt, now],
-            )?;
-            tx.execute(
-                "UPDATE runs SET status = 'running', started_at = COALESCE(started_at, ?2) WHERE id = (SELECT run_id FROM jobs WHERE id = ?1) AND status IN ('queued', 'pending')",
-                params![leg, now],
-            )?;
-            tx.commit()?;
-            Ok(())
-        })
-        .await
+    hub.store.call(move |c| {
+        let tx = crate::store::tx(c)?;
+        claim_in(&tx, &leg, &agent, &executor, attempt, crate::util::now_unix())?;
+        tx.commit()?;
+        Ok(())
+    }).await
+}
+
+/// U01/U03: borrow the existing writer transaction so original ownership and the actual
+/// job claim commit together before the prepared command is allowed to become visible.
+pub(super) fn claim_in(c: &crate::sql::Connection<'_>, leg: &str, agent: &str, executor: &str, attempt: u32, now: i64) -> anyhow::Result<()> {
+    // U03: any canonical assignment ends the imported execution's old-frame permit,
+    // even when a rejection/reassignment reuses its attempt number on the same host.
+    let saved: Option<(String, String)> = c.query_row("SELECT p.run_id, p.input FROM ci_plans p JOIN jobs j ON j.run_id = p.run_id WHERE j.id = ?1", [leg], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+    if let Some((run, saved)) = saved {
+        let mut input: serde_json::Value = serde_json::from_str(&saved)?;
+        if input.get_mut("legacy_running").and_then(serde_json::Value::as_object_mut).is_some_and(|running| running.remove(leg).is_some()) {
+            c.execute("UPDATE ci_plans SET input = ?2 WHERE run_id = ?1", params![run, input.to_string()])?;
+        }
+    }
+    close_wait(c, leg, now)?;
+    // The attempt (W19-R01); one before it that never reported ended with its runner.
+    c.execute("UPDATE ci_attempts SET status = 'done', conclusion = 'failure', failure_class = 'runner-lost', finished_at = ?3 WHERE leg_id = ?1 AND number < ?2 AND status = 'running'", params![leg, attempt, now])?;
+    c.execute(
+        "INSERT INTO ci_attempts (id, leg_id, number, status, runner, executor, queued_at, started_at) VALUES (?1, ?2, ?3, 'running', ?4, ?5, (SELECT queued_at FROM jobs WHERE id = ?2), ?6)
+         ON CONFLICT (leg_id, number) DO UPDATE SET status = 'running', runner = excluded.runner, executor = excluded.executor, queued_at = excluded.queued_at, started_at = excluded.started_at,
+           conclusion = NULL, failure_class = NULL, finished_at = NULL, exit_code = NULL, error = NULL",
+        params![crate::util::new_id(), leg, attempt, agent, executor, now],
+    )?;
+    c.execute(
+        "UPDATE jobs SET status = 'running', agent = ?2, executor = ?3, attempt = ?4, started_at = ?5, finished_at = NULL, exit_code = NULL, error = NULL, wait_reason = NULL, wait_since = NULL WHERE id = ?1",
+        params![leg, agent, executor, attempt, now],
+    )?;
+    c.execute(
+        "UPDATE runs SET status = 'running', started_at = COALESCE(started_at, ?2) WHERE id = (SELECT run_id FROM jobs WHERE id = ?1) AND status IN ('queued', 'pending')",
+        params![leg, now],
+    )?;
+    Ok(())
 }
 
 /// How an attempt ended (W19-R01): its conclusion and, when it failed, why.
+#[derive(Clone)]
 pub struct AttemptEnd {
     pub conclusion: &'static str,
     pub class: Option<&'static str>,
@@ -321,40 +326,48 @@ pub(crate) async fn attempt_lost(hub: &Hub, leg: &str, attempt: u32, end: Attemp
 
 async fn attempt_end(hub: &Hub, leg: &str, attempt: u32, end: AttemptEnd, losing: bool) -> anyhow::Result<bool> {
     let leg = leg.to_owned();
-    let labels = (end.conclusion, end.class.unwrap_or(""));
-    let rss = end.peak_rss.and_then(|r| i64::try_from(r).ok());
-    let recorded = hub.store
-        .call(move |c| {
-            let tx = crate::store::tx(c)?;
-            if losing && tx.query_row("SELECT EXISTS(SELECT 1 FROM ci_completion_reports WHERE job = ?1 AND attempt = ?2)", params![leg, attempt], |r| r.get::<_, bool>(0))? {
-                return Ok(false);
-            }
-            tx.execute(
-                "UPDATE ci_attempts SET status = 'done', conclusion = ?3, failure_class = ?4, exit_code = ?5, error = ?6, peak_rss = ?7, cpu_seconds = ?8, finished_at = ?9 WHERE leg_id = ?1 AND number = ?2",
-                params![leg, attempt, end.conclusion, end.class, end.exit_code, end.error, rss, end.cpu_seconds, crate::util::now_unix()],
-            )?;
-            tx.commit()?;
-            Ok(true)
-        })
-        .await?;
-    if recorded { crate::metrics::global().ci_attempts.inc(&[labels.0, labels.1]); }
+    let labels = (end.conclusion, end.class);
+    let recorded = hub.store.call(move |c| {
+        let tx = crate::store::tx(c)?;
+        let recorded = attempt_end_in(&tx, &leg, attempt, &end, losing, crate::util::now_unix())?;
+        if !recorded { return Ok(false); }
+        tx.commit()?;
+        Ok(recorded)
+    }).await?;
+    if recorded { attempt_metric(labels.0, labels.1); }
     Ok(recorded)
 }
+
+/// U01/U03: the completion/loss arbitration and physical debt transition share this SAME
+/// borrowed writer connection. This helper never commits, opens another Store or emits a
+/// success metric before its caller knows the enclosing transaction committed.
+pub(super) fn attempt_end_in(c: &crate::sql::Connection<'_>, leg: &str, attempt: u32, end: &AttemptEnd, losing: bool, now: i64) -> anyhow::Result<bool> {
+    if losing && c.query_row("SELECT EXISTS(SELECT 1 FROM ci_completion_reports WHERE job = ?1 AND attempt = ?2)", params![leg, attempt], |r| r.get::<_, bool>(0))? { return Ok(false); }
+    let rss = end.peak_rss.and_then(|r| i64::try_from(r).ok());
+    c.execute("UPDATE ci_attempts SET status = 'done', conclusion = ?3, failure_class = ?4, exit_code = ?5, error = ?6, peak_rss = ?7, cpu_seconds = ?8, finished_at = ?9 WHERE leg_id = ?1 AND number = ?2",
+        params![leg, attempt, end.conclusion, end.class, end.exit_code, end.error, rss, end.cpu_seconds, now])?;
+    Ok(true)
+}
+
+pub(super) fn attempt_metric(conclusion: &'static str, class: Option<&'static str>) { crate::metrics::global().ci_attempts.inc(&[conclusion, class.unwrap_or("")]); }
 
 /// A leg waiting again: a retry, or a runner that refused it.
 pub async fn requeue(hub: &Hub, leg: &str, attempt: u32, note: Option<String>) -> anyhow::Result<()> {
     let leg = leg.to_owned();
     hub.store
-        .call(move |c| {
-            let now = crate::util::now_unix();
-            c.execute(
-                "UPDATE jobs SET status = 'queued', agent = NULL, executor = NULL, attempt = ?2, queued_at = ?3, started_at = NULL, error = ?4, wait_since = ?3 WHERE id = ?1",
-                params![leg, attempt, now, note],
-            )?;
-            c.execute("UPDATE steps SET status = 'pending', started_at = NULL, finished_at = NULL, exit_code = NULL WHERE job_id = ?1", [&leg])?;
-            Ok(())
-        })
+        .call(move |c| requeue_in(c,&leg,attempt,note.as_deref(),crate::util::now_unix()))
         .await
+}
+
+/// Borrow the SAME existing writer transaction when readiness eligibility and requeue
+/// must commit together. Public requeue preserves its historical SQL and clock boundary.
+pub(super) fn requeue_in(c:&crate::sql::Connection<'_>,leg:&str,attempt:u32,note:Option<&str>,now:i64)->anyhow::Result<()> {
+    c.execute(
+        "UPDATE jobs SET status = 'queued', agent = NULL, executor = NULL, attempt = ?2, queued_at = ?3, started_at = NULL, error = ?4, wait_since = ?3 WHERE id = ?1",
+        params![leg, attempt, now, note],
+    )?;
+    c.execute("UPDATE steps SET status = 'pending', started_at = NULL, finished_at = NULL, exit_code = NULL WHERE job_id = ?1", [leg])?;
+    Ok(())
 }
 
 /// The legs kept now: each with its runner and until when.

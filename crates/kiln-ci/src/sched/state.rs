@@ -331,6 +331,11 @@ pub enum Input {
     /// What a runner has in use now, from the samples it sends the server: its [`Headroom`] until
     /// the next, or until it's older than [`SAMPLE_FRESH_MS`] (the scheduler's headroom, W05).
     RunnerSample { runner: String, sample: Sample },
+    /// U01/U03: a shared admission budget refused this exact attempt before command
+    /// exposure. The caller must FIRST positively abort its same private command token;
+    /// storage uncertainty is never this input. Retry on this Scheduler's existing timer,
+    /// keeping the attempt, rather than bounce among otherwise eligible runners.
+    AdmissionDeferred { leg: String, attempt: u32 },
 }
 
 /// What a runner has in use now, by its latest sample: what placement weighs of it besides its
@@ -885,6 +890,20 @@ impl Scheduler {
                         }
                         self.enqueue(&leg, now, &mut out);
                     }
+                    self.try_runner(&runner, now, &mut out);
+                }
+            }
+            Input::AdmissionDeferred { leg, attempt } => {
+                if self.legs.get(&leg).is_some_and(|l| l.attempt == attempt)
+                    && let Some(runner) = self.release(&leg)
+                {
+                    self.stopped(&leg);
+                    self.discard_used(&leg, &mut out);
+                    let at = now.saturating_add(REFUSED_AGAIN_MS);
+                    if let Some(l) = self.legs.get_mut(&leg) { l.state = State::Retrying { at }; }
+                    self.timers.entry(at).or_default().push(leg.clone());
+                    out.push(Command::Timer { at });
+                    self.set_reason(&leg, WaitReason::Retry { at }, &mut out);
                     self.try_runner(&runner, now, &mut out);
                 }
             }
@@ -2404,7 +2423,7 @@ impl Scheduler {
         let due: Vec<i64> = self.timers.range(..=now).map(|(k, _)| *k).collect();
         for at in due {
             for id in self.timers.remove(&at).unwrap_or_default() {
-                let (retrying, waited) = self.legs.get(&id).map_or((false, false), |l| (matches!(l.state, State::Retrying { .. }), l.hold.as_ref().is_some_and(|h| h.until <= now)));
+                let (retrying, waited) = self.legs.get(&id).map_or((false, false), |l| (matches!(&l.state, State::Retrying { at: retry_at } if *retry_at == at), l.hold.as_ref().is_some_and(|h| h.until <= now)));
                 if retrying {
                     self.enqueue(&id, now, out);
                 } else if waited {
@@ -3541,5 +3560,52 @@ mod admission_tests {
         }
         assert!(scheduler.legs.is_empty());
         assert!(scheduler.sigs.is_empty(), "ended calls must not leave an unbounded predicate cache");
+        // U01/U03: a global journal Full/TooLarge cannot be cured by A -> B -> A.
+        // Keep the same attempt pending through the existing timer and let unrelated
+        // work use the released capacity. No runner gets blamed for this shared budget.
+        for id in ["a", "b"] { scheduler.handle(Input::RunnerUp(Box::new(RunnerIn { id:id.into(), slots:1, ..Default::default() })), 1000); }
+        let assigns = |commands: &[Command]| commands.iter().filter(|c| matches!(c, Command::Assign { leg, attempt:1, .. } if leg=="shared-budget")).count();
+        let commands = scheduler.handle(Input::LegQueued(Box::new(LegIn { id:"shared-budget".into(), repo:"repo".into(), ..Default::default() })), 1001);
+        assert_eq!(assigns(&commands), 1);
+        let old_attempt = scheduler.handle(Input::AdmissionDeferred { leg:"shared-budget".into(), attempt:2 }, 1002);
+        assert!(old_attempt.is_empty(), "another attempt cannot release this original assignment");
+        let commands = scheduler.handle(Input::AdmissionDeferred { leg:"shared-budget".into(), attempt:1 }, 1002);
+        let at = 1002 + REFUSED_AGAIN_MS;
+        assert_eq!(assigns(&commands), 0);
+        assert_eq!(commands.iter().filter(|c| matches!(c, Command::Timer { at:due } if *due==at)).count(), 1);
+        assert!(matches!(scheduler.reason("shared-budget"), Some(WaitReason::Retry { at:due }) if *due==at));
+        for id in ["a", "b"] {
+            let commands = scheduler.handle(Input::RunnerChanged(Box::new(RunnerIn { id:id.into(), slots:1, ..Default::default() })), 1500);
+            assert_eq!(assigns(&commands), 0, "a second available runner cannot cause an immediate retry");
+        }
+        let other = scheduler.handle(Input::LegQueued(Box::new(LegIn { id:"other".into(), repo:"other-repo".into(), ..Default::default() })), 1501);
+        assert!(other.iter().any(|c| matches!(c, Command::Assign { leg, .. } if leg=="other")), "unrelated scheduling remains usable");
+        scheduler.handle(Input::LegGone { leg:"other".into() }, 1502);
+        assert_eq!(assigns(&scheduler.handle(Input::Tick, at-1)), 0);
+        assert_eq!(assigns(&scheduler.handle(Input::Tick, at)), 1, "the same attempt retries once when its timer becomes due");
+        let commands = scheduler.handle(Input::AdmissionDeferred { leg:"shared-budget".into(), attempt:1 }, at+1);
+        assert_eq!(assigns(&commands), 0, "a second refusal remains delayed, whichever runner was selected");
+        scheduler.handle(Input::LegCancelled { leg:"shared-budget".into(), reason:"cancelled while admission waits".into() }, at+2);
+        assert_eq!(assigns(&scheduler.handle(Input::Tick, at+1+REFUSED_AGAIN_MS)), 0, "a stale timer cannot resurrect cancelled work");
+
+        // A real earlier warm-wait timer survives an early assignment. It cannot
+        // become the owner of a later admission retry's deadline for the same leg.
+        let mut warm_scheduler = Scheduler::new(Config::default());
+        for id in ["cold", "warm"] { warm_scheduler.handle(Input::RunnerUp(Box::new(RunnerIn { id:id.into(), slots:1, ..Default::default() })), 0); }
+        warm_scheduler.handle(Input::Warm { runner:"warm".into(), held:WarmHeld { workspaces:vec![warm::Workspace { lane:"admission-lane".into(), warm_s:Some(20.0), ..Default::default() }], ..Default::default() } }, 0);
+        let warm_leg = |id: &str| LegIn { id:id.into(), run:id.into(), repo:"admission-repo".into(), warm_lane:Some("admission-lane".into()), cold:Some(120.0), prefer:vec![Preference { warm:true, ..Default::default() }], ..Default::default() };
+        let first = warm_scheduler.handle(Input::LegQueued(Box::new(warm_leg("warm-first"))), 0);
+        assert!(first.iter().any(|c| matches!(c, Command::Assign { leg, runner, .. } if leg=="warm-first" && runner=="warm")));
+        warm_scheduler.handle(Input::LegQueued(Box::new(warm_leg("warm-next"))), 1000);
+        let warm_until = match warm_scheduler.reason("warm-next") { Some(WaitReason::Warm { until, .. }) => *until, _ => 0 };
+        let freed = warm_scheduler.handle(Input::AttemptFinished { leg:"warm-first".into(), attempt:1, outcome:Outcome::Success }, 40_000);
+        assert!(freed.iter().any(|c| matches!(c, Command::Assign { leg, attempt:1, .. } if leg=="warm-next")));
+        warm_scheduler.handle(Input::AdmissionDeferred { leg:"warm-next".into(), attempt:1 }, 40_001);
+        let retry_at = 40_001 + REFUSED_AGAIN_MS;
+        assert!(warm_until > 40_001 && warm_until < retry_at, "the earlier warm deadline must occur during the admission wait");
+        let stale = warm_scheduler.handle(Input::Tick, warm_until);
+        assert!(!stale.iter().any(|c| matches!(c, Command::Assign { leg, .. } if leg=="warm-next")), "an obsolete warm timer cannot end admission back-pressure early");
+        let due = warm_scheduler.handle(Input::Tick, retry_at);
+        assert_eq!(due.iter().filter(|c| matches!(c, Command::Assign { leg, attempt:1, .. } if leg=="warm-next")).count(), 1);
     }
 }

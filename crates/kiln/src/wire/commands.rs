@@ -127,8 +127,21 @@ impl Stream {
     }
 }
 
+/// U01/U03: this SAME Commands owner reserves without making bytes visible to poll/Net.
+/// A dropped waiter leaves the reservation here. State 0=reserved,1=published,2=never exposed.
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedCommand {
+    connection: crate::net::Connection, grant: String, stamp: kiln_ci::wire::OrdinaryCommandV1,
+    state: std::sync::Arc<std::sync::atomic::AtomicU8>,
+}
+impl PreparedCommand {
+    pub(crate) fn stamp(&self) -> &kiln_ci::wire::OrdinaryCommandV1 { &self.stamp }
+    pub(crate) fn never_exposed(&self) -> bool { self.state.load(std::sync::atomic::Ordering::SeqCst) == 2 }
+}
+
 struct Peer {
     tx: Sender,
+    prepared: Option<PreparedCommand>,
     parked: Stream,
     live: Stream,
     /// The link is up: the runner process is connected, and may not have said what it has yet.
@@ -169,7 +182,7 @@ impl Commands {
 
     fn peer(&mut self, peer: PeerId) -> &mut Peer {
         let (room, patience) = (self.room, self.patience);
-        self.peers.entry(peer).or_insert_with(|| Peer { tx: Sender::new(room, patience), parked: Stream::new("p"), live: Stream::new("l"), link: false, up: false, wire: false, coming: None })
+        self.peers.entry(peer).or_insert_with(|| Peer { tx: Sender::new(room, patience), prepared: None, parked: Stream::new("p"), live: Stream::new("l"), link: false, up: false, wire: false, coming: None })
     }
 
     /// Whether runner process `peer` takes commands on the channel (it said so, or sent a frame of
@@ -242,6 +255,60 @@ impl Commands {
         p.coming = None;
     }
 
+    /// U01/U03: bounded, non-publishing reservation. It consumes no sequence; other Live
+    /// enqueues are refused until this exact token is committed or positively aborted.
+    pub(crate) fn prepare_bound(&mut self, connection: crate::net::Connection, grant: String) -> Result<PreparedCommand, &'static str> {
+        let born = self.born;
+        let p = self.peer(connection.peer());
+        if !p.link || !p.wire || !p.up { return Err("ordinary assignment needs an acknowledged current Live channel"); }
+        if p.prepared.is_some() { return Err("ordinary command preparation is full"); }
+        if p.live.generation == u64::MAX { return Err("ordinary Live generation is exhausted"); }
+        let stream = p.live.name(born);
+        let seq = p.tx.next_sequence(&stream);
+        if seq == u64::MAX { return Err("ordinary Live sequence is exhausted"); }
+        let token = PreparedCommand { connection, grant, stamp: kiln_ci::wire::OrdinaryCommandV1 { stream, seq }, state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)) };
+        p.prepared = Some(token.clone());
+        Ok(token)
+    }
+
+    /// Emergency session controls may retire only this SAME owner's private slot.
+    /// The sequence has never entered Sender; the caller's token retains that positive
+    /// non-exposure disposition for exact claim reconciliation, even if Store is pending.
+    pub(crate) fn preempt_unexposed(&mut self, peer: PeerId) {
+        if let Some(p) = self.peers.get_mut(&peer) && let Some(token) = p.prepared.take() {
+            token.state.store(2,std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// ONLY the exact owner can positively close a token which has never been exposed.
+    /// Unknown storage must retain the token; caller cancellation is not an abort request.
+    pub(crate) fn abort_prepared(&mut self, token: &PreparedCommand) -> bool {
+        let Some(p) = self.peers.get_mut(&token.connection.peer()) else { return token.never_exposed() };
+        if p.prepared.as_ref().is_some_and(|held| std::sync::Arc::ptr_eq(&held.state, &token.state)) {
+            token.state.store(2, std::sync::atomic::Ordering::SeqCst);
+            p.prepared = None;
+            return true;
+        }
+        token.never_exposed()
+    }
+
+    pub(crate) fn publish_prepared(&mut self, token: &PreparedCommand, body: Vec<u8>, now: Instant) -> Result<oneshot::Receiver<Answer>, &'static str> {
+        let born = self.born;
+        let Some(p) = self.peers.get_mut(&token.connection.peer()) else { return Err("original command owner is absent"); };
+        if !p.link || !p.wire || !p.prepared.as_ref().is_some_and(|held| std::sync::Arc::ptr_eq(&held.state, &token.state)
+            && held.connection == token.connection && held.grant == token.grant)
+            || p.live.name(born) != token.stamp.stream || p.tx.next_sequence(&token.stamp.stream) != token.stamp.seq
+            || token.state.load(std::sync::atomic::Ordering::SeqCst) != 0 { return Err("original command reservation changed; no retargeting"); }
+        if body.len() > ITEM_MOST { return Err("ordinary assignment exceeds command byte budget"); }
+        let seq = p.tx.push(&token.stamp.stream, body.clone()).map_err(|_| "ordinary command lane is full")?;
+        let (answer, receiver) = oneshot::channel();
+        // No fallible/await boundary remains between queue admission and ownership publication.
+        p.live.waiting.insert(seq, Waiting { answer, body, at: now, connection: Some(token.connection) });
+        token.state.store(1, std::sync::atomic::Ordering::SeqCst);
+        p.prepared = None;
+        Ok(receiver)
+    }
+
     /// Queues `body` (an encoded `ServerMsg`) as a command to `peer`: its answer comes on the
     /// receiver. A live command to a runner that's away (its link down), or one past the room, is
     /// answered at once; one to a runner that has just connected goes once it has said what it has.
@@ -259,6 +326,10 @@ impl Commands {
         let (tx, rx) = oneshot::channel();
         let born = self.born;
         let p = self.peer(peer);
+        if kind == Kind::Live && p.prepared.is_some() {
+            let _ = tx.send(Answer::Unreachable { why: "the exact ordinary command slot is preparing; retry without changing its owner".into() });
+            return rx;
+        }
         if connection.is_some() && (!p.link || !p.wire) {
             let _ = tx.send(Answer::Unreachable { why: "its captured runner does not have a live command channel".into() });
             return rx;
@@ -348,7 +419,10 @@ impl Commands {
     /// Runner process `peer` is gone for good (retired, forgotten): every command it hadn't
     /// answered ends unreachable.
     pub fn gone(&mut self, peer: PeerId, why: &str) {
-        let Some(p) = self.peers.remove(&peer) else { return };
+        let Some(mut p) = self.peers.remove(&peer) else { return };
+        // Only this Commands owner can attest that its private slot was never enqueued.
+        // Published commands have no prepared slot and remain Unknown on disconnection.
+        if let Some(token) = p.prepared.take() { token.state.store(2,std::sync::atomic::Ordering::SeqCst); }
         for w in p.parked.waiting.into_values().chain(p.live.waiting.into_values()) {
             let _ = w.answer.send(Answer::Unreachable { why: why.to_owned() });
         }
@@ -402,6 +476,10 @@ fn restart(p: &mut Peer, kind: Kind, born: u64, went: bool) {
         Kind::Parked => &mut p.parked,
         Kind::Live => &mut p.live,
     };
+    if kind == Kind::Live && let Some(prepared) = p.prepared.take() {
+        // The slot was never put into Sender; ending this exact authority cannot expose it later.
+        prepared.state.store(2, std::sync::atomic::Ordering::SeqCst);
+    }
     p.tx.drop_stream(&stream.name(born));
     let waiting = std::mem::take(&mut stream.waiting);
     stream.generation = stream.generation.saturating_add(1);
@@ -566,7 +644,7 @@ mod tests {
     }
 
     #[test]
-    fn a_command_is_answered_by_its_runner_and_a_refusal_says_why() {
+    fn a_command_is_answered_by_its_runner_and_a_refusal_says_why() -> anyhow::Result<()> {
         let base = Instant::now();
         let mut c = Commands::new(7);
         let mut r = Runner::new();
@@ -579,6 +657,40 @@ mod tests {
         assert_eq!(answer(&mut cancel), Some(Answer::Taken));
         assert_eq!(answer(&mut unknown), Some(Answer::Refused { code: Refusal::Unknown, why: "no such leg".into() }));
         assert_eq!(c.waiting(), 0);
+        // U01/U03: caller disappearance cannot expose a prepared Start. Both the
+        // actual delivery and a late publish after authority retirement are exercised.
+        let connection = crate::net::Connection::new(1,4,[4;32]);
+        let prepared = c.prepare_bound(connection,"original-grant".into()).map_err(anyhow::Error::msg)?;
+        let waiter = prepared.clone(); drop(waiter);
+        assert!(c.poll(base).is_empty(), "no prepared bytes reach the runner before known journal commit");
+        let mut raced = c.push(1,Kind::Live,b"must wait".to_vec(),base);
+        assert!(matches!(answer(&mut raced),Some(Answer::Unreachable { .. })));
+        let mut accepted = c.publish_prepared(&prepared,b"one exact Start".to_vec(),base).map_err(anyhow::Error::msg)?;
+        for frame in r.deliver(c.poll(base), |_| false) { c.on_frame(1,frame); }
+        assert_eq!(answer(&mut accepted),Some(Answer::Taken));
+        assert!(!c.abort_prepared(&prepared), "published work is never relabeled never-exposed");
+        assert!(c.publish_prepared(&prepared,b"duplicate effect".to_vec(),base).is_err());
+        let blocked = c.prepare_bound(connection,"pending-storage".into()).map_err(anyhow::Error::msg)?;
+        c.preempt_unexposed(connection.peer());
+        let mut urgent = c.push(connection.peer(),Kind::Live,b"interrupt now".to_vec(),base);
+        for frame in r.deliver(c.poll(base), |_| false) { c.on_frame(1,frame); }
+        assert_eq!(answer(&mut urgent),Some(Answer::Taken));
+        assert!(blocked.never_exposed() && c.abort_prepared(&blocked));
+        assert!(c.publish_prepared(&blocked,b"preempted Start".to_vec(),base).is_err());
+        assert_eq!(r.took.iter().filter(|body| body.as_slice() == b"interrupt now").count(),1);
+        let abandoned = c.prepare_bound(connection,"abandoned".into()).map_err(anyhow::Error::msg)?;
+        c.down(1);
+        assert!(abandoned.never_exposed());
+        assert!(c.publish_prepared(&abandoned,b"late effect".to_vec(),base).is_err());
+        c.connected(connection.peer());
+        c.on_frame(connection.peer(),Frame::Have(Vec::new()));
+        let forgotten = c.prepare_bound(connection,"forgotten".into()).map_err(anyhow::Error::msg)?;
+        c.gone(connection.peer(),"the original owner retired");
+        assert!(forgotten.never_exposed());
+        assert!(c.abort_prepared(&forgotten));
+        assert!(c.publish_prepared(&forgotten,b"retired effect".to_vec(),base).is_err());
+        assert_eq!(r.took.iter().filter(|body| body.as_slice() == b"one exact Start").count(),1);
+        Ok(())
     }
 
     /// A command too large for the frame its item rides is answered at once, never queued: it

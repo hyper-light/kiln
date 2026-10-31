@@ -214,6 +214,13 @@ impl Connection {
     pub(crate) fn new(peer: PeerId, epoch: u64, binding: [u8; 32]) -> Self { Self { peer, epoch, binding } }
     pub(crate) fn peer(self) -> PeerId { self.peer }
     pub(crate) fn epoch(self) -> u64 { self.epoch }
+    /// U01/U03: both TLS endpoints can compare this public binding digest. Unlike the
+    /// local connection_id, it deliberately contains no endpoint-specific PeerId/epoch.
+    pub(crate) fn channel_id(self) -> String {
+        let mut input = b"kiln ordinary channel v1\0".to_vec();
+        input.extend_from_slice(&self.binding);
+        crate::util::sha256_hex(&input)
+    }
     /// A public ownership identifier; it does not reveal TLS exporter material.
     pub(crate) fn connection_id(self) -> String {
         let mut input = b"kiln runner connection v1\0".to_vec();

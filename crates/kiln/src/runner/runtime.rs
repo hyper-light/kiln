@@ -1180,8 +1180,13 @@ impl Leg {
     }
 
     async fn event(&self, e: &JobEventV2) {
-        if let Ok(json) = serde_json::to_string(e) {
-            self.up.msg(AgentMsg::JobEvent { job: self.a.job_id.clone(), json }).await;
+        if let Ok(mut value) = serde_json::to_value(e) {
+            // U01/U03: capacity already belongs to the durable original claim. This live
+            // debug notification must not create a second legacy receipt obligation.
+            if matches!(e,JobEventV2::KeptOwned { .. }) && let Some(owner) = &self.a.ordinary_owner
+                && let Some(object) = value.as_object_mut()
+            { object.insert("ordinary_grant".into(),serde_json::Value::String(owner.grant.clone())); }
+            if let Ok(json) = serde_json::to_string(&value) { self.up.msg(AgentMsg::JobEvent { job: self.a.job_id.clone(), json }).await; }
         }
     }
 

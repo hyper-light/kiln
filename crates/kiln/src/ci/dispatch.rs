@@ -26,6 +26,7 @@ use crate::sql::OptionalExtension as _;
 mod admission;
 mod cancellation;
 mod retained;
+mod ordinary;
 mod executors;
 pub use cancellation::CancelError;
 pub use executors::ExecutorOrigin;
@@ -78,6 +79,8 @@ pub enum Msg {
     /// U01: one Scheduler owns both CI and externally executed reach reservations.
     Admission { agent: String, ask: serde_json::Value, reply: async_channel::Sender<serde_json::Value> },
     /// U01: exact ownership must be durable before the transport acknowledges a kept event.
+    OrdinaryStage { agent: String, nonce: String, event: JobEventV2, reply: async_channel::Sender<Result<Option<wire::OrdinaryFrontierAckV1>,String>> },
+    OrdinaryRejected { owner: wire::OrdinaryOwnerV1 },
     RetainedStage { agent: String, job: String, event: JobEventV2, reply: async_channel::Sender<Result<(), String>> },
     ExecutorStage { agent: String, event: crate::runner::pool::Said, connection: Option<ExecutorOrigin>, reply: async_channel::Sender<Result<(), String>> },
     ExecutorCommand { executor: String, generation: String, allocation: String, operation: String, answer: crate::wire::commands::Answer },
@@ -627,6 +630,17 @@ impl Handle {
             Ok(Ok(Ok(()))) => Ok(true),
             Ok(Ok(Err(e))) => Err(anyhow::anyhow!(e)),
             _ => Err(anyhow::anyhow!("U01 ownership staging did not commit before timeout")),
+        }
+    }
+
+    /// U01/U03: authenticated ordinary domain/proof effect commits before exact frontier ACK.
+    pub(crate) async fn stage_ordinary_event(&self,agent: &str,nonce: &str,event: JobEventV2) -> anyhow::Result<Option<wire::OrdinaryFrontierAckV1>> {
+        anyhow::ensure!(self.on.load(Ordering::Relaxed) && self.tx.len() < 128, "ordinary ownership admission is unavailable/full");
+        let (reply,rx) = async_channel::bounded(1);
+        self.send(Msg::OrdinaryStage { agent:agent.into(),nonce:nonce.into(),event,reply });
+        match crate::rt::timeout(Duration::from_secs(10),rx.recv()).await {
+            Ok(Ok(Ok(ack))) => Ok(ack), Ok(Ok(Err(error))) => Err(anyhow::anyhow!(error)),
+            _ => Err(anyhow::anyhow!("ordinary ownership outcome is unknown; preserve original custody and replay")),
         }
     }
 
@@ -1213,6 +1227,12 @@ impl Dispatch {
                 let _ = reply.try_send(answer);
                 Ok(())
             }
+            Msg::OrdinaryStage { agent, nonce, event, reply } => {
+                let result = self.ordinary_event(&agent,&nonce,event).await.map_err(|error| format!("{error:#}"));
+                let _ = reply.try_send(result);
+                Ok(())
+            }
+            Msg::OrdinaryRejected { owner } => self.ordinary_rejected(owner).await,
             Msg::RetainedStage { agent, job, event, reply } => {
                 let result = self.retained_event(&agent, &job, event).await.map_err(|e| format!("{e:#}"));
                 let _ = reply.try_send(result);
@@ -1301,17 +1321,7 @@ impl Dispatch {
                 self.repo_deleted(&repo).await;
                 Ok(())
             }
-            Msg::Rejected { agent, leg } => {
-                self.hub.release_slot(&agent, &leg);
-                if let Some(l) = self.legs.get_mut(&leg) {
-                    l.agent = None;
-                }
-                let cmds = self.sched.handle(Input::Rejected { leg }, now_ms());
-                if let Some(cmds) = self.after(cmds) {
-                    Box::pin(self.commands(cmds)).await;
-                }
-                Ok(())
-            }
+            Msg::Rejected { agent, leg } => self.ordinary_or_legacy_rejected(&agent,&leg).await,
             Msg::Cancel { run, attempt, reason, reply } => {
                 let result = self.accept_cancel(&run, Some(attempt), &reason).await;
                 let committed = result.is_ok();
@@ -1574,6 +1584,31 @@ impl Dispatch {
 
     /// `gone`'s legs (each with its attempt) lost with their runner: each attempt fails so, for the
     /// scheduler to retry or conclude (W05-R05). The scheduler's commands.
+    async fn ordinary_rejected(&mut self,owner: wire::OrdinaryOwnerV1) -> anyhow::Result<()> {
+        let Some(journal) = self.ordinary_record(&owner.job,owner.attempt).await? else { return Ok(()) };
+        if journal.owner != owner || journal.physical != "no_start" || journal.logical != "running"
+            || !self.legs.get(&owner.job).is_some_and(|leg| leg.attempt == owner.attempt && leg.agent.as_deref() == Some(owner.host.as_str())) { return Ok(()); }
+        runs::requeue(&self.hub,&owner.job,owner.attempt,Some("the exact original ordinary grant never started".into())).await?;
+        self.hub.release_slot(&owner.host,&owner.job);
+        if let Some(leg) = self.legs.get_mut(&owner.job) { leg.agent = None; }
+        let commands = self.sched.handle(Input::Rejected { leg:owner.job },now_ms());
+        if let Some(commands) = self.after(commands) { Box::pin(self.commands(commands)).await; }
+        Ok(())
+    }
+    async fn ordinary_or_legacy_rejected(&mut self,agent: &str,leg: &str) -> anyhow::Result<()> {
+        let attempt = self.legs.get(leg).map_or(0,|leg| leg.attempt);
+        if let Some(journal) = self.ordinary_record(leg,attempt).await? {
+            // Generic Reject is not grant-wide NoStart. Only canonical exact proof can refund.
+            if journal.physical == "no_start" { self.hub.ci.send(Msg::OrdinaryRejected { owner:journal.owner }); }
+            return Ok(());
+        }
+        self.hub.release_slot(agent,leg);
+        if let Some(state) = self.legs.get_mut(leg) { state.agent = None; }
+        let commands = self.sched.handle(Input::Rejected { leg:leg.into() },now_ms());
+        if let Some(commands) = self.after(commands) { Box::pin(self.commands(commands)).await; }
+        Ok(())
+    }
+
     async fn lose(&mut self, gone: Vec<(String, u32)>, why: &str) -> Vec<Command> {
         let mut cmds = Vec::new();
         for (leg, attempt) in gone {
@@ -1581,36 +1616,32 @@ impl Dispatch {
                 self.forget_gone(&leg, attempt).await;
                 continue;
             }
-            let reservation = if let Some(agent) = self.legs.get(&leg).and_then(|l| l.agent.clone()) {
-                match self.prepare_retained(&agent, &leg, attempt).await {
-                    Ok(reservation) => reservation,
-                    Err(e) => {
-                        tracing::error!(leg, error = %format!("{e:#}"), "U01 lost retained allocation cannot be released");
-                        self.pending_losses.insert(leg.clone(), (attempt, why.into()));
-                        self.timers.insert(now_ms().saturating_add(1_000));
-                        continue;
-                    }
-                }
-            } else { None };
             let end = runs::AttemptEnd { conclusion: "failure", class: Some(FailureClass::RunnerLost.as_str()), exit_code: None, error: Some(why.to_owned()), peak_rss: None, cpu_seconds: None };
-            match runs::attempt_lost(&self.hub, &leg, attempt, end).await {
-                Ok(true) => { self.pending_losses.remove(&leg); }
-                Ok(false) => {
-                    if let Some(agent) = self.legs.get(&leg).and_then(|l| l.agent.clone())
-                        && let Err(e) = Box::pin(self.completion(&agent, &leg, attempt)).await
-                    {
-                        tracing::warn!(leg = %leg, error = %format!("{e:#}"), "the saved completion could not be applied before reconciling its runner");
-                        self.timers.insert(now_ms().saturating_add(1_000));
-                    }
-                    continue;
+            let ordinary = self.terminal_ordinary(&leg,attempt,end.clone(),true).await;
+            let (won,reservation) = match ordinary {
+                Ok(Some(result)) => result,
+                Ok(None) => {
+                    let reservation = if let Some(agent) = self.legs.get(&leg).and_then(|leg| leg.agent.clone()) {
+                        match self.prepare_retained(&agent,&leg,attempt).await { Ok(value) => value, Err(error) => {
+                            tracing::warn!(error = %format!("{error:#}"), "original lost allocation remains held");
+                            self.pending_losses.insert(leg.clone(),(attempt,why.into()));self.timers.insert(now_ms().saturating_add(1000));continue;
+                        } }
+                    } else { None };
+                    match runs::attempt_lost(&self.hub,&leg,attempt,end).await { Ok(won) => (won,reservation),Err(error) => {
+                        tracing::warn!(error = %format!("{error:#}"), "lost attempt remains unknown under its original owner");
+                        self.pending_losses.insert(leg.clone(),(attempt,why.into()));self.timers.insert(now_ms().saturating_add(1000));continue;
+                    } }
+                },
+                Err(error) => {
+                    tracing::warn!(error = %format!("{error:#}"), "ordinary loss transfer remains held until exact transaction reconciliation");
+                    self.pending_losses.insert(leg.clone(),(attempt,why.into()));self.timers.insert(now_ms().saturating_add(1000));continue;
                 }
-                Err(e) => {
-                    tracing::warn!(leg = %leg, error = %format!("{e:#}"), "the lost attempt could not be recorded");
-                    self.pending_losses.insert(leg.clone(), (attempt, why.into()));
-                    self.timers.insert(now_ms().saturating_add(1_000));
-                    continue;
-                }
+            };
+            if !won {
+                if let Some(agent) = self.legs.get(&leg).and_then(|leg| leg.agent.clone()) { let _ = Box::pin(self.completion(&agent,&leg,attempt)).await; }
+                continue;
             }
+            self.pending_losses.remove(&leg);
             let outcome = Outcome::Failed(Failed { class: FailureClass::RunnerLost, exit_code: None, log_hits: Vec::new() });
             let input = match reservation {
                 Some(reservation) => Input::RetainedFinished { leg, attempt, reservation: Box::new(reservation), outcome },
@@ -2773,6 +2804,42 @@ impl Dispatch {
         Ok(())
     }
 
+    /// U01/A2: callers have positive no-exposure authority: either no Commands token was
+    /// created, or their SAME token was positively aborted after a definite writer refusal.
+    /// Eligibility and requeue share one writer transaction; only its known commit can
+    /// return this SAME assigned attempt to the existing15s Scheduler timer.
+    async fn defer_ordinary_unexposed(&mut self,leg:&str,attempt:u32,note:String)->anyhow::Result<()> {
+        if self.sched.allocation(leg,attempt,"preclaim-readiness".into()).is_none() {
+            self.admission.ready=false;
+            anyhow::bail!("ordinary readiness deferral lost its exact assigned Scheduler attempt");
+        }
+        let key=leg.to_owned();
+        let requeued=self.hub.store.call(move|c| {
+            let tx=crate::store::tx(c)?;
+            let job:Option<(String,u32,bool)>=tx.query_row("SELECT status,attempt,job_id IS NULL FROM jobs WHERE id=?1",[&key],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional()?;
+            let (status,current,legacy)=job.ok_or_else(||anyhow::anyhow!("ordinary preclaim readiness has no original job"))?;
+            anyhow::ensure!(!legacy && matches!(status.as_str(),"queued"|"pending"|"waiting") && current.max(1)==attempt,"ordinary readiness deferral cannot requeue running, legacy or changed attempt ownership");
+            let previous:Option<(String,Option<String>,String,bool,bool)>=tx.query_row("SELECT agent,execution,allocation,transferred,released FROM ci_retained_ownership WHERE job=?1 AND attempt=?2",crate::sql::params![key,attempt],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).optional()?;
+            if let Some((agent,execution,json,transferred,released))=previous {
+                let journal=ordinary::journal_json(&json)?.ok_or_else(||anyhow::anyhow!("ordinary readiness deferral cannot replace historical ownership"))?;
+                anyhow::ensure!(journal.owner.job==key && journal.owner.attempt==attempt && journal.owner.host==agent && execution.as_deref()==Some(journal.owner.execution.as_str())
+                    && released && !transferred && journal.physical=="no_start" && journal.logical=="running" && status=="queued","ordinary readiness deferral cannot refund an unresolved or launched original grant");
+            }
+            runs::requeue_in(&tx,&key,attempt,Some(&note),crate::util::now_unix())?;
+            tx.commit()?;
+            Ok(())
+        }).await;
+        if let Err(error)=requeued {
+            self.admission.ready=false;
+            return Err(error.context("ordinary pre-effect requeue/ownership outcome is not safely deferrable; original Scheduler charge remains held"));
+        }
+        if let Some(state)=self.legs.get_mut(leg) {state.agent=None;}
+        let now=now_ms();
+        let commands=self.sched.handle(Input::AdmissionDeferred{leg:leg.into(),attempt},now);
+        if let Some(commands)=self.after(commands) {Box::pin(self.commands(commands)).await;}
+        Ok(())
+    }
+
     async fn assign(&mut self, leg: &str, runner: &str, attempt: u32, placed: Placement) -> anyhow::Result<()> {
         let Placement { executor, image, docker, slot } = placed;
         let Some(l) = self.legs.get(leg) else { return Ok(()) };
@@ -2867,14 +2934,84 @@ impl Dispatch {
             a.masks.push(v.clone());
             a.env_from.push((k, v));
         }
-        let json = serde_json::to_string(&a)?;
+        let ordinary = if a.executor.slot.is_none() && a.parent_binding.is_none() && !pod && !matches!(a.executor.kind.as_str(),"k8s" | "firecracker") {
+            let required = crate::proto::CAP_UNIFIED_LAYOUT | crate::proto::CAP_RESOURCE_OWNERSHIP | crate::proto::CAP_JOB_ATTEMPT | crate::proto::CAP_ORDINARY_EXECUTION_DEBT;
+            // Capture/prepare readiness failures precede any token/claim. Keep the user's
+            // SAME attempt queued on the existing delayed admission timer, without failing it
+            // or bouncing to another runner. Domain/ownership ambiguity remains fail-closed.
+            let captured = match self.hub.capture_newest_runner(runner,required) {
+                Ok(captured) => captured,
+                Err(error) => return self.defer_ordinary_unexposed(leg,attempt,format!("ordinary runner readiness: {error}")).await,
+            };
+            let Some(epoch) = captured.ordinary_epoch().map(str::to_owned) else {
+                return self.fail_unstarted(leg,attempt,"ownership","ordinary captured runner has no registered publication domain".into()).await;
+            };
+            match self.ordinary_domain(runner).await {
+                Ok(Some(registered)) if registered == epoch => {},
+                Ok(_) => return self.fail_unstarted(leg,attempt,"ownership","ordinary captured publication domain is not durably registered".into()).await,
+                Err(error) => { self.admission.ready = false; return Err(error.context("ordinary domain read is unknown; original admission remains held")); },
+            }
+            let allocation_id = format!("retained-{}",crate::util::new_id());
+            let Some(allocation) = self.sched.allocation(leg,attempt,allocation_id.clone()) else {
+                return self.fail_unstarted(leg,attempt,"ownership","ordinary assignment lost its original Scheduler snapshot".into()).await;
+            };
+            let grant = crate::util::new_id();
+            let token = match self.hub.prepare_ordinary_command(&captured,grant.clone()) {
+                Ok(token) => token,
+                Err(error) => return self.defer_ordinary_unexposed(leg,attempt,format!("ordinary command readiness: {error:#}")).await,
+            };
+            let owner = wire::OrdinaryOwnerV1 { version:1,grant,execution:format!("ci-{}",crate::util::new_id()),allocation:allocation_id,job:leg.into(),attempt,host:runner.into(),process_nonce:captured.process_nonce().into(),publication_epoch:epoch,connection:captured.connection().channel_id(),command:token.stamp().clone() };
+            if let Err(error) = owner.validate() {
+                if self.hub.abort_ordinary_command(&token) {
+                    return self.fail_unstarted(leg,attempt,"ownership",error.into()).await;
+                }
+                self.admission.ready = false;
+                anyhow::bail!("ordinary reservation could not be positively invalidated before claim");
+            }
+            a.ordinary_owner = Some(owner.clone());
+            Some((captured,token,owner,allocation))
+        } else { None };
+        // A definite encode failure predates the durable claim. Positively retire
+        // only our SAME never-enqueued token before the existing unstarted failure.
+        let json = match serde_json::to_string(&a) {
+            Ok(json) => json,
+            Err(error) => {
+                if let Some((_,token,_,_)) = &ordinary {
+                    if self.hub.abort_ordinary_command(token) {
+                        return self.fail_unstarted(leg,attempt,"assignment",format!("the ordinary assignment could not be encoded: {error}")).await;
+                    }
+                    self.admission.ready = false;
+                    return Err(anyhow::Error::new(error).context("ordinary encode failed without positive token invalidation; original admission remains held"));
+                }
+                return Err(error.into());
+            }
+        };
         if let Err(e) = super::secrets::record_uses(&self.hub, leg, used_ids).await {
             tracing::warn!(leg, error = %format!("{e:#}"), "secret uses could not be recorded");
         }
         // In a `k8s` pool's pod it runs in the pod's own container (W13-R07): a terminal into it is
         // an exec into the pod, not a shell on a machine (W17-R01).
         let recorded = if self.hub.pod_executors.lock().contains_key(runner) { "k8s" } else { executor.as_deref().unwrap_or("host") };
-        runs::claim(&self.hub, leg, runner, recorded, attempt).await?;
+        if let Some((_,token,owner,allocation)) = &ordinary {
+            match self.claim_ordinary(owner.clone(),allocation.clone(),recorded).await {
+                Ok(Ok(())) => {},
+                Ok(Err(refusal)) => {
+                    // Only the successful writer's closed pre-write disposition can
+                    // use this path. No ambiguity is reclassified as admission Full.
+                    if !self.hub.abort_ordinary_command(token) {
+                        self.admission.ready = false;
+                        anyhow::bail!("ordinary definite admission refusal lacks positive original token invalidation");
+                    }
+                    return self.defer_ordinary_unexposed(leg,attempt,refusal.to_string()).await;
+                }
+                Err(error) => {
+                    // Store/query/commit can be Unknown. Retain SAME token and original
+                    // Scheduler footprint, even if urgent control preempted its private slot.
+                    self.admission.ready = false;
+                    return Err(error.context("ordinary original claim outcome is unknown; admission remains held"));
+                }
+            }
+        } else { runs::claim(&self.hub, leg, runner, recorded, attempt).await?; }
         // The run's first leg to start: `workflow_run` `in_progress`.
         if let Some(run) = self.legs.get(leg).map(|l| l.run.clone()) {
             let first = self.runs.get_mut(&run).is_some_and(|r| !std::mem::replace(&mut r.in_progress, true));
@@ -2902,6 +3039,23 @@ impl Dispatch {
         tracing::info!(leg, runner, attempt, "leg assigned");
         // A live command: refused at once while its runner is away. Once taken, the leg's own
         // answer (JobStarted or Reject) says what came of it.
+        if let Some((captured,token,owner,_)) = ordinary {
+            match self.hub.publish_ordinary_command(&captured,&token,&ServerMsg::AssignV2 { json }).await {
+                Ok(pending) => pending.log_when_answered(crate::hub::LOG_WITHIN),
+                Err(error) => {
+                    // Only SAME Commands positive non-exposure can authorize this NoStart.
+                    if self.hub.abort_ordinary_command(&token) {
+                        if let Err(error) = self.refuse_unexposed(&owner).await {
+                            self.admission.ready = false;
+                            return Err(error.context("ordinary never-exposed disposition is unknown; original charge remains held"));
+                        }
+                        self.hub.ci.send(Msg::OrdinaryRejected { owner });
+                    } else { tracing::warn!(error = %format!("{error:#}"), "ordinary delivery remains unknown under its original grant"); }
+                }
+            }
+            self.hub.emit_job(leg).await;
+            return Ok(());
+        }
         let pending = self.hub.command_start(runner, &ServerMsg::AssignV2 { json }).await;
         match pending.at_once().filter(|a| **a != crate::wire::commands::Answer::Sent).cloned() {
             Some(a) => {
@@ -3057,6 +3211,7 @@ impl Dispatch {
             run_id: l.run.clone(),
             attempt,
             parent_binding: None,
+            ordinary_owner: None,
             repo: r.repo.name.clone(),
             sha: r.event.sha.clone(),
             git_ref: r.event.git_ref.clone(),
@@ -3237,6 +3392,7 @@ impl Dispatch {
                     tracing::warn!(leg, error = %format!("{e:#}"), "a built image could not be registered");
                 }
             }
+            JobEventV2::OrdinaryDomain { .. } | JobEventV2::OrdinaryExecutionPublication { .. } => anyhow::bail!("ordinary ownership event bypassed authenticated staging"),
             JobEventV2::Group { .. } | JobEventV2::Mask { .. } | JobEventV2::TestReport { .. } => {}
         }
         Ok(())
@@ -3300,8 +3456,15 @@ impl Dispatch {
         };
         let end = runs::AttemptEnd { conclusion, class, exit_code: r.exit_code, error: r.error.clone(), peak_rss: r.peak_rss, cpu_seconds: r.cpu_seconds };
         // U01: commit the transfer before terminal state or retry can free physical capacity.
-        let reservation = self.prepare_retained(agent, &r.job, attempt).await?;
-        runs::attempt_finished(&self.hub, &r.job, attempt, end).await?;
+        let reservation = match self.terminal_ordinary(&r.job,attempt,end.clone(),false).await? {
+            Some((true,reservation)) => reservation,
+            Some((false,_)) => return Ok(()),
+            None => {
+                let reservation = self.prepare_retained(agent,&r.job,attempt).await?;
+                runs::attempt_finished(&self.hub,&r.job,attempt,end).await?;
+                reservation
+            },
+        };
         if let Some(l) = self.legs.get_mut(&r.job) { l.agent = None; }
         let input = match reservation {
             Some(reservation) => Input::RetainedFinished { leg: r.job.clone(), attempt, reservation: Box::new(reservation), outcome },
@@ -3355,7 +3518,12 @@ impl Dispatch {
     /// A leg gone with its repository that ended (or was lost with its runner): out of the
     /// dispatcher, and its slot the scheduler's to give.
     async fn forget_gone(&mut self, leg: &str, attempt: u32) {
-        let reservation = if let Some(agent) = self.legs.get(leg).and_then(|l| l.agent.clone()) {
+        let end = runs::AttemptEnd { conclusion:"cancelled",class:None,exit_code:None,error:Some("repository or logical job removed".into()),peak_rss:None,cpu_seconds:None };
+        let ordinary = match self.terminal_ordinary(leg,attempt,end,false).await {
+            Ok(value) => value,
+            Err(error) => { tracing::warn!(error = %format!("{error:#}"), "deleted ordinary job retains its original allocation"); return; },
+        };
+        let reservation = if let Some((_,reservation)) = ordinary { reservation } else if let Some(agent) = self.legs.get(leg).and_then(|l| l.agent.clone()) {
             match self.prepare_retained(&agent, leg, attempt).await {
                 Ok(reservation) => reservation,
                 Err(e) => {
@@ -3723,6 +3891,23 @@ impl Dispatch {
                 // hold one of its slots for good.
                 (Status::Running, Some(a)) => {
                     let _ = self.sched.handle(Input::LegRunning { leg: Box::new(li), runner: a, attempt: attempt.max(1) }, now_ms());
+                    if let Some(journal) = self.ordinary_record(&id,attempt.max(1)).await? && journal.logical != "running" {
+                        let outcome = if journal.logical == "lost" { Outcome::Failed(Failed { class:FailureClass::RunnerLost,exit_code:None,log_hits:Vec::new() }) } else {
+                            let key = id.clone();let number = attempt.max(1);
+                            let (conclusion,class,exit): (String,Option<String>,Option<i32>) = self.hub.store.call(move |c| Ok(c.query_row("SELECT conclusion,failure_class,exit_code FROM ci_attempts WHERE leg_id=?1 AND number=?2 AND status='done'",crate::sql::params![key,number],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?)).await?;
+                            match conclusion.as_str() {
+                                "success" => Outcome::Success, "cancelled" => Outcome::Cancelled,
+                                "failure" | "timed_out" => Outcome::Failed(Failed { class:class.as_deref().and_then(FailureClass::parse).unwrap_or(if conclusion == "timed_out" { FailureClass::Timeout } else { FailureClass::Failure }),exit_code:exit,log_hits:Vec::new() }),
+                                _ => anyhow::bail!("ordinary terminal replay has an unsupported original attempt outcome"),
+                            }
+                        };
+                        let input = if journal.physical == "pending" { Input::RetainedFinished { leg:id.clone(),attempt:attempt.max(1),reservation:Box::new(journal.allocation),outcome } }
+                            else { Input::AttemptFinished { leg:id.clone(),attempt:attempt.max(1),outcome } };
+                        // No command/placement is exposed between original adoption and the SAME
+                        // retained_finished transition; pre-adopted debt is never adopted twice.
+                        self.next.extend(self.sched.handle(input,now_ms()));
+                        if let Some(leg) = self.legs.get_mut(&id) { leg.agent = None; }
+                    }
                 }
                 _ => queued.push(li),
             }

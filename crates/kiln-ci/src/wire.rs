@@ -25,6 +25,50 @@ pub struct ParentBinding {
     pub attempt: u32,
 }
 
+/// U01/U03: the immutable ordinary grant and ORIGINAL Live admission stamp. JSON only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrdinaryCommandV1 { pub stream: String, pub seq: u64 }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrdinaryOwnerV1 {
+    pub version: u8, pub grant: String, pub execution: String, pub allocation: String,
+    pub job: String, pub attempt: u32, pub host: String, pub process_nonce: String,
+    pub publication_epoch: String, pub connection: String, pub command: OrdinaryCommandV1,
+}
+impl OrdinaryOwnerV1 {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let text = |s: &str, limit| !s.is_empty() && s.len() <= limit && !s.chars().any(char::is_control);
+        let id = |s: &str| text(s,128) && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+        if self.version != 1 || self.attempt == 0 || self.command.seq == 0 || self.command.seq == u64::MAX
+            || !id(&self.grant) || !id(&self.publication_epoch) || !self.execution.starts_with("ci-") || !id(&self.execution)
+            || !self.allocation.starts_with("retained-") || !id(&self.allocation) || !text(&self.job,512) || !text(&self.host,256)
+            || !text(&self.process_nonce,128) || self.connection.len() != 64 || !self.connection.bytes().all(|b| b.is_ascii_hexdigit()) || !text(&self.command.stream,128) { return Err("invalid ordinary execution owner"); }
+        let Some((born,generation)) = self.command.stream.strip_prefix("l:").and_then(|s| s.split_once('.')) else { return Err("ordinary assignment needs its original Live stamp"); };
+        if born.parse::<u64>().is_err() || generation.parse::<u64>().ok().is_none_or(|g| g == 0 || g == u64::MAX) { return Err("invalid ordinary Live generation"); }
+        Ok(())
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrdinaryPhaseV1 { Stopped, NoStart }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrdinaryPublicationV1 { pub version: u8, pub epoch: String, pub seq: u64, pub owner: OrdinaryOwnerV1, pub phase: OrdinaryPhaseV1, pub recovery: bool }
+impl OrdinaryPublicationV1 {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        self.owner.validate()?;
+        if self.version != 1 || self.seq == 0 || self.epoch != self.owner.publication_epoch { return Err("invalid ordinary publication domain/sequence"); }
+        Ok(())
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrdinaryFrontierAckV1 { pub kind: String, pub version: u8, pub epoch: String, pub through: u64 }
+impl OrdinaryFrontierAckV1 {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.kind != "ordinary_frontier" || self.version != 1 || self.epoch.is_empty() || self.epoch.len() > 128
+            || !self.epoch.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') { return Err("invalid ordinary frontier acknowledgement"); }
+        Ok(())
+    }
+}
+
 /// One leg for a runner.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -37,6 +81,9 @@ pub struct AssignmentV2 {
     /// U01: inherited ownership of an already reserved executor; never a second reservation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_binding: Option<ParentBinding>,
+    /// U01/U03: native, non-pooled, negotiated ordinary ownership only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ordinary_owner: Option<OrdinaryOwnerV1>,
     /// `owner/name`.
     pub repo: String,
     pub sha: String,
@@ -502,6 +549,10 @@ pub enum JobEventV2 {
     /// U03: bind retained capacity to its exact execution before terminal completion. Legacy
     /// Kept remains readable, but cannot supply this execution identity on its own.
     KeptOwned { execution: String, attempt: u32, until: i64 },
+    /// U01/U03: host durable publication domain, authenticated before ordinary readiness.
+    OrdinaryDomain { epoch: String, process_nonce: String },
+    /// U01/U03: exact positive physical/no-start evidence; never an ordinary status.
+    OrdinaryExecutionPublication { publication: OrdinaryPublicationV1 },
 }
 
 #[cfg(test)]

@@ -487,12 +487,14 @@ pub const CAP_UNIFIED_LAYOUT: u64 = 1 << 49;
 /// CI/CD coordinator with pinned admission; a runner owns a live explicit activation backend.
 /// This is role-specific software capability, never cryptographic approval of a release/job.
 pub const CAP_EXPLICIT_ACTIVATION: u64 = 1 << 50;
+/// U01/U03: paired durable ordinary grant/admission and sequenced physical debt law.
+pub const CAP_ORDINARY_EXECUTION_DEBT: u64 = 1 << 51;
 
 /// Refuse an identifiable unsupported private layout at its capability handshake, before
 /// dispatching extensions. Main's bit 41 means only CAP_UNREAD; it cannot prove Amphora.
 pub fn check_unified_layout(caps: u64) -> Result<(), &'static str> {
     let extensions = CAP_HARNESS_RELEASE | CAP_JOB_ATTEMPT | CAP_OPEN_ONCE
-        | CAP_RETAINED_RECEIVED | CAP_RESOURCE_OWNERSHIP | CAP_FIRECRACKER_SHAPE | CAP_AMPHORA | CAP_EXPLICIT_ACTIVATION;
+        | CAP_RETAINED_RECEIVED | CAP_RESOURCE_OWNERSHIP | CAP_FIRECRACKER_SHAPE | CAP_AMPHORA | CAP_EXPLICIT_ACTIVATION | CAP_ORDINARY_EXECUTION_DEBT;
     if caps & extensions != 0 && caps & CAP_UNIFIED_LAYOUT == 0 {
         Err("unsupported private protocol layout; unified extensions require CAP_UNIFIED_LAYOUT")
     } else {
@@ -1263,6 +1265,10 @@ mod tests {
         assert_eq!(unified & current_main, 0, "unified capabilities follow the deployed main bits");
         assert_eq!(CAP_UNIFIED_LAYOUT, 1 << 49);
         assert_eq!(CAP_EXPLICIT_ACTIVATION, 1 << 50);
+        assert_eq!(CAP_ORDINARY_EXECUTION_DEBT,1 << 51);
+        assert_eq!(CAP_ORDINARY_EXECUTION_DEBT & (CAP_EXPLICIT_ACTIVATION | CAP_UNIFIED_LAYOUT | unified | current_main),0);
+        assert!(check_unified_layout(CAP_ORDINARY_EXECUTION_DEBT).is_err());
+        assert!(check_unified_layout(CAP_UNIFIED_LAYOUT | CAP_ORDINARY_EXECUTION_DEBT).is_ok());
         assert_eq!(CAP_EXPLICIT_ACTIVATION & (CAP_UNIFIED_LAYOUT | unified | CAP_FIRECRACKER_SHAPE | current_main), 0);
         assert!(check_unified_layout(CAP_EXPLICIT_ACTIVATION).is_err());
         assert!(check_unified_layout(CAP_UNIFIED_LAYOUT | CAP_EXPLICIT_ACTIVATION).is_ok());

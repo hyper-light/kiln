@@ -31,6 +31,10 @@ struct Record {
     parent: Option<ParentBinding>,
     #[serde(default)]
     executor_owner: Option<ExecutorOwner>,
+    #[serde(default)]
+    ordinary_owner: Option<kiln_ci::wire::OrdinaryOwnerV1>,
+    #[serde(default)]
+    incoming_closed: bool,
     phase: Phase,
     #[serde(default)]
     resource_domain: Option<ResourceDomain>,
@@ -41,14 +45,15 @@ struct Record {
 }
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum Phase { Open, Closed, Stopped, V2Open, V2Closed, V2Stopped }
+enum Phase { Open, Closed, Stopped, V2Open, V2Closed, V2Stopped, OrdinaryOpen, OrdinaryClosed, OrdinaryStopped, OrdinaryNoStart }
 impl Phase {
-    fn open(self) -> bool { matches!(self, Self::Open | Self::V2Open) }
-    fn closed(self) -> bool { matches!(self, Self::Closed | Self::V2Closed) }
-    fn stopped(self) -> bool { matches!(self, Self::Stopped | Self::V2Stopped) }
+    fn open(self) -> bool { matches!(self, Self::Open | Self::V2Open | Self::OrdinaryOpen) }
+    fn closed(self) -> bool { matches!(self, Self::Closed | Self::V2Closed | Self::OrdinaryClosed) }
+    fn stopped(self) -> bool { matches!(self, Self::Stopped | Self::V2Stopped | Self::OrdinaryStopped | Self::OrdinaryNoStart) }
     fn v2(self) -> bool { matches!(self, Self::V2Open | Self::V2Closed | Self::V2Stopped) }
-    fn closing(self) -> Self { if self.v2() { Self::V2Closed } else { Self::Closed } }
-    fn stopping(self) -> Self { if self.v2() { Self::V2Stopped } else { Self::Stopped } }
+    fn ordinary(self) -> bool { matches!(self, Self::OrdinaryOpen | Self::OrdinaryClosed | Self::OrdinaryStopped | Self::OrdinaryNoStart) }
+    fn closing(self) -> Self { if self.ordinary() { Self::OrdinaryClosed } else if self.v2() { Self::V2Closed } else { Self::Closed } }
+    fn stopping(self) -> Self { if self.ordinary() { Self::OrdinaryStopped } else if self.v2() { Self::V2Stopped } else { Self::Stopped } }
 }
 
 /// The existing strict phase enum is the reader-version fence: older binaries reject all
@@ -74,6 +79,12 @@ fn validate_record(identity: &str, record: &Record) -> anyhow::Result<()> {
     anyhow::ensure!(record.execution == identity && !record.job.is_empty() && record.job.len() <= 512 && record.attempt.is_none_or(|a| a > 0), "invalid execution fence metadata");
     anyhow::ensure!(!(record.retained && (record.phase.stopped() || record.was_retained == Some(false))), "inconsistent retained execution fence");
     anyhow::ensure!(record.phase.v2() == record.resource_domain.is_some(), "inconsistent execution Gate version/domain");
+    anyhow::ensure!(record.phase.ordinary() == record.ordinary_owner.is_some(), "inconsistent ordinary Gate version/owner");
+    if let Some(owner) = &record.ordinary_owner {
+        owner.validate().map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(owner.execution == record.execution && owner.job == record.job && record.attempt == Some(owner.attempt)
+            && record.parent.is_none() && record.executor_owner.is_none() && record.resource_domain.is_none(), "ordinary Gate changed its original native grant");
+    }
     if let Some(domain) = &record.resource_domain {
         domain.limits.validate()?;
         let identity = Path::new(&domain.identity);
@@ -93,14 +104,34 @@ fn validate_record(identity: &str, record: &Record) -> anyhow::Result<()> {
 
 impl Gate {
     pub(super) fn create(admission: Admission, execution: &str, job: &str, attempt: Option<u32>, work: &Path, parent: Option<ParentBinding>, executor_owner: Option<ExecutorOwner>) -> anyhow::Result<Arc<Self>> {
+        Self::create_owned(admission, execution, job, attempt, work, parent, executor_owner, None)
+    }
+
+    pub(super) fn create_owned(admission: Admission, execution: &str, job: &str, attempt: Option<u32>, work: &Path, parent: Option<ParentBinding>, executor_owner: Option<ExecutorOwner>, ordinary_owner: Option<kiln_ci::wire::OrdinaryOwnerV1>) -> anyhow::Result<Arc<Self>> {
+        if let Some(owner) = &ordinary_owner {
+            owner.validate().map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(owner.execution == execution && owner.job == job && attempt == Some(owner.attempt) && parent.is_none() && executor_owner.is_none(), "ordinary Gate admission changed its grant");
+        }
         std::fs::create_dir_all(root(&admission))?;
         anyhow::ensure!(entries(&admission)?.len() < LIMIT, "physical execution evidence is full; deliver its pending stopped proofs before admitting work");
         let at = path(&admission, execution)?;
         let permit = std::fs::OpenOptions::new().create_new(true).read(true).write(true).open(at.with_extension("lock"))?;
         permit.try_lock()?;
         let work = std::path::absolute(work)?;
-        save(&at, &Record { execution: execution.into(), job: job.into(), attempt, work, parent, executor_owner, phase: Phase::Open, resource_domain: None, retained: false, was_retained: Some(false) })?;
+        save(&at, &Record { execution: execution.into(), job: job.into(), attempt, work, parent, executor_owner, phase: if ordinary_owner.is_some() { Phase::OrdinaryOpen } else { Phase::Open }, ordinary_owner, incoming_closed: false, resource_domain: None, retained: false, was_retained: Some(false) })?;
         Ok(Arc::new(Self { admission, identity: execution.into(), _permit: permit, lifecycle: parking_lot::Mutex::new(()) }))
+    }
+
+    pub(super) fn close_incoming(&self, owner: &kiln_ci::wire::OrdinaryOwnerV1, no_start: bool) -> anyhow::Result<()> {
+        let _serial = self.lifecycle.lock();
+        let mut record = read(&self.admission, &self.identity)?;
+        anyhow::ensure!(record.ordinary_owner.as_ref() == Some(owner), "ordinary admission changed its exact owner");
+        if no_start {
+            anyhow::ensure!(record.phase == Phase::OrdinaryOpen && !super::records(&self.admission)?.iter().any(|(_, group)| group.execution.as_deref() == Some(self.identity.as_str())), "NoStart cannot erase an admitted physical effect");
+            record.phase = Phase::OrdinaryNoStart;
+        }
+        record.incoming_closed = true;
+        save(&path(&self.admission, &self.identity)?, &record)
     }
 
     pub(super) fn bind_domain(&self, kernel: &super::Containment, limits: crate::os::cgroup::CpuMemoryLimit) -> anyhow::Result<()> {
@@ -270,6 +301,7 @@ pub(crate) fn try_acknowledge_evidence(admission: &Admission, proof: &StoppedExe
     let at = path(admission, &proof.execution)?;
     let record = match read(admission, &proof.execution) { Ok(r) => r, Err(_) if !at.try_exists()? => return Ok(true), Err(e) => return Err(e) };
     anyhow::ensure!((proof.attempt.is_some() || proof.executor_owner.is_some()) && proof.was_retained.is_some() && record.phase.stopped() && record.job == proof.job && record.attempt == proof.attempt && record.work == proof.work && record.parent == proof.parent && record.was_retained == proof.was_retained && record.executor_owner == proof.executor_owner, "the receipt does not own this stopped execution proof");
+    if record.phase.ordinary() { return Ok(false); }
     // Do not unlink evidence while a live cleanup still holds its exact root permit. That
     // cleanup may still be returning from its durable close; the Amphora spool can retry.
     let permit = match std::fs::OpenOptions::new().read(true).write(true).open(at.with_extension("lock")) {
@@ -292,6 +324,53 @@ pub(crate) fn try_acknowledge_evidence(admission: &Admission, proof: &StoppedExe
     Ok(true)
 }
 
+/// U01/U03: custody of the EXISTING Gate lock, never another lock/controller.
+pub(crate) enum OrdinaryClaim { Legacy, Pending, Claimed(Box<OrdinaryEvidence>) }
+pub(crate) struct OrdinaryEvidence { admission: Admission, proof: StoppedExecution, owner: kiln_ci::wire::OrdinaryOwnerV1, phase: kiln_ci::wire::OrdinaryPhaseV1, _permit: std::fs::File }
+impl OrdinaryEvidence {
+    pub(crate) fn owner(&self) -> &kiln_ci::wire::OrdinaryOwnerV1 { &self.owner }
+    pub(crate) fn phase(&self) -> kiln_ci::wire::OrdinaryPhaseV1 { self.phase }
+    pub(crate) fn confirm_incoming(&self) -> anyhow::Result<()> {
+        let mut record = read(&self.admission, &self.proof.execution)?;
+        anyhow::ensure!(record.ordinary_owner.as_ref() == Some(&self.owner) && record.phase.stopped(), "incoming closure changed exact stopped owner");
+        record.incoming_closed = true;
+        save(&path(&self.admission,&self.proof.execution)?,&record)
+    }
+    pub(crate) fn retire(self) -> anyhow::Result<bool> {
+        let record = read(&self.admission, &self.proof.execution)?;
+        anyhow::ensure!(record.ordinary_owner.as_ref() == Some(&self.owner) && record.phase.stopped(), "ordinary source changed during canonical transfer");
+        if !record.incoming_closed { return Ok(false); }
+        let at = path(&self.admission, &self.proof.execution)?;
+        remove(&at)?;
+        remove(&at.with_extension("lock"))?;
+        Ok(true)
+    }
+}
+#[derive(Debug,thiserror::Error)]
+#[error("LegacyOrdinaryExecutionsRequireDrain: pre-feature native Gate evidence remains; physically drain it before ordinary publication readiness")]
+struct LegacyOrdinaryExecutionsRequireDrain;
+pub(crate) fn ordinary_inventory_present(admission: &Admission) -> anyhow::Result<bool> {
+    let rows = entries(admission)?;
+    anyhow::ensure!(!rows.iter().any(|(_,record)| !record.phase.ordinary() && record.attempt.is_some() && record.parent.is_none() && record.executor_owner.is_none()),LegacyOrdinaryExecutionsRequireDrain);
+    Ok(rows.iter().any(|(_,record)| record.phase.ordinary()))
+}
+pub(crate) fn claim_ordinary_evidence(admission: &Admission, proof: &StoppedExecution) -> anyhow::Result<OrdinaryClaim> {
+    let at = path(admission, &proof.execution)?;
+    let first = match read(admission, &proof.execution) { Ok(record) => record, Err(_) if !at.try_exists()? => return Ok(OrdinaryClaim::Pending), Err(error) => return Err(error) };
+    if !first.phase.ordinary() { return Ok(OrdinaryClaim::Legacy); }
+    let permit = match std::fs::OpenOptions::new().read(true).write(true).open(at.with_extension("lock")) {
+        Ok(permit) => permit, Err(_) if !at.try_exists()? => return Ok(OrdinaryClaim::Pending), Err(error) => return Err(error.into()),
+    };
+    match permit.try_lock() { Ok(()) => {}, Err(std::fs::TryLockError::WouldBlock) => return Ok(OrdinaryClaim::Pending), Err(std::fs::TryLockError::Error(error)) => return Err(error.into()) }
+    // Re-read AFTER owning the same permit: a pre-lock snapshot may have been retired.
+    let record = match read(admission, &proof.execution) { Ok(record) => record, Err(_) if !at.try_exists()? => return Ok(OrdinaryClaim::Pending), Err(error) => return Err(error) };
+    anyhow::ensure!(record.phase.ordinary() && record.phase.stopped() && record.job == proof.job && record.attempt == proof.attempt && record.work == proof.work
+        && record.parent == proof.parent && record.executor_owner == proof.executor_owner && record.was_retained == proof.was_retained, "ordinary proof changed its exact physical owner");
+    let owner = record.ordinary_owner.context("ordinary proof lacks original owner")?;
+    let phase = if record.phase == Phase::OrdinaryNoStart { kiln_ci::wire::OrdinaryPhaseV1::NoStart } else { kiln_ci::wire::OrdinaryPhaseV1::Stopped };
+    Ok(OrdinaryClaim::Claimed(Box::new(OrdinaryEvidence { admission: admission.clone(), proof: proof.clone(), owner, phase, _permit: permit })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,7 +384,7 @@ mod tests {
         enum LegacyPhase { Open, Closed, Stopped }
         let mut record = Record { execution: "ci-format-fixture".into(), job: "executor:fixture".into(), attempt: None, work: PathBuf::from("fixture"), parent: None,
             executor_owner: Some(ExecutorOwner { executor: "fixture".into(), generation: "generation".into(), allocation: "allocation".into() }),
-            phase: Phase::Open, resource_domain: None, retained: false, was_retained: Some(false) };
+            ordinary_owner: None, incoming_closed: false, phase: Phase::Open, resource_domain: None, retained: false, was_retained: Some(false) };
         for phase in [Phase::Open, Phase::Closed, Phase::Stopped] {
             record.phase = phase;
             validate_record(&record.execution, &record)?;
@@ -323,6 +402,20 @@ mod tests {
             assert!(validate_record(&record.execution, &record).is_err(), "a v2 reader cannot lose its domain obligation");
             record.resource_domain = Some(domain.clone());
         }
+        // Ordinary ownership must also fence the actual previous v2 decoder, rather
+        // than relying on an optional field which old importers would ignore.
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum BeforeOrdinary { Open, Closed, Stopped, V2Open, V2Closed, V2Stopped }
+        record.resource_domain = None; record.executor_owner = None;
+        record.job = "ordinary-job".into(); record.attempt = Some(1);
+        record.ordinary_owner = Some(kiln_ci::wire::OrdinaryOwnerV1 { version:1,grant:"grant".into(),execution:record.execution.clone(),allocation:"retained-grant".into(),job:record.job.clone(),attempt:1,host:"host".into(),process_nonce:"a".repeat(43),publication_epoch:"epoch".into(),connection:"b".repeat(64),command:kiln_ci::wire::OrdinaryCommandV1 { stream:"l:7.1".into(),seq:1 } });
+        for phase in [Phase::OrdinaryOpen,Phase::OrdinaryClosed,Phase::OrdinaryStopped,Phase::OrdinaryNoStart] {
+            record.phase = phase; validate_record(&record.execution,&record)?;
+            assert!(serde_json::from_value::<BeforeOrdinary>(serde_json::to_value(phase)?).is_err());
+        }
+        record.ordinary_owner = None;
+        assert!(validate_record(&record.execution,&record).is_err(), "strict phase cannot lose original owner");
         Ok(())
     }
 }
