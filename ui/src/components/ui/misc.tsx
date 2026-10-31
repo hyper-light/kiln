@@ -6,6 +6,7 @@ import { Button } from "./button";
 import { pad2 } from "@/lib/format";
 import { useLocalStorage } from "@/lib/hooks";
 import { setPref } from "@/lib/prefs";
+import { copyText } from "@/views/terminal/clipboard";
 
 /* ---------------------------- page scaffolding ---------------------------- */
 
@@ -490,20 +491,13 @@ export function CopyButton({ text, label = "Copy", className }: { text: string; 
       variant="secondary"
       size="sm"
       className={className}
-      onClick={async () => {
-        try {
-          await navigator.clipboard.writeText(text);
-        } catch {
-          const ta = document.createElement("textarea");
-          ta.value = text;
-          document.body.appendChild(ta);
-          ta.select();
-          document.execCommand("copy");
-          ta.remove();
-        }
-        setCopied(true);
-        window.setTimeout(() => setCopied(false), 1600);
-      }}
+      onClick={() =>
+        void copyText(text).then((ok) => {
+          if (!ok) return;
+          setCopied(true);
+          window.setTimeout(() => setCopied(false), 1600);
+        })
+      }
     >
       {copied ? "Copied" : label}
     </Button>
