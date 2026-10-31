@@ -455,6 +455,18 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
     let Some(caller) = boxed(|| caller_of(&hub, req.headers())).await else {
         return Err(err(StatusCode::UNAUTHORIZED, "authentication required"));
     };
+    // agents.wait takes delivery of the waiter's messages: a change, so a POST. Asked by GET, the
+    // registry would read `wait` as an agent's id (agents.get); say why instead.
+    if method == Method::GET && s.as_slice() == ["api", "harness", "agents", "wait"] {
+        return Err(err(StatusCode::METHOD_NOT_ALLOWED, "agents.wait takes delivery of your messages, so it's a POST: send its input as a JSON body"));
+    }
+    // An agent's repository, its workflows and whether the caller may run them (the experiments
+    // setup's summary): the UI's own read, no operation, ahead of experiments.get (which would read
+    // `where` as an experiment's id). where_for checks the caller may read that repository's runs.
+    if method == Method::GET && s.as_slice() == ["api", "experiments", "where"] {
+        let q = srv::query(&req);
+        return boxed(|| crate::ci::experiments::where_for(&hub, &caller, &q)).await.map_err(|(c, m)| err(c, m));
+    }
     // U12: the descriptor decides routing, rights and whether this call is audited.
     if crate::ops::owns_http(&method, &s) {
         let cx = crate::ops::Cx { hub: Arc::clone(&hub), caller };

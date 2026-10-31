@@ -86,7 +86,9 @@ where it has one; Devin, the other ACP agents and Antigravity take it in words, 
 first message they get (a restart before that gives it then), in less room. The permission mode
 goes at the same latitude, never wider (an ACP agent that names its modes only once started gets
 kiln's Ask, or Bypass from a mode that skipped every check), and the effort as near as the model
-takes. The timeline marks the line between the two.
+takes. The to-dos go in the note it's given ("The plan as it stands"), and the session goes on
+with none: the new harness keeps a list of its own, so keep-going ([goals.md](goals.md)) never
+holds it to one only the old harness could change. The timeline marks the line between the two.
 
 ## Where a harness is found
 
@@ -132,6 +134,14 @@ drives). So does a job of the machine's own: a systemd user unit (`systemd-run -
 scope) leaves the agent's group of processes, and kiln leaves it alone. An `ssh-agent` a shell's startup file starts (`eval "$(ssh-agent -s)"`) is no work of the
 agent's at all: never shown as left running, and stopped between turns or once 30 minutes old.
 
+An agent's harness is never something it left running, nor is anything under it: neither any
+session's harness as it is now, nor a process kiln started itself (its parent is the runner, which is
+no subreaper, so what a command leaves runs on under init or the nearest subreaper). A harness can
+start while a look goes on (a sign-in starts every Claude Code agent's again at once): the look
+knew the harness before it, so the session it belongs to is left out of that look and looked at
+again ten seconds later. On 2026-10-31 such harnesses were noted as left running and stopped once
+their agents were between turns, and 26 agents on one machine ended.
+
 When the runner starts again (an upgrade, a crash, the system stopping it, a re-join), a harness
 that outlived it is stopped before the session resumes (what it started is kept), so two harnesses
 never work one conversation; then whatever the session started that still runs is taken back over
@@ -140,6 +150,27 @@ it goes when that turn ends, as anything else left running.
 Ending the agent stops what it left running, then ends whatever else is still in its group (what
 left its harness's tree included) and removes the group. kiln's own helpers and MCP servers aren't
 counted.
+
+## An agent lives until it's ended
+
+An agent lives from its start until a person ends it, or the agent that started it does (`agents.stop`).
+Its machine's record of its sessions holds it, and the server's conversation store holds its
+conversation. Its harness's process is only how it runs now. When that process ends and nobody
+ended the agent, whatever ended it (a signal from outside it, a machine short of memory, a crash,
+an end of its own), the agent goes on. kiln starts its harness again on the same conversation, and
+a turn the end cut short goes on first: the agent is told its process ended part-way through it and
+to pick up where it left off. Its timeline says how the process ended ("exit 143: SIGTERM from
+outside it") and that it starts again. Until it's back, it stands as working, and its `exit` says
+when it starts again (`again_at`, Unix ms).
+
+The first start again waits 2 s. Each after it waits twice as long as the one before, at most
+5 minutes, and once a process runs 10 minutes the wait is 2 s again. A harness that never starts
+(its program is missing), or that ends within 20 s of each of its last three starts, won't start:
+it stands stopped, saying why, until a person restarts it or sends it a message. Where its
+machine holds as many agents at work as it may, it starts again once there's room.
+
+A runner that starts again (an upgrade, a crash, the system stopping it) starts each of its agents
+again the same way, from its record (above).
 
 ## How many agents a machine runs
 
@@ -569,7 +600,7 @@ code-mode function (`kiln.agents.start`) and, from a kiln shell, a CLI command.
 | `agents.start` | `POST /api/harness/agents` | `{kind, on?, cwd?, prompt?, model?, effort?, mode?, name?, count?, workspace?}` → `{agents: [Agent], parent}` |
 | `agents.about` | `POST /api/harness/agents/:id/about` | `{path, code, line?, end_line?, selection?, change?, question?, now?}` → `{agents: [Agent], itself}`: a child of the agent, reading only, answers what a person tapped in its conversation (a name, a line, a change) in four parts (what it is, what it does here, where else it's used, what's worth knowing); when the agent runs no subagents (`max_subagents` 0) it answers itself (`itself: true`, `sent` as `agents.send` answers), after its turn or with `now` between its steps. The child is a helper (`helper: "about"` on it): no row of Mission Control, its parent not told of it, ended once no card has read it (`agents.result`) for 90 seconds |
 | `agents.send` | `POST /api/harness/agents/:id/send` | `{text, mode?: "queue" \| "steer" \| "now", key?}` (or the `Idempotency-Key` header) → `{sent, message, accepted?}`: `accepted` is the agent's inbox's answer, `repeat` on every one after the first ("Sending again", below) |
-| `agents.wait` | `GET /api/harness/agents/wait` | `agent?` or `agents?` (a list; over HTTP `a,b`), `until?: "settled" \| "change"`, `any?`, `timeout_s?`, `hand_over?` → `{done, timed_out, waited_ms, until, agents: [Agent], messages?: [{from, name, text, at}]}` (`messages`: what other agents sent the agent that waits, handed over: "Waiting") |
+| `agents.wait` | `POST /api/harness/agents/wait` | `{agent?` or `agents?` (a list, or `a,b`), `until?: "settled" \| "change"`, `any?`, `timeout_s?`, `hand_over?}` → `{done, timed_out, waited_ms, until, agents: [Agent], messages?: [{from, name, text, at}]}` (`messages`: what other agents sent the agent that waits, handed over: "Waiting") |
 | `agents.result` | `GET /api/harness/agents/:id/result` | → `{agent, reply: {text, at}, last_turn, changes: {files: [{path, added, removed, created, deleted}], files_changed, lines_added, lines_removed}, cwd, machine, cost_usd, workspace, branch, change_request}` |
 | `agents.children` | `GET /api/harness/agents/:id/children` | → `{children: [{id, name, kind, status, parent}]}`: the ones still running, and theirs |
 | `agents.interrupt` | `POST /api/harness/agents/:id/interrupt` | → `{interrupted}` |
@@ -725,6 +756,12 @@ nothing over; a program's waits in code mode don't unless it passes `hand_over: 
 program returns of the answer is its own. `kiln agents wait` prints them after where each agent
 stands. A message an agent sends another says so in its id (`from-agent-<sender>-…`), which is how
 a wait finds it.
+
+So a wait is a change, not a read: a `POST`, written in the audit trail, and not marked read-only to
+MCP clients. What it hands over lives only in its answer, and a client may run a read-only tool beside
+others, again, or ahead of time and drop its answer; a wait's messages would be lost with it.
+`agents.result` stays a read: all it changes is what its caller is told of what it has just read in
+full (the line in its news, and the settle not told again).
 
 ### Who asks
 

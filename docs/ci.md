@@ -199,7 +199,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W17 | Debugging | W06, W13 | in progress | terminals into running and kept legs (host, docker; on the run page and `kiln debug terminal`), keep on failure with extend and release, a step rerun in place, `kiln workflow run` here or on a server, agents through MCP (exec, rerun step, keep, release); log search and "compare with the last green run" (W19); terminals into `k8s` pods' legs; in Firecracker microVMs terminals, keeping, extend and release, and reruns in place (W13-R05); shards' left |
 | W18 | Supply chain, untrusted code | W10, W13 | in progress | provenance the server makes from its own records and signs (SLSA v1.0, DSSE, Sigstore bundles; its own P-256 key, a cosign key file, AWS KMS, or keyless through Fulcio and Rekor), images' referrers in kiln's registry, a provenance check CD's environments require before they deploy (R04, AC04), `kiln/attest@v1` and the job's `attest:`, bundles beside files, on the run and through GitHub's attestations API; SBOMs (SPDX 2.3, CycloneDX 1.6) from ten lockfile kinds and `syft`, `kiln sbom`; AC01 with cosign, AC02; untrusted code: trust (fork PRs polled or delivered, marks), approval of outside contributors' runs, untrusted executors (rootless Docker), isolated cache scopes, contained networks through a per-leg egress proxy (SNI checked, blocks annotated), AC03 in containers; the dependency changes a diff makes, on its review page (R03); attestations as referrers in other registries too; Firecracker microVMs contained (no network device: out only through the egress proxy, W13-R05); shards' left |
 | W19 | Insights, audit, notifications | W05 | done (AC05's real channels with W11-AC03's tenants) | notification rules from trunk and the server (events, `where`, `throttle`, `run.fixed`, `deploy.*`, `leg.flaky`, `land.ejected`, `runner.offline`, `review.requested`, `comment.reply`, `mention`, `quota.near`, `secret.unused`), Slack, Discord, Teams, Telegram, PagerDuty, Opsgenie, email (SMTP), kiln's inbox and signed webhooks, deliveries recorded, `kiln/notify@v1`, AC05; outgoing webhooks (per-scope subscriptions to kiln's events, signed, in order, retried, logged before sending, resumed after a restart, redelivered); insights (hourly and daily rollups that merge, percentiles within 1 %, waits by reason, attempts, flaky legs, cache, runner utilization, fair share, critical path, AC01, AC02) with Prometheus metrics; compare (differences in actions, variables, environment, images, machines and cache; changed files; steps side by side; "since the last green run", AC03); log search (a trigram index built as legs finish, filters, one leg's search, failure excerpts, AC06 under 1 ms in 10,000 runs); audit v2 (one row per change with principal, on-behalf-of, token, scope, route, result and address; handlers' notes as its detail; secret uses and integration exchanges; filters by every field; AC04 from the route table); OpenTelemetry export (OTLP traces of runs, legs and steps); a person's own rules (inbox, email; Settings → You); Linear and Jira as channels, `diff.landed` and `test.quarantined` |
-| W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | in progress | one registry for deployments' and CI's operations, checked against the route table; `kiln.ci.*` and tools for runs, legs (exec, rerun step, keep, release), workflows (edits proposed as diffs), caches, artifacts, tests (quarantine proposed as a diff), metrics, runners, pools, images, routing, secrets' names, variables, integrations, environments, insights and diffs; the seven CI skills (author, diagnose, runners, review, migrate, secrets, performance), their programs run as written (AC05); users' tokens over MCP; every operation over HTTP, in the OpenAPI document and as `kiln op`; writes to routing rules, pools and environments that say what they do (R03); agents asking for runs (R07); attachments and incidents, with every wake R08 lists, Attach agent on each page it names, and daily limits on incidents, tokens and runner minutes (R08 to R10); every §4.1 route an operation on every surface, and §4.3's commands (AC01); bisecting a failure; experiments, their options built by agents too, measured by ordinary runs, with intervals, effects, interactions and a recommendation (R11, AC06); agents' own isolation left |
+| W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | in progress | one registry for deployments' and CI's operations, checked against the route table; `kiln.ci.*` and tools for runs, legs (exec, rerun step, keep, release), workflows (edits proposed as diffs), caches, artifacts, tests (quarantine proposed as a diff), metrics, runners, pools, images, routing, secrets' names, variables, integrations, environments, insights and diffs; the seven CI skills (author, diagnose, runners, review, migrate, secrets, performance), their programs run as written (AC05); users' tokens over MCP; every operation over HTTP, in the OpenAPI document and as `kiln op`; writes to routing rules, pools and environments that say what they do (R03); agents asking for runs (R07); attachments and incidents, with every wake R08 lists, Attach agent on each page it names, and daily limits on incidents, tokens and runner minutes (R08 to R10); every §4.1 route an operation on every surface, and §4.3's commands (AC01); bisecting a failure; experiments, their options built by agents too, measured by commands in each variant's own worktree beside the agent that asks (no CI) or by ordinary runs, with intervals, effects, interactions and a recommendation (R11, AC06); agents' own isolation left |
 | W21 | UI | each backend it shows | in progress | the CI API; the run page (attempts, reruns, the graph from the plan with matrix grids, progress and what jobs wait for, critical path, summaries, annotations, artifacts, pins); the leg page (notes, timing bar, attempts, outputs, terminal, Keep); the runs list's facets and sorts; the workflow editor (checks against its repository, the schema's keys, the plan preview and its matrix, the flow view, saving as the repository takes it); Insights (repositories, workflows, runners, tests, benchmarks); Settings → CI, → People, → Tokens and → You; the Runners page's pools (their scaling history), images and executors, and the image builder; comparing runs; log search; environments (board and pages); AC01 in kiln's CI (`ci/ui/run-all.sh`), AC02, AC03 (25–30 ms, 60 fps), AC04, the run's data flow; the editor's Agentfile lints left (shards' own: blocked on shards) |
 | W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 39 of 57 runnable starter workflows green, the other 18 failing the same way on GitHub, every miss explained; AC02: 48 of F-21's 50 green, four of them needing accounts and passing in dry configurations against stand-ins (AWS's two, Google's, Codecov's); azure/login waits for a tenant, and attest-build-provenance for GitHub's Sigstore; AC04 (fault injection: drops, delays, OOM kills, full disks and corrupted uploads, each recovered from as specified); AC07 (the security suite: token scope on every route, secrets in no log, API, event or database file, YAML bombs, SSRF guards, archive traversal); AC06 (the UI suite in kiln's own CI: `ci/ui/run-all.sh` in `.kiln/ci.yaml`'s `ui-checks`); AC08 (`kiln ci bench`, every §1.5 target it measures met, regressions gated in kiln's own CI); AC09 (a runner from before the CI work beside this version's) |
 | W23 | CI providers: KilnCI, GitHub Actions, GitLab CI/CD, Bitbucket Pipelines | W03, W14, deploy-api.md §7 | in progress | the git-host interface (kiln, GitHub, GitLab, Bitbucket); the provider core; GitHub Actions, GitLab CI/CD and Bitbucket Pipelines behind one contract (runs, jobs, logs, rerun, cancel, dispatch, artifacts, approvals, environments, checks, lint, webhooks; AC01); the hosts' pull requests through one API (R06); events for agents; SSO with GitHub, GitLab and Bitbucket, and acting on the host as the person |
@@ -6485,9 +6485,11 @@ mode in QuickJS, a tool per operation, skills) from deployments to all of CI, an
   - decisions (bring results back, or pick automatically);
   - budgets.
 
-  Two things change. Measurement is ordinary CI: each variant's runs are workflow runs on routed
-  runners, so benchmarks land on exclusive hardware by routing rules. Isolation options now include
-  `firecracker` and `shards` (built from an Agentfile that declares the agent and its grants).
+  Two things change. Experiments don't need CI: a command runs in each variant's own worktree on
+  the machine of the agent that asks, and only a pipeline (or a command given `runs-on`) is a CI
+  run, on routed runners, so a benchmark can land on exclusive hardware by routing rules. Isolation
+  options now include `firecracker` and `shards` (built from an Agentfile that declares the agent
+  and its grants).
 
 **Acceptance criteria**
 
@@ -6715,16 +6717,24 @@ R04, R05's skills, and R06's rights.
     applies each option's change, resolves the conflicts and submits the combination as a diff
     (the variant's glue commit), and the variant is measured once it's made. Without one, or
     when it can't, the variant isn't measured; nor is one with an option an agent didn't make.
-  - **Measuring** is ordinary CI on routed runners:
-    - a `pipeline` criterion runs its workflow at the variant's commit, its triggers' filters
-      aside;
-    - a `command` criterion runs a one-job workflow, on a commit made on the variant's for it, on
-      its `runs-on`;
-    - a `metric` is read from those runs' `$KILN_METRICS`.
+  - **Measuring** needs no CI (the person's call, 2026-10-31):
+    - a `command` criterion runs in the variant's own worktree on the machine of the agent that
+      asks (`crate::workspace::measure`, asked through that agent's runner): the base with the
+      variant's change committed, made once for each variant under kiln's data folder there and
+      kept for its rounds, then removed with the experiment. The command runs as `kiln run` runs
+      one there (the person's login environment, bash, what it leaves running ended with it), and
+      passes when it exits 0; one that doesn't says why with what it printed last;
+    - a `pipeline` criterion, or a `command` given `runs-on`, is a CI run on routed runners: a
+      pipeline's workflow at the variant's commit, its triggers' filters aside; a command's
+      one-job workflow on a commit made on the variant's for it. Only these need CI's engine:
+      with it off, the experiment is refused, saying so;
+    - a `metric` is read from what they write to `$KILN_METRICS`, a JSON line each
+      (`{"name": "p95_ms", "value": 12.3}`).
 
     Repetitions are interleaved: each round runs every variant once, in a shuffled order (seeded
-    by the experiment), `max_parallel` at once. A `budget_minutes` that runs out cancels what
-    runs and reports what was measured, as a cancel does. Each variant counts its runner
+    by the experiment), `max_parallel` at once. A time limit (`budget_seconds`, set in any unit
+    from seconds to years; or `budget_minutes`) that runs out cancels what runs and reports what
+    was measured, as a cancel does. Each variant counts its runner
     minutes. Its runs are trusted as the owner's are, and anyone else's as a fork's.
   - **Results**:
     - each variant's required checks (passes of repetitions), and each metric's median and its
@@ -6738,13 +6748,22 @@ R04, R05's skills, and R06's rights.
     `experiments.decide` chooses one. The asking agent is told the variant's commit and ref,
     which it fetches by its commit from kiln's git.
   - **From a question**: an agent's multiple-choice question offers "Experiment…" beside its
-    answers (the choices dialog's experiment form: options, strategy, isolation, criteria and
-    thresholds, repetitions, a budget, who decides). Its pipelines are the workflows of the
-    repository the agent's folder is a checkout of (`GET /api/experiments/where?agent=`). The
-    options become options for agents to implement, and the question is answered "running
-    experiment E12"; the results come as the agent's next message. Started from an agent
-    without a `repo`, the experiment is in that repository; a command criterion without
-    `runs-on` runs on the agent's machine.
+    answers (the choices dialog's experiment form: options, strategy, isolation, its checks and
+    its metrics with their thresholds, repetitions, a budget, who decides). A check is a command,
+    or, while CI's engine is on, one of the workflows of the repository the agent's folder is a
+    checkout of (`GET /api/experiments/where?agent=`, which also names the machine the checks
+    run on, and what the agent suggested). A metric is lower or higher being better, with no
+    threshold, one to stay within (at most, or at least), or a % better than the baseline; one
+    with a threshold may be required to meet it, and one without is only compared. The form is
+    the experiment at a glance, a line for each part (its variants, checks, metrics, runs, and
+    what happens when it's done) saying what it's set to; each opens a page of its own to change
+    it, and Start is on the glance, so starting as the agent suggested is one tap. A time limit
+    is in any unit from seconds to years. The form starts with what the agent suggested for its
+    question (`experiments.suggest`, one of every agent's tools: the commands its options' variants
+    run, the metrics they write and their thresholds). The options become options for agents to
+    implement, and the question is answered "running experiment E12"; the results come as the
+    agent's next message. Started from an agent without a `repo`, the experiment is in that
+    repository.
   - **Its page**: every variant with its checks and its metrics' intervals on one scale (a dot and
     whiskers against the baseline's line, said in words beside them), the effects and
     interactions, its runs by variant, "Continue with this" on each once it's done, and Cancel.
@@ -6757,6 +6776,12 @@ R04, R05's skills, and R06's rights.
   a variant records its commit. A second experiment's conflicting options make a variant said
   to conflict, and cancelling it stops it. The analysis is checked on its own too
   (`w20_r11_measurements_say_what_helps_and_what_fights`, `w20_r11_strategies_make_their_variants`).
+  Without CI (`w20_r11_measured_beside_the_agent_without_ci`): CI's engine off, the same options and
+  bench, the bench a command run beside an agent on a runner, give the same results, every run on
+  that agent's machine and none a CI run, and the worktrees go when it's done; a pipeline is
+  refused. A variant's worktree, its rounds and its end are checked on their own
+  (`w20_r11_a_variant_is_measured_in_its_own_worktree`), and the form in the browser
+  (`ui/e2e/experiment-setup.spec.ts`).
 - *AC02*, against a local server (`tests/code_mode.rs`, `w20_ac02_one_program_over_the_last_hundred_runs`):
   a hundred runs of a workflow with two jobs failing each its own way (a plain failure, a full
   disk). One `code_run` program pages through the runs and reads the failed ones' legs, then each
@@ -9493,7 +9518,7 @@ errors as `{ error, code, details? }`. Today's routes (`/api/runs`, `/api/jobs/.
 | GET/POST · PUT/DELETE · POST | `/api/attachments` · `/:id` · `/pause` (built) | `attachments.list`, `.get`, `.save`, `.remove`, `.pause` | runs.read · agents.attach | W20 |
 | GET · POST | `/api/incidents?state=&attachment=` · `/:id` · `/:id/report` (built) | `incidents.list`, `.get`, `.report` | runs.read · its agent, or who may attach there | W20 |
 | POST · GET | `/api/ci/runs/:id/bisect` · `/api/ci/runs/:id/bisects[/:bisect]` (built) | `ci.runs.bisect` (`{ job?, good?, bad? }`: the job run on the commits between, halving them), `ci.runs.bisects` | runs.debug (bisecting is diagnosing) · runs.read | W20 |
-| POST · GET · POST | `/api/experiments` · `/:id` · `/:id/{decide,cancel}` (built) | `experiments.start`, `.list`, `.get`, `.decide`, `.cancel` | experiments.run · runs.read (reading) | W20 |
+| POST · GET · POST · POST | `/api/experiments` · `/:id` · `/:id/{decide,cancel}` · `/suggest` (built) | `experiments.start`, `.list`, `.get`, `.decide`, `.cancel`, `.suggest` | experiments.run · runs.read (reading) | W20 |
 | GET · PUT | `/api/ci/repos/:repo/providers` | `ci.providers.get`, `.set` (`{ providers }`: what its CI runs on) | runs.read · settings.manage | W23 |
 | POST | `/api/ci/repos/:repo/providers/sync` | `ci.providers.sync` (other providers' runs, looked at now) | runs.read | W23 |
 | GET | `/api/ci/repos/:repo/providers/workflows` | `ci.providers.workflows` (each provider's CI files, checked) | runs.read | W23 |

@@ -2382,9 +2382,17 @@ impl Host {
                 // from it (`nohup … &`, a daemon, what a harness before this one started) goes now.
                 // Their harness's own background tasks run under it, and end with the agent.
                 let settled: std::collections::HashSet<String> = sessions.iter().filter(|s| s.pid.lock().is_some() && super::session::settled(s)).map(|s| s.id.clone()).collect();
-                let adopted: Vec<super::survivors::Ran> = sessions.iter().filter(|s| settled.contains(&s.id)).flat_map(|s| s.left.lock().clone()).collect();
+                let adopted: Vec<(String, super::survivors::Ran)> = sessions.iter().filter(|s| settled.contains(&s.id)).flat_map(|s| s.left.lock().iter().map(|r| (s.id.clone(), r.clone())).collect::<Vec<_>>()).collect();
+                let harnesses = sessions.clone();
                 let look = move || {
-                    let seen = super::survivors::scan(&which);
+                    let mut seen = super::survivors::scan(&which);
+                    // Never an agent's own harness (`survivors::spare`): each is read again once the
+                    // look is over, for one that started while it went on.
+                    let now: HashMap<String, Option<u32>> = harnesses.iter().map(|s| (s.id.clone(), *s.pid.lock())).collect();
+                    let host = std::process::id();
+                    let stale = super::survivors::spare(&mut seen, &which, &now, host);
+                    let running: std::collections::HashSet<u32> = now.values().flatten().copied().collect();
+                    let adopted: Vec<super::survivors::Ran> = adopted.into_iter().filter(|(id, r)| !stale.contains(id) && super::survivors::leftover(r, &running, host)).map(|(_, r)| r).collect();
                     // Shells' ssh-agents are no session's work: stopped once old enough.
                     let (agents, leftovers) = super::survivors::to_stop(&seen, &settled, now_s);
                     if !agents.is_empty() {
@@ -2397,12 +2405,13 @@ impl Host {
                         super::survivors::stop(&leftovers);
                         adopted.iter().for_each(super::survivors::stop_tree);
                     }
-                    (seen, super::survivors::alive(&known))
+                    (seen, super::survivors::alive(&known), stale)
                 };
-                let Ok((seen, alive)) = crate::rt::blocking(look).await else { continue };
+                let Ok((seen, alive, stale)) = crate::rt::blocking(look).await else { continue };
                 let alive: HashMap<u32, u64> = alive.into_iter().map(|r| (r.pid, r.started)).collect();
                 let mut changed = false;
-                for s in &sessions {
+                // One whose harness changed while it was looked at is looked at again next time.
+                for s in sessions.iter().filter(|s| !stale.contains(&s.id)) {
                     if h.note(s, seen.get(&s.id).cloned().unwrap_or_default(), &alive, now_s) {
                         changed = true;
                     }
@@ -2420,14 +2429,17 @@ impl Host {
     /// One session's look (`watch`): whether what's kept of it changed. What it started that runs
     /// apart from its harness (marked as its, or as recorded and still running) is left running.
     fn note(&self, s: &Session, seen: super::survivors::Seen, alive: &HashMap<u32, u64>, now_s: u64) -> bool {
-        let running = s.pid.lock().is_some();
+        let harness = *s.pid.lock();
+        let running = harness.is_some();
         let mut ran = s.ran.lock();
         let still = |r: &super::survivors::Ran| alive.get(&r.pid) == Some(&r.started);
         // Everything under it now, not only what's noted (a record keeps so many).
         let under = |pid: u32| seen.below.contains(&pid) || seen.under.iter().any(|r| r.pid == pid);
         let mut apart = seen.apart;
         // As recorded, still running, neither under it nor marked (it cleared its environment).
-        for r in ran.1.iter().filter(|r| !under(r.pid) && still(r) && !super::survivors::login_agent(&r.command)) {
+        // Never its harness, which an older look may have noted apart from it (`survivors::spare`).
+        let own: std::collections::HashSet<u32> = harness.into_iter().collect();
+        for r in ran.1.iter().filter(|r| !under(r.pid) && still(r) && !super::survivors::login_agent(&r.command) && super::survivors::leftover(r, &own, std::process::id())) {
             if !apart.iter().any(|a| a.pid == r.pid) {
                 apart.push(r.clone());
             }
@@ -3423,6 +3435,150 @@ mod tests {
             let left = s.left.lock().clone();
             assert!(left.is_empty(), "{left:?}");
             assert!(s.core.lock().state.tasks.iter().all(|t| !t.live()), "nothing shown as left running");
+            Ok(())
+        })
+    }
+
+    /// A harness an older look noted apart from its session (it started while the look went on) is
+    /// never left running, so never stopped once the agent is between turns: not as its harness
+    /// now, nor as one this host started (agents lost to it on 2026-10-31).
+    #[test]
+    fn an_agents_own_harness_noted_apart_is_never_left_running() -> anyhow::Result<()> {
+        use super::super::survivors::{Ran, Seen};
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let (tx, _rx) = async_channel::unbounded();
+            let host = sim(tx, None, Limits::default());
+            let s = host.open(Some("again".into()), no_harness(dir.path()))?;
+            let ran = |pid: u32, ppid: u32| Ran { pid, ppid, started: 1_700_000_000, command: format!("claude -p {pid}") };
+            // 4242, its harness now; 4343, one this host started that it doesn't know yet.
+            *s.ran.lock() = (None, vec![ran(4242, 1), ran(4343, std::process::id())]);
+            *s.pid.lock() = Some(4242);
+            host.note(&s, Seen::default(), &HashMap::from([(4242, 1_700_000_000), (4343, 1_700_000_000)]), 1_800_000_000);
+            assert!(s.left.lock().is_empty(), "{:?}", s.left.lock());
+            assert!(s.core.lock().state.tasks.iter().all(|t| !t.live()), "nothing shown as left running");
+            Ok(())
+        })
+    }
+
+    /// A stand-in for Claude Code: it answers kiln's initialize and each turn (a turn that says
+    /// "long" goes on for a minute), and notes in `heard` each line it reads, with its pid.
+    #[cfg(unix)]
+    fn stand_in(dir: &std::path::Path) -> anyhow::Result<(PathBuf, PathBuf)> {
+        use std::os::unix::fs::PermissionsExt;
+        let heard = dir.join("heard.jsonl");
+        let fake = dir.join("fake-claude.py");
+        std::fs::write(&fake, r##"import json, os, sys, time, uuid
+HEARD = sys.argv[1]
+args = sys.argv[2:]
+def out(o):
+    sys.stdout.write(json.dumps(o) + "\n")
+    sys.stdout.flush()
+if "--version" in args:
+    print("2.1.296 (Claude Code)")
+    sys.exit(0)
+session = str(uuid.uuid4())
+for flag in ("--session-id", "--resume"):
+    if flag in args and args.index(flag) + 1 < len(args):
+        session = args[args.index(flag) + 1]
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    with open(HEARD, "a") as f:
+        f.write(json.dumps({"pid": os.getpid(), "line": line.strip()}) + "\n")
+    try:
+        m = json.loads(line)
+    except ValueError:
+        continue
+    if m.get("type") == "control_request":
+        req = m.get("request") or {}
+        resp = {}
+        if req.get("subtype") == "initialize":
+            resp = {"commands": [], "models": [], "agents": [], "current_permission_mode": "default", "claude_code_version": "2.1.296"}
+        out({"type": "control_response", "response": {"subtype": "success", "request_id": m.get("request_id"), "response": resp}})
+    elif m.get("type") == "user":
+        uid = m.get("uuid")
+        out({"type": "command_lifecycle", "command_uuid": uid, "state": "started", "session_id": session})
+        out({"type": "system", "subtype": "init", "cwd": ".", "session_id": session, "tools": [], "mcp_servers": [], "model": "claude-opus-5-5", "permissionMode": "default", "claude_code_version": "2.1.296"})
+        if "long" in json.dumps(m.get("message")):
+            time.sleep(60)
+        out({"type": "assistant", "message": {"id": "msg_%s" % uuid.uuid4(), "type": "message", "role": "assistant", "model": "claude-opus-5-5", "content": [{"type": "text", "text": "done"}], "stop_reason": None, "usage": {"input_tokens": 1, "output_tokens": 1}}, "parent_tool_use_id": None, "session_id": session})
+        out({"type": "result", "subtype": "success", "is_error": False, "duration_ms": 1, "num_turns": 1, "result": "done", "session_id": session, "total_cost_usd": 0, "usage": {"input_tokens": 1, "output_tokens": 1}})
+        out({"type": "command_lifecycle", "command_uuid": uid, "state": "completed", "session_id": session})
+"##)?;
+        let program = dir.join("claude-stand-in");
+        std::fs::write(&program, format!("#!/bin/sh\nexec python3 '{}' '{}' \"$@\"\n", fake.display(), heard.display()))?;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))?;
+        Ok((program, heard))
+    }
+
+    /// An agent lives until it's ended (docs/agents.md): its harness's process ending by a signal
+    /// from outside it (kiln's own left-running sweep sent 26 agents' one on 2026-10-31, and they
+    /// ended) ends nothing. It starts again by itself, its conversation resumed, and one that was
+    /// cut short mid-turn picks the turn up.
+    #[cfg(unix)]
+    #[test]
+    fn an_agent_whose_harness_is_stopped_from_outside_starts_again_by_itself() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let (program, heard) = stand_in(dir.path())?;
+            let (tx, _rx) = async_channel::unbounded();
+            let host = with_inbox(tx);
+            let spec = Spec { kind: "claude".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), program: Some(program.to_string_lossy().into_owned()), ..Spec::default() };
+            let s = host.open(Some("lives".into()), spec)?;
+            let idle = || s.pid.lock().is_some() && s.core.lock().state.status == Status::Idle;
+            until_it("the stand-in's start", 300, || s.pid.lock().is_some() && !s.core.lock().meta.features.is_empty()).await?;
+            assert!(host.command("lives", message("m1", "hello")));
+            until_it("m1's turn, over", 60, || idle() && s.core.lock().state.harness_session.is_some()).await?;
+            let stop = |pid: u32| std::process::Command::new("kill").args(["-TERM", &pid.to_string()]).status();
+            // Between turns, stopped from outside: it stands as starting again, then is back,
+            // another process on the same conversation.
+            let first = s.pid.lock().ok_or_else(|| anyhow::anyhow!("no harness"))?;
+            let conversation = s.core.lock().state.harness_session.clone();
+            stop(first)?;
+            until_it("it ending, to start again", 30, || s.core.lock().state.exit.as_ref().is_some_and(|x| x.again_at.is_some())).await?;
+            assert_eq!(super::super::wait::stand(&s.info()), "working", "{:?}", s.info().exit);
+            until_it("it back by itself", 60, || idle() && s.pid.lock().is_some_and(|p| p != first)).await?;
+            assert_eq!(s.core.lock().state.harness_session, conversation, "the same conversation");
+            assert!(s.core.lock().state.exit.is_none(), "it runs again");
+            let said = |words: &str| s.core.lock().events().any(|e| matches!(&e.body, super::super::model::Body::Notice { text, .. } if text.contains(words)));
+            assert!(said("Its process ended"), "it says why it started again");
+            // Mid-turn: the turn is picked up by the process that starts after it.
+            let second = s.pid.lock().ok_or_else(|| anyhow::anyhow!("no harness"))?;
+            assert!(host.command("lives", message("m2", "a long one")));
+            until_it("m2's turn", 60, || s.core.lock().state.status == Status::Running).await?;
+            stop(second)?;
+            let picked = || {
+                std::fs::read_to_string(&heard).unwrap_or_default().lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()).any(|w| {
+                    w.get("pid").and_then(serde_json::Value::as_u64).is_some_and(|p| p != u64::from(second) && p != u64::from(first))
+                        && w.get("line").and_then(serde_json::Value::as_str).is_some_and(|l| l.contains("Pick up where you left off"))
+                })
+            };
+            until_it("the cut turn picked up by the next process", 60, picked).await?;
+            host.close("lives");
+            Ok(())
+        })
+    }
+
+    /// A harness that ends as soon as it starts, three starts in a row, won't start: it isn't
+    /// started again, and stands stopped, waiting for a person, with why.
+    #[cfg(unix)]
+    #[test]
+    fn a_harness_that_wont_start_waits_for_a_person() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let program = dir.path().join("claude-that-ends");
+            std::fs::write(&program, "#!/bin/sh\nexit 3\n")?;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))?;
+            let (tx, _rx) = async_channel::unbounded();
+            let host = with_inbox(tx);
+            let spec = Spec { kind: "claude".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), program: Some(program.to_string_lossy().into_owned()), ..Spec::default() };
+            let s = host.open(Some("wont".into()), spec)?;
+            until_it("it given up on", 60, || s.core.lock().state.exit.as_ref().is_some_and(|x| x.again_at.is_none() && x.error.as_deref().is_some_and(|e| e.contains("stopped starting it again")))).await?;
+            assert_eq!(super::super::wait::stand(&s.info()), "stopped");
+            host.close("wont");
             Ok(())
         })
     }

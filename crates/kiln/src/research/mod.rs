@@ -215,6 +215,40 @@ pub struct View {
     pub markdown: Option<String>,
 }
 
+/// Research in brief, as a list shows it (`brief`): what was asked and what it comes to, its
+/// findings' grades, the strongest first, and the strongest one's claim; no sources or citations.
+#[derive(Debug, Clone, Serialize)]
+pub struct Brief {
+    pub id: String,
+    pub question: String,
+    pub agent: Option<String>,
+    pub by: String,
+    pub plan: Option<String>,
+    pub summary: Summary,
+    pub grades: Vec<&'static str>,
+    pub best: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+pub fn brief(v: &View) -> Brief {
+    let mut ranked: Vec<&Graded> = v.findings.iter().collect();
+    // The strongest first; alike, in the order they were given.
+    ranked.sort_by_key(|g| std::cmp::Reverse(g.confidence.score));
+    Brief {
+        id: v.id.clone(),
+        question: v.question.clone(),
+        agent: v.agent.clone(),
+        by: v.by.clone(),
+        plan: v.plan.clone(),
+        summary: v.summary.clone(),
+        grades: ranked.iter().map(|g| g.confidence.grade).collect(),
+        best: ranked.first().map(|g| g.finding.claim.clone()),
+        created_at: v.created_at,
+        updated_at: v.updated_at,
+    }
+}
+
 /// A failure the caller can act on.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -237,24 +271,27 @@ fn clip(s: &str, n: usize) -> String {
     if t.chars().count() > n { format!("{}…", t.chars().take(n).collect::<String>()) } else { t.to_owned() }
 }
 
-fn load(c: &crate::sql::Connection, id: &str) -> anyhow::Result<Option<Research>> {
-    c.query_row("SELECT id, question, agent, by, plan_id, sources, findings, skipped, created_at, updated_at FROM research WHERE id = ?1", params![id], |r| {
-        let json = |i: usize| r.get::<_, String>(i);
-        Ok(Research {
-            id: r.get(0)?,
-            question: r.get(1)?,
-            agent: r.get(2)?,
-            by: r.get(3)?,
-            plan: r.get(4)?,
-            sources: serde_json::from_str(&json(5)?).unwrap_or_default(),
-            findings: serde_json::from_str(&json(6)?).unwrap_or_default(),
-            skipped: serde_json::from_str(&json(7)?).unwrap_or_default(),
-            created_at: r.get(8)?,
-            updated_at: r.get(9)?,
-        })
+/// A row of `research`, as `row` reads it.
+const COLUMNS: &str = "id, question, agent, by, plan_id, sources, findings, skipped, created_at, updated_at";
+
+fn row(r: &crate::sql::Row<'_>) -> crate::sql::Result<Research> {
+    let json = |i: usize| r.get::<_, String>(i);
+    Ok(Research {
+        id: r.get(0)?,
+        question: r.get(1)?,
+        agent: r.get(2)?,
+        by: r.get(3)?,
+        plan: r.get(4)?,
+        sources: serde_json::from_str(&json(5)?).unwrap_or_default(),
+        findings: serde_json::from_str(&json(6)?).unwrap_or_default(),
+        skipped: serde_json::from_str(&json(7)?).unwrap_or_default(),
+        created_at: r.get(8)?,
+        updated_at: r.get(9)?,
     })
-    .optional()
-    .map_err(Into::into)
+}
+
+fn load(c: &crate::sql::Connection, id: &str) -> anyhow::Result<Option<Research>> {
+    c.query_row(&format!("SELECT {COLUMNS} FROM research WHERE id = ?1"), params![id], row).optional().map_err(Into::into)
 }
 
 fn save(c: &crate::sql::Connection, r: &Research) -> anyhow::Result<()> {
@@ -306,23 +343,43 @@ pub async fn start(hub: &Hub, question: &str, agent: Option<&str>, by: &str, pla
     Ok(r)
 }
 
-/// Research, newest change first: a plan's, an agent's, or every one (the last 100).
-pub async fn list(hub: &Hub, plan: Option<String>, agent: Option<String>) -> R<Vec<View>> {
-    let ids: Vec<String> = hub
+/// The most research a list holds: the newest.
+const LISTED: usize = 100;
+
+/// Research, newest change first: a plan's, an agent's, or every one, the last 100; given words
+/// `q`, only what holds them (`holds`). Read in one call to the store.
+pub async fn list(hub: &Hub, plan: Option<String>, agent: Option<String>, q: Option<String>) -> R<Vec<View>> {
+    let words = q.map(|q| q.trim().to_lowercase()).filter(|q| !q.is_empty());
+    let kept = hub
         .store
         .call(move |c| {
-            let mut st = c.prepare("SELECT id FROM research WHERE (?1 IS NULL OR plan_id = ?1) AND (?2 IS NULL OR agent = ?2) ORDER BY updated_at DESC LIMIT 100")?;
-            let v = st.query_map(params![plan, agent], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
-            Ok(v)
+            // The words are looked for in each row as it's kept first, where SQLite's `lower` folds
+            // them as Rust's does (ASCII, nothing JSON escapes), then in what it says (`holds`).
+            let raw = words.as_deref().filter(|w| w.is_ascii() && !w.contains(['"', '\\']) && !w.contains(|c: char| c.is_ascii_control()));
+            let limit = if words.is_some() { -1 } else { LISTED as i64 };
+            let mut st = c.prepare(&format!(
+                "SELECT {COLUMNS} FROM research WHERE (?1 IS NULL OR plan_id = ?1) AND (?2 IS NULL OR agent = ?2) AND (?3 IS NULL OR instr(lower(question || ' ' || findings || ' ' || sources), ?3) > 0) ORDER BY updated_at DESC, id LIMIT ?4"
+            ))?;
+            let mut rows = st.query(params![plan, agent, raw, limit])?;
+            let mut out = Vec::new();
+            while out.len() < LISTED {
+                let Some(r) = rows.next()? else { break };
+                let r = row(r)?;
+                if words.as_deref().is_none_or(|w| holds(&r, w)) {
+                    out.push(r);
+                }
+            }
+            Ok(out)
         })
         .await?;
-    let mut out = Vec::new();
-    for id in ids {
-        if let Ok(r) = get(hub, &id).await {
-            out.push(view(&r, false));
-        }
-    }
-    Ok(out)
+    Ok(kept.iter().map(|r| view(r, false)).collect())
+}
+
+/// Whether research holds `words` (lowercase): in its question, a finding's claim, a quote, or a
+/// source's title or where it is.
+fn holds(r: &Research, words: &str) -> bool {
+    let has = |s: &str| s.to_lowercase().contains(words);
+    has(&r.question) || r.findings.iter().any(|f| has(&f.claim) || f.cites.iter().any(|c| c.quote.as_deref().is_some_and(has))) || r.sources.iter().any(|s| has(&s.title) || has(&s.locator))
 }
 
 /// What an agent adds to research: sources, findings (a cite's `source` an id, or a source
@@ -744,6 +801,71 @@ mod tests {
         assert!(md.contains("No external sources: nothing outside kiln bears on it"), "{md}");
         assert_eq!((v.summary.internal, v.summary.external, v.summary.grades.get("A").copied()), (1, 0, Some(1)));
         Ok(())
+    }
+}
+
+/// Research listed on a hub of its own: the newest first, kept to what holds the words asked for
+/// (its question, a claim, a quote, a source's title or place; any case, beyond ASCII too), and in
+/// brief its findings' grades, the strongest first, and that one's claim, without its sources.
+#[cfg(test)]
+mod list_tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn research_is_found_by_its_words_and_listed_in_brief() -> anyhow::Result<()> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::rt::block_on(async {
+                let hub = crate::hub::tests::scratch_hub().await?;
+                let given = [
+                    (
+                        "Can agents search conversations?",
+                        json!({"findings": [
+                            {"claim": "A blog says it's quick.", "cites": [{"source": {"type": "blog", "title": "Quick search", "locator": "https://example.dev/quick"}}]},
+                            {"claim": "It searches every agent's events.", "cites": [{"source": {"type": "code", "title": "store.rs", "locator": "crates/kiln/src/convo/store.rs:396"}, "quote": "pub fn search(&self, q: Query)"}]}
+                        ]}),
+                    ),
+                    ("Does QUIC keep its order?", json!({"findings": [{"claim": "Streams are ordered.", "cites": [{"source": {"type": "standard", "title": "RFC 9000", "locator": "https://www.rfc-editor.org/rfc/rfc9000"}, "quote": "a lightweight byte-stream"}]}]})),
+                    ("Is the planner's Kostenmodell sound? Prüfung", json!({})),
+                ];
+                let mut kept = Vec::new();
+                for (at, (question, what)) in (100..).zip(given) {
+                    let mut r = start(&hub, question, None, "admin", None).await?;
+                    merge(&mut r, serde_json::from_value(what)?, at)?;
+                    r.updated_at = at;
+                    let row = r.clone();
+                    hub.store.call(move |c| save(c, &row)).await?;
+                    kept.push(r.id);
+                }
+                let found = |q: &str| {
+                    let hub = Arc::clone(&hub);
+                    let q = q.to_owned();
+                    async move { Ok::<_, anyhow::Error>(list(&hub, None, None, Some(q)).await?.into_iter().map(|v| v.id).collect::<Vec<_>>()) }
+                };
+                let newest_first: Vec<String> = kept.iter().rev().cloned().collect();
+                let all: Vec<String> = list(&hub, None, None, None).await?.into_iter().map(|v| v.id).collect();
+                anyhow::ensure!(all == newest_first, "newest first: {all:?}");
+                let one = |i: usize| kept.get(i).cloned().into_iter().collect::<Vec<_>>();
+                for (q, want) in [("QUICK SEARCH", one(0)), ("byte-stream", one(1)), ("ordered", one(1)), ("  planner ", one(2)), ("PRÜFUNG", one(2))] {
+                    let got = found(q).await?;
+                    anyhow::ensure!(got == want, "{q:?} found {got:?}, not {want:?}");
+                }
+                // Words only the rows' own JSON holds (a source's `type`) find nothing.
+                anyhow::ensure!(found("type").await?.is_empty() && found("locator").await?.is_empty());
+                let v = list(&hub, None, None, Some("agents".into())).await?.into_iter().next().ok_or_else(|| anyhow::anyhow!("no research"))?;
+                let mut ranked: Vec<(u8, &str, String)> = v.findings.iter().map(|g| (g.confidence.score, g.confidence.grade, g.finding.claim.clone())).collect();
+                ranked.sort_by_key(|r| std::cmp::Reverse(r.0));
+                let b = brief(&v);
+                anyhow::ensure!(b.grades == ranked.iter().map(|r| r.1).collect::<Vec<_>>() && b.best == ranked.first().map(|r| r.2.clone()), "{b:?}");
+                anyhow::ensure!(b.best.as_deref() == Some("It searches every agent's events."), "the code with its quote is the stronger: {b:?}");
+                let shown = serde_json::to_value(&b)?;
+                anyhow::ensure!(shown.get("sources").is_none() && shown.get("findings").is_none() && shown.pointer("/summary/findings") == Some(&json!(2)), "{shown}");
+                Ok::<(), anyhow::Error>(())
+            }));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(60)).map_err(|e| anyhow::anyhow!("the test didn't end: {e}"))?
     }
 }
 

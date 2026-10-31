@@ -7,10 +7,12 @@
 //!   cherry-picked onto the base in the options' order, kept as
 //!   `refs/kiln/experiments/<id>/<variant>`; one whose options conflict is said to, and isn't
 //!   measured.
-//! - Measuring is ordinary CI: each variant's runs of the criteria's workflows (a command's is a
-//!   one-job workflow on a commit made for it), on routed runners. Repetitions are interleaved:
-//!   each round runs every variant once, in a shuffled order, `max_parallel` at once, within the
-//!   time budget.
+//! - Measuring needs no CI: a command runs in each variant's own worktree on the machine of the
+//!   agent that asks (`crate::workspace::measure`), its exit code and the metrics it writes to
+//!   `$KILN_METRICS` brought back. A pipeline, or a command given `runs-on`, is a CI run on routed
+//!   runners instead (a command's a one-job workflow on a commit made for it), and only these need
+//!   the CI engine. Repetitions are interleaved: each round runs every variant once, in a shuffled
+//!   order, `max_parallel` at once, within the time budget.
 //! - The results (`kiln_ci::experiments::analyze`): each variant's required checks, its metrics
 //!   against the baseline's with intervals, each option's main effect and each pair's
 //!   interaction, and a recommendation. Then decided: brought back (the default), or the clear
@@ -86,6 +88,9 @@ pub struct Run {
     pub criterion: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run: Option<String>,
+    /// The machine a command ran on beside the agent that asked (none for a CI run).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on: Option<String>,
     /// Its conclusion once it ended; `untestable` when it didn't start.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conclusion: Option<String>,
@@ -135,6 +140,10 @@ pub struct Experiment {
     pub max_parallel: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub budget_minutes: Option<u64>,
+    /// Its time limit in seconds (a person sets it in any unit, a second to years); `budget_minutes`
+    /// from before it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_seconds: Option<u64>,
     /// `ask` (bring the results back) or `auto` (take the clear winner).
     pub decide: String,
     /// `implementing` (its options' agents at work), `building`, `measuring`, `done`, `cancelled`,
@@ -160,6 +169,10 @@ const PARALLEL: usize = 4;
 const REPETITIONS: usize = 3;
 /// How long one measuring run may take.
 const ONE_RUN: Duration = Duration::from_secs(3 * 3600);
+/// How long a machine measuring beside the agent may go unheard before its measurement is given up.
+const UNHEARD: Duration = Duration::from_secs(5 * 60);
+/// The largest variant change sent to a machine to measure beside the agent.
+const PATCH_MOST: usize = 8 << 20;
 
 fn key(id: &str) -> String {
     format!("ci/experiment/{id}")
@@ -287,6 +300,7 @@ struct Ask {
     repetitions: Option<usize>,
     max_parallel: Option<usize>,
     budget_minutes: Option<u64>,
+    budget_seconds: Option<u64>,
     decide: Option<String>,
     harness: Option<HarnessAsk>,
 }
@@ -305,9 +319,6 @@ struct AskOption {
 /// `POST /api/experiments`: an experiment started by `caller`, its variants built and measured from
 /// now on.
 pub async fn start(hub: &Arc<Hub>, caller: &Caller, body: Value) -> Result<Response, Fail> {
-    if !hub.ci.enabled() {
-        return Err((StatusCode::NOT_FOUND, "the CI engine is off ([ci] enabled)".into()));
-    }
     let mut ask: Ask = serde_json::from_value(body).map_err(|e| bad(format!("{e}")))?;
     // Left out: the repository the asking agent's folder is a checkout of.
     if ask.repo.trim().is_empty()
@@ -332,20 +343,27 @@ pub async fn start(hub: &Arc<Hub>, caller: &Caller, body: Value) -> Result<Respo
     let baseline = ask.baseline.unwrap_or(true);
     let variants = ex::variants(&names, &strategy, baseline).map_err(bad)?;
     if !ask.criteria.iter().any(|c| !matches!(c.kind, Kind::Metric { .. })) {
-        return Err(bad("say how a variant is measured: a `pipeline` or `command` criterion (a metric is read from their runs)"));
+        return Err(bad("say how a variant is measured: a `command` (or `pipeline`) criterion (a metric is read from what they run)"));
     }
-    // A command runs where the asking agent does, unless it says.
-    let machine = ask.agent.clone().or_else(|| caller.agent.clone()).and_then(|a| hub.harness.info(&a)).map(|i| i.target.strip_prefix("agent:").unwrap_or(&i.target).to_owned());
-    for c in &mut ask.criteria {
-        if let Kind::Command { runs_on, .. } = &mut c.kind
-            && runs_on.is_none()
-        {
-            *runs_on = machine.clone();
-        }
-    }
+    // A command runs beside the agent that asks, in each variant's own worktree of its repository;
+    // a pipeline, or a command given `runs-on`, is a CI run, and only these need CI's engine.
+    let asker = ask.agent.clone().or_else(|| caller.agent.clone()).and_then(|a| hub.harness.info(&a));
     for c in &ask.criteria {
-        if let Kind::Command { runs_on: None, .. } = &c.kind {
-            return Err(bad(format!("`{}`: a command criterion says where it runs (`runs-on`: a label or a runner)", c.name)));
+        let ci_run = match &c.kind {
+            Kind::Pipeline { .. } => Some("a pipeline's run"),
+            Kind::Command { runs_on: Some(_), .. } => Some("a command run on `runs-on`"),
+            Kind::Command { runs_on: None, .. } | Kind::Metric { .. } => None,
+        };
+        if let Some(what) = ci_run
+            && !hub.ci.enabled()
+        {
+            return Err((
+                StatusCode::CONFLICT,
+                format!("`{}` is {what}, which is CI's, and the CI engine is off ([ci] enabled): measure with a command, which runs in each variant's own worktree beside the agent that asks", c.name),
+            ));
+        }
+        if matches!(c.kind, Kind::Command { runs_on: None, .. }) && asker.is_none() {
+            return Err(bad(format!("`{}` runs in each variant's own worktree beside the agent that asks: start the experiment from an agent (`agent`), or say where it runs (`runs-on`, a CI run)", c.name)));
         }
     }
     let mut seen = Vec::new();
@@ -369,7 +387,6 @@ pub async fn start(hub: &Arc<Hub>, caller: &Caller, body: Value) -> Result<Respo
         None => git(hub, &["-C", &mirror, "rev-parse", "--verify", &format!("refs/heads/{}^{{commit}}", facts.default_branch)]).await.map_err(internal)?,
     };
     // The agents that implement options: as asked, or as the asking agent is.
-    let asker = ask.agent.clone().or_else(|| caller.agent.clone()).and_then(|a| hub.harness.info(&a));
     let harness = ask
         .harness
         .clone()
@@ -428,6 +445,7 @@ pub async fn start(hub: &Arc<Hub>, caller: &Caller, body: Value) -> Result<Respo
         repetitions: ask.repetitions.unwrap_or(REPETITIONS).clamp(1, 20),
         max_parallel: ask.max_parallel.unwrap_or(PARALLEL).clamp(1, 16),
         budget_minutes: ask.budget_minutes,
+        budget_seconds: ask.budget_seconds.or(ask.budget_minutes.map(|m| m.saturating_mul(60))).filter(|s| *s > 0),
         decide,
         state: "building".into(),
         variants: variants.iter().map(|v| Built { name: v.name.clone(), options: v.options.clone(), state: "building".into(), ..Built::default() }).collect(),
@@ -452,15 +470,22 @@ async fn repo_of_agent(hub: &Hub, info: &crate::harness::session::Info) -> Optio
     crate::workspace::change::matched(&repos, &facts.remotes, &hub.cfg.server.public_url).map(|(r, _)| r.name.clone())
 }
 
-/// Builds `e`'s variants, measures them, says what the measurements show and decides.
+/// Builds `e`'s variants, measures them, says what the measurements show and decides; then the
+/// worktrees it measured in beside the agent that asked go.
 async fn drive(hub: Arc<Hub>, mut e: Experiment, repo: Repo) {
-    let deadline = e.budget_minutes.map(|m| std::time::Instant::now() + Duration::from_secs(m * 60));
+    run_it(&hub, &mut e, &repo).await;
+    unmeasure(&hub, &e).await;
+}
+
+async fn run_it(hub: &Arc<Hub>, e: &mut Experiment, repo: &Repo) {
+    // A limit too far off to fall within this server's clock is none.
+    let deadline = limit(e).and_then(|s| std::time::Instant::now().checked_add(Duration::from_secs(s)));
     if e.options.iter().any(|o| o.implement.is_some() && o.to.is_empty()) {
         e.state = "implementing".into();
-        save(&hub, &mut e).await;
-        implement(&hub, &mut e, &repo, deadline).await;
+        save(hub, e).await;
+        implement(hub, e, repo, deadline).await;
         if e.state == "cancelled" {
-            save(&hub, &mut e).await;
+            save(hub, e).await;
             return;
         }
     }
@@ -468,24 +493,24 @@ async fn drive(hub: Arc<Hub>, mut e: Experiment, repo: Repo) {
     let greedy = matches!(e.strategy, Some(Strategy::Greedy));
     let mut round_variants: Vec<String> = e.variants.iter().map(|v| v.name.clone()).collect();
     loop {
-        if let Err(why) = build(&hub, &mut e, &repo, &round_variants).await {
+        if let Err(why) = build(hub, e, repo, &round_variants).await {
             e.state = "failed".into();
             e.why = Some(why);
-            save(&hub, &mut e).await;
+            save(hub, e).await;
             return;
         }
         e.state = "measuring".into();
-        save(&hub, &mut e).await;
-        let mut ended = measure(&hub, &mut e, &repo, &round_variants, deadline).await;
+        save(hub, e).await;
+        let mut ended = measure(hub, e, repo, &round_variants, deadline).await;
         // The variants agents glued, measured once they're made.
         if ended.is_none() {
-            let glued = glue_finish(&hub, &mut e, &repo, &round_variants, deadline).await;
+            let glued = glue_finish(hub, e, repo, &round_variants, deadline).await;
             if !glued.is_empty() {
-                ended = measure(&hub, &mut e, &repo, &glued, deadline).await;
+                ended = measure(hub, e, repo, &glued, deadline).await;
             }
         }
-        analyze(&mut e);
-        save(&hub, &mut e).await;
+        analyze(e);
+        save(hub, e).await;
         if ended.is_some() || !greedy {
             if let Some(why) = ended {
                 e.why = Some(why);
@@ -503,19 +528,19 @@ async fn drive(hub: Arc<Hub>, mut e: Experiment, repo: Repo) {
         // variants measured already, and it stops.
         round_variants = next.iter().map(|v| v.name.clone()).collect();
         e.variants.extend(next.into_iter().map(|v| Built { name: v.name, options: v.options, state: "building".into(), ..Built::default() }));
-        save(&hub, &mut e).await;
+        save(hub, e).await;
     }
     if e.state != "cancelled" {
         e.state = "done".into();
         let recommended = e.results.as_ref().and_then(|r| r.get("recommendation")).and_then(Value::as_str).map(str::to_owned);
-        save(&hub, &mut e).await;
+        save(hub, e).await;
         if e.decide == "auto"
             && let Some(v) = recommended.as_ref().and_then(|n| e.variants.iter().find(|v| &v.name == n)).cloned()
         {
-            record_decision(&hub, &mut e, Decision { variant: v.name.clone(), commit: v.commit.clone().unwrap_or_default(), by: "kiln".into(), at: crate::util::now_unix() }).await;
+            record_decision(hub, e, Decision { variant: v.name.clone(), commit: v.commit.clone().unwrap_or_default(), by: "kiln".into(), at: crate::util::now_unix() }).await;
         }
-        let e = overlay(&hub, e).await;
-        tell(&hub, &e).await;
+        let told = overlay(hub, e.clone()).await;
+        tell(hub, &told).await;
     }
 }
 
@@ -834,6 +859,8 @@ fn seed_of(id: &str) -> u64 {
 /// criterion, in a shuffled order, `max_parallel` at once. Why it stopped early, when it did.
 async fn measure(hub: &Arc<Hub>, e: &mut Experiment, repo: &Repo, which: &[String], deadline: Option<std::time::Instant>) -> Option<String> {
     let measuring: Vec<Criterion> = e.criteria.iter().filter(|c| !matches!(c.kind, Kind::Metric { .. })).cloned().collect();
+    // Each variant's change, as the machine measuring beside the agent applies it: made once.
+    let mut patches: BTreeMap<String, Result<String, String>> = BTreeMap::new();
     for round in 0..e.repetitions {
         let mut order: Vec<(String, String, Criterion)> = e
             .variants
@@ -849,17 +876,35 @@ async fn measure(hub: &Arc<Hub>, e: &mut Experiment, repo: &Repo, which: &[Strin
             }
             let mut started = Vec::new();
             for (variant, commit, c) in chunk {
-                let r = start_one(hub, e, repo, variant, commit, c, round).await;
+                let r = match &c.kind {
+                    Kind::Command { command, runs_on: None } => {
+                        if !patches.contains_key(variant) {
+                            patches.insert(variant.clone(), patch_of(hub, repo, &e.base, commit).await);
+                        }
+                        let patch = patches.get(variant).cloned().unwrap_or_else(|| Err("no change".into()));
+                        match start_beside(hub, e, variant, &c.name, command, round, patch).await {
+                            Ok(r) => r,
+                            // Nothing of it can be measured there: it stops, saying why.
+                            Err(why) => return Some(why),
+                        }
+                    }
+                    _ => start_one(hub, e, repo, variant, commit, c, round).await,
+                };
                 started.push(r);
             }
             for mut r in started {
-                if let Some(run) = r.run.clone() {
+                let minutes = if let Some(run) = r.run.clone() {
                     let (conclusion, metrics, minutes) = finish(hub, &e.id, &run, deadline).await;
                     r.conclusion = Some(conclusion);
                     r.metrics = metrics;
-                    if let Some(v) = e.variants.iter_mut().find(|v| v.name == r.variant) {
-                        v.minutes += minutes;
-                    }
+                    minutes
+                } else if r.on.is_some() && r.conclusion.is_none() {
+                    finish_beside(hub, e, &mut r, deadline).await
+                } else {
+                    0.0
+                };
+                if let Some(v) = e.variants.iter_mut().find(|v| v.name == r.variant) {
+                    v.minutes += minutes;
                 }
                 e.runs.push(r);
             }
@@ -872,13 +917,166 @@ async fn measure(hub: &Arc<Hub>, e: &mut Experiment, repo: &Repo, which: &[Strin
     None
 }
 
+/// `e`'s time limit, in seconds.
+fn limit(e: &Experiment) -> Option<u64> {
+    e.budget_seconds.or(e.budget_minutes.map(|m| m.saturating_mul(60)))
+}
+
+/// `seconds` in the largest unit it's a whole number of: `90 seconds`, `2 hours`, `3 days`.
+fn span(seconds: u64) -> String {
+    let (n, unit) = [(86_400, "day"), (3_600, "hour"), (60, "minute")].into_iter().find(|(u, _)| seconds >= *u && seconds.is_multiple_of(*u)).map_or((seconds, "second"), |(u, name)| (seconds / u, name));
+    format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
+}
+
 /// Whether to stop: cancelled, or past the budget (its runs cancelled either way).
 async fn stopped(hub: &Hub, e: &mut Experiment, deadline: Option<std::time::Instant>) -> Option<String> {
     if let Some(by) = hub.store.kv_get(cancel_key(&e.id)).await.ok().flatten() {
         e.state = "cancelled".into();
         return Some(format!("cancelled by {by}"));
     }
-    deadline.filter(|d| std::time::Instant::now() >= *d).map(|_| format!("its budget of {} minutes ran out: what was measured is reported", e.budget_minutes.unwrap_or(0)))
+    deadline.filter(|d| std::time::Instant::now() >= *d).map(|_| format!("its time limit of {} ran out: what was measured is reported", span(limit(e).unwrap_or(0))))
+}
+
+/// Measurement `round` of `variant` by `criterion`, as the machine beside the agent knows it: the
+/// experiment's id and when it was made (ids of two servers' experiments can meet on a machine).
+fn measure_key(e: &Experiment, variant: &str, criterion: &str, round: usize) -> String {
+    format!("{}/{variant}/{criterion}/{round}", beside_id(e))
+}
+
+fn beside_id(e: &Experiment) -> String {
+    format!("{}-{}", e.id, e.created_at)
+}
+
+/// What variant commit `commit` changes over `base`, as `git apply` takes it on the machine that
+/// measures it (base64: a change's files needn't be UTF-8); or why it can't be sent.
+async fn patch_of(hub: &Hub, repo: &Repo, base: &str, commit: &str) -> Result<String, String> {
+    let mirror = crate::gitops::mirror_path(hub, &repo.name).to_string_lossy().into_owned();
+    let out = crate::gitops::run_git(hub, &["-C", &mirror, "diff", "--binary", "--full-index", "--no-renames", "--no-color", "--no-ext-diff", "--no-textconv", base, commit], crate::gitops::LS_REMOTE_TIMEOUT)
+        .await
+        .map_err(|err| format!("its change: {err:#}"))?;
+    if out.len() > PATCH_MOST {
+        return Err(format!("its change is {} MiB, more than kiln sends a machine to measure ({} MiB)", out.len() >> 20, PATCH_MOST >> 20));
+    }
+    Ok(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, out))
+}
+
+/// Starts measuring `variant` by command criterion `criterion` in round `round` beside the agent
+/// that asked: in the variant's own worktree of its repository, on its machine, its change
+/// `patch` on the base (docs/ci.md W20-R11, measured without CI). `Err` when that machine can't
+/// measure at all (its kiln is older than the server's): why.
+async fn start_beside(hub: &Hub, e: &Experiment, variant: &str, criterion: &str, command: &str, round: usize, patch: Result<String, String>) -> Result<Run, String> {
+    let mut r = Run { variant: variant.to_owned(), round, criterion: criterion.to_owned(), ..Run::default() };
+    let Some(info) = e.agent.as_ref().and_then(|a| hub.harness.info(a)) else {
+        r.conclusion = Some("untestable".into());
+        r.why = Some("the agent that asked is gone, and a command runs beside it".into());
+        return Ok(r);
+    };
+    let machine = crate::harness::wait::machine(&info.target).to_owned();
+    r.on = Some(machine.clone());
+    let patch = match patch {
+        Ok(p) => p,
+        Err(why) => {
+            r.conclusion = Some("untestable".into());
+            r.why = Some(why);
+            return Ok(r);
+        }
+    };
+    let m = crate::workspace::measure::Measure {
+        key: measure_key(e, variant, criterion, round),
+        experiment: beside_id(e),
+        variant: variant.to_owned(),
+        base: e.base.clone(),
+        patch,
+        command: command.to_owned(),
+        limit_s: ONE_RUN.as_secs(),
+    };
+    match crate::workspace::change::ask_machine(hub, &info, &crate::workspace::Ask::Measure(m)).await {
+        Ok(_) => {}
+        // Not answered in time (a large repository's worktree, made first): it may be under way,
+        // and asked about it says.
+        Err((StatusCode::BAD_GATEWAY, _)) => {}
+        // A runner from before measuring: it can't read the ask (`crate::wire::payload`; older,
+        // `workspace::serve`), or takes no asks about agents' folders at all.
+        Err((_, why)) if ["couldn't be read", "doesn't understand", "too old"].iter().any(|w| why.contains(w)) => {
+            return Err(format!("{machine}'s kiln is older than this server's and can't measure beside its agent: upgrade its runner (System → Updates), then start the experiment again ({why})"));
+        }
+        Err((_, why)) => {
+            r.conclusion = Some("untestable".into());
+            r.why = Some(why);
+        }
+    }
+    Ok(r)
+}
+
+/// A measurement beside the agent that asked, to its end: its conclusion and metrics in `r`, and
+/// the minutes it took; what it printed last, when it failed. Stopped with the experiment, past
+/// its budget, or past [`ONE_RUN`].
+async fn finish_beside(hub: &Hub, e: &Experiment, r: &mut Run, deadline: Option<std::time::Instant>) -> f64 {
+    let key = measure_key(e, &r.variant, &r.criterion, r.round);
+    let machine = r.on.clone().unwrap_or_default();
+    let (until, mut heard) = (std::time::Instant::now() + ONE_RUN, std::time::Instant::now());
+    loop {
+        let Some(info) = e.agent.as_ref().and_then(|a| hub.harness.info(a)) else {
+            r.conclusion = Some("untestable".into());
+            r.why = Some("the agent that asked is gone, and its measurements with it".into());
+            return 0.0;
+        };
+        let now = std::time::Instant::now();
+        let cancelled = hub.store.kv_get(cancel_key(&e.id)).await.ok().flatten().is_some();
+        let stop = cancelled || now >= until || deadline.is_some_and(|d| now >= d);
+        let asked = crate::workspace::change::ask_machine(hub, &info, &crate::workspace::Ask::Measured { key: key.clone(), stop }).await;
+        if stop {
+            r.conclusion = Some("cancelled".into());
+            return 0.0;
+        }
+        match asked {
+            Ok(v) => {
+                heard = now;
+                if let Some(done) = v.get("done") {
+                    let code = done.get("exit_code").and_then(Value::as_i64);
+                    r.metrics = serde_json::from_value(done.get("metrics").cloned().unwrap_or_default()).unwrap_or_default();
+                    r.conclusion = Some(if code == Some(0) { "success" } else { "failure" }.into());
+                    if code != Some(0) {
+                        let error = done.get("error").and_then(Value::as_str).filter(|x| !x.is_empty());
+                        let output = done.get("output").and_then(Value::as_str).unwrap_or_default();
+                        let last: Vec<&str> = output.lines().rev().take(12).collect::<Vec<_>>().into_iter().rev().collect();
+                        let said = match (error, code) {
+                            (Some(err), _) => err.to_owned(),
+                            (None, Some(c)) => format!("exit code {c}"),
+                            (None, None) => "ended by a signal".to_owned(),
+                        };
+                        r.why = Some(crate::util::truncate(&format!("{said}: {}", last.join("\n")), 2000).trim_end_matches(": ").to_owned());
+                    }
+                    return done.get("seconds").and_then(Value::as_f64).unwrap_or_default() / 60.0;
+                }
+            }
+            // The machine said it has no such measurement (its runner started again), or can't.
+            Err((StatusCode::CONFLICT, why)) => {
+                r.conclusion = Some("untestable".into());
+                r.why = Some(why);
+                return 0.0;
+            }
+            Err((_, why)) => {
+                if now.duration_since(heard) > UNHEARD {
+                    r.conclusion = Some("untestable".into());
+                    r.why = Some(format!("{machine} went unheard for {} minutes: {why}", UNHEARD.as_secs() / 60));
+                    return 0.0;
+                }
+            }
+        }
+        crate::rt::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// The worktrees `e` measured in beside the agent that asked go (its runs still going stop).
+async fn unmeasure(hub: &Hub, e: &Experiment) {
+    if !e.runs.iter().any(|r| r.on.is_some()) {
+        return;
+    }
+    let Some(info) = e.agent.as_ref().and_then(|a| hub.harness.info(a)) else { return };
+    if let Err((_, why)) = crate::workspace::change::ask_machine(hub, &info, &crate::workspace::Ask::Unmeasure { experiment: beside_id(e) }).await {
+        tracing::warn!(experiment = %e.id, error = %why, "an experiment's worktrees stayed beside its agent");
+    }
 }
 
 /// Starts the run measuring `variant` (at `commit`) for criterion `c`.
@@ -1006,7 +1204,12 @@ fn analyze(e: &mut Experiment) {
 /// Tells the agent that asked what came of it: the results, and the variant taken or asked for.
 async fn tell(hub: &Arc<Hub>, e: &Experiment) {
     let Some(agent) = e.agent.clone() else { return };
-    let why = e.results.as_ref().and_then(|r| r.get("why")).and_then(Value::as_str).unwrap_or_default().to_owned();
+    let said = e.results.as_ref().and_then(|r| r.get("why")).and_then(Value::as_str).unwrap_or_default();
+    // Ended early (its budget, a machine that couldn't measure): that first.
+    let why = match e.why.as_deref() {
+        Some(early) => format!("{early}; {said}"),
+        None => said.to_owned(),
+    };
     let text = match &e.decision {
         Some(d) => format!(
             "Experiment {} is done: {why}. Continue with {}: its commit is {} (refs/kiln/experiments/{}/{}), the base with its options' changes. Its results: `experiments.get {{\"experiment\": \"{}\"}}`.",
@@ -1082,20 +1285,99 @@ pub async fn cancel(hub: &Hub, caller: &Caller, id: &str) -> Result<Response, Fa
     Ok(srv::json(StatusCode::OK, &json!({ "experiment": e })))
 }
 
-/// When the server starts: experiments it was running stopped with it.
-pub async fn interrupted(hub: &Hub) {
+/// When the server starts: experiments it was running stopped with it, and the worktrees they
+/// measured in beside their agents go once those agents' runners are back.
+pub async fn interrupted(hub: &Arc<Hub>) {
     for mut e in all(hub).await {
         if matches!(e.state.as_str(), "implementing" | "building" | "measuring") {
             e.state = "failed".into();
             e.why = Some("the server restarted while it ran: start it again".into());
             save(hub, &mut e).await;
+            let h = Arc::clone(hub);
+            crate::rt::spawn(async move {
+                crate::rt::sleep(Duration::from_secs(120)).await;
+                unmeasure(&h, &e).await;
+            });
         }
     }
 }
 
+/// What an agent suggests an experiment from its question be measured by (`experiments.suggest`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Suggested {
+    /// The question, as asked (none: the agent's next).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub question: Option<String>,
+    pub criteria: Vec<Criterion>,
+    pub at: i64,
+}
+
+/// An agent's suggestions kept, its newest.
+const SUGGESTIONS: usize = 8;
+
+fn suggested_key(agent: &str) -> String {
+    format!("ci/experiment-suggested/{agent}")
+}
+
+async fn suggestions(hub: &Hub, agent: &str) -> Vec<Suggested> {
+    hub.store.kv_get(suggested_key(agent)).await.ok().flatten().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+}
+
+/// `POST /api/experiments/suggest {question?, criteria, agent?}`: how the calling agent suggests its
+/// question's options be measured, should the person run an experiment instead of answering it:
+/// the commands each variant runs, the metrics they write and their thresholds. The setup of an
+/// experiment opened from that question starts with them (`where_for`'s `suggested`).
+pub async fn suggest(hub: &Hub, caller: &Caller, body: Value) -> Result<Response, Fail> {
+    let named = body.get("agent").and_then(Value::as_str).map(str::trim).filter(|a| !a.is_empty()).map(str::to_owned);
+    let agent = match (&caller.agent, named) {
+        (Some(me), Some(other)) if *me != other => return Err((StatusCode::FORBIDDEN, format!("{} suggests for its own questions, not {other}'s", caller.name))),
+        (Some(me), _) => me.clone(),
+        (None, Some(other)) => other,
+        (None, None) => return Err(bad("an agent suggests for its own questions: call this as one, or say which (`agent`)")),
+    };
+    if hub.harness.info(&agent).is_none() {
+        return Err((StatusCode::NOT_FOUND, format!("no agent `{agent}`")));
+    }
+    let question = body.get("question").and_then(Value::as_str).map(str::trim).filter(|q| !q.is_empty()).map(str::to_owned);
+    let criteria: Vec<Criterion> = serde_json::from_value(body.get("criteria").cloned().unwrap_or_default()).map_err(|e| bad(format!("`criteria`: {e}")))?;
+    if criteria.is_empty() || criteria.len() > 16 {
+        return Err(bad("suggest from 1 to 16 criteria"));
+    }
+    if !criteria.iter().any(|c| !matches!(c.kind, Kind::Metric { .. })) {
+        return Err(bad("suggest a command among them: it's what a variant runs, and what writes its metrics"));
+    }
+    let mut seen: Vec<&str> = Vec::new();
+    for c in &criteria {
+        if c.name.trim().is_empty() || seen.contains(&c.name.as_str()) {
+            return Err(bad("each criterion has a name of its own"));
+        }
+        seen.push(&c.name);
+        let empty = match &c.kind {
+            Kind::Command { command, .. } => command.trim().is_empty(),
+            Kind::Pipeline { workflow } => workflow.trim().is_empty(),
+            Kind::Metric { metric, .. } => metric.trim().is_empty(),
+        };
+        let unbounded = matches!(c.threshold, Some(ex::Threshold::AtMost(x) | ex::Threshold::AtLeast(x) | ex::Threshold::Better(x)) if !x.is_finite());
+        if empty || unbounded {
+            return Err(bad(format!("`{}`: say what it runs or measures, and a threshold that's a number", c.name)));
+        }
+    }
+    let made = Suggested { question: question.clone(), criteria, at: crate::util::now_unix() };
+    let mut kept = suggestions(hub, &agent).await;
+    kept.retain(|k| k.question != question);
+    kept.insert(0, made.clone());
+    kept.truncate(SUGGESTIONS);
+    let text = serde_json::to_string(&kept).map_err(|e| internal(e.into()))?;
+    hub.store.kv_set(suggested_key(&agent), text).await.map_err(internal)?;
+    Ok(srv::json(StatusCode::OK, &json!({ "suggested": made })))
+}
+
 /// `GET /api/experiments/where?agent=`: where an experiment from that agent's question runs: the
-/// repository its folder is a checkout of, the workflows on its default branch that can measure
-/// one, and whether the caller may start it.
+/// repository its folder is a checkout of, the machine its commands run on (`machine`, each
+/// variant in a worktree of its own there), whether CI's engine is on (`ci`) and the workflows on
+/// its default branch that can measure one then, what the agent suggested measuring by
+/// (`suggested`, newest first), and whether the caller may start it.
 pub async fn where_for(hub: &Hub, caller: &Caller, q: &std::collections::HashMap<String, String>) -> Result<Response, Fail> {
     let agent = q.get("agent").filter(|a| !a.is_empty()).ok_or_else(|| bad("say which agent (`agent`)"))?;
     let info = hub.harness.info(agent).ok_or_else(|| (StatusCode::NOT_FOUND, format!("no agent `{agent}`")))?;
@@ -1106,20 +1388,28 @@ pub async fn where_for(hub: &Hub, caller: &Caller, q: &std::collections::HashMap
     }
     let repo = hub.store.repos().await.map_err(internal)?.into_iter().find(|r| r.name == name).ok_or_else(|| (StatusCode::NOT_FOUND, format!("no repository `{name}`")))?;
     let facts = super::events::facts(hub, &repo).await;
+    // A pipeline is CI's to run: offered while its engine is on.
+    let ci = hub.ci.enabled();
     let workflows: Vec<String> = match super::events::named_ref(hub, &repo, &facts.default_branch).await {
-        Ok((_, sha)) => super::load::load(hub, &repo, &sha).await.map(|c| c.workflows.into_iter().filter(|l| l.runs).map(|l| l.path).collect()).unwrap_or_default(),
-        Err(_) => Vec::new(),
+        Ok((_, sha)) if ci => super::load::load(hub, &repo, &sha).await.map(|c| c.workflows.into_iter().filter(|l| l.runs).map(|l| l.path).collect()).unwrap_or_default(),
+        _ => Vec::new(),
     };
-    Ok(srv::json(StatusCode::OK, &json!({ "repo": repo.name, "branch": facts.default_branch, "workflows": workflows, "may": caller.can("experiments.run", &scope) })))
+    let machine = crate::harness::wait::machine(&info.target).to_owned();
+    let suggested = suggestions(hub, agent).await;
+    Ok(srv::json(
+        StatusCode::OK,
+        &json!({ "repo": repo.name, "branch": facts.default_branch, "machine": machine, "ci": ci, "workflows": workflows, "suggested": suggested, "may": caller.can("experiments.run", &scope) }),
+    ))
 }
 
-/// `/api/experiments[/:id[/decide|/cancel]]`, and `/where`.
+/// `/api/experiments[/:id[/decide|/cancel]]`, `/where` and `/suggest`.
 pub async fn route(hub: &Arc<Hub>, caller: &Caller, method: &http::Method, rest: &[&str], q: &std::collections::HashMap<String, String>, body: Value) -> Result<Response, Fail> {
     use http::Method;
     match (method, rest) {
         (&Method::GET, []) => list(hub, caller, q).await,
         (&Method::GET, ["where"]) => where_for(hub, caller, q).await,
         (&Method::POST, []) => start(hub, caller, body).await,
+        (&Method::POST, ["suggest"]) => suggest(hub, caller, body).await,
         (&Method::GET, [id]) => show(hub, caller, id).await,
         (&Method::POST, [id, "decide"]) => decide(hub, caller, id, &body).await,
         (&Method::POST, [id, "cancel"]) => cancel(hub, caller, id).await,
@@ -1130,6 +1420,19 @@ pub async fn route(hub: &Arc<Hub>, caller: &Caller, method: &http::Method, rest:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn w20_r11_a_time_limit_is_said_in_its_largest_whole_unit() {
+        assert_eq!(span(90), "90 seconds");
+        assert_eq!(span(60), "1 minute");
+        assert_eq!(span(7_200), "2 hours");
+        assert_eq!(span(3 * 86_400), "3 days");
+        assert_eq!(span(31_536_000), "365 days");
+        let e = Experiment { budget_minutes: Some(5), ..Experiment::default() };
+        assert_eq!(limit(&e), Some(300), "a limit from before seconds");
+        let e = Experiment { budget_minutes: Some(5), budget_seconds: Some(45), ..Experiment::default() };
+        assert_eq!(limit(&e), Some(45), "seconds when it has them");
+    }
 
     #[test]
     fn w20_r11_an_agents_diff_is_the_last_it_names() {

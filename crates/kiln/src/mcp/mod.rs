@@ -208,6 +208,10 @@ const RUNNER_ANSWER_MAX: usize = 4 << 20;
 /// runs (a plan's versions, and deleting one, are code mode's).
 const PLAN_TOOLS: &[&str] = &["plans.list", "plans.get", "plans.create", "plans.update", "plans.ready", "plans.run", "plans.runs.list", "plans.runs.get", "plans.runs.stop", "plans.runs.retry"];
 
+/// CI's operations an agent has as tools of its own: what it suggests its question's experiment
+/// be measured by (docs/ci.md W20-R11).
+const CI_TOOLS: &[&str] = &["experiments.suggest"];
+
 /// kiln's operations an agent has as tools of its own (`agents_start`, `goals_plan`, `plans_run`,
 /// …): `agents.*`, `goals.*` but a stack's settings, most of `plans.*`, and `research.*`. The server says which
 /// ([`runner_ask`]'s registry answer), so its agents' MCP servers offer what it has, however old
@@ -259,7 +263,7 @@ pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, ask: &crate::reach::Questi
     let answer = match ask {
         Question::Registry { .. } => {
             let skills: Vec<Value> = skills::list().into_iter().map(|s| json!({"name": s.get("name"), "description": s.get("description")})).collect();
-            let tools: Vec<&str> = agent_ops().iter().map(|o| o.name).collect();
+            let tools: Vec<&str> = agent_ops().iter().map(|o| o.name).chain(CI_TOOLS.iter().copied()).collect();
             json!({"registry": code::registry(hub), "skills": skills, "agent_tools": tools})
         }
         Question::Call { name, input, .. } => match crate::ops::call_checked(crate::ops::Cx { hub: Arc::clone(hub), caller: caller.clone() }, name, input.clone()).await {

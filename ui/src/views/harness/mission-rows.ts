@@ -6,7 +6,7 @@
  */
 import type { AgentInfo, SaidHit, SubagentBrief } from "@/api/harness";
 import type { AiSession } from "@/api/types";
-import { kilnSubagentsOf, throughSubagents, withKilnSubagents } from "./tasks";
+import { kilnSubagentsOf, startingAgain, throughSubagents, withKilnSubagents } from "./tasks";
 
 export type MissionStand = "needs" | "crashed" | "paused" | "working" | "finished" | "ready" | "offline" | "ended";
 /** An agent's row; `asking`: one of the subagents kiln started for it, whose request for you is on its row. */
@@ -37,6 +37,7 @@ export function missionRows(list: readonly AgentInfo[], seen: Readonly<Record<st
 export function standOf(a: AgentInfo, seen: number | undefined): MissionStand {
   // A request, or goals it paused for you.
   if (a.approvals.length > 0 || a.status === "waiting" || a.held) return "needs";
+  if (startingAgain(a)) return "working";
   if (a.status === "exited" && a.exit?.error) return "crashed";
   // Waiting for a usage limit to reset (its current turn, if any, finishes first).
   if (a.pause && a.status !== "running" && a.status !== "exited" && a.status !== "disconnected") return "paused";

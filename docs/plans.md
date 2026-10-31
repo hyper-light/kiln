@@ -3,16 +3,19 @@
 A plan is what an agent will do, kept with the agent session it belongs to: written in its Plan
 tab, made by the agent or from one of its goals, or saved from the plan it proposed; changed (each
 change a version), shared by a link, and run on that agent or any other of any harness kiln runs
-(Claude Code, Codex, Gemini CLI, opencode, Goose, Amp, ...). Each agent's Plan tab lists its own
-plans (**Your plans**); there's no list of every plan apart from them. A plan's page, its runs and
-its research lead back to the agent it's kept with.
+(Claude Code, Codex, Gemini CLI, opencode, Goose, Amp, ...). Each agent's Plan tab has **Plans**:
+the plan under way up top, as it moves (its to-do list, or the plan it proposed), and under it,
+**Saved plans**: every plan kept, in brief, newest first, to search by their words and narrow by
+whose they are (this agent's, other agents', no agent's), where they stand (being planned, not run
+yet, run before) and their tags, a row each that opens in place to run it on that agent. A plan's
+page, its runs and its research lead back to the agent it's kept with.
 
 ## Keeping one
 
-- **In an agent's Plan tab**, under **Your plans**: **New plan**, then its steps one at a time,
+- **In an agent's Plan tab**, under **Plans**: **New plan**, then its steps one at a time,
   each with its own **description**, **examples**, **acceptance criteria** and **tests**; an
   optional overview for what every step should know. Save it, change it (**Edit**), and run it on
-  that agent, without leaving it.
+  that agent (**Run here**), without leaving it; any plan found under **Saved plans** the same way.
 
   A step's **acceptance criteria** are as many as it needs, each **in words** or **a measure**: a
   target ("p99.9 latency"), how it compares (is at most, less than, at least, more than, exactly,
@@ -272,7 +275,7 @@ A plan's written steps are `items` in the API: `[{title, description, examples, 
 
 | Method | Path | |
 | --- | --- | --- |
-| GET | `/api/plans` | every plan, newest change first; `session`: an agent's (made in its conversation), `proposed=1`: the plans agents proposed (plan mode), kept by kiln |
+| GET | `/api/plans` | every plan, newest change first; `q`: those whose title, text, steps or tags hold it (any case), `session`: an agent's (made in its conversation), `proposed=1`: the plans agents proposed (plan mode), kept by kiln; `brief=1`: each without its text, items or steps' titles (`step_count` says how many), as the Plan tab lists them |
 | POST | `/api/plans` | `{title?, body, tags?, source?}` |
 | GET / PATCH / DELETE | `/api/plans/:id` | one plan (with `reviewed`: the last answer to its review, `{answer, words?, version, by, at}`); `{title?, body?, items?, tags?}` (a title given empty is taken from the text, else the first step, as for a new plan) |
 | GET | `/api/plans/:id/versions` | every version, newest first |
