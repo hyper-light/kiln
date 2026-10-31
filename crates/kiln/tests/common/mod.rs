@@ -7,6 +7,8 @@
 #[cfg(unix)]
 pub mod agents;
 #[cfg(unix)]
+pub mod custody;
+#[cfg(unix)]
 pub mod lab;
 
 use std::collections::BTreeMap;

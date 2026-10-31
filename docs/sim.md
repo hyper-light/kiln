@@ -97,7 +97,7 @@ What the models leave out, so what no seed can find:
 - **The goal driver's model has one node, the server's:** the scheduler never chooses between nodes
   there.
 - **kiln's temporary files** left in a folder (`.kiln-sync-*.tmp`) are left out of the check.
-- **The transfers model's processes** are their copies' keys and whether they run: the host's own take-over (its package, files and harness) isn't run, a take-over there being the epoch up, the receipt signed at it, and a session refused where a copy of it runs already. The server's store doesn't crash there: what kiln certified and revoked is kept whole. Work, changes and reviews changing hands aren't modelled (`crates/kiln/tests/custody.rs` tests them end to end).
+- **The transfers model's processes** are their copies' keys and whether they run: the host's own take-over (its package, files and harness) isn't run, a take-over there being the epoch up, the receipt signed at it, and a session refused where a copy of it runs already. The server's store doesn't crash there: what kiln certified and revoked is kept whole. Work, changes and reviews changing hands aren't modelled (`crates/kiln/tests/transfers.rs` tests them end to end).
 
 ## The bugs it found
 

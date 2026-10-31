@@ -203,7 +203,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W23 | CI providers: KilnCI, GitHub Actions, GitLab CI/CD, Bitbucket Pipelines | W03, W14, deploy-api.md §7 | in progress | the git-host interface (kiln, GitHub, GitLab, Bitbucket); the provider core; GitHub Actions, GitLab CI/CD and Bitbucket Pipelines behind one contract (runs, jobs, logs, rerun, cancel, dispatch, artifacts, approvals, environments, checks, lint, webhooks; AC01); the hosts' pull requests through one API (R06); events for agents; SSO with GitHub, GitLab and Bitbucket, and acting on the host as the person |
 | W24 | Incremental CI: fingerprints, reuse, warm state, shared caches | W04, W05, W06, W08, W13, W18 | ready | specified (2026-10-24): R01–R31, AC01–AC15; milestones M0–M7 and M1e are kiln goals with plans |
 | W26 | Review in Ship: changes as Ship items, each owning its review | W14, W23, W27, Ship (the CI/CD Integration plan) | in progress | R06–R15 built: each item's dropdown owns its review (Files and the Conversation, search on vorpal, kinds and the gate, suggestions and conflicts as revisions, the Review lanes), unsigned until W27-R03; AC06 in Chromium, not yet WebKit; specified (2026-10-25): R01–R20, AC01–AC11; plan `01a175b7d5e1772f8d3c7cb28e50ab2b` |
-| W27 | Attested end to end: identities, signatures, hand-offs, the trail | W10, W18, W26 | in progress | specified (2026-10-25): R01–R12, AC01–AC08; research `01a175c54441773fa28bf1488b82e6aa`; identities built (R01, R02, R12; AC01, AC02): plan `01a17856b1b0712babf8dfd37ce48756` |
+| W27 | Attested end to end: identities, signatures, hand-offs, the trail | W10, W18, W26 | in progress | specified (2026-10-25): R01–R12, AC01–AC08; research `01a175c54441773fa28bf1488b82e6aa`; identities built (R01, R02, R12; AC01, AC02): plan `01a17856b1b0712babf8dfd37ce48756`; hand-offs built (R08, but for an approval carried across a rebase-only revision; AC05: the 14:18 drop and the twin played again, refused and recorded, and the transfers simulation): plan `01a17856b1b477eda14a574ae312a123` |
 
 ---
 
@@ -9260,7 +9260,8 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
   a session's next epoch whoever holds it, the fence); `custody::w27_r08_*` (records kept, breaks
   and refusals; a transfer kept before its epoch rises; the timeline);
   `store::migrations::w27_r08_custody_tables`; `proto::w27_r08_custody_is_appended_after_headroom`;
-  `crates/kiln/tests/custody.rs`: records through the API and the CLI, two take-overs, a move, a
+  `crates/kiln/tests/custody.rs`: records through the API and the CLI; `crates/kiln/tests/transfers.rs`
+  (`cargo test -p kiln --test transfers`), every kind of hand-over: two take-overs, a move, a
   resume from kiln's copy, each walking unbroken with both sides signed; in a release build (an
   upgrade downloads the server's own kiln, and a debug one is larger than kiln serves) a blue/green
   upgrade sending nothing again and `w27_r08_session_hand_overs` (moved, upgraded, taken over,

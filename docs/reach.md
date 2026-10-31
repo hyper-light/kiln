@@ -327,7 +327,12 @@ exit code; a machine that can't be reached rejects). Calls run side by side, up 
 `kiln.machines.list`, `.start` (in the background), `.output` and `.stop`. kiln's own operations
 (`kiln.ci.*`, `kiln.cd.*`, as `code_search` lists them) go to the server through the runner's own
 connection (`Req::Ask` → `AgentMsg::ReachAsk`, `mcp::runner_ask`), for the session: it must be one
-the server knows on that runner, and not a job's runner. The session acts for whoever started it
+the server knows on that runner, and not a job's runner. Once kiln has certified a holder of the
+session, each such ask is the session's act, signed beside it (`act`) by the runner process
+holding the session's key at its epoch (docs/ci.md W27-R08): kiln takes it only from that holder
+now. One from a copy left behind (at an epoch the session left, or from another process) is
+refused, answered with why (where and when the session went on), and recorded with who signed it
+(`kiln transfers refused`). A run on another machine is asked as an act first. The session acts for whoever started it
 (their rights, or the owner's), audited as `agent:<session>@<runner> for <them>`; on a kiln nobody
 but the owner signs in to, a session kiln doesn't know the starter of acts for the owner, and on
 others it can't call kiln's operations. A program has 10 minutes unless `timeout_s` says otherwise
@@ -354,6 +359,14 @@ and is answered over there.
 When the agent's machine is away, it can't hand the agent over. The move then goes on from the
 server's copy of the conversation instead, its transcript included (`{"from_store": true}`; see
 [conversations.md](conversations.md), "Resuming on another machine").
+
+A move is a transfer signed by both sides (docs/ci.md W27-R08). The runner the agent leaves signs
+its hand-on at the agent's epoch, which the package carries. The runner it goes to signs its
+receipt with the key it asks kiln to certify at the next epoch. kiln records both before the epoch
+rises, and certifies the key only then. A move from the server's copy is kiln's take, signed by
+kiln's server for the runner that can't hand it on, saying when kiln last heard from it. The copy
+left behind there is told to let go at its runner's first word back, and what it asks of kiln
+meanwhile is refused (§7).
 
 An agent that isn't running moves too: one that crashed or couldn't start on its runner goes as
 any other (its runner hands it over), and starts again where it goes, with the first message it
@@ -504,6 +517,9 @@ agent stays where it is.
 
 ## 9. Not yet
 
+- A runner's Open of an agent at a later epoch isn't signed itself: it raises the epoch kiln's
+  registry keeps (what the agent's inbox and updates are fenced by) before its transfer is recorded,
+  though acts are held to the epoch kiln certified (docs/ci.md W27-R08).
 - A direct runner-to-runner path when two runners can reach each other (the link would move to it
   and keep its session); today every link goes through the server.
 - Pinning fingerprints from the UI (today: `kiln reach status`, `kiln reach forget`).

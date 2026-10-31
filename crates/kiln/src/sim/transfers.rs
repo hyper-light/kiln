@@ -23,7 +23,7 @@
 //! Left out: the host's own take-over (its package, files and harness: here a take-over is the
 //! epoch up, the receipt signed at it, and a session refused where a copy of it runs already), the
 //! sessions' data (the `moves` model's), and work, changes and reviews changing hands (tested end to
-//! end, `tests/custody.rs`).
+//! end, `tests/transfers.rs`).
 
 #[cfg(test)]
 mod model {
