@@ -162,6 +162,12 @@ pub fn server_checks(yes: bool) {
     SERVER_CHECKS.store(yes, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether this process sends kiln its custody records: it signs them, and its server takes them
+/// (not a pod's ephemeral runner, nor one whose server is from before).
+pub(crate) fn sends() -> bool {
+    signs() && SERVER_CHECKS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Whether kiln takes `what` (a run on another machine) as agent session `session`'s act now
 /// (docs/ci.md W27-R08): asked with the act signed by the session this process holds, through
 /// `handle` ([`signed_ask`]); why not (kiln refused it, or can't be asked) if it doesn't. A server
@@ -233,8 +239,14 @@ fn queue(bundle: &Value) {
     STATE.lock().outbox.push_back(bundle.to_string());
 }
 
+/// A custody record this process signed (its receipts of a leg's inputs, `runner::signed`), sent
+/// to kiln with the others, oldest first (`AgentMsg::Custody`).
+pub(crate) fn send(bundle: &Value) {
+    queue(bundle);
+}
+
 /// The digest of a bundle's statement ("" when it can't be read).
-fn digest_of(bundle: &Value) -> String {
+pub(crate) fn digest_of(bundle: &Value) -> String {
     use base64::Engine as _;
     let env = bundle.get("dsseEnvelope");
     let ty = env.and_then(|e| e.get("payloadType")).and_then(Value::as_str);
@@ -246,7 +258,7 @@ fn digest_of(bundle: &Value) -> String {
 }
 
 /// A bundle's statement, unchecked: the server checks it.
-fn statement_of(bundle: &Value) -> Option<Statement> {
+pub(crate) fn statement_of(bundle: &Value) -> Option<Statement> {
     use base64::Engine as _;
     let payload = bundle.get("dsseEnvelope")?.get("payload")?.as_str()?;
     let bytes = base64::engine::general_purpose::STANDARD.decode(payload).ok()?;
@@ -259,7 +271,7 @@ fn body_of(bundle: &Value) -> Option<Value> {
 }
 
 /// Whom a hand-on says its thing comes from: the giver a take hands on for, else its signer.
-fn giver_of(hand_on: &Value) -> Option<String> {
+pub(crate) fn giver_of(hand_on: &Value) -> Option<String> {
     let body = body_of(hand_on)?;
     let s = |k: &str| body.get(k).and_then(Value::as_str).map(str::to_owned);
     if s("kind").as_deref() == Some("taken") { s("taken_for") } else { s("by") }
@@ -448,12 +460,24 @@ fn task_hand_on(slot: &str, by: &str, session: &str, task: &str) -> Option<Value
 
 /// kiln's server handed one of this process's agent sessions work (`json`: `{session, hand_on}`,
 /// `ServerMsg::Custody`): the session's receipt is signed as its next turn starts ([`status`]).
-/// Asked again for the same hand-on (after a reconnect), it's kept once.
+/// Asked again for the same hand-on (after a reconnect), it's kept once. Or it handed this process
+/// a leg's inputs (`{leg, hand_on: [..]}`, the Transfers plan's step 11): kept for the leg, whose
+/// end this process signs its receipts of them at (`runner::signed`).
 pub fn handed(json: &str) {
     if !signs() {
         return;
     }
     let Ok(v) = serde_json::from_str::<Value>(json) else { return };
+    let bundle = |b: &Value| match b {
+        Value::String(s) => serde_json::from_str::<Value>(s).unwrap_or(Value::Null),
+        b => b.clone(),
+    };
+    if let Some(job) = v.get("leg").and_then(Value::as_str) {
+        for b in v.get("hand_on").and_then(Value::as_array).into_iter().flatten() {
+            crate::runner::signed::kiln_handed(job, bundle(b));
+        }
+        return;
+    }
     let Some(session) = v.get("session").and_then(Value::as_str) else { return };
     let hand_on = match v.get("hand_on") {
         Some(Value::String(s)) => serde_json::from_str::<Value>(s).unwrap_or(Value::Null),

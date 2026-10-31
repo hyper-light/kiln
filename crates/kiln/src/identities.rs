@@ -873,6 +873,11 @@ async fn issue(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) -> any
         (Actor::Leg { attempt, .. }, Some(job)) => Some(delegate_leg(hub, job, *attempt, &uri, &pem, &facts, ask.signs).await.map_err(|e| e.context("the server's delegation of the leg wasn't signed"))?),
         _ => None,
     };
+    // And the leg's inputs handed to the runner process running it, signed (docs/ci.md W27-R08).
+    if let (Actor::Leg { attempt, .. }, Some(job)) = (&identity.actor, ask.of.as_deref()) {
+        let commit = facts.iter().find(|(m, _)| *m == kiln_ci::identity::chain::fulcio::SOURCE_REPOSITORY_DIGEST).map(|(_, c)| c.as_str());
+        Box::pin(crate::ci::signed::give_inputs(hub, peer, job, *attempt, &uri, commit)).await;
+    }
     let now = crate::util::now_unix();
     // A hand-over's (docs/ci.md W27-R08): its hand-on and the receipt for it kept first, so the
     // epoch rises with them; the key isn't certified without them.

@@ -674,7 +674,7 @@ pub async fn handed_to(store: &Store, to: &str, thing: &statement::Subject) -> a
 }
 
 /// A kept record's statement, read from its envelope as kiln took it.
-fn statement_in(envelope: &str) -> Option<statement::Statement> {
+pub(crate) fn statement_in(envelope: &str) -> Option<statement::Statement> {
     let bundle: Value = serde_json::from_str(envelope).ok()?;
     let payload = bundle.get("dsseEnvelope")?.get("payload")?.as_str()?;
     let bytes = base64::engine::general_purpose::STANDARD.decode(payload).ok()?;

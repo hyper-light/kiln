@@ -44,6 +44,12 @@ reaching a process it isn't for.
 - An approval carried to a rebase-only version, signed by kiln as a transfer and shown in Ship.
 - The simulation (`sim::transfers`): no stale act is ever applied, and each of five planted bugs is
   found.
+- A leg's custody, from the land to what it made (step 11): kiln hands a leg's inputs (its
+  assignment, its commit naming its land, the tarball it serves, the caches it finds) to the runner
+  process running it; that process receives each and hands each to the leg's executor; the leg's
+  hand-on of what it made names the images its token pushed to kiln's registry. A walk from an
+  artifact or an image goes back through every hop. A tarball changed on its way is refused before
+  the leg runs, and the break recorded.
 
 ## Deploying it
 
@@ -61,11 +67,23 @@ reaching a process it isn't for.
   capability bits don't collide: 41 is main's `CAP_UNREAD`; 42, 43 and 44 are `CAP_AGENT_GIT`,
   `CAP_LEG_SIGNS` and `CAP_CUSTODY`. Diff the tails against production's commit again before the
   runners take it.
+- **Merging main into it (Ship, from CI/CD Integration, 2026-10-31).** main's `ship.rs`
+  `hand_off_in` (88de8655b6, b1ef50d5ce, not in this branch) takes a commit's author from
+  `made_by(&rec).agent`, not `authors_agent`. This branch's `handing()` (the browser-signed Hand
+  off) must take that, keeping its live-revision and no-one-has-it filters;
+  `ship::tests::w26_r18_made_by_says_who_made_each_commit` holds it. Against `ship-actions`
+  (b978aaecd5), `ui/src/api/ship.ts`, `ui/mock/ship.ts`, `docs/api.md` and both conflicts in
+  `authz/mod.rs` keep both sides.
 - **Order.** The server first, then the runners. A runner from before signs nothing, and its
   hand-overs are recorded as unsigned, naming which side is from before. A server from before
   announces no `CAP_CUSTODY`, so runners send it nothing signed.
+- **Step 11 on the wire:** no new variants or bits. kiln's hand-ons of a leg's inputs go as
+  `ServerMsg::Custody` with a new JSON shape (`{leg, hand_on}`), which a runner from before ignores;
+  the tarball's comes in a response header (`Kiln-Custody-Hand-On`) and a cache's in a new field of
+  the lookup's answer, both ignored by a runner from before. A runner asks `/_kiln/pushed` at a
+  leg's end; a server from before answers 404, and the leg's hand-on names no images, as before.
 - **Config:** nothing new in kiln.toml.
-- **First start:** the migration only adds tables.
+- **First start:** the migrations only add tables (`ci_leg_pushed` with step 11).
 
 ## Watching it
 
@@ -81,5 +99,6 @@ reaching a process it isn't for.
 
 ## Open
 
-- Steps 11–16: artifacts, machines and intermediaries. They start once Ada has seen plan v7.
+- Steps 12–16: machines, intermediaries, production, the walk and its simulation, and the end to
+  end. Ada approved plan v7 on 2026-10-31; step 11 is built.
 - A session's `Open` at a later epoch isn't signed itself (docs/reach.md, "Not yet").

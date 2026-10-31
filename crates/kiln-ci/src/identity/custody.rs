@@ -530,10 +530,13 @@ pub fn hop(record: &str, records: &BTreeMap<String, Checked>, server: &str) -> R
             Edge::MadeFrom => made_from.push(f.clone()),
         }
     }
-    if rb.kind.takes() && !gave {
+    // A receipt of what came from where kiln has no identity (a registry outside it,
+    // `docker://alpine:3.20`), following nothing: its chain begins there, as its taker received it.
+    let from_outside = rb.kind == Kind::Received && r.statement.follows.is_empty() && rb.from.as_deref().is_some_and(|f| !f.is_empty() && !f.starts_with("kiln://"));
+    if rb.kind.takes() && !gave && !from_outside {
         return Err(Break::NoHandOn { record: record.to_owned(), kind: rb.kind });
     }
-    let began = !rb.kind.takes() && !held;
+    let began = (!rb.kind.takes() && !held) || from_outside;
     let taken_for = rb.taken_for.clone().filter(|_| r.custodian == server);
     Ok(Hop { record: record.to_owned(), kind: rb.kind, custodian: r.custodian.clone(), taken_for, at: r.at, subject: r.statement.subject.clone(), made_from, began })
 }
@@ -834,6 +837,15 @@ mod tests {
             let key = KeyPair::generate()?;
             let serial: Vec<u8> = std::iter::once(0x42).chain(Sha256::digest(key.der_bytes()).iter().take(8).copied()).collect();
             p.serial_number = Some(SerialNumber::from_slice(&serial));
+            // A leg's names the facts its kind needs: its commit and its workflow.
+            if uri.contains("/leg/") {
+                use crate::identity::chain::fulcio;
+                for (member, value) in [(fulcio::SOURCE_REPOSITORY_DIGEST, "4c1e2a90d1f3b5a7c9e1f3a5b7c9d1e3f5a7b9c1"), (fulcio::BUILD_SIGNER_URI, "https://kiln.home/hyper-light/kiln/.kiln/ci.yml@refs/heads/main")] {
+                    let mut oid = fulcio::ARC.to_vec();
+                    oid.push(member);
+                    p.custom_extensions.push(rcgen::CustomExtension::from_oid_content(&oid, crate::identity::chain::der_utf8_string(value).ok_or_else(|| anyhow::anyhow!("too long"))?));
+                }
+            }
             Ok(Self { uri: uri.to_owned(), der: p.signed_by(&key, &ca.issuer)?.der().to_vec(), key })
         }
 
@@ -1083,6 +1095,78 @@ mod tests {
         let r = walk(&l.deployed, &kept.records, SERVER);
         assert!(matches!(&r, Err(Break::NoRecord { record, followed_by: Some(by) }) if record == &l.built && by == &l.stored), "{r:?}");
         assert!(r.is_err_and(|e| e.to_string().contains("which")));
+        Ok(())
+    }
+
+    /// W27-R08 (the Transfers plan's step 11): a leg's receipt of an image from a registry kiln has
+    /// no identity of begins its chain there, as the leg received it; a receipt from one of kiln's
+    /// identities with no hand-on before it is still a break.
+    #[test]
+    fn w27_r08_a_receipt_from_outside_kiln_begins_its_chain() -> anyhow::Result<()> {
+        let ca = ca()?;
+        let fedora = Signer::new(&ca, FEDORA)?;
+        let image = thing("image docker.io/library/alpine:3.20", 'c');
+        let mut kept = Kept::default();
+        let got = kept.take(&ca, &fedora, &record(Kind::Received, std::slice::from_ref(&image), None, Some("docker://alpine:3.20"), &[], "custody", 1), AT - 1)?;
+        let w = walk(&got, &kept.records, SERVER)?;
+        assert_eq!(w.began, vec![got.clone()]);
+        assert!(w.hops.iter().all(|h| h.kind == Kind::Received && h.began));
+        let mut kept = Kept::default();
+        let from_kiln = kept.take(&ca, &fedora, &record(Kind::Received, std::slice::from_ref(&image), None, Some(SERVER), &[], "custody", 1), AT - 1)?;
+        let r = walk(&from_kiln, &kept.records, SERVER);
+        assert!(matches!(&r, Err(Break::NoHandOn { record, .. }) if record == &from_kiln), "{r:?}");
+        Ok(())
+    }
+
+    /// W27-R08 (the Transfers plan's step 11): a leg's inputs, from the land to what it made. kiln
+    /// hands fedora-2's runner the leg's assignment, its commit and the tarball it served it; the
+    /// runner receives each and hands each the leg's executor needs to it ([`crate::attest::leg::
+    /// runner_custody`]); the leg receives them, builds, and hands the image it made to kiln, which
+    /// receives it. Walked back from kiln's receipt: every hop a hand-on and its receipt, begun only
+    /// where kiln handed the leg's inputs on, none left unanswered. The tarball changed in transit:
+    /// the runner's receipt of what it got breaks at that hop.
+    #[test]
+    fn w27_r08_a_legs_inputs_walk_from_kiln_to_what_it_made() -> anyhow::Result<()> {
+        use crate::attest::leg::{self, Handed, Receipt};
+        let leg_uri = format!("{FEDORA}/run/812/attempt/1/leg/build");
+        assert_eq!(leg::runner_of(&leg_uri).map_err(anyhow::Error::msg)?, FEDORA);
+        let ca = ca()?;
+        let (server, runner, built) = (Signer::new(&ca, SERVER)?, Signer::new(&ca, FEDORA)?, Signer::new(&ca, &leg_uri)?);
+        let commit = Subject { name: "commit".into(), digest: BTreeMap::from([("gitCommit".to_owned(), "4c1e2a".repeat(7).get(..40).unwrap_or_default().to_owned())]), ..Subject::default() };
+        let (assignment, tarball) = (thing("assignment", 'a'), thing("checkout", 'b'));
+        let mut kept = Kept::default();
+        let mut handed = Vec::new();
+        for (n, t) in [&assignment, &commit, &tarball].into_iter().enumerate() {
+            let d = kept.take(&ca, &server, &record(Kind::HandedOn, std::slice::from_ref(t), Some(FEDORA), None, &[], "inputs", n as u64 + 1), AT - 10)?;
+            handed.push(Handed { subject: t.clone(), hand_on: d, from: SERVER.into() });
+        }
+        let to_leg = vec![assignment.clone(), tarball.clone()];
+        let (records, hand_ons) = leg::runner_custody(FEDORA, &leg_uri, &handed, &to_leg, "for the leg")?;
+        assert_eq!(hand_ons.len(), to_leg.len());
+        for (st, _) in &records {
+            kept.take(&ca, &runner, st, AT - 8)?;
+        }
+        let receipts: Vec<Receipt> = to_leg.iter().zip(&hand_ons).map(|(t, h)| Receipt { subject: t.clone(), from: FEDORA.into(), why: "from its runner".into(), follows: vec![h.clone()] }).collect();
+        let image = thing("image registry/app", 'e');
+        let mut made = String::new();
+        for (st, d) in leg::custody(&leg_uri, &receipts, vec![image.clone()], SERVER, None)? {
+            kept.take(&ca, &built, &st, AT - 5)?;
+            made = d;
+        }
+        let kilns = kept.take(&ca, &server, &record(Kind::Received, std::slice::from_ref(&image), None, Some(&leg_uri), &[made.as_str()], "leg", 1), AT - 1)?;
+        let w = walk(&kilns, &kept.records, SERVER)?;
+        assert_eq!(w.hops.len(), 3 + records.len() + receipts.len() + 2, "{:#?}", w.hops);
+        // Begun where kiln handed the leg's inputs on, and where the leg made the image from them.
+        let began: Vec<&str> = w.began.iter().filter_map(|b| kept.records.get(b)).map(|c| c.custodian.as_str()).collect();
+        assert_eq!(began.iter().filter(|c| **c == SERVER).count(), 3, "{began:?}");
+        assert_eq!(began.iter().filter(|c| **c == leg_uri).count(), 1, "{began:?}");
+        assert!(w.hops.iter().any(|h| h.custodian == leg_uri && h.kind == Kind::HandedOn && h.began && h.made_from.len() == receipts.len()), "{:#?}", w.hops);
+        assert!(unanswered(&kept.records).is_empty(), "{:?}", unanswered(&kept.records));
+        // The tarball changed in transit: what the runner got isn't what kiln handed on.
+        let got = record(Kind::Received, &[thing("checkout", 'f')], None, Some(SERVER), &[handed.get(2).map(|h| h.hand_on.as_str()).unwrap_or_default()], "refused", 1);
+        let refused = kept.take(&ca, &runner, &got, AT)?;
+        let r = hop(&refused, &kept.records, SERVER);
+        assert!(matches!(&r, Err(Break::Changed { .. })), "{r:?}");
         Ok(())
     }
 

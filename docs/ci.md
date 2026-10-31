@@ -9445,6 +9445,26 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
   new build its receipt as its own once that identity is certified, both to the server; the
   upgrade's job is the replant's record of the machine, listing each transfer (the runner role and
   each session the machine held as it began) and what moved without one.
+- *A leg's custody, from the land to what it made* (step 11): kiln's server hands each leg's
+  inputs to the runner process it gives the leg to, a hand-on of each by digest, signed as the
+  server and kept: its assignment and its commit as it certifies the leg (`ci::signed::give_inputs`,
+  sent to that process as `ServerMsg::Custody` `{leg, hand_on}`), the commit naming the land that
+  put it at its trunk's head when kiln's queue landed it (`land`: "landed (kiln)"); the tarball and
+  each action it serves, with the bytes (`Kiln-Custody-Hand-On`); each cache it finds, in the
+  lookup's answer; each artifact the leg downloads, in the signed URL's answer when kiln's runner
+  asks (`kiln_custody`: GitHub's toolkit reads that answer only as it knows it). The
+  runner process signs, as itself, its receipt of each and its hand-on of each thing it gives the
+  leg's executor (`kiln_ci::attest::leg::runner_custody`), sent ahead of the leg's records, and the
+  leg's receipts follow those hand-ons; what came from where kiln has no identity (an image from a
+  registry outside it) begins its chain at the leg's receipt. The leg's hand-on of what it made
+  names each image its token pushed to kiln's registry (`ci_leg_pushed`, asked at the leg's end as
+  `/_kiln/pushed`), and kiln's receipt of it, as the artifact store and the registry, takes custody
+  of them all. The leg's records and kiln's receipt are kept in kiln's custody too, so a walk from
+  an artifact or an image (`GET /api/custody?digest=`) goes back through every hop to where kiln
+  handed the leg's inputs on. A tarball, an action or an artifact whose bytes aren't the ones kiln
+  handed on isn't used (a checkout's is refused before the leg's first step runs), and the runner's
+  receipt of what it got is the break kiln records at that hop. A leg's provenance (W27-R06) is
+  signed only of what its hand-on names and of materials among what it received.
 - *A resume from the server's store* is kiln's take: signed with the server's own key for the
   identity kiln last certified the session as at that epoch (`identities::holder_at`), to the next,
   saying when kiln last heard from the machine; kiln keeps it at once, the package carries it, and
@@ -9502,8 +9522,18 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
   neither, saying why) and, in the UI, `e2e/ship-carried.spec.ts` (the carried line under Approve,
   in Chromium and WebKit at desktop and phone widths); and, in a release build, `w27_r08_replant` (box-a
   upgraded blue/green with two sessions: its job lists the runner role, from the process replaced to
-  its new build, and both sessions, each a verified transfer, nothing without one). Simulation (the
-  Transfers plan's step 9, W27-AC05):
+  its new build, and both sessions, each a verified transfer, nothing without one). A leg's custody
+  (step 11): kiln-ci's `w27_r08_a_legs_inputs_walk_from_kiln_to_what_it_made` (kiln's hand-ons of a
+  leg's assignment, commit and tarball, its runner's receipts and hand-ons, the leg's receipts and
+  hand-on of the image it made, kiln's receipt: unbroken, begun only where kiln handed the inputs
+  on and where the leg made the image, nothing unanswered; the tarball changed, broken at its hop)
+  and `w27_r08_a_receipt_from_outside_kiln_begins_its_chain`; and, with `chaos`, `identities`'s
+  `w27_r08_custody_build` (D1 landed by main's queue; main's run on fedora-2, with no git, checks it
+  out from kiln's tarball, stores an artifact and pushes and attests an image: each walked back from
+  kiln's receipt with both records at every hop, kiln's hand-on of the commit naming D1's land; the
+  image's provenance, signed as the leg, of that image from that commit; then, with the server's
+  `tarball_changed`, the leg refused before any step and the break recorded where fedora-2's runner
+  received other bytes than kiln handed on). Simulation (the Transfers plan's step 9, W27-AC05):
   `sim::transfers::tests::w27_ac05_no_stale_act_is_ever_applied` (docs/sim.md's transfers model:
   moves, resumes from kiln's copy while a machine is cut off, take-overs with the old process still
   acting, blue/green upgrades and their rollbacks, the server restarting with its count stale, under
@@ -9520,14 +9550,15 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
   the session at its next epoch); a runner's Open at a later epoch still raises the epoch the
   registry keeps (what its inbox and updates are fenced by) before its transfer is recorded, though
   acts are held to the epoch kiln certified; what a copy left behind does on its own machine
-  without kiln goes on until its runner hears from kiln (docs/agents.md, "A copy left behind"); a
-  person's hand-off from Ship in the browser is still kiln's take for them, not yet signed with the
-  browser's key as a take-over is; an agent kiln's server runs itself (`local`) signs no receipt of work
+  without kiln goes on until its runner hears from kiln (docs/agents.md, "A copy left behind"); an
+  agent kiln's server runs itself (`local`) signs no receipt of work
   handed to it yet, so its hand-on stays unanswered; an agent's give or pass is kiln's take for it
   (its signed act verified), not yet a hand-on its runner signs; a promotion
   from a linked server's environment, which this server's CD doesn't sign for, nor KilnCD's apps'
   syncs, which take no `after`; Ship's journey listing a replant's transfers beside its runners
-  (its job does); artifacts, machines and intermediaries (steps 11 to 16).
+  (its job does); a pod's leg, its own runner, whose inputs aren't a runner process's to hand on;
+  images a leg pushes to a registry outside kiln, which signs no receipt; machines, intermediaries
+  and production (steps 12 to 16).
 
 ### W28 Demand-driven CI: adopt, cover, stagger, land by conflict graph
 

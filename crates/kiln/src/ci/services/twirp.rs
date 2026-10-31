@@ -252,7 +252,21 @@ async fn signed_url(hub: &Hub, c: &Claims, body: &Value, origin: &str) -> anyhow
     let name = string(body, "name").unwrap_or_default();
     let found = rows(hub, &c.run, Some(name.clone()), None).await?;
     let Some(a) = found.last() else { return Ok(err("not_found", &format!("no artifact named {name} in this run"))) };
-    Ok(srv::json(StatusCode::OK, &json!({ "signed_url": blob::url(hub, origin, Target::Artifact(a.id), "r", URL_TTL) })))
+    let url = blob::url(hub, origin, Target::Artifact(a.id), "r", URL_TTL);
+    // kiln's hand-on of the artifact to the runner process running the leg (docs/ci.md W27-R08),
+    // for kiln's own runner, which asks for it: GitHub's toolkit reads the answer as it knows it.
+    let custody = body.get("kiln_custody").and_then(Value::as_bool).unwrap_or(false);
+    let hand_on = match a.digest.as_deref().and_then(|d| d.strip_prefix("sha256:")).filter(|_| custody) {
+        Some(hex) => crate::ci::signed::artifact_hand_on(hub, &c.sub, &a.name, hex).await.unwrap_or_else(|e| {
+            tracing::warn!(target: "kiln.custody", leg = %c.sub, error = %format!("{e:#}"), "an artifact served to a leg went without kiln's hand-on");
+            None
+        }),
+        None => None,
+    };
+    Ok(srv::json(StatusCode::OK, &match hand_on {
+        Some(h) => json!({ "signed_url": url, "hand_on": h }),
+        None => json!({ "signed_url": url }),
+    }))
 }
 
 async fn delete(hub: &Hub, c: &Claims, body: &Value) -> anyhow::Result<Response> {

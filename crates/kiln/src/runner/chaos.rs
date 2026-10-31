@@ -43,6 +43,11 @@
 //!   other than the one it counted as its holder, it also sends that one the words about a
 //!   hand-over it sent before transfers named the holder (hand it to the newest, it was taken), as
 //!   it did at 14:18 on 2026-10-25 (docs/ci.md W27-R08), so a test plays the drop again.
+//! - `tarball_changed`: the server's: a commit's tarball it serves a leg has a byte changed after
+//!   kiln signed its hand-on of it, as a tarball changed in transit is (docs/ci.md W27-R08), so a
+//!   test sees the runner refuse it before the leg runs and kiln record the break.
+//! - `no_git`: the runner acts as if git weren't installed: a leg checks its commit out from the
+//!   server's tarball, as on a machine without git (docs/ci.md W27-R08's tarball hand-on).
 //! - `copy=<path>`: every frame this runner sends, appended to `path` as it goes below the channel
 //!   (its lane and length, then its bytes), so a test can say what crossed the network (W27-R02).
 //! - `keys=<path>`: each identity key this runner process makes (`crate::runner::identity`),
@@ -87,6 +92,11 @@ pub struct Chaos {
     pub unsigned: bool,
     /// The server's: sends a session's former holder its stale hand-over words (`stale_words`).
     pub stale_words: bool,
+    /// The server's: a tarball it serves a leg changes after kiln signed its hand-on of it
+    /// (`tarball_changed`).
+    pub tarball_changed: bool,
+    /// Acts as if git weren't installed: legs check out from the tarball (`no_git`).
+    pub no_git: bool,
     /// Where every frame this process sends is copied (`copy=`).
     pub copy: Option<std::path::PathBuf>,
     /// Where each identity key this process makes is copied (`keys=`).
@@ -149,6 +159,8 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
             "old" => c.old = true,
             "unsigned" => c.unsigned = true,
             "stale_words" => c.stale_words = true,
+            "tarball_changed" => c.tarball_changed = true,
+            "no_git" => c.no_git = true,
             "copy" | "keys" => {
                 anyhow::ensure!(!v.is_empty(), "chaos `{k}` takes a file's path");
                 let path = Some(std::path::PathBuf::from(v));
@@ -159,7 +171,7 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
                 }
             }
             "seed" => c.seed = v.parse().map_err(|_| anyhow::anyhow!("chaos `seed` takes a number, not `{v}`"))?,
-            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, lag, oom, disk, corrupt, fetch, platform, rebuild, shed, twice, late, seed, fanout, old, unsigned, stale_words, copy or keys"),
+            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, lag, oom, disk, corrupt, fetch, platform, rebuild, shed, twice, late, seed, fanout, old, unsigned, stale_words, tarball_changed, no_git, copy or keys"),
         }
     }
     Ok(c)
@@ -391,10 +403,13 @@ mod tests {
                 old: false,
                 unsigned: false,
                 stale_words: false,
+                tarball_changed: false,
+                no_git: false,
                 copy: None,
                 keys: None
             }
         );
+        assert!(parse("tarball_changed")?.tarball_changed && parse("no_git")?.no_git);
         assert_eq!(parse("platform=darwin/arm64")?.platform.as_deref(), Some("darwin/arm64"));
         // W27-R02's test copies: what a runner sends, and the keys it makes.
         let c = parse("copy=/tmp/a.frames,keys=/tmp/a.keys")?;

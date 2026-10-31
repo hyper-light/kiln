@@ -50,6 +50,9 @@ struct Leg {
     received: Vec<(statement::Subject, Giver, String)>,
     /// What it handed on as it went (artifacts, caches), besides its logs and reports.
     handed: Vec<statement::Subject>,
+    /// kiln's server's hand-ons of the leg's inputs to this runner process (docs/ci.md W27-R08):
+    /// its assignment and commit as it gave the leg, the tarball as it served it. Bundles.
+    from_kiln: Vec<serde_json::Value>,
 }
 
 static LEGS: LazyLock<Mutex<HashMap<String, Leg>>> = LazyLock::new(Default::default);
@@ -81,6 +84,61 @@ pub fn received(job: &str, what: statement::Subject, from: Giver, why: &str) {
     let l = legs.entry(job.to_owned()).or_default();
     if !l.received.iter().any(|(s, f, _)| *s == what && *f == from) {
         l.received.push((what, from, why.to_owned()));
+    }
+}
+
+/// kiln's server handed this runner process an input of leg `job` (`bundle`, its signed hand-on,
+/// the Transfers plan's step 11): kept, once, for this process's receipt of it at the leg's end.
+pub fn kiln_handed(job: &str, bundle: serde_json::Value) {
+    let mut legs = LEGS.lock();
+    let l = legs.entry(job.to_owned()).or_default();
+    if !l.from_kiln.contains(&bundle) {
+        l.from_kiln.push(bundle);
+    }
+}
+
+/// kiln's hand-on (`hand_on`, as it came with what kiln served leg `job`: a tarball, an action, an
+/// artifact; docs/ci.md W27-R08) against what this runner process got (`got`, by its digests).
+/// Signed by kiln (checked against its root, `ca`, when this process has it) and of what came, it's
+/// kept for this process's receipt of it at the leg's end. Else what's wrong, said after the
+/// thing's name ("… isn't what kiln handed on (…)"), and, for other bytes, this process's receipt
+/// of what it got is signed and sent at once ([`got_other`]): the leg doesn't run on it.
+pub fn check_handed(job: &str, hand_on: serde_json::Value, ca: Option<&[u8]>, got: statement::Subject) -> Result<(), String> {
+    if let Some(ca) = ca
+        && let Err(e) = statement::verify(&hand_on, ca, &[], crate::util::now_unix())
+    {
+        return Err(format!("came with a hand-on of kiln's that doesn't verify ({e})"));
+    }
+    let Some(said) = crate::runner::custody::statement_of(&hand_on).and_then(|s| s.subject.into_iter().next()) else { return Ok(()) };
+    let other = said.digest.iter().find_map(|(alg, hex)| got.digest.get(alg).filter(|g| !g.eq_ignore_ascii_case(hex)).map(|g| (alg.clone(), hex.clone(), g.clone())));
+    match other {
+        None => {
+            kiln_handed(job, hand_on);
+            Ok(())
+        }
+        Some((alg, said, got_hex)) => {
+            got_other(&hand_on, got);
+            Err(format!("isn't what kiln handed on (kiln said {alg} {said}, this runner got {got_hex})"))
+        }
+    }
+}
+
+/// This runner process got something other than what kiln's server handed it for a leg
+/// (`hand_on`): its receipt of what it got (`got`, by its digests), following that hand-on, signed
+/// as this process and sent at once, so kiln records the break at that hop (docs/ci.md W27-R08;
+/// the Transfers plan's step 11). The leg doesn't run on it.
+pub fn got_other(hand_on: &serde_json::Value, got: statement::Subject) {
+    use crate::runner::custody::{digest_of, giver_of};
+    let Some(by) = crate::runner::identity::uri("runner") else {
+        return tracing::warn!(target: "kiln.custody", thing = %got.name, "this runner got other bytes than kiln handed on, and isn't certified to sign its receipt of them");
+    };
+    let body = serde_json::json!({ "v": 1, "kind": "received", "by": by, "from": giver_of(hand_on).unwrap_or_default(), "why": format!("the leg's {}, other bytes than kiln handed on: the leg doesn't run on them", got.name) });
+    let mut st = statement::Statement::new(body);
+    st.subject = vec![got];
+    st.follows = vec![digest_of(hand_on)];
+    match statement::payload(&st).map_err(anyhow::Error::from).and_then(|p| sign("runner", statement::PAYLOAD_CUSTODY, &p)) {
+        Ok(b) => crate::runner::custody::send(&b),
+        Err(e) => tracing::warn!(target: "kiln.custody", error = %format!("{e:#}"), "this runner's receipt of other bytes than kiln handed on couldn't be signed"),
     }
 }
 
@@ -162,23 +220,78 @@ fn sign_records_with(job: &str, end: &JobResult, slot: &str) -> anyhow::Result<S
     outputs.extend(kept.handed);
     let digest = statement::digest(leg::PAYLOAD_RESULTS, &payload);
     outputs.push(thing("results", [("sha256", digest.trim_start_matches("sha256:").to_owned())]));
+    // What this process gave the leg's executor, from kiln or from what it held: its receipt of
+    // each thing kiln handed it for the leg and its hand-on of each to the leg, signed as this
+    // process (docs/ci.md W27-R08), which the leg's receipts follow.
+    let to_leg: Vec<statement::Subject> = kept.received.iter().filter(|(_, f, _)| matches!(f, Giver::Server | Giver::Runner)).map(|(s, _, _)| s.clone()).collect();
+    let mut runners = runner_records(&uri, &kept.from_kiln, &to_leg).into_iter();
+    let delegation: Vec<String> = under.clone().into_iter().collect();
     let received: Vec<leg::Receipt> = kept
         .received
         .into_iter()
-        .map(|(subject, from, why)| leg::Receipt {
-            subject,
-            from: match from {
-                Giver::Server => server.clone(),
-                Giver::Runner => runner.clone(),
-                Giver::Elsewhere(at) => at,
-            },
-            why,
+        .map(|(subject, from, why)| {
+            let (from, follows) = match from {
+                // Where kiln has no identity: its chain begins at the leg's receipt.
+                Giver::Elsewhere(at) => (at, Vec::new()),
+                given => match (runners.next(), given) {
+                    // From this process, which handed it to the leg's executor (W27-R08).
+                    (Some(hand_on), _) => (runner.clone(), hand_on),
+                    // Without its hand-on (kiln handed it nothing signed): under kiln's delegation.
+                    (None, Giver::Server) => (server.clone(), delegation.clone()),
+                    (None, _) => (runner.clone(), delegation.clone()),
+                },
+            };
+            leg::Receipt { subject, from, why, follows }
         })
         .collect();
     for (record, _) in leg::custody(&uri, &received, outputs, &server, under.as_deref())? {
         bundles.push(sign(slot, statement::PAYLOAD_CUSTODY, &statement::payload(&record)?)?);
     }
     Ok(serde_json::to_string(&bundles)?)
+}
+
+/// This runner process's custody records of the inputs of the leg it runs (`leg`, its identity's
+/// URI), the Transfers plan's step 11: its receipt of each hand-on kiln's server gave it for the
+/// leg (`from_kiln`), and its hand-on of each thing it gives the leg's executor (`to_leg`), signed
+/// as this process and sent on their own, ahead of the leg's (they aren't the leg's records). For
+/// each of `to_leg` in turn, what the leg's receipt of it follows: this process's hand-on of it.
+/// None when kiln handed it nothing (a server from before) or this process isn't certified, or one
+/// didn't sign: the leg's receipts then follow kiln's delegation, as before.
+fn runner_records(leg: &str, from_kiln: &[serde_json::Value], to_leg: &[statement::Subject]) -> Vec<Vec<String>> {
+    use crate::runner::custody::{digest_of, giver_of, statement_of};
+    // Records this process wouldn't send kiln (a pod's runner, a server from before) aren't signed.
+    if !crate::runner::custody::sends() {
+        return Vec::new();
+    }
+    let Some(by) = crate::runner::identity::uri("runner") else { return Vec::new() };
+    let handed: Vec<leg::Handed> = from_kiln
+        .iter()
+        .filter_map(|b| Some(leg::Handed { subject: statement_of(b)?.subject.into_iter().next()?, hand_on: digest_of(b), from: giver_of(b)? }))
+        .collect();
+    if handed.is_empty() {
+        return Vec::new();
+    }
+    let (records, hand_ons) = match leg::runner_custody(&by, leg, &handed, to_leg, &format!("for {leg}")) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(target: "kiln.custody", %leg, error = %e, "this runner's receipts of the leg's inputs couldn't be written: the leg's follow kiln's delegation");
+            return Vec::new();
+        }
+    };
+    let mut signed = Vec::new();
+    for (st, _) in &records {
+        match statement::payload(st).map_err(anyhow::Error::from).and_then(|p| sign("runner", statement::PAYLOAD_CUSTODY, &p)) {
+            Ok(b) => signed.push(b),
+            Err(e) => {
+                tracing::warn!(target: "kiln.custody", %leg, error = %format!("{e:#}"), "this runner's receipts of the leg's inputs couldn't be signed: the leg's follow kiln's delegation");
+                return Vec::new();
+            }
+        }
+    }
+    for b in &signed {
+        crate::runner::custody::send(b);
+    }
+    hand_ons.into_iter().map(|d| vec![d]).collect()
 }
 
 /// The leg's server and runner process, by their identities' URIs, from the leg's own (`uri`).
@@ -230,6 +343,25 @@ fn sign(slot: &str, payload_type: &str, payload: &[u8]) -> anyhow::Result<serde_
 mod tests {
     use super::*;
     use kiln_ci::identity::chain::{Actor, Identity};
+
+    /// W27-R08 (the Transfers plan's step 11): kiln's hand-on of what it served a leg (an artifact,
+    /// an action, a tarball) is kept for this runner's receipt when it's of what came, and said to
+    /// be of other bytes when it isn't, the leg not taking them.
+    #[test]
+    fn w27_r08_kilns_hand_on_is_held_to_what_came() -> anyhow::Result<()> {
+        use base64::Engine as _;
+        let job = "w27-r08-held-to-what-came";
+        let mut st = statement::Statement::new(serde_json::json!({ "v": 1, "kind": "handed-on", "by": "kiln://hyper-light/server", "to": "kiln://hyper-light/person/admin/machine/m/instance/i" }));
+        st.subject = vec![thing("artifact/app", [("sha256", "ab".repeat(32))])];
+        let payload = base64::engine::general_purpose::STANDARD.encode(statement::payload(&st)?);
+        let hand_on = serde_json::json!({ "dsseEnvelope": { "payloadType": statement::PAYLOAD_CUSTODY, "payload": payload, "signatures": [] } });
+        assert_eq!(check_handed(job, hand_on.clone(), None, thing("artifact/app", [("sha256", "ab".repeat(32))])), Ok(()));
+        assert!(LEGS.lock().get(job).is_some_and(|l| l.from_kiln.contains(&hand_on)), "kept for this runner's receipt of it");
+        let other = check_handed(job, hand_on, None, thing("artifact/app", [("sha256", "cd".repeat(32))]));
+        assert!(other.as_ref().is_err_and(|w| w.starts_with("isn't what kiln handed on (kiln said sha256 abab")), "{other:?}");
+        forget(job);
+        Ok(())
+    }
 
     /// The server's delegation of the leg [`held`] gives, by its digest.
     const DELEGATION: &str = "sha256:d1e9a7e0c0ffee00d1e9a7e0c0ffee00d1e9a7e0c0ffee00d1e9a7e0c0ffee00";
