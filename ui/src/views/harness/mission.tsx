@@ -17,10 +17,11 @@ import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
 import { PageIntro, SelectField, Skeleton } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
-import { useAgentsLive } from "@/lib/data";
+import { pushDevicesRes, pushStateRes, thisDeviceRes } from "@/api/push";
+import { agentsRes, useAgentsLive, useRes, type Res } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage, useLocalStorage, useMediaQuery, useNow } from "@/lib/hooks";
-import { invalidate, useSuspenseResource } from "@/lib/resource";
+import { invalidate, preload, useSuspenseResource } from "@/lib/resource";
 import { Tries } from "@/lib/tries";
 import { heldWords } from "./cards";
 import { agentLabel, hasOwnName, plain } from "./derive";
@@ -35,10 +36,10 @@ import { Ago, machineName } from "./parts";
 import { LowBattery } from "../battery";
 import { useSeen } from "./seen";
 import { missionFoundSessions, missionRows, subagentsLine, type MissionRow, type MissionStand as Stand } from "./mission-rows";
-import { NewAgent } from "./new-agent";
+import { machinesRes, NewAgent, NewAgentLoading } from "./new-agent";
 import { MISSION_DRAFT } from "./new-agent-draft";
 import { useDrafts } from "./state";
-import { useAgentList, useAgents } from "./use-agents";
+import { preloadAgents, useAgentList, useAgents } from "./use-agents";
 import { both, touchSelect, type TouchSelect } from "./touch-select";
 import { answer, asAnswered, useAnswered } from "./answered";
 import { PushOffer } from "./push-offer";
@@ -271,11 +272,28 @@ function standsOf(list: AgentInfo[], seen: Record<string, number>, done: Readonl
   );
 }
 
-/** Before the agents are known: the list's shape, so nothing moves when they come. */
-function RowsLoading() {
+const NO_COUNTS = {};
+const ONE_STAND = ["working"] as const;
+
+/**
+ * Before the agents are known: the page's shape (the stands' line, the composer with what's written
+ * in it, the filter and the list's head over a few rows), so nothing moves when they come. What only
+ * their answer can tell (a note under the composer, a notice over the list) comes with them, in one go.
+ */
+function PageLoading() {
+  const text = useDrafts((s) => s.drafts[MISSION_DRAFT] ?? "");
   return (
     <div className="ms-loading" role="status" aria-label="Loading agents">
-      <Skeleton className="ms-loading-bar" />
+      <div className="ms-loading-sd" aria-hidden="true">
+        <Stands counts={NO_COUNTS} every={ONE_STAND} />
+      </div>
+      <div className="mc-mode" data-first="">
+        <NewAgentLoading text={text} />
+      </div>
+      <div className="filter-bar ms-bar" aria-hidden="true">
+        <Skeleton className="ms-loading-bar" />
+      </div>
+      <div className="ms-listhead" aria-hidden="true" />
       <ul className="ms-list" aria-hidden="true">
         {[62, 48, 70, 54, 40].map((w, i) => (
           <li key={i} className="ms-row ms-loading-row" style={{ opacity: 1 - i * 0.15 }}>
@@ -302,15 +320,37 @@ function StandsNow() {
   return <Stands rows={rows} />;
 }
 
+const ask = <T,>(r: Res<T>) => preload(r.key, r.fetch, r.opts);
+
+/**
+ * What shows over the rows, read with them so the page comes whole: More options and the
+ * composer's notes (the machines' answer), a machine gone or low (the runners), and the
+ * notifications offer. It draws nothing: once the rows show, nothing over them moves as these come.
+ */
+function OverTheRows() {
+  useRes(machinesRes);
+  useRes(agentsRes);
+  useRes(pushStateRes);
+  useRes(thisDeviceRes);
+  useRes(pushDevicesRes);
+  return null;
+}
+
 export default function Mission() {
+  // All of it asked for at once: each read would otherwise wait for the one before it.
+  preloadAgents();
+  ask(machinesRes);
+  ask(agentsRes);
+  ask(pushStateRes);
+  ask(thisDeviceRes);
+  ask(pushDevicesRes);
   return (
     <div className="container-console page ms-page">
       <title>Agents · kiln</title>
       <PageIntro index={5} label="Agents" title="Mission control." compact />
-      <React.Suspense fallback={<div className="sd" aria-hidden="true" />}>
+      <Loadable label="Loading agents" fallback={<PageLoading />}>
+        <OverTheRows />
         <StandsNow />
-      </React.Suspense>
-      <Loadable label="Loading agents" fallback={<RowsLoading />}>
         <Agents />
       </Loadable>
     </div>
@@ -481,6 +521,12 @@ function MissionComposer({
   // Its height as it starts an agent, held while it messages those selected (shorter, with room for
   // its To line to grow), so the list under it stays where it is as the first is picked and the last put back.
   const [held] = React.useState(() => ({ height: 0 }));
+  // Only a turn crossfades: the composer the page opens with shows as it is, where its shape stood while the agents loaded.
+  const mode = picked.length > 0 ? "message" : "new";
+  const [opened] = React.useState(mode);
+  const [turned, setTurned] = React.useState(false);
+  if (!turned && mode !== opened) setTurned(true);
+  const first = turned ? undefined : "";
   const measured = React.useCallback(
     (el: HTMLDivElement | null) => {
       if (!el) return;
@@ -494,11 +540,11 @@ function MissionComposer({
     [held],
   );
   return picked.length > 0 ? (
-    <div className="mc-mode" key="message" style={held.height > 0 ? { minHeight: held.height } : undefined}>
+    <div className="mc-mode" key="message" data-first={first} style={held.height > 0 ? { minHeight: held.height } : undefined}>
       <MessageBar agents={picked} reach="selected" onEnded={onClear} all={all} onPick={onPick} text={text} onText={onText} onClear={onClear} autoFocus={focusFor === "message"} />
     </div>
   ) : (
-    <div className="mc-mode" key="new" ref={measured}>
+    <div className="mc-mode" key="new" data-first={first} ref={measured}>
       <NewAgent text={text} onText={onText} all={all} onPick={onPick} autoFocus={focusFor === "new"} />
     </div>
   );

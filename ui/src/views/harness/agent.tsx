@@ -52,6 +52,9 @@ type PhoneTab = "work" | InspectorTab;
 const NO_EVENTS: HEvent[] = [];
 const NO_TODOS: Todo[] = [];
 
+/** The composer's field, to type in: the field itself, not the marked copy drawn under it (compose-field.tsx), which has its class too. */
+const composerField = () => document.querySelector<HTMLTextAreaElement>("textarea.hx-compose-input");
+
 /** What a message to it can carry. */
 const acceptsOf = (meta: Meta | null) => {
   const f = meta?.features ?? [];
@@ -132,7 +135,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
       const d = useDrafts.getState();
       const was = d.drafts[id] ?? "";
       d.setDraft(id, was.trim() ? `${was.replace(/\s+$/, "")}\n\n${text}` : text);
-      document.querySelector<HTMLTextAreaElement>(".hx-compose-input")?.focus();
+      composerField()?.focus();
     },
     [id],
   );
@@ -225,7 +228,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
     setFindOpen(false);
     setFindAt(null);
     setSearched("");
-    document.querySelector<HTMLTextAreaElement>(".hx-compose-input")?.focus();
+    composerField()?.focus();
   };
   const find = React.useMemo(() => (findOpen ? { q, now: findAt } : undefined), [findOpen, q, findAt]);
   const showTools = React.useCallback(() => {
