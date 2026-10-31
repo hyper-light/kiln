@@ -561,6 +561,16 @@ pub async fn person_hand_on(hub: &crate::hub::Hub, person: &str, to: &str, thing
     Ok(take(&hub.store, &hub.pki.ca_der, &hub.pki.organization(), bundle, came_from, at).await?.map(|t| t.digest).map_err(|r| r.to_string()))
 }
 
+/// Whom a hand-on (`bundle`, read without checking: kiln checked it as it took it) says its things
+/// come from: the giver a take hands on for, else its signer.
+pub fn giver_of(bundle: &Value) -> Option<String> {
+    let b: custody::Body = serde_json::from_value(statement_in(&bundle.to_string())?.body).ok()?;
+    Some(match b.kind {
+        Kind::Taken => b.taken_for?,
+        _ => b.by,
+    })
+}
+
 /// The receipt by which `holder` came to hold `thing`, its newest of it: one it signed, or kiln's
 /// for it (a person with no key on the device that asked). None if kiln has none.
 async fn held_with(store: &Store, org: &str, holder: &str, thing: &statement::Subject) -> anyhow::Result<Option<String>> {
@@ -610,6 +620,49 @@ fn statement_in(envelope: &str) -> Option<statement::Statement> {
 /// A kept record's body, read from its envelope as kiln took it.
 fn body_in(envelope: &str) -> Option<custody::Body> {
     serde_json::from_value(statement_in(envelope)?.body).ok()
+}
+
+/// The newest hand-on (or take) of `thing` to `to` that no receipt answers yet: its digest and
+/// bundle (docs/ci.md W27-R08; the Transfers plan's step 7: a change given, waiting to be taken).
+pub async fn waiting_for(store: &Store, to: &str, thing: &statement::Subject) -> anyhow::Result<Option<(String, Value)>> {
+    let Some((algorithm, hex)) = thing.digest.iter().next().map(|(a, h)| (a.clone(), h.clone())) else { return Ok(None) };
+    let to = to.to_owned();
+    let row: Option<(String, String)> = store
+        .call(move |c| {
+            Ok(c.query_row(
+                "SELECT c.digest, c.envelope FROM custody c JOIN custody_things t ON t.record = c.digest WHERE c.kind IN ('handed-on', 'taken') AND c.counterpart = ?1 AND t.algorithm = ?2 AND t.hex = ?3
+                 AND NOT EXISTS (SELECT 1 FROM custody_follows f JOIN custody r ON r.digest = f.record WHERE f.follows = c.digest AND r.kind = 'received')
+                 ORDER BY c.taken_at DESC, c.rowid DESC LIMIT 1",
+                params![to, algorithm, hex],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+        })
+        .await?;
+    Ok(row.and_then(|(d, e)| serde_json::from_str(&e).ok().map(|b| (d, b))))
+}
+
+/// The newest hand-on (or take) of `thing` away from `giver` (its signer, or whom kiln's server
+/// took it for): how `giver` came to no longer hold it. Its digest (docs/ci.md W27-R08: a change's
+/// former author).
+pub async fn handed_from(store: &Store, org: &str, giver: &str, thing: &statement::Subject) -> anyhow::Result<Option<String>> {
+    let Some((algorithm, hex)) = thing.digest.iter().next().map(|(a, h)| (a.clone(), h.clone())) else { return Ok(None) };
+    let rows: Vec<(String, String, String)> = store
+        .call(move |c| {
+            let mut q = c.prepare("SELECT c.digest, c.custodian, c.envelope FROM custody c JOIN custody_things t ON t.record = c.digest WHERE c.kind IN ('handed-on', 'taken') AND t.algorithm = ?1 AND t.hex = ?2 ORDER BY c.taken_at DESC, c.rowid DESC")?;
+            let rows = q.query_map(params![algorithm, hex], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await?;
+    let server = server_uri(org);
+    Ok(rows
+        .into_iter()
+        .find(|(_, custodian, envelope)| {
+            let for_whom = if *custodian == server { body_in(envelope).and_then(|b| b.taken_for) } else { None };
+            let whose = for_whom.unwrap_or_else(|| custodian.clone());
+            custody::names(giver, &whose) || custody::names(&whose, giver)
+        })
+        .map(|(d, _, _)| d))
 }
 
 /// The newest hand-on (or take) of `thing` kiln has, to whomever: its digest.
@@ -969,6 +1022,9 @@ async fn refuse(store: &Store, r: Refusal) -> anyhow::Result<()> {
         ..crate::audit::Entry::default()
     };
     tracing::info!(target: "kiln.custody", digest = %r.digest, signer = %r.signer, why = %r.why, "refused {}", r.act);
+    // What an API caller sent is audited as their request already, one row for it (W19-AC04);
+    // what a runner sent, which no request audits, is audited here.
+    let audited = !r.came_from.starts_with("api:");
     store
         .call(move |c| {
             c.execute(
@@ -978,8 +1034,16 @@ async fn refuse(store: &Store, r: Refusal) -> anyhow::Result<()> {
             Ok(())
         })
         .await?;
-    crate::audit::write(store, entry).await;
+    if audited {
+        crate::audit::write(store, entry).await;
+    }
     Ok(())
+}
+
+/// Records that kiln refused `act` by `signer`, who no longer holds what it acts on: superseded by
+/// `transfer`, the hand-over that moved it (docs/ci.md W27-R08: a change's former author).
+pub async fn refused_former(store: &Store, act: &str, signer: &str, why: &str, transfer: &str, came_from: &str, at: i64) -> anyhow::Result<()> {
+    refuse(store, Refusal { act: act.to_owned(), signer: signer.to_owned(), why: why.to_owned(), superseded_by: transfer.to_owned(), came_from: came_from.to_owned(), at, ..Refusal::default() }).await
 }
 
 /// Records that kiln refused act `act` (a statement's digest `digest`, signed by `signer`) for

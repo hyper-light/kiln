@@ -9122,7 +9122,8 @@ delegation of it.
   - Ship shows none of this yet (the CI/CD Integration plan's).
 
 **Built: custody, and agent sessions handed over signed (R08, in part).** Plan
-`01a17856b1b477eda14a574ae312a123`, its steps 1 to 6; research `01a18abf2d28762d92104dca2fbfbf89`.
+`01a17856b1b477eda14a574ae312a123`, its steps 1 to 6 and step 7's changes and review requests;
+research `01a18abf2d28762d92104dca2fbfbf89`.
 
 - *Custody records* are signed statements (`kiln_ci::identity::statement`) whose body says the
   things they're about were handed on, received, passed on unchanged by a relay, or taken by kiln's
@@ -9142,7 +9143,7 @@ delegation of it.
   moved on isn't refused. Its own hop is checked as it's taken (a receipt that comes before its
   hand-on waits for it); a break is recorded with the records around it, and a statement kiln
   can't take (its signer's identity revoked, as a copy left behind's is) is refused and recorded
-  with its signer and envelope; both are audited. `POST /api/custody`, `GET /api/custody?digest=`
+  with its signer and envelope; both are audited (what an API caller sent, once, as their request). `POST /api/custody`, `GET /api/custody?digest=`
   or `?name=` (a thing's newest chain: who holds it, an offer no one took lapsing after 10
   minutes), `/api/custody/breaks`, `/api/transfers/refused` and `/api/transfers/unsigned`;
   `kiln custody show|breaks`, `kiln transfers refused|unsigned`.
@@ -9223,6 +9224,17 @@ delegation of it.
   that superseded it: a goal met for a step tried again or taken over, and, from an agent kiln ended
   as the step went on to another (still running where kiln couldn't end it), any act, its runner
   told to close it.
+- *Changes and review requests* (step 7): a change's authorship ("change <repo> <name>") and its
+  review request ("review request of <repo> <name>") change hands as work does. Its author gives a
+  change to another (`POST /api/diffs/:id/give` `{to}`), their own hand-on when they send it signed,
+  else kiln's take for them; it stays theirs until the other takes it (`…/take`), with their receipt,
+  and only then is theirs. Commandeered, it's kiln's take for the author it's taken from, who isn't
+  there to sign, and the new author's receipt. A reviewer passes their review request on
+  (`POST /api/diffs/:id/reviewers/pass` `{to}`); it moves only once the other takes it
+  (`…/reviewers/take`), and stays the first reviewer's until then. A person's side without a key is
+  kiln's for them, as for work; an agent taker's receipt is asked of its runner. Once a change has
+  changed hands, what its former author does as its author (a version pushed, an abandon, a give) is
+  refused, saying who its author is now, and recorded with the transfer that superseded them.
 - *A resume from the server's store* is kiln's take: signed with the server's own key for the
   identity kiln last certified the session as at that epoch (`identities::holder_at`), to the next,
   saying when kiln last heard from the machine; kiln keeps it at once, the package carries it, and
@@ -9262,7 +9274,11 @@ delegation of it.
   over without a key, kiln's receipt for the person, one with a key, the person's own; a subagent's
   task handed on, passed on and received; every chain unbroken, none open); in the UI,
   `e2e/plan-run-take.spec.ts` and `ship-hand-off.spec.ts` (the line saying how a take-over or a
-  hand-off from a browser is signed, in Chromium and WebKit at desktop and phone widths). Nightly:
+  hand-off from a browser is signed, in Chromium and WebKit at desktop and phone widths);
+  `w27_r08_change_hands` (D1 given by kim, taken by sam, commandeered by lee: two transfers, each
+  with both sides; sam's version pushed afterwards, and his abandon, refused and recorded with the
+  transfer) and `w27_r08_review_passed_on` (passed on and taken, the request moves with both sides;
+  passed on again and never taken, it stays). Nightly:
   `.kiln/custody-lab.yaml`.
 - *Not yet.* A session's package isn't yet addressed to the process it goes to (its hand-on is to
   the session at its next epoch); a runner's Open at a later epoch still raises the epoch the
@@ -9271,8 +9287,10 @@ delegation of it.
   without kiln goes on until its runner hears from kiln (docs/agents.md, "A copy left behind"); a
   person signs on their device only through the CLI until the browser has a key of its own (the
   signing plan's step 4); an agent kiln's server runs itself (`local`) signs no receipt of work
-  handed to it yet, so its hand-on stays unanswered; changes, review requests, carried approvals, promotions, replant,
-  artifacts, machines and intermediaries (steps 7 to 16).
+  handed to it yet, so its hand-on stays unanswered; an agent's give or pass is kiln's take for it
+  (its signed act verified), not yet a hand-on its runner signs; approvals carried over a
+  rebase-only revision (step 7's last part, on the signing plan's signed verdicts); promotions,
+  replant, artifacts, machines and intermediaries (steps 8 to 16).
 
 ### W28 Demand-driven CI: adopt, cover, stagger, land by conflict graph
 

@@ -591,6 +591,96 @@ pub async fn readiness(hub: &Hub, d: &Diff) -> Result<Value, Fail> {
     Ok(json!({ "blockers": blockers, "accepting": f.accepting(&policy.land), "requesting": f.requesting(), "checks": f.checks, "required": policy.land.checks, "strategies": policy.land.strategies, "default": policy.strategy(None, d.kind != "diff").ok() }))
 }
 
+/// A diff's review request as its hand-overs name it (docs/ci.md W27-R08; the Transfers plan's
+/// step 7): "review request of <repo> <name>".
+fn request_work(d: &Diff) -> kiln_ci::identity::statement::Subject {
+    crate::custody::work(&format!("review request of {} {}", d.repo, d.name), &[&d.repo, &d.id, "review"])
+}
+
+/// The reviewer an identity is, as `diff_reviewers` names them: `user:<name>` (`admin` for the
+/// owner), `agent:<id>`.
+fn reviewer_of(identity: &str) -> Option<String> {
+    use kiln_ci::identity::chain::{Actor, Identity};
+    match Identity::parse(identity).ok()?.actor {
+        Actor::Person { name } if name == "admin" => Some(name),
+        Actor::Person { name } => Some(format!("user:{name}")),
+        Actor::Agent { agent, .. } => Some(format!("agent:{agent}")),
+        _ => None,
+    }
+}
+
+/// Reviewer `caller` passes their review request of `d` on to `to` (`user:<name>`, `agent:<id>`),
+/// signed (docs/ci.md W27-R08): their own hand-on when they send it signed on their device
+/// (`hand_on`), else kiln's take for them on their signed-in session. The request stays theirs
+/// until `to` takes it ([`take_passed`]).
+pub async fn pass(hub: &Hub, d: &Diff, caller: &Caller, body: &Value) -> Result<Value, Fail> {
+    let (me, _) = who(caller);
+    let to = body.get("to").and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty()).ok_or_else(|| bad("`to`: whom to pass the review on to (user:<name>, agent:<id>)"))?.to_owned();
+    let (id, me2, to2) = (d.id.clone(), me.clone(), to.clone());
+    let (mine, theirs): (bool, bool) = hub
+        .store
+        .call(move |c| {
+            let has = |r: &str| -> rusqlite::Result<bool> { Ok(c.query_row("SELECT 1 FROM diff_reviewers WHERE diff_id = ?1 AND reviewer = ?2", params![id, r], |_| Ok(())).optional()?.is_some()) };
+            Ok((has(&me2)?, has(&to2)?))
+        })
+        .await
+        .map_err(fail)?;
+    if !mine {
+        return Err((StatusCode::CONFLICT, format!("{me} isn't asked to review {}", d.name)));
+    }
+    if theirs || to.eq_ignore_ascii_case(&me) {
+        return Err((StatusCode::CONFLICT, format!("{to} is asked to review {} already", d.name)));
+    }
+    let (giver, taker, thing) = (super::diffs::identity_of(hub, &me).await, super::diffs::identity_of(hub, &to).await, request_work(d));
+    let hand_on = match body.get("hand_on") {
+        Some(b) => crate::custody::person_hand_on(hub, &giver, &taker, &thing, b, &format!("api:{}", caller.name)).await.map_err(fail)?.map_err(|w| (StatusCode::UNPROCESSABLE_ENTITY, w))?,
+        None => {
+            let why = format!("{}'s review passed on to {to} by {me}: kiln's take for them, on their signed-in session; their own signature is missing: no key on the device that asked", d.name);
+            crate::custody::hand_work(hub, thing, &taker, &why, crate::custody::Giver::For(giver)).await.map_err(fail)?.0
+        }
+    };
+    hub.store.audit(caller.name.clone(), "diffs.review.pass".into(), format!("{} {} to {to}", d.repo, d.name)).await;
+    Ok(json!({ "passed": { "to": to, "hand_on": hand_on }, "reviewer": me }))
+}
+
+/// `caller` takes the review request of `d` passed on to them ([`pass`]): their receipt, their own
+/// when they send it signed on their device (`receipt`), else kiln's for them; then the request
+/// moves from the reviewer who passed it to them (docs/ci.md W27-R08). Never taken, it stays with
+/// that reviewer.
+pub async fn take_passed(hub: &Hub, d: &Diff, caller: &Caller, body: &Value) -> Result<Value, Fail> {
+    let (me, _) = who(caller);
+    let mine = super::diffs::identity_of(hub, &me).await;
+    let Some((hand_on, bundle)) = crate::custody::waiting_for(&hub.store, &mine, &request_work(d)).await.map_err(fail)? else {
+        return Err((StatusCode::CONFLICT, format!("no review request of {} was passed on to {me}", d.name)));
+    };
+    let giver = crate::custody::giver_of(&bundle).unwrap_or_default();
+    let passer = reviewer_of(&giver).ok_or_else(|| (StatusCode::CONFLICT, format!("{} was passed on by {giver}, who reviews nothing here", d.name)))?;
+    match body.get("receipt") {
+        Some(r) => {
+            crate::custody::person_receipt(hub, &mine, &hand_on, r, &format!("api:{}", caller.name)).await.map_err(fail)?.map_err(|w| (StatusCode::UNPROCESSABLE_ENTITY, w))?;
+        }
+        None => match me.strip_prefix("agent:") {
+            Some(agent) => crate::custody::ask_receipt(hub, agent, &bundle).await,
+            None => {
+                crate::custody::receive_for(hub, &mine, request_work(d), &hand_on, &giver, &format!("{}'s review passed on to {me}", d.name)).await.map_err(fail)?;
+            }
+        },
+    }
+    let (id, me2, from) = (d.id.clone(), me.clone(), passer.clone());
+    hub.store
+        .call(move |c| {
+            let tx = crate::store::tx(c)?;
+            tx.execute("DELETE FROM diff_reviewers WHERE diff_id = ?1 AND reviewer = ?2", params![id, from])?;
+            tx.execute("INSERT INTO diff_reviewers (diff_id, reviewer, state, added_at) VALUES (?1, ?2, 'not-looked', ?3) ON CONFLICT(diff_id, reviewer) DO NOTHING", params![id, me2, crate::util::now_unix()])?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .map_err(fail)?;
+    hub.store.audit(caller.name.clone(), "diffs.review.take".into(), format!("{} {} from {passer}", d.repo, d.name)).await;
+    Ok(json!({ "reviewer": me, "from": passer, "hand_on": hand_on }))
+}
+
 /// `POST /api/diffs/:id/review`: `{ action: accept | request_changes | comment | resign, body }`.
 /// Publishes the reviewer's drafts on the diff with it, and moves the diff's review state.
 pub async fn review(hub: &std::sync::Arc<Hub>, d: &Diff, caller: &Caller, body: &Value) -> Result<Value, Fail> {

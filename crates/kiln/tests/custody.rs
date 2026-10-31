@@ -1061,3 +1061,147 @@ fn w27_r08_work_handed() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// `git <args>` in `dir`, as a test's own git (no system config, no prompts): what it said.
+fn git(home: &Path, dir: &Path, args: &[&str]) -> anyhow::Result<String> {
+    let o = std::process::Command::new("git")
+        .args(["-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "init.defaultBranch=main", "-c", "credential.helper=", "-c", "commit.gpgsign=false"])
+        .args(args)
+        .current_dir(dir)
+        .env("HOME", home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env_remove("GIT_ASKPASS")
+        .env_remove("SSH_ASKPASS")
+        .output()?;
+    let out = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    anyhow::ensure!(o.status.success(), "git {args:?}: {out}");
+    Ok(out)
+}
+
+/// User `name`, a developer of `repo`, with a personal access token of their own: the token.
+fn developer(port: u16, admin: &str, name: &str, repo: &str) -> anyhow::Result<String> {
+    let (st, body) = http(port, "POST", "/api/users", admin, Some(&json!({ "name": name, "grants": [format!("developer@repo:{repo}")] })))?;
+    anyhow::ensure!((200..300).contains(&st), "{name}: {st} {body}");
+    let (st, body) = http(port, "POST", "/api/tokens", admin, Some(&json!({ "kind": "pat", "user": name, "grants": ["owner"] })))?;
+    anyhow::ensure!((200..300).contains(&st), "{name}'s token: {st} {body}");
+    serde_json::from_str::<Value>(&body)?.get("token").and_then(Value::as_str).map(str::to_owned).ok_or_else(|| anyhow::anyhow!("no token in {body}"))
+}
+
+/// A native repository `repo` with a first commit on main, and a clone of it: (git's home, the
+/// clone).
+fn native(dir: &Path, port: u16, admin: &str, repo: &str) -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf)> {
+    let (st, body) = http(port, "POST", "/api/repos", admin, Some(&json!({ "name": repo, "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{repo}: {st} {body}");
+    let (home, work) = (dir.join("githome"), dir.join("clone"));
+    std::fs::create_dir_all(&home)?;
+    git(&home, dir, &["clone", "-q", &format!("http://x:{admin}@127.0.0.1:{port}/git/{repo}.git"), "clone"])?;
+    std::fs::write(work.join("README.md"), "notes\n")?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "first"])?;
+    git(&home, &work, &["push", "-q", "origin", "HEAD:main"])?;
+    Ok((home, work))
+}
+
+/// The custody chain of the thing named `name`, walked now.
+fn chain_named(port: u16, admin: &str, name: &str) -> anyhow::Result<Value> {
+    let (_, body) = http(port, "GET", &format!("/api/custody?name={}", name.replace(' ', "%20")), admin, None)?;
+    Ok(serde_json::from_str(&body).unwrap_or_default())
+}
+
+/// W27-R08 (the Transfers plan's step 7): a change changes hands signed. kim gives D1 to sam, who
+/// takes it; lee commandeers it: two transfers, each with both sides (kiln's take for the side not
+/// there, its receipt for a person with no key on the device that asked). sam, its author no more,
+/// pushing a version of it as its author, or abandoning it, is refused and recorded with the
+/// transfer that superseded them.
+#[test]
+fn w27_r08_change_hands() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options::default())?;
+    let (port, admin, repo) = (s.port, s.admin.as_str(), "acme/notes");
+    let (home, work) = native(dir.path(), port, admin, repo)?;
+    let (kim, sam, lee) = (developer(port, admin, "kim", repo)?, developer(port, admin, "sam", repo)?, developer(port, admin, "lee", repo)?);
+    let origin = |token: &str| format!("http://x:{token}@127.0.0.1:{port}/git/{repo}.git");
+    git(&home, &work, &["checkout", "-qb", "change"])?;
+    std::fs::write(work.join("notes.txt"), "a note\n")?;
+    git(&home, &work, &["add", "notes.txt"])?;
+    git(&home, &work, &["commit", "-qm", "A note\n\nChange-Id: I5555555555555555555555555555555555555555"])?;
+    git(&home, &work, &["push", "-q", &origin(&kim), "HEAD:refs/for/main"])?;
+    let author = || -> anyhow::Result<String> {
+        let (_, body) = http(port, "GET", "/api/diffs/D1", admin, None)?;
+        Ok(field(&serde_json::from_str::<Value>(&body)?, "author").to_owned())
+    };
+    anyhow::ensure!(author()? == "user:kim", "{}", author()?);
+    // Given by kim, taken by sam.
+    let (st, body) = http(port, "POST", "/api/diffs/D1/give", &kim, Some(&json!({ "to": "user:sam" })))?;
+    anyhow::ensure!(st == 200, "kim gives D1: {st} {body}");
+    anyhow::ensure!(author()? == "user:kim", "given, it's kim's until sam takes it");
+    let (st, body) = http(port, "POST", "/api/diffs/D1/take", &sam, None)?;
+    anyhow::ensure!(st == 200, "sam takes D1: {st} {body}");
+    anyhow::ensure!(author()? == "user:sam", "{}", author()?);
+    // Commandeered by lee.
+    let (st, body) = http(port, "POST", "/api/diffs/D1/commandeer", &lee, None)?;
+    anyhow::ensure!(st == 200, "lee commandeers D1: {st} {body}");
+    anyhow::ensure!(author()? == "user:lee", "{}", author()?);
+    let v = chain_named(port, admin, &format!("change {repo} D1"))?;
+    let kinds: Vec<&str> = v.get("hops").and_then(Value::as_array).into_iter().flatten().filter_map(|h| h.get("kind").and_then(Value::as_str)).collect();
+    assert!(v.get("unbroken") == Some(&json!(true)) && kinds == ["received", "taken", "received", "taken"] && half_named(&v) == 0, "two transfers, both sides each: {v}");
+    let take_from_sam = v.pointer("/hops/1/record").and_then(Value::as_str).unwrap_or_default().to_owned();
+    // sam, its author no more: a version pushed as its author, and abandoning it, refused.
+    std::fs::write(work.join("notes.txt"), "a note, by its author before\n")?;
+    git(&home, &work, &["commit", "-q", "--amend", "-am", "A note\n\nChange-Id: I5555555555555555555555555555555555555555"])?;
+    let pushed = git(&home, &work, &["push", "-q", &origin(&sam), "HEAD:refs/for/main"]);
+    assert!(pushed.as_ref().is_err_and(|e| e.to_string().contains("changed hands")), "{pushed:?}");
+    let (st, body) = http(port, "POST", "/api/diffs/D1/abandon", &sam, None)?;
+    assert!(st == 403 && body.contains("changed hands"), "{st} {body}");
+    let (_, body) = http(port, "GET", "/api/transfers/refused", admin, None)?;
+    let refused: Vec<Value> = serde_json::from_str::<Value>(&body)?.get("refused").and_then(Value::as_array).cloned().unwrap_or_default();
+    let of_sam: Vec<&Value> = refused.iter().filter(|r| field(r, "signer").ends_with("/person/sam") && field(r, "superseded_by") == take_from_sam).collect();
+    assert!(of_sam.iter().any(|r| field(r, "act").starts_with("push of a version")) && of_sam.iter().any(|r| field(r, "act").starts_with("abandon")), "{refused:?}");
+    anyhow::ensure!(author()? == "user:lee", "nothing sam did took");
+    Ok(())
+}
+
+/// W27-R08 (the Transfers plan's step 7): a review request passed on changes hands signed. rev1
+/// passes D1's to rev2, who takes it: the request moves, with both sides. rev2 passes it on to rev3,
+/// who never takes it: it stays rev2's.
+#[test]
+fn w27_r08_review_passed_on() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options::default())?;
+    let (port, admin, repo) = (s.port, s.admin.as_str(), "acme/notes");
+    let (home, work) = native(dir.path(), port, admin, repo)?;
+    let kim = developer(port, admin, "kim", repo)?;
+    let (rev1, rev2, _rev3) = (developer(port, admin, "rev1", repo)?, developer(port, admin, "rev2", repo)?, developer(port, admin, "rev3", repo)?);
+    git(&home, &work, &["checkout", "-qb", "change"])?;
+    std::fs::write(work.join("notes.txt"), "a note\n")?;
+    git(&home, &work, &["add", "notes.txt"])?;
+    git(&home, &work, &["commit", "-qm", "A note\n\nChange-Id: I6666666666666666666666666666666666666666"])?;
+    git(&home, &work, &["push", "-q", "-o", "reviewer=user:rev1", &format!("http://x:{kim}@127.0.0.1:{port}/git/{repo}.git"), "HEAD:refs/for/main"])?;
+    let reviewers = || -> anyhow::Result<Vec<String>> {
+        let (_, body) = http(port, "GET", "/api/diffs/D1", admin, None)?;
+        let v: Value = serde_json::from_str(&body)?;
+        let mut r: Vec<String> = v.get("reviewers").and_then(Value::as_array).into_iter().flatten().filter_map(|r| r.get("reviewer").or_else(|| r.get("name")).and_then(Value::as_str).map(str::to_owned)).collect();
+        r.sort();
+        Ok(r)
+    };
+    anyhow::ensure!(reviewers()? == ["user:rev1"], "{:?}", reviewers()?);
+    // Passed on and taken: the request moves.
+    let (st, body) = http(port, "POST", "/api/diffs/D1/reviewers/pass", &rev1, Some(&json!({ "to": "user:rev2" })))?;
+    anyhow::ensure!(st == 200, "rev1 passes D1's review: {st} {body}");
+    anyhow::ensure!(reviewers()? == ["user:rev1"], "passed, it's rev1's until rev2 takes it");
+    let (st, body) = http(port, "POST", "/api/diffs/D1/reviewers/take", &rev2, None)?;
+    anyhow::ensure!(st == 200, "rev2 takes it: {st} {body}");
+    anyhow::ensure!(reviewers()? == ["user:rev2"], "{:?}", reviewers()?);
+    let name = format!("review request of {repo} D1");
+    let v = chain_named(port, admin, &name)?;
+    let kinds: Vec<&str> = v.get("hops").and_then(Value::as_array).into_iter().flatten().filter_map(|h| h.get("kind").and_then(Value::as_str)).collect();
+    assert!(v.get("unbroken") == Some(&json!(true)) && kinds == ["received", "taken"] && half_named(&v) == 0, "moved with both sides: {v}");
+    // Passed on again, never taken: it stays rev2's.
+    let (st, body) = http(port, "POST", "/api/diffs/D1/reviewers/pass", &rev2, Some(&json!({ "to": "user:rev3" })))?;
+    anyhow::ensure!(st == 200, "rev2 passes it on: {st} {body}");
+    anyhow::ensure!(reviewers()? == ["user:rev2"], "never taken, it stays rev2's: {:?}", reviewers()?);
+    let v = chain_named(port, admin, &name)?;
+    assert!(v.get("open") == Some(&json!(true)), "the pass to rev3 waits, answered by no one: {v}");
+    Ok(())
+}
