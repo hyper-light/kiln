@@ -490,6 +490,7 @@ mod unix {
                 let listener=LocalListener::bind(&path,4)?;
                 let receipt=context_dir.path().join(format!("{case}.result"));
                 let mut child=std::process::Command::new(&executable).args(["--exact",TEST,"--nocapture"])
+                    .stdout(std::process::Stdio::null())
                     .env(CASE,case).env("KILN_U16_CONTEXT_RESULT",&receipt).env(crate::bluegreen::SUPERVISOR_ENV,&path).env("KILN_GENERATION","71").spawn()?;
                 let pid=child.id();
                 let checked=crate::rt::timeout(Duration::from_secs(8),async {
@@ -536,11 +537,13 @@ mod unix {
             // original parent. The client must refuse before sending its frame.
             let path=context_dir.path().join("peer");
             let server=std::process::Command::new(&executable).args(["--exact",TEST,"--nocapture"])
+                    .stdout(std::process::Stdio::null())
                 .env(CASE,"peer-server").env("KILN_U16_CONTEXT_RESULT",context_dir.path().join("peer-server.result")).env(crate::bluegreen::SUPERVISOR_ENV,&path).spawn()?;
             let mut children=vec![server];
             let checked=crate::rt::timeout(Duration::from_secs(8),async {
                     while !path.exists() {crate::rt::sleep(Duration::from_millis(20)).await;}
                     children.push(std::process::Command::new(&executable).args(["--exact",TEST,"--nocapture"])
+                    .stdout(std::process::Stdio::null())
                         .env(CASE,"peer").env("KILN_U16_CONTEXT_RESULT",context_dir.path().join("peer.result")).env(crate::bluegreen::SUPERVISOR_ENV,&path).env("KILN_GENERATION","71").spawn()?);
                     loop {
                         let statuses=children.iter_mut().map(std::process::Child::try_wait).collect::<std::io::Result<Vec<_>>>()?;

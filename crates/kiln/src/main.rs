@@ -1280,6 +1280,7 @@ mod tests {
             let listener=std::os::unix::net::UnixListener::bind(&handover)?;listener.set_nonblocking(true)?;
             let mut child=std::process::Command::new(std::env::current_exe()?)
                 .args(["--exact","tests::g18_deferred_cli_help_version_and_errors","--nocapture"])
+                    .stdout(std::process::Stdio::null())
                 .env(ENTRY,root.path()).env(kiln::bluegreen::TAKE_OVER_ENV,&handover)
                 .env(kiln::bluegreen::SUPERVISOR_ENV,root.path().join("old-unbound-control.sock")).env("KILN_GENERATION","71")
                 .env_remove("KILN_SUPERVISOR_FD").env_remove("KILN_SUPERVISOR_PID").env_remove("KILN_HANDOVER_FDS").env_remove("KILN_SUPERVISE_CHILD").env_remove("KILN_CHAOS").spawn()?;
