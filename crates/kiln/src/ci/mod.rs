@@ -76,6 +76,7 @@ pub mod services;
 pub mod token;
 pub mod trackers;
 pub mod uploads;
+pub mod verdicts;
 pub mod warm;
 pub mod webhooks;
 pub mod work;

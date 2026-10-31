@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use http::StatusCode;
+use kiln_ci::identity::verdict::{Asked, Holds};
 use kiln_ci::land::{self, Action, Facts, OwnerRule, Policy};
 use kiln_ci::review::{Gate, Kind, State};
 use rusqlite::{OptionalExtension as _, params};
@@ -206,6 +207,16 @@ pub async fn comment(hub: &std::sync::Arc<Hub>, d: &Diff, caller: &Caller, body:
         Some(k) => Kind::parse(k).ok_or_else(|| bad("`kind` is `question`, `nit`, `issue` or `blocking`"))?,
     }
     .as_str();
+    // Signed by whoever gives it, over the version it's on (W27-R04).
+    let signed = match body.get("signed").filter(|v| !v.is_null()) {
+        Some(bundle) => {
+            let v = versions.iter().find(|v| v.n == version).ok_or_else(|| bad(format!("{} has no version {version}", d.name)))?;
+            let asked = Asked { kind: "comment", revision: super::verdicts::revision(hub, d, v).await?, place: super::verdicts::place_of(body), words: &text, suggestion: suggestion.as_deref(), ..Asked::default() };
+            Some(super::verdicts::take(hub, caller, &asked, bundle).await?)
+        }
+        None if caller.kind != crate::authz::gate::Kind::Job && super::verdicts::required(hub, d).await? => return Err(super::verdicts::unsigned(d, "comment")),
+        None => None,
+    };
     let (diff_id, me2, said, file_c, side_c) = (d.id.clone(), me.clone(), text.clone(), file.clone(), side.clone());
     let (tid, cid) = hub
         .store
@@ -230,6 +241,9 @@ pub async fn comment(hub: &std::sync::Arc<Hub>, d: &Diff, caller: &Caller, body:
                 "INSERT INTO review_comments (id, thread_id, author, body, suggestion, created_at, updated_at, published) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7)",
                 params![cid, tid, me2, text, suggestion, now, publish],
             )?;
+            if let Some(t) = &signed {
+                super::verdicts::keep(c, "comment", &cid, &diff_id, version, t)?;
+            }
             Ok((tid, cid))
         })
         .await
@@ -390,6 +404,17 @@ pub async fn edit(hub: &Hub, id: &str, caller: &Caller, body: &Value) -> Result<
             return Err(bad(format!("{}: an owner resolving {whose}'s blocking comment says why (`reason`)", f.at)));
         }
     }
+    // New words are signed by their author, as the comment was (W27-R04).
+    let signed = if text.is_some() || suggestion.is_some() {
+        let e = super::verdicts::edit_of(hub, id, body).await?;
+        match body.get("signed").filter(|v| !v.is_null()) {
+            Some(bundle) => Some((e.diff.id.clone(), e.revision.version, super::verdicts::take(hub, caller, &e.asked(), bundle).await?)),
+            None if caller.kind != crate::authz::gate::Kind::Job && super::verdicts::required(hub, &e.diff).await? => return Err(super::verdicts::unsigned(&e.diff, "comment")),
+            None => None,
+        }
+    } else {
+        None
+    };
     let (cid, tid, me2) = (id.to_owned(), f.thread.clone(), me.clone());
     let (text_c, sug_c, reason_c) = (text.clone(), suggestion.clone(), reason.clone());
     hub.store
@@ -398,6 +423,13 @@ pub async fn edit(hub: &Hub, id: &str, caller: &Caller, body: &Value) -> Result<
             let now = crate::util::now_unix();
             if text_c.is_some() || sug_c.is_some() {
                 tx.execute("UPDATE review_comments SET body = COALESCE(?2, body), suggestion = COALESCE(?3, suggestion), updated_at = ?4 WHERE id = ?1", params![cid, text_c, sug_c, now])?;
+                // The signature of its words now, or none: the old words' isn't theirs.
+                match &signed {
+                    Some((diff, version, t)) => super::verdicts::keep(&tx, "comment", &cid, diff, *version, t)?,
+                    None => {
+                        tx.execute("DELETE FROM review_signatures WHERE kind = 'comment' AND id = ?1", [&cid])?;
+                    }
+                }
             }
             if let Some(k) = kind {
                 tx.execute("UPDATE review_threads SET kind = ?2 WHERE id = ?1", params![tid, k.as_str()])?;
@@ -476,12 +508,18 @@ pub async fn delete(hub: &Hub, id: &str, caller: &Caller) -> Result<Value, Fail>
 /// its latest version's checks and files.
 pub async fn facts(hub: &Hub, d: &Diff, versions: &[Version]) -> Result<Facts, Fail> {
     let id = d.id.clone();
+    // Where each signed verdict holds on the latest version (W27-R04), and whether only those count.
+    let signed_only = super::verdicts::required(hub, d).await.unwrap_or(false);
+    let holding = super::verdicts::holding(hub, d, versions).await.unwrap_or_default();
     let (reviews, open) = hub
         .store
         .call(move |c| {
-            let mut st = c.prepare("SELECT reviewer, reviewer_kind, version, action FROM reviews WHERE diff_id = ?1 ORDER BY created_at, rowid")?;
-            let rows = st.query_map([&id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, u32>(2)?, r.get::<_, String>(3)?)))?;
-            let reviews: Vec<land::Review> = rows.filter_map(Result::ok).filter_map(|(reviewer, kind, version, action)| Action::parse(&action).map(|action| land::Review { reviewer, agent: kind == "agent", version, action })).collect();
+            let mut st = c.prepare("SELECT reviewer, reviewer_kind, version, action, id FROM reviews WHERE diff_id = ?1 ORDER BY created_at, rowid")?;
+            let rows = st.query_map([&id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, u32>(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?)))?;
+            let reviews: Vec<land::Review> = rows
+                .filter_map(Result::ok)
+                .filter_map(|(reviewer, kind, version, action, review)| Action::parse(&action).map(|action| land::Review { reviewer, agent: kind == "agent", version, action, holds: holding.get(&review).map(Holds::holds) }))
+                .collect();
             // Threads on code (as GitHub's conversation resolution counts them; a comment on the
             // diff as a whole, a bot's report say, doesn't hold a land up).
             let open: i64 = c.query_row("SELECT COUNT(*) FROM review_threads t WHERE t.diff_id = ?1 AND t.state = 'open' AND t.file IS NOT NULL AND EXISTS (SELECT 1 FROM review_comments c WHERE c.thread_id = t.id AND c.published = 1)", [&id], |r| r.get(0))?;
@@ -499,7 +537,7 @@ pub async fn facts(hub: &Hub, d: &Diff, versions: &[Version]) -> Result<Facts, F
         (Some(v), Ok((_, p))) => gitops::run_git(hub, &["-C", &p, "diff", "--name-only", &v.parent, &v.commit], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).lines().map(str::to_owned).collect()).unwrap_or_default(),
         _ => Vec::new(),
     };
-    Ok(Facts { author: d.author.clone(), rebase_only: versions.iter().map(|v| v.rebase_only).collect(), reviews, open_threads: open, checks, paths })
+    Ok(Facts { author: d.author.clone(), rebase_only: versions.iter().map(|v| v.rebase_only).collect(), reviews, open_threads: open, checks, paths, signed_only })
 }
 
 /// The checks on a commit: each workflow (by its name and its path) and each of its jobs
@@ -612,7 +650,17 @@ pub async fn review(hub: &std::sync::Arc<Hub>, d: &Diff, caller: &Caller, body: 
     };
     let versions = super::diffs::versions(hub, d).await.map_err(fail)?;
     let latest = versions.last().map_or(1, |v| v.n);
-    let (id, me2, text2) = (d.id.clone(), me.clone(), text.clone());
+    // Signed by whoever gives it, over the version it's given on (W27-R04).
+    let signed = match body.get("signed").filter(|v| !v.is_null()) {
+        Some(bundle) => {
+            let v = versions.last().ok_or_else(|| (StatusCode::CONFLICT, format!("{} has no version to review", d.name)))?;
+            let asked = Asked { kind: "verdict", revision: super::verdicts::revision(hub, d, v).await?, action: action.as_str(), words: &text, ..Asked::default() };
+            Some(super::verdicts::take(hub, caller, &asked, bundle).await?)
+        }
+        None if caller.kind != crate::authz::gate::Kind::Job && super::verdicts::required(hub, d).await? => return Err(super::verdicts::unsigned(d, "verdict")),
+        None => None,
+    };
+    let (id, me2, text2, rid) = (d.id.clone(), me.clone(), text.clone(), crate::util::new_id());
     let (published, drafts) = hub
         .store
         .call(move |c| {
@@ -626,8 +674,11 @@ pub async fn review(hub: &std::sync::Arc<Hub>, d: &Diff, caller: &Caller, body: 
             let published = tx.execute("UPDATE review_comments SET published = 1, updated_at = ?3 WHERE author = ?2 AND published = 0 AND thread_id IN (SELECT id FROM review_threads WHERE diff_id = ?1)", params![id, me2, now])?;
             tx.execute(
                 "INSERT INTO reviews (id, diff_id, version, reviewer, reviewer_kind, action, body, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![crate::util::new_id(), id, latest, me2, if agent { "agent" } else { "human" }, action.as_str(), text2, now],
+                params![rid, id, latest, me2, if agent { "agent" } else { "human" }, action.as_str(), text2, now],
             )?;
+            if let Some(t) = &signed {
+                super::verdicts::keep(&tx, "verdict", &rid, &id, latest, t)?;
+            }
             match action {
                 Action::Resign => {
                     tx.execute("DELETE FROM diff_reviewers WHERE diff_id = ?1 AND reviewer = ?2", params![id, me2])?;

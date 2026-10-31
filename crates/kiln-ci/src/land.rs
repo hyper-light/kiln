@@ -263,6 +263,10 @@ pub struct Review {
     pub agent: bool,
     pub version: u32,
     pub action: Action,
+    /// Whether its giver's signature holds on the latest version (W27-R04): on its own revision, or
+    /// on a later one with its verbatim patch-id; none: it's unsigned.
+    #[serde(default)]
+    pub holds: Option<bool>,
 }
 
 /// What a diff's land readiness depends on, as the server knows it.
@@ -279,6 +283,9 @@ pub struct Facts {
     pub checks: BTreeMap<String, Option<String>>,
     /// The latest version's files.
     pub paths: Vec<String>,
+    /// Signatures are required (W27-R03, R04): only verdicts whose signature holds on the latest
+    /// version count, carried by their verbatim patch-id, never by rebase-only versions alone.
+    pub signed_only: bool,
 }
 
 impl Facts {
@@ -286,9 +293,12 @@ impl Facts {
         u32::try_from(self.rebase_only.len()).unwrap_or(u32::MAX)
     }
 
-    /// Whether an accept of `version` still counts for the latest version.
-    fn carries(&self, sticky: Sticky, version: u32) -> bool {
-        let latest = self.latest();
+    /// Whether accept `r` still counts for the latest version.
+    fn carries(&self, sticky: Sticky, r: &Review) -> bool {
+        if self.signed_only {
+            return r.holds == Some(true);
+        }
+        let (latest, version) = (self.latest(), r.version);
         version == latest || (sticky != Sticky::None && version < latest && self.rebase_only.iter().skip(usize::try_from(version).unwrap_or(usize::MAX)).all(|r| *r))
     }
 
@@ -315,15 +325,16 @@ impl Facts {
     pub fn accepting(&self, land: &Land) -> BTreeSet<String> {
         self.standing()
             .into_values()
-            .filter(|r| r.action == Action::Accept && !r.reviewer.eq_ignore_ascii_case(&self.author) && (land.agents_can_approve || !r.agent) && self.carries(land.sticky_approvals, r.version))
+            .filter(|r| r.action == Action::Accept && !r.reviewer.eq_ignore_ascii_case(&self.author) && (land.agents_can_approve || !r.agent) && self.carries(land.sticky_approvals, r))
             .map(|r| r.reviewer.clone())
             .collect()
     }
 
-    /// Who asks for changes in the latest version (a newer version answers an older request).
+    /// Who asks for changes in the latest version (a newer version answers an older request; where
+    /// signatures are required, only a signed request counts).
     pub fn requesting(&self) -> Vec<String> {
         let latest = self.latest();
-        self.standing().into_values().filter(|r| r.action == Action::RequestChanges && r.version == latest).map(|r| r.reviewer.clone()).collect()
+        self.standing().into_values().filter(|r| r.action == Action::RequestChanges && r.version == latest && (!self.signed_only || r.holds == Some(true))).map(|r| r.reviewer.clone()).collect()
     }
 }
 
@@ -420,7 +431,30 @@ mod tests {
     use super::*;
 
     fn review(reviewer: &str, version: u32, action: Action) -> Review {
-        Review { reviewer: reviewer.into(), agent: reviewer.starts_with("agent:"), version, action }
+        Review { reviewer: reviewer.into(), agent: reviewer.starts_with("agent:"), version, action, holds: None }
+    }
+
+    /// W27-R04: where signatures are required, only a verdict whose signature holds on the latest
+    /// version counts: an unsigned accept doesn't, one carried by its verbatim patch-id does, and
+    /// rebase-only versions alone carry nothing.
+    #[test]
+    fn w27_r04_where_signatures_are_required_only_verdicts_that_hold_count() {
+        let land = Land::default();
+        let signed = |reviewer: &str, version: u32, action: Action, holds: bool| Review { holds: Some(holds), ..review(reviewer, version, action) };
+        let mut f = Facts { author: "user:ada".into(), rebase_only: vec![false, true], signed_only: true, ..Facts::default() };
+        f.reviews = vec![review("user:bob", 2, Action::Accept)];
+        assert_eq!(review_state(&land, &f), crate::review::State::NeedsReview, "an unsigned accept");
+        f.reviews = vec![signed("user:bob", 1, Action::Accept, false)];
+        assert_eq!(review_state(&land, &f), crate::review::State::NeedsReview, "v2 only rebased, but its verbatim patch-id isn't v1's");
+        f.reviews = vec![signed("user:bob", 1, Action::Accept, true)];
+        assert_eq!(review_state(&land, &f), crate::review::State::Accepted, "carried by its verbatim patch-id");
+        f.reviews.push(review("user:cy", 2, Action::RequestChanges));
+        assert_eq!(review_state(&land, &f), crate::review::State::Accepted, "an unsigned request doesn't count");
+        f.reviews.push(signed("user:cy", 2, Action::RequestChanges, true));
+        assert_eq!(review_state(&land, &f), crate::review::State::ChangesRequested);
+        f.signed_only = false;
+        f.reviews = vec![review("user:bob", 1, Action::Accept)];
+        assert_eq!(review_state(&land, &f), crate::review::State::Accepted, "where they aren't, rebase-only versions carry as before");
     }
 
     #[test]
