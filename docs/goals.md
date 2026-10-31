@@ -331,9 +331,11 @@ Every harness kiln runs as an agent reports how its turns end: Claude Code (its 
 reason), Codex (`turn/completed`: completed, interrupted, failed), the ACP agents, Gemini CLI,
 opencode, Goose and Amp (the prompt's `stopReason`: end_turn, max_tokens, max_turn_requests,
 refusal, cancelled), and the Antigravity CLI (its `result`: SUCCESS, or ERROR with what went wrong;
-"interrupted" is a stop). Their to-dos are Claude Code's TodoWrite, Codex's plan and ACP's plan. A
-turn of the Antigravity CLI that ended on something it wasn't allowed to do (it can't ask, so it
-was denied) ends as "blocked" and is left alone: going on would only be denied again.
+"interrupted" is a stop). Their to-dos are Claude Code's TodoWrite, Codex's plan and ACP's plan;
+after a switch to another harness, only the list the new one keeps (the old one's went to it in
+its note: agents.md). A turn of the Antigravity CLI that ended on something it wasn't allowed to
+do (it can't ask, so it was denied) ends as "blocked" and is left alone: going on would only be
+denied again.
 
 Kiln waits four seconds (a message of yours goes first), then sends one line, shown as kiln's in
 the timeline: "Your last turn stopped part-way (stop_sequence). Pick up where you left off and
