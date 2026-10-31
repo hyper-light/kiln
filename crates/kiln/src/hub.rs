@@ -1340,7 +1340,7 @@ impl Hub {
             let on_channel = stream.filter(|_| self.cmds.lock().keeps(p));
             match on_channel {
                 Some(kind) => {
-                    away &= !self.cmds.lock().is_up(p);
+                    away &= self.cmds.lock().is_away(p);
                     let mut rx = self.cmds.lock().push(p, kind, body.clone(), Instant::now());
                     match rx.try_recv() {
                         Ok(Some(a)) => given.push(a),
