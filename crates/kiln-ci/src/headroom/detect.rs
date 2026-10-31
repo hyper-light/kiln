@@ -303,16 +303,18 @@ impl Detector {
 
 /// How often to probe a target (µs): the time left to act on trouble (its tolerance less the
 /// longest a cut has taken to show, `lag_us`) shared over the samples a shift takes to alarm and
-/// one more to see it start; never faster than the probe itself takes (`cost_us`), and for a target
-/// that serves others, never more of its time than `load_share` of it (`service_us` a request).
-pub fn interval_us(tolerance_us: f64, lag_us: f64, delay_samples: f64, cost_us: f64, service: Option<(f64, f64)>) -> f64 {
-    let window = (tolerance_us - lag_us.max(0.0)).max(cost_us.max(1.0));
+/// one more to see it start. A lag at or past the tolerance leaves no time that probing faster
+/// could win back, so it doesn't shorten the interval. Never more of the target's time than
+/// `load_share` of it, at `cost_us` a probe: a disk, like a server, serves others besides the
+/// probe (2026-10-30: a 221 s lag had every runner's disk probed back to back and production's
+/// server about 270 times a second).
+pub fn interval_us(tolerance_us: f64, lag_us: f64, delay_samples: f64, cost_us: f64, load_share: f64) -> f64 {
+    let lag = lag_us.max(0.0);
+    let lag = if lag < tolerance_us { lag } else { 0.0 };
+    let window = (tolerance_us - lag).max(cost_us.max(1.0));
     let every = window / (delay_samples.max(1.0) + 1.0);
-    let floor = match service {
-        Some((service_us, share)) if share > 0.0 => cost_us.max(service_us / share),
-        _ => cost_us,
-    };
-    every.max(floor).max(1.0)
+    let share = if load_share > 0.0 && load_share <= 1.0 { load_share } else { 1.0 };
+    every.max(cost_us / share).max(1.0)
 }
 
 #[cfg(test)]
@@ -448,15 +450,31 @@ mod tests {
 
     #[test]
     fn probe_intervals_follow_tolerance_lag_and_cost() {
-        let fast = interval_us(1e6, 0.0, 3.0, 5e3, None);
-        let tight = interval_us(2e5, 0.0, 3.0, 5e3, None);
+        let fast = interval_us(1e6, 0.0, 3.0, 5e3, 1.0);
+        let tight = interval_us(2e5, 0.0, 3.0, 5e3, 1.0);
         assert!(tight < fast);
         // Never under the probe's own cost.
-        assert_eq!(interval_us(1e4, 0.0, 9.0, 5e3, None), 5e3);
+        assert_eq!(interval_us(1e4, 0.0, 9.0, 5e3, 1.0), 5e3);
         // A lag eats into the window.
-        assert!(interval_us(1e6, 5e5, 3.0, 5e3, None) < fast);
-        // A served target is held to its share: 1 ms a request at 10% is no more than every 10 ms.
-        assert!(interval_us(1e5, 0.0, 9.0, 1e3, Some((1e3, 0.1))) >= 1e4);
+        assert!(interval_us(1e6, 5e5, 3.0, 5e3, 1.0) < fast);
+        // A lag at or past the tolerance leaves no time to win back: as with none.
+        assert_eq!(interval_us(1e6, 1e6, 3.0, 5e3, 1.0), fast);
+        assert_eq!(interval_us(1e6, 221e6, 3.0, 5e3, 1.0), fast);
+        // Every target is held to its share: 1 ms a probe at 10% is no more than every 10 ms.
+        assert!(interval_us(1e5, 0.0, 9.0, 1e3, 0.1) >= 1e4);
+    }
+
+    proptest::proptest! {
+        /// However long the lag and however cheap the probe, probes take at most the load share
+        /// of a target's time, and a lag at or past the tolerance probes no faster than none.
+        #[test]
+        fn probes_stay_within_the_load_share(tolerance in 1e3f64..1e8, lag in 0.0f64..1e9, delay in 1.0f64..100.0, cost in 1.0f64..1e6, share in 1e-4f64..=1.0) {
+            let every = interval_us(tolerance, lag, delay, cost, share);
+            proptest::prop_assert!(cost / every <= share * (1.0 + 1e-9), "{cost} µs a probe every {every} µs is over {share}");
+            if lag >= tolerance {
+                proptest::prop_assert_eq!(every, interval_us(tolerance, 0.0, delay, cost, share));
+            }
+        }
     }
 
     #[test]

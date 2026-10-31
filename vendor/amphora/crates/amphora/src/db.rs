@@ -935,6 +935,23 @@ mod tests {
                 .query("SELECT value FROM original", [], |_| Ok(false))
                 .is_err()
         );
+        // U05: an old member's floor-bearing image is not a writer-floor
+        // receipt. Refusal must roll back its catalog before any apply marker.
+        crate::database::bootstrap_db(&source).unwrap();
+        source.exec("INSERT INTO __amphora_application_floor VALUES(1, 'kiln.host-store', 6)").unwrap();
+        source.flusher()().unwrap();
+        let floor_image = postcard::to_allocvec(&source.image_pages(1 << 20).unwrap()).unwrap();
+        let replica_path = dir.path().join("replica.db");
+        let mut replica = crate::replication::Machine::open(&replica_path, hyper_raft::proto::ConfState::default()).unwrap();
+        let accepted = hyper_durable::Point { index: 1, term: 1 };
+        hyper_durable::StateMachine::install(&mut replica, &postcard::to_allocvec(&image).unwrap(), accepted, &hyper_raft::proto::ConfState::default()).unwrap();
+        assert!(hyper_durable::StateMachine::install(&mut replica, &floor_image, hyper_durable::Point { index: 2, term: 1 }, &hyper_raft::proto::ConfState::default()).is_err());
+        assert_eq!(hyper_durable::StateMachine::durable(&replica), accepted);
+        assert_eq!(replica.read(|db| Ok(db.query_row("SELECT value FROM replacement", [], |row| row.get::<_, String>(0))?)).unwrap(), "seed");
+        assert_eq!(replica.read(|db| Ok(db.query_row("SELECT count(*) FROM sqlite_schema WHERE name='__amphora_application_floor'", [], |row| row.get::<_, i64>(0))?)).unwrap(), 0);
+        drop(source);
+        let refusal = crate::replication::Machine::open(&dir.path().join("source.db"), hyper_raft::proto::ConfState::default()).err().unwrap();
+        assert!(matches!(refusal, amphora_api::Refusal::Fenced(reason) if reason == "application writer floor requires a member-proven replication contract"));
     }
 
     /// U05/U15: an expired SQL VM is interrupted and the guard clears before rollback,

@@ -47,6 +47,7 @@ struct Job {
     requires: Vec<String>,
     /// Its run has finished.
     run_done: bool,
+    pipeline_origin:bool,
     /// It's of its run's latest attempt (a pipeline's job always is).
     latest: bool,
     /// What ran it: `kiln`, or another CI provider (W23).
@@ -78,21 +79,21 @@ impl Job {
 }
 
 async fn job_of(hub: &Hub, id: &str) -> Result<Job, Fail> {
-    type Row = (String, String, Option<String>, String, Option<String>, Option<String>, String, i64, String, i64, String, Option<String>);
+    type Row = (String, String, Option<String>, String, Option<String>, Option<String>, String, i64, String, i64, String, Option<String>, bool);
     let key = id.to_owned();
     let row: Option<Row> = hub
         .store
         .call(move |c| {
             Ok(c.query_row(
-                "SELECT j.run_id, j.key, j.job_id, j.status, j.agent, j.executor, j.labels, j.run_attempt, r.status, r.attempt, r.provider, j.spec FROM jobs j JOIN runs r ON r.id = j.run_id WHERE j.id = ?1",
+                "SELECT j.run_id, j.key, j.job_id, j.status, j.agent, j.executor, j.labels, j.run_attempt, r.status, r.attempt, r.provider, j.spec, EXISTS(SELECT 1 FROM ci_plans p WHERE p.run_id=r.id AND json_extract(p.input,'$.legacy_import')=1) FROM jobs j JOIN runs r ON r.id = j.run_id WHERE j.id = ?1",
                 [&key],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?, r.get(12)?)),
             )
             .optional()?)
         })
         .await
         .map_err(internal)?;
-    let Some((run, key, job, status, agent, executor, labels, leg_attempt, run_status, run_attempt, provider, spec)) = row else { return Err((StatusCode::NOT_FOUND, "no such job".into())) };
+    let Some((run, key, job, status, agent, executor, labels, leg_attempt, run_status, run_attempt, provider, spec, pipeline_origin)) = row else { return Err((StatusCode::NOT_FOUND, "no such job".into())) };
     let latest = job.is_none() || leg_attempt == run_attempt;
     let requires = spec.and_then(|s| serde_json::from_str::<Value>(&s).ok()).and_then(|v| v.get("requires").cloned()).and_then(|r| serde_json::from_value(r).ok()).unwrap_or_default();
     Ok(Job {
@@ -107,6 +108,7 @@ async fn job_of(hub: &Hub, id: &str) -> Result<Job, Fail> {
         requires,
         run_done: Status::parse(&run_status).is_terminal(),
         latest,
+        pipeline_origin,
         provider,
     })
 }
@@ -117,10 +119,11 @@ fn why_not(hub: &Hub, j: &Job) -> Option<String> {
         return Some(format!("it hasn't finished: it's {}", j.status.as_str()));
     }
     match j.kind() {
+        _ if j.pipeline_origin && j.status == Status::Skipped => Some("it was skipped: retry the job it needs, or the run".into()),
         "pipeline" if j.status == Status::Skipped => Some("it was skipped: retry the job it needs, or the run".into()),
         "ci" | "pipeline" if !hub.ci.enabled() => Some("the CI engine is off ([ci] enabled)".into()),
         "ci" if !j.latest => Some("it's of an earlier attempt of its run: retry it in the latest".into()),
-        "ci" if !j.run_done => Some("its run is still in progress: cancel it or wait for it to finish".into()),
+        "ci" if !j.run_done && !j.pipeline_origin => Some("its run is still in progress: cancel it or wait for it to finish".into()),
         _ => None,
     }
 }

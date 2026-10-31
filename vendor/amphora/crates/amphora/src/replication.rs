@@ -165,6 +165,8 @@ impl Machine {
         }
         let mut db = Db::open(path).map_err(unavailable)?;
         db.hold_owner(std::sync::Arc::clone(&owner));
+        // Check before retaining a baseline image or writing a replica marker.
+        crate::database::require_replication(&db).map_err(|e| crate::database::refused(&e))?;
         let mut marked = false;
         db.query(
             "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = '__amphora_replica'",
@@ -260,9 +262,11 @@ impl Machine {
         self.baseline.source()
     }
     pub(crate) fn prepare_bootstrap(&self, entry_room: usize) -> Result<Option<Vec<u8>>, Refusal> {
+        crate::database::require_replication(&self.db).map_err(|e| crate::database::refused(&e))?;
         self.baseline.proposal(entry_room)
     }
     fn require_baseline(&self) -> Result<(), Refusal> {
+        crate::database::require_replication(&self.db).map_err(|e| crate::database::refused(&e))?;
         if self.baseline.pending() {
             return Err(api::invalid(
                 "replica baseline",
@@ -279,7 +283,12 @@ impl Machine {
         self.require_baseline()?;
         let (answer, pages) = self
             .db
-            .prepare_pages(COMMAND_BYTES, f)
+            .prepare_pages(COMMAND_BYTES, |db| {
+                crate::database::require_replication(db)?;
+                let answer = f(db)?;
+                crate::database::require_replication(db)?;
+                Ok(answer)
+            })
             .map_err(|e| crate::database::refused(&e))?;
         validate_pages(&pages, COMMAND_BYTES)?;
         Ok((
@@ -307,6 +316,7 @@ impl Machine {
         let (answer, image) = compaction::retry(|visits| {
             let result = self.db.compaction_attempt(pages, true, |db| {
                 let _deadline = db.deadline(until);
+                crate::database::require_replication(db)?;
                 compaction::ready(db, namespace, until, false)?;
                 compaction::step(db, namespace, before, visits)
             });
@@ -352,6 +362,7 @@ impl Machine {
                 let mut connection = crate::sql::Connection::new(db);
                 let value = f(&mut connection)?;
                 connection.finish()?;
+                crate::database::require_replication(db)?;
                 Ok(value)
             })
             .map_err(|e| crate::database::refused(&e))?;
@@ -379,6 +390,7 @@ impl Machine {
                 let mut connection = crate::sql::Connection::new(db);
                 let value = f(&mut connection)?;
                 connection.finish()?;
+                crate::database::require_replication(db)?;
                 Ok(value)
             })
             .map_err(|e| crate::database::refused(&e))?;
@@ -397,8 +409,15 @@ impl Machine {
         pages: &[(u32, Vec<u8>)],
         configuration: &ConfState,
     ) -> Result<(), Fatal> {
+        crate::database::require_replication(&self.db).map_err(failed)?;
         self.db
-            .apply_pages(pages, |db| marker(db, at, configuration))
+            .apply_pages(pages, |db| {
+                // Pages from an older member carry no trustworthy application claim.
+                // This callback is inside the unpublished-page transaction: refusal
+                // rolls the image back before its applied marker can commit.
+                crate::database::require_replication(db)?;
+                marker(db, at, configuration)
+            })
             .map_err(failed)?;
         self.db.flusher()().map_err(failed)?;
         self.point = at;
@@ -411,6 +430,7 @@ impl StateMachine for Machine {
     type Answer = Applied;
 
     fn apply(&mut self, entry: &EntryRef<'_>, answers: &mut Vec<Applied>) -> Result<(), Fatal> {
+        crate::database::require_replication(&self.db).map_err(failed)?;
         if entry.index <= self.point.index {
             return Err(failed("a committed entry was applied twice"));
         }
@@ -422,6 +442,7 @@ impl StateMachine for Machine {
             && self
                 .baseline
                 .apply_seed(&mut self.db, entry.data, |db| {
+                    crate::database::require_replication(db)?;
                     crate::database::bootstrap_db(db)?;
                     db.exec(META)?;
                     marker(db, at, &self.configuration)
@@ -511,6 +532,7 @@ impl StateMachine for Machine {
         None
     }
     fn install(&mut self, image: &[u8], at: Point, configuration: &ConfState) -> Result<(), Fatal> {
+        crate::database::require_replication(&self.db).map_err(failed)?;
         api::bound(
             "snapshot",
             image.len(),
@@ -536,6 +558,7 @@ impl StateMachine for Machine {
         }
         self.db
             .apply_pages(&pages, |db| {
+                crate::database::require_replication(db)?;
                 db.exec(META)?;
                 marker(db, at, configuration)?;
                 self.baseline.completed_marker(db)

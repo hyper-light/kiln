@@ -25,6 +25,13 @@ use amphora_engine_parser::{
 use crate::db::Db;
 use crate::store::{self, Checkpointed, Engine, Flush, Opener, Store};
 
+mod application;
+pub use application::WriterBoundary;
+pub(crate) use application::Application;
+
+pub(crate) fn require_replication(db: &Db) -> anyhow::Result<()> {
+    application::require_replication(db)
+}
 pub(crate) mod compaction;
 mod import;
 pub(crate) mod remote;
@@ -40,7 +47,8 @@ CREATE TABLE IF NOT EXISTS __amphora_namespaces (name TEXT PRIMARY KEY, head INT
 CREATE TABLE IF NOT EXISTS __amphora_versions (namespace TEXT NOT NULL, family TEXT NOT NULL, key BLOB NOT NULL, rev INTEGER NOT NULL, seq INTEGER NOT NULL, value BLOB, PRIMARY KEY(namespace, family, key, rev));
 CREATE INDEX IF NOT EXISTS __amphora_feed ON __amphora_versions(namespace, family, rev, seq);
 CREATE TABLE IF NOT EXISTS __amphora_families (namespace TEXT NOT NULL, family TEXT NOT NULL, newest INTEGER NOT NULL, PRIMARY KEY(namespace, family));
-CREATE TABLE IF NOT EXISTS __amphora_migrations (name TEXT PRIMARY KEY, sql TEXT NOT NULL);";
+CREATE TABLE IF NOT EXISTS __amphora_migrations (name TEXT PRIMARY KEY, sql TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS __amphora_application_floor (singleton INTEGER PRIMARY KEY CHECK(singleton=1), application TEXT NOT NULL, version INTEGER NOT NULL CHECK(version>0));";
 const LIVE_MAX: u64 = 10_000_000;
 const QUEUED_BYTES: usize = 512 << 20;
 struct Admission(Arc<AtomicUsize>);
@@ -66,6 +74,7 @@ impl Drop for Admission {
 #[derive(Clone)]
 pub struct Database {
     shared: Arc<Shared>,
+    application: Option<Application>,
 }
 
 struct Shared {
@@ -156,6 +165,7 @@ enum Answer {
 type Reply = Arc<Mutex<Option<Result<Answer, Refusal>>>>;
 struct Command {
     namespace: String,
+    application: Option<Application>,
     operation: Operation,
     answer: Reply,
     publication: Arc<Mutex<Option<BTreeMap<String, Published>>>>,
@@ -398,7 +408,7 @@ impl Database {
                         match remote::validate(&backend.client, replica, until) {
                             Ok(_) => {
                                 backend.configure(replica)?;
-                                return Ok(Self { shared });
+                                return Ok(Self { shared, application: None });
                             }
                             // Identity probes cannot submit application work. Only a successful
                             // OS lease below permits starting the predecessor's replacement.
@@ -426,9 +436,9 @@ impl Database {
                                 ));
                             }
                         }
-                        return Ok(Self { shared });
+                        return Ok(Self { shared, application: None });
                     } else {
-                        return Ok(Self { shared });
+                        return Ok(Self { shared, application: None });
                     }
                 }
                 // Store shutdown is asynchronous. Its engine/readers/flusher still retain the
@@ -524,6 +534,7 @@ impl Database {
                     until,
                 )?;
                 Ok(Self {
+                    application: None,
                     shared: Arc::new(Shared {
                         transport: Mutex::new(None),
                         path: OnceLock::new(),
@@ -596,6 +607,7 @@ impl Database {
         let changed = Changed::default();
         *locked(&changed.published)? = read_published(&db)?;
         let database = Self {
+            application: None,
             shared: Arc::new(Shared {
                 transport: Mutex::new(None),
                 path: OnceLock::new(),
@@ -723,7 +735,7 @@ impl Database {
             }
             Writer::Local(store) => store,
             Writer::Client(backend) => {
-                return remote::submit(&backend.client, namespace, operation, until);
+                return remote::submit(&backend.client.for_application(self.application.clone()), namespace, operation, until);
             }
         };
         let admission = Admission::reserve(&self.shared.admitted)?;
@@ -760,6 +772,7 @@ impl Database {
             .put_then(
                 vec![Command {
                     namespace: namespace.to_owned(),
+                    application: self.application.clone(),
                     operation,
                     answer: Arc::clone(&answer),
                     publication: Arc::clone(&publication),
@@ -1095,6 +1108,10 @@ impl Engine for Local {
         }) {
             for row in rows {
                 if let Operation::Mutation(Mutation::CompactStep { before, .. }) = &row.operation {
+                    if let Err(error) = application::check(&self.db, row.application.as_ref(), &row.operation) {
+                        *locked(&row.answer)? = Some(Err(refused(&error)));
+                        continue;
+                    }
                     let result = compaction::local(
                         &mut self.db,
                         &row.namespace,
@@ -1113,6 +1130,7 @@ impl Engine for Local {
                             return Err(Refusal::Timeout.into());
                         }
                         let _deadline = db.deadline(row.until);
+                        application::check(db, row.application.as_ref(), &row.operation)?;
                         if !restoring && restore::incomplete(db)? {
                             return Err(api::invalid("database", "restore is incomplete").into());
                         }
@@ -1147,6 +1165,7 @@ impl Engine for Local {
                         return Err(Refusal::Timeout.into());
                     }
                     let _deadline = db.deadline(r.until);
+                    application::check(db, r.application.as_ref(), &r.operation)?;
                     let result = apply(db, &r.namespace, &r.operation);
                     if result.is_err() && Instant::now() >= r.until {
                         return Err(Refusal::Timeout.into());

@@ -941,7 +941,7 @@ impl Registry {
             sources.push(dir.join(crate::convo::FILE));
             sources.sort();
             sources.dedup();
-            Some(crate::records::SessionStorage::from_host_database_with_initial_hold(database, machine_name, &sources, conversations.upkeep(), 0)?)
+            Some(crate::records::SessionStorage::from_archive_host_database(database, machine_name, &sources, conversations)?)
         };
         let convo = storage.as_ref().map(crate::records::SessionStorage::conversations);
         let (tx, rx) = async_channel::bounded(8192);

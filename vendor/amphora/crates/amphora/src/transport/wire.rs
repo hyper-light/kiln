@@ -41,6 +41,9 @@ pub(super) enum Request {
     ),
     ReplicaStatus,
     Capabilities,
+    // Appended: one bounded claim before the existing ordinary request. It
+    // declares a client format; only the actual owner's floor grants admission.
+    Application(crate::database::Application),
 }
 #[derive(Serialize, Deserialize)]
 pub(super) enum Record {

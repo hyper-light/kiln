@@ -144,6 +144,12 @@ fn transport_child() {
             let _ = std::io::stdin().read_exact(&mut [0]);
             drop(database);
         }
+        "application" => {
+            let database = Database::open(path, until()).unwrap()
+                .for_application("kiln.host-store", 6).unwrap();
+            assert!(matches!(database.writer_floor("kiln.host-store", 6, until()), Err(api::Refusal::Invalid { .. })), "an attached client cannot mint original owner custody");
+            database.call(until(), |db| { db.execute("INSERT INTO items VALUES(4)", [])?; Ok(()) }).unwrap();
+        }
         "owner" => {
             let database = Database::open(path, until()).unwrap();
             migration_diagnostics(&database);
@@ -530,5 +536,34 @@ fn independent_processes_share_cas_and_adaptive_sql_and_abort_disconnect() {
         client.namespace("ledger").unwrap().head(until()).unwrap(),
         2
     );
+    // U05: the durable floor serializes behind prior adaptive sessions. Existing
+    // untagged attachments cannot bypass it; a new tagged SDK client can use the
+    // SAME actual owner without opening a second engine.
+    let application = clone.for_application("kiln.host-store", 6).unwrap();
+    let (entered_tx,entered_rx)=std::sync::mpsc::sync_channel(1);
+    let (release_tx,release_rx)=std::sync::mpsc::sync_channel(1);
+    let old_client=client.clone();
+    let old=std::thread::spawn(move ||old_client.call(until(),move |db| {
+        db.execute("INSERT INTO items VALUES(5)",[])?;
+        entered_tx.send(()).unwrap();
+        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        Ok(())
+    }));
+    entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let installing=application.clone();
+    let floor=std::thread::spawn(move ||installing.writer_floor("kiln.host-store",6,until()));
+    // Entry, not a thread-start or guessed delay, is the old transaction proof.
+    // The receipt is returned only after this original session settles.
+    release_tx.send(()).unwrap();
+    old.join().unwrap().unwrap();
+    let boundary=floor.join().unwrap().unwrap();
+    boundary.require(&application).unwrap();
+    assert_eq!(boundary.version(), 6);
+    let old: Result<(), _> = client.call(until(), |db| { db.execute("INSERT INTO items VALUES(100)", [])?; Ok(()) });
+    assert!(matches!(old, Err(amphora::transport::Error::Refused(api::Refusal::Fenced(_)))));
+    assert!(matches!(ns.commit(api::Tx { conds:vec![], writes:vec![api::Write::Delete { family:"work".into(),key:b"one".to_vec() }] },until()), Err(api::Refusal::Fenced(_))));
+    assert!(child(&path, "application").success());
+    assert_eq!(application.call(until(), |db| Ok(db.query_row("SELECT count(*) FROM items", [], |row| row.get::<_,i64>(0))?)).unwrap(),4);
+    assert_eq!(application.namespace("ledger").unwrap().get("work",b"one",api::Consistency::Linearizable,until()).unwrap().unwrap().value,b"child_claimed");
     drop(clone);
 }

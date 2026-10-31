@@ -13,7 +13,7 @@
 //!
 //! The engine is behind [`Engine`]: the host's shared Amphora database ([`super::amphora`]).
 
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -284,6 +284,9 @@ pub trait Engine: Send + 'static {
     /// Let go of up to `limit` record lines of sessions that ended before `before` (unix ms):
     /// how many went (0: none are left). Their events stay.
     fn prune_some(&mut self, before: i64, limit: usize) -> anyhow::Result<usize>;
+    /// A bounded maintenance page can advance without deleting rows. Continue
+    /// only on the same actor's next idle turn, preserving input responsiveness.
+    fn maintenance_pending(&self)->bool { false }
     /// A step of making the database's file compact, once compressing and letting go left
     /// `min_free` bytes of it free, and a third of it: a copy, `step_bytes` at a time, under the
     /// same numbers, then what was written meanwhile, then the copy takes the file's place. The
@@ -395,6 +398,8 @@ pub struct Store {
     watchers: Watchers,
     /// Sessions that ended at or after this (unix ms) keep their records ([`Store::hold_prune`]).
     hold: Arc<AtomicI64>,
+    maintenance: Option<super::retention::Authority>,
+    maintenance_due: Arc<AtomicBool>,
 }
 
 impl Store {
@@ -405,29 +410,41 @@ impl Store {
 
     /// Limits bound safe admitted input, not historical migration calls or engine RSS.
     pub fn start_with_limits(engine: Box<dyn Engine>, upkeep: Upkeep, limits: AdmissionLimits) -> anyhow::Result<Self> {
-        Self::start_initialized(engine, upkeep, limits, i64::MAX)
+        Self::start_initialized(engine, upkeep, limits, i64::MAX, None)
     }
 
     /// The existing archive owner installs its initial hold before the writer can run.
     /// Ordinary constructors retain their unbounded initial cutoff and original upkeep.
+    #[cfg(test)]
     pub(crate) fn start_with_initial_hold(engine: Box<dyn Engine>, upkeep: Upkeep, initial_hold: i64) -> anyhow::Result<Self> {
-        Self::start_initialized(engine, upkeep, AdmissionLimits::default(), initial_hold)
+        Self::start_initialized(engine, upkeep, AdmissionLimits::default(), initial_hold, None)
     }
 
-    fn start_initialized(engine: Box<dyn Engine>, upkeep: Upkeep, limits: AdmissionLimits, initial_hold: i64) -> anyhow::Result<Self> {
+    pub(crate) fn start_with_maintenance(engine: Box<dyn Engine>, upkeep: Upkeep, initial_hold: i64, authority: Option<super::retention::Authority>) -> anyhow::Result<Self> {
+        Self::start_initialized(engine, upkeep, AdmissionLimits::default(), initial_hold, authority)
+    }
+
+    pub(crate) fn maintenance(&self) -> Option<super::retention::Authority> { self.maintenance.clone() }
+
+    /// A coalesced wake hint only; the engine rechecks the durable authority and
+    /// exact receipt. No user event or destructive permission lives in this bit.
+    pub(crate) fn wake_maintenance(&self) { self.maintenance_due.store(true,Ordering::Release); }
+
+    fn start_initialized(engine: Box<dyn Engine>, upkeep: Upkeep, limits: AdmissionLimits, initial_hold: i64, maintenance: Option<super::retention::Authority>) -> anyhow::Result<Self> {
         anyhow::ensure!(limits.batches > 0 && limits.bytes > 0, "conversation admission limits must be positive");
         let (tx, rx) = mpsc::sync_channel::<Msg>(QUEUE.min(limits.batches));
         let id: Arc<str> = engine.id().into();
         let watchers: Watchers = Arc::default();
         let meter: Arc<Meter> = Arc::default();
         let hold = Arc::new(AtomicI64::new(initial_hold));
+        let maintenance_due = Arc::new(AtomicBool::new(false));
         let failure: Failure = Arc::default();
         let capacity = Arc::new(Capacity { limits, used: Mutex::default(), changed: event_listener::Event::new(), meter: meter.clone() });
         let identity = Arc::new(());
         let life = WriterLife(capacity.clone());
-        let (w, m, h, f) = (watchers.clone(), meter.clone(), Arc::clone(&hold), failure.clone());
-        std::thread::Builder::new().name("kiln-convo".into()).spawn(move || { writer(engine, &rx, WriterContext { watchers: &w, upkeep, meter: &m, hold: &h, failure: &f, capacity: &life.0 }); drop(life); })?;
-        Ok(Self { tx, failure, capacity, identity, id, meter, watchers, hold })
+        let (w, m, h, f, due) = (watchers.clone(), meter.clone(), Arc::clone(&hold), failure.clone(), maintenance_due.clone());
+        std::thread::Builder::new().name("kiln-convo".into()).spawn(move || { writer(engine, &rx, WriterContext { watchers: &w, upkeep, meter: &m, hold: &h, maintenance_due: &due, failure: &f, capacity: &life.0 }); drop(life); })?;
+        Ok(Self { tx, failure, capacity, identity, id, meter, watchers, hold, maintenance, maintenance_due })
     }
 
     /// Binding token only: no sender/Database clone is captured by an admitted Records batch.
@@ -787,7 +804,7 @@ impl Store {
 }
 
 struct Settlement<'a> { failure: &'a Failure, capacity: &'a Capacity, meter: &'a Meter, watchers: &'a Watchers }
-struct WriterContext<'a> { watchers: &'a Watchers, upkeep: Upkeep, meter: &'a Meter, hold: &'a AtomicI64, failure: &'a Failure, capacity: &'a Capacity }
+struct WriterContext<'a> { watchers: &'a Watchers, upkeep: Upkeep, meter: &'a Meter, hold: &'a AtomicI64, maintenance_due: &'a AtomicBool, failure: &'a Failure, capacity: &'a Capacity }
 
 fn block(envelope: Envelope, cause: &Arc<ApplyFailure>, retained: &mut Vec<Envelope>) {
     envelope.completion.finish(Err(Arc::new(ApplyFailure::Blocked(cause.clone()))));
@@ -860,7 +877,7 @@ fn shares_flush(pending: &[Envelope], batch: &Batch) -> bool {
 /// The writer: rows wait at most `COMMIT_MS` (or until `COMMIT_ROWS`) to share a commit; a job
 /// commits what waits first, so it sees everything sent before it.
 fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, context: WriterContext<'_>) {
-    let WriterContext { watchers, upkeep, meter, hold, failure, capacity } = context;
+    let WriterContext { watchers, upkeep, meter, hold, maintenance_due, failure, capacity } = context;
     let settlement = Settlement { watchers, meter, failure, capacity };
     let keep_closed = upkeep.keep_closed;
     // The hold on letting records go as it last looked: one moved later lets more go, so it looks
@@ -1012,13 +1029,15 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, context: Writer
                             return;
                         }
                     };
-                } else if !had && (looking || Instant::now() >= look_at || hold.load(Ordering::Acquire) > held) {
+                } else if !had && (looking || Instant::now() >= look_at || hold.load(Ordering::Acquire) > held || maintenance_due.load(Ordering::Acquire)) {
                     held = hold.load(Ordering::Acquire);
+                    maintenance_due.store(false,Ordering::Release);
                     let gone = match keep_closed {
                         Some(keep) => engine.prune_some(crate::util::now_ms().saturating_sub(i64::try_from(keep.as_millis()).unwrap_or(i64::MAX)).min(held), PRUNE_BATCH),
                         None => Ok(0),
                     };
                     match gone {
+                        Ok(0) if engine.maintenance_pending() => looking=true,
                         Ok(0) => {
                             if pruned > 0 {
                                 tracing::info!(lines = pruned, days = keep_closed.map_or(0, |k| k.as_secs() / 86_400), "conversation store: the records of sessions that ended long ago were let go");
@@ -1113,7 +1132,7 @@ pub fn stopped() -> Store {
     let (tx, _) = mpsc::sync_channel(1);
     let meter: Arc<Meter> = Arc::default();
     let capacity = Arc::new(Capacity { limits: AdmissionLimits::default(), used: Mutex::new(Used { closed: true, ..Used::default() }), changed: event_listener::Event::new(), meter: meter.clone() });
-    Store { tx, failure: Arc::default(), capacity, identity: Arc::new(()), id: "stopped".into(), meter, watchers: Arc::default(), hold: Arc::new(AtomicI64::new(i64::MAX)) }
+    Store { tx, failure: Arc::default(), capacity, identity: Arc::new(()), id: "stopped".into(), meter, watchers: Arc::default(), hold: Arc::new(AtomicI64::new(i64::MAX)), maintenance: None, maintenance_due: Arc::new(AtomicBool::new(false)) }
 }
 
 #[cfg(test)]
@@ -1388,39 +1407,48 @@ mod tests {
         let database = host.database();
         let engine = super::super::amphora::Amphora::from_database(database.clone())?;
         let store = Store::start_with_limits(Box::new(engine), Upkeep::default(), AdmissionLimits { batches: 1, bytes: 1 << 20 })?;
-        let (entered_tx, entered_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let held = std::thread::spawn(move || database.call(Instant::now() + READ_WAIT, move |_connection| {
-            entered_tx.send(())?;
-            release_rx.recv_timeout(READ_WAIT)?;
+        // Scoped ownership drops the release sender before joining on every error/unwind.
+        std::thread::scope(|scope| -> anyhow::Result<()> {
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let held = scope.spawn(move || database.call(Instant::now() + READ_WAIT, move |_connection| {
+                entered_tx.send(())?;
+                // Only explicit release or sender drop ends this original callback.
+                // The public Database::call deadline remains READ_WAIT.
+                release_rx.recv()?;
+                Ok(())
+            }));
+            entered_rx.recv_timeout(READ_WAIT)?;
+            let batch = Batch::from_update("s", &said("m1", 1, "retained"), 1)?.ok_or_else(|| anyhow::anyhow!("missing projection"))?;
+            let ticket = store.try_admit(batch).map_err(|e| anyhow::anyhow!("{:?}", e.reason))?;
+            let next = Batch::from_update("later", &said("m2", 2, "caller owns this"), 2)?.ok_or_else(|| anyhow::anyhow!("missing later projection"))?;
+            let refused = store.try_admit(next).err().ok_or_else(|| anyhow::anyhow!("the applying batch released its count reservation"))?;
+            anyhow::ensure!(matches!(refused.reason, AdmissionRefusal::Full { .. }) && refused.input.session() == "later", "typed Full did not return its input");
+            anyhow::ensure!(ticket.try_result().is_none() && store.report().admission.batches == 1, "a held owner was reported durable or released custody");
+            let waiting_store = store.clone();
+            let waiting_ticket = ticket.clone();
+            let pending = crate::rt::block_on(async move {
+                match waiting_ticket.wait_until(Instant::now()).await {
+                    Err(_elapsed) => {}
+                    Ok(Ok(committed)) => anyhow::bail!("the held batch produced a durable receipt before release: {committed:?}"),
+                    Ok(Err(cause)) => anyhow::bail!("the held batch answered before release: {cause}"),
+                }
+                let mut pending = PendingSubmission::new(refused.input);
+                let mut waiting = Box::pin(waiting_store.admit_until(&mut pending, Instant::now() + READ_WAIT));
+                anyhow::ensure!(futures::poll!(waiting.as_mut()).is_pending(), "full store did not hold admission");
+                drop(waiting);
+                anyhow::ensure!(pending.input().is_some() && pending.ticket().is_none(), "cancelling room wait consumed the input");
+                Ok(pending)
+            })?;
+            anyhow::ensure!(pending.into_input().is_some(), "caller could not recover unadmitted input");
+            drop(ticket);
+            anyhow::ensure!(store.report().admission.batches == 1, "dropping the final caller ticket cancelled applying input");
+            release_tx.send(())?;
+            held.join().map_err(|_| anyhow::anyhow!("held owner thread failed"))??;
+            store.sync()?;
+            anyhow::ensure!(store.report().admission.batches == 0 && store.kept("s", 10)?.is_some_and(|kept| kept.events.len() == 1), "durable completion did not release input or retain the event");
             Ok(())
-        }));
-        entered_rx.recv_timeout(READ_WAIT)?;
-        let batch = Batch::from_update("s", &said("m1", 1, "retained"), 1)?.ok_or_else(|| anyhow::anyhow!("missing projection"))?;
-        let ticket = store.try_admit(batch).map_err(|e| anyhow::anyhow!("{:?}", e.reason))?;
-        let next = Batch::from_update("later", &said("m2", 2, "caller owns this"), 2)?.ok_or_else(|| anyhow::anyhow!("missing later projection"))?;
-        let refused = store.try_admit(next).err().ok_or_else(|| anyhow::anyhow!("the applying batch released its count reservation"))?;
-        anyhow::ensure!(matches!(refused.reason, AdmissionRefusal::Full { .. }) && refused.input.session() == "later", "typed Full did not return its input");
-        anyhow::ensure!(ticket.try_result().is_none() && store.report().admission.batches == 1, "a held owner was reported durable or released custody");
-        let waiting_store = store.clone();
-        let waiting_ticket = ticket.clone();
-        let pending = crate::rt::block_on(async move {
-            anyhow::ensure!(waiting_ticket.wait_until(Instant::now()).await.is_err(), "a receipt wait timeout manufactured success");
-            let mut pending = PendingSubmission::new(refused.input);
-            let mut waiting = Box::pin(waiting_store.admit_until(&mut pending, Instant::now() + READ_WAIT));
-            anyhow::ensure!(futures::poll!(waiting.as_mut()).is_pending(), "full store did not hold admission");
-            drop(waiting);
-            anyhow::ensure!(pending.input().is_some() && pending.ticket().is_none(), "cancelling room wait consumed the input");
-            Ok(pending)
-        })?;
-        anyhow::ensure!(pending.into_input().is_some(), "caller could not recover unadmitted input");
-        drop(ticket);
-        anyhow::ensure!(store.report().admission.batches == 1, "dropping the final caller ticket cancelled applying input");
-        release_tx.send(())?;
-        held.join().map_err(|_| anyhow::anyhow!("held owner thread failed"))??;
-        store.sync()?;
-        anyhow::ensure!(store.report().admission.batches == 0 && store.kept("s", 10)?.is_some_and(|kept| kept.events.len() == 1), "durable completion did not release input or retain the event");
-        Ok(())
+        })
     }
 
     #[test]

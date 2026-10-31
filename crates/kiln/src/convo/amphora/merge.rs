@@ -63,7 +63,7 @@ impl Session<'_, '_> {
     }
     /// The caller's transaction fences source identity and cursor before calling this method.
     /// A collision rolls back this archive, every projection in the page, and its cursor.
-    pub(super) fn merge_legacy(&mut self, source: &str, table: &str, row: PreparedLegacy) -> anyhow::Result<()> {
+    pub(super) fn merge_legacy(&mut self, source: &str, table: &str, row: PreparedLegacy, mutations: &mut super::super::retention::Mutations) -> anyhow::Result<()> {
         let PreparedLegacy {id,values,archived,markers,epoch}=row;
         for marker in markers {segments::validate(self.conn,&marker)?;}
         let (session,item,number,source_rev)=match table {
@@ -90,7 +90,7 @@ impl Session<'_, '_> {
         match table {
             "sessions"=>self.merge_session(source,values),
             "events"=>self.merge_event(source,values,epoch),
-            "records"=>self.merge_record(source,values,epoch),
+            "records"=>self.merge_record(source,values,epoch,mutations),
             "drops"=>{
                 // Historical resets are source-local evidence, never destructive commands
                 // against rows imported from an independent authority or revision space.
@@ -136,7 +136,7 @@ impl Session<'_, '_> {
         let line=self.line(session,source,n,value)?;
         Ok((u64::try_from(line.len())?,Sha256::digest(line.as_bytes()).to_vec()))
     }
-    fn merge_record(&mut self, source: &str, values: Vec<Value>, epoch: u64) -> anyhow::Result<()> {
+    fn merge_record(&mut self, source: &str, values: Vec<Value>, epoch: u64, mutations: &mut super::super::retention::Mutations) -> anyhow::Result<()> {
         let values=if values.len()==3 {
             vec![value(&values,0)?.clone(),txt("legacy"),value(&values,1)?.clone(),int(0),value(&values,2)?.clone(),int(0)]
         } else {values};
@@ -150,7 +150,9 @@ impl Session<'_, '_> {
             self.check_legacy_duplicate(super::reset::LegacyKey {source,table:"records",session:&session,item:&record_source,n,at:None,epoch})?;
             if end>get::<u64>(&prior,0)? {
                 let rev=self.merge_next_rev()?;
+                let accepted=u64::from_sql(&rev)?;
                 self.conn.execute("UPDATE convo_records SET line_end=?4,rev=?5 WHERE session=?1 AND source=?2 AND n=?3",vec![txt(&session),txt(&record_source),checked_revision(n)?,checked_revision(end)?,rev])?;
+                mutations.record(&session,&record_source,n,accepted,false)?;
             }
             return Ok(());
         }
@@ -163,6 +165,7 @@ impl Session<'_, '_> {
         let rec=super::super::rows::RecordRow {session,source:record_source,n,end,line,kept};
         let rev=u64::from_sql(&self.merge_next_rev()?)?;
         anyhow::ensure!(self.write_record(&rec,rev)?,"new legacy transcript did not insert");
+        mutations.record(&rec.session,&rec.source,rec.n,rev,false)?;
         Ok(())
     }
     fn merge_session(&mut self, source: &str, mut incoming: Vec<Value>) -> anyhow::Result<()> {
@@ -207,6 +210,7 @@ impl Session<'_, '_> {
         let mut merged=merged;
         *merged.get_mut(8).ok_or_else(||anyhow::anyhow!("missing session revision"))?=self.merge_next_rev()?;
         self.conn.execute("INSERT INTO convo_sessions(id,info,meta,state,changes,updated_at,closed_at,epoch,rev,machine) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(id) DO UPDATE SET info=excluded.info,meta=excluded.meta,state=excluded.state,changes=excluded.changes,updated_at=excluded.updated_at,closed_at=excluded.closed_at,epoch=excluded.epoch,rev=excluded.rev,machine=excluded.machine",merged)?;
+        super::super::retention::projection(self.conn,&id,self.rev,false,"adopted")?;
         Ok(())
     }
 }

@@ -48,6 +48,28 @@ impl std::fmt::Debug for Store {
 
 struct Inner { database: Database, path: Option<PathBuf> }
 
+/// Retains the actual Store and original Amphora owner through destructive
+/// maintenance. No deserializer, pathname, bootstrap marker or physical PID can
+/// create this capability; only the writer's positive durable floor barrier can.
+pub(crate) struct StoreWriterBoundary { store: Store, boundary: amphora::database::WriterBoundary }
+impl std::fmt::Debug for StoreWriterBoundary {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {
+        f.debug_struct("StoreWriterBoundary").field("version",&self.version()).finish_non_exhaustive()
+    }
+}
+#[derive(Debug,thiserror::Error)]
+#[error("conversation maintenance requires the original standalone Store writer; this owner mode is unsupported")]
+pub(crate) struct UnsupportedStoreWriterBoundary;
+impl StoreWriterBoundary {
+    pub(crate) fn require_store(&self,store:&Store)->anyhow::Result<()> {
+        self.boundary.require(&self.store.inner.database)?;
+        self.boundary.require(&store.inner.database)?;
+        Ok(())
+    }
+    pub(crate) fn version(&self)->u32 { self.boundary.version() }
+}
+
+
 // U05: every host opener shares one product writer, including offline helpers and Records.
 static OPEN: OnceLock<Mutex<HashMap<PathBuf, Weak<Inner>>>> = OnceLock::new();
 
@@ -366,11 +388,12 @@ impl Store {
     }
 
     fn from_database_at(database:Database,path:Option<PathBuf>)->anyhow::Result<Self> {
+        let database=database.for_application("kiln.host-store",migrations::SCHEMA_EPOCH)?;
         Self::initialize(&database)?;
         Ok(Self { inner: Arc::new(Inner { database, path }), #[cfg(test)] inline: false })
     }
 
-    fn initialize(database: &Database) -> anyhow::Result<()> {
+    pub(crate) fn initialize(database: &Database) -> anyhow::Result<()> {
         migrations::initialize(database, SCHEMA).context("initialize store schema")
     }
 
@@ -382,6 +405,29 @@ impl Store {
 
     /// The single product database, shared by SQL, Records, sessions and conversation feeds.
     pub fn database(&self) -> Database { self.inner.database.clone() }
+
+    pub(crate) fn require_same_database(&self,other:&Store)->anyhow::Result<()> {
+        self.inner.database.require_same_application(&other.inner.database)?;
+        Ok(())
+    }
+
+    /// U05: the actual original standalone SQL writer durably fences older
+    /// application attachments. Neither opening the Store nor an OS lease alone
+    /// constructs this boundary. No Session/provider physical authority follows.
+    pub(crate) fn writer_boundary(&self,required:u32)->anyhow::Result<StoreWriterBoundary> {
+        anyhow::ensure!(required<=migrations::SCHEMA_EPOCH,"this Store does not implement the required writer contract");
+        let boundary=match self.inner.database.writer_floor("kiln.host-store",required,deadline()) {
+            Ok(boundary)=>boundary,
+            // Classify only the SDK's exact owner-mode refusal, not arbitrary
+            // Invalid, schema/identity errors, deadlines or unknown outcomes.
+            Err(amphora_api::Refusal::Invalid {what,why}) if what=="writer boundary" && why=="original standalone non-restoring owner required"=>return Err(UnsupportedStoreWriterBoundary.into()),
+            Err(error)=>return Err(error.into()),
+        };
+        // The app tag/compiled constant is not a migration receipt. Observe the
+        // actual numbered schema through this same now-fenced durable writer.
+        self.inner.database.call(deadline(),move |conn|migrations::require_installed(conn,required))?;
+        Ok(StoreWriterBoundary{store:self.clone(),boundary})
+    }
 
     /// A fresh product database for tests; it executes the same schema and numbered migrations.
     pub fn in_memory() -> anyhow::Result<Self> {

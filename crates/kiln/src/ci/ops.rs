@@ -453,13 +453,23 @@ pub fn ops() -> &'static [Op] {
                 input: Input::of::<input::CiDiffsReply>(),
                 route: Routes(vec![Definition::new("POST", &[Part::Literal("api"), Part::Literal("diffs"), Part::Field("diff"), Part::Literal("comments")], &[], "diffs.review", ScopeAt::Diff(2)).named_only()]),
                 run: |cx: Cx, v: Value| async move { let d = text(&v, "diff")?; diffs(&cx, Method::POST, &["diffs", d.as_str(), "comments"], &HashMap::new(), &v).await }),
-            op!("ci.diffs.resolve", "Resolve a comment's thread, or open it again.", base: "", ro: false, destructive: false,
-                input: Input::of::<input::CiDiffsResolve>(),
+            // U13/W26-R11: a public edit preserves absent state; only named resolve defaults it.
+            op!("ci.diffs.edit", "Edit a comment or its thread: text, suggestion, kind, state, or an owner's resolution reason.", base: "", ro: false, destructive: false,
+                input: Input::of::<input::CiDiffsEdit>(),
                 route: Routes(vec![Definition::new("PATCH", &[Part::Literal("api"), Part::Literal("comments"), Part::Field("comment")], &[], "diffs.review", ScopeAt::Comment(2))]),
                 run: |cx: Cx, v: Value| async move {
                     let c = text(&v, "comment")?;
-                    let state = v.get("state").and_then(Value::as_str).unwrap_or("resolved");
-                    diffs(&cx, Method::PATCH, &["comments", c.as_str()], &HashMap::new(), &json!({ "state": state })).await
+                    diffs(&cx, Method::PATCH, &["comments", c.as_str()], &HashMap::new(), &v).await
+                }),
+            op!("ci.diffs.resolve", "Resolve a comment's thread (the default), or open it again; an owner resolving another author's blocking thread says why.", base: "", ro: false, destructive: false,
+                input: Input::of::<input::CiDiffsEdit>(),
+                route: Routes(vec![Definition::new("PATCH", &[Part::Literal("api"), Part::Literal("comments"), Part::Field("comment")], &[], "diffs.review", ScopeAt::Comment(2)).named_only()]),
+                run: |cx: Cx, mut v: Value| async move {
+                    let c = text(&v, "comment")?;
+                    if v.get("state").is_none_or(Value::is_null) {
+                        v.as_object_mut().ok_or_else(|| bad("the input is a JSON object"))?.insert("state".into(), json!("resolved"));
+                    }
+                    diffs(&cx, Method::PATCH, &["comments", c.as_str()], &HashMap::new(), &v).await
                 }),
             op!("ci.diffs.review", "Review a diff: accept, request changes, comment, or resign; publishes your draft comments.", base: "", ro: false, destructive: false,
                 input: Input::of::<input::CiDiffsReview>(),
@@ -1726,10 +1736,18 @@ pub mod input {
 
     #[derive(Debug, Deserialize, JsonSchema)]
     #[serde(deny_unknown_fields)]
-    pub struct CiDiffsResolve {
-        /// The thread's first comment's id.
+    pub struct CiDiffsEdit {
+        /// The comment's id; thread changes apply to its thread.
         pub comment: String,
+        /// A comment's author (or an owner) edits its text and suggestion.
+        pub body: Option<String>,
+        pub suggestion: Option<String>,
+        /// Only the thread's author changes its kind.
+        pub kind: Option<CiDiffsCommentKind>,
+        /// Leave out to preserve it; named `ci.diffs.resolve` defaults to `resolved`.
         pub state: Option<CiDiffsResolveState>,
+        /// An owner resolving another author's blocking thread says why; the reason is kept.
+        pub reason: Option<String>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]

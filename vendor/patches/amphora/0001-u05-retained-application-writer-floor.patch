@@ -1,0 +1,632 @@
+Subject: U05: retained application writer floor
+Why: The original database lease excludes a second engine, while already-open older attachments and replicated mode transitions need a serialized application contract fence before destructive maintenance
+
+diff --git a/crates/amphora/src/database.rs b/crates/amphora/src/database.rs
+index cf43c2ddc2bb86e90845652cec90647f8df13050..1b6ee608c6d4d0bc425770de64e39c32bc2ad560 100644
+--- a/crates/amphora/src/database.rs
++++ b/crates/amphora/src/database.rs
+@@ -25,6 +25,13 @@ use amphora_engine_parser::{
+ use crate::db::Db;
+ use crate::store::{self, Checkpointed, Engine, Flush, Opener, Store};
+-
++
++mod application;
++pub use application::WriterBoundary;
++pub(crate) use application::Application;
++
++pub(crate) fn require_replication(db: &Db) -> anyhow::Result<()> {
++    application::require_replication(db)
++}
+ pub(crate) mod compaction;
+ mod import;
+ pub(crate) mod remote;
+@@ -40,7 +47,8 @@ CREATE TABLE IF NOT EXISTS __amphora_namespaces (name TEXT PRIMARY KEY, head INT
+ CREATE TABLE IF NOT EXISTS __amphora_versions (namespace TEXT NOT NULL, family TEXT NOT NULL, key BLOB NOT NULL, rev INTEGER NOT NULL, seq INTEGER NOT NULL, value BLOB, PRIMARY KEY(namespace, family, key, rev));
+ CREATE INDEX IF NOT EXISTS __amphora_feed ON __amphora_versions(namespace, family, rev, seq);
+ CREATE TABLE IF NOT EXISTS __amphora_families (namespace TEXT NOT NULL, family TEXT NOT NULL, newest INTEGER NOT NULL, PRIMARY KEY(namespace, family));
+-CREATE TABLE IF NOT EXISTS __amphora_migrations (name TEXT PRIMARY KEY, sql TEXT NOT NULL);";
++CREATE TABLE IF NOT EXISTS __amphora_migrations (name TEXT PRIMARY KEY, sql TEXT NOT NULL);
++CREATE TABLE IF NOT EXISTS __amphora_application_floor (singleton INTEGER PRIMARY KEY CHECK(singleton=1), application TEXT NOT NULL, version INTEGER NOT NULL CHECK(version>0));";
+ const LIVE_MAX: u64 = 10_000_000;
+ const QUEUED_BYTES: usize = 512 << 20;
+ struct Admission(Arc<AtomicUsize>);
+@@ -66,6 +74,7 @@ impl Drop for Admission {
+ #[derive(Clone)]
+ pub struct Database {
+     shared: Arc<Shared>,
++    application: Option<Application>,
+ }
+-
++
+ struct Shared {
+@@ -156,6 +165,7 @@ enum Answer {
+ type Reply = Arc<Mutex<Option<Result<Answer, Refusal>>>>;
+ struct Command {
+     namespace: String,
++    application: Option<Application>,
+     operation: Operation,
+     answer: Reply,
+     publication: Arc<Mutex<Option<BTreeMap<String, Published>>>>,
+@@ -398,7 +408,7 @@ impl Database {
+                         match remote::validate(&backend.client, replica, until) {
+                             Ok(_) => {
+                                 backend.configure(replica)?;
+-                                return Ok(Self { shared });
++                                return Ok(Self { shared, application: None });
+                             }
+                             // Identity probes cannot submit application work. Only a successful
+                             // OS lease below permits starting the predecessor's replacement.
+@@ -426,9 +436,9 @@ impl Database {
+                                 ));
+                             }
+                         }
+-                        return Ok(Self { shared });
++                        return Ok(Self { shared, application: None });
+                     } else {
+-                        return Ok(Self { shared });
++                        return Ok(Self { shared, application: None });
+                     }
+                 }
+                 // Store shutdown is asynchronous. Its engine/readers/flusher still retain the
+@@ -524,6 +534,7 @@ impl Database {
+                     until,
+                 )?;
+                 Ok(Self {
++                    application: None,
+                     shared: Arc::new(Shared {
+                         transport: Mutex::new(None),
+                         path: OnceLock::new(),
+@@ -596,6 +607,7 @@ impl Database {
+         let changed = Changed::default();
+         *locked(&changed.published)? = read_published(&db)?;
+         let database = Self {
++            application: None,
+             shared: Arc::new(Shared {
+                 transport: Mutex::new(None),
+                 path: OnceLock::new(),
+@@ -723,7 +735,7 @@ impl Database {
+             }
+             Writer::Local(store) => store,
+             Writer::Client(backend) => {
+-                return remote::submit(&backend.client, namespace, operation, until);
++                return remote::submit(&backend.client.for_application(self.application.clone()), namespace, operation, until);
+             }
+         };
+         let admission = Admission::reserve(&self.shared.admitted)?;
+@@ -760,6 +772,7 @@ impl Database {
+             .put_then(
+                 vec![Command {
+                     namespace: namespace.to_owned(),
++                    application: self.application.clone(),
+                     operation,
+                     answer: Arc::clone(&answer),
+                     publication: Arc::clone(&publication),
+@@ -1095,6 +1108,10 @@ impl Engine for Local {
+         }) {
+             for row in rows {
+                 if let Operation::Mutation(Mutation::CompactStep { before, .. }) = &row.operation {
++                    if let Err(error) = application::check(&self.db, row.application.as_ref(), &row.operation) {
++                        *locked(&row.answer)? = Some(Err(refused(&error)));
++                        continue;
++                    }
+                     let result = compaction::local(
+                         &mut self.db,
+                         &row.namespace,
+@@ -1113,6 +1130,7 @@ impl Engine for Local {
+                             return Err(Refusal::Timeout.into());
+                         }
+                         let _deadline = db.deadline(row.until);
++                        application::check(db, row.application.as_ref(), &row.operation)?;
+                         if !restoring && restore::incomplete(db)? {
+                             return Err(api::invalid("database", "restore is incomplete").into());
+                         }
+@@ -1147,6 +1165,7 @@ impl Engine for Local {
+                         return Err(Refusal::Timeout.into());
+                     }
+                     let _deadline = db.deadline(r.until);
++                    application::check(db, r.application.as_ref(), &r.operation)?;
+                     let result = apply(db, &r.namespace, &r.operation);
+                     if result.is_err() && Instant::now() >= r.until {
+                         return Err(Refusal::Timeout.into());
+diff --git a/crates/amphora/src/database/application.rs b/crates/amphora/src/database/application.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..8e241dd227ac364bca8b6a55b895e8d3d238e7d0
+--- /dev/null
++++ b/crates/amphora/src/database/application.rs
+@@ -0,0 +1,133 @@
++//! Retained application writer boundary on the existing standalone owner (U05).
++//! The database lease excludes another engine, while this floor also fences old
++//! attached application writers at the actual serialized transaction boundary.
++
++use super::*;
++use serde::{Deserialize, Serialize};
++
++#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
++pub(crate) struct Application {
++    pub(crate) name: String,
++    pub(crate) version: u32,
++}
++impl Application {
++    pub(crate) fn validate(&self) -> Result<(), Refusal> {
++        api::family(&self.name)?;
++        api::bound("application identity", self.name.len(), 128)?;
++        if self.version == 0 {
++            return Err(api::invalid("application contract", "zero version"));
++        }
++        Ok(())
++    }
++}
++
++/// An actual successful floor barrier, not deserialized metadata or an attachment
++/// claiming it holds the original owner. Keeping this value retains that owner,
++/// its engine and its original lease through the caller's maintenance lifetime.
++pub struct WriterBoundary {
++    database: Database,
++    floor: Application,
++}
++impl WriterBoundary {
++    /// Identity only. The same owner's writer rechecks the persisted floor inside
++    /// every application transaction, including queued pre-floor requests.
++    pub fn require(&self, database: &Database) -> Result<(), Refusal> {
++        if !Arc::ptr_eq(&self.database.shared, &database.shared)
++            || database.application.as_ref() != self.database.application.as_ref()
++        {
++            return Err(api::invalid("writer boundary", "different original owner or application"));
++        }
++        Ok(())
++    }
++    pub fn version(&self) -> u32 { self.floor.version }
++}
++
++impl Database {
++    /// Identity comparison only; this does not establish a writer floor.
++    pub fn require_same_application(&self, other:&Self)->Result<(),Refusal> {
++        if !Arc::ptr_eq(&self.shared,&other.shared) || self.application!=other.application {
++            return Err(api::invalid("application database identity","different retained database or application"));
++        }
++        Ok(())
++    }
++    /// Bind a handle and all namespaces it creates to this application's format.
++    /// No floor is installed and no authority is created by this declaration.
++    pub fn for_application(&self, name: &str, version: u32) -> Result<Self, Refusal> {
++        let application = Application { name: name.into(), version };
++        application.validate()?;
++        let mut selected = self.clone();
++        selected.application = Some(application);
++        Ok(selected)
++    }
++
++    /// Install/observe the monotonic contract in the SAME original local writer.
++    /// Return only after its normal durable callback. A failed/unknown callback
++    /// yields no boundary. Replication and remote-owner takeover need their own
++    /// application-floor proof and are deliberately not certified by this API.
++    pub fn writer_floor(&self, name: &str, required: u32, until: Instant) -> Result<WriterBoundary, Refusal> {
++        if !matches!(&self.shared.writer, Writer::Local(_))
++            || self.shared.restoring.load(Ordering::Acquire)
++        {
++            return Err(api::invalid("writer boundary", "original standalone non-restoring owner required"));
++        }
++        let database = self.clone();
++        let application = database.application.clone()
++            .ok_or_else(|| api::invalid("writer boundary", "application-bound handle required"))?;
++        application.validate()?;
++        if application.name != name || required == 0 || required > application.version {
++            return Err(api::invalid("writer boundary", "requested contract exceeds this application"));
++        }
++        let wanted = Application { name: name.into(), version: required };
++        let floor = database.call_db(until, move |db| {
++            let current = policy(db)?;
++            if let Some(current) = &current {
++                anyhow::ensure!(current.name == wanted.name, "another application's writer floor is installed");
++            }
++            let version = current.as_ref().map_or(wanted.version, |current| current.version.max(wanted.version));
++            db.query("INSERT INTO __amphora_application_floor(singleton, application, version) VALUES(1, ?1, ?2) ON CONFLICT(singleton) DO UPDATE SET version=excluded.version",
++                [text(&wanted.name), EValue::from_i64(i64::from(version))], |_| Ok(true))?;
++            Ok(Application { name: wanted.name, version })
++        })?;
++        Ok(WriterBoundary { database, floor })
++    }
++}
++
++fn policy(db: &Db) -> anyhow::Result<Option<Application>> {
++    let mut value = None;
++    db.query("SELECT application, version FROM __amphora_application_floor WHERE singleton=1", [], |row| {
++        anyhow::ensure!(value.is_none(), "duplicate application writer floor");
++        value = Some(Application {
++            name: row.get::<String>(0).map_err(unavailable)?,
++            version: u32::try_from(row.get::<i64>(1).map_err(unavailable)?)?,
++        });
++        Ok(true)
++    })?;
++    if let Some(value) = &value { value.validate()?; }
++    Ok(value)
++}
++
++pub(super) fn check(db: &Db, claim: Option<&Application>, operation: &Operation) -> anyhow::Result<()> {
++    // The owner's initial durability barrier has no SQL or product effect and
++    // must run before open returns an application-bindable handle.
++    if matches!(operation, Operation::Mutation(Mutation::Sql(statements)) if statements.is_empty()) {
++        return Ok(());
++    }
++    let Some(floor) = policy(db)? else { return Ok(()) };
++    let claim = claim.ok_or_else(|| Refusal::Fenced("application writer contract required".into()))?;
++    claim.validate()?;
++    if claim.name != floor.name || claim.version < floor.version {
++        return Err(Refusal::Fenced("application writer contract is older than the installed floor".into()).into());
++    }
++    Ok(())
++}
++
++// No member-proven application claim is carried by resolved Raft pages yet.
++// Never turn a standalone floor into permission for untracked replicated writes.
++pub(super) fn require_replication(db: &Db) -> anyhow::Result<()> {
++    let mut present = false;
++    db.query("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='__amphora_application_floor'", [], |_| { present = true; Ok(false) })?;
++    if present && policy(db)?.is_some() {
++        return Err(Refusal::Fenced("application writer floor requires a member-proven replication contract".into()).into());
++    }
++    Ok(())
++}
+diff --git a/crates/amphora/src/database/remote.rs b/crates/amphora/src/database/remote.rs
+index e401de37ed9e4493ddd01d03de424f787e69063e..e03f93937374d3c903365e687b0a15794283edc6 100644
+--- a/crates/amphora/src/database/remote.rs
++++ b/crates/amphora/src/database/remote.rs
+@@ -84,7 +84,7 @@ pub(super) fn publish(database: &Database, path: &Path) -> Result<(), Refusal> {
+     if service.is_none() {
+         let weak = Arc::downgrade(&database.shared);
+         *service = Some(crate::transport::Owner::start(path, move || {
+-            weak.upgrade().map(|shared| Database { shared })
++            weak.upgrade().map(|shared| Database { shared, application: None })
+         })?);
+     }
+     Ok(())
+@@ -104,6 +104,7 @@ pub(super) fn attach(
+             .map(|(path, config)| (PathBuf::from(path), config)),
+     };
+     Ok(Database {
++        application: None,
+         shared: Arc::new(Shared {
+             transport: Mutex::new(None),
+             path: OnceLock::new(),
+@@ -217,7 +218,7 @@ impl Database {
+                     Writer::Client(backend) => match validate(&backend.client, expected, until) {
+                         Ok(_) => {
+                             backend.configure(expected)?;
+-                            return Ok(Some(Self { shared }));
++                            return Ok(Some(Self { shared, application: None }));
+                         }
+                         Err(
+                             Refusal::Unavailable(_) | Refusal::Timeout | Refusal::UnknownOutcome,
+@@ -229,7 +230,7 @@ impl Database {
+                         config: current,
+                         ..
+                     } if log_path == &log && current == &config => {
+-                        return Ok(Some(Self { shared }));
++                        return Ok(Some(Self { shared, application: None }));
+                     }
+                     _ => {
+                         return Err(api::invalid(
+@@ -261,10 +262,12 @@ impl Database {
+     }
+-
++
+     pub(super) fn resolve(&self, until: Instant) -> Result<Database, Refusal> {
+-        match &self.shared.writer {
++        let mut database = match &self.shared.writer {
+             Writer::Client(backend) => backend.resolve(until),
+             _ => Ok(self.clone()),
+-        }
++        }?;
++        database.application = self.application.clone();
++        Ok(database)
+     }
+     /// Selects the current host owner before carrying replication messages. A standby returns
+     /// None; after its predecessor releases ownership this handle starts the same configured
+@@ -303,9 +306,9 @@ impl Database {
+             replica,
+         })
+     }
+-    pub(super) fn remote_client(&self) -> Option<&crate::transport::Client> {
++    pub(super) fn remote_client(&self) -> Option<crate::transport::Client> {
+         match &self.shared.writer {
+-            Writer::Client(backend) => Some(&backend.client),
++            Writer::Client(backend) => Some(backend.client.for_application(self.application.clone())),
+             _ => None,
+         }
+     }
+diff --git a/crates/amphora/src/db.rs b/crates/amphora/src/db.rs
+index 8c1427a938dc40fb059fdaf13f447401e61ed891..73d4271207b45436e3fda201fc298714745fcc50 100644
+--- a/crates/amphora/src/db.rs
++++ b/crates/amphora/src/db.rs
+@@ -935,6 +935,23 @@ mod tests {
+                 .query("SELECT value FROM original", [], |_| Ok(false))
+                 .is_err()
+         );
++        // U05: an old member's floor-bearing image is not a writer-floor
++        // receipt. Refusal must roll back its catalog before any apply marker.
++        crate::database::bootstrap_db(&source).unwrap();
++        source.exec("INSERT INTO __amphora_application_floor VALUES(1, 'kiln.host-store', 6)").unwrap();
++        source.flusher()().unwrap();
++        let floor_image = postcard::to_allocvec(&source.image_pages(1 << 20).unwrap()).unwrap();
++        let replica_path = dir.path().join("replica.db");
++        let mut replica = crate::replication::Machine::open(&replica_path, hyper_raft::proto::ConfState::default()).unwrap();
++        let accepted = hyper_durable::Point { index: 1, term: 1 };
++        hyper_durable::StateMachine::install(&mut replica, &postcard::to_allocvec(&image).unwrap(), accepted, &hyper_raft::proto::ConfState::default()).unwrap();
++        assert!(hyper_durable::StateMachine::install(&mut replica, &floor_image, hyper_durable::Point { index: 2, term: 1 }, &hyper_raft::proto::ConfState::default()).is_err());
++        assert_eq!(hyper_durable::StateMachine::durable(&replica), accepted);
++        assert_eq!(replica.read(|db| Ok(db.query_row("SELECT value FROM replacement", [], |row| row.get::<_, String>(0))?)).unwrap(), "seed");
++        assert_eq!(replica.read(|db| Ok(db.query_row("SELECT count(*) FROM sqlite_schema WHERE name='__amphora_application_floor'", [], |row| row.get::<_, i64>(0))?)).unwrap(), 0);
++        drop(source);
++        let refusal = crate::replication::Machine::open(&dir.path().join("source.db"), hyper_raft::proto::ConfState::default()).err().unwrap();
++        assert!(matches!(refusal, amphora_api::Refusal::Fenced(reason) if reason == "application writer floor requires a member-proven replication contract"));
+     }
+-
++
+     /// U05/U15: an expired SQL VM is interrupted and the guard clears before rollback,
+diff --git a/crates/amphora/src/replication.rs b/crates/amphora/src/replication.rs
+index 8c5f2db411a0e4a8b01a0ced15f8d0d27d42427d..4806b329ac2c685acb3e3a5fb725513500f07655 100644
+--- a/crates/amphora/src/replication.rs
++++ b/crates/amphora/src/replication.rs
+@@ -165,6 +165,8 @@ impl Machine {
+         }
+         let mut db = Db::open(path).map_err(unavailable)?;
+         db.hold_owner(std::sync::Arc::clone(&owner));
++        // Check before retaining a baseline image or writing a replica marker.
++        crate::database::require_replication(&db).map_err(|e| crate::database::refused(&e))?;
+         let mut marked = false;
+         db.query(
+             "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = '__amphora_replica'",
+@@ -260,9 +262,11 @@ impl Machine {
+         self.baseline.source()
+     }
+     pub(crate) fn prepare_bootstrap(&self, entry_room: usize) -> Result<Option<Vec<u8>>, Refusal> {
++        crate::database::require_replication(&self.db).map_err(|e| crate::database::refused(&e))?;
+         self.baseline.proposal(entry_room)
+     }
+     fn require_baseline(&self) -> Result<(), Refusal> {
++        crate::database::require_replication(&self.db).map_err(|e| crate::database::refused(&e))?;
+         if self.baseline.pending() {
+             return Err(api::invalid(
+                 "replica baseline",
+@@ -279,7 +283,12 @@ impl Machine {
+         self.require_baseline()?;
+         let (answer, pages) = self
+             .db
+-            .prepare_pages(COMMAND_BYTES, f)
++            .prepare_pages(COMMAND_BYTES, |db| {
++                crate::database::require_replication(db)?;
++                let answer = f(db)?;
++                crate::database::require_replication(db)?;
++                Ok(answer)
++            })
+             .map_err(|e| crate::database::refused(&e))?;
+         validate_pages(&pages, COMMAND_BYTES)?;
+         Ok((
+@@ -307,6 +316,7 @@ impl Machine {
+         let (answer, image) = compaction::retry(|visits| {
+             let result = self.db.compaction_attempt(pages, true, |db| {
+                 let _deadline = db.deadline(until);
++                crate::database::require_replication(db)?;
+                 compaction::ready(db, namespace, until, false)?;
+                 compaction::step(db, namespace, before, visits)
+             });
+@@ -352,6 +362,7 @@ impl Machine {
+                 let mut connection = crate::sql::Connection::new(db);
+                 let value = f(&mut connection)?;
+                 connection.finish()?;
++                crate::database::require_replication(db)?;
+                 Ok(value)
+             })
+             .map_err(|e| crate::database::refused(&e))?;
+@@ -379,6 +390,7 @@ impl Machine {
+                 let mut connection = crate::sql::Connection::new(db);
+                 let value = f(&mut connection)?;
+                 connection.finish()?;
++                crate::database::require_replication(db)?;
+                 Ok(value)
+             })
+             .map_err(|e| crate::database::refused(&e))?;
+@@ -397,8 +409,15 @@ impl Machine {
+         pages: &[(u32, Vec<u8>)],
+         configuration: &ConfState,
+     ) -> Result<(), Fatal> {
++        crate::database::require_replication(&self.db).map_err(failed)?;
+         self.db
+-            .apply_pages(pages, |db| marker(db, at, configuration))
++            .apply_pages(pages, |db| {
++                // Pages from an older member carry no trustworthy application claim.
++                // This callback is inside the unpublished-page transaction: refusal
++                // rolls the image back before its applied marker can commit.
++                crate::database::require_replication(db)?;
++                marker(db, at, configuration)
++            })
+             .map_err(failed)?;
+         self.db.flusher()().map_err(failed)?;
+         self.point = at;
+@@ -411,6 +430,7 @@ impl StateMachine for Machine {
+     type Answer = Applied;
+-
++
+     fn apply(&mut self, entry: &EntryRef<'_>, answers: &mut Vec<Applied>) -> Result<(), Fatal> {
++        crate::database::require_replication(&self.db).map_err(failed)?;
+         if entry.index <= self.point.index {
+             return Err(failed("a committed entry was applied twice"));
+         }
+@@ -422,6 +442,7 @@ impl StateMachine for Machine {
+             && self
+                 .baseline
+                 .apply_seed(&mut self.db, entry.data, |db| {
++                    crate::database::require_replication(db)?;
+                     crate::database::bootstrap_db(db)?;
+                     db.exec(META)?;
+                     marker(db, at, &self.configuration)
+@@ -511,6 +532,7 @@ impl StateMachine for Machine {
+         None
+     }
+     fn install(&mut self, image: &[u8], at: Point, configuration: &ConfState) -> Result<(), Fatal> {
++        crate::database::require_replication(&self.db).map_err(failed)?;
+         api::bound(
+             "snapshot",
+             image.len(),
+@@ -536,6 +558,7 @@ impl StateMachine for Machine {
+         }
+         self.db
+             .apply_pages(&pages, |db| {
++                crate::database::require_replication(db)?;
+                 db.exec(META)?;
+                 marker(db, at, configuration)?;
+                 self.baseline.completed_marker(db)
+diff --git a/crates/amphora/src/transport/common.rs b/crates/amphora/src/transport/common.rs
+index 7b248bae44b7419308b18a758576c56a4d55c123..8c9943f0c62c01c57af5a2fad8f9e007e8c1181b 100644
+--- a/crates/amphora/src/transport/common.rs
++++ b/crates/amphora/src/transport/common.rs
+@@ -275,12 +275,14 @@ impl Drop for Owner {
+ #[derive(Clone)]
+ pub struct Client {
+     pub(super) path: PathBuf,
++    application: Option<crate::database::Application>,
+ }
+ impl Client {
+     pub fn connect(path: &Path, until: Instant) -> Result<Self, Refusal> {
+         remaining(until)?;
+         let client = Self {
+             path: path.canonicalize().map_err(unavailable)?,
++            application: None,
+         };
+         // Authenticate now, without creating a writer session or replaying any command.
+         let mut stream = client.stream(until)?;
+@@ -292,6 +294,11 @@ impl Client {
+         }
+         Ok(client)
+     }
++    pub(crate) fn for_application(&self, application: Option<crate::database::Application>) -> Self {
++        let mut client = self.clone();
++        client.application = application;
++        client
++    }
+     pub(super) fn stream(&self, until: Instant) -> Result<Stream, Refusal> {
+         remaining(until)?;
+         let auth_until = until.min(
+@@ -313,9 +320,18 @@ impl Client {
+         let proof = auth::proof(&token, false, &hello, &challenge.nonce)?;
+         write_auth(&mut stream, &proof, auth_until)?;
+         match read_limit::<Response>(&mut stream, auth_until, 256)?? {
+-            Answer::Ready => Ok(stream),
+-            _ => Err(unavailable("unexpected owner greeting")),
++            Answer::Ready => (),
++            _ => return Err(unavailable("unexpected owner greeting")),
+         }
++        if let Some(application) = &self.application {
++            application.validate()?;
++            send(&mut stream, &encode(&Request::Application(application.clone()), 256)?, until)?;
++            match read_limit::<Response>(&mut stream, until, 256)?? {
++                Answer::Ready => (),
++                _ => return Err(unavailable("application declaration refused")),
++            }
++        }
++        Ok(stream)
+     }
+     pub(super) fn request(&self, request: Request, until: Instant) -> Result<Answer, Error> {
+         let encoded = encode(&request, FRAME_MAX)?;
+@@ -635,6 +651,14 @@ fn serve(
+         .ok_or(Refusal::Timeout)?;
+     write(&mut stream, &Ok::<_, Refusal>(Answer::Ready), until)?;
+     let mut request: Request = read(&mut stream, until)?;
++    let application = if let Request::Application(application) = request {
++        application.validate()?;
++        // This ACK is schema acceptance only, before any application effect.
++        // Admission is checked again by the actual serialized SQL writer.
++        write(&mut stream, &Ok::<_, Refusal>(Answer::Ready), until)?;
++        request = read(&mut stream, until)?;
++        Some(application)
++    } else { None };
+     if matches!(request, Request::Capabilities) {
+         write(
+             &mut stream,
+@@ -659,7 +683,10 @@ fn serve(
+     if matches!(request, Request::Probe) {
+         return write(&mut stream, &Ok::<_, Refusal>(Answer::Done), until);
+     }
+-    let database = acquire().ok_or_else(|| unavailable("owner is draining"))?;
++    let mut database = acquire().ok_or_else(|| unavailable("owner is draining"))?;
++    if let Some(application) = application {
++        database = database.for_application(&application.name, application.version)?;
++    }
+     if matches!(request, Request::Session) {
+         let mut final_stream = stream.try_clone().map_err(unavailable)?;
+         let result = database
+@@ -763,7 +790,7 @@ fn serve(
+                 Record::ImportState => Answer::ImportState(ns.import_state(until)?),
+             })
+         })(),
+-        Request::Session | Request::Probe | Request::Capabilities => {
++        Request::Session | Request::Probe | Request::Capabilities | Request::Application(_) => {
+             Err(unavailable("unexpected session"))
+         }
+     };
+diff --git a/crates/amphora/src/transport/wire.rs b/crates/amphora/src/transport/wire.rs
+index f48d45f731fcc7d3fe54049b4268b10b476e7ddb..687bbeb1f5f5f33eafc53b5e92e758ff5f76d081 100644
+--- a/crates/amphora/src/transport/wire.rs
++++ b/crates/amphora/src/transport/wire.rs
+@@ -41,6 +41,9 @@ pub(super) enum Request {
+     ),
+     ReplicaStatus,
+     Capabilities,
++    // Appended: one bounded claim before the existing ordinary request. It
++    // declares a client format; only the actual owner's floor grants admission.
++    Application(crate::database::Application),
+ }
+ #[derive(Serialize, Deserialize)]
+ pub(super) enum Record {
+diff --git a/crates/amphora/tests/transport.rs b/crates/amphora/tests/transport.rs
+index 297b74c589b58dc3a1efd87f4322e0178089bbd2..68a4f8ec0e6193b5c7efe8d674292d38f74da106 100644
+--- a/crates/amphora/tests/transport.rs
++++ b/crates/amphora/tests/transport.rs
+@@ -144,6 +144,12 @@ fn transport_child() {
+             let _ = std::io::stdin().read_exact(&mut [0]);
+             drop(database);
+         }
++        "application" => {
++            let database = Database::open(path, until()).unwrap()
++                .for_application("kiln.host-store", 6).unwrap();
++            assert!(matches!(database.writer_floor("kiln.host-store", 6, until()), Err(api::Refusal::Invalid { .. })), "an attached client cannot mint original owner custody");
++            database.call(until(), |db| { db.execute("INSERT INTO items VALUES(4)", [])?; Ok(()) }).unwrap();
++        }
+         "owner" => {
+             let database = Database::open(path, until()).unwrap();
+             migration_diagnostics(&database);
+@@ -530,5 +536,34 @@ fn independent_processes_share_cas_and_adaptive_sql_and_abort_disconnect() {
+         client.namespace("ledger").unwrap().head(until()).unwrap(),
+         2
+     );
++    // U05: the durable floor serializes behind prior adaptive sessions. Existing
++    // untagged attachments cannot bypass it; a new tagged SDK client can use the
++    // SAME actual owner without opening a second engine.
++    let application = clone.for_application("kiln.host-store", 6).unwrap();
++    let (entered_tx,entered_rx)=std::sync::mpsc::sync_channel(1);
++    let (release_tx,release_rx)=std::sync::mpsc::sync_channel(1);
++    let old_client=client.clone();
++    let old=std::thread::spawn(move ||old_client.call(until(),move |db| {
++        db.execute("INSERT INTO items VALUES(5)",[])?;
++        entered_tx.send(()).unwrap();
++        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
++        Ok(())
++    }));
++    entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
++    let installing=application.clone();
++    let floor=std::thread::spawn(move ||installing.writer_floor("kiln.host-store",6,until()));
++    // Entry, not a thread-start or guessed delay, is the old transaction proof.
++    // The receipt is returned only after this original session settles.
++    release_tx.send(()).unwrap();
++    old.join().unwrap().unwrap();
++    let boundary=floor.join().unwrap().unwrap();
++    boundary.require(&application).unwrap();
++    assert_eq!(boundary.version(), 6);
++    let old: Result<(), _> = client.call(until(), |db| { db.execute("INSERT INTO items VALUES(100)", [])?; Ok(()) });
++    assert!(matches!(old, Err(amphora::transport::Error::Refused(api::Refusal::Fenced(_)))));
++    assert!(matches!(ns.commit(api::Tx { conds:vec![], writes:vec![api::Write::Delete { family:"work".into(),key:b"one".to_vec() }] },until()), Err(api::Refusal::Fenced(_))));
++    assert!(child(&path, "application").success());
++    assert_eq!(application.call(until(), |db| Ok(db.query_row("SELECT count(*) FROM items", [], |row| row.get::<_,i64>(0))?)).unwrap(),4);
++    assert_eq!(application.namespace("ledger").unwrap().get("work",b"one",api::Consistency::Linearizable,until()).unwrap().unwrap().value,b"child_claimed");
+     drop(clone);
+ }

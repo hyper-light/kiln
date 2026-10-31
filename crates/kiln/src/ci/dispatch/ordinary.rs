@@ -195,8 +195,19 @@ pub(super) fn log_owner(c:&crate::sql::Connection<'_>,job:&str,attempt:u32)->any
 }
 
 pub(super) fn log_registration(c:&crate::sql::Connection<'_>,job:&str,attempt:u32)->anyhow::Result<Option<(OrdinaryOwnerV1,Option<kiln_ci::wire::JobLogContractV1>)>> {
+    let row=row_in(c,job,attempt)?;
+    let marker:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM ci_retained_ownership WHERE job=?1)",[MARKER_JOB],|r|r.get(0))?;
+    if row.is_none() && !marker {
+        // U01/U05: ordinary commands require a durable domain before their private
+        // token exists, and claim+owner+required logs commit before publication.
+        // A truly legacy lookup has none of that evidence. Missing newer evidence
+        // remains a drain refusal, never an implicit conversion back to legacy.
+        let prior:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM kv WHERE k LIKE 'u01/ordinary-domain/%' OR k LIKE 'u01/ordinary-anchor/%') OR EXISTS(SELECT 1 FROM ci_retained_ownership WHERE json_extract(allocation,'$.format')=?1) OR EXISTS(SELECT 1 FROM ci_log_producers) OR EXISTS(SELECT 1 FROM ci_attempts WHERE leg_id=?2 AND number=?3 AND physical_receipt IS NOT NULL)",params![FORMAT,job,attempt],|r|r.get(0))?;
+        anyhow::ensure!(!prior,Refusal::FormatRequiresDrain);
+        return Ok(None);
+    }
     ensure_marker(c,false)?;
-    let Some(row)=row_in(c,job,attempt)? else{return Ok(None)};
+    let Some(row)=row else{return Ok(None)};
     let domain=domain_in(c,&row.journal.owner.host)?.ok_or(Refusal::EpochMissing)?;
     anyhow::ensure!(domain.epoch==row.journal.owner.publication_epoch,Refusal::EpochMismatch);
     Ok(Some((row.journal.owner,row.journal.log_contract)))
@@ -215,6 +226,33 @@ fn before_effect<T>(result: anyhow::Result<T>) -> anyhow::Result<Result<T,Refusa
         Ok(value)=>Ok(Ok(value)),
         Err(error)=>match error.downcast::<Refusal>() {Ok(refusal)=>Ok(Err(refusal)),Err(error)=>Err(error)},
     }
+}
+
+/// U01/W05-R28: capacity records are temporary; a finished attempt's SAME
+/// validated positive proof persists on its original ci_attempts row. A no_start
+/// while logical=running is provisional: the SAME attempt may be requeued under
+/// a new owner, so it cannot freeze an immutable completed-attempt receipt yet.
+fn retain_physical_receipt(c:&crate::sql::Connection<'_>,journal:&Journal)->anyhow::Result<()> {
+    if journal.physical=="pending" || journal.logical=="running" {return Ok(());}
+    let attempt:Option<(Option<String>,Option<String>,String)>=c.query_row("SELECT physical_receipt,runner,status FROM ci_attempts WHERE leg_id=?1 AND number=?2",params![journal.owner.job,journal.owner.attempt],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+    let Some((prior,runner,status))=attempt else {
+        let exists:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM jobs WHERE id=?1)",[&journal.owner.job],|r|r.get(0))?;
+        anyhow::ensure!(!exists,"ordinary physical proof lost an existing canonical job attempt");
+        // Canonical deletion removes attempts, not the original retained physical
+        // owner. Omit only the optional history copy: this SAME validated stop
+        // publication must still retire that original owner and its allocation.
+        return Ok(());
+    };
+    anyhow::ensure!(runner.as_deref()==Some(journal.owner.host.as_str()) && status=="done","ordinary physical proof changed its canonical attempt owner or disposition");
+    if let Some(prior)=prior {
+        let prior=journal_json(&prior)?.ok_or_else(||anyhow::anyhow!("ordinary physical receipt changed format"))?;
+        anyhow::ensure!(prior.owner==journal.owner && prior.physical==journal.physical && prior.allocation==journal.allocation,"ordinary physical receipt changed its original proof");
+    }else{
+        let receipt=serde_json::to_string(journal)?;
+        let saved=c.execute("UPDATE ci_attempts SET physical_receipt=?3 WHERE leg_id=?1 AND number=?2 AND runner=?4 AND physical_receipt IS NULL",params![journal.owner.job,journal.owner.attempt,receipt,journal.owner.host])?;
+        anyhow::ensure!(saved==1,"ordinary physical proof lost its original canonical attempt");
+    }
+    Ok(())
 }
 
 impl Dispatch {
@@ -326,6 +364,8 @@ impl Dispatch {
             ensure_marker(&tx,false)?;
             if row.journal.logical!="running" {
                 let won=(row.journal.logical=="lost")==losing;
+                retain_physical_receipt(&tx,&row.journal)?;
+                tx.commit()?;
                 return Ok(Some((won,if won && !row.released {Some(row.journal.allocation.clone())} else {None},false)));
             }
             let attempt_exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM ci_attempts WHERE leg_id=?1 AND number=?2 AND runner=?3 AND status='running')",params![job,attempt,row.journal.owner.host],|r|r.get(0))?;
@@ -334,6 +374,7 @@ impl Dispatch {
             row.journal.logical=if losing {"lost"} else {"terminal"}.into();
             row.transferred = !row.released;
             save_row(&tx,&row)?;
+            retain_physical_receipt(&tx,&row.journal)?;
             tx.commit()?;
             Ok(Some((true,(!row.released).then(||row.journal.allocation.clone()),true)))
         }).await;
@@ -412,6 +453,7 @@ impl Dispatch {
             let tx=crate::store::tx(c)?;
             row.journal.physical=physical.into();row.released=true;
             save_row(&tx,&row)?;
+            retain_physical_receipt(&tx,&row.journal)?;
             if row.journal.physical=="no_start" {crate::logs::accepted::producer::no_start(&tx,&row.journal.owner)?;}
             tx.execute("UPDATE jobs SET kept_until=NULL WHERE id=?1 AND agent=?2 AND attempt=?3",params![row.journal.owner.job,row.journal.owner.host,row.journal.owner.attempt])?;
             domain.accepted_above.insert(publication.seq);
@@ -511,6 +553,40 @@ pub(super) async fn exercise_oracle(d: &mut Dispatch) -> anyhow::Result<()> {
     let second=owned.get(1).cloned().ok_or_else(||anyhow::anyhow!("ordinary oracle second owner"))?;
     let third=owned.get(2).cloned().ok_or_else(||anyhow::anyhow!("ordinary oracle third owner"))?;
     let fourth=owned.get(3).cloned().ok_or_else(||anyhow::anyhow!("ordinary oracle fourth owner"))?;
+    // U01/U05: the real completion lookup must refuse lost/corrupt ordinary
+    // format evidence, including a lost journal, without staging a report.
+    let probe=first.clone();
+    let wire=crate::proto::encode(&crate::proto::JobResult{job:probe.job.clone(),status:crate::store::Status::Succeeded,exit_code:Some(0),error:None,peak_rss:None,cpu_seconds:None})?;
+    d.hub.store.call(move|c| {
+        let tx=crate::store::tx(c)?;
+        let mut query=tx.prepare("SELECT job,attempt,agent,execution,until_at,allocation,transferred,released,received_at FROM ci_retained_ownership WHERE job IN (?1,?2) ORDER BY job")?;
+        let original:Vec<(String,u32,String,Option<String>,i64,String,bool,bool,i64)>=query.query_map(params![MARKER_JOB,probe.job],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?)))?.collect::<crate::sql::Result<_>>()?;
+        drop(query);
+        anyhow::ensure!(original.len()==2,"ordinary format probe needs both original marker and owner");
+        let reports:usize=tx.query_row("SELECT count(*) FROM ci_completion_reports",[],|r|r.get(0))?;
+        tx.execute("DELETE FROM ci_retained_ownership WHERE job=?1",[MARKER_JOB])?;
+        let missing=runs::completion_report_allowed(&tx,&probe.job,&probe.host,Some(probe.attempt),None,&wire).err().ok_or_else(||anyhow::anyhow!("missing marker allowed original ordinary completion"))?;
+        assert!(matches!(missing.downcast_ref::<Refusal>(),Some(Refusal::FormatRequiresDrain)));
+        tx.execute("DELETE FROM ci_retained_ownership WHERE job=?1 AND attempt=?2",params![probe.job,probe.attempt])?;
+        let missing_owner=runs::completion_report_allowed(&tx,&probe.job,&probe.host,Some(probe.attempt),None,&wire).err().ok_or_else(||anyhow::anyhow!("lost ordinary journal became a legacy completion"))?;
+        assert!(matches!(missing_owner.downcast_ref::<Refusal>(),Some(Refusal::FormatRequiresDrain)));
+        for (job,attempt,agent,execution,until,allocation,transferred,released,received) in &original {
+            tx.execute("INSERT INTO ci_retained_ownership(job,attempt,agent,execution,until_at,allocation,transferred,released,received_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![job,attempt,agent,execution,until,allocation,transferred,released,received])?;
+        }
+        tx.execute("UPDATE ci_retained_ownership SET allocation='{}' WHERE job=?1",[MARKER_JOB])?;
+        let corrupt=runs::completion_report_allowed(&tx,&probe.job,&probe.host,Some(probe.attempt),None,&wire).err().ok_or_else(||anyhow::anyhow!("corrupt marker allowed original ordinary completion"))?;
+        assert!(matches!(corrupt.downcast_ref::<Refusal>(),Some(Refusal::FormatRequiresDrain)));
+        let legacy=runs::completion_report_allowed(&tx,"unassigned-legacy-probe",&probe.host,Some(1),None,&wire).err().ok_or_else(||anyhow::anyhow!("legacy read ignored an existing incompatible marker"))?;
+        assert!(matches!(legacy.downcast_ref::<Refusal>(),Some(Refusal::FormatRequiresDrain)));
+        let marker=original.iter().find(|r|r.0==MARKER_JOB).ok_or_else(||anyhow::anyhow!("original marker snapshot missing"))?;
+        tx.execute("UPDATE ci_retained_ownership SET allocation=?2 WHERE job=?1",params![MARKER_JOB,marker.5])?;
+        let mut query=tx.prepare("SELECT job,attempt,agent,execution,until_at,allocation,transferred,released,received_at FROM ci_retained_ownership WHERE job IN (?1,?2) ORDER BY job")?;
+        let restored:Vec<(String,u32,String,Option<String>,i64,String,bool,bool,i64)>=query.query_map(params![MARKER_JOB,probe.job],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?)))?.collect::<crate::sql::Result<_>>()?;
+        drop(query);
+        assert_eq!(restored,original,"guard probes preserve the exact original ownership rows");
+        assert_eq!(tx.query_row("SELECT count(*) FROM ci_completion_reports",[],|r|r.get::<_,usize>(0))?,reports,"refused lookup cannot stage a completion");
+        tx.commit()?;Ok(())
+    }).await?;
     assert!(d.ordinary_kept("ordinary-host",&first.job,JobEventV2::KeptOwned{execution:first.execution.clone(),attempt:1,until:7}).await?);
     assert!(d.hub.ci.kept_by(&first.job,"ordinary-host"));
     assert_eq!(d.ordinary_record(&first.job,1).await?.map(|j|j.owner),Some(first.clone()),"UI debug retention preserves the original ordinary envelope");

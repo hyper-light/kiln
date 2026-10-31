@@ -134,6 +134,7 @@ repository = "https://github.com/hyper-light/amphora"
 commit = "327a8f994de8a201eff14898b637e1a0f526167c"
 path = "vendor/amphora"
 exclude = ["vendor", "bench"]
+own = ["UPSTREAM.md"]
 
 # CP-M1 / AC-M1.4: one socket2 source, preserving Windows exclusivity and Linux IUCV.
 [projects.socket2]

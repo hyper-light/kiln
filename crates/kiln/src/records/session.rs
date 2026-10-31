@@ -17,13 +17,22 @@ pub struct SessionStorage {
 }
 impl SessionStorage {
     pub fn from_host_database(database: Database, host: &str, legacy_conversations: &[PathBuf], upkeep: Upkeep) -> anyhow::Result<Self> {
-        Self::from_host_database_with_initial_hold(database, host, legacy_conversations, upkeep, i64::MAX)
+        anyhow::ensure!(crate::convo::enabled(), "U05 session batch capability requires conversation storage");
+        // Preserve the actual app-tagged handle for both the actor and every
+        // Records namespace it creates after an acknowledged writer floor.
+        let database=crate::store::Store::from_database(database)?.database();
+        let conversations = crate::convo::from_host_sources(database.clone(), host, legacy_conversations, upkeep)?;
+        Ok(Self { database, conversations })
     }
 
-    /// Archive startup chooses its hold before the same actor is spawned or exposed.
-    pub(crate) fn from_host_database_with_initial_hold(database: Database, host: &str, legacy_conversations: &[PathBuf], upkeep: Upkeep, initial_hold: i64) -> anyhow::Result<Self> {
+    /// Only trusted Registry startup declares archive policy before exposing its actor.
+    pub(crate) fn from_archive_host_database(database: Database, host: &str, legacy_conversations: &[PathBuf], config: &crate::config::Conversations) -> anyhow::Result<Self> {
         anyhow::ensure!(crate::convo::enabled(), "U05 session batch capability requires conversation storage");
-        let conversations = crate::convo::from_host_sources_with_initial_hold(database.clone(), host, legacy_conversations, upkeep, initial_hold)?;
+        // Preserve the actual app-tagged handle for both the actor and every
+        // Records namespace it creates after an acknowledged writer floor.
+        let database=crate::store::Store::from_database(database)?.database();
+        let policy=crate::convo::retention::Policy::archive(config)?;
+        let conversations = crate::convo::from_host_sources_for_archive(database.clone(), host, legacy_conversations, config.upkeep(), policy)?;
         Ok(Self { database, conversations })
     }
 

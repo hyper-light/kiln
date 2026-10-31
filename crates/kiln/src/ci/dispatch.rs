@@ -27,6 +27,7 @@ mod admission;
 mod cancellation;
 mod retained;
 mod ordinary;
+mod live_retry;
 mod executors;
 pub use cancellation::CancelError;
 pub use executors::ExecutorOrigin;
@@ -814,6 +815,7 @@ struct RunSt {
     cold: bool,
     /// Where a person's retry asked its legs to run, by key (W05-R28).
     placed: HashMap<String, kiln_ci::sched::Placement>,
+    retry_fresh:HashSet<String>,
 }
 
 /// What an unapproved run is handed to the scheduler with, once it's approved.
@@ -1046,6 +1048,7 @@ async fn shard_files(hub: &Hub, repo: &Repo, sha: &str, wf: &Workflow, called: &
 }
 
 struct Dispatch {
+    pipeline_retries:HashMap<String,live_retry::Pending>,
     admission: admission::State,
     pending_losses: HashMap<String, (u32, String)>,
     hub: Arc<Hub>,
@@ -1205,7 +1208,7 @@ pub fn spawn(hub: Arc<Hub>) {
         (cfg.pools, cfg.reservations) = super::pools::sources(&hub).await;
         let mut d = Dispatch {
             admission: admission::State::default(),
-            pending_losses: HashMap::new(),
+            pending_losses: HashMap::new(), pipeline_retries:HashMap::new(),
             hub: Arc::clone(&hub),
             sched: Scheduler::new(cfg),
             routing: sources,
@@ -1481,6 +1484,7 @@ impl Dispatch {
     }
 
     async fn tick(&mut self) {
+        self.retry_pipeline_intents().await;
         self.retry_cancellations().await;
         self.drain_completions().await;
         for (leg, (attempt, reason)) in std::mem::take(&mut self.pending_losses) {
@@ -1522,6 +1526,7 @@ impl Dispatch {
         if let Some(cmds) = self.after(cmds) {
             Box::pin(self.commands(cmds)).await;
         }
+        self.arm_pipeline_retry_timer();
     }
 
     /// A runner as the scheduler sees it: what its probes found (W13-R01), else what its build
@@ -1820,7 +1825,7 @@ impl Dispatch {
         let group = plan.concurrency.as_ref().map(|g| (format!("{}\0{}", s.repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
         let costs = super::insights::costs(&self.hub, &s.repo.id, &s.path).await;
         let sup = sup_of(&s.workflow, &s.repo, &s.path, &s.event.name, &github);
-        let mut st = RunSt { plan, repo: s.repo, event: s.event, path: s.path, created: crate::util::now_unix(), in_progress: false, files, wf: s.workflow, github, vars, trusted, actions: s.actions, keys: HashMap::new(), held: Some(actions), cancellation: None, cancel_request: None, seq: 0, keep: HashMap::new(), debug: false, keep_failed: None, given: s.given, timing, tree, removed: 0, costs, awaiting: None, no_reuse: false, who: Who::default(), sup, cold: false, placed: HashMap::new() };
+        let mut st = RunSt { plan, repo: s.repo, event: s.event, path: s.path, created: crate::util::now_unix(), in_progress: false, files, wf: s.workflow, github, vars, trusted, actions: s.actions, keys: HashMap::new(), held: Some(actions), cancellation: None, cancel_request: None, seq: 0, keep: HashMap::new(), debug: false, keep_failed: None, given: s.given, timing, tree, removed: 0, costs, awaiting: None, no_reuse: false, who: Who::default(), sup, cold: false, placed: HashMap::new(), retry_fresh:HashSet::new() };
         st.who = who_of(&self.hub, &st).await;
         self.workflow_run(&st, "requested", None);
         if approval {
@@ -2093,6 +2098,7 @@ impl Dispatch {
                 Work::Action(action) => action,
                 Work::SaveRemoved => { self.save_removed(run).await?; continue; }
             };
+            if self.defer_pipeline_retry_action(run,&a) {continue;}
             match a {
                 PlanAction::Queue(spec) => {
                     // A rerun's leg that isn't run again keeps the last attempt's result.
@@ -2245,6 +2251,9 @@ impl Dispatch {
         by: &str,
     ) -> anyhow::Result<u32> {
         if self.runs.contains_key(run) {
+            if let RerunMode::Leg {key,..}=mode {
+                return Box::pin(self.retry_active_pipeline(run,key,placed,by)).await;
+            }
             anyhow::bail!("the run is still in progress; cancel it or wait for it to finish");
         }
         let r = run.to_owned();
@@ -2305,7 +2314,7 @@ impl Dispatch {
         let costs = super::insights::costs(&self.hub, &repo.id, &path).await;
         // A maintainer reruns it: that is approval enough, as on GitHub.
         let sup = sup_of(&wf, &repo, &path, &event.name, &github);
-        let mut st = RunSt { plan, repo, event, path, created: crate::util::now_unix(), in_progress: false, files, wf, github, vars: input.vars, trusted: input.trusted, actions, keys: HashMap::new(), held: Some(acts), cancellation: None, cancel_request: None, seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), tree: Arc::clone(&tree), removed: 0, costs, awaiting: None, no_reuse, who: Who::default(), sup, cold, placed };
+        let mut st = RunSt { plan, repo, event, path, created: crate::util::now_unix(), in_progress: false, files, wf, github, vars: input.vars, trusted: input.trusted, actions, keys: HashMap::new(), held: Some(acts), cancellation: None, cancel_request: None, seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), tree: Arc::clone(&tree), removed: 0, costs, awaiting: None, no_reuse, who: Who::default(), sup, cold, placed, retry_fresh:HashSet::new() };
         st.who = who_of(&self.hub, &st).await;
         self.workflow_run(&st, "requested", None);
         self.runs.insert(run.to_owned(), st);
@@ -2588,7 +2597,7 @@ impl Dispatch {
     async fn reuse_hash(&self, run: &str, spec: &LegSpec) -> Option<(String, u64)> {
         let reuse = super::reuse::spec_of(spec)?;
         let (repo, sha, actions, vars, trusted) = {
-            let r = self.runs.get(run).filter(|r| !r.no_reuse)?;
+            let r = self.runs.get(run).filter(|r| !r.no_reuse && !r.retry_fresh.contains(&spec.key))?;
             (r.repo.clone(), r.event.sha.clone(), r.actions.clone(), r.vars.clone(), r.trusted)
         };
         match super::reuse::inputs(&self.hub, &repo, &sha, spec, &reuse, &actions, &vars, trusted).await {
@@ -2654,6 +2663,7 @@ impl Dispatch {
     /// them overflowed a shard's 2 MiB stack (a queued leg's commands, from `commands`' own work).
     /// Otherwise the commands, for the caller to carry out.
     fn after(&mut self, cmds: Vec<Command>) -> Option<Vec<Command>> {
+        self.fence_pipeline_retry_conflicts();
         if self.in_commands {
             self.next.extend(cmds);
             None
@@ -2664,6 +2674,7 @@ impl Dispatch {
 
     /// Carries out what the scheduler decided.
     async fn commands(&mut self, cmds: Vec<Command>) {
+        self.fence_pipeline_retry_conflicts();
         // One loop does them all. What a command makes as it runs (a cancel's settles, a settle's
         // next legs, their assignments) comes right after it, as if it had done it itself, rather
         // than a level down: a chain of them doesn't deepen the stack.
@@ -3777,6 +3788,7 @@ impl Dispatch {
     }
 
     async fn cancel_run(&mut self, run: &str, reason: &str) -> anyhow::Result<()> {
+        if let Some(pending)=self.pipeline_retries.get_mut(run) {let _=pending.cancel.get_or_insert_with(||reason.into());return Ok(());}
         self.accept_cancel(run, None, reason).await?;
         self.apply_cancellation(run).await;
         Ok(())
@@ -3832,15 +3844,20 @@ impl Dispatch {
         let (mut plan, initial) = RunPlan::start(Arc::clone(&wf), input.clone(), self.settings_with(&v), &Graphed { source: Source { files: &files, timing: &timing, tree: &tree }, graph }).map_err(|e| anyhow::anyhow!(e))?;
         let mut recovered = initial.clone();
         let run_owned = run.to_owned();
-        let (log, last_seq): (Vec<(i64, String, Option<String>, Option<String>)>, i64) = self.hub.store.call(move |c| {
-            let mut st = c.prepare("SELECT seq, kind, leg, report FROM ci_plan_log WHERE run_id = ?1 AND attempt = (SELECT attempt FROM runs WHERE id = ?1) ORDER BY seq")?;
-            let log = st.query_map([&run_owned], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<Vec<_>, _>>()?;
+        let (log, last_seq, attempt): (Vec<(i64, String, Option<String>, Option<String>)>, i64, u32) = self.hub.store.call(move |c| {
+            let attempt:u32=c.query_row("SELECT attempt FROM runs WHERE id=?1",[&run_owned],|r|r.get(0))?;
+            let mut st = c.prepare("SELECT seq, kind, leg, report FROM ci_plan_log WHERE run_id = ?1 AND attempt = ?2 ORDER BY seq")?;
+            let log = st.query_map(crate::sql::params![run_owned,attempt], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<Vec<_>, _>>()?;
             // The log goes on across attempts: an attempt that logged nothing yet continues from
             // the last attempt's end.
             let last: i64 = c.query_row("SELECT COALESCE(MAX(seq), 0) FROM ci_plan_log WHERE run_id = ?1", [&run_owned], |r| r.get(0))?;
-            Ok((log, last))
+            Ok((log, last, attempt))
         })
         .await?;
+        // Reject an unsupported record before applying ANY replayed report.
+        // Historical producers write only leg/cancel; retry decisions are exact
+        // epoch6 records rather than defaults interpreted as completions.
+        for (_,kind,_,_) in &log {live_retry::known_log_kind(kind)?;}
         let seq = last_seq;
         let logged = !log.is_empty();
         let mut reported: HashSet<String> = HashSet::new();
@@ -3850,6 +3867,8 @@ impl Dispatch {
         let mut cancelled_keys = HashSet::new();
         for (logged_seq, kind, leg, report) in log {
             match kind.as_str() {
+                "retry-subgraph" => live_retry::replay(live_retry::Log {run,attempt,seq:logged_seq,leg:leg.as_deref(),report:report.as_deref(),workflow:&wf},&mut plan,&Source {files:&files,timing:&timing,tree:&tree},&mut recovered,&mut reported)?,
+                "retry-subgraph-refused" => live_retry::replay_refused(live_retry::Log {run,attempt,seq:logged_seq,leg:leg.as_deref(),report:report.as_deref(),workflow:&wf},&plan)?,
                 "cancel" => {
                     cancelled = true;
                     cancel_seq = logged_seq;
@@ -3864,13 +3883,14 @@ impl Dispatch {
                         recovered.extend(acts);
                     }
                 }
-                _ => {
+                "leg" => {
                     let rep = report.as_deref().map(report_from_json).unwrap_or_default();
                     let key = leg.unwrap_or_default();
                     let acts = plan.on_leg_finished(&key, rep, &Source { files: &files, timing: &timing, tree: &tree });
                     recovered.extend(acts);
                     reported.insert(key);
                 }
+                other=>return Err(live_retry::UnknownPlanLogKind(other.into()).into()),
             }
         }
         // The legs as the store has them.
@@ -3941,7 +3961,7 @@ impl Dispatch {
         let sup = sup_of(&wf, &repo, &path, &event.name, &input.github);
         // Where a person's retry asked its legs to run (W05-R28), those queued after a restart too.
         let placed = v.get("placed").and_then(|p| serde_json::from_value(p.clone()).ok()).unwrap_or_default();
-        let mut st = RunSt { plan, repo: repo.clone(), event, path, created: row.created_at, in_progress: !unapproved, files: Arc::clone(&files), wf: Arc::clone(&wf), github: input.github.clone(), vars: input.vars.clone(), trusted: input.trusted, actions, keys: HashMap::new(), held, cancellation: cancelled.then(|| cancellation::Pending { seq: cancel_seq, ..Default::default() }), cancel_request: None, seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), tree: Arc::clone(&tree), removed: 0, costs, awaiting, no_reuse: v.get("no_reuse").and_then(serde_json::Value::as_bool).unwrap_or(false), who: Who::default(), sup, cold: v.get("cold").and_then(serde_json::Value::as_bool).unwrap_or(false), placed };
+        let mut st = RunSt { plan, repo: repo.clone(), event, path, created: row.created_at, in_progress: !unapproved, files: Arc::clone(&files), wf: Arc::clone(&wf), github: input.github.clone(), vars: input.vars.clone(), trusted: input.trusted, actions, keys: HashMap::new(), held, cancellation: cancelled.then(|| cancellation::Pending { seq: cancel_seq, ..Default::default() }), cancel_request: None, seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), tree: Arc::clone(&tree), removed: 0, costs, awaiting, no_reuse: v.get("no_reuse").and_then(serde_json::Value::as_bool).unwrap_or(false), who: Who::default(), sup, cold: v.get("cold").and_then(serde_json::Value::as_bool).unwrap_or(false), placed, retry_fresh:v.get("retry_fresh").map(|v|serde_json::from_value(v.clone())).transpose()?.unwrap_or_default() };
         st.who = who_of(&self.hub, &st).await;
         let mut queued = Vec::new();
         for (id, key, status, agent, attempt, leg, input_hash) in legs {
@@ -4390,7 +4410,7 @@ mod tests {
             let dispatcher = || Dispatch {
                 hub: Arc::clone(&hub), sched: Scheduler::new(sched_config(&hub, Vec::new())), routing: Default::default(),
                 held: HashMap::new(), runs: HashMap::new(), legs: HashMap::new(), timers: BTreeSet::new(), next: Vec::new(),
-                in_commands: false, pods: HashSet::new(), absent_after: None, decisions: HashMap::new(), warm: HashMap::new(), warm_seq: 0, admission: admission::State::default(), pending_losses: HashMap::new(),
+                in_commands: false, pods: HashSet::new(), absent_after: None, decisions: HashMap::new(), warm: HashMap::new(), warm_seq: 0, admission: admission::State::default(), pending_losses: HashMap::new(), pipeline_retries:HashMap::new(),
             };
             // U01: fresh unbound native rows must still refuse before any legacy
             // import. Full restore imports first, so exercise its retained guard directly.
@@ -4628,7 +4648,7 @@ mod tests {
             let failed = old("fails")?.id.clone();
             let prepared = old("prepare")?.id.clone();
             crate::ci::dispatch::spawn(std::sync::Arc::clone(&hub));
-            let result = async {
+            let result: anyhow::Result<()> = async {
                 crate::rt::timeout(std::time::Duration::from_secs(5), async {
                     while hub.ci.restored().is_none() { crate::rt::sleep(std::time::Duration::from_millis(10)).await; }
                 }).await.map_err(|_| anyhow::anyhow!("retry dispatcher did not restore"))?;
@@ -4666,7 +4686,8 @@ mod tests {
             }.await;
             hub.shutdown.cancel();
             hub.ci.tx.close();
-            result
+            result?;
+            super::live_retry::exercise_active_retry().await
         })
     }
 

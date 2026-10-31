@@ -180,12 +180,13 @@ impl Row {
     /// A prior staged Record can read512parts:522 total exchanges, rounded up to600.
     pub fn command_cost(&self) -> usize {
         match self {
-            Row::Session { .. } => 4,
+            Row::Session { .. } => 32,
             Row::Event(_) => 2,
             Row::Reset { .. } => 4,
-            Row::RecordReset { .. } => 5,
-            Row::Machine { .. } | Row::Closed { .. } => 2,
-            Row::Record(_) => 600,
+            Row::RecordReset { .. } => 32,
+            Row::Machine { .. } => 2,
+            Row::Closed { .. } => 32,
+            Row::Record(_) => 640,
         }
     }
 

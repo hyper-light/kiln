@@ -323,7 +323,7 @@ mod tests {
             hub, sched: Scheduler::new(Config::default()), routing: Default::default(),
             held: HashMap::new(), runs: HashMap::new(), legs: HashMap::new(), timers: BTreeSet::new(),
             next: Vec::new(), in_commands: false, pods: HashSet::new(), absent_after: None,
-            decisions: HashMap::new(), warm: HashMap::new(), warm_seq: 0, admission: State::default(), pending_losses: HashMap::new(),
+            decisions: HashMap::new(), warm: HashMap::new(), warm_seq: 0, admission: State::default(), pending_losses: HashMap::new(), pipeline_retries:Default::default(),
         }
     }
 

@@ -12,7 +12,8 @@ pub const PREPARED_MAX: usize = amphora_api::REQUEST_MAX.saturating_sub(1 << 20)
 /// Projection-only flushes leave additional room below the final request bound.
 pub const GROUP_MAX: usize = 16 << 20;
 /// Pinned Amphora wire.rs COMMAND_MAX is 4096. Leave room for protocol/finalization.
-/// Source proof: meta+Commit<=5, ordinary row exchanges below, Record<=522 (bound600).
+/// Source proof: meta+Commit<=5; retention identities add at most32 row exchanges;
+/// a prior staged Record can read512 parts and is conservatively bounded at640.
 /// WORK_MAX and BASE_WORK are shared by admission, actor grouping and backend preflight.
 pub const WORK_MAX: usize = 4000;
 pub const BASE_WORK: usize = 32;
@@ -337,8 +338,8 @@ mod tests {
         let rows = (0..2_000).map(|_| Row::Closed { session: "s".into(), at: 1 }).collect();
         let rejected = Batch::projection("s".into(), rows).err().ok_or_else(|| anyhow::anyhow!("oversized remote effect was admitted"))?;
         anyhow::ensure!(matches!(rejected.reason, AdmissionRefusal::TooLarge { limit: WORK_MAX, .. }) && rejected.input.rows.len() == 2_000, "work refusal split or consumed its input");
-        let a = Batch::projection("a".into(), (0..1_900).map(|_| Row::Closed { session: "a".into(), at: 1 }).collect()).map_err(|e| anyhow::anyhow!("{:?}", e.reason))?;
-        let b = Batch::projection("b".into(), (0..84).map(|_| Row::Closed { session: "b".into(), at: 1 }).collect()).map_err(|e| anyhow::anyhow!("{:?}", e.reason))?;
+        let a = Batch::projection("a".into(), (0..62).map(|_| Row::Closed { session: "a".into(), at: 1 }).collect()).map_err(|e| anyhow::anyhow!("{:?}", e.reason))?;
+        let b = Batch::projection("b".into(), (0..62).map(|_| Row::Closed { session: "b".into(), at: 1 }).collect()).map_err(|e| anyhow::anyhow!("{:?}", e.reason))?;
         anyhow::ensure!(group_command_cost([&a, &b]) == Some(WORK_MAX), "group charged a fixed call allowance per envelope instead of once");
         anyhow::ensure!(group_command_cost(std::iter::empty()) == Some(0), "an empty group consumed a call allowance");
         Ok(())

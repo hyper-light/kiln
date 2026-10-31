@@ -22,10 +22,12 @@ pub mod record;
 pub mod resume;
 pub mod rows;
 mod segments;
+pub(crate) const TRANSCRIPT_LINE_MAX: usize = segments::LINE_MAX;
 // Historical unprefixed SQL is used only by the legacy fixture engine.
 #[cfg(test)]
 pub mod sql;
 pub mod store;
+pub(crate) mod retention;
 pub mod telemetry;
 // U15: retained only to construct/read compatibility fixtures. Production never opens it.
 #[cfg(test)]
@@ -86,23 +88,24 @@ pub fn from_database(database: ::amphora::database::Database, legacy: &std::path
 /// U06/U15/U19: singleton compatibility import of a complete local source inventory.
 /// Sources share canonical IDs but retain independent metadata, revisions and feed history.
 pub fn from_legacy_sources(database: ::amphora::database::Database, legacy: &[std::path::PathBuf], upkeep: store::Upkeep) -> anyhow::Result<store::Store> {
-    open_legacy_sources(database,None,legacy,upkeep,i64::MAX)
+    open_legacy_sources(database,None,legacy,upkeep,i64::MAX,None)
 }
 
 /// U19: replicated startup binds each old file to its certificate-authenticated origin.
 /// Host/path identity is stable; the separately pinned fingerprint fences source replacement.
 pub fn from_host_sources(database: ::amphora::database::Database, host:&str, legacy:&[std::path::PathBuf], upkeep:store::Upkeep)->anyhow::Result<store::Store> {
-    from_host_sources_with_initial_hold(database,host,legacy,upkeep,i64::MAX)
-}
-
-pub(crate) fn from_host_sources_with_initial_hold(database: ::amphora::database::Database, host:&str, legacy:&[std::path::PathBuf], upkeep:store::Upkeep, initial_hold:i64)->anyhow::Result<store::Store> {
     anyhow::ensure!(!host.is_empty() && host.len()<=1024,"legacy source requires an authenticated host name of 1 to 1024 bytes");
-    open_legacy_sources(database,Some(host),legacy,upkeep,initial_hold)
+    open_legacy_sources(database,Some(host),legacy,upkeep,i64::MAX,None)
 }
 
-fn open_legacy_sources(database: ::amphora::database::Database, host:Option<&str>, legacy:&[std::path::PathBuf], upkeep:store::Upkeep, initial_hold:i64)->anyhow::Result<store::Store> {
+pub(crate) fn from_host_sources_for_archive(database: ::amphora::database::Database, host:&str, legacy:&[std::path::PathBuf], upkeep:store::Upkeep, policy:retention::Policy)->anyhow::Result<store::Store> {
+    anyhow::ensure!(!host.is_empty() && host.len()<=1024,"legacy source requires an authenticated host name of 1 to 1024 bytes");
+    open_legacy_sources(database,Some(host),legacy,upkeep,i64::MAX,Some(policy))
+}
+
+fn open_legacy_sources(database: ::amphora::database::Database, host:Option<&str>, legacy:&[std::path::PathBuf], mut upkeep:store::Upkeep, initial_hold:i64, archive:Option<retention::Policy>)->anyhow::Result<store::Store> {
     anyhow::ensure!(legacy.len()<=4096,"too many legacy conversation sources");
-    let mut engine = amphora::Amphora::from_database(database)?;
+    let mut engine = amphora::Amphora::from_database(database.clone())?;
     // Resume available inputs before checking missing ones: a missing optional path must not
     // prevent completion of another registered source that is still present.
     for path in legacy.iter().filter(|p|p.exists()).chain(legacy.iter().filter(|p|!p.exists())) {
@@ -111,7 +114,13 @@ fn open_legacy_sources(database: ::amphora::database::Database, host:Option<&str
     // This is deliberately a global barrier: partial projections are in one shared timeline.
     // A host must not expose another origin's unfinished projection as complete history.
     engine.finish_imports()?;
-    store::Store::start_with_initial_hold(Box::new(engine), upkeep, initial_hold)
+    let authority=match archive {
+        Some(policy)=>retention::register(engine.host(),host.ok_or_else(||anyhow::anyhow!("archive startup requires its trusted host identity"))?,policy)?,
+        None=>None,
+    };
+    engine.maintenance(authority.clone())?;
+    if authority.is_none() { upkeep.keep_closed=None; }
+    store::Store::start_with_maintenance(Box::new(engine), upkeep, initial_hold, authority)
 }
 
 #[cfg(test)]

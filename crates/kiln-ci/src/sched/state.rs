@@ -117,7 +117,7 @@ impl Default for Config {
 }
 
 /// A leg to schedule.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct LegIn {
     /// U01: externally executed work retains its assignment until its host proves termination.
     /// A lost transport is not evidence that its process stopped.
@@ -765,9 +765,66 @@ impl Sig {
     }
 }
 
+/// U01/W05-R28: custody of selected unexposed demands during one durable
+/// pipeline retry. Only the same Scheduler holding its state can consume it.
+#[derive(Debug,Clone)]
+pub struct PipelineRetryPause { id: String }
+#[derive(Debug,Clone,PartialEq)]
+enum RetryPhysicalInput {
+    Adopt {leg:Box<LegIn>,runner:String,attempt:u32},
+    Executor {snapshot:Box<ExecutorSnapshot>,stopping:bool},
+    Retained {leg:String,attempt:u32,reservation:Box<Allocation>,outcome:Outcome},
+}
+
+/// Unsupported direct-core physical evidence cannot silently replace a paused
+/// original logical demand. Memory is bounded to two full bodies per selected
+/// id; further differing bodies leave an explicit count and diagnostic digest.
+/// This is permanent conflict evidence, NEVER a release/recovery capability.
+#[derive(Debug,Clone)]
+pub struct PipelineRetryConflict {
+    job:String,
+    first:RetryPhysicalInput,
+    changed:Option<RetryPhysicalInput>,
+    omitted:u64,
+    omitted_digest:[u8;32],
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,thiserror::Error)]
+#[error("pipeline retry is permanently fenced by unsupported physical evidence for `{job}` ({omitted} additional bodies omitted)")]
+pub struct PipelineRetryConflictStatus {
+    pub job:String,
+    pub ambiguous:bool,
+    pub omitted:u64,
+    /// Version1 SHA256 chain of prior digest plus Debug input: diagnostic only.
+    /// It is not an exact owner identity, physical proof or lossless body log.
+    pub omitted_digest:[u8;32],
+}
+
+impl PipelineRetryConflict {
+    fn retain(&mut self,input:&RetryPhysicalInput) {
+        if &self.first==input || self.changed.as_ref()==Some(input) {return;}
+        if self.changed.is_none() {self.changed=Some(input.clone());return;}
+        use sha2::Digest as _;
+        self.omitted=self.omitted.saturating_add(1);
+        let mut hash=sha2::Sha256::new();hash.update(self.omitted_digest);hash.update(format!("{input:?}").as_bytes());
+        self.omitted_digest=hash.finalize().into();
+    }
+    pub fn status(&self)->PipelineRetryConflictStatus {
+        PipelineRetryConflictStatus {job:self.job.clone(),ambiguous:self.changed.is_some() || self.omitted>0,omitted:self.omitted,omitted_digest:self.omitted_digest}
+    }
+}
+
+#[derive(Debug,Clone)]
+struct PausedPipelineRetry {
+    selected: Vec<(String,u32)>,
+    legs: Vec<Leg>,
+    conflicts:BTreeMap<String,PipelineRetryConflict>,
+}
+
 /// The scheduler.
 #[derive(Debug, Clone, Default)]
 pub struct Scheduler {
+    pipeline_retries: HashMap<String,PausedPipelineRetry>,
     cfg: Config,
     runners: BTreeMap<String, Runner>,
     legs: HashMap<String, Leg>,
@@ -817,6 +874,119 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
+    /// Pause only the original imported pipeline's unexposed queue demands.
+    /// Assigned/retained/starting physical work is refused before any change.
+    /// Imported jobs have no group, admission or work-adoption ownership to move.
+    pub fn pause_pipeline_retry(&mut self,id:String,expected:&[(String,u32)])->Result<PipelineRetryPause,String> {
+        if id.is_empty() || id.len()>1024 || self.pipeline_retries.contains_key(&id) {return Err("retry identity is invalid or already held".into());}
+        let mut unique=BTreeSet::new();
+        for (job,attempt) in expected {
+            if !unique.insert(job) {return Err("retry selection repeats a job".into());}
+            if self.pipeline_retry_paused(job) {return Err("another retry owns this job's queue demand".into());}
+            if self.executors.values().any(|e|e.leg.as_deref()==Some(job.as_str()) || matches!(&e.state,ExecState::Busy {leg} if leg==job))
+                || self.executor_bindings.values().any(|b|b.job==*job && b.attempt==*attempt) {
+                return Err(format!("`{job}` still owns an executor grant"));
+            }
+            if let Some(leg)=self.legs.get(job) {
+                if leg.attempt!=*attempt || !matches!(leg.state,State::Queued|State::Retrying {..})
+                    || leg.input.external || leg.input.retained.is_some() || leg.input.parent_binding.is_some()
+                    || leg.input.group.is_some() || leg.input.admission.is_some() || leg.input.work.is_some() {
+                    return Err(format!("`{job}` is not the original unexposed pipeline queue demand"));
+                }
+            }
+        }
+        let mut legs=Vec::new();
+        for (job,_) in expected {
+            self.unqueue(job);
+            if let Some(leg)=self.legs.remove(job) {legs.push(leg);}
+        }
+        self.pipeline_retries.insert(id.clone(),PausedPipelineRetry {selected:expected.to_vec(),legs,conflicts:BTreeMap::new()});
+        Ok(PipelineRetryPause {id})
+    }
+
+    fn pipeline_retry_paused(&self,job:&str)->bool {
+        self.pipeline_retries.values().any(|p|p.selected.iter().any(|(id,_)|id==job))
+    }
+
+    fn retain_pipeline_retry_conflict(&mut self,input:RetryPhysicalInput) {
+        let jobs:Vec<&str>=match &input {
+            RetryPhysicalInput::Adopt {leg,..}=>vec![leg.id.as_str()],
+            RetryPhysicalInput::Executor {snapshot,..}=>snapshot.leg.as_deref().into_iter().chain(snapshot.binding.as_ref().map(|b|b.job.as_str())).collect(),
+            RetryPhysicalInput::Retained {leg,reservation,..}=>vec![leg.as_str(),reservation.id.as_str()],
+        };
+        for paused in self.pipeline_retries.values_mut() {
+            let selected:Vec<String>=paused.selected.iter().filter(|(job,_)|jobs.contains(&job.as_str())).map(|(job,_)|job.clone()).collect();
+            for job in selected {
+                match paused.conflicts.entry(job.clone()) {
+                    std::collections::btree_map::Entry::Occupied(mut entry)=>entry.get_mut().retain(&input),
+                    std::collections::btree_map::Entry::Vacant(entry)=>{entry.insert(PipelineRetryConflict {job,first:input.clone(),changed:None,omitted:0,omitted_digest:[0;32]});},
+                }
+            }
+        }
+    }
+
+    pub fn pipeline_retry_conflict(&self,pause:&PipelineRetryPause)->Option<&PipelineRetryConflict> {
+        self.pipeline_retries.get(&pause.id)?.conflicts.values().next()
+    }
+
+    /// Only a confirmed original retry commit retires these logical demands.
+    /// None held a physical allocation; no runner/parent capacity is refunded.
+    pub fn commit_pipeline_retry(&mut self,pause:&PipelineRetryPause)->Result<(),String> {
+        if let Some(conflict)=self.pipeline_retry_conflict(pause) {return Err(conflict.status().to_string());}
+        let paused=self.pipeline_retries.remove(&pause.id).ok_or_else(||"the original retry pause is not owned by this scheduler".to_owned())?;
+        for leg in paused.legs {
+            self.uncount(&leg);
+            self.decided.remove(&leg.input.id);
+            self.holds.retain(|_,hold|hold.leg!=leg.input.id);
+            for ids in self.timers.values_mut() {ids.retain(|id|id!=&leg.input.id);}
+        }
+        Ok(())
+    }
+
+    /// Definite noncommit restores the SAME unstarted demands and queue order.
+    /// A delayed retry whose original deadline passed becomes eligible now.
+    pub fn resume_pipeline_retry(&mut self,pause:&PipelineRetryPause,now:i64)->Result<Vec<Command>,String> {
+        if let Some(conflict)=self.pipeline_retry_conflict(pause) {return Err(conflict.status().to_string());}
+        let paused=self.pipeline_retries.get(&pause.id).ok_or_else(||"the original retry pause is not owned by this scheduler".to_owned())?;
+        if paused.legs.iter().any(|leg|self.legs.contains_key(&leg.input.id)) {return Err("a paused retry demand was replaced".into());}
+        let paused=self.pipeline_retries.remove(&pause.id).ok_or_else(||"the original retry pause disappeared".to_owned())?;
+        let mut delayed=Vec::new();
+        let mut warmed=Vec::new();
+        let mut out=Vec::new();
+        for leg in paused.legs {
+            let (id,state,hold)=(leg.input.id.clone(),leg.state.clone(),leg.hold.as_ref().map(|h|h.until));
+            self.legs.insert(id.clone(),leg);
+            match state {
+                State::Queued=>{
+                    self.insert_queue(&id);
+                    if let Some(at)=hold {
+                        if at<=now {warmed.push(id);}else{
+                            let timer=self.timers.entry(at).or_default();
+                            if !timer.contains(&id) {timer.push(id);}
+                            out.push(Command::Timer {at});
+                        }
+                    }
+                },
+                State::Retrying {at} if at<=now=>delayed.push(id),
+                State::Retrying {at}=>{
+                    let timer=self.timers.entry(at).or_default();
+                    if !timer.contains(&id) {timer.push(id);}
+                    out.push(Command::Timer {at});
+                },
+                _=>return Err("paused retry changed its original unexposed state".into()),
+            }
+        }
+        // Existing deadlines may have fired while their original demands were
+        // paused. Restore that SAME timer/hold state through the normal paths.
+        self.release_holds(now,&mut out);
+        for id in warmed {self.unhold(&id,now,&mut out);}
+        for id in delayed {self.enqueue(&id,now,&mut out);}
+        let runners:Vec<String>=self.runners.keys().cloned().collect();
+        for runner in runners {self.try_runner(&runner,now,&mut out);}
+        self.scale_all(now,&mut out);
+        Ok(out)
+    }
+
     pub fn new(cfg: Config) -> Scheduler {
         let admit = Admit::new(cfg.window);
         Scheduler { cfg, admit, ..Scheduler::default() }
@@ -828,6 +998,17 @@ impl Scheduler {
 
     /// Handles one input at `now` (unix milliseconds).
     pub fn handle(&mut self, input: Input, now: i64) -> Vec<Command> {
+        let input=match input {
+            Input::LegRunning {leg,runner,attempt} if self.pipeline_retry_paused(&leg.id)=>{
+                self.retain_pipeline_retry_conflict(RetryPhysicalInput::Adopt {leg,runner,attempt});
+                return Vec::new();
+            },
+            Input::RetainedFinished {leg,attempt,reservation,outcome} if self.pipeline_retry_paused(&leg) || self.pipeline_retry_paused(&reservation.id)=>{
+                self.retain_pipeline_retry_conflict(RetryPhysicalInput::Retained {leg,attempt,reservation,outcome});
+                return Vec::new();
+            },
+            input=>input,
+        };
         let mut out = Vec::new();
         self.now = now;
         // Reservations' windows that opened or closed since: what may run where changes.
@@ -1080,6 +1261,7 @@ impl Scheduler {
 
     fn leg_queued(&mut self, mut input: LegIn, now: i64, out: &mut Vec<Command>) {
         let id = input.id.clone();
+        if self.pipeline_retry_paused(&id) {return;}
         if self.legs.get(&id).is_some_and(|l| l.state != State::Done) {
             return;
         }
@@ -1218,6 +1400,10 @@ impl Scheduler {
     }
 
     fn adopt(&mut self, mut input: LegIn, runner: String, attempt: u32, now: i64, out: &mut Vec<Command>) {
+        if self.pipeline_retry_paused(&input.id) {
+            self.retain_pipeline_retry_conflict(RetryPhysicalInput::Adopt {leg:Box::new(input),runner,attempt});
+            return;
+        }
         let id = input.id.clone();
         // A repeated announcement cannot charge an already assigned original attempt again,
         // especially after its positive physical release while logical close is pending.
@@ -1892,6 +2078,11 @@ impl Scheduler {
     /// Restore before RunnerUp: its physical allocation stays occupied until the same grant
     /// is recovered or fenced. Starting state prevents assigning an unverified warm executor.
     pub fn restore_executor(&mut self, snapshot: ExecutorSnapshot, stopping: bool, now: i64) -> bool {
+        if snapshot.leg.as_deref().is_some_and(|job|self.pipeline_retry_paused(job))
+            || snapshot.binding.as_ref().is_some_and(|binding|self.pipeline_retry_paused(&binding.job)) {
+            self.retain_pipeline_retry_conflict(RetryPhysicalInput::Executor {snapshot:Box::new(snapshot),stopping});
+            return false;
+        }
         if self.executors.contains_key(&snapshot.executor) { return false; }
         if !snapshot.runner.is_empty() {
             let runner = snapshot.runner.clone();
@@ -1954,6 +2145,11 @@ impl Scheduler {
     }
 
     fn retained_finished(&mut self, id: &str, attempt: u32, allocation: Allocation, outcome: Outcome, now: i64, out: &mut Vec<Command>) {
+        // An internal adoption refusal must precede the original transfer/release.
+        if self.pipeline_retry_paused(id) || self.pipeline_retry_paused(&allocation.id) {
+            self.retain_pipeline_retry_conflict(RetryPhysicalInput::Retained {leg:id.into(),attempt,reservation:Box::new(allocation),outcome});
+            return;
+        }
         if !self.legs.get(id).is_some_and(|l| l.attempt == attempt && matches!(l.state, State::Assigned { .. })) { return; }
         if self.legs.get(id).is_some_and(|l| l.physical_released) {
             // A cached pre-proof snapshot cannot recreate debt, but this authenticated

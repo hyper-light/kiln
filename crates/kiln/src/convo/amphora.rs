@@ -37,9 +37,12 @@ fn text(s: Option<&str>) -> Value { s.map_or(Value::Null, txt) }
 fn int(n: i64) -> Value { Value::Integer(n) }
 fn seq(n: u64) -> Value { Value::Integer(i64::try_from(n).unwrap_or(i64::MAX)) }
 
-pub struct Amphora { database: Database, id: String, rev: u64 }
+pub struct Amphora { host: crate::store::Store, database: Database, id: String, rev: u64, maintenance: Option<super::retention::Authority>, prune_pending: bool }
 impl Amphora {
     pub fn from_database(database: Database) -> anyhow::Result<Self> {
+        // Never initialize recursively inside the writer callback below.
+        let host=crate::store::Store::from_database(database)?;
+        let database=host.database();
         let id = crate::util::new_id();
         let (id, rev) = database.call(until(), move |c| {
             // U06: fresh namespaced schema only. Old files are imported separately, never
@@ -53,16 +56,28 @@ impl Amphora {
             }
 
             let id = match s.meta("id")? { Some(id) => id, None => { s.set_meta("id", &id)?; id } };
-            let mut rev = s.meta("rev")?.and_then(|v| v.parse().ok()).unwrap_or(0);
-            for q in sql::REV_MAX { rev = rev.max(s.one_int(q, &[])?.and_then(|v| u64::try_from(v).ok()).unwrap_or(0)); }
+            let saved=s.meta("rev")?;
+            let mut rev = saved.as_deref().map(str::parse::<u64>).transpose()?.unwrap_or(0);
+            for q in sql::REV_MAX {rev=rev.max(s.one_int(q,&[])?.map(u64::try_from).transpose()?.unwrap_or(0));}
+            let _=i64::try_from(rev)?;
+            // Publish recovery before any frontend uses the global allocator.
+            let recovered=rev.to_string();
+            if saved.as_deref()!=Some(recovered.as_str()) {s.set_meta("rev",&recovered)?;}
             Ok((id, rev))
         })?;
-        Ok(Self { database, id, rev })
+        Ok(Self { host, database, id, rev, maintenance: None, prune_pending: false })
     }
+    pub(super) fn host(&self)->&crate::store::Store { &self.host }
+    pub(super) fn maintenance(&mut self, authority: Option<super::retention::Authority>)->anyhow::Result<()> {
+        if let Some(authority)=&authority { authority.require_store_identity(&self.host)?; }
+        self.maintenance=authority;
+        Ok(())
+    }
+
     fn call<T: Send + 'static>(&mut self, f: impl FnOnce(&mut Session<'_, '_>) -> anyhow::Result<T> + Send + 'static) -> anyhow::Result<T> {
         let (value, rev) = self.database.call(until(), move |c| {
             let mut s = Session { conn: c, rev: 0 };
-            s.rev = s.meta("rev")?.map(|v| v.parse()).transpose()?.unwrap_or(0);
+            s.rev = s.meta("rev")?.ok_or_else(||anyhow::anyhow!("conversation revision allocator is missing"))?.parse()?;
             let before = s.rev;
             let value = f(&mut s)?;
             if s.rev != before { s.set_meta("rev", &s.rev.to_string())?; }
@@ -116,7 +131,7 @@ impl Amphora {
         let records_first = batches.len() == 1 && batches.first().is_some_and(|b| b.records().is_some());
         let committed = self.database.call(until(), move |conn| {
             let mut session = Session { conn, rev: 0 };
-            session.rev = session.meta("rev")?.map(|v| v.parse()).transpose()?.unwrap_or(0);
+            session.rev = session.meta("rev")?.ok_or_else(||anyhow::anyhow!("conversation revision allocator is missing"))?.parse()?;
             let before = session.rev;
             let mut committed = Vec::with_capacity(prepared.len());
             for (rows, records) in prepared {
@@ -504,6 +519,7 @@ impl Session<'_, '_> {
                     self.run(&mut w.open, &[txt(session)], none)?;
                     self.touch(session);
                 }
+                if *open || epoch.is_some() {super::retention::projection(self.conn, session, rev, *open, "native")?;}
             }
             Row::Event(e) => {
                 self.run(
@@ -531,7 +547,10 @@ impl Session<'_, '_> {
                 self.run(&mut w.reset, &[txt(session), seq(from.unwrap_or(0))], none)?;
                 self.run(&mut w.dropped, &[r, txt(session), txt("events"), Value::Null, from.map_or(Value::Null, seq), int(*at)], none)?;
             }
-            Row::Closed { session, at } => self.run(&mut w.close, &[txt(session), int(*at), r], none)?,
+            Row::Closed { session, at } => {
+                self.run(&mut w.close, &[txt(session), int(*at), r], none)?;
+                super::retention::closed(self.conn, session, rev, "native")?;
+            }
             Row::Record(rec) => { return self.write_record(rec, rev); }
             Row::RecordReset { session, source, at } => {
                 self.run(&mut w.records_reset, &[txt(session), txt(source)], none)?;
@@ -553,13 +572,20 @@ impl Session<'_, '_> {
         }
         self.transaction(|t| {
             let mut w = t.writes()?;
+            let mut mutations=super::retention::Mutations::default();
             for row in rows {
                 t.rev = t.rev.checked_add(1).ok_or_else(|| anyhow::anyhow!("conversation revision overflow"))?;
                 if !t.write(&mut w, row, t.rev)? {
                     t.rev = t.rev.saturating_sub(1);
+                }else{
+                    match row {
+                        Row::Record(rec)=>mutations.record(&rec.session,&rec.source,rec.n,t.rev,false)?,
+                        Row::RecordReset {session,source,..}=>mutations.record(session,source,0,t.rev,true)?,
+                        _=>{},
+                    }
                 }
             }
-            Ok(())
+            mutations.flush(t.conn)
         })
     }
 
@@ -790,17 +816,80 @@ impl Engine for Amphora {
     fn peer(&mut self, _: &str) -> anyhow::Result<u64> { retired() }
     fn peers(&mut self) -> anyhow::Result<Vec<(String,u64,i64)>> { retired() }
     fn squeeze_some(&mut self, _: usize) -> anyhow::Result<bool> { Ok(false) }
+    fn maintenance_pending(&self)->bool { self.prune_pending }
     fn prune_some(&mut self, before: i64, limit: usize) -> anyhow::Result<usize> {
-        self.call(move |s| {
-            let mut query = s.conn.prepare("SELECT r.session,r.source,r.n FROM convo_records r JOIN convo_sessions s ON s.id=r.session WHERE s.closed_at IS NOT NULL AND s.closed_at < ?1 ORDER BY r.session,r.source,r.n LIMIT ?2")?;
-            let rows = query.query_map(vec![int(before),seq(u64::try_from(limit.min(2000))?)], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?)))?.collect::<amphora_api::sql::Result<Vec<_>>>()?;
-            for (session,source,n) in &rows {
-                let params=vec![txt(session),txt(source),int(*n)];
-                s.conn.execute("DELETE FROM convo_segments WHERE session=?1 AND source=?2 AND n=?3", params.clone())?;
-                s.conn.execute("DELETE FROM convo_records WHERE session=?1 AND source=?2 AND n=?3", params)?;
+        self.prune_pending=false;
+        if limit==0 {return Ok(0);}
+        let authority=self.maintenance.clone().ok_or(super::retention::MaintenanceRefusal::Secondary)?;
+        authority.require_store(&self.host)?;
+        let outcome=self.call(move |s| {
+            match authority.state(s.conn)? {
+                super::retention::AuthorityState::Stale=>return Ok((Err(super::retention::MaintenanceRefusal::Stale),false)),
+                super::retention::AuthorityState::Initializing=>return Ok((Err(super::retention::MaintenanceRefusal::Initializing),false)),
+                super::retention::AuthorityState::Ready=>{},
+                super::retention::AuthorityState::UnsupportedWriterBoundary=>return Ok((Err(super::retention::MaintenanceRefusal::UnsupportedWriterBoundary),false)),
             }
-            Ok(rows.len())
-        })
+            let Some(keep)=authority.policy.keep_closed_ms else { return Ok((Ok(0),false)) };
+            let before=before.min(crate::util::now_ms().saturating_sub(keep));
+            // Bound both examined sessions and deleted rows. A fixed indexed
+            // horizon prevents new arrivals from starving older obligations;
+            // empty/ineligible histories cannot cause a whole-record-table scan.
+            let (after,horizon,again):(Option<String>,Option<String>,bool)=s.conn.query_row("SELECT prune_after,prune_horizon,prune_again FROM conversation_maintenance WHERE id=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+            let after=after.map(|v|serde_json::from_str::<(i64,String)>(&v)).transpose()?;
+            let mut horizon=horizon.map(|v|serde_json::from_str::<(i64,String)>(&v)).transpose()?;
+            if horizon.is_none() {
+                horizon=match s.conn.query_row("SELECT observed_ms,session FROM convo_retention WHERE observed_ms<?1 ORDER BY observed_ms DESC,session DESC LIMIT 1",vec![int(before)],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?))) {
+                    Ok(row)=>Some(row),Err(amphora_api::sql::Error::QueryReturnedNoRows)=>None,Err(error)=>return Err(error.into()),
+                };
+            }
+            let Some(end)=horizon else {
+                s.conn.execute("UPDATE conversation_maintenance SET prune_again=0 WHERE id=1",[])?;
+                return Ok((Ok(0),false));
+            };
+            let mut q=if after.is_some() {
+                s.conn.prepare("SELECT observed_ms,session FROM convo_retention WHERE (observed_ms,session)>(?1,?2) AND (observed_ms,session)<=(?3,?4) AND observed_ms<?5 ORDER BY observed_ms,session LIMIT 32")?
+            }else{
+                s.conn.prepare("SELECT observed_ms,session FROM convo_retention WHERE (observed_ms,session)<=(?1,?2) AND observed_ms<?3 ORDER BY observed_ms,session LIMIT 32")?
+            };
+            let read=|r:&crate::sql::Row<'_>|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?));
+            let sessions=if let Some((at,id))=&after {
+                q.query_map(vec![int(*at),txt(id),int(end.0),txt(&end.1),int(before)],read)?.collect::<amphora_api::sql::Result<Vec<_>>>()?
+            }else{q.query_map(vec![int(end.0),txt(&end.1),int(before)],read)?.collect::<amphora_api::sql::Result<Vec<_>>>()?};
+            let (mut cursor,mut gone)=(after,0usize);
+            // 1800*2 deletes plus at most32 eligibility/record reads and cursor
+            // work leave protocol/finalization room below COMMAND_MAX=4096.
+            let limit=limit.min(1800);
+            for (at,session) in &sessions {
+                let positive:bool=s.conn.query_row("SELECT EXISTS(SELECT 1 FROM convo_sessions s JOIN convo_retention v ON v.session=s.id JOIN transcript_archives a ON a.session=s.id LEFT JOIN transcript_manifests m ON m.capture=a.manifest
+                    WHERE s.id=?1 AND s.closed_at IS NOT NULL AND v.close_rev IS NOT NULL AND v.close_epoch=s.epoch AND v.close_at=s.closed_at AND v.observed_ms<?2
+                    AND a.close_rev=v.close_rev AND a.accepted_rev=v.accepted_rev AND a.owner_generation=?3 AND a.policy_version=?4
+                    AND (a.status='given-up' OR (a.status='archived' AND m.state='complete' AND m.catalog_complete=1 AND m.session=s.id AND m.close_rev=v.close_rev AND m.close_epoch=v.close_epoch AND m.accepted_rev=v.accepted_rev AND m.owner_generation=?3 AND m.policy_version=?4 AND m.history_rev=v.history_rev)))",
+                    vec![txt(session),int(before),int(authority.generation),int(authority.policy_version)],|r|r.get(0))?;
+                if positive {
+                    let left=limit.checked_sub(gone).ok_or_else(||anyhow::anyhow!("prune budget underflow"))?;
+                    if left==0 {break;}
+                    let mut records=s.conn.prepare("SELECT source,n FROM convo_records WHERE session=?1 ORDER BY source,n LIMIT ?2")?;
+                    let rows=records.query_map(vec![txt(session),seq(u64::try_from(left)?)],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?)))?.collect::<amphora_api::sql::Result<Vec<_>>>()?;
+                    for (source,n) in &rows {
+                        let params=vec![txt(session),txt(source),int(*n)];
+                        s.conn.execute("DELETE FROM convo_segments WHERE session=?1 AND source=?2 AND n=?3",params.clone())?;
+                        s.conn.execute("DELETE FROM convo_records WHERE session=?1 AND source=?2 AND n=?3",params)?;
+                    }
+                    gone=gone.checked_add(rows.len()).ok_or_else(||anyhow::anyhow!("prune count overflow"))?;
+                    if rows.len()==left {break;}
+                }
+                cursor=Some((*at,session.clone()));
+            }
+            let (cursor,horizon)=if sessions.is_empty() {(None,None)}else{(cursor,Some(end))};
+            let encode=|v:Option<(i64,String)>|v.map(|v|serde_json::to_string(&v)).transpose();
+            s.conn.execute("UPDATE conversation_maintenance SET prune_after=?1,prune_horizon=?2,prune_again=CASE WHEN ?3 THEN 0 ELSE prune_again END WHERE id=1",vec![text(encode(cursor)?.as_deref()),text(encode(horizon)?.as_deref()),int(i64::from(sessions.is_empty()))])?;
+            // A positive receipt arriving behind this finite cursor schedules
+            // one further pass; it neither resets ongoing progress nor grants
+            // pruning authority. Every deletion rechecks the witness above.
+            Ok((Ok(gone),!sessions.is_empty() || again))
+        })?;
+        self.prune_pending=outcome.1;
+        outcome.0.map_err(Into::into)
     }
     // U15: application code never checkpoints, copies or swaps the shared host database.
     fn compact_some(self: Box<Self>, _: u64, _: usize) -> anyhow::Result<(Box<dyn Engine>,Compacting)> { Ok((self,Compacting::Not)) }
@@ -820,7 +909,9 @@ impl Amphora {
                 let mut merge=Session {conn:&transaction,rev:s.rev};
                 let result=(||->anyhow::Result<()> {
                     merge.import_fence(&source,&fingerprint,table,expected)?;
-                    for row in rows {merge.merge_legacy(&source,table,row)?;}
+                    let mut mutations=super::retention::Mutations::default();
+                    for row in rows {merge.merge_legacy(&source,table,row,&mut mutations)?;}
+                    mutations.flush(merge.conn)?;
                     merge.conn.execute("INSERT INTO convo_import(source,table_name,cursor,done,fingerprint) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(source,table_name) DO UPDATE SET cursor=excluded.cursor,done=excluded.done",vec![txt(&source),txt(table),int(next),int(i64::from(done)),txt(&fingerprint)])?;
                     Ok(())
                 })();
@@ -1264,7 +1355,9 @@ mod tests {
             engine.call(move |s| {
                 let row=page.into_iter().next().ok_or_else(||anyhow::anyhow!("missing prepared page"))?;
                 let id=row.id;
-                s.merge_legacy(&source,"records",row)?;
+                let mut mutations=super::super::retention::Mutations::default();
+                s.merge_legacy(&source,"records",row,&mut mutations)?;
+                mutations.flush(s.conn)?;
                 for (table,cursor) in [("__source__",i64::MIN),("records",id)] {
                     s.conn.execute("INSERT INTO convo_import(source,table_name,cursor,done,fingerprint) VALUES (?1,?2,?3,0,?4)",vec![txt(&source),txt(table),int(cursor),txt(&identity)])?;
                 }

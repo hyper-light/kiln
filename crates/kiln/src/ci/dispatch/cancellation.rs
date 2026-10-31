@@ -80,6 +80,7 @@ impl Handle {
 
 impl Dispatch {
     pub(super) async fn accept_cancel(&mut self, run: &str, expected: Option<u32>, reason: &str) -> Result<(), CancelError> {
+        if self.pipeline_retries.contains_key(run) {return Err(CancelError::Unavailable("the original pipeline retry outcome is pending"));}
         let Some(state) = self.runs.get(run) else {
             // Internal group commands for an already-retired run remain idempotent. An API
             // request must distinguish that from an unfinished plan not owned after recovery.
@@ -255,7 +256,7 @@ mod tests {
             sched: Scheduler::new(sched_config(&hub, Vec::new())), hub, routing: Default::default(),
             held: HashMap::new(), runs: HashMap::new(), legs: HashMap::new(), timers: BTreeSet::new(), next: Vec::new(),
             in_commands: false, pods: HashSet::new(), absent_after: None, decisions: HashMap::new(), warm: HashMap::new(),
-            warm_seq: 0, admission: admission::State::default(), pending_losses: HashMap::new(),
+            warm_seq: 0, admission: admission::State::default(), pending_losses: HashMap::new(), pipeline_retries:Default::default(),
         }
     }
 

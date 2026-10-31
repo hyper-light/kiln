@@ -772,7 +772,7 @@ mod tests {
             assert_eq!(ready.snapshot.shape, Some(shaped));
             assert_eq!(ready.startup, vm.startup, "Ready cannot rewrite the original startup owner or image");
             let mut d = Dispatch { hub: std::sync::Arc::clone(&hub), sched: kiln_ci::sched::Scheduler::new(Default::default()), routing: Default::default(), held: Default::default(), runs: Default::default(), legs: Default::default(),
-                timers: Default::default(), next: Vec::new(), in_commands: true, pods: Default::default(), absent_after: None, decisions: Default::default(), warm: Default::default(), warm_seq: 0, admission: Default::default(), pending_losses: Default::default() };
+                timers: Default::default(), next: Vec::new(), in_commands: true, pods: Default::default(), absent_after: None, decisions: Default::default(), warm: Default::default(), warm_seq: 0, admission: Default::default(), pending_losses: Default::default(), pipeline_retries:Default::default() };
             d.sched.restore_executor(ready.snapshot.clone(), false, now_ms());
             let origin = ExecutorOrigin { peer: 2, connection: "authenticated-original-connection".into(), process_nonce: Some("a".repeat(43)) };
             let recovery = crate::runner::pool::Said { executor: vm.executor.clone(), state: "stopped".into(), generation: Some(vm.generation.clone()), allocation: Some(vm.allocation.clone()), physical_execution: Some("vm-physical".into()),
@@ -848,7 +848,7 @@ mod tests {
             hub.store.kv_set(key(&next.executor), serde_json::to_string(&next)?).await?;
             assert!(stop_exact_executor_grant(&hub, &ready).await?.is_none(), "late stop cannot fence a successor allocation");
             let mut d = Dispatch { hub: std::sync::Arc::clone(&hub), sched: kiln_ci::sched::Scheduler::new(Default::default()), routing: Default::default(), held: Default::default(), runs: Default::default(), legs: Default::default(),
-                timers: Default::default(), next: Vec::new(), in_commands: true, pods: Default::default(), absent_after: None, decisions: Default::default(), warm: Default::default(), warm_seq: 0, admission: Default::default(), pending_losses: Default::default() };
+                timers: Default::default(), next: Vec::new(), in_commands: true, pods: Default::default(), absent_after: None, decisions: Default::default(), warm: Default::default(), warm_seq: 0, admission: Default::default(), pending_losses: Default::default(), pipeline_retries:Default::default() };
             d.sched.restore_executor(next.snapshot.clone(), false, now_ms());
             let failed = crate::runner::pool::Said { executor: ready.executor.clone(), state: "failed".into(), generation: Some(ready.generation.clone()),
                 allocation: Some(ready.allocation.clone()), physical_execution: ready.physical_execution.clone(), error: Some("late startup error".into()), ..Default::default() };
@@ -987,7 +987,7 @@ mod tests {
             assert!(!stopped_received(&hub, "other-host", &said).await?);
             assert!(!stopped_received(&hub, "host", &crate::runner::pool::Said { physical_execution: Some("different".into()), ..said.clone() }).await?);
             let mut d = Dispatch { hub: std::sync::Arc::clone(&hub), sched: kiln_ci::sched::Scheduler::new(Default::default()), routing: Default::default(), held: Default::default(), runs: Default::default(), legs: Default::default(),
-                timers: Default::default(), next: Vec::new(), in_commands: false, pods: Default::default(), absent_after: None, decisions: Default::default(), warm: Default::default(), warm_seq: 0, admission: Default::default(), pending_losses: Default::default() };
+                timers: Default::default(), next: Vec::new(), in_commands: false, pods: Default::default(), absent_after: None, decisions: Default::default(), warm: Default::default(), warm_seq: 0, admission: Default::default(), pending_losses: Default::default(), pipeline_retries:Default::default() };
             d.restore_admission().await?;
             d.executor_event("host", said.clone()).await?;
             assert!(executor_grant(&hub, &g.executor).await?.is_none(), "receipt replay never reconstructs a grant");

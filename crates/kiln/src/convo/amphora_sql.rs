@@ -127,7 +127,7 @@ pub const MIGRATIONS: &[&str] = &[
 pub const META: &str = "CREATE TABLE IF NOT EXISTS convo_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)";
 pub const META_GET: &str = "SELECT value FROM convo_meta WHERE key = ?1";
 pub const META_SET: &str = "INSERT INTO convo_meta (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = excluded.value";
-pub const REV_MAX: &[&str] = &["SELECT MAX(rev) FROM convo_sessions", "SELECT MAX(rev) FROM convo_events", "SELECT MAX(rev) FROM convo_records", "SELECT MAX(rev) FROM convo_drops"];
+pub const REV_MAX: &[&str] = &["SELECT MAX(rev) FROM convo_sessions", "SELECT MAX(rev) FROM convo_events", "SELECT MAX(rev) FROM convo_records", "SELECT MAX(rev) FROM convo_drops", "SELECT MAX(close_rev) FROM convo_retention", "SELECT MAX(accepted_rev) FROM convo_retention"];
 
 pub const SESSION_UPSERT: &str = "INSERT INTO convo_sessions (id, info, meta, state, changes, updated_at, epoch, rev) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
     ON CONFLICT (id) DO UPDATE SET

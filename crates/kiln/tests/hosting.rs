@@ -2734,7 +2734,8 @@ fn w15_r08_kinds_the_starter_set_and_the_board() -> anyhow::Result<()> {
     for (name, body, why) in [
         ("bad", json!({ "kind": "host" }), "runners"),
         ("bad", json!({ "kind": "kubernetes", "targets": { "clusters": [] } }), "clusters"),
-        ("bad", json!({ "kind": "space" }), "isn't a kind"),
+        // U13: an invalid kind is refused at its typed input path, not by legacy prose.
+        ("bad", json!({ "kind": "space" }), "/kind"),
         ("bad", json!({ "kind": "host", "targets": { "runners": "label (" } }), "its runners"),
         ("bad", json!({ "kind": "platform" }), "integration"),
     ] {
@@ -3888,7 +3889,8 @@ fn w26_r11_the_gate_holds_warns_and_informs() -> anyhow::Result<()> {
     }
     let (st, r) = call("PATCH", &s.admin, &blocking, Some(json!({ "state": "resolved" })))?;
     assert_eq!((st, error(&r)), (400, "expand.rs:2: an owner resolving kim's blocking comment says why (`reason`)".to_owned()), "{r}");
-    let (st, r) = call("PATCH", &kim, &blocking, Some(json!({ "state": "resolved" })))?;
+    // U13: the existing named resolve shorthand still defaults to resolving, on this same gate.
+    let (st, r) = post(&s, &kim, "/api/ops/ci.diffs.resolve", &json!({ "comment": blocking }))?;
     anyhow::ensure!(st == 200, "kim resolves her own: {r}");
     let done = thread_of(&threads(&lee)?, &blocking);
     assert_eq!((text(&done, "state"), text(&done, "resolved_by")), ("resolved", "user:kim"), "{done}");
@@ -3896,6 +3898,9 @@ fn w26_r11_the_gate_holds_warns_and_informs() -> anyhow::Result<()> {
     // A blocking thread whose reviewer has gone: an owner resolves it, saying why, and the reason
     // stays with it.
     let (stranded, _) = said(&kim, json!({ "body": "and the last axis", "file": "expand.rs", "start_line": 3, "kind": "blocking", "publish": true }))?;
+    let (st, r) = call("PATCH", &s.admin, &stranded, Some(json!({ "state": "resolved", "reson": "a typo is not a reason" })))?;
+    assert!(st == 400 && error(&r).contains("/reson"), "{st} {r}");
+    assert_eq!(text(&thread_of(&threads(&lee)?, &stranded), "state"), "open", "a typed refusal changes no thread");
     let (st, r) = call("PATCH", &s.admin, &stranded, Some(json!({ "state": "resolved", "reason": "kim is away; D2 handles the empty matrix" })))?;
     anyhow::ensure!(st == 200, "an owner resolves it, saying why: {r}");
     let kept = thread_of(&threads(&lee)?, &stranded);
@@ -3908,6 +3913,12 @@ fn w26_r11_the_gate_holds_warns_and_informs() -> anyhow::Result<()> {
     assert_eq!(st, 400, "{r}");
     let (st, r) = call("PATCH", &kim, &question, Some(json!({ "kind": "issue" })))?;
     assert_eq!((st, text(&r, "kind")), (200, "issue"), "{r}");
+    // U13/W26-R11: kind-only and body-only public PATCHes preserve the open thread.
+    assert_eq!(text(&thread_of(&threads(&lee)?, &question), "state"), "open");
+    let (st, r) = call("PATCH", &kim, &question, Some(json!({ "body": "why the first axis, including an empty matrix?" })))?;
+    anyhow::ensure!(st == 200, "the author edits the comment: {r}");
+    let edited = thread_of(&threads(&lee)?, &question);
+    assert_eq!((text(&edited, "state"), edited.pointer("/comments/0/body")), ("open", Some(&json!("why the first axis, including an empty matrix?"))), "{edited}");
 
     // Two issues open warn: accepting asks for `force`, then says what's open; neither holds landing.
     let (other, _) = said(&kim, json!({ "body": "the docs say nothing of empty matrices", "kind": "issue", "publish": true }))?;

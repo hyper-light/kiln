@@ -1,0 +1,5 @@
+-- kiln:epoch 6
+-- U01/W05-R28: retry-subgraph and retry-subgraph-refused are exact plan-log
+-- decisions, not leg-completion reports. Older replay must refuse this store.
+-- Active retry also requires the original Store's actual durable writer floor;
+-- this reader marker alone does not fence already-attached older writers.

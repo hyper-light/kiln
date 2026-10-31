@@ -275,12 +275,14 @@ impl Drop for Owner {
 #[derive(Clone)]
 pub struct Client {
     pub(super) path: PathBuf,
+    application: Option<crate::database::Application>,
 }
 impl Client {
     pub fn connect(path: &Path, until: Instant) -> Result<Self, Refusal> {
         remaining(until)?;
         let client = Self {
             path: path.canonicalize().map_err(unavailable)?,
+            application: None,
         };
         // Authenticate now, without creating a writer session or replaying any command.
         let mut stream = client.stream(until)?;
@@ -291,6 +293,11 @@ impl Client {
             _ => return Err(unavailable("unexpected owner probe response")),
         }
         Ok(client)
+    }
+    pub(crate) fn for_application(&self, application: Option<crate::database::Application>) -> Self {
+        let mut client = self.clone();
+        client.application = application;
+        client
     }
     pub(super) fn stream(&self, until: Instant) -> Result<Stream, Refusal> {
         remaining(until)?;
@@ -313,9 +320,18 @@ impl Client {
         let proof = auth::proof(&token, false, &hello, &challenge.nonce)?;
         write_auth(&mut stream, &proof, auth_until)?;
         match read_limit::<Response>(&mut stream, auth_until, 256)?? {
-            Answer::Ready => Ok(stream),
-            _ => Err(unavailable("unexpected owner greeting")),
+            Answer::Ready => (),
+            _ => return Err(unavailable("unexpected owner greeting")),
         }
+        if let Some(application) = &self.application {
+            application.validate()?;
+            send(&mut stream, &encode(&Request::Application(application.clone()), 256)?, until)?;
+            match read_limit::<Response>(&mut stream, until, 256)?? {
+                Answer::Ready => (),
+                _ => return Err(unavailable("application declaration refused")),
+            }
+        }
+        Ok(stream)
     }
     pub(super) fn request(&self, request: Request, until: Instant) -> Result<Answer, Error> {
         let encoded = encode(&request, FRAME_MAX)?;
@@ -635,6 +651,14 @@ fn serve(
         .ok_or(Refusal::Timeout)?;
     write(&mut stream, &Ok::<_, Refusal>(Answer::Ready), until)?;
     let mut request: Request = read(&mut stream, until)?;
+    let application = if let Request::Application(application) = request {
+        application.validate()?;
+        // This ACK is schema acceptance only, before any application effect.
+        // Admission is checked again by the actual serialized SQL writer.
+        write(&mut stream, &Ok::<_, Refusal>(Answer::Ready), until)?;
+        request = read(&mut stream, until)?;
+        Some(application)
+    } else { None };
     if matches!(request, Request::Capabilities) {
         write(
             &mut stream,
@@ -659,7 +683,10 @@ fn serve(
     if matches!(request, Request::Probe) {
         return write(&mut stream, &Ok::<_, Refusal>(Answer::Done), until);
     }
-    let database = acquire().ok_or_else(|| unavailable("owner is draining"))?;
+    let mut database = acquire().ok_or_else(|| unavailable("owner is draining"))?;
+    if let Some(application) = application {
+        database = database.for_application(&application.name, application.version)?;
+    }
     if matches!(request, Request::Session) {
         let mut final_stream = stream.try_clone().map_err(unavailable)?;
         let result = database
@@ -763,7 +790,7 @@ fn serve(
                 Record::ImportState => Answer::ImportState(ns.import_state(until)?),
             })
         })(),
-        Request::Session | Request::Probe | Request::Capabilities => {
+        Request::Session | Request::Probe | Request::Capabilities | Request::Application(_) => {
             Err(unavailable("unexpected session"))
         }
     };
