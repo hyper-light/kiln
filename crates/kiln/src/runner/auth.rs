@@ -355,13 +355,51 @@ impl Refresh {
     }
 }
 
+/// Copy from the same owned running file for both helper names. The caller already
+/// runs staging on its existing blocking lane; rewind is private to this one file owner.
+#[cfg(target_os = "linux")]
+fn stage_running_binary(file: &mut std::fs::File, tmp: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::io::Seek as _;
+    file.rewind()?;
+    let mut output = std::fs::File::create(tmp)?;
+    std::io::copy(file, &mut output)?;
+    crate::os::make_executable(tmp)?;
+    std::fs::rename(tmp, dst)
+}
+
+/// Length and time only avoid unnecessary reads. A mutable cached helper must also
+/// contain exactly this running image; bound its read even if another writer grows it.
+#[cfg(target_os = "linux")]
+fn cached_running_binary(path: &Path, source: &std::fs::Metadata, own: &(String, u64)) -> bool {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    if !std::fs::metadata(path).is_ok_and(|other| source.len() == other.len() && source.modified().ok() <= other.modified().ok()) {
+        return false;
+    }
+    let Ok(file) = std::fs::OpenOptions::new().read(true).custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK).open(path) else { return false };
+    let Ok(cached) = file.metadata() else { return false };
+    if !cached.is_file() || cached.len() != source.len() || cached.modified().ok() < source.modified().ok() { return false; }
+    crate::updates::hash_reader(file.take(own.1.saturating_add(1))).ok().as_ref() == Some(own)
+}
+
 /// The runner's own binary in `<work>/_externals/kiln/` (containers see it at `/__e/kiln/`), so
-/// a step can run `kiln auth` (W11-R04): linked where it can be, copied where it can't,
-/// replaced when the runner is. (A container needs the libc the binary was built against.)
+/// a step can run `kiln auth` (W11-R04). Linux copies its retained running file and checks
+/// cached bytes; other platforms keep their ordinary hard-link/copy path behavior.
+/// A container still needs the libc the binary was built against.
 pub fn place_binary(work: &Path) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    let (mut file, source, own) = {
+        let file = crate::os::running_binary_file().ok()?;
+        let metadata = file.metadata().ok()?;
+        (file, metadata, crate::updates::own_binary().ok()?)
+    };
+    #[cfg(not(target_os = "linux"))]
     let exe = crate::os::this_kiln().ok()?;
     let dir = work.join("_externals").join("kiln");
     let dst = dir.join(if cfg!(windows) { "kiln.exe" } else { "kiln" });
+    #[cfg(target_os = "linux")]
+    let current = cached_running_binary(&dst, &source, &own);
+    #[cfg(not(target_os = "linux"))]
     let current = match (std::fs::metadata(&exe), std::fs::metadata(&dst)) {
         (Ok(x), Ok(y)) => x.len() == y.len() && x.modified().ok() <= y.modified().ok(),
         _ => false,
@@ -370,17 +408,28 @@ pub fn place_binary(work: &Path) -> Option<PathBuf> {
         std::fs::create_dir_all(&dir).ok()?;
         let tmp = dir.join(format!(".kiln-{}", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
-        if std::fs::hard_link(&exe, &tmp).is_err() {
-            std::fs::copy(&exe, &tmp).ok()?;
+        #[cfg(target_os = "linux")]
+        stage_running_binary(&mut file, &tmp, &dst).ok()?;
+        #[cfg(not(target_os = "linux"))]
+        {
+            if std::fs::hard_link(&exe, &tmp).is_err() {
+                std::fs::copy(&exe, &tmp).ok()?;
+            }
+            std::fs::rename(&tmp, &dst).ok()?;
         }
-        std::fs::rename(&tmp, &dst).ok()?;
     }
     // Docker's credential helper is the same binary by another name (W12-R03).
     let helper = dir.join(if cfg!(windows) { "docker-credential-kiln.exe" } else { "docker-credential-kiln" });
+    #[cfg(target_os = "linux")]
+    let same = cached_running_binary(&helper, &source, &own);
+    #[cfg(not(target_os = "linux"))]
     let same = matches!((std::fs::metadata(&dst), std::fs::metadata(&helper)), (Ok(x), Ok(y)) if x.len() == y.len() && x.modified().ok() <= y.modified().ok());
     if !same {
         let tmp = dir.join(format!(".helper-{}", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
+        #[cfg(target_os = "linux")]
+        stage_running_binary(&mut file, &tmp, &helper).ok()?;
+        #[cfg(not(target_os = "linux"))]
         if std::fs::hard_link(&dst, &tmp).is_ok() || std::fs::copy(&dst, &tmp).is_ok() {
             let _ = std::fs::rename(&tmp, &helper);
         }

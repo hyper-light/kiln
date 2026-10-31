@@ -811,7 +811,15 @@ const SINK_BATCH: usize = 1 << 20;
 /// end of file (or a read error, which is logged).
 pub fn file_source(path: impl Into<PathBuf>) -> anyhow::Result<async_channel::Receiver<Bytes>> {
     let path = path.into();
-    let file = Arc::new(std::fs::File::open(&path).with_context(|| format!("open {}", path.display()))?);
+    let file = std::fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
+    Ok(file_source_open(file, path))
+}
+
+/// Retain an already-open file through this stream. `path` labels read errors only;
+/// it is never reopened. Every stream has its own positional offset, even if file
+/// descriptors share a cursor. The same blocking reads and bounded back-pressure apply.
+pub(crate) fn file_source_open(file: std::fs::File, path: PathBuf) -> async_channel::Receiver<Bytes> {
+    let file = Arc::new(file);
     let (tx, rx) = async_channel::bounded::<Bytes>(4);
     spawn(async move {
         let mut offset = 0u64;
@@ -843,7 +851,7 @@ pub fn file_source(path: impl Into<PathBuf>) -> anyhow::Result<async_channel::Re
             }
         }
     });
-    Ok(rx)
+    rx
 }
 
 /// Write a stream of chunks to a new file. Send chunks into the returned sender, drop it, then
@@ -1261,6 +1269,16 @@ mod tests {
                 back.extend_from_slice(&c);
             }
             assert_eq!(back, data);
+
+            // Shared file descriptors still give each stream all bytes from offset zero.
+            let file = std::fs::File::open(&p)?;
+            let first = file_source_open(file.try_clone()?, p.clone());
+            let second = file_source_open(file, p.clone());
+            for source in [first, second] {
+                let mut received = Vec::new();
+                while let Ok(chunk) = source.recv().await { received.extend_from_slice(&chunk); }
+                assert_eq!(received, data);
+            }
 
             let (tx, done) = file_sink(dir.path().join("small"), 10)?;
             let _ = tx.send(Bytes::from_static(b"0123456789abc")).await;

@@ -215,7 +215,21 @@ pub(crate) fn say(msg: impl AsRef<str>) {
 
 /// Copy the running executable to `dest` atomically (no-op if it already is `dest`).
 pub(crate) fn place_binary(dest: &Path) -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    let mut file = {
+        use std::os::unix::fs::MetadataExt as _;
+        let file = crate::os::running_binary_file()?;
+        let source = file.metadata()?;
+        if let Ok(destination) = std::fs::metadata(dest)
+            && (source.dev(), source.ino()) == (destination.dev(), destination.ino())
+        {
+            return Ok(());
+        }
+        file
+    };
+    #[cfg(not(target_os = "linux"))]
     let exe = std::env::current_exe()?;
+    #[cfg(not(target_os = "linux"))]
     if let (Ok(source),Ok(destination))=(exe.canonicalize(),dest.canonicalize())
         && source==destination
     {
@@ -233,6 +247,12 @@ pub(crate) fn place_binary(dest: &Path) -> anyhow::Result<()> {
         }
     }
     let tmp = dest.with_extension(format!("new.{}", std::process::id()));
+    #[cfg(target_os = "linux")]
+    {
+        let mut output = std::fs::File::create(&tmp).with_context(|| format!("copy to {}", tmp.display()))?;
+        std::io::copy(&mut file, &mut output).with_context(|| format!("copy to {}", tmp.display()))?;
+    }
+    #[cfg(not(target_os = "linux"))]
     std::fs::copy(&exe, &tmp).with_context(|| format!("copy to {}", tmp.display()))?;
     crate::os::make_executable(&tmp)?;
     sign_placed(&tmp, dest);

@@ -3450,8 +3450,8 @@ async fn deny_join(hub: &Hub, id: &str) -> R {
 
 /// The running binary, so new agents can be installed straight from the server.
 async fn download_binary() -> R {
-    let exe = std::env::current_exe().map_err(anyhow::Error::from)?;
-    let body = crate::rt::file_source(exe)?;
+    let file = crate::os::running_binary_file().map_err(anyhow::Error::from)?;
+    let body = crate::rt::file_source_open(file, std::path::PathBuf::from("running kiln binary"));
     Ok(srv::response(StatusCode::OK, "application/octet-stream", srv::channel_body(body)))
 }
 

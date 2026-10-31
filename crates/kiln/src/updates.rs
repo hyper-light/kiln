@@ -190,8 +190,8 @@ pub fn build_id(sha256_hex: &str) -> String {
 pub fn own_binary() -> Result<(String, u64), String> {
     static OWN: OnceLock<Result<(String, u64), String>> = OnceLock::new();
     OWN.get_or_init(|| {
-        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        hash_file(&exe).map_err(|e| format!("{e:#}"))
+        let file = crate::os::running_binary_file().map_err(|e| e.to_string())?;
+        hash_reader(file).map_err(|e| format!("{e:#}"))
     })
     .clone()
 }
@@ -213,8 +213,11 @@ pub fn own_build() -> String {
 }
 
 pub(crate) fn hash_file(p: &Path) -> anyhow::Result<(String, u64)> {
-    use std::io::Read as _;
-    let mut f = std::fs::File::open(p).with_context(|| format!("open {}", p.display()))?;
+    let file = std::fs::File::open(p).with_context(|| format!("open {}", p.display()))?;
+    hash_reader(file)
+}
+
+pub(crate) fn hash_reader(mut f: impl std::io::Read) -> anyhow::Result<(String, u64)> {
     let mut h = Sha256::new();
     let mut buf = vec![0u8; 1 << 20];
     let mut size = 0u64;

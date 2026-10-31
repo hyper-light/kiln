@@ -1190,7 +1190,7 @@ pub(crate) async fn retire_turn(logs:&super::Logs,store:&Store,blobs:&Arc<dyn Bl
     // New requests register before lookup; late Resume performs its own checked lookup.
     if logs.io.lock().busy(&job) {return Ok(false)}
     let check=view.clone();
-    let pending=store.call(move |c|Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM ci_log_accepted_ops WHERE view=?1 AND status='pending' UNION ALL SELECT 1 FROM ci_log_accepted_copy WHERE source_view=?1 AND active=1 UNION ALL SELECT 1 FROM ci_log_accepted_unpublished WHERE view=?1)",[check],|r|r.get::<_,bool>(0))?)).await?;
+    let pending=store.call(move |c|Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM ci_log_accepted_ops WHERE view=?1 AND status='pending') OR EXISTS(SELECT 1 FROM ci_log_accepted_copy WHERE source_view=?1 AND active=1) OR EXISTS(SELECT 1 FROM ci_log_accepted_unpublished WHERE view=?1)",[check],|r|r.get::<_,bool>(0))?)).await?;
     anyhow::ensure!(!pending,"retired view {view} retains a pending original operation; no cleanup verdict");
     let key_view=view.clone();
     let pin=store.call(move |c|{

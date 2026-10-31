@@ -129,6 +129,17 @@ pub fn have(name: &str) -> bool {
     which(name).is_some()
 }
 
+/// Open the running image for an owned read or copy, not a command to launch. Linux's
+/// kernel link still names the executed inode after its installed pathname is replaced.
+/// Each caller owns a fresh file and retains it through the last read; no identity or
+/// CI approval is inferred. Other platforms keep their current-executable path law.
+pub(crate) fn running_binary_file() -> std::io::Result<std::fs::File> {
+    #[cfg(target_os = "linux")]
+    { std::fs::File::open("/proc/self/exe") }
+    #[cfg(not(target_os = "linux"))]
+    { std::fs::File::open(std::env::current_exe()?) }
+}
+
 /// This kiln's binary, as a path another process can start. On Linux, once an upgrade has put a new
 /// binary in its place (and until this process takes it up, once its jobs are done), the path
 /// reads `<path> (deleted)`: the kiln at `<path>` is the one to start.
@@ -373,12 +384,20 @@ mod tests {
         const GO: &str = "KILN_TEST_REPLACED_GO";
         // The run in the replaced binary: once told, what it names.
         if let Some(go) = std::env::var_os(GO) {
+            let retained = running_binary_file()?;
             let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
             while !Path::new(&go).exists() && std::time::Instant::now() < until {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             println!("exe={}", std::env::current_exe()?.display());
             println!("this_kiln={}", this_kiln()?.display());
+            let mut kept = [0u8; 4];
+            let mut current = [0u8; 4];
+            assert_eq!(read_at(&retained, &mut kept, 0)?, kept.len());
+            assert_eq!(read_at(&running_binary_file()?, &mut current, 0)?, current.len());
+            assert_eq!(kept, *b"\x7fELF");
+            assert_eq!(current, kept, "fresh and retained reads still name the executed image");
+            println!("running_image={}", hex::encode(current));
             return Ok(());
         }
         let me = std::env::current_exe()?;
@@ -399,6 +418,7 @@ mod tests {
         println!("{said}");
         assert!(said.contains(&format!("exe={} (deleted)\n", bin.display())), "the replaced binary's own path: {said}");
         assert!(said.contains(&format!("this_kiln={}\n", bin.display())), "{said}");
+        assert!(said.contains("running_image=7f454c46\n"), "owned reads must retain the running ELF, not replacement bytes: {said}");
         Ok(())
     }
 
