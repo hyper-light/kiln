@@ -387,22 +387,29 @@ fn now_ms() -> u64 {
 /// `GET /api/ship/deploys?q=`: every app, by project (W26-R24).
 pub async fn list(hub: &Arc<Hub>, q: &HashMap<String, String>, caller: &crate::authz::Caller) -> Result<Response, Fail> {
     may_read(hub, caller).await?;
-    let cd = cd()?;
-    let mut facts = gather(&cd, None);
-    read_ahead(&cd, &mut facts).await;
-    Ok(srv::json(StatusCode::OK, &list_json(&facts, q.get("q").map(String::as_str), now_ms())))
+    Ok(srv::json(StatusCode::OK, &list_of(&cd()?, q.get("q").map(String::as_str), now_ms()).await))
+}
+
+/// The list as `cd` holds it.
+async fn list_of(cd: &Arc<Cd>, q: Option<&str>, now_ms: u64) -> Value {
+    let mut facts = gather(cd, None);
+    read_ahead(cd, &mut facts).await;
+    list_json(&facts, q, now_ms)
 }
 
 /// `GET /api/ship/deploys/:project/:name`: an app's pane (W26-R24).
 pub async fn get(hub: &Arc<Hub>, project: &str, name: &str, caller: &crate::authz::Caller) -> Result<Response, Fail> {
     may_read(hub, caller).await?;
-    let cd = cd()?;
-    let id = format!("{project}/{name}");
-    let mut facts = gather(&cd, Some(&id));
-    read_ahead(&cd, &mut facts).await;
+    Ok(srv::json(StatusCode::OK, &pane_of(&cd()?, &format!("{project}/{name}"), now_ms()).await?))
+}
+
+/// App `id`'s pane as `cd` holds it.
+async fn pane_of(cd: &Arc<Cd>, id: &str, now_ms: u64) -> Result<Value, Fail> {
+    let mut facts = gather(cd, Some(id));
+    read_ahead(cd, &mut facts).await;
     let f = facts.pop().ok_or_else(|| (StatusCode::NOT_FOUND, format!("no app {id}")))?;
-    let o = open(&cd, &f).await;
-    Ok(srv::json(StatusCode::OK, &pane_json(&f, &o, now_ms())))
+    let o = open(cd, &f).await;
+    Ok(pane_json(&f, &o, now_ms))
 }
 
 /// The CD operation a verb of the strip is, and its input, from the body: only what that
@@ -475,10 +482,11 @@ fn op_of(app: &str, verb: &str, body: &Value) -> Result<(&'static str, Value), F
 /// its environment lets agents deploy) and audited in this request's one row; it answers what the
 /// operation did, or why it couldn't.
 pub async fn act(hub: &Arc<Hub>, caller: &crate::authz::Caller, body: &Value) -> Result<Response, Fail> {
-    act_in(hub, caller, body).await.map(|v| srv::json(StatusCode::OK, &v))
+    act_in(hub, caller, body, cd).await.map(|v| srv::json(StatusCode::OK, &v))
 }
 
-async fn act_in(hub: &Arc<Hub>, caller: &crate::authz::Caller, body: &Value) -> Result<Value, Fail> {
+/// [`act`] on the KilnCD `cd` gives, once the caller may.
+async fn act_in(hub: &Arc<Hub>, caller: &crate::authz::Caller, body: &Value, cd: impl FnOnce() -> Result<Arc<Cd>, Fail>) -> Result<Value, Fail> {
     let field = |k: &str| body.get(k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
     let (Some(app), Some(verb)) = (field("app"), field("verb")) else {
         return Err((StatusCode::BAD_REQUEST, "`app` and `verb`: the app, and what to do to it".to_string()));
@@ -741,5 +749,258 @@ mod tests {
         assert_eq!(project_of(Some("git@github.com:hyper-light/site.git"), "default", &names), "hyper-light/site");
         assert_eq!(project_of(Some("oci://ghcr.io"), "default", &names), "ghcr.io");
         assert_eq!(project_of(None, "default", &names), "default");
+    }
+
+    fn within(f: impl std::future::Future<Output = anyhow::Result<()>> + Send + 'static) -> anyhow::Result<()> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::rt::block_on(f));
+        });
+        rx.recv_timeout(Duration::from_secs(120)).unwrap_or_else(|_| Err(anyhow::anyhow!("not done within two minutes")))
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> anyhow::Result<String> {
+        let o = std::process::Command::new("git")
+            .args(["-c", "user.name=ada", "-c", "user.email=ada@example.com", "-c", "init.defaultBranch=main", "-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()?;
+        anyhow::ensure!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+        Ok(String::from_utf8_lossy(&o.stdout).trim().to_owned())
+    }
+
+    /// A repository at `dir` with two commits on main: their shas, oldest first.
+    fn two_commits(dir: &std::path::Path) -> anyhow::Result<(String, String)> {
+        std::fs::create_dir_all(dir.join("deploy"))?;
+        git(dir, &["init", "-q"])?;
+        let mut shas = Vec::new();
+        for n in ["one", "two"] {
+            std::fs::write(dir.join("deploy/cm.yaml"), format!("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: web-config\ndata:\n  v: {n}\n"))?;
+            git(dir, &["add", "."])?;
+            git(dir, &["commit", "-q", "-m", &format!("Commit {n}")])?;
+            shas.push(git(dir, &["rev-parse", "HEAD"])?);
+        }
+        let mut it = shas.into_iter();
+        Ok((it.next().unwrap_or_default(), it.next().unwrap_or_default()))
+    }
+
+    /// What the simulated cluster's engine left, for the scratch KilnCD.
+    struct Left {
+        statuses: Vec<(String, kiln_cd::engine::Summary)>,
+        deployments: Vec<Deployment>,
+        now: u64,
+    }
+
+    /// W26-R24 over a scratch hub, with the simulated cluster: four apps of two repositories run on
+    /// it as people and kiln ran them (kiln-production synced by a person, then behind git;
+    /// kiln-staging synced by itself; quiver-production rolled back by a person; quiver-canary's
+    /// rollout waiting for an approval), and KilnCD holds what the engine left, what its store kept
+    /// (the history, the pin, the rollout) and its mirrors of the repositories. Ship's list, each
+    /// pane and each verb are read and done from there.
+    #[test]
+    fn w26_r24_over_a_scratch_hub_with_the_simulated_cluster_ship_reads_what_cd_holds_and_acts_through_its_ops() -> anyhow::Result<()> {
+        use kiln_cd::engine::{Config as EngineConfig, Engine, Input, OpPhase, Record, SyncRequest, Trigger};
+        use kiln_cd::harness::{Harness, Renderer};
+        use kiln_cd::model::{AppConfig, SyncPolicy};
+        use kiln_cd::state::{Command, rollout_id};
+
+        let dir = tempfile::tempdir()?;
+        let (k1, k2) = two_commits(&dir.path().join("git/hyper-light/kiln"))?;
+        let (q1, q2) = two_commits(&dir.path().join("git/hyper-light/quiver"))?;
+        let short = |s: &str| s.get(..7).unwrap_or(s).to_owned();
+        let url = |name: &str| format!("file://{}", dir.path().join("git/hyper-light").join(name).to_string_lossy());
+        let (kiln_url, quiver_url) = (url("kiln"), url("quiver"));
+        const KP: &str = "default/kiln-production";
+        const KS: &str = "default/kiln-staging";
+        const QP: &str = "default/quiver-production";
+        const QC: &str = "default/quiver-canary";
+        let start = 1_793_400_000_000;
+        let (d1, d2, d3, d4) = (k1.clone(), k2.clone(), q1.clone(), q2.clone());
+        let drive = move || {
+            // Each app's objects at a commit: its Deployment's image and its config say which.
+            let renderer: Renderer = Box::new(|_app: &str, rev: &str, _key: u64| {
+                let r = rev.get(..7).unwrap_or(rev);
+                Ok(vec![
+                    json!({"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "web"}, "spec": {"replicas": 1, "selector": {"matchLabels": {"app": "web"}}, "template": {"metadata": {"labels": {"app": "web"}}, "spec": {"containers": [{"name": "web", "image": format!("web:{r}")}]}}}}),
+                    json!({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "web-config"}, "data": {"v": r}}),
+                ])
+            });
+            let mut h = Harness::new(Engine::new(EngineConfig { wave_delay_ms: 0, ..EngineConfig::default() }), renderer);
+            h.now = start;
+            h.add_cluster(kiln_cd::sim::Cluster::new("dev"), None);
+            for (id, auto) in [(KP, false), (KS, true), (QP, false), (QC, false)] {
+                let mut a = AppConfig::new(id, "dev", id.trim_start_matches("default/"));
+                a.sync = SyncPolicy { auto, prune: true, self_heal: false, ..SyncPolicy::default() };
+                h.input(Input::UpsertApp(a));
+            }
+            let key = |id: &str, rev: &str| kiln_cd::obj::hash_bytes(format!("{id}@{rev}").as_bytes());
+            let inputs = |h: &mut Harness, id: &str, rev: &str| h.input(Input::Inputs { app: id.into(), revision: rev.into(), key: key(id, rev), content: key(id, rev) });
+            let by_ada = || SyncRequest { by: Some("ada".into()), ..SyncRequest::default() };
+            let finished = |h: &Harness, id: &str| h.records.iter().filter(|r| matches!(r, Record::Finished { app, .. } if &**app == id)).count();
+            let settled = |h: &Harness, id: &str| h.statuses.get(id).is_some_and(|s| s.sync == Sync::Synced && s.health == Health::Healthy && s.operation.as_ref().is_some_and(|o| o.phase == OpPhase::Succeeded));
+            let sync = |h: &mut Harness, id: &str, n: usize| {
+                h.input(Input::Sync { app: id.into(), request: by_ada() });
+                h.run_until(60_000, |h| finished(h, id) == n && settled(h, id))
+            };
+            // kiln-production: a person syncs the first commit; then git moves on.
+            inputs(&mut h, KP, &d1);
+            let mut ok = sync(&mut h, KP, 1);
+            // kiln-staging syncs the second by itself.
+            inputs(&mut h, KS, &d2);
+            ok &= h.run_until(60_000, |h| finished(h, KS) == 1 && settled(h, KS));
+            inputs(&mut h, KP, &d2);
+            h.run_for(10_000);
+            // quiver-production: synced to each commit, then rolled back to the first.
+            inputs(&mut h, QP, &d3);
+            ok &= sync(&mut h, QP, 1);
+            inputs(&mut h, QP, &d4);
+            ok &= sync(&mut h, QP, 2);
+            let back = SyncRequest { trigger: Some(Trigger::Rollback), ..by_ada() };
+            h.input(Input::SyncTo { app: QP.into(), revision: d3.as_str().into(), key: key(QP, &d3), content: key(QP, &d3), request: back });
+            ok &= h.run_until(60_000, |h| finished(h, QP) == 3 && settled(h, QP));
+            // quiver-canary: the first commit, then the second, whose rollout waits.
+            inputs(&mut h, QC, &d3);
+            ok &= sync(&mut h, QC, 1);
+            inputs(&mut h, QC, &d4);
+            ok &= sync(&mut h, QC, 2);
+            let deployments: Vec<Deployment> = h
+                .records
+                .iter()
+                .filter_map(|r| match r {
+                    Record::Finished { app, op, revision, key, content, trigger, by, succeeded, message, applied, pruned, at_ms } => Some(Deployment {
+                        app: app.to_string(),
+                        op: *op,
+                        revision: revision.as_ref().map(|r| r.to_string()),
+                        key: *key,
+                        trigger: trigger.as_str().to_owned(),
+                        by: by.clone(),
+                        succeeded: *succeeded,
+                        message: message.clone(),
+                        applied: *applied,
+                        pruned: *pruned,
+                        at_ms: *at_ms,
+                        content: *content,
+                        commits: vec![revision.as_ref().map(|r| r.to_string())],
+                        ..Deployment::default()
+                    }),
+                    _ => None,
+                })
+                .collect();
+            let statuses = h.statuses.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+            let now = h.now;
+            (h, (ok, Left { statuses, deployments, now }))
+        };
+        within(async move {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let (cd, (ok, left)) = Cd::scratch(hub.clone(), &dir.path().join("cd"), drive)?;
+            anyhow::ensure!(ok, "the simulated cluster never settled: {:?}", left.statuses);
+            // What KilnCD holds: the apps, the engine's statuses, the store's history, pin and rollout.
+            for (id, repo, auto, env) in [(KP, &kiln_url, false, "production"), (KS, &kiln_url, true, "staging"), (QP, &quiver_url, false, "production"), (QC, &quiver_url, false, "canary")] {
+                let name = id.trim_start_matches("default/");
+                let def: kiln_cd::apps::AppDef = serde_json::from_value(json!({
+                    "name": name, "project": "default",
+                    "sources": [{ "repo": repo, "path": "deploy", "revision": "main", "chart": null, "as_ref": null, "engine": { "Directory": { "recurse": false, "include": null, "exclude": null } } }],
+                    "destination": { "cluster": "dev", "namespace": name },
+                    "sync": { "auto": auto, "prune": true, "self_heal": false, "allow_empty": false, "options": {}, "retry": null },
+                    "ignore": [], "tracking": "Kiln", "origin": "Api", "environment": env, "labels": {}, "history_limit": 10, "cascade": true, "managed_namespace": null,
+                }))?;
+                let entry = crate::cd::AppEntry { def, commits: Vec::new(), deps: Vec::new(), key: None, error: None, children: Default::default(), resolved: VecDeque::new() };
+                cd.apps.write().insert(id.to_owned(), entry);
+            }
+            cd.statuses.write().extend(left.statuses);
+            let submit = |c: Command| {
+                let cd = cd.clone();
+                async move { cd.store.submit(c).await.map_err(|_| anyhow::anyhow!("the store stopped"))?.map_err(anyhow::Error::msg) }
+            };
+            for d in left.deployments {
+                submit(Command::Deployed { deployment: Box::new(d), limit: 10 }).await?;
+            }
+            submit(Command::Pin { app: QP.into(), pin: Some(Box::new(Pin { to: 1, revision: Some(q1.clone()), commits: vec![Some(q1.clone())], head: 1, by: Some("ada".into()), at_ms: left.now })) }).await?;
+            let mut m = Rollout::new(Plan { steps: vec![Step::Weight { weight: 20 }, Step::Approve, Step::Weight { weight: 100 }], ..Plan::default() }, left.now);
+            m.state = State::Paused { why: "waiting for approval".into() };
+            m.step = 1;
+            m.weight = 20;
+            let rid = rollout_id("dev", "apps/Deployment/quiver-canary/web");
+            let rec = RolloutRecord {
+                app: QC.into(), environment: Some("canary".into()), target: "dev".into(), key: "apps/Deployment/quiver-canary/web".into(), object: Value::Null,
+                revision: Some(q2.clone()), previous: Some(q1.clone()), back_to: Some(1), blue: Value::Null, green: Value::Null, preview_url: None, stable_url: None,
+                rollout: m, checks: BTreeMap::new(), started_ms: left.now, updated_ms: left.now, version: 1,
+            };
+            submit(Command::Rollout { id: rid, record: Some(Box::new(rec)), expect: None }).await?;
+            let now = left.now + 2 * stands::SOAK_MS;
+
+            // The list: by project, needs-you first, each row as defined.
+            let v = list_of(&cd, None, now).await;
+            let heads: Vec<(Value, Value)> = at(&v, "/projects").as_array().into_iter().flatten().map(|p| (at(p, "/project").clone(), at(p, "/say").clone())).collect();
+            assert_eq!(heads, [(json!("hyper-light/kiln"), json!("2 apps · 1 out of sync")), (json!("hyper-light/quiver"), json!("2 apps · 1 waits on you"))]);
+            let rows: Vec<(Value, Value, Value, Value)> = at(&v, "/projects")
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|p| at(p, "/apps").as_array().cloned().unwrap_or_default())
+                .map(|r| (at(&r, "/name").clone(), at(&r, "/stand").clone(), at(&r, "/word").clone(), at(&r, "/line").clone()))
+                .collect();
+            assert_eq!(
+                rows,
+                [
+                    (json!("kiln-production"), json!("needs_you"), json!("Out of sync"), json!(format!("#1 runs {} · trunk is 1 ahead · healthy", short(&k1)))),
+                    (json!("kiln-staging"), json!("shipped"), json!("Synced"), json!(format!("#1 runs {} · healthy", short(&k2)))),
+                    (json!("quiver-canary"), json!("needs_you"), json!("Needs you"), json!("#2 is waiting for approval · #1 runs")),
+                    (json!("quiver-production"), json!("rolled_back"), json!("Rolled back"), json!("back on #1 · held there until git changes it")),
+                ]
+            );
+            let kp = at(&v, "/projects/0/apps/0");
+            assert_eq!((at(kp, "/by"), at(kp, "/environment"), at(kp, "/runs"), at(kp, "/sync"), at(kp, "/health")), (&json!("ada"), &json!("production"), &json!(short(&k1)), &json!("OutOfSync"), &json!("Healthy")));
+            assert_eq!(at(&v, "/projects/0/apps/1/by"), &json!("auto-sync"));
+
+            // kiln-production's pane: what differs from git, by owner (its cluster isn't reached
+            // live: what the engine holds), and its history, main's newer commit beside its deploy.
+            let pane = pane_of(&cd, KP, now).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            let groups: Vec<(Value, Value, Value)> = at(&pane, "/groups").as_array().into_iter().flatten().map(|g| (at(g, "/name").clone(), at(g, "/note").clone(), at(g, "/owner/key").clone())).collect();
+            assert_eq!(groups, [(json!("Deployment web"), json!("out of sync"), json!("apps~Deployment~kiln-production~web")), (json!("Config"), json!("1 differs from git"), Value::Null)]);
+            assert_eq!(at(&pane, "/groups/1/items/0/state"), &json!("changes"));
+            assert_eq!(at(&pane, "/tree/live"), &json!(false));
+            let history: Vec<(Value, Value, Value)> = at(&pane, "/history").as_array().into_iter().flatten().map(|l| (at(l, "/deploy").clone(), at(l, "/revision").clone(), at(l, "/now").clone())).collect();
+            assert_eq!(history, [(Value::Null, json!(k2), json!(false)), (json!(1), Value::Null, json!(true))]);
+            // quiver-production's: its deploys of main's commits, what runs now among them.
+            let pane = pane_of(&cd, QP, now).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            let history: Vec<(Value, Value, Value, Value)> = at(&pane, "/history").as_array().into_iter().flatten().map(|l| (at(l, "/deploy").clone(), at(l, "/short").clone(), at(l, "/now").clone(), at(l, "/to").clone())).collect();
+            assert_eq!(history, [(json!(2), json!(short(&q2)), json!(false), json!(2)), (json!(3), json!(short(&q1)), json!(true), Value::Null), (json!(1), json!(short(&q1)), json!(false), json!(1))]);
+            // quiver-canary's: its rollout's steps, and what can't be done meanwhile.
+            let pane = pane_of(&cd, QC, now).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            let steps: Vec<(Value, Value)> = at(&pane, "/rollout/steps").as_array().into_iter().flatten().map(|s| (at(s, "/state").clone(), at(s, "/what").clone())).collect();
+            assert_eq!(steps, [(json!("passed"), json!("weight 20%")), (json!("requested"), json!("a person approves")), (json!("none"), json!("weight 100%"))]);
+            assert_eq!(at(&pane, "/why_not").as_object().map(|m| m.keys().cloned().collect::<Vec<_>>()), Some(vec!["follow".to_owned(), "stop".to_owned()]));
+
+            // The verbs, as the caller: a viewer may do none; the owner's reach their operations,
+            // and what an operation refuses comes back as it says it.
+            let viewer = crate::authz::Caller::peer("vic", "viewer");
+            let owner = crate::authz::Caller::owner();
+            let act = |caller: &crate::authz::Caller, body: Value| {
+                let (hub, cd, caller) = (hub.clone(), cd.clone(), caller.clone());
+                async move { act_in(&hub, &caller, &body, || Ok(cd)).await }
+            };
+            for verb in ["sync", "refresh", "rollback", "stop", "follow", "promote", "abort", "approve", "deny", "auto_sync", "auto_rollback"] {
+                let refused = act(&viewer, json!({ "app": QC, "verb": verb, "on": true, "check": "release" })).await;
+                assert!(matches!(&refused, Err((StatusCode::FORBIDDEN, m)) if m.contains("environments.deploy")), "{verb}: {refused:?}");
+            }
+            let done = act(&owner, json!({ "app": KP, "verb": "auto_sync", "on": true })).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            assert_eq!((at(&done, "/op"), at(&done, "/done/on"), at(&done, "/done/from")), (&json!("cd.apps.set_auto_sync"), &json!(true), &json!("app")));
+            // Now kiln syncs it by itself: it waits for that, no one else.
+            let v = list_of(&cd, Some("kiln-production"), now).await;
+            assert_eq!((at(&v, "/projects/0/apps/0/stand"), at(&v, "/projects/0/apps/0/auto_sync")), (&json!("waiting"), &json!(true)));
+            let done = act(&owner, json!({ "app": KP, "verb": "refresh", "hard": true })).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            assert_eq!(at(&done, "/done/refreshing"), &json!(KP));
+            let done = act(&owner, json!({ "app": QP, "verb": "follow" })).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            assert_eq!(at(&done, "/done/following"), &json!(QP));
+            assert!(cd.store.read(|d| !d.pins.contains_key(QP)), "followed: no longer held");
+            let refused = act(&owner, json!({ "app": KP, "verb": "promote" })).await;
+            assert!(matches!(&refused, Err((StatusCode::NOT_FOUND, m)) if m.contains("has no rollout")), "{refused:?}");
+            let refused = act(&owner, json!({ "app": KP, "verb": "rollback", "revision": k2 })).await;
+            assert!(matches!(&refused, Err((StatusCode::SERVICE_UNAVAILABLE, m)) if m.contains("cluster dev is not connected")), "{refused:?}");
+            Ok(())
+        })
     }
 }

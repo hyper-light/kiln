@@ -8728,12 +8728,16 @@ repository):
   its source's commits; each verb reaches its operation: done and audited as a maintainer's, the
   operation's own refusal said, refused for a viewer, an agent held to what its environment lets
   agents do. Apps the engine leaves on the simulated cluster stand as defined (soaking then
-  synced, waiting for a person, behind git, rolled back, failed), and for several projects the
-  stands, lines, components, history, a rollout's steps and the verbs' reasons are as defined.
-  *`tests/ship_deploys.rs`
+  synced, waiting for a person, behind git, rolled back, failed). Over a scratch hub with a KilnCD
+  of its own holding what the simulated cluster's engine left, its store's history, pin and rollout
+  and its mirrors, Ship's list, panes and verbs read and do as defined for two projects: an app out
+  of sync and trunk ahead of it, one synced, one whose rollout waits for an approval, one rolled
+  back. *`tests/ship_deploys.rs`
   `w26_r24_ship_lists_cds_apps_by_project_and_each_verb_reaches_its_operation_as_the_caller`;
-  `ship::deploys` `w26_r24_*`; `kiln-cd` `w26_r24_apps_stand_as_the_engine_leaves_them` (the
-  simulated cluster) and `stands` `w26_r24_*`.*
+  `ship::deploys`
+  `w26_r24_over_a_scratch_hub_with_the_simulated_cluster_ship_reads_what_cd_holds_and_acts_through_its_ops`
+  and `w26_r24_*`; `kiln-cd` `w26_r24_apps_stand_as_the_engine_leaves_them` (the simulated
+  cluster) and `stands` `w26_r24_*`.*
 - **W26-AC17 Logs beyond pods.** On this machine's Docker, a Compose project's log reads its last
   lines in order with their times, follows as lines come, and reads a stopped container's as its
   previous one; each source's command is as asked. *`cd::logs`

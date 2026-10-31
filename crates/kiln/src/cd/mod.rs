@@ -1731,6 +1731,62 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
 }
 
 #[cfg(test)]
+impl Cd {
+    /// A KilnCD of its own over `hub`, its store under `dir`, for tests: never the server's (`get`
+    /// doesn't answer it), no cluster connected, nothing polled. Its engine is the one `drive`
+    /// leaves, on a thread of its own (the simulated cluster's, `kiln_cd::harness`): it answers
+    /// queries, and inputs change nothing. What `drive` gives besides comes back with it.
+    pub(crate) fn scratch<T: Send + 'static>(hub: Arc<Hub>, dir: &std::path::Path, drive: impl FnOnce() -> (kiln_cd::harness::Harness, T) + Send + 'static) -> Result<(Arc<Cd>, T)> {
+        let store = Store::open(&dir.join("store"), 1, &[1])?;
+        let (etx, erx) = std::sync::mpsc::channel::<ToEngine>();
+        let (ttx, trx) = std::sync::mpsc::channel::<T>();
+        std::thread::Builder::new().name("kiln-cd-scratch".into()).spawn(move || {
+            let (h, t) = drive();
+            if ttx.send(t).is_err() {
+                return;
+            }
+            while let Ok(m) = erx.recv() {
+                if let ToEngine::Query(f) = m {
+                    f(&h.engine);
+                }
+            }
+        })?;
+        let t = trx.recv().context("the scratch engine's drive ended")?;
+        let cd = Arc::new(Cd {
+            hub,
+            store,
+            engine: etx,
+            apps: RwLock::new(BTreeMap::new()),
+            clusters: RwLock::new(BTreeMap::new()),
+            statuses: RwLock::new(BTreeMap::new()),
+            dirty: Mutex::new(BTreeSet::new()),
+            deleting: Mutex::new(BTreeMap::new()),
+            watched: Mutex::new(BTreeSet::new()),
+            connecting: Mutex::new(BTreeSet::new()),
+            inputs_gate: Mutex::new(()),
+            dir: dir.to_path_buf(),
+            tools: Tools::default(),
+            poll: Duration::from_secs(60),
+            in_cluster_context: String::new(),
+            kubeconfig: String::new(),
+            kick: crate::rt::Notify::new(),
+            live: live::Live::default(),
+            plans: plans::Renders::default(),
+            artifacts: Mutex::new(HashMap::new()),
+            secret_values: Mutex::new(HashMap::new()),
+            deploy_errors: Mutex::new(BTreeMap::new()),
+            environments: RwLock::new(BTreeMap::new()),
+            started: Mutex::new(HashMap::new()),
+            targets: RwLock::new(BTreeMap::new()),
+            target_errors: Mutex::new(BTreeMap::new()),
+            repo_names: RwLock::new(HashMap::new()),
+            rollouts: rollouts::Drivers::default(),
+        });
+        Ok((cd, t))
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
