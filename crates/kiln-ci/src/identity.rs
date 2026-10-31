@@ -17,8 +17,9 @@
 //! policy says, [`push`] (W27-R03); a review's verdicts and comments, signed over their revision,
 //! and where a verdict holds, [`verdict`] (W27-R04); a land, signed as the queue that tested it,
 //! [`landing`] (W27-R07); the chain of custody of what changes hands, hop by hop, [`custody`]
-//! (W27-R08); and the trail of every statement kiln takes, a hash chain with a Merkle tree over it
-//! and kiln's signed checkpoints, [`trail`] (W27-R09).
+//! (W27-R08); the trail of every statement kiln takes, a hash chain with a Merkle tree over it and
+//! kiln's signed checkpoints, [`trail`] (W27-R09); and the chain kiln verify walks from a deploy
+//! back to whoever made it, link by link, [`verify`] (W27-R10).
 
 pub mod chain;
 pub mod custody;
@@ -29,6 +30,7 @@ pub mod sshsig;
 pub mod statement;
 pub mod trail;
 pub mod verdict;
+pub mod verify;
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
