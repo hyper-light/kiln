@@ -914,6 +914,19 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             boxed(|| own_op(&hub, &caller, "plans.run", body)).await
         }
         (&Method::POST, ["api", "plans", id, "share"]) => boxed(|| plans_share(&hub, id, req)).await,
+        (&Method::POST, ["api", "plans", id, "review"]) => {
+            let id = (*id).to_owned();
+            // Its idempotency key may come as the standard header (CP-T3.2).
+            let key = idempotency_key(&req);
+            let mut body = boxed(|| body_value(req)).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("id".into(), json!(id));
+                if let Some(k) = key.filter(|_| !o.contains_key("key")) {
+                    o.insert("key".into(), json!(k));
+                }
+            }
+            boxed(|| own_op(&hub, &caller, "plans.review", body)).await
+        }
         (&Method::POST, ["api", "plans", id, "ready"]) => {
             let id = (*id).to_owned();
             let mut body = boxed(|| body_value(req)).await?;

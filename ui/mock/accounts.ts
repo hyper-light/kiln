@@ -21,6 +21,7 @@ import { defaultInfo, defaultMeta, defaultState } from "./defaults.ts";
 import { longInfo } from "./conversation.ts";
 import { fleetCommand, fleetInfos } from "./push.ts";
 import { familyInfos } from "./agents.ts";
+import { reviewInfos } from "./plan-review.ts";
 import { fastInfos } from "./fast.ts";
 
 const now = () => Math.floor(Date.now() / 1000);
@@ -424,7 +425,7 @@ export async function handleAccounts(req: http.IncomingMessage, res: http.Server
     return true;
   }
   if (p === "/api/harness/sessions" && m === "GET") {
-    json(res, 200, [...[...demos.values()].map((d) => d.info), longInfo(), ...fastInfos(), ...fleetInfos(), ...familyInfos()]);
+    json(res, 200, [...[...demos.values()].map((d) => d.info), longInfo(), ...fastInfos(), ...fleetInfos(), ...familyInfos(), ...reviewInfos()]);
     return true;
   }
 

@@ -1588,10 +1588,13 @@ export const Timeline = React.memo(function Timeline({
   accountOpen,
   find,
   onReply,
+  onReviewPlan,
 }: {
   store: SessionStore;
   /** The agent's id: where your place in it is kept. */
   agent: string;
+  /** A plan it proposes is reviewed in its Plan tab: this opens it there (none: the plan is read here, in full). */
+  onReviewPlan?: () => void;
   /** Find in the conversation: the words, and the match being shown. */
   find?: { q: string; now: FindNow | null };
   agentLabel?: string;
@@ -1885,7 +1888,7 @@ export const Timeline = React.memo(function Timeline({
           {tail && hasAsks && onDecide && (
             <div ref={asksRef} className="hx-asks">
               {pending.map((a) => (
-                <ApprovalCard key={a.id} a={a} cwd={cwd} onDecide={onDecide} agentName={agentName} kind={agentLabel} agentId={agent} />
+                <ApprovalCard key={a.id} a={a} cwd={cwd} onDecide={onDecide} agentName={agentName} kind={agentLabel} agentId={agent} onReviewPlan={parent ? undefined : onReviewPlan} />
               ))}
             </div>
           )}
