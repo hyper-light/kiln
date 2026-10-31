@@ -390,6 +390,7 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/stacks/*", "diffs.read", At::Stack(2)),
     r("POST", "/api/diffs/*/comments", "diffs.review", At::Diff(2)),
     r("POST", "/api/diffs/*/review", "diffs.review", At::Diff(2)),
+    r("POST", "/api/diffs/*/statement", "diffs.review", At::Diff(2)),
     r("POST", "/api/diffs/*/viewed", "diffs.read", At::Diff(2)),
     r("POST", "/api/diffs/*/land", "diffs.land", At::Diff(2)),
     // Conflicts resolved where they fall, then committed as a revision (W26-R12): code, as Apply is.
@@ -397,6 +398,7 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/diffs/*/conflicts/*/resolution", "diffs.submit", At::Diff(2)),
     r("DELETE", "/api/diffs/*/conflicts/*/resolution", "diffs.submit", At::Diff(2)),
     r("PATCH", "/api/comments/*", "diffs.review", At::Comment(2)),
+    r("POST", "/api/comments/*/statement", "diffs.review", At::Comment(2)),
     r("DELETE", "/api/comments/*", "diffs.review", At::Comment(2)),
     r("POST", "/api/comments/*/apply", "diffs.submit", At::Comment(2)),
     r("POST", "/api/repos/*/submit", "diffs.submit", At::Repo(2)),

@@ -5,6 +5,7 @@
 import type { Res } from "@/lib/data";
 import { apiPath } from "@/lib/peer-base";
 import { request } from "./client";
+import { signed } from "@/lib/signing";
 
 export type DiffState = "draft" | "needs-review" | "changes-requested" | "accepted" | "landing" | "landed" | "abandoned";
 
@@ -275,12 +276,20 @@ export const reviewApi = {
   dependencies: (key: string, to: number, from: number | null, signal?: AbortSignal) =>
     request<Dependencies>("GET", `/api/diffs/${enc(key)}/dependencies?to=${to}${from != null ? `&from=${from}` : ""}`, undefined, { signal }),
   threads: (key: string, signal?: AbortSignal) => request<{ threads: Thread[]; gate?: ReviewGate }>("GET", `/api/diffs/${enc(key)}/comments`, undefined, { signal }).then((r) => r.threads),
-  comment: (
+  /** A comment, signed by whoever gives it (W27-R04: `signed`). */
+  comment: async (
     key: string,
     body: { body: string; suggestion?: string; publish?: boolean; thread?: string; version?: number; file?: string; side?: "old" | "new"; start_line?: number; end_line?: number; kind?: ThreadKind },
-  ) => request<{ id: string; thread: string; draft: boolean }>("POST", `/api/diffs/${enc(key)}/comments`, body),
-  editComment: (id: string, body: { body?: string; suggestion?: string; state?: "resolved" | "open"; kind?: ThreadKind; reason?: string }) =>
-    request<{ id: string; thread: string; state: string; kind?: ThreadKind }>("PATCH", `/api/comments/${enc(id)}`, body),
+  ) => {
+    const s = await signed(`/api/diffs/${enc(key)}/statement`, { ...body, kind: "comment" });
+    return request<{ id: string; thread: string; draft: boolean }>("POST", `/api/diffs/${enc(key)}/comments`, s ? { ...body, signed: s } : body);
+  },
+  /** A comment edited; its new words signed by its author (W27-R04: `signed`). */
+  editComment: async (id: string, body: { body?: string; suggestion?: string; state?: "resolved" | "open"; kind?: ThreadKind; reason?: string }) => {
+    const words = body.body !== undefined || body.suggestion !== undefined;
+    const s = words ? await signed(`/api/comments/${enc(id)}/statement`, { body: body.body, suggestion: body.suggestion }) : undefined;
+    return request<{ id: string; thread: string; state: string; kind?: ThreadKind }>("PATCH", `/api/comments/${enc(id)}`, s ? { ...body, signed: s } : body);
+  },
   deleteComment: (id: string) => request<{ id: string; thread: string; deleted: boolean; thread_deleted: boolean }>("DELETE", `/api/comments/${enc(id)}`),
   applySuggestion: (id: string, suggestion?: number) =>
     request<{ diff: string; version: number; thread: string; state: string; commit?: string; suggestion?: number; signer?: string | null }>(
@@ -288,12 +297,16 @@ export const reviewApi = {
       `/api/comments/${enc(id)}/apply`,
       suggestion == null ? {} : { suggestion },
     ),
-  review: (key: string, action: ReviewAction, body: string, force?: boolean) =>
-    request<{ diff: string; action: string; version: number; published: number; state: string; note?: string | null }>(
-      "POST",
-      `/api/diffs/${enc(key)}/review`,
-      force ? { action, body, force } : { action, body },
-    ),
+  /** A verdict, signed by whoever gives it (W27-R04: `signed`). */
+  review: async (key: string, action: ReviewAction, body: string, force?: boolean) => {
+    const s = await signed(`/api/diffs/${enc(key)}/statement`, { kind: "verdict", action, body });
+    return request<{ diff: string; action: string; version: number; published: number; state: string; note?: string | null }>("POST", `/api/diffs/${enc(key)}/review`, {
+      action,
+      body,
+      ...(force ? { force } : {}),
+      ...(s ? { signed: s } : {}),
+    });
+  },
   viewed: (key: string, file: string, viewed: boolean) => request<{ file: string; viewed: boolean; version: number }>("POST", `/api/diffs/${enc(key)}/viewed`, { file, viewed }),
   readiness: (key: string, signal?: AbortSignal) => request<Readiness>("GET", `/api/diffs/${enc(key)}/land`, undefined, { signal }),
   land: (key: string, strategy?: string) => request<unknown>("POST", `/api/diffs/${enc(key)}/land`, strategy ? { strategy } : {}),

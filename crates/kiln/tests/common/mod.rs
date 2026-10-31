@@ -44,6 +44,8 @@ pub const NOT_INHERITED: &[&str] = &[
     "KILN_UPGRADE_ID",
     "KILN_REACH_SOCK",
     "KILN_REACH_FROM",
+    // An agent session's runner, which would sign for a test run in that session (W27-R04).
+    "KILN_HARNESS_SOCK",
     "KILN_CONFIG",
     "KILN_URL",
     "KILN_ADMIN_TOKEN",

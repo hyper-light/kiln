@@ -135,6 +135,7 @@ async fn scope_of(cx: &Cx, v: &Value) -> Result<super::secrets::Scope, Fail> {
 }
 
 const DIFF: &str = "The diff: `D12`.";
+const SIGNED: &str = "Its giver's signature (W27-R04): `ci.diffs.statement`'s statement signed where their key is, as a Sigstore bundle. An agent's MCP server signs its verdicts and comments through its runner by itself.";
 const SCOPE: &str = "Where: `server`, `org:<owner>`, `repo:<owner/name>`, `workflow:<repo>:<path>` or `env:<repo>:<environment>`.";
 
 fn path(parts: &[&str]) -> Vec<String> {
@@ -512,7 +513,7 @@ pub fn ops() -> &'static [Op] {
                 route: |v| Ok((Method::POST, path(&["diffs", &text(v, "diff")?, "comments"]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move { let d = text(&v, "diff")?; diffs(&cx, Method::POST, &["diffs", d.as_str(), "comments"], &HashMap::new(), &v).await }),
             op!("ci.diffs.reply", "Reply in a diff's thread.", base: "", ro: false, destructive: false,
-                input: || schema(json!({"diff": {"type": "string", "description": DIFF}, "thread": {"type": "string"}, "body": {"type": "string"}, "publish": {"type": "boolean"}}), &["diff", "thread", "body"]),
+                input: || schema(json!({"diff": {"type": "string", "description": DIFF}, "thread": {"type": "string"}, "body": {"type": "string"}, "publish": {"type": "boolean"}, "signed": {"type": "object", "description": SIGNED}}), &["diff", "thread", "body"]),
                 route: |v| Ok((Method::POST, path(&["diffs", &text(v, "diff")?, "comments"]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move { let d = text(&v, "diff")?; diffs(&cx, Method::POST, &["diffs", d.as_str(), "comments"], &HashMap::new(), &v).await }),
             op!("ci.diffs.resolve", "Resolve a comment's thread, or open it again.", base: "", ro: false, destructive: false,
@@ -523,8 +524,12 @@ pub fn ops() -> &'static [Op] {
                     let state = v.get("state").and_then(Value::as_str).unwrap_or("resolved");
                     diffs(&cx, Method::PATCH, &["comments", c.as_str()], &HashMap::new(), &json!({ "state": state })).await
                 }),
+            op!("ci.diffs.statement", "What to sign to give a verdict or comment on a diff (W27-R04): its statement, on the diff's latest version (a comment's `version`, if said) by its commit and verbatim patch-id, as you; and whether its repository requires it.", base: "", ro: false, destructive: false,
+                input: || schema(json!({"diff": {"type": "string", "description": DIFF}, "kind": {"type": "string", "enum": ["verdict", "comment"]}, "action": {"type": "string", "enum": ["accept", "request_changes", "comment", "resign"]}, "body": {"type": "string"}, "suggestion": {"type": "string"}, "version": {"type": "integer"}, "thread": {"type": "string"}, "file": {"type": "string"}, "side": {"type": "string", "enum": ["old", "new"]}, "start_line": {"type": "integer"}, "end_line": {"type": "integer"}}), &["diff", "kind"]),
+                route: |v| Ok((Method::POST, path(&["diffs", &text(v, "diff")?, "statement"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { let d = text(&v, "diff")?; diffs(&cx, Method::POST, &["diffs", d.as_str(), "statement"], &HashMap::new(), &v).await }),
             op!("ci.diffs.review", "Review a diff: accept, request changes, comment, or resign; publishes your draft comments.", base: "", ro: false, destructive: false,
-                input: || schema(json!({"diff": {"type": "string", "description": DIFF}, "action": {"type": "string", "enum": ["accept", "request_changes", "comment", "resign"]}, "body": {"type": "string"}}), &["diff", "action"]),
+                input: || schema(json!({"diff": {"type": "string", "description": DIFF}, "action": {"type": "string", "enum": ["accept", "request_changes", "comment", "resign"]}, "body": {"type": "string"}, "signed": {"type": "object", "description": SIGNED}}), &["diff", "action"]),
                 route: |v| Ok((Method::POST, path(&["diffs", &text(v, "diff")?, "review"]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move { let d = text(&v, "diff")?; diffs(&cx, Method::POST, &["diffs", d.as_str(), "review"], &HashMap::new(), &v).await }),
             op!("ci.diffs.submit_patch", "Submit commits as diffs without git: patches (`git format-patch`'s mbox, or a list) onto the trunk, each a diff or a new version of its diff (by its change: its Kiln-Change, a Change-Id, or the diff it rewrites).", base: "", ro: false, destructive: false,

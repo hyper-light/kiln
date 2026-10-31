@@ -266,6 +266,30 @@ pub async fn person_identity(store: &Store, org: &str, caller: &crate::authz::Ca
     Identity::new(org, Actor::Person { name }).uri().map_err(|e| PersonRefused::Unnamed(e.to_string()))
 }
 
+/// Whether `signer`, a certificate's identity, is `caller` (W27-R04): the person signed in, or the
+/// agent session they are, for the person kiln says it acts for, at whatever epoch and on whatever
+/// runner holds its key.
+pub async fn is_caller(hub: &Hub, caller: &crate::authz::Caller, signer: &Identity) -> bool {
+    if signer.org != hub.pki.organization() {
+        return false;
+    }
+    match (&signer.actor, caller.agent.as_deref()) {
+        (Actor::Person { name }, None) => person_signed_in(&hub.store, caller).await.is_ok_and(|p| p == *name),
+        (Actor::Agent { person, agent, .. }, Some(session)) if agent == session => match crate::mcp::whose(hub, session).await {
+            Some(p) if p == "owner" => person == "admin",
+            Some(p) => *person == person_of(&p),
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+/// The identity of the person `caller` is, as their verdicts and comments are signed (W27-R04).
+pub async fn person_uri(hub: &Hub, caller: &crate::authz::Caller) -> Result<String, PersonRefused> {
+    let name = person_signed_in(&hub.store, caller).await?;
+    Identity::new(hub.pki.organization(), Actor::Person { name }).uri().map_err(|e| PersonRefused::Unnamed(e.to_string()))
+}
+
 /// An SSH key a person signs commits with, bound to their identity (W27-R03).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SshSigner {
@@ -1049,6 +1073,13 @@ pub async fn epoch_held(store: &Store, session: &str, machine: &str, instance: &
         _ => None,
     };
     Ok(epochs_of(store, session).await?.iter().filter_map(|(s, _)| at(s)).max())
+}
+
+/// The identity agent session `session` signs as (W27-R04): the one kiln issued it last. None: it
+/// has none yet.
+pub async fn agent_uri(store: &Store, session: &str) -> anyhow::Result<Option<String>> {
+    let pattern = format!("%/agent/{session}/epoch/%");
+    store.call(move |c| Ok(c.query_row("SELECT subject FROM identities WHERE kind = 'agent' AND subject LIKE ?1 ORDER BY issued_at DESC, rowid DESC LIMIT 1", [pattern], |r| r.get(0)).optional()?)).await
 }
 
 /// Agent session `session` ended: every certificate of every epoch it had is revoked from now.
