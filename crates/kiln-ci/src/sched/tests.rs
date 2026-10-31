@@ -533,7 +533,7 @@ fn inputs(seed: u64) -> Vec<(Input, i64)> {
 #[test]
 fn e1_3_two_schedulers_given_the_same_inputs_decide_alike() {
     use super::state::{Class, ClassConfig, FairBy};
-    let mut seen = [0u64; 4];
+    let mut seen = [0u64; 5];
     for seed in 0..1_000u64 {
         // Fair share across repositories, or within them by actor and lane too (W28-R66); the
         // classes' floors and bounds as they come, or, every other seed, higher floors and bounds
@@ -544,9 +544,9 @@ fn e1_3_two_schedulers_given_the_same_inputs_decide_alike() {
             _ => vec![FairBy::Repo, FairBy::Actor, FairBy::Lane],
         };
         // Grants as leases short enough to run out in a seed's minutes, in a seed of every four
-        // (W05-R34).
+        // (W05-R34); backfilling in a third of the seeds, room kept for exclusive legs (W05-R39).
         let lease = (seed % 4 == 3).then_some(20_000);
-        let mut cfg = Config { fair_by, lease, ..Config::default() };
+        let mut cfg = Config { fair_by, lease, backfill: (seed / 3) % 3 == 0, ..Config::default() };
         if seed % 2 == 1 {
             cfg.classes = [(Class::Batch, ClassConfig { floor: 300, bound: Some(40_000) }), (Class::Background, ClassConfig { floor: 200, bound: Some(60_000) })].into_iter().collect();
         }
@@ -559,6 +559,7 @@ fn e1_3_two_schedulers_given_the_same_inputs_decide_alike() {
                     Command::Demand { .. } => seen[1] += 1,
                     Command::Wait { reason: WaitReason::Coalescing { .. }, .. } => seen[2] += 1,
                     Command::Lost { why: super::state::Loss::Expired, .. } => seen[3] += 1,
+                    Command::Wait { reason: WaitReason::Reserved { .. }, .. } => seen[4] += 1,
                     _ => {}
                 }
             }
@@ -567,9 +568,9 @@ fn e1_3_two_schedulers_given_the_same_inputs_decide_alike() {
             assert!(grants.is_ok(), "seed {seed}, input {step} at {now}: {grants:?}");
         }
     }
-    // What the seeds cover of the work in flight, admission and leases: adoptions, demands'
-    // decisions, legs coalescing, grants run out.
-    assert!(seen.iter().all(|n| *n > 0), "adopted, demand decisions, coalescing, expired: {seen:?}");
+    // What the seeds cover of the work in flight, admission, leases and reservations: adoptions,
+    // demands' decisions, legs coalescing, grants run out, room kept.
+    assert!(seen.iter().all(|n| *n > 0), "adopted, demand decisions, coalescing, expired, reserved: {seen:?}");
 }
 
 /// E1 (docs/needs.md), W05-R03: the rule counts in thousandths and compares without dividing, so
@@ -2850,4 +2851,142 @@ fn w05_r38_ends_without_history() {
     // Looked at at 16 minutes, past its expected end: 5 + 2 x 11.
     assert_eq!(t.due("adopted", 16 * MIN), Some((27 * MIN, 65 * MIN)));
     assert_eq!(t.check_grants(), Ok(()));
+}
+
+/// A runner of `cpus` CPUs in resource mode, for reservations' tests (W05-R39).
+fn sized(name: &str, cpus: u64) -> RunnerIn {
+    RunnerIn { capacity: Some(Resources { cpu: Cpus::whole(cpus), mem: 256 << 30, disk: 1 << 40, gpu: 0 }), ..linux(name, 64) }
+}
+
+/// A leg asking `cpus` CPUs, expected to take `p90` ms (W05-R38).
+fn asking(id: &str, cpus: u64, p90: i64) -> LegIn {
+    LegIn { request: Resources { cpu: Cpus::whole(cpus), mem: 1 << 30, ..Resources::default() }, p90: u64::try_from(p90).ok(), ..leg(id, "acme/x", 60) }
+}
+
+/// Reservations' tests run in resource mode, CPUs not overcommitted, backfilling or not.
+fn backfilling(backfill: bool) -> Config {
+    Config { resources: true, overcommit_cpu: 1000, backfill, ..Config::default() }
+}
+
+/// When a leg's reservation was first said, and from when (W05-R39).
+fn reserved_at(sim: &Sim, leg: &str) -> Option<(i64, i64)> {
+    sim.waits.iter().find_map(|(t, l, w)| match w {
+        WaitReason::Reserved { at, .. } if l == leg => Some((*t, *at)),
+        _ => None,
+    })
+}
+
+/// W05-R39, docs/needs.md E4.2: a 12-CPU leg behind a steady stream of 1-CPU legs on one 16-CPU
+/// runner (one a 4 s, a minute each). With backfill, it reserves the runner from when 11 more of
+/// them are expected to have ended and starts then, within a minute of coming: no leg granted
+/// meanwhile runs past that time beside it unless it fits. Without, it hasn't started by three
+/// hours, as today's engine (docs/needs.md E4's probe).
+#[test]
+fn w05_r39_a_big_leg_reserves_the_runner_that_frees_first() {
+    let run = |backfill: bool| {
+        let mut sim = Sim::new(backfilling(backfill));
+        sim.runner(0, sized("r", 16));
+        for (i, t) in (0..3 * 60 * MIN).step_by(4_000).enumerate() {
+            sim.leg(t, asking(&format!("s{i}"), 1, MIN), MIN);
+        }
+        sim.leg(5 * MIN, asking("big", 12, 10 * MIN), 10 * MIN);
+        sim.run(3 * 60 * MIN);
+        sim
+    };
+    let on = run(true);
+    let (said, at) = reserved_at(&on, "big").unwrap_or_default();
+    let started = on.started("big").unwrap_or(i64::MAX);
+    assert_eq!(started, at, "it starts at its reservation's time, said at {said}");
+    assert!(started - 5 * MIN <= MIN, "it waited {} ms", started - 5 * MIN);
+    // What ran beside it as it started fit beside it: 4 CPUs.
+    let beside = on.busy_legs.iter().filter(|(l, from, to)| l != "big" && *from <= started && *to > started).count();
+    assert!(beside <= 4, "{beside} legs ran beside it");
+    assert_eq!(run(false).started("big"), None);
+}
+
+/// W05-R39: on a 32-CPU runner, a 16-CPU leg reserves it from 10 minutes, when 12 CPUs free;
+/// 8 are kept running past then. A 4-CPU leg that would run past it fits beside it then and
+/// starts at once; an 8-CPU one doesn't, and waits behind it; a 2-CPU one that ends before it
+/// starts at once.
+#[test]
+fn w05_r39_backfill_ends_before_or_fits_beside() {
+    let mut sim = Sim::new(backfilling(true));
+    sim.runner(0, sized("r", 32));
+    sim.leg(0, asking("a", 12, 10 * MIN), 10 * MIN);
+    sim.leg(0, asking("b", 8, 60 * MIN), 60 * MIN);
+    sim.leg(MIN, asking("big", 16, 30 * MIN), 30 * MIN);
+    sim.leg(MIN, asking("four", 4, 30 * MIN), 30 * MIN);
+    sim.leg(MIN, asking("eight", 8, 30 * MIN), 30 * MIN);
+    sim.leg(MIN, asking("two", 2, 5 * MIN), 5 * MIN);
+    sim.run(5 * MIN);
+    assert_eq!(reserved_at(&sim, "big").map(|(_, at)| at), Some(10 * MIN));
+    assert_eq!((sim.started("four"), sim.started("two"), sim.started("eight")), (Some(MIN), Some(MIN), None));
+    assert_eq!(sim.last_wait("eight"), Some(&WaitReason::Behind { leg: "big".into(), runner: "r".into(), at: 10 * MIN }));
+    assert_eq!(sim.sched.check_grants(), Ok(()));
+    sim.run(60 * MIN);
+    assert_eq!(sim.started("big"), Some(10 * MIN));
+    assert!(sim.started("eight").is_some_and(|t| t > 10 * MIN));
+}
+
+/// W05-R39: a grant runs past its p90. Once the reservation's time has passed, nothing new goes
+/// into the room kept on that runner; the next time the reservation matters it's worked out again
+/// from the grant's moved-on end (W05-R38), and the reserved leg starts as that grant ends.
+#[test]
+fn w05_r39_a_reservation_whose_time_passes_is_worked_out_again() {
+    let mut sim = Sim::new(backfilling(true));
+    sim.runner(0, sized("r", 16));
+    sim.runner(0, sized("small", 4));
+    // Expected to end at 5 minutes, it runs 8.
+    sim.leg(0, asking("a", 12, 5 * MIN), 8 * MIN);
+    sim.leg(MIN, asking("big", 12, 10 * MIN), 10 * MIN);
+    sim.leg(MIN, asking("one", 1, 10 * MIN), 10 * MIN);
+    sim.run(2 * MIN);
+    assert_eq!(reserved_at(&sim, "big").map(|(_, at)| at), Some(5 * MIN));
+    // Past its time: a leg that would run into the kept room doesn't start on r, but on small,
+    // and the reservation is worked out again: a at 0 + 2 x 6 minutes.
+    sim.leg(6 * MIN, asking("late", 1, 10 * MIN), 10 * MIN);
+    sim.run(7 * MIN);
+    assert_eq!(sim.assigned.iter().find(|a| a.leg == "late").map(|a| a.runner.as_str()), Some("small"));
+    assert_eq!(sim.last_wait("big"), Some(&WaitReason::Reserved { runner: "r".into(), at: 12 * MIN }));
+    sim.run(20 * MIN);
+    assert_eq!(sim.started("big"), Some(8 * MIN));
+}
+
+/// W05-R39: two classes' first items each fit no runner: the critical one's reservation comes
+/// first, the batch one's after the critical item is expected to end; and the critical item's
+/// grant doesn't wait for the batch one's reservation.
+#[test]
+fn w05_r39_classes_reserve_in_order() {
+    use super::state::Class;
+    let mut sim = Sim::new(backfilling(true));
+    sim.runner(0, sized("r", 16));
+    sim.leg(0, asking("a", 14, 10 * MIN), 10 * MIN);
+    sim.leg(MIN, LegIn { class: Class::Batch, ..asking("batch", 12, 20 * MIN) }, 20 * MIN);
+    sim.leg(MIN, LegIn { class: Class::Critical, ..asking("critical", 12, 20 * MIN) }, 20 * MIN);
+    sim.leg(MIN, asking("small", 2, 5 * MIN), 5 * MIN);
+    sim.run(2 * MIN);
+    assert_eq!(reserved_at(&sim, "critical").map(|(_, at)| at), Some(10 * MIN));
+    assert_eq!(reserved_at(&sim, "batch").map(|(_, at)| at), Some(30 * MIN));
+    assert_eq!(sim.sched.check_grants(), Ok(()));
+    sim.run(60 * MIN);
+    assert_eq!((sim.started("critical"), sim.started("batch")), (Some(10 * MIN), Some(30 * MIN)));
+}
+
+/// W05-R39: an exclusive leg asking for no CPUs reserves its runner whole: it starts as the
+/// runner's grants end, and no leg granted there meanwhile runs past that.
+#[test]
+fn w05_r39_an_exclusive_leg_reserves_its_runner_whole() {
+    let mut sim = Sim::new(Config { backfill: true, ..Config::default() });
+    sim.runner(0, linux("r", 4));
+    for i in 0..3 {
+        sim.leg(0, LegIn { p90: Some(10 * 60_000), ..leg(&format!("held{i}"), "acme/x", 60) }, 10 * MIN);
+    }
+    sim.leg(MIN, LegIn { exclusive: true, p90: Some(10 * 60_000), ..leg("whole", "acme/x", 60) }, 10 * MIN);
+    sim.leg(MIN, LegIn { p90: Some(10 * 60_000), ..leg("long", "acme/x", 60) }, 10 * MIN);
+    sim.leg(2 * MIN, LegIn { p90: Some(5 * 60_000), ..leg("short", "acme/x", 60) }, 5 * MIN);
+    sim.run(30 * MIN);
+    assert_eq!(reserved_at(&sim, "whole").map(|(_, at)| at), Some(10 * MIN));
+    assert_eq!(sim.started("short"), Some(2 * MIN));
+    assert_eq!(sim.started("whole"), Some(10 * MIN));
+    assert!(sim.started("long").is_some_and(|t| t >= 20 * MIN), "{:?}", sim.started("long"));
 }

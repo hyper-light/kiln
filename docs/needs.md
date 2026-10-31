@@ -227,7 +227,9 @@ machine for light work.
 reserves for it the runner where that room frees soonest (from its grants' expected ends, p90), and
 grants there only what will end before then, or what's preemptible and will be paused then (EASY
 backfilling). A 12-CPU gate on a machine that 1-CPU work keeps refilling starts by its reservation's
-time (G6). A gang is reserved the same way, every one of its runners at once.
+time (G6). A gang is reserved the same way, every one of its runners at once. Until runners can
+pause (E7), what's preemptible takes no reserved room: a reserved runner takes only what will end
+before then, or fits beside the reserved item (docs/ci.md W05-R39).
 
 **The same work once.** Items with the same `key` share a grant: one asked while another runs joins
 it, and one asked after another passed takes its result from the ledger while that is valid

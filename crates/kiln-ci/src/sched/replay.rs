@@ -2,8 +2,9 @@
 //! (SplitMix64, as kiln-sim draws) of runners of mixed sizes and platforms, legs of mixed needs,
 //! classes, priorities and repositories, attempts finishing, failing and retried, legs cancelled
 //! and runners lost and back drive the engine through its simulator; in half the seeds grants are
-//! leases, renewed by runners' heartbeats, some runners falling silent past them (W05-R34). Every
-//! command it gives is written
+//! leases, renewed by runners' heartbeats, some runners falling silent past them (W05-R34), and in
+//! half it backfills, keeping room for each class's first item that fits no runner (W05-R39).
+//! Every command it gives is written
 //! in a stable text form and hashed with SHA-256, and the digest must be the one committed beside
 //! this file (`replay.digest`). kiln's CI runs it on x86-64 and on arm64 (`.kiln/ci.yaml`).
 //!
@@ -210,9 +211,10 @@ fn replay(cfg: &Config) -> (Vec<String>, String) {
             1 => vec![FairBy::Repo, FairBy::Actor],
             _ => vec![FairBy::Repo, FairBy::Actor, FairBy::Lane],
         };
-        // Grants are leases in seeds 4 to 7 of every 8 (W05-R34).
+        // Grants are leases in seeds 4 to 7 of every 8 (W05-R34); it backfills in seeds 8 to 15 of
+        // every 16 (W05-R39).
         let lease = ((seed / 4) % 2 == 1).then_some(60 * 1000);
-        let mut cfg = Config { resources: seed % 2 == 1, fair_by, lease, ..cfg.clone() };
+        let mut cfg = Config { resources: seed % 2 == 1, fair_by, lease, backfill: (seed / 8) % 2 == 1, ..cfg.clone() };
         if (seed / 6) % 2 == 1 {
             let minutes = |m: u64| Some(m * 60 * 1000);
             cfg.classes = [(Class::Interactive, ClassConfig { floor: 50, bound: None }), (Class::Batch, ClassConfig { floor: 250, bound: minutes(2) }), (Class::Background, ClassConfig { floor: 100, bound: minutes(3) })].into_iter().collect();
@@ -241,8 +243,9 @@ fn e1_4_the_replay_gives_the_committed_digest() {
     // retried after a backoff and assigned again, and runners lost under legs (a leg retried at
     // once, or failed for it).
     let has = |what: &[&str]| lines.iter().any(|l| what.iter().all(|w| l.contains(w)));
-    // And grants lost past their leases, a stop leg's among them (W05-R34).
-    for what in [&[" wait "][..], &[" success "], &[" failed "], &[" settled ", " cancelled "], &[" cancel ", " attempt="], &[" timer "], &[" assign ", " attempt=2 "], &[" lost ", " expired"], &[" assign ", " on-lease-loss=stop"]] {
+    // And grants lost past their leases, a stop leg's among them (W05-R34); and room kept for a
+    // class's first item, legs waiting behind it (W05-R39).
+    for what in [&[" wait "][..], &[" success "], &[" failed "], &[" settled ", " cancelled "], &[" cancel ", " attempt="], &[" timer "], &[" assign ", " attempt=2 "], &[" lost ", " expired"], &[" assign ", " on-lease-loss=stop"], &["\"reason\":\"reserved\""], &["\"reason\":\"behind\""]] {
         assert!(has(what), "no command has {what:?} in it");
     }
     let lost = lines.iter().any(|l| {

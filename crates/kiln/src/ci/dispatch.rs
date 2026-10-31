@@ -506,6 +506,8 @@ fn sched_config(hub: &Hub, rules: Vec<kiln_ci::sched::routing::Rule>) -> Config 
         // doesn't read.
         lease: Some(lease),
         lock_delay,
+        // Reservations for big items (W05-R39): off until declared.
+        backfill: hub.cfg.sched.backfill,
         ..Config::default()
     }
 }
@@ -4218,6 +4220,16 @@ mod tests {
             let cfg: crate::config::Config = toml::from_str(bad)?;
             assert!(cfg.sched.leases().is_err(), "{bad}");
         }
+        Ok(())
+    }
+
+    /// W05-R39: reservations for big items are off until `[sched] backfill` declares them
+    /// (docs/ci.md §0.3).
+    #[test]
+    fn w05_r39_backfill_is_off_until_declared() -> anyhow::Result<()> {
+        assert!(!crate::config::Config::default().sched.backfill);
+        let cfg: crate::config::Config = toml::from_str("[sched]\nbackfill = true\n")?;
+        assert!(cfg.sched.backfill);
         Ok(())
     }
 

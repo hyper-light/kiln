@@ -252,6 +252,12 @@ pub struct Sched {
     /// next attempt (W05-R34): its runner has stopped it by then. 15 s by default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lock_delay: Option<String>,
+    /// Reservations for big items (docs/needs.md §5, docs/ci.md W05-R39): the first of each class
+    /// that fits no runner keeps room on the runner where it frees first, from its grants' expected
+    /// ends, and only what ends before then, or fits beside it, is granted there. Without it a big
+    /// item may wait as long as smaller ones keep coming. Off until declared (docs/ci.md §0.3).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub backfill: bool,
 }
 
 /// `[sched.classes.<class>]`.

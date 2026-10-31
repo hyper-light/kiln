@@ -43,6 +43,8 @@ const REASONS: Record<string, string> = {
   concurrency: "Concurrency group",
   quota: "Quota",
   exclusive: "Exclusive",
+  reserved: "Room kept for it",
+  behind: "Behind room kept for another",
   retry: "Retry backoff",
   approval: "Approval",
   "wait-timer": "Wait timer",

@@ -400,6 +400,10 @@ pub struct Config {
     /// losing its lease ([`LeaseLoss::Stop`], W05-R34): its runner has stopped it by then.
     /// kiln's `[sched] lock_delay`, 15 s by default.
     pub lock_delay: Ms,
+    /// Reservations for big items (W05-R39, docs/needs.md §5): the first of each class that fits
+    /// no runner keeps room where it frees first, and only what ends before then, or fits beside
+    /// it, is granted there. kiln's `[sched] backfill`: off until declared (docs/ci.md §0.3).
+    pub backfill: bool,
 }
 
 /// A level of fair share (W28-R66).
@@ -434,6 +438,7 @@ impl Default for Config {
             classes: default_classes(),
             lease: None,
             lock_delay: 15_000,
+            backfill: false,
         }
     }
 }
@@ -721,6 +726,12 @@ pub enum WaitReason {
     /// It asks for more than any runner that could take it has, even idle (resource mode,
     /// W05-R03): what it asks, and what each of those runners has of what it's short of.
     Oversized { asked: String, short: Vec<String> },
+    /// The first of its class that fits no runner now: its room is kept on `runner` from `at`
+    /// (unix ms), when the grants there are expected to have left it room (W05-R39).
+    Reserved { runner: String, at: i64 },
+    /// It would fit on `runner`, but only into the room kept there for `leg` from `at` (unix ms),
+    /// past which it would run (W05-R39).
+    Behind { leg: String, runner: String, at: i64 },
 }
 
 /// Why the runner a retry asked for can't take its leg now (W05-R28).
@@ -1190,8 +1201,33 @@ pub struct Scheduler {
     /// While a runner's loss is handled: the legs it lost that came back to the queue, offered once
     /// it's handled, in queue order with the others whose place changed (W05-R04).
     requeued: Option<Vec<String>>,
+    /// Each class's reservation, when it has one (W05-R39): room kept for its first item that
+    /// fits no runner now. Not stored: worked out again from the grants after a restart.
+    reserved: BTreeMap<Class, Kept>,
     /// The time of the last input: explanations reckon waits from it.
     now: i64,
+}
+
+/// Room kept for a class's first item that fits no runner now (W05-R39): its request on `runner`
+/// from `at`, when the grants there are expected to have left room for it; worked out at `made`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Kept {
+    leg: String,
+    runner: String,
+    at: i64,
+    made: i64,
+}
+
+/// What a runner holds, as the room rule counts it (W05-R03): the share its exclusive legs hold,
+/// whether one holds it whole, how many ordinary legs run beside them, what's used of its
+/// resources, and how many legs it runs.
+#[derive(Debug, Clone, Copy, Default)]
+struct Holding {
+    held: Resources,
+    whole: bool,
+    ordinary: usize,
+    used: Resources,
+    running: usize,
 }
 
 impl Scheduler {
@@ -1352,6 +1388,8 @@ impl Scheduler {
             Input::Tick => self.tick(now, &mut out),
             Input::Warm { runner, held } => self.warm_changed(runner, held),
         }
+        // A reservation whose item left the queue, or whose runner went, keeps nothing (W05-R39).
+        self.drop_stale_reservations();
         // A timer for the next promotion to look at or grant to expire, so each is looked at then
         // and not at whatever input comes next (W05-R31, R34): one at a time, the earlier of the
         // two, asked for again once it has passed or when an earlier one is due.
@@ -1654,6 +1692,9 @@ impl Scheduler {
 
     fn adopt(&mut self, input: LegIn, runner: String, attempt: u32, fence: Fence, now: i64, out: &mut Vec<Command>) {
         let id = input.id.clone();
+        // What runs there changed under them: the reservations there are worked out again when
+        // next they matter (W05-R39).
+        self.reserved.retain(|_, k| k.runner != runner);
         // Its grant keeps its fence, and gets a lease afresh: its runner renews it once it's back,
         // or it's lost then (W05-R34).
         let expires = self.cfg.lease.map(|ms| later(now, ms));
@@ -2165,30 +2206,75 @@ impl Scheduler {
             let own = self.own_leg(l);
             return self.executors.values().any(|e| e.pool == *pool && e.runner == r.input.id && e.state == ExecState::Idle && e.leg.as_deref() == own);
         }
+        self.room_in(r, &Holding { held, whole, ordinary, used: r.used, running: r.running.len() }, l)
+    }
+
+    /// Whether a runner holding `h` has room for a leg that isn't a pool's ([`Self::capacity`]):
+    /// none while a leg holds it whole; for an exclusive leg, the whole runner empty when it asks
+    /// for nothing, else a share of what no other share holds and the ordinary legs there don't
+    /// take; for an ordinary leg, a slot or the resources beside what's held.
+    fn room_in(&self, r: &Runner, h: &Holding, l: &Leg) -> bool {
+        if h.whole {
+            return false;
+        }
         let c = self.config();
         let size = size(r);
         match claim(&l.input, size) {
             // The whole runner: it waits for it to be empty.
-            Some(Claim::Whole) => return r.running.is_empty(),
+            Some(Claim::Whole) => return h.running == 0,
             // A share: what it holds is its own, so of the runner's CPUs and memory that no other
             // share holds and the ordinary legs there don't take, never more than the runner is.
             Some(Claim::Share(q)) => {
                 let Some(s) = size else { return false };
                 return match (c.resources, r.input.capacity) {
                     (true, Some(_)) => {
-                        let (cpu, mem) = (r.used.cpu.saturating_sub(held.cpu), r.used.mem.saturating_sub(held.mem));
-                        held.cpu.saturating_add(cpu).saturating_add(q.cpu) <= s.cpu && held.mem.saturating_add(mem).saturating_add(q.mem) <= s.mem
+                        let (cpu, mem) = (h.used.cpu.saturating_sub(h.held.cpu), h.used.mem.saturating_sub(h.held.mem));
+                        h.held.cpu.saturating_add(cpu).saturating_add(q.cpu) <= s.cpu && h.held.mem.saturating_add(mem).saturating_add(q.mem) <= s.mem
                     }
-                    _ => room(r.input.slots, size, &held, false, ordinary, r.running.len(), Incoming::Share(q)),
+                    _ => room(r.input.slots, size, &h.held, false, h.ordinary, h.running, Incoming::Share(q)),
                 };
             }
             None => {}
         }
         // An ordinary leg: in what no exclusive leg holds.
         match (c.resources, r.input.capacity) {
-            (true, Some(cap)) => fits_beside(&r.used, &held, &cap, &l.input.request, c),
-            _ => room(r.input.slots, size, &held, false, ordinary, r.running.len(), Incoming::Ordinary),
+            (true, Some(cap)) => fits_beside(&h.used, &h.held, &cap, &l.input.request, c),
+            _ => room(r.input.slots, size, &h.held, false, h.ordinary, h.running, Incoming::Ordinary),
         }
+    }
+
+    /// What a runner would hold of the legs it runs that `keep` keeps, with `plus` beside them
+    /// (W05-R39): as [`Self::holding`] counts them, its resources used less what the legs it
+    /// doesn't keep ask and more what `plus` ask.
+    fn holding_with(&self, r: &Runner, keep: impl Fn(&Leg) -> bool, plus: &[&Leg]) -> Holding {
+        let size = size(r);
+        let mut h = Holding { used: r.used, ..Holding::default() };
+        let count = |h: &mut Holding, l: &Leg| match claim(&l.input, size) {
+            Some(Claim::Share(q)) => add(&mut h.held, &q),
+            Some(Claim::Whole) => h.whole = true,
+            None => h.ordinary += 1,
+        };
+        for id in &r.running {
+            let Some(l) = self.legs.get(id) else {
+                h.ordinary += 1;
+                h.running += 1;
+                continue;
+            };
+            if !keep(l) {
+                sub(&mut h.used, &l.input.request);
+                continue;
+            }
+            h.running += 1;
+            if l.req.pool.is_none() {
+                count(&mut h, l);
+            }
+        }
+        for l in plus {
+            add(&mut h.used, &l.input.request);
+            h.running += 1;
+            count(&mut h, l);
+        }
+        h
     }
 
     /// What holds a heavy leg off a runner by the runner's load, when admission is on (W24-R19).
@@ -2236,13 +2322,21 @@ impl Scheduler {
     /// dimensions this runner offers, level by level (W05-R32, R33), then the tenant's own order
     /// (W05-R09's aged priority), then arrival.
     fn try_runner(&mut self, runner: &str, now: i64, out: &mut Vec<Command>) {
+        self.drop_stale_reservations();
         loop {
             let Some(r) = self.runners.get(runner) else { return };
             let set = profile(&dims(&r.input, self.config().resources));
-            let mut bests = Class::ALL.into_iter().zip(self.bests(r, set)).filter_map(|(c, id)| id.map(|id| (c, id)));
-            let Some((_, id)) = bests.next() else { return };
-            let ahead = bests.filter(|(c, _)| self.short(*c)).find_map(|(c, id)| self.ahead_of(c, id, r, now));
-            let (id, over) = ahead.map_or_else(|| (id.clone(), None), |(id, over)| (id.clone(), over));
+            let (bests, passed) = self.bests(r, set);
+            let mut bests = Class::ALL.into_iter().zip(bests).filter_map(|(c, id)| id.map(|id| (c, id)));
+            let Some((class, id)) = bests.next() else { return };
+            let ahead = bests.filter(|(c, _)| self.short(*c)).find_map(|(c, id)| self.ahead_of(c, id, r, now).map(|(id, over)| (c, id, over)));
+            let (class, id, over) = ahead.map_or_else(|| (class, id.clone(), None), |(c, id, over)| (c, id.clone(), over));
+            // Before it takes an item while the first of that item's class, or of a class before
+            // it, had no room here, those firsts keep room where it frees first (W05-R39); then
+            // it picks again, held to them.
+            if self.cfg.backfill && passed.iter().take(class.index() + 1).any(|p| *p) && self.reserve(runner, passed, class, now, out) {
+                continue;
+            }
             // One that would rather wait for a busy runner where it's warm holds out for it, and
             // then fits this one no more (W24-R18).
             if self.hold_for_warm(&id, runner, now, out) {
@@ -2257,24 +2351,40 @@ impl Scheduler {
 
     /// Each class's best queued leg that fits a runner offering the set of dimensions `set`, by
     /// [`Class::index`]: the least (its leaf's standing, its tenant's own order, its arrival) over
-    /// the signatures the runner may take, walked once.
-    fn bests(&self, r: &Runner, set: usize) -> [Option<&String>; 5] {
-        let mut best: [Option<(([u128; LEVELS], i128, u64), &String)>; 5] = Default::default();
+    /// the signatures the runner may take, walked once, held to the reservations standing there
+    /// (W05-R39). And for each class, whether a leg before its best (or a leg at all, when it has
+    /// none) was passed over for want of room: the runner would take it, but hasn't room for it.
+    fn bests(&self, r: &Runner, set: usize) -> ([Option<&String>; 5], [bool; 5]) {
+        type Key = ([u128; LEVELS], i128, u64);
+        let mut best: [Option<(Key, &String)>; 5] = Default::default();
+        let mut short: [Option<Key>; 5] = Default::default();
+        let held = self.reserved.values().any(|res| res.runner == r.input.id);
         for s in self.sigs.values().filter(|s| s.eligible.contains(&r.input.id)) {
             for (class, level) in &s.queue {
-                let Some(b) = best.get_mut(class.index()) else { continue };
+                let (Some(b), Some(u)) = (best.get_mut(class.index()), short.get_mut(class.index())) else { continue };
                 for (standing, k, q, id) in self.walk(*class, level, set) {
                     if b.as_ref().is_some_and(|(key, _)| (standing, k, q) >= *key) {
                         break;
                     }
-                    if self.legs.get(id).is_some_and(|l| self.fits(r, l)) {
+                    let Some(l) = self.legs.get(id) else { continue };
+                    if self.fits(r, l) {
+                        if held && !self.allowed(r, l) {
+                            continue;
+                        }
                         *b = Some(((standing, k, q), id));
                         break;
+                    }
+                    if u.is_none_or(|u| (standing, k, q) < u) && self.admits(r, l) && !self.capacity(r, l) {
+                        *u = Some((standing, k, q));
                     }
                 }
             }
         }
-        best.map(|b| b.map(|(_, id)| id))
+        let mut passed = [false; 5];
+        for ((p, b), u) in passed.iter_mut().zip(&best).zip(&short) {
+            *p = u.is_some_and(|u| b.as_ref().is_none_or(|(key, _)| u < *key));
+        }
+        (best.map(|b| b.map(|(_, id)| id)), passed)
     }
 
     /// Charges a leg's tenant for its dispatch to `runner` (W05-R32, R33): in its
@@ -2365,6 +2475,7 @@ impl Scheduler {
     }
 
     fn assign(&mut self, id: &str, runner: &str, now: i64, out: &mut Vec<Command>) {
+        self.granted_over(id, runner);
         self.charge(id, runner, now);
         self.unqueue(id);
         let expected = self.legs.get(id).map(|l| self.expected_ms(l, runner));
@@ -2804,6 +2915,9 @@ impl Scheduler {
 
     fn runner_up(&mut self, r: RunnerIn, now: i64, out: &mut Vec<Command>) {
         let id = r.id.clone();
+        // What it offers may have changed: the reservations on it are worked out again when next
+        // they matter (W05-R39).
+        self.reserved.retain(|_, k| k.runner != id);
         // A hosted executor's own runner: the executor is ready, there (W13-R07). One the
         // scheduler doesn't know is told to go.
         if let Some(e) = r.executor.clone() {
@@ -2912,6 +3026,8 @@ impl Scheduler {
 
     fn rules_changed(&mut self, rules: Vec<Rule>, now: i64, out: &mut Vec<Command>) {
         self.cfg.rules = rules;
+        // Where each item may run changed: reservations are worked out again (W05-R39).
+        self.reserved.clear();
         let queued: Vec<String> = self.legs.iter().filter(|(_, l)| l.state == State::Queued).map(|(k, _)| k.clone()).collect();
         for id in &queued {
             self.unqueue(id);
@@ -3209,6 +3325,190 @@ impl Scheduler {
             }
             self.refresh_reasons(out);
         }
+    }
+
+    // ------------------------------------------------------------------ reservations for big items (W05-R39)
+
+    /// How many of a class's first queued items [`Self::head`] looks at for one that waits for
+    /// room, so a queue of legs held back for other reasons (a quota) costs a bounded look.
+    const HEAD_LOOK: usize = 64;
+
+    /// Works out the reservation of each class up to `upto` whose first item `runner` passed over
+    /// for want of room (`passed`, [`Self::bests`]): the class's first queued item by every
+    /// dimension that waits for room keeps room on the runner where it would fit soonest. A
+    /// reservation stands until its item is granted, cancelled or no longer first, and moves only
+    /// to where its item would fit sooner; one whose time has passed is worked out again, from
+    /// the expected ends moved on since. Whether one was made, moved or dropped.
+    fn reserve(&mut self, runner: &str, passed: [bool; 5], upto: Class, now: i64, out: &mut Vec<Command>) -> bool {
+        let mut changed = false;
+        for class in Class::ALL.into_iter().filter(|c| *c <= upto && passed.get(c.index()).copied().unwrap_or(false)) {
+            let Some(head) = self.head(class) else {
+                changed |= self.reserved.remove(&class).is_some();
+                continue;
+            };
+            let standing = self.reserved.get(&class).filter(|res| res.leg == head && res.at > now).cloned();
+            let next = match &standing {
+                Some(res) if res.runner == runner => None,
+                Some(res) => self.earliest(&head, runner, now).filter(|at| *at < res.at).map(|at| (runner.to_owned(), at)),
+                None => self.soonest(&head, now),
+            };
+            let Some((on, at)) = next else {
+                // No runner could take it even once its grants end: nothing kept for it.
+                if standing.is_none() {
+                    changed |= self.reserved.remove(&class).is_some();
+                }
+                continue;
+            };
+            // Its item's class goes before those after it: their reservations there are worked out
+            // again when next they matter.
+            self.reserved.retain(|c, res| *c <= class || res.runner != on);
+            self.reserved.insert(class, Kept { leg: head.clone(), runner: on, at, made: now });
+            let reason = self.wait_reason(&head);
+            self.set_reason(&head, reason, out);
+            changed = true;
+        }
+        changed
+    }
+
+    /// A class's first queued item by every dimension (as legs going to their best runner go:
+    /// [`Self::pick_key`]) that waits for room ([`Self::waits_for_room`]), among its first
+    /// [`Self::HEAD_LOOK`].
+    fn head(&self, class: Class) -> Option<String> {
+        let set = PROFILES - 1;
+        let mut walks: Vec<std::iter::Peekable<Walk<'_>>> = self.sigs.values().filter_map(|s| s.queue.get(&class)).map(|level| self.walk(class, level, set).peekable()).collect();
+        for _ in 0..Self::HEAD_LOOK {
+            let mut least: Option<(([u128; LEVELS], i128, u64), usize)> = None;
+            for (i, w) in walks.iter_mut().enumerate() {
+                if let Some((standing, k, q, _)) = w.peek()
+                    && least.is_none_or(|(key, _)| (*standing, *k, *q) < key)
+                {
+                    least = Some(((*standing, *k, *q), i));
+                }
+            }
+            let (_, i) = least?;
+            let (_, _, _, id) = walks.get_mut(i)?.next()?;
+            if self.waits_for_room(id) {
+                return Some(id.clone());
+            }
+        }
+        None
+    }
+
+    /// Whether a queued leg waits for room alone (W05-R39): some runner it may run on would take
+    /// it and could hold it idle, and none has room for it now. One a pool's executor or a warm
+    /// runner holds isn't one.
+    fn waits_for_room(&self, id: &str) -> bool {
+        let Some(l) = self.legs.get(id).filter(|l| l.state == State::Queued && l.hold.is_none() && l.req.pool.is_none()) else { return false };
+        let Some(s) = self.sigs.get(&l.sig) else { return false };
+        let mut could = false;
+        for r in s.eligible.iter().filter_map(|r| self.runners.get(r)) {
+            if !self.admits(r, l) {
+                continue;
+            }
+            if self.capacity(r, l) {
+                return false;
+            }
+            could |= self.could_hold(r, l);
+        }
+        could
+    }
+
+    /// The runner where a leg would fit soonest ([`Self::earliest`]), and when: ties to where it
+    /// would finish first (W24-R18), then by name.
+    fn soonest(&mut self, id: &str, now: i64) -> Option<(String, i64)> {
+        let eligible: Vec<String> = self.legs.get(id).and_then(|l| self.sigs.get(&l.sig)).map(|s| s.eligible.iter().cloned().collect())?;
+        let mut best: Option<(i64, i64, String)> = None;
+        for r in eligible {
+            let Some(at) = self.earliest(id, &r, now) else { continue };
+            let finish = at.saturating_add(self.legs.get(id).map_or(0, |l| ms_i64(self.expected_ms(l, &r))));
+            if best.as_ref().is_none_or(|(a, f, n)| (at, finish, &r) < (*a, *f, n)) {
+                best = Some((at, finish, r));
+            }
+        }
+        best.map(|(at, _, r)| (r, at))
+    }
+
+    /// When a runner is expected to have room for a leg (W05-R39): now, or as soon as enough of
+    /// the grants it runs are expected to have ended (their expected ends looked at now: W05-R38),
+    /// beside the items of the classes before the leg's reserved there, each held from now until
+    /// it's expected to end. `None` when it wouldn't take the leg, couldn't hold it idle, or
+    /// wouldn't have room for it even so.
+    fn earliest(&mut self, id: &str, runner: &str, now: i64) -> Option<i64> {
+        let running = self.runners.get(runner)?.running.clone();
+        let ends: Vec<i64> = running.iter().filter_map(|g| self.look(g, now)).collect();
+        let (r, l) = (self.runners.get(runner)?, self.legs.get(id)?);
+        let class = l.key.map(|(c, _, _)| c)?;
+        if !self.admits(r, l) || !self.could_hold(r, l) {
+            return None;
+        }
+        let before = self.reserved_on(runner, |c, _| c < class);
+        let mut times: Vec<i64> = ends.into_iter().chain(before.iter().map(|(_, end)| *end)).map(|t| t.max(now)).collect();
+        times.sort_unstable();
+        times.dedup();
+        std::iter::once(now).chain(times).find(|t| {
+            let plus: Vec<&Leg> = before.iter().filter(|(_, end)| end > t).map(|(item, _)| *item).collect();
+            self.room_in(r, &self.holding_with(r, |g| g.due.is_none_or(|d| d.expected > *t), &plus), l)
+        })
+    }
+
+    /// The items reserved on a runner whose reservations `keep` keeps (W05-R39), each with when
+    /// it's expected to end: its reservation's time plus its expected duration (W05-R38).
+    fn reserved_on(&self, runner: &str, keep: impl Fn(Class, &Kept) -> bool) -> Vec<(&Leg, i64)> {
+        self.reserved.iter().filter(|(c, k)| k.runner == runner && keep(**c, k)).filter_map(|(_, k)| self.legs.get(&k.leg).map(|item| (item, Due::of(&item.input, k.at).expected))).collect()
+    }
+
+    /// A running leg's expected end looked at at `now` (W05-R38), kept as it was moved, so a
+    /// reservation worked out from it stays put until it passes again.
+    fn look(&mut self, id: &str, now: i64) -> Option<i64> {
+        let d = self.legs.get_mut(id)?.due.as_mut()?;
+        *d = d.at(now);
+        Some(d.expected)
+    }
+
+    /// Whether a runner may take a leg now as the reservations standing there go (W05-R39): each
+    /// of the leg's class or a class before it, for another item, lets it if it's expected to end
+    /// by the reservation's time ([`Self::respects`]).
+    fn allowed(&self, r: &Runner, l: &Leg) -> bool {
+        let class = l.key.map_or(Class::Background, |(c, _, _)| c);
+        self.reserved.iter().filter(|(c, res)| **c <= class && res.runner == r.input.id && res.leg != l.input.id).all(|(_, res)| self.respects(r, l, res))
+    }
+
+    /// Whether a leg granted on a runner now leaves a reservation there its room (W05-R39): it's
+    /// expected to end by the reservation's time, or fits there then beside the reserved item, the
+    /// grants still expected to run then, and the other items reserved there that will be running
+    /// then.
+    fn respects(&self, r: &Runner, l: &Leg, res: &Kept) -> bool {
+        if l.input.id == res.leg || l.req.pool.is_some() || Due::of(&l.input, self.now).expected <= res.at {
+            return true;
+        }
+        let Some(item) = self.legs.get(&res.leg) else { return true };
+        let others = self.reserved_on(&res.runner, |_, o| o.leg != res.leg && o.at <= res.at);
+        let plus: Vec<&Leg> = std::iter::once(item).chain(others.into_iter().filter(|(_, end)| *end > res.at).map(|(other, _)| other)).collect();
+        self.room_in(r, &self.holding_with(r, |g| g.due.is_none_or(|d| d.at(self.now).expected > res.at), &plus), l)
+    }
+
+    /// The reservations a leg granted on a runner doesn't leave room (W05-R39): those of classes
+    /// after its own, which it goes before, are dropped, and worked out again when next they
+    /// matter. A grant of the reserved item ends its reservation.
+    fn granted_over(&mut self, id: &str, runner: &str) {
+        if self.reserved.is_empty() {
+            return;
+        }
+        let (Some(l), Some(r)) = (self.legs.get(id), self.runners.get(runner)) else { return };
+        let gone: Vec<Class> = self.reserved.iter().filter(|(_, res)| res.leg == id || (res.runner == runner && !self.respects(r, l, res))).map(|(c, _)| *c).collect();
+        for c in gone {
+            self.reserved.remove(&c);
+        }
+    }
+
+    /// Drops the reservations whose item no longer waits in the queue in its class, or whose
+    /// runner is gone, away or draining (W05-R39).
+    fn drop_stale_reservations(&mut self) {
+        if self.reserved.is_empty() {
+            return;
+        }
+        let (legs, runners) = (&self.legs, &self.runners);
+        self.reserved.retain(|class, res| legs.get(&res.leg).is_some_and(|l| l.state == State::Queued && l.key.is_some_and(|(c, _, _)| c == *class)) && runners.get(&res.runner).is_some_and(|r| r.connected && !r.draining));
     }
 
     // ------------------------------------------------------------------ pools (W13-R09)
@@ -3524,8 +3824,24 @@ impl Scheduler {
             if let Some(short) = self.oversized(&eligible, l) {
                 return WaitReason::Oversized { asked: needs::request_words(&l.input.request).join(", "), short };
             }
+            // The first of its class that fits no runner, its room kept where it frees first
+            // (W05-R39).
+            if let Some(res) = self.reserved.values().find(|res| res.leg == id) {
+                return WaitReason::Reserved { runner: name(&res.runner), at: res.at };
+            }
             if l.input.exclusive && eligible.iter().all(|r| matches!(claim(&l.input, size(r)), Some(Claim::Whole)) && (!r.running.is_empty() || r.draining)) {
                 return WaitReason::Exclusive;
+            }
+            // It would fit, but only into room kept for another (W05-R39): the soonest that keeps it.
+            if !self.reserved.is_empty() {
+                let fitting: Vec<&Runner> = eligible.iter().copied().filter(|r| self.fits(r, l)).collect();
+                if !fitting.is_empty() && fitting.iter().all(|r| !self.allowed(r, l)) {
+                    let class = l.key.map_or(Class::Background, |(c, _, _)| c);
+                    let kept = fitting.iter().flat_map(|r| self.reserved.iter().filter(move |(c, res)| **c <= class && res.runner == r.input.id && res.leg != id && !self.respects(r, l, res)));
+                    if let Some((_, res)) = kept.min_by_key(|(_, res)| (res.at, res.runner.clone())) {
+                        return WaitReason::Behind { leg: res.leg.clone(), runner: name(&res.runner), at: res.at };
+                    }
+                }
             }
             let draining = eligible.iter().filter(|r| r.draining).count();
             let busy = eligible.iter().filter(|r| !r.draining && !self.fits(r, l)).count();
@@ -3716,6 +4032,29 @@ impl Scheduler {
         }
         if indexed != self.leases {
             return Err(format!("the expiry index holds {:?}, the running legs' grants {:?}", self.leases, indexed));
+        }
+        self.check_reservations()
+    }
+
+    /// The reservations' invariants (W05-R39, G6's half in the engine): each is for an item queued
+    /// in its class, on a runner connected and not draining, and its room is still left at its
+    /// time: by the grants' own expected ends (a grant run past its end aside), the item fits
+    /// there beside what's expected to run then and the items of the classes before it reserved
+    /// there.
+    #[cfg(test)]
+    fn check_reservations(&self) -> Result<(), String> {
+        for (class, k) in &self.reserved {
+            let Some(item) = self.legs.get(&k.leg).filter(|l| l.state == State::Queued && l.key.is_some_and(|(c, _, _)| c == *class)) else {
+                return Err(format!("{class:?}'s reservation is for {}, not queued in it", k.leg));
+            };
+            let Some(r) = self.runners.get(&k.runner).filter(|r| r.connected && !r.draining) else {
+                return Err(format!("{class:?}'s reservation for {} is on {}, gone or draining", k.leg, k.runner));
+            };
+            let before: Vec<&Leg> = self.reserved_on(&k.runner, |c, _| c < *class).into_iter().filter(|(_, end)| *end > k.at).map(|(other, _)| other).collect();
+            let h = self.holding_with(r, |g| g.due.is_none_or(|d| Due::of(&g.input, d.from).expected > k.at), &before);
+            if !self.room_in(r, &h, item) {
+                return Err(format!("{}'s room on {} at {} isn't left: it runs {:?}", k.leg, k.runner, k.at, r.running));
+            }
         }
         Ok(())
     }

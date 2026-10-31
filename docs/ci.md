@@ -1727,8 +1727,10 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   to hold it: R16's `runner: different`, or a runner that refused it; which), `adopted` (it waits for the same work in flight, W28-R42: which
   leg of which run), and admission's (W28-R60): `coalescing` (its lane, until when, at the latest
   when), `cadence` (its lane, its next start) and `speculation` (its lane, the window, how many are
-  in flight). It is stored (`jobs.wait_reason`), sent as an event, and shown
-  on the leg.
+  in flight); and backfilling's (W05-R39): `reserved` (the first of its class that fits no runner
+  now: the runner whose room is kept for it, and from when) and `behind` (it would fit, but only in
+  room kept for another and past its time: which leg, on which runner, from when). It is stored
+  (`jobs.wait_reason`), sent as an event, and shown on the leg.
 
 **Requirements: retries** (G-16)
 
@@ -1985,14 +1987,35 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
 - **W05-R38 A grant's two ends** (docs/needs.md §5, E4.1). A leg brings its job's p90 duration over
   two weeks, from the W19 rollup its median cost comes from (W05-R10), and its `timeout-minutes`.
   A running grant keeps two ends beside the median-based one that ranks runners (W24-R18). Its
-  expected end, the one a reservation is to go by (docs/needs.md §5), is its start plus its p90,
-  else its cost, else its timeout. Its hard end, when its runner stops it, is its start plus its
-  timeout (360 minutes when its job says none). An expected end that has passed, the grant still
-  running, is moved on when it's looked at, to its start plus twice the time it has run, never
-  past its hard end: a prediction corrected once it's proved wrong, its kill-time kept apart
-  (Tsafrir, Etsion and Feitelson's EASY++). No timer waits for it. A grant a restart rebuilds
-  (W05-R25) goes from the start the store has. Nothing decides on these ends yet: placement is as
-  it was.
+  expected end, the one reservations go by (W05-R39), is its start plus its p90, else its cost,
+  else its timeout. Its hard end, when its runner stops it, is its start plus its timeout (360
+  minutes when its job says none). An expected end that has passed, the grant still running, is
+  moved on when a reservation looks at it, to its start plus twice the time it has run, never past
+  its hard end, and kept there: a prediction corrected once it's proved wrong, its kill-time kept
+  apart (Tsafrir, Etsion and Feitelson's EASY++). No timer waits for it. A grant a restart
+  rebuilds (W05-R25) goes from the start the store has.
+- **W05-R39 Reservations for big items** (docs/needs.md §5, E4.2; `[sched] backfill`, off until
+  declared, §0.3). The first queued item of each class by every dimension, as items going to their
+  best runner are ordered, that waits only for room (some runner it may run on would take it and
+  could hold it idle, and none has room for it now) keeps room on the runner where it would fit
+  soonest: its request, from the time the grants there are expected to have left it room (their
+  expected ends, W05-R38), beside the items of the classes before its kept there, each until it's
+  expected to end; ties go to where it would finish first (W24-R18), then by name. An exclusive
+  item asking for no CPUs keeps the runner whole. While the room is kept, a grant there of its
+  class or a class after it must be expected to end by its time, or fit then beside it, the grants
+  expected to run on and the other items kept there (EASY backfilling, Mu'alem and Feitelson); a
+  grant of a class before it goes first, and the room is worked out again when next it matters.
+  Elsewhere nothing changes. The room is kept until its item is granted, cancelled or no longer
+  first, its runner goes or drains, or what runs there changes under it (a runner's facts, a grant
+  a restart rebuilds, the routing rules), and moves only to a runner where its item would fit
+  sooner. Once its time passes with its item still not fitting (a grant ran past its expected end),
+  nothing new goes into the room, and it's worked out again from the moved-on ends the next time it
+  matters. It's worked out only where it can matter, when a runner is about to take an item while
+  the first of that item's class, or of a class before it, had no room there: where every item fits
+  every runner (W05-AC08's bench), none is. Nothing about it is stored: a restart works it out
+  again from the grants it rebuilt. Preemptible items take kept room once runners can pause them
+  (docs/needs.md E7); until then none does. The item says where and from when (`reserved`), and an
+  item kept out of the room, with no room elsewhere, says behind what (`behind`; W05-R13).
 
 **Design.** `crates/kiln-ci/src/sched/`: `state.rs` (runners, signatures, queues), `fair.rs`,
 `groups.rs`, `routing.rs` (constraint parser, rule matching, eligibility, scoring, explain),
