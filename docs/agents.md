@@ -285,18 +285,20 @@ server says, and counts every session it has, ended ones included, until it's up
   on this", Ask an agent, a shell's "Start agents in this shell", the command palette) fills the
   composer in and says where it came from, with Clear for your own defaults.
 - **Messaging agents.** With agents selected (or one picked by typing @ and part of a name, machine
-  or harness), the same composer writes to them, each named in the To line where the folder was,
-  in the order they were picked (each new one at the end), put back with its ×, Clear for them
-  all. The To line is one line: as many as fit, the rest folded into "+N more" after them. What's
-  written stays as it turns, and it keeps the height it had starting an agent, so the list under
-  it doesn't move as the first is picked or the last put back. A prompt goes with
-  files (the paperclip, a paste or a drop) and what you say into the mic, queued, steered or sent
-  now as an agent's own box sends it. The line above is theirs: unset, each agent keeps its own;
-  chosen (the speed too), only the agents that have it are sent to, and given it first (Reset
-  unsets them all). In the field, / lists kiln's own commands for all of them first
+  or harness), the same composer writes to them, in the rows it has starting an agent: the line
+  above the box is theirs, and under the box, where More options is, the To line names each, in
+  the order they were picked (each new one at the end), put back with its ×, Clear for them all.
+  The To line is one line: as many as fit, the rest folded into "+N more" after them. What's
+  written stays as it turns, and with the same rows (the word about the machines under them too)
+  it keeps its height, so the list under it doesn't move as the first is picked or the last put
+  back. A prompt goes with files (the paperclip, a paste or a drop) and what you say into the mic,
+  queued, steered or sent now as an agent's own box sends it. On the line above, unset, each agent
+  keeps its own; chosen (the speed too), only the agents that have it are sent to, and given it
+  first (Reset unsets them all). In the field, / lists kiln's own commands for all of them first
   (`/interrupt`, `/restart`, `/allow` and `/deny` what waits on you, `/end` those selected),
-  each asked once under the field, then the agents' own; Stop beside Send stops the turns of those
-  working. It empties as it sends, and says how it went. Every agent the list shows is Select all.
+  each asked once in a line under the To line, then the agents' own; Stop beside Send stops the
+  turns of those working. It empties as it sends, and that line says how it went; it slides open
+  and shut, so the list under it moves smoothly. Every agent the list shows is Select all.
 
 ## API
 

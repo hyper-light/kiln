@@ -248,8 +248,6 @@ function resolve(c: Choices, m: Machines) {
     machine: target ? shortMachineLabel(target, m.machines) : "",
     machineFull: target ? machineLabel(target, m.machines) : "",
     noHarness: !all.some((k) => k.available),
-    // Connected machines whose runner never reported its harnesses: too old to run agents.
-    stale: m.machines.filter((x) => !(`agent:${x.name}` in m.byTarget)),
     machines: m.machines,
     reach: m.reach,
     workspaces: m.workspaces,
@@ -555,16 +553,29 @@ function Under({
         </button>
       </div>
       {more && <Options c={c} s={s} past={past} setPast={setPast} onResume={onResume} />}
-      {s.stale.length > 0 ? (
-        <p className="mc-note">
-          <b>{s.stale.map((m) => m.name).join(", ")}</b> {s.stale.length === 1 ? "is" : "are"} connected, but {s.stale.length === 1 ? "its kiln runner is" : "their kiln runners are"} too old to run
-          agents. Upgrade without a restart (shells keep running) by running this on {s.stale.length === 1 ? "that machine" : "each machine"} with the new kiln binary:{" "}
-          <code>kiln install --agent --upgrade</code>
-        </p>
-      ) : (
-        s.noHarness && <p className="mc-note">No connected machine has a coding agent installed. Install Claude Code or Codex on any machine running kiln, then try again.</p>
-      )}
+      <MachinesNote />
     </>
+  );
+}
+
+/**
+ * What's in the way on the machines themselves: runners too old to run agents, or none with a coding
+ * agent. Under the composer as it starts an agent and as it messages those selected (mission.tsx),
+ * so it stays where it is as the composer turns.
+ */
+export function MachinesNote() {
+  const m = useRes(machinesRes).data;
+  // Connected machines whose runner never reported its harnesses: too old to run agents.
+  const stale = m.machines.filter((x) => !(`agent:${x.name}` in m.byTarget));
+  if (stale.length > 0)
+    return (
+      <p className="mc-note">
+        <b>{stale.map((x) => x.name).join(", ")}</b> {stale.length === 1 ? "is" : "are"} connected, but {stale.length === 1 ? "its kiln runner is" : "their kiln runners are"} too old to run agents.
+        Upgrade without a restart (shells keep running) by running this on {stale.length === 1 ? "that machine" : "each machine"} with the new kiln binary: <code>kiln install --agent --upgrade</code>
+      </p>
+    );
+  return harnessesOf(m.byTarget).some((k) => k.available) ? null : (
+    <p className="mc-note">No connected machine has a coding agent installed. Install Claude Code or Codex on any machine running kiln, then try again.</p>
   );
 }
 

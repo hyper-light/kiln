@@ -36,7 +36,7 @@ import { Ago, machineName } from "./parts";
 import { LowBattery } from "../battery";
 import { useSeen } from "./seen";
 import { missionFoundSessions, missionRows, subagentsLine, type MissionRow, type MissionStand as Stand } from "./mission-rows";
-import { machinesRes, NewAgent, NewAgentLoading } from "./new-agent";
+import { MachinesNote, machinesRes, NewAgent, NewAgentLoading } from "./new-agent";
 import { MISSION_DRAFT } from "./new-agent-draft";
 import { useDrafts } from "./state";
 import { preloadAgents, useAgentList, useAgents } from "./use-agents";
@@ -518,8 +518,10 @@ function MissionComposer({
   const text = useDrafts((s) => s.drafts[MISSION_DRAFT] ?? "");
   const setDraft = useDrafts((s) => s.setDraft);
   const onText = React.useCallback((t: string | ((was: string) => string)) => setDraft(MISSION_DRAFT, typeof t === "function" ? t(useDrafts.getState().drafts[MISSION_DRAFT] ?? "") : t), [setDraft]);
-  // Its height as it starts an agent, held while it messages those selected (shorter, with room for
-  // its To line to grow), so the list under it stays where it is as the first is picked and the last put back.
+  // Both have the same rows (the line of settings, the box, a line under it, the word about the machines),
+  // so they're the same height and the list under them stays where it is as the first is picked and the
+  // last put back. Its height as it starts an agent is held while it messages all the same, for what only
+  // starting one shows (More options open, the line a start leaves).
   const [held] = React.useState(() => ({ height: 0 }));
   // Only a turn crossfades: the composer the page opens with shows as it is, where its shape stood while the agents loaded.
   const mode = picked.length > 0 ? "message" : "new";
@@ -541,7 +543,22 @@ function MissionComposer({
   );
   return picked.length > 0 ? (
     <div className="mc-mode" key="message" data-first={first} style={held.height > 0 ? { minHeight: held.height } : undefined}>
-      <MessageBar agents={picked} reach="selected" onEnded={onClear} all={all} onPick={onPick} text={text} onText={onText} onClear={onClear} autoFocus={focusFor === "message"} />
+      <MessageBar
+        agents={picked}
+        reach="selected"
+        onEnded={onClear}
+        all={all}
+        onPick={onPick}
+        text={text}
+        onText={onText}
+        onClear={onClear}
+        autoFocus={focusFor === "message"}
+        under={
+          <React.Suspense fallback={null}>
+            <MachinesNote />
+          </React.Suspense>
+        }
+      />
     </div>
   ) : (
     <div className="mc-mode" key="new" data-first={first} ref={measured}>
