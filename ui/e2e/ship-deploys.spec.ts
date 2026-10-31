@@ -54,7 +54,7 @@ test("Ship's tabs are Commits and Deploys; /runs lands on Ship, /deployments on 
   await expect(page.getByRole("heading", { name: "Ship.", exact: true })).toBeVisible();
 });
 
-test("apps are Ship's rows by project, needs-you first: the stand word, the line, Sync · Health · Soak, and no buttons", async ({ page }) => {
+test("apps are Ship's rows by project, needs-you first: the stand word, the line, Sync · Health · Soak, and no buttons", async ({ page, isMobile }) => {
   await page.goto("/ship/deploys");
   await notices(page);
   // What waits on a person first, then what went back, then what's out of sync: as the stills order them.
@@ -68,16 +68,20 @@ test("apps are Ship's rows by project, needs-you first: the stand word, the line
   await expect(kiln.locator(".js-l")).toHaveText(["Sync", "Health", "Soak"]);
   await expect(kiln.locator(".ship-env")).toHaveText("production");
   await expect(kiln.locator(".ship-sha")).toHaveText("15878aa");
-  // Who and when, as the stills name them: an agent with whom it acted for; the rest with the when, whole and in the fewest words.
-  await expect(kiln.locator(".dp-by")).toHaveText("agent:01a18b08 for admin");
+  // Who and when, as the stills name them (an agent with whom it acted for): the who whole, the when where the column has room.
+  await expect(kiln.locator(".dp-by")).toHaveText(/^agent:01a18b08 for admin\s*·\s*36m$/);
   await expect(page.locator('.dp-row[data-app="default/quiver-staging"] .dp-by')).toHaveText(/^auto-sync\s*·\s*now$/);
   await expect(page.locator('.dp-row[data-app="default/kube-prometheus-stack-production"] .dp-by')).toHaveText(/^admin\s*·\s*6d$/);
   for (const by of await page.locator(".dp-by").all()) {
-    const fit = await by.evaluate((el) => {
-      const ago = el.querySelector(".dp-ago");
-      return !ago || (ago.scrollWidth <= ago.clientWidth && ago.getBoundingClientRect().right <= el.getBoundingClientRect().right + 0.5);
+    const seen = await by.evaluate((el) => {
+      const right = el.getBoundingClientRect().right + 0.5;
+      const who = el.querySelector(".ship-who")?.getBoundingClientRect().right ?? 0;
+      const ago = el.querySelector(".dp-ago")?.getBoundingClientRect().right ?? 0;
+      return { who: who <= right, ago: ago <= right };
     });
-    expect(fit).toBe(true);
+    expect(seen.who).toBe(true);
+    // A phone's column has room for both.
+    if (isMobile) expect(seen.ago).toBe(true);
   }
   await expect(page.locator('.dp-row[data-app="default/site-production"] .ship-text')).toHaveText("#19 failed its health check · back on #18");
   // Nothing on a row is a button but to open it.
@@ -111,8 +115,10 @@ test("an opened app is the jobs pane's anatomy: the strip, its objects by owner,
   const where = isMobile ? at.locator("xpath=following-sibling::li[1]") : pane.locator(".jp-side");
   if (isMobile) {
     await expect(pane.locator(".jp-side")).toHaveCount(0);
+    // Right under its line, as the approved phone stills draw it: the strip stays at the pane's top.
     await expect(where).toHaveClass(/jp-detail/);
-    await expect(where.locator(".jp-strip")).toBeVisible();
+    await expect(where.locator(".jp-strip")).toHaveCount(0);
+    await expect(pane.locator(".jp-strip")).toHaveCount(1);
   } else await expect(pane.locator(".jp-detail")).toHaveCount(0);
   const out = where.locator(".ship-output");
   await expect(out.locator(".ship-output__name")).toHaveText("Pod · kiln-cd9dc7b7-rsmwz · kiln");
@@ -129,6 +135,143 @@ test("an opened app is the jobs pane's anatomy: the strip, its objects by owner,
     expect(r.radius, sel).toBe("0px");
     expect(r.left, sel).toBe("0px");
   }
+});
+
+test("with the approved stills' own content, the tab says what they say, word for word", async ({ page, isMobile }) => {
+  await page.request.post("/api/mock/ship/deploys?reset=1");
+  await page.request.post("/api/mock/ship/deploys?fixture=approved");
+  await page.goto(`/ship/deploys?app=${encodeURIComponent(KILN)}`);
+  await notices(page);
+  await expect(page.locator(".dp-proj > span:first-child")).toHaveText(["hyper-light/quiver", "hyper-light/hyperlight-site", "hyper-light/kiln"]);
+  await expect(page.locator(".dp-proj > span:last-child")).toHaveText(["2 apps · 1 waits on you", "1 app · rolled back", "3 apps · 1 out of sync"]);
+  await expect(page.locator(".dp-row .ship-name")).toHaveText(["quiver-production", "quiver-staging", "site-production", "kiln-production", "kube-prometheus-stack-production"]);
+  await expect(page.locator(".dp-row .ship-stand")).toHaveText([/^Needs you$/i, /^Syncing$/i, /^Rolled back$/i, /^Out of sync$/i, /^Synced$/i]);
+  await expect(page.locator(".dp-row .ship-text")).toHaveText([
+    "#39 waits for your approval · #38 runs",
+    "#42 · wave 2 of 3",
+    "#19 failed its health check · back on #18",
+    "#153 runs 15878aa · trunk is 2 ahead · healthy",
+    "chart 92.2.0 · healthy",
+  ]);
+  await expect(page.locator(".dp-row .ship-who")).toHaveText(["ada", "auto-sync", "auto-rollback", "agent:01a18b08 for admin", "admin"]);
+  await expect(page.locator(".dp-row .dp-ago")).toHaveText(["2d", "now", "3h", "36m", "6d"]);
+  await expect(page.locator(".dp-row .ship-env")).toHaveText(["production", "staging", "production", "production", "production"]);
+  await expect(page.locator(".dp-row .ship-sha")).toHaveText(["1f9b2c4", "7ac3e1d", "9d1e0a7", "15878aa", "92.2.0"]);
+  const pane = page.locator(`.dp-row[data-app="${KILN}"]`).getByRole("region", { name: "Deploys" });
+  await expect(pane.locator(".ship-sech")).toContainText("in-cluster/kiln · 22 objects · deploy/helm/kiln @ main");
+  await expect(said(pane)).toHaveText("Pod kiln-cd9dc7b7-rsmwz picked · running on kiln-m02 · up 3m · 4 restarts");
+  await expect(verbs(pane)).toHaveText(["Sync", "Refresh", "Roll back", "Stop"]);
+  await expect(pane.locator(".jp-g > span:first-child, .jp-g .jp-line > span:first-child")).toHaveText(["Deployment kiln", "Network", "Config", "Storage", "Jobs", "History", "Settings"]);
+  await expect(pane.locator(".jp-g > span:last-child, .jp-g .jp-line > span:last-child")).toHaveText([
+    "1/1 ready · out of sync",
+    "synced",
+    "1 differs from git",
+    "synced",
+    "",
+    "deploys and main's commits",
+    "from .kiln/deploy.yaml",
+  ]);
+  await expect(pane.locator(".jp-j .jp-line .n")).toHaveText([
+    /^Pod\s*kiln-cd9dc7b7-rsmwz$/,
+    /^ReplicaSet\s*kiln-cd9dc7b7$/,
+    /^Service\s*kiln$/,
+    /^Ingress\s*kiln$/,
+    /^ConfigMap\s*kiln-config$/,
+    /^Secret\s*kiln$/,
+    /^PVC\s*kiln-data$/,
+    /^Job\s*kiln-guard-94lwq$/,
+    /^021a29f\s*The agent page's composer keeps Mission Control's grey border$/,
+    /^b1ef50d\s*Merge ship-made-by: Files colours and ask…$/,
+    /^#153 · 15878aa\s*Merge main \(eecbd0decf\) into fix\/frozen-front-door$/,
+    /^d90465f\s*Runner upgrades: progress never waits on the uplink$/,
+    /^#151 · b626724\s*Merge main \(f381c4220f\) into observe-merge-main$/,
+    /^#149 · a946ea5\s*Mission control: an offline machine's notice can be put away$/,
+    /^Auto-sync\s*off$/,
+    /^Auto-rollback\s*on$/,
+    /^Prune\s*off$/,
+    /^App\s*delete kiln-production$/,
+  ]);
+  await expect(pane.locator(".jp-j .jp-line .v")).toHaveText([
+    "up 3m · 4 restarts",
+    "1 pod",
+    "ClusterIP · 3 ports",
+    "kiln.lan",
+    "differs from git",
+    "synced",
+    "Bound · 200Gi",
+    "completed 12h ago",
+    "1h",
+    "2h",
+    "runs now · 36m",
+    "1d",
+    "1d",
+    "2d",
+    "syncs when you say",
+    "back on a failed deploy",
+    "keeps what git dropped",
+    "",
+  ]);
+  const out = (isMobile ? pane.locator(".jp-detail") : pane.locator(".jp-side")).locator(".ship-output");
+  await expect(out.locator(".ship-output__name")).toHaveText("Pod · kiln-cd9dc7b7-rsmwz · kiln");
+  await expect(out.locator(".dp-w button")).toHaveText(["Logs", "Events", "Manifest"]);
+  await expect(out.locator(".xterm-rows")).toContainText("conversation feed caught up store=01a18bdc… from=1847211", { timeout: 15_000 });
+  await out.locator(".dp-w button", { hasText: "Events" }).click();
+  await expect(out.locator(".dp-op span")).toHaveText([
+    "05:31:02  Normal   Started    container kiln\n",
+    "05:30:58  Normal   Pulled     kiln:15878aaf0b already on kiln-m02\n",
+    "05:30:40  Warning  Unhealthy  liveness: GET /healthz: deadline exceeded\n",
+    "05:30:40  Normal   Killing    container kiln failed liveness, restarting\n",
+    "05:19:12  Warning  Unhealthy  readiness: GET /readyz: deadline exceeded (x591)\n",
+  ]);
+  // The ConfigMap that differs: its own word lit, how many keys, its diff against git.
+  await pickLine(pane, "o:~ConfigMap~kiln~kiln-config");
+  await expect(said(pane)).toHaveText("ConfigMap kiln-config picked · differs from git in 2 keys · Sync applies just this object");
+  await expect(strip(pane).locator(".jp-q button", { hasText: "out of sync" })).toHaveAttribute("aria-pressed", "mixed");
+  await expect(pane.locator(".dp-op i").last()).toHaveText("live (left) against git at 021a29f (right) · 2 keys differ");
+  // Refresh asked, as the stills ask it.
+  await verb(pane, "Refresh").click();
+  await expect(said(pane)).toHaveText("Refresh reads git and the cluster again and compares them. Hard refresh also renders deploy/helm/kiln from scratch, its cache dropped.");
+  await expect(verbs(pane)).toHaveText(["Keep", "Refresh", "Hard refresh"]);
+  await verb(pane, "Keep").click();
+  // A commit never deployed, Roll back asked: what it is, where it sits, what it would change.
+  await pickLine(pane, "h:3");
+  await verb(pane, "Roll back").click();
+  await expect(said(pane)).toHaveText(
+    "Roll kiln-production back to d90465f? It was never deployed: kiln renders deploy/helm/kiln at d90465f, syncs it, and holds it there until trunk changes what it renders.",
+  );
+  await expect(verbs(pane)).toHaveText(["Keep", "Roll back"]);
+  const card = pane.locator(".jp-cm[data-key='h:3']");
+  await expect(card.locator("h4")).toHaveText(["d90465f · never deployed", "Against what runs (#153)"]);
+  await expect(card).toContainText("user.email · 1d ago · between #151 and #153");
+  await expect(card.locator("li")).toHaveText(["Deployment kiln: image kiln:15878aa → kiln:d90465f", "ConfigMap kiln-config: 2 keys", "20 objects the same"]);
+  await verb(pane, "Keep").click();
+  // Auto-sync picked: the setting's change in the strip, the rest dimmed; what it does, and whose word it is.
+  await pickLine(pane, "c:auto_sync");
+  await expect(said(pane)).toHaveText("Auto-sync picked · off, as .kiln/deploy.yaml says");
+  await expect(verbs(pane)).toHaveText(["Turn on", "Refresh", "Roll back", "Stop"]);
+  await expect(pane.locator(".jp-cm").first()).toContainText("kiln-production syncs when someone says so. When on, it syncs each time trunk changes what it renders.");
+  await expect(pane.locator(".jp-cm").first()).toContainText("Set off in hyper-light/kiln's .kiln/deploy.yaml. Turning it on here holds until that file changes it.");
+
+  // kiln-production's canary #154 under way, as the rollout still draws it.
+  await page.request.post("/api/mock/ship/deploys?fixture=approved-rollout");
+  await page.reload();
+  await notices(page);
+  await expect(said(pane)).toHaveText("Rollout #154 picked · canary at 20%, analysis passing · Promote moves it to 50% now", { timeout: 15_000 });
+  await expect(verbs(pane)).toHaveText(["Promote", "Refresh", "Roll back", "Abort"]);
+  await expect(pane.locator(".jp-g > span").first()).toHaveText("Rollout #154");
+  await expect(pane.locator(".jp-g > span").nth(1)).toHaveText("canary · 20% · analysis passing");
+  await expect(pane.locator('.jp-j[data-key^="s:"] .v')).toHaveText(["done 4m", "passing", "next", ""]);
+  const roll = pane.locator(".jp-cm").first();
+  await expect(roll.locator("h4")).toHaveText(["Rollout #154 · canary", "Pods"]);
+  await expect(roll.locator(".row")).toHaveText([
+    /^Step 1 · weight 20%\s*4m$/,
+    /^Step 2 · analysis: error rate 0\.2% \(under 1%\), p99 41 ms \(under 250 ms\)\s*passing$/,
+    /^Step 3 · weight 50%\s*next$/,
+    /^Step 4 · weight 100%\s*$/,
+  ]);
+  await expect(roll).toContainText("stable kiln-cd9dc7b7 · 4 pods · 80%");
+  await expect(roll).toContainText("canary kiln-6f1c02aa · 1 pod · 20% · up 4m");
+  await page.request.post("/api/mock/ship/deploys?reset=1");
 });
 
 test("an object that differs shows its Diff; Events and Manifest read; Sync applies what's picked of what differs", async ({ page }) => {

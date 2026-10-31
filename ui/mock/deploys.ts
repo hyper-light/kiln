@@ -57,7 +57,7 @@ interface App {
 
 const settings = (autoSync: boolean, from = "deploy-file"): ShipDeploySetting[] => [
   { key: "auto_sync", on: autoSync, from, what: autoSync ? "syncs each time git changes what it renders" : "syncs when you say", can: true },
-  { key: "auto_rollback", on: true, from: "default", what: "goes back on a failed deploy", can: true },
+  { key: "auto_rollback", on: true, from: "default", what: "back on a failed deploy", can: true },
   { key: "prune", on: false, from: "deploy-file", what: "keeps what git dropped", can: false },
   { key: "self_heal", on: false, from: "deploy-file", what: "leaves changes made by hand", can: false },
 ];
@@ -380,6 +380,68 @@ const APPS: App[] = [
   },
 ];
 
+/**
+ * The approved stills' own content (Ada's v5 and v6 of 2026-10-30, ~/.cache/ship-design/design-v5.mjs and
+ * design-v6.mjs), for stills of the built tab to set beside them: `POST /api/mock/ship/deploys?fixture=approved`,
+ * or `approved-rollout` with kiln-production's canary #154 under way. Its five apps, kiln's heading as the
+ * stills write it, kiln-production's history as they list it, and the pod's events as they show them.
+ */
+const byName = (name: string): App => {
+  const a = APPS.find((x) => x.row.name === name);
+  if (!a) throw new Error(`no mock app ${name}`);
+  return a;
+};
+const ROLLOUT_154 = {
+  id: "in-cluster|apps/Deployment/kiln/kiln",
+  revision: "6f1c02a",
+  state: "running",
+  note: "canary · 20% · analysis passing",
+  steps: [
+    { n: 1, state: "passed", what: "weight 20%", v: "done 4m" },
+    { n: 2, state: "running", what: "analysis: error rate, latency", v: "passing", detail: "analysis: error rate 0.2% (under 1%), p99 41 ms (under 250 ms)" },
+    { n: 3, state: "none", what: "weight 50%", v: "next" },
+    { n: 4, state: "none", what: "weight 100%", v: "" },
+  ],
+  under_way: true,
+  waits: null,
+  approvals: [],
+  deploy: 154,
+  back_to: 153,
+  weight: 20,
+  strategy: "canary",
+  said: "analysis passing",
+  promote_to: 50,
+  sides: [
+    { side: "stable" as const, name: "kiln-cd9dc7b7", pods: 4, share: 80, up: null },
+    { side: "canary" as const, name: "kiln-6f1c02aa", pods: 1, share: 20, up: "4m" },
+  ],
+};
+function approved(rollout: boolean): App[] {
+  const kiln = byName("kiln-production");
+  const staging = byName("quiver-staging");
+  const kilnPane: App["pane"] = {
+    ...kiln.pane,
+    history: [
+      commit("021a29f", "The agent page's composer keeps Mission Control's grey border", HOUR),
+      commit("b1ef50d", "Merge ship-made-by: Files colours and ask…", 2 * HOUR),
+      deploy(153, "15878aa", "Merge main (eecbd0decf) into fix/frozen-front-door", 36 * MIN, { now: true, by: "agent:01a18b08 for user:admin" }),
+      commit("d90465f", "Runner upgrades: progress never waits on the uplink", DAY),
+      deploy(151, "b626724", "Merge main (f381c4220f) into observe-merge-main", DAY, { dim: true }),
+      deploy(149, "a946ea5", "Mission control: an offline machine's notice can be put away", 2 * DAY, { dim: true }),
+    ],
+    ...(rollout ? { rollout: ROLLOUT_154, why_not: { stop: "no sync is running", follow: "it follows git already", ...DECLARED } } : {}),
+  };
+  return [
+    byName("quiver-production"),
+    { row: { ...staging.row, line: "#42 · wave 2 of 3", ago: 0, runs: "7ac3e1d" }, pane: staging.pane },
+    byName("site-production"),
+    { row: kiln.row, pane: kilnPane },
+    byName("kube-prometheus-stack-production"),
+  ];
+}
+/** Projects' headings as the stills write them (kiln's counts an app they don't draw). */
+const APPROVED_SAY: Record<string, string> = { "hyper-light/kiln": "3 apps · 1 out of sync" };
+
 /** What each browser did, by its user agent: each body it sent, and the settings it changed. */
 interface Acts {
   bodies: unknown[];
@@ -388,12 +450,14 @@ interface Acts {
   tick: number;
   /** The apps it deleted. */
   deleted: Set<string>;
+  /** The approved stills' content instead of the mock's own (`approved`, `approved-rollout`). */
+  fixture: string;
 }
 const acts = new Map<string, Acts>();
 function actsOf(ua: string): Acts {
   let a = acts.get(ua);
   if (!a) {
-    a = { bodies: [], autoSync: new Map(), tick: 0, deleted: new Set() };
+    a = { bodies: [], autoSync: new Map(), tick: 0, deleted: new Set(), fixture: "" };
     acts.set(ua, a);
   }
   return a;
@@ -416,7 +480,7 @@ function seen(a: App, mine: Acts): { row: ShipDeployRow; pane: Omit<ShipDeployPa
       row.line = auto ? "#153 runs 15878aa · trunk is 2 ahead · auto-sync syncs it" : a.row.line;
     }
   }
-  if (a.row.app === "default/quiver-staging" && mine.tick > 0) row.line = `#42 · wave ${Math.min(mine.tick + 1, 3)} of 3`;
+  if (a.row.app === "default/quiver-staging" && mine.tick > 0 && !mine.fixture) row.line = `#42 · wave ${Math.min(mine.tick + 1, 3)} of 3`;
   delete (row as Partial<App["row"]>).ago;
   return { row, pane };
 }
@@ -426,16 +490,21 @@ const RANK: Record<string, number> = { needs_you: 0, failing: 1, rolled_back: 2,
 const rank = (r: ShipDeployRow) => (r.stand === "needs_you" && r.word === "Out of sync" ? 3 : (RANK[r.stand] ?? 7));
 
 /** The list as the server answers it: by project, each project's apps and the projects most pressing first. */
+/** The apps this browser sees: the mock's, or the approved stills'. */
+const appsOf = (mine: Acts): App[] => (mine.fixture ? approved(mine.fixture === "approved-rollout") : APPS);
+
 function list(mine: Acts, q: string): ShipDeploys {
   const want = q.trim().toLowerCase();
-  const rows = APPS.filter((a) => !mine.deleted.has(a.row.app))
+  const rows = appsOf(mine)
+    .filter((a) => !mine.deleted.has(a.row.app))
     .map((a) => seen(a, mine).row)
     .filter((r) => !want || [r.project, r.app, r.environment ?? "", r.cluster, r.namespace].some((v) => v.toLowerCase().includes(want)));
   const by = new Map<string, ShipDeployRow[]>();
   for (const r of rows) by.set(r.project, [...(by.get(r.project) ?? []), r]);
   const projects: ShipDeployProject[] = [...by.entries()].map(([project, apps]) => {
     apps.sort((x, y) => rank(x) - rank(y) || x.name.localeCompare(y.name));
-    return { project, apps, ...say(apps) };
+    const s = say(apps);
+    return { project, apps, ...s, say: (mine.fixture ? APPROVED_SAY[project] : undefined) ?? s.say };
   });
   projects.sort((x, y) => Math.min(...x.apps.map(rank)) - Math.min(...y.apps.map(rank)) || x.project.localeCompare(y.project));
   return { projects, total: rows.length, at_ms: Date.now() };
@@ -509,6 +578,29 @@ const LOG = [
 function logsOf(name: string) {
   const day = new Date().toISOString().slice(0, 10);
   return { pods: [name], more_pods: 0, container: "kiln", containers: ["kiln"], lines: LOG.map(([t, text]) => ({ pod: name, ts: `${day}T${t}Z`, text })), errors: [] };
+}
+/** The pod's events as the approved stills show them. */
+function approvedEvents() {
+  const day = new Date().toISOString().slice(0, 10);
+  const ev = (t: string, type: string, reason: string, message: string, count = 1) => ({
+    type,
+    reason,
+    message,
+    count,
+    first: `${day}T${t}Z`,
+    last: `${day}T${t}Z`,
+    source: "kubelet",
+    object: { kind: "Pod", name: null },
+  });
+  return {
+    events: [
+      ev("05:31:02", "Normal", "Started", "container kiln"),
+      ev("05:30:58", "Normal", "Pulled", "kiln:15878aaf0b already on kiln-m02"),
+      ev("05:30:40", "Warning", "Unhealthy", "liveness: GET /healthz: deadline exceeded"),
+      ev("05:30:40", "Normal", "Killing", "container kiln failed liveness, restarting"),
+      ev("05:19:12", "Warning", "Unhealthy", "readiness: GET /readyz: deadline exceeded", 591),
+    ],
+  };
 }
 function eventsOf() {
   const at = (m: number) => new Date(Date.now() - m * 60_000).toISOString();
@@ -660,7 +752,7 @@ export async function handleDeploys(req: http.IncomingMessage, res: http.ServerR
   const one = m === "GET" ? p.match(/^\/api\/ship\/deploys\/([^/]+)\/([^/]+)$/) : null;
   if (one) {
     const id = `${decodeURIComponent(one[1] ?? "")}/${decodeURIComponent(one[2] ?? "")}`;
-    const a = APPS.find((x) => x.row.app === id && !actsOf(ua).deleted.has(id));
+    const a = appsOf(actsOf(ua)).find((x) => x.row.app === id && !actsOf(ua).deleted.has(id));
     if (!a) ctx.json(res, 404, { error: `no app ${id}` });
     else {
       const s = seen(a, actsOf(ua));
@@ -676,7 +768,7 @@ export async function handleDeploys(req: http.IncomingMessage, res: http.ServerR
       body = {};
     }
     const verb = body.verb as ShipDeployVerb;
-    const a = APPS.find((x) => x.row.app === body.app && !actsOf(ua).deleted.has(x.row.app));
+    const a = appsOf(actsOf(ua)).find((x) => x.row.app === body.app && !actsOf(ua).deleted.has(x.row.app));
     if (!a || !(verb in OPS)) {
       ctx.json(res, 400, { error: "`app` and `verb`: the app, and what to do to it" });
       return true;
@@ -698,6 +790,8 @@ export async function handleDeploys(req: http.IncomingMessage, res: http.ServerR
   // What this browser sent the strip's endpoint, for the e2e to read; `reset` starts it over.
   if (p === "/api/mock/ship/deploys") {
     if (url.searchParams.get("reset")) acts.delete(ua);
+    const fixture = url.searchParams.get("fixture");
+    if (fixture !== null) actsOf(ua).fixture = fixture === "approved" || fixture === "approved-rollout" ? fixture : "";
     ctx.json(res, 200, { bodies: acts.get(ua)?.bodies ?? [] });
     return true;
   }
@@ -728,7 +822,7 @@ export async function handleDeploys(req: http.IncomingMessage, res: http.ServerR
   if (!r) return false;
   const key = decodeURIComponent(r[1] ?? "");
   if (r[2] === "/logs") ctx.json(res, 200, logsOf(key.split("~")[3] ?? "pod"));
-  else if (r[2] === "/events") ctx.json(res, 200, eventsOf());
+  else if (r[2] === "/events") ctx.json(res, 200, actsOf(ua).fixture ? approvedEvents() : eventsOf());
   else ctx.json(res, 200, manifestOf(key));
   return true;
 }

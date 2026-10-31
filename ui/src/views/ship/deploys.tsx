@@ -12,7 +12,7 @@
  * effects.
  */
 import * as React from "react";
-import { Check, ChevronDown, Copy } from "lucide-react";
+import { ChevronDown } from "lucide-react";
 import { cdApi } from "@/api/cd";
 import { whoSaid } from "@/api/review";
 import {
@@ -33,7 +33,6 @@ import { Loadable, Loading } from "@/components/ui/loading";
 import { EmptyState, PageIntro } from "@/components/ui/misc";
 import { JourneyStrip, StatusGlyph } from "@/components/ui/status-glyph";
 import { GLYPHS } from "@/components/ui/status-glyph-spec";
-import { toast } from "@/components/ui/toast";
 import { errorMessage, useMediaQuery } from "@/lib/hooks";
 import { useSearchParams } from "@/lib/router";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
@@ -152,20 +151,18 @@ function DeployRow({ row, open, landed, onOpen }: { row: ShipDeployRow; open: bo
           <JourneyStrip pips={strip(row.pips)} />
         </span>
         <span className="ship-metas">
-          {/* Who and when, the when whole and in the fewest words; an agent with whom it acted for instead, as the stills draw it. */}
+          {/* Who and when, as the stills draw them: the who whole, the when in the fewest words where the column has room for it. */}
           <span className="dp-by">
             {row.by ? (
-              <span className="ship-who">
-                <StatusGlyph state={row.by.startsWith("agent:") ? "agent" : "person"} size={12} />
-                <span>{byWord(row.by)}</span>
-              </span>
-            ) : null}
-            {row.by?.includes(" for ") ? null : (
               <>
-                {row.by ? <span>·</span> : null}
-                <span className="dp-ago">{row.at ? since(row.at * 1000) : "never"}</span>
+                <span className="ship-who">
+                  <StatusGlyph state={row.by.startsWith("agent:") ? "agent" : "person"} size={12} />
+                  <span>{byWord(row.by)}</span>
+                </span>
+                <span>·</span>
               </>
-            )}
+            ) : null}
+            <span className="dp-ago">{row.at ? since(row.at * 1000) : "never"}</span>
           </span>
           <span className="ship-m2">
             {row.environment ? (
@@ -375,17 +372,9 @@ function DeployPane({ row }: { row: ShipDeployRow }) {
   const words = !armed && !setting && !line && !deleting && !shown?.kind.startsWith("step");
   const one = !pick.word && picked.length === 1 ? picked[0] : undefined;
   const lit = (w: Word): boolean | "mixed" => (pick.word === w ? true : one && w !== "all" && (w === "out of sync" ? one.item.differs : UNHEALTHY.has(one.item.state)) ? "mixed" : false);
-  const stripOf = (live: boolean) => (
-    <Strip live={live} say={say} tone={armed === "refresh" || armed === "rollback" ? "ask" : armed || said?.refused ? "warn" : undefined} words={words} lit={lit} onWord={onWord} verbs={verbs} />
-  );
   const detail = shown ? <Detail pane={p} row={row} shown={shown} rows={phone ? PHONE_ROWS : SIDE_ROWS} /> : null;
-  const below = (k: Key) =>
-    phone && k === at ? (
-      <li className="jp-detail">
-        {stripOf(false)}
-        {detail}
-      </li>
-    ) : null;
+  // On a phone, the picked one's detail is right under its line, as the approved stills draw it.
+  const below = (k: Key) => (phone && k === at ? <li className="jp-detail">{detail}</li> : null);
   const settingsFrom = p.settings.some((s) => s.from === "deploy-file") ? "from .kiln/deploy.yaml" : "set here";
   return (
     <section aria-label="Deploys" className="ship-sec dp">
@@ -393,7 +382,7 @@ function DeployPane({ row }: { row: ShipDeployRow }) {
         {p.about.cluster}/{p.about.namespace} · {p.about.objects} objects · {p.about.source}
       </SectionHead>
       <div className="jp">
-        {stripOf(true)}
+        <Strip say={say} tone={armed === "refresh" || armed === "rollback" ? "ask" : armed || said?.refused ? "warn" : undefined} words={words} lit={lit} onWord={onWord} verbs={verbs} />
         <div className="jp-body dp-body">
           <ol className="jp-list" aria-label={`${row.name}'s objects, history and settings`}>
             {p.rollout ? (
@@ -614,7 +603,6 @@ function armedVerbs(
 
 /** The strip: what's picked and what an action would do, the words that pick objects, the four actions. */
 function Strip({
-  live,
   say,
   tone,
   words,
@@ -622,7 +610,6 @@ function Strip({
   onWord,
   verbs,
 }: {
-  live: boolean;
   say: React.ReactNode;
   tone: "warn" | "ask" | undefined;
   /** The words pick objects: where they don't apply (a question, a setting, a commit, a step), what's said has their room, the strip its height. */
@@ -635,7 +622,7 @@ function Strip({
   return (
     <div className="jp-strip">
       <div className="jp-say" data-tone={tone} data-room={!words || undefined}>
-        <div className="jp-said" aria-live={live ? "polite" : undefined}>
+        <div className="jp-said" aria-live="polite">
           {say}
         </div>
         <div className="jp-q" aria-hidden={!words || undefined}>
@@ -817,19 +804,7 @@ type View = "Logs" | "Diff" | "Events" | "Manifest";
 function ObjectDetail({ app, item, trunk, rows }: { app: string; item: ShipDeployItem; trunk: string | null; rows: number }) {
   const views: View[] = item.differs ? ["Diff", "Events", "Manifest"] : item.logs ? ["Logs", "Events", "Manifest"] : ["Events", "Manifest"];
   const [view, setView] = React.useState<View>(views[0] ?? "Events");
-  const [copied, setCopied] = React.useState(false);
   const k = keyOf(item);
-  // Copy: the last lines as CD reads them, as the commits' Output copies a job's.
-  const copy = async () => {
-    try {
-      const r = await cdApi.logs(app, k, { tail_lines: 500 });
-      await navigator.clipboard.writeText(r.lines.map((l) => l.text).join("\n"));
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1500);
-    } catch (e) {
-      toast({ title: "Couldn't copy the log", description: errorMessage(e), tone: "failed" });
-    }
-  };
   return (
     <div className="ship-output dp-o" data-key={item.key} data-view={view}>
       <div className="ship-output__bar">
@@ -846,11 +821,6 @@ function ObjectDetail({ app, item, trunk, rows }: { app: string; item: ShipDeplo
             </button>
           ))}
         </span>
-        {view === "Logs" ? (
-          <button type="button" className="icon-btn" data-variant="bare" data-size="sm" aria-label={copied ? "Copied the log" : "Copy the log"} onClick={() => void copy()}>
-            {copied ? <Check size={14} /> : <Copy size={14} />}
-          </button>
-        ) : null}
       </div>
       {view === "Logs" ? (
         <LogViewer cd={{ app, key: k }} live rows={rows} bare />
@@ -990,7 +960,7 @@ function RolloutDetail({ rollout }: { rollout: ShipDeployRollout }) {
         <div key={s.n} className="row">
           <StatusGlyph state={glyphOf(s.state)} size={12} />
           <span>
-            Step {s.n} · {s.what}
+            Step {s.n} · {s.detail ?? s.what}
           </span>
           {/* A step done says when: its line says it's done. */}
           <span className="dim">{s.v.replace(/^done /, "")}</span>

@@ -787,6 +787,10 @@ pub struct StepLine {
     pub state: Glyph,
     pub what: String,
     pub v: String,
+    /// The step under way's analysis as measured: each check's latest measurement
+    /// (`analysis: error rate 0.2% (under 1%), p99 41 ms (under 250 ms)`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// A rollout as the pane shows it.
@@ -846,7 +850,7 @@ fn step_what(s: &Step) -> String {
         Step::Weight { weight } => format!("weight {weight}%"),
         Step::Pause { ms: Some(ms) } => format!("wait {}", span(*ms)),
         Step::Pause { ms: None } => "wait for a promote".into(),
-        Step::Checks { names, .. } => format!("checks: {}", names.join(", ")),
+        Step::Checks { names, .. } => format!("analysis: {}", names.join(", ")),
         Step::Watch { names, window_ms } => format!("watch {} for {}", names.join(", "), span(*window_ms)),
         Step::Approve => "a person approves".into(),
     }
@@ -894,11 +898,24 @@ pub fn rollout(id: &str, rec: &RolloutRecord, now_ms: u64) -> Rollout {
             } else {
                 (Glyph::None, if i == r.step + 1 { "next".to_owned() } else { String::new() })
             };
-            StepLine { n: i + 1, state, what: step_what(s), v }
+            // Under way, an analysis says what each of its checks measured last.
+            let detail = (i == r.step && matches!(s, Step::Checks { .. }) && !r.checks.is_empty()).then(|| {
+                let each: Vec<String> = r
+                    .checks
+                    .iter()
+                    .map(|c| match c.measurements.last() {
+                        Some(m) if !m.message.is_empty() => first_line(&m.message),
+                        Some(m) if !m.value.is_null() => format!("{} {}", c.name, m.value),
+                        _ => c.name.clone(),
+                    })
+                    .collect();
+                format!("analysis: {}", each.join(", "))
+            });
+            StepLine { n: i + 1, state, what: step_what(s), v, detail }
         })
         .collect();
     let (state, said) = match &r.state {
-        State::Running => (Glyph::Running, if r.checks.is_empty() && r.background.is_empty() { "running".to_owned() } else { format!("checks {}", checks_word(r)) }),
+        State::Running => (Glyph::Running, if r.checks.is_empty() && r.background.is_empty() { "running".to_owned() } else { format!("analysis {}", checks_word(r)) }),
         State::Paused { why } => (Glyph::Requested, first_line(why)),
         State::Succeeded => (Glyph::Passed, "done".to_owned()),
         State::Aborted { why } => (Glyph::Failed, format!("aborted: {}", first_line(why))),
@@ -1338,7 +1355,7 @@ mod tests {
         let r = rollout("ro1", &record(steps.clone(), State::Running, 1, 20), NOW);
         assert_eq!(r.steps.iter().map(|s| (s.state, s.what.as_str(), s.v.as_str())).collect::<Vec<_>>(), [
             (Glyph::Passed, "weight 20%", "done 4m"),
-            (Glyph::Running, "checks: error rate, latency", "measuring"),
+            (Glyph::Running, "analysis: error rate, latency", "measuring"),
             (Glyph::None, "weight 50%", "next"),
             (Glyph::None, "weight 100%", ""),
         ]);
@@ -1347,6 +1364,24 @@ mod tests {
         assert_eq!((r.strategy.as_str(), r.said.as_str(), r.promote_to), ("canary", "running", Some(50)));
         let all = rollout("ro1", &record(vec![Step::Approve, Step::Weight { weight: 100 }], State::Running, 0, 0), NOW);
         assert_eq!((all.strategy.as_str(), all.promote_to), ("blue/green", Some(100)));
+        // Under way, its analysis as measured: each check's latest measurement, in its own words.
+        let check = |name: &str, said: &str| crate::rollout::CheckRun {
+            name: name.into(),
+            timing: crate::rollout::Timing::default(),
+            against: crate::rollout::Against::Production,
+            measurements: vec![crate::rollout::Measurement { at_ms: NOW - MIN, verdict: Verdict::Pass, value: serde_json::json!(0.002), message: said.into() }],
+            tally: crate::rollout::Tally::default(),
+            asked: None,
+            next_ms: NOW,
+            verdict: Some(Verdict::Pass),
+            why: String::new(),
+        };
+        let mut measured = record(steps.clone(), State::Running, 1, 20);
+        measured.rollout.checks = vec![check("error rate", "error rate 0.2% (under 1%)"), check("latency", "p99 41 ms (under 250 ms)")];
+        let r = rollout("ro1", &measured, NOW);
+        assert_eq!((r.note.as_str(), r.said.as_str()), ("canary · 20% · analysis passing", "analysis passing"));
+        assert_eq!(r.steps.get(1).and_then(|s| s.detail.as_deref()), Some("analysis: error rate 0.2% (under 1%), p99 41 ms (under 250 ms)"));
+        assert!(r.steps.iter().enumerate().all(|(i, s)| i == 1 || s.detail.is_none()));
         let r = rollout("ro1", &record(steps.clone(), State::Aborted { why: "error rate 4% over 1%".into() }, 1, 0), NOW);
         assert_eq!(r.steps.iter().map(|s| s.state).collect::<Vec<_>>(), [Glyph::Passed, Glyph::Failed, Glyph::Superseded, Glyph::Superseded]);
         assert_eq!((r.state, r.under_way), (Glyph::Failed, false));

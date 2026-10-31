@@ -355,7 +355,7 @@ fn setting(key: &str, on: bool, from: &str, can: bool) -> Value {
     let what = match (key, on) {
         ("auto_sync", true) => "syncs each time git changes what it renders",
         ("auto_sync", false) => "syncs when you say",
-        ("auto_rollback", true) => "goes back on a failed deploy",
+        ("auto_rollback", true) => "back on a failed deploy",
         ("auto_rollback", false) => "stays on a failed deploy",
         ("prune", true) => "a sync deletes what git dropped",
         ("prune", false) => "keeps what git dropped",

@@ -1141,22 +1141,17 @@
     height: 230px;
   }
 }
-/* An app's who and when: the when whole, the who cut short where the two run long. */
+/* An app's who and when, as the stills draw them: the who whole, the when after it where the column has room. */
 .ship-metas > .dp-by {
   display: flex;
   gap: 0.6ch;
   align-items: center;
-  justify-content: flex-end;
-}
-.dp-by .ship-who {
-  min-width: 0;
-}
-.dp-by .ship-who > span:last-child {
   overflow: hidden;
-  text-overflow: ellipsis;
+}
+.dp-by > * {
+  flex: none;
 }
 .dp-ago {
-  flex: none;
   min-width: 4ch;
   font-variant-numeric: tabular-nums;
   text-align: end;

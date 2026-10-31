@@ -283,6 +283,8 @@ export interface ShipDeployStep {
   state: string;
   what: string;
   v: string;
+  /** The step under way's analysis as measured: each check's latest measurement. */
+  detail?: string;
 }
 
 export interface ShipDeployRollout {
