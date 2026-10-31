@@ -712,6 +712,21 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let limit = srv::query(&req).get("limit").and_then(|v| v.parse().ok()).unwrap_or(10);
             boxed(|| async { crate::trail::checkpoints_page(&hub.store, limit).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))) }).await
         }
+        // The trail as a tiled log (C2SP tlog-tiles): its checkpoint, its tiles and its entries.
+        (&Method::GET, ["api", "trail", "log", rest @ ..]) => {
+            let path = rest.join("/");
+            boxed(|| async {
+                match crate::trail::log(&hub.store, &path).await {
+                    Ok(Some((bytes, ctype, immutable))) => {
+                        let r = srv::response(StatusCode::OK, ctype, srv::full(bytes::Bytes::from(bytes)));
+                        Ok(srv::with_header(r, header::CACHE_CONTROL, if immutable { "private, max-age=31536000, immutable" } else { "private, max-age=5" }))
+                    }
+                    Ok(None) => Err(err(StatusCode::NOT_FOUND, format!("the trail has no {path}"))),
+                    Err(e) => Err(err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))),
+                }
+            })
+            .await
+        }
         (&Method::POST, ["api", "trail", "checkpoints"]) => boxed(|| async {
             let size = crate::trail::checkpoint(&hub, true).await.map_err(|e| err(StatusCode::CONFLICT, format!("the trail's checkpoint isn't signed: {e:#}")))?;
             Ok(srv::json(StatusCode::OK, &json!({ "size": size })))

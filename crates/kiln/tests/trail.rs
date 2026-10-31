@@ -222,7 +222,7 @@ fn w27_r09_every_signed_statement_is_in_the_trail() -> anyhow::Result<()> {
     until(Duration::from_secs(60), "kiln's receipt of the leg's hand-on", || Ok(db.query_row("SELECT 1 FROM ci_leg_records WHERE uri = ?1", [&server], |_| Ok(())).optional()?))?;
     // The provenance kiln wrote of what the leg built, and the leg's signature of it.
     let origins = || -> anyhow::Result<Vec<String>> { Ok(db.prepare("SELECT origin FROM ci_attestations ORDER BY id")?.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?) };
-    until(Duration::from_secs(30), "the provenance, signed by kiln and by the leg", || Ok(origins().map(|o| (o.iter().any(|o| o == "kiln") && o.iter().any(|o| o == "leg")).then_some(()))?))?;
+    until(Duration::from_secs(30), "the provenance, signed by kiln and by the leg", || origins().map(|o| (o.iter().any(|o| o == "kiln") && o.iter().any(|o| o == "leg")).then_some(())))?;
     // More than 4 entries by now: a checkpoint signed at its interval.
     until(Duration::from_secs(30), "a checkpoint at its interval", || Ok(checkpoints(&s, &root)?.into_iter().next()))?;
 
@@ -293,21 +293,13 @@ fn w27_r09_every_signed_statement_is_in_the_trail() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// W27-R09: forty revocations, eight requests at a time, each in the trail once and its chain
-/// whole; after a restart the trail is as it was, appends go on from where it ended, and the next
-/// checkpoint extends the last one signed before.
-#[test]
-fn w27_r09_the_trail_survives_restart_and_concurrent_appends() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let mut s = start(dir.path(), &Options { agent: false, ci: "trail = { checkpoint_every = 8, checkpoint_minutes = 600 }", extra: "" })?;
-    let root = root_of(dir.path())?;
-    let serials: Vec<String> = (0..40u64).map(|i| format!("{:032x}", 0xfeed_0000 + i)).collect();
-    let (port, admin) = (s.port, s.admin.clone());
+/// Revokes each of `serials` (certificates kiln never issued), `threads` requests at a time.
+fn revoke_all(s: &Server, serials: &[String], threads: usize) -> anyhow::Result<()> {
+    let (port, admin) = (s.port, s.admin.as_str());
     std::thread::scope(|scope| -> anyhow::Result<()> {
-        let threads: Vec<_> = serials
-            .chunks(5)
+        let running: Vec<_> = serials
+            .chunks(serials.len().div_ceil(threads.max(1)).max(1))
             .map(|chunk| {
-                let admin = admin.as_str();
                 scope.spawn(move || -> anyhow::Result<()> {
                     for serial in chunk {
                         let (st, body) = http(port, "POST", "/api/identities/revoke", admin, Some(&json!({ "serial": serial, "reason": "lost in a test" })))?;
@@ -317,11 +309,71 @@ fn w27_r09_the_trail_survives_restart_and_concurrent_appends() -> anyhow::Result
                 })
             })
             .collect();
-        for t in threads {
+        for t in running {
             t.join().map_err(|_| anyhow::anyhow!("a thread of requests stopped short"))??;
         }
         Ok(())
-    })?;
+    })
+}
+
+/// `GET /api/trail/log/<path>` as the owner: its bytes, none for a 404.
+fn fetch(s: &Server, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    let (st, body) = common::raw(s.port, "GET", &format!("/api/trail/log/{path}"), &format!("Authorization: Bearer {}\r\n", s.admin), &[])?;
+    match st {
+        200 => Ok(Some(body)),
+        404 => Ok(None),
+        _ => anyhow::bail!("GET /api/trail/log/{path}: {st} {}", String::from_utf8_lossy(&body)),
+    }
+}
+
+/// W27-R09: the trail reads as a tiled log (C2SP tlog-tiles). From its checkpoint and its tiles
+/// alone, a client proves an entry in it and a later checkpoint consistent with an earlier one.
+#[test]
+fn w27_r09_the_trail_reads_as_a_tiled_log() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: false, ci: "trail = { checkpoint_every = 100000, checkpoint_minutes = 600 }", extra: "" })?;
+    let root = root_of(dir.path())?;
+    let serials = |from: u64, to: u64| -> Vec<String> { (from..to).map(|i| format!("{:032x}", 0xbeef_0000 + i)).collect() };
+    let signed = |s: &Server| -> anyhow::Result<Checkpoint> {
+        let (st, body) = http(s.port, "POST", "/api/trail/checkpoints", &s.admin, None)?;
+        anyhow::ensure!(st == 200, "a checkpoint asked for: {st} {body}");
+        checkpoints(s, &root)?.into_iter().next().ok_or_else(|| anyhow::anyhow!("no checkpoint"))
+    };
+    revoke_all(&s, &serials(0, 300), 6)?;
+    let first = signed(&s)?;
+    anyhow::ensure!(first.size >= 300, "{}", first.size);
+    // The log's checkpoint is the one the server signed last.
+    let note = String::from_utf8(fetch(&s, "checkpoint")?.ok_or_else(|| anyhow::anyhow!("no checkpoint served"))?)?;
+    assert_eq!(Checkpoint::parse(trail::open(&note)?.0)?, first);
+    let mut tile = |t: trail::Tile| -> Option<Vec<Hash>> { fetch(&s, &t.path(false)).ok().flatten().and_then(|b| trail::hashes_of(&t, &b)) };
+    // An entry read from its bundle, proven in the tree from tiles alone.
+    for m in [7u64, 299] {
+        let bundle = trail::Tile { level: 0, index: m / 256, width: trail::width_at(first.size, 0, m / 256).unwrap_or(0) };
+        let data = trail::unbundle(&fetch(&s, &bundle.path(true))?.ok_or_else(|| anyhow::anyhow!("entries of {m}"))?).ok_or_else(|| anyhow::anyhow!("a bundle"))?;
+        let e = Entry::parse(data.get(usize::try_from(m % 256)?).ok_or_else(|| anyhow::anyhow!("entry {m} in its bundle"))?)?;
+        assert_eq!(e.index, m);
+        let proof = trail::inclusion_by(first.size, m, &mut |lo, hi| trail::mth_from(first.size, lo, hi, &mut tile)).ok_or_else(|| anyhow::anyhow!("a proof of {m}"))?;
+        assert!(trail::verify_inclusion(&e.hash(), m, first.size, &proof, &first.root), "entry {m}");
+    }
+    assert!(fetch(&s, "tile/0/005")?.is_none(), "a tile the trail hasn't");
+    // Grown, the next checkpoint proven consistent with the first, from tiles alone.
+    revoke_all(&s, &serials(300, 330), 3)?;
+    let next = signed(&s)?;
+    let proof = trail::consistency_by(next.size, first.size, &mut |lo, hi| trail::mth_from(next.size, lo, hi, &mut tile)).ok_or_else(|| anyhow::anyhow!("a consistency proof"))?;
+    assert!(trail::verify_consistency(first.size, next.size, &first.root, &next.root, &proof));
+    Ok(())
+}
+
+/// W27-R09: forty revocations, eight requests at a time, each in the trail once and its chain
+/// whole; after a restart the trail is as it was, appends go on from where it ended, and the next
+/// checkpoint extends the last one signed before.
+#[test]
+fn w27_r09_the_trail_survives_restart_and_concurrent_appends() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut s = start(dir.path(), &Options { agent: false, ci: "trail = { checkpoint_every = 8, checkpoint_minutes = 600 }", extra: "" })?;
+    let root = root_of(dir.path())?;
+    let serials: Vec<String> = (0..40u64).map(|i| format!("{:032x}", 0xfeed_0000 + i)).collect();
+    revoke_all(&s, &serials, 8)?;
     let before = trail_of(&s)?;
     for serial in &serials {
         let mine: Vec<&Entry> = before.iter().map(|(e, _)| e).filter(|e| e.kind == trail::PAYLOAD_REVOCATION && e.subjects.contains(&format!("x509Serial:{serial}"))).collect();

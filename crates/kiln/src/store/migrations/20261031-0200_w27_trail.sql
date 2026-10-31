@@ -26,6 +26,15 @@ CREATE TABLE trail_signatures (
     taken_at INTEGER NOT NULL,
     PRIMARY KEY (statement, signature)
 );
+-- Each whole subtree of 256^level leaves (level from 1), by its index on that level, its hash
+-- kept as its last leaf came: the hashes of the trail's tiles above level 0 (C2SP tlog-tiles), and
+-- what its root and proofs are hashed up from.
+CREATE TABLE trail_nodes (
+    level INTEGER NOT NULL,
+    idx INTEGER NOT NULL,
+    hash TEXT NOT NULL,
+    PRIMARY KEY (level, idx)
+);
 -- Each entry by each of its subjects: what the trail says of a commit, an artifact or a key.
 CREATE TABLE trail_subjects (
     subject TEXT NOT NULL,
