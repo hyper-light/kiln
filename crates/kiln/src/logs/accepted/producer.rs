@@ -529,7 +529,7 @@ pub(super) async fn remaining_debt(ctx:&Context,original:Operation)->Option<Oper
 pub(super) async fn recover(ctx:Context,op:Operation)->anyhow::Result<Option<Receipt>> {
     let own=op.id.clone();
     let current=reconcile(&ctx.store,move |c|Ok(Some(publication_current(c,&own)?))).await;
-    if !current {return Ok(Some(refused(&ctx,op.id,"original producer is no longer current; retained pins preserved".into()).await))}
+    if !current {return Ok(Some(refused_append(&ctx,&op.id,"original producer is no longer current; retained pins preserved".into()).await))}
     if !op.input_ready && !matches!(read_key(&ctx.blobs,&op.input_key,&op.input_hash,op.input_bytes).await,Ok(true)) {return Ok(None)}
     retained_operation(ctx,op).await.map(Some)
 }

@@ -265,7 +265,7 @@ impl Spool {
                     d.discarded=d.discarded.checked_add(count-take).context("producer discarded-byte counter exhausted")?;
                     if take>0 {
                         let step_offset=d.steps.get(step).copied().unwrap_or(0);
-                        added_step=!d.steps.contains_key(step);
+                        added_step = !d.steps.contains_key(step);
                         anyhow::ensure!(!added_step||q.steps<STEPS,Full);
                         let seq=d.issued.checked_add(1).context("producer wire sequence exhausted")?;
                         let data=data.get(..usize::try_from(take)?).context("producer captured prefix unavailable")?.to_vec();

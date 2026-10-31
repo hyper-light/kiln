@@ -2053,7 +2053,9 @@ impl Hub {
                                 Some((Refusal::Malformed, why))
                             }
                             Ok(inner) => {
-                                let evidence = matches!(&inner, AgentMsg::JobEvent { .. } | AgentMsg::JobFinished(_) | AgentMsg::JobFinishedV2 { .. });
+                                // U05: a wrong-lane producer item has no charged original frame;
+                                // keep its OUT retryable rather than issuing a terminal control ACK/NACK.
+                                let evidence = matches!(&inner, AgentMsg::JobEvent { .. } | AgentMsg::JobFinished(_) | AgentMsg::JobFinishedV2 { .. } | AgentMsg::JobLogChunkV1(_) | AgentMsg::JobLogEndV1(_));
                                 match self.accepts_layout(peer, &inner, origin).await {
                                     Ok(true) => {},
                                     Ok(false) => {
@@ -2157,6 +2159,11 @@ impl Hub {
         };
         match msg {
             AgentMsg::Hello(_) | AgentMsg::Instance(_) => {}
+            // U05: only on_net's charged Kind::Log/LANE_JOB_LOG route retains the
+            // whole frame and checks its original authenticated connection/process.
+            AgentMsg::JobLogChunkV1(_) | AgentMsg::JobLogEndV1(_) => {
+                anyhow::bail!("producer log item requires its original retained job-log frame and authenticated route");
+            }
             // What carries JSON came read (`wire::payload_of`), to `on_read`.
             AgentMsg::AiSessions { .. }
             | AgentMsg::Identity { .. }
@@ -3565,6 +3572,42 @@ pub(crate) mod tests {
             assert_eq!(frame.2.as_slice(),b"original bytes");assert_eq!(frame.3,Some(current));
             hub.on_wire(1,"box",Frame::Ack(Has{stream:frame.0,upto:frame.1,nacks:Vec::new()}),Some(current)).await;
             assert_eq!(answer.try_recv()?,Some(Answer::Taken));
+            // U05: even this joined, current, fully capable connection cannot turn an
+            // ordinary control item into the original charged producer frame. Both binary
+            // variants must remain unacknowledged/replayable without SQL or projection.
+            hub.instances.lock().set_wide(1,strict | proto::CAP_JOB_LOG_V1);
+            let binding=proto::JobLogBindingV1 {
+                contract:proto::JobLogContractV1{version:1,capture_limit:65536},
+                owner:kiln_ci::wire::OrdinaryOwnerV1{version:1,grant:"wrong-lane-grant".into(),execution:"ci-wrong-lane".into(),allocation:"retained-wrong-lane".into(),job:"wrong-lane-log".into(),attempt:1,host:"box".into(),process_nonce:nonce.clone(),publication_epoch:"ordinary-ready".into(),connection:current.channel_id(),command:kiln_ci::wire::OrdinaryCommandV1{stream:"l:1.1".into(),seq:1}},
+            };
+            let initial=proto::job_log::initial_root(&proto::job_log::binding_id(&binding)?);
+            let result=proto::encode(&JobResult{job:binding.owner.job.clone(),status:Status::Succeeded,exit_code:Some(0),error:None,peak_rss:None,cpu_seconds:None})?;
+            let result_hash=proto::job_log::result_hash(&result)?;
+            let producer_stream=proto::job_log::stream(&binding)?;
+            let before_logs:(u64,u64,u64)=hub.store.call(|c|Ok(c.query_row("SELECT (SELECT COUNT(*) FROM ci_log_producers),(SELECT COUNT(*) FROM ci_log_producer_items),(SELECT COUNT(*) FROM ci_log_accepted_ops)",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?)).await?;
+            hub.sent.lock().clear();
+            for item in [
+                AgentMsg::JobLogChunkV1(proto::JobLogChunkV1{binding:binding.clone(),seq:1,step:0,offset:0,previous_root:initial,data:b"wrong lane".to_vec()}),
+                AgentMsg::JobLogEndV1(proto::JobLogEndV1{binding:binding.clone(),final_seq:0,captured_bytes:0,root:initial,result,result_hash,capture:proto::JobLogCaptureV1::Complete}),
+            ] {
+                assert!(hub.accepts_layout(1,&item,Some(current)).await?,"the fixture must reach generic dispatch rather than an earlier layout refusal");
+                let body=proto::encode(&item)?;
+                assert!(hub.on_agent_msg_from(1,item,Some(current)).await.is_err(),"an unwrapped typed log item has no original retained-frame authority");
+                for _ in 0..2 {
+                    hub.on_wire(1,"box",Frame::Item{stream:producer_stream.clone(),seq:1,low:0,body:body.clone()},Some(current)).await;
+                }
+                assert!(!hub.sent.lock().iter().any(|(_,reply)|match reply {
+                    ServerMsg::JobLogReplyV1(_)=>true,
+                    ServerMsg::Wire(Frame::Ack(has))=>has.stream==producer_stream && has.upto>=1,
+                    _=>false,
+                }),"wrong-lane receipt or terminal ACK/NACK would release the runner's original OUT");
+                assert!(matches!(hub.wire.on_item("box",&producer_stream,1,0,body),Arrival::Take(_)),"the same unacknowledged control item must remain replayable");
+                hub.wire.retry("box",&producer_stream,1);
+            }
+            let after_logs:(u64,u64,u64)=hub.store.call(|c|Ok(c.query_row("SELECT (SELECT COUNT(*) FROM ci_log_producers),(SELECT COUNT(*) FROM ci_log_producer_items),(SELECT COUNT(*) FROM ci_log_accepted_ops)",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?)).await?;
+            assert_eq!(after_logs,before_logs,"wrong-lane protocol input cannot reserve or publish accepted log SQL");
+            assert!(!hub.logs.is_live(&binding.owner.job),"wrong-lane protocol input cannot create a compatibility publisher");
+            assert!(hub.logs.read(&binding.owner.job,0).await.is_empty(),"wrong-lane input cannot project raw output");
             hub.instances.lock().connected(1,3,Some([3;32]));
             assert_eq!(hub.runner_wide_caps("box") & proto::CAP_ORDINARY_EXECUTION_DEBT,0,"replacement cannot borrow the former joined channel readiness");
             assert_eq!(hub.instances.lock().owner(&crate::instances::Owned::Job("physical".into())),Some(1));

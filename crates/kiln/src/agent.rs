@@ -1367,7 +1367,7 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
     let mut front_door_sent: Option<String> = None;
     let ordinary_records: Arc<dyn kiln_seams::records::Records> = Arc::new(crate::records::from_database(&database, &runner_machine_namespace(&name))?);
     let spool = retained::Spool::new_in(Arc::clone(&ordinary_records), admission_paths.clone());
-    let mut retained_spool = None;
+    let mut retained_spool: Option<retained::Spool> = None;
     // Initialize the SAME producer before strict readiness, without holding session ingress.
     // Physical pre-feature drain and old-writer quiescence remain external prerequisites.
     let (inventory,records)=(admission_paths.clone(),Arc::clone(&ordinary_records));

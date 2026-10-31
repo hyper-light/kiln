@@ -618,8 +618,8 @@ mod tests {
             let before=records.head().await?;
             assert!(restarted.receive_job_log(&binding,&crate::proto::JobLogReplyV1::Committed(wrong)).await.is_err());
             assert_eq!(records.head().await?,before);
-            let ack=restarted.receive_job_log(&binding,&crate::proto::JobLogReplyV1::Committed(receipt)).await?;
-            assert_eq!(ack.upto,3);
+            let log_ack=restarted.receive_job_log(&binding,&crate::proto::JobLogReplyV1::Committed(receipt)).await?;
+            assert_eq!(log_ack.upto,3);
             assert!(matches!(restarted.clean_job_log_page(&binding).await?,logs::Clean::Finished));
             assert!(!restarted.job_log_debt().await?);
             // No OS child was launched by this metadata fixture; close that SAME Gate
