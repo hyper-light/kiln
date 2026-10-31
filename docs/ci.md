@@ -8898,10 +8898,10 @@ research `01a17947fdad71e5a4f15866e3541c41`.
   body or DER); the migration's `w27_r01_identities_and_revocations_tables`; `identities.rs`'s
   `w27_r02_*`; `ci::signing`'s `w27_r12_*` (keyless signing through the simulator verifies; kiln's
   client passes the Sigstore suite).
-- *Not yet.* kiln's Sigstore client hasn't run the suite against a real Fulcio and Rekor; reviews, CI
-  output, lands and deploys don't sign with these identities yet (R04 to R11; commits do: *Built:
-  signatures*, below); the CLI signs in with a passkey only through a personal access token (no
-  approving a device from the browser yet).
+- *Not yet.* kiln's Sigstore clients haven't run the suite against a real Fulcio and Rekor; deploys
+  don't sign with these identities yet (Ship's plan; commits, verdicts and comments, a leg's
+  results and provenance, and lands do: the *Built* entries below); the CLI signs in with a passkey
+  only through a personal access token (no approving a device from the browser yet).
 
 **Built: signatures (R03: commits, pushes and what hosts verified; AC03).** Plan
 `01a17856b1b273268adf6ce8c4f78410`, research `01a18abcef987683938692b8832c1831`.

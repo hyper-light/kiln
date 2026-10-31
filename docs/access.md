@@ -73,6 +73,17 @@ each epoch, for its person, named by the runner process holding its key, and lik
 legs, the server and CD. docs/ci.md W27 says what each kind's certificate names, how long it lasts
 and how a revoked one is refused from that moment (`kiln identities`).
 
+**Signed as themselves.** What each makes is signed as whoever made it, never with a key shared
+between them. A person's commits are signed on their device, with the key `kiln login` made there
+(`kiln clone` sets git up to) or an SSH key they bound to themselves (`/api/me/ssh-signers`). An
+agent's commits, and its pushes, are signed by its runner with the session's key, kiln's git
+credential for the agent making the push the agent's too. The commits kiln makes itself (revisions,
+lands) are signed as its server or CD. A review's verdicts and comments are signed by whoever gives
+them, a leg's results and provenance by the leg, a land by the queue that tested it. A repository
+kiln hosts that requires signatures (`.kiln/review.yaml`'s `signatures:`, new repositories by
+default) refuses a push whose commits aren't signed by someone kiln verifies, saying which commit
+and why. docs/ci.md W27 (R03 to R07) says what each signs, over what, and how it's checked.
+
 **Jobs ask for what they need** with a new pipeline key, so no pipeline needs the admin token in
 a secret:
 
