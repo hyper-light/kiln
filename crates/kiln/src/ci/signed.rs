@@ -154,12 +154,18 @@ async fn take(hub: &Hub, machine: &str, job: &str, bundles: &str) -> anyhow::Res
     let j = job.to_owned();
     hub.store
         .call(move |c| {
+            let tx = crate::store::tx(c)?;
             for r in rows {
-                c.execute(
+                let n = tx.execute(
                     "INSERT OR IGNORE INTO ci_leg_records (job_id, attempt, digest, payload_type, bundle, signer, uri, taken_at, refused) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                     params![j, r.attempt, r.digest, r.payload_type, r.bundle, r.signer, r.uri, r.taken_at, r.refused],
                 )?;
+                // In the trail as taken: what was refused wasn't.
+                if n > 0 && r.refused.is_none() {
+                    crate::trail::take(&tx, &r.bundle, r.taken_at)?;
+                }
             }
+            tx.commit()?;
             Ok(())
         })
         .await?;
@@ -184,10 +190,15 @@ async fn receipt(hub: &Hub, job: &str, attempt: i64, h: &statement::Checked, ser
     let (j, s, at) = (job.to_owned(), server.to_owned(), crate::util::now_unix());
     hub.store
         .call(move |c| {
-            c.execute(
+            let tx = crate::store::tx(c)?;
+            let n = tx.execute(
                 "INSERT OR IGNORE INTO ci_leg_records (job_id, attempt, digest, payload_type, bundle, signer, uri, taken_at, refused) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
                 params![j, attempt, digest, statement::PAYLOAD_CUSTODY, bundle, words, s, at],
             )?;
+            if n > 0 {
+                crate::trail::take(&tx, &bundle, at)?;
+            }
+            tx.commit()?;
             Ok(())
         })
         .await

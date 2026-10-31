@@ -161,10 +161,29 @@ pub struct Ci {
     /// someone kiln verifies (`required`, the default) or only warns (`warn`), where its
     /// `.kiln/review.yaml` doesn't say (docs/ci.md W27-R03). Repositories from before warn.
     pub signatures: kiln_ci::land::SignatureMode,
+    /// `[ci.trail]`: when kiln signs a checkpoint of its trail of signed statements (docs/ci.md
+    /// W27-R09).
+    pub trail: Trail,
     /// `kiln workflow run`'s own server (docs/ci.md W17-R06): every leg runs on its one runner,
     /// whatever names for runners its `runs-on` uses. Not a setting.
     #[serde(skip)]
     pub local: bool,
+}
+
+/// `[ci.trail]`'s settings: kiln signs a checkpoint of its trail once `checkpoint_every` entries
+/// came after the last one, or the oldest of them has waited `checkpoint_minutes`, whichever comes
+/// first (docs/ci.md W27-R09).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Trail {
+    pub checkpoint_every: u64,
+    pub checkpoint_minutes: u64,
+}
+
+impl Default for Trail {
+    fn default() -> Self {
+        Trail { checkpoint_every: 256, checkpoint_minutes: 10 }
+    }
 }
 
 /// `[ci.advisories]`'s settings.

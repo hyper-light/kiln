@@ -123,7 +123,10 @@ async fn delegate_leg(hub: &Hub, job: &str, attempt: u32, uri: &str, cert_pem: &
     let (j, d, at) = (job.to_owned(), digest.clone(), crate::util::now_unix());
     hub.store
         .call(move |c| {
-            c.execute("INSERT OR REPLACE INTO ci_leg_delegations (digest, job_id, bundle, taken_at, signs) VALUES (?1, ?2, ?3, ?4, ?5)", params![d, j, bundle, at, signs])?;
+            let tx = crate::store::tx(c)?;
+            tx.execute("INSERT OR REPLACE INTO ci_leg_delegations (digest, job_id, bundle, taken_at, signs) VALUES (?1, ?2, ?3, ?4, ?5)", params![d, j, bundle, at, signs])?;
+            crate::trail::take(&tx, &bundle, at)?;
+            tx.commit()?;
             Ok(())
         })
         .await?;
@@ -1080,11 +1083,14 @@ pub async fn revoke(store: &Store, target: Target, reason: &str, by: &str, at: i
                     vec![(None, Some(key.clone()), subject.unwrap_or(key))]
                 }
             };
+            let taken_at = crate::util::now_unix();
             for (serial, key, subject) in &rows {
                 tx.execute(
                     "INSERT INTO revocations (serial, key_sha256, subject, at, reason, by) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![serial, key, subject, at, reason, by],
                 )?;
+                let said = kiln_ci::identity::trail::revocation(serial.as_deref(), key.as_deref(), subject, at, &reason, &by);
+                crate::trail::own(&tx, kiln_ci::identity::trail::PAYLOAD_REVOCATION, &said, taken_at)?;
             }
             tx.commit()?;
             let mut keys: Vec<String> = rows.into_iter().filter_map(|(_, k, _)| k).collect();

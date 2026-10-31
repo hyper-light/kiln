@@ -16,15 +16,22 @@
 //!   (`kiln://<org>/trail`, its key's name too), its size and its root, signed by kiln's server
 //!   with its P-256 key (signed-note's type 0x02, its key ID the hash of its public key, as Rekor's
 //!   checkpoints are), under a certificate that verifies to kiln's root ([`signed`],
-//!   [`verify_note`]). kiln signs no checkpoint that doesn't extend the one before ([`extends`]).
+//!   [`verify_note`]). kiln signs no checkpoint that doesn't extend the one before ([`extends`]),
+//!   and signs one once entries have waited long enough or come in number enough ([`due`]).
+//! - **What an entry says** of its statement comes from the statement ([`about`]). What kiln checks
+//!   that isn't a statement itself (a pushed commit's signature, what a host verified, a
+//!   revocation) goes in as kiln's own statement of it ([`PAYLOAD_CHECKED`],
+//!   [`PAYLOAD_REVOCATION`]), unsigned: the checkpoints over the trail vouch for it.
 
 use base64::Engine as _;
 use const_oid::db::rfc5912::{ID_EC_PUBLIC_KEY, SECP_256_R_1};
 use der::asn1::ObjectIdentifier;
 use der::{Decode as _, Encode as _};
+use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
 use super::chain::{self, Actor, Identity, Revocation, Verified};
+use super::statement::{Statement, Subject};
 
 /// A SHA-256 hash.
 pub type Hash = [u8; 32];
@@ -516,6 +523,102 @@ pub fn extends(old: &Checkpoint, new: &Checkpoint, proof: &[Hash]) -> Result<(),
     Ok(())
 }
 
+/// Whether kiln signs a checkpoint now: entries came after the last one it signed (at `signed`
+/// entries, 0 before the first), and `every` of them did, or the oldest, taken at `oldest`, has
+/// waited `minutes`. No entry waits longer for a checkpoint, nor among more than `every`.
+pub fn due(size: u64, signed: u64, oldest: Option<i64>, now: i64, every: u64, minutes: u64) -> bool {
+    let waiting = size.saturating_sub(signed);
+    let wait = i64::try_from(minutes.saturating_mul(60)).unwrap_or(i64::MAX);
+    waiting > 0 && (waiting >= every.max(1) || oldest.is_some_and(|t| now.saturating_sub(t) >= wait))
+}
+
+/// What a trail entry says of a statement, from its payload type and payload: its digest (SHA-256
+/// over its PAE, [`super::statement::digest`]), its kind and its subjects. Its kind is an in-toto
+/// statement's predicate type (W18's attestations), else its payload type, on one line however it
+/// came; its subjects are what its payload names by digest (kiln's statements and in-toto's alike),
+/// each `<algorithm>:<hex>`, leaving out any that isn't one.
+pub fn about(payload_type: &str, payload: &[u8]) -> (String, String, Vec<String>) {
+    let digest = super::statement::digest(payload_type, payload);
+    let value: Value = serde_json::from_slice(payload).unwrap_or(Value::Null);
+    let kind = value.get("predicateType").and_then(Value::as_str).filter(|k| !k.is_empty()).unwrap_or(payload_type);
+    let kind: String = kind.escape_debug().take(256).collect();
+    let mut subjects: Vec<String> = value
+        .get("subject")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s.get("digest").and_then(Value::as_object))
+        .flatten()
+        .filter_map(|(alg, hex)| hex.as_str().filter(|h| alg.len() <= 32 && alg.chars().all(|c| c.is_ascii_alphanumeric()) && !alg.is_empty() && is_hex(h)).map(|h| format!("{alg}:{}", h.to_ascii_lowercase())))
+        .collect();
+    subjects.sort();
+    subjects.dedup();
+    (digest, if kind.is_empty() { "unknown".to_owned() } else { kind }, subjects)
+}
+
+fn is_hex(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 128 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// kiln's own statement of what it checked, where what it checked isn't a statement itself: a
+/// pushed commit's signature ([`checked_commit`]), what a repository's host verified of a commit
+/// ([`checked_by_host`]). Unsigned: the checkpoints over the trail vouch for it.
+pub const PAYLOAD_CHECKED: &str = "application/vnd.kiln.checked+json";
+/// kiln's own statement of a revocation it recorded ([`revocation`]), unsigned as
+/// [`PAYLOAD_CHECKED`]'s are.
+pub const PAYLOAD_REVOCATION: &str = "application/vnd.kiln.revocation+json";
+
+/// A subject named by one digest, when `hex` is one of `algorithm`'s (lowercased).
+fn subject(name: &str, algorithm: &str, hex: &str) -> Option<Subject> {
+    let hex = hex.to_ascii_lowercase();
+    let length = match algorithm {
+        "gitCommit" => hex.len() == 40 || hex.len() == 64,
+        "sha256" => hex.len() == 64,
+        _ => true,
+    };
+    (is_hex(&hex) && length).then(|| Subject { name: name.to_owned(), digest: [(algorithm.to_owned(), hex)].into(), ..Subject::default() })
+}
+
+/// kiln's statement that it checked the signature of commit `sha` as a push to `refname` of
+/// `repo` brought it: the signature by its digest (`signature`, the SHA-256 of the signature as the
+/// commit carries it) where it has one, and what kiln found: `seen` (`unsigned`, `unverified` or
+/// `by`) and its words (why it isn't verified; the identity that signed).
+pub fn checked_commit(repo: &str, refname: &str, sha: &str, signature: Option<&str>, seen: &str, words: Option<&str>) -> Statement {
+    let mut s = Statement::new(json!({ "check": "signature", "repo": repo, "ref": refname, "seen": seen, "words": words }));
+    s.subject = commit_and_signature(sha, signature);
+    s
+}
+
+/// kiln's statement that it made commit `sha` of `repo` and signed it as `by` (its server's or
+/// CD's identity), the signature by its digest as [`checked_commit`] names one.
+pub fn made_commit(repo: &str, sha: &str, signature: Option<&str>, by: &str) -> Statement {
+    let mut s = Statement::new(json!({ "check": "made", "repo": repo, "by": by }));
+    s.subject = commit_and_signature(sha, signature);
+    s
+}
+
+fn commit_and_signature(sha: &str, signature: Option<&str>) -> Vec<Subject> {
+    subject("commit", "gitCommit", sha).into_iter().chain(signature.and_then(|d| subject("signature", "sha256", d))).collect()
+}
+
+/// kiln's statement of what host `host` (`github`, `gitlab`, `bitbucket`) said it verified of
+/// commit `sha` of `repo`, as kiln read it at `read_at`: its state, why, the signer it named and
+/// when it verified.
+#[allow(clippy::too_many_arguments)]
+pub fn checked_by_host(repo: &str, host: &str, sha: &str, state: &str, reason: Option<&str>, signer: Option<&str>, verified_at: Option<i64>, read_at: i64) -> Statement {
+    let mut s = Statement::new(json!({ "check": "host", "repo": repo, "host": host, "state": state, "reason": reason, "signer": signer, "verified_at": verified_at, "read_at": read_at }));
+    s.subject = subject("commit", "gitCommit", sha).into_iter().collect();
+    s
+}
+
+/// kiln's statement of a revocation: the certificate (`serial`) or key (`key`, the SHA-256 of its
+/// SubjectPublicKeyInfo) it names, whose they were, from when (`at`), why and by whom.
+pub fn revocation(serial: Option<&str>, key: Option<&str>, subject_of: &str, at: i64, reason: &str, by: &str) -> Statement {
+    let mut s = Statement::new(json!({ "serial": serial, "key": key, "subject": subject_of, "at": at, "reason": reason, "by": by }));
+    s.subject = serial.and_then(|v| subject("certificate", "x509Serial", v)).into_iter().chain(key.and_then(|k| subject("key", "sha256", k))).collect();
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -780,6 +883,46 @@ mod tests {
         assert!(Checkpoint::parse("kiln://hyper-light/trail\nten\n").is_err());
         assert!(Checkpoint::parse("kiln://hyper-light/trail\n+10\nAAAA\n").is_err());
         assert!(open("kiln://hyper-light/trail\n10\n").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn w27_r09_a_checkpoint_comes_due_by_count_or_by_time() {
+        let now = AT;
+        assert!(!due(0, 0, None, now, 4, 10), "nothing to sign");
+        assert!(!due(3, 0, Some(now - 10), now, 4, 10), "three waiting, ten seconds");
+        assert!(due(4, 0, Some(now - 10), now, 4, 10), "four waiting");
+        assert!(due(5, 4, Some(now - 600), now, 4, 10), "one waiting ten minutes");
+        assert!(!due(5, 4, Some(now - 599), now, 4, 10), "one waiting a second less");
+        assert!(!due(4, 4, Some(now - 10_000), now, 4, 10), "none waiting since the last");
+        assert!(due(1, 0, Some(now), now, 0, 10), "every 0 is every entry");
+    }
+
+    #[test]
+    fn w27_r09_an_entry_says_what_its_statement_is_about() -> anyhow::Result<()> {
+        use super::super::statement;
+        // kiln's own words: its payload type, the commit and its signature.
+        let checked = checked_commit("hyper-light/kiln", "refs/heads/main", &"a".repeat(40), Some(&"B".repeat(64)), "by", Some("kiln://hyper-light/person/sam"));
+        let payload = statement::payload(&checked)?;
+        let (digest, kind, subjects) = about(PAYLOAD_CHECKED, &payload);
+        assert_eq!(digest, statement::digest(PAYLOAD_CHECKED, &payload));
+        assert_eq!((kind.as_str(), subjects), (PAYLOAD_CHECKED, vec![format!("gitCommit:{}", "a".repeat(40)), format!("sha256:{}", "b".repeat(64))]));
+        let host = statement::payload(&checked_by_host("hyper-light/kiln", "github", &"c".repeat(40), "valid", Some("valid"), Some("sam"), Some(AT), AT))?;
+        assert_eq!(about(PAYLOAD_CHECKED, &host).2, vec![format!("gitCommit:{}", "c".repeat(40))]);
+        // An in-toto statement (W18's): its predicate type; its subjects lowercased; one that
+        // isn't a digest left out.
+        let intoto = json!({ "_type": "https://in-toto.io/Statement/v1", "subject": [{ "name": "image", "digest": { "sha256": "CC".repeat(32) } }, { "name": "x", "digest": { "sha256": "zz\n" } }], "predicateType": "https://slsa.dev/provenance/v1", "predicate": {} });
+        let (_, kind, subjects) = about("application/vnd.in-toto+json", &serde_json::to_vec(&intoto)?);
+        assert_eq!((kind.as_str(), subjects), ("https://slsa.dev/provenance/v1", vec![format!("sha256:{}", "c".repeat(64))]));
+        // A payload type of two lines is one, its newline written out: the entry is written.
+        let (d, kind, _) = about("application/x\nforged", b"{}");
+        assert_eq!(kind, "application/x\\nforged");
+        assert!(next(None, &d, &kind, vec![], AT).is_ok());
+        // A revocation: its serial lowercased; one that isn't hex named in its words alone.
+        let r = statement::payload(&revocation(Some("0A1B"), Some(&"d".repeat(64)), "fedora-2", AT, "runner forgotten", "ada"))?;
+        assert_eq!(about(PAYLOAD_REVOCATION, &r).2, vec![format!("sha256:{}", "d".repeat(64)), "x509Serial:0a1b".to_owned()]);
+        let odd = revocation(Some("not hex"), None, "fedora-2", AT, "key lost", "sam");
+        assert!(odd.subject.is_empty() && statement::payload(&odd).is_ok());
         Ok(())
     }
 

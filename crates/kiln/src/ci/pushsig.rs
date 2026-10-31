@@ -59,6 +59,20 @@ pub struct Verdict {
     pub refname: String,
     pub refused: Option<String>,
     pub warnings: Vec<String>,
+    /// What it found of each commit the ref brought, for the trail (W27-R09).
+    #[serde(default)]
+    pub commits: Vec<Found>,
+}
+
+/// What kiln's hook found of one commit's signature: the signature by its digest (the SHA-256 of
+/// it as the commit carries it), and `seen` (`unsigned`, `unverified`, `by`) with its words (why it
+/// isn't verified; the identity that signed).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Found {
+    pub sha: String,
+    pub signature: Option<String>,
+    pub seen: String,
+    pub words: Option<String>,
 }
 
 /// A push's folder, readied for kiln's hook (`<data>/pushes/<id>`), gone when this is dropped.
@@ -158,11 +172,22 @@ fn hook(args: &[String]) -> anyhow::Result<bool> {
     let revocations: Vec<Revocation> = context.revocations.iter().map(|r| Revocation { serial: r.serial.clone(), key: r.key.clone(), at: r.at, reason: r.reason.clone(), by: r.by.clone() }).collect();
     let ssh: Vec<(String, Vec<u8>)> = context.ssh.iter().filter_map(|(person, key)| base64::engine::general_purpose::STANDARD.decode(key).ok().map(|blob| (person.clone(), blob))).collect();
     let against = Against { org: &context.org, root: &root, revocations: &revocations, ssh: &ssh, now: crate::util::now_unix() };
-    let seen: Vec<(String, Seen)> = new_commits(new)?.into_iter().map(|(sha, raw)| (sha, checked(&raw, &against))).collect();
+    let mut seen: Vec<(String, Seen)> = Vec::new();
+    let mut commits: Vec<Found> = Vec::new();
+    for (sha, raw) in new_commits(new)? {
+        let s = checked(&raw, &against);
+        let (word, words) = match &s {
+            Seen::Unsigned => ("unsigned", None),
+            Seen::Unverified(why) => ("unverified", Some(why.clone())),
+            Seen::By(identity) => ("by", Some(identity.uri().unwrap_or_else(|_| identity.to_string()))),
+        };
+        commits.push(Found { sha: sha.clone(), signature: gitsig::signature_of(&raw).map(|g| crate::util::sha256_hex(g.as_bytes())), seen: word.to_owned(), words });
+        seen.push((sha, s));
+    }
     let pusher = context.agent_for.clone().map_or(Pusher::Other, |person| Pusher::Agent { person });
     let judged = kiln_ci::identity::push::judge(&context.policy, context.required, &context.org, refname, &pusher, &seen);
     let taken = judged.refused.is_none();
-    let verdict = Verdict { refname: refname.clone(), refused: judged.refused, warnings: judged.warnings };
+    let verdict = Verdict { refname: refname.clone(), refused: judged.refused, warnings: judged.warnings, commits };
     let file = dir.join("verdicts").join(format!("{}.json", crate::util::sha256_hex(refname.as_bytes())));
     std::fs::write(&file, serde_json::to_vec(&verdict)?).with_context(|| format!("write {}", file.display()))?;
     Ok(taken)
@@ -247,7 +272,7 @@ mod tests {
         let p = Prepared { dir: dir.clone() };
         assert_eq!(p.config(), format!("core.hooksPath={}", dir.join("hooks").display()));
         assert!(p.verdicts().is_empty(), "nothing judged yet");
-        let v = Verdict { refname: "refs/heads/main".into(), refused: Some("commit 3f2a1c9 isn't signed".into()), warnings: Vec::new() };
+        let v = Verdict { refname: "refs/heads/main".into(), refused: Some("commit 3f2a1c9 isn't signed".into()), warnings: Vec::new(), commits: Vec::new() };
         std::fs::write(dir.join("verdicts").join("a.json"), serde_json::to_vec(&v)?)?;
         assert_eq!(p.verdicts().first().and_then(|v| v.refused.as_deref()), Some("commit 3f2a1c9 isn't signed"));
         drop(p);

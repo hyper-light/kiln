@@ -1,0 +1,269 @@
+//! The trail (docs/ci.md W27-R09): every signed statement kiln takes goes into one append-only
+//! log, in the transaction that takes it, so the trail's order is the order kiln took things; and
+//! kiln's server signs checkpoints of it as `[ci.trail]` says. What holds, and what kiln signs, is
+//! `kiln_ci::identity::trail`'s.
+//!
+//! - **Taken** ([`take`]): a signed statement as kiln keeps it in its own table: a leg's records
+//!   and the server's delegations of legs, custody records, W18's attestations.
+//! - **kiln's own** ([`own`]): what kiln checks that isn't a statement itself (a pushed commit's
+//!   signature, what a host verified, a revocation) goes in as kiln's statement of it, unsigned:
+//!   the checkpoints over it vouch for it.
+//! - **Once**: a statement taken again (a leg's records sent again after a reconnect) stays where
+//!   kiln first took it; a signature of it by another is kept beside it. Nothing is pruned.
+//! - **Checkpoints** ([`checkpoint`], [`checkpoints_loop`]): signed by the server once due, each
+//!   only after the entries since the one before hold as a chain and hash as kept, and the tree
+//!   over the leaves kept extends the one before's: kiln signs none that doesn't, saying why.
+
+use std::sync::Arc;
+
+use base64::Engine as _;
+use kiln_ci::identity::statement::Statement;
+use kiln_ci::identity::trail::{self, Checkpoint, Entry, Hash};
+use rusqlite::{Connection, OptionalExtension as _, params};
+use serde_json::{Value, json};
+
+use crate::hub::Hub;
+use crate::store::Store;
+
+/// How often the server looks for a checkpoint that's due.
+const LOOK_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+
+/// Appends signed statement `bundle` (a Sigstore bundle, as kiln keeps it), taken at `taken_at`,
+/// in the transaction `c` that takes it, and keeps its signature beside it: whether the statement
+/// is new to the trail. Signed again by another (the leg that built an artifact signing the
+/// provenance kiln wrote), it stays where it is and has that signature too.
+pub fn take(c: &Connection, bundle: &str, taken_at: i64) -> anyhow::Result<bool> {
+    let v: Value = serde_json::from_str(bundle)?;
+    let envelope = v.get("dsseEnvelope").ok_or_else(|| anyhow::anyhow!("the statement signs no DSSE envelope"))?;
+    let payload_type = envelope.get("payloadType").and_then(Value::as_str).filter(|t| !t.is_empty()).ok_or_else(|| anyhow::anyhow!("the statement's envelope has no payload type"))?;
+    let payload = B64.decode(envelope.get("payload").and_then(Value::as_str).unwrap_or_default())?;
+    let signature = B64.decode(envelope.pointer("/signatures/0/sig").and_then(Value::as_str).unwrap_or_default())?;
+    let (new, digest) = append(c, payload_type, &payload, taken_at)?;
+    c.execute("INSERT OR IGNORE INTO trail_signatures (statement, signature, bundle, taken_at) VALUES (?1, ?2, ?3, ?4)", params![digest, crate::util::sha256_hex(&signature), bundle, taken_at])?;
+    Ok(new)
+}
+
+/// Appends kiln's own `statement` of `payload_type` ([`trail::PAYLOAD_CHECKED`],
+/// [`trail::PAYLOAD_REVOCATION`]), taken at `taken_at`, in the transaction `c` that records what
+/// it says: whether it's new to the trail.
+pub fn own(c: &Connection, payload_type: &str, statement: &Statement, taken_at: i64) -> anyhow::Result<bool> {
+    let payload = kiln_ci::identity::statement::payload(statement).map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(append(c, payload_type, &payload, taken_at)?.0)
+}
+
+/// Appends the statement `payload` of `payload_type` unless the trail has it: whether it's new,
+/// and its digest.
+fn append(c: &Connection, payload_type: &str, payload: &[u8], taken_at: i64) -> anyhow::Result<(bool, String)> {
+    let (digest, kind, subjects) = trail::about(payload_type, payload);
+    if c.query_row("SELECT 1 FROM trail WHERE statement = ?1", [&digest], |_| Ok(())).optional()?.is_some() {
+        return Ok((false, digest));
+    }
+    let last = c.query_row(&format!("SELECT {COLUMNS} FROM trail ORDER BY idx DESC LIMIT 1"), [], raw).optional()?.map(entry).transpose()?;
+    let e = trail::next(last.as_ref().map(|(e, _)| e), &digest, &kind, subjects, taken_at).map_err(|b| anyhow::anyhow!("{b}"))?;
+    let idx = i64::try_from(e.index)?;
+    c.execute(
+        "INSERT INTO trail (idx, prev, statement, kind, subjects, taken_at, hash, payload_type, payload) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![idx, hex::encode(e.prev), e.statement, e.kind, serde_json::to_string(&e.subjects)?, e.taken_at, hex::encode(e.hash()), payload_type, payload],
+    )?;
+    for s in &e.subjects {
+        c.execute("INSERT OR IGNORE INTO trail_subjects (subject, idx) VALUES (?1, ?2)", params![s, idx])?;
+    }
+    Ok((true, digest))
+}
+
+/// An entry's columns, as [`raw`] reads them.
+const COLUMNS: &str = "idx, prev, statement, kind, subjects, taken_at, hash";
+
+type Raw = (i64, String, String, String, String, i64, String);
+
+fn raw(r: &rusqlite::Row<'_>) -> rusqlite::Result<Raw> {
+    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
+}
+
+/// An entry as kept, and its hash as kept.
+fn entry((idx, prev, statement, kind, subjects, taken_at, hash): Raw) -> anyhow::Result<(Entry, String)> {
+    Ok((Entry { index: u64::try_from(idx)?, prev: unhex(&prev)?, statement, kind, subjects: serde_json::from_str(&subjects)?, taken_at }, hash))
+}
+
+fn unhex(s: &str) -> anyhow::Result<Hash> {
+    hex::decode(s)?.try_into().map_err(|_| anyhow::anyhow!("{s:?} isn't a SHA-256"))
+}
+
+/// How many entries the trail has.
+fn size_of(c: &Connection) -> anyhow::Result<u64> {
+    let n: i64 = c.query_row("SELECT COALESCE(MAX(idx) + 1, 0) FROM trail", [], |r| r.get(0))?;
+    Ok(u64::try_from(n)?)
+}
+
+/// A checkpoint as kiln keeps it.
+pub struct Kept {
+    pub size: u64,
+    pub root: Hash,
+    /// The signed note.
+    pub note: String,
+    /// The certificate it's signed under (DER).
+    pub certificate: Vec<u8>,
+    pub signed_at: i64,
+}
+
+/// kiln's checkpoints, the newest first, at most `limit`.
+pub async fn checkpoints(store: &Store, limit: u64) -> anyhow::Result<Vec<Kept>> {
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let rows: Vec<(i64, String, String, String, i64)> = store
+        .call(move |c| {
+            let mut q = c.prepare("SELECT size, root, note, certificate, signed_at FROM trail_checkpoints ORDER BY size DESC LIMIT ?1")?;
+            let rows = q.query_map([limit], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?.collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await?;
+    rows.into_iter().map(|(size, root, note, certificate, signed_at)| Ok(Kept { size: u64::try_from(size)?, root: unhex(&root)?, note, certificate: B64.decode(certificate)?, signed_at })).collect()
+}
+
+/// Signs a checkpoint of the trail as kiln's server when one is due ([`trail::due`]; `now`: as
+/// soon as any entry came after the last one): the size it signed at, if it signed. The entries
+/// since the last checkpoint must hold as a chain and hash as kept, and the tree over the leaves
+/// kept must extend the last checkpoint's: else it isn't signed, saying why.
+pub async fn checkpoint(hub: &Hub, now: bool) -> anyhow::Result<Option<u64>> {
+    let (every, minutes) = (hub.cfg.ci.trail.checkpoint_every, hub.cfg.ci.trail.checkpoint_minutes);
+    let at = crate::util::now_unix();
+    let last = checkpoints(&hub.store, 1).await?.into_iter().next();
+    let signed = last.as_ref().map_or(0, |k| k.size);
+    let from = i64::try_from(signed)?;
+    let (size, oldest) = hub
+        .store
+        .call(move |c| {
+            let oldest: Option<i64> = c.query_row("SELECT taken_at FROM trail WHERE idx = ?1", [from], |r| r.get(0)).optional()?;
+            Ok((size_of(c)?, oldest))
+        })
+        .await?;
+    let due = if now { size > signed } else { trail::due(size, signed, oldest, at, every, minutes) };
+    if !due {
+        return Ok(None);
+    }
+    // The leaves as kept; the entries since the last checkpoint whole, with the one before them.
+    let (to, before) = (i64::try_from(size)?, from.saturating_sub(1));
+    let (leaves, recent) = hub
+        .store
+        .call(move |c| {
+            let leaves: Vec<String> = c.prepare("SELECT hash FROM trail WHERE idx < ?1 ORDER BY idx")?.query_map([to], |r| r.get(0))?.collect::<Result<_, _>>()?;
+            let recent: Vec<Raw> = c.prepare(&format!("SELECT {COLUMNS} FROM trail WHERE idx >= ?1 AND idx < ?2 ORDER BY idx"))?.query_map([before, to], raw)?.collect::<Result<_, _>>()?;
+            Ok((leaves, recent))
+        })
+        .await?;
+    let leaves: Vec<Hash> = leaves.iter().map(|h| unhex(h)).collect::<anyhow::Result<_>>()?;
+    anyhow::ensure!(leaves.len() as u64 == size, "the trail has {} entries kept up to {size}: one is missing", leaves.len());
+    let recent: Vec<(Entry, String)> = recent.into_iter().map(entry).collect::<anyhow::Result<_>>()?;
+    let (head, run) = match recent.split_first() {
+        Some((h, rest)) if signed > 0 => (Some(&h.0), rest),
+        _ => (None, recent.as_slice()),
+    };
+    if let Some((e, _)) = run.iter().find(|(e, kept)| hex::encode(e.hash()) != *kept) {
+        anyhow::bail!("entry {} doesn't hash to the hash kept beside it", e.index);
+    }
+    let run: Vec<Entry> = run.iter().map(|(e, _)| e.clone()).collect();
+    trail::check(head, &run)?;
+    let origin = trail::origin(&hub.pki.organization());
+    let cp = Checkpoint { origin: origin.clone(), size, root: trail::root(&leaves) };
+    let previous = last.as_ref().map(|k| Checkpoint { origin, size: k.size, root: k.root });
+    let proof = trail::consistency(&leaves, usize::try_from(signed)?).unwrap_or_default();
+    let pki = hub.pki.clone();
+    let mut under = Vec::new();
+    let note = trail::signed(&cp, previous.as_ref().map(|p| (p, proof.as_slice())), |m| {
+        let (signature, certificate) = crate::identities::sign_own(&pki, "server", m).map_err(|e| format!("{e:#}"))?;
+        under.clone_from(&certificate);
+        Ok((signature, certificate))
+    })?;
+    let (root, certificate) = (hex::encode(cp.root), B64.encode(&under));
+    let kept = hub
+        .store
+        .call(move |c| Ok(c.execute("INSERT OR IGNORE INTO trail_checkpoints (size, root, note, certificate, signed_at) VALUES (?1, ?2, ?3, ?4, ?5)", params![to, root, note, certificate, at])?))
+        .await?;
+    if kept > 0 {
+        tracing::info!(target: "kiln.trail", size, "the trail's checkpoint signed");
+    }
+    Ok((kept > 0).then_some(size))
+}
+
+/// Signs the trail's checkpoints as they come due, until the server stops (docs/ci.md W27-R09);
+/// one that can't be signed is said once, until it's signed or why changes.
+pub async fn checkpoints_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
+    let mut said = String::new();
+    while hub.shutdown.sleep(LOOK_EVERY).await {
+        match checkpoint(&hub, false).await {
+            Ok(_) => said.clear(),
+            Err(e) => {
+                let why = format!("{e:#}");
+                if why != said {
+                    tracing::warn!(target: "kiln.trail", error = %why, "the trail's checkpoint isn't signed");
+                    said = why;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `GET /api/trail`: the trail's size, and its entries from index `from`, at most `limit` (100;
+/// 1,000 at most): each with its hash as kept.
+pub async fn page(store: &Store, from: u64, limit: u64) -> anyhow::Result<Value> {
+    let (from, limit) = (i64::try_from(from).unwrap_or(i64::MAX), i64::try_from(limit.clamp(1, 1000)).unwrap_or(1000));
+    let (size, rows) = store
+        .call(move |c| {
+            let rows: Vec<Raw> = c.prepare(&format!("SELECT {COLUMNS} FROM trail WHERE idx >= ?1 ORDER BY idx LIMIT ?2"))?.query_map([from, limit], raw)?.collect::<Result<_, _>>()?;
+            Ok((size_of(c)?, rows))
+        })
+        .await?;
+    let entries = rows
+        .into_iter()
+        .map(|r| {
+            let (e, hash) = entry(r)?;
+            Ok(json!({ "index": e.index, "prev": hex::encode(e.prev), "statement": e.statement, "kind": e.kind, "subjects": e.subjects, "taken_at": e.taken_at, "hash": hash }))
+        })
+        .collect::<anyhow::Result<Vec<Value>>>()?;
+    Ok(json!({ "size": size, "entries": entries }))
+}
+
+/// `GET /api/trail/checkpoints`: kiln's checkpoints, the newest first, at most `limit` (10): each
+/// its size, root (hex), signed note, the certificate it's signed under (DER, base64) and when.
+pub async fn checkpoints_page(store: &Store, limit: u64) -> anyhow::Result<Value> {
+    let kept = checkpoints(store, limit.clamp(1, 1000)).await?;
+    let list: Vec<Value> = kept.iter().map(|k| json!({ "size": k.size, "root": hex::encode(k.root), "note": k.note, "certificate": B64.encode(&k.certificate), "signed_at": k.signed_at })).collect();
+    Ok(json!({ "checkpoints": list }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The trail as kept, from its start.
+    async fn kept(store: &Store) -> anyhow::Result<Vec<(Entry, String)>> {
+        let rows: Vec<Raw> = store.call(|c| Ok(c.prepare(&format!("SELECT {COLUMNS} FROM trail ORDER BY idx"))?.query_map([], raw)?.collect::<Result<_, _>>()?)).await?;
+        rows.into_iter().map(entry).collect()
+    }
+
+    #[test]
+    fn w27_r09_appends_at_once_chain_and_a_statement_goes_in_once() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let store = Store::in_memory()?;
+            let said = |i: u64| trail::revocation(Some(&format!("{i:08x}")), None, "fedora-2", 1_790_000_000, "a test", "ada");
+            let calls = (0..32u64).map(|i| {
+                let (store, s) = (store.clone(), said(i));
+                async move { store.call(move |c| own(c, trail::PAYLOAD_REVOCATION, &s, 1_790_000_000)).await }
+            });
+            for appended in futures::future::join_all(calls).await {
+                assert!(appended?, "each new to the trail");
+            }
+            let again = said(7);
+            assert!(!store.call(move |c| own(c, trail::PAYLOAD_REVOCATION, &again, 1_790_000_100)).await?, "taken again, it stays where it was");
+            let t = kept(&store).await?;
+            assert_eq!(t.len(), 32);
+            assert!(t.iter().all(|(e, hash)| hex::encode(e.hash()) == *hash), "each hashes as kept");
+            trail::check(None, &t.into_iter().map(|(e, _)| e).collect::<Vec<_>>())?;
+            let v = page(&store, 30, 10).await?;
+            assert_eq!((v.get("size").and_then(Value::as_u64), v.get("entries").and_then(Value::as_array).map(Vec::len)), (Some(32), Some(2)));
+            Ok(())
+        })
+    }
+}

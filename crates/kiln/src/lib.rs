@@ -80,6 +80,7 @@ pub mod tailscale;
 pub mod terminal;
 pub mod termsess;
 pub mod toolfix;
+pub mod trail;
 pub mod tunnel;
 pub mod ui;
 pub mod uiserver;

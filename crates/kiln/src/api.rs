@@ -700,6 +700,23 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             })
             .await
         }
+        // The trail of every signed statement kiln takes, a page of it at a time, and kiln's
+        // checkpoints of it, one signed now when asked (W27-R09).
+        (&Method::GET, ["api", "trail"]) => {
+            let q = srv::query(&req);
+            let number = |k: &str, or: u64| q.get(k).and_then(|v| v.parse().ok()).unwrap_or(or);
+            let (from, limit) = (number("from", 0), number("limit", 100));
+            boxed(|| async { crate::trail::page(&hub.store, from, limit).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))) }).await
+        }
+        (&Method::GET, ["api", "trail", "checkpoints"]) => {
+            let limit = srv::query(&req).get("limit").and_then(|v| v.parse().ok()).unwrap_or(10);
+            boxed(|| async { crate::trail::checkpoints_page(&hub.store, limit).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))) }).await
+        }
+        (&Method::POST, ["api", "trail", "checkpoints"]) => boxed(|| async {
+            let size = crate::trail::checkpoint(&hub, true).await.map_err(|e| err(StatusCode::CONFLICT, format!("the trail's checkpoint isn't signed: {e:#}")))?;
+            Ok(srv::json(StatusCode::OK, &json!({ "size": size })))
+        })
+        .await,
         // Custody of what changes hands (W27-R08): a signed record taken, a thing's chain walked
         // now, the breaks kiln found and what it refused.
         (&Method::POST, ["api", "custody"]) => {

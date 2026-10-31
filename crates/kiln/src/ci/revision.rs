@@ -91,11 +91,20 @@ pub(crate) async fn sign_as_kiln(hub: &Hub, path: &str, sha: &str, kind: &str) -
     let raw = super::diffs::git_run(hub, &["-C", path, "cat-file", "commit", sha], &[], Vec::new()).await?;
     anyhow::ensure!(raw.ok, "git cat-file: {}", String::from_utf8_lossy(&raw.err).trim());
     let signed = crate::identities::signed_commit(&raw.out, |m| crate::identities::sign_own(&hub.pki, kind, m))?;
+    let signature = kiln_ci::identity::gitsig::signature_of(&signed).map(|g| crate::util::sha256_hex(g.as_bytes()));
     let w = super::diffs::git_run(hub, &["-C", path, "hash-object", "-t", "commit", "-w", "--stdin"], &[], signed).await?;
     anyhow::ensure!(w.ok, "git hash-object: {}", String::from_utf8_lossy(&w.err).trim());
     let actor = if kind == "cd" { kiln_ci::identity::chain::Actor::Cd } else { kiln_ci::identity::chain::Actor::Server };
     let signer = kiln_ci::identity::chain::Identity::new(hub.pki.organization(), actor).uri().map_err(|e| anyhow::anyhow!("{e}"))?;
-    Ok((String::from_utf8_lossy(&w.out).trim().to_owned(), signer))
+    let sha = String::from_utf8_lossy(&w.out).trim().to_owned();
+    // In the trail as kiln's word for the commit it made (W27-R09): the repository by its name.
+    let repo = std::path::Path::new(path).strip_prefix(super::hosting::root(hub)).map(|p| p.to_string_lossy().trim_end_matches(".git").to_owned()).unwrap_or_default();
+    let said = kiln_ci::identity::trail::made_commit(&repo, &sha, signature.as_deref(), &signer);
+    let at = crate::util::now_unix();
+    if let Err(e) = hub.store.call(move |c| crate::trail::own(c, kiln_ci::identity::trail::PAYLOAD_CHECKED, &said, at)).await {
+        tracing::error!(commit = %sha, error = %format!("{e:#}"), "a commit kiln made isn't in the trail");
+    }
+    Ok((sha, signer))
 }
 
 /// Why a revision exists (W26-R04), kept with its version.

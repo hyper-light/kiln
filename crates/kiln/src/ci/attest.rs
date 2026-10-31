@@ -203,14 +203,17 @@ async fn keep(hub: &Hub, run: String, leg: String, idx: u32, nonce: String, orig
             let now = crate::util::now_unix();
             let mut ids = Vec::new();
             for (kind, bundle) in made {
+                let text = bundle.to_string();
                 tx.execute(
                     "INSERT INTO ci_attestations (run_id, leg_id, idx, nonce, origin, predicate_type, subjects, bundle, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                    params![run, leg, idx, nonce, origin, kind, subjects_json, bundle.to_string(), now],
+                    params![run, leg, idx, nonce, origin, kind, subjects_json, text, now],
                 )?;
                 let id = tx.last_insert_rowid();
                 for d in &digests {
                     tx.execute("INSERT INTO ci_attestation_subjects (attestation_id, digest) VALUES (?1, ?2)", params![id, d])?;
                 }
+                // In the trail as taken, once its own rows are written (the trail's would be the last row's id).
+                crate::trail::take(&tx, &text, now)?;
                 ids.push(id);
             }
             tx.commit()?;
