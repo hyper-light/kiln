@@ -608,7 +608,7 @@ code-mode function (`kiln.agents.start`) and, from a kiln shell, a CLI command.
 | `agents.start` | `POST /api/harness/agents` | `{kind, on?, cwd?, prompt?, model?, effort?, mode?, name?, count?, workspace?}` → `{agents: [Agent], parent}` |
 | `agents.about` | `POST /api/harness/agents/:id/about` | `{path, code, line?, end_line?, selection?, change?, question?, now?}` → `{agents: [Agent], itself}`: a child of the agent, reading only, answers what a person tapped in its conversation (a name, a line, a change) in four parts (what it is, what it does here, where else it's used, what's worth knowing); when the agent runs no subagents (`max_subagents` 0) it answers itself (`itself: true`, `sent` as `agents.send` answers), after its turn or with `now` between its steps. The child is a helper (`helper: "about"` on it): no row of Mission Control, its parent not told of it, ended once no card has read it (`agents.result`) for 90 seconds |
 | `agents.send` | `POST /api/harness/agents/:id/send` | `{text, mode?: "queue" \| "steer" \| "now", key?}` (or the `Idempotency-Key` header) → `{sent, message, accepted?}`: `accepted` is the agent's inbox's answer, `repeat` on every one after the first ("Sending again", below) |
-| `agents.wait` | `GET /api/harness/agents/wait` | `agent?` or `agents?` (a list; over HTTP `a,b`), `until?: "settled" \| "change"`, `any?`, `timeout_s?`, `hand_over?` → `{done, timed_out, waited_ms, until, agents: [Agent], messages?: [{from, name, text, at}]}` (`messages`: what other agents sent the agent that waits, handed over: "Waiting") |
+| `agents.wait` | `POST /api/harness/agents/wait` | `{agent?` or `agents?` (a list, or `a,b`), `until?: "settled" \| "change"`, `any?`, `timeout_s?`, `hand_over?}` → `{done, timed_out, waited_ms, until, agents: [Agent], messages?: [{from, name, text, at}]}` (`messages`: what other agents sent the agent that waits, handed over: "Waiting") |
 | `agents.result` | `GET /api/harness/agents/:id/result` | → `{agent, reply: {text, at}, last_turn, changes: {files: [{path, added, removed, created, deleted}], files_changed, lines_added, lines_removed}, cwd, machine, cost_usd, workspace, branch, change_request}` |
 | `agents.children` | `GET /api/harness/agents/:id/children` | → `{children: [{id, name, kind, status, parent}]}`: the ones still running, and theirs |
 | `agents.interrupt` | `POST /api/harness/agents/:id/interrupt` | → `{interrupted}` |
@@ -764,6 +764,12 @@ nothing over; a program's waits in code mode don't unless it passes `hand_over: 
 program returns of the answer is its own. `kiln agents wait` prints them after where each agent
 stands. A message an agent sends another says so in its id (`from-agent-<sender>-…`), which is how
 a wait finds it.
+
+So a wait is a change, not a read: a `POST`, written in the audit trail, and not marked read-only to
+MCP clients. What it hands over lives only in its answer, and a client may run a read-only tool beside
+others, again, or ahead of time and drop its answer; a wait's messages would be lost with it.
+`agents.result` stays a read: all it changes is what its caller is told of what it has just read in
+full (the line in its news, and the settle not told again).
 
 ### Who asks
 
