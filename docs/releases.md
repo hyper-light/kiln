@@ -85,10 +85,23 @@ replaced while it runs. The new build comes up beside it, and takes over only on
 3. Once it's ready, the runner hands it every agent session and terminal over a local socket.
    Their processes keep running: pipes and PTYs are passed across, not reopened. A reply that was
    streaming goes on, and background commands never stop. Whatever reaches the old runner
-   meanwhile (a message for an agent, keystrokes, a new session) goes on to the new build.
+   meanwhile (a message for an agent, keystrokes, a new session) goes on to the new build. The
+   server's word on a hand-over (hand a session to the newest process, or let go of one) doesn't:
+   it names the process it's for, its machine, instance and epoch, signed by the server
+   (docs/ci.md W27-R08), and any other process refuses it, and kiln records that. The old runner
+   keeps such a word and refuses one about a session it handed to the new build, and the new build
+   refuses one passed on to it. Once kiln certifies the new build for a session, it sends that
+   session's words to the new build.
 4. The supervisor promotes the new build, and the server sends it new work from then on. The old
    runner finishes the jobs it's running (jobs aren't moved yet), then exits. The supervisor keeps
    the new build, and starts it again after a restart or reboot.
+
+Each agent session handed over running is signed for (docs/ci.md W27-R08): the runner upgraded
+signs its hand-on at the session's epoch, and the new build, once it's promoted, asks for the
+session's identity at the next epoch with its receipt, then goes on at that epoch. The session's
+copy on the server goes on where it was, nothing sent again. Before the new build is promoted, a
+rollback leaves the session with the runner it came from. A session started again from its record
+goes over as before.
 
 If the new build doesn't come up, the runner goes on with everything, as it was, and the machine
 never goes offline. That covers a build that can't connect, crashes, or can't take over in time.

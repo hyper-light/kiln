@@ -203,6 +203,7 @@ classes! {
         AgentMsg::Observe { .. } => OBSERVE,
         AgentMsg::LegResults { .. } => Class::Stream,
         AgentMsg::LegSignature { .. } => Class::Answer,
+        AgentMsg::Custody { .. } => Class::Stream,
     }
 }
 

@@ -2004,10 +2004,10 @@ impl Hub {
                     }
                     // An agent's MCP server on the runner asks for kiln's operations: answered on
                     // their own, so a slow one holds up nothing else the runner says.
-                    Some("registry" | "call" | "page" | "stream") => {
+                    Some("registry" | "call" | "page" | "stream" | "act") => {
                         let (hub, runner) = (Arc::clone(self), agent.clone());
                         crate::rt::spawn(async move {
-                            let answer = crate::mcp::runner_ask(&hub, &runner, &ask).await;
+                            let answer = crate::mcp::runner_ask(&hub, &runner, peer, &ask).await;
                             hub.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
                         });
                     }
@@ -2047,6 +2047,11 @@ impl Hub {
                 if self.owns_job(peer, &job) {
                     crate::ci::attest::leg_signed(self, &agent, &job, &nonce, bundle, error).await;
                 }
+            }
+            // A signed custody record of one of its sessions' hand-overs (docs/ci.md W27-R08).
+            AgentMsg::Custody { json } => {
+                let (hub, machine) = (Arc::clone(self), agent.clone());
+                crate::rt::spawn(async move { crate::custody::on_runner(&hub, peer, &machine, &json).await });
             }
             AgentMsg::UpgradeLog { job, line } => self.updates.on_log(self, &job, line),
             AgentMsg::UpgradeDone { job, ok, error } => self.updates.on_done(self, &job, ok, error),
@@ -2114,9 +2119,15 @@ impl Hub {
             },
             AgentMsg::HarnessInventory { json } => match serde_json::from_str::<crate::harness::host::Inventory>(&json) {
                 Ok(mut inv) => {
-                    // A copy it kept of a session that went on elsewhere since isn't its own (it
-                    // lets go of it once it announces it).
+                    // A copy it kept of a session that went on elsewhere since isn't its own: it's
+                    // told to let go of it now, at its runner's first word since, not once the copy
+                    // announces it again (W27-R08: the twin of 2026-10-25 ran on for ten minutes).
+                    // One just arriving, its Open on its way, is kept.
+                    let left = self.harness.left_behind(&agent, &inv);
                     inv.sessions.retain(|id| self.harness.runs_on(id, &agent));
+                    for id in &left {
+                        crate::mcp::let_go(self, &agent, peer, id).await;
+                    }
                     // This process's sessions are its own; another process of the machine keeps
                     // the ones it holds (the registry forgets sessions a report leaves out), and
                     // so does one that isn't connected now (`Registry::holder`).
@@ -2346,7 +2357,7 @@ impl Hub {
         }
         // It keeps the channel (docs/wire.md): said first, so a runner that keeps it too knows on
         // Welcome not to send its sessions whole. An older runner skips the frame.
-        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_HANDOVER | proto::CAP_WORK | proto::CAP_AGENT_LIMIT | proto::CAP_IDENTITY | proto::CAP_HEADROOM | proto::CAP_CHANGES_PATCH | proto::CAP_AGENT_GIT | proto::CAP_LEG_SIGNS }).await;
+        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_HANDOVER | proto::CAP_WORK | proto::CAP_AGENT_LIMIT | proto::CAP_IDENTITY | proto::CAP_HEADROOM | proto::CAP_CHANGES_PATCH | proto::CAP_AGENT_GIT | proto::CAP_LEG_SIGNS | proto::CAP_CUSTODY }).await;
         // What its sessions' copies have here, so a stream it starts sends only what they lack
         // (`crate::wire::sums`): a few dozen sessions a frame, each about a kilobyte.
         for part in self.harness.kept_on(&name).chunks(KEPT_A_FRAME) {

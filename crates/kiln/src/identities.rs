@@ -794,6 +794,32 @@ async fn issue(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) -> any
         _ => None,
     };
     let now = crate::util::now_unix();
+    // A hand-over's (docs/ci.md W27-R08): its hand-on and the receipt for it kept first, so the
+    // epoch rises with them; the key isn't certified without them.
+    if let (Actor::Agent { .. }, Some(hand_on)) = (&identity.actor, ask.hand_on.as_deref()) {
+        let instance = hub.instances.lock().get(peer).map(|i| i.label()).unwrap_or_else(|| "legacy".to_owned());
+        let came_from = format!("runner {machine} (instance {instance})");
+        let epoch = ask.epoch.unwrap_or_default();
+        if let Err(why) = crate::custody::transfer(&hub.store, &hub.pki.ca_der, &hub.pki.organization(), &came_from, &uri, epoch, hand_on, ask.receipt.as_ref(), &pem, now).await? {
+            anyhow::bail!("its hand-over wasn't recorded, so kiln certifies no key at epoch {epoch}: {why}");
+        }
+    } else if let (Actor::Agent { epoch, .. }, Some(session)) = (&identity.actor, ask.of.as_deref())
+        && *epoch > 0
+        && holder_at(&hub.store, session, *epoch).await?.is_none()
+    {
+        // None came with it, to an epoch kiln certifies the session at for the first time: its
+        // hand-over went unsigned, recorded saying which side is from before signed hand-overs.
+        let gave = holder_at(&hub.store, session, epoch - 1).await?.unwrap_or_default();
+        let takes = hub.instances.lock().get(peer).is_some_and(|i| (u64::from(i.caps) | i.wide) & crate::proto::CAP_CUSTODY != 0);
+        let why = if !takes {
+            format!("the process it went to, on {machine}, runs a kiln from before signed hand-overs: it signed no receipt")
+        } else if gave.is_empty() {
+            "the process it came from was never certified: it runs a kiln from before identities, or the session went on before kiln had them".to_owned()
+        } else {
+            format!("{gave} signed no hand-on: it runs a kiln from before signed hand-overs")
+        };
+        crate::custody::unsigned(&hub.store, session, *epoch, &gave, &uri, &why, now).await?;
+    }
     revoke(&hub.store, Target::Certificates(uri.clone()), "superseded by a newer certificate", "kiln", now).await?;
     if let Actor::Agent { epoch, held_by, .. } = &identity.actor
         && let Some(session) = ask.of.as_deref()
@@ -804,6 +830,24 @@ async fn issue(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) -> any
         let to = held_by.as_ref().map(|h| format!(", on runner {} (instance {})", h.machine, h.instance)).unwrap_or_default();
         for (subject, left) in epochs_of(&hub.store, session).await?.into_iter().filter(|(_, e)| e < epoch) {
             revoke(&hub.store, Target::Subject(subject), &format!("epoch {left} left: moved on to epoch {epoch}{to}"), "kiln", now).await?;
+        }
+        // The epoch rises with its transfer recorded, signed or said to be unsigned (W27-R08), and
+        // the session's words go to the process certified at it from now on, not to whichever one
+        // kiln's count of them last named (the 14:18 drop: words for the runner a blue/green
+        // upgrade took over from, passed on to the new build).
+        hub.harness.raise_epoch(session, *epoch);
+        hub.instances.lock().own(crate::instances::Owned::Agent(session.to_owned()), peer);
+        if let Some(h) = held_by {
+            hub.harness.held_by(session, &h.instance);
+        }
+        // A test build's `stale_words` (the server's): the 14:18 drop played again, its words to
+        // the machine's other processes, as kiln sent them to the one it still counted, which
+        // refuse them.
+        if crate::runner::chaos::get().is_some_and(|c| c.stale_words) {
+            let others: Vec<crate::instances::PeerId> = hub.instances.lock().of(machine).into_iter().filter(|p| *p != peer).collect();
+            for was in others {
+                stale_words(hub, machine, was, session).await;
+            }
         }
     }
     record(&hub.store, &ask.kind, &uri, &pem).await?;
@@ -894,6 +938,54 @@ async fn epochs_of(store: &Store, session: &str) -> anyhow::Result<Vec<(String, 
             _ => None,
         })
         .collect())
+}
+
+/// The identity agent session `session` was last certified as at `epoch`, naming the runner
+/// process that held it then: whom kiln takes it for when that process can't hand it on
+/// (docs/ci.md W27-R08). None if kiln never certified it at that epoch.
+pub async fn holder_at(store: &Store, session: &str, epoch: u64) -> anyhow::Result<Option<String>> {
+    let pattern = format!("%/agent/{session}/epoch/{epoch}/%");
+    let subjects: Vec<String> = store
+        .call(move |c| {
+            let mut q = c.prepare("SELECT subject FROM identities WHERE kind = 'agent' AND subject LIKE ?1 ORDER BY issued_at DESC, rowid DESC")?;
+            let rows = q.query_map([pattern], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+            Ok(rows)
+        })
+        .await?;
+    Ok(subjects.into_iter().find(|s| Identity::parse(s).is_ok_and(|i| matches!(i.actor, Actor::Agent { ref agent, epoch: e, .. } if agent == session && e == epoch))))
+}
+
+/// A test build's `stale_words`: the words about a hand-over kiln sent before transfers named a
+/// session's holder (hand it to the newest; it was taken), sent to `was`, another process of
+/// `machine` than the one certified for it (docs/ci.md W27-R08, the 14:18 drop).
+async fn stale_words(hub: &Hub, machine: &str, was: crate::instances::PeerId, session: &str) {
+    use crate::harness::model::Command;
+    let words = [Command::MoveTo { to: machine.to_owned(), cwd: String::new(), note: None, now: false, kind: None, model: None, local: true }, crate::handovers::Word::Taken.command()];
+    for c in words {
+        if let Some(json) = hub.worded(machine, was, session, &c).await {
+            tracing::info!(target: "kiln.custody", %session, %machine, was, "chaos: a stale hand-over's word to the process kiln counted before");
+            let _ = hub.command_peers(machine, vec![was], &crate::proto::ServerMsg::HarnessCmd { session: session.to_owned(), json }).await;
+        }
+    }
+}
+
+/// The newest epoch kiln certified agent session `session` at, and the identity it certified it
+/// as then, naming the process holding it: the session's epoch as its transfers say (an Open that
+/// says another doesn't move it), and its holder (docs/ci.md W27-R08).
+pub async fn newest_holder(store: &Store, session: &str) -> anyhow::Result<Option<(u64, String)>> {
+    let Some(epoch) = epochs_of(store, session).await?.into_iter().map(|(_, e)| e).max() else { return Ok(None) };
+    Ok(holder_at(store, session, epoch).await?.map(|h| (epoch, h)))
+}
+
+/// The newest epoch kiln certified agent session `session` at for runner process `instance` of
+/// `machine`: the epoch that process holds it at, as kiln knows it (docs/ci.md W27-R08, a hand-over's
+/// word for it). None if kiln never certified it there.
+pub async fn epoch_held(store: &Store, session: &str, machine: &str, instance: &str) -> anyhow::Result<Option<u64>> {
+    let at = |s: &str| match Identity::parse(s).map(|i| i.actor) {
+        Ok(Actor::Agent { agent, epoch, held_by: Some(h), .. }) if agent == session && h.machine == machine && h.instance == instance => Some(epoch),
+        _ => None,
+    };
+    Ok(epochs_of(store, session).await?.iter().filter_map(|(s, _)| at(s)).max())
 }
 
 /// Agent session `session` ended: every certificate of every epoch it had is revoked from now.

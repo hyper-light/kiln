@@ -537,6 +537,7 @@ impl Server {
             timeout_ms: args.get("timeout_s").and_then(Value::as_f64).map(|t| (t.max(0.0) * 1000.0) as u64),
             shell: s("shell"),
             detach: false,
+            asker: None,
         };
         let mut client = Client::connect(&self.sock).map_err(|e| format!("{e:#}"))?;
         let reuse = args.get("reuse").and_then(Value::as_bool).unwrap_or(false);

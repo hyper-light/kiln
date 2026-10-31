@@ -33,6 +33,13 @@
 //! - `old`: the runner says nothing of what it can do past `Build`'s 32 bits (no `Caps`), as a
 //!   runner from before the channel says nothing (docs/wire.md): the server sends it commands and
 //!   takes its updates as it did such runners'.
+//! - `unsigned`: the runner says nothing of custody (no `CAP_CUSTODY`, and taking over blue/green
+//!   it doesn't say it takes a session signed for) and signs no hand-over or receipt, as a runner
+//!   from before signed hand-overs does (docs/ci.md W27-R08): its hand-overs go unsigned.
+//! - `stale_words`: the server's: as kiln certifies an agent session at an epoch for a process
+//!   other than the one it counted as its holder, it also sends that one the words about a
+//!   hand-over it sent before transfers named the holder (hand it to the newest, it was taken), as
+//!   it did at 14:18 on 2026-10-25 (docs/ci.md W27-R08), so a test plays the drop again.
 //! - `copy=<path>`: every frame this runner sends, appended to `path` as it goes below the channel
 //!   (its lane and length, then its bytes), so a test can say what crossed the network (W27-R02).
 //! - `keys=<path>`: each identity key this runner process makes (`crate::runner::identity`),
@@ -71,6 +78,10 @@ pub struct Chaos {
     pub seed: u64,
     pub fanout: Option<usize>,
     pub old: bool,
+    /// Signs no hand-over (`unsigned`).
+    pub unsigned: bool,
+    /// The server's: sends a session's former holder its stale hand-over words (`stale_words`).
+    pub stale_words: bool,
     /// Where every frame this process sends is copied (`copy=`).
     pub copy: Option<std::path::PathBuf>,
     /// Where each identity key this process makes is copied (`keys=`).
@@ -130,6 +141,8 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
             }
             "fanout" => c.fanout = Some(v.parse().ok().filter(|n: &usize| *n > 0).ok_or_else(|| anyhow::anyhow!("chaos `fanout` takes a number of frames, not `{v}`"))?),
             "old" => c.old = true,
+            "unsigned" => c.unsigned = true,
+            "stale_words" => c.stale_words = true,
             "copy" | "keys" => {
                 anyhow::ensure!(!v.is_empty(), "chaos `{k}` takes a file's path");
                 let path = Some(std::path::PathBuf::from(v));
@@ -140,7 +153,7 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
                 }
             }
             "seed" => c.seed = v.parse().map_err(|_| anyhow::anyhow!("chaos `seed` takes a number, not `{v}`"))?,
-            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, oom, disk, corrupt, fetch, platform, rebuild, shed, twice, late, seed, fanout, old, copy or keys"),
+            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, oom, disk, corrupt, fetch, platform, rebuild, shed, twice, late, seed, fanout, old, unsigned, stale_words, copy or keys"),
         }
     }
     Ok(c)
@@ -369,6 +382,8 @@ mod tests {
                 seed: 0,
                 fanout: None,
                 old: false,
+                unsigned: false,
+                stale_words: false,
                 copy: None,
                 keys: None
             }
@@ -379,6 +394,7 @@ mod tests {
         assert_eq!((c.copy.as_deref(), c.keys.as_deref()), (Some(std::path::Path::new("/tmp/a.frames")), Some(std::path::Path::new("/tmp/a.keys"))));
         assert!(parse("copy=").is_err() && parse("keys").is_err(), "each names its file");
         assert!(parse("drop=6s,old")?.old);
+        assert!(parse("unsigned")?.unsigned && parse("stale_words")?.stale_words);
         assert!(parse("fetch")?.fetch);
         assert_eq!(parse("rebuild=4s")?.rebuild_after, Some(Duration::from_secs(4)));
         assert_eq!(parse("drop=5s,down=30s")?.down_for, Some(Duration::from_secs(30)));

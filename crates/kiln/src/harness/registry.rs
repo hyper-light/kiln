@@ -1351,8 +1351,16 @@ impl Registry {
         self.epochs.lock().get(id).is_some_and(|e| *e > epoch)
     }
 
+    /// The sessions runner `machine` reports holding (`inv`) whose copy there is one left behind:
+    /// the session runs elsewhere now, at a later epoch than that copy (docs/ci.md W27-R08). One
+    /// just arriving there (its Open on its way) is at the epoch it goes on at, which isn't; a
+    /// runner from before says no epochs, so none of its are.
+    pub fn left_behind(&self, machine: &str, inv: &super::host::Inventory) -> Vec<String> {
+        inv.sessions.iter().filter(|id| !self.runs_on(id, machine) && inv.epochs.get(*id).is_some_and(|e| self.stale(id, *e))).cloned().collect()
+    }
+
     /// Session `id` is at `epoch` now (epochs only rise), kept when it changes.
-    fn raise_epoch(&self, id: &str, epoch: u64) {
+    pub(crate) fn raise_epoch(&self, id: &str, epoch: u64) {
         let snapshot = {
             let mut g = self.epochs.lock();
             let e = g.entry(id.to_owned()).or_insert(0);
@@ -1408,7 +1416,18 @@ impl Registry {
             other => other,
         };
         match &u {
-            Update::Open { info, .. } if info.epoch > 0 => self.raise_epoch(id, info.epoch),
+            Update::Open { info, .. } if info.epoch > 0 => {
+                // Gone on at a later epoch on a runner from before signed hand-overs: unsigned,
+                // recorded saying so (docs/ci.md W27-R08).
+                if let Location::Machine(machine) = from
+                    && info.epoch > self.epoch_of(id)
+                    && hub.runner_wide_caps(machine) & crate::proto::CAP_CUSTODY == 0
+                {
+                    let why = format!("the process it went to, on {machine}, runs a kiln from before signed hand-overs: it signed no receipt");
+                    unsigned(hub, id, info.epoch, &format!("runner {machine}"), why);
+                }
+                self.raise_epoch(id, info.epoch);
+            }
             Update::Open { .. } => {}
             // Only the machine a session runs on speaks for it: a copy left behind where it went
             // on from says nothing more of it.
@@ -2413,10 +2432,23 @@ impl Registry {
             return Err(format!("{to} runs a kiln too old to take a session from the server; upgrade it first"));
         }
         let (st, i, f, t) = (store.clone(), id.to_owned(), from_name.clone(), to.to_owned());
-        let pkg = crate::rt::blocking(move || crate::convo::resume::package(&st, &i, &f, &t, cwd.as_deref()))
+        let mut pkg = crate::rt::blocking(move || crate::convo::resume::package(&st, &i, &f, &t, cwd.as_deref()))
             .await
             .map_err(|e| format!("{e:#}"))?
             .map_err(|e| format!("{e:#}"))?;
+        // kiln takes it for the process that held it, which can't hand it on: the package carries
+        // the take, which the receipt follows as a hand-on's (docs/ci.md W27-R08).
+        let heard = hub.agents.lock().get(&from_name).map(|a| a.last_seen).unwrap_or_default();
+        let when = time::OffsetDateTime::from_unix_timestamp(heard).ok().and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok()).unwrap_or_else(|| "never".to_owned());
+        let why = format!("resumed from kiln's copy: {from_name} was last heard from at {when}");
+        match crate::custody::take_for(&hub.store, &hub.pki, id, pkg.state.epoch, &pkg.events, &why).await {
+            Ok(take) => pkg.hand_on = take,
+            Err(e) => tracing::warn!(target: "kiln.custody", session = %id, error = %format!("{e:#}"), "kiln couldn't take a session it resumes from its copy: it goes on unsigned"),
+        }
+        if hub.runner_wide_caps(to) & crate::proto::CAP_CUSTODY == 0 {
+            let why = format!("{to} runs a kiln from before signed hand-overs: it signs no receipt of kiln's take");
+            unsigned(hub, id, pkg.state.epoch.saturating_add(1), &format!("runner {to}"), why);
+        }
         let bytes = serde_json::to_vec(&pkg).map_err(|e| e.to_string())?;
         // Its copy where it was doesn't count from now on: not here, not in the store (rows that
         // machine still sends are left out).
@@ -2578,6 +2610,18 @@ fn proposed_in(e: &super::model::Event) -> Option<String> {
     call.input.get("plan").and_then(Value::as_str).map(str::trim).filter(|p| !p.is_empty()).map(str::to_owned)
 }
 
+
+/// Session `id`'s hand-over to `epoch`, taken by `took`, went unsigned because `why`: recorded,
+/// with the process kiln last certified it as before then (docs/ci.md W27-R08).
+fn unsigned(hub: &Hub, id: &str, epoch: u64, took: &str, why: String) {
+    let (store, session, took) = (hub.store.clone(), id.to_owned(), took.to_owned());
+    crate::rt::spawn(async move {
+        let gave = crate::identities::holder_at(&store, &session, epoch.saturating_sub(1)).await.ok().flatten().unwrap_or_default();
+        if let Err(e) = crate::custody::unsigned(&store, &session, epoch, &gave, &took, &why, crate::util::now_unix()).await {
+            tracing::warn!(target: "kiln.custody", %session, error = %format!("{e:#}"), "an unsigned hand-over couldn't be recorded");
+        }
+    });
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3050,6 +3094,29 @@ mod tests {
             // Who holds what is kept for the next start.
             let kept: HashMap<String, String> = serde_json::from_slice(&std::fs::read(hub.harness.dir.join("holders.json"))?)?;
             anyhow::ensure!(kept.get("old-1").map(String::as_str) == Some("01a14794") && !kept.contains_key("old-2"), "{kept:?}");
+            Ok(())
+        })
+    }
+
+    /// W27-R08 (the twin): a runner's report names the sessions it holds a copy of that went on
+    /// elsewhere at a later epoch, which it's told to let go of; not one just arriving there (its
+    /// Open on its way, at the epoch it goes on at), not one it runs, and none from a runner that
+    /// says no epochs.
+    #[test]
+    fn w27_r08_a_report_names_the_copies_left_behind() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let info = |id: &str, epoch: u64| Info { id: id.into(), kind: "claude".into(), epoch, ..Info::default() };
+            // "twin" went on on box-b at epoch 1, its copy left on box-a; "arriving" is on its way
+            // from box-b to box-a, at epoch 1 there; "here" runs on box-a.
+            let (a, b) = (Location::Machine("box-a".into()), Location::Machine("box-b".into()));
+            hub.harness.ingest(&hub, &b, "twin", Update::Open { info: Box::new(info("twin", 1)), since: None });
+            hub.harness.ingest(&hub, &b, "arriving", Update::Open { info: Box::new(info("arriving", 0)), since: None });
+            hub.harness.ingest(&hub, &a, "here", Update::Open { info: Box::new(info("here", 0)), since: None });
+            let report = |held: &[(&str, u64)]| crate::harness::host::Inventory { sessions: held.iter().map(|(s, _)| (*s).to_owned()).collect(), epochs: held.iter().map(|(s, e)| ((*s).to_owned(), *e)).collect(), ..Default::default() };
+            assert_eq!(hub.harness.left_behind("box-a", &report(&[("twin", 0), ("arriving", 1), ("here", 0)])), ["twin"]);
+            let before = crate::harness::host::Inventory { sessions: vec!["twin".into()], ..Default::default() };
+            assert!(hub.harness.left_behind("box-a", &before).is_empty(), "a runner from before says no epochs");
             Ok(())
         })
     }

@@ -681,6 +681,9 @@ enum Ctl {
     /// There may be room on its machine for it to go to work: what waited for that goes, if it
     /// may now (`super::limit`).
     Room,
+    /// Its hand-over to this process is recorded (docs/ci.md W27-R08: a blue/green upgrade's): it
+    /// goes on at this epoch, its state saying so.
+    Epoch(u64),
 }
 
 /// A session handed from this image of the process to the next (an in-place upgrade) with its
@@ -770,6 +773,11 @@ impl Session {
     /// There may be room on its machine now for it to go to work ([`Ctl::Room`]).
     pub fn room(&self) {
         let _ = self.ctl.try_send(Ctl::Room);
+    }
+
+    /// It goes on at `epoch` ([`Ctl::Epoch`]): its hand-over to this process is recorded.
+    pub fn go_on_at(&self, epoch: u64) {
+        let _ = self.ctl.try_send(Ctl::Epoch(epoch));
     }
 
     /// Hand its harness process to this process's next image (an in-place upgrade, next):
@@ -1179,6 +1187,14 @@ fn queued(c: Command) -> Option<super::model::QueueItem> {
             Some(super::model::QueueItem { id: id.unwrap_or_else(crate::util::new_id), text, at, attachments: Vec::new(), overrides: None, reply_to: None })
         }
         _ => None,
+    }
+}
+
+/// The session goes on at `epoch` (epochs only rise): its state says so, sent with its next flush.
+fn raise_epoch(core: &mut Core, epoch: u64) {
+    if core.state.epoch < epoch {
+        core.state.epoch = epoch;
+        core.touch_state();
     }
 }
 
@@ -2453,6 +2469,7 @@ async fn files_in(s: &Session, sink: &Sink, mark: &crate::sync::runner::Mark, ct
                 Ok(Ctl::Close) | Err(_) => return Arrived::End { let_go: false },
                 // What it carries goes once it's on, asking for room then.
                 Ok(Ctl::Room) => {}
+                Ok(Ctl::Epoch(e)) => raise_epoch(&mut s.core.lock(), e),
             },
             () = tick => {}
         }
@@ -2531,6 +2548,8 @@ where
         _ => Carry::Nothing,
     };
     let mut pkg = super::moving::pack(&s.id, spec, &cwd, &mv.to, &cwd, carry, events, state);
+    // Signed for as it goes, by its identity at the epoch it leaves (docs/ci.md W27-R08).
+    pkg.hand_on = crate::runner::custody::hand_on(&s.id, pkg.state.epoch, &pkg.events, "taken over by this machine's newer runner process");
     // Its harness's own record is here already: it goes on from it, nothing started anew.
     if matches!(pkg.carry, Carry::Nothing) {
         pkg.spec.resume = resume;
@@ -2727,6 +2746,8 @@ async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move, ids: &Carri
     // Paused for a limit: it goes on there, where it moved for room, the cut-off turn first.
     let cut = picks_up_there(&mut state);
     let mut pkg = super::moving::pack(&s.id, spec, &mv.cwd, &me, &from_cwd, carry, events, state);
+    // Signed for as it goes, by its identity at the epoch it leaves (docs/ci.md W27-R08).
+    pkg.hand_on = crate::runner::custody::hand_on(&s.id, pkg.state.epoch, &pkg.events, "moved to another machine");
     if let Some(home) = home {
         pkg = pkg.with_home(home);
     }
@@ -3300,6 +3321,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                             }
                             adapter.room(&mut core);
                         }
+                        Ev::Ctl(Some(Ctl::Epoch(e))) => raise_epoch(&mut s.core.lock(), e),
                         Ev::Ctl(Some(Ctl::HandOver(reply))) => {
                             // This image of the process ends next (an in-place upgrade): the next
                             // one goes on with this very process. What it has said so far is taken
@@ -3689,6 +3711,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         break;
                     }
                 }
+                Ev::Ctl(Some(Ctl::Epoch(e))) => raise_epoch(&mut s.core.lock(), e),
                 Ev::Ctl(ctl @ (Some(Ctl::Close | Ctl::LetGo) | None)) => {
                     // Ending the agent ends what it left running that kiln took back over, and the
                     // rest of its group of processes, which then goes.

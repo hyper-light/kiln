@@ -112,6 +112,12 @@ pub fn slot(kind: &str, of: Option<&str>, epoch: Option<u64>) -> String {
 /// A leg's key is kept only once the process's memory is out of its steps' reach (they haven't
 /// started: a leg's key is made as the leg is given to this runner).
 pub fn ask(kind: &str, of: Option<&str>, epoch: Option<u64>) -> anyhow::Result<String> {
+    Ok(serde_json::to_string(&request(kind, of, epoch)?)?)
+}
+
+/// [`ask`], before it's sent: what an agent session's ask carries beside its CSR is added to it
+/// (`crate::runner::custody::carrying`).
+pub fn request(kind: &str, of: Option<&str>, epoch: Option<u64>) -> anyhow::Result<IdentityAsk> {
     let slot = slot(kind, of, epoch);
     let csr = {
         let mut held = HELD.lock();
@@ -130,7 +136,7 @@ pub fn ask(kind: &str, of: Option<&str>, epoch: Option<u64>) -> anyhow::Result<S
     };
     // A leg this runner runs signs its records, and the provenance kiln writes when asked
     // (docs/ci.md W27-R05, R06).
-    Ok(serde_json::to_string(&IdentityAsk { kind: kind.to_owned(), csr, of: of.map(str::to_owned), epoch, signs: kind == LEG })?)
+    Ok(IdentityAsk { kind: kind.to_owned(), csr, of: of.map(str::to_owned), epoch, signs: kind == LEG, ..IdentityAsk::default() })
 }
 
 /// The server's answer: the certificate kept for its slot (and written, public, under
@@ -201,6 +207,13 @@ pub fn kiln_git() -> Vec<String> {
     KILN_GIT.lock().clone()
 }
 
+/// The newest epoch of agent session `session` this process holds a certified key at: the epoch
+/// it holds the session at, as kiln certified it.
+pub fn epoch_held(session: &str) -> Option<u64> {
+    let prefix = format!("agent/{session}/");
+    HELD.lock().certs.keys().filter_map(|k| k.strip_prefix(&prefix)?.parse::<u64>().ok()).max()
+}
+
 /// The certificate held for a slot.
 pub fn cert(slot: &str) -> Option<String> {
     HELD.lock().certs.get(slot).map(|(pem, _)| pem.clone())
@@ -215,6 +228,15 @@ pub fn uri(slot: &str) -> Option<String> {
 /// the leg, given with its certificate.
 pub fn under(slot: &str) -> Option<String> {
     HELD.lock().given.get(slot).and_then(|g| g.under.clone())
+}
+
+/// Signs `message` with the slot's key before kiln has certified it (a receipt that goes with
+/// the ask for its certificate): the signature. The key stays here.
+pub fn sign_uncertified(slot: &str, message: &[u8]) -> anyhow::Result<Vec<u8>> {
+    use rcgen::SigningKey as _;
+    let held = HELD.lock();
+    let key = held.keys.get(slot).ok_or_else(|| anyhow::anyhow!("no key for {slot}"))?;
+    Ok(key.sign(message)?)
 }
 
 /// Signs `message` with the slot's key (ECDSA P-256, SHA-256, ASN.1): the signature, and the
