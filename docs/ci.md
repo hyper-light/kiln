@@ -9160,6 +9160,11 @@ delegation of it.
 - *Judged when read*: `GET /api/ci/legs/:id/signed` holds the records against what kiln keeps.
   - The results: each step's end, each log's verdict, each report by its CAS digest, and the leg's
     end.
+  - A log kiln keeps as taken from the leg, of a step the leg signed no log of, is a break too.
+    What kiln copies into a reused step's log (W24-R07, its source leg's) it keeps as no chunk of
+    the leg's (`Logs::append_copy`), so the step's log checks against what the leg itself sent.
+    That step's reports are its source's too, and aren't held against the leg (its receipt of
+    `reused/<step>` says it was reused).
   - The custody (`leg::judge_custody`): its stream whole, and its hand-on naming its results and
     received by kiln. Its receipts of its assignment and commit must be of what kiln handed, and a
     checkout by tarball of the tarball kiln served it, by the bytes kiln sent (`ci_leg_served`).

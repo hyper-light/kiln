@@ -1591,8 +1591,15 @@ fn w27_r05_a_legs_results_verify_as_the_leg() -> anyhow::Result<()> {
     std::fs::write(&built, &bytes)?;
     let v = signed()?;
     assert_eq!(field(&v, "state"), "broken", "{v:#}");
-    let breaks: Vec<String> = v.get("breaks").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
-    assert!(breaks.iter().any(|b| b.contains("isn't what the leg sent")), "{breaks:#?}");
+    let breaks = |v: &Value| -> Vec<String> { v.get("breaks").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect() };
+    assert!(breaks(&v).iter().any(|b| b.contains("isn't what the leg sent")), "{:#?}", breaks(&v));
+    // A log kiln keeps as the leg's, of a step the leg signed no log of: found too.
+    let forged: &[u8] = b"forged\n";
+    std::fs::write(logs_dir.join("7.log"), forged)?;
+    let piece = kiln_ci::logs::Piece { at: Some(0), len: forged.len() as u64, digest: kiln_ci::logs::digest(forged) };
+    std::fs::write(logs_dir.join("7.digests"), format!("{}\n", kiln_ci::logs::line(&piece)))?;
+    let v = signed()?;
+    assert!(breaks(&v).iter().any(|b| b == "step 7's log: kiln keeps 1 chunk of it as the leg's, and the leg signed none"), "{:#?}", breaks(&v));
     Ok(())
 }
 

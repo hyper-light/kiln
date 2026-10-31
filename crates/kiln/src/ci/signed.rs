@@ -275,11 +275,21 @@ async fn kept(hub: &Hub, job: &str, signed: &leg::Results) -> anyhow::Result<leg
     for (idx, chain) in &signed.logs {
         logs.insert(*idx, hub.logs.check(job, *idx, chain).await);
     }
+    // What kiln keeps as taken from the leg of a step it signed no log of.
+    let mut unsigned_logs = std::collections::BTreeMap::new();
+    for idx in hub.logs.kept_steps(job).await.into_iter().filter(|idx| !signed.logs.contains_key(idx)) {
+        let chunks = hub.logs.pieces(job, idx).await.last().map_or(0, |p| p.len() as u64);
+        if chunks > 0 {
+            unsigned_logs.insert(idx, chunks);
+        }
+    }
     Ok(leg::Kept {
         steps: steps.into_iter().filter_map(|(idx, status, exit)| Some((u32::try_from(idx).ok()?, (status, exit)))).collect(),
         logs,
         reports: reports.into_iter().filter_map(|(idx, path, object)| Some(leg::Report { idx: u32::try_from(idx).ok()?, path, sha256: object.trim_start_matches("sha256:").to_owned() })).collect(),
         conclusion,
+        unsigned_logs,
+        reused: std::collections::BTreeSet::new(),
     })
 }
 
@@ -343,11 +353,13 @@ pub async fn judged(hub: &Hub, job: &str) -> anyhow::Result<Option<Value>> {
         Ok(s) => s,
         Err(why) => return Ok(refusal(why)),
     };
-    let kept = kept(hub, job, &signed).await?;
-    let mut breaks = leg::judge(&signed, &kept);
     // Its custody: the leg's records, kiln's receipts, held to the delegation that gave it the leg.
     let fine: Vec<&statement::Checked> = took.iter().filter_map(|(_, u)| u.as_ref().ok()).map(|u| &u.statement).collect();
     let custody = |of_kiln: bool| fine.iter().copied().filter(|c| c.payload_type == statement::PAYLOAD_CUSTODY && (c.custodian == server) == of_kiln).collect::<Vec<_>>();
+    let mut kept = kept(hub, job, &signed).await?;
+    // The steps it says it received reused: what kiln copied into them is their source leg's.
+    kept.reused = leg::reused(&custody(false));
+    let mut breaks = leg::judge(&signed, &kept);
     let delegation = u.through.first();
     let served = served_of(hub, job, results_row.attempt).await?;
     breaks.extend(leg::judge_custody(&leg::Taken { legs: custody(false), kilns: custody(true), results: Some(&u.statement), delegation, served }));
