@@ -6,4 +6,9 @@ export type ExitInfo = { code: number | null, error?: string,
  * Unix ms it ended: what a stop is known by (its card, a person's mark of it), so a refresh
  * or a restart is never another stop.
  */
-at?: number, };
+at?: number, 
+/**
+ * Unix ms kiln starts it again by itself: its process ended without anyone ending the agent
+ * (docs/agents.md, "An agent lives until it's ended").
+ */
+again_at?: number, };

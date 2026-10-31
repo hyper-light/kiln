@@ -635,7 +635,11 @@ function Dock({
         </div>
       ) : status === "exited" ? (
         <div className="hx-exited">
-          <span className="hx-dim">{exit?.error ?? `The agent stopped${exit?.code != null ? ` (exit ${exit.code})` : ""}.`} Sending a message picks up where it left off.</span>
+          <span className="hx-dim">
+            {exit?.again_at != null
+              ? `Its process ended${exit.code != null ? ` (exit ${exit.code})` : ""}. It starts again by itself, and its conversation goes on.`
+              : `${exit?.error ?? `The agent stopped${exit?.code != null ? ` (exit ${exit.code})` : ""}.`} Sending a message picks up where it left off.`}
+          </span>
           {resume && (
             <Button size="sm" variant="secondary" onClick={() => send({ type: "restart" })}>
               <RotateCcw /> Restart

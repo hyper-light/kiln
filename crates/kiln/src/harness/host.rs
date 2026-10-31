@@ -2765,6 +2765,128 @@ mod tests {
         })
     }
 
+    /// A stand-in for Claude Code: it answers kiln's initialize and each turn (a turn that says
+    /// "long" goes on for a minute), and notes in `heard` each line it reads, with its pid.
+    #[cfg(unix)]
+    fn stand_in(dir: &std::path::Path) -> anyhow::Result<(PathBuf, PathBuf)> {
+        use std::os::unix::fs::PermissionsExt;
+        let heard = dir.join("heard.jsonl");
+        let fake = dir.join("fake-claude.py");
+        std::fs::write(&fake, r##"import json, os, sys, time, uuid
+HEARD = sys.argv[1]
+args = sys.argv[2:]
+def out(o):
+    sys.stdout.write(json.dumps(o) + "\n")
+    sys.stdout.flush()
+if "--version" in args:
+    print("2.1.296 (Claude Code)")
+    sys.exit(0)
+session = str(uuid.uuid4())
+for flag in ("--session-id", "--resume"):
+    if flag in args and args.index(flag) + 1 < len(args):
+        session = args[args.index(flag) + 1]
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    with open(HEARD, "a") as f:
+        f.write(json.dumps({"pid": os.getpid(), "line": line.strip()}) + "\n")
+    try:
+        m = json.loads(line)
+    except ValueError:
+        continue
+    if m.get("type") == "control_request":
+        req = m.get("request") or {}
+        resp = {}
+        if req.get("subtype") == "initialize":
+            resp = {"commands": [], "models": [], "agents": [], "current_permission_mode": "default", "claude_code_version": "2.1.296"}
+        out({"type": "control_response", "response": {"subtype": "success", "request_id": m.get("request_id"), "response": resp}})
+    elif m.get("type") == "user":
+        uid = m.get("uuid")
+        out({"type": "command_lifecycle", "command_uuid": uid, "state": "started", "session_id": session})
+        out({"type": "system", "subtype": "init", "cwd": ".", "session_id": session, "tools": [], "mcp_servers": [], "model": "claude-opus-5-5", "permissionMode": "default", "claude_code_version": "2.1.296"})
+        if "long" in json.dumps(m.get("message")):
+            time.sleep(60)
+        out({"type": "assistant", "message": {"id": "msg_%s" % uuid.uuid4(), "type": "message", "role": "assistant", "model": "claude-opus-5-5", "content": [{"type": "text", "text": "done"}], "stop_reason": None, "usage": {"input_tokens": 1, "output_tokens": 1}}, "parent_tool_use_id": None, "session_id": session})
+        out({"type": "result", "subtype": "success", "is_error": False, "duration_ms": 1, "num_turns": 1, "result": "done", "session_id": session, "total_cost_usd": 0, "usage": {"input_tokens": 1, "output_tokens": 1}})
+        out({"type": "command_lifecycle", "command_uuid": uid, "state": "completed", "session_id": session})
+"##)?;
+        let program = dir.join("claude-stand-in");
+        std::fs::write(&program, format!("#!/bin/sh\nexec python3 '{}' '{}' \"$@\"\n", fake.display(), heard.display()))?;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))?;
+        Ok((program, heard))
+    }
+
+    /// An agent lives until it's ended (docs/agents.md): its harness's process ending by a signal
+    /// from outside it (kiln's own left-running sweep sent 26 agents' one on 2026-10-31, and they
+    /// ended) ends nothing. It starts again by itself, its conversation resumed, and one that was
+    /// cut short mid-turn picks the turn up.
+    #[cfg(unix)]
+    #[test]
+    fn an_agent_whose_harness_is_stopped_from_outside_starts_again_by_itself() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let (program, heard) = stand_in(dir.path())?;
+            let (tx, _rx) = async_channel::unbounded();
+            let host = with_inbox(tx);
+            let spec = Spec { kind: "claude".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), program: Some(program.to_string_lossy().into_owned()), ..Spec::default() };
+            let s = host.open(Some("lives".into()), spec)?;
+            let idle = || s.pid.lock().is_some() && s.core.lock().state.status == Status::Idle;
+            until_it("the stand-in's start", 300, || s.pid.lock().is_some() && !s.core.lock().meta.features.is_empty()).await?;
+            assert!(host.command("lives", message("m1", "hello")));
+            until_it("m1's turn, over", 60, || idle() && s.core.lock().state.harness_session.is_some()).await?;
+            let stop = |pid: u32| std::process::Command::new("kill").args(["-TERM", &pid.to_string()]).status();
+            // Between turns, stopped from outside: it stands as starting again, then is back,
+            // another process on the same conversation.
+            let first = s.pid.lock().ok_or_else(|| anyhow::anyhow!("no harness"))?;
+            let conversation = s.core.lock().state.harness_session.clone();
+            stop(first)?;
+            until_it("it ending, to start again", 30, || s.core.lock().state.exit.as_ref().is_some_and(|x| x.again_at.is_some())).await?;
+            assert_eq!(super::super::wait::stand(&s.info()), "working", "{:?}", s.info().exit);
+            until_it("it back by itself", 60, || idle() && s.pid.lock().is_some_and(|p| p != first)).await?;
+            assert_eq!(s.core.lock().state.harness_session, conversation, "the same conversation");
+            assert!(s.core.lock().state.exit.is_none(), "it runs again");
+            let said = |words: &str| s.core.lock().events().any(|e| matches!(&e.body, super::super::model::Body::Notice { text, .. } if text.contains(words)));
+            assert!(said("Its process ended"), "it says why it started again");
+            // Mid-turn: the turn is picked up by the process that starts after it.
+            let second = s.pid.lock().ok_or_else(|| anyhow::anyhow!("no harness"))?;
+            assert!(host.command("lives", message("m2", "a long one")));
+            until_it("m2's turn", 60, || s.core.lock().state.status == Status::Running).await?;
+            stop(second)?;
+            let picked = || {
+                std::fs::read_to_string(&heard).unwrap_or_default().lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()).any(|w| {
+                    w.get("pid").and_then(serde_json::Value::as_u64).is_some_and(|p| p != u64::from(second) && p != u64::from(first))
+                        && w.get("line").and_then(serde_json::Value::as_str).is_some_and(|l| l.contains("Pick up where you left off"))
+                })
+            };
+            until_it("the cut turn picked up by the next process", 60, picked).await?;
+            host.close("lives");
+            Ok(())
+        })
+    }
+
+    /// A harness that ends as soon as it starts, three starts in a row, won't start: it isn't
+    /// started again, and stands stopped, waiting for a person, with why.
+    #[cfg(unix)]
+    #[test]
+    fn a_harness_that_wont_start_waits_for_a_person() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let program = dir.path().join("claude-that-ends");
+            std::fs::write(&program, "#!/bin/sh\nexit 3\n")?;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))?;
+            let (tx, _rx) = async_channel::unbounded();
+            let host = with_inbox(tx);
+            let spec = Spec { kind: "claude".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), program: Some(program.to_string_lossy().into_owned()), ..Spec::default() };
+            let s = host.open(Some("wont".into()), spec)?;
+            until_it("it given up on", 60, || s.core.lock().state.exit.as_ref().is_some_and(|x| x.again_at.is_none() && x.error.as_deref().is_some_and(|e| e.contains("stopped starting it again")))).await?;
+            assert_eq!(super::super::wait::stand(&s.info()), "stopped");
+            host.close("wont");
+            Ok(())
+        })
+    }
+
     /// On a simulated clock of its own, as every host in these tests is (CP-M2, AC-M2.1).
     #[test]
     fn a_session_is_saved_and_restored_with_its_pause_without_deadlocking() -> anyhow::Result<()> {
@@ -3902,4 +4024,3 @@ while True:
         })
     }
 }
-
