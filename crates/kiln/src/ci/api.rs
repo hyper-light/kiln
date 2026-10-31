@@ -194,6 +194,9 @@ async fn outside(hub: &Arc<Hub>, method: &Method, rest: &[&str], q: &HashMap<Str
         (&Method::POST, ["repos", repo, "providers", "sync"]) => Ok(ok(&super::providers::sync_now(hub, repo).await?)),
         (&Method::GET, ["repos", repo, "providers", "workflows"]) => Ok(ok(&super::providers::workflows(hub, repo).await?)),
         (&Method::GET, ["repos", repo, "commits", sha, "checks"]) => Ok(ok(&super::providers::checks(hub, repo, sha).await?)),
+        // W28-R55: a commit's verdict on each lane it is on, per unit and test.
+        (&Method::GET, ["repos", repo, "commits", sha, "verdict"]) => Ok(ok(&super::verdict::of_commit(hub, repo, sha, q).await?)),
+        (&Method::GET, ["repos", repo, "commits", sha, "verdict", "wait"]) => Ok(ok(&super::verdict::wait(hub, repo, sha, q).await?)),
         // W26-R07: a search across a host's pull request, at its mirrored head.
         (&Method::GET, ["repos", repo, "pulls", n, "search"]) => Ok(ok(&super::search::pull(hub, repo, n, q, caller).await?)),
         // W23-R06: the host's pull requests (merge requests).

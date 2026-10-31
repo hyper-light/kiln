@@ -92,10 +92,17 @@ same draws.
   live demand wants is dropped if it hasn't started. Once running, it finishes, unless live work waits
   for its capacity and it has more than `finish_within` left; then it is cancelled, and a cancelled
   k8s job's progress goes to the next run of its job on the lane (`warm_credit`).
-- **P3**, P2 plus verdicts: a commit without a result of its own for a job is covered by the first
-  later result for it (a pass, or a failure in the step already failing at its base). A new failure
-  bisects the commits it may have come from, ceil(log2(n + 1)) runs at low priority, and answers them
-  when the bisection ends.
+- **P3**, P2 plus verdicts, decided by `kiln_ci::verdict` (docs/ci.md W28-R50 to R53): each job is
+  a check of its own, and a commit affects the jobs whose input keys it changed. A job a commit
+  could affect, with no result of its own, is covered by the nearest later commit's result for it (a
+  pass, or a failure in the step already failing at its base). A new failure's suspects are the
+  commits since its base that changed the job's inputs, the failing one among them: bisected at
+  low priority where `kiln_ci::verdict::culprit` says (W28-R56: a binary search here, each try a
+  suspect's job doing what its draw says; one suspect is the culprit at once), the culprit named
+  and the rest cleared when the bisection ends. A covered verdict needs a later commit's result,
+  so P3 keeps what is under way: a run whose own work has begun still runs its jobs as they come
+  ready though newer pushes withdrew it, and the newest execution of each job of a lane (its pod
+  launching, or running) stays until a live demand of the same job needs its room.
 - **P4**, P3 plus admission, by `kiln_ci::sched::admit` itself (W28-R61, R63): a push waits `quiet`
   while its pools are saturated, a burst never past `max_wait`, and goes as soon as its pools free;
   exclusive jobs and Mac jobs run on a cadence (the newest commit when the resource frees, never
@@ -106,8 +113,10 @@ same draws.
 
 ## The report
 
-A verdict is when a commit's run had every job's result: under P0 to P2 its own run concluding,
-from P3 on also covered or bisected. "Longest gap between verdicts" is `runs_analyze.py`'s (it
+A verdict is when a commit is answered: under P0 to P2 its own run concluding; from P3 on, when
+`kiln_ci::verdict` answers it (every job its diff could affect direct or covered, or the commit
+named a culprit), counted from when it was answered for good: a covered verdict a nearer commit's
+new failure takes back counts again only once it is answered again. "Longest gap between verdicts" is `runs_analyze.py`'s (it
 includes nights without pushes); "longest wait for any verdict" is the longest a push waited for
 the next verdict on main, its own or a later commit's. Bench wait is from a push to its exclusive
 bench job's start. Runner-hours per verdict are the workflow's runner-hours over its commits given
@@ -122,9 +131,11 @@ Medians over seeds 1-8, with their ranges; ci's commits on main; latency over ev
 | P0 | 90.3 (88.7–91.1) | 50.4% (50.0%–51.1%) | 49 min (41 min–1.1 h) | never | 6.6 h | 3.9 h (3.5 h–3.9 h) | 51 min (50 min–53 min) | 0.36 (0.36–0.37) |
 | P1 | 0.0 | 66.7% (64.1%–68.9%) | 34 min (29 min–36 min) | never | 6.7 h (6.6 h–6.8 h) | 3.0 h (2.7 h–3.1 h) | 32 min (31 min–34 min) | 0.30 (0.29–0.31) |
 | P2 | 2.2 (1.8–2.7) | 65.6% (63.3%–66.7%) | 24 min | never | 6.8 h (6.7 h–6.8 h) | 3.5 h (3.3 h–3.5 h) | 20 min | 0.31 (0.30–0.32) |
-| P3 | 2.4 (1.9–3.0) | 75.9% (74.1%–78.9%) | 21 min (21 min–23 min) | 2.7 h (2.1 h–2.8 h) | 6.8 h (6.7 h–6.8 h) | 3.5 h (3.3 h–3.5 h) | 20 min | 0.21 (0.21–0.22) |
-| P4 | 1.3 (0.9–1.6) | 72.6% (70.7%–74.4%) | 25 min (24 min–27 min) | 2.7 h (2.4 h–2.8 h) | 6.8 h (6.7 h–6.8 h) | 3.5 h (3.3 h–3.5 h) | 7 min (7 min–8 min) | 0.21 |
-| P5 | 1.3 (0.9–1.4) | 74.1% (71.9%–75.9%) | 25 min (24 min–26 min) | 2.7 h (2.4 h–2.8 h) | 6.8 h (6.7 h–6.8 h) | 3.5 h (3.3 h–3.5 h) | 7 min (7 min–8 min) | 0.20 |
+| P3 | 2.4 (1.9–3.2) | 90.0% (87.8%–90.7%) | 17 min (16 min–18 min) | 1.0 h (53 min–1.1 h) | 6.8 h (6.7 h–6.8 h) | 3.1 h (2.7 h–3.1 h) | 20 min (20 min–21 min) | 0.26 (0.24–0.26) |
+| P4 | 0.3 (0.1–0.5) | 85.6% (84.8%–86.3%) | 21 min (20 min–21 min) | 1.2 h (1.1 h–1.3 h) | 6.8 h (6.7 h–6.8 h) | 3.1 h (2.7 h–3.3 h) | 7 min (7 min–8 min) | 0.25 (0.24–0.26) |
+| P5 | 0.2 (0.1–0.5) | 86.7% (85.6%–87.4%) | 21 min (20 min–21 min) | 1.2 h (1.0 h–1.2 h) | 6.8 h (6.7 h–6.8 h) | 3.0 h (2.7 h–3.1 h) | 7 min (7 min–8 min) | 0.23 (0.22–0.24) |
+| P3 + overflow | 2.4 (1.8–3.0) | 99.6% (98.5%–100.0%) | 13 min (13 min–14 min) | 36 min (34 min–36 min) | 6.7 h (6.6 h–6.7 h) | 49 min (40 min–1.8 h) | 20 min (19 min–21 min) | 0.28 (0.27–0.28) |
+| P4 + overflow | 0.2 (0.1–0.4) | 95.2% (94.1%–97.0%) | 14 min (13 min–14 min) | 42 min (40 min–46 min) | 6.7 h (6.6 h–6.7 h) | 1.2 h (1.1 h–1.8 h) | 7 min (7 min–8 min) | 0.27 (0.27–0.28) |
 
 P0's calibration against the measured week:
 
@@ -137,6 +148,16 @@ P0's calibration against the measured week:
 - P0 seed 7: runner time 339.6 h, superseded 90.0 h (26.5%) against 25.0%; ci pushes to main concluded 141 of 270 (52.2%) against 137 of 270
 - P0 seed 8: runner time 340.9 h, superseded 91.1 h (26.7%) against 25.0%; ci pushes to main concluded 142 of 270 (52.6%) against 137 of 270
 
+Where ci's commits on main without a verdict an hour after their push stood then (W28-R53), medians over seeds with their ranges:
+
+| Policy | a suspect: its bisection still going | pending: a pod of its lane's work not started | pending: its answer's job waiting for a runner | pending: its answer's job running | pending: its answer's job waiting for its needs | pending: its answer's push not made yet | no answer in the window |
+|---|---|---|---|---|---|---|---|
+| P3 | 0 (0–2) | 13 (9–15) | 0 (0–1) | 4 (1–6) | 5 (3–9) | 4 (3–8) | 1 (0–2) |
+| P4 | 0 (0–2) | 13 (9–14) | 6 (4–8) | 7 (4–8) | 7 (5–11) | 4 (3–8) | 3 (0–5) |
+| P5 | 0 (0–2) | 13 (9–14) | 6 (4–8) | 4 (2–6) | 7 (6–11) | 4 (3–8) | 1 (0–3) |
+| P3 + overflow | 0 (0–1) | 0 | 0 | 0 (0–1) | 0 (0–1) | 0 | 0 (0–1) |
+| P4 + overflow | 0 (0–1) | 0 | 5 (4–7) | 3 (0–5) | 2 (1–3) | 0 | 2 (0–5) |
+
 ci on main:
 
 | Policy | Verdict within 60 min | Latency p50 | p90 | Longest gap | Longest wait for any verdict | Runner-h used | Wasted | Runner-h per verdict |
@@ -145,9 +166,11 @@ ci on main:
 | P0 | 50.4% (50.0%–51.1%) | 49 min (41 min–1.1 h) | never | 6.6 h | 3.9 h (3.5 h–3.9 h) | 52.0 (51.6–52.1) | 10.8 (10.6–10.9) | 0.36 (0.36–0.37) |
 | P1 | 66.7% (64.1%–68.9%) | 34 min (29 min–36 min) | never | 6.7 h (6.6 h–6.8 h) | 3.0 h (2.7 h–3.1 h) | 62.1 (59.4–64.5) | 0.0 | 0.30 (0.29–0.31) |
 | P2 | 65.6% (63.3%–66.7%) | 24 min | never | 6.8 h (6.7 h–6.8 h) | 3.5 h (3.3 h–3.5 h) | 55.5 (55.1–56.7) | 0.0 | 0.31 (0.30–0.32) |
-| P3 | 75.9% (74.1%–78.9%) | 21 min (21 min–23 min) | 2.7 h (2.1 h–2.8 h) | 6.8 h (6.7 h–6.8 h) | 3.5 h (3.3 h–3.5 h) | 56.9 (56.2–57.7) | 0.0 | 0.21 (0.21–0.22) |
-| P4 | 72.6% (70.7%–74.4%) | 25 min (24 min–27 min) | 2.7 h (2.4 h–2.8 h) | 6.8 h (6.7 h–6.8 h) | 3.5 h (3.3 h–3.5 h) | 56.3 (55.5–57.0) | 0.0 | 0.21 |
-| P5 | 74.1% (71.9%–75.9%) | 25 min (24 min–26 min) | 2.7 h (2.4 h–2.8 h) | 6.8 h (6.7 h–6.8 h) | 3.5 h (3.3 h–3.5 h) | 53.5 (52.6–54.2) | 0.0 | 0.20 |
+| P3 | 90.0% (87.8%–90.7%) | 17 min (16 min–18 min) | 1.0 h (53 min–1.1 h) | 6.8 h (6.7 h–6.8 h) | 3.1 h (2.7 h–3.1 h) | 68.9 (65.8–70.5) | 0.0 | 0.26 (0.24–0.26) |
+| P4 | 85.6% (84.8%–86.3%) | 21 min (20 min–21 min) | 1.2 h (1.1 h–1.3 h) | 6.8 h (6.7 h–6.8 h) | 3.1 h (2.7 h–3.3 h) | 68.5 (65.1–69.8) | 0.0 | 0.25 (0.24–0.26) |
+| P5 | 86.7% (85.6%–87.4%) | 21 min (20 min–21 min) | 1.2 h (1.0 h–1.2 h) | 6.8 h (6.7 h–6.8 h) | 3.0 h (2.7 h–3.1 h) | 62.7 (59.6–63.7) | 0.0 | 0.23 (0.22–0.24) |
+| P3 + overflow | 99.6% (98.5%–100.0%) | 13 min (13 min–14 min) | 36 min (34 min–36 min) | 6.7 h (6.6 h–6.7 h) | 49 min (40 min–1.8 h) | 74.4 (72.1–75.8) | 0.0 | 0.28 (0.27–0.28) |
+| P4 + overflow | 95.2% (94.1%–97.0%) | 14 min (13 min–14 min) | 42 min (40 min–46 min) | 6.7 h (6.6 h–6.7 h) | 1.2 h (1.1 h–1.8 h) | 74.1 (71.3–75.3) | 0.0 | 0.27 (0.27–0.28) |
 
 release on main:
 
@@ -157,9 +180,11 @@ release on main:
 | P0 | 30.4% (29.6%–31.2%) | never | never | 12.0 h (8.2 h–12.0 h) | 11.1 h (7.4 h–11.1 h) | 182.9 (182.0–183.9) | 61.4 (60.7–62.3) | 2.11 (2.07–2.16) |
 | P1 | 55.4% (52.3%–57.3%) | 53 min (50 min–57 min) | never | 7.1 h (6.6 h–7.1 h) | 1.5 h (1.5 h–1.8 h) | 189.7 (186.7–192.3) | 0.0 | 1.06 (1.06–1.08) |
 | P2 | 81.9% (79.2%–83.8%) | 32 min (31 min–33 min) | 1.5 h (1.4 h–never) | 7.1 h (6.6 h–7.1 h) | 1.4 h (1.2 h–1.4 h) | 219.3 (217.4–222.9) | 1.0 (0.5–1.4) | 0.93 (0.92–0.95) |
-| P3 | 87.7% (84.2%–92.7%) | 31 min (31 min–33 min) | 1.1 h (56 min–1.2 h) | 7.1 h (6.6 h–7.1 h) | 1.4 h (1.2 h–1.4 h) | 221.0 (219.6–226.6) | 1.0 (0.5–1.6) | 0.85 (0.85–0.87) |
-| P4 | 81.5% (78.8%–85.4%) | 34 min (33 min–38 min) | 1.4 h (1.2 h–1.4 h) | 7.1 h (6.6 h–7.1 h) | 2.2 h (2.2 h–2.3 h) | 210.6 (204.9–213.4) | 0.1 (0.1–0.3) | 0.81 (0.80–0.82) |
-| P5 | 83.1% (79.6%–86.5%) | 33 min (32 min–38 min) | 1.3 h (1.2 h–1.4 h) | 7.1 h (6.6 h–7.1 h) | 2.2 h (2.2 h–2.3 h) | 204.2 (198.4–206.6) | 0.1 (0.1–0.3) | 0.79 (0.77–0.80) |
+| P3 | 88.8% (86.2%–91.9%) | 31 min (30 min–32 min) | 1.1 h (56 min–1.2 h) | 7.2 h (6.8 h–7.3 h) | 1.4 h (1.1 h–1.4 h) | 225.5 (222.0–230.3) | 1.1 (0.5–1.7) | 0.89 (0.87–0.90) |
+| P4 | 83.1% (81.2%–85.8%) | 33 min (31 min–34 min) | 1.3 h (1.2 h–1.4 h) | 7.2 h (6.8 h–7.3 h) | 1.4 h (1.3 h–2.2 h) | 215.9 (208.1–219.7) | 0.0 | 0.85 (0.83–0.86) |
+| P5 | 84.2% (82.3%–86.5%) | 31 min (30 min–32 min) | 1.3 h (1.1 h–1.4 h) | 7.2 h (6.8 h–7.3 h) | 1.4 h (1.3 h–2.2 h) | 209.0 (202.1–213.2) | 0.0 | 0.82 (0.81–0.83) |
+| P3 + overflow | 88.8% (86.2%–91.9%) | 31 min (30 min–32 min) | 1.1 h (56 min–1.2 h) | 7.2 h (6.8 h–7.3 h) | 1.4 h (1.1 h–1.4 h) | 225.5 (222.2–230.3) | 1.0 (0.5–1.6) | 0.89 (0.87–0.90) |
+| P4 + overflow | 83.5% (81.2%–85.8%) | 33 min (31 min–34 min) | 1.3 h (1.2 h–1.4 h) | 7.2 h (6.8 h–7.3 h) | 1.4 h (1.3 h–2.2 h) | 215.9 (209.0–220.1) | 0.0 | 0.85 (0.83–0.86) |
 
 image on main:
 
@@ -169,9 +194,11 @@ image on main:
 | P0 | 43.8% (43.0%–44.9%) | never (4.6 h–never) | never | 6.8 h (6.8 h–8.6 h) | 4.5 h (3.6 h–7.5 h) | 69.7 (69.4–70.2) | 17.9 (17.1–18.5) | 0.52 (0.51–0.53) |
 | P1 | 70.2% (68.8%–72.4%) | 36 min (35 min–37 min) | never | 6.6 h (6.5 h–6.6 h) | 1.1 h (56 min–1.2 h) | 80.5 (79.2–82.0) | 0.0 | 0.39 (0.38–0.39) |
 | P2 | 86.8% (85.7%–89.0%) | 24 min | never (1.0 h–never) | 6.6 h (6.5 h–6.6 h) | 1.3 h (56 min–1.3 h) | 93.2 (91.3–94.8) | 1.1 (0.9–1.5) | 0.39 (0.38–0.39) |
-| P3 | 94.1% (93.8%–96.0%) | 24 min (23 min–24 min) | 47 min (43 min–50 min) | 6.6 h (6.5 h–6.6 h) | 1.3 h (56 min–1.3 h) | 93.9 (92.4–96.9) | 1.2 (1.0–1.6) | 0.35 (0.34–0.36) |
-| P4 | 87.1% (83.8%–87.9%) | 28 min (27 min–29 min) | 1.1 h (1.0 h–1.2 h) | 6.6 h (6.6 h–6.7 h) | 2.4 h (2.4 h–2.5 h) | 83.7 (81.8–85.4) | 1.1 (0.8–1.3) | 0.31 (0.30–0.32) |
-| P5 | 86.8% (83.8%–87.9%) | 28 min (27 min–29 min) | 1.1 h (1.0 h–1.2 h) | 6.6 h (6.6 h–6.7 h) | 2.4 h (2.4 h–2.5 h) | 83.7 (82.1–85.8) | 1.1 (0.8–1.2) | 0.31 (0.30–0.32) |
+| P3 | 97.1% (96.3%–97.8%) | 23 min (23 min–24 min) | 43 min (41 min–43 min) | 6.6 h (6.5 h–6.6 h) | 58 min (51 min–1.1 h) | 94.6 (91.3–95.5) | 1.2 (0.9–1.3) | 0.35 (0.34–0.35) |
+| P4 | 88.6% (86.4%–89.3%) | 27 min (25 min–27 min) | 1.0 h (1.0 h–1.1 h) | 6.6 h (6.6 h–6.7 h) | 2.4 h (2.4 h–2.5 h) | 82.8 (82.2–85.3) | 0.3 (0.1–0.5) | 0.31 (0.30–0.31) |
+| P5 | 88.2% (86.4%–89.0%) | 27 min (25 min–27 min) | 1.0 h (1.0 h–1.1 h) | 6.6 h (6.6 h–6.7 h) | 2.4 h (2.4 h–2.5 h) | 84.0 (81.9–84.4) | 0.2 (0.1–0.4) | 0.31 (0.30–0.31) |
+| P3 + overflow | 97.1% (96.3%–97.8%) | 23 min (23 min–24 min) | 42 min (40 min–43 min) | 6.6 h (6.5 h–6.6 h) | 58 min (51 min–1.1 h) | 94.9 (92.0–95.8) | 1.1 (0.9–1.3) | 0.35 (0.34–0.35) |
+| P4 + overflow | 88.6% (86.4%–89.3%) | 26 min (25 min–27 min) | 1.0 h (1.0 h–1.1 h) | 6.6 h (6.6 h–6.7 h) | 2.4 h (2.4 h–2.5 h) | 83.6 (82.1–85.3) | 0.2 (0.1–0.4) | 0.31 (0.30–0.31) |
 
 bench on main:
 
@@ -181,9 +208,11 @@ bench on main:
 | P0 | 59.2% (57.8%–59.7%) | 50 min (50 min–51 min) | 3.1 h (2.9 h–3.2 h) | 7.5 h | 4.2 h (3.4 h–6.2 h) | 35.6 (35.5–35.8) | 0.0 | 0.17 |
 | P1 | 51.9% (48.5%–54.9%) | 57 min (51 min–1.0 h) | never | 7.0 h (7.0 h–7.4 h) | 4.3 h (2.8 h–5.0 h) | 23.2 (22.2–23.5) | 0.0 | 0.16 |
 | P2 | 49.0% (48.1%–50.0%) | 1.2 h (1.0 h–1.3 h) | never | 7.3 h | 4.5 h (3.7 h–6.3 h) | 20.0 (19.7–20.3) | 0.2 | 0.19 (0.18–0.19) |
-| P3 | 69.9% (68.0%–70.9%) | 42 min (42 min–44 min) | 2.4 h (2.0 h–2.4 h) | 7.3 h | 4.2 h (3.4 h–6.0 h) | 20.0 (19.7–20.3) | 0.2 | 0.10 |
-| P4 | 86.9% (85.4%–87.9%) | 24 min (23 min–25 min) | 1.1 h (1.0 h–1.2 h) | 6.8 h | 2.9 h (2.9 h–3.9 h) | 28.3 (27.8–28.9) | 0.0 | 0.14 (0.13–0.14) |
-| P5 | 86.4% (84.5%–87.9%) | 24 min (23 min–24 min) | 1.1 h (1.0 h–1.2 h) | 6.8 h | 2.9 h (2.9 h–3.9 h) | 28.3 (27.7–28.9) | 0.0 | 0.14 (0.13–0.14) |
+| P3 | 72.3% (70.9%–73.3%) | 41 min (41 min–42 min) | 2.2 h (1.9 h–2.4 h) | 7.3 h (7.3 h–7.8 h) | 4.5 h (3.7 h–6.3 h) | 19.8 (19.3–20.2) | 0.2 (0.1–0.2) | 0.10 (0.09–0.10) |
+| P4 | 86.9% (85.4%–87.9%) | 23 min (22 min–23 min) | 1.1 h (1.1 h–1.2 h) | 6.8 h | 3.2 h (2.3 h–3.9 h) | 28.2 (27.7–28.9) | 0.0 | 0.14 (0.13–0.14) |
+| P5 | 86.9% (85.0%–87.9%) | 23 min (22 min–23 min) | 1.1 h (1.1 h–1.2 h) | 6.8 h | 3.2 h (2.3 h–3.9 h) | 28.2 (27.7–28.9) | 0.0 | 0.14 (0.13–0.14) |
+| P3 + overflow | 72.3% (70.9%–73.3%) | 41 min | 2.2 h (1.9 h–2.4 h) | 7.3 h (7.3 h–7.8 h) | 4.5 h (3.7 h–6.3 h) | 19.7 (19.3–20.2) | 0.2 (0.1–0.2) | 0.10 (0.09–0.10) |
+| P4 + overflow | 87.4% (85.9%–87.9%) | 23 min (22 min–23 min) | 1.1 h (1.1 h–1.2 h) | 6.8 h | 3.1 h (1.9 h–3.9 h) | 28.2 (27.7–28.6) | 0.0 | 0.14 (0.13–0.14) |
 <!-- /report -->
 
 ## Defaults for later steps
@@ -193,13 +222,14 @@ over seeds 1-8).
 
 | Parameter | Default | Why |
 |---|---|---|
-| `finish_within` | 300 s | On P3, 0 s wastes 4.5 runner-h and gives 77.0% of ci's commits a verdict within 60 min; 300 s, 2.4 h and 75.9%; 600 s, 1.4 h and 74.8%; 1200 s, none and 74.8%. 300 s keeps waste under 1% of runner time, within about a point of the most verdicts. |
+| `finish_within` | 300 s | On P3, 0 s wastes 3.9 runner-h and gives 90.0% of ci's commits a verdict within 60 min; 300 s, 2.4 h and 90.0%; 600 s, 1.5 h and 90.7%; 1200 s, none and 90.7%. 300 s keeps waste under 1% of runner time, within about a point of the most verdicts. |
 | `warm_credit` | 0.5 | No effect measured (2.5 runner-h wasted at 0, 2.4 h from 0.25 to 0.75): once newer pushes withdraw instead of cancel, few k8s jobs are cancelled. The design's half stays. |
-| `quiet` | 60 s | On P4: 0 s wastes 8.7 runner-h, as the bench's drain cancels more unwanted work; 60 s, 1.3 h with 72.6% of verdicts within 60 min; 120 s and 300 s, 1.3 h and 71.5%. |
+| `quiet` | 60 s | On P4: 0 s gives 87.8% of verdicts within 60 min and the bench a 5 min wait; 60 s, 85.6% and 7 min; 120 s, 85.2%; 300 s, 85.9%; each wastes 0.6 runner-h or less, now that P3 keeps what is under way. |
 | `max_wait` | 600 s | No burst of the week was held 5 min: 300 to 1800 s give the same numbers. 600 s bounds a burst at 10 min. |
-| cadence | on (exclusive jobs, the macOS release) | The bench waits 7 min (p50) with it, 20 min without, at about 3 points of ci's verdicts within 60 min (72.6% against 75.9%): the drain holds the server's slots that ci's release-binary also needs. |
+| cadence | on (exclusive jobs, the macOS release) | The bench waits 7 min (p50) with it, 21 min without, at about 4 points of ci's verdicts within 60 min (85.6% against 90.0%): the drain holds the server's slots that ci's release-binary also needs. |
 | speculation window | 4 (floor 1, cap 20) | No effect measured: P4's bisection runs, its lane's speculative demands (W28-R68), never overlapped on the week, so windows of 1 to 8 and none give the same numbers. 4 leaves room for the intermediate commits W25's step 5 keeps for direct verdicts, and halves to 1 on failures. |
 | `image_compile_share` | 0 | No effect in the replay: the image starts beside release's Linux build, not after it, so there is no finished compile to take. W25's step 7, which has the Dockerfile take release's binary, decides it. |
+| `overflow.after` | 120 s | W28-R80, on P3: 120, 300 and 600 s each give 99.6% of ci's commits a verdict within 60 min (90.0% without), wasting 2.4, 2.5 and 2.5 runner-h; on P4, 95.2% each (85.6% without). Half the week's pods started within 8 s and three in four within 21 s: past 120 s a pod was already in the slowest 13% (87 of 657), past 300 s the slowest 8%. 120 s sends the most late pods' work on and wastes the least. |
 
 ## What the numbers say
 
@@ -213,12 +243,32 @@ over seeds 1-8).
 - **P2** wastes 2.2 runner-h a week (0.6% of runner time; W25's step 4 asks at most 5%), with a
   median latency of 24 min. Its withdrawals, adoptions, drops, finishes and cancels are the
   scheduler's own, made by `kiln_ci::sched::demand` (W28-R48, W28-AC45).
-- **P3** gives 75.9% of ci's commits a verdict within 60 min, and nine in ten one within 2.7 h:
-  short of the 95% W25's step 5 asks. Covered verdicts can't come before the next
-  commit's run ends, and the pods' recorded start delays, the server's queue for release-binary and
-  low-priority bisections remain. Measuring where the last quarter waits is for step 5.
-- **P4** brings the bench's wait to 7 min (W25's step 6 asks at most 15) and waste to 1.3 runner-h,
-  at 72.6% of ci's verdicts within 60 min.
+- **P3** gives 90.0% (87.8%–90.7%) of ci's commits a verdict within 60 min (75.9% before
+  `kiln_ci::verdict` decided them, 79.3% with it alone), and nine in ten one within 1.0 h: still
+  short of the 95% W25's step 5 asks. Over two hours of steady pushes (runs 140 to 174) the
+  recorded week started no ci rust pod at all: each waited for the cluster and was cancelled when
+  the next push came. Under P2 each push dropped the pod in flight and asked for another, so no
+  commit of the burst was answered until the pushes stopped. Keeping what is under way (the
+  newest execution of each job of a lane, and a begun run's later jobs) took P3 from 79.3% to
+  90.0%, for 0.26 runner-h per verdict against 0.21; keeping every begun run whole did worse
+  (88.9%, and the bench waited 41 min). An hour after their push (the table under the report), of
+  the week's 27 or so late commits 13 waited for a pod of their lane's work the cluster hadn't
+  started: that week's pods waited from 30 min to 2.5 h at times (runs 328 and 332's rust pods
+  started 149 min after their push). 5 waited for a job's needs, 4 for a run going and 4 for a push
+  made after the hour, and 1 had no answer in the window. With pods starting as they did that
+  week, 95% is out of reach for verdicts: the pods alone leave 13 commits a week late.
+  Replayed with every pool's capacity unlimited (runner slots, the k8s quota's CPU, memory and pods),
+  P3 reaches 93.3% (89.6%–95.9%) and P4 89.6%: 8 commits a week still wait at the hour on pods the
+  recorded week started late, so no policy that waits for its pods reaches 95% on this trace.
+- **P3 + overflow** (W28-R80, docs/ci.md: a k8s job whose pod hasn't started 2 min after the quota
+  took it runs on a Linux machine's free slot instead, looking again every 30 s) gives 99.6%
+  (98.5%–100.0%) of ci's commits a verdict within 60 min, wasting 2.4 runner-h (1.8–3.0), with a
+  median latency of 13 min: no commit is left late for a pod. Release (88.8%), the image (97.1%)
+  and the bench (72.3%) are as under P3: their jobs aren't the pods'. The replay keeps each job's
+  recorded duration on the machine it overflows to, as it does everywhere (the limits below).
+- **P4** brings the bench's wait to 7 min (W25's step 6 asks at most 15) and waste to 0.3 runner-h,
+  at 85.6% of ci's verdicts within 60 min. It has steps 4 and 6 on (the demand table and
+  admission), so W28-AC51 is measured on it: which commits it leaves late is below.
 - **P5** saves about 6 runner-h a week of release builds and 3 of ci (0.20 runner-h per ci verdict,
   against 0.36 today).
 - **The longest gap between verdicts** stays near 6.7 h under every policy: it is the week's longest
@@ -229,69 +279,175 @@ Limits: recorded durations stay fixed whatever runs beside them, so a policy tha
 looks a little better than it would on the loaded server; input keys come from path sets, an
 approximation of W24's observed reads; verdicts are by job, not by test.
 
+### Which commits are late (W28-AC51)
+
+W28-AC51 asks that 95% of ci's commits on main be answered within an hour of their push, with
+steps 4 and 6 on: P4 (the demand table and admission) answers 85.6% (84.8%–86.3%) over seeds 1-8,
+P3 (no admission) 90.0%; with W28-R80's overflow, P4 answers 95.2% (94.1%–97.0%) and P3 99.6%. `cargo run -p kiln-ci --example replay -- ci/sim/trace.json --late` lists
+each commit P3 and P4 leave late in any seed, where it stood at the hour (as the table under the
+report counts them) and what held it. P4's, each run by its place in `trace.json` and pushed that
+many hours into the window:
+
+| Run | Pushed | Late in seeds | Where it stood at the hour | What held it |
+|---|---|---|---|---|
+| 20 | 1.4 h | 3 of 8 | no answer in the window |  |
+| 147 | 14.1 h | 5 of 8 | pending: its answer's push not made yet | release-binary, answered by run 286 |
+| 265 | 29.4 h | 2 of 8 | no answer in the window |  |
+| 286 | 30.8 h | 2 of 8 | pending: its answer's job waiting for a runner | release-binary, answered by run 286 |
+| 293 | 30.9 h | 3 of 8 | pending: its answer's job waiting for a runner | release-binary, answered by run 293 |
+| 297 | 31.0 h | 5 of 8 | pending: its answer's job waiting for a runner | release-binary, answered by run 297 |
+| 328 | 37.6 h | 4 of 8 | pending: a pod of its lane's work not started | rust's pod for run 328: it never started in the recorded week |
+| 332 | 37.7 h | 8 of 8 | pending: a pod of its lane's work not started | rust's pod for run 332: the recorded week took 2.5 h to start it |
+| 363 | 48.1 h | 8 of 8 | pending: its answer's job waiting for its needs | release-binary, answered by run 363 |
+| 443 | 62.7 h | 8 of 8 | pending: a pod of its lane's work not started | rust's pod for run 443: it never started in the recorded week |
+| 450 | 63.9 h | 4 of 8 | pending: a pod of its lane's work not started | rust's pod for run 450: it never started in the recorded week |
+| 453 | 64.1 h | 4 of 8 | pending: its answer's job waiting for its needs | release-binary, answered by run 453 |
+| 521 | 86.0 h | 8 of 8 | pending: a pod of its lane's work not started | rust's pod for run 521: it never started in the recorded week |
+| 524 | 86.1 h | 8 of 8 | pending: its answer's job waiting for its needs | release-binary, answered by run 524 |
+| 661 | 109.4 h | 5 of 8 | pending: its answer's job running | rust, answered by run 661 |
+| 664 | 109.4 h | 7 of 8 | pending: a pod of its lane's work not started | rust's pod for run 681: it never started in the recorded week |
+| 670 | 109.6 h | 7 of 8 | pending: a pod of its lane's work not started | rust's pod for run 689: it never started in the recorded week |
+| 673 | 109.7 h | 3 of 8 | pending: its answer's push not made yet | release-binary, answered by run 724 |
+| 677 | 109.7 h | 8 of 8 | pending: a pod of its lane's work not started | rust's pod for run 689: it never started in the recorded week |
+| 681 | 109.7 h | 8 of 8 | pending: a pod of its lane's work not started | rust's pod for run 689: it never started in the recorded week |
+| 685 | 110.0 h | 5 of 8 | pending: its answer's job waiting for its needs | ui-checks, answered by run 689 |
+| 689 | 110.2 h | 6 of 8 | pending: its answer's job running | rust, answered by run 693 |
+| 693 | 110.4 h | 5 of 8 | pending: a pod of its lane's work not started | rust's pod for run 701: it never started in the recorded week |
+| 697 | 110.9 h | 6 of 8 | pending: its answer's job running | rust, answered by run 701 |
+| 701 | 111.2 h | 4 of 8 | pending: its answer's job running | rust, answered by run 701 |
+| 705 | 111.4 h | 3 of 8 | pending: its answer's job running | rust, answered by run 705 |
+| 732 | 114.7 h | 3 of 8 | pending: its answer's job running | release-binary, answered by run 732 |
+| 766 | 121.1 h | 6 of 8 | pending: its answer's job waiting for its needs | release-binary, answered by run 770 |
+| 770 | 121.8 h | 2 of 8 | pending: its answer's job waiting for a runner | release-binary, answered by run 774 |
+| 774 | 122.4 h | 6 of 8 | pending: its answer's job waiting for a runner | release-binary, answered by run 774 |
+| 808 | 123.6 h | 1 of 8 | pending: its answer's job waiting for a runner | release-binary, answered by run 812 |
+| 812 | 123.7 h | 5 of 8 | pending: its answer's job waiting for a runner | release-binary, answered by run 812 |
+| 816 | 124.0 h | 3 of 8 | pending: its answer's job running | release-binary, answered by run 819 |
+| 831 | 125.6 h | 8 of 8 | pending: its answer's job waiting for a runner | release-binary, answered by run 831 |
+| 835 | 125.7 h | 8 of 8 | pending: its answer's job waiting for a runner | release-binary, answered by run 835 |
+| 857 | 131.5 h | 2 of 8 | pending: its answer's job running | release-binary, answered by run 857 |
+| 865 | 132.5 h | 2 of 8 | pending: its answer's job running | release-binary, answered by run 865 |
+| 873 | 134.2 h | 8 of 8 | pending: a pod of its lane's work not started | rust's pod for run 873: it never started in the recorded week |
+| 877 | 135.2 h | 8 of 8 | pending: its answer's push not made yet | ui-checks, answered by run 893 |
+| 881 | 135.4 h | 8 of 8 | pending: its answer's push not made yet | ui-checks, answered by run 893 |
+| 885 | 135.7 h | 8 of 8 | pending: its answer's push not made yet | ui-checks, answered by run 893 |
+| 889 | 136.1 h | 8 of 8 | pending: its answer's job waiting for its needs | ui-checks, answered by run 893 |
+| 893 | 136.8 h | 3 of 8 | a suspect: its bisection still going |  |
+| 913 | 141.1 h | 8 of 8 | pending: its answer's job waiting for its needs | release-binary, answered by run 917 |
+| 917 | 141.7 h | 1 of 8 | pending: its answer's job running | release-binary, answered by run 917 |
+| 935 | 148.0 h | 2 of 8 | pending: its answer's job waiting for a runner | release-binary, answered by run 935 |
+| 942 | 148.7 h | 3 of 8 | pending: its answer's job waiting for a runner | release-binary, answered by run 942 |
+| 958 | 150.6 h | 1 of 8 | pending: its answer's job running | ui-checks, answered by run 958 |
+| 965 | 151.5 h | 5 of 8 | pending: its answer's job running | release-binary, answered by run 965 |
+| 970 | 151.7 h | 1 of 8 | a suspect: its bisection still going |  |
+| 974 | 152.5 h | 3 of 8 | pending: its answer's job running | release-binary, answered by run 974 |
+| 997 | 158.0 h | 8 of 8 | pending: a pod of its lane's work not started | rust's pod for run 997: it never started in the recorded week |
+| 1001 | 158.9 h | 8 of 8 | pending: a pod of its lane's work not started | rust's pod for run 1001: it never started in the recorded week |
+| 1004 | 159.8 h | 8 of 8 | pending: its answer's job waiting for its needs | ui-checks, answered by run 1004 |
+| 1008 | 160.1 h | 4 of 8 | pending: its answer's job running | release-binary, answered by run 1008 |
+| 1017 | 165.1 h | 8 of 8 | pending: a pod of its lane's work not started | rust's pod for run 1017: it never started in the recorded week |
+| 1028 | 166.6 h | 4 of 8 | pending: its answer's job waiting for a runner | release-binary, answered by run 1032 |
+| 1032 | 166.8 h | 8 of 8 | no answer in the window |  |
+| 1036 | 167.0 h | 4 of 8 | no answer in the window |  |
+| 1039 | 167.5 h | 3 of 8 | no answer in the window |  |
+
+What holds the rest under P4, a seed's median in brackets:
+
+- **Pods the recorded week didn't start (13).** Runs 328, 332, 443, 450, 521, 664, 670, 677, 681,
+  693, 873, 997, 1001 and 1017 wait at the hour for a rust k8s pod of their lane (their own run's
+  or a later push's). The recorded week started run 332's pod 2.5 h after it was asked for; the
+  others never started: each waited for the cluster (up to 68 min) until a newer push superseded
+  it, and the replay draws a longer wait than the one recorded. No policy answers these sooner on
+  this trace.
+- **The server machine held for the bench (6, P4 alone).** release-binary runs only on the server
+  (`baremetal`, `local`), which takes no new work while the bench's exclusive job waits on its
+  cadence (W28-R62): runs 286, 293, 297, 770, 774, 808, 812, 831, 835, 935, 942 and 1028. P3 has
+  none of these: it is the price of the bench waiting 7 min instead of 20.
+- **A job running at the hour (7)**: rust or release-binary under way for a burst's commits (runs
+  661, 689, 697, 701, 705, 732, 816, 857, 865, 917, 958, 965, 974 and 1008).
+- **A job waiting for its needs (7)**: release-binary or ui-checks waiting for rust (runs 363, 453,
+  524, 685, 766, 889, 913 and 1004).
+- **A push made after the hour (4)**: runs 147, 673, 877, 881 and 885, answered by a later push's
+  run.
+- **No answer in the window (3)**: runs 20 and 265, and the week's last pushes, 1032, 1036 and 1039.
+- **A suspect's bisection still going (0)**: runs 893 and 970, in a few seeds.
+
 ## Sweeps
 
 finish_within on P3:
 
 | Policy | Wasted runner-h | ci commits with a verdict within 60 min | Verdict latency p50 | p90 | Longest gap between verdicts | Longest wait for any verdict | Bench wait p50 | Runner-h per verdict |
 |---|---|---|---|---|---|---|---|---|
-| finish_within 0 s | 4.5 (3.4–5.1) | 77.0% (74.1%–79.3%) | 21 min (20 min–23 min) | 2.7 h (2.1 h–2.8 h) | 6.8 h (6.7 h–6.8 h) | 3.5 h (3.3 h–3.5 h) | 19 min | 0.21 (0.20–0.21) |
-| finish_within 120 s | 4.2 (3.3–4.6) | 77.0% (74.1%–79.3%) | 22 min (21 min–23 min) | 2.7 h (2.1 h–2.8 h) | 6.8 h (6.7 h–6.8 h) | 3.5 h (3.3 h–3.5 h) | 19 min (19 min–20 min) | 0.21 |
-| finish_within 300 s | 2.4 (1.9–3.0) | 75.9% (74.1%–78.9%) | 21 min (21 min–23 min) | 2.7 h (2.1 h–2.8 h) | 6.8 h (6.7 h–6.8 h) | 3.5 h (3.3 h–3.5 h) | 20 min | 0.21 (0.21–0.22) |
-| finish_within 600 s | 1.4 (0.9–1.9) | 74.8% (72.6%–77.8%) | 21 min (21 min–23 min) | 2.7 h (2.1 h–3.1 h) | 6.8 h (6.7 h–6.8 h) | 3.5 h (3.3 h–3.5 h) | 21 min | 0.22 (0.21–0.22) |
-| finish_within 1200 s | 0.0 | 74.8% (72.6%–77.8%) | 21 min (21 min–23 min) | 2.7 h (2.1 h–3.1 h) | 6.8 h (6.7 h–6.8 h) | 3.5 h (3.3 h–3.5 h) | 21 min (20 min–21 min) | 0.22 (0.21–0.22) |
+| finish_within 0 s | 3.9 (3.3–4.2) | 90.0% (87.4%–91.5%) | 17 min (16 min–17 min) | 1.1 h (53 min–1.1 h) | 6.8 h (6.7 h–6.8 h) | 3.0 h (2.7 h–3.1 h) | 19 min | 0.25 (0.23–0.25) |
+| finish_within 120 s | 3.6 (3.0–3.8) | 90.0% (87.4%–91.5%) | 17 min (16 min–17 min) | 1.0 h (51 min–1.1 h) | 6.8 h (6.7 h–6.8 h) | 3.0 h (2.7 h–3.1 h) | 19 min (19 min–20 min) | 0.25 (0.23–0.25) |
+| finish_within 300 s | 2.4 (1.9–3.2) | 90.0% (87.8%–90.7%) | 17 min (16 min–18 min) | 1.0 h (53 min–1.1 h) | 6.8 h (6.7 h–6.8 h) | 3.1 h (2.7 h–3.1 h) | 20 min (20 min–21 min) | 0.26 (0.24–0.26) |
+| finish_within 600 s | 1.5 (1.2–1.9) | 90.7% (88.1%–91.5%) | 17 min (16 min–17 min) | 53 min (51 min–1.1 h) | 6.8 h (6.7 h–6.8 h) | 2.8 h (2.6 h–3.0 h) | 21 min | 0.27 (0.26–0.27) |
+| finish_within 1200 s | 0.0 | 90.7% (88.1%–91.9%) | 17 min (16 min–17 min) | 53 min (51 min–1.1 h) | 6.8 h (6.7 h–6.8 h) | 2.8 h (2.6 h–3.0 h) | 21 min (20 min–21 min) | 0.27 (0.26–0.27) |
 
 warm_credit on P3:
 
 | Policy | Wasted runner-h | ci commits with a verdict within 60 min | Verdict latency p50 | p90 | Longest gap between verdicts | Longest wait for any verdict | Bench wait p50 | Runner-h per verdict |
 |---|---|---|---|---|---|---|---|---|
-| warm_credit 0 | 2.5 (1.9–3.1) | 75.9% (74.1%–78.9%) | 21 min (21 min–23 min) | 2.7 h (2.1 h–2.8 h) | 6.8 h (6.7 h–6.8 h) | 3.5 h (3.3 h–3.5 h) | 20 min | 0.21 (0.21–0.22) |
-| warm_credit 0.25 | 2.4 (1.9–3.0) | 75.9% (74.1%–78.9%) | 21 min (21 min–23 min) | 2.7 h (2.1 h–2.8 h) | 6.8 h (6.7 h–6.8 h) | 3.5 h (3.3 h–3.5 h) | 20 min | 0.21 (0.21–0.22) |
-| warm_credit 0.5 | 2.4 (1.9–3.0) | 75.9% (74.1%–78.9%) | 21 min (21 min–23 min) | 2.7 h (2.1 h–2.8 h) | 6.8 h (6.7 h–6.8 h) | 3.5 h (3.3 h–3.5 h) | 20 min | 0.21 (0.21–0.22) |
-| warm_credit 0.75 | 2.4 (1.9–3.0) | 75.9% (74.1%–78.9%) | 21 min (21 min–23 min) | 2.7 h (2.1 h–2.8 h) | 6.8 h (6.7 h–6.8 h) | 3.5 h (3.3 h–3.5 h) | 20 min | 0.21 (0.21–0.22) |
+| warm_credit 0 | 2.5 (2.0–3.3) | 90.0% (87.4%–90.7%) | 17 min (16 min–18 min) | 1.0 h (53 min–1.1 h) | 6.8 h (6.7 h–6.8 h) | 3.1 h (2.7 h–3.1 h) | 20 min (20 min–21 min) | 0.26 (0.24–0.26) |
+| warm_credit 0.25 | 2.4 (1.9–3.2) | 90.0% (87.8%–90.7%) | 17 min (16 min–18 min) | 1.0 h (53 min–1.1 h) | 6.8 h (6.7 h–6.8 h) | 3.1 h (2.7 h–3.1 h) | 20 min (20 min–21 min) | 0.26 (0.24–0.26) |
+| warm_credit 0.5 | 2.4 (1.9–3.2) | 90.0% (87.8%–90.7%) | 17 min (16 min–18 min) | 1.0 h (53 min–1.1 h) | 6.8 h (6.7 h–6.8 h) | 3.1 h (2.7 h–3.1 h) | 20 min (20 min–21 min) | 0.26 (0.24–0.26) |
+| warm_credit 0.75 | 2.4 (1.9–3.2) | 90.0% (87.8%–90.7%) | 17 min (16 min–18 min) | 1.0 h (53 min–1.1 h) | 6.8 h (6.7 h–6.8 h) | 3.1 h (2.7 h–3.1 h) | 20 min (20 min–21 min) | 0.26 (0.24–0.26) |
 
 quiet on P4 (max_wait 600 s):
 
 | Policy | Wasted runner-h | ci commits with a verdict within 60 min | Verdict latency p50 | p90 | Longest gap between verdicts | Longest wait for any verdict | Bench wait p50 | Runner-h per verdict |
 |---|---|---|---|---|---|---|---|---|
-| quiet 0 s | 8.7 (8.0–9.1) | 75.2% (73.0%–78.5%) | 23 min (21 min–23 min) | 2.7 h (2.1 h–2.8 h) | 6.8 h (6.7 h–6.8 h) | 3.5 h (3.3 h–3.5 h) | 2 min (2 min–3 min) | 0.21 (0.21–0.22) |
-| quiet 60 s | 1.3 (0.9–1.6) | 72.6% (70.7%–74.4%) | 25 min (24 min–27 min) | 2.7 h (2.4 h–2.8 h) | 6.8 h (6.7 h–6.8 h) | 3.5 h (3.3 h–3.5 h) | 7 min (7 min–8 min) | 0.21 |
-| quiet 120 s | 1.3 (0.9–1.5) | 71.5% (70.4%–74.4%) | 25 min (24 min–27 min) | 2.7 h (2.4 h–2.8 h) | 6.8 h (6.7 h–6.8 h) | 3.5 h (3.3 h–3.5 h) | 7 min (7 min–8 min) | 0.21 (0.21–0.22) |
-| quiet 300 s | 1.3 (1.0–1.9) | 71.5% (70.4%–74.4%) | 25 min (24 min–27 min) | 2.7 h (2.4 h–2.8 h) | 6.8 h (6.7 h–6.8 h) | 3.5 h (3.3 h–3.5 h) | 7 min (7 min–8 min) | 0.22 (0.21–0.22) |
+| quiet 0 s | 0.0 (0.0–0.1) | 87.8% (85.6%–88.5%) | 19 min (18 min–19 min) | 1.2 h (1.0 h–1.3 h) | 6.8 h (6.7 h–6.8 h) | 3.1 h (2.7 h–3.3 h) | 5 min (5 min–6 min) | 0.25 (0.24–0.26) |
+| quiet 60 s | 0.3 (0.1–0.5) | 85.6% (84.8%–86.3%) | 21 min (20 min–21 min) | 1.2 h (1.1 h–1.3 h) | 6.8 h (6.7 h–6.8 h) | 3.1 h (2.7 h–3.3 h) | 7 min (7 min–8 min) | 0.25 (0.24–0.26) |
+| quiet 120 s | 0.5 (0.2–0.5) | 85.2% (85.2%–86.3%) | 21 min | 1.2 h (1.1 h–1.3 h) | 6.8 h (6.7 h–6.8 h) | 3.1 h (2.7 h–3.3 h) | 7 min (7 min–8 min) | 0.26 (0.25–0.27) |
+| quiet 300 s | 0.6 (0.3–0.7) | 85.9% (84.8%–87.4%) | 21 min (20 min–21 min) | 1.2 h (1.1 h–1.3 h) | 6.8 h (6.7 h–6.8 h) | 3.1 h (2.7 h–3.3 h) | 7 min (7 min–8 min) | 0.26 (0.25–0.27) |
 
 max_wait on P4 (quiet 60 s):
 
 | Policy | Wasted runner-h | ci commits with a verdict within 60 min | Verdict latency p50 | p90 | Longest gap between verdicts | Longest wait for any verdict | Bench wait p50 | Runner-h per verdict |
 |---|---|---|---|---|---|---|---|---|
-| max_wait 300 s | 1.3 (0.9–1.6) | 72.6% (70.7%–74.4%) | 25 min (24 min–27 min) | 2.7 h (2.4 h–2.8 h) | 6.8 h (6.7 h–6.8 h) | 3.5 h (3.3 h–3.5 h) | 7 min (7 min–8 min) | 0.21 |
-| max_wait 600 s | 1.3 (0.9–1.6) | 72.6% (70.7%–74.4%) | 25 min (24 min–27 min) | 2.7 h (2.4 h–2.8 h) | 6.8 h (6.7 h–6.8 h) | 3.5 h (3.3 h–3.5 h) | 7 min (7 min–8 min) | 0.21 |
-| max_wait 900 s | 1.3 (0.9–1.6) | 72.6% (70.7%–74.4%) | 25 min (24 min–27 min) | 2.7 h (2.4 h–2.8 h) | 6.8 h (6.7 h–6.8 h) | 3.5 h (3.3 h–3.5 h) | 7 min (7 min–8 min) | 0.21 |
-| max_wait 1800 s | 1.3 (0.9–1.6) | 72.6% (70.7%–74.4%) | 25 min (24 min–27 min) | 2.7 h (2.4 h–2.8 h) | 6.8 h (6.7 h–6.8 h) | 3.5 h (3.3 h–3.5 h) | 7 min (7 min–8 min) | 0.21 |
+| max_wait 300 s | 0.3 (0.1–0.5) | 85.6% (84.8%–86.3%) | 21 min (20 min–21 min) | 1.2 h (1.1 h–1.3 h) | 6.8 h (6.7 h–6.8 h) | 3.1 h (2.7 h–3.3 h) | 7 min (7 min–8 min) | 0.25 (0.24–0.26) |
+| max_wait 600 s | 0.3 (0.1–0.5) | 85.6% (84.8%–86.3%) | 21 min (20 min–21 min) | 1.2 h (1.1 h–1.3 h) | 6.8 h (6.7 h–6.8 h) | 3.1 h (2.7 h–3.3 h) | 7 min (7 min–8 min) | 0.25 (0.24–0.26) |
+| max_wait 900 s | 0.3 (0.1–0.5) | 85.6% (84.8%–86.3%) | 21 min (20 min–21 min) | 1.2 h (1.1 h–1.3 h) | 6.8 h (6.7 h–6.8 h) | 3.1 h (2.7 h–3.3 h) | 7 min (7 min–8 min) | 0.25 (0.24–0.26) |
+| max_wait 1800 s | 0.3 (0.1–0.5) | 85.6% (84.8%–86.3%) | 21 min (20 min–21 min) | 1.2 h (1.1 h–1.3 h) | 6.8 h (6.7 h–6.8 h) | 3.1 h (2.7 h–3.3 h) | 7 min (7 min–8 min) | 0.25 (0.24–0.26) |
 
 cadence on P4:
 
 | Policy | Wasted runner-h | ci commits with a verdict within 60 min | Verdict latency p50 | p90 | Longest gap between verdicts | Longest wait for any verdict | Bench wait p50 | Runner-h per verdict |
 |---|---|---|---|---|---|---|---|---|
-| cadence on | 1.3 (0.9–1.6) | 72.6% (70.7%–74.4%) | 25 min (24 min–27 min) | 2.7 h (2.4 h–2.8 h) | 6.8 h (6.7 h–6.8 h) | 3.5 h (3.3 h–3.5 h) | 7 min (7 min–8 min) | 0.21 |
-| cadence off | 2.6 (1.8–3.0) | 75.9% (74.1%–78.9%) | 21 min (21 min–23 min) | 2.7 h (2.1 h–2.8 h) | 6.8 h (6.7 h–6.8 h) | 3.5 h (3.3 h–3.5 h) | 20 min (20 min–21 min) | 0.21 (0.21–0.22) |
+| cadence on | 0.3 (0.1–0.5) | 85.6% (84.8%–86.3%) | 21 min (20 min–21 min) | 1.2 h (1.1 h–1.3 h) | 6.8 h (6.7 h–6.8 h) | 3.1 h (2.7 h–3.3 h) | 7 min (7 min–8 min) | 0.25 (0.24–0.26) |
+| cadence off | 2.5 (2.0–2.8) | 90.0% (87.4%–91.1%) | 17 min (16 min–17 min) | 1.0 h (52 min–1.1 h) | 6.8 h (6.7 h–6.8 h) | 3.1 h (2.7 h–3.1 h) | 21 min (20 min–21 min) | 0.26 (0.24–0.26) |
 
 speculation window on P4 (bisection runs; floor 1, cap 20):
 
 | Policy | Wasted runner-h | ci commits with a verdict within 60 min | Verdict latency p50 | p90 | Longest gap between verdicts | Longest wait for any verdict | Bench wait p50 | Runner-h per verdict |
 |---|---|---|---|---|---|---|---|---|
-| window 1 | 1.3 (0.9–1.6) | 72.6% (70.7%–74.4%) | 25 min (24 min–27 min) | 2.7 h (2.4 h–2.8 h) | 6.8 h (6.7 h–6.8 h) | 3.5 h (3.3 h–3.5 h) | 7 min (7 min–8 min) | 0.21 |
-| window 2 | 1.3 (0.9–1.6) | 72.6% (70.7%–74.4%) | 25 min (24 min–27 min) | 2.7 h (2.4 h–2.8 h) | 6.8 h (6.7 h–6.8 h) | 3.5 h (3.3 h–3.5 h) | 7 min (7 min–8 min) | 0.21 |
-| window 4 | 1.3 (0.9–1.6) | 72.6% (70.7%–74.4%) | 25 min (24 min–27 min) | 2.7 h (2.4 h–2.8 h) | 6.8 h (6.7 h–6.8 h) | 3.5 h (3.3 h–3.5 h) | 7 min (7 min–8 min) | 0.21 |
-| window 8 | 1.3 (0.9–1.6) | 72.6% (70.7%–74.4%) | 25 min (24 min–27 min) | 2.7 h (2.4 h–2.8 h) | 6.8 h (6.7 h–6.8 h) | 3.5 h (3.3 h–3.5 h) | 7 min (7 min–8 min) | 0.21 |
-| no window | 1.3 (0.9–1.6) | 72.6% (70.7%–74.4%) | 25 min (24 min–27 min) | 2.7 h (2.4 h–2.8 h) | 6.8 h (6.7 h–6.8 h) | 3.5 h (3.3 h–3.5 h) | 7 min (7 min–8 min) | 0.21 |
+| window 1 | 0.3 (0.1–0.5) | 85.6% (84.8%–86.3%) | 21 min (20 min–21 min) | 1.2 h (1.1 h–1.3 h) | 6.8 h (6.7 h–6.8 h) | 3.1 h (2.7 h–3.3 h) | 7 min (7 min–8 min) | 0.25 (0.24–0.26) |
+| window 2 | 0.3 (0.1–0.5) | 85.6% (84.8%–86.3%) | 21 min (20 min–21 min) | 1.2 h (1.1 h–1.3 h) | 6.8 h (6.7 h–6.8 h) | 3.1 h (2.7 h–3.3 h) | 7 min (7 min–8 min) | 0.25 (0.24–0.26) |
+| window 4 | 0.3 (0.1–0.5) | 85.6% (84.8%–86.3%) | 21 min (20 min–21 min) | 1.2 h (1.1 h–1.3 h) | 6.8 h (6.7 h–6.8 h) | 3.1 h (2.7 h–3.3 h) | 7 min (7 min–8 min) | 0.25 (0.24–0.26) |
+| window 8 | 0.3 (0.1–0.5) | 85.6% (84.8%–86.3%) | 21 min (20 min–21 min) | 1.2 h (1.1 h–1.3 h) | 6.8 h (6.7 h–6.8 h) | 3.1 h (2.7 h–3.3 h) | 7 min (7 min–8 min) | 0.25 (0.24–0.26) |
+| no window | 0.3 (0.1–0.5) | 85.6% (84.8%–86.3%) | 21 min (20 min–21 min) | 1.2 h (1.1 h–1.3 h) | 6.8 h (6.7 h–6.8 h) | 3.1 h (2.7 h–3.3 h) | 7 min (7 min–8 min) | 0.25 (0.24–0.26) |
 
 image_compile_share on P5 (assumed: the trace can't split the image's build):
 
 | Policy | Wasted runner-h | ci commits with a verdict within 60 min | Verdict latency p50 | p90 | Longest gap between verdicts | Longest wait for any verdict | Bench wait p50 | Runner-h per verdict |
 |---|---|---|---|---|---|---|---|---|
-| image_compile_share 0 | 1.3 (0.9–1.4) | 74.1% (71.9%–75.9%) | 25 min (24 min–26 min) | 2.7 h (2.4 h–2.8 h) | 6.8 h (6.7 h–6.8 h) | 3.5 h (3.3 h–3.5 h) | 7 min (7 min–8 min) | 0.20 |
-| image_compile_share 0.3 | 1.3 (0.9–1.4) | 74.1% (71.9%–75.9%) | 25 min (24 min–26 min) | 2.7 h (2.4 h–2.8 h) | 6.8 h (6.7 h–6.8 h) | 3.5 h (3.3 h–3.5 h) | 7 min (7 min–8 min) | 0.20 |
-| image_compile_share 0.6 | 1.3 (0.9–1.4) | 74.1% (71.9%–75.9%) | 25 min (24 min–26 min) | 2.7 h (2.4 h–2.8 h) | 6.8 h (6.7 h–6.8 h) | 3.5 h (3.3 h–3.5 h) | 7 min (7 min–8 min) | 0.20 |
+| image_compile_share 0 | 0.2 (0.1–0.5) | 86.7% (85.6%–87.4%) | 21 min (20 min–21 min) | 1.2 h (1.0 h–1.2 h) | 6.8 h (6.7 h–6.8 h) | 3.0 h (2.7 h–3.1 h) | 7 min (7 min–8 min) | 0.23 (0.22–0.24) |
+| image_compile_share 0.3 | 0.2 (0.1–0.5) | 86.7% (85.6%–87.4%) | 21 min (20 min–21 min) | 1.2 h (1.0 h–1.2 h) | 6.8 h (6.7 h–6.8 h) | 3.0 h (2.7 h–3.1 h) | 7 min (7 min–8 min) | 0.23 (0.22–0.24) |
+| image_compile_share 0.6 | 0.2 (0.1–0.5) | 86.7% (85.6%–87.4%) | 21 min (20 min–21 min) | 1.2 h (1.0 h–1.2 h) | 6.8 h (6.7 h–6.8 h) | 3.0 h (2.7 h–3.1 h) | 7 min (7 min–8 min) | 0.23 (0.22–0.24) |
+
+overflow on P3 and P4 (W28-R80: a pod not started by then gives way to a Linux machine's slot):
+
+| Policy | Wasted runner-h | ci commits with a verdict within 60 min | Verdict latency p50 | p90 | Longest gap between verdicts | Longest wait for any verdict | Bench wait p50 | Runner-h per verdict |
+|---|---|---|---|---|---|---|---|---|
+| P3, no overflow | 2.4 (1.9–3.2) | 90.0% (87.8%–90.7%) | 17 min (16 min–18 min) | 1.0 h (53 min–1.1 h) | 6.8 h (6.7 h–6.8 h) | 3.1 h (2.7 h–3.1 h) | 20 min (20 min–21 min) | 0.26 (0.24–0.26) |
+| P3, overflow after 120 s | 2.4 (1.8–3.0) | 99.6% (98.5%–100.0%) | 13 min (13 min–14 min) | 36 min (34 min–36 min) | 6.7 h (6.6 h–6.7 h) | 49 min (40 min–1.8 h) | 20 min (19 min–21 min) | 0.28 (0.27–0.28) |
+| P3, overflow after 300 s | 2.5 (1.7–3.2) | 99.6% (98.5%–100.0%) | 14 min (13 min–14 min) | 37 min (36 min–38 min) | 6.7 h (6.6 h–6.8 h) | 51 min (51 min–1.4 h) | 20 min (20 min–21 min) | 0.27 (0.26–0.28) |
+| P3, overflow after 600 s | 2.5 (2.0–3.3) | 99.6% (98.5%–100.0%) | 15 min (15 min–16 min) | 39 min (37 min–41 min) | 6.8 h (6.7 h–6.8 h) | 57 min (51 min–1.4 h) | 21 min (20 min–21 min) | 0.27 (0.26–0.28) |
+| P4, no overflow | 0.3 (0.1–0.5) | 85.6% (84.8%–86.3%) | 21 min (20 min–21 min) | 1.2 h (1.1 h–1.3 h) | 6.8 h (6.7 h–6.8 h) | 3.1 h (2.7 h–3.3 h) | 7 min (7 min–8 min) | 0.25 (0.24–0.26) |
+| P4, overflow after 120 s | 0.2 (0.1–0.4) | 95.2% (94.1%–97.0%) | 14 min (13 min–14 min) | 42 min (40 min–46 min) | 6.7 h (6.6 h–6.7 h) | 1.2 h (1.1 h–1.8 h) | 7 min (7 min–8 min) | 0.27 (0.27–0.28) |
+| P4, overflow after 300 s | 0.3 (0.1–0.6) | 95.2% (94.1%–96.7%) | 14 min (14 min–15 min) | 43 min (40 min–47 min) | 6.7 h (6.6 h–6.8 h) | 1.2 h (1.1 h–1.4 h) | 7 min (7 min–8 min) | 0.27 (0.27–0.28) |
+| P4, overflow after 600 s | 0.3 (0.1–0.7) | 95.2% (94.1%–96.7%) | 17 min (16 min–17 min) | 45 min (42 min–49 min) | 6.8 h (6.7 h–6.8 h) | 1.2 h (1.1 h–1.4 h) | 7 min (7 min–8 min) | 0.27 (0.27–0.28) |
 
 ## The land queue
 
