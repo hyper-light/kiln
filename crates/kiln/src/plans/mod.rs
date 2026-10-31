@@ -62,6 +62,42 @@ pub struct Plan {
     pub reviewed: Option<review::Reviewed>,
 }
 
+/// A plan in brief, as a list shows it (`brief`): what it is and where it stands, without its
+/// words, its items or its steps' titles (a kiln's plans in full run to megabytes).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Brief {
+    pub id: String,
+    pub title: String,
+    pub tags: Vec<String>,
+    pub source: Option<Source>,
+    pub share: Option<String>,
+    pub version: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+    /// How many steps it has: its items, else its body's top-level list items.
+    pub step_count: usize,
+    pub runs: i64,
+    pub phase: String,
+    pub research: Option<String>,
+}
+
+pub fn brief(p: &Plan) -> Brief {
+    Brief {
+        id: p.id.clone(),
+        title: p.title.clone(),
+        tags: p.tags.clone(),
+        source: p.source.clone(),
+        share: p.share.clone(),
+        version: p.version,
+        created_at: p.created_at,
+        updated_at: p.updated_at,
+        step_count: p.steps.len(),
+        runs: p.runs,
+        phase: p.phase.clone(),
+        research: p.research.clone(),
+    }
+}
+
 /// One step of a plan: a piece of the work, what it's like, what makes it done, and how it's
 /// tested.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1286,6 +1322,32 @@ mod tests {
         assert!(p.is_some_and(|p| p.items.is_none()), "steps not given stay as they are");
         let n = serde_json::from_value::<New>(serde_json::json!({"title": "t", "items": [{"title": "a"}]})).ok();
         assert_eq!(n.map(|n| n.items.len()), Some(1));
+    }
+
+    #[test]
+    fn a_plan_in_brief_says_how_many_steps_without_its_words() -> anyhow::Result<()> {
+        let p = Plan {
+            id: "p".into(),
+            title: "T".into(),
+            body: "Why, at length.\n\n- a\n- b".into(),
+            items: vec![],
+            tags: vec!["t".into()],
+            source: Some(Source { session: Some("s1".into()), proposed: true, ..Source::default() }),
+            share: None,
+            version: 3,
+            created_at: 1,
+            updated_at: 2,
+            steps: vec!["a".into(), "b".into()],
+            runs: 1,
+            phase: "ready".into(),
+            research: None,
+            reviewed: None,
+        };
+        let b = serde_json::to_value(brief(&p))?;
+        assert_eq!(b.get("step_count"), Some(&serde_json::json!(2)));
+        assert_eq!(b.get("source").and_then(|s| s.get("session")), Some(&serde_json::json!("s1")));
+        assert!(["body", "items", "steps"].iter().all(|k| b.get(k).is_none()), "{b}");
+        Ok(())
     }
 
     #[test]

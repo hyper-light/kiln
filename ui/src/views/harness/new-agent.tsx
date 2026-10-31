@@ -19,6 +19,7 @@ import { clientId, harnessApi, sessionStore, type AgentInfo, type KindInfo, type
 import type { Agent, ReachRunner, TerminalSessionInfo } from "@/api/types";
 import { Loadable } from "@/components/ui/loading";
 import { Tip } from "@/components/ui/tooltip";
+import { useRes, type Res } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage, useLocalStorage, useNow } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
@@ -62,6 +63,9 @@ const askMachines = (signal: AbortSignal): Promise<Machines> =>
   ]).then(([byTarget, machines, shells, reach, workspaces]) => ({ byTarget, machines, shells, reach, workspaces }));
 /** Read again now and then: a machine connects, a harness is installed. */
 const MACHINES = { pollMs: 60_000 } as const;
+
+/** The machines' answer, as the composer reads it: Mission control asks for it with its agents, so its page comes whole. */
+export const machinesRes: Res<Machines> = { key: "harness/spawn", fetch: askMachines, opts: MACHINES };
 
 const COUNTS = [1, 2, 3, 4, 6, 8, 12];
 type Part = "machine" | null;
@@ -213,7 +217,7 @@ function resolve(c: Choices, m: Machines) {
 type Setup = ReturnType<typeof resolve>;
 
 function useSetup(c: Choices): Setup {
-  return resolve(c, useSuspenseResource("harness/spawn", askMachines, MACHINES).data);
+  return resolve(c, useRes(machinesRes).data);
 }
 
 /** Above the box: the agent page's own line, for the agent to be. */
@@ -531,6 +535,48 @@ const LineLoading = () => (
   </div>
 );
 
+/** More options before the machines have answered: there, turned off, so nothing under it moves when they do. */
+const UnderLoading = () => (
+  <div className="mc-under">
+    <button type="button" className="mc-toggle" disabled>
+      More options
+      <ChevronDown size={12} className="mc-chev" aria-hidden="true" />
+    </button>
+  </div>
+);
+
+const NO_FIELD: React.RefObject<HTMLTextAreaElement | null> = { current: null };
+const IGNORE = () => undefined;
+
+/**
+ * The composer before Mission control has its agents (its page's skeleton, mission.tsx): its own
+ * parts with what's written in it, none of them usable yet, so nothing moves when it comes.
+ */
+export function NewAgentLoading({ text }: { text: string }) {
+  return (
+    <section className="ms-msg cp mc" aria-hidden="true" inert>
+      <LineLoading />
+      <div className="ms-msg-field">
+        <div className="hx-compose-box">
+          <ComposeField text={text} readOnly placeholder="What should it do?" />
+          <div className="cp-bar">
+            <button type="button" className="cp-icon" disabled>
+              <Paperclip size={15} />
+            </button>
+            <MicButton field={NO_FIELD} setText={IGNORE} onNote={IGNORE} disabled />
+            <span className="cp-gap" />
+            <button type="button" className="cp-send" data-mode="send" disabled>
+              <ArrowUp size={15} />
+              <span>Start</span>
+            </button>
+          </div>
+        </div>
+      </div>
+      <UnderLoading />
+    </section>
+  );
+}
+
 export function NewAgent({
   text,
   onText,
@@ -789,7 +835,7 @@ export function NewAgent({
           </div>
         )}
       </div>
-      <React.Suspense fallback={null}>
+      <React.Suspense fallback={<UnderLoading />}>
         <Under c={c} more={more} setMore={setMore} past={past} setPast={setPast} onResume={(s, p) => void resume(s, p)} />
       </React.Suspense>
       {(starting || error || result || note) && (
