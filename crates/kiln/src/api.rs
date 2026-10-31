@@ -2182,6 +2182,10 @@ async fn plans_list(hub: &Hub, q: &HashMap<String, String>) -> R {
     // An agent's (`session`), and the plan each agent proposed (`proposed`), when asked.
     let proposed = q.get("proposed").is_some_and(|p| p == "1" || p == "true");
     let plans = crate::plans::of_source(plans, q.get("session").map(String::as_str).filter(|s| !s.is_empty()), proposed);
+    // In brief, for a list that opens each on asking (an agent's Plan tab).
+    if q.get("brief").is_some_and(|b| b == "1" || b == "true") {
+        return Ok(srv::json(StatusCode::OK, &plans.iter().map(crate::plans::brief).collect::<Vec<_>>()));
+    }
     Ok(srv::json(StatusCode::OK, &plans))
 }
 

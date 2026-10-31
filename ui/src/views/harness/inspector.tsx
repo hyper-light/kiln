@@ -14,11 +14,11 @@ import { LimitMeter, StatusList } from "./limits";
 import { McpPanel, SkillsPanel } from "./tools";
 import { TaskElapsed } from "./timeline";
 import { Background, isBackground } from "./background";
-import { PlansHere } from "@/views/plans/here";
+import { PlansSection } from "@/views/plans/browser";
 import { PlanSourceContext, SavePlan, todosAsPlan } from "@/views/plans/save";
 import { ProposedPlan, TodoSteps } from "@/views/plans/its-plan";
 import { ReviewHere, useReviewWaits } from "@/views/plans/review";
-import { AgentResearch } from "@/views/research/research";
+import { ResearchSection } from "@/views/research/research";
 import { Goals } from "./goals";
 import { LivePages } from "./live-pages";
 import { Loadable } from "@/components/ui/loading";
@@ -406,42 +406,41 @@ export function Inspector({
             <PlanSourceContext.Provider value={agentId ? { session: agentId } : null}>
               {/* A plan waiting on you (review.tsx): read and answered here, first. */}
               {agentId && <ReviewHere agent={agentId} store={store} send={send} />}
-              <Fold id="plan" title="Plan">
-                {/* Its to-do list, drawn as a plan's steps are: how far it's come. */}
-                {todos.length > 0 && (
-                  <div className="hx-stack">
-                    <TodoSteps todos={todos} />
-                    <SavePlan body={todosAsPlan(todos)} title={todos[0]?.text.slice(0, 80)} />
-                  </div>
-                )}
-                {/* The plan it proposed (plan mode), in its words, kept by kiln; while it waits on you, the review above is it. */}
-                {reviewing === "proposed" && send ? (
-                  <p className="in-none">Its plan waits on your review, above.</p>
-                ) : agentId ? (
-                  <Loadable label="its plan" fallback={null}>
-                    <ProposedPlan session={agentId} words={proposed} tracked={todos.length > 0} />
-                  </Loadable>
-                ) : (
-                  proposed && (
-                    <div className="hx-stack">
-                      <Prose text={proposed} className="hx-plan-text" />
-                      <SavePlan body={proposed} />
-                    </div>
-                  )
-                )}
-                {todos.length === 0 && !proposed && <p className="in-none">None yet: the plan it proposes shows here, kept by kiln as one of your plans, and its to-do list as it works through it.</p>}
-              </Fold>
-              {/* What it found out, graded by kiln (research.tsx): the newest in full. */}
-              {agentId && (
-                <Loadable label="its research" fallback={null}>
-                  <AgentResearch agent={agentId} brief={reviewing === "goal"} />
-                </Loadable>
-              )}
-              {agentId && (
-                <Fold id="your-plans" title="Your plans">
-                  <PlansHere session={agentId} />
-                </Fold>
-              )}
+              {/* The plan under way as it moves, then every plan kept, to find and recall (browser.tsx). */}
+              <PlansSection
+                session={agentId}
+                active={
+                  <>
+                    {/* Its to-do list, drawn as a plan's steps are: how far it's come. */}
+                    {todos.length > 0 && (
+                      <div className="hx-stack">
+                        <TodoSteps todos={todos} />
+                        <SavePlan body={todosAsPlan(todos)} title={todos[0]?.text.slice(0, 80)} />
+                      </div>
+                    )}
+                    {/* The plan it proposed (plan mode), in its words, kept by kiln; while it waits on you, the review above is it. */}
+                    {reviewing === "proposed" && send ? (
+                      <p className="in-none">Its plan waits on your review, above.</p>
+                    ) : agentId ? (
+                      <Loadable label="its plan" fallback={null}>
+                        <ProposedPlan session={agentId} words={proposed} tracked={todos.length > 0} />
+                      </Loadable>
+                    ) : (
+                      proposed && (
+                        <div className="hx-stack">
+                          <Prose text={proposed} className="hx-plan-text" />
+                          <SavePlan body={proposed} />
+                        </div>
+                      )
+                    )}
+                    {todos.length === 0 && !proposed && (
+                      <p className="in-none">None yet: the plan it proposes shows here, kept by kiln as one of your plans, and its to-do list as it works through it.</p>
+                    )}
+                  </>
+                }
+              />
+              {/* What agents found out, graded by kiln (research.tsx): to search, a card each, in brief until opened. */}
+              {agentId && <ResearchSection agent={agentId} />}
               {agentId && <Goals agent={agentId} harness={harness} working={working} store={store} onOpenTask={onOpenTask} />}
             </PlanSourceContext.Provider>
           </div>

@@ -1308,10 +1308,14 @@ html[data-motion="paused"] .ms-pick::before {
     height: 24px;
   }
 }
-/* Before the agents are known (RowsLoading): the bar and a few rows, in their own sizes. */
+/* Before the agents are known (PageLoading): the page's parts in their own sizes, and a few rows. The
+   stands' line holds its room unseen (a count of nothing would say something); the bar fills the filter's. */
+.ms-loading-sd {
+  visibility: hidden;
+}
 .ms-loading-bar {
-  height: 40px;
-  margin-bottom: 18px;
+  flex: 1 1 auto;
+  height: var(--field-h);
   border-radius: 7px;
 }
 .ms-row.ms-loading-row {
@@ -1339,6 +1343,10 @@ html[data-motion="paused"] .ms-pick::before {
 .mc-mode {
   display: flow-root;
   animation: mc-in 0.14s ease-out;
+}
+/* The composer the page opens with shows as it is: only a turn crossfades. */
+.mc-mode[data-first] {
+  animation: none;
 }
 @keyframes mc-in {
   from {

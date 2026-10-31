@@ -47,9 +47,6 @@ async function onTheField(field: Locator) {
 test("Mission control's composers mark what's typed as an agent's composer does", async ({ page }, info) => {
   test.skip(REAL, "the mock's agents");
   await page.goto("/agents");
-  // The machines' answer in (the line over the box, More options under it), so the list under them stays put.
-  await expect(page.locator(".mc-how .rs-v").first()).toBeVisible();
-  await expect(page.locator(".mc-toggle")).toBeVisible();
 
   // Starting an agent: its first message's Markdown, marked as it's typed.
   const start = page.getByRole("textbox", { name: "Its first message" });
