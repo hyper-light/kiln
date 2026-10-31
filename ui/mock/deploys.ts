@@ -130,7 +130,7 @@ const KILN_GROUPS: ShipDeployGroup[] = [
     items: [item("ConfigMap", "kiln-config", "changes", "differs from git", { ns: "kiln", differs: true }), item("Secret", "kiln", "healthy", "synced", { ns: "kiln" })],
   },
   { name: "Storage", note: "synced", owner: null, items: [item("PersistentVolumeClaim", "kiln-data", "healthy", "Bound · 200Gi", { ns: "kiln" })] },
-  { name: "Jobs", note: "", owner: null, items: [item("Job", "kiln-guard-94lwq", "passed", "completed · made 12h ago", { group: "batch", ns: "kiln", logs: true })] },
+  { name: "Jobs", note: "", owner: null, items: [item("Job", "kiln-guard-94lwq", "passed", "completed 12h ago", { group: "batch", ns: "kiln", logs: true })] },
 ];
 
 /** A workload and its config, for the others' panes. */
@@ -279,9 +279,9 @@ const APPS: App[] = [
         id: "in-cluster|apps/Rollout/quiver/quiver",
         revision: "1f9b2c4",
         state: "requested",
-        note: "20% · step 2 of 3 · waiting for approval",
+        note: "canary · 20% · waiting for approval",
         steps: [
-          { n: 1, state: "passed", what: "weight 20%", v: "done" },
+          { n: 1, state: "passed", what: "weight 20%", v: "done 4m" },
           { n: 2, state: "requested", what: "a person approves", v: "waiting for approval" },
           { n: 3, state: "none", what: "weight 100%", v: "next" },
         ],
@@ -291,6 +291,13 @@ const APPS: App[] = [
         deploy: 39,
         back_to: 38,
         weight: 20,
+        strategy: "canary",
+        said: "waiting for approval",
+        promote_to: 100,
+        sides: [
+          { side: "stable", name: "quiver-5c7d9b", pods: 3, share: 80, up: null },
+          { side: "canary", name: "quiver-6f1c02", pods: 1, share: 20, up: "4m" },
+        ],
       },
       history: [
         deploy(39, "1f9b2c4", "Quiver: a follower's vote waits for its grant", 2 * DAY, { now: true }),
@@ -310,10 +317,10 @@ const APPS: App[] = [
       namespace: "quiver-staging",
       stand: "shipping",
       word: "Syncing",
-      line: "syncing 7ac3e1d",
+      line: "#42 · syncing 7ac3e1d",
       pips: pips("running", "none", "none"),
       by: "auto-sync",
-      ago: 10,
+      ago: 2,
       runs: "1f9b2c4",
       sync: "OutOfSync",
       health: "Progressing",
@@ -409,7 +416,7 @@ function seen(a: App, mine: Acts): { row: ShipDeployRow; pane: Omit<ShipDeployPa
       row.line = auto ? "#153 runs 15878aa · trunk is 2 ahead · auto-sync syncs it" : a.row.line;
     }
   }
-  if (a.row.app === "default/quiver-staging" && mine.tick > 0) row.line = `syncing 7ac3e1d · wave ${Math.min(mine.tick + 1, 3)} of 3`;
+  if (a.row.app === "default/quiver-staging" && mine.tick > 0) row.line = `#42 · wave ${Math.min(mine.tick + 1, 3)} of 3`;
   delete (row as Partial<App["row"]>).ago;
   return { row, pane };
 }

@@ -298,6 +298,12 @@ export interface ShipDeployRollout {
   deploy?: number | null;
   back_to?: number | null;
   weight?: number;
+  /** `canary` or `blue/green`; how it's going in a few words; the share Promote moves it to now. */
+  strategy?: string;
+  said?: string;
+  promote_to?: number | null;
+  /** On a cluster: its workload's ReplicaSet that ran (`stable`) and the newest (`canary`). */
+  sides?: { side: "stable" | "canary"; name: string; pods: number; share: number; up: string | null }[];
 }
 
 export interface ShipDeploySetting {

@@ -32,6 +32,7 @@ import { FacetBox, type Chosen } from "@/components/ui/facet-box";
 import { Loadable, Loading } from "@/components/ui/loading";
 import { EmptyState, PageIntro } from "@/components/ui/misc";
 import { JourneyStrip, StatusGlyph } from "@/components/ui/status-glyph";
+import { GLYPHS } from "@/components/ui/status-glyph-spec";
 import { toast } from "@/components/ui/toast";
 import { errorMessage, useMediaQuery } from "@/lib/hooks";
 import { useSearchParams } from "@/lib/router";
@@ -125,6 +126,9 @@ function DeploysList() {
   );
 }
 
+/** Who did it, as the stills name them: a person or kiln by name, an agent by its id's first eight, and whom it acted for (`agent:01a18b08 for admin`). */
+const byWord = (by: string) => by.replace(/\bagent:([0-9a-z]{8})[0-9a-z]*/gi, "agent:$1").replace(/\buser:/g, "");
+
 /** A row a link opened the page on, brought into view as it's first drawn. */
 const intoView = (el: HTMLLIElement | null) => el?.scrollIntoView({ block: "start" });
 
@@ -148,18 +152,20 @@ function DeployRow({ row, open, landed, onOpen }: { row: ShipDeployRow; open: bo
           <JourneyStrip pips={strip(row.pips)} />
         </span>
         <span className="ship-metas">
-          {/* Who and when: the when whole, in the fewest words; the who cut short where the two run long. */}
+          {/* Who and when, the when whole and in the fewest words; an agent with whom it acted for instead, as the stills draw it. */}
           <span className="dp-by">
             {row.by ? (
-              <>
-                <span className="ship-who">
-                  <StatusGlyph state={row.by.startsWith("agent:") ? "agent" : "person"} size={12} />
-                  <span>{whoSaid(row.by)}</span>
-                </span>
-                <span>·</span>
-              </>
+              <span className="ship-who">
+                <StatusGlyph state={row.by.startsWith("agent:") ? "agent" : "person"} size={12} />
+                <span>{byWord(row.by)}</span>
+              </span>
             ) : null}
-            <span className="dp-ago">{row.at ? since(row.at * 1000) : "never"}</span>
+            {row.by?.includes(" for ") ? null : (
+              <>
+                {row.by ? <span>·</span> : null}
+                <span className="dp-ago">{row.at ? since(row.at * 1000) : "never"}</span>
+              </>
+            )}
           </span>
           <span className="ship-m2">
             {row.environment ? (
@@ -365,17 +371,12 @@ function DeployPane({ row }: { row: ShipDeployRow }) {
               { label: "Stop", on: !busy && !no("stop"), run: () => setArmed("stop") },
             ];
   const say = armed ? armedSay(armed, row, p, back) : said ? said.text : pickSay(p, row, shown, picked, pick.word, rollout);
+  // The words pick objects: they show while an object (or nothing) is picked, a picked one lighting its own.
+  const words = !armed && !setting && !line && !deleting && !shown?.kind.startsWith("step");
+  const one = !pick.word && picked.length === 1 ? picked[0] : undefined;
+  const lit = (w: Word): boolean | "mixed" => (pick.word === w ? true : one && w !== "all" && (w === "out of sync" ? one.item.differs : UNHEALTHY.has(one.item.state)) ? "mixed" : false);
   const stripOf = (live: boolean) => (
-    <Strip
-      live={live}
-      say={say}
-      tone={armed === "refresh" || armed === "rollback" ? "ask" : armed || said?.refused ? "warn" : undefined}
-      asks={armed != null}
-      word={setting || line || deleting ? null : pick.word}
-      words={!setting && !line && !deleting && !shown?.kind.startsWith("step")}
-      onWord={onWord}
-      verbs={verbs}
-    />
+    <Strip live={live} say={say} tone={armed === "refresh" || armed === "rollback" ? "ask" : armed || said?.refused ? "warn" : undefined} words={words} lit={lit} onWord={onWord} verbs={verbs} />
   );
   const detail = shown ? <Detail pane={p} row={row} shown={shown} rows={phone ? PHONE_ROWS : SIDE_ROWS} /> : null;
   const below = (k: Key) =>
@@ -430,6 +431,7 @@ function DeployPane({ row }: { row: ShipDeployRow }) {
                     <Line
                       k={`o:${i.key}`}
                       state={i.state}
+                      quiet={Boolean(g.owner) && i.group === "apps" && i.kind === "ReplicaSet"}
                       kind={KIND_WORD[i.kind] ?? i.kind}
                       name={i.name}
                       v={i.v}
@@ -531,6 +533,7 @@ function Line({
   name,
   v,
   dim,
+  quiet,
   picked,
   at,
   onLine,
@@ -543,12 +546,14 @@ function Line({
   name: string;
   v: string;
   dim?: boolean;
+  /** Drawn quiet (the slashed ring), its own state its glyph's name: a workload's ReplicaSet, whose pods carry how it runs. */
+  quiet?: boolean;
   picked: boolean;
   at: boolean;
   onLine: (k: Key) => void;
   onGlyph?: (k: Key) => void;
 }) {
-  const glyph = <StatusGlyph state={glyphOf(state)} size={12} />;
+  const glyph = quiet ? <StatusGlyph state="superseded" size={12} label={GLYPHS[glyphOf(state)].word} /> : <StatusGlyph state={glyphOf(state)} size={12} />;
   return (
     <li className="jp-j" data-key={k} data-sel={picked || undefined} data-at={at || undefined} data-dim={dim || undefined} data-state={state}>
       {onGlyph ? (
@@ -612,34 +617,33 @@ function Strip({
   live,
   say,
   tone,
-  asks,
-  word,
   words,
+  lit,
   onWord,
   verbs,
 }: {
   live: boolean;
   say: React.ReactNode;
   tone: "warn" | "ask" | undefined;
-  /** Asked again: the question has the words' room too. */
-  asks: boolean;
-  word: Word | null;
+  /** The words pick objects: where they don't apply (a question, a setting, a commit, a step), what's said has their room, the strip its height. */
   words: boolean;
+  /** A word's state: picked by it, or the one picked object's own. */
+  lit: (w: Word) => boolean | "mixed";
   onWord: (w: Word) => void;
   verbs: Verb[];
 }) {
   return (
     <div className="jp-strip">
-      <div className="jp-say" data-tone={tone} data-asks={asks || undefined}>
+      <div className="jp-say" data-tone={tone} data-room={!words || undefined}>
         <div className="jp-said" aria-live={live ? "polite" : undefined}>
           {say}
         </div>
-        <div className="jp-q" data-off={!words || undefined}>
+        <div className="jp-q" aria-hidden={!words || undefined}>
           <span>pick:</span>
           {WORDS.map((w, i) => (
             <React.Fragment key={w}>
               {i ? <span aria-hidden>·</span> : null}
-              <button type="button" aria-pressed={word === w} disabled={!words} onClick={() => onWord(w)}>
+              <button type="button" aria-pressed={lit(w)} disabled={!words} onClick={() => onWord(w)}>
                 {w}
               </button>
             </React.Fragment>
@@ -701,6 +705,11 @@ function pickSay(p: ShipDeployPane, row: ShipDeployRow, shown: Shown | null, pic
           </b>{" "}
           picked · {i.node ? `running on ${i.node} · ` : ""}
           {i.v}
+          {i.differs ? (
+            <Loadable label="Reading what differs" fallback={<></>}>
+              <Keys app={row.app} item={i} />
+            </Loadable>
+          ) : null}
           {i.differs ? " · Sync applies just this object" : ""}
         </>
       );
@@ -715,13 +724,15 @@ function pickSay(p: ShipDeployPane, row: ShipDeployRow, shown: Shown | null, pic
         </>
       );
     }
-    case "step":
+    case "step": {
+      const r = shown.rollout;
       return (
         <>
-          <b>{rolloutName(shown.rollout)}</b> picked · {shown.rollout.note}
-          {rollout ? " · Promote moves it on now" : ""}
+          <b>{rolloutName(r)}</b> picked · {r.strategy ? `${r.strategy} at ${r.weight ?? 0}%, ${r.said ?? ""}` : r.note}
+          {rollout ? (r.promote_to != null ? ` · Promote moves it to ${r.promote_to}% now` : " · Promote moves it on now") : ""}
         </>
       );
+    }
     case "setting": {
       const s = shown.setting;
       return (
@@ -879,12 +890,26 @@ function ManifestBody({ app, k }: { app: string; k: CdResourceKey }) {
   return <pre className="dp-op">{r.live ?? r.desired ?? "Not in the cluster."}</pre>;
 }
 
-function DiffBody({ app, item, trunk }: { app: string; item: ShipDeployItem; trunk: string | null }) {
-  const diffs = useSuspenseResource(`ship/deploy/${app}/diff`, (s) => cdApi.diff(app, s), { on: CD_EVENTS }).data.diffs;
-  const d = diffs.find((x) => x.key.kind === item.kind && x.key.name === item.name && x.key.namespace === item.namespace && x.key.group === item.group);
+/** An app's diff, as CD says it: what differs in each of its objects. */
+const useDiffs = (app: string) => useSuspenseResource(`ship/deploy/${app}/diff`, (s) => cdApi.diff(app, s), { on: CD_EVENTS }).data.diffs;
+type Diff = ReturnType<typeof useDiffs>[number];
+const diffOf = (diffs: readonly Diff[], i: ShipDeployItem) => diffs.find((x) => x.key.kind === i.kind && x.key.name === i.name && x.key.namespace === i.namespace && x.key.group === i.group);
+/** How many keys differ: each a line taken out, put in, or both. */
+const keysOf = (d: Diff | undefined) => {
   const lines = d?.hunks.flatMap((h) => h.lines) ?? [];
-  // Each changed key a line taken out, put in, or both.
-  const changed = Math.max(lines.filter((l) => l.startsWith("+")).length, lines.filter((l) => l.startsWith("-")).length);
+  return Math.max(lines.filter((l) => l.startsWith("+")).length, lines.filter((l) => l.startsWith("-")).length);
+};
+
+/** What a picked object that differs differs in, in the strip: ` in 2 keys`. */
+function Keys({ app, item }: { app: string; item: ShipDeployItem }) {
+  const n = keysOf(diffOf(useDiffs(app), item));
+  return n ? <>{` in ${n} key${n === 1 ? "" : "s"}`}</> : null;
+}
+
+function DiffBody({ app, item, trunk }: { app: string; item: ShipDeployItem; trunk: string | null }) {
+  const d = diffOf(useDiffs(app), item);
+  const lines = d?.hunks.flatMap((h) => h.lines) ?? [];
+  const changed = keysOf(d);
   return (
     <pre className="dp-op">
       {lines.map((l, i) => (
@@ -954,21 +979,35 @@ function Against({ repo, sha, app }: { repo: string; sha: string; app: string })
 
 function RolloutDetail({ rollout }: { rollout: ShipDeployRollout }) {
   const weight = rollout.weight ?? null;
+  const sides = rollout.sides ?? [];
   return (
     <div className="jp-cm">
-      <h4>{rolloutName(rollout)}</h4>
+      <h4>
+        {rolloutName(rollout)}
+        {rollout.strategy ? ` · ${rollout.strategy}` : ""}
+      </h4>
       {rollout.steps.map((s) => (
         <div key={s.n} className="row">
           <StatusGlyph state={glyphOf(s.state)} size={12} />
           <span>
             Step {s.n} · {s.what}
           </span>
-          <span className="dim">{s.v}</span>
+          {/* A step done says when: its line says it's done. */}
+          <span className="dim">{s.v.replace(/^done /, "")}</span>
         </div>
       ))}
-      <div className="dim">{rollout.note}</div>
+      {rollout.strategy ? null : <div className="dim">{rollout.note}</div>}
       {rollout.approvals?.length ? <div>Waits for: {rollout.approvals.join(", ")}</div> : null}
-      {weight != null && rollout.under_way ? (
+      {sides.length ? (
+        <>
+          <h4>Pods</h4>
+          {sides.map((s) => (
+            <div key={s.side}>
+              {s.side} {s.name} · {s.pods} pod{s.pods === 1 ? "" : "s"} · {s.share}%{s.up ? ` · up ${s.up}` : ""}
+            </div>
+          ))}
+        </>
+      ) : weight != null && rollout.under_way ? (
         <>
           <h4>Traffic</h4>
           {rollout.back_to != null ? (

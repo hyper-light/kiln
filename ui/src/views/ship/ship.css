@@ -971,8 +971,11 @@
 .jp-say[data-tone="ask"] .jp-said {
   color: #e2b9bd;
 }
-.jp-q[data-off] {
-  opacity: 0.35;
+/* The one picked object's own word lights as a picked word does. */
+.dp .jp-q button[aria-pressed="mixed"] {
+  color: #e4e5e7;
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
 .jp-q button:disabled {
   cursor: default;
@@ -1162,12 +1165,13 @@
 .dp-row {
   scroll-margin-top: calc(var(--header-h, 64px) + 12px);
 }
-/* Asked again, the question has the words' room too, as the approved stills draw it: the strip keeps its height. */
-.jp-say[data-asks] {
+/* Where the words don't apply (a question, a setting, a commit, a step), what's said has their room too, as the
+   approved stills draw it: the strip keeps its height. */
+.jp-say[data-room] {
   grid-template-rows: 36px auto;
 }
-/* Both in its one column: the question over the words' row, not beside it. */
-.jp-say[data-asks] .jp-said {
+/* Both in its one column: what's said over the words' row, not beside it. */
+.jp-say[data-room] .jp-said {
   grid-column: 1;
   grid-row: 1 / span 2;
   align-self: center;
@@ -1175,7 +1179,7 @@
   max-height: 100%;
   -webkit-line-clamp: 3;
 }
-.jp-say[data-asks] .jp-q {
+.jp-say[data-room] .jp-q {
   grid-column: 1;
   grid-row: 2;
   visibility: hidden;

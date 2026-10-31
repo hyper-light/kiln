@@ -403,6 +403,8 @@ pub(crate) fn pane_json(f: &Facts, o: &Opened, now_ms: u64) -> Value {
             m.insert("deploy".into(), json!(deploy));
             m.insert("back_to".into(), json!(r.back_to));
             m.insert("weight".into(), json!(r.rollout.weight));
+            // On a cluster, its two sides: the ReplicaSet that ran and the one it rolls out.
+            m.insert("sides".into(), json!(stands::sides(&o.nodes, &r.key, r.rollout.weight, now_ms)));
         }
         v
     });
@@ -751,7 +753,7 @@ mod tests {
             rows,
             [
                 row("quiver-production", "needs_you", "Needs you", "#39 waits for your approval · #38 runs"),
-                row("quiver-staging", "shipping", "Syncing", "syncing 3333333"),
+                row("quiver-staging", "shipping", "Syncing", "#42 · syncing 3333333"),
                 row("site-production", "rolled_back", "Rolled back", "#19 failed its health check · back on #18"),
                 row("kiln-production", "needs_you", "Out of sync", "#153 runs 2222222 · trunk is 2 ahead · healthy"),
                 row("kube-prometheus-stack-production", "shipped", "Synced", "chart 92.2.0 · healthy"),
@@ -846,6 +848,9 @@ mod tests {
         assert_eq!(at(&v, "/rollout/steps/1/state"), &json!("requested"));
         assert_eq!(at(&v, "/rollout/approvals"), &json!(["release-approval"]));
         assert_eq!((at(&v, "/rollout/deploy"), at(&v, "/rollout/back_to"), at(&v, "/rollout/weight")), (&json!(39), &json!(38), &json!(20)));
+        assert_eq!((at(&v, "/rollout/strategy"), at(&v, "/rollout/note"), at(&v, "/rollout/promote_to")), (&json!("canary"), &json!("canary · 20% · waiting for approval"), &json!(100)));
+        // Not a cluster's: no ReplicaSets to say its sides by.
+        assert_eq!(at(&v, "/rollout/sides"), &json!([]));
         assert!(at(&v, "/why_not/approve").is_null() && at(&v, "/why_not/promote").is_null(), "{}", at(&v, "/why_not"));
     }
 

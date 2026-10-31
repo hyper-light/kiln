@@ -8638,8 +8638,9 @@ a time. The design was agreed on a live mock built on Ship's own prototype
   - An opened app (`GET /api/ship/deploys/:app`) has the jobs pane's anatomy: its components, each
     workload a group (its pods with their node, container, uptime and restarts, its ReplicaSets)
     and then the rest by what they are (network, config, storage, jobs, access), live from its
-    cluster or else what KilnCD holds; a rollout's steps, the deploy it rolls out and the one it
-    goes back to, and its traffic between them; its settings (auto-sync and auto-rollback, a
+    cluster or else what KilnCD holds; a rollout's steps, its strategy, the deploy it rolls out and
+    the one it goes back to, and its traffic between them (on a cluster, its two ReplicaSets and
+    their pods); a sync under way named by the deploy it will be and the wave it's at; its settings (auto-sync and auto-rollback, a
     person's to set; prune and self-heal, its deploy file's); its history, its source's newest commits each as the
     deploy that ran it or one a rollback can go to, then older deploys; and why each verb can't
     apply, where one can't.

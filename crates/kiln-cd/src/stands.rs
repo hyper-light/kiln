@@ -260,8 +260,13 @@ pub fn standing(a: &App<'_>, now_ms: u64) -> Standing {
     if let Some(op) = running(a) {
         let to = a.revision.map(short).unwrap_or_default();
         let word = if op.phase == OpPhase::Terminating { "Stopping" } else { "Syncing" };
-        let mut line = format!("syncing {to}").trim_end().to_owned();
-        if !op.message.is_empty() && op.message != "syncing" {
+        // The deploy it will be (CD numbers each record one past its last), then its wave where it
+        // has more than one (`#42 · wave 2 of 3`), else what it syncs to and what it's doing.
+        let next = a.history.back().map_or(0, |d| d.id) + 1;
+        let mut line = format!("#{next} · syncing {to}").trim_end().to_owned();
+        if op.message.starts_with("wave ") {
+            line = format!("#{next} · {}", first_line(&op.message));
+        } else if !op.message.is_empty() && op.message != "syncing" {
             line = format!("{line} · {}", first_line(&op.message));
         }
         let mut s = out(Stand::Shipping, word, line, pips(Glyph::Running, Glyph::None, Glyph::None, None));
@@ -454,7 +459,12 @@ fn wanted(n: &Node) -> Option<u64> {
 }
 
 fn age_ms(n: &Node, now_ms: u64) -> Option<u64> {
-    let at = n.created_at.as_deref().and_then(tree::rfc3339_secs)?;
+    since_ms(n.created_at.as_deref()?, now_ms)
+}
+
+/// How long ago an RFC 3339 time was.
+fn since_ms(at: &str, now_ms: u64) -> Option<u64> {
+    let at = tree::rfc3339_secs(at)?;
     Some(now_ms.saturating_sub(u64::try_from(at).ok()? * 1000))
 }
 
@@ -541,9 +551,9 @@ fn item_value(n: &Node, now_ms: u64) -> String {
         }
         ("networking.k8s.io", "Ingress") => info(n, "Hosts").unwrap_or_default().to_owned(),
         ("", "PersistentVolumeClaim") => [info(n, "Phase"), info(n, "Capacity")].into_iter().flatten().collect::<Vec<_>>().join(" · "),
-        ("batch", "Job") => match (n.health.as_deref(), &age) {
-            (Some("Healthy"), Some(a)) => format!("completed · made {a} ago"),
-            (Some("Healthy"), None) => "completed".into(),
+        ("batch", "Job") => match (n.health.as_deref(), info(n, "Completed").and_then(|c| since_ms(c, now_ms))) {
+            (Some("Healthy"), Some(done)) => format!("completed {} ago", span(done)),
+            (Some("Healthy"), None) => age.map_or_else(|| "completed".to_owned(), |a| format!("completed · made {a} ago")),
             (Some("Degraded"), _) => "failed".into(),
             _ => "running".into(),
         },
@@ -786,12 +796,49 @@ pub struct Rollout {
     /// What it rolls out.
     pub revision: Option<String>,
     pub state: Glyph,
-    /// `20% · step 2 of 4 · checks passing`.
+    /// `canary · 20% · checks passing`.
     pub note: String,
     pub steps: Vec<StepLine>,
     pub under_way: bool,
     /// What it waits for a person to do, while it does.
     pub waits: Option<String>,
+    /// `canary` (some of the traffic first) or `blue/green` (all of it at once).
+    pub strategy: String,
+    /// How it's going, in a few words (`checks passing`, `waiting for approval`).
+    pub said: String,
+    /// The share of traffic Promote moves it to now: the next weight step's.
+    pub promote_to: Option<u8>,
+}
+
+/// One side of a rollout on a cluster: what ran before (`stable`) or what it rolls out
+/// (`canary`), as its workload's ReplicaSet, its pods, its share of traffic, and how long the new
+/// one has been up.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Side {
+    pub side: &'static str,
+    pub name: String,
+    pub pods: u64,
+    pub share: u8,
+    pub up: Option<String>,
+}
+
+/// A rollout's two sides as its cluster has them (`key`: its workload, `group/Kind/namespace/name`):
+/// of the workload's ReplicaSets with pods, the newest is what it rolls out and the one before it
+/// what ran; none where it's one ReplicaSet or none, or not a cluster's.
+pub fn sides(nodes: &[Node], key: &str, weight: u8, now_ms: u64) -> Vec<Side> {
+    let mut parts = key.splitn(4, '/');
+    let (Some(group), Some(kind), Some(ns), Some(name)) = (parts.next(), parts.next(), parts.next(), parts.next()) else { return Vec::new() };
+    let Some(uid) = nodes.iter().find(|n| n.group == group && n.kind == kind && n.namespace == ns && n.name == name).and_then(|n| n.uid.as_deref()) else { return Vec::new() };
+    let mut sets: Vec<&Node> = nodes.iter().filter(|n| n.group == "apps" && n.kind == "ReplicaSet" && n.parents.iter().any(|p| p == uid) && wanted(n).unwrap_or(0) > 0).collect();
+    sets.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| a.name.cmp(&b.name)));
+    let weight = weight.min(100);
+    match sets.as_slice() {
+        [new, old, ..] => vec![
+            Side { side: "stable", name: old.name.clone(), pods: wanted(old).unwrap_or(0), share: 100 - weight, up: None },
+            Side { side: "canary", name: new.name.clone(), pods: wanted(new).unwrap_or(0), share: weight, up: age_ms(new, now_ms).map(span) },
+        ],
+        _ => Vec::new(),
+    }
 }
 
 fn step_what(s: &Step) -> String {
@@ -820,7 +867,6 @@ fn checks_word(r: &crate::rollout::Rollout) -> &'static str {
 /// A rollout's steps and where it stands, `now_ms` for what a timed pause has left.
 pub fn rollout(id: &str, rec: &RolloutRecord, now_ms: u64) -> Rollout {
     let r = &rec.rollout;
-    let total = r.plan.steps.len();
     let gone = matches!(r.state, State::Aborted { .. } | State::Superseded { .. });
     let steps: Vec<StepLine> = r
         .plan
@@ -828,8 +874,11 @@ pub fn rollout(id: &str, rec: &RolloutRecord, now_ms: u64) -> Rollout {
         .iter()
         .enumerate()
         .map(|(i, s)| {
-            let (state, v) = if i < r.step || r.state == State::Succeeded {
+            let (state, v) = if r.state == State::Succeeded || (i < r.step && i + 1 < r.step) {
                 (Glyph::Passed, "done".to_owned())
+            } else if i < r.step {
+                // The step just done: how long ago, as it ended when the one under way began.
+                (Glyph::Passed, format!("done {}", span(now_ms.saturating_sub(r.step_ms))))
             } else if i == r.step {
                 match (&r.state, s) {
                     (State::Aborted { why }, _) => (Glyph::Failed, first_line(why)),
@@ -855,18 +904,26 @@ pub fn rollout(id: &str, rec: &RolloutRecord, now_ms: u64) -> Rollout {
         State::Aborted { why } => (Glyph::Failed, format!("aborted: {}", first_line(why))),
         State::Superseded { by } => (Glyph::Superseded, format!("superseded by {}", short(by))),
     };
-    let at = (r.step + 1).min(total.max(1));
+    // Some of the traffic first, or all of it at once.
+    let strategy = if r.plan.steps.iter().any(|s| matches!(s, Step::Weight { weight } if (1..100).contains(weight))) { "canary" } else { "blue/green" };
+    let promote_to = r.plan.steps.iter().skip(r.step + 1).find_map(|s| match s {
+        Step::Weight { weight } => Some(*weight),
+        _ => None,
+    });
     Rollout {
         id: id.to_owned(),
         revision: rec.revision.as_deref().map(short),
         state,
-        note: format!("{}% · step {at} of {} · {said}", r.weight, total.max(1)),
+        note: format!("{strategy} · {}% · {said}", r.weight),
         steps,
         under_way: !r.finished(),
         waits: match &r.state {
             State::Paused { why } => Some(why.clone()),
             _ => None,
         },
+        strategy: strategy.to_owned(),
+        said,
+        promote_to,
     }
 }
 
@@ -1007,7 +1064,11 @@ mod tests {
         let mut a = app(&h);
         a.operation = Some(&op);
         let s = standing(&a, NOW);
-        assert_eq!((s.stand, s.word.as_str(), s.line.as_str(), s.by.as_deref(), s.at_ms), (Stand::Shipping, "Syncing", "syncing 2222222", Some("ada"), NOW - 5_000));
+        assert_eq!((s.stand, s.word.as_str(), s.line.as_str(), s.by.as_deref(), s.at_ms), (Stand::Shipping, "Syncing", "#2 · syncing 2222222", Some("ada"), NOW - 5_000));
+        // Of waves, the one it's at: the deploy it will be, as the approved stills say it.
+        let wave = OpStatus { message: "wave 2 of 3".into(), ..op.clone() };
+        a.operation = Some(&wave);
+        assert_eq!(standing(&a, NOW).line, "#2 · wave 2 of 3");
         assert_eq!(glyphs(&s), [Glyph::Running, Glyph::None, Glyph::None]);
 
         // Its latest sync failed: failing, what runs said.
@@ -1162,7 +1223,7 @@ mod tests {
         cm.sync = Some("OutOfSync".into());
         let secret = node("", "Secret", "kiln", "sec1", &[]);
         let pvc = with_info(node("", "PersistentVolumeClaim", "kiln-data", "pvc1", &[]), &[("Phase", "Bound"), ("Capacity", "200Gi")]);
-        let mut job = node("batch", "Job", "kiln-guard-94lwq", "j1", &[]);
+        let mut job = with_info(node("batch", "Job", "kiln-guard-94lwq", "j1", &[]), &[("Completed", "2026-10-31T17:32:00Z")]);
         job.health = Some("Healthy".into());
         job.created_at = Some("2026-10-31T17:30:00Z".into());
         let mut gone = node("", "ConfigMap", "old-config", "cm2", &[]);
@@ -1197,7 +1258,7 @@ mod tests {
                 ("ConfigMap".to_owned(), "old-config".to_owned(), Glyph::Superseded, "git dropped it".to_owned()),
                 ("Secret".to_owned(), "kiln".to_owned(), Glyph::Healthy, "synced".to_owned()),
                 ("PersistentVolumeClaim".to_owned(), "kiln-data".to_owned(), Glyph::Healthy, "Bound · 200Gi".to_owned()),
-                ("Job".to_owned(), "kiln-guard-94lwq".to_owned(), Glyph::Passed, "completed · made 12h ago".to_owned()),
+                ("Job".to_owned(), "kiln-guard-94lwq".to_owned(), Glyph::Passed, "completed 12h ago".to_owned()),
             ]
         );
         // A Compose project with no live tree: its objects by their kind, logs read.
@@ -1206,6 +1267,27 @@ mod tests {
         project.health = Some("Healthy".into());
         let groups = components(&[project], now);
         assert_eq!(groups.iter().map(|g| (g.name.as_str(), g.items.iter().all(|i| i.logs))).collect::<Vec<_>>(), [("Project", true)]);
+    }
+
+    #[test]
+    fn w26_r24_a_rollouts_sides_are_its_workloads_replicasets() {
+        let deploy = node("apps", "Deployment", "kiln", "d1", &[]);
+        let mut stable = node("apps", "ReplicaSet", "kiln-cd9dc7b7", "rs1", &["d1"]);
+        stable.ready = Some("4/4".into());
+        stable.created_at = Some("2026-10-31T05:33:00Z".into());
+        let mut canary = node("apps", "ReplicaSet", "kiln-6f1c02aa", "rs2", &["d1"]);
+        canary.ready = Some("1/1".into());
+        canary.created_at = Some("2026-11-01T05:29:00Z".into());
+        let mut gone = node("apps", "ReplicaSet", "kiln-1a2b3c4d", "rs0", &["d1"]);
+        gone.ready = Some("0/0".into());
+        gone.created_at = Some("2026-10-30T05:33:00Z".into());
+        let nodes = [deploy, stable, canary, gone];
+        // 2026-11-01T05:33:00Z.
+        let now = 1_793_511_180_000;
+        let lines: Vec<(&str, String, u64, u8, Option<String>)> = sides(&nodes, "apps/Deployment/kiln/kiln", 20, now).into_iter().map(|s| (s.side, s.name, s.pods, s.share, s.up)).collect();
+        assert_eq!(lines, [("stable", "kiln-cd9dc7b7".to_owned(), 4, 80, None), ("canary", "kiln-6f1c02aa".to_owned(), 1, 20, Some("4m".to_owned()))]);
+        // Not a cluster's workload, or one ReplicaSet: no sides.
+        assert!(sides(&nodes, "fn", 20, now).is_empty() && sides(&nodes[..2], "apps/Deployment/kiln/kiln", 20, now).is_empty());
     }
 
     #[test]
@@ -1255,12 +1337,16 @@ mod tests {
         ];
         let r = rollout("ro1", &record(steps.clone(), State::Running, 1, 20), NOW);
         assert_eq!(r.steps.iter().map(|s| (s.state, s.what.as_str(), s.v.as_str())).collect::<Vec<_>>(), [
-            (Glyph::Passed, "weight 20%", "done"),
+            (Glyph::Passed, "weight 20%", "done 4m"),
             (Glyph::Running, "checks: error rate, latency", "measuring"),
             (Glyph::None, "weight 50%", "next"),
             (Glyph::None, "weight 100%", ""),
         ]);
-        assert_eq!((r.note.as_str(), r.under_way, r.waits.as_deref(), r.revision.as_deref()), ("20% · step 2 of 4 · running", true, None, Some("3333333")));
+        assert_eq!((r.note.as_str(), r.under_way, r.waits.as_deref(), r.revision.as_deref()), ("canary · 20% · running", true, None, Some("3333333")));
+        // Promote moves it to the next weight step's share; all at once is blue/green.
+        assert_eq!((r.strategy.as_str(), r.said.as_str(), r.promote_to), ("canary", "running", Some(50)));
+        let all = rollout("ro1", &record(vec![Step::Approve, Step::Weight { weight: 100 }], State::Running, 0, 0), NOW);
+        assert_eq!((all.strategy.as_str(), all.promote_to), ("blue/green", Some(100)));
         let r = rollout("ro1", &record(steps.clone(), State::Aborted { why: "error rate 4% over 1%".into() }, 1, 0), NOW);
         assert_eq!(r.steps.iter().map(|s| s.state).collect::<Vec<_>>(), [Glyph::Passed, Glyph::Failed, Glyph::Superseded, Glyph::Superseded]);
         assert_eq!((r.state, r.under_way), (Glyph::Failed, false));

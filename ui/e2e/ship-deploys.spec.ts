@@ -68,12 +68,14 @@ test("apps are Ship's rows by project, needs-you first: the stand word, the line
   await expect(kiln.locator(".js-l")).toHaveText(["Sync", "Health", "Soak"]);
   await expect(kiln.locator(".ship-env")).toHaveText("production");
   await expect(kiln.locator(".ship-sha")).toHaveText("15878aa");
-  // Who and when: the when whole, in the fewest words, however long the who.
-  await expect(kiln.locator(".dp-by")).toHaveText(/^agent 01a18b08\s*·\s*36m$/);
+  // Who and when, as the stills name them: an agent with whom it acted for; the rest with the when, whole and in the fewest words.
+  await expect(kiln.locator(".dp-by")).toHaveText("agent:01a18b08 for admin");
+  await expect(page.locator('.dp-row[data-app="default/quiver-staging"] .dp-by')).toHaveText(/^auto-sync\s*·\s*now$/);
+  await expect(page.locator('.dp-row[data-app="default/kube-prometheus-stack-production"] .dp-by')).toHaveText(/^admin\s*·\s*6d$/);
   for (const by of await page.locator(".dp-by").all()) {
     const fit = await by.evaluate((el) => {
       const ago = el.querySelector(".dp-ago");
-      return !!ago && ago.scrollWidth <= ago.clientWidth && ago.getBoundingClientRect().right <= el.getBoundingClientRect().right + 0.5;
+      return !ago || (ago.scrollWidth <= ago.clientWidth && ago.getBoundingClientRect().right <= el.getBoundingClientRect().right + 0.5);
     });
     expect(fit).toBe(true);
   }
@@ -96,6 +98,11 @@ test("an opened app is the jobs pane's anatomy: the strip, its objects by owner,
   expect(new Set(widths).size).toBe(1);
   await expect(strip(pane).locator(".jp-q button")).toHaveText(["out of sync", "unhealthy", "all"]);
   await expect(pane.locator(".jp-g > span:first-child, .jp-g .jp-line > span:first-child")).toHaveText(["Deployment kiln", "Network", "Config", "Storage", "Jobs", "History", "Settings"]);
+  // A workload's ReplicaSet drawn quiet, as the stills draw it, its glyph still naming how it is; a Job by when it completed.
+  const rs = line(pane, "o:apps~ReplicaSet~kiln~kiln-cd9dc7b7").locator("svg.sg").first();
+  await expect(rs).toHaveAttribute("data-state", "superseded");
+  await expect(rs).toHaveAttribute("aria-label", "healthy");
+  await expect(line(pane, "o:batch~Job~kiln~kiln-guard-94lwq")).toContainText("completed 12h ago");
   // The pod's shown first, where it runs: its log in the commits' Output's frame, by its container.
   await expect(said(pane)).toContainText("Pod kiln-cd9dc7b7-rsmwz picked · running on kiln-m02 · up 3m · 4 restarts");
   const at = pane.locator("[data-at]");
@@ -127,7 +134,10 @@ test("an opened app is the jobs pane's anatomy: the strip, its objects by owner,
 test("an object that differs shows its Diff; Events and Manifest read; Sync applies what's picked of what differs", async ({ page }) => {
   const pane = await open(page);
   await pickLine(pane, "o:~ConfigMap~kiln~kiln-config");
-  await expect(said(pane)).toContainText("ConfigMap kiln-config picked · differs from git · Sync applies just this object");
+  await expect(said(pane)).toContainText("ConfigMap kiln-config picked · differs from git in 2 keys · Sync applies just this object");
+  // Its own word lights: it's one of what's out of sync.
+  await expect(strip(pane).locator(".jp-q button", { hasText: "out of sync" })).toHaveAttribute("aria-pressed", "mixed");
+  await expect(strip(pane).locator(".jp-q button", { hasText: "unhealthy" })).toHaveAttribute("aria-pressed", "false");
   const out = pane.locator(".ship-output[data-key='~ConfigMap~kiln~kiln-config']");
   await expect(out.locator(".dp-w button")).toHaveText(["Diff", "Events", "Manifest"]);
   await expect(out.locator(".dp-op .rm").first()).toContainText("log_level: info");
@@ -145,6 +155,7 @@ test("an object that differs shows its Diff; Events and Manifest read; Sync appl
   // "out of sync" picks what differs: the workload and its config.
   await strip(pane).locator(".jp-q button", { hasText: "out of sync" }).click();
   await expect(said(pane)).toContainText("2 out of sync picked");
+  await expect(strip(pane).locator(".jp-q button", { hasText: "out of sync" })).toHaveAttribute("aria-pressed", "true");
   await verb(pane, "Sync").click();
   await expect(said(pane)).toContainText("Syncing 2 objects of kiln-production.");
   expect(await last(page)).toEqual({ app: KILN, verb: "sync", resources: ["apps~Deployment~kiln~kiln", "~ConfigMap~kiln~kiln-config"] });
@@ -214,13 +225,18 @@ test("Promote and Abort while a rollout runs; Abort asks again", async ({ page }
   const pane = await open(page, "default/quiver-production");
   await expect(verbs(pane)).toHaveText(["Promote", "Refresh", "Roll back", "Abort"]);
   await expect(pane.locator(".jp-g > span:first-child").first()).toHaveText("Rollout #39");
+  await expect(pane.locator(".jp-g > span:last-child").first()).toHaveText("canary · 20% · waiting for approval");
+  await expect(line(pane, "s:1")).toContainText("done 4m");
   await expect(pane.locator("[data-at]")).toHaveAttribute("data-key", "s:2");
-  await expect(said(pane)).toContainText("Rollout #39 picked · 20% · step 2 of 3 · waiting for approval · Promote moves it on now");
+  await expect(said(pane)).toContainText("Rollout #39 picked · canary at 20%, waiting for approval · Promote moves it to 100% now");
+  // A step, a commit or a setting picked: the words, which pick objects, give what's said their room.
+  await expect(strip(pane).locator(".jp-q")).toBeHidden();
   const card = pane.locator(".jp-cm").first();
+  await expect(card.locator("h4").first()).toHaveText("Rollout #39 · canary");
   await expect(card).toContainText("Step 2 · a person approves");
-  // Its traffic: what ran before, and what it rolls out.
-  await expect(card).toContainText("#38 · what ran before · 80%");
-  await expect(card).toContainText("#39 · rolling out · 20%");
+  // Its pods: the ReplicaSet that ran, and the one it rolls out.
+  await expect(card).toContainText("stable quiver-5c7d9b · 3 pods · 80%");
+  await expect(card).toContainText("canary quiver-6f1c02 · 1 pod · 20% · up 4m");
   await verb(pane, "Promote").click();
   await expect(said(pane)).toContainText("Promoting the rollout past its step.");
   expect(await last(page)).toEqual({ app: "default/quiver-production", verb: "promote", rollout: "in-cluster|apps/Rollout/quiver/quiver" });
@@ -243,9 +259,12 @@ test("Stop is for a sync under way, asked again; Sync waits for it", async ({ pa
   expect(await last(page)).toEqual({ app: "default/quiver-staging", verb: "stop" });
 });
 
-test("a setting picked: its change in the strip, the rest dimmed, never hidden", async ({ page }) => {
+test("a setting picked: its change in the strip, the other verbs dimmed, the words' room its; the strip holds its height", async ({ page }) => {
   const pane = await open(page);
+  const tall = (await strip(pane).boundingBox())?.height ?? 0;
   await pickLine(pane, "c:auto_sync");
+  await expect(strip(pane).locator(".jp-q")).toBeHidden();
+  expect((await strip(pane).boundingBox())?.height).toBe(tall);
   await expect(said(pane)).toContainText("Auto-sync picked · off, as .kiln/deploy.yaml says");
   await expect(verbs(pane)).toHaveText(["Turn on", "Refresh", "Roll back", "Stop"]);
   for (const v of ["Refresh", "Roll back", "Stop"]) await expect(verb(pane, v)).toBeDisabled();
