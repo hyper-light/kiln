@@ -2,7 +2,7 @@
 import * as React from "react";
 import { useServerEvents } from "@/api/events";
 import { harnessApi, listed, type AgentInfo } from "@/api/harness";
-import { useSuspenseResource } from "@/lib/resource";
+import { preload, useSuspenseResource } from "@/lib/resource";
 
 /**
  * How often the list takes in what changed. Many agents working at once send a stream of events;
@@ -18,6 +18,9 @@ const list = () => harnessApi.list();
 export function useAgentList(): AgentInfo[] {
   return useSuspenseResource(KEY, list).data;
 }
+
+/** Starts reading the agents without waiting for them (Mission control asks for them with what it shows over them). */
+export const preloadAgents = () => preload(KEY, list);
 
 /**
  * The agents, live: the list (suspends until it's in; read again when the server's back after a
