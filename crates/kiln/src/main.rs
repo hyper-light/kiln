@@ -126,8 +126,14 @@ enum Cmd {
         /// launcher, a copy of kiln that upgrades leave alone, runs the `kiln` they replace.
         #[arg(long)]
         exe: Option<PathBuf>,
+        /// Explicit installer bootstrap context; custom/unbound endpoints are unsupported.
+        #[arg(long, hide = true)]
+        installed_cli: Option<kiln::bluegreen::InstalledCli>,
+        /// Read-only protocol probe of the actual selected launcher, before boot writes.
+        #[arg(long, hide = true)]
+        check_installed_cli_context: Option<u32>,
         /// The kiln subcommand to supervise, e.g. `-- server`.
-        #[arg(last = true, required = true)]
+        #[arg(last = true, required_unless_present = "check_installed_cli_context")]
         args: Vec<String>,
     },
     /// Shorthand for `supervise -- server`.
@@ -637,6 +643,12 @@ fn main() -> ExitCode {
             return ExitCode::from(code);
         }
     };
+    // U16: the selected launcher proves only its parser/context protocol. No
+    // config, runtime, service, child or publication is changed by this probe.
+    if let Cmd::Supervise { check_installed_cli_context: Some(version), .. } = &cli.cmd.0 {
+        return if supervise::installed_cli_context_supported(*version) { ExitCode::SUCCESS }
+        else { eprintln!("{}",kiln::bluegreen::InstalledCliRefusal::Unsupported); ExitCode::FAILURE };
+    }
     // `kiln gocacheprog` answers the go command on stdout (W24-R08): nothing else may write there,
     // logs included, and it needs no runtime.
     if let Cmd::Gocacheprog(a) = &cli.cmd.0 {
@@ -708,6 +720,13 @@ async fn real_main(cli: Cli, config_from_argv: bool) -> anyhow::Result<()> {
             // What the supervisor handed this process (its handover channel), before anything
             // here starts a process that could inherit it.
             kiln::os::supervise::claim_inherited();
+            // U16: a new takeover target refuses directly out of real_main before
+            // containment, discovery/enrollment, any writers or the retrying loop.
+            // Env triggers the check but only the original parent/PID/generation
+            // can supply context. Failure never reaches TakeOverEnded or Ready.
+            if std::env::var_os(kiln::bluegreen::TAKE_OVER_ENV).is_some() {
+                kiln::bluegreen::Supervisor::installed_cli().await?;
+            }
             shutdown_on_signals(shutdown.clone());
             // The agents it starts have their processes held together (`os::contain`).
             kiln::os::contain::hold_agents();
@@ -853,7 +872,7 @@ async fn real_main(cli: Cli, config_from_argv: bool) -> anyhow::Result<()> {
                 None => Ok(()),
             }
         }
-        Cmd::Supervise { detach, exe, args } => {
+        Cmd::Supervise { detach, exe, installed_cli, check_installed_cli_context: _, args } => {
             // Detached supervisors re-enter with the child's config in `args`.
             // Keep that authority and do not prepend a different default/duplicate flag.
             let child_config = kiln::upgrade::arg_value(&args, "--config");
@@ -875,9 +894,9 @@ async fn real_main(cli: Cli, config_from_argv: bool) -> anyhow::Result<()> {
                 args.insert(0, format!("--config={}", config_path.to_str().ok_or_else(|| anyhow::anyhow!("supervise requires a UTF-8 config filename"))?));
             }
             if detach {
-                return supervise::detach(&args, &state_dir, exe.as_deref());
+                return supervise::detach(&args, &state_dir, exe.as_deref(), installed_cli.as_ref());
             }
-            boxed(|| supervise::run(supervise::Options { args, state_dir, exe })).await
+            boxed(|| supervise::run(supervise::Options { args, state_dir, exe, installed_cli })).await
         }
         Cmd::Up => {
             let cfg = config::Config::load(&config_path)?;
@@ -886,7 +905,7 @@ async fn real_main(cli: Cli, config_from_argv: bool) -> anyhow::Result<()> {
                 return Ok(());
             }
             let config_arg = format!("--config={}", config_path.to_str().ok_or_else(|| anyhow::anyhow!("up requires a UTF-8 config filename"))?);
-            boxed(|| supervise::run(supervise::Options { args: vec![config_arg, "server".into()], state_dir: cfg.server.data_dir, exe: None })).await
+            boxed(|| supervise::run(supervise::Options { args: vec![config_arg, "server".into()], state_dir: cfg.server.data_dir, exe: None, installed_cli: None })).await
         }
         Cmd::Setup(a) => {
             anyhow::ensure!(config_path == std::path::absolute(config::default_config_path())?, "setup cannot preserve a non-default --config context; run join/install with that --config explicitly instead");
@@ -1241,6 +1260,43 @@ mod tests {
     #[test]
     fn g18_deferred_cli_help_version_and_errors() -> anyhow::Result<()> {
         use clap::error::ErrorKind;
+        #[cfg(unix)]
+        {
+            use anyhow::Context as _;
+            const ENTRY:&str="KILN_U16_AGENT_ENTRY_FIXTURE";
+            if let Some(root)=std::env::var_os(ENTRY) {
+                let root=std::path::PathBuf::from(root);
+                let state=root.join("product-state");let config=root.join("product-config.toml");
+                let cli=super::Cli::try_parse_from(vec!["kiln".to_owned(),format!("--config={}",config.display()),"agent".to_owned(),format!("--state-dir={}",state.display()),"--server=http://127.0.0.1:1".to_owned(),"--token=must-not-enroll".to_owned()])?;
+                let error=kiln::rt::block_on(super::real_main(cli,true)).err().context("takeover entered without installed context")?;
+                assert_eq!(error.downcast_ref::<kiln::bluegreen::InstalledCliRefusal>(),Some(&kiln::bluegreen::InstalledCliRefusal::Unsupported),"actual entry returned another failure: {error:#}");
+                assert!(!state.exists() && !config.exists(),"refusal precedes product paths and enrollment");
+                std::fs::write(root.join("entry-refused.result"),b"actual-agent-entry-refused")?;
+                return Ok(());
+            }
+            kiln::rt::block_on(async move {
+            let root=tempfile::Builder::new().prefix("ku16-entry-").tempdir_in("/tmp")?;
+            let handover=root.path().join("handover.sock");
+            let listener=std::os::unix::net::UnixListener::bind(&handover)?;listener.set_nonblocking(true)?;
+            let mut child=std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact","tests::g18_deferred_cli_help_version_and_errors","--nocapture"])
+                .env(ENTRY,root.path()).env(kiln::bluegreen::TAKE_OVER_ENV,&handover)
+                .env(kiln::bluegreen::SUPERVISOR_ENV,root.path().join("old-unbound-control.sock")).env("KILN_GENERATION","71")
+                .env_remove("KILN_SUPERVISOR_FD").env_remove("KILN_SUPERVISOR_PID").env_remove("KILN_HANDOVER_FDS").env_remove("KILN_SUPERVISE_CHILD").env_remove("KILN_CHAOS").spawn()?;
+            let finished=kiln::rt::timeout(std::time::Duration::from_secs(7),async {
+                    loop {if let Some(status)=child.try_wait()? {return anyhow::Ok(status);}kiln::rt::sleep(std::time::Duration::from_millis(20)).await;}
+                }).await;
+            let _=child.kill();
+            let reaped=kiln::rt::timeout(std::time::Duration::from_secs(2),async {
+                    loop {if let Some(status)=child.try_wait()? {return anyhow::Ok(status);}kiln::rt::sleep(std::time::Duration::from_millis(20)).await;}
+                }).await;
+            assert!(reaped??.success(),"actual takeover-entry fixture child failed");assert!(finished??.success());
+            assert!(!root.path().join("product-state").exists() && !root.path().join("product-config.toml").exists());
+            assert_eq!(std::fs::read(root.path().join("entry-refused.result"))?,b"actual-agent-entry-refused","selected entry fixture really executed");
+            assert!(matches!(listener.accept(),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock),"refused entry must never connect to send Ready");
+                anyhow::Ok(())
+            })?;
+        }
         for (args, kind, text) in [
             (vec!["kiln", "--version"], ErrorKind::DisplayVersion, "kiln "),
             (vec!["kiln", "--help"], ErrorKind::DisplayHelp, "server"),

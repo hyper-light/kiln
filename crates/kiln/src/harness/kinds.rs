@@ -88,7 +88,7 @@ impl Kind {
 
     /// The process to start for session `session` of `spec` (cwd, environment and arguments).
     #[cfg_attr(not(unix), allow(unused_variables))]
-    pub fn launch(&self, spec: &Spec, session: &str) -> anyhow::Result<Process> {
+    pub async fn launch(&self, spec: &Spec, session: &str) -> anyhow::Result<Process> {
         if self.protocol == Protocol::Terminal {
             anyhow::bail!("{} has no structured mode; run it in a terminal ({})", self.name, self.program);
         }
@@ -110,7 +110,7 @@ impl Kind {
                 // kiln's MCP server: on a runner, its own (code mode over the kiln's machines and
                 // kiln's operations, through the runner); else the server's, where this machine's
                 // kiln serves it.
-                let local = local_tools(spec);
+                let local = local_tools(spec).await?;
                 match (&local, crate::mcp::kit()) {
                     #[cfg(unix)]
                     (Some((kiln, sock, prefer)), _) => {
@@ -137,7 +137,7 @@ impl Kind {
                     p.arg("-c").arg(format!("agents.max_concurrent_threads_per_session={n}"));
                 }
                 #[cfg(unix)]
-                if let Some((kiln, sock, prefer)) = local_tools(spec) {
+                if let Some((kiln, sock, prefer)) = local_tools(spec).await? {
                     p.args(crate::reach::mcp::codex_config(&kiln, sock, prefer, session));
                 }
             }
@@ -150,7 +150,7 @@ impl Kind {
                 // kiln's MCP server, which `prepare` put in agy's own config: whom it serves is
                 // this session, by agy's environment, which agy hands on to the servers it starts.
                 #[cfg(unix)]
-                if let Some((_, sock, prefer)) = local_tools(spec) {
+                if let Some((sock, prefer)) = local_connection(spec) {
                     p.envs(crate::reach::mcp::agy_env(sock, prefer, session));
                 }
             }
@@ -190,12 +190,12 @@ impl Kind {
     /// Antigravity's own config, the only place agy reads one from (`crate::reach::mcp::agy_add`),
     /// unless it's there already or a person turned it off; and its page tools allowed in agy's
     /// settings, as agy can't ask once started (`agy_allow_in`). It names this kiln, so a runner
-    /// upgraded since puts its own. A session whose server couldn't be put there starts without it.
+    /// upgraded since uses the retained installed endpoint. A required helper refusal stops startup.
     #[cfg_attr(not(unix), allow(unused_variables))]
-    pub async fn prepare(&self, spec: &Spec) {
+    pub async fn prepare(&self, spec: &Spec) -> anyhow::Result<()> {
         #[cfg(unix)]
         if self.protocol == Protocol::AgyStreamJson
-            && let Some((kiln, _, _)) = local_tools(spec)
+            && let Some((kiln, _, _)) = local_tools(spec).await?
         {
             let home = crate::os::home_dir();
             let config = home.join(".gemini/config/mcp_config.json");
@@ -206,15 +206,14 @@ impl Kind {
                     Ok(cmd) => crate::proc::output(cmd, AGY_ADD_TIMEOUT).await.and_then(|o| if o.status.success() { Ok(()) } else { Err(anyhow::anyhow!("{}", String::from_utf8_lossy(&o.stderr).trim())) }),
                     Err(e) => Err(e),
                 };
-                if let Err(e) = added {
-                    tracing::warn!(error = %format!("{e:#}"), "kiln's MCP server couldn't be put in Antigravity's config: its agents start without kiln's tools");
-                }
+                added.map_err(|error|error.context("kiln's required MCP helper could not be put in Antigravity's config; session not started"))?;
             }
             let settings = home.join(".gemini/antigravity-cli/settings.json");
             if let Err(e) = crate::rt::blocking(move || agy_allow_in(&settings)).await.and_then(|r| r) {
                 tracing::warn!(error = %format!("{e:#}"), "kiln's page tools couldn't be allowed in Antigravity's settings: agy decides on them as on its other tools");
             }
         }
+        Ok(())
     }
 }
 
@@ -240,33 +239,33 @@ fn agy_allow_in(path: &std::path::Path) -> anyhow::Result<bool> {
     Ok(true)
 }
 
-/// Whether a session gets the runner's own kiln MCP server (`crate::reach::mcp`), and how to
-/// start it: this kiln binary, the runner's reach socket, the session's preferred runner.
+/// Existing local connection/preference selection performs no endpoint query.
 #[cfg(unix)]
-fn local_tools(spec: &Spec) -> Option<(std::path::PathBuf, &'static str, Option<&str>)> {
-    let pref = spec.reach.as_deref().map(str::trim).filter(|r| !r.is_empty());
-    if pref == Some("off") {
-        return None;
-    }
-    let sock = crate::reach::local::socket()?;
-    let kiln = crate::os::this_kiln().ok()?;
-    Some((kiln, sock, pref))
+fn local_connection(spec:&Spec)->Option<(&'static str,Option<&str>)> {
+    let prefer=spec.reach.as_deref().map(str::trim).filter(|value|!value.is_empty());
+    if prefer==Some("off") {return None;}
+    Some((crate::reach::local::socket()?,prefer))
 }
 
-/// Without Unix sockets there is no runner of the machine to talk to.
+/// U16: resolve once, only where the real provider exports a persistent helper.
+/// Unbound/manual/custom contexts refuse this helper demand, not ordinary startup.
+#[cfg(unix)]
+async fn local_tools(spec:&Spec)->anyhow::Result<Option<(std::path::PathBuf,&'static str,Option<&str>)>> {
+    let Some((socket,prefer))=local_connection(spec) else {return Ok(None)};
+    let context=crate::bluegreen::Supervisor::installed_cli().await?;
+    Ok(Some((context.path().to_path_buf(),socket,prefer)))
+}
 #[cfg(not(unix))]
-fn local_tools(_spec: &Spec) -> Option<(std::path::PathBuf, &'static str, Option<&str>)> {
-    None
-}
+async fn local_tools(_spec:&Spec)->anyhow::Result<Option<(std::path::PathBuf,&'static str,Option<&str>)>> {Ok(None)}
 
-/// The MCP servers an ACP agent's session gets (`session/new`'s `mcpServers`): the runner's own.
-pub fn acp_servers(spec: &Spec, session: &str) -> Vec<serde_json::Value> {
+/// The actual ACP startup consumer alone offers these MCP servers.
+pub async fn acp_servers(spec:&Spec,session:&str)->anyhow::Result<Vec<serde_json::Value>> {
     #[cfg(unix)]
-    if let Some((kiln, sock, prefer)) = local_tools(spec) {
-        return vec![crate::reach::mcp::acp_config(&kiln, sock, prefer, session)];
+    if let Some((kiln,socket,prefer))=local_tools(spec).await? {
+        return Ok(vec![crate::reach::mcp::acp_config(&kiln,socket,prefer,session)]);
     }
-    let _ = (spec, session);
-    Vec::new()
+    let _=(spec,session);
+    Ok(Vec::new())
 }
 
 /// Where harnesses are looked for, and the PATH they run with: this process's, then the folders
@@ -903,7 +902,7 @@ mod tests {
             env: vec![("DEVIN_SESSION_TEST".into(), "kept".into()), ("CLAUDECODE".into(), "scrubbed".into())],
             ..Spec::default()
         };
-        let launch = kind.launch(&spec, "session")?;
+        let launch = crate::rt::block_on(async move {kind.launch(&spec, "session").await})?;
         assert_eq!(launch.get_program(), "/path/to/devin");
         assert_eq!(launch.get_args().collect::<Vec<_>>(), ["acp"]);
         assert_eq!(launch.get_current_dir(), Some(cwd.path()));
@@ -941,8 +940,8 @@ mod tests {
         assert_eq!(joined_path(None, None), None);
         // Started, it has the PATH it was looked for on: this process's folders first.
         let kind = Kind::get("claude").ok_or_else(|| anyhow::anyhow!("no Claude Code harness"))?;
-        let spec = Spec { kind: "claude".into(), program: Some(claude.to_string_lossy().into_owned()), cwd: Some(dir.path().to_string_lossy().into_owned()), ..Spec::default() };
-        let launch = kind.launch(&spec, "session")?;
+        let spec = Spec { kind: "claude".into(), program: Some(claude.to_string_lossy().into_owned()), cwd: Some(dir.path().to_string_lossy().into_owned()), reach:Some("off".into()), ..Spec::default() };
+        let launch = crate::rt::block_on(async move {kind.launch(&spec, "session").await})?;
         let dirs = |p: Option<&std::ffi::OsStr>| p.map(|p| std::env::split_paths(p).collect::<Vec<_>>()).unwrap_or_default();
         let ran = dirs(launch.get_envs().find(|(k, _)| *k == "PATH").and_then(|(_, v)| v));
         let mine = dirs(std::env::var_os("PATH").as_deref());

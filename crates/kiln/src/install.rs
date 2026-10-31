@@ -216,7 +216,9 @@ pub(crate) fn say(msg: impl AsRef<str>) {
 /// Copy the running executable to `dest` atomically (no-op if it already is `dest`).
 pub(crate) fn place_binary(dest: &Path) -> anyhow::Result<()> {
     let exe = std::env::current_exe()?;
-    if exe.canonicalize().ok() == dest.canonicalize().ok() {
+    if let (Ok(source),Ok(destination))=(exe.canonicalize(),dest.canonicalize())
+        && source==destination
+    {
         return Ok(());
     }
     let dir = dest.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
@@ -245,6 +247,108 @@ pub(crate) fn place_binary(dest: &Path) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// U16: only the explicit installer's conventional role and normal data layout
+/// supply endpoint retention. A file's existence is not a custom retention lease.
+fn installed_endpoint(bin:&Path,state:&Path,system:bool)->anyhow::Result<crate::bluegreen::InstalledCli> {
+    let refused=||anyhow::Error::new(crate::bluegreen::InstalledCliRefusal::Unsupported);
+    let normal=if system {PathBuf::from("/var/lib/kiln")} else {home().join(".local/share/kiln")};
+    let endpoint=crate::bluegreen::InstalledCli::conventional(system);
+    if bin!=endpoint || (state!=normal && state!=normal.join("agent")) {return Err(refused());}
+    for path in [bin,state] {
+        for ancestor in path.ancestors() {
+            match std::fs::symlink_metadata(ancestor) {
+                Ok(meta) if meta.file_type().is_symlink()=>return Err(refused()),
+                Ok(_)=>{},
+                Err(error) if error.kind()==std::io::ErrorKind::NotFound && path==state=>{},
+                Err(_)=>return Err(refused()),
+            }
+        }
+    }
+    if !bin.is_file() || bin.canonicalize().map_err(|_|refused())?!=endpoint {return Err(refused());}
+    crate::bluegreen::InstalledCli::from_install(endpoint,system).map_err(anyhow::Error::from)
+}
+
+/// Ordinary installation remains usable without a retained helper endpoint.
+/// Missing qualification publishes no delegation; actual consumers refuse it.
+fn installed_bootstrap(bin:&Path,state:&Path,system:bool)->Option<crate::bluegreen::InstalledCli> {
+    crate::supervise::installed_cli_context_supported(crate::bluegreen::INSTALLED_CLI_CONTRACT)
+        .then(||installed_endpoint(bin,state,system).ok()).flatten()
+}
+
+fn wants_installed_cli_context(i:&Install<'_>)->bool {
+    let options:Vec<String>=i.args.iter().skip(1).take_while(|arg|arg.as_str()!="--").cloned().collect();
+    crate::upgrade::arg_value(&options,"--installed-cli").is_some()
+}
+
+fn resolved_boot(boot:Boot,i:&Install<'_>)->Boot {
+    let systemd=have("systemctl") && Path::new("/run/systemd/system").exists();
+    match boot {
+        Boot::Auto if cfg!(windows)=>Boot::Task,
+        Boot::Auto if cfg!(target_os="macos")=>Boot::Launchd,
+        Boot::Auto if systemd=>Boot::Systemd,
+        Boot::Auto if have("crontab")=>Boot::Cron,
+        Boot::Auto if !i.system=>Boot::Xdg,
+        Boot::Auto=>Boot::None,
+        selected=>selected,
+    }
+}
+
+struct ContextBoot {kind:Boot,launcher:Option<PathBuf>}
+
+/// Read-only probe of the actual selected executable. This is the only new
+/// installer work submitted to rt::blocking; boot writes/restarts stay owned by
+/// the original install future. Dropping that future cannot start a late service.
+async fn prepare_installed_boot(boot:Boot,i:&Install<'_>)->anyhow::Result<Option<ContextBoot>> {
+    if !wants_installed_cli_context(i) {return Ok(None);}
+    let refused=|error:anyhow::Error|anyhow::Error::new(crate::bluegreen::InstalledCliRefusal::Unsupported).context(format!("installed helper context preflight refused before boot mutation: {error:#}"));
+    let kind=resolved_boot(boot,i);
+    validate_boot_config(i.config,kind).map_err(refused)?;
+    if let Some(env)=i.env {
+        for config in env.iter().filter_map(|entry|entry.strip_prefix("KILN_CONFIG=")) {
+            validate_boot_config(Path::new(config),kind).map_err(refused)?;
+        }
+    }
+    let launcher=if kind==Boot::Launchd {
+        let existing=launcher_path(i.unit);
+        Some(match std::fs::symlink_metadata(&existing) {
+            Ok(_)=>existing,
+            // Preserve the existing explicit fresh-launcher creation owner. An
+            // existing immutable legacy launcher is never replaced for support.
+            Err(error) if error.kind()==std::io::ErrorKind::NotFound=>ensure_launcher(i.unit,i.bin).map_err(refused)?,
+            Err(error)=>return Err(refused(error.into())),
+        })
+    } else {None};
+    let selected=launcher.as_deref().unwrap_or(i.bin).to_path_buf();
+    crate::rt::blocking(move||probe_installed_context(&selected)).await.map_err(refused)??;
+    Ok(Some(ContextBoot{kind,launcher}))
+}
+
+fn probe_installed_context(executable:&Path)->anyhow::Result<()> {
+    let refused=||anyhow::Error::new(crate::bluegreen::InstalledCliRefusal::Unsupported).context(format!("actual selected launcher {} lacks the helper contract; no boot definition was changed",executable.display()));
+    if !executable.is_absolute() {return Err(refused());}
+    let mut child=Command::new(executable)
+        .arg("supervise").arg(format!("--check-installed-cli-context={}",crate::bluegreen::INSTALLED_CLI_CONTRACT))
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|_|refused())?;
+    let deadline=std::time::Instant::now()+Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status))=>return if status.success() {Ok(())} else {Err(refused())},
+            Ok(None) if std::time::Instant::now()<deadline=>std::thread::sleep(Duration::from_millis(20)),
+            Ok(None)|Err(_)=>break,
+        }
+    }
+    let _=child.kill();
+    let reap_deadline=std::time::Instant::now()+Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_))=>return Err(refused()),
+            Ok(None) if std::time::Instant::now()<reap_deadline=>std::thread::sleep(Duration::from_millis(20)),
+            _=>return Err(refused().context("read-only probe child reap remains unknown; no boot write or success inferred")),
+        }
+    }
+}
+
 
 /// The binary's folder on the user's PATH, so `kiln` works in every new terminal: on Windows in
 /// the user's own PATH; elsewhere, when this terminal's PATH hasn't it (`~/.local/bin` on a Mac),
@@ -377,6 +481,9 @@ pub async fn install_with_config(a: InstallArgs, config_path: PathBuf) -> anyhow
         say("target      this machine (no kubeconfig names a cluster here; --on kubernetes or --on docker installs elsewhere)");
     }
     match install_here(&a, system, &bin, &config_path, &mut on_path).await {
+        // A context refusal precedes boot mutation. The broad fresh rollback must
+        // not disable an older service just refused for its immutable launcher.
+        Err(e) if e.downcast_ref::<crate::bluegreen::InstalledCliRefusal>().is_some()=>Err(e),
         Err(e) if fresh => {
             say("");
             say("taking back the install, which didn't come up");
@@ -429,11 +536,19 @@ async fn install_here(a: &InstallArgs, system: bool, bin: &Path, config_path: &P
         ("kiln", vec!["server".to_owned()])
     };
 
-    let mut sup_args = vec!["supervise".to_owned(), "--".to_owned()];
+    let mut sup_args=vec!["supervise".to_owned()];
+    // place_binary succeeded above, including its explicit same-file no-op.
+    if let Some(context)=installed_bootstrap(bin,&state_dir,system) {
+        sup_args.push(format!("--installed-cli={}",context.argument()?));
+    }
+    // Custom/unqualified layouts still install and start normally. Without
+    // the explicit flag, actual helper demands return typed Unsupported.
+    sup_args.push("--".to_owned());
     sup_args.extend(args);
     let ask = !a.unattended && crate::join::interactive();
     let boot = Install { system, unit, bin, args: &sup_args, config: config_path, state_dir: &state_dir, env: None, ask };
-    let started_by_boot = setup_boot(a.boot, &boot)?;
+    let prepared_context=prepare_installed_boot(a.boot,&boot).await?;
+    let started_by_boot = setup_boot(a.boot, &boot,prepared_context.as_ref())?;
 
     let mut running = started_by_boot;
     if !a.no_start && !started_by_boot {
@@ -561,7 +676,7 @@ async fn agent_setup(a: &InstallArgs, config_path: &Path) -> anyhow::Result<Vec<
 pub fn start_service(system: bool, unit: &str, bin: &Path, args: &[String], state_dir: &Path, env: &[String]) -> anyhow::Result<()> {
     let config = crate::config::default_config_path();
     let i = Install { system, unit, bin, args, config: &config, state_dir, env: (!env.is_empty()).then_some(env), ask: false };
-    if !setup_boot(Boot::Auto, &i)? {
+    if !setup_boot(Boot::Auto, &i,None)? {
         let mut cmd = Command::new(bin);
         cmd.arg("supervise").arg("--detach").args(args.iter().skip(1));
         run(&mut cmd)?;
@@ -656,17 +771,9 @@ fn validate_boot_config(path: &Path, boot: Boot) -> anyhow::Result<()> {
 }
 
 /// Returns true when the boot mechanism also started the service now.
-fn setup_boot(boot: Boot, i: &Install<'_>) -> anyhow::Result<bool> {
-    let systemd = have("systemctl") && Path::new("/run/systemd/system").exists();
-    let boot = match boot {
-        Boot::Auto if cfg!(windows) => Boot::Task,
-        Boot::Auto if cfg!(target_os = "macos") => Boot::Launchd,
-        Boot::Auto if systemd => Boot::Systemd,
-        Boot::Auto if have("crontab") => Boot::Cron,
-        Boot::Auto if !i.system => Boot::Xdg,
-        Boot::Auto => Boot::None,
-        b => b,
-    };
+fn setup_boot(boot: Boot, i: &Install<'_>,context:Option<&ContextBoot>) -> anyhow::Result<bool> {
+    if wants_installed_cli_context(i) && context.is_none() {return Err(crate::bluegreen::InstalledCliRefusal::Unsupported.into());}
+    let boot=context.map_or_else(||resolved_boot(boot,i),|context|context.kind);
     validate_boot_config(i.config, boot)?;
     // A companion/rewrite retains its existing service environment rather than this caller's
     // default config field. Validate that actual filename as well before writing a boot unit.
@@ -742,7 +849,7 @@ fn setup_boot(boot: Boot, i: &Install<'_>) -> anyhow::Result<bool> {
             say(format!("boot        XDG autostart {} (starts at login)", path.display()));
             Ok(false)
         }
-        Boot::Launchd => launchd(i),
+        Boot::Launchd => launchd(i,context.and_then(|context|context.launcher.as_deref())),
         Boot::Task => scheduled_task(i, TaskStart::Boot),
         Boot::Logon => scheduled_task(i, TaskStart::SignIn),
         Boot::None | Boot::Auto => {
@@ -1183,12 +1290,14 @@ fn strays_in(ps: &str, state_dir: &Path, job: &[u32], me: u32) -> Vec<u32> {
         .collect()
 }
 
-fn launchd(i: &Install<'_>) -> anyhow::Result<bool> {
+fn launchd(i: &Install<'_>,selected_launcher:Option<&Path>) -> anyhow::Result<bool> {
     let label = launchd_label(i.unit);
     let path = launchd_plist(i.system, i.unit);
     let log = i.state_dir.join("kiln.log");
     std::fs::create_dir_all(i.state_dir).with_context(|| format!("create {}", i.state_dir.display()))?;
-    let launcher = match ensure_launcher(i.unit, i.bin) {
+    let launcher = if wants_installed_cli_context(i) {
+        Some(selected_launcher.ok_or(crate::bluegreen::InstalledCliRefusal::Unsupported)?.to_path_buf())
+    } else {match ensure_launcher(i.unit, i.bin) {
         Ok(l) => {
             say(format!("launcher    {} (macOS allows it onto the local network once; upgrades replace {})", l.display(), i.bin.display()));
             Some(l)
@@ -1197,7 +1306,7 @@ fn launchd(i: &Install<'_>) -> anyhow::Result<bool> {
             say(format!("launcher    none ({e:#}): the job runs {} itself", i.bin.display()));
             None
         }
-    };
+    }};
     crate::util::write_secret(&path, launchd_body(i, &log, launcher.as_deref()).as_bytes(), 0o644)?;
     let kind = if i.system { "LaunchDaemon" } else { "LaunchAgent" };
     let domains = launchd_domains(i.system);
@@ -1870,6 +1979,24 @@ mod tests {
             env: None,
             ask: false,
         };
+        let context=crate::bluegreen::InstalledCli::from_install(crate::bluegreen::InstalledCli::conventional(false),false)?;
+        let mut delegated=args.clone();delegated.insert(1,format!("--installed-cli={}",context.argument()?));
+        let delegated_install=Install{args:&delegated,..i};
+        assert!(systemd_body(&delegated_install).contains("--installed-cli="));
+        assert!(delegated_install.detach_args().contains(delegated.get(1).context("missing context argument")?));
+        let body=launchd_body(&delegated_install,Path::new("/tmp/kiln.log"),None);
+        assert_eq!(crate::upgrade::parse_plist(&body,"kiln-agent",false).context("delegated boot not parsed")?.args,args.get(2..).context("missing original child")?);
+        assert!(installed_endpoint(Path::new("/custom/kiln"),Path::new("/custom/state"),false).is_err(),"custom endpoints have no inferred retention");
+        assert!(installed_bootstrap(Path::new("/custom/kiln"),Path::new("/custom/state"),false).is_none(),"ordinary custom installation emits no helper delegation or probe requirement");
+        #[cfg(unix)]
+        {
+            let dir=tempfile::tempdir()?;let executable=dir.path().canonicalize()?.join("legacy-launcher");
+            let bytes=b"#!/bin/sh\nexit 2\n";std::fs::write(&executable,bytes)?;crate::os::make_executable(&executable)?;
+            let selected=executable.clone();
+            let refused=crate::rt::block_on(crate::rt::blocking(move||probe_installed_context(&selected)))?;
+            assert!(refused.err().is_some_and(|error|error.downcast_ref::<crate::bluegreen::InstalledCliRefusal>().is_some()));
+            assert_eq!(std::fs::read(&executable)?,bytes,"read-only probe never replaces retained launcher");
+        }
         // Rendering must cover the same server, runner and companion install owner without
         // invoking systemctl. Inherited service environment cannot replace the layout schema.
         let inherited = ["PATH=/tool/bin".to_owned(), "KILN_CGROUP_LAYOUT=old-layout".to_owned()];

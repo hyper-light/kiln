@@ -3071,30 +3071,36 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
             },
             None => {
                 let mut adapter = kind.adapter(&spec);
-                adapter.offer_mcp(super::kinds::acp_servers(&spec, &s.id));
+
                 if let Some(items) = &seed {
                     adapter.seed(items.clone());
                 }
                 let blocked = if spec.takeover_pid.is_some() { takeover_ready(&s, &sink, Duration::from_secs(3)).await } else { None };
+                let mut prepared=if blocked.is_none() && matches!(kind.protocol,super::kinds::Protocol::Acp(_)) {
+                    super::kinds::acp_servers(&spec,&s.id).await.map(|servers|adapter.offer_mcp(servers))
+                } else {Ok(())};
                 // One the machine's own PATH lacks may be on its user's: their login shell is asked
                 // first (once, then kept ten minutes).
-                if blocked.is_none() && spec.program.is_none() && !kind.available() {
+                if blocked.is_none() && prepared.is_ok() && spec.program.is_none() && !kind.available() {
                     crate::reach::serve::login_env().await;
                 }
                 // What it needs before it starts (kiln's MCP server in Antigravity's own config).
-                if blocked.is_none() {
-                    kind.prepare(&spec).await;
+                if blocked.is_none() && prepared.is_ok() {
+                    prepared=kind.prepare(&spec).await;
                 }
                 let spawned = match blocked {
                     Some(why) => Err(anyhow::anyhow!(why)),
                     // In the session's group of processes where the machine has them, and marked as
                     // its, and so is everything it starts (`survivors`).
-                    None => match kind.launch(&spec, &s.id) {
+                    None => match prepared {
+                        Err(error)=>Err(error),
+                        Ok(())=>match kind.launch(&spec, &s.id).await {
                         Ok(mut p) => {
                             p.env(super::survivors::MARK, &s.id);
                             crate::proc::spawn_duplex_in_pool(p, crate::os::contain::Group::of(&s.id)).await
                         }
                         Err(e) => Err(e),
+                        },
                     },
                 };
                 (adapter, spawned, Vec::new(), false)

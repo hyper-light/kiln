@@ -3878,6 +3878,12 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                                 up.msg(AgentMsg::UpgradeDone { job, ok: false, error: Some(format!("{e:#}")) }).await;
                                 return;
                             }
+                            // Fresh context demand precedes fetch; activation bit 50 alone
+                            // never grants the installed helper endpoint contract.
+                            if let Err(error)=crate::bluegreen::Supervisor::installed_cli().await {
+                                up.msg(AgentMsg::UpgradeDone{job,ok:false,error:Some(error.to_string())}).await;
+                                return;
+                            }
                             match crate::updates::fetch_build(&http, &server_url, &order, &state, &up).await {
                                 Ok((exe, build)) => {
                                     let _ = tx.send(Bg::Fetched { job, exe, build }).await;

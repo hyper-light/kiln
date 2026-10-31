@@ -73,15 +73,154 @@ pub struct Supervisor {
 }
 
 /// U16: a route to the existing supervisor's owned process, not release approval or retirement proof.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ActivationOwner {
     pub pid: u32,
     pub generation: u64,
 }
 
+/// U16: the existing installer's conventional mutable CLI endpoint, independent of
+/// the selected runner image. Contract 1 supplies kiln's reach-MCP and Go helper CLIs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstalledCli {
+    contract: u32,
+    system: bool,
+    path: PathBuf,
+}
+
+pub const INSTALLED_CLI_CONTRACT: u32 = 1;
+#[cfg(unix)]
+pub(crate) const CONTEXT_WITHIN: Duration = Duration::from_secs(5);
+#[cfg(unix)]
+pub(crate) const CONTEXT_FRAME: usize = 64 << 10;
+#[cfg(unix)]
+pub(crate) const CONTEXT_MARKER: u8 = b'@';
+
+impl InstalledCli {
+    pub(crate) fn conventional(system: bool) -> PathBuf {
+        if system { PathBuf::from("/usr/local/bin/kiln") }
+        else { crate::os::home_dir().join(".local/bin/kiln") }
+    }
+
+    /// Called only by explicit installation after successful placement, in the
+    /// qualified conventional role/layout. Custom layouts have no retention grant.
+    pub(crate) fn from_install(path: PathBuf, system: bool) -> Result<Self, InstalledCliRefusal> {
+        let value = Self { contract: INSTALLED_CLI_CONTRACT, system, path };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), InstalledCliRefusal> {
+        let path = self.path.to_str().ok_or(InstalledCliRefusal::Unsupported)?;
+        if self.contract != INSTALLED_CLI_CONTRACT || path.len() > 4096
+            || !self.path.is_absolute() || self.path != Self::conventional(self.system)
+            || self.path.components().any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir))
+        { return Err(InstalledCliRefusal::Unsupported); }
+        Ok(())
+    }
+
+    pub fn path(&self) -> &Path { &self.path }
+    pub(crate) fn argument(&self) -> Result<String> { Ok(serde_json::to_string(self)?) }
+}
+
+impl std::str::FromStr for InstalledCli {
+    type Err = InstalledCliRefusal;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.len() > 8192 { return Err(InstalledCliRefusal::Unsupported); }
+        let context: Self = serde_json::from_str(value).map_err(|_| InstalledCliRefusal::Unsupported)?;
+        context.validate()?;
+        Ok(context)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstalledCliRefusal { Unsupported, Busy }
+impl std::fmt::Display for InstalledCliRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Unsupported => "U16: installed helper context is unsupported for this process; explicit compatible conventional installation is required",
+            Self::Busy => "U16: installed helper context is busy or its five-second deadline elapsed; no helper or takeover was started",
+        })
+    }
+}
+impl std::error::Error for InstalledCliRefusal {}
+
+/// This read-only frame is bounded before growth. A delimiter belongs to the
+/// 64 KiB cap; EOF, a second frame or trailing bytes in the read are refusal.
+#[cfg(unix)]
+pub(crate) async fn read_context_frame(stream: &hyper_rt::local::LocalStream) -> Result<serde_json::Value> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0u8; 4096];
+    loop {
+        let remaining = CONTEXT_FRAME.checked_sub(bytes.len()).context("context frame too large")?;
+        anyhow::ensure!(remaining > 0, "context frame exceeds 64 KiB");
+        let take = remaining.min(buffer.len());
+        let read = stream.read(buffer.get_mut(..take).context("context read bound")?).await?;
+        anyhow::ensure!(read > 0, "context frame ended before its delimiter");
+        let part = buffer.get(..read).context("context read length")?;
+        if let Some(end) = part.iter().position(|byte| *byte == b'\n') {
+            anyhow::ensure!(end + 1 == read, "trailing context frame bytes");
+            bytes.extend_from_slice(part.get(..end).context("context delimiter bound")?);
+            return Ok(serde_json::from_slice(&bytes)?);
+        }
+        bytes.extend_from_slice(part);
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn context_frame(value: &serde_json::Value) -> Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec(value)?;
+    anyhow::ensure!(bytes.len() < CONTEXT_FRAME, "context frame exceeds 64 KiB");
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+
 impl Supervisor {
     pub fn from_env() -> Option<Self> {
         std::env::var_os(SUPERVISOR_ENV).map(|p| Self { path: PathBuf::from(p), owner: None }).filter(|s| s.path.exists())
+    }
+
+    /// Resolve only from this process's actual parent supervisor. The locator and
+    /// generation from env never grant authority. One owned async stream and one
+    /// overall deadline cover connect, kernel proof, bounded write/read and parse.
+    pub async fn installed_cli() -> Result<InstalledCli, InstalledCliRefusal> {
+        #[cfg(unix)]
+        {
+            let operation = async {
+                let path = std::env::var_os(SUPERVISOR_ENV).map(PathBuf::from).ok_or(InstalledCliRefusal::Unsupported)?;
+                if path.as_os_str().as_encoded_bytes().len() > 4096 { return Err(InstalledCliRefusal::Unsupported); }
+                let generation = std::env::var("KILN_GENERATION").ok().and_then(|v| v.parse::<u64>().ok()).filter(|g| *g > 0).ok_or(InstalledCliRefusal::Unsupported)?;
+                let owner = ActivationOwner { pid: std::process::id(), generation };
+                let expected_parent=std::os::unix::process::parent_id();
+                let stream = hyper_rt::local::LocalStream::connect(&path).await.map_err(|error| match error {
+                    hyper_rt::error::RtError::WouldBlock { .. } => InstalledCliRefusal::Busy,
+                    _ => InstalledCliRefusal::Unsupported,
+                })?;
+                let peer = stream.peer().map_err(|_| InstalledCliRefusal::Unsupported)?;
+                let user = hyper_rt::local::current_user().map_err(|_| InstalledCliRefusal::Unsupported)?;
+                if peer.user != user || peer.pid != Some(expected_parent)
+                    || std::os::unix::process::parent_id()!=expected_parent {
+                    return Err(InstalledCliRefusal::Unsupported);
+                }
+                // A context-only marker permits its own bounded server path without
+                // imposing the 64 KiB cap on legacy mutating Start argv/env frames.
+                let request = context_frame(&serde_json::json!({"op":"installed_cli","owner":owner})).map_err(|_| InstalledCliRefusal::Unsupported)?;
+                stream.write_all(&[CONTEXT_MARKER]).await.map_err(|_| InstalledCliRefusal::Unsupported)?;
+                stream.write_all(&request).await.map_err(|_| InstalledCliRefusal::Unsupported)?;
+                let value = read_context_frame(&stream).await.map_err(|_| InstalledCliRefusal::Unsupported)?;
+                if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) { return Err(InstalledCliRefusal::Unsupported); }
+                let returned: ActivationOwner = serde_json::from_value(value.get("owner").cloned().ok_or(InstalledCliRefusal::Unsupported)?).map_err(|_| InstalledCliRefusal::Unsupported)?;
+                if returned != owner { return Err(InstalledCliRefusal::Unsupported); }
+                let context: InstalledCli = serde_json::from_value(value.get("installed_cli").cloned().ok_or(InstalledCliRefusal::Unsupported)?).map_err(|_| InstalledCliRefusal::Unsupported)?;
+                context.validate()?;
+                Ok(context)
+            };
+            crate::rt::timeout(CONTEXT_WITHIN,operation).await.map_err(|_| InstalledCliRefusal::Busy)?
+        }
+        #[cfg(not(unix))]
+        { Err(InstalledCliRefusal::Unsupported) }
     }
 
     /// U16: advertise only a live explicit backend for this exact supervised process.
@@ -313,6 +452,120 @@ mod unix {
 
         #[test]
         fn frames_carry_descriptors_both_ways() -> anyhow::Result<()> {
+            use crate::bluegreen::{ActivationOwner,InstalledCli,InstalledCliRefusal,Supervisor};
+            use hyper_rt::local::LocalListener;
+            const CASE:&str="KILN_U16_CONTEXT_FIXTURE";
+            const TEST:&str="bluegreen::unix::tests::frames_carry_descriptors_both_ways";
+            if let Ok(expected)=std::env::var(CASE) {
+                if expected=="peer-server" {
+                    let path=std::env::var_os(crate::bluegreen::SUPERVISOR_ENV).context("missing fixture socket")?;
+                    return crate::rt::block_on(async move {
+                        crate::rt::timeout(Duration::from_secs(10),async {
+                            let listener=LocalListener::bind(Path::new(&path),4)?;
+                            let stream=listener.accept().await?;
+                            let mut byte=[0u8;1];
+                            assert_eq!(stream.read(&mut byte).await?,0,"wrong-parent client refuses before writing its request");
+                            std::fs::write(std::env::var_os("KILN_U16_CONTEXT_RESULT").context("missing fixture receipt")?,b"peer-server")?;
+                            anyhow::Ok(())
+                        }).await?
+                    });
+                }
+                let answer=crate::rt::block_on(async {anyhow::Ok(Supervisor::installed_cli().await)})?;
+                if expected=="supported" {
+                    assert_eq!(answer?.path(),InstalledCli::conventional(false));
+                } else {
+                    let want=if expected=="trickle" {InstalledCliRefusal::Busy} else {InstalledCliRefusal::Unsupported};
+                    assert_eq!(answer.err(),Some(want),"actual bounded context consumer: {expected}");
+                }
+                std::fs::write(std::env::var_os("KILN_U16_CONTEXT_RESULT").context("missing fixture receipt")?,expected.as_bytes())?;
+                return Ok(());
+            }
+            crate::rt::block_on(async move {
+            // Real owned async connection, actual child/parent kernel credentials,
+            // and one whole5s client budget; this is not a p99/timing benchmark.
+            let context_dir=tempfile::Builder::new().prefix("ku16-").tempdir_in("/tmp")?;
+            let executable=std::env::current_exe()?;
+            for case in ["supported","trickle","oversize","eof","owner","generation"] {
+                let path=context_dir.path().join(case);
+                let listener=LocalListener::bind(&path,4)?;
+                let receipt=context_dir.path().join(format!("{case}.result"));
+                let mut child=std::process::Command::new(&executable).args(["--exact",TEST,"--nocapture"])
+                    .env(CASE,case).env("KILN_U16_CONTEXT_RESULT",&receipt).env(crate::bluegreen::SUPERVISOR_ENV,&path).env("KILN_GENERATION","71").spawn()?;
+                let pid=child.id();
+                let checked=crate::rt::timeout(Duration::from_secs(8),async {
+                        let stream=listener.accept().await?;
+                        let peer=stream.peer()?;
+                        anyhow::ensure!(peer.pid==Some(pid),"fixture kernel peer PID mismatch");
+                        anyhow::ensure!(peer.user==hyper_rt::local::current_user()?,"fixture kernel peer UID mismatch");
+                        let mut marker=[0u8;1];anyhow::ensure!(stream.read(&mut marker).await?==1,"missing context marker");
+                        anyhow::ensure!(marker==[crate::bluegreen::CONTEXT_MARKER],"wrong context marker");
+                        let request=crate::bluegreen::read_context_frame(&stream).await?;
+                        anyhow::ensure!(request.get("op").and_then(serde_json::Value::as_str)==Some("installed_cli"),"wrong context operation");
+                        let mut owner:ActivationOwner=serde_json::from_value(request.get("owner").cloned().context("missing owner")?)?;
+                        anyhow::ensure!(owner==ActivationOwner{pid,generation:71},"fixture original owner mismatch");
+                        let mut retained=Some(stream);
+                        if case=="eof" {drop(retained.take());}
+                        else if case=="oversize" {
+                            let oversized=vec![b'x';crate::bluegreen::CONTEXT_FRAME+1];
+                            let _=retained.as_ref().context("missing over-cap stream")?.write_all(&oversized).await;
+                        } else if case!="trickle" {
+                            if case=="owner" {owner.pid=owner.pid.checked_add(1).context("fixture PID overflow")?;}
+                            if case=="generation" {owner.generation+=1;}
+                            let context=InstalledCli::from_install(InstalledCli::conventional(false),false)?;
+                            let bytes=crate::bluegreen::context_frame(&serde_json::json!({"ok":true,"owner":owner,"installed_cli":context}))?;
+                            retained.as_ref().context("missing fixture stream")?.write_all(&bytes).await?;
+                        } else {retained.as_ref().context("missing trickle stream")?.write_all(b"{").await?;}
+                        loop {
+                            if let Some(status)=child.try_wait()? {return anyhow::Ok(status);}
+                            // Each byte arrives well within a read timeout, but
+                            // cannot restart the consumer's whole request budget.
+                            if case=="trickle" && let Some(stream)=&retained {let _=stream.write_all(b" ").await;}
+                            crate::rt::sleep(Duration::from_millis(100)).await;
+                        }
+                    }).await;
+                // Every error path still owns and reaps only this fixture child.
+                let _=child.kill();
+                let reaped=crate::rt::timeout(Duration::from_secs(2),async {
+                        loop {if let Some(status)=child.try_wait()? {return anyhow::Ok(status);}crate::rt::sleep(Duration::from_millis(20)).await;}
+                    }).await;
+                let status=reaped??;assert!(status.success(),"context fixture child failed: {case}");
+                assert!(checked??.success(),"bounded context exchange failed: {case}");
+                assert_eq!(std::fs::read(&receipt)?,case.as_bytes(),"selected child fixture really executed");
+            }
+            // A real sibling server has this user's UID but is not the client's
+            // original parent. The client must refuse before sending its frame.
+            let path=context_dir.path().join("peer");
+            let server=std::process::Command::new(&executable).args(["--exact",TEST,"--nocapture"])
+                .env(CASE,"peer-server").env("KILN_U16_CONTEXT_RESULT",context_dir.path().join("peer-server.result")).env(crate::bluegreen::SUPERVISOR_ENV,&path).spawn()?;
+            let mut children=vec![server];
+            let checked=crate::rt::timeout(Duration::from_secs(8),async {
+                    while !path.exists() {crate::rt::sleep(Duration::from_millis(20)).await;}
+                    children.push(std::process::Command::new(&executable).args(["--exact",TEST,"--nocapture"])
+                        .env(CASE,"peer").env("KILN_U16_CONTEXT_RESULT",context_dir.path().join("peer.result")).env(crate::bluegreen::SUPERVISOR_ENV,&path).env("KILN_GENERATION","71").spawn()?);
+                    loop {
+                        let statuses=children.iter_mut().map(std::process::Child::try_wait).collect::<std::io::Result<Vec<_>>>()?;
+                        if statuses.iter().all(Option::is_some) {
+                            anyhow::ensure!(statuses.iter().flatten().all(std::process::ExitStatus::success),"wrong-parent fixture child failed");
+                            return anyhow::Ok(());
+                        }
+                        crate::rt::sleep(Duration::from_millis(20)).await;
+                    }
+                }).await;
+            // The handles remain outside the canceled future, including a client
+            // spawned just before its deadline. Kill and reap both on every result.
+            for child in &mut children {let _=child.kill();}
+            let reaped=crate::rt::timeout(Duration::from_secs(2),async {
+                    loop {
+                        let statuses=children.iter_mut().map(std::process::Child::try_wait).collect::<std::io::Result<Vec<_>>>()?;
+                        if statuses.iter().all(Option::is_some) {return anyhow::Ok(statuses);}
+                        crate::rt::sleep(Duration::from_millis(20)).await;
+                    }
+                }).await;
+            assert!(reaped??.iter().flatten().all(std::process::ExitStatus::success),"wrong-parent fixture failed");checked??;
+            assert_eq!(std::fs::read(context_dir.path().join("peer-server.result"))?,b"peer-server");
+            assert_eq!(std::fs::read(context_dir.path().join("peer.result"))?,b"peer");
+                anyhow::Ok(())
+            })?;
             let (a, b) = UnixStream::pair()?;
             let (a, b) = (Conn { stream: a }, Conn { stream: b });
             // A pipe: its write end goes across, and still writes into the same pipe.

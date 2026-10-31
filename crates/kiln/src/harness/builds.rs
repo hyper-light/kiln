@@ -43,8 +43,10 @@ pub struct Tools {
 impl Tools {
     /// What this machine has: sccache only from 0.9 on, which gives each scope a server of its own
     /// (`SCCACHE_SERVER_UDS`); an older one would serve every scope from its one server.
-    pub fn here() -> Tools {
-        Tools { sccache: crate::os::which("sccache").filter(|p| sccache_serves_sockets(p)), kiln: crate::os::this_kiln().ok() }
+    pub async fn here() -> Result<Tools,crate::bluegreen::InstalledCliRefusal> {
+        // Optional Go tooling omission is the caller's explicit typed decision.
+        let context=crate::bluegreen::Supervisor::installed_cli().await?;
+        Ok(Tools {sccache:crate::os::which("sccache").filter(|p|sccache_serves_sockets(p)),kiln:Some(context.path().to_path_buf())})
     }
 }
 

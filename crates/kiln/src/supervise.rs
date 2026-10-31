@@ -25,6 +25,11 @@ use futures::channel::oneshot;
 use crate::os::supervise::ChildControl;
 use crate::rt::{Interval, Signals};
 
+/// U16: parser/helper protocol support, not a live context or image capability.
+pub fn installed_cli_context_supported(version: u32) -> bool {
+    cfg!(any(target_os="linux",target_os="macos")) && version==crate::bluegreen::INSTALLED_CLI_CONTRACT
+}
+
 const MIN_BACKOFF: Duration = Duration::from_millis(500);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const HEALTHY: Duration = Duration::from_secs(60);
@@ -44,6 +49,7 @@ pub struct Options {
     /// copy of kiln upgrades leave alone, so macOS keeps knowing the job) runs the `kiln` that
     /// upgrades replace.
     pub exe: Option<PathBuf>,
+    pub installed_cli: Option<crate::bluegreen::InstalledCli>,
 }
 
 fn exe_mtime(p: &Path) -> Option<SystemTime> {
@@ -181,7 +187,7 @@ fn single_instance(state_dir: &Path, args: &[String]) -> anyhow::Result<Option<s
 
 /// Start `kiln supervise [--exe <exe>] -- <args>` in its own session, detached from the
 /// terminal, with output appended to `<state>/kiln.log` (rotated at 64 MiB). Returns immediately.
-pub fn detach(args: &[String], state_dir: &Path, child_exe: Option<&Path>) -> anyhow::Result<()> {
+pub fn detach(args: &[String], state_dir: &Path, child_exe: Option<&Path>, installed_cli: Option<&crate::bluegreen::InstalledCli>) -> anyhow::Result<()> {
     std::fs::create_dir_all(state_dir)?;
     let log = state_dir.join("kiln.log");
     if std::fs::metadata(&log).is_ok_and(|m| m.len() > 64 << 20) {
@@ -192,6 +198,7 @@ pub fn detach(args: &[String], state_dir: &Path, child_exe: Option<&Path>) -> an
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("supervise");
+    if let Some(context)=installed_cli { cmd.arg("--installed-cli").arg(context.argument()?); }
     if let Some(e) = child_exe {
         cmd.arg("--exe").arg(e);
     }
@@ -210,6 +217,26 @@ struct ChildCmd {
     /// pinned once when the person starts this supervisor; this is not CI release approval.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sha256: Option<String>,
+}
+
+/// Extra optional local metadata remains backward-readable as ChildCmd. The
+/// explicit supervisor bootstrap, not this saved field or a selected Start, grants
+/// delegation. Ordinary/manual/custom startup without that argument stays unbound.
+#[derive(serde::Serialize,serde::Deserialize)]
+struct RememberedCommand {
+    #[serde(flatten)] command: ChildCmd,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    installed_cli: Option<crate::bluegreen::InstalledCli>,
+}
+struct SavedSupervisor { path: PathBuf, installed_cli: Option<crate::bluegreen::InstalledCli> }
+impl SavedSupervisor {
+    fn remember(&self,command:&ChildCmd)->std::io::Result<()> {
+        let bytes=serde_json::to_vec(&RememberedCommand{command:command.clone(),installed_cli:self.installed_cli.clone()}).map_err(std::io::Error::other)?;
+        crate::util::write_secret(&self.path,&bytes,0o600)
+    }
+    fn forget_selection(&self,own:&ChildCmd)->std::io::Result<()> {
+        if self.installed_cli.is_some() {self.remember(own)} else {std::fs::remove_file(&self.path)}
+    }
 }
 
 impl ChildCmd {
@@ -298,11 +325,18 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
     if runner {
         own = crate::rt::blocking(move || { own.pin()?; anyhow::Ok(own) }).await??;
     }
-    let saved = current_path(&opts.state_dir, &opts.args);
-    let mut current = std::fs::read(&saved).ok().and_then(|b| serde_json::from_slice::<ChildCmd>(&b).ok()).filter(|c| c.exe.is_file()).unwrap_or_else(|| own.clone());
+    let saved_path=current_path(&opts.state_dir,&opts.args);
+    let remembered=std::fs::read(&saved_path).ok().and_then(|bytes|serde_json::from_slice::<RememberedCommand>(&bytes).ok());
+    let explicit_context=opts.installed_cli.is_some();
+    let stale_context=remembered.as_ref().is_some_and(|saved|saved.installed_cli.is_some());
+    let installed_cli=opts.installed_cli;
+    if let Some(context)=&installed_cli {context.validate()?;}
+    let saved=SavedSupervisor{path:saved_path,installed_cli};
+    let mut current=remembered.map(|saved|saved.command).filter(|command|command.exe.is_file()).unwrap_or_else(||own.clone());
     if runner {
         current = crate::rt::blocking(move || { current.pin()?; anyhow::Ok(current) }).await??;
     }
+    if explicit_context || stale_context {saved.remember(&current)?;}
     let control_at = control_path(&opts.state_dir, &opts.args);
     let ctl = control::listen(&control_at).map_err(|e| tracing::warn!(error = %format!("{e:#}"), "no control socket: upgrades of the child aren't blue/green")).ok();
     let ctl_path = ctl.as_ref().map(|_| control_at.as_path());
@@ -368,7 +402,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
                     // A promoted build that can't start: back to this supervisor's own.
                     if current != own {
                         current = own.clone();
-                        let _ = std::fs::remove_file(&saved);
+                        let _ = saved.forget_selection(&own);
                     }
                     crate::rt::sleep(crate::sup::jitter(backoff)).await;
                     backoff = (backoff * 2).min(MAX_BACKOFF);
@@ -453,9 +487,10 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
                         }
                     }
                 }
-                Ev::Control(Some(stream)) => {
+                Ev::Control(Some(mut stream)) => {
                     let req = stream.request().await;
                     let answer = match req {
+                        Ok(Request::InstalledCli{owner}) if stream.is_context() => installed_cli_answer(owner,stream.context_peer(),control.pid().and_then(|pid|u32::try_from(pid).ok()),&candidate,generation,&saved),
                         Ok(r) => handle(r, &mut candidate, &saved, generation, ctl_path, runner, if runner { control.pid().and_then(|p| u32::try_from(p).ok()) } else { None }).await,
                         Err(e) => serde_json::json!({ "ok": false, "error": format!("{e:#}") }),
                     };
@@ -477,7 +512,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
                     if exe_mtime(&exe) != started_mtime && !std::mem::replace(&mut noticed, true) {
                         tracing::info!(exe = %exe.display(), "kiln was installed again; the runner runs it from its next start");
                         current = own.clone();
-                        let _ = std::fs::remove_file(&saved);
+                        let _ = saved.forget_selection(&own);
                     }
                 }
                 Ev::UpgradeCheck => {
@@ -571,7 +606,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
                         tracing::error!("{msg}");
                         crash_log(&opts.state_dir, &msg);
                         current = own.clone();
-                        let _ = std::fs::remove_file(&saved);
+                        let _ = saved.forget_selection(&own);
                         quick_ends = 0;
                     }
                 }
@@ -630,15 +665,28 @@ enum Request {
         #[serde(default)]
         kill: bool,
     },
+    /// U16: bounded read-only context framing; no mutation or Ready transition.
+    InstalledCli {owner:crate::bluegreen::ActivationOwner},
+}
+
+fn installed_cli_answer(owner:crate::bluegreen::ActivationOwner,peer:Option<u32>,current:Option<u32>,candidate:&Option<Candidate>,generation:u64,saved:&SavedSupervisor)->serde_json::Value {
+    if peer!=Some(owner.pid) || !owns_activation(owner,current,candidate,generation) {
+        return serde_json::json!({"ok":false,"error":"unsupported original supervisor owner"});
+    }
+    match &saved.installed_cli {
+        Some(context)=>serde_json::json!({"ok":true,"owner":owner,"installed_cli":context}),
+        None=>serde_json::json!({"ok":false,"error":"unsupported installed CLI context"}),
+    }
 }
 
 fn owns_activation(owner: crate::bluegreen::ActivationOwner, current: Option<u32>, candidate: &Option<Candidate>, generation: u64) -> bool {
     owner.generation == generation && current.is_some() && (current == Some(owner.pid) || candidate.as_ref().is_some_and(|c| c.pid == owner.pid))
 }
 
-async fn handle(r: Request, candidate: &mut Option<Candidate>, saved: &Path, generation: u64, ctl: Option<&Path>, runner_role: bool, runner: Option<u32>) -> serde_json::Value {
+async fn handle(r: Request, candidate: &mut Option<Candidate>, saved: &SavedSupervisor, generation: u64, ctl: Option<&Path>, runner_role: bool, runner: Option<u32>) -> serde_json::Value {
     use serde_json::json;
     match r {
+        Request::InstalledCli { .. } => json!({"ok":false,"error":"installed context requires bounded framing and the kernel peer"}),
         Request::Activation { owner } => {
             let ok = cfg!(unix) && runner_role && owns_activation(owner, runner, candidate, generation);
             json!({ "ok": ok, "error": if ok { "" } else { "U16: no explicit activation backend for this owned runner process" } })
@@ -678,7 +726,7 @@ async fn handle(r: Request, candidate: &mut Option<Candidate>, saved: &Path, gen
         Request::Promote { pid } => match candidate {
             Some(c) if c.pid == pid => {
                 c.promoted = true;
-                let written = serde_json::to_vec(&c.cmd).map_err(std::io::Error::other).and_then(|b| crate::util::write_secret(saved, &b, 0o600));
+                let written = saved.remember(&c.cmd);
                 if let Err(e) = written {
                     tracing::warn!(error = %e, "couldn't remember the promoted build: a restart of the supervisor starts its own");
                 }
@@ -706,17 +754,26 @@ async fn handle(r: Request, candidate: &mut Option<Candidate>, saved: &Path, gen
     }
 }
 
-/// The control socket (Unix only: elsewhere upgrades of the child aren't blue/green).
+/// The same supervisor control listener. Legacy mutators retain their original
+/// JSON-line framing and post-send waits. Only @-prefixed read-only context has
+/// a 64 KiB frame and the remaining five-second accepted-connection budget.
 mod control {
     use std::path::Path;
+    #[cfg(unix)]
+    use std::time::{Duration, Instant};
+    #[cfg(unix)]
+    use anyhow::Context as _;
 
     #[cfg(unix)]
-    pub struct Listener(std::os::unix::net::UnixListener);
+    pub struct Listener(hyper_rt::local::LocalListener);
     #[cfg(not(unix))]
     pub struct Listener;
-
     #[cfg(unix)]
-    pub struct Stream(std::os::unix::net::UnixStream);
+    pub struct Stream {
+        inner: hyper_rt::local::LocalStream,
+        accepted: Instant,
+        context: bool,
+    }
     #[cfg(not(unix))]
     pub struct Stream;
 
@@ -724,84 +781,102 @@ mod control {
     pub fn listen(path: &Path) -> anyhow::Result<Listener> {
         use std::os::unix::fs::PermissionsExt as _;
         let _ = std::fs::remove_file(path);
-        let l = std::os::unix::net::UnixListener::bind(path)?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        l.set_nonblocking(true)?;
-        Ok(Listener(l))
+        let listener = hyper_rt::local::LocalListener::bind(path,128)?;
+        std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o600))?;
+        Ok(Listener(listener))
     }
-
     #[cfg(not(unix))]
-    pub fn listen(_path: &Path) -> anyhow::Result<Listener> {
-        anyhow::bail!("no Unix sockets here")
-    }
+    pub fn listen(_path: &Path) -> anyhow::Result<Listener> { anyhow::bail!("no Unix sockets here") }
 
-    /// The next connection (`None` on a failed accept); never, without a listener.
     #[cfg(unix)]
-    pub async fn accept(l: Option<&Listener>) -> Option<Stream> {
-        use std::os::fd::AsRawFd as _;
-        let Some(Listener(l)) = l else { return std::future::pending().await };
-        loop {
-            match l.accept() {
-                Ok((s, _)) => return Some(Stream(s)),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    if hyper_rt::readiness::readable(l.as_raw_fd()).await.is_err() {
-                        crate::rt::sleep(std::time::Duration::from_millis(200)).await;
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => {
-                    tracing::warn!(error = %e, "supervisor control accept failed");
-                    crate::rt::sleep(std::time::Duration::from_millis(500)).await;
-                    return None;
-                }
+    pub async fn accept(listener: Option<&Listener>) -> Option<Stream> {
+        let Some(Listener(listener)) = listener else { return std::future::pending().await };
+        match listener.accept().await {
+            Ok(inner) => Some(Stream {inner,accepted:Instant::now(),context:false}),
+            Err(error) => {
+                tracing::warn!(error=%error,"supervisor control accept failed");
+                crate::rt::sleep(Duration::from_millis(500)).await;
+                None
             }
         }
     }
-
     #[cfg(not(unix))]
-    pub async fn accept(_l: Option<&Listener>) -> Option<Stream> {
-        std::future::pending().await
-    }
+    pub async fn accept(_listener: Option<&Listener>) -> Option<Stream> { std::future::pending().await }
 
     impl Stream {
-        /// Its one request: a JSON line.
         #[cfg(unix)]
-        pub async fn request(&self) -> anyhow::Result<super::Request> {
-            let s = self.0.try_clone()?;
-            let line = crate::rt::blocking(move || -> anyhow::Result<String> {
-                use std::io::BufRead as _;
-                s.set_nonblocking(false)?;
-                s.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
-                let mut line = String::new();
-                std::io::BufReader::new(s).read_line(&mut line)?;
-                Ok(line)
-            })
-            .await??;
-            Ok(serde_json::from_str(&line)?)
+        fn remaining(&self) -> anyhow::Result<Duration> {
+            crate::bluegreen::CONTEXT_WITHIN.checked_sub(self.accepted.elapsed()).context("context deadline elapsed")
         }
-
+        #[cfg(unix)]
+        pub fn context_peer(&self) -> Option<u32> {
+            if !self.context { return None; }
+            let peer=self.inner.peer().ok()?;
+            (peer.user==hyper_rt::local::current_user().ok()?).then_some(peer.pid).flatten()
+        }
         #[cfg(not(unix))]
-        pub async fn request(&self) -> anyhow::Result<super::Request> {
-            anyhow::bail!("no Unix sockets here")
-        }
+        pub fn context_peer(&self) -> Option<u32> { None }
 
         #[cfg(unix)]
-        pub async fn answer(self, v: &serde_json::Value) {
-            let mut line = v.to_string();
-            line.push('\n');
-            let _ = crate::rt::blocking(move || {
-                use std::io::Write as _;
-                let mut s = self.0;
-                let _ = s.set_nonblocking(false);
-                s.write_all(line.as_bytes())
-            })
-            .await;
-        }
-
+        pub fn is_context(&self) -> bool { self.context }
         #[cfg(not(unix))]
-        pub async fn answer(self, _v: &serde_json::Value) {}
+        pub fn is_context(&self) -> bool { false }
+
+        #[cfg(unix)]
+        pub async fn request(&mut self) -> anyhow::Result<super::Request> {
+            // Preserve the existing generic intake's ten-second read inactivity
+            // limit before the first byte identifies a protocol. It grants no
+            // effect. The context client owns its own overall five-second limit.
+            let mut first=[0u8;1];
+            let read=crate::rt::timeout(Duration::from_secs(10),self.inner.read(&mut first)).await??;
+            anyhow::ensure!(read==1,"empty supervisor control request");
+            if first.first().copied()==Some(crate::bluegreen::CONTEXT_MARKER) {
+                self.context=true;
+                let remaining=self.remaining()?;
+                let value=crate::rt::timeout(remaining,crate::bluegreen::read_context_frame(&self.inner)).await??;
+                let request=serde_json::from_value(value)?;
+                anyhow::ensure!(matches!(&request,super::Request::InstalledCli{..}),"context frame cannot carry a mutating command");
+                return Ok(request);
+            }
+            // Legacy Start argv/env are not assigned the new context frame cap.
+            // Their per-read inactivity timeout remains ten seconds and no new
+            // Start/Promote/Stop post-send timeout or no-effect claim is added.
+            let mut line=Vec::from(first);
+            let mut buffer=[0u8;4096];
+            loop {
+                if line.last().copied()==Some(b'\n') { break; }
+                let read=crate::rt::timeout(Duration::from_secs(10),self.inner.read(&mut buffer)).await??;
+                if read==0 { break; }
+                let part=buffer.get(..read).context("control read length")?;
+                if let Some(end)=part.iter().position(|byte|*byte==b'\n') {
+                    line.extend_from_slice(part.get(..=end).context("control delimiter")?);
+                    break;
+                }
+                line.extend_from_slice(part);
+            }
+            let request=serde_json::from_slice(&line)?;
+            anyhow::ensure!(!matches!(&request,super::Request::InstalledCli{..}),"installed context requires its bounded framing");
+            Ok(request)
+        }
+        #[cfg(not(unix))]
+        pub async fn request(&mut self) -> anyhow::Result<super::Request> { anyhow::bail!("no Unix sockets here") }
+
+        #[cfg(unix)]
+        pub async fn answer(self,value:&serde_json::Value) {
+            if self.context {
+                if let (Ok(remaining),Ok(bytes))=(self.remaining(),crate::bluegreen::context_frame(value)) {
+                    let _=crate::rt::timeout(remaining,self.inner.write_all(&bytes)).await;
+                }
+            } else {
+                let mut bytes=value.to_string().into_bytes();bytes.push(b'\n');
+                let _=self.inner.write_all(&bytes).await;
+            }
+        }
+        #[cfg(not(unix))]
+        pub async fn answer(self,_value:&serde_json::Value) {}
     }
 }
+
 
 async fn stop_child(exited: &mut oneshot::Receiver<Ended>, control: &mut ChildControl) {
     control.stop();
@@ -815,7 +890,7 @@ async fn stop_child(exited: &mut oneshot::Receiver<Ended>, control: &mut ChildCo
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     use anyhow::Context as _;
 
     #[cfg(target_os = "linux")]
@@ -823,7 +898,7 @@ mod tests {
     fn a_new_build_is_started_promoted_and_killed_as_the_runner_asks() -> anyhow::Result<()> {
         crate::rt::block_on(async {
             let dir = tempfile::tempdir()?;
-            let saved = dir.path().join("supervise-x.json");
+            let saved = SavedSupervisor {path:dir.path().join("supervise-x.json"),installed_cli:None};
             let mut candidate = None;
             let ask = |json: &str| serde_json::from_str::<Request>(json).map_err(anyhow::Error::from);
             let legacy = r#"{"op":"start","exe":"/bin/sleep","args":["60"]}"#;
@@ -831,11 +906,11 @@ mod tests {
             for current in [Some(std::process::id()), None] {
                 let refused = handle(ask(legacy)?, &mut candidate, &saved, 1, None, true, current).await;
                 assert_eq!(refused.get("ok"), Some(&serde_json::Value::Bool(false)), "legacy Start cannot activate a runner, even with unknown PID");
-                assert!(candidate.is_none() && !saved.exists());
+                assert!(candidate.is_none() && !saved.path.exists());
             }
             let unknown = handle(ask(&start)?, &mut candidate, &saved, 1, None, true, None).await;
             assert_eq!(unknown.get("ok"), Some(&serde_json::Value::Bool(false)), "a claimed owner cannot replace the runner's missing physical handle");
-            assert!(candidate.is_none() && !saved.exists());
+            assert!(candidate.is_none() && !saved.path.exists());
             let v = handle(ask(&start)?, &mut candidate, &saved, 1, None, true, Some(std::process::id())).await;
             let pid = v.get("pid").and_then(serde_json::Value::as_u64).and_then(|p| u32::try_from(p).ok()).context("no pid")?;
             assert!(crate::os::pid_alive(pid));
@@ -847,12 +922,21 @@ mod tests {
             assert_eq!(wrong.get("ok"), Some(&serde_json::Value::Bool(false)));
             let ok = handle(ask(&format!(r#"{{"op":"promote","pid":{pid}}}"#))?, &mut candidate, &saved, 1, None, true, Some(std::process::id())).await;
             assert_eq!(ok.get("ok"), Some(&serde_json::Value::Bool(true)));
-            let kept: ChildCmd = serde_json::from_slice(&std::fs::read(&saved)?)?;
+            let kept: ChildCmd = serde_json::from_slice(&std::fs::read(&saved.path)?)?;
             assert_eq!(kept.exe, PathBuf::from("/bin/sleep"));
             assert_eq!(kept.args, vec!["60".to_owned()]);
             assert!(kept.sha256.is_some());
+            let context=crate::bluegreen::InstalledCli::from_install(crate::bluegreen::InstalledCli::conventional(false),false)?;
+            let bound=SavedSupervisor{path:saved.path.clone(),installed_cli:Some(context.clone())};
+            let current_owner=crate::bluegreen::ActivationOwner{pid:std::process::id(),generation:1};
+            assert_eq!(installed_cli_answer(current_owner,Some(current_owner.pid),Some(current_owner.pid),&candidate,1,&bound).get("installed_cli"),Some(&serde_json::to_value(&context)?));
+            for (peer,generation) in [(None,1),(Some(pid),1),(Some(current_owner.pid),2)] {
+                assert_eq!(installed_cli_answer(current_owner,peer,Some(current_owner.pid),&candidate,generation,&bound).get("ok"),Some(&serde_json::Value::Bool(false)));
+            }
+            assert_eq!(installed_cli_answer(current_owner,Some(current_owner.pid),Some(current_owner.pid),&candidate,1,&saved).get("ok"),Some(&serde_json::Value::Bool(false)),"unbound startup never guesses the selected image");
             let owner = crate::bluegreen::ActivationOwner { pid, generation: 1 };
             assert!(owns_activation(owner, Some(std::process::id()), &candidate, 1));
+            assert_eq!(installed_cli_answer(owner,Some(pid),Some(std::process::id()),&candidate,1,&bound).get("installed_cli"),Some(&serde_json::to_value(&context)?),"original candidate gets the same supervisor context before Ready");
             assert!(!owns_activation(owner, Some(std::process::id()), &candidate, 2));
             assert!(!owns_activation(owner, None, &candidate, 1), "a server child never advertises runner activation");
             let answer = handle(Request::Activation { owner }, &mut candidate, &saved, 1, None, true, Some(std::process::id())).await;
@@ -946,5 +1030,44 @@ mod tests {
             Takes::Restart
         };
         assert_eq!(takes_upgrade(&args(&["--config=/c.toml", "agent", "--name", "x"])), runner);
+        // The marked read-only intake is portable across Unix runtimes. This
+        // existing fixture runs on macOS too; Linux's child lifecycle fixture
+        // above retains its original start/promote/kill behavior unchanged.
+        #[cfg(unix)]
+        {
+            let checked=crate::rt::block_on(async move {
+                let dir=tempfile::Builder::new().prefix("ku16-server-").tempdir_in("/tmp")?;
+                let context=crate::bluegreen::InstalledCli::from_install(crate::bluegreen::InstalledCli::conventional(false),false)?;
+                let bound=SavedSupervisor{path:dir.path().join("supervise.json"),installed_cli:Some(context)};
+                let candidate=None;
+                let wrong_pid=std::process::id().checked_add(1).context("fixture PID overflow")?;
+                for (said,epoch,want) in [(std::process::id(),1,true),(wrong_pid,1,false),(std::process::id(),2,false)] {
+                    let at=dir.path().join(format!("context-{said}-{epoch}.sock"));
+                    let listener=control::listen(&at)?;
+                    let exchange=async {
+                        let serving=async {
+                            let mut stream=control::accept(Some(&listener)).await.context("missing context fixture connection")?;
+                            let Request::InstalledCli{owner}=stream.request().await? else {anyhow::bail!("not a context request")};
+                            let answer=installed_cli_answer(owner,stream.context_peer(),Some(std::process::id()),&candidate,1,&bound);
+                            stream.answer(&answer).await;
+                            anyhow::Ok(())
+                        };
+                        let asking=async {
+                            let stream=hyper_rt::local::LocalStream::connect(&at).await?;
+                            let bytes=crate::bluegreen::context_frame(&serde_json::json!({"op":"installed_cli","owner":{"pid":said,"generation":epoch}}))?;
+                            stream.write_all(&[crate::bluegreen::CONTEXT_MARKER]).await?;stream.write_all(&bytes).await?;
+                            let answer=crate::bluegreen::read_context_frame(&stream).await?;
+                            assert_eq!(answer.get("ok"),Some(&serde_json::Value::Bool(want)),"real kernel peer/owner/generation refusal");
+                            anyhow::Ok(())
+                        };
+                        futures::try_join!(serving,asking)?;
+                        anyhow::Ok(())
+                    };
+                    crate::rt::timeout(Duration::from_secs(3),exchange).await??;
+                }
+                anyhow::Ok(())
+            });
+            assert!(checked.is_ok(),"portable marked context intake failed: {checked:#?}");
+        }
     }
 }
