@@ -151,6 +151,10 @@ hyper-durable = { version = "=0.1.0", features = ["test-store"] }
 # Allocations and page faults counted (benches/collect.rs), as kiln-obs's benches count them.
 hyper-measure = "=0.1.0"
 
+# A signal to one thread (`pthread_kill`: tests/cache_tools.rs), for tests alone.
+[target.'cfg(unix)'.dev-dependencies]
+nix = { version = "0.31.3", features = ["pthread", "signal"] }
+
 [[bench]]
 name = "collect"
 harness = false

@@ -9,10 +9,9 @@ Plan 01a18e5191f0738abebeef6c8df0e88a carried the work in ten steps, and docs/ci
 requirements, W26-R21 to W26-R27.
 
 **Where it stands (2026-10-31, when written):**
-- **Merged:** with this file, onto local main, on Ada's word, as a merge with main first. The
-  branch is ship-actions, with local main 656fb3e427 merged in (3ecc8312e8). It also holds
-  origin/main up to d50f1fd322 (10-30). Local main and origin/main had drifted apart, by 55 commits
-  and 126. Production's 96b3afd1a8 and origin's 26 commits since 10-30 aren't in this branch.
+- **Merged:** with this file, onto main, on Ada's word, as a merge with main first. The branch is
+  ship-actions, with main c305a41e1c merged in (a67b1907f2). That's both mains together, local and
+  origin, production's 96b3afd1a8 among them.
 - **Deployed:** not yet. That waits for Ada's word.
 - **Checked at the tree that lands:**
   - the UI's typecheck, lint, tests and build;
@@ -68,6 +67,14 @@ requirements, W26-R21 to W26-R27.
   their branches.
 - **Store.** Migration 20261030-2100_w26_paused adds `jobs.paused_at` and `jobs.paused_ms`. Being
   paused is `paused_at` being set; the job's status stays what it was.
+
+- **One cgroup per CI job.** Main's fix for the 2026-10-29 outage (1bd81fe179) put each host step
+  in `kiln-jobs/<job>`, released when the step ended. That way a kiln a step starts holds its
+  agents there, never in the runner's `kiln-agents`. Pause's group, `kiln-jobs-<pid>/<job>`, is
+  joined by every step of the job and lasts for the whole job. A process is in one cgroup, so the
+  merge keeps one group, Pause's, and it serves both purposes:
+  - `os::JobGroup` and `contain::job_group` go;
+  - a runner's start prunes main's `kiln-jobs` folder once empty.
 
 ## Deploying it
 

@@ -32,6 +32,10 @@ async fn list(cx: Cx, v: Value) -> Out {
     let session = s("session").filter(|x| !x.trim().is_empty());
     let proposed = v.get("proposed").and_then(|p| p.as_bool().or_else(|| p.as_str().map(|s| s == "true" || s == "1"))).unwrap_or(false);
     let plans = super::of_source(super::list(&cx.hub, s("q"), s("tag")).await.map_err(fail)?, session.as_deref(), proposed);
+    // In brief: what each is and where it stands, without its words, items or steps' titles.
+    if v.get("brief").is_some_and(|b| b.as_bool().unwrap_or_else(|| matches!(b.as_str(), Some("1" | "true")))) {
+        return json_of(&json!({"plans": plans.iter().map(super::brief).collect::<Vec<_>>()}));
+    }
     json_of(&json!({"plans": plans}))
 }
 
@@ -141,6 +145,8 @@ async fn ready(cx: Cx, v: Value) -> Out {
     if !matches!(then, "goals" | "agents" | "review") {
         return Err((StatusCode::BAD_REQUEST, "`then` is goals, agents or review".into()));
     }
+    // Sent back for changes by the person reviewing it (`plans.review`, revise): it comes back to them.
+    let then = if super::review::last(&cx.hub, &id).await.map_err(fail)?.is_some_and(|r| r.answer == super::review::Answer::Revise) { "review" } else { then };
     let skipped: Option<crate::research::Skipped> =
         v.get("skipped").cloned().filter(|s| !s.is_null()).map(serde_json::from_value).transpose().map_err(|e| (StatusCode::BAD_REQUEST, format!("`skipped`: {e}")))?;
     let was_planning = p.phase == "planning";
@@ -191,6 +197,33 @@ async fn ready(cx: Cx, v: Value) -> Out {
     }
     cx.hub.store.audit(cx.caller.name.clone(), "plan.ready".into(), format!("{} (v{})", plan.title, plan.version)).await;
     Ok(out)
+}
+
+/// A person's answer to a plan its agent's goal stack waits on (`super::review`): approve, reject, or
+/// revise with their words; for the version they looked at. A person's: an agent can't answer one.
+async fn review(cx: Cx, v: Value) -> Out {
+    if cx.caller.agent.is_some() {
+        return Err((StatusCode::FORBIDDEN, "a plan waiting on a person's review is answered by a person, in its agent's Plan tab".into()));
+    }
+    let id = id_of(&v)?;
+    let answer = match v.get("answer").and_then(Value::as_str) {
+        Some("approve") => super::review::Answer::Approve,
+        Some("reject") => super::review::Answer::Reject,
+        Some("revise") => super::review::Answer::Revise,
+        _ => return Err((StatusCode::BAD_REQUEST, "`answer` is approve, reject or revise".into())),
+    };
+    let asked = super::review::Asked {
+        answer: Some(answer),
+        words: v.get("words").and_then(Value::as_str).map(str::to_owned),
+        version: v.get("version").and_then(Value::as_i64),
+        key: scoped_key(&cx, &v)?,
+    };
+    let p = super::get(&cx.hub, &id).await.map_err(fail)?;
+    let agent = p.source.as_ref().and_then(|s| s.goal.as_ref()).map(|g| g.agent.clone()).unwrap_or_default();
+    let by = crate::goals::By::of(&cx.hub, &cx.caller, &agent);
+    let (plan, stack) = super::review::answer(&cx.hub, &id, asked, &cx.caller.name, &by).await.map_err(fail)?;
+    cx.hub.store.audit(cx.caller.name.clone(), "plan.review".into(), format!("{} (v{}): {}", p.title, p.version, v.get("answer").and_then(Value::as_str).unwrap_or_default())).await;
+    json_of(&json!({"plan": plan, "stack": stack}))
 }
 
 async fn versions(cx: Cx, v: Value) -> Out {
@@ -287,7 +320,7 @@ pub fn list_ops() -> Vec<Op> {
     vec![
         Op {
             name: "plans.list",
-            summary: "Plans kept in kiln, newest change first; `q` matches title, text or tags, `tag` keeps one tag, `session` an agent's (made in its conversation), and `proposed` the one each agent proposed (plan mode), kept by kiln.",
+            summary: "Plans kept in kiln, newest change first; `q` matches title, text or tags, `tag` keeps one tag, `session` an agent's (made in its conversation), and `proposed` the one each agent proposed (plan mode), kept by kiln; `brief` gives each without its words, items or steps' titles (`step_count` says how many), for a long list.",
             read_only: true,
             destructive: false,
             input: Input::of::<input::PlansList>(),
@@ -329,6 +362,15 @@ pub fn list_ops() -> Vec<Op> {
             input: Input::of::<input::PlansReady>(),
             route: |v| Ok((Method::POST, path(&["api", "plans", &id_of(v)?, "ready"]))),
             run: |cx, v| Box::pin(ready(cx, v)),
+        },
+        Op {
+            name: "plans.review",
+            summary: "A person's answer to a plan its agent's goal stack waits on (one said ready with `then: review`), for the `version` they looked at: `approve` (the stack resumes: its steps go to the agent), `reject` (its steps come off the stack, the goal it was made from is skipped, the agent is told, and the stack waits for them), or `revise` with `words` (the agent changes it as they say, and it comes back to them for review). A person's to give, in the agent's Plan tab: agents can't. `key`: asked again under it, it's answered as things stand.",
+            read_only: false,
+            destructive: false,
+            input: Input::of::<input::PlansReview>(),
+            route: |v| Ok((Method::POST, path(&["api", "plans", &id_of(v)?, "review"]))),
+            run: |cx, v| Box::pin(review(cx, v)),
         },
         Op {
             name: "plans.versions",
@@ -409,6 +451,8 @@ pub mod input {
         pub tag: Option<String>,
         pub session: Option<String>,
         pub proposed: Option<bool>,
+        /// Each in brief: without its words, items or steps' titles.
+        pub brief: Option<bool>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
@@ -515,6 +559,30 @@ pub mod input {
         pub then: Option<PlansReadyThen>,
         /// Why its research has no internal, or no external, sources.
         pub skipped: Option<PlansReadySkipped>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum PlansReviewAnswer {
+        Approve,
+        Reject,
+        Revise,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct PlansReview {
+        /// The plan's id.
+        pub id: String,
+        pub answer: PlansReviewAnswer,
+        /// Revise: what should change, in the person's words.
+        pub words: Option<String>,
+        /// The version looked at (none: as it is now).
+        pub version: Option<i64>,
+        /// An idempotency key: asked again under it (its answer lost), it's answered as things
+        /// stand and nothing more is done (CP-T3.2). Without it, an answer asked again once the
+        /// first went through is refused, nothing waiting on the review any more: pass it.
+        pub key: Option<String>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]

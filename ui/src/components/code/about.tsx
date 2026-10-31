@@ -13,6 +13,7 @@
 import * as React from "react";
 import { flushSync } from "react-dom";
 import { harnessApi, useSession, type AgentResult, type HEvent, type SessionStore } from "@/api/harness";
+import { copyText } from "@/views/terminal/clipboard";
 import "./about.css";
 
 /** The agent whose code it is: who asking goes to. */
@@ -439,7 +440,7 @@ export function AboutCard({ ask, onClose, closing = false, onGone }: { ask: Aske
                 type="button"
                 className="hx-about-btn"
                 onClick={() => {
-                  void navigator.clipboard?.writeText(ask.selection ?? ask.code).then(() => setCopied(true));
+                  void copyText(ask.selection ?? ask.code).then(setCopied);
                 }}
               >
                 {copied ? "Copied" : "Copy"}

@@ -435,7 +435,8 @@ impl Exec {
         let (prog, args) = self.command_line(shell, script);
         let mut cmd = Command::new(prog);
         cmd.args(args).current_dir(cwd).envs(env);
-        // In its job's cgroup from its first instruction, so the job can be frozen whole (W26-R22).
+        // In its job's cgroup from its first instruction: the job can be frozen whole (W26-R22), and
+        // a kiln it starts holds its agents there, never in the runner's (the 2026-10-29 outage).
         crate::runner::freeze::enter(&self.assign.job_id, &mut cmd);
         // On the CPUs its job may use: its own share, or what no share holds (W05-R03).
         let mut running = crate::runner::cpus::spawn_on(&self.assign.job_id, move || crate::proc::spawn_group(cmd))?;

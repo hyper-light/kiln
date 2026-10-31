@@ -2057,6 +2057,12 @@ impl Codex {
         !self.waiting.is_empty()
     }
 
+    /// What it held for its thread, in order, out of its hands: Codex never got any of it, and its
+    /// process is gone (`Adapter::let_go`).
+    pub fn take_held(&mut self) -> Vec<QueueItem> {
+        std::mem::take(&mut self.waiting)
+    }
+
     /// The account reached its usage limit (`usageLimitExceeded`): the session pauses until it
     /// resets, its turn noted as cut off. Said once.
     fn limit_reached(&mut self, core: &mut Core, said: &str) {

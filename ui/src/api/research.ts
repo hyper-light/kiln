@@ -102,6 +102,22 @@ export interface Research {
   markdown?: string;
 }
 
+/** Research in brief (`brief`), as an agent's Plan tab lists it: no sources or citations. */
+export interface ResearchBrief {
+  id: string;
+  question: string;
+  agent: string | null;
+  by: string;
+  plan: string | null;
+  summary: Research["summary"];
+  /** Its findings' grades, the strongest first. */
+  grades: Grade[];
+  /** Its strongest finding's claim. */
+  best: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
 const enc = encodeURIComponent;
 
 export const researchApi = {
@@ -111,6 +127,8 @@ export const researchApi = {
     const q = new URLSearchParams(Object.entries(of).filter((e): e is [string, string] => !!e[1])).toString();
     return request<{ research: Research[] }>("GET", `/api/research${q ? `?${q}` : ""}`, undefined, { signal });
   },
+  /** The newest 100 in brief; `q`: those whose question, findings, quotes or sources hold it. */
+  briefs: (q: string, signal?: AbortSignal) => request<{ research: ResearchBrief[] }>("GET", `/api/research?brief=1${q ? `&q=${enc(q)}` : ""}`, undefined, { signal }),
 };
 
 export const researchHref = (id: string) => `/agents/research/${enc(id)}`;

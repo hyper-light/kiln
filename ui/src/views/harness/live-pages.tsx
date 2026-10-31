@@ -13,6 +13,7 @@ import { Loadable } from "@/components/ui/loading";
 import { SelectField } from "@/components/ui/misc";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
+import { copyLater } from "@/views/terminal/clipboard";
 import { Live } from "./live";
 import { typedUrl, type LiveStream } from "./live-of";
 import "./live.css";
@@ -184,14 +185,7 @@ function Pages({ session }: { session: string }) {
     const w = how === "here" ? window.open("", "_blank") : null;
     let made: (url: string) => void = () => undefined;
     const link = new Promise<string>((r) => (made = r));
-    if (how === "copy") {
-      const later = () => void link.then((u) => (u ? navigator.clipboard?.writeText(u) : undefined)).catch(() => undefined);
-      try {
-        navigator.clipboard.write([new ClipboardItem({ "text/plain": link.then((u) => (u ? new Blob([u], { type: "text/plain" }) : Promise.reject(new Error("no link")))) })]).catch(later);
-      } catch {
-        later();
-      }
-    }
+    const copied = how === "copy" ? copyLater(link) : null;
     setDeviceBusy(true);
     setError(null);
     setNote(null);
@@ -203,7 +197,7 @@ function Pages({ session }: { session: string }) {
         w.opener = null;
         w.location.href = o.url;
       }
-      if (how === "copy") setNote("Link copied. Open it on your other device within ten minutes: it works once.");
+      if (copied) setNote(`${(await copied) ? "Link copied" : `The browser wouldn't copy it: ${o.url ?? ""}`}. Open it on your other device within ten minutes: it works once.`);
     } catch (e) {
       made("");
       w?.close();

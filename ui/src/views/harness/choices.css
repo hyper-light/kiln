@@ -583,7 +583,7 @@ textarea.ch-free {
   font-size: 12.5px;
 }
 /* Phones zoom into fields under 16px. */
-.ch[data-layout="sheet"] :is(.ch-input, .ch-select),
+.ch[data-layout="sheet"] :is(.ch-input, .ch-pick),
 .ch[data-layout="sheet"] .ch-mono {
   font-size: 16px;
 }
@@ -591,7 +591,7 @@ textarea.ch-free {
   .ch {
     --ch-input-size: 16px;
   }
-  .ch :is(.ch-input, .ch-select),
+  .ch :is(.ch-input, .ch-pick),
   .ch .ch-mono {
     font-size: 16px;
   }
@@ -883,11 +883,9 @@ textarea.ch-free {
   gap: 2px;
   min-width: 0;
   margin: 0;
-  color: #c4c6cd;
-  font-family: var(--font-mono);
-  font-size: 11px;
+  color: var(--ch-muted);
+  font-size: 12.5px;
   font-variant-numeric: tabular-nums;
-  letter-spacing: 0.01em;
 }
 .ch-problem {
   color: var(--ch-warn);
@@ -940,12 +938,6 @@ textarea.ch-free {
   background-size: 250% 100%;
   animation: ch-current 6s ease-in-out infinite alternate;
 }
-.ch-x-sub {
-  margin: 0;
-  color: var(--ch-muted);
-  font-size: 12.5px;
-  line-height: 1.6;
-}
 .ch-x-of {
   margin: 2px 0 0;
   padding-left: 10px;
@@ -954,10 +946,6 @@ textarea.ch-free {
   font-size: 12.5px;
   line-height: 1.55;
   overflow-wrap: anywhere;
-}
-/* Phones: the question it tries says enough. */
-.ch[data-layout="sheet"] .ch-x-sub {
-  display: none;
 }
 .ch-x-sec {
   display: flex;
@@ -987,28 +975,11 @@ textarea.ch-free {
   margin: 0;
   font: inherit;
 }
-.ch-x-aside {
-  color: var(--ch-faint);
-  letter-spacing: 0.02em;
-  text-transform: none;
-}
-.ch-x-aside .ch-warn {
-  font-family: var(--font-mono);
-  font-size: 10px;
-}
+/* adding a check or a metric: a line of its own under the list */
 .ch-add {
-  min-height: 24px;
-  margin: -4px -4px -4px 0;
-  font-family: var(--font-sans);
-  font-size: 12px;
-  letter-spacing: 0;
-  text-transform: none;
-}
-.ch-x-hint {
-  margin: 0;
-  color: var(--ch-muted);
-  font-size: 12px;
-  line-height: 1.55;
+  align-self: flex-start;
+  min-height: var(--ch-line-h);
+  font-size: 13.5px;
 }
 .ch-warn {
   margin: 0;
@@ -1020,7 +991,8 @@ textarea.ch-free {
   color: var(--ch-faint);
 }
 
-/* chips: toggles that wrap */
+/* chips: toggles that wrap (which question, a custom experiment's sets). Flat: a hairline under
+   each, the picked one a square tint over a straight prism-lit edge. */
 .ch-chips {
   display: flex;
   flex-wrap: wrap;
@@ -1030,147 +1002,226 @@ textarea.ch-free {
   position: relative;
   display: inline-flex;
   align-items: center;
-  gap: 8px;
   max-width: 100%;
   min-height: var(--ch-ctl);
-  padding: 4px 12px 4px 10px;
-  border: 1px solid var(--ch-edge);
-  border-radius: 5px;
-  background: var(--ch-field);
-  color: #c4c6cd;
+  padding: 4px 10px;
+  color: var(--ch-muted);
   font-size: 13px;
   line-height: 1.35;
   text-align: left;
+  box-shadow: inset 0 -1px 0 #2a2c33;
   overflow-wrap: anywhere;
   transition:
-    border-color 0.15s,
     background-color 0.15s,
     color 0.15s;
 }
 .ch-chip:hover {
-  border-color: #47464f;
   color: var(--ch-text);
 }
 .ch-chip[aria-checked="true"] {
-  border-color: #5a5275;
   background: #121119;
   color: var(--ch-bright);
-}
-.ch-chip-n {
-  color: var(--ch-faint);
-  font-family: var(--font-mono);
-  font-size: 10px;
-}
-.ch-chip[aria-checked="true"] .ch-chip-n {
-  background: var(--ch-prism);
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
-}
-.ch-chip[role="checkbox"][aria-checked="false"] {
-  border-style: dashed;
-  color: var(--ch-faint);
+  box-shadow: inset 0 -2px 0 #bab0e3;
 }
 .ch-set {
   justify-content: center;
-  min-width: 52px;
-  padding-inline: 10px;
+  min-width: 48px;
   font-family: var(--font-mono);
   font-size: 12px;
 }
-
-/* tiles: radio choices in a grid that wraps (two to a row on phones) */
-.ch-tiles {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(min(100%, 160px), 1fr));
-  gap: 6px;
+.ch-sets {
+  padding: 6px 0 10px;
 }
-.ch-tile {
-  position: relative;
+
+/* lines on hairlines: the options, the settings, the decision. No boxes: what a line is shows in
+   its words and its mark, its control at its right end. */
+.ch-x {
+  --ch-line-h: 40px;
+}
+/* Wide screens: a setting's words and its control within a reading's reach of each other. */
+.ch-x,
+.ch-foot[data-trying] {
+  max-width: 640px;
+}
+@media (pointer: coarse) {
+  .ch-x {
+    --ch-line-h: 44px;
+  }
+}
+.ch-list {
   display: flex;
   flex-direction: column;
-  justify-content: center;
-  gap: 3px;
   min-width: 0;
-  min-height: var(--ch-ctl);
-  padding: 8px 12px;
-  border: 1px solid #2a2c33;
-  border-radius: 6px;
-  background: var(--ch-field);
-  text-align: left;
-  transition:
-    border-color 0.15s,
-    background-color 0.15s;
-}
-.ch-tile:hover:not(:disabled) {
-  border-color: #47464f;
-}
-.ch-tile[aria-checked="true"] {
-  border-color: #4a4560;
-  background: #111018;
-}
-.ch-tile[aria-checked="true"]::after {
-  position: absolute;
-  right: 10px;
-  bottom: -1px;
-  left: 10px;
-  height: 1px;
-  background: var(--ch-prism);
-  background-size: 250% 100%;
-  animation: ch-current 6s ease-in-out infinite alternate;
-  content: "";
-}
-.ch-tile:disabled {
-  border-style: dashed;
-  cursor: not-allowed;
-}
-.ch-tile:disabled .ch-tile-label {
-  color: var(--ch-faint);
-}
-.ch-tile-top {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 8px;
-  min-width: 0;
-}
-.ch-tile-label {
-  min-width: 0;
-  color: var(--ch-text);
-  font-size: 13px;
-  line-height: 1.35;
-  overflow-wrap: anywhere;
-}
-.ch-tile-n {
-  flex: none;
-  color: var(--ch-muted);
-  font-family: var(--font-mono);
-  font-size: 10.5px;
-  font-variant-numeric: tabular-nums;
-}
-.ch-tile[aria-checked="true"] .ch-tile-n {
-  color: #cdc6ea;
-}
-.ch-tile-desc {
-  color: #7b7e88;
-  font-size: 11.5px;
-  line-height: 1.45;
-  overflow-wrap: anywhere;
 }
 
-/* the baseline switch */
-.ch-switch {
-  display: inline-flex;
+/* the experiment at a glance: a line for each part, what it's set to, and its page a tap away */
+.ch-sum {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.ch-sum > li + li {
+  border-top: 1px solid #1b1d21;
+}
+.ch-sum-line {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
-  align-self: flex-start;
-  gap: 10px;
-  min-height: var(--ch-ctl);
-  padding-right: 4px;
-  border-radius: 5px;
+  gap: 14px;
+  width: 100%;
+  min-height: 48px;
+  padding: 6px 0;
+  text-align: left;
+  color: var(--ch-faint);
+  transition: color 0.15s;
+}
+.ch-sum-label {
   color: #c4c6cd;
-  font-size: 13px;
+  font-size: 13.5px;
+}
+.ch-sum-value {
+  overflow: hidden;
+  color: var(--ch-muted);
+  font-size: 13.5px;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ch-sum-value.ch-mono {
+  font-size: 12.5px;
+}
+.ch-sum-line:hover .ch-sum-value,
+.ch-sum-line:hover .ch-sum-label {
+  color: var(--ch-bright);
+}
+.ch-sum-line[data-problem] .ch-sum-value {
+  color: var(--ch-warn);
+}
+.ch-sum-line:focus-visible {
+  outline: 2px solid var(--ch-focus);
+  outline-offset: 2px;
+}
+/* a value shown, not set here */
+.ch-field-value {
+  color: var(--ch-muted);
+  font-size: 13.5px;
+}
+.ch-list > * + * {
+  border-top: 1px solid #1b1d21;
+}
+.ch-item,
+.ch-field,
+.ch-toggle {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  min-width: 0;
+  min-height: var(--ch-line-h);
+  padding: 6px 0;
   text-align: left;
 }
+.ch-item {
+  color: #a9abb3;
+  font-size: 13.5px;
+  line-height: 1.4;
+  transition: color 0.15s;
+}
+.ch-item:hover,
+.ch-item[aria-checked="true"] {
+  color: var(--ch-bright);
+}
+.ch-item > .ch-mark {
+  flex: none;
+  margin-top: 0;
+}
+.ch-item-label {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.ch-field,
+.ch-toggle {
+  justify-content: space-between;
+}
+/* Too narrow for both: the control goes under its label, still at the line's end. */
+.ch-field {
+  flex-wrap: wrap;
+  row-gap: 2px;
+}
+.ch-field > :last-child {
+  margin-left: auto;
+}
+.ch-toggle:disabled {
+  cursor: default;
+  opacity: 0.4;
+}
+.ch-field-label {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  color: #c4c6cd;
+  font-size: 13.5px;
+  line-height: 1.4;
+}
+.ch-field-hint {
+  color: var(--ch-faint);
+  font-size: 12px;
+  line-height: 1.4;
+}
+.ch-toggle > .ch-switch-track {
+  flex: none;
+}
+.ch-toggle:hover:not(:disabled) .ch-field-label {
+  color: var(--ch-bright);
+}
+
+/* a choice that reads as what it's set to: no box, a small chevron after it */
+.ch-pick {
+  flex: none;
+  min-width: 0;
+  max-width: 100%;
+  height: var(--ch-ctl);
+  padding: 0 16px 0 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 10'%3E%3Cpath d='M2 3.5l3 3 3-3' fill='none' stroke='%238f929b' stroke-width='1.3'/%3E%3C/svg%3E") right center /
+    9px no-repeat;
+  color: var(--ch-bright);
+  font-size: 13.5px;
+  text-align: right;
+  text-align-last: right;
+  text-overflow: ellipsis;
+  appearance: none;
+  cursor: pointer;
+  outline: none;
+}
+.ch-pick:focus-visible {
+  outline: 2px solid var(--ch-focus);
+  outline-offset: 2px;
+}
+.ch-pick option {
+  background: #121317;
+  color: var(--ch-text);
+}
+/* a number at a line's end: the number alone, no steppers (a phone's keypad types it) */
+.ch .ch-amount {
+  flex: none;
+  width: 72px;
+  text-align: right;
+  appearance: textfield;
+}
+.ch-amount::-webkit-inner-spin-button,
+.ch-amount::-webkit-outer-spin-button {
+  margin: 0;
+  appearance: none;
+}
+
+/* the switch */
 .ch-switch-track {
   position: relative;
   flex: none;
@@ -1196,20 +1247,19 @@ textarea.ch-free {
     transform 0.2s var(--ch-ease),
     background-color 0.15s;
 }
-.ch-switch[aria-checked="true"] .ch-switch-track {
+.ch-toggle[aria-checked="true"] .ch-switch-track {
   border-color: #6b6290;
   background: #1b1828;
 }
-.ch-switch[aria-checked="true"] .ch-switch-track::after {
+.ch-toggle[aria-checked="true"] .ch-switch-track::after {
   background: var(--ch-prism);
   transform: translateX(12px);
 }
 
-/* criteria */
+/* checks and metrics: each its own lines, a hairline between one and the next */
 .ch-crits {
   display: flex;
   flex-direction: column;
-  gap: 8px;
   margin: 0;
   padding: 0;
   list-style: none;
@@ -1217,155 +1267,40 @@ textarea.ch-free {
 .ch-crit {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding: 10px;
-  border: 1px solid #24262b;
-  border-radius: 6px;
-  background: #0b0c0e;
+  padding: 8px 0 4px;
+  border-top: 1px solid #1b1d21;
 }
-.ch-crit-main,
-.ch-crit-more {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px 8px;
-  min-width: 0;
+.ch-crit:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+/* its settings under its command or name, closer together than the lists' lines */
+.ch-crit > :is(.ch-field, .ch-toggle) {
+  min-height: 36px;
+  padding: 2px 0;
 }
 .ch-crit-main {
-  flex-wrap: nowrap;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
 }
 .ch-crit-main > .ch-grow {
   flex: 1 1 0;
   min-width: 0;
 }
+/* a threshold's kind and its number together at the line's end */
 .ch-thr {
   display: inline-flex;
-  flex: 1 1 200px;
-  gap: 6px;
-  min-width: 0;
-}
-.ch-thr > .ch-input {
-  flex: 1 1 70px;
-  width: auto;
-  min-width: 70px;
-}
-.ch-thr > .ch-select {
-  flex: 0 1 auto;
-  min-width: 0;
-}
-
-.ch-select {
   flex: none;
-  min-width: 0;
-  max-width: 100%;
-  height: var(--ch-ctl);
-  padding: 0 28px 0 10px;
-  border: 1px solid var(--ch-edge);
-  border-radius: 5px;
-  /* a chevron, drawn here so the native one can go */
-  background-color: var(--ch-field);
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 10'%3E%3Cpath d='M2 3.5l3 3 3-3' fill='none' stroke='%238f929b' stroke-width='1.3'/%3E%3C/svg%3E");
-  background-position: right 10px center;
-  background-repeat: no-repeat;
-  background-size: 10px;
-  color: var(--ch-text);
-  font-size: 13px;
-  text-overflow: ellipsis;
-  appearance: none;
-  outline: none;
-}
-.ch-select:focus-visible {
-  border-color: #6b6290;
-  box-shadow: 0 0 0 3px rgb(186 176 227 / 12%);
-}
-
-/* two or three choices side by side */
-.ch-seg {
-  display: inline-flex;
-  flex: none;
-  max-width: 100%;
-  overflow: hidden;
-  border: 1px solid var(--ch-edge);
-  border-radius: 5px;
-}
-.ch-seg > button {
-  position: relative;
-  min-height: calc(var(--ch-ctl) - 2px);
-  padding: 0 11px;
-  color: #a1a4ad;
-  font-size: 12px;
-  white-space: nowrap;
-  transition:
-    background-color 0.15s,
-    color 0.15s;
-}
-.ch-seg > button + button {
-  border-left: 1px solid var(--ch-edge);
-}
-.ch-seg > button:hover {
-  color: var(--ch-text);
-}
-.ch-seg > button[aria-checked="true"] {
-  background: #17161f;
-  color: var(--ch-bright);
-  box-shadow: inset 0 -1px 0 #bab0e3;
-}
-.ch-seg > button:focus-visible {
-  outline: 2px solid var(--ch-focus);
-  outline-offset: -2px;
-}
-
-/* repetitions, parallel, budget: three across, always */
-.ch-nums {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 8px;
-}
-.ch-num {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  min-width: 0;
-}
-.ch-num > .ch-x-label {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-/* radio rows (the decision) */
-.ch-radios {
-  display: flex;
-  flex-direction: column;
-  overflow: clip;
-  border: 1px solid #272a31;
-  border-radius: 6px;
-}
-.ch-radio {
-  display: flex;
   align-items: center;
-  gap: 12px;
-  min-height: var(--ch-ctl);
-  padding: 8px 12px;
-  color: #c4c6cd;
-  font-size: 13px;
-  text-align: left;
-  transition: background-color 0.15s;
+  gap: 10px;
+  min-width: 0;
 }
-.ch-radio + .ch-radio {
-  border-top: 1px solid #1f2126;
+.ch-thr > .ch-input:disabled {
+  opacity: 0.35;
 }
-.ch-radio:hover {
-  background: #0f1013;
-}
-.ch-radio[aria-checked="true"] {
-  background: #101016;
-  color: var(--ch-bright);
-}
-.ch-radio > .ch-mark {
-  flex: none;
-  margin-top: 0;
-}
+
 .ch-x-notes {
   display: flex;
   flex-direction: column;
@@ -1373,12 +1308,9 @@ textarea.ch-free {
 }
 
 /* focus for the setup's buttons */
-:is(.ch-chip, .ch-tile, .ch-switch, .ch-radio):focus-visible {
+:is(.ch-chip, .ch-item, .ch-toggle):focus-visible {
   outline: 2px solid var(--ch-focus);
-  outline-offset: 1px;
-}
-.ch-radio:focus-visible {
-  outline-offset: -2px;
+  outline-offset: 2px;
 }
 
 /* ------------------------------------------------------------ motion: CSS only, quiet */
@@ -1434,7 +1366,6 @@ textarea.ch-free {
 }
 /* The lit hairlines drift; paused, they hold still. */
 :root[data-motion="paused"] .ch-opt[data-checked]::after,
-:root[data-motion="paused"] .ch-tile[aria-checked="true"]::after,
 :root[data-motion="paused"] .ch-rule {
   animation-play-state: paused;
 }
@@ -1459,25 +1390,24 @@ textarea.ch-free {
   }
   .ch-opts,
   .ch-opt + .ch-opt,
-  .ch-tile,
-  .ch-radios {
+  .ch-list > * + *,
+  .ch-crit {
     border-color: #555864;
   }
 }
 /* Clipped-gradient text and gradient fills would vanish under forced colours. */
 @media (forced-colors: active) {
-  .ch-rec,
-  .ch-chip[aria-checked="true"] .ch-chip-n {
+  .ch-rec {
     background: none;
     color: CanvasText;
   }
-  :is(.ch-row, .ch-tile, .ch-chip, .ch-radio)[aria-checked="true"] {
+  :is(.ch-row, .ch-chip)[aria-checked="true"] {
     outline: 2px solid Highlight;
     outline-offset: -2px;
   }
   [role="radio"][aria-checked="true"] > .ch-mark::after,
   [role="checkbox"][aria-checked="true"] > .ch-mark,
-  .ch-switch[aria-checked="true"] .ch-switch-track::after {
+  .ch-toggle[aria-checked="true"] .ch-switch-track::after {
     background: Highlight;
   }
 }

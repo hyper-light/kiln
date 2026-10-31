@@ -2757,7 +2757,7 @@ impl Leg {
         };
         let job_container = if in_job { st.containers.as_ref().and_then(|c| c.job.as_ref().map(|j| (c.cli.clone(), j.clone()))) } else { None };
         let mut in_container: Option<InContainer> = None;
-        let cmd = if let Some((cli, image, entrypoint, args)) = container_run {
+        let mut cmd = if let Some((cli, image, entrypoint, args)) = container_run {
             // A Docker action: GitHub's mounts, every value by name.
             let map = self.action_paths(st);
             let mut inner = map.translate_env(&env);
@@ -2801,8 +2801,8 @@ impl Leg {
             c.current_dir(wd).envs(&env);
             c
         };
-        // In its job's cgroup from its first instruction, so the job can be frozen whole (W26-R22).
-        let mut cmd = cmd;
+        // In its job's cgroup from its first instruction: the job can be frozen whole (W26-R22), and
+        // a kiln it starts holds its agents there, never in the runner's (the 2026-10-29 outage).
         super::freeze::enter(&self.a.job_id, &mut cmd);
         // On the CPUs its leg may use (W05-R03): its share, the CPUs it was lent, or what no share
         // holds, from its first instruction; and moved as a share is taken or let go.

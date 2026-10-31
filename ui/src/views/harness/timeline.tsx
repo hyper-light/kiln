@@ -1177,8 +1177,8 @@ function Since({ since }: { since: number }) {
 }
 
 /** A compaction under way, where the turn's live line is: what it does, the context it compacts
- *  and for how long; the optic draws in, and the conversation's spectrum is condensed into the bar
- *  its marker keeps, in the same place, once it's done. */
+ *  and for how long; the optic draws in, and the particle ribbon turns about the line until it's
+ *  done, when the bar its marker keeps takes its place, in the same room. */
 function CompactingRow({ c }: { c: Compacting }) {
   return (
     <div className="hx-compaction" data-state="live" role="status">
@@ -1588,10 +1588,13 @@ export const Timeline = React.memo(function Timeline({
   accountOpen,
   find,
   onReply,
+  onReviewPlan,
 }: {
   store: SessionStore;
   /** The agent's id: where your place in it is kept. */
   agent: string;
+  /** A plan it proposes is reviewed in its Plan tab: this opens it there (none: the plan is read here, in full). */
+  onReviewPlan?: () => void;
   /** Find in the conversation: the words, and the match being shown. */
   find?: { q: string; now: FindNow | null };
   agentLabel?: string;
@@ -1885,7 +1888,7 @@ export const Timeline = React.memo(function Timeline({
           {tail && hasAsks && onDecide && (
             <div ref={asksRef} className="hx-asks">
               {pending.map((a) => (
-                <ApprovalCard key={a.id} a={a} cwd={cwd} onDecide={onDecide} agentName={agentName} kind={agentLabel} agentId={agent} />
+                <ApprovalCard key={a.id} a={a} cwd={cwd} onDecide={onDecide} agentName={agentName} kind={agentLabel} agentId={agent} onReviewPlan={parent ? undefined : onReviewPlan} />
               ))}
             </div>
           )}

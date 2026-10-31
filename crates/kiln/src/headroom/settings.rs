@@ -3,7 +3,7 @@
 //! restarted without its server starts from what it was last told.
 //!
 //! Only what a person decides is here (docs/headroom.md, "Where every number comes from"): how
-//! many false alarms a day they'll accept, how slow each target may get, how much of a served
+//! many false alarms a day they'll accept, how slow each target may get, how much of each
 //! target's time its probes may take, and what headroom may touch. Everything else is measured.
 
 use serde::{Deserialize, Serialize};
@@ -28,7 +28,7 @@ pub struct Settings {
     pub automatic: bool,
     /// How many times a day headroom may hold or slow work when nothing would have gone wrong.
     pub false_alarms_per_day: f64,
-    /// How much of a served target's time its probes may take (0 to 1).
+    /// How much of each target's time its probes may take (0 to 1).
     pub probe_load_share: f64,
     /// Work the user's service manager runs outside kiln's groups (a build an agent started with
     /// `systemd-run --user`) is paced too.
@@ -71,13 +71,6 @@ pub enum Probe {
     Http { url: String },
     /// Open a TCP connection to `host:port`.
     Tcp { addr: String },
-}
-
-impl Probe {
-    /// A target that serves others: its probes are held to the load share.
-    pub fn served(&self) -> bool {
-        !matches!(self, Probe::Fsync { .. })
-    }
 }
 
 impl Settings {
@@ -151,7 +144,7 @@ mod tests {
     #[test]
     fn a_target_without_a_tolerance_takes_the_platforms() -> anyhow::Result<()> {
         let t: Target = serde_json::from_str(r#"{"name":"api","probe":{"kind":"http","url":"http://x/healthz"}}"#)?;
-        anyhow::ensure!(t.tolerance_ms() == 1000 && t.probe.served());
+        anyhow::ensure!(t.tolerance_ms() == 1000);
         Ok(())
     }
 }

@@ -15,6 +15,7 @@ import { toast } from "@/components/ui/toast";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import LogViewer from "@/views/run-detail/log-viewer";
+import { copyLater } from "@/views/terminal/clipboard";
 import { stepToShow } from "@/views/updates/logs";
 import { StatusGlyph } from "@/components/ui/status-glyph";
 import { glyphOf } from "./model";
@@ -51,11 +52,12 @@ function JobOutput({ job, title, state }: { job: string; title: string; state: s
   const j = useSuspenseResource(`ship/job/${job}`, (s) => api.job(job, s), { on: ["job"] });
   const step = stepToShow(j.data.steps) ?? 0;
   const [copied, setCopied] = React.useState(false);
-  // Copy (step 4): the step's whole output as the REST log has it, through the clipboard as
-  // kiln's CopyButton writes it; a refusal says so.
+  // Copy (step 4): the step's whole output as the REST log has it, asked for in the tap itself
+  // (the fetch is still on its way); a refusal says so.
   const copy = async () => {
+    const logs = api.jobLogs(job, step);
     try {
-      await navigator.clipboard.writeText(await api.jobLogs(job, step));
+      if (!(await copyLater(logs))) throw new Error((await logs) ? "The browser refused the clipboard." : "There's no output to copy.");
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1500);
     } catch (e) {
