@@ -245,6 +245,10 @@ export interface ShipDeployItem {
   v: string;
   logs: boolean;
   differs: boolean;
+  /** A pod's node. */
+  node?: string;
+  /** The container a pod's logs read. */
+  container?: string;
 }
 
 /** Its objects of one owner (`Deployment kiln`) or one sort (`Network`, `Config`, …). */
@@ -290,6 +294,10 @@ export interface ShipDeployRollout {
   under_way: boolean;
   waits: string | null;
   approvals?: string[];
+  /** The deploy it rolls out, the one it goes back to, and the new one's share of traffic (%). */
+  deploy?: number | null;
+  back_to?: number | null;
+  weight?: number;
 }
 
 export interface ShipDeploySetting {
@@ -315,7 +323,7 @@ export interface ShipDeployPane {
   why_not: Partial<Record<ShipDeployVerb, string>>;
 }
 
-export type ShipDeployVerb = "sync" | "refresh" | "rollback" | "stop" | "follow" | "promote" | "abort" | "approve" | "deny" | "auto_sync" | "auto_rollback";
+export type ShipDeployVerb = "sync" | "refresh" | "rollback" | "stop" | "follow" | "promote" | "abort" | "approve" | "deny" | "auto_sync" | "auto_rollback" | "delete";
 
 /** A verb's body: the app, the verb, and only what that verb takes. */
 export interface ShipDeployAct {
@@ -335,6 +343,8 @@ export interface ShipDeployAct {
   rollout?: string;
   /** auto_sync, auto_rollback. */
   on?: boolean | null;
+  /** Delete: `foreground` deletes its objects too, `orphan` leaves them in the cluster. */
+  cascade?: "foreground" | "orphan";
 }
 
 /** The words the jobs pane picks by. */

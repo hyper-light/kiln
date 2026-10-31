@@ -369,6 +369,10 @@ fn a_wave_starts_only_when_the_one_before_is_healthy() {
     let cm = ResKey::new("", "ConfigMap", "web", "after-db");
     h.run_for(5_000);
     assert!(h.clusters.get("dev").and_then(|c| c.get(&cm)).is_none(), "wave 1 ran before wave 0 was healthy");
+    // Meanwhile the sync says which of its waves it's at (W26-R24: Ship's line for a sync under way).
+    let says = |h: &Harness| status(h, "web").and_then(|s| s.operation.as_ref().map(|o| o.message.clone())).unwrap_or_default();
+    assert_eq!(says(&h), "wave 1 of 2");
+    assert!(h.run_until(60_000, |h| says(h) == "wave 2 of 2"), "{}", says(&h));
     assert!(h.run_until(60_000, |h| settled(h, "web")));
     assert!(h.clusters.get("dev").and_then(|c| c.get(&cm)).is_some());
 }

@@ -61,6 +61,9 @@ pub(crate) struct Facts {
     pub source: String,
     /// Its git source of its own, by index, and that source's repository and revision.
     pub own: Option<(usize, String, String)>,
+    /// What declares it besides kiln's own record (`its repository's .kiln/deploy.yaml`): deleted
+    /// here, it comes back when kiln reads that again.
+    pub declared: Option<String>,
 }
 
 impl Facts {
@@ -88,6 +91,15 @@ impl Facts {
         let all = stands::deploys(&self.history);
         let d = all.iter().rev().find(|d| d.succeeded())?;
         d.sync.commits.get(i).cloned().flatten().or_else(|| d.sync.revision.clone())
+    }
+}
+
+/// What declares an app besides kiln's own record, by where its definition came from.
+fn declared(origin: &kiln_cd::apps::Origin) -> Option<String> {
+    match origin {
+        kiln_cd::apps::Origin::Deploy { .. } => Some("its repository's .kiln/deploy.yaml".to_owned()),
+        kiln_cd::apps::Origin::Argo { parent: Some(p) } => Some(format!("the app {p}")),
+        _ => None,
     }
 }
 
@@ -143,6 +155,7 @@ pub(crate) fn gather(cd: &Cd, only: Option<&str>) -> Vec<Facts> {
                 objects: s.map_or(0, |s| s.resources),
                 source,
                 own,
+                declared: declared(&def.origin),
                 ..Facts::default()
             });
         }
@@ -315,7 +328,7 @@ pub(crate) fn list_json(facts: &[Facts], q: Option<&str>, now_ms: u64) -> Value 
     let mut by: BTreeMap<&str, Vec<(u8, &Facts, Standing)>> = BTreeMap::new();
     for f in facts.iter().filter(|f| q.is_none_or(|q| matches(f, q))) {
         let s = stands::standing(&f.app(), now_ms);
-        by.entry(f.project.as_str()).or_default().push((stands::rank(s.stand), f, s));
+        by.entry(f.project.as_str()).or_default().push((stands::rank(s.stand, &s.word), f, s));
     }
     let mut projects: Vec<(u8, &str, Vec<(u8, &Facts, Standing)>)> = by
         .into_iter()
@@ -377,11 +390,19 @@ pub(crate) fn pane_json(f: &Facts, o: &Opened, now_ms: u64) -> Value {
     let groups = stands::components(&o.nodes, now_ms);
     let history = stands::history(&f.history, &o.commits, f.own.as_ref().map_or(0, |(i, _, _)| *i), stands::health_glyph(f.health));
     let back = history.iter().any(|l| l.to.is_some() || l.revision.is_some());
-    let why_not = stands::why_not(&a, back);
+    let mut why_not = stands::why_not(&a, back);
+    if let Some(d) = &f.declared {
+        why_not.insert("delete", format!("{d} declares it: take it out there"));
+    }
     let rollout = f.rollout.as_ref().map(|(id, r)| {
         let mut v = serde_json::to_value(stands::rollout(id, r, now_ms)).unwrap_or(Value::Null);
         if let Some(m) = v.as_object_mut() {
             m.insert("approvals".into(), json!(o.approvals));
+            // The deploy it rolls out and the one it goes back to, and the new one's share of traffic.
+            let deploy = stands::deploys(&f.history).iter().rev().find(|d| d.sync.revision.is_some() && d.sync.revision == r.revision).map(|d| d.id());
+            m.insert("deploy".into(), json!(deploy));
+            m.insert("back_to".into(), json!(r.back_to));
+            m.insert("weight".into(), json!(r.rollout.weight));
         }
         v
     });
@@ -556,7 +577,11 @@ fn op_of(app: &str, verb: &str, body: &Value) -> Result<(&'static str, Value), F
             input.insert("on".into(), body.get("on").cloned().unwrap_or(Value::Null));
             if verb == "auto_sync" { "cd.apps.set_auto_sync" } else { "cd.apps.set_auto_rollback" }
         }
-        _ => return Err((StatusCode::BAD_REQUEST, format!("`verb` {verb}: sync, refresh, rollback, stop, follow, promote, abort, approve, deny, auto_sync or auto_rollback"))),
+        "delete" => {
+            take(&["cascade"]);
+            "cd.apps.delete"
+        }
+        _ => return Err((StatusCode::BAD_REQUEST, format!("`verb` {verb}: sync, refresh, rollback, stop, follow, promote, abort, approve, deny, auto_sync, auto_rollback or delete"))),
     };
     // Promote, abort, approve and deny take what applies to them only.
     if op == "cd.apps.rollout_act" {
@@ -573,7 +598,9 @@ fn op_of(app: &str, verb: &str, body: &Value) -> Result<(&'static str, Value), F
 /// `POST /api/ship/deploys {app, verb, …}`: one of the strip's verbs on an app (W26-R24): sync
 /// (`resources`: what's picked; `prune`), refresh (`hard`), rollback (`to` a deployment, or
 /// `revision`: any commit), stop, follow, promote (`full`), abort (`reason`), approve and deny
-/// (`check`), auto_sync and auto_rollback (`on`: true, false or null). Each is its CD operation,
+/// (`check`), auto_sync and auto_rollback (`on`: true, false or null), and delete (`cascade`:
+/// `orphan` leaves its objects in the cluster; refused for an app something else declares, as it
+/// would come back). Each is its CD operation,
 /// as its route would let the caller (`environments.deploy` on the whole server, an agent where
 /// its environment lets agents deploy) and audited in this request's one row; it answers what the
 /// operation did, or why it couldn't.
@@ -593,6 +620,11 @@ async fn act_in(hub: &Arc<Hub>, caller: &crate::authz::Caller, body: &Value, on:
     crate::authz::gate::check(hub, caller, &method, &["api", "cd", "ops", op], &HashMap::new()).await?;
     def.input.fits(&input).map_err(|m| (StatusCode::BAD_REQUEST, m.said(op)))?;
     let (cd, model) = on()?;
+    if verb == "delete"
+        && let Some(d) = cd.apps.read().get(&app).and_then(|e| declared(&e.def.origin))
+    {
+        return Err((StatusCode::CONFLICT, format!("{d} declares {app}: deleted here, it comes back when kiln reads that again; take it out there")));
+    }
     let done = crate::cd::ops::call(crate::cd::ops::Cx { hub: Arc::clone(hub), cd, actor: caller.name.clone() }, op, input).await?;
     // What it did shows at once, whether or not CD says so in an event.
     model.changed();
@@ -699,9 +731,9 @@ mod tests {
         assert_eq!(
             projects,
             [
-                ("hyper-light/kiln".to_owned(), "2 apps · 1 out of sync".to_owned(), true),
                 ("hyper-light/quiver".to_owned(), "2 apps · 1 waits on you".to_owned(), true),
                 ("hyper-light/hyperlight-site".to_owned(), "1 app · rolled back".to_owned(), true),
+                ("hyper-light/kiln".to_owned(), "2 apps · 1 out of sync".to_owned(), true),
             ]
         );
         let rows: Vec<(String, String, String, String)> = at(&v, "/projects")
@@ -718,19 +750,19 @@ mod tests {
         assert_eq!(
             rows,
             [
-                row("kiln-production", "needs_you", "Out of sync", "#153 runs 2222222 · trunk is 2 ahead · healthy"),
-                row("kube-prometheus-stack-production", "shipped", "Synced", "chart 92.2.0 · healthy"),
                 row("quiver-production", "needs_you", "Needs you", "#39 waits for your approval · #38 runs"),
                 row("quiver-staging", "shipping", "Syncing", "syncing 3333333"),
                 row("site-production", "rolled_back", "Rolled back", "#19 failed its health check · back on #18"),
+                row("kiln-production", "needs_you", "Out of sync", "#153 runs 2222222 · trunk is 2 ahead · healthy"),
+                row("kube-prometheus-stack-production", "shipped", "Synced", "chart 92.2.0 · healthy"),
             ]
         );
-        let kiln = at(&v, "/projects/0/apps/0");
+        let kiln = at(&v, "/projects/2/apps/0");
         assert_eq!(at(kiln, "/pips").as_array().map(|p| p.iter().map(|x| format!("{}:{}", at(x, "/stage").as_str().unwrap_or_default(), at(x, "/state").as_str().unwrap_or_default())).collect::<Vec<_>>()), Some(vec!["sync:passed".to_owned(), "health:healthy".to_owned(), "soak:passed".to_owned()]));
         assert_eq!((at(kiln, "/environment"), at(kiln, "/runs"), at(kiln, "/by"), at(kiln, "/at")), (&json!("production"), &json!("2222222"), &json!("ada"), &json!((NOW - 36 * MIN) / 1000)));
         assert!(at(kiln, "/v").as_str().is_some_and(|v| v.len() == 16), "{kiln}");
-        assert_eq!(at(&v, "/projects/1/apps/1/by"), &json!("auto-sync"));
-        assert_eq!(at(&v, "/projects/2/apps/0/pinned/to"), &json!(18));
+        assert_eq!(at(&v, "/projects/0/apps/1/by"), &json!("auto-sync"));
+        assert_eq!(at(&v, "/projects/1/apps/0/pinned/to"), &json!(18));
         assert_eq!(at(&v, "/total"), &json!(5));
         // What the search box asks for: an environment, a project, a cluster.
         let names = |q: &str| at(&list_json(&fleet(), Some(q), NOW), "/projects").as_array().into_iter().flatten().flat_map(|p| at(p, "/apps").as_array().cloned().unwrap_or_default()).map(|r| at(&r, "/name").as_str().unwrap_or_default().to_owned()).collect::<Vec<_>>();
@@ -804,11 +836,16 @@ mod tests {
         assert_eq!(at(&v, "/settings/0/what"), &json!("syncs when you say"));
         assert_eq!(at(&v, "/why_not").as_object().map(|m| m.keys().cloned().collect::<Vec<_>>()), Some(vec!["abort".to_owned(), "approve".to_owned(), "deny".to_owned(), "follow".to_owned(), "promote".to_owned(), "stop".to_owned()]));
         assert_eq!(at(&v, "/rollout"), &Value::Null);
-        // A rollout waiting on a person: its steps, and the approvals it waits for.
+        // Deleted here, an app its repository's deploy file declares would come back.
+        let v = pane_json(&Facts { declared: Some("its repository's .kiln/deploy.yaml".into()), ..kiln.clone() }, &o, NOW);
+        assert_eq!(at(&v, "/why_not/delete"), &json!("its repository's .kiln/deploy.yaml declares it: take it out there"));
+        // A rollout waiting on a person: its steps, the approvals it waits for, the deploy it rolls
+        // out and the one it goes back to, and the new one's share of traffic.
         let quiver = all.iter().find(|f| f.name == "quiver-production").cloned().unwrap_or_default();
         let v = pane_json(&quiver, &Opened { approvals: vec!["release-approval".into()], ..Opened::default() }, NOW);
         assert_eq!(at(&v, "/rollout/steps/1/state"), &json!("requested"));
         assert_eq!(at(&v, "/rollout/approvals"), &json!(["release-approval"]));
+        assert_eq!((at(&v, "/rollout/deploy"), at(&v, "/rollout/back_to"), at(&v, "/rollout/weight")), (&json!(39), &json!(38), &json!(20)));
         assert!(at(&v, "/why_not/approve").is_null() && at(&v, "/why_not/promote").is_null(), "{}", at(&v, "/why_not"));
     }
 
@@ -830,9 +867,10 @@ mod tests {
         assert_eq!(op("auto_sync", json!({ "on": true })), Ok(("cd.apps.set_auto_sync", json!({ "app": "default/web", "on": true }))));
         assert_eq!(op("auto_rollback", json!({})), Ok(("cd.apps.set_auto_rollback", json!({ "app": "default/web", "on": null }))));
         assert!(op("sync", json!({ "resources": ["Deployment"] })).is_err_and(|e| e.contains("isn't an object's key")));
-        assert!(op("delete", json!({})).is_err_and(|e| e.starts_with("400")));
+        assert_eq!(op("delete", json!({ "cascade": "orphan", "to": 1 })), Ok(("cd.apps.delete", json!({ "app": "default/web", "cascade": "orphan" }))));
+        assert!(op("explode", json!({})).is_err_and(|e| e.starts_with("400")));
         // Each one's input is its operation's to the letter.
-        for (verb, body) in [("sync", json!({ "resources": ["apps~Deployment~web~api"] })), ("refresh", json!({ "hard": false })), ("rollback", json!({ "to": 1 })), ("stop", json!({})), ("follow", json!({})), ("promote", json!({})), ("abort", json!({})), ("deny", json!({ "check": "c" })), ("auto_sync", json!({ "on": false })), ("auto_rollback", json!({ "on": true }))] {
+        for (verb, body) in [("sync", json!({ "resources": ["apps~Deployment~web~api"] })), ("refresh", json!({ "hard": false })), ("rollback", json!({ "to": 1 })), ("stop", json!({})), ("follow", json!({})), ("promote", json!({})), ("abort", json!({})), ("deny", json!({ "check": "c" })), ("auto_sync", json!({ "on": false })), ("auto_rollback", json!({ "on": true })), ("delete", json!({ "cascade": "orphan" }))] {
             let (name, input) = op_of("default/web", verb, &body).map_err(|(_, m)| anyhow::anyhow!(m)).unwrap_or(("none", Value::Null));
             let def = crate::cd::ops::ops().iter().find(|o| o.name == name);
             assert!(def.is_some_and(|d| !d.read_only && d.input.fits(&input).is_ok()), "{verb}: {name} {input}");
@@ -1033,7 +1071,7 @@ mod tests {
             // The list: by project, needs-you first, each row as defined.
             let v = list_of(&hub, &cd, &model, None, now).await;
             let heads: Vec<(Value, Value)> = at(&v, "/projects").as_array().into_iter().flatten().map(|p| (at(p, "/project").clone(), at(p, "/say").clone())).collect();
-            assert_eq!(heads, [(json!("hyper-light/kiln"), json!("2 apps · 1 out of sync")), (json!("hyper-light/quiver"), json!("2 apps · 1 waits on you"))]);
+            assert_eq!(heads, [(json!("hyper-light/quiver"), json!("2 apps · 1 waits on you")), (json!("hyper-light/kiln"), json!("2 apps · 1 out of sync"))]);
             let rows: Vec<(Value, Value, Value, Value)> = at(&v, "/projects")
                 .as_array()
                 .into_iter()
@@ -1044,15 +1082,15 @@ mod tests {
             assert_eq!(
                 rows,
                 [
-                    (json!("kiln-production"), json!("needs_you"), json!("Out of sync"), json!(format!("#1 runs {} · trunk is 1 ahead · healthy", short(&k1)))),
-                    (json!("kiln-staging"), json!("shipped"), json!("Synced"), json!(format!("#1 runs {} · healthy", short(&k2)))),
                     (json!("quiver-canary"), json!("needs_you"), json!("Needs you"), json!("#2 waits for your approval · #1 runs")),
                     (json!("quiver-production"), json!("rolled_back"), json!("Rolled back"), json!("back on #1 · held there until git changes it")),
+                    (json!("kiln-production"), json!("needs_you"), json!("Out of sync"), json!(format!("#1 runs {} · trunk is 1 ahead · healthy", short(&k1)))),
+                    (json!("kiln-staging"), json!("shipped"), json!("Synced"), json!(format!("#1 runs {} · healthy", short(&k2)))),
                 ]
             );
-            let kp = at(&v, "/projects/0/apps/0");
+            let kp = at(&v, "/projects/1/apps/0");
             assert_eq!((at(kp, "/by"), at(kp, "/environment"), at(kp, "/runs"), at(kp, "/sync"), at(kp, "/health")), (&json!("ada"), &json!("production"), &json!(short(&k1)), &json!("OutOfSync"), &json!("Healthy")));
-            assert_eq!(at(&v, "/projects/0/apps/1/by"), &json!("auto-sync"));
+            assert_eq!(at(&v, "/projects/1/apps/1/by"), &json!("auto-sync"));
 
             // kiln-production's pane: what differs from git, by owner (its cluster isn't reached
             // live: what the engine holds), and its history, main's newer commit beside its deploy.
@@ -1081,7 +1119,7 @@ mod tests {
                 let (hub, cd, model, caller) = (hub.clone(), cd.clone(), model.clone(), caller.clone());
                 async move { act_in(&hub, &caller, &body, || Ok((cd, model))).await }
             };
-            for verb in ["sync", "refresh", "rollback", "stop", "follow", "promote", "abort", "approve", "deny", "auto_sync", "auto_rollback"] {
+            for verb in ["sync", "refresh", "rollback", "stop", "follow", "promote", "abort", "approve", "deny", "auto_sync", "auto_rollback", "delete"] {
                 let refused = act(&viewer, json!({ "app": QC, "verb": verb, "on": true, "check": "release" })).await;
                 assert!(matches!(&refused, Err((StatusCode::FORBIDDEN, m)) if m.contains("environments.deploy")), "{verb}: {refused:?}");
             }
@@ -1135,6 +1173,21 @@ mod tests {
             assert_eq!(row(&list_of(&hub, &cd, &model, None, now).await, "quiver-canary"), Some((json!("Synced"), json!(format!("#2 runs {} · healthy", short(&q2))))));
             // Another of the server's events isn't CD's: nothing to gather again for it.
             assert!(!is_cds(&crate::wire::events::ServerEvent::Terminals.text()) && is_cds(&crate::wire::events::ServerEvent::CdAppDeleted { app: KP.into() }.text()));
+
+            // Delete: refused for an app a deploy file declares, as it would come back; done for one
+            // made through the API, its objects left where they are, and gone from the list.
+            if let Some(e) = cd.apps.write().get_mut(KS) {
+                e.def.origin = kiln_cd::apps::Origin::Deploy { repo: kiln_url.clone() };
+            }
+            let refused = act(&owner, json!({ "app": KS, "verb": "delete" })).await;
+            assert!(matches!(&refused, Err((StatusCode::CONFLICT, m)) if m.contains(".kiln/deploy.yaml declares default/kiln-staging")), "{refused:?}");
+            assert_eq!(at(&pane_of(&cd, KS, now).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?, "/why_not/delete"), &json!("its repository's .kiln/deploy.yaml declares it: take it out there"));
+            // Made through the API, it's kept in CD's store too: what deleting it takes out.
+            let qc = cd.apps.read().get(QC).map(|e| e.def.clone()).ok_or_else(|| anyhow::anyhow!("no {QC}"))?;
+            submit(Command::PutApp(Box::new(qc))).await?;
+            let done = act(&owner, json!({ "app": QC, "verb": "delete", "cascade": "orphan" })).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            assert_eq!((at(&done, "/op"), at(&done, "/done/deleted"), at(&done, "/done/cascade")), (&json!("cd.apps.delete"), &json!(QC), &json!(false)));
+            assert_eq!(row(&list_of(&hub, &cd, &model, None, now).await, "quiver-canary"), None);
             Ok(())
         })
     }

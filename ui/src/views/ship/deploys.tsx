@@ -39,7 +39,6 @@ import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { relativeTime } from "@/lib/format";
 import LogViewer from "@/views/run-detail/log-viewer";
 import { Shimmer } from "@/views/harness/signals";
-import { RelTime } from "../shared";
 import { SectionHead } from "./head";
 import { glyphOf, optionsOf, strip } from "./model";
 import "./ship.css";
@@ -73,6 +72,8 @@ function DeploysList() {
   const list = useSuspenseResource("ship/deploys", (s) => shipApi.deploys("", s), { on: CD_EVENTS, pollMs: 30_000 });
   const q = params.get("q") ?? "";
   const open = params.get("app");
+  // The app a link opened the page on is brought into view, once; one opened here leaves the page where it is.
+  const [landed] = React.useState(open);
   const chosen: Chosen = Object.fromEntries(FACETS.map((k): [string, string[]] => [k, (params.get(k) ?? "").split(",").filter(Boolean)]).filter(([, v]) => v.length > 0));
   const set = (patch: Record<string, string | null>) => {
     const next = new URLSearchParams(params);
@@ -110,7 +111,7 @@ function DeploysList() {
                 <span data-needs={p.needs || undefined}>{p.say}</span>
               </li>
               {p.apps.map((r) => (
-                <DeployRow key={r.app} row={r} open={open === r.app} onOpen={(o) => set({ app: o ? r.app : null })} />
+                <DeployRow key={r.app} row={r} open={open === r.app} landed={landed === r.app} onOpen={(o) => set({ app: o ? r.app : null })} />
               ))}
             </React.Fragment>
           ))}
@@ -124,10 +125,13 @@ function DeploysList() {
   );
 }
 
+/** A row a link opened the page on, brought into view as it's first drawn. */
+const intoView = (el: HTMLLIElement | null) => el?.scrollIntoView({ block: "start" });
+
 /** An app as Ship's row: its name, its stand and line, its latest deploy's pips, who and when, where it deploys and what runs. No buttons but to open it. */
-function DeployRow({ row, open, onOpen }: { row: ShipDeployRow; open: boolean; onOpen: (open: boolean) => void }) {
+function DeployRow({ row, open, landed, onOpen }: { row: ShipDeployRow; open: boolean; landed: boolean; onOpen: (open: boolean) => void }) {
   return (
-    <li className="ship-row dp-row" data-stand={row.stand} data-app={row.app}>
+    <li className="ship-row dp-row" data-stand={row.stand} data-app={row.app} ref={landed ? intoView : undefined}>
       <div className="ship-r">
         <button type="button" className="ship-main" aria-expanded={open} onClick={() => onOpen(!open)}>
           <span className="ship-name">{row.name}</span>
@@ -144,17 +148,18 @@ function DeployRow({ row, open, onOpen }: { row: ShipDeployRow; open: boolean; o
           <JourneyStrip pips={strip(row.pips)} />
         </span>
         <span className="ship-metas">
-          <span>
+          {/* Who and when: the when whole, in the fewest words; the who cut short where the two run long. */}
+          <span className="dp-by">
             {row.by ? (
               <>
                 <span className="ship-who">
                   <StatusGlyph state={row.by.startsWith("agent:") ? "agent" : "person"} size={12} />
                   <span>{whoSaid(row.by)}</span>
-                </span>{" "}
-                ·{" "}
+                </span>
+                <span>·</span>
               </>
             ) : null}
-            <span className="ship-ago">{row.at ? <RelTime ts={row.at} /> : "never"}</span>
+            <span className="dp-ago">{row.at ? since(row.at * 1000) : "never"}</span>
           </span>
           <span className="ship-m2">
             {row.environment ? (
@@ -187,7 +192,7 @@ type Word = "out of sync" | "unhealthy" | "all";
 const WORDS: Word[] = ["out of sync", "unhealthy", "all"];
 const UNHEALTHY = new Set(["degraded", "failed", "error", "queued"]);
 /** What asks again before it's done (the stills: Refresh's choice, Roll back's, and what can't be taken back). */
-type Armed = "refresh" | "rollback" | "stop" | "abort";
+type Armed = "refresh" | "rollback" | "stop" | "abort" | "delete";
 /** A setting's label on its line. */
 const SETTING_WORD: Record<string, string> = { auto_sync: "Auto-sync", auto_rollback: "Auto-rollback", prune: "Prune", self_heal: "Self-heal" };
 /** The settings the pane shows, in its order. */
@@ -195,7 +200,7 @@ const SETTINGS_SHOWN = ["auto_sync", "auto_rollback", "prune"];
 /** A kind's word on its line, where it's long. */
 const KIND_WORD: Record<string, string> = { PersistentVolumeClaim: "PVC", HorizontalPodAutoscaler: "HPA", PodDisruptionBudget: "PDB" };
 
-/** A pick's key: an object (`o:` its key), a workload's head (`w:`), a history line (`h:` its index), a rollout step (`s:` its number), a setting (`c:`). */
+/** A pick's key: an object (`o:` its key), a workload's head (`w:`), a history line (`h:` its index), a rollout step (`s:` its number), a setting (`c:`), deleting the app (`c:delete`). */
 type Key = string;
 
 interface Pick {
@@ -226,6 +231,9 @@ const since = (ms: number) => relativeTime(ms / 1000).replace(/ ago$/, "");
 
 /** The deploy line's head: `#153 · 15878aa`, or a commit's short hash. */
 const lineHead = (l: ShipDeployLine) => (l.deploy != null ? `#${l.deploy} · ${l.short ?? ""}` : (l.short ?? ""));
+
+/** A rollout by the deploy it rolls out (`Rollout #39`), else its commit. */
+const rolloutName = (r: ShipDeployRollout) => (r.deploy != null ? `Rollout #${r.deploy}` : r.revision ? `Rollout ${r.revision}` : "Rollout");
 
 /** An opened app: the strip, its objects, rollout, history and settings, and the picked one's detail. */
 function DeployPane({ row }: { row: ShipDeployRow }) {
@@ -270,7 +278,8 @@ function DeployPane({ row }: { row: ShipDeployRow }) {
       setSaid({ text: errorMessage(e), refused: true });
     } finally {
       setBusy(false);
-      pane.reload();
+      // A deleted app has no pane to read again: the list drops its row.
+      if (body.verb !== "delete") pane.reload();
       invalidate("ship/deploys");
     }
   };
@@ -290,6 +299,19 @@ function DeployPane({ row }: { row: ShipDeployRow }) {
     );
   const line = shown?.kind === "line" ? shown.line : null;
   const setting = shown?.kind === "setting" ? shown.setting : null;
+  const deleting = shown?.kind === "delete";
+  const del = (cascade: "foreground" | "orphan") =>
+    void act({ verb: "delete", cascade }, (r) =>
+      (r as { cascade?: boolean } | null)?.cascade ? (
+        <>
+          Deleting <b>{row.name}</b> and its objects.
+        </>
+      ) : (
+        <>
+          Deleting <b>{row.name}</b>; its objects stay in {p.about.cluster}/{p.about.namespace}.
+        </>
+      ),
+    );
   const back = line && !line.now && (line.to != null || line.revision) ? line : null;
   const rollBack = () =>
     void act(back ? (back.to != null ? { verb: "rollback", to: back.to } : { verb: "rollback", revision: back.revision ?? undefined }) : { verb: "rollback" }, () => (
@@ -304,44 +326,53 @@ function DeployPane({ row }: { row: ShipDeployRow }) {
         rollback: rollBack,
         stop: () => void act({ verb: "stop" }, () => <>Stopping {row.name}&apos;s sync.</>),
         abort: () => void act({ verb: "abort", rollout: rollout?.id }, () => <>Aborting the rollout: its traffic goes back.</>),
+        delete: del,
       })
-    : setting
+    : deleting
       ? [
-          {
-            label: setting.on ? "Turn off" : "Turn on",
-            on: !busy && setting.can && (setting.key === "auto_sync" || setting.key === "auto_rollback"),
-            run: () =>
-              void act({ verb: setting.key === "auto_rollback" ? "auto_rollback" : "auto_sync", on: !setting.on }, () => (
-                <>
-                  {SETTING_WORD[setting.key]} is {setting.on ? "off" : "on"} for {row.name}.
-                </>
-              )),
-          },
+          { label: "Delete", on: !busy && !no("delete"), run: () => setArmed("delete") },
           { label: "Refresh", on: false, run: () => undefined },
           { label: "Roll back", on: false, run: () => undefined },
           { label: rollout ? "Abort" : "Stop", on: false, run: () => undefined },
         ]
-      : rollout
+      : setting
         ? [
-            { label: "Promote", on: !busy && !no("promote"), run: () => void act({ verb: "promote", rollout: rollout.id }, () => <>Promoting the rollout past its step.</>) },
-            { label: "Refresh", on: !busy, run: () => setArmed("refresh") },
-            { label: "Roll back", on: !busy && !no("rollback") && (!line || Boolean(back)), run: () => setArmed("rollback") },
-            { label: "Abort", on: !busy && !no("abort"), run: () => setArmed("abort") },
+            {
+              label: setting.on ? "Turn off" : "Turn on",
+              on: !busy && setting.can && (setting.key === "auto_sync" || setting.key === "auto_rollback"),
+              run: () =>
+                void act({ verb: setting.key === "auto_rollback" ? "auto_rollback" : "auto_sync", on: !setting.on }, () => (
+                  <>
+                    {SETTING_WORD[setting.key]} is {setting.on ? "off" : "on"} for {row.name}.
+                  </>
+                )),
+            },
+            { label: "Refresh", on: false, run: () => undefined },
+            { label: "Roll back", on: false, run: () => undefined },
+            { label: rollout ? "Abort" : "Stop", on: false, run: () => undefined },
           ]
-        : [
-            { label: "Sync", on: !busy && !no("sync"), run: sync },
-            { label: "Refresh", on: !busy, run: () => setArmed("refresh") },
-            { label: "Roll back", on: !busy && !no("rollback") && (!line || Boolean(back)), run: () => setArmed("rollback") },
-            { label: "Stop", on: !busy && !no("stop"), run: () => setArmed("stop") },
-          ];
+        : rollout
+          ? [
+              { label: "Promote", on: !busy && !no("promote"), run: () => void act({ verb: "promote", rollout: rollout.id }, () => <>Promoting the rollout past its step.</>) },
+              { label: "Refresh", on: !busy, run: () => setArmed("refresh") },
+              { label: "Roll back", on: !busy && !no("rollback") && (!line || Boolean(back)), run: () => setArmed("rollback") },
+              { label: "Abort", on: !busy && !no("abort"), run: () => setArmed("abort") },
+            ]
+          : [
+              { label: "Sync", on: !busy && !no("sync"), run: sync },
+              { label: "Refresh", on: !busy, run: () => setArmed("refresh") },
+              { label: "Roll back", on: !busy && !no("rollback") && (!line || Boolean(back)), run: () => setArmed("rollback") },
+              { label: "Stop", on: !busy && !no("stop"), run: () => setArmed("stop") },
+            ];
   const say = armed ? armedSay(armed, row, p, back) : said ? said.text : pickSay(p, row, shown, picked, pick.word, rollout);
   const stripOf = (live: boolean) => (
     <Strip
       live={live}
       say={say}
       tone={armed === "refresh" || armed === "rollback" ? "ask" : armed || said?.refused ? "warn" : undefined}
-      word={setting || line ? null : pick.word}
-      words={!setting && !line && !shown?.kind.startsWith("step")}
+      asks={armed != null}
+      word={setting || line || deleting ? null : pick.word}
+      words={!setting && !line && !deleting && !shown?.kind.startsWith("step")}
       onWord={onWord}
       verbs={verbs}
     />
@@ -367,7 +398,7 @@ function DeployPane({ row }: { row: ShipDeployRow }) {
             {p.rollout ? (
               <>
                 <li className="jp-g" data-group="rollout">
-                  <span>Rollout{p.rollout.revision ? ` · ${p.rollout.revision}` : ""}</span>
+                  <span>{rolloutName(p.rollout)}</span>
                   <span>{p.rollout.note}</span>
                 </li>
                 {p.rollout.steps.map((s) => (
@@ -453,6 +484,8 @@ function DeployPane({ row }: { row: ShipDeployRow }) {
                   {below(`c:${s.key}`)}
                 </React.Fragment>
               ))}
+            <Line k="c:delete" state="none" kind="App" name={`delete ${row.name}`} v="" picked={sel.includes("c:delete")} at={at === "c:delete"} onLine={onLine} />
+            {below("c:delete")}
           </ol>
           {phone ? null : <div className="jp-side dp-side">{detail}</div>}
         </div>
@@ -463,7 +496,11 @@ function DeployPane({ row }: { row: ShipDeployRow }) {
 
 /** What a pick's key shows. */
 type Shown =
-  { kind: "object"; obj: Obj } | { kind: "line"; line: ShipDeployLine; i: number } | { kind: "step"; rollout: ShipDeployRollout; n: number } | { kind: "setting"; setting: ShipDeploySetting };
+  | { kind: "object"; obj: Obj }
+  | { kind: "line"; line: ShipDeployLine; i: number }
+  | { kind: "step"; rollout: ShipDeployRollout; n: number }
+  | { kind: "setting"; setting: ShipDeploySetting }
+  | { kind: "delete" };
 
 function resolve(p: ShipDeployPane, objs: readonly Obj[], k: Key): Shown | null {
   const [tag, rest] = [k.slice(0, 2), k.slice(2)];
@@ -477,6 +514,7 @@ function resolve(p: ShipDeployPane, objs: readonly Obj[], k: Key): Shown | null 
     return line ? { kind: "line", line, i } : null;
   }
   if (tag === "s:") return p.rollout ? { kind: "step", rollout: p.rollout, n: Number(rest) } : null;
+  if (k === "c:delete") return { kind: "delete" };
   if (tag === "c:") {
     const setting = p.settings.find((s) => s.key === rest);
     return setting ? { kind: "setting", setting } : null;
@@ -544,8 +582,12 @@ interface Verb {
   wide?: number;
 }
 
-/** The answers to what's asked again: Keep, and the action (Refresh's two). */
-function armedVerbs(armed: Armed, busy: boolean, run: { keep: () => void; refresh: (hard: boolean) => void; rollback: () => void; stop: () => void; abort: () => void }): Verb[] {
+/** The answers to what's asked again: Keep, and the action (Refresh's two, Delete's two). */
+function armedVerbs(
+  armed: Armed,
+  busy: boolean,
+  run: { keep: () => void; refresh: (hard: boolean) => void; rollback: () => void; stop: () => void; abort: () => void; delete: (cascade: "foreground" | "orphan") => void },
+): Verb[] {
   const keep: Verb = { label: "Keep", on: true, keep: true, run: run.keep };
   switch (armed) {
     case "refresh":
@@ -556,6 +598,12 @@ function armedVerbs(armed: Armed, busy: boolean, run: { keep: () => void; refres
       return [keep, { label: "Stop the sync", on: !busy, go: "warn", wide: 3, run: run.stop }];
     case "abort":
       return [keep, { label: "Abort it", on: !busy, go: "warn", wide: 3, run: run.abort }];
+    case "delete":
+      return [
+        keep,
+        { label: "Delete all", on: !busy, go: "warn", run: () => run.delete("foreground") },
+        { label: "Delete, leave objects", on: !busy, go: "warn", wide: 2, run: () => run.delete("orphan") },
+      ];
   }
 }
 
@@ -564,6 +612,7 @@ function Strip({
   live,
   say,
   tone,
+  asks,
   word,
   words,
   onWord,
@@ -572,6 +621,8 @@ function Strip({
   live: boolean;
   say: React.ReactNode;
   tone: "warn" | "ask" | undefined;
+  /** Asked again: the question has the words' room too. */
+  asks: boolean;
   word: Word | null;
   words: boolean;
   onWord: (w: Word) => void;
@@ -579,7 +630,7 @@ function Strip({
 }) {
   return (
     <div className="jp-strip">
-      <div className="jp-say" data-tone={tone}>
+      <div className="jp-say" data-tone={tone} data-asks={asks || undefined}>
         <div className="jp-said" aria-live={live ? "polite" : undefined}>
           {say}
         </div>
@@ -648,7 +699,8 @@ function pickSay(p: ShipDeployPane, row: ShipDeployRow, shown: Shown | null, pic
           <b>
             {i.kind} {i.name}
           </b>{" "}
-          picked · {i.v}
+          picked · {i.node ? `running on ${i.node} · ` : ""}
+          {i.v}
           {i.differs ? " · Sync applies just this object" : ""}
         </>
       );
@@ -666,7 +718,7 @@ function pickSay(p: ShipDeployPane, row: ShipDeployRow, shown: Shown | null, pic
     case "step":
       return (
         <>
-          <b>Rollout{shown.rollout.revision ? ` ${shown.rollout.revision}` : ""}</b> picked · {shown.rollout.note}
+          <b>{rolloutName(shown.rollout)}</b> picked · {shown.rollout.note}
           {rollout ? " · Promote moves it on now" : ""}
         </>
       );
@@ -679,6 +731,12 @@ function pickSay(p: ShipDeployPane, row: ShipDeployRow, shown: Shown | null, pic
         </>
       );
     }
+    case "delete":
+      return (
+        <>
+          <b>Delete {row.name}</b> picked · {p.why_not.delete ?? `its ${p.about.objects} objects go too, unless you leave them`}
+        </>
+      );
   }
 }
 
@@ -688,7 +746,7 @@ function armedSay(armed: Armed, row: ShipDeployRow, p: ShipDeployPane, back: Shi
     case "refresh":
       return (
         <>
-          <b>Refresh</b> reads git and the cluster again and compares them. <b>Hard refresh</b> also renders {p.about.source} from scratch, its cache dropped.
+          <b>Refresh</b> reads git and the cluster again and compares them. <b>Hard refresh</b> also renders {p.about.source.split(" @ ")[0]} from scratch, its cache dropped.
         </>
       );
     case "rollback":
@@ -716,6 +774,13 @@ function armedSay(armed: Armed, row: ShipDeployRow, p: ShipDeployPane, back: Shi
           Abort the rollout of <b>{row.name}</b>? Its traffic goes back to what ran before{p.settings.find((s) => s.key === "auto_rollback")?.on ? ", and kiln goes back to the deploy before it" : ""}.
         </>
       );
+    case "delete":
+      return (
+        <>
+          Delete <b>{row.name}</b>? kiln stops deploying it. <b>Delete all</b> deletes its {p.about.objects} objects from {p.about.cluster}/{p.about.namespace} too; <b>Delete, leave objects</b> leaves
+          them running.
+        </>
+      );
   }
 }
 
@@ -730,6 +795,8 @@ function Detail({ pane, row, shown, rows }: { pane: ShipDeployPane; row: ShipDep
       return <RolloutDetail rollout={shown.rollout} />;
     case "setting":
       return <SettingDetail setting={shown.setting} row={row} />;
+    case "delete":
+      return <DeleteDetail pane={pane} row={row} />;
   }
 }
 
@@ -758,6 +825,7 @@ function ObjectDetail({ app, item, trunk, rows }: { app: string; item: ShipDeplo
         <StatusGlyph state={glyphOf(item.state)} size={12} />
         <span className="ship-output__name">
           {item.kind} · {item.name}
+          {item.container ? ` · ${item.container}` : ""}
         </span>
         <span className="dp-w" role="group" aria-label="Views">
           {views.map((v) => (
@@ -815,7 +883,8 @@ function DiffBody({ app, item, trunk }: { app: string; item: ShipDeployItem; tru
   const diffs = useSuspenseResource(`ship/deploy/${app}/diff`, (s) => cdApi.diff(app, s), { on: CD_EVENTS }).data.diffs;
   const d = diffs.find((x) => x.key.kind === item.kind && x.key.name === item.name && x.key.namespace === item.namespace && x.key.group === item.group);
   const lines = d?.hunks.flatMap((h) => h.lines) ?? [];
-  const changed = lines.filter((l) => l.startsWith("+")).length;
+  // Each changed key a line taken out, put in, or both.
+  const changed = Math.max(lines.filter((l) => l.startsWith("+")).length, lines.filter((l) => l.startsWith("-")).length);
   return (
     <pre className="dp-op">
       {lines.map((l, i) => (
@@ -825,7 +894,7 @@ function DiffBody({ app, item, trunk }: { app: string; item: ShipDeployItem; tru
       ))}
       {"\n"}
       <i>
-        live (left) against git{trunk ? ` at ${trunk}` : ""} (right) · {d?.why ?? (changed ? `${changed} line${changed === 1 ? "" : "s"} differ` : "nothing differs")}
+        live (left) against git{trunk ? ` at ${trunk}` : ""} (right) · {changed ? `${changed} key${changed === 1 ? " differs" : "s differ"}` : (d?.why ?? "nothing differs")}
       </i>
     </pre>
   );
@@ -884,9 +953,10 @@ function Against({ repo, sha, app }: { repo: string; sha: string; app: string })
 }
 
 function RolloutDetail({ rollout }: { rollout: ShipDeployRollout }) {
+  const weight = rollout.weight ?? null;
   return (
     <div className="jp-cm">
-      <h4>Rollout{rollout.revision ? ` ${rollout.revision}` : ""}</h4>
+      <h4>{rolloutName(rollout)}</h4>
       {rollout.steps.map((s) => (
         <div key={s.n} className="row">
           <StatusGlyph state={glyphOf(s.state)} size={12} />
@@ -898,6 +968,32 @@ function RolloutDetail({ rollout }: { rollout: ShipDeployRollout }) {
       ))}
       <div className="dim">{rollout.note}</div>
       {rollout.approvals?.length ? <div>Waits for: {rollout.approvals.join(", ")}</div> : null}
+      {weight != null && rollout.under_way ? (
+        <>
+          <h4>Traffic</h4>
+          {rollout.back_to != null ? (
+            <div>
+              #{rollout.back_to} · what ran before · {100 - weight}%
+            </div>
+          ) : null}
+          <div>
+            {rollout.deploy != null ? `#${rollout.deploy}` : (rollout.revision ?? "it")} · rolling out · {weight}%
+          </div>
+        </>
+      ) : null}
+    </div>
+  );
+}
+
+/** Deleting the app: what goes, and what stays unless it's left. */
+function DeleteDetail({ pane, row }: { pane: ShipDeployPane; row: ShipDeployRow }) {
+  return (
+    <div className="jp-cm">
+      <h4>App · delete</h4>
+      <div>
+        Deleting {row.name} stops kiln deploying it. Its {pane.about.objects} objects in {pane.about.cluster}/{pane.about.namespace} go too, unless you leave them running.
+      </div>
+      <div className="dim">{pane.why_not.delete ?? `Its deploy history goes with it; ${row.project}'s commits stay.`}</div>
     </div>
   );
 }

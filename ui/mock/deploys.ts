@@ -61,7 +61,7 @@ const settings = (autoSync: boolean, from = "deploy-file"): ShipDeploySetting[] 
   { key: "prune", on: false, from: "deploy-file", what: "keeps what git dropped", can: false },
   { key: "self_heal", on: false, from: "deploy-file", what: "leaves changes made by hand", can: false },
 ];
-const item = (kind: string, name: string, state: string, v: string, o: { group?: string; ns: string; logs?: boolean; differs?: boolean }) => ({
+const item = (kind: string, name: string, state: string, v: string, o: { group?: string; ns: string; logs?: boolean; differs?: boolean; node?: string; container?: string }) => ({
   key: `${o.group ?? ""}~${kind}~${o.ns}~${name}`,
   group: o.group ?? "",
   kind,
@@ -71,6 +71,8 @@ const item = (kind: string, name: string, state: string, v: string, o: { group?:
   v,
   logs: o.logs ?? false,
   differs: o.differs ?? false,
+  ...(o.node ? { node: o.node } : {}),
+  ...(o.container ? { container: o.container } : {}),
 });
 const deploy = (n: number, short: string, subject: string, ago: number, o: { now?: boolean; dim?: boolean; state?: string; by?: string; to?: boolean } = {}): ShipDeployLine => ({
   deploy: n,
@@ -101,6 +103,8 @@ const commit = (short: string, subject: string, ago: number, by = "user.email", 
   same_as,
 });
 const NO_ROLLOUT = { promote: "no rollout is under way", abort: "no rollout is under way", approve: "nothing waits for an approval", deny: "nothing waits for an approval" };
+/** Deleted here, an app its repository's deploy file declares would come back. */
+const DECLARED = { delete: "its repository's .kiln/deploy.yaml declares it: take it out there" };
 
 /** kiln-production's objects, as the stills draw them. */
 const KILN_GROUPS: ShipDeployGroup[] = [
@@ -109,7 +113,7 @@ const KILN_GROUPS: ShipDeployGroup[] = [
     note: "1/1 ready · out of sync",
     owner: item("Deployment", "kiln", "changes", "differs from git", { group: "apps", ns: "kiln", logs: true, differs: true }),
     items: [
-      item("Pod", "kiln-cd9dc7b7-rsmwz", "running", "up 3m · 4 restarts", { ns: "kiln", logs: true }),
+      item("Pod", "kiln-cd9dc7b7-rsmwz", "running", "up 3m · 4 restarts", { ns: "kiln", logs: true, node: "kiln-m02", container: "kiln" }),
       item("ReplicaSet", "kiln-cd9dc7b7", "healthy", "1 pod", { group: "apps", ns: "kiln", logs: true }),
     ],
   },
@@ -117,7 +121,7 @@ const KILN_GROUPS: ShipDeployGroup[] = [
     name: "Network",
     note: "synced",
     owner: null,
-    items: [item("Ingress", "kiln", "healthy", "kiln.lan", { group: "networking.k8s.io", ns: "kiln" }), item("Service", "kiln", "healthy", "ClusterIP · 3 ports", { ns: "kiln" })],
+    items: [item("Service", "kiln", "healthy", "ClusterIP · 3 ports", { ns: "kiln" }), item("Ingress", "kiln", "healthy", "kiln.lan", { group: "networking.k8s.io", ns: "kiln" })],
   },
   {
     name: "Config",
@@ -126,7 +130,7 @@ const KILN_GROUPS: ShipDeployGroup[] = [
     items: [item("ConfigMap", "kiln-config", "changes", "differs from git", { ns: "kiln", differs: true }), item("Secret", "kiln", "healthy", "synced", { ns: "kiln" })],
   },
   { name: "Storage", note: "synced", owner: null, items: [item("PersistentVolumeClaim", "kiln-data", "healthy", "Bound · 200Gi", { ns: "kiln" })] },
-  { name: "Jobs", note: "synced", owner: null, items: [item("Job", "kiln-guard-94lwq", "passed", "completed · made 12h ago", { group: "batch", ns: "kiln", logs: true })] },
+  { name: "Jobs", note: "", owner: null, items: [item("Job", "kiln-guard-94lwq", "passed", "completed · made 12h ago", { group: "batch", ns: "kiln", logs: true })] },
 ];
 
 /** A workload and its config, for the others' panes. */
@@ -135,7 +139,9 @@ const small = (name: string, ns: string, pods: number, state = "running"): ShipD
     name: `Deployment ${name}`,
     note: `${pods}/${pods} ready`,
     owner: item("Deployment", name, "healthy", `${pods}/${pods} ready`, { group: "apps", ns, logs: true }),
-    items: Array.from({ length: pods }, (_, i) => item("Pod", `${name}-5c7d9b-${["x2k4f", "p8r1q", "m3n7v"][i] ?? "z0z0z"}`, state, `up ${2 + i}h`, { ns, logs: true })),
+    items: Array.from({ length: pods }, (_, i) =>
+      item("Pod", `${name}-5c7d9b-${["x2k4f", "p8r1q", "m3n7v"][i] ?? "z0z0z"}`, state, `up ${2 + i}h`, { ns, logs: true, node: i % 2 ? "kiln" : "kiln-m02", container: name }),
+    ),
   },
   { name: "Network", note: "synced", owner: null, items: [item("Service", name, "healthy", "ClusterIP · 1 port", { ns })] },
   { name: "Config", note: "synced", owner: null, items: [item("ConfigMap", `${name}-config`, "healthy", "synced", { ns })] },
@@ -176,7 +182,7 @@ const APPS: App[] = [
         deploy(149, "a946ea5", "Mission control: an offline machine's notice can be put away", 2 * DAY, { dim: true }),
       ],
       settings: settings(false),
-      why_not: { stop: "no sync is running", follow: "it follows git already", ...NO_ROLLOUT },
+      why_not: { stop: "no sync is running", follow: "it follows git already", ...NO_ROLLOUT, ...DECLARED },
     },
   },
   {
@@ -209,7 +215,7 @@ const APPS: App[] = [
         deploy(87, "b1ef50d", "Merge ship-made-by: Files colours and ask about a commit's lines", 2 * HOUR, { dim: true }),
       ],
       settings: settings(true),
-      why_not: { stop: "no sync is running", follow: "it follows git already", ...NO_ROLLOUT },
+      why_not: { stop: "no sync is running", follow: "it follows git already", ...NO_ROLLOUT, ...DECLARED },
     },
   },
   {
@@ -241,7 +247,7 @@ const APPS: App[] = [
         { ...deploy(4, "92.2.0", "successfully synced (all tasks run)", 6 * DAY, { now: true, by: "admin" }), sha: "92.2.0", revision: null },
         { ...deploy(3, "91.0.1", "successfully synced (all tasks run)", 30 * DAY, { dim: true, by: "admin" }), sha: "91.0.1", revision: null },
       ],
-      settings: settings(false),
+      settings: settings(false, "default"),
       why_not: { stop: "no sync is running", follow: "it follows git already", ...NO_ROLLOUT },
     },
   },
@@ -282,13 +288,16 @@ const APPS: App[] = [
         under_way: true,
         waits: "waiting for approval",
         approvals: ["release"],
+        deploy: 39,
+        back_to: 38,
+        weight: 20,
       },
       history: [
         deploy(39, "1f9b2c4", "Quiver: a follower's vote waits for its grant", 2 * DAY, { now: true }),
         deploy(38, "6b0d2e1", "Quiver: elections settle within one term", 9 * DAY, { dim: true }),
       ],
       settings: settings(false),
-      why_not: { stop: "no sync is running", follow: "it follows git already" },
+      why_not: { stop: "no sync is running", follow: "it follows git already", ...DECLARED },
     },
   },
   {
@@ -321,7 +330,7 @@ const APPS: App[] = [
         deploy(41, "1f9b2c4", "Quiver: a follower's vote waits for its grant", 2 * DAY, { now: true, by: "auto-sync" }),
       ],
       settings: settings(true),
-      why_not: { sync: "a sync is running: stop it first", rollback: "a sync is running: stop it first", follow: "it follows git already", ...NO_ROLLOUT },
+      why_not: { sync: "a sync is running: stop it first", rollback: "a sync is running: stop it first", follow: "it follows git already", ...NO_ROLLOUT, ...DECLARED },
     },
   },
   {
@@ -359,7 +368,7 @@ const APPS: App[] = [
         deploy(18, "9d1e0a7", "Hyperlight site: the docs' search keeps its place", 2 * DAY, { dim: true }),
       ],
       settings: settings(true),
-      why_not: { stop: "no sync is running", ...NO_ROLLOUT },
+      why_not: { stop: "no sync is running", ...NO_ROLLOUT, ...DECLARED },
     },
   },
 ];
@@ -370,12 +379,14 @@ interface Acts {
   autoSync: Map<string, boolean>;
   /** quiver-staging's sync, moved on by `/api/mock/ship/deploys/tick`. */
   tick: number;
+  /** The apps it deleted. */
+  deleted: Set<string>;
 }
 const acts = new Map<string, Acts>();
 function actsOf(ua: string): Acts {
   let a = acts.get(ua);
   if (!a) {
-    a = { bodies: [], autoSync: new Map(), tick: 0 };
+    a = { bodies: [], autoSync: new Map(), tick: 0, deleted: new Set() };
     acts.set(ua, a);
   }
   return a;
@@ -403,16 +414,18 @@ function seen(a: App, mine: Acts): { row: ShipDeployRow; pane: Omit<ShipDeployPa
   return { row, pane };
 }
 
-/** Where a stand sorts, as `kiln_cd::stands::rank` has it: what needs someone first. */
-const RANK: Record<string, number> = { needs_you: 0, failing: 1, rolled_back: 2, shipping: 3, waiting: 4, shipped: 5 };
+/** Where an app sorts, as `kiln_cd::stands::rank` has it: what needs someone first, out of sync after what failed or went back. */
+const RANK: Record<string, number> = { needs_you: 0, failing: 1, rolled_back: 2, shipping: 4, waiting: 5, shipped: 6 };
+const rank = (r: ShipDeployRow) => (r.stand === "needs_you" && r.word === "Out of sync" ? 3 : (RANK[r.stand] ?? 7));
 
 /** The list as the server answers it: by project, each project's apps and the projects most pressing first. */
 function list(mine: Acts, q: string): ShipDeploys {
   const want = q.trim().toLowerCase();
-  const rows = APPS.map((a) => seen(a, mine).row).filter((r) => !want || [r.project, r.app, r.environment ?? "", r.cluster, r.namespace].some((v) => v.toLowerCase().includes(want)));
+  const rows = APPS.filter((a) => !mine.deleted.has(a.row.app))
+    .map((a) => seen(a, mine).row)
+    .filter((r) => !want || [r.project, r.app, r.environment ?? "", r.cluster, r.namespace].some((v) => v.toLowerCase().includes(want)));
   const by = new Map<string, ShipDeployRow[]>();
   for (const r of rows) by.set(r.project, [...(by.get(r.project) ?? []), r]);
-  const rank = (r: ShipDeployRow) => RANK[r.stand] ?? 6;
   const projects: ShipDeployProject[] = [...by.entries()].map(([project, apps]) => {
     apps.sort((x, y) => rank(x) - rank(y) || x.name.localeCompare(y.name));
     return { project, apps, ...say(apps) };
@@ -430,7 +443,7 @@ function say(apps: ShipDeployRow[]): { say: string; needs: boolean } {
   const k = apps.filter((a) => a.stand === top.stand && a.word === top.word).length;
   const phrase = top.word === "Needs you" ? (k === 1 ? "waits on you" : "wait on you") : top.word.toLowerCase();
   const text = n === 1 ? `${count} · ${phrase}` : n === k ? `${count} · all ${phrase}` : `${count} · ${k} ${phrase}`;
-  return { say: text, needs: (RANK[top.stand] ?? 6) <= 2 };
+  return { say: text, needs: ["needs_you", "failing", "rolled_back"].includes(top.stand) };
 }
 
 const OPS: Record<ShipDeployVerb, string> = {
@@ -445,6 +458,7 @@ const OPS: Record<ShipDeployVerb, string> = {
   deny: "cd.apps.rollout_act",
   auto_sync: "cd.apps.set_auto_sync",
   auto_rollback: "cd.apps.set_auto_rollback",
+  delete: "cd.apps.delete",
 };
 
 /** What a verb's operation answers, as CD's do. */
@@ -468,6 +482,8 @@ function done(app: App, verb: ShipDeployVerb, body: Record<string, unknown>): { 
     case "auto_sync":
     case "auto_rollback":
       return { status: 200, body: { on: body.on, from: body.on === null ? "deploy-file" : "app" } };
+    case "delete":
+      return { status: 200, body: { deleted: id, cascade: body.cascade !== "orphan" } };
     default:
       return { status: 200, body: { app: id, rollout: app.pane.rollout?.id ?? null, action: verb } };
   }
@@ -637,7 +653,7 @@ export async function handleDeploys(req: http.IncomingMessage, res: http.ServerR
   const one = m === "GET" ? p.match(/^\/api\/ship\/deploys\/([^/]+)\/([^/]+)$/) : null;
   if (one) {
     const id = `${decodeURIComponent(one[1] ?? "")}/${decodeURIComponent(one[2] ?? "")}`;
-    const a = APPS.find((x) => x.row.app === id);
+    const a = APPS.find((x) => x.row.app === id && !actsOf(ua).deleted.has(id));
     if (!a) ctx.json(res, 404, { error: `no app ${id}` });
     else {
       const s = seen(a, actsOf(ua));
@@ -653,7 +669,7 @@ export async function handleDeploys(req: http.IncomingMessage, res: http.ServerR
       body = {};
     }
     const verb = body.verb as ShipDeployVerb;
-    const a = APPS.find((x) => x.row.app === body.app);
+    const a = APPS.find((x) => x.row.app === body.app && !actsOf(ua).deleted.has(x.row.app));
     if (!a || !(verb in OPS)) {
       ctx.json(res, 400, { error: "`app` and `verb`: the app, and what to do to it" });
       return true;
@@ -664,6 +680,10 @@ export async function handleDeploys(req: http.IncomingMessage, res: http.ServerR
     if (r.status === 200 && verb === "auto_sync") {
       if (body.on === null) mine.autoSync.delete(a.row.app);
       else mine.autoSync.set(a.row.app, body.on === true);
+    }
+    if (r.status === 200 && verb === "delete") {
+      mine.deleted.add(a.row.app);
+      emit({ type: "cd_app_deleted", app: a.row.app });
     }
     ctx.json(res, r.status, r.status === 200 ? { app: a.row.app, verb, op: OPS[verb], done: r.body } : r.body);
     return true;

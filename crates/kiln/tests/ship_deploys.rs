@@ -178,7 +178,7 @@ fn w26_r24_ship_lists_cds_apps_by_project_and_each_verb_reaches_its_operation_as
     let viewer = token(&s, "vic", &["viewer"], None)?;
     let (st, _) = call(&s, &viewer, "GET", "/api/ship/deploys", None)?;
     assert_eq!(st, 200);
-    for verb in ["sync", "refresh", "rollback", "stop", "follow", "promote", "abort", "auto_sync", "auto_rollback"] {
+    for verb in ["sync", "refresh", "rollback", "stop", "follow", "promote", "abort", "auto_sync", "auto_rollback", "delete"] {
         let (st, v) = act(&viewer, verb, json!({ "on": true }))?;
         assert!(st == 403 && v.to_string().contains("environments.deploy"), "{verb}: {st} {v}");
     }
@@ -186,5 +186,17 @@ fn w26_r24_ship_lists_cds_apps_by_project_and_each_verb_reaches_its_operation_as
     let agent = token(&s, "ada", &["maintainer"], Some("fixer"))?;
     let (st, v) = act(&agent, "sync", json!({}))?;
     assert!(st == 403 && v.to_string().contains("agents may not sync"), "{st} {v}");
+    // Delete, as the Settings group's last line asks it: the app made through the API goes, its
+    // objects left where they are, and the list no longer has it.
+    let body = json!({ "app": "default/kiln-staging", "verb": "delete", "cascade": "orphan" });
+    let (st, v) = call(&s, &maintainer, "POST", "/api/ship/deploys", Some(&body))?;
+    assert_eq!((st, at(&v, "/op"), at(&v, "/done/deleted"), at(&v, "/done/cascade")), (200, &json!("cd.apps.delete"), &json!("default/kiln-staging"), &json!(false)), "{v}");
+    until(Duration::from_secs(30), "two apps listed", || {
+        let (st, v) = call(&s, &s.admin, "GET", "/api/ship/deploys", None)?;
+        Ok((st == 200 && at(&v, "/total") == &json!(2), v))
+    })?;
+    // Gone, it isn't there to delete again.
+    let (st, _) = call(&s, &maintainer, "POST", "/api/ship/deploys", Some(&body))?;
+    assert_eq!(st, 404);
     Ok(())
 }

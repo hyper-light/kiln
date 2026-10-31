@@ -345,16 +345,19 @@ pub fn standing(a: &App<'_>, now_ms: u64) -> Standing {
     }
 }
 
-/// Where a stand sorts: what needs someone first.
-pub fn rank(stand: Stand) -> u8 {
+/// Where an app sorts by its stand and word: what needs someone first. A rollout waiting on a
+/// person goes before what failed or went back; an app out of sync for a person to sync goes after
+/// them, as trunk being ahead isn't something gone wrong.
+pub fn rank(stand: Stand, word: &str) -> u8 {
     match stand {
+        Stand::NeedsYou if word == "Out of sync" => 3,
         Stand::NeedsYou => 0,
         Stand::Failing => 1,
         Stand::RolledBack => 2,
-        Stand::Shipping => 3,
-        Stand::Waiting => 4,
-        Stand::Shipped => 5,
-        _ => 6,
+        Stand::Shipping => 4,
+        Stand::Waiting => 5,
+        Stand::Shipped => 6,
+        _ => 7,
     }
 }
 
@@ -364,7 +367,7 @@ pub fn rank(stand: Stand) -> u8 {
 pub fn project_say(apps: &[(Stand, &str)]) -> (String, bool) {
     let n = apps.len();
     let count = if n == 1 { "1 app".to_owned() } else { format!("{n} apps") };
-    let Some((top, word)) = apps.iter().min_by_key(|(s, _)| rank(*s)).copied() else { return (count, false) };
+    let Some((top, word)) = apps.iter().min_by_key(|(s, w)| rank(*s, w)).copied() else { return (count, false) };
     let k = apps.iter().filter(|(s, w)| *s == top && *w == word).count();
     let phrase = match word {
         "Needs you" if k == 1 => "waits on you".to_owned(),
@@ -376,7 +379,7 @@ pub fn project_say(apps: &[(Stand, &str)]) -> (String, bool) {
         (n, k) if n == k => format!("{count} · all {phrase}"),
         _ => format!("{count} · {k} {phrase}"),
     };
-    (say, rank(top) <= rank(Stand::RolledBack))
+    (say, matches!(top, Stand::NeedsYou | Stand::Failing | Stand::RolledBack))
 }
 
 /// One object of an app, as a line: its key as the API's routes take it (`apps~Deployment~web~api`).
@@ -394,6 +397,13 @@ pub struct Item {
     pub logs: bool,
     /// It differs from git: what a sync would change in it reads as a diff.
     pub differs: bool,
+    /// The node a pod runs on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    /// The container a pod's logs read unless another is asked for: its first that isn't an init
+    /// container (`cd::live::container_of`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
 }
 
 /// An app's objects of one owner or one sort.
@@ -556,6 +566,8 @@ fn item(n: &Node, now_ms: u64) -> Item {
         v: item_value(n, now_ms),
         logs: has_logs(&n.group, &n.kind),
         differs: differs(n),
+        node: n.node.clone(),
+        container: n.containers.iter().find(|c| !c.init).or(n.containers.first()).map(|c| c.name.clone()),
     }
 }
 
@@ -639,7 +651,9 @@ pub fn components(nodes: &[Node], now_ms: u64) -> Vec<Group> {
     }
     owners.sort_by(|a, b| a.name.cmp(&b.name));
     for ((_, name), (mut items, managed)) in sorts {
-        items.sort_by(|a, b| a.kind.cmp(&b.kind).then_with(|| a.name.cmp(&b.name)));
+        // A Service before what routes to it.
+        let first = |i: &Item| !(i.group.is_empty() && i.kind == "Service");
+        items.sort_by(|a, b| first(a).cmp(&first(b)).then_with(|| a.kind.cmp(&b.kind)).then_with(|| a.name.cmp(&b.name)));
         owners.push(Group { note: sort_note(&items, managed), name, owner: None, items });
     }
     owners
@@ -1077,9 +1091,11 @@ mod tests {
         assert_eq!(project_say(&[(Stand::NeedsYou, "Out of sync"), (Stand::Shipped, "Synced"), (Stand::Shipped, "Synced")]), ("3 apps · 1 out of sync".to_owned(), true));
         assert_eq!(project_say(&[(Stand::Shipped, "Synced"), (Stand::Shipped, "Synced")]), ("2 apps · all synced".to_owned(), false));
         assert_eq!(project_say(&[(Stand::NeedsYou, "Needs you"), (Stand::NeedsYou, "Needs you"), (Stand::Shipped, "Synced")]), ("3 apps · 2 wait on you".to_owned(), true));
-        let mut by: Vec<Stand> = vec![Stand::Shipped, Stand::Waiting, Stand::Failing, Stand::NeedsYou, Stand::Shipping, Stand::RolledBack];
-        by.sort_by_key(|s| rank(*s));
-        assert_eq!(by, [Stand::NeedsYou, Stand::Failing, Stand::RolledBack, Stand::Shipping, Stand::Waiting, Stand::Shipped]);
+        assert_eq!(project_say(&[(Stand::NeedsYou, "Out of sync"), (Stand::NeedsYou, "Needs you")]), ("2 apps · 1 waits on you".to_owned(), true));
+        let mut by: Vec<(Stand, &str)> =
+            vec![(Stand::Shipped, "Synced"), (Stand::Waiting, "Comparing"), (Stand::NeedsYou, "Out of sync"), (Stand::Failing, "Sync failed"), (Stand::NeedsYou, "Needs you"), (Stand::Shipping, "Syncing"), (Stand::RolledBack, "Rolled back")];
+        by.sort_by_key(|(s, w)| rank(*s, w));
+        assert_eq!(by.iter().map(|(_, w)| *w).collect::<Vec<_>>(), ["Needs you", "Sync failed", "Rolled back", "Out of sync", "Syncing", "Comparing", "Synced"]);
     }
 
     fn node(group: &str, kind: &str, name: &str, uid: &str, parents: &[&str]) -> Node {
@@ -1135,6 +1151,9 @@ mod tests {
         pod.status = Some("Running".into());
         pod.restarts = Some(4);
         pod.created_at = Some("2026-11-01T05:30:00Z".into());
+        pod.node = Some("kiln-m02".into());
+        let container = |name: &str, init: bool| tree::Container { name: name.into(), image: format!("{name}:1"), init, ready: Some(true), restarts: Some(0), state: None, reason: None, last: None };
+        pod.containers = vec![container("migrate", true), container("kiln", false), container("guard", false)];
         let revision = node("apps", "ControllerRevision", "kiln-1", "cr1", &["d1"]);
         let svc = with_info(node("", "Service", "kiln", "s1", &[]), &[("Type", "ClusterIP"), ("Ports", "7070/TCP, 7443/TCP, 7071/UDP")]);
         let slice = node("discovery.k8s.io", "EndpointSlice", "kiln-abc", "es1", &["s1"]);
@@ -1163,14 +1182,17 @@ mod tests {
                 ("ReplicaSet".to_owned(), "kiln-6f1c02aa".to_owned(), Glyph::Superseded, "0 pods".to_owned()),
             ]
         );
+        // A pod says where it runs and whose logs it reads: its first container that isn't an init's.
+        let pod = groups.first().and_then(|g| g.items.first());
+        assert_eq!(pod.map(|i| (i.node.as_deref(), i.container.as_deref())), Some((Some("kiln-m02"), Some("kiln"))));
         let owner = groups.first().and_then(|g| g.owner.clone());
         assert!(owner.as_ref().is_some_and(|o| o.key == "apps~Deployment~kiln~kiln" && o.differs && o.logs && o.state == Glyph::Changes), "{owner:?}");
         let rest: Vec<_> = groups.iter().skip(1).flat_map(lines).collect();
         assert_eq!(
             rest,
             [
-                ("Ingress".to_owned(), "kiln".to_owned(), Glyph::Healthy, "kiln.lan".to_owned()),
                 ("Service".to_owned(), "kiln".to_owned(), Glyph::Healthy, "ClusterIP · 3 ports".to_owned()),
+                ("Ingress".to_owned(), "kiln".to_owned(), Glyph::Healthy, "kiln.lan".to_owned()),
                 ("ConfigMap".to_owned(), "kiln-config".to_owned(), Glyph::Changes, "differs from git".to_owned()),
                 ("ConfigMap".to_owned(), "old-config".to_owned(), Glyph::Superseded, "git dropped it".to_owned()),
                 ("Secret".to_owned(), "kiln".to_owned(), Glyph::Healthy, "synced".to_owned()),

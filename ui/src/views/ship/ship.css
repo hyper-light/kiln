@@ -1062,7 +1062,10 @@
   font-family: var(--font-mono, ui-monospace, monospace);
   font-size: 12px;
   line-height: 1.18;
-  white-space: pre;
+  /* A long line goes on under itself, as the approved stills draw it: nothing scrolls sideways. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  overflow-x: hidden;
 }
 .dp-op i {
   color: #6d7078;
@@ -1134,4 +1137,46 @@
   .dp-op {
     height: 230px;
   }
+}
+/* An app's who and when: the when whole, the who cut short where the two run long. */
+.ship-metas > .dp-by {
+  display: flex;
+  gap: 0.6ch;
+  align-items: center;
+  justify-content: flex-end;
+}
+.dp-by .ship-who {
+  min-width: 0;
+}
+.dp-by .ship-who > span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.dp-ago {
+  flex: none;
+  min-width: 4ch;
+  font-variant-numeric: tabular-nums;
+  text-align: end;
+}
+/* An app a link opened the page on comes into view below the page's sticky header. */
+.dp-row {
+  scroll-margin-top: calc(var(--header-h, 64px) + 12px);
+}
+/* Asked again, the question has the words' room too, as the approved stills draw it: the strip keeps its height. */
+.jp-say[data-asks] {
+  grid-template-rows: 36px auto;
+}
+/* Both in its one column: the question over the words' row, not beside it. */
+.jp-say[data-asks] .jp-said {
+  grid-column: 1;
+  grid-row: 1 / span 2;
+  align-self: center;
+  height: auto;
+  max-height: 100%;
+  -webkit-line-clamp: 3;
+}
+.jp-say[data-asks] .jp-q {
+  grid-column: 1;
+  grid-row: 2;
+  visibility: hidden;
 }

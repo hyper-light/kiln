@@ -4,8 +4,8 @@
  * on Deploys); apps are Ship's rows by project, needs-you first, with no buttons; an opened app is
  * the jobs pane's anatomy (the strip, its objects by owner, its rollout, history and settings, the
  * picked one's detail beside them or under its line with the strip again on a phone). Each action
- * reaches `POST /api/ship/deploys` with the right body, Refresh, Roll back, Stop and Abort ask again
- * as the stills do, a refusal says why in the strip; nothing moves, and nothing scrolls sideways.
+ * reaches `POST /api/ship/deploys` with the right body, Refresh, Roll back, Stop, Abort and Delete ask
+ * again, a refusal says why in the strip; nothing moves, and nothing scrolls sideways.
  */
 import { expect, test, type Locator, type Page } from "@playwright/test";
 
@@ -57,16 +57,26 @@ test("Ship's tabs are Commits and Deploys; /runs lands on Ship, /deployments on 
 test("apps are Ship's rows by project, needs-you first: the stand word, the line, Sync · Health · Soak, and no buttons", async ({ page }) => {
   await page.goto("/ship/deploys");
   await notices(page);
-  await expect(page.locator(".dp-proj > span:first-child")).toHaveText(["hyper-light/kiln", "hyper-light/quiver", "hyper-light/hyperlight-site"]);
-  await expect(page.locator(".dp-proj > span:last-child")).toHaveText(["3 apps · 1 out of sync", "2 apps · 1 waits on you", "1 app · rolled back"]);
-  await expect(page.locator(".dp-row .ship-name")).toHaveText(["kiln-production", "kiln-staging", "kube-prometheus-stack-production", "quiver-production", "quiver-staging", "site-production"]);
-  await expect(page.locator(".dp-row .ship-stand")).toHaveText([/Out of sync/i, /Synced/i, /Synced/i, /Needs you/i, /Syncing/i, /Rolled back/i]);
+  // What waits on a person first, then what went back, then what's out of sync: as the stills order them.
+  await expect(page.locator(".dp-proj > span:first-child")).toHaveText(["hyper-light/quiver", "hyper-light/hyperlight-site", "hyper-light/kiln"]);
+  await expect(page.locator(".dp-proj > span:last-child")).toHaveText(["2 apps · 1 waits on you", "1 app · rolled back", "3 apps · 1 out of sync"]);
+  await expect(page.locator(".dp-row .ship-name")).toHaveText(["quiver-production", "quiver-staging", "site-production", "kiln-production", "kiln-staging", "kube-prometheus-stack-production"]);
+  await expect(page.locator(".dp-row .ship-stand")).toHaveText([/Needs you/i, /Syncing/i, /Rolled back/i, /Out of sync/i, /Synced/i, /Synced/i]);
   const kiln = page.locator(`.dp-row[data-app="${KILN}"]`);
   await expect(kiln).toHaveAttribute("data-stand", "needs_you");
   await expect(kiln.locator(".ship-text")).toHaveText("#153 runs 15878aa · trunk is 2 ahead · healthy");
   await expect(kiln.locator(".js-l")).toHaveText(["Sync", "Health", "Soak"]);
   await expect(kiln.locator(".ship-env")).toHaveText("production");
   await expect(kiln.locator(".ship-sha")).toHaveText("15878aa");
+  // Who and when: the when whole, in the fewest words, however long the who.
+  await expect(kiln.locator(".dp-by")).toHaveText(/^agent 01a18b08\s*·\s*36m$/);
+  for (const by of await page.locator(".dp-by").all()) {
+    const fit = await by.evaluate((el) => {
+      const ago = el.querySelector(".dp-ago");
+      return !!ago && ago.scrollWidth <= ago.clientWidth && ago.getBoundingClientRect().right <= el.getBoundingClientRect().right + 0.5;
+    });
+    expect(fit).toBe(true);
+  }
   await expect(page.locator('.dp-row[data-app="default/site-production"] .ship-text')).toHaveText("#19 failed its health check · back on #18");
   // Nothing on a row is a button but to open it.
   for (const row of await page.locator(".dp-row").all()) {
@@ -75,7 +85,7 @@ test("apps are Ship's rows by project, needs-you first: the stand word, the line
   }
   // Finding by an environment narrows to it.
   await page.getByPlaceholder("Project, app, environment, cluster…").fill("staging");
-  await expect(page.locator(".dp-row .ship-name")).toHaveText(["kiln-staging", "quiver-staging"]);
+  await expect(page.locator(".dp-row .ship-name")).toHaveText(["quiver-staging", "kiln-staging"]);
 });
 
 test("an opened app is the jobs pane's anatomy: the strip, its objects by owner, history and settings, the picked one beside them or under its line", async ({ page, isMobile }) => {
@@ -86,8 +96,8 @@ test("an opened app is the jobs pane's anatomy: the strip, its objects by owner,
   expect(new Set(widths).size).toBe(1);
   await expect(strip(pane).locator(".jp-q button")).toHaveText(["out of sync", "unhealthy", "all"]);
   await expect(pane.locator(".jp-g > span:first-child, .jp-g .jp-line > span:first-child")).toHaveText(["Deployment kiln", "Network", "Config", "Storage", "Jobs", "History", "Settings"]);
-  // The pod's shown first: its log in the commits' Output's frame.
-  await expect(said(pane)).toContainText("Pod kiln-cd9dc7b7-rsmwz picked");
+  // The pod's shown first, where it runs: its log in the commits' Output's frame, by its container.
+  await expect(said(pane)).toContainText("Pod kiln-cd9dc7b7-rsmwz picked · running on kiln-m02 · up 3m · 4 restarts");
   const at = pane.locator("[data-at]");
   await expect(at).toHaveCount(1);
   await expect(at).toHaveAttribute("data-key", "o:~Pod~kiln~kiln-cd9dc7b7-rsmwz");
@@ -98,6 +108,7 @@ test("an opened app is the jobs pane's anatomy: the strip, its objects by owner,
     await expect(where.locator(".jp-strip")).toBeVisible();
   } else await expect(pane.locator(".jp-detail")).toHaveCount(0);
   const out = where.locator(".ship-output");
+  await expect(out.locator(".ship-output__name")).toHaveText("Pod · kiln-cd9dc7b7-rsmwz · kiln");
   await expect(out.locator(".dp-w button")).toHaveText(["Logs", "Events", "Manifest"]);
   await expect(out.locator('.dp-w button[aria-pressed="true"]')).toHaveText("Logs");
   // It follows its end: the newest line is in view.
@@ -121,8 +132,11 @@ test("an object that differs shows its Diff; Events and Manifest read; Sync appl
   await expect(out.locator(".dp-w button")).toHaveText(["Diff", "Events", "Manifest"]);
   await expect(out.locator(".dp-op .rm").first()).toContainText("log_level: info");
   await expect(out.locator(".dp-op .ad").first()).toContainText("log_level: debug");
+  await expect(out.locator(".dp-op")).toContainText("live (left) against git at 021a29f (right) · 2 keys differ");
   await out.locator(".dp-w button", { hasText: "Events" }).click();
   await expect(out.locator(".dp-op")).toContainText("Readiness probe failed");
+  // A long event goes on under itself: nothing in the detail scrolls sideways.
+  expect(await out.locator(".dp-op").evaluate((el) => el.scrollWidth - el.clientWidth)).toBeLessThanOrEqual(0);
   await out.locator(".dp-w button", { hasText: "Manifest" }).click();
   await expect(out.locator(".dp-op")).toContainText("kind: ConfigMap");
   await verb(pane, "Sync").click();
@@ -143,14 +157,20 @@ test("an object that differs shows its Diff; Events and Manifest read; Sync appl
 
 test("Refresh asks: Refresh or Hard refresh; Keep sends nothing", async ({ page }) => {
   const pane = await open(page);
+  const tall = async () => (await strip(pane).boundingBox())?.height ?? 0;
+  const before = await tall();
   await verb(pane, "Refresh").click();
   await expect(verbs(pane)).toHaveText(["Keep", "Refresh", "Hard refresh"]);
-  await expect(said(pane)).toContainText("Hard refresh also renders deploy/helm/kiln @ main from scratch, its cache dropped.");
+  await expect(said(pane)).toContainText("Hard refresh also renders deploy/helm/kiln from scratch, its cache dropped.");
   await expect(strip(pane).locator(".jp-say")).toHaveAttribute("data-tone", "ask");
-  const before = (await sent(page)).length;
+  // The question has the words' room, whole, and the strip keeps its height.
+  await expect(strip(pane).locator(".jp-q")).toBeHidden();
+  expect(await said(pane).evaluate((el) => el.scrollHeight <= el.clientHeight + 1)).toBe(true);
+  expect(await tall()).toBe(before);
+  const bodies = (await sent(page)).length;
   await verb(pane, "Keep").click();
   await expect(verbs(pane)).toHaveText(["Sync", "Refresh", "Roll back", "Stop"]);
-  expect((await sent(page)).length).toBe(before);
+  expect((await sent(page)).length).toBe(bodies);
   await verb(pane, "Refresh").click();
   await verb(pane, "Hard refresh").click();
   await expect(said(pane)).toContainText("Rendering kiln-production again and comparing it.");
@@ -193,10 +213,14 @@ test("History: any commit can be rolled back to, asked again; what runs now can'
 test("Promote and Abort while a rollout runs; Abort asks again", async ({ page }) => {
   const pane = await open(page, "default/quiver-production");
   await expect(verbs(pane)).toHaveText(["Promote", "Refresh", "Roll back", "Abort"]);
-  await expect(pane.locator(".jp-g > span:first-child").first()).toHaveText("Rollout · 1f9b2c4");
+  await expect(pane.locator(".jp-g > span:first-child").first()).toHaveText("Rollout #39");
   await expect(pane.locator("[data-at]")).toHaveAttribute("data-key", "s:2");
-  await expect(said(pane)).toContainText("Rollout 1f9b2c4 picked · 20% · step 2 of 3 · waiting for approval · Promote moves it on now");
-  await expect(pane.locator(".jp-cm").first()).toContainText("Step 2 · a person approves");
+  await expect(said(pane)).toContainText("Rollout #39 picked · 20% · step 2 of 3 · waiting for approval · Promote moves it on now");
+  const card = pane.locator(".jp-cm").first();
+  await expect(card).toContainText("Step 2 · a person approves");
+  // Its traffic: what ran before, and what it rolls out.
+  await expect(card).toContainText("#38 · what ran before · 80%");
+  await expect(card).toContainText("#39 · rolling out · 20%");
   await verb(pane, "Promote").click();
   await expect(said(pane)).toContainText("Promoting the rollout past its step.");
   expect(await last(page)).toEqual({ app: "default/quiver-production", verb: "promote", rollout: "in-cluster|apps/Rollout/quiver/quiver" });
@@ -235,6 +259,33 @@ test("a setting picked: its change in the strip, the rest dimmed, never hidden",
   // Prune is its deploy file's to set.
   await pickLine(pane, "c:prune");
   await expect(verb(pane, "Turn on")).toBeDisabled();
+});
+
+test("Delete, Settings' last line: dimmed where a deploy file declares the app; else asked again, and its row goes", async ({ page }) => {
+  const pane = await open(page);
+  await expect(line(pane, "c:delete")).toContainText(/App\s*delete kiln-production/);
+  await pickLine(pane, "c:delete");
+  await expect(said(pane)).toContainText("Delete kiln-production picked · its repository's .kiln/deploy.yaml declares it: take it out there");
+  await expect(verbs(pane)).toHaveText(["Delete", "Refresh", "Roll back", "Stop"]);
+  for (const v of ["Delete", "Refresh", "Roll back", "Stop"]) await expect(verb(pane, v)).toBeDisabled();
+  // The chart made here can go: asked again, Keep sends nothing, its objects left where they are.
+  const PROM = "default/kube-prometheus-stack-production";
+  const prom = await open(page, PROM);
+  await pickLine(prom, "c:delete");
+  await expect(said(prom)).toContainText("Delete kube-prometheus-stack-production picked · its 140 objects go too, unless you leave them");
+  await expect(prom.locator(".jp-cm").first()).toContainText("Its deploy history goes with it");
+  await verb(prom, "Delete").click();
+  await expect(verbs(prom)).toHaveText(["Keep", "Delete all", "Delete, leave objects"]);
+  await expect(said(prom)).toContainText("Delete kube-prometheus-stack-production? kiln stops deploying it.");
+  await expect(strip(prom).locator(".jp-say")).toHaveAttribute("data-tone", "warn");
+  const before = (await sent(page)).length;
+  await verb(prom, "Keep").click();
+  expect((await sent(page)).length).toBe(before);
+  await verb(prom, "Delete").click();
+  await verb(prom, "Delete, leave objects").click();
+  await expect(page.locator(`.dp-row[data-app="${PROM}"]`)).toHaveCount(0);
+  expect(await last(page)).toEqual({ app: PROM, verb: "delete", cascade: "orphan" });
+  await expect(page.locator(".dp-proj > span:last-child").last()).toHaveText("2 apps · 1 out of sync");
 });
 
 test("what an action couldn't do says why in the strip", async ({ page }) => {
@@ -298,5 +349,14 @@ for (const width of [320, 390, 1280]) {
       const right = await page.locator(sel).evaluateAll((els) => Math.max(...els.map((n) => n.getBoundingClientRect().right)));
       expect(right, sel).toBeLessThanOrEqual(width + 0.5);
     }
+    // A pod's events, their long lines wrapped: nothing in the detail scrolls sideways either.
+    await verb(pane, "Keep").click();
+    await pickLine(pane, "o:~Pod~kiln~kiln-cd9dc7b7-rsmwz");
+    const out = pane.locator(".ship-output").first();
+    await out.locator(".dp-w button", { hasText: "Events" }).click();
+    const op = out.locator(".dp-op:not([aria-busy])");
+    await expect(op).toContainText("Readiness probe failed");
+    expect(await op.evaluate((el) => el.scrollWidth - el.clientWidth)).toBeLessThanOrEqual(0);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBe(0);
   });
 }

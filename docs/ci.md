@@ -8626,7 +8626,8 @@ a time. The design was agreed on a live mock built on Ship's own prototype
     sideways from 320 px up.
 - **W26-R24 Deploys in Ship.** Ship's Deploys lists every app KilnCD holds as Ship's rows, by
   project (the repository its deploy file is in or its manifests come from), what needs someone
-  first: each app's stand, word and line; the pips of its latest deploy (Sync, Health, Soak: healthy
+  first (a rollout waiting on a person, then what failed, then what went back, then what's out of
+  sync for a person to sync): each app's stand, word and line; the pips of its latest deploy (Sync, Health, Soak: healthy
   for ten minutes after its sync, or the guard's word); who did it and when; where it deploys and
   what runs (`GET /api/ship/deploys`). Where it stands is `kiln_cd::stands`'s to say, the first that
   holds: Argo CD's; can't read, render or compare; syncing; its rollout waits for a person, or rolls
@@ -8635,24 +8636,27 @@ a time. The design was agreed on a live mock built on Ship's own prototype
   in memory as Ship's commits are, and gathered again once CD says something it reads changed (its
   `cd_apps`, `cd_rollout` and `cd_app_deleted` events, its store's changes) or Ship acted.
   - An opened app (`GET /api/ship/deploys/:app`) has the jobs pane's anatomy: its components, each
-    workload a group (its pods with their uptime and restarts, its ReplicaSets) and then the rest by
-    what they are (network, config, storage, jobs, access), live from its cluster or else what
-    KilnCD holds; a rollout's steps; its settings (auto-sync and auto-rollback, a person's to set;
-    prune and self-heal, its deploy file's); its history, its source's newest commits each as the
+    workload a group (its pods with their node, container, uptime and restarts, its ReplicaSets)
+    and then the rest by what they are (network, config, storage, jobs, access), live from its
+    cluster or else what KilnCD holds; a rollout's steps, the deploy it rolls out and the one it
+    goes back to, and its traffic between them; its settings (auto-sync and auto-rollback, a
+    person's to set; prune and self-heal, its deploy file's); its history, its source's newest commits each as the
     deploy that ran it or one a rollback can go to, then older deploys; and why each verb can't
     apply, where one can't.
   - The strip's verbs go to `POST /api/ship/deploys { app, verb, … }`, each its CD operation (sync,
     of the picked objects when some are picked; refresh and hard refresh; roll back to a deploy or
     any commit; stop; follow git again; promote, abort, approve and deny a rollout; auto-sync and
-    auto-rollback), as that operation's route would let the caller, and audited in the request's
-    one row.
+    auto-rollback; delete, with its objects or leaving them), as that operation's route would let
+    the caller, and audited in the request's one row. Deleting an app something else declares (its
+    repository's `.kiln/deploy.yaml`, an app that renders it) is refused, as it would come back.
   - Ship's tabs are Commits and Deploys: the runs' list and the apps' list are gone from it (/runs
     lands on Ship, /deployments on Deploys; a run's and an app's pages keep their addresses). Deploys
     draws them as Ada's approved stills do (v5, v6): apps as Ship's rows by project, the stand word,
     the edge, the pips, no buttons; an opened app the jobs pane's anatomy. Its strip has Sync (what's
     picked of what differs), Refresh (asking Refresh or Hard refresh), Roll back and Stop; Promote and
-    Abort while a rollout runs; a setting's change when one is picked. Roll back, Stop and Abort ask
-    again. Under it are its objects by owner, its rollout, its history and its settings. The picked
+    Abort while a rollout runs; a setting's change when one is picked; Delete when the Settings
+    group's last line is. Roll back, Stop, Abort and Delete ask again. Under it are its objects by
+    owner, its rollout, its history and its settings. The picked
     one's detail is beside them, or under its line on a phone with the strip again: an object's Logs
     (the commits' Output, its LogViewer following CD's log), Events and Manifest, or its Diff; a
     commit, where it sits among the deploys and what syncing it would change against what runs
@@ -8742,14 +8746,15 @@ repository):
   rollout, history and settings, the picked one's detail beside them or under its line with the strip
   again); each action reaching `POST /api/ship/deploys` with its body (Sync with what's picked of
   what differs, Refresh and Hard refresh, Roll back to a deploy or any commit, Stop, Promote, Abort,
-  a setting), Refresh, Roll back, Stop and Abort asking again and Keep sending nothing, a refusal's
-  why in the strip; no layout shift through picking, acting and CD's events; nothing sideways at
+  a setting, Delete leaving its objects), Refresh, Roll back, Stop, Abort and Delete asking again and
+  Keep sending nothing, Delete dimmed where a deploy file declares the app, a refusal's why in the
+  strip; no layout shift through picking, acting and CD's events; nothing sideways at
   320, 390 and 1280. *`ui/e2e/ship-deploys.spec.ts`; `ui/e2e/ship-routes.spec.ts`; every Ship e2e.*
 - **W26-AC18 Deploys in Ship.** On a server with KilnCD, apps of two repositories list under them
   as CD holds each (sync, health, auto-sync, environment), and an app's pane has its settings and
   its source's commits; each verb reaches its operation: done and audited as a maintainer's, the
   operation's own refusal said, refused for a viewer, an agent held to what its environment lets
-  agents do. Apps the engine leaves on the simulated cluster stand as defined (soaking then
+  agents do; an app deleted, its objects left, gone from the list. Apps the engine leaves on the simulated cluster stand as defined (soaking then
   synced, waiting for a person, behind git, rolled back, failed). Over a scratch hub with a KilnCD
   of its own holding what the simulated cluster's engine left, its store's history, pin and rollout
   and its mirrors, Ship's list, panes and verbs read and do as defined for two projects: an app out
