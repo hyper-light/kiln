@@ -640,6 +640,8 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/trail", "audit.read", At::Server),
     // kiln verify (W27-R10): a chain walked back over the trail, read as the audit is.
     r("GET", "/api/verify", "audit.read", At::Server),
+    r("GET", "/api/verify/export", "audit.read", At::Server),
+    r("POST", "/api/verify/vsa", "audit.read", At::Server),
     r("POST", "/api/custody", SIGNED_IN, At::Server),
     r("GET", "/api/custody/breaks", "audit.read", At::Server),
     r("GET", "/api/custody", "audit.read", At::Server),

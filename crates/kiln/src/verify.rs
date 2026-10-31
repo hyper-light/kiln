@@ -107,21 +107,71 @@ impl Target {
 /// Walks the chain back from `target` (docs/ci.md W27-R10): each link with whether it holds or why
 /// not, the first that doesn't named, and how long the walk took.
 pub async fn verify(hub: &Hub, target: &Target) -> Result<Value, Fail> {
-    match target {
-        Target::Deploy(id) => {
-            let r = release_of(hub, id).await?;
-            walk(hub, target.words(), Start::Release(&r)).await
-        }
-        Target::Artifact(digest) => walk(hub, target.words(), Start::Artifact(digest)).await,
-        Target::Commit { repo, sha } => walk(hub, target.words(), Start::Commit { repo, sha }).await,
-        Target::Change(key) => walk(hub, target.words(), Start::Change(key)).await,
-    }
+    let started = Instant::now();
+    let w = walked_to(hub, target).await?;
+    Ok(report(&w, target.words(), started))
 }
 
 /// [`verify`] of release `r` as it's asked for, before kiln records it: what an environment's gates
 /// walk (docs/ci.md W27-R11).
 pub async fn release(hub: &Hub, r: &Release) -> Result<Value, Fail> {
-    walk(hub, format!("deploy {}/{}@{}", r.environment, r.app, r.version.as_deref().unwrap_or("?")), Start::Release(r)).await
+    let started = Instant::now();
+    let w = walked(hub, Start::Release(r)).await?;
+    Ok(report(&w, format!("deploy {}/{}@{}", r.environment, r.app, r.version.as_deref().unwrap_or("?")), started))
+}
+
+/// `kiln verify export` (docs/ci.md W27-R10): the walk back from `target` for an auditor to check
+/// offline against kiln's root (`kiln_ci::identity::verify::offline`): each link as kiln found it
+/// with the statements it rested on, each statement with its entry, its proof and its signatures,
+/// the checkpoint the proofs lead to, and kiln's own statement of each revocation under it.
+pub async fn export(hub: &Hub, target: &Target) -> Result<Value, Fail> {
+    let w = walked_to(hub, target).await?;
+    let Some(size) = w.under.as_ref().map(|k| k.size) else { return Err((StatusCode::CONFLICT, "kiln's server has signed no checkpoint of its trail yet".into())) };
+    let (pt, to) = (trail::PAYLOAD_REVOCATION.to_owned(), i64::try_from(size).map_err(|e| internal(e.into()))?);
+    let revoked: Vec<String> = hub
+        .store
+        .call(move |c| Ok(c.prepare("SELECT statement FROM trail WHERE payload_type = ?1 AND idx < ?2 ORDER BY idx")?.query_map(params![pt, to], |r| r.get(0))?.collect::<Result<_, _>>()?))
+        .await
+        .map_err(internal)?;
+    for d in &revoked {
+        let _ = w.holding(d).await;
+    }
+    let Some(k) = w.under.as_ref() else { return Err((StatusCode::CONFLICT, "kiln's server has signed no checkpoint of its trail yet".into())) };
+    let record = std::mem::take(&mut *w.record.lock());
+    let links = w.links.iter().zip(&w.rests).map(|(l, r)| verify::ExportedLink { link: l.words.clone(), holds: l.holds.is_ok(), why: l.holds.clone().err(), rests_on: r.clone() }).collect();
+    let e = verify::Export {
+        kind: verify::EXPORT_KIND.into(),
+        target: target.words(),
+        org: w.org.clone(),
+        checkpoint: verify::ExportedCheckpoint { note: k.note.clone(), certificate: B64.encode(&k.certificate), signed_at: k.signed_at },
+        statements: record.statements.into_values().collect(),
+        links,
+    };
+    serde_json::to_value(e).map_err(|e| internal(e.into()))
+}
+
+/// A revision's Source VSA (docs/ci.md W27-R10; SLSA v1.2's source track): commit `sha` of
+/// repository `repo` walked as kiln verify walks it, and what it found as an in-toto statement
+/// signed as kiln's server (PASSED and level 3 where its chain verifies), kept in the trail.
+pub async fn vsa(hub: &Hub, repo: &str, sha: &str) -> Result<Value, Fail> {
+    let started = Instant::now();
+    let (r, path, full, trunk) = resolve(hub, repo, sha).await?;
+    let w = walked(hub, Start::Commit { repo: &r.name, sha: &full }).await?;
+    let found = report(&w, format!("commit {}@{full}", r.name), started);
+    let passed = verify::first_broken(&w.links).is_none();
+    let on_trunk = git(hub, &path, &["merge-base", "--is-ancestor", &full, &format!("refs/heads/{trunk}")]).await.map_err(internal)?.ok;
+    let refs: Vec<String> = if on_trunk { vec![format!("refs/heads/{trunk}")] } else { Vec::new() };
+    let base = hub.cfg.server.public_url.trim_end_matches('/');
+    let (uri, repository, verifier, policy) = (format!("{base}/ship/{}/{full}", r.name), format!("git+{base}/{}", r.name), format!("{base}/api/verify"), format!("git+{base}/{}@refs/heads/{trunk}#.kiln/review.yaml", r.name));
+    let at = crate::util::now_unix();
+    let name = format!("{}@{full}", r.name);
+    let statement = verify::source_vsa(&verify::SourceRevision { name: &name, uri: &uri, commit: &full, refs: &refs, repository: &repository, verifier: &verifier, at, policy: &policy, passed });
+    let payload = serde_json::to_vec(&statement).map_err(|e| internal(e.into()))?;
+    let bundle = crate::identities::sign_as(&hub.pki, "server", kiln_ci::attest::PAYLOAD_TYPE, &payload).map_err(internal)?;
+    // In the trail as kiln took it (W27-R09).
+    let text = bundle.to_string();
+    hub.store.call(move |c| crate::trail::take(c, &text, at)).await.map_err(internal)?;
+    Ok(json!({ "vsa": statement, "bundle": bundle, "verified": passed, "broken": found.get("broken"), "links": found.get("links") }))
 }
 
 /// Where a walk starts.
@@ -132,13 +182,38 @@ enum Start<'a> {
     Change(&'a str),
 }
 
-async fn walk(hub: &Hub, words: String, start: Start<'_>) -> Result<Value, Fail> {
-    let started = Instant::now();
+async fn walked_to<'h>(hub: &'h Hub, target: &Target) -> Result<Walk<'h>, Fail> {
+    match target {
+        Target::Deploy(id) => {
+            let r = release_of(hub, id).await?;
+            walked(hub, Start::Release(&r)).await
+        }
+        Target::Artifact(digest) => walked(hub, Start::Artifact(digest)).await,
+        Target::Commit { repo, sha } => walked(hub, Start::Commit { repo, sha }).await,
+        Target::Change(key) => walked(hub, Start::Change(key)).await,
+    }
+}
+
+/// The walk from `start`, kiln's root its last link.
+async fn walked<'h>(hub: &'h Hub, start: Start<'_>) -> Result<Walk<'h>, Fail> {
     // Every statement under a checkpoint: one signed now when any entry came after the last.
     let refused = crate::trail::checkpoint(hub, true).await.err().map(|e| format!("{e:#}"));
     let under = crate::trail::checkpoints(&hub.store, 1).await.map_err(internal)?.into_iter().next();
     let revocations = crate::identities::revocations(&hub.store).await.map_err(internal)?;
-    let mut w = Walk { hub, org: hub.pki.organization(), revocations, under, refused, links: Vec::new(), lands: HashMap::new(), held_lands: HashMap::new(), policies: HashMap::new(), walked: BTreeSet::new() };
+    let mut w = Walk {
+        hub,
+        org: hub.pki.organization(),
+        revocations,
+        under,
+        refused,
+        links: Vec::new(),
+        rests: Vec::new(),
+        record: parking_lot::Mutex::new(Record::default()),
+        lands: HashMap::new(),
+        held_lands: HashMap::new(),
+        policies: HashMap::new(),
+        walked: BTreeSet::new(),
+    };
     match start {
         Start::Release(r) => Box::pin(w.deploy(r)).await.map_err(internal)?,
         Start::Artifact(digest) => {
@@ -150,21 +225,34 @@ async fn walk(hub: &Hub, words: String, start: Start<'_>) -> Result<Value, Fail>
         Start::Change(key) => Box::pin(w.change(key)).await?,
     }
     let root = crate::util::sha256_hex(&hub.pki.ca_der);
-    w.links.push(Link::holds(format!("kiln's root, {} (sha256 {}…): every signature above verifies to it", w.org, root.get(..16).unwrap_or(&root))));
+    w.push(Link::holds(format!("kiln's root, {} (sha256 {}…): every signature above verifies to it", w.org, root.get(..16).unwrap_or(&root))));
+    Ok(w)
+}
+
+/// What [`verify`] answers of walk `w` (of `words`, begun at `started`).
+fn report(w: &Walk<'_>, words: String, started: Instant) -> Value {
     let broken = verify::first_broken(&w.links).map(|l| json!({ "link": l.words, "why": l.holds.as_ref().err() }));
     let links: Vec<Value> = w.links.iter().map(|l| json!({ "link": l.words, "holds": l.holds.is_ok(), "why": l.holds.as_ref().err() })).collect();
     let checkpoint = match (&w.under, &w.refused) {
         (Some(k), None) => json!({ "size": k.size, "signed_at": k.signed_at }),
         (k, why) => json!({ "size": k.as_ref().map(|k| k.size), "refused": why }),
     };
-    Ok(json!({
+    json!({
         "target": words,
         "verified": broken.is_none(),
         "broken": broken,
         "links": links,
         "checkpoint": checkpoint,
         "took_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-    }))
+    })
+}
+
+/// What a walk read of the trail, for its export: the statements each link touched since the one
+/// before, and each statement held, by digest.
+#[derive(Default)]
+struct Record {
+    touched: Vec<String>,
+    statements: std::collections::BTreeMap<String, verify::Exported>,
 }
 
 /// A trunk's lands, as their kept statements say, to find the one a commit or a diff landed by
@@ -196,6 +284,9 @@ struct Walk<'h> {
     under: Option<crate::trail::Kept>,
     refused: Option<String>,
     links: Vec<Link>,
+    /// The digests of the statements each link rests on, beside it.
+    rests: Vec<Vec<String>>,
+    record: parking_lot::Mutex<Record>,
     /// Each (repository's id, trunk)'s lands, read once a walk.
     lands: HashMap<(String, String), Lands>,
     /// Each land held, by its digest, and each trunk's policy, by where a land began: a batch's
@@ -211,9 +302,25 @@ impl Walk<'_> {
         Against { root: &self.hub.pki.ca_der, revocations: &self.revocations, org: &self.org }
     }
 
+    /// Link `link`, resting on the statements touched since the link before.
+    fn push(&mut self, link: Link) {
+        let rests = std::mem::take(&mut self.record.lock().touched);
+        self.links.push(link);
+        self.rests.push(rests);
+    }
+
+    /// Statement `digest` was found signed as `who` (the leg, kiln's server, whom a verdict names):
+    /// as its export says.
+    fn signed_as(&self, digest: &str, who: &Identity) {
+        if let (Some(s), Ok(uri)) = (self.record.lock().statements.get_mut(digest), who.uri()) {
+            s.signer = Some(uri);
+        }
+    }
+
     /// Statement `digest` as the trail holds it, under the newest checkpoint: what it says, and each
     /// signature kept beside it with when kiln took it; or why the trail doesn't hold it.
     async fn holding(&self, digest: &str) -> Result<(Held, Vec<(Value, i64)>), String> {
+        self.record.lock().touched.push(digest.to_owned());
         let size = self.under.as_ref().map_or(0, |k| k.size);
         let h = crate::trail::holding(&self.hub.store, digest, size).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("the trail has no {}", short_digest(digest)))?;
         let (Some(k), Some(proof)) = (&self.under, h.proof) else {
@@ -224,6 +331,15 @@ impl Walk<'_> {
             return Err(format!("the trail has it at entry {}, under no checkpoint kiln's server signed{why}", h.entry.index));
         };
         let taken_at = h.entry.taken_at;
+        let exported = verify::Exported {
+            payload_type: h.payload_type.clone(),
+            payload: B64.encode(&h.payload),
+            entry: verify::ExportedEntry { index: h.entry.index, prev: hex::encode(h.entry.prev), statement: h.entry.statement.clone(), kind: h.entry.kind.clone(), subjects: h.entry.subjects.clone(), taken_at },
+            proof: proof.iter().map(hex::encode).collect(),
+            signatures: h.signatures.iter().map(|(bundle, at)| verify::ExportedSignature { bundle: bundle.clone(), taken_at: *at }).collect(),
+            signer: None,
+        };
+        self.record.lock().statements.entry(digest.to_owned()).or_insert(exported);
         let proven = Proven { entry: h.entry, proof, note: k.note.clone(), certificate: k.certificate.clone(), signed_at: k.signed_at };
         Ok((Held { payload_type: h.payload_type, payload: h.payload, bundle: None, taken_at, proven: Some(proven) }, h.signatures))
     }
@@ -324,9 +440,10 @@ impl Walk<'_> {
 
     async fn land_held(&self, digest: &str) -> Result<Land, String> {
         let (held, signers) = self.signed(digest).await?;
-        if !signers.iter().any(|s| matches!(s.actor, Actor::Server) && s.org == self.org) {
+        let Some(server) = signers.iter().find(|s| matches!(s.actor, Actor::Server) && s.org == self.org) else {
             return Err(format!("it's signed by {}, not kiln's server, whose queue it is", names(&signers)));
-        }
+        };
+        self.signed_as(digest, server);
         landing::read(&held.payload_type, &statement_of(&held.payload)?)
     }
 
@@ -340,24 +457,24 @@ impl Walk<'_> {
         let on = git(self.hub, path, &["merge-base", "--is-ancestor", sha, &format!("refs/heads/{trunk}")]).await?.ok;
         let words = format!("{} on {trunk}", short(sha));
         let signed = self.commit_signed(sha).await;
-        self.links.push(match (on, signed) {
+        self.push(match (on, signed) {
             (false, _) => Link::broken(words, format!("it isn't on {trunk}")),
             (true, Ok(by)) => Link::holds(format!("{words}, {by}")),
             (true, Err(why)) => Link::broken(words, why),
         });
         let words = format!("{} landed by {trunk}'s queue", short(sha));
         let Some(digest) = self.lands(repo, trunk).await?.by_commit.get(sha).cloned() else {
-            self.links.push(Link::broken(words, format!("no land of {trunk}'s queue names it: it wasn't tested as it landed")));
+            self.push(Link::broken(words, format!("no land of {trunk}'s queue names it: it wasn't tested as it landed")));
             return Ok(());
         };
         let land = match self.land(&digest).await {
             Ok(land) => land,
             Err(why) => {
-                self.links.push(Link::broken(words, format!("its land: {why}")));
+                self.push(Link::broken(words, format!("its land: {why}")));
                 return Ok(());
             }
         };
-        self.links.push(match verify::landed(sha, &land) {
+        self.push(match verify::landed(sha, &land) {
             Ok(said) => Link::holds(format!("{} {said}", short(sha))),
             Err(why) => Link::broken(words, why),
         });
@@ -367,7 +484,7 @@ impl Walk<'_> {
             carried = land.batch.iter().collect();
         }
         if carried.is_empty() {
-            self.links.push(Link::broken(format!("{}'s reviews", short(sha)), "its land names no diff it carries"));
+            self.push(Link::broken(format!("{}'s reviews", short(sha)), "its land names no diff it carries"));
         }
         let policy = match self.policies.get(&land.base) {
             Some(p) => p.clone(),
@@ -388,13 +505,13 @@ impl Walk<'_> {
     /// were given on, and the one that landed, signed by whoever made it.
     async fn landed_diff(&mut self, path: &str, trunk: &str, l: &Landed, policy: &Policy) -> anyhow::Result<()> {
         let Some(d) = diffs::find(self.hub, &l.diff).await? else {
-            self.links.push(Link::broken(format!("{} v{}", l.diff, l.version), "kiln has no such diff"));
+            self.push(Link::broken(format!("{} v{}", l.diff, l.version), "kiln has no such diff"));
             return Ok(());
         };
         self.custody(&d).await?;
         let versions = diffs::versions(self.hub, &d).await?;
         let Some(landed) = versions.iter().find(|v| v.n == l.version) else {
-            self.links.push(Link::broken(format!("{} v{}", d.name, l.version), format!("v{} isn't one of {}'s versions", l.version, d.name)));
+            self.push(Link::broken(format!("{} v{}", d.name, l.version), format!("v{} isn't one of {}'s versions", l.version, d.name)));
             return Ok(());
         };
         let patch = crate::ci::verdicts::verbatim(self.hub, path, &landed.commit).await;
@@ -404,19 +521,19 @@ impl Walk<'_> {
         for digest in &l.verdicts {
             match self.verdict(digest, &kept, l.version).await {
                 Ok((words, reviewer, given)) => {
-                    self.links.push(Link::holds(words));
+                    self.push(Link::holds(words));
                     revisions.insert(given);
                     if let Some((who, person, agent)) = reviewer.filter(|(_, person, agent)| *person != author && (policy.land.agents_can_approve || !agent)) {
                         approvers.insert((who, person, agent));
                     }
                 }
-                Err((words, why)) => self.links.push(Link::broken(words, why)),
+                Err((words, why)) => self.push(Link::broken(words, why)),
             }
         }
         let (asks, have) = (usize::try_from(policy.land.approvals).unwrap_or(usize::MAX), approvers.len());
         let words = format!("{} met {trunk}'s review policy", d.name);
         let whose = if policy.land.agents_can_approve { "people's or agents'" } else { "people's" };
-        self.links.push(if have >= asks {
+        self.push(if have >= asks {
             Link::holds(format!("{words}: {have} of the {asks} approvals it asks ({whose}, none its author's)"))
         } else {
             Link::broken(words, format!("it asks for {asks} approvals ({whose}, none its author's): {have} hold"))
@@ -424,7 +541,7 @@ impl Walk<'_> {
         for n in revisions {
             let Some(v) = versions.iter().find(|v| v.n == n) else { continue };
             let words = format!("{} v{n} ({})", d.name, short(&v.commit));
-            self.links.push(match self.commit_signed(&v.commit).await {
+            self.push(match self.commit_signed(&v.commit).await {
                 Ok(by) => Link::holds(format!("{words}, {by}")),
                 Err(why) => Link::broken(words, why),
             });
@@ -448,6 +565,7 @@ impl Walk<'_> {
         let Some(signer) = signers.iter().find(|s| s.uri().is_ok_and(|u| u == body.by)) else {
             return Err((words, format!("its verdict on {at} is signed by {}, not whom it names", names(&signers))));
         };
+        self.signed_as(digest, signer);
         if body.kind != "verdict" || body.action != "accept" {
             return Err((words, format!("its {} on {at} is {}, not an accept", body.kind, body.action)));
         }
@@ -462,7 +580,7 @@ impl Walk<'_> {
         let Some(head) = crate::custody::head_named(&self.hub.store, name).await? else { return Ok(()) };
         let Some(chain) = crate::custody::chain(&self.hub.store, &self.hub.pki.ca_der, &self.org, &head, crate::util::now_unix()).await? else { return Ok(()) };
         let words = format!("{}'s custody", d.name);
-        self.links.push(if chain.get("unbroken").and_then(Value::as_bool) == Some(true) {
+        self.push(if chain.get("unbroken").and_then(Value::as_bool) == Some(true) {
             let hops = chain.get("hops").and_then(Value::as_array).map_or(0, Vec::len);
             let by = chain.get("held_by").and_then(Value::as_str).map_or_else(String::new, |h| format!(", held by {h}"));
             Link::holds(format!("{words}: {hops} hops, each signed by both sides{by}"))
@@ -477,35 +595,39 @@ impl Walk<'_> {
     async fn artifact(&mut self, digest: &str, named: &str) -> anyhow::Result<Option<Built>> {
         let words = format!("artifact {named}");
         let Some(statement) = provenance_of(self.hub, digest).await? else {
-            self.links.push(Link::broken(words, format!("kiln has no provenance of {}: its CI didn't build it, or it was rebuilt since", short_digest(digest))));
+            self.push(Link::broken(words, format!("kiln has no provenance of {}: its CI didn't build it, or it was rebuilt since", short_digest(digest))));
             return Ok(None);
         };
         let (held, signers) = match self.signed(&statement).await {
             Ok(s) => s,
             Err(why) => {
-                self.links.push(Link::broken(words, format!("its provenance: {why}")));
+                self.push(Link::broken(words, format!("its provenance: {why}")));
                 return Ok(None);
             }
         };
         let built = match verify::artifact(digest, &held.payload) {
             Ok(b) => b,
             Err(why) => {
-                self.links.push(Link::broken(words, why));
+                self.push(Link::broken(words, why));
                 return Ok(None);
             }
         };
-        self.links.push(Link::holds(format!("{words}, built from {} as its provenance says", short(&built.commit))));
-        self.links.push(match signers.iter().find_map(|s| verify::built_by(s).ok()) {
-            Some(leg) => Link::holds(leg),
+        self.push(Link::holds(format!("{words}, built from {} as its provenance says", short(&built.commit))));
+        let leg = signers.iter().find_map(|s| verify::built_by(s).ok().map(|words| (s, words)));
+        if let Some((s, _)) = &leg {
+            self.signed_as(&statement, s);
+        }
+        self.push(match leg {
+            Some((_, words)) => Link::holds(words),
             None => Link::broken(format!("{named} built by its leg"), format!("its provenance is signed by {} alone, not the leg that built it", names(&signers))),
         });
         let repos = self.hub.store.repos().await?;
         let Some(repo) = repo_of(repos, &built.source) else {
-            self.links.push(Link::broken(format!("{} on its trunk", short(&built.commit)), format!("it's of {}, a repository kiln doesn't host", built.source)));
+            self.push(Link::broken(format!("{} on its trunk", short(&built.commit)), format!("it's of {}, a repository kiln doesn't host", built.source)));
             return Ok(None);
         };
         let Some(path) = crate::ci::hosting::native_path(self.hub, &repo) else {
-            self.links.push(Link::broken(format!("{} on its trunk", short(&built.commit)), format!("{} isn't hosted here any more", repo.name)));
+            self.push(Link::broken(format!("{} on its trunk", short(&built.commit)), format!("{} isn't hosted here any more", repo.name)));
             return Ok(None);
         };
         let trunk = repo.default_branch.clone().filter(|b| !b.is_empty()).unwrap_or_else(|| "main".into());
@@ -535,7 +657,7 @@ impl Walk<'_> {
         let mut list: Vec<String> = String::from_utf8_lossy(&out.out).lines().map(str::to_owned).collect();
         if list.len() > COMMITS_MAX {
             list.truncate(COMMITS_MAX);
-            self.links.push(Link::broken(format!("the commits {} brings", short(sha)), format!("more than {COMMITS_MAX} since {}: kiln verify commit walks the rest one at a time", short(&since))));
+            self.push(Link::broken(format!("the commits {} brings", short(sha)), format!("more than {COMMITS_MAX} since {}: kiln verify commit walks the rest one at a time", short(&since))));
         }
         if list.is_empty() {
             list.push(sha.to_owned());
@@ -548,16 +670,16 @@ impl Walk<'_> {
     async fn deploy(&mut self, r: &Release) -> anyhow::Result<()> {
         let words = format!("deploy {}/{}@{}", r.environment, r.app, r.version.clone().unwrap_or_else(|| r.id.to_string()));
         if r.artifacts.is_empty() {
-            self.links.push(Link::broken(words, "it names no artifact: kiln has nothing it runs to walk back from"));
+            self.push(Link::broken(words, "it names no artifact: kiln has nothing it runs to walk back from"));
             return Ok(());
         }
         // Deploys sign with Ship's plan (W27-R07): until then, the release is kiln's record of it.
         let kept = if r.id == 0 { "as it's asked for".to_owned() } else { format!("(release {}), as kiln's deploy records have it", r.id) };
-        self.links.push(Link::holds(format!("{words} {kept}")));
+        self.push(Link::holds(format!("{words} {kept}")));
         let before = previous(self.hub, r).await?;
         for (name, a) in &r.artifacts {
             if a.digest.is_empty() {
-                self.links.push(Link::broken(format!("artifact {name}"), format!("it's deployed by its tag ({}:{}), not its digest", a.repository, a.tag)));
+                self.push(Link::broken(format!("artifact {name}"), format!("it's deployed by its tag ({}:{}), not its digest", a.repository, a.tag)));
                 continue;
             }
             let Some(built) = self.artifact(&a.digest, &format!("{name} {}", short_digest(&a.digest))).await? else { continue };
@@ -574,16 +696,7 @@ impl Walk<'_> {
 
     /// Commit `sha` (whole or abbreviated) of repository `name`, on its trunk.
     async fn commit_of(&mut self, name: &str, sha: &str) -> Result<(), Fail> {
-        let repos = self.hub.store.repos().await.map_err(internal)?;
-        let repo = repos.into_iter().find(|r| r.name == name || r.id == name).ok_or_else(|| (StatusCode::NOT_FOUND, format!("no repository {name}")))?;
-        let path = crate::ci::hosting::native_path(self.hub, &repo).ok_or_else(|| (StatusCode::CONFLICT, format!("{name} isn't hosted here")))?.to_string_lossy().into_owned();
-        let spec = format!("{sha}^{{commit}}");
-        let found = git(self.hub, &path, &["rev-parse", "--verify", "--quiet", &spec]).await.map_err(internal)?;
-        let full = String::from_utf8_lossy(&found.out).trim().to_ascii_lowercase();
-        if !found.ok || full.is_empty() {
-            return Err((StatusCode::NOT_FOUND, format!("{name} has no commit {sha}")));
-        }
-        let trunk = repo.default_branch.clone().filter(|b| !b.is_empty()).unwrap_or_else(|| "main".into());
+        let (repo, path, full, trunk) = resolve(self.hub, name, sha).await?;
         Box::pin(self.commit(&repo, &path, &trunk, &full)).await.map_err(internal)
     }
 
@@ -596,11 +709,27 @@ impl Walk<'_> {
             Some(commit) => Box::pin(self.commit(&repo, &path, &d.trunk, &commit)).await.map_err(internal)?,
             None => {
                 self.custody(&d).await.map_err(internal)?;
-                self.links.push(Link::broken(format!("{} landed", d.name), format!("no land of {}'s queue names it: it hasn't landed", d.trunk)));
+                self.push(Link::broken(format!("{} landed", d.name), format!("no land of {}'s queue names it: it hasn't landed", d.trunk)));
             }
         }
         Ok(())
     }
+}
+
+/// Repository `name` (or its id) that kiln hosts, where it's kept, its commit `sha` whole, and
+/// its trunk.
+async fn resolve(hub: &Hub, name: &str, sha: &str) -> Result<(Repo, String, String, String), Fail> {
+    let repos = hub.store.repos().await.map_err(internal)?;
+    let repo = repos.into_iter().find(|r| r.name == name || r.id == name).ok_or_else(|| (StatusCode::NOT_FOUND, format!("no repository {name}")))?;
+    let path = crate::ci::hosting::native_path(hub, &repo).ok_or_else(|| (StatusCode::CONFLICT, format!("{name} isn't hosted here")))?.to_string_lossy().into_owned();
+    let spec = format!("{sha}^{{commit}}");
+    let found = git(hub, &path, &["rev-parse", "--verify", "--quiet", &spec]).await.map_err(internal)?;
+    let full = String::from_utf8_lossy(&found.out).trim().to_ascii_lowercase();
+    if !found.ok || full.is_empty() {
+        return Err((StatusCode::NOT_FOUND, format!("{name} has no commit {sha}")));
+    }
+    let trunk = repo.default_branch.clone().filter(|b| !b.is_empty()).unwrap_or_else(|| "main".into());
+    Ok((repo, path, full, trunk))
 }
 
 fn internal(e: anyhow::Error) -> Fail {
@@ -711,14 +840,23 @@ fn short_digest(digest: &str) -> String {
 }
 
 /// `kiln verify`: the chain back from a deploy, an artifact, a commit or a change, each link with
-/// whether it holds, the first that doesn't named (docs/ci.md W27-R10), over the API.
+/// whether it holds, the first that doesn't named (docs/ci.md W27-R10), over the API. `kiln verify
+/// export <kind> <id>` writes that walk for an auditor, which `kiln verify --offline <file> --root
+/// <kiln's root>` checks with no server; `kiln verify vsa <repository>@<commit>` has kiln sign a
+/// revision's Source VSA.
 #[derive(clap::Args)]
 pub struct VerifyArgs {
-    /// What to walk back from: `deploy`, `artifact`, `commit` or `change`.
-    kind: String,
-    /// A release (its number, or `<environment>/<app>@<version>`), an artifact's digest
-    /// (`sha256:<hex>`), `<repository>@<commit>`, or a diff (`D12`).
-    id: String,
+    /// `<kind> <id>` (`deploy`, `artifact`, `commit` or `change`: a release's number or
+    /// `<environment>/<app>@<version>`, `sha256:<hex>`, `<repository>@<commit>`, `D12`),
+    /// `export <kind> <id>`, or `vsa <repository>@<commit>`.
+    #[arg(num_args = 0..=3)]
+    what: Vec<String>,
+    /// Check a trail export (what `kiln verify export` writes) offline, against kiln's root.
+    #[arg(long, value_name = "FILE")]
+    offline: Option<std::path::PathBuf>,
+    /// kiln's root certificate (PEM), which `--offline` checks against.
+    #[arg(long, value_name = "FILE")]
+    root: Option<std::path::PathBuf>,
     #[arg(long, env = "KILN_URL")]
     url: Option<String>,
     /// The admin token, or a personal access token with `audit.read`.
@@ -729,34 +867,87 @@ pub struct VerifyArgs {
     json: bool,
 }
 
-/// `kiln verify <kind> <id>`: each link on a line; an error naming the first that doesn't hold.
+/// `kiln verify …`: each link on a line; an error naming the first that doesn't hold.
 pub async fn cli(args: VerifyArgs, cfg: &crate::config::Config) -> anyhow::Result<()> {
     use crate::ci::cli::{Api, enc};
     use crate::http::client::Method;
-    Target::parse(&args.kind, &args.id).map_err(anyhow::Error::msg)?;
-    let api = Api::connect(cfg, args.url.as_deref(), args.token.as_deref()).await?;
-    let v = api.call_api(Method::Get, &format!("/api/verify?{}={}", args.kind, enc(&args.id)), None).await?;
-    let text = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&v)?);
-    } else {
-        for l in v.get("links").and_then(Value::as_array).into_iter().flatten() {
-            match l.get("why").and_then(Value::as_str) {
-                Some(why) => println!("✗ {}: {why}", text(l, "link")),
-                None => println!("→ {}", text(l, "link")),
+    if let Some(file) = &args.offline {
+        return offline_cli(file, args.root.as_deref(), args.json);
+    }
+    let what: Vec<&str> = args.what.iter().map(String::as_str).collect();
+    let api = || Api::connect(cfg, args.url.as_deref(), args.token.as_deref());
+    match what.as_slice() {
+        ["export", kind, id] => {
+            Target::parse(kind, id).map_err(anyhow::Error::msg)?;
+            let v = api().await?.call_api(Method::Get, &format!("/api/verify/export?{kind}={}", enc(id)), None).await?;
+            println!("{}", serde_json::to_string_pretty(&v)?);
+            Ok(())
+        }
+        ["vsa", commit] => {
+            Target::parse("commit", commit).map_err(anyhow::Error::msg)?;
+            let v = api().await?.call_api(Method::Post, "/api/verify/vsa", Some(json!({ "commit": commit }))).await?;
+            println!("{}", serde_json::to_string_pretty(&v)?);
+            Ok(())
+        }
+        [kind, id] => {
+            Target::parse(kind, id).map_err(anyhow::Error::msg)?;
+            let v = api().await?.call_api(Method::Get, &format!("/api/verify?{kind}={}", enc(id)), None).await?;
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&v)?);
+            } else {
+                print_links(v.get("links").and_then(Value::as_array).into_iter().flatten().map(|l| (text(l, "link"), l.get("why").and_then(Value::as_str).map(str::to_owned))));
+            }
+            let took = v.get("took_ms").and_then(Value::as_u64).unwrap_or_default();
+            match v.get("broken").filter(|b| !b.is_null()) {
+                Some(b) => anyhow::bail!("the chain breaks at {}: {} ({took} ms)", text(b, "link"), text(b, "why")),
+                None => {
+                    if !args.json {
+                        println!("verified ({took} ms)");
+                    }
+                    Ok(())
+                }
             }
         }
+        _ => anyhow::bail!("say what to verify: `kiln verify <deploy|artifact|commit|change> <id>`, `kiln verify export <kind> <id>`, `kiln verify vsa <repository>@<commit>`, or `kiln verify --offline <file> --root <kiln's root, PEM>`"),
     }
-    let took = v.get("took_ms").and_then(Value::as_u64).unwrap_or_default();
-    match v.get("broken").filter(|b| !b.is_null()) {
-        Some(b) => anyhow::bail!("the chain breaks at {}: {} ({took} ms)", text(b, "link"), text(b, "why")),
+}
+
+/// `kiln verify --offline <file> --root <pem>`: trail export `file` checked against kiln's root,
+/// with no server.
+fn offline_cli(file: &std::path::Path, root: Option<&std::path::Path>, as_json: bool) -> anyhow::Result<()> {
+    let root = root.ok_or_else(|| anyhow::anyhow!("--offline checks against kiln's root: say where its certificate is, --root <PEM>"))?;
+    let der = crate::pki::der_of(&std::fs::read_to_string(root)?)?;
+    let e: verify::Export = serde_json::from_slice(&std::fs::read(file)?).map_err(|e| anyhow::anyhow!("{} isn't a trail export: {e}", file.display()))?;
+    let links = verify::offline(&e, &der).map_err(|why| anyhow::anyhow!("{} doesn't verify: {why}", file.display()))?;
+    if as_json {
+        let list: Vec<Value> = links.iter().map(|l| json!({ "link": l.words, "holds": l.holds.is_ok(), "why": l.holds.as_ref().err() })).collect();
+        println!("{}", serde_json::to_string_pretty(&json!({ "target": e.target, "links": list }))?);
+    } else {
+        print_links(links.iter().map(|l| (l.words.clone(), l.holds.clone().err())));
+    }
+    match verify::first_broken(&links) {
+        Some(b) => anyhow::bail!("the chain breaks at {}: {}", b.words, b.holds.clone().err().unwrap_or_default()),
         None => {
-            if !args.json {
-                println!("verified ({took} ms)");
+            if !as_json {
+                println!("verified offline: {} statements, against {}", e.statements.len(), root.display());
             }
             Ok(())
         }
     }
+}
+
+/// Each link on a line: `→` where it holds, `✗` and why where it doesn't.
+fn print_links(links: impl Iterator<Item = (String, Option<String>)>) {
+    for (link, why) in links {
+        match why {
+            Some(why) => println!("✗ {link}: {why}"),
+            None => println!("→ {link}"),
+        }
+    }
+}
+
+fn text(v: &Value, k: &str) -> String {
+    v.get(k).and_then(Value::as_str).unwrap_or_default().to_owned()
 }
 
 #[cfg(test)]

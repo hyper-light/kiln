@@ -745,6 +745,25 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             })
             .await
         }
+        // The same walk for an auditor, to check offline against kiln's root; and a revision's
+        // Source VSA (SLSA's source track), signed as kiln's server and kept in the trail.
+        (&Method::GET, ["api", "verify", "export"]) => {
+            let q = srv::query(&req);
+            boxed(|| async {
+                let target = crate::verify::Target::of(&q).map_err(|(s, e)| err(s, e))?;
+                crate::verify::export(&hub, &target).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(s, e)| err(s, e))
+            })
+            .await
+        }
+        (&Method::POST, ["api", "verify", "vsa"]) => boxed(|| async {
+            let body: serde_json::Value = boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+            let asked = body.get("commit").and_then(serde_json::Value::as_str).unwrap_or_default();
+            let crate::verify::Target::Commit { repo, sha } = crate::verify::Target::parse("commit", asked).map_err(|e| err(StatusCode::BAD_REQUEST, e))? else {
+                return Err(err(StatusCode::BAD_REQUEST, "`commit`: <repository>@<commit>"));
+            };
+            crate::verify::vsa(&hub, &repo, &sha).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(s, e)| err(s, e))
+        })
+        .await,
         // Custody of what changes hands (W27-R08): a signed record taken, a thing's chain walked
         // now, the breaks kiln found and what it refused.
         (&Method::POST, ["api", "custody"]) => {

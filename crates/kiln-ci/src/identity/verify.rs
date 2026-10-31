@@ -12,8 +12,13 @@
 //!   candidate the commit that landed ([`landed`]); a verdict that holds on the revision that landed,
 //!   its own or carried by verbatim patch-id ([`approved`]).
 //! - **The first link that doesn't hold is named** ([`first_broken`]).
+//! - **For an auditor**: a trail export ([`Export`]) carries every statement a chain rested on, each
+//!   with its proof, and the checkpoint the proofs lead to, checked offline against kiln's root
+//!   ([`offline`]); a revision's Source VSA (SLSA's source track, [`source_vsa`]) names the level
+//!   its chain verifies at.
 
 use base64::Engine as _;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::chain::{self, Actor, Identity, Revocation};
@@ -197,6 +202,185 @@ pub fn approved(b: &Body, signer: &Identity, versions: &[Kept], landed: u32) -> 
     }
 }
 
+/// The predicate type of SLSA's verification summary: a Source VSA's.
+pub const VSA: &str = "https://slsa.dev/verification_summary/v1";
+
+/// What a revision's Source VSA is about (SLSA v1.2's source track): its name (`<repository>@<commit>`),
+/// where a person finds it, its commit, the refs that point at it (fully qualified), its
+/// repository's URI (SPDX's download location, `git+https://<host>/<repo>`), who verified it, when,
+/// against which policy, and whether its chain verified.
+pub struct SourceRevision<'a> {
+    pub name: &'a str,
+    pub uri: &'a str,
+    pub commit: &'a str,
+    pub refs: &'a [String],
+    pub repository: &'a str,
+    pub verifier: &'a str,
+    pub at: i64,
+    pub policy: &'a str,
+    pub passed: bool,
+}
+
+/// A revision's Source VSA (SLSA v1.2's source track), an in-toto statement for kiln to sign. It's
+/// about the revision's commit (`gitCommit`, and the refs pointing at it as `sourceRefs`), verified
+/// at `at` against `policy`, and names only the highest source level it meets: 3 when its chain
+/// verifies (landed through its queue, tested and reviewed as its trunk's policy asks, by identities
+/// kiln verifies); 1 when it doesn't (it's in version control: that's all kiln vouches for).
+pub fn source_vsa(r: &SourceRevision<'_>) -> Value {
+    serde_json::json!({
+        "_type": "https://in-toto.io/Statement/v1",
+        "subject": [{ "name": r.name, "uri": r.uri, "digest": { "gitCommit": r.commit }, "annotations": { "sourceRefs": r.refs } }],
+        "predicateType": VSA,
+        "predicate": {
+            "verifier": { "id": r.verifier },
+            "timeVerified": crate::trigger::context::rfc3339(r.at),
+            "resourceUri": r.repository,
+            "policy": { "uri": r.policy },
+            "verificationResult": if r.passed { "PASSED" } else { "FAILED" },
+            "verifiedLevels": [if r.passed { "SLSA_SOURCE_LEVEL_3" } else { "SLSA_SOURCE_LEVEL_1" }],
+        },
+    })
+}
+
+/// What a trail export is (`kiln verify export`).
+pub const EXPORT_KIND: &str = "kiln-trail-export/v1";
+
+/// A trail export, for an auditor to check offline against kiln's root ([`offline`]): its target,
+/// kiln's organization, the checkpoint every statement's proof leads to, every statement a link
+/// rested on (and kiln's own statements of each revocation), and the links as kiln found them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Export {
+    pub kind: String,
+    pub target: String,
+    pub org: String,
+    pub checkpoint: ExportedCheckpoint,
+    pub statements: Vec<Exported>,
+    pub links: Vec<ExportedLink>,
+}
+
+/// The checkpoint an export's proofs lead to: its signed note, the certificate it's signed under
+/// (DER, base64), and when it was signed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExportedCheckpoint {
+    pub note: String,
+    pub certificate: String,
+    pub signed_at: i64,
+}
+
+/// A statement as an export carries it: what it says (its payload base64), its entry, the entry's
+/// proof (hex), each signature as kiln kept it, and whom the walk found it signed by (none: any,
+/// or kiln's own words).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Exported {
+    pub payload_type: String,
+    pub payload: String,
+    pub entry: ExportedEntry,
+    pub proof: Vec<String>,
+    #[serde(default)]
+    pub signatures: Vec<ExportedSignature>,
+    #[serde(default)]
+    pub signer: Option<String>,
+}
+
+/// A trail entry as an export carries it ([`trail::Entry`], the hash before it hex).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExportedEntry {
+    pub index: u64,
+    pub prev: String,
+    pub statement: String,
+    pub kind: String,
+    pub subjects: Vec<String>,
+    pub taken_at: i64,
+}
+
+/// A signature as an export carries it: its Sigstore bundle, and when kiln took it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExportedSignature {
+    pub bundle: Value,
+    pub taken_at: i64,
+}
+
+/// A link as kiln found it, and the digests of the statements it rests on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExportedLink {
+    pub link: String,
+    pub holds: bool,
+    #[serde(default)]
+    pub why: Option<String>,
+    #[serde(default)]
+    pub rests_on: Vec<String>,
+}
+
+/// Export `e` checked offline against kiln's root `root` (`kiln verify --offline`): the checkpoint
+/// is signed by the org's server under it; each statement is the one its entry names, in the tree
+/// the checkpoint signs, and signed as the walk found it, verified to the root as of when kiln took
+/// it (with the revocations kiln's own statements of them in the export say). Each link as kiln
+/// found it, broken where a statement it rests on doesn't hold; the checkpoint's link first.
+pub fn offline(e: &Export, root: &[u8]) -> Result<Vec<Link>, String> {
+    if e.kind != EXPORT_KIND {
+        return Err(format!("it's a {}, not a trail export", e.kind));
+    }
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let certificate = b64.decode(&e.checkpoint.certificate).map_err(|_| "its checkpoint's certificate isn't base64".to_owned())?;
+    let held_of = |s: &Exported| -> Result<Held, String> {
+        let payload = b64.decode(&s.payload).map_err(|_| format!("statement {}'s payload isn't base64", s.entry.statement))?;
+        let hash = |h: &str| -> Result<Hash, String> { trail::unhex(h).and_then(|b| b.try_into().ok()).ok_or_else(|| format!("{h:?} isn't a SHA-256")) };
+        let entry = Entry { index: s.entry.index, prev: hash(&s.entry.prev)?, statement: s.entry.statement.clone(), kind: s.entry.kind.clone(), subjects: s.entry.subjects.clone(), taken_at: s.entry.taken_at };
+        let proof = s.proof.iter().map(|h| hash(h)).collect::<Result<Vec<_>, _>>()?;
+        let proven = Proven { entry, proof, note: e.checkpoint.note.clone(), certificate: certificate.clone(), signed_at: e.checkpoint.signed_at };
+        Ok(Held { payload_type: s.payload_type.clone(), payload, bundle: None, taken_at: s.entry.taken_at, proven: Some(proven) })
+    };
+    // The revocations: kiln's own statements of them that the export carries, each in the trail.
+    let mut revocations = Vec::new();
+    for s in e.statements.iter().filter(|s| s.payload_type == trail::PAYLOAD_REVOCATION) {
+        let h = held_of(s)?;
+        held(&h, &Against { root, revocations: &[], org: &e.org }).map_err(|why| format!("revocation {}: {why}", s.entry.statement))?;
+        let st: statement::Statement = serde_json::from_slice(&h.payload).map_err(|_| format!("revocation {} doesn't read", s.entry.statement))?;
+        let text = |k: &str| st.body.get(k).and_then(Value::as_str).map(str::to_owned);
+        let at = st.body.get("at").and_then(Value::as_i64).ok_or_else(|| format!("revocation {} says no time", s.entry.statement))?;
+        revocations.push(Revocation { serial: text("serial"), key: text("key"), at, reason: text("reason").unwrap_or_default(), by: text("by").unwrap_or_default() });
+    }
+    let a = Against { root, revocations: &revocations, org: &e.org };
+    let (cp, _) = trail::verify_note(&e.checkpoint.note, &e.org, &[&certificate], root, &revocations, e.checkpoint.signed_at).map_err(|why| format!("its checkpoint doesn't verify: {why}"))?;
+    let mut found: std::collections::BTreeMap<&str, Result<(), String>> = std::collections::BTreeMap::new();
+    for s in &e.statements {
+        let r = held_of(s).and_then(|h| {
+            if s.signatures.is_empty() {
+                return held(&h, &a).map(|_| ());
+            }
+            let mut why = None;
+            for sig in &s.signatures {
+                match held(&Held { bundle: Some(sig.bundle.clone()), taken_at: h.taken_at.max(sig.taken_at), ..h.clone() }, &a) {
+                    Ok(Some(id)) if s.signer.as_deref().is_none_or(|want| id.uri().is_ok_and(|u| u == want)) => return Ok(()),
+                    Ok(Some(id)) => {
+                        why.get_or_insert(format!("it's signed by {id}, not {}", s.signer.as_deref().unwrap_or_default()));
+                    }
+                    Ok(None) => {}
+                    Err(w) => {
+                        why.get_or_insert(w);
+                    }
+                }
+            }
+            Err(why.unwrap_or_else(|| "it carries no signature".into()))
+        });
+        found.insert(s.entry.statement.as_str(), r);
+    }
+    let mut out = vec![Link::holds(format!("the trail's checkpoint of {} entries, signed by {}'s server", cp.size, e.org))];
+    for l in &e.links {
+        let broken = l.rests_on.iter().find_map(|d| match found.get(d.as_str()) {
+            Some(Ok(())) => None,
+            Some(Err(why)) => Some(why.clone()),
+            None => Some(format!("the export carries no statement {d}")),
+        });
+        out.push(match (broken, l.holds) {
+            (Some(why), _) => Link::broken(l.link.clone(), why),
+            (None, true) => Link::holds(l.link.clone()),
+            (None, false) => Link::broken(l.link.clone(), l.why.clone().unwrap_or_else(|| "kiln found it doesn't hold".into())),
+        });
+    }
+    Ok(out)
+}
+
 fn short(sha: &str) -> &str {
     sha.get(..7).unwrap_or(sha)
 }
@@ -333,6 +517,117 @@ mod tests {
         assert!(approved(&body, &kim, &other, 2).is_err_and(|e| e.starts_with("kim's verdict doesn't hold on v2")), "a verdict on another patch");
         let chain = [Link::holds("artifact"), Link::broken("approved by kim", "another patch"), Link::broken("later", "x")];
         assert_eq!(first_broken(&chain).map(|l| l.words.as_str()), Some("approved by kim"));
+        Ok(())
+    }
+
+    #[test]
+    fn w27_r10_a_source_vsa_says_what_slsa_asks() {
+        let (commit, refs) = ("c".repeat(40), vec!["refs/heads/main".to_owned()]);
+        let r = |passed: bool| SourceRevision {
+            name: "acme/app@cccc",
+            uri: "https://kiln.home/ship/acme/app/cccc",
+            commit: &commit,
+            refs: &refs,
+            repository: "git+https://kiln.home/acme/app",
+            verifier: "https://kiln.home/api/verify",
+            at: AT,
+            policy: "git+https://kiln.home/acme/app@refs/heads/main#.kiln/review.yaml",
+            passed,
+        };
+        let v = source_vsa(&r(true));
+        let at = |p: &str| v.pointer(p).cloned().unwrap_or_default();
+        assert_eq!((at("/_type"), at("/predicateType"), at("/subject/0/name")), (json!("https://in-toto.io/Statement/v1"), json!(VSA), json!("acme/app@cccc")));
+        assert_eq!((at("/subject/0/digest/gitCommit"), at("/subject/0/annotations/sourceRefs"), at("/subject/0/uri")), (json!(commit), json!(["refs/heads/main"]), json!("https://kiln.home/ship/acme/app/cccc")));
+        assert_eq!((at("/predicate/resourceUri"), at("/predicate/verifier/id"), at("/predicate/policy/uri")), (json!("git+https://kiln.home/acme/app"), json!("https://kiln.home/api/verify"), json!("git+https://kiln.home/acme/app@refs/heads/main#.kiln/review.yaml")));
+        assert_eq!(at("/predicate/timeVerified"), json!(crate::trigger::context::rfc3339(AT)));
+        assert_eq!((at("/predicate/verificationResult"), at("/predicate/verifiedLevels")), (json!("PASSED"), json!(["SLSA_SOURCE_LEVEL_3"])), "only the highest level met");
+        let failed = source_vsa(&r(false));
+        assert_eq!((failed.pointer("/predicate/verificationResult"), failed.pointer("/predicate/verifiedLevels")), (Some(&json!("FAILED")), Some(&json!(["SLSA_SOURCE_LEVEL_1"]))));
+    }
+
+    /// An export of kim's verdict and kiln's word on a commit, the trail holding kiln's statement of
+    /// a revocation of `revoked`'s key at `AT - 10`; the server's checkpoint over all three.
+    fn export_of(server: &(Vec<u8>, KeyPair), kim: &(Vec<u8>, KeyPair), revoked: &[u8]) -> anyhow::Result<Export> {
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let verdict_t = "application/vnd.kiln.review.verdict+json";
+        let said = statement::payload(&statement::Statement::new(json!({ "words": "a verdict" })))?;
+        let own = statement::payload(&trail::checked_commit("acme/app", "refs/heads/main", &"c".repeat(40), None, "by", Some("kiln://hyper-light/person/kim")))?;
+        let (_, cert) = x509_parser::parse_x509_certificate(revoked).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let key = chain::hex(&<sha2::Sha256 as sha2::Digest>::digest(cert.public_key().raw));
+        let revocation = statement::payload(&trail::revocation(None, Some(&key), "someone", AT - 10, "key lost", "admin"))?;
+        let stated = [(verdict_t.to_owned(), said.clone()), (trail::PAYLOAD_CHECKED.to_owned(), own.clone()), (trail::PAYLOAD_REVOCATION.to_owned(), revocation.clone())];
+        let proven = trailed(&stated, (&server.0, &server.1))?;
+        let ex = |i: usize, signatures: Vec<ExportedSignature>, signer: Option<&str>| -> anyhow::Result<Exported> {
+            let (p, (t, payload)) = proven.get(i).zip(stated.get(i)).ok_or_else(|| anyhow::anyhow!("statement {i}"))?;
+            Ok(Exported {
+                payload_type: t.clone(),
+                payload: b64.encode(payload),
+                entry: ExportedEntry { index: p.entry.index, prev: chain::hex(&p.entry.prev), statement: p.entry.statement.clone(), kind: p.entry.kind.clone(), subjects: p.entry.subjects.clone(), taken_at: p.entry.taken_at },
+                proof: p.proof.iter().map(|h| chain::hex(h)).collect(),
+                signatures,
+                signer: signer.map(str::to_owned),
+            })
+        };
+        let digest = |i: usize| proven.get(i).map(|p| p.entry.statement.clone()).unwrap_or_default();
+        Ok(Export {
+            kind: EXPORT_KIND.into(),
+            target: "commit acme/app@cccc".into(),
+            org: ORG.into(),
+            checkpoint: ExportedCheckpoint { note: proven.first().map(|p| p.note.clone()).unwrap_or_default(), certificate: b64.encode(&server.0), signed_at: AT },
+            statements: vec![ex(0, vec![ExportedSignature { bundle: bundle(verdict_t, &said, &kim.0, &kim.1)?, taken_at: AT }], Some("kiln://hyper-light/person/kim"))?, ex(1, Vec::new(), None)?, ex(2, Vec::new(), None)?],
+            links: vec![
+                ExportedLink { link: "approved by kim (v1)".into(), holds: true, why: None, rests_on: vec![digest(0)] },
+                ExportedLink { link: "ccccccc on main, signed by kim".into(), holds: true, why: None, rests_on: vec![digest(1)] },
+            ],
+        })
+    }
+
+    /// W27-R10: a trail export verifies offline against kiln's root, and doesn't once anything in it
+    /// is changed: a statement, a proof, the signer, the checkpoint; nor where the trail's own
+    /// statement of a revocation says the signer's key was revoked before kiln took it.
+    #[test]
+    fn w27_r10_an_export_holds_offline_and_fails_when_changed() -> anyhow::Result<()> {
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let ca = ca()?;
+        let server = signer(&ca, "kiln://hyper-light/server")?;
+        let kim = signer(&ca, "kiln://hyper-light/person/kim")?;
+        let sam = signer(&ca, "kiln://hyper-light/person/sam")?;
+        let lee = signer(&ca, "kiln://hyper-light/person/lee")?;
+        let export = export_of(&server, &kim, &lee.0)?;
+        let links = offline(&export, &ca.der).map_err(anyhow::Error::msg)?;
+        assert!(links.len() == 3 && links.iter().all(|l| l.holds.is_ok()), "{links:?}");
+        let back: Export = serde_json::from_value(serde_json::to_value(&export)?)?;
+        assert_eq!(back, export, "as `kiln verify export` writes it and `--offline` reads it");
+        let broken = |e: &Export| -> anyhow::Result<(String, String)> {
+            let links = offline(e, &ca.der).map_err(anyhow::Error::msg)?;
+            let b = first_broken(&links).ok_or_else(|| anyhow::anyhow!("nothing broken: {links:?}"))?;
+            Ok((b.words.clone(), b.holds.clone().err().unwrap_or_default()))
+        };
+        let mut changed = export.clone();
+        if let Some(s) = changed.statements.get_mut(1) {
+            s.payload = b64.encode(br#"{"check":"signature","seen":"by","words":"kiln://hyper-light/person/mallory"}"#);
+        }
+        let (link, why) = broken(&changed)?;
+        assert!(link.starts_with("ccccccc on main") && why.contains("names"), "a statement changed: {link}: {why}");
+        let mut proof = export.clone();
+        if let Some(h) = proof.statements.first_mut().and_then(|s| s.proof.first_mut()) {
+            *h = "00".repeat(32);
+        }
+        let (link, why) = broken(&proof)?;
+        assert!(link.starts_with("approved by kim") && why.contains("isn't in the tree"), "a proof changed: {link}: {why}");
+        let mut other = export.clone();
+        if let Some(s) = other.statements.first_mut() {
+            let said = b64.decode(&s.payload)?;
+            s.signatures = vec![ExportedSignature { bundle: bundle(&s.payload_type, &said, &sam.0, &sam.1)?, taken_at: AT }];
+        }
+        let (link, why) = broken(&other)?;
+        assert!(link.starts_with("approved by kim") && why.contains("not kiln://hyper-light/person/kim"), "signed by another: {link}: {why}");
+        let mut note = export.clone();
+        note.checkpoint.note = note.checkpoint.note.replacen("kiln://", "kiln:/", 1);
+        assert!(offline(&note, &ca.der).is_err_and(|e| e.contains("checkpoint")), "the checkpoint changed");
+        let revoked = export_of(&server, &kim, &kim.0)?;
+        let (link, _) = broken(&revoked)?;
+        assert!(link.starts_with("approved by kim"), "kim's key revoked before kiln took her verdict, as the trail says: {link}");
         Ok(())
     }
 }

@@ -130,7 +130,8 @@ const BUILD: &str = "on:\n  push:\n    branches: [main]\njobs:\n  image:\n    ru
 fn shop(dir: &Path, n: usize) -> anyhow::Result<Shop> {
     let s = start_cd(dir, &Options { agent: false, ci: "kiln_workflows = true\n", extra: "" })?;
     let (runner, log) = agents::runner_with(dir, s.port, "fedora-2", None, TALK, &[])?;
-    agents::connected(s.port, &s.admin, "fedora-2", &log, Duration::from_secs(60))?;
+    // Under load (a gate beside it) a runner takes a while to connect.
+    agents::connected(s.port, &s.admin, "fedora-2", &log, Duration::from_secs(180))?;
     post(&s, "/api/repos", Some(&json!({ "name": "acme/app", "mode": "native" })))?;
     let (sam, kim) = (Person::new(dir, &s, "sam")?, Person::new(dir, &s, "kim")?);
     sam.git(dir, &["clone", "-q", &format!("http://x:{}@127.0.0.1:{}/git/acme/app.git", sam.token, s.port), "work"])?;
@@ -359,5 +360,67 @@ fn w27_ac08_production_refuses_an_unverified_chain() -> anyhow::Result<()> {
     let (st, body) = http(s.port, "PUT", "/api/deploy/environments/staging", &s.admin, Some(&json!({ "name": "staging", "provider": "kilncd", "production": true })))?;
     anyhow::ensure!((200..300).contains(&st), "staging made production: {st} {body}");
     assert_eq!(require_chain("staging")?, None, "made production since, it keeps what it had");
+    Ok(())
+}
+
+/// W27-R10: a deploy's trail exported for an auditor verifies offline against kiln's root with no
+/// server, and doesn't once a statement or a proof in it is changed. A revision's Source VSA (SLSA's
+/// source track) is signed as kiln's server, says what the source track asks, and is in the trail.
+#[test]
+fn w27_r10_an_exported_trail_verifies_offline() -> anyhow::Result<()> {
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let dir = tempfile::tempdir()?;
+    let shop = shop(dir.path(), 1)?;
+    let s = &shop.s;
+    let export = get(s, "/api/verify/export?deploy=prod/app@1.0.0")?;
+    let (st, pem) = http(s.port, "GET", "/ca.pem", "", None)?;
+    anyhow::ensure!(st == 200, "kiln's root: {st} {pem}");
+    let root = dir.path().join("ca.pem");
+    std::fs::write(&root, &pem)?;
+    let offline = |e: &Value, name: &str| -> anyhow::Result<(bool, String)> {
+        let file = dir.path().join(name);
+        std::fs::write(&file, serde_json::to_vec_pretty(e)?)?;
+        let out = common::kiln().args(["verify", "--offline"]).arg(&file).arg("--root").arg(&root).env_remove("KILN_URL").env_remove("KILN_ADMIN_TOKEN").output()?;
+        Ok((out.status.success(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))))
+    };
+    let (ok, said) = offline(&export, "trail.json")?;
+    assert!(ok && said.contains("verified offline") && said.contains("→ the trail's checkpoint"), "the export, offline: {said}");
+
+    // A statement a link rests on, changed; then its proof.
+    let rests = export.get("links").and_then(Value::as_array).into_iter().flatten().find_map(|l| l.pointer("/rests_on/0").and_then(Value::as_str)).map(str::to_owned).ok_or_else(|| anyhow::anyhow!("no link rests on a statement: {export:#}"))?;
+    let at = export.get("statements").and_then(Value::as_array).and_then(|list| list.iter().position(|x| x.pointer("/entry/statement").and_then(Value::as_str) == Some(rests.as_str()))).ok_or_else(|| anyhow::anyhow!("{rests} isn't exported"))?;
+    let mut changed = export.clone();
+    if let Some(p) = changed.pointer_mut(&format!("/statements/{at}/payload")) {
+        *p = json!(b64.encode(br#"{"_type":"https://in-toto.io/Statement/v1","predicate":{"edited":true}}"#));
+    }
+    let (ok, said) = offline(&changed, "changed.json")?;
+    assert!(!ok && said.contains("the chain breaks at") && said.contains("names"), "a statement changed: {said}");
+    let mut proof = export.clone();
+    if let Some(h) = proof.pointer_mut(&format!("/statements/{at}/proof/0")) {
+        *h = json!("00".repeat(32));
+    }
+    let (ok, said) = offline(&proof, "proof.json")?;
+    assert!(!ok && said.contains("isn't in the tree"), "a proof changed: {said}");
+
+    // The revision that's released: its Source VSA.
+    let v = post(s, "/api/verify/vsa", Some(&json!({ "commit": format!("acme/app@{}", shop.tip) })))?;
+    assert_eq!(v.get("verified"), Some(&json!(true)), "{v:#}");
+    let vsa = v.get("vsa").cloned().unwrap_or_default();
+    let at = |p: &str| vsa.pointer(p).cloned().unwrap_or_default();
+    assert_eq!((at("/predicateType"), at("/subject/0/digest/gitCommit"), at("/subject/0/annotations/sourceRefs")), (json!("https://slsa.dev/verification_summary/v1"), json!(shop.tip), json!(["refs/heads/main"])), "{vsa:#}");
+    assert_eq!((at("/predicate/verificationResult"), at("/predicate/verifiedLevels")), (json!("PASSED"), json!(["SLSA_SOURCE_LEVEL_3"])), "{vsa:#}");
+    assert!(text(&vsa, "_type") == "https://in-toto.io/Statement/v1" && at("/predicate/resourceUri").as_str().is_some_and(|u| u.starts_with("git+") && u.ends_with("/acme/app")), "{vsa:#}");
+    // Signed as kiln's server: its DSSE signature, under the certificate it carries, to kiln's root.
+    let now = i64::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs())?;
+    let bundle = v.get("bundle").cloned().unwrap_or_default();
+    let field = |p: &str| -> anyhow::Result<Vec<u8>> { Ok(b64.decode(bundle.pointer(p).and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("no {p}: {bundle}"))?)?) };
+    let (payload_type, payload) = (text(bundle.get("dsseEnvelope").unwrap_or(&Value::Null), "payloadType"), field("/dsseEnvelope/payload")?);
+    assert_eq!(serde_json::from_slice::<Value>(&payload)?, vsa, "the bundle signs the VSA");
+    let leaf = field("/verificationMaterial/certificate/rawBytes")?;
+    let signer = kiln_ci::identity::chain::verify_signed(&[&leaf], &kiln::pki::der_of(&pem)?, &[], now, &kiln_ci::attest::pae(payload_type, &payload), &field("/dsseEnvelope/signatures/0/sig")?)?;
+    assert_eq!(signer.identity.uri().map_err(|e| anyhow::anyhow!("{e}"))?, "kiln://hyper-light/server", "signed as kiln's server");
+    let digest = kiln_ci::identity::statement::digest(payload_type, &payload);
+    let entries = get(s, "/api/trail?from=0&limit=1000")?;
+    assert!(entries.get("entries").and_then(Value::as_array).into_iter().flatten().any(|e| text(e, "statement") == digest), "the Source VSA in the trail");
     Ok(())
 }
