@@ -258,6 +258,8 @@ Joining is never automatic: a machine asks, an admin decides.
 5. **Approval** signs the CSR with the kiln CA exactly as enrollment does (365 days). The agent's
    name is the requested one unless an agent on another host (or the server's local agent) already
    has it; then it becomes `<name>-2`, `-3`, …, and the agent takes its name from the certificate.
+   The server's own machine asking for its local agent's name is refused (409) rather than named
+   `<name>-2`: that agent is already the machine's runner, and a machine runs one.
    The answer carries the certificate, the CA and the QUIC address (the address the machine reached
    the HTTP API at, when that is an IP, else the advertised one).
 6. The machine stores the credentials in the agent state directory like enrollment

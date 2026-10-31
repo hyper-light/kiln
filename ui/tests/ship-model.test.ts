@@ -111,15 +111,31 @@ test("w26_r14: Ship's stages as the Lanes' groups, every job its lane from the s
     groups.map((g) => g.group),
     ["land", "checks", "build", "staging", "production", "replant"],
   );
-  // Every leg its lane from the start: the queued one too, with no bar until it has times.
+  // Every leg its lane from the start, as "pipeline · leg": the queued one too, with no bar until it
+  // has times; one that ran names its job, for Output (plan 01a1856fe81375b1bd1d1d86f270a45b, step 8).
   assert.deepEqual(groups[1]?.lanes, [
-    { id: "ci/lint", name: "lint", state: "passed", start: 100, end: 160 },
-    { id: "ci/test", name: "test", state: "queued", start: null, end: null },
+    { id: "ci/lint", name: "ci · lint", state: "passed", start: 100, end: 160, job: "j1" },
+    { id: "ci/test", name: "ci · test", state: "queued", start: null, end: null },
   ]);
   assert.equal(groups[1]?.state, "passed");
-  assert.deepEqual(groups[3]?.lanes, [{ id: "staging@200", name: "staging", state: "passed", start: 200, end: 200, note: "synced" }]);
+  assert.equal(groups[1]?.note, "1/2");
+  // The land queue; staging's sync and soak; production's approval, deploy and guard, not yet: each
+  // listed from the start, so nothing grows as they begin.
+  assert.deepEqual(groups[0]?.lanes, [{ id: "land", name: "land queue", state: "none", start: null, end: null }]);
+  assert.deepEqual(groups[3]?.lanes, [
+    { id: "staging/sync", name: "sync", state: "passed", start: 200, end: 200, note: "synced" },
+    { id: "staging/soak", name: "soak", state: "soaking", start: 200, end: null },
+  ]);
   assert.equal(groups[3]?.state, "soaking");
-  assert.deepEqual(groups[4]?.lanes, []);
+  assert.deepEqual(
+    groups[4]?.lanes.map((l) => [l.name, l.state]),
+    [
+      ["approval", "none"],
+      ["deploy", "none"],
+      ["guard", "none"],
+    ],
+  );
+  assert.equal(groups[4]?.note, "not yet");
   // Each platform and the image, and each runner, its lane from the start.
   const later = shipGroups({
     ...detail,
@@ -130,7 +146,11 @@ test("w26_r14: Ship's stages as the Lanes' groups, every job its lane from the s
     { id: "platform/linux/amd64", name: "linux/amd64", state: "running", start: null, end: null },
     { id: "image", name: "image", state: "queued", start: null, end: null },
   ]);
-  assert.deepEqual(later[5]?.lanes, [{ id: "runner/adacachy", name: "adacachy", state: "replanting", start: null, end: null, note: "a newer kiln" }]);
+  assert.deepEqual(later[5]?.lanes, [
+    { id: "replant/server", name: "server", state: "replanted", start: null, end: null },
+    { id: "runner/adacachy", name: "adacachy", state: "replanting", start: null, end: null, note: "a newer kiln" },
+  ]);
+  assert.equal(later[5]?.note, "0/1");
 });
 
 test("an open row never folds: not under the approval it rides with, nor into a run of shipped commits", () => {
@@ -266,7 +286,10 @@ test("a runner's replant, as the read model says it, in glyphs and words, and in
   assert.deepEqual(states.map(replantGlyph), ["replanted", "replanting", "failed", "offline"]);
   assert.deepEqual(states.map(replantWord), ["replanted", "replanting", "didn't replant", "offline"]);
   const lanes = shipGroups({ ...c("r", "shipped"), replant: [{ name: "pi", state: "failed", why: "timed out" }] })[5]?.lanes;
-  assert.deepEqual(lanes, [{ id: "runner/pi", name: "pi", state: "failed", start: null, end: null, note: "timed out" }]);
+  assert.deepEqual(lanes, [
+    { id: "replant/server", name: "server", state: "replanted", start: null, end: null },
+    { id: "runner/pi", name: "pi", state: "failed", start: null, end: null, note: "timed out" },
+  ]);
 });
 
 test("a lane's state as its glyph: one the page has no glyph for yet, as a landed change's, shows as not yet, never a crash", () => {

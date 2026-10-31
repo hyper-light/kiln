@@ -173,10 +173,15 @@ doesn't need a person for any of it:
   for someone to resume it (`resume`, or `start`). Kiln doesn't keep an agent going (below) while
   its stack is paused for a while: it waits on purpose.
 - **Waiting on you.** A stack its agent paused with no time to resume, or a plan an agent readied
-  for review (`plans_ready` `then: review`), waits on you: Mission control lists the agent under
-  Needs you, and wherever else you are in kiln a card says so, with **Review the plan** (for a
-  plan) and **Resume** (docs/agents.md, "Requests anywhere"). Yours, a parent agent's (other than
-  a plan to review) and those for a while don't.
+  for review (`plans_ready` `then: review`: "plan … waits on your review"), waits on you: Mission
+  control lists the agent under Needs you, and wherever else you are in kiln a card says so, with
+  **Resume**, or for a plan **Approve** and **Review**, which opens it in the agent's Plan tab
+  (docs/plans.md, "Reviewing a plan"; docs/agents.md, "Requests anywhere"). Approving resumes the
+  stack; rejecting skips the goal the plan was made from (its steps off the stack) and leaves the
+  stack paused by you; **Other…** takes its steps off and puts a part before the goal asking the
+  agent to change the plan as you said, and the stack runs: once the agent says the plan is ready
+  again it waits on your review once more. Yours, a parent agent's (other than a plan to review)
+  and those for a while don't.
 
 The server keeps the stacks and drives them, so they go on with no console open and across
 restarts. A stack holds at most 500 goals, those met or under way included, so a program of a
@@ -326,9 +331,11 @@ Every harness kiln runs as an agent reports how its turns end: Claude Code (its 
 reason), Codex (`turn/completed`: completed, interrupted, failed), the ACP agents, Gemini CLI,
 opencode, Goose and Amp (the prompt's `stopReason`: end_turn, max_tokens, max_turn_requests,
 refusal, cancelled), and the Antigravity CLI (its `result`: SUCCESS, or ERROR with what went wrong;
-"interrupted" is a stop). Their to-dos are Claude Code's TodoWrite, Codex's plan and ACP's plan. A
-turn of the Antigravity CLI that ended on something it wasn't allowed to do (it can't ask, so it
-was denied) ends as "blocked" and is left alone: going on would only be denied again.
+"interrupted" is a stop). Their to-dos are Claude Code's TodoWrite, Codex's plan and ACP's plan;
+after a switch to another harness, only the list the new one keeps (the old one's went to it in
+its note: agents.md). A turn of the Antigravity CLI that ended on something it wasn't allowed to
+do (it can't ask, so it was denied) ends as "blocked" and is left alone: going on would only be
+denied again.
 
 Kiln waits four seconds (a message of yours goes first), then sends one line, shown as kiln's in
 the timeline: "Your last turn stopped part-way (stop_sequence). Pick up where you left off and
@@ -353,7 +360,7 @@ What the driver sends, and the goals it sees end, are counted on `/metrics`
 
 | Method | Path | |
 |---|---|---|
-| GET | `/api/harness/sessions/:id/goals` | the stack: `{agent, state: "running" \| "paused" \| "done", reason?, items: [{id, text, status: "pending" \| "active" \| "met" \| "unmet" \| "skipped", reason?, how?, started_at?, ended_at?, reminders?, reminded_at?, part_of?, part_kind?, step?: {plan, version, n, run?}, planned_as?, waits_on?, subagent?, needs?, needs_by?}], updated_at, cleared?, resume_at?, side_by_side}` (`subagent`: the subagent a plan's step was handed to, side by side with its others, while it's still to go here, and once it met it; `needs`: the goals it waits for, by id, when it says ("What a goal waits for"); `needs_by`: who said so, `kiln` when it couldn't get it ordered and it goes in turn; `side_by_side`: whether goals ready together go to subagents, once that's built; `part_kind`: who made it a part: `own` (the agent), or kiln: `checks`, `plan`, `planning`, `run`; `planned_as`: the plan the goal became; `waits_on`: the plan run a part waits for; `reminders`: times the goal under way was sent again in a row without real work; `reminded_at`: when it was last sent, unix ms, none since it was resumed; `part_of`: the goal it's a part of; `step`: the plan step it was made from; `cleared`: how many goals the last clear kept, to bring back; `resume_at`: when a stack paused for a while resumes, unix ms; `held_for`: paused for you, until you resume it: `""`, or the plan it waits for you to look at; `plan_big`: whether it plans its big goals first) |
+| GET | `/api/harness/sessions/:id/goals` | the stack: `{agent, state: "running" \| "paused" \| "done", reason?, items: [{id, text, status: "pending" \| "active" \| "met" \| "unmet" \| "skipped", reason?, how?, started_at?, ended_at?, reminders?, reminded_at?, part_of?, part_kind?, step?: {plan, version, n, run?}, planned_as?, waits_on?, subagent?, needs?, needs_by?}], updated_at, cleared?, resume_at?, side_by_side}` (`subagent`: the subagent a plan's step was handed to, side by side with its others, while it's still to go here, and once it met it; `needs`: the goals it waits for, by id, when it says ("What a goal waits for"); `needs_by`: who said so, `kiln` when it couldn't get it ordered and it goes in turn; `side_by_side`: whether goals ready together go to subagents, once that's built; `part_kind`: who made it a part: `own` (the agent), or kiln: `checks`, `plan`, `planning`, `run`; `planned_as`: the plan the goal became; `waits_on`: the plan run a part waits for; `reminders`: times the goal under way was sent again in a row without real work; `reminded_at`: when it was last sent, unix ms, none since it was resumed; `part_of`: the goal it's a part of; `step`: the plan step it was made from; `cleared`: how many goals the last clear kept, to bring back; `resume_at`: when a stack paused for a while resumes, unix ms; `held_for`: paused for you, until you resume it: `""`, or the plan it waits on your review of; `plan_big`: whether it plans its big goals first) |
 | POST | `/api/harness/sessions/:id/goals` | `{goals: [text \| {text, needs?}], parallel?, start?, next?, before?, after?}`: goals after the others, or right after the goal under way (`next`), or before or after a goal still to go (by id) (a stack that was done, given more, is paused until started); `needs`: what each waits for, goals of the stack by id or of these by their place from 1; `parallel`: those that say nothing wait for nothing |
 | POST | `/api/harness/sessions/:id/goals/order` | `{goals: [{id, needs}]}`: what goals still to go wait for, several at once ("What a goal waits for"); a loop of waiting is refused |
 | POST | `/api/harness/sessions/:id/goals/done` | `{id?, evidence?}`: the goal under way (or `id`) is met |

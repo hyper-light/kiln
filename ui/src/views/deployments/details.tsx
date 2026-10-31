@@ -9,7 +9,9 @@ import { X } from "lucide-react";
 
 import { cdApi, resourceKey, type CdLogQuery } from "@/api/cd";
 import { wsUrl } from "@/api/client";
+import { readFrame, unread } from "@/api/frames";
 import type { CdLogDown, CdLogLine, CdLogs, CdNode, CdResourceDetail, CdResourceKey } from "@/api/types";
+import type { UnreadFrame } from "@/api/wire";
 import { Button } from "@/components/ui/button";
 import { RowsHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
@@ -64,7 +66,12 @@ export function ResourceDetails({
   const options: { value: Show; label: string }[] = [
     { value: "summary", label: "Summary" },
     { value: "live", label: "Live manifest" },
-    ...(node.managed ? [{ value: "desired" as const, label: "Desired manifest" }, { value: "diff" as const, label: "Diff" }] : []),
+    ...(node.managed
+      ? [
+          { value: "desired" as const, label: "Desired manifest" },
+          { value: "diff" as const, label: "Diff" },
+        ]
+      : []),
     { value: "events", label: "Events" },
     ...(logs ? [{ value: "logs" as const, label: "Logs" }] : []),
   ];
@@ -357,6 +364,9 @@ function ReadLog({ appId, node, q, o, set }: { appId: string; node: CdNode; q: C
 
 type FollowState = "loading" | "live" | "ended";
 
+/** A deployment's log socket's frames, by tag: a frame with another isn't applied (`api/frames.ts`). */
+const CD_LOG_FRAMES = { lines: true, error: true, end: true, refused: true } satisfies Record<CdLogDown["type"], true>;
+
 /** The log followed: a WebSocket says each line as it is written (opened with its view, closed with it). */
 function FollowedLog({ appId, node, q, o, set }: { appId: string; node: CdNode; q: CdLogQuery; o: LogOpts; set: (p: Partial<LogOpts>) => void }) {
   // The pods and containers there are, as the last read found them.
@@ -386,8 +396,13 @@ function FollowedLog({ appId, node, q, o, set }: { appId: string; node: CdNode; 
       };
       ws.onopen = () => setState("live");
       ws.onmessage = (m) => {
-        if (typeof m.data !== "string") return;
-        const msg = JSON.parse(m.data) as CdLogDown;
+        // Applied only when it reads as one of the socket's frames; else the server, which sent it, is told.
+        const read = typeof m.data === "string" ? readFrame<CdLogDown>(m.data, "type", CD_LOG_FRAMES) : unread("", "a binary frame: this socket sends text");
+        if ("unread" in read) {
+          if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(read.unread satisfies UnreadFrame));
+          return;
+        }
+        const msg = read.frame;
         if (msg.type === "lines") {
           pending.push(...msg.lines);
           if (!frame) frame = requestAnimationFrame(flush);

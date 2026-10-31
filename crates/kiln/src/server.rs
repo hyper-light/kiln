@@ -105,7 +105,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     if let Some(c) = crate::runner::chaos::get() {
         net.command(crate::net::Out::Seed(c.seed)).await;
         for rule in c.faults.iter().copied() {
-            net.command(crate::net::Out::Shed(rule)).await;
+            net.command(crate::net::Out::Shed(rule.past(crate::wire::server_classes().len()))).await;
         }
     }
     // HTTPS on the HTTP port, when asked: the configured certificate, else the kiln CA's.
@@ -128,6 +128,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     // it connects, and the server's own agents held to theirs from the start.
     hub.agent_limits.load(&hub.store).await?;
     crate::harness::limit::hold_local(&hub);
+    hub.headrooms.load(&hub.store).await?;
     // Peered clusters (docs/peers.md): forwarded to, and their ports open, from the start.
     crate::peers::start(&hub).await;
     // The tailnet's DNS for them: the Tailscale credential given in the UI, the routes kiln set.

@@ -364,6 +364,14 @@ fn w22_ac02_account_actions_in_dry_configurations() -> anyhow::Result<()> {
     let google = if localhost_names() { Some(google_sts(dir.path())?) } else { None };
     let path = docker_path(dir.path())?;
     let env: Vec<(&str, &str)> = path.as_deref().map(|p| ("PATH", p)).into_iter().collect();
+    // codecov's action checks its CLI with gpg in the job's home. gpg 2.4 gives a new home
+    // keyboxd, whose database steps load on a busy machine leave locked ("SQL library used
+    // incorrectly"); an empty common.conf keeps it on its keyring file.
+    let gnupg = dir.path().join("home/.gnupg");
+    std::fs::create_dir_all(&gnupg)?;
+    #[cfg(unix)]
+    std::fs::set_permissions(&gnupg, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+    std::fs::write(gnupg.join("common.conf"), "")?;
     let s = start_env(dir.path(), &Options { agent: true, ..Options::default() }, false, &env)?;
     let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
     anyhow::ensure!(st == 200, "{st} {body}");

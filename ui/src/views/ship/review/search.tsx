@@ -20,7 +20,7 @@ export interface Jump {
 export function SearchBox({ q, onQ, hits, onJump }: { q: string; onQ: (q: string) => void; hits: Res<SearchResult> | null; onJump: (j: Jump) => void }) {
   return (
     <div className="rv-search">
-      <label className="rv-q">
+      <label className="field rv-q">
         <Search size={13} aria-hidden="true" />
         <input value={q} onChange={(e) => onQ(e.target.value)} placeholder="Search · vorpal" aria-label="Search the change" autoComplete="off" />
       </label>

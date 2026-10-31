@@ -58,18 +58,39 @@ export interface ShipCommit {
   change?: ShipChange | null;
   /** The change's tip this commit folds under. */
   fold_under?: string | null;
+  /**
+   * Who made it, as far as kiln knows (ship.rs's made_by, W26-R18): the agent session that made it,
+   * and the person it traces back to. Hand off goes to `agent`, and Files' ask asks it. Today only a
+   * kiln change says it; Chain of Ownership fills it for every commit in time.
+   */
+  made_by?: { agent?: string; person?: string } | null;
   actions?: ShipAction[];
   /** A hash of what the row shows (W26-R06): the same row, the same `v`. */
   v?: string;
 }
 
+/**
+ * The pace line's words (plan 01a1856fe81375b1bd1d1d86f270a45b, step 5): the commits in flight
+ * (landing, checking, building) and the agents behind them; what each environment of each
+ * repository in view runs now, production with how many commits it's behind; and how many of the
+ * connected runners run production's commit (null when none does).
+ */
+export interface ShipPace {
+  in_flight: number;
+  agents: number;
+  envs: { repo: string; environment: string; short: string; behind: number | null }[];
+  runners: { on: number; of: number } | null;
+}
+
 export interface ShipPage {
   commits: ShipCommit[];
   next_cursor: number | null;
+  /** With a page the server read from memory. */
+  pace?: ShipPace;
 }
 
-/** A build part's state (`Part` in kiln_cd::journey). */
-export type ShipPart = "queued" | "running" | "passed" | "failed" | "superseded";
+/** A build part's state (`Part` in kiln_cd::journey): `none` when nothing built it. */
+export type ShipPart = "queued" | "running" | "passed" | "failed" | "superseded" | "none";
 
 /**
  * A mark of a lane group (W26-R14): a push, replay, comment, fix, resolution or approval with its

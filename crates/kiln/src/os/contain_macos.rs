@@ -243,6 +243,24 @@ impl Group {
             t.sessions.lock().remove(&self.session);
         }
     }
+
+    /// CI jobs get no group of their own here ([`job_group`]).
+    pub fn release(&self) {}
+}
+
+/// A CI job's group of processes: Linux's alone (`crate::os::contain` there), where a kiln a step
+/// starts would otherwise take the runner's own cgroup as its.
+pub fn job_group(_job: &str) -> Option<Group> {
+    None
+}
+
+/// The sessions with processes followed now.
+pub fn sessions() -> Vec<String> {
+    let Some(t) = tracker() else { return Vec::new() };
+    let mut s: Vec<String> = t.members.lock().values().cloned().collect();
+    s.sort();
+    s.dedup();
+    s
 }
 
 /// The agent session process `pid` belongs to, when it's one followed.

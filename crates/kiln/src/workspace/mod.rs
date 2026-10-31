@@ -8,10 +8,13 @@
 //! - [`change`]: an agent's change request, from its work to review (C1, C6).
 //! - [`follow`]: what happens to it, back to the agent (C2, C3).
 //! - [`slates`]: a workspace of its own, a Slates volume over its folder (W1–W4).
+//! - [`measure`]: an experiment's variants measured beside it, each in a worktree of its own
+//!   (docs/ci.md W20-R11).
 
 pub mod change;
 pub mod follow;
 pub mod git;
+pub mod measure;
 pub mod slates;
 
 use std::path::{Path, PathBuf};
@@ -111,6 +114,17 @@ pub enum Ask {
     /// agent's folder, or a page, fetched from here as the agent would; only whether each is
     /// there comes back.
     Cite { looks: Vec<crate::research::check::Look> },
+    /// Start measuring an experiment's variant: a command run in the variant's own worktree of the
+    /// agent's repository ([`measure::start`], docs/ci.md W20-R11).
+    Measure(measure::Measure),
+    /// How measurement `key` goes, until it ends; `stop` stops it ([`measure::measured`]).
+    Measured {
+        key: String,
+        #[serde(default)]
+        stop: bool,
+    },
+    /// Experiment `experiment` is over: its worktrees go ([`measure::unmeasure`]).
+    Unmeasure { experiment: String },
 }
 
 /// A push of one commit to one ref, as one principal.
@@ -182,11 +196,7 @@ pub const WAIT: Duration = Duration::from_secs(240);
 /// [`crate::harness::session::Info::work_dir`]), the files a finding cites under its folder
 /// (`cwd`), and its workspace `ws` when it has one of its own: `{"facts"}`, `{"made", "said"}`,
 /// `{"drift"}`, `{"plan"}`, `{"landed"}`, or `{"error"}`.
-pub async fn serve(cwd: &Path, work: &Path, ws: Option<&Workspace>, ask: &str) -> Value {
-    let ask: Ask = match serde_json::from_str(ask) {
-        Ok(a) => a,
-        Err(e) => return json!({"error": format!("a question this machine doesn't understand ({e}): its kiln may be older than the server's")}),
-    };
+pub async fn serve(cwd: &Path, work: &Path, ws: Option<&Workspace>, ask: Ask) -> Value {
     let r = match ask {
         Ask::Cite { looks } => Ok(json!({"looks": crate::research::check::local(cwd, looks).await})),
         ask => answer(work, ws, ask).await,
@@ -234,6 +244,9 @@ async fn answer(cwd: &Path, ws: Option<&Workspace>, ask: Ask) -> anyhow::Result<
             })
         }
         Ask::Git => Ok(json!({"facts": git::facts(cwd).await?})),
+        Ask::Measure(m) => measure::start(cwd, m).await,
+        Ask::Measured { key, stop } => Ok(measure::measured(&key, stop)),
+        Ask::Unmeasure { experiment } => measure::unmeasure(cwd, &experiment).await,
         Ask::Cite { looks } => Ok(json!({"looks": crate::research::check::local(cwd, looks).await})),
         Ask::Change(c) => {
             let facts = git::facts(cwd).await?;

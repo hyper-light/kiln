@@ -5,17 +5,19 @@
  */
 import * as React from "react";
 import { DropdownMenu } from "radix-ui";
-import { Check, ChevronDown, ShieldAlert, X } from "lucide-react";
+import { ArrowRight, Check, ChevronDown, ShieldAlert, X } from "lucide-react";
 import type { Approval, Command } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { diffStats, relPath, tildify } from "./derive";
 import { DiffStat, FileDiffView } from "./diff";
-import { experimentsApi, experimentWhereRes } from "@/api/experiments";
+import { experimentsApi, experimentWhereRes, type ExCriterion } from "@/api/experiments";
 import { useRes } from "@/lib/data";
-import { answersToClaude, Choices, type ChoiceAnswer, type ChoiceQuestion, type ChoicesProps, type ExperimentSpec } from "./choices";
+import { answersToClaude, Choices, type ChoiceAnswer, type ChoiceQuestion, type ChoicesProps, type Criterion, type ExperimentSpec } from "./choices";
 import { Prose, ToolIcon } from "./parts";
 import { SavePlan } from "@/views/plans/save";
+import { headingOf } from "@/views/plans/review-model";
+import { planSteps } from "@/views/plans/steps";
 import { Highlighted } from "@/components/code/highlighted";
 
 export type Decide = (c: Extract<Command, { type: "approve" }>) => void;
@@ -84,8 +86,22 @@ function optionName(label: string, taken: string[]): string {
   return name;
 }
 
-/** The dialog's criteria, as an experiment takes them. */
-function criteriaOf(spec: ExperimentSpec) {
+/** An experiment's criterion (one an agent suggested), as the setup takes it. */
+export function criterionFrom(c: ExCriterion): Criterion {
+  if (c.kind === "pipeline") return { kind: "pipeline", pipeline: c.workflow ?? "", required: c.required };
+  if (c.kind === "command") return { kind: "command", command: c.command ?? "", required: c.required };
+  const t = c.threshold;
+  const threshold =
+    t?.better !== undefined
+      ? { type: "relative" as const, value: Math.round(t.better * 1000) / 10 }
+      : (t?.at_most ?? t?.at_least) !== undefined
+        ? { type: "absolute" as const, value: t?.at_most ?? t?.at_least ?? NaN }
+        : undefined;
+  return { kind: "metric", metric: c.metric ?? c.name, better: c.better ?? "lower", ...(threshold && { threshold }), required: c.required };
+}
+
+/** The setup's criteria, as an experiment takes them. */
+export function criteriaOf(spec: ExperimentSpec) {
   return spec.criteria.map((c, i) => {
     if (c.kind === "pipeline") return { name: `pipeline-${i + 1}`, kind: "pipeline", workflow: c.pipeline ?? "", required: c.required ?? true };
     if (c.kind === "command") return { name: `command-${i + 1}`, kind: "command", command: c.command ?? "", required: c.required ?? true };
@@ -138,7 +154,7 @@ function WithExperiment({
         criteria: criteriaOf(spec),
         repetitions: spec.repetitions,
         max_parallel: spec.maxParallel,
-        ...(spec.budgetMinutes && { budget_minutes: spec.budgetMinutes }),
+        ...(spec.budgetSeconds && { budget_seconds: spec.budgetSeconds }),
         decide: spec.decide,
       });
       answer([
@@ -156,7 +172,12 @@ function WithExperiment({
   };
   return (
     <>
-      {render({ onExperiment: (spec, others) => void start(spec, others), pipelines: where.workflows })}
+      {render({
+        onExperiment: (spec, others) => void start(spec, others),
+        pipelines: where.workflows,
+        machine: where.machine,
+        suggested: where.suggested?.map((s) => ({ question: s.question, criteria: s.criteria.map(criterionFrom) })),
+      })}
       {error && <p className="text-[12.5px] text-[#d1aaad]">{error}</p>}
     </>
   );
@@ -177,6 +198,7 @@ export function ApprovalCard({
   agentName,
   kind,
   agentId,
+  onReviewPlan,
 }: {
   a: Approval;
   cwd: string;
@@ -185,6 +207,8 @@ export function ApprovalCard({
   agentName?: string;
   kind?: string;
   agentId?: string;
+  /** A plan is reviewed in its agent's Plan tab, beside this: this opens it (none: it's read here, in full). */
+  onReviewPlan?: () => void;
 }) {
   const [denying, setDenying] = React.useState(false);
   const [note, setNote] = React.useState("");
@@ -197,6 +221,7 @@ export function ApprovalCard({
         <Questions a={a} onDecide={onDecide} agentName={agentName} kind={kind} agentId={agentId} />
       </div>
     );
+  if (isPlan && onReviewPlan) return <PlanAsk a={a} onDecide={onDecide} onReview={onReviewPlan} className={className} />;
 
   return (
     <div className={cn("hx-approval", a.default_to_no && "hx-approval-danger", className)} role="group" aria-label={`Approval: ${a.title}`}>
@@ -287,6 +312,42 @@ export function ApprovalCard({
           </Button>
         </div>
       )}
+    </div>
+  );
+}
+
+/**
+ * A plan it proposes, where it asked: what it is in a line, Approve at once, and Review, which opens
+ * its Plan tab beside the conversation (a phone's Plan tab), where it's read step by step and
+ * rejected or answered in your own words (views/plans/review.tsx).
+ */
+function PlanAsk({ a, onDecide, onReview, className }: { a: Approval; onDecide: Decide; onReview: () => void; className?: string }) {
+  const steps = planSteps(a.plan ?? "").length;
+  return (
+    <div className={cn("hx-approval", className)} role="group" aria-label={`Approval: ${a.title}`}>
+      <div className="hx-approval-head">
+        <span className="hx-approval-icon">
+          <ToolIcon kind="plan" size={14} />
+        </span>
+        <span className="hx-approval-ask">
+          {a.agent ? <span className="hx-dim">{a.agent} proposes a plan</span> : <span className="hx-dim">Proposes a plan</span>}
+          {steps > 0 && (
+            <span className="hx-dim">
+              {" "}
+              · {steps} step{steps === 1 ? "" : "s"}
+            </span>
+          )}
+        </span>
+      </div>
+      <div className="hx-plan-ask">{headingOf(a.plan ?? "") ?? a.title}</div>
+      <div className="hx-approve-actions">
+        <Button size="sm" onClick={() => onDecide({ type: "approve", id: a.id, decision: "allow" })}>
+          <Check /> Approve plan
+        </Button>
+        <Button size="sm" variant="secondary" onClick={onReview}>
+          Review it <ArrowRight />
+        </Button>
+      </div>
     </div>
   );
 }

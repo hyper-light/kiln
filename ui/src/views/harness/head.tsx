@@ -2,13 +2,15 @@
  * The agent page's head, in hyper-light.dev's figure-header voice: a mono eyebrow (where you are),
  * the agent's name, state on the stop control's border; then how it runs — permissions, model, effort,
  * and its speed where the model goes faster — as one line that changes them in place (no popups).
- * Settings live in ⋯.
+ * Settings live in ⋯. A flag says when any of its messages was refused, and opens their list in place.
  */
 import * as React from "react";
 import { Link, useNavigate } from "@/lib/router";
-import { ArrowLeft, MoreHorizontal, Pause, Power, RotateCcw, Search, SquareTerminal } from "lucide-react";
-import { FORCE_STOP_AFTER_MS, harnessApi, type AgentInfo, type Command, type KindInfo, type Meta, type State, type Status } from "@/api/harness";
+import { ArrowLeft, Flag, MoreHorizontal, Pause, Power, RotateCcw, Search, SquareTerminal } from "lucide-react";
+import { FORCE_STOP_AFTER_MS, harnessApi, useSession, useStopAt, type AgentInfo, type Command, type KindInfo, type Meta, type SessionStore, type State, type Status } from "@/api/harness";
+import type { RefusedMessages } from "@/api/types";
 import { useSuspenseResource } from "@/lib/resource";
+import { newestFirst, refusedCounts, refusedFlag, refusedWhen, whatWhy } from "@/views/refused";
 import { agentLabel, hasOwnName, modelLabel } from "./derive";
 import { useClock, useListener } from "./dom";
 import { RoundButton } from "./figure/figure";
@@ -22,13 +24,13 @@ import { kilnAtWork, kilnSubagentsOf, subagentsAtWork, subagentTasksAtWork, work
 import { harnessSessionsRes, useRes } from "@/lib/data";
 import "./console.css";
 
-type BorderState = "active" | "stopped" | "finished" | "ready" | "disconnected";
+export type BorderState = "active" | "needs" | "stopped" | "finished" | "ready" | "disconnected";
 
 function turnSignal(status: Status, conn: string, state: State | null, info: AgentInfo | null, kiln: number): { tone: BorderState; label: string } {
   if (status === "disconnected" || (conn !== "open" && status !== "exited")) return { tone: "disconnected", label: conn === "reconnecting" ? "Reconnecting…" : "Disconnected" };
   if (state?.pause ?? info?.pause) return { tone: "stopped", label: "Paused at a usage limit" };
-  if (status === "exited") return { tone: "stopped", label: "Stopped" };
-  if (status === "waiting" || (state?.approvals.length ?? info?.approvals.length ?? 0) > 0) return { tone: "ready", label: "Waiting for you" };
+  if (status === "exited") return (state?.exit ?? info?.exit)?.again_at != null ? { tone: "active", label: "Starting again…" } : { tone: "stopped", label: "Stopped" };
+  if (status === "waiting" || (state?.approvals.length ?? info?.approvals.length ?? 0) > 0) return { tone: "needs", label: "Waiting for you" };
   if (status === "starting") return { tone: "active", label: state?.harness_session ? "Resuming…" : "Starting…" };
   if (status === "running") return { tone: "active", label: "Working" };
   // Its turn over, a subagent it sent off still works (its harness's own, or one kiln started for its goals: `kiln`).
@@ -36,6 +38,22 @@ function turnSignal(status: Status, conn: string, state: State | null, info: Age
   if (workingThrough(status, subs)) return { tone: "active", label: `Working · ${subs} subagent${subs === 1 ? "" : "s"}` };
   if (state?.last_turn) return state.last_turn.how === "done" ? { tone: "finished", label: "Finished" } : { tone: "stopped", label: "Stopped" };
   return { tone: "ready", label: "Ready" };
+}
+
+/**
+ * The turn control's state for the agent in `store`, as the head shows it (a stop asked of the
+ * turn under way, until it takes, included): the agent page's composer wears it on its border.
+ * `kiln`: the subagents kiln started for it.
+ */
+export function useTurnState(store: SessionStore, kiln: readonly AgentInfo[]): BorderState {
+  const stopAt = useStopAt(store);
+  const working = kilnAtWork(kiln).length;
+  return useSession(store, (s) => {
+    const status = s.state?.status ?? s.info?.status ?? "starting";
+    // Asked to stop, as the head's StoppingControl shows it.
+    if (stopAt != null && (status === "running" || status === "waiting") && s.meta?.features.includes("interrupt")) return s.conn !== "open" ? "disconnected" : "stopped";
+    return turnSignal(status, s.conn, s.state, s.info, working).tone;
+  });
 }
 
 /** State lives on the existing button's border. Its shape, icon and hit area never animate. */
@@ -178,13 +196,21 @@ export function AgentHeader({
   const usageId = React.useId();
   const top = topLimit(limits);
   line.trailing = top?.used_percent != null ? <LimitBadge className="rs-v" limits={limits} open={usage} controls={usageId} onClick={() => setUsage(!usage)} /> : undefined;
+  // What of its messages couldn't be read (on its sockets, in its MCP calls, in its runner's updates
+  // of it): the flag opens their list in place, under it.
+  const refused = info?.refused;
+  const flag = refusedFlag(refused);
+  const [refusals, setRefusals] = React.useState(false);
+  const refusalsId = React.useId();
   useListener<KeyboardEvent>(
     document,
     "keydown",
     (e) => {
-      if (e.key === "Escape") setUsage(false);
+      if (e.key !== "Escape") return;
+      setUsage(false);
+      setRefusals(false);
     },
-    { on: usage },
+    { on: usage || refusals },
   );
   // The kind is said beside a label that isn't the kind's own name.
   const label = info ? agentLabel(info) : "Agent";
@@ -258,7 +284,14 @@ export function AgentHeader({
       </div>
       <div className="ag-clock-row">
         {running && state?.turn_started != null ? <TurnTime started={state.turn_started} /> : state?.last_turn && lastTurnFrom != null ? <TurnTook ms={state.last_turn.at - lastTurnFrom} /> : null}
+        {flag && (
+          <button type="button" className="ag-refused" aria-expanded={refusals} aria-controls={refusals ? refusalsId : undefined} onClick={() => setRefusals(!refusals)}>
+            <Flag size={11} aria-hidden="true" />
+            {flag}
+          </button>
+        )}
       </div>
+      {refusals && refused && flag && <RefusedList id={refusalsId} refused={refused} />}
       {switchTarget ? (
         <React.Suspense fallback={<RunSettings {...line} />}>
           <RunSettingsElsewhere {...line} target={switchTarget} own={info?.kind} />
@@ -284,6 +317,27 @@ export function AgentHeader({
         />
       )}
     </header>
+  );
+}
+
+/** Its messages kiln couldn't read, opened from the flag: how many by wire and code, then the newest first, each with when, what and why. */
+function RefusedList({ id, refused }: { id: string; refused: RefusedMessages }) {
+  const now = useClock(1000);
+  return (
+    <section id={id} className="ag-refused-list" aria-label="Refused messages">
+      <p className="ag-refused-counts">{refusedCounts(refused)}</p>
+      <ul className="ag-refused-rows">
+        {newestFirst(refused).map((m, i) => (
+          <li key={i} className="ag-refused-row">
+            <span className="ag-refused-at">{refusedWhen(m, now)}</span>
+            <span className="ag-refused-wire">
+              {m.unread.wire} {m.unread.code}
+            </span>
+            <span className="ag-refused-why">{whatWhy(m)}</span>
+          </li>
+        ))}
+      </ul>
+    </section>
   );
 }
 

@@ -46,6 +46,15 @@ test("none where the page shows it itself: Mission control, and the agent's own 
   assert.deepEqual(kinds(fleet, "/agents/lim/changes"), ["request:ask", "request:both", "held:plan", "stopped:crash"]);
 });
 
+test("a subagent kiln started has no request card on its agent's page, which has its request over the composer", () => {
+  const ask = { id: "s1", tool: "question" as const, tool_name: "AskUserQuestion", title: "Which first?", at: 20 };
+  const step = agent("step", { parent: "lead", subagent: true, status: "waiting", approvals: [ask] });
+  assert.deepEqual(kinds([agent("lead"), step], "/agents/lead"), []);
+  // Anywhere else its card shows, as any agent's does; so does one only started by an agent.
+  assert.deepEqual(kinds([agent("lead"), step], "/runs"), ["request:step"]);
+  assert.deepEqual(kinds([agent("lead"), agent("child", { parent: "lead", approvals: [ask] })], "/agents/lead"), ["request:child"]);
+});
+
 test("a limit under a turn still going isn't one yet, nor a limit of a machine gone quiet", () => {
   assert.deepEqual(kinds([agent("a", { status: "running", pause: limit(5) }), agent("b", { status: "disconnected", pause: limit(5) })]), []);
 });

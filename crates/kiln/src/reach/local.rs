@@ -107,7 +107,8 @@ pub fn path(name: &str, home: &Path) -> PathBuf {
 }
 
 /// The reach socket of a runner on this machine, for a shell outside kiln's terminals: the one
-/// named in `KILN_REACH_SOCK`, else the only one there is.
+/// named in `KILN_REACH_SOCK`, else the only one a runner answers on, else the machine's installed
+/// runner's among several ([`choose_socket`]).
 pub fn find_socket() -> anyhow::Result<PathBuf> {
     if let Some(p) = std::env::var_os("KILN_REACH_SOCK").map(PathBuf::from) {
         return Ok(p);
@@ -116,13 +117,33 @@ pub fn find_socket() -> anyhow::Result<PathBuf> {
     if let Some(r) = std::env::var_os("XDG_RUNTIME_DIR") {
         dirs.insert(0, PathBuf::from(r).join("kiln"));
     }
-    let mut found: Vec<PathBuf> = dirs
+    let found: Vec<PathBuf> = dirs
         .iter()
         .filter_map(|d| std::fs::read_dir(d).ok())
         .flat_map(|rd| rd.flatten().map(|e| e.path()))
         .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("reach-") && n.to_string_lossy().ends_with(".sock")))
         .collect();
+    let installed = crate::harness::socket::tag_of(&crate::config::default_data_dir().join("agent"));
+    choose_socket(found, &installed)
+}
+
+/// Of the reach sockets `found`, the one a runner answers on: a file nothing answers on is one a
+/// runner left as it ended (`crate::harness::socket::sweep` removes them in time). Among several,
+/// the machine's installed runner's, whose state directory is the default (its name ends in
+/// `-<installed>.sock`), before a test's or a lab's.
+fn choose_socket(mut found: Vec<PathBuf>, installed: &str) -> anyhow::Result<PathBuf> {
+    #[cfg(unix)]
+    found.retain(|p| crate::harness::socket::answers(p));
     found.sort();
+    if found.len() > 1 {
+        let suffix = format!("-{installed}.sock");
+        let mut theirs: Vec<&PathBuf> = found.iter().filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().ends_with(&suffix))).collect();
+        if theirs.len() == 1
+            && let Some(one) = theirs.pop()
+        {
+            return Ok(one.clone());
+        }
+    }
     match found.len() {
         0 => anyhow::bail!("no kiln runner on this machine takes reach requests (is `kiln agent` running here, and new enough?)"),
         1 => Ok(found.remove(0)),
@@ -566,3 +587,28 @@ pub fn send_on(stream: &mut std::os::unix::net::UnixStream, r: &Req) -> anyhow::
     stream.write_all(&wire::frame(r)?)?;
     Ok(())
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// Discovery counts only sockets a runner answers on, and among several takes the installed
+    /// runner's: 1,532 left by ended test and lab runners kept `kiln reach mcp` from finding it.
+    #[test]
+    fn the_runner_s_socket_is_found_among_ended_ones_and_others() -> anyhow::Result<()> {
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir()?;
+        let path = |n: &str| dir.path().join(n);
+        drop(UnixListener::bind(path("reach-lab-0-deadbeef.sock"))?);
+        let installed = path("reach-adacachy-4b48ed43.sock");
+        let _runner = UnixListener::bind(&installed)?;
+        let all = || std::fs::read_dir(dir.path()).map(|rd| rd.flatten().map(|e| e.path()).collect::<Vec<_>>());
+        anyhow::ensure!(choose_socket(all()?, "00000000")? == installed, "the one live socket wasn't chosen");
+        let _lab = UnixListener::bind(path("reach-lab-1-0badf00d.sock"))?;
+        anyhow::ensure!(choose_socket(all()?, "4b48ed43")? == installed, "the installed runner's wasn't chosen among live ones");
+        anyhow::ensure!(choose_socket(all()?, "00000000").is_err(), "two live runners, neither installed, were told apart");
+        anyhow::ensure!(choose_socket(vec![path("reach-lab-0-deadbeef.sock")], "4b48ed43").is_err(), "an ended runner's socket was chosen");
+        Ok(())
+    }
+}
+

@@ -29,7 +29,7 @@ import { agentLabel, changesetOf, editsOf, useSameList } from "./derive";
 import { useListener } from "./dom";
 import { FindBar, findIn, type FindNow } from "./find";
 import { EarlierMatches } from "./said";
-import { AgentHeader } from "./head";
+import { AgentHeader, useTurnState, type BorderState } from "./head";
 import { Inspector, type InspectorTab } from "./inspector";
 import { DesktopLayout, INSPECTOR_COLLAPSED } from "./desktop";
 import { AskedLine } from "./asked";
@@ -40,6 +40,8 @@ import { Timeline, type ReplyTarget } from "./timeline";
 import { BesideTerminals, openBeside as openTerminal } from "./beside";
 import { useDrafts } from "./state";
 import { PlanSourceContext } from "@/views/plans/save";
+import { useReviewWaits } from "@/views/plans/review";
+import { revealReview } from "@/views/plans/reveal";
 import { useEndWithChildren } from "./family";
 import { LoadingMark, PrismLabel } from "./signals";
 import { markAnswered, stillAsked, unmark, useAnswered } from "./answered";
@@ -49,6 +51,9 @@ type PhoneTab = "work" | InspectorTab;
 
 const NO_EVENTS: HEvent[] = [];
 const NO_TODOS: Todo[] = [];
+
+/** The composer's field, to type in: the field itself, not the marked copy drawn under it (compose-field.tsx), which has its class too. */
+const composerField = () => document.querySelector<HTMLTextAreaElement>("textarea.hx-compose-input");
 
 /** What a message to it can carry. */
 const acceptsOf = (meta: Meta | null) => {
@@ -103,6 +108,8 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
   // The subagents kiln started for its goals or plan steps: its, as its harness's own are.
   const everyone = useRes(harnessSessionsRes).data;
   const kiln = React.useMemo(() => kilnSubagentsOf(everyone, id), [everyone, id]);
+  // The head's pause button's state: the composer's border wears it, whichever thread it writes to.
+  const turn = useTurnState(store, kiln);
   // One of those, its thread shown here: a session of its own.
   const sub = taskId ? (kiln.find((a) => a.id === taskId) ?? null) : null;
   // Mission Control links by the stable task id; the timeline groups its events by spawn call.
@@ -130,7 +137,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
       const d = useDrafts.getState();
       const was = d.drafts[id] ?? "";
       d.setDraft(id, was.trim() ? `${was.replace(/\s+$/, "")}\n\n${text}` : text);
-      document.querySelector<HTMLTextAreaElement>(".hx-compose-input")?.focus();
+      composerField()?.focus();
     },
     [id],
   );
@@ -223,7 +230,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
     setFindOpen(false);
     setFindAt(null);
     setSearched("");
-    document.querySelector<HTMLTextAreaElement>(".hx-compose-input")?.focus();
+    composerField()?.focus();
   };
   const find = React.useMemo(() => (findOpen ? { q, now: findAt } : undefined), [findOpen, q, findAt]);
   const showTools = React.useCallback(() => {
@@ -235,6 +242,11 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
     setTrayCollapsed(false);
     setTab("plan");
     setPhoneTab("plan");
+  };
+  /** A plan it proposes, reviewed where its plans are: its Plan tab, the review at its top. */
+  const reviewPlan = () => {
+    showPlan();
+    revealReview();
   };
   /** /model, /effort, /permissions: that setting of the head's run settings, opened in place. */
   const openSetting = (label: "Model" | "Effort" | "Permissions") => {
@@ -313,7 +325,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
       )}
       {sub ? (
         <React.Suspense fallback={<LoadingMark />}>
-          <KilnThread key={sub.id} id={sub.id} onTerminal={openBeside} find={find} />
+          <KilnThread key={sub.id} id={sub.id} onTerminal={openBeside} find={find} turn={turn} />
         </React.Suspense>
       ) : (
         <>
@@ -336,6 +348,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
                 accountOpen={account !== null}
                 find={find}
                 footer={footer}
+                onReviewPlan={task ? undefined : reviewPlan}
               />
             </AboutContext.Provider>
           </PlanSourceContext.Provider>
@@ -346,6 +359,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
             toMain={task !== null}
             task={task}
             kiln={kiln}
+            turn={turn}
             onView={openView}
             onTerminal={openBeside}
             onOpenTask={openTask}
@@ -509,7 +523,18 @@ function Head({ store, cwd, send, onUsage, onSettings, onFind }: { store: Sessio
  * thread where the conversation is, what it asks you answered there, and the composer writing to
  * it. What's only on its page of its own (its settings, its own subagents' threads) opens there.
  */
-function KilnThread({ id, onTerminal, find }: { id: string; onTerminal: (o: { what: "shell" | "screen"; command?: string }) => void; find?: { q: string; now: FindNow | null } }) {
+function KilnThread({
+  id,
+  onTerminal,
+  find,
+  turn,
+}: {
+  id: string;
+  onTerminal: (o: { what: "shell" | "screen"; command?: string }) => void;
+  find?: { q: string; now: FindNow | null };
+  /** The agent's pause button's state, on the composer's border. */
+  turn: BorderState;
+}) {
   const store = sessionStore(id);
   useSessionReady(store);
   const navigate = useNavigate();
@@ -551,6 +576,7 @@ function KilnThread({ id, onTerminal, find }: { id: string; onTerminal: (o: { wh
         attachments={attachments}
         toMain={false}
         task={null}
+        turn={turn}
         onView={() => ownPage()}
         onTerminal={onTerminal}
         onOpenTask={ownPage}
@@ -571,6 +597,7 @@ function Dock({
   toMain,
   task,
   kiln,
+  turn,
   onView,
   onTerminal,
   onOpenTask,
@@ -587,6 +614,8 @@ function Dock({
   task: string | null;
   /** The subagents kiln started for its goals or plan steps, beside its harness's own. */
   kiln?: readonly AgentInfo[];
+  /** The agent's pause button's state, on the composer's border. */
+  turn: BorderState;
   onView: (view: string) => void;
   onTerminal: (o: { what: "shell" | "screen"; command?: string }) => void;
   onOpenTask: (toolId: string) => void;
@@ -606,7 +635,7 @@ function Dock({
   const [moving, setMoving] = React.useState(false);
   return (
     <div className="hx-dock" onPointerDown={keepTyping} onMouseDown={keepTyping}>
-      <ActivityLine store={store} onOpenTask={onOpenTask} kiln={kiln} />
+      <ActivityLine store={store} onOpenTask={onOpenTask} kiln={kiln} inThread={task} />
       {status === "exited" && exit?.error && empty ? (
         <div className="hx-startfail" role="alert">
           <b>This agent couldn't start.</b> {exit.error}
@@ -627,7 +656,11 @@ function Dock({
         </div>
       ) : status === "exited" ? (
         <div className="hx-exited">
-          <span className="hx-dim">{exit?.error ?? `The agent stopped${exit?.code != null ? ` (exit ${exit.code})` : ""}.`} Sending a message picks up where it left off.</span>
+          <span className="hx-dim">
+            {exit?.again_at != null
+              ? `Its process ended${exit.code != null ? ` (exit ${exit.code})` : ""}. It starts again by itself, and its conversation goes on.`
+              : `${exit?.error ?? `The agent stopped${exit?.code != null ? ` (exit ${exit.code})` : ""}.`} Sending a message picks up where it left off.`}
+          </span>
           {resume && (
             <Button size="sm" variant="secondary" onClick={() => send({ type: "restart" })}>
               <RotateCcw /> Restart
@@ -637,7 +670,7 @@ function Dock({
       ) : null}
       <PausedLine store={store} send={send} onLogin={() => onView("login")} />
       <AskedLine store={store} />
-      <Composer store={store} agent={id} attachments={attachments} toMain={toMain} task={task} onView={onView} onTerminal={onTerminal} replyTo={reply} onClearReply={onClearReply} />
+      <Composer store={store} agent={id} attachments={attachments} toMain={toMain} task={task} turn={turn} onView={onView} onTerminal={onTerminal} replyTo={reply} onClearReply={onClearReply} />
     </div>
   );
 }
@@ -663,10 +696,12 @@ function PhoneTabs({ store, tab, onTab }: { store: SessionStore; tab: PhoneTab; 
   const fileCount = React.useMemo(() => (changes ? changes.length : changesetOf(edits).length), [changes, edits]);
   const todos = useSession(store, (s) => s.state?.todos ?? NO_TODOS);
   const todosDone = todos.filter((t) => t.status === "completed").length;
-  const tabs: { id: PhoneTab; label: string; n?: string; warn?: boolean }[] = [
+  // A plan waiting on your review: its tab says so (review.tsx).
+  const reviewing = useReviewWaits(store);
+  const tabs: { id: PhoneTab; label: string; n?: string; warn?: boolean; waits?: boolean }[] = [
     { id: "work", label: "Work", n: approvals ? String(approvals) : undefined, warn: approvals > 0 },
     { id: "changes", label: "Changes", n: fileCount ? String(fileCount) : undefined },
-    { id: "plan", label: "Plan", n: todos.length ? `${todosDone}/${todos.length}` : undefined },
+    { id: "plan", label: "Plan", n: todos.length ? `${todosDone}/${todos.length}` : undefined, waits: reviewing !== null },
     { id: "tools", label: "Tools" },
   ];
   return (
@@ -679,6 +714,7 @@ function PhoneTabs({ store, tab, onTab }: { store: SessionStore; tab: PhoneTab; 
               {t.n}
             </span>
           )}
+          {t.waits && <i className="pr-tab-dot" role="img" aria-label="a plan waits on your review" />}
         </button>
       ))}
     </div>

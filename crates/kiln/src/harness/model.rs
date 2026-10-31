@@ -264,6 +264,29 @@ pub struct FileChange {
     pub at: i64,
 }
 
+impl FileChange {
+    /// Which file of its changeset it is: what a changeset's patch names it by.
+    pub fn key(&self) -> FileKey {
+        FileKey { path: self.path.clone(), tree: self.tree.clone() }
+    }
+
+    /// The change with its diff left out, its counts kept: too large to send as it is.
+    pub fn counts_only(&self) -> Self {
+        Self { hunks: Vec::new(), truncated: true, ..self.clone() }
+    }
+}
+
+/// A file of a changeset, as its [`FileChange`] names it: its path, and the top of its working
+/// tree when it's in one. A changeset's patch says a file is gone from it by this.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+pub struct FileKey {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub tree: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Todo {
@@ -1499,12 +1522,17 @@ pub struct ExitInfo {
     /// or a restart is never another stop.
     #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub at: i64,
+    /// Unix ms kiln starts it again by itself: its process ended without anyone ending the agent
+    /// (docs/agents.md, "An agent lives until it's ended").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub again_at: Option<i64>,
 }
 
 impl ExitInfo {
     /// It ended now, with `code` and `error`.
     pub fn now(code: Option<i32>, error: Option<String>) -> Self {
-        Self { code, error, at: crate::util::now_ms() }
+        Self { code, error, at: crate::util::now_ms(), again_at: None }
     }
 }
 

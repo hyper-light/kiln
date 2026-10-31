@@ -425,6 +425,7 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/experiments", "runs.read", At::Anywhere),
     r("GET", "/api/experiments/*", "runs.read", At::Anywhere),
     r("POST", "/api/experiments", "experiments.run", At::Anywhere),
+    r("POST", "/api/experiments/suggest", "experiments.run", At::Anywhere),
     r("POST", "/api/experiments/*/*", "experiments.run", At::Anywhere),
     // Lists narrowed row by row to the repositories the caller may read (W10).
     r("GET", "/api/runs", "runs.read", At::Anywhere),
@@ -587,6 +588,8 @@ pub static ROUTES: &[Rule] = &[
     // registrations are their management.
     r("GET", "/api/deploy/**", "runs.read", At::Server),
     r("GET", "/api/ship/**", "runs.read", At::Anywhere),
+    // A row's Hand off: the handler checks `runs.rerun` on the repository its body names (W26-R18).
+    r("POST", "/api/ship/hand-off", "runs.rerun", At::Anywhere),
     // Releases are a deployer's in their environment, or an owner team's where it lets owners.
     r("POST", "/api/deploy/releases", "environments.deploy", At::Deploy),
     r("POST", "/api/deploy/fleets", "environments.deploy", At::Anywhere),
@@ -615,6 +618,8 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/runners/*/front-door", "runners.read", At::Runner(2)),
     // How many agent sessions it runs at once: read with the runner, set by those who manage it.
     r("GET", "/api/runners/*/agent-limit", "runners.read", At::Runner(2)),
+    r("GET", "/api/headroom", "runners.read", At::Server),
+    r("GET", "/api/runners/*/headroom", "runners.read", At::Runner(2)),
     any("/api/runners/*/**", "runners.manage", At::Runner(2)),
     r("GET", "/api/agents/*/diagnose", "runners.read", At::Runner(2)),
     r("POST", "/api/agents/*/repair", "runners.manage", At::Runner(2)),
@@ -724,7 +729,7 @@ pub fn openapi(version: &str, ops: &[crate::ops::Info]) -> serde_json::Value {
                 "summary": o.summary,
                 "x-kiln-read-only": o.read_only,
                 "x-kiln-destructive": o.destructive,
-                "requestBody": { "required": false, "content": { "application/json": { "schema": (o.input)() } } },
+                "requestBody": { "required": false, "content": { "application/json": { "schema": o.input.schema() } } },
                 "security": [{ "bearer": [] }, { "session": [] }],
                 "responses": { "200": { "description": "its answer" }, "400": { "description": "the input isn't right" }, "403": { "description": "its route's capability is missing in that scope" }, "404": { "description": "no such operation, or what it names" } },
             } }),

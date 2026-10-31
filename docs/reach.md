@@ -135,6 +135,16 @@ is pinged; at 45 s it is replaced.
 Nothing on the runner waits on reach (its input is unbounded, bounded in practice by the windows),
 and reach never waits on the runner: output to the server is batched, many messages per frame.
 
+A message either side can't read (a kind its build doesn't know, or bytes that aren't one) is
+answered in the link with what it was, a code and why (`Say::Unread`, `Ask::Unread`, appended last),
+and the link ends; a runner from before ends it on that as it would on any garbage, and its session
+goes on on a new link. The runner that couldn't read it tells the server (`AgentMsg::LinkUnread`, to
+one that says `CAP_UNREAD`), which notes it against the runner that sent it, checking the link's ends
+against its relay's (docs/wire.md, "What can't be read"). What the relay refuses it says with a code
+too (`ServerMsg::ReachRefused`): a link id taken, a link to itself, too many links, a runner that
+doesn't take links or doesn't accept them, one not connected, a link closed. A frame from a runner
+that isn't one of a link's ends, or from a job's pod, goes nowhere, and is noted.
+
 ### 4.2 Runs
 
 Shell text, run by `bash -c` (`sh` where there is none; on Windows, Git for Windows' bash, found on
@@ -279,9 +289,17 @@ over the runner's own connection (`AgentMsg::ReachAsk`), answered with `Ev::Answ
 kiln gives every agent it starts on a runner its own MCP server, `kiln` (`kiln reach mcp`, run by
 the runner's kiln): Claude Code through `--mcp-config` (with kiln's skills through `--plugin-dir`),
 Codex through `-c mcp_servers.kiln.*` (with a tool timeout as long as a program may run, where Codex
-otherwise gives up after 60 s), and ACP agents (Gemini CLI, opencode, Goose, Amp) through their
-session's `mcpServers`. Antigravity's headless mode takes no MCP servers; its agents use `kiln run`
-from their shell. Its instructions name the kiln's machines (asked of the runner when the server
+otherwise gives up after 60 s), ACP agents (Gemini CLI, opencode, Goose, Amp) through their
+session's `mcpServers`, and Antigravity through its own config (`~/.gemini/config/mcp_config.json`,
+the only place agy reads MCP servers from). There kiln puts its server as a session starts, unless
+it's there already or a person turned it off (`agy mcp disable kiln`), and starts agy with the
+session's identity in its environment, which agy hands on to the servers it starts. A person
+running agy outside kiln has it too, without a session: its machines' tools work, and what needs
+kiln says so. agy can't ask once started, so kiln also allows its page tools there
+(`mcp(kiln/show_page)` and `mcp(kiln/preview_page)` in `~/.gemini/antigravity-cli/settings.json`'s
+`permissions.allow`), unless a person's own rule covers them (an `ask` or `deny` rule for one,
+`mcp(kiln/*)` or `mcp(*)`), which then decides; agy decides on kiln's other tools itself.
+Its instructions name the kiln's machines (asked of the runner when the server
 starts), tell the agent who it is (its id in kiln) and how its goal stack and plans work, and tell
 the model when reach helps. When a step has to happen on another machine, such as
 the person's Mac, the agent runs it there itself rather than handing the person a command to type.
@@ -302,6 +320,10 @@ on its own machine, with its own tools. Its tools:
 | `goals_*` | its goal stack (docs/goals.md): without `agent`, its own |
 | `research_*`, `conversations_search` | research it records, each finding graded by kiln from its sources (docs/research.md), and every agent's conversations kiln keeps |
 | `plans_*` | plans kept, run (on itself without `session` or `new`; one agent per step, in its harness, on its machine and in its folder unless it says otherwise) and followed (docs/plans.md); a plan's versions and deleting one are code mode's |
+
+Each of its own tools (and each `kiln.machines.*` operation below) reads its arguments as a type
+(`reach::mcp::input`), its `inputSchema` made from it. A call that doesn't fit is a tool error
+saying where and why, and the server hears of it (docs/wire.md, `mcp_reach`).
 
 The `agents_*`, `goals_*`, `research_*` and `plans_*` tools are the ones the kiln server says agents
 have (its answer for the operations names them), each as the server describes it, so a server

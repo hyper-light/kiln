@@ -221,18 +221,39 @@ export function pickCard(cards: readonly { state: string }[]): number {
 /** A deployment's state as a glyph's (W26-R14's lanes). */
 const DEPLOY_GLYPH: Record<string, string> = { success: "passed", failure: "failed", error: "failed", inactive: "superseded", in_progress: "running", pending: "queued", queued: "queued" };
 
+/** A job's states counted done in its stage's "n/m" (f-ship's). */
+const DONE_JOB = new Set(["passed", "reused", "flaky", "replanted"]);
+/** Staging's soak as the staging pip has it. */
+const SOAK: Record<string, string> = { soaking: "soaking", healthy: "passed", passed: "passed", rode: "rode", superseded: "superseded" };
+/** Production's guard as the production pip has it: watching, held, or what came instead. */
+const GUARD: Record<string, string> = { guard: "guard", healthy: "passed", passed: "passed", rode: "rode", rolledback: "rolledback" };
+/** How long kiln's guard watches production after a deploy (ship.rs's GUARD_MS). */
+const GUARD_S = 600;
+
 /**
- * Ship's stages as the Lanes' groups (W26-R14), in the journey's order after Review: each its pip's
- * state, and every job its lane from the start (opened commit's step 2): each Checks leg, each
- * platform the build makes and its image, each runner replanted, a bar once it has times; and each
- * deploy at its time.
+ * Ship's stages as f-ship's job cards and the Lanes' groups (plan 01a1856fe81375b1bd1d1d86f270a45b,
+ * step 8; W26-R14), in the journey's order after Review: each its pip's state, the word its card's
+ * head says (how many of its jobs are done, or how it stands), and every job it has listed from the
+ * start, so nothing grows as they begin: the land queue; each Checks leg as "pipeline · leg", with
+ * the job Output shows once it has run; each platform the build makes and its image; staging's sync
+ * and soak; production's approval, deploy and guard; the server and each runner replanted.
  */
 export function shipGroups(detail: ShipDetail): ShipLaneGroup[] {
   const pip = (stage: Stage) => detail.pips.find((p) => p.stage === stage)?.state ?? "none";
   const glyph = (state: string) => (state in GLYPHS ? state : "none");
+  const word = (stage: Stage) => GLYPHS[glyphOf(pip(stage))].word;
+  const done = (lanes: ShipLane[]) => `${lanes.filter((l) => DONE_JOB.has(l.state)).length}/${lanes.length}`;
   // Keyed by the leg, not its job: a leg tried again keeps its lane (opened commit's step 3).
   const legs: ShipLane[] = (detail.checks ?? []).flatMap((c) =>
-    c.legs.map((l) => ({ id: `${c.pipeline}/${l.name}`, name: l.name, state: l.state, start: l.start ?? null, end: l.end ?? null, ...(l.note ? { note: l.note } : {}) })),
+    c.legs.map((l) => ({
+      id: `${c.pipeline}/${l.name}`,
+      name: `${c.pipeline} · ${l.name}`,
+      state: l.state,
+      start: l.start ?? null,
+      end: l.end ?? null,
+      ...(l.note ? { note: l.note } : {}),
+      ...(l.job ? { job: l.job } : {}),
+    })),
   );
   const built = detail.build;
   const build: ShipLane[] = built
@@ -241,13 +262,45 @@ export function shipGroups(detail: ShipDetail): ShipLaneGroup[] {
         { id: "image", name: "image", state: glyph(built.image.state), start: null, end: null },
       ]
     : [];
-  const replant: ShipLane[] = (detail.replant ?? []).map((r) => ({ id: `runner/${r.name}`, name: r.name, state: replantGlyph(r.state), start: null, end: null, ...(r.why ? { note: r.why } : {}) }));
-  const deploys = (production: boolean): ShipLane[] =>
-    (detail.deployments ?? [])
-      .filter((d) => d.production === production)
-      .map((d) => ({ id: `${d.environment}@${d.at}`, name: d.environment, state: DEPLOY_GLYPH[d.state ?? ""] ?? "none", start: d.at, end: d.at, ...(d.description ? { note: d.description } : {}) }));
-  const group = (stage: Stage, lanes: ShipLane[]): ShipLaneGroup => ({ group: stage, label: STAGE_WORD[stage], state: pip(stage), note: "", lanes });
-  return [group("land", []), group("checks", legs), group("build", build), group("staging", deploys(false)), group("production", deploys(true)), group("replant", replant)];
+  // An environment's newest deploy of this commit, and a lane for it (not yet without one).
+  const newest = (production: boolean) =>
+    (detail.deployments ?? []).filter((d) => d.production === production).reduce<NonNullable<ShipDetail["deployments"]>[number] | null>((a, d) => (a && a.at > d.at ? a : d), null);
+  const deployed = (id: string, name: string, d: ReturnType<typeof newest>): ShipLane => ({
+    id,
+    name,
+    state: d ? (DEPLOY_GLYPH[d.state ?? ""] ?? "none") : "none",
+    start: d?.at ?? null,
+    end: d?.at ?? null,
+    ...(d?.description ? { note: d.description } : {}),
+  });
+  const st = newest(false);
+  const soak = SOAK[pip("staging")] ?? "none";
+  const staging: ShipLane[] = [deployed("staging/sync", "sync", st), { id: "staging/soak", name: "soak", state: soak, start: soak !== "none" ? (st?.at ?? null) : null, end: null }];
+  const pr = newest(true);
+  const prod = pip("production");
+  const guard = GUARD[prod] ?? "none";
+  const released = (detail.releases ?? []).slice(-1)[0];
+  // A commit that rode with another's deploy had none of its own: each of its three says so.
+  const production: ShipLane[] =
+    prod === "rode"
+      ? ["approval", "deploy", "guard"].map((n) => ({ id: `production/${n}`, name: n, state: "rode", start: null, end: null }))
+      : [
+          { id: "production/approval", name: "approval", state: prod === "needs" ? "needs" : released && released.state !== "waiting" ? "passed" : "none", start: null, end: null },
+          deployed("production/deploy", "deploy", pr),
+          { id: "production/guard", name: "guard", state: guard, start: pr && guard !== "none" ? pr.at : null, end: pr && guard !== "none" && guard !== "guard" ? pr.at + GUARD_S : null },
+        ];
+  const runners: ShipLane[] = (detail.replant ?? []).map((r) => ({ id: `runner/${r.name}`, name: r.name, state: replantGlyph(r.state), start: null, end: null, ...(r.why ? { note: r.why } : {}) }));
+  // The server restarts into the build production runs before its runners replant onto it.
+  const replant: ShipLane[] = runners.length ? [{ id: "replant/server", name: "server", state: "replanted", start: null, end: null }, ...runners] : [];
+  const group = (stage: Stage, lanes: ShipLane[], note: string): ShipLaneGroup => ({ group: stage, label: STAGE_WORD[stage], state: pip(stage), note, lanes });
+  return [
+    group("land", [{ id: "land", name: "land queue", state: glyph(pip("land")), start: null, end: null }], word("land")),
+    group("checks", legs, legs.length ? done(legs) : word("checks")),
+    group("build", build, build.length ? done(build) : word("build")),
+    group("staging", staging, word("staging")),
+    group("production", production, word("production")),
+    group("replant", replant, runners.length ? done(runners) : word("replant")),
+  ];
 }
 
 /** What failed in a commit, each with its stage, its words and where its log is (the commit page's Errors, its step 2). */

@@ -20,7 +20,9 @@ import type { DiscoveredInstance, DiscoveryInfo, DiscoveryMethod, DiscoveryProbl
 import { defaultRunner } from "./defaults.ts";
 import { AUTHORS, REPOS, commitMessage, hashStr, mockDirList, mulberry32, pick, pipelineFor, sha, stepLog, type JobTpl, type LogPlan, type Toolchain } from "./data.ts";
 import { handleAccounts, handleDemoSession, setDemoEmit } from "./accounts.ts";
-import { handleFamily, handleFamilySession, setFamilyEmit } from "./agents.ts";
+import { handleFamily, handleFamilySession, refuseAgent, setFamilyEmit } from "./agents.ts";
+import { handlePlanReview, handleReviewSession, reviewInfos, setReviewEmit } from "./plan-review.ts";
+import { ahead, note, runnerRefused } from "./refused.ts";
 import { handleGoals } from "./goals.ts";
 import { handlePrograms } from "./programs.ts";
 import { handlePages } from "./pages.ts";
@@ -28,6 +30,7 @@ import { handleSettings } from "./settings.ts";
 import { handleMachines } from "./machines.ts";
 import { handleKeep } from "./keep.ts";
 import { handleReap } from "./reap.ts";
+import { handleExperiments } from "./experiments.ts";
 import { handlePlaces } from "./places.ts";
 import { handleLongFiles, handleLongSession, handleShownPages, longInfo, searchSaid, sendAway, setLongEmit } from "./conversation.ts";
 import { fastInfos, handleFastSession } from "./fast.ts";
@@ -94,6 +97,8 @@ interface SimJob {
 }
 interface LogStream {
   data: string;
+  /** When each piece arrived: its byte offset and unix ms (kiln's `<step>.times`). */
+  times: [number, number][];
   done: boolean;
   subs: Set<WebSocket>;
 }
@@ -108,6 +113,14 @@ function liveJob() {
   const all = [...jobsById.values()];
   const sj = all.find((j) => j.job.status === "running") ?? all[0];
   return sj ? { run: sj.job.run_id, job: sj.job.id, name: sj.job.display || sj.job.key, state: sj.job.status } : null;
+}
+/** The run of Ship's live job, each of its jobs (ship.ts: a commit's Checks, each leg its own job,
+ * as production's v1 runs have them; plan 01a1856fe81375b1bd1d1d86f270a45b, step 8). */
+function liveRun() {
+  const live = liveJob();
+  if (!live) return null;
+  const jobs = (jobsByRun.get(live.run) ?? []).map((s) => ({ job: s.job.id, name: s.job.display || s.job.key, status: s.job.status, start: s.job.started_at, end: s.job.finished_at, error: s.job.error }));
+  return { run: live.run, jobs };
 }
 const logs = new Map<string, LogStream>();
 const agents = new Map<string, Agent>();
@@ -233,6 +246,9 @@ addAgent({ name: "metal-epyc-01", labels: ["baremetal", "bench", "gpu", "linux",
 addAgent({ name: "metal-mac-mini", labels: ["baremetal", "macos", "arm64"], slots: 2, hostname: "mac-mini.lan", os: "macos", arch: "aarch64", version: VERSION, ephemeral: false, connected: true, last_seen: t, enrolled_at: t - 86400 * 9 }, newHost(10, 32, 1000));
 addAgent({ name: "metal-pi-04", labels: ["baremetal", "arm64", "linux"], slots: 1, hostname: "pi-04.lan", os: "linux", arch: "aarch64", version: "0.0.9", ephemeral: false, connected: true, last_seen: t, enrolled_at: t - 86400 * 60, draining: true }, newHost(4, 8, 120));
 addAgent({ name: "metal-nuc-old", labels: ["baremetal", "linux", "x86_64"], slots: 2, hostname: "nuc.lan", os: "linux", arch: "x86_64", version: "0.0.8", ephemeral: false, connected: false, last_seen: t - 86400 * 2 - 3600, enrolled_at: t - 86400 * 120 }, newHost(8, 16, 500));
+// What kiln couldn't read of metal-ryzen-01, of the server's to it and of reach's, kept for its page (refused.ts).
+const refusing = agents.get("metal-ryzen-01");
+if (refusing) refusing.refused = runnerRefused();
 
 /* ------------------------------------------------------------------ */
 /* Repos & runs                                                        */
@@ -487,6 +503,7 @@ function emit(ev: ServerEvent) {
 setLongEmit((ev) => emit(ev as ServerEvent));
 setDemoEmit((ev) => emit(ev as ServerEvent));
 setFamilyEmit((ev) => emit(ev as ServerEvent));
+setReviewEmit((ev) => emit(ev as ServerEvent));
 
 function queueCounts() {
   let queued = 0;
@@ -545,14 +562,31 @@ function getStream(sj: SimJob, idx: number): LogStream {
   if (!s) {
     const step = sj.steps[idx];
     const done = !step || !["running", "pending", "queued"].includes(step.status);
-    s = { data: step && done ? completedLog(sj, step) : "", done, subs: new Set() };
+    const data = step && done ? completedLog(sj, step) : "";
+    s = { data, times: step && data ? spread(data, step) : [], done, subs: new Set() };
     logs.set(k, s);
   }
   return s;
 }
 
+/** A finished step's log made at once: its lines' times spread across the step's run, as kiln would have noted them. */
+function spread(data: string, step: SimStep): [number, number][] {
+  const from = (step.started_at ?? now()) * 1000;
+  const to = Math.max(from, (step.finished_at ?? step.started_at ?? now()) * 1000);
+  const starts: number[] = [0];
+  let at = 0;
+  for (const line of data.split("\n").slice(0, -1)) {
+    at += Buffer.byteLength(line, "utf8") + 1;
+    if (at < Buffer.byteLength(data, "utf8")) starts.push(at);
+  }
+  return starts.map((o, i) => [o, Math.round(from + ((to - from) * i) / Math.max(1, starts.length - 1))]);
+}
+
 function appendLog(sj: SimJob, idx: number, text: string) {
+  // Nothing to add, nothing to note (kiln notes only pieces that hold bytes).
+  if (!text) return;
   const s = getStream(sj, idx);
+  s.times.push([Buffer.byteLength(s.data, "utf8"), Date.now()]);
   s.data += text;
   const buf = Buffer.from(text, "utf8");
   for (const ws of s.subs) if (ws.readyState === WebSocket.OPEN) ws.send(buf, { binary: true });
@@ -1431,6 +1465,19 @@ const server = http.createServer(async (req, res) => {
       quiet = (await body<{ on?: boolean }>(req)).on ?? true;
       return json(res, 200, { quiet });
     }
+    // The browser checks note a message kiln couldn't read, `what` it was: a runner's frame
+    // (`?runner=`), or its runner's update of an agent (`?agent=`). Its page is told, as kiln's are.
+    if (p === "/api/mock/refuse" && m === "POST") {
+      const what = url.searchParams.get("what") ?? "variant 53";
+      const a = agents.get(url.searchParams.get("runner") ?? "");
+      if (a) {
+        a.refused = note(a.refused, ahead(a.name, what), Date.now());
+        emit({ type: "agent", agent: a });
+        return json(res, 200, a.refused);
+      }
+      const refused = refuseAgent(url.searchParams.get("agent") ?? "", what);
+      return refused ? json(res, 200, refused) : err(res, 404, "no such runner or agent");
+    }
     // ---- files the long session's messages mention ----
     if (handleLongFiles(p, url, req, res)) return;
     // ---- live pages a person opens (the Tools tab): what its machine serves; no streams here ----
@@ -1452,18 +1499,22 @@ const server = http.createServer(async (req, res) => {
     const opened = /^\/api\/harness\/sessions\/([^/]+)\/opened$/.exec(p);
     if (opened && m === "GET") return json(res, 200, []);
     if (opened && m === "POST") return err(res, 409, "opening an app on your device needs pages' own site: set [server] pages_url (docs/previews.md)");
+    // ---- plans waiting on a person's review (their stacks, plans and research first) ----
+    if (await handlePlanReview(req, res, url)) return;
     // ---- goal stacks ----
     if (await handleGoals(req, res, url)) return;
     if (await handlePrograms(req, res, url)) return;
     // ---- agents that run agents ----
-    if (await handleShip(req, res, url, { json, liveJob, push: () => void startRun(repos.find((r) => r.name === "hyper-light/kiln") ?? repos[0]!, { branch: "main", event: "push" }) })) return;
-    if (await handleFamily(req, res, url, () => [longInfo(), ...fastInfos()])) return;
+    if (await handleShip(req, res, url, { json, liveJob, liveRun, push: () => void startRun(repos.find((r) => r.name === "hyper-light/kiln") ?? repos[0]!, { branch: "main", event: "push" }) })) return;
+    if (await handleFamily(req, res, url, () => [longInfo(), ...fastInfos(), ...reviewInfos()])) return;
     // ---- harness accounts (and the demo agents to see them from) ----
     if (await handleMachines(req, res, url, { json, body })) return;
     // ---- copies runners keep of other runners' trees (docs/reach.md §5.1) ----
     if (await handleKeep(req, res, url, { json, body })) return;
     // ---- the reaper's policies (W24-R31) ----
     if (await handleReap(req, res, url, { json, body })) return;
+    // ---- experiments from an agent's question (docs/ci.md W20-R11) ----
+    if (await handleExperiments(req, res, url, { json, body })) return;
     if (await handleAccounts(req, res, url)) return;
     if (p === "/api/overview") return json(res, 200, overview());
 
@@ -1607,6 +1658,14 @@ const server = http.createServer(async (req, res) => {
       if (!sj.steps[idx]) return err(res, 404, "no such step");
       res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
       return void res.end(getStream(sj, idx).data);
+    }
+    if ((mm = p.match(/^\/api\/jobs\/([^/]+)\/logs\/times$/)) && m === "GET") {
+      const sj = jobsById.get(decodeURIComponent(mm[1]!));
+      if (!sj) return err(res, 404, "no such job");
+      const idx = Number(url.searchParams.get("step") ?? 0);
+      if (!sj.steps[idx]) return err(res, 404, "no such step");
+      const s = getStream(sj, idx);
+      return json(res, 200, { times: s.times, size: Buffer.byteLength(s.data, "utf8") });
     }
     if ((mm = p.match(/^\/api\/jobs\/([^/]+)\/tools$/)) && m === "GET") {
       const sj = jobsById.get(decodeURIComponent(mm[1]!));
@@ -1854,6 +1913,7 @@ server.on("upgrade", (req, socket, head) => {
     if (
       hm &&
       (handleDemoSession(ws, decodeURIComponent(hm[1]!)) ||
+        handleReviewSession(ws, decodeURIComponent(hm[1]!)) ||
         handleFamilySession(ws, decodeURIComponent(hm[1]!)) ||
         handleFastSession(ws, decodeURIComponent(hm[1]!), url.searchParams.get("patch") === "state") ||
         handleLongSession(ws, decodeURIComponent(hm[1]!), url.searchParams.get("z") === "gzip", url.searchParams.get("patch") === "state"))

@@ -76,9 +76,11 @@ const diffs: MockDiff[] = [
     title: "pipeline: dynamic matrices",
     summary:
       "A matrix may come from a job's output (`fromJSON(needs.plan.outputs.legs)`).\n\n- `expand` moves to its own module, as include and exclude are coming.\n- Plans say which legs a matrix made, and why one was left out.",
-    author: "user:sam",
-    author_kind: "user",
-    author_for: null,
+    // An agent's change for sam, as Ship's row has it (mock/ship.ts): what's in it can be asked about,
+    // the mock's long agent answering (mock/agents.ts's agents.about).
+    author: "agent:demo-long",
+    author_kind: "agent",
+    author_for: "user:sam",
     state: "needs-review",
     trunk: "main",
     stack: "s1",

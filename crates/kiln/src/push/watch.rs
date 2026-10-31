@@ -38,6 +38,10 @@ pub fn stand_of(i: &Info) -> Stand {
     if !i.approvals.is_empty() || i.status == Status::Waiting {
         return Stand::Needs;
     }
+    // Its process ended while nobody ended it: kiln starts it again by itself.
+    if i.status == Status::Exited && i.exit.as_ref().is_some_and(|e| e.again_at.is_some()) {
+        return Stand::Working;
+    }
     if i.status == Status::Exited && i.exit.as_ref().is_some_and(|e| e.error.is_some()) {
         return Stand::Stopped;
     }

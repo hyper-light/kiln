@@ -165,6 +165,36 @@ await test("cached resources do not process live events while nothing shows them
   } finally { events.stop(); }
 });
 
+await test("what of its messages was refused comes with its events, on the socket it has: no new snapshot, no reload", async () => {
+  const { events } = await import("../src/api/events.ts");
+  const store = new SessionStore("refused");
+  const off = store.subscribe(() => {});
+  const ws = Socket.all.at(-1)!;
+  events.start();
+  const feed = Socket.all.at(-1)!;
+  const refused = (n: number) => ({
+    counts: [{ wire: "runner_payload", code: "unknown", n }],
+    newest: [{ at: 1, unread: { wire: "runner_payload", from: { runner: { name: "box", instance: "main" } }, what: "update kind teleport", code: "unknown", why: "no such update" } }],
+  });
+  try {
+    for (const frame of snapshot("refused", [event(1)])) ws.frame(frame);
+    await tick();
+    assert.equal(store.get().info?.refused, undefined);
+    feed.frame({ type: "harness", info: { id: "refused", status: "running", refused: refused(1) } });
+    assert.deepEqual(store.get().info?.refused, refused(1));
+    // Another agent's says nothing of this one's.
+    feed.frame({ type: "harness", info: { id: "other", status: "running", refused: refused(5) } });
+    assert.deepEqual(store.get().info?.refused, refused(1));
+    feed.frame({ type: "harness", info: { id: "refused", status: "running", refused: refused(2) } });
+    assert.equal(store.get().info?.refused?.counts[0]?.n, 2);
+    assert.equal(store.get().info?.status, "running", "the rest of what it shows stays");
+    assert.equal(Socket.all.at(-1), feed, "the session's socket stays: nothing is read again");
+  } finally {
+    off();
+    events.stop();
+  }
+});
+
 await test("a message's id is a UUIDv7 made once: 32 hex digits, its time first, and never another's (CP-T3.2)", async () => {
   const { clientId } = await import("../src/api/harness.ts");
   const ids = Array.from({ length: 10_000 }, () => clientId());
@@ -173,4 +203,23 @@ await test("a message's id is a UUIDv7 made once: 32 hex digits, its time first,
   const ms = Number.parseInt(ids[0]!.slice(0, 12), 16);
   assert.ok(Math.abs(ms - Date.now()) < 60_000, `its time: ${ms}`);
   assert.ok(ids.every((id, i) => i === 0 || id.slice(0, 12) >= ids[i - 1]!.slice(0, 12)), "made later, sorted later");
+});
+
+await test("a changeset comes whole, then as what changed in it, taken in place in the server's order", async () => {
+  const file = (path: string, added: number, tree?: string) => ({ path, ...(tree ? { tree } : {}), added, removed: 0, hunks: [], at: 1 });
+  const store = new SessionStore("changes");
+  const off = store.subscribe(() => {});
+  const ws = Socket.all.at(-1)!;
+  try {
+    assert.match(ws.url, /patch=changes/, "the socket asks for changesets as patches");
+    for (const frame of snapshot("changes", [])) ws.frame(frame);
+    ws.frame({ t: "changes", files: [file("a.rs", 1), file("b.rs", 1), file("a.rs", 1, "/w")] });
+    await tick();
+    const kept = store.get().changes?.[0];
+    // The file the agent touched in place, the one it put back gone, a new one after the rest.
+    ws.frame({ t: "changes_patch", set: [file("a.rs", 7, "/w"), file("c.rs", 2)], gone: [{ path: "b.rs" }] });
+    await tick();
+    assert.deepEqual(store.get().changes, [file("a.rs", 1), file("a.rs", 7, "/w"), file("c.rs", 2)]);
+    assert.equal(store.get().changes?.[0], kept, "a file that didn't change stays the same object");
+  } finally { off(); }
 });

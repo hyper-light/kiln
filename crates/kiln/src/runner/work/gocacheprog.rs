@@ -346,9 +346,19 @@ mod tests {
             let endpoint = Endpoint::Tcp { addr: at.to_string(), prefix: String::new() };
             let action = [7u8; 32];
             let body = b"package object bytes".to_vec();
+            // The get first, on its own: the server answers a batch's requests at once, in any
+            // order (cmd/go matches them by ID), so beside a put of its action it could find it.
+            let (r0, ep0, tk0) = (root.clone(), endpoint.clone(), token.clone());
+            let miss = on_thread(move || -> anyhow::Result<Vec<Value>> {
+                let out = Shared::default();
+                super::serve(std::io::Cursor::new([request(1, "get", &action, None), request(2, "close", &[], None)].concat()), out.clone(), Helper::new(r0.join("disk1"), Some((ep0, tk0)))?)?;
+                responses(&out)
+            })
+            .await??;
+            anyhow::ensure!(by_id(&miss, 1).get("Miss") == Some(&json!(true)), "{miss:?}");
             let (r1, ep, tk, b1) = (root.clone(), endpoint.clone(), token.clone(), body.clone());
             let first = on_thread(move || -> anyhow::Result<Vec<Value>> {
-                let input = [request(1, "get", &action, None), request(2, "put", &action, Some(&b1)), request(3, "put", &[8u8; 32], Some(b"")), request(4, "put", &[9u8; 32], Some(b"x")), request(5, "close", &[], None)].concat();
+                let input = [request(2, "put", &action, Some(&b1)), request(3, "put", &[8u8; 32], Some(b"")), request(4, "put", &[9u8; 32], Some(b"x")), request(5, "close", &[], None)].concat();
                 // A put whose body isn't its OutputID is refused.
                 let input = input.replace(&format!("\"{}\"", B64.encode(b"x")), &format!("\"{}\"", B64.encode(b"y")));
                 let out = Shared::default();
@@ -357,7 +367,6 @@ mod tests {
             })
             .await??;
             anyhow::ensure!(first.first() == Some(&json!({ "ID": 0, "KnownCommands": ["get", "put", "close"] })), "{first:?}");
-            anyhow::ensure!(by_id(&first, 1).get("Miss") == Some(&json!(true)), "{first:?}");
             let put = by_id(&first, 2);
             let disk = put.get("DiskPath").and_then(Value::as_str).unwrap_or_default().to_owned();
             anyhow::ensure!(std::fs::read(&disk)? == body, "{put}");

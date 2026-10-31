@@ -52,6 +52,9 @@ pub const NOT_INHERITED: &[&str] = &[
     "KILN_INSTANCE",
     "KILN_LOG",
     "KILN_CHAOS",
+    // A gate's own git config (ci/gate.sh sets it): it overrides the HOME a test's kiln is given,
+    // and actions/checkout edits a .gitconfig in the HOME it sets for git, which it then misses.
+    "GIT_CONFIG_GLOBAL",
 ];
 
 /// This build's `kiln`, as a test starts it: with none of [`NOT_INHERITED`] (what the test sets
@@ -887,6 +890,8 @@ pub fn dechunk(mut s: &str) -> String {
 pub struct Server {
     child: Child,
     pub port: u16,
+    /// Its QUIC port, where its runners connect.
+    pub quic: u16,
     pub admin: String,
     dir: std::path::PathBuf,
     /// Its environment beyond the test's, kept for a restart.
@@ -982,7 +987,7 @@ fn sweep(work: &Path) {
 pub struct Options<'a> {
     /// Its own runner (labels `local`), working under `<dir>/work`.
     pub agent: bool,
-    /// More of `[ci]`.
+    /// More of `[ci]` (`enabled = false`: its engine off).
     pub ci: &'a str,
     /// More sections: `[[repos]]`, ….
     pub extra: &'a str,
@@ -1092,7 +1097,6 @@ tailscale = false
 
 {cd}
 [ci]
-enabled = true
 {ci}
 
 {extra}
@@ -1101,7 +1105,8 @@ enabled = true
         work = toml_path(&work),
         scheme = if https { "https" } else { "http" },
         agent = o.agent,
-        ci = o.ci,
+        // The engine on, unless the test turns it off (`enabled = false`).
+        ci = if o.ci.contains("enabled = false") { o.ci.to_owned() } else { format!("enabled = true\n{}", o.ci) },
         extra = extra,
         // CD stays off unless the test asks for it (`start_cd`) or has a `[cd]` of its own.
         cd = if o.extra.contains("[cd]") {
@@ -1122,7 +1127,7 @@ enabled = true
     let mut cmd = server_command(dir, log)?;
     cmd.envs(env.iter().copied());
     let child = cmd.spawn()?;
-    let mut server = Server { child, port, admin: String::new(), dir: dir.to_path_buf(), env: env.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect(), leave: false };
+    let mut server = Server { child, port, quic, admin: String::new(), dir: dir.to_path_buf(), env: env.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect(), leave: false };
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         if let Some(status) = server.child.try_wait()? {
@@ -1150,6 +1155,43 @@ enabled = true
         anyhow::ensure!(Instant::now() < deadline, "the server didn't start");
         std::thread::sleep(Duration::from_millis(200));
     }
+}
+
+/// A series' value in the server's metrics (0 when it has none).
+pub fn metric(port: u16, admin: &str, series: &str) -> u64 {
+    let (_, text) = http(port, "GET", "/metrics", admin, None).unwrap_or_default();
+    text.lines().find_map(|l| l.strip_prefix(series).and_then(|v| v.trim().parse::<f64>().ok())).map_or(0, |v| v as u64)
+}
+
+/// `kiln_wire_refused_total` of `wire` and `code` (docs/wire.md, "What can't be read").
+pub fn refused(port: u16, admin: &str, wire: &str, code: &str) -> u64 {
+    metric(port, admin, &format!("kiln_wire_refused_total{{wire=\"{wire}\",code=\"{code}\"}}"))
+}
+
+/// Runner `name`'s record (`GET /api/agents`).
+pub fn record(port: u16, admin: &str, name: &str) -> Value {
+    let (_, body) = http(port, "GET", "/api/agents", admin, None).unwrap_or_default();
+    let v: Value = serde_json::from_str(&body).unwrap_or_default();
+    let list = v.as_array().cloned().or_else(|| v.get("agents").and_then(Value::as_array).cloned()).unwrap_or_default();
+    list.into_iter().find(|a| a.get("name").and_then(Value::as_str) == Some(name)).unwrap_or_default()
+}
+
+/// How many refusals of `wire` and `code` a page keeps (a runner's record, an agent session's info).
+pub fn kept(rec: &Value, wire: &str, code: &str) -> u64 {
+    rec.pointer("/refused/counts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|c| c.get("wire").and_then(Value::as_str) == Some(wire) && c.get("code").and_then(Value::as_str) == Some(code))
+        .filter_map(|c| c.get("n").and_then(Value::as_u64))
+        .sum()
+}
+
+/// The audit log's `security.wire_refused` rows whose principal is `principal` (`runner:fedora`,
+/// `agent:<session>`, a person's name).
+pub fn audited(port: u16, admin: &str, principal: &str) -> Vec<Value> {
+    let (_, body) = http(port, "GET", &format!("/api/audit?action=security.wire_refused&principal={principal}"), admin, None).unwrap_or_default();
+    serde_json::from_str::<Value>(&body).ok().and_then(|v| v.as_array().cloned()).unwrap_or_default()
 }
 
 /// A concrete path for a pattern: `*` an id, `**` two segments.

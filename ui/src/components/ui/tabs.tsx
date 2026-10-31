@@ -12,6 +12,8 @@ const SIZES = {
   default: { box: "min-h-11 gap-1 p-1", pill: tabsTriggerClass },
   // A filter bar's height (--field-h), beside its field; where it can't fit beside it (a phone), it wraps.
   bar: { box: "min-h-[var(--field-h)] gap-0.5 p-[3px]", pill: `${trigger} h-8 px-3` },
+  // A section head's height (Ship's opened commit), beside xs buttons.
+  xs: { box: "min-h-8 gap-0.5 p-[2px]", pill: `${trigger} h-7 px-2.5 text-xs` },
 };
 
 /** A pill segmented control not tied to tab panels (filters, ranges). */

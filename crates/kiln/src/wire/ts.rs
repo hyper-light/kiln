@@ -194,7 +194,10 @@ pub fn hand_written(ui_src: &Path, generated: &Path, names: &[String]) -> Vec<St
                 let l = l.strip_prefix("declare ").unwrap_or(l);
                 let Some(rest) = ["type ", "interface ", "enum "].iter().find_map(|k| l.strip_prefix(k)) else { continue };
                 let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$').collect();
-                if names.contains(&name) {
+                // A definition goes on (`=`, `<`, `{`, `extends`); `type X,` in an import list doesn't.
+                let after = rest.get(name.len()..).unwrap_or_default().trim_start();
+                let defines = after.starts_with('=') || after.starts_with('<') || after.starts_with('{') || after.starts_with("extends");
+                if defines && names.contains(&name) {
                     let rel = path.strip_prefix(&ui_src).unwrap_or(&path);
                     out.push(format!("ui/src/{}:{}: {name}", rel.display(), n + 1));
                 }
@@ -220,7 +223,7 @@ fn hand_written_finds_definitions_not_re_exports() -> anyhow::Result<()> {
     let generated = root.path().join("api/wire");
     std::fs::create_dir_all(&generated)?;
     std::fs::write(generated.join("Command.ts"), "export type Command = { type: \"interrupt\" };\n")?;
-    std::fs::write(root.path().join("a.ts"), "export type { Command } from \"./api/wire\";\nexport interface Update { t: string }\n  type Command<T> = T;\n")?;
+    std::fs::write(root.path().join("a.ts"), "export type { Command } from \"./api/wire\";\nexport interface Update { t: string }\n  type Command<T> = T;\nimport {\n  type Update,\n  type Command,\n} from \"./api/wire\";\n")?;
     let names = vec!["Command".to_owned(), "Update".to_owned()];
     anyhow::ensure!(hand_written(root.path(), &generated, &names) == ["ui/src/a.ts:2: Update", "ui/src/a.ts:3: Command"], "{:?}", hand_written(root.path(), &generated, &names));
     Ok(())

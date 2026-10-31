@@ -14,25 +14,25 @@ test("the job cards' view and focus in an open row survive updates", async ({ pa
   test.setTimeout(90_000);
   await page.request.post("/api/mock/ship/arrive?clear=1");
   try {
-    // Three cards to a view: the six stages page once.
+    // Three cards to a view: D41's seven stations (Review first) page twice.
     await page.setViewportSize({ width: 800, height: 900 });
     await page.goto("/ship");
     const row = page.locator(".ship-row").filter({ hasText: "D41" }).first();
     await expect(row).toBeVisible({ timeout: 15_000 });
     await row.locator(".ship-go").click();
-    // The second view: staging, production, replant.
-    const first = row.locator(".ship-jobs__track > .ship-job").first();
-    await expect(first).toHaveAttribute("data-stage", "land");
+    // The second view: build, staging, production.
+    const first = row.locator(".ship-jobs__track > .ship-stn").first();
+    await expect(first).toHaveAttribute("data-stage", "review");
     await row.getByRole("button", { name: "Next stages" }).click();
-    await expect(first).toHaveAttribute("data-stage", "staging");
+    await expect(first).toHaveAttribute("data-stage", "build");
     const copy = row.getByRole("button", { name: /^Cop(y|ied) the output$/ });
     await copy.focus();
     // Updates: a commit arrives, and the list fetches again (twice).
     await page.request.post("/api/mock/ship/arrive");
     for (let i = 0; i < 2; i++) await page.waitForResponse((r) => r.url().includes("/api/ship/commits") && r.request().method() === "GET", { timeout: 40_000 });
     await page.waitForTimeout(300);
-    await expect(first).toHaveAttribute("data-stage", "staging");
-    await expect(row.locator(".ship-jobs__track > .ship-job")).toHaveCount(3);
+    await expect(first).toHaveAttribute("data-stage", "build");
+    await expect(row.locator(".ship-jobs__track > .ship-stn")).toHaveCount(3);
     await expect(copy).toBeFocused();
     await expect(row.locator(".ship-go")).toHaveAttribute("aria-expanded", "true");
   } finally {
@@ -59,7 +59,7 @@ test("the lanes' walk, room, rows and focus in an open row survive updates", asy
     await expect(lanes.getByRole("button", { name: "Now" })).toBeEnabled();
     // Each lane's row marked with its name, to tell a row kept from one drawn again. (A lane can be
     // another's: the mock's fixed rows stream whichever of its jobs runs. Those that stay are kept.)
-    const kept = await box.locator(".ship-lane").evaluateAll((els) => els.map((el) => ((el as HTMLElement).dataset.probe = el.querySelector(".ship-lane__name")?.textContent ?? "")));
+    const kept = await box.locator(".ship-lrow[data-lane]").evaluateAll((els) => els.map((el) => ((el as HTMLElement).dataset.probe = el.querySelector(".ship-ll__name")?.textContent ?? "")));
     expect(kept.length).toBeGreaterThan(0);
     const later = lanes.getByRole("button", { name: "Later" });
     await later.focus();
@@ -71,8 +71,8 @@ test("the lanes' walk, room, rows and focus in an open row survive updates", asy
     await expect(lanes.getByRole("button", { name: "Fit" })).toBeVisible();
     await expect(lanes.getByRole("button", { name: "Now" })).toBeEnabled();
     const after = await box
-      .locator(".ship-lane")
-      .evaluateAll((els) => els.map((el) => ({ name: el.querySelector(".ship-lane__name")?.textContent ?? "", probe: (el as HTMLElement).dataset.probe ?? null })));
+      .locator(".ship-lrow[data-lane]")
+      .evaluateAll((els) => els.map((el) => ({ name: el.querySelector(".ship-ll__name")?.textContent ?? "", probe: (el as HTMLElement).dataset.probe ?? null })));
     const stayed = after.filter((l) => kept.includes(l.name));
     expect(stayed.length).toBeGreaterThan(0);
     expect(stayed.filter((l) => l.probe !== l.name)).toEqual([]);

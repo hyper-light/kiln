@@ -51,6 +51,12 @@ impl Uplink {
         let _ = self.0.send(Up::Msg(m)).await;
     }
 
+    /// A message that's only said along the way (an upgrade's progress): sent without waiting, so
+    /// what's doing it never waits on the connection; dropped when the uplink is full.
+    pub fn say(&self, m: AgentMsg) {
+        let _ = self.0.try_send(Up::Msg(m));
+    }
+
     pub async fn log(&self, job: &str, idx: u32, data: Vec<u8>) {
         let _ = self.0.send(Up::Log(LogChunk { job: job.to_owned(), idx, data })).await;
     }
@@ -425,6 +431,7 @@ impl Exec {
         let (prog, args) = self.command_line(shell, script);
         let mut cmd = Command::new(prog);
         cmd.args(args).current_dir(cwd).envs(env);
+        let _job_group = crate::os::JobGroup::enter(&self.assign.job_id, &mut cmd);
         // On the CPUs its job may use: its own share, or what no share holds (W05-R03).
         let mut running = crate::runner::cpus::spawn_on(&self.assign.job_id, move || crate::proc::spawn_group(cmd))?;
         let pgid = running.pgid;

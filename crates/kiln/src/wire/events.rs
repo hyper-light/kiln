@@ -98,6 +98,8 @@ pub enum ServerEvent {
     /// How many agent sessions a runner has at work at once changed (set here, or what it said it
     /// holds): refetch it.
     AgentLimit { runner: String },
+    /// A runner's headroom changed (settings, or what the runner reported): refetch it.
+    Headroom { runner: String },
     /// An agent's change request opened or moved on.
     AgentChange { agent: String, change: Box<crate::workspace::change::Record> },
     /// An agent session kiln runs appeared or changed.
@@ -122,6 +124,9 @@ pub enum ServerEvent {
     /// A change's conflicts changed (W26-R12): its replay found some, one was resolved or taken
     /// back, or their resolution was committed.
     Conflict(Box<ConflictChange>),
+    /// What the page sent up this socket that couldn't be read: to that socket alone, never
+    /// [`crate::hub::Hub::emit`]ted.
+    Refused(crate::wire::ui::Refused),
     /// Something happened to a run or a diff that notification rules hear (`run.failed`,
     /// `mention` ...): the tag is its [`NoticeKind`].
     #[serde(untagged)]

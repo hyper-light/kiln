@@ -177,7 +177,7 @@ pub struct MachineView {
 
 enum Input {
     Wake,
-    Heard { machine: String, json: String, bytes: Vec<u8> },
+    Heard { machine: String, msg: Msg, bytes: Vec<u8> },
     Up { machine: String, up: bool },
     Series(Vec<(SeriesKey, Vec<(i64, f64)>)>),
     /// Samples as a request decoded them: keys once, samples flat.
@@ -367,8 +367,8 @@ impl Observe {
     }
 
     /// What `machine` (on the server), or the server (on a runner: `machine` empty), said.
-    pub fn heard(&self, machine: &str, json: String, bytes: Vec<u8>) {
-        let _ = self.tx.send(Input::Heard { machine: machine.to_owned(), json, bytes });
+    pub fn heard(&self, machine: &str, msg: Msg, bytes: Vec<u8>) {
+        let _ = self.tx.send(Input::Heard { machine: machine.to_owned(), msg, bytes });
     }
 
     /// A machine's replicating runner process came or went (on the server), or the server did (on
@@ -1122,13 +1122,11 @@ impl Owner {
     fn input(&mut self, input: Input) {
         match input {
             Input::Wake => {}
-            Input::Heard { machine, json, bytes } => {
-                if let Some(msg) = wire::decode(&json) {
-                    if self.is_server() {
-                        self.heard_from_runner(&machine, msg, bytes);
-                    } else {
-                        self.heard_from_server(msg, bytes);
-                    }
+            Input::Heard { machine, msg, bytes } => {
+                if self.is_server() {
+                    self.heard_from_runner(&machine, msg, bytes);
+                } else {
+                    self.heard_from_server(msg, bytes);
                 }
             }
             Input::Up { machine, up } => {

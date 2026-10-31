@@ -35,6 +35,11 @@ pub type PeerId = u64;
 pub const ROOM: usize = 4 << 20;
 /// How long a command sent on a live link waits for its answer before it goes again.
 pub const PATIENCE: Duration = Duration::from_secs(3);
+/// The most a command carries: the frame its item rides (`ServerMsg::Wire`, on the control lane) is
+/// at most 1 MiB (the transport's bound for its class), and the item's head takes some of that. One
+/// larger would never go, and every command after it would wait behind it: it's answered at once,
+/// and counted as a frame the server let go (`refused`).
+pub const ITEM_MOST: usize = (1 << 20) - 1024;
 /// How long a parked command waits for its runner to come back before it ends unreachable.
 pub const PARK_FOR: Duration = Duration::from_secs(24 * 3600);
 
@@ -244,6 +249,11 @@ impl Commands {
         let p = self.peer(peer);
         if kind == Kind::Live && !p.link && p.coming.is_none() {
             let _ = tx.send(Answer::Unreachable { why: "its runner is away".into() });
+            return rx;
+        }
+        if body.len() > ITEM_MOST {
+            crate::metrics::net().dropped(peer, crate::proto::LANE_CONTROL, "refused", 1);
+            let _ = tx.send(Answer::Unreachable { why: format!("it's too large to send: {} bytes, more than the {ITEM_MOST} a command carries", body.len()) });
             return rx;
         }
         let stream = match kind {
@@ -535,6 +545,30 @@ mod tests {
         assert_eq!(answer(&mut cancel), Some(Answer::Taken));
         assert_eq!(answer(&mut unknown), Some(Answer::Refused { code: Refusal::Unknown, why: "no such leg".into() }));
         assert_eq!(c.waiting(), 0);
+    }
+
+    /// A command too large for the frame its item rides is answered at once, never queued: it
+    /// would never go, and the commands after it would wait behind it.
+    #[test]
+    fn a_command_too_large_for_a_frame_is_answered_at_once_and_the_next_goes() {
+        // A peer of its own: the count is the process's.
+        const PEER: PeerId = 9_001;
+        let base = Instant::now();
+        let mut c = Commands::new(7);
+        let mut r = Runner::new();
+        c.connected(PEER);
+        c.on_frame(PEER, r.rx.have());
+        let refused = || crate::metrics::net().toward(PEER).iter().filter(|d| d.lane == "control" && d.reason == "refused").map(|d| d.frames).sum::<u64>();
+        let before = refused();
+        let mut large = c.push(PEER, Kind::Live, vec![7; ITEM_MOST + 1], base);
+        assert!(matches!(answer(&mut large), Some(Answer::Unreachable { why }) if why.contains("too large")));
+        assert_eq!(refused(), before + 1, "counted as a frame let go toward its runner");
+        let mut next = c.push(PEER, Kind::Live, b"interrupt".to_vec(), base);
+        for a in r.deliver(c.poll(base), |_| false) {
+            c.on_frame(PEER, a);
+        }
+        assert_eq!(answer(&mut next), Some(Answer::Taken));
+        assert_eq!(r.took, vec![b"interrupt".to_vec()]);
     }
 
     #[test]

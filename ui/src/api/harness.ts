@@ -7,6 +7,7 @@ import * as React from "react";
 import { wsUrl } from "@/api/client";
 import { apiPath } from "@/lib/peer-base";
 import { events } from "@/api/events";
+import { readFrame, unread } from "./frames";
 import type { TerminalSessionInfo } from "./types";
 import type {
   Account,
@@ -27,6 +28,7 @@ import type {
   SlashCommand,
   AgentState as State,
   SessionStatus as Status,
+  UnreadFrame,
 } from "./wire";
 export type {
   Account,
@@ -164,6 +166,8 @@ export interface GoalStack {
   resume_at?: number;
   /** Its big goals planned first (docs/goals.md, "Big goals, planned first"): on unless turned off. */
   plan_big?: boolean;
+  /** Paused by its agent for a person: "" for any such pause, a plan's id when it waits on your review of that plan. */
+  held_for?: string;
 }
 
 /** A terminal beside an agent, in its folder on its machine: its shell, or its harness's own screen. */
@@ -793,8 +797,52 @@ const patched = (was: State | null, u: { set: Partial<State>; gone?: string[] })
   return now as unknown as State;
 };
 
-/** The socket's query: a snapshot packed when it can be unpacked here, and a state as what changed in it. */
-const TAKES = GUNZIP ? "?z=gzip&patch=state" : "?patch=state";
+/** A changeset's file's key: its path, and the top of its working tree when it's in one. */
+const fileKey = (f: { path: string; tree?: string | null }) => `${f.tree ?? ""}\u0000${f.path}`;
+
+/**
+ * `was` with a changeset's patch taken in as the server's copy takes it (`merge_changes`): each file
+ * set in place of the one with its key, or after the rest when new; each gone, out. The list keeps the
+ * server's order, and its files that didn't change stay the same objects.
+ */
+export const changesPatched = (was: FileChange[] | null, u: { set?: FileChange[]; gone?: { path: string; tree?: string }[] }): FileChange[] => {
+  const out = new Set((u.gone ?? []).map(fileKey));
+  const now = (was ?? []).filter((f) => !out.has(fileKey(f)));
+  const at = new Map(now.map((f, i) => [fileKey(f), i]));
+  for (const f of u.set ?? []) {
+    const i = at.get(fileKey(f));
+    if (i === undefined) {
+      at.set(fileKey(f), now.length);
+      now.push(f);
+    } else now[i] = f;
+  }
+  return now;
+};
+
+/** The socket's query: a snapshot packed when it can be unpacked here, and a state and a changeset as what changed in them. */
+const TAKES = GUNZIP ? "?z=gzip&patch=state&patch=changes" : "?patch=state&patch=changes";
+
+/** The session socket's frames, by tag: a frame with another isn't applied (`frames.ts`). */
+const SESSION_FRAMES = {
+  open: true,
+  resumed: true,
+  meta: true,
+  state: true,
+  state_patch: true,
+  changes: true,
+  changes_patch: true,
+  files: true,
+  events: true,
+  stream: true,
+  reply: true,
+  inbox: true,
+  reset: true,
+  closed: true,
+  synced: true,
+  error: true,
+  ack: true,
+  nack: true,
+} satisfies Record<SessionDown["t"], true>;
 
 /** A snapshot on its way: gathered here and swapped in at once, so what's shown never empties. */
 interface Incoming {
@@ -1032,11 +1080,26 @@ export class SessionStore {
       // The server restarted, or the network came back: this socket may be gone too without having said so.
       events.onReopen(() => this.kick(true)),
       // The session is on the server again (its machine came back): no need to wait for the next try.
+      // And what of its messages couldn't be read, which only the server says, as it changes.
       events.on((ev) => {
-        if (ev.type === "harness" && ev.info.id === this.id) this.kick(false);
+        if (ev.type !== "harness" || ev.info.id !== this.id) return;
+        this.refused(ev.info.refused);
+        this.kick(false);
       }),
     ];
     this.connect();
+  }
+
+  /**
+   * What of its messages couldn't be read (`crate::wire::unread`), as an event about it says: the
+   * server keeps it, and the socket's open said it only as it was then. Shown at once.
+   */
+  private refused(refused: AgentInfo["refused"]) {
+    const info = this.snap.info;
+    if (!info || share(info.refused, refused) === info.refused) return;
+    const next = { ...info, refused };
+    if (!refused) delete next.refused;
+    this.patch({ info: next });
   }
 
   /** Nothing shows it any more: it stays live a while, then closes. */
@@ -1109,7 +1172,9 @@ export class SessionStore {
         .then((text) => {
           if (this.ws === ws) for (const line of text.split("\n")) if (line) this.take1(line);
         })
-        .catch(() => undefined)
+        .catch((e: unknown) => {
+          if (this.ws === ws) this.told(unread("", `a packed snapshot that couldn't be unpacked: ${e instanceof Error ? e.message : String(e)}`).unread);
+        })
         .finally(() => {
           if (this.ws === ws) this.unpacking -= 1;
         });
@@ -1132,17 +1197,19 @@ export class SessionStore {
     });
   }
 
-  /** One update, as JSON. */
+  /** One update, as JSON: applied when it reads as the socket's frame; else not, and the server is told. */
   private take1(data: string) {
-    let u: SessionDown;
-    try {
-      u = JSON.parse(data) as SessionDown;
-    } catch {
-      return;
-    }
+    const read = readFrame<SessionDown>(data, "t", SESSION_FRAMES);
+    if ("unread" in read) return this.told(read.unread);
+    const u = read.frame;
     this.frames += 1;
     this.apply(u);
     this.mark(u);
+  }
+
+  /** A frame that came down and couldn't be read: the server, which sent it, is told (it notes it). */
+  private told(f: UnreadFrame) {
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(f satisfies SessionUp));
   }
 
   /** Where a frame says the server's copy is: an "open" or "resumed" once what follows it is in, a
@@ -1290,6 +1357,9 @@ export class SessionStore {
       case "changes":
         inc.changes = u.files;
         break;
+      case "changes_patch":
+        inc.changes = changesPatched(inc.changes, u);
+        break;
       case "files":
         inc.files = withFiles(inc.files ?? [], u.files);
         break;
@@ -1373,6 +1443,9 @@ export class SessionStore {
     switch (u.t) {
       case "changes":
         this.snap = { ...this.snap, changes: share(this.snap.changes, u.files) };
+        break;
+      case "changes_patch":
+        this.snap = { ...this.snap, changes: changesPatched(this.snap.changes, u) };
         break;
       case "files":
         this.snap = { ...this.snap, files: withFiles(this.snap.files, u.files) };

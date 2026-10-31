@@ -977,6 +977,9 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
     core.state.cwd.clone_from(&cwd);
     core.state.model = spec.model.clone().unwrap_or_default();
     core.state.mode = spec.mode.clone().unwrap_or_default();
+    // What it starts at, until its harness says what it applied.
+    core.state.effort = spec.effort.clone().unwrap_or_default();
+    core.state.speed = spec.speed.clone().unwrap_or_default();
     core.state.harness_session.clone_from(&spec.resume);
     // Moved here: its timeline as it was, then the line saying so.
     let mut items = None;
@@ -1015,7 +1018,38 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
         core.state.arriving = sd.synced;
     }
     core.state.reach.clone_from(&spec.reach);
+    named_ahead(&mut core.meta, kind, spec.model.as_deref());
     begin(id, spec, kind, core, sink, on_change, files, items, None)
+}
+
+/// Harness `kind`'s lists as this machine knows them, for a session's page to name its settings by
+/// before the harness says anything (a new session may wait for room on its machine, then take
+/// seconds to start; a switch starts the harness anew): its permission modes, its models (but an
+/// ACP agent's), and the effort levels and speeds of the one it runs (`model`; none, its default),
+/// as Mission control's composer offered them. What the harness says once it runs takes their place.
+fn named_ahead(meta: &mut super::model::Meta, kind: &Kind, model: Option<&str>) {
+    let models = super::kinds::models_of(kind.id);
+    let runs = match model.filter(|m| !m.is_empty()) {
+        Some(id) => models.iter().find(|m| m.id == id),
+        None => models.iter().find(|m| m.default).or(models.first()),
+    }
+    .cloned();
+    if meta.modes.is_empty() {
+        meta.modes = kind.modes().0;
+    }
+    if meta.efforts.is_empty() {
+        meta.efforts = match runs.as_ref().filter(|m| !m.efforts.is_empty()) {
+            Some(m) => m.efforts.iter().map(|e| super::model::ControlOption { id: e.clone(), label: super::model::effort_label(e), description: String::new(), dangerous: false }).collect(),
+            None => kind.efforts(),
+        };
+    }
+    if meta.speeds.is_empty() {
+        meta.speeds = runs.map(|m| m.speeds).unwrap_or_default();
+    }
+    // An ACP agent's own list says it can run them: it lists none before it's signed in.
+    if meta.models.is_empty() && !matches!(kind.protocol, Protocol::Acp(_)) {
+        meta.models = models;
+    }
 }
 
 /// A session with this core, its task started (`adopt`: going on with a harness process the
@@ -1023,6 +1057,7 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
 #[allow(clippy::too_many_arguments)]
 fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, items: Option<Vec<serde_json::Value>>, adopt: Option<Adopt>) -> anyhow::Result<Arc<Session>> {
     let now = crate::util::now_ms();
+    core.session_id.clone_from(&id);
     core.state.max_subagents = core.state.max_subagents.or(spec.max_subagents);
     // It goes to work only with room on its machine (`super::limit`).
     core.room = Some(Arc::clone(&files.room));
@@ -1229,6 +1264,8 @@ enum Ev {
     Exit(Option<i32>),
     Fx(Option<Done>),
     Tick,
+    /// Headroom has room for work it held (docs/headroom.md).
+    Room,
 }
 
 /// What of a session's pause is kept on disk (`host::Saved`): a change is written there.
@@ -1254,6 +1291,53 @@ const RUN_OUTPUT_MAX: usize = 32 * 1024;
 const READ_MAX: u64 = 512 * 1024;
 /// How often the adapter gets a tick while the process runs.
 const TICK: Duration = Duration::from_secs(5);
+
+/// The wait before a harness whose process ended (nobody ending the agent) starts again; twice
+/// the wait before for each that ends after it, at most `AGAIN_MOST`, from `AGAIN_FIRST` again
+/// once one runs `AGAIN_RESET`.
+const AGAIN_FIRST: Duration = Duration::from_secs(2);
+const AGAIN_MOST: Duration = Duration::from_secs(300);
+const AGAIN_RESET: Duration = Duration::from_secs(600);
+/// A harness that ends within `SOON` of each of its last `SOON_TRIES` starts won't start: it
+/// waits for a person.
+const SOON: Duration = Duration::from_secs(20);
+const SOON_TRIES: u32 = 3;
+/// What an agent is told when its process ended part-way through a turn and started again.
+const PICK_UP: &str = "Your process ended part-way through your last turn, and kiln started it again: your conversation is as it was. Pick up where you left off.";
+
+/// How a harness's process ended, in words: its exit code, and the signal one past 128 stands for.
+fn ended_how(code: Option<i32>) -> String {
+    let signal = |n: i32| match n {
+        1 => "SIGHUP".to_owned(),
+        2 => "SIGINT".to_owned(),
+        9 => "SIGKILL".to_owned(),
+        15 => "SIGTERM".to_owned(),
+        n => format!("signal {n}"),
+    };
+    match code {
+        None => "a signal ended it".to_owned(),
+        Some(c) if (129..160).contains(&c) => format!("exit {c}: {} from outside it", signal(c - 128)),
+        Some(c) => format!("exit {c}"),
+    }
+}
+
+/// Completes when headroom has room for this session's held work: only while it holds some (so
+/// sessions with nothing waiting don't wake for it).
+async fn held_room(core: &Mutex<Core>) {
+    // Listening before looking: room given between the look and the wait isn't missed.
+    let room = crate::headroom::room();
+    let (queued, held, granted) = {
+        let c = core.lock();
+        (!c.state.queue.is_empty(), crate::headroom::held(&c.session_id), crate::headroom::take_grant(&c.session_id))
+    };
+    if queued && granted {
+        // Let in (perhaps before this looked): its queue goes now, once.
+    } else if queued && held {
+        room.await;
+    } else {
+        futures::future::pending::<()>().await;
+    }
+}
 /// How long a take-over waits for the session it takes over to end.
 const TAKEOVER_WAIT: Duration = Duration::from_secs(15);
 /// How long a session taken over from outside kiln has to quit before it is killed.
@@ -1932,7 +2016,7 @@ fn carried_choices(from: &Kind, to: &Kind, mode: &str, effort: &str, allow_bypas
 
 /// The session's state for the harness it goes on in (`session`: its conversation's id there):
 /// the model, mode and effort it runs with; what was the old harness's own (its servers, skills,
-/// account, plan and limits, what it was doing) goes with it.
+/// account, plan and limits, its to-dos, what it was doing) goes with it.
 fn for_harness(st: &mut super::model::State, session: Option<String>, model: &str, mode: Option<String>, effort: Option<String>) {
     st.harness_session = session;
     model.clone_into(&mut st.model);
@@ -1957,6 +2041,9 @@ fn for_harness(st: &mut super::model::State, session: Option<String>, model: &st
     st.exit = None;
     st.activity = None;
     st.doing = None;
+    // Its to-dos too: the new harness has them in its note ("The plan as it stands") and keeps
+    // a list of its own, so keep-going never holds it to one only the old harness could change.
+    st.todos.clear();
 }
 
 /// A paused session moving to another machine goes on there: the pause (for this machine's
@@ -2045,6 +2132,7 @@ async fn carry_over(s: &Arc<Session>, from: &'static Kind, sw: Switch, left: usi
         for_harness(st, resume, &sw.model, mode, effort);
         st.status = Status::Starting;
         core.meta = super::model::Meta::default();
+        named_ahead(&mut core.meta, to, Some(&sw.model));
         core.hold = false;
         core.state.switching = None;
         // A pause for the old harness's limit ends: the new one runs on its own account. The turn
@@ -2841,7 +2929,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
         let _ = sink.send((s.id.clone(), u)).await;
     }
     let mut first = !handed;
-    let mut crashes: Vec<Instant> = Vec::new();
+    // Its process ending never ends it: how many starts in a row ended soon after, the wait before
+    // its next start, and when that is.
+    let mut soon: u32 = 0;
+    let mut again = AGAIN_FIRST;
+    let mut again_at: Option<Instant>;
     // A message that arrived while the process was down, sent once it is back.
     let mut carry: Vec<Command> = Vec::new();
     // Skill runs sent while there was no room on its machine for it to go to work: run once there
@@ -2891,8 +2983,9 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
     let mut reloading = false;
     // Tasks the harness left running that a switch stopped.
     let mut left = 0usize;
-    // The models it last listed (the machine keeps the list for its "new agent" and switches).
-    let mut models_seen: Vec<super::model::ModelOption> = Vec::new();
+    // The models it last listed (the machine keeps the list for its "new agent" and switches): not
+    // those kiln named ahead of its harness (`named_ahead`), which are the machine's list already.
+    let mut models_seen = s.core.lock().meta.models.clone();
     loop {
         // The harness it ran in is down: on in the other one.
         // Its turn is over: on to the other runner (or, if that can't be, on here).
@@ -2936,7 +3029,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
             if let Some((to, carried)) = carry_over(&s, kind, sw, std::mem::take(&mut left), &sink).await {
                 kind = to;
                 seed = carried;
-                models_seen.clear();
+                models_seen = s.core.lock().meta.models.clone();
             }
             first = false;
             on_change();
@@ -2977,22 +3070,28 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                 if blocked.is_none() && spec.program.is_none() && !kind.available() {
                     crate::reach::serve::login_env().await;
                 }
+                // What it needs before it starts (kiln's MCP server in Antigravity's own config).
+                if blocked.is_none() {
+                    kind.prepare(&spec).await;
+                }
                 let spawned = match blocked {
                     Some(why) => Err(anyhow::anyhow!(why)),
                     // In the session's group of processes where the machine has them, and marked as
                     // its, and so is everything it starts (`survivors`).
-                    None => kind
-                        .launch(&spec, &s.id)
-                        .map(|mut p| {
+                    None => match kind.launch(&spec, &s.id) {
+                        Ok(mut p) => {
                             p.env(super::survivors::MARK, &s.id);
-                            p
-                        })
-                        .and_then(|p| crate::proc::spawn_duplex_in(p, crate::os::contain::Group::of(&s.id).as_ref())),
+                            crate::proc::spawn_duplex_in_pool(p, crate::os::contain::Group::of(&s.id)).await
+                        }
+                        Err(e) => Err(e),
+                    },
                 };
                 (adapter, spawned, Vec::new(), false)
             }
         };
         let started = Instant::now();
+        again_at = None;
+        let launched = spawned.is_ok();
         let mut code = None;
         let mut error = None;
         match spawned {
@@ -3075,6 +3174,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         f = fx_rx.recv().fuse() => Ev::Fx(f.ok()),
                         x = (&mut p.exit).fuse() => Ev::Exit(x.ok().flatten()),
                         _ = crate::rt::sleep_until(next_tick).fuse() => Ev::Tick,
+                        () = held_room(&s.core).fuse() => Ev::Room,
                     };
                     match ev {
                         Ev::Out(Some(chunk)) => {
@@ -3362,6 +3462,10 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         Ev::Fx(Some(d)) => d.apply(&mut adapter, &mut s.core.lock()),
                         Ev::Fx(None) => {}
                         Ev::Tick => {}
+                        Ev::Room => {
+                            let mut core = s.core.lock();
+                            adapter.drain(&mut core);
+                        }
                         Ev::Exit(c) => {
                             code = c;
                             // Read what is left on stdout (the last lines often explain the exit).
@@ -3496,19 +3600,48 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
         if switching.is_some() || moving.is_some() || reloading {
             continue;
         }
-        // A crash after a good run comes back by itself (a few times), with room on its machine
-        // for it (at work when it crashed, it has its own still); a harness that will not start
-        // waits for a person.
+        // Its process ending never ends the agent, however it ended (a signal from outside it, a
+        // crash, an end of its own): an agent lives until a person, or the agent that started it,
+        // ends it (docs/agents.md, "An agent lives until it's ended"). It starts again by itself,
+        // its conversation resumed and the turn the end cut short picked up first, once there's
+        // room on its machine for it: after `AGAIN_FIRST`, each time twice the wait before (at most
+        // `AGAIN_MOST`), from `AGAIN_FIRST` again once it ran `AGAIN_RESET`. A harness that never
+        // started, or ended within `SOON` of each of its last `SOON_TRIES` starts, won't start: it
+        // waits for a person (a restart or a message), saying why.
         let ran = started.elapsed();
-        crashes.retain(|t| t.elapsed() < Duration::from_secs(600));
-        let auto = code != Some(0) && error.is_none() && ran > Duration::from_secs(20) && crashes.len() < 3;
-        if auto {
-            crashes.push(Instant::now());
-            if s.core.lock().has_room() {
-                crate::rt::sleep(Duration::from_secs(2)).await;
-                continue;
+        if ran >= AGAIN_RESET {
+            again = AGAIN_FIRST;
+        }
+        soon = if ran < SOON { soon.saturating_add(1) } else { 0 };
+        if launched && soon < SOON_TRIES {
+            let cut = s.turn_open.load(std::sync::atomic::Ordering::Relaxed);
+            again_at = Instant::now().checked_add(again);
+            {
+                let mut core = s.core.lock();
+                let now = Core::now();
+                if let Some(x) = core.state.exit.as_mut() {
+                    x.again_at = Some(now.saturating_add(i64::try_from(again.as_millis()).unwrap_or(i64::MAX)));
+                }
+                let then = if cut { ", and picks up the turn it was on" } else { "" };
+                core.upsert(&format!("harness-again:{now}"), None, super::model::Body::Notice { level: Level::Warn, text: format!("Its process ended ({}). kiln starts it again{then}: its conversation goes on.", ended_how(code)) });
+                if cut && !core.state.queue.first().is_some_and(|q| q.text == PICK_UP) {
+                    core.state.queue.insert(0, super::model::QueueItem { id: format!("{}again-{now}", super::core::KEEP_ID), text: PICK_UP.to_owned(), at: now, attachments: Vec::new(), overrides: None, reply_to: None });
+                }
+                core.touch_state();
             }
-            restart_wanted = true;
+            flush(&s, &sink, None).await;
+            on_change();
+            again = again.saturating_mul(2).min(AGAIN_MOST);
+        } else if launched {
+            {
+                let mut core = s.core.lock();
+                if let Some(x) = core.state.exit.as_mut() {
+                    x.error.get_or_insert_with(|| format!("It ended within {} s of each of its last {SOON_TRIES} starts, so kiln stopped starting it again: send a message or restart it.", SOON.as_secs()));
+                }
+                core.touch_state();
+            }
+            flush(&s, &sink, None).await;
+            on_change();
         }
         // Skill runs that waited for room go with its next start.
         carry.append(&mut for_room);
@@ -3535,9 +3668,21 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
             if unwaited {
                 flush(&s, &sink, None).await;
             }
+            // Its process ended without anyone ending it: it starts again when its wait is over.
+            let due = again_at;
+            let wake = async move {
+                match due {
+                    Some(at) => crate::rt::sleep(at.saturating_duration_since(Instant::now())).await,
+                    None => futures::future::pending::<()>().await,
+                }
+            };
             let ev = futures::select_biased! {
                 c = ctl_rx.recv().fuse() => Ev::Ctl(c.ok()),
                 f = fx_rx.recv().fuse() => Ev::Fx(f.ok()),
+                () = wake.fuse() => {
+                    again_at = None;
+                    Ev::Ctl(Some(Ctl::Cmd(Box::new(Command::Restart))))
+                }
             };
             match ev {
                 Ev::Ctl(Some(Ctl::Cmd(c))) => match *c {
@@ -3932,6 +4077,25 @@ mod tests {
         assert!(!switch_now(&core), "running");
     }
 
+    /// A switch leaves the old harness's to-dos to the note it gives the new one ("The plan as it
+    /// stands": the next test): the session goes on with none, so keep-going counts only the list
+    /// the new harness keeps, never one it has no way to change (Claude Code without a to-do tool,
+    /// after Devin).
+    #[test]
+    fn a_switch_leaves_the_to_dos_of_the_old_harness_in_its_note() {
+        use super::super::model::{State, Todo};
+        use super::{Info, for_harness};
+        let todo = |text: &str, status: &str| Todo { text: text.into(), status: status.into() };
+        let mut st = State { todos: vec![todo("find the cause", "completed"), todo("upgrade the studios", "in_progress"), todo("check them", "pending")], ..State::default() };
+        let mut info = Info::default();
+        info.apply(&st);
+        assert_eq!((info.todos_done, info.todos_total), (1, 3));
+        for_harness(&mut st, Some("S2".into()), "opus", Some("auto".into()), Some("max".into()));
+        info.apply(&st);
+        assert!(st.todos.is_empty(), "{:?}", st.todos);
+        assert_eq!((info.todos_done, info.todos_total), (0, 0), "nothing left open for keep-going to count");
+    }
+
     /// Into Devin, Antigravity or another ACP agent too: named by its own modes (kiln's Ask and
     /// Bypass for an agent that says its own only once started), at the same latitude.
     #[test]
@@ -3954,6 +4118,35 @@ mod tests {
         assert_eq!(carried_choices(claude, gemini, "plan", "", true, "").0, None);
         // And out of one: Devin's plan stays plan in Claude Code.
         assert_eq!(carried_choices(devin, claude, "plan", "", true, "opus").0.as_deref(), Some("plan"));
+        Ok(())
+    }
+
+    /// A session's page names its settings by its harness's lists before the harness says anything
+    /// (started, or switched to it anew): its modes by their names, the effort levels of the model it
+    /// runs where this machine has its list, else the harness's. What the harness said stays.
+    #[test]
+    fn a_harness_s_lists_name_a_session_s_settings_ahead_of_it() -> anyhow::Result<()> {
+        use super::super::model::{Meta, ModeOption};
+        use super::{Kind, named_ahead};
+        let kind = |id: &str| Kind::get(id).ok_or_else(|| anyhow::anyhow!("no {id}"));
+        let mut meta = Meta::default();
+        named_ahead(&mut meta, kind("codex")?, Some("gpt-6.1-sol"));
+        assert!(meta.modes.iter().any(|m| m.id == "untrusted" && m.label == "Ask"), "{:?}", meta.modes);
+        assert!(!meta.efforts.is_empty() && !meta.models.is_empty(), "{meta:?}");
+        // A model this machine hasn't listed: the harness's levels.
+        let mut meta = Meta::default();
+        named_ahead(&mut meta, kind("claude")?, Some("claude-unlisted-1"));
+        assert!(meta.modes.iter().any(|m| m.id == "acceptEdits" && m.label == "Accept edits"), "{:?}", meta.modes);
+        assert_eq!(meta.efforts.iter().map(|e| e.label.as_str()).collect::<Vec<_>>(), ["Low", "Medium", "High", "Extra high", "Max"]);
+        assert!(meta.speeds.is_empty(), "{:?}", meta.speeds);
+        // An ACP agent's models are its own to list (none before it's signed in); its modes are known.
+        let mut meta = Meta::default();
+        named_ahead(&mut meta, kind("devin")?, None);
+        assert!(meta.modes.iter().any(|m| m.id == "smart" && m.label == "Smart") && meta.models.is_empty(), "{meta:?}");
+        let said = vec![ModeOption { id: "said".into(), label: "Said".into(), description: String::new(), dangerous: false }];
+        let mut meta = Meta { modes: said.clone(), ..Meta::default() };
+        named_ahead(&mut meta, kind("claude")?, None);
+        assert_eq!(meta.modes, said);
         Ok(())
     }
 
