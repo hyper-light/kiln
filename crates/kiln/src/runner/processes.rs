@@ -947,6 +947,13 @@ mod tests {
             assert!(execution.stopped_proven().await?, "the barrier can still read the exact same proof after physical import");
             drop(debug);
             drop(execution); // the real owner drops only after its ordered-barrier outbox commit
+            // The same positive proof may precede the final scoped pipe task's drop.
+            crate::rt::timeout(Duration::from_secs(5), async {
+                while !try_acknowledge_evidence(&admission, &proof)? {
+                    crate::rt::sleep(Duration::from_millis(10)).await;
+                }
+                Ok::<_, anyhow::Error>(())
+            }).await.context("stopped owner tasks still hold their exact Gate")??;
             acknowledge_evidence(&admission, &proof)?;
             let owner = proof.executor_owner.as_ref().context("executor proof lost its grant owner")?;
             assert!(executions::stopped(&admission, &proof.execution, owner).is_err(), "missing evidence is unknown, never another stop proof");
@@ -1008,6 +1015,13 @@ mod tests {
             assert!(limited.stopped_proven().await?);
             let proof = recovery_evidence(&admission)?.into_iter().find(|p| p.execution == limited.identity()).context("limited owner lost its physical proof")?;
             drop(limited);
+            // The same positive proof may precede the final scoped pipe task's drop.
+            crate::rt::timeout(Duration::from_secs(5), async {
+                while !try_acknowledge_evidence(&admission, &proof)? {
+                    crate::rt::sleep(Duration::from_millis(10)).await;
+                }
+                Ok::<_, anyhow::Error>(())
+            }).await.context("stopped owner tasks still hold their exact Gate")??;
             acknowledge_evidence(&admission, &proof)?;
             Ok(())
         })

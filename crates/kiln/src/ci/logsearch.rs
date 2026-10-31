@@ -1339,7 +1339,13 @@ mod tests {
         }).await?;
         let mut stale_read=None;let mut stale_post=None;
         for _ in 0..64 {
-            let work=hub.store.call(|c|index::leg(c,"accepted-prefix")).await?;
+            // A whole pass can finish pruning and consume the first Read in its same
+            // fresh-leg turn. Advance one real prune atom before sampling that Read.
+            let Some(work)=hub.store.call(|c|{
+                let pruning:Option<String>=c.query_row("SELECT version FROM ci_log_index_progress WHERE leg='accepted-prefix' AND pruning=1",[],|r|r.get(0)).optional()?;
+                if let Some(version)=pruning {index::prune(c,"accepted-prefix",&version)?;return Ok(None)}
+                Ok(Some(index::leg(c,"accepted-prefix")?))
+            }).await? else {continue};
             match work {
                 index::Work::Read(plan)=>{if stale_read.is_none(){stale_read=Some(plan)}},
                 index::Work::Post(id) if stale_post.is_none()=>{
@@ -1350,6 +1356,8 @@ mod tests {
             pass(&hub,&mut accepted_scan).await?;
         }
         let captured=(stale_read.ok_or_else(||anyhow::anyhow!("R1 did not expose read work"))?,stale_post.ok_or_else(||anyhow::anyhow!("R1 did not expose posting work"))?);
+        assert_eq!(captured.0.prefix.as_ref(),Some(&r1.prefix),"captured read belongs to R1");
+        assert_eq!(captured.1.0.prefix.as_ref(),Some(&r1.prefix),"captured posting belongs to R1");
         hub.store.call(|c|{
             let hits=search(c,&Query{q:"historicalneedle".into(),..Query::default()})?;
             assert_eq!(hits.iter().filter(|h|h.leg=="accepted-prefix").count(),1,"first append cannot shadow historical file lines");
