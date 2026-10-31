@@ -905,11 +905,27 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             boxed(|| own_op(&hub, &caller, "plans.runs.retry", body)).await
         }
         // Taking a step over, and saying it's met, are a person's: no operation does them.
-        (&Method::POST, ["api", "plans", "runs", run, "steps", n, what @ ("take" | "met")]) => {
+        (&Method::POST, ["api", "plans", "runs", run, "steps", n, "met"]) => {
             let n: usize = n.parse().map_err(|_| err(StatusCode::BAD_REQUEST, "a step's number, from 1"))?;
             let by = caller.name.clone();
-            let r = if *what == "take" { boxed(|| crate::plans::agents::take(&hub, run, n, &by)).await } else { boxed(|| crate::plans::agents::met(&hub, run, n, &by)).await };
-            r.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err)
+            boxed(|| crate::plans::agents::met(&hub, run, n, &by)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err)
+        }
+        // Taken over, the step goes to the person the caller is, signed (docs/ci.md W27-R08): their
+        // receipt is theirs when they say they sign it on their device (`signs`, then `receipt`),
+        // else kiln's for them.
+        (&Method::POST, ["api", "plans", "runs", run, "steps", n, "take"]) => {
+            let n: usize = n.parse().map_err(|_| err(StatusCode::BAD_REQUEST, "a step's number, from 1"))?;
+            let by = caller.name.clone();
+            let signs = boxed(|| body_value(req)).await?.get("signs").and_then(serde_json::Value::as_bool).unwrap_or(false);
+            let person = crate::identities::person_identity(&hub.store, &hub.pki.organization(), &caller).await.ok();
+            boxed(|| crate::plans::agents::take(&hub, run, n, &by, person.as_deref(), signs)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err)
+        }
+        (&Method::POST, ["api", "plans", "runs", run, "steps", n, "receipt"]) => {
+            let n: usize = n.parse().map_err(|_| err(StatusCode::BAD_REQUEST, "a step's number, from 1"))?;
+            let person = crate::identities::person_identity(&hub.store, &hub.pki.organization(), &caller).await.map_err(|e| err(StatusCode::FORBIDDEN, e.to_string()))?;
+            let body = boxed(|| body_value(req)).await?;
+            let receipt = body.get("receipt").cloned().ok_or_else(|| err(StatusCode::BAD_REQUEST, "send your receipt: `receipt`, a Sigstore bundle signed on your device"))?;
+            boxed(|| crate::plans::agents::receipt(&hub, run, n, &person, &receipt)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err)
         }
         (&Method::GET, ["api", "programs"]) => boxed(|| own_op(&hub, &caller, "programs.list", json!({}))).await,
         (&Method::GET, ["api", "programs", id]) => boxed(|| own_op(&hub, &caller, "programs.get", json!({"program": id}))).await,

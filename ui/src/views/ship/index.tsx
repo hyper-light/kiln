@@ -358,8 +358,15 @@ function Actions({ commit, reload, onReview }: { commit: ShipCommit; reload: () 
     }
     setBusy(a.name);
     try {
-      await shipApi.act(a);
-      toast({ title: `${ACTION_WORD[a.name] ?? a.name}: ${commit.change?.name ?? commit.short}`, tone: "succeeded" });
+      const answer = await shipApi.act(a);
+      // A hand-off kiln signed for you, this browser having no key (docs/ci.md W27-R08): says so,
+      // and how to sign your own.
+      const signedForYou = (answer as { custody?: { kiln_signed_for_you?: boolean } } | null)?.custody?.kiln_signed_for_you === true;
+      toast({
+        title: `${ACTION_WORD[a.name] ?? a.name}: ${commit.change?.name ?? commit.short}`,
+        description: signedForYou ? "kiln signed the hand-off for you: this browser has no key. `kiln login` gives this device one." : undefined,
+        tone: "succeeded",
+      });
       invalidate("ship/");
       reload();
     } catch (e) {

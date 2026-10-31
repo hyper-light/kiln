@@ -946,3 +946,118 @@ fn w27_ac05_the_twin_played_again() -> anyhow::Result<()> {
     Ok(())
 }
 
+
+/// W27-R08 (the Transfers plan's step 6): work handed between agents and to people, signed by
+/// both sides. A plan run with an agent per step, side by side: each agent signs its receipt of
+/// kiln's hand-on as it takes its step up, at its first turn. Step 1, tried again, goes to a new
+/// agent, kiln taking it for the first, which, asking still as the step's agent, is refused and
+/// recorded. Step 2, taken over by the owner from a device with no key, gets kiln's receipt for
+/// them; step 3, taken over by sam with a key, gets sam's own. Step 1's agent starts a subagent for
+/// a task it hands on signed, which kiln passes on unchanged and the subagent signs for as it takes
+/// it up. No transfer without both sides' signatures: every chain walks unbroken, none left open.
+#[test]
+fn w27_r08_work_handed() -> anyhow::Result<()> {
+    use kiln::reach::local::{Client, Ev, Req};
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options::default())?;
+    let (port, admin) = (s.port, s.admin.as_str());
+    let cwd = dir.path().join("work-here");
+    let _harnesses = Harnesses::new(&cwd, &dir.path().join("home"))?;
+    let claude = dir.path().join("home").join(".claude").to_string_lossy().into_owned();
+    let env = [("FAKE_CLAUDE_RECORD", "1"), ("CLAUDE_CONFIG_DIR", claude.as_str())];
+    let (_a, log_a) = agents::runner_with(dir.path(), port, "box-a", None, TALK, &env)?;
+    agents::connected(port, admin, "box-a", &log_a, Duration::from_secs(60))?;
+    let json_of = |what: &str, (st, body): (u16, String)| -> anyhow::Result<Value> {
+        anyhow::ensure!((200..300).contains(&st), "{what}: {st} {body}");
+        Ok(serde_json::from_str(&body)?)
+    };
+    let plan = json_of("the plan", http(port, "POST", "/api/plans", admin, Some(&json!({ "title": "work handed", "body": "- build it\n- test it\n- ship it\n" })))?)?;
+    let at = cwd.to_string_lossy().into_owned();
+    let ran = json_of("the run", http(port, "POST", &format!("/api/plans/{}/run", field(&plan, "id")), admin, Some(&json!({ "mode": "agents", "parallel": true, "new": { "on": "box-a", "kind": "claude", "cwd": at } })))?)?;
+    let run = field(&ran, "run").to_owned();
+    let chain_of = |name: &str| -> anyhow::Result<Value> {
+        let (_, body) = http(port, "GET", &format!("/api/custody?name={}", name.replace(' ', "%20").replace('\'', "%27")), admin, None)?;
+        Ok(serde_json::from_str(&body).unwrap_or_default())
+    };
+    let hops = |v: &Value| -> Vec<Value> { v.get("hops").and_then(Value::as_array).cloned().unwrap_or_default() };
+    let kinds = |v: &Value| -> Vec<String> { hops(v).iter().map(|h| field(h, "kind").to_owned()).collect() };
+    let received = |name: &str, by: &str| -> anyhow::Result<Value> {
+        until(Duration::from_secs(120), || {
+            let v = chain_of(name)?;
+            let first = hops(&v).first().cloned().unwrap_or_default();
+            Ok((v.get("unbroken") == Some(&json!(true)) && field(&first, "kind") == "received" && field(&first, "custodian").contains(by)).then_some(v))
+        })
+        .map_err(|e| anyhow::anyhow!("{e}: {name}: {}\n{}", chain_of(name).unwrap_or_default(), said_of(dir.path(), port, admin, by)))
+    };
+    let agent_of = |n: u64| -> anyhow::Result<String> {
+        let v = json_of("the run", http(port, "GET", &format!("/api/plans/runs/{run}"), admin, None)?)?;
+        Ok(v.get("steps").and_then(Value::as_array).and_then(|s| s.iter().find(|x| x.get("n") == Some(&json!(n)))).map(|x| field(x, "agent_id").to_owned()).unwrap_or_default())
+    };
+    let step = |n: u64| format!("plan run {run} step {n}");
+    // Each step's agent takes it up at its first turn: kiln's hand-on, and its receipt.
+    let mut firsts = Vec::new();
+    for n in 1..=3 {
+        let a = until(Duration::from_secs(120), || Ok(Some(agent_of(n)?).filter(|a| !a.is_empty())))?;
+        let v = received(&step(n), &format!("/agent/{a}/"))?;
+        assert_eq!(kinds(&v), ["received", "handed-on"], "{v}");
+        firsts.push(a);
+    }
+    let first = firsts.first().cloned().unwrap_or_default();
+    // Step 1 tried again: kiln takes it for its agent and hands it to the next, which signs.
+    json_of("the retry", http(port, "POST", &format!("/api/plans/runs/{run}/steps/1/retry"), admin, Some(&json!({})))?)?;
+    let second = until(Duration::from_secs(120), || Ok(Some(agent_of(1)?).filter(|a| !a.is_empty() && *a != first)))?;
+    let v = received(&step(1), &format!("/agent/{second}/"))?;
+    assert_eq!(kinds(&v), ["received", "taken", "received", "handed-on"], "{v}");
+    let take = hops(&v).get(1).map(|h| field(h, "record").to_owned()).unwrap_or_default();
+    // The first agent, asking still as the step's: refused, and recorded with the take.
+    let sock = kiln::reach::local::path("box-a", &dir.path().join("box-a-state"));
+    let ask_as = |session: &str, name: &str, input: Value| -> anyhow::Result<String> {
+        let mut c = Client::connect(&sock)?;
+        c.send(&Req::Ask { json: json!({ "op": "call", "session": session, "name": name, "input": input }).to_string() })?;
+        Ok(match c.event()? {
+            Some(Ev::Answer(a)) => a,
+            Some(Ev::Error(e)) => e,
+            other => format!("{other:?}"),
+        })
+    };
+    let said = ask_as(&first, "goals.done", json!({ "evidence": "said by the try before" }))?;
+    assert!(said.contains("refused") && said.contains("no longer holds"), "{said}");
+    let refused = json_of("the refusals", http(port, "GET", "/api/transfers/refused", admin, None)?)?;
+    let of_first: Vec<Value> = refused.get("refused").and_then(Value::as_array).into_iter().flatten().filter(|r| field(r, "act").contains(&first)).cloned().collect();
+    assert!(of_first.iter().any(|r| field(r, "superseded_by") == take && field(r, "came_from").starts_with("runner box-a")), "{of_first:?}");
+    // Step 2 taken over by the owner, from a device with no key: kiln's receipt for them.
+    let took = json_of("step 2 taken over", http(port, "POST", &format!("/api/plans/runs/{run}/steps/2/take"), admin, None)?)?;
+    assert!(took.pointer("/custody/kiln_signed_for_you").is_some_and(Value::is_string), "{took}");
+    let v = chain_of(&step(2))?;
+    let kiln_for = hops(&v).first().cloned().unwrap_or_default();
+    assert_eq!(kinds(&v), ["received", "taken", "received", "handed-on"], "{v}");
+    assert!(field(&kiln_for, "custodian").ends_with("/server") && field(&kiln_for, "taken_for").ends_with("/person/admin") && field(&kiln_for, "why").contains("no key on the device that asked"), "kiln for the owner, never the owner: {kiln_for}");
+    // Step 3 taken over by sam, with a key: sam's own receipt.
+    let sam = person(port, admin, "sam")?;
+    let sams_key = certified(port, Auth::Cookie(&sam))?;
+    let (st, body) = ask(port, "POST", &format!("/api/plans/runs/{run}/steps/3/take"), Auth::Cookie(&sam), Some(&json!({ "signs": true })))?;
+    anyhow::ensure!(st == 200, "step 3 taken over by sam: {st} {body}");
+    let c = serde_json::from_str::<Value>(&body)?.get("custody").cloned().unwrap_or_default();
+    let subject: Subject = serde_json::from_value(c.get("subject").cloned().unwrap_or_default())?;
+    let b = Body { from: Some(field(&c, "from").to_owned()), why: "step 3, taken over".into(), ..Body::new(Kind::Received, "") };
+    let receipt = sams_key.sign(&Statement { subject: vec![subject], follows: vec![field(&c, "hand_on").to_owned()], ..Statement::new(to_value(&b)) })?;
+    let (st, body) = ask(port, "POST", &format!("/api/plans/runs/{run}/steps/3/receipt"), Auth::Cookie(&sam), Some(&json!({ "receipt": receipt })))?;
+    anyhow::ensure!(st == 200, "sam's receipt: {st} {body}");
+    let v = chain_of(&step(3))?;
+    let sams = hops(&v).first().cloned().unwrap_or_default();
+    assert!(field(&sams, "custodian") == sams_key.uri && sams.get("taken_for").is_none_or(Value::is_null), "sam's own: {sams}");
+    // A subagent: step 1's agent starts one for a task, handing it on signed.
+    let started = ask_as(&second, "agents.start", json!({ "kind": "claude", "prompt": "count the tests", "cwd": at }))?;
+    let child = serde_json::from_str::<Value>(&started).ok().and_then(|v| v.pointer("/ok/agents/0/id").and_then(Value::as_str).map(str::to_owned)).ok_or_else(|| anyhow::anyhow!("no subagent started: {started}"))?;
+    let task = format!("a subagent's task from agent {second}");
+    let v = received(&task, &format!("/agent/{child}/"))?;
+    assert_eq!(kinds(&v), ["received", "passed-on", "handed-on"], "{v}");
+    let custodians: Vec<String> = hops(&v).iter().map(|h| field(h, "custodian").to_owned()).collect();
+    assert!(custodians.get(1).is_some_and(|c| c.ends_with("/server")) && custodians.get(2).is_some_and(|c| c.contains(&format!("/agent/{second}/"))), "{custodians:?}");
+    // No transfer without both sides' signatures: every chain unbroken, none open.
+    for name in [step(1), step(2), step(3), task] {
+        let v = chain_of(&name)?;
+        assert!(v.get("unbroken") == Some(&json!(true)) && v.get("open") != Some(&json!(true)) && half_named(&v) == 0, "{name}: {v}");
+    }
+    Ok(())
+}

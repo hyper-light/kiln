@@ -260,6 +260,25 @@ pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, peer: crate::instances::Pe
             let_go(hub, runner, peer, session).await;
             return answer;
         }
+        // A session kiln ended as the work it held went on to another (a plan's step tried again
+        // with another agent), still running where kiln couldn't end it: what it says is refused
+        // and recorded, and its runner told to close it (W27-R08).
+        if !session.is_empty()
+            && ask.get("op").and_then(Value::as_str) != Some("registry")
+            && let Ok(Some((transfer, work, to))) = crate::custody::work_taken_from(&hub.store, session).await
+        {
+            let instance = hub.instances.lock().get(peer).map_or_else(|| "legacy".to_owned(), crate::instances::Instance::label);
+            let left = format!("agent session {session} no longer holds {work}: kiln took it for this agent and handed it to {to} (transfer {transfer})");
+            let answer = match crate::custody::refused_work_act(hub, runner, &instance, session, ask, &left, &transfer, crate::util::now_unix()).await {
+                Ok(why) => json!({"error": format!("refused: {why}"), "status": 403}),
+                Err(e) => {
+                    tracing::warn!(target: "kiln.custody", %session, error = %format!("{e:#}"), "a refused act couldn't be recorded");
+                    json!({"error": left, "status": 403})
+                }
+            };
+            let _ = hub.command_peers(runner, vec![peer], &crate::proto::ServerMsg::HarnessClose { session: session.to_owned() }).await;
+            return answer;
+        }
         return json!({"error": why});
     } else {
         session_caller(hub, session, Some(runner)).await
@@ -273,6 +292,16 @@ pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, peer: crate::instances::Pe
                 return json!({"error": format!("refused: {why}"), "status": 403});
             }
             Err(e) => return json!({"error": format!("whether the act counts couldn't be told: {e:#}"), "status": 503}),
+        }
+        // A plan step's goal said met by an agent that no longer holds the step (tried again with
+        // another, or taken over by a person): refused and recorded (W27-R08).
+        if ask.get("op").and_then(Value::as_str) == Some("call")
+            && ask.get("name").and_then(Value::as_str) == Some("goals.done")
+            && let Some((left, transfer)) = crate::plans::agents::step_left(hub, session, ask.get("input").unwrap_or(&Value::Null)).await
+        {
+            let why = crate::custody::refused_work_act(hub, runner, &instance, session, ask, &left, &transfer, crate::util::now_unix()).await.unwrap_or(left);
+            tracing::info!(target: "kiln.custody", %session, %runner, %why, "a plan step's goal said met by an agent that no longer holds it: refused");
+            return json!({"error": format!("refused: {why}"), "status": 403});
         }
     }
     let caller = match caller {
@@ -289,7 +318,17 @@ pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, peer: crate::instances::Pe
             let name = ask.get("name").and_then(Value::as_str).unwrap_or("");
             let input = ask.get("input").cloned().unwrap_or(Value::Null);
             match crate::ops::call(crate::ops::Cx { hub: Arc::clone(hub), caller }, name, input).await {
-                Ok(v) => json!({"ok": v}),
+                Ok(v) => {
+                    // Subagents started for a task the agent handed on signed: kiln passes it on
+                    // to each, signed for as each takes it up (W27-R08).
+                    if name == "agents.start"
+                        && let Some(hand_on) = ask.get("hand_on").and_then(Value::as_str).and_then(|h| serde_json::from_str::<Value>(h).ok())
+                    {
+                        let children: Vec<String> = v.get("agents").and_then(Value::as_array).into_iter().flatten().filter_map(|a| a.get("id").and_then(Value::as_str).map(str::to_owned)).collect();
+                        crate::custody::subagents_handed(hub, &format!("runner {runner}"), &hand_on, &children).await;
+                    }
+                    json!({"ok": v})
+                }
                 Err((status, msg)) => json!({"error": msg, "status": status.as_u16()}),
             }
         }

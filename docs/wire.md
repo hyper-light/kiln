@@ -559,6 +559,7 @@ Four edges are left, and the lab steers clear of each:
 | `Identity` | answer | The certificate kiln's CA issued for an `Identity` the runner asked for, or why there's none (ci.md W27-R01). A leg's comes with the server's delegation of the leg, by its digest (`delegation`, optional: ci.md W27-R05). | New: to runners that say `CAP_IDENTITY`. |
 | `Observe` | carried (observe's group) | To the runner's replica: hyper-raft's messages, and the leader's word on the writes it took. | Only to a runner announcing `CAP_OBSERVE`, on lane 5. |
 | `SignAsLeg` | ask | The provenance kiln wrote of what a leg built, for the leg to sign as itself once it's of what its attest step reported (ci.md W27-R06). Answered by `LegSignature`. | New: to runners that say `CAP_LEG_SIGNS`. |
+| `Custody` | ask | Work kiln handed one of the runner's agent sessions (a plan's step, a subagent's task, what a person handed off): its hand-on, whose receipt the process holding the session signs as the session's next turn starts (ci.md W27-R08). Answered by a `Custody` record. | New: to runners that say `CAP_CUSTODY`; sent again for work not yet received when the runner says what it holds. |
 
 ## Commands to a session: `Command`
 

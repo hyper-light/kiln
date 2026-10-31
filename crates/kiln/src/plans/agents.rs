@@ -588,6 +588,7 @@ async fn begin(hub: &Hub, run: &str, head: &Head, row: &Row) -> R<()> {
         let paused = crate::goals::get(hub, to).await.is_ok_and(|s| s.state == "paused" && s.reason.is_some());
         mark_started(hub, run, row.idx, to).await?;
         crate::goals::add_at(hub, to, goal, !paused, &At::End).await.map_err(|e| Error::Bad(format!("its goal: {e}")))?;
+        hand_step(hub, run, head, row, to).await;
         tracing::info!(%run, step = at + 1, agent = %to, "a plan step's goal goes on an agent's goal stack");
         return Ok(());
     }
@@ -627,8 +628,125 @@ async fn begin(hub: &Hub, run: &str, head: &Head, row: &Row) -> R<()> {
     let agent = started.map_err(|(_, m)| Error::Bad(m))?.ok_or_else(|| Error::Bad("the step's agent didn't start".into()))?;
     mark_started(hub, run, row.idx, &agent).await?;
     crate::goals::add_at(hub, &agent, goal, true, &At::End).await.map_err(|e| Error::Bad(format!("its goal: {e}")))?;
+    hand_step(hub, run, head, row, &agent).await;
     tracing::info!(%run, step = at + 1, %agent, "a plan step's agent started");
     Ok(())
+}
+
+/// Step `row`'s work, as its hand-overs name it: "plan run <run> step <n>", by its run, number and
+/// goal (docs/ci.md W27-R08).
+fn step_work(run: &str, row: &Row) -> kiln_ci::identity::statement::Subject {
+    let n = (row.idx + 1).to_string();
+    crate::custody::work(&format!("plan run {run} step {n}"), &[run, &n, &row.goal])
+}
+
+/// Agent session `agent`'s identity: the one kiln last certified, else at its epoch, without the
+/// process holding it. None when kiln can't say whom it acts for.
+async fn holder_of(hub: &Hub, agent: &str) -> Option<String> {
+    if let Ok(Some((_, holder))) = crate::identities::newest_holder(&hub.store, agent).await {
+        return Some(holder);
+    }
+    crate::identities::agent_at(hub, agent, hub.harness.epoch_of(agent)).await.ok()
+}
+
+/// Whom kiln acts for as the run's driver, nearest first: the agent that ran the plan, if one did,
+/// then the person its steps act for.
+async fn acts_for(hub: &Hub, head: &Head) -> Vec<String> {
+    let mut chain = Vec::new();
+    if let Some(parent) = head.config.parent.as_deref()
+        && let Some(id) = holder_of(hub, parent).await
+    {
+        chain.push(id);
+    }
+    let person = match head.config.opener.as_deref().unwrap_or(&head.config.actor) {
+        "owner" => "admin".to_owned(),
+        who => crate::identities::person_of(who),
+    };
+    chain.push(crate::custody::person_uri(&hub.pki.organization(), &person));
+    chain
+}
+
+/// Step `row` changes hands, signed (docs/ci.md W27-R08; the Transfers plan's step 6): kiln, the
+/// run's driver, hands it to `agent`, acting for the agent that ran the plan (if one did) and its
+/// person; or, tried again after another agent had it, takes it for that one. `agent` signs its
+/// receipt as it takes the step up, at its first turn (`crate::custody::ask_receipt`).
+async fn hand_step(hub: &Hub, run: &str, head: &Head, row: &Row, agent: &str) {
+    let n = row.idx + 1;
+    let to = match crate::identities::agent_at(hub, agent, hub.harness.epoch_of(agent)).await {
+        Ok(to) => to,
+        Err(e) => return tracing::warn!(target: "kiln.custody", %run, step = n, %agent, error = %format!("{e:#}"), "a plan step handed on unsigned: kiln can't name its agent"),
+    };
+    let earlier = match row.agent.as_deref().filter(|a| *a != agent) {
+        Some(a) => holder_of(hub, a).await,
+        None => None,
+    };
+    let giver = match earlier {
+        Some(e) => crate::custody::Giver::For(e),
+        None => crate::custody::Giver::Kiln { acts_for: acts_for(hub, head).await },
+    };
+    let why = format!("step {n} of plan run {run}: {}", row.title);
+    match crate::custody::hand_work(hub, step_work(run, row), &to, &why, giver).await {
+        Ok((_, bundle)) => crate::custody::ask_receipt(hub, agent, &bundle).await,
+        Err(e) => tracing::warn!(target: "kiln.custody", %run, step = n, %agent, error = %format!("{e:#}"), "a plan step's hand-on wasn't kept"),
+    }
+}
+
+/// Step `row`, taken over by `person` (their identity's URI), changes hands signed (docs/ci.md
+/// W27-R08): kiln takes it for the agent that held it and hands it to them. Their receipt is their
+/// own, signed on their device (`signs`: they send it, [`receipt`]), or kiln's for them, on their
+/// signed-in session, saying their own signature is missing and why. What they sign it from: the
+/// hand-on's digest, the step's work and whom it came from.
+async fn hand_to_person(hub: &Hub, run: &str, row: &Row, person: &str, signs: bool) -> Option<serde_json::Value> {
+    let thing = step_work(run, row);
+    let held = match row.agent.as_deref() {
+        Some(a) => holder_of(hub, a).await,
+        None => None,
+    };
+    let giver = held.clone().map_or_else(|| crate::custody::Giver::Kiln { acts_for: Vec::new() }, crate::custody::Giver::For);
+    let why = format!("step {} of plan run {run}, taken over", row.idx + 1);
+    let hand_on = match crate::custody::hand_work(hub, thing.clone(), person, &why, giver).await {
+        Ok((digest, _)) => digest,
+        Err(e) => {
+            tracing::warn!(target: "kiln.custody", %run, step = row.idx + 1, error = %format!("{e:#}"), "a step taken over: its hand-on wasn't kept");
+            return None;
+        }
+    };
+    let from = held.unwrap_or_else(|| crate::custody::server_uri(&hub.pki.organization()));
+    let kiln_signed = if signs {
+        None
+    } else {
+        match crate::custody::receive_for(hub, person, thing.clone(), &hand_on, &from, &why).await {
+            Ok(d) => Some(d),
+            Err(e) => {
+                tracing::warn!(target: "kiln.custody", %run, step = row.idx + 1, error = %format!("{e:#}"), "a step taken over: kiln's receipt for the person wasn't kept");
+                None
+            }
+        }
+    };
+    Some(serde_json::json!({ "hand_on": hand_on, "subject": thing, "from": from, "to": person, "kiln_signed_for_you": kiln_signed }))
+}
+
+/// Whether agent session `session` saying a goal is met (`input`: its `id`, else the one under
+/// way) is refused because the goal is a plan step's that changed hands since: tried again with
+/// another agent, or taken over by a person (docs/ci.md W27-R08). Why, saying where it went, and
+/// the step's hand-over that superseded it.
+pub async fn step_left(hub: &Hub, session: &str, input: &serde_json::Value) -> Option<(String, String)> {
+    let stack = crate::goals::get(hub, session).await.ok()?;
+    let goal = match input.get("id").and_then(serde_json::Value::as_str) {
+        Some(id) => stack.items.iter().find(|g| g.id == id),
+        None => stack.items.iter().find(|g| g.status == "active"),
+    }?;
+    let step = goal.step.as_ref()?;
+    let run = step.run.as_deref()?;
+    let (_, rows) = load_run(hub, run).await.ok()?;
+    let row = step_row(&rows, step.n).ok()?;
+    let why = match (row.status.as_str(), row.agent.as_deref()) {
+        ("taken", _) => format!("step {} of plan run {run} changed hands: {}; this agent no longer holds it", step.n, row.reason.clone().unwrap_or_else(|| "taken over".into())),
+        (_, Some(a)) if a != session => format!("step {} of plan run {run} changed hands: it went to agent {a}, tried again; this agent no longer holds it", step.n),
+        _ => return None,
+    };
+    let transfer = crate::custody::newest_hand_on(&hub.store, &step_work(run, row)).await.ok().flatten().unwrap_or_default();
+    Some((why, transfer))
 }
 
 /// How a started step's goal came out: `Some((met, why))` once it ended.
@@ -865,9 +983,12 @@ pub async fn retry(hub: &Arc<Hub>, run: &str, n: usize, seen: Option<i64>, by: &
 }
 
 /// A person takes step `n` over: kiln no longer holds its agent to the goal (they work with it
-/// themselves), and the steps waiting for it wait until they say it's met.
-pub async fn take(hub: &Hub, run: &str, n: usize, by: &str) -> R<Run> {
-    {
+/// themselves), and the steps waiting for it wait until they say it's met. Taken over by `person`
+/// (their identity's URI), it changes hands signed (docs/ci.md W27-R08): the run as it is, and, as
+/// `custody`, what they sign their receipt from on their device (`signs`, [`receipt`]) or the
+/// receipt kiln signed for them.
+pub async fn take(hub: &Hub, run: &str, n: usize, by: &str, person: Option<&str>, signs: bool) -> R<serde_json::Value> {
+    let custody = {
         let lock = looking(run);
         let _one = lock.lock().await;
         let (_, rows) = load_run(hub, run).await?;
@@ -878,9 +999,32 @@ pub async fn take(hub: &Hub, run: &str, n: usize, by: &str) -> R<Run> {
         let_go(hub, run, row, false).await;
         set_step(hub, run, row.idx, "taken", Some(format!("taken over by {by}"))).await?;
         set_run(hub, run, "running", None).await?;
-    }
+        match person {
+            Some(p) => hand_to_person(hub, run, row, p, signs).await,
+            None => None,
+        }
+    };
     hub.store.audit(by.to_owned(), "plan.run.take".into(), format!("{run} step {n}")).await;
-    view(hub, run).await
+    let mut v = serde_json::to_value(view(hub, run).await?).map_err(anyhow::Error::from)?;
+    if let (Some(c), Some(o)) = (custody, v.as_object_mut()) {
+        o.insert("custody".into(), c);
+    }
+    Ok(v)
+}
+
+/// Person `person`'s own receipt of step `n`, which they took over (`receipt`: signed on their
+/// device with `kiln login`'s key, following the hand-on that taking it over answered with): kept
+/// if it's theirs and of that hand-on (docs/ci.md W27-R08). Its digest, and the hand-on's.
+pub async fn receipt(hub: &Hub, run: &str, n: usize, person: &str, receipt: &serde_json::Value) -> R<serde_json::Value> {
+    let (_, rows) = load_run(hub, run).await?;
+    let row = step_row(&rows, n)?;
+    let Some(hand_on) = crate::custody::handed_to(&hub.store, person, &step_work(run, row)).await? else {
+        return Err(Error::Bad(format!("step {n} wasn't handed to {person}: take it over first")));
+    };
+    match crate::custody::person_receipt(hub, person, &hand_on, receipt, &format!("api:{person}")).await? {
+        Ok(digest) => Ok(serde_json::json!({ "receipt": digest, "hand_on": hand_on })),
+        Err(why) => Err(Error::Bad(why)),
+    }
 }
 
 /// A person says step `n` is met (one they took over, or one they judge done): the steps waiting

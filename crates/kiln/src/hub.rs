@@ -2109,7 +2109,14 @@ impl Hub {
                     if let Some(label) = holder {
                         self.harness.held_by(&session, &label);
                     }
+                    // Opened: the work kiln handed it as it started is asked to be signed for, as
+                    // it takes it up (docs/ci.md W27-R08).
+                    let opened = matches!(u, crate::harness::core::Update::Open { .. });
                     self.harness.ingest_from(self, &crate::harness::registry::Location::Machine(agent.clone()), &session, u, shipped);
+                    if opened {
+                        let (hub, id) = (Arc::clone(self), session.clone());
+                        crate::rt::spawn(async move { crate::custody::ask_open(&hub, &id).await });
+                    }
                     if closed {
                         self.check_retire().await;
                         self.check_handover().await;
@@ -2131,6 +2138,9 @@ impl Hub {
                     // This process's sessions are its own; another process of the machine keeps
                     // the ones it holds (the registry forgets sessions a report leaves out), and
                     // so does one that isn't connected now (`Registry::holder`).
+                    // Work kiln handed them that no receipt answers yet is asked for again.
+                    let (hub, held) = (Arc::clone(self), inv.sessions.clone());
+                    crate::rt::spawn(async move { crate::custody::ask_again(&hub, peer, &held).await });
                     let (me, present, others) = {
                         let mut inst = self.instances.lock();
                         for id in &inv.sessions {

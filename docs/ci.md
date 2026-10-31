@@ -9122,7 +9122,7 @@ delegation of it.
   - Ship shows none of this yet (the CI/CD Integration plan's).
 
 **Built: custody, and agent sessions handed over signed (R08, in part).** Plan
-`01a17856b1b477eda14a574ae312a123`, its steps 1 to 5; research `01a18abf2d28762d92104dca2fbfbf89`.
+`01a17856b1b477eda14a574ae312a123`, its steps 1 to 6; research `01a18abf2d28762d92104dca2fbfbf89`.
 
 - *Custody records* are signed statements (`kiln_ci::identity::statement`) whose body says the
   things they're about were handed on, received, passed on unchanged by a relay, or taken by kiln's
@@ -9202,6 +9202,27 @@ delegation of it.
   for ten minutes after its machine came back. A session just arriving, at the epoch it goes on
   at, isn't one. Updates go by where the session runs, not by signatures: only the machine it runs on
   speaks for it, and of two of that machine's processes that say they hold it, the newer.
+- *Work handed* (step 6): a plan's step, a subagent's task, what a person hands off in Ship, and a
+  step a person takes over change hands as custody records of the work (`kiln-work-v1`: "plan run
+  <run> step <n>" by its run, number and goal; a task by its words; a hand-off by its commit and what
+  was handed). kiln, a plan run's driver, hands each step to its agent at its epoch, saying whom it
+  acts for, nearest first (`acts_for`: the agent that ran the plan, its person); tried again, it
+  takes the step for the agent before (following that agent's receipt of it) and hands it to the
+  next. An agent's subagent task is the agent's own hand-on, signed by its runner beside its
+  `agents.start` ask, to kiln's server, which passes it on unchanged to each subagent it starts (a
+  relay's record). The agent given work signs its receipt as it takes it up, at its next turn: kiln
+  asks its runner (`ServerMsg::Custody`), again when it opens or its runner says what it holds, and
+  the receipt waits there for the session's identity if it isn't certified yet. A person's side is
+  theirs when they sign it on their device: `kiln plans take <run> <n>` takes a step over and signs
+  the receipt with the key `kiln login` made (`POST /api/plans/runs/<run>/steps/<n>/take` with
+  `signs`, then `…/receipt`); Ship's Hand off takes the person's own signed hand-on beside it. Without
+  a key, kiln's server signs for them on their signed-in session (a take, or a receipt, `taken_for`
+  the person), saying their own signature is missing and why; a walk reads that link as kiln's for
+  them, never as theirs (`taken_for` on its hop), and the page says in place how to get a key. Once a
+  step changes hands, what its former agent says of it is refused and recorded with the transfer
+  that superseded it: a goal met for a step tried again or taken over, and, from an agent kiln ended
+  as the step went on to another (still running where kiln couldn't end it), any act, its runner
+  told to close it.
 - *A resume from the server's store* is kiln's take: signed with the server's own key for the
   identity kiln last certified the session as at that epoch (`identities::holder_at`), to the next,
   saying when kiln last heard from the machine; kiln keeps it at once, the package carries it, and
@@ -9232,15 +9253,26 @@ delegation of it.
   `w27_ac05_the_twin_played_again` (a session moved off a machine cut off goes on elsewhere from
   kiln's copy; the copy marks its goal met, starts a CI run and a run on another machine: none
   done, each recorded with the epoch it's from and the transfer that superseded it, the copy told
-  to let go once its machine is back, the session at its next epoch untouched). Nightly:
+  to let go once its machine is back, the session at its next epoch untouched). Work: kiln-ci's
+  `w27_r08_kiln_takes_for_a_person_with_no_key`, `custody::w27_r08_work_changes_hands_signed_by_both_sides`,
+  `runner::custody::w27_r08_work_handed_is_received_at_the_sessions_next_turn`,
+  `ship::w27_r08_a_hand_off_changes_hands_signed` (a failure handed off from a device with no key:
+  kiln's take for the person, answered by the agent's receipt), and `w27_r08_work_handed` (a plan run with an agent per step: each step signed for at its agent's
+  first turn; one tried again, the agent before refused and recorded as it says it's met; one taken
+  over without a key, kiln's receipt for the person, one with a key, the person's own; a subagent's
+  task handed on, passed on and received; every chain unbroken, none open); in the UI,
+  `e2e/plan-run-take.spec.ts` and `ship-hand-off.spec.ts` (the line saying how a take-over or a
+  hand-off from a browser is signed, in Chromium and WebKit at desktop and phone widths). Nightly:
   `.kiln/custody-lab.yaml`.
 - *Not yet.* A session's package isn't yet addressed to the process it goes to (its hand-on is to
   the session at its next epoch); a runner's Open at a later epoch still raises the epoch the
   registry keeps (what its inbox and updates are fenced by) before its transfer is recorded, though
   acts are held to the epoch kiln certified; what a copy left behind does on its own machine
-  without kiln goes on until its runner hears from kiln (docs/agents.md, "A copy left behind");
-  work handed between agents, changes, review requests, carried approvals, promotions, replant,
-  artifacts, machines and intermediaries (steps 6 to 16).
+  without kiln goes on until its runner hears from kiln (docs/agents.md, "A copy left behind"); a
+  person signs on their device only through the CLI until the browser has a key of its own (the
+  signing plan's step 4); an agent kiln's server runs itself (`local`) signs no receipt of work
+  handed to it yet, so its hand-on stays unanswered; changes, review requests, carried approvals, promotions, replant,
+  artifacts, machines and intermediaries (steps 7 to 16).
 
 ### W28 Demand-driven CI: adopt, cover, stagger, land by conflict graph
 

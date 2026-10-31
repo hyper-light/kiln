@@ -2924,6 +2924,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         };
                         uplink.msg(AgentMsg::LegSignature { job, nonce, bundle, error }).await;
                     }
+                    // Work kiln handed one of its agent sessions: its receipt is signed as the
+                    // session takes it up, at its next turn (docs/ci.md W27-R08).
+                    ServerMsg::Custody { json } => crate::runner::custody::handed(&json),
                     // A message for an epoch (CP-T3.2): through its session's inbox, which answers.
                     ServerMsg::HarnessSend { session, epoch, json } => {
                         let known = harness.as_ref().is_some_and(|h| h.get(&session).is_some());
@@ -3704,21 +3707,30 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 note_announced(&mut announced, &session, &u);
                 // Each session this process holds has an identity at its epoch, asked for until it
                 // has one; one that closed lets go of its keys (docs/ci.md W27-R01).
+                let mut took_up = false;
                 match &u {
                     crate::harness::core::Update::Open { info, .. } => {
                         session_epochs.insert(session.clone(), info.epoch);
                     }
-                    // It went on at a later epoch (a blue/green take-over, once recorded).
+                    // It went on at a later epoch (a blue/green take-over, once recorded). A turn
+                    // starting takes up the work kiln handed it, signed for (W27-R08).
                     crate::harness::core::Update::State { state } => {
                         if let Some(e) = session_epochs.get_mut(&session) {
                             *e = (*e).max(state.epoch);
                         }
+                        took_up = crate::runner::custody::status(&session, &state.status);
                     }
                     crate::harness::core::Update::Closed => {
                         session_epochs.remove(&session);
                         crate::runner::identity::forget_prefix(&format!("agent/{session}/"));
+                        crate::runner::custody::closed(&session);
                     }
                     _ => {}
+                }
+                if took_up && server_custody && connected {
+                    for json in crate::runner::custody::drain() {
+                        uplink.0.send(Up::Term(AgentMsg::Custody { json })).await.ok();
+                    }
                 }
                 if server_identity
                     && connected
@@ -3801,7 +3813,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
             }
             Ev::Heartbeat => {
-                // Custody records signed since (a session's hand-on or receipt, docs/ci.md W27-R08).
+                // Custody records signed since (a session's hand-on or receipt, docs/ci.md W27-R08),
+                // with the receipts of work taken up before this process held the session's identity.
+                crate::runner::custody::take_up_due();
                 if server_custody && connected {
                     for json in crate::runner::custody::drain() {
                         uplink.0.send(Up::Term(AgentMsg::Custody { json })).await.ok();
