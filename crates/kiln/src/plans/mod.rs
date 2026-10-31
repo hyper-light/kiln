@@ -5,6 +5,7 @@
 //! serve the console (`/api/plans`), agents (kiln's MCP server: `plans.*`) and code mode.
 
 pub mod agents;
+pub mod cli;
 pub mod criteria;
 pub mod ops;
 pub mod stack;

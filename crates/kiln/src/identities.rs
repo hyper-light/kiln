@@ -262,6 +262,13 @@ async fn person_signed_in(store: &Store, caller: &crate::authz::Caller) -> Resul
     person_name(name.as_deref()).map_err(PersonRefused::Unnamed)
 }
 
+/// The identity of the person `caller` is, as `kiln login` certifies it (`kiln://<org>/person/<name>`):
+/// never an agent's, a job's or a peer's (docs/ci.md W27-R08: whom work handed to a person goes to).
+pub async fn person_identity(store: &Store, org: &str, caller: &crate::authz::Caller) -> Result<String, PersonRefused> {
+    let name = person_signed_in(store, caller).await?;
+    Identity::new(org, Actor::Person { name }).uri().map_err(|e| PersonRefused::Unnamed(e.to_string()))
+}
+
 /// Whether `signer`, a certificate's identity, is `caller` (W27-R04): the person signed in, or the
 /// agent session they are, for the person kiln says it acts for, at whatever epoch and on whatever
 /// runner holds its key.
@@ -466,6 +473,49 @@ struct Kept {
 enum Cred<'a> {
     Bearer(&'a str),
     Cookie(&'a str),
+}
+
+/// `POST <path>` with `body` to the server `kiln login` signed this device in to, as the person it
+/// signed in as (docs/ci.md W27-R08: what a person signs on this device is theirs, so it's asked
+/// as them): its answer, or why not. A sign-in that's the machine's admin token is found again.
+pub async fn post_as_person(cfg: &crate::config::Config, path: &str, body: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    use anyhow::Context as _;
+    let dir = device_dir();
+    let kept: Kept = serde_json::from_str(&std::fs::read_to_string(dir.join("identity.json")).context("this device isn't signed in: `kiln login` first")?)?;
+    let found;
+    let cred = match &kept.sign_in {
+        SignIn::Token(t) => Cred::Bearer(t),
+        SignIn::Session(s) => Cred::Cookie(s),
+        SignIn::Found => {
+            found = crate::access::resolve(cfg, Some(&kept.url), None).await?.token;
+            Cred::Bearer(&found)
+        }
+    };
+    let client = crate::http::client::Client::public()?;
+    let req = client.post(&format!("{}{path}", kept.url.trim_end_matches('/'))).json(body);
+    let req = match cred {
+        Cred::Bearer(t) => req.bearer(t),
+        Cred::Cookie(s) => req.header("Cookie", &format!("kiln_session={s}")),
+    };
+    let resp = req.send().await?;
+    let status = resp.status();
+    let v: serde_json::Value = resp.json(1 << 20).await.unwrap_or_default();
+    anyhow::ensure!((200..300).contains(&status), "{}", v.get("error").and_then(serde_json::Value::as_str).map_or_else(|| format!("HTTP {status}"), str::to_owned));
+    Ok(v)
+}
+
+/// `s` signed on this device as `payload_type`, with the key `kiln login` made it: its Sigstore
+/// bundle (docs/ci.md W27-R08: a person's receipt, signed on their own device).
+pub fn device_signed(payload_type: &str, s: &kiln_ci::identity::statement::Statement) -> anyhow::Result<serde_json::Value> {
+    use anyhow::Context as _;
+    use kiln_ci::identity::statement;
+    use rcgen::SigningKey as _;
+    let dir = device_dir();
+    let key = std::fs::read_to_string(dir.join("identity.key")).with_context(|| format!("this device has no key to sign with ({}): `kiln login` makes one", dir.display()))?;
+    let cert = std::fs::read_to_string(dir.join("identity.pem")).with_context(|| format!("this device's key has no certificate ({}): `kiln login` again", dir.display()))?;
+    let payload = statement::payload(s)?;
+    let signature = rcgen::KeyPair::from_pem(&key).context("this device's key")?.sign(&statement::to_sign(payload_type, &payload))?;
+    Ok(statement::bundle(payload_type, &payload, &signature, &crate::pki::der_of(&cert)?))
 }
 
 /// This device's certificate, as kiln issued it.
@@ -891,13 +941,26 @@ async fn agent_identity(hub: &Hub, machine: &str, instance: &str, session: &str,
     anyhow::ensure!(info.target == format!("agent:{machine}"), "agent session {session} runs on {}, not {machine}", info.target);
     let known = hub.harness.epoch_of(session);
     anyhow::ensure!(epoch >= known, "agent session {session} is at epoch {known}; epoch {epoch} is a copy left behind");
-    let person = match crate::mcp::whose(hub, session).await {
+    let person = agent_person(hub, session).await?;
+    let held_by = Some(Holder { machine: machine.to_owned(), instance: instance.to_owned() });
+    Ok(Identity::new(hub.pki.organization(), Actor::Agent { person, agent: session.to_owned(), epoch, held_by }))
+}
+
+/// The person agent session `session` acts for, as its identities name them.
+async fn agent_person(hub: &Hub, session: &str) -> anyhow::Result<String> {
+    Ok(match crate::mcp::whose(hub, session).await {
         Some(p) if p == "owner" => "admin".to_owned(),
         Some(p) => person_of(&p),
         None => anyhow::bail!("kiln can't say whom agent session {session} acts for"),
-    };
-    let held_by = Some(Holder { machine: machine.to_owned(), instance: instance.to_owned() });
-    Ok(Identity::new(hub.pki.organization(), Actor::Agent { person, agent: session.to_owned(), epoch, held_by }))
+    })
+}
+
+/// Agent session `session`'s identity at `epoch`, without the runner process that holds its key
+/// (`…/agent/<s>/epoch/<n>`): whom work handed to it goes to, before kiln has certified it there
+/// (docs/ci.md W27-R08; the Transfers plan's step 6).
+pub async fn agent_at(hub: &Hub, session: &str, epoch: u64) -> anyhow::Result<String> {
+    let person = agent_person(hub, session).await?;
+    Ok(Identity::new(hub.pki.organization(), Actor::Agent { person, agent: session.to_owned(), epoch, held_by: None }).uri()?)
 }
 
 /// A CI leg's identity, for the runner process of `machine` it was given to: its run's number,

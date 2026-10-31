@@ -780,6 +780,13 @@ pub enum ServerMsg {
     /// of what the leg reported (docs/ci.md W27-R06); it answers [`AgentMsg::LegSignature`]. Only to
     /// runners announcing [`CAP_LEG_SIGNS`]. Appended last: postcard encodes variants by index.
     SignAsLeg { job: String, nonce: String, payload_type: String, payload: Vec<u8> },
+    /// Work kiln's server handed one of the runner's agent sessions (docs/ci.md W27-R08; the
+    /// Transfers plan's step 6): `{session, hand_on}`, the hand-on (a Sigstore bundle, as JSON) of a
+    /// plan's step, a subagent's task or what a person handed off, whose receipt the runner
+    /// process holding the session signs as the session's next turn starts (it takes the work up
+    /// then) and sends ([`AgentMsg::Custody`]). Only to runners announcing [`CAP_CUSTODY`].
+    /// Appended last: postcard encodes variants by index.
+    Custody { json: String },
 }
 
 /// What the server's copy of one agent session has of its events, said in digests
@@ -1168,6 +1175,12 @@ mod tests {
         assert_eq!(decode::<AgentMsg>(&b)?, custody);
         let before = CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_AGENT_GIT | CAP_LEG_SIGNS;
         assert!(CAP_CUSTODY.is_power_of_two() && CAP_CUSTODY == 1 << 44 && CAP_CUSTODY & before == 0);
+        // The server's ask for a receipt of work handed (step 6), after the legs' SignAsLeg.
+        let sign_as_leg = encode(&ServerMsg::SignAsLeg { job: "j".into(), nonce: "n".into(), payload_type: String::new(), payload: Vec::new() })?;
+        let asked = ServerMsg::Custody { json: "{}".into() };
+        let b = encode(&asked)?;
+        assert_eq!(b.first().copied(), sign_as_leg.first().map(|i| i + 1), "ServerMsg::Custody comes right after SignAsLeg");
+        assert_eq!(decode::<ServerMsg>(&b)?, asked);
         Ok(())
     }
 

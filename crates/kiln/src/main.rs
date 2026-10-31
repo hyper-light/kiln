@@ -259,6 +259,8 @@ enum Cmd {
     Verify(kiln::verify::VerifyArgs),
     /// What kiln refused because its signer no longer held what it acted on (W27-R08).
     Transfers(kiln::custody::TransfersArgs),
+    /// A plan run's step taken over from here, your receipt of it signed on this device (W27-R08).
+    Plans(kiln::plans::cli::PlansArgs),
     /// Forget a runner: it's removed and its certificates revoked from now on; enrolling the
     /// machine again brings a new certificate.
     Forget(kiln::identities::ForgetArgs),
@@ -1095,6 +1097,10 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         Cmd::Verify(a) => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
             boxed(|| kiln::verify::cli(a, &cfg)).await
+        }
+        Cmd::Plans(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::plans::cli::cli(a, &cfg)).await
         }
         Cmd::Identities(a) => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();

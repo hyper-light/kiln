@@ -379,6 +379,11 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/diffs/*/abandon", "diffs.submit", At::Diff(2)),
     r("POST", "/api/diffs/*/reclaim", "diffs.submit", At::Diff(2)),
     r("POST", "/api/diffs/*/commandeer", "diffs.submit", At::Diff(2)),
+    // A change given and taken, a review request passed on and taken, signed (W27-R08).
+    r("POST", "/api/diffs/*/give", "diffs.submit", At::Diff(2)),
+    r("POST", "/api/diffs/*/take", "diffs.submit", At::Diff(2)),
+    r("POST", "/api/diffs/*/reviewers/pass", "diffs.review", At::Diff(2)),
+    r("POST", "/api/diffs/*/reviewers/take", "diffs.review", At::Diff(2)),
     r("PATCH", "/api/diffs/*", "diffs.submit", At::Diff(2)),
     r("POST", "/api/diffs/*/labels", "diffs.review", At::Diff(2)),
     r("DELETE", "/api/diffs/*/labels/*", "diffs.review", At::Diff(2)),

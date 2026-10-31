@@ -330,8 +330,9 @@ enum Bg {
     Fetched { job: String, exe: PathBuf, build: String },
     /// The new build's runner is connected and ready: hand it everything.
     #[cfg(unix)]
-    /// `custody`: the new build takes sessions signed for (docs/ci.md W27-R08).
-    Ready { job: String, conn: Arc<crate::bluegreen::Conn>, custody: bool },
+    /// `custody`: the new build takes sessions signed for (docs/ci.md W27-R08); `role`: its instance,
+    /// when it takes the machine's runner role signed for too.
+    Ready { job: String, conn: Arc<crate::bluegreen::Conn>, custody: bool, role: Option<String> },
     /// Everything was sent: what the new build said of each, in order (`broke`: the connection
     /// failed part-way).
     #[cfg(unix)]
@@ -844,7 +845,7 @@ async fn take_over_from(path: PathBuf, harness: Option<Arc<crate::harness::host:
     let conn = Arc::new(crate::rt::blocking(move || crate::bluegreen::connect(&path)).await??);
     let c = Arc::clone(&conn);
     let (custody, instance) = (crate::runner::custody::signs(), me.instance.clone());
-    crate::rt::blocking(move || c.send(&Frame::Ready { pid: std::process::id(), instance, custody }, &[])).await??;
+    crate::rt::blocking(move || c.send(&Frame::Ready { pid: std::process::id(), instance, custody, role: custody }, &[])).await??;
     tracing::info!(upgrade = %std::env::var("KILN_UPGRADE_ID").unwrap_or_default(), "connected to the runner being upgraded: taking over");
     // Read on a thread of its own: once everything is in, the connection stays open (idle) until
     // the old runner ends.
@@ -912,6 +913,12 @@ async fn take_over_from(path: PathBuf, harness: Option<Arc<crate::harness::host:
                     let _ = tx.send(Bg::Forwarded(d)).await;
                 }
                 continue;
+            }
+            // The machine's runner role: this process's receipt, signed once its own identity is
+            // certified, goes to the server with blue's hand-on (docs/ci.md W27-R08).
+            Frame::Role { hand_on } => {
+                crate::runner::custody::role_taken(&hand_on);
+                ("runner role".to_owned(), Ok(()))
             }
             Frame::Ready { .. } | Frame::Ack { .. } => continue,
         };
@@ -1717,7 +1724,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 let (tx, j) = (bg_tx.clone(), job.clone());
                                 let waited = std::thread::Builder::new().name("kiln-upgrade".into()).spawn(move || {
                                     let _ = match listener.ready(green.pid, Instant::now() + crate::bluegreen::READY_WITHIN) {
-                                        Ok((conn, _, custody)) => tx.send_blocking(Bg::Ready { job: j, conn: Arc::new(conn), custody }),
+                                        Ok((conn, instance, custody, role)) => tx.send_blocking(Bg::Ready { job: j, conn: Arc::new(conn), custody, role: role.then_some(instance) }),
                                         Err(e) => tx.send_blocking(Bg::Failed { job: j, why: format!("{e:#}") }),
                                     };
                                 });
@@ -1738,7 +1745,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             }
                         }
                     }
-                    Bg::Ready { job, conn, custody } => {
+                    Bg::Ready { job, conn, custody, role } => {
                         let Some(mv) = moving.as_mut() else { continue };
                         if let Some(h) = mv.healthy.take() {
                             h.record("result", "ok");
@@ -1791,6 +1798,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 moved.insert(crate::instances::Owned::Agent(id));
                                 mv.items.push(Item::Session { record: Box::new(rec), kept });
                             }
+                        }
+                        // The machine's runner role, last, signed for as it goes to a new build that
+                        // takes it so (docs/ci.md W27-R08; the Transfers plan's step 8). Its answer
+                        // comes after every item's, so it pairs with none of them.
+                        if let Some(to) = role.as_deref()
+                            && let Some(hand_on) = crate::runner::custody::role_hand_on(to)
+                        {
+                            frames.push((Frame::Role { hand_on }, Vec::new()));
                         }
                         let (sessions, terminals) = (mv.items.iter().filter(|i| matches!(i, Item::Session { .. })).count(), mv.items.iter().filter(|i| matches!(i, Item::Terminal { .. })).count());
                         let line = format!("the new build is connected to the server: handing it {sessions} agent session(s) and {terminals} terminal(s), their processes running on");
@@ -2897,6 +2912,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         if let Err(e) = crate::runner::identity::given(&json, &o.state_dir, &label) {
                             tracing::warn!(error = %format!("{e:#}"), "an identity kiln sent couldn't be kept");
                         }
+                        // The runner role handed to this process, signed for once its own
+                        // identity is (W27-R08).
+                        crate::runner::custody::role_due();
                         // A session's identity at an epoch it was taken over at: its receipt went
                         // with the ask, and kiln recorded it. Taken over blue/green, it goes on at
                         // that epoch now.
@@ -2924,6 +2942,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         };
                         uplink.msg(AgentMsg::LegSignature { job, nonce, bundle, error }).await;
                     }
+                    // Work kiln handed one of its agent sessions: its receipt is signed as the
+                    // session takes it up, at its next turn (docs/ci.md W27-R08).
+                    ServerMsg::Custody { json } => crate::runner::custody::handed(&json),
                     // A message for an epoch (CP-T3.2): through its session's inbox, which answers.
                     ServerMsg::HarnessSend { session, epoch, json } => {
                         let known = harness.as_ref().is_some_and(|h| h.get(&session).is_some());
@@ -3704,21 +3725,30 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 note_announced(&mut announced, &session, &u);
                 // Each session this process holds has an identity at its epoch, asked for until it
                 // has one; one that closed lets go of its keys (docs/ci.md W27-R01).
+                let mut took_up = false;
                 match &u {
                     crate::harness::core::Update::Open { info, .. } => {
                         session_epochs.insert(session.clone(), info.epoch);
                     }
-                    // It went on at a later epoch (a blue/green take-over, once recorded).
+                    // It went on at a later epoch (a blue/green take-over, once recorded). A turn
+                    // starting takes up the work kiln handed it, signed for (W27-R08).
                     crate::harness::core::Update::State { state } => {
                         if let Some(e) = session_epochs.get_mut(&session) {
                             *e = (*e).max(state.epoch);
                         }
+                        took_up = crate::runner::custody::status(&session, &state.status);
                     }
                     crate::harness::core::Update::Closed => {
                         session_epochs.remove(&session);
                         crate::runner::identity::forget_prefix(&format!("agent/{session}/"));
+                        crate::runner::custody::closed(&session);
                     }
                     _ => {}
+                }
+                if took_up && server_custody && connected {
+                    for json in crate::runner::custody::drain() {
+                        uplink.0.send(Up::Term(AgentMsg::Custody { json })).await.ok();
+                    }
                 }
                 if server_identity
                     && connected
@@ -3801,7 +3831,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
             }
             Ev::Heartbeat => {
-                // Custody records signed since (a session's hand-on or receipt, docs/ci.md W27-R08).
+                // Custody records signed since (a session's hand-on or receipt, docs/ci.md W27-R08),
+                // with the receipts of work taken up before this process held the session's identity.
+                crate::runner::custody::take_up_due();
+                crate::runner::custody::role_due();
                 if server_custody && connected {
                     for json in crate::runner::custody::drain() {
                         uplink.0.send(Up::Term(AgentMsg::Custody { json })).await.ok();

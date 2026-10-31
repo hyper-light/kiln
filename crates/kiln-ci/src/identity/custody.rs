@@ -99,13 +99,20 @@ pub struct Body {
     /// Whom its signer holds them for, when not itself: a session, a person.
     #[serde(rename = "for", default, skip_serializing_if = "Option::is_none")]
     pub held_for: Option<String>,
+    /// Whom its signer acts for here, nearest first, back to the person: a plan's step kiln hands
+    /// on as the run's driver, for the agent that ran the plan, for its person (W27-R08's nested
+    /// actors). Said, as its signer knows them; who each acts for is its certificate's.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acts_for: Vec<String>,
     /// What for: "leg 812/1's checkout", "deploy kiln-production".
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub why: String,
     /// The part of its signer that holds them: kiln's registry, its cache, a runner's mirror.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub component: Option<String>,
-    /// A take's: the giver that couldn't sign, whose custody kiln's server hands on.
+    /// A take's: the giver that couldn't sign, whose custody kiln's server hands on. Or kiln's
+    /// receipt's: the taker that couldn't (a person with no key on the device that asked), for whom
+    /// kiln's server takes them. A walk reads either link as kiln's for them, never as theirs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub taken_for: Option<String>,
     /// An agent session's transfer: the epoch it goes on at.
@@ -120,7 +127,7 @@ pub struct Body {
 impl Body {
     /// A record of `kind` signed `by` (an identity's URI), between no one yet.
     pub fn new(kind: Kind, by: &str) -> Self {
-        Self { v: VERSION, kind, by: by.to_owned(), to: None, from: None, held_for: None, why: String::new(), component: None, taken_for: None, epoch: None, said_at: None }
+        Self { v: VERSION, kind, by: by.to_owned(), to: None, from: None, held_for: None, acts_for: Vec::new(), why: String::new(), component: None, taken_for: None, epoch: None, said_at: None }
     }
 
     /// Whether it's well formed, or why not.
@@ -137,8 +144,9 @@ impl Body {
         }
         match (self.kind, &self.taken_for) {
             (Kind::Taken, who) if !named(who) => Err("it's a take but names no giver it takes for".into()),
-            (Kind::Taken, _) | (_, None) => Ok(()),
-            (kind, Some(_)) => Err(format!("it says they were {kind}, and only a take names a giver it takes for")),
+            (Kind::Received, who @ Some(_)) if !named(who) => Err("it's kiln's receipt for someone but names no one".into()),
+            (Kind::Taken | Kind::Received, _) | (_, None) => Ok(()),
+            (kind, Some(_)) => Err(format!("it says they were {kind}, and only a take, or kiln's receipt for someone, names whom kiln acts for")),
         }
     }
 }
@@ -296,6 +304,9 @@ pub struct Hop {
     pub kind: Kind,
     /// Its signer.
     pub custodian: String,
+    /// A take's or kiln's receipt's: whom kiln's server signed it for ("kiln for sam"), who
+    /// didn't sign it.
+    pub taken_for: Option<String>,
     /// When kiln took it.
     pub at: i64,
     pub subject: Vec<Subject>,
@@ -431,6 +442,17 @@ pub fn names(named: &str, signer: &str) -> bool {
     agent_epoch && signer.strip_prefix(named).is_some_and(|rest| rest.starts_with("/machine/"))
 }
 
+/// Whose custody record `c` (body `b`) is: its signer's; a take's giver's, for whom kiln's server
+/// hands on (a take signed by another breaks as [`Break::TakenNotByServer`] where it's taken); or,
+/// kiln's receipt for a taker who couldn't sign, theirs ("kiln for sam").
+fn custodian_for(c: &Checked, b: &Body, server: &str) -> String {
+    match (&b.taken_for, b.kind) {
+        (Some(who), Kind::Taken) => who.clone(),
+        (Some(who), _) if c.custodian == server => who.clone(),
+        _ => c.custodian.clone(),
+    }
+}
+
 /// How a record follows another.
 enum Edge {
     /// It takes what the other gave it.
@@ -465,11 +487,16 @@ fn edge(r: &Checked, rb: &Body, p: &Checked, pb: &Body, server: &str) -> Result<
         if pb.kind == Kind::Taken && p.custodian != server {
             return Err(Break::TakenNotByServer { record: from, signer: p.custodian.clone(), server: server.to_owned() });
         }
-        let to = pb.to.clone().unwrap_or_default();
-        if !names(&to, &r.custodian) {
-            return Err(Break::NotTheTaker { record, from, to, signer: r.custodian.clone() });
+        // kiln's receipt for a taker that couldn't sign: only kiln's server signs one.
+        if rb.taken_for.is_some() && r.custodian != server {
+            return Err(Break::TakenNotByServer { record, signer: r.custodian.clone(), server: server.to_owned() });
         }
-        let giver = if pb.kind == Kind::Taken { pb.taken_for.clone().unwrap_or_default() } else { p.custodian.clone() };
+        let to = pb.to.clone().unwrap_or_default();
+        let taker = custodian_for(r, rb, server);
+        if !names(&to, &taker) {
+            return Err(Break::NotTheTaker { record, from, to, signer: taker });
+        }
+        let giver = custodian_for(p, pb, server);
         let says = rb.from.clone().unwrap_or_default();
         if !names(&says, &giver) && !names(&giver, &says) {
             return Err(Break::NotTheGiver { record, from, says, giver });
@@ -480,9 +507,9 @@ fn edge(r: &Checked, rb: &Body, p: &Checked, pb: &Body, server: &str) -> Result<
     if !pb.kind.takes() {
         return Err(out_of_order());
     }
-    let holder = if rb.kind == Kind::Taken { rb.taken_for.clone().unwrap_or_default() } else { r.custodian.clone() };
-    if !names(&holder, &p.custodian) {
-        return Err(Break::NotTheHolder { record, from, holder: p.custodian.clone(), signer: holder });
+    let (holder, held) = (custodian_for(r, rb, server), custodian_for(p, pb, server));
+    if !names(&holder, &held) {
+        return Err(Break::NotTheHolder { record, from, holder: held, signer: holder });
     }
     Ok(if same.0 > 0 { Edge::Holding } else { Edge::MadeFrom })
 }
@@ -507,7 +534,8 @@ pub fn hop(record: &str, records: &BTreeMap<String, Checked>, server: &str) -> R
         return Err(Break::NoHandOn { record: record.to_owned(), kind: rb.kind });
     }
     let began = !rb.kind.takes() && !held;
-    Ok(Hop { record: record.to_owned(), kind: rb.kind, custodian: r.custodian.clone(), at: r.at, subject: r.statement.subject.clone(), made_from, began })
+    let taken_for = rb.taken_for.clone().filter(|_| r.custodian == server);
+    Ok(Hop { record: record.to_owned(), kind: rb.kind, custodian: r.custodian.clone(), taken_for, at: r.at, subject: r.statement.subject.clone(), made_from, began })
 }
 
 /// Walks a thing's chain of custody back from record `from` (by its digest), where it's used,
@@ -920,10 +948,55 @@ mod tests {
         assert!(refused(Kind::HandedOn, &|b| b.to = None, &ws)?.contains("not to whom"));
         assert!(refused(Kind::PassedOn, &|b| b.from = Some(String::new()), &ws)?.contains("not from whom"));
         assert!(refused(Kind::Taken, &|_| {}, &ws)?.contains("names no giver"));
-        assert!(refused(Kind::Received, &|b| b.taken_for = Some(FEDORA.into()), &ws)?.contains("only a take"));
+        assert!(refused(Kind::PassedOn, &|b| b.taken_for = Some(FEDORA.into()), &ws)?.contains("only a take, or kiln's receipt for someone"));
+        assert!(refused(Kind::Received, &|b| b.taken_for = Some(String::new()), &ws)?.contains("names no one"));
         assert!(refused(Kind::Received, &|_| {}, &[])?.contains("about nothing"));
         // A record saying it's by another than its signer: two custodians' records are never one.
         assert!(refused(Kind::Received, &|b| b.by = JUPITER.into(), &ws)?.contains(&format!("it says it's by {JUPITER}, but {FEDORA} signed it")));
+        Ok(())
+    }
+
+    /// W27-R08 (the Transfers plan's step 6): sam takes a plan's step over from a device with no
+    /// key. kiln's server signs the receipt for them (`taken_for`), and the walk reads that link as
+    /// kiln's for sam, never as sam's; a receipt for someone that another signs, or for another
+    /// than the hand-on went to, breaks the chain. Once sam has a key, what they hand on follows
+    /// kiln's receipt for them as theirs. Whom a giver acts for goes with what it hands on, nearest
+    /// first.
+    #[test]
+    fn w27_r08_kiln_takes_for_a_person_with_no_key() -> anyhow::Result<()> {
+        let ca = ca()?;
+        let (server, sam, fedora, agent) = (Signer::new(&ca, SERVER)?, Signer::new(&ca, SAM)?, Signer::new(&ca, FEDORA)?, Signer::new(&ca, AGENT)?);
+        let mut kept = Kept::default();
+        let step = thing("plan run 01a17 step 3", 'd');
+        let planner = "kiln://hyper-light/person/sam/agent/planner/epoch/0";
+        let mut handed = record(Kind::HandedOn, std::slice::from_ref(&step), Some(SAM), None, &[], "plans", 1);
+        if let Some(o) = handed.body.as_object_mut() {
+            o.insert("acts_for".into(), json!([planner, SAM]));
+        }
+        let hand_on = kept.take(&ca, &server, &handed, AT - 30)?;
+        let b = body(kept.records.get(&hand_on).ok_or_else(|| anyhow::anyhow!("the hand-on isn't kept"))?)?;
+        assert_eq!(b.acts_for, vec![planner.to_owned(), SAM.to_owned()]);
+        let for_whom = |who: &str, s: Statement| -> Statement {
+            let mut s = s;
+            if let Some(o) = s.body.as_object_mut() {
+                o.insert("taken_for".into(), json!(who));
+            }
+            s
+        };
+        let receipt = |stream: &str, seq: u64| record(Kind::Received, std::slice::from_ref(&step), None, Some(SERVER), &[&hand_on], stream, seq);
+        let taken = kept.take(&ca, &server, &for_whom(SAM, receipt("plans", 2)), AT - 20)?;
+        let h = hop(&taken, &kept.records, SERVER)?;
+        assert_eq!((h.custodian.as_str(), h.taken_for.as_deref()), (SERVER, Some(SAM)), "kiln for sam, never sam");
+        let forged = kept.take(&ca, &fedora, &for_whom(SAM, receipt("legs", 1)), AT - 19)?;
+        assert!(matches!(hop(&forged, &kept.records, SERVER), Err(Break::TakenNotByServer { .. })));
+        let elsewhere = kept.take(&ca, &server, &for_whom(JUPITER, receipt("plans-2", 1)), AT - 18)?;
+        assert!(matches!(hop(&elsewhere, &kept.records, SERVER), Err(Break::NotTheTaker { .. })));
+        // sam, with a key now, hands it on: theirs, following kiln's receipt for them.
+        let to_agent = kept.take(&ca, &sam, &record(Kind::HandedOn, std::slice::from_ref(&step), Some(AGENT), None, &[&taken], "work", 1), AT - 10)?;
+        let got = kept.take(&ca, &agent, &record(Kind::Received, std::slice::from_ref(&step), None, Some(SAM), &[&to_agent], "work", 1), AT)?;
+        let w = walk(&got, &kept.records, SERVER)?;
+        let hops: Vec<(&str, Option<&str>)> = w.hops.iter().map(|h| (h.custodian.as_str(), h.taken_for.as_deref())).collect();
+        assert_eq!(hops, vec![(AGENT, None), (SAM, None), (SERVER, Some(SAM)), (SERVER, None)]);
         Ok(())
     }
 

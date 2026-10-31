@@ -1314,13 +1314,25 @@ pub async fn release(d: &Deploy, who: &Who, ask: Ask) -> Result<Release, Fail> {
     }
     // The gates (§9.1): one it can't pass by waiting refuses it now; one that holds it, it waits on.
     match gates::evaluate(d, &r, &env, &a).await.map_err(internal)? {
-        Verdict::Refuse { why, .. } => return Err(conflict(why)),
+        Verdict::Refuse { results, why } => {
+            // A promotion refused is recorded as one (docs/ci.md W27-R08).
+            if let Err(e) = super::promotion::refused(d, &r, &results, &why).await {
+                tracing::warn!(app = %r.app, environment = %r.environment, error = %format!("{e:#}"), "deploy: a promotion refused wasn't recorded");
+            }
+            return Err(conflict(why));
+        }
         Verdict::Hold { results, why, approval, .. } => {
             r.gates = results;
             r.state = if approval { State::WaitingApproval } else { State::Waiting };
             r.message = Some(why);
         }
-        Verdict::Go(results) => r.gates = results,
+        Verdict::Go(results) => {
+            r.gates = results;
+            // A promotion goes: CD's hand-on for the environment it leaves (W27-R08).
+            if let Err(e) = super::promotion::hand_on(d, &mut r).await {
+                tracing::warn!(app = %r.app, environment = %r.environment, error = %format!("{e:#}"), "deploy: CD's hand-on of a promotion wasn't signed");
+            }
+        }
     }
     if let Some(other) = store::in_flight(&*d.records, &a.name, &env.name).await.map_err(internal)? {
         match env.concurrency {
@@ -1516,6 +1528,10 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
                 match gates::evaluate(d, &r, &env, &a).await? {
                     Verdict::Go(results) => {
                         r.gates = results;
+                        // A promotion goes: CD's hand-on for the environment it leaves (W27-R08).
+                        if let Err(e) = super::promotion::hand_on(d, &mut r).await {
+                            tracing::warn!(release = r.id, error = %format!("{e:#}"), "deploy: CD's hand-on of a promotion wasn't signed");
+                        }
                         r.state = State::Committing;
                         r.message = None;
                         if store::update_release(st, &r, was).await? {
@@ -1540,6 +1556,10 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
                         store::schedule(st, id, until.unwrap_or(now + 300).clamp(now + 1, now + 300)).await?;
                     }
                     Verdict::Refuse { results, why } => {
+                        // A promotion refused is recorded as one (W27-R08).
+                        if let Err(e) = super::promotion::refused(d, &r, &results, &why).await {
+                            tracing::warn!(release = r.id, error = %format!("{e:#}"), "deploy: a promotion refused wasn't recorded");
+                        }
                         r.gates = results;
                         finish(d, r, State::Failed, Some(why)).await?;
                     }
@@ -2370,6 +2390,10 @@ async fn finish(d: &Deploy, mut r: Release, state: State, message: Option<String
     audit(d, &format!("deploy for {}", r.requested_by), "deploy.release.end", format!("release {} {}{}", r.id, state.as_str(), r.message.as_deref().map(|m| format!(": {m}")).unwrap_or_default())).await;
     emit_release(d, &r);
     if state == State::Succeeded && r.kind == Kind::Deploy {
+        // A promotion landed: CD's receipt for the environment it reached (W27-R08).
+        if let Err(e) = super::promotion::receipt(d, &r).await {
+            tracing::warn!(release = r.id, error = %format!("{e:#}"), "deploy: CD's receipt of a promotion wasn't signed");
+        }
         promote_onward(d, &r).await;
     }
     // A release waiting behind this one may go now.
@@ -2977,6 +3001,107 @@ mod tests {
             step(&d, c.id).await?;
             let c = get(c.id).await?;
             anyhow::ensure!(c.state == State::Waiting && c.message.as_deref() == Some(waits.as_str()), "{:?} {:?}", c.state, c.message);
+            Ok(())
+        })
+    }
+
+    /// docs/ci.md W27-R08 (the Transfers plan's step 8): web 1.2.0 has run in staging for ten minutes,
+    /// its image at digest A; production, after staging, takes 1.2.0 at A: a promotion, CD's hand-on
+    /// for staging as it goes and its receipt for production as it lands, one transfer walking
+    /// unbroken, both records signed by CD, naming both environments and A. Then 1.2.0 at digest B
+    /// in production: not what staging ran, refused as a promotion and recorded with both digests.
+    #[test]
+    fn w27_r08_promotion() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            crate::identities::own_identities(&hub.store, &hub.pki).await?;
+            let root = tempfile::tempdir()?;
+            let d = Deploy {
+                records: Arc::clone(&hub.records),
+                stand_in: None,
+                hosted: super::super::host::Hosted::new(root.path()),
+                owner: "test".into(),
+                wake: crate::rt::Notify::new(),
+                changes: crate::rt::Broadcast::new(16),
+                argo: Default::default(),
+                remote: Default::default(),
+                hub: Arc::clone(&hub),
+            };
+            let st = &*d.records;
+            store::put_environment(st, &Environment { name: "staging".into(), ..env(false) }).await?;
+            store::put_environment(st, &Environment { gates: serde_json::from_value(json!({ "after": ["staging"] }))?, ..env(false) }).await?;
+            let package = Package::Helm { repo: "oci://ghcr.io/acme/charts".into(), chart: "web".into(), chart_version: None, set: BTreeMap::new() };
+            store::put_app(st, &App { name: "web".into(), project: "shop".into(), owners: vec![], package, namespace: Some("web".into()), properties: BTreeMap::new(), template: None, contacts: Contacts::default(), source: None, archived: false, registries: None }).await?;
+            let (a, b) = ("a".repeat(64), "b".repeat(64));
+            let release = |environment: &str, hex: &str, state: State| Release {
+                id: 0,
+                app: "web".into(),
+                environment: environment.into(),
+                kind: Kind::Deploy,
+                state,
+                origin: Origin::Api,
+                version: Some("1.2.0".into()),
+                artifacts: BTreeMap::from([("web".to_owned(), Artifact { repository: "registry.example/acme/web".into(), tag: "1.2.0".into(), digest: format!("sha256:{hex}") })]),
+                values: None,
+                commit: None,
+                requested_by: "user:ada".into(),
+                message: None,
+                rollback_of: None,
+                rolled_back_by: None,
+                keep: false,
+                provider: Value::Null,
+                gates: Vec::new(),
+                approvals: Vec::new(),
+                promoted_from: None,
+                idempotency_key: None,
+                created_at: 0,
+                committed_at: None,
+                ended_at: None,
+                secrets: None,
+                no_revert: false,
+                reverts: None,
+                reverted_by: None,
+                irreversible: None,
+            };
+            let get = |id: i64| async move { store::release(st, id).await?.ok_or_else(|| anyhow::anyhow!("no release {id}")) };
+            // Staging runs 1.2.0 at A, landed ten minutes ago.
+            let mut ran = release("staging", &a, State::Succeeded);
+            ran.ended_at = Some(crate::util::now_unix() - 600);
+            let (ran, _) = store::insert_release(st, &ran).await?;
+            for (environment, running) in [("staging", Some(ran.id)), ("production", None)] {
+                store::put_registration(st, &Registration { app: "web".into(), environment: environment.into(), enabled: true, paused: false, running, created_at: 0, degraded: None }).await?;
+            }
+            // Production takes it at A: CD hands it on from staging as it goes...
+            let (p, _) = store::insert_release(st, &release("production", &a, State::Waiting)).await?;
+            step(&d, p.id).await?;
+            let mut going = get(p.id).await?;
+            anyhow::ensure!(going.state == State::Committing, "{:?} {:?}", going.state, going.message);
+            let promoted = going.gates.iter().find(|g| g.gate == super::super::promotion::GATE).ok_or_else(|| anyhow::anyhow!("no promotion: {:?}", going.gates))?;
+            anyhow::ensure!(promoted.evidence.get("hand_on").and_then(Value::as_array).is_some_and(|h| h.len() == 1), "{promoted:?}");
+            // ...and receives it for production as it lands.
+            going.state = State::Delivering;
+            going.commit = Some("web-1.2.0".into());
+            anyhow::ensure!(store::update_release(st, &going, State::Committing).await?);
+            finish(&d, going, State::Succeeded, None).await?;
+            let (org, now) = (hub.pki.organization(), crate::util::now_unix());
+            let view = crate::custody::chain(&hub.store, &hub.pki.ca_der, &org, &format!("sha256:{a}"), now).await?.ok_or_else(|| anyhow::anyhow!("no chain for A"))?;
+            anyhow::ensure!(view.get("unbroken") == Some(&json!(true)), "{view}");
+            let hops = view.get("hops").and_then(Value::as_array).cloned().unwrap_or_default();
+            let cd = crate::custody::cd_uri(&org);
+            let said: Vec<(Option<&str>, Option<&str>, Option<&str>)> =
+                hops.iter().map(|h| (h.get("kind").and_then(Value::as_str), h.get("custodian").and_then(Value::as_str), h.get("component").and_then(Value::as_str))).collect();
+            let both = [(Some("received"), Some(cd.as_str()), Some("environment production")), (Some("handed-on"), Some(cd.as_str()), Some("environment staging"))];
+            anyhow::ensure!(said == both, "{said:?}");
+            anyhow::ensure!(hops.iter().all(|h| h.pointer("/subject/0/digest/sha256") == Some(&json!(a))), "{view}");
+            // Production at B: not what staging ran, refused as a promotion and recorded.
+            let (other, _) = store::insert_release(st, &release("production", &b, State::Waiting)).await?;
+            step(&d, other.id).await?;
+            let refused = get(other.id).await?;
+            anyhow::ensure!(refused.state == State::Failed && refused.message.as_deref().is_some_and(|m| m.contains("with other artifacts")), "{:?} {:?}", refused.state, refused.message);
+            let recorded = crate::custody::refusals(&hub.store, 10).await?;
+            let act = json!("a promotion of web 1.2.0 from staging to production");
+            let why = recorded.iter().find(|r| r.get("act") == Some(&act)).and_then(|r| r.get("why")).and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("not recorded: {recorded:?}"))?;
+            anyhow::ensure!(why.contains(&format!("sha256:{a}")) && why.contains(&format!("sha256:{b}")), "{why}");
             Ok(())
         })
     }

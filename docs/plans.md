@@ -168,6 +168,12 @@ waits for instead (**after 2, 3**).
   nothing is at work and nothing more can start, the run stops, saying which steps hold it up:
   **Retry with a new agent** (a step given to an agent: its goal on that agent's stack again) or
   **Take it over** (kiln stops holding the agent to it; **It's met: go on** when it is).
+  Each step changes hands signed (docs/ci.md W27-R08): kiln hands it to its agent, which signs its
+  receipt as it takes the step up; tried again, kiln takes it for the agent before; taken over, it
+  goes to you. Your receipt is yours when you sign it on your device (`kiln plans take <run> <n>`,
+  with the key `kiln login` made); taken over in the browser, which has no key, kiln signs it for
+  you, saying your own signature is missing, and the page says so beside the button. The agent
+  before you, or before the new try, can't say the step is met: kiln refuses it, and records it.
   **Stop the run** lets every step under way go: their own agents interrupted, and a step's goal
   on an agent it was given to taken out of that agent's stack.
 - **What comes out.** In a git repository, each step's work goes up for review as it's met, as
@@ -240,6 +246,7 @@ A plan's written steps are `items` in the API: `[{title, description, examples, 
 | GET | `/api/plans/runs` | runs of one agent per step (`?active=1`: those under way) |
 | GET | `/api/plans/runs/:run` | a run: each step's `{n, title, goal, stand, needs, given, agent, agent_id, reason, tries}`, its `state`, `reason`, `note` and stack |
 | POST | `/api/plans/runs/:run/stop` | stop it |
-| POST | `/api/plans/runs/:run/steps/:n/{retry,take,met}` | retry a step, take it over, say it's met |
+| POST | `/api/plans/runs/:run/steps/:n/{retry,take,met}` | retry a step, take it over (`{signs: true}`: you'll sign your receipt on your device; the answer's `custody` says what to sign), say it's met |
+| POST | `/api/plans/runs/:run/steps/:n/receipt` | `{receipt}`: your receipt of a step you took over, signed on your device |
 | POST | `/api/plans/:id/share` | `{on}` |
 | GET | `/api/shared/plans/:token` | **open**: a shared plan's title, text and steps |

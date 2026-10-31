@@ -230,6 +230,9 @@ const PI = "pi-kitchen";
 /** Retried, by browser (its User-Agent), so the e2e projects running side by side each have their own Pi. */
 const piRetried = new Set<string>();
 
+/** What a hand-off from a browser says of its custody (docs/ci.md W27-R08): kiln's take for the person. */
+const SIGNED_FOR_YOU = { hand_on: `sha256:${"5".repeat(64)}`, kiln_signed_for_you: true };
+
 /** The fixed rows each browser handed off (`POST /api/ship/hand-off`), by its user agent as Pi's
  * retry is, so a desktop's and a phone's tests don't see each other's. */
 const handedBy = new Map<string, Set<string>>();
@@ -557,7 +560,8 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
     else ctx.json(res, 200, detail);
     return true;
   }
-  // A row's Hand off (W26-R18), answered as the server answers: who took it, or why no one did.
+  // A row's Hand off (W26-R18), answered as the server answers: who took it, or why no one did;
+  // handed off from a browser, which has no key, kiln signs it for the person (W27-R08).
   if (p === "/api/ship/hand-off" && m === "POST") {
     let body: { repo?: unknown; sha?: unknown } = {};
     try {
@@ -572,7 +576,7 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
     }
     const taken = trunk?.handOff(sha);
     if (taken != null) {
-      if (taken) ctx.json(res, 200, { handed: { to: "ci-doctor", agent: "agent-ci-doctor", incident: `inc-${sha.slice(0, 7)}`, what: ["checks"] } });
+      if (taken) ctx.json(res, 200, { handed: { to: "ci-doctor", agent: "agent-ci-doctor", incident: `inc-${sha.slice(0, 7)}`, what: ["checks"] }, custody: SIGNED_FOR_YOU });
       else ctx.json(res, 409, { error: `${sha.slice(0, 7)} has nothing open to hand off` });
       return true;
     }
@@ -584,7 +588,7 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
     }
     handedBy.set(ua, mine.add(sha));
     const to = takerOf(row);
-    ctx.json(res, 200, { handed: { to, agent: `agent-${to}`, ...(row.change ? {} : { incident: `inc-${row.short}` }), what: [row.change ? "threads" : "checks"] } });
+    ctx.json(res, 200, { handed: { to, agent: `agent-${to}`, ...(row.change ? {} : { incident: `inc-${row.short}` }), what: [row.change ? "threads" : "checks"] }, custody: SIGNED_FOR_YOU });
     return true;
   }
   if (p === "/api/mock/ship/hand-off" && m === "POST") {

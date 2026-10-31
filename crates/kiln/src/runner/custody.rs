@@ -12,7 +12,7 @@
 //! hand-on is of a timeline made from the one received, and follows that receipt, so the chain
 //! runs on from hand-over to hand-over.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::LazyLock;
 
 use kiln_ci::identity::custody::{Body, Kind, to_value};
@@ -70,13 +70,36 @@ impl Receipt {
     }
 }
 
+/// Work kiln's server handed an agent session this process holds (a plan's step, a subagent's
+/// task, what a person handed off), its receipt to sign as the session takes it up: at its next
+/// turn (docs/ci.md W27-R08; the Transfers plan's step 6).
+struct Work {
+    subject: Vec<Subject>,
+    /// The hand-on's digest, which the receipt follows.
+    follows: String,
+    /// Whom it came from: the hand-on's signer, or the giver kiln took it for.
+    from: String,
+    why: String,
+}
+
 #[derive(Default)]
 struct State {
     waiting: BTreeMap<(String, u64), Waiting>,
+    /// Work handed to each session, not yet taken up.
+    handed: BTreeMap<String, Vec<Work>>,
+    /// The sessions whose turn is under way, as their harness last said.
+    running: BTreeSet<String>,
+    /// Sessions that took work up before this process held their identity: signed for once it
+    /// does ([`take_up_due`]).
+    due: BTreeSet<String>,
     /// The receipt this process signed for each session at each epoch: what its hand-on follows.
     receipts: BTreeMap<(String, u64), String>,
     outbox: VecDeque<String>,
     sent: VecDeque<String>,
+    /// The machine's runner role, handed to this process (a blue/green upgrade's new build) by the
+    /// one it took over from: its hand-on, to answer with this process's receipt once its own
+    /// identity is certified ([`role_due`]).
+    role: Option<Value>,
     /// What's sent once, not again after a reconnect: a hand-over's word refused here.
     once: VecDeque<String>,
 }
@@ -176,6 +199,17 @@ pub fn signed_ask(json: String) -> String {
     let Some(epoch) = identity::epoch_held(&session) else { return json };
     let slot = identity::slot("agent", Some(&session), Some(epoch));
     let Some(by) = identity::uri(&slot) else { return json };
+    // A subagent started for a task: the task is handed on, signed by this session, to kiln's
+    // server, which starts the subagent and passes the task on to it unchanged (docs/ci.md W27-R08;
+    // the Transfers plan's step 6). The act signs it too.
+    if op == "call"
+        && v.get("name").and_then(Value::as_str) == Some("agents.start")
+        && let Some(task) = v.pointer("/input/prompt").and_then(Value::as_str).filter(|t| !t.trim().is_empty()).map(str::to_owned)
+        && let Some(hand_on) = task_hand_on(&slot, &by, &session, &task)
+        && let Some(o) = v.as_object_mut()
+    {
+        o.insert("hand_on".into(), Value::String(hand_on.to_string()));
+    }
     let what = crate::custody::without(&v, "act");
     let named = v.get("name").and_then(Value::as_str).map_or_else(|| op.clone(), |n| format!("{op} {n}"));
     let hex: String = sha2::Sha256::digest(what.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
@@ -211,13 +245,17 @@ fn digest_of(bundle: &Value) -> String {
     }
 }
 
-/// A bundle's statement's body, unchecked: the server checks it.
-fn body_of(bundle: &Value) -> Option<Value> {
+/// A bundle's statement, unchecked: the server checks it.
+fn statement_of(bundle: &Value) -> Option<Statement> {
     use base64::Engine as _;
     let payload = bundle.get("dsseEnvelope")?.get("payload")?.as_str()?;
     let bytes = base64::engine::general_purpose::STANDARD.decode(payload).ok()?;
-    let s: Statement = serde_json::from_slice(&bytes).ok()?;
-    Some(s.body)
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// A bundle's statement's body, unchecked: the server checks it.
+fn body_of(bundle: &Value) -> Option<Value> {
+    statement_of(bundle).map(|s| s.body)
 }
 
 /// Whom a hand-on says its thing comes from: the giver a take hands on for, else its signer.
@@ -366,7 +404,7 @@ pub fn word_for_me(session: &str, json: &str, signs: bool, root: &[u8], machine:
     let checked = match word {
         None if !signs => return Ok(()),
         None => Err("it isn't signed: kiln signs every word it says of a hand-over".to_owned()),
-        Some(w) => addressed(session, &v, w, root, machine, instance, epoch),
+        Some(w) => addressed(session, &v, w, root, machine, instance, epoch, crate::util::now_unix()),
     };
     if let Err(why) = &checked {
         refused_word(session, word, why);
@@ -374,10 +412,14 @@ pub fn word_for_me(session: &str, json: &str, signs: bool, root: &[u8], machine:
     checked
 }
 
-fn addressed(session: &str, v: &Value, word: &str, root: &[u8], machine: &str, instance: &str, epoch: Option<u64>) -> Result<(), String> {
+/// Whether `word`, the signature beside hand-over's word `v` about session `session`, makes it this
+/// process's as of `at` ([`word_for_me`]'s check; the transfers simulation, `crate::sim::transfers`,
+/// runs it too). Why not, when it doesn't.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn addressed(session: &str, v: &Value, word: &str, root: &[u8], machine: &str, instance: &str, epoch: Option<u64>, at: i64) -> Result<(), String> {
     use kiln_ci::identity::chain::{Actor, Identity};
     let bundle: Value = serde_json::from_str(word).map_err(|e| format!("its signature can't be read: {e}"))?;
-    let c = statement::verify(&bundle, root, &[], crate::util::now_unix()).map_err(|e| e.to_string())?;
+    let c = statement::verify(&bundle, root, &[], at).map_err(|e| e.to_string())?;
     // kiln's server alone signs words, under kiln's root.
     let server = if Identity::parse(&c.custodian).is_ok_and(|i| matches!(i.actor, Actor::Server)) { c.custodian.clone() } else { String::new() };
     kiln_ci::identity::custody::addressed(&c, &server, session, crate::custody::unworded(v).as_bytes(), machine, instance, epoch).map(|_| ()).map_err(|e| e.to_string())
@@ -387,6 +429,187 @@ fn addressed(session: &str, v: &Value, word: &str, root: &[u8], machine: &str, i
 pub fn refused_word(session: &str, word: Option<&str>, why: &str) {
     tracing::warn!(target: "kiln.custody", %session, %why, "a hand-over's word refused: it isn't this process's");
     STATE.lock().once.push_back(serde_json::json!({ "refused_word": { "session": session, "why": why, "word": word } }).to_string());
+}
+
+/// Agent session `session`'s hand-on of `task`, a subagent's, to kiln's server, which starts the
+/// subagent and passes the task on to it unchanged: signed with slot `slot`'s key, as `by`.
+fn task_hand_on(slot: &str, by: &str, session: &str, task: &str) -> Option<Value> {
+    let org = kiln_ci::identity::chain::Identity::parse(by).ok()?.org;
+    let body = Body { to: Some(crate::custody::server_uri(&org)), why: "a subagent's task".into(), ..Body::new(Kind::HandedOn, by) };
+    let s = Statement { subject: vec![crate::custody::work(&format!("a subagent's task from agent {session}"), &[session, task])], ..Statement::new(to_value(&body)) };
+    match sign(slot, by, &s) {
+        Ok(bundle) => Some(bundle),
+        Err(e) => {
+            tracing::warn!(target: "kiln.custody", %session, error = %format!("{e:#}"), "a subagent's task couldn't be signed for: it goes unsigned");
+            None
+        }
+    }
+}
+
+/// kiln's server handed one of this process's agent sessions work (`json`: `{session, hand_on}`,
+/// `ServerMsg::Custody`): the session's receipt is signed as its next turn starts ([`status`]).
+/// Asked again for the same hand-on (after a reconnect), it's kept once.
+pub fn handed(json: &str) {
+    if !signs() {
+        return;
+    }
+    let Ok(v) = serde_json::from_str::<Value>(json) else { return };
+    let Some(session) = v.get("session").and_then(Value::as_str) else { return };
+    let hand_on = match v.get("hand_on") {
+        Some(Value::String(s)) => serde_json::from_str::<Value>(s).unwrap_or(Value::Null),
+        Some(b) => b.clone(),
+        None => Value::Null,
+    };
+    let Some(statement) = statement_of(&hand_on) else {
+        return tracing::warn!(target: "kiln.custody", %session, "work handed with a hand-on that can't be read: no receipt signed");
+    };
+    let follows = digest_of(&hand_on);
+    let from = giver_of(&hand_on).unwrap_or_default();
+    let why = statement.body.get("why").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let mut st = STATE.lock();
+    let work = st.handed.entry(session.to_owned()).or_default();
+    if !work.iter().any(|w| w.follows == follows) {
+        tracing::info!(target: "kiln.custody", %session, %why, "work handed: its receipt is signed as the session takes it up");
+        work.push(Work { subject: statement.subject, follows, from, why });
+    }
+}
+
+/// Agent session `session`'s harness says it's `status` now. As a turn starts, the work handed to
+/// it is taken up: its receipts signed with its identity at the epoch this process holds it at
+/// (until that's certified, they wait: [`take_up_due`]). Whether any was signed.
+pub fn status(session: &str, status: &crate::harness::model::Status) -> bool {
+    let started = {
+        let mut st = STATE.lock();
+        let started = if matches!(status, crate::harness::model::Status::Running) {
+            st.running.insert(session.to_owned())
+        } else {
+            st.running.remove(session);
+            false
+        };
+        started && st.handed.contains_key(session)
+    };
+    started && take_up(session)
+}
+
+/// Signs session `session`'s receipts of the work handed to it, which it took up: with its
+/// identity at the newest epoch this process holds a certificate for. None held yet: it's due,
+/// signed once one is. Whether any was signed.
+fn take_up(session: &str) -> bool {
+    let held = identity::epoch_held(session).map(|e| identity::slot("agent", Some(session), Some(e))).and_then(|slot| identity::uri(&slot).map(|by| (slot, by)));
+    let Some((slot, by)) = held else {
+        STATE.lock().due.insert(session.to_owned());
+        return false;
+    };
+    let work = {
+        let mut st = STATE.lock();
+        st.due.remove(session);
+        st.handed.remove(session).unwrap_or_default()
+    };
+    let mut signed = false;
+    for w in work {
+        let body = Body { from: Some(w.from.clone()), why: w.why.clone(), ..Body::new(Kind::Received, &by) };
+        let s = Statement { subject: w.subject.clone(), follows: vec![w.follows.clone()], ..Statement::new(to_value(&body)) };
+        match sign(&slot, &by, &s) {
+            Ok(bundle) => {
+                tracing::info!(target: "kiln.custody", %session, why = %w.why, "took up work handed to it: signed its receipt");
+                queue(&bundle);
+                signed = true;
+            }
+            Err(e) => {
+                tracing::warn!(target: "kiln.custody", %session, error = %format!("{e:#}"), "couldn't sign a receipt of work handed: it waits for the next turn");
+                STATE.lock().handed.entry(session.to_owned()).or_default().push(w);
+            }
+        }
+    }
+    signed
+}
+
+/// The sessions that took work up before this process held their identity, signed for now that
+/// it may (each heartbeat). Whether any was.
+pub fn take_up_due() -> bool {
+    let due: Vec<String> = STATE.lock().due.iter().cloned().collect();
+    let mut signed = false;
+    for s in &due {
+        signed |= take_up(s);
+    }
+    signed
+}
+
+/// Session `session` closed here: the work handed to it that it never took up goes with it.
+pub fn closed(session: &str) {
+    let mut st = STATE.lock();
+    st.handed.remove(session);
+    st.running.remove(session);
+    st.due.remove(session);
+}
+
+/// A machine's runner role, the thing a hand-over of it is about (docs/ci.md W27-R08; the
+/// Transfers plan's step 8): "runner role of <machine>", by a digest of its organization and
+/// machine, which the process handing it on and the one taking it work out alike.
+pub fn role(org: &str, machine: &str) -> Subject {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(format!("kiln-runner-role/{org}/{machine}").as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+    Subject { name: format!("runner role of {machine}"), digest: BTreeMap::from([("sha256".to_owned(), digest)]), ..Subject::default() }
+}
+
+/// (A blue/green upgrade's runner being upgraded.) Its hand-on of the machine's runner role to the
+/// new build, runner process `to` of this machine (its instance), signed as this process's runner
+/// identity: kept to send to the server, and given to the new build, which answers it with its
+/// receipt ([`role_taken`]). None when this process holds no certified identity, or (logged) its
+/// signature failed.
+#[cfg(unix)]
+pub fn role_hand_on(to: &str) -> Option<String> {
+    use kiln_ci::identity::chain::{Actor, Identity};
+    let by = identity::uri("runner")?;
+    let me = Identity::parse(&by).ok()?;
+    let Actor::Runner { enrolled_by, machine, .. } = &me.actor else { return None };
+    let green = Identity::new(me.org.clone(), Actor::Runner { enrolled_by: enrolled_by.clone(), machine: machine.clone(), instance: to.to_owned() }).uri().ok()?;
+    let b = Body { to: Some(green), why: format!("a blue/green upgrade of {machine}: its new build holds its runner role"), ..Body::new(Kind::HandedOn, "") };
+    match sign("runner", &by, &Statement { subject: vec![role(&me.org, machine)], ..Statement::new(to_value(&b)) }) {
+        Ok(bundle) => {
+            queue(&bundle);
+            Some(bundle.to_string())
+        }
+        Err(e) => {
+            tracing::warn!(target: "kiln.custody", error = %format!("{e:#}"), "the runner role's hand-on to the new build couldn't be signed");
+            None
+        }
+    }
+}
+
+/// (A blue/green upgrade's new build.) The machine's runner role, handed to this process by the one
+/// it took over from (`hand_on`, its bundle as JSON): answered with this process's receipt, signed
+/// as its runner identity once that's certified ([`role_due`]), both sent to the server.
+#[cfg(unix)]
+pub fn role_taken(hand_on: &str) {
+    let Ok(h) = serde_json::from_str::<Value>(hand_on) else {
+        tracing::warn!(target: "kiln.custody", "the runner role's hand-on from the runner taken over from can't be read: no receipt signed");
+        return;
+    };
+    STATE.lock().role = Some(h);
+    role_due();
+}
+
+/// The runner role's receipt, signed once this process's runner identity is certified (as it
+/// connects, and again on each connection): called as an identity is given, and on each beat.
+pub fn role_due() {
+    let Some(h) = STATE.lock().role.clone() else { return };
+    let Some(by) = identity::uri("runner") else { return };
+    let (Some(s), Some(from)) = (statement_of(&h), giver_of(&h)) else {
+        STATE.lock().role = None;
+        return;
+    };
+    let b = Body { from: Some(from), why: "this process holds the machine's runner role".into(), ..Body::new(Kind::Received, "") };
+    match sign("runner", &by, &Statement { subject: s.subject, follows: vec![digest_of(&h)], ..Statement::new(to_value(&b)) }) {
+        Ok(receipt) => {
+            let mut st = STATE.lock();
+            st.role = None;
+            st.outbox.push_back(h.to_string());
+            st.outbox.push_back(receipt.to_string());
+            tracing::info!(target: "kiln.custody", "signed for the machine's runner role, handed on by the runner taken over from");
+        }
+        Err(e) => tracing::warn!(target: "kiln.custody", error = %format!("{e:#}"), "the runner role's receipt couldn't be signed: tried again at the next beat"),
+    }
 }
 
 /// The records to send now, oldest first: each kept, to send again after a reconnect, but a
@@ -412,6 +635,58 @@ pub fn sent() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// W27-R08 (the Transfers plan's step 6): work kiln handed one of this process's sessions is
+    /// signed for as the session takes it up, at its next turn, with its identity at its epoch.
+    /// Before its identity is certified it waits, and is signed once it is; the same hand-on asked
+    /// again is one receipt; work handed while a turn is under way waits for the next turn.
+    #[test]
+    fn w27_r08_work_handed_is_received_at_the_sessions_next_turn() -> anyhow::Result<()> {
+        use crate::harness::model::Status;
+        use kiln_ci::identity::chain::{Actor, Identity};
+        let dir = tempfile::tempdir()?;
+        let pki = crate::pki::Pki::open_scratch(&dir.path().join("pki"))?;
+        let (session, org) = ("w27-r08-work", pki.organization());
+        let server = Identity::new(&org, Actor::Server);
+        let key = crate::pki::new_key_pem()?;
+        let server_pem = pki.issue_identity(&crate::pki::make_csr_with_key("kiln-identity", &key)?, &server, &[], time::Duration::hours(1))?;
+        let signing = rcgen::KeyPair::from_pem(&key)?;
+        let hand_on = |name: &str| -> anyhow::Result<Value> {
+            use rcgen::SigningKey as _;
+            let body = Body { to: Some(format!("kiln://{org}/person/ada/agent/{session}/epoch/0")), why: format!("{name}: a test"), ..Body::new(Kind::HandedOn, &server.uri()?) };
+            let p = statement::payload(&Statement { subject: vec![crate::custody::work(name, &[name])], ..Statement::new(to_value(&body)) })?;
+            Ok(statement::bundle(PAYLOAD_CUSTODY, &p, &signing.sign(&statement::to_sign(PAYLOAD_CUSTODY, &p))?, &crate::pki::der_of(&server_pem)?))
+        };
+        let ask = |b: &Value| serde_json::json!({ "session": session, "hand_on": b.to_string() }).to_string();
+        let receipts = |name: &str| -> Vec<Statement> { drain().iter().filter_map(|r| serde_json::from_str::<Value>(r).ok()).filter_map(|b| statement_of(&b)).filter(|s| s.subject.first().is_some_and(|t| t.name == name)).collect() };
+        let first = hand_on("plan run r1 step 1")?;
+        handed(&ask(&first));
+        assert!(!status(session, &Status::Idle), "nothing before a turn");
+        assert!(!status(session, &Status::Running), "its turn starts before its identity is certified: it waits");
+        // Its identity at epoch 0, certified.
+        let asked: IdentityAsk = serde_json::from_str(&identity::ask("agent", Some(session), Some(0))?)?;
+        let me = Identity::new(&org, Actor::Agent { person: "ada".into(), agent: session.into(), epoch: 0, held_by: Some(kiln_ci::identity::chain::Holder { machine: "adacachy".into(), instance: "01a14794".into() }) });
+        let pem = pki.issue_identity(&asked.csr, &me, &[], time::Duration::hours(1))?;
+        identity::given(&serde_json::to_string(&crate::proto::IdentityGiven { kind: asked.kind, of: asked.of, epoch: asked.epoch, uri: me.uri()?, cert_pem: Some(pem), ..crate::proto::IdentityGiven::default() })?, dir.path(), "main")?;
+        assert!(take_up_due(), "signed once its identity is");
+        let got = receipts("plan run r1 step 1");
+        let body = got.first().map(|s| s.body.clone()).unwrap_or_default();
+        assert_eq!(got.len(), 1);
+        assert_eq!((body.get("kind"), body.get("by"), body.get("from")), (Some(&serde_json::json!("received")), Some(&serde_json::json!(me.uri()?)), Some(&serde_json::json!(server.uri()?))));
+        assert_eq!(got.first().map(|s| s.follows.clone()), Some(vec![digest_of(&first)]));
+        // Asked again (a reconnect), and more work while the turn is under way: the next turn.
+        handed(&ask(&first));
+        let second = hand_on("plan run r1 step 2")?;
+        handed(&ask(&second));
+        assert!(!status(session, &Status::Running), "a turn under way takes up nothing new");
+        assert!(!status(session, &Status::Idle));
+        assert!(status(session, &Status::Running), "the next turn takes it up");
+        assert_eq!(receipts("plan run r1 step 2").len(), 1);
+        assert!(receipts("plan run r1 step 1").is_empty(), "the first, signed for once");
+        closed(session);
+        identity::forget_prefix(&format!("agent/{session}/"));
+        Ok(())
+    }
 
     /// W27-R08: a session taken over blue/green from a runner that signed nothing (one from before
     /// signed hand-overs) asks for its next epoch only once this runner is promoted, carrying

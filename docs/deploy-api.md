@@ -837,6 +837,16 @@ don't approve their own change on its way, and once per landing and environment 
 that doesn't run the version yet) goes when the next of its `after` lands, or by hand. Config
 releases and rollbacks never move on by themselves.
 
+A promotion is a transfer (docs/ci.md W27-R08): as a deploy promoted from an environment of this
+server's goes (its `after` passed there, or `promote_from` named it), CD signs a hand-on for the
+environment it leaves, naming the images that ran there by their digests; as it lands, CD signs
+its receipt for the one it reached, the same digests. Both are kept as custody records (CD's
+identity, `kiln://<org>/server/cd`, each naming its environment as its `component`), and the
+release keeps the hand-on's digest as its `promotion` gate. A release whose version or images
+aren't what runs in an environment it must run in first is refused as a promotion, and that's
+recorded with both sides' digests (`kiln transfers refused`, `GET /api/transfers/refused`). A release naming no image digests
+is said to be a promotion not signed; an `after` on a linked server is that server's to sign.
+
 ## 10. Rollback, versions and history
 
 - **Rollback**: `POST /api/deploy/releases/{id}/rollback`, or a release with `rollback: { to }`.

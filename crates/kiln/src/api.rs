@@ -610,7 +610,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::POST, ["api", "updates", "binaries"]) => boxed(|| upload_binary(&hub, &q, req)).await,
         (&Method::DELETE, ["api", "updates", "binaries", target]) => boxed(|| delete_binary(&hub, target)).await,
         (&Method::GET, ["api", "updates", "jobs", id]) => match hub.updates.job(id) {
-            Some(j) => Ok(srv::json(StatusCode::OK, &j)),
+            Some(j) => boxed(|| update_job(&hub, j)).await,
             None => Err(err(StatusCode::NOT_FOUND, "no such upgrade")),
         },
         (&Method::GET, ["api", "metrics", "history"]) => Ok(history(&hub, &q)),
@@ -969,11 +969,27 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             boxed(|| own_op(&hub, &caller, "plans.runs.retry", body)).await
         }
         // Taking a step over, and saying it's met, are a person's: no operation does them.
-        (&Method::POST, ["api", "plans", "runs", run, "steps", n, what @ ("take" | "met")]) => {
+        (&Method::POST, ["api", "plans", "runs", run, "steps", n, "met"]) => {
             let n: usize = n.parse().map_err(|_| err(StatusCode::BAD_REQUEST, "a step's number, from 1"))?;
             let by = caller.name.clone();
-            let r = if *what == "take" { boxed(|| crate::plans::agents::take(&hub, run, n, &by)).await } else { boxed(|| crate::plans::agents::met(&hub, run, n, &by)).await };
-            r.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err)
+            boxed(|| crate::plans::agents::met(&hub, run, n, &by)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err)
+        }
+        // Taken over, the step goes to the person the caller is, signed (docs/ci.md W27-R08): their
+        // receipt is theirs when they say they sign it on their device (`signs`, then `receipt`),
+        // else kiln's for them.
+        (&Method::POST, ["api", "plans", "runs", run, "steps", n, "take"]) => {
+            let n: usize = n.parse().map_err(|_| err(StatusCode::BAD_REQUEST, "a step's number, from 1"))?;
+            let by = caller.name.clone();
+            let signs = boxed(|| body_value(req)).await?.get("signs").and_then(serde_json::Value::as_bool).unwrap_or(false);
+            let person = crate::identities::person_identity(&hub.store, &hub.pki.organization(), &caller).await.ok();
+            boxed(|| crate::plans::agents::take(&hub, run, n, &by, person.as_deref(), signs)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err)
+        }
+        (&Method::POST, ["api", "plans", "runs", run, "steps", n, "receipt"]) => {
+            let n: usize = n.parse().map_err(|_| err(StatusCode::BAD_REQUEST, "a step's number, from 1"))?;
+            let person = crate::identities::person_identity(&hub.store, &hub.pki.organization(), &caller).await.map_err(|e| err(StatusCode::FORBIDDEN, e.to_string()))?;
+            let body = boxed(|| body_value(req)).await?;
+            let receipt = body.get("receipt").cloned().ok_or_else(|| err(StatusCode::BAD_REQUEST, "send your receipt: `receipt`, a Sigstore bundle signed on your device"))?;
+            boxed(|| crate::plans::agents::receipt(&hub, run, n, &person, &receipt)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err)
         }
         (&Method::GET, ["api", "programs"]) => boxed(|| own_op(&hub, &caller, "programs.list", json!({}))).await,
         (&Method::GET, ["api", "programs", id]) => boxed(|| own_op(&hub, &caller, "programs.get", json!({"program": id}))).await,
@@ -3912,6 +3928,21 @@ async fn set_skew(hub: &Arc<Hub>, req: Request) -> R {
     hub.store.audit("admin".into(), "upgrade.skew".into(), format!("full within {} commits, upgrade within {}", t.full, t.upgrade)).await;
     hub.emit(&crate::wire::events::ServerEvent::Updates);
     Ok(srv::status(StatusCode::NO_CONTENT))
+}
+
+/// `GET /api/updates/jobs/{id}`: the upgrade, and, a runner's blue/green one, its replant's record
+/// of what it handed on (docs/ci.md W27-R08; the Transfers plan's step 8): its machine's runner role
+/// and its agent sessions, each a transfer signed by both sides (`transfers`), and what moved
+/// without one (`moved_without_a_transfer`).
+async fn update_job(hub: &Arc<Hub>, j: crate::updates::Job) -> R {
+    let mut v = serde_json::to_value(&j).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if let Some((machine, since, sessions)) = crate::updates::Updates::replant(&j) {
+        let r = crate::custody::replanted(&hub.store, &hub.pki.ca_der, &hub.pki.organization(), &machine, since, &sessions).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+        if let (Some(o), Some(r)) = (v.as_object_mut(), r.as_object()) {
+            o.extend(r.clone());
+        }
+    }
+    Ok(srv::json(StatusCode::OK, &v))
 }
 
 /// `DELETE /api/updates/skew`: back to what kiln.toml says.

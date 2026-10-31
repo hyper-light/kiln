@@ -103,6 +103,14 @@ copy on the server goes on where it was, nothing sent again. Before the new buil
 rollback leaves the session with the runner it came from. A session started again from its record
 goes over as before.
 
+The machine's runner role goes over signed too (the Transfers plan's step 8): after its sessions,
+the runner upgraded hands it on, signed as its runner process, to a new build that says it takes it
+so, and the new build signs its receipt as its own runner process once that identity is
+certified; both go to the server. The upgrade's job, which is the replant's record of that machine
+(`GET /api/updates/jobs/<id>`), lists each transfer: the runner role, from the process replaced
+to its new build, and each agent session it held as the upgrade began (`transfers`), and anything
+that moved without one (`moved_without_a_transfer`).
+
 If the new build doesn't come up, the runner goes on with everything, as it was, and the machine
 never goes offline. That covers a build that can't connect, crashes, or can't take over in time.
 The new build is killed, and the upgrade's log says why it failed. A new build that ends soon after

@@ -273,6 +273,7 @@ classes! {
         ServerMsg::Identity { .. } => Class::Answer,
         ServerMsg::Observe { .. } => OBSERVE,
         ServerMsg::SignAsLeg { .. } => Class::Ask,
+        ServerMsg::Custody { .. } => Class::Ask,
     }
 }
 

@@ -40,6 +40,10 @@ pub enum Frame {
         instance: String,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         custody: bool,
+        /// It takes the machine's runner role signed for (the Transfers plan's step 8): blue sends it
+        /// [`Frame::Role`]. A new build from before says nothing, and is sent none.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        role: bool,
     },
     /// blue → green: an agent session, its harness process still running (descriptors: its stdin,
     /// stdout and stderr), or (`handed` none) to start again from its record. `hand_on`: blue's
@@ -64,6 +68,10 @@ pub enum Frame {
     Forward { data: String },
     /// green → blue: taken over, or why not.
     Ack { id: String, ok: bool, error: Option<String> },
+    /// blue → green, after its sessions, to a new build that said `role`: blue's hand-on of the
+    /// machine's runner role to it (a bundle, as JSON), signed as blue's runner process (docs/ci.md
+    /// W27-R08), which green answers with its receipt, to the server.
+    Role { hand_on: String },
 }
 
 /// Where a runner whose own directory is `own_dir` waits for the new build to take over from it:
@@ -187,8 +195,9 @@ mod unix {
 
         /// Wait (blocking) for green (process `pid`) to connect and say it's ready, until
         /// `deadline`, as long as it runs. The connection to hand it everything over, the
-        /// instance it runs as, and whether it takes sessions signed for.
-        pub fn ready(&self, pid: u32, deadline: Instant) -> Result<(Conn, String, bool)> {
+        /// instance it runs as, whether it takes sessions signed for, and whether it takes the
+        /// machine's runner role so.
+        pub fn ready(&self, pid: u32, deadline: Instant) -> Result<(Conn, String, bool, bool)> {
             loop {
                 match self.listener.accept() {
                     Ok((stream, _)) => {
@@ -196,7 +205,7 @@ mod unix {
                         stream.set_read_timeout(Some(Duration::from_secs(60)))?;
                         let conn = Conn { stream };
                         match conn.recv() {
-                            Ok((Frame::Ready { pid: said, instance, custody }, _)) if said == pid => return Ok((conn, instance, custody)),
+                            Ok((Frame::Ready { pid: said, instance, custody, role }, _)) if said == pid => return Ok((conn, instance, custody, role)),
                             // Not the process started for this: not listened to.
                             Ok((Frame::Ready { pid: said, .. }, _)) => tracing::warn!(said, expected = pid, "a runner that isn't the new build tried to take over; ignored"),
                             Ok(_) => tracing::warn!("a connection to the handover socket didn't open by saying it's ready; ignored"),
