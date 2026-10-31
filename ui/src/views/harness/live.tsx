@@ -22,6 +22,7 @@ import type { UnreadFrame } from "@/api/wire";
 import { SelectField } from "@/components/ui/misc";
 import { formatBytes } from "@/lib/format";
 import { useSuspenseResource } from "@/lib/resource";
+import { copyLater } from "@/views/terminal/clipboard";
 import { duration } from "./derive";
 import { Beam, PrismLabel } from "./signals";
 import { chunkOf, fieldAt, liveOf, modifiers, pagePoint, secret, shapeOf, typedUrl, type FieldPlace, type LiveStream, type PageField } from "./live-of";
@@ -844,20 +845,14 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
       { t: "k", k: "up", key: name, code: name },
     ]);
   // What's selected in the page, to the viewer's clipboard: asked of the page now, written as it
-  // answers (a clipboard item that waits for it, where the browser lets one; else its text then).
+  // answers (copyLater). Nothing came: nothing's written (the clipboard keeps what it had).
   const copyOut = () => {
     const text = new Promise<string>((resolve) => {
       copying.current = resolve;
       setTimeout(() => resolve(""), 3000);
     });
     send({ control: { copy: true } });
-    const later = () => void text.then((t) => (t ? navigator.clipboard?.writeText(t) : undefined)).catch(() => undefined);
-    try {
-      // Nothing came: nothing's written (the clipboard keeps what it had).
-      navigator.clipboard.write([new ClipboardItem({ "text/plain": text.then((t) => (t ? new Blob([t], { type: "text/plain" }) : Promise.reject(new Error("nothing selected")))) })]).catch(later);
-    } catch {
-      later();
-    }
+    void copyLater(text);
   };
   const key = (k: "down" | "up") => (e: React.KeyboardEvent) => {
     // A paste comes as its text (the page's own clipboard isn't the viewer's).

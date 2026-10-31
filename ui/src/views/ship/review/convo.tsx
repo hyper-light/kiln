@@ -10,6 +10,7 @@ import type { Thread } from "@/api/review";
 import { whoSaid } from "@/api/review";
 import { StatusGlyph } from "@/components/ui/status-glyph";
 import { relativeTime } from "@/lib/format";
+import { copyText } from "@/views/terminal/clipboard";
 import { CommentText } from "./comment";
 import { ReviewComposer } from "./composer";
 import { draftKey, useDraftSet } from "./draft";
@@ -61,7 +62,7 @@ export function Description({ item, author, title, body, at }: { item?: string; 
               },
               <Reply size={14} aria-hidden="true" />,
             )}
-          {icon("Copy", () => void navigator.clipboard?.writeText(body).catch(() => {}), <Copy size={14} aria-hidden="true" />)}
+          {icon("Copy", () => void copyText(body), <Copy size={14} aria-hidden="true" />)}
           {item != null &&
             icon(
               "Quote",

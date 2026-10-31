@@ -1987,7 +1987,7 @@ fn carried_choices(from: &Kind, to: &Kind, mode: &str, effort: &str, allow_bypas
 
 /// The session's state for the harness it goes on in (`session`: its conversation's id there):
 /// the model, mode and effort it runs with; what was the old harness's own (its servers, skills,
-/// account, plan and limits, what it was doing) goes with it.
+/// account, plan and limits, its to-dos, what it was doing) goes with it.
 fn for_harness(st: &mut super::model::State, session: Option<String>, model: &str, mode: Option<String>, effort: Option<String>) {
     st.harness_session = session;
     model.clone_into(&mut st.model);
@@ -2012,6 +2012,9 @@ fn for_harness(st: &mut super::model::State, session: Option<String>, model: &st
     st.exit = None;
     st.activity = None;
     st.doing = None;
+    // Its to-dos too: the new harness has them in its note ("The plan as it stands") and keeps
+    // a list of its own, so keep-going never holds it to one only the old harness could change.
+    st.todos.clear();
 }
 
 /// A paused session moving to another machine goes on there: the pause (for this machine's
@@ -3996,6 +3999,25 @@ mod tests {
         core.state.turn_started = None;
         core.state.status = Status::Running;
         assert!(!switch_now(&core), "running");
+    }
+
+    /// A switch leaves the old harness's to-dos to the note it gives the new one ("The plan as it
+    /// stands": the next test): the session goes on with none, so keep-going counts only the list
+    /// the new harness keeps, never one it has no way to change (Claude Code without a to-do tool,
+    /// after Devin).
+    #[test]
+    fn a_switch_leaves_the_to_dos_of_the_old_harness_in_its_note() {
+        use super::super::model::{State, Todo};
+        use super::{Info, for_harness};
+        let todo = |text: &str, status: &str| Todo { text: text.into(), status: status.into() };
+        let mut st = State { todos: vec![todo("find the cause", "completed"), todo("upgrade the studios", "in_progress"), todo("check them", "pending")], ..State::default() };
+        let mut info = Info::default();
+        info.apply(&st);
+        assert_eq!((info.todos_done, info.todos_total), (1, 3));
+        for_harness(&mut st, Some("S2".into()), "opus", Some("auto".into()), Some("max".into()));
+        info.apply(&st);
+        assert!(st.todos.is_empty(), "{:?}", st.todos);
+        assert_eq!((info.todos_done, info.todos_total), (0, 0), "nothing left open for keep-going to count");
     }
 
     /// Into Devin, Antigravity or another ACP agent too: named by its own modes (kiln's Ask and

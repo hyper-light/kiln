@@ -86,7 +86,9 @@ where it has one; Devin, the other ACP agents and Antigravity take it in words, 
 first message they get (a restart before that gives it then), in less room. The permission mode
 goes at the same latitude, never wider (an ACP agent that names its modes only once started gets
 kiln's Ask, or Bypass from a mode that skipped every check), and the effort as near as the model
-takes. The timeline marks the line between the two.
+takes. The to-dos go in the note it's given ("The plan as it stands"), and the session goes on
+with none: the new harness keeps a list of its own, so keep-going ([goals.md](goals.md)) never
+holds it to one only the old harness could change. The timeline marks the line between the two.
 
 ## Where a harness is found
 
