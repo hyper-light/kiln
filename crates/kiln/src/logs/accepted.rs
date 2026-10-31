@@ -1015,9 +1015,7 @@ async fn continue_operation(ctx:Context,mut op:Operation)->anyhow::Result<Receip
             let owned:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM ci_log_accepted_pins WHERE key=?1 AND view=?2 AND operation=?3 AND hash=?4 AND bytes=?5)",params![expected.key,expected.view,expected.operation,expected.hash,expected.bytes],|r|r.get(0))?;
             Ok(owned.then_some(()))
         }).await;
-        if write {
-            if let Err(why)=owned_put(&ctx,&p.key,&p.hash,bytes).await {return Ok(refused(&ctx,op.id,why).await)}
-        }
+        if write && let Err(why)=owned_put(&ctx,&p.key,&p.hash,bytes).await {return Ok(refused(&ctx,op.id,why).await)}
         let proposal=p.clone();let expected=p.clone();
         transition(&ctx.store,move |c|stage(c,&proposal,next_file,next_offset,input,input_cursor),move |c|{
             let Some(op)=operation(c,&expected.operation)? else {return Ok(None)};
@@ -1027,10 +1025,8 @@ async fn continue_operation(ctx:Context,mut op:Operation)->anyhow::Result<Receip
         }).await;
         op=prepared(load(&ctx.store,op.id).await)?;
     }
-    if op.expected_revision==0 {
-        if let Err(error)=ctx.files.verify_directory(&op.job,op.baseline_json.clone()).await {
-            return Ok(refused(&ctx,op.id,format!("historical directory changed before publication: {error:#}")).await);
-        }
+    if op.expected_revision==0 && let Err(error)=ctx.files.verify_directory(&op.job,op.baseline_json.clone()).await {
+        return Ok(refused(&ctx,op.id,format!("historical directory changed before publication: {error:#}")).await);
     }
     let id=op.id.clone();let check=id.clone();
     let done=transition(&ctx.store,move |c|{publish(c,&id)?;Ok(())},move |c|completed(c,&check)).await;
@@ -1283,7 +1279,8 @@ pub(crate) async fn retire_file_turn(logs:&super::Logs,cursor:&mut Option<String
     let Some(original)=original else {return Ok(false)};
     // INSERT fence prevents same-ID replacement while this durable intent exists. Current
     // accepted producer futures are still checked; tombstones do not prove old-writer drain.
-    if {let owner=logs.io.lock();owner.busy(&job)} {return Ok(false)}
+    let busy={let owner=logs.io.lock();owner.busy(&job)};
+    if busy {return Ok(false)}
     ctx.files.delete_captured(&job,original.clone()).await?;
     let done=job.clone();let host=ctx.host.clone();
     ctx.store.call(move |c|{c.execute("DELETE FROM ci_log_deferred_delete WHERE job=?1 AND host=?2 AND capture=?3 AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.id=?1) AND NOT EXISTS(SELECT 1 FROM ci_log_accepted_copy x WHERE x.source_job=?1 AND x.active=1)",params![done,host,original])?;Ok(())}).await?;

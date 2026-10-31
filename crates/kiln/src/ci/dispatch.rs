@@ -1204,6 +1204,12 @@ pub fn spawn(hub: Arc<Hub>) {
             d.timers.insert(at);
         }
         loop {
+            // U01/U03: committed receipt/recovery handlers may enqueue commands outside
+            // commands(). Carry them out before waiting for an unrelated message or timer.
+            if !d.next.is_empty() {
+                let pending = std::mem::take(&mut d.next);
+                d.commands(pending).await;
+            }
             let wait = d.timers.first().map(|at| Duration::from_millis(u64::try_from((at - now_ms()).max(0)).unwrap_or(0)));
             let msg = match wait {
                 Some(w) => crate::rt::timeout(w, rx.recv()).await.ok(),
@@ -2597,7 +2603,9 @@ impl Dispatch {
             return;
         }
         self.in_commands = true;
-        let mut todo: std::collections::VecDeque<Command> = cmds.into();
+        // U01/U03: earlier receipt/recovery outputs precede this newer input's commands.
+        let mut todo: std::collections::VecDeque<Command> = std::mem::take(&mut self.next).into();
+        todo.extend(cmds);
         while let Some(c) = todo.pop_front() {
             let cancelled = match &c {
                 Command::Settled { leg, outcome: Outcome::Cancelled, reason } => self.legs.get(leg)
@@ -3890,7 +3898,7 @@ impl Dispatch {
                 // grace (`absent`). Not put on `a`'s record here: a leg its hello left out would
                 // hold one of its slots for good.
                 (Status::Running, Some(a)) => {
-                    let _ = self.sched.handle(Input::LegRunning { leg: Box::new(li), runner: a, attempt: attempt.max(1) }, now_ms());
+                    self.next.extend(self.sched.handle(Input::LegRunning { leg: Box::new(li), runner: a, attempt: attempt.max(1) }, now_ms()));
                     if let Some(journal) = self.ordinary_record(&id,attempt.max(1)).await? && journal.logical != "running" {
                         let outcome = if journal.logical == "lost" { Outcome::Failed(Failed { class:FailureClass::RunnerLost,exit_code:None,log_hits:Vec::new() }) } else {
                             let key = id.clone();let number = attempt.max(1);

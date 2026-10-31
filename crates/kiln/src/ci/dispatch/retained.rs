@@ -140,7 +140,7 @@ impl Dispatch {
             if record.released { continue; }
             if record.ordinary.is_none() || record.transferred || record.until != 0 {
                 self.hub.ci.keep(&record.job, Some((record.agent.clone(), record.until)));
-                self.sched.handle(Input::RetainExecution { leg: record.job.clone(), attempt: record.attempt }, now_ms());
+                self.next.extend(self.sched.handle(Input::RetainExecution { leg: record.job.clone(), attempt: record.attempt }, now_ms()));
             }
             if !record.transferred || self.admission.retained.contains(&record.allocation.id) { continue; }
             let commands = self.sched.handle(Input::LegRunning { leg: Box::new(record.allocation.leg()), runner: record.allocation.runner.clone(), attempt: 1 }, now_ms());
@@ -198,7 +198,7 @@ impl Dispatch {
                 }).await?;
             }
             self.commit_retained(&record, true).await?;
-            self.sched.handle(Input::ExecutionReleased { leg: job.to_owned(), attempt }, now_ms());
+            self.next.extend(self.sched.handle(Input::ExecutionReleased { leg: job.to_owned(), attempt }, now_ms()));
             if self.admission.retained.remove(&record.allocation.id) {
                 let commands = self.sched.handle(Input::AttemptFinished { leg: record.allocation.id, attempt: 1, outcome: Outcome::Success }, now_ms());
                 if let Some(commands) = self.after(commands) {
@@ -224,7 +224,7 @@ impl Dispatch {
         if execution.is_some() { record.execution = execution; }
         record.until = until;
         self.commit_retained(&record, false).await?;
-        self.sched.handle(Input::RetainExecution { leg: job.to_owned(), attempt }, now_ms());
+        self.next.extend(self.sched.handle(Input::RetainExecution { leg: job.to_owned(), attempt }, now_ms()));
         self.hub.ci.keep(job, Some((agent.to_owned(), until)));
         Ok(())
     }

@@ -3984,7 +3984,18 @@ mod tests {
             host.sessions.lock().remove("s");
             host.lanes.lock().remove("s");
             drop(running);
-            drop(host);
+            // U17: a lane/save adapter can still hold its Host after its result was sent.
+            // Drain only that old adapter, then drop its owner lock before simulating restart.
+            let mut retiring = host;
+            crate::rt::timeout(Duration::from_secs(5), async move {
+                loop {
+                    match Arc::try_unwrap(retiring) {
+                        Ok(previous) => { drop(previous); return; },
+                        Err(still_owned) => retiring = still_owned,
+                    }
+                    crate::rt::sleep(Duration::from_millis(10)).await;
+                }
+            }).await.map_err(|_| anyhow::anyhow!("the original fixture Host still owns its adapter during crash teardown"))?;
             let (tx, _rx) = async_channel::unbounded();
             let again = Host::try_with_records(tx, Some(file.clone()), Limits::default(), Arc::new(SimClock::new()), records, "runner/test")?;
             again.try_restore_from(None)?;

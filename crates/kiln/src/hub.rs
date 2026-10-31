@@ -257,28 +257,27 @@ fn said_unread(u: &crate::wire::unread::Unread, n: u64) {
 /// back, though its session went on elsewhere meanwhile and took it there, sent again under its id
 /// (the twenty-second adversarial check's). Live, a link that drops before it's answered ends it,
 /// and its sender sends it again under its id, wherever its session runs then. None: not a command.
-fn stream_of(msg: &ServerMsg) -> Option<crate::wire::commands::Kind> {
+fn route_of(msg: &ServerMsg) -> (Option<crate::wire::commands::Kind>, bool) {
     use crate::wire::commands::Kind as Stream;
     use crate::wire::{Away, Class};
-    let class = match (crate::wire::server_class(msg), msg) {
-        (Class::Command(Away::AsItsCommand), ServerMsg::HarnessCmd { json, .. }) => crate::wire::payload::command_class(json),
-        (c, _) => c,
+    let (class, urgent) = match (crate::wire::server_class(msg), msg) {
+        (Class::Command(Away::AsItsCommand), ServerMsg::HarnessCmd { json, .. }) => crate::wire::payload::command_route(json),
+        (c, _) => (c, false),
     };
-    match class {
+    let stream = match class {
         Class::Command(Away::Refuse) => Some(Stream::Live),
         Class::Command(Away::Park | Away::AsItsCommand) | Class::State => Some(Stream::Parked),
         _ => None,
-    }
+    };
+    (stream, urgent)
 }
+
+fn stream_of(msg: &ServerMsg) -> Option<crate::wire::commands::Kind> { route_of(msg).0 }
 
 /// Keep the existing stream/away law. Only explicit emergency session controls can
 /// positively preempt a never-enqueued ordinary reservation in the SAME Commands owner.
-fn preempts_ordinary(msg: &ServerMsg) -> bool {
-    match msg {
-        ServerMsg::HarnessCmd { json, .. } => matches!(serde_json::from_str::<crate::harness::model::Command>(json),Ok(crate::harness::model::Command::Interrupt | crate::harness::model::Command::ForceStop)),
-        _ => false,
-    }
-}
+#[cfg(test)]
+fn preempts_ordinary(msg: &ServerMsg) -> bool { route_of(msg).1 }
 
 /// A question asked of a runner, waiting for its answer (by its `req`): what reads the answer as
 /// the type its asker wants (`crate::wire::payload`) and hands it over. An answer it can't read is
@@ -1263,8 +1262,7 @@ impl Hub {
         if peers.is_empty() {
             return at_once(Answer::Unreachable { why: format!("{agent} is not connected") });
         }
-        let stream = stream_of(msg);
-        let preempt = preempts_ordinary(msg);
+        let (stream, preempt) = route_of(msg);
         let body = match proto::encode(msg) {
             Ok(b) => b,
             Err(e) => return at_once(Answer::Unreachable { why: format!("it couldn't be encoded: {e}") }),
@@ -3004,9 +3002,9 @@ impl Hub {
     /// Grant persistence authorizes NEW items after a reconnect; an old item never changes route.
     pub async fn send_captured_runner(&self, captured: &crate::instances::CapturedRunner, msg: &ServerMsg) -> anyhow::Result<Pending> {
         use crate::wire::commands::Answer;
-        if stream_of(msg) != Some(crate::wire::commands::Kind::Live) { anyhow::bail!("captured runner commands require the Live command stream"); }
+        let (stream, preempt) = route_of(msg);
+        if stream != Some(crate::wire::commands::Kind::Live) { anyhow::bail!("captured runner commands require the Live command stream"); }
         let frame = proto::encode(msg)?;
-        let preempt = preempts_ordinary(msg);
         let mut answer = {
             let instances = self.instances.lock();
             if !instances.still_captured(captured) {
@@ -4196,8 +4194,8 @@ pub(crate) mod tests {
         use crate::wire::commands::{Answer, COMING_FOR, Kind};
         crate::rt::block_on(async {
             let hub = scratch_hub().await?;
-            hub.peers.lock().insert(1, "box-a".into());
-            hub.peers.lock().insert(2, "box-b".into());
+            join_runner(&hub, 1, "box-a", 0);
+            join_runner(&hub, 2, "box-b", 0);
             let now = Instant::now();
             for peer in [1, 2] {
                 hub.cmds.lock().coming(peer, now);

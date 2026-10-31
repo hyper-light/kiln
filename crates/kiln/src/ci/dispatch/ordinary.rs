@@ -387,7 +387,7 @@ impl Dispatch {
             Err(error)=>{self.admission.ready=false;return Err(error);}
         };
         if let Some((journal,release_debt))=effect {
-            self.sched.handle(Input::ExecutionReleased{leg:journal.owner.job.clone(),attempt:journal.owner.attempt},now_ms());
+            self.next.extend(self.sched.handle(Input::ExecutionReleased{leg:journal.owner.job.clone(),attempt:journal.owner.attempt},now_ms()));
             if release_debt {
                 self.admission.retained.remove(&journal.allocation.id);
                 let commands=self.sched.handle(Input::AttemptFinished{leg:journal.allocation.id.clone(),attempt:1,outcome:Outcome::Success},now_ms());
@@ -430,7 +430,7 @@ impl Dispatch {
             tx.execute("UPDATE jobs SET kept_until=?4 WHERE id=?1 AND agent=?2 AND attempt=?3",params![job,agent,attempt,until])?;
             tx.commit()?;Ok(())
         }).await?;
-        self.sched.handle(Input::RetainExecution{leg:ui_job.clone(),attempt},now_ms());
+        self.next.extend(self.sched.handle(Input::RetainExecution{leg:ui_job.clone(),attempt},now_ms()));
         self.hub.ci.keep(&ui_job,Some((ui_agent,until)));
         Ok(true)
     }

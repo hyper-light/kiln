@@ -26,7 +26,7 @@ use crate::exec::{Exec, Up, Uplink};
 use crate::net::{self, Kind, NetEvent, Out, SERVER_PEER};
 use crate::pki::Leaf;
 use crate::proto::{self, AgentMsg, Hello, JobResult, LANE_CONTROL, LANE_CONVO, LANE_FILES, LANE_LOGS, LANE_OBSERVE, LANE_PORTS, LANE_REACH, LANE_STREAM, LANE_SYNC, LANE_TERM, ServerMsg};
-use crate::wire::payload::{Carried, FromServer, Waits};
+use crate::wire::payload::{Carried, FromServer, RetainedAcknowledgement, Waits};
 use crate::store::Status;
 use crate::terminal::{self, PtyOut, PtySession};
 
@@ -439,7 +439,7 @@ enum Ev {
     /// A periodic U01/U03 retry opportunity; its handler only changes the existing latches.
     OrdinaryRecovery,
     /// An exact buffered receiver ticket whose admission exclusion is already durable.
-    OrdinaryInput(crate::wire::channel::OrdinaryTicket),
+    OrdinaryInput(AdmittedInput),
     /// This SAME local event has already entered the retained outbox.
     UpDurable(Up),
     /// A test build's fault: the connection drops (W22-AC04).
@@ -468,13 +468,17 @@ fn complete_ordinary_urgent<T:crate::harness::host::Taker+?Sized>(receiver:&mut 
 }
 enum SpoolWork {
     Publish { up: Box<Up>, receipt: retained::Receipt },
-    Ack(serde_json::Value),
+    Ack(RetainedAcknowledgement),
     Sample { hints: Vec<retained::Receipt>, work: PathBuf, ordinary: bool, legacy: bool, records:Arc<dyn kiln_seams::records::Records>, nonce:String },
 }
+// The SAME admission continuation carries its already-read assignment to the effect boundary.
+// It is discarded with the original ticket on cancellation/Unknown, never cached by a new owner.
+type ServerRead = Result<Carried<ServerMsg, FromServer>, Box<crate::wire::payload::Unreadable>>;
+struct AdmittedInput { ticket: OrdinaryTicket, assignment: Option<Box<ServerRead>> }
 enum OrdinaryDone {
     Initialized { spool: retained::Spool, epoch: Result<String,String> },
     Registered { origin: crate::net::Connection, result: Box<anyhow::Result<Incoming>> },
-    Admitted { ticket: OrdinaryTicket, execution: Option<Arc<crate::runner::processes::Execution>>, result: Box<anyhow::Result<Incoming>> },
+    Admitted { ticket: OrdinaryTicket, execution: Option<Arc<crate::runner::processes::Execution>>, assignment: Option<Box<ServerRead>>, result: Box<anyhow::Result<Incoming>> },
     Closed { ticket: OrdinaryTicket, execution: Arc<crate::runner::processes::Execution>, reason: String, result: anyhow::Result<()> },
     Committed { closure: OrdinaryClosure, result: Box<anyhow::Result<Incoming>> },
     Spool { spool: retained::Spool, work: Box<SpoolWork>, result: anyhow::Result<Vec<AgentMsg>>, incoming:Box<Option<anyhow::Result<Option<Incoming>>>> },
@@ -492,11 +496,10 @@ fn spool_io(mut spool: retained::Spool, work: SpoolWork) -> OrdinaryIo {
             match &work {
                 SpoolWork::Publish { receipt, .. } => { spool.publish(receipt).await?; Ok(Vec::new()) },
                 SpoolWork::Ack(value) => {
-                    match value.get("kind").and_then(serde_json::Value::as_str) {
-                        Some("ordinary_frontier") => spool.received_ordinary(&serde_json::from_value::<kiln_ci::wire::OrdinaryFrontierAckV1>(value.clone())?).await?,
-                        Some(_) => anyhow::bail!("unknown retained acknowledgement kind"),
-                        None if value.get("kind").is_some() => anyhow::bail!("malformed retained acknowledgement kind"),
-                        None => spool.received(&serde_json::from_value::<retained::Receipt>(value.clone())?).await?,
+                    match value {
+                        RetainedAcknowledgement::Frontier(frontier) => spool.received_ordinary(frontier).await?,
+                        RetainedAcknowledgement::Legacy(receipt) => spool.received(receipt).await?,
+                        RetainedAcknowledgement::Domain(_) => anyhow::bail!("ordinary domain acknowledgement is not a spool receipt"),
                     }
                     Ok(Vec::new())
                 },
@@ -1354,7 +1357,7 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
     let mut ordinary_answer: Option<OrdinaryTicket> = None;
     let mut ordinary_urgents=VecDeque::<OrdinaryUrgent>::new();
     let mut spool_publication_pending=false;
-    let mut ordinary_dispatch: Option<OrdinaryTicket> = None;
+    let mut ordinary_dispatch: Option<AdmittedInput> = None;
     let mut ordinary_execution: Option<Arc<crate::runner::processes::Execution>> = None;
     // Unknown preparation keeps its exact Execution/Gate, never a new attempt or NoStart.
     let mut ordinary_unknown: Option<(OrdinaryTicket,Option<Arc<crate::runner::processes::Execution>>)> = None;
@@ -1830,10 +1833,14 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                     OrdinaryDone::Committed{closure,result:Box::new(result)}
                 }.boxed());
             } else if !ordinary_paused && let Some(ticket)=wire_in.ordinary_head(origin,&process_nonce,stream)? {
-                let owner=match proto::read_server(ticket.body()) {
-                    Ok(ServerMsg::AssignV2{json})=>serde_json::from_str::<kiln_ci::wire::AssignmentV2>(&json).ok().and_then(|a|a.ordinary_owner),
+                let assignment=match proto::read_server(ticket.body()) {
+                    Ok(message @ ServerMsg::AssignV2{..})=>Some(Box::new(crate::wire::payload_of(message))),
                     _=>None,
                 };
+                let owner=assignment.as_deref().and_then(|read|match read {
+                    Ok(Carried::Read(FromServer::AssignV2(assignment)))=>assignment.ordinary_owner.clone(),
+                    _=>None,
+                });
                 ordinary_pending=Some(PendingOrdinary{job:owner.as_ref().map(|owner|owner.job.clone()),ticket:ticket.clone(),cancelled:false});
                 let (paths,work,records,nonce)=(admission_paths.clone(),o.work_dir.clone(),Arc::clone(&ordinary_records),ticket.nonce().to_owned());
                 ordinary_io=Some(async move {
@@ -1849,7 +1856,7 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                         }
                         Ok(state)
                     }.await;
-                    OrdinaryDone::Admitted{ticket,execution,result:Box::new(result)}
+                    OrdinaryDone::Admitted{ticket,execution,assignment,result:Box::new(result)}
                 }.boxed());
             }
         }
@@ -1975,7 +1982,7 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                         },
                         Err(error)=>tracing::warn!(error=%format!("{error:#}"),"incoming binding not registered; strict readiness remains fenced"),
                     },
-                    OrdinaryDone::Admitted{ticket,execution,result}=>match *result {
+                    OrdinaryDone::Admitted{ticket,execution,assignment,result}=>match *result {
                         Ok(state)=> {
                             ordinary_incoming=Some(state);
                             let same=ordinary_pending.as_ref().is_some_and(|pending|pending.ticket.same_identity(&ticket)
@@ -1983,7 +1990,7 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                             let valid=same && !shutdown.is_cancelled() && Some(ticket.origin())==server_connection && ordinary_registered==Some(ticket.origin());
                             let cancelled=ordinary_pending.as_ref().is_some_and(|pending|pending.cancelled);
                             if valid && !cancelled && wire_in.ordinary_admitted(&ticket).is_ok() {
-                                ordinary_execution=execution;ordinary_dispatch=Some(ticket);
+                                ordinary_execution=execution;ordinary_dispatch=Some(AdmittedInput{ticket,assignment});
                             } else if let Some(execution)=execution {
                                 ordinary_io=Some(close_ordinary_io(ticket,execution,"the original pending Start was cancelled or its incoming authority retired".into()));
                             } else {ordinary_pending=None;}
@@ -2054,10 +2061,11 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                                 retained_blocked=Some((*up,Instant::now()+Duration::from_secs(1)));
                             },
                             (_,Ok(messages))=>for message in messages {
-                                if let AgentMsg::JobEvent{json,..}=&message
-                                    && matches!(serde_json::from_str::<kiln_ci::wire::JobEventV2>(json),Ok(kiln_ci::wire::JobEventV2::OrdinaryExecutionPublication{..}))
-                                    && (ordinary_registered.is_none() || ordinary_registered!=server_connection) {continue;}
-                                if let AgentMsg::Executor{json}=&message && let Ok(said)=serde_json::from_str::<crate::runner::pool::Said>(json) {pool_execs.recovered(&said);}
+                                match crate::wire::payload::retained_replay(&message) {
+                                    crate::wire::payload::RetainedReplay::OrdinaryPublication if ordinary_registered.is_none() || ordinary_registered!=server_connection => continue,
+                                    crate::wire::payload::RetainedReplay::Executor(said) => pool_execs.recovered(&said),
+                                    _ => {},
+                                }
                                 deferred_control.enqueue(&uplink.0,Up::Msg(message))?;
                             },
                             (_,Err(error))=>tracing::warn!(error=%format!("{error:#}"),"retained operation remains recoverable in its original owner"),
@@ -2681,13 +2689,13 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                 dial_backoff = (dial_backoff * 2).min(Duration::from_secs(30));
             }
             event @ (Ev::Net(Some(NetEvent::Frame { .. })) | Ev::Forwarded(_) | Ev::OrdinaryInput(_)) => {
-                let (data, origin) = match event {
-                    Ev::Net(Some(NetEvent::Frame { data, connection, .. })) => (data.into_vec(), connection),
-                    Ev::Forwarded(data) => (data, None),
-                    Ev::OrdinaryInput(ticket) => {
+                let (data, origin, assignment) = match event {
+                    Ev::Net(Some(NetEvent::Frame { data, connection, .. })) => (data.into_vec(), connection, None),
+                    Ev::Forwarded(data) => (data, None, None),
+                    Ev::OrdinaryInput(AdmittedInput{ticket,assignment}) => {
                         answer_after=Some((ticket.stream().into(),ticket.seq(),None));
                         ordinary_pending=None;
-                        let pair=(ticket.body().to_vec(),Some(ticket.origin()));
+                        let pair=(ticket.body().to_vec(),Some(ticket.origin()),assignment);
                         ordinary_answer=Some(ticket);pair
                     },
                     _ => continue 'events,
@@ -2740,15 +2748,13 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                             { continue 'events; }
                             let strict_ordinary = current_origin && ordinary_strict==origin && origin.is_some()
                                 && crate::wire::commands::kind_of(&stream) == Some(crate::wire::commands::Kind::Live);
-                            if let Ok(ServerMsg::AssignV2 { json }) = &inner {
-                                #[derive(Deserialize)]
-                                struct Header { #[serde(default)] ordinary_owner: Option<kiln_ci::wire::OrdinaryOwnerV1> }
-                                if let Ok(header) = serde_json::from_str::<Header>(json) && let Some(owner) = header.ordinary_owner {
-                                    let valid = owner.validate().is_ok() && strict_ordinary && owner.host == name && owner.process_nonce == process_nonce
-                                        && origin.is_some_and(|origin| owner.connection == origin.channel_id()) && owner.command.stream == stream && owner.command.seq == seq
-                                        && ordinary_epoch.as_ref().is_ok_and(|epoch| *epoch == owner.publication_epoch);
-                                    if !valid { tracing::warn!("ordinary Start refused before admission: original owner/stamp/domain mismatch"); continue 'events; }
-                                }
+                            if let Ok(ServerMsg::AssignV2 { json }) = &inner
+                                && let Some(owner) = crate::wire::payload::ordinary_owner(json)
+                            {
+                                let valid = owner.validate().is_ok() && strict_ordinary && owner.host == name && owner.process_nonce == process_nonce
+                                    && origin.is_some_and(|origin| owner.connection == origin.channel_id()) && owner.command.stream == stream && owner.command.seq == seq
+                                    && ordinary_epoch.as_ref().is_ok_and(|epoch| *epoch == owner.publication_epoch);
+                                if !valid { tracing::warn!("ordinary Start refused before admission: original owner/stamp/domain mismatch"); continue 'events; }
                             }
                             if strict_ordinary && let Some(actual)=origin {
                                 use crate::wire::channel::OrdinaryArrival;
@@ -2770,7 +2776,7 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                                     ordinary_stream=Some(stream.clone());
                                 }
                                 let typed=match &inner {
-                                    Ok(ServerMsg::HarnessCmd{session,json})=>serde_json::from_str::<crate::harness::model::Command>(json).ok().filter(|command|matches!(command,crate::harness::model::Command::Interrupt|crate::harness::model::Command::ForceStop)).map(|command|(session.clone(),command)),
+                                    Ok(ServerMsg::HarnessCmd{session,json})=>crate::wire::payload::urgent_command(json).map(|command|(session.clone(),command)),
                                     _=>None,
                                 };
                                 let capture=typed.as_ref().filter(|_|!ordinary_urgents.iter().any(|urgent|urgent.origin==actual && urgent.stream==stream && urgent.seq==seq)).map(|(session,command)|OrdinaryUrgent{
@@ -2875,7 +2881,7 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                 // can't be read"). What can't be read is refused: a command on the channel is NACKed
                 // saying why, the server hears of it (`Unread`) either way (of a kind its newer build
                 // sends, once a connection), and what waits on it is told why too.
-                let msg = match crate::wire::payload_of(msg) {
+                let msg = match assignment.map(|read|*read).unwrap_or_else(||crate::wire::payload_of(msg)) {
                     Ok(read) => read,
                     Err(e) => {
                         tracing::warn!(what = %e.what, code = e.code.name(), why = %e.why, "what a message from the server carries couldn't be read");
@@ -2891,12 +2897,11 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                     Carried::Nothing(m) => m,
                     Carried::Read(FromServer::RetainedReceived(receipt)) => {
                         if !server_retained_received || !current_origin { continue; }
-                        match receipt.get("kind").and_then(serde_json::Value::as_str) {
-                            Some("ordinary_domain")=> {
+                        match &*receipt {
+                            RetainedAcknowledgement::Domain(domain)=> {
                                 if ordinary_registered==origin && origin.is_some() {continue;}
-                                let epoch=receipt.get("epoch").and_then(serde_json::Value::as_str);
-                                if receipt.get("version").and_then(serde_json::Value::as_u64)==Some(1) && server_ordinary
-                                    && ordinary_epoch.as_ref().is_ok_and(|own|Some(own.as_str())==epoch) && !o.outpost && executor_bootstrap.is_none()
+                                if server_ordinary
+                                    && ordinary_epoch.as_ref().is_ok_and(|own|*own==domain.epoch) && !o.outpost && executor_bootstrap.is_none()
                                     && ordinary_io.is_none() && let Some(origin)=origin
                                 {
                                     let (records,nonce)=(Arc::clone(&ordinary_records),process_nonce.clone());
@@ -2909,7 +2914,7 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                                     }.boxed());
                                 }
                             },
-                            Some("ordinary_frontier") if ordinary_registered!=origin || origin.is_none()=>tracing::warn!("ordinary frontier ACK lacks its registered origin"),
+                            RetainedAcknowledgement::Frontier(_) if ordinary_registered!=origin || origin.is_none()=>tracing::warn!("ordinary frontier ACK lacks its registered origin"),
                             _=> {
                                 // No proof is retired by dropping an unadmitted ACK: the same
                                 // bounded outbox replays and obtains it again. No ACK-of-ACK exists.

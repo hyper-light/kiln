@@ -141,7 +141,7 @@ impl std::fmt::Debug for ApplicationPermit {
 impl ApplicationPermit {
     fn agent() -> Self { Self { initialized:true,key:None } }
     #[cfg(test)]
-    pub(crate) fn fixture() -> Self { Self::agent() }
+    pub(crate) fn fixture() -> Self { Self { initialized: true, key: Some(Arc::from("test-only-application-key")) } }
 }
 
 /// Server-side directory: any certificate the TLS layer accepted was signed by the kiln CA, so it

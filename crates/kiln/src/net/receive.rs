@@ -115,7 +115,7 @@ impl Budget {
         let Some(debt)=a.debts.get_mut(&self.generation) else {a.fenced=true;return};
         let amount=if tag==URGENT {&mut debt.urgent}else{&mut debt.common};
         let Some(left)=amount.checked_sub(bytes) else {a.fenced=true;return};*amount=left;
-        if let Some(at)=slot {if let Some(slot)=a.slots.get_mut(at){*slot=None}}
+        if let Some(at)=slot && let Some(slot)=a.slots.get_mut(at){*slot=None}
         let good=if tag==URGENT {a.urgent.give(reservation)}else{a.common.give(reservation)};
         if !good {a.fenced=true;tracing::error!("receive accountant underflow; further grants fenced")}
         if a.debts.get(&self.generation).is_some_and(|d|d.retired && d.common==0 && d.urgent==0) && !a.slots.iter().flatten().any(|slot|slot.generation==self.generation) {a.debts.remove(&self.generation);}

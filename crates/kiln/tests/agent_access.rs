@@ -159,7 +159,7 @@ fn a_person_reaches_the_agents_they_opened() -> anyhow::Result<()> {
         ("POST", format!("/api/harness/sessions/{mine}/command"), Some(&interrupt)),
         ("GET", format!("/api/harness/sessions/{mine}/goals"), None),
         ("GET", format!("/api/harness/agents/{mine}"), None),
-        ("POST", format!("/api/harness/agents/{mine}/interrupt"), Some(&interrupt)),
+        ("POST", format!("/api/harness/agents/{mine}/interrupt"), None),
         ("POST", "/api/ops/agents.get".to_owned(), Some(&stop)),
         ("POST", "/api/ops/agents.stop".to_owned(), Some(&stop)),
         ("DELETE", format!("/api/harness/sessions/{mine}"), None),

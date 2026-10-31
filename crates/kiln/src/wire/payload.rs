@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use kiln_seams::Clock;
 use parking_lot::Mutex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
@@ -138,6 +138,80 @@ pub fn payload<T: DeserializeOwned + Serialize>(wire: Wire, of: &'static str, js
         }
     }
     Ok(read)
+}
+
+/// U01/U03: the three existing acknowledgement shapes, kept typed through spool admission.
+/// A present discriminator never falls back to the legacy shape.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum RetainedAcknowledgement {
+    Legacy(crate::agent::RetainedReceipt),
+    Domain(OrdinaryDomain),
+    Frontier(kiln_ci::wire::OrdinaryFrontierAckV1),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct OrdinaryDomain {
+    kind: String,
+    version: u8,
+    pub epoch: String,
+}
+
+impl<'de> Deserialize<'de> for RetainedAcknowledgement {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let value = Value::deserialize(deserializer)?;
+        match value.get("kind") {
+            Some(Value::String(kind)) if kind == "ordinary_domain" => {
+                let domain = OrdinaryDomain::deserialize(&value).map_err(D::Error::custom)?;
+                if domain.version != 1 || domain.epoch.is_empty() || domain.epoch.len() > 128
+                    || !domain.epoch.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                { return Err(D::Error::custom("malformed ordinary domain acknowledgement")); }
+                Ok(Self::Domain(domain))
+            }
+            Some(Value::String(kind)) if kind == "ordinary_frontier" => {
+                let frontier = kiln_ci::wire::OrdinaryFrontierAckV1::deserialize(&value).map_err(D::Error::custom)?;
+                frontier.validate().map_err(D::Error::custom)?;
+                Ok(Self::Frontier(frontier))
+            }
+            Some(Value::String(kind)) => Err(D::Error::unknown_variant(kind, &["ordinary_domain", "ordinary_frontier"])),
+            Some(_) => Err(D::Error::custom("malformed retained acknowledgement kind")),
+            None => crate::agent::RetainedReceipt::deserialize(&value).map(Self::Legacy).map_err(D::Error::custom),
+        }
+    }
+}
+
+/// A pre-admission projection only: unrelated assignment fields are skipped without constructing
+/// another full assignment. The complete payload is still read at its original effect boundary.
+pub fn ordinary_owner(json: &str) -> Option<kiln_ci::wire::OrdinaryOwnerV1> {
+    #[derive(Deserialize)]
+    struct Header { #[serde(default)] ordinary_owner: Option<kiln_ci::wire::OrdinaryOwnerV1> }
+    serde_json::from_str::<Header>(json).ok().and_then(|header| header.ordinary_owner)
+}
+
+/// Only the two unit controls preempt ordinary work. An ordinary struct skips unrelated values
+/// with IgnoredAny; an internally tagged enum would buffer them as Content. The tag itself is
+/// decoded once; duplicate, missing or non-string tags refuse this projection. The full Command
+/// remains at its original typed effect boundary.
+pub fn urgent_command(json: &str) -> Option<crate::harness::model::Command> {
+    #[derive(Deserialize)]
+    struct Header { #[serde(rename = "type")] kind: String }
+    match serde_json::from_str::<Header>(json).ok()?.kind.as_str() {
+        "interrupt" => Some(crate::harness::model::Command::Interrupt),
+        "force_stop" => Some(crate::harness::model::Command::ForceStop),
+        _ => None,
+    }
+}
+
+/// Existing retained replay classification, before reconnect registration or local recovery.
+/// Parse only the matching variant, once; an unreadable outgoing replay retains its old behavior.
+pub enum RetainedReplay { OrdinaryPublication, Executor(Box<crate::runner::pool::Said>), Other }
+pub fn retained_replay(message: &AgentMsg) -> RetainedReplay {
+    match message {
+        AgentMsg::JobEvent { json, .. } if matches!(serde_json::from_str::<kiln_ci::wire::JobEventV2>(json), Ok(kiln_ci::wire::JobEventV2::OrdinaryExecutionPublication { .. })) => RetainedReplay::OrdinaryPublication,
+        AgentMsg::Executor { json } => serde_json::from_str(json).map(RetainedReplay::Executor).unwrap_or(RetainedReplay::Other),
+        _ => RetainedReplay::Other,
+    }
 }
 
 /// Reserved pre-unification formats never start a second persistence/replication owner.
@@ -454,8 +528,8 @@ pub enum FromServer {
     Observe { msg: Box<crate::observe::wire::Msg>, bytes: Vec<u8> },
     /// `Headroom`: this machine's headroom settings (docs/headroom.md).
     Headroom(Box<crate::headroom::Push>),
-    /// The single existing retained-evidence receipt type, read at the boundary once.
-    RetainedReceived(Box<serde_json::Value>),
+    /// Existing retained evidence and ordinary acknowledgements, read at the boundary once.
+    RetainedReceived(Box<RetainedAcknowledgement>),
 }
 
 impl Carries for ServerMsg {
@@ -573,11 +647,17 @@ impl Carries for ServerMsg {
 /// How a `HarnessCmd` the server sends rides the channel (`crate::wire::command_class`), from its
 /// JSON: the server's own, read here like every payload. One with a message's id is refused at once
 /// while its runner is away, never parked (CP-T3.2); one it can't read parks.
-pub fn command_class(json: &str) -> super::Class {
+pub fn command_class(json: &str) -> super::Class { command_route(json).0 }
+
+/// The stream law and emergency priority come from the SAME typed read.
+pub fn command_route(json: &str) -> (super::Class, bool) {
     match payload::<crate::harness::model::Command>(Wire::ServerPayload, "HarnessCmd", json) {
-        Ok(c) if crate::harness::registry::message_id(&c).is_some() => super::Class::Command(super::Away::Refuse),
-        Ok(c) => super::command_class(&c),
-        Err(_) => super::Class::Command(super::Away::Park),
+        Ok(c) => {
+            let urgent = matches!(&c, crate::harness::model::Command::Interrupt | crate::harness::model::Command::ForceStop);
+            let class = if crate::harness::registry::message_id(&c).is_some() { super::Class::Command(super::Away::Refuse) } else { super::command_class(&c) };
+            (class, urgent)
+        }
+        Err(_) => (super::Class::Command(super::Away::Park), false),
     }
 }
 
@@ -674,7 +754,7 @@ mod tests {
             case("Identity", |json| ServerMsg::Identity { json }, &crate::proto::IdentityGiven { kind: "runner".into(), uri: "kiln://runner/m1".into(), ..Default::default() }, None),
             case("Observe", |json| ServerMsg::Observe { json, bytes: Vec::new() }, &crate::observe::wire::Msg::Release, Some(r#"{"kind":"teleport"}"#)),
             case("Headroom", |json| ServerMsg::Headroom { json }, &crate::headroom::Push::default(), None),
-            case("RetainedReceived", |json| ServerMsg::RetainedReceived { json }, &crate::agent::RetainedReceipt { job: "j".into(), event: serde_json::json!({"t":"kept_owned","attempt":1,"execution":"e"}) }, None),
+            case("RetainedReceived", |json| ServerMsg::RetainedReceived { json }, &crate::agent::RetainedReceipt { job: "j".into(), event: serde_json::json!({"t":"kept_owned","attempt":1,"execution":"e"}) }, Some(r#"{"kind":"teleport"}"#)),
         ];
         cases.push(Case { of: "StreamOpen", make: |json| ServerMsg::StreamOpen { stream: "st1".into(), session: "s1".into(), json }, good: r#"{"url":"https://example.com"}"#.into(), unknown: None, any: false });
         cases
@@ -715,6 +795,36 @@ mod tests {
         }
         check(runner)?;
         check(server)?;
+        // U01/U03: each current ACK shape survives the shared reader. A discriminator cannot
+        // smuggle an unknown or malformed ordinary ACK through the legacy receipt's fields.
+        for (json, kind) in [
+            (r#"{"job":"j","event":{"t":"released","attempt":1,"execution":"e"},"future":true}"#, "legacy"),
+            (r#"{"kind":"ordinary_domain","version":1,"epoch":"epoch-1","future":true}"#, "domain"),
+            (r#"{"kind":"ordinary_frontier","version":1,"epoch":"epoch-1","through":7,"future":true}"#, "frontier"),
+        ] {
+            let read = payload_of(ServerMsg::RetainedReceived { json: json.into() }).map_err(|error| anyhow::anyhow!("{error}"))?;
+            anyhow::ensure!(matches!(read, Carried::Read(FromServer::RetainedReceived(ack)) if matches!((&*ack, kind),
+                (RetainedAcknowledgement::Legacy(_), "legacy") | (RetainedAcknowledgement::Domain(_), "domain") | (RetainedAcknowledgement::Frontier(_), "frontier"))), "wrong typed acknowledgement: {kind}");
+        }
+        for (json, code) in [
+            (r#"{"kind":"teleport","job":"j","event":{}}"#, Code::Unknown),
+            (r#"{"kind":null,"job":"j","event":{}}"#, Code::Malformed),
+            (r#"{"kind":"ordinary_domain","version":2,"epoch":"epoch-1"}"#, Code::Malformed),
+            (r#"{"kind":"ordinary_domain","version":1,"epoch":""}"#, Code::Malformed),
+            (r#"{"kind":"ordinary_frontier","version":1,"epoch":"epoch-1","through":"7"}"#, Code::Malformed),
+            (r#"{"kind":"ordinary_frontier","version":1,"epoch":"epoch-1"}"#, Code::Malformed),
+            (r#"{"job":"j"}"#, Code::Malformed),
+        ] {
+            anyhow::ensure!(payload_of(ServerMsg::RetainedReceived { json: json.into() }).is_err_and(|error| error.code == code), "bad acknowledgement was taken: {json}");
+        }
+        anyhow::ensure!(payload_of(ServerMsg::RetainedReceived { json: " ".repeat(65537) }).is_err_and(|error| error.code == Code::Malformed), "ACK budget was weakened");
+        for command in [crate::harness::model::Command::Interrupt, crate::harness::model::Command::ForceStop] {
+            let json = serde_json::to_string(&command)?;
+            anyhow::ensure!(urgent_command(&json) == Some(command.clone()) && command_route(&json).1, "emergency command lost its original priority");
+        }
+        for json in [r#"{"type":"close"}"#, r#"{"type":"teleport"}"#, "{"] {
+            anyhow::ensure!(urgent_command(json).is_none() && !command_route(json).1, "non-emergency acquired priority: {json}");
+        }
         // Reserved old ordinals fail closed independently of their payload's shape.
         for msg in [AgentMsg::Convo { json: "{".into(), data: Vec::new() }, AgentMsg::Cluster { json: "{}".into(), raft: Vec::new() }] {
             anyhow::ensure!(payload_of(msg).is_err_and(|e| e.code == Code::Unknown), "retired runner protocol was interpreted");

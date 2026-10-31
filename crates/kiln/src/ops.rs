@@ -683,8 +683,11 @@ pub async fn call(cx: Cx, name: &str, input: Value) -> Out {
 pub(crate) async fn call_checked(cx: Cx, name: &str, input: Value) -> CheckedOut {
     let input = yours(&cx.caller, name, if input.is_null() { json!({}) } else { input });
     let op = find_in(registry(), name)?;
-    let policy = op.policy(&input)?;
-    let (method, segs, q) = op.route(&input)?;
+    // U12: a malformed path argument still receives its canonical typed refusal.
+    // Valid routes keep authorization before input validation and domain execution.
+    let route_error = |error| op.info().input.fits(&input).err().map(CallError::Misfit).unwrap_or(CallError::Failed(error));
+    let policy = op.policy(&input).map_err(route_error)?;
+    let (method, segs, q) = op.route(&input).map_err(route_error)?;
     let decoded: Vec<&str> = segs.iter().map(String::as_str).collect();
     let path = format!("/{}", segs.iter().map(|s| s.replace('%', "%25").replace('/', "%2F")).collect::<Vec<_>>().join("/"));
     let run = checked(cx.clone(), op, input);

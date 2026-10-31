@@ -1414,7 +1414,7 @@ mod tests {
         let check=effect.clone();let target_head=hub.store.call(move|c|{
             let op=crate::logs::accepted::copy_metadata_operation(c,"large-copy",2,1,&check)?.ok_or_else(||anyhow::anyhow!("first metadata unexpectedly applied"))?;
             assert!(c.query_row("SELECT active FROM ci_log_accepted_copy WHERE operation=?1",[op],|r|r.get::<_,bool>(0))?,"source lease must survive target head until metadata receipt");
-            Ok(crate::logs::accepted::prefix(c,"large-copy")?)
+            crate::logs::accepted::prefix(c,"large-copy")
         }).await?;
         hub.logs.append_server("large-source".into(),1,b"later source must not duplicate target copy\n".to_vec()).await?;
         let replay=hub.logs.copy_step(crate::logs::accepted::CopyStep{job:"large-copy".into(),step:2,target_attempt:1,effect:effect.clone(),source_job:"large-source".into(),source_step:1,result:b"NEWER selected result must not replace FIRST".to_vec(),output_tree:None}).await?;
