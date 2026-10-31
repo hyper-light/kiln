@@ -57,6 +57,44 @@ pub(crate) async fn answer(r: Result<Response, Fail>) -> Out {
     if status.is_success() { Ok(v) } else { Err((status, v.get("error").and_then(Value::as_str).map_or_else(|| status.to_string(), str::to_owned))) }
 }
 
+/// U05/W20: named reads retain the raw route's qualification. A provider or genuine
+/// legacy response has no canonical headers and acquires no completion claim here.
+async fn answer_log(r: Result<Response, Fail>) -> Out {
+    let response = r?;
+    let headers = response.headers().clone();
+    if !response.status().is_success() { return answer(Ok(response)).await; }
+    let complete = match headers.get("x-kiln-log-complete").map(|v| v.to_str()).transpose().map_err(|e| internal(e.into()))? {
+        Some("1") => true,
+        Some("0") => false,
+        None => return answer(Ok(response)).await,
+        _ => return Err(internal(anyhow::anyhow!("invalid canonical log completion header"))),
+    };
+    // A real End0 is a qualified empty text body, not the generic adapter's Null.
+    // Collection failure must not manufacture that positive empty response either.
+    let bytes = response.into_body().collect().await.map_err(|e| internal(anyhow::anyhow!("{e}")))?.to_bytes();
+    let mut value = json!({ "text": String::from_utf8_lossy(&bytes) });
+    let object = value.as_object_mut().ok_or_else(|| internal(anyhow::anyhow!("canonical log response is not an object")))?;
+    object.insert("complete".into(), Value::Bool(complete));
+    for (header, key) in [
+        ("x-kiln-log-qualification", "qualification"), ("x-kiln-log-view", "view"),
+        ("x-kiln-log-root", "root"), ("x-kiln-log-capture", "capture"),
+    ] {
+        if let Some(value) = headers.get(header) {
+            object.insert(key.into(), json!(value.to_str().map_err(|e| internal(e.into()))?));
+        }
+    }
+    for (header, key) in [
+        ("x-kiln-log-revision", "revision"), ("x-kiln-log-capture-limit", "capture_limit"),
+        ("x-kiln-log-discarded-bytes", "discarded_bytes"),
+    ] {
+        if let Some(value) = headers.get(header) {
+            let value = value.to_str().map_err(|e| internal(e.into()))?.parse::<u64>().map_err(|e| internal(e.into()))?;
+            object.insert(key.into(), json!(value));
+        }
+    }
+    Ok(value)
+}
+
 fn by(cx: &Cx) -> String {
     cx.caller.name.clone()
 }
@@ -181,10 +219,10 @@ pub fn ops() -> &'static [Op] {
                 input: Input::of::<input::CiLegsGet>(),
                 route: Routes(vec![Definition::new("GET", &[Part::Literal("api"), Part::Literal("ci"), Part::Literal("legs"), Part::Field("leg")], &[], "runs.read", ScopeAt::Job(3))]),
                 run: |cx: Cx, v: Value| async move { answer(super::runs_api::leg(&cx.hub, &text(&v, "leg")?).await).await }),
-            op!("ci.legs.logs", "A step's log, from byte `from` on: `{ text }`.", ro: true, destructive: false,
+            op!("ci.legs.logs", "A step's log from byte `from`: `{ text }`, with completion/prefix/capture qualification for registered producers; canonical-only `aggregate` reads their captured step catalog instead of selecting `step`, and `require_complete` refuses a pending producer.", ro: true, destructive: false,
                 input: Input::of::<input::CiLegsLogs>(),
-                route: Routes(vec![Definition::new("GET", &[Part::Literal("api"), Part::Literal("ci"), Part::Literal("legs"), Part::Field("leg"), Part::Literal("logs")], &["step", "from"], "logs.read", ScopeAt::Job(3)).reply(Reply::Protocol)]),
-                run: |cx: Cx, v: Value| async move { answer(super::runs_api::logs(&cx.hub, &text(&v, "leg")?, &query(&v, &["step", "from"])).await).await }),
+                route: Routes(vec![Definition::new("GET", &[Part::Literal("api"), Part::Literal("ci"), Part::Literal("legs"), Part::Field("leg"), Part::Literal("logs")], &["step", "from", "require_complete", "aggregate"], "logs.read", ScopeAt::Job(3)).reply(Reply::Protocol)]),
+                run: |cx: Cx, v: Value| async move { answer_log(super::runs_api::logs(&cx.hub, &text(&v, "leg")?, &query(&v, &["step", "from", "require_complete", "aggregate"])).await).await }),
             op!("ci.legs.search", "Search one leg's logs (a running one's too) for a string: `{ hits: [{ step, step_name, line, text, at }] }`.", ro: true, destructive: false,
                 input: Input::of::<input::CiLegsSearch>(),
                 route: Routes(vec![Definition::new("GET", &[Part::Literal("api"), Part::Literal("ci"), Part::Literal("legs"), Part::Field("leg"), Part::Literal("logs"), Part::Literal("search")], &["q"], "logs.read", ScopeAt::Job(3))]),
@@ -1085,9 +1123,13 @@ pub mod input {
     pub struct CiLegsLogs {
         /// The leg's id (a job of a run, one matrix combination of it).
         pub leg: String,
-        /// The step's index (`idx` in ci.legs.get).
-        pub step: i64,
+        /// The step's index (`idx` in ci.legs.get), default 0; cannot accompany aggregate=true.
+        pub step: Option<i64>,
         pub from: Option<i64>,
+        /// Require an original closed producer receipt; legacy/provider logs remain unqualified.
+        pub require_complete: Option<bool>,
+        /// Read the registered captured catalog; provider/true legacy returns log_aggregate_not_registered.
+        pub aggregate: Option<bool>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]

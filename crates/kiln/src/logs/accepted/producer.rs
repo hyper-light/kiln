@@ -663,6 +663,7 @@ pub(crate) enum ReadError {
 pub(crate) struct ProducerSnapshot {
     pub complete:bool,pub prefix:Option<Prefix>,pub qualification:&'static str,
     pub capture:Option<JobLogCaptureV1>,pub max_bytes:u64,
+    captured_bytes:u64,
     // Metadata only: an empty complete read must still GET/verify this original
     // End0 marker. This is captured with the SAME binding/close snapshot, not a
     // later lookup that could select a newer attempt's registration.
@@ -707,14 +708,14 @@ fn snapshot(c:&Connection,job:&str,require_complete:bool,max_bytes:u64)->anyhow:
     if require_complete && !complete {return Err(ReadError::Pending.into())}
     // The close prefix proves original delivery; later explicit server-authored accepted
     // operations remain visible through the latest SAME-view head, never a projection file.
-    let prefix=prefix(c,job)?;
+    let prefix=prefix(c,job)?;let mut captured_bytes=0;
     if let Some(p)=&prefix {
         anyhow::ensure!(p.view==r.view,ReadError::Unavailable("registered captured view changed".into()));checked_prefix(c,p)?;
-        let bytes:u64=c.query_row("SELECT bytes FROM ci_log_accepted_views WHERE view=?1",[&p.view],|r|r.get(0))?;
-        anyhow::ensure!(bytes<=max_bytes,ReadError::Unavailable("captured view exceeds current configured read bound".into()));
+        captured_bytes=c.query_row("SELECT bytes FROM ci_log_accepted_views WHERE view=?1",[&p.view],|r|r.get(0))?;
+        anyhow::ensure!(captured_bytes<=max_bytes,ReadError::Unavailable("captured view exceeds current configured read bound".into()));
     }
     if complete && prefix.is_none() {return Err(ReadError::Unavailable("closed producer lacks a captured historical view".into()).into())}
-    Ok(Some(ProducerSnapshot{complete,prefix,qualification:"registered_producer_and_captured_observed_job_view_v1",capture,max_bytes,empty_marker}))
+    Ok(Some(ProducerSnapshot{complete,prefix,qualification:"registered_producer_and_captured_observed_job_view_v1",capture,max_bytes,captured_bytes,empty_marker}))
 }
 
 /// Existing product fixture drives this exact SQL/Blobs publisher leaf. It deliberately
@@ -805,15 +806,46 @@ impl crate::logs::Logs {
         result.map_err(anyhow::Error::from)
     }
     pub(crate) async fn read_producer(&self,job:&str,step:u32,require_complete:bool)->anyhow::Result<Option<ProducerRead>> {
+        self.read_producer_selected(job,Some(step),require_complete).await
+    }
+    /// U05/W20: one captured view, catalogued in first-observed step order. SQL step
+    /// projections cannot decide whether a registered producer has bytes or is complete.
+    pub(crate) async fn read_producer_all(&self,job:&str,require_complete:bool)->anyhow::Result<Option<ProducerRead>> {
+        self.read_producer_selected(job,None,require_complete).await
+    }
+    async fn read_producer_selected(&self,job:&str,selected:Option<u32>,require_complete:bool)->anyhow::Result<Option<ProducerRead>> {
         let Some(snapshot)=self.producer_snapshot(job,require_complete).await? else{return Ok(None)};
         let ctx=self.accepted_context()?;let mut bytes=Vec::new();
-        if let Some(prefix)=snapshot.prefix.clone() && let Some(mut reader)=RawReader::open(&ctx.store,prefix,step).await.map_err(|e|ReadError::Unavailable(format!("{e:#}")))? {
+        if let Some(prefix)=snapshot.prefix.clone() {
+            let mut after=None;let mut steps=0i64;let mut remaining=prefix.revision;
             loop {
-                let turn=reader.advance(&ctx.store,&ctx.blobs).await.map_err(|e|ReadError::Unavailable(format!("{e:#}")))?;
-                let size=u64::try_from(bytes.len())?.checked_add(u64::try_from(turn.bytes.len())?).ok_or_else(||anyhow::anyhow!("raw read byte count overflow"))?;
-                anyhow::ensure!(size<=ctx.files.max_bytes(),ReadError::Unavailable("raw accepted read exceeds configured job bound".into()));
-                bytes.extend_from_slice(&turn.bytes);if turn.done {break}reader=turn.reader;
+                let page=if let Some(step)=selected {vec![(0,step)]}else{RawReader::steps(&ctx.store,prefix.clone(),after).await.map_err(|e|ReadError::Unavailable(format!("{e:#}")))?};
+                anyhow::ensure!(page.len()<=32,ReadError::Unavailable("raw accepted catalog page exceeds its bound".into()));
+                if page.is_empty(){break}
+                for (order,step) in page {
+                    if selected.is_none() {
+                        steps=steps.checked_add(1).ok_or_else(||anyhow::anyhow!(ReadError::Unavailable("raw accepted catalog count overflow".into())))?;
+                        anyhow::ensure!(order>after.unwrap_or(0) && order<=prefix.revision && steps<=prefix.revision,ReadError::Unavailable("raw accepted catalog does not advance within its captured bound".into()));
+                        after=Some(order);
+                    }
+                    let reader=RawReader::open(&ctx.store,prefix.clone(),step).await.map_err(|e|ReadError::Unavailable(format!("{e:#}")))?;
+                    let Some(mut reader)=reader else {
+                        anyhow::ensure!(selected.is_some(),ReadError::Unavailable("captured aggregate step disappeared".into()));continue
+                    };
+                    loop {
+                        // One shared aggregate turn budget, not a fresh allowance per step.
+                        anyhow::ensure!(remaining>0,ReadError::Unavailable("raw accepted read exceeds captured chunk count".into()));remaining-=1;
+                        let turn=reader.advance(&ctx.store,&ctx.blobs).await.map_err(|e|ReadError::Unavailable(format!("{e:#}")))?;
+                        let size=u64::try_from(bytes.len())?.checked_add(u64::try_from(turn.bytes.len())?).ok_or_else(||anyhow::anyhow!("raw read byte count overflow"))?;
+                        anyhow::ensure!(size<=snapshot.max_bytes,ReadError::Unavailable("raw accepted read exceeds configured job bound".into()));
+                        bytes.extend_from_slice(&turn.bytes);if turn.done {break}reader=turn.reader;
+                    }
+                }
+                if selected.is_some(){break}
             }
+        }
+        if selected.is_none() {
+            anyhow::ensure!(u64::try_from(bytes.len())?==snapshot.captured_bytes,ReadError::Unavailable("captured aggregate catalog does not cover its exact byte count".into()));
         }
         if snapshot.complete && bytes.is_empty() && let Some((key,digest,size))=&snapshot.empty_marker {
             match read_key(&ctx.blobs,key,digest,*size).await {

@@ -1616,6 +1616,7 @@ mod tests {
             owner:OrdinaryOwnerV1{version:1,job:job.into(),attempt:1,host:"producer-fixture".into(),process_nonce:"producer-process".into(),publication_epoch:"producer-epoch".into(),connection:"e".repeat(64),grant:format!("producer-grant-{n}"),execution:format!("ci-producer-{n}"),allocation:format!("retained-producer-{n}"),command:OrdinaryCommandV1{stream:"l:1.1".into(),seq:u64::try_from(n).unwrap_or(0)+1}},
         }).collect();
         hub.logs.historical_fixture_append("producer-prefix",1,b"historical producer baseline\n");
+        hub.logs.historical_fixture_append("producer-prefix",2,b"captured-only second step\n");
         hub.logs.finish("producer-prefix");
         let seed=bindings.clone();
         hub.store.call(move |c|{
@@ -1626,9 +1627,13 @@ mod tests {
             let key=crate::util::sha256_hex(b"producer-fixture");
             tx.execute("INSERT INTO kv(k,v) VALUES(?1,?2)",params![format!("u01/ordinary-domain/{key}"),domain])?;
             tx.execute("INSERT INTO kv(k,v) VALUES(?1,?2)",params![format!("u01/ordinary-anchor/{key}"),anchor])?;
+            for (id,number) in [("producer-prefix-run",4),("producer-empty-run",5)] {
+                tx.execute("INSERT INTO runs(id,repo_id,number,pipeline,event,branch,sha,status,created_at,workflow_id,conclusion) VALUES(?1,'log-repo',?2,'ci','push','main','abc','succeeded',1,'ci.yml','success')",params![id,number])?;
+            }
             for binding in seed {
                 let owner=&binding.owner;
-                tx.execute("INSERT INTO jobs(id,run_id,key,display,status,labels,needs,spec,attempt,job_id) VALUES(?1,'log-run',?1,?1,'running','[]','[]','{}',1,'producer-fixture')",[&owner.job])?;
+                let run=match owner.job.as_str(){"producer-prefix"=>"producer-prefix-run","producer-empty"=>"producer-empty-run",_=>"log-run"};
+                tx.execute("INSERT INTO jobs(id,run_id,key,display,status,labels,needs,spec,attempt,job_id) VALUES(?1,?2,?1,?1,'running','[]','[]','{}',1,'producer-fixture')",params![owner.job,run])?;
                 let allocation=kiln_ci::sched::state::Allocation{id:owner.allocation.clone(),runner:owner.host.clone(),request:kiln_ci::sched::state::Resources{cpu:1.0,..Default::default()},mode:kiln_ci::sched::state::ReservationMode::Ordinary,repo:"log-repo".into(),actor:"fixture".into(),lane:"ci".into(),parent_binding:None};
                 let journal=serde_json::json!({"format":"u01-ordinary-domain-v1","version":1,"owner":owner,"allocation":allocation,"recorded":"host","physical":"pending","logical":"running","log_contract":binding.contract}).to_string();
                 tx.execute("INSERT INTO ci_retained_ownership(job,attempt,agent,execution,until_at,allocation,transferred,released,received_at) VALUES(?1,1,?2,?3,0,?4,0,0,0)",params![owner.job,owner.host,owner.execution,journal])?;
@@ -1672,6 +1677,27 @@ mod tests {
         assert_eq!(response.headers().get("x-kiln-log-complete").and_then(|v| v.to_str().ok()), Some("0"));
         assert!(response.headers().get("x-kiln-log-capture").is_none(), "a partial read cannot invent a captured End disposition");
         assert_eq!(response.into_body().collect().await?.to_bytes().as_ref(), partial.bytes.as_slice());
+        // U05/W20: HTTP, named operations and plain MCP resources share this SAME
+        // captured prefix; projection files are not a second completion authority.
+        let mut request = http::Request::builder().uri(format!("/api/ci/legs/{}/logs?step=1&from=3", binding.owner.job))
+            .header(http::header::AUTHORIZATION, format!("Bearer {}", hub.admin_token)).body(kiln_http::Incoming::empty())?;
+        request.extensions_mut().insert(crate::http::server::Secure);
+        let response = Arc::clone(&api).handle(request).await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(response.headers().get("x-kiln-log-complete").and_then(|v| v.to_str().ok()), Some("0"));
+        assert_eq!(response.into_body().collect().await?.to_bytes().as_ref(), partial.bytes.get(3..).ok_or_else(||anyhow::anyhow!("fixture prefix is too short"))?);
+        let named = crate::ops::call(crate::ops::Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() }, "ci.legs.logs", json!({"leg": binding.owner.job, "step": 1, "from": 3})).await.map_err(|(_, why)|anyhow::anyhow!(why))?;
+        assert_eq!(named.get("complete").and_then(Value::as_bool), Some(false));
+        assert_eq!(named.get("text").and_then(Value::as_str), Some(String::from_utf8_lossy(partial.bytes.get(3..).ok_or_else(||anyhow::anyhow!("fixture prefix is too short"))?).as_ref()));
+        assert!(named.get("qualification").and_then(Value::as_str).is_some() && named.get("capture").is_none());
+        let pending = crate::mcp::answer(&hub, crate::authz::Caller::owner(), &serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":format!("kiln://legs/{}/logs/1",binding.owner.job)}}))?).await.ok_or_else(||anyhow::anyhow!("MCP resource reply missing"))?;
+        assert_eq!(pending.pointer("/error/code").and_then(Value::as_i64), Some(-32002));
+        assert!(pending.pointer("/error/message").and_then(Value::as_str).is_some_and(|s|s.contains("log_pending")), "a plain resource cannot drop partial qualification: {pending}");
+        hub.store.call(|c|{assert_eq!(c.query_row("SELECT COUNT(*) FROM steps WHERE job_id IN ('producer-prefix','producer-empty')",[],|r|r.get::<_,u64>(0))?,0,"the canonical run resource must not depend on SQL step projection");Ok(())}).await?;
+        let pending_run = crate::mcp::answer(&hub,crate::authz::Caller::owner(),&serde_json::to_vec(&json!({"jsonrpc":"2.0","id":4,"method":"resources/read","params":{"uri":"kiln://runs/producer-prefix-run/logs"}}))?).await.ok_or_else(||anyhow::anyhow!("MCP run reply missing"))?;
+        assert!(pending_run.pointer("/error/message").and_then(Value::as_str).is_some_and(|s|s.contains("log_pending")),"zero projected steps cannot bypass producer Pending: {pending_run}");
+        let conflict = crate::ops::call(crate::ops::Cx{hub:Arc::clone(&hub),caller:crate::authz::Caller::owner()},"ci.legs.logs",json!({"leg":binding.owner.job,"step":1,"aggregate":true})).await;
+        assert!(matches!(conflict,Err((http::StatusCode::BAD_REQUEST,_))),"aggregate and explicit step cannot silently override each other");
         let initial_prefix=partial.prefix.clone().ok_or_else(||anyhow::anyhow!("first producer receipt lacks captured history"))?;
         let mut raw=producer::RawReader::open(&hub.store,initial_prefix,1).await?.ok_or_else(||anyhow::anyhow!("captured first step is missing"))?;
         let mut observed=Vec::new();loop {
@@ -1685,7 +1711,7 @@ mod tests {
         let turn=raw.advance(&hub.store,&hub.blobs.blobs).await?;
         assert!(turn.done && turn.reader.done());assert_eq!(turn.bytes,second.data,"cursor extension reads only newly accepted raw bytes");
         assert_eq!(turn.reader.len(),u64::try_from(partial.bytes.len()+second.data.len())?);
-        assert_eq!(hub.logs.producer_step_page(latest,None).await?.into_iter().map(|(_,step)|step).collect::<Vec<_>>(),vec![1],"step enumeration uses the captured catalog");
+        assert_eq!(hub.logs.producer_step_page(latest,None).await?.into_iter().map(|(_,step)|step).collect::<Vec<_>>(),vec![1,2],"step enumeration uses the captured catalog");
         assert!(matches!(producer::fixture_input(&hub.logs,binding.clone(),end_body.clone()).await?,JobLogReplyV1::Unknown{..}),"exact control result is a separate durable dependency");
         let b=binding.clone();let original_result=result.clone();
         hub.store.call(move |c|{assert_eq!(producer::note_result(c,&b,&original_result)?,producer::Close::Pending);Ok(())}).await?;
@@ -1707,6 +1733,35 @@ mod tests {
         let captured=hub.logs.read_producer(&binding.owner.job,1,true).await?.ok_or_else(||anyhow::anyhow!("closed producer became legacy"))?;
         assert!(captured.complete && captured.prefix.as_ref().is_some_and(|p|p.revision>0));
         assert_eq!(captured.bytes,[b"historical producer baseline\n".as_slice(),first.data.as_slice(),second.data.as_slice()].concat(),"raw terminal read preserves every captured historical and producer byte without normalization");
+        let complete = crate::mcp::answer(&hub, crate::authz::Caller::owner(), &serde_json::to_vec(&json!({"jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri":format!("kiln://legs/{}/logs/1",binding.owner.job)}}))?).await.ok_or_else(||anyhow::anyhow!("MCP resource reply missing"))?;
+        assert_eq!(complete.pointer("/result/contents/0/text").and_then(Value::as_str), Some(String::from_utf8_lossy(&captured.bytes).as_ref()));
+        let aggregate=crate::ops::call(crate::ops::Cx{hub:Arc::clone(&hub),caller:crate::authz::Caller::owner()},"ci.legs.logs",json!({"leg":binding.owner.job,"aggregate":true,"require_complete":true,"from":3})).await.map_err(|(_,why)|anyhow::anyhow!(why))?;
+        let all=[captured.bytes.as_slice(),b"captured-only second step\n".as_slice()].concat();
+        assert_eq!(aggregate.get("text").and_then(Value::as_str),Some(String::from_utf8_lossy(all.get(3..).ok_or_else(||anyhow::anyhow!("aggregate too short"))?).as_ref()));
+        assert_eq!(aggregate.get("complete").and_then(Value::as_bool),Some(true));
+        let complete_run=crate::mcp::answer(&hub,crate::authz::Caller::owner(),&serde_json::to_vec(&json!({"jsonrpc":"2.0","id":5,"method":"resources/read","params":{"uri":"kiln://runs/producer-prefix-run/logs"}}))?).await.ok_or_else(||anyhow::anyhow!("MCP run reply missing"))?;
+        assert_eq!(complete_run.pointer("/result/contents/0/text").and_then(Value::as_str),Some(format!("== producer-prefix ==\n{}",String::from_utf8_lossy(&all)).as_str()),"zero SQL steps must not discard any captured-only step");
+        hub.store.call(|c|{c.execute("INSERT INTO jobs(id,run_id,key,display,status,labels,needs,spec,finished_at,attempt,reused_from) VALUES('producer-reused-view','log-run','reuse','reuse','succeeded','[]','[]','{}',400,1,'producer-prefix')",[])?;Ok(())}).await?;
+        for path in ["/api/jobs/producer-reused-view/logs?step=1&require_complete=1", "/api/ci/legs/producer-reused-view/logs?step=1&from=3&require_complete=true"] {
+            let mut request = http::Request::builder().uri(path).header(http::header::AUTHORIZATION, format!("Bearer {}", hub.admin_token)).body(kiln_http::Incoming::empty())?;
+            request.extensions_mut().insert(crate::http::server::Secure);
+            let response = Arc::clone(&api).handle(request).await;
+            assert_eq!(response.status(), http::StatusCode::OK);
+            assert_eq!(response.headers().get("x-kiln-log-complete").and_then(|v|v.to_str().ok()), Some("1"));
+            let expected = if path.contains("from=3") { captured.bytes.get(3..).ok_or_else(||anyhow::anyhow!("fixture prefix is too short"))? } else { captured.bytes.as_slice() };
+            assert_eq!(response.into_body().collect().await?.to_bytes().as_ref(), expected, "a reused leg reads its original immutable producer prefix");
+        }
+        let reused_aggregate=crate::ops::call(crate::ops::Cx{hub:Arc::clone(&hub),caller:crate::authz::Caller::owner()},"ci.legs.logs",json!({"leg":"producer-reused-view","aggregate":true,"require_complete":true})).await.map_err(|(_,why)|anyhow::anyhow!(why))?;
+        assert_eq!(reused_aggregate.get("complete").and_then(Value::as_bool),Some(true));
+        assert_eq!(reused_aggregate.get("text").and_then(Value::as_str),Some(String::from_utf8_lossy(&all).as_ref()),"canonical-only reuse must read its original aggregate before compatibility fallback");
+        hub.store.call(|c|{c.execute("INSERT INTO jobs(id,run_id,key,display,status,labels,needs,spec,finished_at,attempt) VALUES('producer-legacy-view','log-run','legacy','legacy','succeeded','[]','[]','{}',400,1)",[])?;Ok(())}).await?;
+        hub.logs.historical_fixture_append("producer-legacy-view",1,b"unregistered legacy bytes\n");
+        hub.logs.finish("producer-legacy-view");
+        let legacy = crate::ops::call(crate::ops::Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() }, "ci.legs.logs", json!({"leg":"producer-legacy-view","step":1,"require_complete":true})).await.map_err(|(_,why)|anyhow::anyhow!(why))?;
+        assert_eq!(legacy.get("text").and_then(Value::as_str), Some("unregistered legacy bytes\n"));
+        assert!(legacy.get("complete").is_none() && legacy.get("qualification").is_none(), "a genuine legacy response remains unqualified even when completion was requested");
+        let unregistered=crate::ops::call(crate::ops::Cx{hub:Arc::clone(&hub),caller:crate::authz::Caller::owner()},"ci.legs.logs",json!({"leg":"producer-legacy-view","aggregate":true,"require_complete":true})).await;
+        assert!(matches!(unregistered,Err((http::StatusCode::NOT_IMPLEMENTED,ref code)) if code==crate::ci::runs_api::AGGREGATE_NOT_REGISTERED),"canonical-only aggregate returns an explicit disposition, never compatibility text: {unregistered:?}");
         hub.store.call(|c|{c.execute("DELETE FROM ci_retained_ownership WHERE job='producer-prefix'",[])?;Ok(())}).await?;
         let b=binding.clone();let x=result.clone();hub.store.call(move |c|{
             assert!(crate::ci::runs::completion_report_received(c,&b.owner.job,&b.owner.host,b.owner.attempt,Some(&b.owner.process_nonce),&x)?,"immutable exact result receipt survives original journal retirement");
@@ -1723,12 +1778,24 @@ mod tests {
         assert!(matches!(producer::fixture_input(&hub.logs,zero.clone(),crate::proto::encode(&crate::proto::AgentMsg::JobLogEndV1(end0))?).await?,JobLogReplyV1::Committed(_)));
         let zero_read=hub.logs.read_producer(&zero.owner.job,1,true).await?.ok_or_else(||anyhow::anyhow!("End0 became legacy"))?;
         assert!(zero_read.complete && zero_read.bytes.is_empty() && zero_read.prefix.is_some_and(|p|p.revision>0),"End0 owns a real captured zero-marker prefix, not synthetic Prefix0");
+        let empty = crate::ops::call(crate::ops::Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() }, "ci.legs.logs", json!({"leg": zero.owner.job, "step": 1, "require_complete": true})).await.map_err(|(_, why)|anyhow::anyhow!(why))?;
+        assert_eq!(empty.get("complete").and_then(Value::as_bool), Some(true));
+        assert_eq!(empty.get("capture").and_then(Value::as_str), Some("complete"));
+        assert_eq!(empty.get("text").and_then(Value::as_str), Some(""), "only the original End0 marker certifies empty output");
+        let empty_run=crate::mcp::answer(&hub,crate::authz::Caller::owner(),&serde_json::to_vec(&json!({"jsonrpc":"2.0","id":6,"method":"resources/read","params":{"uri":"kiln://runs/producer-empty-run/logs"}}))?).await.ok_or_else(||anyhow::anyhow!("MCP run reply missing"))?;
+        assert_eq!(empty_run.pointer("/result/contents/0/text").and_then(Value::as_str),Some("== producer-empty ==\n"),"the original End0 proves a complete empty aggregate");
         let id=hex::encode(crate::proto::job_log::binding_id(&zero)?);
         let marker=hub.store.call(move |c|Ok(c.query_row("SELECT o.input_key FROM ci_log_producers p JOIN ci_log_accepted_ops o ON o.operation=p.close_operation WHERE p.binding=?1",[id],|r|r.get::<_,String>(0))?)).await?;
         hub.blobs.blobs.delete(&marker).await?;
         let absent=hub.logs.read_producer(&zero.owner.job,1,true).await;
         assert!(matches!(absent.as_ref().err().and_then(|e|e.downcast_ref::<producer::ReadError>()),Some(producer::ReadError::Unavailable(_))),"missing original End0 marker cannot become complete empty data: {absent:?}");
 
+        let unavailable = crate::mcp::answer(&hub, crate::authz::Caller::owner(), &serde_json::to_vec(&json!({"jsonrpc":"2.0","id":3,"method":"resources/read","params":{"uri":format!("kiln://legs/{}/logs/1",zero.owner.job)}}))?).await.ok_or_else(||anyhow::anyhow!("MCP resource reply missing"))?;
+        assert_eq!(unavailable.pointer("/error/code").and_then(Value::as_i64), Some(-32002));
+        assert!(unavailable.pointer("/error/message").and_then(Value::as_str).is_some_and(|s|s.contains("log_unavailable")), "missing immutable bytes cannot become a successful empty resource: {unavailable}");
+
+        let unavailable_run=crate::mcp::answer(&hub,crate::authz::Caller::owner(),&serde_json::to_vec(&json!({"jsonrpc":"2.0","id":7,"method":"resources/read","params":{"uri":"kiln://runs/producer-empty-run/logs"}}))?).await.ok_or_else(||anyhow::anyhow!("MCP run reply missing"))?;
+        assert!(unavailable_run.pointer("/error/message").and_then(Value::as_str).is_some_and(|s|s.contains("log_unavailable")),"zero SQL steps cannot hide a missing original End0 marker: {unavailable_run}");
         let reuse=bindings.get(2).cloned().ok_or_else(||anyhow::anyhow!("producer NoStart binding missing"))?;
         let old=reuse.owner.clone();hub.store.call(move |c|{
             let tx=crate::store::tx(c)?;
@@ -1788,6 +1855,12 @@ mod tests {
             (&binding.owner.job, "complete", None, captured.bytes.as_slice()),
             (&truncated.owner.job, "truncated", Some(("3", "2")), capped.bytes.as_slice()),
         ] {
+            let named = crate::ops::call(crate::ops::Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() }, "ci.legs.logs", json!({"leg":job,"step":1,"require_complete":true})).await.map_err(|(_,why)|anyhow::anyhow!(why))?;
+            assert_eq!(named.get("complete").and_then(Value::as_bool), Some(true));
+            assert_eq!(named.get("capture").and_then(Value::as_str), Some(capture));
+            assert_eq!(named.get("capture_limit").and_then(Value::as_u64), counts.map(|_|3));
+            assert_eq!(named.get("discarded_bytes").and_then(Value::as_u64), counts.map(|_|2));
+            assert!(named.get("revision").and_then(Value::as_u64).is_some_and(|r|r>0));
             for times in [false, true] {
                 let mut request = http::Request::builder().uri(format!("/api/jobs/{job}/logs{}?step=1&require_complete=1", if times { "/times" } else { "" }))
                     .header(http::header::AUTHORIZATION, format!("Bearer {}", hub.admin_token)).body(kiln_http::Incoming::empty())?;

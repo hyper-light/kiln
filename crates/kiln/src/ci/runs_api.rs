@@ -771,16 +771,37 @@ pub async fn exec(hub: &std::sync::Arc<Hub>, id: &str, body: &Value, caller: Opt
     Ok(srv::json(StatusCode::OK, &json!({ "output": output, "exit_code": code, "timed_out": timed_out, "truncated": truncated })))
 }
 
+/// Only this explicit aggregate disposition permits MCP's old unqualified presentation.
+/// It grants no completion claim and is returned before provider/legacy body reads.
+pub(crate) const AGGREGATE_NOT_REGISTERED: &str = "log_aggregate_not_registered";
+
 /// `GET /api/ci/legs/:id/logs?step=&from=`: from byte `from` on, for a follower.
 pub async fn logs(hub: &Hub, id: &str, q: &HashMap<String, String>) -> Result<Response, Fail> {
+    let aggregate = q.get("aggregate").is_some_and(|v| matches!(v.as_str(), "1" | "true"));
+    if aggregate && q.contains_key("step") { return Err((StatusCode::BAD_REQUEST, "aggregate logs cannot also select a step".into())); }
     let step = q.get("step").and_then(|v| v.parse().ok()).unwrap_or(0);
     let from: usize = q.get("from").and_then(|v| v.parse().ok()).unwrap_or(0);
     // Another provider's leg (W23): its log, read from the provider.
     if let Some((repo, provider, run, job)) = super::providers::of_leg(hub, id).await.map_err(internal)? {
+        if aggregate { return Err((StatusCode::NOT_IMPLEMENTED, AGGREGATE_NOT_REGISTERED.into())); }
         let text = super::providers::logs(hub, &repo, &provider, &run, &job).await?;
         let data = text.into_bytes();
         let data = if from == 0 { data } else { data.get(from..).map(<[u8]>::to_vec).unwrap_or_default() };
         return Ok(srv::response(StatusCode::OK, "text/plain; charset=utf-8", srv::full(data)));
+    }
+    let require_complete = q.get("require_complete").is_some_and(|v| matches!(v.as_str(), "1" | "true"));
+    if let Some(response) = crate::api::producer_job_log(hub, id, if aggregate { None } else { Some(step) }, from, require_complete).await.map_err(internal)? {
+        return Ok(response);
+    }
+    if aggregate {
+        // Canonical-only selection: do not fetch and discard a compatibility body.
+        // A genuine unregistered reused leg may still have a registered original.
+        if let Some(reused) = hub.store.reused_from(id.to_owned()).await.map_err(internal)?
+            && let Some(response) = crate::api::producer_job_log(hub, &reused, None, from, require_complete).await.map_err(internal)?
+        {
+            return Ok(response);
+        }
+        return Err((StatusCode::NOT_IMPLEMENTED, AGGREGATE_NOT_REGISTERED.into()));
     }
     let mut data = hub.logs.read(id, step).await;
     // A leg a rerun kept: the logs are those of the leg whose result it keeps (W05-R17).
@@ -788,6 +809,9 @@ pub async fn logs(hub: &Hub, id: &str, q: &HashMap<String, String>) -> Result<Re
         let leg = id.to_owned();
         let from_leg: Option<String> = hub.store.call(move |c| Ok(c.query_row("SELECT reused_from FROM jobs WHERE id = ?1", [&leg], |r| r.get(0)).optional()?.flatten())).await.map_err(internal)?;
         if let Some(reused) = from_leg {
+            if let Some(response) = crate::api::producer_job_log(hub, &reused, if aggregate { None } else { Some(step) }, from, require_complete).await.map_err(internal)? {
+                return Ok(response);
+            }
             data = hub.logs.read(&reused, step).await;
         }
     }

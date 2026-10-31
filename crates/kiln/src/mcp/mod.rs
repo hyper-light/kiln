@@ -641,7 +641,7 @@ impl Server {
         match parts.as_slice() {
             ["legs", leg, "logs", step] => {
                 let step: i64 = step.parse().map_err(|_| format!("{uri}: a step is its index"))?;
-                Ok(text(call("ci.legs.logs", json!({"leg": leg, "step": step})).await.map_err(said)?))
+                Ok(text(call("ci.legs.logs", json!({"leg": leg, "step": step, "require_complete": true})).await.map_err(said)?))
             }
             ["runs", run, "logs"] => {
                 let detail = call("ci.runs.get", json!({"run": run})).await.map_err(said)?;
@@ -649,10 +649,30 @@ impl Server {
                 for l in detail.get("legs").and_then(Value::as_array).cloned().unwrap_or_default() {
                     let Some(leg) = l.get("id").and_then(Value::as_str) else { continue };
                     let name = l.get("name").and_then(Value::as_str).or_else(|| l.get("key").and_then(Value::as_str)).unwrap_or(leg);
+                    // Check/read the SAME canonical aggregate even before SQL has projected
+                    // any step. Registered bytes never depend on that mutable enumeration.
+                    let aggregate = match call("ci.legs.logs", json!({"leg":leg,"aggregate":true,"require_complete":true})).await {
+                        Ok(value) => Some(value),
+                        Err((status,why)) if status==StatusCode::NOT_IMPLEMENTED && why==crate::ci::runs_api::AGGREGATE_NOT_REGISTERED => None,
+                        Err(error) => return Err(said(error)),
+                    };
+                    if let Some(aggregate)=aggregate {
+                        if aggregate.get("complete").and_then(Value::as_bool)!=Some(true) {
+                            return Err("canonical log aggregate lacks its original completion qualification".into());
+                        }
+                        let log=aggregate.get("text").and_then(Value::as_str).ok_or_else(||"canonical log aggregate lacks its text body".to_owned())?;
+                        out.push_str(&format!("== {name} ==\n{log}"));
+                        if !out.ends_with('\n') {out.push('\n');}
+                        if out.len()>RUN_LOGS {
+                            out.push_str("… (the rest: read each leg's steps with ci.legs.logs)\n");return Ok(out)
+                        }
+                        continue;
+                    }
+                    // Only explicit NotRegistered keeps the old unqualified step presentation.
                     let steps = call("ci.legs.get", json!({"leg": leg})).await.map_err(said)?;
                     for st in steps.get("steps").and_then(Value::as_array).cloned().unwrap_or_default() {
                         let idx = st.get("idx").and_then(Value::as_i64).unwrap_or_default();
-                        let log = text(call("ci.legs.logs", json!({"leg": leg, "step": idx})).await.map_err(said)?);
+                        let log = text(call("ci.legs.logs", json!({"leg": leg, "step": idx, "require_complete": true})).await.map_err(said)?);
                         out.push_str(&format!("== {name} · {} ==\n{log}", st.get("name").and_then(Value::as_str).unwrap_or_default()));
                         if !out.ends_with('\n') {
                             out.push('\n');

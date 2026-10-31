@@ -2516,23 +2516,41 @@ async fn job(hub: &Hub, id: &str) -> R {
 
 async fn job_logs(hub: &Hub, id: &str, q: &HashMap<String, String>) -> R {
     let step = q.get("step").and_then(|v| v.parse().ok()).unwrap_or(0);
-    match hub.logs.read_producer(id, step, q.get("require_complete").is_some_and(|v| v == "1")).await {
-        Ok(Some(read)) => {
-            let mut response = srv::response(StatusCode::OK, "text/plain; charset=utf-8", srv::full(read.bytes));
-            producer_log_headers(&mut response, read.complete, read.qualification, read.prefix.as_ref(), read.capture.as_ref())?;
-            return Ok(response);
-        }
-        Ok(None) => {}, // No registered contract: preserve the legacy/reused-job path.
-        Err(error) => return Ok(producer_log_error(&error)),
+    let require_complete = q.get("require_complete").is_some_and(|v| matches!(v.as_str(), "1" | "true"));
+    if let Some(response) = producer_job_log(hub, id, Some(step), 0, require_complete).await? {
+        return Ok(response);
     }
     let mut data = hub.logs.read(id, step).await;
     // A CI leg a rerun kept: its original's logs (docs/ci.md W05-R17).
     if data.is_empty()
         && let Some(from) = hub.store.reused_from(id.to_owned()).await?
     {
+        if let Some(response) = producer_job_log(hub, &from, Some(step), 0, require_complete).await? {
+            return Ok(response);
+        }
         data = hub.logs.read(&from, step).await;
     }
     Ok(srv::response(StatusCode::OK, "text/plain; charset=utf-8", srv::full(data)))
+}
+
+/// U05/W20: every raw-log adapter reads the same immutable producer prefix. Only a
+/// genuine unregistered legacy job may use its compatibility file; errors never do.
+pub(crate) async fn producer_job_log(hub: &Hub, id: &str, step: Option<u32>, from: usize, require_complete: bool) -> anyhow::Result<Option<Response>> {
+    let read = match step {
+        Some(step) => hub.logs.read_producer(id, step, require_complete).await,
+        None => hub.logs.read_producer_all(id, require_complete).await,
+    };
+    match read {
+        Ok(Some(read)) => {
+            // Offset slicing follows the validated immutable read, never a growing file.
+            let data = if from == 0 { read.bytes } else { read.bytes.get(from..).map(<[u8]>::to_vec).unwrap_or_default() };
+            let mut response = srv::response(StatusCode::OK, "text/plain; charset=utf-8", srv::full(data));
+            producer_log_headers(&mut response, read.complete, read.qualification, read.prefix.as_ref(), read.capture.as_ref())?;
+            Ok(Some(response))
+        }
+        Ok(None) => Ok(None),
+        Err(error) => Ok(Some(producer_log_error(&error))),
+    }
 }
 
 /// When each piece of a step's log arrived (`{ times: [[offset, unix_ms], ...], size }`, oldest
