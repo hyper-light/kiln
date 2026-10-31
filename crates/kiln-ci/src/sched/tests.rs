@@ -2757,6 +2757,34 @@ fn w05_r03_a_share_on_a_runner_of_no_known_size_holds_it_whole() {
     assert!(room(4, Some(Resources { cpu: Cpus::whole(8), mem: 16 << 30, ..Resources::default() }), &share, false, 1, 2, Incoming::Ordinary), "a known size keeps the rest");
 }
 
+/// W05-R34, R25, docs/sim.md's bug 13: a stop item the store has queued at its second attempt
+/// after a restart (its first lost with its runner, cut off, which may still hold it until its lease
+/// runs out by its own clock) waits out a whole lease and the lock-delay before it's granted again.
+/// A finish item at its second attempt, or a stop item at its first, goes at once.
+#[test]
+fn w05_r34_a_stop_item_queued_again_after_a_restart_waits_out_a_lease() {
+    use super::state::LeaseLoss;
+    let mut s = Scheduler::with_epoch(Config { lease: Some(60_000), lock_delay: 15_000, ..Config::default() }, 2);
+    s.handle(Input::RunnerUp(Box::new(linux("a", 4))), 0);
+    let mut stop = leg("stop", "acme/x", 60);
+    (stop.attempt, stop.on_lease_loss) = (2, LeaseLoss::Stop);
+    let c = s.handle(Input::LegQueued(Box::new(stop)), 1_000);
+    assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. })), "{c:?}");
+    assert_eq!(s.reason("stop"), Some(&WaitReason::Retry { at: 76_000 }));
+    let mut first = leg("first", "acme/x", 60);
+    first.on_lease_loss = LeaseLoss::Stop;
+    let mut finish = leg("finish", "acme/x", 60);
+    finish.attempt = 2;
+    for l in [first, finish] {
+        let id = l.id.clone();
+        let c = s.handle(Input::LegQueued(Box::new(l)), 1_000);
+        assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, .. } if *leg == id)), "{id} at once: {c:?}");
+    }
+    assert!(!s.handle(Input::Tick, 75_999).iter().any(|x| matches!(x, Command::Assign { .. })));
+    let c = s.handle(Input::Tick, 76_000);
+    assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, attempt: 2, .. } if leg == "stop")), "{c:?}");
+}
+
 /// W05-R25, found reading the dispatcher's rebuild for kiln-sim's model (docs/needs.md E3.8): a leg
 /// the store has queued at its second attempt (its first lost with its runner) is queued again
 /// after a restart at that attempt, and granted as it: never as its first again, which ended. Its

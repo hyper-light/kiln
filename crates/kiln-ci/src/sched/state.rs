@@ -881,6 +881,9 @@ struct Leg {
     /// with no lease), as [`Scheduler::leases`] keeps it.
     fence: Fence,
     expires: Option<i64>,
+    /// Not queued before then (W05-R34): a stop item queued again at a later attempt, as after a
+    /// restart, waits out the lease of any earlier grant a runner cut off still holds.
+    not_before: Option<i64>,
 }
 
 /// A leg's wait for a busy runner where it would finish sooner (W24-R18).
@@ -1472,9 +1475,18 @@ impl Scheduler {
         self.ensure_sig(&sig, &req);
         let group = input.group.clone();
         let attempt = input.attempt.max(1);
+        // Queued at a later attempt, which only a restart's rebuild does (W05-R25): an earlier grant
+        // of a stop item may still be held by its runner, cut off, until its lease runs out by that
+        // runner's clock, and the store doesn't keep when the engine would have let the next
+        // attempt go (the grant's expiry and the lock-delay). It waits out a whole lease and the
+        // lock-delay from now, past the end of any lease from before (W05-R34).
+        let not_before = match (attempt > 1 && input.on_lease_loss == LeaseLoss::Stop, self.cfg.lease) {
+            (true, Some(lease)) => Some(later(now, lease).saturating_add(ms_i64(self.cfg.lock_delay))),
+            _ => None,
+        };
         self.legs.insert(
             id.clone(),
-            Leg { input, req, sig, state: State::Pending, attempt, queued_at: now, arrived: now, key: None, flow: String::new(), charge: None, reason: None, avoid: None, pin: None, last_runner: None, cancelling: None, gone: false, started: None, hold: None, held: false, ends: None, fence: Fence::default(), expires: None },
+            Leg { input, req, sig, state: State::Pending, attempt, queued_at: now, arrived: now, key: None, flow: String::new(), charge: None, reason: None, avoid: None, pin: None, last_runner: None, cancelling: None, gone: false, started: None, hold: None, held: false, ends: None, fence: Fence::default(), expires: None, not_before },
         );
         match group {
             Some((key, name, cfg)) => {
@@ -1637,6 +1649,7 @@ impl Scheduler {
                 ends: None,
                 fence,
                 expires,
+                not_before: None,
             },
         );
         if let Some(at) = expires {
@@ -1690,6 +1703,17 @@ impl Scheduler {
         if leg.state == State::Done {
             return;
         }
+        // Not before its time (W05-R34): it waits as a retry does, and the retry's tick queues it.
+        if let Some(at) = leg.not_before.filter(|at| *at > now) {
+            if let Some(l) = self.legs.get_mut(id) {
+                l.state = State::Retrying { at };
+            }
+            self.timers.entry(at).or_default().push(id.to_owned());
+            out.push(Command::Timer { at });
+            self.set_reason(id, WaitReason::Retry { at }, out);
+            return;
+        }
+        let Some(leg) = self.legs.get(id) else { return };
         if let Some(work) = leg.input.work.clone()
             && !self.demands.is_execution(id)
         {
