@@ -3464,6 +3464,8 @@ impl Dispatch {
             // Its work again, from the input hash it was queued with (W28-R46, W05-R25).
             li.work = work_of(&st, &spec, super::reuse::hash_of(&self.hub, &id).await.ok().flatten());
             li.finish_within = st.sup.as_ref().map(|s| s.finish_within);
+            // Queued again at the attempt the store has (W05-R25): one that ended isn't granted again.
+            li.attempt = attempt.max(1);
             match (s, agent) {
                 // Running on `a` as the store has it, under the grant it was given (its attempt and
                 // the epoch it was made in): `a` says whether it still is. A runner that said hello

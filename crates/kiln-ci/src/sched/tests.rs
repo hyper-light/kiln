@@ -2740,3 +2740,30 @@ fn w05_r25_a_new_epoch_numbers_grants_afresh_above_the_old() {
     assert!(!c.iter().any(|x| matches!(x, Command::Lost { leg, .. } if leg == "x")), "renewed by its old fence: {c:?}");
     assert_eq!(s.check_grants(), Ok(()));
 }
+
+/// W05-R25, found reading the dispatcher's rebuild for kiln-sim's model (docs/needs.md E3.8): a leg
+/// the store has queued at its second attempt (its first lost with its runner) is queued again
+/// after a restart at that attempt, and granted as it: never as its first again, which ended. Its
+/// next retry is its third, and its policy counts from there.
+#[test]
+fn w05_r25_a_leg_queued_after_a_restart_keeps_its_attempt() {
+    let mut s = Scheduler::with_epoch(Config { lease: Some(60_000), ..Config::default() }, 2);
+    let mut l = leg("x", "acme/x", 60);
+    l.attempt = 2;
+    l.retry = Some(RetryPolicy { max: 2, on: vec![super::retry::RetryOn::Class(FailureClass::RunnerLost)], initial_ms: 0, factor: 1000, max_ms: 0, runner: super::retry::RunnerChoice::Any });
+    s.handle(Input::LegQueued(Box::new(l)), 0);
+    assert_eq!(s.grant("x"), Some((2, None)));
+    let c = s.handle(Input::RunnerUp(Box::new(linux("a", 2))), 1);
+    assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, attempt: 2, .. } if leg == "x")), "granted as its second attempt: {c:?}");
+    assert_eq!(s.grant("x"), Some((2, Some(("a", Fence { epoch: 2, n: 1 })))));
+    let c = s.handle(Input::RunnerLost { runner: "a".into() }, 2);
+    assert!(c.iter().any(|x| matches!(x, Command::Retry { leg, attempt: 3, .. } if leg == "x")), "its third next: {c:?}");
+    let c = s.handle(Input::RunnerUp(Box::new(linux("b", 2))), 3);
+    assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, attempt: 3, .. } if leg == "x")), "{c:?}");
+    // Its policy allows two retries, the first and second attempts' failures: the third's is its last.
+    let c = s.handle(Input::RunnerLost { runner: "b".into() }, 4);
+    assert!(c.iter().any(|x| matches!(x, Command::Settled { leg, .. } if leg == "x")), "{c:?}");
+    // A new leg says nothing of its attempt: its first.
+    s.handle(Input::LegQueued(Box::new(leg("y", "acme/x", 60))), 5);
+    assert_eq!(s.grant("y").map(|g| g.0), Some(1));
+}

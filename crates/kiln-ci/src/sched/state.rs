@@ -516,6 +516,9 @@ pub struct LegIn {
     /// After a restart: when the attempt its runner still runs started (unix ms), for how long it
     /// has left (W28-R43).
     pub started: Option<i64>,
+    /// After a restart: the attempt it's queued for, as the store has it (W05-R25), so an attempt
+    /// that ended is never granted again. A new leg's is its first (0 is taken as 1).
+    pub attempt: u32,
     /// Its workflow's `supersede.finish-within` (W28-R43), over the scheduler's.
     pub finish_within: Option<i64>,
     /// Its lane, unit and place, and its workflow's `coalesce:` and `cadence:` (W28-R60): legs
@@ -1467,9 +1470,10 @@ impl Scheduler {
         let sig = req.signature();
         self.ensure_sig(&sig, &req);
         let group = input.group.clone();
+        let attempt = input.attempt.max(1);
         self.legs.insert(
             id.clone(),
-            Leg { input, req, sig, state: State::Pending, attempt: 1, queued_at: now, arrived: now, key: None, flow: String::new(), charge: None, reason: None, avoid: None, pin: None, last_runner: None, cancelling: None, gone: false, started: None, hold: None, held: false, ends: None, fence: Fence::default(), expires: None },
+            Leg { input, req, sig, state: State::Pending, attempt, queued_at: now, arrived: now, key: None, flow: String::new(), charge: None, reason: None, avoid: None, pin: None, last_runner: None, cancelling: None, gone: false, started: None, hold: None, held: false, ends: None, fence: Fence::default(), expires: None },
         );
         match group {
             Some((key, name, cfg)) => {
@@ -3550,6 +3554,17 @@ impl Scheduler {
     /// The current wait reason of a leg, if it waits.
     pub fn reason(&self, id: &str) -> Option<&WaitReason> {
         self.legs.get(id).and_then(|l| l.reason.as_ref())
+    }
+
+    /// Where a leg stands as grants go (W05-R34): its attempt now and, while it runs under a grant,
+    /// that grant's runner and fence. What kiln-sim's model holds the store to (docs/sim.md).
+    pub fn grant(&self, id: &str) -> Option<(u32, Option<(&str, Fence)>)> {
+        let l = self.legs.get(id)?;
+        let held = match &l.state {
+            State::Assigned { runner } => Some((runner.as_str(), l.fence)),
+            _ => None,
+        };
+        Some((l.attempt, held))
     }
 
     /// Legs queued now (for metrics).

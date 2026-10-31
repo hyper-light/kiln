@@ -886,6 +886,109 @@ mod tests {
         })
     }
 
+    /// W05-R25, docs/sim.md's bug 11: a leg the store has queued at its second attempt (its first
+    /// lost with its runner) through a restart. The next server rebuilds it at that attempt: given
+    /// to a runner, the claim writes its second attempt, and its first's record stays as it ended.
+    /// Before, it came back as its first, and the claim wrote over the first's end.
+    #[test]
+    fn w05_r25_a_queued_leg_keeps_its_attempt_through_a_restart() -> anyhow::Result<()> {
+        use kiln_ci::trigger::Event;
+        let tmp = tempfile::tempdir()?;
+        let dir = tmp.path().to_path_buf();
+        crate::rt::block_on(async move {
+            let db = dir.join("again.db");
+            let first = bench_hub_on(&dir.join("one"), crate::store::Store::open(&db)?)?;
+            let queued = async {
+                let repo = bench_repo(&first, "bench/again").await?;
+                let (path, text) = (".kiln/again.yaml", "name: again\non: push\njobs:\n  q:\n    runs-on: elsewhere\n    steps:\n      - run: echo never\n");
+                let (workflow, _) = kiln_ci::wf::parse_workflow(path, text, Dialect::Kiln);
+                anyhow::ensure!(workflow.is_some(), "the workflow didn't read");
+                let loaded = crate::ci::load::Loaded { path: path.into(), dialect: Dialect::Kiln, runs: true, workflow, diagnostics: Vec::new() };
+                let event = Event { name: "push".into(), repo: repo.name.clone(), git_ref: "refs/heads/main".into(), sha: format!("{:040x}", 2), actor: "bench".into(), trusted: true, payload: serde_json::json!({}), ..Event::default() };
+                let (tx, rx) = async_channel::bounded(1);
+                let given = crate::ci::dispatch::Given { reply: Some(tx), ..crate::ci::dispatch::Given::default() };
+                crate::ci::events::start_given(&first, &repo, &event, &loaded, ("bench", "bench"), serde_json::Value::Null, given).await?;
+                let run = crate::rt::timeout(Duration::from_secs(60), rx.recv()).await.map_err(|_| anyhow::anyhow!("no run within a minute"))??;
+                let deadline = Instant::now() + Duration::from_secs(60);
+                let id = loop {
+                    let r = run.clone();
+                    let id: Option<String> = first.store.call(move |c| Ok(c.query_row("SELECT id FROM jobs WHERE run_id = ?1 AND status = 'queued'", [r], |x| x.get(0)).ok())).await?;
+                    if let Some(id) = id {
+                        break id;
+                    }
+                    anyhow::ensure!(Instant::now() < deadline, "its leg not queued within a minute");
+                    crate::rt::sleep(Duration::from_millis(200)).await;
+                };
+                // As its first attempt's loss left it: that attempt ended, the leg queued for its
+                // second.
+                let l = id.clone();
+                first
+                    .store
+                    .call(move |c| {
+                        let now = crate::util::now_unix();
+                        c.execute("UPDATE jobs SET attempt = 2 WHERE id = ?1", [&l])?;
+                        c.execute(
+                            "INSERT INTO ci_attempts (id, leg_id, number, status, conclusion, failure_class, runner, executor, queued_at, started_at, finished_at) VALUES (lower(hex(randomblob(16))), ?1, 1, 'done', 'failure', 'runner-lost', 'gone', 'host', ?2, ?2, ?2)",
+                            rusqlite::params![l, now],
+                        )?;
+                        Ok(())
+                    })
+                    .await?;
+                anyhow::Ok(id)
+            }
+            .await;
+            first.shutdown.cancel();
+            let leg = queued?;
+            let second = bench_hub_on(&dir.join("two"), crate::store::Store::open(&db)?)?;
+            let attempts = async {
+                let deadline = Instant::now() + Duration::from_secs(120);
+                while second.ci.restored().is_none() {
+                    anyhow::ensure!(Instant::now() < deadline, "the second hub didn't rebuild its runs within two minutes");
+                    crate::rt::sleep(Duration::from_millis(5)).await;
+                }
+                // A runner for it comes, one that runs CI legs (its process says `CAP_CI2`).
+                second.agents.lock().insert("r".into(), crate::hub::AgentLive { labels: vec!["elsewhere".into()], slots: 1, ..crate::hub::tests::live_runner("r", "linux", "x86_64") });
+                let hello = crate::proto::Hello { protocol: 0, name: "r".into(), labels: vec!["elsewhere".into()], slots: 1, hostname: "r".into(), os: "linux".into(), arch: "x86_64".into(), version: String::new(), ephemeral: false, dedicated_job: None, running: Vec::new(), terminal: false };
+                {
+                    let mut inst = second.instances.lock();
+                    let _ = inst.join(7, "r", hello, crate::util::now_unix());
+                    inst.set_build(7, "test".into(), crate::proto::CAP_CI2);
+                }
+                second.ci.send(crate::ci::dispatch::Msg::RunnerUp { agent: "r".into(), running: Vec::new() });
+                let deadline = Instant::now() + Duration::from_secs(30);
+                loop {
+                    let l = leg.clone();
+                    let rows: Vec<(u32, Option<String>)> = second
+                        .store
+                        .call(move |c| {
+                            let mut st = c.prepare("SELECT number, conclusion FROM ci_attempts WHERE leg_id = ?1 ORDER BY number")?;
+                            let rows = st.query_map([l], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<Vec<_>, _>>()?;
+                            Ok(rows)
+                        })
+                        .await?;
+                    // The first claim since the restart, whatever it wrote: a later one (its lease
+                    // run out, its next attempt) would hide it.
+                    if rows.len() > 1 || rows.first() != Some(&(1, Some("failure".to_owned()))) {
+                        return anyhow::Ok(rows);
+                    }
+                    if Instant::now() > deadline {
+                        let l = leg.clone();
+                        let row: Vec<Option<String>> = second
+                            .store
+                            .call(move |c| Ok(c.query_row("SELECT status, agent, attempt, wait_reason, error FROM jobs WHERE id = ?1", [l], |r| Ok(vec![r.get(0)?, r.get(1)?, r.get::<_, Option<i64>>(2)?.map(|a| a.to_string()), r.get(3)?, r.get(4)?]))?))
+                            .await?;
+                        anyhow::bail!("nothing claimed within 30 s: {rows:?}; the leg: {row:?}");
+                    }
+                    crate::rt::sleep(Duration::from_millis(50)).await;
+                }
+            }
+            .await;
+            second.shutdown.cancel();
+            assert_eq!(attempts?, vec![(1, Some("failure".to_owned())), (2, None)], "claimed as its second attempt, its first's end kept");
+            anyhow::Ok(())
+        })
+    }
+
     /// W08-AC08's network half, small: a 9 MiB entry restored from its blob URL over HTTP, in two
     /// whole 4 MiB ranges and a part of one.
     #[test]
