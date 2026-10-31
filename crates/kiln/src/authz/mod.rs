@@ -419,6 +419,7 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/experiments", "runs.read", At::Anywhere),
     r("GET", "/api/experiments/*", "runs.read", At::Anywhere),
     r("POST", "/api/experiments", "experiments.run", At::Anywhere),
+    r("POST", "/api/experiments/suggest", "experiments.run", At::Anywhere),
     r("POST", "/api/experiments/*/*", "experiments.run", At::Anywhere),
     // Lists narrowed row by row to the repositories the caller may read (W10).
     r("GET", "/api/runs", "runs.read", At::Anywhere),
