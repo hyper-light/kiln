@@ -1072,7 +1072,7 @@ mod tests {
     }
 
     #[test]
-    fn the_install_scripts_hand_over_to_setup_and_an_older_kiln_installs_as_before() {
+    fn the_install_scripts_hand_over_to_setup_and_an_older_kiln_installs_as_before() -> anyhow::Result<()> {
         let sh = include_str!("../../assets/install-agent.sh");
         assert!(sh.contains(r#"exec "$BIN_DIR/kiln" setup --server "$SERVER" $ARGS </dev/tty"#), "at a terminal: asked there");
         assert!(sh.contains(r#"exec "$BIN_DIR/kiln" setup --unattended --server "$SERVER" $ARGS"#), "without one: nothing asked");
@@ -1080,6 +1080,66 @@ mod tests {
         let ps1 = include_str!("../../assets/install-agent.ps1");
         assert!(ps1.contains("$setupArgs = @('setup', '--server', $Server)"));
         assert!(ps1.contains("$installArgs = @('install', '--agent', '--server', $Server)"), "a kiln from before setup");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let temp = tempfile::tempdir()?;
+            let mock = temp.path().join("commands");
+            std::fs::create_dir(&mock)?;
+            let executable = |name: &str, body: &str| -> anyhow::Result<std::path::PathBuf> {
+                let path = mock.join(name);
+                std::fs::write(&path, body)?;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+                Ok(path)
+            };
+            executable("id", "#!/bin/sh\nprintf '1000\\n'\n")?;
+            executable("uname", "#!/bin/sh\ncase \"$1\" in -s) echo Linux;; -m) echo x86_64;; *) exit 1;; esac\n")?;
+            executable("curl", r#"#!/bin/sh
+set -eu
+printf downloaded >"$HOME/downloaded"
+case "$KILN_BOOTSTRAP_CASE" in
+  appeared-file) printf 'another owner\n' >"$HOME/.local/bin/kiln" ;;
+  appeared-directory) mkdir "$HOME/.local/bin/kiln" ;;
+  appeared-link) ln -s "$HOME/other-owner" "$HOME/.local/bin/kiln" ;;
+esac
+cp "$KILN_FAKE_BINARY" "$4"
+"#)?;
+            let binary = executable("downloaded-kiln", r#"#!/bin/sh
+set -eu
+if [ "$1" = setup ] && [ "$2" = --help ]; then exit 0; fi
+printf '%s\n' "$@" >"$HOME/handoff"
+"#)?;
+            let script = temp.path().join("install.sh");
+            std::fs::write(&script, sh)?;
+            for case in ["existing", "appeared-file", "appeared-directory", "appeared-link", "fresh"] {
+                let home = temp.path().join(case);
+                let endpoint = home.join(".local/bin/kiln");
+                std::fs::create_dir_all(home.join(".local/bin"))?;
+                std::fs::write(home.join("other-owner"), b"another owner\n")?;
+                if case == "existing" { std::fs::write(&endpoint, b"another owner\n")?; }
+                let mut command = std::process::Command::new("/bin/sh");
+                command.arg(&script).args(["--server", "http://bootstrap.invalid", "--token", "fixture-token", "--labels", "fixture", "--name", "box"])
+                    .env_clear().env("HOME", &home).env("PATH", format!("{}:/usr/bin:/bin", mock.display()))
+                    .env("KILN_BOOTSTRAP_CASE", case).env("KILN_FAKE_BINARY", &binary).stdin(std::process::Stdio::null());
+                let out = crate::rt::block_on(crate::proc::output(command, std::time::Duration::from_secs(5)))?;
+                if case == "fresh" {
+                    anyhow::ensure!(out.status.success(), "fresh bootstrap: {}", String::from_utf8_lossy(&out.stderr));
+                    anyhow::ensure!(std::fs::read(&endpoint)? == std::fs::read(&binary)?, "fresh bytes must be the owned download");
+                    anyhow::ensure!(std::fs::read_to_string(home.join("handoff"))? == "setup\n--unattended\n--server\nhttp://bootstrap.invalid\n--token\nfixture-token\n--labels\nfixture\n--name\nbox\n", "bootstrap keeps the original setup arguments");
+                } else {
+                    anyhow::ensure!(!out.status.success() && !home.join("handoff").exists(), "{case}: refusal must precede handoff");
+                    if case == "appeared-directory" {
+                        anyhow::ensure!(endpoint.is_dir() && std::fs::read_dir(&endpoint)?.next().is_none(), "a destination directory is not a place to publish into");
+                    } else if case == "appeared-link" {
+                        anyhow::ensure!(std::fs::read_link(&endpoint)? == home.join("other-owner") && std::fs::read(home.join("other-owner"))? == b"another owner\n", "a concurrent link and its target stay untouched");
+                    } else {
+                        anyhow::ensure!(std::fs::read(&endpoint)? == b"another owner\n", "{case}: an existing owner's bytes survive");
+                    }
+                    if case == "existing" { anyhow::ensure!(!home.join("downloaded").exists(), "an existing endpoint refuses before download"); }
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]

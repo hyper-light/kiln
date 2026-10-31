@@ -50,21 +50,39 @@ $target = "$cpu-pc-windows-msvc"
 
 # An outpost keeps kiln, its certificate and its files in a folder of its own.
 $dir = if ($Outpost) { Join-Path $env:LOCALAPPDATA 'kiln-outpost' } else { Join-Path $env:LOCALAPPDATA 'Programs\kiln' }
-New-Item -ItemType Directory -Force -Path $dir | Out-Null
 $exe = Join-Path $dir 'kiln.exe'
-$tmp = Join-Path $dir (".kiln.{0}.exe" -f $PID)
+# U16: bootstrap only an absent canonical endpoint; this is not discovery of
+# every custom runner/service on the machine. Errors other than absence refuse.
+$absent = $false
 try {
-  # The server sends its own binary when it was built for this target, else redirects to the
-  # matching release build.
+  [System.IO.File]::GetAttributes($exe) | Out-Null
+} catch {
+  $cause = $_.Exception.GetBaseException()
+  if ($cause -isnot [System.IO.FileNotFoundException] -and $cause -isnot [System.IO.DirectoryNotFoundException]) { throw }
+  $absent = $true
+}
+if (-not $absent) {
+  throw "kiln: bootstrap refuses $exe because it already exists; use the installed kiln. Runner upgrades use kiln updates upgrade <runner>."
+}
+New-Item -ItemType Directory -Force -Path $dir | Out-Null
+$tmp = Join-Path $dir (".kiln.{0}.exe" -f [System.IO.Path]::GetRandomFileName())
+$ownedTmp = $false
+$reservation = $null
+try {
+  # Reserve only our temporary filename. Failure does not give cleanup authority
+  # over an entry another invocation created.
+  $reservation = [System.IO.File]::Open($tmp, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+  $ownedTmp = $true
+  $reservation.Dispose()
+  $reservation = $null
+  # The server sends its own binary for this target, else the matching release.
   Invoke-WebRequest -UseBasicParsing -Uri "$Server/dl/kiln/$target" -OutFile $tmp
-  Get-ChildItem -Path $dir -Filter 'kiln.exe.old-*' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-  if (Test-Path $exe) {
-    # A running kiln.exe cannot be overwritten, but it can be renamed out of the way.
-    Move-Item -Force -Path $exe -Destination (Join-Path $dir ("kiln.exe.old-{0}" -f $PID))
-  }
-  Move-Item -Force -Path $tmp -Destination $exe
+  # The two-argument same-directory move refuses any concurrently created
+  # destination; no overwrite overload, rename-aside or old-file sweep.
+  [System.IO.File]::Move($tmp, $exe)
 } finally {
-  if (Test-Path $tmp) { Remove-Item -Force $tmp }
+  if ($null -ne $reservation) { $reservation.Dispose() }
+  if ($ownedTmp) { [System.IO.File]::Delete($tmp) }
 }
 if ($Outpost) {
   Write-Host "kiln ($target) is in $dir, not installed: it runs here as an outpost until you stop it (Ctrl-C)"

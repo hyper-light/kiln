@@ -68,6 +68,18 @@ esac
 # An outpost keeps kiln, its certificate and its files in a folder of its own, root or not.
 if [ "$OUTPOST" = 1 ]; then BIN_DIR="${HOME}/.kiln-outpost"
 elif [ "$(id -u)" = "0" ]; then BIN_DIR=/usr/local/bin; else BIN_DIR="${HOME}/.local/bin"; fi
+# U16: this script only bootstraps an absent canonical CLI endpoint. Another
+# installation or service elsewhere is not ruled out by absence here.
+if [ -e "$BIN_DIR/kiln" ] || [ -L "$BIN_DIR/kiln" ]; then
+  echo "kiln: bootstrap refuses $BIN_DIR/kiln because it already exists; use the installed kiln. Runner upgrades use kiln updates upgrade <runner>." >&2
+  exit 1
+fi
+# `link` calls link(2) for this exact destination. Unlike `ln`, a directory at
+# the destination is an error, never a place to put the downloaded file.
+if ! command -v link >/dev/null 2>&1; then
+  echo "kiln: bootstrap requires the link utility for create-only publication; no installation was started" >&2
+  exit 1
+fi
 mkdir -p "$BIN_DIR"
 TMP="$(mktemp "${BIN_DIR}/.kiln.XXXXXX")"
 trap 'rm -f "$TMP"' EXIT
@@ -77,7 +89,12 @@ else
   wget -qO "$TMP" "$URL"
 fi
 chmod 0755 "$TMP"
-mv -f "$TMP" "$BIN_DIR/kiln"
+# A concurrently created entry wins. Never replace it or continue to setup.
+if ! link "$TMP" "$BIN_DIR/kiln"; then
+  echo "kiln: cannot publish $BIN_DIR/kiln without replacing an entry; bootstrap stopped before setup" >&2
+  exit 1
+fi
+rm -f "$TMP"
 trap - EXIT
 if [ "$OUTPOST" = 1 ]; then
   echo "kiln ($TARGET) is in $BIN_DIR, not installed: it runs here as an outpost until you stop it (Ctrl-C)"
