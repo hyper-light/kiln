@@ -467,7 +467,7 @@ fn complete_ordinary_urgent<T:crate::harness::host::Taker+?Sized>(receiver:&mut 
     receiver.ordinary_effect_done(ticket,refusal)?;Ok(())
 }
 enum SpoolWork {
-    Publish { up: Up, receipt: retained::Receipt },
+    Publish { up: Box<Up>, receipt: retained::Receipt },
     Ack(serde_json::Value),
     Sample { hints: Vec<retained::Receipt>, work: PathBuf, ordinary: bool, legacy: bool, records:Arc<dyn kiln_seams::records::Records>, nonce:String },
 }
@@ -526,7 +526,7 @@ fn spool_io(mut spool: retained::Spool, work: SpoolWork) -> OrdinaryIo {
 fn close_ordinary_io(ticket:OrdinaryTicket, execution:Arc<crate::runner::processes::Execution>, reason:String) -> OrdinaryIo {
     async move {
         let held=Arc::clone(&execution);
-        let result=crate::rt::blocking(move || held.close_ordinary_admission(true)).await.map_err(anyhow::Error::from).and_then(|result|result);
+        let result=crate::rt::blocking(move || held.close_ordinary_admission(true)).await.and_then(|result|result);
         OrdinaryDone::Closed{ticket,execution,reason,result}
     }.boxed()
 }
@@ -1996,10 +1996,10 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                     OrdinaryDone::Closed{ticket,execution,reason,result}=> {
                         match result {
                             Ok(())=> {
-                                if Some(ticket.origin())==server_connection && ordinary_registered==Some(ticket.origin()) {
-                                    if let Err(error)=wire_in.ordinary_effect_done(&ticket,Some((crate::wire::channel::Refusal::Refused,reason))) {
-                                        tracing::debug!(error=%error,"retired incoming ticket has durable NoStart evidence; no successor ACK or effect");
-                                    }
+                                if Some(ticket.origin())==server_connection && ordinary_registered==Some(ticket.origin())
+                                    && let Err(error)=wire_in.ordinary_effect_done(&ticket,Some((crate::wire::channel::Refusal::Refused,reason)))
+                                {
+                                    tracing::debug!(error=%error,"retired incoming ticket has durable NoStart evidence; no successor ACK or effect");
                                 }
                             },
                             Err(error)=> {
@@ -2048,10 +2048,10 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                             }
                         }
                         match (work,result) {
-                            (SpoolWork::Publish{up,..},Ok(_))=>durable_up=Some(up),
+                            (SpoolWork::Publish{up,..},Ok(_))=>durable_up=Some(*up),
                             (SpoolWork::Publish{up,..},Err(error))=> {
                                 tracing::warn!(error=%format!("{error:#}"),"retained local event still awaits durable publication");
-                                retained_blocked=Some((up,Instant::now()+Duration::from_secs(1)));
+                                retained_blocked=Some((*up,Instant::now()+Duration::from_secs(1)));
                             },
                             (_,Ok(messages))=>for message in messages {
                                 if let AgentMsg::JobEvent{json,..}=&message
@@ -4216,7 +4216,7 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                 if !already_durable && let Some(receipt)=retained_evidence {
                     if ordinary_io.is_none() && let Some(spool)=retained_spool.take() {
                         spool_publication_pending=true;
-                        ordinary_io=Some(spool_io(spool,SpoolWork::Publish{up,receipt}));
+                        ordinary_io=Some(spool_io(spool,SpoolWork::Publish{up:Box::new(up),receipt}));
                     } else {retained_blocked=Some((up,Instant::now()+Duration::from_secs(1)));}
                     continue 'events;
                 }

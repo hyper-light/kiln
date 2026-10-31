@@ -217,7 +217,7 @@ impl Execution {
         if self.reconciling { return Ok(None) }
         if let Some(gate) = &state.gate { return Ok(Some(Arc::clone(gate))) }
         let gate = if self.ordinary_owner.is_some() {
-            executions::Gate::create_owned(self.admission.clone(), &self.identity, &self.job, self._attempt, &self.work, state.parent_binding.clone(), self.executor_owner.clone(), self.ordinary_owner.clone())?
+            executions::Gate::create_owned(self.admission.clone(), &self.identity, &self.job, self._attempt, &self.work, executions::Ownership { parent: state.parent_binding.clone(), executor_owner: self.executor_owner.clone(), ordinary_owner: self.ordinary_owner.clone() })?
         } else { executions::Gate::create(self.admission.clone(), &self.identity, &self.job, self._attempt, &self.work, state.parent_binding.clone(), self.executor_owner.clone())? };
         state.gate = Some(Arc::clone(&gate));
         Ok(Some(gate))

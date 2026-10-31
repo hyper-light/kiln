@@ -64,6 +64,13 @@ struct ResourceDomain { identity: String, limits: crate::os::cgroup::CpuMemoryLi
 
 pub(super) struct Gate { pub(super) admission: Admission, pub(super) identity: String, _permit: std::fs::File, lifecycle: parking_lot::Mutex<()> }
 
+/// U03: original parent, executor and ordinary grants for Gate creation.
+pub(super) struct Ownership {
+    pub(super) parent: Option<ParentBinding>,
+    pub(super) executor_owner: Option<ExecutorOwner>,
+    pub(super) ordinary_owner: Option<kiln_ci::wire::OrdinaryOwnerV1>,
+}
+
 fn root(admission: &Admission) -> PathBuf { admission.ci().join("executions") }
 fn path(admission: &Admission, identity: &str) -> anyhow::Result<PathBuf> {
     anyhow::ensure!(identity.starts_with("ci-") && identity.len() <= 128 && identity.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'), "invalid execution fence identity");
@@ -104,10 +111,11 @@ fn validate_record(identity: &str, record: &Record) -> anyhow::Result<()> {
 
 impl Gate {
     pub(super) fn create(admission: Admission, execution: &str, job: &str, attempt: Option<u32>, work: &Path, parent: Option<ParentBinding>, executor_owner: Option<ExecutorOwner>) -> anyhow::Result<Arc<Self>> {
-        Self::create_owned(admission, execution, job, attempt, work, parent, executor_owner, None)
+        Self::create_owned(admission, execution, job, attempt, work, Ownership { parent, executor_owner, ordinary_owner: None })
     }
 
-    pub(super) fn create_owned(admission: Admission, execution: &str, job: &str, attempt: Option<u32>, work: &Path, parent: Option<ParentBinding>, executor_owner: Option<ExecutorOwner>, ordinary_owner: Option<kiln_ci::wire::OrdinaryOwnerV1>) -> anyhow::Result<Arc<Self>> {
+    pub(super) fn create_owned(admission: Admission, execution: &str, job: &str, attempt: Option<u32>, work: &Path, ownership: Ownership) -> anyhow::Result<Arc<Self>> {
+        let Ownership { parent, executor_owner, ordinary_owner } = ownership;
         if let Some(owner) = &ordinary_owner {
             owner.validate().map_err(anyhow::Error::msg)?;
             anyhow::ensure!(owner.execution == execution && owner.job == job && attempt == Some(owner.attempt) && parent.is_none() && executor_owner.is_none(), "ordinary Gate admission changed its grant");

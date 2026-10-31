@@ -328,6 +328,7 @@ impl Dispatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context as _;
     use std::sync::Arc;
     use kiln_ci::sched::state::{Config, LegIn, Resources, RunnerIn, Scheduler};
 
@@ -485,7 +486,7 @@ mod tests {
             hub.store.call(|c| { c.execute("UPDATE jobs SET spec = '{broken' WHERE run_id = 'retained-run'", [])?; Ok(()) }).await?;
             let mut unbound = dispatcher(Arc::clone(&hub));
             unbound.restore_admission().await?;
-            let refused = unbound.restore_retained().await.expect_err("unbound pre-feature native work must require physical drain");
+            let refused = unbound.restore_retained().await.err().context("unbound pre-feature native work must require physical drain")?;
             assert!(refused.is::<LegacyNativeAssignmentsRequireDrain>());
             assert!(records(&hub).await?.is_empty(), "drain refusal must not fabricate a historical allocation");
             assert!(unbound.prepare_retained("host",&job,1).await.is_err(), "loss cannot refund an unbound original native assignment");
