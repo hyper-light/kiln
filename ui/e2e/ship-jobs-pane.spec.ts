@@ -16,6 +16,10 @@ test.skip(REAL, "drives the mock's commits");
 async function open(page: Page): Promise<{ pane: Locator; sha: string }> {
   await page.request.post("/api/mock/ship/jobs?reset=1");
   await page.goto("/ship");
+  // The app's own requests waiting on you (the mock's agents ask on their own) come and go over the page's
+  // foot, and on a phone a tap meant for what's under them lands on them: set aside, as the layout-shift
+  // count already leaves them out.
+  await page.addStyleTag({ content: ".rq-viewport { display: none !important; }" });
   const row = page.locator(".ship-row").filter({ hasText: "3333333" }).first();
   await row.getByRole("button", { name: /^Open / }).click();
   const pane = row.getByRole("region", { name: "Jobs" });

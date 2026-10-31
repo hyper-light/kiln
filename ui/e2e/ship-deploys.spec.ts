@@ -14,10 +14,16 @@ test.skip(REAL, "drives the mock's apps");
 
 const KILN = "default/kiln-production";
 
+/** The app's own requests waiting on you (the mock's agents ask on their own) come and go over the page's foot,
+ * and on a phone a tap meant for what's under them lands on them: they're set aside, as the layout-shift
+ * counts already leave them out. */
+const notices = (page: Page) => page.addStyleTag({ content: ".rq-viewport { display: none !important; }" });
+
 /** The Deploys tab with `app` opened: its pane. */
 async function open(page: Page, app = KILN): Promise<Locator> {
   await page.request.post("/api/mock/ship/deploys?reset=1");
   await page.goto(`/ship/deploys?app=${encodeURIComponent(app)}`);
+  await notices(page);
   const pane = page.locator(`.dp-row[data-app="${app}"]`).getByRole("region", { name: "Deploys" });
   await expect(pane.locator(".jp-strip").first()).toBeVisible({ timeout: 15_000 });
   return pane;
@@ -50,6 +56,7 @@ test("Ship's tabs are Commits and Deploys; /runs lands on Ship, /deployments on 
 
 test("apps are Ship's rows by project, needs-you first: the stand word, the line, Sync · Health · Soak, and no buttons", async ({ page }) => {
   await page.goto("/ship/deploys");
+  await notices(page);
   await expect(page.locator(".dp-proj > span:first-child")).toHaveText(["hyper-light/kiln", "hyper-light/quiver", "hyper-light/hyperlight-site"]);
   await expect(page.locator(".dp-proj > span:last-child")).toHaveText(["3 apps · 1 out of sync", "2 apps · 1 waits on you", "1 app · rolled back"]);
   await expect(page.locator(".dp-row .ship-name")).toHaveText(["kiln-production", "kiln-staging", "kube-prometheus-stack-production", "quiver-production", "quiver-staging", "site-production"]);
