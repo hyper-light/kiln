@@ -1860,28 +1860,33 @@ export const Timeline = React.memo(function Timeline({
             ) : (
               mine.length === 0 && <div className="hx-empty">Nothing yet. Tell the agent what to do.</div>
             ))}
-          {turns.slice(from, to).map((t, j) => (
-            <TurnView
-              key={t.key}
-              turn={t}
-              cwd={cwd}
-              delivery={t.prompt?.client_id ? state?.delivery[t.prompt.client_id] : undefined}
-              live={running && from + j === turns.length - 1}
-              doing={running && from + j === turns.length - 1 ? state?.doing : undefined}
-              compacting={from + j === turns.length - 1 ? compacting : undefined}
-              turnStarted={running && from + j === turns.length - 1 ? (parent ? task?.started : (state?.turn_started ?? undefined)) : undefined}
-              onOpenTask={onOpenTask}
-              meta={meta}
-              onCommand={onCommand}
-              agentLabel={agentLabel}
-              reading={reading.current}
-              queueItem={t.prompt?.client_id ? state?.queue.find((q) => q.id === t.prompt?.client_id) : undefined}
-              onReply={onReply}
-              lookup={lookup}
-              spawn={spawn}
-              kindName={agentLabel ?? kind}
-            />
-          ))}
+          {/* A turn that only passed a person's message on to a subagent (`Turn.relay`) is drawn as nothing: the message is in that subagent's thread. */}
+          {turns
+            .slice(from, to)
+            .map((t, j) =>
+              t.relay ? null : (
+                <TurnView
+                  key={t.key}
+                  turn={t}
+                  cwd={cwd}
+                  delivery={t.prompt?.client_id ? state?.delivery[t.prompt.client_id] : undefined}
+                  live={running && from + j === turns.length - 1}
+                  doing={running && from + j === turns.length - 1 ? state?.doing : undefined}
+                  compacting={from + j === turns.length - 1 ? compacting : undefined}
+                  turnStarted={running && from + j === turns.length - 1 ? (parent ? task?.started : (state?.turn_started ?? undefined)) : undefined}
+                  onOpenTask={onOpenTask}
+                  meta={meta}
+                  onCommand={onCommand}
+                  agentLabel={agentLabel}
+                  reading={reading.current}
+                  queueItem={t.prompt?.client_id ? state?.queue.find((q) => q.id === t.prompt?.client_id) : undefined}
+                  onReply={onReply}
+                  lookup={lookup}
+                  spawn={spawn}
+                  kindName={agentLabel ?? kind}
+                />
+              ),
+            )}
           {/* A window further back: what came after joins as you scroll down to it. */}
           {!tail && <div key={`to-${to}`} ref={later} className="hx-earlier" aria-hidden="true" />}
           {tail && mine.map((m) => <Sending key={m.id} m={m} live={live} lookup={lookup} onResend={resend} onDiscard={store.discard} />)}

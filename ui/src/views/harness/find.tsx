@@ -8,6 +8,7 @@
 import * as React from "react";
 import { ChevronDown, ChevronUp, Search, X } from "lucide-react";
 import type { HEvent } from "@/api/harness";
+import { relayHidden } from "./derive";
 
 /** The match being shown: its event, and how many times one has been shown (to open it again). */
 export interface FindNow {
@@ -77,8 +78,10 @@ function textOf(e: HEvent): string {
 export function findIn(events: HEvent[], parent: string | undefined, q: string): string[] {
   const needle = q.trim().toLowerCase();
   if (!needle) return [];
+  // What kiln's relays to subagents put in the main thread isn't shown, so it isn't found.
+  const hidden = parent === undefined ? relayHidden(events) : null;
   const out: string[] = [];
-  for (const e of events) if ((e.parent ?? undefined) === parent && textOf(e).includes(needle)) out.push(e.id);
+  for (const e of events) if ((e.parent ?? undefined) === parent && !hidden?.has(e.id) && textOf(e).includes(needle)) out.push(e.id);
   return out;
 }
 

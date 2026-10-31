@@ -23,6 +23,9 @@
  *   /agents/ask-perm   "Figure audit" (Claude Code), its step 1's subagent asks to run a command
  *   /agents/ask-own    "Docs check" (Claude Code), its harness's own subagent asks to run a command
  *
+ * And /agents/relay-lead "Parser rewrite" (Claude Code), whose subagent the person wrote twice: what
+ * kiln asked the agent to pass each on is in its history, as the server keeps it, not in its chat.
+ *
  * The `agents.*` routes answer as the server's do, from these and nothing else.
  */
 import type http from "node:http";
@@ -735,6 +738,68 @@ for (const m of [
   },
 ] as Member[]) {
   if (m.tasks) leaves(m);
+  family.set(m.info.id, m);
+}
+
+// /agents/relay-lead "Parser rewrite" (Claude Code): two messages the person wrote its subagent,
+// each passed on by the agent as kiln asked it (harness/subagent.rs `relay_words`): one in a turn
+// of its own, the agent idle; one steered into its work. Neither shows in its conversation with
+// you: both are in the subagent's thread.
+{
+  const SUB = "a575c1d3e5f7a9b1c";
+  const SPAWN = "toolu_relay_tests";
+  const t = Date.now() - 30 * 60_000;
+  const m = member("relay-lead", "claude", "local", "Parser rewrite", "idle", "auto", "Rewrite the parser; send a subagent through its tests.", "A subagent is on the tests.");
+  const relay = (id: string, text: string, at: number): HEvent =>
+    ({
+      id: `kiln-relay-${id}`,
+      seq: at,
+      at,
+      kind: "user",
+      text: `The person wrote a message to your subagent “Run the parser tests” (agent id ${SUB}), which you started, through kiln, which can't reach it directly. Send it with your SendMessage tool (to: "${SUB}"). Pass it on exactly as written and don't act on it yourself; if it can't be sent, say why.\n\n<message>\n${text}\n</message>`,
+      client_id: `kiln-relay-${id}`,
+      origin: "kiln",
+    }) as HEvent;
+  const tool = (id: string, at: number, name: string, kind: string, title: string, input: unknown, extra: Record<string, unknown> = {}): HEvent =>
+    ({ id, seq: at, at, kind: "tool", tool_id: id, name, tool: kind, title, input, status: "done", started: at, ended: at + 1500, ...extra }) as unknown as HEvent;
+  const said = (id: string, text: string, at: number, parent?: string): HEvent => ({ id, seq: at, at, kind: "assistant", text, streaming: false, ...(parent ? { parent } : {}) }) as HEvent;
+  const theirs = (id: string, text: string, at: number): HEvent => ({ id, seq: at, at, parent: SPAWN, kind: "user", text, client_id: id, origin: "human" }) as HEvent;
+  m.events = [
+    { id: "relay-lead-u1", seq: t, at: t, kind: "user", text: "Rewrite the parser; send a subagent through its tests.", client_id: "relay-lead-u1", origin: "human" } as HEvent,
+    tool(SPAWN, t + 1_000, "Agent", "agent", "Run the parser tests", { description: "Run the parser tests", prompt: "Run the parser's tests and report what fails." }, { task: SUB }),
+    said("relay-lead-a1", "A subagent is on the tests.", t + 2_000),
+    // Passed on in a turn of its own, the agent idle.
+    theirs("relay-m1", "Use the v2 parser", t + 60_000),
+    relay("relay-m1", "Use the v2 parser", t + 61_000),
+    said("relay-lead-a2", "Passing that on to the subagent.", t + 62_000),
+    tool("toolu_relay_send1", t + 63_000, "SendMessage", "other", "SendMessage", { to: SUB, message: "Use the v2 parser" }),
+    said("relay-lead-a3", "Sent.", t + 64_000),
+    said("relay-sub-a1", "Switched to the v2 parser; 3 of 41 tests fail.", t + 90_000, SPAWN),
+    // Steered into its work on what you asked next.
+    { id: "relay-lead-u2", seq: t + 120_000, at: t + 120_000, kind: "user", text: "Also bump the version.", client_id: "relay-lead-u2", origin: "human" } as HEvent,
+    tool("toolu_relay_bash", t + 121_000, "Bash", "shell", "cargo test -p parser", { command: "cargo test -p parser" }),
+    theirs("relay-m2", "Then run the figure tests", t + 122_000),
+    relay("relay-m2", "Then run the figure tests", t + 123_000),
+    tool("toolu_relay_send2", t + 124_000, "SendMessage", "other", "SendMessage", { to: SUB, message: "Then run the figure tests" }),
+    tool("toolu_relay_edit", t + 125_000, "Edit", "edit", "crates/parser/Cargo.toml", { file_path: "crates/parser/Cargo.toml" }),
+    said("relay-lead-a4", "Version bumped to 0.3.0.", t + 126_000),
+  ];
+  m.tasks = [
+    {
+      ...defaultTask(),
+      id: SUB,
+      tool_id: SPAWN,
+      description: "Run the parser tests",
+      class: "agent",
+      kind: "local_agent",
+      status: "running",
+      background: true,
+      started: t + 1_000,
+      last_tool: "Bash",
+      stoppable: true,
+    },
+  ];
+  leaves(m);
   family.set(m.info.id, m);
 }
 /** What each of them asks, and what it does meanwhile: asked again by `POST /api/mock/asks` (so each browser test starts from it). */
