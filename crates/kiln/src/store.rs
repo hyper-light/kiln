@@ -319,6 +319,10 @@ impl Store {
             return Ok(Self { inner, #[cfg(test)] inline: false });
         }
         let database = if let Some(source) = &fence.source { legacy::import(&path, source, fence.identity.as_deref())? } else { Database::open(&path, deadline()).with_context(|| format!("open Amphora {}", path.display()))? };
+        // Bound to the host store's contract, as from_database's handles are: once the conversation
+        // archive's writer floor is installed (convo::retention::register), the owner refuses every
+        // unbound write ("application writer contract required"), and the server stopped at start.
+        let database = database.for_application("kiln.host-store", migrations::SCHEMA_EPOCH)?;
         Self::initialize(&database)?;
         let inner = Arc::new(Inner { database, path: Some(path.clone()) });
         registry.insert(path, Arc::downgrade(&inner));
