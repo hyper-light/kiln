@@ -2741,6 +2741,22 @@ fn w05_r25_a_new_epoch_numbers_grants_afresh_above_the_old() {
     assert_eq!(s.check_grants(), Ok(()));
 }
 
+/// W05-R03, docs/sim.md's bug 12: a share held on a runner whose size isn't known holds it whole,
+/// as the engine claims one there, so nothing has room beside it, whoever asks (a runner's own
+/// admission, the v1 dispatcher). Before, an ordinary leg had every slot beside it: found by
+/// kiln-sim's scheduler model, a share running on there after its grant was lost and the runner
+/// given another leg.
+#[test]
+fn w05_r03_a_share_on_a_runner_of_no_known_size_holds_it_whole() {
+    let share = Resources { cpu: Cpus::whole(4), mem: 2 << 30, ..Resources::default() };
+    let none = Resources::default();
+    assert!(room(4, None, &none, false, 0, 0, Incoming::Share(share)), "alone");
+    assert!(!room(4, None, &none, false, 1, 1, Incoming::Share(share)), "not beside another");
+    assert!(!room(4, None, &share, false, 0, 1, Incoming::Ordinary), "nothing beside it");
+    assert!(room(4, None, &none, false, 3, 3, Incoming::Ordinary), "without one, slots as ever");
+    assert!(room(4, Some(Resources { cpu: Cpus::whole(8), mem: 16 << 30, ..Resources::default() }), &share, false, 1, 2, Incoming::Ordinary), "a known size keeps the rest");
+}
+
 /// W05-R25, found reading the dispatcher's rebuild for kiln-sim's model (docs/needs.md E3.8): a leg
 /// the store has queued at its second attempt (its first lost with its runner) is queued again
 /// after a restart at that attempt, and granted as it: never as its first again, which ended. Its

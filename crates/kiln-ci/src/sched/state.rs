@@ -973,9 +973,10 @@ impl Incoming {
 /// `running` legs running beside them. An ordinary leg takes a slot of what isn't held; one
 /// holding the whole runner needs it empty; a share needs as much neither held nor taken by the
 /// ordinary legs there (a slot's share each), never more than the runner is, and on a runner
-/// whose size isn't known, the runner empty.
+/// whose size isn't known, the runner empty. A share held on a runner whose size isn't known holds
+/// it whole, as the engine claims one there: nothing has room beside it.
 pub fn room(slots: u32, size: Option<Resources>, held: &Resources, whole: bool, ordinary: usize, running: usize, incoming: Incoming) -> bool {
-    if whole {
+    if whole || (size.is_none() && !(held.cpu.is_zero() && held.mem == 0)) {
         return false;
     }
     match incoming {

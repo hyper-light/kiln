@@ -3238,8 +3238,10 @@ pub(crate) mod tests {
         assert!(!agent_room(4, Some(&facts), &held, false, 1, Incoming::Whole), "the whole runner waits for it to be empty");
         // Before: an exclusive job took the whole runner; asking nothing, it still does.
         assert!(!agent_room(4, Some(&facts), &[], true, 1, Incoming::Ordinary));
-        // A runner whose facts aren't in yet: the bench waits for it to be empty.
+        // A runner whose facts aren't in yet: the bench waits for it to be empty, and holds it
+        // whole once there (W05-R03, docs/sim.md's bug 12).
         assert!(!agent_room(4, None, &[], false, 1, bench) && agent_room(4, None, &[], false, 0, bench));
+        assert!(!agent_room(4, None, &held, false, 1, Incoming::Ordinary));
     }
 
     /// A job's labels fit a runner by its own labels, its name, or its platform (`linux`, `amd64`,

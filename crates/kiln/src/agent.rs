@@ -4172,6 +4172,9 @@ mod tests {
         assert_eq!(admits(4, size, [(false, Incoming::Whole)].into_iter(), true, o), Err("an exclusive job has this runner to itself"));
         // Without exclusive jobs, slots as ever.
         assert_eq!(admits(2, size, [(false, o), (false, o)].into_iter(), false, o), Err("no free slot"));
+        // On a runner whose size isn't known a share holds it whole (W05-R03, docs/sim.md's bug 12).
+        assert_eq!(admits(4, None, std::iter::empty(), false, bench), Ok(()));
+        assert_eq!(admits(4, None, [(false, bench)].into_iter(), false, o), Err("no free slot beside what's held"));
     }
 
     /// A stream that starts again sends a server whose copy has part of a session only what the
