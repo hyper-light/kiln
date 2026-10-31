@@ -49,7 +49,7 @@ Object.assign(globalThis, {
 });
 const { SessionStore } = await import("../src/api/harness.ts");
 const { events } = await import("../src/api/events.ts");
-const { readStreamFrame } = await import("../src/api/frames.ts");
+const { readLogFrame, readStreamFrame } = await import("../src/api/frames.ts");
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
 const event = (seq: number) => ({ id: `e${seq}`, seq, at: seq, kind: "assistant", text: `line ${seq}` });
 
@@ -125,7 +125,13 @@ await test("the events socket applies no frame with an unknown tag or that isn't
 
 await test("a live page's socket reads each frame by its one key, and tells what it can't of the rest", () => {
   // The server's, and what the stream's runner said, each of a kind the type has: read whole.
-  for (const f of [{ webrtc: { can: true } }, { refused: { of: "text", code: "malformed", why: "not JSON" } }, { loaded: { title: "A" } }, { tabs: { list: [], shown: "", seq: 1 } }, { closed: { why: "it was closed" } }])
+  for (const f of [
+    { webrtc: { can: true } },
+    { refused: { of: "text", code: "malformed", why: "not JSON" } },
+    { loaded: { title: "A" } },
+    { tabs: { list: [], shown: "", seq: 1 } },
+    { closed: { why: "it was closed" } },
+  ])
     assert.deepEqual(readStreamFrame(JSON.stringify(f)), { frame: f });
   // A kind the type doesn't have (the plan's example), named; one cut short, more than one key or
   // none, or not an object, not.
@@ -139,4 +145,13 @@ await test("a live page's socket reads each frame by its one key, and tells what
     const read = readStreamFrame(text);
     assert.ok("unread" in read && read.unread.of === "" && why.test(read.unread.why), `${text}: ${JSON.stringify(read)}`);
   }
+  // Log availability is a resource state, not an unread inbound frame or a completion.
+  for (const type of ["pending", "unavailable"] as const) {
+    const frame = { type, message: "Output is not complete yet." };
+    assert.deepEqual(readLogFrame(JSON.stringify(frame)), { frame });
+    const malformed = readLogFrame(JSON.stringify({ type, message: 3 }));
+    assert.ok("unread" in malformed && malformed.unread.of === type);
+  }
+  assert.deepEqual(readLogFrame('{"type":"end"}'), { frame: { type: "end" } });
+  assert.deepEqual(readLogFrame('{"type":"hologram"}'), { unread: { t: "unread", of: "hologram", why: "unknown frame" } });
 });

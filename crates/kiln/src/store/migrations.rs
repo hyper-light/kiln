@@ -20,9 +20,9 @@ use anyhow::bail;
 use crate::sql::{Connection, OptionalExtension as _, params};
 
 /// The newest schema epoch this build reads and writes: at least every shipped migration's.
-// U05: epoch 3 writers append only files and cannot maintain accepted-prefix authority.
+// U05: epoch 4 writers have no original producer/End ledger or completion-effect gate.
 // This reader fence is separate from the ordinary publisher epoch and physical writer drain.
-pub const SCHEMA_EPOCH: u32 = 4;
+pub const SCHEMA_EPOCH: u32 = 5;
 
 /// The database's `min_reader_epoch`, as last read or raised here (0: none said).
 static MIN_READER: AtomicU32 = AtomicU32::new(0);
@@ -256,8 +256,13 @@ mod tests {
             c.execute("INSERT INTO ci_log_accepted_copy(operation,request_hash,source_job,descriptor,active,target_attempt,effect,result_hash,result_bytes,result_ready,metadata_applied,object_cursor,objects_complete) VALUES('reopen-copy',?1,'original-source',?2,0,1,?1,?3,0,1,1,1,1)",params!["0".repeat(64),r#"{"NoBytes":{"job":"original-source","step":1,"qualification":"no_captured_bytes_no_delivery_claim"}}"#,crate::util::sha256_hex(b"")])?;
             c.execute("INSERT INTO ci_log_copy_objects(operation,digest,size) VALUES('reopen-copy',?1,7)",["a".repeat(64)])?;
             c.execute("INSERT INTO ci_log_accepted_pins(key,view,operation,hash,bytes,put_started,ready,ambiguous) VALUES('reopen-uncertain','retained-prefix','reopen-copy',?1,1,1,1,1)",["b".repeat(64)])?;
+            // Opaque original descriptor bytes survive the same schema owner drain. This
+            // is migration custody, not a fabricated positive producer/End receipt.
+            c.execute("INSERT INTO ci_log_producers(binding,descriptor,job,job_order,attempt,agent,view,capture_limit,through,root) VALUES(?1,?2,'migration-reopen',123,1,'migration','retained-prefix',7,'0000000000000000',?3)",params!["c".repeat(64),b"original producer descriptor".as_slice(),"d".repeat(64)])?;
             let refused=check_against(c,3,MIGRATIONS).err().map(|e|e.to_string()).unwrap_or_default();
-            assert!(refused.contains("needs a kiln of schema epoch 4 or newer, and this is 3"),"epoch-3 file-only writers must refuse: {refused}");
+            assert!(refused.contains("needs a kiln of schema epoch 5 or newer, and this is 3"),"epoch-3 file-only writers must refuse: {refused}");
+            let refused=check_against(c,4,MIGRATIONS).err().map(|e|e.to_string()).unwrap_or_default();
+            assert!(refused.contains("needs a kiln of schema epoch 5 or newer, and this is 4"),"epoch-4 observed-only writers must refuse producer authority: {refused}");
             assert!(apply_list(c, MIGRATIONS)?.is_empty(),"the complete shipped history reapplied a migration");
             snapshot(c)
         })?;
@@ -271,7 +276,8 @@ mod tests {
             assert_eq!(c.query_row("SELECT source_job,target_attempt,result_ready,metadata_applied,object_cursor,objects_complete FROM ci_log_accepted_copy WHERE operation='reopen-copy'",[],|r|Ok((r.get::<_,String>(0)?,r.get::<_,u32>(1)?,r.get::<_,bool>(2)?,r.get::<_,bool>(3)?,r.get::<_,u64>(4)?,r.get::<_,bool>(5)?)))?,("original-source".into(),1,true,true,1,true));
             assert_eq!(c.query_row("SELECT size FROM ci_log_copy_objects WHERE operation='reopen-copy'",[],|r|r.get::<_,u64>(0))?,7,"flat target output custody survives roll-forward");
             assert!(c.query_row("SELECT ambiguous FROM ci_log_accepted_pins WHERE key='reopen-uncertain'",[],|r|r.get::<_,bool>(0))?,"an uncertain physical PUT lifetime cannot be normalized away on reopen");
-            assert_eq!(read_min_reader(c)?,4,"reader epoch never falls on reopen; already-open older writers still require an external physical drain");
+            assert_eq!(c.query_row("SELECT descriptor,job_order,through,root,active FROM ci_log_producers WHERE binding=?1",["c".repeat(64)],|r|Ok((r.get::<_,Vec<u8>>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,bool>(4)?)))?,(b"original producer descriptor".to_vec(),123,"0000000000000000".into(),"d".repeat(64),true),"roll-forward preserves original producer metadata without a synthetic close");
+            assert_eq!(read_min_reader(c)?,5,"reader epoch never falls on reopen; already-open older writers still require an external physical drain");
             snapshot(c)
         })?;
         assert_eq!(after,before,"reopen changed the shipped schema or migration receipts");
@@ -340,7 +346,7 @@ mod tests {
             assert_eq!(numbers, ["CR3", "D1", "D2", "D4"]);
             let changes: i64 = c.query_row("SELECT COUNT(*) FROM changes", [], |r| r.get(0))?;
             assert_eq!(changes, 4);
-            assert_eq!(read_min_reader(c)?, 4, "the full migration suffix includes the later U05 accepted-prefix reader fence");
+            assert_eq!(read_min_reader(c)?, 5, "the full migration suffix includes the later U05 producer-completion reader fence");
             Ok(())
         })
     }
@@ -388,7 +394,7 @@ mod tests {
         database.call(crate::store::deadline(),|c| {
             let (at, reason, by): (i64, String, String) = c.query_row("SELECT at, reason, by FROM revocations WHERE serial = '0a'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
             assert_eq!((at, reason.as_str(), by.as_str()), (1_790_000_000, "runner forgotten", "ada"));
-            assert_eq!(read_min_reader(c)?, 4, "the full migration suffix includes the later U05 accepted-prefix reader fence");
+            assert_eq!(read_min_reader(c)?, 5, "the full migration suffix includes the later U05 producer-completion reader fence");
             assert_eq!(c.query_row("SELECT COUNT(*) FROM identities WHERE serial='0a'",[],|r|r.get::<_,u64>(0))?,1,"failed duplicate must not add a second identity");
             assert_eq!(c.query_row("SELECT key_sha256 FROM identities WHERE serial='0a'",[],|r|r.get::<_,String>(0))?,"k1","failed duplicate must preserve the original identity");
             assert_eq!(c.query_row("SELECT COUNT(*) FROM revocations",[],|r|r.get::<_,u64>(0))?,2,"both positive revocations survive rollback-only refusal calls");

@@ -44,6 +44,8 @@ pub(super) enum ClaimRefusal {
     Full,
     #[error("ordinary ownership journal exceeds its byte budget before original claim")]
     TooLarge,
+    #[error("this original attempt requires durable producer logs; the selected runner cannot downgrade that contract")]
+    LogContractRequired,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -56,10 +58,17 @@ pub(super) struct Journal {
     pub recorded: String,
     pub physical: String,
     pub logical: String,
+    /// U05: None preserves the legacy journal bytes. A required producer contract is
+    /// fixed with the original grant, before the same assignment can be exposed.
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub log_contract: Option<kiln_ci::wire::JobLogContractV1>,
 }
 impl Journal {
     fn validate(&self) -> anyhow::Result<()> {
         self.owner.validate().map_err(anyhow::Error::msg)?;
+        if let Some(contract)=&self.log_contract {
+            crate::proto::job_log::validate_binding(&kiln_ci::wire::JobLogBindingV1 {contract:contract.clone(),owner:self.owner.clone()})?;
+        }
         anyhow::ensure!(self.format == FORMAT && self.version == 1 && self.owner.job != MARKER_JOB
             && self.allocation.id == self.owner.allocation && self.allocation.runner == self.owner.host && self.allocation.parent_binding.is_none()
             && self.allocation.request.cpu.is_finite() && self.allocation.request.cpu >= 0.0
@@ -179,6 +188,25 @@ fn save_row(c: &crate::sql::Connection<'_>,row: &Row) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// U05: read the SAME validated durable owner for log registration/publication.
+/// This constructs no grant and does not promote a syntactic owner payload to authority.
+pub(super) fn log_owner(c:&crate::sql::Connection<'_>,job:&str,attempt:u32)->anyhow::Result<Option<OrdinaryOwnerV1>> {
+    Ok(log_registration(c,job,attempt)?.map(|(owner,_)|owner))
+}
+
+pub(super) fn log_registration(c:&crate::sql::Connection<'_>,job:&str,attempt:u32)->anyhow::Result<Option<(OrdinaryOwnerV1,Option<kiln_ci::wire::JobLogContractV1>)>> {
+    ensure_marker(c,false)?;
+    let Some(row)=row_in(c,job,attempt)? else{return Ok(None)};
+    let domain=domain_in(c,&row.journal.owner.host)?.ok_or(Refusal::EpochMissing)?;
+    anyhow::ensure!(domain.epoch==row.journal.owner.publication_epoch,Refusal::EpochMismatch);
+    Ok(Some((row.journal.owner,row.journal.log_contract)))
+}
+
+pub(super) fn log_no_start(c:&crate::sql::Connection<'_>,owner:&OrdinaryOwnerV1)->anyhow::Result<bool> {
+    if log_owner(c,&owner.job,owner.attempt)?.as_ref()!=Some(owner) {return Ok(false)}
+    Ok(row_in(c,&owner.job,owner.attempt)?.is_some_and(|row|row.released && row.journal.physical=="no_start"))
+}
+
 /// Called only inside the writer callback BEFORE any write/effect is attempted.
 /// Only this module's closed typed refusal is an owned, definite rejection; raw SQL,
 /// session and commit errors are never classified by their text or outer error type.
@@ -209,9 +237,9 @@ impl Dispatch {
         }).await
     }
 
-    pub(super) async fn claim_ordinary(&self,owner: OrdinaryOwnerV1,allocation: Allocation,recorded: &str) -> anyhow::Result<Result<(),ClaimRefusal>> {
+    pub(super) async fn claim_ordinary(&self,owner: OrdinaryOwnerV1,allocation: Allocation,recorded: &str,log_contract:Option<kiln_ci::wire::JobLogContractV1>) -> anyhow::Result<Result<(),ClaimRefusal>> {
         anyhow::ensure!(self.admission.ready,"U01 ordinary ownership admission is fenced");
-        let journal=Journal{format:FORMAT.into(),version:1,owner,allocation,recorded:recorded.into(),physical:"pending".into(),logical:"running".into()};
+        let journal=Journal{format:FORMAT.into(),version:1,owner,allocation,recorded:recorded.into(),physical:"pending".into(),logical:"running".into(),log_contract};
         journal.validate()?;
         let encoded=serde_json::to_string(&journal)?;
         self.hub.store.call(move|c| {
@@ -223,13 +251,18 @@ impl Dispatch {
             let previous=row_in(c,&journal.owner.job,journal.owner.attempt)?;
             if let Some(previous)=&previous
                 && previous.journal.owner==journal.owner {
-                anyhow::ensure!(previous.journal.allocation==journal.allocation && previous.journal.recorded==journal.recorded
+                anyhow::ensure!(previous.journal.allocation==journal.allocation && previous.journal.recorded==journal.recorded && previous.journal.log_contract==journal.log_contract
                     && previous.journal.logical=="running" && previous.journal.physical=="pending","U01 ordinary claim cannot replace original ownership");
+                let expected=journal.log_contract.clone().map(|contract|kiln_ci::wire::JobLogBindingV1 {contract,owner:journal.owner.clone()});
+                anyhow::ensure!(crate::logs::accepted::producer::registered(c,&journal.owner.job,journal.owner.attempt,&journal.owner.host)?==expected,"original ordinary claim cannot add or drop its producer contract");
                 return Ok(Ok(()));
             }
             if let Some(previous)=&previous {
                 anyhow::ensure!(previous.released && previous.journal.physical=="no_start" && previous.journal.logical=="running" && !previous.transferred,
                     "U01 ordinary claim cannot replace unresolved or launched debt");
+            }
+            if journal.log_contract.is_none() && crate::logs::accepted::producer::requires_contract(c,&journal.owner.job,journal.owner.attempt)? {
+                return Ok(Err(ClaimRefusal::LogContractRequired));
             }
             let exists:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM ci_retained_ownership WHERE job=?1 AND attempt=?2)",params![journal.owner.job,journal.owner.attempt],|r|r.get(0))?;
             anyhow::ensure!(previous.is_some() || !exists,"U01 ordinary claim cannot replace a different existing ownership format");
@@ -254,6 +287,11 @@ impl Dispatch {
             runs::claim_in(&tx,&journal.owner.job,&journal.owner.host,&journal.recorded,journal.owner.attempt,crate::util::now_unix())?;
             tx.execute("INSERT INTO ci_retained_ownership(job,attempt,agent,execution,until_at,allocation,transferred,released,received_at) VALUES(?1,?2,?3,?4,0,?5,0,0,?6)",
                 params![journal.owner.job,journal.owner.attempt,journal.owner.host,journal.owner.execution,encoded,crate::util::now_unix()])?;
+            if let Some(contract)=&journal.log_contract {
+                let binding=kiln_ci::wire::JobLogBindingV1 {contract:contract.clone(),owner:journal.owner.clone()};
+                let order:i64=tx.query_row("SELECT rowid FROM jobs WHERE id=?1 AND attempt=?2 AND agent=?3",params![journal.owner.job,journal.owner.attempt,journal.owner.host],|r|r.get(0))?;
+                crate::logs::accepted::producer::register(&tx,&binding,order)?;
+            }
             tx.commit()?;
             Ok(Ok(()))
         }).await
@@ -270,9 +308,11 @@ impl Dispatch {
             let mut row=row_in(&tx,&owner.job,owner.attempt)?.ok_or_else(||anyhow::anyhow!("U01 never-exposed refusal has no original intent"))?;
             anyhow::ensure!(row.journal.owner==owner && row.journal.logical=="running" && !row.transferred
                 && matches!(row.journal.physical.as_str(),"pending"|"no_start"),"U01 never-exposed refusal cannot replace launched or terminal ownership");
-            if row.journal.physical=="no_start" {return Ok(());}
+            if row.journal.physical=="no_start" {crate::logs::accepted::producer::no_start(&tx,&row.journal.owner)?;tx.commit()?;return Ok(());}
             row.journal.physical="no_start".into();row.released=true;
-            save_row(&tx,&row)?;tx.commit()?;Ok(())
+            save_row(&tx,&row)?;
+            crate::logs::accepted::producer::no_start(&tx,&row.journal.owner)?;
+            tx.commit()?;Ok(())
         }).await
     }
 
@@ -372,6 +412,7 @@ impl Dispatch {
             let tx=crate::store::tx(c)?;
             row.journal.physical=physical.into();row.released=true;
             save_row(&tx,&row)?;
+            if row.journal.physical=="no_start" {crate::logs::accepted::producer::no_start(&tx,&row.journal.owner)?;}
             tx.execute("UPDATE jobs SET kept_until=NULL WHERE id=?1 AND agent=?2 AND attempt=?3",params![row.journal.owner.job,row.journal.owner.host,row.journal.owner.attempt])?;
             domain.accepted_above.insert(publication.seq);
             while let Some(next)=domain.through.checked_add(1) {
@@ -387,7 +428,7 @@ impl Dispatch {
             Err(error)=>{self.admission.ready=false;return Err(error);}
         };
         if let Some((journal,release_debt))=effect {
-            self.next.extend(self.sched.handle(Input::ExecutionReleased{leg:journal.owner.job.clone(),attempt:journal.owner.attempt},now_ms()));
+            self.next.extend(self.sched.handle(Input::OrdinaryExecutionReleased{leg:journal.owner.job.clone(),attempt:journal.owner.attempt,runner:journal.owner.host.clone()},now_ms()));
             if release_debt {
                 self.admission.retained.remove(&journal.allocation.id);
                 let commands=self.sched.handle(Input::AttemptFinished{leg:journal.allocation.id.clone(),attempt:1,outcome:Outcome::Success},now_ms());
@@ -464,7 +505,7 @@ pub(super) async fn exercise_oracle(d: &mut Dispatch) -> anyhow::Result<()> {
     for owner in &owned {
         d.sched.handle(Input::LegRunning{leg:Box::new(LegIn{id:owner.job.clone(),run:"ordinary-run".into(),repo:"test/ordinary".into(),request:Resources{cpu:2.0,mem:20,..Resources::default()},..LegIn::default()}),runner:owner.host.clone(),attempt:1},1);
         let allocation=d.sched.allocation(&owner.job,1,owner.allocation.clone()).ok_or_else(||anyhow::anyhow!("ordinary oracle original allocation"))?;
-        d.claim_ordinary(owner.clone(),allocation,"host").await??;
+        d.claim_ordinary(owner.clone(),allocation,"host",None).await??;
     }
     let first=owned.first().cloned().ok_or_else(||anyhow::anyhow!("ordinary oracle first owner"))?;
     let second=owned.get(1).cloned().ok_or_else(||anyhow::anyhow!("ordinary oracle second owner"))?;
@@ -482,7 +523,8 @@ pub(super) async fn exercise_oracle(d: &mut Dispatch) -> anyhow::Result<()> {
     let duplicate=d.ordinary_event("ordinary-host","process-one",JobEventV2::OrdinaryExecutionPublication{publication:first_proof}).await?.ok_or_else(||anyhow::anyhow!("ordinary duplicate ACK"))?;
     assert_eq!(duplicate.through,0,"accepted-above duplicate has no second effect");
     assert!(!d.hub.ci.kept_by(&first.job,"ordinary-host"));
-    assert!(d.sched.allocation(&first.job,1,first.allocation.clone()).is_some(),"physical proof does not by itself finish logical work");
+    assert!(d.sched.standing(&first.job).is_some(),"physical proof does not by itself finish logical work");
+    assert!(d.sched.allocation(&first.job,1,first.allocation.clone()).is_none(),"positive physical release cannot mint another allocation while logical work waits");
     let (won,reservation)=d.terminal_ordinary(&first.job,1,end(true),true).await?.ok_or_else(||anyhow::anyhow!("ordinary oracle first journal"))?;
     assert!(won && reservation.is_none(),"proof before loss must not invent later physical debt");
     d.sched.handle(Input::AttemptFinished{leg:first.job.clone(),attempt:1,outcome:lost()},2);
@@ -499,7 +541,7 @@ pub(super) async fn exercise_oracle(d: &mut Dispatch) -> anyhow::Result<()> {
     assert!(d.sched.allocation(&debt.id,1,debt.id.clone()).is_none(),"only committed physical proof releases adopted debt");
     assert!(!d.admission.retained.contains(&debt.id));
     let result=crate::proto::JobResult{job:third.job.clone(),status:crate::store::Status::Succeeded,exit_code:Some(0),error:None,peak_rss:None,cpu_seconds:None};
-    assert!(runs::stage_completion(&d.hub,"ordinary-host",&result,Some(1)).await?.is_some());
+    assert!(runs::stage_completion(&d.hub,"ordinary-host",&result,Some(1),None).await?.is_some());
     let before=d.ordinary_record(&third.job,1).await?.ok_or_else(||anyhow::anyhow!("ordinary completion owner"))?;
     let losing=d.terminal_ordinary(&third.job,1,end(true),true).await?.ok_or_else(||anyhow::anyhow!("ordinary completion arbitration"))?;
     assert!(!losing.0 && losing.1.is_none());
@@ -515,7 +557,7 @@ pub(super) async fn exercise_oracle(d: &mut Dispatch) -> anyhow::Result<()> {
     let next=owner(&fourth.job,5);
     let allocation=Allocation{id:next.allocation.clone(),runner:next.host.clone(),request:Resources{cpu:2.0,mem:20,..Resources::default()},mode:kiln_ci::sched::state::ReservationMode::Ordinary,
         repo:"test/ordinary".into(),actor:String::new(),lane:String::new(),parent_binding:None};
-    d.claim_ordinary(next.clone(),allocation,"host").await??;
+    d.claim_ordinary(next.clone(),allocation,"host",None).await??;
     d.ordinary_event("ordinary-host","process-one",JobEventV2::OrdinaryExecutionPublication{publication:no_start}).await?;
     assert_eq!(d.ordinary_record(&next.job,1).await?.map(|j|j.owner),Some(next.clone()),"old NoStart cannot reject or overwrite a same-attempt successor");
     assert!(d.ordinary_kept("ordinary-host",&next.job,JobEventV2::KeptReleased{execution:next.execution.clone(),attempt:1}).await.is_err());
@@ -547,14 +589,14 @@ pub(super) async fn exercise_oracle(d: &mut Dispatch) -> anyhow::Result<()> {
     }
     let full_count=d.hub.store.call(|c|Ok(c.query_row("SELECT count(*) FROM ci_retained_ownership",[],|r|r.get::<_,usize>(0))?)).await?;
     assert_eq!(full_count,LIMIT);
-    assert_eq!(d.claim_ordinary(budget.clone(),budget_allocation.clone(),"host").await?,Err(ClaimRefusal::Full));
+    assert_eq!(d.claim_ordinary(budget.clone(),budget_allocation.clone(),"host",None).await?,Err(ClaimRefusal::Full));
     assert!(d.admission.ready,"known pre-write claim Full must leave unrelated placement usable");
-    d.claim_ordinary(next.clone(),before.allocation.clone(),"host").await??;
+    d.claim_ordinary(next.clone(),before.allocation.clone(),"host",None).await??;
     let mut changed=before.allocation.clone();changed.repo="x".repeat(BYTES);
-    assert!(d.claim_ordinary(next.clone(),changed,"host").await.is_err(),"an existing original owner cannot become a refundable oversized new claim");
+    assert!(d.claim_ordinary(next.clone(),changed,"host",None).await.is_err(),"an existing original owner cannot become a refundable oversized new claim");
     d.hub.store.call(|c| {c.execute("DELETE FROM ci_retained_ownership WHERE agent='ordinary-budget-padding' AND job LIKE 'ordinary-budget-padding-%'",[])?;Ok(())}).await?;
     let mut too_large=budget_allocation;too_large.repo="x".repeat(BYTES);
-    assert_eq!(d.claim_ordinary(budget.clone(),too_large,"host").await?,Err(ClaimRefusal::TooLarge));
+    assert_eq!(d.claim_ordinary(budget.clone(),too_large,"host",None).await?,Err(ClaimRefusal::TooLarge));
     assert!(d.ordinary_record(&budget.job,1).await?.is_none());
     let untouched=d.hub.store.call(|c|Ok(c.query_row("SELECT status,(SELECT count(*) FROM ci_attempts WHERE leg_id='ordinary-budget') FROM jobs WHERE id='ordinary-budget'",[],|r|Ok((r.get::<_,String>(0)?,r.get::<_,usize>(1)?)))?)).await?;
     assert_eq!(untouched,("queued".into(),0),"definite Full/TooLarge attempt no original claim write");

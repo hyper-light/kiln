@@ -1,16 +1,13 @@
 import * as React from "react";
 import { ArrowDownToLine, ChevronDown, ChevronUp, Download, Search, X } from "lucide-react";
-import { api, wsUrl } from "@/api/client";
-import { readFrame } from "@/api/frames";
-import type { LogControlFrame, Status } from "@/api/types";
+import { api, ApiError, wsUrl } from "@/api/client";
+import { readLogFrame } from "@/api/frames";
+import type { Status } from "@/api/types";
 import type { UnreadFrame } from "@/api/wire";
 import { createTerminal, ensureFont, safeFit, SEARCH_DECORATIONS, type KilnTerminal } from "@/components/terminal/xterm-setup";
 import { Tip } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { formatDuration } from "@/lib/format";
-
-/** A job log socket's text frames, by tag: a frame with another isn't applied (`api/frames.ts`). */
-const LOG_FRAMES = { step: true, end: true, refused: true } satisfies Record<LogControlFrame["type"], true>;
 
 const MAX_ROWS = 38;
 const MIN_ROWS = 4;
@@ -47,6 +44,7 @@ export default function LogViewer({
   const followRef = React.useRef(true);
   followRef.current = follow;
   const [ended, setEnded] = React.useState(false);
+  const [outputState, setOutputState] = React.useState<string | null>(null);
   const [bytes, setBytes] = React.useState(0);
   const [searchOpen, setSearchOpen] = React.useState(false);
   const [query, setQuery] = React.useState("");
@@ -64,6 +62,11 @@ export default function LogViewer({
       let ws: WebSocket | null = null;
       let total = 0;
       let gotAny = false;
+      // Timed output can be received before its pending timing metadata renders it.
+      let received = false;
+      let canonical = false;
+      let complete = false;
+      let unavailable = false;
       let growRaf = 0;
       const subs: { dispose(): void }[] = [];
 
@@ -80,6 +83,7 @@ export default function LogViewer({
 
       void ensureFont().then(() => {
         if (disposed) return;
+        setOutputState(null);
         const k = createTerminal(
           host,
           {
@@ -173,20 +177,34 @@ export default function LogViewer({
             .catch(() => ({ times: [] as [number, number][], size: Number.MAX_SAFE_INTEGER }))
             .then((n) => {
               if (disposed) return;
-              noted = n;
+              noted = n.size === null ? { times: [], size: Number.MAX_SAFE_INTEGER } : { times: n.times, size: n.size };
               for (const b of waiting.splice(0)) lines(b);
             });
 
         const fallback = () => {
           api
-            .jobLogs(jobId, step)
+            // A strict fallback may finish only with this capture's own complete result.
+            // Jobs without a producer contract retain their legacy response semantics.
+            .jobLogs(jobId, step, true)
             .then((text) => {
-              if (disposed || gotAny) return;
+              if (disposed || gotAny || (canonical && received)) return;
               write(text);
+              complete = true;
+              setOutputState(null);
               setEnded(true);
             })
-            .catch(() => {
-              if (!disposed && !gotAny) k.term.write("\x1b[38;2;151;153;159m(no output)\x1b[0m");
+            .catch((error: unknown) => {
+              if (disposed) return;
+              if (error instanceof ApiError && (error.message === "log_pending" || error.message === "log_unavailable")) {
+                canonical = true;
+                setEnded(false);
+                setOutputState(error.message === "log_pending" ? "Output is not complete yet. Reload to try again." : "Output is unavailable. Reload to try again.");
+              } else if (canonical) {
+                setEnded(false);
+                setOutputState("Output is unavailable. Reload to try again.");
+              } else if (!gotAny) {
+                k.term.write("\x1b[38;2;151;153;159m(no output)\x1b[0m");
+              }
             });
         };
 
@@ -196,20 +214,37 @@ export default function LogViewer({
           ws.onmessage = (ev) => {
             if (typeof ev.data === "string") {
               // Applied only when it reads as one of the socket's frames; else the server, which sent it, is told.
-              const read = readFrame<LogControlFrame>(ev.data, "type", LOG_FRAMES);
+              const read = readLogFrame(ev.data);
               if ("unread" in read) {
                 if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(read.unread satisfies UnreadFrame));
                 return;
               }
               const msg = read.frame;
-              if (msg.type === "end") setEnded(true);
-              else if (msg.type === "step") cb.current?.(msg.idx, msg.status);
+              if (msg.type === "end") {
+                complete = true;
+                setOutputState(null);
+                setEnded(true);
+              } else if (msg.type === "pending" || msg.type === "unavailable") {
+                canonical = true;
+                unavailable = msg.type === "unavailable";
+                setOutputState(msg.message);
+                setEnded(false);
+              } else if (msg.type === "step") cb.current?.(msg.idx, msg.status);
               return;
             }
+            received = true;
+            if (canonical && !unavailable) setOutputState(null);
             write(new Uint8Array(ev.data as ArrayBuffer));
           };
           ws.onclose = () => {
             if (disposed) return;
+            if (canonical) {
+              if (!complete && !unavailable) {
+                setOutputState("Output is not complete yet. Reload to try again.");
+                if (!received) fallback();
+              }
+              return;
+            }
             if (!gotAny) fallback();
             setEnded(true);
           };
@@ -261,7 +296,7 @@ export default function LogViewer({
     <div className={cn(!bare && "border-t border-[#1d2128]")}>
       <div className={cn("flex flex-wrap items-center gap-1 px-3 py-1.5", bare && "hidden")}>
         <span className="label mr-auto flex items-center gap-2">
-          {live && !ended ? (
+          {live && !ended && !outputState ? (
             <>
               <i className="dot" data-status="running" aria-hidden="true" /> streaming
             </>
@@ -339,6 +374,11 @@ export default function LogViewer({
           </a>
         </Tip>
       </div>
+      {outputState && (
+        <div role="status" className="px-3 py-1.5 text-xs text-[#969aa3]">
+          {outputState}
+        </div>
+      )}
       <div className="relative bg-[#08090a]" style={{ height }}>
         <div ref={hostRef} className="absolute inset-0 py-2 pr-1 pl-3" data-terminal />
       </div>

@@ -852,6 +852,33 @@ mod tests {
             assert!(matches!(super::http(denied, Method::POST, &["api", "plans"], &Default::default(), request).await, Err((StatusCode::FORBIDDEN, _))));
             let count: i64 = hub.store.call(|c| Ok(c.query_row("SELECT count(*) FROM audit2", [], |row| row.get(0))?)).await?;
             assert_eq!(count - baseline, 5, "two successful changes, two denied changes and one typed refusal, with no read or nested handler rows");
+            // The HTTP binding and a named call carry the same legitimate nested pool input
+            // through typed dispatch into the canonical PoolSpec, including its defaults.
+            let owner = Cx { hub: Arc::clone(&hub), caller: Caller::owner() };
+            let pool = json!({"executor": "docker", "image": "fixture", "labels": ["u12-pool"], "hosts": "label no-u12-runner", "resources": {"cpu": "1", "memory": "512Mi"}});
+            let mut named = pool.clone();
+            named["name"] = json!("u12-named");
+            call(owner.clone(), "ci.pools.set", named).await.map_err(|(_, why)| anyhow::anyhow!(why))?;
+            let matched = match_http(&Method::PUT, &["api", "ci", "pools", "u12-http"])
+                .map_err(|(_, why)| anyhow::anyhow!(why))?.ok_or_else(|| anyhow::anyhow!("pool HTTP route"))?;
+            let input = matched.definition.input(&matched.bindings, &Default::default(), pool, &matched.operation.info().input.schema())
+                .map_err(|(_, why)| anyhow::anyhow!(why))?;
+            call(owner, matched.operation.info().name, input).await.map_err(|(_, why)| anyhow::anyhow!(why))?;
+            let saved: Vec<(String, String)> = hub.store.call(|c| {
+                let mut statement = c.prepare("SELECT name, spec FROM ci_pools WHERE name IN ('u12-named', 'u12-http') ORDER BY name")?;
+                let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+                Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            }).await?;
+            assert_eq!(saved.len(), 2);
+            for (name, text) in saved {
+                let spec: kiln_ci::sched::pools::PoolSpec = serde_json::from_str(&text)?;
+                assert_eq!(spec.name, name);
+                assert_eq!(spec.hosts.as_deref(), Some("label no-u12-runner"));
+                assert_eq!(spec.min_idle, 0);
+                let resources = spec.resources.ok_or_else(|| anyhow::anyhow!("saved pool resources"))?;
+                assert_eq!(resources.cpu.as_deref(), Some("1"));
+                assert_eq!(resources.memory.as_deref(), Some("512Mi"));
+            }
             Ok(())
         })
     }

@@ -28,7 +28,7 @@ fn part<'a>(name: &'a str, what: &'static str) -> Result<&'a [u8], Refusal> {
 }
 
 /// `peer` NUL `stream` NUL: the start of every key of one stream.
-fn stream_key(peer: &str, stream: &str) -> Result<Vec<u8>, Refusal> {
+pub(crate) fn stream_key(peer: &str, stream: &str) -> Result<Vec<u8>, Refusal> {
     let mut k = part(peer, "a peer's name")?.to_vec();
     k.push(0);
     k.extend_from_slice(part(stream, "a stream's name")?);
@@ -36,7 +36,7 @@ fn stream_key(peer: &str, stream: &str) -> Result<Vec<u8>, Refusal> {
     Ok(k)
 }
 
-fn item_key(peer: &str, stream: &str, seq: Seq) -> Result<Vec<u8>, Refusal> {
+pub(crate) fn item_key(peer: &str, stream: &str, seq: Seq) -> Result<Vec<u8>, Refusal> {
     let mut k = stream_key(peer, stream)?;
     k.extend_from_slice(&seq.to_be_bytes());
     Ok(k)

@@ -146,6 +146,14 @@ interface FrontDoorView { runner; connected: boolean; supported: boolean|null /*
   changed: refetch `/api/runners/:name/front-door`).
 * `GET /api/jobs/:id/logs/ws?step=N` — server sends the backlog then live output as **binary**
   frames (raw bytes, ANSI). Text frames: `{type:"step", idx, status}`, `{type:"end"}`.
+  Registered producer logs also send `{type:"pending", message}` before their bytes and
+  `{type:"unavailable", message}` if they cannot be read; only their own captured complete
+  prefix followed by `end` declares completion. Socket closure alone does not.
+  Their HTTP GET accepts `require_complete=1` (409 `log_pending`, 503 `log_unavailable`),
+  serves raw accepted bytes with `x-kiln-log-complete`, `x-kiln-log-qualification` and captured
+  view/revision/root headers, and never substitutes another job merely because bytes are empty.
+  Times remain compatibility offsets; strict `size` is the captured raw size, or null while no
+  head is captured. Logs without a registered producer contract retain their legacy behavior.
 * `GET /api/terminal/ws?target=local|agent:<name>&cols=120&rows=40` — full PTY.
   Client → server: **binary** = keystrokes, text `{type:"resize", cols, rows}`.
   Server → client: **binary** = PTY output, text `{type:"exit", code}` / `{type:"error", message}`.

@@ -1,5 +1,6 @@
 //! U05: the server's durably accepted, observed job-view prefix. This is deliberately
-//! not an attempt identity, a producer sequence, or proof of log-stream closure.
+//! not itself an attempt identity or proof of log-stream closure. The separate, explicitly
+//! registered producer ledger qualifies original sequence/End receipts against this view.
 //!
 //! One retained operation owns its immutable keys before it writes them. Preparation and
 //! Blobs I/O never execute inside the shared SQL writer. Publication is one checked SQL
@@ -8,6 +9,7 @@
 use std::sync::Arc;
 
 mod outputs;
+pub(crate) mod producer;
 
 use kiln_seams::blobs::{Blobs, Cond, Put, Refusal};
 use serde::{Deserialize, Serialize};
@@ -266,7 +268,7 @@ pub(crate) fn prefix(c:&Connection,job:&str)->anyhow::Result<Option<Prefix>> {
 
 #[derive(Clone)]
 struct Original {
-    id:String,view:String,job:String,step:u32,hash:String,bytes:u64,origin:String,host:String,copy:Option<CopyRequest>,job_order:Option<i64>,
+    id:String,view:String,job:String,step:u32,hash:String,bytes:u64,origin:String,host:String,copy:Option<CopyRequest>,job_order:Option<i64>,attempt:Option<u32>,producer:Option<producer::Original>,
 }
 
 enum Reserved { Ready(Box<Operation>), Busy, Refused(String) }
@@ -302,7 +304,7 @@ fn copy_source(c:&Connection,id:&str)->anyhow::Result<Option<CopySource>> {
 fn reserve(c:&Connection,o:&Original,max_bytes:u64)->anyhow::Result<Reserved> {
     if let Some(op)=operation(c,&o.id)? {
         if let Some(order)=o.job_order {
-            let same:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM ci_log_accepted_views v JOIN jobs j ON j.id=v.job WHERE v.view=?1 AND j.rowid=?2 AND v.job_order=?2 AND v.retired=0 AND j.attempt=?3)",params![op.view,order,o.copy.as_ref().map(|copy|copy.attempt)],|r|r.get(0))?;
+            let same:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM ci_log_accepted_views v JOIN jobs j ON j.id=v.job WHERE v.view=?1 AND j.rowid=?2 AND v.job_order=?2 AND v.retired=0 AND (?3 IS NULL OR j.attempt=?3))",params![op.view,order,o.attempt],|r|r.get(0))?;
             if !same {return Ok(Reserved::Refused("original target row/view/attempt is no longer current".into()))}
         }
         let same=op.job==o.job && op.step==o.step && op.origin==o.origin;
@@ -316,6 +318,16 @@ fn reserve(c:&Connection,o:&Original,max_bytes:u64)->anyhow::Result<Reserved> {
     let job:Option<i64>=tx.query_row("SELECT j.rowid FROM jobs j JOIN runs r ON r.id=j.run_id WHERE j.id=?1 AND r.provider='kiln'",[&o.job],|r|r.get(0)).optional()?;
     let Some(job_order)=job else {return Ok(Reserved::Refused("the observed job is absent or not a kiln job".into()))};
     if o.job_order.is_some_and(|order|order!=job_order) {return Ok(Reserved::Refused("original target incarnation was replaced".into()))}
+    if let Some(attempt)=o.attempt {
+        let same:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM jobs WHERE id=?1 AND rowid=?2 AND attempt=?3)",params![o.job,job_order,attempt],|r|r.get(0))?;
+        if !same {return Ok(Reserved::Refused("original target attempt changed".into()))}
+    }
+    if let Some(producer)=&o.producer {
+        if !producer::reserve_current(&tx,producer)? {return Ok(Reserved::Refused("original registered producer owner changed".into()))}
+    }else if o.origin.starts_with("legacy-job-view/net/") {
+        let required:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM ci_log_producers p JOIN jobs j ON j.id=p.job WHERE p.job=?1 AND p.job_order=?2 AND j.rowid=?2 AND p.attempt=j.attempt)",params![o.job,job_order],|r|r.get(0))?;
+        if required {return Ok(Reserved::Refused("unsequenced network input cannot bypass the original required producer contract".into()))}
+    }
     if let Some(copy)=&o.copy {
         let same:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM jobs WHERE id=?1 AND rowid=?2 AND attempt=?3)",params![o.job,job_order,copy.attempt],|r|r.get(0))?;
         if !same {return Ok(Reserved::Refused("original target attempt changed".into()))}
@@ -353,11 +365,12 @@ fn reserve(c:&Connection,o:&Original,max_bytes:u64)->anyhow::Result<Reserved> {
     }
     let busy:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM ci_log_accepted_ops WHERE view=?1 AND status='pending')",[&view],|r|r.get(0))?;
     if busy {return Ok(Reserved::Busy)}
-    if (input_bytes==0 && copied.is_none()) || bytes.checked_add(input_bytes).is_none_or(|n|n>max_bytes) {
+    let end0=o.producer.is_some() && producer::is_end0(&tx,&o.id)?;
+    if (input_bytes==0 && copied.is_none() && !end0) || bytes.checked_add(input_bytes).is_none_or(|n|n>max_bytes) {
         return Ok(Reserved::Refused("the accepted job-view prefix has reached its existing byte bound".into()));
     }
     anyhow::ensure!(operations.checked_add(1).is_some() && chunks.checked_add(1).is_some(),"accepted-prefix SQL counter exhausted");
-    let baseline_state=if revision==0 && input_bytes>0 {"discovering"}else{"ready"};
+    let baseline_state=if revision==0 && (input_bytes>0 || end0) {"discovering"}else{"ready"};
     let input_key=format!("ci-logs/{view}/{}/input",o.id);
     tx.execute("INSERT INTO ci_log_accepted_ops(operation,job,view,expected_revision,expected_root,staged_revision,staged_root,staged_bytes,staged_chunks,step,input_key,input_hash,input_bytes,origin,baseline,baseline_host,baseline_count,baseline_bytes,baseline_state,input_ready) VALUES(?1,?2,?3,?4,?5,?4,?5,?6,?7,?8,?9,?10,?11,?12,'',?13,0,0,?14,?15)",params![o.id,o.job,view,revision,root,bytes,chunks,o.step,input_key,o.hash,input_bytes,o.origin,o.host,baseline_state,copied.is_some()])?;
     tx.execute("UPDATE ci_log_accepted_views SET operations=operations+1 WHERE view=?1",[&view])?;
@@ -437,6 +450,9 @@ pub(crate) fn publish(c:&Connection,id:&str)->anyhow::Result<Receipt> {
     if copied && !copy_current(&tx,id)? {
         let refused=refusal_in(&tx,&op,"original copy target row/view/attempt ceased to be current before publication")?;tx.commit()?;return Ok(refused);
     }
+    if !producer::publication_current(&tx,id)? {
+        let refused=refusal_in(&tx,&op,"original producer row/attempt/cursor ceased to be current before publication")?;tx.commit()?;return Ok(refused);
+    }
     anyhow::ensure!(op.input_ready && op.input_staged && op.baseline_state=="ready","accepted operation still has uncaptured input or history");
     let incomplete:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM ci_log_accepted_copy WHERE operation=?1 AND (result_ready=0 OR objects_complete=0))",[id],|r|r.get(0))?;
     anyhow::ensure!(!incomplete,"copy cannot publish before original result/output pin receipt");
@@ -446,6 +462,7 @@ pub(crate) fn publish(c:&Connection,id:&str)->anyhow::Result<Receipt> {
         tx.commit()?;return Ok(done);
     }
     tx.execute("UPDATE ci_log_accepted_ops SET status='accepted',receipt_revision=?2,receipt_root=?3 WHERE operation=?1",params![id,op.staged_revision,op.staged_root])?;
+    producer::published(&tx,id,Prefix{view:op.view.clone(),revision:op.staged_revision,root:op.staged_root.clone()})?;
     // This is O(1) dirty intent. Existing indexer pages retire old postings later. Search
     // fences on this new revision immediately, before any old preparation can publish.
     crate::ci::logsearch::stage_finished(&tx,&op.job)?;
@@ -579,7 +596,7 @@ async fn input_ready(ctx:&Context,op:&Operation) {
 pub(super) async fn append(ctx:Context,job:String,step:u32,input:Vec<u8>,origin:String)->anyhow::Result<Receipt> {
     anyhow::ensure!(!input.is_empty() && input.len()<=CHUNK && origin.len()<=256 && ctx.host.len()<=256,"observed append exceeds its admission bound");
     let (input,digest)=crate::rt::blocking(move ||{let digest=hash(&input);(input,digest)}).await?;
-    let original=Original{id:crate::util::new_id(),view:crate::util::new_id(),job,step,hash:digest,bytes:u64::try_from(input.len())?,origin,host:ctx.host.clone(),copy:None,job_order:None};
+    let original=Original{id:crate::util::new_id(),view:crate::util::new_id(),job,step,hash:digest,bytes:u64::try_from(input.len())?,origin,host:ctx.host.clone(),copy:None,job_order:None,attempt:None,producer:None};
     let mut op=loop {
         let o=original.clone();let max=ctx.files.max_bytes();
         match ctx.store.call(move |c|reserve(c,&o,max)).await {
@@ -800,7 +817,7 @@ async fn copy_append(ctx:Context,request:CopyStep)->anyhow::Result<Vec<u8>> {
     let needs_file=ctx.store.call(move |c|Ok(operation(c,&key)?.is_none() && prefix(c,&source)?.is_none())).await?;
     let (legacy,directory)=if needs_file {ctx.files.copy_capture(&source_job,source_step).await?}else{(None,String::new())};
     let (result,digest)=crate::rt::blocking(move ||{let digest=hash(&result);(result,digest)}).await?;
-    let original=Original{id:id.clone(),view:crate::util::new_id(),job,step,hash:digest.clone(),bytes:0,origin:"server-memo-copy".into(),host:ctx.host.clone(),job_order:Some(order),copy:Some(CopyRequest{source:source_job,step:source_step,request_hash:effect.clone(),legacy,directory,attempt:target_attempt,effect,result_hash:digest,result_bytes:u64::try_from(result.len())?,output_tree})};
+    let original=Original{id:id.clone(),view:crate::util::new_id(),job,step,hash:digest.clone(),bytes:0,origin:"server-memo-copy".into(),host:ctx.host.clone(),job_order:Some(order),attempt:Some(target_attempt),producer:None,copy:Some(CopyRequest{source:source_job,step:source_step,request_hash:effect.clone(),legacy,directory,attempt:target_attempt,effect,result_hash:digest,result_bytes:u64::try_from(result.len())?,output_tree})};
     let op=loop {
         let o=original.clone();let max=ctx.files.max_bytes();
         match ctx.store.call(move |c|reserve(c,&o,max)).await {
@@ -872,7 +889,7 @@ async fn retained_operation(ctx:Context,mut op:Operation)->anyhow::Result<Receip
             Ok(done)=>return Ok(done),
             Err(error)=>{
                 let id=op.id.clone();
-                let stale=ctx.store.call(move|c|Ok(copy_source(c,&id)?.is_some() && !copy_current(c,&id)?)).await;
+                let stale=ctx.store.call(move|c|Ok((copy_source(c,&id)?.is_some() && !copy_current(c,&id)?) || !producer::publication_current(c,&id)?)).await;
                 if matches!(stale,Ok(true)){return Ok(refused(&ctx,op.id,"original copy target ceased to be current while preparing; owned pins retained".into()).await)}
                 // Reads/preparation retry under the same operation. Conditional mutations
                 // reconcile/replay their exact captured descriptor in transition(), never
@@ -1032,6 +1049,9 @@ async fn continue_operation(ctx:Context,mut op:Operation)->anyhow::Result<Receip
     let done=transition(&ctx.store,move |c|{publish(c,&id)?;Ok(())},move |c|completed(c,&check)).await;
     if done.accepted {
         crate::ci::logsearch::kick();
+        // SAME live topic, before any compatibility projection can fail or await I/O.
+        // This is a resnapshot hint; only the immutable own receipt qualifies the bytes.
+        ctx.files.accepted(&op.job);
         // Compatibility output follows the OWN durable receipt. Failure here does not
         // erase acceptance, mutate its immutable source, or become delivery closure.
         if let Err(error)=project_input(&ctx,&op,copy.is_some()).await {
@@ -1221,6 +1241,7 @@ pub(crate) async fn retire_turn(logs:&super::Logs,store:&Store,blobs:&Arc<dyn Bl
         anyhow::ensure!(!held,"retired view {view} retains ambiguous PUT lifetimes, immutable keys and SQL pins; cleanup incomplete");
         let eligible:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM ci_log_accepted_views v WHERE view=?1 AND retired=1 AND NOT EXISTS(SELECT 1 FROM ci_log_accepted_ops o WHERE o.view=v.view AND o.status='pending') AND NOT EXISTS(SELECT 1 FROM ci_log_accepted_pins p WHERE p.view=v.view) AND NOT EXISTS(SELECT 1 FROM ci_log_accepted_unpublished u WHERE u.view=v.view) AND NOT EXISTS(SELECT 1 FROM ci_log_accepted_copy x WHERE x.source_view=v.view AND x.active=1))",[&view],|r|r.get(0))?;
         if !eligible {return Ok(false)}
+        if producer::retire_page(&tx,&view)? {tx.commit()?;return Ok(true)}
         let chunks=tx.execute("DELETE FROM ci_log_accepted_chunks WHERE view=?1 AND revision IN (SELECT revision FROM ci_log_accepted_chunks WHERE view=?1 ORDER BY revision LIMIT 32)",[&view])?;
         if chunks==0 {
             let operation:Option<String>=tx.query_row("SELECT operation FROM ci_log_accepted_ops WHERE view=?1 ORDER BY operation LIMIT 1",[&view],|r|r.get(0)).optional()?;
@@ -1296,25 +1317,52 @@ pub(crate) struct Observed {
 pub(crate) enum Answer {
     Append(futures::channel::oneshot::Sender<Result<Receipt,String>>),
     Copy(futures::channel::oneshot::Sender<Result<Vec<u8>,String>>),
+    #[cfg(test)] Producer(futures::channel::oneshot::Sender<Result<kiln_ci::wire::JobLogReplyV1,String>>),
 }
 pub(crate) enum Input {
     Frame(crate::net::FrameBytes,std::ops::Range<usize>),
     Server(Vec<u8>),
     Copy(Box<CopyStep>),
     Resume(String),
+    Producer(Box<ProducerFrame>),
+    #[cfg(test)] ProducerReplay(Box<(kiln_ci::wire::JobLogBindingV1,Vec<u8>,String)>),
+}
+pub(crate) struct ProducerFrame {
+    binding:kiln_ci::wire::JobLogBindingV1,connection:crate::net::Connection,
+    original:crate::net::FrameBytes,body:std::ops::Range<usize>,operation:String,refused:bool,
 }
 impl Input {
     fn bytes(&self)->anyhow::Result<&[u8]> {
         match self {
             Self::Frame(frame,range)=>frame.get(range.clone()).ok_or_else(||anyhow::anyhow!("captured log body range is invalid")),
             Self::Server(bytes)=>Ok(bytes),
-            Self::Copy(_)|Self::Resume(_)=>anyhow::bail!("copy input is a durable descriptor, not a frame body"),
+            Self::Copy(_)|Self::Resume(_)|Self::Producer(_)=>anyhow::bail!("typed retained input is not a legacy append body"),
+            #[cfg(test)] Self::ProducerReplay(..)=>anyhow::bail!("typed producer replay is not a legacy append body"),
         }
     }
-    fn server(&self)->bool {!matches!(self,Self::Frame(..))}
+    fn server(&self)->bool {!matches!(self,Self::Frame(..)|Self::Producer(_))}
+    fn producer_operation(&self)->Option<&str> {
+        match self {
+            Self::Producer(frame)=>Some(&frame.operation),
+            #[cfg(test)] Self::ProducerReplay(replay)=>Some(&replay.2),
+            _=>None,
+        }
+    }
 }
-enum Outcome {Append(Receipt),Copy(Vec<u8>)}
-struct Done {job:String,server:bool,result:anyhow::Result<Outcome>,answer:Option<Answer>}
+#[derive(Clone,Debug)]
+pub(crate) enum Completion {
+    Append(Receipt),
+    Producer {binding:kiln_ci::wire::JobLogBindingV1,connection:crate::net::Connection,reply:kiln_ci::wire::JobLogReplyV1},
+    RecoveredProducer {binding:kiln_ci::wire::JobLogBindingV1,reply:kiln_ci::wire::JobLogReplyV1},
+}
+enum Outcome {Append(Receipt),Copy(Vec<u8>),Producer(Completion),RecoveredProducer(Option<Completion>),EndPage(Vec<producer::EndCandidate>),RecoveredPending(Operation),#[cfg(test)] ProducerReplay(kiln_ci::wire::JobLogReplyV1)}
+struct Done {job:String,server:bool,result:anyhow::Result<Outcome>,answer:Option<Answer>,retained:Option<Observed>,debt:Option<Operation>,recovered_id:Option<String>}
+struct Delivery {key:String,job:String,completion:Completion,held:Option<Observed>,credit:bool}
+struct Debt {op:Operation,recheck:bool}
+// A cancelled/finished server waiter must hand polling back to Hub after it temporarily
+// became FuturesUnordered's last waker. This guard owns no I/O or new task/controller.
+struct ReplyPoll<'a>(&'a parking_lot::Mutex<Owner>);
+impl Drop for ReplyPoll<'_> {fn drop(&mut self){self.0.lock().wake_hub()}}
 type Io=futures::future::BoxFuture<'static,Done>;
 type Recovery=futures::future::BoxFuture<'static,anyhow::Result<Vec<Operation>>>;
 
@@ -1325,14 +1373,29 @@ type Recovery=futures::future::BoxFuture<'static,anyhow::Result<Vec<Operation>>>
 pub(super) struct Owner {
     context:Option<Context>,io:futures::stream::FuturesUnordered<Io>,
     jobs:std::collections::HashSet<String>,waiting:std::collections::VecDeque<Observed>,
+    // Only original charged network frames park here. They do not occupy an I/O slot
+    // or block a later predecessor for the same job. The 64 receive grants bound them.
+    parked:std::collections::VecDeque<Observed>,
+    // A cold pending reservation whose pre-PUT bytes were lost still owns one of
+    // the SAME eight I/O credits. Only its exact producer replay may borrow it.
+    debts:Vec<Debt>,
+    // At most one fixed page of original persisted Ends, revisited only on startup
+    // or real progress. No new polling timer, worker, exporter or reporting route.
+    end_waiting:std::collections::VecDeque<producer::EndCandidate>,end_probe:bool,end_after:Option<String>,
+    // Server own_reply may drive unrelated I/O but cannot consume Hub's replies. Each
+    // delivery is backed by its same original frame, either here or in parked, and is
+    // coalesced per original receive identity before another progress opportunity.
+    deliveries:std::collections::VecDeque<Delivery>,
     // At most one End marker per already-owned/queued job; no terminal backlog is admitted.
     ends:std::collections::HashSet<String>,
-    server:usize,recovery:Option<Recovery>,ready:bool,wake:Option<std::task::Waker>,
+    server:usize,recovery:Option<Recovery>,ready:bool,wake:Option<std::task::Waker>,hub_wake:Option<std::task::Waker>,
 }
 impl Owner {
+    fn wake_hub(&mut self) {if let Some(wake)=self.hub_wake.take(){wake.wake()}}
     pub(super) fn bind(&mut self,context:Context) {if self.context.is_none(){self.context=Some(context)}}
     pub(super) fn bound(&self)->bool {self.context.is_some()}
-    fn occupied(&self,job:&str)->bool {self.jobs.contains(job) || self.waiting.iter().any(|o|o.job==job)}
+    fn occupied(&self,job:&str)->bool {self.jobs.contains(job) || self.debts.iter().any(|d|d.op.job==job) || self.end_waiting.iter().any(|e|e.job==job) || self.waiting.iter().chain(self.parked.iter()).any(|o|o.job==job) || self.deliveries.iter().any(|d|d.job==job)}
+    fn credits(&self)->usize {self.io.len()+self.debts.len()+self.deliveries.iter().filter(|d|d.credit).count()}
     fn busy(&self,job:&str)->bool {self.bound() && (!self.ready || self.occupied(job))}
     pub(super) fn defer_finish(&mut self,job:&str)->bool {
         if !self.occupied(job) {return false}
@@ -1341,6 +1404,19 @@ impl Owner {
     fn queue(&mut self,observed:Observed) {
         self.waiting.push_back(observed);if let Some(wake)=self.wake.take(){wake.wake()}
     }
+    fn progress(&mut self) {
+        // A successful own predecessor/result receipt is a progress opportunity, not a
+        // polling timer. Definitively refused inputs remain held pending disposition.
+        let count=self.parked.len();
+        for _ in 0..count {
+            let Some(observed)=self.parked.pop_front() else{break};
+            if matches!(&observed.input,Input::Producer(frame) if !frame.refused) {self.waiting.push_back(observed)}else{self.parked.push_back(observed)}
+        }
+        for debt in &mut self.debts {debt.recheck=true}
+        self.end_probe=true;
+        if let Some(wake)=self.wake.take(){wake.wake()}
+        self.wake_hub();
+    }
     fn server(&mut self,observed:Observed)->anyhow::Result<()> {
         anyhow::ensure!(self.context.is_some() && self.server<SERVER_SLOTS,"server log effect refused before bounded admission; no acceptance/projection");
         self.server+=1;self.queue(observed);Ok(())
@@ -1348,13 +1424,63 @@ impl Owner {
     fn start_ready(&mut self) {
         let Some(ctx)=self.context.clone() else{return};
         while self.io.len()<IO_SLOTS {
-            let Some(at)=self.waiting.iter().position(|o|!self.jobs.contains(&o.job)) else{break};
+            let at=self.waiting.iter().position(|o|{
+                if self.jobs.contains(&o.job) {return false}
+                match self.debts.iter().find(|d|d.op.job==o.job) {
+                    Some(debt)=>o.input.producer_operation()==Some(debt.op.id.as_str()),
+                    None=>self.credits()<IO_SLOTS,
+                }
+            });
+            let Some(at)=at else {
+                // One turn per actual progress opportunity, using the debt's own
+                // credit. Missing input returns to debt; no timer/controller is added.
+                if let Some(at)=self.debts.iter().position(|d|d.recheck && !self.jobs.contains(&d.op.job)) {
+                    let debt=self.debts.remove(at);self.start_recovery(ctx.clone(),debt.op);continue
+                }
+                if let Some(at)=self.end_waiting.iter().position(|e|!self.jobs.contains(&e.job) && match self.debts.iter().find(|d|d.op.job==e.job) {Some(d)=>d.op.id==e.operation,None=>self.credits()<IO_SLOTS}) {
+                    let Some(candidate)=self.end_waiting.remove(at) else{break};let ctx=ctx.clone();self.jobs.insert(candidate.job.clone());
+                    let borrowed=self.debts.iter().position(|d|d.op.job==candidate.job).map(|at|self.debts.remove(at).op);
+                    self.io.push(Box::pin(async move {
+                        let job=candidate.job.clone();let id=candidate.operation.clone();let recovered=producer::recover_end(ctx.clone(),candidate).await;
+                        let (mut result,debt)=match recovered {Ok((completion,debt))=>(Ok(Outcome::RecoveredProducer(completion)),debt),Err(error)=>(Err(error),None)};
+                        let debt=match borrowed {Some(op)=>producer::remaining_debt(&ctx,op).await,None=>debt};
+                        if debt.is_some() && result.is_ok(){result=Ok(Outcome::RecoveredProducer(None))}
+                        Done{job,server:false,result,answer:None,retained:None,debt,recovered_id:Some(id)}
+                    }));continue
+                }
+                if self.credits()>=IO_SLOTS {break}
+                if self.end_probe && self.end_waiting.is_empty() {
+                    self.end_probe=false;let store=ctx.store.clone();let after=self.end_after.clone();
+                    self.io.push(Box::pin(async move {
+                        let result=store.call(move |c|producer::end_page(c,after.as_deref())).await.map(Outcome::EndPage);
+                        Done{job:String::new(),server:false,result,answer:None,retained:None,debt:None,recovered_id:None}
+                    }));continue
+                }
+                break
+            };
             let Some(observed)=self.waiting.remove(at) else{break};
+            let debt=self.debts.iter().position(|d|d.op.job==observed.job).map(|at|self.debts.remove(at).op);
             self.jobs.insert(observed.job.clone());let ctx=ctx.clone();
             self.io.push(Box::pin(async move {
-                let Observed{job,step,input,origin,answer}=observed;let server=input.server();
+                let Observed{job,step,input,origin,answer}=observed;let server=input.server();let mut retained=None;
                 let result=match input {
-                    Input::Copy(request)=>copy_append(ctx,*request).await.map(Outcome::Copy),
+                    Input::Producer(mut frame)=>{
+                        let original=frame.original.clone();let range=frame.body.clone();let binding=frame.binding.clone();
+                        let prepared=crate::rt::blocking(move ||{
+                            anyhow::ensure!(range.len()<=96<<10,"producer body exceeds its bounded envelope");
+                            original.get(range).map(|body|body.to_vec()).ok_or_else(||anyhow::anyhow!("producer body range is invalid"))
+                        }).await;
+                        let reply=match prepared {
+                            Ok(Ok(body))=>producer::turn(ctx.clone(),binding,body,Some(frame.operation.clone())).await,
+                            Ok(Err(error))|Err(error)=>kiln_ci::wire::JobLogReplyV1::Unknown{binding_id:crate::proto::job_log::binding_id(&frame.binding).unwrap_or([0;32]),item_seq:0,operation:None,why:crate::util::truncate(&format!("{error:#}"),4096).into()},
+                        };
+                        let completion=Completion::Producer{binding:frame.binding.clone(),connection:frame.connection,reply:reply.clone()};
+                        frame.refused=matches!(reply,kiln_ci::wire::JobLogReplyV1::Refused{..});
+                        retained=Some(Observed{job:job.clone(),step,input:Input::Producer(frame),origin,answer:None});
+                        Ok(Outcome::Producer(completion))
+                    },
+                    #[cfg(test)] Input::ProducerReplay(replay)=>{let(binding,body,id)=*replay;Ok(Outcome::ProducerReplay(producer::turn(ctx.clone(),binding,body,Some(id)).await))},
+                    Input::Copy(request)=>copy_append(ctx.clone(),*request).await.map(Outcome::Copy),
                     Input::Resume(id)=>{
                         // A prequeue slot lookup is not receipt custody. Recheck after
                         // registration; GC/revocation means unavailable, never a new miss.
@@ -1362,25 +1488,53 @@ impl Owner {
                             let op=operation(c,&id)?.ok_or_else(||anyhow::anyhow!("original copy disappeared before retained resume admission"))?;
                             anyhow::ensure!(copy_current(c,&id)?,"original copy target is retired, replaced or revoked");Ok(op)
                         }).await;
-                        match checked {Ok(op)=>finish_copy(ctx,op).await.map(Outcome::Copy),Err(error)=>Err(error)}
+                        match checked {Ok(op)=>finish_copy(ctx.clone(),op).await.map(Outcome::Copy),Err(error)=>Err(error)}
                     },
                     input=>{
                         // Only active frame/server append inputs allocate one CHUNK vector.
                         // Waiting frames retain their original whole charged Reservation.
                         let prepared=crate::rt::blocking(move ||{let bytes=input.bytes()?.to_vec();Ok::<_,anyhow::Error>((bytes,input))}).await;
                         match prepared {
-                            Ok(Ok((bytes,input)))=>{let result=append(ctx,job.clone(),step,bytes,origin).await.map(Outcome::Append);drop(input);result},
+                            Ok(Ok((bytes,input)))=>{let result=append(ctx.clone(),job.clone(),step,bytes,origin).await.map(Outcome::Append);drop(input);result},
                             Ok(Err(error))|Err(error)=>Err(error),
                         }
                     }
                 };
-                Done{job,server,result,answer}
+                // This read only accounts the original reservation. It never turns
+                // this frame's reply into success or infers a receipt from a barrier.
+                let debt=match debt {Some(op)=>producer::remaining_debt(&ctx,op).await,None=>None};
+                Done{job,server,result,answer,retained,debt,recovered_id:None}
             }));
         }
     }
-    fn poll(&mut self,cx:&mut std::task::Context<'_>)->std::task::Poll<anyhow::Result<Receipt>> {
+    fn start_recovery(&mut self,ctx:Context,op:Operation) {
+        self.jobs.insert(op.job.clone());
+        self.io.push(Box::pin(async move {
+            let job=op.job.clone();let id=op.id.clone();let check=id.clone();
+            // A caller timeout is not absence and cannot release this credit.
+            let strict=reconcile(&ctx.store,move |c|Ok(Some(c.query_row("SELECT EXISTS(SELECT 1 FROM ci_log_producer_items WHERE operation=?1)",[&check],|r|r.get::<_,bool>(0))?))).await;
+            let original=strict.then(||op.clone());
+            let result=if strict {
+                match producer::recover(ctx.clone(),op.clone()).await {Ok(Some(receipt))=>Ok(Outcome::RecoveredProducer(Some(producer::recovered_completion(&ctx,id.clone(),receipt).await))),Ok(None)=>Ok(Outcome::RecoveredPending(op)),Err(error)=>Err(error)}
+            }else{retained_operation(ctx,op).await.map(Outcome::Append)};
+            let debt=if result.is_err(){original}else{None};
+            Done{job,server:false,result,answer:None,retained:None,debt,recovered_id:strict.then_some(id)}
+        }));
+    }
+    fn poll(&mut self,cx:&mut std::task::Context<'_>)->std::task::Poll<anyhow::Result<Completion>> {
+        self.poll_inner(cx,true)
+    }
+    fn poll_inner(&mut self,cx:&mut std::task::Context<'_>,deliver:bool)->std::task::Poll<anyhow::Result<Completion>> {
         use futures::{FutureExt as _,StreamExt as _};
         self.wake=Some(cx.waker().clone());let Some(ctx)=self.context.clone()else{return std::task::Poll::Pending};
+        if deliver {self.hub_wake=Some(cx.waker().clone())}
+        if deliver && let Some(delivery)=self.deliveries.pop_front() {
+            let job=delivery.job.clone();
+            drop(delivery.held);
+            if !self.occupied(&job) && self.ends.remove(&job) {ctx.files.finish(&job)}
+            self.start_ready();
+            return std::task::Poll::Ready(Ok(delivery.completion))
+        }
         if !self.ready {
             if self.recovery.is_none() {
                 let store=ctx.store.clone();self.recovery=Some(Box::pin(async move{
@@ -1397,10 +1551,9 @@ impl Owner {
                 std::task::Poll::Pending=>return std::task::Poll::Pending,
                 std::task::Poll::Ready(Err(error))=>{self.recovery=None;return std::task::Poll::Ready(Err(error))},
                 std::task::Poll::Ready(Ok(operations))=>{
-                    self.recovery=None;self.ready=true;
+                    self.recovery=None;self.ready=true;self.end_probe=true;
                     for op in operations {
-                        self.jobs.insert(op.job.clone());let ctx=ctx.clone();
-                        self.io.push(Box::pin(async move{let job=op.job.clone();let result=retained_operation(ctx,op).await.map(Outcome::Append);Done{job,server:false,result,answer:None}}));
+                        self.start_recovery(ctx.clone(),op);
                     }
                 }
             }
@@ -1409,11 +1562,61 @@ impl Owner {
         match self.io.poll_next_unpin(cx) {
             std::task::Poll::Ready(Some(done))=>{
                 if matches!(&done.result,Ok(Outcome::Append(receipt)) if !receipt.accepted) || done.result.is_err() {crate::ci::logsearch::kick();}
-                self.jobs.remove(&done.job);if done.server{self.server=self.server.saturating_sub(1)}self.start_ready();
+                let progress=matches!(&done.result,Ok(Outcome::Append(receipt)) if receipt.accepted)
+                    || matches!(&done.result,Ok(Outcome::Copy(_)))
+                    || matches!(&done.result,Ok(Outcome::Producer(Completion::Producer{reply:kiln_ci::wire::JobLogReplyV1::Committed(_),..})))
+                    || matches!(&done.result,Ok(Outcome::RecoveredProducer(Some(Completion::RecoveredProducer{reply:kiln_ci::wire::JobLogReplyV1::Committed(_),..}))));
+                self.jobs.remove(&done.job);if done.server{self.server=self.server.saturating_sub(1)}
+                if let Some(op)=done.debt {self.debts.push(Debt{op,recheck:false})}
+                if let Ok(Outcome::RecoveredPending(op))=&done.result {self.debts.push(Debt{op:op.clone(),recheck:false})}
+                let producer_delivery=if let Ok(Outcome::Producer(completion))=&done.result {
+                    let Some(retained)=done.retained else{return std::task::Poll::Ready(Err(anyhow::anyhow!("producer completion lost its original receive custody")))};
+                    let key=retained.origin.clone();
+                    let committed=matches!(completion,Completion::Producer{reply:kiln_ci::wire::JobLogReplyV1::Committed(_),..});
+                    let held=if committed {Some(retained)}else{self.parked.push_back(retained);None};
+                    Some(Delivery{key,job:done.job.clone(),completion:completion.clone(),held,credit:false})
+                }else{
+                    if let Some(retained)=done.retained {self.parked.push_back(retained)}None
+                };
+                if let Ok(Outcome::EndPage(page))=&done.result {
+                    self.end_after=page.last().map(|e|e.binding.clone());
+                    for candidate in page {
+                        if !self.end_waiting.iter().any(|e|e.operation==candidate.operation) && !self.deliveries.iter().any(|d|d.key==candidate.operation) {
+                            self.end_waiting.push_back(candidate.clone())
+                        }
+                    }
+                }
+                if let Ok(Outcome::RecoveredProducer(Some(completion)))=&done.result {
+                    let Some(key)=done.recovered_id.clone() else{return std::task::Poll::Ready(Err(anyhow::anyhow!("recovered End lost its original operation identity")))};
+                    if let Some(at)=self.deliveries.iter().position(|d|d.key==key){self.deliveries.remove(at);}
+                    self.deliveries.push_back(Delivery{key,job:done.job.clone(),completion:completion.clone(),held:None,credit:true});self.wake_hub();
+                }
+                if let Some(delivery)=producer_delivery {
+                    // Same original progress retry replaces its prior notification rather
+                    // than adding an unbounded reply backlog. Frames remain actual grants.
+                    if let Some(at)=self.deliveries.iter().position(|d|d.key==delivery.key) {self.deliveries.remove(at);}
+                    self.deliveries.push_back(delivery);
+                    self.wake_hub();
+                }
+                if progress {self.progress()}self.start_ready();
                 if !self.occupied(&done.job) && self.ends.remove(&done.job) {ctx.files.finish(&done.job)}
                 match (done.result,done.answer) {
-                    (Ok(Outcome::Append(receipt)),Some(Answer::Append(answer)))=>{let _=answer.send(Ok(receipt.clone()));std::task::Poll::Ready(Ok(receipt))},
-                    (Ok(Outcome::Append(receipt)),None)=>std::task::Poll::Ready(Ok(receipt)),
+                    (Ok(Outcome::Append(receipt)),Some(Answer::Append(answer)))=>{let _=answer.send(Ok(receipt.clone()));std::task::Poll::Ready(Ok(Completion::Append(receipt)))},
+                    (Ok(Outcome::Append(receipt)),None)=>std::task::Poll::Ready(Ok(Completion::Append(receipt))),
+                    (Ok(Outcome::Producer(_)|Outcome::RecoveredProducer(Some(_))),None)=>{
+                        cx.waker().wake_by_ref();
+                        if deliver {
+                            let Some(delivery)=self.deliveries.pop_front() else{return std::task::Poll::Ready(Err(anyhow::anyhow!("producer delivery disappeared")))};
+                            let job=delivery.job.clone();drop(delivery.held);
+                            if !self.occupied(&job) && self.ends.remove(&job) {ctx.files.finish(&job)}
+                            self.start_ready();
+                            std::task::Poll::Ready(Ok(delivery.completion))
+                        }else{std::task::Poll::Pending}
+                    },
+                    (Ok(Outcome::RecoveredPending(_)),None)=>{cx.waker().wake_by_ref();std::task::Poll::Pending},
+                    (Ok(Outcome::RecoveredProducer(None)|Outcome::EndPage(_)),None)=>{cx.waker().wake_by_ref();std::task::Poll::Pending},
+                    #[cfg(test)] (Ok(Outcome::ProducerReplay(reply)),Some(Answer::Producer(answer)))=>{let _=answer.send(Ok(reply));cx.waker().wake_by_ref();std::task::Poll::Pending},
+                    #[cfg(test)] (Err(error),Some(Answer::Producer(answer)))=>{let _=answer.send(Err(format!("{error:#}")));std::task::Poll::Ready(Err(error))},
                     (Ok(Outcome::Copy(bytes)),Some(Answer::Copy(answer)))=>{let _=answer.send(Ok(bytes));cx.waker().wake_by_ref();std::task::Poll::Pending},
                     (Err(error),Some(Answer::Append(answer)))=>{let _=answer.send(Err(format!("{error:#}")));std::task::Poll::Ready(Err(error))},
                     (Err(error),Some(Answer::Copy(answer)))=>{let _=answer.send(Err(format!("{error:#}")));std::task::Poll::Ready(Err(error))},
@@ -1429,16 +1632,32 @@ impl Owner {
 impl super::Logs {
     pub(super) fn accepted_context(&self)->anyhow::Result<Context> {self.io.lock().context.clone().ok_or_else(||anyhow::anyhow!("accepted Logs owner is unbound"))}
     pub(crate) fn observe_frame(&self,observed:Observed) {self.io.lock().queue(observed)}
+    /// Root has already authenticated the original registration and outer stream/seq.
+    /// The whole original grant and reporting connection enter owner custody before any
+    /// cancelable storage wait. A later connection is never substituted for this route.
+    pub(crate) fn observe_producer_frame(&self,binding:kiln_ci::wire::JobLogBindingV1,connection:crate::net::Connection,original:crate::net::FrameBytes,item_body:std::ops::Range<usize>,item_seq:u64)->anyhow::Result<()> {
+        anyhow::ensure!(original.retained(),"strict producer input lacks its original charged frame");
+        let job=binding.owner.job.clone();let origin=original.origin();
+        let operation=crate::proto::job_log::stable_operation(&crate::proto::job_log::binding_id(&binding)?,item_seq)?;
+        // Actual received frames enter custody even if a later shape/storage check
+        // refuses them. No awaited/cancelable caller owns the only copy of that grant.
+        let mut owner=self.io.lock();
+        owner.queue(Observed{job,step:0,input:Input::Producer(Box::new(ProducerFrame{binding,connection,original,body:item_body,operation,refused:false})),origin,answer:None});Ok(())
+    }
+    /// Called only after an OWN durable registration/result receipt, never a generic
+    /// barrier or mere wake. No new task/timer is created and no pending grant is refunded.
+    pub(crate) fn producer_progress(&self) {self.io.lock().progress()}
     pub(crate) fn observe_server(&self,job:String,step:u32,input:Vec<u8>)->anyhow::Result<()> {
         if input.is_empty(){return Ok(())}anyhow::ensure!(input.len()<=CHUNK,"server log observation exceeds its bound");
         self.io.lock().server(Observed{job,step,input:Input::Server(input),origin:"server-observed".into(),answer:None})
     }
     async fn own_reply<T>(&self,mut reply:futures::channel::oneshot::Receiver<Result<T,String>>)->anyhow::Result<T> {
         use futures::FutureExt as _;
+        let _wake_on_drop=ReplyPoll(&self.io);
         futures::future::poll_fn(|cx|{
             if let std::task::Poll::Ready(result)=reply.poll_unpin(cx){return std::task::Poll::Ready(result.map_err(anyhow::Error::from).and_then(|r|r.map_err(anyhow::Error::msg)))}
             // Drive the SAME retained owner, including when the original Hub poll was cancelled.
-            if let std::task::Poll::Ready(result)=self.io.lock().poll(cx){
+            if let std::task::Poll::Ready(result)=self.io.lock().poll_inner(cx,false){
                 if let Err(error)=result {tracing::warn!(error=%format!("{error:#}"),"retained Logs completion remains qualified");}
                 // FuturesUnordered may already have another ready item without a fresh
                 // wake after returning this unrelated successful append completion.
@@ -1468,5 +1687,5 @@ impl super::Logs {
         self.io.lock().server(Observed{job:job.to_owned(),step,input:Input::Resume(id),origin:"server-memo-copy".into(),answer:Some(Answer::Copy(answer))})?;
         Ok(Some(self.own_reply(reply).await?))
     }
-    pub(crate) async fn accepted_completion(&self)->anyhow::Result<Receipt> {futures::future::poll_fn(|cx|self.io.lock().poll(cx)).await}
+    pub(crate) async fn accepted_completion(&self)->anyhow::Result<Completion> {futures::future::poll_fn(|cx|self.io.lock().poll(cx)).await}
 }

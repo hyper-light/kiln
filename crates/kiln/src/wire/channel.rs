@@ -260,6 +260,31 @@ impl Sender {
         out
     }
 
+    /// U05: a finite fair turn of this SAME sender. Only selected items get their
+    /// sent timestamp, so a held first stream cannot starve another producer.
+    pub(crate) fn poll_bounded(&mut self, now: Instant, limit: usize, after: &mut Option<(String,Seq)>) -> Vec<Frame> {
+        if !self.up || limit == 0 {return Vec::new()}
+        let mut keys=self.streams.iter().flat_map(|(stream,out)|out.pending.iter().map(move |pending|(stream.clone(),pending.seq))).collect::<Vec<_>>();
+        if let Some(previous)=after.as_ref(){keys.sort_by_key(|key|key<=previous);}
+        let mut frames=Vec::new();
+        for (stream,seq) in keys {
+            let Some(out)=self.streams.get_mut(&stream) else{continue};
+            let Some(p)=out.pending.iter_mut().find(|pending|pending.seq==seq) else{continue};
+            let due=match p.sent {
+                None=>true,
+                Some(at) if now.saturating_duration_since(at)>=self.patience=>true,
+                Some(_)=>match p.wanted{Wanted::No=>false,Wanted::Now=>true,Wanted::Again=>p.went_for_want.is_none_or(|at|now.saturating_duration_since(at)>=WANT_AGAIN)},
+            };
+            if !due{continue}
+            if p.wanted!=Wanted::No{p.went_for_want=Some(now);}
+            p.wanted=Wanted::No;p.sent=Some(now);
+            *after=Some((stream.clone(),seq));
+            frames.push(Frame::Item{stream,seq,low:out.answered,body:p.body.clone()});
+            if frames.len()==limit{break}
+        }
+        frames
+    }
+
     /// The link went down: what was sent on it goes again once the peer says what it has.
     pub fn down(&mut self) {
         self.up = false;
@@ -1121,6 +1146,14 @@ mod tests {
         again.on_frame(Frame::Have(vec![Has { stream: "a".into(), upto: 2, nacks: Vec::new() }]));
         assert_eq!(items(&again.poll(base)), vec![3, 4]);
         assert_eq!(again.push("a", vec![9]), Ok(5));
+        let mut fair=Sender::new(1024,Duration::from_secs(10));
+        for stream in ["held","other"]{for n in 0..4u8{fair.push(stream,vec![n]).map_err(|_|anyhow::anyhow!("fixture window full"))?;}}
+        fair.on_frame(Frame::Have(Vec::new()));
+        let mut after=None;let mut observed=std::collections::BTreeSet::new();
+        for _ in 0..8{let frames=fair.poll_bounded(base,1,&mut after);assert_eq!(frames.len(),1);for frame in frames{if let Frame::Item{stream,seq,..}=frame{observed.insert((stream,seq));}}}
+        assert_eq!(observed.len(),8,"bounded turns do not repeatedly timestamp unsent later items");
+        assert!(fair.poll_bounded(base,1,&mut after).is_empty());
+        assert_eq!(fair.unanswered(),8,"transport attempts without own receipts keep every original");
         Ok(())
     }
 

@@ -10,6 +10,9 @@
 
 use serde::{Deserialize, Serialize};
 
+pub(crate) mod job_log;
+pub use kiln_ci::wire::{JobLogBindingV1, JobLogCaptureV1, JobLogChunkV1, JobLogContractV1, JobLogEndV1, JobLogPrefixV1, JobLogReceiptV1, JobLogRefusalV1, JobLogReplyV1, JobLogViewV1};
+
 use crate::metrics::HostSample;
 use crate::pipeline::PlannedJob;
 use crate::store::Status;
@@ -43,6 +46,9 @@ pub const LANE_STREAM: u32 = 8;
 /// A lane of its own, so a page's files never wait behind a stream's picture or a terminal; only to
 /// runners announcing [`CAP_PORTS`].
 pub const LANE_PORTS: u32 = 9;
+/// U05: negotiated producer log channel, direct channel::Frame, still Kind::Log/Agent-Bulk.
+/// Bit52 is reserved; this held phase1 implementation never advertises it.
+pub const LANE_JOB_LOG: u32 = 10;
 
 /// A lane's name, as metrics and runner pages say it.
 pub fn lane_name(lane: u32) -> &'static str {
@@ -57,6 +63,7 @@ pub fn lane_name(lane: u32) -> &'static str {
         LANE_FILES => "files",
         LANE_STREAM => "stream",
         LANE_PORTS => "ports",
+        LANE_JOB_LOG => "job-log",
         _ => "other",
     }
 }
@@ -280,6 +287,10 @@ pub enum AgentMsg {
     /// U01: one cryptographic identity per agent process, repeated on reconnect. Only to a
     /// server advertising CAP_FIRECRACKER_SHAPE. Appended: no older postcard index changes.
     RunnerProcess { nonce: String },
+    /// U05: only inside the original producer channel on LANE_JOB_LOG. Appended.
+    JobLogChunkV1(JobLogChunkV1),
+    /// U05: original captured frontier/result, not physical stop or shared-history proof.
+    JobLogEndV1(JobLogEndV1),
 }
 
 /// A leg's event as a runner sends it ([`AgentMsg::JobEvent`]'s JSON): the event, and its place in
@@ -489,12 +500,22 @@ pub const CAP_UNIFIED_LAYOUT: u64 = 1 << 49;
 pub const CAP_EXPLICIT_ACTIVATION: u64 = 1 << 50;
 /// U01/U03: paired durable ordinary grant/admission and sequenced physical debt law.
 pub const CAP_ORDINARY_EXECUTION_DEBT: u64 = 1 << 51;
+/// U05: RESERVED paired native producer-log protocol. Neither peer advertises it until
+/// original registration, producer outbox, canonical receipts and terminal effects compose.
+pub const CAP_JOB_LOG_V1: u64 = 1 << 52;
+
+pub(crate) fn check_job_log_caps(caps: u64) -> Result<(), &'static str> {
+    let required = CAP_UNIFIED_LAYOUT | CAP_WIRE | CAP_JOB_ATTEMPT
+        | CAP_RESOURCE_OWNERSHIP | CAP_ORDINARY_EXECUTION_DEBT | CAP_JOB_LOG_V1;
+    if caps & required == required { Ok(()) }
+    else { Err("required producer logs need the paired original ordinary/wire/attempt contract") }
+}
 
 /// Refuse an identifiable unsupported private layout at its capability handshake, before
 /// dispatching extensions. Main's bit 41 means only CAP_UNREAD; it cannot prove Amphora.
 pub fn check_unified_layout(caps: u64) -> Result<(), &'static str> {
     let extensions = CAP_HARNESS_RELEASE | CAP_JOB_ATTEMPT | CAP_OPEN_ONCE
-        | CAP_RETAINED_RECEIVED | CAP_RESOURCE_OWNERSHIP | CAP_FIRECRACKER_SHAPE | CAP_AMPHORA | CAP_EXPLICIT_ACTIVATION | CAP_ORDINARY_EXECUTION_DEBT;
+        | CAP_RETAINED_RECEIVED | CAP_RESOURCE_OWNERSHIP | CAP_FIRECRACKER_SHAPE | CAP_AMPHORA | CAP_EXPLICIT_ACTIVATION | CAP_ORDINARY_EXECUTION_DEBT | CAP_JOB_LOG_V1;
     if caps & extensions != 0 && caps & CAP_UNIFIED_LAYOUT == 0 {
         Err("unsupported private protocol layout; unified extensions require CAP_UNIFIED_LAYOUT")
     } else {
@@ -504,12 +525,12 @@ pub fn check_unified_layout(caps: u64) -> Result<(), &'static str> {
 
 /// These messages require a successfully checked layout declaration on this connection.
 pub fn agent_extension(msg: &AgentMsg) -> bool {
-    matches!(msg, AgentMsg::Amphora { .. } | AgentMsg::JobFinishedV2 { .. } | AgentMsg::RunnerProcess { .. })
+    matches!(msg, AgentMsg::Amphora { .. } | AgentMsg::JobFinishedV2 { .. } | AgentMsg::RunnerProcess { .. } | AgentMsg::JobLogChunkV1(_) | AgentMsg::JobLogEndV1(_))
 }
 
 /// These messages require a successfully checked layout declaration on this connection.
 pub fn server_extension(msg: &ServerMsg) -> bool {
-    matches!(msg, ServerMsg::Amphora { .. } | ServerMsg::ReceivedV2 { .. } | ServerMsg::RetainedReceived { .. })
+    matches!(msg, ServerMsg::Amphora { .. } | ServerMsg::ReceivedV2 { .. } | ServerMsg::RetainedReceived { .. } | ServerMsg::JobLogReplyV1(_))
 }
 
 
@@ -824,6 +845,8 @@ pub enum ServerMsg {
     ReceivedV2 { job: String, attempt: u32 },
     /// U03: JSON exact retained evidence accepted durably by the server. Appended last.
     RetainedReceived { json: String },
+    /// U05: exact own durable log receipt, or typed refusal/Unknown. Appended.
+    JobLogReplyV1(JobLogReplyV1),
 }
 
 /// What the server's copy of one agent session has of its events, said in digests
@@ -1267,6 +1290,12 @@ mod tests {
         assert_eq!(CAP_EXPLICIT_ACTIVATION, 1 << 50);
         assert_eq!(CAP_ORDINARY_EXECUTION_DEBT,1 << 51);
         assert_eq!(CAP_ORDINARY_EXECUTION_DEBT & (CAP_EXPLICIT_ACTIVATION | CAP_UNIFIED_LAYOUT | unified | current_main),0);
+        assert_eq!(CAP_JOB_LOG_V1, 1 << 52);
+        assert_eq!(CAP_JOB_LOG_V1 & (CAP_ORDINARY_EXECUTION_DEBT | CAP_EXPLICIT_ACTIVATION | CAP_UNIFIED_LAYOUT | unified | current_main | CAP_FIRECRACKER_SHAPE), 0);
+        assert!(check_unified_layout(CAP_JOB_LOG_V1).is_err());
+        let paired = CAP_UNIFIED_LAYOUT | CAP_WIRE | CAP_JOB_ATTEMPT | CAP_RESOURCE_OWNERSHIP | CAP_ORDINARY_EXECUTION_DEBT | CAP_JOB_LOG_V1;
+        assert!(check_job_log_caps(paired).is_ok());
+        for bit in [CAP_UNIFIED_LAYOUT, CAP_WIRE, CAP_JOB_ATTEMPT, CAP_RESOURCE_OWNERSHIP, CAP_ORDINARY_EXECUTION_DEBT, CAP_JOB_LOG_V1] { assert!(check_job_log_caps(paired & !bit).is_err()); }
         assert!(check_unified_layout(CAP_ORDINARY_EXECUTION_DEBT).is_err());
         assert!(check_unified_layout(CAP_UNIFIED_LAYOUT | CAP_ORDINARY_EXECUTION_DEBT).is_ok());
         assert_eq!(CAP_EXPLICIT_ACTIVATION & (CAP_UNIFIED_LAYOUT | unified | CAP_FIRECRACKER_SHAPE | current_main), 0);
@@ -1305,6 +1334,50 @@ mod tests {
         assert_eq!(bytes.first(), Some(&65));
         assert_eq!(decode::<ServerMsg>(&bytes)?, receipt);
         assert_eq!(CAP_JOB_ATTEMPT, 1 << 43);
+        // U05: append-only framing and the borrowed Item refer to the SAME original body.
+        let owner = kiln_ci::wire::OrdinaryOwnerV1 { version: 1, grant: "grant-fixture".into(), execution: "ci-fixture".into(), allocation: "retained-fixture".into(), job: "leg".into(), attempt: 7, host: "fixture-host".into(), process_nonce: "a".repeat(43), publication_epoch: "epoch-fixture".into(), connection: "0".repeat(64), command: kiln_ci::wire::OrdinaryCommandV1 { stream: "l:1.1".into(), seq: 1 } };
+        let binding = JobLogBindingV1 { contract: JobLogContractV1 { version: 1, capture_limit: 100 }, owner };
+        let mut assignment=kiln_ci::wire::AssignmentV2::default();
+        assignment.debug.keep_on_failure_minutes=Some(10);
+        assert!(job_log::assignment_binding(&assignment,0)?.is_none(),"ordinary None does not acquire new policy");
+        assignment.job_id="leg".into();assignment.attempt=7;assignment.executor.kind="host".into();assignment.log_contract=Some(binding.contract.clone());assignment.limits.log_bytes=100;assignment.ordinary_owner=Some(binding.owner.clone());
+        let paired=CAP_JOB_LOG_V1|CAP_UNIFIED_LAYOUT|CAP_WIRE|CAP_JOB_ATTEMPT|CAP_RESOURCE_OWNERSHIP|CAP_ORDINARY_EXECUTION_DEBT;
+        assert!(job_log::assignment_binding(&assignment,paired).is_err(),"kept rerun writers need a separate original stream contract");
+        assignment.debug.keep_on_failure_minutes=None;
+        assert_eq!(job_log::assignment_binding(&assignment,paired)?,Some(binding.clone()));
+        assignment.limits.log_bytes=99;assert!(job_log::assignment_binding(&assignment,paired).is_err());
+        let initial = job_log::initial_root(&job_log::binding_id(&binding)?);
+        let chunk = JobLogChunkV1 { binding: binding.clone(), seq: 1, step: 0, offset: 0, previous_root: initial, data: b"hello".to_vec() };
+        let body = encode(&AgentMsg::JobLogChunkV1(chunk.clone()))?;
+        let old = encode(&AgentMsg::RunnerProcess { nonce: "a".repeat(43) })?;
+        assert_eq!(body.first().copied(), old.first().map(|tag| tag + 1));
+        let frame = encode(&crate::wire::channel::Frame::Item { stream: job_log::stream(&binding)?, seq: 1, low: 0, body: body.clone() })?;
+        let item = job_log::borrow_item(&frame)?;
+        assert_eq!((item.stream, item.seq, item.low, item.body), (job_log::stream(&binding)?.as_str(), 1, 0, body.as_slice()));
+        let offset = item.body.as_ptr() as usize - frame.as_ptr() as usize;
+        assert_eq!(frame.get(offset..offset + item.body.len()), Some(body.as_slice()));
+        let mut trailing = frame.clone(); trailing.push(0); assert!(job_log::borrow_item(&trailing).is_err());
+        // Variant, stream length, seq, low and body length each reject redundant
+        // varints without allocating/re-encoding the retained body.
+        let seq_at = 2 + item.stream.len();
+        for at in [0, 1, seq_at, seq_at + 1, seq_at + 2] {
+            let mut redundant = frame.clone();
+            let mut last = at;
+            while redundant.get(last).is_some_and(|byte| byte & 0x80 != 0) { last += 1; }
+            *redundant.get_mut(last).ok_or_else(|| anyhow::anyhow!("fixture varint is truncated"))? |= 0x80;
+            redundant.insert(last + 1, 0);
+            assert!(job_log::borrow_item(&redundant).is_err());
+        }
+        assert!(job_log::borrow_item(&encode(&crate::wire::channel::Frame::Have(Vec::new()))?).is_err());
+        let result_bytes = encode(&JobResult { job: "leg".into(), status: Status::Succeeded, exit_code: Some(0), error: None, peak_rss: None, cpu_seconds: Some(0.0) })?;
+        let end = JobLogEndV1 { binding, final_seq: 1, captured_bytes: 5, root: job_log::chunk_root(&chunk)?, result_hash: job_log::result_hash(&result_bytes)?, result: result_bytes, capture: JobLogCaptureV1::Complete };
+        assert_eq!(job_log::validate_end(&end)?.job, "leg");
+        let end_bytes = encode(&AgentMsg::JobLogEndV1(end.clone()))?;
+        assert_eq!(end_bytes.first().copied(), body.first().map(|tag| tag + 1));
+        let mut invalid = end; invalid.result.push(0); assert!(job_log::validate_end(&invalid).is_err());
+        let reply = ServerMsg::JobLogReplyV1(JobLogReplyV1::Unknown { binding_id: [0;32], item_seq: 1, operation: None, why: "fixture".into() });
+        assert_eq!(encode(&reply)?.first().copied(), encode(&ServerMsg::RetainedReceived { json: "{}".into() })?.first().map(|tag| tag + 1));
+        assert_eq!(LANE_JOB_LOG, 10); assert_eq!(lane_name(LANE_JOB_LOG), "job-log");
         Ok(())
     }
 
@@ -1382,7 +1455,7 @@ mod tests {
         assert_eq!(decode::<AgentMsg>(&encode(&up)?)?, up);
         assert_eq!(decode::<ServerMsg>(&encode(&down)?)?, down);
         // Step 5 appended `LinkUnread` (57) and `ReachRefused` (63) after them.
-        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (61, 67), "each table has every variant once");
+        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (63, 68), "each table has every variant once");
         assert!(CAP_UNREAD.is_power_of_two() && CAP_UNREAD == 1 << 41 && CAP_UNREAD & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH) == 0);
         Ok(())
     }

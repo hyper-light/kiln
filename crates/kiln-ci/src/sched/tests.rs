@@ -2075,6 +2075,55 @@ fn u01_kept_terminal_transfers_same_allocation_and_only_proof_releases_it() -> R
         replay.handle(Input::LegQueued(Box::new(LegIn { request: capacity, ..leg("replayed-waiting", "other", 60) })), 17);
         assert!(replay.reason("replayed-waiting").is_some());
         assert_eq!(assigned(&replay.handle(Input::AttemptFinished { leg: snapshot.id, attempt: 1, outcome: Outcome::Success }, 18)), vec!["replayed-waiting"], "replayed transfer does not duplicate or leak an allocation");
+
+        // U03/U05: physical proof frees this exact native assignment BEFORE logical/log
+        // completion. Exercise both live placement and conservative cold re-adoption.
+        for cold in [false, true] {
+            let mut early = Scheduler::new(Config { resources, quotas:[("physical-repo".into(),1)].into_iter().collect(), ..Config::default() });
+            let runner = RunnerIn { capacity: Some(capacity), ..linux("a", 1) };
+            let original = LegIn { request: capacity, ..leg("physical-first", "physical-repo", 60) };
+            if cold {
+                early.handle(Input::LegRunning { leg:Box::new(original.clone()),runner:"a".into(),attempt:1 },20);
+                early.handle(Input::RunnerUp(Box::new(runner)),21);
+            } else {
+                early.handle(Input::RunnerUp(Box::new(runner)),20);
+                assert_eq!(assigned(&early.handle(Input::LegQueued(Box::new(original.clone())),21)),vec!["physical-first"]);
+            }
+            let old = early.allocation("physical-first",1,"physical-old".into()).ok_or("original physical charge missing")?;
+            early.handle(Input::RetainExecution { leg:"physical-first".into(),attempt:1 },22);
+            let waiting = LegIn { request:capacity,..leg("physical-second","physical-repo",60) };
+            assert!(assigned(&early.handle(Input::LegQueued(Box::new(waiting)),23)).is_empty());
+            let third = LegIn { request:capacity,..leg("physical-third","physical-repo",60) };
+            assert!(assigned(&early.handle(Input::LegQueued(Box::new(third)),24)).is_empty());
+            let stale = early.handle(Input::OrdinaryExecutionReleased { leg:"physical-first".into(),attempt:2,runner:"a".into() },25);
+            assert!(assigned(&stale).is_empty());
+            let released = early.handle(Input::OrdinaryExecutionReleased { leg:"physical-first".into(),attempt:1,runner:"a".into() },26);
+            assert_eq!(assigned(&released),vec!["physical-second"],"physical proof returns capacity without waiting for log close");
+            assert!(!released.iter().any(|c| matches!(c,Command::Settled{leg,..}|Command::Retry{leg,..} if leg=="physical-first")));
+            assert!(early.standing("physical-first").is_some(),"the SAME logical leg remains pending");
+            assert!(early.allocation("physical-first",1,"cannot-resurrect".into()).is_none());
+            let second = early.allocation("physical-second",1,"physical-second-charge".into()).ok_or("second assignment missing")?;
+            for (attempt,runner) in [(1,"a"),(2,"a"),(1,"elsewhere")] {
+                let duplicate = early.handle(Input::OrdinaryExecutionReleased { leg:"physical-first".into(),attempt,runner:runner.into() },27);
+                assert!(assigned(&duplicate).is_empty(),"duplicate/stale proof cannot refund the second leg");
+                assert_eq!(early.allocation("physical-second",1,second.id.clone()),Some(second.clone()));
+            }
+            early.handle(Input::LegRunning { leg:Box::new(original),runner:"a".into(),attempt:1 },28);
+            assert!(early.allocation("physical-first",1,"cannot-re-adopt-debt".into()).is_none(),"a repeated running announcement cannot recharge the released assignment");
+            early.handle(Input::RetainExecution { leg:"physical-first".into(),attempt:1 },29);
+            let old_id=old.id.clone();
+            let logical = if cold {
+                early.handle(Input::RetainedFinished { leg:"physical-first".into(),attempt:1,reservation:Box::new(old),outcome:Outcome::Success },31)
+            } else {
+                early.handle(Input::AttemptFinished { leg:"physical-first".into(),attempt:1,outcome:Outcome::Success },31)
+            };
+            assert!(early.standing(&old_id).is_none(),"a cached pre-proof snapshot cannot recreate physical debt when its actual logical outcome arrives");
+            assert!(logical.iter().any(|c| matches!(c,Command::Settled{leg,outcome:Outcome::Success,..} if leg=="physical-first")));
+            assert!(early.standing("physical-first").is_none());
+            assert!(assigned(&logical).is_empty(),"logical completion must not refund the second assignment again");
+            assert_eq!(early.allocation("physical-second",1,second.id.clone()),Some(second));
+            assert_eq!(assigned(&early.handle(Input::AttemptFinished { leg:"physical-second".into(),attempt:1,outcome:Outcome::Success },32)),vec!["physical-third"]);
+        }
     }
     Ok(())
 }

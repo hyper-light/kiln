@@ -2516,6 +2516,15 @@ async fn job(hub: &Hub, id: &str) -> R {
 
 async fn job_logs(hub: &Hub, id: &str, q: &HashMap<String, String>) -> R {
     let step = q.get("step").and_then(|v| v.parse().ok()).unwrap_or(0);
+    match hub.logs.read_producer(id, step, q.get("require_complete").is_some_and(|v| v == "1")).await {
+        Ok(Some(read)) => {
+            let mut response = srv::response(StatusCode::OK, "text/plain; charset=utf-8", srv::full(read.bytes));
+            producer_log_headers(&mut response, read.complete, read.qualification, read.prefix.as_ref())?;
+            return Ok(response);
+        }
+        Ok(None) => {}, // No registered contract: preserve the legacy/reused-job path.
+        Err(error) => return Ok(producer_log_error(&error)),
+    }
     let mut data = hub.logs.read(id, step).await;
     // A CI leg a rerun kept: its original's logs (docs/ci.md W05-R17).
     if data.is_empty()
@@ -2532,6 +2541,33 @@ async fn job_logs(hub: &Hub, id: &str, q: &HashMap<String, String>) -> R {
 /// kept answers with its original's, as its log does.
 async fn job_log_times(hub: &Hub, id: &str, q: &HashMap<String, String>) -> R {
     let step = q.get("step").and_then(|v| v.parse().ok()).unwrap_or(0);
+    match hub.logs.producer_snapshot(id, q.get("require_complete").is_some_and(|v| v == "1")).await {
+        Ok(Some(snapshot)) => {
+            // Times are only the old projection's offsets. The byte count comes from
+            // the validated immutable catalog, without reading the growing log again.
+            let size = match snapshot.prefix.as_ref() {
+                Some(prefix) => match crate::logs::accepted::producer::RawReader::open(&hub.store, prefix.clone(), step).await {
+                    Ok(reader) => Some(reader.as_ref().map_or(0, |r| r.len())),
+                    Err(error) => return Ok(producer_log_error(&error)),
+                },
+                None if snapshot.complete => Some(0), // Own captured zero End.
+                None => None, // Partial without a captured head is not known empty.
+            };
+            if size.is_some_and(|size| size > snapshot.max_bytes) {
+                return Ok(producer_log_error(&crate::logs::accepted::producer::ReadError::Unavailable("captured log exceeds the configured bound".into()).into()));
+            }
+            let times = hub.logs.times(id, step).await;
+            let mut response = srv::json(StatusCode::OK, &json!({
+                "times": times, "times_qualification": "compatibility_projection",
+                "size": size, "size_qualification": snapshot.qualification,
+                "complete": snapshot.complete, "prefix": &snapshot.prefix,
+            }));
+            producer_log_headers(&mut response, snapshot.complete, snapshot.qualification, snapshot.prefix.as_ref())?;
+            return Ok(response);
+        }
+        Ok(None) => {},
+        Err(error) => return Ok(producer_log_error(&error)),
+    }
     let mut of = id.to_owned();
     if hub.logs.size(&of, step).await == 0
         && let Some(from) = hub.store.reused_from(id.to_owned()).await?
@@ -2541,6 +2577,41 @@ async fn job_log_times(hub: &Hub, id: &str, q: &HashMap<String, String>) -> R {
     let size = hub.logs.size(&of, step).await;
     let times = hub.logs.times(&of, step).await;
     Ok(srv::json(StatusCode::OK, &json!({ "times": times, "size": size })))
+}
+
+// These errors describe the canonical producer read, never an empty compatibility file.
+fn producer_log_refusal(error: &anyhow::Error) -> (&'static str, StatusCode) {
+    match error.downcast_ref::<crate::logs::accepted::producer::ReadError>() {
+        Some(crate::logs::accepted::producer::ReadError::Pending) => ("log_pending", StatusCode::CONFLICT),
+        _ => ("log_unavailable", StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
+fn producer_log_error(error: &anyhow::Error) -> Response {
+    let (code, status) = producer_log_refusal(error);
+    srv::json(status, &json!({"error": code, "message": format!("{error:#}")}))
+}
+
+fn producer_log_headers(response: &mut Response, complete: bool, qualification: &str, prefix: Option<&crate::logs::accepted::Prefix>) -> anyhow::Result<()> {
+    let headers = response.headers_mut();
+    headers.insert("x-kiln-log-complete", header::HeaderValue::from_static(if complete { "1" } else { "0" }));
+    headers.insert("x-kiln-log-qualification", header::HeaderValue::from_str(qualification)?);
+    if let Some(prefix) = prefix {
+        headers.insert("x-kiln-log-view", header::HeaderValue::from_str(&prefix.view)?);
+        headers.insert("x-kiln-log-revision", header::HeaderValue::from_str(&prefix.revision.to_string())?);
+        headers.insert("x-kiln-log-root", header::HeaderValue::from_str(&prefix.root)?);
+    }
+    Ok(())
+}
+
+async fn producer_log_socket_error(tx: &mut ws::Sender, error: &anyhow::Error) -> anyhow::Result<()> {
+    let frame = match error.downcast_ref::<crate::logs::accepted::producer::ReadError>() {
+        Some(crate::logs::accepted::producer::ReadError::Pending) => LogDown::Pending { message: "Output is not complete yet. Reload to try again.".into() },
+        _ => LogDown::Unavailable { message: "Output is unavailable. Reload to try again.".into() },
+    };
+    tx.send(ws::text(frame.text())).await?;
+    tx.close(None).await.ok();
+    Ok(())
 }
 
 fn job_logs_ws(hub: Arc<Hub>, job: String, step: u32, req: Request) -> R {
@@ -2560,6 +2631,124 @@ fn job_logs_ws(hub: Arc<Hub>, job: String, step: u32, req: Request) -> R {
 }
 
 async fn stream_logs(hub: Arc<Hub>, job: String, step: u32, socket: ws::WebSocket, sock: &ui::Socket) -> anyhow::Result<()> {
+    match hub.logs.producer_snapshot(&job, false).await {
+        Ok(Some(_)) => stream_producer_logs(hub, job, step, socket, sock).await,
+        Ok(None) => stream_legacy_logs(hub, job, step, socket, sock).await,
+        Err(error) => {
+            let (mut tx, _) = socket.split();
+            producer_log_socket_error(&mut tx, &error).await?;
+            Err(error)
+        }
+    }
+}
+
+/// One cursor over the accepted raw step. Events wake it; their payloads never advance it.
+async fn stream_producer_logs(hub: Arc<Hub>, job: String, step: u32, socket: ws::WebSocket, sock: &ui::Socket) -> anyhow::Result<()> {
+    use crate::logs::accepted::producer::{RawReader, ReadError};
+    use futures::FutureExt as _;
+    let (mut tx, mut rx_ws) = socket.split();
+    // Subscribe BEFORE the authoritative snapshot. An append across that seam is either
+    // in the snapshot or a hint to extend it. Replayed hints never replay cursor bytes.
+    let mut rx = hub.logs.subscribe_existing(&job);
+    // Establish strict completion semantics before any binary bytes. A transport close
+    // without this capture's End must not become a completed log in an older UI path.
+    tx.send(ws::text(LogDown::Pending { message: "Reading output.".into() }.text())).await?;
+    let mut reader: Option<RawReader> = None;
+    let mut captured: Option<crate::logs::accepted::Prefix> = None;
+    let mut sent = 0_u64;
+    let mut lost = rx.is_none().then(|| "partial log has no live event publisher".to_owned());
+    let result: anyhow::Result<()> = async {
+        loop {
+            let snapshot = hub.logs.producer_snapshot(&job, false).await?
+                .ok_or_else(|| ReadError::Unavailable("registered log contract disappeared".into()))?;
+            anyhow::ensure!(sent <= snapshot.max_bytes, "captured log exceeds the configured bound");
+            match snapshot.prefix.as_ref() {
+                Some(prefix) => {
+                    if let Some(previous) = captured.as_ref() {
+                        anyhow::ensure!(prefix.view == previous.view && prefix.revision >= previous.revision
+                            && (prefix.revision != previous.revision || prefix.root == previous.root),
+                            "captured log view changed or regressed");
+                    }
+                    reader = match reader.take() {
+                        Some(current) => Some(current.extend(&hub.store, prefix.clone()).await?),
+                        None => RawReader::open(&hub.store, prefix.clone(), step).await?,
+                    };
+                    captured = Some(prefix.clone());
+                }
+                None if captured.is_some() => return Err(ReadError::Unavailable("accepted log head disappeared".into()).into()),
+                None => {},
+            }
+            while let Some(current) = reader.take() {
+                if current.done() {
+                    reader = Some(current);
+                    break;
+                }
+                let turn = current.advance(&hub.store, &hub.blobs.blobs).await?;
+                let bytes = u64::try_from(turn.bytes.len())?;
+                let next = sent.checked_add(bytes).ok_or_else(|| ReadError::Unavailable("captured log size overflow".into()))?;
+                anyhow::ensure!(next <= snapshot.max_bytes, "captured log exceeds the configured bound");
+                for chunk in turn.bytes.chunks(64 * 1024) {
+                    tx.send(ws::binary(Bytes::copy_from_slice(chunk))).await?;
+                }
+                sent = next;
+                reader = Some(turn.reader);
+            }
+            // Only this capture's own End plus its fully drained raw prefix closes the
+            // socket. Compatibility End/Closed and an empty partial head cannot do so.
+            if snapshot.complete {
+                if reader.is_none() {
+                    // Metadata completeness alone cannot qualify an empty body. The
+                    // canonical reader verifies the original empty-object marker now.
+                    let empty = hub.logs.read_producer(&job, step, true).await?
+                        .ok_or_else(|| ReadError::Unavailable("registered log contract disappeared".into()))?;
+                    if !empty.complete { return Err(ReadError::Pending.into()); }
+                    if empty.prefix.as_ref() != snapshot.prefix.as_ref() {
+                        let newer = match (snapshot.prefix.as_ref(), empty.prefix.as_ref()) {
+                            (Some(previous), Some(next)) => next.view == previous.view && next.revision > previous.revision,
+                            _ => false,
+                        };
+                        if newer { continue; } // Resnapshot/extend the same cursor, never send reread bytes.
+                        return Err(ReadError::Unavailable("captured empty log view changed".into()).into());
+                    }
+                    if !empty.bytes.is_empty() {
+                        return Err(ReadError::Unavailable("captured empty log step changed".into()).into());
+                    }
+                }
+                tx.send(ws::text(LogDown::End.text())).await?;
+                tx.close(None).await.ok();
+                return Ok(());
+            }
+            if let Some(why) = lost.take() {
+                return Err(ReadError::Unavailable(why).into());
+            }
+            let Some(rx) = rx.as_mut() else {
+                return Err(ReadError::Unavailable("partial log has no live event publisher".into()).into());
+            };
+            futures::select_biased! {
+                event = rx.recv().fuse() => match event {
+                    Ok(LogEvent::Accepted | LogEvent::Data { .. } | LogEvent::End) => {},
+                    Ok(LogEvent::Step { idx, status }) => {
+                        tx.send(ws::text(LogDown::Step { idx, status: status.to_owned() }.text())).await?;
+                    }
+                    Err(crate::bus::RecvError::Overflowed(_)) => {},
+                    Err(crate::bus::RecvError::Closed) => lost = Some("log event publisher closed before captured completion".to_owned()),
+                    Err(crate::bus::RecvError::Unavailable(why)) => lost = Some(why),
+                },
+                message = rx_ws.next().fuse() => {
+                    if hub.unread_only(sock, &mut tx, ui::came(message), |r| LogDown::Refused(r).text()).await? {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }.await;
+    if let Err(error) = &result {
+        producer_log_socket_error(&mut tx, error).await?;
+    }
+    result
+}
+
+async fn stream_legacy_logs(hub: Arc<Hub>, job: String, step: u32, socket: ws::WebSocket, sock: &ui::Socket) -> anyhow::Result<()> {
     use futures::FutureExt as _;
     let (mut tx, mut rx_ws) = socket.split();
     let live = hub.logs.is_live(&job);
@@ -2577,7 +2766,7 @@ async fn stream_logs(hub: Arc<Hub>, job: String, step: u32, socket: ws::WebSocke
         futures::select_biased! {
             ev = rx.recv().fuse() => match ev {
                 Ok(LogEvent::Data { idx, data }) if idx == step => tx.send(ws::binary(data)).await?,
-                Ok(LogEvent::Data { .. }) => {}
+                Ok(LogEvent::Data { .. } | LogEvent::Accepted) => {}
                 Ok(LogEvent::Step { idx, status }) => {
                     tx.send(ws::text(LogDown::Step { idx, status: status.to_owned() }.text())).await?;
                 }

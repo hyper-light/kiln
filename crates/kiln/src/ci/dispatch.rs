@@ -32,6 +32,14 @@ pub use cancellation::CancelError;
 pub use executors::ExecutorOrigin;
 pub(crate) use executors::{ExecutorGrant, executor_grant, bind_pod_enrollment, hold_pod_retirement};
 
+pub(crate) fn ordinary_log_no_start(c:&crate::sql::Connection<'_>,owner:&wire::OrdinaryOwnerV1)->anyhow::Result<bool> {
+    ordinary::log_no_start(c,owner)
+}
+
+pub(crate) fn ordinary_log_registration(c:&crate::sql::Connection<'_>,job:&str,attempt:u32)->anyhow::Result<Option<(wire::OrdinaryOwnerV1,Option<wire::JobLogContractV1>)>> {
+    ordinary::log_registration(c,job,attempt)
+}
+
 pub use retained::quarantine_run;
 
 use super::runs;
@@ -230,7 +238,68 @@ fn unresolved(steps: &[kiln_ci::wf::ir::Step], actions: &std::collections::BTree
 
 /// The `log:` patterns of a leg's retry policy (W05-R14) that its attempt's log has, its steps'
 /// logs read in turn.
-async fn log_hits(hub: &Hub, leg: &str, patterns: &[String]) -> Vec<String> {
+async fn log_hits(hub: &Hub, leg: &str, patterns: &[String]) -> anyhow::Result<Vec<String>> {
+    use crate::logs::accepted::producer::{RawReader, ReadError};
+    let Some(snapshot) = hub.logs.producer_snapshot(leg, true).await? else {
+        return Ok(legacy_log_hits(hub, leg, patterns).await);
+    };
+    // Snapshot(true) requires the original producer's captured End, including the
+    // explicit zero baseline. Absence/unavailability never becomes a false empty match.
+    anyhow::ensure!(snapshot.complete, "producer log completion was not captured");
+    let Some(prefix) = snapshot.prefix else {
+        let empty = hub.logs.read_producer(leg, 0, true).await?
+            .ok_or_else(|| ReadError::Unavailable("registered log contract disappeared".into()))?;
+        if !empty.complete { return Err(ReadError::Pending.into()); }
+        if empty.prefix.is_some() || !empty.bytes.is_empty() {
+            return Err(ReadError::Unavailable("captured empty log baseline changed".into()).into());
+        }
+        return Ok(Vec::new());
+    };
+    let mut after = None;
+    let mut read = 0_u64;
+    let mut hits = Vec::new();
+    loop {
+        let page = hub.logs.producer_step_page(prefix.clone(), after).await?;
+        if page.is_empty() {
+            if after.is_none() {
+                let empty = hub.logs.read_producer(leg, 0, true).await?
+                    .ok_or_else(|| ReadError::Unavailable("registered log contract disappeared".into()))?;
+                if !empty.complete { return Err(ReadError::Pending.into()); }
+                if empty.prefix.as_ref() != Some(&prefix) || !empty.bytes.is_empty() {
+                    return Err(ReadError::Unavailable("captured empty log catalog changed".into()).into());
+                }
+            }
+            break;
+        }
+        for (revision, step) in page {
+            anyhow::ensure!(after.is_none_or(|old| revision > old), "producer step cursor did not advance");
+            after = Some(revision);
+            let mut reader = RawReader::open(&hub.store, prefix.clone(), step).await?
+                .ok_or_else(|| ReadError::Unavailable("captured producer step disappeared".into()))?;
+            let mut bytes = Vec::new();
+            while !reader.done() {
+                let turn = reader.advance(&hub.store, &hub.blobs.blobs).await?;
+                read = read.checked_add(u64::try_from(turn.bytes.len())?)
+                    .ok_or_else(|| ReadError::Unavailable("captured log size overflow".into()))?;
+                anyhow::ensure!(read <= snapshot.max_bytes, "captured log exceeds the configured bound");
+                bytes.extend_from_slice(&turn.bytes);
+                reader = turn.reader;
+            }
+            // Existing retry matching is plain text; its input is now this one captured
+            // raw prefix, never a mutable compatibility file or a step-table omission.
+            let text = super::logsearch::plain(&bytes);
+            for pattern in patterns {
+                if !hits.contains(pattern) && text.contains(pattern.as_str()) {
+                    hits.push(pattern.clone());
+                }
+            }
+            if hits.len() == patterns.len() { return Ok(hits); }
+        }
+    }
+    Ok(hits)
+}
+
+async fn legacy_log_hits(hub: &Hub, leg: &str, patterns: &[String]) -> Vec<String> {
     let id = leg.to_owned();
     let steps: Vec<u32> = hub
         .store
@@ -2977,6 +3046,18 @@ impl Dispatch {
                 anyhow::bail!("ordinary reservation could not be positively invalidated before claim");
             }
             a.ordinary_owner = Some(owner.clone());
+            // U05: selection uses this SAME captured runner. Keep/debug and foreign
+            // owners retain their unchanged legacy route until their real binding exists.
+            if captured.wide_caps()&crate::proto::CAP_JOB_LOG_V1!=0 && !a.debug.keep_on_failure_minutes.is_some_and(|minutes|minutes>0) {
+                a.log_contract=Some(wire::JobLogContractV1 {version:1,capture_limit:a.limits.log_bytes});
+                if let Err(error)=crate::proto::job_log::assignment_binding(&a,captured.wide_caps()) {
+                    if self.hub.abort_ordinary_command(&token) {
+                        return self.fail_unstarted(leg,attempt,"logs",format!("required producer log contract refused before exposure: {error:#}")).await;
+                    }
+                    self.admission.ready=false;
+                    return Err(error.context("producer contract refusal lacks positive original token invalidation; admission remains held"));
+                }
+            }
             Some((captured,token,owner,allocation))
         } else { None };
         // A definite encode failure predates the durable claim. Positively retire
@@ -3001,8 +3082,8 @@ impl Dispatch {
         // an exec into the pod, not a shell on a machine (W17-R01).
         let recorded = if self.hub.pod_executors.lock().contains_key(runner) { "k8s" } else { executor.as_deref().unwrap_or("host") };
         if let Some((_,token,owner,allocation)) = &ordinary {
-            match self.claim_ordinary(owner.clone(),allocation.clone(),recorded).await {
-                Ok(Ok(())) => {},
+            match self.claim_ordinary(owner.clone(),allocation.clone(),recorded,a.log_contract.clone()).await {
+                Ok(Ok(())) => {self.hub.logs.producer_progress();},
                 Ok(Err(refusal)) => {
                     // Only the successful writer's closed pre-write disposition can
                     // use this path. No ambiguity is reclassified as admission Full.
@@ -3220,6 +3301,7 @@ impl Dispatch {
             attempt,
             parent_binding: None,
             ordinary_owner: None,
+            log_contract: None,
             repo: r.repo.name.clone(),
             sha: r.event.sha.clone(),
             git_ref: r.event.git_ref.clone(),
@@ -3435,7 +3517,7 @@ impl Dispatch {
                 // The retry policy's `log:` patterns the attempt's log has (W05-R14).
                 let patterns: Vec<String> = l.spec.def().and_then(|j| j.kiln.retry.as_ref()).and_then(RetryPolicy::from_yval).map(|p| p.on.into_iter().filter_map(|o| if let RetryOn::Log(s) = o { Some(s) } else { None }).collect()).unwrap_or_default();
                 let class = l.class.unwrap_or(FailureClass::Failure);
-                let log_hits = if patterns.is_empty() { Vec::new() } else { log_hits(&self.hub, &r.job, &patterns).await };
+                let log_hits = if patterns.is_empty() { Vec::new() } else { log_hits(&self.hub, &r.job, &patterns).await? };
                 Outcome::Failed(Failed { class, exit_code: r.exit_code, log_hits })
             }
         };
@@ -3488,6 +3570,15 @@ impl Dispatch {
 
     async fn completion(&mut self, agent: &str, job: &str, attempt: u32) -> anyhow::Result<()> {
         let Some(result) = runs::completion(&self.hub, job, attempt, agent).await? else { return Ok(()) };
+        let (original_job,original_agent)=(job.to_owned(),agent.to_owned());
+        let logs_ready=self.hub.store.call(move |c|runs::completion_logs_ready(c,&original_job,attempt,&original_agent)).await?;
+        if !logs_ready {
+            // U05: the original result remains in the existing completion ledger.
+            // A producer close receipt wakes this SAME dispatcher; no log retry worker
+            // or result re-enqueue is created. Positive physical proof returns capacity
+            // independently, before this logical result/effect gate.
+            return Ok(());
+        }
         if self.legs.get(job).is_some_and(|l| l.attempt == attempt && l.agent.as_deref() == Some(agent)) {
             self.finished(agent, result).await?;
         }
@@ -3531,7 +3622,10 @@ impl Dispatch {
             Ok(value) => value,
             Err(error) => { tracing::warn!(error = %format!("{error:#}"), "deleted ordinary job retains its original allocation"); return; },
         };
-        let reservation = if let Some((_,reservation)) = ordinary { reservation } else if let Some(agent) = self.legs.get(leg).and_then(|l| l.agent.clone()) {
+        // A negative original disposition is still owned: never remove/retry it as
+        // though the required capture or terminal acceptance had committed.
+        if matches!(&ordinary,Some((false,_))) {return;}
+        let reservation = if let Some((true,reservation)) = ordinary { reservation } else if let Some(agent) = self.legs.get(leg).and_then(|l| l.agent.clone()) {
             match self.prepare_retained(&agent, leg, attempt).await {
                 Ok(reservation) => reservation,
                 Err(e) => {
@@ -3899,7 +3993,14 @@ impl Dispatch {
                 // hold one of its slots for good.
                 (Status::Running, Some(a)) => {
                     self.next.extend(self.sched.handle(Input::LegRunning { leg: Box::new(li), runner: a, attempt: attempt.max(1) }, now_ms()));
-                    if let Some(journal) = self.ordinary_record(&id,attempt.max(1)).await? && journal.logical != "running" {
+                    let journal = self.ordinary_record(&id,attempt.max(1)).await?;
+                    if let Some(journal) = &journal && journal.physical != "pending" {
+                        anyhow::ensure!(self.legs.get(&id).and_then(|l| l.agent.as_deref()) == Some(journal.owner.host.as_str()), "ordinary physical replay changed its original assigned host");
+                        // Conservative re-adoption above acquires a charge. The SAME durable
+                        // positive journal proof returns it before any placement is exposed.
+                        self.next.extend(self.sched.handle(Input::OrdinaryExecutionReleased { leg:id.clone(),attempt:attempt.max(1),runner:journal.owner.host.clone() },now_ms()));
+                    }
+                    if let Some(journal) = journal && journal.logical != "running" {
                         let outcome = if journal.logical == "lost" { Outcome::Failed(Failed { class:FailureClass::RunnerLost,exit_code:None,log_hits:Vec::new() }) } else {
                             let key = id.clone();let number = attempt.max(1);
                             let (conclusion,class,exit): (String,Option<String>,Option<i32>) = self.hub.store.call(move |c| Ok(c.query_row("SELECT conclusion,failure_class,exit_code FROM ci_attempts WHERE leg_id=?1 AND number=?2 AND status='done'",crate::sql::params![key,number],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?)).await?;
@@ -4279,13 +4380,13 @@ mod tests {
             let id = |key: &str| before.iter().find(|j| j.key == key).map(|j| j.id.clone()).ok_or_else(|| anyhow::anyhow!("missing fixture job {key}"));
             let (running, dependent) = (id("b")?, id("a")?);
             let report = JobResult { job: running.clone(), status: Status::Succeeded, exit_code: Some(0), error: None, peak_rss: Some(4096), cpu_seconds: Some(0.5) };
-            assert!(runs::stage_completion(&hub, "another-runner", &report, Some(1)).await?.is_none());
-            assert!(runs::stage_completion(&hub, "old-runner", &report, Some(2)).await?.is_none());
-            let receipt = runs::stage_completion(&hub, "old-runner", &report, Some(1)).await?.ok_or_else(|| anyhow::anyhow!("completion was not staged"))?;
+            assert!(runs::stage_completion(&hub, "another-runner", &report, Some(1), None).await?.is_none());
+            assert!(runs::stage_completion(&hub, "old-runner", &report, Some(2), None).await?.is_none());
+            let receipt = runs::stage_completion(&hub, "old-runner", &report, Some(1), None).await?.ok_or_else(|| anyhow::anyhow!("completion was not staged"))?;
             assert_eq!(receipt.1, 1, "a legacy report has its canonical attempt before import");
             let mut duplicate = report.clone();
             duplicate.status = Status::Failed;
-            runs::stage_completion(&hub, "old-runner", &duplicate, Some(1)).await?;
+            runs::stage_completion(&hub, "old-runner", &duplicate, Some(1), None).await?;
             let dispatcher = || Dispatch {
                 hub: Arc::clone(&hub), sched: Scheduler::new(sched_config(&hub, Vec::new())), routing: Default::default(),
                 held: HashMap::new(), runs: HashMap::new(), legs: HashMap::new(), timers: BTreeSet::new(), next: Vec::new(),
@@ -4368,8 +4469,8 @@ mod tests {
             assert!(d.legs.contains_key(&dependent), "the shared dispatcher owns the released job");
             assert_eq!(after.iter().find(|j| j.id == running).map(|j| j.status), Some(Status::Succeeded));
             assert!(runs::pending_completions(&hub).await?.is_empty(), "the receipt is retired after its outcome is durable");
-            assert_eq!(runs::stage_completion(&hub, "old-runner", &report, Some(1)).await?, Some(receipt.clone()), "a lost acknowledgement is safe after the plan has committed");
-            assert!(runs::stage_completion(&hub, "old-runner", &report, Some(2)).await?.is_none(), "a receipt never acknowledges a different attempt");
+            assert_eq!(runs::stage_completion(&hub, "old-runner", &report, Some(1), None).await?, Some(receipt.clone()), "a lost acknowledgement is safe after the plan has committed");
+            assert!(runs::stage_completion(&hub, "old-runner", &report, Some(2), None).await?.is_none(), "a receipt never acknowledges a different attempt");
             assert!(runs::pending_completions(&hub).await?.is_empty(), "terminal retries do not reapply completion");
             d.completion("old-runner", &running, receipt.1).await?;
             assert_eq!(hub.store.jobs("recoverable".into(), false).await?.len(), before.len(), "receipt replay is idempotent");

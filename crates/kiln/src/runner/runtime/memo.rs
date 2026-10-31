@@ -906,7 +906,7 @@ mod tests {
             ..AssignmentV2::default()
         };
         let (tx, rx) = async_channel::unbounded();
-        let l = Leg { a, work_dir: work.to_path_buf(), runner_name: "runner-a".into(), up: Uplink(tx), cancel: Shutdown::new(), http: Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None, legacy: None };
+        let l = Leg { a, work_dir: work.to_path_buf(), runner_name: "runner-a".into(), up: Uplink(tx), cancel: Shutdown::new(), http: Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None, legacy: None, producer: None };
         let result = l.run_in(admission.clone()).await;
         let (mut logs, mut events) = (BTreeMap::<u32, String>::new(), Vec::new());
         while let Ok(m) = rx.try_recv() {

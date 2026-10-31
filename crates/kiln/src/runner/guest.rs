@@ -644,7 +644,7 @@ async fn run_owned(start: LegStart, a: kiln_ci::wire::AssignmentV2, conn: UnixSt
         http,
         warm: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         cache_max: start.cache_max,
-        legacy: None,
+        legacy: None, producer: None,
     };
     // U03: this child fences local spawns but owns no host grant or kernel domain. Its result
     // is provisional; only the host can prove the VMM's physical domain has stopped.

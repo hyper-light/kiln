@@ -69,6 +69,84 @@ impl OrdinaryFrontierAckV1 {
     }
 }
 
+// U05 held phase1 contract; capability reservation does not advertise readiness.
+// Data is not authority: only the existing authenticated native admission constructs
+// the producer owner after matching the SAME original Execution and ordinary stamp.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobLogContractV1 { pub version: u8, pub capture_limit: u64 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobLogBindingV1 { pub contract: JobLogContractV1, pub owner: OrdinaryOwnerV1 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobLogChunkV1 {
+    pub binding: JobLogBindingV1,
+    pub seq: u64,
+    pub step: u32,
+    pub offset: u64,
+    pub previous_root: [u8; 32],
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobLogRefusalV1 { Unsupported, Malformed, Conflict, StaleOwner, Full, Incomplete, Unavailable }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobLogCaptureV1 {
+    Complete,
+    Truncated { limit: u64, discarded_bytes: u64 },
+    Incomplete { code: JobLogRefusalV1, why: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobLogEndV1 {
+    pub binding: JobLogBindingV1,
+    pub final_seq: u64,
+    pub captured_bytes: u64,
+    pub root: [u8; 32],
+    // EXACT proto::encode(JobResult), <=65536 bytes; no kiln-ci -> kiln dependency.
+    pub result: Vec<u8>,
+    pub result_hash: [u8; 32],
+    pub capture: JobLogCaptureV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobLogPrefixV1 { pub view: String, pub revision: i64, pub root: String }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobLogViewV1 { ProducerOnly, Captured(JobLogPrefixV1) }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobLogReceiptV1 {
+    pub binding_id: [u8; 32],
+    // Chunk n has item_seq=chunk_seq=n. End has item_seq=chunk_seq+1.
+    pub item_seq: u64,
+    pub chunk_seq: u64,
+    pub captured_bytes: u64,
+    pub root: [u8; 32],
+    pub operation: String,
+    pub view: JobLogViewV1,
+    // Some iff this is the positive own durable End receipt.
+    pub result_hash: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobLogReplyV1 {
+    Committed(JobLogReceiptV1),
+    Refused { binding_id: [u8; 32], item_seq: u64, code: JobLogRefusalV1, why: String },
+    Unknown { binding_id: [u8; 32], item_seq: u64, operation: Option<String>, why: String },
+}
+
 /// One leg for a runner.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -84,6 +162,9 @@ pub struct AssignmentV2 {
     /// U01/U03: native, non-pooled, negotiated ordinary ownership only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ordinary_owner: Option<OrdinaryOwnerV1>,
+    /// U05: required captured-output contract. Ordinary callers leave this absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_contract: Option<JobLogContractV1>,
     /// `owner/name`.
     pub repo: String,
     pub sha: String,

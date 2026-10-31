@@ -22,6 +22,9 @@ pub enum LogEvent {
     Data { idx: u32, data: Bytes },
     Step { idx: u32, status: String },
     End,
+    /// Same-topic resnapshot hint after an own canonical append/close receipt. It carries
+    /// no bytes or completion authority; strict readers consult the immutable prefix.
+    Accepted,
 }
 
 struct Live {
@@ -55,6 +58,9 @@ impl Projection {
     fn max_bytes(&self)->u64 {self.max_bytes}
     fn append(&self,job:&str,step:u32,bytes:&[u8]) {self.logs().project(job,step,bytes)}
     fn finish(&self,job:&str) {self.logs().finish_projection(job)}
+    fn accepted(&self,job:&str) {
+        self.logs().with_live(job,|live|{let _=live.tx.send(LogEvent::Accepted);});
+    }
     async fn delete_capture(&self,job:&str)->anyhow::Result<String> {
         let path=self.logs().job_dir(job);
         crate::rt::blocking(move ||Ok(serde_json::to_string(&directory_identity(&path)?)?)).await?
@@ -332,6 +338,12 @@ impl Logs {
     /// in between (viewers may see a few bytes twice at the seam, never miss any).
     pub fn subscribe(&self, job: &str) -> crate::bus::Receiver<LogEvent> {
         self.with_live(job, |live| live.tx.subscribe())
+    }
+    /// Observe an existing publisher without creating a compatibility Live/topic. Strict
+    /// readers resnapshot canonical state after subscribing and refuse an absent publisher
+    /// while incomplete; a completed immutable read needs no new live object.
+    pub(crate) fn subscribe_existing(&self,job:&str)->Option<crate::bus::Receiver<LogEvent>> {
+        self.live.lock().get(job).map(|live|live.tx.subscribe())
     }
 
     pub fn is_live(&self, job: &str) -> bool {

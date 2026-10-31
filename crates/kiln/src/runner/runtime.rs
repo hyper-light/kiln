@@ -49,6 +49,8 @@ pub struct Leg {
     /// U03: local transport adaptation for an assignment from a pre-workflow server. The
     /// common runtime owns execution; this supplies only its source/artifact endpoints.
     pub(crate) legacy: Option<std::sync::Arc<crate::exec::Exec>>,
+    /// Only Agent's original native Gate+Spool preparation supplies this writer.
+    pub(crate) producer: Option<std::sync::Arc<crate::agent::retained::logs::Writer>>,
 }
 
 /// What a step runs: a script under a shell, or a program (an action's `node main.js`).
@@ -1033,6 +1035,9 @@ impl Leg {
     }
 
     pub async fn run(self) -> JobResult {
+        if self.a.log_contract.is_some() && !self.producer.as_ref().is_some_and(|producer|self.a.ordinary_owner.as_ref()==Some(&producer.binding().owner) && self.a.log_contract.as_ref()==Some(&producer.binding().contract)
+            && super::processes::current().is_some_and(|execution|execution.identity()==producer.binding().owner.execution && execution.require_native_attempt(&self.a.job_id,self.a.attempt).is_ok()))
+        {return JobResult{job:self.a.job_id.clone(),status:Status::Failed,exit_code:None,error:Some("required producer logs have no original admitted native writer".into()),peak_rss:None,cpu_seconds:None};}
         if super::processes::current().is_none() {
             let attempt = self.legacy.is_none().then_some(self.a.attempt);
             let execution = super::processes::Execution::new(self.work_dir.clone(), self.a.job_id.clone(), attempt);
@@ -1098,8 +1103,8 @@ impl Leg {
         drop(tools);
         let (status, error) = match r {
             Ok(Ok(s)) => (s, None),
-            Ok(Err(e)) => (Status::Failed, Some(format!("{e:#}"))),
-            Err(_) => (Status::Failed, Some("the runtime failed unexpectedly".into())),
+            Ok(Err(e)) => {if let Some(producer)=&self.producer{producer.incomplete("the original runtime returned before all capture paths completed");}(Status::Failed, Some(format!("{e:#}")))},
+            Err(_) => {if let Some(producer)=&self.producer{producer.incomplete("the original runtime failed before all writers joined");}(Status::Failed, Some("the runtime failed unexpectedly".into()))},
         };
         // How long a trusted leg of a warm job took here, warm or cold: its lane's history, for
         // placement (W24-R18). An untrusted leg's time says nothing anyone may plan by.
@@ -1191,11 +1196,22 @@ impl Leg {
     }
 
     async fn log(&self, idx: u32, data: Vec<u8>) {
+        let capture=match &self.producer {
+            Some(producer)=>match producer.capture(){Ok(capture)=>Some(capture),Err(error)=>{tracing::warn!(error=%error,"original producer is no longer open");self.cancel.cancel();return}},
+            None=>None,
+        };
         if !data.is_empty() {
             for piece in data.chunks(LOG_CHUNK) {
-                self.up.log(&self.a.job_id, idx, piece.to_vec()).await;
+                if let Some(producer)=&self.producer {
+                    if let Err(error)=producer.log(&self.up,idx,piece.to_vec()).await {
+                        producer.incomplete("original output could not complete its durable handoff");
+                        tracing::warn!(error=%format!("{error:#}"),"required captured output remains incomplete");
+                        self.cancel.cancel();return;
+                    }
+                }else{self.up.log(&self.a.job_id, idx, piece.to_vec()).await;}
             }
         }
+        if let Some(capture)=capture{capture.finish();}
     }
 
     /// Prepares the leg's integrations (W11-R03): their files and variables, their ID tokens
@@ -1326,7 +1342,8 @@ impl Leg {
     }
 
     async fn note(&self, idx: u32, text: &str) {
-        self.up.note(&self.a.job_id, idx, text).await;
+        if self.producer.is_some(){self.log(idx,format!("\x1b[2m[kiln] {text}\x1b[0m\r\n").into_bytes()).await;}
+        else{self.up.note(&self.a.job_id, idx, text).await;}
     }
 
     /// The environment the tools a built-in runs get, as a step's: the leg's variables, GitHub's
@@ -2088,7 +2105,16 @@ impl Leg {
                 p = turns.acquire().fuse() => Some(p),
             };
             let end = match permit {
-                Some(_turn) => self.step(&mut s, idx, step, deadline, false).await,
+                Some(_turn) => {
+                    // Reserve an independent original input slot BEFORE this background
+                    // flow can spawn/read. No data is held by a cancelable credit wait.
+                    if let Some(producer)=&self.producer {
+                        match producer.fork().await{
+                            Ok(writer)=>{let mut leg=self.clone();leg.producer=Some(writer);leg.step(&mut s,idx,step,deadline,false).await},
+                            Err(error)=>{self.annotate(idx,"error",&format!("required capture flow refused: {error:#}")).await;Some(End::Exit(Some(1)))},
+                        }
+                    }else{self.step(&mut s,idx,step,deadline,false).await}
+                },
                 None => {
                     let name = step.id.clone().unwrap_or_else(|| "a background step".into());
                     self.start(idx, &name, if step.uses.is_some() { "uses" } else { "run" }, step.uses.clone()).await;
@@ -2925,6 +2951,9 @@ impl Leg {
 
     /// Runs a script or a program and processes what it prints and writes (W06-R05 to W06-R08).
     async fn exec(&self, st: &mut State, idx: u32, what: Run<'_>, wd: &Path, mut env: BTreeMap<String, String>, deadline: Instant) -> anyhow::Result<Ran> {
+        // RAM credit belongs to this explicit flow before child/read effects. Losing
+        // the whole reader still records Incomplete, never a fabricated joined capture.
+        let captured=self.producer.as_ref().map(|producer|producer.capture()).transpose()?;
         let id = crate::util::new_id();
         let in_job = st.containers.as_ref().and_then(|c| c.job.as_ref()).is_some() && !matches!(what, Run::Container { .. });
         // A test build's OOM killer (W22-AC04): a step on the host, killed so long after it starts.
@@ -3090,7 +3119,8 @@ impl Leg {
                 // Daemons keep the pipes open: drain briefly once the step itself exited.
                 match crate::rt::timeout(Duration::from_secs(2), running.output.recv()).await {
                     Ok(Ok(c)) => self.feed(st, idx, &mut r, &c).await,
-                    Ok(Err(_)) | Err(_) => output_done = true,
+                    Ok(Err(_)) => output_done = true,
+                    Err(_) => {if let Some(producer)=&self.producer{producer.incomplete("an original output pipe did not drain before its finite deadline");}output_done=true;},
                 }
                 continue;
             }
@@ -3160,6 +3190,7 @@ impl Leg {
         }
         let tail = st.masker.finish();
         self.log(idx, tail).await;
+        if let Some(captured)=captured{captured.finish();}
         // The environment files (W06-R07).
         let read = |p: &PathBuf| std::fs::read_to_string(p).unwrap_or_default();
         let get = |k: &str| files.iter().find(|(x, _)| *x == k).map(|(_, p)| p.clone()).unwrap_or_default();
@@ -5584,7 +5615,7 @@ mod tests {
         tweak(&mut a);
         use crate::exec::Up;
         let (tx, rx) = async_channel::unbounded();
-        let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None, legacy: None };
+        let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None, legacy: None, producer: None };
         let result = crate::rt::block_on(async move { Ok(leg.run_in(crate::runner::processes::Admission::private(&tempfile::tempdir()?.keep())?).await) })?;
         let (mut logs, mut events) = (BTreeMap::<u32, String>::new(), Vec::new());
         while let Ok(m) = rx.try_recv() {
@@ -5882,7 +5913,7 @@ runs:
                 http: std::sync::Arc::new(crate::http::client::Client::public()?),
                 warm: Default::default(),
                 cache_max: None,
-                legacy: None,
+                legacy: None, producer: None,
             })
         };
         let dir = tmp.path().join("_actions/cargo-bins/cargo-binstall/dc19f1e4");
@@ -6085,7 +6116,7 @@ jobs:
         let tmp = tempfile::tempdir()?;
         let a = AssignmentV2 { job_id: "leg-p".into(), repo: "acme/app".into(), dialect: "gha".into(), ..AssignmentV2::default() };
         let (tx, _rx) = async_channel::unbounded();
-        let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None, legacy: None };
+        let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None, legacy: None, producer: None };
         let l = Layout::new(tmp.path(), "leg-p", "acme/app", None);
         let map = leg.container_map(&l);
         assert_eq!(map.translate(&l.workspace.to_string_lossy()), "/__w/app/app");
@@ -6114,7 +6145,7 @@ jobs:
                 http: std::sync::Arc::new(crate::http::client::Client::public()?),
                 warm: Default::default(),
                 cache_max: None,
-                legacy: None,
+                legacy: None, producer: None,
             })
         };
         let leg = leg_of("kiln/runner-ubuntu-24.04")?;
@@ -6178,7 +6209,7 @@ jobs:
         let a = AssignmentV2 { job_id: "leg-c".into(), repo: "acme/app".into(), dialect: "gha".into(), steps: job.steps.clone(), timeout_minutes: 5, ..AssignmentV2::default() };
         let (tx, rx) = async_channel::unbounded();
         let cancel = Shutdown::new();
-        let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: cancel.clone(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None, legacy: None };
+        let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: cancel.clone(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None, legacy: None, producer: None };
         let result = crate::rt::block_on(async move {
             crate::rt::spawn(async move {
                 let until = Instant::now() + Duration::from_secs(120);
@@ -6618,7 +6649,7 @@ jobs:
                 ..AssignmentV2::default()
             };
             let (tx, rx) = async_channel::unbounded();
-            let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None, legacy: None };
+            let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None, legacy: None, producer: None };
             let admission = admission.clone();
             let result = crate::rt::block_on(async move { Ok(leg.run_in(admission).await) })?;
             let mut log = String::new();
@@ -6668,7 +6699,7 @@ jobs:
                 ..AssignmentV2::default()
             };
             let (tx, rx) = async_channel::unbounded();
-            let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None, legacy: None };
+            let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None, legacy: None, producer: None };
             let admission = admission.clone();
             let result = crate::rt::block_on(async move { Ok(leg.run_in(admission).await) })?;
             let mut log = String::new();

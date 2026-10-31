@@ -1,6 +1,8 @@
 //! U03: retained evidence outbox in the runner's existing shared Amphora Records.
 //! Completion receipts and process lifetimes never retire this independent evidence.
 
+pub(crate) mod logs;
+
 use std::sync::Arc;
 use kiln_seams::records::{Cond, Consistency, Records, Refusal, Scan, Tx, Write};
 use serde::{Deserialize, Serialize};
@@ -567,6 +569,124 @@ mod tests {
                 job: format!("ordinary-{n}"), attempt: 1, host: "host-fixture".into(), process_nonce: "process-fixture".into(), publication_epoch: "epoch-fixture".into(), connection: "a".repeat(64),
                 command: kiln_ci::wire::OrdinaryCommandV1 { stream: "l:7.1".into(), seq: n } };
             let ack = |through| OrdinaryFrontierAckV1 { kind: "ordinary_frontier".into(), version: 1, epoch: "epoch-fixture".into(), through };
+            // U05: actual original native Gate + SAME Records. A lost local reply
+            // reconciles the exact committed slot; no generic delivery ACK deletes it.
+            let owner=ordinary_owner(9000);
+            let execution=crate::runner::processes::Execution::ordinary_in(admission.clone(),std::path::absolute("producer-log-fixture")?,owner.clone())?;
+            let binding=crate::proto::JobLogBindingV1{contract:crate::proto::JobLogContractV1{version:1,capture_limit:5},owner};
+            let producer=restarted.register_job_log(binding.clone(),&execution).await?;
+            let writer=producer.foreground();
+            let (tx,rx)=async_channel::bounded(1);let up=crate::exec::Uplink(tx);
+            let mut write=Box::pin(writer.log(&up,4,b"abc".to_vec()));
+            assert!(futures::poll!(write.as_mut()).is_pending());
+            let crate::exec::Up::JobLog(id)=rx.recv().await? else{anyhow::bail!("fixture lost original producer input")};
+            assert_eq!(id,crate::proto::job_log::binding_id(&binding)?);
+            let input=producer.pending().ok_or_else(||anyhow::anyhow!("fixture lost original producer input"))?;
+            assert!(Arc::ptr_eq(&producer.pending().ok_or_else(||anyhow::anyhow!("producer lost its pending input"))?,&input));
+            restarted.publish_job_log(&input).await?;
+            let original=input.published().flatten().ok_or_else(||anyhow::anyhow!("producer item was not published"))?;
+            restarted.publish_job_log(&input).await?; // original commit completed, its reply was lost
+            assert_eq!(input.published().flatten(),Some(original.clone()));
+            assert!(restarted.job_log_debt().await?);
+            producer.complete(&input)?;write.await?;
+            let mut write=Box::pin(writer.log(&up,7,b"defgh".to_vec()));
+            assert!(futures::poll!(write.as_mut()).is_pending());
+            let crate::exec::Up::JobLog(id)=rx.recv().await? else{anyhow::bail!("fixture lost second producer input")};
+            assert_eq!(id,crate::proto::job_log::binding_id(&binding)?);
+            let input=producer.pending().ok_or_else(||anyhow::anyhow!("fixture lost second producer input"))?;
+            restarted.publish_job_log(&input).await?;producer.complete(&input)?;write.await?;
+            let result=crate::proto::JobResult{job:binding.owner.job.clone(),status:crate::store::Status::Succeeded,exit_code:Some(0),error:None,peak_rss:None,cpu_seconds:Some(0.0)};
+            let mut end_wait=Box::pin(producer.end(&up,&result));
+            assert!(futures::poll!(end_wait.as_mut()).is_pending());
+            let crate::exec::Up::JobLog(id)=rx.recv().await? else{anyhow::bail!("fixture lost original producer End")};
+            assert_eq!(id,crate::proto::job_log::binding_id(&binding)?);
+            let input=producer.pending().ok_or_else(||anyhow::anyhow!("fixture lost original producer End"))?;
+            restarted.publish_job_log(&input).await?;
+            let Some(Some(crate::wire::channel::Frame::Item{seq,body,..}))=input.published() else{anyhow::bail!("fixture End not retained")};
+            let crate::proto::AgentMsg::JobLogEndV1(end)=crate::proto::read_agent(&body).map_err(|e|anyhow::anyhow!(e.why("producer fixture End")))? else{anyhow::bail!("fixture retained wrong item")};
+            assert_eq!((seq,end.final_seq,end.captured_bytes),(3,2,5));
+            assert_eq!(end.capture,crate::proto::JobLogCaptureV1::Truncated{limit:5,discarded_bytes:3});
+            producer.complete(&input)?;end_wait.await?;
+            let id=crate::proto::job_log::binding_id(&binding)?;
+            let pending=crate::wire::keep::load_out(&*records,"server").await?;
+            assert_eq!(pending.iter().find(|row|row.stream==crate::proto::job_log::stream(&binding).unwrap_or_default()).map(|row|row.pending.len()),Some(3));
+            let unknown=crate::proto::JobLogReplyV1::Unknown{binding_id:id,item_seq:seq,operation:Some(crate::proto::job_log::stable_operation(&id,seq)?),why:"lost canonical reply".into()};
+            assert!(restarted.receive_job_log(&binding,&unknown).await.is_err());
+            assert!(matches!(restarted.clean_job_log_page(&binding).await?,logs::Clean::Waiting));
+            let receipt=crate::proto::JobLogReceiptV1{binding_id:id,item_seq:seq,chunk_seq:2,captured_bytes:5,root:end.root,operation:crate::proto::job_log::stable_operation(&id,seq)?,view:crate::proto::JobLogViewV1::Captured(crate::proto::JobLogPrefixV1{view:"original-view".into(),revision:1,root:"a".repeat(64)}),result_hash:Some(end.result_hash)};
+            let mut wrong=receipt.clone();wrong.root=[9;32];
+            let before=records.head().await?;
+            assert!(restarted.receive_job_log(&binding,&crate::proto::JobLogReplyV1::Committed(wrong)).await.is_err());
+            assert_eq!(records.head().await?,before);
+            let ack=restarted.receive_job_log(&binding,&crate::proto::JobLogReplyV1::Committed(receipt)).await?;
+            assert_eq!(ack.upto,3);
+            assert!(matches!(restarted.clean_job_log_page(&binding).await?,logs::Clean::Finished));
+            assert!(!restarted.job_log_debt().await?);
+            // No OS child was launched by this metadata fixture; close that SAME Gate
+            // NoStart rather than fabricate a stopped kernel owner.
+            execution.close_ordinary_admission(true)?;
+            assert!(restarted.register_job_log(binding,&execution).await.is_err());
+
+            // The real row window reaches Full without deleting the blocked original.
+            let owner=ordinary_owner(9001);
+            let execution=crate::runner::processes::Execution::ordinary_in(admission.clone(),std::path::absolute("producer-full-fixture")?,owner.clone())?;
+            let binding=crate::proto::JobLogBindingV1{contract:crate::proto::JobLogContractV1{version:1,capture_limit:512},owner};
+            let producer=restarted.register_job_log(binding.clone(),&execution).await?;
+            let writer=producer.foreground();
+            let mut flows=Vec::new();
+            for _ in 1..64{flows.push(writer.fork().await?);}
+            let mut waiting=Box::pin(writer.fork());
+            assert!(futures::poll!(waiting.as_mut()).is_pending(),"RAM Full waits before a new flow can read");
+            assert!(writer.log(&up,0,Vec::new()).await.is_err(),"empty input cannot bypass RAM quota");
+            assert!(producer.pending().is_none()&&rx.try_recv().is_err(),"empty input creates no pending metadata or wake");
+            let flow=flows.pop().ok_or_else(||anyhow::anyhow!("fixture capture flow missing"))?;
+            let mut lost=Box::pin(flow.log(&up,0,vec![7]));
+            assert!(futures::poll!(lost.as_mut()).is_pending());
+            let crate::exec::Up::JobLog(id)=rx.recv().await? else{anyhow::bail!("fixture lost preowned RAM input")};
+            assert_eq!(id,crate::proto::job_log::binding_id(&binding)?);
+            let original=producer.pending().ok_or_else(||anyhow::anyhow!("fixture lost preowned RAM input"))?;
+            drop(lost);drop(flow);
+            assert!(Arc::ptr_eq(&producer.pending().ok_or_else(||anyhow::anyhow!("cancelled waiter lost original bytes"))?,&original));
+            assert!(futures::poll!(waiting.as_mut()).is_pending(),"cancelling a writer cannot reuse its occupied input slot");
+            restarted.publish_job_log(&original).await?;
+            let mut first=original.published().flatten();
+            producer.complete(&original)?;
+            let reused=waiting.await?;drop(reused);drop(flows);
+            for _ in 0..255u32{
+                let mut write=Box::pin(writer.log(&up,0,vec![7]));
+                assert!(futures::poll!(write.as_mut()).is_pending());
+                let crate::exec::Up::JobLog(id)=rx.recv().await? else{anyhow::bail!("fixture lost bounded input")};
+            assert_eq!(id,crate::proto::job_log::binding_id(&binding)?);
+            let input=producer.pending().ok_or_else(||anyhow::anyhow!("fixture lost bounded input"))?;
+                restarted.publish_job_log(&input).await?;
+                if first.is_none(){first=input.published().flatten();}
+                producer.complete(&input)?;write.await?;
+            }
+            let mut blocked=Box::pin(writer.log(&up,0,vec![8]));
+            assert!(futures::poll!(blocked.as_mut()).is_pending());
+            let crate::exec::Up::JobLog(id)=rx.recv().await? else{anyhow::bail!("fixture lost Full input")};
+            assert_eq!(id,crate::proto::job_log::binding_id(&binding)?);
+            let input=producer.pending().ok_or_else(||anyhow::anyhow!("fixture lost Full input"))?;
+            let before=records.head().await?;
+            let error=restarted.publish_job_log(&input).await.err().ok_or_else(||anyhow::anyhow!("outbox did not impose its row bound"))?;
+            assert!(error.downcast_ref::<logs::Full>().is_some());
+            assert_eq!(records.head().await?,before);
+            assert!(Arc::ptr_eq(&producer.pending().ok_or_else(||anyhow::anyhow!("Full lost original bytes"))?,&input));
+            let Some(crate::wire::channel::Frame::Item{body,..})=first else{anyhow::bail!("fixture lost first committed body")};
+            let crate::proto::AgentMsg::JobLogChunkV1(chunk)=crate::proto::read_agent(&body).map_err(|e|anyhow::anyhow!(e.why("producer fixture chunk")))? else{anyhow::bail!("fixture first body is not a chunk")};
+            let id=crate::proto::job_log::binding_id(&binding)?;
+            let receipt=crate::proto::JobLogReceiptV1{binding_id:id,item_seq:1,chunk_seq:1,captured_bytes:1,root:crate::proto::job_log::chunk_root(&chunk)?,operation:crate::proto::job_log::stable_operation(&id,1)?,view:crate::proto::JobLogViewV1::Captured(crate::proto::JobLogPrefixV1{view:"full-view".into(),revision:1,root:"b".repeat(64)}),result_hash:None};
+            restarted.receive_job_log(&binding,&crate::proto::JobLogReplyV1::Committed(receipt)).await?;
+            restarted.clean_job_log_page(&binding).await?;
+            restarted.publish_job_log(&input).await?;producer.complete(&input)?;blocked.await?;
+            drop(producer);
+            // This deliberate pending producer remains durable after handle loss; neither
+            // a missing sender nor successful physical NoStart is log-completion proof.
+            execution.close_ordinary_admission(true)?;
+            assert!(restarted.job_log_debt().await?);
+            let cold=Spool::new_in(Arc::clone(&records),admission.clone());
+            assert!(cold.job_log_debt().await?);
+
             let first_owner = ordinary_owner(1);
             let first = restarted.publish_ordinary(&first_owner, OrdinaryPhaseV1::Stopped).await?;
             assert_eq!(first.seq, 1);

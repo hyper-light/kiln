@@ -465,6 +465,8 @@ impl Carries for AgentMsg {
             | AgentMsg::StepFinished { .. }
             | AgentMsg::JobFinished(_)
             | AgentMsg::JobFinishedV2 { .. }
+            | AgentMsg::JobLogChunkV1(..)
+            | AgentMsg::JobLogEndV1(..)
             | AgentMsg::RunnerProcess { .. }
             | AgentMsg::Amphora { .. }
             | AgentMsg::JobSample { .. }
@@ -632,6 +634,7 @@ impl Carries for ServerMsg {
             | ServerMsg::PortAck { .. }
             | ServerMsg::PortClose { .. }
             | ServerMsg::Received { .. }
+            | ServerMsg::JobLogReplyV1(..)
             | ServerMsg::ReceivedV2 { .. }
             | ServerMsg::Amphora { .. }
             | ServerMsg::Caps { .. }

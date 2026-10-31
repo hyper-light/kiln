@@ -1015,6 +1015,46 @@ mod tests {
                 }
             }
             anyhow::ensure!(differ.is_empty(), "published schemas that aren't their input type's: {differ:?}");
+            // Compatibility spellings must be published as well as accepted at runtime.
+            let approval = ops.iter().find(|op| op.name == "ci.runs.approve").ok_or_else(|| anyhow::anyhow!("approval operation"))?;
+            let schema = approval.input.schema();
+            let states = schema.pointer("/properties/state/enum").and_then(Value::as_array).ok_or_else(|| anyhow::anyhow!("published approval states"))?;
+            anyhow::ensure!(states.len() == 4 && ["approved", "approve", "rejected", "reject"].iter().all(|state| states.contains(&json!(state))), "published approval states: {states:?}");
+            // U12: existing HTTP/CLI inputs retain their defaults and supported fields.
+            // These are type checks; domain authorization and semantic checks still run later.
+            for (name, input) in [
+                ("ci.runs.rerun", json!({"run": "r1", "fresh_actions": false, "no_reuse": false, "keep_failed": true})),
+                ("ci.runs.approve", json!({"run": "r1"})),
+                ("ci.runs.approve", json!({"run": "r1", "state": "approve", "environments": ["prod"]})),
+                ("ci.runs.approve", json!({"run": "r1", "state": "reject", "comment": "not yet"})),
+                ("ci.diffs.comment", json!({"diff": "D1", "thread": "t1", "body": "reply", "kind": "issue"})),
+                ("ci.diffs.comment", json!({"diff": "D1", "file": "a.rs", "line": 1, "suggestion": "replacement"})),
+                ("ci.diffs.review", json!({"diff": "D1", "action": "accept", "force": true})),
+                ("ci.diffs.submit_patch", json!({"repo": "org/repo", "mbox": "patch", "draft": true, "reviewers": ["ada"], "topic": "fix", "message": "repair"})),
+                ("ci.change_requests.open", json!({"repo": "org/repo", "branch": "fix", "draft": true, "reviewers": ["ada"]})),
+                ("ci.pools.set", json!({"name": "pods", "executor": "k8s", "hosts": "label linux", "labels": ["pod"], "per_host_max": 2, "idle_timeout": "10m", "resources": {"cpu": "1", "memory": "512Mi", "gpu": 0}, "reserve": {"for": "workflow == 'bench'", "cron": "0 2 * * *", "duration": "2h"}, "docker": {"engine": "podman"}, "warm": {"root": "/var/lib/kiln/warm", "node_label": "kiln/warm"}})),
+                ("ci.pools.set", json!({"name": "vms", "executor": "firecracker", "image": "fixture", "labels": ["vm"], "resources": {"cpu": "2", "memory": "2Gi", "disk": "10Gi"}, "firecracker_overhead": {"memory": "256Mi", "disk": "1Gi"}})),
+                ("host.pulls.merge", json!({"repo": "org/repo", "number": 1, "method": "fast-forward"})),
+            ] {
+                let op = ops.iter().find(|op| op.name == name).ok_or_else(|| anyhow::anyhow!("no operation {name}"))?;
+                let fit = op.input.fits(&input);
+                anyhow::ensure!(fit.is_ok(), "{name}: {fit:?}");
+                let mut typo = input;
+                typo.as_object_mut().ok_or_else(|| anyhow::anyhow!("{name}: not an object"))?.insert("zz_not_a_field".into(), json!(true));
+                anyhow::ensure!(op.input.fits(&typo).is_err_and(|m| m.code() == "unknown_field" && m.path == "/zz_not_a_field"), "{name} must still reject typos");
+            }
+            for (name, input, path, code) in [
+                ("ci.runs.rerun", json!({"run": "r1", "fresh_actions": "yes"}), "/fresh_actions", "invalid_type"),
+                ("ci.runs.approve", json!({"run": "r1", "comment": null}), "/comment", "invalid_type"),
+                ("ci.diffs.comment", json!({"diff": "D1", "body": "x", "kind": "silent"}), "/kind", "invalid_value"),
+                ("ci.pools.set", json!({"name": "p", "resources": {"cpu": 1}}), "/resources/cpu", "invalid_type"),
+                ("ci.pools.set", json!({"name": "p", "resources": {"cpus": "1"}}), "/resources/cpus", "unknown_field"),
+                ("ci.environments.save", json!({"repo": "org/repo", "name": "prod", "kind": "space"}), "/kind", "invalid_value"),
+            ] {
+                let op = ops.iter().find(|op| op.name == name).ok_or_else(|| anyhow::anyhow!("no operation {name}"))?;
+                let fit = op.input.fits(&input);
+                anyhow::ensure!(fit.is_err_and(|m| m.code() == code && m.path == path), "{name} must refuse {input}");
+            }
             Ok(())
         })
     }

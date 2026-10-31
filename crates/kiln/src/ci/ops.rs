@@ -1016,6 +1016,13 @@ pub mod input {
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(untagged)]
+    pub enum CiRunsRerunKeepFailed {
+        Flag(bool),
+        Minutes(serde_json::Number),
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
     #[serde(deny_unknown_fields)]
     pub struct CiRunsRerun {
         /// The run's id.
@@ -1025,7 +1032,11 @@ pub mod input {
         pub job: Option<String>,
         pub debug: Option<bool>,
         /// Minutes a failed leg is kept to look into (W17-R02).
-        pub keep_failed: Option<i64>,
+        pub keep_failed: Option<CiRunsRerunKeepFailed>,
+        /// Resolve action refs again instead of reusing this run's pins (W07-R02).
+        pub fresh_actions: Option<bool>,
+        /// Run every leg despite a matching reusable result (W08-R10).
+        pub no_reuse: Option<bool>,
         /// Run cold (W24-R23): no reuse, no kept folders, no cache restored.
         pub cold: Option<bool>,
     }
@@ -1034,7 +1045,9 @@ pub mod input {
     #[serde(rename_all = "snake_case")]
     pub enum CiRunsApproveState {
         Approved,
+        Approve,
         Rejected,
+        Reject,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
@@ -1042,10 +1055,12 @@ pub mod input {
     pub struct CiRunsApprove {
         /// The run's id.
         pub run: String,
-        pub state: CiRunsApproveState,
+        pub state: Option<CiRunsApproveState>,
         /// Which; all the run waits on when left out.
-        pub environments: Option<Vec<String>>,
-        pub comment: Option<String>,
+        #[serde(default)]
+        pub environments: Vec<String>,
+        #[serde(default)]
+        pub comment: String,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
@@ -1374,12 +1389,47 @@ pub mod input {
     #[serde(deny_unknown_fields)]
     pub struct CiPoolsSet {
         pub name: String,
-        pub executor: CiPoolsSetExecutor,
+        pub executor: Option<CiPoolsSetExecutor>,
+        pub hosts: Option<String>,
         pub image: Option<String>,
+        #[serde(default)]
         pub labels: Vec<String>,
-        pub min_idle: Option<i64>,
-        pub max: Option<i64>,
+        pub min_idle: Option<usize>,
+        pub max: Option<usize>,
+        pub per_host_max: Option<usize>,
+        pub idle_timeout: Option<String>,
+        #[serde(default)]
+        #[schemars(schema_with = "pool_resources_schema")]
+        pub resources: Option<kiln_ci::sched::pools::ResourceSpec>,
+        #[serde(default)]
+        #[schemars(schema_with = "pool_resources_schema")]
+        pub firecracker_overhead: Option<kiln_ci::sched::pools::ResourceSpec>,
+        #[serde(default)]
+        #[schemars(schema_with = "pool_reserve_schema")]
+        pub reserve: Option<kiln_ci::sched::reserve::ReservationSpec>,
+        #[serde(default)]
+        #[schemars(schema_with = "pool_docker_schema")]
+        pub docker: Option<kiln_ci::sched::pools::PodDocker>,
+        #[serde(default)]
+        #[schemars(schema_with = "pool_warm_schema")]
+        pub warm: Option<kiln_ci::sched::pools::PodWarm>,
     }
+
+    // U12/W13: actual canonical Deserialize types retain default and typo rules.
+    // These schema-only bridges avoid a schema dependency in the deterministic core.
+    fn pool_resources_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({"type":["object","null"],"additionalProperties":false,"properties":{"cpu":{"type":["string","null"]},"memory":{"type":["string","null"]},"disk":{"type":["string","null"]},"gpu":{"type":["integer","null"],"minimum":0,"maximum":4294967295}}})
+    }
+    fn pool_reserve_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({"type":["object","null"],"additionalProperties":false,"properties":{"name":{"type":"string"},"runners":{"type":["string","null"]},"pool":{"type":["string","null"]},"for":{"type":"string"},"cron":{"type":"string"},"duration":{"type":"string"},"timezone":{"type":["string","null"]}}})
+    }
+    fn pool_docker_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({"type":["object","null"],"additionalProperties":false,"properties":{"engine":{"type":["string","null"]},"image":{"type":["string","null"]},"cli_image":{"type":["string","null"]}}})
+    }
+    fn pool_warm_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({"type":["object","null"],"additionalProperties":false,"properties":{"root":{"type":["string","null"]},"node_label":{"type":["string","null"]}}})
+    }
+
 
     #[derive(Debug, Deserialize, JsonSchema)]
     #[serde(deny_unknown_fields)]
@@ -1628,11 +1678,24 @@ pub mod input {
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum CiDiffsCommentKind {
+        Question,
+        Nit,
+        Issue,
+        Blocking,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
     #[serde(deny_unknown_fields)]
     pub struct CiDiffsComment {
         /// The diff: `D12`.
         pub diff: String,
-        pub body: String,
+        /// Text or a suggestion; the same handler checks that one says something.
+        pub body: Option<String>,
+        pub thread: Option<String>,
+        /// A new thread is a question by default (W26-R11).
+        pub kind: Option<CiDiffsCommentKind>,
         pub file: Option<String>,
         pub line: Option<i64>,
         pub start_line: Option<i64>,
@@ -1685,6 +1748,8 @@ pub mod input {
         pub diff: String,
         pub action: CiDiffsReviewAction,
         pub body: Option<String>,
+        /// Acknowledge issues; conflicts and blocking threads still refuse.
+        pub force: Option<bool>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
@@ -1695,6 +1760,10 @@ pub mod input {
         pub mbox: Option<String>,
         pub patches: Option<Vec<serde_json::Value>>,
         pub trunk: Option<String>,
+        pub draft: Option<bool>,
+        pub reviewers: Option<Vec<String>>,
+        pub topic: Option<String>,
+        pub message: Option<String>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
@@ -2353,6 +2422,8 @@ pub mod input {
         Merge,
         Squash,
         Rebase,
+        #[serde(rename = "fast-forward")]
+        FastForward,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
@@ -2459,6 +2530,8 @@ pub mod input {
         pub title: Option<String>,
         pub body: Option<String>,
         pub trunk: Option<String>,
+        pub draft: Option<bool>,
+        pub reviewers: Option<Vec<String>>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]

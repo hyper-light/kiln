@@ -18,6 +18,8 @@ use crate::store::Status;
 pub enum Up {
     Msg(AgentMsg),
     Log(LogChunk),
+    /// U05: small wake hint only. SAME Spool retains original input outside this queue.
+    JobLog([u8;32]),
     /// Interactive terminal traffic: never buffered across a disconnect.
     Term(AgentMsg),
     /// Repo sync, on its own lane: never buffered across a disconnect (it says it all again).
@@ -133,7 +135,7 @@ impl Exec {
         let leg = crate::runner::runtime::Leg {
             a, work_dir: legacy.work_dir.clone(), runner_name: legacy.agent_name.clone(), up: Uplink(tx),
             cancel: legacy.cancel.clone(), http: Arc::clone(&legacy.http), warm: Default::default(), cache_max: None,
-            legacy: Some(legacy),
+            legacy: Some(legacy), producer: None,
         };
         let result = leg.run().await;
         let _ = bridge.await;

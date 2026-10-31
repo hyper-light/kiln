@@ -41,6 +41,16 @@ impl std::error::Error for EvidenceStorageError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(self.0.as_ref()) }
 }
 
+/// U05: produced only from the actual connection's authenticated process declaration.
+/// This is arrival evidence, not newest-host inventory and not a deserializable grant.
+pub(crate) struct CompletionOrigin {
+    connection: crate::net::Connection,
+    process_nonce: String,
+}
+impl CompletionOrigin {
+    pub(crate) fn process_nonce(&self) -> &str { &self.process_nonce }
+}
+
 /// Apply only around storage operations; invalid requests must retain their final refusal.
 pub(crate) fn evidence_storage(error: anyhow::Error) -> anyhow::Error { EvidenceStorageError(error).into() }
 
@@ -1545,8 +1555,24 @@ impl Hub {
                 // Ready retained I/O gets one turn before another FIFO item. A continuously
                 // ready control/other-Bulk stream cannot starve an already durable receipt.
                 done = self.logs.accepted_completion().fuse() => match done {
-                    Ok(receipt) if receipt.accepted => tracing::debug!(operation=receipt.operation, revision=receipt.prefix.revision, "observed log-prefix operation has its own durable receipt"),
-                    Ok(receipt) => tracing::warn!(operation=receipt.operation,job=receipt.job,reason=receipt.refusal.as_deref().unwrap_or("original operation refused"),"observed log append refused; no new acceptance or projection"),
+                    Ok(crate::logs::accepted::Completion::Append(receipt)) if receipt.accepted => tracing::debug!(operation=receipt.operation, revision=receipt.prefix.revision, "observed log-prefix operation has its own durable receipt"),
+                    Ok(crate::logs::accepted::Completion::Append(receipt)) => tracing::warn!(operation=receipt.operation,job=receipt.job,reason=receipt.refusal.as_deref().unwrap_or("original operation refused"),"observed log append refused; no new acceptance or projection"),
+                    Ok(crate::logs::accepted::Completion::Producer { binding, connection, reply }) => {
+                        // U05: logical terminal effects wait for this exact original close,
+                        // while physical stop/grant accounting remains independent.
+                        self.producer_log_receipt(&binding,&reply);
+                        // A reconnect/newest process cannot take another request's reply.
+                        // Lost sends leave the producer's exact durable OUT for replay.
+                        match proto::encode(&ServerMsg::JobLogReplyV1(reply)) {
+                            Ok(bytes) => { let _=self.net.send_bound(connection,LANE_CONTROL,Kind::Control,bytes).await; },
+                            Err(error) => tracing::warn!(error=%error,"own log receipt could not be encoded; original producer replay remains required"),
+                        }
+                    },
+                    Ok(crate::logs::accepted::Completion::RecoveredProducer {binding,reply}) => {
+                        // Recovery has an original durable operation but no live requester.
+                        // Wake only the canonical owner; never manufacture a network ACK.
+                        self.producer_log_receipt(&binding,&reply);
+                    },
                     Err(error) => tracing::warn!(error=%format!("{error:#}"), "observed log ingest remains incomplete"),
                 },
                 event = rx.recv().fuse() => {
@@ -1616,6 +1642,35 @@ impl Hub {
                     }
                 }
             }
+            NetEvent::Frame { peer,kind:Kind::Log,lane:proto::LANE_JOB_LOG,data,connection,.. } => {
+                // U05: one negotiated codec on a charged Bulk lane. Do not pass job
+                // streams through Updates or await SQL/Blobs on control intake.
+                let connection=connection.context("producer log input has no original authenticated connection")?;
+                let agent=self.agent_of(peer).context("producer log input precedes authenticated Hello")?;
+                let required=proto::CAP_JOB_LOG_V1 | proto::CAP_UNIFIED_LAYOUT | proto::CAP_WIRE | proto::CAP_JOB_ATTEMPT | proto::CAP_RESOURCE_OWNERSHIP | proto::CAP_ORDINARY_EXECUTION_DEBT;
+                let nonce={
+                    let instances=self.instances.lock();
+                    anyhow::ensure!(instances.effective_wide(peer)&required==required,"producer log input lacks the original negotiated contract");
+                    instances.process_on(peer,Some(connection)).map(str::to_owned).context("producer log input has no current original process declaration")?
+                };
+                anyhow::ensure!(data.retained(),"producer log input lost its original receive grant");
+                let item=proto::job_log::borrow_item(&data)?;
+                anyhow::ensure!(item.body.len()<=proto::job_log::END_MAX,"original producer envelope exceeds its retained descriptor bound");
+                let (binding,seq)=match proto::read_agent(item.body).map_err(|error|anyhow::anyhow!("producer item: {}",error.why("AgentMsg")))? {
+                    AgentMsg::JobLogChunkV1(chunk)=>(chunk.binding,chunk.seq),
+                    AgentMsg::JobLogEndV1(end)=>{let seq=proto::job_log::end_item_seq(&end)?;(end.binding,seq)},
+                    _=>anyhow::bail!("job-log stream carries a different message kind"),
+                };
+                proto::job_log::validate_binding(&binding)?;
+                anyhow::ensure!(item.seq==seq && item.stream==proto::job_log::stream(&binding)?,"producer channel item changed its original stream/sequence");
+                // Same-process reconnects keep the original binding's first connection.
+                // A different process needs an explicit authenticated cold recovery law;
+                // a shared host identity alone never grants a former producer's nonce.
+                anyhow::ensure!(binding.owner.host==agent && binding.owner.process_nonce==nonce,"producer log input changed its original authenticated process");
+                let from=(item.body.as_ptr() as usize).checked_sub(data.as_ptr() as usize).context("producer body is outside its original frame")?;
+                let end=from.checked_add(item.body.len()).filter(|end|*end<=data.len()).context("producer body exceeds its original frame")?;
+                self.logs.observe_producer_frame(binding,connection,data,from..end,seq)?;
+            },
             // Bulk frames are job output, but on the conversation feed's and the files' lanes
             // (messages, in bulk).
             NetEvent::Frame { peer, kind: Kind::Log, lane, data, .. } if lane != proto::LANE_CONVO && lane != proto::LANE_FILES => {
@@ -1809,28 +1864,40 @@ impl Hub {
             && matches!(event, kiln_ci::wire::JobEventV2::KeptOwned { .. } | kiln_ci::wire::JobEventV2::KeptReleased { .. })
     }
 
+    fn producer_log_receipt(&self,binding:&proto::JobLogBindingV1,reply:&proto::JobLogReplyV1) {
+        if matches!(reply,proto::JobLogReplyV1::Committed(receipt) if receipt.result_hash.is_some() && matches!(&receipt.view,proto::JobLogViewV1::Captured(_))) {
+            self.ci.send(crate::ci::dispatch::Msg::Completion {agent:binding.owner.host.clone(),job:binding.owner.job.clone(),attempt:binding.owner.attempt});
+        }
+    }
+
     /// U03: storage failure propagates before a receipt; retries retain their attempt identity.
-    async fn runner_completion(&self, peer: PeerId, agent: &str, result: JobResult, attempt: Option<u32>) -> anyhow::Result<()> {
+    async fn runner_completion(&self, peer: PeerId, agent: &str, result: JobResult, attempt: Option<u32>, origin: Option<crate::net::Connection>) -> anyhow::Result<()> {
+        // Capture BEFORE any await; reconnect must never substitute another process.
+        let proof=origin.and_then(|connection| self.instances.lock().process_on(peer,Some(connection))
+            .map(|nonce|CompletionOrigin {connection,process_nonce:nonce.to_owned()}));
         let job = result.job.clone();
+        let (key,host,nonce)=(job.clone(),agent.to_owned(),proof.as_ref().map(|proof|proof.process_nonce.clone()));
+        let wire=std::sync::Arc::new(proto::encode(&result)?);
+        let check_wire=wire.clone();
+        let authorized=self.store.call(move |c|crate::ci::runs::completion_report_allowed(c,&key,&host,attempt,nonce.as_deref(),check_wire.as_slice())).await?;
+        anyhow::ensure!(authorized,"required original completion has no authenticated process/connection proof; retained channel input must retry");
         let mut received = false;
         if self.owns_job(peer, &job) {
             let canonical = self.store.ci_legs(vec![job.clone()]).await?.contains(&job);
-            received = self.finish_owned_completion(peer, agent, &result, attempt, canonical).await?;
+            received = self.finish_owned_completion(peer, agent, &result, attempt, canonical, proof.as_ref()).await?;
         } else if let Some(attempt) = attempt {
             // A durable receipt may outlive in-memory ownership across a server crash.
-            received = crate::ci::runs::completion(self, &job, attempt, agent).await?.is_some();
-            if !received {
-                let (job, agent) = (job.clone(), agent.to_owned());
-                received = self.store.call(move |c| {
-                    // Read-only: never stage work without authenticating the exact process.
-                    // A retired receipt is represented by the same durable terminal attempt.
-                    Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM jobs j JOIN ci_attempts a ON a.leg_id = j.id WHERE j.id = ?1 AND j.agent = ?3 AND a.runner = ?3 AND a.number = ?2 AND (CASE WHEN j.job_id IS NULL THEN j.attempt + 1 ELSE MAX(j.attempt, 1) END) = ?2 AND j.status IN ('succeeded', 'failed', 'cancelled', 'skipped') AND a.status = 'done' AND COALESCE(a.failure_class, '') != 'runner-lost')", crate::sql::params![job, attempt, agent], |r| r.get::<_, bool>(0))?)
-                }).await?;
-            }
+            // Exact report validation and its positive lookup share one SQL callback;
+            // no intervening first-result acceptance can authorize another report.
+            let (key,host,nonce)=(job.clone(),agent.to_owned(),proof.as_ref().map(|proof|proof.process_nonce.clone()));
+            received=self.store.call(move |c|crate::ci::runs::completion_report_received(c,&key,&host,attempt,nonce.as_deref(),wire.as_slice())).await?;
         }
         if received {
             if let Some(attempt) = attempt {
-                self.send_peer(peer, &ServerMsg::ReceivedV2 { job, attempt }).await;
+                let reply=ServerMsg::ReceivedV2 {job,attempt};
+                if let Some(proof)=proof {
+                    let _=self.net.send_bound(proof.connection,LANE_CONTROL,Kind::Control,proto::encode(&reply)?).await;
+                } else {self.send_peer(peer,&reply).await;}
             } else if self.instances.lock().get(peer).is_some_and(|i| i.caps & proto::CAP_RECEIVED != 0) {
                 self.send_peer(peer, &ServerMsg::Received { job }).await;
             }
@@ -1840,7 +1907,7 @@ impl Hub {
 
     /// U01/U03: continue an authenticated completion after classification. A negative
     /// classification is only advisory; the legacy writer must fence concurrent adoption.
-    async fn finish_owned_completion(&self, peer: PeerId, agent: &str, result: &JobResult, attempt: Option<u32>, mut canonical: bool) -> anyhow::Result<bool> {
+    async fn finish_owned_completion(&self, peer: PeerId, agent: &str, result: &JobResult, attempt: Option<u32>, mut canonical: bool, proof: Option<&CompletionOrigin>) -> anyhow::Result<bool> {
         let mut received = false;
         if !canonical {
             match self.job_done(agent, result.clone()).await {
@@ -1854,7 +1921,7 @@ impl Hub {
         if canonical {
             // U03: disabling ingress cannot let an attempt-capable process bypass fencing.
             if attempt.is_none() && self.instances.lock().get(peer).is_some_and(|i| i.wide & proto::CAP_JOB_ATTEMPT != 0) { return Ok(false); }
-            if let Some((job, attempt)) = crate::ci::runs::stage_completion(self, agent, result, attempt).await? {
+            if let Some((job, attempt)) = crate::ci::runs::stage_completion(self, agent, result, attempt, proof).await? {
                 self.ci.send(crate::ci::dispatch::Msg::Completion { agent: agent.to_owned(), job, attempt });
                 received = true;
             }
@@ -2142,10 +2209,10 @@ impl Hub {
             }
             AgentMsg::JobSample { .. } => {}
             AgentMsg::JobFinished(r) => {
-                self.runner_completion(peer, &agent, r, None).await?;
+                self.runner_completion(peer, &agent, r, None, origin).await?;
             }
             AgentMsg::JobFinishedV2 { result, attempt } => {
-                self.runner_completion(peer, &agent, result, Some(attempt)).await?;
+                self.runner_completion(peer, &agent, result, Some(attempt), origin).await?;
             }
             AgentMsg::Reject { job, .. } if self.ci.is_leg(&job) => {
                 if self.owns_job(peer, &job) {
@@ -3632,10 +3699,10 @@ pub(crate) mod tests {
             assert!(refused.iter().all(|e| e.as_ref().is_some_and(|e| e.is::<crate::store::CanonicalJobMutation>())), "adoption refusal remains typed across Store::call");
             assert_eq!(serde_json::to_value((hub.store.jobs("adoption-run".into(), true).await?, hub.store.run("adoption-run".into()).await?))?, before, "no legacy state machine, step reset, or dependency advance may run after adoption");
             // Resume the exact completion continuation with its now-stale negative classification.
-            assert!(!hub.finish_owned_completion(77, "box", &report, None, false).await?, "old message variant cannot bypass attempt fencing after adoption");
-            assert!(!hub.finish_owned_completion(77, "box", &report, Some(2), false).await?, "wrong attempt cannot gain a receipt");
+            assert!(!hub.finish_owned_completion(77, "box", &report, None, false, None).await?, "old message variant cannot bypass attempt fencing after adoption");
+            assert!(!hub.finish_owned_completion(77, "box", &report, Some(2), false, None).await?, "wrong attempt cannot gain a receipt");
             assert!(crate::ci::runs::pending_completions(&hub).await?.is_empty());
-            assert!(hub.finish_owned_completion(77, "box", &report, Some(1), false).await?, "the refused legacy finish reroutes through the durable canonical receipt");
+            assert!(hub.finish_owned_completion(77, "box", &report, Some(1), false, None).await?, "the refused legacy finish reroutes through the durable canonical receipt");
             assert_eq!(crate::ci::runs::completion(&hub, &job, 1, "box").await?, Some(report));
             assert!(hub.owns_job(77, &job), "refusals and staged results do not disown the process");
             let runner = hub.agents.lock().get("box").cloned().ok_or_else(|| anyhow::anyhow!("missing runner"))?;
@@ -3673,11 +3740,11 @@ pub(crate) mod tests {
                 assert!(hub.owns_job(77, &job), "hello retains exact process ownership");
                 let attempt = if job == "imported-leg" { 2 } else { 1 };
                 let report = JobResult { job: job.clone(), status: Status::Succeeded, exit_code: Some(0), error: None, peak_rss: None, cpu_seconds: None };
-                hub.runner_completion(77, "box", report.clone(), None).await?;
+                hub.runner_completion(77, "box", report.clone(), None, None).await?;
                 assert!(crate::ci::runs::completion(&hub, &job, attempt, "box").await?.is_none(), "disabled ingress cannot bypass attempt fencing through JobFinished");
-                hub.runner_completion(77, "box", report.clone(), Some(attempt + 1)).await?;
+                hub.runner_completion(77, "box", report.clone(), Some(attempt + 1), None).await?;
                 assert!(crate::ci::runs::completion(&hub, &job, attempt, "box").await?.is_none(), "a different attempt cannot stage a receipt");
-                hub.runner_completion(77, "box", report.clone(), Some(attempt)).await?;
+                hub.runner_completion(77, "box", report.clone(), Some(attempt), None).await?;
                 assert_eq!(crate::ci::runs::completion(&hub, &job, attempt, "box").await?, Some(report));
                 assert_eq!(hub.store.job(job.clone()).await?.map(|j| j.status), Some(Status::Running), "only the dispatcher may apply the staged report");
             }
@@ -3741,21 +3808,21 @@ pub(crate) mod tests {
                 Ok(())
             }).await?;
             let report = JobResult { job: "u03-leg".into(), status: Status::Succeeded, exit_code: Some(0), error: None, peak_rss: None, cpu_seconds: None };
-            assert!(crate::ci::runs::stage_completion(&hub, "box", &report, Some(1)).await?.is_none(), "same machine's old attempt cannot stage a result");
+            assert!(crate::ci::runs::stage_completion(&hub, "box", &report, Some(1), None).await?.is_none(), "same machine's old attempt cannot stage a result");
             assert!(crate::ci::runs::completion(&hub, "u03-leg", 2, "box").await?.is_none());
-            assert!(crate::ci::runs::stage_completion(&hub, "another-box", &report, Some(2)).await?.is_none(), "the current attempt still requires its machine owner");
-            assert_eq!(crate::ci::runs::stage_completion(&hub, "box", &report, Some(2)).await?, Some(("u03-leg".into(), 2)));
+            assert!(crate::ci::runs::stage_completion(&hub, "another-box", &report, Some(2), None).await?.is_none(), "the current attempt still requires its machine owner");
+            assert_eq!(crate::ci::runs::stage_completion(&hub, "box", &report, Some(2), None).await?, Some(("u03-leg".into(), 2)));
             let mut conflicting = report.clone();
             conflicting.status = Status::Failed;
-            assert_eq!(crate::ci::runs::stage_completion(&hub, "box", &conflicting, Some(2)).await?, Some(("u03-leg".into(), 2)));
+            assert_eq!(crate::ci::runs::stage_completion(&hub, "box", &conflicting, Some(2), None).await?, Some(("u03-leg".into(), 2)));
             assert_eq!(crate::ci::runs::completion(&hub, "u03-leg", 2, "box").await?, Some(report.clone()), "retransmission cannot overwrite the first durable completion");
             // A crash before the receipt reaches the runner loses in-memory ownership, but the
             // exact durable completion remains enough to acknowledge its retransmission.
             hub.peers.lock().insert(77, "box".into());
             assert!(!hub.owns_job(77, "u03-leg"));
-            hub.runner_completion(77, "box", report.clone(), Some(2)).await?;
+            hub.runner_completion(77, "box", report.clone(), Some(2), None).await?;
             assert_eq!(crate::ci::runs::completion(&hub, "u03-leg", 2, "box").await?, Some(report.clone()));
-            hub.runner_completion(77, "box", report, Some(1)).await?;
+            hub.runner_completion(77, "box", report, Some(1), None).await?;
             assert!(crate::ci::runs::completion(&hub, "u03-leg", 1, "box").await?.is_none(), "retransmission cannot turn a stale attempt into a receipt");
             Ok(())
         })

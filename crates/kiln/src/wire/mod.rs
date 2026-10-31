@@ -155,6 +155,8 @@ classes! {
         AgentMsg::StepFinished { .. } => Class::Stream,
         AgentMsg::JobFinished(..) => Class::Stream,
         AgentMsg::JobFinishedV2 { .. } => Class::Stream,
+        AgentMsg::JobLogChunkV1(..) => Class::Stream,
+        AgentMsg::JobLogEndV1(..) => Class::Stream,
         AgentMsg::JobSample { .. } => Class::Telemetry,
         AgentMsg::Reject { .. } => Class::Answer,
         AgentMsg::TermOutput { .. } => Class::Stream,
@@ -270,6 +272,7 @@ classes! {
         ServerMsg::Executor { .. } => REFUSED,
         ServerMsg::Received { .. } => Class::Ack,
         ServerMsg::ReceivedV2 { .. } => Class::Ack,
+        ServerMsg::JobLogReplyV1(..) => Class::Ack,
         ServerMsg::RetainedReceived { .. } => Class::Ack,
         ServerMsg::Undeploy { .. } => PARKED,
         ServerMsg::Caps { .. } => Class::Handshake,
@@ -467,6 +470,8 @@ pub const SOCKETS: &[SocketMsg] = &[
     msg(TUNNEL, Way::Up, "unread", Class::Ack),
     msg(TUNNEL, Way::Down, "datagram", Class::Carried("tunnel")),
     msg(TUNNEL, Way::Down, "refused", Class::Ack),
+    msg(JOB_LOG, Way::Down, "pending", Class::State),
+    msg(JOB_LOG, Way::Down, "unavailable", Class::State),
 ];
 
 #[cfg(test)]

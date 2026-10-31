@@ -336,6 +336,10 @@ pub enum Input {
     /// storage uncertainty is never this input. Retry on this Scheduler's existing timer,
     /// keeping the attempt, rather than bounce among otherwise eligible runners.
     AdmissionDeferred { leg: String, attempt: u32 },
+    /// U03/U05: the adapter committed this exact ordinary native owner's positive physical
+    /// proof. Return only this assignment's physical accounting; logical result/log close,
+    /// demands and retry decisions remain pending. Never use for a pool/parent/reach grant.
+    OrdinaryExecutionReleased { leg: String, attempt: u32, runner: String },
 }
 
 /// What a runner has in use now, by its latest sample: what placement weighs of it besides its
@@ -597,6 +601,9 @@ struct Leg {
     sig: String,
     state: State,
     attempt: u32,
+    /// U03/U05: physical capacity was returned once for THIS assignment. Keep Assigned and
+    /// its original runner while the logical result waits for durable log close.
+    physical_released: bool,
     /// When it was (last) queued, for aging.
     queued_at: i64,
     /// When it arrived: a leg admission held counts its wait from then.
@@ -868,6 +875,23 @@ impl Scheduler {
             Input::ExecutionReleased { leg, attempt } => {
                 if let Some(l) = self.legs.get_mut(&leg).filter(|l| l.attempt == attempt) { l.input.retained = None; }
             }
+            Input::OrdinaryExecutionReleased { leg, attempt, runner } => {
+                let original = self.legs.get(&leg).is_some_and(|l| l.attempt == attempt && !l.physical_released
+                    && matches!(&l.state, State::Assigned { runner: assigned } if assigned == &runner)
+                    && !l.input.external && l.req.pool.is_none() && l.input.parent_binding.is_none());
+                let executor_bound = self.executor_bindings.values().any(|b| b.job == leg && b.attempt == attempt)
+                    || self.executors.values().any(|e| e.state == ExecState::Busy { leg: leg.clone() } || e.leg.as_deref() == Some(leg.as_str()));
+                if original && !executor_bound {
+                    if let Some(l) = self.legs.get_mut(&leg) { l.input.retained = None; }
+                    if let Some(runner) = self.release(&leg) {
+                        // No stopped()/settle()/answer(): this SAME logical leg still waits.
+                        self.try_runner(&runner, now, &mut out);
+                        self.scale_all(now, &mut out);
+                        self.review_admission(now, &mut out);
+                        self.refresh_reasons(&mut out);
+                    }
+                }
+            }
             Input::RetainedFinished { leg, attempt, reservation, outcome } => self.retained_finished(&leg, attempt, *reservation, outcome, now, &mut out),
             Input::Rejected { leg } => {
                 if let Some(runner) = self.release(&leg) {
@@ -1072,7 +1096,7 @@ impl Scheduler {
         let attempt = input.initial_attempt.max(1);
         self.legs.insert(
             id.clone(),
-            Leg { input, runtime_request, req, sig, state: State::Pending, attempt, queued_at: now, arrived: now, key: None, counted: false, reason: None, avoid: None, pin: None, last_runner: None, cancelling: None, gone: false, started: None, hold: None, held: false, ends: None },
+            Leg { input, runtime_request, req, sig, state: State::Pending, attempt, physical_released: false, queued_at: now, arrived: now, key: None, counted: false, reason: None, avoid: None, pin: None, last_runner: None, cancelling: None, gone: false, started: None, hold: None, held: false, ends: None },
         );
         match group {
             Some((key, name, cfg)) => {
@@ -1195,6 +1219,9 @@ impl Scheduler {
 
     fn adopt(&mut self, mut input: LegIn, runner: String, attempt: u32, now: i64, out: &mut Vec<Command>) {
         let id = input.id.clone();
+        // A repeated announcement cannot charge an already assigned original attempt again,
+        // especially after its positive physical release while logical close is pending.
+        if self.legs.get(&id).is_some_and(|l| matches!(l.state, State::Assigned { .. }) || attempt < l.attempt) { return; }
         let runtime_request = input.request;
         let req = self.requirement(&input);
         // U01: the restored executor already owns its pool's footprint, just as at queue time.
@@ -1219,6 +1246,7 @@ impl Scheduler {
                 sig,
                 state: State::Assigned { runner: runner.clone() },
                 attempt,
+                physical_released: false,
                 queued_at: 0,
                 arrived: 0,
                 key: None,
@@ -1757,6 +1785,7 @@ impl Scheduler {
         let expected = self.legs.get(id).map(|l| self.expected_s(l, runner));
         let Some(l) = self.legs.get_mut(id) else { return };
         l.state = State::Assigned { runner: runner.to_owned() };
+        l.physical_released = false; // only a real new assignment acquires another charge
         l.reason = None;
         l.hold = None;
         l.ends = expected.map(|s| now.saturating_add(ms(s)));
@@ -1799,9 +1828,13 @@ impl Scheduler {
     }
 
     fn release(&mut self, id: &str) -> Option<String> {
-        let l = self.legs.get(id)?;
+        let l = self.legs.get_mut(id)?;
         let State::Assigned { runner } = &l.state else { return None };
         let (runner, request, repo) = (runner.clone(), l.input.request, l.input.repo.clone());
+        // Keep the original runner for retry::Same even when physical release preceded
+        // AttemptFinished. Never subtract another leg's resources/quota on a second call.
+        if l.physical_released { return Some(runner); }
+        l.physical_released = true;
         if let Some(n) = self.in_progress.get_mut(&repo) {
             *n = n.saturating_sub(1);
         }
@@ -1893,7 +1926,7 @@ impl Scheduler {
         if binding.attempt == 0 || [&binding.executor, &binding.generation, &binding.allocation, &binding.physical_execution, &binding.job]
             .iter().any(|v| v.is_empty() || v.len() > 512 || v.chars().any(char::is_control)) { return false; }
         let Some(l) = self.legs.get(&binding.job) else { return false };
-        if l.attempt != binding.attempt || !matches!(l.state, State::Assigned { .. }) { return false; }
+        if l.attempt != binding.attempt || l.physical_released || !matches!(l.state, State::Assigned { .. }) { return false; }
         if l.req.pool.is_some() && !self.executors.values().any(|e| e.id == binding.executor
             && (e.state == ExecState::Busy { leg: binding.job.clone() } || e.leg.as_deref() == Some(binding.job.as_str()))) { return false; }
         if l.input.parent_binding.as_ref().is_some_and(|current| current != &binding) { return false; }
@@ -1908,7 +1941,7 @@ impl Scheduler {
     pub fn allocation(&self, id: &str, attempt: u32, reservation: String) -> Option<Allocation> {
         let l = self.legs.get(id)?;
         let State::Assigned { runner } = &l.state else { return None };
-        if l.attempt != attempt { return None; }
+        if l.attempt != attempt || l.physical_released { return None; }
         let mut a = Allocation { id: reservation, runner: runner.clone(), request: l.input.request,
             mode: match claim(&l.input, self.runners.get(runner).and_then(size)) { None => ReservationMode::Ordinary, Some(Claim::Share(_)) => ReservationMode::Share, Some(Claim::Whole) => ReservationMode::Whole },
             repo: l.input.repo.clone(), actor: l.input.actor.clone(), lane: l.input.lane.clone(), parent_binding: l.input.parent_binding.clone().or_else(|| self.executor_bindings.values().find(|b| b.job == id && b.attempt == attempt).cloned()) };
@@ -1922,6 +1955,12 @@ impl Scheduler {
 
     fn retained_finished(&mut self, id: &str, attempt: u32, allocation: Allocation, outcome: Outcome, now: i64, out: &mut Vec<Command>) {
         if !self.legs.get(id).is_some_and(|l| l.attempt == attempt && matches!(l.state, State::Assigned { .. })) { return; }
+        if self.legs.get(id).is_some_and(|l| l.physical_released) {
+            // A cached pre-proof snapshot cannot recreate debt, but this authenticated
+            // logical outcome still belongs to the SAME attempt and must not be lost.
+            self.finished(id, attempt, outcome, now, out);
+            return;
+        }
         // Durable replay may already have adopted the retained allocation before this receipt.
         if !self.legs.contains_key(&allocation.id) {
             self.adopt(allocation.leg(), allocation.runner.clone(), 1, now, out);
@@ -2209,6 +2248,7 @@ impl Scheduler {
             .into_iter()
             .filter_map(|x| {
                 let u = self.legs.get(&x)?;
+                if u.physical_released { return None; } // no physical capacity remains to contend for
                 let State::Assigned { runner } = &u.state else { return None };
                 let could = match (&pool, &u.req.pool) {
                     (Some(p), Some(q)) => p == q,

@@ -14,11 +14,18 @@ use crate::store::{Repo, Run, Status};
 /// The first report for this owner and attempt wins, including across retries/reconnects.
 /// Legacy attempt numbers are normalized before import, so a result arriving during migration
 /// has the same identity after the workflow engine takes ownership.
-pub async fn stage_completion(hub: &Hub, agent: &str, result: &crate::proto::JobResult, expected_attempt: Option<u32>) -> anyhow::Result<Option<(String, u32)>> {
+pub(crate) async fn stage_completion(hub: &Hub, agent: &str, result: &crate::proto::JobResult, expected_attempt: Option<u32>, origin: Option<&crate::hub::CompletionOrigin>) -> anyhow::Result<Option<(String, u32)>> {
     anyhow::ensure!(result.status.is_terminal(), "a job completion must have a terminal status");
     let (agent, job, payload) = (agent.to_owned(), result.job.clone(), serde_json::to_string(result)?);
-    hub.store.call(move |c| {
+    // U05: preserve the exact wire result outside the shared SQL writer. A JSON
+    // reconstruction cannot substitute for the original producer's result digest.
+    let wire=crate::proto::encode(result)?;
+    let nonce=origin.map(|proof|proof.process_nonce().to_owned());
+    let received=hub.store.call(move |c| {
         let tx = crate::store::tx(c)?;
+        // The admission lookup above the await is advisory. Recheck against the SAME
+        // durable binding before first-result mutation or positive retired receipt.
+        anyhow::ensure!(completion_report_allowed(&tx,&job,&agent,expected_attempt,nonce.as_deref(),&wire)?,"required original completion binding changed before its own SQL acceptance; channel input must retry");
         let row: Option<(Option<String>, String, u32, bool)> = tx.query_row("SELECT agent, status, attempt, job_id IS NULL FROM jobs WHERE id = ?1", [&job], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional()?;
         let Some((owner, status, attempt, legacy)) = row else { return Ok(None) };
         if owner.as_deref() != Some(agent.as_str()) { return Ok(None) }
@@ -34,15 +41,75 @@ pub async fn stage_completion(hub: &Hub, agent: &str, result: &crate::proto::Job
         }
         if status != "running" { return Ok(None) }
         tx.execute("INSERT INTO ci_completion_reports (job, attempt, agent, payload, received_at) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT (job, attempt, agent) DO NOTHING", params![job, attempt, agent, payload, crate::util::now_unix()])?;
+        if let Some(binding)=crate::logs::accepted::producer::registered(&tx,&job,attempt,&agent)? {
+            // First result retention and its required log dependency share this SAME
+            // acceptance. Received means result retained; it never closes the logs.
+            if let crate::logs::accepted::producer::Close::Refused(why)=crate::logs::accepted::producer::note_result(&tx,&binding,&wire)? {
+                anyhow::bail!("original required completion was refused: {why}");
+            }
+        }
         tx.commit()?;
         Ok(Some((job, attempt)))
-    }).await
+    }).await?;
+    if received.is_some() {hub.logs.producer_progress();}
+    Ok(received)
+}
+
+/// Required logs belong to the original authenticated process, not a host name or
+/// Hello running inventory. None preserves legacy contracts; a strict attempt needs
+/// an explicit attempt and arrival proof even for a read-only Received replay.
+pub(crate) fn completion_report_allowed(c:&crate::sql::Connection,job:&str,agent:&str,expected:Option<u32>,nonce:Option<&str>,wire:&[u8])->anyhow::Result<bool> {
+    let row:Option<(u32,String)>=c.query_row("SELECT CASE WHEN job_id IS NULL THEN attempt+1 ELSE MAX(attempt,1) END,status FROM jobs WHERE id=?1",[job],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+    let Some(attempt)=expected.or_else(||row.as_ref().map(|r|r.0)) else{return Ok(true)};
+    let Some(binding)=crate::logs::accepted::producer::registered(c,job,attempt,agent)? else{return Ok(true)};
+    if expected!=Some(binding.owner.attempt) || nonce!=Some(binding.owner.process_nonce.as_str()) {return Ok(false);}
+    // Validate the exact declared encoding and first-result identity for BOTH new
+    // acceptance and read-only Received replay; host/inventory cannot substitute it.
+    crate::proto::job_log::result_hash(wire)?;
+    Ok(match crate::logs::accepted::producer::stored_result(c,&binding)? {
+        Some(first)=>first==wire,
+        None=>!row.is_some_and(|(_,status)|Status::parse(&status).is_terminal()),
+    })
+}
+
+fn completion_in(c:&crate::sql::Connection,job:&str,attempt:u32,agent:&str)->anyhow::Result<Option<crate::proto::JobResult>> {
+    if let Some(binding)=crate::logs::accepted::producer::registered(c,job,attempt,agent)? {
+        let bytes=crate::logs::accepted::producer::stored_result(c,&binding)?;
+        return bytes.map(|bytes|crate::proto::read_whole(&bytes).map_err(|error|anyhow::anyhow!("original producer result: {}",error.why("JobResult")))).transpose();
+    }
+    let payload:Option<String>=c.query_row("SELECT payload FROM ci_completion_reports WHERE job = ?1 AND attempt = ?2 AND agent = ?3",params![job,attempt,agent],|r|r.get(0)).optional()?;
+    payload.map(|payload|serde_json::from_str(&payload).map_err(anyhow::Error::from)).transpose()
 }
 
 pub(crate) async fn completion(hub: &Hub, job: &str, attempt: u32, agent: &str) -> anyhow::Result<Option<crate::proto::JobResult>> {
-    let (job, agent) = (job.to_owned(), agent.to_owned());
-    let payload: Option<String> = hub.store.call(move |c| Ok(c.query_row("SELECT payload FROM ci_completion_reports WHERE job = ?1 AND attempt = ?2 AND agent = ?3", params![job, attempt, agent], |r| r.get(0)).optional()?)).await?;
-    payload.map(|p| serde_json::from_str(&p).map_err(anyhow::Error::from)).transpose()
+    let (job,agent)=(job.to_owned(),agent.to_owned());
+    hub.store.call(move |c|completion_in(c,&job,attempt,&agent)).await
+}
+
+/// U05: readonly Received replay validates the original exact report in the SAME
+/// callback as its positive ledger/retired receipt lookup. It stages no work.
+pub(crate) fn completion_report_received(c:&crate::sql::Connection,job:&str,agent:&str,attempt:u32,nonce:Option<&str>,wire:&[u8])->anyhow::Result<bool> {
+    anyhow::ensure!(completion_report_allowed(c,job,agent,Some(attempt),nonce,wire)?,"required original replay differs from its durable report or authenticated process; channel input must retry");
+    if completion_in(c,job,attempt,agent)?.is_some() {return Ok(true)}
+    Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM jobs j JOIN ci_attempts a ON a.leg_id = j.id WHERE j.id = ?1 AND j.agent = ?3 AND a.runner = ?3 AND a.number = ?2 AND (CASE WHEN j.job_id IS NULL THEN j.attempt + 1 ELSE MAX(j.attempt, 1) END) = ?2 AND j.status IN ('succeeded', 'failed', 'cancelled', 'skipped') AND a.status = 'done' AND COALESCE(a.failure_class, '') != 'runner-lost')",params![job,attempt,agent],|r|r.get::<_,bool>(0))?)
+}
+
+/// U05: the result ledger and producer closure are separate receipts. No-contract
+/// legacy work is unchanged; a required contract never becomes legacy on missing data.
+pub(crate) fn completion_logs_ready(c:&crate::sql::Connection,job:&str,attempt:u32,agent:&str)->anyhow::Result<bool> {
+    let Some(binding)=crate::logs::accepted::producer::registered(c,job,attempt,agent)? else{return Ok(true)};
+    let Some(bytes)=crate::logs::accepted::producer::stored_result(c,&binding)? else{return Ok(false)};
+    Ok(matches!(crate::logs::accepted::producer::close(c,&binding,&bytes)?,crate::logs::accepted::producer::Close::Closed(receipt) if matches!(receipt.view,crate::proto::JobLogViewV1::Captured(_))))
+}
+
+/// Rechecked inside the final status/effect transaction, including replay. A prior
+/// dispatcher check cannot authorize a changed attempt or a missing original receipt.
+fn require_completion_logs(c:&crate::sql::Connection,job:&str)->anyhow::Result<()> {
+    let row:Option<(u32,Option<String>)>=c.query_row("SELECT attempt,agent FROM jobs WHERE id=?1",[job],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+    if let Some((attempt,Some(agent)))=row {
+        anyhow::ensure!(completion_logs_ready(c,job,attempt,&agent)?,"required original producer logs have no own complete captured receipt; terminal effects remain pending");
+    }
+    Ok(())
 }
 
 pub(crate) async fn pending_completions(hub: &Hub) -> anyhow::Result<Vec<(String, u32, String)>> {
@@ -342,6 +409,10 @@ async fn attempt_end(hub: &Hub, leg: &str, attempt: u32, end: AttemptEnd, losing
 /// borrowed writer connection. This helper never commits, opens another Store or emits a
 /// success metric before its caller knows the enclosing transaction committed.
 pub(super) fn attempt_end_in(c: &crate::sql::Connection<'_>, leg: &str, attempt: u32, end: &AttemptEnd, losing: bool, now: i64) -> anyhow::Result<bool> {
+    // Loss/cancel cannot settle/retry this required attempt ahead of its own capture.
+    // Keep the existing logical owner; physical proof/capacity release is independent.
+    let agent:Option<Option<String>>=c.query_row("SELECT runner FROM ci_attempts WHERE leg_id=?1 AND number=?2",params![leg,attempt],|r|r.get(0)).optional()?;
+    if let Some(Some(agent))=agent && !completion_logs_ready(c,leg,attempt,&agent)? {return Ok(false);}
     if losing && c.query_row("SELECT EXISTS(SELECT 1 FROM ci_completion_reports WHERE job = ?1 AND attempt = ?2)", params![leg, attempt], |r| r.get::<_, bool>(0))? { return Ok(false); }
     let rss = end.peak_rss.and_then(|r| i64::try_from(r).ok());
     c.execute("UPDATE ci_attempts SET status = 'done', conclusion = ?3, failure_class = ?4, exit_code = ?5, error = ?6, peak_rss = ?7, cpu_seconds = ?8, finished_at = ?9 WHERE leg_id = ?1 AND number = ?2",
@@ -442,6 +513,7 @@ pub(crate) async fn finish_leg_with_deployment(hub: &Hub, leg: &str, status: Sta
             let c = &tx;
             let now = crate::util::now_unix();
             // One that never started waited until now; an attempt still open ends with it.
+            require_completion_logs(c,&leg)?;
             close_wait(c, &leg, now)?;
             c.execute("UPDATE ci_attempts SET status = 'done', conclusion = ?2, finished_at = ?3 WHERE leg_id = ?1 AND status = 'running'", params![leg, conclusion, now])?;
             c.execute(

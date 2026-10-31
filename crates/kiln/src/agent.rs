@@ -438,6 +438,7 @@ enum Ev {
     Ordinary(Box<OrdinaryDone>),
     /// A periodic U01/U03 retry opportunity; its handler only changes the existing latches.
     OrdinaryRecovery,
+    JobLogChanged(bool),
     /// An exact buffered receiver ticket whose admission exclusion is already durable.
     OrdinaryInput(AdmittedInput),
     /// This SAME local event has already entered the retained outbox.
@@ -468,6 +469,10 @@ fn complete_ordinary_urgent<T:crate::harness::host::Taker+?Sized>(receiver:&mut 
 }
 enum SpoolWork {
     Publish { up: Box<Up>, receipt: retained::Receipt },
+    JobInput(Arc<retained::logs::Input>),
+    JobReply { binding:Box<proto::JobLogBindingV1>,reply:Box<proto::JobLogReplyV1> },
+    JobClean(Box<proto::JobLogBindingV1>),
+    JobNoStart(Box<proto::JobLogBindingV1>),
     Ack(RetainedAcknowledgement),
     Sample { hints: Vec<retained::Receipt>, work: PathBuf, ordinary: bool, legacy: bool, records:Arc<dyn kiln_seams::records::Records>, nonce:String },
 }
@@ -475,13 +480,17 @@ enum SpoolWork {
 // It is discarded with the original ticket on cancellation/Unknown, never cached by a new owner.
 type ServerRead = Result<Carried<ServerMsg, FromServer>, Box<crate::wire::payload::Unreadable>>;
 struct AdmittedInput { ticket: OrdinaryTicket, assignment: Option<Box<ServerRead>> }
+enum SpoolProgress { Evidence(Vec<AgentMsg>,Option<bool>), JobInput, JobReply(crate::wire::channel::Has), JobClean(retained::logs::Clean), JobNoStart }
 enum OrdinaryDone {
-    Initialized { spool: retained::Spool, epoch: Result<String,String> },
+    Initialized { spool: retained::Spool, epoch: Result<String,String>,log_debt:anyhow::Result<bool> },
     Registered { origin: crate::net::Connection, result: Box<anyhow::Result<Incoming>> },
-    Admitted { ticket: OrdinaryTicket, execution: Option<Arc<crate::runner::processes::Execution>>, assignment: Option<Box<ServerRead>>, result: Box<anyhow::Result<Incoming>> },
+    Admitted { ticket: OrdinaryTicket, execution: Option<Arc<crate::runner::processes::Execution>>, producer:Option<Arc<retained::logs::Producer>>,preparation_refusal:Option<String>,spool:Box<retained::Spool>,assignment: Option<Box<ServerRead>>, result: Box<anyhow::Result<Incoming>> },
     Closed { ticket: OrdinaryTicket, execution: Arc<crate::runner::processes::Execution>, reason: String, result: anyhow::Result<()> },
     Committed { closure: OrdinaryClosure, result: Box<anyhow::Result<Incoming>> },
-    Spool { spool: retained::Spool, work: Box<SpoolWork>, result: anyhow::Result<Vec<AgentMsg>>, incoming:Box<Option<anyhow::Result<Option<Incoming>>>> },
+    Spool { spool: retained::Spool, work: Box<SpoolWork>, result: anyhow::Result<SpoolProgress>, incoming:Box<Option<anyhow::Result<Option<Incoming>>>> },
+}
+async fn job_log_change(wait:&mut Option<futures::future::BoxFuture<'static,bool>>)->bool {
+    match wait.as_mut(){Some(wait)=>wait.await,None=>futures::future::pending().await}
 }
 async fn ordinary_completion(io: &mut Option<OrdinaryIo>) -> OrdinaryDone {
     match io.as_mut() { Some(io) => io.await, None => futures::future::pending().await }
@@ -490,18 +499,33 @@ async fn ordinary_completion(io: &mut Option<OrdinaryIo>) -> OrdinaryDone {
 fn recover_ordinary(paused: &mut bool, sample_due: &mut bool) {
     if std::mem::take(paused) { *sample_due = true; }
 }
+#[derive(Clone, Copy)]
+enum JobLogPause { Metadata, Recovery }
+impl JobLogPause {
+    fn for_error(error: &anyhow::Error) -> Self {
+        if error.downcast_ref::<retained::logs::Full>().is_some() { Self::Metadata } else { Self::Recovery }
+    }
+}
+fn recover_job_logs(blocked: &mut std::collections::BTreeMap<(String,u64),JobLogPause>, wait_failed: &mut bool) {
+    if std::mem::take(wait_failed) { blocked.clear(); }
+    else { blocked.retain(|_,pause| matches!(pause,JobLogPause::Metadata)); }
+}
 fn spool_io(mut spool: retained::Spool, work: SpoolWork) -> OrdinaryIo {
     async move {
         let result = async {
             match &work {
-                SpoolWork::Publish { receipt, .. } => { spool.publish(receipt).await?; Ok(Vec::new()) },
+                SpoolWork::Publish { receipt, .. } => { spool.publish(receipt).await?; Ok(SpoolProgress::Evidence(Vec::new(),None)) },
+                SpoolWork::JobInput(input)=>{spool.publish_job_log(input).await?;Ok(SpoolProgress::JobInput)},
+                SpoolWork::JobReply{binding,reply}=>Ok(SpoolProgress::JobReply(spool.receive_job_log(binding,reply).await?)),
+                SpoolWork::JobClean(binding)=>Ok(SpoolProgress::JobClean(spool.clean_job_log_page(binding).await?)),
+                SpoolWork::JobNoStart(binding)=>{spool.no_start_job_log(binding).await?;Ok(SpoolProgress::JobNoStart)},
                 SpoolWork::Ack(value) => {
                     match value {
                         RetainedAcknowledgement::Frontier(frontier) => spool.received_ordinary(frontier).await?,
                         RetainedAcknowledgement::Legacy(receipt) => spool.received(receipt).await?,
                         RetainedAcknowledgement::Domain(_) => anyhow::bail!("ordinary domain acknowledgement is not a spool receipt"),
                     }
-                    Ok(Vec::new())
+                    Ok(SpoolProgress::Evidence(Vec::new(),None))
                 },
                 SpoolWork::Sample { hints, work, ordinary, legacy, .. } => {
                     for hint in hints { spool.publish(hint).await?; }
@@ -513,7 +537,7 @@ fn spool_io(mut spool: retained::Spool, work: SpoolWork) -> OrdinaryIo {
                         messages.push(AgentMsg::JobEvent{job,json});
                     } }
                     if *legacy { for receipt in spool.pending().await? { messages.push(receipt.message()?); } }
-                    Ok(messages)
+                    Ok(SpoolProgress::Evidence(messages,Some(spool.job_log_debt().await?)))
                 },
             }
         }.await;
@@ -1353,7 +1377,8 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
             let present=crate::wire::keep::ordinary_incoming_present(&*records).await?;
             spool.initialize_ordinary(&crate::util::new_id(),pristine && !present).await
         }.await.map_err(|error:anyhow::Error|format!("{error:#}"));
-        OrdinaryDone::Initialized{spool,epoch}
+        let log_debt=spool.job_log_debt().await;
+        OrdinaryDone::Initialized{spool,epoch,log_debt}
     }.boxed());
     let mut ordinary_epoch: Result<String,String> = Err("ordinary producer initialization pending".into());
     let mut ordinary_incoming: Option<Incoming> = None;
@@ -1367,6 +1392,18 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
     let mut spool_publication_pending=false;
     let mut ordinary_dispatch: Option<AdmittedInput> = None;
     let mut ordinary_execution: Option<Arc<crate::runner::processes::Execution>> = None;
+    let mut ordinary_producer:Option<Arc<retained::logs::Producer>>=None;
+    let mut job_logs=std::collections::BTreeMap::<String,Arc<retained::logs::Producer>>::new();
+    let mut job_log_sender=crate::wire::channel::Sender::new(8<<20,Duration::from_secs(3));
+    let mut job_log_blocked=std::collections::BTreeMap::<(String,u64),JobLogPause>::new();
+    let mut job_log_after:Option<String>=None;
+    let mut job_log_cleanup=std::collections::BTreeSet::<String>::new();
+    let mut job_log_nostart=std::collections::BTreeSet::<String>::new();
+    let mut job_log_send_after:Option<(String,u64)>=None;
+    let mut job_log_wait:Option<futures::future::BoxFuture<'static,bool>>=None;
+    let mut job_log_wait_failed=false;
+    let mut job_log_debt=true;
+    let mut server_job_log_caps=0u64;
     // Unknown preparation keeps its exact Execution/Gate, never a new attempt or NoStart.
     let mut ordinary_unknown: Option<(OrdinaryTicket,Option<Arc<crate::runner::processes::Execution>>)> = None;
     let mut spool_waits=VecDeque::<SpoolWork>::new();
@@ -1827,7 +1864,7 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
         // Start normal effects in order. Buffered later ordinary frames do not wait for a
         // three-second retransmit; urgent exact tickets remain selectable during this I/O.
         if ordinary_io.is_none() && ordinary_pending.is_none() && ordinary_unknown.is_none() && !ordinary_paused
-            && spool_waits.is_empty() && !spool_sample_due
+            && spool_waits.is_empty() && !spool_sample_due && retained_spool.is_some()
             && let (Some(origin),Some(stream))=(ordinary_registered,ordinary_stream.as_deref())
             && Some(origin)==server_connection
         {
@@ -1846,26 +1883,52 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                     Ok(message @ ServerMsg::AssignV2{..})=>Some(Box::new(crate::wire::payload_of(message))),
                     _=>None,
                 };
+                let log_binding=assignment.as_deref().and_then(|read|match read {
+                    Ok(Carried::Read(FromServer::AssignV2(assignment)))=>Some(proto::job_log::assignment_binding(assignment,server_job_log_caps)),
+                    _=>None,
+                });
+                // Registration Unknown may have committed its reservation. Only an
+                // authoritative SAME-owner debt read can clear clean retirement.
+                if log_binding.as_ref().is_some_and(|binding|matches!(binding,Ok(Some(_)))){job_log_debt=true;}
+                // Unsupported required input acquires no Gate; its SAME typed head
+                // reaches the ordinary refusal boundary without starting effects.
                 let owner=assignment.as_deref().and_then(|read|match read {
-                    Ok(Carried::Read(FromServer::AssignV2(assignment)))=>assignment.ordinary_owner.clone(),
+                    Ok(Carried::Read(FromServer::AssignV2(assignment))) if log_binding.as_ref().is_none_or(Result::is_ok)=>assignment.ordinary_owner.clone(),
                     _=>None,
                 });
                 ordinary_pending=Some(PendingOrdinary{job:owner.as_ref().map(|owner|owner.job.clone()),ticket:ticket.clone(),cancelled:false});
                 let (paths,work,records,nonce)=(admission_paths.clone(),o.work_dir.clone(),Arc::clone(&ordinary_records),ticket.nonce().to_owned());
+                let spool=retained_spool.take().context("original admission lost its SAME Spool")?;
                 ordinary_io=Some(async move {
                     let mut execution=None;
+                    let mut producer=None;
+                    let mut preparation_refusal=None;
                     let result=async {
                         if let Some(owner)=owner {
                             execution=Some(crate::rt::blocking(move || crate::runner::processes::Execution::ordinary_in(paths,work,owner)).await??);
                         }
                         let state=crate::wire::keep::accept_ordinary_incoming_state(&*records,&nonce,ticket.origin(),ticket.stream(),ticket.seq()).await?;
+                        if let Some(Ok(Some(binding)))=log_binding {
+                            match spool.register_job_log(binding,execution.as_deref().context("producer admission has no original Execution")?).await {
+                                Ok(original)=>producer=Some(original),
+                                Err(error) if error.downcast_ref::<retained::logs::Full>().is_some()=>{
+                                    // A known quota refusal before any writer/child can close
+                                    // its SAME admitted Gate NoStart; Unknown cannot take this path.
+                                    let held=execution.clone().context("producer quota refusal lost its exact Gate")?;
+                                    crate::rt::blocking(move||held.close_ordinary_admission(true)).await??;
+                                    preparation_refusal=Some("required producer-log admission quota is full; no writer started".into());
+                                    return Ok(state);
+                                },
+                                Err(error)=>return Err(error),
+                            }
+                        }
                         if let Some(execution)=&execution {
                             let held=Arc::clone(execution);
                             crate::rt::blocking(move || held.close_ordinary_admission(false)).await??;
                         }
                         Ok(state)
                     }.await;
-                    OrdinaryDone::Admitted{ticket,execution,assignment,result:Box::new(result)}
+                    OrdinaryDone::Admitted{ticket,execution,producer,preparation_refusal,spool:Box::new(spool),assignment,result:Box::new(result)}
                 }.boxed());
             }
         }
@@ -1875,7 +1938,18 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                 spool_sample_due=false;
                 let hints=pool_execs.closed_owner_hints().iter().map(|said|serde_json::to_string(said).map_err(anyhow::Error::from).and_then(|json|retained::Receipt::executor(&json)?.context("closed executor lacks receipt"))).collect::<anyhow::Result<Vec<_>>>()?;
                 ordinary_io=Some(spool_io(spool,SpoolWork::Sample{hints,work:o.work_dir.clone(),ordinary:connected && welcomed && server_retained_received && ordinary_registered==server_connection && ordinary_registered.is_some(),legacy:connected && welcomed && server_retained_received,records:Arc::clone(&ordinary_records),nonce:process_nonce.clone()}));
-            } else { retained_spool=Some(spool); }
+            } else {
+                // One original pending input per producer; turn order is bounded and fair.
+                let mut ready=job_logs.iter().filter_map(|(stream,producer)|producer.pending().map(|input|(stream.clone(),input))).filter(|(stream,input)|!job_log_blocked.contains_key(&(stream.clone(),input.number()))).collect::<Vec<_>>();
+                ready.sort_by_key(|(stream,_)|job_log_after.as_ref().is_some_and(|after|stream<=after));
+                if let Some((stream,input))=ready.into_iter().next(){job_log_after=Some(stream);ordinary_io=Some(spool_io(spool,SpoolWork::JobInput(input)));}
+                else{retained_spool=Some(spool);}
+            }
+        }
+        if job_log_wait.is_none() && !job_log_wait_failed && !job_log_blocked.is_empty() {
+            let after=job_logs.values().filter_map(|producer|producer.pending()).map(|input|input.after()).min().unwrap_or(0);
+            let records=Arc::clone(&ordinary_records);
+            job_log_wait=Some(async move {records.wait("retained-meta",after).await.is_ok()}.boxed());
         }
         if let Some(until) = lingering
             && ((crate::observe::collect::get().is_none_or(|c| c.stopped()) && crate::observe::last_written()) || Instant::now() >= until)
@@ -1884,18 +1958,18 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
         }
         // Ephemeral agents leave once their one job is done and everything is delivered: its
         // result received, or given 30 s (a server older than receipts never says).
-        if o.ephemeral && served_dedicated && jobs.is_empty() && buffer.is_empty() && retained_blocked.is_none() && deferred_control.pending.is_empty() && up_rx.is_empty() && unreceived.values().all(|(at, _)| at.elapsed() > Duration::from_secs(30)) {
+        if o.ephemeral && served_dedicated && jobs.is_empty() && buffer.is_empty() && retained_blocked.is_none() && deferred_control.pending.is_empty() && up_rx.is_empty() && !job_log_debt && job_logs.is_empty() && unreceived.values().all(|(at, _)| at.elapsed() > Duration::from_secs(30)) {
             tracing::info!("ephemeral agent finished its job; exiting");
             crate::rt::sleep(Duration::from_millis(500)).await;
             return Ok(());
         }
-        if o.ephemeral && !served_dedicated && jobs.is_empty() && started.elapsed() > Duration::from_secs(900) {
+        if o.ephemeral && !served_dedicated && jobs.is_empty() && !job_log_debt && started.elapsed() > Duration::from_secs(900) {
             anyhow::bail!("ephemeral agent received no job within 15 minutes");
         }
-        if draining && jobs.is_empty() && o.ephemeral {
+        if draining && jobs.is_empty() && o.ephemeral && !job_log_debt && job_logs.is_empty() {
             return Ok(());
         }
-        if retiring && jobs.is_empty() && terms.is_empty() && retire_at.is_some_and(|t| Instant::now() >= t) {
+        if retiring && jobs.is_empty() && terms.is_empty() && !job_log_debt && job_logs.is_empty() && retire_at.is_some_and(|t| Instant::now() >= t) {
             tracing::info!("handed everything to the new build, and its own jobs are done: this runner retires");
             // What its tracers' spans counted, written before it goes, as a stop's is.
             crate::observe::ddtrace::finish(Duration::from_secs(3)).await;
@@ -1914,6 +1988,7 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
             futures::select_biased! {
                 ()=shutdown_or_tick(&shutdown,lingering.is_some()).fuse()=>Ev::Shutdown,
                 result=ordinary_completion(&mut ordinary_io).fuse()=>Ev::Ordinary(Box::new(result)),
+                healthy=job_log_change(&mut job_log_wait).fuse()=>Ev::JobLogChanged(healthy),
                 ()=ordinary_recovery_tick.tick().fuse()=>Ev::OrdinaryRecovery,
                 ev=events.recv().fuse()=>Ev::Net(ev.ok()),
                 ()=sample_tick.tick().fuse()=>Ev::Sample,
@@ -1924,6 +1999,7 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
             futures::select_biased! {
                 () = shutdown_or_tick(&shutdown, lingering.is_some()).fuse() => Ev::Shutdown,
                 result = ordinary_completion(&mut ordinary_io).fuse() => Ev::Ordinary(Box::new(result)),
+                healthy=job_log_change(&mut job_log_wait).fuse()=>Ev::JobLogChanged(healthy),
                 () = sleep_until_opt(Some(retry_at)).fuse() => match retained_blocked.take() {
                     Some((up, _)) => Ev::Up(up),
                     None => Ev::Watchdog,
@@ -1936,6 +2012,7 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
             futures::select_biased! {
             () = shutdown_or_tick(&shutdown, lingering.is_some()).fuse() => Ev::Shutdown,
             result = ordinary_completion(&mut ordinary_io).fuse() => Ev::Ordinary(Box::new(result)),
+                healthy=job_log_change(&mut job_log_wait).fuse()=>Ev::JobLogChanged(healthy),
             () = ordinary_recovery_tick.tick().fuse() => Ev::OrdinaryRecovery,
             ev = events.recv().fuse() => Ev::Net(ev.ok()),
             r = done_rx.recv().fuse() => match r { Ok((r, attempt)) => Ev::Done(r, attempt), Err(_) => Ev::Watchdog },
@@ -1959,24 +2036,35 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                 Ok(b) => Ev::Bg(b),
                 Err(_) => Ev::Watchdog,
             },
-            () = sleep_until_opt(retire_at.filter(|_| retiring && jobs.is_empty() && terms.is_empty())).fuse() => Ev::Watchdog,
+            () = sleep_until_opt(retire_at.filter(|_| retiring && jobs.is_empty() && terms.is_empty() && !job_log_debt && job_logs.is_empty())).fuse() => Ev::Watchdog,
             }
         } else {
             // Free room without making retained durability block network urgency.
             futures::select_biased! {
                 () = shutdown_or_tick(&shutdown, lingering.is_some()).fuse() => Ev::Shutdown,
                 result = ordinary_completion(&mut ordinary_io).fuse() => Ev::Ordinary(Box::new(result)),
+                healthy=job_log_change(&mut job_log_wait).fuse()=>Ev::JobLogChanged(healthy),
                 () = ordinary_recovery_tick.tick().fuse() => Ev::OrdinaryRecovery,
                 ev = events.recv().fuse() => Ev::Net(ev.ok()),
                 up = up_rx.recv().fuse() => match up { Ok(up) => Ev::Up(up), Err(_) => Ev::Watchdog },
             }
         };
         match ev {
-            Ev::OrdinaryRecovery => recover_ordinary(&mut ordinary_paused, &mut spool_sample_due),
+            Ev::OrdinaryRecovery => {
+                for stream in &job_log_cleanup{if let Some(producer)=job_logs.get(stream)&&spool_waits.len()<64{spool_waits.push_back(SpoolWork::JobClean(Box::new(producer.binding().clone())));}}
+                for stream in &job_log_nostart{if let Some(producer)=job_logs.get(stream)&&spool_waits.len()<64{spool_waits.push_back(SpoolWork::JobNoStart(Box::new(producer.binding().clone())));}}
+                recover_ordinary(&mut ordinary_paused, &mut spool_sample_due);
+                // A quiet healthy metadata wait cannot rescue a transient pre-commit
+                // failure. This existing cadence retries that SAME original input;
+                // dedicated quota Full still waits for authoritative metadata progress.
+                recover_job_logs(&mut job_log_blocked,&mut job_log_wait_failed);
+            },
+            Ev::JobLogChanged(healthy)=>{job_log_wait=None;if healthy{job_log_blocked.clear();}else{job_log_wait_failed=true;}},
             Ev::Ordinary(done) => {
                 ordinary_io=None;
                 match *done {
-                    OrdinaryDone::Initialized{spool,epoch}=> {
+                    OrdinaryDone::Initialized{spool,epoch,log_debt}=> {
+                        job_log_debt=log_debt.unwrap_or(true);
                         retained_spool=Some(spool);ordinary_epoch=epoch;
                         if let Err(error)=&ordinary_epoch {tracing::warn!(error,"ordinary admission remains fenced; existing sessions retain their owners");}
                     },
@@ -1991,7 +2079,10 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                         },
                         Err(error)=>tracing::warn!(error=%format!("{error:#}"),"incoming binding not registered; strict readiness remains fenced"),
                     },
-                    OrdinaryDone::Admitted{ticket,execution,assignment,result}=>match *result {
+                    OrdinaryDone::Admitted{ticket,execution,producer,preparation_refusal,spool,assignment,result}=>{
+                        retained_spool=Some(*spool);
+                        if let Some(producer)=&producer{job_log_debt=true;job_logs.insert(proto::job_log::stream(producer.binding())?,Arc::clone(producer));}
+                        match *result {
                         Ok(state)=> {
                             ordinary_incoming=Some(state);
                             let same=ordinary_pending.as_ref().is_some_and(|pending|pending.ticket.same_identity(&ticket)
@@ -1999,7 +2090,13 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                             let valid=same && !shutdown.is_cancelled() && Some(ticket.origin())==server_connection && ordinary_registered==Some(ticket.origin());
                             let cancelled=ordinary_pending.as_ref().is_some_and(|pending|pending.cancelled);
                             if valid && !cancelled && wire_in.ordinary_admitted(&ticket).is_ok() {
-                                ordinary_execution=execution;ordinary_dispatch=Some(AdmittedInput{ticket,assignment});
+                                if let Some(reason)=preparation_refusal {
+                                    wire_in.ordinary_effect_done(&ticket,Some((crate::wire::channel::Refusal::Refused,reason)))?;
+                                    ordinary_pending=None;
+                                }else{
+                                    ordinary_execution=execution;ordinary_producer=producer;ordinary_dispatch=Some(AdmittedInput{ticket,assignment});
+                                }
+                            } else if preparation_refusal.is_some(){ordinary_pending=None;
                             } else if let Some(execution)=execution {
                                 ordinary_io=Some(close_ordinary_io(ticket,execution,"the original pending Start was cancelled or its incoming authority retired".into()));
                             } else {ordinary_pending=None;}
@@ -2008,10 +2105,15 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                             tracing::warn!(error=%format!("{error:#}"),"original admission remains unknown; no effect or wire answer is invented");
                             ordinary_unknown=Some((ticket,execution));ordinary_pending=None;
                         },
+                    }
                     },
                     OrdinaryDone::Closed{ticket,execution,reason,result}=> {
                         match result {
                             Ok(())=> {
+                                for producer in job_logs.values().filter(|producer|producer.binding().owner.execution==execution.identity()) {
+                                    let stream=proto::job_log::stream(producer.binding())?;job_log_nostart.insert(stream);
+                                    if spool_waits.len()<64{spool_waits.push_back(SpoolWork::JobNoStart(Box::new(producer.binding().clone())));}
+                                }
                                 if Some(ticket.origin())==server_connection && ordinary_registered==Some(ticket.origin())
                                     && let Err(error)=wire_in.ordinary_effect_done(&ticket,Some((crate::wire::channel::Refusal::Refused,reason)))
                                 {
@@ -2069,15 +2171,41 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                                 tracing::warn!(error=%format!("{error:#}"),"retained local event still awaits durable publication");
                                 retained_blocked=Some((*up,Instant::now()+Duration::from_secs(1)));
                             },
-                            (_,Ok(messages))=>for message in messages {
+                            (SpoolWork::JobInput(input),Ok(SpoolProgress::JobInput))=>{
+                                let stream=proto::job_log::stream(input.binding())?;
+                                if let Some(Some(crate::wire::channel::Frame::Item{seq,body,..}))=input.take_published() {
+                                    let next=job_log_sender.next_sequence(&stream);
+                                    if seq==next {anyhow::ensure!(job_log_sender.push(&stream,body)==Ok(seq),"durable producer Sender charge/sequence diverged; bytes remain retained");}
+                                    else{anyhow::ensure!(seq<next,"durable producer Sender has an original sequence gap");}
+                                }
+                                let producer=job_logs.get(&stream).context("durable input lost its original producer")?;
+                                producer.complete(&input)?;
+                            },
+                            (SpoolWork::JobInput(input),Err(error))=>{
+                                job_log_blocked.insert((proto::job_log::stream(input.binding())?,input.number()),JobLogPause::for_error(&error));
+                                tracing::warn!(error=%format!("{error:#}"),"original producer input remains parked; controls and own receipts remain selectable");
+                            },
+                            (SpoolWork::JobReply{binding,..},Ok(SpoolProgress::JobReply(has)))=>{
+                                job_log_sender.on_frame(crate::wire::channel::Frame::Ack(has));
+                                job_log_cleanup.insert(proto::job_log::stream(&binding)?);
+                                if spool_waits.len()<64{spool_waits.push_back(SpoolWork::JobClean(binding));}
+                            },
+                            (SpoolWork::JobClean(binding),Ok(SpoolProgress::JobClean(progress)))=>match progress{
+                                retained::logs::Clean::Finished=>{let stream=proto::job_log::stream(&binding)?;job_logs.remove(&stream);job_log_sender.drop_stream(&stream);job_log_blocked.retain(|(s,_),_|s!=&stream);job_log_cleanup.remove(&stream);},
+                                retained::logs::Clean::More=>if spool_waits.len()<64{spool_waits.push_back(SpoolWork::JobClean(binding));},
+                                retained::logs::Clean::Waiting=>{job_log_cleanup.remove(&proto::job_log::stream(&binding)?);},
+                            },
+                            (SpoolWork::JobNoStart(binding),Ok(SpoolProgress::JobNoStart))=>{let stream=proto::job_log::stream(&binding)?;job_logs.remove(&stream);job_log_nostart.remove(&stream);},
+                            (_,Ok(SpoolProgress::Evidence(messages,debt)))=>{if let Some(debt)=debt{job_log_debt=debt;}for message in messages {
                                 match crate::wire::payload::retained_replay(&message) {
                                     crate::wire::payload::RetainedReplay::OrdinaryPublication if ordinary_registered.is_none() || ordinary_registered!=server_connection => continue,
                                     crate::wire::payload::RetainedReplay::Executor(said) => pool_execs.recovered(&said),
                                     _ => {},
                                 }
                                 deferred_control.enqueue(&uplink.0,Up::Msg(message))?;
-                            },
+                            }},
                             (_,Err(error))=>tracing::warn!(error=%format!("{error:#}"),"retained operation remains recoverable in its original owner"),
+                            (_,Ok(_))=>anyhow::bail!("SAME Spool returned an incompatible typed operation receipt"),
                         }
                     },
                 }
@@ -2680,6 +2808,7 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                 server_limit = false;
                 server_job_attempt = false;
                 server_retained_received = false;
+                server_job_log_caps=0;job_log_sender.down();
                 limit_said = None;
                 if let Some(s) = &sync {
                     s.connected(false);
@@ -3158,6 +3287,7 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                     // A leg of the CI engine (docs/ci.md W06): this runner announces `CAP_CI2`.
                     Carried::Read(FromServer::AssignV2(a)) => {
                         let mut a = *a;
+                        if let Err(error)=proto::job_log::assignment_binding(&a,server_job_log_caps){refuse(&mut answer_after,crate::wire::channel::Refusal::Unsupported,format!("{error:#}"));continue;}
                         let id = a.job_id.clone();
                         let attempt = Some(a.attempt);
                         // A pool's leg runs in its executor, beside this runner's own slots.
@@ -3285,13 +3415,20 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                         hold_cpus(&id, holds);
                         jobs.insert(id.clone(), Running { _admission: admission, cancel: cancel.clone(), attempt, grace_stop: Shutdown::new(), execution: Arc::clone(&execution), pooled, holds });
                         tracing::info!(job = %id, leg = %a.leg.name, "running leg");
-                        let leg = crate::runner::runtime::Leg { a, work_dir: o.work_dir.clone(), runner_name: name.clone(), up: uplink.clone(), cancel, http: http.clone(), warm: std::sync::Arc::new(parking_lot::Mutex::new(warm)), cache_max: o.declared.cache_max.as_deref().and_then(crate::runner::cache::parse_size), legacy: None };
+                        let producer=if a.log_contract.is_some(){
+                            let producer=ordinary_producer.take().context("required producer lost its original prepared continuation")?;
+                            execution.require_native_attempt(&id,a.attempt)?;
+                            anyhow::ensure!(producer.binding().owner.execution==execution.identity(),"producer original physical owner changed");Some(producer)
+                        }else{None};
+                        let leg = crate::runner::runtime::Leg { producer:producer.as_ref().map(|producer|producer.foreground()), a, work_dir: o.work_dir.clone(), runner_name: name.clone(), up: uplink.clone(), cancel, http: http.clone(), warm: std::sync::Arc::new(parking_lot::Mutex::new(warm)), cache_max: o.declared.cache_max.as_deref().and_then(crate::runner::cache::parse_size), legacy: None };
                         let done = done_tx.clone();
                         // On the `firecracker` executor, in a microVM of its own (W13-R05).
                         #[cfg(target_os = "linux")]
                         let microvm = (leg.a.executor.kind == "firecracker").then(|| microvm_ca.clone());
                         let scope = Arc::clone(&execution);
-                        crate::rt::spawn(scope.scope(async move {
+                        let strict_up=uplink.clone();
+                        crate::rt::spawn(async move {
+                          let result = scope.scope(async move {
                             #[cfg(target_os = "linux")]
                             let result = match microvm {
                                 Some(ca) => crate::runner::firecracker::run(leg, Some(ca)).await,
@@ -3300,8 +3437,17 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                             #[cfg(not(target_os = "linux"))]
                             let result = leg.run().await;
                             execution.stop().await;
-                            let _ = done.send((result, attempt)).await;
-                        }));
+                            let _ = done.send((result.clone(), attempt)).await;
+                            result
+                          }).await;
+                          // Logical outbox debt retains original bytes/binding only.
+                          // All physical task/Execution custody ended before End waits.
+                          drop(scope);
+                            if let Some(producer)=producer {
+                                // Actual joined runtime, never grace-stop/queue-empty inference.
+                                if let Err(error)=producer.end(&strict_up,&result).await{tracing::warn!(error=%format!("{error:#}"),"original producer End remains incomplete/pending");}
+                            }
+                        });
                         continue;
                     }
                     // Start or stop a pool's executor (docs/ci.md W13-R09).
@@ -3355,6 +3501,7 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                         server_kept.extend(sessions.into_iter().map(|k| (k.session.clone(), k)));
                     }
                     ServerMsg::Caps { caps } => {
+                        server_job_log_caps=caps;
                         server_layout = origin.filter(|_| caps & proto::CAP_UNIFIED_LAYOUT != 0);
                         server_activation = server_layout.filter(|_| caps & proto::CAP_EXPLICIT_ACTIVATION != 0);
                         server_shaped_commands = caps & proto::CAP_FIRECRACKER_SHAPE != 0;
@@ -3425,6 +3572,18 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                     // What the server has of this runner's streams, its answers and wants: what it
                     // lacks goes; a stream it lost starts over, its snapshot first.
                     ServerMsg::Wire(frame) => {
+                        let frame=match frame {
+                            crate::wire::channel::Frame::Want{stream,from} if stream.starts_with("jlog:")=>{
+                                if current_origin&&proto::check_job_log_caps(server_job_log_caps).is_ok(){job_log_sender.on_frame(crate::wire::channel::Frame::Want{stream,from});}
+                                continue;
+                            },
+                            crate::wire::channel::Frame::Ack(has) if has.stream.starts_with("jlog:")=>continue,
+                            crate::wire::channel::Frame::Have(mut all)=>{
+                                if current_origin&&proto::check_job_log_caps(server_job_log_caps).is_ok(){job_log_sender.on_frame(crate::wire::channel::Frame::Have(Vec::new()));}
+                                all.retain(|has|!has.stream.starts_with("jlog:"));crate::wire::channel::Frame::Have(all)
+                            },
+                            frame=>frame,
+                        };
                         updates.on_frame(frame);
                         for key in updates.take_stale() {
                             if let Some(id) = key.strip_prefix("s:") {
@@ -3654,8 +3813,17 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                             refuse(&mut answer_after, crate::wire::channel::Refusal::Unknown, format!("no job {job} runs here"));
                         }
                     }
+                    ServerMsg::JobLogReplyV1(reply)=>{
+                        if !current_origin || proto::check_job_log_caps(server_job_log_caps).is_err(){continue;}
+                        let id=match &reply {proto::JobLogReplyV1::Committed(receipt)=>receipt.binding_id,proto::JobLogReplyV1::Refused{binding_id,..}|proto::JobLogReplyV1::Unknown{binding_id,..}=>*binding_id};
+                        let stream=format!("jlog:{}",hex::encode(id));
+                        if let Some(producer)=job_logs.get(&stream) && producer.binding().owner.process_nonce==process_nonce && spool_waits.len()<64 {
+                            spool_waits.push_back(SpoolWork::JobReply{binding:Box::new(producer.binding().clone()),reply:Box::new(reply)});
+                        }
+                    },
                     ServerMsg::Drain => draining = true,
                     ServerMsg::Retire { instance } => {
+                        if job_log_debt || !job_logs.is_empty(){tracing::warn!("retained producer input prevents automatic process retirement");continue;}
                         // An older runner process of this machine holds nothing any more: stop
                         // the service this instance replaces (it checks for terminals itself).
                         let state_dir = o.state_dir.clone();
@@ -4226,6 +4394,12 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
             }
             event @ (Ev::Up(_) | Ev::UpDurable(_)) => {
                 let (mut up,already_durable)=match event {Ev::Up(up)=>(up,false),Ev::UpDurable(up)=>(up,true),_=>continue};
+                if let Up::JobLog(id)=&up {
+                    // This bounded hint contains no byte or admission ownership. The
+                    // SAME retained producer map is the sole source of original inputs.
+                    if !job_logs.contains_key(&format!("jlog:{}",hex::encode(id))){tracing::debug!("unbound producer wake ignored");}
+                    continue 'events;
+                }
                 // U03: commit retained evidence before its first transmission. Completion
                 // receipts never clear this independent crash-replay outbox.
                 let retained_evidence = match &up {
@@ -4256,6 +4430,7 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                 }
                 let (lane, kind, data) = match &up {
                     Up::Msg(m) => (LANE_CONTROL, Kind::Control, proto::encode(m)),
+                    Up::JobLog(_)=>continue 'events,
                     Up::Log(c) => (LANE_LOGS, Kind::Log, proto::encode(c)),
                     Up::Term(m) => (LANE_TERM, Kind::Term, proto::encode(m)),
                     Up::Sync(m) => (LANE_SYNC, Kind::Control, proto::encode(m)),
@@ -4382,6 +4557,11 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                 }
             }
             Ev::Heartbeat => {
+                if connected && welcomed && proto::check_job_log_caps(server_job_log_caps).is_ok(){
+                    for frame in job_log_sender.poll_bounded(Instant::now(),32,&mut job_log_send_after){
+                        if let Ok(data)=proto::encode(&frame){net.try_send(SERVER_PEER,proto::LANE_JOB_LOG,Kind::Log,data);}
+                    }
+                }
                 // Each agent session it holds and has no identity for yet, asked for again: a quiet
                 // one's first ask may have come before the server had its Open, and was refused.
                 if server_identity && connected {
@@ -5415,16 +5595,31 @@ mod tests {
             // ingress once the retained owner has completed. It changes latches only.
             io=None;
             let (mut paused,mut sample_due)=(true,false);
+            // U05: the store can recover without any metadata write. Its real quiet
+            // wait remains Pending, so transient original inputs need this SAME tick.
+            use kiln_seams::records::Records as _;
+            let records=kiln_seams::records::SimRecords::new();
+            let metadata_head=records.head().await?;
+            let mut quiet=records.wait("retained-meta",metadata_head).fuse();
+            assert!(futures::poll!(&mut quiet).is_pending());
+            let transient:anyhow::Error=kiln_seams::records::Refusal::Unavailable("before commit; no metadata changed".into()).into();
+            let full:anyhow::Error=retained::logs::Full.into();
+            let retry=("jlog:original".to_owned(),7);
+            let quota_wait=("jlog:full".to_owned(),9);
+            let mut blocked=std::collections::BTreeMap::from([(retry.clone(),JobLogPause::for_error(&transient)),(quota_wait.clone(),JobLogPause::for_error(&full))]);
+            let mut wait_failed=false;
             let recovered=futures::select_biased! {
                 _=ordinary_completion(&mut io).fuse()=>anyhow::bail!("idle I/O completed"),
                 ()=recovery_tick.tick().fuse()=>Ev::OrdinaryRecovery,
                 _=events.recv().fuse()=>anyhow::bail!("ready ingress starved due recovery"),
             };
             match recovered {
-                Ev::OrdinaryRecovery=>recover_ordinary(&mut paused,&mut sample_due),
+                Ev::OrdinaryRecovery=>{recover_ordinary(&mut paused,&mut sample_due);recover_job_logs(&mut blocked,&mut wait_failed);},
                 _=>anyhow::bail!("unexpected recovery event"),
             }
             assert!(!paused && sample_due,"the same paused closure gets a bounded retry opportunity");
+            assert!(!blocked.contains_key(&retry)&&matches!(blocked.get(&quota_wait),Some(JobLogPause::Metadata)),"only transient/Unknown publish errors retry on the existing healthy recovery cadence");
+            assert!(!wait_failed&&records.head().await?==metadata_head&&futures::poll!(&mut quiet).is_pending(),"retry needs neither a failed wait nor a fabricated metadata write");
             assert_eq!(events.len(),1,"pure recovery does not consume urgent ingress");
             assert!(applied.is_empty(),"recovery cannot invent an effect or durable ACK");
             // The immediate first tick is consumed even while healthy. The next tick

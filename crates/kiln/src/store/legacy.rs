@@ -147,6 +147,7 @@ impl Legacy {
 #[derive(Serialize, Deserialize)]
 enum Position { Rows { table: usize, after: Option<Cursor> }, Objects, Finished }
 
+#[cfg(unix)]
 pub(super) fn identity(source: &Path) -> anyhow::Result<String> {
     let legacy = Legacy::open(source)?;
     let identity = format!("main-sql-v1:{}", legacy.identity()?);

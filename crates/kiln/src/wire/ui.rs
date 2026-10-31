@@ -507,6 +507,10 @@ pub enum LogDown {
     End,
     /// What the page sent that couldn't be read.
     Refused(Refused),
+    /// This log has not been declared complete; a socket close alone is not its End.
+    Pending { message: String },
+    /// The output could not be read. Already streamed bytes remain partial, not complete.
+    Unavailable { message: String },
 }
 
 impl LogDown {
@@ -783,6 +787,11 @@ mod tests {
         assert_eq!(stream_up(said), Ok(Up::Unread(unread())));
         assert_eq!(stream_up(r#"{"teleport":{}}"#).map_err(|r| (r.code, r.of)), Err((Code::Unknown, "teleport".to_owned())));
         assert_eq!(stream_up(r#"{"input":"keys"}"#).map_err(|r| r.code), Err(Code::Malformed));
+        // Resource availability is not an unread inbound frame and never serializes as End.
+        assert_eq!(LogDown::Pending { message: "Reading output.".into() }.text(), r#"{"type":"pending","message":"Reading output."}"#);
+        assert_eq!(LogDown::Unavailable { message: "Output is unavailable.".into() }.text(), r#"{"type":"unavailable","message":"Output is unavailable."}"#);
+        assert_eq!(LogDown::End.text(), r#"{"type":"end"}"#);
+        assert_eq!(LogDown::Refused(Refused::binary()).text(), r#"{"type":"refused","of":"binary","code":"malformed","why":"this socket takes text frames, not binary ones"}"#);
     }
 
     /// What a live page's runner says is one of its kinds, one key naming it: each reads, and goes

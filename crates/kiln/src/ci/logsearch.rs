@@ -945,6 +945,7 @@ mod tests {
                         }else{*original=Some(descriptor)}
                     }
                     if mode==2 {return Err(blobs::Refusal::Unavailable("fixture retains original bytes while PUT outcome is unknown".into()))}
+                    if mode==5 {return Err(blobs::Refusal::Invalid{what:"fixture original producer PUT",why:"definite no-write refusal".into()})}
                     let result=self.inner.put(key,bytes,put).await;
                     if mode==1 && result.is_ok() {self.mode.store(2,Ordering::SeqCst);return Err(blobs::Refusal::Unavailable("fixture lost committed PUT acknowledgment".into()))}
                     result
@@ -1323,7 +1324,7 @@ mod tests {
             assert_eq!(c.query_row("SELECT COUNT(*) FROM ci_log_accepted_ops WHERE job='accepted-prefix' AND status='pending'",[],|r|r.get::<_,i64>(0))?,1,"same original operation retained");Ok(())
         }).await?;
         fault.store(3,Ordering::SeqCst);
-        let r1=hub.logs.accepted_completion().await?;
+        let crate::logs::accepted::Completion::Append(r1)=hub.logs.accepted_completion().await? else{anyhow::bail!("legacy fixture received a producer completion")};
         assert!(r1.accepted,"first observed append includes historical prefix: {r1:?}");
         assert!(attempts.load(Ordering::SeqCst)>=2 && exact.load(Ordering::SeqCst),"ambiguous immutable PUT retries preserve exact original key/body/digest/condition");
         fault.store(0,Ordering::SeqCst);
@@ -1364,7 +1365,7 @@ mod tests {
             assert!(hits.iter().all(|h|h.source_qualification==crate::logs::accepted::QUALIFICATION));Ok(())
         }).await?;
         hub.logs.observe_server("accepted-prefix".into(),u32::MAX,b"lateacceptedneedle R2\n".to_vec())?;
-        let r2=hub.logs.accepted_completion().await?;
+        let crate::logs::accepted::Completion::Append(r2)=hub.logs.accepted_completion().await? else{anyhow::bail!("legacy fixture received a producer completion")};
         assert!(r2.accepted && r2.prefix.view==r1.prefix.view && r2.prefix.revision>r1.prefix.revision);
         let expected=r2.prefix.clone();
         hub.store.call(move |c|{
@@ -1514,7 +1515,7 @@ mod tests {
                     event=viewer.recv().fuse()=>match event? {
                         crate::logs::LogEvent::Data{data,..}=>shown.extend_from_slice(&data),
                         crate::logs::LogEvent::End=>return Ok::<_,anyhow::Error>(shown),
-                        crate::logs::LogEvent::Step{..}=>{},
+                        crate::logs::LogEvent::Step{..}|crate::logs::LogEvent::Accepted=>{},
                     },
                     completion=hub.logs.accepted_completion().fuse()=>{completion?;},
                 }
@@ -1596,6 +1597,197 @@ mod tests {
         let refused=hub.store.call(|c|{c.execute("INSERT INTO jobs(id,run_id,key,display,status,labels,needs,spec) VALUES('fifth-reader','log-run','reuse','reuse','queued','[]','[]','{}') ON CONFLICT(id) DO UPDATE SET status='queued'",[])?;Ok(())}).await;
         assert!(matches!(refused.as_ref().err().and_then(|error|error.downcast_ref::<amphora_api::Refusal>()),Some(amphora_api::Refusal::Unavailable(reason)) if reason.contains("retired log job identity cannot be reused")),"retired ID cannot bypass fence with upsert: {refused:?}");
         assert!(hub.blobs.blobs.head(&held).await.is_ok(),"ambiguous retained key cannot be physically removed");
+
+        // Extend this same real Store/Blobs behavior fixture through the producer ledger.
+        // The leaf helper does not forge a transport grant: Net/Hub custody remains a
+        // separate integration witness. These are real durable reservations/publications.
+        use kiln_ci::wire::{JobLogBindingV1,JobLogContractV1,JobLogChunkV1,JobLogEndV1,
+            JobLogCaptureV1,JobLogReplyV1,JobLogRefusalV1,OrdinaryOwnerV1,OrdinaryCommandV1};
+        use crate::logs::accepted::producer;
+        let bindings:Vec<_>=["producer-prefix","producer-empty","producer-reuse","producer-recovery","producer-incomplete","producer-truncated","producer-refused"].into_iter().enumerate().map(|(n,job)|JobLogBindingV1{
+            contract:JobLogContractV1{version:1,capture_limit:if job=="producer-truncated"{3}else{65536}},
+            owner:OrdinaryOwnerV1{version:1,job:job.into(),attempt:1,host:"producer-fixture".into(),process_nonce:"producer-process".into(),publication_epoch:"producer-epoch".into(),connection:"e".repeat(64),grant:format!("producer-grant-{n}"),execution:format!("ci-producer-{n}"),allocation:format!("retained-producer-{n}"),command:OrdinaryCommandV1{stream:"l:1.1".into(),seq:u64::try_from(n).unwrap_or(0)+1}},
+        }).collect();
+        hub.logs.historical_fixture_append("producer-prefix",1,b"historical producer baseline\n");
+        hub.logs.finish("producer-prefix");
+        let seed=bindings.clone();
+        hub.store.call(move |c|{
+            let tx=crate::store::tx(c)?;
+            tx.execute("INSERT OR IGNORE INTO ci_retained_ownership(job,attempt,agent,execution,until_at,allocation,transferred,released,received_at) VALUES('@kiln/u01-ordinary-format-v1',1,'@kiln-format',NULL,0,?1,0,0,0)",[r#"{"format":"u01-ordinary-domain-v1","version":1}"#])?;
+            let domain=serde_json::json!({"version":1,"host":"producer-fixture","epoch":"producer-epoch","through":0,"accepted_above":[]}).to_string();
+            let anchor=serde_json::json!({"version":1,"host":"producer-fixture","epoch":"producer-epoch"}).to_string();
+            let key=crate::util::sha256_hex(b"producer-fixture");
+            tx.execute("INSERT INTO kv(k,v) VALUES(?1,?2)",params![format!("u01/ordinary-domain/{key}"),domain])?;
+            tx.execute("INSERT INTO kv(k,v) VALUES(?1,?2)",params![format!("u01/ordinary-anchor/{key}"),anchor])?;
+            for binding in seed {
+                let owner=&binding.owner;
+                tx.execute("INSERT INTO jobs(id,run_id,key,display,status,labels,needs,spec,attempt,job_id) VALUES(?1,'log-run',?1,?1,'running','[]','[]','{}',1,'producer-fixture')",[&owner.job])?;
+                let allocation=kiln_ci::sched::state::Allocation{id:owner.allocation.clone(),runner:owner.host.clone(),request:kiln_ci::sched::state::Resources{cpu:1.0,..Default::default()},mode:kiln_ci::sched::state::ReservationMode::Ordinary,repo:"log-repo".into(),actor:"fixture".into(),lane:"ci".into(),parent_binding:None};
+                let journal=serde_json::json!({"format":"u01-ordinary-domain-v1","version":1,"owner":owner,"allocation":allocation,"recorded":"host","physical":"pending","logical":"running","log_contract":binding.contract}).to_string();
+                tx.execute("INSERT INTO ci_retained_ownership(job,attempt,agent,execution,until_at,allocation,transferred,released,received_at) VALUES(?1,1,?2,?3,0,?4,0,0,0)",params![owner.job,owner.host,owner.execution,journal])?;
+                let row=tx.query_row("SELECT rowid FROM jobs WHERE id=?1",[&owner.job],|r|r.get(0))?;
+                producer::register(&tx,&binding,row)?;
+            }
+            tx.commit()?;Ok(())
+        }).await?;
+        let binding=bindings.first().cloned().ok_or_else(||anyhow::anyhow!("producer fixture binding missing"))?;
+        // Integration overlay: authorization Y before first acceptance is not an own
+        // Received receipt after X wins in a later canonical writer transaction.
+        let contender=crate::proto::encode(&crate::proto::JobResult{job:binding.owner.job.clone(),status:crate::store::Status::Failed,exit_code:Some(17),error:None,peak_rss:None,cpu_seconds:Some(0.0)})?;
+        let b=binding.clone();let y=contender.clone();hub.store.call(move |c|{
+            assert!(crate::ci::runs::completion_report_allowed(c,&b.owner.job,&b.owner.host,Some(b.owner.attempt),Some(&b.owner.process_nonce),&y)?,"Y is eligible before any original result is accepted");
+            assert!(!crate::ci::runs::completion_report_received(c,&b.owner.job,&b.owner.host,b.owner.attempt,Some(&b.owner.process_nonce),&y)?,"eligibility alone is not a positive original receipt");Ok(())
+        }).await?;
+        let initial=crate::proto::job_log::initial_root(&crate::proto::job_log::binding_id(&binding)?);
+        let first=JobLogChunkV1{binding:binding.clone(),seq:1,step:1,offset:0,previous_root:initial,data:b"raw \0\xff first\n".to_vec()};
+        let second=JobLogChunkV1{binding:binding.clone(),seq:2,step:1,offset:u64::try_from(first.data.len())?,previous_root:crate::proto::job_log::chunk_root(&first)?,data:b"last producer bytes\n".to_vec()};
+        let result=crate::proto::encode(&crate::proto::JobResult{job:binding.owner.job.clone(),status:crate::store::Status::Succeeded,exit_code:Some(0),error:None,peak_rss:None,cpu_seconds:Some(0.0)})?;
+        let end=JobLogEndV1{binding:binding.clone(),final_seq:2,captured_bytes:u64::try_from(first.data.len()+second.data.len())?,root:crate::proto::job_log::chunk_root(&second)?,result:result.clone(),result_hash:crate::proto::job_log::result_hash(&result)?,capture:JobLogCaptureV1::Complete};
+        let end_body=crate::proto::encode(&crate::proto::AgentMsg::JobLogEndV1(end.clone()))?;
+        assert!(matches!(producer::fixture_input(&hub.logs,binding.clone(),end_body.clone()).await?,JobLogReplyV1::Unknown{..}),"End before its predecessor cannot close");
+        assert!(matches!(producer::fixture_input(&hub.logs,binding.clone(),crate::proto::encode(&crate::proto::AgentMsg::JobLogChunkV1(second.clone()))?).await?,JobLogReplyV1::Unknown{..}),"a sequence gap cannot append out of order");
+        let first_body=crate::proto::encode(&crate::proto::AgentMsg::JobLogChunkV1(first.clone()))?;
+        let first_receipt=producer::fixture_input(&hub.logs,binding.clone(),first_body.clone()).await?;
+        assert!(matches!(first_receipt,JobLogReplyV1::Committed(_)));
+        let before=hub.store.call(|c|crate::logs::accepted::prefix(c,"producer-prefix")).await?;
+        assert_eq!(producer::fixture_input(&hub.logs,binding.clone(),first_body.clone()).await?,first_receipt,"lost ACK replay returns the SAME own receipt");
+        assert_eq!(hub.store.call(|c|crate::logs::accepted::prefix(c,"producer-prefix")).await?,before,"exact replay cannot append twice");
+        let mut conflict=first.clone();conflict.data.push(b'!');
+        assert!(matches!(producer::fixture_input(&hub.logs,binding.clone(),crate::proto::encode(&crate::proto::AgentMsg::JobLogChunkV1(conflict))?).await?,JobLogReplyV1::Refused{code:JobLogRefusalV1::Conflict,..}));
+        let partial=hub.logs.read_producer(&binding.owner.job,1,false).await?.ok_or_else(||anyhow::anyhow!("registered producer became legacy"))?;
+        assert!(!partial.complete && partial.bytes.ends_with(&first.data));
+        let initial_prefix=partial.prefix.clone().ok_or_else(||anyhow::anyhow!("first producer receipt lacks captured history"))?;
+        let mut raw=producer::RawReader::open(&hub.store,initial_prefix,1).await?.ok_or_else(||anyhow::anyhow!("captured first step is missing"))?;
+        let mut observed=Vec::new();loop {
+            let turn=raw.advance(&hub.store,&hub.blobs.blobs).await?;observed.extend_from_slice(&turn.bytes);raw=turn.reader;if turn.done{break}
+        }
+        assert_eq!(observed,partial.bytes,"incremental reader preserves the exact initial raw prefix");
+        assert!(hub.logs.read_producer(&binding.owner.job,1,true).await.is_err(),"no complete body before own End");
+        assert!(matches!(producer::fixture_input(&hub.logs,binding.clone(),crate::proto::encode(&crate::proto::AgentMsg::JobLogChunkV1(second.clone()))?).await?,JobLogReplyV1::Committed(_)));
+        let latest=hub.logs.producer_snapshot(&binding.owner.job,false).await?.and_then(|s|s.prefix).ok_or_else(||anyhow::anyhow!("second producer prefix missing"))?;
+        raw=raw.extend(&hub.store,latest.clone()).await?;
+        let turn=raw.advance(&hub.store,&hub.blobs.blobs).await?;
+        assert!(turn.done && turn.reader.done());assert_eq!(turn.bytes,second.data,"cursor extension reads only newly accepted raw bytes");
+        assert_eq!(turn.reader.len(),u64::try_from(partial.bytes.len()+second.data.len())?);
+        assert_eq!(hub.logs.producer_step_page(latest,None).await?.into_iter().map(|(_,step)|step).collect::<Vec<_>>(),vec![1],"step enumeration uses the captured catalog");
+        assert!(matches!(producer::fixture_input(&hub.logs,binding.clone(),end_body.clone()).await?,JobLogReplyV1::Unknown{..}),"exact control result is a separate durable dependency");
+        let b=binding.clone();let original_result=result.clone();
+        hub.store.call(move |c|{assert_eq!(producer::note_result(c,&b,&original_result)?,producer::Close::Pending);Ok(())}).await?;
+        let b=binding.clone();let y=contender.clone();
+        let denied=hub.store.call(move |c|crate::ci::runs::completion_report_received(c,&b.owner.job,&b.owner.host,b.owner.attempt,Some(&b.owner.process_nonce),&y)).await;
+        assert!(denied.as_ref().err().is_some_and(|e|format!("{e:#}").contains("required original replay differs")),"the earlier allowed Y cannot receive X's durable receipt: {denied:?}");
+        let b=binding.clone();let x=result.clone();hub.store.call(move |c|{
+            assert!(crate::ci::runs::completion_report_received(c,&b.owner.job,&b.owner.host,b.owner.attempt,Some(&b.owner.process_nonce),&x)?);
+            assert!(!crate::ci::runs::completion_report_received(c,&b.owner.job,&b.owner.host,b.owner.attempt+1,Some(&b.owner.process_nonce),&x)?,"a different attempt has no original receipt");
+            assert_eq!(producer::stored_result(c,&b)?,Some(x));Ok(())
+        }).await?;
+        let b=binding.clone();let x=result.clone();
+        let denied=hub.store.call(move |c|crate::ci::runs::completion_report_received(c,&b.owner.job,&b.owner.host,b.owner.attempt,Some("different-process-nonce"),&x)).await;
+        assert!(denied.as_ref().err().is_some_and(|e|format!("{e:#}").contains("required original replay differs")),"same host with wrong nonce has no Received authority: {denied:?}");
+        let (debts,recovered)=producer::fixture_restart(&hub.logs).await?;
+        assert_eq!(debts,0);
+        assert!(recovered.iter().any(|completion|matches!(completion,crate::logs::accepted::Completion::RecoveredProducer{binding:original,reply:JobLogReplyV1::Committed(receipt)} if original==&binding && receipt.result_hash==Some(end.result_hash))),"restart closes the SAME eligible persisted End without inventing a reporting connection");
+        assert!(matches!(producer::fixture_input(&hub.logs,binding.clone(),end_body.clone()).await?,JobLogReplyV1::Committed(_)),"later original frame replay obtains its same own close receipt");
+        let captured=hub.logs.read_producer(&binding.owner.job,1,true).await?.ok_or_else(||anyhow::anyhow!("closed producer became legacy"))?;
+        assert!(captured.complete && captured.prefix.as_ref().is_some_and(|p|p.revision>0));
+        assert_eq!(captured.bytes,[b"historical producer baseline\n".as_slice(),first.data.as_slice(),second.data.as_slice()].concat(),"raw terminal read preserves every captured historical and producer byte without normalization");
+        hub.store.call(|c|{c.execute("DELETE FROM ci_retained_ownership WHERE job='producer-prefix'",[])?;Ok(())}).await?;
+        let b=binding.clone();let x=result.clone();hub.store.call(move |c|{
+            assert!(crate::ci::runs::completion_report_received(c,&b.owner.job,&b.owner.host,b.owner.attempt,Some(&b.owner.process_nonce),&x)?,"immutable exact result receipt survives original journal retirement");
+            assert_eq!(c.query_row("SELECT COUNT(*) FROM ci_completion_reports WHERE job=?1",[&b.owner.job],|r|r.get::<_,u64>(0))?,0,"readonly replay must not stage another result report");Ok(())
+        }).await?;
+        assert_eq!(producer::fixture_input(&hub.logs,binding.clone(),first_body).await?,first_receipt,"immutable committed replay outlives ordinary journal retirement");
+        assert!(matches!(producer::fixture_input(&hub.logs,binding.clone(),end_body).await?,JobLogReplyV1::Committed(_)));
+        assert!(hub.logs.read_producer(&binding.owner.job,1,true).await?.is_some_and(|r|r.complete));
+
+        let zero=bindings.get(1).cloned().ok_or_else(||anyhow::anyhow!("producer End0 binding missing"))?;
+        let zero_result=crate::proto::encode(&crate::proto::JobResult{job:zero.owner.job.clone(),status:crate::store::Status::Succeeded,exit_code:Some(0),error:None,peak_rss:None,cpu_seconds:Some(0.0)})?;
+        let z=zero.clone();let bytes=zero_result.clone();hub.store.call(move |c|{assert_eq!(producer::note_result(c,&z,&bytes)?,producer::Close::Pending);Ok(())}).await?;
+        let end0=JobLogEndV1{binding:zero.clone(),final_seq:0,captured_bytes:0,root:crate::proto::job_log::initial_root(&crate::proto::job_log::binding_id(&zero)?),result_hash:crate::proto::job_log::result_hash(&zero_result)?,result:zero_result,capture:JobLogCaptureV1::Complete};
+        assert!(matches!(producer::fixture_input(&hub.logs,zero.clone(),crate::proto::encode(&crate::proto::AgentMsg::JobLogEndV1(end0))?).await?,JobLogReplyV1::Committed(_)));
+        let zero_read=hub.logs.read_producer(&zero.owner.job,1,true).await?.ok_or_else(||anyhow::anyhow!("End0 became legacy"))?;
+        assert!(zero_read.complete && zero_read.bytes.is_empty() && zero_read.prefix.is_some_and(|p|p.revision>0),"End0 owns a real captured zero-marker prefix, not synthetic Prefix0");
+        let id=hex::encode(crate::proto::job_log::binding_id(&zero)?);
+        let marker=hub.store.call(move |c|Ok(c.query_row("SELECT o.input_key FROM ci_log_producers p JOIN ci_log_accepted_ops o ON o.operation=p.close_operation WHERE p.binding=?1",[id],|r|r.get::<_,String>(0))?)).await?;
+        hub.blobs.blobs.delete(&marker).await?;
+        let absent=hub.logs.read_producer(&zero.owner.job,1,true).await;
+        assert!(matches!(absent.as_ref().err().and_then(|e|e.downcast_ref::<producer::ReadError>()),Some(producer::ReadError::Unavailable(_))),"missing original End0 marker cannot become complete empty data: {absent:?}");
+
+        let reuse=bindings.get(2).cloned().ok_or_else(||anyhow::anyhow!("producer NoStart binding missing"))?;
+        let old=reuse.owner.clone();hub.store.call(move |c|{
+            let tx=crate::store::tx(c)?;
+            tx.execute("UPDATE ci_retained_ownership SET released=1,allocation=json_set(allocation,'$.physical','no_start') WHERE job=?1 AND attempt=?2",params![old.job,old.attempt])?;
+            producer::no_start(&tx,&old)?;assert!(producer::requires_contract(&tx,&old.job,old.attempt)?,"NoStart cannot downgrade required mode");tx.commit()?;Ok(())
+        }).await?;
+        let mut successor=reuse.clone();successor.owner.grant="producer-successor-grant".into();successor.owner.execution="ci-producer-successor".into();successor.owner.allocation="retained-producer-successor".into();successor.owner.command.seq+=1;
+        let next=successor.clone();hub.store.call(move |c|{
+            let tx=crate::store::tx(c)?;let owner=&next.owner;
+            let allocation=kiln_ci::sched::state::Allocation{id:owner.allocation.clone(),runner:owner.host.clone(),request:kiln_ci::sched::state::Resources{cpu:1.0,..Default::default()},mode:kiln_ci::sched::state::ReservationMode::Ordinary,repo:"log-repo".into(),actor:"fixture".into(),lane:"ci".into(),parent_binding:None};
+            let journal=serde_json::json!({"format":"u01-ordinary-domain-v1","version":1,"owner":owner,"allocation":allocation,"recorded":"host","physical":"pending","logical":"running","log_contract":next.contract}).to_string();
+            tx.execute("UPDATE ci_retained_ownership SET execution=?2,allocation=?3,released=0 WHERE job=?1 AND attempt=1",params![owner.job,owner.execution,journal])?;
+            let row=tx.query_row("SELECT rowid FROM jobs WHERE id=?1",[&owner.job],|r|r.get(0))?;producer::register(&tx,&next,row)?;tx.commit()?;Ok(())
+        }).await?;
+        let stale=JobLogChunkV1{binding:reuse.clone(),seq:1,step:1,offset:0,previous_root:crate::proto::job_log::initial_root(&crate::proto::job_log::binding_id(&reuse)?),data:b"stale original producer".to_vec()};
+        assert!(matches!(producer::fixture_input(&hub.logs,reuse,crate::proto::encode(&crate::proto::AgentMsg::JobLogChunkV1(stale))?).await?,JobLogReplyV1::Refused{code:JobLogRefusalV1::StaleOwner,..}),"a new same-attempt grant cannot bless disposed original bytes");
+        let b=successor.clone();hub.store.call(move |c|{assert_eq!(producer::registered(c,&b.owner.job,b.owner.attempt,&b.owner.host)?,Some(b));Ok(())}).await?;
+
+        let recovery=bindings.get(3).cloned().ok_or_else(||anyhow::anyhow!("producer recovery binding missing"))?;
+        let lost=JobLogChunkV1{binding:recovery.clone(),seq:1,step:1,offset:0,previous_root:crate::proto::job_log::initial_root(&crate::proto::job_log::binding_id(&recovery)?),data:b"original bytes replayed after two cold starts\n".to_vec()};
+        let body=crate::proto::encode(&crate::proto::AgentMsg::JobLogChunkV1(lost.clone()))?;
+        let pending=producer::fixture_missing_input(&hub.logs,recovery.clone(),body.clone()).await?;
+        for _ in 0..2 {
+            assert_eq!(producer::fixture_restart(&hub.logs).await?.0,1,"a missing pre-PUT input retains exactly its original finite I/O credit across restart");
+            let id=pending.clone();hub.store.call(move |c|{
+                assert_eq!(c.query_row("SELECT COUNT(*) FROM ci_log_accepted_ops WHERE status='pending'",[],|r|r.get::<_,usize>(0))?,1,"restart must not create another operation");
+                assert!(c.query_row("SELECT EXISTS(SELECT 1 FROM ci_log_accepted_ops o JOIN ci_log_accepted_pins p ON p.operation=o.operation AND p.key=o.input_key WHERE o.operation=?1 AND o.status='pending' AND o.input_ready=0 AND p.ready=0)",[id],|r|r.get::<_,bool>(0))?,"original missing input keeps its pending reservation and pin");Ok(())
+            }).await?;
+            assert!(hub.logs.read_producer(&recovery.owner.job,1,true).await.is_err(),"missing input cannot close or fabricate an empty prefix");
+        }
+        assert!(matches!(producer::fixture_owned_replay(&hub.logs,recovery.clone(),body,pending).await?,JobLogReplyV1::Committed(_)),"the SAME raw operation can consume its own debt credit and publish");
+        assert_eq!(producer::fixture_restart(&hub.logs).await?.0,0,"only the original checked terminal receipt clears recovery debt");
+        let read=hub.logs.read_producer(&recovery.owner.job,1,false).await?.ok_or_else(||anyhow::anyhow!("replayed producer became legacy"))?;
+        assert!(!read.complete);assert_eq!(read.bytes,lost.data,"replay preserves the original raw bytes once, without producer closure");
+
+        let incomplete=bindings.get(4).cloned().ok_or_else(||anyhow::anyhow!("incomplete binding missing"))?;
+        let failed_result=crate::proto::encode(&crate::proto::JobResult{job:incomplete.owner.job.clone(),status:crate::store::Status::Failed,exit_code:Some(1),error:None,peak_rss:None,cpu_seconds:Some(0.0)})?;
+        let b=incomplete.clone();let bytes=failed_result.clone();hub.store.call(move |c|{producer::note_result(c,&b,&bytes)?;Ok(())}).await?;
+        let failed_end=JobLogEndV1{binding:incomplete.clone(),final_seq:0,captured_bytes:0,root:crate::proto::job_log::initial_root(&crate::proto::job_log::binding_id(&incomplete)?),result_hash:crate::proto::job_log::result_hash(&failed_result)?,result:failed_result,capture:JobLogCaptureV1::Incomplete{code:JobLogRefusalV1::Incomplete,why:"captured source is explicitly incomplete".into()}};
+        assert!(matches!(producer::fixture_input(&hub.logs,incomplete.clone(),crate::proto::encode(&crate::proto::AgentMsg::JobLogEndV1(failed_end))?).await?,JobLogReplyV1::Refused{code:JobLogRefusalV1::Incomplete,..}));
+        let (_,recovered)=producer::fixture_restart(&hub.logs).await?;
+        assert!(!recovered.iter().any(|completion|matches!(completion,crate::logs::accepted::Completion::RecoveredProducer{binding,reply:JobLogReplyV1::Committed(_)} if binding==&incomplete)),"Incomplete is never eligible for a closed recovery receipt");
+        assert!(hub.logs.read_producer(&incomplete.owner.job,1,true).await.is_err());
+
+        let truncated=bindings.get(5).cloned().ok_or_else(||anyhow::anyhow!("truncated binding missing"))?;
+        let cap=JobLogChunkV1{binding:truncated.clone(),seq:1,step:1,offset:0,previous_root:crate::proto::job_log::initial_root(&crate::proto::job_log::binding_id(&truncated)?),data:b"cap".to_vec()};
+        assert!(matches!(producer::fixture_input(&hub.logs,truncated.clone(),crate::proto::encode(&crate::proto::AgentMsg::JobLogChunkV1(cap.clone()))?).await?,JobLogReplyV1::Committed(_)));
+        let cap_result=crate::proto::encode(&crate::proto::JobResult{job:truncated.owner.job.clone(),status:crate::store::Status::Succeeded,exit_code:Some(0),error:None,peak_rss:None,cpu_seconds:Some(0.0)})?;
+        let b=truncated.clone();let bytes=cap_result.clone();hub.store.call(move |c|{producer::note_result(c,&b,&bytes)?;Ok(())}).await?;
+        let cap_end=JobLogEndV1{binding:truncated.clone(),final_seq:1,captured_bytes:3,root:crate::proto::job_log::chunk_root(&cap)?,result_hash:crate::proto::job_log::result_hash(&cap_result)?,result:cap_result,capture:JobLogCaptureV1::Truncated{limit:3,discarded_bytes:2}};
+        assert!(matches!(producer::fixture_input(&hub.logs,truncated.clone(),crate::proto::encode(&crate::proto::AgentMsg::JobLogEndV1(cap_end))?).await?,JobLogReplyV1::Committed(_)));
+        let capped=hub.logs.read_producer(&truncated.owner.job,1,true).await?.ok_or_else(||anyhow::anyhow!("truncated producer became legacy"))?;
+        assert!(capped.complete && capped.bytes==b"cap" && matches!(capped.capture,Some(JobLogCaptureV1::Truncated{limit:3,discarded_bytes:2})),"closed capture preserves its explicit truncation qualification");
+
+        let rejected=bindings.get(6).cloned().ok_or_else(||anyhow::anyhow!("negative replay binding missing"))?;
+        let denied=JobLogChunkV1{binding:rejected.clone(),seq:1,step:1,offset:0,previous_root:crate::proto::job_log::initial_root(&crate::proto::job_log::binding_id(&rejected)?),data:b"original input refused before PUT\n".to_vec()};
+        let denied_body=crate::proto::encode(&crate::proto::AgentMsg::JobLogChunkV1(denied))?;
+        fault.store(5,Ordering::SeqCst);
+        let negative=producer::fixture_input(&hub.logs,rejected.clone(),denied_body.clone()).await?;
+        fault.store(6,Ordering::SeqCst); // healthy pass-through still counts any actual PUT
+        assert!(matches!(&negative,JobLogReplyV1::Refused{code:JobLogRefusalV1::Incomplete,why,..} if why.contains("definite no-write refusal")),"first definite failure must return its own durable negative disposition: {negative:?}");
+        let puts=attempts.load(Ordering::SeqCst);
+        assert_eq!(producer::fixture_input(&hub.logs,rejected.clone(),denied_body.clone()).await?,negative,"exact negative replay cannot become Unknown");
+        assert_eq!(attempts.load(Ordering::SeqCst),puts,"negative replay cannot issue a different PUT");
+        assert_eq!(producer::fixture_restart(&hub.logs).await?.0,0,"checked terminal refusal is not pending recovery debt");
+        assert_eq!(producer::fixture_input(&hub.logs,rejected.clone(),denied_body).await?,negative,"the SAME checked negative disposition survives cold owner rebuild");
+        assert_eq!(attempts.load(Ordering::SeqCst),puts,"cold negative replay cannot issue another PUT even after backend recovery");
+        fault.store(0,Ordering::SeqCst);
+        let job=rejected.owner.job.clone();hub.store.call(move |c|{assert!(crate::logs::accepted::prefix(c,&job)?.is_none(),"negative receipt cannot publish an empty prefix");Ok(())}).await?;
+        assert!(hub.logs.read_producer(&rejected.owner.job,1,true).await.is_err(),"known refusal is never a complete producer close");
+
+        let original_operation=match first_receipt {JobLogReplyV1::Committed(r)=>r.operation,_=>anyhow::bail!("missing original receipt")};
+        let missing=hub.store.call(move |c|Ok(c.query_row("SELECT input_key FROM ci_log_accepted_ops WHERE operation=?1",[original_operation],|r|r.get::<_,String>(0))?)).await?;
+        hub.blobs.blobs.delete(&missing).await?;
+        assert!(hub.logs.read_producer(&binding.owner.job,1,true).await.is_err(),"missing immutable producer bytes cannot become complete empty data");
         hub.store.delete_repo("log-repo".into()).await?;
         hub.store.call(|c|{assert!(!c.query_row("SELECT EXISTS(SELECT 1 FROM repos WHERE id='log-repo')",[],|r|r.get::<_,bool>(0))?,"released source lease permits later explicit repo deletion");Ok(())}).await?;
         Ok(())

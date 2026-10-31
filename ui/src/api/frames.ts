@@ -6,7 +6,7 @@
  * isn't applied: the page says so up the same socket (`{t: "unread", of, why}`), and the server,
  * which sent it, notes it.
  */
-import type { StreamDown, UnreadFrame } from "./wire";
+import type { LogDown, StreamDown, UnreadFrame } from "./wire";
 
 /** A frame that came down, read: the frame, or what the page tells the server of it. */
 export type Read<T> = { frame: T } | { unread: UnreadFrame };
@@ -29,6 +29,17 @@ export function readFrame<T>(data: string, tag: "t" | "type", tags: Record<strin
   if (typeof t !== "string") return unread("", `no ${tag}`);
   if (!Object.hasOwn(tags, t)) return unread(t, "unknown frame");
   return { frame: v as T };
+}
+
+/** Log resource state is separate from an unread inbound frame; a close is not its End. */
+const LOG_FRAMES = { step: true, end: true, refused: true, pending: true, unavailable: true } satisfies Record<LogDown["type"], true>;
+
+export function readLogFrame(data: string): Read<LogDown> {
+  const read = readFrame<LogDown>(data, "type", LOG_FRAMES);
+  if ("frame" in read && (read.frame.type === "pending" || read.frame.type === "unavailable") && typeof read.frame.message !== "string") {
+    return unread(read.frame.type, "no message");
+  }
+  return read;
 }
 
 /** The keys of a union of objects, each member's. */

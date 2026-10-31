@@ -468,7 +468,11 @@ takes a new bit, never one that means something already, even in the other direc
 | 48 | `CAP_AMPHORA` | `AgentMsg::Caps`, `ServerMsg::Caps` | U15: typed opaque Amphora transport; distinct from the retired learner bit |
 | 49 | `CAP_UNIFIED_LAYOUT` | `AgentMsg::Caps`, `ServerMsg::Caps` | U15: the unification wire layout appended after main's unread messages, independent of whether this peer currently carries Amphora traffic |
 
-Bits from 50 are free. Take the next one, and add its row here in the same change.
+| 50 | `CAP_EXPLICIT_ACTIVATION` | AgentMsg::Caps, ServerMsg::Caps | existing role-specific explicit activation owner; not release approval |
+| 51 | `CAP_ORDINARY_EXECUTION_DEBT` | AgentMsg::Caps, ServerMsg::Caps | existing paired original ordinary admission and sequenced physical debt |
+| 52 | `CAP_JOB_LOG_V1` | RESERVED, NOT ADVERTISED | U05 original native producer capture, durable bounded outbox and own canonical receipt; requires layout, wire, attempt, resource ownership and ordinary debt |
+
+Bits from 53 are free. A reserved bit is not evidence that its complete route is active.
 
 Main's unread messages retain their deployed indices: runner messages 56 and 57, server
 messages 62 and 63, and reach ask 11. The private unification messages follow them. Both peers
@@ -598,6 +602,9 @@ Four edges are left, and the lab steers clear of each:
 | `Amphora` | carried (Amphora) | U15: bounded opaque product transport, with authenticated member routes. | Amphora owns acknowledgement, resend, recovery and membership; Kiln only frames bytes. |
 | `RunnerProcess` | handshake | U01: one authenticated process identity, repeated when that process reconnects. It identifies the producer; it does not prove that a process or its executions stopped. | To a server announcing `CAP_FIRECRACKER_SHAPE`, under `CAP_UNIFIED_LAYOUT`. |
 
+| `JobLogChunkV1` | stream | Original bound attempt's captured chunk, sequence, step offset and rolling root. Direct channel Item on lane10/Kind::Log. | HELD; reserved bit52 is not advertised. |
+| `JobLogEndV1` | stream | Original captured frontier, explicit complete/truncated/incomplete disposition and exact canonical result bytes. Not physical stop or full historical-view proof. | HELD; no producer activates this requirement today. |
+
 
 ## Server to runner: `ServerMsg`
 
@@ -670,6 +677,8 @@ Four edges are left, and the lab steers clear of each:
 | `Unread` | ack | A frame of the runner's the server couldn't read: on which wire, what it was, why, and how many more went untold before it ("What can't be read"). | New: to runners announcing `CAP_UNREAD`. |
 | `ReachRefused` | carried (reach link) | A reach frame of the runner's the relay refused: its link, the runner it was for, why in a code (`taken`, `to_itself`, `too_many`, `not_offered`, `not_accepted`, `not_connected`, `closed`) and in words. | New: to runners announcing `CAP_UNREAD`, in place of `Reach`'s `close`. |
 | `Amphora` | carried (Amphora) | U15: bounded opaque product transport, with authenticated member routes. | Amphora owns acknowledgement, resend, recovery and membership; Kiln only frames bytes. |
+
+| `JobLogReplyV1` | ack | Own canonical operation receipt or typed noncommitted outcome for the original bound producer input. Only a committed own receipt permits outbox retirement. | HELD; ordinary generic channel ACK/Have cannot retire producer bytes. |
 
 
 ## Commands to a session: `Command`
@@ -834,6 +843,8 @@ CIs typecheck the UI against them.
 | `/api/jobs/:id/logs/ws` | up | `unread` | ack | As the session socket's. | Noted (`log_down`). |
 | `/api/jobs/:id/logs/ws` | down | `log` | stream | A step's log, by offset. | As its class says. |
 | `/api/jobs/:id/logs/ws` | down | `refused` | ack | What the page sent up that couldn't be read. | As its class says. |
+| `/api/jobs/:id/logs/ws` | down | `pending` | state | The strict log has not declared completion; socket closure is not End. | Reload reads the same captured output. |
+| `/api/jobs/:id/logs/ws` | down | `unavailable` | state | Output cannot currently be read; bytes already delivered remain partial. | Reload may try again; this is never End or an unread inbound frame. |
 | `/api/harness/sessions/:id/streams/:sid/ws` | up | `input` | command, refused while away | What the viewer did. | Not answered. |
 | `/api/harness/sessions/:id/streams/:sid/ws` | up | `unread` | ack | As the session socket's. | Noted on the agent's page (`stream_down`). |
 | `/api/harness/sessions/:id/streams/:sid/ws` | down | `frame` | media | Picture and sound. | As its class says. |
@@ -846,3 +857,56 @@ CIs typecheck the UI against them.
 | `/api/agents/tunnel` | up | `unread` | ack | A frame that came down that the runner couldn't read: its tag (`of`) and why. | Noted from the tunnel's address (`tunnel_down`); nothing goes back. |
 | `/api/agents/tunnel` | down | `datagram` | carried (tunnel) | The tunnel's own protocol. | As its class says. |
 | `/api/agents/tunnel` | down | `refused` | ack | What the runner sent that couldn't be read. | Read and logged by the runner. |
+
+
+## Held native producer-log contract (U05)
+
+This source component is unadvertised. Existing assignments omit the optional JSON
+log_contract and keep their ordinary behavior. A required contract names version1 and
+the exact configured limits.log_bytes. It requires an original native host/docker
+unpooled OrdinaryOwnerV1, matching authenticated process/stamp and actual prepared
+Execution. Positive keep_on_failure_minutes, inherited/pooled/foreign executors and
+unknown native kinds refuse before any writer starts. Debug verbosity is unchanged.
+
+The existing LOGS lane2 remains its old LogChunk codec. Appended lane10 is Bulk
+Kind::Log carrying the existing channel Frame; Item variant0 contains one direct
+AgentMsg::JobLogChunkV1 or JobLogEndV1. Their hashes bind a fixed explicit original
+owner tuple, not a later connection or the latest job attempt. The actual current
+authenticated host/process nonce must match registration on the server. Same-process
+reconnect never restamps the original connection. Another process does not gain replay
+authority by opening the same host Records.
+
+The SAME retained Spool uses wire.out and wire.next, with bounded joblog-v1 metadata
+inside retained-meta. It reserves one96KiB End slot before a native writer starts.
+Byte/cursor/quota and original outbox bytes commit in one conditional Records transaction.
+Durable limits are8MiB/256 unanswered chunk rows per producer,64MiB/2048 chunk rows/64
+original bindings per host, and4096 retained step offsets. Separate RAM credit reserves
+one input slot before each actual runtime flow can spawn/read:64 slots/producer ×64
+producers ×32KiB is128MiB maximum data, plus one preowned96KiB End per producer (6MiB).
+The existing ten background turns plus foreground use explicit independent flow slots.
+A full RAM pool waits before child/read effects. Canceling an occupied flow retains its
+original slot and bytes until durable handoff; zero-length data cannot consume a slot. Metadata cleanup and network attempts
+are finite32-item turns of existing owners. No new database, task worker or topic exists.
+
+Full is back-pressure: the original producer input waits outside the one Spool I/O future,
+so own receipts, stop/control and independent whole Execution retirement remain selectable.
+Unknown and noncommitted outcomes retain input and typed uncertainty. A successful own
+receipt is persisted before the same Sender advances and before32-row physical outbox
+cleanup. Generic channel ACK/Have/low cannot delete producer bytes. The strict route
+never enters the reconnect queue that sheds legacy logs.
+
+Only the actual joined runtime makes End. A finite pipe-drain timeout or lost writer is
+Incomplete; configured-cap capture is explicitly Truncated. A grace-stop result, a single
+child exit and an empty queue are never a producer frontier. Positive whole-owner physical
+Stop and CPU return remain separate from pending logical producer closure. Natural work
+can remain back-pressured until quota frees.
+
+End0 proves zero captured bytes from this registered producer, not an empty full job-view
+history. Producer-only and captured shared-view receipts remain distinct. Existing
+accepted historical-prefix capacity is separate from the original attempt capture cap.
+
+Pending producer metadata prevents clean automatic process retirement. Hard process loss
+does not fabricate End; old-nonce outbox bytes remain retained and no fresh process
+automatically replays them without authenticated recovery authority. Server registration,
+canonical cursor/End receipts, terminal-effect gating and complete log-read composition
+are separate held components. Capability activation and native validation remain pending.

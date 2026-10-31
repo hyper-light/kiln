@@ -7,4 +7,4 @@ import type { RunStatus } from "./RunStatus";
  * What goes down a job step's log socket (`/api/jobs/:id/logs/ws?step=`) as text: the log goes as
  * binary frames beside these.
  */
-export type LogDown = { "type": "step", idx: number, status: RunStatus, } | { "type": "end" } | { "type": "refused" } & RefusedFrame;
+export type LogDown = { "type": "step", idx: number, status: RunStatus, } | { "type": "end" } | { "type": "refused" } & RefusedFrame | { "type": "pending", message: string, } | { "type": "unavailable", message: string, };
