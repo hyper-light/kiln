@@ -292,7 +292,7 @@ impl Dispatch {
             anyhow::ensure!(attempt_exists,"U01 ordinary logical transition lost its original running attempt");
             if !runs::attempt_end_in(&tx,&job,attempt,&end,losing,crate::util::now_unix())? {return Ok(Some((false,None,false)));}
             row.journal.logical=if losing {"lost"} else {"terminal"}.into();
-            row.transferred=!row.released;
+            row.transferred = !row.released;
             save_row(&tx,&row)?;
             tx.commit()?;
             Ok(Some((true,(!row.released).then(||row.journal.allocation.clone()),true)))
