@@ -688,6 +688,29 @@ pub enum Restore {
     Retired { reason: &'static str },
 }
 
+/// The local host is restored once before either public starts or auxiliary services.
+/// The blocking closure owns this state even if its async caller goes away.
+#[derive(Default)]
+struct LocalStartup {
+    restoration: Option<Result<(), String>>,
+    services_started: bool,
+}
+
+impl LocalStartup {
+    fn restore(&mut self, host: &Host, store: Option<&crate::convo::store::Store>) -> anyhow::Result<()> {
+        if self.restoration.is_none() {
+            // Leave a refusal if recovery unwinds after partially restoring physical owners.
+            self.restoration = Some(Err("U17 local session restoration did not complete; retain this owner for recovery".into()));
+            self.restoration = Some(host.try_restore_from(store).map_err(|error| format!("{error:#}")));
+        }
+        match &self.restoration {
+            Some(Ok(())) => Ok(()),
+            Some(Err(error)) => anyhow::bail!("{error}"),
+            None => anyhow::bail!("U17 local session restoration has no outcome"),
+        }
+    }
+}
+
 pub struct Registry {
     mirrors: Mutex<HashMap<String, Mirror>>,
     /// The bus each session's live feed rides (`super::live`).
@@ -717,7 +740,7 @@ pub struct Registry {
     control_snapshot: Option<super::host::snapshot::Snapshot>,
     control_commit: Mutex<()>,
     control_baseline: Mutex<ControlState>,
-    local_restored: Mutex<bool>,
+    local_startup: Arc<Mutex<LocalStartup>>,
     /// Sessions kiln doesn't keep going when they stop part-way (`goals::keep`; the "keep_going"
     /// control), kept in global Records so it holds across restarts.
     keep_off: Mutex<std::collections::HashSet<String>>,
@@ -948,7 +971,7 @@ impl Registry {
             control_snapshot: None,
             control_commit: Mutex::new(()),
             control_baseline: Mutex::new(ControlState::default()),
-            local_restored: Mutex::new(false),
+            local_startup: Arc::new(Mutex::new(LocalStartup::default())),
             names: Mutex::new(std::fs::read(dir.join("names.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
             keep_off: Mutex::new(std::fs::read(dir.join("keep-off.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
             asked: super::asked::Asked::default(),
@@ -1395,17 +1418,23 @@ impl Registry {
         }
     }
 
-    /// U17: await the local host's canonical recovery before accepting session starts. The same
-    /// once-only boundary serves supervised startup and callers that need explicit readiness.
+    /// Await this Registry's original recovery without starting its auxiliary services.
+    async fn restore_local(&self) -> anyhow::Result<()> {
+        let (host, store, startup) = (Arc::clone(&self.local), self.convo.clone(), Arc::clone(&self.local_startup));
+        crate::rt::blocking(move || startup.lock().restore(&host, store.as_ref())).await??;
+        Ok(())
+    }
+
+    /// U17: await the same recovery used by early local starts, then start services once.
     pub(crate) async fn initialize_local(hub: &Arc<Hub>) -> anyhow::Result<()> {
         // U17: restoration and its once-only startup guard take synchronous ownership/storage
         // locks. Keep those waits off the shard which admits the session lanes they start.
         let starting = Arc::clone(hub);
         crate::rt::blocking(move || -> anyhow::Result<()> {
             let hub = starting;
-            let mut restored = hub.harness.local_restored.lock();
-            if !*restored {
-                hub.harness.local.try_restore_from(hub.harness.convo.as_ref())?;
+            let mut startup = hub.harness.local_startup.lock();
+            startup.restore(&hub.harness.local, hub.harness.convo.as_ref())?;
+            if !startup.services_started {
                 // Files finished messages mention, kept as they come.
                 crate::rt::spawn(Keeper::run(hub.clone()));
                 // The server's own sessions' harness records, followed into its store.
@@ -1422,7 +1451,7 @@ impl Registry {
                     Ok(p) => *hub.harness.local_sock.lock() = Some(p.to_string_lossy().into_owned()),
                     Err(e) => tracing::info!(error = %format!("{e:#}"), "`kiln spawn` will not be available in the server's own terminals"),
                 }
-                *restored = true;
+                startup.services_started = true;
             }
             Ok(())
         }).await??;
@@ -2120,6 +2149,7 @@ impl Registry {
         {
             anyhow::bail!("{why}");
         }
+        if let Location::Local = &loc { self.restore_local().await?; }
         let mut out = Vec::new();
         for i in 0..count {
             let mut spec = spec.clone();
@@ -2276,6 +2306,7 @@ impl Registry {
     pub async fn open_once(&self, hub: &Hub, target: &str, spec: Spec, session_id: &str) -> anyhow::Result<Info> {
         let (snapshot, mut intent) = self.bind_open(target, spec, session_id, hub.clock.unix_ms())?;
         let loc = Location::of_target(&intent.target);
+        if let Location::Local = &loc { self.restore_local().await?; }
         if !intent.accepted {
             // U17: volume preparation changes the spec's mount metadata on replay. Keep the
             // durable identity boundary explicit until that lifecycle can reuse its first input.
@@ -3518,6 +3549,48 @@ mod tests {
         assert!(replica.bind_open("agent:chosen", changed, "stable", 30).is_err());
         assert!(!snapshot.read::<OpenIntent>()?.ok_or_else(|| anyhow::anyhow!("lost pending intent"))?.accepted, "failed request retries leave acceptance pending");
         assert!(replica.planned_open("missing")?.is_none());
+        crate::rt::block_on(async {
+            // Both public local start forms must recover the existing canonical host before
+            // run_local or initialize_local has ever been polled.
+            for keyed in [false, true] {
+                let hub = crate::hub::tests::scratch_hub_with(|config| config.conversations.off = true).await?;
+                hub.harness.local.hold(true);
+                let scope = hub.harness.local.persistent_scope().ok_or_else(|| anyhow::anyhow!("missing local scope"))?;
+                let namespace = registry_namespace("server.", &scope);
+                let records: Arc<dyn kiln_seams::Records> = Arc::new(crate::records::from_database(&hub.store.database(), &namespace)?);
+                let (saved, _) = super::super::host::snapshot::Snapshot::open::<Vec<super::super::host::Saved>>(records, &scope, None)?;
+                let spec = Spec { kind: "claude".into(), program: Some("/nonexistent/kiln-registry-startup".into()), cwd: Some(hub.cfg.server.data_dir.to_string_lossy().into_owned()), ..Spec::default() };
+                let prior: Vec<super::super::host::Saved> = serde_json::from_value(json!([{ "id": "before-startup", "spec": spec }]))?;
+                saved.save(&prior)?;
+                let opened = if keyed {
+                    hub.harness.open_once(&hub, "local", spec.clone(), "first-open").await?
+                } else {
+                    hub.harness.open(&hub, "local", spec.clone(), 1).await?.pop().ok_or_else(|| anyhow::anyhow!("no local start"))?
+                };
+                let recovered = hub.harness.local.get("before-startup").ok_or_else(|| anyhow::anyhow!("local open did not await canonical restoration"))?;
+                let started = hub.harness.local.get(&opened.id).ok_or_else(|| anyhow::anyhow!("local open lost its session"))?;
+                assert!(hub.harness.local_sock.lock().is_none(), "an early start must not start the server socket");
+                // A later initialization must not re-read/replay a different durable start.
+                // This is a real snapshot change, not a synthetic readiness flag.
+                let (revision, mut later) = saved.read_versioned::<Vec<super::super::host::Saved>>()?.ok_or_else(|| anyhow::anyhow!("missing local snapshot"))?;
+                later.extend(serde_json::from_value::<Vec<super::super::host::Saved>>(json!([{ "id": "after-startup", "spec": spec }]))?);
+                saved.save_at(&later, revision)?;
+                Registry::initialize_local(&hub).await?;
+                #[cfg(unix)]
+                let socket = hub.harness.local_sock.lock().clone().ok_or_else(|| anyhow::anyhow!("server socket was not started"))?;
+                #[cfg(not(unix))]
+                assert!(hub.harness.local_sock.lock().is_none(), "the optional server socket is unavailable on this platform");
+                Registry::initialize_local(&hub).await?;
+                #[cfg(unix)]
+                assert_eq!(hub.harness.local_sock.lock().as_ref(), Some(&socket));
+                #[cfg(not(unix))]
+                assert!(hub.harness.local_sock.lock().is_none(), "repeated initialization preserves optional socket unavailability");
+                assert!(hub.harness.local.get("after-startup").is_none(), "initialization cannot restore again after an early local start");
+                assert!(Arc::ptr_eq(&recovered, &hub.harness.local.get("before-startup").ok_or_else(|| anyhow::anyhow!("recovered session disappeared"))?));
+                assert!(Arc::ptr_eq(&started, &hub.harness.local.get(&opened.id).ok_or_else(|| anyhow::anyhow!("started session disappeared"))?));
+            }
+            Ok::<(), anyhow::Error>(())
+        })?;
         Ok(())
     }
 
