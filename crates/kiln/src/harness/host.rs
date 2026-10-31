@@ -86,6 +86,11 @@ impl Room {
 pub struct Inventory {
     pub sessions: Vec<String>,
     pub kinds: Vec<KindInfo>,
+    /// Each session's epoch here: what tells a copy left behind (the server has its session at a
+    /// later epoch) from a session just arriving (docs/ci.md W27-R08). A runner from before sends
+    /// none.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub epochs: std::collections::BTreeMap<String, u64>,
 }
 
 /// A session as kept on disk, and as it goes to another runner process of this machine when its
@@ -796,7 +801,8 @@ impl Host {
     }
 
     pub fn inventory(&self) -> Inventory {
-        Inventory { sessions: self.sessions.lock().keys().cloned().collect(), kinds: super::kinds::offered() }
+        let sessions: Vec<(String, Arc<Session>)> = self.sessions.lock().iter().map(|(id, s)| (id.clone(), Arc::clone(s))).collect();
+        Inventory { epochs: sessions.iter().map(|(id, s)| (id.clone(), s.epoch())).collect(), sessions: sessions.into_iter().map(|(id, _)| id).collect(), kinds: super::kinds::offered() }
     }
 
     /// Sessions still working on something (an upgrade waits for these).

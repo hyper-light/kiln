@@ -66,7 +66,12 @@ CREATE TABLE IF NOT EXISTS transfer_refusals (
     why TEXT NOT NULL,
     envelope TEXT NOT NULL DEFAULT '',
     came_from TEXT NOT NULL DEFAULT '',
-    at INTEGER NOT NULL
+    at INTEGER NOT NULL,
+    -- An agent session's: the epoch it's from (signed at, or, unsigned, the one its sender held
+    -- the session at), and kiln's record of the transfer the session went on with, when that
+    -- epoch is one it left (a copy left behind's).
+    epoch INTEGER,
+    superseded_by TEXT NOT NULL DEFAULT ''
 );
 
 -- An agent session's hand-over that went unsigned (a side from before signed hand-overs, or one

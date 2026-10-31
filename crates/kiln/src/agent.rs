@@ -1465,6 +1465,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         h.restore_from(convo.as_ref());
         h
     });
+    // Which of the machine's processes are its agent sessions' own: a run they ask for elsewhere
+    // is their act (docs/ci.md W27-R08).
+    if let Some(h) = &harness {
+        let h = Arc::clone(h);
+        crate::runner::custody::set_sessions(move || h.harness_pids());
+    }
     // The harnesses its user's login shell finds are this machine's too
     // (`crate::harness::kinds::search_path`): that shell is asked now, and every ten minutes.
     if harness.is_some() {
@@ -2389,6 +2395,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         server_identity = caps & proto::CAP_IDENTITY != 0 && !o.ephemeral;
                         // Custody records sent before go again: the server takes each once.
                         server_custody = caps & proto::CAP_CUSTODY != 0 && !o.ephemeral;
+                        crate::runner::custody::server_checks(server_custody);
                         if server_custody {
                             for json in crate::runner::custody::sent() {
                                 uplink.0.send(Up::Term(AgentMsg::Custody { json })).await.ok();

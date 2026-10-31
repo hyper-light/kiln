@@ -99,6 +99,7 @@ pub enum Refused {
 }
 
 /// A refusal, as kiln records it.
+#[derive(Default)]
 struct Refusal {
     digest: String,
     act: String,
@@ -107,6 +108,11 @@ struct Refusal {
     envelope: String,
     came_from: String,
     at: i64,
+    /// An agent session's: the epoch it's from (signed at, or, unsigned, the one its sender held
+    /// the session at).
+    epoch: Option<u64>,
+    /// The transfer the session went on with, when that epoch is one it left.
+    superseded_by: String,
 }
 
 /// Takes the signed custody record or delegation `bundle`, which came over `came_from` (a runner
@@ -121,15 +127,16 @@ pub async fn take(store: &Store, root: &[u8], org: &str, bundle: &Value, came_fr
         return Ok(Ok(Taken { digest, again: true, broke: None }));
     }
     let revocations = crate::identities::revocations(store).await?;
-    let refusal = |act: &str, signer: String, why: String| Refusal { digest: digest_of(bundle), act: act.to_owned(), signer, why, envelope: bundle.to_string(), came_from: came_from.to_owned(), at };
+    let refusal = |act: &str, signer: String, why: String| Refusal { digest: digest_of(bundle), act: act.to_owned(), signer, why, envelope: bundle.to_string(), came_from: came_from.to_owned(), at, ..Refusal::default() };
     let c = match statement::verify(bundle, root, &revocations, at) {
         Ok(c) => c,
         Err(e) => {
             // Who signed it, as its certificate says, revocations aside: a copy left behind signs
             // as the epoch it left.
             let signer = statement::verify(bundle, root, &[], at).map(|c| c.custodian).unwrap_or_default();
+            let (epoch, superseded_by) = left(store, &signer).await?;
             let why = e.to_string();
-            refuse(store, refusal("a signed statement", signer, why.clone())).await?;
+            refuse(store, Refusal { epoch, superseded_by, ..refusal("a signed statement", signer, why.clone()) }).await?;
             return Ok(Err(Refused::Unsigned(why)));
         }
     };
@@ -173,13 +180,24 @@ pub async fn on_runner(hub: &crate::hub::Hub, peer: crate::instances::PeerId, ma
         return tracing::debug!(%machine, "an unreadable custody record");
     };
     let came_from = format!("runner {machine} (instance {instance})");
+    // An act of one of its sessions it didn't do, kiln being out of reach (W27-R08: a machine cut
+    // off, as the twin's was).
+    if let Some(r) = bundle.get("refused_act") {
+        let text = |k: &str| r.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+        let op = r.get("op").and_then(Value::as_str).unwrap_or("call");
+        let ask = json!({ "op": op, "name": text("name"), "act": r.get("act") });
+        if let Err(e) = refused_act(hub, machine, &instance, &text("session"), &ask, &text("why"), crate::util::now_unix()).await {
+            tracing::warn!(target: "kiln.custody", %machine, error = %format!("{e:#}"), "an act a runner didn't do couldn't be recorded");
+        }
+        return tracing::info!(target: "kiln.custody", %machine, %instance, session = %text("session"), why = %text("why"), "a runner process didn't do an act: kiln was out of its reach");
+    }
     // A hand-over's word it refused, not being the process it was for (W27-R08; the 14:18 drop).
     if let Some(r) = bundle.get("refused_word") {
         let text = |k: &str| r.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
         let word: Option<Value> = r.get("word").and_then(Value::as_str).and_then(|w| serde_json::from_str(w).ok());
         let signer = word.as_ref().and_then(|w| statement::verify(w, &hub.pki.ca_der, &[], crate::util::now_unix()).ok()).map(|c| c.custodian).unwrap_or_default();
         let why = format!("session {}: {}", text("session"), text("why"));
-        let refusal = Refusal { digest: word.as_ref().map(digest_of).unwrap_or_default(), act: "a hand-over's word".into(), signer, why: why.clone(), envelope: word.map(|w| w.to_string()).unwrap_or_default(), came_from, at: crate::util::now_unix() };
+        let refusal = Refusal { digest: word.as_ref().map(digest_of).unwrap_or_default(), act: "a hand-over's word".into(), signer, why: why.clone(), envelope: word.map(|w| w.to_string()).unwrap_or_default(), came_from, at: crate::util::now_unix(), ..Refusal::default() };
         if let Err(e) = refuse(&hub.store, refusal).await {
             tracing::warn!(target: "kiln.custody", %machine, error = %format!("{e:#}"), "a refused hand-over's word couldn't be recorded");
         }
@@ -236,11 +254,168 @@ pub fn word(pki: &crate::pki::Pki, session: &str, command: &str, machine: &str, 
 /// The command a hand-over's word signs (`v`, as sent): its JSON without the word, as `serde_json`
 /// writes it again, which the server and the runner write alike.
 pub fn unworded(v: &Value) -> String {
+    without(v, "word")
+}
+
+/// `v` without its `key` (a signature beside it), as `serde_json` writes it again: what that
+/// signature signs, which both sides write alike.
+pub fn without(v: &Value, key: &str) -> String {
     let mut v = v.clone();
     if let Some(o) = v.as_object_mut() {
-        o.remove("word");
+        o.remove(key);
     }
     v.to_string()
+}
+
+/// Whether ask `ask`, which runner process `instance` of `machine` sends kiln for agent session
+/// `session` (a kiln operation, a page it shows, a run it asks before doing:
+/// `crate::mcp::runner_ask`), is the session's act now (docs/ci.md W27-R08; the Transfers plan's
+/// step 5, the twin). Once kiln has certified a holder at the session's epoch, it's the session's
+/// only if it's signed beside it (`act`) by that holder at that epoch
+/// (`kiln_ci::identity::custody::acted`): a copy left behind signs at an epoch whose key kiln
+/// revoked as the session went on, and a runner process that signs acts (`signs`: `CAP_CUSTODY`)
+/// and that kiln certified for the session can't send one unsigned. One that isn't certified for it
+/// yet (it just took it over), or a runner from before, goes by its machine, as before.
+/// Why not, each refusal recorded with the act's envelope, the epoch it's from and the transfer
+/// that superseded it.
+pub async fn act_counts(hub: &crate::hub::Hub, machine: &str, instance: &str, signs: bool, session: &str, ask: &Value, at: i64) -> anyhow::Result<Result<(), String>> {
+    // The session as its transfers say (the newest epoch kiln certified it at, and its holder
+    // then), not as an Open says: what a process announces doesn't fence out the holder.
+    let Some(held) = held_now(&hub.store, session).await? else { return Ok(Ok(())) };
+    let came_from = format!("runner {machine} (instance {instance})");
+    let record = |signer: String, epoch: Option<u64>, why: String, act: Option<&Value>| Refusal {
+        digest: act.map(digest_of).unwrap_or_default(),
+        act: format!("an act of session {session}: {}", op_of(ask)),
+        signer,
+        why,
+        envelope: act.map(Value::to_string).unwrap_or_default(),
+        came_from: came_from.clone(),
+        at,
+        superseded_by: if epoch.is_some_and(|e| e < held.epoch) { held.transfer.clone() } else { String::new() },
+        epoch,
+    };
+    let Some(act) = ask.get("act").and_then(Value::as_str).and_then(|a| serde_json::from_str::<Value>(a).ok()) else {
+        // Unsigned: from a process that signs acts and that kiln certified for the session, it's
+        // refused (at the session's epoch it holds the key; at one the session left, it's a copy
+        // left behind); from one kiln hasn't certified for it (it just took it over, its
+        // certificate on its way) or a runner from before, it goes by its machine, as before.
+        let held_at = if signs { crate::identities::epoch_held(&hub.store, session, machine, instance).await? } else { None };
+        let Some(e) = held_at else { return Ok(Ok(())) };
+        let why = if e < held.epoch {
+            format!("it isn't signed, from a runner process that held session {session} at epoch {e}, which {}: it's from a copy left behind", held.went_on())
+        } else {
+            format!("it isn't signed, from a runner process that signs its sessions' acts and holds session {session}'s key at epoch {e}")
+        };
+        refuse(&hub.store, record(String::new(), Some(e), why.clone(), None)).await?;
+        return Ok(Err(why));
+    };
+    let what = without(ask, "act");
+    let revocations = crate::identities::revocations(&hub.store).await?;
+    let checked = match statement::verify(&act, &hub.pki.ca_der, &revocations, at) {
+        Ok(c) => c,
+        Err(e) => {
+            // Its signer's identity revoked: a copy left behind signs at the epoch it left, which
+            // kiln revoked as the session went on. Who signed it, revocations aside, and why the
+            // fence says it doesn't count.
+            let signed = statement::verify(&act, &hub.pki.ca_der, &[], at).ok();
+            let why = match signed.as_ref().map(|c| custody::acted(c, &held, what.as_bytes())) {
+                Some(Err(fenced @ custody::Unacted::Fenced(_))) => fenced.to_string(),
+                _ => format!("session {session}'s act isn't signed as its holder now: {e}"),
+            };
+            let signer = signed.map(|c| c.custodian).unwrap_or_default();
+            refuse(&hub.store, record(signer.clone(), epoch_of(&signer), why.clone(), Some(&act))).await?;
+            return Ok(Err(why));
+        }
+    };
+    match custody::acted(&checked, &held, what.as_bytes()) {
+        Ok(_) => Ok(Ok(())),
+        Err(e) => {
+            let why = e.to_string();
+            refuse(&hub.store, record(checked.custodian.clone(), epoch_of(&checked.custodian), why.clone(), Some(&act))).await?;
+            Ok(Err(why))
+        }
+    }
+}
+
+/// Act `ask` of agent session `session`, from runner process `instance` of `machine`, refused
+/// before it was checked as an act (`why`: the session went on elsewhere, so this is a copy left
+/// behind; its runner, out of kiln's reach, didn't do it): recorded with its envelope, who signed it
+/// and at which epoch (revocations aside), and the transfer the session went on with if that's an
+/// epoch it left (docs/ci.md W27-R08). Why, saying where the session went on.
+pub async fn refused_act(hub: &crate::hub::Hub, machine: &str, instance: &str, session: &str, ask: &Value, why: &str, at: i64) -> anyhow::Result<String> {
+    let act = ask.get("act").and_then(Value::as_str).and_then(|a| serde_json::from_str::<Value>(a).ok());
+    let signer = act.as_ref().and_then(|a| statement::verify(a, &hub.pki.ca_der, &[], at).ok()).map(|c| c.custodian).unwrap_or_default();
+    // The epoch it's from: the one it's signed at, or, unsigned, the newest kiln certified this
+    // process for the session at.
+    let epoch = match epoch_of(&signer) {
+        Some(e) => Some(e),
+        None => crate::identities::epoch_held(&hub.store, session, machine, instance).await?,
+    };
+    let (why, superseded_by) = match (held_now(&hub.store, session).await?, epoch) {
+        (Some(h), Some(e)) if e < h.epoch => (format!("{why}: it's from epoch {e} of session {session}, which {}", h.went_on()), h.transfer),
+        _ => (why.to_owned(), String::new()),
+    };
+    let refusal = Refusal {
+        digest: act.as_ref().map(digest_of).unwrap_or_default(),
+        act: format!("an act of session {session}: {}", op_of(ask)),
+        signer,
+        why: why.clone(),
+        envelope: act.map(|a| a.to_string()).unwrap_or_default(),
+        came_from: format!("runner {machine} (instance {instance})"),
+        at,
+        epoch,
+        superseded_by,
+    };
+    refuse(&hub.store, refusal).await?;
+    Ok(why)
+}
+
+/// What ask `ask` is: "call goals.done", "act run", "page".
+fn op_of(ask: &Value) -> String {
+    match (ask.get("op").and_then(Value::as_str), ask.get("name").and_then(Value::as_str)) {
+        (Some(op), Some(name)) => format!("{op} {name}"),
+        (Some(op), None) => op.to_owned(),
+        _ => "an ask".to_owned(),
+    }
+}
+
+/// The epoch agent identity `signer` signs at; None for another identity.
+fn epoch_of(signer: &str) -> Option<u64> {
+    Identity::parse(signer).ok().and_then(|i| match i.actor {
+        Actor::Agent { epoch, .. } => Some(epoch),
+        _ => None,
+    })
+}
+
+/// Who holds agent session `session` now, as its transfers say: the newest epoch kiln certified it
+/// at, the runner process it certified then and when, and kiln's record of the transfer that
+/// process took it with (its receipt). None before kiln certified any (W27-R08).
+async fn held_now(store: &Store, session: &str) -> anyhow::Result<Option<custody::Held>> {
+    let Some((epoch, holder)) = crate::identities::newest_holder(store, session).await? else { return Ok(None) };
+    let by = Identity::parse(&holder).ok().and_then(|i| match i.actor {
+        Actor::Agent { held_by, .. } => held_by,
+        _ => None,
+    });
+    Ok(Some(custody::Held { session: session.to_owned(), epoch, by, since: issued_at(store, &holder).await?.unwrap_or_default(), transfer: receipt_of(store, &holder).await?.unwrap_or_default() }))
+}
+
+/// The epoch agent identity `signer` signs at, and the transfer its session went on with if that's
+/// an epoch the session left (a copy left behind's): what a refusal of what it signed records.
+async fn left(store: &Store, signer: &str) -> anyhow::Result<(Option<u64>, String)> {
+    let Some((session, epoch)) = Identity::parse(signer).ok().and_then(|i| match i.actor {
+        Actor::Agent { agent, epoch, .. } => Some((agent, epoch)),
+        _ => None,
+    }) else {
+        return Ok((None, String::new()));
+    };
+    let held = held_now(store, &session).await?;
+    Ok((Some(epoch), held.filter(|h| epoch < h.epoch).map(|h| h.transfer).unwrap_or_default()))
+}
+
+/// When kiln issued its newest certificate for identity `subject`.
+async fn issued_at(store: &Store, subject: &str) -> anyhow::Result<Option<i64>> {
+    let s = subject.to_owned();
+    store.call(move |c| Ok(c.query_row("SELECT MAX(issued_at) FROM identities WHERE subject = ?1", [&s], |r| r.get::<_, Option<i64>>(0)).optional()?.flatten())).await
 }
 
 /// kiln's take of agent session `session` as it leaves epoch `epoch` (its timeline `events`), for
@@ -483,8 +658,8 @@ async fn refuse(store: &Store, r: Refusal) -> anyhow::Result<()> {
     store
         .call(move |c| {
             c.execute(
-                "INSERT INTO transfer_refusals (digest, act, signer, why, envelope, came_from, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![r.digest, r.act, r.signer, r.why, r.envelope, r.came_from, r.at],
+                "INSERT INTO transfer_refusals (digest, act, signer, why, envelope, came_from, at, epoch, superseded_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![r.digest, r.act, r.signer, r.why, r.envelope, r.came_from, r.at, r.epoch.map(|e| i64::try_from(e).unwrap_or(i64::MAX)), r.superseded_by],
             )?;
             Ok(())
         })
@@ -496,7 +671,7 @@ async fn refuse(store: &Store, r: Refusal) -> anyhow::Result<()> {
 /// Records that kiln refused act `act` (a statement's digest `digest`, signed by `signer`) for
 /// `why`: what the fence and the act checks call (W27-R08).
 pub async fn refused(store: &Store, digest: &str, act: &str, signer: &str, why: &str, came_from: &str, at: i64) -> anyhow::Result<()> {
-    refuse(store, Refusal { digest: digest.to_owned(), act: act.to_owned(), signer: signer.to_owned(), why: why.to_owned(), envelope: String::new(), came_from: came_from.to_owned(), at }).await
+    refuse(store, Refusal { digest: digest.to_owned(), act: act.to_owned(), signer: signer.to_owned(), why: why.to_owned(), came_from: came_from.to_owned(), at, ..Refusal::default() }).await
 }
 
 /// The record a walk starts from: `digest` if it's a record kiln has; else, as a thing's digest
@@ -661,10 +836,10 @@ pub async fn refusals(store: &Store, limit: usize) -> anyhow::Result<Vec<Value>>
     let n = i64::try_from(limit).unwrap_or(i64::MAX);
     store
         .call(move |c| {
-            let mut q = c.prepare("SELECT digest, act, signer, why, came_from, at FROM transfer_refusals ORDER BY at DESC, id DESC LIMIT ?1")?;
+            let mut q = c.prepare("SELECT digest, act, signer, why, came_from, at, epoch, superseded_by FROM transfer_refusals ORDER BY at DESC, id DESC LIMIT ?1")?;
             let rows = q
                 .query_map([n], |r| {
-                    Ok(json!({ "digest": r.get::<_, String>(0)?, "act": r.get::<_, String>(1)?, "signer": r.get::<_, String>(2)?, "why": r.get::<_, String>(3)?, "came_from": r.get::<_, String>(4)?, "at": r.get::<_, i64>(5)? }))
+                    Ok(json!({ "digest": r.get::<_, String>(0)?, "act": r.get::<_, String>(1)?, "signer": r.get::<_, String>(2)?, "why": r.get::<_, String>(3)?, "came_from": r.get::<_, String>(4)?, "at": r.get::<_, i64>(5)?, "epoch": r.get::<_, Option<i64>>(6)?, "superseded_by": r.get::<_, String>(7)? }))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
@@ -958,6 +1133,90 @@ mod tests {
             assert!(check(&command, "main", Some(3)).is_err_and(|w| w.contains("isn't signed")), "unsigned, from a server that signs words");
             assert_eq!(word_for_me("s1", &command, false, &root, "fedora", "main", Some(3)), Ok(()), "unsigned, from a server from before");
             assert_eq!(check(&serde_json::to_string(&Command::Interrupt)?, "01a17502", None), Ok(()), "not a hand-over's word");
+            Ok(())
+        })
+    }
+
+    /// W27-R08 (the Transfers plan's step 5, the twin): once kiln has certified a session's holder
+    /// at its epoch, an act counts only from that holder, signed at that epoch, whatever it is (a
+    /// goal met, a message to an agent, a CI run, a page's answer, a run on another machine asked
+    /// before it's done). Unsigned, it's refused from a runner process that signs and that kiln
+    /// certified for the session (its holder, or a copy left behind), and goes by its machine from
+    /// one kiln hasn't certified for it (it just took it over) or a runner from before; signed by
+    /// the holder, it counts; signed by the copy left behind at the epoch it left, or by a former
+    /// holder of the current epoch, or beside another act than its own, it's refused, saying why.
+    /// Each refusal is recorded with who signed it, the epoch it's from and the transfer that
+    /// superseded that epoch.
+    #[test]
+    fn w27_r08_an_act_counts_only_from_its_holder_now() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let (org, at) = (hub.pki.organization(), crate::util::now_unix());
+            let uri = |epoch: u64, machine: &str, instance: &str| format!("kiln://{org}/person/ada/agent/s1/epoch/{epoch}/machine/{machine}/instance/{instance}");
+            let (left_uri, former_uri, holder_uri) = (uri(0, "fedora", "main"), uri(1, "jupiter", "01a14700"), uri(1, "adacachy", "01a14794"));
+            let (left, former, holder) = (Signer::new(&hub.pki, &left_uri)?, Signer::new(&hub.pki, &former_uri)?, Signer::new(&hub.pki, &holder_uri)?);
+            // Certified in turn: the copy left behind at epoch 0, then at epoch 1 a process that
+            // held it before its holder now.
+            for (u, s) in [(&left_uri, &left), (&former_uri, &former), (&holder_uri, &holder)] {
+                crate::identities::record(&hub.store, "agent", u, &s.pem).await?;
+            }
+            crate::identities::revoke(&hub.store, crate::identities::Target::Subject(left_uri.clone()), "epoch 0 left: moved on to epoch 1, on runner adacachy (instance 01a14794)", "kiln", at - 10).await?;
+            // kiln's record of the receipt its holder took it with.
+            let h = holder_uri.clone();
+            hub.store.call(move |c| Ok(c.execute("INSERT INTO custody (digest, payload_type, kind, custodian, envelope, taken_at) VALUES ('sha256:5e55', ?1, 'received', ?2, '{}', ?3)", params![PAYLOAD_CUSTODY, h, at])?)).await?;
+            // An Open that says epoch 7 doesn't move the epoch acts are held to.
+            hub.harness.raise_epoch("s1", 7);
+            let asks = [
+                json!({"op": "call", "session": "s1", "name": "goals.done", "input": {"id": "g1", "evidence": "built"}}),
+                json!({"op": "call", "session": "s1", "name": "agents.send", "input": {"agent": "a2", "text": "the build is green"}}),
+                json!({"op": "call", "session": "s1", "name": "ci.runs.trigger", "input": {"repo": "kiln"}}),
+                json!({"op": "page", "session": "s1", "page": "p1", "do": "approve"}),
+                json!({"op": "act", "session": "s1", "name": "run on jupiter: cargo build"}),
+            ];
+            let signed = |by: &Signer, epoch: u64, ask: &Value| -> anyhow::Result<Value> {
+                use sha2::Digest as _;
+                let hex: String = sha2::Sha256::digest(without(ask, "act").as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+                let body = serde_json::to_value(custody::Act { v: statement::VERSION, by: String::new(), session: "s1".into(), epoch, op: op_of(ask) })?;
+                let subject = Subject { name: "an act of session s1".into(), digest: BTreeMap::from([("sha256".to_owned(), hex)]), ..Subject::default() };
+                let p = by.payload(&Statement { subject: vec![subject], ..Statement::new(body) })?;
+                let act = bundle(custody::PAYLOAD_ACT, &p, &by.key.sign(&to_sign(custody::PAYLOAD_ACT, &p))?, &by.der);
+                let mut a = ask.clone();
+                if let Some(o) = a.as_object_mut() {
+                    o.insert("act".into(), Value::String(act.to_string()));
+                }
+                Ok(a)
+            };
+            let counts = |machine: &'static str, instance: &'static str, signs: bool, a: Value| {
+                let hub = std::sync::Arc::clone(&hub);
+                async move { act_counts(&hub, machine, instance, signs, "s1", &a, at).await }
+            };
+            for ask in &asks {
+                let op = op_of(ask);
+                assert!(counts("adacachy", "01a14794", true, ask.clone()).await?.is_err_and(|w| w.contains("isn't signed")), "{op}: unsigned, from the process that holds the key");
+                assert_eq!(counts("adacachy", "z9", true, ask.clone()).await?, Ok(()), "{op}: unsigned, from a process kiln hasn't certified for it");
+                assert_eq!(counts("adacachy", "01a14794", false, ask.clone()).await?, Ok(()), "{op}: unsigned, from a runner from before");
+                assert_eq!(counts("adacachy", "01a14794", true, signed(&holder, 1, ask)?).await?, Ok(()), "{op}: signed by its holder at its epoch");
+                let stale = counts("fedora", "main", true, signed(&left, 0, ask)?).await?;
+                assert!(stale.as_ref().is_err_and(|w| w.contains("signed at epoch 0 of session s1, which went on at epoch 1, on runner adacachy (instance 01a14794)") && w.contains("(transfer sha256:5e55): it's from a copy left behind")), "{op}: {stale:?}");
+                let unsigned_left = counts("fedora", "main", true, ask.clone()).await?;
+                assert!(unsigned_left.as_ref().is_err_and(|w| w.contains("held session s1 at epoch 0, which went on at epoch 1") && w.ends_with("it's from a copy left behind")), "{op}: {unsigned_left:?}");
+                let former_now = counts("jupiter", "01a14700", true, signed(&former, 1, ask)?).await?;
+                assert!(former_now.as_ref().is_err_and(|w| w.contains("on runner jupiter (instance 01a14700), but the session is held, on runner adacachy (instance 01a14794)")), "{op}: {former_now:?}");
+            }
+            // Its holder's signature beside another act (its goal changed): refused.
+            let mut changed = signed(&holder, 1, &json!({"op": "call", "session": "s1", "name": "goals.done", "input": {"id": "g1", "evidence": "built"}}))?;
+            if let Some(id) = changed.pointer_mut("/input/id") {
+                *id = json!("g2");
+            }
+            assert!(counts("adacachy", "01a14794", true, changed).await?.is_err_and(|w| w.contains("the act itself changed")));
+            let r = refusals(&hub.store, LIST_MAX).await?;
+            assert_eq!(r.len(), 4 * asks.len() + 1, "{r:?}");
+            let from = |who: &str| -> Vec<&Value> { r.iter().filter(|x| x.get("signer") == Some(&json!(who))).collect() };
+            let (stale, former_now) = (from(&left_uri), from(&former_uri));
+            assert!(stale.len() == asks.len() && stale.iter().all(|x| x.get("epoch") == Some(&json!(0)) && x.get("superseded_by") == Some(&json!("sha256:5e55")) && x.get("came_from") == Some(&json!("runner fedora (instance main)"))), "{stale:?}");
+            assert!(former_now.len() == asks.len() && former_now.iter().all(|x| x.get("epoch") == Some(&json!(1)) && x.get("superseded_by") == Some(&json!(""))), "{former_now:?}");
+            let unsigned_left: Vec<&Value> = r.iter().filter(|x| x.get("signer") == Some(&json!("")) && x.get("epoch") == Some(&json!(0))).collect();
+            assert!(unsigned_left.len() == asks.len() && unsigned_left.iter().all(|x| x.get("superseded_by") == Some(&json!("sha256:5e55"))), "{unsigned_left:?}");
             Ok(())
         })
     }

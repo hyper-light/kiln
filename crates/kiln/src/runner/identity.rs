@@ -163,6 +163,13 @@ pub fn uri(slot: &str) -> Option<String> {
     HELD.lock().uris.get(slot).cloned()
 }
 
+/// The newest epoch of agent session `session` this process holds a certified key at: the epoch
+/// it holds the session at, as kiln certified it.
+pub fn epoch_held(session: &str) -> Option<u64> {
+    let prefix = format!("agent/{session}/");
+    HELD.lock().certs.keys().filter_map(|k| k.strip_prefix(&prefix)?.parse::<u64>().ok()).max()
+}
+
 /// The certificate held for a slot.
 pub fn cert(slot: &str) -> Option<String> {
     HELD.lock().certs.get(slot).map(|(pem, _)| pem.clone())

@@ -161,6 +161,7 @@ pub async fn run(a: RunArgs, shutdown: crate::rt::Shutdown) -> anyhow::Result<()
         timeout_ms: a.timeout.map(|s| s.saturating_mul(1000)),
         shell: a.shell.clone(),
         detach: a.detach,
+        asker: None,
     };
     let stream = std::os::unix::net::UnixStream::connect(&path).map_err(|e| anyhow::anyhow!("cannot reach the kiln runner at {}: {e}", path.display()))?;
     stream.set_nonblocking(true)?;

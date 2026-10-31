@@ -271,9 +271,20 @@ impl Handle {
     }
 
     /// Ask the kiln server `json` ([`crate::proto::AgentMsg::ReachAsk`]: an agent's MCP server
-    /// asking for kiln's operations, `crate::mcp::runner_ask`), and wait for its answer.
+    /// asking for kiln's operations, `crate::mcp::runner_ask`), and wait for its answer. An agent
+    /// session's act goes signed by the session this process holds (docs/ci.md W27-R08).
     pub async fn query(&self, json: String) -> anyhow::Result<String> {
-        self.ask(|reply| Local::Query { json, reply }).await?
+        let json = crate::runner::custody::signed_ask(json);
+        let sent = json.clone();
+        let answer = match self.ask(|reply| Local::Query { json, reply }).await {
+            Ok(a) => a,
+            Err(e) => Err(e),
+        };
+        // Unanswered, a session's act wasn't done: kiln hears of it once it's back.
+        if let Err(e) = &answer {
+            crate::runner::custody::unanswered(&sent, &format!("{e:#}"));
+        }
+        answer
     }
 
     /// Hand `data` to `peer` to take over (an agent session moving there), and wait until it has,

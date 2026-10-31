@@ -8901,7 +8901,7 @@ research `01a17947fdad71e5a4f15866e3541c41`.
   browser yet).
 
 **Built: custody, and agent sessions handed over signed (R08, in part).** Plan
-`01a17856b1b477eda14a574ae312a123`, its steps 1 to 4; research `01a18abf2d28762d92104dca2fbfbf89`.
+`01a17856b1b477eda14a574ae312a123`, its steps 1 to 5; research `01a18abf2d28762d92104dca2fbfbf89`.
 
 - *Custody records* are signed statements (`kiln_ci::identity::statement`) whose body says the
   things they're about were handed on, received, passed on unchanged by a relay, or taken by kiln's
@@ -8957,6 +8957,30 @@ research `01a17947fdad71e5a4f15866e3541c41`.
   Once kiln certifies a process for a session, it sends that session's words there. A test
   build's `stale_words` (the server's) sends the old holder its stale words, to play the drop
   again.
+- *Acts, the session's holder's only* (the twin). Each act an agent session makes through kiln
+  (a kiln operation its MCP server calls: goals, plans, agents and messages to them, research, CI
+  runs and deploys, changes; a page's answer; a run on another machine, asked before it's done) is
+  signed by the runner process holding it, with the session's key at the epoch it holds it at,
+  beside the ask (`act`: `kiln_ci::identity::custody::Act`, its subject the ask itself by digest).
+  kiln takes it only from the session's holder now (`crate::custody::act_counts`): signed at the
+  newest epoch kiln certified the session at (what an Open says doesn't move it), by the process
+  certified then (`acted`, `fence`), the ask unchanged. Signed at an epoch the session left (its key
+  revoked as it went on), by another process of its epoch, or beside another ask, it's refused,
+  answered with why ("it was signed at epoch 0 of session …, which went on at epoch 1, on runner
+  box-b (instance …) at … (transfer …): it's from a copy left behind"), and recorded with its
+  envelope, its signer, the epoch it's from and the transfer that superseded that epoch
+  (`transfer_refusals.epoch`, `.superseded_by`). A runner that signs acts (`CAP_CUSTODY`) can't send
+  one unsigned for a session kiln certified it for; one kiln hasn't certified for it yet (it just
+  took it over) or a runner from before goes by its machine, as before. An act from a machine the
+  session no longer runs on is refused the same way before it's checked. A run on another machine
+  is asked of kiln first (op `act`) by the runner the agent's process asks, which tells an agent's
+  processes from the machine's by the asking process's tree; one its runner can't put to kiln (cut
+  off) isn't done, and kiln records it once the runner is back. A copy left behind is told to let
+  go of the session at its runner's first word since (its inventory, which says each session's
+  epoch there, or any ask), not once it announces the session again: the twin of 2026-10-25 ran on
+  for ten minutes after its machine came back. A session just arriving, at the epoch it goes on
+  at, isn't one. Updates go by where the session runs, not by signatures: only the machine it runs on
+  speaks for it, and of two of that machine's processes that say they hold it, the newer.
 - *A resume from the server's store* is kiln's take: signed with the server's own key for the
   identity kiln last certified the session as at that epoch (`identities::holder_at`), to the next,
   saying when kiln last heard from the machine; kiln keeps it at once, the package carries it, and
@@ -8980,12 +9004,22 @@ research `01a17947fdad71e5a4f15866e3541c41`.
   the new build). `custody::w27_r08_a_hand_overs_word_goes_only_to_its_process`, kiln-ci's
   `w27_r08_a_hand_overs_word_is_only_its_processs`, and
   `agent::w27_ac05_a_hand_overs_word_for_the_runner_being_upgraded_never_reaches_the_new_build`
-  (fix/upgrade-keeps-agents' test, come over). Nightly: `.kiln/custody-lab.yaml`.
+  (fix/upgrade-keeps-agents' test, come over). Acts: kiln-ci's
+  `w27_r08_an_act_is_only_its_holders_at_its_epoch`, `custody::w27_r08_an_act_counts_only_from_its_holder_now`
+  (a goal met, a message, a CI run, a page's answer and a run, each from the holder, a copy left
+  behind, a former holder of the epoch, unsigned, changed), and, with `chaos`,
+  `w27_ac05_the_twin_played_again` (a session moved off a machine cut off goes on elsewhere from
+  kiln's copy; the copy marks its goal met, starts a CI run and a run on another machine: none
+  done, each recorded with the epoch it's from and the transfer that superseded it, the copy told
+  to let go once its machine is back, the session at its next epoch untouched). Nightly:
+  `.kiln/custody-lab.yaml`.
 - *Not yet.* A session's package isn't yet addressed to the process it goes to (its hand-on is to
-  the session at its next epoch); acts aren't yet refused on every channel when signed at an epoch
-  left, and a runner's Open at a later epoch still raises it before its transfer is recorded (step
-  5); work handed between agents, changes, review requests, carried approvals, promotions,
-  replant, artifacts, machines and intermediaries (steps 6 to 16).
+  the session at its next epoch); a runner's Open at a later epoch still raises the epoch the
+  registry keeps (what its inbox and updates are fenced by) before its transfer is recorded, though
+  acts are held to the epoch kiln certified; what a copy left behind does on its own machine
+  without kiln goes on until its runner hears from kiln (docs/agents.md, "A copy left behind");
+  work handed between agents, changes, review requests, carried approvals, promotions, replant,
+  artifacts, machines and intermediaries (steps 6 to 16).
 
 ### W28 Demand-driven CI: adopt, cover, stagger, land by conflict graph
 

@@ -85,13 +85,114 @@ static STATE: LazyLock<Mutex<State>> = LazyLock::new(Default::default);
 
 /// `s` signed with slot `slot`'s key, its body naming that identity: its bundle.
 fn sign(slot: &str, by: &str, s: &Statement) -> anyhow::Result<Value> {
+    sign_as(slot, by, PAYLOAD_CUSTODY, s)
+}
+
+/// [`sign`], as `payload_type`.
+fn sign_as(slot: &str, by: &str, payload_type: &str, s: &Statement) -> anyhow::Result<Value> {
     let mut s = s.clone();
     if let Some(o) = s.body.as_object_mut() {
         o.insert("by".into(), Value::String(by.to_owned()));
     }
     let payload = statement::payload(&s)?;
-    let (signature, cert) = identity::sign(slot, &statement::to_sign(PAYLOAD_CUSTODY, &payload))?;
-    Ok(statement::bundle(PAYLOAD_CUSTODY, &payload, &signature, &crate::pki::der_of(&cert)?))
+    let (signature, cert) = identity::sign(slot, &statement::to_sign(payload_type, &payload))?;
+    Ok(statement::bundle(payload_type, &payload, &signature, &crate::pki::der_of(&cert)?))
+}
+
+/// Ask `json`, a session's act ([`signed_ask`]), went unanswered (`why`: kiln couldn't be asked,
+/// as from a machine cut off), so it wasn't done: kiln is told once it's back, and records it
+/// with the act (docs/ci.md W27-R08). Nothing for another ask.
+pub fn unanswered(json: &str, why: &str) {
+    let Ok(v) = serde_json::from_str::<Value>(json) else { return };
+    let (Some(session), Some(op)) = (v.get("session").and_then(Value::as_str), v.get("op").and_then(Value::as_str)) else { return };
+    if op == "registry" {
+        return;
+    }
+    let name = v.get("name").and_then(Value::as_str).unwrap_or(op);
+    tracing::info!(target: "kiln.custody", %session, %name, %why, "an act went unanswered by kiln: not done");
+    let record = serde_json::json!({ "refused_act": { "session": session, "op": op, "name": name, "why": format!("kiln couldn't be asked whether it's the session's to do, so it wasn't done: {why}"), "act": v.get("act") } });
+    STATE.lock().once.push_back(record.to_string());
+}
+
+/// This runner's agent sessions and their harness processes, as its harness says.
+type Sessions = Box<dyn Fn() -> Vec<(String, Option<u32>)> + Send + Sync>;
+static SESSIONS: std::sync::OnceLock<Sessions> = std::sync::OnceLock::new();
+
+/// Where this runner's agent sessions' harness processes are (`Host::harness_pids`): what tells an
+/// agent session's own processes from the machine's ([`session_of_pid`]).
+pub fn set_sessions(f: impl Fn() -> Vec<(String, Option<u32>)> + Send + Sync + 'static) {
+    let _ = SESSIONS.set(Box::new(f));
+}
+
+/// The agent session process `pid` belongs to (its harness, or what it started), if any. Blocking.
+pub fn session_of_pid(pid: u32) -> Option<String> {
+    let sessions = SESSIONS.get().map(|f| f()).unwrap_or_default();
+    crate::harness::survivors::session_of(pid, &sessions)
+}
+
+/// Whether this runner's server takes custody records and checks its sessions' acts
+/// (`CAP_CUSTODY`), as it last said.
+static SERVER_CHECKS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The server says what it can do: whether it checks this runner's sessions' acts.
+pub fn server_checks(yes: bool) {
+    SERVER_CHECKS.store(yes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether kiln takes `what` (a run on another machine) as agent session `session`'s act now
+/// (docs/ci.md W27-R08): asked with the act signed by the session this process holds, through
+/// `handle` ([`signed_ask`]); why not (kiln refused it, or can't be asked) if it doesn't. A server
+/// from before, which doesn't check acts, takes them as before.
+pub async fn act_taken(handle: &crate::reach::node::Handle, session: &str, what: &str) -> Result<(), String> {
+    if !signs() || !SERVER_CHECKS.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(());
+    }
+    let ask = serde_json::json!({ "op": "act", "session": session, "name": what });
+    let answer = handle.query(ask.to_string()).await.map_err(|e| format!("kiln couldn't be asked whether it's session {session}'s to do: {e:#}"))?;
+    let v: Value = serde_json::from_str(&answer).map_err(|e| format!("kiln's answer was unreadable: {e}"))?;
+    match v.get("error").and_then(Value::as_str) {
+        Some(why) => Err(why.trim_start_matches("refused: ").to_owned()),
+        None => Ok(()),
+    }
+}
+
+/// Ask `json` this runner sends kiln for one of its agent sessions (a kiln operation it calls, a
+/// page it shows: `crate::mcp::runner_ask`), with the act it is beside it as `act` (docs/ci.md
+/// W27-R08; the Transfers plan's step 5): signed with the session's key at the epoch this process
+/// holds it at, so kiln applies it only from the session's holder now. As it was when this process
+/// holds no certified key for the session (it just took it over), or it isn't an act (what kiln's
+/// operations are).
+pub fn signed_ask(json: String) -> String {
+    use kiln_ci::identity::custody::{Act, PAYLOAD_ACT};
+    use sha2::Digest as _;
+    if !signs() {
+        return json;
+    }
+    let Ok(mut v) = serde_json::from_str::<Value>(&json) else { return json };
+    let (Some(session), Some(op)) = (v.get("session").and_then(Value::as_str).map(str::to_owned), v.get("op").and_then(Value::as_str).map(str::to_owned)) else { return json };
+    if op == "registry" {
+        return json;
+    }
+    let Some(epoch) = identity::epoch_held(&session) else { return json };
+    let slot = identity::slot("agent", Some(&session), Some(epoch));
+    let Some(by) = identity::uri(&slot) else { return json };
+    let what = crate::custody::without(&v, "act");
+    let named = v.get("name").and_then(Value::as_str).map_or_else(|| op.clone(), |n| format!("{op} {n}"));
+    let hex: String = sha2::Sha256::digest(what.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+    let subject = Subject { name: format!("an act of session {session}: {named}"), digest: BTreeMap::from([("sha256".to_owned(), hex)]), ..Subject::default() };
+    let body = serde_json::to_value(Act { v: statement::VERSION, by: by.clone(), session: session.clone(), epoch, op: named }).unwrap_or(Value::Null);
+    match sign_as(&slot, &by, PAYLOAD_ACT, &Statement { subject: vec![subject], ..Statement::new(body) }) {
+        Ok(bundle) => {
+            if let Some(o) = v.as_object_mut() {
+                o.insert("act".into(), Value::String(bundle.to_string()));
+            }
+            v.to_string()
+        }
+        Err(e) => {
+            tracing::warn!(target: "kiln.custody", %session, epoch, error = %format!("{e:#}"), "an act couldn't be signed: it goes unsigned");
+            json
+        }
+    }
 }
 
 fn queue(bundle: &Value) {

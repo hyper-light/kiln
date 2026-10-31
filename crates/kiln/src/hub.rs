@@ -2004,10 +2004,10 @@ impl Hub {
                     }
                     // An agent's MCP server on the runner asks for kiln's operations: answered on
                     // their own, so a slow one holds up nothing else the runner says.
-                    Some("registry" | "call" | "page" | "stream") => {
+                    Some("registry" | "call" | "page" | "stream" | "act") => {
                         let (hub, runner) = (Arc::clone(self), agent.clone());
                         crate::rt::spawn(async move {
-                            let answer = crate::mcp::runner_ask(&hub, &runner, &ask).await;
+                            let answer = crate::mcp::runner_ask(&hub, &runner, peer, &ask).await;
                             hub.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
                         });
                     }
@@ -2107,9 +2107,15 @@ impl Hub {
             },
             AgentMsg::HarnessInventory { json } => match serde_json::from_str::<crate::harness::host::Inventory>(&json) {
                 Ok(mut inv) => {
-                    // A copy it kept of a session that went on elsewhere since isn't its own (it
-                    // lets go of it once it announces it).
+                    // A copy it kept of a session that went on elsewhere since isn't its own: it's
+                    // told to let go of it now, at its runner's first word since, not once the copy
+                    // announces it again (W27-R08: the twin of 2026-10-25 ran on for ten minutes).
+                    // One just arriving, its Open on its way, is kept.
+                    let left = self.harness.left_behind(&agent, &inv);
                     inv.sessions.retain(|id| self.harness.runs_on(id, &agent));
+                    for id in &left {
+                        crate::mcp::let_go(self, &agent, peer, id).await;
+                    }
                     // This process's sessions are its own; another process of the machine keeps
                     // the ones it holds (the registry forgets sessions a report leaves out), and
                     // so does one that isn't connected now (`Registry::holder`).

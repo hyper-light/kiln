@@ -1351,6 +1351,14 @@ impl Registry {
         self.epochs.lock().get(id).is_some_and(|e| *e > epoch)
     }
 
+    /// The sessions runner `machine` reports holding (`inv`) whose copy there is one left behind:
+    /// the session runs elsewhere now, at a later epoch than that copy (docs/ci.md W27-R08). One
+    /// just arriving there (its Open on its way) is at the epoch it goes on at, which isn't; a
+    /// runner from before says no epochs, so none of its are.
+    pub fn left_behind(&self, machine: &str, inv: &super::host::Inventory) -> Vec<String> {
+        inv.sessions.iter().filter(|id| !self.runs_on(id, machine) && inv.epochs.get(*id).is_some_and(|e| self.stale(id, *e))).cloned().collect()
+    }
+
     /// Session `id` is at `epoch` now (epochs only rise), kept when it changes.
     pub(crate) fn raise_epoch(&self, id: &str, epoch: u64) {
         let snapshot = {
@@ -3086,6 +3094,29 @@ mod tests {
             // Who holds what is kept for the next start.
             let kept: HashMap<String, String> = serde_json::from_slice(&std::fs::read(hub.harness.dir.join("holders.json"))?)?;
             anyhow::ensure!(kept.get("old-1").map(String::as_str) == Some("01a14794") && !kept.contains_key("old-2"), "{kept:?}");
+            Ok(())
+        })
+    }
+
+    /// W27-R08 (the twin): a runner's report names the sessions it holds a copy of that went on
+    /// elsewhere at a later epoch, which it's told to let go of; not one just arriving there (its
+    /// Open on its way, at the epoch it goes on at), not one it runs, and none from a runner that
+    /// says no epochs.
+    #[test]
+    fn w27_r08_a_report_names_the_copies_left_behind() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let info = |id: &str, epoch: u64| Info { id: id.into(), kind: "claude".into(), epoch, ..Info::default() };
+            // "twin" went on on box-b at epoch 1, its copy left on box-a; "arriving" is on its way
+            // from box-b to box-a, at epoch 1 there; "here" runs on box-a.
+            let (a, b) = (Location::Machine("box-a".into()), Location::Machine("box-b".into()));
+            hub.harness.ingest(&hub, &b, "twin", Update::Open { info: Box::new(info("twin", 1)), since: None });
+            hub.harness.ingest(&hub, &b, "arriving", Update::Open { info: Box::new(info("arriving", 0)), since: None });
+            hub.harness.ingest(&hub, &a, "here", Update::Open { info: Box::new(info("here", 0)), since: None });
+            let report = |held: &[(&str, u64)]| crate::harness::host::Inventory { sessions: held.iter().map(|(s, _)| (*s).to_owned()).collect(), epochs: held.iter().map(|(s, e)| ((*s).to_owned(), *e)).collect(), ..Default::default() };
+            assert_eq!(hub.harness.left_behind("box-a", &report(&[("twin", 0), ("arriving", 1), ("here", 0)])), ["twin"]);
+            let before = crate::harness::host::Inventory { sessions: vec!["twin".into()], ..Default::default() };
+            assert!(hub.harness.left_behind("box-a", &before).is_empty(), "a runner from before says no epochs");
             Ok(())
         })
     }

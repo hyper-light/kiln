@@ -574,7 +574,7 @@ pub enum Fenced {
     NotAnAgent { signer: String },
     #[error("it's signed as agent {agent}, not session {session}")]
     AnotherSession { session: String, agent: String },
-    #[error("it was signed at epoch {signed} of session {session}, which went on at epoch {current}{to} at {since} ({transfer}): it's from a copy left behind")]
+    #[error("it was signed at epoch {signed} of session {session}, which went on at epoch {current}{to} at {since}{}: it's from a copy left behind", transfer_of(.transfer))]
     Left { session: String, signed: u64, current: u64, to: String, since: String, transfer: String },
     #[error("it's signed at epoch {signed} of session {session}, which kiln has at epoch {current}: no transfer to epoch {signed} is recorded")]
     Ahead { session: String, signed: u64, current: u64 },
@@ -585,6 +585,19 @@ pub enum Fenced {
 /// ", on runner fedora-2 (instance 01a174ed)", or "" for no holder.
 fn on(h: Option<&Holder>) -> String {
     h.map(|h| format!(", on runner {} (instance {})", h.machine, h.instance)).unwrap_or_default()
+}
+
+/// " (transfer 3f…)", kiln's record of the transfer, or "" for none (a hand-over from before).
+fn transfer_of(t: &str) -> String {
+    if t.is_empty() { String::new() } else { format!(" (transfer {t})") }
+}
+
+impl Held {
+    /// "went on at epoch 1, on runner adacachy (instance 01a14794) at 2026-10-25T22:58:15Z
+    /// (transfer 3f…)": where the session is now, said to what comes from an epoch it left.
+    pub fn went_on(&self) -> String {
+        format!("went on at epoch {}{} at {}{}", self.epoch, on(self.by.as_ref()), chain::when(self.since), transfer_of(&self.transfer))
+    }
 }
 
 /// Whether an act signed by `signer` counts as agent session `held.session`'s: signed at the epoch
@@ -613,6 +626,61 @@ pub fn fence(held: &Held, signer: &Identity) -> Result<(), Fenced> {
 /// A custody body as JSON, for a [`statement::Statement`]'s body.
 pub fn to_value(b: &Body) -> Value {
     serde_json::to_value(b).unwrap_or(Value::Null)
+}
+
+/// An act's payload type ([`Act`]).
+pub const PAYLOAD_ACT: &str = "application/vnd.kiln.act+json";
+
+/// An act an agent session makes through kiln (W27-R08: the twin), signed by the runner process
+/// holding it with the session's key at its epoch, as [`PAYLOAD_ACT`]: what it is (`op`: a kiln
+/// operation's name, a machine run), the statement's subject being the act itself, by its digest.
+/// kiln applies it only if [`fence`] takes its signer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Act {
+    /// [`VERSION`].
+    pub v: u32,
+    /// Its signer, as its certificate names it (as [`Body::by`]).
+    #[serde(default)]
+    pub by: String,
+    pub session: String,
+    pub epoch: u64,
+    pub op: String,
+}
+
+/// Why an act doesn't count as its session's.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum Unacted {
+    #[error("it isn't signed as an act: {0}")]
+    Unsigned(String),
+    #[error("it's an act of session {said}, not {session}")]
+    AnotherSession { said: String, session: String },
+    #[error("it's not the act its session signed: the act itself changed")]
+    Changed,
+    #[error("{0}")]
+    Fenced(#[from] Fenced),
+}
+
+/// Whether act `act` (checked: [`statement::verify`]) is session `held.session`'s to make now:
+/// signed as of `what` (its bytes as sent, without the act), at the epoch kiln has the session at,
+/// by the runner process holding it then ([`fence`]). The act, or why not.
+pub fn acted(act: &Checked, held: &Held, what: &[u8]) -> Result<Act, Unacted> {
+    if act.payload_type != PAYLOAD_ACT {
+        return Err(Unacted::Unsigned(format!("it's a {} statement", act.payload_type)));
+    }
+    let a: Act = serde_json::from_value(act.statement.body.clone()).map_err(|e| Unacted::Unsigned(e.to_string()))?;
+    if a.v != VERSION || a.by != act.custodian {
+        return Err(Unacted::Unsigned(format!("its body (version {}, by {}) isn't one kiln reads", a.v, a.by)));
+    }
+    if a.session != held.session {
+        return Err(Unacted::AnotherSession { said: a.session, session: held.session.clone() });
+    }
+    let digest = chain::hex(&<sha2::Sha256 as sha2::Digest>::digest(what));
+    if !act.statement.subject.iter().any(|t| t.digest.get("sha256").is_some_and(|d| d.eq_ignore_ascii_case(&digest))) {
+        return Err(Unacted::Changed);
+    }
+    let signer = Identity::parse(&act.custodian).map_err(|e| Unacted::Unsigned(e.to_string()))?;
+    fence(held, &signer)?;
+    Ok(a)
 }
 
 /// A hand-over's word's payload type ([`Word`]).
@@ -1113,6 +1181,39 @@ mod tests {
         assert!(matches!(addressed(&for_main, SERVER, "s1", br#"{"type":"move_to"}"#, "fedora", "main", Some(3)), Err(Misaddressed::Changed)));
         assert!(matches!(addressed(&for_main, SERVER, "s2", command, "fedora", "main", Some(3)), Err(Misaddressed::AnotherSession { .. })));
         assert!(matches!(addressed(&word(&cd, 3, command)?, SERVER, "s1", command, "fedora", "main", Some(3)), Err(Misaddressed::Unsigned(_))), "CD doesn't speak for the server");
+        Ok(())
+    }
+
+    /// W27-R08 (the Transfers plan's step 5, the twin): an act is its session's only from the
+    /// process holding it at the epoch kiln has it at, on every channel it comes by (a kiln
+    /// operation, a machine run, a message to an agent, a change put up for review, a CI run):
+    /// not from a copy left behind at the epoch it left, not from a former holder of the current
+    /// epoch, not for another session, not changed on the way, and not when it isn't an act.
+    #[test]
+    fn w27_r08_an_act_is_only_its_holders_at_its_epoch() -> anyhow::Result<()> {
+        let ca = ca()?;
+        let (copy, holder) = (Signer::new(&ca, LEFT)?, Signer::new(&ca, MOVED)?);
+        let former = Signer::new(&ca, "kiln://hyper-light/person/ada/agent/01a1751c/epoch/1/machine/adacachy/instance/01a14700")?;
+        let held = Held { session: "01a1751c".into(), epoch: 1, by: Some(Holder { machine: "adacachy".into(), instance: "01a14794".into() }), since: AT - 60, transfer: "sha256:5e".into() };
+        let act = |by: &Signer, epoch: u64, op: &str, what: &[u8], payload_type: &str| -> anyhow::Result<Checked> {
+            let body = serde_json::to_value(Act { v: VERSION, by: String::new(), session: "01a1751c".into(), epoch, op: op.into() })?;
+            let subject = Subject { name: format!("an act of session 01a1751c: {op}"), digest: BTreeMap::from([("sha256".to_owned(), chain::hex(&Sha256::digest(what)))]), ..Subject::default() };
+            Ok(verify(&by.sign(payload_type, &Statement { subject: vec![subject], ..Statement::new(body) })?, &ca.der, &[], AT)?)
+        };
+        for op in ["goals.done", "a machine run", "agents.send", "ci.runs.start", "agents.land"] {
+            let what = format!(r#"{{"op":"call","name":"{op}"}}"#);
+            assert!(acted(&act(&holder, 1, op, what.as_bytes(), PAYLOAD_ACT)?, &held, what.as_bytes()).is_ok_and(|a| a.op == op), "{op}");
+            let stale = acted(&act(&copy, 0, op, what.as_bytes(), PAYLOAD_ACT)?, &held, what.as_bytes());
+            assert!(matches!(stale, Err(Unacted::Fenced(Fenced::Left { signed: 0, current: 1, .. }))), "{op}: {stale:?}");
+            let gone = acted(&act(&former, 1, op, what.as_bytes(), PAYLOAD_ACT)?, &held, what.as_bytes());
+            assert!(matches!(gone, Err(Unacted::Fenced(Fenced::NotTheHolder { epoch: 1, .. }))), "{op}: {gone:?}");
+            assert!(matches!(acted(&act(&holder, 1, op, what.as_bytes(), PAYLOAD_ACT)?, &held, b"another act"), Err(Unacted::Changed)), "{op}");
+            assert!(matches!(acted(&act(&holder, 1, op, what.as_bytes(), PAYLOAD_CUSTODY)?, &held, what.as_bytes()), Err(Unacted::Unsigned(_))), "{op}");
+        }
+        let other = Held { session: "01a1751d".into(), ..held.clone() };
+        assert!(matches!(acted(&act(&holder, 1, "goals.done", b"x", PAYLOAD_ACT)?, &other, b"x"), Err(Unacted::AnotherSession { .. })));
+        let said = acted(&act(&copy, 0, "goals.done", b"x", PAYLOAD_ACT)?, &held, b"x").map_err(|e| e.to_string()).err().unwrap_or_default();
+        assert!(said.contains("signed at epoch 0 of session 01a1751c, which went on at epoch 1, on runner adacachy (instance 01a14794)") && said.contains("sha256:5e"), "{said}");
         Ok(())
     }
 

@@ -204,7 +204,7 @@ mod tests {
         assert_eq!(columns("custody_follows")?, ["record", "follows"]);
         assert_eq!(columns("custody_things")?, ["record", "name", "algorithm", "hex"]);
         assert_eq!(columns("custody_breaks")?, ["id", "record", "kind", "detail", "around", "refused", "at"]);
-        assert_eq!(columns("transfer_refusals")?, ["id", "digest", "act", "signer", "why", "envelope", "came_from", "at"]);
+        assert_eq!(columns("transfer_refusals")?, ["id", "digest", "act", "signer", "why", "envelope", "came_from", "at", "epoch", "superseded_by"]);
         let insert = "INSERT INTO custody (digest, payload_type, kind, custodian, envelope, taken_at) VALUES ('sha256:aa', 'application/vnd.kiln.custody+json', 'received', 'kiln://hyper-light/server', '{}', 1)";
         c.execute(insert, [])?;
         assert!(c.execute(insert, []).is_err(), "a record is kept once by its digest");

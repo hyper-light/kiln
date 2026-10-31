@@ -853,3 +853,96 @@ fn w27_ac05_the_1418_drop_played_again() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Operation `name` as an admin calls it (`POST /api/ops/<name>`): its answer.
+#[cfg(feature = "chaos")]
+fn op(port: u16, admin: &str, name: &str, input: &Value) -> anyhow::Result<Value> {
+    let (st, body) = http(port, "POST", &format!("/api/ops/{name}"), admin, Some(input))?;
+    anyhow::ensure!((200..300).contains(&st), "{name}: {st} {body}");
+    Ok(serde_json::from_str(&body).unwrap_or(Value::Null))
+}
+
+/// W27-AC05 (the Transfers plan's step 5): the twin played again. A session moves off a machine
+/// cut off from kiln (it goes on on another from kiln's copy); its copy there, still running at the
+/// epoch it left, marks its goal met, starts a CI run and starts a run on another machine. None of
+/// it is done: each act is refused, and recorded with who signed it; once the machine is back, its
+/// runner is told to let go of the copy at its first word; and the session at its next epoch goes
+/// on untouched.
+#[cfg(feature = "chaos")]
+#[test]
+fn w27_ac05_the_twin_played_again() -> anyhow::Result<()> {
+    use kiln::reach::local::{Client, Ev, Req};
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options::default())?;
+    let (port, admin) = (s.port, s.admin.as_str());
+    let cwd = dir.path().join("work-here");
+    let _harnesses = Harnesses::new(&cwd, &dir.path().join("home"))?;
+    let claude = dir.path().join("home").join(".claude").to_string_lossy().into_owned();
+    let env = [("FAKE_CLAUDE_RECORD", "1"), ("CLAUDE_CONFIG_DIR", claude.as_str())];
+    // box-a's link drops a minute after each connection, and stays away a minute.
+    let (_a, log_a) = agents::runner_with(dir.path(), port, "box-a", Some("drop=60s,down=60s"), TALK, &env)?;
+    let (_b, log_b) = agents::runner_with(dir.path(), port, "box-b", None, TALK, &env)?;
+    let (_c, log_c) = agents::runner_with(dir.path(), port, "box-c", None, TALK, &env)?;
+    for (name, log) in [("box-a", &log_a), ("box-b", &log_b), ("box-c", &log_c)] {
+        agents::connected(port, admin, name, log, Duration::from_secs(60))?;
+    }
+    let id = agents::open_session(port, admin, "box-a", &cwd, Duration::from_secs(60))?;
+    let e0 = first_epoch(port, admin, &id)?;
+    let text = "the twin's goal: never met by a copy left behind";
+    op(port, admin, "goals.add", &json!({"agent": id, "goals": [{"text": text}]}))?;
+    let stack = op(port, admin, "goals.get", &json!({"agent": id}))?;
+    let goal_id = stack.get("items").and_then(Value::as_array).and_then(|l| l.iter().find(|g| field(g, "text") == text)).map(|g| field(g, "id").to_owned()).ok_or_else(|| anyhow::anyhow!("no goal added: {stack}"))?;
+    record_kept(dir.path(), port, admin, "box-a")?;
+    let copy: i64 = {
+        let said = std::fs::read_to_string(cwd.join(".fake-claude-messages"))?;
+        said.lines().find_map(|l| serde_json::from_str::<Value>(l).ok()?.get("pid")?.as_i64()).ok_or_else(|| anyhow::anyhow!("the copy's harness said no pid"))?
+    };
+    // box-a cut off: the session goes on on box-b, from kiln's copy.
+    until(Duration::from_secs(120), || Ok((!connected(port, admin, "box-a")?).then_some(())))?;
+    let (st, body) = http(port, "POST", &format!("/api/harness/sessions/{id}/move"), admin, Some(&json!({"to": "box-b"})))?;
+    anyhow::ensure!((200..300).contains(&st) && body.contains("from_store"), "{st} {body}");
+    session_chain(dir.path(), port, admin, &id, 2)?;
+    // The copy, cut off and still at epoch e0, acts: its goal met and a CI run, through its runner
+    // as its MCP server asks, and a run on box-c, as its own child.
+    let sock = kiln::reach::local::path("box-a", &dir.path().join("box-a-state"));
+    let ask = |name: &str, input: Value| -> anyhow::Result<String> {
+        let mut c = Client::connect(&sock)?;
+        c.send(&Req::Ask { json: json!({"op": "call", "session": id, "name": name, "input": input}).to_string() })?;
+        Ok(match c.event()? {
+            Some(Ev::Answer(a)) => a,
+            Some(Ev::Error(e)) => e,
+            other => format!("{other:?}"),
+        })
+    };
+    let met = ask("goals.done", json!({"id": goal_id, "evidence": "said by a copy left behind"}))?;
+    let ci = ask("ci.runs.trigger", json!({"repo": "hyper-light/kiln", "workflow": "ci.yaml", "ref": "main"}))?;
+    let ran = dir.path().join("twin-ran");
+    std::fs::write(cwd.join(format!(".fake-claude-acts-{copy}")), format!("{} run --on box-c -- touch {}\n", env!("CARGO_BIN_EXE_kiln"), ran.display()))?;
+    let acted = until(Duration::from_secs(60), || Ok(std::fs::read_to_string(cwd.join(".fake-claude-acted")).ok().filter(|t| !t.is_empty())))?;
+    // box-a back: its runner is told to let go of the copy, and what the copy tried is recorded.
+    until(Duration::from_secs(150), || Ok(connected(port, admin, "box-a")?.then_some(())))?;
+    let refused = until(Duration::from_secs(90), || {
+        let (_, body) = http(port, "GET", "/api/transfers/refused", admin, None)?;
+        let v: Value = serde_json::from_str(&body).unwrap_or_default();
+        let of: Vec<Value> = v.get("refused").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().filter(|r| field(r, "act").contains(&id) && field(r, "came_from").starts_with("runner box-a")).collect();
+        Ok((of.len() >= 3).then_some(of))
+    })
+    .map_err(|e| anyhow::anyhow!("{e}: goals.done said {met}; ci said {ci}; the run said {acted}: {}", said_of(dir.path(), port, admin, &id)))?;
+    let server_log = std::fs::read_to_string(dir.path().join("server.log")).unwrap_or_default();
+    assert!(server_log.contains("its runner is told to let go of it") && server_log.contains(&id), "the copy was told to let go at its runner's first word");
+    // None of it done: the goal is still to meet, no CI run started, nothing ran on box-c.
+    let goals = op(port, admin, "goals.get", &json!({"agent": id}))?;
+    let still = goals.get("items").and_then(Value::as_array).is_some_and(|l| l.iter().any(|g| field(g, "id") == goal_id && field(g, "status") != "met"));
+    assert!(still, "the copy's goals.done wasn't applied: {goals}");
+    let runs = op(port, admin, "ci.runs.list", &json!({}))?;
+    assert!(runs.get("runs").and_then(Value::as_array).is_none_or(Vec::is_empty), "no CI run started: {runs}");
+    assert!(!ran.exists(), "nothing ran on box-c: {acted}");
+    assert!(refused.iter().any(|r| field(r, "act").contains("goals.done")) && refused.iter().any(|r| field(r, "act").contains("ci.runs.trigger")) && refused.iter().any(|r| field(r, "act").contains("a run on box-c")), "{refused:?}");
+    // Each recorded with who signed it, the epoch it's from and the transfer that superseded it.
+    let from_e0 = |r: &Value| r.get("epoch").and_then(Value::as_u64) == Some(e0) && field(r, "signer").contains(&format!("/agent/{id}/epoch/{e0}/machine/box-a/")) && !field(r, "superseded_by").is_empty() && !field(r, "digest").is_empty();
+    assert!(refused.iter().all(from_e0), "{refused:?}");
+    // The session at its next epoch goes on untouched, on box-b.
+    let v = session_chain(dir.path(), port, admin, &id, 2)?;
+    assert!(field(&v, "held_by").contains(&format!("/agent/{id}/epoch/{}/machine/box-b/", e0 + 1)), "{v}");
+    Ok(())
+}
+

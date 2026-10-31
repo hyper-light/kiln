@@ -446,7 +446,7 @@ Four edges are left, and the lab steers clear of each:
 | `AiSessions` | state | The AI sessions found running on this machine. | Sent when they change, not acknowledged. |
 | `AiTranscript` | answer | Answers `AiTranscript`. | As its class says. |
 | `Harness` | stream | A session's updates, in order, a stream per session. | On the channel: a stream per session (`s:<session>#<boot>.<gen>`), each update kept until the server has applied it, sent again after a cut from where the server has it. The session goes whole only when its stream starts: at its start, or once a server that restarted lost it. Without the channel (an older runner or server): fire-and-forget, and every connect sends every session whole. |
-| `HarnessInventory` | state | The sessions this machine runs and the harnesses it offers. | Sent on every connect, not acknowledged. |
+| `HarnessInventory` | state | The sessions this machine runs and the harnesses it offers, and each session's epoch there (`epochs`, new: the server tells such a copy left behind, its session gone on elsewhere at a later epoch, to let go of it; ci.md W27-R08). | Sent on every connect, not acknowledged. |
 | `AiView` | answer | Answers `AiView`. | As its class says. |
 | `Instance` | handshake | Which runner process of its machine this connection is. | As its class says. |
 | `Build` | handshake | The build and what it can do. | As its class says. |
@@ -462,7 +462,7 @@ Four edges are left, and the lab steers clear of each:
 | `Facts` | state | What the runner is: OS, CPUs, tools and so on. | Sent on connect, every 10 minutes and when asked. |
 | `Reach` | carried (reach link) | A frame of a link between two runners, relayed. The link's ends frame it. | As its class says. |
 | `ReachHello` | state | This runner's reach identity. | Sent on every connect. |
-| `ReachAsk` | ask | A question for the server, answered by `ReachAnswer`. | As its class says. |
+| `ReachAsk` | ask | A question for the server, answered by `ReachAnswer`. An agent session's act (a kiln operation its MCP server calls, a page's answer, or `act`: a run on another machine asked before it's done), from a runner announcing `CAP_CUSTODY` that holds the session's key, carries beside it, as `act`, the act signed with that key at its epoch (ci.md W27-R08): the server takes it only from the session's holder now, and refuses it, answering why, from any other. | As its class says. |
 | `Convo` | carried (conversation feed) | The runner's conversation store, fed to the server's. | Acknowledged and resent by number (`convo/feed.rs`). |
 | `UpdatePrefs` | state | Whether this machine takes upgrades. | Sent on every connect and change. |
 | `Power` | state | The machine's battery. | Sent on change and every 10 minutes. |
@@ -486,7 +486,7 @@ Four edges are left, and the lab steers clear of each:
 | `AgentLimit` | state | The most agent sessions the machine has at work at once, and where that comes from: set from the server, its config, or kiln's default (agents.md, "How many agents a machine runs"). Each supersedes the last. | New: as it's welcomed and whenever it changes, to a server announcing `CAP_AGENT_LIMIT`. |
 | `Identity` | ask | A CSR for a key the runner process made and keeps: for itself, an agent session it holds at an epoch, or a leg it runs (ci.md W27-R01). An agent session's at the epoch a hand-over raised it to carries the hand-on its package brought and the process's receipt for it, signed with the key asked for (W27-R08): the server records both before the epoch rises, and certifies the key only then. The server answers with `Identity`. | New: on each connection for the process's own, to a server announcing `CAP_IDENTITY`. |
 | `Observe` | carried (observe's group) | The runner's replica of observe's group (docs/observe.md §5): hyper-raft's messages, which it acknowledges and resends, and the writes it takes, offered to the leader until they commit. | Only from a runner announcing `CAP_OBSERVE`, on lane 5. |
-| `Custody` | stream | A signed custody record of one of its sessions' hand-overs (ci.md W27-R08): its hand-on, as it hands the session on (the package carries it too), which the server takes once, by its digest; or a hand-over's word it refused, not being the process it was for, which the server records. | New: to a server announcing `CAP_CUSTODY`; a record kept and sent again after a reconnect, a refusal sent once. |
+| `Custody` | stream | A signed custody record of one of its sessions' hand-overs (ci.md W27-R08): its hand-on, as it hands the session on (the package carries it too), which the server takes once, by its digest; a hand-over's word it refused, not being the process it was for; or an act of one of its sessions it didn't do, the server out of reach (`refused_act`). The server records both. | New: to a server announcing `CAP_CUSTODY`; a record kept and sent again after a reconnect, a refusal sent once. |
 
 ## Server to runner: `ServerMsg`
 

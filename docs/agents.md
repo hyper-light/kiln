@@ -1212,6 +1212,22 @@ reloads) and goes to the agent in order once it can take it, ahead of anything s
 Files attached go along when they were uploaded; ones that couldn't be (no server) stay with the
 page until it reloads.
 
+### A copy left behind
+
+An agent that goes on on another machine while its own is cut off (moved there from the server's
+copy) leaves its copy running where it was, at the epoch it left (docs/ci.md W27-R08). kiln fences
+what that copy does through it. Each act an agent makes through kiln (a kiln operation it calls, a
+page it shows, a run on another machine) is signed by the runner process holding it, with the
+agent's key at its epoch, and kiln takes it only from the agent's holder now. The copy's acts are
+refused, answered with why (the epoch it's at, and where and when the agent went on), and recorded
+with who signed them, that epoch and the transfer the agent went on with (`kiln transfers
+refused`). One its runner couldn't put to kiln while cut off isn't done, and kiln hears of it once
+the runner is back.
+At the runner's first word back, kiln tells it to let go of the copy. What kiln can't refuse is
+what the copy does on its own machine without kiln (the files it edits there, the commands it runs
+there): that goes on until its runner hears from kiln. A runner from before signed acts is taken by
+its machine, as before.
+
 ### What you sent, at once
 
 A message shows at the end of the conversation the moment it goes, marked *sending…*, then *sent*

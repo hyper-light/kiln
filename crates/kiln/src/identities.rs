@@ -756,6 +756,14 @@ async fn stale_words(hub: &Hub, machine: &str, was: crate::instances::PeerId, se
     }
 }
 
+/// The newest epoch kiln certified agent session `session` at, and the identity it certified it
+/// as then, naming the process holding it: the session's epoch as its transfers say (an Open that
+/// says another doesn't move it), and its holder (docs/ci.md W27-R08).
+pub async fn newest_holder(store: &Store, session: &str) -> anyhow::Result<Option<(u64, String)>> {
+    let Some(epoch) = epochs_of(store, session).await?.into_iter().map(|(_, e)| e).max() else { return Ok(None) };
+    Ok(holder_at(store, session, epoch).await?.map(|h| (epoch, h)))
+}
+
 /// The newest epoch kiln certified agent session `session` at for runner process `instance` of
 /// `machine`: the epoch that process holds it at, as kiln knows it (docs/ci.md W27-R08, a hand-over's
 /// word for it). None if kiln never certified it there.
