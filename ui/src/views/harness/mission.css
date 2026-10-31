@@ -754,14 +754,16 @@ a.ms-why:hover {
 }
 
 /* Over the list: check them all, how many there are, and what to do with those picked, on one line a
-   finger's height (40 px); its hairline, held in view by touch, fading in and out with selecting. */
+   finger's height (40 px); its hairline, held in view by touch, fading in and out with selecting. It
+   sits on the list's own edges, its hairline's ends, as the filter and the sort over it do: the check
+   (or ring) at its left, the last button at its right. */
 .ms-listhead {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 0 22px;
   min-height: 40px;
-  padding: 0 8px 0 9px;
+  padding: 0;
   transition: box-shadow 0.2s ease;
 }
 .ms-all {
@@ -1070,11 +1072,7 @@ a.ms-why:hover {
     user-select: none;
     -webkit-user-select: none;
   }
-  /* The head's left edge where the rows' is, and its ring as far from the count as theirs from their
-     names: the ring that picks them all sits over theirs. */
-  .ms-listhead {
-    padding-left: 6px;
-  }
+  /* The ring that picks them all as far from the count as theirs from their names. */
   .ms-all {
     gap: 0;
   }
@@ -1084,9 +1082,6 @@ a.ms-why:hover {
       grid-template-areas:
         "main main"
         "meta actions";
-      padding-left: 12px;
-    }
-    .ms-listhead {
       padding-left: 12px;
     }
   }
