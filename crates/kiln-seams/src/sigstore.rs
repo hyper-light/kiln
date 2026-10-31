@@ -183,6 +183,14 @@ impl PublicKey {
         };
         UnparsedPublicKey::new(alg, bytes).verify(message, signature).is_ok()
     }
+
+    /// Whether `signature` is this key's over SHA-256 `digest`, as Rekor checks a hashedrekord
+    /// entry's: a P-256 key's alone (the others hash otherwise, or not at all).
+    fn verifies_digest(&self, digest: &[u8], signature: &[u8]) -> bool {
+        let PublicKey::P256(b) = self else { return false };
+        let Ok(d) = aws_lc_rs::digest::Digest::import_less_safe(digest, &aws_lc_rs::digest::SHA256) else { return false };
+        UnparsedPublicKey::new(&sig::ECDSA_P256_SHA256_ASN1, b).verify_digest(&d, signature).is_ok()
+    }
 }
 
 /// A Rekor verifier's key (the verifier is base64 of a PEM certificate or public key).
@@ -445,36 +453,11 @@ impl Sigstore for SimSigstore {
             if self.st.lock().entries.len() >= SIM_ENTRIES {
                 return Err(Refusal::Full { limit: SIM_ENTRIES });
             }
-            let bad = |why: &str| Refusal::Invalid { what: "entry", why: why.to_owned() };
-            if entry.get("kind").and_then(Value::as_str) != Some("dsse") || entry.get("apiVersion").and_then(Value::as_str) != Some("0.0.1") {
-                return Err(bad("it isn't a dsse 0.0.1 entry"));
-            }
-            let envelope = entry.pointer("/spec/proposedContent/envelope").and_then(Value::as_str).ok_or_else(|| bad("it has no envelope"))?;
-            let verifiers: Vec<(&str, PublicKey)> =
-                entry.pointer("/spec/proposedContent/verifiers").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).filter_map(|v| verifier_key(v).map(|key| (v, key))).collect();
-            if verifiers.is_empty() {
-                return Err(bad("it names no verifier the log can read"));
-            }
-            let env: Value = serde_json::from_str(envelope).map_err(|_| bad("its envelope isn't JSON"))?;
-            let payload_type = env.get("payloadType").and_then(Value::as_str).ok_or_else(|| bad("its envelope has no payload type"))?;
-            let payload = env.get("payload").and_then(Value::as_str).and_then(|p| B64.decode(p).ok()).ok_or_else(|| bad("its envelope's payload isn't base64"))?;
-            let signed = pae(payload_type, &payload);
-            let mut signatures = Vec::new();
-            for s in env.get("signatures").and_then(Value::as_array).into_iter().flatten() {
-                let text = s.get("sig").and_then(Value::as_str).ok_or_else(|| bad("a signature is missing"))?;
-                let raw = B64.decode(text).map_err(|_| bad("a signature isn't base64"))?;
-                let (verifier, _) = verifiers.iter().find(|(_, key)| key.verifies(&signed, &raw)).ok_or_else(|| bad("a signature isn't its verifiers'"))?;
-                signatures.push(json!({ "signature": text, "verifier": verifier }));
-            }
-            if signatures.is_empty() {
-                return Err(bad("its envelope has no signature"));
-            }
-            let body = json!({ "apiVersion": "0.0.1", "kind": "dsse", "spec": {
-                "envelopeHash": { "algorithm": "sha256", "value": hex::encode(sha256(envelope.as_bytes())) },
-                "payloadHash": { "algorithm": "sha256", "value": hex::encode(sha256(&payload)) },
-                "signatures": signatures,
-            } })
-            .to_string();
+            let body = match (entry.get("kind").and_then(Value::as_str), entry.get("apiVersion").and_then(Value::as_str)) {
+                (Some("dsse"), Some("0.0.1")) => dsse_body(&entry)?,
+                (Some("hashedrekord"), Some("0.0.1")) => hashed_body(&entry)?,
+                _ => return Err(Refusal::Invalid { what: "entry", why: "it isn't a dsse or hashedrekord 0.0.1 entry".into() }),
+            };
             let leaf = leaf_hash(body.as_bytes());
             let uuid = hex::encode(leaf);
             let body = B64.encode(&body);
@@ -501,6 +484,62 @@ impl Sigstore for SimSigstore {
             self.answer(&st, k, index)
         })
     }
+}
+
+/// A dsse entry's body as the log keeps it, once each signature of its envelope is one of its
+/// verifiers'.
+fn dsse_body(entry: &Value) -> Result<String, Refusal> {
+    let bad = |why: &str| Refusal::Invalid { what: "entry", why: why.to_owned() };
+    let envelope = entry.pointer("/spec/proposedContent/envelope").and_then(Value::as_str).ok_or_else(|| bad("it has no envelope"))?;
+    let verifiers: Vec<(&str, PublicKey)> =
+        entry.pointer("/spec/proposedContent/verifiers").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).filter_map(|v| verifier_key(v).map(|key| (v, key))).collect();
+    if verifiers.is_empty() {
+        return Err(bad("it names no verifier the log can read"));
+    }
+    let env: Value = serde_json::from_str(envelope).map_err(|_| bad("its envelope isn't JSON"))?;
+    let payload_type = env.get("payloadType").and_then(Value::as_str).ok_or_else(|| bad("its envelope has no payload type"))?;
+    let payload = env.get("payload").and_then(Value::as_str).and_then(|p| B64.decode(p).ok()).ok_or_else(|| bad("its envelope's payload isn't base64"))?;
+    let signed = pae(payload_type, &payload);
+    let mut signatures = Vec::new();
+    for s in env.get("signatures").and_then(Value::as_array).into_iter().flatten() {
+        let text = s.get("sig").and_then(Value::as_str).ok_or_else(|| bad("a signature is missing"))?;
+        let raw = B64.decode(text).map_err(|_| bad("a signature isn't base64"))?;
+        let (verifier, _) = verifiers.iter().find(|(_, key)| key.verifies(&signed, &raw)).ok_or_else(|| bad("a signature isn't its verifiers'"))?;
+        signatures.push(json!({ "signature": text, "verifier": verifier }));
+    }
+    if signatures.is_empty() {
+        return Err(bad("its envelope has no signature"));
+    }
+    Ok(json!({ "apiVersion": "0.0.1", "kind": "dsse", "spec": {
+        "envelopeHash": { "algorithm": "sha256", "value": hex::encode(sha256(envelope.as_bytes())) },
+        "payloadHash": { "algorithm": "sha256", "value": hex::encode(sha256(&payload)) },
+        "signatures": signatures,
+    } })
+    .to_string())
+}
+
+/// A hashedrekord entry's body as the log keeps it, once its signature is its key's over its
+/// digest: a SHA-256, the signature (base64) and its key, a PEM certificate or public key (base64).
+fn hashed_body(entry: &Value) -> Result<String, Refusal> {
+    let bad = |why: &str| Refusal::Invalid { what: "entry", why: why.to_owned() };
+    let spec = entry.get("spec").ok_or_else(|| bad("it has no spec"))?;
+    if spec.pointer("/data/hash/algorithm").and_then(Value::as_str) != Some("sha256") {
+        return Err(bad("its hash isn't a SHA-256"));
+    }
+    let value = spec.pointer("/data/hash/value").and_then(Value::as_str).ok_or_else(|| bad("it has no hash"))?;
+    let digest = hex::decode(value).ok().filter(|d| d.len() == 32 && !value.bytes().any(|b| b.is_ascii_uppercase())).ok_or_else(|| bad("its hash isn't 64 lowercase hex digits"))?;
+    let content = spec.pointer("/signature/content").and_then(Value::as_str).ok_or_else(|| bad("it has no signature"))?;
+    let signature = B64.decode(content).map_err(|_| bad("its signature isn't base64"))?;
+    let key_text = spec.pointer("/signature/publicKey/content").and_then(Value::as_str).ok_or_else(|| bad("it names no key"))?;
+    let key = verifier_key(key_text).ok_or_else(|| bad("its key isn't a PEM certificate or public key the log reads"))?;
+    if !key.verifies_digest(&digest, &signature) {
+        return Err(bad("its signature isn't its key's over its hash"));
+    }
+    Ok(json!({ "apiVersion": "0.0.1", "kind": "hashedrekord", "spec": {
+        "data": { "hash": { "algorithm": "sha256", "value": value } },
+        "signature": { "content": content, "publicKey": { "content": key_text } },
+    } })
+    .to_string())
 }
 
 // ------------------------------------------------------------------ the suite
@@ -694,6 +733,31 @@ fn c8<F: SigstoreFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     })
 }
 
+/// A hashedrekord entry of `message`'s SHA-256, its signature `a`'s over `signed`, its key `pem`
+/// (a certificate or public key).
+fn hashed_of(a: &Asker, pem: &str, message: &[u8], signed: &[u8]) -> Value {
+    json!({ "apiVersion": "0.0.1", "kind": "hashedrekord", "spec": {
+        "data": { "hash": { "algorithm": "sha256", "value": hex::encode(sha256(message)) } },
+        "signature": { "content": B64.encode(a.sign(signed)), "publicKey": { "content": B64.encode(pem) } },
+    } })
+}
+
+fn c9<F: SigstoreFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
+    Box::pin(async move {
+        let (a, leaf) = (f.asker()?, verifier(f).await?);
+        let message = b"kiln://hyper-light/trail\n9\n";
+        let logged = fine("log", f.sigstore().log(hashed_of(a, &leaf, message, message)).await)?;
+        let again = fine("entry", f.sigstore().entry(logged.index).await)?;
+        same("body", &again.body, &logged.body)?;
+        let body: Value = B64.decode(&logged.body).ok().and_then(|b| serde_json::from_slice(&b).ok()).ok_or_else(|| "its body isn't base64 of JSON".to_owned())?;
+        same("the hash kept", body.pointer("/spec/data/hash/value").and_then(Value::as_str).map(str::to_owned), Some(hex::encode(sha256(message))))?;
+        match refused("a signature over another hash", f.sigstore().log(hashed_of(a, &leaf, message, b"another checkpoint")).await)? {
+            Refusal::Invalid { what, .. } => same("what's named", what, "entry"),
+            other => Err(format!("refused {other:?}, want Invalid")),
+        }
+    })
+}
+
 /// The Sigstore suite: docs/seams.md's clauses, in order.
 pub fn cases<F: SigstoreFixture>() -> Vec<Case<F>> {
     vec![
@@ -709,6 +773,11 @@ pub fn cases<F: SigstoreFixture>() -> Vec<Case<F>> {
             check: c7::<F>,
         },
         Case { id: "SIGSTORE-8", says: "an entry whose signature isn't its verifier's is refused Invalid, naming the entry", check: c8::<F> },
+        Case {
+            id: "SIGSTORE-9",
+            says: "a hashedrekord entry (a SHA-256, and its key's signature over it) is logged and found again, keeping its hash; one whose signature is over another hash is refused Invalid, naming the entry",
+            check: c9::<F>,
+        },
     ]
 }
 

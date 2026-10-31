@@ -364,6 +364,114 @@ fn w27_r09_the_trail_reads_as_a_tiled_log() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Rekor's v1 API in front of kiln-seams' simulated Sigstore, on a port of its own: an entry
+/// logged, and read back by its index or its uuid.
+fn rekor_of(sim: std::sync::Arc<kiln_seams::sigstore::SimSigstore>) -> anyhow::Result<common::Service> {
+    use kiln_seams::Sigstore as _;
+    use kiln_seams::sigstore::{Logged, Refusal};
+    fn one(l: &Logged) -> String {
+        Value::Object(serde_json::Map::from_iter([(l.uuid.clone(), l.answer.clone())])).to_string()
+    }
+    fn said(e: &Refusal) -> String {
+        json!({ "message": e.to_string() }).to_string()
+    }
+    common::Service::start(std::sync::Arc::new(move |method: &str, got: &common::Got| -> (u16, String) {
+        let (path, query) = got.path.split_once('?').unwrap_or((got.path.as_str(), ""));
+        let read = |r: Result<Logged, Refusal>| match r {
+            Ok(l) => (200, one(&l)),
+            Err(e @ Refusal::NotFound { .. }) => (404, said(&e)),
+            Err(e) => (500, said(&e)),
+        };
+        match (method, path) {
+            ("POST", "/rekor/api/v1/log/entries") => match futures::executor::block_on(sim.log(serde_json::from_slice(&got.body).unwrap_or(Value::Null))) {
+                Ok(l) => (201, one(&l)),
+                Err(Refusal::Conflict { index }) => {
+                    let uuid = futures::executor::block_on(sim.entry(index)).map(|l| l.uuid).unwrap_or_default();
+                    (409, json!({ "message": format!("an equivalent entry already exists in the transparency log with UUID {uuid}") }).to_string())
+                }
+                Err(e @ Refusal::Invalid { .. }) => (400, said(&e)),
+                Err(e) => (500, said(&e)),
+            },
+            ("GET", "/rekor/api/v1/log/entries") => match query.split('&').find_map(|kv| kv.strip_prefix("logIndex=")).and_then(|n| n.parse::<u64>().ok()) {
+                Some(n) => read(futures::executor::block_on(sim.entry(n))),
+                None => (400, "{}".to_owned()),
+            },
+            ("GET", p) => match p.strip_prefix("/rekor/api/v1/log/entries/").and_then(|uuid| sim.index_of(uuid)) {
+                Some(n) => read(futures::executor::block_on(sim.entry(n))),
+                None => (404, "{}".to_owned()),
+            },
+            _ => (404, "{}".to_owned()),
+        }
+    }))
+}
+
+/// W27-R09: each checkpoint is anchored in the Rekor kiln is configured with, and the trail held
+/// to what Rekor saw. Rewritten from entry 2 on, every hash made again and its checkpoints signed
+/// anew (as one holding kiln's key could), the trail's own checkpoints agree with it; the anchor
+/// doesn't, and says so.
+#[test]
+fn w27_r09_a_rewritten_trail_is_caught_against_its_anchor() -> anyhow::Result<()> {
+    use kiln_seams::Sigstore as _;
+    let dir = tempfile::tempdir()?;
+    let sim = std::sync::Arc::new(kiln_seams::sigstore::SimSigstore::new(1_790_000_000));
+    let rekor = rekor_of(sim.clone())?;
+    let rekor_url = format!("{}/rekor", rekor.url());
+    let trust = dir.path().join("trusted_root.json");
+    std::fs::write(&trust, sim.trusted_root("https://fulcio.test", &rekor_url).map_err(|e| anyhow::anyhow!("{e}"))?.to_string())?;
+    let extra = format!("[ci.attest]\nrekor_url = \"{rekor_url}\"\ntrusted_root = {}\n", common::toml_path(&trust));
+    let mut s = start(dir.path(), &Options { agent: false, ci: "trail = { checkpoint_every = 4, checkpoint_minutes = 600 }", extra: &extra })?;
+    let root = root_of(dir.path())?;
+    let anchors = |s: &Server| -> anyhow::Result<Vec<Value>> {
+        let (st, body) = http(s.port, "GET", "/api/trail/anchors", &s.admin, None)?;
+        anyhow::ensure!(st == 200, "GET /api/trail/anchors: {st} {body}");
+        Ok(serde_json::from_str::<Value>(&body)?.get("anchors").and_then(Value::as_array).cloned().unwrap_or_default())
+    };
+    let holds = |a: &Value| a.get("holds") == Some(&json!(true));
+    revoke_all(&s, &(0..8u64).map(|i| format!("{:032x}", 0xa11c_0000 + i)).collect::<Vec<_>>(), 4)?;
+    // Anchored, and holding: Rekor's promise and proof verified against its trusted root.
+    let first = until(Duration::from_secs(60), "an anchored checkpoint", || Ok(anchors(&s)?.into_iter().next()))?;
+    assert!(holds(&first) && first.get("rekor") == Some(&json!("verified")), "{first}");
+    let (size, index) = (first.get("size").and_then(Value::as_u64).unwrap_or_default(), first.get("index").and_then(Value::as_u64).unwrap_or(u64::MAX));
+    // Rekor's entry, read from it directly: a hashedrekord of the checkpoint's note text.
+    let (st, body) = http(s.port, "GET", "/api/trail/checkpoints?limit=1000", &s.admin, None)?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let note = serde_json::from_str::<Value>(&body)?.get("checkpoints").and_then(Value::as_array).into_iter().flatten().find(|c| c.get("size").and_then(Value::as_u64) == Some(size)).and_then(|c| c.get("note").and_then(Value::as_str).map(str::to_owned)).ok_or_else(|| anyhow::anyhow!("checkpoint {size}"))?;
+    let logged = futures::executor::block_on(sim.entry(index))?;
+    let kept: Value = serde_json::from_slice(&base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &logged.body)?)?;
+    assert_eq!(kept.pointer("/spec/data/hash/value").and_then(Value::as_str), Some(kiln::util::sha256_hex(trail::open(&note)?.0.as_bytes()).as_str()), "{kept}");
+    assert_eq!(checkpoints(&s, &root)?.iter().find(|c| c.size == size).map(|c| Checkpoint::parse(&c.text()).ok()), Some(Some(Checkpoint::parse(trail::open(&note)?.0)?)));
+
+    // Rewritten from entry 2 on, every hash after it made again; kiln's own checkpoints dropped.
+    {
+        let db = rusqlite::Connection::open(dir.path().join("data/kiln.db"))?;
+        db.busy_timeout(Duration::from_secs(10))?;
+        let tx = db.unchecked_transaction()?;
+        let rows: Vec<(i64, String, String, String, i64)> = tx.prepare("SELECT idx, statement, kind, subjects, taken_at FROM trail ORDER BY idx")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?.collect::<Result<_, _>>()?;
+        let mut last: Option<Entry> = None;
+        for (idx, statement, kind, subjects, taken_at) in rows {
+            let kind = if idx == 2 { "application/vnd.kiln.forged+json".to_owned() } else { kind };
+            let e = trail::next(last.as_ref(), &statement, &kind, serde_json::from_str(&subjects)?, taken_at)?;
+            tx.execute("UPDATE trail SET prev = ?2, kind = ?3, hash = ?4 WHERE idx = ?1", rusqlite::params![idx, hex::encode(e.prev), e.kind, hex::encode(e.hash())])?;
+            last = Some(e);
+        }
+        tx.execute("DELETE FROM trail_checkpoints", [])?;
+        tx.commit()?;
+    }
+    s.restart()?;
+    // kiln signs the rewritten trail anew, and anchors that too: its own checkpoints agree with
+    // it. The anchor from before doesn't: Rekor saw another root.
+    let list = until(Duration::from_secs(60), "the rewritten trail checkpointed and anchored", || {
+        let list = anchors(&s)?;
+        Ok((list.len() >= 2).then_some(list))
+    })?;
+    let before = list.iter().find(|a| a.get("index").and_then(Value::as_u64) == Some(index)).ok_or_else(|| anyhow::anyhow!("anchor {index}: {list:?}"))?;
+    assert!(!holds(before), "{before}");
+    let why = before.get("why").and_then(Value::as_str).unwrap_or_default();
+    assert!(why.contains(&format!("the trail's first {size} entries don't make the root Rekor saw at entry {index}")), "{why}");
+    assert!(list.iter().filter(|a| a.get("index").and_then(Value::as_u64) != Some(index)).any(holds), "the checkpoint signed anew holds against its own anchor: {list:?}");
+    Ok(())
+}
+
 /// W27-R09: forty revocations, eight requests at a time, each in the trail once and its chain
 /// whole; after a restart the trail is as it was, appends go on from where it ended, and the next
 /// checkpoint extends the last one signed before.

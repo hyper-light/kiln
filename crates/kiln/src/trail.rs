@@ -13,6 +13,9 @@
 //! - **Checkpoints** ([`checkpoint`], [`checkpoints_loop`]): signed by the server once due, each
 //!   only after the entries since the one before hold as a chain and hash as kept, and the tree
 //!   as kept extends the one before's: kiln signs none that doesn't, saying why.
+//! - **Anchors** ([`anchor`], [`anchors`]): each checkpoint logged in the Rekor `[ci.attest]
+//!   rekor_url` names, as a hashedrekord entry of its note's text, and the trail held to what Rekor
+//!   saw: rewritten and checkpointed anew, it no longer makes the root an anchor names.
 //! - **A tiled log** ([`log`]): the newest checkpoint and the tree's tiles and entry bundles (C2SP
 //!   tlog-tiles), from which anyone who may read the trail computes any proof. Each tile a leaf
 //!   completes is kept as a node of the level above as it's appended, so a tile, a root or a proof
@@ -239,22 +242,128 @@ pub async fn checkpoint(hub: &Hub, now: bool) -> anyhow::Result<Option<u64>> {
     Ok((kept > 0).then_some(size))
 }
 
-/// Signs the trail's checkpoints as they come due, until the server stops (docs/ci.md W27-R09);
-/// one that can't be signed is said once, until it's signed or why changes.
+/// Signs the trail's checkpoints as they come due, and anchors each in the Rekor kiln is
+/// configured with, until the server stops (docs/ci.md W27-R09); what can't be done is said once,
+/// until it's done or why changes.
 pub async fn checkpoints_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     let mut said = String::new();
     while hub.shutdown.sleep(LOOK_EVERY).await {
-        match checkpoint(&hub, false).await {
-            Ok(_) => said.clear(),
+        let done = match checkpoint(&hub, false).await {
+            Ok(_) => anchor(&hub).await.map(|_| ()).map_err(|e| e.context("the trail's checkpoint isn't anchored")),
+            Err(e) => Err(e.context("the trail's checkpoint isn't signed")),
+        };
+        match done {
+            Ok(()) => said.clear(),
             Err(e) => {
                 let why = format!("{e:#}");
                 if why != said {
-                    tracing::warn!(target: "kiln.trail", error = %why, "the trail's checkpoint isn't signed");
+                    tracing::warn!(target: "kiln.trail", error = %why, "the trail's checkpoints fall behind");
                     said = why;
                 }
             }
         }
     }
+    Ok(())
+}
+
+/// The Rekor `[ci.attest] rekor_url` names, the trail's checkpoints anchored there: its URL and a
+/// client of it.
+fn rekor(hub: &Hub) -> anyhow::Result<Option<(String, crate::ci::signing::Remote)>> {
+    let Some(url) = hub.cfg.ci.attest.rekor_url.as_deref().map(|u| u.trim().trim_end_matches('/')).filter(|u| !u.is_empty()) else { return Ok(None) };
+    let fulcio = hub.cfg.ci.attest.fulcio_url.as_deref().unwrap_or_default();
+    Ok(Some((url.to_owned(), crate::ci::signing::Remote::new(fulcio, url)?)))
+}
+
+/// Anchors each checkpoint the configured Rekor hasn't yet (by its note: one signed anew at a size
+/// anchored before is another): a hashedrekord entry of its note's
+/// text (its SHA-256, and the note's signature with the certificate it's signed under), Rekor's
+/// answer kept apart from the checkpoints. The sizes anchored now.
+pub async fn anchor(hub: &Hub) -> anyhow::Result<Vec<u64>> {
+    use kiln_seams::Sigstore as _;
+    let Some((log, remote)) = rekor(hub)? else { return Ok(Vec::new()) };
+    let l = log.clone();
+    let pending: Vec<(i64, String, String)> = hub
+        .store
+        .call(move |c| Ok(c.prepare("SELECT size, note, certificate FROM trail_checkpoints WHERE note NOT IN (SELECT note FROM trail_anchors WHERE log = ?1) ORDER BY size")?.query_map([&l], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?))
+        .await?;
+    let mut anchored = Vec::new();
+    for (size, note, certificate) in pending {
+        let entry = {
+            let (text, signatures) = trail::open(&note)?;
+            let signature = signatures.first().map(|s| B64.encode(&s.signature)).ok_or_else(|| anyhow::anyhow!("checkpoint {size} has no signature"))?;
+            let pem = kiln_seams::sigstore::pem("CERTIFICATE", &B64.decode(&certificate)?);
+            json!({ "apiVersion": "0.0.1", "kind": "hashedrekord", "spec": {
+                "data": { "hash": { "algorithm": "sha256", "value": crate::util::sha256_hex(text.as_bytes()) } },
+                "signature": { "content": signature, "publicKey": { "content": B64.encode(pem) } },
+            } })
+        };
+        let logged = match remote.log(entry).await {
+            Ok(l) => l,
+            // Logged before (kiln stopped before keeping Rekor's answer): read where it is.
+            Err(kiln_seams::sigstore::Refusal::Conflict { index }) => remote.entry(index).await.map_err(|e| anyhow::anyhow!("checkpoint {size}'s entry {index} in {log}: {e}"))?,
+            Err(e) => anyhow::bail!("checkpoint {size} isn't anchored in {log}: {e}"),
+        };
+        let (l, idx, at, answer) = (log.clone(), i64::try_from(logged.index)?, crate::util::now_unix(), logged.answer.to_string());
+        let uuid = logged.uuid;
+        hub.store
+            .call(move |c| {
+                Ok(c.execute("INSERT OR IGNORE INTO trail_anchors (size, log, idx, uuid, note, certificate, answer, anchored_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)", params![size, l, idx, uuid, note, certificate, answer, at])?)
+            })
+            .await?;
+        tracing::info!(target: "kiln.trail", size, %log, index = idx, "the trail's checkpoint anchored");
+        anchored.push(u64::try_from(size)?);
+    }
+    Ok(anchored)
+}
+
+/// `GET /api/trail/anchors`: each of the trail's anchors as it stands now. One holds when Rekor
+/// still has its entry, naming the SHA-256 of the anchored note's text (its promise and proof
+/// Rekor's, checked against Sigstore's trusted root where kiln has it); the note is kiln's
+/// server's; and the trail as kept makes the root the note names at its size. Else, why not.
+pub async fn anchors(hub: &Hub) -> anyhow::Result<Value> {
+    let rows: Vec<(i64, String, i64, String, String, i64)> = hub
+        .store
+        .call(|c| Ok(c.prepare("SELECT size, log, idx, note, certificate, anchored_at FROM trail_anchors ORDER BY size, idx")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?.collect::<Result<_, _>>()?))
+        .await?;
+    let remote = rekor(hub)?;
+    let trust = crate::ci::sigstore::trusted_root(&hub.cfg).await;
+    let revocations = crate::identities::revocations(&hub.store).await?;
+    let mut list = Vec::new();
+    for (size, log, idx, note, certificate, at) in rows {
+        let held = held(hub, remote.as_ref().filter(|(url, _)| *url == log), &trust, &revocations, idx, &note, &certificate, at).await;
+        let rekor = match &trust {
+            Ok(_) => "verified".to_owned(),
+            Err(e) => format!("Rekor's promise and proof unchecked: no trusted root ({e:#})"),
+        };
+        list.push(json!({ "size": size, "log": log, "index": idx, "holds": held.is_ok(), "why": held.err().map(|e| format!("{e:#}")), "rekor": rekor }));
+    }
+    Ok(json!({ "anchors": list }))
+}
+
+/// Whether anchor `idx` (checkpoint `note`, signed under `certificate`, anchored at `at`) holds.
+#[allow(clippy::too_many_arguments)]
+async fn held(hub: &Hub, remote: Option<&(String, crate::ci::signing::Remote)>, trust: &anyhow::Result<crate::ci::sigstore::TrustedRoot>, revocations: &[kiln_ci::identity::chain::Revocation], idx: i64, note: &str, certificate: &str, at: i64) -> anyhow::Result<()> {
+    use kiln_seams::Sigstore as _;
+    let cert = B64.decode(certificate)?;
+    let (cp, _) = trail::verify_note(note, &hub.pki.organization(), &[&cert], &hub.pki.ca_der, revocations, at)?;
+    let (text, _) = trail::open(note)?;
+    let (log, client) = remote.ok_or_else(|| anyhow::anyhow!("kiln isn't configured with the Rekor that anchored checkpoint {}", cp.size))?;
+    let logged = client.entry(u64::try_from(idx)?).await.map_err(|e| anyhow::anyhow!("entry {idx} of {log}: {e}"))?;
+    let body: Value = match trust {
+        Ok(root) => crate::ci::sigstore::logged(&logged.answer, root)?,
+        Err(_) => serde_json::from_slice(&B64.decode(&logged.body)?)?,
+    };
+    anyhow::ensure!(body.pointer("/spec/data/hash/value").and_then(Value::as_str) == Some(crate::util::sha256_hex(text.as_bytes()).as_str()), "entry {idx} of {log} names another hash than checkpoint {}'s", cp.size);
+    let size = cp.size;
+    let kept = hub
+        .store
+        .call(move |c| {
+            let now = size_of(c)?;
+            anyhow::ensure!(now >= size, "the trail has {now} entries, fewer than the {size} Rekor saw");
+            Ok(trail::mth_from(now, 0, size, &mut |t| tile_hashes(c, t).ok()))
+        })
+        .await?;
+    anyhow::ensure!(kept == Some(cp.root), "the trail's first {size} entries don't make the root Rekor saw at entry {idx} of {log}");
     Ok(())
 }
 

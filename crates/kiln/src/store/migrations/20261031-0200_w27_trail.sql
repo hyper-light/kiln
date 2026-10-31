@@ -35,6 +35,21 @@ CREATE TABLE trail_nodes (
     hash TEXT NOT NULL,
     PRIMARY KEY (level, idx)
 );
+-- Where each checkpoint is anchored (W27-R09): in the Rekor `[ci.attest] rekor_url` named (`log`),
+-- at its entry `idx` (a hashedrekord of the note's text), with the note and certificate as signed
+-- and Rekor's answer as it came. Kept apart from trail_checkpoints, so the trail is held to what
+-- Rekor saw however its own checkpoints change.
+CREATE TABLE trail_anchors (
+    size INTEGER NOT NULL,
+    log TEXT NOT NULL,
+    idx INTEGER NOT NULL,
+    uuid TEXT NOT NULL,
+    note TEXT NOT NULL,
+    certificate TEXT NOT NULL,
+    answer TEXT NOT NULL,
+    anchored_at INTEGER NOT NULL,
+    PRIMARY KEY (log, idx)
+);
 -- Each entry by each of its subjects: what the trail says of a commit, an artifact or a key.
 CREATE TABLE trail_subjects (
     subject TEXT NOT NULL,

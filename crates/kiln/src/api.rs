@@ -712,6 +712,9 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let limit = srv::query(&req).get("limit").and_then(|v| v.parse().ok()).unwrap_or(10);
             boxed(|| async { crate::trail::checkpoints_page(&hub.store, limit).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))) }).await
         }
+        (&Method::GET, ["api", "trail", "anchors"]) => {
+            boxed(|| async { crate::trail::anchors(&hub).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))) }).await
+        }
         // The trail as a tiled log (C2SP tlog-tiles): its checkpoint, its tiles and its entries.
         (&Method::GET, ["api", "trail", "log", rest @ ..]) => {
             let path = rest.join("/");

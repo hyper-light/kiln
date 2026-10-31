@@ -600,7 +600,9 @@ is in its tree, and gives each back by its number.
   Its keys come from a seed; its certificates are for code signing and valid ten minutes; its log
   holds 100,000 entries (past it, refused `Full`), each request a second after the last from the
   start it's given.
-- **Used by:** kiln's keyless signing (`[ci.attest] signing = "keyless"`, `ci/signing.rs`).
+- **Used by:** kiln's keyless signing (`[ci.attest] signing = "keyless"`, `ci/signing.rs`), and the
+  trail's anchors: each checkpoint the server signs, logged as a hashedrekord entry where
+  `[ci.attest] rekor_url` names a Rekor (`trail.rs`, docs/ci.md W27-R09).
 - **Passed by:** the simulator, every clause; kiln's client, every clause, over Fulcio's and
   Rekor's HTTP APIs against an HTTP front of the simulator (`ci::signing`'s tests). Not yet against
   a real Fulcio and Rekor (one deployed in kiln's cluster, W18-R02).
@@ -615,3 +617,4 @@ Methods: `certify`, `log`, `entry`.
 - **SIGSTORE-6** an index never logged is refused NotFound
 - **SIGSTORE-7** an entry comes with the log's promise and the proof of its inclusion: its index in a tree of more entries than that, the tree's root, and a checkpoint of that tree
 - **SIGSTORE-8** an entry whose signature isn't its verifier's is refused Invalid, naming the entry
+- **SIGSTORE-9** a hashedrekord entry (a SHA-256, and its key's signature over it) is logged and found again, keeping its hash; one whose signature is over another hash is refused Invalid, naming the entry

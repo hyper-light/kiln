@@ -632,6 +632,7 @@ pub static ROUTES: &[Rule] = &[
     // signature says who it's from); chains, breaks and refusals read by those who read the audit.
     r("GET", "/api/trail/checkpoints", "audit.read", At::Server),
     r("GET", "/api/trail/log/**", "audit.read", At::Server),
+    r("GET", "/api/trail/anchors", "audit.read", At::Server),
     r("POST", "/api/trail/checkpoints", "settings.manage", At::Server),
     r("GET", "/api/trail", "audit.read", At::Server),
     r("POST", "/api/custody", SIGNED_IN, At::Server),
