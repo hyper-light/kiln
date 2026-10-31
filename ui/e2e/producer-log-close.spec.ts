@@ -105,7 +105,25 @@ test("required output ends only on End, including bytes queued behind timing met
         await view.goto("/ship");
         const row = view.getByRole("list", { name: "Commits", exact: true }).locator(":scope > li").first();
         await row.getByRole("button", { name: /^Open / }).click();
-        await row.getByRole("list", { name: "Checks jobs" }).getByRole("button", { name: shown, exact: true }).first().click();
+        const stages = row.getByRole("list", { name: "Stages", exact: true });
+        const cards = stages.locator(":scope > li");
+        await expect(cards.first()).toBeVisible();
+        const checks = row.getByRole("list", { name: "Checks jobs", exact: true });
+        // JobCards draws only this view. Review plus six real stages bounds the walk.
+        for (let turn = 0; turn < 7 && !(await checks.isVisible()); turn++) {
+          const before = await cards.evaluateAll((nodes) => nodes.map((node) => node.getAttribute("data-stage")));
+          const next = row.getByRole("button", { name: "Next stages", exact: true });
+          await expect(next).toBeEnabled();
+          await next.click();
+          await expect.poll(() => cards.evaluateAll((nodes) => nodes.map((node) => node.getAttribute("data-stage")))).not.toEqual(before);
+        }
+        await expect(checks).toBeVisible();
+        const exactName = new RegExp("^" + shown.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$");
+        await checks
+          .getByRole("button")
+          .filter({ has: view.locator(".ship-part__name").filter({ hasText: exactName }) })
+          .first()
+          .click();
         const out = row.locator(".ship-output");
         await expect(out).toHaveAttribute("data-job", jobId);
         await expect(out).toHaveAttribute("data-step", String(step));
