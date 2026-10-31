@@ -1,0 +1,816 @@
+//! The trail (docs/ci.md W27-R09), the pure part: one append-only log of every signed statement
+//! kiln takes, in the order it takes them.
+//!
+//! - **An entry** names the statement it records by its digest (SHA-256 over its PAE:
+//!   [`super::statement::digest`]), its kind (the statement's payload type, or what kiln checked
+//!   for what isn't one), the things it's about by digest, when kiln took it, its index from 0, and
+//!   the hash of the entry before it. The entries are a hash chain, as gittuf's reference state log
+//!   chains its entries: one edited, dropped, inserted or moved breaks it where it happened
+//!   ([`check`]).
+//! - **The tree.** The entries are the leaves of an RFC 6962 Merkle tree ([`root`]), an entry's
+//!   hash its leaf hash: an entry's inclusion in a tree of n, and a tree's consistency with an
+//!   earlier one, are proven in at most ceil(log2 n) + 1 hashes ([`inclusion`], [`consistency`],
+//!   checked by RFC 9162's algorithms in [`verify_inclusion`] and [`verify_consistency`]). A chain
+//!   forged whole, every hash made again, still doesn't make the root kiln signed ([`check_root`]).
+//! - **A checkpoint** is a C2SP checkpoint in a signed note ([`Checkpoint`]): the trail's origin
+//!   (`kiln://<org>/trail`, its key's name too), its size and its root, signed by kiln's server
+//!   with its P-256 key (signed-note's type 0x02, its key ID the hash of its public key, as Rekor's
+//!   checkpoints are), under a certificate that verifies to kiln's root ([`signed`],
+//!   [`verify_note`]). kiln signs no checkpoint that doesn't extend the one before ([`extends`]).
+
+use base64::Engine as _;
+use const_oid::db::rfc5912::{ID_EC_PUBLIC_KEY, SECP_256_R_1};
+use der::asn1::ObjectIdentifier;
+use der::{Decode as _, Encode as _};
+use sha2::{Digest as _, Sha256};
+
+use super::chain::{self, Actor, Identity, Revocation, Verified};
+
+/// A SHA-256 hash.
+pub type Hash = [u8; 32];
+
+/// What the first entry names as the hash before it.
+pub const ZERO: Hash = [0; 32];
+
+const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+
+/// One entry of the trail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    /// Its place in the trail, from 0.
+    pub index: u64,
+    /// The hash of the entry before it ([`ZERO`] for the first).
+    pub prev: Hash,
+    /// The statement it records, by digest (`sha256:<hex>`).
+    pub statement: String,
+    /// What kind of statement it is: its payload type, or what kiln checked (`commit`).
+    pub kind: String,
+    /// What it's about, each by digest (`sha256:<hex>`, `gitCommit:<hex>`).
+    pub subjects: Vec<String>,
+    /// When kiln took it (unix seconds): the time it's checked at again.
+    pub taken_at: i64,
+}
+
+impl Entry {
+    /// What's hashed: a line each, under a version. No field holds a newline ([`next`] and
+    /// [`check`] refuse one that does), so no two entries encode alike.
+    fn encoding(&self) -> Vec<u8> {
+        let mut s = format!("kiln trail entry v1\n{}\n{}\n{}\n{}\n{}\n", self.index, chain::hex(&self.prev), self.statement, self.kind, self.taken_at);
+        for subject in &self.subjects {
+            s.push_str(subject);
+            s.push('\n');
+        }
+        s.into_bytes()
+    }
+
+    /// Its hash: RFC 6962's leaf hash of its encoding, which the next entry names and the tree is
+    /// built over.
+    pub fn hash(&self) -> Hash {
+        leaf(&self.encoding())
+    }
+
+    /// Why it isn't an entry kiln writes, when it isn't.
+    fn malformed(&self) -> Option<String> {
+        let line = |s: &str| !s.is_empty() && !s.chars().any(char::is_control);
+        if !self.statement.strip_prefix("sha256:").is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit())) {
+            return Some(format!("its statement {:?} isn't a digest (sha256:<64 hex>)", self.statement));
+        }
+        if !line(&self.kind) {
+            return Some(format!("its kind {:?} is empty, or more than a line", self.kind));
+        }
+        if let Some(bad) = self.subjects.iter().find(|s| !line(s) || !s.contains(':')) {
+            return Some(format!("its subject {bad:?} isn't a digest (<algorithm>:<hex>)"));
+        }
+        if self.index == 0 && self.prev != ZERO {
+            return Some("it's the first entry, yet it names an entry before it".to_owned());
+        }
+        None
+    }
+}
+
+/// The entry that records `statement` after `last` (none: the trail's first), or why it can't be
+/// one: kiln writes no entry [`check`] would refuse, whatever a statement's payload type says.
+pub fn next(last: Option<&Entry>, statement: &str, kind: &str, subjects: Vec<String>, taken_at: i64) -> Result<Entry, Break> {
+    let e = Entry { index: last.map_or(0, |e| e.index.saturating_add(1)), prev: last.map_or(ZERO, Entry::hash), statement: statement.to_owned(), kind: kind.to_owned(), subjects, taken_at };
+    match e.malformed() {
+        Some(why) => Err(Break::Malformed { index: e.index, why }),
+        None => Ok(e),
+    }
+}
+
+/// Where a run of entries doesn't hold.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum Break {
+    #[error("entry {index} isn't one kiln writes: {why}")]
+    Malformed { index: u64, why: String },
+    #[error("the trail starts at entry {index}, not entry 0")]
+    Start { index: u64 },
+    #[error("entry {index} comes right after entry {after}: entry {missing} is missing")]
+    Missing { index: u64, after: u64, missing: u64 },
+    #[error("there are two entries {index}: one was inserted")]
+    Inserted { index: u64 },
+    #[error("entry {index} comes after entry {after}: the trail is out of order")]
+    OutOfOrder { index: u64, after: u64 },
+    #[error("entry {index} doesn't hash to what entry {next} names")]
+    Edited { index: u64, next: u64 },
+    #[error("the trail's first {size} entries don't make the root its checkpoint names")]
+    Root { size: u64 },
+}
+
+/// Whether `entries` hold as a run of the trail after `before` (none: from its start): each well
+/// formed, numbered one after the other, each naming the hash of the one before. The first link
+/// that doesn't hold is named.
+pub fn check(before: Option<&Entry>, entries: &[Entry]) -> Result<(), Break> {
+    let mut last = before;
+    for (i, e) in entries.iter().enumerate() {
+        if let Some(why) = e.malformed() {
+            return Err(Break::Malformed { index: e.index, why });
+        }
+        match last {
+            None if e.index != 0 => return Err(Break::Start { index: e.index }),
+            None => {}
+            Some(p) => {
+                let want = p.index.saturating_add(1);
+                if e.index > want {
+                    // The one it skips comes later: moved, not dropped.
+                    let later = entries.iter().skip(i + 1).any(|x| x.index == want);
+                    return Err(if later { Break::OutOfOrder { index: e.index, after: p.index } } else { Break::Missing { index: e.index, after: p.index, missing: want } });
+                }
+                if e.index == p.index {
+                    return Err(Break::Inserted { index: e.index });
+                }
+                if e.index < want {
+                    return Err(Break::OutOfOrder { index: e.index, after: p.index });
+                }
+                if e.prev != p.hash() {
+                    return Err(Break::Edited { index: p.index, next: e.index });
+                }
+            }
+        }
+        last = Some(e);
+    }
+    Ok(())
+}
+
+/// Whether `entries`, the trail from its start, hold, and their first `checkpoint.size` make the
+/// root it names: a chain forged whole (each hash made again) doesn't, nor does a last entry
+/// changed, which no entry after it names.
+pub fn check_root(entries: &[Entry], checkpoint: &Checkpoint) -> Result<(), Break> {
+    check(None, entries)?;
+    let size = usize::try_from(checkpoint.size).unwrap_or(usize::MAX);
+    let leaves: Vec<Hash> = entries.iter().take(size).map(Entry::hash).collect();
+    if leaves.len() != size || root(&leaves) != checkpoint.root {
+        return Err(Break::Root { size: checkpoint.size });
+    }
+    Ok(())
+}
+
+fn sha(parts: &[&[u8]]) -> Hash {
+    let mut h = Sha256::new();
+    for p in parts {
+        h.update(p);
+    }
+    <Hash>::try_from(h.finalize().as_slice()).unwrap_or(ZERO)
+}
+
+/// RFC 6962's hash of a leaf: SHA-256 of 0x00 and its data.
+pub fn leaf(data: &[u8]) -> Hash {
+    sha(&[&[0], data])
+}
+
+fn node(left: &Hash, right: &Hash) -> Hash {
+    sha(&[&[1], left, right])
+}
+
+/// The largest power of two smaller than `n` (more than 1).
+fn split(n: usize) -> usize {
+    let mut k = 1;
+    while k << 1 < n {
+        k <<= 1;
+    }
+    k
+}
+
+/// The root of the tree over `leaves` (RFC 6962's Merkle Tree Hash): SHA-256 of nothing for none.
+pub fn root(leaves: &[Hash]) -> Hash {
+    match leaves {
+        [] => sha(&[]),
+        [one] => *one,
+        _ => {
+            let (l, r) = leaves.split_at(split(leaves.len()));
+            node(&root(l), &root(r))
+        }
+    }
+}
+
+/// The proof that leaf `index` is in the tree over `leaves` (RFC 6962's audit path); none for an
+/// index past its end.
+pub fn inclusion(leaves: &[Hash], index: usize) -> Option<Vec<Hash>> {
+    fn walk(m: usize, d: &[Hash], path: &mut Vec<Hash>) {
+        if d.len() <= 1 {
+            return;
+        }
+        let (l, r) = d.split_at(split(d.len()));
+        if m < l.len() {
+            walk(m, l, path);
+            path.push(root(r));
+        } else {
+            walk(m - l.len(), r, path);
+            path.push(root(l));
+        }
+    }
+    if index >= leaves.len() {
+        return None;
+    }
+    let mut path = Vec::new();
+    walk(index, leaves, &mut path);
+    Some(path)
+}
+
+/// Whether `proof` shows `leaf` at `index` of a tree of `size` whose root is `root` (RFC 9162,
+/// 2.1.3.2).
+pub fn verify_inclusion(leaf: &Hash, index: u64, size: u64, proof: &[Hash], root: &Hash) -> bool {
+    if index >= size {
+        return false;
+    }
+    let (mut f, mut s) = (index, size - 1);
+    let mut r = *leaf;
+    for p in proof {
+        if s == 0 {
+            return false;
+        }
+        if f & 1 == 1 || f == s {
+            r = node(p, &r);
+            while f & 1 == 0 && f != 0 {
+                f >>= 1;
+                s >>= 1;
+            }
+        } else {
+            r = node(&r, p);
+        }
+        f >>= 1;
+        s >>= 1;
+    }
+    s == 0 && r == *root
+}
+
+/// The proof that the tree over `leaves` extends the tree over its first `old` (RFC 6962's
+/// consistency proof); none for an `old` past its end.
+pub fn consistency(leaves: &[Hash], old: usize) -> Option<Vec<Hash>> {
+    fn sub(m: usize, d: &[Hash], whole: bool, proof: &mut Vec<Hash>) {
+        if m == d.len() {
+            if !whole {
+                proof.push(root(d));
+            }
+            return;
+        }
+        let (l, r) = d.split_at(split(d.len()));
+        if m <= l.len() {
+            sub(m, l, whole, proof);
+            proof.push(root(r));
+        } else {
+            sub(m - l.len(), r, false, proof);
+            proof.push(root(l));
+        }
+    }
+    if old > leaves.len() {
+        return None;
+    }
+    let mut proof = Vec::new();
+    if old > 0 {
+        sub(old, leaves, true, &mut proof);
+    }
+    Some(proof)
+}
+
+/// Whether `proof` shows the tree of `second` leaves (root `second_root`) extends the tree of its
+/// first `first` (root `first_root`) (RFC 9162, 2.1.4.2; the empty tree is extended by every one).
+pub fn verify_consistency(first: u64, second: u64, first_root: &Hash, second_root: &Hash, proof: &[Hash]) -> bool {
+    if first > second {
+        return false;
+    }
+    if first == second {
+        return proof.is_empty() && first_root == second_root;
+    }
+    if first == 0 {
+        return proof.is_empty();
+    }
+    if proof.is_empty() {
+        return false;
+    }
+    let mut path: Vec<Hash> = Vec::with_capacity(proof.len() + 1);
+    if first.is_power_of_two() {
+        path.push(*first_root);
+    }
+    path.extend_from_slice(proof);
+    let (mut f, mut s) = (first - 1, second - 1);
+    while f & 1 == 1 {
+        f >>= 1;
+        s >>= 1;
+    }
+    let Some((head, rest)) = path.split_first() else { return false };
+    let (mut fr, mut sr) = (*head, *head);
+    for c in rest {
+        if s == 0 {
+            return false;
+        }
+        if f & 1 == 1 || f == s {
+            fr = node(c, &fr);
+            sr = node(c, &sr);
+            while f & 1 == 0 && f != 0 {
+                f >>= 1;
+                s >>= 1;
+            }
+        } else {
+            sr = node(&sr, c);
+        }
+        f >>= 1;
+        s >>= 1;
+    }
+    fr == *first_root && sr == *second_root && s == 0
+}
+
+/// The origin of org `org`'s trail: what its checkpoints name it, and their key's name.
+pub fn origin(org: &str) -> String {
+    format!("kiln://{org}/trail")
+}
+
+/// A checkpoint of the trail: what kiln signs of it at a size (C2SP tlog-checkpoint).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Checkpoint {
+    /// The trail's name: [`origin`].
+    pub origin: String,
+    /// How many entries it covers.
+    pub size: u64,
+    /// The root of the tree over them.
+    pub root: Hash,
+}
+
+impl Checkpoint {
+    /// The checkpoint of `entries`, the trail from its start.
+    pub fn of(origin: &str, entries: &[Entry]) -> Checkpoint {
+        let leaves: Vec<Hash> = entries.iter().map(Entry::hash).collect();
+        Checkpoint { origin: origin.to_owned(), size: leaves.len() as u64, root: root(&leaves) }
+    }
+
+    /// Its note text: the origin, the size, and the root in base64, a line each.
+    pub fn text(&self) -> String {
+        format!("{}\n{}\n{}\n", self.origin, self.size, B64.encode(self.root))
+    }
+
+    /// A checkpoint's note text read back: its origin, size and root, then any extension lines,
+    /// which are ignored.
+    pub fn parse(text: &str) -> Result<Checkpoint, Refusal> {
+        let bad = |why: &str| Refusal::Malformed(why.to_owned());
+        let body = text.strip_suffix('\n').ok_or_else(|| bad("a note's text ends in a newline"))?;
+        let lines: Vec<&str> = body.split('\n').collect();
+        let [origin, size, root, ..] = lines.as_slice() else { return Err(bad("a checkpoint has three lines: origin, size, root")) };
+        if lines.iter().any(|l| l.is_empty()) {
+            return Err(bad("a checkpoint has no empty lines"));
+        }
+        if !size.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(bad("its size isn't a number"));
+        }
+        let size: u64 = size.parse().map_err(|_| bad("its size isn't a number"))?;
+        let root = B64.decode(root).ok().and_then(|r| <Hash>::try_from(r.as_slice()).ok()).ok_or_else(|| bad("its root isn't a SHA-256 in base64"))?;
+        Ok(Checkpoint { origin: (*origin).to_owned(), size, root })
+    }
+}
+
+/// Why a checkpoint isn't signed or taken.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum Refusal {
+    #[error("not a checkpoint kiln reads: {0}")]
+    Malformed(String),
+    #[error("it's a checkpoint of {origin}, not of {want}")]
+    Elsewhere { origin: String, want: String },
+    #[error("the checkpoint's signing key: {0}")]
+    Key(String),
+    #[error("kiln couldn't sign the checkpoint: {0}")]
+    Sign(String),
+    #[error("the checkpoint has no signature as {0} by its certificate's key")]
+    Unsigned(String),
+    #[error(transparent)]
+    Signer(#[from] chain::Refusal),
+    #[error("the checkpoint is signed by {by}, not by {org}'s server")]
+    NotTheServer { by: String, org: String },
+    #[error("checkpoint {new} doesn't extend checkpoint {old}: {why}")]
+    Inconsistent { old: u64, new: u64, why: String },
+}
+
+/// Whether `name` can name a log or a note's key (C2SP tlog-cosignature): not empty, at most 255
+/// bytes, and no spaces, plus signs or control characters.
+fn nameable(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 255 && !name.chars().any(|c| c.is_whitespace() || c == '+' || c.is_control())
+}
+
+/// The public key (its SubjectPublicKeyInfo, DER) a checkpoint is signed with, from its
+/// certificate: an ECDSA P-256 key, as signed-note's type 0x02 takes (it hashes with SHA-256
+/// whatever the curve, so kiln signs with no other).
+fn signing_key(cert_der: &[u8]) -> Result<Vec<u8>, Refusal> {
+    let cert = x509_cert::Certificate::from_der(cert_der).map_err(|e| Refusal::Key(format!("its certificate doesn't parse: {e}")))?;
+    let spki = &cert.tbs_certificate.subject_public_key_info;
+    let curve = spki.algorithm.parameters.as_ref().and_then(|p| p.decode_as::<ObjectIdentifier>().ok());
+    if spki.algorithm.oid != ID_EC_PUBLIC_KEY || curve != Some(SECP_256_R_1) {
+        return Err(Refusal::Key("it isn't ECDSA P-256, which a checkpoint's signature (signed-note's type 0x02) is made with".into()));
+    }
+    spki.to_der().map_err(|e| Refusal::Key(e.to_string()))
+}
+
+/// The key ID of an ECDSA key's note signatures: the first four bytes of SHA-256 over its public
+/// key, as signed-note has it for type 0x02 (other types hash the key's name and type first).
+fn key_id(spki: &[u8]) -> [u8; 4] {
+    let h = sha(&[spki]);
+    [h[0], h[1], h[2], h[3]]
+}
+
+/// A signature line of a signed note: its key's name and ID, and the signature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteSignature {
+    pub name: String,
+    pub key_id: [u8; 4],
+    pub signature: Vec<u8>,
+}
+
+/// A signed note read (C2SP signed-note): its text, through the newline before its last blank
+/// line, and its signature lines after it.
+pub fn open(note: &str) -> Result<(&str, Vec<NoteSignature>), Refusal> {
+    let bad = |why: &str| Refusal::Malformed(why.to_owned());
+    if note.chars().any(|c| c < ' ' && c != '\n') {
+        return Err(bad("a note has no control characters but newlines"));
+    }
+    let split = note.rfind("\n\n").ok_or_else(|| bad("a signed note is its text, a blank line and its signatures"))?;
+    let text = note.get(..=split).unwrap_or_default();
+    let lines = note.get(split + 2..).unwrap_or_default();
+    if lines.is_empty() {
+        return Err(bad("it has no signatures"));
+    }
+    if !lines.ends_with('\n') {
+        return Err(bad("its last signature line doesn't end in a newline"));
+    }
+    let signatures = lines
+        .split_terminator('\n')
+        .map(|line| {
+            let (name, sig) = line.strip_prefix("\u{2014} ").and_then(|l| l.split_once(' ')).filter(|(n, _)| nameable(n)).ok_or_else(|| bad("a signature line is \u{2014}, its key's name and its signature, a space apart"))?;
+            let blob = B64.decode(sig).map_err(|_| bad("a signature isn't base64"))?;
+            let (id, signature) = blob.split_at_checked(4).filter(|(_, s)| !s.is_empty()).ok_or_else(|| bad("a signature is cut short"))?;
+            Ok(NoteSignature { name: name.to_owned(), key_id: <[u8; 4]>::try_from(id).unwrap_or_default(), signature: signature.to_vec() })
+        })
+        .collect::<Result<Vec<_>, Refusal>>()?;
+    Ok((text, signatures))
+}
+
+/// `checkpoint` as a signed note: its text, a blank line and its signature line under its origin's
+/// name, `sign` signing the text as kiln's server (it says the signature and the certificate it
+/// verifies under, as kiln's `sign_own` does). kiln signs only a checkpoint that extends the last
+/// one it signed, `last` with the consistency proof from it (none: the trail's first): it never
+/// signs two that contradict each other.
+pub fn signed(checkpoint: &Checkpoint, last: Option<(&Checkpoint, &[Hash])>, sign: impl FnOnce(&[u8]) -> Result<(Vec<u8>, Vec<u8>), String>) -> Result<String, Refusal> {
+    if let Some((last, proof)) = last {
+        extends(last, checkpoint, proof)?;
+    }
+    let name = &checkpoint.origin;
+    if !nameable(name) {
+        return Err(Refusal::Malformed(format!("{name:?} can't name a log: it's empty, over 255 bytes, or has spaces, plus signs or control characters")));
+    }
+    let text = checkpoint.text();
+    let (signature, cert) = sign(text.as_bytes()).map_err(Refusal::Sign)?;
+    let mut blob = key_id(&signing_key(&cert)?).to_vec();
+    blob.extend(signature);
+    Ok(format!("{text}\n\u{2014} {name} {}\n", B64.encode(blob)))
+}
+
+/// The checkpoint a signed note says, and who signed it, read as org `org`'s trail: its signature
+/// under its origin's name by the key of `chain`'s first certificate, which verifies to `root` at
+/// `at` with `revocations` as `org`'s server, the only signer of its trail.
+pub fn verify_note(note: &str, org: &str, chain: &[&[u8]], root: &[u8], revocations: &[Revocation], at: i64) -> Result<(Checkpoint, Verified), Refusal> {
+    let (text, signatures) = open(note)?;
+    let checkpoint = Checkpoint::parse(text)?;
+    let want = origin(org);
+    if checkpoint.origin != want {
+        return Err(Refusal::Elsewhere { origin: checkpoint.origin, want });
+    }
+    let leaf = chain.first().ok_or_else(|| Refusal::Key("no certificate for it".into()))?;
+    let id = key_id(&signing_key(leaf)?);
+    let signature = signatures.iter().find(|s| s.name == want && s.key_id == id).ok_or_else(|| Refusal::Unsigned(want.clone()))?;
+    let v = chain::verify_signed(chain, root, revocations, at, text.as_bytes(), &signature.signature)?;
+    if v.identity != Identity::new(org, Actor::Server) {
+        return Err(Refusal::NotTheServer { by: v.identity.to_string(), org: org.to_owned() });
+    }
+    Ok((checkpoint, v))
+}
+
+/// Whether checkpoint `new` extends checkpoint `old`, `proof` its consistency proof: kiln signs
+/// none that doesn't.
+pub fn extends(old: &Checkpoint, new: &Checkpoint, proof: &[Hash]) -> Result<(), Refusal> {
+    let refuse = |why: &str| Err(Refusal::Inconsistent { old: old.size, new: new.size, why: why.to_owned() });
+    if old.origin != new.origin {
+        return refuse("they're of different trails");
+    }
+    if new.size < old.size {
+        return refuse("it's smaller");
+    }
+    if !verify_consistency(old.size, new.size, &old.root, &new.root, proof) {
+        return refuse("its tree doesn't contain the earlier one's");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aws_lc_rs::signature::{ECDSA_P256_SHA256_ASN1, UnparsedPublicKey};
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose, SanType, SignatureAlgorithm, SigningKey as _, date_time_ymd};
+
+    /// Inside every test leaf's validity (2026-01-01 to 2027-01-01).
+    const AT: i64 = 1_790_000_000;
+    const ORG: &str = "hyper-light";
+    const SERVER: &str = "kiln://hyper-light/server";
+
+    fn hex(h: &Hash) -> String {
+        chain::hex(h)
+    }
+
+    /// A trail of `n` entries, each a statement of its own.
+    fn trail(n: u64) -> anyhow::Result<Vec<Entry>> {
+        let mut t: Vec<Entry> = Vec::new();
+        for i in 0..n {
+            let statement = format!("sha256:{}", chain::hex(&sha(&[&i.to_be_bytes()])));
+            let e = next(t.last(), &statement, "application/vnd.kiln.custody+json", vec![format!("gitCommit:{:040x}", i + 1)], AT + i as i64)?;
+            t.push(e);
+        }
+        Ok(t)
+    }
+
+    fn leaves(t: &[Entry]) -> Vec<Hash> {
+        t.iter().map(Entry::hash).collect()
+    }
+
+    fn ceil_log2(n: usize) -> usize {
+        (usize::BITS - n.saturating_sub(1).leading_zeros()) as usize
+    }
+
+    #[test]
+    fn w27_ac06_an_edited_dropped_or_reordered_entry_is_found() -> anyhow::Result<()> {
+        let t = trail(10)?;
+        assert_eq!(check(None, &t), Ok(()), "a whole trail holds");
+        let cp = Checkpoint::of(&origin(ORG), &t);
+        assert_eq!(check_root(&t, &cp), Ok(()));
+        // An entry's subject edited: the next entry no longer names its hash.
+        let mut edited = t.clone();
+        if let Some(e) = edited.get_mut(4) {
+            e.subjects = vec!["gitCommit:ffffffffffffffffffffffffffffffffffffffff".into()];
+        }
+        let found = check(None, &edited);
+        assert_eq!(found, Err(Break::Edited { index: 4, next: 5 }));
+        assert_eq!(found.err().map(|b| b.to_string()).as_deref(), Some("entry 4 doesn't hash to what entry 5 names"));
+        // One dropped.
+        let mut dropped = t.clone();
+        dropped.remove(6);
+        let found = check(None, &dropped);
+        assert_eq!(found, Err(Break::Missing { index: 7, after: 5, missing: 6 }));
+        assert_eq!(found.err().map(|b| b.to_string()).as_deref(), Some("entry 7 comes right after entry 5: entry 6 is missing"));
+        // Two moved.
+        let mut moved = t.clone();
+        moved.swap(3, 4);
+        assert_eq!(check(None, &moved), Err(Break::OutOfOrder { index: 4, after: 2 }));
+        // One inserted beside entry 6, naming entry 5's hash as entry 6 does; one inserted with
+        // a wrong hash before it.
+        let (head, tail) = t.split_at(6);
+        let six = next(head.last(), &format!("sha256:{}", "a".repeat(64)), "commit", vec!["gitCommit:0000000000000000000000000000000000000abc".into()], AT)?;
+        let inserted: Vec<Entry> = head.iter().cloned().chain([six.clone()]).chain(tail.iter().cloned()).collect();
+        let found = check(None, &inserted);
+        assert_eq!(found, Err(Break::Inserted { index: 6 }));
+        assert_eq!(found.err().map(|b| b.to_string()).as_deref(), Some("there are two entries 6: one was inserted"));
+        let wrong = Entry { prev: ZERO, ..six };
+        let inserted: Vec<Entry> = head.iter().cloned().chain([wrong]).chain(tail.iter().cloned()).collect();
+        assert_eq!(check(None, &inserted), Err(Break::Edited { index: 5, next: 6 }));
+        // A chain forged whole from entry 4 on (an entry inserted and every hash after it made
+        // again): it holds as a chain, but not against the root kiln signed.
+        let (kept, _) = t.split_at(4);
+        let mut forged = kept.to_vec();
+        for i in 4..10u64 {
+            let e = next(forged.last(), &format!("sha256:{}", "e".repeat(64)), "commit", vec![format!("gitCommit:{i:040x}")], AT + 100)?;
+            forged.push(e);
+        }
+        assert_eq!(check(None, &forged), Ok(()));
+        assert_eq!(check_root(&forged, &cp), Err(Break::Root { size: 10 }));
+        // The last entry changed: no entry names it, the root does.
+        let mut last = t.clone();
+        if let Some(e) = last.last_mut() {
+            e.taken_at += 1;
+        }
+        assert_eq!(check(None, &last), Ok(()));
+        assert_eq!(check_root(&last, &cp), Err(Break::Root { size: 10 }));
+        // Fewer entries than the checkpoint covers.
+        assert_eq!(check_root(t.get(..9).unwrap_or_default(), &cp), Err(Break::Root { size: 10 }));
+        // A run checked after the entry before it; one that starts elsewhere; one malformed.
+        let (head, tail) = t.split_at(3);
+        assert_eq!(check(head.last(), tail), Ok(()));
+        assert_eq!(check(None, tail), Err(Break::Start { index: 3 }));
+        let mut bad = t.clone();
+        if let Some(e) = bad.get_mut(2) {
+            e.statement = "sha256:not-a-digest".into();
+        }
+        assert!(matches!(check(None, &bad), Err(Break::Malformed { index: 2, .. })));
+        // An entry that would break the trail is never written: a payload type of two lines.
+        let refused = next(t.last(), &format!("sha256:{}", "b".repeat(64)), "application/x\nforged", vec![], AT);
+        assert!(matches!(refused, Err(Break::Malformed { index: 10, .. })), "{refused:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn w27_r09_the_tree_is_rfc_6962s() {
+        // RFC 6962's test leaves and the roots of their first 1, 2, 3 and 8, and the empty tree.
+        let data: [&[u8]; 8] = [b"", b"\x00", b"\x10", b"\x20\x21", b"\x30\x31", b"\x40\x41\x42\x43", b"\x50\x51\x52\x53\x54\x55\x56\x57", b"\x60\x61\x62\x63\x64\x65\x66\x67\x68\x69\x6a\x6b\x6c\x6d\x6e\x6f"];
+        let l: Vec<Hash> = data.iter().map(|d| leaf(d)).collect();
+        assert_eq!(hex(&root(&[])), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+        let known = [
+            (1, "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"),
+            (2, "fac54203e7cc696cf0dfcb42c92a1d9dbaf70ad9e621f4bd8d98662f00e3c125"),
+            (3, "aeb6bcfe274b70a14fb067a5e5578264db0fa9b51af5e0ba159158f329e06e77"),
+            (8, "5dc9da79a70659a9ad559cb701ded9a2ab9d823aad2f4960cfe370eff4604328"),
+        ];
+        for (n, want) in known {
+            assert_eq!(hex(&root(l.get(..n).unwrap_or_default())), want, "the root of the first {n}");
+        }
+    }
+
+    #[test]
+    fn w27_r09_proofs_verify_and_stay_logarithmic() -> anyhow::Result<()> {
+        // One trail of 10,000: the trail of n is its first n.
+        let all = leaves(&trail(10_000)?);
+        let mut longest = (0, 0);
+        let mut proven = |n: usize, at: &[usize], olds: &[usize]| -> anyhow::Result<()> {
+            let l = all.get(..n).unwrap_or_default();
+            anyhow::ensure!(l.len() == n, "a trail of {n}");
+            let r = root(l);
+            let bound = ceil_log2(n) + 1;
+            for &m in at {
+                let leaf = l.get(m).copied().unwrap_or(ZERO);
+                let p = inclusion(l, m).unwrap_or_default();
+                anyhow::ensure!(verify_inclusion(&leaf, m as u64, n as u64, &p, &r), "leaf {m} of {n}");
+                anyhow::ensure!(p.len() <= bound, "leaf {m} of {n}: {} hashes, over {bound}", p.len());
+                longest.0 = longest.0.max(p.len());
+                if !p.is_empty() {
+                    let mut wrong = p.clone();
+                    if let Some(h) = wrong.first_mut() {
+                        h[0] ^= 1;
+                    }
+                    anyhow::ensure!(!verify_inclusion(&leaf, m as u64, n as u64, &wrong, &r), "a changed proof, leaf {m} of {n}");
+                    anyhow::ensure!(!verify_inclusion(&leaf, (m as u64 + 1) % n as u64, n as u64, &p, &r), "another index, leaf {m} of {n}");
+                }
+                anyhow::ensure!(!verify_inclusion(&leaf, n as u64, n as u64, &p, &r), "an index past the end, {n}");
+            }
+            for &m in olds {
+                let p = consistency(l, m).unwrap_or_default();
+                let old = root(l.get(..m).unwrap_or_default());
+                anyhow::ensure!(verify_consistency(m as u64, n as u64, &old, &r, &p), "{m} to {n}");
+                anyhow::ensure!(p.len() <= bound, "{m} to {n}: {} hashes, over {bound}", p.len());
+                longest.1 = longest.1.max(p.len());
+                if m > 0 && m < n {
+                    anyhow::ensure!(!verify_consistency(m as u64, n as u64, &leaf(b"another"), &r, &p), "another old root, {m} to {n}");
+                    let mut wrong = p.clone();
+                    if let Some(h) = wrong.last_mut() {
+                        h[31] ^= 1;
+                    }
+                    anyhow::ensure!(!verify_consistency(m as u64, n as u64, &old, &r, &wrong), "a changed proof, {m} to {n}");
+                }
+            }
+            Ok(())
+        };
+        // Every leaf and every earlier size of the trees of 1 to 64.
+        for n in 1..=64usize {
+            let every: Vec<usize> = (0..n).collect();
+            let olds: Vec<usize> = (0..=n).collect();
+            proven(n, &every, &olds)?;
+        }
+        // Up to 10,000: each side of every power of two, its ends, its middle.
+        for n in [100usize, 127, 128, 129, 255, 256, 257, 1_000, 1_023, 1_024, 1_025, 4_095, 4_096, 4_097, 8_191, 8_192, 8_193, 9_999, 10_000] {
+            let pow = split(n);
+            let at = [0, 1, pow - 1, pow, n / 2, n - 2, n - 1];
+            let olds = [0, 1, 2, n / 3, pow - 1, pow, pow + 1, n - 1, n];
+            proven(n, &at, &olds.map(|m| m.min(n)))?;
+        }
+        assert!(longest.0 <= ceil_log2(10_000) + 1 && longest.1 <= ceil_log2(10_000) + 1, "{longest:?}");
+        assert!(inclusion(&all, 10_000).is_none() && consistency(&all, 10_001).is_none());
+        Ok(())
+    }
+
+    struct Ca {
+        der: Vec<u8>,
+        issuer: Issuer<'static, KeyPair>,
+    }
+
+    fn ca() -> anyhow::Result<Ca> {
+        let key = KeyPair::generate()?;
+        let mut p = CertificateParams::new(Vec::<String>::new())?;
+        p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        p.distinguished_name.push(rcgen::DnType::CommonName, ORG);
+        p.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign, KeyUsagePurpose::DigitalSignature];
+        p.not_before = date_time_ymd(2025, 1, 1);
+        p.not_after = date_time_ymd(2036, 1, 1);
+        let cert = p.self_signed(&key)?;
+        Ok(Ca { der: cert.der().to_vec(), issuer: Issuer::new(p, key) })
+    }
+
+    /// A certificate from `ca` for `uri` with a key of `alg`, and the key.
+    fn signer(ca: &Ca, uri: &str, alg: &'static SignatureAlgorithm) -> anyhow::Result<(Vec<u8>, KeyPair)> {
+        let mut p = CertificateParams::new(Vec::<String>::new())?;
+        p.subject_alt_names = vec![SanType::URI(uri.try_into()?)];
+        p.is_ca = IsCa::ExplicitNoCa;
+        p.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        p.not_before = date_time_ymd(2026, 1, 1);
+        p.not_after = date_time_ymd(2027, 1, 1);
+        let key = KeyPair::generate_for(alg)?;
+        let der = p.signed_by(&key, &ca.issuer)?.der().to_vec();
+        Ok((der, key))
+    }
+
+    /// What signs as `cert`'s holder, as kiln's `sign_own` signs: the signature and the certificate.
+    fn signs_as<'a>(cert: &'a [u8], key: &'a KeyPair) -> impl FnOnce(&[u8]) -> Result<(Vec<u8>, Vec<u8>), String> + 'a {
+        move |m: &[u8]| Ok((key.sign(m).map_err(|e| e.to_string())?, cert.to_vec()))
+    }
+
+    #[test]
+    fn w27_r09_a_checkpoint_never_contradicts_the_one_before() -> anyhow::Result<()> {
+        let ca = ca()?;
+        let (server, key) = signer(&ca, SERVER, &rcgen::PKCS_ECDSA_P256_SHA256)?;
+        let t = trail(12)?;
+        let (first, _) = t.split_at(10);
+        let cp10 = Checkpoint::of(&origin(ORG), first);
+        let note = signed(&cp10, None, signs_as(&server, &key))?;
+        assert!(note.starts_with(&format!("kiln://hyper-light/trail\n10\n{}\n\n\u{2014} kiln://hyper-light/trail ", B64.encode(cp10.root))) && note.ends_with('\n'), "{note}");
+        let (read, by) = verify_note(&note, ORG, &[&server], &ca.der, &[], AT)?;
+        assert_eq!((read, by.identity), (cp10.clone(), Identity::new(ORG, Actor::Server)));
+        // Twelve extend ten, and kiln signs them; a trail changed at entry 3 doesn't, however it's
+        // hashed again, and kiln won't sign it.
+        let cp12 = Checkpoint::of(&origin(ORG), &t);
+        let l = leaves(&t);
+        let proof = consistency(&l, 10).unwrap_or_default();
+        assert_eq!(extends(&cp10, &cp12, &proof), Ok(()));
+        let note12 = signed(&cp12, Some((&cp10, &proof)), signs_as(&server, &key))?;
+        assert_eq!(verify_note(&note12, ORG, &[&server], &ca.der, &[], AT)?.0, cp12);
+        let mut rehashed: Vec<Entry> = Vec::new();
+        for (i, e) in t.iter().enumerate() {
+            let taken_at = if i == 3 { e.taken_at + 60 } else { e.taken_at };
+            let n = next(rehashed.last(), &e.statement, &e.kind, e.subjects.clone(), taken_at)?;
+            rehashed.push(n);
+        }
+        let forged = Checkpoint::of(&origin(ORG), &rehashed);
+        let proof = consistency(&leaves(&rehashed), 10).unwrap_or_default();
+        assert!(matches!(extends(&cp10, &forged, &proof), Err(Refusal::Inconsistent { old: 10, new: 12, .. })));
+        let refused = signed(&forged, Some((&cp10, &proof)), signs_as(&server, &key));
+        assert!(matches!(refused, Err(Refusal::Inconsistent { old: 10, new: 12, .. })), "{refused:?}");
+        assert_eq!(refused.err().map(|r| r.to_string()).as_deref(), Some("checkpoint 12 doesn't extend checkpoint 10: its tree doesn't contain the earlier one's"));
+        assert!(extends(&cp12, &cp10, &[]).is_err(), "a smaller one never extends");
+        // A note changed after it was signed; one by someone else; one of another trail; one
+        // whose signature isn't the certificate's key's; a key signed-note's type 0x02 isn't.
+        let edited = note.replacen("\n10\n", "\n11\n", 1);
+        assert!(matches!(verify_note(&edited, ORG, &[&server], &ca.der, &[], AT), Err(Refusal::Signer(chain::Refusal::BadSignature { .. }))));
+        let (sam, sam_key) = signer(&ca, "kiln://hyper-light/person/sam", &rcgen::PKCS_ECDSA_P256_SHA256)?;
+        let by_sam = signed(&cp10, None, signs_as(&sam, &sam_key))?;
+        assert!(matches!(verify_note(&by_sam, ORG, &[&sam], &ca.der, &[], AT), Err(Refusal::NotTheServer { .. })));
+        assert_eq!(verify_note(&by_sam, ORG, &[&server], &ca.der, &[], AT).err(), Some(Refusal::Unsigned(origin(ORG))));
+        assert!(matches!(verify_note(&note, "other-org", &[&server], &ca.der, &[], AT), Err(Refusal::Elsewhere { .. })));
+        let (ed, ed_key) = signer(&ca, SERVER, &rcgen::PKCS_ED25519)?;
+        assert!(matches!(signed(&cp10, None, signs_as(&ed, &ed_key)), Err(Refusal::Key(_))));
+        // The checkpoint's text reads back; one that isn't three lines, or isn't a note, doesn't.
+        assert_eq!(Checkpoint::parse(&cp12.text()), Ok(cp12));
+        assert!(Checkpoint::parse("kiln://hyper-light/trail\nten\n").is_err());
+        assert!(Checkpoint::parse("kiln://hyper-light/trail\n+10\nAAAA\n").is_err());
+        assert!(open("kiln://hyper-light/trail\n10\n").is_err());
+        Ok(())
+    }
+
+    /// Rekor's public log's checkpoint and key, as https://rekor.sigstore.dev/api/v1/log and
+    /// /api/v1/log/publicKey gave them on 2026-10-30: a type 0x02 signed note from outside kiln.
+    const REKOR_NOTE: &str = "rekor.sigstore.dev - 1193050959916656506\n3484845866\nvC+7KDx/H0/nu8aZsqO02V2jsX/UaS77jEP4AgEx2VI=\n\n\u{2014} rekor.sigstore.dev wNI9ajBFAiEAoO79I1HUQKh1t7dLFxeKnuTfDKcVQiFVJoPy+vNriFUCICfqXTpqtA5JqD7JBoajh4pYtXOXLV5hx5rARNxxBQcY\n";
+    const REKOR_KEY: &str = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE2G2Y+2tabdTV5BcGiBIx0a9fAFwrkBbmLSGtks4L3qX6yYY0zufBnhC8Ur/iy55GhWP/9A/bY2LhC30M9+RYtw==";
+
+    /// Whether a C2SP verifier holding only `spki` (an ECDSA P-256 key, DER) takes `name`'s
+    /// signature on `note`, as transparency-dev's does: its key ID, then its signature over the text.
+    fn c2sp_verifies(note: &str, name: &str, spki: &[u8]) -> anyhow::Result<bool> {
+        let (text, signatures) = open(note)?;
+        let point = x509_cert::spki::SubjectPublicKeyInfoOwned::from_der(spki)?.subject_public_key.raw_bytes().to_vec();
+        let key = UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, point);
+        Ok(signatures.iter().any(|s| s.name == name && s.key_id == key_id(spki) && key.verify(text.as_bytes(), &s.signature).is_ok()))
+    }
+
+    #[test]
+    fn w27_r09_a_checkpoint_is_a_signed_note_as_rekors_are() -> anyhow::Result<()> {
+        // Rekor's note opens to the text it signed, under the key ID its key hashes to.
+        let rekor = B64.decode(REKOR_KEY)?;
+        assert_eq!(key_id(&rekor), [0xc0, 0xd2, 0x3d, 0x6a]);
+        assert!(c2sp_verifies(REKOR_NOTE, "rekor.sigstore.dev", &rekor)?);
+        assert!(!c2sp_verifies(&REKOR_NOTE.replacen("3484845866", "3484845867", 1), "rekor.sigstore.dev", &rekor)?);
+        let cp = Checkpoint::parse(open(REKOR_NOTE)?.0)?;
+        assert_eq!((cp.origin.as_str(), cp.size, hex(&cp.root).as_str()), ("rekor.sigstore.dev - 1193050959916656506", 3_484_845_866, "bc2fbb283c7f1f4fe7bbc699b2a3b4d95da3b17fd4692efb8c43f8020131d952"));
+        // kiln's checkpoint, as a verifier holding only the server's public key checks it.
+        let ca = ca()?;
+        let (server, key) = signer(&ca, SERVER, &rcgen::PKCS_ECDSA_P256_SHA256)?;
+        let note = signed(&Checkpoint::of(&origin(ORG), &trail(3)?), None, signs_as(&server, &key))?;
+        assert!(c2sp_verifies(&note, &origin(ORG), &signing_key(&server)?)?);
+        Ok(())
+    }
+}

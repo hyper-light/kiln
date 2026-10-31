@@ -14,13 +14,15 @@
 //! and how kiln checks it as of the time it took it, [`statement`] (W27-R03 to R08's base); a commit's
 //! signature in git's x509 form, [`gitsig`], and in its SSH form, [`sshsig`], against keys people
 //! bound to their identities (W27-R03); whether a push's commits are signed as a repository's
-//! policy says, [`push`] (W27-R03).
+//! policy says, [`push`] (W27-R03); the trail of every statement kiln takes, a hash chain with a
+//! Merkle tree over it and kiln's signed checkpoints, [`trail`] (W27-R09).
 
 pub mod chain;
 pub mod gitsig;
 pub mod push;
 pub mod sshsig;
 pub mod statement;
+pub mod trail;
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
