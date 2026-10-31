@@ -1227,6 +1227,10 @@ async fn resource_logs(cx: Cx, v: Value) -> Out {
     let id = app_id(&v)?;
     exists(&cx.cd, &id)?;
     let k = res_key(&v)?;
+    // What a runner's job made (a Compose project, a host's service): read on its hosts (W26-R26).
+    if super::logs::on_runners(&k) {
+        return super::logs::read(&cx.hub, &cx.cd, &id, &k, &super::logs::ask_of(&v, false)).await;
+    }
     let (t, ids, all) = log_pods(&cx.cd, &id, &k, str_in(&v, "pod")).await?;
     let pods: Vec<&kiln_cd::tree::Node> = ids.iter().filter_map(|i| t.tree.nodes.iter().find(|n| n.id == *i)).collect();
     let q = super::live::LogQuery::from_json(&v);

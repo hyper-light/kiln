@@ -435,7 +435,7 @@ The API lives under `/api/cd`. It follows [access.md](access.md)'s conventions: 
 | GET / PUT | `/api/cd/repos/auto-rollback` | auto-rollback by repository; PUT `{ repo, on: true \| false \| null }` |
 | GET | `/api/cd/apps/:app/resources/:key` | one object of the tree: its node, live manifest, desired manifest and diff (managed objects), labels, annotations, conditions and owners. `:key` is `group~kind~namespace~name` |
 | GET | `/api/cd/apps/:app/resources/:key/events` | its Kubernetes events, newest first |
-| GET | `/api/cd/apps/:app/resources/:key/logs?container=&pod=&tail_lines=&since_seconds=&previous=` | the last lines of a pod's log, or of a workload's pods merged by time; `/logs/ws` follows them over a WebSocket |
+| GET | `/api/cd/apps/:app/resources/:key/logs?container=&pod=&tail_lines=&since_seconds=&previous=` | the last lines of a pod's log, or of a workload's pods merged by time; `/logs/ws` follows them over a WebSocket A Compose project's or a host's service's (`compose.kiln.dev`, `host.kiln.dev`) are read on its hosts by their runners, each line naming its host (ci.md W26-R26) |
 | POST / DELETE | `/api/cd/apps/:app/resources/:key/actions/:action` | resource actions (restart, delete a pod): not yet |
 | POST | `/api/cd/bulk` | `{ selector, action }` over many apps |
 | GET / POST | `/api/cd/plans?repo=&commit=\|head=&base=\|pr=&trunk=&brief=` | a plan of a commit, a stack or a pull request (POST takes the same as JSON, with app filters); `diff=` (kiln's own diffs): not yet |

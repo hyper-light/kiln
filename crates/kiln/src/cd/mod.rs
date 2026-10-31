@@ -18,6 +18,7 @@ pub mod guard;
 pub mod images;
 pub mod kube;
 pub mod live;
+pub mod logs;
 pub mod ops;
 pub mod plans;
 pub mod rollback;

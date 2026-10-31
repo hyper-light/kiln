@@ -8629,6 +8629,13 @@ a time. The design was agreed on a live mock built on Ship's own prototype
   synced as a rollback, recorded as a deployment, and held there until trunk changes what the app
   renders (cd.md, "Any commit"). Its rollback targets list main's newest commits beside the
   deployments, each naming the deployment that ran it and the one whose render it matches.
+- **W26-R26 Logs beyond pods.** A deploy's logs read in the same API and stream as a pod's, for
+  what kiln's runners run too: a Compose project's containers (`docker compose logs`, one service's
+  or all; previous, its newest container that exited) and a host's service (its user unit's journal
+  on Linux; on macOS the files its launch agent now writes its stdout and stderr to). Each takes the
+  last lines, since when, and following. kiln reads them on each host the object was made on, by the
+  runner there, in a terminal of its own nobody's list shows, each line naming its host where a
+  pod's names its pod. A Windows service's logs, and the clouds', come later.
 - **W26-R27 Auto-sync from the UI.** A person turns an app's auto-sync on or off from Ship
   (`cd.apps.set_auto_sync`), kept in the store's settings and audited, as auto-rollback is. It beats
   the deploy file until the file changes what it says (cd.md, "Auto-sync"). Prune keeps its own
@@ -8696,6 +8703,12 @@ repository):
   `kiln-ci` `w26_r22_a_paused_leg_waits_until_it_is_resumed`; proto
   `w26_r22_freeze_is_appended_after_every_older_variant`; contain
   `w26_r22_a_job_left_frozen_by_an_ended_runner_goes_on`.*
+- **W26-AC17 Logs beyond pods.** On this machine's Docker, a Compose project's log reads its last
+  lines in order with their times, follows as lines come, and reads a stopped container's as its
+  previous one; each source's command is as asked. *`cd::logs`
+  `w26_r26_a_compose_projects_log_reads_follows_and_reads_a_stopped_containers` and
+  `w26_r26_a_terminals_bytes_read_as_plain_lines`; `kiln-cd`
+  `w26_r26_each_source_reads_its_log_as_asked`.*
 - **W26-AC16 Auto-sync from the UI.** An app whose deploy file leaves auto-sync off syncs once a
   person turns it on, and stops when they turn it off; once the file changes its word, the file's
   stands. *`kiln-cd` `w26_r27_a_persons_auto_sync_beats_the_file_until_the_file_changes` and
