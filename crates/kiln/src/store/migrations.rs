@@ -350,7 +350,8 @@ mod tests {
     /// revocation naming neither is refused; applying again changes nothing; no epoch is raised.
     #[test]
     fn w27_r01_identities_and_revocations_tables() -> anyhow::Result<()> {
-        crate::sql::with_memory(|c| {
+        let database=amphora::database::Database::in_memory(crate::store::deadline())?;
+        database.call(crate::store::deadline(),|c| {
             const MINE: &str = "20261026-1800_w27_identities";
             c.execute_batch(crate::store::SCHEMA)?;
             let (before, after): (Vec<(&str, &str)>, Vec<(&str, &str)>) = MIGRATIONS.iter().copied().partition(|(n, _)| *n < MINE);
@@ -362,16 +363,38 @@ mod tests {
             assert_eq!(columns("identities")?, ["serial", "kind", "subject", "key_sha256", "not_before", "not_after", "issued_at", "cert_pem"]);
             assert_eq!(columns("revocations")?, ["id", "serial", "key_sha256", "subject", "at", "reason", "by"]);
             c.execute("INSERT INTO identities (serial, kind, subject, key_sha256, not_before, not_after, issued_at) VALUES ('0a', 'machine', 'fedora-2', 'k1', 1, 2, 1)", [])?;
-            assert!(c.execute("INSERT INTO identities (serial, kind, subject, key_sha256, not_before, not_after, issued_at) VALUES ('0a', 'machine', 'fedora-2', 'k2', 1, 2, 1)", []).is_err(), "a serial is issued once");
+            Ok(())
+        })?;
+        // Deliberate write failures must leave their SAME owner call as Err, so
+        // Amphora rolls back instead of committing a poisoned successful session.
+        let duplicate=database.call(crate::store::deadline(),|c| {
+            c.execute("INSERT INTO identities (serial, kind, subject, key_sha256, not_before, not_after, issued_at) VALUES ('0a', 'machine', 'fedora-2', 'k2', 1, 2, 1)",[])?;Ok(())
+        }).err().ok_or_else(||anyhow::anyhow!("a serial is issued once: duplicate was accepted"))?;
+        anyhow::ensure!(matches!(&duplicate,amphora_api::Refusal::Unavailable(reason) if reason.contains("UNIQUE constraint failed: identities.serial")),"a serial is issued once: {duplicate:?}");
+        database.call(crate::store::deadline(),|c| {
             c.execute("INSERT INTO revocations (serial, subject, at, reason, by) VALUES ('0a', 'fedora-2', 1790000000, 'runner forgotten', 'ada')", [])?;
             c.execute("INSERT INTO revocations (key_sha256, subject, at, reason, by) VALUES ('k1', 'fedora-2', 1790000001, 'key lost', 'sam')", [])?;
-            assert!(c.execute("INSERT INTO revocations (subject, at, reason, by) VALUES ('fedora-2', 1, 'x', 'ada')", []).is_err(), "a revocation names a serial or a key");
-            assert!(c.execute("INSERT INTO revocations (serial, subject, at, by) VALUES ('0a', 'fedora-2', 1, 'ada')", []).is_err(), "a revocation says why");
+            Ok(())
+        })?;
+        for (sql,diagnostic,rule) in [
+            ("INSERT INTO revocations (subject, at, reason, by) VALUES ('fedora-2', 1, 'x', 'ada')","CHECK constraint failed: serial IS NOT NULL OR key_sha256 IS NOT NULL","a revocation names a serial or a key"),
+            ("INSERT INTO revocations (serial, subject, at, by) VALUES ('0a', 'fedora-2', 1, 'ada')","NOT NULL constraint failed: revocations.reason","a revocation says why"),
+        ] {
+            let refused=database.call(crate::store::deadline(),move |c| {c.execute(sql,[])?;Ok(())}).err().ok_or_else(||anyhow::anyhow!("{rule}: invalid revocation was accepted"))?;
+            anyhow::ensure!(matches!(&refused,amphora_api::Refusal::Unavailable(reason) if reason.contains(diagnostic)),"{rule}: {refused:?}");
+        }
+        // A subsequent successful owner call proves usability after all three
+        // rollbacks and inspects both positive and absent-invalid rows.
+        database.call(crate::store::deadline(),|c| {
             let (at, reason, by): (i64, String, String) = c.query_row("SELECT at, reason, by FROM revocations WHERE serial = '0a'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
             assert_eq!((at, reason.as_str(), by.as_str()), (1_790_000_000, "runner forgotten", "ada"));
             assert_eq!(read_min_reader(c)?, 4, "the full migration suffix includes the later U05 accepted-prefix reader fence");
+            assert_eq!(c.query_row("SELECT COUNT(*) FROM identities WHERE serial='0a'",[],|r|r.get::<_,u64>(0))?,1,"failed duplicate must not add a second identity");
+            assert_eq!(c.query_row("SELECT key_sha256 FROM identities WHERE serial='0a'",[],|r|r.get::<_,String>(0))?,"k1","failed duplicate must preserve the original identity");
+            assert_eq!(c.query_row("SELECT COUNT(*) FROM revocations",[],|r|r.get::<_,u64>(0))?,2,"both positive revocations survive rollback-only refusal calls");
+            assert_eq!(c.query_row("SELECT COUNT(*) FROM revocations WHERE at=1",[],|r|r.get::<_,u64>(0))?,0,"neither invalid revocation may persist");
             Ok(())
-        })
+        }).map_err(Into::into)
     }
 
     #[test]

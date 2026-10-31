@@ -560,8 +560,15 @@ mod tests {
             crate::rt::blocking(move || -> anyhow::Result<()> {
                 let until = std::time::Instant::now() + Duration::from_secs(15);
                 // report() reads existing telemetry, so it cannot keep this actor busy.
-                // Observe idle worker progress before checking the shared transcript.
-                while r.report().waits.iter().sum::<u64>() < 3 {
+                // The first look can precede pruning. Observe a later idle look as well,
+                // after the worker has had its initial maintenance turn.
+                let mut first_look = 0;
+                loop {
+                    let file = r.report().file;
+                    if first_look != 0 && file.at != 0 && file.at != first_look && matches!(file.upkeep, crate::convo::telemetry::Upkeeping::Idle) {
+                        break;
+                    }
+                    if first_look == 0 { first_look = file.at; }
                     anyhow::ensure!(std::time::Instant::now() < until, "replica maintenance did not run");
                     std::thread::sleep(Duration::from_millis(50));
                 }
