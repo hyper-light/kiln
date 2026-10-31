@@ -547,7 +547,7 @@ pub async fn http(cx: Cx, method: Method, path: &[&str], q: &std::collections::H
         let body = if ignore_body { json!({}) } else {
             let bytes = srv::body_bytes(req.into_body(), definition.map_or(8 << 20, |d| d.limit)).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
             if text_body { json!(String::from_utf8_lossy(&bytes)) }
-            else if bytes.is_empty() { json!({}) }
+            else if bytes.is_empty() || definition.is_some_and(|d| matches!(d.payload, Payload::EmptyObject)) && bytes.iter().all(u8::is_ascii_whitespace) { json!({}) }
             else { serde_json::from_slice(&bytes).map_err(|e| (StatusCode::BAD_REQUEST, format!("the body is not JSON: {e}")))? }
         };
         let mut input = if let Some(definition) = definition { definition.input(&bindings, q, body, &schema)? }
@@ -567,6 +567,11 @@ pub async fn http(cx: Cx, method: Method, path: &[&str], q: &std::collections::H
             Reply::Yaml(field) => {
                 let text = value.get(field).and_then(Value::as_str).ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, format!("{} did not return {field}", info.name)))?;
                 Ok(srv::response(StatusCode::OK, "application/yaml", srv::full(text.to_owned())))
+            }
+            Reply::JsonField(code, field) => {
+                let status = StatusCode::from_u16(code).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                let answer = value.get(field).ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, format!("{} did not return {field}", info.name)))?;
+                Ok(srv::json(status, answer))
             }
             Reply::Json(code) => {
                 let status = StatusCode::from_u16(code).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -609,9 +614,9 @@ pub fn document_http(paths: &mut serde_json::Map<String, Value>, listed: &[Info]
             let input = match route.payload {
                 Payload::Wrapped(key) => info.input.schema().get("properties").and_then(|p| p.get(key)).cloned().unwrap_or_else(|| json!({})),
                 Payload::Text(_) => json!({"type": "string"}),
-                Payload::Object | Payload::Ignored => input,
+                Payload::Object | Payload::EmptyObject | Payload::Ignored => input,
             };
-            let code = match route.reply { Reply::Json(code) => code, Reply::Empty => 204, _ => 200 };
+            let code = match route.reply { Reply::Json(code) | Reply::JsonField(code, _) => code, Reply::Empty => 204, _ => 200 };
             let mut response = json!({
                 "summary": info.summary,
                 "x-kiln-operation": info.name,

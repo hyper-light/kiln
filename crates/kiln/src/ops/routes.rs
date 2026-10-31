@@ -43,6 +43,8 @@ impl Part {
 #[derive(Clone, Copy)]
 pub enum Payload {
     Object,
+    /// Legacy JSON routes that accept an absent or whitespace-only body as an empty object.
+    EmptyObject,
     Ignored,
     Wrapped(&'static str),
     Text(&'static str),
@@ -51,6 +53,8 @@ pub enum Payload {
 #[derive(Clone, Copy)]
 pub enum Reply {
     Json(u16),
+    /// U12: keep a legacy HTTP answer while named calls retain the whole domain result.
+    JsonField(u16, &'static str),
     Empty,
     Yaml(&'static str),
     /// Binary downloads, streaming and other protocol-owned responses stay adapters.
@@ -124,6 +128,7 @@ impl Definition {
     pub fn input(&self, bindings: &[(&str, String)], query: &HashMap<String, String>, body: Value, schema: &Value) -> Out {
         let mut input = match self.payload {
             Payload::Object | Payload::Ignored => if body.is_null() { json!({}) } else { body },
+            Payload::EmptyObject => body,
             Payload::Wrapped(key) => json!({key: body}),
             Payload::Text(key) => json!({key: body}),
         };

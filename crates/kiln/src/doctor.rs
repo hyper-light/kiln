@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 
 use crate::authz::{Caller, Scope};
 use crate::hub::Hub;
-use crate::ops::{Cx, Fail, Input, Op, Out, text, Definition, Part, Routes, Reply};
+use crate::ops::{Cx, Fail, Input, Op, Out, text, Definition, Part, Routes, Reply, Payload};
 use crate::proto::{self, ServerMsg};
 
 /// How much a finding matters.
@@ -686,17 +686,12 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "updates.retry",
-            summary: "Upgrade a runner to the newest kiln now (a failed upgrade tried again), optionally `way` download or build. Nothing it runs stops: its agents and jobs carry on in the new build.",
+            summary: "Upgrade a runner to the newest kiln, retry a failed lifecycle job (`retry`) with its pinned commit/artifact, or roll back to a successful CD release (`rollback`). Choose only one of `way`, `retry` or `rollback`; its agents and jobs carry on.",
             read_only: false,
             destructive: false,
             input: Input::of::<input::UpdatesRetry>(),
-            route: Routes(vec![Definition::new("POST", &[Part::Literal("api"), Part::Literal("updates"), Part::Literal("runners"), Part::Field("runner")], &[], "runners.manage", ScopeAt::Runner(3)).reply(Reply::Protocol)]),
-            run: |cx, v| {
-                Box::pin(async move {
-                    let ask = Ask { action: "retry-upgrade".to_owned(), way: v.get("way").and_then(Value::as_str).map(str::to_owned) };
-                    repair(&cx.hub, &runner_of(&v)?, &ask).await
-                })
-            },
+            route: Routes(vec![Definition::new("POST", &[Part::Literal("api"), Part::Literal("updates"), Part::Literal("runners"), Part::Field("runner")], &[], "runners.manage", ScopeAt::Runner(3)).payload(Payload::EmptyObject).reply(Reply::JsonField(202, "job"))]),
+            run: |cx, v| Box::pin(upgrade(cx, v)),
         },
         Op {
             name: "updates.policy",
@@ -704,7 +699,7 @@ pub fn list_ops() -> Vec<Op> {
             read_only: false,
             destructive: false,
             input: Input::of::<input::UpdatesPolicy>(),
-            route: Routes(vec![Definition::new("PUT", &[Part::Literal("api"), Part::Literal("updates"), Part::Literal("runners"), Part::Field("runner")], &[], "runners.manage", ScopeAt::Runner(3)).reply(Reply::Protocol)]),
+            route: Routes(vec![Definition::new("PUT", &[Part::Literal("api"), Part::Literal("updates"), Part::Literal("runners"), Part::Field("runner")], &[], "runners.manage", ScopeAt::Runner(3)).reply(Reply::Empty)]),
             run: |cx, v| Box::pin(set_policy(cx, v)),
         },
     ]
@@ -765,7 +760,12 @@ pub mod input {
     pub struct UpdatesRetry {
         /// The runner (machine) by name, as Runners lists it.
         pub runner: String,
+        /// Historical choices both consume canonical CI artifacts (U16).
         pub way: Option<RunnersRepairWay>,
+        /// Retry a failed lifecycle job with its original commit and pinned artifact.
+        pub retry: Option<String>,
+        /// Deploy the retained artifact of this runner's successful CD release.
+        pub rollback: Option<i64>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
@@ -785,10 +785,31 @@ pub mod input {
     }
 }
 
+/// U12/U16: one typed action and coordinator entry for HTTP, named and MCP callers.
+async fn upgrade(cx: Cx, v: Value) -> Out {
+    let ask: input::UpdatesRetry = serde_json::from_value(v).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    if usize::from(ask.way.is_some()) + usize::from(ask.retry.is_some()) + usize::from(ask.rollback.is_some()) > 1 {
+        return Err((StatusCode::BAD_REQUEST, "choose only one of way, retry or rollback".to_owned()));
+    }
+    if ask.retry.as_deref().is_some_and(|id| id.trim().is_empty()) || ask.rollback.is_some_and(|id| id <= 0) {
+        return Err((StatusCode::BAD_REQUEST, "retry needs a job id; rollback needs a positive CD release id".to_owned()));
+    }
+    let result = match (ask.retry, ask.rollback) {
+        (Some(job), None) => crate::updates::coordinator::retry(&cx.hub, &ask.runner, &job, &cx.caller.name).await,
+        (None, Some(release)) => crate::updates::coordinator::rollback(&cx.hub, &ask.runner, release, &cx.caller.name).await,
+        _ => {
+            let way = ask.way.map(|way| match way { input::RunnersRepairWay::Download => crate::updates::Way::Download, input::RunnersRepairWay::Build => crate::updates::Way::Build });
+            crate::updates::upgrade_runner_as(&cx.hub, &ask.runner, way, &cx.caller.name).await
+        }
+    };
+    let job = result.map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
+    Ok(json!({"ok": true, "action": "retry-upgrade", "job": job}))
+}
+
 async fn set_policy(cx: Cx, v: Value) -> Out {
     let name = runner_of(&v)?;
     let p: crate::updates::Policy = serde_json::from_value(json!(text(&v, "policy")?)).map_err(|_| (StatusCode::BAD_REQUEST, "`policy` is auto, notify or off".to_owned()))?;
-    crate::updates::set_policy(&cx.hub, &name, p).await.map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
+    crate::updates::apply_policies(&cx.hub, std::slice::from_ref(&name), p, &cx.caller.name).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     Ok(json!({"runner": name, "policy": p}))
 }
 

@@ -1425,6 +1425,17 @@ pub async fn set_policy(hub: &Hub, machine: &str, p: Policy) -> anyhow::Result<(
     if p == Policy::default() { hub.store.kv_delete(policy_key(machine)).await } else { hub.store.kv_set(policy_key(machine), p.as_str().to_owned()).await }
 }
 
+/// U12: policy transports share persistence, caller evidence and fleet/viewer refresh.
+pub(crate) async fn apply_policies(hub: &Hub, names: &[String], policy: Policy, by: &str) -> anyhow::Result<()> {
+    for name in names {
+        set_policy(hub, name, policy).await?;
+    }
+    hub.store.audit(by.to_owned(), "upgrade.policy".into(), format!("updates {} for {}", policy.as_str(), names.join(", "))).await;
+    hub.emit(&crate::wire::events::ServerEvent::Updates);
+    hub.updates.fleet.wake();
+    Ok(())
+}
+
 /// How long kiln waits on a runner's upgrade before it calls it failed: `[updates]` in kiln.toml,
 /// unless changed in System → Updates. A change applies to upgrades under way too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -1635,11 +1646,16 @@ pub async fn runners(hub: &Arc<Hub>) -> Vec<RunnerInfo> {
 /// held back by the wait between automatic tries. With no newest known (a server built without
 /// knowing its commit), to the build kiln has for its platform. Nothing it runs is stopped.
 pub async fn upgrade_runner(hub: &Arc<Hub>, machine: &str, way: Option<Way>) -> anyhow::Result<Job> {
+    upgrade_runner_as(hub, machine, way, "admin").await
+}
+
+/// U12: keep the authenticated operation's caller in the existing lifecycle coordinator.
+pub(crate) async fn upgrade_runner_as(hub: &Arc<Hub>, machine: &str, way: Option<Way>, by: &str) -> anyhow::Result<Job> {
     let r = runners(hub).await.into_iter().find(|r| r.name == machine).ok_or_else(|| anyhow::anyhow!("there is no runner called {machine}"))?;
     let commit = hub.updates.fleet.target().map(|t| t.commit).or_else(|| (!crate::api::COMMIT.is_empty()).then(|| crate::api::COMMIT.to_owned()))
         .ok_or_else(|| anyhow::anyhow!("the release commit is unknown; choose a versioned CI release before upgrading"))?;
     let _ = way; // U16: both historical choices now use the canonical CI build.
-    coordinator::request(hub, &r, &commit, "admin", None).await
+    coordinator::request(hub, &r, &commit, by, None).await
 }
 
 /// Start upgrading `r` to binary `b` (`by`: who asked, for the audit log). Nothing it runs is

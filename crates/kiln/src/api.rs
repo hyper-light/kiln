@@ -264,7 +264,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::POST, ["api", "ops", name]) => {
             let Some(caller) = boxed(|| caller_of(&hub, req.headers())).await else { return Err(err(StatusCode::UNAUTHORIZED, "authentication required")) };
             let name = (*name).to_owned();
-            let input: serde_json::Value = boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.unwrap_or(serde_json::Value::Null);
+            let input: serde_json::Value = boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("the body is not JSON: {e:#}")))?;
             let cx = crate::ops::Cx { hub: Arc::clone(&hub), caller };
             return boxed(|| crate::ops::call(cx, &name, input)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(c, m)| err(c, m));
         }
@@ -620,9 +620,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::GET, ["api", "updates", "runners"]) => Ok(srv::json(StatusCode::OK, &boxed(|| crate::doctor::updates_for(&hub, &caller)).await)),
         (&Method::POST, ["api", "updates", "runners"]) => Ok(boxed(|| upgrade_all_runners(&hub)).await),
         (&Method::POST, ["api", "updates", "build"]) => boxed(|| build_every_platform(&hub)).await,
-        (&Method::POST, ["api", "updates", "runners", name]) => boxed(|| upgrade_runner(&hub, name, req)).await,
-        (&Method::PUT, ["api", "updates", "runners", name]) => boxed(|| set_runner_policy(&hub, name, req)).await,
-        (&Method::PUT, ["api", "updates", "policy"]) => boxed(|| set_policies(&hub, req)).await,
+        (&Method::PUT, ["api", "updates", "policy"]) => boxed(|| set_policies(&hub, &caller, req)).await,
         (&Method::PUT, ["api", "updates", "waits"]) => boxed(|| set_waits(&hub, req)).await,
         (&Method::DELETE, ["api", "updates", "waits"]) => boxed(|| reset_waits(&hub)).await,
         (&Method::GET, ["api", "updates", "skew"]) => Ok(srv::json(StatusCode::OK, &boxed(|| skew_view(&hub)).await)),
@@ -3630,53 +3628,6 @@ async fn build_every_platform(hub: &Hub) -> R {
     Ok(srv::json(StatusCode::ACCEPTED, &run))
 }
 
-/// `POST /api/updates/runners/{name}`: upgrade that machine's runner (nothing it runs stops).
-#[derive(Deserialize, Default)]
-struct RunnerUpgrade {
-    /// Historical choices both consume canonical CI artifacts (U16).
-    #[serde(default)]
-    way: Option<crate::updates::Way>,
-    /// Retry the failed lifecycle job with its original commit and pinned artifact.
-    #[serde(default)]
-    retry: Option<String>,
-    /// Deploy the retained artifact of this runner's successful CD release.
-    #[serde(default)]
-    rollback: Option<i64>,
-}
-
-impl RunnerUpgrade {
-    async fn start(self, hub: &Arc<Hub>, name: &str) -> R {
-        // U16: an explicit selector cannot be silently replaced by another action.
-        if usize::from(self.way.is_some()) + usize::from(self.retry.is_some()) + usize::from(self.rollback.is_some()) > 1 {
-            return Err(err(StatusCode::BAD_REQUEST, "choose only one of way, retry or rollback"));
-        }
-        if self.retry.as_deref().is_some_and(|id| id.trim().is_empty()) || self.rollback.is_some_and(|id| id <= 0) {
-            return Err(err(StatusCode::BAD_REQUEST, "retry needs a job id; rollback needs a positive CD release id"));
-        }
-        let result = match (self.retry, self.rollback) {
-            (Some(job), None) => crate::updates::coordinator::retry(hub, name, &job, "admin").await,
-            (None, Some(release)) => crate::updates::coordinator::rollback(hub, name, release, "admin").await,
-            _ => crate::updates::upgrade_runner(hub, name, self.way).await,
-        };
-        match result {
-            Ok(job) => Ok(srv::json(StatusCode::ACCEPTED, &job)),
-            Err(e) => Err(err(StatusCode::CONFLICT, format!("{e:#}"))),
-        }
-    }
-}
-
-/// U16: `POST /api/updates/runners/{name}` accepts a historical `way`, a failed job's `retry`
-/// id, or a successful CD release's `rollback` id. All enter the same persisted coordinator.
-async fn upgrade_runner(hub: &Arc<Hub>, name: &str, req: Request) -> R {
-    let bytes = srv::body_bytes(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    let b: RunnerUpgrade = if bytes.iter().all(u8::is_ascii_whitespace) {
-        RunnerUpgrade::default()
-    } else {
-        serde_json::from_slice(&bytes).map_err(|e| err(StatusCode::BAD_REQUEST, format!("the body isn't an upgrade: {e}")))?
-    };
-    b.start(hub, name).await
-}
-
 /// `PUT` (the body's rules) or `DELETE` (none: the scope above's apply) the rules for the copies of
 /// runners' trees other runners keep, `whose` (docs/reach.md §5.1). Runners have them within
 /// 20 seconds.
@@ -3707,18 +3658,6 @@ async fn keep_now(hub: &Arc<Hub>, caller: &crate::authz::Caller, runner: Option<
 }
 
 #[derive(Deserialize)]
-struct RunnerPolicy {
-    policy: crate::updates::Policy,
-}
-
-/// `PUT /api/updates/runners/{name}` `{"policy": "auto" | "notify" | "off"}`: what that machine's
-/// runner does with a newer kiln (Notify unless chosen otherwise).
-async fn set_runner_policy(hub: &Arc<Hub>, name: &str, req: Request) -> R {
-    let b: RunnerPolicy = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    apply_policy(hub, &[name.to_owned()], b.policy).await
-}
-
-#[derive(Deserialize)]
 struct Policies {
     policy: crate::updates::Policy,
     /// These runners; or every one, with `all`.
@@ -3730,23 +3669,13 @@ struct Policies {
 
 /// `PUT /api/updates/policy` `{"policy": "off", "runners": ["a", "b"]}` (or `"all": true`): the same
 /// update policy for any number of runners at once.
-async fn set_policies(hub: &Arc<Hub>, req: Request) -> R {
+async fn set_policies(hub: &Arc<Hub>, caller: &crate::authz::Caller, req: Request) -> R {
     let b: Policies = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let names = if b.all { crate::updates::runners(hub).await.into_iter().map(|r| r.name).collect() } else { b.runners };
     if names.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "name the runners, or say all"));
     }
-    apply_policy(hub, &names, b.policy).await
-}
-
-async fn apply_policy(hub: &Arc<Hub>, names: &[String], policy: crate::updates::Policy) -> R {
-    for name in names {
-        crate::updates::set_policy(hub, name, policy).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
-    }
-    hub.store.audit("admin".into(), "upgrade.policy".into(), format!("updates {} for {}", policy.as_str(), names.join(", "))).await;
-    hub.emit(&crate::wire::events::ServerEvent::Updates);
-    // Its gauges at once, and an automatic one brought up to date.
-    hub.updates.fleet.wake();
+    crate::updates::apply_policies(hub, &names, b.policy, &caller.name).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     Ok(srv::status(StatusCode::NO_CONTENT))
 }
 
@@ -5481,19 +5410,84 @@ mod tests {
     fn u16_upgrade_api_rejects_ambiguous_actions_and_dispatches_retry_and_rollback() -> anyhow::Result<()> {
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
-            for ask in [json!({"retry":"job", "rollback":1}), json!({"way":"build", "retry":"job"}), json!({"rollback":0}), json!({"retry":" "})] {
-                let b: RunnerUpgrade = serde_json::from_value(ask)?;
-                let Err(e) = b.start(&hub, "fixture").await else { anyhow::bail!("ambiguous upgrade action accepted") };
-                assert_eq!(e.0, StatusCode::BAD_REQUEST);
-            }
-            let b: RunnerUpgrade = serde_json::from_value(json!({"retry":"missing-job"}))?;
-            let Err(e) = b.start(&hub, "fixture").await else { anyhow::bail!("missing retry succeeded") };
-            assert_eq!(e.0, StatusCode::CONFLICT);
-            assert!(e.1.contains("no upgrade intent missing-job"), "retry reached lifecycle lookup: {}", e.1);
-            let b: RunnerUpgrade = serde_json::from_value(json!({"rollback":123}))?;
-            let Err(e) = b.start(&hub, "fixture").await else { anyhow::bail!("missing rollback succeeded") };
-            assert_eq!(e.0, StatusCode::CONFLICT);
-            assert!(e.1.contains("no CD release 123"), "rollback reached canonical CD lookup: {}", e.1);
+            let mut owner = crate::ops::Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
+            owner.caller.name = "u12-fixture-caller".to_owned();
+            // U12: actual incoming bodies cross the API parser, using this fixture's scratch hub.
+            let tcp = hyper_rt::tcp::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)), 16).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let address = tcp.local_addr().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let api = Arc::new(Api { hub: Arc::clone(&hub) });
+            // The client opens one connection per request. Owning both futures here closes the
+            // listener/current connection even when a check fails; no server task is detached.
+            let serving = async move {
+                for _ in 0..15 {
+                    let stream = crate::rt::timeout(std::time::Duration::from_secs(30), tcp.accept()).await??;
+                    let remote = stream.peer_addr().ok();
+                    crate::rt::timeout(std::time::Duration::from_secs(30), srv::serve_connection(crate::http::io::RtIo::new(stream), Arc::clone(&api), remote)).await?;
+                }
+                Ok::<(), anyhow::Error>(())
+            };
+            let checking = async {
+                let client = crate::http::client::Client::public()?;
+                let base = format!("http://{address}");
+                for ask in [json!({"retry":"job", "rollback":1}), json!({"way":"build", "retry":"job"}), json!({"rollback":0}), json!({"retry":" "}), json!({"rollbackk":123})] {
+                    let response = client.post(&format!("{base}/api/updates/runners/fixture")).bearer(&hub.admin_token).json(&ask).send().await?;
+                    assert_eq!(response.status(), 400, "ambiguous or unknown selector reached no upgrade");
+                    let _ = response.bytes(JSON_LIMIT).await?;
+                    let mut named = ask;
+                    named.as_object_mut().ok_or_else(|| anyhow::anyhow!("upgrade input"))?.insert("runner".to_owned(), json!("fixture"));
+                    let Err((code, _)) = crate::ops::call(owner.clone(), "updates.retry", named).await else { anyhow::bail!("ambiguous upgrade action accepted") };
+                    assert_eq!(code, StatusCode::BAD_REQUEST);
+                }
+                for (ask, why) in [(json!({"retry":"missing-job"}), "no upgrade intent missing-job"), (json!({"rollback":123}), "no CD release 123")] {
+                    let response = client.post(&format!("{base}/api/updates/runners/fixture")).bearer(&hub.admin_token).json(&ask).send().await?;
+                    assert_eq!(response.status(), 409);
+                    let body: serde_json::Value = response.json(JSON_LIMIT).await?;
+                    assert!(body.get("error").and_then(serde_json::Value::as_str).is_some_and(|e| e.contains(why)), "HTTP reached canonical lookup: {body}");
+                    let mut named = ask;
+                    named.as_object_mut().ok_or_else(|| anyhow::anyhow!("upgrade input"))?.insert("runner".to_owned(), json!("fixture"));
+                    let Err((code, message)) = crate::ops::call(owner.clone(), "updates.retry", named).await else { anyhow::bail!("missing upgrade source succeeded") };
+                    assert_eq!(code, StatusCode::CONFLICT);
+                    assert!(message.contains(why), "named reached canonical lookup: {message}");
+                }
+                for (body, status, why) in [("", 409, "there is no runner called fixture"), (" \r\n", 409, "there is no runner called fixture"), ("null", 400, "the request is a JSON object")] {
+                    let response = client.post(&format!("{base}/api/updates/runners/fixture")).bearer(&hub.admin_token).body(body.to_owned()).send().await?;
+                    assert_eq!(response.status(), status, "legacy empty input keeps its meaning; null is not an upgrade object");
+                    let body: serde_json::Value = response.json(JSON_LIMIT).await?;
+                    assert!(body.get("error").and_then(serde_json::Value::as_str).is_some_and(|e| e.contains(why)), "{body}");
+                }
+                assert!(hub.updates.jobs().is_empty(), "all refused selectors leave no admitted upgrade");
+                // Invalid named HTTP JSON used to become {}, reaching this real zero-input mutator.
+                for route in ["api/ops/ci.oidc.rotate", "api/ci/oidc/rotate"] {
+                    let response = client.post(&format!("{base}/{route}")).bearer(&hub.admin_token).body("{".to_owned()).send().await?;
+                    assert_eq!(response.status(), 400, "invalid JSON must not rotate an OIDC key");
+                    let _ = response.bytes(JSON_LIMIT).await?;
+                }
+                let (_, token) = crate::authz::tokens::mint_agent(&hub, "u12-reader", "owner", &["runs.read"], None, "U12 refusal parity").await?;
+                let denied = crate::authz::gate::caller(&hub, Some(&token), None).await.ok_or_else(|| anyhow::anyhow!("denied caller"))?;
+                let response = client.post(&format!("{base}/api/ops/ci.oidc.rotate")).bearer(&token).json(&json!({})).send().await?;
+                assert_eq!(response.status(), 403);
+                let _ = response.bytes(JSON_LIMIT).await?;
+                assert!(matches!(crate::ops::call(crate::ops::Cx { hub: Arc::clone(&hub), caller: denied }, "ci.oidc.rotate", json!({})).await, Err((StatusCode::FORBIDDEN, _))));
+                let keys: i64 = hub.store.call(|c| Ok(c.query_row("SELECT count(*) FROM oidc_keys", [], |r| r.get(0))?)).await?;
+                assert_eq!(keys, 0, "malformed and denied requests made no key");
+                let response = client.post(&format!("{base}/api/ops/ci.oidc.rotate")).bearer(&hub.admin_token).body("null".to_owned()).send().await?;
+                assert_eq!(response.status(), 200, "explicit null retains the named operation's empty-input meaning");
+                let _ = response.bytes(JSON_LIMIT).await?;
+                let keys: i64 = hub.store.call(|c| Ok(c.query_row("SELECT count(*) FROM oidc_keys", [], |r| r.get(0))?)).await?;
+                assert!(keys > 0, "a valid request reaches the actual key mutation");
+                let mut events = hub.events.subscribe();
+                let response = client.put(&format!("{base}/api/updates/runners/fixture")).bearer(&hub.admin_token).json(&json!({"policy":"off"})).send().await?;
+                assert_eq!(response.status(), 204, "HTTP policy keeps its empty reply");
+                let _ = response.bytes(JSON_LIMIT).await?;
+                assert_eq!(crate::updates::policy(&hub, "fixture").await, crate::updates::Policy::Off);
+                assert_eq!(crate::rt::timeout(std::time::Duration::from_secs(5), events.recv()).await??.as_ref(), crate::wire::events::ServerEvent::Updates.text());
+                let policy = crate::ops::call(owner, "updates.policy", json!({"runner":"fixture", "policy":"notify"})).await.map_err(|(_, e)| anyhow::anyhow!(e))?;
+                assert_eq!(policy, json!({"runner":"fixture", "policy":"notify"}), "named policy keeps its JSON reply");
+                assert_eq!(crate::updates::policy(&hub, "fixture").await, crate::updates::Policy::Notify);
+                assert_eq!(crate::rt::timeout(std::time::Duration::from_secs(5), events.recv()).await??.as_ref(), crate::wire::events::ServerEvent::Updates.text());
+                Ok::<(), anyhow::Error>(())
+            };
+            futures::try_join!(serving, checking)?;
             Ok(())
         })
     }
