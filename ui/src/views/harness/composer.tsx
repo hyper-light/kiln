@@ -24,6 +24,7 @@ import { MicButton } from "./voice";
 import { modelLabel } from "./derive";
 import { useDraft, useHeld, useSendMode, type Held } from "./state";
 import { stopperOf, subagentPlaceholder, takesMessages } from "./tasks";
+import { notShown } from "./queue-shown";
 
 export const MODES: { id: SendMode; label: string; hint: string; feature?: string }[] = [
   { id: "queue", label: "Queue", hint: "Sent when it finishes what it's doing" },
@@ -427,7 +428,8 @@ export function Composer({
   const sub = useSession(store, (s) => (task ? s.state?.tasks.find((t) => t.id === task || t.tool_id === task) : undefined));
   const subTakes = sub?.takes ?? NO_MODES;
   const toSub = takesMessages(sub) ? sub : undefined;
-  const shownQueue = toSub ? (toSub.queue ?? NO_QUEUE) : queue;
+  const delivery = useSession(store, (s) => s.state?.delivery);
+  const shownQueue = React.useMemo(() => notShown(toSub ? (toSub.queue ?? NO_QUEUE) : queue, delivery), [toSub, queue, delivery]);
   const [suggest, setSuggest] = React.useState<{ kind: "/" | "@"; items: { label: string; hint?: string }[]; index: number } | null>(null);
   const ta = React.useRef<HTMLTextAreaElement | null>(null);
   // Where the caret is, as the field last said; null: at the end (text put in, not typed).

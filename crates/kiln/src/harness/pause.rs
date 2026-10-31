@@ -485,13 +485,17 @@ fn step_under_way(core: &Core) -> bool {
 
 /// A command on its way to the harness: a message sent while the session is paused (or at its
 /// stop point), or while there's no room on its machine for it to go to work (`Core::has_room`),
-/// joins the queue instead (None); anything else goes on.
+/// or one to go in turn while the queue holds others, joins the queue instead (None); anything
+/// else goes on.
 pub fn let_through(core: &mut Core, c: Command) -> Option<Command> {
-    if !matches!(c, Command::Send { .. }) || (!at_threshold(core) && core.has_room()) {
+    // Behind what kiln's queue holds (held for a harness that has since ended, CP-T3.2, or
+    // waiting for the turn under way), a message to go in turn waits too: never ahead of them.
+    let behind = matches!(&c, Command::Send { mode: super::model::SendMode::Queue, task: None, .. }) && !core.state.queue.is_empty();
+    if !matches!(c, Command::Send { .. }) || (!behind && !at_threshold(core) && core.has_room()) {
         return Some(c);
     }
-    if let Command::Send { id, text, attachments, overrides, task, .. } = c {
-        let m = QueueItem { id, text, at: Core::now(), attachments, overrides, reply_to: None };
+    if let Command::Send { id, text, attachments, overrides, reply_to, task, .. } = c {
+        let m = QueueItem { id, text, at: Core::now(), attachments, overrides, reply_to };
         match task {
             // One for a subagent waits in its queue, for when the pause ends.
             Some(task) if core.state.tasks.iter().any(|t| t.id == task && t.takes.contains(&super::model::SendMode::Queue)) => {
@@ -660,9 +664,34 @@ mod tests {
         room.store(true, Ordering::SeqCst);
         assert!(open(&mut core), "room: its queue goes");
         assert_eq!(core.state.room_wait, None);
-        assert!(let_through(&mut core, send("m2")).is_some());
+        assert!(let_through(&mut core, send("m2")).is_none(), "in turn, behind m1");
+        assert_eq!(core.state.queue.iter().map(|q| q.id.as_str()).collect::<Vec<_>>(), ["m1", "m2"]);
+        // Its harness took them: the next goes on.
+        core.state.queue.clear();
+        assert!(let_through(&mut core, send("m3")).is_some());
         // A core of no machine's has room.
         assert!(open(&mut Core::new()));
+    }
+
+    /// CP-T3.2: what kiln's queue holds (a message held for a harness that has since ended, one
+    /// waiting for the turn under way) goes first. A message to go in turn waits behind it, its
+    /// reply with it, never ahead (a harness starting again takes kiln's queue once it's ready,
+    /// and would have taken that one first); one steered or sent now, or one for a subagent, goes
+    /// on as it was asked to.
+    #[test]
+    fn a_message_to_go_in_turn_waits_behind_what_kiln_s_queue_holds() {
+        use crate::harness::model::SendMode;
+        let send = |id: &str, mode: SendMode, task: Option<&str>| Command::Send { id: id.into(), text: "and this".into(), mode, attachments: Vec::new(), overrides: None, reply_to: Some("e7".into()), task: task.map(str::to_owned) };
+        let mut core = Core::new();
+        assert!(let_through(&mut core, send("m1", SendMode::Queue, None)).is_some(), "nothing waits: it goes on");
+        core.state.queue.push(QueueItem { id: "held".into(), text: "Plans and Research, one tab each".into(), at: 1, attachments: Vec::new(), overrides: None, reply_to: None });
+        assert!(let_through(&mut core, send("m2", SendMode::Queue, None)).is_none());
+        assert_eq!(core.state.queue.iter().map(|q| (q.id.as_str(), q.reply_to.as_deref())).collect::<Vec<_>>(), [("held", None), ("m2", Some("e7"))]);
+        for mode in [SendMode::Steer, SendMode::Now] {
+            assert!(let_through(&mut core, send("m3", mode, None)).is_some(), "{mode:?} goes on");
+        }
+        assert!(let_through(&mut core, send("m4", SendMode::Queue, Some("t1"))).is_some(), "a subagent's isn't kiln's queue's");
+        assert_eq!(core.state.queue.len(), 2);
     }
 
     #[test]

@@ -959,6 +959,12 @@ impl Acp {
         !self.waiting.is_empty()
     }
 
+    /// What it held for its session, in order, out of its hands: the agent never got any of it,
+    /// and its process is gone (`Adapter::let_go`).
+    pub fn take_held(&mut self) -> Vec<QueueItem> {
+        std::mem::take(&mut self.waiting)
+    }
+
     /// A pause ended: the turn it cut off goes on first, then kiln's queue.
     pub fn go_on(&mut self, core: &mut Core, p: super::model::Pause) {
         if p.cut.is_some() && !self.busy(core) && core.state.status != Status::Exited {

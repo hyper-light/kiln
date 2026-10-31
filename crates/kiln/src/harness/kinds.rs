@@ -403,6 +403,7 @@ impl Adapter {
     }
 
     pub fn command(&mut self, core: &mut Core, c: Command) {
+        core.shown_queued(&c);
         // A message waiting for one of its subagents is changed where it waits, or goes to it now.
         match super::subagent::queue_command(core, c) {
             super::subagent::Queued::Done => {}
@@ -475,6 +476,28 @@ impl Adapter {
         // (a switch, a stop, a restart or a crash), its subagents' and shells' calls with it.
         core.end_harness_work();
         self.settle_subagents(core);
+        self.let_go(core);
+    }
+
+    /// Its process is gone, and this adapter goes with it (it ended, was stopped, or starts again,
+    /// in this harness or another: a switch, a move, a rewind, a setting): no message it was given
+    /// is lost or left on its way (CP-T3.2). What it held for its harness, which never got it (sent
+    /// as Codex or an ACP agent started, or to go first as a turn stopped), goes first in kiln's
+    /// queue, in order, still shown queued: the next process takes it, whichever harness that is.
+    /// One a rewind took out of the conversation goes with it. What its harness was handed and
+    /// never finished ends dropped (`Core::drop_unfinished`).
+    pub fn let_go(&mut self, core: &mut Core) {
+        let held = match self {
+            Self::Codex(a) => a.take_held(),
+            Self::Acp(a) => a.take_held(),
+            Self::Claude(_) | Self::Agy(_) => Vec::new(),
+        };
+        let held: Vec<QueueItem> = held.into_iter().filter(|m| core.get(&m.id).is_some()).collect();
+        if !held.is_empty() {
+            core.state.queue.splice(0..0, held);
+            core.touch_state();
+        }
+        core.drop_unfinished(false);
     }
 
     /// A run (`Effect::Run` or `Effect::Fetch`) ended: its exit code (None: it could not start
@@ -1040,5 +1063,157 @@ mod tests {
         assert!(core.state.tasks.iter().filter(|t| t.id != "left-77").all(|t| !t.live()));
         assert!(core.get("exec-3").is_some_and(|e| matches!(&e.body, Body::Tool(t) if t.status == ToolStatus::Cancelled)));
         assert_eq!(core.state.tasks.iter().find(|t| t.id == "left-77").map(|t| t.status.as_str()), Some("running"), "kiln's own, taken back over");
+    }
+
+    fn message(id: &str, text: &str) -> Command {
+        Command::Send { id: id.into(), text: text.into(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None }
+    }
+
+    /// The ids of the user messages kiln wrote its harness since the last look (Claude Code's
+    /// `uuid`), and the id of its request `subtype` among what it wrote.
+    fn wrote(core: &mut Core, subtype: &str) -> (Vec<String>, Option<serde_json::Value>) {
+        let lines: Vec<serde_json::Value> = core.take_writes().iter().filter_map(|w| serde_json::from_str(w).ok()).collect();
+        let users = lines.iter().filter(|v| v.get("type").and_then(serde_json::Value::as_str) == Some("user")).filter_map(|v| v.get("uuid").and_then(serde_json::Value::as_str).map(str::to_owned)).collect();
+        let asked = lines.iter().find(|v| v.pointer("/request/subtype").and_then(serde_json::Value::as_str) == Some(subtype)).and_then(|v| v.get("request_id").cloned());
+        (users, asked)
+    }
+
+    fn queue(core: &Core) -> Vec<&str> {
+        core.state.queue.iter().map(|q| q.id.as_str()).collect()
+    }
+
+    /// The "Tabs UI" agent's first message (2026-10-31), sent as Codex started: Codex's adapter held
+    /// it for the thread to open, shown queued by the agent. The switch to Claude Code went at once
+    /// (nothing was under way) and ended Codex's process, its adapter with it: the message was
+    /// never sent anywhere, and said queued for good. Now a harness's process ending lets go of what
+    /// its adapter held: first in kiln's queue, still shown queued where it was said, the harness
+    /// after it takes it once it's up, and the rest after it in order (CP-T3.2).
+    #[test]
+    fn a_message_held_for_a_harness_that_ends_goes_to_the_one_after_it() {
+        use super::super::model::{Delivery, Status};
+        let mut core = Core::new();
+        let mut codex = Adapter::Codex(Box::new(Codex::new(None, None, None, false)));
+        codex.start(&mut core);
+        codex.command(&mut core, message("m1", "Plans and Research, one tab each"));
+        codex.command(&mut core, message("m2", "Research searchable, its results as cards"));
+        assert_eq!([core.state.delivery.get("m1"), core.state.delivery.get("m2")], [Some(&Delivery::Queued); 2]);
+        let said = core.get("m1").map(|e| e.seq);
+        assert!(said.is_some() && core.state.queue.is_empty(), "held by Codex's adapter, shown");
+        // The switch: Codex's process ends.
+        codex.exited(&mut core, None, None);
+        assert_eq!(queue(&core), ["m1", "m2"]);
+        assert_eq!([core.state.delivery.get("m1"), core.state.delivery.get("m2")], [Some(&Delivery::Queued); 2], "still shown queued");
+        // Claude Code, once up, takes the first; the next once that's done.
+        core.state.exit = None;
+        core.set_status(Status::Starting);
+        let mut claude = Adapter::Claude(Box::new(Claude::new(false)));
+        claude.start(&mut core);
+        let (_, init) = wrote(&mut core, "initialize");
+        claude.line(&mut core, &serde_json::json!({"type": "control_response", "response": {"subtype": "success", "request_id": init, "response": {}}}).to_string());
+        assert_eq!(wrote(&mut core, "").0, ["m1"]);
+        assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Sent));
+        assert_eq!(core.get("m1").map(|e| e.seq), said, "where it was said");
+        assert_eq!(queue(&core), ["m2"]);
+        for line in [
+            r#"{"type":"command_lifecycle","command_uuid":"m1","state":"started","uuid":"x","session_id":"s"}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"Two designs.","stop_reason":"end_turn","session_id":"s"}"#,
+            r#"{"type":"command_lifecycle","command_uuid":"m1","state":"completed","uuid":"y","session_id":"s"}"#,
+        ] {
+            claude.line(&mut core, line);
+        }
+        assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Completed));
+        assert_eq!(wrote(&mut core, "").0, ["m2"]);
+        assert!(core.state.queue.is_empty());
+    }
+
+    /// An ACP agent (Devin, Gemini) holds a message till its session opens, as Codex does till its
+    /// thread does: one that ends first (it can't sign in, and is switched out of) lets go of it
+    /// the same way.
+    #[test]
+    fn an_acp_agent_that_ends_before_its_session_opens_lets_go_of_what_it_held() {
+        use super::super::model::Delivery;
+        let mut core = Core::new();
+        let mut acp = Adapter::Acp(Box::new(Acp::new(None)));
+        acp.start(&mut core);
+        acp.command(&mut core, message("m1", "Plans and Research, one tab each"));
+        assert_eq!((core.state.delivery.get("m1"), queue(&core).len()), (Some(&Delivery::Queued), 0));
+        acp.exited(&mut core, Some(1), Some("not signed in".into()));
+        assert_eq!(queue(&core), ["m1"]);
+        assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Queued));
+    }
+
+    /// CP-T3.2: its process gone, what its harness was handed and never finished (sent, in its own
+    /// queue, under way) ends dropped, never on its way for good; it may have run, so it isn't sent
+    /// again. What waits in kiln's queue or a subagent's still goes, and what ended stays as it
+    /// ended. The agent ended, nothing that waited goes either.
+    #[test]
+    fn what_a_harness_never_finished_ends_dropped_with_its_process() {
+        use super::super::model::{Delivery, Task};
+        let item = |id: &str| QueueItem { id: id.into(), text: "next".into(), at: 1, attachments: Vec::new(), overrides: None, reply_to: None };
+        let mut core = Core::new();
+        let all = [("sent", Delivery::Sent), ("its-queue", Delivery::Queued), ("under-way", Delivery::Started), ("done", Delivery::Completed), ("unsent", Delivery::Cancelled), ("kiln-queue", Delivery::Queued), ("sub-queue", Delivery::Queued)];
+        core.state.delivery = all.into_iter().map(|(id, d)| (id.to_owned(), d)).collect();
+        core.state.queue.push(item("kiln-queue"));
+        core.state.tasks.push(Task { id: "t1".into(), queue: vec![item("sub-queue")], ..Task::default() });
+        core.drop_unfinished(false);
+        let now = |core: &Core| all.map(|(id, _)| core.state.delivery.get(id).copied());
+        use Delivery::{Cancelled, Completed, Queued};
+        assert_eq!(now(&core), [Some(Cancelled), Some(Cancelled), Some(Cancelled), Some(Completed), Some(Cancelled), Some(Queued), Some(Queued)]);
+        core.drop_unfinished(true);
+        assert_eq!(now(&core), [Some(Cancelled), Some(Cancelled), Some(Cancelled), Some(Completed), Some(Cancelled), Some(Cancelled), Some(Cancelled)]);
+    }
+
+    /// CP-T3.2: Claude Code's process ends (a crash, a stop by force) while it works on a message:
+    /// that message ends dropped, never "being worked on" for good, and one waiting in kiln's
+    /// queue behind it goes to the process after it.
+    #[test]
+    fn a_message_under_way_when_its_harness_ends_is_dropped_and_the_next_still_goes() {
+        use super::super::model::{Delivery, Status};
+        let mut core = Core::new();
+        let mut claude = Adapter::Claude(Box::new(Claude::new(false)));
+        claude.start(&mut core);
+        let (_, init) = wrote(&mut core, "initialize");
+        claude.line(&mut core, &serde_json::json!({"type": "control_response", "response": {"subtype": "success", "request_id": init, "response": {}}}).to_string());
+        claude.command(&mut core, message("m1", "Plans and Research, one tab each"));
+        claude.line(&mut core, r#"{"type":"command_lifecycle","command_uuid":"m1","state":"started","uuid":"x","session_id":"s"}"#);
+        claude.command(&mut core, message("m2", "and a search"));
+        assert_eq!((core.state.delivery.get("m1"), queue(&core)), (Some(&Delivery::Started), vec!["m2"]));
+        claude.exited(&mut core, Some(137), None);
+        assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Cancelled));
+        assert_eq!(queue(&core), ["m2"]);
+        core.state.exit = None;
+        core.set_status(Status::Starting);
+        let mut again = Adapter::Claude(Box::new(Claude::new(false)));
+        again.start(&mut core);
+        let (_, init) = wrote(&mut core, "initialize");
+        again.line(&mut core, &serde_json::json!({"type": "control_response", "response": {"subtype": "success", "request_id": init, "response": {}}}).to_string());
+        assert_eq!(wrote(&mut core, "").0, ["m2"]);
+    }
+
+    /// A message held for a harness that ended waits in kiln's queue, shown queued where it was
+    /// said, and that's where its Edit and Unsend reach it: changed, the conversation says its new
+    /// words before it goes; taken back, it says it was dropped, never queued for good. One its
+    /// harness's adapter still holds is out of their reach, as before (`unsend.ts`).
+    #[test]
+    fn a_message_shown_waiting_in_kiln_s_queue_is_changed_and_taken_back_there() {
+        use super::super::model::{Body, Delivery};
+        let mut core = Core::new();
+        let mut codex = Adapter::Codex(Box::new(Codex::new(None, None, None, false)));
+        codex.start(&mut core);
+        codex.command(&mut core, message("m1", "Plans"));
+        codex.command(&mut core, message("m2", "Research"));
+        codex.command(&mut core, Command::QueueRemove { id: "m2".into() });
+        assert_eq!(core.state.delivery.get("m2"), Some(&Delivery::Queued), "its adapter's: out of reach");
+        codex.exited(&mut core, None, None);
+        codex.command(&mut core, Command::QueueEdit { id: "m1".into(), text: "Plans, one tab".into(), attachments: None });
+        let shown = |core: &Core, id: &str| match core.get(id).map(|e| &e.body) {
+            Some(Body::User { text, .. }) => text.clone(),
+            _ => String::new(),
+        };
+        assert_eq!((shown(&core, "m1").as_str(), core.state.queue.first().map(|q| q.text.as_str())), ("Plans, one tab", Some("Plans, one tab")));
+        codex.command(&mut core, Command::QueueRemove { id: "m2".into() });
+        assert_eq!(queue(&core), ["m1"]);
+        assert_eq!(core.state.delivery.get("m2"), Some(&Delivery::Cancelled));
+        assert_eq!(shown(&core, "m2"), "Research", "still where it was said");
     }
 }

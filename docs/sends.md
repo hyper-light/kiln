@@ -108,6 +108,18 @@ started again with them before then (a handover's fence, unlike a move's, is lif
 unreadable as a session is handed over, the session takes the ids it holds itself: its queue's, its
 timeline's, and those it brought and hasn't taken in.
 
+**A harness that ends.** An ACP or Codex adapter holds a message its harness can't take yet (sent as
+the harness started, or to go first as a turn stops), and the conversation shows it queued. Whatever
+ends the harness's process (a switch to another harness, a move, a stop, a crash, a start again for
+a rewind or a setting, an upgrade that can't hand it over), what its adapter held goes first in
+kiln's queue, in order, still shown queued where it was said, and the next process takes it,
+whichever harness that is (`Adapter::let_go`). Until it does, the conversation's Edit and Unsend
+reach it there, and the queue above the composer doesn't list it again. A message to go in turn
+waits behind what kiln's queue holds, sent while the harness runs or starts or while the agent is
+stopped (what's open, below, says when it doesn't). What the harness was handed and never finished
+ends dropped, never left on its way; and when the agent ends, so does what still waited to go.
+Before, a switch out of a Codex still starting lost the message, which said queued for good.
+
 **One runner a machine.** A session an older runner process hands to its machine's newest
 (docs/releases.md, "One runner a machine") goes as a move does: it takes no messages as it's handed
 over, its inbox's newest ids go with it (the newest process keeps an inbox of its own, in its own
@@ -391,7 +403,14 @@ host's.
   and sends nothing: sent again under an id of its own, it was a second prompt (the twentieth
   adversarial check's; `ui/src/views/harness/unsend.ts`). Taking such a message back, where its
   harness allows, is to come; an unsend that does take one back must let its id go for Undo to send
-  it again.
+  it again. Once the adapter's harness has ended, what it held waits in kiln's queue (above, "A
+  harness that ends"), and an unsend takes it back there: the conversation says it was dropped, and
+  Undo sends nothing.
+- **What a harness was handed when its process ended.** A message its harness was handed and never
+  finished (sent, in its own queue, under way) ends dropped: it may have run, so it isn't sent
+  again, and one that never reached it is the person's to send again (above, "A harness that ends").
+- **A message sent as a session arrives.** One sent while a session's files come in from the
+  machine it left goes to its harness as it starts there, ahead of the queue it brought.
 - **A goal's word withdrawn while its harness starts.** The goal driver takes a goal's word back
   (the goal ended, cleared or put back) with `queue_remove` too, which can't take back a word a
   starting Codex or ACP harness's adapter holds: that word still reaches the agent, once, and the
