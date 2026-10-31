@@ -899,6 +899,13 @@ async fn step(hub: &Arc<Hub>, repo: &Repo, trunk: &str) -> anyhow::Result<()> {
             return Ok(());
         }
         failures().lock().remove(&key);
+        // Signed as the queue that tested it (W27-R07): a land kiln can't sign stands, unsigned, and says so.
+        let carried: Vec<(String, String)> = testing.iter().flat_map(|e| e.diffs.iter().filter_map(|d| e.commits.get(d).map(|c| (d.clone(), c.clone())))).collect();
+        // This queue moves the trunk from the candidate's base to the candidate: never applied again.
+        let mv = super::lands::Moved { from: &base, to: &candidate, candidate: &candidate, base: &base, rebased: false };
+        if let Err(e) = Box::pin(super::lands::sign(hub, repo, trunk, &mv, &carried)).await {
+            tracing::warn!(repo = %repo.name, %trunk, %candidate, error = %format!("{e:#}"), "a land wasn't signed");
+        }
         landed(hub, repo, &path, trunk, &testing, &candidate).await?;
         return Ok(());
     }

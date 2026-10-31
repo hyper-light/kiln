@@ -216,6 +216,10 @@ impl Remote {
     /// The Fulcio and Rekor `[ci.attest]` names.
     fn configured(hub: &Hub) -> anyhow::Result<Self> {
         let c = &hub.cfg.ci.attest;
+        anyhow::ensure!(
+            c.rekor_api == crate::config::ci::RekorApi::V1,
+            "[ci.attest] rekor_api = \"v2\": keyless signing logs DSSE entries, which Rekor v2 doesn't take (it anchors the trail's checkpoints); sign keyless against a v1 Rekor"
+        );
         let fulcio = c.fulcio_url.as_deref().ok_or_else(|| anyhow::anyhow!("[ci.attest] signing = \"keyless\" needs fulcio_url"))?;
         let rekor = c.rekor_url.as_deref().ok_or_else(|| anyhow::anyhow!("[ci.attest] signing = \"keyless\" needs rekor_url"))?;
         Self::new(fulcio, rekor)
@@ -232,20 +236,170 @@ impl Remote {
         }
     }
 
-    /// One of Rekor's entries (`{uuid: entry}`), as the seam has it.
+    /// One of Rekor's entries (`{uuid: entry}`), as the seam has it: its proof of inclusion (hex,
+    /// as v1 writes it) and its promise from its `verification`.
     fn logged(v: &Value) -> Result<Logged, SigRefusal> {
         let (uuid, e) = v.as_object().and_then(|o| o.iter().next()).ok_or_else(|| SigRefusal::Unavailable(format!("Rekor's answer has no entry: {v}")))?;
+        let p = e.pointer("/verification/inclusionProof");
+        let num = |k: &str| p.and_then(|p| p.get(k)).and_then(Value::as_u64);
+        let proof = p.zip(num("logIndex")).zip(num("treeSize")).map(|((p, index), size)| Proof {
+            index,
+            size,
+            root: hex::decode(p.get("rootHash").and_then(Value::as_str).unwrap_or_default()).unwrap_or_default(),
+            hashes: p.get("hashes").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).filter_map(|h| hex::decode(h).ok()).collect(),
+            checkpoint: p.get("checkpoint").and_then(Value::as_str).unwrap_or_default().to_owned(),
+        });
         Ok(Logged {
             uuid: uuid.clone(),
             index: e.get("logIndex").and_then(Value::as_u64).unwrap_or_default(),
             integrated_time: e.get("integratedTime").and_then(Value::as_i64).unwrap_or_default(),
             body: e.get("body").and_then(Value::as_str).unwrap_or_default().to_owned(),
             answer: e.clone(),
+            proof,
+            promise: e.pointer("/verification/signedEntryTimestamp").and_then(Value::as_str).map(str::to_owned),
         })
     }
 }
 
-use kiln_seams::sigstore::{CertifyAsk, Certified, Logged, Refusal as SigRefusal};
+use kiln_seams::sigstore::{CertifyAsk, Certified, Logged, Proof, Refusal as SigRefusal};
+
+/// kiln's client of a Rekor v2 (rekor-tiles), beside [`Remote`]'s Fulcio: an entry logged at
+/// `/api/v2/log/entries`, a hashedrekord (the one kind it takes), and read back from its tiles (C2SP
+/// tlog-tiles under `/api/v2`), proven against its checkpoint. It promises nothing: its checkpoints
+/// and proofs are what hold it (docs/seams.md, "Sigstore").
+pub struct RemoteV2 {
+    fulcio: Remote,
+    rekor: String,
+    http: crate::http::client::Client,
+}
+
+impl RemoteV2 {
+    pub fn new(fulcio: &str, rekor: &str) -> anyhow::Result<Self> {
+        Ok(Self { fulcio: Remote::new(fulcio, rekor)?, rekor: rekor.trim_end_matches('/').to_owned(), http: crate::http::client::Client::public()? })
+    }
+
+    /// A v1 hashedrekord entry as v2 asks for it: its digest, its signature, and the key that made
+    /// it (a certificate or a public key, DER) with its kind.
+    fn request(entry: &Value) -> Result<Value, SigRefusal> {
+        let bad = |why: &str| SigRefusal::Invalid { what: "entry", why: why.to_owned() };
+        if entry.get("kind").and_then(Value::as_str) != Some("hashedrekord") {
+            return Err(bad("Rekor v2 takes hashedrekord entries alone"));
+        }
+        let spec = entry.get("spec").ok_or_else(|| bad("it has no spec"))?;
+        let digest = hex::decode(spec.pointer("/data/hash/value").and_then(Value::as_str).unwrap_or_default()).map_err(|_| bad("its hash isn't hex"))?;
+        let key = B64.decode(spec.pointer("/signature/publicKey/content").and_then(Value::as_str).unwrap_or_default()).ok().and_then(|k| String::from_utf8(k).ok()).ok_or_else(|| bad("its key isn't base64 of a PEM"))?;
+        let verifier = match der_of(&key) {
+            Some((label, der)) if label == "CERTIFICATE" => json!({ "x509Certificate": { "rawBytes": B64.encode(der) }, "keyDetails": "PKIX_ECDSA_P256_SHA_256" }),
+            Some((label, der)) if label == "PUBLIC KEY" => json!({ "publicKey": { "rawBytes": B64.encode(der) }, "keyDetails": "PKIX_ECDSA_P256_SHA_256" }),
+            _ => return Err(bad("its key isn't a PEM certificate or public key")),
+        };
+        let content = spec.pointer("/signature/content").cloned().unwrap_or(Value::Null);
+        Ok(json!({ "hashedRekordRequestV002": { "digest": B64.encode(digest), "signature": { "content": content, "verifier": verifier } } }))
+    }
+
+    /// One of Rekor v2's entries as it answers for it (a TransparencyLogEntry: its numbers as
+    /// strings, its hashes base64), as the seam has it.
+    fn logged(v: &Value) -> Result<Logged, SigRefusal> {
+        let num = |x: Option<&Value>| x.and_then(|x| x.as_str().and_then(|s| s.parse::<u64>().ok()).or_else(|| x.as_u64()));
+        let index = num(v.get("logIndex")).ok_or_else(|| SigRefusal::Unavailable(format!("Rekor v2's answer has no index: {v}")))?;
+        let body = v.get("canonicalizedBody").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let raw = B64.decode(&body).map_err(|_| SigRefusal::Unavailable(format!("entry {index}'s body isn't base64")))?;
+        let proof = v.get("inclusionProof").and_then(|p| {
+            Some(Proof {
+                index: num(p.get("logIndex"))?,
+                size: num(p.get("treeSize"))?,
+                root: B64.decode(p.get("rootHash").and_then(Value::as_str).unwrap_or_default()).unwrap_or_default(),
+                hashes: p.get("hashes").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).filter_map(|h| B64.decode(h).ok()).collect(),
+                checkpoint: p.pointer("/checkpoint/envelope").and_then(Value::as_str).unwrap_or_default().to_owned(),
+            })
+        });
+        let integrated_time = num(v.get("integratedTime")).and_then(|t| i64::try_from(t).ok()).unwrap_or(0);
+        let promise = v.pointer("/inclusionPromise/signedEntryTimestamp").and_then(Value::as_str).map(str::to_owned);
+        Ok(Logged { uuid: hex::encode(kiln_ci::identity::trail::leaf(&raw)), index, integrated_time, body, answer: v.clone(), proof, promise })
+    }
+
+    /// `<rekor>/api/v2/<path>`'s bytes; none for what it hasn't.
+    async fn get(&self, path: &str) -> Result<Option<Vec<u8>>, SigRefusal> {
+        let r = self.http.get(&format!("{}/api/v2/{path}", self.rekor)).send().await.map_err(|e| SigRefusal::Unavailable(format!("Rekor v2: {e:#}")))?;
+        match r.status() {
+            200 => Ok(Some(r.bytes(64 << 20).await.map_err(|e| SigRefusal::Unavailable(format!("Rekor v2's {path}: {e:#}")))?.to_vec())),
+            404 => Ok(None),
+            st => Err(SigRefusal::Unavailable(format!("Rekor v2's {path} ({st})"))),
+        }
+    }
+
+    /// Entry `index` read from the log's tiles: its bundle's entry, and the proof of it and the root
+    /// hashed up from the tiles they ask for, held to the log's checkpoint now.
+    async fn read_back(&self, index: u64) -> Result<Logged, SigRefusal> {
+        use kiln_ci::identity::trail::{self, Tile};
+        let down = SigRefusal::Unavailable;
+        let note = String::from_utf8(self.get("checkpoint").await?.ok_or_else(|| down("Rekor v2 serves no checkpoint".into()))?).map_err(|_| down("Rekor v2's checkpoint isn't text".into()))?;
+        let cp = trail::open(&note).ok().and_then(|(text, _)| trail::Checkpoint::parse(text).ok()).ok_or_else(|| down(format!("Rekor v2's checkpoint isn't one: {note:?}")))?;
+        if index >= cp.size {
+            return Err(SigRefusal::NotFound { index });
+        }
+        let bundle = Tile { level: 0, index: index / trail::TILE, width: trail::width_at(cp.size, 0, index / trail::TILE).unwrap_or(0) };
+        let entries = trail::unbundle(&self.get(&bundle.path(true)).await?.ok_or_else(|| down(format!("Rekor v2 serves no {}", bundle.path(true))))?).ok_or_else(|| down("Rekor v2's entry bundle is cut short".into()))?;
+        let data = entries.get(usize::try_from(index % trail::TILE).unwrap_or(usize::MAX)).cloned().ok_or_else(|| down(format!("entry {index} isn't in its bundle")))?;
+        let leaf = trail::leaf(&data);
+        let mut have: std::collections::HashMap<(u8, u64, u64), Vec<trail::Hash>> = std::collections::HashMap::new();
+        let (hashes, root) = loop {
+            let mut missing: Option<Tile> = None;
+            let found = {
+                let mut tile = |t: Tile| {
+                    let got = have.get(&(t.level, t.index, t.width)).cloned();
+                    if got.is_none() {
+                        missing.get_or_insert(t);
+                    }
+                    got
+                };
+                let proof = trail::inclusion_by(cp.size, index, &mut |lo, hi| trail::mth_from(cp.size, lo, hi, &mut tile));
+                proof.and_then(|p| trail::mth_from(cp.size, 0, cp.size, &mut tile).map(|r| (p, r)))
+            };
+            if let Some(done) = found {
+                break done;
+            }
+            let t = missing.ok_or_else(|| down(format!("entry {index}'s proof can't be made from Rekor v2's tiles")))?;
+            let bytes = self.get(&t.path(false)).await?.ok_or_else(|| down(format!("Rekor v2 serves no {}", t.path(false))))?;
+            have.insert((t.level, t.index, t.width), trail::hashes_of(&t, &bytes).ok_or_else(|| down(format!("Rekor v2's {} isn't {} hashes", t.path(false), t.width)))?);
+        };
+        if root != cp.root || !trail::verify_inclusion(&leaf, index, cp.size, &hashes, &cp.root) {
+            return Err(down(format!("Rekor v2's tiles don't make the root its checkpoint names at {}", cp.size)));
+        }
+        let body = B64.encode(&data);
+        let encoded: Vec<String> = hashes.iter().map(|h| B64.encode(h)).collect();
+        let answer = json!({ "logIndex": index.to_string(), "canonicalizedBody": body, "inclusionProof": { "logIndex": index.to_string(), "rootHash": B64.encode(cp.root), "treeSize": cp.size.to_string(), "hashes": encoded, "checkpoint": { "envelope": note } } });
+        let proof = Proof { index, size: cp.size, root: cp.root.to_vec(), hashes: hashes.iter().map(|h| h.to_vec()).collect(), checkpoint: note };
+        Ok(Logged { uuid: hex::encode(leaf), index, integrated_time: 0, body, answer, proof: Some(proof), promise: None })
+    }
+}
+
+impl kiln_seams::Sigstore for RemoteV2 {
+    fn certify(&self, ask: CertifyAsk) -> futures::future::BoxFuture<'_, Result<Certified, SigRefusal>> {
+        kiln_seams::Sigstore::certify(&self.fulcio, ask)
+    }
+
+    fn log(&self, entry: Value) -> futures::future::BoxFuture<'_, Result<Logged, SigRefusal>> {
+        Box::pin(async move {
+            let request = Self::request(&entry)?;
+            let r = self.http.post(&format!("{}/api/v2/log/entries", self.rekor)).json(&request).send().await.map_err(|e| SigRefusal::Unavailable(format!("Rekor v2: {e:#}")))?;
+            let st = r.status();
+            // Rekor v2 names the entry it has already in a header (x-log-index).
+            let had = r.header("x-log-index").and_then(|i| i.trim().parse::<u64>().ok());
+            let v: Value = r.json(1 << 20).await.unwrap_or(Value::Null);
+            match st {
+                200 | 201 => Self::logged(&v),
+                409 => Err(SigRefusal::Conflict { index: had.ok_or_else(|| SigRefusal::Unavailable(format!("Rekor v2 has the entry already but doesn't say where: {v}")))? }),
+                400 => Err(SigRefusal::Invalid { what: "entry", why: v.to_string() }),
+                _ => Err(SigRefusal::Unavailable(format!("Rekor v2 logged nothing ({st}): {v}"))),
+            }
+        })
+    }
+
+    fn entry(&self, index: u64) -> futures::future::BoxFuture<'_, Result<Logged, SigRefusal>> {
+        Box::pin(async move { self.read_back(index).await })
+    }
+}
 
 impl kiln_seams::Sigstore for Remote {
     fn certify(&self, ask: CertifyAsk) -> futures::future::BoxFuture<'_, Result<Certified, SigRefusal>> {
@@ -461,8 +615,63 @@ mod tests {
                     Some(index) => found(sim.entry(index).await),
                     None => say(404, json!({ "code": 404, "message": "entry not found" })),
                 },
+                ("POST", "/rekor2/api/v2/log/entries") => v2_log(sim, &body).await,
+                ("GET", p) if p.starts_with("/rekor2/api/v2/") => v2_read(sim, p.trim_start_matches("/rekor2/api/v2/")),
                 _ => say(404, json!({ "code": 404, "message": format!("no {method} {path}") })),
             }
+        }
+    }
+
+    /// Rekor v2's answer for an entry the simulator logged: a TransparencyLogEntry.
+    fn v2_entry(l: &Logged, log_id: &[u8]) -> Value {
+        let proof = l.proof.as_ref().map(|p| {
+            let hashes: Vec<String> = p.hashes.iter().map(|h| B64.encode(h)).collect();
+            json!({ "logIndex": p.index.to_string(), "rootHash": B64.encode(&p.root), "treeSize": p.size.to_string(), "hashes": hashes, "checkpoint": { "envelope": p.checkpoint } })
+        });
+        json!({ "logIndex": l.index.to_string(), "logId": { "keyId": B64.encode(log_id) }, "kindVersion": { "kind": "hashedrekord", "version": "0.0.1" }, "integratedTime": "0", "inclusionProof": proof, "canonicalizedBody": l.body })
+    }
+
+    /// `POST /api/v2/log/entries` as Rekor v2 answers it, in front of the simulator: a hashedrekord
+    /// request alone; one it has already, 409 naming where (x-log-index).
+    async fn v2_log(sim: &SimSigstore, body: &Value) -> Response {
+        use kiln_seams::Sigstore as _;
+        let say = |status: u16, v: Value| srv::json(http::StatusCode::from_u16(status).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR), &v);
+        let Some(r) = body.get("hashedRekordRequestV002") else { return say(400, json!({ "code": 3, "message": "invalid type, must be hashedrekord" })) };
+        let text = |p: &str| r.pointer(p).and_then(Value::as_str).unwrap_or_default().to_owned();
+        let (der, label) = if r.pointer("/signature/verifier/x509Certificate").is_some() { (text("/signature/verifier/x509Certificate/rawBytes"), "CERTIFICATE") } else { (text("/signature/verifier/publicKey/rawBytes"), "PUBLIC KEY") };
+        let pem = kiln_seams::sigstore::pem(label, &B64.decode(der).unwrap_or_default());
+        let entry = json!({ "apiVersion": "0.0.1", "kind": "hashedrekord", "spec": {
+            "data": { "hash": { "algorithm": "sha256", "value": hex::encode(B64.decode(text("/digest")).unwrap_or_default()) } },
+            "signature": { "content": text("/signature/content"), "publicKey": { "content": B64.encode(pem) } },
+        } });
+        match sim.log(entry).await {
+            Ok(l) => say(201, v2_entry(&l, &sim.log_id().unwrap_or_default())),
+            Err(SigRefusal::Conflict { index }) => srv::with_header(say(409, json!({ "code": 6, "message": "an equivalent entry already exists" })), http::header::HeaderName::from_static("x-log-index"), &index.to_string()),
+            Err(SigRefusal::Invalid { why, .. }) => say(400, json!({ "code": 3, "message": why })),
+            Err(e) => say(500, json!({ "code": 13, "message": e.to_string() })),
+        }
+    }
+
+    /// Rekor v2's tiled reads in front of the simulator: its checkpoint, its tiles and its entry
+    /// bundles (C2SP tlog-tiles).
+    fn v2_read(sim: &SimSigstore, path: &str) -> Response {
+        use kiln_ci::identity::trail::{self, Tile};
+        let not_found = || srv::json(http::StatusCode::NOT_FOUND, &json!({ "message": format!("no {path}") }));
+        let Ok((leaves, bodies, note)) = sim.tiled() else { return srv::json(http::StatusCode::INTERNAL_SERVER_ERROR, &json!({ "message": "the simulator" })) };
+        if path == "checkpoint" {
+            return srv::response(http::StatusCode::OK, "text/plain; charset=utf-8", srv::full(bytes::Bytes::from(note)));
+        }
+        let Some((t, entries)) = Tile::parse(path) else { return not_found() };
+        let (Some((start, end)), Some(per)) = (t.span().filter(|(_, end)| *end <= leaves.len() as u64), trail::TILE.checked_pow(u32::from(t.level))) else { return not_found() };
+        let (start, end, per) = (start as usize, end as usize, per as usize);
+        let bytes = if entries {
+            trail::bundle(bodies.get(start..end).unwrap_or_default())
+        } else {
+            Some((0..t.width as usize).filter_map(|i| leaves.get(start + i * per..start + (i + 1) * per).map(trail::root)).flat_map(|h| h.to_vec()).collect())
+        };
+        match bytes {
+            Some(b) => srv::response(http::StatusCode::OK, "application/octet-stream", srv::full(bytes::Bytes::from(b))),
+            None => not_found(),
         }
     }
 
@@ -495,10 +704,12 @@ mod tests {
         }
     }
 
-    /// What the suite runs against: kiln's client, on a fake of Fulcio and Rekor over a fresh simulator.
+    /// What the suite runs against: kiln's client, on a fake of Fulcio and Rekor over a fresh
+    /// simulator; `v2`, Rekor v2's (hashedrekord entries alone, no promises).
     struct RemoteFixture {
         sigstore: Box<dyn kiln_seams::Sigstore>,
         asker: Result<Asker, String>,
+        v2: bool,
     }
 
     impl SigstoreFixture for RemoteFixture {
@@ -508,28 +719,80 @@ mod tests {
         fn asker(&self) -> Result<&Asker, String> {
             self.asker.as_ref().map_err(Clone::clone)
         }
+        fn kinds(&self) -> &'static [&'static str] {
+            if self.v2 { &["hashedrekord"] } else { &["dsse", "hashedrekord"] }
+        }
+        fn promises(&self) -> bool {
+            !self.v2
+        }
+    }
+
+    /// The suite on kiln's client of Rekor's API `v2` (or v1) in front of a fresh simulator.
+    async fn suite_on(v2: bool) -> anyhow::Result<()> {
+        let cases = kiln_seams::sigstore::cases::<RemoteFixture>();
+        let make = move || async move {
+            let made = match serve(SimSigstore::new(1_790_000_000)).await {
+                Ok(base) if v2 => RemoteV2::new(&format!("{base}/fulcio"), &format!("{base}/rekor2")).map(|r| Box::new(r) as Box<dyn kiln_seams::Sigstore>).map_err(|e| format!("{e:#}")),
+                Ok(base) => Remote::new(&format!("{base}/fulcio"), &format!("{base}/rekor")).map(|r| Box::new(r) as Box<dyn kiln_seams::Sigstore>).map_err(|e| format!("{e:#}")),
+                Err(e) => Err(format!("{e:#}")),
+            };
+            let sigstore: Box<dyn kiln_seams::Sigstore> = made.unwrap_or_else(|e| Box::new(Down(e)));
+            RemoteFixture { sigstore, asker: Asker::new(kiln_seams::sigstore::ISSUER, kiln_seams::sigstore::SUBJECT), v2 }
+        };
+        let clock = crate::rt::clock();
+        let name = if v2 { "Sigstore (kiln's Rekor v2 client)" } else { "Sigstore (kiln's client)" };
+        let report = kiln_seams::conformance::run_within(name, &cases, make, || clock.sleep(Duration::from_secs(60))).await;
+        anyhow::ensure!(report.failed.is_empty() && report.passed.len() == cases.len(), "failed {:?}", report.failed);
+        Ok(())
     }
 
     /// W27-R12: kiln's client of a Fulcio and Rekor passes the Sigstore seam's suite, over Fulcio's
     /// and Rekor's HTTP APIs as they answer, in front of the simulator.
     #[test]
     fn w27_r12_kilns_sigstore_client_passes_the_sigstore_suite() -> anyhow::Result<()> {
+        crate::rt::block_on(suite_on(false))
+    }
+
+    /// W27-R12: kiln's client of a Rekor v2 passes it too: hashedrekord entries logged, each read
+    /// back from the log's tiles and proven against its checkpoint, no promise asked of it.
+    #[test]
+    fn w27_r12_kilns_rekor_v2_client_passes_the_sigstore_suite() -> anyhow::Result<()> {
+        crate::rt::block_on(suite_on(true))
+    }
+
+    /// W27-R09: an entry of a Rekor v2, as logged and as read back from its tiles, is proven against
+    /// Sigstore's trusted root by its proof and the log's signed checkpoint, with no promise to go
+    /// by; a proof changed isn't.
+    #[test]
+    fn w27_r09_a_rekor_v2_entry_is_proven_by_its_checkpoint() -> anyhow::Result<()> {
+        use kiln_seams::Sigstore as _;
         crate::rt::block_on(async move {
-            let cases = kiln_seams::sigstore::cases::<RemoteFixture>();
-            let make = || async move {
-                let made = match serve(SimSigstore::new(1_790_000_000)).await {
-                    Ok(base) => Remote::new(&format!("{base}/fulcio"), &format!("{base}/rekor")).map_err(|e| format!("{e:#}")),
-                    Err(e) => Err(format!("{e:#}")),
-                };
-                let sigstore: Box<dyn kiln_seams::Sigstore> = match made {
-                    Ok(r) => Box::new(r),
-                    Err(e) => Box::new(Down(e)),
-                };
-                RemoteFixture { sigstore, asker: Asker::new(kiln_seams::sigstore::ISSUER, kiln_seams::sigstore::SUBJECT) }
+            let sim = SimSigstore::new(1_790_000_000);
+            let trust = crate::ci::sigstore::TrustedRoot::from_json(sim.trusted_root("https://fulcio.test", "https://rekor.test").map_err(|e| anyhow::anyhow!("{e}"))?.to_string().as_bytes())?;
+            let base = serve(sim).await?;
+            let v2 = RemoteV2::new(&format!("{base}/fulcio"), &format!("{base}/rekor2"))?;
+            let asker = Asker::new(kiln_seams::sigstore::ISSUER, kiln_seams::sigstore::SUBJECT).map_err(|e| anyhow::anyhow!(e))?;
+            let leaf = v2.certify(asker.ask()).await.map_err(|e| anyhow::anyhow!("{e}"))?.chain.into_iter().next().ok_or_else(|| anyhow::anyhow!("no certificate"))?;
+            let entry = |message: &[u8]| {
+                json!({ "apiVersion": "0.0.1", "kind": "hashedrekord", "spec": {
+                    "data": { "hash": { "algorithm": "sha256", "value": crate::util::sha256_hex(message) } },
+                    "signature": { "content": B64.encode(asker.sign(message)), "publicKey": { "content": B64.encode(&leaf) } },
+                } })
             };
-            let clock = crate::rt::clock();
-            let report = kiln_seams::conformance::run_within("Sigstore (kiln's client)", &cases, make, || clock.sleep(Duration::from_secs(60))).await;
-            anyhow::ensure!(report.failed.is_empty() && report.passed.len() == cases.len(), "failed {:?}", report.failed);
+            let checkpoint = b"kiln://hyper-light/trail\n4\n";
+            v2.log(entry(b"a checkpoint before")).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            let logged = v2.log(entry(checkpoint)).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            assert!(logged.promise.is_none(), "Rekor v2 promises nothing");
+            let again = v2.entry(logged.index).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            for l in [logged, again] {
+                let body = crate::ci::sigstore::proven(&l, &trust)?;
+                assert_eq!(body.pointer("/spec/data/hash/value").and_then(Value::as_str), Some(crate::util::sha256_hex(checkpoint).as_str()));
+                let mut changed = l.clone();
+                if let Some(h) = changed.proof.as_mut().and_then(|p| p.hashes.first_mut()).and_then(|h| h.first_mut()) {
+                    *h ^= 1;
+                }
+                assert!(crate::ci::sigstore::proven(&changed, &trust).is_err(), "a proof changed is refused");
+            }
             Ok(())
         })
     }

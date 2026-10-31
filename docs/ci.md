@@ -602,7 +602,10 @@ type JobEventV2 =
 
 A runner without `CAP_CI2` keeps getting `Assign` (v1) for v1-shaped kiln jobs, so a fleet can be
 upgraded one machine at a time. A leg that needs `CAP_CI2` is never routed to such a runner; its
-wait reason says so (W05).
+wait reason says so (W05). A v1 job is written for what its runner says it can do, so it goes to no
+runner that hasn't said yet (its `Build`, sent as it connects, a pod's aside): one written before,
+its capabilities reading none, reached a runner of today's build out of step and was read with no
+steps, passing without running (W05-R22).
 
 ### 2.6 Server endpoints
 
@@ -8898,10 +8901,10 @@ research `01a17947fdad71e5a4f15866e3541c41`.
   body or DER); the migration's `w27_r01_identities_and_revocations_tables`; `identities.rs`'s
   `w27_r02_*`; `ci::signing`'s `w27_r12_*` (keyless signing through the simulator verifies; kiln's
   client passes the Sigstore suite).
-- *Not yet.* kiln's Sigstore client hasn't run the suite against a real Fulcio and Rekor; reviews, CI
-  output, lands and deploys don't sign with these identities yet (R04 to R11; commits do: *Built:
-  signatures*, below); the CLI signs in with a passkey only through a personal access token (no
-  approving a device from the browser yet).
+- *Not yet.* kiln's Sigstore clients haven't run the suite against a real Fulcio and Rekor; deploys
+  don't sign with these identities yet (Ship's plan; commits, verdicts and comments, a leg's
+  results and provenance, and lands do: the *Built* entries below); the CLI signs in with a passkey
+  only through a personal access token (no approving a device from the browser yet).
 
 **Built: signatures (R03: commits, pushes and what hosts verified; AC03).** Plan
 `01a17856b1b273268adf6ce8c4f78410`, research `01a18abcef987683938692b8832c1831`.
@@ -9020,7 +9023,7 @@ research `01a17947fdad71e5a4f15866e3541c41`.
   simulator and githost.
 - *Not yet.* A host's pull request isn't judged by `.kiln/review.yaml`'s `signatures:` on what its
   host verified; the mirror reads a pull request's first 100 commits, so later ones have no
-  verdict; lands (R07). A remote naming kiln's server by another name
+  verdict. A remote naming kiln's server by another name
   than those (another host name for it) keeps the person's credential. A job's push (its
   `GITHUB_TOKEN`) can't sign its commits, so it's refused where signatures are required. Agents
   the server runs itself hold no key of theirs, so what they commit is unsigned.
@@ -9077,6 +9080,40 @@ research `01a17947fdad71e5a4f15866e3541c41`.
   conflict resolution's acceptance (W26-R17's ladder) takes this verdict path once both are on one
   branch. Jobs' reviews aren't signed as their legs.
 
+**Built: each land, signed as the queue that tested it (R07).** Plan
+`01a17856b1b273268adf6ce8c4f78410` step 6.
+
+- *What's signed.* When a land queue moves a trunk (its compare-and-swap), kiln signs the land as
+  its server, whose queue it is (`ci::lands::sign`). The statement (`kiln_ci::identity::landing`,
+  `application/vnd.kiln.land+json`) is about the trunk at the commit it moved to (`to`;
+  `<repo>@refs/heads/<trunk>`, by `gitCommit`). It names its queue (`<repo>:<trunk>`), the tip it
+  was applied onto (`from`), the candidate the queue tested and that candidate's `base`.
+  - `to` is the candidate itself, unless the trunk moved since the candidate's base only for
+    changes it shares nothing with and the queue applied the batch again onto the tip (`rebased`, a
+    queue's that does: the Merge Queues agent's). A land not applied again that moved the trunk
+    anywhere but its candidate isn't taken.
+  - It names the batch's diffs, each at the version that landed, with the commit that carries it on
+    `to` and the signed accepts that hold on it (their statements' digests, R04).
+  - It names the checks run on the candidate, each with its conclusion and its legs' signed results
+    (their statements' digests, R05). A leg that signs sends those at its end, after the events its
+    conclusion comes from, so the queue can see a check pass first (a moment first, or longer on a
+    loaded machine): the land's signing waits for them up to a minute, then signs with what kiln
+    has.
+- *Kept and read.* It's kept in `land_signatures` by the commit the trunk moved to (migration
+  `w27_land_signatures`). `GET /api/repos/:repo/lands/:commit` reads it back: its trunk, head,
+  candidate, base, signer, digest, when, what it says, and its envelope. A land kiln can't sign
+  stands, unsigned, and the log says so.
+- *Tests.* kiln-ci's `identity::landing` (`w27_r07_a_lands_statement_reads_back`,
+  `w27_r07_a_land_applied_again_is_about_the_commit_the_trunk_moved_to`,
+  `w27_r07_a_land_that_doesnt_hold_together_is_refused`), and integration
+  `w27_r07_a_land_is_signed_by_its_queue`. In it D1, approved by Kim on her laptop, lands through
+  main's queue with its `gate` run on the candidate. The statement verifies as kiln's server and
+  names main's queue, the candidate that landed, D1 at v1 with Kim's verdict, and `gate` with its
+  legs' signed results.
+- *Not yet.* The Merge Queues agent's queue signs its lands the same way, from its `landed()`, right
+  after its compare-and-swap (it has the statement's shape). A land's statement isn't posted to
+  hosts.
+
 **Built: a leg's results and provenance, signed as the leg (R05, R06).** Plan
 `01a17856b1b273268adf6ce8c4f78410` step 5, planned as `01a18b12f931749d83a2acdfbf55e67a` (research
 `01a18b12f9487223be9926cdb890fe22`), on step 1's statement (`kiln_ci::identity::statement`). A leg
@@ -9117,11 +9154,13 @@ delegation of it.
 - *Its results* (`application/vnd.kiln.ci.results+json`): one statement, numbered 1 on its
   `results` stream. Its body is each step's end and the leg's conclusion; its subjects are its logs
   and reports.
-- *Signed at its end*, in `Ev::Done`, with the leg's key before letting go of it.
-  `AgentMsg::LegResults` carries them all. It goes before `JobFinished`, and again with it until
-  it's received (`CAP_LEG_SIGNS`, docs/wire.md). A `k8s` pool's pod's leg signs too: its runner
-  says nothing of itself past `Build`'s caps, so it says so of the leg as it asks for the leg's
-  identity (`IdentityAsk.signs`), and kiln asks the leg for provenance by that.
+- *Signed at its end*, in `Ev::Done`, with the leg's key before letting go of it. What the leg
+  sent before it ended goes first, however far its runner is behind: an end that comes while its
+  last log chunks or step ends still wait on the runner's uplink waits behind them, so its records
+  cover all it sent. `AgentMsg::LegResults` carries them all. It goes before `JobFinished`, and
+  again with it until it's received (`CAP_LEG_SIGNS`, docs/wire.md). A `k8s` pool's pod's leg
+  signs too: its runner says nothing of itself past `Build`'s caps, so it says so of the leg as it
+  asks for the leg's identity (`IdentityAsk.signs`), and kiln asks the leg for provenance by that.
 - *Taken*: the server checks each record as it takes it, at that time, through its records
   (`verify_under`).
   - Each must be the leg's, signed by the leg it gave that job on that runner, under its delegation
@@ -9133,6 +9172,11 @@ delegation of it.
 - *Judged when read*: `GET /api/ci/legs/:id/signed` holds the records against what kiln keeps.
   - The results: each step's end, each log's verdict, each report by its CAS digest, and the leg's
     end.
+  - A log kiln keeps as taken from the leg, of a step the leg signed no log of, is a break too.
+    What kiln copies into a reused step's log (W24-R07, its source leg's) it keeps as no chunk of
+    the leg's (`Logs::append_copy`), so the step's log checks against what the leg itself sent.
+    That step's reports are its source's too, and aren't held against the leg (its receipt of
+    `reused/<step>` says it was reused).
   - The custody (`leg::judge_custody`): its stream whole, and its hand-on naming its results and
     received by kiln. Its receipts of its assignment and commit must be of what kiln handed, and a
     checkout by tarball of the tarball kiln served it, by the bytes kiln sent (`ci_leg_served`).
@@ -9157,12 +9201,18 @@ delegation of it.
     `w27_r06_provenance_is_signed_as_the_leg_only_when_its_subjects_are_the_legs`;
   - `proto`'s `w27_r05_leg_signing_is_appended_after_every_older_variant`;
   - integration: `identities`'s `w27_r05_a_legs_results_verify_as_the_leg`,
+    `w27_r05_a_v1_jobs_results_verify_as_the_leg`,
     `w27_r06_provenance_verifies_as_the_leg_that_built_it` and (with `chaos`)
-    `w27_r05_a_leg_on_an_older_runner_reads_unsigned_with_why`; `k8s_pool`'s
-    `w27_r05_a_pods_leg_signs_its_records_as_the_leg`.
+    `w27_r05_a_leg_on_an_older_runner_reads_unsigned_with_why` and
+    `w27_r05_a_runner_behind_its_legs_signs_all_they_sent`; `k8s_pool`'s
+    `w27_r05_a_pods_leg_signs_its_records_as_the_leg`; `memo`'s `w24_r07` (a leg with reused steps).
+- *v1 jobs too*: a `.kiln/` workflow on v1, as production runs them, signs as the leg on its
+  runner. Its runner asks for the job's identity as it takes it (`ServerMsg::Assign`), as a v2
+  leg's does. kiln issues it from the job's run: its run has no plan, so its claims are its
+  pipeline's (`<repo>/.kiln/<pipeline>.yaml@refs/heads/<branch>`, at its commit).
 - *Not yet*:
-  - v1 jobs have no leg identity (W27-R01 issues one only to the legs of runs kiln planned), nor do
-    legs on runners from before identities. Their records stay unsigned, and the API says why.
+  - Legs on runners from before identities, and v1 jobs on runners from before v1 jobs signed, have
+    no leg identity. Their records stay unsigned, and the API says why.
   - kiln signs no hand-on of what it gives a leg. The delegation names its assignment and commit,
     but a leg's inputs (artifacts, caches, actions, images) are received with no hand-on of kiln's
     to follow. Only the assignment, the commit and the tarball are judged against what kiln
@@ -9172,6 +9222,90 @@ delegation of it.
   - kiln's provenance names every action the job resolved. A leg asked to sign it before a later
     step fetches one refuses, saying which; kiln's own bundle is kept either way.
   - Ship shows none of this yet (the CI/CD Integration plan's).
+
+**Built: the trail, and kiln verify (R09, R10; AC06, AC07).** Plan
+`01a17856b1b670deb829ec1600f2c2fd`, its steps 1 to 4 and 6; research
+`01a17856b1b670deb829ec1763cc1245`.
+
+- *The trail* (`kiln_ci::identity::trail`, pure): an entry names the statement it records by digest,
+  its kind and subjects, when kiln took it, its index and the hash of the entry before it (as
+  gittuf's reference state log chains its entries); the entries are the leaves of an RFC 6962
+  Merkle tree, so an inclusion or consistency proof is at most ⌈log₂ n⌉ + 1 hashes. Checking a run
+  of entries names an edited, dropped, inserted or reordered one. A checkpoint is a C2SP signed
+  note (origin `kiln://<org>/trail`, size, root; an ECDSA signature, key ID the first four bytes of
+  the SHA-256 of its SubjectPublicKeyInfo), signed with the server's key; kiln never signs one that
+  doesn't extend the one before, saying why.
+- *Kept* (migration `w27_trail`; `crate::trail`): each statement kiln takes goes in, in the
+  transaction that takes it, once by digest, every signature of it kept beside it (a leg's of the
+  provenance kiln wrote, beside kiln's): W18's attestations, a leg's records and the server's
+  delegations of legs, custody records, verdicts and comments, lands; and what kiln checked that
+  isn't a statement itself as kiln's own words (a push's commits' signatures, the commits kiln makes,
+  what a host verified, revocations), which the checkpoints over them vouch for. Nothing is pruned.
+  A checkpoint is signed every `[ci.trail] checkpoint_every` entries (256) or `checkpoint_minutes`
+  (10), whichever comes first, once the entries since the last hold as a chain and hash as kept.
+- *Served and anchored*: `GET /api/trail` (entries), `/api/trail/checkpoints`, and the trail as a
+  tiled log (`/api/trail/log/…`, C2SP tlog-tiles: its checkpoint, tiles and entry bundles, each
+  whole tile kept as a node above as its last leaf comes, so a proof is a few reads); each
+  checkpoint logged in the Rekor `[ci.attest] rekor_url` names (v1, or v2's rekor-tiles by
+  `rekor_api`, through the Sigstore seam) as a hashedrekord of its note, and `GET
+  /api/trail/anchors` holds the trail to what Rekor saw.
+- *kiln verify* (`kiln verify <deploy | artifact | commit | change> <id>`, `GET /api/verify`, the
+  `ci.verify` operation): the chain back from a release (`prod/api@1.4.2` or its number), an
+  artifact's digest, `<repository>@<commit>` or a diff, a link at a time, the first that doesn't
+  hold named. The release as kiln's deploy records have it (deploys sign with Ship's plan); each
+  artifact's provenance, which names it and the commit it was built from, signed as the leg that
+  built it; every commit on the trunk it brings (since the commit the release before ran, else since
+  the trunk's first land), each on the trunk and signed as kiln checked it; the land that put it
+  there, signed as the queue that tested it (the candidate tested is what landed, each check
+  passing); each verdict the land names, signed by whom it names, an accept holding on the version
+  that landed (given there or carried by verbatim patch-id), people and agents apart, as many as
+  the trunk's policy asked where the land began; each revision's author; a change's custody where
+  it changed hands; kiln's root. Each link rests on a statement checked as of when kiln took it
+  (its signer's chain to kiln's root, the revocations as of then) and found in the trail by an
+  inclusion proof against the newest checkpoint, signed first when any entry came after the last.
+  A deploy of 10 commits, each reviewed, tested and landed, verifies in about 170 ms on a warm
+  server (AC07 asks 2 s).
+- *For an auditor* (`kiln verify export <kind> <id>`, `GET /api/verify/export`): the same walk with
+  every statement each link rested on (its payload, its entry, the entry's proof, each signature
+  as kiln kept it and whom the walk found it signed by), kiln's own statement of each revocation
+  under the checkpoint, and that checkpoint; `kiln verify --offline <file> --root <kiln's root>`
+  checks it with no server (`kiln_ci::identity::verify::offline`): it fails where any statement,
+  signature, proof or the checkpoint was changed, or the trail says a signer's key was revoked
+  before kiln took what it signed. A revision's Source VSA (`kiln verify vsa <repository>@<commit>`,
+  `POST /api/verify/vsa`; SLSA v1.2's source track): an in-toto statement of
+  `https://slsa.dev/verification_summary/v1` about its `gitCommit` (`sourceRefs` the trunk that
+  holds it), `resourceUri` `git+<kiln>/<repository>`, verifier `<kiln>/api/verify`, its trunk's
+  review policy as the policy, PASSED with `SLSA_SOURCE_LEVEL_3` where its chain verifies (FAILED,
+  `SLSA_SOURCE_LEVEL_1`, where it doesn't), signed as kiln's server and kept in the trail.
+- *Tests*: `kiln_ci::identity::trail`'s `w27_ac06_an_edited_dropped_or_reordered_entry_is_found`
+  and `w27_r09_*` (RFC 6962's tree and proofs, at most ⌈log₂ n⌉ + 1 hashes over 1 to 10,000
+  leaves; checkpoints as Rekor's signed notes, never contradicting the one before; tiles);
+  `identity::verify`'s `w27_r10_*` (a statement held, each link's words, the Source VSA's fields, an
+  export offline and changed); `tests/trail.rs`'s `w27_r09_*` (every kind kiln takes, in order;
+  restart and concurrent appends; the tiled log; a rewritten trail caught against its anchor);
+  `tests/verify.rs`'s `w27_ac07_a_deploy_verifies_end_to_end` (10 commits, timed),
+  `w27_ac07_kiln_verify_names_each_broken_link` (an artifact rebuilt, a forged review, a trail
+  entry edited, a commit pushed to main without the queue) and
+  `w27_r10_an_exported_trail_verifies_offline`; `ci::signing`'s `w27_r12_kilns_rekor_v2_*`.
+- *Not yet.* Deploys aren't signed (Ship's plan), so kiln verify rests a release on kiln's record
+  of it; it takes each check's conclusion from the land its queue signed, not from each leg's own
+  signed results; a change's custody is walked by its change's identity, as the hand-offs of a
+  change name it; no witness cosigns the checkpoints; an export carries the revocations the trail
+  holds, those recorded since it began; Ship's What happened and commit page draw the links from
+  `GET /api/verify` (the CI/CD Integration agent's).
+
+**Built: a verified chain to deploy (R11, AC08).** Plan `01a17856b1b670deb829ec1600f2c2fd`, step 5.
+
+- The deploy gate `chain` (docs/deploy-api.md §9.1) walks what a new version deploys, or a
+  rollback puts back, as kiln verify does, as the release is asked for. `gates.require_chain: true`
+  refuses one whose chain breaks, naming the link; elsewhere the release says whether its chain
+  verifies. An environment made as `production` requires it from the start; one from before keeps
+  what it has until its settings change it, as a repository's signatures do.
+- *Tests*: `tests/verify.rs`'s `w27_ac08_production_refuses_an_unverified_chain` (made as
+  production, the rebuilt image refused at its artifact and main's build taken; from before, the
+  rebuilt one taken, saying its chain doesn't verify).
+- *Not yet.* The environment's page doesn't show `require_chain` or `production` (an edit there
+  keeps them).
 
 **Built: custody, and agent sessions handed over signed (R08, in part).** Plan
 `01a17856b1b477eda14a574ae312a123`, its steps 1 to 6 and step 7's changes and review requests;
@@ -9972,6 +10106,7 @@ kiln metrics criterion|hyperfine|gobench|pytest-benchmark|gbench|k6 PATH
 kiln store verify|gc                    kiln ci bench [--scheduler|--expr|--parse|--cache|--logs]
 kiln tokens create|list|revoke          kiln login
 kiln repo provider <repo> [provider…]
+kiln verify <deploy|artifact|commit|change> <id>   kiln verify export|vsa …   kiln verify --offline FILE --root PEM
 kiln work why <run|leg|step>            kiln work status|warm|verify|gc|reap   kiln rerun <run> --cold
 kiln gocacheprog                        kiln rustc   (W24: the runner's cache helpers)
 ```

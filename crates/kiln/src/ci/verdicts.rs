@@ -238,14 +238,16 @@ pub async fn take(hub: &Hub, caller: &Caller, asked: &Asked<'_>, bundle: &Value)
     Ok(Taken { digest: c.digest, signer: c.custodian, bundle: bundle.to_string(), at })
 }
 
-/// Keeps `t`, the signature of `kind` `id` on version `version` of diff `diff_id`, in `tx`.
-pub fn keep(tx: &rusqlite::Connection, kind: &str, id: &str, diff_id: &str, version: u32, t: &Taken) -> rusqlite::Result<()> {
+/// Keeps `t`, the signature of `kind` `id` on version `version` of diff `diff_id`, in `tx`, and in
+/// the trail as taken (W27-R09).
+pub fn keep(tx: &rusqlite::Connection, kind: &str, id: &str, diff_id: &str, version: u32, t: &Taken) -> anyhow::Result<()> {
     tx.execute(
         "INSERT INTO review_signatures (kind, id, diff_id, version, digest, signer, taken_at, bundle) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT (kind, id) DO UPDATE SET version = excluded.version, digest = excluded.digest, signer = excluded.signer, taken_at = excluded.taken_at, bundle = excluded.bundle",
         params![kind, id, diff_id, version, t.digest, t.signer, t.at, t.bundle],
-    )
-    .map(|_| ())
+    )?;
+    crate::trail::take(tx, &t.bundle, t.at)?;
+    Ok(())
 }
 
 /// The refusal of an unsigned verdict or comment where `d`'s repository requires signatures,
@@ -305,6 +307,23 @@ pub async fn list(hub: &Hub, d: &Diff) -> Result<Value, Fail> {
         out.push(v);
     }
     Ok(json!({ "diff": d.name, "latest": latest, "verdicts": out }))
+}
+
+/// The digests of the signed accepts on `d` that hold on its latest version, oldest first: what
+/// lets it land where signatures count, as its land's statement names them (W27-R07).
+pub async fn holding_accepts(hub: &Hub, d: &Diff, versions: &[Version]) -> Result<Vec<String>, Fail> {
+    let holds = holding(hub, d, versions).await?;
+    let id = d.id.clone();
+    let rows: Vec<(String, String)> = hub
+        .store
+        .call(move |c| {
+            let mut q = c.prepare("SELECT r.id, s.digest FROM reviews r JOIN review_signatures s ON s.kind = 'verdict' AND s.id = r.id WHERE r.diff_id = ?1 AND r.action = 'accept' ORDER BY r.created_at, r.rowid")?;
+            let rows = q.query_map([&id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+        .map_err(fail)?;
+    Ok(rows.into_iter().filter(|(review, _)| holds.get(review).is_some_and(Holds::holds)).map(|(_, digest)| digest).collect())
 }
 
 /// A verdict (by its statement's `digest`) given on version `from` of `d`, carried to its latest,

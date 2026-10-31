@@ -33,6 +33,7 @@ pub mod inbox;
 pub mod pools;
 pub mod insights;
 pub mod land;
+pub mod lands;
 pub mod integrations;
 pub mod load;
 pub mod local;

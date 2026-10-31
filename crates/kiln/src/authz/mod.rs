@@ -406,6 +406,7 @@ pub static ROUTES: &[Rule] = &[
     // The caller's own notifications, marked read (W19-R06).
     r("POST", "/api/review/inbox/read", "diffs.read", At::Anywhere),
     r("GET", "/api/repos/*/queue", "diffs.read", At::Repo(2)),
+    r("GET", "/api/repos/*/lands/*", "diffs.read", At::Repo(2)),
     r("DELETE", "/api/queue/*", "queue.manage", At::Entry(2)),
     // Change requests (W14-R04), as diffs.
     r("GET", "/api/repos/*/change-requests", "diffs.read", At::Repo(2)),
@@ -639,6 +640,15 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/identities/revoke", "settings.manage", At::Server),
     // Custody of what changes hands (W27-R08): a signed record taken from anyone signed in (its
     // signature says who it's from); chains, breaks and refusals read by those who read the audit.
+    r("GET", "/api/trail/checkpoints", "audit.read", At::Server),
+    r("GET", "/api/trail/log/**", "audit.read", At::Server),
+    r("GET", "/api/trail/anchors", "audit.read", At::Server),
+    r("POST", "/api/trail/checkpoints", "settings.manage", At::Server),
+    r("GET", "/api/trail", "audit.read", At::Server),
+    // kiln verify (W27-R10): a chain walked back over the trail, read as the audit is.
+    r("GET", "/api/verify", "audit.read", At::Server),
+    r("GET", "/api/verify/export", "audit.read", At::Server),
+    r("POST", "/api/verify/vsa", "audit.read", At::Server),
     r("POST", "/api/custody", SIGNED_IN, At::Server),
     r("GET", "/api/custody/breaks", "audit.read", At::Server),
     r("GET", "/api/custody", "audit.read", At::Server),

@@ -612,7 +612,8 @@ pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req:
     let mut said: Vec<String> = Vec::new();
     // What kiln's hook found of each ref's commits' signatures: its words in place of git's "hook
     // declined", and its warnings.
-    for v in checked.verdicts() {
+    let verdicts = checked.verdicts();
+    for v in &verdicts {
         if let Some(why) = &v.refused {
             let declined = format!("ng {} ", v.refname);
             if let Some(l) = report.lines.iter_mut().find(|l| l.starts_with(&declined)) {
@@ -620,7 +621,7 @@ pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req:
             }
             hub.store.audit(user.clone(), "repo.push".into(), format!("{} refused: {}: {why}", repo.name, v.refname)).await;
         }
-        said.extend(v.warnings);
+        said.extend(v.warnings.iter().cloned());
     }
     let author = match &who {
         Pusher::Caller(c) => super::diffs::author_of(&c.name, Some(c.kind)),
@@ -633,6 +634,27 @@ pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req:
     }
     // What git took (`ok <ref>`), before kiln says more.
     let took: HashSet<String> = report.lines.iter().filter_map(|l| l.strip_prefix("ok ")).map(|r| r.split_whitespace().next().unwrap_or(r).to_owned()).collect();
+    // The signatures of the commits each ref git took brought, as kiln checked them: in the trail
+    // as its word for what it found (W27-R09).
+    let found: Vec<(String, super::pushsig::Found)> = verdicts.into_iter().filter(|v| took.contains(&v.refname)).flat_map(|v| v.commits.into_iter().map(move |c| (v.refname.clone(), c))).collect();
+    if !found.is_empty() {
+        let (name, at) = (repo.name.clone(), crate::util::now_unix());
+        let kept = hub
+            .store
+            .call(move |c| {
+                let tx = crate::store::tx(c)?;
+                for (refname, f) in &found {
+                    let said = kiln_ci::identity::trail::checked_commit(&name, refname, &f.sha, f.signature.as_deref(), &f.seen, f.words.as_deref());
+                    crate::trail::own(&tx, kiln_ci::identity::trail::PAYLOAD_CHECKED, &said, at)?;
+                }
+                tx.commit()?;
+                Ok(())
+            })
+            .await;
+        if let Err(e) = kept {
+            tracing::error!(repo = %repo.name, error = %format!("{e:#}"), "what kiln found of a push's signatures isn't in the trail");
+        }
+    }
     // The first branch pushed to an empty repository is its default, as on GitHub, when the one
     // it was made on (its HEAD) isn't among those pushed.
     if empty

@@ -85,6 +85,19 @@ impl Logs {
     /// Append output for a step. Never fails the caller: disk errors are logged and the data still
     /// reaches live viewers.
     pub fn append(&self, job: &str, idx: u32, data: &[u8]) {
+        self.put(job, idx, data, true);
+    }
+
+    /// Output kiln copies into a step's log from elsewhere (a reused step's, from its source leg,
+    /// W24-R07): kept and shown as [`Logs::append`] keeps it, and noted as no chunk of the leg's,
+    /// which it wasn't taken from, so the leg's log checks against what the leg itself sent
+    /// (docs/ci.md W27-R05).
+    pub fn append_copy(&self, job: &str, idx: u32, data: &[u8]) {
+        self.put(job, idx, data, false);
+    }
+
+    /// `data` appended to step `idx`'s log, and noted as a chunk its leg sent when it's `taken`.
+    fn put(&self, job: &str, idx: u32, data: &[u8], taken: bool) {
         crate::metrics::global().log_bytes.add(data.len() as u64);
         let path = self.step_path(job, idx);
         let times_path = self.times_path(job, idx);
@@ -95,7 +108,9 @@ impl Logs {
         let (len, digest) = (data.len() as u64, kiln_ci::logs::digest(data));
         self.with_live(job, |live| {
             if live.truncated {
-                note_piece(live, idx, &digests_path, &kiln_ci::logs::Piece { at: None, len, digest });
+                if taken {
+                    note_piece(live, idx, &digests_path, &kiln_ci::logs::Piece { at: None, len, digest });
+                }
                 return;
             }
             let (chunk, truncate_now) = if live.bytes + data.len() as u64 > max {
@@ -138,7 +153,9 @@ impl Logs {
             };
             // The leg's chunk: where it's kept, or that it isn't (the cap's notice took its place).
             let kept = at.filter(|_| wrote && !truncate_now);
-            note_piece(live, idx, &digests_path, &kiln_ci::logs::Piece { at: kept, len, digest });
+            if taken {
+                note_piece(live, idx, &digests_path, &kiln_ci::logs::Piece { at: kept, len, digest });
+            }
             // A piece that holds no bytes holds no line: nothing to note.
             if let (true, Some(at), false) = (wrote, at, chunk.is_empty()) {
                 let times = match live.times.entry(idx) {
@@ -208,6 +225,19 @@ impl Logs {
         crate::rt::blocking(move || std::fs::read_to_string(p).map(|s| kiln_ci::logs::parse(&s)).unwrap_or_else(|_| kiln_ci::logs::parse("")))
             .await
             .unwrap_or_else(|_| kiln_ci::logs::parse(""))
+    }
+
+    /// The steps of `job` whose chunks kiln keeps by digest (a `<step>.digests` beside each log), in
+    /// order: each step its leg sent a log of since kiln kept digests.
+    pub async fn kept_steps(&self, job: &str) -> Vec<u32> {
+        let dir = self.job_dir(job);
+        crate::rt::blocking(move || {
+            let mut steps: Vec<u32> = std::fs::read_dir(&dir).into_iter().flatten().flatten().filter_map(|e| e.file_name().to_str()?.strip_suffix(".digests")?.parse().ok()).collect();
+            steps.sort_unstable();
+            steps
+        })
+        .await
+        .unwrap_or_default()
     }
 
     /// A step's log as kiln keeps it against `signed`, the chain its leg signed for its latest
@@ -396,6 +426,27 @@ mod tests {
             assert_eq!(logs.check("job2", 0, &Chain::of([b"attempt one\n".as_slice()])).await, Verdict::Differs);
             // A log from before kiln kept digests has no pieces: a signed chain finds none of it.
             assert_eq!(logs.check("job3", 0, &signed).await, Verdict::Incomplete { have: 0, want: 4 });
+            Ok(())
+        })
+    }
+
+    /// W27-R05: what kiln copies into a step's log (a reused step's, from its source leg) is kept
+    /// and read as the rest is, and is no chunk of the leg's: the step's log checks against what the
+    /// leg itself sent, and the steps kept by digest are those the leg sent a log of.
+    #[test]
+    fn w27_r05_a_copy_kiln_makes_is_kept_and_no_chunk_of_the_legs() -> anyhow::Result<()> {
+        use kiln_ci::logs::{Chain, Verdict};
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let logs = Logs::new(dir.path().to_path_buf(), 1 << 20);
+            let note: &[u8] = b"memo: reused from run #1\n";
+            logs.append_copy("job1", 0, b"built 1 as 7f3a\n");
+            logs.append("job1", 0, note);
+            logs.append_copy("job1", 1, b"tested\n");
+            logs.finish("job1");
+            assert_eq!(logs.read("job1", 0).await, [b"built 1 as 7f3a\n".as_slice(), note].concat());
+            assert_eq!(logs.check("job1", 0, &Chain::of([note])).await, Verdict::Verified { kept: note.len() as u64, dropped: 0 });
+            assert_eq!(logs.kept_steps("job1").await, [0]);
             Ok(())
         })
     }

@@ -564,7 +564,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             .map_err(|(c, m)| err(c, m))
         }
         // W14: diffs and stacks.
-        (_, ["api", "diffs" | "change-requests" | "stacks" | "comments" | "review" | "queue", ..]) | (&Method::GET, ["api", "repos", _, "diffs" | "queue" | "change-requests"]) | (&Method::POST, ["api", "repos", _, "change-requests" | "submit"]) => {
+        (_, ["api", "diffs" | "change-requests" | "stacks" | "comments" | "review" | "queue", ..]) | (&Method::GET, ["api", "repos", _, "diffs" | "queue" | "change-requests"] | ["api", "repos", _, "lands", _]) | (&Method::POST, ["api", "repos", _, "change-requests" | "submit"]) => {
             let segs: Vec<&str> = s.iter().skip(1).copied().collect();
             let body: serde_json::Value = if matches!(method, Method::POST | Method::PATCH | Method::PUT) { boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.unwrap_or(serde_json::Value::Null) } else { serde_json::Value::Null };
             boxed(|| crate::ci::diffs::route(&hub, &method, &segs, &q, &caller, &body)).await.map_err(|(c, m)| err(c, m))
@@ -705,6 +705,70 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             })
             .await
         }
+        // The trail of every signed statement kiln takes, a page of it at a time, and kiln's
+        // checkpoints of it, one signed now when asked (W27-R09).
+        (&Method::GET, ["api", "trail"]) => {
+            let q = srv::query(&req);
+            let number = |k: &str, or: u64| q.get(k).and_then(|v| v.parse().ok()).unwrap_or(or);
+            let (from, limit) = (number("from", 0), number("limit", 100));
+            boxed(|| async { crate::trail::page(&hub.store, from, limit).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))) }).await
+        }
+        (&Method::GET, ["api", "trail", "checkpoints"]) => {
+            let limit = srv::query(&req).get("limit").and_then(|v| v.parse().ok()).unwrap_or(10);
+            boxed(|| async { crate::trail::checkpoints_page(&hub.store, limit).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))) }).await
+        }
+        (&Method::GET, ["api", "trail", "anchors"]) => {
+            boxed(|| async { crate::trail::anchors(&hub).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))) }).await
+        }
+        // The trail as a tiled log (C2SP tlog-tiles): its checkpoint, its tiles and its entries.
+        (&Method::GET, ["api", "trail", "log", rest @ ..]) => {
+            let path = rest.join("/");
+            boxed(|| async {
+                match crate::trail::log(&hub.store, &path).await {
+                    Ok(Some((bytes, ctype, immutable))) => {
+                        let r = srv::response(StatusCode::OK, ctype, srv::full(bytes::Bytes::from(bytes)));
+                        Ok(srv::with_header(r, header::CACHE_CONTROL, if immutable { "private, max-age=31536000, immutable" } else { "private, max-age=5" }))
+                    }
+                    Ok(None) => Err(err(StatusCode::NOT_FOUND, format!("the trail has no {path}"))),
+                    Err(e) => Err(err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))),
+                }
+            })
+            .await
+        }
+        (&Method::POST, ["api", "trail", "checkpoints"]) => boxed(|| async {
+            let size = crate::trail::checkpoint(&hub, true).await.map_err(|e| err(StatusCode::CONFLICT, format!("the trail's checkpoint isn't signed: {e:#}")))?;
+            Ok(srv::json(StatusCode::OK, &json!({ "size": size })))
+        })
+        .await,
+        // kiln verify (W27-R10): the chain back from a deploy, an artifact, a commit or a change,
+        // each link with whether it holds, the first that doesn't named.
+        (&Method::GET, ["api", "verify"]) => {
+            let q = srv::query(&req);
+            boxed(|| async {
+                let target = crate::verify::Target::of(&q).map_err(|(s, e)| err(s, e))?;
+                crate::verify::verify(&hub, &target).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(s, e)| err(s, e))
+            })
+            .await
+        }
+        // The same walk for an auditor, to check offline against kiln's root; and a revision's
+        // Source VSA (SLSA's source track), signed as kiln's server and kept in the trail.
+        (&Method::GET, ["api", "verify", "export"]) => {
+            let q = srv::query(&req);
+            boxed(|| async {
+                let target = crate::verify::Target::of(&q).map_err(|(s, e)| err(s, e))?;
+                crate::verify::export(&hub, &target).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(s, e)| err(s, e))
+            })
+            .await
+        }
+        (&Method::POST, ["api", "verify", "vsa"]) => boxed(|| async {
+            let body: serde_json::Value = boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+            let asked = body.get("commit").and_then(serde_json::Value::as_str).unwrap_or_default();
+            let crate::verify::Target::Commit { repo, sha } = crate::verify::Target::parse("commit", asked).map_err(|e| err(StatusCode::BAD_REQUEST, e))? else {
+                return Err(err(StatusCode::BAD_REQUEST, "`commit`: <repository>@<commit>"));
+            };
+            crate::verify::vsa(&hub, &repo, &sha).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(s, e)| err(s, e))
+        })
+        .await,
         // Custody of what changes hands (W27-R08): a signed record taken, a thing's chain walked
         // now, the breaks kiln found and what it refused.
         (&Method::POST, ["api", "custody"]) => {

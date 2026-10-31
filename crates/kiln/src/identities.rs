@@ -123,7 +123,10 @@ async fn delegate_leg(hub: &Hub, job: &str, attempt: u32, uri: &str, cert_pem: &
     let (j, d, at) = (job.to_owned(), digest.clone(), crate::util::now_unix());
     hub.store
         .call(move |c| {
-            c.execute("INSERT OR REPLACE INTO ci_leg_delegations (digest, job_id, bundle, taken_at, signs) VALUES (?1, ?2, ?3, ?4, ?5)", params![d, j, bundle, at, signs])?;
+            let tx = crate::store::tx(c)?;
+            tx.execute("INSERT OR REPLACE INTO ci_leg_delegations (digest, job_id, bundle, taken_at, signs) VALUES (?1, ?2, ?3, ?4, ?5)", params![d, j, bundle, at, signs])?;
+            crate::trail::take(&tx, &bundle, at)?;
+            tx.commit()?;
             Ok(())
         })
         .await?;
@@ -834,26 +837,29 @@ async fn answer(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) {
     }
 }
 
+/// Which of `machine`'s runner processes asked, as it said when it joined. One that isn't joined
+/// now (gone while its ask waited for its session to open) is named in no certificate, rather than
+/// certified as a process kiln can't say it is (docs/ci.md W27-R01).
+fn asker(hub: &Hub, peer: PeerId, machine: &str) -> anyhow::Result<String> {
+    hub.instances.lock().get(peer).map(crate::instances::Instance::label).ok_or_else(|| anyhow::anyhow!("the runner process of {machine} that asked is no longer connected"))
+}
+
 /// The identity `ask` asks for, certified and recorded: its URI and certificate, and for a leg the
 /// server's delegation of it, by digest ([`delegate_leg`]). A leg's identity comes with its
 /// delegation or not at all, since its records are taken only under it.
 async fn issue(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) -> anyhow::Result<(String, String, Option<String>)> {
     let mut facts: Vec<(u64, String)> = Vec::new();
+    let instance = asker(hub, peer, machine)?;
     let (identity, lifetime) = match ask.kind.as_str() {
-        "runner" => {
-            let instance = hub.instances.lock().get(peer).map(|i| i.label()).unwrap_or_else(|| "legacy".to_owned());
-            (runner_identity(hub, machine, &instance).await?, time::Duration::hours(RUNNER_HOURS))
-        }
+        "runner" => (runner_identity(hub, machine, &instance).await?, time::Duration::hours(RUNNER_HOURS)),
         "agent" => {
             let session = ask.of.as_deref().ok_or_else(|| anyhow::anyhow!("an agent's identity names its session"))?;
             let epoch = ask.epoch.ok_or_else(|| anyhow::anyhow!("an agent's identity names its epoch"))?;
             // The runner process asking holds the session's key at this epoch: named in its certificate.
-            let instance = hub.instances.lock().get(peer).map(|i| i.label()).unwrap_or_else(|| "legacy".to_owned());
             (agent_identity(hub, machine, &instance, session, epoch).await?, time::Duration::hours(AGENT_HOURS))
         }
         "leg" => {
             let leg = ask.of.as_deref().ok_or_else(|| anyhow::anyhow!("a leg's identity names its leg"))?;
-            let instance = hub.instances.lock().get(peer).map(|i| i.label()).unwrap_or_else(|| "legacy".to_owned());
             let (identity, f, lifetime) = leg_identity(hub, machine, &instance, leg).await?;
             facts = f;
             (identity, lifetime)
@@ -871,7 +877,6 @@ async fn issue(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) -> any
     // A hand-over's (docs/ci.md W27-R08): its hand-on and the receipt for it kept first, so the
     // epoch rises with them; the key isn't certified without them.
     if let (Actor::Agent { .. }, Some(hand_on)) = (&identity.actor, ask.hand_on.as_deref()) {
-        let instance = hub.instances.lock().get(peer).map(|i| i.label()).unwrap_or_else(|| "legacy".to_owned());
         let came_from = format!("runner {machine} (instance {instance})");
         let epoch = ask.epoch.unwrap_or_default();
         if let Err(why) = crate::custody::transfer(&hub.store, &hub.pki.ca_der, &hub.pki.organization(), &came_from, &uri, epoch, hand_on, ask.receipt.as_ref(), &pem, now).await? {
@@ -963,23 +968,38 @@ pub async fn agent_at(hub: &Hub, session: &str, epoch: u64) -> anyhow::Result<St
 /// A CI leg's identity, for the runner process of `machine` it was given to: its run's number,
 /// its attempt and key, on that runner (and through it who enrolled the machine); as facts, W10's
 /// claims for it in Fulcio's extensions, as Fulcio puts a CI job's (its workflow's ref and digest,
-/// its repository, commit and ref, the event, its run and attempt); and how long it lasts.
+/// its repository, commit and ref, the event, its run and attempt), a v1 job's from its run;
+/// and how long it lasts.
 async fn leg_identity(hub: &Hub, machine: &str, instance: &str, leg: &str) -> anyhow::Result<(Identity, Vec<(u64, String)>, time::Duration)> {
     use kiln_ci::identity::chain::fulcio;
     let id = leg.to_owned();
-    type Row = (i64, i64, String, Option<String>, Option<String>);
+    type Row = (i64, i64, String, Option<String>, Option<String>, serde_json::Map<String, serde_json::Value>);
     let row: Option<Row> = hub
         .store
         .call(move |c| {
-            Ok(c.query_row("SELECT r.number, j.attempt, j.key, j.agent, j.leg FROM jobs j JOIN runs r ON r.id = j.run_id WHERE j.id = ?1", [&id], |x| {
-                Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?, x.get(4)?))
+            let sql = "SELECT r.number, j.attempt, j.key, j.agent, j.leg, r.id, r.sha, r.pipeline, r.event, r.branch, p.name
+                       FROM jobs j JOIN runs r ON r.id = j.run_id LEFT JOIN repos p ON p.id = r.repo_id WHERE j.id = ?1";
+            Ok(c.query_row(sql, [&id], |x| {
+                let text = |i: usize| x.get::<_, Option<String>>(i).map(Option::unwrap_or_default);
+                let (attempt, repo, sha, branch) = (x.get::<_, i64>(1)?, text(10)?, text(6)?, text(9)?);
+                // A v1 job's claims, as W10 words a planned run's: its `.kiln/` pipeline at its commit.
+                let at = format!("refs/heads/{branch}");
+                let workflow = format!("{repo}/.kiln/{}.yaml@{at}", text(7)?);
+                let v1 = serde_json::json!({
+                    "job_workflow_ref": workflow, "job_workflow_sha": sha, "workflow_ref": workflow, "workflow_sha": sha, "repository": repo,
+                    "sha": sha, "ref": at, "event_name": text(8)?, "run_id": text(5)?, "run_attempt": attempt.max(1).to_string(),
+                });
+                Ok((x.get(0)?, attempt, x.get(2)?, x.get(3)?, x.get(4)?, v1.as_object().cloned().unwrap_or_default()))
             })
             .optional()?)
         })
         .await?;
-    let (number, attempt, key, agent, spec) = row.ok_or_else(|| anyhow::anyhow!("kiln knows no leg {leg}"))?;
+    let (number, attempt, key, agent, spec, v1) = row.ok_or_else(|| anyhow::anyhow!("kiln knows no leg {leg}"))?;
     anyhow::ensure!(agent.as_deref() == Some(machine), "leg {leg} was given to {}, not {machine}", agent.unwrap_or_else(|| "no runner".into()));
-    let claims = crate::ci::oidc::leg_claims(hub, leg).await?.ok_or_else(|| anyhow::anyhow!("leg {leg} is of no run kiln planned"))?;
+    // A run kiln planned: W10's claims for it. A v1 job's run has no plan: its claims are its
+    // pipeline's, at its commit, so its results sign as the leg all the same (W27-R05).
+    let claims = crate::ci::oidc::leg_claims(hub, leg).await?.unwrap_or(v1);
+    let facts = fulcio::from_claims(&claims, &hub.cfg.server.public_url);
     // Its spec's timeout, as the scheduler reads it (360 minutes when it has none).
     let timeout = spec
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
@@ -997,7 +1017,7 @@ async fn leg_identity(hub: &Hub, machine: &str, instance: &str, leg: &str) -> an
             leg: leg_name(&key),
         },
     );
-    Ok((identity, fulcio::from_claims(&claims, &hub.cfg.server.public_url), leg_lifetime(timeout)))
+    Ok((identity, facts, leg_lifetime(timeout)))
 }
 
 /// A leg's key as its identity names it: its letters, digits, `.`, `_` and `-` (the rest `-`), at
@@ -1174,11 +1194,14 @@ pub async fn revoke(store: &Store, target: Target, reason: &str, by: &str, at: i
                     vec![(None, Some(key.clone()), subject.unwrap_or(key))]
                 }
             };
+            let taken_at = crate::util::now_unix();
             for (serial, key, subject) in &rows {
                 tx.execute(
                     "INSERT INTO revocations (serial, key_sha256, subject, at, reason, by) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![serial, key, subject, at, reason, by],
                 )?;
+                let said = kiln_ci::identity::trail::revocation(serial.as_deref(), key.as_deref(), subject, at, &reason, &by);
+                crate::trail::own(&tx, kiln_ci::identity::trail::PAYLOAD_REVOCATION, &said, taken_at)?;
             }
             tx.commit()?;
             let mut keys: Vec<String> = rows.into_iter().filter_map(|(_, k, _)| k).collect();

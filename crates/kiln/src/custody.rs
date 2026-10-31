@@ -984,6 +984,7 @@ async fn keep(store: &Store, c: &Checked, kind: Option<Kind>, counterpart: Optio
             for (name, alg, hex) in &things {
                 tx.execute("INSERT INTO custody_things (record, name, algorithm, hex) VALUES (?1, ?2, ?3, ?4)", params![digest, name, alg, hex])?;
             }
+            crate::trail::take(&tx, &envelope, taken_at)?;
             tx.commit()?;
             Ok(true)
         })

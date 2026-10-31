@@ -1,5 +1,6 @@
 //! The gates a release passes before its commit (docs/deploy-api.md §9.1): a freeze, the
-//! environment's windows, built-in checks, the provenance of what it deploys, the upstream
+//! environment's windows, built-in checks, the provenance of what it deploys, its chain back to
+//! whoever made it (kiln verify; refused where the environment requires it), the upstream
 //! environments it must run in first (`after`, here or on a linked server, §11) and how long
 //! (`soak`), external checks (a URL, a workflow) and people's approvals. Each gate's result is
 //! recorded on the release with its evidence. A gate that can pass by waiting holds the release
@@ -208,6 +209,20 @@ async fn judge(d: &Deploy, r: &Release, env: &Environment, app: &App, checks: &[
         }
     }
 
+    // What a new version deploys, or a rollback puts back, verifies back to whoever made it (docs/ci.md
+    // W27-R11): where the environment requires it, a chain that breaks is refused; elsewhere it's said.
+    if matches!(r.kind, Kind::Deploy | Kind::Rollback) {
+        let (verified, said, evidence) = chain(d, r).await;
+        if verified {
+            results.push(result("chain", true, said, evidence));
+        } else if g.require_chain == Some(true) {
+            results.push(result("chain", false, said.clone(), evidence));
+            return Ok(Verdict::Refuse { results, why: format!("{} requires a verified chain (require_chain): {said}", env.name) });
+        } else {
+            results.push(result("chain", false, format!("{said} (not required here)"), evidence));
+        }
+    }
+
     // A new version runs upstream first; rollbacks, config and enabling run what passed before.
     if r.kind == Kind::Deploy && !g.after.is_empty() {
         let soak = match g.soak.as_deref() {
@@ -384,6 +399,24 @@ async fn provenance(d: &Deploy, r: &Release, env: &Environment, p: &Provenance) 
     let names: Vec<&String> = verified.keys().collect();
     let detail = format!("kiln's signed provenance of {} meets the requirement", names.iter().map(|n| n.as_str()).collect::<Vec<_>>().join(", "));
     Ok(Proven::Yes(detail, json!({ "artifacts": verified, "requirement": wanted })))
+}
+
+/// kiln verify of what `r` deploys (docs/ci.md W27-R10): whether its chain verifies, in words, and
+/// the walk in short as the evidence.
+async fn chain(d: &Deploy, r: &Release) -> (bool, String, Value) {
+    match Box::pin(crate::verify::release(&d.hub, r)).await {
+        Ok(v) => {
+            let verified = v.get("verified").and_then(Value::as_bool).unwrap_or(false);
+            let links = v.get("links").and_then(Value::as_array).map_or(0, Vec::len);
+            let text = |b: &Value, k: &str| b.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+            let said = match v.get("broken").filter(|b| !b.is_null()) {
+                Some(b) => format!("the chain breaks at {}: {}", text(b, "link"), text(b, "why")),
+                None => format!("its chain verifies, {links} links back to whoever made it"),
+            };
+            (verified, said, json!({ "verified": verified, "links": links, "broken": v.get("broken"), "checkpoint": v.get("checkpoint"), "took_ms": v.get("took_ms") }))
+        }
+        Err((_, why)) => (false, format!("its chain couldn't be walked: {why}"), Value::Null),
+    }
 }
 
 /// What runs of an app in an upstream environment, and what's on its way there.

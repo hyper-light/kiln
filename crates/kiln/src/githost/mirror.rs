@@ -220,7 +220,11 @@ async fn record(store: &Store, repo_id: &str, host: Host, verdicts: Vec<Verifica
                      WHERE host IS NOT excluded.host OR state IS NOT excluded.state OR reason IS NOT excluded.reason OR signer IS NOT excluded.signer OR verified_at IS NOT excluded.verified_at",
                 )?;
                 for v in &verdicts {
-                    q.execute(params![repo, v.sha, host, signature_word(v.state), v.reason, v.signer, v.verified_at, at])?;
+                    // Read anew or changed: in the trail as kiln's word for what the host said.
+                    if q.execute(params![repo, v.sha, host, signature_word(v.state), v.reason, v.signer, v.verified_at, at])? > 0 {
+                        let said = kiln_ci::identity::trail::checked_by_host(&repo, host, &v.sha, signature_word(v.state), Some(&v.reason), v.signer.as_deref(), v.verified_at, at);
+                        crate::trail::own(&tx, kiln_ci::identity::trail::PAYLOAD_CHECKED, &said, at)?;
+                    }
                 }
             }
             tx.commit()?;

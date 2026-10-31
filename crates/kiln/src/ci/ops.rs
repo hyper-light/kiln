@@ -561,6 +561,15 @@ pub fn ops() -> &'static [Op] {
                 input: || schema(json!({"run": {"type": "string", "description": RUN}, "limit": {"type": "integer", "minimum": 1, "maximum": 1000}}), &[]),
                 route: |v| Ok((Method::GET, path(&["notify", "deliveries"]), query(v, &["run", "limit"]))),
                 run: |cx: Cx, v: Value| async move { answer(super::notify::deliveries(&cx.hub, &query(&v, &["run", "limit"])).await).await }),
+            op!("ci.verify", "Walk the chain back from a deploy, an artifact, a commit or a change (W27-R10): the release; the artifact's provenance and the leg that built it; each commit on the trunk it brings and its signature; the land by the queue that tested it; the verdicts that let it land, people and agents apart, and the trunk's review policy; each revision's author; kiln's root. Each link says whether it holds or why not, resting on a signed statement in kiln's trail checked as of when kiln took it, and the first that doesn't is named. Give exactly one of `deploy`, `artifact`, `commit` or `change`.", base: "", ro: true, destructive: false,
+                input: || schema(json!({
+                    "deploy": {"type": "string", "description": "A release: its number, or `<environment>/<app>@<version>`."},
+                    "artifact": {"type": "string", "description": "An artifact's digest, `sha256:<hex>`."},
+                    "commit": {"type": "string", "description": "`<repository>@<commit>`, of a repository kiln hosts."},
+                    "change": {"type": "string", "description": "A diff (`D12`), or its id."}
+                }), &[]),
+                route: |v| Ok((Method::GET, path(&["verify"]), query(v, &["deploy", "artifact", "commit", "change"]))),
+                run: |cx: Cx, v: Value| async move { crate::verify::verify(&cx.hub, &crate::verify::Target::of(&query(&v, &["deploy", "artifact", "commit", "change"]))?).await }),
             op!("ci.tests.propose_quarantine", "Propose quarantining a test (W16-R05) as a diff adding it to the trunk's `.kiln/quarantine.yaml`: under `quarantine: enforce`, its failures alone then let a step pass, with a warning. It lands through review.", base: "", ro: false, destructive: false,
                 input: || schema(json!({
                     "repo": {"type": "string", "description": REPO}, "test": {"type": "string", "description": "suite.name, suite::name, the name, or the id; `*` matches any run of characters."},
