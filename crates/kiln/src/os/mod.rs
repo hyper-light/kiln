@@ -415,7 +415,6 @@ mod tests {
         std::fs::rename(&new, &bin)?;
         std::fs::write(&go, b"")?;
         let said = String::from_utf8_lossy(&child.wait_with_output()?.stdout).into_owned();
-        println!("{said}");
         assert!(said.contains(&format!("exe={} (deleted)\n", bin.display())), "the replaced binary's own path: {said}");
         assert!(said.contains(&format!("this_kiln={}\n", bin.display())), "{said}");
         assert!(said.contains("running_image=7f454c46\n"), "owned reads must retain the running ELF, not replacement bytes: {said}");

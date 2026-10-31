@@ -1587,9 +1587,14 @@ mod tests {
         let retained=held.clone();hub.store.call(move|c|{
             assert!(c.query_row("SELECT EXISTS(SELECT 1 FROM ci_log_accepted_pins WHERE key=?1 AND ambiguous=1)",[retained],|r|r.get::<_,bool>(0))?);
             assert_eq!(c.query_row("SELECT COUNT(*) FROM ci_log_accepted_pins p JOIN ci_log_accepted_views v ON v.view=p.view WHERE v.job='fifth-reader'",[],|r|r.get::<_,u64>(0))?,0,"later eligible retirement must not starve behind held oldest view");
-            assert!(c.execute("INSERT OR IGNORE INTO jobs(id,run_id,key,display,status,labels,needs,spec) VALUES('fifth-reader','log-run','reuse','reuse','queued','[]','[]','{}')",[]).is_err(),"retired ID cannot bypass fence with INSERT OR IGNORE");
-            assert!(c.execute("INSERT INTO jobs(id,run_id,key,display,status,labels,needs,spec) VALUES('fifth-reader','log-run','reuse','reuse','queued','[]','[]','{}') ON CONFLICT(id) DO UPDATE SET status='queued'",[]).is_err(),"retired ID cannot bypass fence with upsert");Ok(())
+            Ok(())
         }).await?;
+        // An expected failed write must reach the same Store owner's rollback, not
+        // be swallowed inside a successful closure whose COMMIT is then poisoned.
+        let refused=hub.store.call(|c|{c.execute("INSERT OR IGNORE INTO jobs(id,run_id,key,display,status,labels,needs,spec) VALUES('fifth-reader','log-run','reuse','reuse','queued','[]','[]','{}')",[])?;Ok(())}).await;
+        assert!(matches!(refused.as_ref().err().and_then(|error|error.downcast_ref::<amphora_api::Refusal>()),Some(amphora_api::Refusal::Unavailable(reason)) if reason.contains("retired log job identity cannot be reused")),"retired ID cannot bypass fence with INSERT OR IGNORE: {refused:?}");
+        let refused=hub.store.call(|c|{c.execute("INSERT INTO jobs(id,run_id,key,display,status,labels,needs,spec) VALUES('fifth-reader','log-run','reuse','reuse','queued','[]','[]','{}') ON CONFLICT(id) DO UPDATE SET status='queued'",[])?;Ok(())}).await;
+        assert!(matches!(refused.as_ref().err().and_then(|error|error.downcast_ref::<amphora_api::Refusal>()),Some(amphora_api::Refusal::Unavailable(reason)) if reason.contains("retired log job identity cannot be reused")),"retired ID cannot bypass fence with upsert: {refused:?}");
         assert!(hub.blobs.blobs.head(&held).await.is_ok(),"ambiguous retained key cannot be physically removed");
         hub.store.delete_repo("log-repo".into()).await?;
         hub.store.call(|c|{assert!(!c.query_row("SELECT EXISTS(SELECT 1 FROM repos WHERE id='log-repo')",[],|r|r.get::<_,bool>(0))?,"released source lease permits later explicit repo deletion");Ok(())}).await?;
