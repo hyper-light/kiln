@@ -737,6 +737,29 @@ pub(crate) async fn fixture_missing_input(logs:&crate::logs::Logs,binding:JobLog
     Ok(id)
 }
 
+/// W19-R04: settle only the existing discovery probe before this fixture seeds its
+/// first producer. No live input, original delivery or receipt is discarded or reset.
+#[cfg(test)]
+pub(crate) async fn fixture_drain_before_producers(logs:&crate::logs::Logs)->anyhow::Result<Option<Completion>> {
+    let ctx=logs.accepted_context()?;
+    ctx.store.call(|c|{
+        anyhow::ensure!(!c.query_row("SELECT EXISTS(SELECT 1 FROM ci_log_producers)",[],|r|r.get::<_,bool>(0))?,"fixture discovery drain must precede producer ledger seeding");Ok(())
+    }).await?;
+    let only_probe=|owner:&Owner|owner.ready && owner.recovery.is_none() && owner.jobs.is_empty() && owner.waiting.is_empty() && owner.parked.is_empty() && owner.deliveries.is_empty() && owner.end_waiting.is_empty() && owner.debts.is_empty() && owner.ends.is_empty() && owner.server==0 && owner.io.len()<=1;
+    futures::future::poll_fn(|cx|{
+        let mut owner=logs.io.lock();
+        if !only_probe(&owner) {return std::task::Poll::Ready(Err(anyhow::anyhow!("fixture discovery drain refuses live work or original delivery custody")))}
+        // deliver=false keeps every Hub delivery in the SAME owner. If an unexpected
+        // append completion appears, return it for the fixture to inspect, never hide it.
+        if let std::task::Poll::Ready(result)=owner.poll_inner(cx,false) {
+            return std::task::Poll::Ready(result.map(Some))
+        }
+        if !only_probe(&owner) {return std::task::Poll::Ready(Err(anyhow::anyhow!("fixture discovery drain encountered live work; original owner retained")))}
+        if owner.io.is_empty() && !owner.end_probe {return std::task::Poll::Ready(Ok(None))}
+        std::task::Poll::Pending
+    }).await
+}
+
 /// Rebuild only at a quiescent owner boundary, retaining the real Store/Blobs and their
 /// original durable operations. This does not manufacture a Net grant or test transport.
 #[cfg(test)]

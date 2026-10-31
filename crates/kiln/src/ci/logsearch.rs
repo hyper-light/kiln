@@ -1606,6 +1606,11 @@ mod tests {
         use kiln_ci::wire::{JobLogBindingV1,JobLogContractV1,JobLogChunkV1,JobLogEndV1,
             JobLogCaptureV1,JobLogReplyV1,JobLogRefusalV1,OrdinaryOwnerV1,OrdinaryCommandV1};
         use crate::logs::accepted::producer;
+        // Earlier own append/copy replies may leave their discovery probe in this
+        // SAME owner. Settle it BEFORE any End exists; the first eligible producer
+        // End below must still be recovered by the actual cold restart, not this poll.
+        let earlier=producer::fixture_drain_before_producers(&hub.logs).await?;
+        assert!(earlier.is_none(),"discovery drain cannot hide an earlier completion: {earlier:?}");
         let bindings:Vec<_>=["producer-prefix","producer-empty","producer-reuse","producer-recovery","producer-incomplete","producer-truncated","producer-refused"].into_iter().enumerate().map(|(n,job)|JobLogBindingV1{
             contract:JobLogContractV1{version:1,capture_limit:if job=="producer-truncated"{3}else{65536}},
             owner:OrdinaryOwnerV1{version:1,job:job.into(),attempt:1,host:"producer-fixture".into(),process_nonce:"producer-process".into(),publication_epoch:"producer-epoch".into(),connection:"e".repeat(64),grant:format!("producer-grant-{n}"),execution:format!("ci-producer-{n}"),allocation:format!("retained-producer-{n}"),command:OrdinaryCommandV1{stream:"l:1.1".into(),seq:u64::try_from(n).unwrap_or(0)+1}},
