@@ -16,9 +16,12 @@ import { agentLabel, taskLive } from "./derive";
  */
 export const kilnSubagentsOf = (list: readonly AgentInfo[], id: string): AgentInfo[] => list.filter((a) => a.subagent === true && a.parent === id);
 
+/** Its process ended while nobody ended it: kiln starts it again by itself (docs/agents.md, "An agent lives until it's ended"). */
+export const startingAgain = (a: Pick<AgentInfo, "status" | "exit">) => a.status === "exited" && a.exit?.again_at != null;
+
 /** Where one of them stands, in a task's words: running, paused (on you, or for a usage limit), pending (its machine away), else done. */
 export function kilnStatus(a: Pick<AgentInfo, "status" | "approvals" | "pause" | "exit" | "held">): string {
-  if (a.status === "running" || a.status === "starting") return "running";
+  if (a.status === "running" || a.status === "starting" || startingAgain(a)) return "running";
   if (a.status === "waiting" || a.approvals.length > 0 || a.held || a.pause) return "paused";
   if (a.status === "disconnected") return "pending";
   if (a.status === "exited" && a.exit?.error) return "failed";
