@@ -128,6 +128,12 @@ pub async fn prepare(hub: &Hub, repo_id: &str, policy: &kiln_ci::land::Signature
         std::fs::create_dir_all(dir.join("verdicts"))?;
         let prepared = Prepared { dir };
         std::fs::write(prepared.dir.join("context.json"), serde_json::to_vec(&context)?)?;
+        // Built as its library's tests, this binary is the test harness, not kiln: git can't run
+        // it as the hook, so those tests' pushes go unchecked (tests/identities.rs checks them
+        // with kiln's own binary).
+        if cfg!(test) {
+            return Ok(prepared);
+        }
         let script = format!("#!/bin/sh\nexec {} {HOOK_ARG} update {} \"$@\"\n", quoted(&exe), quoted(&prepared.dir));
         let update = hooks.join("update");
         std::fs::write(&update, script)?;
