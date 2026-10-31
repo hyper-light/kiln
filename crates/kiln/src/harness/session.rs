@@ -977,6 +977,9 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
     core.state.cwd.clone_from(&cwd);
     core.state.model = spec.model.clone().unwrap_or_default();
     core.state.mode = spec.mode.clone().unwrap_or_default();
+    // What it starts at, until its harness says what it applied.
+    core.state.effort = spec.effort.clone().unwrap_or_default();
+    core.state.speed = spec.speed.clone().unwrap_or_default();
     core.state.harness_session.clone_from(&spec.resume);
     // Moved here: its timeline as it was, then the line saying so.
     let mut items = None;
@@ -1015,7 +1018,38 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
         core.state.arriving = sd.synced;
     }
     core.state.reach.clone_from(&spec.reach);
+    named_ahead(&mut core.meta, kind, spec.model.as_deref());
     begin(id, spec, kind, core, sink, on_change, files, items, None)
+}
+
+/// Harness `kind`'s lists as this machine knows them, for a session's page to name its settings by
+/// before the harness says anything (a new session may wait for room on its machine, then take
+/// seconds to start; a switch starts the harness anew): its permission modes, its models (but an
+/// ACP agent's), and the effort levels and speeds of the one it runs (`model`; none, its default),
+/// as Mission control's composer offered them. What the harness says once it runs takes their place.
+fn named_ahead(meta: &mut super::model::Meta, kind: &Kind, model: Option<&str>) {
+    let models = super::kinds::models_of(kind.id);
+    let runs = match model.filter(|m| !m.is_empty()) {
+        Some(id) => models.iter().find(|m| m.id == id),
+        None => models.iter().find(|m| m.default).or(models.first()),
+    }
+    .cloned();
+    if meta.modes.is_empty() {
+        meta.modes = kind.modes().0;
+    }
+    if meta.efforts.is_empty() {
+        meta.efforts = match runs.as_ref().filter(|m| !m.efforts.is_empty()) {
+            Some(m) => m.efforts.iter().map(|e| super::model::ControlOption { id: e.clone(), label: super::model::effort_label(e), description: String::new(), dangerous: false }).collect(),
+            None => kind.efforts(),
+        };
+    }
+    if meta.speeds.is_empty() {
+        meta.speeds = runs.map(|m| m.speeds).unwrap_or_default();
+    }
+    // An ACP agent's own list says it can run them: it lists none before it's signed in.
+    if meta.models.is_empty() && !matches!(kind.protocol, Protocol::Acp(_)) {
+        meta.models = models;
+    }
 }
 
 /// A session with this core, its task started (`adopt`: going on with a harness process the
@@ -2066,6 +2100,7 @@ async fn carry_over(s: &Arc<Session>, from: &'static Kind, sw: Switch, left: usi
         for_harness(st, resume, &sw.model, mode, effort);
         st.status = Status::Starting;
         core.meta = super::model::Meta::default();
+        named_ahead(&mut core.meta, to, Some(&sw.model));
         core.hold = false;
         core.state.switching = None;
         // A pause for the old harness's limit ends: the new one runs on its own account. The turn
@@ -2912,8 +2947,9 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
     let mut reloading = false;
     // Tasks the harness left running that a switch stopped.
     let mut left = 0usize;
-    // The models it last listed (the machine keeps the list for its "new agent" and switches).
-    let mut models_seen: Vec<super::model::ModelOption> = Vec::new();
+    // The models it last listed (the machine keeps the list for its "new agent" and switches): not
+    // those kiln named ahead of its harness (`named_ahead`), which are the machine's list already.
+    let mut models_seen = s.core.lock().meta.models.clone();
     loop {
         // The harness it ran in is down: on in the other one.
         // Its turn is over: on to the other runner (or, if that can't be, on here).
@@ -2957,7 +2993,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
             if let Some((to, carried)) = carry_over(&s, kind, sw, std::mem::take(&mut left), &sink).await {
                 kind = to;
                 seed = carried;
-                models_seen.clear();
+                models_seen = s.core.lock().meta.models.clone();
             }
             first = false;
             on_change();
@@ -3984,6 +4020,35 @@ mod tests {
         assert_eq!(carried_choices(claude, gemini, "plan", "", true, "").0, None);
         // And out of one: Devin's plan stays plan in Claude Code.
         assert_eq!(carried_choices(devin, claude, "plan", "", true, "opus").0.as_deref(), Some("plan"));
+        Ok(())
+    }
+
+    /// A session's page names its settings by its harness's lists before the harness says anything
+    /// (started, or switched to it anew): its modes by their names, the effort levels of the model it
+    /// runs where this machine has its list, else the harness's. What the harness said stays.
+    #[test]
+    fn a_harness_s_lists_name_a_session_s_settings_ahead_of_it() -> anyhow::Result<()> {
+        use super::super::model::{Meta, ModeOption};
+        use super::{Kind, named_ahead};
+        let kind = |id: &str| Kind::get(id).ok_or_else(|| anyhow::anyhow!("no {id}"));
+        let mut meta = Meta::default();
+        named_ahead(&mut meta, kind("codex")?, Some("gpt-6.1-sol"));
+        assert!(meta.modes.iter().any(|m| m.id == "untrusted" && m.label == "Ask"), "{:?}", meta.modes);
+        assert!(!meta.efforts.is_empty() && !meta.models.is_empty(), "{meta:?}");
+        // A model this machine hasn't listed: the harness's levels.
+        let mut meta = Meta::default();
+        named_ahead(&mut meta, kind("claude")?, Some("claude-unlisted-1"));
+        assert!(meta.modes.iter().any(|m| m.id == "acceptEdits" && m.label == "Accept edits"), "{:?}", meta.modes);
+        assert_eq!(meta.efforts.iter().map(|e| e.label.as_str()).collect::<Vec<_>>(), ["Low", "Medium", "High", "Extra high", "Max"]);
+        assert!(meta.speeds.is_empty(), "{:?}", meta.speeds);
+        // An ACP agent's models are its own to list (none before it's signed in); its modes are known.
+        let mut meta = Meta::default();
+        named_ahead(&mut meta, kind("devin")?, None);
+        assert!(meta.modes.iter().any(|m| m.id == "smart" && m.label == "Smart") && meta.models.is_empty(), "{meta:?}");
+        let said = vec![ModeOption { id: "said".into(), label: "Said".into(), description: String::new(), dangerous: false }];
+        let mut meta = Meta { modes: said.clone(), ..Meta::default() };
+        named_ahead(&mut meta, kind("claude")?, None);
+        assert_eq!(meta.modes, said);
         Ok(())
     }
 
