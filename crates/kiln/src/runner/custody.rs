@@ -379,6 +379,17 @@ pub fn certified(session: &str, epoch: u64) -> bool {
     STATE.lock().waiting.remove(&(session.to_owned(), epoch)).is_some_and(|w| w.blue_green)
 }
 
+/// A bundle (a signed statement, as JSON) as it came: a hand-on passed from the runner before this
+/// one (blue/green), read here, where what's signed is checked.
+pub fn bundle_of(json: &str) -> Option<Value> {
+    serde_json::from_str(json).ok()
+}
+
+/// The server's signature beside hand-over's word `json` (its `word`), as it came.
+pub fn word_in(json: &str) -> Option<String> {
+    serde_json::from_str::<Value>(json).ok()?.get("word")?.as_str().map(str::to_owned)
+}
+
 /// Whether session command `json` the server sent is a hand-over's word (a local `MoveTo`: hand
 /// it to this machine's newest process; `HandedOver`: the server's word on such a hand-over): about
 /// the hold of the process it's sent to, never another's.
@@ -449,11 +460,10 @@ fn task_hand_on(slot: &str, by: &str, session: &str, task: &str) -> Option<Value
 /// kiln's server handed one of this process's agent sessions work (`json`: `{session, hand_on}`,
 /// `ServerMsg::Custody`): the session's receipt is signed as its next turn starts ([`status`]).
 /// Asked again for the same hand-on (after a reconnect), it's kept once.
-pub fn handed(json: &str) {
+pub fn handed(v: &Value) {
     if !signs() {
         return;
     }
-    let Ok(v) = serde_json::from_str::<Value>(json) else { return };
     let Some(session) = v.get("session").and_then(Value::as_str) else { return };
     let hand_on = match v.get("hand_on") {
         Some(Value::String(s)) => serde_json::from_str::<Value>(s).unwrap_or(Value::Null),
@@ -657,7 +667,7 @@ mod tests {
             let p = statement::payload(&Statement { subject: vec![crate::custody::work(name, &[name])], ..Statement::new(to_value(&body)) })?;
             Ok(statement::bundle(PAYLOAD_CUSTODY, &p, &signing.sign(&statement::to_sign(PAYLOAD_CUSTODY, &p))?, &crate::pki::der_of(&server_pem)?))
         };
-        let ask = |b: &Value| serde_json::json!({ "session": session, "hand_on": b.to_string() }).to_string();
+        let ask = |b: &Value| serde_json::json!({ "session": session, "hand_on": b.to_string() });
         let receipts = |name: &str| -> Vec<Statement> { drain().iter().filter_map(|r| serde_json::from_str::<Value>(r).ok()).filter_map(|b| statement_of(&b)).filter(|s| s.subject.first().is_some_and(|t| t.name == name)).collect() };
         let first = hand_on("plan run r1 step 1")?;
         handed(&ask(&first));
@@ -667,7 +677,7 @@ mod tests {
         let asked: IdentityAsk = serde_json::from_str(&identity::ask("agent", Some(session), Some(0))?)?;
         let me = Identity::new(&org, Actor::Agent { person: "ada".into(), agent: session.into(), epoch: 0, held_by: Some(kiln_ci::identity::chain::Holder { machine: "adacachy".into(), instance: "01a14794".into() }) });
         let pem = pki.issue_identity(&asked.csr, &me, &[], time::Duration::hours(1))?;
-        identity::given(&serde_json::to_string(&crate::proto::IdentityGiven { kind: asked.kind, of: asked.of, epoch: asked.epoch, uri: me.uri()?, cert_pem: Some(pem), ..crate::proto::IdentityGiven::default() })?, dir.path(), "main")?;
+        identity::given(crate::proto::IdentityGiven { kind: asked.kind, of: asked.of, epoch: asked.epoch, uri: me.uri()?, cert_pem: Some(pem), ..crate::proto::IdentityGiven::default() }, dir.path(), "main")?;
         assert!(take_up_due(), "signed once its identity is");
         let got = receipts("plan run r1 step 1");
         let body = got.first().map(|s| s.body.clone()).unwrap_or_default();

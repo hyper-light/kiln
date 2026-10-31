@@ -66,7 +66,7 @@ session is at, and the inbox refuses, naming both epochs:
 | `no_session` | the session isn't on that host | answers the sender |
 | `full` | the session's lane holds 1,024 waiting | answers the sender |
 | `unavailable` | its records can't be read or written now | answers the sender |
-| `invalid` | an id that can't be kept (empty, over 128 bytes, a control character) | answers the sender |
+| `invalid` | an id that can't be kept (empty, over 128 bytes, a control character), or a message its runner couldn't read that it never took (below) | answers the sender |
 
 **Moves.** As a move begins, a session takes no more messages: those it was sent and hadn't taken go
 with it at the end of its queue, and those after are refused `moved` before its inbox takes them, so
@@ -102,11 +102,24 @@ machine, at the same epoch) brings its inbox's newest ids the same way, and refu
 it's handed over. The new build takes no messages until it's promoted (each refused `moved`, and
 sent again): if it never is, the runner it upgrades takes its sessions back once the new build is
 seen gone (stopped by its supervisor, else killed: one that can't be stopped keeps what it took
-over, and takes messages again a while later, never beside the runner it upgrades), and their
-inboxes take messages again, what they took before still counting; so does that runner if it's
-started again with them before then (a handover's fence, unlike a move's, is lifted). Its inbox
-unreadable as a session is handed over, the session takes the ids it holds itself: its queue's, its
-timeline's, and those it brought and hasn't taken in.
+over, and takes messages again a while later, never beside the runner it upgrades; so does one
+whose link to that runner ends, everything handed over or part of it, with no word of its
+promotion), and their inboxes take messages again, what they took before still counting; so does
+that runner if it's started again with them before then (a handover's fence, unlike a move's, is
+lifted). Its inbox unreadable as a session is handed over, the session takes the ids it holds
+itself: its queue's, its timeline's, and those it brought and hasn't taken in.
+
+**A harness that ends.** An ACP or Codex adapter holds a message its harness can't take yet (sent as
+the harness started, or to go first as a turn stops), and the conversation shows it queued. Whatever
+ends the harness's process (a switch to another harness, a move, a stop, a crash, a start again for
+a rewind or a setting, an upgrade that can't hand it over), what its adapter held goes first in
+kiln's queue, in order, still shown queued where it was said, and the next process takes it,
+whichever harness that is (`Adapter::let_go`). Until it does, the conversation's Edit and Unsend
+reach it there, and the queue above the composer doesn't list it again. A message to go in turn
+waits behind what kiln's queue holds, sent while the harness runs or starts or while the agent is
+stopped (what's open, below, says when it doesn't). What the harness was handed and never finished
+ends dropped, never left on its way; and when the agent ends, so does what still waited to go.
+Before, a switch out of a Codex still starting lost the message, which said queued for good.
 
 **One runner a machine.** A session an older runner process hands to its machine's newest
 (docs/releases.md, "One runner a machine") goes as a move does: it takes no messages as it's handed
@@ -194,6 +207,19 @@ To a runner announcing `CAP_INBOX` (past `Build`'s 32 bits, in its `AgentMsg::Ca
 (appended last, after the wire's and the cluster group's: postcard variants); the runner's process
 that holds the session answers it. A runner from before inboxes gets `HarnessCmd` as before: its
 messages go on unchecked, and no answer is waited for.
+
+A message its runner can't read (docs/wire.md, "What can't be read": `server_payload`) is answered
+by its session's inbox all the same, when its id can be read: the runner puts what it could read of
+it on the session's lane, after what came before it, and the inbox answers it as it would the
+message. One it took before is answered as its repeat: its words can't be compared, so whatever
+comes under an id it took is taken for that message, as one brought from another machine is, never
+`reused`. One sent for an epoch other than the one its session is at here, or as it went on
+elsewhere, is refused as above (`stale_epoch`, `behind`, `moved`); its lane full, `full`; its
+session not here, `no_session`. One it never took is refused for good, `invalid`, saying its runner
+couldn't read it and why. The runner tells a server that takes it (`CAP_UNREAD`) what it couldn't
+read (`AgentMsg::Unread`, naming the session), and it's kept on the agent's page. When not even its
+id can be read, or its inbox can't be read just then, nothing answers it: the server stops waiting
+for its answer, as it does for any that doesn't come (`kiln_sends_unanswered_total`).
 
 ## Metrics
 
@@ -378,7 +404,14 @@ host's.
   and sends nothing: sent again under an id of its own, it was a second prompt (the twentieth
   adversarial check's; `ui/src/views/harness/unsend.ts`). Taking such a message back, where its
   harness allows, is to come; an unsend that does take one back must let its id go for Undo to send
-  it again.
+  it again. Once the adapter's harness has ended, what it held waits in kiln's queue (above, "A
+  harness that ends"), and an unsend takes it back there: the conversation says it was dropped, and
+  Undo sends nothing.
+- **What a harness was handed when its process ended.** A message its harness was handed and never
+  finished (sent, in its own queue, under way) ends dropped: it may have run, so it isn't sent
+  again, and one that never reached it is the person's to send again (above, "A harness that ends").
+- **A message sent as a session arrives.** One sent while a session's files come in from the
+  machine it left goes to its harness as it starts there, ahead of the queue it brought.
 - **A goal's word withdrawn while its harness starts.** The goal driver takes a goal's word back
   (the goal ended, cleared or put back) with `queue_remove` too, which can't take back a word a
   starting Codex or ACP harness's adapter holds: that word still reaches the agent, once, and the
@@ -402,11 +435,11 @@ host's.
   the new build goes with it; if the new build hands one on to its harness and the upgrade is then
   rolled back, the runner it upgrades sends it again (CP-T3.1's journal keeps the queue with what's
   handed on).
-- **A crash just after a blue/green handover.** A runner that crashes in the moment after it handed
-  its sessions to the new build, before its record says so, and starts again takes them back
-  (fenced, and its harnesses stopped) while the new build, not promoted, takes messages again after
-  a while: both hold them. CP-T3.1's journal, which commits a session's leaving before it's done,
-  closes the moment.
+- **A crash during or just after a blue/green handover.** A runner that crashes as it hands its
+  sessions to the new build, or in the moment after, before its record says so, and starts again
+  takes back those it had handed (fenced, and its harnesses stopped) while the new build, not
+  promoted, takes messages again after a while: both hold them. CP-T3.1's journal, which commits a
+  session's leaving before it's done, closes the moment.
 - **A crash mid-move.** A runner that crashes after fencing a moving session's inbox and before the
   machine it goes to takes it has the session back fenced: it refuses messages (`moved`) until it's
   moved again (the server's taking it back by itself is to come).

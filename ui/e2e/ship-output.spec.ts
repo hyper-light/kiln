@@ -104,7 +104,8 @@ test("copy puts the job step's whole output on the clipboard", async ({ page, is
   });
   const { out } = await openOutput(page);
   // A running job moves from step to step, so each copy is checked against the very log it fetched
-  // (GET /api/jobs/:id/logs?step=N for the job and step the card showed), until one carries text.
+  // (GET /api/jobs/:id/logs?step=N for the job and step the card showed), until one carries text
+  // (an empty one copies nothing).
   let copied = "";
   let url = "";
   for (let i = 0; i < 15 && !copied; i++) {
@@ -112,7 +113,7 @@ test("copy puts the job step's whole output on the clipboard", async ({ page, is
     await out.getByRole("button", { name: /^Cop(y|ied) the output$/ }).click();
     const res = await got;
     const fetched = await res.text();
-    await expect.poll(() => page.evaluate(() => (window as unknown as { __copied?: string }).__copied ?? null)).toBe(fetched);
+    await expect.poll(() => page.evaluate(() => (window as unknown as { __copied?: string }).__copied ?? "")).toBe(fetched);
     copied = fetched;
     url = new URL(res.url()).pathname + new URL(res.url()).search;
     if (!copied) await page.waitForTimeout(1000);
@@ -126,8 +127,10 @@ test("copy puts the job step's whole output on the clipboard", async ({ page, is
 
 test("a refused copy says so", async ({ page, isMobile }) => {
   test.skip(isMobile, "the desktop projects run it");
+  // Refused both ways: the clipboard API, and the copy command it falls back to.
   await page.addInitScript(() => {
     Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async () => Promise.reject(new DOMException("Write permission denied.", "NotAllowedError")) } });
+    Object.defineProperty(document, "execCommand", { configurable: true, value: () => false });
   });
   const { out } = await openOutput(page);
   await out.getByRole("button", { name: "Copy the output" }).click();

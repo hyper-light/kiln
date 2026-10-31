@@ -197,7 +197,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W17 | Debugging | W06, W13 | in progress | terminals into running and kept legs (host, docker; on the run page and `kiln debug terminal`), keep on failure with extend and release, a step rerun in place, `kiln workflow run` here or on a server, agents through MCP (exec, rerun step, keep, release); log search and "compare with the last green run" (W19); terminals into `k8s` pods' legs; in Firecracker microVMs terminals, keeping, extend and release, and reruns in place (W13-R05); shards' left |
 | W18 | Supply chain, untrusted code | W10, W13 | in progress | provenance the server makes from its own records and signs (SLSA v1.0, DSSE, Sigstore bundles; its own P-256 key, a cosign key file, AWS KMS, or keyless through Fulcio and Rekor), images' referrers in kiln's registry, a provenance check CD's environments require before they deploy (R04, AC04), `kiln/attest@v1` and the job's `attest:`, bundles beside files, on the run and through GitHub's attestations API; SBOMs (SPDX 2.3, CycloneDX 1.6) from ten lockfile kinds and `syft`, `kiln sbom`; AC01 with cosign, AC02; untrusted code: trust (fork PRs polled or delivered, marks), approval of outside contributors' runs, untrusted executors (rootless Docker), isolated cache scopes, contained networks through a per-leg egress proxy (SNI checked, blocks annotated), AC03 in containers; the dependency changes a diff makes, on its review page (R03); attestations as referrers in other registries too; Firecracker microVMs contained (no network device: out only through the egress proxy, W13-R05); shards' left |
 | W19 | Insights, audit, notifications | W05 | done (AC05's real channels with W11-AC03's tenants) | notification rules from trunk and the server (events, `where`, `throttle`, `run.fixed`, `deploy.*`, `leg.flaky`, `land.ejected`, `runner.offline`, `review.requested`, `comment.reply`, `mention`, `quota.near`, `secret.unused`), Slack, Discord, Teams, Telegram, PagerDuty, Opsgenie, email (SMTP), kiln's inbox and signed webhooks, deliveries recorded, `kiln/notify@v1`, AC05; outgoing webhooks (per-scope subscriptions to kiln's events, signed, in order, retried, logged before sending, resumed after a restart, redelivered); insights (hourly and daily rollups that merge, percentiles within 1 %, waits by reason, attempts, flaky legs, cache, runner utilization, fair share, critical path, AC01, AC02) with Prometheus metrics; compare (differences in actions, variables, environment, images, machines and cache; changed files; steps side by side; "since the last green run", AC03); log search (a trigram index built as legs finish, filters, one leg's search, failure excerpts, AC06 under 1 ms in 10,000 runs); audit v2 (one row per change with principal, on-behalf-of, token, scope, route, result and address; handlers' notes as its detail; secret uses and integration exchanges; filters by every field; AC04 from the route table); OpenTelemetry export (OTLP traces of runs, legs and steps); a person's own rules (inbox, email; Settings → You); Linear and Jira as channels, `diff.landed` and `test.quarantined` |
-| W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | in progress | one registry for deployments' and CI's operations, checked against the route table; `kiln.ci.*` and tools for runs, legs (exec, rerun step, keep, release), workflows (edits proposed as diffs), caches, artifacts, tests (quarantine proposed as a diff), metrics, runners, pools, images, routing, secrets' names, variables, integrations, environments, insights and diffs; the seven CI skills (author, diagnose, runners, review, migrate, secrets, performance), their programs run as written (AC05); users' tokens over MCP; every operation over HTTP, in the OpenAPI document and as `kiln op`; writes to routing rules, pools and environments that say what they do (R03); agents asking for runs (R07); attachments and incidents, with every wake R08 lists, Attach agent on each page it names, and daily limits on incidents, tokens and runner minutes (R08 to R10); every §4.1 route an operation on every surface, and §4.3's commands (AC01); bisecting a failure; experiments, their options built by agents too, measured by ordinary runs, with intervals, effects, interactions and a recommendation (R11, AC06); agents' own isolation left |
+| W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | in progress | one registry for deployments' and CI's operations, checked against the route table; `kiln.ci.*` and tools for runs, legs (exec, rerun step, keep, release), workflows (edits proposed as diffs), caches, artifacts, tests (quarantine proposed as a diff), metrics, runners, pools, images, routing, secrets' names, variables, integrations, environments, insights and diffs; the seven CI skills (author, diagnose, runners, review, migrate, secrets, performance), their programs run as written (AC05); users' tokens over MCP; every operation over HTTP, in the OpenAPI document and as `kiln op`; writes to routing rules, pools and environments that say what they do (R03); agents asking for runs (R07); attachments and incidents, with every wake R08 lists, Attach agent on each page it names, and daily limits on incidents, tokens and runner minutes (R08 to R10); every §4.1 route an operation on every surface, and §4.3's commands (AC01); bisecting a failure; experiments, their options built by agents too, measured by commands in each variant's own worktree beside the agent that asks (no CI) or by ordinary runs, with intervals, effects, interactions and a recommendation (R11, AC06); agents' own isolation left |
 | W21 | UI | each backend it shows | in progress | the CI API; the run page (attempts, reruns, the graph from the plan with matrix grids, progress and what jobs wait for, critical path, summaries, annotations, artifacts, pins); the leg page (notes, timing bar, attempts, outputs, terminal, Keep); the runs list's facets and sorts; the workflow editor (checks against its repository, the schema's keys, the plan preview and its matrix, the flow view, saving as the repository takes it); Insights (repositories, workflows, runners, tests, benchmarks); Settings → CI, → People, → Tokens and → You; the Runners page's pools (their scaling history), images and executors, and the image builder; comparing runs; log search; environments (board and pages); AC01 in kiln's CI (`ci/ui/run-all.sh`), AC02, AC03 (25–30 ms, 60 fps), AC04, the run's data flow; the editor's Agentfile lints left (shards' own: blocked on shards) |
 | W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 39 of 57 runnable starter workflows green, the other 18 failing the same way on GitHub, every miss explained; AC02: 48 of F-21's 50 green, four of them needing accounts and passing in dry configurations against stand-ins (AWS's two, Google's, Codecov's); azure/login waits for a tenant, and attest-build-provenance for GitHub's Sigstore; AC04 (fault injection: drops, delays, OOM kills, full disks and corrupted uploads, each recovered from as specified); AC07 (the security suite: token scope on every route, secrets in no log, API, event or database file, YAML bombs, SSRF guards, archive traversal); AC06 (the UI suite in kiln's own CI: `ci/ui/run-all.sh` in `.kiln/ci.yaml`'s `ui-checks`); AC08 (`kiln ci bench`, every §1.5 target it measures met, regressions gated in kiln's own CI); AC09 (a runner from before the CI work beside this version's) |
 | W23 | CI providers: KilnCI, GitHub Actions, GitLab CI/CD, Bitbucket Pipelines | W03, W14, deploy-api.md §7 | in progress | the git-host interface (kiln, GitHub, GitLab, Bitbucket); the provider core; GitHub Actions, GitLab CI/CD and Bitbucket Pipelines behind one contract (runs, jobs, logs, rerun, cancel, dispatch, artifacts, approvals, environments, checks, lint, webhooks; AC01); the hosts' pull requests through one API (R06); events for agents; SSO with GitHub, GitLab and Bitbucket, and acting on the host as the person |
@@ -1767,7 +1767,10 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
 - **W05-R16 Defaults.** Without a policy: `runner-lost` is retried once on a different runner
   when one can take it, else on the same one (today's requeue, kept, and shown as "retried:
   runner X was lost"); nothing else is retried. A policy's `runner: different` waits for another
-  runner, and says so (`other-runner`).
+  runner, and says so (`other-runner`). A leg its runner refuses (an assignment that couldn't
+  reach it counts as refused) goes to another runner that can take it, on the same attempt; with
+  none, it's offered to the one that refused it again 15 s later, as v1 offers a declined job
+  again, and says so (`retry`).
 - **W05-R17 Reruns**, GitHub-exact: re-run all jobs, re-run failed jobs (and the jobs that need
   them), re-run one job (and its dependents), optionally with debug logging. A rerun is a new run
   attempt (`github.run_attempt`); automatic leg retries are attempts of the leg
@@ -6437,9 +6440,11 @@ mode in QuickJS, a tool per operation, skills) from deployments to all of CI, an
   - decisions (bring results back, or pick automatically);
   - budgets.
 
-  Two things change. Measurement is ordinary CI: each variant's runs are workflow runs on routed
-  runners, so benchmarks land on exclusive hardware by routing rules. Isolation options now include
-  `firecracker` and `shards` (built from an Agentfile that declares the agent and its grants).
+  Two things change. Experiments don't need CI: a command runs in each variant's own worktree on
+  the machine of the agent that asks, and only a pipeline (or a command given `runs-on`) is a CI
+  run, on routed runners, so a benchmark can land on exclusive hardware by routing rules. Isolation
+  options now include `firecracker` and `shards` (built from an Agentfile that declares the agent
+  and its grants).
 
 **Acceptance criteria**
 
@@ -6518,6 +6523,10 @@ R04, R05's skills, and R06's rights.
   once as that route's would be), in the OpenAPI document (`/api/ops/{name}`, each with its
   summary and schema), and as `kiln op` (the list, `--schema`, and a run with a JSON object or
   `key=value` pairs). Checked end to end (`w20_r01_operations_over_http_and_the_cli`).
+- *R01's* input schemas are generated (docs/agents.md, "Operations"): each operation takes a Rust
+  input type (`crate::ops::Input`), whose JSON Schema is what every surface publishes, and a call's
+  input is read as it once its caller may run it. An argument it doesn't take, or one of the wrong
+  type, is refused saying where and why (`mcp::tests::every_operation_is_typed`).
 - *AC05* (`tests/skills.rs`): the skills' programs run as written. The test takes each program
   from its `SKILL.md` and calls `code_run` with it over MCP, against a server with a repository,
   a failing run, a leg no runner can take, a diff and a secret:
@@ -6663,16 +6672,24 @@ R04, R05's skills, and R06's rights.
     applies each option's change, resolves the conflicts and submits the combination as a diff
     (the variant's glue commit), and the variant is measured once it's made. Without one, or
     when it can't, the variant isn't measured; nor is one with an option an agent didn't make.
-  - **Measuring** is ordinary CI on routed runners:
-    - a `pipeline` criterion runs its workflow at the variant's commit, its triggers' filters
-      aside;
-    - a `command` criterion runs a one-job workflow, on a commit made on the variant's for it, on
-      its `runs-on`;
-    - a `metric` is read from those runs' `$KILN_METRICS`.
+  - **Measuring** needs no CI (the person's call, 2026-10-31):
+    - a `command` criterion runs in the variant's own worktree on the machine of the agent that
+      asks (`crate::workspace::measure`, asked through that agent's runner): the base with the
+      variant's change committed, made once for each variant under kiln's data folder there and
+      kept for its rounds, then removed with the experiment. The command runs as `kiln run` runs
+      one there (the person's login environment, bash, what it leaves running ended with it), and
+      passes when it exits 0; one that doesn't says why with what it printed last;
+    - a `pipeline` criterion, or a `command` given `runs-on`, is a CI run on routed runners: a
+      pipeline's workflow at the variant's commit, its triggers' filters aside; a command's
+      one-job workflow on a commit made on the variant's for it. Only these need CI's engine:
+      with it off, the experiment is refused, saying so;
+    - a `metric` is read from what they write to `$KILN_METRICS`, a JSON line each
+      (`{"name": "p95_ms", "value": 12.3}`).
 
     Repetitions are interleaved: each round runs every variant once, in a shuffled order (seeded
-    by the experiment), `max_parallel` at once. A `budget_minutes` that runs out cancels what
-    runs and reports what was measured, as a cancel does. Each variant counts its runner
+    by the experiment), `max_parallel` at once. A time limit (`budget_seconds`, set in any unit
+    from seconds to years; or `budget_minutes`) that runs out cancels what runs and reports what
+    was measured, as a cancel does. Each variant counts its runner
     minutes. Its runs are trusted as the owner's are, and anyone else's as a fork's.
   - **Results**:
     - each variant's required checks (passes of repetitions), and each metric's median and its
@@ -6686,13 +6703,22 @@ R04, R05's skills, and R06's rights.
     `experiments.decide` chooses one. The asking agent is told the variant's commit and ref,
     which it fetches by its commit from kiln's git.
   - **From a question**: an agent's multiple-choice question offers "Experiment…" beside its
-    answers (the choices dialog's experiment form: options, strategy, isolation, criteria and
-    thresholds, repetitions, a budget, who decides). Its pipelines are the workflows of the
-    repository the agent's folder is a checkout of (`GET /api/experiments/where?agent=`). The
-    options become options for agents to implement, and the question is answered "running
-    experiment E12"; the results come as the agent's next message. Started from an agent
-    without a `repo`, the experiment is in that repository; a command criterion without
-    `runs-on` runs on the agent's machine.
+    answers (the choices dialog's experiment form: options, strategy, isolation, its checks and
+    its metrics with their thresholds, repetitions, a budget, who decides). A check is a command,
+    or, while CI's engine is on, one of the workflows of the repository the agent's folder is a
+    checkout of (`GET /api/experiments/where?agent=`, which also names the machine the checks
+    run on, and what the agent suggested). A metric is lower or higher being better, with no
+    threshold, one to stay within (at most, or at least), or a % better than the baseline; one
+    with a threshold may be required to meet it, and one without is only compared. The form is
+    the experiment at a glance, a line for each part (its variants, checks, metrics, runs, and
+    what happens when it's done) saying what it's set to; each opens a page of its own to change
+    it, and Start is on the glance, so starting as the agent suggested is one tap. A time limit
+    is in any unit from seconds to years. The form starts with what the agent suggested for its
+    question (`experiments.suggest`, one of every agent's tools: the commands its options' variants
+    run, the metrics they write and their thresholds). The options become options for agents to
+    implement, and the question is answered "running experiment E12"; the results come as the
+    agent's next message. Started from an agent without a `repo`, the experiment is in that
+    repository.
   - **Its page**: every variant with its checks and its metrics' intervals on one scale (a dot and
     whiskers against the baseline's line, said in words beside them), the effects and
     interactions, its runs by variant, "Continue with this" on each once it's done, and Cancel.
@@ -6705,6 +6731,12 @@ R04, R05's skills, and R06's rights.
   a variant records its commit. A second experiment's conflicting options make a variant said
   to conflict, and cancelling it stops it. The analysis is checked on its own too
   (`w20_r11_measurements_say_what_helps_and_what_fights`, `w20_r11_strategies_make_their_variants`).
+  Without CI (`w20_r11_measured_beside_the_agent_without_ci`): CI's engine off, the same options and
+  bench, the bench a command run beside an agent on a runner, give the same results, every run on
+  that agent's machine and none a CI run, and the worktrees go when it's done; a pipeline is
+  refused. A variant's worktree, its rounds and its end are checked on their own
+  (`w20_r11_a_variant_is_measured_in_its_own_worktree`), and the form in the browser
+  (`ui/e2e/experiment-setup.spec.ts`).
 - *AC02*, against a local server (`tests/code_mode.rs`, `w20_ac02_one_program_over_the_last_hundred_runs`):
   a hundred runs of a workflow with two jobs failing each its own way (a plain failure, a full
   disk). One `code_run` program pages through the runs and reads the failed ones' legs, then each
@@ -9524,8 +9556,9 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
 
 **Scope.** The land queue, builds and deploys of a trunk many agents change at once (kiln plan
 `01a17502affc74b3af5a30092f8418bc`). This section holds step 9's requirements, R30–R39 (kiln plan
-`01a1751638e773b98b5092662fc06bf5`); the other steps take their ranges as they come. Commits
-before this one call this workstream "W25 step N". Step 6's, admission, are R60–R69 (kiln plan `01a17603d7cd701bb0a238c056af91ae`).
+`01a1751638e773b98b5092662fc06bf5`) and its third step's, R100–R109, and step 5's, R50–R59 (kiln plan
+`01a17604e26a73e187efb3a2859aaacb`); the other steps take their ranges as they come. Commits
+before this one call this workstream "W25 step N". Step 6's, admission, are R60–R69 (kiln plan `01a17603d7cd701bb0a238c056af91ae`); step 8's, spreading load, R80–R89.
 
 **Requirements: the conflict graph**
 
@@ -9619,6 +9652,98 @@ before this one call this workstream "W25 step N". Step 6's, admission, are R60�
   broken trunk (the last push to finish the job had failed it at the same step) fails only on a
   stack that holds the change that started its streak. *Replay* (`cargo test -p kiln-ci
   w28_ac33`); ci/sim/README.md keeps the report.
+
+**Requirements: the land queue by component** (step 9's third step, R100–R109: R30–R37 wired into
+`crates/kiln/src/ci/land.rs`, the decisions pure in `kiln_ci::land::queue`, with what Review needs of
+the queue)
+
+- **W28-R100 Components.** The entries queued and under test make a conflict graph (R30, R31) over
+  the repository's units: the trunk's package graph and each entry's own (its top pinned
+  revision's), each package a unit by its folder, its dependencies and its workspace's root files.
+  An entry's change is the files its pinned revisions change, and those of the diffs below it that
+  entries ahead of it land, so a stack split at its clear prefix stays one component, its later part
+  after the rest. Each component is a queue of its own: entries of different components never wait
+  for each other. Each entry keeps its standing: its component (by its head's id), its place there,
+  its component's window, and its decision against each entry ahead of it (R34).
+- **W28-R101 Candidates by component.** Each component without a candidate under test gets one,
+  tested beside every other component's: its first entries, as many as its window allows (R36's
+  AIMD window, starting at and never passing the trunk's `queue.batch`, or a bisection's bound),
+  applied in order onto the trunk's tip. A joint candidate holds only entries that meet, and says
+  where (their interaction units, files or targets); an entry that meets no other has a candidate
+  of its own, its own change's result. An entry that conflicts with one ahead of it in its
+  candidate waits for that one to land; the candidate ends before it. New candidates go in R35's
+  order. Each entry counts the candidates that held it (`tested`).
+- **W28-R102 Results stand; bisection stays inside.** A candidate that passed after the trunk moved
+  for another component lands as tested, its entries applied again onto the trunk's tip, when what
+  moved the trunk shares no file, unit or target with it (asked again just before the move); else it
+  is tested again on the trunk as it is, saying why. So when the trunk moves for one component, the
+  others aren't tested again. A failure is bisected inside its component: alone, its entry is the
+  culprit and is ejected, saying which check failed; else the component's window halves and its next
+  candidate ends at the middle suspect.
+- **W28-R103 One move at a time.** The trunk moves by compare-and-swap, each move taking every entry
+  of one ready candidate at once; a move the trunk raced builds the candidate again.
+- **W28-R104 Review's gate.** `review::readiness` is the single gate of `land`, `land_when_ready` and
+  the queue's re-check just before each move: ready means it lands; blockers (by the trunk's policy
+  on the diff's latest version) mean it holds, with them as the reason; a conflict with the trunk's
+  tip, each diff applied on top of those below it, sends it back to Review's conflict ladder (R107).
+  `GET /api/diffs/:id/land` shows the gate, and the entry that holds the diff. An entry the gate
+  holds (`held`, `hold: gate`) is asked again as reviews come and at least every 10 s, and joins the
+  queue once the gate clears it. Review holds an entry (`POST /api/queue/:entry/hold`, `hold:
+  review`) until it lets it go (`/release`), or withdraws it (`/withdraw`, `withdrawn`), each
+  saying who and why (`diffs.review`). Held, returned or withdrawn, an entry's diffs are Review's
+  again, in the state their reviews give them.
+- **W28-R105 Pinned revisions.** An entry pins each diff's approved revision: its version, commit,
+  the commit below it and its patch-id. A newer revision invalidates the pin unless it only rebased,
+  with the same patch-id: the entry holds (`it has v2 since v1 was approved, which changes its patch:
+  v2 lands once Review approves it`), and once Review approves the newer one it's pinned and the
+  entry joins the queue again. The candidate tested is the pinned revision onto the trunk, never a
+  newer one. The commit is the unit: entries name their commits.
+- **W28-R106 A stack's clear prefix.** A stack lands its clear prefix, in order; the rest holds in an
+  entry of its own, each diff saying why (`D3: 0 of 1 accepts`, `D4: D3, below it, holds`), and
+  follows once Review's gate clears it. With nothing clear, `land` lands nothing and says why. An
+  entry whose upper diffs stop being clear before its move lands its prefix, tested on its own.
+- **W28-R107 Conflicts go back to Review.** An entry that conflicts with the trunk isn't ejected: it's
+  `returned` to Review, saying where (`needs rebase: conflicts with the trunk in README.md`, the
+  files kept in `conflicts`) and, beside it, what Review's gate says of the diff (W26's conflicts,
+  each where it falls: `README.md:3: resolve this conflict first`), and the same entry joins the
+  queue again once a version resolves it and Review's gate clears that version.
+- **W28-R108 The land record.** Each land keeps (`land_records`, one row per entry; `record` in
+  `GET /api/repos/:repo/queue`): the change and its kind (`diff`, `stack`, `change_request`,
+  `host`), the strategy, the approved revisions with their patch-ids, the candidate tested and the
+  trunk it was built on, its checks' runs, whether it landed as tested onto a trunk that moved
+  since, the trunk's move, the commit carrying each change, the trunk's policy it landed under, who
+  asked, and which queue landed it.
+- **W28-R109 A host's own queue.** Which queue lands a repository's changes is the forge seam's
+  `abilities(repo).queue` (`kiln_seams::Forge`, docs/seams.md): none means W28's queue; one means
+  the host's (GitHub's merge queue, GitLab's merge trains), followed through the seam alone:
+  `enqueue` each change at the head Review cleared, `queued` read back after each call (a stacked
+  change takes those below it), `change` read conditionally until it merged (landed, recorded) or
+  left the queue unmerged (out), `dequeue` when Review holds or withdraws it. kiln never calls
+  githost directly for it; kiln's own git server has no forge, so its repositories land on W28's.
+  `POST /api/repos/:repo/queue` (`ci.queue.enqueue`, `{ trunk?, changes: [{ number, head }] }`,
+  bottom first) puts a host's changes in: each read on its host first, a change whose head isn't the
+  one Review cleared is refused (409, naming the head it moved to), as is one merged or closed, and a
+  repository whose host has no queue for it (422). What it does next is each entry's in
+  `GET /api/repos/:repo/queue`: `state` (queued, testing, landed, ejected with `reason`), `route`,
+  `host` (each change's `state`, `entered`, `queued` and merged `commit`) and, once landed, `record`.
+
+**Acceptance criteria: the land queue by component**
+
+- **W28-AC100 Four diffs in two components, one culprit.** W14-AC03 with the diffs in packages `a`
+  and `b`: a candidate for each component under test at once; the clean component lands, none of its
+  entries tested again, before the culprit's bisection ends; only the culprit is ejected, with its
+  reason. *Integration test* (`cargo test -p kiln --test hosting w14_ac03`).
+- **W28-AC101 Independent diffs.** Two diffs that share nothing, side by side on one trunk: both
+  land, each tested once, the second as tested onto the trunk the first moved. *Integration test*
+  (`w28_r102_independent_diffs_land_without_testing_each_other_again`); the planner's
+  (`cargo test -p kiln-ci land::queue`).
+- **W28-AC102 Review's needs.** One test each: the gate holds a candidate whose diff was asked for
+  changes just before its move and lands it once accepted, and Review holds, lets go and withdraws
+  (`w28_r104_one_gate_for_land_and_the_move`); pins hold through a rebase-only revision and not
+  through one that changes the patch (`w28_r105_entries_pin_what_review_approved`); a stack lands
+  its clear prefix (`w28_r106_a_stack_lands_its_clear_prefix`); a conflict goes back to Review and
+  comes back (`w28_r107_a_conflict_goes_back_to_review_and_comes_back`); a host's queue through
+  the forge seam's simulator (`cargo test -p kiln w28_r109`).
 
 **Requirements: deploys by what they share**
 
@@ -9731,8 +9856,12 @@ before this one call this workstream "W25 step N". Step 6's, admission, are R60�
 batches with a 60 min hold land changes 73% sooner than today's serial queue (5.0 h to 1.3 h) at
 54% fewer runner-hours per landed change (0.453 to 0.208), more than half on every seed; no job
 waits for a runner and no window opens past 8. Per-change speculation lands faster (-88%) but
-saves 7%, its candidates waiting past the aging bound (ci/sim/README.md). The land queue uses none of this yet: that
-is step 9's third step, in `crates/kiln/src/ci/land.rs`. R38, R39 and AC38 built (2026-10-25): `kiln_cd::deploys` decides, and the release worker in `crates/kiln/src/deploy` carries it out for every release in flight, the objects two apps share read from KilnCD's engine (`Engine::shared_objects`). One target coalescing applies with an environment's `concurrency: queue`; with `reject`, the default, a second release is refused as before.
+saves 7%, its candidates waiting past the aging bound (ci/sim/README.md). R100–R109 and AC100–AC102 built
+(2026-10-26): the land queue in `crates/kiln/src/ci/land.rs` carries out `kiln_ci::land::queue`'s plan by
+component, asks `review::readiness` before every move, pins approved revisions, lands a stack's clear
+prefix, returns conflicts to Review, keeps `land_records`, and routes on the forge seam (migration
+`20261026-1700_w28_land_wire`). Deploy targets aren't read into the conflict graph's changes yet, and
+R37's batch hold isn't applied by the server. R38, R39 and AC38 built (2026-10-25): `kiln_cd::deploys` decides, and the release worker in `crates/kiln/src/deploy` carries it out for every release in flight, the objects two apps share read from KilnCD's engine (`Engine::shared_objects`). One target coalescing applies with an environment's `concurrency: queue`; with `reject`, the default, a second release is refused as before.
 
 **Requirements: demands and adopt-on-supersede** (step 4's, R40–R49; kiln plan
 `01a17607cd1273c5836771efb9d377d7`)
@@ -9843,6 +9972,150 @@ is step 9's third step, in `crates/kiln/src/ci/land.rs`. R38, R39 and AC38 built
 `kiln_ci::sched::state`, `crates/kiln/src/ci/dispatch.rs`, step 1's replayer and
 `crates/kiln/tests/warm_cancel.rs`.
 
+**Requirements: verdicts**
+
+- **W28-R50 Lanes, checks and verdicts.** `kiln_ci::verdict`, pure: a lane is a workflow's commits
+  on one branch, first parents, oldest first, each with the units its diff could affect (W24-R17,
+  `Units::affected`; every unit when that isn't known). A check is a workflow's test of a unit, or
+  the unit (a job) as a whole, with the checks it needs. A result is a check's outcome at a commit
+  (passed; failed, with its signature: the test, or a job's failed step; skipped because a need
+  failed), how it came (ran, reused, adopted) and when. Each commit gets a verdict per check, and
+  a kind for the whole: the weakest of the checks its diff could affect (direct, covered, pending,
+  suspect, culprit). Checks its diff can't affect are unaffected and never count against it; a
+  check whose need fails at a commit is settled with that need. Every verdict says why.
+- **W28-R51 Covered.** A check with no result of its own at a commit is covered by the nearest
+  later commit with one, when that result passed, or failed as the base (the nearest earlier
+  result) already did, or failed a test W16 marks flaky or quarantined. Covered is a kind of its
+  own, optimistic: it carries no outcome, so it is never shown or kept as passed.
+- **W28-R52 Suspects and culprits.** A failure is new when the check passed, or failed otherwise,
+  at its base. Its suspects are exactly the commits from just after the base to the failing one
+  whose diffs could affect the check's unit; a later commit's new failure makes a commit suspect
+  before its needs settle it. A culprit finding's outcome names the culprit among them (those before
+  it are cleared, those after it fail because of it), finds no culprit (a flake: all cleared), or
+  can't tell (they stay suspects, saying why).
+- **W28-R53 The replay.** Step 1's replayer decides P3's verdicts with `kiln_ci::verdict`: each job a
+  check, a commit affecting the jobs whose input keys it changed, a new failure bisecting only its
+  suspects, each try where R56's planner says (a suspect's job doing what its draw says; one
+  suspect is the culprit at once), and keeping what is under way: a run whose own work has begun
+  runs its jobs as they come ready though newer pushes withdrew it, and the newest execution of
+  each job of a lane (launching or running) stays until a live demand of the same job needs its
+  room. A commit's verdict counts from
+  when it was answered for good. ci/sim/README.md reports where the commits answered after an hour
+  stood at the hour.
+- **W28-R54 A Cargo workspace's units.** `kiln_ci::verdict::cargo`, pure: from the root manifest's
+  `members` and `exclude`, one unit per member (its package name and folder) with the members it
+  depends on by path, normal, dev and build dependencies and target tables alike, `workspace =
+  true` resolved through `[workspace.dependencies]`; every member reads the root `Cargo.toml` and
+  `Cargo.lock`. A file no unit takes affects every unit.
+- **W28-R55 Verdicts on the server.** `ci.verdict` (`GET /api/ci/repos/:repo/commits/:sha/verdict`)
+  gives the commit's verdict on each lane whose first parents hold it, its commits named by SHA.
+  The server reads the lane from the mirror (the branch's first parents up to its tip, 200 back
+  from the commit), each commit's changed files over the units the newest commit's manifests
+  give, and each run's latest attempt: every test W16 recorded as a check (its unit from its file,
+  else its suite's crate, else its job), every job without a report as a check of its own (its
+  conclusion as the failure's signature). A test W16 found flaky in a run (W16-R04's first rule)
+  or quarantined (W16-R05) is marked: its failures don't count. `kiln_ci::verdict` decides.
+- **W28-R56 Flake-aware culprit finding.** `kiln_ci::verdict::culprit`, pure, after Google's Flake
+  Aware Culprit Finding: a posterior over "suspect i broke it" and "no culprit, a flake", from a
+  prior (the check's flake rate; at least 0.1 for a test W16 marks flaky) and every try's outcome,
+  a broken check failing every time and an unbroken one at the flake rate. It names a culprit, or
+  no culprit, at a posterior of 0.99; a flaky check's first try runs the failing commit again;
+  each other try is the first suspect whose cumulative posterior reaches one half (the one before
+  it when that one already failed); past ceil(log2 n) + 1 + 3 tries it stops inconclusive. With
+  no flakiness it is a binary search: at most ceil(log2 n) + 1 tries for n suspects.
+- **W28-R57 Bisecting a test.** `ci.runs.bisect` takes a `test` (W16's `suite name`): the job is
+  the one that reported it, `good` the last run of the lane it passed in, and only the commits
+  whose diffs could affect its unit are tried (`suspects`), each try judged by the test's own
+  result in its run, with `vars.KILN_VERDICT_UNITS` and `vars.KILN_VERDICT_TESTS` set. Every
+  bisection's tries come from R56's planner; a try that can't run gives way to its nearest
+  testable neighbour. A bisection's end is a culprit finding (R52) for its lane's verdicts: found
+  (`culprit`), `no-culprit` (a flake) or `inconclusive`. Once declared (`[ci] culprits = true`),
+  culprit finding starts on its own for each new failure with two or more suspects, a test's over
+  its unit's commits, as the run that opened the suspect ends. Its tries run at low priority (20,
+  below W28-R64's work in progress), each a speculative demand of its lane under the lane's window
+  (W28-R68) where the workflow declares admission; on a branch in `[ci] culprit_gates` they go at
+  once, at gate priority (90), nothing holding them. A try is no newer push of its branch: it joins
+  no run-level concurrency group, coalesces with no push and supersedes nothing (W05-R08,
+  W28-R46), so nothing on the branch waits for it, cancels it or is withdrawn by it. Only kiln's
+  bisection marks a run a try (kept with its input, so a restart keeps it); no request can. Result
+  reuse sits behind a trait (`kiln_ci::verdict::Ledger`): before each try the bisection asks what a
+  run of the same inputs concluded, takes it as the try's outcome, and runs nothing. kiln has no
+  ledger for it yet (`NoLedger`: W24-R06's keys a leg's inputs as dispatch plans it, which a
+  bisection can't yet), so every try runs, its legs reusing what W24-R06 finds as they are queued.
+- **W28-R58 Waiting for a verdict.** `ci.verdict.wait` (`GET
+  /api/ci/repos/:repo/commits/:sha/verdict/wait`) answers once the commit's verdict is final (every
+  lane's direct, covered or culprit; `until: final`, the default) or once it changes at all
+  (`until: any`), or when `timeout_s` (600 at most) runs out: the verdict then, whether it is
+  final, and whether the time ran out, as `deploy.releases.wait` does. Code mode has
+  `kiln.ci.verdict()` and `kiln.ci.verdict.wait()` both, whatever the registry's order.
+- **W28-R59 The pushing agent hears.** When a run of a workflow ends, or a bisection, the lane's
+  verdicts around it are worked out again. Each commit whose verdict changed since it was last kept
+  gets a `ci_verdict` event (§4.2), and the agent that pushed it, as step 6 attributes it
+  (`kiln_ci::sched::actor`, W28-R67: the agent token its push came with, as kiln kept the push for
+  the lane's first run at or after the commit, and only for the commits that push brought; else
+  the agent change request whose last pushed commit it is; else its `Kiln-Agent` line), a
+  `verdict.changed` message, queued after its turn as `fix_checks`' messages are:
+  a change of a verdict kept before, or the first answer of a commit the run newly answers.
+  Direct and covered say so in a line, covered as optimistic, not passed; suspect says the failing
+  check, the commit it failed at, its base and how to find the culprit (`ci.runs.bisect` with the
+  test); culprit says why.
+
+**Acceptance criteria**
+
+- **W28-AC50 Random lanes.** Over 10,000 random lanes: each check's verdict is as worked out afresh;
+  a failure already at the base, or of a marked test, makes no suspect; a new failure names exactly
+  the commits whose diffs could affect its unit; covered is never shown as passed; the verdicts
+  don't depend on the order results come in; a culprit named clears those before it. *Property
+  test* (`cargo test -p kiln-ci verdict`).
+- **W28-AC51 The recorded week.** At least 95% of ci's commits on main answered within an hour of
+  their push, with steps 4 and 6 on (P4: the demand table and admission), over seeds 1-8 (`cargo
+  run -p kiln-ci --example replay -- ci/sim/trace.json`; `--late` names each commit left late and
+  what held it).
+- **W28-AC52 End to end.** A native repository with a two-crate Cargo workspace whose workflow
+  reports each test with TAP: a test failing at the base makes no later commit suspect; a new
+  failure in crate p names exactly the commits whose diffs affect p; a quarantined test's failure
+  makes none, and its verdict says so; covered checks carry no outcome. *Integration test*
+  (`cargo test -p kiln --test verdicts`).
+- **W28-AC53 Culprits.** Without flakiness the planner names the culprit within ceil(log2 n) + 1
+  tries for every culprit position (up to 64 suspects); over 10,000 random searches with flake
+  rates up to 0.3, every search ends within its cap and the same outcomes give the same tries.
+  End to end, a bisection of one test tries only the commits that change its crate, names the
+  culprit, and the culprit's verdict is culprit. *Unit, property and integration tests* (`cargo
+  test -p kiln-ci culprit`, `cargo test -p kiln --test verdicts`).
+- **W28-AC54 Agents hear and wait.** End to end, an agent's commit (its `Kiln-Agent` trailer)
+  covered by a later run's pass gets the agent a `verdict.changed` message saying it is covered,
+  and no other commit's; so does a commit without the trailer that the agent pushed with its own
+  token, and not what its branch already held; `ci.verdict.wait` answers at once for a final
+  verdict and says the time ran out when nothing changes. `ci.verdict` and `ci.verdict.wait` are
+  §4.1 routes and operations on every surface (`w20_r01_each_operation_is_a_route`). *Integration
+  and unit tests* (`cargo test -p kiln --test verdicts`, `cargo test -p kiln w28_r58`,
+  `cargo test -p kiln-ci w28_r67`).
+- **W28-AC55 Culprit finding on its own.** End to end, with `[ci] culprits = true`, a new failure
+  of a test with two suspects is bisected without anyone asking, over only its unit's commits,
+  naming the culprit, and the tries' ends start no other bisection. A try's priority is 20 (gate:
+  90), its admission speculative (gate: never held), and no request can make a run a try; a
+  ledger's answers replace tries without changing the search. *Integration and unit tests* (`cargo
+  test -p kiln --test verdicts`, `cargo test -p kiln w28_r57`, `cargo test -p kiln-ci w28_r57`).
+
+**Progress.** R50–R59, AC50 and AC52–AC55 built (2026-10-25; R57's tries, R59's attribution and
+the ledger trait 2026-10-26) in `kiln_ci::verdict` (its `cargo` reader, `culprit` planner and
+`Ledger`), the replayer, `crates/kiln/src/ci/verdict.rs` (`ci.verdict`, `ci.verdict.wait`,
+`ci_verdict`, `verdict.changed` to the agent `kiln_ci::sched::actor` names), `ci/bisect.rs`
+(culprit finding on its own) and `ci/dispatch.rs` (its tries). AC51 is not met: with steps 4 and 6
+on (P4) 85.6% (84.8%–86.3%) of ci's commits are answered within the hour, against 95%; P3, without
+admission, 90.0% (87.8%–90.7%), against 75.9% before verdicts. What holds the rest, each commit
+named in ci/sim/README.md: at the hour about 13 a week wait for a rust pod the recorded week's
+cluster started 2.5 h late or never (superseded first), which no policy answers sooner on this
+trace; 6 (P4 alone) wait for release-binary on the server machine, which the bench's cadence keeps
+free for its exclusive job; 7 for a job running, 7 for a job's needs, 4 for a push made after the
+hour, and 3 have no answer before the window ends. With every pool's capacity unlimited P4 reaches
+89.6%. With step 8's overflow (W28-R80: a pod not started in 2 min gives way to a Linux machine's
+slot) AC51 is met: P4 answers 95.2% (94.1%–97.0%) and P3 99.6% (98.5%–100.0%), wasting 2.4
+runner-h, release, the image and the bench as before (W28-AC81, 2026-10-29); the synthetic lane of
+W25 step 5's step 2 (a push every 10 min, ui-checks 25 min after its push) answers every commit
+within the hour and runs ui-checks every hour under P3, where P2 answers only the last
+(`w28_ac51_a_steady_lane_keeps_its_tail_jobs`).
+
 **Requirements: identical steps shared across pipelines** (step 7's, R70–R79; kiln plan
 `01a1751638db73ba809b8bf4abb6f386`)
 
@@ -9919,6 +10192,56 @@ is step 9's third step, in `crates/kiln/src/ci/land.rs`. R38, R39 and AC38 built
 flight}`, `crates/kiln/src/ci/services/memo.rs`, `crates/kiln/src/runner/runtime/memo.rs`, `.kiln/`
 and the `Dockerfile`, on W24's ledger and memo steps (land/w24, through ci-w25-engine) and the
 runner's cache service (ci-w24-m2-cache), merged in. Live counts wait for step 3's switch.
+
+**Requirements: spreading load across machines** (step 8's, R80–R89; kiln plan
+`01a1751638df77cbb4720dbbb4e407ff`)
+
+- **W28-R80 Overflow.** A `k8s` pool may say where its legs go when their pods are late: `overflow
+  = { hosts = "os == linux && tools has cargo", after = "2m" }` in its `[[ci.pools]]`, `hosts` a
+  constraint over runners' facts as a pool's own `hosts` is, `after` a duration (2 min when left
+  out; another pool kind's `overflow` is refused). A leg of the pool that its executor hasn't
+  taken `after` it was queued (its pod not started, or none started for it within `max`) goes to
+  a runner meeting `hosts` and its own `requires`, capabilities and preferences, on the host and
+  never a pool's executor, as soon as one has room for it, asking of that runner what its
+  `resources:` ask (W05-R03); until one has, it keeps waiting for its pod and looks again every
+  30 s. Its own pod, still starting, stops. Once gone it stays there, its retries too. An untrusted
+  leg goes only when `host` is among its executors (W18-R07). Without `overflow`, a pool's legs
+  wait for its pods, as before. 2 min: half the recorded week's pods started within 8 s, and one
+  not started by 2 min was already in the slowest 13% (ci/sim/README.md).
+- **W28-R81 Every overflow says why.** The leg's notice (`overflow`) and its routing
+  (`ci.legs.routing`'s `overflow`: `pool`, `hosts`, `waited_s`, `at`, `why`) say what it waited
+  for, how long, and where it may run now: `its executor in pool k8s hadn't taken it 2 min after
+  it was queued (1 of the pool's starting, 3 of 64 in all): it runs on a runner where os == linux
+  && tools has cargo, on the host`. Its routing's runners are measured against the overflow's
+  checks from then on, and admission by load (W24-R19) and warm placement (W24-R18) weigh them
+  as any runner.
+- **W28-R82 The replay.** Step 1's replayer models it (`Policy::overflow`): a k8s job whose pod
+  hasn't started `after` the quota took it runs on a free slot of a machine labelled `linux`, the
+  least busy, giving the quota back, and looks again every 30 s; ci/sim/README.md reports "P3 +
+  overflow" and "P4 + overflow" beside P0 to P5, and sweeps `after`.
+
+**Acceptance criteria: spreading load**
+
+- **W28-AC80 Overflow, simulated.** A leg whose pod is late runs, `after` it was queued, on a runner
+  of `hosts` with room and never on one lacking what `hosts` or its own `requires` ask; its pod,
+  starting, stops; it says why, and its routing shows the overflow's checks. A pod on time keeps
+  its leg, a pool without `overflow` waits for its pods however late, a leg with no room keeps
+  waiting and goes within 30 s of a runner freeing (or runs in its pod if that comes first), and
+  an untrusted leg goes only with `host` among its executors. `overflow` is a `k8s` pool's, with
+  a constraint and a duration, and an unknown key in it is refused. *Unit tests* (`cargo test -p
+  kiln-ci w28_r80`).
+- **W28-AC81 The recorded week.** With the overflow at 2 min, P3 gives at least 95% of ci's commits
+  on main a direct or covered verdict within 60 min over seeds 1-8 (99.6%: 90.0% without), wasting
+  at most 2.4 runner-h (2.38); release's, the image's and the bench's shares are no lower than
+  P3's without it; and P4 with it meets W28-AC51 (95.2%). *Replay test* (`cargo test -p kiln-ci
+  w28_ac81`).
+
+**Progress (step 8).** v1's part on main (eb400ce1c, cfba6d8c3: benches and release's Linux and
+Windows builds and ci's release-binary placed by `requires`). R80–R82 and AC80–AC81 built
+(2026-10-29) in `kiln_ci::sched::{pools, state}` and the replay. Production's change (W28 step 3's,
+docs/trains/w28-step3.md) carries the `k8s` pool's `overflow` and `[ci.scheduler.admission]`;
+adacachy's load per CPU over CI hours (1.62 before, at most 1.0 asked) is measured from
+`GET /api/metrics/history` once production runs them.
 
 **M2 (built 2026-10-25, awaiting review).**
 
@@ -10048,16 +10371,19 @@ errors as `{ error, code, details? }`. Today's routes (`/api/runs`, `/api/jobs/.
 | GET/POST | `/api/repos/:repo/change-requests` · `/api/change-requests/:id/...` | `ci.change_requests.list`, `.open`, `.get` (the rest as diffs') | diffs.* | W14 |
 | GET | `/api/review/inbox` | `ci.review.inbox` (your conversations) | diffs.read | W14 |
 | GET · DELETE | `/api/repos/:repo/queue` · `/api/queue/:entry` | `ci.queue.list`, `.remove` | diffs.read, queue.manage | W14 |
+| POST | `/api/repos/:repo/queue` | `ci.queue.enqueue` (`{ trunk?, changes: [{ number, head }] }`: a host's changes into its host's own queue, each at the head Review cleared) | diffs.land | W28-R109 |
 | GET | `/api/stacks/:id` | `ci.stacks.get` | diffs.read | W14 |
 | POST | `/api/repos/:repo/submit` | `ci.diffs.submit_patch` (no git needed) | diffs.submit | W14 |
 | GET/POST · PUT/DELETE · POST | `/api/attachments` · `/:id` · `/pause` (built) | `attachments.list`, `.get`, `.save`, `.remove`, `.pause` | runs.read · agents.attach | W20 |
 | GET · POST | `/api/incidents?state=&attachment=` · `/:id` · `/:id/report` (built) | `incidents.list`, `.get`, `.report` | runs.read · its agent, or who may attach there | W20 |
 | POST · GET | `/api/ci/runs/:id/bisect` · `/api/ci/runs/:id/bisects[/:bisect]` (built) | `ci.runs.bisect` (`{ job?, good?, bad? }`: the job run on the commits between, halving them), `ci.runs.bisects` | runs.debug (bisecting is diagnosing) · runs.read | W20 |
-| POST · GET · POST | `/api/experiments` · `/:id` · `/:id/{decide,cancel}` (built) | `experiments.start`, `.list`, `.get`, `.decide`, `.cancel` | experiments.run · runs.read (reading) | W20 |
+| POST · GET · POST · POST | `/api/experiments` · `/:id` · `/:id/{decide,cancel}` · `/suggest` (built) | `experiments.start`, `.list`, `.get`, `.decide`, `.cancel`, `.suggest` | experiments.run · runs.read (reading) | W20 |
 | GET · PUT | `/api/ci/repos/:repo/providers` | `ci.providers.get`, `.set` (`{ providers }`: what its CI runs on) | runs.read · settings.manage | W23 |
 | POST | `/api/ci/repos/:repo/providers/sync` | `ci.providers.sync` (other providers' runs, looked at now) | runs.read | W23 |
 | GET | `/api/ci/repos/:repo/providers/workflows` | `ci.providers.workflows` (each provider's CI files, checked) | runs.read | W23 |
 | GET | `/api/ci/repos/:repo/commits/:sha/checks` | `ci.providers.checks` (every provider's runs of a commit) | runs.read | W23 |
+| GET | `/api/ci/repos/:repo/commits/:sha/verdict?workflow=` | `ci.verdict` (a commit's verdict per unit and test on each lane: direct, covered, suspect, culprit) | runs.read | W28 |
+| GET | `/api/ci/repos/:repo/commits/:sha/verdict/wait?until=&timeout_s=&workflow=` | `ci.verdict.wait` (until the verdict is final, or changes with `until: any`; `timeout_s` at most 600) | runs.read | W28 |
 | GET | `/api/ci/runs/:id/pending` | `ci.runs.pending` (whichever provider's run) | runs.read | W23 |
 | GET · POST | `/api/ci/repos/:repo/pulls[/:n]` · `/:n/{comments,reviews,merge}` | `host.pulls.list`, `.get`, `.comment`, `.review`, `.merge` (GitHub's, GitLab's and Bitbucket's; as the person when they signed in with that host) | diffs.read · diffs.review · diffs.land | W23 |
 | POST | `/api/hooks/gitlab` · `/api/hooks/bitbucket` | GitLab's and Bitbucket's webhooks | open, their secret | W23 |
@@ -10076,8 +10402,9 @@ token model.
 read and coalesced per object at most every 250 ms: `ci_run`, `ci_leg` (status, wait reason,
 progress), `ci_step`, `ci_annotation`, `ci_artifact`, `ci_runner` (facts, health), `ci_pool`,
 `ci_routing` (rules changed), `diff`, `diff_version`, `review`, `comment`, `queue`, `deployment`,
-`environment`, `incident`, `experiment`, `notification`. Today's `run`, `job`, `agent`, `sample`,
-`queue` messages stay.
+`environment`, `incident`, `experiment`, `notification`, `ci_verdict` (a commit's verdict on a lane
+changed: `repo`, `workflow`, `branch`, `sha`, `kind`, `why`, the verdict; W28-R59). Today's `run`,
+`job`, `agent`, `sample`, `queue` messages stay.
 
 ### 4.3 CLI
 

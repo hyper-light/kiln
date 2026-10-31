@@ -6,23 +6,28 @@
  * (the machines and systems the agent works in) or outside. Kept live while quotes are being looked
  * for.
  *
- * Where it shows: its plan's page; its agent's Plan tab (the newest in full); its agent's
+ * Where it shows: its plan's page; its agent's Plan tab (every piece kept, to search, a card each); its agent's
  * conversation, where the agent records or reads it (in brief, in full on asking); a planned goal
  * on its stack (in a line); and a page of its own, its way back to its agent's plans.
  */
 import * as React from "react";
+import { ChevronRight } from "lucide-react";
 import { Fold } from "@/views/harness/fold";
 import { useParams, Link } from "@/lib/router";
 import { ApiError } from "@/api/client";
 import { planHref } from "@/api/plans";
-import { INSIDE, SOURCE_WORDS, researchApi, researchHref, type Cite, type CheckState, type Finding, type Research, type ResearchSource } from "@/api/research";
+import { INSIDE, SOURCE_WORDS, researchApi, researchHref, type Cite, type CheckState, type Finding, type Research, type ResearchBrief, type ResearchSource } from "@/api/research";
 import { Loadable } from "@/components/ui/loading";
 import { RowsHold } from "@/components/ui/hold";
-import { EmptyState } from "@/components/ui/misc";
+import { Button } from "@/components/ui/button";
+import { FacetBox, type Chosen } from "@/components/ui/facet-box";
+import { EmptyState, FilterBar } from "@/components/ui/misc";
 import { relativeTime } from "@/lib/format";
 import { useSuspenseResource } from "@/lib/resource";
+import { cn } from "@/lib/utils";
 import { Shimmer } from "@/views/harness/signals";
 import { SessionCrumbs } from "@/views/plans/crumbs";
+import { facetsOf, hasChosen, researchDimensions, useAsked } from "@/views/plans/browse";
 import "./research.css";
 
 const CHECK_WORDS: Record<CheckState, string> = {
@@ -147,7 +152,7 @@ function FindingCard({ f, sources }: { f: Finding; sources: ResearchSource[] }) 
 }
 
 /** Its findings' grades, as many of each: "A 2 · B 3 · C 1". */
-const gradeWords = (r: Research) =>
+const gradeWords = (r: { summary: Research["summary"] }) =>
   (["A", "B", "C", "D", "F"] as const)
     .filter((g) => r.summary.grades[g])
     .map((g) => `${g} ${r.summary.grades[g]}`)
@@ -168,11 +173,20 @@ function ResearchHead({ r, live }: { r: Research; live?: boolean }) {
 
 /** Research, graded, its sources numbered. `live`: it's still being done. */
 export function ResearchView({ r, live }: { r: Research; live?: boolean }) {
-  const s = r.summary;
   return (
     <div className="rs">
       <ResearchHead r={r} live={live} />
       <p className="rs-question">{r.question}</p>
+      <ResearchBody r={r} />
+    </div>
+  );
+}
+
+/** What research found: each finding with its grade and quotes, what had no sources, the sources. */
+function ResearchBody({ r }: { r: Research }) {
+  const s = r.summary;
+  return (
+    <>
       {s.checking > 0 && (
         <p className="rs-dim">
           kiln is looking for {s.checking} quote{s.checking === 1 ? "" : "s"} where they're cited…
@@ -214,7 +228,7 @@ export function ResearchView({ r, live }: { r: Research; live?: boolean }) {
           </ol>
         </>
       )}
-    </div>
+    </>
   );
 }
 
@@ -304,26 +318,126 @@ function ResearchCardLoaded({ id }: { id: string }) {
   );
 }
 
-/** The research agent `agent` did, newest first: the newest in full, the rest in brief. None, nothing. */
-export function AgentResearch({ agent }: { agent: string }) {
-  const all = useSuspenseResource(`research/of/${agent}`, (s) => researchApi.list({ agent }, s), { pollMs: 5000 }).data.research;
-  const newest = all[0];
-  if (!newest) return null;
+/** Research in an agent's Plan tab: the newest kiln keeps, in brief, found by their words and facets (whose, their grades, their plan), a card each, opened in place, read in full, to each finding, its grade and sources. */
+export function ResearchSection({ agent }: { agent: string }) {
+  const [typed, asked, type] = useAsked();
+  const [chosen, setChosen] = React.useState<Chosen>({});
+  // While the words asked for are read, what was found before stays.
+  const words = React.useDeferredValue(asked);
   return (
-    <Fold id="research" title="Its research" count={all.length > 1 ? all.length : undefined}>
-      <div className="rs-list">
-        <div className="rs-card">
-          <ResearchView r={newest} live={newest.summary.checking > 0} />
-          <ResearchLinks r={newest} />
-        </div>
-        {all.slice(1).map((r) => (
-          <div key={r.id} className="rs-card">
-            <ResearchBrief r={r} live={r.summary.checking > 0} />
-            <ResearchLinks r={r} />
+    <Loadable
+      label="research"
+      fallback={
+        <Fold id="research" title="Research">
+          <RowsHold rows={2} rowHeight={96} />
+        </Fold>
+      }
+    >
+      <ResearchFound agent={agent} words={words} typed={typed} type={type} chosen={chosen} onChosen={setChosen} />
+    </Loadable>
+  );
+}
+
+/** Cards shown before "Show more", and how many more each time. */
+const CARDS = 4;
+const MORE_CARDS = 10;
+
+function ResearchFound({ agent, words, typed, type, chosen, onChosen }: { agent: string; words: string; typed: string; type: (w: string) => void; chosen: Chosen; onChosen: (c: Chosen) => void }) {
+  const all = useSuspenseResource(`research/briefs/${words}`, (s) => researchApi.briefs(words, s), { pollMs: 15_000 }).data.research;
+  const [open, setOpen] = React.useState<ReadonlySet<string>>(new Set());
+  const [more, setMore] = React.useState(0);
+  const dims = React.useMemo(() => researchDimensions(agent), [agent]);
+  const facets = React.useMemo(() => facetsOf(dims, all, chosen), [dims, all, chosen]);
+  const shown = all.filter((r) => hasChosen(dims, chosen, r));
+  const limit = CARDS + more;
+  const rest = shown.length - limit;
+  const toggle = (id: string) => {
+    const next = new Set(open);
+    if (!next.delete(id)) next.add(id);
+    setOpen(next);
+  };
+  return (
+    <Fold id="research" title="Research" count={all.length && !words ? all.length : undefined}>
+      <div className="rb">
+        <FilterBar>
+          <FacetBox label="Search research" placeholder="Search research by question, finding or source…" query={typed} onQuery={type} facets={facets} chosen={chosen} onChosen={onChosen} />
+        </FilterBar>
+        {shown.length === 0 ? (
+          <p className="in-none">{words || Object.values(chosen).some((c) => c.length) ? "No research matches." : "No research yet: what agents find out, graded by kiln, shows here."}</p>
+        ) : (
+          <ul className="rb-list">
+            {shown.slice(0, limit).map((r) => (
+              <ResearchItem key={r.id} r={r} agent={agent} open={open.has(r.id)} onOpen={() => toggle(r.id)} />
+            ))}
+          </ul>
+        )}
+        {rest > 0 && (
+          <div className="plan-actions">
+            <Button size="xs" variant="ghost" onClick={() => setMore(more + MORE_CARDS)}>
+              {rest > MORE_CARDS ? `Show ${MORE_CARDS} more of ${rest}` : `Show ${rest} more`}
+            </Button>
           </div>
-        ))}
+        )}
       </div>
     </Fold>
+  );
+}
+
+/** Research as a card: whose and when, what was asked, a segment a finding in its grade's colour and the strongest one; opened, each finding, its grade and sources. */
+function ResearchItem({ r, agent, open, onOpen }: { r: ResearchBrief; agent: string; open: boolean; onOpen: () => void }) {
+  const s = r.summary;
+  const live = s.checking > 0;
+  const whose = r.agent === agent ? "this agent" : r.agent ? "another agent" : r.by;
+  const tally = gradeWords(r);
+  return (
+    <li className="rb-card" data-open={open || undefined}>
+      <button type="button" className="rb-head" aria-expanded={open} onClick={onOpen}>
+        <span className="rb-eyebrow">
+          <Shimmer on={live}>{[live ? "checking quotes" : "", whose, relativeTime(r.updated_at / 1000)].filter(Boolean).join(" · ")}</Shimmer>
+          {tally && <span className="rs-grades">{tally}</span>}
+        </span>
+        <span className="rb-q">{r.question}</span>
+        {r.grades.length > 0 && (
+          <span className="rb-strip" aria-hidden="true">
+            {r.grades.map((g, i) => (
+              <i key={i} data-g={g} />
+            ))}
+          </span>
+        )}
+        {r.best && !open && (
+          <span className="rb-best">
+            <span className="rs-grade rs-grade-sm">
+              <b data-g={r.grades[0]}>{r.grades[0]}</b>
+            </span>
+            <span>{r.best}</span>
+          </span>
+        )}
+        <span className="rb-foot">
+          {s.findings ? `${s.findings} finding${s.findings === 1 ? "" : "s"}` : "No findings yet"} · {s.sources} source{s.sources === 1 ? "" : "s"}
+          {s.sources > 0 && ` (${s.internal} inside, ${s.external} outside)`}
+        </span>
+        <ChevronRight size={14} className={cn("rb-chev hx-chev", open && "rotate-90")} aria-hidden="true" />
+      </button>
+      {open && (
+        <div className="rb-body">
+          <Loadable label="the research" fallback={<RowsHold rows={2} rowHeight={56} />}>
+            <ResearchDetails id={r.id} />
+          </Loadable>
+        </div>
+      )}
+    </li>
+  );
+}
+
+/** Research `id` read in full, opened in its card: each finding, its grade and quotes, its sources; read again every few seconds. */
+function ResearchDetails({ id }: { id: string }) {
+  const res = useSuspenseResource(`research/${id}`, (s) => researchApi.get(id, s).catch(unlessGone), { pollMs: 4000 });
+  if (res.data === "gone") return <p className="rs-dim">Its research is gone.</p>;
+  return (
+    <div className="rs">
+      <ResearchBody r={res.data} />
+      <ResearchLinks r={res.data} />
+    </div>
   );
 }
 

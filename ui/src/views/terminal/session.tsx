@@ -1,8 +1,13 @@
 import * as React from "react";
 import { wsUrl } from "@/api/client";
+import { readFrame } from "@/api/frames";
 import type { TerminalControlFrame, TerminalSessionInfo, TerminalUp } from "@/api/types";
+import type { UnreadFrame } from "@/api/wire";
 import { createTerminal, ensureFont, TERM_FONT, type KilnTerminal } from "@/components/terminal/xterm-setup";
 import { copyText, readClipboard } from "./clipboard";
+
+/** A terminal socket's text frames, by tag: a frame with another isn't applied (`api/frames.ts`). */
+const TERMINAL_FRAMES = { session: true, missing: true, reconnect: true, size: true, exit: true, error: true, refused: true } satisfies Record<TerminalControlFrame["type"], true>;
 
 export type SessionState =
   | { kind: "connecting" }
@@ -273,14 +278,17 @@ const TerminalSessionView = React.forwardRef<SessionHandle, Props>(function Term
           term.write(new Uint8Array(ev.data as ArrayBuffer));
           return;
         }
-        let msg: TerminalControlFrame;
-        try {
-          msg = JSON.parse(ev.data) as TerminalControlFrame;
-        } catch {
-          term.write(ev.data);
+        // Applied only when it reads as one of the socket's frames; else the server, which sent it, is told.
+        const read = readFrame<TerminalControlFrame>(ev.data, "type", TERMINAL_FRAMES);
+        if ("unread" in read) {
+          if (sock.readyState === WebSocket.OPEN) sock.send(JSON.stringify(read.unread satisfies UnreadFrame));
           return;
         }
+        const msg = read.frame;
         switch (msg.type) {
+          case "refused":
+            // What the server couldn't read of what this view sent: noted there, on the runner's page.
+            return;
           case "session": {
             sessionRef.current = msg.session.id;
             live.current.onSession(live.current.tabId, msg.session);

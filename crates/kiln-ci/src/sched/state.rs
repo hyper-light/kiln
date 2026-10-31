@@ -497,6 +497,9 @@ pub enum Command {
     Demand { leg: String, decision: Decision },
     /// An adopter's execution ended: it's done, reused from `from`, as `from` ended (W28-R44).
     Adopted { leg: String, from: String, outcome: Outcome },
+    /// Its pool's executor was late: it goes to the runners of the pool's `overflow`, as `why`
+    /// says (W28-R80).
+    Overflowed { leg: String, why: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -515,7 +518,8 @@ enum State {
     Done,
 }
 
-/// How long a leg a person's retry placed on a runner waits when that runner refuses it (W05-R28).
+/// How long a leg waits to be offered again to a runner that refused it, when that runner alone
+/// may run it (a person's retry placed it there, W05-R28) or alone could (W05-R16).
 pub const REFUSED_AGAIN_MS: i64 = 15_000;
 
 /// Why a leg stays off a runner (W05-R16).
@@ -561,7 +565,26 @@ struct Leg {
     held: bool,
     /// While it runs: when it's expected to end (unix ms), so its runner has room again.
     ends: Option<i64>,
+    /// What it asks of a runner (W05-R03), kept while its pool's executor holds what it runs in:
+    /// what it asks again once it overflows (W28-R80).
+    asked: Resources,
+    /// Where it went when its pool's executor was late (W28-R80): the overflow it took, and why.
+    overflow: Option<(pools::Overflow, Overflowed)>,
 }
+
+/// A `k8s` pool's leg sent to runners because its pod was late (W28-R80): its pool, the runners
+/// it may go to (`hosts`), how long it had waited for its pod, when (unix ms), and why in words.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Overflowed {
+    pub pool: String,
+    pub hosts: String,
+    pub waited_s: i64,
+    pub at: i64,
+    pub why: String,
+}
+
+/// How often a leg past its pool's `overflow.after` looks again for a runner with room (W28-R80).
+pub const OVERFLOW_AGAIN_MS: i64 = 30_000;
 
 /// A leg's wait for a busy runner where it would finish sooner (W24-R18).
 #[derive(Debug, Clone, PartialEq)]
@@ -787,17 +810,27 @@ impl Scheduler {
                 if let Some(runner) = self.release(&leg) {
                     self.stopped(&leg);
                     self.discard_used(&leg, &mut out);
-                    // Refused by the runner a person's retry asked for (W05-R28): only it may run
-                    // the leg, so it's asked again in a while, as v1 offers a declined job again.
-                    if self.legs.get(&leg).is_some_and(|l| l.input.placement.runner.as_deref() == Some(runner.as_str())) {
+                    // Refused by the runner a person's retry asked for (W05-R28), which alone may
+                    // run the leg, or by the only runner that could take it (W05-R16; an
+                    // assignment that couldn't reach a runner away for a moment, or handing over
+                    // to a newer process, comes back refused too): it's asked again in a while, on
+                    // the same attempt, as v1 offers a declined job again. Otherwise the leg waits
+                    // for another runner.
+                    let pinned = self.legs.get(&leg).is_some_and(|l| l.input.placement.runner.as_deref() == Some(runner.as_str()));
+                    if pinned || self.legs.get(&leg).is_some_and(|l| !self.another_could(l, &runner)) {
                         let at = now + REFUSED_AGAIN_MS;
                         if let Some(l) = self.legs.get_mut(&leg) {
                             l.state = State::Retrying { at };
                         }
                         self.timers.entry(at).or_default().push(leg.clone());
                         out.push(Command::Timer { at });
-                        let name = self.runners.get(&runner).map_or_else(|| runner.clone(), |r| r.input.view.name.clone());
-                        self.set_reason(&leg, WaitReason::Pinned { runner: name, state: PinnedState::Busy }, &mut out);
+                        let reason = if pinned {
+                            let name = self.runners.get(&runner).map_or_else(|| runner.clone(), |r| r.input.view.name.clone());
+                            WaitReason::Pinned { runner: name, state: PinnedState::Busy }
+                        } else {
+                            WaitReason::Retry { at }
+                        };
+                        self.set_reason(&leg, reason, &mut out);
                     } else {
                         if let Some(l) = self.legs.get_mut(&leg) {
                             l.avoid = Some((runner.clone(), Off::Refused));
@@ -960,6 +993,7 @@ impl Scheduler {
             return;
         }
         let mut req = self.requirement(&input);
+        let asked = input.request;
         // A pool's leg takes what its executor holds already.
         if req.pool.is_some() {
             input.request = Resources::default();
@@ -970,7 +1004,29 @@ impl Scheduler {
         let group = input.group.clone();
         self.legs.insert(
             id.clone(),
-            Leg { input, req, sig, state: State::Pending, attempt: 1, queued_at: now, arrived: now, key: None, counted: false, reason: None, avoid: None, pin: None, last_runner: None, cancelling: None, gone: false, started: None, hold: None, held: false, ends: None },
+            Leg {
+                input,
+                req,
+                sig,
+                state: State::Pending,
+                attempt: 1,
+                queued_at: now,
+                arrived: now,
+                key: None,
+                counted: false,
+                reason: None,
+                avoid: None,
+                pin: None,
+                last_runner: None,
+                cancelling: None,
+                gone: false,
+                started: None,
+                hold: None,
+                held: false,
+                ends: None,
+                asked,
+                overflow: None,
+            },
         );
         match group {
             Some((key, name, cfg)) => {
@@ -1102,6 +1158,7 @@ impl Scheduler {
         *self.in_progress.entry(input.repo.clone()).or_default() += 1;
         let request = input.request;
         let (work, run, priority, started) = (input.work.clone(), input.run.clone(), input.priority, input.started);
+        let asked = input.request;
         self.legs.insert(
             id.clone(),
             Leg {
@@ -1124,6 +1181,8 @@ impl Scheduler {
                 hold: None,
                 held: false,
                 ends: None,
+                asked,
+                overflow: None,
             },
         );
         // When it started isn't known: it's expected to take its whole run from now (W24-R18).
@@ -1223,11 +1282,101 @@ impl Scheduler {
         }
         if let Some(pool) = self.legs.get(id).filter(|l| l.state == State::Queued).and_then(|l| l.req.pool.clone()) {
             self.scale(&pool, now, out);
+            // Its pool's `overflow` (W28-R80): if its executor hasn't taken it by `after`, it may go
+            // to the overflow's runners.
+            if let Some(after) = self.pool(&pool).and_then(|p| p.overflow.as_ref()).map(|o| o.after_ms) {
+                let at = since.saturating_add(after).max(now);
+                self.timers.entry(at).or_default().push(id.to_owned());
+                out.push(Command::Timer { at });
+            }
         }
         if self.legs.get(id).is_some_and(|l| l.state == State::Queued) {
             let reason = self.wait_reason(id);
             self.set_reason(id, reason, out);
         }
+    }
+
+    // ------------------------------------------------------------------ overflow (W28-R80)
+
+    /// What a leg of a pool with `overflow` asks of the overflow's runners: on one of `hosts` that
+    /// meets its own `requires`, capabilities and preferences, on the host, never a pool's
+    /// executor; `None` for an untrusted leg whose executors don't take `host` (W18-R07).
+    pub fn overflow_requirement(input: &LegIn, o: &pools::Overflow) -> Option<Requirement> {
+        if input.route.untrusted.as_ref().is_some_and(|u| !u.executors.iter().any(|e| e == "host")) {
+            return None;
+        }
+        let mut constraints = o.hosts.clone();
+        for c in &input.route.requires {
+            match routing::Constraint::parse(c) {
+                Ok(x) => constraints.push((c.clone(), x)),
+                Err(e) => constraints.push((e, routing::Constraint::Or(Vec::new()))),
+            }
+        }
+        Some(Requirement { constraints, caps: input.route.caps, executors: vec!["host".into()], prefer: input.prefer.clone(), ..Requirement::default() })
+    }
+
+    /// A leg of a pool with `overflow` that its pool's executor hasn't taken `after` it was queued
+    /// (W28-R80): it goes to the overflow's runners when one that meets its own requirements has
+    /// room for it now, asking what it asks of a runner (its `resources:`), and its own executor
+    /// still starting stops; else it keeps waiting for its executor, and looks again in
+    /// [`OVERFLOW_AGAIN_MS`]. Once it has gone, it stays there, its retries too.
+    fn try_overflow(&mut self, id: &str, now: i64, out: &mut Vec<Command>) {
+        let Some(l) = self.legs.get(id) else { return };
+        if l.state != State::Queued || l.overflow.is_some() {
+            return;
+        }
+        let Some(pool) = l.req.pool.as_deref().and_then(|p| self.pool(p)).cloned() else { return };
+        let Some(o) = pool.overflow.clone() else { return };
+        let Some(req) = Self::overflow_requirement(&l.input, &o) else { return };
+        let sig = req.signature();
+        let mut moved = l.clone();
+        moved.input.request = l.asked;
+        moved.req = req.clone();
+        moved.sig = sig.clone();
+        self.ensure_sig(&sig, &req);
+        let room = self.sigs.get(&sig).is_some_and(|s| s.eligible.iter().filter_map(|r| self.runners.get(r)).any(|r| self.fits(r, &moved)));
+        if !room {
+            let at = now.saturating_add(OVERFLOW_AGAIN_MS);
+            self.timers.entry(at).or_default().push(id.to_owned());
+            out.push(Command::Timer { at });
+            return;
+        }
+        let waited_s = (now - moved.queued_at).max(0) / 1000;
+        let hosts = o.hosts.iter().map(|(src, _)| src.as_str()).collect::<Vec<_>>().join(" && ");
+        let starting = self.executors.values().filter(|e| e.pool == pool.name && e.state == ExecState::Starting).count();
+        let why = format!(
+            "its executor in pool {} hadn't taken it {} after it was queued ({starting} of the pool's starting, {} of {} in all): it runs on a runner where {hosts}, on the host",
+            pool.name,
+            words_s(waited_s),
+            self.executors.values().filter(|e| e.pool == pool.name).count(),
+            pool.max
+        );
+        // Its own executor, still starting, isn't wanted now.
+        let own: Vec<(String, String)> = self.executors.values().filter(|e| e.leg.as_deref() == Some(id) && e.state == ExecState::Starting).map(|e| (e.id.clone(), e.runner.clone())).collect();
+        for (e, runner) in own {
+            self.drop_executor(&e);
+            out.push(Command::StopExecutor { executor: e, runner });
+        }
+        self.unqueue(id);
+        moved.overflow = Some((o, Overflowed { pool: pool.name.clone(), hosts, waited_s, at: now, why: why.clone() }));
+        self.legs.insert(id.to_owned(), moved);
+        self.insert_queue(id);
+        out.push(Command::Overflowed { leg: id.to_owned(), why });
+        for r in self.candidates(id) {
+            if !self.legs.get(id).is_some_and(|l| l.state == State::Queued && l.hold.is_none()) {
+                break;
+            }
+            self.try_runner(&r, now, out);
+        }
+        if self.legs.get(id).is_some_and(|l| l.state == State::Queued) {
+            let reason = self.wait_reason(id);
+            self.set_reason(id, reason, out);
+        }
+    }
+
+    /// Where a leg went when its pool's executor was late, if it did (W28-R80).
+    pub fn overflowed(&self, id: &str) -> Option<&Overflowed> {
+        self.legs.get(id).and_then(|l| l.overflow.as_ref()).map(|(_, o)| o)
     }
 
     /// The queue key: its priority, fair-share start, arrival. Aging is applied between
@@ -2090,8 +2239,16 @@ impl Scheduler {
         let ids: Vec<String> = self.legs.keys().cloned().collect();
         for id in ids {
             let Some(input) = self.legs.get(&id).map(|l| l.input.clone()) else { continue };
-            let mut req = self.requirement(&input);
-            req.prefer.extend(input.prefer.iter().cloned());
+            // One that overflowed stays with the overflow it took (W28-R80).
+            let over = self.legs.get(&id).and_then(|l| l.overflow.as_ref()).and_then(|(o, _)| Self::overflow_requirement(&input, o));
+            let req = match over {
+                Some(r) => r,
+                None => {
+                    let mut req = self.requirement(&input);
+                    req.prefer.extend(input.prefer.iter().cloned());
+                    req
+                }
+            };
             let sig = req.signature();
             self.ensure_sig(&sig, &req);
             if let Some(l) = self.legs.get_mut(&id) {
@@ -2123,6 +2280,14 @@ impl Scheduler {
                 } else if waited {
                     // Its wait for a warm runner is up (W24-R18).
                     self.unhold(&id, now, out);
+                } else {
+                    // Its wait for its pool's executor may be (W28-R80).
+                    let due = self.legs.get(&id).is_some_and(|l| {
+                        l.state == State::Queued && l.overflow.is_none() && l.req.pool.as_deref().and_then(|p| self.pool(p)).and_then(|p| p.overflow.as_ref()).is_some_and(|o| now - l.queued_at >= o.after_ms)
+                    });
+                    if due {
+                        self.try_overflow(&id, now, out);
+                    }
                 }
             }
         }
@@ -2992,6 +3157,17 @@ pub struct Warmth {
 /// Seconds as whole milliseconds.
 fn ms(s: f64) -> i64 {
     (s * 1000.0).round() as i64
+}
+
+/// Seconds in words: `45 s`, `5 min`, `1.5 h`.
+fn words_s(s: i64) -> String {
+    if s < 60 {
+        format!("{s} s")
+    } else if s < 3600 {
+        format!("{} min", (s + 30) / 60)
+    } else {
+        format!("{:.1} h", s as f64 / 3600.0)
+    }
 }
 
 /// A person's retry's placement as one more check of a runner, for explanations (W05-R28).

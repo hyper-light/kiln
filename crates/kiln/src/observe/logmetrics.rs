@@ -46,6 +46,8 @@ const SETTLE_MIN_MS: i64 = 2_000;
 const SETTLE_MAX_MS: i64 = 30_000;
 /// The least a window counted waits to be counted again.
 const AGAIN_MIN_MS: i64 = 1_000;
+/// How long before a window leaves the horizon its count again goes ahead of every other window's.
+const LAST_CALL_MS: i64 = 60_000;
 /// Names kiln writes itself, and Datadog keeps for its own.
 const RESERVED: [&str; 5] = ["kiln.", "system.", "datadog.", "error_tracking.", kiln_obs::llm::metrics::PREFIX];
 
@@ -356,8 +358,15 @@ impl State {
         self.counting.windows_waiting = self.windows.values().filter(|w| w.dirty).count();
     }
 
-    /// The window to count now, if any: one never counted first, oldest first; then one counted
-    /// again, oldest first.
+    /// The window to count now, if any: one about to leave the horizon first (its records are
+    /// counted then or never), then one never counted, then one counted again, oldest first each.
+    ///
+    /// A window counted is counted again, once records come for it, after half the time since it
+    /// ended (ever less often, however late they keep coming) or half the time it has left in the
+    /// horizon, whichever is less: never past the horizon. (Half its age alone took a window first
+    /// counted over 13⅓ minutes after it ended, as every window of the horizon is when the server
+    /// starts, past its twenty minutes, so records that came for it in time were never counted;
+    /// goal 47bbcf7e, found by the ClickHouse comparison.)
     fn due(&self, now_ms: i64) -> Option<i64> {
         let settle = self.counting.settle_ms;
         let ended = |w: i64| (w + WINDOW).div_euclid(1_000_000);
@@ -367,11 +376,13 @@ impl State {
                 && now_ms >= end + settle
                 && match win.counted_ms {
                     None => true,
-                    Some(c) => now_ms >= c + ((c - end) / 2).max(AGAIN_MIN_MS),
+                    Some(c) => now_ms >= c + ((c - end) / 2).min((end + HORIZON_MS - c) / 2).max(AGAIN_MIN_MS),
                 }
         };
-        let fresh = self.windows.iter().find(|(w, win)| win.counted_ms.is_none() && ready(**w, win));
-        fresh.or_else(|| self.windows.iter().find(|(w, win)| ready(**w, win))).map(|(w, _)| *w)
+        let leaving = |w: i64| now_ms >= ended(w) + HORIZON_MS - LAST_CALL_MS;
+        let last_call = self.windows.iter().find(|(w, win)| win.counted_ms.is_some() && leaving(**w) && ready(**w, win));
+        let fresh = || self.windows.iter().find(|(w, win)| win.counted_ms.is_none() && ready(**w, win));
+        last_call.or_else(fresh).or_else(|| self.windows.iter().find(|(w, win)| ready(**w, win))).map(|(w, _)| *w)
     }
 }
 
@@ -604,7 +615,7 @@ impl LogMetrics {
             if v.leader == 0 || v.leader != v.member {
                 continue;
             }
-            let Some(store) = o.store() else { continue };
+            let Some(store) = o.store_replayed() else { continue };
             let me = self.clone();
             let _ = crate::rt::blocking(move || {
                 let touched = if me.spans { o.spans_touched() } else { o.touched() }.clone();
@@ -707,6 +718,49 @@ mod tests {
         st.mark(&Spans::default(), end0 + HORIZON_MS + 10_000);
         assert!(st.windows.is_empty());
         assert_eq!(st.counting.windows_expired, 1);
+    }
+
+    #[test]
+    fn a_window_counted_late_is_counted_again_before_it_leaves_the_horizon() {
+        // Goal 47bbcf7e: every window of the horizon is counted as the server starts, one then 15
+        // minutes old among them, and records come for it after, each second until ten seconds
+        // before its twenty minutes are up. Half its age (7.5 minutes) would have taken it past
+        // the horizon, uncounted; half what it has left keeps every count within it.
+        let mut st = State { started: true, counting: Counting { settle_ms: SETTLE_MIN_MS, ..Counting::default() }, ..State::default() };
+        let end = 1_792_324_800_000i64;
+        let w = window_of((end - 1) * 1_000_000);
+        let c = end + 15 * 60_000;
+        st.windows.insert(w, Win { dirty: true, counted_ms: Some(c) });
+        assert!(c + (c - end) / 2 > end + HORIZON_MS, "half its age alone outlasts the horizon");
+        let first_again = c + (end + HORIZON_MS - c) / 2;
+        assert_eq!(st.due(first_again - 1), None);
+        assert_eq!(st.due(first_again), Some(w));
+        let (mut counts, mut last) = (0, 0);
+        let mut t = c;
+        while t <= end + HORIZON_MS + 5_000 {
+            let coming = t <= end + HORIZON_MS - 10_000;
+            st.mark(&Spans { windows: if coming { vec![(w, w)] } else { Vec::new() }, ..Spans::default() }, t);
+            if st.due(t) == Some(w) {
+                st.windows.insert(w, Win { dirty: false, counted_ms: Some(t) });
+                counts += 1;
+                last = t;
+            }
+            t += 1_000;
+        }
+        assert!(last >= end + HORIZON_MS - 10_000, "counted again as the last records came or after ({} s before the horizon's end)", (end + HORIZON_MS - last) / 1000);
+        assert!(counts <= 12, "ever less often toward the horizon too: {counts} counts");
+        assert_eq!(st.counting.windows_expired, 0, "no window left the horizon with records uncounted");
+        assert!(st.windows.is_empty(), "gone once past the horizon");
+
+        // About to leave the horizon, its count again goes before a window never counted.
+        let mut st = State { started: true, counting: Counting { settle_ms: SETTLE_MIN_MS, ..Counting::default() }, ..State::default() };
+        let now = end + HORIZON_MS - 30_000;
+        let fresh = window_of((now - 60_000) * 1_000_000);
+        st.windows.insert(w, Win { dirty: true, counted_ms: Some(now - 40_000) });
+        st.windows.insert(fresh, Win { dirty: true, counted_ms: None });
+        assert_eq!(st.due(now), Some(w));
+        st.windows.insert(w, Win { dirty: false, counted_ms: Some(now) });
+        assert_eq!(st.due(now), Some(fresh));
     }
 
     #[test]

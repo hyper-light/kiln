@@ -143,9 +143,12 @@ pub enum In {
     /// A frame of a link, relayed by the server ([`crate::proto::ServerMsg::Reach`]).
     Frame { from: String, link: String, open: bool, data: Vec<u8>, close: Option<String> },
     /// The server's answer to a question ([`crate::proto::ServerMsg::ReachAnswer`]).
-    Answer { req: u64, json: String },
+    Answer { req: u64, answer: Value },
     /// The connection to the server came up (true) or went (false).
     Server(bool),
+    /// Whether the server takes word of a message a link couldn't read (it says
+    /// [`crate::proto::CAP_UNREAD`]: [`crate::proto::AgentMsg::LinkUnread`]).
+    Unread(bool),
     Local(Local),
     /// An event of a run this node does for another runner.
     Ran { key: (String, String), id: u64, ev: serve::Event },
@@ -170,6 +173,9 @@ pub enum Local {
     SyncAsk { peer: String, ask: SyncAsk },
     /// Stop following a run or a sync.
     Leave { peer: String, run: Option<u64>, sync: Option<String> },
+    /// A test's: `bytes` as they are, on this node's link to `peer`, as if a message.
+    #[cfg(test)]
+    Garble { peer: String, bytes: Vec<u8> },
     Status { reply: oneshot::Sender<Value> },
     /// Forget a runner's pinned key (it was reinstalled).
     Forget { runner: String, reply: oneshot::Sender<bool> },
@@ -260,6 +266,12 @@ impl Handle {
 
     pub async fn leave(&self, peer: &str, run: Option<u64>, sync: Option<String>) {
         let _ = self.tx.send(In::Local(Local::Leave { peer: peer.to_owned(), run, sync })).await;
+    }
+
+    /// A test's: `bytes` sent as they are on this node's link to `peer`, where a message would go.
+    #[cfg(test)]
+    pub async fn garble(&self, peer: &str, bytes: Vec<u8>) {
+        let _ = self.tx.send(In::Local(Local::Garble { peer: peer.to_owned(), bytes })).await;
     }
 
     pub async fn status(&self) -> anyhow::Result<Value> {
@@ -441,6 +453,7 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, async_channel::Receiver<Age
         tx: net_tx.clone(),
         dirty: Vec::new(),
         server: false,
+        server_unread: false,
         directory: None,
         asked: HashMap::new(),
         queries: HashMap::new(),
@@ -620,6 +633,8 @@ struct Node {
     /// Links with ciphertext waiting, flushed after each batch.
     dirty: Vec<String>,
     server: bool,
+    /// The server takes word of a message a link couldn't read ([`In::Unread`]).
+    server_unread: bool,
     directory: Option<(Instant, Vec<RunnerInfo>)>,
     asked: HashMap<u64, Instant>,
     /// Questions local tools asked the server, waiting for its answers.
@@ -635,9 +650,12 @@ impl Node {
     async fn on(&mut self, m: In) {
         match m {
             In::Frame { from, link, open, data, close } => self.on_frame(from, link, open, data, close).await,
-            In::Answer { req, json } => self.on_answer(req, &json).await,
+            In::Answer { req, answer } => self.on_answer(req, answer).await,
+            In::Unread(takes) => self.server_unread = takes,
             In::Server(up) => {
                 self.server = up;
+                // It says again what it takes once it's back.
+                self.server_unread &= up;
                 // Whatever the directory said may have changed while away: ask again.
                 self.directory = None;
                 if !up {
@@ -697,15 +715,15 @@ impl Node {
         self.directory.as_ref().filter(|(at, _)| at.elapsed() < DIRECTORY_TTL).map(|(_, d)| d.as_slice())
     }
 
-    async fn on_answer(&mut self, req: u64, json: &str) {
+    async fn on_answer(&mut self, req: u64, answer: Value) {
         if let Some((_, reply)) = self.queries.remove(&req) {
-            let _ = reply.send(Ok(json.to_owned()));
+            let _ = reply.send(Ok(answer.to_string()));
             return;
         }
         if self.asked.remove(&req).is_none() {
             return;
         }
-        let runners: Vec<RunnerInfo> = serde_json::from_str::<Value>(json).ok().and_then(|v| v.get("runners").cloned()).and_then(|r| serde_json::from_value(r).ok()).unwrap_or_default();
+        let runners: Vec<RunnerInfo> = answer.get("runners").cloned().and_then(|r| serde_json::from_value(r).ok()).unwrap_or_default();
         self.directory = Some((Instant::now(), runners.clone()));
         for (_, w) in std::mem::take(&mut self.waiting) {
             match w {
@@ -792,6 +810,29 @@ impl Node {
     async fn flush(&mut self) {
         for id in std::mem::take(&mut self.dirty) {
             self.send_frames(&id, None).await;
+        }
+    }
+
+    /// A message on link `id` this runner couldn't read: said to the other end (`Unread`: a runner
+    /// from before, which can't read that either, ends the link as on any garbage), and the link
+    /// ends; the server hears of it, naming the runner that sent it, when it takes word of it.
+    async fn unread_on(&mut self, id: &str, role: Role, e: &crate::proto::Unreadable) {
+        let of = match role {
+            Role::Asker => "Say",
+            Role::Doer => "Ask",
+        };
+        let (what, code, why) = (e.what(), e.code(), e.why(of));
+        let from = self.links.get(id).map(|l| l.peer.clone()).unwrap_or_default();
+        tracing::warn!(peer = %from, link = id, %what, code = code.name(), %why, "a reach message couldn't be read: the link ends");
+        let said = match role {
+            Role::Asker => self.say_on(id, &Ask::Unread { what: what.clone(), code, why: why.clone() }).await,
+            Role::Doer => self.say_on(id, &Say::Unread { what: what.clone(), code, why: why.clone() }).await,
+        };
+        if self.server_unread {
+            self.send_out(AgentMsg::LinkUnread { from, link: id.to_owned(), what: what.clone(), code, why: why.clone() }).await;
+        }
+        if said {
+            self.drop_link(id, &format!("{of} {what} couldn't be read ({}): {why}", code.name()), true).await;
         }
     }
 
@@ -906,15 +947,15 @@ impl Node {
             let Some(l) = self.links.get_mut(&link) else { return };
             let role = l.role;
             let next = match role {
-                Role::Asker => l.de.take::<Say>().map(|m| m.map(Msg::Say)),
-                Role::Doer => l.de.take::<Ask>().map(|m| m.map(Msg::Ask)),
+                Role::Asker => l.de.read::<Say>(wire::SAY_VARIANTS).map(|m| m.map(Msg::Say)),
+                Role::Doer => l.de.read::<Ask>(wire::ASK_VARIANTS).map(|m| m.map(Msg::Ask)),
             };
             match next {
                 Ok(Some(Msg::Say(s))) => self.on_say(&link, s).await,
                 Ok(Some(Msg::Ask(a))) => self.on_ask(&link, a).await,
                 Ok(None) => break,
                 Err(e) => {
-                    self.drop_link(&link, &format!("{e:#}"), true).await;
+                    self.unread_on(&link, role, &e).await;
                     return;
                 }
             }
@@ -1123,6 +1164,11 @@ impl Node {
                 }
             }
             Say::Pong { .. } => {}
+            // The other end couldn't read a message of this one's: it ends the link.
+            Say::Unread { what, code, why } => {
+                tracing::warn!(peer = %name, link, %what, code = code.name(), %why, "the other runner couldn't read a message of this one's on a reach link");
+                self.drop_link(link, &format!("{name} couldn't read {what} ({}): {why}", code.name()), false).await;
+            }
         }
     }
 
@@ -1259,6 +1305,11 @@ impl Node {
                         self.say_on(link, &Say::ObjectMissing { id }).await;
                     }
                 }
+            }
+            // The asker couldn't read a message of this one's: it ends the link.
+            Ask::Unread { what, code, why } => {
+                tracing::warn!(peer = %key.0, link, %what, code = code.name(), %why, "the other runner couldn't read a message of this one's on a reach link");
+                self.drop_link(link, &format!("{} couldn't read {what} ({}): {why}", key.0, code.name()), false).await;
             }
         }
     }
@@ -1561,6 +1612,16 @@ impl Node {
                     self.send_or_queue(&peer, Ask::Sync(ask)).await;
                 }
             }
+            #[cfg(test)]
+            Local::Garble { peer, bytes } => {
+                let link = self.peers.get(&peer).and_then(|p| p.link.clone());
+                if let Some(id) = link
+                    && let Some(l) = self.links.get_mut(&id)
+                    && l.tls.send(&bytes).is_ok()
+                {
+                    self.mark(&id);
+                }
+            }
             Local::Leave { peer, run, sync } => {
                 if let Some(p) = self.peers.get_mut(&peer) {
                     if let Some(id) = run {
@@ -1602,6 +1663,7 @@ impl Node {
                     "runner": n,
                     "state": format!("{:?}", p.state).split_whitespace().next().unwrap_or("").trim_end_matches('{').to_owned(),
                     "runs": p.follows.len(),
+                    "link": p.link,
                     "syncs": p.syncs.len(),
                     "host": p.host,
                     "error": p.error,

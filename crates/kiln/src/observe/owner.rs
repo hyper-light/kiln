@@ -130,6 +130,11 @@ pub struct View {
     pub term: u64,
     pub applied: u64,
     pub durable: u64,
+    /// The last entry the log held when the replica opened, and whether the replica has applied
+    /// it: until it has, the store answers part of what it holds (it is replaying its log), so
+    /// readers wait (`Observe::store_replayed`).
+    pub replay_to: u64,
+    pub replayed: bool,
     pub series: u64,
     pub blocks: u64,
     /// Bytes observe's folder holds on this machine (`dir_bytes`), and of them its logs files and
@@ -177,7 +182,7 @@ pub struct MachineView {
 
 enum Input {
     Wake,
-    Heard { machine: String, json: String, bytes: Vec<u8> },
+    Heard { machine: String, msg: Msg, bytes: Vec<u8> },
     Up { machine: String, up: bool },
     Series(Vec<(SeriesKey, Vec<(i64, f64)>)>),
     /// Samples as a request decoded them: keys once, samples flat.
@@ -314,6 +319,8 @@ pub struct Observe {
     tx: Sender<Input>,
     admission: Arc<Admission>,
     store: Arc<Mutex<Option<Shared>>>,
+    /// Whether the open replica has applied what its log held as it opened.
+    replayed: Arc<AtomicBool>,
     view: Arc<Mutex<View>>,
     out: async_channel::Receiver<Out>,
     snaps: PathBuf,
@@ -350,9 +357,10 @@ impl Observe {
         let (touched, spans_touched) = (Arc::new(Touched::new()), Arc::new(Touched::new()));
         let server = matches!(settings.role, Role::Server { .. });
         let told = server.then(|| (touched.clone(), spans_touched.clone()));
-        let handle = Self { tx: tx.clone(), admission: admission.clone(), store: store.clone(), view: view.clone(), out: out_rx, snaps, key, feed: feed.clone(), touched, spans_touched };
+        let replayed = Arc::new(AtomicBool::new(false));
+        let handle = Self { tx: tx.clone(), admission: admission.clone(), store: store.clone(), replayed: replayed.clone(), view: view.clone(), out: out_rx, snaps, key, feed: feed.clone(), touched, spans_touched };
         let spawned = std::thread::Builder::new().name("kiln-observe".into()).spawn(move || {
-            let mut owner = Owner::new(settings, store, view, out_tx, tx, admission, feed, told);
+            let mut owner = Owner::new(settings, store, replayed, view, out_tx, tx, admission, feed, told);
             owner.run(&rx);
         });
         if let Err(e) = spawned {
@@ -367,8 +375,8 @@ impl Observe {
     }
 
     /// What `machine` (on the server), or the server (on a runner: `machine` empty), said.
-    pub fn heard(&self, machine: &str, json: String, bytes: Vec<u8>) {
-        let _ = self.tx.send(Input::Heard { machine: machine.to_owned(), json, bytes });
+    pub fn heard(&self, machine: &str, msg: Msg, bytes: Vec<u8>) {
+        let _ = self.tx.send(Input::Heard { machine: machine.to_owned(), msg, bytes });
     }
 
     /// A machine's replicating runner process came or went (on the server), or the server did (on
@@ -718,6 +726,18 @@ impl Observe {
         lock(&self.store).clone()
     }
 
+    /// Whether the store has applied what its log held as it opened: after a start it replays the
+    /// entries since its last cut, and until then a read sees only the first of them.
+    pub fn replayed(&self) -> bool {
+        self.replayed.load(Ordering::Acquire)
+    }
+
+    /// The store, once it has replayed its log: what queries and the server's own readers (monitors,
+    /// error tracking, metrics from logs, archives) read, so none takes part of it for all of it.
+    pub fn store_replayed(&self) -> Option<Shared> {
+        if self.replayed() { self.store() } else { None }
+    }
+
     /// The log records this node's replica applies, as it applies them (live tail): the same feed
     /// whichever replica is open.
     pub fn feed(&self) -> &Arc<Feed> {
@@ -797,6 +817,23 @@ fn cut_after() -> Duration {
     *AFTER.get_or_init(|| std::env::var("KILN_OBSERVE_CUT_AFTER_MS").ok().and_then(|v| v.parse().ok()).map_or(group::CUT_AFTER, Duration::from_millis))
 }
 
+/// The log's size since its last cut that cuts it (`kiln_obs::group::due`: half a cadence); a test
+/// that needs its whole log replayed after a restart sets `KILN_OBSERVE_CUT_BYTES` above what it
+/// writes (tests/observe_replay.rs: a cut part-way through its points left a tail too short to catch
+/// a query in, on a loaded machine).
+fn cut_bytes() -> Option<u64> {
+    static BYTES: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| std::env::var("KILN_OBSERVE_CUT_BYTES").ok().and_then(|v| v.parse().ok()))
+}
+
+/// How long after the store opens it says it has replayed, at the least (none but in a test): a test
+/// that asks while the store replays sets `KILN_OBSERVE_REPLAY_HOLD_MS` (tests/observe_replay.rs), as a
+/// fast machine's replay could end before its first query came (fedora's, 2026-10-31).
+fn replay_hold() -> Duration {
+    static HOLD: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *HOLD.get_or_init(|| std::env::var("KILN_OBSERVE_REPLAY_HOLD_MS").ok().and_then(|v| v.parse().ok()).map_or(Duration::ZERO, Duration::from_millis))
+}
+
 /// Which member each machine is, as the server keeps it (`<observe>/members.json`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Members {
@@ -827,6 +864,9 @@ struct Owner {
     max_series: u64,
     rep: Option<Rep>,
     store: Arc<Mutex<Option<Shared>>>,
+    /// The last entry the log held as the replica opened, and whether it has been applied since.
+    replay_to: u64,
+    replayed: Arc<AtomicBool>,
     view: Arc<Mutex<View>>,
     viewed: Instant,
     /// The bytes observe's folder holds (the store's files, the group's log, snapshots), and when
@@ -904,7 +944,7 @@ fn now_ns(start: Instant) -> u64 {
 
 impl Owner {
     #[allow(clippy::too_many_arguments)]
-    fn new(settings: Settings, store: Arc<Mutex<Option<Shared>>>, view: Arc<Mutex<View>>, out: async_channel::Sender<Out>, input: Sender<Input>, admission: Arc<Admission>, feed: Arc<Feed>, touched: Option<(Arc<Touched>, Arc<Touched>)>) -> Self {
+    fn new(settings: Settings, store: Arc<Mutex<Option<Shared>>>, replayed: Arc<AtomicBool>, view: Arc<Mutex<View>>, out: async_channel::Sender<Out>, input: Sender<Input>, admission: Arc<Admission>, feed: Arc<Feed>, touched: Option<(Arc<Touched>, Arc<Touched>)>) -> Self {
         let wakeup = Arc::new(Wakeup { tx: input.clone(), pending: AtomicBool::new(false) });
         let waker = Waker::from(wakeup.clone());
         let mut o = Self {
@@ -914,6 +954,8 @@ impl Owner {
             max_series: settings.max_series,
             rep: None,
             store,
+            replay_to: 0,
+            replayed,
             view,
             viewed: Instant::now(),
             dir_bytes: 0,
@@ -1001,6 +1043,7 @@ impl Owner {
     /// let go first, its maintenance thread ended: two stores never write one folder.
     fn open(&mut self, id: u64) {
         self.rep = None;
+        self.replayed.store(false, Ordering::Release);
         self.maintain = None;
         self.tried = Some(Instant::now());
         if !self.is_server() && self.lock.is_none() {
@@ -1032,8 +1075,11 @@ impl Owner {
                     let _ = rep.r.campaign();
                 }
                 // What it applies from here on is published, but nothing its log held as it
-                // opened: entries applied before a restart are applied again.
+                // opened: entries applied before a restart are applied again. Until the replica has
+                // applied them all, it holds part of what it held (readers wait: `store_replayed`).
+                self.replay_to = rep.r.applied().index;
                 if let Ok(last) = hyper_raft::Storage::last_index(rep.r.core().store()) {
+                    self.replay_to = last;
                     self.feed.seen(last);
                     if let Some((t, s)) = &self.touched {
                         t.seen(last);
@@ -1064,6 +1110,7 @@ impl Owner {
     /// replicates now), removing nothing.
     fn close(&mut self) {
         self.rep = None;
+        self.replayed.store(false, Ordering::Release);
         self.maintain = None;
         *lock(&self.store) = None;
         if let Some(f) = self.lock.take() {
@@ -1122,13 +1169,11 @@ impl Owner {
     fn input(&mut self, input: Input) {
         match input {
             Input::Wake => {}
-            Input::Heard { machine, json, bytes } => {
-                if let Some(msg) = wire::decode(&json) {
-                    if self.is_server() {
-                        self.heard_from_runner(&machine, msg, bytes);
-                    } else {
-                        self.heard_from_server(msg, bytes);
-                    }
+            Input::Heard { machine, msg, bytes } => {
+                if self.is_server() {
+                    self.heard_from_runner(&machine, msg, bytes);
+                } else {
+                    self.heard_from_server(msg, bytes);
                 }
             }
             Input::Up { machine, up } => {
@@ -1692,6 +1737,7 @@ impl Owner {
             tracing::warn!(error = %why, again_in = ?self.reopen_after(), "observe's replica stopped; it opens again");
             self.error = Some(why);
             self.rep = None;
+            self.replayed.store(false, Ordering::Release);
             self.maintain = None;
             self.tried = Some(Instant::now());
             return;
@@ -1701,7 +1747,7 @@ impl Owner {
         if rep.waiting.is_none() && rep.r.applied().index > rep.cut {
             rep.waiting = Some(now);
         }
-        let due = asked || group::due(&rep.r);
+        let due = asked || cut_bytes().map_or_else(|| group::due(&rep.r), |b| rep.r.is_stalled() || rep.r.compactable_bytes() >= b);
         if due && rep.r.compact(keep, now, &self.waker).unwrap_or(false) {
             self.compact_asked = false;
             rep.compacted = rep.r.applied().index;
@@ -1843,6 +1889,14 @@ impl Owner {
             self.sized = Some(Instant::now());
             self.dir_bytes = dir_bytes(&self.dir);
         }
+        if !self.replayed.load(Ordering::Relaxed)
+            && let Some(rep) = &self.rep
+            && rep.r.applied().index >= self.replay_to
+            && self.opened_at.is_none_or(|t| t.elapsed() >= replay_hold())
+        {
+            self.replayed.store(true, Ordering::Release);
+            tracing::info!(applied = self.replay_to, took_ms = self.opened_at.map(|t| t.elapsed().as_millis() as u64), "observe's store has replayed its log");
+        }
         if self.viewed.elapsed() >= VIEW_EVERY {
             self.viewed = Instant::now();
             let view = self.make_view();
@@ -1907,6 +1961,8 @@ impl Owner {
             v.term = rep.r.term();
             v.applied = rep.r.applied().index;
             v.durable = store.durable().index;
+            v.replay_to = self.replay_to;
+            v.replayed = self.replayed.load(Ordering::Acquire);
             v.series = store.series_count() as u64;
             v.blocks = store.block_count() as u64;
             v.log_bytes = store.log_bytes();

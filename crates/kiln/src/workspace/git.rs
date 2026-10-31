@@ -61,7 +61,7 @@ pub struct Made {
     pub files: Vec<String>,
 }
 
-fn git(dir: &Path) -> Command {
+pub(super) fn git(dir: &Path) -> Command {
     let mut c = Command::new("git");
     c.arg("-C").arg(dir);
     // Never a prompt: a question nobody sees would hang the call until its timeout.
@@ -70,7 +70,7 @@ fn git(dir: &Path) -> Command {
 }
 
 /// Runs `c`, its stdout trimmed; an error carries what git said.
-async fn run(c: Command, timeout: Duration) -> anyhow::Result<String> {
+pub(super) async fn run(c: Command, timeout: Duration) -> anyhow::Result<String> {
     let what = format!("{:?}", c.get_args().skip(2).collect::<Vec<_>>());
     let out = crate::proc::output(c, timeout).await?;
     if !out.status.success() {
@@ -707,7 +707,7 @@ mod tests {
         let identity = Identity::new(pki.organization(), Actor::Agent { person: "sam".into(), agent: session.clone(), epoch: 2, held_by: None });
         let pem = pki.issue_identity(&asked.csr, &identity, &[], time::Duration::hours(1))?;
         let given = crate::proto::IdentityGiven { kind: asked.kind, of: asked.of, epoch: asked.epoch, uri: identity.uri()?, cert_pem: Some(pem), error: None, delegation: None };
-        crate::runner::identity::given(&serde_json::to_string(&given)?, keys.path(), "main")?;
+        crate::runner::identity::given(given, keys.path(), "main")?;
         let slot = crate::runner::identity::slot("agent", Some(&session), Some(2));
         let here = top.clone();
         let (signed, plain) = crate::rt::block_on(async move {

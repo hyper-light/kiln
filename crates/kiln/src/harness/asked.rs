@@ -240,10 +240,12 @@ pub fn nack(id: Option<&str>, code: &str, why: &str) -> String {
     SessionDown::from(SessionFrame::Nack { id: id.map(str::to_owned), code: code.to_owned(), why: why.to_owned(), again: false, refused: None }).text()
 }
 
-/// The frame that answers what a viewer sent that couldn't be read as a command: `nack`,
-/// `malformed`, under its id when that much could be read.
-pub fn unreadable(id: Option<&str>, why: &str) -> String {
-    nack(id, "malformed", &format!("not a command: {why}"))
+/// The frame that answers what a viewer sent that couldn't be read (`crate::wire::unread`): `nack`,
+/// `unsupported` for a command type or a frame this server doesn't know, `malformed` for the rest
+/// (as the channel says them), under its command's id when that much could be read.
+pub fn unreadable(id: Option<&str>, code: crate::wire::unread::Code, why: &str) -> String {
+    let code = serde_json::to_value(code.refusal()).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_else(|| "malformed".to_owned());
+    nack(id, &code, why)
 }
 
 fn why(sent: &Sent) -> String {
@@ -379,8 +381,11 @@ mod tests {
             let f = frame(&s, k)?;
             anyhow::ensure!(f.get("code") == Some(&json!(code)) && f.get("again") == Some(&json!(again)) && f.get("why").and_then(serde_json::Value::as_str).is_some_and(|w| !w.is_empty()), "{f}");
         }
-        let bad: serde_json::Value = serde_json::from_str(&unreadable(None, "expected value"))?;
+        let bad: serde_json::Value = serde_json::from_str(&unreadable(None, crate::wire::unread::Code::Malformed, "not JSON: expected value"))?;
         anyhow::ensure!(bad.get("code") == Some(&json!("malformed")) && bad.get("id") == Some(&serde_json::Value::Null) && bad.get("again") == Some(&json!(false)), "{bad}");
+        // A command type this server doesn't know: `unsupported`, under its id (the plan's example).
+        let teleport: serde_json::Value = serde_json::from_str(&unreadable(Some("c1"), crate::wire::unread::Code::Unknown, "no command teleport"))?;
+        anyhow::ensure!(teleport == json!({"t": "nack", "id": "c1", "code": "unsupported", "why": "no command teleport", "again": false}), "{teleport}");
         Ok(())
     }
 }

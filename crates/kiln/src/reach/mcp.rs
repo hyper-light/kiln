@@ -23,7 +23,7 @@
 //! that's who it is.
 
 use std::collections::HashMap;
-use std::io::{BufRead as _, Write as _};
+use std::io::{BufRead, Write as _};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -32,6 +32,7 @@ use serde_json::{Value, json};
 use super::local::{Client, Ev, Req, RunReq};
 use super::wire::Signal;
 use crate::mcp::code;
+use crate::ops::Input;
 
 /// Output a tool answer carries at most (the middle goes, as Claude Code's own Bash tool does).
 const OUTPUT_MAX: usize = 30_000;
@@ -44,6 +45,8 @@ const CODE_WALL_DEFAULT: Duration = Duration::from_secs(600);
 const CODE_WALL_MAX: Duration = Duration::from_secs(3600);
 /// kiln's operations, as the server lists them, are asked for again after this.
 const REGISTRY_TTL: Duration = Duration::from_secs(60);
+/// Word of what it couldn't read on its way to the server at once, at most.
+const NOTING_MOST: usize = 4;
 
 fn instructions(prefer: Option<&str>, machines: &str, session: &str) -> String {
     let mut s = "This is kiln's own MCP server: the machines of this kiln (its runners), and kiln itself (CI, deployments). \
@@ -126,7 +129,36 @@ fn describe(v: &Value) -> String {
     out.join(", ")
 }
 
-const WANT: &str = "What the machine must be and have (optional), as `needs` says it: `linux/amd64`, `macos`, `+gpu`, `cpus=8,mem=32g`, `tool:cargo`; or a runner's name.";
+/// What this server's own tool `tool` takes ([`input`]): its schema is the tool's `inputSchema`,
+/// and each call's arguments are read as it before it runs ([`Server::call`]). None for kiln's
+/// operations an agent has as tools: the kiln server reads those (`crate::mcp::runner_ask`).
+fn tool_input(tool: &str) -> Option<Input> {
+    Some(match tool {
+        "code_run" => Input::of::<input::CodeRun>(),
+        "code_search" => Input::of::<crate::mcp::input::CodeSearch>(),
+        "runners" => Input::of::<input::Runners>(),
+        "run" => Input::of::<input::Run>(),
+        "output" => Input::of::<input::Output>(),
+        "stop" => Input::of::<input::Stop>(),
+        "preview_page" => Input::of::<input::PreviewPage>(),
+        "show_page" => Input::of::<input::ShowPage>(),
+        "show_live" => Input::of::<input::ShowLive>(),
+        "use_live" => Input::of::<input::UseLive>(),
+        _ => return None,
+    })
+}
+
+/// What `kiln.machines.<name>` takes, as [`tool_input`] says for a tool: its schema is the
+/// operation's `input` (`code_search`), and each call's input is read as it ([`Program::call`]).
+fn machine_input(name: &str) -> Option<Input> {
+    Some(match name {
+        "machines.list" => Input::of::<input::MachinesList>(),
+        "machines.run" | "machines.start" => Input::of::<input::Command>(),
+        "machines.output" => Input::of::<input::Output>(),
+        "machines.stop" => Input::of::<input::Stop>(),
+        _ => return None,
+    })
+}
 
 /// Where a command of `run` and `kiln.machines.run` goes, as its runner reads it: `on` and `needs`
 /// as one spelling ([`super::directory::target`]), the session's preferred runner when neither is
@@ -138,31 +170,11 @@ fn run_target(args: &Value, prefer: Option<&str>) -> Result<String, String> {
     super::directory::target(on, needs).map_err(|e| format!("`needs`: {e}"))
 }
 
-/// A command's input, as `run` and `kiln.machines.run` take it (`run` adds how long to wait).
-fn command_schema(waits: bool) -> Value {
-    let mut props = json!({
-        "command": {"type": "string", "description": "Shell text, run by bash in the synced copy of this repository."},
-        "needs": {"type": "string", "description": "What the machine must be and have: `linux/amd64`, `macos`, `+gpu` (a label), `tool:cargo`, `cpus>=16` (cores in all), and the room the command asks for, idle and free there now: `cpus=8`, `mem=32g`, `disk=50g`, `gpus=1`; `exclusive`: no CI work on it. Picks this machine when it has them and room to spare, else the idlest that has them."},
-        "on": {"type": "string", "description": "A runner by name, for a step that has to happen on that machine (it must still meet `needs`). Default: what `needs` picks; with neither, the session's preferred runner, else this machine."},
-        "sync": {"type": "boolean", "description": "Copy this repository over first and run in it (default: true inside a git repository)."},
-        "cwd": {"type": "string", "description": "With sync: the folder here whose repository is synced and whose counterpart the command runs in (default: the session's folder). Without sync: the folder on the other machine (default: its home)."},
-        "timeout_s": {"type": "number", "description": "Stop the command after this many seconds."},
-        "shell": {"type": "string", "description": "A named shell over there: its folder and exported variables carry over between runs that name it."},
-        "env": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Environment for the command."},
-        "reuse": {"type": "boolean", "description": "Give back the result of an identical earlier run instead of running again (the same command, folder, environment and machine, over an identical tree; only successes are kept)."}
-    });
-    if waits && let Some(p) = props.as_object_mut() {
-        p.insert("wait_s".into(), json!({"type": "number", "description": "Return after this many seconds even if it is still running (it keeps running in the background; default 600)."}));
-        p.insert("background".into(), json!({"type": "boolean", "description": "Return at once with an id; read with `output`, end with `stop`."}));
-    }
-    json!({"type": "object", "properties": props, "required": ["command"]})
-}
-
 /// kiln's operations an agent has as tools of its own ([`crate::mcp::agent_ops`]: `agents_start`,
 /// `goals_plan`, `plans_run`, …), as this binary knows them: what's offered when the server can't
 /// say (one from before it said, or out of reach).
 fn agent_tools() -> Vec<Value> {
-    crate::mcp::agent_ops().iter().map(|o| tool_of(o.name, &json!(o.summary), &(o.input)(), o.read_only, o.destructive)).collect()
+    crate::mcp::agent_ops().iter().map(|o| tool_of(o.name, &json!(o.summary), &o.input.schema(), o.read_only, o.destructive)).collect()
 }
 
 /// One operation as an agent's tool, asked of the server for this session like the rest of kiln's
@@ -220,128 +232,88 @@ fn tools() -> Value {
 }
 
 fn base_tools() -> Value {
+    let schema = |tool: &str| tool_input(tool).map_or(Value::Null, |i| i.schema());
     json!([
         {
             "name": "code_run",
             "description": "Run a JavaScript program against kiln and get back only what it returns. `await kiln.machines.run({needs, command})` runs a shell command on one of this kiln's machines that has what it needs (or `on`, one by name) (this repository synced over first, as with `run`) and resolves when it ends, with {runner, exit_code, output}; start several and `await Promise.all([...])` to run them side by side. Also `kiln.machines.list({want})`, `kiln.machines.start(...)` (background: {id}), `kiln.machines.output({id, wait_s})`, `kiln.machines.stop({id})`, and kiln's CI and deployments under `kiln.ci.*` and `kiln.cd.*` (`code_search` lists every operation and its input; `kiln.call(name, input)` calls one by name). A refused call throws an Error with `result`. `input` is given as `input`. Bounded: 10 minutes unless timeout_s says otherwise (at most an hour), 16 calls at once, 4 MiB per answer; runs a program ends without are stopped.",
-            "inputSchema": {"type": "object", "properties": {
-                "program": {"type": "string", "description": "The body of an async function; `return` its answer."},
-                "input": {"description": "Any JSON, available as `input`."},
-                "timeout_s": {"type": "number", "description": "How long the program may run (default 600, at most 3600)."}
-            }, "required": ["program"]},
+            "inputSchema": schema("code_run"),
             "annotations": {"readOnlyHint": false, "destructiveHint": true, "openWorldHint": true},
         },
         {
             "name": "code_search",
             "description": "Run a JavaScript program over kiln's operations and return what it returns. The program sees `registry` (every operation: {name, call, summary, read_only, destructive, input}) and `skills` ({name, description}). Example: `return registry.filter(o => o.name.startsWith(\"machines.\") || o.name.startsWith(\"ci.runs\")).map(o => ({call: o.call, input: o.input}))`.",
-            "inputSchema": {"type": "object", "properties": {"program": {"type": "string", "description": "The body of an async function; `return` its answer."}}, "required": ["program"]},
+            "inputSchema": schema("code_search"),
             "annotations": {"readOnlyHint": true, "openWorldHint": false},
         },
         {
             "name": "runners",
             "description": "The machines (kiln runners) commands can run on, best first for `want` (this one first when it suits and has memory to spare): platform, idle cores, free memory, installed agents, and why others don't suit. `want` is what it must be and have, as `run`'s `needs` takes it (`linux/amd64`, `+gpu`, `cpus=8,mem=32g`, `tool:cargo`), or a runner's name.",
-            "inputSchema": {"type": "object", "properties": {"want": {"type": "string", "description": "What the machine must be (optional)."}}},
+            "inputSchema": schema("runners"),
             "annotations": {"readOnlyHint": true, "openWorldHint": false},
         },
         {
             "name": "run",
             "description": "Run a shell command (bash) on another machine, for a step this one can't do: another platform, a GPU, more memory, disk or cores than it has, or one that has to happen on that machine (everything else, run here with your own tools). `needs` picks it: what it must be and have (`linux/amd64`, `macos/arm64`, `+gpu`, `tool:cargo`, `cpus=8,mem=32g` idle and free): this machine when it suits and has room to spare, else the idlest that suits; `on` names a machine when the step has to happen on that one. By default this repository is synced there first (git-tracked and untracked-but-not-ignored files plus .git; build output like target/ stays home) and the command runs in the matching folder. What the command leaves running when it ends (`nohup … &`, a daemon) ends with it: run a server with background: true, and `stop` it when done. Returns the exit code and output (stdout and stderr interleaved, the middle cut past 30k characters). Set background to return at once with an id for `output` and `stop`.",
-            "inputSchema": command_schema(true),
+            "inputSchema": schema("run"),
             "annotations": {"readOnlyHint": false, "destructiveHint": true, "openWorldHint": true},
         },
         {
             "name": "output",
             "description": "A background run's output since the last read, and whether it has ended (with its exit code). wait_s waits up to that long for it to end.",
-            "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}, "wait_s": {"type": "number"}}, "required": ["id"]},
+            "inputSchema": schema("output"),
             "annotations": {"readOnlyHint": true, "openWorldHint": false},
         },
         {
             "name": "stop",
             "description": "Stop a background run (Ctrl-C, then terminate if it doesn't stop).",
-            "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]},
+            "inputSchema": schema("stop"),
             "annotations": {"readOnlyHint": false, "destructiveHint": true, "openWorldHint": false},
         },
         {
             "name": "preview_page",
             "description": "See a page as a person will, in kiln's own browser on this machine: HTML you wrote, an HTML file, or an address (a dev server here, http://localhost:5173, or the web). You get a picture of it, what its console printed (errors with their stack), how tall it is, and how it behaved for a moment after it loaded: layout shift (0: nothing moved), long tasks, frames a second. Check your work with it before you say it's done or show it. A phone by default (390×844, 2× pixels, dark); set width, height, scale and dark to see others. measure: true also gives its height at each width a viewer's conversation might have. The picture is saved at picture_path: to show it to the person, put that path in your message as a Markdown image. The first preview on a machine downloads the browser once (about 200 MB), so it can take a minute.",
-            "inputSchema": {"type": "object", "properties": {
-                "html": {"type": "string", "description": "A whole HTML document you wrote. Full paths in it (src=\"/tmp/shot.png\") load those files."},
-                "path": {"type": "string", "description": "An HTML file on this machine (or a picture, a PDF)."},
-                "url": {"type": "string", "description": "An address: a dev server on this machine or a page on the web."},
-                "width": {"type": "number", "description": "The window's width in CSS pixels: 390 (a phone) by default, 1280 for a desktop."},
-                "height": {"type": "number", "description": "The window's height: 844 by default."},
-                "scale": {"type": "number", "description": "Pixel density: 2 by default."},
-                "dark": {"type": "boolean", "description": "A dark appearance (prefers-color-scheme): true by default."},
-                "reduced_motion": {"type": "boolean", "description": "prefers-reduced-motion: reduce."},
-                "watch_ms": {"type": "number", "description": "How long to watch it after it loads, in ms: 1500 by default, at most 10000."},
-                "measure": {"type": "boolean", "description": "Also its height at each width a viewer's conversation might have."},
-                "picture": {"type": "string", "enum": ["window", "page", "none"], "description": "The window (the default), the whole page, or none."}
-            }},
+            "inputSchema": schema("preview_page"),
             "annotations": {"readOnlyHint": true, "openWorldHint": true},
         },
         {
             "name": "show_page",
             "description": "Show the person a page in the conversation, live and interactive: a chart, a table, a diagram, a mock-up, a small tool to try. Write a whole HTML document (or give an HTML file). kiln keeps it with every file it uses: pictures, styles, scripts, fonts, data, by full path or next to the file; libraries from the web (pin their versions) are fetched once by the server and kept. It's shown inline at the conversation's width, as tall as it is, in kiln's look: dark, transparent background, Geist, and kiln's colors as CSS variables (--foreground, --muted-foreground, --border, --card, --accent, --success, --warning, --destructive, --chart-1 to --chart-5, --font-sans, --font-mono, --radius): use them. Make it fit any width from 320 px up (no fixed widths). It runs sandboxed: its scripts work, but it reaches nothing beyond its own files and has no cookies or storage. In it, kiln.reply(value, label) offers the person's choice back to you as their next message; kiln.save(state) keeps what they did, handed back to kiln.onrestore(state) when it's shown again. What moves (animations, video, sound) pauses while it's out of view. Look at it with preview_page first. The answer says what kiln's browser saw: errors it printed, layout shift, its height at each width.",
-            "inputSchema": {"type": "object", "properties": {
-                "title": {"type": "string", "description": "A few words for it: shown with it, and its name."},
-                "html": {"type": "string", "description": "A whole HTML document."},
-                "path": {"type": "string", "description": "Or an HTML file on this machine (files it uses are found next to it)."}
-            }, "required": ["title"]},
+            "inputSchema": schema("show_page"),
             "annotations": {"readOnlyHint": false, "openWorldHint": true},
         },
         {
             "name": "show_live",
             "description": "Show the person a page live in the conversation, running here on this machine: your dev server (http://localhost:5173), a page that needs this machine's files, network or GPU, or any site. Its picture and sound stream to them while they look, at their screen's size, and what they do in it (taps, typing, scrolling) goes to it. For a page you wrote that runs on its own, use show_page instead. The answer says which stream it is. To test it in another engine, say engine: firefox (this machine's Firefox) or webkit (Safari on a Mac); to see it as a device does, say device (its window, density, touch and user agent the device's).",
-            "inputSchema": {"type": "object", "properties": {
-                "url": {"type": "string", "description": "Its address: on this machine (http://localhost:3000) or on the web."},
-                "title": {"type": "string", "description": "A few words for it."},
-                "engine": {"type": "string", "enum": ["chromium", "firefox", "webkit"], "description": "The engine it runs in (chromium by default)."},
-                "device": {"type": "string", "enum": ["iPhone 15", "iPhone SE", "Pixel 8", "iPad Air", "Laptop", "Desktop"], "description": "A device it's laid out as (by default, as the person's screen is)."}
-            }, "required": ["url"]},
+            "inputSchema": schema("show_live"),
             "annotations": {"readOnlyHint": false, "openWorldHint": true},
         },
         {
             "name": "use_live",
             "description": "Use a page you showed with show_live, as the person can: click or tap at a point (CSS pixels of its window), type text, press a key by name (Enter, Tab, Escape, ArrowDown, a), scroll, go to an address, back, forward, reload, wait; its tabs: show one, open a new one, close one (a link to a new tab or a popup opens a tab of its own, shown). Its actions run in order; then you get a picture of it, its address and title, and its tabs. The person sees what you did as you do it, live, in the same page. Record it too: {\"record\": true} starts a recording (video, and a log of what's done in it by you or the person), {\"record\": false} stops it and answers with its files: the video (MP4), the log (.inputs.jsonl) and a Playwright test of what was done (.spec.ts) to turn into a real one. {\"replay\": \"<.inputs.jsonl path>\"} does a recording's log again in the page.",
-            "inputSchema": {"type": "object", "properties": {
-                "stream": {"type": "string", "description": "The stream's id, from show_live's answer."},
-                "actions": {"type": "array", "description": "In order: {\"click\": [x, y]}, {\"tap\": [x, y]}, {\"type\": \"text\"}, {\"key\": \"Enter\"}, {\"scroll\": [dx, dy]}, {\"go\": \"http://localhost:3000/\"}, {\"back\": true}, {\"forward\": true}, {\"reload\": true}, {\"tab\": {\"show\": \"<tab id>\"}}, {\"tab\": {\"new\": \"https://example.com/\"}}, {\"tab\": {\"close\": \"<tab id>\"}}, {\"wait_ms\": 500}, {\"record\": true}, {\"record\": false}, {\"replay\": \"/path/live-….inputs.jsonl\"}.", "items": {"type": "object"}},
-                "picture": {"type": "boolean", "description": "A picture of it after (true by default)."}
-            }, "required": ["stream"]},
+            "inputSchema": schema("use_live"),
             "annotations": {"readOnlyHint": false, "openWorldHint": true},
         },
     ])
 }
 
-/// `kiln.machines.*`, as `code_search` lists them.
+/// `kiln.machines.*`, as `code_search` lists them, each one's input [`machine_input`]'s.
 fn machine_ops() -> Vec<Value> {
-    let op = |name: &str, summary: &str, read_only: bool, destructive: bool, input: Value| {
+    let op = |name: &str, summary: &str, read_only: bool, destructive: bool| {
+        let input = machine_input(name).map_or(Value::Null, |i| i.schema());
         json!({"name": name, "call": format!("kiln.{name}"), "summary": summary, "read_only": read_only, "destructive": destructive, "input": input})
     };
     vec![
-        op(
-            "machines.list",
-            "The machines (kiln runners) commands can run on, best first for `want`: {me, runners: [{runner: {name, os, arch, ...}, why}], passed: [...]}.",
-            true,
-            false,
-            json!({"type": "object", "properties": {"want": {"type": "string", "description": WANT}}}),
-        ),
+        op("machines.list", "The machines (kiln runners) commands can run on, best first for `want`: {me, runners: [{runner: {name, os, arch, ...}, why}], passed: [...]}.", true, false),
         op(
             "machines.run",
             "Run a shell command on a machine and wait for it to end: {runner, exit_code, output (stdout and stderr interleaved; the middle cut past 1,000,000 characters), why, synced}. A command that fails still resolves, with its exit code; a machine that can't be reached rejects.",
             false,
             true,
-            command_schema(false),
         ),
-        op("machines.start", "Start a shell command on a machine in the background: {id, runner, output so far}. Then machines.output and machines.stop (or the `output` and `stop` tools).", false, true, command_schema(false)),
-        op(
-            "machines.output",
-            "A background run's output since the last read, and whether it has ended (exit_code). wait_s waits up to that long for it to end.",
-            true,
-            false,
-            json!({"type": "object", "properties": {"id": {"type": "string"}, "wait_s": {"type": "number"}}, "required": ["id"]}),
-        ),
-        op("machines.stop", "Stop a background run (Ctrl-C, then terminate if it doesn't stop).", false, true, json!({"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]})),
+        op("machines.start", "Start a shell command on a machine in the background: {id, runner, output so far}. Then machines.output and machines.stop (or the `output` and `stop` tools).", false, true),
+        op("machines.output", "A background run's output since the last read, and whether it has ended (exit_code). wait_s waits up to that long for it to end.", true, false),
+        op("machines.stop", "Stop a background run (Ctrl-C, then terminate if it doesn't stop).", false, true),
     ]
 }
 
@@ -500,6 +472,8 @@ struct Server {
     /// What the agent was last given as the tools (`fingerprint`): when the server's change, it's
     /// told to ask again (`notifications/tools/list_changed`).
     listed: Mutex<Option<u64>>,
+    /// Word of what it couldn't read on its way to the server (`Server::note`).
+    noting: std::sync::atomic::AtomicUsize,
 }
 
 impl Server {
@@ -606,6 +580,40 @@ impl Server {
             None => anyhow::bail!("the kiln runner closed the connection (a runner older than kiln's operations for agents doesn't answer them: upgrade it)"),
             other => anyhow::bail!("unexpected answer {other:?}"),
         }
+    }
+
+    /// `r`, a message its agent sent that it couldn't read, told the server for this session
+    /// ([`Server::tell`]).
+    fn note(self: &Arc<Self>, r: &crate::mcp::rpc::Refused) {
+        if r.unreadable() {
+            self.tell(&r.what, r.code(), &r.noted());
+        }
+    }
+
+    /// A call (`what`: `tools/call run`, `code_run kiln.machines.run`) whose input doesn't fit what
+    /// it takes, told the server as a message it couldn't read (`malformed`, [`Server::tell`]).
+    fn misfit(self: &Arc<Self>, what: &str, m: &crate::ops::Misfit) {
+        self.tell(what, crate::wire::unread::Code::Malformed, &m.noted());
+    }
+
+    /// Word of a message its agent sent that it couldn't read, told the server for this session
+    /// (`crate::reach::Question::Unread`), on a thread of its own so the agent waits for nothing:
+    /// at most [`NOTING_MOST`] on their way at once, and past that one isn't told (it's answered
+    /// all the same).
+    fn tell(self: &Arc<Self>, what: &str, code: crate::wire::unread::Code, why: &str) {
+        use std::sync::atomic::Ordering;
+        if self.session.is_empty() {
+            return;
+        }
+        if self.noting.fetch_add(1, Ordering::SeqCst) >= NOTING_MOST {
+            self.noting.fetch_sub(1, Ordering::SeqCst);
+            return;
+        }
+        let (server, q) = (Arc::clone(self), json!({"op": "unread", "what": what, "code": code, "why": why}));
+        std::thread::spawn(move || {
+            let _ = server.ask(q);
+            server.noting.fetch_sub(1, Ordering::SeqCst);
+        });
     }
 
     /// Ask the machine's preview browser, through the runner (`crate::browser::ask`).
@@ -742,7 +750,18 @@ impl Server {
         t
     }
 
+    /// Whether it offers a tool `name` (`tools`).
+    fn has(&self, name: &str) -> bool {
+        self.tools().as_array().is_some_and(|t| t.iter().any(|t| t.get("name").and_then(Value::as_str) == Some(name)))
+    }
+
     fn call(self: &Arc<Self>, name: &str, args: &Value) -> Value {
+        // Arguments one of its own tools doesn't take, or of the wrong type: a tool error saying
+        // where and why, as an operation's misfit is, and the server told.
+        if let Some(m) = tool_input(name).and_then(|i| i.fits(args).err()) {
+            self.misfit(&format!("tools/call {name}"), &m);
+            return text_result(&m.answer(name), true);
+        }
         let s = |k: &str| args.get(k).and_then(Value::as_str).map(str::to_owned).filter(|v| !v.trim().is_empty());
         match name {
             "code_run" | "code_search" => {
@@ -877,6 +896,18 @@ impl code::Host for Program {
     fn call(&self, name: &str, input: Value) -> Result<Value, Value> {
         let err = |e: String| json!({"error": e});
         let id_of = |input: &Value| input.get("id").and_then(Value::as_str).map(str::to_owned).ok_or_else(|| err("`id` is required".into()));
+        // An input `kiln.machines.*` doesn't take (null is none, as an operation's is): refused as
+        // an operation's misfit is in code mode, saying where and why, and the server told.
+        if let Some(wants) = machine_input(name)
+            && let Err(m) = wants.fits(&if input.is_null() { json!({}) } else { input.clone() })
+        {
+            self.server.misfit(&format!("code_run kiln.{name}"), &m);
+            let mut a = m.answer(name);
+            if let Some(o) = a.as_object_mut() {
+                o.insert("status".into(), json!(http::StatusCode::BAD_REQUEST.as_u16()));
+            }
+            return Err(a);
+        }
         match name {
             "machines.list" => self.server.runners(input.get("want").and_then(Value::as_str).map(str::to_owned)).map_err(|e| err(format!("{e:#}"))),
             "machines.run" | "machines.start" => {
@@ -934,10 +965,6 @@ fn rpc_ok(id: Value, result: Value) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "result": result})
 }
 
-fn rpc_error(id: Value, code: i64, message: &str) -> Value {
-    json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
-}
-
 /// `kiln reach mcp`: serve MCP on stdin/stdout until stdin closes. Tool calls run side by side.
 pub fn serve() -> anyhow::Result<()> {
     let sock = super::local::find_socket()?;
@@ -945,7 +972,7 @@ pub fn serve() -> anyhow::Result<()> {
     let session = std::env::var("KILN_SESSION").unwrap_or_default();
     let cwd = std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
     let machines = machines(&sock);
-    let server = Arc::new(Server { sock, prefer, cwd, session, runs: Arc::default(), next: Mutex::new(0), registry: Mutex::new(None), agent_tools: Mutex::new(None), listed: Mutex::new(None) });
+    let server = Arc::new(Server { sock, prefer, cwd, session, runs: Arc::default(), next: Mutex::new(0), registry: Mutex::new(None), agent_tools: Mutex::new(None), listed: Mutex::new(None), noting: Default::default() });
     let out = Arc::new(Mutex::new(std::io::stdout()));
     let say = |out: &Arc<Mutex<std::io::Stdout>>, v: &Value| {
         if let Ok(mut o) = out.lock() {
@@ -971,72 +998,151 @@ pub fn serve() -> anyhow::Result<()> {
             }
         });
     }
-    for line in std::io::stdin().lock().lines() {
-        let Ok(line) = line else { break };
-        if line.trim().is_empty() {
+    let mut stdin = std::io::stdin().lock();
+    while let Ok(Some(line)) = next_line(&mut stdin) {
+        // A line past what a message may be is refused unread, and noted.
+        let Ok(line) = line else {
+            let r = Box::new(crate::mcp::rpc::too_large());
+            server.note(&r);
+            say(&out, &r.answer());
+            continue;
+        };
+        if line.trim_ascii().is_empty() {
             continue;
         }
-        let msg: Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(e) => {
-                say(&out, &rpc_error(Value::Null, -32700, &format!("parse error: {e}")));
-                continue;
-            }
-        };
-        let Some(id) = msg.get("id").cloned().filter(|i| !i.is_null()) else { continue };
-        let method = msg.get("method").and_then(Value::as_str).unwrap_or("").to_owned();
-        let params = msg.get("params").cloned().unwrap_or(Value::Null);
-        match method.as_str() {
-            "initialize" => {
-                let version = params.get("protocolVersion").and_then(Value::as_str).unwrap_or("2025-06-18").to_owned();
-                say(
-                    &out,
-                    &rpc_ok(
-                        id,
-                        json!({
-                            "protocolVersion": version,
-                            "capabilities": {"tools": {"listChanged": true}, "resources": {"listChanged": false}},
-                            "serverInfo": {"name": "kiln", "title": "kiln", "version": env!("CARGO_PKG_VERSION")},
-                            "instructions": instructions(server.prefer.as_deref(), &machines, &server.session),
-                        }),
-                    ),
-                );
-            }
-            "ping" => say(&out, &rpc_ok(id, json!({}))),
-            "tools/list" => {
-                let t = server.tools();
-                if let Ok(mut g) = server.listed.lock() {
-                    *g = Some(fingerprint(&t));
-                }
-                say(&out, &rpc_ok(id, json!({"tools": t})));
-            }
-            "tools/call" => {
-                let (server, out) = (Arc::clone(&server), Arc::clone(&out));
-                std::thread::spawn(move || {
-                    let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-                    let args = params.get("arguments").cloned().unwrap_or(json!({}));
-                    let v = server.call(name, &args);
-                    if let Ok(mut o) = out.lock() {
-                        let _ = writeln!(o, "{}", rpc_ok(id, v));
-                        let _ = o.flush();
-                    }
-                });
-            }
-            // kiln's skills (deploying, diagnosing): resources, as the server offers them.
-            "resources/list" => say(&out, &rpc_ok(id, json!({"resources": crate::mcp::skills::resources()}))),
-            "resources/read" => {
-                let uri = params.get("uri").and_then(Value::as_str).unwrap_or("");
-                match crate::mcp::skills::read(uri) {
-                    Some(c) => say(&out, &rpc_ok(id, json!({"contents": [c]}))),
-                    None => say(&out, &rpc_error(id, -32002, &format!("no resource {uri}"))),
-                }
-            }
-            "resources/templates/list" => say(&out, &rpc_ok(id, json!({"resourceTemplates": []}))),
-            "prompts/list" => say(&out, &rpc_ok(id, json!({"prompts": []}))),
-            other => say(&out, &rpc_error(id, -32601, &format!("method not found: {other}"))),
+        // Each message read into a request, or refused as JSON-RPC 2.0 says and noted (`rpc`). A
+        // batch (MCP before 2025-06-18) is answered whole, each message in turn; a message alone is
+        // answered as it's done, a tool's call on a thread of its own.
+        let body = crate::mcp::rpc::body(&line);
+        let lone = (!body.batch).then_some(&out);
+        let answers: Vec<Value> = body.messages.into_iter().filter_map(|m| answer(&server, &machines, m, lone)).collect();
+        if let Some(a) = crate::mcp::rpc::reply(body.batch, answers) {
+            say(&out, &a);
         }
     }
     Ok(())
+}
+
+/// The next line of `input`, without its newline: none at its end; `Err` for one past what a message
+/// may be (`rpc::BODY_MOST`), the rest of it read and let go.
+fn next_line(input: &mut impl BufRead) -> std::io::Result<Option<Result<Vec<u8>, ()>>> {
+    let (mut line, mut over, mut any) = (Vec::new(), false, false);
+    loop {
+        let buf = input.fill_buf()?;
+        if buf.is_empty() {
+            return Ok(any.then_some(if over { Err(()) } else { Ok(line) }));
+        }
+        any = true;
+        let (took, ended) = match buf.iter().position(|b| *b == b'\n') {
+            Some(at) => (at + 1, Some(at)),
+            None => (buf.len(), None),
+        };
+        if !over {
+            line.extend_from_slice(buf.get(..ended.unwrap_or(took)).unwrap_or_default());
+            if line.len() > crate::mcp::rpc::BODY_MOST {
+                over = true;
+                line = Vec::new();
+            }
+        }
+        input.consume(took);
+        if ended.is_some() {
+            return Ok(Some(if over { Err(()) } else { Ok(line) }));
+        }
+    }
+}
+
+/// One message's answer: none for a notification, nor for a tool's call when `out` is given (its
+/// answer goes there once it's done).
+fn answer(server: &Arc<Server>, machines: &str, m: Result<crate::mcp::rpc::Request, Box<crate::mcp::rpc::Refused>>, out: Option<&Arc<Mutex<std::io::Stdout>>>) -> Option<Value> {
+    use crate::mcp::rpc;
+    let refused = |r: Box<rpc::Refused>| {
+        server.note(&r);
+        Some(r.answer())
+    };
+    let req = match m {
+        Ok(req) => req,
+        Err(r) => return refused(r),
+    };
+    // A notification is never answered; one no client sends is noted all the same.
+    let Some(id) = req.id.clone() else {
+        if let Some(r) = req.unknown_notification() {
+            server.note(&r);
+        }
+        return None;
+    };
+    // A list's cursor is a string (its lists come whole).
+    if matches!(req.method.as_str(), "tools/list" | "resources/list" | "resources/templates/list" | "prompts/list")
+        && let Err(r) = req.params::<rpc::Paginated>()
+    {
+        return refused(r);
+    }
+    Some(match req.method.as_str() {
+        "initialize" => {
+            let p: rpc::Initialize = match req.params() {
+                Ok(p) => p,
+                Err(r) => return refused(r),
+            };
+            let version = p.protocol_version.unwrap_or_else(|| "2025-06-18".to_owned());
+            rpc_ok(
+                id,
+                json!({
+                    "protocolVersion": version,
+                    "capabilities": {"tools": {"listChanged": true}, "resources": {"listChanged": false}},
+                    "serverInfo": {"name": "kiln", "title": "kiln", "version": env!("CARGO_PKG_VERSION")},
+                    "instructions": instructions(server.prefer.as_deref(), machines, &server.session),
+                }),
+            )
+        }
+        "ping" => rpc_ok(id, json!({})),
+        "tools/list" => {
+            let t = server.tools();
+            if let Ok(mut g) = server.listed.lock() {
+                *g = Some(fingerprint(&t));
+            }
+            rpc_ok(id, json!({"tools": t}))
+        }
+        "tools/call" => {
+            let p: rpc::ToolsCall = match req.params() {
+                Ok(p) => p,
+                Err(r) => return refused(r),
+            };
+            // A tool it doesn't have is a protocol error (MCP 2025-11-25), not the tool's: looked
+            // for where the call runs, as listing the tools may ask the server.
+            let unknown = req.unknown_tool(&p.name);
+            let call = move |server: &Arc<Server>| {
+                if !server.has(&p.name) {
+                    server.note(&unknown);
+                    return unknown.answer();
+                }
+                rpc_ok(id, server.call(&p.name, &Value::Object(p.arguments.unwrap_or_default())))
+            };
+            let Some(out) = out else { return Some(call(server)) };
+            let (server, out) = (Arc::clone(server), Arc::clone(out));
+            std::thread::spawn(move || {
+                let v = call(&server);
+                if let Ok(mut o) = out.lock() {
+                    let _ = writeln!(o, "{v}");
+                    let _ = o.flush();
+                }
+            });
+            return None;
+        }
+        // kiln's skills (deploying, diagnosing): resources, as the server offers them.
+        "resources/list" => rpc_ok(id, json!({"resources": crate::mcp::skills::resources()})),
+        "resources/read" => {
+            let p: rpc::ResourcesRead = match req.params() {
+                Ok(p) => p,
+                Err(r) => return refused(r),
+            };
+            match crate::mcp::skills::read(&p.uri) {
+                Some(c) => rpc_ok(id, json!({"contents": [c]})),
+                None => rpc::Refused::new(id, -32002, format!("no resource {}", p.uri)).answer(),
+            }
+        }
+        "resources/templates/list" => rpc_ok(id, json!({"resourceTemplates": []})),
+        "prompts/list" => rpc_ok(id, json!({"prompts": []})),
+        _ => return refused(Box::new(req.unknown_method())),
+    })
 }
 
 /// The server's environment: the runner's reach socket, the session's preferred runner, and the
@@ -1126,6 +1232,240 @@ pub fn agy_allow(settings: &Value) -> Option<Value> {
     Some(out)
 }
 
+/// The devices `show_live` lays a page out as, by name (`crate::browser::devices`).
+fn devices() -> Vec<&'static str> {
+    crate::browser::devices::DEVICES.iter().map(|d| d.name).collect()
+}
+
+/// What this server's own tools take ([`tool_input`]), and code mode's `kiln.machines.*` here
+/// ([`machine_input`]). `code_search` takes `crate::mcp::input::CodeSearch`, as the server's does.
+pub mod input {
+    use std::collections::BTreeMap;
+
+    use schemars::JsonSchema;
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CodeRun {
+        /// The body of an async function; `return` its answer.
+        pub program: String,
+        /// Any JSON, available as `input`.
+        pub input: Option<serde_json::Value>,
+        /// How long the program may run (default 600, at most 3600).
+        pub timeout_s: Option<f64>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct Runners {
+        /// What the machine must be (optional).
+        pub want: Option<String>,
+    }
+
+    /// A command, as `run` takes it: [`Command`]'s, and how long to wait for it.
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct Run {
+        /// Shell text, run by bash in the synced copy of this repository.
+        pub command: String,
+        /// What the machine must be and have: `linux/amd64`, `macos`, `+gpu` (a label),
+        /// `tool:cargo`, `cpus>=16` (cores in all), and the room the command asks for, idle and
+        /// free there now: `cpus=8`, `mem=32g`, `disk=50g`, `gpus=1`; `exclusive`: no CI work on
+        /// it. Picks this machine when it has them and room to spare, else the idlest that has
+        /// them.
+        pub needs: Option<String>,
+        /// A runner by name, for a step that has to happen on that machine (it must still meet
+        /// `needs`). Default: what `needs` picks; with neither, the session's preferred runner,
+        /// else this machine.
+        pub on: Option<String>,
+        /// Copy this repository over first and run in it (default: true inside a git repository).
+        pub sync: Option<bool>,
+        /// With sync: the folder here whose repository is synced and whose counterpart the command
+        /// runs in (default: the session's folder). Without sync: the folder on the other machine
+        /// (default: its home).
+        pub cwd: Option<String>,
+        /// Stop the command after this many seconds.
+        pub timeout_s: Option<f64>,
+        /// A named shell over there: its folder and exported variables carry over between runs
+        /// that name it.
+        pub shell: Option<String>,
+        /// Environment for the command.
+        pub env: Option<BTreeMap<String, String>>,
+        /// Give back the result of an identical earlier run instead of running again (the same
+        /// command, folder, environment and machine, over an identical tree; only successes are
+        /// kept).
+        pub reuse: Option<bool>,
+        /// Return after this many seconds even if it is still running (it keeps running in the
+        /// background; default 600).
+        pub wait_s: Option<f64>,
+        /// Return at once with an id; read with `output`, end with `stop`.
+        pub background: Option<bool>,
+    }
+
+    /// A command, as `kiln.machines.run` and `kiln.machines.start` take it.
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct Command {
+        /// Shell text, run by bash in the synced copy of this repository.
+        pub command: String,
+        /// What the machine must be and have: `linux/amd64`, `macos`, `+gpu` (a label),
+        /// `tool:cargo`, `cpus>=16` (cores in all), and the room the command asks for, idle and
+        /// free there now: `cpus=8`, `mem=32g`, `disk=50g`, `gpus=1`; `exclusive`: no CI work on
+        /// it. Picks this machine when it has them and room to spare, else the idlest that has
+        /// them.
+        pub needs: Option<String>,
+        /// A runner by name, for a step that has to happen on that machine (it must still meet
+        /// `needs`). Default: what `needs` picks; with neither, the session's preferred runner,
+        /// else this machine.
+        pub on: Option<String>,
+        /// Copy this repository over first and run in it (default: true inside a git repository).
+        pub sync: Option<bool>,
+        /// With sync: the folder here whose repository is synced and whose counterpart the command
+        /// runs in (default: the session's folder). Without sync: the folder on the other machine
+        /// (default: its home).
+        pub cwd: Option<String>,
+        /// Stop the command after this many seconds.
+        pub timeout_s: Option<f64>,
+        /// A named shell over there: its folder and exported variables carry over between runs
+        /// that name it.
+        pub shell: Option<String>,
+        /// Environment for the command.
+        pub env: Option<BTreeMap<String, String>>,
+        /// Give back the result of an identical earlier run instead of running again (the same
+        /// command, folder, environment and machine, over an identical tree; only successes are
+        /// kept).
+        pub reuse: Option<bool>,
+    }
+
+    /// A background run's output (`output`, `kiln.machines.output`).
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct Output {
+        pub id: String,
+        pub wait_s: Option<f64>,
+    }
+
+    /// A background run stopped (`stop`, `kiln.machines.stop`).
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct Stop {
+        pub id: String,
+    }
+
+    // The window, the whole page, or none. (Not a doc comment: it would be the description of
+    // each field of this type.)
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum PreviewPagePicture {
+        Window,
+        Page,
+        None,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct PreviewPage {
+        /// A whole HTML document you wrote. Full paths in it (src="/tmp/shot.png") load those
+        /// files.
+        pub html: Option<String>,
+        /// An HTML file on this machine (or a picture, a PDF).
+        pub path: Option<String>,
+        /// An address: a dev server on this machine or a page on the web.
+        pub url: Option<String>,
+        /// The window's width in CSS pixels: 390 (a phone) by default, 1280 for a desktop.
+        pub width: Option<f64>,
+        /// The window's height: 844 by default.
+        pub height: Option<f64>,
+        /// Pixel density: 2 by default.
+        pub scale: Option<f64>,
+        /// A dark appearance (prefers-color-scheme): true by default.
+        pub dark: Option<bool>,
+        /// prefers-reduced-motion: reduce.
+        pub reduced_motion: Option<bool>,
+        /// How long to watch it after it loads, in ms: 1500 by default, at most 10000.
+        pub watch_ms: Option<f64>,
+        /// Also its height at each width a viewer's conversation might have.
+        pub measure: Option<bool>,
+        /// The window (the default), the whole page, or none.
+        pub picture: Option<PreviewPagePicture>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct ShowPage {
+        /// A few words for it: shown with it, and its name.
+        pub title: String,
+        /// A whole HTML document.
+        pub html: Option<String>,
+        /// Or an HTML file on this machine (files it uses are found next to it).
+        pub path: Option<String>,
+    }
+
+    // Chromium, Firefox or WebKit. (Not a doc comment: it would be the description of each field
+    // of this type.)
+    /// Read as a live page's stream reads it (`crate::browser::driven::Engine::parse`): in any case,
+    /// and `chrome`, `gecko` and `safari` for chromium, firefox and webkit, though its schema lists
+    /// the three.
+    #[derive(Debug, JsonSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ShowLiveEngine {
+        Chromium,
+        Firefox,
+        Webkit,
+    }
+
+    impl<'de> Deserialize<'de> for ShowLiveEngine {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            use crate::browser::driven::Engine;
+            let s = String::deserialize(d)?;
+            match Engine::parse(&s) {
+                Ok(Engine::Chromium) => Ok(Self::Chromium),
+                Ok(Engine::Firefox) => Ok(Self::Firefox),
+                Ok(Engine::Webkit) => Ok(Self::Webkit),
+                Err(_) => Err(serde::de::Error::unknown_variant(&s, &["chromium", "firefox", "webkit"])),
+            }
+        }
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct ShowLive {
+        /// Its address: on this machine (http://localhost:3000) or on the web.
+        pub url: String,
+        /// A few words for it.
+        pub title: Option<String>,
+        /// The engine it runs in (chromium by default).
+        pub engine: Option<ShowLiveEngine>,
+        /// A device it's laid out as (by default, as the person's screen is).
+        #[schemars(extend("enum" = super::devices()))]
+        pub device: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct UseLive {
+        /// The stream's id, from show_live's answer.
+        pub stream: String,
+        /// In order: {"click": [x, y]}, {"tap": [x, y]}, {"type": "text"}, {"key": "Enter"},
+        /// {"scroll": [dx, dy]}, {"go": "http://localhost:3000/"}, {"back": true}, {"forward":
+        /// true}, {"reload": true}, {"tab": {"show": "<tab id>"}}, {"tab": {"new":
+        /// "https://example.com/"}}, {"tab": {"close": "<tab id>"}}, {"wait_ms": 500}, {"record":
+        /// true}, {"record": false}, {"replay": "/path/live-….inputs.jsonl"}.
+        pub actions: Option<Vec<serde_json::Map<String, serde_json::Value>>>,
+        /// A picture of it after (true by default).
+        pub picture: Option<bool>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct MachinesList {
+        /// What the machine must be and have (optional), as `needs` says it: `linux/amd64`,
+        /// `macos`, `+gpu`, `cpus=8,mem=32g`, `tool:cargo`; or a runner's name.
+        pub want: Option<String>,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1169,6 +1509,33 @@ mod tests {
         // Settings not as agy writes them are left alone.
         assert_eq!(agy_allow(&json!(["x"])), None);
         assert_eq!(agy_allow(&json!({"permissions": {"allow": "mcp(*)"}})), None);
+    }
+
+    /// What the agent sends its runner's MCP server is read as JSON-RPC 2.0 and MCP say: what
+    /// isn't JSON or a request is refused (each message of a batch on its own, under a null id when
+    /// its id can't be read), a method or a tool the server doesn't have too, and a valid
+    /// notification isn't answered.
+    #[test]
+    fn what_the_agent_sends_is_read_as_json_rpc_says() {
+        let server = Arc::new(Server { sock: "/nonexistent/kiln-reach.sock".into(), prefer: None, cwd: String::new(), session: String::new(), runs: Arc::default(), next: Mutex::new(0), registry: Mutex::new(None), agent_tools: Mutex::new(None), listed: Mutex::new(None), noting: Default::default() });
+        let ask = |line: &str| {
+            let body = crate::mcp::rpc::body(line.as_bytes());
+            let answers = body.messages.into_iter().filter_map(|m| answer(&server, "", m, None)).collect();
+            crate::mcp::rpc::reply(body.batch, answers)
+        };
+        let code = |v: Option<Value>| v.and_then(|v| v.pointer("/error/code").and_then(Value::as_i64));
+        assert_eq!(code(ask("{")), Some(-32700));
+        assert_eq!(code(ask("{}")), Some(-32600));
+        let three = ask("[1,2,3]");
+        let each: Option<Vec<(Option<Value>, Option<Value>)>> = three.as_ref().and_then(Value::as_array).map(|a| a.iter().map(|e| (e.pointer("/error/code").cloned(), e.get("id").cloned())).collect());
+        assert_eq!(each, Some(vec![(Some(json!(-32600)), Some(Value::Null)); 3]), "{three:?}");
+        assert_eq!(code(ask(r#"{"jsonrpc":"2.0","id":1}"#)), Some(-32600));
+        assert_eq!(code(ask(r#"{"jsonrpc":"2.0","id":2,"method":"teleport"}"#)), Some(-32601));
+        assert_eq!(code(ask(r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"teleport","arguments":{}}}"#)), Some(-32602));
+        assert_eq!(ask(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#), None);
+        assert_eq!(ask(r#"{"jsonrpc":"2.0","method":"notifications/teleport"}"#), None, "no notification is answered, one no client sends neither");
+        assert_eq!(code(ask(r#"{"jsonrpc":"2.0","id":5,"method":"tools/list","params":{"cursor":5}}"#)), Some(-32602), "a cursor is a string");
+        assert_eq!(ask(r#"{"jsonrpc":"2.0","id":4,"method":"ping"}"#), Some(json!({"jsonrpc": "2.0", "id": 4, "result": {}})));
     }
 
     /// The agent tools are the server's: those it names (each as its registry has it, one it
@@ -1278,9 +1645,272 @@ mod tests {
         assert_eq!(t(json!({"command": "make", "needs": " "})).as_deref(), Ok("mac"));
         assert_eq!(run_target(&json!({"command": "make"}), None).as_deref(), Ok(""));
         assert_eq!(t(json!({"command": "make", "needs": "memm=4g"})), Err("`needs`: memm=4g: no such need".to_owned()));
-        assert_eq!(command_schema(true).pointer("/properties/needs/type"), Some(&json!("string")));
+        assert_eq!(tool_input("run").map(|i| i.schema()).and_then(|s| s.pointer("/properties/needs/type").cloned()), Some(json!("string")));
         let runs: Vec<Value> = machine_ops().into_iter().filter(|o| o.get("name").and_then(Value::as_str).is_some_and(|n| n == "machines.run" || n == "machines.start")).collect();
         assert_eq!(runs.len(), 2);
         assert!(runs.iter().all(|o| o.pointer("/input/properties/needs").is_some()), "{runs:?}");
+    }
+
+    /// A line past what a message may be is refused whole and the rest of it let go; the next is
+    /// read as it came.
+    #[test]
+    fn a_line_past_what_a_message_may_be_is_let_go_and_the_next_read() -> anyhow::Result<()> {
+        let mut input = b"{\"a\":1}\n".to_vec();
+        input.extend(std::iter::repeat_n(b'x', crate::mcp::rpc::BODY_MOST + 1));
+        input.extend_from_slice(b"\n{\"b\":2}");
+        let mut r = std::io::BufReader::new(input.as_slice());
+        assert_eq!(next_line(&mut r)?, Some(Ok(b"{\"a\":1}".to_vec())));
+        assert_eq!(next_line(&mut r)?, Some(Err(())));
+        assert_eq!(next_line(&mut r)?, Some(Ok(b"{\"b\":2}".to_vec())));
+        assert_eq!(next_line(&mut r)?, None);
+        Ok(())
+    }
+
+    /// A server of its own on `sock`, for session `session` (none: it tells the kiln server
+    /// nothing).
+    fn server_on(sock: &str, session: &str) -> Arc<Server> {
+        Arc::new(Server { sock: sock.into(), prefer: None, cwd: String::new(), session: session.into(), runs: Arc::default(), next: Mutex::new(0), registry: Mutex::new(None), agent_tools: Mutex::new(None), listed: Mutex::new(None), noting: Default::default() })
+    }
+
+    /// Each of its own tools and of `kiln.machines.*`, with the schema it publishes: the tool's
+    /// `inputSchema`, the operation's `input` (`code_search`'s registry); whether it's a tool.
+    fn published() -> Vec<(String, Value, bool)> {
+        let tools = base_tools().as_array().cloned().unwrap_or_default();
+        let tools = tools.into_iter().filter_map(|t| Some((t.get("name")?.as_str()?.to_owned(), t.get("inputSchema")?.clone(), true)));
+        let machines = machine_ops().into_iter().filter_map(|o| Some((o.get("name")?.as_str()?.to_owned(), o.get("input")?.clone(), false)));
+        tools.chain(machines).collect()
+    }
+
+    /// What each of its own tools and of `kiln.machines.*` published as its input before it was
+    /// typed, as it was written by hand.
+    fn published_before() -> Vec<(&'static str, Value)> {
+        let command = |waits: bool| {
+            let mut props = json!({
+                "command": {"type": "string", "description": "Shell text, run by bash in the synced copy of this repository."},
+                "needs": {"type": "string", "description": "What the machine must be and have: `linux/amd64`, `macos`, `+gpu` (a label), `tool:cargo`, `cpus>=16` (cores in all), and the room the command asks for, idle and free there now: `cpus=8`, `mem=32g`, `disk=50g`, `gpus=1`; `exclusive`: no CI work on it. Picks this machine when it has them and room to spare, else the idlest that has them."},
+                "on": {"type": "string", "description": "A runner by name, for a step that has to happen on that machine (it must still meet `needs`). Default: what `needs` picks; with neither, the session's preferred runner, else this machine."},
+                "sync": {"type": "boolean", "description": "Copy this repository over first and run in it (default: true inside a git repository)."},
+                "cwd": {"type": "string", "description": "With sync: the folder here whose repository is synced and whose counterpart the command runs in (default: the session's folder). Without sync: the folder on the other machine (default: its home)."},
+                "timeout_s": {"type": "number", "description": "Stop the command after this many seconds."},
+                "shell": {"type": "string", "description": "A named shell over there: its folder and exported variables carry over between runs that name it."},
+                "env": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Environment for the command."},
+                "reuse": {"type": "boolean", "description": "Give back the result of an identical earlier run instead of running again (the same command, folder, environment and machine, over an identical tree; only successes are kept)."}
+            });
+            if waits && let Some(p) = props.as_object_mut() {
+                p.insert("wait_s".into(), json!({"type": "number", "description": "Return after this many seconds even if it is still running (it keeps running in the background; default 600)."}));
+                p.insert("background".into(), json!({"type": "boolean", "description": "Return at once with an id; read with `output`, end with `stop`."}));
+            }
+            json!({"type": "object", "properties": props, "required": ["command"]})
+        };
+        vec![
+            ("code_run", json!({"type": "object", "properties": {
+                "program": {"type": "string", "description": "The body of an async function; `return` its answer."},
+                "input": {"description": "Any JSON, available as `input`."},
+                "timeout_s": {"type": "number", "description": "How long the program may run (default 600, at most 3600)."}
+            }, "required": ["program"]})),
+            ("code_search", json!({"type": "object", "properties": {"program": {"type": "string", "description": "The body of an async function; `return` its answer."}}, "required": ["program"]})),
+            ("runners", json!({"type": "object", "properties": {"want": {"type": "string", "description": "What the machine must be (optional)."}}})),
+            ("run", command(true)),
+            ("output", json!({"type": "object", "properties": {"id": {"type": "string"}, "wait_s": {"type": "number"}}, "required": ["id"]})),
+            ("stop", json!({"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]})),
+            ("preview_page", json!({"type": "object", "properties": {
+                "html": {"type": "string", "description": "A whole HTML document you wrote. Full paths in it (src=\"/tmp/shot.png\") load those files."},
+                "path": {"type": "string", "description": "An HTML file on this machine (or a picture, a PDF)."},
+                "url": {"type": "string", "description": "An address: a dev server on this machine or a page on the web."},
+                "width": {"type": "number", "description": "The window's width in CSS pixels: 390 (a phone) by default, 1280 for a desktop."},
+                "height": {"type": "number", "description": "The window's height: 844 by default."},
+                "scale": {"type": "number", "description": "Pixel density: 2 by default."},
+                "dark": {"type": "boolean", "description": "A dark appearance (prefers-color-scheme): true by default."},
+                "reduced_motion": {"type": "boolean", "description": "prefers-reduced-motion: reduce."},
+                "watch_ms": {"type": "number", "description": "How long to watch it after it loads, in ms: 1500 by default, at most 10000."},
+                "measure": {"type": "boolean", "description": "Also its height at each width a viewer's conversation might have."},
+                "picture": {"type": "string", "enum": ["window", "page", "none"], "description": "The window (the default), the whole page, or none."}
+            }})),
+            ("show_page", json!({"type": "object", "properties": {
+                "title": {"type": "string", "description": "A few words for it: shown with it, and its name."},
+                "html": {"type": "string", "description": "A whole HTML document."},
+                "path": {"type": "string", "description": "Or an HTML file on this machine (files it uses are found next to it)."}
+            }, "required": ["title"]})),
+            ("show_live", json!({"type": "object", "properties": {
+                "url": {"type": "string", "description": "Its address: on this machine (http://localhost:3000) or on the web."},
+                "title": {"type": "string", "description": "A few words for it."},
+                "engine": {"type": "string", "enum": ["chromium", "firefox", "webkit"], "description": "The engine it runs in (chromium by default)."},
+                "device": {"type": "string", "enum": ["iPhone 15", "iPhone SE", "Pixel 8", "iPad Air", "Laptop", "Desktop"], "description": "A device it's laid out as (by default, as the person's screen is)."}
+            }, "required": ["url"]})),
+            ("use_live", json!({"type": "object", "properties": {
+                "stream": {"type": "string", "description": "The stream's id, from show_live's answer."},
+                "actions": {"type": "array", "description": "In order: {\"click\": [x, y]}, {\"tap\": [x, y]}, {\"type\": \"text\"}, {\"key\": \"Enter\"}, {\"scroll\": [dx, dy]}, {\"go\": \"http://localhost:3000/\"}, {\"back\": true}, {\"forward\": true}, {\"reload\": true}, {\"tab\": {\"show\": \"<tab id>\"}}, {\"tab\": {\"new\": \"https://example.com/\"}}, {\"tab\": {\"close\": \"<tab id>\"}}, {\"wait_ms\": 500}, {\"record\": true}, {\"record\": false}, {\"replay\": \"/path/live-….inputs.jsonl\"}.", "items": {"type": "object"}},
+                "picture": {"type": "boolean", "description": "A picture of it after (true by default)."}
+            }, "required": ["stream"]})),
+            ("machines.list", json!({"type": "object", "properties": {"want": {"type": "string", "description": "What the machine must be and have (optional), as `needs` says it: `linux/amd64`, `macos`, `+gpu`, `cpus=8,mem=32g`, `tool:cargo`; or a runner's name."}}})),
+            ("machines.run", command(false)),
+            ("machines.start", command(false)),
+            ("machines.output", json!({"type": "object", "properties": {"id": {"type": "string"}, "wait_s": {"type": "number"}}, "required": ["id"]})),
+            ("machines.stop", json!({"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]})),
+        ]
+    }
+
+    /// Each of its own tools and of `kiln.machines.*` publishes its input type's schema, and it
+    /// says what the hand-written one did: the same fields, required, types, enums and
+    /// descriptions, but for spelling (`ops::as_written_by_hand`: a number's `format`, `true` on a
+    /// free-form object), and `additionalProperties: false`, which says it takes nothing else.
+    #[test]
+    fn its_tools_publish_their_types_saying_what_they_said_before() {
+        let before = published_before();
+        let now = published();
+        assert_eq!(now.len(), before.len(), "every tool of its own and every machine operation: {now:?}");
+        for (name, was) in before {
+            let typed = tool_input(name).or_else(|| machine_input(name)).map(|i| i.schema());
+            let schema = now.iter().find(|(n, _, _)| n == name).map(|(_, s, _)| s.clone());
+            assert!(schema.is_some() && schema == typed, "{name} publishes its type's schema: {schema:?}");
+            let schema = schema.unwrap_or_default();
+            assert_eq!(schema.get("additionalProperties"), Some(&json!(false)), "{name} takes nothing else");
+            assert_eq!(crate::ops::as_written_by_hand(&schema), was, "{name}");
+        }
+    }
+
+    /// A value of the wrong type for a property whose schema is `s`: a number for a string, a
+    /// string for the rest; none for one that may be any JSON.
+    fn wrong_for(s: &Value) -> Option<Value> {
+        let t = s.get("type")?.as_str()?;
+        Some(if t == "string" { json!(1) } else { json!("x") })
+    }
+
+    /// Each of its own tools and of `kiln.machines.*` reads what it's given as its type before it
+    /// runs: an argument it doesn't take, each one of the wrong type, and one it must have left out
+    /// are refused saying which (`unknown_field`, `invalid_type`, `missing_field`) and where. A
+    /// tool's is a tool error; a machine operation's is its call's refusal, with the 400 an
+    /// operation's misfit has in code mode. A misspelled `program` is refused, not run empty.
+    #[test]
+    fn its_tools_refuse_what_they_dont_take_saying_which_and_where() {
+        let server = server_on("/nonexistent/kiln-reach.sock", "");
+        let program = Program { server: Arc::clone(&server), remote: Vec::new(), unavailable: None, mine: Mutex::new(Vec::new()) };
+        // What each says of what it's given: the code and the path, and whether it's refused.
+        let said = |name: &str, tool: bool, given: Value| {
+            if tool {
+                let a = server.call(name, &given);
+                (a.pointer("/structuredContent/code").cloned(), a.pointer("/structuredContent/path").cloned(), a.get("isError") == Some(&json!(true)))
+            } else {
+                match code::Host::call(&program, name, given) {
+                    Err(a) => (a.get("code").cloned(), a.get("path").cloned(), a.get("status") == Some(&json!(400))),
+                    Ok(_) => (None, None, false),
+                }
+            }
+        };
+        let refused = |code: &str, path: &str| (Some(json!(code)), Some(json!(path)), true);
+        let all = published();
+        assert_eq!(all.len(), 15);
+        for (name, schema, tool) in &all {
+            assert_eq!(said(name, *tool, json!({"zz_not_a_field": 1})), refused("unknown_field", "/zz_not_a_field"), "{name}");
+            for (field, s) in schema.get("properties").and_then(Value::as_object).into_iter().flatten() {
+                let Some(w) = wrong_for(s) else { continue };
+                assert_eq!(said(name, *tool, json!({ field.clone(): w })), refused("invalid_type", &format!("/{field}")), "{name}'s {field}");
+            }
+            if schema.get("required").and_then(Value::as_array).is_some_and(|r| !r.is_empty()) {
+                assert_eq!(said(name, *tool, json!({})), refused("missing_field", ""), "{name}");
+            }
+        }
+        assert_eq!(said("code_run", true, json!({"programm": "return 1"})), refused("unknown_field", "/programm"));
+        let a = server.call("show_live", &json!({"url": "http://localhost:3000", "engine": "netscape"}));
+        assert_eq!(a.pointer("/structuredContent/code"), Some(&json!("invalid_value")), "an engine it doesn't list: {a}");
+        // What the stream always took still fits: an engine in any case, by its browser's name too.
+        let live = tool_input("show_live");
+        for engine in ["Safari", "chrome", "gecko", "WebKit", ""] {
+            assert!(live.as_ref().is_some_and(|i| i.fits(&json!({"url": "http://localhost:3000", "engine": engine})).is_ok()), "{engine:?}");
+        }
+    }
+
+    fn open(id: &str) -> crate::harness::core::Update {
+        crate::harness::core::Update::Open { info: Box::new(crate::harness::session::Info { id: id.into(), kind: "claude".into(), ..Default::default() }), since: None }
+    }
+
+    /// A runner's reach socket at `at`, as its agents' MCP servers see it: each question it's asked
+    /// (`Req::Ask`) is put to the kiln server `hub` as runner `box`'s, as the runner's own
+    /// connection puts it (`crate::mcp::runner_ask`), and answered with what the server says. What
+    /// was asked is handed to the receiver this returns once it's answered.
+    fn reach_socket(hub: Arc<crate::hub::Hub>, at: &std::path::Path) -> anyhow::Result<std::sync::mpsc::Receiver<Value>> {
+        use std::io::{Read as _, Write as _};
+        let listener = std::os::unix::net::UnixListener::bind(at)?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { return };
+                let (hub, tx) = (Arc::clone(&hub), tx.clone());
+                std::thread::spawn(move || {
+                    let (mut de, mut buf) = (crate::reach::wire::Deframer::default(), vec![0u8; 64 << 10]);
+                    let json = loop {
+                        match de.take::<Req>() {
+                            Ok(Some(Req::Ask { json })) => break json,
+                            Ok(None) => {}
+                            Ok(Some(_)) | Err(_) => return,
+                        }
+                        match conn.read(&mut buf) {
+                            Ok(n) if n > 0 => de.push(buf.get(..n).unwrap_or_default()),
+                            _ => return,
+                        }
+                    };
+                    let asked: Value = serde_json::from_str(&json).unwrap_or_default();
+                    let raw = asked.clone();
+                    let answer = match serde_json::from_value::<crate::reach::Question>(asked.clone()) {
+                        Ok(q) => crate::rt::block_on(async move { Ok(crate::mcp::runner_ask(&hub, "box", 0, &q, &raw).await) }).unwrap_or_default(),
+                        Err(e) => json!({"error": format!("unknown reach question: {e}")}),
+                    };
+                    if let Ok(b) = crate::reach::wire::frame(&Ev::Answer(answer.to_string())) {
+                        let _ = conn.write_all(&b);
+                    }
+                    let _ = tx.send(asked);
+                });
+            }
+        });
+        Ok(rx)
+    }
+
+    /// Through reach: a call of one of its own tools, or of `kiln.machines.*` in a program, whose
+    /// input doesn't fit reaches the kiln server as a note (`ReachAsk`'s `unread`), as a message it
+    /// couldn't read does, without the value that came. The server notes it against the session
+    /// (wire `mcp_reach`, `malformed`): counted, on its page and its runner's, and audited naming
+    /// it.
+    #[test]
+    fn through_reach_a_misfit_reaches_the_server_as_a_note() -> anyhow::Result<()> {
+        use crate::wire::unread::Kept;
+        let hub = crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            hub.agents.lock().insert("box".into(), crate::hub::tests::live_runner("box", "linux", "x86_64"));
+            hub.harness.ingest(&hub, &crate::harness::registry::Location::Machine("box".into()), "s1", open("s1"));
+            Ok(hub)
+        })?;
+        let dir = tempfile::tempdir()?;
+        let sock = dir.path().join("reach.sock");
+        let asked = reach_socket(Arc::clone(&hub), &sock)?;
+        let server = server_on(&sock.to_string_lossy(), "s1");
+        let counted = || crate::metrics::wire().refused.get(&["mcp_reach", "malformed"]);
+        let before = counted();
+        // `run`, given a timeout that isn't a number: a tool error saying which and where.
+        let a = server.call("run", &json!({"command": "make", "timeout_s": "hunter2"}));
+        let (code, path) = (a.pointer("/structuredContent/code"), a.pointer("/structuredContent/path"));
+        assert!(a.get("isError") == Some(&json!(true)) && code == Some(&json!("invalid_type")) && path == Some(&json!("/timeout_s")), "{a}");
+        // A program's `kiln.machines.run`, given a field it doesn't take: its call refused the same
+        // way, which the program catches.
+        let program = "try { await kiln.machines.run({comand: 'make'}); return 'ran'; } catch (e) { return e.result; }";
+        let a = server.call("code_run", &json!({ "program": program }));
+        let (code, path) = (a.pointer("/structuredContent/result/code"), a.pointer("/structuredContent/result/path"));
+        assert!(code == Some(&json!("unknown_field")) && path == Some(&json!("/comand")), "{a}");
+        // Each told the server, which noted it before it answered.
+        let notes: Vec<Value> = std::iter::from_fn(|| asked.recv_timeout(Duration::from_secs(60)).ok()).filter(|q| q.get("op") == Some(&json!("unread"))).take(2).collect();
+        let what: Vec<&str> = notes.iter().filter_map(|q| q.get("what").and_then(Value::as_str)).collect();
+        assert!(what.contains(&"tools/call run") && what.contains(&"code_run kiln.machines.run"), "{notes:?}");
+        assert!(notes.iter().all(|q| q.get("session") == Some(&json!("s1")) && q.get("code") == Some(&json!("malformed"))), "{notes:?}");
+        let words = serde_json::to_string(&notes)?;
+        assert!(words.contains("(at /timeout_s)") && words.contains("(at /comand)") && !words.contains("hunter2"), "noted without the value that came: {words}");
+        assert!(counted() >= before + 2, "counted");
+        crate::rt::block_on(async move {
+            let session = hub.harness.list().into_iter().find(|i| i.id == "s1").and_then(|i| i.refused);
+            anyhow::ensure!(session.as_ref().map(Kept::total) == Some(2), "the session's page: {session:?}");
+            let runner = hub.agent_list().await.into_iter().find(|r| r.name == "box").and_then(|r| r.refused);
+            anyhow::ensure!(runner.as_ref().map(Kept::total) == Some(2), "the runner's page: {runner:?}");
+            let principal: String = hub.store.call(|c| Ok(c.query_row("SELECT principal FROM audit2 WHERE action = 'security.wire_refused' AND target = 'mcp_reach' LIMIT 1", [], |r| r.get(0))?)).await?;
+            anyhow::ensure!(principal == "agent:s1", "{principal}");
+            Ok(())
+        })
     }
 }

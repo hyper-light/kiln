@@ -20,7 +20,9 @@ import type { DiscoveredInstance, DiscoveryInfo, DiscoveryMethod, DiscoveryProbl
 import { defaultRunner } from "./defaults.ts";
 import { AUTHORS, REPOS, commitMessage, hashStr, mockDirList, mulberry32, pick, pipelineFor, sha, stepLog, type JobTpl, type LogPlan, type Toolchain } from "./data.ts";
 import { handleAccounts, handleDemoSession, setDemoEmit } from "./accounts.ts";
-import { handleFamily, handleFamilySession, setFamilyEmit } from "./agents.ts";
+import { handleFamily, handleFamilySession, refuseAgent, setFamilyEmit } from "./agents.ts";
+import { handlePlanReview, handleReviewSession, reviewInfos, setReviewEmit } from "./plan-review.ts";
+import { ahead, note, runnerRefused } from "./refused.ts";
 import { handleGoals } from "./goals.ts";
 import { handlePrograms } from "./programs.ts";
 import { handlePages } from "./pages.ts";
@@ -28,6 +30,7 @@ import { handleSettings } from "./settings.ts";
 import { handleMachines } from "./machines.ts";
 import { handleKeep } from "./keep.ts";
 import { handleReap } from "./reap.ts";
+import { handleExperiments } from "./experiments.ts";
 import { handlePlaces } from "./places.ts";
 import { handleLongFiles, handleLongSession, handleShownPages, longInfo, searchSaid, sendAway, setLongEmit } from "./conversation.ts";
 import { fastInfos, handleFastSession } from "./fast.ts";
@@ -243,6 +246,9 @@ addAgent({ name: "metal-epyc-01", labels: ["baremetal", "bench", "gpu", "linux",
 addAgent({ name: "metal-mac-mini", labels: ["baremetal", "macos", "arm64"], slots: 2, hostname: "mac-mini.lan", os: "macos", arch: "aarch64", version: VERSION, ephemeral: false, connected: true, last_seen: t, enrolled_at: t - 86400 * 9 }, newHost(10, 32, 1000));
 addAgent({ name: "metal-pi-04", labels: ["baremetal", "arm64", "linux"], slots: 1, hostname: "pi-04.lan", os: "linux", arch: "aarch64", version: "0.0.9", ephemeral: false, connected: true, last_seen: t, enrolled_at: t - 86400 * 60, draining: true }, newHost(4, 8, 120));
 addAgent({ name: "metal-nuc-old", labels: ["baremetal", "linux", "x86_64"], slots: 2, hostname: "nuc.lan", os: "linux", arch: "x86_64", version: "0.0.8", ephemeral: false, connected: false, last_seen: t - 86400 * 2 - 3600, enrolled_at: t - 86400 * 120 }, newHost(8, 16, 500));
+// What kiln couldn't read of metal-ryzen-01, of the server's to it and of reach's, kept for its page (refused.ts).
+const refusing = agents.get("metal-ryzen-01");
+if (refusing) refusing.refused = runnerRefused();
 
 /* ------------------------------------------------------------------ */
 /* Repos & runs                                                        */
@@ -497,6 +503,7 @@ function emit(ev: ServerEvent) {
 setLongEmit((ev) => emit(ev as ServerEvent));
 setDemoEmit((ev) => emit(ev as ServerEvent));
 setFamilyEmit((ev) => emit(ev as ServerEvent));
+setReviewEmit((ev) => emit(ev as ServerEvent));
 
 function queueCounts() {
   let queued = 0;
@@ -1458,6 +1465,19 @@ const server = http.createServer(async (req, res) => {
       quiet = (await body<{ on?: boolean }>(req)).on ?? true;
       return json(res, 200, { quiet });
     }
+    // The browser checks note a message kiln couldn't read, `what` it was: a runner's frame
+    // (`?runner=`), or its runner's update of an agent (`?agent=`). Its page is told, as kiln's are.
+    if (p === "/api/mock/refuse" && m === "POST") {
+      const what = url.searchParams.get("what") ?? "variant 53";
+      const a = agents.get(url.searchParams.get("runner") ?? "");
+      if (a) {
+        a.refused = note(a.refused, ahead(a.name, what), Date.now());
+        emit({ type: "agent", agent: a });
+        return json(res, 200, a.refused);
+      }
+      const refused = refuseAgent(url.searchParams.get("agent") ?? "", what);
+      return refused ? json(res, 200, refused) : err(res, 404, "no such runner or agent");
+    }
     // ---- files the long session's messages mention ----
     if (handleLongFiles(p, url, req, res)) return;
     // ---- live pages a person opens (the Tools tab): what its machine serves; no streams here ----
@@ -1479,18 +1499,22 @@ const server = http.createServer(async (req, res) => {
     const opened = /^\/api\/harness\/sessions\/([^/]+)\/opened$/.exec(p);
     if (opened && m === "GET") return json(res, 200, []);
     if (opened && m === "POST") return err(res, 409, "opening an app on your device needs pages' own site: set [server] pages_url (docs/previews.md)");
+    // ---- plans waiting on a person's review (their stacks, plans and research first) ----
+    if (await handlePlanReview(req, res, url)) return;
     // ---- goal stacks ----
     if (await handleGoals(req, res, url)) return;
     if (await handlePrograms(req, res, url)) return;
     // ---- agents that run agents ----
     if (await handleShip(req, res, url, { json, liveJob, liveRun, push: () => void startRun(repos.find((r) => r.name === "hyper-light/kiln") ?? repos[0]!, { branch: "main", event: "push" }) })) return;
-    if (await handleFamily(req, res, url, () => [longInfo(), ...fastInfos()])) return;
+    if (await handleFamily(req, res, url, () => [longInfo(), ...fastInfos(), ...reviewInfos()])) return;
     // ---- harness accounts (and the demo agents to see them from) ----
     if (await handleMachines(req, res, url, { json, body })) return;
     // ---- copies runners keep of other runners' trees (docs/reach.md §5.1) ----
     if (await handleKeep(req, res, url, { json, body })) return;
     // ---- the reaper's policies (W24-R31) ----
     if (await handleReap(req, res, url, { json, body })) return;
+    // ---- experiments from an agent's question (docs/ci.md W20-R11) ----
+    if (await handleExperiments(req, res, url, { json, body })) return;
     if (await handleAccounts(req, res, url)) return;
     if (p === "/api/overview") return json(res, 200, overview());
 
@@ -1889,6 +1913,7 @@ server.on("upgrade", (req, socket, head) => {
     if (
       hm &&
       (handleDemoSession(ws, decodeURIComponent(hm[1]!)) ||
+        handleReviewSession(ws, decodeURIComponent(hm[1]!)) ||
         handleFamilySession(ws, decodeURIComponent(hm[1]!)) ||
         handleFastSession(ws, decodeURIComponent(hm[1]!), url.searchParams.get("patch") === "state") ||
         handleLongSession(ws, decodeURIComponent(hm[1]!), url.searchParams.get("z") === "gzip", url.searchParams.get("patch") === "state"))

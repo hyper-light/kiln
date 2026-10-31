@@ -1522,12 +1522,17 @@ pub struct ExitInfo {
     /// or a restart is never another stop.
     #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub at: i64,
+    /// Unix ms kiln starts it again by itself: its process ended without anyone ending the agent
+    /// (docs/agents.md, "An agent lives until it's ended").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub again_at: Option<i64>,
 }
 
 impl ExitInfo {
     /// It ended now, with `code` and `error`.
     pub fn now(code: Option<i32>, error: Option<String>) -> Self {
-        Self { code, error, at: crate::util::now_ms() }
+        Self { code, error, at: crate::util::now_ms(), again_at: None }
     }
 }
 

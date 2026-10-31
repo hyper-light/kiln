@@ -174,11 +174,8 @@ pub async fn take(store: &Store, root: &[u8], org: &str, bundle: &Value, came_fr
 
 /// A custody record a runner process sent ([`crate::proto::AgentMsg::Custody`]): taken as having
 /// come over that process's connection, and logged either way.
-pub async fn on_runner(hub: &crate::hub::Hub, peer: crate::instances::PeerId, machine: &str, json: &str) {
+pub async fn on_runner(hub: &crate::hub::Hub, peer: crate::instances::PeerId, machine: &str, bundle: Value) {
     let instance = hub.instances.lock().get(peer).map(|i| i.label()).unwrap_or_else(|| "legacy".to_owned());
-    let Ok(bundle) = serde_json::from_str::<Value>(json) else {
-        return tracing::debug!(%machine, "an unreadable custody record");
-    };
     let came_from = format!("runner {machine} (instance {instance})");
     // An act of one of its sessions it didn't do, kiln being out of reach (W27-R08: a machine cut
     // off, as the twin's was).

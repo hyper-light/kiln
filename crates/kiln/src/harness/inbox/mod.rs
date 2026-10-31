@@ -418,6 +418,31 @@ impl Inbox {
         Err(unavailable(session, "its head kept changing"))
     }
 
+    /// What to tell the sender of message `message`, sent for `epoch`, that this machine couldn't
+    /// read (`crate::wire::payload`), its id read: taken before, it's that message's repeat, the
+    /// first time's answer, as [`Inbox::accept`] answers one (its words can't be compared, so it's
+    /// taken for the same message); sent for an epoch the session isn't at here, refused as
+    /// `accept` refuses it, so it's sent where the session is; never taken, refused for good
+    /// (`invalid`: `why`), as nothing took it. Its records unreadable now: `unavailable`.
+    pub async fn unreadable(&self, session: &str, message: &str, epoch: Option<u64>, why: &str, at: i64) -> Result<Answer, Refusal> {
+        check_session(session)?;
+        self.take_in(session, at).await?;
+        check_message(message)?;
+        let c = self.head(session).await?;
+        if c.head.moved {
+            return Err(Refusal::Moved { session: session.to_owned(), epoch: c.head.epoch });
+        }
+        match epoch {
+            Some(sent) if sent < c.head.epoch => return Err(Refusal::StaleEpoch { session: session.to_owned(), sent, current: c.head.epoch }),
+            Some(sent) if sent > c.head.epoch => return Err(Refusal::Behind { session: session.to_owned(), here: c.head.epoch, sent }),
+            _ => {}
+        }
+        match self.kept(session, message).await? {
+            Some((first, rev)) => Ok(Answer { session: session.to_owned(), message: message.to_owned(), epoch: first.epoch, at: first.at, seq: rev, repeat: true }),
+            None => Err(Refusal::Invalid { what: "message".to_owned(), why: format!("its runner couldn't read it: {why}") }),
+        }
+    }
+
     /// Message `message`, taken, never reached its session after all (it was on its way to another
     /// machine, or ended): it's forgotten, so a retry of it goes where the session is.
     pub async fn unaccept(&self, session: &str, message: &str) -> Result<(), Refusal> {

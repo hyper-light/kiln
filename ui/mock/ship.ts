@@ -80,6 +80,9 @@ function commits(): ShipCommit[] {
       host: "kiln",
       change: { ...change("D41", "diff", "kiln", "pipeline: dynamic matrices", "requested", ["user:ada"], { question: 1, nit: 0, issue: 0, blocking: 0 }), revision: 7, latest: 7 },
       runs: [{ id: "run-41", pipeline: "ci" }],
+      // Who made it (ship.rs's made_by): the mock's long agent stands in for the Matrix agent, so
+      // Files' ask reaches one (mock/agents.ts's agents.about), for sam.
+      made_by: { agent: "demo-long", person: "user:sam" },
       actions: [
         { name: "hand_off", method: "POST", path: "/api/ship/hand-off", body: { repo: REPO, sha: sha("4") } },
         { name: "review", method: "GET", path: "/api/diffs/D41", body: null },

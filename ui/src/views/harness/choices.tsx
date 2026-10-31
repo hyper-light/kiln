@@ -5,7 +5,8 @@
  * question. Options are full-width rows with radio or checkbox semantics, "Other…" takes your own
  * words, a note can ride along, and an option's preview sits beside the list (under the option on
  * phones). Or, instead of picking one, an experiment: the options tried alone, stacked, in pairs or
- * greedily, each in an isolated workspace, judged against criteria you set.
+ * greedily, each in an isolated workspace, judged by the checks it runs and the metrics they report,
+ * with thresholds you set (the agent's suggestion to start from, when it made one).
  *
  * Three frames: a bottom sheet (phones), a centered dialog (desktops), or inline (an approval card,
  * the timeline); left unset, the screen picks between the first two. Minimizing keeps the question
@@ -14,7 +15,7 @@
 import * as React from "react";
 import { flushSync } from "react-dom";
 import { Dialog as D } from "radix-ui";
-import { ArrowLeft, ArrowRight, Check, ChevronDown, FlaskConical, Minus, Plus, X } from "lucide-react";
+import { ArrowLeft, ArrowRight, Check, ChevronDown, ChevronRight, FlaskConical, Minus, Plus, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useMediaQuery } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
@@ -52,6 +53,7 @@ export interface ChoiceQuestion {
 
 export type ExperimentStrategy = "each" | "all" | "pairs" | "greedy" | "custom";
 
+/** A check (a command, or a CI pipeline) each variant runs, or a metric the checks report. */
 export interface Criterion {
   kind: "pipeline" | "command" | "metric";
   pipeline?: string;
@@ -80,9 +82,17 @@ export interface ExperimentSpec {
   criteria: Criterion[];
   repetitions: number;
   maxParallel: number;
-  budgetMinutes?: number;
+  /** Its time limit, in seconds. */
+  budgetSeconds?: number;
   decide: "auto" | "ask";
   notes?: string;
+}
+
+/** What the agent that asks suggested measuring its question's options by (`experiments.suggest`). */
+export interface SuggestedCriteria {
+  /** The question, as asked (none: its next). */
+  question?: string;
+  criteria: Criterion[];
 }
 
 /** Somewhere a variant can run on its own: a git worktree, a slate, a container, a microVM … */
@@ -110,7 +120,12 @@ export interface ChoicesProps {
   onExperiment?: (spec: ExperimentSpec, answers: ChoiceAnswer[]) => void;
   isolation?: IsolationOption[];
   defaultIsolation?: string;
+  /** CI's workflows a check can run (offered while CI's engine is on). */
   pipelines?: string[];
+  /** The machine each variant's checks run on, in a worktree of its own there. */
+  machine?: string;
+  /** What the agent suggested measuring by, newest first: an experiment's setup starts with its question's. */
+  suggested?: SuggestedCriteria[];
   className?: string;
 }
 
@@ -207,32 +222,37 @@ export function variantCount(n: number, strategy: ExperimentStrategy, custom = 0
   }
 }
 
-/** "7 variants + baseline × 3 runs = 24 runs" (repetitions that aren't a count yet read "?"). */
-export function describeRuns(variants: { count: number; atMost: boolean }, baseline: boolean, repetitions: number): string {
-  const up = variants.atMost ? "up to " : "";
-  const v = variants.count;
-  const ok = Number.isInteger(repetitions) && repetitions > 0;
-  const runs = (v + (baseline ? 1 : 0)) * repetitions;
-  const each = ok ? `${repetitions} run${repetitions === 1 ? "" : "s"}` : "? runs";
-  return `${up}${v} variant${v === 1 ? "" : "s"}${baseline ? " + baseline" : ""} × ${each} = ${ok ? `${up}${runs} run${runs === 1 ? "" : "s"}` : "?"}`;
+/** The parts of an experiment's setup, each set on a page of its own: what it tries, the checks each variant runs, the metrics they report, how it runs, and what happens once it's done. */
+export type Part = "variants" | "checks" | "metrics" | "runs" | "end";
+
+/** What stops an experiment from starting, and the part of its setup that says so; null when it's ready. */
+export function problemOf(spec: ExperimentSpec): { part: Part; text: string } | null {
+  const at = (part: Part, text: string) => ({ part, text });
+  if (spec.options.length < 2) return at("variants", "Keep at least two options in play.");
+  if (spec.variants.length === 0) return at("variants", "Pick at least one set to try.");
+  if (!spec.isolation) return at("runs", "Nowhere to run them: no isolation is available.");
+  if (!spec.criteria.some((c) => c.kind !== "metric")) return at("checks", "Add a check: what each variant runs.");
+  const metrics: string[] = [];
+  for (const c of spec.criteria) {
+    if (c.kind === "pipeline" && !c.pipeline?.trim()) return at("checks", "Name the pipeline to run.");
+    if (c.kind === "command" && !c.command?.trim()) return at("checks", "Give the command to run.");
+    if (c.kind === "metric") {
+      const name = c.metric?.trim() ?? "";
+      if (!name) return at("metrics", "Name the metric to measure.");
+      if (metrics.includes(name)) return at("metrics", `Two metrics are named ${name}.`);
+      metrics.push(name);
+      if (c.threshold && !Number.isFinite(c.threshold.value)) return at("metrics", "A threshold has to be a number.");
+    }
+  }
+  if (!Number.isInteger(spec.repetitions) || spec.repetitions < 1) return at("runs", "Runs per variant: a whole number, at least 1.");
+  if (!Number.isInteger(spec.maxParallel) || spec.maxParallel < 1) return at("runs", "At once: a whole number, at least 1.");
+  if (spec.budgetSeconds !== undefined && !(spec.budgetSeconds > 0)) return at("runs", "A time limit is a number.");
+  return null;
 }
 
 /** What stops an experiment from starting, in a few words; null when it's ready. */
 export function experimentProblem(spec: ExperimentSpec): string | null {
-  if (spec.options.length < 2) return "Keep at least two options in play.";
-  if (spec.variants.length === 0) return "Pick at least one set to try.";
-  if (!spec.isolation) return "Nowhere to run them: no isolation is available.";
-  if (spec.criteria.length === 0) return "Add a criterion to judge them by.";
-  for (const c of spec.criteria) {
-    if (c.kind === "pipeline" && !c.pipeline?.trim()) return "Name the pipeline to run.";
-    if (c.kind === "command" && !c.command?.trim()) return "Give the command to run.";
-    if (c.kind === "metric" && !c.metric?.trim()) return "Name the metric to measure.";
-    if (c.threshold && !Number.isFinite(c.threshold.value)) return "A threshold has to be a number.";
-  }
-  if (!Number.isInteger(spec.repetitions) || spec.repetitions < 1) return "Repetitions: a whole number, at least 1.";
-  if (!Number.isInteger(spec.maxParallel) || spec.maxParallel < 1) return "Max parallel: a whole number, at least 1.";
-  if (spec.budgetMinutes !== undefined && !(spec.budgetMinutes > 0)) return "The time budget is a number of minutes.";
-  return null;
+  return problemOf(spec)?.text ?? null;
 }
 
 /* ------------------------------------------------------------------ drafts */
@@ -310,8 +330,9 @@ interface CriterionDraft {
   command: string;
   metric: string;
   better: "lower" | "higher";
-  thresholdType: "absolute" | "relative";
-  /** As typed; empty is no threshold. */
+  /** None, a number to stay within (at most when lower wins, at least when higher does), or a % better than the baseline. */
+  thresholdType: "none" | "absolute" | "relative";
+  /** As typed. */
   threshold: string;
   required: boolean;
 }
@@ -326,21 +347,39 @@ interface Setup {
   sets: string[];
   baseline: boolean;
   isolation: string;
+  /** Checks and metrics, in the order made. */
   criteria: CriterionDraft[];
   /** Numbers as typed. */
   repetitions: string;
   maxParallel: string;
+  /** The time limit, as typed (empty: none), in `budgetUnit`s. */
   budget: string;
+  budgetUnit: DurationUnit;
   decide: "auto" | "ask";
   notes: string;
+  /** The part being set, on its own page; none: the summary of them all. */
+  part?: Part;
 }
 
-const STRATEGIES: { id: ExperimentStrategy; label: string; hint: string }[] = [
-  { id: "each", label: "Each alone", hint: "Every option on its own." },
-  { id: "all", label: "All combinations", hint: "Every option alone, and every way of stacking them." },
-  { id: "pairs", label: "Pairs", hint: "Every option alone, and every two together." },
-  { id: "greedy", label: "Greedy stacking", hint: "Start with the best single option, then keep adding the option that improves most." },
-  { id: "custom", label: "Custom", hint: "Only the sets you pick." },
+export type DurationUnit = "seconds" | "minutes" | "hours" | "days" | "weeks" | "months" | "years";
+
+/** A time limit's units (a month as 30 days, a year as 365). */
+const UNITS: { id: DurationUnit; seconds: number }[] = [
+  { id: "seconds", seconds: 1 },
+  { id: "minutes", seconds: 60 },
+  { id: "hours", seconds: 3_600 },
+  { id: "days", seconds: 86_400 },
+  { id: "weeks", seconds: 604_800 },
+  { id: "months", seconds: 2_592_000 },
+  { id: "years", seconds: 31_536_000 },
+];
+
+const STRATEGIES: { id: ExperimentStrategy; label: string }[] = [
+  { id: "each", label: "Each alone" },
+  { id: "all", label: "All combinations" },
+  { id: "pairs", label: "Alone and in pairs" },
+  { id: "greedy", label: "Greedy stacking" },
+  { id: "custom", label: "Sets you pick" },
 ];
 
 const DECISIONS: { id: Setup["decide"]; label: string }[] = [
@@ -355,7 +394,28 @@ let criterionSeq = 0;
 
 function newCriterion(kind: Criterion["kind"], pipelines: string[]): CriterionDraft {
   criterionSeq += 1;
-  return { key: criterionSeq, kind, pipeline: pipelines[0] ?? "", command: "", metric: "", better: "lower", thresholdType: "relative", threshold: "", required: kind !== "metric" };
+  return { key: criterionSeq, kind, pipeline: pipelines[0] ?? "", command: "", metric: "", better: "lower", thresholdType: "none", threshold: "", required: kind !== "metric" };
+}
+
+/** A criterion as the setup edits it. */
+function draftOf(c: Criterion): CriterionDraft {
+  criterionSeq += 1;
+  return {
+    key: criterionSeq,
+    kind: c.kind,
+    pipeline: c.pipeline ?? "",
+    command: c.command ?? "",
+    metric: c.metric ?? "",
+    better: c.better ?? "lower",
+    thresholdType: c.threshold?.type ?? "none",
+    threshold: c.threshold ? String(c.threshold.value) : "",
+    required: c.required ?? c.kind !== "metric",
+  };
+}
+
+/** The agent's suggestion for `question`: the one naming it, else its newest naming none. */
+export function suggestionFor(question: ChoiceQuestion, suggested: SuggestedCriteria[] = []): Criterion[] | undefined {
+  return (suggested.find((s) => s.question === question.question) ?? suggested.find((s) => !s.question))?.criteria;
 }
 
 /** What depends on the question: its options, and a strategy that suits them (options you'd pick several of can stack). */
@@ -364,15 +424,23 @@ function optionPart(q: number, question: ChoiceQuestion): Pick<Setup, "q" | "on"
   return { q, on: question.options.map(() => true), strategy: question.multi ? (2 ** n - 1 <= MANY_VARIANTS ? "all" : "pairs") : "each", sets: [] };
 }
 
-function newSetup(q: number, question: ChoiceQuestion, isolation: string, pipelines: string[]): Setup {
+/**
+ * A new setup for `question`: its checks and metrics the agent's suggestion when it made one (a
+ * pipeline only while there are pipelines to run), else a command to fill in. A check is a command
+ * by default, which needs no CI.
+ */
+export function newSetup(q: number, question: ChoiceQuestion, isolation: string, pipelines: string[], suggested?: Criterion[]): Setup {
+  const from = (suggested ?? []).filter((c) => c.kind !== "pipeline" || pipelines.length > 0).map(draftOf);
+  const checked = from.some((c) => c.kind !== "metric");
   return {
     ...optionPart(q, question),
     baseline: true,
     isolation,
-    criteria: [newCriterion(pipelines.length > 0 ? "pipeline" : "command", pipelines)],
+    criteria: checked ? from : [newCriterion("command", pipelines), ...from],
     repetitions: "3",
     maxParallel: "4",
     budget: "",
+    budgetUnit: "hours",
     decide: "ask",
     notes: "",
   };
@@ -397,15 +465,18 @@ function criterionOf(c: CriterionDraft): Criterion {
     case "command":
       return { kind: "command", command: c.command.trim(), required: c.required };
     case "metric": {
+      // A threshold picked but not given is no number (and says so).
       const t = c.threshold.trim();
-      return { kind: "metric", metric: c.metric.trim(), better: c.better, ...(t ? { threshold: { type: c.thresholdType, value: Number(t) } } : {}), required: c.required };
+      const threshold = c.thresholdType === "none" ? undefined : { type: c.thresholdType, value: t ? Number(t) : NaN };
+      // Required is meeting its threshold: without one, it's only compared (as its switch shows).
+      return { kind: "metric", metric: c.metric.trim(), better: c.better, ...(threshold && { threshold }), required: c.required && Boolean(threshold) };
     }
   }
 }
 
 const count = (s: string) => (s.trim() ? Number(s) : NaN);
 
-function specOf(question: ChoiceQuestion, s: Setup, isolation: string): ExperimentSpec {
+export function specOf(question: ChoiceQuestion, s: Setup, isolation: string): ExperimentSpec {
   const labels = question.options.map((o) => o.label);
   const options = labels.filter((_, i) => s.on[i]);
   const custom = s.sets
@@ -413,6 +484,7 @@ function specOf(question: ChoiceQuestion, s: Setup, isolation: string): Experime
     .filter((ix) => ix.every((i) => s.on[i]))
     .map((ix) => ix.map((i) => labels[i] ?? ""));
   const budget = s.budget.trim();
+  const unit = UNITS.find((u) => u.id === s.budgetUnit)?.seconds ?? 60;
   const notes = s.notes.trim();
   return {
     question: question.question,
@@ -425,7 +497,7 @@ function specOf(question: ChoiceQuestion, s: Setup, isolation: string): Experime
     criteria: s.criteria.map(criterionOf),
     repetitions: count(s.repetitions),
     maxParallel: count(s.maxParallel),
-    ...(budget ? { budgetMinutes: Number(budget) } : {}),
+    ...(budget ? { budgetSeconds: Math.round(Number(budget) * unit) } : {}),
     decide: s.decide,
     ...(notes ? { notes } : {}),
   };
@@ -501,6 +573,8 @@ function Ask({
   isolation,
   defaultIsolation,
   pipelines = [],
+  machine,
+  suggested,
   className,
 }: ChoicesProps & { sig: string }) {
   const uid = React.useId();
@@ -557,7 +631,8 @@ function Ask({
     if (bodyRef.current) bodyRef.current.scrollTop = 0;
     (rootRef.current?.querySelector<HTMLElement>("[data-autofocus]") ?? rootRef.current)?.focus();
   }, []);
-  const view = trying ? "x" : String(step);
+  // The experiment's summary and each of its parts' pages are views of their own.
+  const view = trying ? `x${setup?.part ? `-${setup.part}` : ""}` : String(step);
   const lastView = React.useRef(view);
   // Each view is its own element (keyed by it), so this runs as a new one shows; the first one's focus is the frame's.
   const showView = React.useCallback(
@@ -579,7 +654,11 @@ function Ask({
   const tried = setup ? questions[setup.q] : undefined;
   const isolationId = setup && isolations.some((o) => o.id === setup.isolation && o.available) ? setup.isolation : pickIsolation(isolations, defaultIsolation);
   const spec = trying && setup && tried ? specOf(tried, setup, isolationId) : null;
-  const problem = spec ? experimentProblem(spec) : null;
+  const issue = spec ? problemOf(spec) : null;
+  const problem = issue?.text ?? null;
+  /** A part of the experiment open on its page (none: its summary). */
+  const part = trying ? setup?.part : undefined;
+  const openPart = (to?: Part) => setSetup((s) => (s ? { ...s, part: to } : s));
 
   const go = (s: number) => {
     setStep(s);
@@ -610,9 +689,10 @@ function Ask({
     );
   };
 
-  /** The primary action: Next, Review, Submit, or Start experiment. */
+  /** The primary action: Next, Review, Submit, Start experiment, or Done with one of its parts. */
   const advance = (ds: Draft[]) => {
     if (busy) return;
+    if (part) return openPart(undefined);
     if (trying) return start();
     if (!q) return submit(ds);
     if (!isAnswered(q, ds[step] ?? BLANK)) {
@@ -624,6 +704,7 @@ function Ask({
   };
 
   const back = () => {
+    if (part) return openPart(undefined);
     if (trying) {
       setTrying(false);
       setHint("");
@@ -650,7 +731,7 @@ function Ask({
     const at = q ? step : setup && eligible.includes(setup.q) ? setup.q : eligible[0];
     const question = at === undefined ? undefined : questions[at];
     if (at === undefined || !question) return;
-    setSetup((s) => (s && s.q === at ? s : newSetup(at, question, pickIsolation(isolations, defaultIsolation), pipelines)));
+    setSetup((s) => (s && s.q === at ? { ...s, part: undefined } : newSetup(at, question, pickIsolation(isolations, defaultIsolation), pipelines, suggestionFor(question, suggested))));
     setTrying(true);
     setHint("");
   };
@@ -677,7 +758,7 @@ function Ask({
       if (trying) {
         if (mod) {
           e.preventDefault();
-          start();
+          advance(drafts);
         }
         return;
       }
@@ -749,14 +830,16 @@ function Ask({
     </>
   );
   const describedBy = trying ? `${uid}-x` : q ? `${uid}-q` : `${uid}-r`;
-  const announce = trying
-    ? `Experiment setup: ${tried?.header || tried?.question || ""}`
-    : q
-      ? n > 1
-        ? `Question ${step + 1} of ${n}${q.header ? `, ${q.header}` : ""}`
-        : q.question
-      : "Review your answers";
-  const primary = busy ? "Sending…" : trying ? "Start experiment" : !q || n === 1 ? "Submit" : toReview || step === n - 1 ? "Review" : "Next";
+  const announce = part
+    ? `Experiment: ${PARTS.find((p) => p.id === part)?.title ?? ""}`
+    : trying
+      ? `Experiment setup: ${tried?.header || tried?.question || ""}`
+      : q
+        ? n > 1
+          ? `Question ${step + 1} of ${n}${q.header ? `, ${q.header}` : ""}`
+          : q.question
+        : "Review your answers";
+  const primary = busy ? "Sending…" : part ? "Done" : trying ? "Start experiment" : !q || n === 1 ? "Submit" : toReview || step === n - 1 ? "Review" : "Next";
 
   const content = (
     <>
@@ -821,6 +904,8 @@ function Ask({
               isolations={isolations}
               isolationId={isolationId}
               pipelines={pipelines}
+              machine={machine}
+              problemPart={issue?.part}
             />
           ) : q ? (
             <QuestionStep
@@ -849,11 +934,10 @@ function Ask({
         </div>
       </div>
 
-      <footer className="ch-foot">
-        {trying && spec ? (
+      <footer className="ch-foot" data-trying={trying || undefined}>
+        {trying ? (
           <p className="ch-runs" id={`${uid}-runs`}>
-            <span>{describeRuns(variantCount(spec.options.length, spec.strategy, spec.variants.length), spec.baseline, spec.repetitions)}</span>
-            {problem && <span className="ch-problem">{problem}</span>}
+            {!part && problem && <span className="ch-problem">{problem}</span>}
           </p>
         ) : (
           <Keys q={q} canMinimize={Boolean(onMinimize)} label={primary} />
@@ -864,7 +948,7 @@ function Ask({
               <FlaskConical /> Experiment…
             </Button>
           )}
-          {(trying || step > 0) && (
+          {((trying && !part) || (!trying && step > 0)) && (
             <Button variant="ghost" size="sm" onClick={back} aria-label="Back" className="ch-back">
               <ArrowLeft /> <span className="ch-back-label">Back</span>
             </Button>
@@ -872,11 +956,11 @@ function Ask({
           <Button
             size="sm"
             onClick={() => advance(drafts)}
-            disabled={busy || (trying ? Boolean(problem) : !ready)}
+            disabled={busy || (trying ? !part && Boolean(problem) : !ready)}
             aria-describedby={trying ? `${uid}-runs` : undefined}
             className="ch-primary"
           >
-            {trying && <FlaskConical />}
+            {trying && !part && <FlaskConical />}
             {primary}
             {!busy && !trying && primary !== "Submit" && <ArrowRight />}
           </Button>
@@ -1247,6 +1331,40 @@ function Review({ uid, questions, drafts, onEdit }: { uid: string; questions: Ch
 
 /* ------------------------------------------------------------------ the experiment setup */
 
+const PARTS: { id: Part; title: string; line: string }[] = [
+  { id: "variants", title: "Variants", line: "Variants" },
+  { id: "checks", title: "Checks", line: "Checks" },
+  { id: "metrics", title: "Metrics", line: "Metrics" },
+  { id: "runs", title: "Runs", line: "Runs" },
+  { id: "end", title: "When it’s done", line: "When done" },
+];
+
+/** What a strategy does to the options, as the summary says it. */
+const WAYS: Record<ExperimentStrategy, string> = { each: "Each alone", all: "Every combination", pairs: "Alone and in pairs", greedy: "Greedy stacking", custom: "Sets you pick" };
+
+/** Each part's line in the summary: what it's set to, in a few words. */
+export function summaryOf(setup: Setup, options: number): Record<Part, string> {
+  const inPlay = setup.on.filter(Boolean).length;
+  const runs = (c: CriterionDraft) => (c.kind === "pipeline" ? c.pipeline : c.command).trim();
+  const checks = setup.criteria
+    .filter((c) => c.kind !== "metric")
+    .map(runs)
+    .filter(Boolean);
+  const metrics = setup.criteria
+    .filter((c) => c.kind === "metric")
+    .map((c) => c.metric.trim())
+    .filter(Boolean);
+  const budget = setup.budget.trim();
+  const unit = budget === "1" ? setup.budgetUnit.replace(/s$/, "") : setup.budgetUnit;
+  return {
+    variants: `${inPlay < options ? `${inPlay} of ${options} · ` : ""}${WAYS[setup.strategy]}${setup.baseline ? " + baseline" : ""}`,
+    checks: checks.length === 0 ? "None" : `${checks[0] ?? ""}${checks.length > 1 ? ` +${checks.length - 1}` : ""}`,
+    metrics: metrics.length === 0 ? "None" : metrics.join(", "),
+    runs: `${setup.repetitions.trim() || "?"} per variant · ${setup.maxParallel.trim() || "?"} at once${budget ? ` · ${budget} ${unit}` : ""}`,
+    end: `${setup.decide === "auto" ? "Pick the clear winner" : "Bring the results back"}${setup.notes.trim() ? " · with a note" : ""}`,
+  };
+}
+
 function ExperimentSetup({
   uid,
   questions,
@@ -1257,6 +1375,8 @@ function ExperimentSetup({
   isolations,
   isolationId,
   pipelines,
+  machine,
+  problemPart,
 }: {
   uid: string;
   questions: ChoiceQuestion[];
@@ -1268,18 +1388,14 @@ function ExperimentSetup({
   isolations: IsolationOption[];
   isolationId: string;
   pipelines: string[];
+  machine?: string;
+  /** The part whose setting stops it from starting. */
+  problemPart?: Part;
 }) {
   const q = questions[setup.q];
   if (!q) return null;
-  const labels = q.options.map((o) => shown(o.label).text);
-  const inPlay = setup.on.filter(Boolean).length;
-  const sets = customSets(q.options.length).filter((s) => s.every((i) => setup.on[i]));
-  const picked = sets.filter((s) => setup.sets.includes(s.join("+"))).length;
-  const size = variantCount(inPlay, setup.strategy, picked);
-  const strategy = STRATEGIES.find((s) => s.id === setup.strategy);
-  const setCriterion = (key: number, p: Partial<CriterionDraft>) => onChange({ criteria: setup.criteria.map((c) => (c.key === key ? { ...c, ...p } : c)) });
-  const firstFree = isolations.findIndex((o) => o.available);
-
+  const part = setup.part;
+  const summary = summaryOf(setup, q.options.length);
   return (
     <div className="ch-x">
       <div className="ch-x-head">
@@ -1288,81 +1404,98 @@ function ExperimentSetup({
           <PrismLabel>Experiment</PrismLabel>
         </div>
         <h3 className="ch-q-text" id={`${uid}-x`} tabIndex={-1} data-autofocus="">
-          Try them instead of picking one
+          {PARTS.find((p) => p.id === part)?.title ?? "Try them instead of picking one"}
         </h3>
-        <p className="ch-x-sub">Each variant runs in its own isolated workspace and is tested against your criteria; then they’re compared.</p>
-        <p className="ch-x-of">{q.question}</p>
+        {!part && <p className="ch-x-of">{q.question}</p>}
       </div>
+      {!part && (
+        <ul className="ch-sum" aria-label="The experiment">
+          {PARTS.map((p) => (
+            <li key={p.id}>
+              <button type="button" className="ch-sum-line" data-problem={problemPart === p.id || undefined} aria-label={`${p.line}: ${summary[p.id]}`} onClick={() => onChange({ part: p.id })}>
+                <span className="ch-sum-label">{p.line}</span>
+                <span className={cn("ch-sum-value", (p.id === "checks" || p.id === "metrics") && summary[p.id] !== "None" && "ch-mono")}>{summary[p.id]}</span>
+                <ChevronRight size={15} aria-hidden="true" />
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+      {part === "variants" && <VariantsPart uid={uid} questions={questions} eligible={eligible} setup={setup} onChange={onChange} onRetarget={onRetarget} />}
+      {part === "checks" && <CriteriaPart kind="check" setup={setup} pipelines={pipelines} onChange={onChange} />}
+      {part === "metrics" && <CriteriaPart kind="metric" setup={setup} pipelines={pipelines} onChange={onChange} />}
+      {part === "runs" && <RunsPart uid={uid} setup={setup} onChange={onChange} isolations={isolations} isolationId={isolationId} machine={machine} />}
+      {part === "end" && <EndPart uid={uid} setup={setup} onChange={onChange} />}
+    </div>
+  );
+}
 
+/** What it tries: the options in play, how they're combined, and the baseline beside them. */
+function VariantsPart({
+  uid,
+  questions,
+  eligible,
+  setup,
+  onChange,
+  onRetarget,
+}: {
+  uid: string;
+  questions: ChoiceQuestion[];
+  eligible: number[];
+  setup: Setup;
+  onChange: (p: Partial<Setup>) => void;
+  onRetarget: (q: number) => void;
+}) {
+  const q = questions[setup.q];
+  if (!q) return null;
+  const labels = q.options.map((o) => shown(o.label).text);
+  const inPlay = setup.on.filter(Boolean).length;
+  const sets = customSets(q.options.length).filter((s) => s.every((i) => setup.on[i]));
+  const picked = sets.filter((s) => setup.sets.includes(s.join("+"))).length;
+  const size = variantCount(inPlay, setup.strategy, picked);
+  return (
+    <>
       {eligible.length > 1 && (
         <Section id={`${uid}-xq`} title="Question">
           <div className="ch-chips" role="radiogroup" aria-labelledby={`${uid}-xq`} data-roving="">
             {eligible.map((i) => (
-              <button
-                key={i}
-                type="button"
-                role="radio"
-                aria-checked={setup.q === i}
-                tabIndex={setup.q === i ? 0 : -1}
-                className="ch-chip"
-                data-item=""
-                onClick={() => setup.q !== i && onRetarget(i)}
-              >
+              <button key={i} type="button" role="radio" aria-checked={setup.q === i} tabIndex={setup.q === i ? 0 : -1} className="ch-chip" data-item="" onClick={() => setup.q !== i && onRetarget(i)}>
                 {questions[i]?.header || `Q${i + 1}`}
               </button>
             ))}
           </div>
         </Section>
       )}
-
-      <Section id={`${uid}-xo`} title="Options in play" aside={inPlay < 2 ? <span className="ch-warn">at least two</span> : `${inPlay} of ${q.options.length}`}>
-        <div className="ch-chips" role="group" aria-labelledby={`${uid}-xo`} data-roving="">
-          {q.options.map((_, i) => (
-            <button
-              key={i}
-              type="button"
-              role="checkbox"
-              aria-checked={Boolean(setup.on[i])}
-              className="ch-chip"
-              data-item=""
-              onClick={() => onChange({ on: setup.on.map((v, j) => (j === i ? !v : v)) })}
-            >
-              <span className="ch-chip-n">{i + 1}</span>
-              {labels[i]}
-            </button>
-          ))}
-        </div>
-      </Section>
-
-      <Section id={`${uid}-xs`} title="Strategy">
-        <div className="ch-tiles" role="radiogroup" aria-labelledby={`${uid}-xs`} data-roving="">
-          {STRATEGIES.map((s) => {
-            const c = variantCount(inPlay, s.id, picked);
-            return (
-              <button
-                key={s.id}
-                type="button"
-                role="radio"
-                aria-checked={setup.strategy === s.id}
-                tabIndex={setup.strategy === s.id ? 0 : -1}
-                className="ch-tile"
-                data-item=""
-                onClick={() => onChange({ strategy: s.id })}
-              >
-                <span className="ch-tile-top">
-                  <span className="ch-tile-label">{s.label}</span>
-                  <span className="ch-tile-n" aria-label={`${c.atMost ? "up to " : ""}${c.count} variants`}>
-                    {c.atMost ? "≤" : ""}
-                    {c.count}
-                  </span>
-                </span>
-              </button>
-            );
-          })}
-        </div>
-        <p className="ch-x-hint">{strategy?.hint}</p>
+      <div className="ch-list" role="group" aria-label="Options in play" data-roving="">
+        {q.options.map((_, i) => (
+          <button
+            key={i}
+            type="button"
+            role="checkbox"
+            aria-checked={Boolean(setup.on[i])}
+            className="ch-item"
+            data-item=""
+            onClick={() => onChange({ on: setup.on.map((v, j) => (j === i ? !v : v)) })}
+          >
+            <span className="ch-mark" aria-hidden="true">
+              <Check size={10} strokeWidth={3} />
+            </span>
+            <span className="ch-item-label">{labels[i]}</span>
+          </button>
+        ))}
+      </div>
+      <div className="ch-list">
+        <Field label="Combine" htmlFor={`${uid}-xs`}>
+          <select id={`${uid}-xs`} className="ch-pick" value={setup.strategy} onChange={(e) => onChange({ strategy: e.target.value as ExperimentStrategy })}>
+            {STRATEGIES.map((s) => (
+              <option key={s.id} value={s.id}>
+                {s.label}
+              </option>
+            ))}
+          </select>
+        </Field>
         {setup.strategy === "custom" && (
-          <div className="ch-chips" role="group" aria-label="Sets to try" data-roving="">
+          <div className="ch-chips ch-sets" role="group" aria-label="Sets to try" data-roving="">
             {sets.map((s, i) => {
               const key = s.join("+");
               const on = setup.sets.includes(key);
@@ -1386,135 +1519,175 @@ function ExperimentSetup({
             })}
           </div>
         )}
-        {size.count > MANY_VARIANTS && (
-          <p className="ch-warn">
-            {size.atMost ? "Up to " : ""}
-            {size.count} variants is a long experiment; Pairs or Greedy stacking try fewer.
-          </p>
-        )}
-        <button type="button" role="switch" aria-checked={setup.baseline} className="ch-switch" onClick={() => onChange({ baseline: !setup.baseline })}>
-          <span className="ch-switch-track" aria-hidden="true" />
-          <span>
-            Include baseline <span className="ch-dim">(none of them)</span>
-          </span>
-        </button>
-      </Section>
-
-      <Section id={`${uid}-xi`} title="Isolation">
-        <div className="ch-tiles" role="radiogroup" aria-labelledby={`${uid}-xi`} data-roving="">
-          {isolations.map((o, i) => {
-            const on = o.id === isolationId;
-            return (
-              <button
-                key={o.id}
-                type="button"
-                role="radio"
-                aria-checked={on}
-                disabled={!o.available}
-                tabIndex={on || (!isolationId && i === firstFree) ? 0 : -1}
-                className="ch-tile"
-                data-item=""
-                onClick={() => onChange({ isolation: o.id })}
-              >
-                <span className="ch-tile-top">
-                  <span className="ch-tile-label">{o.label}</span>
-                  {!o.available && <span className="ch-tile-n">unavailable</span>}
-                </span>
-                {(o.description || !o.available) && <span className="ch-tile-desc">{o.description || "Not available here."}</span>}
-              </button>
-            );
-          })}
-        </div>
-      </Section>
-
-      <Section
-        id={`${uid}-xc`}
-        title="Criteria"
-        aside={
-          <button
-            type="button"
-            className="ch-link ch-add"
-            onClick={() => onChange({ criteria: [...setup.criteria, newCriterion("metric", pipelines)] })}
-          >
-            <Plus size={13} /> Add
-          </button>
-        }
-      >
-        <ol className="ch-crits">
-          {setup.criteria.map((c, i) => (
-            <CriterionRow
-              key={c.key}
-              n={i + 1}
-              c={c}
-              pipelines={pipelines}
-              canRemove={setup.criteria.length > 1}
-              onChange={(p) => setCriterion(c.key, p)}
-              onRemove={() => onChange({ criteria: setup.criteria.filter((x) => x.key !== c.key) })}
-            />
-          ))}
-        </ol>
-      </Section>
-
-      <div className="ch-nums">
-        <NumberField label="Repetitions" value={setup.repetitions} min={1} onChange={(repetitions) => onChange({ repetitions })} />
-        <NumberField label="Max parallel" value={setup.maxParallel} min={1} onChange={(maxParallel) => onChange({ maxParallel })} />
-        <NumberField label="Budget, min" value={setup.budget} min={1} placeholder="none" onChange={(budget) => onChange({ budget })} />
+        <Toggle label="Baseline" on={setup.baseline} onChange={(baseline) => onChange({ baseline })} />
       </div>
+      {size.count > MANY_VARIANTS && (
+        <p className="ch-warn">
+          {size.atMost ? "Up to " : ""}
+          {size.count} variants is a long experiment; pairs or greedy stacking try fewer.
+        </p>
+      )}
+    </>
+  );
+}
 
-      <Section id={`${uid}-xd`} title="Decision">
-        <div className="ch-radios" role="radiogroup" aria-labelledby={`${uid}-xd`} data-roving="">
-          {DECISIONS.map((o) => (
-            <button
-              key={o.id}
-              type="button"
-              role="radio"
-              aria-checked={setup.decide === o.id}
-              tabIndex={setup.decide === o.id ? 0 : -1}
-              className="ch-radio"
-              data-item=""
-              onClick={() => onChange({ decide: o.id })}
-            >
-              <span className="ch-mark" aria-hidden="true" />
-              <span>{o.label}</span>
-            </button>
-          ))}
+/** The checks each variant runs, or the metrics they report. */
+function CriteriaPart({ kind, setup, pipelines, onChange }: { kind: "check" | "metric"; setup: Setup; pipelines: string[]; onChange: (p: Partial<Setup>) => void }) {
+  const setCriterion = (key: number, p: Partial<CriterionDraft>) => onChange({ criteria: setup.criteria.map((c) => (c.key === key ? { ...c, ...p } : c)) });
+  const remove = (key: number) => onChange({ criteria: setup.criteria.filter((x) => x.key !== key) });
+  const mine = setup.criteria.filter((c) => (kind === "metric") === (c.kind === "metric"));
+  return (
+    <>
+      {mine.length > 0 && (
+        <ol className="ch-crits">
+          {mine.map((c, i) =>
+            kind === "check" ? (
+              <CheckRow key={c.key} n={i + 1} c={c} pipelines={pipelines} canRemove={mine.length > 1} onChange={(p) => setCriterion(c.key, p)} onRemove={() => remove(c.key)} />
+            ) : (
+              <MetricRow key={c.key} n={i + 1} c={c} onChange={(p) => setCriterion(c.key, p)} onRemove={() => remove(c.key)} />
+            ),
+          )}
+        </ol>
+      )}
+      <button type="button" className="ch-link ch-add" onClick={() => onChange({ criteria: [...setup.criteria, newCriterion(kind === "check" ? "command" : "metric", pipelines)] })}>
+        <Plus size={13} /> {kind === "check" ? "Add a check" : "Add a metric"}
+      </button>
+    </>
+  );
+}
+
+/** How it runs: how often, how many at once, for how long at most, and where. */
+function RunsPart({
+  uid,
+  setup,
+  onChange,
+  isolations,
+  isolationId,
+  machine,
+}: {
+  uid: string;
+  setup: Setup;
+  onChange: (p: Partial<Setup>) => void;
+  isolations: IsolationOption[];
+  isolationId: string;
+  machine?: string;
+}) {
+  // Where each variant runs is a choice only where there's more than one place it can.
+  const places = isolations.filter((o) => o.available);
+  return (
+    <div className="ch-list">
+      <NumberRow label="Runs per variant" value={setup.repetitions} onChange={(repetitions) => onChange({ repetitions })} />
+      <NumberRow label="At once" value={setup.maxParallel} onChange={(maxParallel) => onChange({ maxParallel })} />
+      <Field label="Time limit" htmlFor={`${uid}-xt`}>
+        <span className="ch-thr">
+          <input
+            id={`${uid}-xt`}
+            className="ch-input ch-amount"
+            type="number"
+            inputMode="decimal"
+            min={0}
+            step="any"
+            value={setup.budget}
+            placeholder="none"
+            onChange={(e) => onChange({ budget: e.target.value })}
+          />
+          <select className="ch-pick" aria-label="Time limit in" value={setup.budgetUnit} onChange={(e) => onChange({ budgetUnit: e.target.value as DurationUnit })}>
+            {UNITS.map((u) => (
+              <option key={u.id} value={u.id}>
+                {u.id}
+              </option>
+            ))}
+          </select>
+        </span>
+      </Field>
+      {places.length > 1 && (
+        <Field label="Isolation" htmlFor={`${uid}-xi`}>
+          <select id={`${uid}-xi`} className="ch-pick" value={isolationId} onChange={(e) => onChange({ isolation: e.target.value })}>
+            {isolations.map((o) => (
+              <option key={o.id} value={o.id} disabled={!o.available}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+        </Field>
+      )}
+      {machine && (
+        <div className="ch-field">
+          <span className="ch-field-label">Machine</span>
+          <span className="ch-field-value">{machine}</span>
         </div>
-      </Section>
-
-      <label className="ch-x-notes">
-        <span className="ch-x-label">Notes</span>
-        <textarea className="ch-input" rows={2} value={setup.notes} onChange={(e) => onChange({ notes: e.target.value })} placeholder="Anything the agent should know (optional)" />
-      </label>
+      )}
     </div>
   );
 }
 
-function Section({ id, title, aside, children }: { id: string; title: string; aside?: React.ReactNode; children: React.ReactNode }) {
+/** What happens once it's done: who picks, and a note for the agent. */
+function EndPart({ uid, setup, onChange }: { uid: string; setup: Setup; onChange: (p: Partial<Setup>) => void }) {
+  return (
+    <>
+      <div className="ch-list" role="radiogroup" aria-label="Who picks" data-roving="">
+        {DECISIONS.map((o) => (
+          <button
+            key={o.id}
+            type="button"
+            role="radio"
+            aria-checked={setup.decide === o.id}
+            tabIndex={setup.decide === o.id ? 0 : -1}
+            className="ch-item"
+            data-item=""
+            onClick={() => onChange({ decide: o.id })}
+          >
+            <span className="ch-mark" aria-hidden="true" />
+            <span className="ch-item-label">{o.label}</span>
+          </button>
+        ))}
+      </div>
+      <label className="ch-x-notes" htmlFor={`${uid}-xn`}>
+        <span className="ch-x-label">Note for the agent</span>
+        <textarea id={`${uid}-xn`} className="ch-input" rows={2} value={setup.notes} onChange={(e) => onChange({ notes: e.target.value })} placeholder="Optional" />
+      </label>
+    </>
+  );
+}
+
+function Section({ id, title, children }: { id: string; title: string; children: React.ReactNode }) {
   return (
     <section className="ch-x-sec" aria-labelledby={id}>
       <div className="ch-x-label">
         <h4 id={id}>{title}</h4>
-        {aside && <span className="ch-x-aside">{aside}</span>}
       </div>
       {children}
     </section>
   );
 }
 
-/** Two or three choices side by side (radio semantics). */
-function Seg<T extends string>({ label, value, options, onChange }: { label: string; value: T; options: { id: T; label: string }[]; onChange: (v: T) => void }) {
+/** A setting on a line of its own: what it is on the left (a word more under it), its control on the right. */
+function Field({ label, hint, htmlFor, children }: { label: string; hint?: string; htmlFor?: string; children: React.ReactNode }) {
   return (
-    <div className="ch-seg" role="radiogroup" aria-label={label} data-roving="">
-      {options.map((o) => (
-        <button key={o.id} type="button" role="radio" aria-checked={value === o.id} tabIndex={value === o.id ? 0 : -1} data-item="" onClick={() => onChange(o.id)}>
-          {o.label}
-        </button>
-      ))}
+    <div className="ch-field">
+      <label className="ch-field-label" htmlFor={htmlFor}>
+        {label}
+        {hint && <span className="ch-field-hint">{hint}</span>}
+      </label>
+      {children}
     </div>
   );
 }
 
-function CriterionRow({
+/** A yes or no on a line of its own, the whole line its switch. */
+function Toggle({ label, hint, name, on, disabled, onChange }: { label: string; hint?: string; name?: string; on: boolean; disabled?: boolean; onChange: (on: boolean) => void }) {
+  return (
+    <button type="button" role="switch" aria-checked={on} aria-label={name} className="ch-toggle" disabled={disabled} onClick={() => onChange(!on)}>
+      <span className="ch-field-label">
+        {label}
+        {hint && <span className="ch-field-hint">{hint}</span>}
+      </span>
+      <span className="ch-switch-track" aria-hidden="true" />
+    </button>
+  );
+}
+
+function CheckRow({
   n,
   c,
   pipelines,
@@ -1529,17 +1702,20 @@ function CriterionRow({
   onChange: (p: Partial<CriterionDraft>) => void;
   onRemove: () => void;
 }) {
-  const name = `Criterion ${n}`;
+  const name = `Check ${n}`;
+  const pipeline = c.kind === "pipeline";
   return (
     <li className="ch-crit">
       <div className="ch-crit-main">
-        <select className="ch-select" aria-label={`${name}: kind`} value={c.kind} onChange={(e) => onChange({ kind: e.target.value as Criterion["kind"] })}>
-          <option value="pipeline">Pipeline</option>
-          <option value="command">Command</option>
-          <option value="metric">Metric</option>
-        </select>
-        {c.kind === "pipeline" && pipelines.length > 0 ? (
-          <select className="ch-select ch-grow" aria-label={`${name}: pipeline`} value={c.pipeline} onChange={(e) => onChange({ pipeline: e.target.value })}>
+        {/* A pipeline is CI's: offered while there are pipelines to run. */}
+        {(pipelines.length > 0 || pipeline) && (
+          <select className="ch-pick" aria-label={`${name}: kind`} value={c.kind} onChange={(e) => onChange({ kind: e.target.value as Criterion["kind"] })}>
+            <option value="command">Command</option>
+            <option value="pipeline">Pipeline</option>
+          </select>
+        )}
+        {pipeline ? (
+          <select className="ch-pick ch-grow" aria-label={`${name}: pipeline`} value={c.pipeline} onChange={(e) => onChange({ pipeline: e.target.value })}>
             {!pipelines.includes(c.pipeline) && <option value={c.pipeline}>{c.pipeline || "Choose a pipeline"}</option>}
             {pipelines.map((p) => (
               <option key={p} value={p}>
@@ -1550,10 +1726,10 @@ function CriterionRow({
         ) : (
           <input
             className="ch-input ch-grow ch-mono"
-            aria-label={`${name}: ${c.kind === "pipeline" ? "pipeline name" : c.kind === "command" ? "command" : "metric name"}`}
-            value={c.kind === "pipeline" ? c.pipeline : c.kind === "command" ? c.command : c.metric}
-            onChange={(e) => onChange(c.kind === "pipeline" ? { pipeline: e.target.value } : c.kind === "command" ? { command: e.target.value } : { metric: e.target.value })}
-            placeholder={c.kind === "pipeline" ? "pipeline name" : c.kind === "command" ? "cargo bench --bench parse" : "p95_ms"}
+            aria-label={`${name}: command`}
+            value={c.command}
+            onChange={(e) => onChange({ command: e.target.value })}
+            placeholder="cargo bench --bench parse"
             spellCheck={false}
             autoCapitalize="off"
             autoComplete="off"
@@ -1563,60 +1739,70 @@ function CriterionRow({
           <X size={15} />
         </button>
       </div>
-      <div className="ch-crit-more">
-        {c.kind === "metric" && (
-          <>
-            <Seg
-              label={`${name}: better`}
-              value={c.better}
-              options={[
-                { id: "lower", label: "Lower wins" },
-                { id: "higher", label: "Higher wins" },
-              ]}
-              onChange={(better) => onChange({ better })}
-            />
-            <span className="ch-thr">
-              <input
-                className="ch-input"
-                type="number"
-                inputMode="decimal"
-                step="any"
-                aria-label={`${name}: threshold`}
-                value={c.threshold}
-                onChange={(e) => onChange({ threshold: e.target.value })}
-                placeholder="threshold"
-              />
-              <select
-                className="ch-select"
-                aria-label={`${name}: threshold is`}
-                value={c.thresholdType}
-                onChange={(e) => onChange({ thresholdType: e.target.value as CriterionDraft["thresholdType"] })}
-              >
-                <option value="relative">% vs baseline</option>
-                <option value="absolute">absolute</option>
-              </select>
-            </span>
-          </>
-        )}
-        <Seg
-          label={`${name}: role`}
-          value={c.required ? "must" : "optimize"}
-          options={[
-            { id: "must", label: "Must pass" },
-            { id: "optimize", label: "Optimize" },
-          ]}
-          onChange={(v) => onChange({ required: v === "must" })}
-        />
-      </div>
+      <Toggle label="Must pass" name={`${name}: must pass`} on={c.required} onChange={(required) => onChange({ required })} />
     </li>
   );
 }
 
-function NumberField({ label, value, min, placeholder, onChange }: { label: string; value: string; min: number; placeholder?: string; onChange: (v: string) => void }) {
+function MetricRow({ n, c, onChange, onRemove }: { n: number; c: CriterionDraft; onChange: (p: Partial<CriterionDraft>) => void; onRemove: () => void }) {
+  const name = `Metric ${n}`;
+  const none = c.thresholdType === "none";
   return (
-    <label className="ch-num">
-      <span className="ch-x-label">{label}</span>
-      <input className="ch-input" type="number" inputMode="numeric" min={min} step={1} value={value} placeholder={placeholder} onChange={(e) => onChange(e.target.value)} />
-    </label>
+    <li className="ch-crit">
+      <div className="ch-crit-main">
+        <input
+          className="ch-input ch-grow ch-mono"
+          aria-label={`${name}: name`}
+          value={c.metric}
+          onChange={(e) => onChange({ metric: e.target.value })}
+          placeholder="p95_ms"
+          spellCheck={false}
+          autoCapitalize="off"
+          autoComplete="off"
+        />
+        <button type="button" className="ch-icon" aria-label={`Remove ${name.toLowerCase()}`} onClick={onRemove}>
+          <X size={15} />
+        </button>
+      </div>
+      <div className="ch-field">
+        <span className="ch-field-label">Better</span>
+        <select className="ch-pick" aria-label={`${name}: better`} value={c.better} onChange={(e) => onChange({ better: e.target.value as CriterionDraft["better"] })}>
+          <option value="lower">Lower</option>
+          <option value="higher">Higher</option>
+        </select>
+      </div>
+      <div className="ch-field">
+        <span className="ch-field-label">Threshold</span>
+        <span className="ch-thr">
+          <select className="ch-pick" aria-label={`${name}: threshold`} value={c.thresholdType} onChange={(e) => onChange({ thresholdType: e.target.value as CriterionDraft["thresholdType"] })}>
+            <option value="none">None</option>
+            <option value="absolute">{c.better === "lower" ? "At most" : "At least"}</option>
+            <option value="relative">% better than baseline</option>
+          </select>
+          <input
+            className="ch-input ch-amount"
+            type="number"
+            inputMode="decimal"
+            step="any"
+            aria-label={`${name}: threshold value`}
+            value={none ? "" : c.threshold}
+            disabled={none}
+            onChange={(e) => onChange({ threshold: e.target.value })}
+            placeholder={none ? "" : c.thresholdType === "relative" ? "5" : "10"}
+          />
+        </span>
+      </div>
+      {/* Without a threshold there's nothing to meet: it's only compared. */}
+      <Toggle label="Must meet the threshold" name={`${name}: must meet the threshold`} on={c.required && !none} disabled={none} onChange={(required) => onChange({ required })} />
+    </li>
+  );
+}
+
+function NumberRow({ label, hint, value, placeholder, onChange }: { label: string; hint?: string; value: string; placeholder?: string; onChange: (v: string) => void }) {
+  const id = React.useId();
+  return (
+    <Field label={label} hint={hint} htmlFor={id}>
+      <input id={id} className="ch-input ch-amount" type="number" inputMode="numeric" min={1} step={1} value={value} placeholder={placeholder} onChange={(e) => onChange(e.target.value)} />
+    </Field>
   );
 }

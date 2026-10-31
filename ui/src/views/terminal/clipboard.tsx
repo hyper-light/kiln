@@ -7,34 +7,65 @@ import * as React from "react";
 import { X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 
-/** Put text on the clipboard: the clipboard API where the page may use it, else the old copy command. */
+/**
+ * Put text on the clipboard: the clipboard API where the page may use it (HTTPS, localhost), else
+ * (or where it refuses) the copy command. Every copy in the UI comes here.
+ */
 export async function copyText(text: string): Promise<boolean> {
   if (!text) return false;
-  try {
-    if (window.isSecureContext && navigator.clipboard?.writeText) {
+  if (window.isSecureContext && navigator.clipboard?.writeText) {
+    try {
       await navigator.clipboard.writeText(text);
       return true;
+    } catch {
+      /* refused (permission, focus): the copy command, while the tap still counts */
     }
-  } catch {
-    /* fall through */
   }
-  const ta = document.createElement("textarea");
-  ta.value = text;
-  ta.setAttribute("readonly", "");
-  ta.style.cssText = "position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;pointer-events:none";
-  const active = document.activeElement as HTMLElement | null;
-  document.body.appendChild(ta);
-  ta.select();
-  ta.setSelectionRange(0, text.length);
-  let ok: boolean;
+  return copyCommand(text);
+}
+
+/**
+ * The copy command, its copy event handed the text: nothing selected and no focus moved, so it
+ * works inside a dialog or a menu too (their focus trap takes focus back from a textarea outside
+ * them before it's copied). False where the browser refuses it: outside a tap or a key press.
+ */
+function copyCommand(text: string): boolean {
+  let handed = false;
+  const hand = (e: ClipboardEvent) => {
+    if (!e.clipboardData) return;
+    e.clipboardData.setData("text/plain", text);
+    e.preventDefault();
+    // Before a terminal's or an editor's own copy handler puts its selection there instead.
+    e.stopImmediatePropagation();
+    handed = true;
+  };
+  window.addEventListener("copy", hand, true);
   try {
-    ok = document.execCommand("copy");
+    // Whether the event came is the answer: Safari's command says false with nothing selected,
+    // though the text it was handed is on the clipboard.
+    document.execCommand("copy");
   } catch {
-    ok = false;
+    /* no copy command */
+  } finally {
+    window.removeEventListener("copy", hand, true);
   }
-  ta.remove();
-  active?.focus?.();
-  return ok;
+  return handed;
+}
+
+/**
+ * Put text that's still coming (fetched, or asked of a page) on the clipboard: called in the tap or
+ * key press itself. A clipboard item that waits for it where the browser has one (Safari takes a
+ * write only during the gesture); else the text once it comes, while the gesture still counts.
+ */
+export function copyLater(text: Promise<string>): Promise<boolean> {
+  const then = () => text.then(copyText, () => false);
+  if (!window.isSecureContext || typeof ClipboardItem === "undefined" || !navigator.clipboard?.write) return then();
+  try {
+    const blob = text.then((t) => (t ? new Blob([t], { type: "text/plain" }) : Promise.reject(new Error("nothing to copy"))));
+    return navigator.clipboard.write([new ClipboardItem({ "text/plain": blob })]).then(() => true, then);
+  } catch {
+    return then();
+  }
 }
 
 /** Read the clipboard, where the browser allows it (secure pages, after a tap or key press). */

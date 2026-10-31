@@ -728,7 +728,7 @@ impl Archives {
             if v.leader == 0 || v.leader != v.member {
                 continue;
             }
-            let Some(store) = o.store() else { continue };
+            let Some(store) = o.store_replayed() else { continue };
             let files = store.read().unwrap_or_else(PoisonError::into_inner).log_files();
             self.round(&files, &|series| o.write(series), &|record| o.log(vec![record])).await;
         }

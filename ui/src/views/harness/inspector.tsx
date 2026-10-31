@@ -14,10 +14,11 @@ import { LimitMeter, StatusList } from "./limits";
 import { McpPanel, SkillsPanel } from "./tools";
 import { TaskElapsed } from "./timeline";
 import { Background, isBackground } from "./background";
-import { PlansHere } from "@/views/plans/here";
+import { PlansSection } from "@/views/plans/browser";
 import { PlanSourceContext, SavePlan, todosAsPlan } from "@/views/plans/save";
 import { ProposedPlan, TodoSteps } from "@/views/plans/its-plan";
-import { AgentResearch } from "@/views/research/research";
+import { ReviewHere, useReviewWaits } from "@/views/plans/review";
+import { ResearchSection } from "@/views/research/research";
 import { Goals } from "./goals";
 import { LivePages } from "./live-pages";
 import { Loadable } from "@/components/ui/loading";
@@ -377,9 +378,11 @@ export function Inspector({
   const tasks = (state?.tasks ?? []).filter((t) => !isBackground(t));
   const subagents = tasks.length + kiln.length;
   const mcp = state?.mcp ?? [];
-  const tabs: { id: InspectorTab; label: string; count?: string }[] = [
+  // A plan waiting on your review: its tab says so, and it's first in it.
+  const reviewing = useReviewWaits(store);
+  const tabs: { id: InspectorTab; label: string; count?: string; waits?: boolean }[] = [
     { id: "changes", label: "Changes", count: fileCount ? String(fileCount) : undefined },
-    { id: "plan", label: "Plan", count: todos.length ? `${done}/${todos.length}` : undefined },
+    { id: "plan", label: "Plan", count: todos.length ? `${done}/${todos.length}` : undefined, waits: reviewing !== null },
     { id: "tools", label: "Tools", count: subagents ? String(subagents) : mcp.length ? `${mcp.filter((m) => m.status === "connected").length}/${mcp.length}` : undefined },
   ];
   return (
@@ -390,6 +393,7 @@ export function Inspector({
             <button key={t.id} type="button" role="tab" aria-selected={tab === t.id} className="hx-tab" onClick={() => onTab(t.id)}>
               {t.label}
               {t.count && <span className="hx-tab-count">{t.count}</span>}
+              {t.waits && <i className="pr-tab-dot" role="img" aria-label="a plan waits on your review" />}
             </button>
           ))}
         </div>
@@ -400,40 +404,43 @@ export function Inspector({
         {tab === "plan" && (
           <div className="in-secs">
             <PlanSourceContext.Provider value={agentId ? { session: agentId } : null}>
-              <Fold id="plan" title="Plan">
-                {/* Its to-do list, drawn as a plan's steps are: how far it's come. */}
-                {todos.length > 0 && (
-                  <div className="hx-stack">
-                    <TodoSteps todos={todos} />
-                    <SavePlan body={todosAsPlan(todos)} title={todos[0]?.text.slice(0, 80)} />
-                  </div>
-                )}
-                {/* The plan it proposed (plan mode), in its words, kept by kiln. */}
-                {agentId ? (
-                  <Loadable label="its plan" fallback={null}>
-                    <ProposedPlan session={agentId} words={proposed} tracked={todos.length > 0} />
-                  </Loadable>
-                ) : (
-                  proposed && (
-                    <div className="hx-stack">
-                      <Prose text={proposed} className="hx-plan-text" />
-                      <SavePlan body={proposed} />
-                    </div>
-                  )
-                )}
-                {todos.length === 0 && !proposed && <p className="in-none">None yet: the plan it proposes shows here, kept by kiln as one of your plans, and its to-do list as it works through it.</p>}
-              </Fold>
-              {/* What it found out, graded by kiln (research.tsx): the newest in full. */}
-              {agentId && (
-                <Loadable label="its research" fallback={null}>
-                  <AgentResearch agent={agentId} />
-                </Loadable>
-              )}
-              {agentId && (
-                <Fold id="your-plans" title="Your plans">
-                  <PlansHere session={agentId} />
-                </Fold>
-              )}
+              {/* A plan waiting on you (review.tsx): read and answered here, first. */}
+              {agentId && <ReviewHere agent={agentId} store={store} send={send} />}
+              {/* The plan under way as it moves, then every plan kept, to find and recall (browser.tsx). */}
+              <PlansSection
+                session={agentId}
+                active={
+                  <>
+                    {/* Its to-do list, drawn as a plan's steps are: how far it's come. */}
+                    {todos.length > 0 && (
+                      <div className="hx-stack">
+                        <TodoSteps todos={todos} />
+                        <SavePlan body={todosAsPlan(todos)} title={todos[0]?.text.slice(0, 80)} />
+                      </div>
+                    )}
+                    {/* The plan it proposed (plan mode), in its words, kept by kiln; while it waits on you, the review above is it. */}
+                    {reviewing === "proposed" && send ? (
+                      <p className="in-none">Its plan waits on your review, above.</p>
+                    ) : agentId ? (
+                      <Loadable label="its plan" fallback={null}>
+                        <ProposedPlan session={agentId} words={proposed} tracked={todos.length > 0} />
+                      </Loadable>
+                    ) : (
+                      proposed && (
+                        <div className="hx-stack">
+                          <Prose text={proposed} className="hx-plan-text" />
+                          <SavePlan body={proposed} />
+                        </div>
+                      )
+                    )}
+                    {todos.length === 0 && !proposed && (
+                      <p className="in-none">None yet: the plan it proposes shows here, kept by kiln as one of your plans, and its to-do list as it works through it.</p>
+                    )}
+                  </>
+                }
+              />
+              {/* What agents found out, graded by kiln (research.tsx): to search, a card each, in brief until opened. */}
+              {agentId && <ResearchSection agent={agentId} />}
               {agentId && <Goals agent={agentId} harness={harness} working={working} store={store} onOpenTask={onOpenTask} />}
             </PlanSourceContext.Provider>
           </div>

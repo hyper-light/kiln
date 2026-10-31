@@ -1,7 +1,8 @@
 /**
- * The text box the agent chat writes in (composer.tsx), shared by review comments (W26-R08): what's
- * typed is marked under the field (marks.tsx: Markdown, and the commands `names` holds), whose own
- * text is clear. Inside a `.cp` (the composer's root).
+ * The text box the agent chat writes in (composer.tsx), shared by review comments (W26-R08) and
+ * Mission control's composers (new-agent.tsx, broadcast.tsx): what's typed is marked under the
+ * field (marks.tsx: Markdown, and the commands `names` holds), whose own text is clear, and dimmed
+ * with it while it's disabled. Inside a `.cp` (the composer's root).
  *
  * It grows with the text (measured as each change is shown) up to the stylesheet's most lines, ten,
  * or four on a phone; past that it scrolls inside, so a long message never pushes what's around it
@@ -23,6 +24,7 @@ export function ComposeField({
   names = NO_NAMES,
   field,
   onScroll,
+  disabled,
   ...rest
 }: FieldProps & {
   text: string;
@@ -48,7 +50,7 @@ export function ComposeField({
   );
   return (
     <div className="cp-field">
-      <div ref={mirror} className="hx-compose-input cp-mirror" aria-hidden="true">
+      <div ref={mirror} className="hx-compose-input cp-mirror" aria-hidden="true" data-off={disabled || undefined}>
         <Marked text={text} names={names} />
       </div>
       <textarea
@@ -56,6 +58,7 @@ export function ComposeField({
         className="hx-compose-input cp-input"
         rows={1}
         value={text}
+        disabled={disabled}
         onScroll={(e) => {
           if (mirror.current) mirror.current.scrollTop = e.currentTarget.scrollTop;
           onScroll?.(e);

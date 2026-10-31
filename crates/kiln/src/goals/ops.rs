@@ -7,7 +7,7 @@ use http::{Method, StatusCode};
 use serde_json::{Value, json};
 
 use super::{Action, At, By, Change, Error, Given, Need, NewGoal, Pausing};
-use crate::ops::{Cx, Fail, Op, Out, path};
+use crate::ops::{Cx, Fail, Input, Op, Out, path};
 
 fn fail(e: Error) -> Fail {
     match e {
@@ -24,13 +24,6 @@ fn json_of<T: serde::Serialize>(v: &T) -> Out {
 fn agent_of(v: &Value) -> Result<String, Fail> {
     v.get("agent").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned).ok_or_else(|| (StatusCode::BAD_REQUEST, "`agent` is required".into()))
 }
-
-fn schema(props: Value, required: &[&str]) -> Value {
-    json!({"type": "object", "properties": props, "required": required, "additionalProperties": false})
-}
-
-const AGENT: &str = "The agent's id (as agents_list gives it); leave it out for your own goal stack.";
-const GOAL_ID: &str = "A goal's id, as goals_get gives it.";
 
 /// A string field of an input, when it's given and not empty.
 fn opt(v: &Value, k: &str) -> Option<String> {
@@ -319,7 +312,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "An agent's goal stack (yours, without `agent`): its goals in order, each with its id and status (pending, active, met, unmet, skipped), the goal it's a part of (`part_of`) and the plan step it's made from (`step`); and whether the stack runs, is paused (why, and `resume_at` when it resumes by itself) or is done; `cleared`: how many goals were cleared from it last (goals_control restore brings them back). The goal under way is sent again whenever the agent stops short of it, until it's met: say so with goals_done.",
             read_only: true,
             destructive: false,
-            input: || schema(json!({"agent": {"type": "string", "description": AGENT}}), &[]),
+            input: Input::of::<input::GoalsGet>(),
             route: |v| Ok((Method::GET, path(&["api", "harness", "sessions", &agent_of(v)?, "goals"]))),
             run: |cx, v| Box::pin(get(cx, v)),
         },
@@ -328,32 +321,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "Line goals up for an agent (for yourself, without `agent`), after the ones it has (or `next`, right after the goal under way; or `before` or `after` a goal still to go, by id). Say what each waits for (`needs`, [] for nothing): a goal goes once what it waits for has ended, and goals that don't wait for each other run side by side, on subagents while there's room. One that says nothing is ordered before it goes (kiln asks the agent: goals_order). Each goes as its harness's own /goal where it has one, like giving it /goal again and again. Runs the stack unless `start` is false. To pursue a document or list as a goal stack, give one goal per item, each saying what done is and what it needs.",
             read_only: false,
             destructive: false,
-            input: || {
-                schema(
-                    json!({
-                        "agent": {"type": "string", "description": AGENT},
-                        "goals": {
-                            "type": "array",
-                            "description": "Each a condition or objective, one line: its words, or {text, needs}.",
-                            "items": {
-                                "type": ["string", "object"],
-                                "properties": {
-                                    "text": {"type": "string"},
-                                    "needs": {"type": "array", "items": {"type": ["integer", "string"]}, "description": "The goals it waits for: a number for one of these (from 1), or a goal's id. [] for none."}
-                                },
-                                "required": ["text"]
-                            }
-                        },
-                        "parallel": {"type": "boolean", "description": "Those of these that don't say what they need wait for nothing."},
-                        "start": {"type": "boolean"},
-                        "next": {"type": "boolean", "description": "Right after the goal under way, before the rest."},
-                        "before": {"type": "string", "description": "Before this goal still to go (its id). Before the goal under way, they go first and it waits after them."},
-                        "after": {"type": "string", "description": "After this goal still to go (its id)."},
-                        "key": {"type": "string", "description": "An idempotency key, made once for this request (1 to 256 bytes): asked again under it (its answer lost), the goals it added are found and none is added twice. Without it, each call adds its goals again: pass it whenever you may ask again."}
-                    }),
-                    &["goals"],
-                )
-            },
+            input: Input::of::<input::GoalsAdd>(),
             route: |v| Ok((Method::POST, path(&["api", "harness", "sessions", &agent_of(v)?, "goals"]))),
             run: |cx, v| Box::pin(add(cx, v)),
         },
@@ -362,15 +330,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "Replace an agent's goals still to go (reordered, edited, removed, added): `goals` is the list as it should be, existing ones by `id` (one given by its words alone is the goal still to go with those words). The goal under way may be in it: first, it stays under way (with other words, it goes to the agent again as they say); after others, it goes back among them and the first goes next; left out, it stays under way. Goals done are left as they are.",
             read_only: false,
             destructive: true,
-            input: || {
-                schema(
-                    json!({
-                        "agent": {"type": "string", "description": AGENT},
-                        "goals": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "text": {"type": "string"}}, "required": ["text"]}}
-                    }),
-                    &["goals"],
-                )
-            },
+            input: Input::of::<input::GoalsSet>(),
             route: |v| Ok((Method::PUT, path(&["api", "harness", "sessions", &agent_of(v)?, "goals"]))),
             run: |cx, v| Box::pin(set(cx, v)),
         },
@@ -379,20 +339,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "Start or resume, pause, skip the goal under way (left unmet: to say it's met, use goals_done), or clear an agent's goal stack; restore brings back the goals cleared last, as they were, and runs it. Starting, resuming or skipping sends what's next to the agent at once. A pause can say `why` and resume by itself: `resume_in_s` (seconds from now) or `resume_at` (unix ms, or a time like 2026-10-21T15:00:00Z); paused, the agent isn't held to its goal (its harness's own goal is cleared) and nothing is sent until it resumes.",
             read_only: false,
             destructive: false,
-            input: || {
-                schema(
-                    json!({
-                        "agent": {"type": "string", "description": AGENT},
-                        "action": {"type": "string", "enum": ["start", "resume", "pause", "skip", "done", "clear", "restore"]},
-                        "why": {"type": "string", "description": "pause: why, shown with the stack (what it waits for)."},
-                        "id": {"type": "string", "description": "skip, done: the goal it's for (the goal under way, by its id); asked again once that goal has ended, nothing more ends."},
-                        "key": {"type": "string", "description": "An idempotency key, made once for this request (1 to 256 bytes): asked again under it (its answer lost), it's answered with the stack as it is and does nothing more, whatever changed since. Without it, a resume or a skip asked again after the stack changed is done again: pass it whenever you may ask again."},
-                        "resume_in_s": {"type": "number", "description": "pause: resume by itself this many seconds from now (at most 30 days)."},
-                        "resume_at": {"type": ["integer", "string"], "description": "pause: resume by itself then: unix ms, or an RFC 3339 time."}
-                    }),
-                    &["action"],
-                )
-            },
+            input: Input::of::<input::GoalsControl>(),
             route: |v| Ok((Method::POST, path(&["api", "harness", "sessions", &agent_of(v)?, "goals", v.get("action").and_then(Value::as_str).unwrap_or("start")]))),
             run: |cx, v| Box::pin(control(cx, v)),
         },
@@ -401,17 +348,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "Say a goal is met: the goal under way (or the one `id` names), with `evidence`, what shows it (the tests that passed, the numbers measured, where it's live). It ends as met, its harness's own goal is cleared, and the next goes to the agent at once. Use this when you've met your goal rather than skipping it (skip leaves a goal unmet); a goal split into parts that's said met takes its parts still to go with it, and a goal skipped earlier can be said met after all.",
             read_only: false,
             destructive: false,
-            input: || {
-                schema(
-                    json!({
-                        "agent": {"type": "string", "description": AGENT},
-                        "id": {"type": "string", "description": "The goal that's met; left out, the goal under way."},
-                        "evidence": {"type": "string", "description": "What shows it's met, a line or two: kept with the goal for the person to see."},
-                        "key": {"type": "string", "description": "An idempotency key, made once for this request (1 to 256 bytes): asked again under it (its answer lost), it's answered with the stack as it is and ends nothing more, whatever ended since. Without it, asked again late it may end the goal under way then: pass it (or the goal's `id`) whenever you may ask again."}
-                    }),
-                    &[],
-                )
-            },
+            input: Input::of::<input::GoalsDone>(),
             route: |v| Ok((Method::POST, path(&["api", "harness", "sessions", &agent_of(v)?, "goals", "done"]))),
             run: |cx, v| Box::pin(done(cx, v)),
         },
@@ -420,21 +357,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "Change one goal still to go, by its `id`, without giving the whole list: `text` gives it other words (the goal under way goes to the agent again as they say); `next`, `before` or `after` (a goal id) moves it (put before the goal under way, it goes next and that one waits); `needs` says what it waits for (goals' ids, [] for none); `remove` takes it out (the goal under way ends as skipped; one to come goes, with its parts, and what waited for it waits for what it waited for).",
             read_only: false,
             destructive: true,
-            input: || {
-                schema(
-                    json!({
-                        "agent": {"type": "string", "description": AGENT},
-                        "id": {"type": "string", "description": GOAL_ID},
-                        "text": {"type": "string", "description": "Its new words: a condition or objective, one line."},
-                        "next": {"type": "boolean", "description": "Move it right after the goal under way."},
-                        "before": {"type": "string", "description": "Move it before this goal still to go (its id)."},
-                        "after": {"type": "string", "description": "Move it after this goal still to go (its id)."},
-                        "needs": {"type": "array", "items": {"type": "string"}, "description": "What it waits for: the ids of goals of the stack ([] for nothing)."},
-                        "remove": {"type": "boolean", "description": "Take it out."}
-                    }),
-                    &["id"],
-                )
-            },
+            input: Input::of::<input::GoalsUpdate>(),
             route: |v| Ok((Method::PATCH, path(&["api", "harness", "sessions", &agent_of(v)?, "goals", &opt(v, "id").unwrap_or_default()]))),
             run: |cx, v| Box::pin(update(cx, v)),
         },
@@ -443,22 +366,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "Say what goals still to go wait for, several at once: `goals`, each {id, needs} (`needs`: the ids of the goals of the stack it waits for, [] for none). A goal goes once what it waits for has ended; goals that don't wait for each other run side by side, on subagents of yours while there's room, and you coordinate. While they can, kiln asks you to order the goals that say nothing before any of them goes: say only what you're sure of from the goals, the conversation and the code, and give every goal it asks about its needs. A loop of waiting is refused.",
             read_only: false,
             destructive: false,
-            input: || {
-                schema(
-                    json!({
-                        "agent": {"type": "string", "description": AGENT},
-                        "goals": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {"id": {"type": "string", "description": GOAL_ID}, "needs": {"type": "array", "items": {"type": "string"}, "description": "The ids of the goals it waits for ([] for none)."}},
-                                "required": ["id", "needs"]
-                            }
-                        }
-                    }),
-                    &["goals"],
-                )
-            },
+            input: Input::of::<input::GoalsOrder>(),
             route: |v| Ok((Method::POST, path(&["api", "harness", "sessions", &agent_of(v)?, "goals", "order"]))),
             run: |cx, v| Box::pin(order(cx, v)),
         },
@@ -467,16 +375,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "Turn a goal (the one under way, or the one `id` names) into a plan kiln keeps: a plan in its planning phase (the goal's words its brief) and its research. The goal gets one part first, planning it: research it inside and outside (research_add: each claim with its sources and the words quoted; kiln grades each), write its steps (plans_update: acceptance criteria, tests, `needs`, and the findings each rests on in `basis`), present the research with its sources and grades (research_get's markdown), then say it's ready (plans_ready). Its steps then become the goal's parts (or run with an agent each), and once every one is met, so is the goal.",
             read_only: false,
             destructive: false,
-            input: || {
-                schema(
-                    json!({
-                        "agent": {"type": "string", "description": AGENT},
-                        "id": {"type": "string", "description": "The goal to plan; left out, the goal under way."},
-                        "title": {"type": "string", "description": "The plan's title (left out: from the goal's words)."}
-                    }),
-                    &[],
-                )
-            },
+            input: Input::of::<input::GoalsPlan>(),
             route: |v| Ok((Method::POST, path(&["api", "harness", "sessions", &agent_of(v)?, "goals", "plan"]))),
             run: |cx, v| Box::pin(plan(cx, v)),
         },
@@ -485,16 +384,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "Whether an agent's goal stack plans its big goals first (`plan_big`, on unless turned off): a goal of the agent's own longer than a couple of sentences is researched and planned before it's worked on, as goals_plan does, its planning going to the agent in its place. And whether its goals that don't wait for each other run side by side on subagents (`side_by_side`, on unless turned off), or one at a time on the agent. A person's settings: not one of the agents' own tools.",
             read_only: false,
             destructive: false,
-            input: || {
-                schema(
-                    json!({
-                        "agent": {"type": "string", "description": AGENT},
-                        "plan_big": {"type": "boolean", "description": "Plan big goals first."},
-                        "side_by_side": {"type": "boolean", "description": "Run goals that don't wait for each other side by side, on subagents."}
-                    }),
-                    &["agent"],
-                )
-            },
+            input: Input::of::<input::GoalsSettings>(),
             route: |v| Ok((Method::POST, path(&["api", "harness", "sessions", &agent_of(v)?, "goals", "settings"]))),
             run: |cx, v| Box::pin(settings(cx, v)),
         },
@@ -503,20 +393,196 @@ pub fn list_ops() -> Vec<Op> {
             summary: "Split a goal (the one under way, or the one `id` names) into a goal stack of its own: its parts (`goals`, a goal each, one line saying what done is) go right before it and are pursued first, each in turn, then the goal itself comes back for its own check. A goal made from a plan's step (its `step` in goals_get), given no parts, splits into its acceptance criteria and its tests, a goal each. The goal under way split waits after its parts, and the first part goes now.",
             read_only: false,
             destructive: false,
-            input: || {
-                schema(
-                    json!({
-                        "agent": {"type": "string", "description": AGENT},
-                        "id": {"type": "string", "description": "The goal to split; left out, the goal under way."},
-                        "goals": {"type": "array", "items": {"type": "string"}, "description": "Its parts, in order. Left out for a plan step's goal: its acceptance criteria and tests."}
-                    }),
-                    &[],
-                )
-            },
+            input: Input::of::<input::GoalsSplit>(),
             route: |v| Ok((Method::POST, path(&["api", "harness", "sessions", &agent_of(v)?, "goals", "split"]))),
             run: |cx, v| Box::pin(split(cx, v)),
         },
     ]
+}
+
+/// What each of these operations takes (`crate::ops::Input`): its JSON Schema is generated from
+/// its type, each field's description from its doc comment.
+pub mod input {
+    use schemars::JsonSchema;
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct GoalsGet {
+        /// The agent's id (as agents_list gives it); leave it out for your own goal stack.
+        pub agent: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(untagged)]
+    pub enum GoalsAddGoal {
+        Text(String),
+        Full(GoalsAddGoalFull),
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    pub struct GoalsAddGoalFull {
+        pub text: String,
+        /// The goals it waits for: a number for one of these (from 1), or a goal's id. [] for none.
+        pub needs: Option<Vec<crate::ops::NumberOrText>>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct GoalsAdd {
+        /// The agent's id (as agents_list gives it); leave it out for your own goal stack.
+        pub agent: Option<String>,
+        /// Each a condition or objective, one line: its words, or {text, needs}.
+        pub goals: Vec<GoalsAddGoal>,
+        /// Those of these that don't say what they need wait for nothing.
+        pub parallel: Option<bool>,
+        pub start: Option<bool>,
+        /// Right after the goal under way, before the rest.
+        pub next: Option<bool>,
+        /// Before this goal still to go (its id). Before the goal under way, they go first and it
+        /// waits after them.
+        pub before: Option<String>,
+        /// After this goal still to go (its id).
+        pub after: Option<String>,
+        /// An idempotency key, made once for this request (1 to 256 bytes): asked again under it
+        /// (its answer lost), the goals it added are found and none is added twice. Without it,
+        /// each call adds its goals again: pass it whenever you may ask again.
+        pub key: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    pub struct GoalsSetGoal {
+        pub id: Option<String>,
+        pub text: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct GoalsSet {
+        /// The agent's id (as agents_list gives it); leave it out for your own goal stack.
+        pub agent: Option<String>,
+        pub goals: Vec<GoalsSetGoal>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum GoalsControlAction {
+        Start,
+        Resume,
+        Pause,
+        Skip,
+        Done,
+        Clear,
+        Restore,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct GoalsControl {
+        /// The agent's id (as agents_list gives it); leave it out for your own goal stack.
+        pub agent: Option<String>,
+        pub action: GoalsControlAction,
+        /// pause: why, shown with the stack (what it waits for).
+        pub why: Option<String>,
+        /// skip, done: the goal it's for (the goal under way, by its id); asked again once that
+        /// goal has ended, nothing more ends.
+        pub id: Option<String>,
+        /// An idempotency key, made once for this request (1 to 256 bytes): asked again under it
+        /// (its answer lost), it's answered with the stack as it is and does nothing more, whatever
+        /// changed since. Without it, a resume or a skip asked again after the stack changed is
+        /// done again: pass it whenever you may ask again.
+        pub key: Option<String>,
+        /// pause: resume by itself this many seconds from now (at most 30 days).
+        pub resume_in_s: Option<f64>,
+        /// pause: resume by itself then: unix ms, or an RFC 3339 time.
+        pub resume_at: Option<crate::ops::NumberOrText>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct GoalsDone {
+        /// The agent's id (as agents_list gives it); leave it out for your own goal stack.
+        pub agent: Option<String>,
+        /// The goal that's met; left out, the goal under way.
+        pub id: Option<String>,
+        /// What shows it's met, a line or two: kept with the goal for the person to see.
+        pub evidence: Option<String>,
+        /// An idempotency key, made once for this request (1 to 256 bytes): asked again under it
+        /// (its answer lost), it's answered with the stack as it is and ends nothing more, whatever
+        /// ended since. Without it, asked again late it may end the goal under way then: pass it
+        /// (or the goal's `id`) whenever you may ask again.
+        pub key: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct GoalsUpdate {
+        /// The agent's id (as agents_list gives it); leave it out for your own goal stack.
+        pub agent: Option<String>,
+        /// A goal's id, as goals_get gives it.
+        pub id: String,
+        /// Its new words: a condition or objective, one line.
+        pub text: Option<String>,
+        /// Move it right after the goal under way.
+        pub next: Option<bool>,
+        /// Move it before this goal still to go (its id).
+        pub before: Option<String>,
+        /// Move it after this goal still to go (its id).
+        pub after: Option<String>,
+        /// What it waits for: the ids of goals of the stack ([] for nothing).
+        pub needs: Option<Vec<String>>,
+        /// Take it out.
+        pub remove: Option<bool>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    pub struct GoalsOrderGoal {
+        /// A goal's id, as goals_get gives it.
+        pub id: String,
+        /// The ids of the goals it waits for ([] for none).
+        pub needs: Vec<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct GoalsOrder {
+        /// The agent's id (as agents_list gives it); leave it out for your own goal stack.
+        pub agent: Option<String>,
+        pub goals: Vec<GoalsOrderGoal>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct GoalsPlan {
+        /// The agent's id (as agents_list gives it); leave it out for your own goal stack.
+        pub agent: Option<String>,
+        /// The goal to plan; left out, the goal under way.
+        pub id: Option<String>,
+        /// The plan's title (left out: from the goal's words).
+        pub title: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct GoalsSettings {
+        /// The agent's id (as agents_list gives it); leave it out for your own goal stack.
+        pub agent: String,
+        /// Plan big goals first.
+        pub plan_big: Option<bool>,
+        /// Run goals that don't wait for each other side by side, on subagents.
+        pub side_by_side: Option<bool>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct GoalsSplit {
+        /// The agent's id (as agents_list gives it); leave it out for your own goal stack.
+        pub agent: Option<String>,
+        /// The goal to split; left out, the goal under way.
+        pub id: Option<String>,
+        /// Its parts, in order. Left out for a plan step's goal: its acceptance criteria and tests.
+        pub goals: Option<Vec<String>>,
+    }
 }
 
 /// Whether another subagent may be sent to plan a goal (Make a plan, Plan it now, Plan it again).

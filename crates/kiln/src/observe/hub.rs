@@ -28,9 +28,9 @@ pub async fn send_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
 }
 
 /// What a machine's runner said on observe's lane.
-pub fn heard(machine: &str, json: String, bytes: Vec<u8>) {
+pub fn heard(machine: &str, msg: wire::Msg, bytes: Vec<u8>) {
     if let Some(o) = super::api::get() {
-        o.heard(machine, json, bytes);
+        o.heard(machine, msg, bytes);
     }
 }
 

@@ -107,14 +107,13 @@ struct Row {
 
 /// Takes leg `job`'s signed records `bundles` (a JSON array of bundles), sent by the runner
 /// `machine` that ran it, then signs kiln's receipt of its hand-on.
-pub async fn taken(hub: &Hub, machine: &str, job: &str, bundles: &str) {
+pub async fn taken(hub: &Hub, machine: &str, job: &str, bundles: Vec<Value>) {
     if let Err(e) = take(hub, machine, job, bundles).await {
         tracing::warn!(job, error = %format!("{e:#}"), "a leg's signed records couldn't be kept");
     }
 }
 
-async fn take(hub: &Hub, machine: &str, job: &str, bundles: &str) -> anyhow::Result<()> {
-    let all: Vec<Value> = serde_json::from_str(bundles)?;
+async fn take(hub: &Hub, machine: &str, job: &str, all: Vec<Value>) -> anyhow::Result<()> {
     let at = crate::util::now_unix();
     let id = job.to_owned();
     let current: i64 = hub.store.call(move |c| Ok(c.query_row("SELECT attempt FROM jobs WHERE id = ?1", [&id], |r| r.get(0)).optional()?.unwrap_or(0))).await?;

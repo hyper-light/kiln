@@ -72,9 +72,16 @@ export function NavLink({
   );
 }
 
+/**
+ * Goes to `to` once. TanStack's Navigate goes again whenever its props are new, so its element is
+ * kept while `to` is: a page that re-renders as the navigation starts (one that reads the location)
+ * would otherwise start it again before it lands, and again, never landing.
+ */
 export function Navigate({ to, replace }: { to: string; replace?: boolean }) {
-  const p = split(to);
-  return <AnyNavigate to={p.pathname} search={p.search} hash={p.hash || undefined} replace={replace} />;
+  return React.useMemo(() => {
+    const p = split(to);
+    return <AnyNavigate to={p.pathname} search={p.search} hash={p.hash || undefined} replace={replace} />;
+  }, [to, replace]);
 }
 
 /** navigate("/runs/1?x=2", { replace }) or navigate(-1). */
