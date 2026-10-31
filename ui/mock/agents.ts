@@ -1106,15 +1106,22 @@ export function handleFamilySession(ws: WebSocket, id: string): boolean {
   viewers.set(id, seen.add(ws));
   ws.on("close", () => seen.delete(ws));
   ws.on("message", (raw) => {
+    type Cmd = { type?: string; task?: string; id?: string; text?: string; mode?: string; index?: number };
+    let frame: Cmd & { t?: string; c?: Cmd };
     try {
-      const c = JSON.parse(raw.toString()) as { type?: string; task?: string; id?: string; text?: string; mode?: string; index?: number };
-      if (c.type === "approve") takeAnswer(m, c);
-      if (c.type === "stop_task" && c.task) setTimeout(() => stopTask(m, c.task ?? ""), 700);
-      if (c.type === "send" && c.task && c.text) tellSubagent(m, c.task, c.id ?? `sub-${Date.now()}`, c.text, c.mode ?? "queue");
-      if (c.type?.startsWith("queue_")) subagentQueue(m, c);
+      frame = JSON.parse(raw.toString()) as typeof frame;
     } catch {
-      // Not a command.
+      return; // Not a command.
     }
+    // Under its client's id (docs/wire.md, "The UI's sockets"), answered under it as the server
+    // answers it (conversation.ts); or bare, as clients from before ids send one.
+    const under = frame.t === "cmd" && typeof frame.id === "string" ? frame.id : undefined;
+    const c: Cmd = (under ? frame.c : frame) ?? {};
+    if (c.type === "approve") takeAnswer(m, c);
+    if (c.type === "stop_task" && c.task) setTimeout(() => stopTask(m, c.task ?? ""), 700);
+    if (c.type === "send" && c.task && c.text) tellSubagent(m, c.task, c.id ?? `sub-${Date.now()}`, c.text, c.mode ?? "queue");
+    if (c.type?.startsWith("queue_")) subagentQueue(m, c);
+    if (under) send({ t: "ack", id: under, outcome: "taken" });
   });
   send({ t: "open", info: m.info });
   send({ t: "meta", meta: { ...META, version: m.info.kind === "claude" ? "2.3.1" : "0.46.0" } });
@@ -1498,8 +1505,10 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
     json(res, 409, { error: "the mock starts no agents: use the demo ones" });
     return true;
   }
-  if (p === "/api/harness/agents/wait" && m === "GET") {
-    const ids = (url.searchParams.get("agents") ?? url.searchParams.get("agent") ?? "").split(",").filter(Boolean);
+  if (p === "/api/harness/agents/wait" && m === "POST") {
+    const q = await body<{ agents?: string[] | string; agent?: string }>(req);
+    const listed = Array.isArray(q.agents) ? q.agents : (q.agents ?? "").split(",");
+    const ids = [...listed, q.agent ?? ""].map((s) => s.trim()).filter(Boolean);
     json(res, 200, {
       done: true,
       timed_out: false,

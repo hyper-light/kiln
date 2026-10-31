@@ -967,7 +967,13 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let body = boxed(|| body_value(req)).await?;
             boxed(|| own_op(&hub, &caller, "agents.start", body)).await
         }
-        (&Method::GET, ["api", "harness", "agents", "wait"]) => boxed(|| own_op(&hub, &caller, "agents.wait", query_value(&q))).await,
+        (&Method::POST, ["api", "harness", "agents", "wait"]) => {
+            let body = boxed(|| body_value(req)).await?;
+            boxed(|| own_op(&hub, &caller, "agents.wait", body)).await
+        }
+        // It takes delivery of the waiter's messages: a change, so not a GET (where an agent's id
+        // would be read).
+        (&Method::GET, ["api", "harness", "agents", "wait"]) => Err(err(StatusCode::METHOD_NOT_ALLOWED, "agents.wait takes delivery of your messages, so it's a POST: send its input as a JSON body")),
         (&Method::GET, ["api", "harness", "agents", id]) => boxed(|| own_op(&hub, &caller, "agents.get", json!({ "agent": id }))).await,
         (&Method::GET, ["api", "harness", "agents", id, what @ ("result" | "children")]) => {
             let op = format!("agents.{what}");
@@ -2176,6 +2182,10 @@ async fn plans_list(hub: &Hub, q: &HashMap<String, String>) -> R {
     // An agent's (`session`), and the plan each agent proposed (`proposed`), when asked.
     let proposed = q.get("proposed").is_some_and(|p| p == "1" || p == "true");
     let plans = crate::plans::of_source(plans, q.get("session").map(String::as_str).filter(|s| !s.is_empty()), proposed);
+    // In brief, for a list that opens each on asking (an agent's Plan tab).
+    if q.get("brief").is_some_and(|b| b == "1" || b == "true") {
+        return Ok(srv::json(StatusCode::OK, &plans.iter().map(crate::plans::brief).collect::<Vec<_>>()));
+    }
     Ok(srv::json(StatusCode::OK, &plans))
 }
 

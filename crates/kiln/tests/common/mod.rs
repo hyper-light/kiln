@@ -987,7 +987,7 @@ fn sweep(work: &Path) {
 pub struct Options<'a> {
     /// Its own runner (labels `local`), working under `<dir>/work`.
     pub agent: bool,
-    /// More of `[ci]`.
+    /// More of `[ci]` (`enabled = false`: its engine off).
     pub ci: &'a str,
     /// More sections: `[[repos]]`, ….
     pub extra: &'a str,
@@ -1097,7 +1097,6 @@ tailscale = false
 
 {cd}
 [ci]
-enabled = true
 {ci}
 
 {extra}
@@ -1106,7 +1105,8 @@ enabled = true
         work = toml_path(&work),
         scheme = if https { "https" } else { "http" },
         agent = o.agent,
-        ci = o.ci,
+        // The engine on, unless the test turns it off (`enabled = false`).
+        ci = if o.ci.contains("enabled = false") { o.ci.to_owned() } else { format!("enabled = true\n{}", o.ci) },
         extra = extra,
         // CD stays off unless the test asks for it (`start_cd`) or has a `[cd]` of its own.
         cd = if o.extra.contains("[cd]") {

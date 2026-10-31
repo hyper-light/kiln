@@ -102,7 +102,11 @@ how kiln's look for each came out, its counterclaims, then its sources, numbered
 answers with it too, for the agent to show the person as its plan is ready. Agents present
 research that way whenever they present it (in a conversation, in a plan): every claim with its
 sources and its grade, never an unweighed one. A plan's page shows its research under its steps,
-live while it's planned; research has a page of its own (`/agents/research/<id>`).
+live while it's planned; research has a page of its own (`/agents/research/<id>`). An agent's Plan
+tab has **Research**: the newest, in brief, to search by their words (in a question, a finding, a
+quote or a source) and narrow by whose they are, their findings' grades and whether they're a
+plan's; a card each (whose and when, its grades, what was asked, a segment a finding in its
+grade's colour, its strongest finding) opens in place to every finding, its grade and sources.
 
 ## Tools and API
 
@@ -112,7 +116,7 @@ and look through kiln's own conversations with `conversations_search`; in code m
 
 | Method | Path | |
 |---|---|---|
-| GET | `/api/research` | research, newest change first (`plan`, `agent`) |
+| GET | `/api/research` | research, newest change first, the last 100 (`plan`, `agent`); `q`: what holds it in its question, findings, quotes or sources (any case); `brief=1`: each without its sources or citations, its findings' `grades` (the strongest first) and the strongest one's claim (`best`) |
 | POST | `/api/research` | `{question, plan?}`: research begun (an agent's own, when an agent asks) |
 | GET | `/api/research/:id` | its sources and findings, each graded (`confidence: {score, grade, words, support, against, reliability, citation, independent, cites, found, failed, why}`), its summary, and `markdown` |
 | POST | `/api/research/:id/findings` | `{sources?, findings?, remove?, skipped?}`: added or changed by id; a cite's `source` is a source's id or the source itself |
