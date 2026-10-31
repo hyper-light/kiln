@@ -88,7 +88,10 @@ goes at the same latitude, never wider (an ACP agent that names its modes only o
 kiln's Ask, or Bypass from a mode that skipped every check), and the effort as near as the model
 takes. The to-dos go in the note it's given ("The plan as it stands"), and the session goes on
 with none: the new harness keeps a list of its own, so keep-going ([goals.md](goals.md)) never
-holds it to one only the old harness could change. The timeline marks the line between the two.
+holds it to one only the old harness could change. The timeline marks the line between the two. A
+message the old harness never got (one sent as Codex or an ACP agent was still starting: a harness
+that can't get going is switched out of at once) goes to the new one first, still shown queued where
+it was said, then what waited after it (docs/sends.md, "A harness that ends").
 
 ## Where a harness is found
 
@@ -1369,7 +1372,9 @@ left running that the list leaves out, should its end never have come.
 
 Nothing a harness ran outlives its process: when it ends (a switch to another harness, a stop, a
 restart, a crash), its live tasks end "stopped" and its calls still under way are cancelled, all
-of them kept to read; a new process starts with nothing of an earlier one's running. What kiln
+of them kept to read; a new process starts with nothing of an earlier one's running. A message it
+was handed and never finished ends dropped; one its adapter held for it, which it never got, goes
+to the next process first (docs/sends.md, "A harness that ends"). What kiln
 took back over (`left-<pid>`: "What an agent left running") is the exception. The state keeps
 the newest 200 tasks (the oldest finished go first, with the output kiln kept of them), and a
 finished task keeps 2,000 characters of a long command (its call keeps it whole), so the state
