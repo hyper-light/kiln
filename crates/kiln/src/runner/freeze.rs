@@ -627,7 +627,8 @@ mod windows_tests {
     /// W26-R22 on Windows: a running job's step tree (the step, and the counter it left running)
     /// uses no CPU while the job is frozen, every process of it suspended; a step that starts
     /// meanwhile is frozen as it starts; let go on, the step finishes its count; cancelling lets a
-    /// frozen job go on.
+    /// frozen job go on. Its waits are long: a runner's headroom may pace what it runs (a part of
+    /// each period), which slows it without stopping it.
     #[test]
     fn w26_r22_on_windows_a_jobs_step_tree_is_suspended_in_place_and_finishes_after() -> anyhow::Result<()> {
         crate::rt::block_on(async {
@@ -638,7 +639,7 @@ mod windows_tests {
             let tree = step.tree();
             // Both counters up, and half a second of CPU used between them.
             let mut up = false;
-            for _ in 0..300 {
+            for _ in 0..1200 {
                 if tree.pids().len() >= 2 && tree.cpu() > 5_000_000 {
                     up = true;
                     break;
@@ -668,9 +669,16 @@ mod windows_tests {
             // Let go on: it counts again, and finishes its count.
             job.freeze(false).await.map_err(|e| anyhow::anyhow!(e))?;
             anyhow::ensure!(!job.frozen() && job.0.lock().held.is_empty(), "exactly those it suspended let go on");
-            crate::rt::sleep(Duration::from_millis(1000)).await;
-            anyhow::ensure!(tree.cpu() > b, "thawed, it goes on");
-            let (code, out) = finished(&mut step, Duration::from_secs(120)).await?;
+            let mut going = false;
+            for _ in 0..600 {
+                if tree.cpu() > b {
+                    going = true;
+                    break;
+                }
+                crate::rt::sleep(Duration::from_millis(100)).await;
+            }
+            anyhow::ensure!(going, "thawed, it goes on");
+            let (code, out) = finished(&mut step, Duration::from_secs(900)).await?;
             anyhow::ensure!(code == Some(0) && out.contains("counted"), "the step finishes after: {code:?} {out:?}");
             // Cancelled while frozen: let go on first, so it hears it's to end.
             job.freeze(true).await.map_err(|e| anyhow::anyhow!(e))?;
@@ -698,7 +706,7 @@ mod windows_tests {
                 .spawn()?;
             let root = shell.id();
             let mut kids = Vec::new();
-            for _ in 0..150 {
+            for _ in 0..1200 {
                 kids = crate::os::contain::tree_of(root);
                 if kids.len() >= 2 {
                     break;
