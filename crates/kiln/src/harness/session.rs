@@ -927,6 +927,8 @@ fn end_tasks(core: &mut Core) {
         t.status = "stopped".to_owned();
         t.ended.get_or_insert_with(Core::now);
     }
+    // What it was sent and never finished, or that waited to go, doesn't go now.
+    core.drop_unfinished(true);
     core.touch_state();
 }
 
@@ -3055,6 +3057,9 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     // goes on), so two of it never run.
                     tracing::warn!(session = %s.id, error = %format!("{e:#}"), "couldn't take over the agent's process after the upgrade: it starts again");
                     crate::proc::terminate_tree(i32::try_from(a.process.pid).unwrap_or(0), Duration::from_secs(2)).await;
+                    // What its adapter held for it goes to the new one.
+                    let mut gone = a.adapter;
+                    gone.let_go(&mut s.core.lock());
                     continue;
                 }
             },
@@ -3373,6 +3378,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                 p.terminate(Duration::from_secs(2));
                                 let _ = crate::rt::timeout(Duration::from_secs(5), &mut p.exit).await;
                                 *s.pid.lock() = None;
+                                // What its adapter held goes with its record, in its queue.
+                                adapter.let_go(&mut s.core.lock());
                                 let _ = reply.send(None);
                                 return;
                             };
@@ -3568,6 +3575,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     seed = None;
                 }
                 if rewind_to.is_some() {
+                    adapter.let_go(&mut s.core.lock());
                     first = false;
                     continue;
                 }
@@ -3726,22 +3734,37 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     c @ (Command::Send { .. } | Command::SkillRun { .. }) => {
                         let c = prepare(&files, c).await;
                         let mut core = s.core.lock();
-                        if core.has_room() {
+                        // What waits in its queue goes first (held for its harness when that
+                        // ended, CP-T3.2): one to go in turn waits behind it, and the harness,
+                        // started again, takes them in order.
+                        if matches!(&c, Command::Send { mode: super::model::SendMode::Queue, task: None, .. }) && !core.state.queue.is_empty() {
+                            if let Some(m) = self::queued(c) {
+                                core.state.queue.push(m);
+                                core.touch_state();
+                            }
+                            let room = core.has_room();
+                            drop(core);
+                            on_change();
+                            if room {
+                                break;
+                            }
+                        } else if core.has_room() {
                             drop(core);
                             carry.push(c);
                             break;
-                        }
-                        // No room on its machine for it to go to work: a message waits in its
-                        // queue till there is (a skill run with what goes with its next start).
-                        match c {
-                            Command::Send { id, text, attachments, overrides, reply_to, .. } => {
-                                core.state.queue.push(super::model::QueueItem { id, text, at: Core::now(), attachments, overrides, reply_to });
-                                core.touch_state();
+                        } else {
+                            // No room on its machine for it to go to work: a message waits in its
+                            // queue till there is (a skill run with what goes with its next start).
+                            match c {
+                                Command::Send { id, text, attachments, overrides, reply_to, .. } => {
+                                    core.state.queue.push(super::model::QueueItem { id, text, at: Core::now(), attachments, overrides, reply_to });
+                                    core.touch_state();
+                                }
+                                c => carry.push(c),
                             }
-                            c => carry.push(c),
+                            drop(core);
+                            on_change();
                         }
-                        drop(core);
-                        on_change();
                     }
                     // Where its commands run, while it isn't running: from its next start.
                     Command::Control { id, value } if id == "reach" => {
@@ -4314,6 +4337,59 @@ mod tests {
         })
     }
 
+    /// CP-T3.2: a message sent as Codex started, held by its adapter for the thread (shown queued
+    /// by the agent), outlives Codex's process: it crashed before the thread opened, and the
+    /// message went first in kiln's queue, still shown queued. Another, sent while the agent is
+    /// down (which starts it again), goes after it; and what neither process ever got stays.
+    #[cfg(unix)]
+    #[test]
+    fn what_a_crashed_harness_held_goes_first_when_its_agent_starts_again() -> anyhow::Result<()> {
+        use super::super::model::{Delivery, SendMode};
+        use std::os::unix::fs::PermissionsExt;
+        async fn until(s: &Session, what: &str, done: impl Fn(&Core) -> bool) -> anyhow::Result<()> {
+            let came = crate::rt::timeout(Duration::from_secs(10), async {
+                while !done(&s.core.lock()) {
+                    crate::rt::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await;
+            let core = s.core.lock();
+            anyhow::ensure!(came.is_ok(), "{what} never came: {:?}, its queue {:?}", core.state.status, core.state.queue.iter().map(|q| &q.id).collect::<Vec<_>>());
+            Ok(())
+        }
+        let queue = |c: &Core| c.state.queue.iter().map(|q| q.id.clone()).collect::<Vec<_>>();
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            // A Codex that never opens a thread, and ends (code 3) a moment after it's told to.
+            let crash = dir.path().join("crash");
+            let codex = dir.path().join("stuck-codex");
+            std::fs::write(&codex, format!("#!/bin/sh\nwhile [ ! -e '{}' ]; do sleep 0.05; done\nsleep 0.3\nexit 3\n", crash.display()))?;
+            std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755))?;
+            let (tx, _rx) = async_channel::unbounded();
+            let host = super::super::host::Host::new(tx, None, super::super::host::Limits::default());
+            let spec = Spec { kind: "codex".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), program: Some(codex.to_string_lossy().into_owned()), ..Spec::default() };
+            let s = host.open(Some("held".into()), spec)?;
+            let send = |id: &str| Command::Send { id: id.into(), text: format!("{id}'s words"), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None };
+            until(&s, "its start", |c| !c.meta.features.is_empty()).await?;
+            anyhow::ensure!(s.command(send("m1")));
+            until(&s, "m1 held", |c| c.state.delivery.get("m1") == Some(&Delivery::Queued)).await?;
+            std::fs::write(&crash, "")?;
+            until(&s, "the crash", |c| c.state.status == Status::Exited).await?;
+            assert_eq!(queue(&s.core.lock()), ["m1"]);
+            // Sent while it's down, which starts it again (it ends at once, as it's told to).
+            anyhow::ensure!(s.command(send("m2")));
+            until(&s, "m2 behind m1", |c| queue(c) == ["m1", "m2"]).await?;
+            until(&s, "its second start", |c| c.state.exit.is_none()).await?;
+            until(&s, "its second end", |c| c.state.status == Status::Exited).await?;
+            let core = s.core.lock();
+            assert_eq!(queue(&core), ["m1", "m2"]);
+            assert_eq!((core.state.delivery.get("m1"), core.state.delivery.get("m2")), (Some(&Delivery::Queued), None));
+            drop(core);
+            host.close("held");
+            Ok(())
+        })
+    }
+
     #[test]
     fn an_ended_agent_shows_nothing_still_running() {
         let row = |id: &str, status: &str| Task { id: id.into(), tool_id: Some(format!("call-{id}")), class: Some("shell".into()), status: status.into(), ..Task::default() };
@@ -4325,6 +4401,19 @@ mod tests {
         assert_eq!(core.state.tasks.last().and_then(|t| t.ended), Some(7));
         assert!(core.get("call-terminal-dev").is_some_and(|e| matches!(&e.body, super::super::model::Body::Assistant { streaming: false, .. })));
         assert!(core.take_out().iter().any(|u| matches!(u, Update::State { state } if state.tasks.iter().all(|t| !t.live()))));
+    }
+
+    /// CP-T3.2: an agent ended with a message still waiting to go (held for a harness that had
+    /// ended, shown queued where it was said) says it was dropped, never queued for good; what it
+    /// finished stays done.
+    #[test]
+    fn an_ended_agent_says_what_never_went_was_dropped() {
+        use super::super::model::{Delivery, QueueItem};
+        let mut core = Core::new();
+        core.state.queue.push(QueueItem { id: "m2".into(), text: "and a search".into(), at: 1, attachments: Vec::new(), overrides: None, reply_to: None });
+        core.state.delivery = [("m1".to_owned(), Delivery::Completed), ("m2".to_owned(), Delivery::Queued)].into_iter().collect();
+        end_tasks(&mut core);
+        assert_eq!((core.state.delivery.get("m1"), core.state.delivery.get("m2")), (Some(&Delivery::Completed), Some(&Delivery::Cancelled)));
     }
 
     #[test]
