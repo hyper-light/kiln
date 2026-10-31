@@ -193,9 +193,10 @@ server says, and counts every session it has, ended ones included, until it's up
   purpose (by name, age, activity, runner, harness or cost) is followed as it is.
 - **Requests anywhere.** On any other page (and an agent's page, for the other agents), a card
   says what each agent has for you, the most pressing first: its oldest request (a tool call is
-  allowed or denied there, a plan it proposes approved there, **Review** to keep it planning with
-  what to change; a question opens the agent); goals it paused for you
-  (**Review the plan**, when they wait on one, and **Resume**); a stop of its own, its harness
+  allowed or denied there, a plan it proposes approved there, **Review** to read it, reject it or
+  answer in your own words in its Plan tab, docs/plans.md "Reviewing a plan"; a question opens the
+  agent); goals it paused for you (**Approve** and **Review** when they wait on a plan, else
+  **Resume**); a stop of its own, its harness
   ended with an error (**Restart**); a usage limit it reached, only said, with when it goes on.
   Two at once (one on a phone), then a line for the rest. Where kiln's other notifications are,
   on every screen: at the bottom, above any passing ones. ×, or a swipe, puts one away until

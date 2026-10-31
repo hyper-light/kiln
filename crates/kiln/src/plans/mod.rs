@@ -7,6 +7,7 @@
 pub mod agents;
 pub mod criteria;
 pub mod ops;
+pub mod review;
 pub mod stack;
 
 use rusqlite::{OptionalExtension as _, params};
@@ -55,6 +56,10 @@ pub struct Plan {
     pub phase: String,
     /// Its research: what its steps rest on (`crate::research`).
     pub research: Option<String>,
+    /// The last answer a person gave its review ([`review`]): a plan read alone ([`get`]) has it,
+    /// lists leave it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewed: Option<review::Reviewed>,
 }
 
 /// One step of a plan: a piece of the work, what it's like, what makes it done, and how it's
@@ -666,6 +671,7 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Plan> {
         runs: r.get(9)?,
         phase: r.get(11)?,
         research: r.get(12)?,
+        reviewed: None,
     })
 }
 
@@ -691,9 +697,17 @@ pub async fn list(hub: &Hub, q: Option<String>, tag: Option<String>) -> R<Vec<Pl
         .collect())
 }
 
+/// One plan, with the last answer to its review.
 pub async fn get(hub: &Hub, id: &str) -> R<Plan> {
     let id = id.to_owned();
-    hub.store.call(move |c| Ok(get_in(c, &id)?)).await?.ok_or(Error::Missing)
+    hub.store
+        .call(move |c| {
+            let Some(mut p) = get_in(c, &id)? else { return Ok(None) };
+            p.reviewed = review::last_in(c, &id)?;
+            Ok(Some(p))
+        })
+        .await?
+        .ok_or(Error::Missing)
 }
 
 /// A shared plan, by its link's token.
@@ -828,6 +842,7 @@ pub async fn delete(hub: &Hub, id: &str) -> R<()> {
             let n = tx.execute("DELETE FROM plans WHERE id = ?1", params![id])?;
             tx.execute("DELETE FROM plan_versions WHERE plan_id = ?1", params![id])?;
             tx.execute("DELETE FROM plan_runs WHERE plan_id = ?1", params![id])?;
+            tx.execute("DELETE FROM plan_reviews WHERE plan_id = ?1", params![id])?;
             tx.commit()?;
             Ok(n > 0)
         })
@@ -1296,6 +1311,7 @@ mod tests {
             runs: 0,
             phase: "ready".into(),
             research: None,
+            reviewed: None,
         };
         assert!(message(&p, None).contains("# T\n\n- a\n- b"));
         let headed = Plan { body: "# T\n\n- a\n- b".into(), ..p.clone() };
@@ -1330,6 +1346,7 @@ mod tests {
             runs: 0,
             phase: "ready".into(),
             research: None,
+            reviewed: None,
         };
         let md = markdown(&p);
         assert!(md.starts_with("Why: the scanner grew.\n\n## 1. Split the scanner\n\nMove number scanning"), "{md}");
@@ -1419,6 +1436,7 @@ mod tests {
             runs: 0,
             phase: "ready".into(),
             research: None,
+            reviewed: None,
         };
         let whole = message(&p, Some(2));
         assert!(whole.contains("they go in this order: 1 and 4 side by side, then 2 and 3 side by side, then 5.") && whole.contains("at most 2 at once (your Subagents setting)"), "{whole}");
