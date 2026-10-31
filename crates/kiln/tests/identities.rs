@@ -1948,7 +1948,7 @@ fn w27_r04_an_agents_verdict_is_signed_by_its_runner() -> anyhow::Result<()> {
     std::fs::write(
         &act,
         format!(
-            "#!/bin/sh\ntext=$(cat)\ncase \"$text\" in review\\ *) KILN_SESSION=${{text#review }} ;; *) exit 0 ;; esac\nexport KILN_SESSION\n{{ printf '%s\\n' '{init}' '{call}'; while ! grep -q '\"id\":2' mcp.out 2>/dev/null; do sleep 0.2; done; }} | '{}' reach mcp > mcp.out 2> mcp.err\nprintf '\\n#act-ended\\n' >> mcp.out\n",
+            "#!/bin/sh\ntext=$(cat)\ncase \"$text\" in review\\ *) KILN_SESSION=${{text#review }} ;; *) exit 0 ;; esac\nexport KILN_SESSION\n{{ printf '%s\\n' '{init}' '{call}'; while ! grep -q '\"id\":2' mcp.out 2>/dev/null; do sleep 0.2; done; }} | '{}' reach mcp > mcp.out 2> mcp.err\necho done >> mcp.out\n",
             env!("CARGO_BIN_EXE_kiln")
         ),
     )?;
@@ -1963,8 +1963,9 @@ fn w27_r04_an_agents_verdict_is_signed_by_its_runner() -> anyhow::Result<()> {
     anyhow::ensure!((200..300).contains(&st), "send: {st} {sent}");
     let out = || std::fs::read_to_string(cwd.join("mcp.out")).unwrap_or_default();
     let deadline = Instant::now() + Duration::from_secs(60);
-    // The act's own end, a line no answer is (kiln's MCP instructions say `done`, in `goals_done`).
-    while !out().lines().any(|l| l == "#act-ended") {
+    // The line the script writes once its call is answered: kiln's instructions say "goals_done"
+    // in the first answer already.
+    while !out().lines().any(|l| l.trim() == "done") {
         anyhow::ensure!(Instant::now() < deadline, "the agent's MCP server never answered: {}\n{}", out(), std::fs::read_to_string(cwd.join("mcp.err")).unwrap_or_default());
         std::thread::sleep(Duration::from_millis(200));
     }
