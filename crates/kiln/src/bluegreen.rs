@@ -461,10 +461,27 @@ mod unix {
                     let path=std::env::var_os(crate::bluegreen::SUPERVISOR_ENV).context("missing fixture socket")?;
                     return crate::rt::block_on(async move {
                         crate::rt::timeout(Duration::from_secs(10),async {
-                            let listener=LocalListener::bind(Path::new(&path),4)?;
-                            let stream=listener.accept().await?;
+                            // Observe EOF even if the correctly refusing client has
+                            // already closed. HyperRT may discard that accepted peer.
+                            let listener=std::os::unix::net::UnixListener::bind(Path::new(&path))?;
+                            listener.set_nonblocking(true)?;
+                            let mut stream=loop {
+                                match listener.accept() {
+                                    Ok((stream,_))=>break stream,
+                                    Err(err) if err.kind()==std::io::ErrorKind::WouldBlock=>crate::rt::sleep(Duration::from_millis(20)).await,
+                                    Err(err)=>return Err(err.into()),
+                                }
+                            };
+                            stream.set_nonblocking(true)?;
                             let mut byte=[0u8;1];
-                            assert_eq!(stream.read(&mut byte).await?,0,"wrong-parent client refuses before writing its request");
+                            let n=loop {
+                                match std::io::Read::read(&mut stream,&mut byte) {
+                                    Ok(n)=>break n,
+                                    Err(err) if err.kind()==std::io::ErrorKind::WouldBlock=>crate::rt::sleep(Duration::from_millis(20)).await,
+                                    Err(err)=>return Err(err.into()),
+                                }
+                            };
+                            assert_eq!(n,0,"wrong-parent client refuses before writing its request");
                             std::fs::write(std::env::var_os("KILN_U16_CONTEXT_RESULT").context("missing fixture receipt")?,b"peer-server")?;
                             anyhow::Ok(())
                         }).await?
