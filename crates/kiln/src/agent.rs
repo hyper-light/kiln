@@ -436,6 +436,8 @@ enum Ev {
     Forwarded(Vec<u8>),
     /// Completion of the one retained ordinary durability operation. It never runs children.
     Ordinary(Box<OrdinaryDone>),
+    /// A periodic U01/U03 retry opportunity; its handler only changes the existing latches.
+    OrdinaryRecovery,
     /// An exact buffered receiver ticket whose admission exclusion is already durable.
     OrdinaryInput(crate::wire::channel::OrdinaryTicket),
     /// This SAME local event has already entered the retained outbox.
@@ -479,6 +481,10 @@ enum OrdinaryDone {
 }
 async fn ordinary_completion(io: &mut Option<OrdinaryIo>) -> OrdinaryDone {
     match io.as_mut() { Some(io) => io.await, None => futures::future::pending().await }
+}
+// U01/U03: one loop owns recovery. Healthy ticks add no duplicate spool sampling.
+fn recover_ordinary(paused: &mut bool, sample_due: &mut bool) {
+    if std::mem::take(paused) { *sample_due = true; }
 }
 fn spool_io(mut spool: retained::Spool, work: SpoolWork) -> OrdinaryIo {
     async move {
@@ -1341,7 +1347,7 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
     let mut ordinary_epoch: Result<String,String> = Err("ordinary producer initialization pending".into());
     let mut ordinary_incoming: Option<Incoming> = None;
     let mut ordinary_stream: Option<String> = None;
-    // One failed completion may retry only on the existing sample opportunity. Unknown
+    // One failed completion may retry only on the periodic recovery opportunity. Unknown
     // admission keeps the exact Gate separately and never retries a fresh creation.
     let mut ordinary_paused=false;
     let mut ordinary_pending: Option<PendingOrdinary> = None;
@@ -1744,6 +1750,9 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
     let mut users_path_known = false;
     let mut sampler = crate::host::Sampler::new(Some(&o.work_dir));
     let mut sample_tick = Interval::new(Duration::from_secs(5));
+    // U01/U03: service this existing-runtime cadence even while healthy, so missed ticks
+    // cannot accumulate behind ingress. First tick is immediate; failures never rearm it.
+    let mut ordinary_recovery_tick = Interval::new(Duration::from_secs(5));
     let mut heartbeat = Interval::new(Duration::from_secs(10));
     let mut watchdog = Interval::new(Duration::from_secs(5));
     let mut served_dedicated = false;
@@ -1889,6 +1898,7 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
             futures::select_biased! {
                 ()=shutdown_or_tick(&shutdown,lingering.is_some()).fuse()=>Ev::Shutdown,
                 result=ordinary_completion(&mut ordinary_io).fuse()=>Ev::Ordinary(Box::new(result)),
+                ()=ordinary_recovery_tick.tick().fuse()=>Ev::OrdinaryRecovery,
                 ev=events.recv().fuse()=>Ev::Net(ev.ok()),
                 ()=sample_tick.tick().fuse()=>Ev::Sample,
             }
@@ -1898,17 +1908,19 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
             futures::select_biased! {
                 () = shutdown_or_tick(&shutdown, lingering.is_some()).fuse() => Ev::Shutdown,
                 result = ordinary_completion(&mut ordinary_io).fuse() => Ev::Ordinary(Box::new(result)),
-                ev = events.recv().fuse() => Ev::Net(ev.ok()),
-                () = sample_tick.tick().fuse() => Ev::Sample,
                 () = sleep_until_opt(Some(retry_at)).fuse() => match retained_blocked.take() {
                     Some((up, _)) => Ev::Up(up),
                     None => Ev::Watchdog,
                 },
+                () = ordinary_recovery_tick.tick().fuse() => Ev::OrdinaryRecovery,
+                ev = events.recv().fuse() => Ev::Net(ev.ok()),
+                () = sample_tick.tick().fuse() => Ev::Sample,
             }
         } else if deferred_control.pending.is_empty() {
             futures::select_biased! {
             () = shutdown_or_tick(&shutdown, lingering.is_some()).fuse() => Ev::Shutdown,
             result = ordinary_completion(&mut ordinary_io).fuse() => Ev::Ordinary(Box::new(result)),
+            () = ordinary_recovery_tick.tick().fuse() => Ev::OrdinaryRecovery,
             ev = events.recv().fuse() => Ev::Net(ev.ok()),
             r = done_rx.recv().fuse() => match r { Ok((r, attempt)) => Ev::Done(r, attempt), Err(_) => Ev::Watchdog },
             () = heartbeat.tick().fuse() => Ev::Heartbeat,
@@ -1938,11 +1950,13 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
             futures::select_biased! {
                 () = shutdown_or_tick(&shutdown, lingering.is_some()).fuse() => Ev::Shutdown,
                 result = ordinary_completion(&mut ordinary_io).fuse() => Ev::Ordinary(Box::new(result)),
+                () = ordinary_recovery_tick.tick().fuse() => Ev::OrdinaryRecovery,
                 ev = events.recv().fuse() => Ev::Net(ev.ok()),
                 up = up_rx.recv().fuse() => match up { Ok(up) => Ev::Up(up), Err(_) => Ev::Watchdog },
             }
         };
         match ev {
+            Ev::OrdinaryRecovery => recover_ordinary(&mut ordinary_paused, &mut spool_sample_due),
             Ev::Ordinary(done) => {
                 ordinary_io=None;
                 match *done {
@@ -2008,7 +2022,7 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                                 }
                             }
                         },
-                        Err(error)=>{ordinary_paused=true;tracing::warn!(error=%format!("{error:#}"),"strict completion remains unacknowledged under its exact origin until the existing sample opportunity");},
+                        Err(error)=>{ordinary_paused=true;tracing::warn!(error=%format!("{error:#}"),"strict completion remains unacknowledged under its exact origin until the periodic recovery opportunity");},
                     },
                     OrdinaryDone::Spool{spool,work,result,incoming}=> {
                         let (work,incoming)=(*work,*incoming);
@@ -4388,7 +4402,6 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                 }
             }
             Ev::Sample => {
-                ordinary_paused=false;
                 if connected && welcomed && server_ordinary && ordinary_registered != server_connection && !o.outpost && executor_bootstrap.is_none()
                     && let Ok(epoch) = &ordinary_epoch
                 {
@@ -5368,15 +5381,56 @@ mod tests {
             release.send(()).map_err(|_|anyhow::anyhow!("held storage owner disappeared"))?;
             // A1: readiness is progress, even when ingress is also ready. The four
             // production select modes use this SAME completion-before-Net ordering.
+            let mut recovery_tick=Interval::new(Duration::from_secs(5));
             controls.try_send(Command::Interrupt)?;
             let completed=futures::select_biased! {
                 result=ordinary_completion(&mut io).fuse()=>result,
+                ()=recovery_tick.tick().fuse()=>anyhow::bail!("recovery tick overtook ready retained I/O"),
                 _=events.recv().fuse()=>anyhow::bail!("ready ingress starved the ready retained owner"),
             };
             assert!(matches!(completed,OrdinaryDone::Registered{..}));
             assert_eq!(events.len(),1,"known I/O completion did not consume urgent ingress");
-            assert_eq!(events.try_recv()?,Command::Interrupt);
             assert!(applied.is_empty(),"servicing durability cannot fabricate another control effect");
+            // U01/U03: a due recovery opportunity cannot wait behind ready production
+            // ingress once the retained owner has completed. It changes latches only.
+            io=None;
+            let (mut paused,mut sample_due)=(true,false);
+            let recovered=futures::select_biased! {
+                _=ordinary_completion(&mut io).fuse()=>anyhow::bail!("idle I/O completed"),
+                ()=recovery_tick.tick().fuse()=>Ev::OrdinaryRecovery,
+                _=events.recv().fuse()=>anyhow::bail!("ready ingress starved due recovery"),
+            };
+            match recovered {
+                Ev::OrdinaryRecovery=>recover_ordinary(&mut paused,&mut sample_due),
+                _=>anyhow::bail!("unexpected recovery event"),
+            }
+            assert!(!paused && sample_due,"the same paused closure gets a bounded retry opportunity");
+            assert_eq!(events.len(),1,"pure recovery does not consume urgent ingress");
+            assert!(applied.is_empty(),"recovery cannot invent an effect or durable ACK");
+            // The immediate first tick is consumed even while healthy. The next tick
+            // must wait; another failure cannot rearm an immediately-ready retry loop.
+            paused=true;sample_due=false;
+            let command=futures::select_biased! {
+                ()=recovery_tick.tick().fuse()=>anyhow::bail!("recovery cadence retried hot"),
+                command=events.recv().fuse()=>command?,
+            };
+            assert_eq!(command,Command::Interrupt);
+            assert!(paused && !sample_due,"pending recovery still permits urgent ingress");
+            let (mut healthy,mut healthy_sample)=(false,false);
+            recover_ordinary(&mut healthy,&mut healthy_sample);
+            assert!(!healthy && !healthy_sample,"healthy recovery ticks add no spool sample");
+            // The existing failed retained-publication deadline also precedes ingress,
+            // keeping exactly its original Up value outside the ordinary recovery latch.
+            controls.try_send(Command::ForceStop)?;
+            let retry_at=Instant::now();
+            let retried=futures::select_biased! {
+                _=ordinary_completion(&mut io).fuse()=>anyhow::bail!("idle I/O completed"),
+                ()=sleep_until_opt(Some(retry_at)).fuse()=>true,
+                ()=recovery_tick.tick().fuse()=>anyhow::bail!("future recovery tick completed"),
+                _=events.recv().fuse()=>false,
+            };
+            assert!(retried,"ready ingress starved the original retained-publication deadline");
+            assert_eq!(events.try_recv()?,Command::ForceStop);
             // A known completion records the SAME head, then the contiguous prefix only.
             receiver.ordinary_admitted(&head)?;receiver.ordinary_effect_done(&head,None)?;
             let closure=receiver.ordinary_ready(origin,&nonce,stream)?.context("ordered completion missing")?;
