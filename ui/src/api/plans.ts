@@ -1,5 +1,6 @@
 /** Plans (docs/plans.md): kept, changed, shared and run on any agent. */
 import { request } from "./client";
+import { signed } from "@/lib/signing";
 
 /** The agent a plan came from. */
 export interface PlanSource {
@@ -268,9 +269,35 @@ export const plansApi = {
   /** `tries`: for a retry, the try it replaces (asked again once it was tried again, nothing more starts: CP-T3.2). */
   step: (run: string, n: number, act: "retry" | "take" | "met", tries?: number) =>
     request<PlanRunView>("POST", `/api/plans/runs/${enc(run)}/steps/${n}/${act}`, act === "retry" && tries !== undefined ? { try: tries } : undefined),
+  /**
+   * Take a step over, signed by the person in this browser (docs/ci.md W27-R08): kiln hands it to
+   * them, and their receipt is signed with this browser's own key (lib/signing). Where this browser
+   * can't sign, kiln's receipt for them says why.
+   */
+  take: async (run: string, n: number): Promise<PlanRunView> => {
+    const steps = `/api/plans/runs/${enc(run)}/steps/${n}`;
+    const signs = browserSigns();
+    const v = await request<PlanRunView & { custody?: { kiln_signed_for_you?: string | null } | null }>("POST", `${steps}/take`, { signs });
+    if (!signs || !v.custody || v.custody.kiln_signed_for_you) return v;
+    let why = "kiln is from before a browser signed its receipts";
+    try {
+      const receipt = await signed(`${steps}/statement`, {});
+      if (receipt) {
+        await request("POST", `${steps}/receipt`, { receipt });
+        return v;
+      }
+    } catch (e) {
+      why = `this browser couldn't sign: ${e instanceof Error ? e.message : String(e)}`;
+    }
+    await request("POST", `${steps}/receipt`, { unsigned: why });
+    return v;
+  },
   share: (id: string, on: boolean) => request<Plan>("POST", `/api/plans/${enc(id)}/share`, { on }),
   shared: (token: string, signal?: AbortSignal) => request<SharedPlan>("GET", `/api/shared/plans/${enc(token)}`, undefined, { signal }),
 };
+
+/** Whether this browser signs as its person: WebCrypto and IndexedDB, which a page that isn't secure (https) lacks. */
+export const browserSigns = () => typeof globalThis.crypto?.subtle !== "undefined" && typeof indexedDB !== "undefined";
 
 export const planHref = (id: string) => `/agents/plans/${enc(id)}`;
 export const runHref = (run: string) => `/agents/plans/runs/${enc(run)}`;

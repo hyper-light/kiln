@@ -1027,6 +1027,44 @@ pub async fn receipt(hub: &Hub, run: &str, n: usize, person: &str, receipt: &ser
     }
 }
 
+/// What person `person` signs, in a browser or anywhere kiln says what to sign, to receive step `n`
+/// they took over (docs/ci.md W27-R08): their receipt of the hand-on waiting for them, from whom it
+/// came, as `kiln plans take` builds it. Its payload type, the statement, its bytes and the bytes
+/// signed (DSSE's PAE), those two base64, as a verdict's statement is said (`ci::verdicts::to_sign`).
+pub async fn receipt_statement(hub: &Hub, run: &str, n: usize, person: &str) -> R<serde_json::Value> {
+    use base64::Engine as _;
+    use kiln_ci::identity::custody::{Body, Kind, to_value};
+    use kiln_ci::identity::statement::{self, PAYLOAD_CUSTODY, Statement};
+    let (_, rows) = load_run(hub, run).await?;
+    let row = step_row(&rows, n)?;
+    let work = step_work(run, row);
+    let Some((hand_on, bundle)) = crate::custody::waiting_for(&hub.store, person, &work).await? else {
+        return Err(Error::Bad(format!("nothing of step {n} waits for {person}'s receipt: take it over first")));
+    };
+    let from = crate::custody::giver_of(&bundle).unwrap_or_else(|| crate::custody::server_uri(&hub.pki.organization()));
+    let body = Body { from: Some(from), why: format!("step {n} of plan run {run}, taken over"), ..Body::new(Kind::Received, person) };
+    let s = Statement { subject: vec![work], follows: vec![hand_on], ..Statement::new(to_value(&body)) };
+    let payload = statement::payload(&s).map_err(|e| Error::Bad(e.to_string()))?;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    Ok(serde_json::json!({ "payload_type": PAYLOAD_CUSTODY, "statement": s, "payload": b64.encode(&payload), "pae": b64.encode(statement::to_sign(PAYLOAD_CUSTODY, &payload)), "required": false }))
+}
+
+/// Step `n`, taken over by `person` where they couldn't sign (`missing`: why, as their browser says
+/// it): kiln's receipt for them of the hand-on waiting for them, saying their own signature is
+/// missing and why (docs/ci.md W27-R08). Its digest, and the hand-on's.
+pub async fn receipt_for(hub: &Hub, run: &str, n: usize, person: &str, missing: &str) -> R<serde_json::Value> {
+    let (_, rows) = load_run(hub, run).await?;
+    let row = step_row(&rows, n)?;
+    let work = step_work(run, row);
+    let Some((hand_on, bundle)) = crate::custody::waiting_for(&hub.store, person, &work).await? else {
+        return Err(Error::Bad(format!("nothing of step {n} waits for {person}'s receipt: take it over first")));
+    };
+    let from = crate::custody::giver_of(&bundle).unwrap_or_else(|| crate::custody::server_uri(&hub.pki.organization()));
+    let why = format!("step {n} of plan run {run}, taken over");
+    let digest = crate::custody::receive_for_because(hub, person, work, &hand_on, &from, &why, missing).await?;
+    Ok(serde_json::json!({ "receipt": digest, "hand_on": hand_on, "kiln_signed_for_you": digest }))
+}
+
 /// A person says step `n` is met (one they took over, or one they judge done): the steps waiting
 /// for it start.
 pub async fn met(hub: &Arc<Hub>, run: &str, n: usize, by: &str) -> R<Run> {

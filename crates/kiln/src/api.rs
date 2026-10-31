@@ -924,8 +924,20 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let n: usize = n.parse().map_err(|_| err(StatusCode::BAD_REQUEST, "a step's number, from 1"))?;
             let person = crate::identities::person_identity(&hub.store, &hub.pki.organization(), &caller).await.map_err(|e| err(StatusCode::FORBIDDEN, e.to_string()))?;
             let body = boxed(|| body_value(req)).await?;
+            // A browser that can't sign says why (`unsigned`): kiln's receipt for them, saying so.
+            if let Some(missing) = body.get("unsigned").and_then(serde_json::Value::as_str) {
+                let missing = missing.chars().take(300).collect::<String>();
+                return boxed(|| crate::plans::agents::receipt_for(&hub, run, n, &person, &missing)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err);
+            }
             let receipt = body.get("receipt").cloned().ok_or_else(|| err(StatusCode::BAD_REQUEST, "send your receipt: `receipt`, a Sigstore bundle signed on your device"))?;
             boxed(|| crate::plans::agents::receipt(&hub, run, n, &person, &receipt)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err)
+        }
+        // What a person signs to receive a step they took over, said as a verdict's is, so a
+        // browser signs it with its own key (docs/ci.md W27-R08; ui/src/lib/signing.ts).
+        (&Method::POST, ["api", "plans", "runs", run, "steps", n, "statement"]) => {
+            let n: usize = n.parse().map_err(|_| err(StatusCode::BAD_REQUEST, "a step's number, from 1"))?;
+            let person = crate::identities::person_identity(&hub.store, &hub.pki.organization(), &caller).await.map_err(|e| err(StatusCode::FORBIDDEN, e.to_string()))?;
+            boxed(|| crate::plans::agents::receipt_statement(&hub, run, n, &person)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err)
         }
         (&Method::GET, ["api", "programs"]) => boxed(|| own_op(&hub, &caller, "programs.list", json!({}))).await,
         (&Method::GET, ["api", "programs", id]) => boxed(|| own_op(&hub, &caller, "programs.get", json!({"program": id}))).await,

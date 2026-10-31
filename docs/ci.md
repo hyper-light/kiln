@@ -9268,9 +9268,12 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
   the receipt waits there for the session's identity if it isn't certified yet. A person's side is
   theirs when they sign it on their device: `kiln plans take <run> <n>` takes a step over and signs
   the receipt with the key `kiln login` made (`POST /api/plans/runs/<run>/steps/<n>/take` with
-  `signs`, then `…/receipt`); Ship's Hand off takes the person's own signed hand-on beside it. Without
-  a key, kiln's server signs for them on their signed-in session (a take, or a receipt, `taken_for`
-  the person), saying their own signature is missing and why; a walk reads that link as kiln's for
+  `signs`, then `…/receipt`); a browser signs it with its own key (the signing plan's WebCrypto key,
+  `ui/src/lib/signing.ts`), kiln saying what to sign (`POST …/statement`, as for a verdict); Ship's
+  Hand off takes the person's own signed hand-on beside it. Without a key (a browser on a page
+  that isn't secure, so with no WebCrypto, says so: `…/receipt` with `unsigned`), kiln's server signs
+  for them on their signed-in session (a take, or a receipt, `taken_for` the person), saying their
+  own signature is missing and why; a walk reads that link as kiln's for
   them, never as theirs (`taken_for` on its hop), and the page says in place how to get a key. Once a
   step changes hands, what its former agent says of it is refused and recorded with the transfer
   that superseded it: a goal met for a step tried again or taken over, and, from an agent kiln ended
@@ -9378,8 +9381,8 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
   registry keeps (what its inbox and updates are fenced by) before its transfer is recorded, though
   acts are held to the epoch kiln certified; what a copy left behind does on its own machine
   without kiln goes on until its runner hears from kiln (docs/agents.md, "A copy left behind"); a
-  person signs on their device only through the CLI until the browser has a key of its own (the
-  signing plan's step 4); an agent kiln's server runs itself (`local`) signs no receipt of work
+  person's hand-off from Ship in the browser is still kiln's take for them, not yet signed with the
+  browser's key as a take-over is; an agent kiln's server runs itself (`local`) signs no receipt of work
   handed to it yet, so its hand-on stays unanswered; an agent's give or pass is kiln's take for it
   (its signed act verified), not yet a hand-on its runner signs; a promotion
   from a linked server's environment, which this server's CD doesn't sign for, nor KilnCD's apps'

@@ -170,9 +170,10 @@ waits for instead (**after 2, 3**).
   **Take it over** (kiln stops holding the agent to it; **It's met: go on** when it is).
   Each step changes hands signed (docs/ci.md W27-R08): kiln hands it to its agent, which signs its
   receipt as it takes the step up; tried again, kiln takes it for the agent before; taken over, it
-  goes to you. Your receipt is yours when you sign it on your device (`kiln plans take <run> <n>`,
-  with the key `kiln login` made); taken over in the browser, which has no key, kiln signs it for
-  you, saying your own signature is missing, and the page says so beside the button. The agent
+  goes to you. Your receipt is yours: signed in the browser with its own key (the one it makes for
+  your verdicts), or on your device (`kiln plans take <run> <n>`, with the key `kiln login` made). A
+  browser that can't sign (a page that isn't secure has no WebCrypto) has kiln sign it for you,
+  saying your own signature is missing and why, and the page says so beside the button. The agent
   before you, or before the new try, can't say the step is met: kiln refuses it, and records it.
   **Stop the run** lets every step under way go: their own agents interrupted, and a step's goal
   on an agent it was given to taken out of that agent's stack.
@@ -247,6 +248,7 @@ A plan's written steps are `items` in the API: `[{title, description, examples, 
 | GET | `/api/plans/runs/:run` | a run: each step's `{n, title, goal, stand, needs, given, agent, agent_id, reason, tries}`, its `state`, `reason`, `note` and stack |
 | POST | `/api/plans/runs/:run/stop` | stop it |
 | POST | `/api/plans/runs/:run/steps/:n/{retry,take,met}` | retry a step, take it over (`{signs: true}`: you'll sign your receipt on your device; the answer's `custody` says what to sign), say it's met |
-| POST | `/api/plans/runs/:run/steps/:n/receipt` | `{receipt}`: your receipt of a step you took over, signed on your device |
+| POST | `/api/plans/runs/:run/steps/:n/statement` | what you sign to receive a step you took over: its payload type, statement, payload and the bytes to sign (base64), as a verdict's is said |
+| POST | `/api/plans/runs/:run/steps/:n/receipt` | `{receipt}`: your receipt of a step you took over, signed in the browser or on your device; `{unsigned: why}`: kiln's for you, saying why yours is missing |
 | POST | `/api/plans/:id/share` | `{on}` |
 | GET | `/api/shared/plans/:token` | **open**: a shared plan's title, text and steps |

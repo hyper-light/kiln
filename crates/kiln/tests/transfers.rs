@@ -790,7 +790,7 @@ fn w27_r08_work_handed() -> anyhow::Result<()> {
         anyhow::ensure!((200..300).contains(&st), "{what}: {st} {body}");
         Ok(serde_json::from_str(&body)?)
     };
-    let plan = json_of("the plan", http(port, "POST", "/api/plans", admin, Some(&json!({ "title": "work handed", "body": "- build it\n- test it\n- ship it\n" })))?)?;
+    let plan = json_of("the plan", http(port, "POST", "/api/plans", admin, Some(&json!({ "title": "work handed", "body": "- build it\n- test it\n- ship it\n- document it\n- announce it\n" })))?)?;
     let at = cwd.to_string_lossy().into_owned();
     let ran = json_of("the run", http(port, "POST", &format!("/api/plans/{}/run", field(&plan, "id")), admin, Some(&json!({ "mode": "agents", "parallel": true, "new": { "on": "box-a", "kind": "claude", "cwd": at } })))?)?;
     let run = field(&ran, "run").to_owned();
@@ -815,7 +815,7 @@ fn w27_r08_work_handed() -> anyhow::Result<()> {
     let step = |n: u64| format!("plan run {run} step {n}");
     // Each step's agent takes it up at its first turn: kiln's hand-on, and its receipt.
     let mut firsts = Vec::new();
-    for n in 1..=3 {
+    for n in 1..=5 {
         let a = until(Duration::from_secs(120), || Ok(Some(agent_of(n)?).filter(|a| !a.is_empty())))?;
         let v = received(&step(n), &format!("/agent/{a}/"))?;
         assert_eq!(kinds(&v), ["received", "handed-on"], "{v}");
@@ -865,6 +865,30 @@ fn w27_r08_work_handed() -> anyhow::Result<()> {
     let v = chain_of(&step(3))?;
     let sams = hops(&v).first().cloned().unwrap_or_default();
     assert!(field(&sams, "custodian") == sams_key.uri && sams.get("taken_for").is_none_or(Value::is_null), "sam's own: {sams}");
+    // Step 4 taken over by sam in a browser, which signs with its own key: kiln says what to sign
+    // (as it does a verdict), the browser signs those bytes, and the receipt is sam's own.
+    let (st, body) = ask(port, "POST", &format!("/api/plans/runs/{run}/steps/4/take"), Auth::Cookie(&sam), Some(&json!({ "signs": true })))?;
+    anyhow::ensure!(st == 200, "step 4 taken over by sam: {st} {body}");
+    let (st, body) = ask(port, "POST", &format!("/api/plans/runs/{run}/steps/4/statement"), Auth::Cookie(&sam), Some(&json!({})))?;
+    anyhow::ensure!(st == 200, "what sam signs: {st} {body}");
+    let asked: Value = serde_json::from_str(&body)?;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let (payload, pae) = (base64::Engine::decode(&b64, field(&asked, "payload"))?, base64::Engine::decode(&b64, field(&asked, "pae"))?);
+    let signed = kiln_ci::identity::statement::bundle(field(&asked, "payload_type"), &payload, &rcgen::SigningKey::sign(&sams_key.key, &pae)?, &sams_key.der);
+    let (st, body) = ask(port, "POST", &format!("/api/plans/runs/{run}/steps/4/receipt"), Auth::Cookie(&sam), Some(&json!({ "receipt": signed })))?;
+    anyhow::ensure!(st == 200, "sam's receipt, signed in the browser: {st} {body}");
+    let v = chain_of(&step(4))?;
+    let browsers = hops(&v).first().cloned().unwrap_or_default();
+    assert!(field(&browsers, "custodian") == sams_key.uri && browsers.get("taken_for").is_none_or(Value::is_null), "sam's own, signed in the browser: {browsers}");
+    // Step 5 taken over by sam in a browser that can't sign: kiln's receipt for him, saying why.
+    let (st, body) = ask(port, "POST", &format!("/api/plans/runs/{run}/steps/5/take"), Auth::Cookie(&sam), Some(&json!({ "signs": true })))?;
+    anyhow::ensure!(st == 200, "step 5 taken over by sam: {st} {body}");
+    let missing = "this page isn't secure (https), so this browser has no key";
+    let (st, body) = ask(port, "POST", &format!("/api/plans/runs/{run}/steps/5/receipt"), Auth::Cookie(&sam), Some(&json!({ "unsigned": missing })))?;
+    anyhow::ensure!(st == 200, "kiln's receipt for sam: {st} {body}");
+    let v = chain_of(&step(5))?;
+    let kiln_for_sam = hops(&v).first().cloned().unwrap_or_default();
+    assert!(field(&kiln_for_sam, "custodian").ends_with("/server") && field(&kiln_for_sam, "taken_for").ends_with("/person/sam") && field(&kiln_for_sam, "why").contains(missing), "kiln for sam, saying why: {kiln_for_sam}");
     // A subagent: step 1's agent starts one for a task, handing it on signed.
     let started = ask_as(&second, "agents.start", json!({ "kind": "claude", "prompt": "count the tests", "cwd": at }))?;
     let child = serde_json::from_str::<Value>(&started).ok().and_then(|v| v.pointer("/ok/agents/0/id").and_then(Value::as_str).map(str::to_owned)).ok_or_else(|| anyhow::anyhow!("no subagent started: {started}"))?;
@@ -874,7 +898,7 @@ fn w27_r08_work_handed() -> anyhow::Result<()> {
     let custodians: Vec<String> = hops(&v).iter().map(|h| field(h, "custodian").to_owned()).collect();
     assert!(custodians.get(1).is_some_and(|c| c.ends_with("/server")) && custodians.get(2).is_some_and(|c| c.contains(&format!("/agent/{second}/"))), "{custodians:?}");
     // No transfer without both sides' signatures: every chain unbroken, none open.
-    for name in [step(1), step(2), step(3), task] {
+    for name in [step(1), step(2), step(3), step(4), step(5), task] {
         let v = chain_of(&name)?;
         assert!(v.get("unbroken") == Some(&json!(true)) && v.get("open") != Some(&json!(true)) && half_named(&v) == 0, "{name}: {v}");
     }

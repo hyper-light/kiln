@@ -540,8 +540,14 @@ pub async fn hand_work(hub: &crate::hub::Hub, thing: statement::Subject, to: &st
 /// signed-in session, saying their own signature is missing and why. A walk reads the link as
 /// kiln's for them, never as theirs. Kept at once: its digest.
 pub async fn receive_for(hub: &crate::hub::Hub, person: &str, thing: statement::Subject, hand_on: &str, giver: &str, why: &str) -> anyhow::Result<String> {
+    receive_for_because(hub, person, thing, hand_on, giver, why, "no key on the device that asked").await
+}
+
+/// [`receive_for`], their own signature missing for the reason `missing` (a browser that can't
+/// sign: "this page isn't secure (https), so this browser has no key").
+pub async fn receive_for_because(hub: &crate::hub::Hub, person: &str, thing: statement::Subject, hand_on: &str, giver: &str, why: &str, missing: &str) -> anyhow::Result<String> {
     let org = hub.pki.organization();
-    let why = format!("{why}: kiln's receipt for them, on their signed-in session; their own signature is missing: no key on the device that asked");
+    let why = format!("{why}: kiln's receipt for them, on their signed-in session; their own signature is missing: {missing}");
     let body = custody::Body { from: Some(giver.to_owned()), taken_for: Some(person.to_owned()), why, ..custody::Body::new(Kind::Received, &server_uri(&org)) };
     let s = statement::Statement { subject: vec![thing], follows: vec![hand_on.to_owned()], ..statement::Statement::new(custody::to_value(&body)) };
     let bundle = server_signed(&hub.pki, &s)?;

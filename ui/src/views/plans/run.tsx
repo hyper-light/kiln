@@ -9,7 +9,7 @@ import * as React from "react";
 import { Link, useParams } from "@/lib/router";
 import { changesRes, changeWords } from "@/api/changes";
 import { ApiError } from "@/api/client";
-import { planHref, plansApi, type PlanRunView, type RunStack, type RunStep, type StackStep, type StepStand } from "@/api/plans";
+import { browserSigns, planHref, plansApi, type PlanRunView, type RunStack, type RunStep, type StackStep, type StepStand } from "@/api/plans";
 import { Button } from "@/components/ui/button";
 import { RowsHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
@@ -126,7 +126,7 @@ function Run({ v, onChange }: { v: PlanRunView; onChange: (v: PlanRunView) => vo
       {v.state !== "running" && error && <span className="plan-error">{error}</span>}
       <ol className="run-steps">
         {v.steps.map((s) => (
-          <Step key={s.n} run={v.id} s={s} stack={v.stack} busy={busy} onAct={(a) => void act(`${s.n}:${a}`, () => plansApi.step(v.id, s.n, a, s.tries))} />
+          <Step key={s.n} run={v.id} s={s} stack={v.stack} busy={busy} onAct={(a) => void act(`${s.n}:${a}`, () => (a === "take" ? plansApi.take(v.id, s.n) : plansApi.step(v.id, s.n, a, s.tries)))} />
         ))}
       </ol>
     </>
@@ -243,7 +243,14 @@ function Step({ run, s, stack, busy, onAct }: { run: string; s: RunStep; stack: 
       )}
       {(live || s.stand === "unmet" || s.stand === "stopped") && (
         <p className="plan-dim run-what">
-          Taken over here, kiln signs your receipt of it for you: this browser has no key. To sign it yourself, <code>kiln login</code>, then <code>{`kiln plans take ${run} ${s.n}`}</code>.
+          {browserSigns() ? (
+            "Taken over here, you sign your receipt of it in this browser, with its own key."
+          ) : (
+            <>
+              Taken over here, kiln signs your receipt of it for you: this page isn't secure (https), so this browser has no key. To sign it yourself, <code>kiln login</code>, then{" "}
+              <code>{`kiln plans take ${run} ${s.n}`}</code>.
+            </>
+          )}
         </p>
       )}
     </li>
