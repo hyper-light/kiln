@@ -887,12 +887,11 @@ impl Scheduler {
                 || self.executor_bindings.values().any(|b|b.job==*job && b.attempt==*attempt) {
                 return Err(format!("`{job}` still owns an executor grant"));
             }
-            if let Some(leg)=self.legs.get(job) {
-                if leg.attempt!=*attempt || !matches!(leg.state,State::Queued|State::Retrying {..})
+            if let Some(leg)=self.legs.get(job)
+                && (leg.attempt!=*attempt || !matches!(leg.state,State::Queued|State::Retrying {..})
                     || leg.input.external || leg.input.retained.is_some() || leg.input.parent_binding.is_some()
-                    || leg.input.group.is_some() || leg.input.admission.is_some() || leg.input.work.is_some() {
-                    return Err(format!("`{job}` is not the original unexposed pipeline queue demand"));
-                }
+                    || leg.input.group.is_some() || leg.input.admission.is_some() || leg.input.work.is_some()) {
+                return Err(format!("`{job}` is not the original unexposed pipeline queue demand"));
             }
         }
         let mut legs=Vec::new();

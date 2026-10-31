@@ -322,12 +322,10 @@ fn observed_page(conn:&Connection<'_>,sweep:&mut Sweep<Position>,before:i64)->an
     let read=|r:&crate::sql::Row<'_>|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?));
     let rows=if let Some(after)=&sweep.after {
         let mut q=conn.prepare("SELECT observed_ms,session FROM convo_retention WHERE (observed_ms,session)>(?1,?2) AND (observed_ms,session)<=(?3,?4) AND observed_ms<?5 ORDER BY observed_ms,session LIMIT ?6")?;
-        let rows=q.query_map(params![after.0,after.1,horizon.0,horizon.1,before,super::LET_GO_BATCH],read)?.collect::<crate::sql::Result<Vec<_>>>()?;
-        rows
+        q.query_map(params![after.0,after.1,horizon.0,horizon.1,before,super::LET_GO_BATCH],read)?.collect::<crate::sql::Result<Vec<_>>>()?
     }else{
         let mut q=conn.prepare("SELECT observed_ms,session FROM convo_retention WHERE (observed_ms,session)<=(?1,?2) AND observed_ms<?3 ORDER BY observed_ms,session LIMIT ?4")?;
-        let rows=q.query_map(params![horizon.0,horizon.1,before,super::LET_GO_BATCH],read)?.collect::<crate::sql::Result<Vec<_>>>()?;
-        rows
+        q.query_map(params![horizon.0,horizon.1,before,super::LET_GO_BATCH],read)?.collect::<crate::sql::Result<Vec<_>>>()?
     };
     if rows.len()<usize::try_from(super::LET_GO_BATCH)? || rows.last()==Some(&horizon) {sweep.after=None;sweep.horizon=None;}else if let Some(last)=rows.last() {sweep.after=Some(last.clone());sweep.horizon=Some(horizon);}
     Ok(rows.into_iter().map(|(_,session)|session).collect())
@@ -347,12 +345,10 @@ fn generation_page(conn:&Connection<'_>,sweep:&mut Sweep<String>)->anyhow::Resul
     let Some(horizon)=horizon else {sweep.after=None;sweep.horizon=None;return Ok(Vec::new())};
     let rows=if let Some(after)=&sweep.after {
         let mut q=conn.prepare("SELECT session FROM transcript_archives WHERE session>?1 AND session<=?2 ORDER BY session LIMIT 32")?;
-        let rows=q.query_map(params![after,horizon],|r|r.get::<_,String>(0))?.collect::<crate::sql::Result<Vec<_>>>()?;
-        rows
+        q.query_map(params![after,horizon],|r|r.get::<_,String>(0))?.collect::<crate::sql::Result<Vec<_>>>()?
     }else{
         let mut q=conn.prepare("SELECT session FROM transcript_archives WHERE session<=?1 ORDER BY session LIMIT 32")?;
-        let rows=q.query_map([&horizon],|r|r.get::<_,String>(0))?.collect::<crate::sql::Result<Vec<_>>>()?;
-        rows
+        q.query_map([&horizon],|r|r.get::<_,String>(0))?.collect::<crate::sql::Result<Vec<_>>>()?
     };
     if rows.len()<32 || rows.last()==Some(&horizon) {sweep.after=None;sweep.horizon=None;}else if let Some(last)=rows.last() {sweep.after=Some(last.clone());sweep.horizon=Some(horizon);}
     Ok(rows)
@@ -368,12 +364,10 @@ fn pending_page(conn:&Connection<'_>,sweep:&mut Sweep<Position>,now:i64)->anyhow
     let read=|r:&crate::sql::Row<'_>|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?));
     let rows=if let Some(after)=&sweep.after {
         let mut q=conn.prepare("SELECT due_ms,session FROM transcript_archives WHERE status='pending' AND (status,due_ms,session)>(?1,?2,?3) AND (status,due_ms,session)<=(?1,?4,?5) AND due_ms<=?6 ORDER BY status,due_ms,session LIMIT ?7")?;
-        let rows=q.query_map(params!["pending",after.0,after.1,horizon.0,horizon.1,now,super::BATCH],read)?.collect::<crate::sql::Result<Vec<_>>>()?;
-        rows
+        q.query_map(params!["pending",after.0,after.1,horizon.0,horizon.1,now,super::BATCH],read)?.collect::<crate::sql::Result<Vec<_>>>()?
     }else{
         let mut q=conn.prepare("SELECT due_ms,session FROM transcript_archives WHERE status='pending' AND (status,due_ms,session)<=(?1,?2,?3) AND due_ms<=?4 ORDER BY status,due_ms,session LIMIT ?5")?;
-        let rows=q.query_map(params!["pending",horizon.0,horizon.1,now,super::BATCH],read)?.collect::<crate::sql::Result<Vec<_>>>()?;
-        rows
+        q.query_map(params!["pending",horizon.0,horizon.1,now,super::BATCH],read)?.collect::<crate::sql::Result<Vec<_>>>()?
     };
     if rows.len()<usize::try_from(super::BATCH)? || rows.last()==Some(&horizon) {sweep.after=None;sweep.horizon=None;}else if let Some(last)=rows.last() {sweep.after=Some(last.clone());sweep.horizon=Some(horizon);}
     Ok(rows.into_iter().map(|(_,session)|session).collect())

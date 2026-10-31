@@ -271,8 +271,8 @@ async fn archive_in(hub: &Hub, convo: &crate::convo::store::Store, session: &str
                 match pieces(hub,convo,&capture,source,limits).await {
                     Ok(n)=>written=written.checked_add(n).ok_or_else(||anyhow::anyhow!("archive piece count overflow"))?,
                     Err(error)=>{
-                        if error.downcast_ref::<UnresolvedPut>().is_some() {
-                            if let Err(refusal)=receipt::abandon(hub,&capture).await {return Err(error.context(format!("unresolved capture pointer could not be released: {refusal:#}")));}
+                        if error.downcast_ref::<UnresolvedPut>().is_some() && let Err(refusal)=receipt::abandon(hub,&capture).await {
+                            return Err(error.context(format!("unresolved capture pointer could not be released: {refusal:#}")));
                         }
                         return Err(error);
                     },

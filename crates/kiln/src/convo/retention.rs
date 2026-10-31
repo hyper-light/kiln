@@ -247,12 +247,10 @@ pub(crate) fn backfill_step(conn: &Connection<'_>, authority: &Authority) -> any
         let rows=if let Some(horizon)=horizon.sessions {
             if let Some(after)=&cursor.sessions {
                 let mut q=conn.prepare("SELECT id FROM convo_sessions WHERE id>?1 AND id<=?2 ORDER BY id LIMIT 64")?;
-                let rows=q.query_map(params![after,horizon],|r|r.get::<_,String>(0))?.collect::<crate::sql::Result<Vec<_>>>()?;
-                rows
+                q.query_map(params![after,horizon],|r|r.get::<_,String>(0))?.collect::<crate::sql::Result<Vec<_>>>()?
             }else{
                 let mut q=conn.prepare("SELECT id FROM convo_sessions WHERE id<=?1 ORDER BY id LIMIT 64")?;
-                let rows=q.query_map([horizon],|r|r.get::<_,String>(0))?.collect::<crate::sql::Result<Vec<_>>>()?;
-                rows
+                q.query_map([horizon],|r|r.get::<_,String>(0))?.collect::<crate::sql::Result<Vec<_>>>()?
             }
         }else{Vec::new()};
         for session in &rows {
@@ -266,12 +264,10 @@ pub(crate) fn backfill_step(conn: &Connection<'_>, authority: &Authority) -> any
         let rows=if let Some((hs,hsrc,hn))=horizon.records {
             if let Some(after)=&cursor.records {
                 let mut q=conn.prepare("SELECT session,source,n FROM convo_records WHERE (session,source,n)>(?1,?2,?3) AND (session,source,n)<=(?4,?5,?6) ORDER BY session,source,n LIMIT 128")?;
-                let rows=q.query_map(params![after.0,after.1,after.2,hs,hsrc,hn],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?)))?.collect::<crate::sql::Result<Vec<_>>>()?;
-                rows
+                q.query_map(params![after.0,after.1,after.2,hs,hsrc,hn],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?)))?.collect::<crate::sql::Result<Vec<_>>>()?
             }else{
                 let mut q=conn.prepare("SELECT session,source,n FROM convo_records WHERE (session,source,n)<=(?1,?2,?3) ORDER BY session,source,n LIMIT 128")?;
-                let rows=q.query_map(params![hs,hsrc,hn],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?)))?.collect::<crate::sql::Result<Vec<_>>>()?;
-                rows
+                q.query_map(params![hs,hsrc,hn],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?)))?.collect::<crate::sql::Result<Vec<_>>>()?
             }
         }else{Vec::new()};
         let mut mutations=Mutations::default();
