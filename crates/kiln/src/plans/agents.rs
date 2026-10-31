@@ -1029,12 +1029,10 @@ pub async fn receipt(hub: &Hub, run: &str, n: usize, person: &str, receipt: &ser
 
 /// What person `person` signs, in a browser or anywhere kiln says what to sign, to receive step `n`
 /// they took over (docs/ci.md W27-R08): their receipt of the hand-on waiting for them, from whom it
-/// came, as `kiln plans take` builds it. Its payload type, the statement, its bytes and the bytes
-/// signed (DSSE's PAE), those two base64, as a verdict's statement is said (`ci::verdicts::to_sign`).
+/// came, as `kiln plans take` builds it, said as `custody::to_sign` says it.
 pub async fn receipt_statement(hub: &Hub, run: &str, n: usize, person: &str) -> R<serde_json::Value> {
-    use base64::Engine as _;
     use kiln_ci::identity::custody::{Body, Kind, to_value};
-    use kiln_ci::identity::statement::{self, PAYLOAD_CUSTODY, Statement};
+    use kiln_ci::identity::statement::Statement;
     let (_, rows) = load_run(hub, run).await?;
     let row = step_row(&rows, n)?;
     let work = step_work(run, row);
@@ -1044,9 +1042,7 @@ pub async fn receipt_statement(hub: &Hub, run: &str, n: usize, person: &str) -> 
     let from = crate::custody::giver_of(&bundle).unwrap_or_else(|| crate::custody::server_uri(&hub.pki.organization()));
     let body = Body { from: Some(from), why: format!("step {n} of plan run {run}, taken over"), ..Body::new(Kind::Received, person) };
     let s = Statement { subject: vec![work], follows: vec![hand_on], ..Statement::new(to_value(&body)) };
-    let payload = statement::payload(&s).map_err(|e| Error::Bad(e.to_string()))?;
-    let b64 = base64::engine::general_purpose::STANDARD;
-    Ok(serde_json::json!({ "payload_type": PAYLOAD_CUSTODY, "statement": s, "payload": b64.encode(&payload), "pae": b64.encode(statement::to_sign(PAYLOAD_CUSTODY, &payload)), "required": false }))
+    crate::custody::to_sign(&s).map_err(|e| Error::Bad(e.to_string()))
 }
 
 /// Step `n`, taken over by `person` where they couldn't sign (`missing`: why, as their browser says

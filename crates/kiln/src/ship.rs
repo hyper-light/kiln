@@ -1797,12 +1797,65 @@ const HANDED_LINES: usize = 40;
 /// way its comments reach it (docs/agentic.md C3). A failure with no agent of its own goes to the
 /// agent attached to what failed, as the failure itself wakes it (an incident, W20-R08). Each is
 /// kept (`ship_handoffs`), so the row says who is on it; with nothing open, or no agent to take it,
-/// it says why. As the caller, with `runs.rerun` on the repository, as Retry asks.
+/// it says why. As the caller, with `runs.rerun` on the repository, as Retry asks. The person's side
+/// is signed (docs/ci.md W27-R08): their own hand-on beside it (`hand_on`), else kiln's take for
+/// them, saying why it isn't theirs (`unsigned`: their browser's reason).
 pub async fn hand_off(hub: &std::sync::Arc<Hub>, caller: &crate::authz::Caller, body: &Value) -> Result<Response, Fail> {
     hand_off_in(hub, caller, body).await.map(|v| srv::json(StatusCode::OK, &v))
 }
 
-async fn hand_off_in(hub: &std::sync::Arc<Hub>, caller: &crate::authz::Caller, body: &Value) -> Result<Value, Fail> {
+/// `POST /api/ship/hand-off/statement` `{repo, sha}`: what a person signs to hand the commit off from
+/// a browser, with the browser's own key (docs/ci.md W27-R08; `ui/src/lib/signing.ts`), said as a
+/// verdict's is. It's their hand-on of what's open of it to kiln's server, which passes it on
+/// unchanged to the agent that takes it, since kiln knows who that is only as it hands it
+/// ([`hand_off`], with the signed hand-on as `hand_on`). Refused as Hand off would be.
+pub async fn hand_off_statement(hub: &std::sync::Arc<Hub>, caller: &crate::authz::Caller, body: &Value) -> Result<Response, Fail> {
+    hand_off_statement_in(hub, caller, body).await.map(|v| srv::json(StatusCode::OK, &v))
+}
+
+async fn hand_off_statement_in(hub: &std::sync::Arc<Hub>, caller: &crate::authz::Caller, body: &Value) -> Result<Value, Fail> {
+    use kiln_ci::identity::custody::{Body, Kind, to_value};
+    use kiln_ci::identity::statement::Statement;
+    let h = handing(hub, caller, body).await?;
+    let org = hub.pki.organization();
+    let person = crate::identities::person_identity(&hub.store, &org, caller).await.map_err(|e| (StatusCode::FORBIDDEN, e.to_string()))?;
+    let what = h.what().join(", ");
+    let b = Body { to: Some(crate::custody::server_uri(&org)), why: handed_why(&h.rec, &what), ..Body::new(Kind::HandedOn, &person) };
+    let s = Statement { subject: vec![handed_work(&h.rec, &what)], ..Statement::new(to_value(&b)) };
+    crate::custody::to_sign(&s).map_err(internal)
+}
+
+/// A commit's Hand off as kiln decides it, before anything is handed: the commit, its journey, and
+/// its change's author's agent while that runs (its id and name), which takes all that's open;
+/// without one, its failure goes to the agent attached to what failed.
+struct Handing {
+    rec: Records,
+    j: Journey,
+    running: Option<(String, String)>,
+}
+
+impl Handing {
+    /// What's open: a change's conflicts and threads, at its live revision only, and a failure
+    /// while no one has it.
+    fn open(&self) -> (&[kiln_ci::review::Conflict], &[ThreadRec], Option<&LegRec>) {
+        let live = self.rec.change.as_ref().filter(|_| self.j.review.as_ref().is_some_and(|r| r.superseded_by.is_none()));
+        let (conflicts, threads) = live.map(|ch| (ch.conflicts.as_slice(), ch.threads.as_slice())).unwrap_or_default();
+        (conflicts, threads, failed_leg(&self.rec).filter(|_| self.j.handled_by.is_none()))
+    }
+
+    /// What its taker is handed: all that's open, to the author's agent; else the failed checks.
+    fn what(&self) -> Vec<&'static str> {
+        if self.running.is_none() || self.rec.change.is_none() {
+            return vec!["checks"];
+        }
+        let (conflicts, threads, failed) = self.open();
+        [(!conflicts.is_empty(), "conflicts"), (!threads.is_empty(), "threads"), (failed.is_some(), "checks")].into_iter().filter_map(|(y, w)| y.then_some(w)).collect()
+    }
+}
+
+/// `body`'s commit's Hand off, decided ([`Handing`]): refused when the caller can't hand it off,
+/// when nothing is open, or when no one could take it.
+async fn handing(hub: &std::sync::Arc<Hub>, caller: &crate::authz::Caller, body: &Value) -> Result<Handing, Fail> {
     let field = |k: &str| body.get(k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
     let (Some(repo), Some(sha)) = (field("repo"), field("sha")) else {
         return Err((StatusCode::BAD_REQUEST, "`repo` and `sha`: the commit to hand off".to_string()));
@@ -1810,43 +1863,29 @@ async fn hand_off_in(hub: &std::sync::Arc<Hub>, caller: &crate::authz::Caller, b
     if !caller.can("runs.rerun", &crate::authz::Scope::Repo { repo: repo.clone() }) {
         return Err((StatusCode::FORBIDDEN, format!("handing off needs `runs.rerun` on {repo}")));
     }
-    let (r, s, deploys) = (repo.clone(), sha.clone(), cd_deploys());
-    let rec = hub.store.call(move |c| load(c, &r, &s, &deploys)).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, "no such commit".to_string()))?;
+    let deploys = cd_deploys();
+    let rec = hub.store.call(move |c| load(c, &repo, &sha, &deploys)).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, "no such commit".to_string()))?;
     let j = journey_of(&rec, &runners_seen(hub).await, crate::util::now_ms());
-    // A change's review is handed at its live revision only; a failure while no one has it.
-    let live = rec.change.as_ref().filter(|_| j.review.as_ref().is_some_and(|r| r.superseded_by.is_none()));
-    let (conflicts, threads) = live.map(|ch| (ch.conflicts.as_slice(), ch.threads.as_slice())).unwrap_or_default();
-    let failed = failed_leg(&rec).filter(|_| j.handled_by.is_none());
-    let at = short(&rec.sha);
-    if conflicts.is_empty() && threads.is_empty() && failed.is_none() {
-        return Err((StatusCode::CONFLICT, format!("{at} has nothing open to hand off")));
-    }
-    let base = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
-    let author = rec.change.as_ref().and_then(authors_agent);
-    let running = match author {
+    let author = rec.change.as_ref().and_then(authors_agent).map(str::to_owned);
+    let running = match &author {
         Some(id) => {
-            let agent = crate::workspace::change::of(hub, id).await.map_or_else(|| id.to_owned(), |r| r.agent);
-            hub.harness.info(&agent).filter(|i| i.status != crate::harness::model::Status::Exited)
+            let agent = crate::workspace::change::of(hub, id).await.map_or_else(|| id.clone(), |r| r.agent);
+            hub.harness.info(&agent).filter(|i| i.status != crate::harness::model::Status::Exited).map(|i| (i.id, i.name))
         }
         None => None,
     };
-    if let (Some(info), Some(ch)) = (running, rec.change.as_ref()) {
-        let excerpt = match failed {
-            Some(leg) => crate::ci::logsearch::failure(hub, &leg.job, HANDED_LINES).await.ok(),
-            None => None,
-        };
-        let text = handed_text(&rec, ch, conflicts, threads, failed.map(|l| (l, excerpt.as_ref())), &base, &caller.name);
-        if !crate::workspace::follow::deliver(hub, &info.id, text).await {
-            return Err((StatusCode::BAD_GATEWAY, format!("{} didn't get it: kiln couldn't reach it", info.name)));
-        }
-        let what: Vec<&str> = [(!conflicts.is_empty(), "conflicts"), (!threads.is_empty(), "threads"), (failed.is_some(), "checks")].into_iter().filter_map(|(y, w)| y.then_some(w)).collect();
-        keep(hub, &rec, &what, &info.name, Some(&info.id), None, Some(ch.n), &caller.name).await?;
-        let custody = hand_off_signed(hub, caller, &rec, &what, &info.id, body.get("hand_on")).await;
-        return Ok(json!({ "handed": { "to": info.name, "agent": info.id, "what": what }, "custody": custody }));
+    let h = Handing { rec, j, running };
+    let (nothing, failure) = {
+        let (conflicts, threads, failed) = h.open();
+        (conflicts.is_empty() && threads.is_empty() && failed.is_none(), failed.is_some())
+    };
+    let at = short(&h.rec.sha);
+    if nothing {
+        return Err((StatusCode::CONFLICT, format!("{at} has nothing open to hand off")));
     }
-    // No agent of its own: a failure goes to what looks after it; a change's review has no one.
-    let Some(leg) = failed else {
-        let name = rec.change.as_ref().map_or_else(|| at.clone(), |ch| ch.name.clone());
+    // No agent of its own and nothing failed: a change's review has no one to go to.
+    if (h.running.is_none() || h.rec.change.is_none()) && !failure {
+        let name = h.rec.change.as_ref().map_or(at, |ch| ch.name.clone());
         return Err((
             StatusCode::CONFLICT,
             match author {
@@ -1854,13 +1893,39 @@ async fn hand_off_in(hub: &std::sync::Arc<Hub>, caller: &crate::authz::Caller, b
                 None => format!("{name} is its author's own: no agent of its author to hand it to"),
             },
         ));
+    }
+    Ok(h)
+}
+
+async fn hand_off_in(hub: &std::sync::Arc<Hub>, caller: &crate::authz::Caller, body: &Value) -> Result<Value, Fail> {
+    let h = handing(hub, caller, body).await?;
+    let (rec, what) = (&h.rec, h.what());
+    let (conflicts, threads, failed) = h.open();
+    let at = short(&rec.sha);
+    let base = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
+    if let (Some((id, name)), Some(ch)) = (h.running.as_ref(), rec.change.as_ref()) {
+        let excerpt = match failed {
+            Some(leg) => crate::ci::logsearch::failure(hub, &leg.job, HANDED_LINES).await.ok(),
+            None => None,
+        };
+        let text = handed_text(rec, ch, conflicts, threads, failed.map(|l| (l, excerpt.as_ref())), &base, &caller.name);
+        if !crate::workspace::follow::deliver(hub, id, text).await {
+            return Err((StatusCode::BAD_GATEWAY, format!("{name} didn't get it: kiln couldn't reach it")));
+        }
+        keep(hub, rec, &what, name, Some(id), None, Some(ch.n), &caller.name).await?;
+        let custody = hand_off_signed(hub, caller, rec, &what, id, body).await;
+        return Ok(json!({ "handed": { "to": name, "agent": id, "what": what }, "custody": custody }));
+    }
+    // No agent of its own: its failure goes to what looks after it ([`handing`] saw one).
+    let Some(leg) = failed else {
+        return Err((StatusCode::CONFLICT, format!("{at} has nothing open to hand off")));
     };
     let Some(notice) = crate::ci::notify::failed_notice(hub, &leg.run_id).await else {
         return Err((StatusCode::NOT_FOUND, format!("no run {} to hand off", leg.run_id)));
     };
     let t = crate::ci::attach::failure_of(hub, &notice, "failure").await;
     let Some(a) = crate::ci::attach::all(hub).await.into_iter().find(|a| crate::ci::attach::looks_after(a, &t.about)) else {
-        return Err((StatusCode::CONFLICT, format!("No agent looks after {repo}: attach one on its page in Repos (an agent woken by failures), and Hand off gives it {at}")));
+        return Err((StatusCode::CONFLICT, format!("No agent looks after {}: attach one on its page in Repos (an agent woken by failures), and Hand off gives it {at}", rec.repo)));
     };
     let Some(i) = crate::ci::attach::wake(hub, &a, &t).await else {
         return Err((StatusCode::CONFLICT, format!("{} didn't take {at}", a.name)));
@@ -1868,21 +1933,35 @@ async fn hand_off_in(hub: &std::sync::Arc<Hub>, caller: &crate::authz::Caller, b
     let Some(agent) = i.agent.clone() else {
         return Err((StatusCode::CONFLICT, format!("{} didn't take {at}: {}", a.name, i.why.unwrap_or_else(|| "its incident waits on a person".to_string()))));
     };
-    keep(hub, &rec, &["checks"], &a.name, Some(&agent), Some(&i.id), None, &caller.name).await?;
-    let custody = hand_off_signed(hub, caller, &rec, &["checks"], &agent, body.get("hand_on")).await;
-    Ok(json!({ "handed": { "to": a.name, "agent": agent, "incident": i.id, "what": ["checks"] }, "custody": custody }))
+    keep(hub, rec, &what, &a.name, Some(&agent), Some(&i.id), None, &caller.name).await?;
+    let custody = hand_off_signed(hub, caller, rec, &what, &agent, body).await;
+    Ok(json!({ "handed": { "to": a.name, "agent": agent, "incident": i.id, "what": what }, "custody": custody }))
+}
+
+/// The work a hand-off of `rec`'s commit hands (`what`: its checks, threads or conflicts), by its
+/// repository, commit and what (`kiln-work-v1`).
+fn handed_work(rec: &Records, what: &str) -> kiln_ci::identity::statement::Subject {
+    crate::custody::work(&format!("{}@{} {what}", rec.repo, short(&rec.sha)), &[&rec.repo, &rec.sha, what])
+}
+
+/// Why a hand-off's records say it changed hands.
+fn handed_why(rec: &Records, what: &str) -> String {
+    format!("handed off: {what} of {}@{}", rec.repo, short(&rec.sha))
 }
 
 /// What `caller` handed agent session `agent` of `rec`'s commit (`what`: its checks, threads or
 /// conflicts) changes hands signed (docs/ci.md W27-R08; the Transfers plan's step 6). The person's
-/// own hand-on when they sent one (`signed`, signed on their device: a hand-on of that work to the
-/// agent), else kiln's take for them on their signed-in session, saying their own signature is
-/// missing; the agent signs its receipt as it takes the work up, at its next turn. What the answer
-/// says of it: the hand-on, and whether kiln signed it for them.
-async fn hand_off_signed(hub: &Hub, caller: &crate::authz::Caller, rec: &Records, what: &[&str], agent: &str, signed: Option<&Value>) -> Value {
+/// own hand-on when they sent one (`hand_on` in `body`, signed on their device), of that work to the
+/// agent, or, from a browser, which signs before kiln knows who takes it, to kiln's server, which
+/// passes it on unchanged to the agent (a relay's record). Else kiln's take for them on their
+/// signed-in session, saying their own signature is missing and why: their browser's reason
+/// (`unsigned`), the one they sent refused, or no key on the device that asked. The agent signs its
+/// receipt as it takes the work up, at its next turn. What the answer says of it: the hand-on, what
+/// kiln passed on, and whether kiln signed it for them.
+async fn hand_off_signed(hub: &Hub, caller: &crate::authz::Caller, rec: &Records, what: &[&str], agent: &str, body: &Value) -> Value {
     let org = hub.pki.organization();
     let what = what.join(", ");
-    let thing = crate::custody::work(&format!("{}@{} {what}", rec.repo, short(&rec.sha)), &[&rec.repo, &rec.sha, &what]);
+    let thing = handed_work(rec, &what);
     let person = crate::identities::person_identity(&hub.store, &org, caller).await.unwrap_or_else(|_| crate::custody::person_uri(&org, &crate::identities::person_of(&caller.name)));
     let to = match crate::identities::agent_at(hub, agent, hub.harness.epoch_of(agent)).await {
         Ok(to) => to,
@@ -1891,19 +1970,40 @@ async fn hand_off_signed(hub: &Hub, caller: &crate::authz::Caller, rec: &Records
             return Value::Null;
         }
     };
-    let why = format!("handed off: {what} of {}@{}", rec.repo, short(&rec.sha));
-    // Their own, signed on their device: kept if it's theirs, and of this work to this agent.
-    if let Some(bundle) = signed {
-        match crate::custody::person_hand_on(hub, &person, &to, &thing, bundle, &format!("api:{}", caller.name)).await {
+    let why = handed_why(rec, &what);
+    let mut missing = body.get("unsigned").and_then(Value::as_str).map(|m| m.chars().take(300).collect::<String>());
+    // Their own, signed on their device: kept if it's theirs, of this work, to this agent or to kiln.
+    if let Some(bundle) = body.get("hand_on") {
+        let server = crate::custody::server_uri(&org);
+        let via_kiln = crate::custody::hand_on_to(bundle).is_some_and(|t| t == server);
+        let kept = crate::custody::person_hand_on(hub, &person, if via_kiln { &server } else { &to }, &thing, bundle, &format!("api:{}", caller.name)).await;
+        match kept {
+            Ok(Ok(digest)) if via_kiln => {
+                let passed = crate::custody::pass_on(hub, vec![thing], &digest, &person, &to, "handed off from Ship, passed on unchanged to the agent that took it").await;
+                return match passed {
+                    Ok((passed, bundle)) => {
+                        crate::custody::ask_receipt(hub, agent, &bundle).await;
+                        json!({ "hand_on": digest, "passed_on": passed, "kiln_signed_for_you": false })
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "kiln.custody", %agent, error = %format!("{e:#}"), "a person's hand-off to kiln wasn't passed on to its agent");
+                        json!({ "hand_on": digest, "kiln_signed_for_you": false })
+                    }
+                };
+            }
             Ok(Ok(digest)) => {
                 crate::custody::ask_receipt(hub, agent, bundle).await;
                 return json!({ "hand_on": digest, "kiln_signed_for_you": false });
             }
-            Ok(Err(why)) => tracing::info!(target: "kiln.custody", %agent, %why, "a person's own hand-off refused: kiln signs it for them"),
+            Ok(Err(why)) => {
+                tracing::info!(target: "kiln.custody", %agent, %why, "a person's own hand-off refused: kiln signs it for them");
+                missing = Some(format!("the one they sent was refused ({why})"));
+            }
             Err(e) => tracing::warn!(target: "kiln.custody", %agent, error = %format!("{e:#}"), "a person's own hand-off couldn't be checked"),
         }
     }
-    let why = format!("{why}: kiln's take for them, on their signed-in session; their own signature is missing: no key on the device that asked");
+    let missing = missing.unwrap_or_else(|| "no key on the device that asked".to_owned());
+    let why = format!("{why}: kiln's take for them, on their signed-in session; their own signature is missing: {missing}");
     match crate::custody::hand_work(hub, thing, &to, &why, crate::custody::Giver::For(person)).await {
         Ok((digest, bundle)) => {
             crate::custody::ask_receipt(hub, agent, &bundle).await;
@@ -2985,6 +3085,86 @@ mod tests {
             let taken = v.pointer("/hops/1").cloned().unwrap_or_default();
             anyhow::ensure!(taken.get("kind") == Some(&json!("taken")) && taken.get("custodian") == Some(&json!(server)) && taken.get("taken_for") == Some(&json!(person)), "kiln for the person: {taken}");
             anyhow::ensure!(taken.get("why").and_then(Value::as_str).is_some_and(|w| w.contains("no key on the device that asked")), "{taken}");
+            Ok(())
+        })
+    }
+
+    /// W27-R08, from a browser with its own key: the browser signs what kiln says
+    /// (`hand_off_statement`), the person's hand-on to kiln's server, since kiln doesn't know yet who
+    /// takes it. kiln passes it on unchanged to the agent the failure goes to, whose receipt follows,
+    /// and the chain walks back to the person's own signature, no link of it kiln's for them. From a
+    /// browser that can't sign, kiln's take for them gives the browser's reason.
+    #[test]
+    fn w27_r08_a_hand_off_from_a_browser_is_its_persons_own() -> anyhow::Result<()> {
+        use base64::Engine as _;
+        use kiln_ci::identity::custody::{Body, Kind, to_value};
+        use kiln_ci::identity::statement::{PAYLOAD_CUSTODY, Statement, bundle, payload, to_sign};
+        use rcgen::SigningKey as _;
+        within(async {
+            for signs in [true, false] {
+                let hub = crate::hub::tests::scratch_hub_with(|c| c.terminal.enabled = true).await?;
+                let h = std::sync::Arc::clone(&hub);
+                crate::rt::spawn(async move {
+                    let _ = crate::harness::registry::Registry::run_local(h).await;
+                });
+                hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
+                crate::identities::own_identities(&hub.store, &hub.pki).await?;
+                let sql = fixture();
+                hub.store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+                let owner = crate::authz::Caller::owner();
+                let folder = tempfile::tempdir()?;
+                let cwd = folder.path().to_string_lossy().into_owned();
+                let cx = crate::ops::Cx { hub: std::sync::Arc::clone(&hub), caller: owner.clone() };
+                crate::ops::call(cx, "attachments.save", json!({ "name": "ci-doctor", "on": "repo:hyper-light/kiln", "harness": { "kind": "claude", "on": "local", "cwd": cwd }, "wake": ["failure"] }))
+                    .await
+                    .map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+                let org = hub.pki.organization();
+                let (person, server) = (crate::custody::person_uri(&org, "admin"), crate::custody::server_uri(&org));
+                let commit = json!({ "repo": "hyper-light/kiln", "sha": C3 });
+                let ask = if signs {
+                    // What kiln says to sign, signed with the browser's key, certified as the person.
+                    let said = hand_off_statement_in(&hub, &owner, &commit).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+                    anyhow::ensure!(said.pointer("/statement/body/by") == Some(&json!(person)) && said.pointer("/statement/body/to") == Some(&json!(server)), "{said}");
+                    let key = crate::pki::new_key_pem()?;
+                    let pem = hub.pki.issue_identity(&crate::pki::make_csr_with_key("kiln-identity", &key)?, &kiln_ci::identity::chain::Identity::parse(&person)?, &[], time::Duration::hours(1))?;
+                    let b64 = base64::engine::general_purpose::STANDARD;
+                    let part = |k: &str| b64.decode(said.get(k).and_then(Value::as_str).unwrap_or_default());
+                    let (p, pae) = (part("payload")?, part("pae")?);
+                    let hand_on = bundle(PAYLOAD_CUSTODY, &p, &rcgen::KeyPair::from_pem(&key)?.sign(&pae)?, &crate::pki::der_of(&pem)?);
+                    json!({ "repo": "hyper-light/kiln", "sha": C3, "hand_on": hand_on })
+                } else {
+                    json!({ "repo": "hyper-light/kiln", "sha": C3, "unsigned": "this page isn't secure (https), so this browser has no key" })
+                };
+                let handed = hand_off_in(&hub, &owner, &ask).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+                anyhow::ensure!(handed.pointer("/custody/kiln_signed_for_you") == Some(&json!(!signs)), "{handed}");
+                // The agent's receipt of what kiln handed it: what kiln passed on, else its take.
+                let agent = handed.pointer("/handed/agent").and_then(Value::as_str).unwrap_or_default().to_owned();
+                let to = crate::identities::agent_at(&hub, &agent, hub.harness.epoch_of(&agent)).await?;
+                let follows = handed.pointer(if signs { "/custody/passed_on" } else { "/custody/hand_on" }).and_then(Value::as_str).unwrap_or_default().to_owned();
+                let key = crate::pki::new_key_pem()?;
+                let pem = hub.pki.issue_identity(&crate::pki::make_csr_with_key("kiln-identity", &key)?, &kiln_ci::identity::chain::Identity::parse(&to)?, &[], time::Duration::hours(1))?;
+                let thing = crate::custody::work("hyper-light/kiln@3333333 checks", &["hyper-light/kiln", C3, "checks"]);
+                let body = Body { from: Some(if signs { server.clone() } else { person.clone() }), why: "handed off".into(), ..Body::new(Kind::Received, &to) };
+                let st = Statement { subject: vec![thing], follows: vec![follows], ..Statement::new(to_value(&body)) };
+                let p = payload(&st)?;
+                let receipt = bundle(PAYLOAD_CUSTODY, &p, &rcgen::KeyPair::from_pem(&key)?.sign(&to_sign(PAYLOAD_CUSTODY, &p))?, &crate::pki::der_of(&pem)?);
+                let now = crate::util::now_unix();
+                let got = crate::custody::take(&hub.store, &hub.pki.ca_der, &org, &receipt, "runner local", now).await?.map_err(|r| anyhow::anyhow!("{r}"))?;
+                let v = crate::custody::chain(&hub.store, &hub.pki.ca_der, &org, &got.digest, now).await?.ok_or_else(|| anyhow::anyhow!("no chain"))?;
+                anyhow::ensure!(v.get("unbroken") == Some(&json!(true)), "{v}");
+                let hops = v.get("hops").and_then(Value::as_array).cloned().unwrap_or_default();
+                let kinds: Vec<&str> = hops.iter().filter_map(|h| h.get("kind").and_then(Value::as_str)).collect();
+                if signs {
+                    anyhow::ensure!(kinds == ["received", "passed-on", "handed-on"], "the person's own hand-on, passed on: {v}");
+                    anyhow::ensure!(hops.get(2).and_then(|h| h.get("custodian")) == Some(&json!(person)), "{v}");
+                    anyhow::ensure!(hops.iter().all(|h| h.get("taken_for").is_none_or(Value::is_null)), "nothing of it kiln's for them: {v}");
+                } else {
+                    anyhow::ensure!(kinds == ["received", "taken"], "{v}");
+                    let taken = hops.get(1).cloned().unwrap_or_default();
+                    anyhow::ensure!(taken.get("taken_for") == Some(&json!(person)), "kiln for the person: {taken}");
+                    anyhow::ensure!(taken.get("why").and_then(Value::as_str).is_some_and(|w| w.contains("this page isn't secure (https), so this browser has no key")), "{taken}");
+                }
+            }
             Ok(())
         })
     }

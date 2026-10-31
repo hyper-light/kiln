@@ -1,6 +1,6 @@
 /** Plans (docs/plans.md): kept, changed, shared and run on any agent. */
 import { request } from "./client";
-import { signed } from "@/lib/signing";
+import { browserSigns, signed } from "@/lib/signing";
 
 /** The agent a plan came from. */
 export interface PlanSource {
@@ -295,9 +295,6 @@ export const plansApi = {
   share: (id: string, on: boolean) => request<Plan>("POST", `/api/plans/${enc(id)}/share`, { on }),
   shared: (token: string, signal?: AbortSignal) => request<SharedPlan>("GET", `/api/shared/plans/${enc(token)}`, undefined, { signal }),
 };
-
-/** Whether this browser signs as its person: WebCrypto and IndexedDB, which a page that isn't secure (https) lacks. */
-export const browserSigns = () => typeof globalThis.crypto?.subtle !== "undefined" && typeof indexedDB !== "undefined";
 
 export const planHref = (id: string) => `/agents/plans/${enc(id)}`;
 export const runHref = (run: string) => `/agents/plans/runs/${enc(run)}`;

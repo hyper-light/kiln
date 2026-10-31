@@ -8,6 +8,7 @@
 import type http from "node:http";
 import type { ShipChange, ShipCommit, ShipDetail, ShipMark, ShipPace, ShipPage, ShipPip } from "../src/api/ship.ts";
 import { STATES } from "../src/components/ui/status-glyph-spec.ts";
+import { ME_URI } from "./agents.ts";
 import { Trunk } from "./ship-sim.ts";
 
 interface Ctx {
@@ -230,8 +231,14 @@ const PI = "pi-kitchen";
 /** Retried, by browser (its User-Agent), so the e2e projects running side by side each have their own Pi. */
 const piRetried = new Set<string>();
 
-/** What a hand-off from a browser says of its custody (docs/ci.md W27-R08): kiln's take for the person. */
-const SIGNED_FOR_YOU = { hand_on: `sha256:${"5".repeat(64)}`, kiln_signed_for_you: true };
+/** What a hand-off from a browser says of its custody (docs/ci.md W27-R08): the person's own
+ * hand-on, signed in the browser, which kiln passed on to the agent; else kiln's take for them. */
+const custodyOf = (b: { hand_on?: unknown }) =>
+  b.hand_on ? { hand_on: `sha256:${"5".repeat(64)}`, passed_on: `sha256:${"6".repeat(64)}`, kiln_signed_for_you: false } : { hand_on: `sha256:${"5".repeat(64)}`, kiln_signed_for_you: true };
+
+/** What each browser sent with its hand-offs, by its user agent (`GET /api/mock/ship/hand-offs`):
+ * its own hand-on, signed, or why it couldn't sign one (W27-R08). */
+const sentBy = new Map<string, { hand_on?: unknown; unsigned?: unknown }[]>();
 
 /** The fixed rows each browser handed off (`POST /api/ship/hand-off`), by its user agent as Pi's
  * retry is, so a desktop's and a phone's tests don't see each other's. */
@@ -560,10 +567,38 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
     else ctx.json(res, 200, detail);
     return true;
   }
-  // A row's Hand off (W26-R18), answered as the server answers: who took it, or why no one did;
-  // handed off from a browser, which has no key, kiln signs it for the person (W27-R08).
-  if (p === "/api/ship/hand-off" && m === "POST") {
+  // What a browser signs to hand a row off (W27-R08), as the server says it: the person's hand-on
+  // of what's open to kiln's server, which passes it on to the agent that takes it.
+  if (p === "/api/ship/hand-off/statement" && m === "POST") {
     let body: { repo?: unknown; sha?: unknown } = {};
+    try {
+      body = JSON.parse((await readBody(req)) || "{}") as typeof body;
+    } catch {
+      body = {};
+    }
+    const sha = typeof body.sha === "string" ? body.sha : "";
+    const row = all().find((c) => c.repo === body.repo && c.sha === sha);
+    if (typeof body.repo !== "string" || !sha || (row && (handedBy.get(ua)?.has(sha) || !(row.actions ?? []).some((a) => a.name === "hand_off")))) {
+      ctx.json(res, row ? 409 : 400, { error: row ? `${row.short} has nothing open to hand off` : "`repo` and `sha`: the commit to hand off" });
+      return true;
+    }
+    const what = row?.change ? "threads" : "checks";
+    const at = `${body.repo}@${sha.slice(0, 7)}`;
+    const statement = {
+      v: 1,
+      subject: [{ name: `${at} ${what}`, digest: { "kiln-work-v1": "cd".repeat(32) } }],
+      body: { v: 1, kind: "handed-on", by: ME_URI, to: "kiln://hyper-light/server", why: `handed off: ${what} of ${at}` },
+    };
+    const text = JSON.stringify(statement);
+    const type = "application/vnd.kiln.custody+json";
+    const pae = `DSSEv1 ${type.length} ${type} ${Buffer.byteLength(text)} ${text}`;
+    ctx.json(res, 200, { payload_type: type, statement, payload: Buffer.from(text).toString("base64"), pae: Buffer.from(pae).toString("base64"), required: false });
+    return true;
+  }
+  // A row's Hand off (W26-R18), answered as the server answers: who took it, or why no one did;
+  // its custody, as the browser sent it: the person's own hand-on, or kiln's take for them (W27-R08).
+  if (p === "/api/ship/hand-off" && m === "POST") {
+    let body: { repo?: unknown; sha?: unknown; hand_on?: unknown; unsigned?: unknown } = {};
     try {
       body = JSON.parse((await readBody(req)) || "{}") as typeof body;
     } catch {
@@ -574,10 +609,13 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
       ctx.json(res, 400, { error: "`repo` and `sha`: the commit to hand off" });
       return true;
     }
+    const sent = () => sentBy.set(ua, [...(sentBy.get(ua) ?? []), { hand_on: body.hand_on, unsigned: body.unsigned }]);
     const taken = trunk?.handOff(sha);
     if (taken != null) {
-      if (taken) ctx.json(res, 200, { handed: { to: "ci-doctor", agent: "agent-ci-doctor", incident: `inc-${sha.slice(0, 7)}`, what: ["checks"] }, custody: SIGNED_FOR_YOU });
-      else ctx.json(res, 409, { error: `${sha.slice(0, 7)} has nothing open to hand off` });
+      if (taken) {
+        sent();
+        ctx.json(res, 200, { handed: { to: "ci-doctor", agent: "agent-ci-doctor", incident: `inc-${sha.slice(0, 7)}`, what: ["checks"] }, custody: custodyOf(body) });
+      } else ctx.json(res, 409, { error: `${sha.slice(0, 7)} has nothing open to hand off` });
       return true;
     }
     const row = all().find((c) => c.repo === body.repo && c.sha === sha);
@@ -587,12 +625,20 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
       return true;
     }
     handedBy.set(ua, mine.add(sha));
+    sent();
     const to = takerOf(row);
-    ctx.json(res, 200, { handed: { to, agent: `agent-${to}`, ...(row.change ? {} : { incident: `inc-${row.short}` }), what: [row.change ? "threads" : "checks"] }, custody: SIGNED_FOR_YOU });
+    ctx.json(res, 200, { handed: { to, agent: `agent-${to}`, ...(row.change ? {} : { incident: `inc-${row.short}` }), what: [row.change ? "threads" : "checks"] }, custody: custodyOf(body) });
+    return true;
+  }
+  if (p === "/api/mock/ship/hand-offs" && m === "GET") {
+    ctx.json(res, 200, { hand_offs: sentBy.get(ua) ?? [] });
     return true;
   }
   if (p === "/api/mock/ship/hand-off" && m === "POST") {
-    if (q.get("reset")) handedBy.delete(ua);
+    if (q.get("reset")) {
+      handedBy.delete(ua);
+      sentBy.delete(ua);
+    }
     ctx.json(res, 200, { ok: true });
     return true;
   }

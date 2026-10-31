@@ -597,6 +597,34 @@ pub async fn person_hand_on(hub: &crate::hub::Hub, person: &str, to: &str, thing
     Ok(take(&hub.store, &hub.pki.ca_der, &hub.pki.organization(), bundle, came_from, at).await?.map(|t| t.digest).map_err(|r| r.to_string()))
 }
 
+/// What a person signs on their device for custody statement `s` (a browser, with its own key:
+/// `ui/src/lib/signing.ts`), said as a verdict's is (`ci::verdicts::to_sign`): its payload type, the
+/// statement, its bytes and the bytes signed (DSSE's PAE), those two base64; never required.
+pub fn to_sign(s: &statement::Statement) -> anyhow::Result<Value> {
+    let payload = statement::payload(s).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    Ok(json!({ "payload_type": PAYLOAD_CUSTODY, "statement": s, "payload": b64.encode(&payload), "pae": b64.encode(statement::to_sign(PAYLOAD_CUSTODY, &payload)), "required": false }))
+}
+
+/// Whom a hand-on (`bundle`, read without checking it) says it hands its things to.
+pub fn hand_on_to(bundle: &Value) -> Option<String> {
+    body_in(&bundle.to_string())?.to
+}
+
+/// kiln's server passes `things`, handed on to it by `from` as `hand_on` (its digest), on unchanged
+/// to `to`, for `why`: a relay's record, its server's (docs/ci.md W27-R08). Kept at once: its
+/// digest and bundle, which `to`'s receipt follows.
+pub async fn pass_on(hub: &crate::hub::Hub, things: Vec<statement::Subject>, hand_on: &str, from: &str, to: &str, why: &str) -> anyhow::Result<(String, Value)> {
+    let org = hub.pki.organization();
+    let body = custody::Body { from: Some(from.to_owned()), to: Some(to.to_owned()), why: why.to_owned(), ..custody::Body::new(Kind::PassedOn, &server_uri(&org)) };
+    let s = statement::Statement { subject: things, follows: vec![hand_on.to_owned()], ..statement::Statement::new(custody::to_value(&body)) };
+    let bundle = server_signed(&hub.pki, &s)?;
+    match take(&hub.store, &hub.pki.ca_der, &org, &bundle, "kiln's server", crate::util::now_unix()).await? {
+        Ok(t) => Ok((t.digest, bundle)),
+        Err(why) => anyhow::bail!("kiln refused its own pass of {hand_on}: {why}"),
+    }
+}
+
 /// Whom a hand-on (`bundle`, read without checking: kiln checked it as it took it) says its things
 /// come from: the giver a take hands on for, else its signer.
 pub fn giver_of(bundle: &Value) -> Option<String> {
@@ -783,15 +811,8 @@ pub async fn subagents_handed(hub: &crate::hub::Hub, came_from: &str, hand_on: &
                 continue;
             }
         };
-        let body = custody::Body { from: Some(parent.clone()), to: Some(to), why: "a subagent's task, passed on unchanged as kiln started it".into(), ..custody::Body::new(Kind::PassedOn, &server_uri(&org)) };
-        let passed = statement::Statement { subject: s.subject.clone(), follows: vec![taken.digest.clone()], ..statement::Statement::new(custody::to_value(&body)) };
-        let bundle = match server_signed(&hub.pki, &passed) {
-            Ok(b) => b,
-            Err(e) => return tracing::warn!(target: "kiln.custody", error = %format!("{e:#}"), "kiln couldn't sign a subagent's task passed on"),
-        };
-        match take(&hub.store, &hub.pki.ca_der, &org, &bundle, "kiln's server", at).await {
-            Ok(Ok(_)) => ask_receipt(hub, child, &bundle).await,
-            Ok(Err(why)) => tracing::warn!(target: "kiln.custody", %child, %why, "kiln refused its own pass of a subagent's task"),
+        match pass_on(hub, s.subject.clone(), &taken.digest, &parent, &to, "a subagent's task, passed on unchanged as kiln started it").await {
+            Ok((_, bundle)) => ask_receipt(hub, child, &bundle).await,
             Err(e) => tracing::warn!(target: "kiln.custody", %child, error = %format!("{e:#}"), "a subagent's task passed on wasn't kept"),
         }
     }

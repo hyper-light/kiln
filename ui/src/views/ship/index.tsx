@@ -20,6 +20,7 @@ import { toast } from "@/components/ui/toast";
 import { errorMessage } from "@/lib/hooks";
 import { Link, useNavigate, useSearchParams } from "@/lib/router";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
+import { browserSigns } from "@/lib/signing";
 import { RelTime } from "../shared";
 import { ACTION_WORD, FACET_KEYS, fold, keyOf, HOSTS, KINDS, optionsOf, order, projectOf, SHIP_STANDS, SORTS, sortOf, standCounts, standWord, strip, type Item } from "./model";
 import "./ship.css";
@@ -358,13 +359,14 @@ function Actions({ commit, reload, onReview }: { commit: ShipCommit; reload: () 
     }
     setBusy(a.name);
     try {
-      const answer = await shipApi.act(a);
-      // A hand-off kiln signed for you, this browser having no key (docs/ci.md W27-R08): says so,
-      // and how to sign your own.
+      // A hand-off is signed in this browser, with its own key; one kiln signed for you says why,
+      // and, on a page that isn't secure, how to sign your own (docs/ci.md W27-R08).
+      const { answer, unsigned } = a.name === "hand_off" ? await shipApi.handOff(a) : { answer: await shipApi.act(a), unsigned: undefined };
       const signedForYou = (answer as { custody?: { kiln_signed_for_you?: boolean } } | null)?.custody?.kiln_signed_for_you === true;
+      const how = browserSigns() ? "" : " Over https, this browser signs its own.";
       toast({
         title: `${ACTION_WORD[a.name] ?? a.name}: ${commit.change?.name ?? commit.short}`,
-        description: signedForYou ? "kiln signed the hand-off for you: this browser has no key. `kiln login` gives this device one." : undefined,
+        description: signedForYou ? `kiln signed the hand-off for you: ${unsigned ?? "it didn't take this browser's signature"}.${how}` : undefined,
         tone: "succeeded",
       });
       invalidate("ship/");

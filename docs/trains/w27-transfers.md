@@ -39,6 +39,8 @@ reaching a process it isn't for.
 - Words addressed to one process. The server signs the process each word is for, and any other
   process refuses it.
 - Work, changes, review requests and promotions handed on, and the replant's runner role.
+- A person's side signed in the browser with its own key: a plan step taken over, and Ship's Hand
+  off. kiln signs for them only where the browser can't (a page that isn't secure), saying why.
 - An approval carried to a rebase-only version, signed by kiln as a transfer and shown in Ship.
 - The simulation (`sim::transfers`): no stale act is ever applied, and each of five planted bugs is
   found.

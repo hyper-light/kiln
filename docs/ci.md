@@ -9270,8 +9270,10 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
   the receipt with the key `kiln login` made (`POST /api/plans/runs/<run>/steps/<n>/take` with
   `signs`, then `…/receipt`); a browser signs it with its own key (the signing plan's WebCrypto key,
   `ui/src/lib/signing.ts`), kiln saying what to sign (`POST …/statement`, as for a verdict); Ship's
-  Hand off takes the person's own signed hand-on beside it. Without a key (a browser on a page
-  that isn't secure, so with no WebCrypto, says so: `…/receipt` with `unsigned`), kiln's server signs
+  Hand off takes the person's own signed hand-on beside it, to the agent or, from a browser, which
+  signs it before kiln knows who takes it (`POST /api/ship/hand-off/statement`), to kiln's server,
+  which passes it on unchanged to the agent (a relay's record). Without a key (a browser on a page
+  that isn't secure, so with no WebCrypto, says so: `…/receipt` or the hand-off with `unsigned`), kiln's server signs
   for them on their signed-in session (a take, or a receipt, `taken_for` the person), saying their
   own signature is missing and why; a walk reads that link as kiln's for
   them, never as theirs (`taken_for` on its hop), and the page says in place how to get a key. Once a
@@ -9344,12 +9346,16 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
   `w27_r08_kiln_takes_for_a_person_with_no_key`, `custody::w27_r08_work_changes_hands_signed_by_both_sides`,
   `runner::custody::w27_r08_work_handed_is_received_at_the_sessions_next_turn`,
   `ship::w27_r08_a_hand_off_changes_hands_signed` (a failure handed off from a device with no key:
-  kiln's take for the person, answered by the agent's receipt), and `w27_r08_work_handed` (a plan run with an agent per step: each step signed for at its agent's
+  kiln's take for the person, answered by the agent's receipt),
+  `ship::w27_r08_a_hand_off_from_a_browser_is_its_persons_own` (signed in a browser: the person's
+  hand-on to kiln, passed on to the agent, its chain walking back to their own signature; from a
+  browser that can't sign, kiln's take giving the browser's reason), and `w27_r08_work_handed` (a plan run with an agent per step: each step signed for at its agent's
   first turn; one tried again, the agent before refused and recorded as it says it's met; one taken
   over without a key, kiln's receipt for the person, one with a key, the person's own; a subagent's
   task handed on, passed on and received; every chain unbroken, none open); in the UI,
-  `e2e/plan-run-take.spec.ts` and `ship-hand-off.spec.ts` (the line saying how a take-over or a
-  hand-off from a browser is signed, in Chromium and WebKit at desktop and phone widths);
+  `e2e/plan-run-take.spec.ts` and `ship-hand-off.spec.ts` (a take-over or a hand-off from a browser
+  signed with its own key, and one from a browser that can't sign, saying why, in Chromium and
+  WebKit at desktop and phone widths);
   `w27_r08_change_hands` (D1 given by kim, taken by sam, commandeered by lee: two transfers, each
   with both sides; sam's version pushed afterwards, and his abandon, refused and recorded with the
   transfer) and `w27_r08_review_passed_on` (passed on and taken, the request moves with both sides;

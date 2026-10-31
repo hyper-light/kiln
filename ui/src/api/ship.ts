@@ -5,6 +5,7 @@
  * it (`fold_under`). Every field is new on the wire, so each is optional here but the basics.
  */
 import { apiPath } from "@/lib/peer-base";
+import { browserSigns, signed } from "@/lib/signing";
 import { request } from "./client";
 
 export type ShipStand = "needs_you" | "failing" | "landing" | "checking" | "building" | "in_staging" | "waiting" | "shipping" | "replanting" | "shipped" | "fixed" | "rolled_back" | "superseded";
@@ -141,4 +142,24 @@ export const shipApi = {
     request<ShipDetail>("GET", apiPath(`/api/ship/commits/${repo.split("/").map(encodeURIComponent).join("/")}/${encodeURIComponent(sha)}`), undefined, { signal }),
   /** A row's action, through the endpoint it names. */
   act: (a: ShipAction) => request<unknown>(a.method, apiPath(a.path), a.method === "GET" ? undefined : (a.body ?? {})),
+  /**
+   * A row's Hand off, the person's side signed in this browser (docs/ci.md W27-R08): kiln says what
+   * to sign (`…/statement`: their hand-on to kiln's server, which passes it on to the agent that
+   * takes it), and it goes with this browser's own key (lib/signing). Where this browser can't sign,
+   * it says why (`unsigned`), and kiln's take for them gives the same reason.
+   */
+  handOff: async (a: ShipAction): Promise<{ answer: unknown; unsigned?: string }> => {
+    const body = (a.body && typeof a.body === "object" ? a.body : {}) as Record<string, unknown>;
+    let why = "this page isn't secure (https), so this browser has no key";
+    if (browserSigns()) {
+      try {
+        const hand_on = await signed(apiPath(`${a.path}/statement`), body);
+        if (hand_on) return { answer: await request<unknown>("POST", apiPath(a.path), { ...body, hand_on }) };
+        why = "kiln is from before a browser signed its hand-offs";
+      } catch (e) {
+        why = `this browser couldn't sign: ${e instanceof Error ? e.message : String(e)}`;
+      }
+    }
+    return { answer: await request<unknown>("POST", apiPath(a.path), { ...body, unsigned: why }), unsigned: why };
+  },
 };

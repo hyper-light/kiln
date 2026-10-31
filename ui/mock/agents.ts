@@ -765,7 +765,7 @@ function runView() {
 
 /** The run's routes (before the plans' own, whose `:id` would take "runs"). */
 /** The person signed in, as kiln names them (MOCK_NO_AUTH's owner). */
-const ME_URI = "kiln://hyper-light/person/admin";
+export const ME_URI = "kiln://hyper-light/person/admin";
 /** The hand-on a step taken over answers with. */
 const HAND_ON = "sha256:" + "aa".repeat(32);
 /** Receipts of steps taken over, as the browser sent them (`GET /api/mock/plans/receipts`). */
