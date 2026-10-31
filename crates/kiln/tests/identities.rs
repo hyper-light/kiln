@@ -1878,7 +1878,9 @@ fn w27_r04_an_agents_verdict_is_signed_by_its_runner() -> anyhow::Result<()> {
     anyhow::ensure!((200..300).contains(&st), "send: {st} {sent}");
     let out = || std::fs::read_to_string(cwd.join("mcp.out")).unwrap_or_default();
     let deadline = Instant::now() + Duration::from_secs(60);
-    while !out().contains("done") {
+    // The line the script writes once its call is answered: kiln's instructions say "goals_done"
+    // in the first answer already.
+    while !out().lines().any(|l| l.trim() == "done") {
         anyhow::ensure!(Instant::now() < deadline, "the agent's MCP server never answered: {}\n{}", out(), std::fs::read_to_string(cwd.join("mcp.err")).unwrap_or_default());
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -1967,6 +1969,11 @@ fn w27_r07_a_land_is_signed_by_its_queue() -> anyhow::Result<()> {
     let land = landing::read(&checked.payload_type, &checked.statement).map_err(|e| anyhow::anyhow!(e))?;
     assert_eq!((land.queue(), land.candidate.as_str()), ("acme/landed:main".to_owned(), tip.as_str()), "the candidate that landed: {land:?}");
     let kims = get("/api/diffs/D1/verdicts")?.get("verdicts").and_then(Value::as_array).and_then(|l| l.first()).map(|v| field(v, "digest").to_owned()).unwrap_or_default();
+    // Both in the trail (W27-R09): Kim's verdict, then the land that names it.
+    let db = rusqlite::Connection::open(dir.path().join("data/kiln.db"))?;
+    let in_trail = |digest: &str| -> anyhow::Result<i64> { db.query_row("SELECT idx FROM trail WHERE statement = ?1", [digest], |r| r.get(0)).map_err(|e| anyhow::anyhow!("{digest} in the trail: {e}")) };
+    let (verdict_at, land_at) = (in_trail(&kims)?, in_trail(&checked.digest)?);
+    assert!(verdict_at < land_at, "the verdict, then the land that names it: {verdict_at}, {land_at}");
     let d1 = land.batch.first().ok_or_else(|| anyhow::anyhow!("an empty batch: {land:?}"))?;
     assert_eq!((d1.diff.as_str(), d1.version, &d1.verdicts), ("D1", 1, &vec![kims]), "{land:?}");
     let gate = land.checks.iter().find(|c| c.name == "gate").ok_or_else(|| anyhow::anyhow!("no gate run: {land:?}"))?;

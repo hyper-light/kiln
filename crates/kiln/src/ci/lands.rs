@@ -89,11 +89,15 @@ pub async fn sign(hub: &Hub, repo: &Repo, trunk: &str, base: &str, candidate: &s
     let (repo_id, trunk, base, candidate, d, at) = (repo.id.clone(), trunk.to_owned(), base.to_owned(), candidate.to_owned(), digest.clone(), crate::util::now_unix());
     hub.store
         .call(move |c| {
-            c.execute(
+            let (tx, text) = (crate::store::tx(c)?, bundle.to_string());
+            tx.execute(
                 "INSERT INTO land_signatures (repo_id, trunk, candidate, base, digest, signer, signed_at, bundle) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT (repo_id, trunk, candidate) DO UPDATE SET base = excluded.base, digest = excluded.digest, signer = excluded.signer, signed_at = excluded.signed_at, bundle = excluded.bundle",
-                params![repo_id, trunk, candidate, base, d, signer, at, bundle.to_string()],
+                params![repo_id, trunk, candidate, base, d, signer, at, text],
             )?;
+            // In the trail as taken (W27-R09).
+            crate::trail::take(&tx, &text, at)?;
+            tx.commit()?;
             Ok(())
         })
         .await?;
