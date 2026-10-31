@@ -32,6 +32,10 @@ async fn list(cx: Cx, v: Value) -> Out {
     let session = s("session").filter(|x| !x.trim().is_empty());
     let proposed = v.get("proposed").and_then(|p| p.as_bool().or_else(|| p.as_str().map(|s| s == "true" || s == "1"))).unwrap_or(false);
     let plans = super::of_source(super::list(&cx.hub, s("q"), s("tag")).await.map_err(fail)?, session.as_deref(), proposed);
+    // In brief: what each is and where it stands, without its words, items or steps' titles.
+    if v.get("brief").is_some_and(|b| b.as_bool().unwrap_or_else(|| matches!(b.as_str(), Some("1" | "true")))) {
+        return json_of(&json!({"plans": plans.iter().map(super::brief).collect::<Vec<_>>()}));
+    }
     json_of(&json!({"plans": plans}))
 }
 
@@ -316,7 +320,7 @@ pub fn list_ops() -> Vec<Op> {
     vec![
         Op {
             name: "plans.list",
-            summary: "Plans kept in kiln, newest change first; `q` matches title, text or tags, `tag` keeps one tag, `session` an agent's (made in its conversation), and `proposed` the one each agent proposed (plan mode), kept by kiln.",
+            summary: "Plans kept in kiln, newest change first; `q` matches title, text or tags, `tag` keeps one tag, `session` an agent's (made in its conversation), and `proposed` the one each agent proposed (plan mode), kept by kiln; `brief` gives each without its words, items or steps' titles (`step_count` says how many), for a long list.",
             read_only: true,
             destructive: false,
             input: Input::of::<input::PlansList>(),
@@ -447,6 +451,8 @@ pub mod input {
         pub tag: Option<String>,
         pub session: Option<String>,
         pub proposed: Option<bool>,
+        /// Each in brief: without its words, items or steps' titles.
+        pub brief: Option<bool>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
