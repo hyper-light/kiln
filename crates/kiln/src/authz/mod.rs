@@ -589,6 +589,9 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/ship/hand-off", "runs.rerun", At::Anywhere),
     // Each verb's own right on the repository is asked inside (`ship::jobs`): retry, cancel, pause.
     r("POST", "/api/ship/jobs", "runs.read", At::Anywhere),
+    // Each verb is its CD operation, asked inside as `/api/cd`'s route asks it (`ship::deploys::act`):
+    // `environments.deploy` on the whole server (W26-R24).
+    r("POST", "/api/ship/deploys", "runs.read", At::Anywhere),
     // Releases are a deployer's in their environment, or an owner team's where it lets owners.
     r("POST", "/api/deploy/releases", "environments.deploy", At::Deploy),
     r("POST", "/api/deploy/fleets", "environments.deploy", At::Anywhere),

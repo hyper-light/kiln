@@ -548,6 +548,13 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let body: serde_json::Value = boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
             boxed(|| crate::ship::jobs(&hub, &caller, &body)).await.map_err(|(c, m)| err(c, m))
         }
+        // Ship's Deploys: every app by project, an app's pane, and the strip's verbs (W26-R24).
+        (&Method::GET, ["api", "ship", "deploys"]) => boxed(|| crate::ship::deploys::list(&hub, &q, &caller)).await.map_err(|(c, m)| err(c, m)),
+        (&Method::GET, ["api", "ship", "deploys", project, name]) => boxed(|| crate::ship::deploys::get(&hub, project, name, &caller)).await.map_err(|(c, m)| err(c, m)),
+        (&Method::POST, ["api", "ship", "deploys"]) => {
+            let body: serde_json::Value = boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+            boxed(|| crate::ship::deploys::act(&hub, &caller, &body)).await.map_err(|(c, m)| err(c, m))
+        }
         // A row's Hand off: what the commit has open, to the agent that takes it (W26-R18).
         (&Method::POST, ["api", "ship", "hand-off"]) => {
             let body: serde_json::Value = boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;

@@ -8624,6 +8624,26 @@ a time. The design was agreed on a live mock built on Ship's own prototype
     `jobs`, those the action applies to.
   - Its heights are held: nothing moves as jobs are picked, acted on and go on, and nothing scrolls
     sideways from 320 px up.
+- **W26-R24 Deploys in Ship.** Ship's Deploys lists every app KilnCD holds as Ship's rows, by
+  project (the repository its deploy file is in or its manifests come from), what needs someone
+  first: each app's stand, word and line; the pips of its latest deploy (Sync, Health, Soak: healthy
+  for ten minutes after its sync, or the guard's word); who did it and when; where it deploys and
+  what runs (`GET /api/ship/deploys`). Where it stands is `kiln_cd::stands`'s to say, the first that
+  holds: Argo CD's; can't read, render or compare; syncing; its rollout waits for a person, or rolls
+  out; rolled back; its latest deploy failed; degraded or missing; out of sync (a person's to sync,
+  unless auto-sync syncs it); progressing or suspended; comparing; soaking; synced.
+  - An opened app (`GET /api/ship/deploys/:app`) has the jobs pane's anatomy: its components, each
+    workload a group (its pods with their uptime and restarts, its ReplicaSets) and then the rest by
+    what they are (network, config, storage, jobs, access), live from its cluster or else what
+    KilnCD holds; a rollout's steps; its settings (auto-sync and auto-rollback, a person's to set;
+    prune and self-heal, its deploy file's); its history, its source's newest commits each as the
+    deploy that ran it or one a rollback can go to, then older deploys; and why each verb can't
+    apply, where one can't.
+  - The strip's verbs go to `POST /api/ship/deploys { app, verb, … }`, each its CD operation (sync,
+    of the picked objects when some are picked; refresh and hard refresh; roll back to a deploy or
+    any commit; stop; follow git again; promote, abort, approve and deny a rollout; auto-sync and
+    auto-rollback), as that operation's route would let the caller, and audited in the request's
+    one row.
 - **W26-R25 Roll back to any commit.** A deploy can go back to any commit of its app's sources, not
   only one it deployed: rendered with that source at the commit and the others at their heads,
   synced as a rollback, recorded as a deployment, and held there until trunk changes what the app
@@ -8703,6 +8723,17 @@ repository):
   `kiln-ci` `w26_r22_a_paused_leg_waits_until_it_is_resumed`; proto
   `w26_r22_freeze_is_appended_after_every_older_variant`; contain
   `w26_r22_a_job_left_frozen_by_an_ended_runner_goes_on`.*
+- **W26-AC18 Deploys in Ship.** On a server with KilnCD, apps of two repositories list under them
+  as CD holds each (sync, health, auto-sync, environment), and an app's pane has its settings and
+  its source's commits; each verb reaches its operation: done and audited as a maintainer's, the
+  operation's own refusal said, refused for a viewer, an agent held to what its environment lets
+  agents do. Apps the engine leaves on the simulated cluster stand as defined (soaking then
+  synced, waiting for a person, behind git, rolled back, failed), and for several projects the
+  stands, lines, components, history, a rollout's steps and the verbs' reasons are as defined.
+  *`tests/ship_deploys.rs`
+  `w26_r24_ship_lists_cds_apps_by_project_and_each_verb_reaches_its_operation_as_the_caller`;
+  `ship::deploys` `w26_r24_*`; `kiln-cd` `w26_r24_apps_stand_as_the_engine_leaves_them` (the
+  simulated cluster) and `stands` `w26_r24_*`.*
 - **W26-AC17 Logs beyond pods.** On this machine's Docker, a Compose project's log reads its last
   lines in order with their times, follows as lines come, and reads a stopped container's as its
   previous one; each source's command is as asked. *`cd::logs`

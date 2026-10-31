@@ -260,7 +260,7 @@ const COMMITS: usize = 20;
 /// source of its own, at the revision it follows, newest first, each who, when and what, with the
 /// deployment that ran it and the newest that rendered what it renders (by its inputs' address,
 /// worked out from git without rendering). None where git can't be read.
-pub(super) async fn commits(cd: &Arc<Cd>, def: &AppDef, history: &VecDeque<Deployment>) -> Vec<Value> {
+pub(crate) async fn commits(cd: &Arc<Cd>, def: &AppDef, history: &VecDeque<Deployment>) -> Vec<Value> {
     let Some((i, src)) = def.sources.iter().enumerate().find(|(_, s)| s.chart.is_none() && s.as_ref.is_none()) else { return Vec::new() };
     // A Kubernetes cluster's version and APIs shape some renders' addresses; not connected, theirs
     // are read without them (and may match no deployment's).

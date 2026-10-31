@@ -17,6 +17,10 @@
 //!   first, cursor-paged; `host` (kiln, github, gitlab, bitbucket) and `kind` (diff, request, commit)
 //!   filter, and `lens=review` keeps the changes' commits (W26-R02).
 //! - `GET /api/ship/commits/:repo/:sha`: one commit, its records and where it stands.
+//!
+//! Its Deploys, every KilnCD app by project and an opened app's pane, are [`deploys`]'s (W26-R24).
+
+pub mod deploys;
 
 use std::collections::{HashMap, HashSet};
 

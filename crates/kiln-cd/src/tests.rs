@@ -1014,3 +1014,150 @@ fn a_sync_of_objects_already_there_applies_every_one() {
     let applied = h.records.iter().skip(n).find_map(|r| if let Record::Finished { applied, .. } = r { Some(*applied) } else { None });
     assert_eq!(applied, Some(12));
 }
+
+/// W26-R24: apps stand in Ship's Deploys as the engine leaves them on the simulated cluster, read as
+/// the server reads KilnCD's state (each app's status, its finished syncs as kept, its pin): one that
+/// syncs by itself soaks and is then held; one a person syncs waits for them, never deployed, then
+/// behind git; one whose sync failed; one a person rolled back. Their components are grouped by
+/// what owns them, and their history is their deploys, newest first.
+#[test]
+fn w26_r24_apps_stand_as_the_engine_leaves_them() {
+    use std::collections::VecDeque;
+
+    use crate::journey::{Glyph, Stand};
+    use crate::stands::{self, App};
+    use crate::state::{Deployment, Pin};
+    use crate::tree::{self, Managed};
+
+    // An app's finished syncs, numbered as the store keeps them.
+    let history = |h: &Harness, app: &str| -> VecDeque<Deployment> {
+        h.records
+            .iter()
+            .filter_map(|r| match r {
+                Record::Finished { app: a, op, revision, key, content, trigger, by, succeeded, message, applied, pruned, at_ms } if &**a == app => Some(Deployment {
+                    app: app.to_owned(),
+                    op: *op,
+                    revision: revision.as_ref().map(|r| r.to_string()),
+                    key: *key,
+                    trigger: trigger.as_str().to_owned(),
+                    by: by.clone(),
+                    succeeded: *succeeded,
+                    message: message.clone(),
+                    applied: *applied,
+                    pruned: *pruned,
+                    at_ms: *at_ms,
+                    content: *content,
+                    commits: vec![revision.as_ref().map(|r| r.to_string())],
+                    ..Deployment::default()
+                }),
+                _ => None,
+            })
+            .enumerate()
+            .map(|(i, mut d)| {
+                d.id = i as u64 + 1;
+                d
+            })
+            .collect()
+    };
+    let stand = |h: &Harness, app: &str, auto_sync: bool, pin: Option<&Pin>| -> (Stand, String, String, Vec<Glyph>, Option<String>) {
+        let hist = history(h, app);
+        let s = status(h, app);
+        let a = App {
+            sync: s.map_or(Sync::Unknown, |s| s.sync),
+            health: s.map_or(Health::Unknown, |s| s.health),
+            operation: s.and_then(|s| s.operation.as_ref()),
+            message: s.and_then(|s| s.message.as_deref()),
+            error: None,
+            shadow: false,
+            auto_sync,
+            history: &hist,
+            pin,
+            rollout: None,
+            chart: false,
+            ahead: None,
+            revision: s.and_then(|s| s.revision.as_deref()),
+        };
+        let st = stands::standing(&a, h.now);
+        (st.stand, st.word, st.line, st.pips.iter().map(|p| p.state).collect(), st.by)
+    };
+    let (mut h, git) = harness(fast());
+
+    // Syncs by itself: soaks for ten minutes once healthy, then is held.
+    h.input(Input::UpsertApp(auto("web")));
+    deploy(&mut h, &git, "web", "r1", vec![deployment("web", "web:1", json!({})), config_map("web-config", "1", json!({}))]);
+    assert!(h.run_until(60_000, |h| settled(h, "web")), "{:?}", status(&h, "web"));
+    let (s, word, line, pips, by) = stand(&h, "web", true, None);
+    assert_eq!((s, word.as_str(), pips.as_slice(), by.as_deref()), (Stand::Shipping, "Soaking", &[Glyph::Passed, Glyph::Healthy, Glyph::Soaking][..], Some("auto-sync")));
+    assert!(line.starts_with("#1 runs r1 · healthy · soaks "), "{line}");
+    h.run_for(stands::SOAK_MS + 60_000);
+    assert_eq!(stand(&h, "web", true, None), (Stand::Shipped, "Synced".to_owned(), "#1 runs r1 · healthy".to_owned(), vec![Glyph::Passed, Glyph::Healthy, Glyph::Passed], Some("auto-sync".to_owned())));
+    // Its components, as the server builds its tree: the Deployment's group, then its config.
+    let managed: Vec<Managed> = h
+        .engine
+        .resources("web")
+        .into_iter()
+        .map(|r| Managed {
+            live: h.clusters.get("dev").and_then(|c| c.get(&r.key)),
+            sync: r.sync.as_str().to_owned(),
+            health: r.health,
+            message: r.message,
+            hook: r.hook,
+            missing: r.missing,
+            requires_pruning: r.requires_pruning,
+            why: r.why,
+            ..Managed::new(r.key)
+        })
+        .collect();
+    let groups = stands::components(&tree::build(managed, Vec::new()).nodes, h.now);
+    let seen: Vec<(String, Option<String>, Vec<(String, Glyph, String)>)> =
+        groups.iter().map(|g| (g.name.clone(), g.owner.as_ref().map(|o| o.key.clone()), g.items.iter().map(|i| (i.name.clone(), i.state, i.v.clone())).collect())).collect();
+    assert_eq!(
+        seen,
+        [
+            ("Deployment web".to_owned(), Some("apps~Deployment~web~web".to_owned()), vec![]),
+            ("Config".to_owned(), None, vec![("web-config".to_owned(), Glyph::Healthy, "synced".to_owned())]),
+        ]
+    );
+
+    // A person syncs it: never deployed, it waits for them; synced, then behind git.
+    let mut manual = auto("api");
+    manual.sync.auto = false;
+    manual.sync.self_heal = false;
+    h.input(Input::UpsertApp(manual));
+    deploy(&mut h, &git, "api", "a1", vec![config_map("api-config", "1", json!({}))]);
+    h.run_for(10_000);
+    let (s, word, line, _, _) = stand(&h, "api", false, None);
+    assert_eq!((s, word.as_str(), line.as_str()), (Stand::NeedsYou, "Out of sync", "never deployed · a1 waits for a sync"));
+    let by_ada = || SyncRequest { by: Some("ada".into()), ..SyncRequest::default() };
+    h.input(Input::Sync { app: "api".into(), request: by_ada() });
+    assert!(h.run_until(60_000, |h| settled(h, "api")), "{:?}", status(&h, "api"));
+    deploy(&mut h, &git, "api", "a2", vec![config_map("api-config", "2", json!({}))]);
+    h.run_for(10_000);
+    let (s, word, line, pips, by) = stand(&h, "api", false, None);
+    assert_eq!((s, word.as_str(), line.as_str(), by.as_deref()), (Stand::NeedsYou, "Out of sync", "#1 runs a1 · healthy", Some("ada")));
+    assert_eq!(pips.first(), Some(&Glyph::Passed));
+
+    // Synced to a2, then a person rolls it back to a1, held there.
+    h.input(Input::Sync { app: "api".into(), request: by_ada() });
+    assert!(h.run_until(60_000, |h| settled(h, "api") && history(h, "api").len() == 2));
+    let key = obj::hash_bytes(b"a1");
+    let back = SyncRequest { trigger: Some(crate::engine::Trigger::Rollback), ..by_ada() };
+    h.input(Input::SyncTo { app: "api".into(), revision: "a1".into(), key, content: key, request: back });
+    assert!(h.run_until(60_000, |h| settled(h, "api") && history(h, "api").len() == 3));
+    let pin = Pin { to: 1, revision: Some("a1".into()), by: Some("ada".into()), at_ms: h.now, ..Pin::default() };
+    let (s, word, line, _, by) = stand(&h, "api", false, Some(&pin));
+    assert_eq!((s, word.as_str(), line.as_str(), by.as_deref()), (Stand::RolledBack, "Rolled back", "back on #1 · held there until git changes it", Some("ada")));
+    let lines: Vec<(Option<u64>, Option<String>, Glyph, bool, Option<u64>)> = stands::history(&history(&h, "api"), &[], 0, Glyph::Healthy).into_iter().map(|l| (l.deploy, l.short, l.state, l.now, l.to)).collect();
+    assert_eq!(lines, [(Some(3), Some("a1".to_owned()), Glyph::Healthy, true, None), (Some(2), Some("a2".to_owned()), Glyph::Superseded, false, Some(2)), (Some(1), Some("a1".to_owned()), Glyph::Superseded, false, Some(1))]);
+
+    // A sync that failed: failing, saying why.
+    if let Some(c) = h.clusters.get_mut("dev") {
+        c.failing_jobs.insert("migrate".into());
+    }
+    h.input(Input::UpsertApp(auto("jobs")));
+    deploy(&mut h, &git, "jobs", "j1", vec![job("migrate", "PreSync"), deployment("jobs", "jobs:1", json!({}))]);
+    assert!(h.run_until(60_000, |h| history(h, "jobs").iter().any(|d| !d.succeeded)));
+    let (s, word, line, pips, _) = stand(&h, "jobs", true, None);
+    assert_eq!((s, word.as_str(), pips.first()), (Stand::Failing, "Sync failed", Some(&Glyph::Failed)));
+    assert!(line.starts_with("#1 failed"), "{line}");
+}
