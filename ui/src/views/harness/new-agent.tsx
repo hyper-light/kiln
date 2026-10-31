@@ -19,12 +19,13 @@ import { clientId, harnessApi, sessionStore, type AgentInfo, type KindInfo, type
 import type { Agent, ReachRunner, TerminalSessionInfo } from "@/api/types";
 import { Loadable } from "@/components/ui/loading";
 import { Tip } from "@/components/ui/tooltip";
-import { harnessSessionsRes } from "@/lib/data";
+import { harnessSessionsRes, useRes, type Res } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage, useLocalStorage, useNow } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { useNavigate, useSearchParams } from "@/lib/router";
 import { atOf, doingOf, findAgents } from "./broadcast";
+import { ComposeField } from "./compose-field";
 import { useAttachments } from "./controls";
 import { agentLabel, modelLabel, tildify } from "./derive";
 import { InlinePath } from "./inline-path";
@@ -62,6 +63,9 @@ const askMachines = (signal: AbortSignal): Promise<Machines> =>
   ]).then(([byTarget, machines, shells, reach, workspaces]) => ({ byTarget, machines, shells, reach, workspaces }));
 /** Read again now and then: a machine connects, a harness is installed. */
 const MACHINES = { pollMs: 60_000 } as const;
+
+/** The machines' answer, as the composer reads it: Mission control asks for it with its agents, so its page comes whole. */
+export const machinesRes: Res<Machines> = { key: "harness/spawn", fetch: askMachines, opts: MACHINES };
 
 const COUNTS = [1, 2, 3, 4, 6, 8, 12];
 type Part = "machine" | null;
@@ -213,7 +217,7 @@ function resolve(c: Choices, m: Machines) {
 type Setup = ReturnType<typeof resolve>;
 
 function useSetup(c: Choices): Setup {
-  return resolve(c, useSuspenseResource("harness/spawn", askMachines, MACHINES).data);
+  return resolve(c, useRes(machinesRes).data);
 }
 
 /** Above the box: the agent page's own line, for the agent to be. */
@@ -531,6 +535,48 @@ const LineLoading = () => (
   </div>
 );
 
+/** More options before the machines have answered: there, turned off, so nothing under it moves when they do. */
+const UnderLoading = () => (
+  <div className="mc-under">
+    <button type="button" className="mc-toggle" disabled>
+      More options
+      <ChevronDown size={12} className="mc-chev" aria-hidden="true" />
+    </button>
+  </div>
+);
+
+const NO_FIELD: React.RefObject<HTMLTextAreaElement | null> = { current: null };
+const IGNORE = () => undefined;
+
+/**
+ * The composer before Mission control has its agents (its page's skeleton, mission.tsx): its own
+ * parts with what's written in it, none of them usable yet, so nothing moves when it comes.
+ */
+export function NewAgentLoading({ text }: { text: string }) {
+  return (
+    <section className="ms-msg cp mc" aria-hidden="true" inert>
+      <LineLoading />
+      <div className="ms-msg-field">
+        <div className="hx-compose-box">
+          <ComposeField text={text} readOnly placeholder="What should it do?" />
+          <div className="cp-bar">
+            <button type="button" className="cp-icon" disabled>
+              <Paperclip size={15} />
+            </button>
+            <MicButton field={NO_FIELD} setText={IGNORE} onNote={IGNORE} disabled />
+            <span className="cp-gap" />
+            <button type="button" className="cp-send" data-mode="send" disabled>
+              <ArrowUp size={15} />
+              <span>Start</span>
+            </button>
+          </div>
+        </div>
+      </div>
+      <UnderLoading />
+    </section>
+  );
+}
+
 export function NewAgent({
   text,
   onText,
@@ -662,25 +708,12 @@ export function NewAgent({
     onPick([a.id], true);
   };
 
-  // Grows with the text up to the stylesheet's most lines, then scrolls inside (as the composer).
-  const lengthWas = React.useRef(0);
-  const grow = React.useCallback(
-    (el: HTMLTextAreaElement | null) => {
-      field.current = el;
-      if (!el) return;
-      if (text.length < lengthWas.current || !text) el.style.height = "auto";
-      lengthWas.current = text.length;
-      const h = `${el.scrollHeight}px`;
-      if (el.style.height !== h) el.style.height = h;
-    },
-    [text],
-  );
-  const attach = (el: HTMLTextAreaElement | null) => {
-    grow(el);
+  // ?new=1's focus, given from the box: React attaches the field inside it first, so `field` holds it.
+  const attach = (box: HTMLDivElement | null) => {
     if (!fromLink) linked.current = false;
-    if (!el || !fromLink || linked.current) return;
+    if (!box || !fromLink || linked.current) return;
     linked.current = true;
-    el.focus();
+    field.current?.focus();
     const n = new URLSearchParams(params);
     n.delete("new");
     setParams(n, { replace: true });
@@ -702,13 +735,12 @@ export function NewAgent({
           void attachments.add(e.dataTransfer.files);
         }}
       >
-        <div className="hx-compose-box">
+        <div ref={attach} className="hx-compose-box">
           {attachments.chips}
-          <textarea
-            ref={attach}
-            className="hx-compose-input"
-            rows={1}
-            value={text}
+          {/* The agent page's field: it grows with the text, and what's typed is marked as it is there. */}
+          <ComposeField
+            text={text}
+            field={field}
             disabled={busy}
             autoFocus={autoFocus}
             placeholder={c.count > 1 ? `What should these ${c.count} agents do? Each gets this message` : "What should it do?"}
@@ -804,7 +836,7 @@ export function NewAgent({
           </div>
         )}
       </div>
-      <React.Suspense fallback={null}>
+      <React.Suspense fallback={<UnderLoading />}>
         <Under c={c} more={more} setMore={setMore} past={past} setPast={setPast} onResume={(s, p) => void resume(s, p)} />
       </React.Suspense>
       {(starting || error || result || note) && (

@@ -166,6 +166,8 @@ export interface GoalStack {
   resume_at?: number;
   /** Its big goals planned first (docs/goals.md, "Big goals, planned first"): on unless turned off. */
   plan_big?: boolean;
+  /** Paused by its agent for a person: "" for any such pause, a plan's id when it waits on your review of that plan. */
+  held_for?: string;
 }
 
 /** A terminal beside an agent, in its folder on its machine: its shell, or its harness's own screen. */

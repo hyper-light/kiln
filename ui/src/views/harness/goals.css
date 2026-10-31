@@ -242,6 +242,16 @@
   text-decoration: underline;
   text-decoration-color: #4a4f58;
 }
+/* Its plan waits on your review, at the top of this tab (views/plans/review.tsx). */
+.gs-review {
+  color: #e2cfae;
+  font-weight: 400;
+}
+.gs-review-it {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: #4a4f58;
+}
 .gs-more {
   padding: 0 0 10px 32px;
 }

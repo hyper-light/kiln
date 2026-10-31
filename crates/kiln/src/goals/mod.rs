@@ -2362,7 +2362,8 @@ pub async fn planned(hub: &Hub, agent: &str, goal: &str, plan: &crate::plans::Pl
     };
     add_at(hub, agent, goals, false, &At::Before(goal.to_owned())).await?;
     if *then == Then::Review {
-        let why = format!("plan \"{}\" is ready for you to look at: its steps go to the agent once you resume", plan.title);
+        // Answered in the agent's Plan tab (`crate::plans::review`): approved, the stack resumes.
+        let why = format!("plan \"{}\" waits on your review", plan.title);
         control_as(hub, agent, Action::Pause, by, Pausing { why: Some(why), until: None, review: Some(plan.id.clone()) }).await?;
     }
     let stack = get(hub, agent).await?;
@@ -2376,6 +2377,86 @@ pub async fn planned(hub: &Hub, agent: &str, goal: &str, plan: &crate::plans::Pl
         done(hub, agent, Some(&id), Some("the plan is ready"), by).await?;
     }
     get(hub, agent).await
+}
+
+/// Goal `goal`'s parts made from plan `plan`'s steps, and their own parts, still to go: what an
+/// answer to the plan's review takes off the stack ([`answer_plan`]).
+fn plan_parts(items: &[Item], goal: &str, plan: &str) -> Vec<String> {
+    let steps: Vec<String> = items
+        .iter()
+        .filter(|i| i.part_of.as_deref() == Some(goal) && i.part_kind.as_deref() == Some("plan") && i.step.as_ref().is_some_and(|s| s.plan == plan))
+        .map(|i| i.id.clone())
+        .collect();
+    let under: Vec<String> = steps.iter().flat_map(|s| descendants(items, s)).collect();
+    items.iter().filter(|i| i.status == "pending" && (steps.contains(&i.id) || under.contains(&i.id))).map(|i| i.id.clone()).collect()
+}
+
+/// The words a plan sent back for changes asks its agent, as a goal: most of the person's own (all of
+/// them are kept with the plan, `plans_get`'s `reviewed`).
+fn revise_words(plan: &crate::plans::Plan, research: Option<&str>, words: &str) -> String {
+    const SAID: usize = 1200;
+    let said: String = words.split_whitespace().collect::<Vec<_>>().join(" ");
+    let cut = said.chars().count() > SAID;
+    let said: String = said.chars().take(SAID).collect();
+    format!(
+        "Change plan \"{}\" (plan {}{}) as the person asked when they reviewed version {}: \"{}{}\". Rewrite its steps (plans_update), research more where it needs it (research_add), then say it's ready again (plans_ready): it comes back to them to look at",
+        plan.title.chars().take(160).collect::<String>(),
+        plan.id,
+        research.map(|r| format!(", research {r}")).unwrap_or_default(),
+        plan.version,
+        said,
+        if cut { "… (the rest: plans_get, its `reviewed`)" } else { "" },
+    )
+}
+
+/// Plan `plan`, made from goal `goal` of agent `agent` and held for a person to look at first
+/// ([`planned`] with [`Then::Review`]), answered by them (`crate::plans::review`), no longer held:
+/// rejected (`revise` none), its steps still to go come off the stack, the goal ends skipped, and
+/// the stack waits, paused by `by`, until they resume it; sent back for changes (`revise`: their
+/// words), its steps still to go come off, a part before the goal asks the agent to change it and
+/// say it's ready again (it comes back for review then: `plans.ready`), and the stack runs from
+/// there, that part going to the agent at once. `made`: the id of that part (from the answer's key,
+/// so asked again it isn't added twice). Approving is resuming ([`control_as`]).
+pub async fn answer_plan(hub: &Hub, agent: &str, goal: &str, plan: &crate::plans::Plan, revise: Option<(&str, Option<&str>)>, made: Option<String>, by: &By) -> R<Stack> {
+    known(hub, agent)?;
+    let part = revise.map(|(words, research)| clean(&revise_words(plan, research, words))).transpose()?;
+    {
+        let _one = CHANGING.lock().await;
+        let stack = get(hub, agent).await?;
+        if !stack.items.iter().any(|i| i.id == goal && matches!(i.status.as_str(), "pending" | "active")) {
+            return Err(Error::Bad("the goal this plan was made from has ended, or gone: its review has nothing left to answer".into()));
+        }
+        let gone = plan_parts(&stack.items, goal, &plan.id);
+        let reject = revise.is_none();
+        withdraw(hub, agent, &stack.items, |i| gone.contains(&i.id) || (reject && i.id == goal)).await;
+        let items = stack.items.clone();
+        let (agent_s, goal_s, now, who) = (agent.to_owned(), goal.to_owned(), now_ms(hub), by.name());
+        let skipped = format!("Skipped by {who}: its plan was rejected (\"{}\", version {}).", plan.title, plan.version);
+        let paused = format!("Paused by {who}: the plan \"{}\" was rejected, and its goal skipped.", plan.title);
+        hub.store
+            .call(move |c| {
+                let tx = crate::store::tx(c)?;
+                for id in &gone {
+                    tx.execute("DELETE FROM goal_items WHERE id = ?1", params![id])?;
+                }
+                rewire(&tx, &items, &gone)?;
+                if reject {
+                    tx.execute("UPDATE goal_items SET status = 'skipped', ended_at = ?2, reason = ?3 WHERE id = ?1 AND status IN ('pending', 'active')", params![goal_s, now, skipped])?;
+                    touch(&tx, &agent_s, Some("paused"), Some(&paused), now)?;
+                }
+                tx.execute("UPDATE goal_stacks SET held_for = NULL WHERE agent = ?1", params![agent_s])?;
+                renumber(&tx, &agent_s)?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await?;
+        if reject {
+            crate::metrics::agents().goal_ended(false);
+        }
+    }
+    let Some(text) = part else { return get(hub, agent).await };
+    add_at(hub, agent, vec![NewGoal { id: made, text, part_of: Some(goal.to_owned()), kind: Some("planning"), ..NewGoal::default() }], false, &At::Before(goal.to_owned())).await?;
+    control_as(hub, agent, Action::Start, by, Pausing::default()).await
 }
 
 /// What a running stack does next.
@@ -4898,7 +4979,7 @@ mod stack_tests {
             itself.agent = Some(id.to_owned());
             let r = call_ok(crate::ops::call(crate::ops::Cx { hub: Arc::clone(&hub), caller: itself }, "plans.ready", serde_json::json!({"id": plans.first(), "then": "review"})).await)?;
             let s = get(&hub, id).await?;
-            assert!(s.state == "paused" && s.reason.as_deref().is_some_and(|w| w.contains("is ready for you to look at")), "{r} {:?}", s.reason);
+            assert!(s.state == "paused" && s.reason.as_deref().is_some_and(|w| w.contains("waits on your review")), "{r} {:?}", s.reason);
             assert_eq!(s.held_for.as_deref(), plans.first().map(String::as_str), "it waits on you to look at the plan");
             assert_eq!(s.items.iter().filter(|i| i.part_of.as_deref() == Some(one.as_str()) && i.part_kind.as_deref() == Some("plan") && i.status == "pending").count(), 2);
             // Its steps met by hand: the goal is met; resumed, the next goal's planning goes on.
@@ -4931,6 +5012,97 @@ mod stack_tests {
             let g = s.items.iter().find(|i| i.id == two).cloned().unwrap_or_default();
             assert_eq!((g.status.as_str(), g.reason.as_deref()), ("met", Some("Met with its plan: its run is done, every step met.")), "{:?}", words(&s));
             assert_eq!(metrics.goals_ended.get(&["met"]), 2, "the run's part and its goal");
+            Ok(())
+        })
+    }
+
+    /// Goal `goal` of agent `id` planned (steps `titles`, its research inside and out) and said
+    /// ready by the agent itself for the person to look at first: the plan's id.
+    async fn held_for_review(hub: &Arc<Hub>, id: &str, goal: &str, titles: &[&str]) -> anyhow::Result<String> {
+        let person = crate::ops::Cx { hub: Arc::clone(hub), caller: crate::authz::Caller::owner() };
+        let mut me = crate::authz::Caller::owner();
+        me.agent = Some(id.to_owned());
+        let itself = crate::ops::Cx { hub: Arc::clone(hub), caller: me };
+        settled(hub, id).await;
+        let p = call_ok(crate::ops::call(person, "goals.plan", serde_json::json!({"agent": id, "id": goal})).await)?;
+        let (pid, rid) = (at(&p, &["plan"]).unwrap_or_default().to_owned(), at(&p, &["research"]).unwrap_or_default().to_owned());
+        let items = titles.iter().map(|t| crate::plans::Item { title: (*t).into(), basis: vec!["f1".into()], ..crate::plans::Item::default() }).collect();
+        crate::plans::update(hub, &pid, crate::plans::Patch { items: Some(items), ..crate::plans::Patch::default() }, "admin").await?;
+        researched(hub, &rid).await?;
+        call_ok(crate::ops::call(itself, "plans.ready", serde_json::json!({"id": pid, "then": "review"})).await)?;
+        Ok(pid)
+    }
+
+    /// A plan held for a person's review, answered (`plans.review`, crate::plans::review): approved,
+    /// its steps go and nothing waits on them; rejected, its steps come off, its goal ends skipped
+    /// and the stack waits, paused, held no longer; sent back with their words, its steps come off,
+    /// a part asks the agent to change it, and said ready again, whatever `then` the agent gives,
+    /// it's held for their review once more, a version on. Asked again under its key nothing more
+    /// happens; an agent can't answer; a version that changed since, or a plan nothing waits on, is
+    /// refused.
+    #[test]
+    fn a_plan_held_for_review_is_approved_rejected_or_sent_back() -> anyhow::Result<()> {
+        within(async {
+            let (hub, id, _folder) = agent_with_goals(&["one", "two", "three"]).await?;
+            let id = id.as_str();
+            let person = crate::ops::Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
+            let mut me = crate::authz::Caller::owner();
+            me.agent = Some(id.to_owned());
+            let itself = crate::ops::Cx { hub: Arc::clone(&hub), caller: me };
+            let ids: Vec<String> = get(&hub, id).await?.items.iter().map(|i| i.id.clone()).collect();
+            let goal = |k: usize| ids.get(k).cloned().unwrap_or_default();
+            let parts = |s: &Stack, g: &str, kind: &str| s.items.iter().filter(|i| i.part_of.as_deref() == Some(g) && i.part_kind.as_deref() == Some(kind) && matches!(i.status.as_str(), "pending" | "active")).map(|i| i.text.clone()).collect::<Vec<_>>();
+
+            // Approved: its steps go; asked again under its key, nothing more; asked anew, refused.
+            let one = held_for_review(&hub, id, &goal(0), &["a", "b"]).await?;
+            assert_eq!(get(&hub, id).await?.held_for.as_deref(), Some(one.as_str()));
+            let refused = crate::ops::call(itself.clone(), "plans.review", serde_json::json!({"id": one, "answer": "approve"})).await;
+            assert!(matches!(&refused, Err((c, _)) if *c == http::StatusCode::FORBIDDEN), "an agent can't answer: {refused:?}");
+            let stale = crate::ops::call(person.clone(), "plans.review", serde_json::json!({"id": one, "answer": "approve", "version": 99})).await;
+            assert!(matches!(&stale, Err((c, _)) if *c == http::StatusCode::CONFLICT), "a version since changed: {stale:?}");
+            let version = crate::plans::get(&hub, &one).await?.version;
+            call_ok(crate::ops::call(person.clone(), "plans.review", serde_json::json!({"id": one, "answer": "approve", "version": version, "key": "k1"})).await)?;
+            let s = get(&hub, id).await?;
+            assert_eq!((s.state.as_str(), s.held_for.as_deref()), ("running", None), "{:?}", words(&s));
+            assert_eq!(parts(&s, &goal(0), "plan").len(), 2, "{:?}", words(&s));
+            call_ok(crate::ops::call(person.clone(), "plans.review", serde_json::json!({"id": one, "answer": "approve", "key": "k1"})).await)?;
+            let again = crate::ops::call(person.clone(), "plans.review", serde_json::json!({"id": one, "answer": "reject", "key": "k2"})).await;
+            assert!(matches!(&again, Err((c, _)) if *c == http::StatusCode::CONFLICT), "nothing waits on it now: {again:?}");
+            assert_eq!(crate::plans::get(&hub, &one).await?.reviewed.map(|r| (r.answer, r.version)), Some((crate::plans::review::Answer::Approve, version)));
+
+            // Rejected: its steps come off, its goal is skipped, and the stack waits, held no longer.
+            let two = held_for_review(&hub, id, &goal(1), &["c", "d"]).await?;
+            call_ok(crate::ops::call(person.clone(), "plans.review", serde_json::json!({"id": two, "answer": "reject", "key": "k3"})).await)?;
+            let s = get(&hub, id).await?;
+            assert!(parts(&s, &goal(1), "plan").is_empty(), "{:?}", words(&s));
+            let g = s.items.iter().find(|i| i.id == goal(1)).cloned().unwrap_or_default();
+            assert!(g.status == "skipped" && g.reason.as_deref().is_some_and(|r| r.contains("rejected")), "{:?}", words(&s));
+            assert!(s.state == "paused" && s.held_for.is_none() && s.reason.as_deref().is_some_and(|r| r.contains("rejected")), "{:?} {:?}", s.state, s.reason);
+
+            // Sent back with words: its steps come off, a part asks the agent to change it, the stack
+            // runs; said ready again (as goals, it says), it's back for review, a version on.
+            control(&hub, id, Action::Start).await?;
+            let three = held_for_review(&hub, id, &goal(2), &["e", "f"]).await?;
+            let before = crate::plans::get(&hub, &three).await?.version;
+            let blank = crate::ops::call(person.clone(), "plans.review", serde_json::json!({"id": three, "answer": "revise", "words": "  "})).await;
+            assert!(matches!(&blank, Err((c, _)) if *c == http::StatusCode::BAD_REQUEST), "revise says what should change: {blank:?}");
+            call_ok(crate::ops::call(person.clone(), "plans.review", serde_json::json!({"id": three, "answer": "revise", "words": "f before e, please", "version": before, "key": "k4"})).await)?;
+            call_ok(crate::ops::call(person.clone(), "plans.review", serde_json::json!({"id": three, "answer": "revise", "words": "f before e, please", "key": "k4"})).await)?;
+            let s = get(&hub, id).await?;
+            assert!(parts(&s, &goal(2), "plan").is_empty(), "{:?}", words(&s));
+            let asks = parts(&s, &goal(2), "planning");
+            assert!(asks.len() == 1 && asks.iter().all(|t| t.contains("f before e, please") && t.contains(&three)), "one part asks for the change, once: {asks:?}");
+            assert_eq!((s.state.as_str(), s.held_for.as_deref()), ("running", None));
+            assert_eq!(crate::plans::get(&hub, &three).await?.phase, "planning");
+            let items = ["f", "e"].iter().map(|t| crate::plans::Item { title: (*t).into(), basis: vec!["f1".into()], ..crate::plans::Item::default() }).collect();
+            crate::plans::update(&hub, &three, crate::plans::Patch { items: Some(items), ..crate::plans::Patch::default() }, "admin").await?;
+            call_ok(crate::ops::call(itself.clone(), "plans.ready", serde_json::json!({"id": three, "then": "goals"})).await)?;
+            let s = get(&hub, id).await?;
+            assert_eq!(s.held_for.as_deref(), Some(three.as_str()), "back for review: {:?}", words(&s));
+            let p = crate::plans::get(&hub, &three).await?;
+            assert!(p.version > before, "a version on");
+            assert_eq!(p.reviewed.map(|r| (r.answer, r.words, r.version)), Some((crate::plans::review::Answer::Revise, Some("f before e, please".to_owned()), before)));
+            assert_eq!(s.items.iter().filter(|i| i.step.as_ref().is_some_and(|st| st.plan == three && st.version == p.version)).count(), 2, "{:?}", words(&s));
             Ok(())
         })
     }

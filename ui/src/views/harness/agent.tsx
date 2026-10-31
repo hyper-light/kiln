@@ -40,6 +40,8 @@ import { Timeline, type ReplyTarget } from "./timeline";
 import { BesideTerminals, openBeside as openTerminal } from "./beside";
 import { useDrafts } from "./state";
 import { PlanSourceContext } from "@/views/plans/save";
+import { useReviewWaits } from "@/views/plans/review";
+import { revealReview } from "@/views/plans/reveal";
 import { useEndWithChildren } from "./family";
 import { LoadingMark, PrismLabel } from "./signals";
 import { markAnswered, stillAsked, unmark, useAnswered } from "./answered";
@@ -49,6 +51,9 @@ type PhoneTab = "work" | InspectorTab;
 
 const NO_EVENTS: HEvent[] = [];
 const NO_TODOS: Todo[] = [];
+
+/** The composer's field, to type in: the field itself, not the marked copy drawn under it (compose-field.tsx), which has its class too. */
+const composerField = () => document.querySelector<HTMLTextAreaElement>("textarea.hx-compose-input");
 
 /** What a message to it can carry. */
 const acceptsOf = (meta: Meta | null) => {
@@ -130,7 +135,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
       const d = useDrafts.getState();
       const was = d.drafts[id] ?? "";
       d.setDraft(id, was.trim() ? `${was.replace(/\s+$/, "")}\n\n${text}` : text);
-      document.querySelector<HTMLTextAreaElement>(".hx-compose-input")?.focus();
+      composerField()?.focus();
     },
     [id],
   );
@@ -223,7 +228,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
     setFindOpen(false);
     setFindAt(null);
     setSearched("");
-    document.querySelector<HTMLTextAreaElement>(".hx-compose-input")?.focus();
+    composerField()?.focus();
   };
   const find = React.useMemo(() => (findOpen ? { q, now: findAt } : undefined), [findOpen, q, findAt]);
   const showTools = React.useCallback(() => {
@@ -235,6 +240,11 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
     setTrayCollapsed(false);
     setTab("plan");
     setPhoneTab("plan");
+  };
+  /** A plan it proposes, reviewed where its plans are: its Plan tab, the review at its top. */
+  const reviewPlan = () => {
+    showPlan();
+    revealReview();
   };
   /** /model, /effort, /permissions: that setting of the head's run settings, opened in place. */
   const openSetting = (label: "Model" | "Effort" | "Permissions") => {
@@ -336,6 +346,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
                 accountOpen={account !== null}
                 find={find}
                 footer={footer}
+                onReviewPlan={task ? undefined : reviewPlan}
               />
             </AboutContext.Provider>
           </PlanSourceContext.Provider>
@@ -663,10 +674,12 @@ function PhoneTabs({ store, tab, onTab }: { store: SessionStore; tab: PhoneTab; 
   const fileCount = React.useMemo(() => (changes ? changes.length : changesetOf(edits).length), [changes, edits]);
   const todos = useSession(store, (s) => s.state?.todos ?? NO_TODOS);
   const todosDone = todos.filter((t) => t.status === "completed").length;
-  const tabs: { id: PhoneTab; label: string; n?: string; warn?: boolean }[] = [
+  // A plan waiting on your review: its tab says so (review.tsx).
+  const reviewing = useReviewWaits(store);
+  const tabs: { id: PhoneTab; label: string; n?: string; warn?: boolean; waits?: boolean }[] = [
     { id: "work", label: "Work", n: approvals ? String(approvals) : undefined, warn: approvals > 0 },
     { id: "changes", label: "Changes", n: fileCount ? String(fileCount) : undefined },
-    { id: "plan", label: "Plan", n: todos.length ? `${todosDone}/${todos.length}` : undefined },
+    { id: "plan", label: "Plan", n: todos.length ? `${todosDone}/${todos.length}` : undefined, waits: reviewing !== null },
     { id: "tools", label: "Tools" },
   ];
   return (
@@ -679,6 +692,7 @@ function PhoneTabs({ store, tab, onTab }: { store: SessionStore; tab: PhoneTab; 
               {t.n}
             </span>
           )}
+          {t.waits && <i className="pr-tab-dot" role="img" aria-label="a plan waits on your review" />}
         </button>
       ))}
     </div>
