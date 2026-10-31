@@ -22,6 +22,8 @@ import { useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
 import { CommandList, matchCommands, parseSlash } from "./palette";
 import { MODES, SendModes } from "./composer";
+import { ComposeField } from "./compose-field";
+import { commandNames } from "./marks";
 import { useAttachments } from "./controls";
 import { agentLabel } from "./derive";
 import { machineName } from "./parts";
@@ -269,6 +271,13 @@ function Bar({ agents: everyone, reach, onEnded, all = [], onPick, preview, text
     ...(reach === "selected" ? [own("end", `End ${count(n, "agent")}: their processes stop`)] : []),
   ];
   const kilns = (name: string) => kiln.some((c) => c.name === name);
+  // Theirs and kiln's own, marked wherever they're typed, as an agent's composer marks its own. Their
+  // names change only with who it goes to (End is for those picked), not with kiln's counts.
+  const names = React.useMemo(
+    () => commandNames([...kiln, ...(preview?.commands ?? [])]),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [reach, preview],
+  );
   // The slash palette: kiln's own first, then what the agents understand, marked where only some do.
   const slash = parseSlash(text);
   const items = focused && slash?.typingName ? [...matchCommands(kiln, slash.name), ...matchCommands(preview?.commands ?? [], slash.name).filter((c) => !kilns(c.name))] : [];
@@ -403,19 +412,6 @@ function Bar({ agents: everyone, reach, onEnded, all = [], onPick, preview, text
       "No agent to send to"
     : "";
 
-  // Grows with the text up to the stylesheet's most lines, then scrolls inside (as the composer).
-  const lengthWas = React.useRef(0);
-  const grow = React.useCallback(
-    (el: HTMLTextAreaElement | null) => {
-      field.current = el;
-      if (!el) return;
-      if (text.length < lengthWas.current || !text) el.style.height = "auto";
-      lengthWas.current = text.length;
-      const h = `${el.scrollHeight}px`;
-      if (el.style.height !== h) el.style.height = h;
-    },
-    [text],
-  );
   const picked = reach === "selected" ? agents : [];
   const sendLabel = working > 0 ? (mode === "queue" ? "Queue" : mode === "steer" ? "Steer" : "Send now") : "Send";
 
@@ -474,11 +470,11 @@ function Bar({ agents: everyone, reach, onEnded, all = [], onPick, preview, text
             )}
           </div>
           {attachments.chips}
-          <textarea
-            ref={grow}
-            className="hx-compose-input"
-            rows={1}
-            value={text}
+          {/* The agent page's field: it grows with the text, and what's typed is marked as it is there. */}
+          <ComposeField
+            text={text}
+            names={names}
+            field={field}
             disabled={n === 0}
             autoFocus={autoFocus}
             placeholder={placeholder}

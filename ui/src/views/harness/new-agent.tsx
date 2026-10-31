@@ -24,6 +24,7 @@ import { errorMessage, useLocalStorage, useNow } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { useNavigate, useSearchParams } from "@/lib/router";
 import { atOf, doingOf, findAgents } from "./broadcast";
+import { ComposeField } from "./compose-field";
 import { useAttachments } from "./controls";
 import { agentLabel, modelLabel, tildify } from "./derive";
 import { InlinePath } from "./inline-path";
@@ -660,25 +661,12 @@ export function NewAgent({
     onPick([a.id], true);
   };
 
-  // Grows with the text up to the stylesheet's most lines, then scrolls inside (as the composer).
-  const lengthWas = React.useRef(0);
-  const grow = React.useCallback(
-    (el: HTMLTextAreaElement | null) => {
-      field.current = el;
-      if (!el) return;
-      if (text.length < lengthWas.current || !text) el.style.height = "auto";
-      lengthWas.current = text.length;
-      const h = `${el.scrollHeight}px`;
-      if (el.style.height !== h) el.style.height = h;
-    },
-    [text],
-  );
-  const attach = (el: HTMLTextAreaElement | null) => {
-    grow(el);
+  // ?new=1's focus, given from the box: React attaches the field inside it first, so `field` holds it.
+  const attach = (box: HTMLDivElement | null) => {
     if (!fromLink) linked.current = false;
-    if (!el || !fromLink || linked.current) return;
+    if (!box || !fromLink || linked.current) return;
     linked.current = true;
-    el.focus();
+    field.current?.focus();
     const n = new URLSearchParams(params);
     n.delete("new");
     setParams(n, { replace: true });
@@ -700,13 +688,12 @@ export function NewAgent({
           void attachments.add(e.dataTransfer.files);
         }}
       >
-        <div className="hx-compose-box">
+        <div ref={attach} className="hx-compose-box">
           {attachments.chips}
-          <textarea
-            ref={attach}
-            className="hx-compose-input"
-            rows={1}
-            value={text}
+          {/* The agent page's field: it grows with the text, and what's typed is marked as it is there. */}
+          <ComposeField
+            text={text}
+            field={field}
             disabled={busy}
             autoFocus={autoFocus}
             placeholder={c.count > 1 ? `What should these ${c.count} agents do? Each gets this message` : "What should it do?"}
