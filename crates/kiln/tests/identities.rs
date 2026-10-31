@@ -1596,6 +1596,27 @@ fn w27_r05_a_legs_results_verify_as_the_leg() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// W27-R05: a runner behind its legs, as a busy machine's falls behind (a test build's `lag`),
+/// still signs all a leg sent. A leg's end that comes while its last sends wait their turn (its test
+/// step's report line, that step's end) goes after them: its results verify, that step's end among
+/// them.
+/// `cargo test -p kiln --features chaos --test identities w27_r05_a_runner_behind_its_legs_signs_all_they_sent`
+#[cfg(feature = "chaos")]
+#[test]
+fn w27_r05_a_runner_behind_its_legs_signs_all_they_sent() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let steps = "      - run: echo building\n      - test-results: { path: report.xml }\n        run: |\n          printf '%s' '<?xml version=\"1.0\"?><testsuite name=\"calc\" tests=\"1\"><testcase classname=\"calc\" name=\"adds\"/></testsuite>' > report.xml\n          echo tested\n";
+    let run = leg_on_a_test_runner_with(dir.path(), &legs_steps_workflow(steps), &[], Some("lag=300ms"))?;
+    let leg = the_leg(dir.path())?;
+    let (st, body) = http(run.s.port, "GET", &format!("/api/ci/legs/{leg}/signed"), &run.s.admin, None)?;
+    anyhow::ensure!(st == 200, "{st} {body}\n{}", run.s.log());
+    let v: Value = serde_json::from_str(&body)?;
+    assert_eq!(field(&v, "state"), "verified", "{v:#}");
+    let ends: Vec<u64> = v.get("steps").and_then(Value::as_array).into_iter().flatten().filter_map(|s| s.get("idx").and_then(Value::as_u64)).collect();
+    assert!(ends.contains(&0) && ends.contains(&1), "both steps' ends are signed: {v:#}");
+    Ok(())
+}
+
 /// W27-R05: a leg on a runner from before legs signed (a test build's `old`) sends no signed
 /// records. The API says the leg's are unsigned and why, never verified.
 #[cfg(feature = "chaos")]

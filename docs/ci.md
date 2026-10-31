@@ -9142,11 +9142,13 @@ delegation of it.
 - *Its results* (`application/vnd.kiln.ci.results+json`): one statement, numbered 1 on its
   `results` stream. Its body is each step's end and the leg's conclusion; its subjects are its logs
   and reports.
-- *Signed at its end*, in `Ev::Done`, with the leg's key before letting go of it.
-  `AgentMsg::LegResults` carries them all. It goes before `JobFinished`, and again with it until
-  it's received (`CAP_LEG_SIGNS`, docs/wire.md). A `k8s` pool's pod's leg signs too: its runner
-  says nothing of itself past `Build`'s caps, so it says so of the leg as it asks for the leg's
-  identity (`IdentityAsk.signs`), and kiln asks the leg for provenance by that.
+- *Signed at its end*, in `Ev::Done`, with the leg's key before letting go of it. What the leg
+  sent before it ended goes first, however far its runner is behind: an end that comes while its
+  last log chunks or step ends still wait on the runner's uplink waits behind them, so its records
+  cover all it sent. `AgentMsg::LegResults` carries them all. It goes before `JobFinished`, and
+  again with it until it's received (`CAP_LEG_SIGNS`, docs/wire.md). A `k8s` pool's pod's leg
+  signs too: its runner says nothing of itself past `Build`'s caps, so it says so of the leg as it
+  asks for the leg's identity (`IdentityAsk.signs`), and kiln asks the leg for provenance by that.
 - *Taken*: the server checks each record as it takes it, at that time, through its records
   (`verify_under`).
   - Each must be the leg's, signed by the leg it gave that job on that runner, under its delegation

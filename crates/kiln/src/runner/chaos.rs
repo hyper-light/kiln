@@ -7,6 +7,9 @@
 //! - `down=<duration>`: after each drop, the runner stays away that long before it dials again (a
 //!   link cut for a while, not a blip);
 //! - `delay=<duration>`: everything it sends the server waits that long first;
+//! - `lag=<duration>`: the runner takes each thing its jobs send (a log's chunk, a job's event)
+//!   that long late, as a busy machine's runner falls behind its jobs: a job's end comes while
+//!   what it sent before still waits (W27-R05);
 //! - `oom=<duration>`: a leg's step on the host is killed that long after it starts, as the OOM
 //!   killer kills (SIGKILL, and counted where kiln counts the OOM killer's kills);
 //! - `disk=<MiB>`: a leg's job container gets a workspace of that size, so filling it is ENOSPC;
@@ -59,6 +62,8 @@ pub struct Chaos {
     pub drop_every: Option<Duration>,
     pub down_for: Option<Duration>,
     pub delay: Option<Duration>,
+    /// Its jobs' sends taken this late (`lag=`).
+    pub lag: Option<Duration>,
     pub oom_after: Option<Duration>,
     pub disk_mib: Option<u32>,
     pub corrupt: bool,
@@ -111,6 +116,7 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
             "drop" => c.drop_every = Some(d()?),
             "down" => c.down_for = Some(d()?),
             "delay" => c.delay = Some(d()?),
+            "lag" => c.lag = Some(d()?),
             "oom" => c.oom_after = Some(d()?),
             "disk" => c.disk_mib = Some(v.parse().map_err(|_| anyhow::anyhow!("chaos `disk` takes MiB, not `{v}`"))?),
             "corrupt" => c.corrupt = true,
@@ -140,7 +146,7 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
                 }
             }
             "seed" => c.seed = v.parse().map_err(|_| anyhow::anyhow!("chaos `seed` takes a number, not `{v}`"))?,
-            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, oom, disk, corrupt, fetch, platform, rebuild, shed, twice, late, seed, fanout, old, copy or keys"),
+            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, lag, oom, disk, corrupt, fetch, platform, rebuild, shed, twice, late, seed, fanout, old, copy or keys"),
         }
     }
     Ok(c)
@@ -359,6 +365,7 @@ mod tests {
                 drop_every: Some(Duration::from_secs(2)),
                 down_for: None,
                 delay: Some(Duration::from_millis(300)),
+                lag: None,
                 oom_after: Some(Duration::from_secs(1)),
                 disk_mib: Some(8),
                 corrupt: true,
@@ -382,6 +389,7 @@ mod tests {
         assert!(parse("fetch")?.fetch);
         assert_eq!(parse("rebuild=4s")?.rebuild_after, Some(Duration::from_secs(4)));
         assert_eq!(parse("drop=5s,down=30s")?.down_for, Some(Duration::from_secs(30)));
+        assert_eq!(parse("lag=300ms")?.lag, Some(Duration::from_millis(300)));
         assert!(parse("platform=plan9/mips").is_err());
         assert!(parse("flood=1s").is_err_and(|e| e.to_string().contains("no fault `flood`")));
         assert!(parse("oom=soon").is_err());
