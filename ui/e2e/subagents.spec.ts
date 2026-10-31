@@ -12,15 +12,19 @@ import { expect, test, type Page } from "@playwright/test";
 /** Against a real kiln server (playwright.config.ts): these drive the mock's agents. */
 const REAL = !!process.env.E2E_BASE_URL;
 
-/** The commands the page sends agents' sessions, as it sends them. */
+/**
+ * The commands the page sends agents' sessions, as it sends them: each out of the id it goes under
+ * (`SessionUp`: `{t: "cmd", id, c}`), or bare, as clients from before ids send one.
+ */
 function commands(page: Page): Record<string, unknown>[] {
   const sent: Record<string, unknown>[] = [];
   page.on("websocket", (ws) => {
     if (!ws.url().includes("/api/harness/sessions/")) return;
     ws.on("framesent", (f) => {
       try {
-        const v: unknown = JSON.parse(String(f.payload));
-        if (v && typeof v === "object") sent.push(v as Record<string, unknown>);
+        const v = JSON.parse(String(f.payload)) as { t?: unknown; c?: Record<string, unknown>; type?: unknown };
+        if (v.t === "cmd" && v.c) sent.push(v.c);
+        else if (typeof v.type === "string") sent.push(v);
       } catch {
         // Not a command.
       }
