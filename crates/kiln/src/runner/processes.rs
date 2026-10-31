@@ -1159,14 +1159,25 @@ mod tests {
             probe.try_lock()?;
             drop(probe);
             assert!(execution.accepts_work(), "canceling a command does not stop the original execution grant");
-            let path = marker.clone();
-            execution.scope(async move {
+            // U03: a descendant may attempt its write only AFTER the original stopped
+            // proof releases capacity. Wall-clock delay before Stop is not a containment test.
+            let ready = dir.path().join("escaped-ready");
+            let release = dir.path().join("escaped-release");
+            let (path, started, released) = (marker.clone(), ready.clone(), release.clone());
+            let escaped = execution.scope(async move {
                 let mut command = std::process::Command::new("sh");
-                command.args(["-c", "setsid sh -c 'sleep 0.5; printf orphan > \"$1\"' sh \"$1\" </dev/null >/dev/null 2>&1 & sleep 0.05", "sh"]).arg(path).env_clear();
+                command.args(["-c", "setsid sh -c 'printf ready > \"$2\"; while [ ! -f \"$3\" ]; do sleep 0.01; done; printf orphan > \"$1\"' sh \"$1\" \"$2\" \"$3\" </dev/null >/dev/null 2>&1 &", "sh"]).arg(path).arg(started.clone()).arg(released).env_clear();
                 let mut child = crate::proc::spawn_group(command)?;
+                let escaped = child.owned.clone().context("the setsid descendant lost its original physical owner")?;
                 assert_eq!(child.wait().await, Some(0));
-                Ok::<_, anyhow::Error>(())
+                crate::rt::timeout(Duration::from_secs(5), async {
+                    while !started.try_exists()? { crate::rt::sleep(Duration::from_millis(20)).await; }
+                    Ok::<_, anyhow::Error>(())
+                }).await.context("the setsid descendant never reached its release barrier")??;
+                Ok::<_, anyhow::Error>(escaped)
             }).await?;
+            assert!(!escaped.kernel.as_ref().context("the setsid descendant lost native containment")?.empty_proven()?, "the ready descendant remains live before Stop");
+            assert!(!marker.exists(), "the descendant must wait for its explicit release barrier");
             let cleanup_marker = dir.path().join("trusted-cleanup");
             let mut cleanup_command = std::process::Command::new("sh");
             cleanup_command.args(["-c", "printf cleaned > \"$1\"", "sh"]).arg(&cleanup_marker);
@@ -1176,6 +1187,8 @@ mod tests {
             bounded_command.args(["-c", "sleep 30; printf late > \"$1\"", "sh"]).arg(&late_marker);
             let bounded = execution.prepare_cleanup(bounded_command)?;
             execution.stop_commands().await;
+            assert!(escaped.finished.is_cancelled(), "ordinary Stop waits for this original descendant group");
+            assert!(escaped.kernel.as_ref().context("the stopped descendant lost native containment")?.empty_proven()?, "ordinary Stop requires the original kernel group's positive empty proof");
             assert!(!recovery_evidence(&admission)?.iter().any(|p| p.execution == execution.identity()), "the preowned cleanup keeps capacity fenced");
             assert!(execution.scope(async { crate::proc::output(std::process::Command::new("true"), Duration::from_secs(1)).await }).await.is_err());
             let (stopping, finished) = (Arc::clone(&execution), crate::rt::Shutdown::new());
@@ -1194,6 +1207,8 @@ mod tests {
             assert_eq!(std::fs::read(&cleanup_marker)?, b"cleaned");
             crate::rt::timeout(Duration::from_secs(5), waiter).await??;
             execution.stop().await;
+            assert!(recovery_evidence(&admission)?.iter().any(|p| p.execution == execution.identity() && p.job == "contained-fixture" && p.attempt == Some(1) && p.work == dir.path()), "the release barrier requires this exact stopped execution proof");
+            std::fs::write(&release, b"released")?;
             crate::rt::sleep(Duration::from_millis(700)).await;
             assert!(!marker.exists(), "setsid descendants end before capacity is released");
             assert!(!sequence_marker.exists(), "a retired sequential phase cannot write after its successor starts");
