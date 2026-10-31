@@ -31,9 +31,11 @@ fn held(f: &Fleet, from_s: i64) -> anyhow::Result<Result<i64, (u16, String)>> {
 
 #[test]
 fn after_a_restart_a_query_is_whole_or_refused_never_short() -> anyhow::Result<()> {
-    // Its log isn't cut for size: past 32 MiB a cut part-way through these points would leave a tail
-    // that replays too fast to catch a query in, on a loaded machine (a gate, 2026-10-31).
-    let mut f = Fleet::with_env(|_| String::new(), &[("KILN_OBSERVE_CUT_BYTES", "1073741824")])?;
+    // Its log isn't cut for size (past 32 MiB a cut part-way through these points left a tail that
+    // replayed before the first query came, a gate on a loaded machine), and the store says it has
+    // replayed no sooner than 5 s after it opens (fedora's replay of the whole log ended before its
+    // /healthz answered): whatever the machine, the test's first queries come while it replays.
+    let mut f = Fleet::with_env(|_| String::new(), &[("KILN_OBSERVE_CUT_BYTES", "1073741824"), ("KILN_OBSERVE_REPLAY_HOLD_MS", "5000")])?;
     // 200 series, a point a second each for three hours before now (2,160,000 points), in requests
     // of five minutes of every series; the span's start on a multiple of its own length, as the
     // query's one bucket is.

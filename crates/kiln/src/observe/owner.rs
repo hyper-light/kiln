@@ -826,6 +826,14 @@ fn cut_bytes() -> Option<u64> {
     *BYTES.get_or_init(|| std::env::var("KILN_OBSERVE_CUT_BYTES").ok().and_then(|v| v.parse().ok()))
 }
 
+/// How long after the store opens it says it has replayed, at the least (none but in a test): a test
+/// that asks while the store replays sets `KILN_OBSERVE_REPLAY_HOLD_MS` (tests/observe_replay.rs), as a
+/// fast machine's replay could end before its first query came (fedora's, 2026-10-31).
+fn replay_hold() -> Duration {
+    static HOLD: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *HOLD.get_or_init(|| std::env::var("KILN_OBSERVE_REPLAY_HOLD_MS").ok().and_then(|v| v.parse().ok()).map_or(Duration::ZERO, Duration::from_millis))
+}
+
 /// Which member each machine is, as the server keeps it (`<observe>/members.json`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Members {
@@ -1884,6 +1892,7 @@ impl Owner {
         if !self.replayed.load(Ordering::Relaxed)
             && let Some(rep) = &self.rep
             && rep.r.applied().index >= self.replay_to
+            && self.opened_at.is_none_or(|t| t.elapsed() >= replay_hold())
         {
             self.replayed.store(true, Ordering::Release);
             tracing::info!(applied = self.replay_to, took_ms = self.opened_at.map(|t| t.elapsed().as_millis() as u64), "observe's store has replayed its log");
