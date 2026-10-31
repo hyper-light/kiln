@@ -228,14 +228,44 @@ pub async fn runners(hub: &Hub, id: &str) -> Result<Response, Fail> {
     ))
 }
 
+/// Another provider, in a person's words.
+pub(crate) fn provider_says(provider: &str) -> &str {
+    match provider {
+        super::providers::GITHUB_ACTIONS => "GitHub Actions",
+        super::providers::GITLAB_CI => "GitLab CI",
+        super::providers::BITBUCKET_PIPELINES => "Bitbucket Pipelines",
+        other => other,
+    }
+}
+
+/// Why a set of another provider's run's jobs isn't acted on here (docs/ci.md W26-R21, R22): that
+/// provider runs them, and kiln keeps only their record ([`super::providers::record`]), so running
+/// them again, stopping or pausing them in kiln's tables would change nothing that runs. Each job
+/// named answers so under `word` (`again`, `cancelled`, `paused`, `resumed`), and nothing changes.
+/// `None` for KilnCI's runs.
+async fn providers_own(hub: &Hub, run: &str, ids: &[String], word: &str) -> Result<Option<Value>, Fail> {
+    let Some((_, provider, _)) = super::providers::of_run(hub, run).await.map_err(internal)? else { return Ok(None) };
+    let why = format!("{} runs it, not kiln", provider_says(&provider));
+    let mut jobs = Vec::new();
+    for id in ids {
+        let ours = job_of(hub, id).await.is_ok_and(|j| j.run == run);
+        jobs.push(json!({ "job": id, word: false, "why": if ours { why.as_str() } else { "not a job of this run" } }));
+    }
+    Ok(Some(json!({ "kind": "provider", "run": run, "provider": provider, "jobs": jobs })))
+}
+
 /// Jobs of one run run again together (docs/ci.md W26-R21), passed ones too:
 /// - a `.kiln/` pipeline's (v1) in their run, each with the jobs that need it
 ///   ([`crate::store::Store::retry_jobs`]);
 /// - legs of the CI engine's as one new attempt of their run, which runs them and what needs
-///   them again, for real (none takes an earlier result over).
+///   them again, for real (none takes an earlier result over);
+/// - another provider's: none, each saying that provider runs it.
 ///
 /// Each job named answers what became of it.
 pub async fn retry_set(hub: &Hub, run: &str, ids: &[String], by: &str) -> Result<Value, Fail> {
+    if let Some(v) = providers_own(hub, run, ids, "again").await? {
+        return Ok(v);
+    }
     if hub.ci.is_run(run) || hub.store.is_engine_run(run.to_owned()).await.map_err(internal)? {
         let mut legs = Vec::new();
         let mut each = Vec::new();
@@ -287,9 +317,12 @@ pub async fn retry_set(hub: &Hub, run: &str, ids: &[String], by: &str) -> Result
 }
 
 /// Jobs of one run stopped, the run going on (docs/ci.md W26-R21): [`Hub::cancel_jobs`], each
-/// job named answering what became of it.
+/// job named answering what became of it. Another provider's run's are its own to stop.
 pub async fn cancel_set(hub: &Hub, run: &str, ids: Vec<String>, by: &str) -> Result<Value, Fail> {
     use crate::store::JobCancel;
+    if let Some(v) = providers_own(hub, run, &ids, "cancelled").await? {
+        return Ok(v);
+    }
     let what = ids.join(", ");
     let each = hub.cancel_jobs(run, ids, &format!("cancelled by {by}")).await.map_err(internal)?;
     hub.store.audit(by.to_owned(), "runs.cancel_jobs".into(), format!("{run}: {what}")).await;
@@ -306,8 +339,11 @@ pub async fn cancel_set(hub: &Hub, run: &str, ids: Vec<String>, by: &str) -> Res
 
 /// Some of a run's jobs paused or resumed (docs/ci.md W26-R22), either engine's, through
 /// [`Hub::pause_jobs`]: each job's log says who paused or resumed it, and each job named answers
-/// what became of it (`paused` or `resumed`, and why not).
+/// what became of it (`paused` or `resumed`, and why not). Another provider's run's are its own.
 pub async fn pause_set(hub: &Hub, run: &str, ids: Vec<String>, paused: bool, by: &str) -> Result<Value, Fail> {
+    if let Some(v) = providers_own(hub, run, &ids, if paused { "paused" } else { "resumed" }).await? {
+        return Ok(v);
+    }
     let what = ids.join(", ");
     let each = hub.pause_jobs(run, ids, paused).await.map_err(internal)?;
     let (verb, word) = if paused { ("runs.pause_jobs", "paused") } else { ("runs.resume_jobs", "resumed") };

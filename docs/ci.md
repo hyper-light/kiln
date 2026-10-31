@@ -8584,6 +8584,10 @@ a time. The design was agreed on a live mock built on Ship's own prototype
   - On the engine, a set's rerun is one new attempt of a finished run, `kiln_ci::plan::rerun`'s
     `Mode::Set`. Legs cancelled one by one go through the plan (`on_cancel_legs`), logged, so a
     restart replays them.
+  - A run another provider keeps (GitHub Actions, GitLab CI, Bitbucket Pipelines) is that
+    provider's: kiln holds only its record, so no set of its jobs runs again, stops, pauses or
+    resumes here. Each job named answers "GitHub Actions runs it, not kiln" (or its provider's
+    name), nothing changes, and Ship's commit offers none of those verbs for them, saying the same.
 - **W26-R22 Pause and Resume.** Any set of a run's jobs pauses where it stands and resumes from
   there, on either engine. `POST /api/runs/:id/pause` and `/resume` take `{ jobs }`, under
   `runs.pause`, and each job named answers what became of it, or why not.

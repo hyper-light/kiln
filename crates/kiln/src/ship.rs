@@ -89,6 +89,9 @@ struct LegRec {
     /// Paused since then (W26-R22), and the runner it runs on.
     paused_at: Option<i64>,
     agent: Option<String>,
+    /// The provider that runs it when that isn't KilnCI (GitHub Actions, GitLab CI, Bitbucket
+    /// Pipelines): kiln keeps only its record.
+    provider: Option<String>,
 }
 
 /// A KilnCD deployment of a commit, as Ship reads it: kiln deploys itself through KilnCD, not CI's
@@ -862,7 +865,8 @@ fn load_with(c: &rusqlite::Connection, ctx: &RepoCtx, sha: &str, first_row: i64)
     // The engine's legs are its run's latest attempt's; v1's jobs (no `job_id`, no `run_attempt`:
     // production's runs, 2026-10-28) are their run's, retried in place.
     let mut st = c.prepare(
-        "SELECT j.id, j.run_id, COALESCE(NULLIF(j.display, ''), j.key), j.status, j.conclusion, j.reused_from IS NOT NULL, j.error, j.started_at, j.finished_at, j.paused_at, j.agent
+        "SELECT j.id, j.run_id, COALESCE(NULLIF(j.display, ''), j.key), j.status, j.conclusion, j.reused_from IS NOT NULL, j.error, j.started_at, j.finished_at, j.paused_at, j.agent,
+                NULLIF(r.provider, 'kiln')
          FROM jobs j JOIN runs r ON r.id = j.run_id WHERE r.repo_id = ?1 AND r.sha = ?2 AND (j.job_id IS NULL OR j.run_attempt = r.attempt) ORDER BY j.rowid",
     )?;
     let legs: Vec<(String, LegRec)> = st
@@ -882,6 +886,7 @@ fn load_with(c: &rusqlite::Connection, ctx: &RepoCtx, sha: &str, first_row: i64)
                     attempts: Vec::new(),
                     paused_at: r.get(9)?,
                     agent: r.get::<_, Option<String>>(10)?.filter(|a| !a.is_empty() && a != "-"),
+                    provider: r.get(11)?,
                 },
             ))
         })?
@@ -1308,8 +1313,12 @@ fn leg_json(l: &journey::Leg) -> Value {
 
 /// What a person can do to one of a commit's jobs from its row (docs/ci.md W26-R21, R22), through
 /// `POST /api/ship/jobs`: each verb that applies now, and why each other doesn't, as that endpoint
-/// would answer.
+/// would answer. Another provider's job is that provider's: none applies here.
 fn job_verbs(leg: &LegRec, runners: &[RunnerSeen]) -> (Vec<&'static str>, serde_json::Map<String, Value>) {
+    if let Some(p) = &leg.provider {
+        let why = Value::String(format!("{} runs it, not kiln", crate::ci::retry::provider_says(p)));
+        return (Vec::new(), ["retry", "cancel", "pause", "resume"].into_iter().map(|v| (v.to_owned(), why.clone())).collect());
+    }
     let status = crate::store::Status::parse(&leg.status);
     let paused = leg.paused_at.is_some();
     let ended = status.is_terminal() || matches!(leg.status.as_str(), "completed");
@@ -3301,6 +3310,76 @@ mod tests {
             anyhow::ensure!(code(jobs_in(&hub, &owner, &ask("retry", json!({}))).await) == 400);
             anyhow::ensure!(code(jobs_in(&hub, &crate::authz::Caller::peer("user:ro", "viewer"), &ask("pause", json!({ "scope": "all" }))).await) == 403);
             anyhow::ensure!(code(jobs_in(&hub, &owner, &json!({ "repo": "acme/two", "sha": "f00d", "verb": "retry", "scope": "all" })).await) == 404);
+            Ok(())
+        })
+    }
+
+    /// W26-R21, R22: a run another provider keeps (GitHub Actions here) is that provider's. Each
+    /// verb, by name and by a word, is refused for its jobs saying so, and none of them changes in
+    /// kiln's tables; the commit offers none of the verbs for them, saying why.
+    #[test]
+    fn w26_r21_r22_a_providers_jobs_are_that_providers_to_act_on() -> anyhow::Result<()> {
+        within(async {
+            let hub = crate::hub::tests::scratch_hub_with(|_| {}).await?;
+            let repo = hub
+                .store
+                .upsert_repo(crate::store::Repo { id: "r-gh".into(), name: "acme/gh".into(), clone_url: "https://example/gh".into(), branches: vec![], poll_seconds: 60, enabled: true, created_at: 0, last_polled_at: None, last_error: None, mode: "upstream".into(), default_branch: None, mirror: None })
+                .await?;
+            let sha = "fedfedfedfedfedfedfedfedfedfedfedfedfedf";
+            let p = crate::pipeline::parse("name: build\njobs:\n  a: {steps: [{run: x}]}\n  b: {steps: [{run: y}]}\n")?;
+            let planned = crate::pipeline::plan(&p, &crate::pipeline::Context::default())?;
+            let run = crate::store::Run {
+                id: "g1".into(),
+                repo_id: repo.id.clone(),
+                repo_name: repo.name.clone(),
+                number: 1,
+                pipeline: p.name.clone(),
+                event: "push".into(),
+                branch: "main".into(),
+                sha: sha.into(),
+                message: "on GitHub".into(),
+                author: "ada".into(),
+                status: crate::store::Status::Queued,
+                created_at: NOW_S,
+                started_at: None,
+                finished_at: None,
+                error: None,
+                concurrency_group: None,
+            };
+            hub.store.create_run(run, planned).await?;
+            // What kiln keeps of a GitHub Actions run (`ci::providers::record`): its provider, and its id there.
+            hub.store.call(|c| Ok(c.execute("UPDATE runs SET provider = 'github-actions', external_id = '4242' WHERE id = 'g1'", [])?)).await?;
+            let ids: Vec<String> = hub.store.jobs("g1".into(), false).await?.into_iter().map(|j| j.id).collect();
+            anyhow::ensure!(ids.len() == 2, "{ids:?}");
+            let kept = |hub: std::sync::Arc<crate::hub::Hub>, ids: Vec<String>| async move {
+                let mut out = Vec::new();
+                for id in ids {
+                    out.push(hub.store.job(id).await?.map(|j| (j.status, j.attempt, j.paused_at)));
+                }
+                anyhow::Ok(out)
+            };
+            let before = kept(std::sync::Arc::clone(&hub), ids.clone()).await?;
+            let owner = crate::authz::Caller::owner();
+            let why = "GitHub Actions runs it, not kiln";
+            for (verb, pick) in [("retry", json!({ "jobs": [ids.first()] })), ("cancel", json!({ "scope": "all" })), ("pause", json!({ "scope": "waiting" })), ("resume", json!({ "jobs": ids }))] {
+                let mut body = json!({ "repo": "acme/gh", "sha": sha, "verb": verb });
+                if let (Some(o), Some(x)) = (body.as_object_mut(), pick.as_object()) {
+                    o.extend(x.clone());
+                }
+                let v = jobs_in(&hub, &owner, &body).await.map_err(|(c, m)| anyhow::anyhow!("{verb}: {c}: {m}"))?;
+                let said = v.get("jobs").and_then(Value::as_array).cloned().unwrap_or_default();
+                anyhow::ensure!(!said.is_empty() && said.iter().all(|j| j.get("done") == Some(&json!(false)) && j.get("why") == Some(&json!(why))), "{verb}: {v}");
+            }
+            anyhow::ensure!(kept(std::sync::Arc::clone(&hub), ids.clone()).await? == before, "nothing changed in kiln's tables");
+            let detail = get_in(&hub.store, "acme/gh", sha, None, Vec::new(), &[], NOW_S * 1000).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let jobs = detail.get("jobs").and_then(Value::as_array).cloned().unwrap_or_default();
+            anyhow::ensure!(jobs.len() == 2, "{detail}");
+            for j in &jobs {
+                anyhow::ensure!(j.get("verbs") == Some(&json!([])), "{j}");
+                for verb in ["retry", "cancel", "pause", "resume"] {
+                    anyhow::ensure!(j.pointer(&format!("/why_not/{verb}")) == Some(&json!(why)), "{verb}: {j}");
+                }
+            }
             Ok(())
         })
     }

@@ -31,6 +31,9 @@ requirements, W26-R21 to W26-R27.
   - Retrying runs exactly those jobs again, passed ones too, along with the jobs that wait on them.
   - Cancelling stops exactly those. The jobs that wait on them are skipped, saying why.
   - Without `jobs`, both behave as before.
+  - Another provider's run (GitHub Actions, GitLab CI, Bitbucket Pipelines) is that provider's
+    to act on. Its jobs are refused, saying so ("GitHub Actions runs it, not kiln"), nothing
+    changes in kiln's tables, and Ship's pane dims every verb for them.
 - **Pause and Resume (W26-R22).** A running job paused is frozen where it runs. It keeps its
   machine, and its time limit stops. Resumed, it goes on from where it was. A waiting job paused
   isn't dispatched. How a job is frozen:
@@ -124,6 +127,16 @@ requirements, W26-R21 to W26-R27.
   records.
 - **convo-marks.** It carries the same one-line `ci_verdict` fix to ui/src/api/events.ts, in the
   same place.
+- **ci-gh-public (Kiln CI -> GitHub, 01a1935d).** Its `ci::providers::act_on_set` routes a
+  provider's job sets to that provider, as far as each allows (`plan_set`). Whichever of us lands
+  second makes the swap:
+  - its one line goes at the top of `retry_set`, `cancel_set` and `pause_set`, in place of this
+    train's refusal (no provider pauses, so pause stays refused);
+  - `job_verbs` takes what the provider allows.
+
+  They also have Ada's asks for Ship's commit rows: Hand off and Retry as icon buttons, Run and
+  Cancel offered clearly. I'm taking those after this train, stills to Ada first. They build the
+  trigger endpoint.
 - **Main's Windows test build.** It fails on crates/kiln/src/ci/review_cli.rs:899, an unused
   `use super::*`. That's main's, not this train's. The gate's Windows clippy checks libraries
   only, so it doesn't see it.
