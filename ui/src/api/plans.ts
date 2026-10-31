@@ -80,6 +80,22 @@ export interface Plan {
   phase: "planning" | "ready";
   /** Its research: what its steps rest on. */
   research: string | null;
+  /** The last answer a person gave its review (one plan read alone has it; lists leave it out). */
+  reviewed?: PlanReviewed | null;
+}
+
+/** A person's answer to a plan its goal stack waits on: its steps run, they don't (its goal skipped), or its agent changes it as they say and it comes back to look at again. */
+export type ReviewAnswer = "approve" | "reject" | "revise";
+
+export interface PlanReviewed {
+  answer: ReviewAnswer;
+  /** Revise: what to change, in their words. */
+  words?: string | null;
+  /** The version they answered. */
+  version: number;
+  by: string;
+  /** Unix seconds. */
+  at: number;
 }
 
 export interface PlanVersion {
@@ -269,6 +285,12 @@ export const plansApi = {
   step: (run: string, n: number, act: "retry" | "take" | "met", tries?: number) =>
     request<PlanRunView>("POST", `/api/plans/runs/${enc(run)}/steps/${n}/${act}`, act === "retry" && tries !== undefined ? { try: tries } : undefined),
   share: (id: string, on: boolean) => request<Plan>("POST", `/api/plans/${enc(id)}/share`, { on }),
+  /**
+   * Answer the review its goal stack waits on, for the version looked at (`version`: changed since,
+   * it's refused; none, as it is now: Approve from a row or a card). `key`: asked again under it (its
+   * answer lost), it's answered as things stand and does nothing more (CP-T3.2).
+   */
+  review: (id: string, r: { answer: ReviewAnswer; words?: string; version?: number; key: string }) => request<{ plan: Plan }>("POST", `/api/plans/${enc(id)}/review`, r),
   shared: (token: string, signal?: AbortSignal) => request<SharedPlan>("GET", `/api/shared/plans/${enc(token)}`, undefined, { signal }),
 };
 
