@@ -159,7 +159,15 @@ impl Conn {
 /// More bytes into `buf`; an error at the end of the stream.
 fn fill(stream: &mut Stream, buf: &mut Vec<u8>) -> anyhow::Result<()> {
     let mut chunk = [0u8; 64 << 10];
-    let n = stream.read(&mut chunk)?;
+    // A read of a socket with a timeout is never restarted after a signal's handler, SA_RESTART or
+    // not (signal(7)): any signal to this thread (a child's SIGCHLD) ends it EINTR, so read again,
+    // as `write_all` does on its side. A gate failed W24-R08's test on it (2026-10-30).
+    let n = loop {
+        match stream.read(&mut chunk) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            r => break r?,
+        }
+    };
     anyhow::ensure!(n > 0, "the cache service closed the connection");
     buf.extend_from_slice(chunk.get(..n).unwrap_or_default());
     Ok(())

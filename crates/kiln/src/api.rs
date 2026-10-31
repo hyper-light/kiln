@@ -5676,6 +5676,16 @@ fn metrics_handler(hub: &Hub, headers: &HeaderMap) -> Response {
 }
 
 async fn readyz(hub: &Hub) -> Response {
+    // Observe's store, open but replaying its log after a start, answers part of what it holds:
+    // not ready until it has applied it all (seconds). A store that didn't open doesn't hold the
+    // server back: the rest of kiln answers without it.
+    if let Some(o) = crate::observe::api::get()
+        && o.store().is_some()
+        && !o.replayed()
+    {
+        let v = o.view();
+        return srv::text(StatusCode::SERVICE_UNAVAILABLE, &format!("observe's store is replaying its log ({} of {} entries applied)", v.applied, v.replay_to));
+    }
     match hub.store.call(|c| Ok(c.query_row("SELECT 1", [], |r| r.get::<_, i64>(0))?)).await {
         Ok(_) => srv::text(StatusCode::OK, "ready"),
         Err(e) => srv::text(StatusCode::SERVICE_UNAVAILABLE, &format!("store: {e:#}")),
