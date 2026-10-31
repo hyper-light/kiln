@@ -134,6 +134,14 @@ drives). So does a job of the machine's own: a systemd user unit (`systemd-run -
 scope) leaves the agent's group of processes, and kiln leaves it alone. An `ssh-agent` a shell's startup file starts (`eval "$(ssh-agent -s)"`) is no work of the
 agent's at all: never shown as left running, and stopped between turns or once 30 minutes old.
 
+An agent's harness is never something it left running, nor is anything under it: neither any
+session's harness as it is now, nor a process kiln started itself (its parent is the runner, which is
+no subreaper, so what a command leaves runs on under init or the nearest subreaper). A harness can
+start while a look goes on (a sign-in starts every Claude Code agent's again at once): the look
+knew the harness before it, so the session it belongs to is left out of that look and looked at
+again ten seconds later. On 2026-10-31 such harnesses were noted as left running and stopped once
+their agents were between turns, and 26 agents on one machine ended.
+
 When the runner starts again (an upgrade, a crash, the system stopping it, a re-join), a harness
 that outlived it is stopped before the session resumes (what it started is kept), so two harnesses
 never work one conversation; then whatever the session started that still runs is taken back over
@@ -142,6 +150,27 @@ it goes when that turn ends, as anything else left running.
 Ending the agent stops what it left running, then ends whatever else is still in its group (what
 left its harness's tree included) and removes the group. kiln's own helpers and MCP servers aren't
 counted.
+
+## An agent lives until it's ended
+
+An agent lives from its start until a person ends it, or the agent that started it does (`agents.stop`).
+Its machine's record of its sessions holds it, and the server's conversation store holds its
+conversation. Its harness's process is only how it runs now. When that process ends and nobody
+ended the agent, whatever ended it (a signal from outside it, a machine short of memory, a crash,
+an end of its own), the agent goes on. kiln starts its harness again on the same conversation, and
+a turn the end cut short goes on first: the agent is told its process ended part-way through it and
+to pick up where it left off. Its timeline says how the process ended ("exit 143: SIGTERM from
+outside it") and that it starts again. Until it's back, it stands as working, and its `exit` says
+when it starts again (`again_at`, Unix ms).
+
+The first start again waits 2 s. Each after it waits twice as long as the one before, at most
+5 minutes, and once a process runs 10 minutes the wait is 2 s again. A harness that never starts
+(its program is missing), or that ends within 20 s of each of its last three starts, won't start:
+it stands stopped, saying why, until a person restarts it or sends it a message. Where its
+machine holds as many agents at work as it may, it starts again once there's room.
+
+A runner that starts again (an upgrade, a crash, the system stopping it) starts each of its agents
+again the same way, from its record (above).
 
 ## How many agents a machine runs
 

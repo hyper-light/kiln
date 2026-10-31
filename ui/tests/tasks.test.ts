@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { AgentInfo, SubagentBrief, Task } from "../src/api/harness.ts";
+import { stoppedItself } from "../src/views/harness/cards.ts";
 import { standOf, subagentsLine } from "../src/views/harness/mission-rows.ts";
 import {
   askWords,
   classOf,
   isSubagent,
+  kilnStatus,
+  startingAgain,
   stopperOf,
   subagentAsks,
   subagentPlaceholder,
@@ -55,6 +58,21 @@ test("its turn over, a subagent still at work keeps an agent working until its s
   // Older servers send no subagents.
   assert.equal(throughSubagents(agent()), false);
   assert.equal(standOf(agent(), 0), "finished");
+});
+
+test("an agent whose process ended while nobody ended it is starting again, not ended or crashed", () => {
+  const again = agent({ status: "exited", exit: { code: 143, error: "terminated", again_at: 2000 } });
+  assert.equal(startingAgain(again), true);
+  assert.equal(standOf(again, 0), "working");
+  assert.equal(kilnStatus(again), "running");
+  assert.equal(stoppedItself(again), false);
+  // Given up on (it won't start), it waits for a person; ended, without an error, it's ended.
+  const wont = agent({ status: "exited", exit: { code: 3, error: "It ended within 20 s of each of its last 3 starts" } });
+  assert.equal(startingAgain(wont), false);
+  assert.equal(standOf(wont, 0), "crashed");
+  assert.equal(kilnStatus(wont), "failed");
+  assert.equal(stoppedItself(wont), true);
+  assert.equal(standOf(agent({ status: "exited", exit: { code: 0 } }), 0), "ended");
 });
 
 test("only subagents count: shells, monitors, workflows and calls left running don't keep it working", () => {
