@@ -602,7 +602,10 @@ type JobEventV2 =
 
 A runner without `CAP_CI2` keeps getting `Assign` (v1) for v1-shaped kiln jobs, so a fleet can be
 upgraded one machine at a time. A leg that needs `CAP_CI2` is never routed to such a runner; its
-wait reason says so (W05).
+wait reason says so (W05). A v1 job is written for what its runner says it can do, so it goes to no
+runner that hasn't said yet (its `Build`, sent as it connects, a pod's aside): one written before,
+its capabilities reading none, reached a runner of today's build out of step and was read with no
+steps, passing without running (W05-R22).
 
 ### 2.6 Server endpoints
 

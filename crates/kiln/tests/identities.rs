@@ -1113,19 +1113,8 @@ fn v1_job_on_a_test_runner(dir: &Path, workflow: &str) -> anyhow::Result<LegRun>
     let s = start(dir, &Options { agent: false, ci: "", extra: "" })?;
     let (runner, log) = agents::runner_with(dir, s.port, "fedora-2", None, TALK, &[])?;
     agents::connected(s.port, &s.admin, "fedora-2", &log, Duration::from_secs(60))?;
-    // Its runner's build known first, so v1 writes the job for what the runner can do. A job given
-    // to it before (its capabilities reading none) goes out of step: read with no steps, and
-    // passed without running (W05-R22).
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        let (_, body) = http(s.port, "GET", "/api/updates", &s.admin, None)?;
-        let runners = serde_json::from_str::<Value>(&body)?.get("runners").and_then(Value::as_array).cloned().unwrap_or_default();
-        if runners.iter().any(|r| field(r, "name") == "fedora-2" && r.get("build").is_some_and(|b| !b.is_null())) {
-            break;
-        }
-        anyhow::ensure!(Instant::now() < deadline, "fedora-2's build never known: {body}");
-        std::thread::sleep(Duration::from_millis(200));
-    }
+    // Pushed at once: the job waits for the runner's `Build` as v1 places it, since one written
+    // before went to it out of step and passed without running (W05-R22).
     let sha = push_e2e(dir, &s, workflow)?;
     let deadline = Instant::now() + Duration::from_secs(300);
     loop {
