@@ -1574,9 +1574,10 @@ mod tests {
         // This fixture's explicit corruption is NOT a production retry policy. The same
         // bounded indexer refuses missing owned bytes and keeps derived work incomplete.
         accepted_scan=Scan::default();
-        let mut refused_read=false;
-        for _ in 0..128 {if pass(&hub,&mut accepted_scan).await.is_err(){refused_read=true;break}}
-        assert!(refused_read,"missing accepted object must fail the read instead of accepted empty data");
+        // A fair pass catches this leg's failure so unrelated work still advances.
+        // Probe the SAME leg owner for its error after the unchanged bounded passes.
+        for _ in 0..128 {pass(&hub,&mut accepted_scan).await?;}
+        assert!(visit_leg(&hub,&mut accepted_scan,"accepted-prefix".into()).await.is_err(),"missing accepted object must fail the read instead of accepted empty data");
         hub.store.call(|c|{assert!(!c.query_row("SELECT EXISTS(SELECT 1 FROM ci_log_indexed WHERE leg='accepted-prefix')",[],|r|r.get::<_,bool>(0))?);Ok(())}).await?;
         // Ambiguous PUT lifetime remains pinned on retirement; later settled views still
         // get their own turn. Tombstoned IDs cannot be INSERT OR IGNORE/upserted back.
