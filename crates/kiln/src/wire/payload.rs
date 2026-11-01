@@ -530,7 +530,8 @@ impl Carries for ServerMsg {
             | ServerMsg::Wire(_)
             | ServerMsg::Kept { .. }
             | ServerMsg::Unread { .. }
-            | ServerMsg::ReachRefused { .. }) => return Ok(Carried::Nothing(m)),
+            | ServerMsg::ReachRefused { .. }
+            | ServerMsg::Freeze { .. }) => return Ok(Carried::Nothing(m)),
         };
         Ok(Carried::Read(read))
     }

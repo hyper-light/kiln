@@ -56,10 +56,11 @@ for (const [path, field] of SEARCHES) {
 
 test("the deployments' filter keeps the focus as its apps load", async ({ page }) => {
   test.skip(REAL, "the mock's data");
+  // /deployments is Ship's Deploys (docs/ci.md W26-R24): its apps come at once, and what's typed
+  // narrows them where they are.
   await page.goto("/deployments");
-  // The list has come (its loading shape's filter is inert, but still matches by name).
-  await expect(page.getByRole("checkbox", { name: "Select every app shown" })).toBeEnabled({ timeout: 15_000 });
-  const box = page.getByRole("combobox", { name: "Filter apps" });
+  await expect(page.getByRole("list", { name: "Apps by project" })).toBeVisible({ timeout: 15_000 });
+  const box = page.getByRole("combobox", { name: "Find apps" });
   await keepsFocus(page, box, async () => {
     // Past the moment it waits before asking the server, and the answer.
     await expect(page).toHaveURL(/[?&]q=svc/);

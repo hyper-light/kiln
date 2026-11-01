@@ -2514,6 +2514,14 @@ impl Engine {
                     self.timer(at, Timer::Wave(a, op.id));
                     return;
                 }
+                // Which of its groups it starts, where it has more than one: what it says meanwhile.
+                let groups: std::collections::BTreeSet<(Phase, i64)> = op.tasks.iter().map(|t| (t.phase, t.wave)).collect();
+                let at = groups.iter().position(|g| *g == (phase, wave)).map_or(1, |i| i + 1);
+                if groups.len() > 1
+                    && let Some(op) = self.app_mut(a).and_then(|x| x.op.as_mut())
+                {
+                    op.message = format!("wave {at} of {}", groups.len());
+                }
                 self.send_group(a, c, &group, false);
             }
             OpPhase::Failing => {

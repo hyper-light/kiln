@@ -64,9 +64,17 @@ export function reloadOnce() {
 
 export function watchForUpdates() {
   events.onReopen(() => void check());
+  // Leaving the page cancels what it was still loading, and WebKit fails those imports: no build is
+  // gone, and a reload would take the page back from where it was going. Still here 5 s on (a
+  // download, say), it wasn't left.
+  let leaving = false;
+  window.addEventListener("beforeunload", () => {
+    leaving = true;
+    window.setTimeout(() => (leaving = false), 5_000);
+  });
   // A part of the page (a lazily loaded view) that's gone: load the new build instead of breaking.
   window.addEventListener("vite:preloadError", (e) => {
     e.preventDefault();
-    reloadOnce();
+    if (!leaving) reloadOnce();
   });
 }

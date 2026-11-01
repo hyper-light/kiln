@@ -28,6 +28,19 @@ const sample = (page: Page) =>
       }),
     }));
 
+/** Each Checks lane's job now, by the names its lane goes by: one whose job changed is another run's. */
+const jobsOf = async (page: Page, sha: string) => {
+  const d = (await (await page.request.get(`/api/ship/commits/hyper-light/kiln/${sha}`)).json()) as { checks?: { pipeline: string; legs: { name: string; job?: string }[] }[] };
+  return new Map(
+    (d.checks ?? []).flatMap((c) =>
+      c.legs.flatMap((l): [string, string][] => [
+        [`${c.pipeline} · ${l.name}`, l.job ?? ""],
+        [l.name, l.job ?? ""],
+      ]),
+    ),
+  );
+};
+
 test("over 60 s the lanes' bars keep their scale", async ({ page, isMobile }) => {
   test.skip(isMobile, "the desktop projects run it");
   test.setTimeout(150_000);
@@ -39,10 +52,11 @@ test("over 60 s the lanes' bars keep their scale", async ({ page, isMobile }) =>
   // The lanes drawn, with their bars (a point has no box of its own, so it's counted, not seen).
   await expect(row.locator(".ship-lanesbox")).toBeVisible({ timeout: 15_000 });
   await expect.poll(() => row.locator(".ship-lanesbox .ship-lbar").count(), { timeout: 15_000 }).toBeGreaterThan(0);
-  const samples = [await sample(page)];
+  const sha = ((await row.locator(".ship-r .ship-sha").textContent()) ?? "").trim();
+  const samples = [{ ...(await sample(page)), jobs: await jobsOf(page, sha) }];
   for (let i = 0; i < 6; i++) {
     await page.waitForTimeout(10_000);
-    samples.push(await sample(page));
+    samples.push({ ...(await sample(page)), jobs: await jobsOf(page, sha) });
   }
   expect(samples[0]?.bars.length ?? 0).toBeGreaterThan(0);
   // One horizon all the while (it holds while the row is open), every bar where it was.
@@ -53,8 +67,9 @@ test("over 60 s the lanes' bars keep their scale", async ({ page, isMobile }) =>
     const before = new Map(was.bars.map((b) => [b.name, b]));
     for (const b of now.bars) {
       const then = before.get(b.name);
-      // A lane by another name is another lane (the mock's fixed rows stream whichever job runs).
-      if (!then) continue;
+      // A lane by another name is another lane (the mock's fixed rows stream whichever job runs), and so
+      // is one whose job changed: the mock's live run ended, and the next run's job took the lane.
+      if (!then || was.jobs.get(b.name) !== now.jobs.get(b.name)) continue;
       expect(b.left, `${b.name}'s start`).toBe(then.left);
       if (b.width !== null && then.width !== null) expect(b.width, `${b.name}'s span`).toBe(then.width);
     }

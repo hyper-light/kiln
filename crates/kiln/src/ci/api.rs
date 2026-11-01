@@ -206,8 +206,23 @@ async fn outside(hub: &Arc<Hub>, method: &Method, rest: &[&str], q: &HashMap<Str
         (&Method::GET, ["runs", id, "pending"]) => super::runs_api::pending(hub, id).await,
         (&Method::GET, ["runs", id, "artifacts"]) => super::runs_api::part(hub, id, "artifacts", q).await,
         (&Method::GET, ["runs", id, "artifacts", artifact, "download"]) => super::runs_api::download(hub, id, artifact).await,
-        (&Method::POST, ["runs", id, "cancel"]) => super::runs_api::cancel(hub, id).await,
-        (&Method::POST, ["runs", id, "rerun"]) => super::runs_api::rerun(hub, id, &body, caller.map_or("admin", |c| c.name.as_str())).await,
+        (&Method::POST, ["runs", id, "cancel"]) => match body.get("jobs").and_then(serde_json::Value::as_array).filter(|j| !j.is_empty()) {
+            // Some of its jobs (W26-R21), the run going on.
+            Some(jobs) => {
+                let ids: Vec<String> = jobs.iter().filter_map(serde_json::Value::as_str).map(str::to_owned).collect();
+                super::retry::cancel_set(hub, id, ids, caller.map_or("admin", |c| c.name.as_str())).await.map(|v| crate::http::server::json(StatusCode::OK, &v))
+            }
+            None => super::runs_api::cancel(hub, id).await,
+        },
+        (&Method::POST, ["runs", id, "rerun"]) => match (body.get("mode").and_then(serde_json::Value::as_str), body.get("jobs").and_then(serde_json::Value::as_array)) {
+            // Some of its jobs (W26-R21), passed ones too.
+            (Some("set"), Some(jobs)) if !jobs.is_empty() => {
+                let ids: Vec<String> = jobs.iter().filter_map(serde_json::Value::as_str).map(str::to_owned).collect();
+                super::retry::retry_set(hub, id, &ids, caller.map_or("admin", |c| c.name.as_str())).await.map(|v| crate::http::server::json(StatusCode::CREATED, &v))
+            }
+            (Some("set"), _) => Err((StatusCode::BAD_REQUEST, "mode `set` names its `jobs`".to_owned())),
+            _ => super::runs_api::rerun(hub, id, &body, caller.map_or("admin", |c| c.name.as_str())).await,
+        },
         (&Method::POST, ["runs", id, "approve"]) => super::environments::approve(hub, id, body, caller).await,
         // W05-R28: a finished job again, here or elsewhere (another provider's, by its provider).
         (&Method::POST, ["legs", id, "retry"]) => super::retry::retry(hub, id, &body, caller.map_or("admin", |c| c.name.as_str())).await,
