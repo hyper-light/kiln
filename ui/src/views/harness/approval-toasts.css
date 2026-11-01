@@ -1,8 +1,8 @@
 /* Requests share the bottom toast position with kiln's other notifications, on every screen, above
-   any passing ones. */
+   any passing ones (and above an agent's message box where they'd cover it). */
 .rq-viewport {
   z-index: 121;
-  bottom: calc(max(16px, env(safe-area-inset-bottom, 0px)) + var(--toast-stack-height, 0px));
+  bottom: calc(max(16px, env(safe-area-inset-bottom, 0px), calc(var(--dock-height, 0px) + 16px)) + var(--toast-stack-height, 0px));
 }
 .toast.rq {
   padding: 12px 8px 12px 14px;
