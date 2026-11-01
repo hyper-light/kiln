@@ -6,6 +6,9 @@
  * by its task, its agent's session. Every choice sits at the panel's right edge. Where its harness
  * sets web search for the whole agent alone (`web_whole`: Codex's is hosted, out of any hook's
  * reach), a subagent of its own has no Web choice and the agent no Ask, and the panel says so.
+ * Where kiln holds its calls only when it asks before one (`limits_asked`: an ACP agent's
+ * `session/request_permission`), the panel says that too: what its own rules let it do without
+ * asking goes as they say.
  */
 import * as React from "react";
 import { Clock, Eye, Folder, Globe, Pencil, SquareTerminal, X } from "lucide-react";
@@ -32,7 +35,17 @@ const count = (v: string) => {
   return d === "" ? undefined : Math.max(1, Number(d));
 };
 
-export function PermsPanel({ n, can, webWhole = false }: { n: Pick<SubagentNode, "kind" | "session" | "task" | "name" | "perms" | "over">; can: boolean; webWhole?: boolean }) {
+export function PermsPanel({
+  n,
+  can,
+  webWhole = false,
+  asked = false,
+}: {
+  n: Pick<SubagentNode, "kind" | "session" | "task" | "name" | "perms" | "over">;
+  can: boolean;
+  webWhole?: boolean;
+  asked?: boolean;
+}) {
   // One of its harness's own subagents (else a session of its own).
   const own = n.kind === "harness" && !!n.task;
   // What it's set to here, at once (its next state says so too). Each of its states is new: what
@@ -121,6 +134,7 @@ export function PermsPanel({ n, can, webWhole = false }: { n: Pick<SubagentNode,
           onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()}
         />
       </span>
+      {asked && <span className="hx-perm-why">Held when it asks before a call; what its own rules let it do without asking goes as they say.</span>}
     </div>
   );
 }

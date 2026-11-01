@@ -1061,6 +1061,37 @@ function codexKids() {
   variantIn(m);
 }
 
+/**
+ * An opencode agent (over ACP) working through two subagents of its own (`POST /api/mock/acp-kids`), for
+ * the tests of holding an ACP agent's subagents (at each call it asks about, `limits_asked`): taken
+ * back with the variants.
+ */
+function acpKids() {
+  const t = Date.now() - 10 * 60_000;
+  const m = member("acp-kids", "codex", "local", "Lexer audit", "running", "build", "Audit the lexer for unicode bugs.", "Its two parts are out on subagents.", {
+    doing: "Waiting for its subagents",
+  });
+  m.info.kind = "opencode";
+  m.info.kind_name = "opencode";
+  m.info.model = "anthropic/claude-sonnet-5-5";
+  m.info.created_at = t;
+  const kid = (id: string, description: string, started: number): Task => ({
+    ...defaultTask(),
+    id,
+    tool_id: id,
+    description,
+    class: "agent",
+    kind: "opencode",
+    status: "running",
+    started,
+    last_tool: "Read src/lexer.rs",
+    pausable: true,
+  });
+  m.tasks = [kid("ses_ak1", "Explore the lexer", t + 60_000), kid("ses_ak2", "Write unicode tests", t + 120_000)];
+  leaves(m);
+  variantIn(m);
+}
+
 /** What a person lets one of them do (`Command::Perms`), or one of its harness's own (`task`), as kiln keeps it. */
 function permsMember(m: Member, perms: Perms | undefined, task?: string) {
   if (task) {
@@ -1437,8 +1468,9 @@ export function handleFamilySession(ws: WebSocket, id: string): boolean {
     if (under) send({ t: "ack", id: under, outcome: "taken" });
   });
   send({ t: "open", info: m.info });
-  // Codex sets its web search for the whole agent alone (`web_whole`).
-  send({ t: "meta", meta: { ...META, version: m.info.kind === "claude" ? "2.3.1" : "0.46.0", features: m.info.kind === "codex" ? [...META.features, "web_whole"] : META.features } });
+  // Codex sets its web search for the whole agent alone (`web_whole`); an ACP agent is held only at the calls it asks about (`limits_asked`).
+  const features = m.info.kind === "codex" ? [...META.features, "web_whole"] : m.info.kind === "opencode" ? [...META.features, "limits_asked"] : META.features;
+  send({ t: "meta", meta: { ...META, version: m.info.kind === "claude" ? "2.3.1" : "0.46.0", features } });
   send({ t: "state", state: stateOf(m) });
   send({ t: "events", events: m.events });
   const files = CHANGESETS[id];
@@ -2206,6 +2238,11 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
   }
   if (p === "/api/mock/codex-kids" && m === "POST") {
     codexKids();
+    json(res, 200, {});
+    return true;
+  }
+  if (p === "/api/mock/acp-kids" && m === "POST") {
+    acpKids();
     json(res, 200, {});
     return true;
   }

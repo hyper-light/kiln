@@ -1566,7 +1566,7 @@ runner's harness socket, which knows the session by the asking process; Codex na
 so kiln tells it by the call's turn. The call of a paused subagent, or of one under it, waits for
 its answer until it's resumed (`tasks[].paused_at`). `tasks[].pausable` says which can be held so:
 Claude Code's while they go; Codex's once Codex lists kiln's hook as trusted (a session whose hook
-it doesn't trust says why); not ACP agents' or Antigravity's. What a pause holds says Paused; the
+it doesn't trust says why); an ACP agent's where its requests name them (opencode's, below); not Antigravity's. What a pause holds says Paused; the
 one paused offers Resume, and those under it wait for that.
 
 **What each may do** (`perms`, `{perms?, task?}`): Read, Edit, Run and Web, each `allow`, `ask` or
@@ -1593,6 +1593,30 @@ harness's own is handed over in words (what it was asked, said and was told) as 
 agent. A New agent (`top`) is an agent of its own. Each carries `variant_of`, and the tree marks
 it with the fork. A finished variant's thread ends with Keep, which tells its parent to use its
 result in place of the one it varied, and to read it whole with `agents_result`.
+
+**ACP agents** (Devin, Gemini CLI, opencode, Goose, Amp). ACP has one place a client can hold a
+tool call, the agent's `session/request_permission`, and the agent decides when to send it: kiln
+holds an ACP agent's calls **at the calls it asks about**, and no others. A call its own rules let
+it make without asking goes as they say. `meta.features` has `limits` and `limits_asked`, and the
+Permissions panel says so in one line. At each request: one from a paused subagent, or one under
+it, waits unanswered and unshown until it's resumed (answered `cancelled` if the turn is cancelled
+first); what its perms (the session's, narrowed by each subagent's) refuse is refused at once
+(`reject_once`), the reason on the call; what they say a person sees is shown with the reason,
+whatever kiln's mode, Bypass too; anything else goes as it always did. Per agent:
+
+| Agent | Its subagents in the tree | A message to one | Pause one | What each may do |
+|---|---|---|---|---|
+| opencode | yes: kiln asks for its child sessions (`_meta["opencode/child-session-updates"]` at `initialize`) and each `opencode/session/child_update` makes a subagent, its tool calls under it, ended as it says | through the agent that started it (`via: "parent"`), once its turn is free: opencode's own subagent tool takes a follow-up by the subagent's session id, running or ended | yes, at each call it asks about (its requests name the subagent in `_meta["opencode/child-session"]`) | the session's and each subagent's, at each call it asks about |
+| Gemini CLI | no: its subagents' calls never reach ACP (its policy engine decides them inside the agent) | no | no | the session's, at each call it asks about |
+| Goose | no: it passes a subagent's request on under a new id, naming no subagent | no | no | the session's, at each call it asks about |
+| Amp (amp-acp) | no: its adapter shows a subagent's calls inline and leaves permissions to Amp | no | no | the session's, at each call it asks about |
+| Devin | not known: its docs don't say what of its subagents reaches ACP, and kiln shows none | no | no | the session's, at each call it asks about |
+
+kiln's tests hold each to this with a stand-in ACP agent (`harness::acp`):
+`acp_subagent_paused_request_waits_until_resumed`, `acp_off_refuses_and_ask_shows_with_reason`,
+`acp_bypass_still_held_to_limits`, `acp_session_perms_hold_own_requests`,
+`acp_opencode_children_are_subagents_in_the_tree`, `acp_nested_child_under_its_parent` and
+`acp_opencode_message_goes_by_its_parent`; the UI's in `ui/e2e/subagent-acp.spec.ts`.
 
 ## Files in messages
 
