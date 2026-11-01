@@ -31,7 +31,7 @@ on a repository covers its pipelines and environments.
 
 | Area | Capabilities |
 | --- | --- |
-| Runs | `runs.read`, `runs.trigger`, `runs.cancel`, `runs.rerun`, `logs.read`, `artifacts.read`, `artifacts.write`, `caches.write` |
+| Runs | `runs.read`, `runs.trigger`, `runs.cancel`, `runs.rerun`, `runs.pause`, `logs.read`, `artifacts.read`, `artifacts.write`, `caches.write` |
 | Code | `diffs.read`, `diffs.submit`, `diffs.review`, `diffs.land`, `queue.manage` |
 | Pipelines | `pipelines.edit` (always as a reviewed diff), `environments.deploy` |
 | Machines | `machines.read`, `machines.manage`, `machines.terminal`, `binaries.publish` |
@@ -41,7 +41,7 @@ on a repository covers its pipelines and environments.
 | Server | `settings.manage`, `tokens.manage`, `users.manage`, `audit.read` |
 
 **Roles** are named sets of capabilities: `viewer` (reads, observe's too), `developer` (trigger,
-rerun, submit, review; observe's dashboards and monitors), `maintainer` (plus land, attach agents,
+rerun, pause, submit, review; observe's dashboards and monitors), `maintainer` (plus land, attach agents,
 manage everyone's agents, manage the queue; observe's integrations and clouds), `admin` (everything
 but ownership) and `owner`. Custom roles are allowed. A user holds roles per scope. Grants add up
 across scopes, and an explicit deny wins.

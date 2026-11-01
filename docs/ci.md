@@ -4235,6 +4235,15 @@ enforcement points to W18, agent isolation to W20.
     handles rare in tests. *Left*: the container's overlay makes no file handles, so fanotify's
     watchers fail in it (TypeScript's `fswatch` tests, 126 of them, corpus pass 1024b) where a
     hosted runner's ext4 has them; a microVM leg (W13-R05) has an ext4 of its own;
+  - a leg given the host's Docker socket gets the capabilities profilers run with in its
+    container, SYS_ADMIN, BPF, PERFMON, DAC_READ_SEARCH and SYS_RESOURCE (`--cap-add`), as a
+    hosted runner's root has them (2026-10-25): a binary holding them as file capabilities can't
+    start where the container's bounding set lacks them (capabilities(7)), and CodSpeed's
+    memtrack (ruff's instrumented benchmarks, corpus pass 1025c) failed to spawn. Such a leg could
+    start any container anyway, as its seccomp is lifted for. *Left*: the rest of a root's
+    (SYS_MODULE, SYS_TIME, SYS_BOOT and the like would reach the host's kernel and clock); a leg
+    without the socket keeps Docker's defaults (`w13_r04_a_socket_legs_container_holds_a_profilers_capabilities`,
+    `w13_r04_a_profilers_binary_starts_with_the_capabilities`);
   - `/opt` is open to all, as GitHub's images leave it (`chmod -R 777 /opt`): steps make their own
     directories there without sudo (neovim's `old-cmake` job);
   - the runner user's `~/.cargo/bin`, `~/.config/composer/vendor/bin` and `~/.dotnet/tools` are
@@ -8496,10 +8505,11 @@ a time. The design was agreed on a live mock built on Ship's own prototype
 - **W26-R01 Changes in Ship, by commit.** Ship's unit stays the commit (or tag). A stacked diff is
   one commit, its row carrying the diff's review; a branch pull request (kiln's change requests and
   hosts' pull requests, W23-R06) is its commits, its head commit's row carrying the request's review
-  and its other commits folded under it. A new revision's commit supersedes the one it replaces, as
-  Ship's rows already do, and after it lands the commit carries on. Rows, glyphs, stand words,
-  author lines and paired actions are Ship's, with nothing special-cased; Ship's per-commit read
-  model grows to review: one read model, not two.
+  and its other commits folded under it (since W26-R29, Ship's rows are repositories, and a change's
+  commits are lines among its repository's commits). A new revision's commit supersedes the one it
+  replaces, as Ship's rows already do, and after it lands the commit carries on. Rows, glyphs, stand
+  words, author lines and paired actions are Ship's, with nothing special-cased; Ship's per-commit
+  read model grows to review: one read model, not two.
 - **W26-R02 Review is the first stage.** Ship's journey strip reads review, land, checks, build,
   staging, production, replant. Review states (needs you, agent fixing, waiting on others,
   conflicts, approved) map onto Ship's stands and its needs-you-first order. Ship's facets gain host
@@ -8599,6 +8609,143 @@ a time. The design was agreed on a live mock built on Ship's own prototype
 - **W26-R20 Hosts.** What each host can do (stacks, queues, updating a stale change, batched reviews,
   merging) is a seam in `crates/kiln-seams`, with a simulator per host and a conformance suite, kept
   within the hosts' rate limits (webhooks, and polling with ETags).
+- **W26-R21 Any set of jobs.** Any set of a run's jobs runs again or stops, on either engine, passed
+  jobs included:
+  - Retrying a set gives each its next attempt, and the jobs that need it run again after it.
+  - Cancelling a set stops each job that hasn't finished. The jobs that need it are skipped as
+    "dependency cancelled", and the run's other jobs go on.
+  - Each job named answers what became of it, or why not: it hasn't finished, it already finished,
+    it isn't the run's.
+  - `POST /api/runs/:id/retry` and `/cancel` take `jobs`, and so does the engine's
+    `/api/ci/runs/:id/cancel`; the engine's `/rerun` takes `{ mode: "set", jobs }`. Without `jobs`,
+    each does what it did.
+  - On the engine, a set's rerun is one new attempt of a finished run, `kiln_ci::plan::rerun`'s
+    `Mode::Set`. Legs cancelled one by one go through the plan (`on_cancel_legs`), logged, so a
+    restart replays them.
+  - A run another provider keeps (GitHub Actions, GitLab CI, Bitbucket Pipelines) is that
+    provider's: kiln holds only its record, so no set of its jobs runs again, stops, pauses or
+    resumes here. Each job named answers "GitHub Actions runs it, not kiln" (or its provider's
+    name), nothing changes, and Ship's commit offers none of those verbs for them, saying the same.
+- **W26-R22 Pause and Resume.** Any set of a run's jobs pauses where it stands and resumes from
+  there, on either engine. `POST /api/runs/:id/pause` and `/resume` take `{ jobs }`, under
+  `runs.pause`, and each job named answers what became of it, or why not.
+  - A running job is frozen where it runs, keeping its runner and its slot. On Linux its steps are
+    in a cgroup of the job's own (`kiln-jobs-<pid>/<job>` under the runner's), joined before they
+    run anything, and that's frozen (`cgroup.freeze`), whatever they started. Elsewhere on Unix,
+    and on Linux without a cgroup v2 the runner may write, its steps' process groups are stopped
+    (SIGSTOP). On Windows each of its steps is in a job object of its own, put in it before it ran
+    anything (created suspended), so whatever it starts is there however that's parented, and a
+    step on a pty (which ConPTY starts outside any job) is followed by its process tree: every one
+    of their processes is suspended where it is (`NtSuspendProcess`), listed again until none is
+    new, and exactly those are let go on (`NtResumeProcess`). A step that starts while its job is
+    frozen is frozen as it starts. Its job container is paused (`docker pause`). Resume undoes each.
+  - The runner is asked with `ServerMsg::Freeze` (appended last), only a runner that says it can
+    (`CAP_FREEZE`, bit 53: Unix and Windows). Its answer comes once it's done, or why not. Pausing
+    a job on any other runner (a kiln from before Pause came to its platform) is refused saying so,
+    and nothing is sent.
+  - Its time limits stop while it's paused: the job's and a step's on the runner, and v1's
+    `timeout_minutes` on the server, which leaves out the paused while (`paused_at`, `paused_ms`).
+  - A waiting job paused isn't dispatched until it's resumed: v1's queue skips it; the engine's
+    scheduler holds the leg (`Input::LegPaused`, waiting `paused`), its place in the queue kept,
+    and a restart brings it back paused.
+  - Nothing resumes a job by itself, but cancelling: a cancelled job is let go on first, so it
+    hears it's to end. A runner process that starts lets go of what runner processes before it
+    left frozen as they ended, as a dead runner's jobs always ran on.
+  - A job that has ended can't be paused, and one that isn't paused can't be resumed: each says so.
+    Pausing a paused job changes nothing.
+  - Ship acts on a commit's jobs through one endpoint, across its runs and either engine's:
+    `POST /api/ship/jobs { repo, sha, verb, jobs?, scope? }`, `verb` one of retry, pause, resume
+    and cancel, the jobs named or those `scope` picks (failed, running, waiting, all). Each run gets
+    its own call underneath, as the caller, who needs the verb's right on the repository
+    (`runs.rerun`, `runs.pause`, `runs.cancel`), and each job answers. The commit's detail lists
+    its `jobs`: each one's id, run, pipeline and name, runner, `paused_at`, the `verbs` that apply
+    now and why each other doesn't (`why_not`), Pause where its runner can't freeze it included.
+- **W26-R23 The jobs pane.** An opened commit's Output and Jobs are one pane, as Ada approved it
+  (2026-10-30). Flat throughout: no box round any of it, hairlines between.
+  - A strip on top says what's picked and what each action would do: Retry, Pause (Resume when
+    what's picked is paused) and Cancel, one width each, dimmed where they don't apply and never
+    hidden. The words "failed · running · waiting · all" pick those jobs. Cancel asks again in the
+    strip (Keep, Cancel them), and what an action did, or why it couldn't, is said there.
+  - Under it, the jobs by stage, no buttons on a line: a line picks its job alone, its glyph adds it
+    to the pick or takes it out. The picked line is a square tint, the one shown with a straight
+    2px edge. A paused job says "paused".
+  - The picked job's output is beside the list on a desktop, and under its line on a phone, where
+    the strip comes again.
+  - Each action goes to `POST /api/ship/jobs`: a word's jobs as its `scope`, a pick's as its
+    `jobs`, those the action applies to.
+  - Its heights are held: nothing moves as jobs are picked, acted on and go on, and nothing scrolls
+    sideways from 320 px up.
+- **W26-R24 Deploys in Ship.** Ship's Deploys lists every app KilnCD holds as Ship's rows, by
+  project (the repository its deploy file is in or its manifests come from), what needs someone
+  first (a rollout waiting on a person, then what failed, then what went back, then what's out of
+  sync for a person to sync): each app's stand, word and line; the pips of its latest deploy (Sync, Health, Soak: healthy
+  for ten minutes after its sync, or the guard's word); who did it and when; where it deploys and
+  what runs (`GET /api/ship/deploys`). Where it stands is `kiln_cd::stands`'s to say, the first that
+  holds: Argo CD's; can't read, render or compare; syncing; its rollout waits for a person, or rolls
+  out; rolled back; its latest deploy failed; degraded or missing; out of sync (a person's to sync,
+  unless auto-sync syncs it); progressing or suspended; comparing; soaking; synced. The list is held
+  in memory as Ship's commits are, and gathered again once CD says something it reads changed (its
+  `cd_apps`, `cd_rollout` and `cd_app_deleted` events, its store's changes) or Ship acted.
+  - An opened app (`GET /api/ship/deploys/:app`) has the jobs pane's anatomy: its components, each
+    workload a group (its pods with their node, container, uptime and restarts, its ReplicaSets)
+    and then the rest by what they are (network, config, storage, jobs, access), live from its
+    cluster or else what KilnCD holds; a rollout's steps, its strategy, the deploy it rolls out and
+    the one it goes back to, and its traffic between them (on a cluster, its two ReplicaSets and
+    their pods); a sync under way named by the deploy it will be and the wave it's at; its settings (auto-sync and auto-rollback, a
+    person's to set; prune and self-heal, its deploy file's); its history, its source's newest commits each as the
+    deploy that ran it or one a rollback can go to, then older deploys; and why each verb can't
+    apply, where one can't.
+  - The strip's verbs go to `POST /api/ship/deploys { app, verb, … }`, each its CD operation (sync,
+    of the picked objects when some are picked; refresh and hard refresh; roll back to a deploy or
+    any commit; stop; follow git again; promote, abort, approve and deny a rollout; auto-sync and
+    auto-rollback; delete, with its objects or leaving them), as that operation's route would let
+    the caller, and audited in the request's one row. Deleting an app something else declares (its
+    repository's `.kiln/deploy.yaml`, an app that renders it) is refused, as it would come back.
+  - Ship's tabs are Commits and Deploys: the runs' list and the apps' list are gone from it (/runs
+    lands on Ship, /deployments on Deploys; a run's and an app's pages keep their addresses). Deploys
+    draws them as Ada's approved stills do (v5, v6): apps as Ship's rows by project, the stand word,
+    the edge, the pips, no buttons; an opened app the jobs pane's anatomy. Its strip has Sync (what's
+    picked of what differs), Refresh (asking Refresh or Hard refresh), Roll back and Stop; Promote and
+    Abort while a rollout runs; a setting's change when one is picked; Delete when the Settings
+    group's last line is. Roll back, Stop, Abort and Delete ask again. Under it are its objects by
+    owner, its rollout, its history and its settings. The picked
+    one's detail is beside them, or under its line on a phone with the strip again: an object's Logs
+    (the commits' Output, its LogViewer following CD's log), Events and Manifest, or its Diff; a
+    commit, where it sits among the deploys and what syncing it would change against what runs
+    (`cd.plans.get`). Flat, every height held.
+- **W26-R25 Roll back to any commit.** A deploy can go back to any commit of its app's sources, not
+  only one it deployed: rendered with that source at the commit and the others at their heads,
+  synced as a rollback, recorded as a deployment, and held there until trunk changes what the app
+  renders (cd.md, "Any commit"). Its rollback targets list main's newest commits beside the
+  deployments, each naming the deployment that ran it and the one whose render it matches.
+- **W26-R26 Logs beyond pods.** A deploy's logs read in the same API and stream as a pod's, for
+  what kiln's runners run too: a Compose project's containers (`docker compose logs`, one service's
+  or all; previous, its newest container that exited) and a host's service (its user unit's journal
+  on Linux; on macOS the files its launch agent now writes its stdout and stderr to). Each takes the
+  last lines, since when, and following. kiln reads them on each host the object was made on, by the
+  runner there, in a terminal of its own nobody's list shows, each line naming its host where a
+  pod's names its pod. A Windows service's logs, and the clouds', come later.
+- **W26-R27 Auto-sync from the UI.** A person turns an app's auto-sync on or off from Ship
+  (`cd.apps.set_auto_sync`), kept in the store's settings and audited, as auto-rollback is. It beats
+  the deploy file until the file changes what it says (cd.md, "Auto-sync"). Prune keeps its own
+  knob; deleting an app is as before.
+- **W26-R29 Repositories as Ship's rows.** Ada, 2026-11-01: "each item maps to a repo, and commits
+  are browsable from within there".
+  - Each of Ship's rows is a repository, showing its newest commit: its stand and line, its journey,
+    who and when, and its actions (`GET /api/ship/commits?by=repo`). While the list holds still (a
+    row open, the pointer on it), a row keeps the commit it shows: a newer one waits for the
+    release, as a new row does.
+  - Opened, its first section is the repository's commits, newest first, a page at a time (5, 10,
+    25, 50 or 100; ten by default), with Newer and Older, narrowed by the host and kind the list is
+    narrowed by. Each line has its checks' glyph, sha, message (cut), author, the machines its jobs
+    ran on, how long they ran (first start to last end: `ran`, open while one runs) and when; two
+    lines on a phone.
+  - Picking a line fills the sections below with its commit: Files with the Conversation, Jobs and
+    Lanes. A divider separates the commits from Files. The commit picked stays picked as newer ones
+    arrive (the row shows the newest); the row's Review picks the newest again.
+  - Paging moves the list only: the page before stays until the next is in, and the list holds a
+    page's height, so nothing beside it moves. A page keeps the commits it shows: one that arrives
+    meanwhile waits behind Newer.
 
 **Hosts.** Theirs where a host has it, kiln's where it doesn't (R20's seam says which, per
 repository):
@@ -8643,6 +8790,84 @@ repository):
 - **W26-AC11 Both kinds.** A branch pull request and a stack of three diffs each go from first
   push to landed: the stack's commits land in stack order, each reviewed on its own; the branch's
   commits land together under its review. *Integration test on real git.*
+- **W26-AC12 Any set of jobs.** On both engines, over HTTP: a set cancelled stops those jobs, skips
+  what needs them as "dependency cancelled" and lets the rest go on. Run again, the same set's jobs
+  take their next attempts with what needs them. What can't be done says why, and without `jobs`
+  nothing changes.
+  *`tests/job_sets.rs` `w26_r21_any_set_of_a_runs_jobs_run_again_or_stopped_on_both_engines`;
+  store `w26_r21_a_set_of_jobs_retried_together` and `w26_r21_a_set_of_jobs_cancelled_the_run_going_on`;
+  `kiln-ci` `w26_r21_a_set_runs_again_each_and_what_needs_it` and
+  `w26_r21_cancelling_some_legs_stops_them_and_skips_what_needs_them_the_rest_go_on`.*
+- **W26-AC13 Pause and Resume.** On a runner of the server's own, a v1 job and an engine leg each
+  running, paused: each reads paused, its processes are frozen (`cgroup.freeze` 1) and nothing of it
+  moves. Resumed, each runs on and finishes, the leg after more than its step's 15 s all told,
+  paused 12 of them. A job paused while it waited isn't dispatched once its need is met, until it's
+  resumed. A runner that can't freeze is sent nothing, and the pause says why.
+  *`tests/pause.rs` `w26_r22_a_running_job_paused_is_frozen_in_place_and_goes_on_when_resumed`;
+  `runner::freeze` `w26_r22_*` (a cgroup, process groups, a Docker container); store
+  `w26_r22_a_paused_job_waits_and_its_paused_time_is_kept`; hub `w26_r22_an_old_runner_gets_no_freeze`;
+  `kiln-ci` `w26_r22_a_paused_leg_waits_until_it_is_resumed`; proto
+  `w26_r22_freeze_is_appended_after_every_older_variant`; contain
+  `w26_r22_a_job_left_frozen_by_an_ended_runner_goes_on`.*
+- **W26-AC19 The Deploys tab.** In Chromium and WebKit, at a desktop's width and a phone's: Ship's tabs
+  are Commits and Deploys, /runs landing on Ship and /deployments on Deploys; the apps by project,
+  needs-you first, with no buttons; an opened app as approved (the strip, its objects by owner, its
+  rollout, history and settings, the picked one's detail beside them or under its line with the strip
+  again); each action reaching `POST /api/ship/deploys` with its body (Sync with what's picked of
+  what differs, Refresh and Hard refresh, Roll back to a deploy or any commit, Stop, Promote, Abort,
+  a setting, Delete leaving its objects), Refresh, Roll back, Stop, Abort and Delete asking again and
+  Keep sending nothing, Delete dimmed where a deploy file declares the app, a refusal's why in the
+  strip; no layout shift through picking, acting and CD's events; nothing sideways at
+  320, 390 and 1280. *`ui/e2e/ship-deploys.spec.ts`; `ui/e2e/ship-routes.spec.ts`; every Ship e2e.*
+- **W26-AC20 Repositories as rows.** Over the store and from memory alike, Ship's rows are each
+  repository's newest commit, newest first, through every facet and as each viewer. A commit says
+  when its jobs ran (open while one runs) and on which machines, in the order they started. In
+  Chromium and WebKit, at a desktop's width and a phone's:
+  - an opened repository's commits page 5, 10, 25, 50 and 100 at a time, Newer and Older off at
+    either end;
+  - picking a commit puts its own Files, Jobs and Lanes below the divider;
+  - the list keeps its height as it pages, and nothing scrolls sideways at 320, 390 and 1280.
+
+  *`ship::tests::w26_r29_*`, `ship_memory_is_what_the_store_says_through_random_changes`;
+  `ui/e2e/ship-repos.spec.ts`; every Ship e2e.*
+- **W26-AC18 Deploys in Ship.** On a server with KilnCD, apps of two repositories list under them
+  as CD holds each (sync, health, auto-sync, environment), and an app's pane has its settings and
+  its source's commits; each verb reaches its operation: done and audited as a maintainer's, the
+  operation's own refusal said, refused for a viewer, an agent held to what its environment lets
+  agents do; an app deleted, its objects left, gone from the list. Apps the engine leaves on the simulated cluster stand as defined (soaking then
+  synced, waiting for a person, behind git, rolled back, failed). Over a scratch hub with a KilnCD
+  of its own holding what the simulated cluster's engine left, its store's history, pin and rollout
+  and its mirrors, Ship's list, panes and verbs read and do as defined for two projects: an app out
+  of sync and trunk ahead of it, one synced, one whose rollout waits for an approval, one rolled
+  back; the list held until CD's `cd_apps` and `cd_rollout` events say what changed. *`tests/ship_deploys.rs`
+  `w26_r24_ship_lists_cds_apps_by_project_and_each_verb_reaches_its_operation_as_the_caller`;
+  `ship::deploys`
+  `w26_r24_over_a_scratch_hub_with_the_simulated_cluster_ship_reads_what_cd_holds_and_acts_through_its_ops`
+  and `w26_r24_*`; `kiln-cd` `w26_r24_apps_stand_as_the_engine_leaves_them` (the simulated
+  cluster) and `stands` `w26_r24_*`.*
+- **W26-AC17 Logs beyond pods.** On this machine's Docker, a Compose project's log reads its last
+  lines in order with their times, follows as lines come, and reads a stopped container's as its
+  previous one; each source's command is as asked. *`cd::logs`
+  `w26_r26_a_compose_projects_log_reads_follows_and_reads_a_stopped_containers` and
+  `w26_r26_a_terminals_bytes_read_as_plain_lines`; `kiln-cd`
+  `w26_r26_each_source_reads_its_log_as_asked`.*
+- **W26-AC16 Auto-sync from the UI.** An app whose deploy file leaves auto-sync off syncs once a
+  person turns it on, and stops when they turn it off; once the file changes its word, the file's
+  stands. *`kiln-cd` `w26_r27_a_persons_auto_sync_beats_the_file_until_the_file_changes` and
+  `w26_r27_auto_sync_set_for_an_app_starts_and_stops_its_syncs` (the simulated cluster).*
+- **W26-AC15 Roll back to any commit.** A commit no deployment ran is rendered, synced and recorded
+  as a deployment; a revision resolves to a deployment first, else to a commit or a tag's commit git
+  has in a source; a commit that renders what a deployment rendered names it. *`kiln-cd`
+  `w26_r25_a_rollback_goes_to_any_commit_and_names_the_render_it_matches`,
+  `w26_r25_a_rollback_to_a_commit_never_deployed_renders_syncs_and_records_it` (the simulated
+  cluster), `w26_r25_a_log_lists_a_revisions_newest_commits`; server
+  `w26_r25_a_rollback_goes_to_a_deployment_or_any_commit_git_has`.*
+- **W26-AC14 The jobs pane.** In Chromium and WebKit, at a desktop's width and a phone's: the pane
+  as approved (the strip, the jobs by stage, the output beside them or under the line with the strip
+  again), a line and its glyph picking, each word and each action reaching `POST /api/ship/jobs`
+  with what's picked (a word's scope, a pick's jobs), Cancel asking again and Keep sending nothing,
+  a refusal's why in the strip; no layout shift through picking, acting and 30 s of updates; nothing
+  sideways at 320, 390 and 1280. *`ui/e2e/ship-jobs-pane.spec.ts`; every Ship e2e.*
 
 **Progress.** In progress. R06 to R15, each Ship item's dropdown owning its review, are built
 (Review plan step 3, kiln plan `01a17856b1aa77df93c0ef014cda0a71`, with the CI/CD Integration
@@ -10364,8 +10589,8 @@ errors as `{ error, code, details? }`. Today's routes (`/api/runs`, `/api/jobs/.
 | GET | `/api/ci/repos/:repo/heads` | `ci.uploads.heads` (the commits a pack can leave out) | runs.read | W17 |
 | POST | `/api/ci/repos/:repo/packs?sha=` | `ci.uploads.pack` (a working tree's commit, as a thin pack) | runs.trigger | W17 |
 | POST | `/api/ci/repos/:repo/local-runs` | `ci.runs.local` (`{ sha, ref, event, payload?, workflows?, job?, matrix?, inputs?, vars?, secrets? }`; untrusted unless the owner's) | runs.trigger | W17 |
-| POST | `/api/ci/runs/:id/cancel` | `ci.runs.cancel` | runs.cancel | W05 |
-| POST | `/api/ci/runs/:id/rerun` | `ci.runs.rerun` (`{ mode: all\|failed\|job, job?, debug?, fresh_actions?, no_reuse?, cold? }`) | runs.rerun | W05, W24 |
+| POST | `/api/ci/runs/:id/cancel` | `ci.runs.cancel` (`{ jobs? }`: just those legs, the run going on) | runs.cancel | W05, W26 |
+| POST | `/api/ci/runs/:id/rerun` | `ci.runs.rerun` (`{ mode: all\|failed\|job\|set, job?, jobs?, debug?, fresh_actions?, no_reuse?, cold? }`; `set` runs `jobs` again) | runs.rerun | W05, W24, W26 |
 | POST | `/api/ci/runs/:id/approve` | `ci.runs.approve` (untrusted run or environment) | runs.approve | W15, W18 |
 | GET | `/api/ci/runs/:id/{summary,annotations,artifacts,tests,flow,metrics,attestations}` (built; the actions it pinned come with the run) | `ci.runs.summary`, `ci.runs.annotations`, `ci.artifacts.list`, `ci.tests.run`, `ci.runs.flow`, `ci.metrics.run`, `ci.runs.attestations` | runs.read | W06, W08, W16, W04, W18 |
 | GET | `/api/ci/legs/:id/tests` · `/api/ci/repos/:repo/tests?sort=failing\|slowest\|flaky` | `ci.tests.leg`, `ci.tests.repo` | runs.read | W16 |

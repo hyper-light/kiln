@@ -280,6 +280,7 @@ classes! {
         ServerMsg::Observe { .. } => OBSERVE,
         ServerMsg::Unread { .. } => Class::Ack,
         ServerMsg::ReachRefused { .. } => REACH,
+        ServerMsg::Freeze { .. } => REFUSED,
         ServerMsg::SignAsLeg { .. } => Class::Ask,
         ServerMsg::Custody { .. } => Class::Ask,
     }

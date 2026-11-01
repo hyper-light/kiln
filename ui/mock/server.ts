@@ -37,6 +37,7 @@ import { fastInfos, handleFastSession } from "./fast.ts";
 import { handlePush, pushHeard } from "./push.ts";
 import { handleReview } from "./review.ts";
 import { handleShip } from "./ship.ts";
+import { handleDeploys, setDeploysEmit } from "./deploys.ts";
 import { handleDoctor } from "./doctor.ts";
 import { handleStores } from "./stores.ts";
 import {
@@ -108,10 +109,22 @@ const repoTc = new Map<string, Toolchain>();
 const runs: Run[] = []; // newest first
 const jobsByRun = new Map<string, SimJob[]>();
 const jobsById = new Map<string, SimJob>();
-/** A job for Ship's fixed rows to stream (ship.ts): one running, else the first. */
+/** The run Ship's fixed rows stream, kept while it has jobs to go: the first running job's run
+ * changes each time one run's job ends before its next starts, and the lanes jumped run to run. One
+ * none of whose jobs will fail where there is one: a fixed row that failed has its own failed leg
+ * (ship.ts), and the rest show no failure they don't have. */
+let liveRunId: string | null = null;
+/** A job for Ship's fixed rows to stream (ship.ts): the live run's running one, else its first. */
 function liveJob() {
   const all = [...jobsById.values()];
-  const sj = all.find((j) => j.job.status === "running") ?? all[0];
+  const going = (j: SimJob) => j.job.run_id === liveRunId && ["pending", "queued", "running"].includes(j.job.status);
+  if (liveRunId === null || !all.some(going)) {
+    const clean = (run: string) => (jobsByRun.get(run) ?? []).every((j) => j.failStep === null && j.job.status !== "failed");
+    const running = all.filter((j) => j.job.status === "running");
+    liveRunId = (running.find((j) => clean(j.job.run_id)) ?? running[0])?.job.run_id ?? null;
+  }
+  const its = all.filter((j) => j.job.run_id === liveRunId);
+  const sj = its.find((j) => j.job.status === "running") ?? its[0] ?? all[0];
   return sj ? { run: sj.job.run_id, job: sj.job.id, name: sj.job.display || sj.job.key, state: sj.job.status } : null;
 }
 /** The run of Ship's live job, each of its jobs (ship.ts: a commit's Checks, each leg its own job,
@@ -502,6 +515,7 @@ function emit(ev: ServerEvent) {
 }
 setLongEmit((ev) => emit(ev as ServerEvent));
 setDemoEmit((ev) => emit(ev as ServerEvent));
+setDeploysEmit((ev) => emit(ev as ServerEvent));
 setFamilyEmit((ev) => emit(ev as ServerEvent));
 setReviewEmit((ev) => emit(ev as ServerEvent));
 
@@ -1505,6 +1519,8 @@ const server = http.createServer(async (req, res) => {
     if (await handleGoals(req, res, url)) return;
     if (await handlePrograms(req, res, url)) return;
     // ---- agents that run agents ----
+    // Ship's Deploys, and the CD routes its panes read for its apps (W26-R24), before the rest of CD's.
+    if (await handleDeploys(req, res, url, { json })) return;
     if (await handleShip(req, res, url, { json, liveJob, liveRun, push: () => void startRun(repos.find((r) => r.name === "hyper-light/kiln") ?? repos[0]!, { branch: "main", event: "push" }) })) return;
     if (await handleFamily(req, res, url, () => [longInfo(), ...fastInfos(), ...reviewInfos()])) return;
     // ---- harness accounts (and the demo agents to see them from) ----

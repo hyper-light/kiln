@@ -557,6 +557,7 @@ impl Carries for ServerMsg {
             | ServerMsg::Kept { .. }
             | ServerMsg::Unread { .. }
             | ServerMsg::ReachRefused { .. }
+            | ServerMsg::Freeze { .. }
             | ServerMsg::SignAsLeg { .. }) => return Ok(Carried::Nothing(m)),
         };
         Ok(Carried::Read(read))

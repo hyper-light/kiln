@@ -57,6 +57,22 @@ export function readLocal<T>(key: string, fallback: T): T {
   return getPref(key, fallback);
 }
 
+/**
+ * A field's words over what it applies (`value`): typed freely, and set back to `value` whenever that
+ * changes from elsewhere (a facet picked, the address changed, the field's own words applied). The
+ * field stays the same element throughout, so it keeps the focus: one keyed by `value` to start over
+ * is made anew as its own words apply, and the focus goes with the old one.
+ */
+export function useFieldText(value: string): [string, (text: string) => void] {
+  const [text, setText] = useState(value);
+  const [was, setWas] = useState(value);
+  if (value !== was) {
+    setWas(value);
+    setText(value);
+  }
+  return [text, setText];
+}
+
 export function useMediaQuery(query: string): boolean {
   return useSyncExternalStore(
     (cb) => {

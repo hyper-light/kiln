@@ -9,6 +9,7 @@ import { ArrowDown, ArrowUp, X } from "lucide-react";
 import { ci } from "@/api/ci";
 import { Button } from "@/components/ui/button";
 import { SelectField, TextField } from "@/components/ui/misc";
+import { useFieldText } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import * as W from "@/lib/workflow-doc";
 
@@ -236,7 +237,7 @@ function Steps({ job, apply }: { job: W.FlowJob; apply: Apply }) {
                 <X />
               </Button>
             </div>
-            {open === i && <StepFields key={`${job.id}-${i}-${s.name}-${s.run}-${s.uses}`} job={job.id} index={i} step={s} apply={apply} />}
+            {open === i && <StepFields key={`${job.id}-${i}`} job={job.id} index={i} step={s} apply={apply} />}
           </li>
         ))}
       </ol>
@@ -260,10 +261,14 @@ function Steps({ job, apply }: { job: W.FlowJob; apply: Apply }) {
   );
 }
 
-/** A step's name and its command or action, each written when its field is left. */
+/**
+ * A step's name and its command or action, each written when its field is left, and what's written
+ * shown in them as it lands (or as the file changes elsewhere): the fields stay, so Tab from one to
+ * the next keeps the focus.
+ */
 function StepFields({ job, index, step, apply }: { job: string; index: number; step: W.FlowStep; apply: Apply }) {
-  const [name, setName] = React.useState(step.name ?? "");
-  const [body, setBody] = React.useState(step.uses ?? step.run ?? "");
+  const [name, setName] = useFieldText(step.name ?? "");
+  const [body, setBody] = useFieldText(step.uses ?? step.run ?? "");
   const key = step.uses !== null ? "uses" : "run";
   const id = React.useId();
   return (

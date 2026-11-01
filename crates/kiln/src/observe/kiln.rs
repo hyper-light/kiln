@@ -514,6 +514,8 @@ mod tests {
             steps,
             matrix: None,
             placement: None,
+            paused_at: None,
+            paused_ms: 0,
         }
     }
 

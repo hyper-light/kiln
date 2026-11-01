@@ -180,14 +180,33 @@ pub fn ops() -> &'static [Op] {
                 input: Input::of::<input::CiRunsCompare>(),
                 route: |v| Ok((Method::GET, path(&["runs", &text(v, "run")?, "compare", v.get("other").and_then(Value::as_str).unwrap_or("last-green")]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move { answer(super::compare::runs(&cx.hub, &text(&v, "run")?, v.get("other").and_then(Value::as_str).unwrap_or("last-green")).await).await }),
-            op!("ci.runs.cancel", "Cancel a run: its queued legs settle, its running ones are stopped.", ro: false, destructive: true,
+            op!("ci.runs.cancel", "Cancel a run, or just some of its jobs (`jobs`), the run going on: queued legs settle, running ones are stopped.", ro: false, destructive: true,
                 input: Input::of::<input::CiRunsCancel>(),
                 route: |v| Ok((Method::POST, path(&["runs", &text(v, "run")?, "cancel"]), HashMap::new())),
-                run: |cx: Cx, v: Value| async move { answer(super::runs_api::cancel(&cx.hub, &text(&v, "run")?).await).await }),
-            op!("ci.runs.rerun", "A new attempt of a finished run: every job, the failed ones and what needs them, or one job; with debug logging, keeping failed legs to look into.", ro: false, destructive: false,
+                run: |cx: Cx, v: Value| async move {
+                    let run = text(&v, "run")?;
+                    match v.get("jobs").and_then(Value::as_array).filter(|j| !j.is_empty()) {
+                        Some(jobs) => {
+                            let ids: Vec<String> = jobs.iter().filter_map(Value::as_str).map(str::to_owned).collect();
+                            answer(super::retry::cancel_set(&cx.hub, &run, ids, &cx.caller.name).await.map(|v| crate::http::server::json(StatusCode::OK, &v))).await
+                        }
+                        None => answer(super::runs_api::cancel(&cx.hub, &run).await).await,
+                    }
+                }),
+            op!("ci.runs.rerun", "A new attempt of a finished run: every job, the failed ones and what needs them, one job, or a set of jobs (`set`, `jobs`); with debug logging, keeping failed legs to look into.", ro: false, destructive: false,
                 input: Input::of::<input::CiRunsRerun>(),
                 route: |v| Ok((Method::POST, path(&["runs", &text(v, "run")?, "rerun"]), HashMap::new())),
-                run: |cx: Cx, v: Value| async move { answer(super::runs_api::rerun(&cx.hub, &text(&v, "run")?, &v, &cx.caller.name).await).await }),
+                run: |cx: Cx, v: Value| async move {
+                    let run = text(&v, "run")?;
+                    if v.get("mode").and_then(Value::as_str) == Some("set") {
+                        let ids: Vec<String> = v.get("jobs").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default();
+                        if ids.is_empty() {
+                            return answer(Err((StatusCode::BAD_REQUEST, "mode `set` names its `jobs`".to_owned()))).await;
+                        }
+                        return answer(super::retry::retry_set(&cx.hub, &run, &ids, &cx.caller.name).await.map(|v| crate::http::server::json(StatusCode::CREATED, &v))).await;
+                    }
+                    answer(super::runs_api::rerun(&cx.hub, &run, &v, &cx.caller.name).await).await
+                }),
             op!("ci.runs.approve", "Approve or reject a run's deployments waiting on environments' reviewers.", ro: false, destructive: false,
                 input: Input::of::<input::CiRunsApprove>(),
                 route: |v| Ok((Method::POST, path(&["runs", &text(v, "run")?, "approve"]), HashMap::new())),
@@ -989,6 +1008,8 @@ pub mod input {
     pub struct CiRunsCancel {
         /// The run's id.
         pub run: String,
+        /// Just these of its jobs (their ids), the run going on (W26-R21).
+        pub jobs: Option<Vec<String>>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
@@ -997,6 +1018,8 @@ pub mod input {
         All,
         Failed,
         Job,
+        /// The jobs `jobs` names, passed ones too (W26-R21).
+        Set,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
@@ -1007,6 +1030,8 @@ pub mod input {
         pub mode: Option<CiRunsRerunMode>,
         /// With mode `job`.
         pub job: Option<String>,
+        /// With mode `set`: the jobs (their ids) to run again (W26-R21).
+        pub jobs: Option<Vec<String>>,
         pub debug: Option<bool>,
         /// Minutes a failed leg is kept to look into (W17-R02).
         pub keep_failed: Option<i64>,

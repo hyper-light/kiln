@@ -7,6 +7,7 @@
  * 01a175b7f21b7455bcdcd71e94ecdce0, step 1, Files).
  */
 import { expect, test, type Locator, type Page } from "@playwright/test";
+import { pickCommit } from "./ship-pick";
 
 const REAL = !!process.env.E2E_BASE_URL;
 test.skip(REAL, "drives the mock's review");
@@ -82,14 +83,13 @@ for (const width of [1280, 390])
 test("from 320 to 1440 px, every item's Files is the lanes card's width within 1 px", async ({ page, isMobile }) => {
   test.skip(isMobile, "the widths are set here; the desktop projects run them");
   test.setTimeout(120_000);
-  // A kiln change (D41), a host's pull request (!6, GitLab) and a commit with no change (sync).
-  for (const name of ["D41", "ci: a landed change", "sync: a move carries its homes"])
+  // A kiln change (D41, its newest revision), a host's pull request (!6, GitLab) and a commit with no change (sync).
+  for (const name of ["pipeline: dynamic matrices", "ci: a landed change", "sync: a move carries its homes"])
     for (const width of [320, 390, 600, 800, 1000, 1280, 1440]) {
       await page.setViewportSize({ width, height: 900 });
       await page.goto("/ship");
-      const row = page.locator(".ship-row").filter({ hasText: name }).first();
-      await expect(row).toBeVisible({ timeout: 15_000 });
-      await openRow(row);
+      // Ship's rows are repositories (W26-R29): kiln's, opened, the item picked.
+      const row = await pickCommit(page, name);
       const files = row.locator('section[aria-label="Files"]');
       const card = row.locator('section[aria-label="Lanes"]');
       await expect(files.locator(".rv-sum")).toBeVisible({ timeout: 15_000 });

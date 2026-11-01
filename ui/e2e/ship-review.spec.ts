@@ -1,24 +1,25 @@
 /**
  * A Ship item's dropdown owns its review (W26-R07, R08, R12, R13): open an item, Files and the
- * Conversation first; reply, resolve, change a kind, delete, apply a suggestion, open a whole
+ * Conversation first after its repository's Commits (W26-R29); reply, resolve, change a kind, delete, apply a suggestion, open a whole
  * file, search; resolve a conflict and commit it. The mock (mock/review.ts) answers the
  * endpoints; Chromium and WebKit, desktop and phone.
  */
 import { expect, test, type Page } from "@playwright/test";
+import { pickCommit } from "./ship-pick";
 
 const open = async (page: Page, name: string) => {
   await page.goto("/ship");
-  const row = page.locator(".ship-row", { hasText: name }).first();
-  await row.locator(".ship-main").click();
+  const row = await pickCommit(page, name);
   await expect(row.locator(".rv-s").first()).toBeVisible();
   return row;
 };
 
-test("Files and the Conversation are the dropdown's first sections", async ({ page }) => {
+test("Files and the Conversation are the dropdown's first sections after its repository's Commits", async ({ page }) => {
   const row = await open(page, "pipeline: dynamic matrices");
   const secs = row.locator(".ship-open > section");
-  await expect(secs.nth(0)).toHaveAttribute("aria-label", "Files");
-  await expect(secs.nth(1)).toHaveAttribute("aria-label", "Conversation");
+  await expect(secs.nth(0)).toHaveAttribute("aria-label", "Commits");
+  await expect(secs.nth(1)).toHaveAttribute("aria-label", "Files");
+  await expect(secs.nth(2)).toHaveAttribute("aria-label", "Conversation");
   // The item's diff is in one place, Files (Ada, 2026-10-27), and Files takes focus: Ship's Diff button brings it there.
   const files = row.getByRole("region", { name: "Files", exact: true });
   await expect(files).toHaveCount(1);

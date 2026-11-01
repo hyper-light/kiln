@@ -36,6 +36,7 @@ pub mod gcp_run;
 pub mod heroku;
 pub mod host;
 pub mod job;
+pub mod logs;
 pub mod microvm;
 pub mod netlify;
 pub mod nomad;

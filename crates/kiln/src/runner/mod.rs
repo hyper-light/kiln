@@ -16,6 +16,7 @@ pub mod pool;
 pub mod egress;
 #[cfg(target_os = "linux")]
 pub mod firecracker;
+pub mod freeze;
 #[cfg(target_os = "linux")]
 pub mod guest;
 pub mod hashfiles;
