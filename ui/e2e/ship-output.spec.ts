@@ -32,6 +32,10 @@ for (const width of [1440, 1280, 1000, 800, 600, 390, 320]) {
     await expect(row.locator(".ship-output .xterm")).toBeVisible({ timeout: 15_000 });
     // Review's Files above it drawn first: what's measured is lines arriving, not Files finishing its load.
     await expect(row.locator('section[aria-label="Files"]')).toBeVisible({ timeout: 15_000 });
+    // The job it shows, picked, so it's that job printing: until one is picked the pane shows the job
+    // under way, which on a narrow pane puts the output under the next job's line once it starts.
+    await row.locator('.jp-j[data-at="true"] .jp-line').first().click();
+    await expect(row.locator(".ship-output .xterm")).toBeVisible({ timeout: 15_000 });
     const first = await measure(row);
     expect(first).not.toBeNull();
     expect(Math.abs((first?.width ?? 0) - (first?.lanes ?? 0))).toBeLessThanOrEqual(1);
