@@ -23,6 +23,8 @@ async function box(l: Locator): Promise<Box> {
 
 test("other agents' cards sit above an agent's message box, not over it (W21-R13)", async ({ page, isMobile }) => {
   test.skip(REAL, "the mock's agents");
+  // Their cards back, whatever the checks before put away (mock/push.ts, forgetMarks).
+  await page.request.post("/api/mock/asks");
   await page.goto("/agents/demo-claude");
   const field = page.getByRole("textbox", { name: "Message to the agent" });
   await expect(field).toBeEnabled();
