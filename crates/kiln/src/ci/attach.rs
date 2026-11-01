@@ -20,9 +20,10 @@
 //! `stuck` (a job has waited past its limit for a runner), `slow` (a run's critical path took
 //! longer than its workflow's recent median by more than its margin), `unroutable` (a job no
 //! runner can take, W05), `degraded` (an app kiln CD deploys to its environment turned degraded,
-//! W15), `schedule` (cron, UTC), `mention` (`@<name>` in a comment); for runners, `offline` (gone
-//! past its grace), `upgrade` (an upgrade failed) and `check` (kiln's checks of the machine found
-//! something failing).
+//! W15), `schedule` (cron, UTC), `mention` (`@<name>` in a comment), `review` (asked to review a
+//! change of its repository, as `agent:<name>`: `git push -o reviewer=agent:review`, W26-R18); for
+//! runners, `offline` (gone past its grace), `upgrade` (an upgrade failed) and `check` (kiln's checks
+//! of the machine found something failing).
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -38,7 +39,7 @@ use crate::ops::{Cx, Fail, Input, Op, Out, path};
 use crate::store::Repo;
 
 /// What wakes an attachment.
-pub const WAKES: &[&str] = &["failure", "ejected", "flaky", "stuck", "slow", "unroutable", "degraded", "schedule", "mention", "offline", "upgrade", "check"];
+pub const WAKES: &[&str] = &["failure", "ejected", "flaky", "stuck", "slow", "unroutable", "degraded", "schedule", "mention", "offline", "upgrade", "check", "review"];
 /// What wakes one on runners.
 const RUNNER_WAKES: &[&str] = &["offline", "upgrade", "check", "schedule"];
 /// What an attachment's agent may do (W20-R09).
@@ -1009,6 +1010,112 @@ async fn mentions(hub: &Hub, v: &Value) -> Vec<Trigger> {
     out
 }
 
+/// An agent asked to review change `diff` of `repo` by `by` (W26-R18): `who` (`agent:<name>`)
+/// names an attachment on the repository that wakes on `review` and may comment. It's woken with
+/// the change's bundle (its versions, its open threads, who asked), its incident on the change, its
+/// agent held to what it may do; once its agent runs, the reviewer asked is that agent, as it
+/// comments, so its words hand the turn back (W26-R05). What came of it, in words, for the push to
+/// say: whose review is under way, or why nothing started.
+pub async fn review_asked(hub: &Arc<Hub>, repo: &Repo, diff: &str, who: &str, by: &str) -> String {
+    let name = who.strip_prefix("agent:").unwrap_or(who);
+    let Some(a) = all(hub).await.into_iter().find(|a| a.name.eq_ignore_ascii_case(name) && repo_of(a).as_deref() == Some(repo.name.as_str())) else {
+        return format!("{who}: {} has no attached agent named {name}: no review started on {diff}", repo.name);
+    };
+    if !a.wake.iter().any(|w| w == "review") {
+        return format!("{who}: {} doesn't wake on review (it wakes on {}): no review started on {diff}", a.name, a.wake.join(", "));
+    }
+    if !a.can.iter().any(|c| c == "comment") {
+        return format!("{who}: {} may not comment: no review started on {diff}", a.name);
+    }
+    let base = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
+    let url = format!("{base}/diffs/{diff}");
+    let t = Trigger {
+        wake: "review",
+        about: About { repo: Some(repo.name.clone()), ..About::default() },
+        signature: format!("review:{}:{diff}", a.id),
+        title: format!("{by} asked {} to review {diff}", a.name),
+        seen: Seen { at: crate::util::now_unix(), what: format!("{by} asked for a review of {diff}"), url: Some(url.clone()), run: None },
+        detail: review_detail(hub, diff, by, &url).await,
+    };
+    let Some(i) = wake(hub, &a, &t).await else { return format!("{who}: no review started on {diff}") };
+    match (&i.agent, i.state.as_str()) {
+        (Some(agent), "open") => {
+            reviewer_is(hub, diff, who, agent).await;
+            format!("{who}: {} is reviewing {diff} (incident {})", a.name, i.id)
+        }
+        _ => format!("{who}: no review started on {diff}: {}", i.why.clone().unwrap_or_else(|| format!("its incident is {}", i.state))),
+    }
+}
+
+/// What a review agent is given of change `diff` (W26-R18): what it is, its versions, its open
+/// threads and who asked; what it may do, and how.
+async fn review_detail(hub: &Hub, diff: &str, by: &str, url: &str) -> String {
+    let Ok(Some(d)) = crate::ci::diffs::find(hub, diff).await else { return format!("{by} asked you to review {diff} ({url})") };
+    let versions = crate::ci::diffs::versions(hub, &d).await.unwrap_or_default();
+    let id = d.id.clone();
+    let threads: Vec<(String, Option<String>, Option<i64>, String, String)> = hub
+        .store
+        .call(move |c| {
+            let mut st = c.prepare(
+                "SELECT t.id, t.file, t.start_line, t.created_by, (SELECT x.body FROM review_comments x WHERE x.thread_id = t.id AND x.published = 1 ORDER BY x.created_at, x.rowid LIMIT 1)
+                 FROM review_threads t WHERE t.diff_id = ?1 AND t.state = 'open' ORDER BY t.created_at, t.id",
+            )?;
+            let rows = st.query_map([&id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get::<_, Option<String>>(4)?.unwrap_or_default())))?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+        .unwrap_or_default();
+    let draft = if d.state == "draft" { ", a draft" } else { "" };
+    let mut b = format!("{by} asked you to review {diff}{draft}, \"{}\" by {}, on {} ({url}).", d.title, d.author, d.trunk);
+    b.push_str("\n\nIts versions:");
+    for v in &versions {
+        b.push_str(&format!("\n- v{} {}{}", v.n, v.commit.get(..7).unwrap_or(&v.commit), v.why.as_deref().map(|w| format!(" ({w})")).unwrap_or_default()));
+    }
+    if threads.is_empty() {
+        b.push_str("\n\nNo threads are open on it.");
+    } else {
+        b.push_str("\n\nIts open threads:");
+        for (t, file, line, who, said) in &threads {
+            let at = match (file, line) {
+                (Some(f), Some(l)) => format!("{f}:{l}"),
+                (Some(f), None) => f.clone(),
+                _ => "the whole change".to_owned(),
+            };
+            b.push_str(&format!("\n- {t} on {at}, by {who}: {}", said.lines().next().unwrap_or_default()));
+        }
+    }
+    b.push_str(&format!(
+        "\n\nReview it as a reviewer would: ci.diffs.files and ci.diffs.interdiff read it; ci.diffs.comment {{\"diff\": \"{diff}\", \"file\": …, \"start_line\": …, \"body\": …, \"publish\": true}} comments on its lines; ci.diffs.reply answers a thread; ci.diffs.resolve resolves one that's fixed; ci.diffs.review gives your verdict. What you say is signed as you, for whoever attached you. You can't push or land it."
+    ));
+    b
+}
+
+/// Change `diff`'s reviewer asked as `who` (`agent:review`) is review agent session `agent`, as it
+/// comments (`agent:<its id's start>[@<runner>]`, `crate::mcp::session_caller`): its words then
+/// hand the turn back (W26-R05).
+async fn reviewer_is(hub: &Hub, diff: &str, who: &str, agent: &str) {
+    let short: String = agent.chars().take(8).collect();
+    let principal = match hub.harness.info(agent).map(|i| i.target) {
+        Some(t) if t.starts_with("agent:") => format!("agent:{short}@{}", t.trim_start_matches("agent:")),
+        _ => format!("agent:{short}"),
+    };
+    let Ok(Some(d)) = crate::ci::diffs::find(hub, diff).await else { return };
+    let (id, who) = (d.id.clone(), who.to_owned());
+    let moved = hub
+        .store
+        .call(move |c| {
+            let tx = crate::store::tx(c)?;
+            let n = tx.execute("INSERT OR IGNORE INTO diff_reviewers (diff_id, reviewer, state, added_at) SELECT diff_id, ?3, state, added_at FROM diff_reviewers WHERE diff_id = ?1 AND reviewer = ?2", rusqlite::params![id, who, principal])?;
+            tx.execute("DELETE FROM diff_reviewers WHERE diff_id = ?1 AND reviewer = ?2", rusqlite::params![id, who])?;
+            tx.commit()?;
+            Ok(n)
+        })
+        .await;
+    if let Err(e) = moved {
+        tracing::warn!(diff, agent, error = %format!("{e:#}"), "a review agent's turn wasn't kept as its own");
+    }
+}
+
 // ------------------------------------------------------------------ waking
 
 /// One incident's bookkeeping at a time.
@@ -1017,8 +1124,9 @@ static WAKING: futures::lock::Mutex<()> = futures::lock::Mutex::new(());
 /// Wakes what `t` wakes.
 pub async fn fire(hub: &Arc<Hub>, t: &Trigger) {
     for a in all(hub).await {
-        // A mention calls the one it names; the rest wake what looks after what they're about.
-        let called = if t.wake == "mention" { t.signature.starts_with(&format!("mention:{}:", a.id)) } else { looks_after(&a, &t.about) };
+        // A mention or an ask to review calls the one it names; the rest wake what looks after what
+        // they're about.
+        let called = if matches!(t.wake, "mention" | "review") { t.signature.starts_with(&format!("{}:{}:", t.wake, a.id)) } else { looks_after(&a, &t.about) };
         if called && a.wake.iter().any(|w| w == t.wake) {
             wake(hub, &a, t).await;
         }

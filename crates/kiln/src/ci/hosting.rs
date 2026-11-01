@@ -673,7 +673,9 @@ pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req:
         if let (Some(at), Some((spec, suffix))) = (at, for_ref(&target.name)) {
             given.extend(suffix);
             let options = kiln_ci::review::options(&given);
-            said.extend(options.unknown.iter().map(|o| format!("push option `{o}` isn't one kiln takes (draft, ready, reviewer=, message=, topic=, title=, change=<commit>:<D12|new>); ignored")));
+            said.extend(options.unknown.iter().map(|o| format!("push option `{o}` isn't one kiln takes (draft, ready, reviewer=, message=, topic=, title=, change=<commit>:<D12|new>, answer=<thread>); ignored")));
+            // Agents asked to review (`reviewer=agent:<name>`, W26-R18): each wakes its attachment.
+            let agents: Vec<String> = options.reviewers.iter().filter(|r| r.starts_with("agent:")).cloned().collect();
             let result = match spec.split_once("/branch/") {
                 // A change request (W14-R04): the branch is the commit pushed, then reviewed whole.
                 Some((trunk, branch)) => match crate::gitops::run_git(hub, &["-C", &p, "update-ref", &format!("refs/heads/{branch}"), &target.new], crate::gitops::LS_REMOTE_TIMEOUT).await {
@@ -687,6 +689,8 @@ pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req:
             };
             match result {
                 Ok(outcomes) => {
+                    let asker = kiln_ci::review::byline(&user, None, None, None).words();
+                    let changed: Vec<String> = outcomes.iter().filter(|o| o.kind != "unchanged").map(|o| o.name.clone()).collect();
                     for o in outcomes {
                         let what = match o.kind {
                             "new" => "new",
@@ -700,6 +704,11 @@ pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req:
                         let absorbed = if o.absorbed.is_empty() { String::new() } else { format!("; absorbed {}", o.absorbed.join(", ")) };
                         said.push(format!("{} v{} ({what}{split}{absorbed})  {}", o.name, o.version, o.title));
                         said.push(format!("  {}", o.url));
+                    }
+                    for who in &agents {
+                        for diff in &changed {
+                            said.push(super::attach::review_asked(hub, repo, diff, who, &asker).await);
+                        }
                     }
                 }
                 Err(why) => {

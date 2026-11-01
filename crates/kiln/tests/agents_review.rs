@@ -714,3 +714,151 @@ fn w26_ac10_the_same_on_a_stacked_diff() -> anyhow::Result<()> {
     anyhow::ensure!(field(&d, "kind") == "diff" && field(&d, "author").contains(&w.matrix.id), "a stacked diff, the Matrix agent's: {d}");
     comment_fix_answer_resolve_on(&w, &diff, false)
 }
+
+/// W26-R18, a review agent asked onto a change. acme/app has an attached agent, `review` (wakes on
+/// review, may read and comment), which runs kiln's fake harness on box-a. kim pushes D1 asking
+/// `-o reviewer=agent:review`:
+/// - the push says review is reviewing D1, and an incident opens on D1 whose agent was given D1's
+///   bundle;
+/// - its agent comments on D1, signed as itself for whoever attached it; its try at pushing a
+///   change is refused (it may read and comment only), and its approval doesn't count, as the trunk
+///   doesn't say agents-can-approve;
+/// - kim's reply in its thread reaches it.
+///
+/// An ask naming no attached agent, and one while `review` is paused, each say why no review
+/// started; asked onto a draft, it reviews that too.
+#[test]
+fn w26_r18_a_review_agent_asked_onto_a_change() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options::default())?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&serde_json::json!({"name": "acme/app", "mode": "native"})))?;
+    anyhow::ensure!(st == 200, "a repository kiln hosts: {st} {body}");
+    add_person(&s, "kim")?;
+    let kim = token_of(&s, "kim")?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let git = |at: &Path, args: &[&str]| Ac10::git_in(&home, at, args);
+    let owner = format!("http://x:{}@127.0.0.1:{}/git/acme/app.git", s.admin, s.port);
+    git(dir.path(), &["clone", "-q", &owner, "base"])?;
+    let base = dir.path().join("base");
+    std::fs::write(base.join("a.py"), "def legs(matrix):\n    return [0]\n")?;
+    git(&base, &["add", "."])?;
+    git(&base, &["commit", "-qm", "legs"])?;
+    git(&base, &["push", "-q", "origin", "main"])?;
+    git(dir.path(), &["clone", "-q", &format!("http://x:{kim}@127.0.0.1:{}/git/acme/app.git", s.port), "kim"])?;
+    let work = dir.path().join("kim");
+    // A change of kim's on its own branch from main, pushed for review with `options`: what kiln said.
+    let push = |n: usize, options: &[&str]| -> anyhow::Result<String> {
+        git(&work, &["checkout", "-q", "-B", &format!("c{n}"), "origin/main"])?;
+        std::fs::write(work.join("a.py"), format!("def legs(matrix):\n    return [{n}]\n"))?;
+        let id = format!("I{}", n.to_string().repeat(40).get(..40).unwrap_or_default());
+        git(&work, &["commit", "-qam", &format!("legs {n}\n\nChange-Id: {id}\n")])?;
+        let mut args: Vec<String> = vec!["push".into()];
+        for o in options {
+            args.push("-o".into());
+            args.push((*o).to_owned());
+        }
+        args.extend(["origin".to_owned(), "HEAD:refs/for/main".to_owned()]);
+        git(&work, &args.iter().map(String::as_str).collect::<Vec<_>>())
+    };
+
+    // `review`, attached to acme/app by its owner: kiln's fake harness on box-a, in a folder of its own.
+    let act = ac10_act(dir.path())?;
+    let (_runner, log) = agents::runner_with(dir.path(), s.port, "box-a", None, TALK, &[("FAKE_CLAUDE_ACT", &act)])?;
+    agents::connected(s.port, &s.admin, "box-a", &log, Duration::from_secs(60))?;
+    let cwd = dir.path().join("review");
+    std::fs::create_dir_all(&cwd)?;
+    std::fs::write(cwd.join(".fake-claude-messages"), "")?;
+    let attach = serde_json::json!({"name": "review", "on": "repo:acme/app", "harness": {"kind": "claude", "on": "box-a", "cwd": cwd.to_string_lossy()}, "wake": ["review"], "can": ["read", "comment"], "playbook": "Review the change you're asked to."});
+    let (st, body) = http(s.port, "POST", "/api/attachments", &s.admin, Some(&attach))?;
+    anyhow::ensure!((200..300).contains(&st), "the attachment: {st} {body}");
+
+    // kim asks review onto D1: the push says so, and an incident opens on D1 with its agent.
+    let said = push(1, &["reviewer=agent:review"])?;
+    anyhow::ensure!(said.contains("D1 v1") && said.contains("agent:review: review is reviewing D1 (incident "), "the push says review is on it: {said}");
+    let incidents = || -> anyhow::Result<Vec<Value>> {
+        let (st, body) = http(s.port, "GET", "/api/incidents?limit=50", &s.admin, None)?;
+        anyhow::ensure!(st == 200, "incidents: {st} {body}");
+        Ok(serde_json::from_str::<Value>(&body)?.get("incidents").and_then(Value::as_array).cloned().unwrap_or_default())
+    };
+    let first = incidents()?.into_iter().find(|i| field(i, "wake") == "review" && field(i, "title").contains("D1")).ok_or_else(|| anyhow::anyhow!("no review incident on D1: {:?}", incidents()))?;
+    let agent = field(&first, "agent").to_owned();
+    anyhow::ensure!(field(&first, "state") == "open" && !agent.is_empty() && field(&first, "repo") == "acme/app", "its incident, with its agent: {first}");
+    std::fs::write(cwd.join("session"), &agent)?;
+    until_identified(&s, &agent, Duration::from_secs(60))?;
+    let heard = || std::fs::read_to_string(cwd.join(".fake-claude-messages")).unwrap_or_default();
+    until(Duration::from_secs(60), "its agent is given D1's bundle", || Ok((!heard().contains("asked you to review D1")).then(heard)))?;
+    let fake = Fake { id: agent.clone(), dir: cwd.clone(), name: "review".into() };
+    let w = Ac10Agents { port: s.port, admin: s.admin.clone() };
+
+    // It comments, signed as itself for whoever attached it.
+    let c = w.run(&fake, "comment", "return await kiln.ci.diffs.comment({diff: \"D1\", body: \"why one leg for an empty matrix?\", file: \"a.py\", start_line: 2, publish: true});")?;
+    let thread = field(&c, "thread").to_owned();
+    let (st, body) = http(s.port, "GET", "/api/diffs/D1/comments", &s.admin, None)?;
+    anyhow::ensure!(st == 200, "threads: {st} {body}");
+    let threads: Value = serde_json::from_str(&body)?;
+    let comment = threads.get("threads").and_then(Value::as_array).into_iter().flatten().filter(|t| field(t, "id") == thread).flat_map(|t| t.get("comments").and_then(Value::as_array).cloned().unwrap_or_default()).next().unwrap_or_default();
+    let signer = comment.pointer("/signed/by").and_then(Value::as_str).unwrap_or_default();
+    anyhow::ensure!(signer.contains(&format!("/agent/{agent}/")) && comment.pointer("/by/kind").and_then(Value::as_str) == Some("agent"), "signed as the review agent: {comment}");
+
+    // It can't push: it may read and comment only.
+    let pushed = w.run(&fake, "push", "try { await kiln.ci.diffs.submit_patch({repo: \"acme/app\", mbox: \"From 0 Mon Sep 17 00:00:00 2001\\nSubject: [PATCH] more legs\\n\\n---\\n\"}); return {pushed: true}; } catch (e) { return {refused: String(e)}; }")?;
+    anyhow::ensure!(pushed.get("pushed").is_none() && !field(&pushed, "refused").is_empty(), "its push is refused: {pushed}");
+    let (st, body) = http(s.port, "GET", "/api/repos/acme%2Fapp/diffs", &s.admin, None)?;
+    anyhow::ensure!(st == 200, "diffs: {st} {body}");
+    let listed: Value = serde_json::from_str(&body)?;
+    let start = format!("agent:{}", agent.get(..8).unwrap_or(&agent));
+    anyhow::ensure!(!listed.get("diffs").or(Some(&listed)).and_then(Value::as_array).into_iter().flatten().any(|d| field(d, "author").starts_with(&start)), "no diff of its own came of it: {body}");
+    // Its approval doesn't count: the trunk doesn't say agents-can-approve.
+    w.run(&fake, "approve", "return await kiln.ci.diffs.review({diff: \"D1\", action: \"accept\", body: \"fine by me\"});")?;
+    let (st, body) = http(s.port, "GET", "/api/diffs/D1/land", &s.admin, None)?;
+    anyhow::ensure!(st == 200 && body.contains("people"), "only people's approvals count: {st} {body}");
+
+    // kim's reply in its thread reaches it.
+    let (st, body) = http(s.port, "POST", "/api/diffs/D1/comments", &kim, Some(&serde_json::json!({"thread": thread, "body": "one leg on purpose", "publish": true})))?;
+    anyhow::ensure!(st == 200, "kim's reply: {st} {body}");
+    until(Duration::from_secs(60), "kim's reply reaches the review agent", || Ok((!(heard().contains(&format!("replied in thread {thread} on D1, which you're reviewing")) && heard().contains("> one leg on purpose"))).then(heard)))?;
+
+    // No such attached agent, then review paused: each push says why no review started.
+    let said = push(2, &["reviewer=agent:nobody"])?;
+    anyhow::ensure!(said.contains("agent:nobody: acme/app has no attached agent named nobody: no review started on D2"), "{said}");
+    let (st, body) = http(s.port, "POST", "/api/attachments/pause", &s.admin, Some(&serde_json::json!({"attachment": "review", "paused": true})))?;
+    anyhow::ensure!((200..300).contains(&st), "paused: {st} {body}");
+    let said = push(3, &["reviewer=agent:review"])?;
+    anyhow::ensure!(said.contains("agent:review: no review started on D3: review is paused"), "{said}");
+
+    // Asked onto a draft, it reviews that too.
+    let (st, body) = http(s.port, "POST", "/api/attachments/pause", &s.admin, Some(&serde_json::json!({"attachment": "review", "paused": false})))?;
+    anyhow::ensure!((200..300).contains(&st), "on again: {st} {body}");
+    let said = push(4, &["draft", "reviewer=agent:review"])?;
+    anyhow::ensure!(said.contains("agent:review: review is reviewing D4 (incident "), "a draft gets its review too: {said}");
+    let (st, body) = http(s.port, "GET", "/api/diffs/D4", &s.admin, None)?;
+    anyhow::ensure!(st == 200 && field(&serde_json::from_str::<Value>(&body)?, "state") == "draft", "still a draft: {st} {body}");
+    Ok(())
+}
+
+/// The server a fake agent's program runs against, for [`Ac10Agents::run`] without the rest of W26-AC10's world.
+struct Ac10Agents {
+    port: u16,
+    admin: String,
+}
+
+impl Ac10Agents {
+    /// Agent `a` runs `program` through its own MCP server: what it returned, or why not.
+    fn run(&self, a: &Fake, name: &str, program: &str) -> anyhow::Result<Value> {
+        std::fs::write(a.dir.join(format!("{name}.js")), program)?;
+        let (st, body) = http(self.port, "POST", &format!("/api/harness/sessions/{}/command", a.id), &self.admin, Some(&serde_json::json!({"type": "send", "id": format!("rv-{name}"), "text": format!("run {name}")})))?;
+        anyhow::ensure!((200..300).contains(&st), "send to {}: {st} {body}", a.name);
+        let out = a.dir.join(format!("{name}.out"));
+        let deadline = Instant::now() + Duration::from_secs(90);
+        while !out.exists() {
+            anyhow::ensure!(Instant::now() < deadline, "{}'s {name} never answered: {}", a.name, std::fs::read_to_string(a.dir.join(format!("{name}.err"))).unwrap_or_default());
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let text = std::fs::read_to_string(&out)?;
+        let answer: Value = text.lines().find(|l| l.contains("\"id\":2")).map(serde_json::from_str::<Value>).transpose()?.unwrap_or_default();
+        let structured = answer.pointer("/result/structuredContent").cloned().unwrap_or_default();
+        anyhow::ensure!(answer.pointer("/result/isError") != Some(&Value::Bool(true)), "{}'s {name}: {structured}", a.name);
+        Ok(structured.get("result").cloned().unwrap_or_default())
+    }
+}

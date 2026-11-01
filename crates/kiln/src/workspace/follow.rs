@@ -11,6 +11,8 @@
 //!   where agents have started 3 fixes since a person spoke in it waits for a person; agents'
 //!   feedback for an agent that has ended is held, and the item says it waits for a person to start
 //!   or resume it (W26-AC10, `kiln_ci::review::agents` decides);
+//! - a reply in a thread a review agent opened goes to that agent too, by the same rule, so it can
+//!   resolve what was fixed (W26-R18);
 //! - CI that failed on its newest version goes to it with the failed legs and the first one's
 //!   failure excerpt, when its person lets it fix failing checks (`fix_checks`, on unless they
 //!   turned it off when opening the change);
@@ -74,14 +76,23 @@ fn s<'a>(v: &'a Value, k: &str) -> Option<&'a str> {
 async fn heard(hub: &Arc<Hub>, kind: &str, v: &Value) {
     match kind {
         "comment" => {
-            let Some(r) = record_of(hub, s(v, "diff_author"), s(v, "diff")).await else { return };
+            let author = record_of(hub, s(v, "diff_author"), s(v, "diff")).await;
             let by = s(v, "author").unwrap_or("someone");
             let p = place_of(hub, v).await;
             let fixes = match &p.thread {
                 Some(t) => fixes_in(hub, t, s(v, "comment")).await,
                 None => 0,
             };
-            routed(hub, &r, v, by, fixes, comment_text(&r, v, &p)).await;
+            if let Some(r) = &author {
+                routed(hub, r, v, by, fixes, comment_text(r, v, &p)).await;
+            }
+            // A review agent's own threads (W26-R18): what's said in them reaches it too.
+            if let Some(t) = &p.thread
+                && let Some((reviewer, first)) = thread_agent(hub, t).await
+                && author.as_ref().is_none_or(|r| r.agent != reviewer)
+            {
+                reviewed(hub, &reviewer, &first, v, by, fixes, &p).await;
+            }
         }
         "review" => {
             let Some(mut r) = record_of(hub, s(v, "diff_author"), s(v, "diff")).await else { return };
@@ -207,6 +218,58 @@ async fn own_words(hub: &Hub, by: &str, comment: Option<&str>, agent: &str) -> b
         }
     }
     by.contains(crate::harness::lineage::short(agent))
+}
+
+/// The agent session that opened thread `thread`, by its first comment's signature (which names its
+/// whole session), and that comment's id (what resolves the thread); none for a person's thread or
+/// an unsigned one.
+async fn thread_agent(hub: &Hub, thread: &str) -> Option<(String, String)> {
+    let t = thread.to_owned();
+    let first: Option<(String, Option<String>)> = hub
+        .store
+        .call(move |c| {
+            use rusqlite::OptionalExtension as _;
+            Ok(c.query_row(
+                "SELECT c.id, (SELECT s.signer FROM review_signatures s WHERE s.kind = 'comment' AND s.id = c.id) FROM review_comments c WHERE c.thread_id = ?1 ORDER BY c.created_at, c.rowid LIMIT 1",
+                [&t],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+        })
+        .await
+        .ok()
+        .flatten();
+    let (comment, signer) = first?;
+    match kiln_ci::identity::chain::Identity::parse(&signer?).ok()?.actor {
+        kiln_ci::identity::chain::Actor::Agent { agent, .. } => Some((agent, comment)),
+        _ => None,
+    }
+}
+
+/// What's said by `by` (event `v`) in a thread review agent `agent` opened (its first comment
+/// `first`), to that agent, by the same rule as feedback on an agent's own change: a person's
+/// always, an agent's where the repository lets agents act on agents' feedback, within the thread's
+/// bound, its own never, and nothing once it has ended (W26-R18).
+async fn reviewed(hub: &Arc<Hub>, agent: &str, first: &str, v: &Value, by: &str, fixes: u32, p: &Place) {
+    let speaker = Speaker::of(by);
+    let own = own_words(hub, by, s(v, "comment"), agent).await;
+    let agents_fix = match s(v, "repo") {
+        Some(repo) => crate::ci::agent_fixes::of_named(hub, repo).await.0,
+        None => false,
+    };
+    let runs = hub.harness.info(agent).is_some_and(|i| i.status != Status::Exited);
+    if decide::route(Heard { speaker, own, agents_fix, fixes, runs }) != Route::Tell {
+        return;
+    }
+    let diff = s(v, "diff").unwrap_or_default();
+    let who = kiln_ci::review::byline(by, None, None, None).words();
+    let thread = p.thread.clone().unwrap_or_default();
+    let quoted: String = s(v, "body").unwrap_or_default().lines().map(|l| if l.is_empty() { ">\n".to_owned() } else { format!("> {l}\n") }).collect();
+    let text = format!(
+        "{who} replied in thread {thread} on {diff}, which you're reviewing{}. {who}'s words, quoted:\n\n{quoted}\nIf it's fixed, resolve the thread: ci.diffs.resolve {{\"comment\": \"{first}\"}}. Otherwise answer in it: ci.diffs.reply {{\"diff\": \"{diff}\", \"thread\": \"{thread}\", \"body\": …}}.",
+        place_words(p)
+    );
+    deliver(hub, agent, text).await;
 }
 
 /// Keeps what kiln did with agents' feedback on agent `r`'s change at its newest version (`what`:
