@@ -411,6 +411,21 @@ impl App {
         }
     }
 
+    /// Who outside a repository may use its actions and reusable workflows, as GitHub says
+    /// (docs/ci.md W29-R17): a public repository's are everyone's; a private one's, its
+    /// `access_level`.
+    pub async fn sharing(&self, repo: &Repo) -> anyhow::Result<kiln_ci::sharing::Access> {
+        let (name, t) = self.token_for(repo, &[("administration", "read"), ("metadata", "read")]).await?;
+        let (st, v) = self.call(Method::Get, &format!("/repos/{name}"), Auth::Token(&t), None).await?;
+        anyhow::ensure!(st == 200, "{name} ({st}): {}", said(&v));
+        if v.get("private").and_then(Value::as_bool) == Some(false) {
+            return Ok(kiln_ci::sharing::Access::Everyone);
+        }
+        let (st, v) = self.call(Method::Get, &format!("/repos/{name}/actions/permissions/access"), Auth::Token(&t), None).await?;
+        anyhow::ensure!(st == 200, "{name}'s actions access ({st}): {}", said(&v));
+        Ok(v.get("access_level").and_then(Value::as_str).and_then(kiln_ci::sharing::Access::of_github).unwrap_or_default())
+    }
+
     /// Opens a pull request, a draft with `draft` (REST's own flag, docs/ci.md W29-R11).
     pub async fn open_change(&self, repo: &Repo, head: &str, base: &str, title: &str, body: &str, draft: bool) -> anyhow::Result<ChangeRef> {
         let (name, t) = self.token_for(repo, &[("pull_requests", "write"), ("contents", "read"), ("metadata", "read")]).await?;
@@ -798,6 +813,32 @@ mod tests {
         assert_eq!(check_state("failed", Some("failure")), ("completed", Some("failure".into())));
         assert_eq!(check_state("running", None), ("in_progress", None));
         Ok(())
+    }
+
+    /// W29-R17 on GitHub: a public repository's actions are everyone's; a private one's are as its
+    /// `access_level` says.
+    #[test]
+    fn w29_r17_github_access() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let kp = KeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048).map_err(|_| anyhow!("keygen"))?;
+            let der = aws_lc_rs::encoding::AsDer::<aws_lc_rs::encoding::Pkcs8V1Der>::as_der(&kp).map_err(|_| anyhow!("der"))?;
+            let pem = format!("-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n", B64.encode(der.as_ref()));
+            let answer: crate::githost::fake_host::Answer = Box::new(|method, path, _query, _body| match (method, path) {
+                ("GET", "/repos/acme/kit/installation" | "/repos/acme/open/installation") => (200, json!({ "id": 8 })),
+                ("POST", "/app/installations/8/access_tokens") => (201, json!({ "token": "ghs_sharing", "expires_at": "2099-01-01T00:00:00Z" })),
+                ("GET", "/repos/acme/kit") => (200, json!({ "full_name": "acme/kit", "private": true })),
+                ("GET", "/repos/acme/kit/actions/permissions/access") => (200, json!({ "access_level": "organization" })),
+                ("GET", "/repos/acme/open") => (200, json!({ "full_name": "acme/open", "private": false })),
+                _ => (404, json!({ "message": "Not Found" })),
+            });
+            let (base, fake) = crate::githost::fake_host::start(answer).await?;
+            let app = App { id: 43, key: key_from_pem(&pem)?, api: base, web: "https://github.com".into(), webhook_secret: None, slug: None, html_url: None };
+            let repo = |name: &str| Repo { id: "r".into(), name: name.into(), clone_url: format!("https://github.com/{name}.git"), branches: vec![], poll_seconds: 60, enabled: true, created_at: 0, last_polled_at: None, last_error: None, mode: "upstream".into(), default_branch: None, mirror: None };
+            assert_eq!(app.sharing(&repo("acme/kit")).await?, kiln_ci::sharing::Access::Owner, "organization: the owner's repositories");
+            assert_eq!(app.sharing(&repo("acme/open")).await?, kiln_ci::sharing::Access::Everyone, "public: everyone's");
+            assert!(fake.sent("GET", "/repos/acme/open/actions/permissions/access").is_empty(), "a public repository's level isn't asked");
+            Ok(())
+        })
     }
 
     /// W29-R11, R12 on GitHub: a pull request opened as a draft (REST's flag; none for the rest),

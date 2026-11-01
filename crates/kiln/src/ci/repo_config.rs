@@ -6,6 +6,8 @@
 //! - `actions`: the repository's action policy (W07-R04): `allow`, `deny`, `require_sha_pins`,
 //!   narrowing the server's.
 //! - `untrusted`: how runs from forks go (W18).
+//! - `share`: who may use its actions and reusable workflows (W29-R17): `none` (the default),
+//!   `owner` or `everyone`.
 //!
 //! It's read from the default branch, never from the commit being run, so a change can't loosen
 //! the rules it runs under.
@@ -30,9 +32,15 @@ pub struct RepoConfig {
     pub actions: Option<Policy>,
     pub untrusted: Option<serde_yaml::Value>,
     pub github_api: Option<serde_yaml::Value>,
+    pub share: Option<String>,
 }
 
 impl RepoConfig {
+    /// Who may use its actions and reusable workflows (W29-R17): not shared unless it says.
+    pub fn share(&self) -> kiln_ci::sharing::Access {
+        self.share.as_deref().and_then(kiln_ci::sharing::Access::of_share).unwrap_or_default()
+    }
+
     /// The plan's default permissions: the repository's, else GitHub's restricted default.
     pub fn default_permissions(&self) -> kiln_ci::plan::perms::Default {
         match self.default_token_permissions.as_deref() {
@@ -83,6 +91,19 @@ pub async fn load(hub: &Hub, repo: &Repo) -> RepoConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// W29-R17: `share:` is who may use the repository's actions and reusable workflows; not
+    /// shared unless it says.
+    #[test]
+    fn w29_r17_share_from_config() -> anyhow::Result<()> {
+        let c: RepoConfig = serde_yaml::from_str("github_workflows: off\n")?;
+        assert_eq!(c.share(), kiln_ci::sharing::Access::None, "not shared unless it says");
+        for (yaml, access) in [("share: owner\n", kiln_ci::sharing::Access::Owner), ("share: everyone\n", kiln_ci::sharing::Access::Everyone), ("share: none\n", kiln_ci::sharing::Access::None), ("share: nobody\n", kiln_ci::sharing::Access::None)] {
+            let c: RepoConfig = serde_yaml::from_str(yaml)?;
+            assert_eq!(c.share(), access, "{yaml}");
+        }
+        Ok(())
+    }
 
     #[test]
     fn appendix_e_settings_read_as_written() -> anyhow::Result<()> {
