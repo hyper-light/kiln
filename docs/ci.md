@@ -8768,16 +8768,30 @@ resolution makes, a comment, a resolution, an approval and each mark of the Revi
     - The entry goes through the queue's own `see` and `build_step` in kiln's mirror: each change's
       head is merged onto the trunk's tip there, and the candidate's workflows run as any
       candidate's do, under `policy.land.checks`.
-    - Once it passes, Review's gate is asked again, the mirror is fetched, and
-      `kiln_ci::land::queue::host_merge` decides. The host merges each change (`forge.merge`, at the
-      head tested) only while its trunk is still the candidate's base. A trunk that moved builds
-      the candidate again; a head that moved takes the entry out (`INVALID_MERGE_COMMIT`).
-    - The land is recorded with the candidate's runs and signed as kiln's queue tested it. The
-      statement's `to` is the host's merge commit, its `candidate` kiln's, and its `via` the route.
-      `kiln verify` reads it as "kiln's queue tested candidate …, and its host merged it".
+    - Once it passes, the batch is decided whole before anything merges: Review's gate is asked
+      again, each change is read on its host, and while nothing has merged, the mirror's trunk
+      (fetched first; if the fetch fails, nothing merges that step) goes through
+      `kiln_ci::land::queue::host_merge`.
+      - A trunk that moved builds the candidate again.
+      - A head that moved, or a change closed, takes its entry out (`INVALID_MERGE_COMMIT`).
+      - The rest of the batch goes back to the queue.
+    - Then the host merges each change at the head tested, bottom first. A background merge is
+      read on the next step, never waited on. A change already merged counts as merged.
+    - A batch stopped part-way still lands what merged: recorded and signed, not as tested.
+    - Merged whole, each entry is checked against what kiln tested: the tip its merges went onto,
+      read in kiln's mirror, is the one before it; the batch's tree is the candidate's. The land
+      is recorded with the candidate's runs and signed with `via` naming the route. The statement's
+      `to` is the host's merge commit and its `candidate` kiln's. Where the check fails, or kiln
+      can't read the merge, it's signed as applied again (`rebased`, `from` the real tip).
+      `kiln verify` reads it as "kiln's queue tested candidate …, and its host merged it", or
+      "… applied again onto …".
+    - Each entry goes by its own route, so a repository whose host gains a queue keeps landing
+      what kiln's queue holds through kiln.
   - *Not yet:* thread kinds on a host's pull request aren't kept, so the gate counts its open
     threads by the trunk's `resolve_threads`. A host change's files aren't read into the conflict
-    graph, so each host entry is a component of its own.
+    graph, so each host entry is a component of its own. That's safe, since `host_merge` builds a
+    candidate again on any moved trunk; it's only slower, as host repositories lose commuting
+    components. It's filed for later.
 - *Tests.*
   - kiln-ci: `review.rs` (`w26_r11_*`, `w26_r12_a_resolved_conflict_waits_on_its_commit`),
     `suggest.rs` (`w26_r10_*`), `conflicts.rs` (`w26_r12_*`). The Search suite on its simulator

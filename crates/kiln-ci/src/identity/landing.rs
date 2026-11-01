@@ -121,8 +121,8 @@ pub fn read(payload_type: &str, s: &Statement) -> Result<Land, String> {
     if !(is_sha(&land.to) && is_sha(&land.candidate) && seen(&land.from) && seen(&land.base)) {
         return Err("its from, to, candidate or base isn't a whole commit".into());
     }
-    // A host that merged what kiln's queue tested made its own commit of it (`via`, W26-R19).
-    if !land.rebased && land.to != land.candidate && land.via.is_empty() {
+    // A host that merged what kiln's queue tested made its own commit of it (W26-R19).
+    if !land.rebased && land.to != land.candidate && !land.via.starts_with(crate::land::queue::HOST_MERGES) {
         return Err(format!("it moved the trunk to {}, not the candidate it tested, {}, and wasn't applied again", land.to, land.candidate));
     }
     if land.batch.is_empty() {

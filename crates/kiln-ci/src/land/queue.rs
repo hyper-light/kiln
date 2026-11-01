@@ -522,6 +522,10 @@ pub enum Route {
 /// [`Route::HostMerges`]'s name, as entries and land records keep it.
 pub const HOST_MERGES: &str = "kiln, merged on its host";
 
+/// What follows a queue's name in a land's `via` when its host merged the change while Review held
+/// its entry (W26-R19).
+pub const HELD_NOTE: &str = ", while Review held it";
+
 impl Route {
     /// The route `abilities(repo).queue` gives: its host queue's name, if it has one.
     pub fn of(host_queue: Option<&str>) -> Route {

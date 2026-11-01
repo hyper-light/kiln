@@ -112,19 +112,29 @@ pub async fn sign(hub: &Hub, repo: &Repo, trunk: &str, moved: &Moved<'_>, carrie
     keep(hub, &repo.id, &land).await
 }
 
+/// What kiln's queue tested of a land its host merged (docs/ci.md W26-R19): the candidate and its
+/// base, the tip the merges went onto (none where kiln's mirror hasn't read it), and whether they
+/// landed other than as tested (`rebased`: onto another tip, or not the candidate's tree).
+pub struct Tested<'a> {
+    pub candidate: &'a str,
+    pub base: &'a str,
+    pub from: &'a str,
+    pub rebased: bool,
+}
+
 /// A land through a host's own queue (docs/ci.md W26-R19, W27-R07), signed as kiln's server for
 /// what it saw: `via`, the host's queue, tested and merged `carried` (each change as `#n`, the
 /// version of it Review cleared, and the commit it merged as) onto `trunk`, the last its head now.
 /// The tip it went onto is named where kiln's mirror has the commit; its checks are the runs kiln
-/// knows of on it. Where kiln's queue tested it and the host only merged it, `tested` is the
-/// candidate and its base, onto which the host merged it: its checks are the candidate's. Kept and
-/// taken into the trail as [`sign`]'s are. Its digest.
-pub async fn sign_host(hub: &Hub, repo: &Repo, trunk: &str, via: &str, tested: Option<(&str, &str)>, carried: &[(String, u32, String)]) -> anyhow::Result<String> {
+/// knows of on it. Where kiln's queue tested it and the host only merged it, `tested` says what kiln
+/// tested and where the merges went: its checks are the candidate's. Kept and taken into the trail
+/// as [`sign`]'s are. Its digest.
+pub async fn sign_host(hub: &Hub, repo: &Repo, trunk: &str, via: &str, tested: Option<Tested<'_>>, carried: &[(String, u32, String)]) -> anyhow::Result<String> {
     let to = carried.last().map(|(_, _, c)| c.clone()).ok_or_else(|| anyhow::anyhow!("no change landed"))?;
-    if let Some((candidate, base)) = tested {
+    if let Some(t) = tested {
         let batch = carried.iter().map(|(diff, version, commit)| Landed { diff: diff.clone(), version: *version, commit: commit.clone(), verdicts: Vec::new() }).collect();
-        let checks = checks_on(hub, &repo.id, candidate).await?;
-        let land = Land { repo: repo.name.clone(), trunk: trunk.to_owned(), from: base.to_owned(), to, candidate: candidate.to_owned(), base: base.to_owned(), rebased: false, batch, checks, via: via.to_owned() };
+        let checks = checks_on(hub, &repo.id, t.candidate).await?;
+        let land = Land { repo: repo.name.clone(), trunk: trunk.to_owned(), from: t.from.to_owned(), to, candidate: t.candidate.to_owned(), base: t.base.to_owned(), rebased: t.rebased, batch, checks, via: via.to_owned() };
         return keep(hub, &repo.id, &land).await;
     }
     let from = match crate::gitops::ensure_commit(hub, repo, &to).await {
