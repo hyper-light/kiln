@@ -59,7 +59,13 @@ async fn lab() -> anyhow::Result<Lab> {
 
 /// [`lab`], mac and linux serving their peers from these caches (docs/ci.md W24-R27).
 async fn lab_with(objects: [Option<Arc<crate::runner::work::store::Store>>; 2]) -> anyhow::Result<Lab> {
+    lab_at(objects, [super::wire::VERSION, super::wire::VERSION]).await
+}
+
+/// [`lab_with`], mac and linux speaking these reach versions (1: a build from before, W27-R08).
+async fn lab_at(objects: [Option<Arc<crate::runner::work::store::Store>>; 2], versions: [u32; 2]) -> anyhow::Result<Lab> {
     let [mac_objects, linux_objects] = objects;
+    let [mac_version, linux_version] = versions;
     let dirs = vec![tempfile::tempdir()?, tempfile::tempdir()?, tempfile::tempdir()?];
     let mirrors = dirs.get(2).map(|d| d.path().to_path_buf()).unwrap_or_default();
     let (adopt_tx, adoptions) = async_channel::unbounded();
@@ -72,9 +78,11 @@ async fn lab_with(objects: [Option<Arc<crate::runner::work::store::Store>>; 2]) 
         using: if name == "linux" { Arc::clone(&using) } else { Arc::default() },
         adopt,
         objects: None,
+        version: super::wire::VERSION,
+        root: Vec::new(),
     };
-    let (mac, mac_out) = node::start(Config { objects: mac_objects, ..cfg("mac", dirs.first().ok_or_else(|| anyhow::anyhow!("dir"))?, None) })?;
-    let (linux, linux_out) = node::start(Config { objects: linux_objects, ..cfg("linux", dirs.get(1).ok_or_else(|| anyhow::anyhow!("dir"))?, Some(adopt_tx)) })?;
+    let (mac, mac_out) = node::start(Config { objects: mac_objects, version: mac_version, ..cfg("mac", dirs.first().ok_or_else(|| anyhow::anyhow!("dir"))?, None) })?;
+    let (linux, linux_out) = node::start(Config { objects: linux_objects, version: linux_version, ..cfg("linux", dirs.get(1).ok_or_else(|| anyhow::anyhow!("dir"))?, Some(adopt_tx)) })?;
     let directory = Arc::new(Mutex::new(vec![info("mac", mac.fingerprint()), info("linux", linux.fingerprint())]));
     // Each runner's current connection, as the server would number them.
     let peers: Arc<Mutex<HashMap<&'static str, u64>>> = Arc::new(Mutex::new(HashMap::from([("mac", 10), ("linux", 20)])));
@@ -306,6 +314,39 @@ fn a_tree_syncs_over_and_the_command_runs_in_the_copy() -> anyhow::Result<()> {
         assert!(evs.iter().any(|e| matches!(e, Ev::Synced { sent: 0 | 1, .. })), "{evs:?}");
         let evs = run_from_mac(&lab, RunReq { command: "true".into(), ..req }, |_| None).await?;
         assert!(evs.iter().any(|e| matches!(e, Ev::Synced { sent: 1, .. })), "{evs:?}");
+        Ok(())
+    })
+}
+
+/// W27-R08 (the Transfers plan's step 12): a link runs at the reach version both ends speak. New to
+/// new it's 2, and a sync's workspace, a run and its output each go with a custody frame; a runner
+/// from before (1) refuses a Hello at 2 and is asked again at 1, or asks at 1 itself, and no link at
+/// 1 carries a custody frame. A run in a synced copy works every way.
+#[cfg(unix)]
+#[test]
+fn w27_r08_a_link_runs_at_the_version_both_speak_and_only_2_carries_custody() -> anyhow::Result<()> {
+    use serde_json::Value;
+    crate::rt::block_on(async move {
+        for (mac_v, linux_v) in [(2, 2), (2, 1), (1, 2), (1, 1)] {
+            let lab = lab_at([None, None], [mac_v, linux_v]).await?;
+            let src = tempfile::tempdir()?;
+            std::fs::write(src.path().join("data.txt"), "synced!\n")?;
+            let req = RunReq { target: "linux".into(), command: "cat data.txt".into(), cwd: Some(src.path().to_string_lossy().into_owned()), sync: true, ..RunReq::default() };
+            let evs = run_from_mac(&lab, req, |_| None).await?;
+            assert_eq!((output(&evs, false).as_str(), exit(&evs)), ("synced!\n", Some((Some(0), None, 0))), "mac at {mac_v}, linux at {linux_v}: {evs:?}");
+            let (m, l) = (lab.mac.status().await?, lab.linux.status().await?);
+            let (peer, serving) = (m.pointer("/peers/0").cloned().unwrap_or_default(), l.pointer("/serving/0").cloned().unwrap_or_default());
+            let at = u64::from(mac_v.min(linux_v));
+            let n = |v: &Value, k: &str| v.get(k).and_then(Value::as_u64);
+            assert_eq!((n(&peer, "version"), n(&serving, "version")), (Some(at), Some(at)), "both ends at {at}: {m} {l}");
+            let frames = (n(&peer, "custody").unwrap_or(0), n(&serving, "custody").unwrap_or(0));
+            if at >= 2 {
+                // The doer: the workspace's and the run's; the asker: their receipts and the output's.
+                assert!(frames.0 >= 3 && frames.1 >= 2, "custody frames at 2: {frames:?}");
+            } else {
+                assert_eq!(frames, (0, 0), "no custody frame on a link at 1");
+            }
+        }
         Ok(())
     })
 }

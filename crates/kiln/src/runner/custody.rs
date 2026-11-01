@@ -245,6 +245,18 @@ pub(crate) fn send(bundle: &Value) {
     queue(bundle);
 }
 
+/// What kiln is told once, not again after a reconnect: a refusal of something another runner
+/// handed this one over a reach link (`crate::reach::custody::refused`).
+pub(crate) fn send_once(record: &Value) {
+    STATE.lock().once.push_back(record.to_string());
+}
+
+/// `s` signed as `payload_type` with slot `slot`'s key, its body naming that identity (`by`): its
+/// bundle. What a reach link's custody records are signed with (`crate::reach::custody`).
+pub(crate) fn sign_record(slot: &str, by: &str, payload_type: &str, s: &Statement) -> anyhow::Result<Value> {
+    sign_as(slot, by, payload_type, s)
+}
+
 /// This process handed a peer runner an object of its cache (docs/ci.md W24-R27; the Transfers
 /// plan's step 12): its hand-on to that runner process (`to`, as kiln names it), signed as this
 /// process and sent to kiln. The peer builds the same hand-on, and its receipt follows it.

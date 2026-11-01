@@ -1246,7 +1246,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // session host, once there is one (below).
     let (adopt_tx, adopt_rx) = async_channel::bounded::<crate::reach::node::Adoption>(4);
     let reach = o.reach.filter(|_| !o.ephemeral).map(|accept| {
-        let cfg = crate::reach::node::Config { adopt: Some(adopt_tx.clone()), objects: None, ..crate::reach::node::Config::for_runner(&name, &o.state_dir, accept) };
+        let cfg = crate::reach::node::Config { adopt: Some(adopt_tx.clone()), objects: None, root: root.clone(), ..crate::reach::node::Config::for_runner(&name, &o.state_dir, accept) };
         (Arc::clone(&cfg.using), cfg.mirrors.clone(), crate::reach::node::start(cfg))
     });
     let reach = reach.and_then(|(using, mirrors, started)| match started {

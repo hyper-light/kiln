@@ -1411,6 +1411,7 @@ impl Hub {
                     connected: a.connected,
                     reach: a.connected && ann.is_some_and(|x| x.accept),
                     fingerprint: ann.map(|x| x.fingerprint.clone()),
+                    reach_version: ann.map(|x| x.version).filter(|v| *v > 0),
                     cpus: s.map_or(0, |s| s.cpus),
                     cpu_pct: s.map_or(0.0, |s| s.cpu_pct),
                     load1: s.map_or(0.0, |s| s.load1),

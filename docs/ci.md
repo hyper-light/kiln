@@ -9470,16 +9470,33 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
   by digest, both sides signed; a machine taking custody for someone else does it under a
   delegation that names them and only narrows; a digest that changes across a hop, or a hop
   missing its receipt, is a break, refused where it would be used and recorded.
-  - *kiln run's sync of a workspace* (`reach::local::run_inner` → `reach::node::on_sync_ask`,
-    `reach::sync::Mirror`): the asking runner process hands on the tree by its digest
-    (`reach::reuse::tree`, SHA-256 over the entries, as `--reuse` reads it) to the runner process
-    that runs it, which receives it once its mirror is committed and hashes to that digest. Today
-    the wire compares sizes and times only.
-  - *A reach run* (`Ask::Run`, `reach::node::start_run`): the asking runner process hands on the
-    run (its command, folder, environment by name and the tree's digest) for the session that
-    asked, under a delegation from that session (today only the server sees the session's signed
-    act, `runner::custody::act_taken`); the runner that runs it receives it, and hands its output
-    back by digest at `Say::Exit`, received by the asker.
+  - *kiln run's sync of a workspace* (`reach::local::sync_tree` → `reach::node::on_sync_ask`,
+    `reach::sync::Mirror`; `reach::custody`): the asking side hands on the tree by its digest
+    (`reach::reuse::digest_of`, as `--reuse` reads a tree, `.git` aside, of the bytes it sent) to the
+    runner process that runs it, ahead of the sync's commit over the link (reach version 2's
+    `Ask::Custody`). That runner receives it once its copy is committed, by the digest of what the
+    copy holds (`Mirror::tree_digest`), for the session whose run it is under that session's
+    delegation, and says its receipt back ahead of `Done`. A copy whose digest isn't the one handed
+    on, or with no hand-on, is refused before anything runs in it (the files the sync wrote are
+    sent again next time); a receipt that doesn't come, or isn't of the hand-on, fails the sync at
+    the asker. Who hands it on: the agent session that asked (`RunReq.asker`), when its runner
+    process holds the session's key at its epoch, signing as the session, with a delegation
+    (`kiln_ci::identity::custody::reach_delegation`) to the other runner's process to receive the
+    workspace and the run for it (`receive:workspace`, `receive:run`, no more: kiln judges a record
+    taken for someone by it, `Break::NotEntitled`); else the asking runner process, as itself.
+  - *A reach run* (`Ask::Run`, `reach::node::start_run`): the asking side hands on the run
+    (`reach::custody::run_digest`: its number in the asker's reach session, command, folder, copy,
+    shell, whether it reads input, its environment by name, never its values, and the workspace's
+    digest) ahead of its `Run`; the runner that runs it checks it against what came, receives it for
+    the session under its delegation, and says its receipt back before the run starts, or refuses
+    the run, saying why. At the run's exit it hands the output back by the SHA-256 of its bytes in
+    the order the run said them, following its receipt of the run, ahead of `Say::Exit`; the asking
+    side receives it by what it got, and refuses the run's result (an error with its exit, never
+    recorded by `--reuse`) when no hand-on came, or it isn't of what came. A link at reach version 1
+    (a runner from before at either end) carries none of it: the asker signs its hand-ons anyway,
+    saying the other speaks 1 and no receipt comes, and a doer from after takes what a runner from
+    before hands it as from outside kiln (`reach-v1:<runner>`), so the hop is named, never missing.
+    Whatever either side refuses it tells kiln (`refused_hop`, kept with kiln's refusals).
   - *A runner's objects from peers* (W24-R27: `runner::work::peers::fetch` ← `reach::node::
     object_window`): the peer holding the object hands it on by its SHA-256, and the runner that
     fetched it receives it once it hashes to that digest (checked today, now recorded); a wrong copy
@@ -9575,7 +9592,18 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
   `transfers`'s `w27_r08_custody_between_machines` (box-b's cache fetches box-a's object over their
   link: box-a's hand-on and box-b's receipt, unbroken; box-b's copy changed on its way to box-a by
   its `peer_object_changed`: never served, nothing of it kept, the break recorded between box-b's
-  hand-on and box-a's receipt). Simulation (the Transfers plan's step 9, W27-AC05):
+  hand-on and box-a's receipt; then kiln run on box-b for an agent session on box-c: the session's
+  hand-ons of its workspace and its run, box-b's receipts of each for the session under its
+  delegation, box-b's hand-on of the output and the session's receipt of it, every hop signed by
+  both sides; and box-d's sync changed on its way by its `sync_file_changed`: refused on box-b
+  before anything ran, the break recorded between box-d's hand-on and box-b's receipt, and box-b's
+  refusal). kiln-ci's `w27_r08_a_reach_run_changes_hands_under_the_sessions_delegation` (the
+  example's chain, unbroken; a changed workspace breaks; a receipt for the session under no
+  delegation of its own to that runner entitling it breaks as `not-entitled`), `reach::sync`'s
+  `w27_r08_a_copy_knows_its_tree_by_the_askers_digest` and reach's lab
+  `w27_r08_a_link_runs_at_the_version_both_speak_and_only_2_carries_custody` (new to new at 2 with
+  custody frames; either end from before at 1, with none; a synced run works every way).
+  Simulation (the Transfers plan's step 9, W27-AC05):
   `sim::transfers::tests::w27_ac05_no_stale_act_is_ever_applied` (docs/sim.md's transfers model:
   moves, resumes from kiln's copy while a machine is cut off, take-overs with the old process still
   acting, blue/green upgrades and their rollbacks, the server restarting with its count stale, under
