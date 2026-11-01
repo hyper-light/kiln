@@ -28,9 +28,11 @@ fn runner(dir: &std::path::Path, port: u16, name: &str, every: &str, down: &str,
 }
 
 /// A runner of the server at `port` with the faults `chaos` says (a `kiln agent --chaos` spec),
-/// the stand-in harness saying `lines` a turn, a tenth of a second apart; its log.
+/// the stand-in harness saying `lines` a turn, a tenth of a second apart; its log. Its terminals'
+/// commands run in `/bin/sh`, whatever the login shell of the machine running the tests (fish
+/// can't read the terminal test's `for … do … done`, and exits 127).
 fn runner_with(dir: &std::path::Path, port: u16, name: &str, chaos: &str, lines: usize) -> anyhow::Result<(agents::Runner, std::path::PathBuf)> {
-    agents::runner(dir, port, name, Some(chaos), Talk { lines, every_ms: 100 })
+    agents::runner_with(dir, port, name, Some(chaos), Talk { lines, every_ms: 100 }, &[("SHELL", "/bin/sh")])
 }
 
 /// How long each cut lasts: 30 seconds, or `KILN_WIRE_CUT` (`60s` shows a minute's cut holds).
