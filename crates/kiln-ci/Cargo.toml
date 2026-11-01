@@ -42,5 +42,9 @@ harness = false
 name = "sched"
 harness = false
 
+[[bench]]
+name = "sched_mixed"
+harness = false
+
 [lints]
 workspace = true
