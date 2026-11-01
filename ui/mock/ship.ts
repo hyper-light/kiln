@@ -270,13 +270,13 @@ function fixOf(row: ShipCommit): ShipCommit {
 
 /** A fixed row once this browser handed it off, as the server reads it: a change at work under
  * its agent (no Hand off and Review pair), its line naming the one thread it has or how many; or a
- * failure on whoever took it (Retry alone). Once the agent's fix is in, the handed revision says
- * which version fixed it, folded under that version. */
+ * failure on whoever took it (Retry alone). Once the agent's fix is in, the handed revision is
+ * superseded as any replaced one is, its line saying which version fixed it, folded under that version. */
 function handedRow(row: ShipCommit, ua: string): ShipCommit {
   if (!handedBy.get(ua)?.has(row.sha)) return row;
   const by = takerOf(row);
   if (row.change && fixedBy.get(ua)?.has(row.sha))
-    return { ...row, stand: "fixed", line: `Fixed in v${row.change.latest + 1}`, pips: pips("none", "none", "superseded"), fold_under: fixShaOf(row.sha), actions: [] };
+    return { ...row, stand: "superseded", line: `Fixed in v${row.change.latest + 1}`, pips: pips("none", "none", "superseded"), fold_under: fixShaOf(row.sha), actions: [] };
   const open = row.change?.open;
   const threads = open ? open.question + open.nit + open.issue + open.blocking : 0;
   if (row.change)

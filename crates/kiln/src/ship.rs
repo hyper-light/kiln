@@ -3377,7 +3377,7 @@ mod tests {
             let after = page().await?;
             for (_, _, _, _, _, v1, _, name) in &changes {
                 let (stand, line, _) = stand_of(&after, v1.get(..7).unwrap_or_default());
-                anyhow::ensure!((stand.as_str(), line.as_str()) == ("fixed", "Fixed in v2"), "{name}'s handed revision says which version fixed it: {stand}: {line}");
+                anyhow::ensure!((stand.as_str(), line.as_str()) == ("superseded", "Fixed in v2"), "{name}'s handed revision says which version fixed it: {stand}: {line}");
             }
             Ok(())
         })

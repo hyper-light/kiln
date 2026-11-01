@@ -465,8 +465,8 @@ pub fn standing(j: &Journey, now: i64) -> Standing {
 pub fn standing_as(j: &Journey, now: i64, yours: bool) -> Standing {
     let pips = pips(j, now);
     let (stand, line) = match &j.review {
-        Some(Review { superseded_by: Some(_), fixed_in: Some(v), .. }) => (Stand::Fixed, format!("Fixed in {v}")),
-        Some(Review { superseded_by: Some(by), .. }) => (Stand::Superseded, format!("Replaced by {by}")),
+        // Replaced: what replaced it, or which version fixed what was handed off at it (W26-R18).
+        Some(Review { superseded_by: Some(by), fixed_in, .. }) => (Stand::Superseded, fixed_in.as_ref().map_or_else(|| format!("Replaced by {by}"), |v| format!("Fixed in {v}"))),
         Some(r) => ranked(j, r, yours),
         None => stand_and_line(j),
     };
@@ -843,7 +843,7 @@ mod tests {
             (r.superseded_by, r.fixed_in) = (Some("v6".into()), Some("v6".into()));
         }
         let s = standing_as(&j, 0, false);
-        assert_eq!((s.stand, s.line.as_str()), (Stand::Fixed, "Fixed in v6"));
+        assert_eq!((s.stand, s.line.as_str()), (Stand::Superseded, "Fixed in v6"));
     }
 
     #[test]
