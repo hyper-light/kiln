@@ -75,6 +75,27 @@ pub async fn open_for(hub: &Hub, repo: &str, path: &str, author: &str) -> anyhow
         .await
 }
 
+/// The draft `id`, whatever its state.
+pub async fn get(hub: &Hub, id: &str) -> anyhow::Result<Option<Draft>> {
+    let id = id.to_owned();
+    hub.store.call(move |c| Ok(c.query_row(&format!("SELECT {COLUMNS} FROM ci_pipeline_drafts WHERE id = ?1"), params![id], row).optional()?)).await
+}
+
+/// The commit a draft's file is at: a kiln diff's latest version, or the head kiln saved last on
+/// a host's draft branch; in the server's mirror, fetched when it isn't there.
+pub async fn head(hub: &Hub, repo: &Repo, d: &Draft) -> anyhow::Result<String> {
+    let head = match d.kind.as_str() {
+        "diff" => {
+            let name = d.name.clone().ok_or_else(|| anyhow::anyhow!("the draft of {} has no diff", d.path))?;
+            let diff = crate::ci::diffs::find(hub, &name).await?.ok_or_else(|| anyhow::anyhow!("no diff {name}"))?;
+            crate::ci::diffs::versions(hub, &diff).await?.last().map(|v| v.commit.clone()).ok_or_else(|| anyhow::anyhow!("{name} has no version"))?
+        }
+        _ => d.head.clone().ok_or_else(|| anyhow::anyhow!("the draft of {} has no head", d.path))?,
+    };
+    crate::gitops::ensure_commit(hub, repo, &head).await?;
+    Ok(head)
+}
+
 /// A repository's open drafts (in draft or in review), oldest first.
 pub async fn open_in(hub: &Hub, repo: &str) -> anyhow::Result<Vec<Draft>> {
     let repo = repo.to_owned();

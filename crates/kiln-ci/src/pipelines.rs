@@ -326,6 +326,8 @@ pub enum Draft {
 /// is, and the change it's saved as.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DraftOf {
+    /// Its record's id (kiln's `ci_pipeline_drafts`).
+    pub id: String,
     pub state: Draft,
     pub author: String,
     pub change: Option<DraftChange>,
@@ -619,7 +621,11 @@ const FNV_START: u64 = 0xcbf2_9ce4_8422_2325;
 /// as it is (W26-R06's).
 pub fn row_json(repo: &str, branch: &str, sha: &str, r: &Row) -> Value {
     let mut v = json!({
-        "key": format!("{repo}:{}", r.facts.path),
+        // A draft's row stands beside its file's published one (W29-R10).
+        "key": match &r.draft {
+            Some(d) => format!("{repo}:{}:draft:{}", r.facts.path, d.id),
+            None => format!("{repo}:{}", r.facts.path),
+        },
         "kind": r.facts.kind.as_str(),
         "dialect": r.dialect,
         "name": r.facts.name,
@@ -1033,23 +1039,6 @@ pub struct Verb {
     pub why_not: Option<&'static str>,
 }
 
-/// The strip's verbs for a row of `kind` (W29-R04): Run, Save draft, Ready and Discard, and
-/// Release for an action or reusable workflow. None is built yet (the master plan's steps 4 to 6),
-/// so each says when it comes.
-pub fn verbs(kind: Kind) -> Vec<Verb> {
-    let dim = |verb, label, why| Verb { verb, label, enabled: false, why_not: Some(why) };
-    let mut out = vec![
-        dim("run", "Run", "Run by hand comes with drafts (W29-R14)"),
-        dim("save_draft", "Save draft", "Drafts come next (W29-R10, R11)"),
-        dim("ready", "Ready", "Drafts come next (W29-R12)"),
-        dim("discard", "Discard", "Drafts come next (W29-R13)"),
-    ];
-    if kind.is_action() || kind == Kind::Reusable {
-        out.push(dim("release", "Release", "Releases by tag come after sharing (W29-R21)"));
-    }
-    out
-}
-
 /// Who looks at a pane, for its verbs: their name, and whether they may submit changes to its
 /// repository (`diffs.submit`).
 #[derive(Debug, Clone, Copy)]
@@ -1108,22 +1097,28 @@ pub struct Opened<'a> {
     pub at: &'a str,
     pub sha: &'a str,
     pub text: &'a str,
+    /// Who opened it, for its verbs and its draft's word ([`Row::seen_by`]).
+    pub viewer: Viewer<'a>,
+    /// A workflow that runs by hand: it has `workflow_dispatch` (kiln's `manual` reads as it).
+    pub by_hand: bool,
 }
 
 /// An opened row's pane (W29-R04's `ShipPipelinePane { head, strip, groups, detail }`).
 pub fn pane_json(o: &Opened<'_>, groups: &[PaneGroup]) -> Value {
-    let f = &o.row.facts;
+    let seen = o.row.seen_by(o.viewer.name);
+    let row = seen.as_ref().unwrap_or(o.row);
+    let f = &row.facts;
     let views: &[&str] = if f.kind.is_action() { &["Changes", "YAML", "Try it"] } else { &["YAML", "Flow", "Plan"] };
     json!({
         "head": {
-            "title": f.name, "path": f.path, "kind": f.kind.as_str(), "dialect": o.row.dialect,
-            "ref": o.at, "commit": o.sha, "draft": serde_json::to_value(&o.row.draft).unwrap_or(Value::Null),
-            "stand": o.row.standing.stand, "word": o.row.standing.word, "pips": o.row.standing.pips,
+            "title": f.name, "path": f.path, "kind": f.kind.as_str(), "dialect": row.dialect,
+            "ref": o.at, "commit": o.sha, "draft": serde_json::to_value(&row.draft).unwrap_or(Value::Null),
+            "stand": row.standing.stand, "word": row.standing.word, "pips": row.standing.pips,
         },
         "strip": {
-            "said": [format!("{} · {}", f.kind.words(), o.row.line)],
+            "said": [format!("{} · {}", f.kind.words(), row.line)],
             "pick": ["all"],
-            "verbs": verbs(f.kind),
+            "verbs": verbs_for(row, o.viewer, o.by_hand),
         },
         "groups": groups,
         "detail": { "name": f.path, "views": views, "text": o.text },
@@ -1406,24 +1401,15 @@ mod tests {
     }
 
     #[test]
-    fn w29_r04_verbs_are_dimmed_never_hidden() {
-        let w = verbs(Kind::Workflow);
-        assert_eq!(w.iter().map(|v| v.verb).collect::<Vec<_>>(), ["run", "save_draft", "ready", "discard"]);
-        assert!(w.iter().all(|v| !v.enabled && v.why_not.is_some_and(|y| y.contains("W29-R"))), "{w:?}");
-        assert_eq!(verbs(Kind::Composite).iter().map(|v| v.verb).collect::<Vec<_>>(), ["run", "save_draft", "ready", "discard", "release"]);
-        assert!(verbs(Kind::Reusable).iter().any(|v| v.verb == "release"));
-    }
-
-    #[test]
     fn w29_r04_verbs_by_draft_state() {
         let ada = Viewer { name: "ada", can_submit: true };
         let sam = Viewer { name: "sam", can_submit: true };
         let reader = Viewer { name: "rae", can_submit: false };
-        let draft = |state| DraftOf { state, author: "ada".into(), change: Some(DraftChange { kind: "diff", name: "D12".into(), url: None }) };
+        let draft = |state| DraftOf { id: "d1".into(), state, author: "ada".into(), change: Some(DraftChange { kind: "diff", name: "D12".into(), url: None }) };
         let wf = Row::new(facts(Kind::Workflow), Some("gha"), String::new(), None, None);
         let saved = wf.clone().drafted(draft(Draft::Unpublished));
         let review = wf.clone().drafted(draft(Draft::Review));
-        let update = wf.clone().drafted(DraftOf { state: Draft::Update, author: "kiln".into(), change: None });
+        let update = wf.clone().drafted(DraftOf { id: "d2".into(), state: Draft::Update, author: "kiln".into(), change: None });
         let said = |row: &Row, v: Viewer<'_>, by_hand: bool| -> Vec<(&'static str, bool, Option<&'static str>)> { verbs_for(row, v, by_hand).into_iter().map(|x| (x.verb, x.enabled, x.why_not)).collect() };
         let on = |row: &Row, v: Viewer<'_>, by_hand: bool| -> Vec<&'static str> { verbs_for(row, v, by_hand).into_iter().filter(|x| x.enabled).map(|x| x.verb).collect() };
         // The author's own draft: everything but Release, which isn't built yet.
@@ -1453,7 +1439,7 @@ mod tests {
     #[test]
     fn w29_r10_a_draft_in_review_is_its_authors() {
         let mk = |name: &str, kind: Kind| Row::new(Facts { name: name.into(), path: format!(".github/workflows/{name}.yml"), ..facts(kind) }, Some("gha"), String::new(), None, None);
-        let review = mk("stress", Kind::Workflow).drafted(DraftOf { state: Draft::Review, author: "ada".into(), change: Some(DraftChange { kind: "change", name: "#5".into(), url: Some("https://github.com/acme/app/pull/5".into()) }) });
+        let review = mk("stress", Kind::Workflow).drafted(DraftOf { id: "d3".into(), state: Draft::Review, author: "ada".into(), change: Some(DraftChange { kind: "change", name: "#5".into(), url: Some("https://github.com/acme/app/pull/5".into()) }) });
         let repo = Repo::new("acme/app".into(), "main".into(), "a".repeat(40), vec![mk("ci", Kind::Workflow), review]);
         assert_eq!(repo.authors, ["ada"]);
         // Everyone else is asked to review it.

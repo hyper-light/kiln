@@ -342,16 +342,8 @@ pub async fn start_runs(hub: &Hub, repo: &Repo, ask: &Ask, trusted: bool, actor:
 /// status to its change, and a job that names an environment stops before it deploys. It runs on
 /// kiln's engine, never the host's, whose `workflow_dispatch` takes only the default branch's.
 pub async fn draft_run(hub: &Hub, repo: &Repo, d: &super::pipeline_drafts::Draft, caller: &Caller, event: &str, jobs: &[String], inputs: serde_json::Map<String, Value>) -> Result<Value, Fail> {
-    let head = match d.kind.as_str() {
-        "diff" => {
-            let name = d.name.clone().ok_or_else(|| (StatusCode::CONFLICT, format!("the draft of {} has no diff", d.path)))?;
-            let diff = super::diffs::find(hub, &name).await.map_err(|e| internal(&e))?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no diff {name}")))?;
-            super::diffs::versions(hub, &diff).await.map_err(|e| internal(&e))?.last().map(|v| v.commit.clone()).ok_or_else(|| (StatusCode::CONFLICT, format!("{name} has no version")))?
-        }
-        _ => d.head.clone().ok_or_else(|| (StatusCode::CONFLICT, format!("the draft of {} has no head", d.path)))?,
-    };
-    let path = gitops::ensure_commit(hub, repo, &head).await.map_err(|e| (StatusCode::CONFLICT, format!("the server can't reach the draft's head {head}: {e:#}")))?;
-    let m = path.to_string_lossy().into_owned();
+    let head = super::pipeline_drafts::head(hub, repo, d).await.map_err(|e| (StatusCode::CONFLICT, format!("the server can't reach the draft's head: {e:#}")))?;
+    let m = gitops::mirror_path(hub, &repo.name).to_string_lossy().into_owned();
     let env = [("GIT_AUTHOR_NAME", "kiln"), ("GIT_AUTHOR_EMAIL", "kiln@kiln"), ("GIT_COMMITTER_NAME", "kiln"), ("GIT_COMMITTER_EMAIL", "kiln@kiln")];
     let message = format!("A run of {}'s draft of {} (docs/ci.md W29-R14)", d.author, d.path);
     let made = super::diffs::git_run(hub, &["-C", &m, "commit-tree", &format!("{head}^{{tree}}"), "-p", &head, "-m", &message], &env, Vec::new()).await.map_err(|e| internal(&e))?;

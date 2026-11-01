@@ -311,9 +311,67 @@ async fn gather(hub: &Hub, repo: &Repo, env: &Env) -> anyhow::Result<Option<Held
         let (action, diags) = wf::parse_action(&text);
         rows.push(action_row(path, action.as_ref(), &diags, &ctx, env));
     }
+    // Each open draft, a row of its own beside what's published (W29-R10).
+    for d in crate::ci::pipeline_drafts::open_in(hub, &repo.name).await.unwrap_or_default() {
+        rows.push(draft_row(hub, repo, &d, &ctx, env).await.0);
+    }
     let view = core::Repo::new(repo.name.clone(), branch, sha, rows);
     let digest = view.digest;
     Ok(Some(Held { view, at: Instant::now(), digest }))
+}
+
+/// A draft's row (W29-R10), as its file is at the draft's head, marked with the draft's state,
+/// author and change; its Latest is its author's runs of it (W29-R14). With it, the file's text
+/// and the head, where kiln can read them: a draft it can't reach still has its row.
+async fn draft_row(hub: &Hub, repo: &Repo, d: &crate::ci::pipeline_drafts::Draft, ctx: &Ctx, env: &Env) -> (Row, Option<(String, String, Option<crate::ci::load::Loaded>)>) {
+    let mark = core::DraftOf {
+        id: d.id.clone(),
+        state: if d.state == "review" { core::Draft::Review } else { core::Draft::Unpublished },
+        author: d.author.clone(),
+        change: d.name.clone().map(|name| core::DraftChange { kind: if d.kind == "diff" { "diff" } else { "change" }, name, url: d.url.clone() }),
+    };
+    let read = async {
+        let head = crate::ci::pipeline_drafts::head(hub, repo, d).await?;
+        let text = crate::ci::load::blob(hub, repo, &head, &d.path).await?;
+        let commit = crate::ci::load::load(hub, repo, &head).await?;
+        anyhow::Ok((head, text, commit.workflows.into_iter().find(|l| l.path == d.path)))
+    };
+    let read = read.await.ok();
+    let mut row = match &read {
+        Some((_, _, Some(l))) => workflow_row(repo, l, ctx, env, ""),
+        Some((_, text, None)) => {
+            let (action, diags) = wf::parse_action(text);
+            action_row(&d.path, action.as_ref(), &diags, ctx, env)
+        }
+        None => {
+            let kind = if matches!(wf::file_kind(&d.path), Some(wf::FileKind::Action)) { Kind::Unknown } else { Kind::Workflow };
+            Row::new(Facts { kind, name: stem_of(&d.path), path: d.path.clone(), runs: true, ..Facts::default() }, None, String::new(), None, None)
+        }
+    };
+    let (latest, running) = draft_runs(hub, &d.id).await.unwrap_or_default();
+    row.facts.latest = latest;
+    row.facts.running = running;
+    row.who = Some(d.author.strip_prefix("user:").unwrap_or(&d.author).to_owned());
+    row.when = Some(d.updated_at);
+    (row.drafted(mark), read)
+}
+
+/// The newest outcome of a draft's runs by its author's hand, and whether one is under way.
+async fn draft_runs(hub: &Hub, draft: &str) -> anyhow::Result<(Option<Outcome>, bool)> {
+    let draft = draft.to_owned();
+    let statuses: Vec<String> = hub
+        .store
+        .call(move |c| {
+            let mut st = c.prepare("SELECT status FROM runs WHERE draft = ?1 ORDER BY created_at DESC LIMIT 20")?;
+            let out = st.query_map([&draft], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(out)
+        })
+        .await?;
+    let mut seen = (None, false);
+    for s in &statuses {
+        fold(&mut seen, s);
+    }
+    Ok(seen)
 }
 
 /// A workflow's newest runs on `branch` (both engines'), newest first, for the pane's Runs.
@@ -353,6 +411,11 @@ pub async fn get(hub: &Arc<Hub>, owner: &str, name: &str, q: &HashMap<String, St
     }
     let path = q.get("path").map(String::as_str).filter(|p| !p.is_empty()).ok_or_else(|| (StatusCode::BAD_REQUEST, "`path` names the workflow or action to open".to_owned()))?;
     let repo = hub.store.repos().await.map_err(internal)?.into_iter().find(|r| r.name == full).ok_or_else(missing)?;
+    let (me, _) = crate::ci::diffs::author_of(&caller.name, Some(caller.kind));
+    let viewer = core::Viewer { name: &me, can_submit: caller.can("diffs.submit", &crate::authz::Scope::Repo { repo: repo.name.clone() }) };
+    if let Some(id) = q.get("draft").filter(|d| !d.is_empty()) {
+        return draft_pane(hub, &repo, id, path, viewer).await;
+    }
     let branch = default_branch(&repo);
     let at = q.get("ref").filter(|r| !r.is_empty()).cloned().unwrap_or_else(|| branch.clone());
     if !crate::ci::load::ref_ok(&at) {
@@ -381,7 +444,36 @@ pub async fn get(hub: &Arc<Hub>, owner: &str, name: &str, q: &HashMap<String, St
             (row, groups)
         }
     };
-    let pane = core::pane_json(&core::Opened { repo: &full, row: &row, at: &at, sha: &sha, text: &text }, &groups);
+    let by_hand = runs_by_hand(commit.workflows.iter().find(|l| l.path == path));
+    let pane = core::pane_json(&core::Opened { repo: &full, row: &row, at: &at, sha: &sha, text: &text, viewer, by_hand }, &groups);
+    Ok(srv::json(StatusCode::OK, &pane))
+}
+
+/// Whether a workflow runs by hand: it has `workflow_dispatch` (kiln's `manual` reads as it).
+fn runs_by_hand(l: Option<&crate::ci::load::Loaded>) -> bool {
+    l.and_then(|l| l.workflow.as_ref()).is_some_and(|w| w.on.iter().any(|t| t.event == "workflow_dispatch"))
+}
+
+/// A draft's pane (`draft=`, W29-R10): its file at the draft's head, its head's DRAFT mark, and
+/// the strip's verbs for `viewer`. A draft that isn't open, or isn't this file's, is missing.
+async fn draft_pane(hub: &Hub, repo: &Repo, id: &str, path: &str, viewer: core::Viewer<'_>) -> Result<Response, Fail> {
+    let gone = || (StatusCode::NOT_FOUND, format!("no open draft {id} of {path} in {}", repo.name));
+    let d = crate::ci::pipeline_drafts::get(hub, id).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?.filter(|d| d.repo == repo.name && d.path == path && matches!(d.state.as_str(), "draft" | "review")).ok_or_else(gone)?;
+    let branch = default_branch(repo);
+    let tip = crate::ci::load::resolve(hub, repo, &branch).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?.unwrap_or_default();
+    let (_, ctx) = context(hub, repo, &branch, &tip).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let env = Env::read(hub).await;
+    let (row, read) = draft_row(hub, repo, &d, &ctx, &env).await;
+    let (head, text, loaded) = read.ok_or_else(|| (StatusCode::BAD_GATEWAY, format!("kiln can't read the draft's head on {}'s host yet", repo.name)))?;
+    let groups = match &loaded {
+        Some(l) => l.workflow.as_ref().map(|w| core::workflow_groups(w, &text, &[], true, "")).unwrap_or_default(),
+        None => {
+            let (action, _) = wf::parse_action(&text);
+            action.as_ref().map(|a| core::action_groups(a, row.facts.kind, &text, &head, &ctx.versions)).unwrap_or_default()
+        }
+    };
+    let at = d.branch.clone().or_else(|| d.name.clone()).unwrap_or_else(|| head.clone());
+    let pane = core::pane_json(&core::Opened { repo: &repo.name, row: &row, at: &at, sha: &head, text: &text, viewer, by_hand: runs_by_hand(loaded.as_ref()) }, &groups);
     Ok(srv::json(StatusCode::OK, &pane))
 }
 
@@ -557,7 +649,9 @@ pub async fn list(hub: &Arc<Hub>, q: &HashMap<String, String>, caller: &crate::a
     let repo = q.get("repo").map(String::as_str).filter(|r| !r.is_empty());
     let text = q.get("q").map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty());
     // Each repository's JSON was rendered when it was gathered: the list joins them.
-    let body = core::list_text(held.iter().map(|h| &h.view), only.as_deref(), repo, text.as_deref(), Some(caller.name.as_str()));
+    // Drafts name their authors as diffs do (`user:ada`): so does the viewer.
+    let (me, _) = crate::ci::diffs::author_of(&caller.name, Some(caller.kind));
+    let body = core::list_text(held.iter().map(|h| &h.view), only.as_deref(), repo, text.as_deref(), Some(me.as_str()));
     Ok(srv::response(StatusCode::OK, "application/json", srv::full(body)))
 }
 

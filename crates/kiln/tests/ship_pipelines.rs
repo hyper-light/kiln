@@ -345,10 +345,14 @@ fn w29_r04_the_pane() -> anyhow::Result<()> {
     let names: Vec<&str> = group(&gha, "Secrets and variables").iter().map(|l| field(l, "name")).collect();
     assert_eq!(names, ["TOKEN", "REGION"]);
     assert!(gha.get("groups").is_some_and(|g| !g.to_string().contains("${{ secrets")), "no value of a secret, or its expression, in the groups");
-    // Every verb is there, dimmed, saying when it comes.
+    // Every verb is there, and each one off says why (W29-R04): a reusable workflow runs where it's
+    // called, there's no draft to make ready or discard, and releases come later; the admin may
+    // save a draft.
     let verbs = gha.pointer("/strip/verbs").and_then(Value::as_array).cloned().unwrap_or_default();
     assert_eq!(verbs.iter().map(|v| field(v, "verb")).collect::<Vec<_>>(), ["run", "save_draft", "ready", "discard", "release"]);
-    assert!(verbs.iter().all(|v| v.get("enabled") == Some(&Value::Bool(false)) && !field(v, "why_not").is_empty()), "{verbs:?}");
+    assert!(verbs.iter().all(|v| v.get("enabled") == Some(&Value::Bool(true)) || !field(v, "why_not").is_empty()), "{verbs:?}");
+    let on: Vec<&str> = verbs.iter().filter(|v| v.get("enabled") == Some(&Value::Bool(true))).map(|v| field(v, "verb")).collect();
+    assert_eq!(on, ["save_draft"], "{verbs:?}");
 
     // Each action kind's own groups, and its versions.
     for (path, own) in [(".github/actions/setup/action.yml", "Steps"), (".github/actions/comment/action.yml", "Runs on Node (node24)"), (".github/actions/image/action.yml", "Image"), (".kiln/actions/fuzz/action.yml", "Firecracker microVM"), (".kiln/actions/sandbox/action.yml", "Shards microVM")] {
@@ -375,5 +379,121 @@ fn w29_r04_the_pane() -> anyhow::Result<()> {
     anyhow::ensure!(st == 200, "acme/other");
     let other = person(&s, "other", &["viewer@repo:acme/other"])?;
     assert_eq!(pane(&s, &other, ".github/workflows/every.yml", None)?.0, 404);
+    Ok(())
+}
+
+/// What code mode's `program` returns, run by `token` over MCP: whether it failed, and its answer.
+fn code_as(s: &Server, token: &str, program: &str) -> anyhow::Result<(bool, Value)> {
+    let (st, body) = http(s.port, "POST", "/api/mcp", token, Some(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "code_run", "arguments": { "program": program } } })))?;
+    anyhow::ensure!(st == 200, "code_run: {st} {body}");
+    let v: Value = serde_json::from_str(&body)?;
+    let text = v.pointer("/result/content/0/text").and_then(Value::as_str).unwrap_or_default();
+    let failed = v.pointer("/result/isError") == Some(&json!(true));
+    Ok((failed, serde_json::from_str::<Value>(text).ok().and_then(|o| o.get("result").cloned()).unwrap_or_else(|| json!(text))))
+}
+
+/// A Pipelines verb through Ship as `token`: its status and answer.
+fn act(s: &Server, token: &str, body: &Value) -> anyhow::Result<(u16, Value)> {
+    let (st, text) = http(s.port, "POST", "/api/ship/pipelines", token, Some(body))?;
+    Ok((st, serde_json::from_str(&text).unwrap_or(Value::Null)))
+}
+
+/// The row of a draft in a repository's rows, if there is one, as the list shows `token`.
+fn draft_row(s: &Server, token: &str, repo: &str, path: &str) -> anyhow::Result<Option<Value>> {
+    let list = pipelines(s, token, &format!("?repo={repo}"))?;
+    Ok(rows_of(&list, repo).into_iter().find(|r| field(r, "path") == path && r.get("draft").is_some_and(|d| !d.is_null())))
+}
+
+/// Until `pick` holds of what the list shows `token`, or a minute passes: the last it showed.
+fn until_list(s: &Server, token: &str, what: &str, pick: impl Fn(&Value) -> bool) -> anyhow::Result<Value> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let list = pipelines(s, token, "")?;
+        if pick(&list) {
+            return Ok(list);
+        }
+        anyhow::ensure!(Instant::now() < deadline, "{what}: {list}");
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// W29-R10 in Ship: a draft has a row of its own, DRAFT beside its title, that says Unpublished
+/// to its author and, once it's ready, Review to someone else; its pane says the same and offers
+/// its author's verbs. Its verbs go through `POST /api/ship/pipelines` and code mode's
+/// `kiln.ship.pipelines.act` alike, each as its own operation: one without its right is refused,
+/// and what a verb did is in the audit log. Discard takes the row away.
+#[test]
+fn w29_r10_drafts_in_ship() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "", extra: "" })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    git(&home, dir.path(), &["clone", "-q", &format!("http://x:{}@127.0.0.1:{}/git/acme/app.git", s.admin, s.port), "app"])?;
+    let work = dir.path().join("app");
+    std::fs::create_dir_all(work.join(".github/workflows"))?;
+    std::fs::write(work.join(".github/workflows/ci.yml"), "name: ci\non: push\njobs:\n  build:\n    runs-on: local\n    steps:\n      - run: echo ci\n")?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "first"])?;
+    git(&home, &work, &["push", "-q", "origin", "main"])?;
+    until_list(&s, &s.admin, "acme/app's rows", |l| !rows_of(l, "acme/app").is_empty())?;
+    let reviewer = person(&s, "rae", &["viewer@repo:acme/app"])?;
+
+    // Save draft: a row of its own, Unpublished.
+    let path = ".github/workflows/try.yml";
+    let text = "name: try\non: [push, workflow_dispatch]\njobs:\n  t:\n    runs-on: local\n    steps:\n      - run: echo tried\n";
+    let (st, saved) = act(&s, &s.admin, &json!({ "repo": "acme/app", "path": path, "verb": "save_draft", "content": text, "title": "Try it" }))?;
+    assert_eq!(st, 200, "{saved}");
+    let id = saved.pointer("/draft/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+    until_list(&s, &s.admin, "the draft's row", |l| rows_of(l, "acme/app").iter().any(|r| field(r, "path") == path && r.pointer("/draft/id").and_then(Value::as_str) == Some(id.as_str())))?;
+    let mine = draft_row(&s, &s.admin, "acme/app", path)?.unwrap_or_default();
+    assert_eq!((field(&mine, "word"), field(&mine, "stand"), mine.pointer("/draft/state").and_then(Value::as_str)), ("Unpublished", "waiting", Some("unpublished")), "{mine}");
+    assert!(field(&mine, "key").contains(":draft:"), "{mine}");
+    assert!(rows_of(&pipelines(&s, &s.admin, "?repo=acme/app")?, "acme/app").iter().any(|r| field(r, "path") == ".github/workflows/ci.yml" && r.get("draft").is_some_and(Value::is_null)), "what's published stays");
+    // Its pane, for its author: the DRAFT mark, and Ready, Discard and Run.
+    let (st, pane) = http(s.port, "GET", &format!("/api/ship/pipelines/acme/app?path={path}&draft={id}"), &s.admin, None)?;
+    anyhow::ensure!(st == 200, "{st} {pane}");
+    let pane: Value = serde_json::from_str(&pane)?;
+    assert_eq!(pane.pointer("/head/draft/id").and_then(Value::as_str), Some(id.as_str()), "{pane}");
+    let on: Vec<String> = pane.pointer("/strip/verbs").and_then(Value::as_array).into_iter().flatten().filter(|v| v.get("enabled") == Some(&json!(true))).map(|v| field(v, "verb").to_owned()).collect();
+    assert_eq!(on, ["run", "save_draft", "ready", "discard"], "{pane}");
+
+    // Run: the draft as its author's test.
+    let (st, ran) = act(&s, &s.admin, &json!({ "repo": "acme/app", "path": path, "verb": "run", "event": "push" }))?;
+    assert_eq!(st, 200, "{ran}");
+    assert!(ran.pointer("/runs/0/id").is_some(), "{ran}");
+
+    // Ready: Review to someone else, Unpublished still to its author.
+    let (st, out) = act(&s, &s.admin, &json!({ "repo": "acme/app", "path": path, "verb": "ready" }))?;
+    assert_eq!(st, 200, "{out}");
+    let theirs = until_list(&s, &reviewer, "Review, to someone else", |l| rows_of(l, "acme/app").iter().any(|r| field(r, "path") == path && field(r, "word") == "Review"))?;
+    let row = rows_of(&theirs, "acme/app").into_iter().find(|r| field(r, "path") == path && !r.get("draft").is_some_and(Value::is_null)).unwrap_or_default();
+    assert_eq!(field(&row, "stand"), "needs_you", "{row}");
+    let mine = draft_row(&s, &s.admin, "acme/app", path)?.unwrap_or_default();
+    assert_eq!(field(&mine, "word"), "Unpublished", "to its author: {mine}");
+    // Someone without its right is refused, as the operation would refuse them.
+    let (st, said) = act(&s, &reviewer, &json!({ "repo": "acme/app", "path": path, "verb": "discard" }))?;
+    assert_eq!(st, 403, "{said}");
+
+    // Code mode's act answers as the route: a second draft, through it.
+    let program = "return await kiln.ship.pipelines.act({ repo: 'acme/app', path: '.github/workflows/other.yml', verb: 'save_draft', content: 'name: other\\non: push\\njobs:\\n  o:\\n    runs-on: local\\n    steps:\\n      - run: echo other\\n', title: 'Another' })";
+    let (failed, out) = code_as(&s, &s.admin, program)?;
+    assert!(!failed, "{out}");
+    assert_eq!((out.pointer("/draft/kind").and_then(Value::as_str), out.pointer("/draft/state").and_then(Value::as_str), out.pointer("/draft/path").and_then(Value::as_str)), (Some("diff"), Some("draft"), Some(".github/workflows/other.yml")), "{out}");
+
+    // The audit log has each verb's request, what its operation did, and the refusal (W29-AC04).
+    let (_, audit) = http(s.port, "GET", "/api/audit?limit=200", &s.admin, None)?;
+    let entries: Vec<Value> = serde_json::from_str::<Value>(&audit)?.as_array().cloned().unwrap_or_default();
+    let ours: Vec<&Value> = entries.iter().filter(|e| field(e, "action") == "POST /api/ship/pipelines").collect();
+    for what in ["ci.workflow.draft:", "diffs.ready:", "ci.workflow.draft.ready:", "ci.workflow.draft.run:"] {
+        assert!(ours.iter().any(|e| field(e, "detail").contains(what)), "{what} in the audit log: {audit}");
+    }
+    assert!(ours.iter().any(|e| field(e, "result") == "403" && field(e, "on_behalf_of") == "user:rae"), "the refusal in the audit log: {audit}");
+
+    // Discard: the row goes.
+    let (st, out) = act(&s, &s.admin, &json!({ "repo": "acme/app", "path": path, "verb": "discard" }))?;
+    assert_eq!(st, 200, "{out}");
+    until_list(&s, &s.admin, "the discarded draft's row gone", |l| !rows_of(l, "acme/app").iter().any(|r| r.pointer("/draft/id").and_then(Value::as_str) == Some(id.as_str())))?;
     Ok(())
 }

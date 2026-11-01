@@ -137,6 +137,18 @@ export interface ShipQuery {
 export type ShipPipelineKind = "workflow" | "reusable" | "composite" | "javascript" | "docker" | "firecracker" | "shards" | "unknown";
 
 /**
+ * A draft of a workflow or action (W29-R10): how far it has come (`unpublished`, or `review` when
+ * it asks someone else to review it; its author sees it unpublished still), whose it is, and the
+ * change it's saved as: a kiln diff (`D12`), or a host's pull or merge request (`#5`, `!5`).
+ */
+export interface ShipPipelineDraft {
+  id: string;
+  state: "not_saved" | "unpublished" | "review" | "update" | string;
+  author: string;
+  change: { kind: "diff" | "change"; name: string; url: string | null } | null;
+}
+
+/**
  * A workflow or action of a repository, as Ship's Pipelines lists it (W29-R02), at its default
  * branch's head: its stand and word (`Can't run`, `Failing`, `Released`, …), its line, and its pips
  * as glyph names, Checks, Runs on and Latest in that order.
@@ -160,8 +172,8 @@ export interface ShipPipelineRow {
   commit: string;
   /** The repository's newest full-version tag, for an action or reusable workflow. */
   released: string | null;
-  /** Its draft (W29-R10): null until drafts are built. */
-  draft: null;
+  /** Its draft (W29-R10), marked DRAFT beside its title; null for what's published. */
+  draft: ShipPipelineDraft | null;
   /** A hash of what the row shows: the same row, the same `v`. */
   v: string;
 }
@@ -226,7 +238,7 @@ export interface ShipPipelinePane {
     dialect: "gha" | "kiln" | null;
     ref: string;
     commit: string;
-    draft: null;
+    draft: ShipPipelineDraft | null;
     stand: ShipStand | string;
     word: string;
     pips: [string, string, string];
@@ -235,6 +247,24 @@ export interface ShipPipelinePane {
   groups: ShipPipelineGroup[];
   detail: ShipPipelineDetail;
   repo: string;
+}
+
+/**
+ * A strip's verb (W29-R04), as `POST /api/ship/pipelines` takes it: on your own work, each as its
+ * own operation and with its right. Save draft takes `content` and `title`; Run takes `event` (a
+ * draft's), `jobs`, `inputs`, and a published workflow's `ref` or `sha`.
+ */
+export interface ShipPipelineAct {
+  repo: string;
+  path: string;
+  verb: "save_draft" | "ready" | "discard" | "run";
+  content?: string;
+  title?: string;
+  event?: string;
+  jobs?: string[];
+  inputs?: Record<string, unknown>;
+  ref?: string;
+  sha?: string;
 }
 
 export function shipSearch(q: ShipQuery): string {
