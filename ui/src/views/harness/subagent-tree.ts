@@ -7,7 +7,7 @@
  * it (an ancestor's, on to that one's next), the line or curve into its mark, and the line on from
  * it. While it needs you, its own piece is tan.
  */
-import type { AgentInfo, Approval, ApprovalBrief, SubagentBrief, Task } from "@/api/harness";
+import type { AgentInfo, Approval, ApprovalBrief, HEvent, SubagentBrief, Task } from "@/api/harness";
 import { agentLabel, plain } from "./derive";
 import { standOf } from "./mission-rows";
 import { askWords, isSubagent, kilnSubagentsOf } from "./tasks";
@@ -233,6 +233,7 @@ export function subagentTree(root: AgentInfo, list: readonly AgentInfo[]): Subag
             machine: machineName(a.target),
             harness: a.kind_name,
             started: a.turn_started ?? a.created_at,
+            ended: stand === "done" || stand === "failed" || stand === "stopped" ? a.last_activity : undefined,
             href: threadHref(root.id, owner.id, a.id),
           });
           walk(a, a.id, depth + 1);
@@ -243,6 +244,71 @@ export function subagentTree(root: AgentInfo, list: readonly AgentInfo[]): Subag
   };
   walk(root, null, 0);
   return out;
+}
+
+/** The agent at the top of one's line: its parent, that one's, and so on, while each is a subagent kiln started whose parent is there. */
+export function topOf(list: readonly AgentInfo[], id: string): AgentInfo | undefined {
+  let at = list.find((a) => a.id === id);
+  const seen = new Set<string>();
+  while (at?.subagent && at.parent && !seen.has(at.id)) {
+    seen.add(at.id);
+    const up: AgentInfo | undefined = list.find((a) => a.id === at?.parent);
+    if (!up) break;
+    at = up;
+  }
+  return at;
+}
+
+/** One name on a thread's path: where its thread opens. */
+export interface Crumb {
+  key: string;
+  name: string;
+  href: string;
+}
+
+/**
+ * A subagent's whole path, for its thread's crumbs: the agent at the top (its main thread), each
+ * subagent it's under, then it (`key`, in `nodes`: the top's tree). Null when it isn't in the tree.
+ */
+export function threadCrumbs(top: AgentInfo, nodes: readonly SubagentNode[], key: string): Crumb[] | null {
+  const byKey = new Map(nodes.map((n) => [n.key, n]));
+  const line: SubagentNode[] = [];
+  for (let n = byKey.get(key); n && !line.includes(n); n = n.parent == null ? undefined : byKey.get(n.parent)) line.unshift(n);
+  if (line.length === 0) return null;
+  return [{ key: top.id, name: agentLabel(top), href: `/agents/${top.id}` }, ...line.map((n) => ({ key: n.key, name: n.name, href: n.href }))];
+}
+
+/**
+ * A subagent's thread: who started it (its parent: its name, and where its thread opens), whether
+ * your messages reach it by way of that one (`Task.via`), and how it ended, once it has.
+ */
+export interface ThreadFrom {
+  name: string;
+  href: string;
+  /** Your messages reach it by way of its parent, which passes them on. */
+  via: boolean;
+  /** A session of its own (one kiln started): its parent's id, which what its parent sent it carries (queued.rs `from_agent`). */
+  session?: string;
+  /** Done, failed or stopped: its word, and when. */
+  end?: { stand: NodeStand; word: string; at?: number };
+}
+
+/** Its thread's `ThreadFrom`, from its path (`crumbs`, it last) and its node in the tree (`here`). */
+export function threadFrom(crumbs: readonly Crumb[], here: SubagentNode | undefined, o: { via?: string | null; session?: string }): ThreadFrom | null {
+  const up = crumbs.at(-2);
+  if (!up) return null;
+  const end = here && !takesMessage(here) ? { stand: here.stand, word: NODE_WORD[here.stand], at: here.ended } : undefined;
+  return { name: up.name, href: up.href, via: o.via === "parent", session: o.session, end };
+}
+
+/**
+ * A message its parent wrote it. In a session of its own: its first (its brief), and what its
+ * parent sent it. In its harness's own subagent's thread: one kiln didn't send (its brief, what its
+ * agent sent it; Claude Code's are "system").
+ */
+export function parentWrote(from: ThreadFrom, e: Extract<HEvent, { kind: "user" }>, first: boolean): boolean {
+  if (from.session) return first || (e.client_id?.startsWith(`from-agent-${from.session}-`) ?? false);
+  return !e.client_id && e.origin !== "human";
 }
 
 /** Each row's piece of the path, drawn from its place among the rows (`nodes`, in tree order). */

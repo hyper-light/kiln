@@ -767,6 +767,8 @@ for (const m of [
   m.events = [
     { id: "relay-lead-u1", seq: t, at: t, kind: "user", text: "Rewrite the parser; send a subagent through its tests.", client_id: "relay-lead-u1", origin: "human" } as HEvent,
     tool(SPAWN, t + 1_000, "Agent", "agent", "Run the parser tests", { description: "Run the parser tests", prompt: "Run the parser's tests and report what fails." }, { task: SUB }),
+    // Its brief in its thread, as Claude Code's transcript has it: the agent's words, not the person's (no client id, "system").
+    { id: "relay-brief", seq: t + 1_100, at: t + 1_100, parent: SPAWN, kind: "user", text: "Run the parser's tests and report what fails.", origin: "system" } as HEvent,
     said("relay-lead-a1", "A subagent is on the tests.", t + 2_000),
     // Passed on in a turn of its own, the agent idle.
     theirs("relay-m1", "Use the v2 parser", t + 60_000),
@@ -797,6 +799,7 @@ for (const m of [
       started: t + 1_000,
       last_tool: "Bash",
       stoppable: true,
+      via: "parent",
     },
   ];
   leaves(m);
@@ -846,6 +849,29 @@ const treeLeadAsk: Approval = {
     sub("ts1-a", "Check vote timeouts", t + 25 * 60_000, { summary: "Reading src/raft/vote.rs", last_tool: "Read" }),
     sub("ts1-b", "Measure election time", t + 26 * 60_000, { status: "completed", ended: t + 30 * 60_000, summary: "Elections settle within two terms." }),
   ];
+  const spawned = (task: string, n: number, title: string, brief: string, at: number, ended?: number): HEvent[] => [
+    {
+      id: `toolu_${task}`,
+      seq: n,
+      at,
+      kind: "tool",
+      tool_id: `toolu_${task}`,
+      name: "Agent",
+      tool: "agent",
+      title,
+      input: { description: title, prompt: brief },
+      status: ended ? "done" : "running",
+      started: at,
+      ended,
+      task,
+    } as unknown as HEvent,
+    { id: `${task}-brief`, seq: n + 1, at: at + 500, parent: `toolu_${task}`, kind: "user", text: brief, origin: "system" } as HEvent,
+  ];
+  s1.events.push(
+    ...spawned("ts1-a", 10, "Check vote timeouts", "Check each vote timeout in src/raft/vote.rs against the spec.", t + 25 * 60_000),
+    ...spawned("ts1-b", 20, "Measure election time", "Time ten elections across three nodes and say how many terms each took.", t + 26 * 60_000, t + 30 * 60_000),
+    { id: "ts1-b-a1", seq: 22, at: t + 30 * 60_000, parent: "toolu_ts1-b", kind: "assistant", text: "Elections settle within two terms." } as HEvent,
+  );
   const s2 = member("tree-s2", "codex", "agent:metal-epyc-01", "Follower catch-up", "waiting", "untrusted", "Step 3 of 5 of the plan \u201cReplicated log\u201d: Follower catch-up", "I'll partition a follower and let it catch up.", { parent: "tree-lead", subagent: true });
   s2.info.created_at = t + 120_000;
   const s3 = member("tree-s3", "claude", "agent:metal-ryzen-02", "Snapshot transfer", "running", "default", "Step 4 of 5 of the plan \u201cReplicated log\u201d: Snapshot transfer", "Streaming a snapshot to a lagging follower.", {

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { AgentInfo } from "../src/api/harness.ts";
-import { briefsOf, stepLive, subagentRows, subagentTree, threadHref, treePaths, type Brief } from "../src/views/harness/subagent-tree.ts";
+import { briefsOf, stepLive, subagentRows, subagentTree, threadCrumbs, threadHref, topOf, treePaths, type Brief } from "../src/views/harness/subagent-tree.ts";
 
 const agent = (id: string, rest: Partial<AgentInfo> = {}): AgentInfo => ({
   id,
@@ -30,8 +30,16 @@ const kiln = (id: string, parent: string, created_at: number, rest: Partial<Agen
 const LEAD = agent("lead", { subagents: [brief("h0", 40, { status: "failed", summary: "Couldn't reach the key server" })] });
 const LIST = [
   LEAD,
-  kiln("k1", "lead", 10, { name: "Leader election", subagents: [brief("h1a", 11, { summary: "Reading src/raft/vote.rs" }), brief("h1b", 12, { status: "completed", summary: "Elections settle within two terms." })] }),
-  kiln("k2", "lead", 20, { name: "Follower catch-up", target: "agent:metal-epyc-01", kind_name: "Codex", approvals: [{ id: "ap", tool: "shell", tool_name: "Bash", title: "cargo test catch_up", at: 5 }] }),
+  kiln("k1", "lead", 10, {
+    name: "Leader election",
+    subagents: [brief("h1a", 11, { summary: "Reading src/raft/vote.rs" }), brief("h1b", 12, { status: "completed", summary: "Elections settle within two terms." })],
+  }),
+  kiln("k2", "lead", 20, {
+    name: "Follower catch-up",
+    target: "agent:metal-epyc-01",
+    kind_name: "Codex",
+    approvals: [{ id: "ap", tool: "shell", tool_name: "Bash", title: "cargo test catch_up", at: 5 }],
+  }),
   kiln("k3", "lead", 30, { name: "Snapshot transfer", doing: "Streaming a 10 GB snapshot" }),
   kiln("k3a", "k3", 31, { name: "Verify the checksum", subagents: [brief("h3a", 32, { last_tool: "Read" })] }),
   agent("elsewhere"),
@@ -86,7 +94,10 @@ test("its thread opens on its agent's page: the lead's for its own, a kiln subag
 });
 
 test("a harness's own subagent that a request names needs you, in the request's words", () => {
-  const a = agent("solo", { subagents: [brief("t1", 1, { tool_id: "toolu_1" }), brief("t2", 2)], approvals: [{ id: "p", tool: "shell", tool_name: "Bash", title: "rm -rf build", at: 1, agent: "toolu_1" }] });
+  const a = agent("solo", {
+    subagents: [brief("t1", 1, { tool_id: "toolu_1" }), brief("t2", 2)],
+    approvals: [{ id: "p", tool: "shell", tool_name: "Bash", title: "rm -rf build", at: 1, agent: "toolu_1" }],
+  });
   const nodes = subagentTree(a, [a]);
   assert.deepEqual(
     nodes.map((n) => [n.key, n.stand, n.line]),
@@ -140,10 +151,20 @@ test("each row's piece of the path: lines passing by for ancestors with a next, 
 });
 
 test("a first child that needs you: its curve in is tan; a last one's line in is, and nothing hangs on after it", () => {
-  const a = agent("r", { subagents: [brief("p", 1), brief("c", 2, { parent_task: "p", tool_id: "tc" })], approvals: [{ id: "q", tool: "question", tool_name: "AskUserQuestion", title: "Which first?", at: 1, agent: "tc" }] });
+  const a = agent("r", {
+    subagents: [brief("p", 1), brief("c", 2, { parent_task: "p", tool_id: "tc" })],
+    approvals: [{ id: "q", tool: "question", tool_name: "AskUserQuestion", title: "Which first?", at: 1, agent: "tc" }],
+  });
   const paths = treePaths(subagentTree(a, [a]));
   assert.deepEqual(paths[1], { lane: 1, pieces: [], curve: { from: 0, to: 1, hot: true } });
-  assert.deepEqual(paths[0], { lane: 0, pieces: [{ lane: 0, from: "top", to: "mark", hot: false }, { lane: 0, from: "mark", to: "bottom", hot: false }], curve: null });
+  assert.deepEqual(paths[0], {
+    lane: 0,
+    pieces: [
+      { lane: 0, from: "top", to: "mark", hot: false },
+      { lane: 0, from: "mark", to: "bottom", hot: false },
+    ],
+    curve: null,
+  });
 });
 
 test("a live state's tasks as the list has them: only subagents, with what they're at", () => {
@@ -151,7 +172,9 @@ test("a live state's tasks as the list has them: only subagents, with what they'
     { id: "s", description: "Audit", status: "running", started: 1, class: "agent", last_tool: "Bash", summary: "Running the tests" },
     { id: "sh", description: "npm run dev", status: "running", started: 2, class: "shell" },
   ]);
-  assert.deepEqual(b, [{ id: "s", tool_id: undefined, description: "Audit", status: "running", parent_task: undefined, started: 1, ended: undefined, last_tool: "Bash", summary: "Running the tests" }]);
+  assert.deepEqual(b, [
+    { id: "s", tool_id: undefined, description: "Audit", status: "running", parent_task: undefined, started: 1, ended: undefined, last_tool: "Bash", summary: "Running the tests" },
+  ]);
 });
 
 test("the agent at a plan's step, live: what it's doing since its turn started, or what it asks; its thread and the session that answers", () => {
@@ -160,4 +183,31 @@ test("the agent at a plan's step, live: what it's doing since its turn started, 
   const ap = { id: "ap", tool: "shell" as const, tool_name: "Bash", title: "cargo test catch_up", at: 5 };
   const asking = agent("s2", { status: "waiting", approvals: [ap] });
   assert.deepEqual(stepLive(asking, "/agents/lead?task=s2"), { line: "Bash: cargo test catch_up", ask: ap, started: 0, href: "/agents/lead?task=s2", session: "s2" });
+});
+
+test("a thread's crumbs: the agent at the top, each subagent it's under, then it, each where its thread opens", () => {
+  assert.equal(topOf(LIST, "k3a")?.id, "lead");
+  assert.equal(topOf(LIST, "lead")?.id, "lead");
+  assert.equal(topOf(LIST, "nobody"), undefined);
+  const nodes = subagentTree(LEAD, LIST);
+  assert.deepEqual(
+    threadCrumbs(LEAD, nodes, "k3a/h3a")?.map((c) => [c.name, c.href]),
+    [
+      ["lead", "/agents/lead"],
+      ["Snapshot transfer", "/agents/lead?task=k3"],
+      ["Verify the checksum", "/agents/k3?own=1&task=k3a"],
+      ["h3a", "/agents/k3a?own=1&task=h3a"],
+    ],
+  );
+  assert.deepEqual(
+    threadCrumbs(LEAD, nodes, "lead/h0")?.map((c) => c.name),
+    ["lead", "h0"],
+  );
+  assert.equal(threadCrumbs(LEAD, nodes, "lead/gone"), null);
+});
+
+test("one whose parent kiln no longer lists heads its own line, and parents that name each other end", () => {
+  assert.equal(topOf([kiln("o", "gone", 1)], "o")?.id, "o");
+  const loop = [kiln("a", "b", 1), kiln("b", "a", 2)];
+  assert.ok(["a", "b"].includes(topOf(loop, "a")?.id ?? ""));
 });

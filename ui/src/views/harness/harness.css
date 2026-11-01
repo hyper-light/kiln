@@ -612,7 +612,7 @@ textarea.hx-input {
   display: flex;
   align-items: center;
   gap: 8px;
-  /* One line, the same height whatever the subagent's description: it alone gives way. */
+  /* One line, the same height whatever the names on it: its path alone gives way. */
   min-width: 0;
   min-height: 44px;
   overflow: hidden;
@@ -626,8 +626,38 @@ textarea.hx-input {
   flex-shrink: 0;
   white-space: nowrap;
 }
-.hx-crumbs > .hx-trunc {
+/* A subagent's whole path: the earlier names give way first (each to an ellipsis, down to a few
+   letters); its own keeps up to 62% of it. */
+.hx-crumbs > .hx-path {
+  display: flex;
   flex: 1 1 0;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+}
+.hx-path-sep {
+  flex: none;
+  color: var(--color-faint);
+}
+.hx-crumb {
+  flex: 0 1 auto;
+  min-width: 3em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.hx-crumb:hover {
+  color: var(--color-bright);
+}
+.hx-here {
+  flex: 0 0 auto;
+  max-width: 62%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-bright);
 }
 
 /* Find in the conversation: a bar over it, in its flow like the crumbs; the matches are painted in
@@ -802,6 +832,77 @@ textarea.hx-input {
   gap: 8px;
   margin-bottom: 4px;
   font-size: 11px;
+}
+/* In a subagent's thread, what its parent wrote it: under its name and mark, with the way back. */
+.hx-by {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.hx-by-mark {
+  flex: none;
+  width: 13px;
+  height: 13px;
+  color: #b8a6d5;
+}
+.hx-by-back {
+  display: inline-flex;
+  color: #c9c3d8;
+}
+.hx-by-back:hover {
+  color: var(--color-bright);
+}
+/* A finished subagent's thread ends with its word and when, and the way back to its parent's. */
+.hx-thread-end {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 10px 0;
+  border-top: 1px solid #1d1f23;
+  font-size: 12px;
+}
+.hx-thread-word {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #a1a4ad;
+}
+.hx-thread-word > i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #7e818a;
+  transform: translateY(-1px);
+}
+.hx-thread-end[data-stand="done"] .hx-thread-word {
+  color: #bfdccf;
+}
+.hx-thread-end[data-stand="done"] .hx-thread-word > i {
+  background: #a8c9bc;
+}
+.hx-thread-end[data-stand="failed"] .hx-thread-word,
+.hx-thread-end[data-stand="stopped"] .hx-thread-word {
+  color: #e2b9bd;
+}
+.hx-thread-end[data-stand="failed"] .hx-thread-word > i,
+.hx-thread-end[data-stand="stopped"] .hx-thread-word > i {
+  background: #d1aaad;
+}
+.hx-thread-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: #c9c3d8;
+}
+.hx-thread-back:hover {
+  color: var(--color-bright);
 }
 /* Where a message stands, each state in its own colour (the stands' tints, stands.css): sent the
    quietest, dropped the one that's seen. */

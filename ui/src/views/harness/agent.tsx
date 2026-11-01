@@ -11,7 +11,7 @@ import * as React from "react";
 import "./harness.css";
 import "./console.css";
 import { Link, Navigate, useNavigate, useParams, useSearchParams } from "@/lib/router";
-import { ArrowLeft, ChevronRight, RotateCcw, X } from "lucide-react";
+import { ArrowLeft, ChevronRight, GitFork, Pause, RotateCcw, Shield, X } from "lucide-react";
 import { clientId, harnessApi, lastTurnFrom, sessionStore, useSession, useSessionReady, useStopAt } from "@/api/harness";
 import type { AgentInfo, Approval, Attachment, Command, FileChange, HEvent, Meta, SendMode, SessionStore, Task, Todo } from "@/api/harness";
 import { harnessSessionsRes, useRes } from "@/lib/data";
@@ -36,7 +36,7 @@ import { AskedLine } from "./asked";
 import { PausedLine } from "./pause";
 import { useMarkSeen } from "./seen";
 import { ActivityLine } from "./background";
-import { Timeline, type ReplyTarget } from "./timeline";
+import { ThreadFromContext, Timeline, type ReplyTarget } from "./timeline";
 import { BesideTerminals, openBeside as openTerminal } from "./beside";
 import { useDrafts } from "./state";
 import { PlanSourceContext } from "@/views/plans/save";
@@ -45,7 +45,7 @@ import { revealReview } from "@/views/plans/reveal";
 import { useEndWithChildren } from "./family";
 import { LoadingMark, PrismLabel } from "./signals";
 import { asAnswered, markAnswered, stillAsked, unmark, useAnswered } from "./answered";
-import { liveRoot, subagentRows, takesMessage } from "./subagent-tree";
+import { liveRoot, subagentRows, subagentTree, takesMessage, threadCrumbs, threadFrom, topOf, type Crumb, type SubagentNode, type ThreadFrom } from "./subagent-tree";
 import { AboutContext } from "@/components/code/about";
 
 type PhoneTab = "work" | InspectorTab;
@@ -205,6 +205,10 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
       return previous;
     });
   const taskName = taskInfo?.description;
+  const path = useThreadPath(store, id, info ?? undefined, sub, taskInfo?.id ?? taskId, taskName);
+  // Who started the thread shown, for its timeline: a key, so its turns only render again when that changes.
+  const fromKey = JSON.stringify(path ? threadFrom(path.crumbs, path.here, { via: sub ? null : taskInfo?.via, session: sub ? id : undefined }) : null);
+  const from = React.useMemo(() => JSON.parse(fromKey) as ThreadFrom | null, [fromKey]);
 
   // The matches, in the thread shown; a new search starts at the newest, and the one shown stays
   // shown as the conversation grows. (The conversation is read here only while finding.)
@@ -306,71 +310,56 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
         />
       )}
       {findOpen && dropped > 0 && <EarlierMatches agent={subId ?? id} q={findQ} before={findEvents[0]?.at} />}
-      {(task || sub) && (
-        <div className="hx-crumbs">
-          <button type="button" className="hx-link" onClick={mainThread}>
-            Main thread
-          </button>
-          <ChevronRight size={12} />
-          <span className="hx-trunc">{sub ? agentLabel(sub) : (taskName ?? "Subagent")}</span>
-          {/* What's only on its page of its own (its changes, its settings). */}
-          {sub && (
-            <Link to={`/agents/${sub.id}?own=1`} className="hx-link shrink-0">
-              Its page
-            </Link>
-          )}
-          <button type="button" className="hx-icon ml-auto" aria-label="Back to the main thread" onClick={mainThread}>
-            <X size={13} />
-          </button>
-        </div>
-      )}
-      {sub ? (
-        <React.Suspense fallback={<LoadingMark />}>
-          <KilnThread key={sub.id} id={sub.id} onTerminal={openBeside} find={find} turn={turn} />
-        </React.Suspense>
-      ) : (
-        <>
-          <PlanSourceContext.Provider value={planSource}>
-            <AboutContext.Provider value={task ? null : about}>
-              <Timeline
-                key={task ?? "main"}
-                store={store}
-                agent={id}
-                cwd={cwd}
-                parent={task ?? undefined}
-                onOpenTask={openTask}
-                onCommand={send}
-                onReply={setReply}
-                agentLabel={task ? "Subagent" : info?.kind_name}
-                agentName={info?.name}
-                onDecide={send}
-                target={info?.target}
-                kind={info?.kind}
-                accountOpen={account !== null}
-                find={find}
-                footer={footer}
-                onReviewPlan={task ? undefined : reviewPlan}
-              />
-            </AboutContext.Provider>
-          </PlanSourceContext.Provider>
-          <Dock
-            store={store}
-            id={id}
-            attachments={attachments}
-            toMain={task !== null}
-            task={task}
-            kiln={kiln}
-            turn={turn}
-            onView={openView}
-            onTerminal={openBeside}
-            onOpenTask={openTask}
-            onRemove={() => setConfirmStop(true)}
-            send={send}
-            reply={reply}
-            onClearReply={() => setReply(null)}
-          />
-        </>
-      )}
+      {path && <ThreadCrumbs crumbs={path.crumbs} sub={sub} onClose={mainThread} />}
+      <ThreadFromContext.Provider value={from}>
+        {sub ? (
+          <React.Suspense fallback={<LoadingMark />}>
+            <KilnThread key={sub.id} id={sub.id} onTerminal={openBeside} find={find} turn={turn} />
+          </React.Suspense>
+        ) : (
+          <>
+            <PlanSourceContext.Provider value={planSource}>
+              <AboutContext.Provider value={task ? null : about}>
+                <Timeline
+                  key={task ?? "main"}
+                  store={store}
+                  agent={id}
+                  cwd={cwd}
+                  parent={task ?? undefined}
+                  onOpenTask={openTask}
+                  onCommand={send}
+                  onReply={setReply}
+                  agentLabel={task ? "Subagent" : info?.kind_name}
+                  agentName={info?.name}
+                  onDecide={send}
+                  target={info?.target}
+                  kind={info?.kind}
+                  accountOpen={account !== null}
+                  find={find}
+                  footer={footer}
+                  onReviewPlan={task ? undefined : reviewPlan}
+                />
+              </AboutContext.Provider>
+            </PlanSourceContext.Provider>
+            <Dock
+              store={store}
+              id={id}
+              attachments={attachments}
+              toMain={task !== null}
+              task={task}
+              kiln={kiln}
+              turn={turn}
+              onView={openView}
+              onTerminal={openBeside}
+              onOpenTask={openTask}
+              onRemove={() => setConfirmStop(true)}
+              send={send}
+              reply={reply}
+              onClearReply={() => setReply(null)}
+            />
+          </>
+        )}
+      </ThreadFromContext.Provider>
     </div>
   );
 
@@ -515,6 +504,91 @@ function Head({ store, cwd, send, onUsage, onSettings, onFind }: { store: Sessio
       />
       {actions.dialogs}
     </>
+  );
+}
+
+/**
+ * The thread shown, when it's a subagent's: its whole path, from the agent at the top through each
+ * subagent it's under to it (subagent-tree.ts `threadCrumbs`), and where it is in the tree. Its own
+ * agent's subagents as its live state has them; the rest as listed. Not in the tree (not listed
+ * yet, or no longer): this page's agent, then it.
+ */
+function useThreadPath(
+  store: SessionStore,
+  id: string,
+  info: AgentInfo | undefined,
+  sub: AgentInfo | null,
+  task: string | null,
+  name: string | undefined,
+): { crumbs: Crumb[]; here?: SubagentNode } | null {
+  const open = sub !== null || task !== null;
+  const everyone = useRes(harnessSessionsRes).data;
+  const done = useAnswered();
+  // Read only while a thread is open: the main thread's page doesn't render again for its tasks.
+  const tasks = useSession(store, (s) => (open ? (s.state?.tasks ?? NO_TASKS) : NO_TASKS));
+  const asks = useSession(store, (s) => (open ? (s.state?.approvals ?? NO_ASKS) : NO_ASKS));
+  return React.useMemo(() => {
+    if (!open) return null;
+    const live = (a: AgentInfo) => liveRoot(a, tasks, asks, done);
+    const list = everyone.some((a) => a.id === id) ? everyone.map((a) => (a.id === id ? live(a) : a)) : info ? [...everyone, live(info)] : everyone;
+    const key = sub ? sub.id : `${id}/${task ?? ""}`;
+    const top = topOf(list, id);
+    const nodes = top ? subagentTree(top, list) : [];
+    const crumbs = top ? threadCrumbs(top, nodes, key) : null;
+    return {
+      crumbs: crumbs ?? [
+        { key: id, name: info ? agentLabel(info) : "Main thread", href: `/agents/${id}${info?.subagent ? "?own=1" : ""}` },
+        { key, name: sub ? agentLabel(sub) : (name ?? "Subagent"), href: "" },
+      ],
+      here: nodes.find((n) => n.key === key),
+    };
+  }, [open, everyone, id, info, sub, task, name, tasks, asks, done]);
+}
+
+/**
+ * Over a subagent's thread: its whole path, earlier names giving way first, each earlier one where
+ * its thread opens (the first its agent's main thread); then pause, branch and its permissions;
+ * its page of its own (one kiln started); and back to the main thread.
+ */
+function ThreadCrumbs({ crumbs, sub, onClose }: { crumbs: readonly Crumb[]; sub: AgentInfo | null; onClose: () => void }) {
+  const last = crumbs.length - 1;
+  return (
+    <div className="hx-crumbs">
+      <nav className="hx-path" aria-label="Path">
+        {crumbs.map((c, i) => (
+          <React.Fragment key={c.key}>
+            {i > 0 && <ChevronRight size={12} className="hx-path-sep" />}
+            {i < last ? (
+              <Link to={c.href} className="hx-crumb" title={c.name}>
+                {c.name}
+              </Link>
+            ) : (
+              <span className="hx-here" title={c.name} aria-current="page">
+                {c.name}
+              </span>
+            )}
+          </React.Fragment>
+        ))}
+      </nav>
+      <button type="button" className="hx-icon" aria-label="Pause" disabled>
+        <Pause size={14} />
+      </button>
+      <button type="button" className="hx-icon" aria-label="Branch" disabled>
+        <GitFork size={14} />
+      </button>
+      <button type="button" className="hx-icon" aria-label="Permissions" disabled>
+        <Shield size={14} />
+      </button>
+      {/* What's only on its page of its own (its changes, its settings). */}
+      {sub && (
+        <Link to={`/agents/${sub.id}?own=1`} className="hx-link">
+          Its page
+        </Link>
+      )}
+      <button type="button" className="hx-icon" aria-label="Back to the main thread" onClick={onClose}>
+        <X size={13} />
+      </button>
+    </div>
   );
 }
 
