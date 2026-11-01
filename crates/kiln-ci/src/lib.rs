@@ -57,6 +57,7 @@ pub mod runner;
 pub mod sbom;
 pub mod sched;
 pub mod secrets;
+pub mod sharing;
 pub mod stats;
 pub mod store;
 pub mod suggest;
