@@ -430,8 +430,12 @@ mod tests {
         a: super::super::SetupArgs,
     }
 
+    /// The words as typed, without the environment's fallbacks: CI's job pods carry KILN_JOIN_TOKEN,
+    /// which `--token` falls back to.
     fn args(words: &[&str]) -> anyhow::Result<super::super::SetupArgs> {
-        Ok(Cli::try_parse_from(std::iter::once("setup").chain(words.iter().copied()))?.a)
+        use clap::{CommandFactory as _, FromArgMatches as _};
+        let typed = Cli::command().mut_args(|a| a.env(None::<&'static str>)).try_get_matches_from(std::iter::once("setup").chain(words.iter().copied()))?;
+        Ok(Cli::from_arg_matches(&typed)?.a)
     }
 
     fn linux() -> Facts {
