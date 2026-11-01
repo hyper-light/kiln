@@ -446,7 +446,7 @@ async fn opened(hub: &Arc<Hub>, st: &mut Stack) {
                 let base = below.clone().unwrap_or_else(|| st.trunk.clone());
                 let branch = e.branch.clone().unwrap_or_default();
                 let opened = match (&host, &repo) {
-                    (Some(h), Some(r)) => match h.open_change(hub, r, &branch, &base, &e.title, &format!("Step {} of a plan run, on {base}.", e.n)).await {
+                    (Some(h), Some(r)) => match h.open_change(hub, r, &branch, &base, &e.title, &format!("Step {} of a plan run, on {base}.", e.n), false).await {
                         Ok(c) => Some((format!("#{}", c.number), c.url)),
                         Err(err) => {
                             tracing::info!(run = %st.run, step = e.n, error = %format!("{err:#}"), "a step's pull request didn't open: its branch is pushed");

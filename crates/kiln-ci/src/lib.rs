@@ -37,6 +37,7 @@ pub mod attest;
 pub mod compare;
 pub mod conflicts;
 pub mod dockerfile;
+pub mod drafts;
 pub mod env;
 pub mod experiments;
 pub mod expr;

@@ -356,7 +356,7 @@ pub async fn open(hub: &Arc<Hub>, actor: &str, info: &Info, want: Want) -> Resul
         (Some(h), Some((repo, _))) => match previous.as_ref().and_then(|p| p.change.clone()) {
             // A new version of a pull request is its branch's new commit: nothing to open.
             Some(c) => (Some(c), previous.as_ref().map(|p| p.url.clone()).unwrap_or_default(), None),
-            None => match h.open_change(hub, repo, &branch, &trunk, &title, want.body.as_deref().unwrap_or_default()).await {
+            None => match h.open_change(hub, repo, &branch, &trunk, &title, want.body.as_deref().unwrap_or_default(), false).await {
                 Ok(c) => (Some(format!("#{}", c.number)), c.url, None),
                 Err(e) => {
                     tracing::info!(agent = %info.id, error = %format!("{e:#}"), "a pull request didn't open: the branch is pushed");

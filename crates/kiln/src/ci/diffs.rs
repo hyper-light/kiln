@@ -1653,6 +1653,12 @@ async fn take(hub: &Hub, d: &Diff, caller: &Caller, body: &Value) -> Result<Valu
     Ok(json!({ "author": who, "hand_on": hand_on }))
 }
 
+/// Marks draft `d` ready for review as `caller` would through `ci.diffs.ready` (a host's draft
+/// change kiln opened, docs/ci.md W29-R12).
+pub(crate) async fn ready_as(hub: &Hub, d: &Diff, caller: &Caller) -> Result<Value, Fail> {
+    act(hub, d, "ready", caller).await
+}
+
 /// The author's actions (and commandeering): `ready`, `abandon`, `reclaim`, `commandeer`.
 async fn act(hub: &Hub, d: &Diff, action: &str, caller: &Caller) -> Result<Value, Fail> {
     let who = author_of(&caller.name, Some(caller.kind)).0;
