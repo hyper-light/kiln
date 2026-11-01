@@ -2193,10 +2193,27 @@ impl Registry {
                     let json = serde_json::to_string(&spec)?;
                     // Its runner answers once it started it (docs/wire.md, "Commands").
                     use crate::wire::commands::Answer;
-                    match hub.command(machine, &ServerMsg::HarnessOpen { session: id.clone(), json }, crate::hub::COMMAND_WITHIN).await {
+                    let ask = ServerMsg::HarnessOpen { session: id.clone(), json };
+                    let mut answer = hub.command(machine, &ask, crate::hub::COMMAND_WITHIN).await;
+                    // U04/U17: its answer lost (its link's Live commands ended: moments after it
+                    // connects, a runner's first strict Caps starts a new generation; or its link
+                    // dropped), a runner that takes a session's id once (CAP_OPEN_ONCE) is asked
+                    // again under the same id: it never starts it twice, and says if it started it.
+                    let mut lost = None;
+                    if let Answer::Unanswered { why } = &answer
+                        && hub.runner_wide_caps(machine) & crate::proto::CAP_OPEN_ONCE != 0
+                    {
+                        lost = Some(why.clone());
+                        answer = hub.command(machine, &ask, crate::hub::COMMAND_WITHIN).await;
+                    }
+                    match answer {
                         Answer::Taken | Answer::Sent | Answer::Parked => {}
                         Answer::Refused { why, .. } => anyhow::bail!("{machine} refused to start it: {why}"),
-                        Answer::Unreachable { .. } => anyhow::bail!("machine {machine} is not connected"),
+                        Answer::Unreachable { .. } => match lost {
+                            // Away now, after its first answer was lost: still unknown.
+                            Some(why) => anyhow::bail!("{machine} may or may not have started it: {why}"),
+                            None => anyhow::bail!("machine {machine} is not connected"),
+                        },
                         Answer::Unanswered { why } => anyhow::bail!("{machine} may or may not have started it: {why}"),
                     }
                     let now = crate::util::now_ms();
