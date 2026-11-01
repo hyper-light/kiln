@@ -2643,10 +2643,18 @@ fn u01_firecracker_pool_uses_guest_capacity_and_fences_legacy_grants() -> Result
 
 // ------------------------------------------------------------------ overflow (W28-R80)
 
-/// A `k8s` pool whose legs may go, `after` their pods are late, to Linux runners with cargo.
+/// A `k8s` pool whose legs may go, `after` their pods are late, to Linux runners with cargo. Its
+/// pods are launched with 2 CPUs: a pod made for a leg is the pool's shape, never one the leg's
+/// request makes up (U01), so it fits the legs here.
 fn overflow_pool(after: &str) -> Result<super::pools::Pool, String> {
     let overflow = super::pools::OverflowSpec { hosts: "os == linux && tools has cargo".into(), after: Some(after.into()) };
-    PoolSpec { name: "pods".into(), executor: "k8s".into(), labels: vec!["pod".into()], max: Some(4), idle_timeout: Some("1m".into()), overflow: Some(overflow), ..PoolSpec::default() }.pool()
+    sized(PoolSpec { name: "pods".into(), executor: "k8s".into(), labels: vec!["pod".into()], max: Some(4), idle_timeout: Some("1m".into()), overflow: Some(overflow), ..PoolSpec::default() }.pool()?)
+}
+
+/// A `k8s` pool's pods launched with 2 CPUs (U01).
+fn sized(mut p: super::pools::Pool) -> Result<super::pools::Pool, String> {
+    p.request = Resources { cpu: 2.0, ..Resources::default() };
+    Ok(p)
 }
 
 /// A Linux runner, bare metal, with cargo or without.
@@ -2713,7 +2721,7 @@ fn w28_r80_pods_on_time_and_pools_without_overflow_keep_their_legs() -> Result<(
     assert!(on.len() == 1 && on.iter().all(|r| r.starts_with("pod-")), "in its pod: {on:?}");
     assert!(sim.overflows.is_empty() && sim.sched.overflowed("rust").is_none(), "{:?}", sim.overflows);
 
-    let plain = PoolSpec { overflow: None, name: "pods".into(), executor: "k8s".into(), labels: vec!["pod".into()], max: Some(4), ..PoolSpec::default() }.pool()?;
+    let plain = sized(PoolSpec { overflow: None, name: "pods".into(), executor: "k8s".into(), labels: vec!["pod".into()], max: Some(4), ..PoolSpec::default() }.pool()?)?;
     let mut sim = Sim::new(Config { pools: vec![plain], ..Config::default() });
     sim.executor_start_ms = 30 * MIN;
     sim.runner(0, metal("forge", 4, true));
