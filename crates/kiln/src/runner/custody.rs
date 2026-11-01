@@ -1321,12 +1321,13 @@ fn runs_answered(link: &str, f: &mut LinkFrames) -> Vec<(String, Subject, Value,
 /// as they came (`thing`); one that differs from the record (a frame dropped, swapped or changed on
 /// the way, which the link's end couldn't read) told to kiln too, as a break naming the relay.
 fn reach_receipt(link: &str, relay: &str, thing: Subject, record: &Value, changed: bool) {
-    use kiln_ci::identity::relay::{FRAMES, Unrelayed};
+    use kiln_ci::identity::relay::{FRAMES, Unrelayed, frames_of};
     if changed {
         let was = statement_of(record).and_then(|s| s.subject.first().and_then(|t| t.digest.get(FRAMES).cloned())).unwrap_or_default();
         let now = thing.digest.get(FRAMES).cloned().unwrap_or_default();
         let u = Unrelayed::Changed { relay: relay.to_owned(), thing: thing.name.clone(), algorithm: FRAMES.to_owned(), was, now };
-        relay_break(Some(record), relay, &u, &format!("reach link {link}: its frames as they came, which its end couldn't read"));
+        let (came, named) = (frames_of(&thing).map_or(0, |(_, n)| n), statement_of(record).and_then(|s| s.subject.first().and_then(frames_of)).map_or(0, |(_, n)| n));
+        relay_break(Some(record), relay, &u, &format!("reach link {link}: its frames as they came ({came} of the {named} kiln's record names), which its end couldn't read"));
     }
     relay_receipt(relay, vec![thing], &digest_of(record), "a reach link's frames, as they came", Vec::new());
 }
