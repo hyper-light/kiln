@@ -2446,6 +2446,19 @@ impl Hub {
                 let own = inv.sessions.clone();
                 inv.sessions.extend(others);
                 self.harness.inventory(self, agent, me.as_deref(), &present, inv);
+                // Those it holds that still read disconnected: its link dropped and came back, and
+                // they've had nothing to say since. Their snapshots bring them back as they are.
+                let stale = self.harness.still_disconnected(agent, &own);
+                if !stale.is_empty() {
+                    tracing::info!(machine = %agent, sessions = stale.len(), "sessions its runner holds still read disconnected after it reconnected: asking for their snapshots");
+                    for id in stale {
+                        let hub = Arc::clone(self);
+                        crate::rt::spawn(async move {
+                            let sent = hub.harness.command(&hub, &id, crate::harness::model::Command::Snapshot).await;
+                            tracing::debug!(session = %id, ?sent, "asked a session still read disconnected for its snapshot");
+                        });
+                    }
+                }
                 // Hand-overs dropped as it went away get their word now it's back.
                 self.handovers_dropped(agent, peer, &own).await;
                 self.check_retire().await;
