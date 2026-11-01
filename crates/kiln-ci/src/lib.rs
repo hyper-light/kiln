@@ -33,6 +33,7 @@
 //! - [`work`]: fingerprints for doing the least work a change needs (W24).
 
 pub mod attest;
+pub mod catalog;
 pub mod compare;
 pub mod conflicts;
 pub mod dockerfile;

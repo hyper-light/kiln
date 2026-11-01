@@ -498,6 +498,8 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/ci/actions", "runs.read", At::Anywhere),
     r("GET", "/api/ci/actions/policy", "runs.read", At::RepoQuery),
     any("/api/ci/actions/policy", "settings.manage", At::RepoQuery),
+    // One action or reusable workflow of the catalog (W29-R20).
+    r("GET", "/api/ci/actions/*/*", "runs.read", At::Anywhere),
     any("/api/ci/actions/**", "settings.manage", At::Server),
     r("GET", "/api/ci/oidc/subject", "runs.read", At::ScopeQuery),
     any("/api/ci/oidc/subject", "settings.manage", At::ScopeQuery),

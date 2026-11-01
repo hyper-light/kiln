@@ -78,6 +78,12 @@ impl Remote {
         format!("/_kiln/actions/{}{}/{}/{sha}.tar.gz", if self.native { "kiln/" } else { "" }, self.owner, self.repo)
     }
 
+    /// Its name without its ref: `kiln://owner/repo/path`, `owner/repo/path`.
+    fn named(&self) -> String {
+        let path = if self.path.is_empty() { String::new() } else { format!("/{}", self.path) };
+        format!("{}{}{path}", if self.native { "kiln://" } else { "" }, self.full())
+    }
+
     /// Whether its name leads to one of kiln's own repositories: `kiln://`, or a plain name a
     /// native `[[ci.actions.sources]]` sends there (W29-R18).
     fn hosted(&self, hub: &Hub) -> bool {
@@ -95,7 +101,7 @@ impl Remote {
         // One kiln doesn't host: pinning it says so.
         let Some(publisher) = hub.store.repos().await.map_err(|e| format!("{e:#}"))?.into_iter().find(|x| x.name.eq_ignore_ascii_case(&name)) else { return Ok(()) };
         let access = super::sharing::access_of(hub, &publisher).await;
-        kiln_ci::sharing::allows(access, &publisher.name, caller).map_err(|why| format!("KCI4022 {why}"))
+        kiln_ci::sharing::allows(access, &publisher.name, caller).map_err(|why| format!("KCI4022 `{}`: {why}", self.named()))
     }
 }
 
@@ -561,8 +567,10 @@ pub async fn tarball(hub: &Arc<Hub>, rest: &[&str], req: &Request) -> Result<Res
 }
 
 /// `/api/ci/actions…` (W07-R04, W07-R12), behind the console's auth:
-/// - `GET /api/ci/actions?q=`: the mirrored actions, with versions and `action.yml` inputs and
-///   outputs (the editor's completion);
+/// - `GET /api/ci/actions?q=&kind=&owner=&repo=`: the built-ins, the mirrored actions, with
+///   versions and `action.yml` inputs and outputs (the editor's completion), and what kiln's own
+///   repositories share (W29-R20), those `repo`'s workflows may use with it;
+/// - `GET /api/ci/actions/:owner/:repo?path=`: one's versions, access and consumers (W29-R20);
 /// - `GET /api/ci/actions/policy[?repo=]`: the server's policy and a repository's;
 /// - `PUT /api/ci/actions/policy?repo=` `{allow, deny, require_sha_pins}`, `DELETE` to drop it;
 /// - `POST /api/ci/actions/sync`: mirror `[ci.actions] prefetch` now.
@@ -570,14 +578,33 @@ pub async fn route(hub: &Hub, method: &http::Method, rest: &[&str], q: &std::col
     let fail = |e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"));
     match (method, rest) {
         (&http::Method::GET, []) => {
-            // The built-ins first, then what the mirrors hold (W07-R12).
-            let want = q.get("q").map(|s| s.to_ascii_lowercase()).unwrap_or_default();
-            let mut list: Vec<Value> = crate::runner::builtins::catalog().as_array().cloned().unwrap_or_default().into_iter().filter(|b| b.get("uses").and_then(Value::as_str).is_some_and(|u| u.contains(&want))).collect();
-            list.extend(catalog(hub, q.get("q").map(String::as_str).unwrap_or_default()).await);
+            let filter = kiln_ci::catalog::Filter { q: q.get("q").cloned().unwrap_or_default(), kind: q.get("kind").cloned().unwrap_or_default(), owner: q.get("owner").cloned().unwrap_or_default() };
+            let (kind, owner) = (filter.kind.trim().to_ascii_lowercase(), filter.owner.trim().to_ascii_lowercase());
+            // The built-ins first (kiln's own, of no kind), then what the mirrors hold (W07-R12),
+            // then what kiln's own repositories share (W29-R20).
+            let want = filter.q.to_ascii_lowercase();
+            let mut list: Vec<Value> = if kind.is_empty() && (owner.is_empty() || owner == "kiln") {
+                crate::runner::builtins::catalog().as_array().cloned().unwrap_or_default().into_iter().filter(|b| b.get("uses").and_then(Value::as_str).is_some_and(|u| u.contains(&want))).collect()
+            } else {
+                Vec::new()
+            };
+            let mirrored = catalog(hub, &filter.q).await.into_iter().filter(|e| {
+                let of = e.get("uses").and_then(Value::as_str).and_then(|u| u.split('/').next()).unwrap_or_default().to_ascii_lowercase();
+                let using = e.pointer("/action/using").and_then(Value::as_str).map(kiln_ci::catalog::kind_of);
+                // A native owner's are kiln's own, listed as such below.
+                !hub.cfg.ci.actions.source_of(&of).is_some_and(|s| s.native) && (owner.is_empty() || of == owner) && (kind.is_empty() || using.as_deref() == Some(kind.as_str()))
+            });
+            list.extend(mirrored);
+            let caller = q.get("repo").map(String::as_str).filter(|r| !r.is_empty());
+            list.extend(Box::pin(super::catalog::hosted(hub, &filter, caller)).await.iter().filter_map(|e| serde_json::to_value(e).ok()));
             Ok(srv::json(StatusCode::OK, &json!({ "actions": list })))
         }
         // W07-R10: the built-in actions' metadata.
         (&http::Method::GET, ["kiln"]) => Ok(srv::json(StatusCode::OK, &json!({ "actions": crate::runner::builtins::catalog() }))),
+        (&http::Method::GET, [owner, repo]) if plain_name(owner) && plain_name(repo) => {
+            let one = Box::pin(super::catalog::one(hub, owner, repo, q.get("path").map(String::as_str))).await?;
+            Ok(srv::json(StatusCode::OK, &one))
+        }
         (&http::Method::POST, ["sync"]) => {
             let mut done = Vec::new();
             for uses in &hub.cfg.ci.actions.prefetch {

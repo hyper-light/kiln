@@ -900,7 +900,6 @@ mod tests {
     /// What §4.1 names that isn't built yet: W24's work operations, and W29's catalog, releases,
     /// locks and switch (docs/ci.md W29-R15–R25), specified before they're built.
     const LEFT: &[&str] = &[
-        "ci.actions.get",
         "ci.locks.update",
         "ci.locks.verify",
         "ci.releases.tag",

@@ -715,10 +715,20 @@ pub fn ops() -> &'static [Op] {
                     let name = text(&v, "integration")?;
                     if super::integrations::delete(&cx.hub, &name, &by(&cx)).await.map_err(internal)? { Ok(json!({ "deleted": true })) } else { Err((StatusCode::NOT_FOUND, format!("no integration `{name}`"))) }
                 }),
-            op!("ci.actions.list", "The actions catalog (W07-R12): the mirrored actions and their versions and pinned commits, searched by `q`.", ro: true, destructive: false,
+            op!("ci.actions.list", "The actions catalog (W07-R12, W29-R20): kiln's built-ins, the mirrored actions with their versions and pinned commits, and the actions and reusable workflows kiln's own repositories share, each with its kind, inputs, outputs, secrets and access; with `repo`, only those its workflows may use. Searched by `q`, `kind` (javascript, composite, docker, firecracker, shards, workflow) and `owner`.", ro: true, destructive: false,
                 input: Input::of::<input::CiActionsList>(),
-                route: |v| Ok((Method::GET, path(&["actions"]), query(v, &["q"]))),
-                run: |cx: Cx, v: Value| async move { answer(super::actions::route(&cx.hub, &Method::GET, &[], &query(&v, &["q"]), Value::Null).await).await }),
+                route: |v| Ok((Method::GET, path(&["actions"]), query(v, &["q", "kind", "owner", "repo"]))),
+                run: |cx: Cx, v: Value| async move { answer(super::actions::route(&cx.hub, &Method::GET, &[], &query(&v, &["q", "kind", "owner", "repo"]), Value::Null).await).await }),
+            op!("ci.actions.get", "One repository's actions and reusable workflows in the catalog (W29-R20), the one at `path` with it: its versions (its tags, each with its commit and its own runs' conclusions there), its access (who may use it), and its consumers (which repositories' runs pinned which version).", ro: true, destructive: false,
+                input: Input::of::<input::CiActionsGet>(),
+                route: |v| {
+                    let (owner, name) = owner_name(v)?;
+                    Ok((Method::GET, path(&["actions", &owner, &name]), query(v, &["path"])))
+                },
+                run: |cx: Cx, v: Value| async move {
+                    let (owner, name) = owner_name(&v)?;
+                    answer(super::actions::route(&cx.hub, &Method::GET, &[owner.as_str(), name.as_str()], &query(&v, &["path"]), Value::Null).await).await
+                }),
             op!("ci.actions.kiln", "kiln's own actions (`kiln/<name>@v1`): what each does and takes.", ro: true, destructive: false,
                 input: Input::of::<input::CiActionsKiln>(),
                 route: |_| Ok((Method::GET, path(&["actions", "kiln"]), HashMap::new())),
@@ -2144,6 +2154,22 @@ pub mod input {
     #[serde(deny_unknown_fields)]
     pub struct CiActionsList {
         pub q: Option<String>,
+        /// `javascript`, `composite`, `docker`, `firecracker`, `shards` or `workflow` (W29-R20).
+        pub kind: Option<String>,
+        /// The owner whose repositories share them (`acme`).
+        pub owner: Option<String>,
+        /// The repository whose workflows would use them: only what it may (W29-R17).
+        pub repo: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CiActionsGet {
+        /// The repository (`acme/kit`).
+        pub repo: String,
+        /// An action's directory (`""` at the root) or a reusable workflow's file; left out, all
+        /// of the repository's.
+        pub path: Option<String>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
