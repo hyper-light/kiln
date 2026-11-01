@@ -334,12 +334,24 @@ fn until_run(s: &Server, repo: &str, what: &str, pick: impl Fn(&Value) -> bool) 
 /// A repository kiln hosts, cloned under `dir` as `name`'s last part, its first commit (README)
 /// pushed and polled.
 fn hosted(s: &Server, home: &Path, dir: &Path, name: &str) -> anyhow::Result<std::path::PathBuf> {
+    hosted_with(s, home, dir, name, &[])
+}
+
+/// [`hosted`], `files` in its first commit too.
+fn hosted_with(s: &Server, home: &Path, dir: &Path, name: &str, files: &[(&str, &str)]) -> anyhow::Result<std::path::PathBuf> {
     let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": name, "mode": "native" })))?;
     anyhow::ensure!(st == 200, "{name}: {st} {body}");
     let leaf = name.rsplit('/').next().unwrap_or(name);
     git(home, dir, &["clone", "-q", &format!("http://x:{}@127.0.0.1:{}/git/{name}.git", s.admin, s.port), leaf])?;
     let work = dir.join(leaf);
     std::fs::write(work.join("README.md"), format!("{name}\n"))?;
+    for (path, text) in files {
+        let p = work.join(path);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(p, text)?;
+    }
     git(home, &work, &["add", "."])?;
     git(home, &work, &["commit", "-qm", "first"])?;
     git(home, &work, &["push", "-q", "origin", "main"])?;
@@ -410,7 +422,8 @@ fn w29_r10_no_other_repository_uses_a_draft() -> anyhow::Result<()> {
     let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", extra: "" })?;
     let home = dir.path().join("githome");
     std::fs::create_dir_all(&home)?;
-    let kit = hosted(&s, &home, dir.path(), "acme/kit")?;
+    // Shared with its owner's repositories (W29-R17): a draft is refused all the same.
+    let kit = hosted_with(&s, &home, dir.path(), "acme/kit", &[(".kiln/config.yaml", "share: owner\n")])?;
     let action = |said: &str| format!("name: x\nruns:\n  using: composite\n  steps:\n    - run: echo {said}\n      shell: bash\n");
     push_files(&home, &kit, "main", &[(".github/actions/x/action.yml", &action("published"))])?;
     let drafted = push_files(&home, &kit, "kiln/draft/x-01a19f2c", &[(".github/actions/x/action.yml", &action("drafted"))])?;

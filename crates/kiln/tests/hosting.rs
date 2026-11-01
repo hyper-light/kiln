@@ -2232,8 +2232,8 @@ fn w03_r09_native_activity_and_kiln_events() -> anyhow::Result<()> {
 }
 
 /// W07-R01's `kiln://owner/repo/path@ref`: an action in one of kiln's own repositories, pinned at
-/// run start from kiln's own git and run like GitHub's; its owner's repositories' to use, so
-/// another owner's workflow fails at the start with why.
+/// run start from kiln's own git and run like GitHub's; shared with its owner's repositories
+/// (`share: owner`, W29-R17), so another owner's workflow fails at the start with why.
 #[test]
 fn w07_r01_kiln_actions() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -2262,7 +2262,7 @@ fn w07_r01_kiln_actions() -> anyhow::Result<()> {
         must(git(&home, &work, &["push", "-q", &url, "main", "--tags"]), "push")?;
         Ok(())
     };
-    push("acme/tools", &[("hello/action.yml", "name: hello\ninputs:\n  who: { required: true }\nruns:\n  using: composite\n  steps:\n    - shell: bash\n      run: echo \"hello from kiln tools to ${{ inputs.who }}\"\n")], Some("v1"))?;
+    push("acme/tools", &[("hello/action.yml", "name: hello\ninputs:\n  who: { required: true }\nruns:\n  using: composite\n  steps:\n    - shell: bash\n      run: echo \"hello from kiln tools to ${{ inputs.who }}\"\n"), (".kiln/config.yaml", "share: owner\n")], Some("v1"))?;
     let using = "on: push\njobs:\n  j:\n    runs-on: local\n    steps:\n      - uses: kiln://acme/tools/hello@v1\n        with:\n          who: ${{ github.repository }}\n";
     // The first push only records refs; the workflow comes with the second.
     for name in ["acme/app", "other/app"] {
@@ -2287,6 +2287,10 @@ fn w07_r01_kiln_actions() -> anyhow::Result<()> {
         let Some(r) = runs.pointer("/runs/0").filter(|r| r.get("finished_at").is_some_and(|f| !f.is_null())) else { return Ok(None) };
         let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{}", text(r, "id")), &s.admin, None)?;
         let leg = serde_json::from_str::<Value>(&detail)?.pointer("/legs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+        // One refused as it starts has no legs: its error says why.
+        if leg.is_empty() {
+            return Ok(Some((text(r, "conclusion").to_owned(), text(r, "error").to_owned())));
+        }
         let (_, l) = http(s.port, "GET", &format!("/api/ci/legs/{leg}"), &s.admin, None)?;
         let l: Value = serde_json::from_str(&l)?;
         let notes: Vec<String> = l.get("annotations").and_then(Value::as_array).into_iter().flatten().filter_map(|a| a.get("message").and_then(Value::as_str).map(str::to_owned)).collect();
@@ -2307,8 +2311,8 @@ fn w07_r01_kiln_actions() -> anyhow::Result<()> {
     };
     assert_eq!(ours.0, "success", "{}", ours.1);
     assert!(ours.1.contains("hello from kiln tools to acme/app"), "{}", ours.1);
-    assert_eq!(theirs.0, "failure", "{}", theirs.1);
-    assert!(theirs.1.contains("another owner's repository"), "{}", theirs.1);
+    assert_eq!(theirs.0, "startup_failure", "{}", theirs.1);
+    assert!(theirs.1.contains("KCI4022") && theirs.1.contains("isn't shared with `other/app`"), "{}", theirs.1);
     Ok(())
 }
 

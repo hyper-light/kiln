@@ -45,6 +45,11 @@ pub async fn files(hub: &Hub, repo: &Repo, sha: &str, wf: &Workflow) -> HashMap<
             continue;
         }
         let Some(r) = Remote::parse(&uses) else { continue };
+        // One its caller may not use isn't read: the run's resolution refuses it (W29-R19).
+        if let Err(why) = r.usable_by(hub, &repo.name).await {
+            tracing::debug!(uses = %uses, %why, "a reusable workflow its caller may not use");
+            continue;
+        }
         match remote(hub, &r).await {
             Ok(w) => {
                 todo.extend(calls(&w).into_iter().map(|u| (u, depth + 1)));

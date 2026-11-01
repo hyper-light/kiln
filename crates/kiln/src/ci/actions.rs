@@ -78,14 +78,24 @@ impl Remote {
         format!("/_kiln/actions/{}{}/{}/{sha}.tar.gz", if self.native { "kiln/" } else { "" }, self.owner, self.repo)
     }
 
-    /// Whether a workflow of `caller` may use it: one of kiln's own repositories is its owner's
-    /// own repositories' to use, as GitHub's private actions are their owner's (W07-R01).
-    pub(crate) fn usable_by(&self, caller: &str) -> Result<(), String> {
-        let theirs = caller.split('/').next().unwrap_or_default();
-        if self.native && !self.owner.eq_ignore_ascii_case(theirs) {
-            return Err(format!("`kiln://{}` is another owner's repository: {caller}'s workflows use `kiln://` actions of `{theirs}/`'s repositories", self.full()));
+    /// Whether its name leads to one of kiln's own repositories: `kiln://`, or a plain name a
+    /// native `[[ci.actions.sources]]` sends there (W29-R18).
+    fn hosted(&self, hub: &Hub) -> bool {
+        self.native || hub.cfg.ci.actions.source_of(&self.owner).is_some_and(|s| s.native)
+    }
+
+    /// Whether workflows of repository `caller` may use it (docs/ci.md W29-R17, R19): one of
+    /// kiln's own repositories as its Access says, for an action and a reusable workflow alike;
+    /// GitHub's own are GitHub's to allow. A refusal is KCI4022's.
+    pub(crate) async fn usable_by(&self, hub: &Hub, caller: &str) -> Result<(), String> {
+        if !self.hosted(hub) {
+            return Ok(());
         }
-        Ok(())
+        let name = self.full();
+        // One kiln doesn't host: pinning it says so.
+        let Some(publisher) = hub.store.repos().await.map_err(|e| format!("{e:#}"))?.into_iter().find(|x| x.name.eq_ignore_ascii_case(&name)) else { return Ok(()) };
+        let access = super::sharing::access_of(hub, &publisher).await;
+        kiln_ci::sharing::allows(access, &publisher.name, caller).map_err(|why| format!("KCI4022 {why}"))
     }
 }
 
@@ -193,6 +203,9 @@ pub async fn resolve(hub: &Hub, repo: &Repo, sha: &str, wf: &Workflow) -> Result
         if let Some(why) = kiln_ci::drafts::uses_of_another(&u, &repo.name) {
             return Err(format!("KCI4023 {why}"));
         }
+        if let Some(r) = Remote::parse(&u) {
+            r.usable_by(hub, &repo.name).await?;
+        }
         let key = u.strip_prefix("./").unwrap_or(&u);
         if let Some(w) = called.get(&u).or_else(|| called.get(key)) {
             calls.extend(w.jobs.iter().filter_map(|j| j.uses.clone()).map(|x| (x, depth + 1)));
@@ -292,14 +305,12 @@ pub async fn resolve(hub: &Hub, repo: &Repo, sha: &str, wf: &Workflow) -> Result
         if depth > 9 {
             return Err(format!("`{uses}`: composite actions nest at most 10 deep"));
         }
+        r.usable_by(hub, &repo.name).await?;
         let key = (format!("{}{}", if r.native { "kiln://" } else { "" }, r.full()), r.git_ref.clone());
         let pinned = match shas.get(&key) {
             Some(s) => s.clone(),
             None => {
-                let s = match r.usable_by(&repo.name) {
-                    Ok(()) => pin(hub, &r).await.map_err(|e| format!("{e:#}")),
-                    Err(why) => Err(why),
-                };
+                let s = pin(hub, &r).await.map_err(|e| format!("{e:#}"));
                 shas.insert(key, s.clone());
                 s
             }
@@ -379,8 +390,6 @@ fn native_source(hub: &Hub, owner: &str, repo: &str) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("`kiln://{owner}/{repo}` is no repository kiln hosts"))
 }
 
-/// The commit `ref` names now, fetched into the mirror (W07-R02, W07-R03): a tag (peeled), a
-/// branch, or a full SHA. When the source can't be reached, a ref the mirror knows still works.
 /// Whether a branch or tag of `r`'s repository other than a draft's (W29-R10) reaches `sha`, as
 /// its mirror has them.
 async fn published(hub: &Hub, r: &Remote, sha: &str) -> anyhow::Result<bool> {
@@ -389,6 +398,8 @@ async fn published(hub: &Hub, r: &Remote, sha: &str) -> anyhow::Result<bool> {
     Ok(String::from_utf8_lossy(&out).lines().any(|r| !r.is_empty() && !kiln_ci::drafts::is_draft_ref(r)))
 }
 
+/// The commit `ref` names now, fetched into the mirror (W07-R02, W07-R03): a tag (peeled), a
+/// branch, or a full SHA. When the source can't be reached, a ref the mirror knows still works.
 pub(crate) async fn pin(hub: &Hub, r: &Remote) -> anyhow::Result<String> {
     pin_ref(hub, r).await.map(|(sha, _)| sha)
 }
@@ -486,13 +497,12 @@ pub async fn tarball(hub: &Arc<Hub>, rest: &[&str], req: &Request) -> Result<Res
         return Err((StatusCode::UNAUTHORIZED, "a leg's token is needed".into()));
     };
     let own = srv::query(req).get("path").cloned().filter(|_| !native);
-    if native {
-        // Its owner's repositories' legs only.
-        let mine = hub.store.repos().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?.into_iter().find(|r| r.id == leg.repo);
-        let r = Remote { owner: (*owner).to_owned(), repo: (*repo).to_owned(), path: String::new(), git_ref: String::new(), native: true };
-        if mine.is_none_or(|m| r.usable_by(&m.name).is_err()) {
-            return Err((StatusCode::FORBIDDEN, "a `kiln://` action is its owner's repositories' to use".into()));
-        }
+    let r = Remote { owner: (*owner).to_owned(), repo: (*repo).to_owned(), path: String::new(), git_ref: String::new(), native };
+    if own.is_none() && r.hosted(hub) {
+        // One of kiln's own repositories: the legs of the repositories its Access lets use it
+        // only (W29-R17).
+        let mine = hub.store.repos().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?.into_iter().find(|x| x.id == leg.repo).map(|x| x.name).unwrap_or_default();
+        r.usable_by(hub, &mine).await.map_err(|why| (StatusCode::FORBIDDEN, why))?;
     }
     let (path, key, mirror_dir, args) = match &own {
         Some(p) => {
@@ -703,19 +713,18 @@ mod tests {
         assert!(["dotfiles", ".github", "a.b-c_d"].iter().all(|n| plain_name(n)) && ["", ".", "..", "a/b", "a b"].iter().all(|n| !plain_name(n)));
     }
 
-    /// W07-R01: `kiln://owner/repo[/path]@ref`, one of kiln's own repositories, its owner's
-    /// repositories' to use, mirrored and served apart from GitHub's of the same name.
+    /// W07-R01: `kiln://owner/repo[/path]@ref`, one of kiln's own repositories, mirrored and
+    /// served apart from GitHub's of the same name; who may use it is its Access (W29-R17).
+    /// `tests/sharing.rs` holds `usable_by` to that.
     #[test]
     fn w07_r01_kiln_forms() {
         let r = Remote::parse("kiln://acme/tools/lint@v2");
         assert_eq!(r, Some(Remote { owner: "acme".into(), repo: "tools".into(), path: "lint".into(), git_ref: "v2".into(), native: true }));
         let r = r.unwrap_or_else(|| Remote { owner: String::new(), repo: String::new(), path: String::new(), git_ref: String::new(), native: true });
-        assert!(r.usable_by("acme/app").is_ok() && r.usable_by("ACME/web").is_ok());
-        assert!(r.usable_by("other/app").is_err_and(|e| e.contains("another owner's")));
+        assert_eq!(r.full(), "acme/tools");
         assert_eq!(r.url(&"a".repeat(40)), format!("/_kiln/actions/kiln/acme/tools/{}.tar.gz", "a".repeat(40)));
-        // GitHub's `acme/tools` is anyone's to use, and lives apart.
+        // GitHub's `acme/tools` lives apart.
         let gh = Remote { native: false, ..r.clone() };
-        assert!(gh.usable_by("other/app").is_ok());
         assert_eq!(gh.url(&"a".repeat(40)), format!("/_kiln/actions/acme/tools/{}.tar.gz", "a".repeat(40)));
     }
 }
