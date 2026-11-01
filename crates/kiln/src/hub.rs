@@ -1875,7 +1875,7 @@ impl Hub {
         use crate::wire::channel::{Arrival, Frame, Refusal};
         match frame {
             Frame::Item { stream, seq, low, body } => {
-                let answer = match self.wire.on_item(agent, &stream, seq, low, body) {
+                let answer = match self.wire.on_item(agent, &stream, seq, low, body, Instant::now()) {
                     Arrival::Take(body) => {
                         let refusal = match proto::read_agent(&body) {
                             Ok(AgentMsg::Wire(_)) => {

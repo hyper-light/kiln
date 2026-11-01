@@ -319,6 +319,8 @@ enum Ev {
     Forwarded(Vec<u8>),
     /// A test build's fault: the connection drops (W22-AC04).
     ChaosDrop,
+    /// A gap in the server's commands it asked for is still there: it asks again.
+    Wants,
     /// A test build's fault: a frame held back, due now (W22-AC04).
     Delayed(crate::runner::chaos::Due),
 }
@@ -1595,7 +1597,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // The server's commands on the channel (`crate::wire::commands`): what this runner has of
     // each stream; and the one being applied, answered at the top of the next turn of the loop
     // (however its arm ended), taken unless its arm refused it.
-    let mut wire_in = crate::wire::channel::Receiver::new();
+    let mut wire_in = crate::wire::channel::Receiver::timed();
     // Which of the server's command streams are current: an item of one let go of is dropped.
     let mut wire_current = crate::wire::commands::Current::new();
     let mut answer_after: Option<(String, u64, Option<(crate::wire::channel::Refusal, String)>)> = None;
@@ -1828,6 +1830,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             () = watchdog.tick().fuse() => Ev::Watchdog,
             () = sleep_until_opt(redial).fuse() => Ev::Redial,
             () = sleep_until_opt(chaos_drop).fuse() => Ev::ChaosDrop,
+            () = sleep_until_opt(wire_in.want_due().filter(|_| connected && server_wire)).fuse() => Ev::Wants,
             d = recv_opt(delayed.as_ref()).fuse() => match d { Some(due) => Ev::Delayed(due), None => Ev::Watchdog },
             t = term_rx.recv().fuse() => match t { Ok((s, out)) => Ev::Term(s, out), Err(_) => Ev::Watchdog },
             up = up_rx.recv().fuse() => match up { Ok(u) => Ev::Up(u), Err(_) => Ev::Watchdog },
@@ -1877,6 +1880,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 } else if kind != Kind::Term && !again {
                     buffered += data.len();
                     buffer.push_back((lane, kind, data));
+                }
+            }
+            Ev::Wants => {
+                // Never waiting for the uplink's room: this loop is what drains it, and a want it
+                // has no room for now is asked again on the gap's clock.
+                for f in wire_in.wants(Instant::now()) {
+                    let _ = uplink.0.try_send(Up::Term(AgentMsg::Wire(f)));
                 }
             }
             Ev::ChaosDrop => {
@@ -2656,8 +2666,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
                 connected = false;
                 welcomed = false;
-                // The channel's items in flight go again once the server says what it has.
+                // The channel's items in flight go again once the server says what it has, and
+                // the server's from what this side says it has.
                 updates.down();
+                wire_in.down();
                 server_wire = false;
                 server_drops = false;
                 server_unread = false;
@@ -2717,7 +2729,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 crate::wire::commands::Stand::Newer(prefix) => wire_in.forget_where(|s| s != stream && crate::wire::commands::prefix_of(s) == Some(prefix)),
                                 crate::wire::commands::Stand::Current => {}
                             }
-                            let answer = match wire_in.on_item(&stream, seq, low, body) {
+                            let answer = match wire_in.on_item(&stream, seq, low, body, Instant::now()) {
                                 Arrival::Take(body) => match proto::read_server(&body) {
                                     Ok(ServerMsg::Wire(_)) => {
                                         let why = "a channel frame inside a command";
