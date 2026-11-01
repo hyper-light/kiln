@@ -3115,6 +3115,9 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
     // A setting its harness takes when it starts (where its commands run) changed: it starts
     // again once nothing is under way.
     let mut reloading = false;
+    // Its harness ran here, a process of its own: one that never did has no group of processes
+    // here to end when it lets go.
+    let mut ran_here = false;
     // Tasks the harness left running that a switch stopped.
     let mut left = 0usize;
     // The models it last listed (the machine keeps the list for its "new agent" and switches): not
@@ -3235,6 +3238,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
             Err(e) => error = Some(format!("{e:#}")),
             Ok(mut p) => {
                 *s.pid.lock() = Some(p.pid);
+                ran_here = true;
                 if adopted {
                     let mut core = s.core.lock();
                     // An older image may have left what the harness before a switch ran looking live.
@@ -4003,7 +4007,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     if !left.is_empty() {
                         let _ = crate::rt::blocking(move || left.iter().for_each(super::survivors::stop_tree)).await;
                     }
-                    if let Some(g) = crate::os::contain::Group::existing(&s.id) {
+                    // Gone on elsewhere without its harness ever running here (it couldn't start),
+                    // it has no group here: one under its id is the machine's it went on to, when
+                    // both kiln processes share a cgroup (a test's server and its runners), its
+                    // harness starting there, and isn't ended from here.
+                    if let Some(g) = crate::os::contain::Group::existing(&s.id).filter(|_| ran_here || !matches!(ctl, Some(Ctl::LetGo))) {
                         end_group(g, Duration::ZERO);
                     }
                     if matches!(ctl, Some(Ctl::LetGo)) {

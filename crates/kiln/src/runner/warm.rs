@@ -338,6 +338,10 @@ pub fn budget(work: &Path) -> Budget {
         Some((size, _)) if size > 0 => ((size / 4).min(512 << 30), (size / 10).min(100 << 30)),
         _ => (64 << 30, 10 << 30),
     };
+    // kiln's own tests keep no floor of the machine's volume unless they set one: theirs is shared
+    // with whatever else fills it (a gate's host at 70 GiB free ran every warm leg cold). The
+    // floor's own tests give their budgets one.
+    let floor = if cfg!(test) { 0 } else { floor };
     Budget { runner: env("KILN_WARM_MAX").unwrap_or(runner), floor: env("KILN_WARM_FLOOR").unwrap_or(floor), slots: SLOTS }
 }
 

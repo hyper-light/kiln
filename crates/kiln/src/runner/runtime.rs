@@ -1474,6 +1474,8 @@ impl Leg {
             }
         }
         let deadline = Instant::now() + Duration::from_secs(u64::from(a.timeout_minutes.max(1)) * 60);
+        // It can be frozen where it runs while it runs here (W26-R22); its time limit stops then.
+        let _freezing = super::freeze::begin(&a.job_id);
         let mut timed_out = false;
         let executor_container = a.executor.kind == "docker" && a.executor.image.is_some();
         if (a.job_container.is_some() || !a.job_services.is_empty() || executor_container) && !self.init_containers(&mut st).await {
@@ -1525,6 +1527,10 @@ impl Leg {
         }
         // What a terminal into the leg opens (W17-R01): its workspace and environment, or its
         // container.
+        // Its job container is what a freeze pauses (W26-R22).
+        if let (Some(f), Some((cli, id))) = (super::freeze::of(&a.job_id), st.containers.as_ref().and_then(|c| c.job.as_ref().map(|j| (c.cli.clone(), j.id.clone())))) {
+            f.container(cli, id);
+        }
         let mut shell_env = self.env_vars(&st);
         shell_env.extend(st.env.iter().map(|(k, v)| (k.clone(), v.clone())));
         let exec = st.containers.as_ref().and_then(|c| c.job.as_ref().map(|j| (c, j))).map(|(c, j)| {
@@ -1557,7 +1563,9 @@ impl Leg {
             let idx = u32::try_from(idx).unwrap_or(u32::MAX);
             if self.cancel.is_cancelled() {
                 st.cancelled = true;
-                after_cancel.get_or_insert_with(|| Instant::now() + CLEANUP_TIME);
+                // Frozen (W26-R22), it's let go on to end: its cleanup isn't stopped as it starts.
+                super::freeze::thaw(&a.job_id).await;
+                after_cancel.get_or_insert_with(|| super::freeze::base(&a.job_id, Instant::now() + CLEANUP_TIME));
                 st.cleanup = true;
             }
             let bound = after_cancel.map_or(deadline, |c| c.min(deadline));
@@ -1570,7 +1578,7 @@ impl Leg {
                 continue;
             }
             let end = bg.drive(self.step(&mut st, idx, step, bound, false)).await;
-            if end == Some(End::TimedOut) && Instant::now() >= deadline {
+            if end == Some(End::TimedOut) && Instant::now() >= super::freeze::effective(&a.job_id, deadline) {
                 timed_out = true;
                 st.failed = true;
                 self.note(idx, &format!("The job running on runner {} has exceeded the maximum execution time of {} minutes.", self.runner_name, a.timeout_minutes)).await;
@@ -2076,7 +2084,8 @@ impl Leg {
             memo::Prepared::Run(keyed) => keyed,
         };
         let deadline = match timeout {
-            Some(t) => job_deadline.min(Instant::now() + t),
+            // Its own time limit runs from now: the while the job was frozen before doesn't count (W26-R22).
+            Some(t) => job_deadline.min(super::freeze::base(&self.a.job_id, Instant::now() + t)),
             None => job_deadline,
         };
         // W24-R10: a `tests:` step runs its build's test binaries itself, or replays them.
@@ -2329,6 +2338,7 @@ impl Leg {
             docker_socket: false,
             docker_proxy: None,
             seccomp_unconfined: false,
+            cap_add: Vec::new(),
             user: None,
             workspace_size: None,
             memory: None,
@@ -2513,12 +2523,15 @@ impl Leg {
                 // Given the host's Docker, the leg could start any container it likes: a seccomp
                 // filter on its own would guard nothing, and it keeps debuggers from what they do
                 // on a hosted runner's machine (lldb's and gdb's `personality` to turn ASLR off).
+                // So do the capabilities profilers run with, which a hosted runner's root has
+                // (CodSpeed's memtrack, W13-R04).
                 Some(super::docker::Spec {
                     image: image.clone(),
                     user: super::docker::host_user(),
                     docker_socket: socket,
                     docker_proxy,
                     seccomp_unconfined: socket,
+                    cap_add: if socket { super::docker::PROFILER_CAPS.iter().map(|c| (*c).to_owned()).collect() } else { Vec::new() },
                     env,
                     seed_tools: true,
                     ..super::docker::Spec::default()
@@ -2792,12 +2805,17 @@ impl Leg {
             c.current_dir(wd).envs(&env);
             c
         };
+        // In its job's cgroup from its first instruction: the job can be frozen whole (W26-R22), and
+        // a kiln it starts holds its agents there, never in the runner's (the 2026-10-29 outage).
+        super::freeze::enter(&self.a.job_id, &mut cmd);
         // On the CPUs its leg may use (W05-R03): its share, the CPUs it was lent, or what no share
         // holds, from its first instruction; and moved as a share is taken or let go.
         let job = self.a.job_id.clone();
-        let _job_group = crate::os::JobGroup::enter(&job, &mut cmd);
         let mut running = super::cpus::spawn_on(&job, move || crate::proc::spawn_group(cmd))?;
         st.groups.push(running.pgid);
+        if let Some(f) = super::freeze::of(&self.a.job_id) {
+            f.step(&running);
+        }
         let _pinned = super::cpus::Step::new(&self.a.job_id, running.pgid);
         let mut oom_at = oom_after.map(|d| Instant::now() + d);
         let mut r = Reading { proc: Processor::new(st.allow_unsecure), line: Vec::new(), set_output: BTreeMap::new(), matchers: st.matchers.step(), failed: false, enospc: false };
@@ -2854,7 +2872,7 @@ impl Leg {
                 code = (&mut running.exit).fuse() => Ev::Exit(code.ok().flatten()),
                 () = cancelled.fuse() => Ev::Cancel,
                 () = stopped => Ev::Stop,
-                () = crate::rt::sleep_until(deadline).fuse() => Ev::Deadline,
+                () = crate::rt::sleep_until(super::freeze::effective(&self.a.job_id, deadline)).fuse() => Ev::Deadline,
                 () = flush.tick().fuse() => Ev::Flush,
                 () = oom.fuse() => Ev::Oom,
             };
@@ -2863,7 +2881,11 @@ impl Leg {
                 Ev::Chunk(None) => output_done = true,
                 Ev::Exit(code) => end = Some(End::Exit(code)),
                 Ev::Flush => self.partial(st, idx, &mut r).await,
+                // Frozen, or frozen before (W26-R22): its time limit didn't run then; looked at again.
+                Ev::Deadline if Instant::now() < super::freeze::effective(&self.a.job_id, deadline) => {}
                 e @ (Ev::Cancel | Ev::Deadline) => {
+                    // Frozen, it's let go on first: a stopped process can't hear it's to end.
+                    super::freeze::thaw(&self.a.job_id).await;
                     match &in_container {
                         Some(c) => signal_in(c, &mut running, &[("INT", SIGINT_GRACE), ("TERM", SIGTERM_GRACE)]).await,
                         None => crate::proc::interrupt_group(&mut running, SIGINT_GRACE, SIGTERM_GRACE).await,

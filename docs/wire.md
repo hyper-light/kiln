@@ -452,8 +452,12 @@ takes a new bit, never one that means something already, even in the other direc
 | 41 | `CAP_UNREAD` | `AgentMsg::Caps`, `ServerMsg::Caps` | this side takes word that a frame of its couldn't be read (`Unread`, "What can't be read") |
 | 42 | `CAP_WORKSPACE_COMMITS` | `AgentMsg::Caps` | the runner answers `Workspace`'s `commits`: a branch's commits since its trunk, its session's own marked, and what picked ones change together (agents.md, "Commits") |
 | 43 | `CAP_WORKSPACE_COMPARE` | `AgentMsg::Caps` | the runner answers `Workspace`'s `refs` and `compare`: a repository's branches, tags and latest commits, and what changes from one point to another (agents.md, "Compare") |
+| 53 | `CAP_FREEZE` | `AgentMsg::Caps` | the runner freezes a job it runs where it runs and lets it go on (`Freeze`: Pause and Resume, ci.md W26-R22); Unix and Windows runners say it |
 
-Bits from 44 are free. Take the next one, and add its row here in the same change.
+Bits 44 to 52 are kept for lines on their way: W27's agent git credential, leg signing and custody
+(`CAP_AGENT_GIT`, `CAP_LEG_SIGNS`, `CAP_CUSTODY`) and the unification's, which held bits from 42 on
+their branches before the Changes tab took 42 and 43. Bits from 54 are free. Take the next one, and
+add its row here in the same change.
 
 ## The lab
 
@@ -640,6 +644,7 @@ Four edges are left, and the lab steers clear of each:
 | `Observe` | carried (observe's group) | To the runner's replica: hyper-raft's messages, and the leader's word on the writes it took. | Only to a runner announcing `CAP_OBSERVE`, on lane 5. |
 | `Unread` | ack | A frame of the runner's the server couldn't read: on which wire, what it was, why, and how many more went untold before it ("What can't be read"). | New: to runners announcing `CAP_UNREAD`. |
 | `ReachRefused` | carried (reach link) | A reach frame of the runner's the relay refused: its link, the runner it was for, why in a code (`taken`, `to_itself`, `too_many`, `not_offered`, `not_accepted`, `not_connected`, `closed`) and in words. | New: to runners announcing `CAP_UNREAD`, in place of `Reach`'s `close`. |
+| `Freeze` | command, refused while away | A running leg frozen where it runs, or let go on (Pause and Resume, ci.md W26-R22): its steps' processes stopped, its job container paused, its time limit stopped. A pause that waited for its runner to come back would stop the job later than the person asked. | New: to runners announcing `CAP_FREEZE`, on the channel ("Commands"): answered once done, refused saying why (no such leg there, or one it can't stop in place). |
 
 ## Commands to a session: `Command`
 

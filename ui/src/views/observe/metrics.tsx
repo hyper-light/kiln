@@ -15,7 +15,7 @@ import { Loadable } from "@/components/ui/loading";
 import { PageIntro, SearchField, SelectField, TextField } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
 import { useRes, type Res } from "@/lib/data";
-import { errorMessage } from "@/lib/hooks";
+import { errorMessage, useFieldText } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 import { ObserveNav, PALETTE, RangePicker, aggregate, chartData, dashboardsRes, dataOf, drawnColor, formatValue, queriesRes, useParam, useRange, type Range } from "./parts";
 
@@ -31,7 +31,7 @@ export default function MetricsExplorer() {
       <title>Metrics · Observe · kiln</title>
       <PageIntro index={8} label="Observe" title="Metrics" lead="Query any metric kiln keeps, over any range it keeps: every series, grouped and combined as the query says." />
       <ObserveNav />
-      <QueryForm key={q} initial={q} onRun={setQ} />
+      <QueryForm initial={q} onRun={setQ} />
       <div className="mb-6 flex flex-wrap items-center gap-3">
         <RangePicker value={range} onChange={setRange} />
         {q && (
@@ -57,7 +57,7 @@ export default function MetricsExplorer() {
 }
 
 function QueryForm({ initial, onRun }: { initial: string; onRun: (q: string) => void }) {
-  const [draft, setDraft] = React.useState(initial);
+  const [draft, setDraft] = useFieldText(initial);
   return (
     <form
       className="mb-4 flex flex-wrap items-end gap-3"

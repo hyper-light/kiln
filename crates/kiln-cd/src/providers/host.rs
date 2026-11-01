@@ -94,10 +94,12 @@ fn unix_script(o: &Value, os: &str, url: &str) -> String {
     );
     let start = s("start");
     if os == "darwin" {
+        // Its stdout and stderr appended to files of its own, where its logs are read
+        // (`providers::logs`, docs/ci.md W26-R26): launchd keeps them nowhere by itself.
         let label = format!("dev.kiln.{svc}");
         let vars: String = env.iter().map(|(k, v)| format!("    <key>{}</key><string>{}</string>\n", xml(k), xml(v))).collect();
         sh.push_str(&format!(
-            "P=\"$HOME/Library/LaunchAgents/{label}.plist\"\nmkdir -p \"$HOME/Library/LaunchAgents\"\ncat > \"$P\" <<'KILN_PLIST'\n<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\n  <key>Label</key><string>{label}</string>\n  <key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string><string>cd \"$HOME/.kiln/services/{svcx}/current\" &amp;&amp; exec {startx}</string></array>\n  <key>EnvironmentVariables</key><dict>\n{vars}  </dict>\n  <key>KeepAlive</key><true/>\n  <key>RunAtLoad</key><true/>\n</dict></plist>\nKILN_PLIST\nlaunchctl bootout \"gui/$(id -u)/{label}\" 2>/dev/null || true\nlaunchctl bootstrap \"gui/$(id -u)\" \"$P\"\nsleep 2\nlaunchctl print \"gui/$(id -u)/{label}\" | grep -q 'state = running' || {{ echo 'the service did not start' >&2; exit 1; }}\n",
+            "P=\"$HOME/Library/LaunchAgents/{label}.plist\"\nmkdir -p \"$HOME/Library/LaunchAgents\"\ncat > \"$P\" <<'KILN_PLIST'\n<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\n  <key>Label</key><string>{label}</string>\n  <key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string><string>mkdir -p \"$HOME/.kiln/services/{svcx}/log\" &amp;&amp; cd \"$HOME/.kiln/services/{svcx}/current\" &amp;&amp; exec {startx} &gt;&gt;\"$HOME/.kiln/services/{svcx}/log/out.log\" 2&gt;&gt;\"$HOME/.kiln/services/{svcx}/log/err.log\"</string></array>\n  <key>EnvironmentVariables</key><dict>\n{vars}  </dict>\n  <key>KeepAlive</key><true/>\n  <key>RunAtLoad</key><true/>\n</dict></plist>\nKILN_PLIST\nlaunchctl bootout \"gui/$(id -u)/{label}\" 2>/dev/null || true\nlaunchctl bootstrap \"gui/$(id -u)\" \"$P\"\nsleep 2\nlaunchctl print \"gui/$(id -u)/{label}\" | grep -q 'state = running' || {{ echo 'the service did not start' >&2; exit 1; }}\n",
             svcx = xml(svc),
             startx = xml(&start),
         ));
