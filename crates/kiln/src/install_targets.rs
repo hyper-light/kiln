@@ -887,8 +887,14 @@ mod tests {
 
     #[test]
     fn this_binary_is_read_as_static_or_dynamic() -> anyhow::Result<()> {
-        // The test binary is linked as the build is: whichever it is, it reads.
-        dynamic(&std::env::current_exe()?)?;
+        // The test binary is linked as the build is: on Linux, whichever it is, it reads; elsewhere
+        // it's no ELF file (Mach-O, PE), and is refused as one.
+        let this = dynamic(&std::env::current_exe()?);
+        if cfg!(target_os = "linux") {
+            this?;
+        } else {
+            assert!(this.is_err());
+        }
         let dir = tempfile::tempdir()?;
         std::fs::write(dir.path().join("x"), b"not an elf file")?;
         assert!(dynamic(&dir.path().join("x")).is_err());
