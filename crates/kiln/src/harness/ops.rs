@@ -190,7 +190,8 @@ async fn about(cx: Cx, v: Value) -> Out {
 
 async fn send(cx: Cx, v: Value) -> Out {
     let id = agent_of(&v)?;
-    let body = text(&v, "text")?;
+    let words = text(&v, "text")?;
+    let body = words.clone();
     let mode: SendMode = match v.get("mode").and_then(Value::as_str).unwrap_or("queue") {
         "queue" => SendMode::Queue,
         "steer" => SendMode::Steer,
@@ -220,7 +221,52 @@ async fn send(cx: Cx, v: Value) -> Out {
         None => made,
     };
     wait::sent(&id, info.last_turn.as_ref().map(|t| t.at));
-    match cx.hub.harness.command(&cx.hub, &id, Command::Send { id: message.clone(), text: body, mode, attachments: Vec::new(), overrides: None, reply_to: None, task: None }).await {
+    // An agent's words, its call relayed signed by its runner and taken: kiln passes them on too,
+    // its record and the ones before it going with them, for the recipient's runner to check end to
+    // end (docs/ci.md W27-R08's relays).
+    let relayed = match cx.caller.agent.as_deref().and_then(|me| cx.hub.relays.carried(me, &words)) {
+        Some(c) => crate::relays::words(&cx.hub, &id, c).await,
+        None => None,
+    };
+    let mut c = Command::Send { id: message.clone(), text: body, mode, attachments: Vec::new(), overrides: None, reply_to: None, task: None };
+    let mut record = None;
+    let sent = match relayed {
+        Some((relayed, seq, digest)) => {
+            record = Some(digest);
+            // A test build's faulty relay (`relay_words`): every second one dropped, swapped for the
+            // one before, or a byte of it changed, after kiln recorded passing it on.
+            use crate::runner::chaos::RelayFault;
+            let relayed = match crate::runner::chaos::get().and_then(|f| f.relay_words).filter(|_| RelayFault::strikes(seq)) {
+                Some(RelayFault::Drop) => return Ok(json!({"sent": true, "message": message})),
+                Some(RelayFault::Alter) => {
+                    if let Command::Send { text, .. } = &mut c {
+                        text.push('!');
+                    }
+                    relayed
+                }
+                Some(RelayFault::Swap) => match cx.hub.relays.swapped(&relayed) {
+                    Some((other, words)) => {
+                        if let Command::Send { text, .. } = &mut c {
+                            *text = words;
+                        }
+                        other
+                    }
+                    None => relayed,
+                },
+                None => relayed,
+            };
+            cx.hub.harness.command_relayed(&cx.hub, &id, c, relayed).await
+        }
+        None => cx.hub.harness.command(&cx.hub, &id, c).await,
+    };
+    // Words kiln recorded passing on that it couldn't deliver: said so at once, not left for a
+    // receipt that won't come.
+    if let Some(record) = record
+        && matches!(sent, Sent::NoSession | Sent::Unreachable | Sent::Rejected { .. } | Sent::Unanswered(_))
+    {
+        crate::relays::undelivered(&cx.hub, &record, &format!("{sent:?}")).await;
+    }
+    match sent {
         Sent::Ok | Sent::Taken => Ok(json!({"sent": true, "message": message})),
         // Its machine is away: it goes once that's back, once.
         Sent::Parked => Ok(json!({"sent": true, "parked": true, "message": message})),
@@ -295,7 +341,7 @@ fn peer_text(sender: Option<&Info>, me: &str, text: &str) -> String {
 
 /// The words of a message from another agent: what follows what kiln says of a fellow agent
 /// (`peer_text`), or all of it.
-fn body_of(text: &str) -> &str {
+pub(crate) fn body_of(text: &str) -> &str {
     text.split_once("\n\n").filter(|(said, _)| said.starts_with("Agent ") && said.ends_with(ANSWER_END)).map_or(text, |(_, body)| body)
 }
 

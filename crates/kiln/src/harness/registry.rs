@@ -2311,6 +2311,33 @@ impl Registry {
     /// message) its inbox's answer to wait for ([`Registry::settle`]), so a sender that goes on
     /// meanwhile (a viewer's socket) waits for nothing.
     pub async fn dispatch(&self, hub: &Hub, id: &str, c: Command) -> Pending {
+        self.dispatch_relayed(hub, id, c, None).await
+    }
+
+    /// Command `c` for session `id` as [`Registry::command`] sends it, with what kiln and the relays
+    /// before it record of passing it on (`relayed`: docs/ci.md W27-R08's relays, `crate::relays::words`)
+    /// beside it in what goes to the runner, which checks it before the session takes it; sent again
+    /// so when its epoch was left meanwhile.
+    pub async fn command_relayed(&self, hub: &Hub, id: &str, c: Command, relayed: Value) -> Sent {
+        let pending = self.dispatch_relayed(hub, id, c.clone(), Some(&relayed)).await;
+        if let Pending::Answer { message, rx } = pending {
+            let sent = self.answer(hub, id, &message, rx).await;
+            if let Sent::Refused(r) = &sent
+                && let Some(current) = again_for(r)
+            {
+                self.raise_epoch(id, current);
+                return match self.dispatch_relayed(hub, id, c, Some(&relayed)).await {
+                    Pending::Now(sent) => sent,
+                    Pending::Answer { message, rx } => self.answer(hub, id, &message, rx).await,
+                    Pending::Command(p) => Sent::of(p.answer_or_parked(crate::hub::COMMAND_WITHIN).await),
+                };
+            }
+            return sent;
+        }
+        self.resolve(hub, id, c, pending).await
+    }
+
+    async fn dispatch_relayed(&self, hub: &Hub, id: &str, c: Command, relayed: Option<&Value>) -> Pending {
         let Some(loc) = self.location(id) else { return Pending::Now(Sent::NoSession) };
         // Kiln's own (`goals::keep`), kept here: its harness has nothing to do with it.
         if let Command::Control { id: control, value } = &c
@@ -2362,7 +2389,14 @@ impl Registry {
                 }
             }
             Location::Machine(machine) => {
-                let Ok(json) = serde_json::to_string(&c) else { return Pending::Now(Sent::NoSession) };
+                let Ok(mut json) = serde_json::to_string(&c) else { return Pending::Now(Sent::NoSession) };
+                if let Some(r) = relayed
+                    && let Ok(mut v) = serde_json::from_str::<Value>(&json)
+                    && let Some(o) = v.as_object_mut()
+                {
+                    o.insert("relayed".into(), r.clone());
+                    json = v.to_string();
+                }
                 // A runner with inboxes takes a message for an epoch, and answers it.
                 let (caps, away) = {
                     let inst = hub.instances.lock();

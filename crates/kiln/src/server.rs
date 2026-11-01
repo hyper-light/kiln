@@ -208,6 +208,9 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         child!("identities", h => crate::identities::own_identities_loop(h));
         // The trail's checkpoints, signed as they come due (docs/ci.md W27-R09).
         child!("trail", h => crate::trail::checkpoints_loop(h));
+        // Relays' records no receipt answered, once they lapse: each a break naming its relay
+        // (docs/ci.md W27-R08's relays).
+        child!("relays", h => crate::relays::relays_loop(h));
         // kiln's base chart in its own registry, for apps' charts to depend on (docs/deploy-api.md §3.4).
         child!("kiln-base", h => crate::deploy::init::publish_base(h));
         if cfg.cd.enabled {

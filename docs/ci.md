@@ -9331,7 +9331,7 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
   can't take (its signer's identity revoked, as a copy left behind's is) is refused and recorded
   with its signer and envelope; both are audited (what an API caller sent, once, as their request). `POST /api/custody`, `GET /api/custody?digest=`
   or `?name=` (a thing's newest chain: who holds it, an offer no one took lapsing after 10
-  minutes), `/api/custody/breaks`, `/api/transfers/refused` and `/api/transfers/unsigned`;
+  minutes), `/api/custody/breaks`, `/api/custody/relays`, `/api/transfers/refused` and `/api/transfers/unsigned`;
   `kiln custody show|breaks`, `kiln transfers refused|unsigned`.
 - *Sessions handed over.* What a session's hand-over is about is its timeline at the epoch it
   leaves ("session <id> at epoch <n>", `kiln-timeline-v1`: its id, the epoch and each event's
@@ -9501,6 +9501,57 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
     its log (its sequence and the digest of the entries since); each learner receives them once it
     has applied them.
   - *The server giving a leg to a runner* (step 11, above).
+- *Relays* (step 13; `kiln_ci::identity::relay`, `crate::relays`): every intermediary records what
+  it passes on, unchanged, as ARC's handlers each add their record of a message. A relay's record
+  is a passed-on of the thing by its digest, from whom it took it, to whom it passes it, numbered on
+  a stream of its own to that receiver, one per run of its process or connection, so the receiver
+  sees each number in turn. Whoever it reaches checks that record before using the thing, and signs
+  its receipt, which follows it.
+  - *A runner relaying its agents' calls to kiln.* Beside each signed act goes the runner's record
+    (`passed_on`), numbered on its stream for that connection as asks go out. kiln places the
+    numbers in the order the runner's messages come. It then checks the record against the act:
+    signed by that runner process, to kiln, of the very act that came, which signs the very ask. It
+    keeps the act, the record and its own receipt, and only then judges the act itself (the fence,
+    step 5). In the plan's example, Kiln PRs' `goals.done` goes from adacachy's runner as
+    "passed-on #5521" of its act's digest, from the agent at epoch 1, to kiln, and kiln's receipt
+    follows it.
+  - *kiln relaying an agent's words (`agents.send`) to the runner holding the agent they're for.*
+    The sender's act, its runner's record and kiln's (numbered on kiln's stream to that runner
+    process) go with the message (`relayed`). That runner checks the act end to end: its signature,
+    the ask it signs, and that it's an `agents.send` of these very words to this session. It checks
+    each record, the nearest first, so a relay that passed on another than it took is the one named.
+    Only then does the session take the words, and the runner signs its receipt.
+  - *kiln relaying reach links' frames.* It can't read them, so it chains each way's frames by
+    their ciphertext's digests (`kiln-frames-v1`) into runs, cut at 1,024 frames or 10 seconds
+    from the first, whichever comes first, whether or not more frames come, and the last at the
+    link's close. Each run is a record numbered on its stream to the link's far end (in
+    `ServerMsg::Custody`), which answers with its receipt of the frames as they came. The frames
+    come another way than the record, so a record that comes first waits for them, up to 20
+    seconds. Frames that came with no record a minute after the link ended are told to kiln as a
+    break too.
+  - *Blue/green's old build forwarding kiln's frames to the new one.* A frame carrying a signed
+    statement goes with the old build's record of it (`Frame::Forward`'s `passed_on`), numbered on
+    its stream to the new build: a hand-over's word, a custody record kiln hands on (work, a leg's
+    inputs, a reach link's run), or an agent's words, whose record is of the sender's act,
+    following kiln's record. The new build checks it and signs its receipt; a hand-over's word for
+    the old build stays refused there (step 4), and the refusal is recorded. A frame with no signed
+    statement (a person's message, a close, an interrupt) goes on unrecorded. kiln keeps the words
+    it signs, so a walk through the old build's record reaches them.
+  A relay can't forge the originator's statement (its signature). It can't alter or swap what it
+  carries: the digest differs, or a genuine other names another. It can't drop it silently: a
+  number is skipped, or a record no receipt follows. Each is refused where it's used (the call, the
+  message, the frame, the link its end can't read) and recorded as a break naming the relay
+  (`custody_breaks.relay`, migration `w27_relays`). A dropped item never arrives, so what's refused
+  is a walk through the relay's stream, whose gap breaks it. kiln looks for relays' records no
+  receipt answers once they lapse (10 minutes). `GET /api/custody/relays` lists each relay's
+  streams (records, numbers missing) and the records unanswered; `POST` records those as breaks at
+  once. Test builds' faults `relay_calls`, `relay_forward`, `relay_words` and `relay_frames` drop,
+  swap or alter every second item. A walk reads a relay's record of an originator's statement as
+  where that thing began (its originator signed it), and a frame's record, whose sender signs
+  nothing, as where its chain begins. Words kiln recorded passing on and couldn't deliver (the
+  runner away, the session gone) are recorded so at once. Each side says `CAP_RELAYS` (bit 45):
+  with a peer from before, things go as before, and kiln's records of what it passes to such a
+  runner go on a stream saying no receipt is waited for.
 - *A resume from the server's store* is kiln's take: signed with the server's own key for the
   identity kiln last certified the session as at that epoch (`identities::holder_at`), to the next,
   saying when kiln last heard from the machine; kiln keeps it at once, the package carries it, and
@@ -9511,7 +9562,15 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
   announced at a later epoch by a runner without `CAP_CUSTODY`, or resumed to one ("… signed no
   receipt"). A test build's `unsigned` fault stands in for such a runner.
 - *Tests.* `kiln-ci` `w27_r08_*` (bodies, chains and each break, relays, takes, gaps, delegations,
-  a session's next epoch whoever holds it, the fence); `custody::w27_r08_*` (records kept, breaks
+  a session's next epoch whoever holds it, the fence); relays: kiln-ci's `w27_r08_relays_*` (a
+  call passed on and received, one statement through two relays, a forged, misaddressed, altered,
+  swapped, dropped or repeated item each caught naming its relay, frames named by their chain, a
+  forwarded frame), `runner::custody::w27_r08_relays_a_runner_records_what_it_passes_on_and_checks_what_is_passed_to_it`,
+  `reach::relay::tests::w27_r08_relays_a_links_frames_are_recorded_in_runs`, and `transfers.rs`'
+  `w27_r08_relays_*`: a runner's relay of an agent's calls, kiln's of an agent's words and of a
+  reach link's frames, and (release) blue/green's forwarder, each with no item relayed without
+  its record, and, with `chaos`, each relay dropping, swapping or altering, refused where used and
+  recorded naming the relay; `custody::w27_r08_*` (records kept, breaks
   and refusals; a transfer kept before its epoch rises; the timeline);
   `store::migrations::w27_r08_custody_tables`; `proto::w27_r08_custody_is_appended_after_headroom`;
   `crates/kiln/tests/custody.rs`: records through the API and the CLI; `crates/kiln/tests/transfers.rs`
@@ -9599,8 +9658,15 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
   from a linked server's environment, which this server's CD doesn't sign for, nor KilnCD's apps'
   syncs, which take no `after`; Ship's journey listing a replant's transfers beside its runners
   (its job does); a pod's leg, its own runner, whose inputs aren't a runner process's to hand on;
-  images a leg pushes to a registry outside kiln, which signs no receipt; machines, intermediaries
-  and production (steps 12 to 16).
+  images a leg pushes to a registry outside kiln, which signs no receipt; machines and production
+  (steps 12, 14 to 16). Of the relays (step 13): a person's words to an agent aren't relayed with a
+  record (a person signs no act, so kiln speaks for them), nor an agent's other commands to its
+  subagents (`agents.interrupt`, `agents.stop`); words for an agent kiln's server runs itself
+  (`local`) reach no runner to check them; a runner from before relays acts with no record, and
+  kiln can't tell its drops (its records are numbered only where the relay records them); a
+  receiver doesn't number-check kiln's own streams (a drop there is kiln's record no receipt
+  follows); and each relayed call adds two records to custody and the trail (the runner's and
+  kiln's receipt) and keeps its act, each message a third.
 
 ### W28 Demand-driven CI: adopt, cover, stagger, land by conflict graph
 

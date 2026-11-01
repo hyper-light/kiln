@@ -232,12 +232,35 @@ pub fn agent_ops() -> Vec<crate::ops::Op> {
 /// answer: `{"registry", "skills"}`, `{"ok": <answer>}`, or `{"error", "status"?}`. An act (all but
 /// the registry) counts only from the session's holder now, signed so once kiln has certified one
 /// (`crate::custody::act_counts`, docs/ci.md W27-R08); a copy left behind is refused, and told to let
-/// go of the session, which went on elsewhere.
-pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, peer: crate::instances::PeerId, ask: &Value) -> Value {
+/// go of the session, which went on elsewhere. The runner relays the act: its record of passing it
+/// on, as the hub `placed` it on its stream, is checked first, and kept with kiln's receipt, or the
+/// act is refused, the break recorded naming the runner (`crate::relays::call`).
+pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, peer: crate::instances::PeerId, ask: &Value, placed: Option<crate::relays::Placed>) -> Value {
     if hub.agents.lock().get(runner).is_none_or(|a| a.ephemeral || a.outpost) {
         return json!({"error": "kiln's operations are for its agents' runners, not a job's"});
     }
     let session = ask.get("session").and_then(Value::as_str).unwrap_or("");
+    let mut carried = None;
+    if let Some(placed) = placed {
+        let instance = hub.instances.lock().get(peer).map_or_else(|| "legacy".to_owned(), crate::instances::Instance::label);
+        match crate::relays::call(hub, runner, &instance, session, ask, placed, crate::util::now_unix()).await {
+            Ok(Ok(c)) => carried = c.map(|c| hub.relays.carry(c)),
+            Ok(Err(why)) => {
+                tracing::info!(target: "kiln.custody", %session, %runner, %instance, %why, "a call refused: its runner's record of passing it on doesn't hold");
+                return json!({"error": format!("refused: {why}"), "status": 403});
+            }
+            Err(e) => return json!({"error": format!("its runner's record of passing it on couldn't be checked: {e:#}"), "status": 503}),
+        }
+    }
+    let answer = Box::pin(runner_ask_checked(hub, runner, peer, ask, session)).await;
+    if let Some(n) = carried {
+        hub.relays.uncarry(n);
+    }
+    answer
+}
+
+/// [`runner_ask`], its runner's record of passing it on checked.
+async fn runner_ask_checked(hub: &Arc<Hub>, runner: &str, peer: crate::instances::PeerId, ask: &Value, session: &str) -> Value {
     let terminal = ask.get("terminal").and_then(Value::as_str).unwrap_or("");
     // The person in one of its kiln shells (`kiln spawn --on`, `kiln agents wait`), for a call.
     let caller = if session.is_empty() && !terminal.is_empty() && ask.get("op").and_then(Value::as_str) == Some("call") {

@@ -14,7 +14,10 @@
 //!   its signer, from whom it says, about the same things with the same digests (in-toto's digest
 //!   sets: two records agree on every algorithm they share, and share one). A hand-on hands on
 //!   what its signer received, or what it made from what it received. A take is kiln's server's.
-//!   No custodian's numbering of its streams has a gap. The first hop that doesn't hold is named.
+//!   A relay's pass, or a receipt, may follow its originator's own signed statement (an agent's
+//!   act), of that very statement, where its thing began; a relay's pass of what its sender signs
+//!   nothing of (a frame) follows nothing, its chain beginning there ([`super::relay`]). No
+//!   custodian's numbering of its streams has a gap. The first hop that doesn't hold is named.
 //! - **Entitlement** ([`entitled`]): a signer acting under delegations may do what the nearest one
 //!   gives it, if each gives no more and lasts no longer than the one it acts under, and none has
 //!   ended or been revoked.
@@ -514,15 +517,54 @@ fn edge(r: &Checked, rb: &Body, p: &Checked, pb: &Body, server: &str) -> Result<
     Ok(if same.0 > 0 { Edge::Holding } else { Edge::MadeFrom })
 }
 
+/// Whether `c` is an originator's own signed statement (an agent session's act, kiln's server's
+/// word), not a custody record or a delegation: what a relay passes on, which a relay's record or a
+/// receipt may follow ([`crate::identity::relay`]).
+fn originator(c: &Checked) -> bool {
+    c.payload_type != PAYLOAD_CUSTODY && c.payload_type != PAYLOAD_DELEGATION
+}
+
+/// Whether record `r` is about statement `p` itself: one of its things is `p`, by its digest.
+fn about(r: &Checked, p: &Checked) -> bool {
+    let hex = p.digest.strip_prefix("sha256:").unwrap_or(&p.digest);
+    r.statement.subject.iter().any(|t| t.digest.get("sha256").is_some_and(|d| d.eq_ignore_ascii_case(hex)))
+}
+
+/// Whether record `r` (body `rb`) takes `p`, its originator's own signed statement: only a relay's
+/// pass or a receipt may, of that very statement (one of its things, by the statement's digest),
+/// saying it came from the statement's signer.
+fn from_originator(r: &Checked, rb: &Body, p: &Checked) -> Result<(), Break> {
+    if !rb.kind.takes() {
+        return Err(Break::NotCustody { record: p.digest.clone(), payload_type: p.payload_type.clone() });
+    }
+    if !about(r, p) {
+        let thing = r.statement.subject.first().map(|t| t.name.clone()).unwrap_or_default();
+        return Err(Break::NotHandedOn { record: r.digest.clone(), from: p.digest.clone(), thing });
+    }
+    let says = rb.from.clone().unwrap_or_default();
+    if !names(&says, &p.custodian) && !names(&p.custodian, &says) {
+        return Err(Break::NotTheGiver { record: r.digest.clone(), from: p.digest.clone(), says, giver: p.custodian.clone() });
+    }
+    Ok(())
+}
+
 /// Checks record `record`'s own hop: each record it follows, which `records` must hold, followed as
 /// [`walk`] says it may be, and a receipt or a pass following a hand-on. Not the records before
 /// those, nor its custodian's numbering: that's [`walk`]'s. What kiln checks as it takes a record.
 pub fn hop(record: &str, records: &BTreeMap<String, Checked>, server: &str) -> Result<Hop, Break> {
     let r = records.get(record).ok_or_else(|| Break::NoRecord { record: record.to_owned(), followed_by: None })?;
     let rb = body(r)?;
-    let (mut gave, mut held, mut made_from) = (false, false, Vec::new());
+    let (mut gave, mut held, mut made_from, mut originated) = (false, false, Vec::new(), false);
     for f in &r.statement.follows {
         let p = records.get(f).ok_or_else(|| Break::NoRecord { record: f.clone(), followed_by: Some(record.to_owned()) })?;
+        // Its originator's own signed statement (an agent's act, kiln's word, or a custody record
+        // of another's, which this record is about by its digest), which a relay passes on: the
+        // thing began there, signed by its originator (docs/ci.md W27-R08's relays).
+        if originator(p) || (about(r, p) && rb.kind.takes()) {
+            from_originator(r, &rb, p)?;
+            (gave, originated) = (true, true);
+            continue;
+        }
         let pb = body(p)?;
         match edge(r, &rb, p, &pb, server)? {
             Edge::Transfer => gave = true,
@@ -533,10 +575,13 @@ pub fn hop(record: &str, records: &BTreeMap<String, Checked>, server: &str) -> R
     // A receipt of what came from where kiln has no identity (a registry outside it,
     // `docker://alpine:3.20`), following nothing: its chain begins there, as its taker received it.
     let from_outside = rb.kind == Kind::Received && r.statement.follows.is_empty() && rb.from.as_deref().is_some_and(|f| !f.is_empty() && !f.starts_with("kiln://"));
-    if rb.kind.takes() && !gave && !from_outside {
+    // A relay's pass of what its sender signs nothing of (a frame of kiln's server, a reach link's
+    // ciphertext), following nothing: its chain begins at the relay, as the relay records it.
+    let unsigned = rb.kind == Kind::PassedOn && r.statement.follows.is_empty();
+    if rb.kind.takes() && !gave && !from_outside && !unsigned {
         return Err(Break::NoHandOn { record: record.to_owned(), kind: rb.kind });
     }
-    let began = (!rb.kind.takes() && !held) || from_outside;
+    let began = (!rb.kind.takes() && !held) || from_outside || originated || unsigned;
     let taken_for = rb.taken_for.clone().filter(|_| r.custodian == server);
     Ok(Hop { record: record.to_owned(), kind: rb.kind, custodian: r.custodian.clone(), taken_for, at: r.at, subject: r.statement.subject.clone(), made_from, began })
 }
@@ -556,7 +601,8 @@ pub fn walk(from: &str, records: &BTreeMap<String, Checked>, server: &str) -> Re
         }
         let h = hop(&d, records, server)?;
         if let Some(r) = records.get(&d) {
-            next.extend(r.statement.follows.iter().cloned());
+            // An originator's own statement is where its thing began, not a hop of its own.
+            next.extend(r.statement.follows.iter().filter(|f| records.get(*f).is_none_or(|p| !originator(p))).cloned());
         }
         if h.began {
             walked.began.push(d);

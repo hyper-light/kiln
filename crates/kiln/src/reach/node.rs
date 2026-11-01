@@ -638,6 +638,11 @@ impl Node {
             In::Answer { req, json } => self.on_answer(req, &json).await,
             In::Server(up) => {
                 self.server = up;
+                // The calls this process passes on to kiln are numbered afresh for each connection
+                // (docs/ci.md W27-R08's relays).
+                if up {
+                    crate::runner::custody::calls_connected();
+                }
                 // Whatever the directory said may have changed while away: ask again.
                 self.directory = None;
                 if !up {
@@ -803,6 +808,7 @@ impl Node {
             self.send_frames(id, Some(why.to_owned())).await;
         }
         let Some(l) = self.links.remove(id) else { return };
+        crate::runner::custody::reach_closed(id);
         tracing::debug!(peer = %l.peer, link = id, role = ?l.role, why, "reach link closed");
         match l.role {
             Role::Asker => {
@@ -843,6 +849,9 @@ impl Node {
     }
 
     async fn on_frame(&mut self, from: String, link: String, open: bool, data: Vec<u8>, close: Option<String>) {
+        // Each frame kiln's relay passed on, as it came: its run's record is answered with it
+        // (docs/ci.md W27-R08's relays).
+        crate::runner::custody::reach_frame(&link, &data);
         if open && !self.links.contains_key(&link) {
             if !self.cfg.accept {
                 let msg = AgentMsg::Reach { to: from.clone(), link, open: false, data: Vec::new(), close: Some(format!("{} does not accept commands from other runners", self.cfg.name)) };
@@ -1520,6 +1529,12 @@ impl Node {
                     let _ = reply.send(Err(anyhow::anyhow!("not connected to the kiln server")));
                     return;
                 }
+                // Its agent's act passed on with this process's record of it, numbered as asks go,
+                // in order (docs/ci.md W27-R08's relays).
+                let Some(json) = crate::runner::custody::passed_on_ask(json) else {
+                    let _ = reply.send(Err(anyhow::anyhow!("dropped on its way to kiln by this runner, a faulty relay (a test build's fault)")));
+                    return;
+                };
                 let req = self.next_req;
                 self.next_req += 1;
                 self.queries.insert(req, (Instant::now(), reply));

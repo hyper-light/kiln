@@ -62,6 +62,7 @@ pub mod push;
 pub mod reach;
 pub mod reads;
 pub mod records;
+pub mod relays;
 pub mod research;
 pub mod runner;
 pub mod rt;

@@ -51,6 +51,17 @@
 //! - `peer_object_changed`: an object of its cache this runner sends a peer has a byte changed after
 //!   it signed its hand-on of it, as in transit (docs/ci.md W27-R08, W24-R27): the peer refuses it
 //!   and kiln records the break.
+//! - `relay_calls=<drop|swap|alter>`: the runner, a relay of its agents' calls to kiln, fails every
+//!   second act it passes on (docs/ci.md W27-R08's relays): it numbers it on its stream and passes
+//!   it on not at all; passes the act before on under its record; or changes a byte of the ask after
+//!   recording it. kiln refuses the swapped and the altered, and records each, and the gap, as a
+//!   break naming the runner.
+//! - `relay_forward=<drop|swap|alter>`: the same of this runner's blue/green forwarder, every second
+//!   frame of kiln's it passes on to its new build, which refuses it and tells kiln.
+//! - `relay_words=<drop|swap|alter>` and `relay_frames=<drop|swap|alter>`: the server's: its relay
+//!   of agents' words to the runners holding the agents they're for, and of reach links' frames,
+//!   fail every second one so (a reach link's: frames 2, 4 …): a word the recipient's runner
+//!   refuses, a frame the link's other end can't read; each break recorded naming kiln's server.
 //! - `copy=<path>`: every frame this runner sends, appended to `path` as it goes below the channel
 //!   (its lane and length, then its bytes), so a test can say what crossed the network (W27-R02).
 //! - `keys=<path>`: each identity key this runner process makes (`crate::runner::identity`),
@@ -102,10 +113,45 @@ pub struct Chaos {
     pub no_git: bool,
     /// An object it sends a peer changes after its hand-on (`peer_object_changed`).
     pub peer_object_changed: bool,
+    /// Its relay of its agents' calls fails every second one (`relay_calls=`).
+    pub relay_calls: Option<RelayFault>,
+    /// Its blue/green forwarder fails every second frame (`relay_forward=`).
+    pub relay_forward: Option<RelayFault>,
+    /// The server's: its relay of agents' words fails every second one (`relay_words=`).
+    pub relay_words: Option<RelayFault>,
+    /// The server's: its relay of reach links' frames fails every second one (`relay_frames=`).
+    pub relay_frames: Option<RelayFault>,
     /// Where every frame this process sends is copied (`copy=`).
     pub copy: Option<std::path::PathBuf>,
     /// Where each identity key this process makes is copied (`keys=`).
     pub keys: Option<std::path::PathBuf>,
+}
+
+/// What a faulty relay does to every second thing it passes on (docs/ci.md W27-R08's relays).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayFault {
+    /// Numbers it and records passing it on, then passes it on not at all.
+    Drop,
+    /// Passes another on in its place, under its record.
+    Swap,
+    /// Changes a byte of it after recording it.
+    Alter,
+}
+
+impl RelayFault {
+    fn parse(v: &str) -> Option<Self> {
+        match v {
+            "drop" => Some(Self::Drop),
+            "swap" => Some(Self::Swap),
+            "alter" => Some(Self::Alter),
+            _ => None,
+        }
+    }
+
+    /// Whether it fails the `n`th thing its relay passes on (from 1): every second one.
+    pub fn strikes(n: u64) -> bool {
+        n > 0 && n.is_multiple_of(2)
+    }
 }
 
 /// `300ms`, `2s`, `1m`.
@@ -167,6 +213,15 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
             "tarball_changed" => c.tarball_changed = true,
             "no_git" => c.no_git = true,
             "peer_object_changed" => c.peer_object_changed = true,
+            "relay_calls" | "relay_forward" | "relay_words" | "relay_frames" => {
+                let f = RelayFault::parse(v).ok_or_else(|| anyhow::anyhow!("chaos `{k}` takes drop, swap or alter, not `{v}`"))?;
+                match k {
+                    "relay_calls" => c.relay_calls = Some(f),
+                    "relay_forward" => c.relay_forward = Some(f),
+                    "relay_words" => c.relay_words = Some(f),
+                    _ => c.relay_frames = Some(f),
+                }
+            }
             "copy" | "keys" => {
                 anyhow::ensure!(!v.is_empty(), "chaos `{k}` takes a file's path");
                 let path = Some(std::path::PathBuf::from(v));
@@ -177,7 +232,7 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
                 }
             }
             "seed" => c.seed = v.parse().map_err(|_| anyhow::anyhow!("chaos `seed` takes a number, not `{v}`"))?,
-            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, lag, oom, disk, corrupt, fetch, platform, rebuild, shed, twice, late, seed, fanout, old, unsigned, stale_words, tarball_changed, no_git, peer_object_changed, copy or keys"),
+            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, lag, oom, disk, corrupt, fetch, platform, rebuild, shed, twice, late, seed, fanout, old, unsigned, stale_words, tarball_changed, no_git, peer_object_changed, relay_calls, relay_forward, relay_words, relay_frames, copy or keys"),
         }
     }
     Ok(c)
@@ -412,11 +467,20 @@ mod tests {
                 tarball_changed: false,
                 no_git: false,
                 peer_object_changed: false,
+                relay_calls: None,
+                relay_forward: None,
+                relay_words: None,
+                relay_frames: None,
                 copy: None,
                 keys: None
             }
         );
         assert!(parse("tarball_changed")?.tarball_changed && parse("no_git")?.no_git && parse("peer_object_changed")?.peer_object_changed);
+        // W27-R08's relays, each failing every second thing it passes on.
+        let c = parse("relay_calls=drop,relay_forward=swap,relay_words=alter,relay_frames=drop")?;
+        assert_eq!((c.relay_calls, c.relay_forward, c.relay_words, c.relay_frames), (Some(RelayFault::Drop), Some(RelayFault::Swap), Some(RelayFault::Alter), Some(RelayFault::Drop)));
+        assert!(parse("relay_calls=lose").is_err() && parse("relay_frames").is_err(), "drop, swap or alter");
+        assert_eq!((1..=6).filter(|n| RelayFault::strikes(*n)).collect::<Vec<_>>(), vec![2, 4, 6]);
         assert_eq!(parse("platform=darwin/arm64")?.platform.as_deref(), Some("darwin/arm64"));
         // W27-R02's test copies: what a runner sends, and the keys it makes.
         let c = parse("copy=/tmp/a.frames,keys=/tmp/a.keys")?;
