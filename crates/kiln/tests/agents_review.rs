@@ -156,7 +156,9 @@ fn w26_r18_agents_words_are_signed_as_the_agent() -> anyhow::Result<()> {
     anyhow::ensure!(st == 200, "threads: {st} {body}");
     let threads: Value = serde_json::from_str(&body)?;
     let comments: Vec<Value> = threads.get("threads").or(Some(&threads)).and_then(Value::as_array).into_iter().flatten().flat_map(|t| t.get("comments").and_then(Value::as_array).cloned().unwrap_or_default()).collect();
-    let agents: Vec<&Value> = comments.iter().filter(|c| field(c, "author") == format!("agent:{id}")).collect();
+    // The agent comments as its session does: `agent:<its id's start>@<its runner>`.
+    let principal = format!("agent:{}@box-a", id.get(..8).unwrap_or(&id));
+    let agents: Vec<&Value> = comments.iter().filter(|c| field(c, "author") == principal).collect();
     assert_eq!(agents.len(), 2, "the agent's comment and its reply, each taken\n{threads}\nthe agent's MCP server said: {}", out());
     for c in &agents {
         let by = c.get("by").cloned().unwrap_or_default();

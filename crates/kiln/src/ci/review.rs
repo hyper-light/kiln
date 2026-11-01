@@ -114,7 +114,14 @@ pub async fn threads(hub: &Hub, d: &Diff, viewer: &str) -> Result<Vec<Value>, Fa
         // whoever gave it, an agent as the agent for its person.
         let signer = signed.get(&cid);
         let identity = signer.and_then(|(uri, _)| kiln_ci::identity::chain::Identity::parse(uri).ok());
-        let (name, newest) = agents.get(author.split(' ').next().unwrap_or(&author)).cloned().unwrap_or_default();
+        let (mut name, newest) = agents.get(author.split(' ').next().unwrap_or(&author)).cloned().unwrap_or_default();
+        // A signed agent's identity names its whole session: its name, when the principal alone
+        // found none.
+        if name.is_none()
+            && let Some(kiln_ci::identity::chain::Actor::Agent { agent, .. }) = identity.as_ref().map(|i| &i.actor)
+        {
+            name = hub.harness.info(agent).map(|i| i.name).filter(|n| !n.trim().is_empty());
+        }
         let line = kiln_ci::review::byline(&author, name.as_deref(), identity.as_ref(), newest.as_ref());
         let seal = signer.map(|(uri, taken)| json!({ "by": uri, "who": line.words(), "at": taken }));
         by.entry(tid).or_default().push(json!({ "id": cid, "author": author, "by": line, "signed": seal, "body": body, "suggestion": suggestion, "created_at": at, "draft": !published, "deleted": deleted, "suggestions": suggests }));
@@ -173,22 +180,45 @@ async fn signatures(hub: &Hub, d: &Diff) -> Result<HashMap<String, (String, i64)
         .map_err(fail)
 }
 
-/// The agents among `authors` (`agent:<session>`), by principal: each one's session's name while
-/// kiln has the session, and its newest identity, whose path names the person it acts for
-/// (W27-R01).
+/// The agents among `authors`, by principal (`agent:<session>`, or an agent session's
+/// `agent:<its id's start>@<its runner>`, as `mcp::session_caller` names it): each one's session's
+/// name while kiln has the session (the newest of that start on that runner), and its newest
+/// identity, whose path names the person it acts for (W27-R01).
 async fn agents_of<'a>(hub: &Hub, authors: impl Iterator<Item = &'a str>) -> HashMap<String, (Option<String>, Option<kiln_ci::identity::chain::Identity>)> {
+    let sessions = hub.harness.list();
     let mut out = HashMap::new();
     for author in authors {
         let principal = author.split(' ').next().unwrap_or(author);
-        let Some(session) = principal.strip_prefix("agent:") else { continue };
+        let Some(rest) = principal.strip_prefix("agent:") else { continue };
         if out.contains_key(principal) {
             continue;
         }
-        let name = hub.harness.info(session).map(|i| i.name).filter(|n| !n.trim().is_empty());
-        let newest = crate::identities::agent_uri(&hub.store, session).await.ok().flatten().and_then(|u| kiln_ci::identity::chain::Identity::parse(&u).ok());
-        out.insert(principal.to_owned(), (name, newest));
+        let (start, runner) = rest.split_once('@').map_or((rest, None), |(s, r)| (s, Some(r)));
+        let session = sessions
+            .iter()
+            .filter(|i| i.id == start || (start.len() >= 8 && i.id.starts_with(start)))
+            .filter(|i| runner.is_none_or(|r| i.target.strip_prefix("agent:").unwrap_or(&i.target) == r))
+            .max_by_key(|i| i.created_at);
+        let name = session.map(|i| i.name.clone()).filter(|n| !n.trim().is_empty());
+        let uri = match session {
+            Some(i) => crate::identities::agent_uri(&hub.store, &i.id).await.ok().flatten(),
+            None => newest_identity(hub, start, runner).await,
+        };
+        out.insert(principal.to_owned(), (name, uri.and_then(|u| kiln_ci::identity::chain::Identity::parse(&u).ok())));
     }
     out
+}
+
+/// The newest identity kiln issued an agent session whose id starts `start`, on `runner` when
+/// it's named: for a session kiln no longer has.
+async fn newest_identity(hub: &Hub, start: &str, runner: Option<&str>) -> Option<String> {
+    let like = |s: &str| s.replace(['%', '_'], "");
+    let pattern = format!("%/agent/{}%/epoch/%{}", like(start), runner.map(|r| format!("/machine/{}/%", like(r))).unwrap_or_default());
+    hub.store
+        .call(move |c| Ok(c.query_row("SELECT subject FROM identities WHERE kind = 'agent' AND subject LIKE ?1 ORDER BY issued_at DESC, rowid DESC LIMIT 1", [pattern], |r| r.get::<_, String>(0)).optional()?))
+        .await
+        .ok()
+        .flatten()
 }
 
 /// A diff's threads as the gate reads them (W26-R11): each one's kind and reviewer, where it

@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::identity::chain::{Actor, Identity};
+use crate::identity::chain::{Actor, Holder, Identity};
 
 /// A diff's state (review.md): `draft` and `needs-review` to `landed`, or `abandoned`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -637,15 +637,18 @@ impl Byline {
 /// The most of an agent's name its line on a host carries.
 const HOST_NAME_CHARS: usize = 60;
 
-/// The byline of `author`, a principal as review records it (`user:kim`, `agent:<session>`,
-/// `job:<leg>`, `admin`). An agent is named `name` (its session's, when kiln has it), else by
-/// the start of its session's id; the person it acts for is the one its signature's identity
-/// (`signer`) names, else its session's newest identity (`newest`), else none.
+/// The byline of `author`, a principal as review records it (`user:kim`, `agent:<session>`, an
+/// agent session as `agent:<its id's start>@<its runner>`, `job:<leg>`, `admin`). An agent is
+/// named `name` (its session's, when kiln has it), else by the start of its session's id; the
+/// person it acts for is the one its signature's identity (`signer`) names, else its session's
+/// newest identity (`newest`), else none: an identity of that session, on that runner.
 pub fn byline(author: &str, name: Option<&str>, signer: Option<&Identity>, newest: Option<&Identity>) -> Byline {
     let p = author.split(" for ").next().unwrap_or(author).trim();
-    if let Some(session) = p.strip_prefix("agent:") {
+    if let Some(rest) = p.strip_prefix("agent:") {
+        let (session, machine) = rest.split_once('@').map_or((rest, None), |(s, m)| (s, Some(m)));
+        let its = |agent: &str, held: Option<&Holder>| (agent == session || (session.len() >= 8 && agent.starts_with(session))) && machine.zip(held).is_none_or(|(m, h)| h.machine == m);
         let person = [signer, newest].into_iter().flatten().find_map(|id| match &id.actor {
-            Actor::Agent { person, agent, .. } if agent == session => Some(person.clone()),
+            Actor::Agent { person, agent, held_by, .. } if its(agent, held_by.as_ref()) => Some(person.clone()),
             _ => None,
         });
         let name = name.map(str::trim).filter(|n| !n.is_empty()).map_or_else(|| format!("agent {}", session.get(..8).unwrap_or(session)), str::to_owned);
@@ -1001,6 +1004,13 @@ mod tests {
         assert_eq!(unsigned.words(), "Matrix agent for kim", "an unsigned comment's agent, by its session's newest identity");
         assert_eq!(byline(&format!("agent:{S}"), Some("Matrix agent"), None, None).words(), "Matrix agent", "no identity: no person");
         assert_eq!(byline(&format!("agent:{S}"), None, Some(&agent("kim", "01a19another")), None).words(), "agent 01a19c0f", "another session's identity names no one here; no name: its id's start");
+        // An agent session comments as `agent:<its id's start>@<its runner>`; its identity names its
+        // whole id and the runner holding its key.
+        let held = |machine: &str| Identity::new("acme", Actor::Agent { person: "kim".into(), agent: S.into(), epoch: 0, held_by: Some(Holder { machine: machine.into(), instance: "main".into() }) });
+        let start = S.get(..8).unwrap_or(S);
+        assert_eq!(byline(&format!("agent:{start}@box-a"), Some("Matrix agent"), Some(&held("box-a")), None).words(), "Matrix agent for kim", "its session, on its runner");
+        assert_eq!(byline(&format!("agent:{start}@box-b"), None, Some(&held("box-a")), None).for_person, None, "a session of the same start on another runner isn't it");
+        assert_eq!(byline(&format!("agent:{start}@box-a for user:kim"), None, None, None).words(), "agent 01a19c0f", "no name, no identity: its id's start");
         assert_eq!(byline("job:build-3", None, None, None), Byline { kind: "job", name: "job build-3".into(), for_person: None });
         assert_eq!(byline("admin", None, None, None).words(), "the owner");
         assert_eq!(serde_json::to_value(&signed).ok(), Some(serde_json::json!({ "kind": "agent", "name": "Matrix agent", "for": "kim" })));
