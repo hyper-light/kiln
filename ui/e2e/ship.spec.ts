@@ -1,8 +1,9 @@
 /**
- * Ship (docs/ci.md W26-R01, R02), in the production build against the mock's commits: D41 sits
- * in Ship's list as Needs you · kim: empty matrix meant? · 1 thread, first, with Ship's Hand off
- * and Review pair; the change request's other commit folds under its head; the kind and host facets
- * narrow the list; an item opens to Files, Jobs (with the picked job's output) and Lanes, in that order. The list bar is the
+ * Ship (docs/ci.md W26-R01, R02, R29), in the production build against the mock's commits: kiln's
+ * row (Ship's rows are repositories) shows its newest, D41, as Needs you · kim: empty matrix meant? ·
+ * 1 thread, first, with Ship's Hand off and Review pair; opened, its commits hold D41's first revision
+ * and the change request's other commit; the kind and host facets narrow the list; an item opens to
+ * its Commits, then Files, Jobs (with the picked job's output) and Lanes, in that order. The list bar is the
  * filter and the sort, nothing between them, at every width; the pace line under it says what's
  * moving in one line (plan 01a1856fe81375b1bd1d1d86f270a45b, steps 1 and 5).
  */
@@ -14,7 +15,7 @@ test.skip(REAL, "drives the mock's commits");
 
 test("changes are Ship items, drawn by Ship's own row, needs you first", async ({ page }) => {
   await page.goto("/ship");
-  const list = page.getByRole("list", { name: "Commits", exact: true });
+  const list = page.getByRole("list", { name: "Repositories", exact: true });
   const rows = list.locator(":scope > li");
   await expect(rows.first()).toContainText("pipeline: dynamic matrices");
   await expect(rows.first()).toContainText("Needs you");
@@ -24,53 +25,61 @@ test("changes are Ship items, drawn by Ship's own row, needs you first", async (
   await expect(rows.first().getByRole("button", { name: "Hand off" })).toBeVisible();
   await expect(rows.first().getByRole("button", { name: "Review" })).toBeVisible();
 
-  // D41's first revision, superseded by its second: quiet, folded under it.
-  await rows
-    .first()
-    .getByRole("button", { name: /Show 1 more commit of D41/ })
-    .click();
-  await expect(rows.first().getByRole("list", { name: "The other commits of D41" })).toContainText("Superseded");
-
-  // The change request's other commit, folded under its head.
-  const cr = rows.filter({ hasText: "sched: fair shares" });
-  await cr.getByRole("button", { name: /Show 1 more commit of CR12/ }).click();
-  await expect(cr.getByRole("list", { name: "The other commits of CR12" })).toContainText("sched: weights");
-
-  // Review opens the item at its files; the dropdown's order.
+  // Review opens the item at its files; the dropdown's order: the repository's commits first.
   await rows.first().getByRole("button", { name: "Review" }).click();
   const sections = rows.first().locator(".rv-s > h3, .ship-sech > h3");
-  await expect(sections).toHaveText([/^Files/, "Conversation", "Jobs", "Lanes"]);
+  await expect(sections).toHaveText(["Commits", /^Files/, "Conversation", "Jobs", "Lanes"]);
+  // Among its commits: D41's first revision, superseded by its second, and the change request's other commit.
+  const commits = rows.first().locator("section.ship-commits");
+  await expect(commits.locator(".sc-c", { hasText: "2222222" }).locator('svg.sg[data-state="superseded"]')).toBeVisible();
+  await expect(commits.locator(".sc-c", { hasText: "sched: weights" })).toHaveCount(1);
 
   // Changes only, by their kind (no toggle of their own). The host facet: GitHub's.
   await page.goto("/ship?kind=diff,request");
   await expect(list.locator(":scope > li").first()).toBeVisible();
   await expect(list).not.toContainText("deploy: a rollback holds");
   await page.goto("/ship?host=github");
-  await expect(page.getByRole("list", { name: "Commits", exact: true }).locator(":scope > li")).toHaveCount(1);
-  await expect(page.getByRole("list", { name: "Commits", exact: true })).toContainText("Faster builds");
+  await expect(page.getByRole("list", { name: "Repositories", exact: true }).locator(":scope > li")).toHaveCount(1);
+  await expect(page.getByRole("list", { name: "Repositories", exact: true })).toContainText("Faster builds");
 });
 
 test("each host's pull requests and kiln's diffs are Ship items, Review first on their strip; host and kind narrow the list", async ({ page }) => {
-  const rows = page.getByRole("list", { name: "Commits", exact: true }).locator(":scope > li");
-  for (const [host, title, review] of [
-    ["github", "Faster builds", "Review: requested"],
-    ["gitlab", "docs: the runner's limits", "Review: changes asked"],
-    ["bitbucket", "ci: cache keys by lockfile", "Review: approved"],
-    ["kiln", "pipeline: dynamic matrices", "Review: requested"],
+  const rows = page.getByRole("list", { name: "Repositories", exact: true }).locator(":scope > li");
+  // A host chosen: the repositories with its changes (the mock's are kiln's), each showing its newest
+  // of them, Review first on its strip; opened, its commits are the host's, that newest first and
+  // picked, the host's change among them.
+  for (const [host, title, n] of [
+    ["github", "Faster builds", 1],
+    ["gitlab", "docs: the runner's limits", 2],
+    ["bitbucket", "ci: cache keys by lockfile", 1],
+    ["kiln", "pipeline: dynamic matrices", 4],
   ] as const) {
-    await page.goto(`/ship?host=${host}&kind=diff,request`);
-    await expect(rows.filter({ hasText: title })).toHaveCount(1);
-    await expect(rows.filter({ hasText: title }).getByRole("img", { name: new RegExp(`^${review}, Land: `) })).toBeVisible();
+    await page.goto(`/ship?host=${host}`);
+    await expect(rows).toHaveCount(1);
+    await expect(rows.first().getByRole("img", { name: /^Review: [^,]+, Land: / })).toBeVisible();
+    await rows
+      .first()
+      .getByRole("button", { name: /^Open / })
+      .click();
+    const lines = rows.first().locator("section.ship-commits .sc-c");
+    await expect(lines).toHaveCount(n, { timeout: 15_000 });
+    await expect(lines.first()).toHaveAttribute("data-sel", "true");
+    await expect(lines.filter({ hasText: title }).first()).toBeVisible();
   }
-  await expect(rows.filter({ hasText: "ci: cache keys by lockfile" })).toHaveCount(0);
   await page.goto("/ship?host=bitbucket");
   await expect(rows.first()).toContainText("Landing");
   // The landed change is GitLab's !6, not a kiln diff: kiln's diff is D41, its change request CR12.
   await page.goto("/ship?kind=diff");
   await expect(rows).toHaveCount(1);
   await expect(rows.first()).toContainText("D41");
+  // Opened, its commits are its diffs: D41's two revisions.
+  await rows
+    .first()
+    .getByRole("button", { name: /^Open / })
+    .click();
+  await expect(rows.first().locator("section.ship-commits .sc-c")).toHaveText([/4444444/, /2222222/], { timeout: 15_000 });
   await page.goto("/ship?kind=request,diff&host=kiln");
-  await expect(rows).toHaveCount(2);
+  await expect(rows).toHaveCount(1);
 });
 
 test("the list bar is the filter and the sort, nothing between them, from 320 to 1440 px", async ({ page, isMobile }) => {
@@ -79,7 +88,7 @@ test("the list bar is the filter and the sort, nothing between them, from 320 to
   for (const width of [320, 390, 430, 640, 641, 800, 1280, 1440]) {
     await page.setViewportSize({ width, height: 900 });
     await page.goto("/ship");
-    const list = page.getByRole("list", { name: "Commits", exact: true });
+    const list = page.getByRole("list", { name: "Repositories", exact: true });
     await expect(list.locator(":scope > li").first()).toBeVisible({ timeout: 15_000 });
     const tools = page.locator(".ship-tools");
     // The filter and the sort: no toggle beside them (Ada, 2026-10-28).
@@ -118,9 +127,11 @@ test("the pace line says what's moving, in the server's numbers, on one line fro
   test.setTimeout(90_000);
   const pace = ((await (await page.request.get("/api/ship/commits")).json()) as ShipPage).pace;
   if (!pace) throw new Error("the list came with no pace");
+  // Each environment named by its repository's name where there's more than one repository.
+  const several = new Set(pace.envs.map((e) => e.repo)).size > 1;
   const words = [
     `${pace.in_flight} in flight · ${pace.agents} agent${pace.agents === 1 ? "" : "s"}`,
-    ...pace.envs.map((e) => `${e.environment} ${e.short}${e.behind === null ? "" : ` · ${e.behind} behind`}`),
+    ...pace.envs.map((e) => `${several ? `${e.repo.split("/").pop()} ` : ""}${e.environment} ${e.short}${e.behind === null ? "" : ` · ${e.behind} behind`}`),
     ...(pace.runners ? [`runners ${pace.runners.on}/${pace.runners.of}`] : []),
   ];
   expect(words.length).toBeGreaterThan(1);
@@ -167,13 +178,16 @@ test("Ship's list holds still as it loads and as a row opens", async ({ page, br
     }).observe({ type: "layout-shift", buffered: true });
   });
   await page.goto("/ship");
-  const rows = page.getByRole("list", { name: "Commits", exact: true }).locator(":scope > li");
+  const rows = page.getByRole("list", { name: "Repositories", exact: true }).locator(":scope > li");
   await expect(rows.first()).toContainText("pipeline: dynamic matrices");
   await page.waitForTimeout(600);
   const shifts = () => page.evaluate(() => (window as unknown as { shifts: string[] }).shifts);
   expect(await shifts()).toEqual([]);
-  await rows.first().getByRole("button", { name: "pipeline: dynamic matrices" }).click();
-  await expect(rows.first().locator(".rv-s > h3, .ship-sech > h3")).toHaveText([/^Files/, "Conversation", "Jobs", "Lanes"]);
+  await rows
+    .first()
+    .getByRole("button", { name: /^Open / })
+    .click();
+  await expect(rows.first().locator(".rv-s > h3, .ship-sech > h3")).toHaveText(["Commits", /^Files/, "Conversation", "Jobs", "Lanes"]);
   await page.waitForTimeout(600);
   expect(await shifts()).toEqual([]);
 });

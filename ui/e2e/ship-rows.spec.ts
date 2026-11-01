@@ -1,7 +1,7 @@
 /**
  * Ship's rows (plan 01a175b7f20b7277b15bddd2ad001bcc, step 5), at 390 against the mock's fixed rows:
- * every row keeps one height whatever its state, and keeps it as a row opens, a change unfolds and
- * the row closes again. And each row as f-ship draws it (plan 01a1856fe81375b1bd1d1d86f270a45b,
+ * every row (a repository's, docs/ci.md W26-R29) keeps one height whatever its state, and keeps it
+ * as a row opens and closes again. And each row as f-ship draws it (plan 01a1856fe81375b1bd1d1d86f270a45b,
  * step 6): its stand word in mono capitals in the stand's colour, who with a person's or an agent's
  * mark, the environment it runs in as a flag, and the strip's stages named under its pips (not on a
  * phone), at 390 and 1280.
@@ -17,17 +17,17 @@ const heights = (page: Page) => page.locator(".ship-row > .ship-r").evaluateAll(
 
 test("a row keeps one height whatever its state", async ({ page }) => {
   await page.goto("/ship");
-  const rows = page.getByRole("list", { name: "Commits", exact: true }).locator(":scope > li");
+  const rows = page.getByRole("list", { name: "Repositories", exact: true }).locator(":scope > li");
   await expect(rows.first()).toBeVisible();
   const before = await heights(page);
-  expect(before.length).toBeGreaterThan(3);
+  expect(before.length).toBeGreaterThanOrEqual(3);
   expect(new Set(before).size).toBe(1);
 
   await rows
     .first()
     .getByRole("button", { name: /^Open / })
     .click();
-  await page.getByRole("button", { name: /Show 1 more commit of CR12/ }).click();
+  await expect(rows.first().locator("section.ship-commits .sc-c").first()).toBeVisible({ timeout: 15_000 });
   const during = await heights(page);
   expect(new Set(during).size).toBe(1);
   expect(during[0]).toBe(before[0]);
@@ -43,7 +43,7 @@ for (const width of [390, 1280])
   test(`at ${width}, each row as f-ship draws it: the stand in capitals, who with a mark, the environment as a flag`, async ({ page }) => {
     await page.setViewportSize({ width, height: 900 });
     await page.goto("/ship");
-    const rows = page.getByRole("list", { name: "Commits", exact: true }).locator(":scope > li.ship-row");
+    const rows = page.getByRole("list", { name: "Repositories", exact: true }).locator(":scope > li.ship-row");
     await expect(rows.first()).toBeVisible();
     const drawn = await rows.evaluateAll((els) =>
       els.map((li) => {
@@ -64,7 +64,7 @@ for (const width of [390, 1280])
         };
       }),
     );
-    expect(drawn.length).toBeGreaterThan(3);
+    expect(drawn.length).toBeGreaterThanOrEqual(3);
     for (const r of drawn) {
       expect({ caps: r.caps, mono: r.mono, size: r.size }, r.stand).toEqual({ caps: "uppercase", mono: true, size: "10px" });
       // A person's or an agent's mark, an agent's for an agent's principal, and a name beside it.

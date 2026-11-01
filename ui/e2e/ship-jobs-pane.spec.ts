@@ -1,6 +1,6 @@
 /**
  * An opened commit's Jobs as one pane (docs/ci.md W26-R23, as Ada approved it on 2026-10-30), against
- * the mock's failing row (3333333): the strip over the jobs by stage, the picked job's output beside
+ * the mock's failing commit (3333333): the strip over the jobs by stage, the picked job's output beside
  * them on a desktop and under its line on a phone, where the strip comes again. A line picks its job
  * alone and its glyph adds it to the pick; the words pick failed, running, waiting or all; Retry,
  * Pause (Resume) and Cancel are one width, dimmed where they don't apply, and each reaches
@@ -8,6 +8,7 @@
  * nothing moves and nothing scrolls sideways.
  */
 import { expect, test, type Locator, type Page } from "@playwright/test";
+import { pickCommit } from "./ship-pick";
 
 const REAL = !!process.env.E2E_BASE_URL;
 test.skip(REAL, "drives the mock's commits");
@@ -20,8 +21,8 @@ async function open(page: Page): Promise<{ pane: Locator; sha: string }> {
   // foot, and on a phone a tap meant for what's under them lands on them: set aside, as the layout-shift
   // count already leaves them out.
   await page.addStyleTag({ content: ".rq-viewport { display: none !important; }" });
-  const row = page.locator(".ship-row").filter({ hasText: "3333333" }).first();
-  await row.getByRole("button", { name: /^Open / }).click();
+  // Ship's rows are repositories (W26-R29): kiln's, its failing commit picked.
+  const row = await pickCommit(page, "3333333");
   const pane = row.getByRole("region", { name: "Jobs" });
   await expect(pane.locator(".jp-strip").first()).toBeVisible({ timeout: 15_000 });
   await expect(pane.locator(".jp-j[data-job]").first()).toBeVisible({ timeout: 15_000 });

@@ -22,7 +22,7 @@ test("from 320 to 1440 px an opened commit is never wider than its window, its l
   const row = page.locator(".ship-row").filter({ hasText: "D41" }).first();
   await expect(row).toBeVisible({ timeout: 15_000 });
   await row.locator(".ship-go").click();
-  await expect(row.locator(".rv-s > h3, .ship-sech > h3")).toHaveText([/^Files/, "Conversation", "Jobs", "Lanes"], { timeout: 15_000 });
+  await expect(row.locator(".rv-s > h3, .ship-sech > h3")).toHaveText(["Commits", /^Files/, "Conversation", "Jobs", "Lanes"], { timeout: 15_000 });
   await expect(row.locator(".ship-lanesbox")).toBeVisible({ timeout: 15_000 });
   const scale = row.locator('section[aria-label="Lanes"]').getByRole("group", { name: "Lanes' scale" });
   const wide: string[] = [];

@@ -9,6 +9,7 @@
  * names itself in words.
  */
 import { expect, test, type Page } from "@playwright/test";
+import { pickCommit, repoRow } from "./ship-pick";
 import { STATES } from "../src/components/ui/status-glyph-spec";
 
 const REAL = !!process.env.E2E_BASE_URL;
@@ -41,7 +42,7 @@ test("with reduced motion, nothing on Ship moves as commits arrive, a row opens 
   await watchMotion(page);
   try {
     await page.goto("/ship");
-    const list = page.getByRole("list", { name: "Commits", exact: true });
+    const list = page.getByRole("list", { name: "Repositories", exact: true });
     await expect(list.locator(":scope > li").first()).toBeVisible({ timeout: 15_000 });
     // The device's setting is the page's one switch: every animation looks at it.
     await expect(page.locator("html")).toHaveAttribute("data-motion", "paused");
@@ -52,10 +53,11 @@ test("with reduced motion, nothing on Ship moves as commits arrive, a row opens 
     const still = await drawn();
     await page.waitForTimeout(2_500);
     expect(await drawn(), "the rule held still").toBe(still);
-    // Commits arrive and the list takes a new order, the pointer off it: rows take their places at once.
+    // Commits arrive, the pointer off the list: kiln's row (Ship's rows are repositories, W26-R29) takes
+    // its newest at once.
     await page.request.post("/api/mock/ship/agents?n=6&over=3");
-    await expect(list.locator(":scope > li").filter({ hasText: "release: production waits on you" })).toBeVisible({ timeout: 20_000 });
-    await expect(list.locator(":scope > li").filter({ hasText: "agent: asks about flake 4" })).toBeVisible({ timeout: 20_000 });
+    const row = repoRow(page);
+    await expect(row.locator(".ship-text")).toContainText(/^(agent: |release: )/, { timeout: 20_000 });
     // A row opens by its Diff (Review) button and its Files come into view: by one jump, not a scroll.
     await page.evaluate(() => {
       const w = window as unknown as { ys: number[] };
@@ -66,8 +68,12 @@ test("with reduced motion, nothing on Ship moves as commits arrive, a row opens 
       };
       requestAnimationFrame(f);
     });
-    const row = list.locator(":scope > li").filter({ hasText: "D41" }).first();
-    await row.getByRole("button", { name: "Review", exact: true }).click();
+    // The row opens, and its Diff brings its newest's Files into view.
+    await row.getByRole("button", { name: /^Open / }).click();
+    await row
+      .getByRole("navigation", { name: /'s pages$/ })
+      .getByRole("button", { name: "Diff", exact: true })
+      .click();
     await expect(row.locator('section[aria-label="Files"]')).toBeFocused({ timeout: 15_000 });
     await page.waitForTimeout(1_500);
     const ys = await page.evaluate(() => (window as unknown as { ys: number[] }).ys);
@@ -98,16 +104,14 @@ test("in grayscale, every state Ship draws is told from every other by its glyph
     for (const g of await glyphsOn(page)) if (g.state && !found.has(g.state)) found.set(g.state, g);
   };
   await page.goto("/ship");
-  const list = page.getByRole("list", { name: "Commits", exact: true });
+  const list = page.getByRole("list", { name: "Repositories", exact: true });
   await expect(list.locator(":scope > li").first()).toBeVisible({ timeout: 15_000 });
   await take();
-  for (const name of ["D41", "sync: a move carries its homes", "ci: a landed change"]) {
-    const row = list.locator(":scope > li").filter({ hasText: name }).first();
-    const go = row.locator(".ship-go");
-    if ((await go.getAttribute("aria-expanded")) !== "true") await go.click();
+  // Each picked in kiln's row (W26-R29), its Lanes and job cards drawn.
+  for (const name of ["pipeline: dynamic matrices", "sync: a move carries its homes", "ci: a landed change"]) {
+    const row = await pickCommit(page, name);
     await expect(row.locator('section[aria-label="Lanes"] .ship-lanesbox')).toBeVisible({ timeout: 15_000 });
     await take();
-    await go.click();
   }
   const commits = ((await (await page.request.get("/api/ship/commits")).json()) as { commits: { repo: string; sha: string }[] }).commits;
   for (const c of commits) {

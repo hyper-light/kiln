@@ -62,6 +62,14 @@ requirements, W26-R21 to W26-R27.
     each strip verb as its CD operation, with the caller's rights.
   - UI: Ship's tabs become Commits and Deploys. The Runs tab goes, and /runs lands on Ship. An
     opened app is drawn as the stills draw it, and an e2e checks the stills' content word for word.
+- **Repositories as Ship's rows (W26-R29, Ada 2026-11-01).** Each row is a repository, showing its
+  newest commit (`GET /api/ship/commits?by=repo`). Opened, its first section is its commits:
+  - 5, 10, 25, 50 or 100 a page, with Newer and Older;
+  - each line has its checks' glyph, sha, message, author, machines, run time and when (each
+    commit's new `ran` and `machines`).
+
+  Picking one fills Files, Jobs and Lanes below a divider. The Kiln CI -> GitHub agent's row
+  buttons (W26-R28) act on the row's commit, its repository's newest.
 - **Wire.** `ServerMsg::Freeze` is variant 64, right after `ReachRefused`, and `CAP_FREEZE` is bit
   53. docs/wire.md keeps bits 42 to 52 for W27's and the unification's lines: they use those bits on
   their branches.

@@ -1,20 +1,20 @@
 /**
- * The opened item's sections in their order (W26-R06, R14): Files (with the Conversation), the
- * terminal output, Jobs right above Lanes — for every item at every stage: a commit with no
- * change, a diff, a change request and a landed change. Chromium and WebKit, desktop and phone.
+ * The opened item's sections in their order (W26-R06, R14, R29): its repository's Commits, then the
+ * picked commit's Files (with the Conversation), the terminal output, Jobs right above Lanes — for
+ * every item at every stage: a commit with no change, a diff, a change request and a landed change.
+ * Chromium and WebKit, desktop and phone.
  */
 import { expect, test, type Page } from "@playwright/test";
+import { pickCommit } from "./ship-pick";
 
 const REAL = !!process.env.E2E_BASE_URL;
 test.skip(REAL, "drives the mock's commits");
 
-const SECTIONS = [/^Files/, "Conversation", "Jobs", "Lanes"];
+const SECTIONS = ["Commits", /^Files/, "Conversation", "Jobs", "Lanes"];
 
 const open = async (page: Page, name: string) => {
   await page.goto("/ship");
-  const row = page.locator(".ship-row", { hasText: name }).first();
-  await row.locator(".ship-main").click();
-  return row;
+  return pickCommit(page, name);
 };
 
 test("a commit with no change opens Files, Conversation, Jobs, Lanes", async ({ page }) => {

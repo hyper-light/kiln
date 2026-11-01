@@ -1179,3 +1179,208 @@
   grid-row: 2;
   visibility: hidden;
 }
+
+/* A repository's commits (docs/ci.md W26-R29; Ada, 2026-11-01): the first section of its opened row,
+   a line each with Runs' columns, a page held at its height whatever it holds, and a hairline under
+   it before the picked commit's Files (Ada: "some sort of divider between the commit section and
+   the files below"). A picked line is the jobs pane's: a square tint and a straight 2px edge. */
+.ship-open .ship-commits {
+  padding-bottom: 12px;
+  margin-bottom: 16px;
+  border-bottom: 1px solid var(--k-line, #2a2c31);
+}
+.sc-slot {
+  min-height: 430px;
+}
+.sc-per {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: #6d7078;
+  font-size: 12px;
+}
+.sc-per button {
+  all: unset;
+  cursor: pointer;
+  padding: 0 2px;
+  color: #8b8e96;
+}
+.sc-per button[aria-pressed="true"] {
+  color: #e4e5e7;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.sc-h,
+.sc-b {
+  display: grid;
+  grid-template-columns: 24px 64px minmax(0, 1fr) 128px 150px 72px 64px;
+  align-items: center;
+  column-gap: 10px;
+}
+.sc-h {
+  height: 26px;
+  padding: 0 8px 0 10px;
+  border-top: 1px solid var(--k-line-2, #1f2125);
+  border-bottom: 1px solid var(--k-line-2, #1f2125);
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: #6d7078;
+}
+.sc-h > :nth-child(6),
+.sc-h > :nth-child(7) {
+  text-align: right;
+}
+.sc-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  min-height: calc(var(--sc-per, 10) * 30px);
+}
+.sc-b {
+  all: unset;
+  box-sizing: border-box;
+  display: grid;
+  grid-template-columns: 24px 64px minmax(0, 1fr) 128px 150px 72px 64px;
+  align-items: center;
+  column-gap: 10px;
+  width: 100%;
+  height: 30px;
+  padding: 0 8px 0 10px;
+  cursor: pointer;
+  color: #b9bbc2;
+  font-size: 12.5px;
+}
+.sc-b > * {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sc-c:not([data-sel]) .sc-b:hover {
+  background: rgb(255 255 255 / 0.03);
+}
+.sc-c[data-sel] .sc-b {
+  background: rgb(205 198 234 / 0.1);
+  color: #e4e5e7;
+  box-shadow: inset 2px 0 0 #cdc6ea;
+}
+.sc-b:focus-visible,
+.sc-per button:focus-visible,
+.sc-pager button:focus-visible {
+  outline: 2px solid #a6c4ed;
+  outline-offset: -2px;
+}
+.sc-sha {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 11px;
+  color: #a6b2c6;
+}
+.sc-who,
+.sc-on {
+  color: #8c8f98;
+  font-size: 12px;
+}
+.sc-on {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 11px;
+}
+.sc-took,
+.sc-ago {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: #a1a4ad;
+  font-size: 12px;
+}
+.sc-ago {
+  color: #7b7e88;
+}
+.sc-l2 {
+  display: none;
+}
+.sc-pager {
+  display: grid;
+  grid-template-columns: 72px 96px 72px;
+  justify-content: end;
+  align-items: center;
+  gap: 6px;
+  padding-top: 8px;
+}
+.sc-pager button {
+  all: unset;
+  box-sizing: border-box;
+  height: 28px;
+  display: inline-grid;
+  place-items: center;
+  border: 1px solid rgb(255 255 255 / 0.14);
+  color: #c9cbd1;
+  font-size: 12px;
+  cursor: pointer;
+}
+.sc-pager button:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+.sc-pager span {
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  color: #a1a4ad;
+  font-size: 12px;
+}
+/* Where Runs' columns don't fit (a phone, a narrow window), each commit takes two lines: its glyph,
+   its message and when; under them its sha, author, machine and run time. */
+@media (max-width: 900px) {
+  .sc-h {
+    display: none;
+  }
+  .sc-slot {
+    min-height: 600px;
+  }
+  .sc-list {
+    min-height: calc(var(--sc-per, 10) * 46px);
+  }
+  .sc-b {
+    height: auto;
+    min-height: 46px;
+    grid-template-columns: 20px minmax(0, 1fr) auto;
+    grid-template-rows: auto auto;
+    row-gap: 2px;
+    padding: 6px 8px 6px 10px;
+  }
+  .sc-b > .sg {
+    grid-row: 1 / 3;
+    align-self: start;
+    margin-top: 2px;
+  }
+  .sc-b > .sc-sha,
+  .sc-b > .sc-who,
+  .sc-b > .sc-on,
+  .sc-b > .sc-took {
+    display: none;
+  }
+  .sc-b > .sc-msg {
+    grid-column: 2;
+    grid-row: 1;
+  }
+  .sc-b > .sc-ago {
+    grid-column: 3;
+    grid-row: 1;
+  }
+  .sc-l2 {
+    display: block;
+    grid-column: 2 / 4;
+    grid-row: 2;
+    color: #7b7e88;
+    font-size: 11.5px;
+  }
+  .sc-l2 b {
+    font-family: var(--mono, ui-monospace, monospace);
+    font-weight: 400;
+    font-size: 10.5px;
+    color: #a6b2c6;
+  }
+  .sc-pager {
+    grid-template-columns: 1fr 96px 1fr;
+  }
+}

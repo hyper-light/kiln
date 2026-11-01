@@ -66,6 +66,13 @@ export interface ShipCommit {
    */
   made_by?: { agent?: string; person?: string } | null;
   actions?: ShipAction[];
+  /**
+   * When its jobs ran (unix seconds): the first one's start to the last one's end, `to` null while
+   * one runs; null when none has started (docs/ci.md W26-R29).
+   */
+  ran?: { from: number; to: number | null } | null;
+  /** The machines its jobs ran on, in the order they started. */
+  machines?: string[];
   /** A hash of what the row shows (W26-R06): the same row, the same `v`. */
   v?: string;
 }
@@ -151,6 +158,8 @@ export interface ShipJobDone {
 
 /** What a list asks for: a repository, the facets (W26-R02), a page. */
 export interface ShipQuery {
+  /** `repo`: each repository's newest commit, Ship's rows (docs/ci.md W26-R29). */
+  by?: "repo";
   repo?: string;
   host?: string;
   kind?: string;

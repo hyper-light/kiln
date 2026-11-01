@@ -3,8 +3,11 @@
  * against the mock's fixed rows: pick a job in the jobs pane, or walk the lanes in Detail, focus a
  * control in the open row, let the list refresh while a commit arrives, and the pane keeps its pick,
  * the lanes their walk, room and rows, the focus and the page stay, and the row stays open in its place.
+ * The commit arrives in the opened row's repository (docs/ci.md W26-R29): the row says it, its newest,
+ * and the commit picked, and its sections, stay.
  */
 import { expect, test } from "@playwright/test";
+import { repoRow } from "./ship-pick";
 
 const REAL = !!process.env.E2E_BASE_URL;
 test.skip(REAL, "drives the mock's commits");
@@ -16,7 +19,7 @@ test("the jobs pane's pick and focus in an open row survive updates", async ({ p
   try {
     await page.setViewportSize({ width: 800, height: 900 });
     await page.goto("/ship");
-    const row = page.locator(".ship-row").filter({ hasText: "D41" }).first();
+    const row = repoRow(page);
     await expect(row).toBeVisible({ timeout: 15_000 });
     await row.locator(".ship-go").click();
     // A job that has run, picked by hand: its line shown, its output beside it.
@@ -36,6 +39,9 @@ test("the jobs pane's pick and focus in an open row survive updates", async ({ p
     await expect(pane.locator(".jp-j[data-sel]")).toHaveCount(1);
     await expect(copy).toBeFocused();
     await expect(row.locator(".ship-go")).toHaveAttribute("aria-expanded", "true");
+    // The row is its repository's newest, the one that arrived; the commit picked is still D41's.
+    await expect(row.locator(".ship-text")).toHaveText(/^arrived 1 · /);
+    await expect(row.locator('section.ship-commits .sc-c[data-sel="true"]')).toContainText("4444444");
   } finally {
     await page.request.post("/api/mock/ship/arrive?clear=1");
   }
@@ -48,7 +54,7 @@ test("the lanes' walk, room, rows and focus in an open row survive updates", asy
   try {
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/ship");
-    const row = page.locator(".ship-row").filter({ hasText: "D41" }).first();
+    const row = repoRow(page);
     await expect(row).toBeVisible({ timeout: 15_000 });
     await row.locator(".ship-go").click();
     const lanes = row.locator('section[aria-label="Lanes"]');

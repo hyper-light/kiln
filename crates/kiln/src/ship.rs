@@ -1237,8 +1237,23 @@ fn summary_of(rec: &Records, j: &Journey, now: i64, yours: bool) -> Value {
         }),
         (None, _) => Value::Null,
     };
+    // When its jobs ran, the first one's start to the last one's end (`to` null while one runs), and
+    // the machines they ran on in the order they started: each commit's line in a repository's
+    // commits says them (docs/ci.md W26-R29). Times, not a running count, so the row's JSON (and its
+    // version) holds still while a job runs.
+    let running = rec.legs.iter().any(|l| l.started.is_some() && l.finished.is_none());
+    let ran = rec.legs.iter().filter_map(|l| l.started).min().map(|from| json!({ "from": from, "to": if running { None } else { rec.legs.iter().filter_map(|l| l.finished).max() } }));
+    let mut by_start: Vec<&LegRec> = rec.legs.iter().filter(|l| l.agent.is_some()).collect();
+    by_start.sort_by_key(|l| l.started.unwrap_or(i64::MAX));
+    let mut machines: Vec<&str> = Vec::new();
+    for a in by_start.iter().filter_map(|l| l.agent.as_deref()) {
+        if !machines.contains(&a) {
+            machines.push(a);
+        }
+    }
     let row = json!({
         "repo": rec.repo, "sha": rec.sha, "short": short(&rec.sha),
+        "ran": ran, "machines": machines,
         "message": message,
         "author": first.map(|r| r.actor.clone()).or_else(|| ch.map(|c| c.author.clone())).unwrap_or_default(),
         "branch": first.map(|r| r.branch.clone()).unwrap_or_default(),
@@ -1454,6 +1469,46 @@ pub async fn list_in(store: &crate::store::Store, q: &HashMap<String, String>, o
         .collect();
     let next = if more { page.last().and_then(|c| c.get("cursor")).cloned() } else { None };
     Ok(json!({ "commits": page, "next_cursor": next }))
+}
+
+/// Each repository's newest commit in view, newest first, from the store (`by=repo`, when memory
+/// can't say: docs/ci.md W26-R29). Each is the first of its repository's own list, so it's the
+/// commit that list shows on top, with the same facets.
+pub async fn heads_in(store: &crate::store::Store, q: &HashMap<String, String>, only: Option<String>, viewer: Option<&HashSet<String>>, runners: Vec<RunnerSeen>, deploys: &[CdDeploy], now: i64) -> Result<Value, Fail> {
+    let names: Option<Vec<String>> = only.as_deref().map(|o| serde_json::from_str(o).unwrap_or_default());
+    let repos = store.repos().await.map_err(internal)?;
+    let mut heads: Vec<Value> = Vec::new();
+    for r in repos.iter().filter(|r| names.as_ref().is_none_or(|n| n.contains(&r.name))) {
+        let mut one = q.clone();
+        one.insert("repo".into(), r.name.clone());
+        one.insert("limit".into(), "1".into());
+        one.remove("cursor");
+        let page = list_in(store, &one, only.clone(), viewer, runners.clone(), deploys, now).await?;
+        if let Some(c) = page.get("commits").and_then(Value::as_array).and_then(|a| a.first()) {
+            heads.push(c.clone());
+        }
+    }
+    heads.sort_by_key(|c| std::cmp::Reverse(c.get("cursor").and_then(Value::as_i64).unwrap_or(0)));
+    Ok(json!({ "commits": heads, "next_cursor": null }))
+}
+
+/// A page's JSON as the list sends it: its commits' JSON as held, and where the next page starts.
+fn page_body(page: &[(i64, &str)], next: Option<i64>) -> String {
+    let mut out = String::with_capacity(page.iter().map(|(_, j)| j.len() + 1).sum::<usize>() + 48);
+    out.push_str("{\"commits\":[");
+    for (i, (_, json)) in page.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(json);
+    }
+    out.push_str("],\"next_cursor\":");
+    match next {
+        Some(f) => out.push_str(&f.to_string()),
+        None => out.push_str("null"),
+    }
+    out.push('}');
+    out
 }
 
 /// One commit of a repository, with the records its stand came from.
@@ -1736,21 +1791,28 @@ impl ShipCache {
         }
         let more = picked.len() > limit;
         let page = picked.get(..limit.min(picked.len())).unwrap_or_default();
-        let mut out = String::with_capacity(page.iter().map(|(_, j)| j.len() + 1).sum::<usize>() + 48);
-        out.push_str("{\"commits\":[");
-        for (i, (_, json)) in page.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
+        Ok(Some(page_body(page, page.last().filter(|_| more).map(|(f, _)| *f))))
+    }
+
+    /// Each repository's newest commit in view, newest first: Ship's rows are repositories, each
+    /// showing its newest commit (docs/ci.md W26-R29). None until the model is built, or when a
+    /// repository in view holds none that matches though it has commits memory doesn't hold: the
+    /// store says then.
+    pub fn heads(&self, only: Option<&[String]>, facets: &Facets, viewer: Option<&HashSet<String>>) -> Result<Option<String>, Fail> {
+        let h = self.held.read().map_err(|_| poisoned())?;
+        if !h.built {
+            return Ok(None);
+        }
+        let mut picked: Vec<(i64, &str)> = Vec::new();
+        for (_, r) in h.repos.iter().filter(|(name, _)| only.is_none_or(|o| o.iter().any(|n| n == *name))) {
+            match r.order.iter().find_map(|(f, sha)| r.rows.get(sha).filter(|row| facets.matches(row.kind, row.host.as_deref())).map(|row| (*f, row.json(viewer)))) {
+                Some(p) => picked.push(p),
+                None if r.order.len() < r.total => return Ok(None),
+                None => {}
             }
-            out.push_str(json);
         }
-        out.push_str("],\"next_cursor\":");
-        match page.last().filter(|_| more) {
-            Some((f, _)) => out.push_str(&f.to_string()),
-            None => out.push_str("null"),
-        }
-        out.push('}');
-        Ok(Some(out))
+        picked.sort_unstable_by_key(|p| std::cmp::Reverse(p.0));
+        Ok(Some(page_body(&picked, None)))
     }
 
     /// The list's pace line for the repositories in view, from memory (plan
@@ -1846,7 +1908,16 @@ pub async fn list(hub: &std::sync::Arc<Hub>, q: &HashMap<String, String>, caller
         None => None,
     };
     let repo = q.get("repo").map(String::as_str).filter(|r| !r.is_empty());
-    match c.page(repo, only.as_deref(), &Facets::from_query(q), viewer.as_ref(), cursor, limit)? {
+    // `by=repo`: Ship's rows, each repository's newest commit (docs/ci.md W26-R29); a repository
+    // chosen narrows them to it.
+    let heads = q.get("by").is_some_and(|b| b == "repo");
+    let in_view: Option<Vec<String>> = match (repo, only.as_ref()) {
+        (Some(r), Some(o)) => Some(o.iter().filter(|n| n.as_str() == r).cloned().collect()),
+        (Some(r), None) => Some(vec![r.to_owned()]),
+        (None, o) => o.cloned(),
+    };
+    let held = if heads { c.heads(in_view.as_deref(), &Facets::from_query(q), viewer.as_ref())? } else { c.page(repo, only.as_deref(), &Facets::from_query(q), viewer.as_ref(), cursor, limit)? };
+    match held {
         Some(mut body) => {
             // The pace line's words go with the page (an optional field).
             if let Some(pace) = c.pace(repo, only.as_deref(), &runners).and_then(|p| serde_json::to_string(&p).ok())
@@ -1858,6 +1929,10 @@ pub async fn list(hub: &std::sync::Arc<Hub>, q: &HashMap<String, String>, caller
                 body.push('}');
             }
             Ok(srv::response(StatusCode::OK, "application/json", srv::full(body)))
+        }
+        None if heads => {
+            let in_view = in_view.map(|names| serde_json::to_string(&names).unwrap_or_else(|_| "[]".into()));
+            Ok(srv::json(StatusCode::OK, &heads_in(&hub.store, q, in_view, viewer.as_ref(), runners, &deploys, now).await?))
         }
         None => {
             let only = only.map(|names| serde_json::to_string(&names).unwrap_or_else(|_| "[]".into()));
@@ -2709,6 +2784,16 @@ mod tests {
                         assert_eq!(serde_json::from_str::<Value>(&got)?, want, "round {round}: the list of {limit} {fq:?} for {viewer:?} from memory isn't the store's");
                         compared += 1;
                     }
+                    // Ship's rows (W26-R29): each repository's newest commit, through the same facets.
+                    if limit == 2 {
+                        let mut hq: HashMap<String, String> = fq.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+                        hq.insert("by".into(), "repo".into());
+                        let want = heads_in(store, &hq, None, viewer, runners(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+                        if let Some(got) = cache.heads(None, &Facets::from_query(&hq), viewer).map_err(|(_, m)| anyhow::anyhow!(m))? {
+                            assert_eq!(serde_json::from_str::<Value>(&got)?, want, "round {round}: the repositories' newest commits {fq:?} for {viewer:?} from memory aren't the store's");
+                            compared += 1;
+                        }
+                    }
                     if !fq.is_empty() {
                         continue;
                     }
@@ -3310,6 +3395,70 @@ mod tests {
             anyhow::ensure!(code(jobs_in(&hub, &owner, &ask("retry", json!({}))).await) == 400);
             anyhow::ensure!(code(jobs_in(&hub, &crate::authz::Caller::peer("user:ro", "viewer"), &ask("pause", json!({ "scope": "all" }))).await) == 403);
             anyhow::ensure!(code(jobs_in(&hub, &owner, &json!({ "repo": "acme/two", "sha": "f00d", "verb": "retry", "scope": "all" })).await) == 404);
+            Ok(())
+        })
+    }
+
+    /// W26-R29: Ship's rows are repositories, each its newest commit, newest first (`by=repo`); and
+    /// each commit says when its jobs ran, the first one's start to the last one's end (open while
+    /// one runs), and the machines they ran on, in the order they started.
+    #[test]
+    fn w26_r29_rows_are_repositories_and_a_commit_says_when_and_where_it_ran() -> anyhow::Result<()> {
+        within(async {
+            let hub = crate::hub::tests::scratch_hub_with(|_| {}).await?;
+            let p = crate::pipeline::parse("name: ci\njobs:\n  a: {steps: [{run: x}]}\n  b: {steps: [{run: y}]}\n")?;
+            let older = "1111111aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+            let other = "2222222bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+            let newer = "3333333ccccccccccccccccccccccccccccccccc";
+            let mut jobs: HashMap<String, Vec<String>> = HashMap::new();
+            for (n, (repo_id, repo, sha)) in [("r-one", "acme/one", older), ("r-two", "acme/two", other), ("r-one", "acme/one", newer)].into_iter().enumerate() {
+                let r = hub
+                    .store
+                    .upsert_repo(crate::store::Repo { id: repo_id.into(), name: repo.into(), clone_url: format!("https://example/{repo}"), branches: vec![], poll_seconds: 60, enabled: true, created_at: 0, last_polled_at: None, last_error: None, mode: "upstream".into(), default_branch: None, mirror: None })
+                    .await?;
+                let run = crate::store::Run {
+                    id: format!("run-{n}"),
+                    repo_id: r.id.clone(),
+                    repo_name: r.name.clone(),
+                    number: i64::try_from(n)? + 1,
+                    pipeline: p.name.clone(),
+                    event: "push".into(),
+                    branch: "main".into(),
+                    sha: sha.into(),
+                    message: format!("commit {n}"),
+                    author: "ada".into(),
+                    status: crate::store::Status::Queued,
+                    created_at: NOW_S + i64::try_from(n)?,
+                    started_at: None,
+                    finished_at: None,
+                    error: None,
+                    concurrency_group: None,
+                };
+                hub.store.create_run(run, crate::pipeline::plan(&p, &crate::pipeline::Context::default())?).await?;
+                jobs.insert(sha.into(), hub.store.jobs(format!("run-{n}"), false).await?.into_iter().map(|j| j.id).collect());
+            }
+            let of = |sha: &str, i: usize| jobs.get(sha).and_then(|j| j.get(i)).cloned().unwrap_or_default();
+            // The newer commit: a on ag2, then b on ag1, both ended. The other repository's: a, still running.
+            for (job, agent) in [(of(newer, 0), "ag2"), (of(newer, 1), "ag1"), (of(other, 0), "ag1")] {
+                anyhow::ensure!(hub.store.claim_job(job, agent.into(), "baremetal".into()).await?, "claimed");
+            }
+            for job in [of(newer, 0), of(newer, 1)] {
+                hub.store.finish_job(job, crate::store::Status::Succeeded, Some(0), None, None, None).await?;
+            }
+            let heads = heads_in(&hub.store, &HashMap::from([("by".to_string(), "repo".to_string())]), None, None, Vec::new(), &[], NOW_S * 1000).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let rows = heads.get("commits").and_then(Value::as_array).cloned().unwrap_or_default();
+            let shas: Vec<&str> = rows.iter().filter_map(|c| c.get("sha").and_then(Value::as_str)).collect();
+            anyhow::ensure!(shas == [newer, other], "each repository's newest, newest first: {shas:?}");
+            let row = |sha: &str| rows.iter().find(|c| c.get("sha").and_then(Value::as_str) == Some(sha)).cloned().unwrap_or_default();
+            let (n, o) = (row(newer), row(other));
+            let (from, to) = (n.pointer("/ran/from").and_then(Value::as_i64), n.pointer("/ran/to").and_then(Value::as_i64));
+            anyhow::ensure!(from.is_some() && to.is_some() && from <= to, "the newer ran from its first start to its last end: {n}");
+            anyhow::ensure!(n.get("machines") == Some(&json!(["ag2", "ag1"])), "its machines in the order they started: {n}");
+            anyhow::ensure!(o.pointer("/ran/from").is_some_and(Value::is_i64) && o.pointer("/ran/to") == Some(&Value::Null), "a commit still running has no end yet: {o}");
+            anyhow::ensure!(o.get("machines") == Some(&json!(["ag1"])), "{o}");
+            // A commit none of whose jobs started says neither.
+            let d = get_in(&hub.store, "acme/one", older, None, Vec::new(), &[], NOW_S * 1000).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            anyhow::ensure!(d.get("ran") == Some(&Value::Null) && d.get("machines") == Some(&json!([])), "{d}");
             Ok(())
         })
     }

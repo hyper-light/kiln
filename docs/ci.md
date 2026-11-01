@@ -8716,6 +8716,21 @@ a time. The design was agreed on a live mock built on Ship's own prototype
   (`cd.apps.set_auto_sync`), kept in the store's settings and audited, as auto-rollback is. It beats
   the deploy file until the file changes what it says (cd.md, "Auto-sync"). Prune keeps its own
   knob; deleting an app is as before.
+- **W26-R29 Repositories as Ship's rows.** Ada, 2026-11-01: "each item maps to a repo, and commits
+  are browsable from within there".
+  - Each of Ship's rows is a repository, showing its newest commit: its stand and line, its journey,
+    who and when, and its actions (`GET /api/ship/commits?by=repo`).
+  - Opened, its first section is the repository's commits, newest first, a page at a time (5, 10,
+    25, 50 or 100; ten by default), with Newer and Older, narrowed by the host and kind the list is
+    narrowed by. Each line has its checks' glyph, sha, message (cut), author, the machines its jobs
+    ran on, how long they ran (first start to last end: `ran`, open while one runs) and when; two
+    lines on a phone.
+  - Picking a line fills the sections below with its commit: Files with the Conversation, Jobs and
+    Lanes. A divider separates the commits from Files. The commit picked stays picked as newer ones
+    arrive (the row shows the newest); the row's Review picks the newest again.
+  - Paging moves the list only: the page before stays until the next is in, and the list holds a
+    page's height, so nothing beside it moves. A page keeps the commits it shows: one that arrives
+    meanwhile waits behind Newer.
 
 **Hosts.** Theirs where a host has it, kiln's where it doesn't (R20's seam says which, per
 repository):
@@ -8789,6 +8804,17 @@ repository):
   Keep sending nothing, Delete dimmed where a deploy file declares the app, a refusal's why in the
   strip; no layout shift through picking, acting and CD's events; nothing sideways at
   320, 390 and 1280. *`ui/e2e/ship-deploys.spec.ts`; `ui/e2e/ship-routes.spec.ts`; every Ship e2e.*
+- **W26-AC20 Repositories as rows.** Over the store and from memory alike, Ship's rows are each
+  repository's newest commit, newest first, through every facet and as each viewer. A commit says
+  when its jobs ran (open while one runs) and on which machines, in the order they started. In
+  Chromium and WebKit, at a desktop's width and a phone's:
+  - an opened repository's commits page 5, 10, 25, 50 and 100 at a time, Newer and Older off at
+    either end;
+  - picking a commit puts its own Files, Jobs and Lanes below the divider;
+  - the list keeps its height as it pages, and nothing scrolls sideways at 320, 390 and 1280.
+
+  *`ship::tests::w26_r29_*`, `ship_memory_is_what_the_store_says_through_random_changes`;
+  `ui/e2e/ship-repos.spec.ts`; every Ship e2e.*
 - **W26-AC18 Deploys in Ship.** On a server with KilnCD, apps of two repositories list under them
   as CD holds each (sync, health, auto-sync, environment), and an app's pane has its settings and
   its source's commits; each verb reaches its operation: done and audited as a maintainer's, the

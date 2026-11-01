@@ -221,6 +221,54 @@ function commits(): ShipCommit[] {
       tags: ["v0.2.0"],
       runs: [{ id: "run-1", pipeline: "ci" }],
     }),
+    // Two other repositories (docs/ci.md W26-R29: Ship's rows are repositories, each its newest
+    // commit): hyper-raft's newest a person's failure, Hand off and Retry on its row (the one before
+    // it in production); acme/web's in production. kiln's row stays first.
+    row({
+      repo: "hyper-light/hyper-raft",
+      sha: sha("e1"),
+      short: "e1e1e1e",
+      message: "raft: a lease outlives a term",
+      author: "mei",
+      at: t - 2700,
+      stand: "needs_you",
+      line: "rust lint + test · assertion failed in raft::lease",
+      cursor: 22,
+      pips: pips("none", "passed", "failed"),
+      runs: [{ id: "run-hr-2", pipeline: "ci" }],
+      actions: [
+        { name: "hand_off", method: "POST", path: "/api/ship/hand-off", body: { repo: "hyper-light/hyper-raft", sha: sha("e1") } },
+        { name: "retry", method: "POST", path: "/api/ci/runs/run-hr-2/rerun", body: { mode: "failed" } },
+      ],
+    }),
+    row({
+      repo: "hyper-light/hyper-raft",
+      sha: sha("e0"),
+      short: "e0e0e0e",
+      message: "raft: elections back off",
+      author: "user:mei",
+      at: t - 5400,
+      stand: "shipped",
+      line: "In production",
+      cursor: 21,
+      pips: pips("none", "passed", "passed", "passed", "passed", "healthy"),
+      environments: [{ environment: "production", production: true }],
+      runs: [{ id: "run-hr-1", pipeline: "ci" }],
+    }),
+    row({
+      repo: "acme/web",
+      sha: sha("f1"),
+      short: "f1f1f1f",
+      message: "web: the cart keeps its items",
+      author: "user:sam",
+      at: t - 1800,
+      stand: "shipped",
+      line: "In production",
+      cursor: 31,
+      pips: pips("approved", "passed", "passed", "passed", "passed", "healthy"),
+      environments: [{ environment: "production", production: true }],
+      runs: [{ id: "run-web-1", pipeline: "ci" }],
+    }),
   ];
 }
 
@@ -520,6 +568,23 @@ function paceOf(list: ShipCommit[]): ShipPace {
 /** Every row: those a test added, the trunk's commits (newest first), then the fixed ones. */
 const all = (): ShipCommit[] => [...arrived, ...(trunk?.commits() ?? []), ...commits()];
 
+/** The machines the mock's commits ran on (examples). */
+const MACHINES = ["adacachy", "kiln-a094a12d", "adas-mac-studio-2", "jupiter"];
+
+/**
+ * A commit's run time and machines as the server says them (docs/ci.md W26-R29), where its row
+ * doesn't: from its checks pip, none before they start, no end while they run (examples).
+ */
+function withRan(c: ShipCommit): ShipCommit {
+  if (c.ran !== undefined) return c;
+  const checks = c.pips.find((x) => x.stage === "checks")?.state ?? "none";
+  const from = c.at + 20;
+  const machines = [MACHINES[Math.abs(c.cursor) % MACHINES.length] ?? "adacachy"];
+  if (checks === "none" || checks === "waiting" || checks === "queued") return { ...c, ran: null, machines: [] };
+  if (checks === "running") return { ...c, ran: { from, to: null }, machines };
+  return { ...c, ran: { from, to: from + 38 + ((Math.abs(c.cursor) * 97) % 900) }, machines };
+}
+
 /** The failing row's (3333333) Checks, fixed as Ada's approved stills of its jobs pane draw them (docs/ci.md
  * W26-R23): its failed leg, two waiting and one running, each a job of its own to act on, whatever
  * the mock's live run is doing; the failed and the running one stream the live job's log (Output). */
@@ -564,7 +629,22 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
     const list = all().filter(
       (c) => (!repo || c.repo === repo) && (!q.get("host") || c.host === q.get("host")) && (!q.get("kind") || c.kind === q.get("kind")) && (q.get("lens") !== "review" || c.kind !== "commit"),
     );
-    const page: ShipPage = { commits: list.map((c) => handedRow(c, ua)), next_cursor: null, pace: paceOf(all().filter((c) => !repo || c.repo === repo)) };
+    const pace = paceOf(all().filter((c) => !repo || c.repo === repo));
+    // Ship's rows (docs/ci.md W26-R29): each repository's newest commit, the first of its own list.
+    if (q.get("by") === "repo") {
+      const seen = new Set<string>();
+      const heads = list.filter((c) => !seen.has(c.repo) && !!seen.add(c.repo));
+      const page: ShipPage = { commits: heads.map((c) => withRan(handedRow(c, ua))), next_cursor: null, pace };
+      ctx.json(res, 200, page);
+      return true;
+    }
+    // A page: `limit` of them from where the last page's last (`cursor`) left off, as the server pages.
+    const limit = Number(q.get("limit") ?? "") || list.length;
+    const after = q.get("cursor");
+    const from = after === null ? 0 : list.findIndex((c) => String(c.cursor) === after) + 1;
+    const slice = list.slice(from, from + limit);
+    const next = from + limit < list.length ? (slice.at(-1)?.cursor ?? null) : null;
+    const page: ShipPage = { commits: slice.map((c) => withRan(handedRow(c, ua))), next_cursor: next, pace };
     ctx.json(res, 200, page);
     return true;
   }

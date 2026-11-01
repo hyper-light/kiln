@@ -16,7 +16,7 @@ test("rows hold while the pointer is on the list, and the new commit shows once 
   await page.request.post("/api/mock/ship/arrive?clear=1");
   try {
     await page.goto("/ship");
-    const list = page.getByRole("list", { name: "Commits", exact: true });
+    const list = page.getByRole("list", { name: "Repositories", exact: true });
     await expect(list.locator(":scope > li").first()).toBeVisible();
     const box = await list.boundingBox();
     if (!box) throw new Error("no list");

@@ -9,6 +9,7 @@
  * ends in an ellipsis inside its row.
  */
 import { expect, test, type Page } from "@playwright/test";
+import { repoRow } from "./ship-pick";
 
 const REAL = !!process.env.E2E_BASE_URL;
 test.skip(REAL, "drives the mock's commits");
@@ -18,14 +19,14 @@ const LONG_LINE =
 const LONG_NAME = "sync: a move carries its homes across every runner, its leases, its journals and the replicas each of them keeps in step with the others";
 const LONG_TAG = "release-candidate-for-the-runners-upgrade-of-2026-10-30";
 
-/** The fixed failing row (3333333) saying as much as production's do. */
+/** kiln's newest commit (4444444), its row's (W26-R29), and the failing one (3333333), its line in the commits, saying as much as production's do. */
 const longRows = (page: Page) =>
   page.route(
     (url) => url.pathname === "/api/ship/commits",
     async (route) => {
       const res = await route.fetch();
       const body = (await res.json()) as { commits: { short: string; message?: string; line: string; tags?: string[] }[] };
-      for (const c of body.commits) if (c.short === "3333333") Object.assign(c, { message: LONG_NAME, line: LONG_LINE, tags: [LONG_TAG] });
+      for (const c of body.commits) if (c.short === "3333333" || c.short === "4444444") Object.assign(c, { message: LONG_NAME, line: LONG_LINE, tags: [LONG_TAG] });
       await route.fulfill({ response: res, json: body });
     },
   );
@@ -55,7 +56,7 @@ for (const at of ["its own width", "320"]) {
     if (at === "320") await page.setViewportSize({ width: 320, height: 720 });
     await longRows(page);
     await page.goto("/ship");
-    const row = page.getByRole("list", { name: "Commits", exact: true }).locator(":scope > li").filter({ hasText: "3333333" }).first();
+    const row = repoRow(page);
     await expect(row).toContainText(LONG_LINE.slice(0, 40), { timeout: 15_000 });
     expect(await sideways(page)).toEqual({ page: 0, over: [] });
 

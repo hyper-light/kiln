@@ -27,7 +27,7 @@ for (const width of [1440, 1280, 1000, 800, 600, 390, 320]) {
     test.skip(isMobile, "each width is set here; the desktop projects run them all");
     await page.setViewportSize({ width, height: 900 });
     await page.goto("/ship");
-    const row = page.getByRole("list", { name: "Commits", exact: true }).locator(":scope > li").first();
+    const row = page.getByRole("list", { name: "Repositories", exact: true }).locator(":scope > li").first();
     await row.getByRole("button", { name: /^Open / }).click();
     await expect(row.locator(".ship-output .xterm")).toBeVisible({ timeout: 15_000 });
     // Review's Files above it drawn first: what's measured is lines arriving, not Files finishing its load.
@@ -74,7 +74,7 @@ for (const width of [1440, 1280, 1000, 800, 600, 390, 320]) {
 test("scrolled up, the output stays where you are", async ({ page, isMobile }) => {
   test.skip(isMobile, "the desktop projects run it");
   await page.goto("/ship");
-  const row = page.getByRole("list", { name: "Commits", exact: true }).locator(":scope > li").first();
+  const row = page.getByRole("list", { name: "Repositories", exact: true }).locator(":scope > li").first();
   await row.getByRole("button", { name: /^Open / }).click();
   const viewport = row.locator(".ship-output .xterm-viewport");
   await expect(viewport).toBeAttached({ timeout: 15_000 });
@@ -87,7 +87,7 @@ test("scrolled up, the output stays where you are", async ({ page, isMobile }) =
 /** Opens the first row at a job of its Checks that has run and waits for the log; its job and step. */
 async function openOutput(page: import("@playwright/test").Page) {
   await page.goto("/ship");
-  const row = page.getByRole("list", { name: "Commits", exact: true }).locator(":scope > li").first();
+  const row = page.getByRole("list", { name: "Repositories", exact: true }).locator(":scope > li").first();
   await row.getByRole("button", { name: /^Open / }).click();
   const last = row.locator('.jp-j[data-stage="checks"]').last();
   await expect(last).toBeVisible({ timeout: 15_000 });
@@ -152,7 +152,7 @@ test("Output as f-ship draws it: the job's glyph and Stage · job, stdout · std
   test.setTimeout(90_000);
   await page.setViewportSize({ width: 1280, height: 900 });
   await page.goto("/ship");
-  const row = page.getByRole("list", { name: "Commits", exact: true }).locator(":scope > li").first();
+  const row = page.getByRole("list", { name: "Repositories", exact: true }).locator(":scope > li").first();
   const sha = ((await row.locator(".ship-sha").first().textContent()) ?? "").trim();
   await row.getByRole("button", { name: /^Open / }).click();
   await expect(row.locator('.jp-j[data-stage="checks"]').first()).toBeVisible({ timeout: 15_000 });

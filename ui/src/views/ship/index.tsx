@@ -1,12 +1,12 @@
 /**
- * Ship (docs/ci.md W26-R01, R02; the CI/CD Integration agent's page, after its f-ship prototype):
- * every commit of a repository on its way from push to production, changes among them. A change is
- * its commits: its tip's row carries its review, the rest fold under it. Each row is Ship's own:
- * the commit, its stand and the one line saying what it's doing, its journey strip, who and when,
- * its paired actions, and the dropdown (Files with the Conversation, Output, Jobs, Lanes). The
- * facets narrow by host and kind, and a change's kind is how to see only changes: no toggle of its
- * own (Ada, 2026-10-28). Data through Suspense, changes through the endpoints the row names; no
- * effects.
+ * Ship (docs/ci.md W26-R01, R02, R29; the CI/CD Integration agent's page, after its f-ship
+ * prototype): every commit of each repository on its way from push to production, changes among
+ * them. Each row is a repository (Ada, 2026-11-01), drawn as Ship's own row of its newest commit:
+ * that commit's stand and the one line saying what it's doing, its journey strip, who and when,
+ * its paired actions; opened, the repository's commits a page at a time, and under them the picked
+ * one's sections (Files with the Conversation, Output, Jobs, Lanes). The facets narrow by host and
+ * kind, and a change's kind is how to see only changes: no toggle of its own (Ada, 2026-10-28).
+ * Data through Suspense, changes through the endpoints the row names; no effects.
  */
 import * as React from "react";
 import { ChevronDown } from "lucide-react";
@@ -21,7 +21,7 @@ import { errorMessage } from "@/lib/hooks";
 import { Link, useNavigate, useSearchParams } from "@/lib/router";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { RelTime } from "../shared";
-import { ACTION_WORD, FACET_KEYS, fold, keyOf, HOSTS, KINDS, optionsOf, order, projectOf, SHIP_STANDS, SORTS, sortOf, standCounts, standWord, strip, type Item } from "./model";
+import { ACTION_WORD, FACET_KEYS, HOSTS, KINDS, optionsOf, order, projectOf, SHIP_STANDS, SORTS, sortOf, standCounts, standWord, strip, type Item } from "./model";
 import "./ship.css";
 import { ShipViews } from "./views";
 import { Stands } from "@/views/harness/stands";
@@ -30,12 +30,16 @@ import { whoSaid } from "@/api/review";
 import { SelectField } from "@/components/ui/misc";
 import { useGlide, useListHold } from "@/views/harness/list-tools";
 import { JobsPane } from "./jobs";
+import { ShipCommits, type Narrow } from "./commits";
 import { ShipOutput } from "./output";
 import { ReviewFiles, ShipLanes, warmReview } from "./review";
 import { SectionHead } from "./head";
 import { counted } from "./review/perf";
 
 const LIMIT = 100;
+
+/** A row's key: its repository, the same as its newest commit changes (docs/ci.md W26-R29). */
+const rowKey = (it: Item) => it.head.repo;
 
 /** The stands under way, whose word shimmers as Mission control's working agents' do (f-ship's). */
 const UNDER_WAY = new Set(["landing", "checking", "building", "shipping", "replanting"]);
@@ -59,8 +63,12 @@ function ShipList() {
   const chosen: Chosen = Object.fromEntries(FACET_KEYS.map((k): [string, string[]] => [k, (params.get(k) ?? "").split(",").filter(Boolean)]).filter(([, v]) => v.length > 0));
   // One value of a facet is the server's to narrow by; several are narrowed here.
   const one = (k: string) => (chosen[k]?.length === 1 ? chosen[k][0] : undefined);
-  const q: ShipQuery = { repo: one("repo"), host: one("host"), kind: one("kind"), limit: LIMIT };
-  const key = `ship/commits/${JSON.stringify(q)}`;
+  // Ship's rows are repositories, each its newest commit (docs/ci.md W26-R29); an opened one pages
+  // through its commits itself.
+  const q: ShipQuery = { by: "repo", repo: one("repo"), host: one("host"), kind: one("kind"), limit: LIMIT };
+  // What the server narrows by narrows an opened row's commits too, so its newest is their first.
+  const narrow: Narrow = { host: q.host, kind: q.kind };
+  const key = `ship/repos/${JSON.stringify(q)}`;
   // Every stage it shows moves on its own event: a run or a leg (checks, build), review, comments and
   // conflicts, an app's sync and a rollout (staging, production), a runner's update (replant).
   const page = useSuspenseResource(key, (s) => shipApi.commits(q, s), {
@@ -88,8 +96,12 @@ function ShipList() {
       else next.delete(k);
       return next;
     });
-  // An open row never folds under another, so it keeps taking its latest data.
-  const items = order(fold(commits, opened), sort);
+  // A row each repository, its newest commit at its head: nothing folds under it, its commits are
+  // its first section.
+  const items = order(
+    commits.map((c): Item => ({ head: c, riders: [] })),
+    sort,
+  );
   const hold = useListHold(opened.size > 0);
   const { ref: holdRef, ...holdProps } = hold.bind;
   // Your own change of view (sort, filter) applies at once; only what arrives waits.
@@ -99,7 +111,7 @@ function ShipList() {
   // reference, so its memoized row doesn't render again; a changed item keeps its key and is
   // patched in place, never remounted.
   const stable = items.map((it) => {
-    const k = keyOf(it);
+    const k = rowKey(it);
     const sig = JSON.stringify(it);
     const was = kept.last.get(k);
     const same = was && was.sig === sig ? was.it : it;
@@ -107,15 +119,15 @@ function ShipList() {
     return same;
   });
   if (!hold.held || kept.order.length === 0 || kept.view !== view) {
-    kept.order = items.map(keyOf);
+    kept.order = items.map(rowKey);
     kept.view = view;
   }
   const shown = hold.held ? kept.order.flatMap((k) => kept.last.get(k)?.it ?? []) : stable;
-  if (!hold.held) kept.last = new Map(stable.map((it) => [keyOf(it), { it, sig: JSON.stringify(it) }]));
+  if (!hold.held) kept.last = new Map(stable.map((it) => [rowKey(it), { it, sig: JSON.stringify(it) }]));
   // The pace line holds with the rows: what it counts waits for the release too, so nothing beside
   // the row you're reading moves (plan 01a1856fe81375b1bd1d1d86f270a45b, step 5).
   if (!hold.held || kept.pace === undefined) kept.pace = page.data.pace;
-  const glide = useGlide(shown.map(keyOf).join("\n"));
+  const glide = useGlide(shown.map(rowKey).join("\n"));
 
   const set = (k: string, v: string | null) =>
     setParams(
@@ -175,7 +187,7 @@ function ShipList() {
       ) : (
         <ul
           className="ship-list"
-          aria-label="Commits"
+          aria-label="Repositories"
           {...holdProps}
           ref={(el) => {
             glide(el);
@@ -183,7 +195,7 @@ function ShipList() {
           }}
         >
           {shown.map((it) => (
-            <Row key={keyOf(it)} item={it} reload={page.reload} open={opened.has(keyOf(it))} onOpen={(o) => toggle(keyOf(it), o)} />
+            <Row key={rowKey(it)} item={it} narrow={narrow} reload={page.reload} open={opened.has(rowKey(it))} onOpen={(o) => toggle(rowKey(it), o)} />
           ))}
         </ul>
       )}
@@ -232,7 +244,7 @@ function Pace({ pace }: { pace?: ShipPace }) {
 }
 
 const Row = React.memo(
-  function Row({ item, reload, open, onOpen }: { item: Item; reload: () => void; open: boolean; onOpen: (open: boolean) => void }) {
+  function Row({ item, narrow, reload, open, onOpen }: { item: Item; narrow: Narrow; reload: () => void; open: boolean; onOpen: (open: boolean) => void }) {
     counted("ship/row");
     const c = item.head;
     const [riders, setRiders] = React.useState(false);
@@ -245,17 +257,18 @@ const Row = React.memo(
     const what = item.folds === "shipped" ? `${n} more shipped` : `${n} more commit${n === 1 ? "" : "s"} of ${c.change?.name ?? "this change"}`;
     return (
       // Its review starts loading as the pointer comes onto the row or the focus into it (W26-R15).
-      <li className="ship-row" data-stand={c.stand} data-glide={keyOf(item)} onPointerEnter={() => warmReview(c)} onFocus={() => warmReview(c)}>
+      <li className="ship-row" data-stand={c.stand} data-glide={rowKey(item)} onPointerEnter={() => warmReview(c)} onFocus={() => warmReview(c)}>
         <div className="ship-r">
           <button type="button" className="ship-main" aria-expanded={open} onClick={() => onOpen(!open)}>
-            <span className="ship-name">{c.message || c.change?.title || c.short}</span>
+            <span className="ship-name">{c.repo}</span>
             <span className="ship-line">
               <span className="ship-stand" data-stand={c.stand}>
-                <Shimmer on={UNDER_WAY.has(c.stand)} flow={keyOf(item)}>
+                <Shimmer on={UNDER_WAY.has(c.stand)} flow={rowKey(item)}>
                   {standWord(c.stand)}
                 </Shimmer>
               </span>
-              <span className="ship-text">{c.line}</span>
+              {/* Its newest commit's message, then what that commit is doing (W26-R29). */}
+              <span className="ship-text">{[c.message || c.change?.title, c.line].filter(Boolean).join(" · ")}</span>
             </span>
           </button>
           <span className="ship-pips">
@@ -296,7 +309,7 @@ const Row = React.memo(
               setReveal((n) => n + 1);
             }}
           />
-          <button type="button" className="ship-go" aria-expanded={open} aria-label={`${open ? "Close" : "Open"} ${c.short}`} onClick={() => onOpen(!open)}>
+          <button type="button" className="ship-go" aria-expanded={open} aria-label={`${open ? "Close" : "Open"} ${c.repo}`} onClick={() => onOpen(!open)}>
             <ChevronDown size={16} />
           </button>
         </div>
@@ -337,14 +350,14 @@ const Row = React.memo(
             ))}
           </ul>
         )}
-        {open && <Dropdown commit={c} reveal={reveal} />}
+        {open && <RepoDropdown head={c} narrow={narrow} reveal={reveal} />}
       </li>
     );
   },
   // A row renders only when its item does (a stable reference while it reads the same), its open
-  // state flips, or its own state does (the Diff button's count); reload and onOpen are made each
-  // render but always do the same thing (W26-R15, AC06).
-  (a, b) => a.item === b.item && a.open === b.open,
+  // state flips, the facets its commits narrow by change, or its own state does (the Diff button's
+  // count); reload and onOpen are made each render but always do the same thing (W26-R15, AC06).
+  (a, b) => a.item === b.item && a.open === b.open && a.narrow.host === b.narrow.host && a.narrow.kind === b.narrow.kind,
 );
 
 /** The row's paired actions, each through the endpoint it names; Review opens the item at its files. */
@@ -435,8 +448,37 @@ function showFiles(open: HTMLElement): (() => void) | undefined {
   return stop;
 }
 
-/** An item's dropdown, in its order: Files (with the Conversation), Jobs (with the picked job's output), Lanes. */
-function Dropdown({ commit, reveal }: { commit: ShipCommit; reveal: number }) {
+/**
+ * An opened repository's dropdown (docs/ci.md W26-R29): its commits first, then the picked one's
+ * sections. The commit picked is the newest when it opened, and stays picked as newer ones arrive,
+ * so what you're reading never turns into another commit under you: only a pick changes it, or the
+ * row's Review (or Diff), which picks the newest again, opening at its Files.
+ */
+function RepoDropdown({ head, narrow, reveal }: { head: ShipCommit; narrow: Narrow; reveal: number }) {
+  const [picked, setPicked] = React.useState<ShipCommit>(head);
+  const [seen, setSeen] = React.useState(reveal);
+  if (seen !== reveal) {
+    setSeen(reveal);
+    setPicked(head);
+  }
+  // The newest picked: its latest data, as the row's, kept as it was last once a newer one arrives.
+  if (picked.sha === head.sha && picked !== head) setPicked(head);
+  const commit = picked.sha === head.sha ? head : picked;
+  return (
+    <Dropdown
+      commit={commit}
+      reveal={reveal}
+      commits={
+        <Loadable label="Loading its commits" className="sc-slot">
+          <ShipCommits repo={head.repo} narrow={narrow} picked={commit.sha} onPick={setPicked} />
+        </Loadable>
+      }
+    />
+  );
+}
+
+/** A commit's sections, in their order: Files (with the Conversation), Jobs (with the picked job's output), Lanes; `commits` before them. */
+function Dropdown({ commit, reveal, commits }: { commit: ShipCommit; reveal: number; commits?: React.ReactNode }) {
   // A Diff press (reveal counts them) brings Files into view; opening the row any other way doesn't.
   const root = React.useRef<HTMLDivElement | null>(null);
   const files = React.useCallback(
@@ -448,10 +490,12 @@ function Dropdown({ commit, reveal }: { commit: ShipCommit; reveal: number }) {
   );
   return (
     <div className="ship-open" ref={files}>
+      {commits}
       {/* Dropdown boundary agreed with the Ship agent 01a1748c, 2026-10-26 20:28 PDT (NOTES.md):
           Files (with the Conversation) first, owned by Review. One loader for them all: every
-          section waits for Files' review, so none is drawn first and then pushed down (2026-10-28). */}
-      <Loadable label="Loading its review">
+          section waits for Files' review, so none is drawn first and then pushed down (2026-10-28).
+          A commit picked anew is a new set of sections (W26-R29). */}
+      <Loadable key={commit.sha} label="Loading its review">
         <ReviewFiles item={commit} />
         {/* Output and Jobs as one pane (docs/ci.md W26-R23): the strip, the jobs by stage, the picked one's output. */}
         <section aria-label="Jobs" className="ship-sec">
