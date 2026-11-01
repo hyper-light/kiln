@@ -1305,10 +1305,34 @@ fn page_ancestors(hub: &Hub) -> String {
     format!("frame-ancestors {}", if origins.is_empty() { "'none'".to_owned() } else { origins.join(" ") })
 }
 
-/// Headers every answer of a page's carries: its sandbox, no referrer (its address is its key), and
-/// to any origin (the page's own is opaque), for fonts and modules.
-fn page_headers(hub: &Hub, h: &mut header::HeaderMap) {
-    let policy = format!("{PAGE_POLICY}; {}", page_ancestors(hub));
+/// Page `id`'s own files and kiln's fonts by the address `req` reached them at, for its policy to
+/// name beside `'self'`: in a document its frame sandboxes (the conversation's frame does), WebKit,
+/// every browser on iOS, matches `'self'` with nothing, and phones were refused the page's own
+/// scripts, pictures and fonts. Only a name and a port make one (no header adds to the policy).
+fn page_sources(hub: &Hub, req: &Request, id: &str) -> String {
+    let asked = req.uri().authority().map(|a| a.as_str().to_owned()).or_else(|| srv::header_str(req, &header::HOST).map(str::to_owned)).unwrap_or_default();
+    named_sources(&asked, is_secure(hub, req), id)
+}
+
+/// [`page_sources`] for a page reached at `asked` (its `Host`), over HTTPS when `secure`.
+fn named_sources(asked: &str, secure: bool, id: &str) -> String {
+    let asked = asked.to_ascii_lowercase();
+    if asked.is_empty() || !asked.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':')) {
+        return String::new();
+    }
+    let scheme = if secure { "https" } else { "http" };
+    format!(" {scheme}://{asked}/v/{id}/ {scheme}://{asked}/v/_/fonts/")
+}
+
+/// [`PAGE_POLICY`] with `sources` beside each `'self'`, then who may frame it.
+fn page_policy(sources: &str, ancestors: &str) -> String {
+    format!("{}; {ancestors}", PAGE_POLICY.replace("'self'", &format!("'self'{sources}")))
+}
+
+/// Headers every answer of page `id`'s carries: its sandbox, no referrer (its address is its key),
+/// and to any origin (the page's own is opaque), for fonts and modules.
+fn page_headers(hub: &Hub, req: &Request, id: &str, h: &mut header::HeaderMap) {
+    let policy = page_policy(&page_sources(hub, req, id), &page_ancestors(hub));
     if let Ok(v) = header::HeaderValue::from_str(&policy) {
         h.insert(header::CONTENT_SECURITY_POLICY, v);
     }
@@ -1333,7 +1357,7 @@ async fn page(hub: &Arc<Hub>, id: &str, req: &Request) -> R {
         if let Ok(to) = header::HeaderValue::from_str(&format!("/v/{}{}", v.id, crate::harness::visuals::url_path(&v.entry))) {
             r.headers_mut().insert(header::LOCATION, to);
         }
-        page_headers(hub, r.headers_mut());
+        page_headers(hub, req, &v.id, r.headers_mut());
         return Ok(r);
     }
     let at = srv::decode(rest);
@@ -1344,7 +1368,7 @@ async fn page(hub: &Arc<Hub>, id: &str, req: &Request) -> R {
     let meta = crate::harness::files::Meta { size, mtime: 0, mime: used.mime.clone(), width: None, height: None };
     let etag = format!("\"{}\"", used.sha);
     if let Some(mut r) = unchanged(req, &etag, true) {
-        page_headers(hub, r.headers_mut());
+        page_headers(hub, req, &v.id, r.headers_mut());
         return Ok(r);
     }
     let Ok(range) = byte_range(req, size) else { return Ok(unsatisfiable(size)) };
@@ -1376,7 +1400,7 @@ async fn page(hub: &Arc<Hub>, id: &str, req: &Request) -> R {
     let name = used.path.rsplit('/').next().unwrap_or("file").to_owned();
     let mut r = file_response(&meta, &name, &etag, true, range, srv::channel_body(rx));
     // The page's own policy, for it and for every file of it (a script or a style is the page's).
-    page_headers(hub, r.headers_mut());
+    page_headers(hub, req, &v.id, r.headers_mut());
     Ok(r)
 }
 
@@ -1824,14 +1848,22 @@ async fn cluster_copy(hub: &Hub, req: &Request) -> R {
         std::fs::remove_file(&path).ok();
         return Err(err(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")));
     }
-    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    let (size, rx) = copy_body(path).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("reading the copy of kiln.db: {e}")))?;
     tracing::info!(machine, bytes = size, took_ms = started.elapsed().as_millis() as u64, "a copy of kiln.db for a runner's learner");
+    let r = srv::response(StatusCode::OK, "application/octet-stream", srv::channel_body(rx));
+    Ok(srv::with_header(r, header::CONTENT_LENGTH, &size.to_string()))
+}
+
+/// Streams the copy at `path` (it goes once sent): its size, and its bytes as they're read, from
+/// the file opened now. The next copy is made once this one is handed over and clears what a stop
+/// left behind, this copy's name among it: an open file outlives its name (and Windows keeps it).
+fn copy_body(path: std::path::PathBuf) -> std::io::Result<(u64, async_channel::Receiver<Bytes>)> {
+    let mut f = std::fs::File::open(&path)?;
+    let size = f.metadata()?.len();
     let (tx, rx) = async_channel::bounded::<Bytes>(16);
     crate::rt::spawn(async move {
-        let p = path.clone();
         let _ = crate::rt::blocking(move || -> std::io::Result<()> {
             use std::io::Read as _;
-            let mut f = std::fs::File::open(&p)?;
             let mut buf = vec![0u8; 256 << 10];
             loop {
                 let n = f.read(&mut buf)?;
@@ -1843,8 +1875,7 @@ async fn cluster_copy(hub: &Hub, req: &Request) -> R {
         .await;
         std::fs::remove_file(&path).ok();
     });
-    let r = srv::response(StatusCode::OK, "application/octet-stream", srv::channel_body(rx));
-    Ok(srv::with_header(r, header::CONTENT_LENGTH, &size.to_string()))
+    Ok((size, rx))
 }
 
 /// One of the contents synced repos name (`HEAD`: whether the server has it).
@@ -5794,6 +5825,27 @@ fn back(connected: u64, before: u64) -> f64 {
 mod tests {
     use super::*;
 
+    /// P2: a learner's copy streams whole though the next copy, made once this one is handed over,
+    /// clears its name (what a stop left behind) before this one's reader has run.
+    #[test]
+    fn a_learner_s_copy_streams_whole_though_its_name_goes_once_handed_over() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let path = dir.path().join("copy.db");
+            let want: Vec<u8> = (0..(3_u32 << 18)).map(|i| u8::try_from(i % 251).unwrap_or(0)).collect();
+            std::fs::write(&path, &want)?;
+            let (size, rx) = copy_body(path.clone())?;
+            // The next copy's sweep, before this one's reader has run (Windows refuses: it's open).
+            std::fs::remove_file(&path).ok();
+            let mut got = Vec::new();
+            while let Ok(chunk) = rx.recv().await {
+                got.extend_from_slice(&chunk);
+            }
+            anyhow::ensure!(u64::try_from(want.len())? == size && got == want, "streamed {} of {} bytes", got.len(), want.len());
+            Ok(())
+        })
+    }
+
     #[test]
     fn the_servers_own_machine_asking_for_its_local_agents_name_is_not_given_another_runner() {
         let local = Some("adas-macbook-pro.local");
@@ -5931,5 +5983,26 @@ mod tests {
         let ps1 = include_str!("../assets/install-agent.ps1");
         assert!(ps1.contains("[switch]$Outpost"));
         assert!(ps1.contains("@('outpost', '--server', $Server, '--state-dir', $dir)"));
+    }
+
+    /// docs/previews.md, "Sandboxed": a shown page's policy names its own folder and kiln's fonts at
+    /// the address it was reached at, beside `'self'`, which WebKit (every browser on iOS) matches
+    /// with nothing in the conversation's sandboxed frame: phones were refused a page's own scripts,
+    /// pictures and fonts. A `Host` that isn't a name and a port adds nothing to it.
+    #[test]
+    fn a_page_s_policy_names_its_own_files_where_it_was_reached() {
+        let id = "0582dcb7c0e9dbd3a891b242896e61c8";
+        let phone = named_sources("Kiln.dev", true, id);
+        assert_eq!(phone, format!(" https://kiln.dev/v/{id}/ https://kiln.dev/v/_/fonts/"));
+        assert_eq!(named_sources("192.168.1.77:7070", false, id), format!(" http://192.168.1.77:7070/v/{id}/ http://192.168.1.77:7070/v/_/fonts/"));
+        for odd in ["", "kiln.dev; script-src *", "kiln.dev https://elsewhere.example", "kiln.dev,evil", "u@kiln.dev", "[fd7a::1]:443"] {
+            assert_eq!(named_sources(odd, true, id), "", "{odd:?}");
+        }
+        let policy = page_policy(&phone, "frame-ancestors 'self'");
+        for d in ["default-src", "script-src", "style-src", "img-src", "media-src", "font-src", "connect-src", "worker-src", "frame-src"] {
+            assert!(policy.contains(&format!("{d} 'self' https://kiln.dev/v/{id}/ https://kiln.dev/v/_/fonts/ ")), "{d}: {policy}");
+        }
+        assert!(policy.starts_with("sandbox allow-scripts ") && policy.ends_with("; frame-ancestors 'self'"), "{policy}");
+        assert_eq!(page_policy("", "frame-ancestors 'self'"), format!("{PAGE_POLICY}; frame-ancestors 'self'"), "none named: the policy as it was");
     }
 }
