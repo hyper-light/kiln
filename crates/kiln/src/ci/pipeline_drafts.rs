@@ -2,10 +2,17 @@
 //! written and not yet published, by its repository, file and author, with the change it's saved
 //! as: a draft diff of a repository kiln hosts, or a host's draft change on its own branch.
 
+use std::sync::Arc;
+
+use http::StatusCode;
 use rusqlite::{OptionalExtension as _, params};
 use serde::Serialize;
+use serde_json::{Value, json};
 
+use super::Fail;
+use crate::authz::Caller;
 use crate::hub::Hub;
+use crate::store::Repo;
 
 /// A draft (one row of `ci_pipeline_drafts`).
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
@@ -98,4 +105,73 @@ pub async fn put(hub: &Hub, d: &Draft) -> anyhow::Result<()> {
             Ok(())
         })
         .await
+}
+
+fn internal(e: &anyhow::Error) -> Fail {
+    (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
+}
+
+/// The diff a draft of a repository kiln hosts is.
+async fn diff_of(hub: &Hub, d: &Draft) -> Result<crate::ci::diffs::Diff, Fail> {
+    let name = d.name.clone().ok_or_else(|| (StatusCode::CONFLICT, format!("the draft of {} has no diff", d.path)))?;
+    crate::ci::diffs::find(hub, &name).await.map_err(|e| internal(&e))?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("no diff {name}")))
+}
+
+/// A host's draft change: its host, branch, head and number.
+async fn on_host(hub: &Hub, repo: &Repo, d: &Draft) -> Result<(crate::githost::GitHost, String, String, u64), Fail> {
+    let host = crate::githost::for_repo(hub, repo).await.ok_or_else(|| (StatusCode::CONFLICT, format!("kiln can't reach {}'s host: no App or credentials of it are set up here", repo.name)))?;
+    match (d.branch.clone(), d.head.clone(), d.number) {
+        (Some(branch), Some(head), Some(number)) => Ok((host, branch, head, number)),
+        _ => Err((StatusCode::CONFLICT, format!("the draft of {} has no change on its host", d.path))),
+    }
+}
+
+/// Records `d`'s new `state`, and audits what `caller` did to it.
+async fn moved(hub: &Hub, caller: &Caller, d: &mut Draft, state: &str, what: &str) -> Result<Value, Fail> {
+    d.state = state.to_owned();
+    d.updated_at = crate::util::now_unix();
+    put(hub, d).await.map_err(|e| internal(&e))?;
+    hub.store.audit(caller.name.clone(), format!("ci.workflow.draft.{what}"), format!("{} {} {}", d.repo, d.path, d.name.as_deref().unwrap_or("draft"))).await;
+    Ok(json!({ "draft": d }))
+}
+
+/// Pipelines' Ready (docs/ci.md W29-R12): `caller`'s draft `d` asks for review. kiln's draft diff
+/// leaves draft as `ci.diffs.ready` takes it out. On a host, the draft's head is committed again,
+/// the same tree, asking to skip nothing, so the host's checks and kiln's run on it; then the
+/// change is marked ready. The record says `review`.
+pub async fn ready(hub: &Arc<Hub>, caller: &Caller, repo: &Repo, d: &mut Draft) -> Result<Value, Fail> {
+    if d.state != "draft" {
+        return Err((StatusCode::CONFLICT, format!("{} is in review already (W29-R12)", d.name.as_deref().unwrap_or(&d.path))));
+    }
+    if d.kind == "diff" {
+        let diff = diff_of(hub, d).await?;
+        crate::ci::diffs::ready_as(hub, &diff, caller).await?;
+    } else {
+        let (host, branch, head, number) = on_host(hub, repo, d).await?;
+        let message = kiln_ci::drafts::ready_message(&d.title);
+        let author = super::workflows::commit_author(caller);
+        let sha = host.recommit(hub, repo, &branch, &head, &message, &author, d.path.starts_with(".github/workflows/")).await.map_err(|e| match e {
+            crate::githost::CommitError::Moved => (StatusCode::CONFLICT, format!("{branch} moved on {}'s host since kiln saved it: save the draft again", repo.name)),
+            crate::githost::CommitError::Other(e) => (StatusCode::BAD_GATEWAY, format!("{}'s host refused the draft's ready commit: {e:#}", repo.name)),
+        })?;
+        d.head = Some(sha);
+        host.ready_change(hub, repo, number).await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("the draft's head is ready, but its change isn't marked so: {e:#}")))?;
+    }
+    moved(hub, caller, d, "review", "ready").await
+}
+
+/// Pipelines' Discard (docs/ci.md W29-R13): `caller`'s draft `d` is gone. kiln's draft diff is
+/// abandoned as `ci.diffs.abandon` does; a host's draft change is closed, and its branch deleted.
+/// The record says `discarded`, and a save after starts a new draft.
+pub async fn discard(hub: &Arc<Hub>, caller: &Caller, repo: &Repo, d: &mut Draft) -> Result<Value, Fail> {
+    if d.kind == "diff" {
+        let diff = diff_of(hub, d).await?;
+        crate::ci::diffs::abandon_as(hub, &diff, caller).await?;
+    } else {
+        let (host, branch, _, number) = on_host(hub, repo, d).await?;
+        let why = format!("Discarded in kiln's Pipelines by {} (docs/ci.md W29-R13).", caller.name);
+        host.close_change(hub, repo, number, &why).await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("{}'s host didn't close the draft's change: {e:#}", repo.name)))?;
+        host.delete_branch(hub, repo, &branch).await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("the draft's change is closed, but its branch {branch} isn't deleted: {e:#}")))?;
+    }
+    moved(hub, caller, d, "discarded", "discard").await
 }

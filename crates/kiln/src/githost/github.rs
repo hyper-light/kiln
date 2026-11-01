@@ -384,6 +384,33 @@ impl App {
         }
     }
 
+    /// `branch`'s `head` committed again with `message`, its tree the same, and the branch moved
+    /// to it if it's still at `head` (docs/ci.md W29-R12). `workflows`: the tree has a workflow.
+    pub async fn recommit(&self, repo: &Repo, branch: &str, head: &str, message: &str, author: &Author, workflows: bool) -> Result<String, CommitError> {
+        let mut perms = vec![("contents", "write"), ("metadata", "read")];
+        if workflows {
+            perms.push(("workflows", "write"));
+        }
+        let (name, t) = self.token_for(repo, &perms).await?;
+        let (st, v) = self.call(Method::Get, &format!("/repos/{name}/git/commits/{head}"), Auth::Token(&t), None).await?;
+        if st != 200 {
+            return Err(CommitError::Other(anyhow!("{head}: {}", said(&v))));
+        }
+        let tree = v.pointer("/tree/sha").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let who = json!({ "name": author.name, "email": author.email });
+        let (st, v) = self.call(Method::Post, &format!("/repos/{name}/git/commits"), Auth::Token(&t), Some(&json!({ "message": message, "tree": tree, "parents": [head], "author": who, "committer": who }))).await?;
+        if st != 201 {
+            return Err(CommitError::Other(anyhow!("the commit: {}", said(&v))));
+        }
+        let sha = v.get("sha").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let (st, v) = self.call(Method::Patch, &format!("/repos/{name}/git/refs/heads/{branch}"), Auth::Token(&t), Some(&json!({ "sha": sha, "force": false }))).await?;
+        match st {
+            200 | 201 => Ok(sha),
+            409 | 422 => Err(CommitError::Moved),
+            _ => Err(CommitError::Other(anyhow!("{branch}: {}", said(&v)))),
+        }
+    }
+
     /// Opens a pull request, a draft with `draft` (REST's own flag, docs/ci.md W29-R11).
     pub async fn open_change(&self, repo: &Repo, head: &str, base: &str, title: &str, body: &str, draft: bool) -> anyhow::Result<ChangeRef> {
         let (name, t) = self.token_for(repo, &[("pull_requests", "write"), ("contents", "read"), ("metadata", "read")]).await?;

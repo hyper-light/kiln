@@ -243,9 +243,14 @@ fn on_github() -> anyhow::Result<OnGithub> {
             ("POST", "/repos/acme/app/git/refs") => (201, json!({ "ref": got.json().get("ref").cloned().unwrap_or_default() })),
             ("PATCH", p) if p.starts_with("/repos/acme/app/git/refs/heads/") => (200, json!({ "ref": p.trim_start_matches("/repos/acme/app/git/") })),
             ("POST", "/repos/acme/app/pulls") => (201, json!({ "number": 12, "html_url": "https://github.example/acme/app/pull/12" })),
+            ("GET", "/repos/acme/app/pulls/12") => (200, json!({ "number": 12, "draft": true, "node_id": "PR_kwDOdraft12" })),
+            ("POST", "/graphql") => (200, json!({ "data": { "markPullRequestReadyForReview": { "pullRequest": { "isDraft": false } } } })),
+            ("POST", "/repos/acme/app/issues/12/comments") => (201, json!({ "id": 1 })),
+            ("PATCH", "/repos/acme/app/pulls/12") => (200, json!({ "number": 12, "state": "closed" })),
+            ("DELETE", p) if p.starts_with("/repos/acme/app/git/refs/heads/") => (204, Value::Null),
             _ => (404, json!({ "message": "Not Found" })),
         };
-        (st, v.to_string())
+        (st, if v.is_null() { String::new() } else { v.to_string() })
     });
     let api = Service::start(answer)?;
     // GitHub's git: a bare repository with a workflow, served over smart HTTP.
@@ -422,5 +427,83 @@ fn w29_r10_no_other_repository_uses_a_draft() -> anyhow::Result<()> {
     let ok = seen.iter().find(|r| done(".kiln/ok.yaml")(r)).cloned().unwrap_or_default();
     assert!(!at(&ok, "/error").contains("KCI4023"), "a published branch is used as ever: {ok}");
     assert_eq!(at(&ok, "/conclusion"), "success", "{ok}");
+    Ok(())
+}
+
+/// A Pipelines verb through Ship, as the admin: its status and answer.
+fn act(s: &Server, body: &Value) -> anyhow::Result<(u16, Value)> {
+    let (st, text) = http(s.port, "POST", "/api/ship/pipelines", &s.admin, Some(body))?;
+    Ok((st, serde_json::from_str(&text).unwrap_or(Value::Null)))
+}
+
+/// A repository kiln hosts with `.github/workflows/ci.yml` on its trunk, polled once.
+fn kiln_with_ci() -> anyhow::Result<(Server, tempfile::TempDir)> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ..Options::default() })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let work = hosted(&s, &home, dir.path(), "acme/app")?;
+    push_files(&home, &work, "main", &[(".github/workflows/ci.yml", CI)])?;
+    Ok((s, dir))
+}
+
+/// W29-R12: Ready asks for review. On kiln the draft diff leaves draft; on GitHub the draft's
+/// head is committed again asking to skip nothing, then GraphQL marks the pull request ready; the
+/// record says review, and Ready again is refused.
+#[test]
+fn w29_r12_ready_asks_for_review() -> anyhow::Result<()> {
+    let save = json!({ "repo": "acme/app", "path": ".github/workflows/ci.yml", "verb": "save_draft", "content": TRY_ONE, "title": "Try a matrix" });
+    let ready = json!({ "repo": "acme/app", "path": ".github/workflows/ci.yml", "verb": "ready" });
+
+    let (s, _dir) = kiln_with_ci()?;
+    let (st, saved) = act(&s, &save)?;
+    assert_eq!(st, 200, "{saved}");
+    let name = at(&saved, "/draft/name").to_owned();
+    let (st, out) = act(&s, &ready)?;
+    assert_eq!((st, at(&out, "/draft/state")), (200, "review"), "{out}");
+    assert_eq!(at(&get(&s, &format!("/api/diffs/{name}"))?, "/state"), "needs-review");
+    let (st, again) = act(&s, &ready)?;
+    assert_eq!(st, 409, "in review already: {again}");
+
+    let g = on_github()?;
+    let (st, saved) = act(&g.s, &save)?;
+    assert_eq!(st, 200, "{saved}");
+    let head = at(&saved, "/draft/head").to_owned();
+    let (st, out) = act(&g.s, &ready)?;
+    assert_eq!((st, at(&out, "/draft/state")), (200, "review"), "{out}");
+    let commits = g.sent("POST", "/repos/acme/app/git/commits");
+    let last = commits.last().cloned().unwrap_or_default();
+    assert_eq!((last.get("message"), last.get("parents"), last.get("tree")), (Some(&json!("Try a matrix\n")), Some(&json!([head])), Some(&json!("tree0"))), "the same tree, asking to skip nothing: {last}");
+    let moved = g.sent("PATCH", &format!("/repos/acme/app/git/refs/heads/{}", at(&saved, "/draft/branch")));
+    assert_eq!(moved.last().and_then(|m| m.get("sha")), Some(&json!(at(&out, "/draft/head"))), "{moved:?}");
+    let asked = g.sent("POST", "/graphql");
+    assert_eq!(asked.first().and_then(|q| q.pointer("/variables/id")), Some(&json!("PR_kwDOdraft12")), "{asked:?}");
+    Ok(())
+}
+
+/// W29-R13: Discard. On kiln the draft diff is abandoned, and saving again starts a new draft; on
+/// GitHub the pull request is closed and the draft's branch deleted.
+#[test]
+fn w29_r13_discard() -> anyhow::Result<()> {
+    let save = json!({ "repo": "acme/app", "path": ".github/workflows/ci.yml", "verb": "save_draft", "content": TRY_ONE, "title": "Try a matrix" });
+    let discard = json!({ "repo": "acme/app", "path": ".github/workflows/ci.yml", "verb": "discard" });
+
+    let (s, _dir) = kiln_with_ci()?;
+    let (_, first) = act(&s, &save)?;
+    let (st, out) = act(&s, &discard)?;
+    assert_eq!((st, at(&out, "/draft/state")), (200, "discarded"), "{out}");
+    assert_eq!(at(&get(&s, &format!("/api/diffs/{}", at(&first, "/draft/name")))?, "/state"), "abandoned");
+    let (st, _) = act(&s, &discard)?;
+    assert_eq!(st, 404, "nothing left to discard");
+    let (_, next) = act(&s, &save)?;
+    assert_ne!((at(&next, "/draft/id"), at(&next, "/draft/name")), (at(&first, "/draft/id"), at(&first, "/draft/name")), "a new draft: {next}");
+
+    let g = on_github()?;
+    let (_, saved) = act(&g.s, &save)?;
+    let branch = at(&saved, "/draft/branch").to_owned();
+    let (st, out) = act(&g.s, &discard)?;
+    assert_eq!((st, at(&out, "/draft/state")), (200, "discarded"), "{out}");
+    assert_eq!(g.sent("PATCH", "/repos/acme/app/pulls/12"), [json!({ "state": "closed" })]);
+    assert_eq!(g.sent("DELETE", &format!("/repos/acme/app/git/refs/heads/{branch}")).len(), 1);
     Ok(())
 }

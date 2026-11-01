@@ -909,6 +909,10 @@ pub fn ops() -> &'static [Op] {
                 input: Input::of::<input::ShipPipelinesGet>(),
                 route: |v| { let (owner, name) = owner_name(v)?; Ok((Method::GET, path(&["ship", "pipelines", &owner, &name]), query(v, &["path", "ref"]))) },
                 run: |cx: Cx, v: Value| async move { let (owner, name) = owner_name(&v)?; answer(crate::ship::pipelines::get(&cx.hub, &owner, &name, &query(&v, &["path", "ref"]), &cx.caller).await).await }),
+            op!("ship.pipelines.act", "A verb of a workflow's or action's strip in Ship's Pipelines (W29-R04), on your own work, as its own operation and with its right: `save_draft` (`content`, `title`: a draft diff, or on a host a draft change from a branch of its own, W29-R11), `ready` (your draft of the file asks for review, W29-R12) or `discard` (your draft of it closed, its branch deleted, W29-R13).", base: "", ro: false, destructive: true,
+                input: Input::of::<input::ShipPipelinesAct>(),
+                route: |_| Ok((Method::POST, path(&["ship", "pipelines"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { answer(crate::ship::pipelines::act(&cx.hub, &cx.caller, &v).await).await }),
         ]
     })
 }
@@ -2555,6 +2559,29 @@ pub mod input {
         /// A branch, tag or commit to read it at: its repository's default branch when left out.
         #[serde(rename = "ref")]
         pub at: Option<String>,
+    }
+
+    /// A strip's verb (docs/ci.md W29-R04).
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ShipPipelinesVerb {
+        SaveDraft,
+        Ready,
+        Discard,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct ShipPipelinesAct {
+        /// The repository, `owner/name`.
+        pub repo: String,
+        /// The workflow's or action's file.
+        pub path: String,
+        pub verb: ShipPipelinesVerb,
+        /// Save draft's text: the file whole.
+        pub content: Option<String>,
+        /// Save draft's title (`Edit <path>` when left out).
+        pub title: Option<String>,
     }
 }
 

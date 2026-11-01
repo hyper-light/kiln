@@ -531,6 +531,10 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         // Ship's Pipelines: every workflow and action by repository (docs/ci.md W29-R03).
         (&Method::GET, ["api", "ship", "pipelines"]) => boxed(|| crate::ship::pipelines::list(&hub, &q, &caller)).await.map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["api", "ship", "pipelines", owner, name]) => boxed(|| crate::ship::pipelines::get(&hub, owner, name, &q, &caller)).await.map_err(|(c, m)| err(c, m)),
+        (&Method::POST, ["api", "ship", "pipelines"]) => {
+            let body: serde_json::Value = boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+            boxed(|| crate::ship::pipelines::act(&hub, &caller, &body)).await.map_err(|(c, m)| err(c, m))
+        }
         (&Method::GET, ["api", "ship", "commits", repo, sha]) => boxed(|| crate::ship::get(&hub, repo, sha, Some(&caller))).await.map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["api", "ship", "commits", repo, sha, "diff"]) => boxed(|| crate::ci::diffs::ship_commit_diff(&hub, repo, sha, &caller)).await.map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["api", "ship", "commits", repo, sha, "blob"]) => boxed(|| crate::ci::diffs::ship_commit_blob(&hub, repo, sha, &q, &caller)).await.map_err(|(c, m)| err(c, m)),

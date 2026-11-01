@@ -1522,6 +1522,12 @@ pub(crate) async fn ready_as(hub: &Hub, d: &Diff, caller: &Caller) -> Result<Val
     act(hub, d, "ready", caller).await
 }
 
+/// Abandons `d` as `caller` would through `ci.diffs.abandon` (a draft discarded, docs/ci.md
+/// W29-R13).
+pub(crate) async fn abandon_as(hub: &Hub, d: &Diff, caller: &Caller) -> Result<Value, Fail> {
+    act(hub, d, "abandon", caller).await
+}
+
 /// The author's actions (and commandeering): `ready`, `abandon`, `reclaim`, `commandeer`.
 async fn act(hub: &Hub, d: &Diff, action: &str, caller: &Caller) -> Result<Value, Fail> {
     let who = author_of(&caller.name, Some(caller.kind)).0;

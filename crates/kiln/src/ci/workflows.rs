@@ -377,13 +377,18 @@ async fn on_host(hub: &Arc<Hub>, caller: &Caller, repo: &Repo, host: &crate::git
     Ok(json!({ "branch": branch, "sha": sha, "change": { "number": opened.number, "url": opened.url } }))
 }
 
+/// `caller` as a commit's author on a host: their name as diffs give it, at `kiln`.
+pub(crate) fn commit_author(caller: &Caller) -> crate::githost::Author {
+    let (me, _) = super::diffs::author_of(&caller.name, Some(caller.kind));
+    let me = me.strip_prefix("user:").unwrap_or(&me).to_owned();
+    crate::githost::Author { email: format!("{}@kiln", me.replace([' ', ':'], "-")), name: me }
+}
+
 /// One file committed as `caller` to `branch` of a repository's host: made on `base`, onto `head`
 /// (the branch's, when it's there). `already` names where a commit changing nothing is refused.
 #[allow(clippy::too_many_arguments)]
 async fn commit_file(hub: &Arc<Hub>, caller: &Caller, repo: &Repo, host: &crate::githost::GitHost, (branch, base, head): (&str, &str, Option<&str>), (file, content): (&str, &str), message: &str, already: &str) -> Result<String, Fail> {
-    let (me, _) = super::diffs::author_of(&caller.name, Some(caller.kind));
-    let me = me.strip_prefix("user:").unwrap_or(&me).to_owned();
-    let author = crate::githost::Author { email: format!("{}@kiln", me.replace([' ', ':'], "-")), name: me };
+    let author = commit_author(caller);
     let files = [crate::githost::Change { path: file.to_owned(), content: Some(content.as_bytes().to_vec()) }];
     let made = host.commit_on(hub, repo, branch, Some(base), head, &files, message, &author).await.map_err(|e| match e {
         crate::githost::CommitError::Moved => (StatusCode::CONFLICT, format!("{branch} moved while this was saved: reload it and save again")),

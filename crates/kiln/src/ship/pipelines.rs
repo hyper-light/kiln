@@ -561,6 +561,48 @@ pub async fn list(hub: &Arc<Hub>, q: &HashMap<String, String>, caller: &crate::a
     Ok(srv::response(StatusCode::OK, "application/json", srv::full(body)))
 }
 
+/// `POST /api/ship/pipelines { repo, path, verb, … }` (docs/ci.md W29-R04, AC04): one of a
+/// strip's verbs on the caller's own work, each as its own operation and with that operation's
+/// right on the repository:
+/// - `save_draft` (`content`, `title`): `ci.workflows.edit` with `draft` (W29-R11);
+/// - `ready`: the caller's draft of the file asks for review (W29-R12);
+/// - `discard`: the caller's draft of it is gone (W29-R13).
+pub async fn act(hub: &Arc<Hub>, caller: &crate::authz::Caller, body: &Value) -> Result<Response, Fail> {
+    let text = |k: &str| body.get(k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+    let need = |k: &str| text(k).ok_or_else(|| (StatusCode::BAD_REQUEST, format!("`{k}` is required")));
+    let (name, path, verb) = (need("repo")?, need("path")?, need("verb")?);
+    let missing = || (StatusCode::NOT_FOUND, format!("no repository `{name}` you may read"));
+    let repo = hub.store.repos().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?.into_iter().find(|r| r.name == name).ok_or_else(missing)?;
+    let scope = crate::authz::Scope::Repo { repo: repo.name.clone() };
+    if !caller.can("runs.read", &scope) {
+        return Err(missing());
+    }
+    let out = match verb {
+        "save_draft" => {
+            let mut ask = body.clone();
+            if let Some(o) = ask.as_object_mut() {
+                o.insert("draft".into(), Value::Bool(true));
+            }
+            crate::ci::workflows::edit(hub, caller, &repo.name, path, &ask).await?
+        }
+        "ready" | "discard" => {
+            if !caller.can("diffs.submit", &scope) {
+                return Err((StatusCode::FORBIDDEN, format!("a draft of {} is its author's to {verb}, with `diffs.submit`", repo.name)));
+            }
+            let (author, _) = crate::ci::diffs::author_of(&caller.name, Some(caller.kind));
+            let mut d = crate::ci::pipeline_drafts::open_for(hub, &repo.name, path, &author)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
+                .ok_or_else(|| (StatusCode::NOT_FOUND, format!("you have no draft of {path} in {}", repo.name)))?;
+            if verb == "ready" { crate::ci::pipeline_drafts::ready(hub, caller, &repo, &mut d).await? } else { crate::ci::pipeline_drafts::discard(hub, caller, &repo, &mut d).await? }
+        }
+        "run" => return Err((StatusCode::BAD_REQUEST, "Run comes with run by hand (docs/ci.md W29-R14)".to_owned())),
+        other => return Err((StatusCode::BAD_REQUEST, format!("`verb` is save_draft, ready or discard, not `{other}`"))),
+    };
+    heard(&repo.name);
+    Ok(srv::json(StatusCode::OK, &out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
