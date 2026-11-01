@@ -447,7 +447,8 @@ impl Adapter {
         match self {
             Self::Claude(a) => a.send_task(core, &t, m, mode),
             Self::Codex(a) => a.send_task(core, &t, m, mode),
-            Self::Acp(_) | Self::Agy(_) => super::subagent::refuse(core, task, &m, "its harness takes no message for it from kiln."),
+            Self::Acp(a) => a.send_task(core, &t, m),
+            Self::Agy(_) => super::subagent::refuse(core, task, &m, "its harness takes no message for it from kiln."),
         }
     }
 
@@ -457,14 +458,17 @@ impl Adapter {
         match self {
             Self::Claude(a) => super::subagent::settle(core, |core, t| a.takes(core, t)),
             Self::Codex(a) => super::subagent::settle(core, |core, t| a.takes(core, t)),
-            Self::Acp(_) | Self::Agy(_) => super::subagent::settle(core, |_, _| (Vec::new(), None)),
+            Self::Acp(a) => super::subagent::settle(core, |core, t| a.takes(core, t)),
+            Self::Agy(_) => super::subagent::settle(core, |_, _| (Vec::new(), None)),
         }
         // Held at its next tool call: Claude Code asks kiln before each (`claude::HOLD_HOOK`), and so
         // does Codex once it trusts kiln's hook (`codex::hook_args`).
         let can = match self {
             Self::Claude(_) => true,
             Self::Codex(a) => a.holds_calls(),
-            Self::Acp(_) | Self::Agy(_) => false,
+            // At each call an ACP agent asks about, where it names its subagent (opencode's).
+            Self::Acp(_) => true,
+            Self::Agy(_) => false,
         };
         super::subagent::settle_pausable(core, |t| can && t.tool_id.is_some());
     }
@@ -474,7 +478,8 @@ impl Adapter {
         match self {
             Self::Claude(a) => a.drain_subagents(core),
             Self::Codex(a) => a.drain_subagents(core),
-            Self::Acp(_) | Self::Agy(_) => {}
+            Self::Acp(a) => a.drain_subagents(core),
+            Self::Agy(_) => {}
         }
         self.settle_subagents(core);
     }
