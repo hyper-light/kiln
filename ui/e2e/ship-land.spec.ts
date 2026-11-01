@@ -6,14 +6,14 @@
  * kim's request for changes. Chromium and WebKit, desktop and phone.
  */
 import { expect, test } from "@playwright/test";
+import { pickCommit } from "./ship-pick";
 
 test("a held change asks to land when ready, then says so, in its place", async ({ page }) => {
   // Each project starts from D41 not yet asked to land (the mock is shared by every project).
   const unask = () => page.request.post("/api/diffs/D41/land", { data: { when_ready: false } });
   await unask();
   await page.goto("/ship");
-  const row = page.locator(".ship-row", { hasText: "pipeline: dynamic matrices" }).first();
-  await row.locator(".ship-main").click();
+  const row = await pickCommit(page, "pipeline: dynamic matrices");
   const bar = row.locator(".rv-bar").first();
   const land = bar.locator(".rv-land");
   await expect(land).toHaveText("Land when ready");
@@ -37,8 +37,7 @@ test("Land's icon holds still as the queue moves the change on, with no one at t
   const move = (state: string | null) => page.request.post("/api/mock/review", { data: { queue: { diff: "D41", state } } });
   await move(null);
   await page.goto("/ship");
-  const row = page.locator(".ship-row", { hasText: "pipeline: dynamic matrices" }).first();
-  await row.locator(".ship-main").click();
+  const row = await pickCommit(page, "pipeline: dynamic matrices");
   const land = row.locator(".rv-bar").first().locator(".rv-land");
   await expect(land).toHaveText("Land when ready");
   // What's measured is the queue's words arriving, so the fonts are in first (a late swap isn't one).
