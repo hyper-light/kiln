@@ -223,13 +223,17 @@ model, grown to reach's synced copies and their build output). Ties go to packin
 `interactive`: the most room, for latency), then the item's preferences (W05-R23), then the asking
 machine for light work.
 
-**Big items don't starve.** When the first item of a class fits no runner with room, the engine
-reserves for it the runner where that room frees soonest (from its grants' expected ends, p90), and
-grants there only what will end before then, or what's preemptible and will be paused then (EASY
-backfilling). A 12-CPU gate on a machine that 1-CPU work keeps refilling starts by its reservation's
-time (G6). A gang is reserved the same way, every one of its runners at once. Until runners can
-pause (E7), what's preemptible takes no reserved room: a reserved runner takes only what will end
-before then, or fits beside the reserved item (docs/ci.md W05-R39).
+**Big items don't starve.** With `[sched] backfill` declared (§21), the first item of each class
+that waits only for room keeps room on the runner where its room frees soonest, from the expected
+ends of the grants there: each one's p90, else its median, else its timeout, and once that has
+passed, its start plus twice what it has run, never past its timeout (docs/ci.md W05-R38). That
+runner grants only what will end before then, or fits beside the item then (EASY backfilling,
+W05-R39). A 12-CPU gate on a machine that 1-CPU work keeps refilling starts by its bound: its
+room's time, plus how far what it waited for ran past its expected ends (G6, W05-AC17). A gang
+keeps room the same way, every one of its runners at once from the latest of their times, and
+starts whole or not at all (G4, W05-R40, W05-AC18). An item waits for room by room alone, the room
+kept for others aside: one that has room but is held off by room kept for another waits behind it.
+Until runners can pause (E7), what's preemptible takes no kept room.
 
 **The same work once.** Items with the same `key` share a grant: one asked while another runs joins
 it, and one asked after another passed takes its result from the ledger while that is valid
@@ -729,7 +733,7 @@ at once; A1 only measures.
 | E1 (built) | The ground: integer amounts, no decision on hash-map order, the replay test, the reference engine, the kiln-sim model's skeleton | the same inputs give the same commands on x86-64 and arm64; the reference and real engines agree on 10,000 random small cases |
 | E2 (built) | Fair share that holds: classes with floors and promotion, W05-R09's aging within a tenant, the tenant tree, dominant-share costs | G7 with staggered arrivals and mixed shapes; W05-AC03 within a tenant; a `background` item under a steady stream of `batch` starts within its bound |
 | E3 (built) | Grants as fenced leases end to end: epoch and expiry, renewal, runners' loss and draining told to the engine, self-fencing, the store refusing stale writes, tokens that die with their grant, reconciling after failover | G2 and G10 in the simulator under the nemesis, a million seeds; live, a runner cut off past its lease: nothing it writes after the next attempt starts is taken, and its tokens no longer work |
-| E4 | Reservations and gangs | G6: a 12-CPU item among a stream of 1-CPU ones starts by its bound; a gang of 3 never half-starts |
+| E4 (built) | Reservations and gangs | G6: a 12-CPU item among a stream of 1-CPU ones starts by its bound; a gang of 3 never half-starts |
 | E5 | Every kind on the engine: commands and sessions held, slices for local work, budgets, rooms measured, heavy units from Headroom | an agent's command with no room is queued, not refused; CI legs, commands and sessions on one runner never exceed its budget together (G1) |
 | E6 | Estimates and keys: requests from history, the same work once, places and estimates in answers | a second gate for the same tree runs nothing; estimates within 25 % at p50 over a day's work |
 | E7 | Preemption by pausing, and stopping restartable items | `critical` work waiting on `background` starts within 10 s; no item preempted more than twice |
@@ -824,3 +828,73 @@ for, live out their TTL. A leg in a microVM is stopped as a cancel stops it. A r
 `Stop` naming a grant of an older epoch than it has seen, though a newer server sent it: such a
 `finish` leg runs to its end, its writes refused, and a `stop` one still ends at its lease's end. A
 restart forgets a leg's retry backoff, which the store doesn't keep.
+
+**E4 is built** (branch `needs-engine`, 2026-11-01; docs/ci.md W05-R38 to R40, W05-AC17 and AC18,
+and W05-R13's `reserved`, `behind` and `gang`; §5 says how it works). A grant keeps two ends beside
+its median one: its expected end at its p90, moved on once it passes, and its hard end at its
+timeout (E4.1). With `[sched] backfill` declared, the first of each class that fits no runner keeps
+room where it frees first, and only what ends before then, or fits beside it, is granted there
+(E4.2). `together:<name>/<n>`, and a job's `together: true`, make items a gang that starts whole or
+not at all, granted in one input and, through the dispatcher, written in one transaction before any
+of its Assigns goes (E4.3, E4.4). The reference engine keeps room and gangs plainly (E4.5), and
+kiln-sim's model draws big items and gangs under its nemesis (E4.6). What it measured:
+
+- **W05-AC17 (G6):** in kiln-ci's simulator, a 12-CPU leg among a stream of 1-CPU legs on one
+  16-CPU runner starts by its bound in each of 1,000 seeds; without backfilling, it doesn't start
+  within three hours.
+- **W05-AC18 (G4):** a gang of three among competing work, a member refused in a third of the seeds
+  and a runner lost in another third: no grant takes part of it in any of 1,000 seeds. Room was kept
+  for its members 5,211 times, 3,387 of them standing until it started, each start by its bound.
+  Through the dispatcher, a matrix of three with `together: true` starts within a second of itself;
+  with kiln's `chaos` faults, a refused member has its gang stopped and run whole after, and a gang
+  whose grants the store can't write is heard of by no runner.
+- **G4 and G6 over a million seeds:** docs/sim.md's scheduler model with big items and gangs,
+  backfilling on, under its nemesis, seeds 0 to 999,999 in release on Linux at 3edf8394e: 0 failed.
+  Room was kept 4,389,232 times, 2,640,214 of them until their item started, and 1,522,310 gangs
+  started whole. On the way, a release probe of its first 125,000 seeds and a first million found
+  five bugs (docs/sim.md's 14 to 18), which the 200 seeds `cargo test` runs had missed. The two bugs
+  planted (a backfill past the room kept for another; a gang started without its last member) are
+  each caught within those 200.
+- **The reference engine:** 0 of 10,000 cases part from the real one, room made, moved and worked
+  out again, backfills granted and refused, and gangs granted, kept for and taken back whole among
+  them. On the way it found five bugs (E4.5).
+- **W05-AC08 against E3:** E4's bench and E3's at 3e176d5b4, each build's binary run by turns in
+  ABBA order on one Mac, 160 rounds, three runs a process: 74,098 assignments/s at the median
+  against E3's 76,314, 2.9% fewer (a bootstrap's 95% interval: 2.1% to 3.7% fewer); E4 retires 1.2%
+  more instructions. Backfilling is off there, and every leg fits every runner, so no room is kept.
+- **What room kept costs:** the mixed bench (`--bench sched_mixed`), 250 runners of 16 CPUs and
+  10,000 legs, one in twenty asking 12 CPUs, backfilling on: 64,475 to 80,524 assignments/s over
+  nine runs, room kept 162 times a run. W05-R26 asks 2,000.
+- **The views:** a leg waiting `reserved`, `behind` or `gang` says so in a sentence on its run, and
+  the queue's breakdown names each, in Chromium and WebKit at desktop and phone widths
+  (`ui/e2e/wait-reasons.spec.ts`).
+
+Building it changed nine of its rules, each for a test or a seed it failed:
+
+- **Room worked out again as it stood changes nothing:** a runner picked forever once a grant ran
+  past its hard end (E4.5).
+- **A runner whose kept room ends takes what fits it before the input is done** (W05-R04): room
+  dropped as its item went elsewhere left its runner idle beside the legs it had kept out (E4.5).
+- **A gang's members share a class,** promoted together: promoted one by one, they split across
+  classes, and the gang's room was dropped and made again for good (E4.5).
+- **Room is kept only on a runner its item may be routed to** (E4.5).
+- **A gang waits for room by room alone,** the room kept for others aside: two whole gangs of a
+  class, each with room only beside the room kept for it, took that room from each other for good,
+  the engine never done with one input (docs/sim.md's bug 14).
+- **A start that comes back from a restart with fewer members than make its gang has had one
+  end:** a member lost after was tried again alone, and waited for good (bug 15).
+- **Room goes once its runner wouldn't take its item now:** a leg lost on a runner stayed off it
+  once another was back, but its room there held others off (bug 16).
+- **A gang kept off the runners that refused its members has those refusals forgiven** when it has
+  no place without them (bug 17).
+- **A member refused or not granted once its start has had an end ends failed, `infra`,** rather
+  than waiting for good for a gang that can't be whole (bug 18).
+
+Its limits: preemptible items take no kept room until runners can pause them (E7), and commands
+can't be one of a gang until the engine places commands (E5). Room kept isn't stored: a restart
+works it out again from the grants it rebuilt. A gang bigger than every runner's room together waits
+saying `capacity`, with no reason of its own. A lone leg that a runner refused stays off that runner
+for its attempt, and waits for another if that was the only one that could take it
+(`other-runner`): only a gang's refusals are forgiven. The end-to-end tests of a refused member and
+of a store that can't write a gang's grants need kiln's `chaos` feature, which the gate doesn't
+build. W05-AC14's limit wasn't measured again with backfilling on.

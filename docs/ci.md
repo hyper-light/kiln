@@ -1995,10 +1995,11 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   its hard end, and kept there: a prediction corrected once it's proved wrong, its kill-time kept
   apart (Tsafrir, Etsion and Feitelson's EASY++). No timer waits for it. A grant a restart
   rebuilds (W05-R25) goes from the start the store has.
-- **W05-R39 Reservations for big items** (docs/needs.md §5, E4.2; `[sched] backfill`, off until
-  declared, §0.3). The first queued item of each class by every dimension, as items going to their
-  best runner are ordered, that waits only for room (some runner it may run on would take it and
-  could hold it idle, and none has room for it now) keeps room on the runner where it would fit
+- **W05-R39 Reservations for big items** (docs/needs.md §5, E4.2; `[sched] backfill = true` in
+  kiln's config, off until declared, §0.3, as docs/needs.md §21 proposes declaring it). The first
+  queued item of each class by every dimension, as items going to their best runner are ordered,
+  that waits only for room (some runner it may run on would take it and could hold it idle, and
+  none has room for it now) keeps room on the runner where it would fit
   soonest: its request, from the time the grants there are expected to have left it room (their
   expected ends, W05-R38), beside the items of the classes before its kept there, each until it's
   expected to end; ties go to where it would finish first (W24-R18), then by name. An exclusive
@@ -2006,11 +2007,12 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   class or a class after it must be expected to end by its time, or fit then beside it, the grants
   expected to run on and the other items kept there (EASY backfilling, Mu'alem and Feitelson); a
   grant of a class before it goes first, and the room is worked out again when next it matters.
-  Elsewhere nothing changes. The room is kept until its item is granted, cancelled or no longer
-  first, its runner goes or drains or wouldn't take the item now (one it stays off since, as
-  W05-R16's other runner back), or what runs there changes under it (a runner's facts, a grant
-  a restart rebuilds, the routing rules), and moves only to a runner where its item would fit
-  sooner. Once its time passes with its item still not fitting (a grant ran past its expected end),
+  Elsewhere nothing changes. Room that ends (its item granted, gone or no longer first, the room
+  moved) leaves its runner to take what fits it before the input is done, as new capacity does
+  (W05-R04). The room is kept until its item is granted, cancelled or no longer first, its runner
+  goes or drains or wouldn't take the item now (one it stays off since, as W05-R16's other runner
+  back), or what runs there changes under it (a runner's facts, a grant a restart rebuilds, the
+  routing rules), and moves only to a runner where its item would fit sooner. Once its time passes with its item still not fitting (a grant ran past its expected end),
   nothing new goes into the room, and it's worked out again from the moved-on ends the next time it
   matters. It's worked out only where it can matter, when a runner is about to take an item while
   the first of that item's class, or of a class before it, had no room there: where every item fits
@@ -2022,7 +2024,8 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   (2 to 64) makes an item one of a gang: it starts with the rest of its gang or not at all (G4).
   No member is granted before as many members as make the gang are queued; until then each says
   how many of how many are (`gang`, W05-R13). A gang takes one place in its class's order, its
-  first member's, and when its turn comes it's granted whole, in one input: each member on a runner
+  first member's: a member queued while others wait joins their class, and a promotion (W05-R31)
+  takes them all. When its turn comes it's granted whole, in one input: each member on a runner
   that would take it with room for it beside the members put there before it (members may share
   a runner), as the reservations there let it, the least loaded first, then by name, the members
   before it put elsewhere where one has no room (at most 4,096 places tried). When no way is
@@ -2159,6 +2162,27 @@ W20.
   told to stop attempt 1. And a stop item on a runner cut off stops itself: its process is gone
   within a second of the runner's lease end, by the runner's clock. On Linux and macOS.
   *End-to-end tests (`w05_ac16_…`, `crates/kiln/tests/leases.rs`).*
+- **W05-AC17 A big item among small ones** (W05-R38, R39; docs/needs.md E4.6, G6). One 16-CPU
+  runner where a 1-CPU leg comes every 4 s, each expected to take a minute (its p90) and taking
+  from half a minute to a fifth past it, within a 10-minute timeout; a 12-CPU leg comes at 5
+  minutes. With backfilling, room is kept for it, and in each of 1,000 seeds it starts by its
+  bound: its room's first time, plus how far the grants it waited for ran past their expected ends,
+  each no further than its hard end. Without backfilling it doesn't start within three hours, as
+  E4's probe found. kiln-sim's scheduler model holds the same bound, under its nemesis, for every
+  item whose room stood until it started (docs/sim.md). *Simulation tests (`w05_ac17_…`, kiln-ci's
+  `sched::sim`; `sim::sched`).*
+- **W05-AC18 A gang starts whole or not at all** (W05-R39, R40; docs/needs.md E4.6, G4). A gang of
+  three 4-CPU members among competing 1- and 2-CPU legs on three or four runners of 4 or 8 CPUs, a
+  member refused by its runner in a third of the seeds and a runner lost (and back two minutes
+  later) in another third: in each of 1,000 seeds no grant takes part of the gang, and room kept
+  for it that stood until it started saw it start by its bound, as W05-AC17's (room that went, to a
+  take-back, a runner lost or a grant run past its expected end, starts the bound again). Through
+  the dispatcher, a job's matrix of three with `together: true`, queued while a runner it needs is
+  full, starts once that runner frees, its three legs within a second of each other; and with
+  kiln's `chaos` faults, a member its runner refuses has the other two stopped within a second and
+  the three run together after, and a gang whose grants the store can't write has none of them
+  heard of. *Simulation tests (`w05_ac18_…`); end-to-end tests (`crates/kiln/tests/gangs.rs`, the
+  refusals' and the store's with `--features chaos`).*
 
 **Scenarios**
 

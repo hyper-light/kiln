@@ -64,8 +64,8 @@ runner and takes the same words too, with `harness=codex` and `-name` (not that 
 
 ## 3. In a workflow
 
-A job's `resources:`, `requires:` and `exclusive:` are its needs (kiln's keys: `needs:` is
-GitHub's, for the jobs a job waits for). A GitHub workflow takes them from its overlay,
+A job's `resources:`, `requires:`, `exclusive:` and `together:` are its needs (kiln's keys:
+`needs:` is GitHub's, for the jobs a job waits for). A GitHub workflow takes them from its overlay,
 `.kiln/overlays/<stem>.yaml`. This job needs `cpus=8,mem=32g,linux/amd64,exclusive`:
 
 ```yaml
