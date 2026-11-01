@@ -51,6 +51,23 @@ fn plain(title: &str) -> String {
     skip::without_markers(title.lines().next().unwrap_or_default())
 }
 
+/// A draft's title as GitLab takes it (W29-R11): its API has no draft flag, so the title starts
+/// "Draft: "; one that says so already stays as it is. Bitbucket's, when it refuses its flag.
+pub fn drafted_title(title: &str) -> String {
+    if undrafted_title(title).is_some() { title.to_owned() } else { format!("Draft: {title}") }
+}
+
+/// A title without the prefix GitLab reads as a draft (`[Draft]`, `Draft:` or `(Draft)`, any
+/// case): what Ready leaves of it (W29-R12). None when it has none.
+pub fn undrafted_title(title: &str) -> Option<String> {
+    let t = title.trim_start();
+    ["[draft]", "draft:", "(draft)"].iter().find(|p| t.get(..p.len()).is_some_and(|head| head.eq_ignore_ascii_case(p))).map(|p| t.get(p.len()..).unwrap_or_default().trim_start().to_owned())
+}
+
+/// GitHub's mutation that marks a draft pull request ready for review, by its node id (W29-R12):
+/// GitHub's REST API can't.
+pub const GITHUB_READY: &str = "mutation($id: ID!) { markPullRequestReadyForReview(input: { pullRequestId: $id }) { pullRequest { isDraft } } }";
+
 /// Why another repository may not use `uses` (W29-R10): it names a ref under `kiln/draft/`, and a
 /// draft is its author's until it's published. A local action (`./…`) and an image aren't
 /// another repository's.
@@ -106,5 +123,18 @@ mod tests {
         assert_eq!(ready_message("Edit ci [CI SKIP]"), "Edit ci\n");
         assert_eq!(ready_message(""), "Ready\n");
         assert!(!skip::asks_to_skip(&ready_message("skip-checks: true")));
+    }
+
+    #[test]
+    fn w29_r11_gitlab_draft_titles() {
+        assert_eq!(drafted_title("Edit ci"), "Draft: Edit ci");
+        for t in ["Draft: Edit ci", "draft:Edit ci", "[Draft] Edit ci", "(DRAFT) Edit ci", "  Draft: Edit ci"] {
+            assert_eq!(drafted_title(t), t, "already a draft's");
+            assert_eq!(undrafted_title(t).as_deref(), Some("Edit ci"), "{t}");
+        }
+        assert_eq!(undrafted_title("Edit ci"), None);
+        assert_eq!(undrafted_title("Drafting the ci"), None, "a word, not the prefix");
+        assert_eq!(undrafted_title(&drafted_title("Édit ci")).as_deref(), Some("Édit ci"));
+        assert!(GITHUB_READY.contains("markPullRequestReadyForReview") && GITHUB_READY.contains("$id: ID!"));
     }
 }

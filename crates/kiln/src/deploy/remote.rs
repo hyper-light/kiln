@@ -438,9 +438,9 @@ impl Remote {
         }
         made.ok_or_else(|| anyhow!("{branch} kept moving: five tries"))?;
         let pr: ChangeRef = match &self.host {
-            Host::Github(app) => app.open_change(&row, &branch, &self.branch, &title, body).await?,
-            Host::Gitlab(g) => g.open_change(&row, &branch, &self.branch, &title, body).await?,
-            Host::Bitbucket(b) => b.open_change(&row, &branch, &self.branch, &title, body).await?,
+            Host::Github(app) => app.open_change(&row, &branch, &self.branch, &title, body, false).await?,
+            Host::Gitlab(g) => g.open_change(&row, &branch, &self.branch, &title, body, false).await?,
+            Host::Bitbucket(b) => b.open_change(&row, &branch, &self.branch, &title, body, false).await?,
         };
         Ok(Proposal { number: pr.number, url: pr.url, branch, state: ChangeState::Open })
     }

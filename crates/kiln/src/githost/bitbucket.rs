@@ -238,10 +238,24 @@ impl Bitbucket {
         super::remote_commit(hub, repo, &url, branch, expected, files, message, author).await
     }
 
-    pub async fn open_change(&self, repo: &Repo, head: &str, base: &str, title: &str, body: &str) -> anyhow::Result<ChangeRef> {
+    /// Opens a pull request; a draft with `draft`: Bitbucket's own `draft`, or, when it refuses the
+    /// flag (its API documents no draft for a new pull request), a title that says so (docs/ci.md
+    /// W29-R11).
+    pub async fn open_change(&self, repo: &Repo, head: &str, base: &str, title: &str, body: &str, draft: bool) -> anyhow::Result<ChangeRef> {
         let name = self.name(repo)?;
-        let ask = json!({ "title": title, "description": body, "source": { "branch": { "name": head } }, "destination": { "branch": { "name": base } } });
-        let (st, v) = self.call(Method::Post, &format!("/repositories/{name}/pullrequests"), Some(&ask)).await?;
+        let path = format!("/repositories/{name}/pullrequests");
+        let ask = |title: &str, flag: bool| {
+            let mut a = json!({ "title": title, "description": body, "source": { "branch": { "name": head } }, "destination": { "branch": { "name": base } } });
+            if let (true, Some(o)) = (flag, a.as_object_mut()) {
+                o.insert("draft".into(), json!(true));
+            }
+            a
+        };
+        let (mut st, mut v) = self.call(Method::Post, &path, Some(&ask(title, draft))).await?;
+        if draft && st == 400 {
+            tracing::debug!(said = %said(&v), "Bitbucket refused a draft pull request's flag: its title says it's a draft instead");
+            (st, v) = self.call(Method::Post, &path, Some(&ask(&kiln_ci::drafts::drafted_title(title), false))).await?;
+        }
         if st != 201 {
             bail!("Bitbucket opened no pull request ({st}): {}", said(&v));
         }
@@ -261,13 +275,40 @@ impl Bitbucket {
     /// (the newest).
     pub async fn find_change(&self, repo: &Repo, head: &str) -> anyhow::Result<Option<(ChangeRef, ChangeState)>> {
         let name = self.name(repo)?;
-        let q = crate::ci::cli::enc(&format!("source.branch.name=\"{head}\""));
-        let (st, v) = self.call(Method::Get, &format!("/repositories/{name}/pullrequests?q={q}&state=OPEN&state=MERGED&state=DECLINED&state=SUPERSEDED"), None).await?;
-        if st != 200 {
-            bail!("the pull requests from {head} ({st}): {}", said(&v));
+        // Bitbucket's list leaves drafts out unless it's asked for them (docs/ci.md W29-R11): a
+        // draft's branch is asked again so.
+        for q in [format!("source.branch.name=\"{head}\""), format!("source.branch.name=\"{head}\" AND draft=true")] {
+            let q = crate::ci::cli::enc(&q);
+            let (st, v) = self.call(Method::Get, &format!("/repositories/{name}/pullrequests?q={q}&state=OPEN&state=MERGED&state=DECLINED&state=SUPERSEDED"), None).await?;
+            if st != 200 {
+                bail!("the pull requests from {head} ({st}): {}", said(&v));
+            }
+            let newest = v.get("values").and_then(Value::as_array).and_then(|l| l.iter().max_by_key(|p| p.get("id").and_then(Value::as_u64).unwrap_or(0)));
+            if let Some(p) = newest {
+                return Ok(Some((ChangeRef { number: p.get("id").and_then(Value::as_u64).unwrap_or(0), url: p.pointer("/links/html/href").and_then(Value::as_str).unwrap_or_default().to_owned() }, pr_state(p))));
+            }
+            if !kiln_ci::drafts::is_draft_ref(head) {
+                break;
+            }
         }
-        let newest = v.get("values").and_then(Value::as_array).and_then(|l| l.iter().max_by_key(|p| p.get("id").and_then(Value::as_u64).unwrap_or(0)));
-        Ok(newest.map(|p| (ChangeRef { number: p.get("id").and_then(Value::as_u64).unwrap_or(0), url: p.pointer("/links/html/href").and_then(Value::as_str).unwrap_or_default().to_owned() }, pr_state(p))))
+        Ok(None)
+    }
+
+    /// Marks draft pull request `number` ready for review (W29-R12): `draft: false`, and its title
+    /// without the Draft prefix it was given where Bitbucket refused the flag.
+    pub async fn ready_change(&self, repo: &Repo, number: u64) -> anyhow::Result<()> {
+        let name = self.name(repo)?;
+        let (st, v) = self.call(Method::Get, &format!("/repositories/{name}/pullrequests/{number}"), None).await?;
+        anyhow::ensure!(st == 200, "pull request #{number} ({st}): {}", said(&v));
+        let title = v.get("title").and_then(Value::as_str).unwrap_or_default();
+        let undrafted = kiln_ci::drafts::undrafted_title(title);
+        if v.get("draft").and_then(Value::as_bool) != Some(true) && undrafted.is_none() {
+            return Ok(());
+        }
+        let ask = json!({ "title": undrafted.as_deref().unwrap_or(title), "draft": false });
+        let (st, v) = self.call(Method::Put, &format!("/repositories/{name}/pullrequests/{number}"), Some(&ask)).await?;
+        anyhow::ensure!(st == 200, "Bitbucket didn't mark pull request #{number} ready ({st}): {}", said(&v));
+        Ok(())
     }
 
     /// Declines pull request `number`, saying why (a comment) first.
@@ -524,5 +565,55 @@ mod tests {
         assert_eq!(push_event(&h, body), Some(Push { repo: "acme/app".into(), refname: "refs/heads/main".into(), before: "a".into(), after: "b".into() }));
         let created = br#"{"repository":{"full_name":"acme/app"},"push":{"changes":[{"new":{"type":"tag","name":"v1","target":{"hash":"c"}},"old":null}]}}"#;
         assert_eq!(push_event(&h, created).map(|p| (p.refname, p.before)), Some(("refs/tags/v1".into(), super::super::NO_COMMIT.into())));
+    }
+
+    /// W29-R11, R12 on Bitbucket: a pull request opened as a draft by its own flag, or, where
+    /// Bitbucket refuses the flag, by its title; made ready by `draft: false` and the title without
+    /// the prefix; and a draft's branch found though Bitbucket's list leaves drafts out.
+    #[test]
+    fn w29_r11_r12_bitbucket_drafts() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let answers = |refuse_flag: bool| -> crate::githost::fake_host::Answer {
+                Box::new(move |method, path, query, body| match (method, path) {
+                    ("POST", "/2.0/repositories/acme/app/pullrequests") if refuse_flag && body.get("draft").is_some() => (400, json!({ "type": "error", "error": { "message": "draft: unknown field" } })),
+                    ("POST", "/2.0/repositories/acme/app/pullrequests") => (201, json!({ "id": 7, "links": { "html": { "href": "https://bitbucket.org/acme/app/pull-requests/7" } } })),
+                    ("GET", "/2.0/repositories/acme/app/pullrequests/7") if refuse_flag => (200, json!({ "id": 7, "title": "Draft: Edit ci", "draft": false })),
+                    ("GET", "/2.0/repositories/acme/app/pullrequests/7") => (200, json!({ "id": 7, "title": "Edit ci", "draft": true })),
+                    ("GET", "/2.0/repositories/acme/app/pullrequests/8") => (200, json!({ "id": 8, "title": "Edit ci", "draft": false })),
+                    ("PUT", "/2.0/repositories/acme/app/pullrequests/7") => (200, json!({ "id": 7 })),
+                    // The list leaves drafts out unless asked for them.
+                    ("GET", "/2.0/repositories/acme/app/pullrequests") if query.contains("draft=true") => (200, json!({ "values": [{ "id": 7, "state": "OPEN", "draft": true, "links": { "html": { "href": "https://bitbucket.org/acme/app/pull-requests/7" } } }] })),
+                    ("GET", "/2.0/repositories/acme/app/pullrequests") => (200, json!({ "values": [] })),
+                    _ => (404, json!({ "type": "error" })),
+                })
+            };
+            let r = repo("https://bitbucket.org/acme/app.git");
+            for refuse_flag in [false, true] {
+                let (base, fake) = crate::githost::fake_host::start(answers(refuse_flag)).await?;
+                let b = Bitbucket { web: "https://bitbucket.org".into(), api: format!("{base}/2.0"), cred: Cred::Token("t".into()), webhook_secret: None, workspaces: vec![], ssh: "ssh://git@bitbucket.org".into() };
+                let opened = b.open_change(&r, "kiln/draft/ci-01a19f2c", "main", "Edit ci", "", true).await?;
+                assert_eq!(opened.number, 7);
+                let sent = fake.sent("POST", "/2.0/repositories/acme/app/pullrequests");
+                if refuse_flag {
+                    assert_eq!(sent.len(), 2, "{sent:?}");
+                    assert_eq!(sent.get(1).map(|s| (s.get("title").cloned(), s.get("draft").is_none())), Some((Some(json!("Draft: Edit ci")), true)), "{sent:?}");
+                } else {
+                    assert_eq!(sent.iter().map(|s| s.get("draft").cloned()).collect::<Vec<_>>(), [Some(json!(true))], "{sent:?}");
+                }
+                b.ready_change(&r, 7).await?;
+                assert_eq!(fake.sent("PUT", "/2.0/repositories/acme/app/pullrequests/7"), [json!({ "title": "Edit ci", "draft": false })], "refused: {refuse_flag}");
+                b.ready_change(&r, 8).await?;
+                assert!(fake.sent("PUT", "/2.0/repositories/acme/app/pullrequests/8").is_empty(), "ready already: nothing to change");
+                let found = b.find_change(&r, "kiln/draft/ci-01a19f2c").await?.map(|(c, _)| c.number);
+                assert_eq!(found, Some(7), "a draft's branch is asked again for drafts");
+                assert_eq!(b.find_change(&r, "kiln/edit-ci-1").await?.map(|(c, _)| c.number), None);
+            }
+            // Not asked for a draft, it sends no flag.
+            let (base, fake) = crate::githost::fake_host::start(answers(false)).await?;
+            let b = Bitbucket { web: "https://bitbucket.org".into(), api: format!("{base}/2.0"), cred: Cred::Token("t".into()), webhook_secret: None, workspaces: vec![], ssh: "ssh://git@bitbucket.org".into() };
+            b.open_change(&r, "kiln/edit-ci-1", "main", "Edit ci", "", false).await?;
+            assert!(fake.sent("POST", "/2.0/repositories/acme/app/pullrequests").iter().all(|s| s.get("draft").is_none()));
+            Ok(())
+        })
     }
 }
