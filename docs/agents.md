@@ -850,7 +850,10 @@ agents"). Its head says what's shown, a row each, each choice in a menu:
   browser keeps the choice.
 - **By**: everyone, the agent itself, or one of its harness's subagents, each with how many of the
   files at that scope it changed. Narrowed to one, a file someone else changed too shows only their
-  part and says who else changed it (see "One subagent's own edits").
+  part and says who else changed it (see "One subagent's own edits"). Under their own heading, the
+  agents it started through kiln (`agents.start`, its goals' and plan steps'): each a session of its
+  own, maybe on another machine, so picking one shows that agent's own changes, read from its own
+  session, at the same scope.
 
 The head's last row carries what's shown in all (`+added −removed`), and Sort (by path, latest change,
 most changed, new, changed or deleted, or who changed it) sits at its right. Its files are a flat

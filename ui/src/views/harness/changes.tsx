@@ -11,7 +11,7 @@
 import * as React from "react";
 import { DropdownMenu } from "radix-ui";
 import { ArrowDownUp, Bot, Check, ChartNoAxesColumn, ChevronDown, Clock, FilePlus2, Folder, Layers, User, Users, type LucideIcon } from "lucide-react";
-import type { FileChange, FilePlace, HEvent } from "@/api/harness";
+import { sessionStore, type FileChange, type FilePlace, type HEvent } from "@/api/harness";
 import { usePref } from "@/lib/prefs";
 import { relativeTime } from "@/lib/format";
 import { DiffStat, FileDiffView } from "./diff";
@@ -57,6 +57,29 @@ const SORTS: { id: SortKey; label: string; word: string; icon: LucideIcon }[] = 
 
 /** The agent itself, as a file's `by` names it beside its subagents' runs. */
 const AGENT = "main";
+
+/** An agent it started through kiln, as By's value names it (its own session's id after it). */
+const STARTED = "started:";
+
+/** No session to listen to: By isn't on an agent it started. */
+const nothingToHear = () => () => undefined;
+
+/** The server's cumulative changeset as the file list and diffs show it (one diff per file). */
+export function fromServer(files: readonly FileChange[]): ChangedFile[] {
+  return files.map((f) => ({
+    path: f.path,
+    tree: f.tree,
+    created: Boolean(f.created),
+    add: f.added,
+    del: f.removed,
+    edits: [{ call: null, diff: { path: f.path, created: f.created, hunks: f.hunks } }],
+    deleted: Boolean(f.deleted),
+    truncated: Boolean(f.truncated),
+    by: f.by,
+    place: f.place,
+    at: f.at,
+  }));
+}
 
 /** A subagent of its harness's: its run's id (its spawning call's), what it was asked, its kind. */
 export interface Sub {
@@ -347,6 +370,7 @@ export function SessionChanges({
   own,
   commits,
   compare,
+  started = [],
 }: {
   files: ChangedFile[];
   cwd: string;
@@ -355,12 +379,30 @@ export function SessionChanges({
   own?: OwnSource;
   commits?: CommitsSource;
   compare?: CompareSource;
+  started?: readonly Sub[];
 }) {
   const [mode, setMode] = React.useState<Mode>("session");
   const [scope, setScope] = useScope();
   const [sort] = usePref<SortKey>("kiln.changes.sort", "path");
   const [by, setBy] = React.useState<string>("all");
   const [sel, setSel] = React.useState<string | null>(null);
+  // An agent it started: its own changes, read from its own session, at the same scope.
+  const startedOne = React.useMemo(
+    () => (by.startsWith(STARTED) ? (started.find((a) => `${STARTED}${a.id}` === by) ?? { id: by.slice(STARTED.length), label: "An agent it started" }) : null),
+    [by, started],
+  );
+  const theirStore = startedOne ? sessionStore(startedOne.id) : null;
+  const theirChanges = React.useSyncExternalStore(
+    theirStore?.subscribe ?? nothingToHear,
+    () => theirStore?.get().changes ?? null,
+    () => null,
+  );
+  const theirReady = React.useSyncExternalStore(
+    theirStore?.subscribe ?? nothingToHear,
+    () => theirStore?.get().ready ?? true,
+    () => true,
+  );
+  const theirs = React.useMemo(() => (startedOne ? fromServer(theirChanges ?? []) : null), [startedOne, theirChanges]);
   const names = React.useMemo(() => new Map(subs.map((s) => [s.id, s.label])), [subs]);
   const who = React.useCallback((id: string) => (id === AGENT ? self : (names.get(id) ?? "A subagent")), [names, self]);
   // Everyone it may be narrowed to: the agent, its subagents as they began, and any run its files name that isn't listed (yet).
@@ -370,9 +412,9 @@ export function SessionChanges({
     return out;
   }, [files, self, subs, who]);
   const scoped = React.useMemo(() => files.filter((f) => inScope(f, scope)), [files, scope]);
-  const mine = React.useMemo(() => (by === "all" ? scoped : scoped.filter((f) => (f.by ?? [AGENT]).includes(by))), [scoped, by]);
+  const mine = React.useMemo(() => (theirs ? theirs.filter((f) => inScope(f, scope)) : by === "all" ? scoped : scoped.filter((f) => (f.by ?? [AGENT]).includes(by))), [theirs, scoped, scope, by]);
   // Narrowed to one of them: what of the files another changed too is theirs, asked of the session; the answer before it holds while the next is asked.
-  const shared = by === "all" ? [] : mine.filter((f) => (f.by?.length ?? 0) > 1);
+  const shared = by === "all" || theirs ? [] : mine.filter((f) => (f.by?.length ?? 0) > 1);
   const stamp = own?.answers && shared.length > 0 ? shared.map(stampOf).join("\u0001") : "";
   const askedBy = React.useDeferredValue(by);
   const asked = React.useDeferredValue(stamp);
@@ -380,7 +422,7 @@ export function SessionChanges({
     const parts = new Map<string, string | undefined>();
     const pending = new Set<string>();
     const rows = mine.map((f) => {
-      if (by === "all" || (f.by?.length ?? 0) < 2) return rowOf(f, cwd);
+      if (by === "all" || theirs || (f.by?.length ?? 0) < 2) return rowOf(f, cwd);
       const p = partOf(f, by, reply === undefined || reply?.by === by ? reply : undefined, own, cwd);
       const r = rowOf(p.file, cwd);
       parts.set(r.key, p.note);
@@ -391,7 +433,7 @@ export function SessionChanges({
     return { rows: sortRows(rows, sort, first), notes: parts, pending };
   };
   const count = (id: string) => scoped.filter((f) => (f.by ?? [AGENT]).includes(id)).length;
-  const byLabel = by === "all" ? "Everyone" : who(by);
+  const byLabel = by === "all" ? "Everyone" : startedOne ? startedOne.label : who(by);
   const scopeOf = SCOPE[scope];
   // Commits: on once its machine has listed them (each read through Suspense), else turned off with why.
   const commitsMode = commits && (
@@ -425,6 +467,7 @@ export function SessionChanges({
   const line = (r: Row): string => {
     const ids = r.file.by ?? [];
     const tree = r.tree ? ` · ${treeWord(r.tree)}` : "";
+    if (startedOne) return `${startedOne.label}${tree}`;
     if (by === "all") return ids.length ? `${ids.map(who).join(", ")}${tree}` : tree.slice(3);
     const others = ids.filter((id) => id !== by);
     return others.length ? `also changed by ${others.map(who).join(", ")}` : `${who(by)}${tree}`;
@@ -445,7 +488,7 @@ export function SessionChanges({
       line={line}
       sel={sel}
       onSel={setSel}
-      none={scope === "project" && by === "all" ? "Nothing in this project changed." : "Nothing here at this scope."}
+      none={startedOne && !theirReady ? "Asking it for its changes…" : scope === "project" && by === "all" ? "Nothing in this project changed." : "Nothing here at this scope."}
       notes={notes}
       pending={pending}
     />
@@ -535,6 +578,22 @@ export function SessionChanges({
                       </React.Fragment>
                     );
                   })}
+                  {started.length > 0 && <DropdownMenu.Label className="cx-menu-label">Agents it started</DropdownMenu.Label>}
+                  {started.map((a) => (
+                    <DropdownMenu.RadioItem key={a.id} value={`${STARTED}${a.id}`} className="menu-item">
+                      <span className="cx-mark">
+                        <DropdownMenu.ItemIndicator>
+                          <Check size={14} aria-hidden="true" />
+                        </DropdownMenu.ItemIndicator>
+                      </span>
+                      <Bot size={14} aria-hidden="true" />
+                      <span className="cx-item">
+                        {a.label}
+                        <small>{a.kind ? `${a.kind} · a session of its own` : "a session of its own"}</small>
+                      </span>
+                      <span className="cx-n" />
+                    </DropdownMenu.RadioItem>
+                  ))}
                 </DropdownMenu.RadioGroup>
               </DropdownMenu.Content>
             </DropdownMenu.Portal>

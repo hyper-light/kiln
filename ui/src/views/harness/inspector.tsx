@@ -6,7 +6,7 @@ import * as React from "react";
 import { Bot, Square } from "lucide-react";
 import { harnessApi, useSession, type AgentInfo, type Command, type FileChange as ServerChange, type HEvent, type Meta, type SessionStore, type State, type Task } from "@/api/harness";
 import { cn } from "@/lib/utils";
-import { agentLabel, changesetOf, duration, editsOf, money, runsOf, taskDot, taskLive, tokens, useSameList, type ChangedFile, type ToolEvent } from "./derive";
+import { agentLabel, changesetOf, duration, editsOf, money, runsOf, taskDot, taskLive, tokens, useSameList, type ToolEvent } from "./derive";
 import { kilnStatus } from "./tasks";
 import { Output, Prose } from "./parts";
 import { LimitMeter, StatusList } from "./limits";
@@ -25,7 +25,7 @@ import { ChangeBar } from "./change-bar";
 import { Fold, FoldOpen } from "./fold";
 import { WorkspaceBar } from "./workspace-bar";
 import { SubagentOutput } from "./task-output";
-import { SessionChanges, inScope, useScope, type OwnSource, type Sub } from "./changes";
+import { SessionChanges, fromServer, inScope, useScope, type OwnSource, type Sub } from "./changes";
 import type { CommitsSource } from "./commits";
 import type { CompareSource } from "./compare";
 
@@ -43,23 +43,6 @@ function ToolSection({ id, title, count, children }: { id: string; title: string
       {children}
     </Fold>
   );
-}
-
-/** The server's cumulative changeset as the file list and diffs show it (one diff per file). */
-function fromServer(files: ServerChange[]): ChangedFile[] {
-  return files.map((f) => ({
-    path: f.path,
-    tree: f.tree,
-    created: Boolean(f.created),
-    add: f.added,
-    del: f.removed,
-    edits: [{ call: null, diff: { path: f.path, created: f.created, hunks: f.hunks } }],
-    deleted: Boolean(f.deleted),
-    truncated: Boolean(f.truncated),
-    by: f.by,
-    place: f.place,
-    at: f.at,
-  }));
 }
 
 /** Its harness's subagents (their runs' ids, what each was asked, its kind), the same list while they stay the same: what the Changes tab's By names. */
@@ -85,6 +68,7 @@ export const Changes = React.memo(function Changes({
   self,
   subs,
   own,
+  started,
 }: {
   events: HEvent[];
   changes: ServerChange[] | null;
@@ -94,6 +78,7 @@ export const Changes = React.memo(function Changes({
   self: string;
   subs: readonly Sub[];
   own?: OwnSource;
+  started?: readonly Sub[];
 }) {
   const local = React.useMemo(() => (changes ? null : changesetOf(events)), [events, changes]);
   const files = React.useMemo(() => (changes ? fromServer(changes) : (local ?? [])), [changes, local]);
@@ -120,7 +105,7 @@ export const Changes = React.memo(function Changes({
           <ChangeBar agentId={agentId} />
         </Loadable>
       )}
-      <SessionChanges files={files} cwd={cwd} self={self} subs={subs} own={own} commits={commits} compare={compare} />
+      <SessionChanges files={files} cwd={cwd} self={self} subs={subs} own={own} commits={commits} compare={compare} started={started} />
     </div>
   );
 });
@@ -322,9 +307,12 @@ export function Inspector({
   harness,
   send,
   kiln = NO_AGENTS,
+  started,
 }: {
   /** The subagents kiln started for its goals or plan steps (sessions of their own), listed with its harness's own. */
   kiln?: readonly AgentInfo[];
+  /** Every agent it started through kiln: the Changes tab's By lists them, each read from its own session. */
+  started?: readonly Sub[];
   /** The agent, and how to send it commands (background tasks: output, stop). */
   agentId?: string;
   /** The agent's harness, by name ("Claude Code"). */
@@ -398,7 +386,7 @@ export function Inspector({
         {actions}
       </div>
       <div className="hx-inspector-body">
-        {tab === "changes" && <Changes events={edits} changes={changes} cwd={cwd} agentId={agentId} volumeOver={volumeOver} self={self} subs={subs} own={own} />}
+        {tab === "changes" && <Changes events={edits} changes={changes} cwd={cwd} agentId={agentId} volumeOver={volumeOver} self={self} subs={subs} own={own} started={started} />}
         {tab === "plan" && (
           <div className="in-secs">
             <PlanSourceContext.Provider value={agentId ? { session: agentId } : null}>

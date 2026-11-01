@@ -26,7 +26,7 @@ import { useAgentActions } from "./actions";
 import { MoveDialog, movable } from "./move";
 import { SettingsSheet, useAttachments, type Attachments } from "./controls";
 import { agentLabel, changesetOf, editsOf, useSameList } from "./derive";
-import { inScope, useScope } from "./changes";
+import { inScope, useScope, type Sub } from "./changes";
 import { useListener } from "./dom";
 import { FindBar, findIn, type FindNow } from "./find";
 import { EarlierMatches } from "./said";
@@ -109,6 +109,8 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
   // The subagents kiln started for its goals or plan steps: its, as its harness's own are.
   const everyone = useRes(harnessSessionsRes).data;
   const kiln = React.useMemo(() => kilnSubagentsOf(everyone, id), [everyone, id]);
+  // Every agent it started through kiln (its goals' and plan steps' too): the Changes tab's By lists them.
+  const started = React.useMemo(() => everyone.filter((a) => a.parent === id).map((a): Sub => ({ id: a.id, label: a.name, kind: a.target.replace(/^agent:/, "") })), [everyone, id]);
   // The head's pause button's state: the composer's border wears it, whichever thread it writes to.
   const turn = useTurnState(store, kiln);
   // One of those, its thread shown here: a session of its own.
@@ -417,7 +419,20 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
           onCollapsed={setTrayCollapsed}
           side={(actions) => (
             <AboutContext.Provider value={about}>
-              <Inspector tab={tab} onTab={setTab} store={store} cwd={cwd} onOpenTask={openTask} agentId={id} harness={info?.kind_name} send={send} kiln={kiln} className="hx-side" actions={actions} />
+              <Inspector
+                tab={tab}
+                onTab={setTab}
+                store={store}
+                cwd={cwd}
+                onOpenTask={openTask}
+                agentId={id}
+                harness={info?.kind_name}
+                send={send}
+                kiln={kiln}
+                started={started}
+                className="hx-side"
+                actions={actions}
+              />
             </AboutContext.Provider>
           )}
         >
@@ -440,6 +455,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
                 harness={info?.kind_name}
                 send={send}
                 kiln={kiln}
+                started={started}
                 hideTabs
                 className="hx-side hx-side-phone"
               />

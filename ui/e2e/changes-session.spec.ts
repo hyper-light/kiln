@@ -185,3 +185,21 @@ test("narrowed to one who changed it, a file another changed too shows only thei
   await pick(page, "By", /^Everyone/);
   await expect(quic.locator(".hx-stat")).toHaveText("+4−2");
 });
+
+test("By lists the agents it started; picking one shows its own changes, read from its own session", async ({ page }) => {
+  test.skip(REAL, "the mock's agents");
+  await open(page);
+  await page.getByRole("button", { name: /^By:/ }).click();
+  const menu = page.getByRole("menu");
+  await expect(menu.getByText("Agents it started")).toBeVisible();
+  await expect(menu.getByRole("menuitemradio", { name: /^(Fix the flaky retry test|Update the docs|Check the migration)/ })).toHaveCount(3);
+  await menu.getByRole("menuitemradio", { name: /^Fix the flaky retry test/ }).click();
+  await expect(page.getByRole("button", { name: "By: Fix the flaky retry test" })).toBeVisible();
+  // Its own changeset, at the tab's scope: not the lead's.
+  await expect(files(page)).toHaveCount(1);
+  const client = page.locator(".cx-file", { hasText: "client.rs" });
+  await expect(client.locator(".hx-stat")).toHaveText("+6−2");
+  await expect(client.locator(".cx-by")).toHaveText("Fix the flaky retry test");
+  await pick(page, "By", /^Everyone/);
+  await expect(files(page)).toHaveCount(4);
+});
