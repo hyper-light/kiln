@@ -9914,13 +9914,151 @@ is kiln research `01a1947b2b0270fa9d1e32d07aebaa7e` (44 findings, 37 sources) an
   - Agents get the same through `ci.workflows.*`, and through `ship.pipelines.list`, `.get` and
     `.act` in the one route table (W20-R01).
 
-**W29's routes, events and types** (step 2's; later steps add theirs)
+**Requirements: drafts, runs by hand and the engine on**
+
+- **W29-R10 Drafts.** A draft is a workflow or action written and not yet published (the
+  Vocabulary's).
+  - It lives apart from the default branch. In a repository kiln hosts, it's a draft diff (W14-R05's
+    draft state). On a host, it's a branch `kiln/draft/<stem>-<id8>` with a draft change (W29-R11).
+  - **No trigger runs it.**
+    - kiln's engine starts no run for an event on a ref under `kiln/draft/`.
+    - A draft diff fires no `diff` workflow unless that workflow says `drafts: true` (W03-R09); a
+      draft pipeline's own `diff` triggers don't count.
+    - On a host, the draft's commits carry `[skip ci]` in their head message. GitHub skips its push
+      and pull-request workflows for that commit, and kiln, GitHub-exact, does too (W03-R06).
+  - **No other repository can use it.** It has no tag, and kiln's resolution (W07-R02) refuses a
+    `uses:` from another repository that names a ref under `kiln/draft/`, saying it's a draft.
+    GitHub can't be held to this for its own runs: a host-side `uses:` of the branch is the host's
+    to allow.
+  - **Its author runs it by hand** (W29-R14), and that is the only way it runs.
+  - **Ship marks it** DRAFT beside its title, on its row and on its pane's head. Its stand's word
+    says how far it is:
+    - Not saved: edits not yet committed;
+    - Unpublished: a new pipeline, saved;
+    - Review: someone else's draft, waiting on you;
+    - Update: kiln's update draft (W29-R22).
+  - A draft lands, and is published, through its change's review and landing: kiln's land queue
+    (W14), or the host's merge (W23, W26-R19). The read model then gathers it again (W29-R03), and
+    the row loses DRAFT.
+- **W29-R11 Save draft.** `POST /api/ship/pipelines { verb: "save_draft", repo, path, content, files?,
+  title? }`. It goes to `ci.workflows.edit` with `draft: true` (W21-R06's saving, grown) as the
+  caller, who needs `diffs.submit`.
+  - **The first save** opens the draft:
+    - kiln: a diff submitted with the `draft` push option (W14-R05);
+    - GitHub: the branch, then a pull request with REST's `draft: true`;
+    - GitLab: the branch, then a merge request titled "Draft: …" (its API takes no draft flag);
+    - Bitbucket: the branch, then a pull request with `draft: true`. If Bitbucket refuses the flag,
+      the title says "Draft: …" instead (its draft API has no documented example).
+  - **Later saves** add to it: a new version of the diff, or a new commit on the branch, its head
+    still carrying `[skip ci]`.
+  - `githost::open_change` gains a `draft` argument, and each host's client says what it did.
+  - A save with errors is refused (W21-R06). A warning (KCI6002, a tag to pin) is kept, with
+    W29-R25's lock written in the same save.
+- **W29-R12 Ready.** `POST /api/ship/pipelines { verb: "ready", repo, path }` asks for review.
+  - kiln: `ci.diffs.ready`, so the diff's state goes from draft to needs-review (W14-R05).
+  - A host first commits the draft's head again without `[skip ci]` (the same tree), so the host's
+    checks and kiln's run on it. Then:
+    - GitHub: GraphQL `markPullRequestReadyForReview` (REST can't change it);
+    - GitLab: the title loses "Draft:";
+    - Bitbucket: `draft: false`.
+  - `githost` gains `ready_change`.
+- **W29-R13 Discard.** `POST /api/ship/pipelines { verb: "discard", repo, path }`, asked again in the
+  strip (Keep · Discard).
+  - kiln: `ci.diffs.abandon`.
+  - A host: `githost::close_change`, then `delete_branch` (both exist for GitHub, GitLab and
+    Bitbucket).
+  - Unsaved edits are simply dropped. The row goes back to what's published, or goes, for a new
+    pipeline.
+- **W29-R14 Run, by hand.** `POST /api/ship/pipelines { verb: "run", repo, path, ref | sha, event?,
+  inputs?, jobs? }`. It goes to `ci.runs.trigger`, which gains `sha`, `event` and `jobs`.
+  - **A published workflow** runs as GitHub's `workflow_dispatch`, or kiln's `manual` (W03-R11):
+    - it needs that trigger, and Run is dimmed, saying so, without it;
+    - its typed inputs are asked for under the strip, in place;
+    - `jobs` runs the chosen jobs and what they need (`uploads::only_job`, grown to a set).
+  - **A draft** runs as its author's test, for the event picked in "plan for:" (W29-R07), at its
+    head commit or at the editor's text (as Try it commits it under `refs/kiln/uploads/`, W21-R07).
+    That's kiln's addition. The run:
+    - is marked a draft's;
+    - reports no status to its change;
+    - stops a job that names an environment before it deploys, saying the run is a draft's.
+  - **Where it runs:**
+    - Every run is on kiln's engine, whatever the repository's CI provider (W23).
+    - A host that is the provider is asked too: GitHub's `workflow_dispatch` for a published
+      workflow.
+    - A draft never runs on the host: GitHub dispatches only workflows on the default branch.
+  - **An action** runs by Try it (W21-R07), which this verb also takes.
+- **W29-R15 Turning a workflow off and on.** `POST /api/ship/pipelines { verb: "turn_off" |
+  "turn_on", repo, path, why? }` goes to the new `ci.workflows.disable` and `ci.workflows.enable`.
+  - A new table (migration `…_w29_r15_workflow_switch`) keeps `(repo, path, on, by, at, why)`.
+  - While a workflow is off, its triggers start nothing and Run refuses, each saying who turned it
+    off, when and why. Its runs under way finish.
+  - Where GitHub is the repository's provider, GitHub's `PUT
+    /repos/{owner}/{repo}/actions/workflows/{id}/disable` (or `/enable`) is called too, so both
+    agree.
+  - GitLab and Bitbucket keep one pipeline file each, so the switch is kiln's alone there.
+  - The pane's Settings group shows it: "Turned on · runs on its triggers", or "Off · <who> ·
+    <why>".
+- **W29-R16 The engine on, in stages, bare metal by default.**
+  1. **The server.** `[ci] enabled = true` with `github_workflows = "off"`. The engine plans,
+     checks and runs by hand (Run, Try it, `ci.runs.trigger`), and starts nothing on its own.
+     Production's commit for this stage is `9ce4e445d0`, deployed by itself, after main's head is
+     deployed and healthy.
+  2. **Each repository, by its own change.** Its `.kiln/config.yaml` on the default branch says
+     `github_workflows: on` (`repo_config.rs`, existing). It gains `kiln_workflows: on`, so a
+     repository's `.kiln/` workflows move to the engine one repository at a time. The server-wide
+     `[ci] kiln_workflows` stays as the default. Pipelines' Settings writes these lines as a draft
+     (W29-R10, R11), reviewed like any change.
+  3. **kiln's own `.kiln/` workflows**, after W24 M0's side-by-side replay of main's commits agrees
+     with v1.
+
+  Each stage is a KilnCD deploy or a reviewed change, held healthy by its guard.
+  - **Machines:**
+    - A leg that asks for no executor runs as `host` (bare metal), on a runner whose headroom keeps
+      what else runs there safe (docs/headroom.md).
+    - Docker, Firecracker, Shards and Kubernetes legs are asked for by `executor:` (kiln's dialect),
+      by labels, or by routing rules (W05-R21).
+    - Compose is new: `executor: compose` runs a leg's job container and services (W13-R08) as one
+      Docker Compose project, on a runner with Docker. It's a W13 addendum.
+
+**Per host**
+
+| Verb | kiln-hosted | GitHub | GitLab | Bitbucket |
+| --- | --- | --- | --- | --- |
+| Save draft, first | draft diff | `kiln/draft/…` branch, `[skip ci]` head, PR `draft: true` | branch, `[skip ci]`, MR "Draft: …" | branch, `[skip ci]`, PR `draft: true` (else "Draft: …") |
+| Save draft, again | the diff's next version | a commit on the branch | a commit on the branch | a commit on the branch |
+| Ready | `ci.diffs.ready` | head without `[skip ci]`, `markPullRequestReadyForReview` | head without `[skip ci]`, title loses "Draft:" | head without `[skip ci]`, `draft: false` |
+| Discard | `ci.diffs.abandon` | `close_change`, `delete_branch` | the same | the same |
+| Run, published | kiln's engine | kiln's engine; GitHub's dispatch too where GitHub is the provider | kiln's engine | kiln's engine |
+| Run, draft | kiln's engine, the author's test | kiln's engine only | kiln's engine only | kiln's engine only |
+| Turn off or on | kiln's switch | kiln's switch and GitHub's disable or enable | kiln's switch | kiln's switch |
+
+**A draft's life, from New to landing.** Each transition, the requirement that does it, and its
+endpoint, for a repository kiln hosts and for one on GitHub:
+
+| # | Transition | Requirement | kiln-hosted | GitHub |
+| --- | --- | --- | --- | --- |
+| 1 | New, Create draft | R08, R10, R11 | `POST /api/ship/pipelines {verb: "new"}` → `ci.workflows.edit {to: diff, draft: true}`: a draft diff | the same verb → `kiln/draft/<stem>-<id8>` with a `[skip ci]` head, `githost::open_change(draft)` |
+| 2 | Edit in place | R05, R06 | `POST /api/ci/validate` as you type; nothing written | the same |
+| 3 | Save draft | R11 | `{verb: "save_draft"}` → the diff's next version | `{verb: "save_draft"}` → a commit on the branch |
+| 4 | Run the draft | R14 | `{verb: "run", sha, event}` → `ci.runs.trigger` on kiln's engine; a draft's run | the same: kiln's engine, never GitHub's |
+| 5 | Ready | R12 | `{verb: "ready"}` → `ci.diffs.ready` | `{verb: "ready"}` → head without `[skip ci]`, then `markPullRequestReadyForReview` |
+| 6 | Review and checks | W14, W26 | the diff's review in Ship; its checks run | the pull request's review (W23, W26-R20); checks run on the new head |
+| 7 | Land: published | R10 | the land queue (W14) lands it on the default branch | the merge (W26-R19 through the merge queue) |
+| 8 | The row without DRAFT | R03 | the read model gathers again on the default branch's move; the `pipelines` event | the same |
+| — | Discard, at any step | R13 | `{verb: "discard"}` → `ci.diffs.abandon` | `{verb: "discard"}` → `close_change`, `delete_branch` |
+
+**W29's routes, events and types**
 
 | Route or event | Operation | Gives |
 | --- | --- | --- |
 | `GET /api/ship/pipelines?q=&repo=` | `ship.pipelines.list` | `{ repos: ShipPipelineRepo[] }` |
 | `GET /api/ship/pipelines/:owner/:name?path=&ref=` | `ship.pipelines.get` | `ShipPipelinePane` |
 | `POST /api/ship/pipelines { repo, path, verb, … }` | `ship.pipelines.act` | what the verb's operation answers, and the pane again |
+| verb `save_draft` (W29-R11) | `ci.workflows.edit`, grown: `draft: true` | the draft diff, or the host's draft change and branch |
+| verb `ready` (W29-R12) | `ci.diffs.ready`; `githost::ready_change`, new | the change asking for review |
+| verb `discard` (W29-R13) | `ci.diffs.abandon`; `githost::close_change`, `delete_branch` | the change closed |
+| verb `run` (W29-R14) | `ci.runs.trigger`, grown: `sha`, `event`, `jobs` | the run |
+| verbs `turn_off`, `turn_on` (W29-R15) | `ci.workflows.disable`, `ci.workflows.enable`, new | the switch, who and why |
 | event `pipelines { repo }` | | pages ask again |
 
 The TypeScript types (`ui/src/api/ship.ts`), each a Rust struct of `ship::pipelines`:
