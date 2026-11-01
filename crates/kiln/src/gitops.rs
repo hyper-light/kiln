@@ -726,6 +726,8 @@ pub async fn schedule_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
         last_minute = minute;
         // The CI engine's workflows (docs/ci.md W03-R10), when it is on.
         crate::ci::schedule::tick(&hub, minute * 60, &mut ci_cache).await;
+        // Update drafts whose cooldown has passed (docs/ci.md W29-R22).
+        crate::ci::updates::sweep(&hub).await;
         for repo in hub.store.repos().await? {
             let refs: HashMap<String, String> = hub.store.refs(repo.id.clone()).await?.into_iter().collect();
             let Some(head) = refs.get("HEAD->") else { continue };

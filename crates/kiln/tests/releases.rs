@@ -36,12 +36,25 @@ fn must(home: &Path, dir: &Path, args: &[&str]) -> anyhow::Result<String> {
 
 /// A repository kiln hosts, cloned under `dir` (its `/` a `_`), with a first commit on main.
 fn hosted(s: &Server, home: &Path, dir: &Path, name: &str) -> anyhow::Result<PathBuf> {
+    hosted_with(s, home, dir, name, &[])
+}
+
+/// [`hosted`], `files` in its first commit too: a setting read from the trunk is there before
+/// anything reads it.
+fn hosted_with(s: &Server, home: &Path, dir: &Path, name: &str, files: &[(&str, &str)]) -> anyhow::Result<PathBuf> {
     let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": name, "mode": "native" })))?;
     anyhow::ensure!(st == 200, "{name}: {st} {body}");
     let leaf = name.replace('/', "_");
     must(home, dir, &["clone", "-q", &format!("http://x:{}@127.0.0.1:{}/git/{name}.git", s.admin, s.port), &leaf])?;
     let work = dir.join(&leaf);
     std::fs::write(work.join("README.md"), format!("{name}\n"))?;
+    for (path, text) in files {
+        let p = work.join(path);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(p, text)?;
+    }
     must(home, &work, &["add", "."])?;
     must(home, &work, &["commit", "-qm", "first"])?;
     must(home, &work, &["push", "-q", "origin", "main"])?;
@@ -183,5 +196,115 @@ fn w29_r21_release_by_tag() -> anyhow::Result<()> {
     assert_eq!(tagged(&home, &work, "v1")?, b, "v1 stays at the newest release");
     let by_code = code(&s, &format!("return await kiln.ci.releases.tag({{ repo: 'acme/kit', sha: '{a}', tag: 'v1.1.2' }})"))?;
     assert_eq!((at(&by_code, "/tag"), at(&by_code, "/sha"), by_code.get("moved")), ("v1.1.2", a.as_str(), Some(&json!(["v1.1"]))), "{by_code}");
+    Ok(())
+}
+
+/// Commits `files` in `work` and pushes main: the commit.
+fn push(home: &Path, work: &Path, files: &[(&str, &str)]) -> anyhow::Result<String> {
+    for (path, text) in files {
+        let p = work.join(path);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(p, text)?;
+    }
+    must(home, work, &["add", "."])?;
+    must(home, work, &["commit", "-qm", "files"])?;
+    must(home, work, &["push", "-q", "origin", "main"])?;
+    Ok(must(home, work, &["rev-parse", "HEAD"])?.trim().to_owned())
+}
+
+/// The drafts in `repo`'s rows that kiln's updates opened, once `n` of them are there (and still
+/// after 2 s): each its id and its file's text at its head.
+fn update_drafts(s: &Server, repo: &str, path: &str, n: usize) -> anyhow::Result<Vec<(String, String)>> {
+    let read = || -> anyhow::Result<Vec<(String, String)>> {
+        let (_, body) = http(s.port, "GET", &format!("/api/ship/pipelines?repo={repo}"), &s.admin, None)?;
+        let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+        let rows: Vec<Value> = v.pointer("/repos/0/rows").and_then(Value::as_array).cloned().unwrap_or_default();
+        let mut out = Vec::new();
+        for r in rows.iter().filter(|r| at(r, "/path") == path && at(r, "/draft/author").starts_with("kiln-updates:")) {
+            let id = at(r, "/draft/id").to_owned();
+            let (_, pane) = http(s.port, "GET", &format!("/api/ship/pipelines/{repo}?path={path}&draft={id}"), &s.admin, None)?;
+            let pane: Value = serde_json::from_str(&pane).unwrap_or(Value::Null);
+            out.push((id, at(&pane, "/detail/text").to_owned()));
+        }
+        Ok(out)
+    };
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while read()?.len() < n {
+        anyhow::ensure!(Instant::now() < deadline, "{repo} has fewer than {n} update drafts of {path}: {:?}\n{}", read()?, s.log());
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    read()
+}
+
+/// W29-R22: update drafts. After acme/kit releases v1.1.0, acme/app (updates on, cooldown 0),
+/// whose runs used v1.0.0, gets an update draft moving its `uses:` to v1.1.0; acme/other, which
+/// didn't ask, gets none. In acme/web, a weekly group gathers acme/kit's and acme/tools' releases
+/// in one draft.
+#[test]
+fn w29_r22_update_drafts() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "", extra: "" })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let action = "name: x\nruns:\n  using: composite\n  steps:\n    - run: echo x\n      shell: bash\n";
+    let release = |repo: &str, sha: &str, tag: &str| -> anyhow::Result<()> {
+        let (st, out) = http(s.port, "POST", &format!("/api/ci/repos/{}/releases", repo.replace('/', "%2F")), &s.admin, Some(&json!({ "sha": sha, "tag": tag })))?;
+        anyhow::ensure!(st == 200, "{repo} {tag}: {st} {out}");
+        Ok(())
+    };
+    let mut heads = Vec::new();
+    for publisher in ["acme/kit", "acme/tools"] {
+        let work = hosted_with(&s, &home, dir.path(), publisher, &[(".kiln/config.yaml", "share: owner\n"), (".github/actions/x/action.yml", action)])?;
+        let head = must(&home, &work, &["rev-parse", "HEAD"])?.trim().to_owned();
+        release(publisher, &head, "v1.0.0")?;
+        heads.push((publisher, head));
+    }
+    let uses = |names: &[&str]| -> String {
+        let steps: String = names.iter().map(|n| format!("      - uses: kiln://{n}/.github/actions/x@v1.0.0\n")).collect();
+        format!("name: ci\non: push\njobs:\n  a:\n    runs-on: local\n    steps:\n{steps}")
+    };
+    let consumers = [
+        ("acme/app", Some("updates:\n  actions: on\n  cooldown: 0\n"), uses(&["acme/kit"])),
+        ("acme/other", None, uses(&["acme/kit"])),
+        ("acme/web", Some("updates:\n  actions: on\n  cooldown: 0\n  group: weekly\n"), uses(&["acme/kit", "acme/tools"])),
+    ];
+    for (name, config, workflow) in &consumers {
+        let mut files: Vec<(&str, &str)> = vec![(".github/workflows/ci.yml", workflow.as_str())];
+        if let Some(c) = config {
+            files.push((".kiln/config.yaml", c));
+        }
+        let work = hosted(&s, &home, dir.path(), name)?;
+        let sha = push(&home, &work, &files)?;
+        assert_eq!(concluded(&s, name, &sha)?, "success", "{name}'s run used v1.0.0");
+    }
+
+    // acme/kit's v1.1.0: one draft each where it was asked for.
+    let kit = heads.first().map(|(_, h)| h.clone()).unwrap_or_default();
+    release("acme/kit", &kit, "v1.1.0")?;
+    let app = update_drafts(&s, "acme/app", ".github/workflows/ci.yml", 1)?;
+    assert_eq!(app.len(), 1, "{app:?}");
+    assert!(app.iter().all(|(_, text)| text.contains("kiln://acme/kit/.github/actions/x@v1.1.0\n")), "{app:?}");
+    let web = update_drafts(&s, "acme/web", ".github/workflows/ci.yml", 1)?;
+    assert_eq!(web.len(), 1, "{web:?}");
+    assert_eq!(update_drafts(&s, "acme/other", ".github/workflows/ci.yml", 0)?.len(), 0, "acme/other didn't ask");
+
+    // acme/tools' v1.1.0 joins acme/web's week: one draft, both moved.
+    let tools = heads.get(1).map(|(_, h)| h.clone()).unwrap_or_default();
+    release("acme/tools", &tools, "v1.1.0")?;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let web = update_drafts(&s, "acme/web", ".github/workflows/ci.yml", 1)?;
+        if web.iter().any(|(_, t)| t.contains("acme/tools/.github/actions/x@v1.1.0")) {
+            assert_eq!(web.len(), 1, "one draft for the week: {web:?}");
+            assert!(web.iter().all(|(_, t)| t.contains("acme/kit/.github/actions/x@v1.1.0") && t.contains("acme/tools/.github/actions/x@v1.1.0")), "{web:?}");
+            break;
+        }
+        anyhow::ensure!(Instant::now() < deadline, "acme/tools' release didn't join acme/web's draft: {web:?}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert_eq!(update_drafts(&s, "acme/app", ".github/workflows/ci.yml", 1)?.len(), 1, "acme/app doesn't use acme/tools");
     Ok(())
 }

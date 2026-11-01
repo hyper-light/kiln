@@ -66,6 +66,7 @@ pub mod suggest;
 pub mod trigger;
 pub mod trust;
 pub mod turn;
+pub mod updates;
 pub mod verdict;
 pub mod wf;
 pub mod wire;

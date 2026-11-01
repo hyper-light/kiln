@@ -422,12 +422,20 @@ pub(crate) async fn pin(hub: &Hub, r: &Remote) -> anyhow::Result<String> {
     pin_ref(hub, r).await.map(|(sha, _)| sha)
 }
 
+/// A mirror's tags.
+async fn mirror_tags(hub: &Hub, dir: &str) -> std::collections::HashSet<String> {
+    gitops::run_git(hub, &["-C", dir, "for-each-ref", "--format=%(refname:short)", "refs/tags"], GIT_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).lines().map(str::to_owned).collect()).unwrap_or_default()
+}
+
 /// [`pin`], and the ref as GitHub writes it, which it was found as: `refs/tags/v1`,
 /// `refs/heads/main`, or the commit's SHA.
 pub(crate) async fn pin_ref(hub: &Hub, r: &Remote) -> anyhow::Result<(String, String)> {
     let dir = r.mirror(hub);
     let d = dir.to_string_lossy().to_string();
     let url = if r.native { native_source(hub, &r.owner, &r.repo)? } else { source(hub, &r.owner, &r.repo)? };
+    // The mirror's tags before it fetches: a new full version after is a release for consumers
+    // (W29-R22). A first mirror's are all new, and no one's update.
+    let before = if dir.join("HEAD").exists() { Some(mirror_tags(hub, &d).await) } else { None };
     if dir.join("HEAD").exists() {
         // The source may have moved (`[[ci.actions.sources]]` changed): fetch from where it is now.
         let _ = gitops::run_git(hub, &["-C", &d, "remote", "set-url", "origin", &url], GIT_TIMEOUT).await;
@@ -453,6 +461,12 @@ pub(crate) async fn pin_ref(hub: &Hub, r: &Remote) -> anyhow::Result<(String, St
     };
     if let Err(e) = fetched {
         tracing::warn!(action = %r.full(), error = %format!("{e:#}"), "action source unreachable; using the mirror");
+    } else if let Some(before) = before {
+        for tag in mirror_tags(hub, &d).await.into_iter().filter(|t| !before.contains(t)) {
+            if let Err(e) = super::updates::released(hub, &r.full(), &tag).await {
+                tracing::warn!(action = %r.full(), %tag, error = %format!("{e:#}"), "a new release's updates weren't made due");
+            }
+        }
     }
     for full in [format!("refs/tags/{}", r.git_ref), format!("refs/heads/{}", r.git_ref), r.git_ref.clone()] {
         if let Ok(o) = gitops::run_git(hub, &["-C", &d, "rev-parse", "--verify", "--quiet", &format!("{full}^{{commit}}")], GIT_TIMEOUT).await {

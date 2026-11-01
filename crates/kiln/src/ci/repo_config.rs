@@ -33,9 +33,38 @@ pub struct RepoConfig {
     pub untrusted: Option<serde_yaml::Value>,
     pub github_api: Option<serde_yaml::Value>,
     pub share: Option<String>,
+    /// W29-R22: `updates: { actions: on, cooldown: 3d, group: weekly }`, kiln's update drafts for
+    /// what its workflows use.
+    pub updates: Option<UpdatesConfig>,
+}
+
+/// `.kiln/config.yaml`'s `updates:` as written (W29-R22).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct UpdatesConfig {
+    pub actions: Option<serde_yaml::Value>,
+    pub cooldown: Option<serde_yaml::Value>,
+    pub group: Option<String>,
+}
+
+/// A scalar as YAML wrote it: `on`, `true`, `0`, `3d`.
+fn scalar(v: &serde_yaml::Value) -> Option<String> {
+    match v {
+        serde_yaml::Value::String(s) => Some(s.clone()),
+        serde_yaml::Value::Bool(b) => Some(b.to_string()),
+        serde_yaml::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
 }
 
 impl RepoConfig {
+    /// Its update drafts (W29-R22): off unless `updates.actions` says on.
+    pub fn updates(&self) -> kiln_ci::updates::Updates {
+        let u = self.updates.clone().unwrap_or_default();
+        let (actions, cooldown) = (u.actions.as_ref().and_then(scalar), u.cooldown.as_ref().and_then(scalar));
+        kiln_ci::updates::of_config(actions.as_deref(), cooldown.as_deref(), u.group.as_deref())
+    }
+
     /// Who may use its actions and reusable workflows (W29-R17): not shared unless it says.
     pub fn share(&self) -> kiln_ci::sharing::Access {
         self.share.as_deref().and_then(kiln_ci::sharing::Access::of_share).unwrap_or_default()

@@ -53,6 +53,15 @@ pub async fn tag(hub: &Arc<Hub>, caller: &Caller, name: &str, body: &Value) -> R
         _ => return Err((StatusCode::BAD_REQUEST, format!("{} isn't one kiln releases: Release is for repositories kiln hosts and GitHub's (W29-R21)", repo.name))),
     };
     record(hub, &repo.id, &[(tag.clone(), sha.clone())], &caller.name).await.map_err(internal)?;
+    // Each consumer that asked for updates gets one (W29-R22), opened as its cooldown says.
+    match super::updates::released(hub, &repo.name, &tag).await {
+        Ok(0) => {}
+        Ok(_) => {
+            let hub = Arc::clone(hub);
+            crate::rt::spawn(async move { super::updates::sweep(&hub).await });
+        }
+        Err(e) => tracing::warn!(repo = %repo.name, %tag, error = %format!("{e:#}"), "the release's updates weren't made due"),
+    }
     hub.store.audit(caller.name.clone(), "ci.releases.tag".into(), format!("{} {tag} at {sha}, moving {}", repo.name, if moved.is_empty() { "nothing".to_owned() } else { moved.join(", ") })).await;
     Ok(json!({ "repo": repo.name, "tag": tag, "sha": sha, "moved": moved, "url": url, "confirmed": !failed.is_empty() }))
 }
