@@ -418,7 +418,8 @@ async fn result(cx: Cx, v: Value) -> Out {
         .into_iter()
         .flatten()
         .map(|f| {
-            json!({"path": f.get("path"), "tree": f.get("tree"), "added": f.get("added"), "removed": f.get("removed"), "created": f.get("created").and_then(Value::as_bool).unwrap_or(false), "deleted": f.get("deleted").and_then(Value::as_bool).unwrap_or(false)})
+            // Who changed it and whose it is: its counts are this project's files only.
+            json!({"path": f.get("path"), "tree": f.get("tree"), "added": f.get("added"), "removed": f.get("removed"), "created": f.get("created").and_then(Value::as_bool).unwrap_or(false), "deleted": f.get("deleted").and_then(Value::as_bool).unwrap_or(false), "by": f.get("by"), "place": f.get("place").and_then(Value::as_str).unwrap_or("project")})
         })
         .collect();
     Ok(json!({
@@ -453,6 +454,50 @@ async fn workspace(cx: Cx, v: Value) -> Out {
     };
     let look = crate::workspace::change::ask_machine(&cx.hub, &info, &crate::workspace::Ask::Look).await?;
     Ok(json!({"workspace": {"kind": w.kind, "over": w.over, "sub": w.sub, "volume": w.made.as_ref().map(|m| &m.volume), "mount": w.made.as_ref().map(|m| &m.mount)}, "drift": look.get("drift").cloned().unwrap_or(json!([]))}))
+}
+
+/// Its repository's branches, tags and latest commits (docs/agents.md, "Compare").
+async fn refs(cx: Cx, v: Value) -> Out {
+    let info = seen(&cx, &agent_of(&v)?).await?;
+    crate::workspace::change::ask_machine(&cx.hub, &info, &crate::workspace::Ask::Refs).await
+}
+
+/// A point as `agents.compare` takes it: `now`, `began`, `agent:<who>`, else a branch, tag or
+/// commit (`ref:<name>` for one named like those).
+fn point(p: &str) -> crate::workspace::git::Point {
+    use crate::workspace::git::Point;
+    match p {
+        "now" => Point::Now,
+        "began" => Point::Began,
+        _ => match p.strip_prefix("agent:") {
+            Some(by) => Point::Agent { by: by.to_owned() },
+            None => Point::Ref { name: p.strip_prefix("ref:").unwrap_or(p).to_owned() },
+        },
+    }
+}
+
+/// What changes from one point to another in its repository (docs/agents.md, "Compare").
+async fn compare_points(cx: Cx, v: Value) -> Out {
+    let info = seen(&cx, &agent_of(&v)?).await?;
+    let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::trim).filter(|x| !x.is_empty()).map(str::to_owned);
+    let (Some(from), Some(to)) = (s("from"), s("to")) else {
+        return Err((StatusCode::BAD_REQUEST, "`from` and `to`: each a point (`now`, `began`, `agent:<who>`, or a branch, tag or commit)".to_owned()));
+    };
+    let split = s("split").is_none_or(|x| x != "false" && x != "0");
+    let since_head = cx.hub.harness.state(&info.id).and_then(|st| st.started_head);
+    let ask = crate::workspace::Ask::Compare { from: point(&from), to: point(&to), split, path: s("path"), since_head };
+    crate::workspace::change::ask_machine(&cx.hub, &info, &ask).await
+}
+
+/// Its branch's commits, its session's own after the commit it began at (else made after it
+/// began), and what `picks` change together (docs/agents.md, "Commits").
+async fn commits(cx: Cx, v: Value) -> Out {
+    let info = seen(&cx, &agent_of(&v)?).await?;
+    let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::trim).filter(|x| !x.is_empty()).map(str::to_owned);
+    let picks: Vec<String> = s("picks").map(|p| p.split(',').map(str::trim).filter(|x| !x.is_empty()).map(str::to_owned).collect()).unwrap_or_default();
+    let since_head = cx.hub.harness.state(&info.id).and_then(|st| st.started_head);
+    let ask = crate::workspace::Ask::Commits { branch: s("branch"), trunk: s("trunk"), since_head, since_at: Some(info.created_at), picks };
+    crate::workspace::change::ask_machine(&cx.hub, &info, &ask).await
 }
 
 async fn land(cx: Cx, v: Value) -> Out {
@@ -676,6 +721,33 @@ pub fn list_ops() -> Vec<Op> {
             run: |cx, v| Box::pin(workspace(cx, v)),
         },
         Op {
+            name: "agents.commits",
+            summary: "An agent's branch's commits (or `branch`'s) since its trunk (`trunk`, else its remote's default branch), newest first, the ones its session made marked, and what isn't committed yet; with `picks` (commits, comma-separated, `now` for what isn't committed yet), what they change together: a run of them from the first one's parent to the last, or, with gaps, each applied in order onto the first one's parent beside the folder (one that doesn't go without a commit left out says which). Asked of its machine, in the working tree its work is in.",
+            read_only: true,
+            destructive: false,
+            input: Input::of::<input::AgentsCommits>(),
+            route: |v| Ok((Method::GET, path(&["api", "harness", "agents", &agent_of(v)?, "commits"]))),
+            run: |cx, v| Box::pin(commits(cx, v)),
+        },
+        Op {
+            name: "agents.refs",
+            summary: "An agent's repository's branches (its own, then its remote's), tags and latest commits, and its trunk: what Compare's From and To offer besides the session's own points. Asked of its machine.",
+            read_only: true,
+            destructive: false,
+            input: Input::of::<input::AgentsRefs>(),
+            route: |v| Ok((Method::GET, path(&["api", "harness", "agents", &agent_of(v)?, "refs"]))),
+            run: |cx, v| Box::pin(refs(cx, v)),
+        },
+        Op {
+            name: "agents.compare",
+            summary: "What changes in an agent's repository from one point to another. `from` and `to` are each `now` (its folder as it is, untracked files too), `began` (as its session began), `agent:<who>` (`main`, the agent itself, or a subagent run: its files as it left them) or a branch, tag or commit (`ref:<name>` for one named like those). `split` (on unless `false`): from where they split, as git's three-dot diff does; never between two agents' versions, which say of each file which of them changed it (`changed_by`). `path`: one file's lines. A large compare sends counts first (`counts_only`). Asked of its machine.",
+            read_only: true,
+            destructive: false,
+            input: Input::of::<input::AgentsCompare>(),
+            route: |v| Ok((Method::GET, path(&["api", "harness", "agents", &agent_of(v)?, "compare"]))),
+            run: |cx, v| Box::pin(compare_points(cx, v)),
+        },
+        Op {
             name: "agents.land",
             summary: "Write an agent's workspace of its own back to the folder it's laid over. Without `manifest`: the plan (what it would create, replace and delete, and any file changed on disk since, which it won't overwrite), for a person to read. With the plan's `manifest`: written exactly as that plan says, or, if anything changed since, nothing written and the new plan back (`changed`) — only a person can write, never an agent. Build output and what git ignores stay out, and so does `.git`.",
             read_only: false,
@@ -873,6 +945,46 @@ pub mod input {
     pub struct AgentsWorkspace {
         /// The agent's id (as agents.list gives it).
         pub agent: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentsCommits {
+        /// The agent's id (as agents.list gives it).
+        pub agent: String,
+        /// Commits to see together, comma-separated (`now`: what isn't committed yet).
+        #[serde(default)]
+        pub picks: Option<String>,
+        /// The branch its commits are counted from (else its remote's default branch).
+        #[serde(default)]
+        pub trunk: Option<String>,
+        /// Another of its repository's branches to list (else the one checked out).
+        #[serde(default)]
+        pub branch: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentsRefs {
+        /// The agent's id (as agents.list gives it).
+        pub agent: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentsCompare {
+        /// The agent's id (as agents.list gives it).
+        pub agent: String,
+        /// Where from: `now`, `began`, `agent:<who>`, or a branch, tag or commit.
+        pub from: String,
+        /// Where to, as `from`.
+        pub to: String,
+        /// From where they split (git's three-dot): on unless `false`.
+        #[serde(default)]
+        pub split: Option<String>,
+        /// One file's lines alone.
+        #[serde(default)]
+        pub path: Option<String>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]

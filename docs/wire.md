@@ -154,8 +154,8 @@ An agent session's commands ride these streams too: `HarnessOpen`, `HarnessCmd`,
   ends it. Its sender sends it again under its id, wherever its session runs then; parked, it
   would go to the copy there with no epoch even after its session went on elsewhere (CP-T3.2,
   until CP-T3.3 parks it under its epoch).
-- **Asks**, which go as asks do, answered by what they ask for: `Suggest`, `Snapshot`, `McpAuth`
-  and `SkillView`.
+- **Asks**, which go as asks do, answered by what they ask for: `Suggest`, `Snapshot`, `McpAuth`,
+  `SkillView` and `OwnEdits`.
 - **Live**, refused at once while its runner is away: every other command (an interrupt, a model,
   effort or mode to change to, a move, a restart, the MCP servers' and skills' commands ...).
 
@@ -450,11 +450,14 @@ takes a new bit, never one that means something already, even in the other direc
 | 39 | `CAP_HEADROOM` | `AgentMsg::Caps`, `ServerMsg::Caps` | headroom: the runner keeps its machine's from settings the server sends and says how it does, the server takes that (`Headroom`, `HeadroomStatus`; docs/headroom.md) |
 | 40 | `CAP_CHANGES_PATCH` | `ServerMsg::Caps` | the server takes a session's changeset as what changed in it (`Update::ChangesPatch`), so a runner sends the files an agent touched, not the whole changeset |
 | 41 | `CAP_UNREAD` | `AgentMsg::Caps`, `ServerMsg::Caps` | this side takes word that a frame of its couldn't be read (`Unread`, "What can't be read") |
+| 42 | `CAP_WORKSPACE_COMMITS` | `AgentMsg::Caps` | the runner answers `Workspace`'s `commits`: a branch's commits since its trunk, its session's own marked, and what picked ones change together (agents.md, "Commits") |
+| 43 | `CAP_WORKSPACE_COMPARE` | `AgentMsg::Caps` | the runner answers `Workspace`'s `refs` and `compare`: a repository's branches, tags and latest commits, and what changes from one point to another (agents.md, "Compare") |
 | 53 | `CAP_FREEZE` | `AgentMsg::Caps` | the runner freezes a job it runs where it runs and lets it go on (`Freeze`: Pause and Resume, ci.md W26-R22); Unix and Windows runners say it |
 
-Bits 42 to 52 are kept for lines on their way: W27's agent git credential, leg signing and custody
-(`CAP_AGENT_GIT`, `CAP_LEG_SIGNS`, `CAP_CUSTODY`) and the unification's. Bits from 54 are free.
-Take the next one, and add its row here in the same change.
+Bits 44 to 52 are kept for lines on their way: W27's agent git credential, leg signing and custody
+(`CAP_AGENT_GIT`, `CAP_LEG_SIGNS`, `CAP_CUSTODY`) and the unification's, which held bits from 42 on
+their branches before the Changes tab took 42 and 43. Bits from 54 are free. Take the next one, and
+add its row here in the same change.
 
 ## The lab
 
@@ -687,6 +690,7 @@ travels in `HarnessCmd`.
 | `MaxSubagents` | command, refused while away | As `AutoResume`. | Fire-and-forget. |
 | `MoveOnLimit` | command, refused while away | As `AutoResume`. | Fire-and-forget. |
 | `LimitHold` | command, refused while away | The server works the hold out again once the machine is back. | Fire-and-forget. |
+| `OwnEdits` | ask | Answered by a `Reply` to its client: what one who changed its files did alone (docs/agents.md, "One subagent's own edits"). | New: a session whose features have `own_edits` answers it. |
 
 ## Updates of a session: `Update`
 
