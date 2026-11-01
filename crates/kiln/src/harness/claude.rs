@@ -833,7 +833,7 @@ impl Claude {
                 }
             }
             // A pause's commands are the session's (`harness::pause`), as is a person's of the whole of it.
-            Command::Resume | Command::AutoResume { .. } | Command::PauseAt { .. } | Command::MaxSubagents { .. } | Command::MoveOnLimit { .. } | Command::LimitHold { .. } | Command::Pause { task: None, .. } | Command::Perms { task: None, .. } => {}
+            Command::Resume | Command::AutoResume { .. } | Command::PauseAt { .. } | Command::MaxSubagents { .. } | Command::MoveOnLimit { .. } | Command::LimitHold { .. } | Command::Pause { task: None, .. } | Command::Perms { task: None, .. } | Command::Branch { .. } => {}
             Command::Pause { on, task: Some(task) } => self.pause_subagent(core, &task, on),
             Command::Perms { perms, task: Some(task) } => self.set_perms(core, &task, perms),
             Command::SetEffort { effort } => {

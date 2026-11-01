@@ -8,7 +8,7 @@ import * as React from "react";
 import "./harness.css";
 import "./mission.css";
 import { Link, useNavigate } from "@/lib/router";
-import { ArrowUpRight, ChevronDown, ChevronRight, ChevronUp, ListChecks, X } from "lucide-react";
+import { ArrowUpRight, ChevronDown, ChevronRight, ChevronUp, GitFork, ListChecks, X } from "lucide-react";
 import { api } from "@/api/client";
 import { clientId, harnessApi, type AgentInfo, type ApprovalBrief } from "@/api/harness";
 import { plansApi } from "@/api/plans";
@@ -313,10 +313,13 @@ function MissionNode({ r, owner, rowAsk }: { r: SubagentRow; owner: AgentInfo | 
   const open = () => navigate(r.href);
   const ask = r.stand === "needs" && r.ask && r.ask.id !== rowAsk ? r.ask : undefined;
   return (
-    <li className="ms-node" data-stand={r.stand}>
+    <li className="ms-node" data-stand={r.stand} data-depth={r.depth}>
       <TreePath path={r.path} stand={r.stand} className="ms-node-path" x0={coarse ? 12 : 17} dx={10} y={19} width={coarse ? 40 : 46} />
       <button type="button" className="ms-node-main" onClick={open}>
-        <span className="ms-node-name">{r.name}</span>
+        <span className="ms-node-name">
+          {r.variant && <GitFork size={12} className="tree-fork" role="img" aria-label="Variant" />}
+          {r.name}
+        </span>
         <span className="ms-node-line">
           <span className="ms-word">
             <i aria-hidden="true" />

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { AgentInfo } from "../src/api/harness.ts";
-import { briefsOf, stepLive, subagentRows, subagentTree, threadCrumbs, threadHref, topOf, treePaths, within, wider, type Brief } from "../src/views/harness/subagent-tree.ts";
+import { briefsOf, keepOf, stepLive, subagentRows, subagentTree, threadCrumbs, threadHref, topOf, treePaths, within, wider, type Brief } from "../src/views/harness/subagent-tree.ts";
 import type { Perms } from "../src/api/wire/Perms.ts";
 
 const agent = (id: string, rest: Partial<AgentInfo> = {}): AgentInfo => ({
@@ -266,4 +266,19 @@ test("what a subagent may do: never more than what it's under (model.rs Perms::n
     { read: "allow", edit: "off", run: "ask", web: "allow", folder: undefined, minutes: undefined, tokens: undefined },
     "under its session: that one's, as narrowed by its agent's",
   );
+});
+
+test("Keep on a variant tells its parent to use its result, naming what it varied, its id and how to read it", () => {
+  const lead = agent("kl", { subagents: [brief("kt", 1, { description: "Measure election time" })] });
+  const varied = kiln("kv", "kl", 2, { name: "Follower catch-up" });
+  const v = kiln("kv2", "kl", 3, { name: "Catch up in batches", variant_of: "kv" });
+  const ofTask = kiln("kv3", "kl", 4, { name: "Five nodes", variant_of: "kl/kt" });
+  const list = [lead, varied, v, ofTask];
+  assert.deepEqual(keepOf(v, list), {
+    to: "kl",
+    text: "Keep “Catch up in batches”, the variant of “Follower catch-up”: use its result in place of that one's. Read it whole with agents_result (kv2).",
+  });
+  assert.equal(keepOf(ofTask, list)?.text.includes("the variant of “Measure election time”"), true);
+  assert.equal(keepOf(varied, list), undefined, "not a variant");
+  assert.equal(keepOf({ ...v, parent: undefined }, list), undefined, "no parent to tell");
 });

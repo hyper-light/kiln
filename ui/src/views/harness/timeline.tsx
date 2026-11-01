@@ -76,6 +76,7 @@ import { useHeld, useRecent } from "./dom";
 import { unsending } from "./unsend";
 import { KindGlyph } from "./kind-glyph";
 import { parentWrote, type ThreadFrom } from "./subagent-tree";
+import { KeepButton } from "./subagent-branch";
 import { Highlighted } from "@/components/code/highlighted";
 
 /** Tool calls the agent is asking you about right now (the rest of the pending ones wait their turn). */
@@ -1948,6 +1949,7 @@ export const Timeline = React.memo(function Timeline({
                 <ArrowUpLeft size={13} />
                 {threadFrom.name}
               </Link>
+              {threadFrom.keep && <KeepButton keep={threadFrom.keep} />}
             </div>
           )}
           {/* A window further back: what came after joins as you scroll down to it. */}

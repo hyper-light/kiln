@@ -659,6 +659,33 @@ textarea.hx-input {
   white-space: nowrap;
   color: var(--color-bright);
 }
+/* A branch of a subagent: what changes, then a Variant or a New agent, under its crumbs. */
+.hx-branch {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-bottom: 1px solid #1d1f23;
+  background: #0d0c12;
+}
+.hx-branch input {
+  flex: 1;
+  min-width: 0;
+  height: 30px;
+  padding: 0 8px;
+  border: 0;
+  border-bottom: 1px solid #3a3d45;
+  background: transparent;
+  outline: 0;
+  font-size: 13px;
+  color: var(--color-bright);
+}
+.hx-branch input:focus {
+  border-bottom-color: #cdc6ea;
+}
+.hx-branch input::placeholder {
+  color: #5b5e66;
+}
 /* What a person lets a subagent do: under its crumbs, in the thread's flow, every choice at the
    panel's right edge. */
 .hx-perm {

@@ -2011,6 +2011,17 @@ pub enum Command {
         #[cfg_attr(test, ts(optional))]
         task: Option<String>,
     },
+    /// A person branches it, or one of its harness's own subagents (`task`): a new session on its
+    /// machine from the conversation so far and their `words`, a Variant beside it (under the same
+    /// agent) or a New agent of its own (`top`) (`goback::branch_spec`).
+    Branch {
+        words: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        top: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
+        task: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

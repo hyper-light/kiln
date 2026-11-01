@@ -143,6 +143,11 @@ helper?: string,
  */
 subagent?: boolean, 
 /**
+ * What a person branched it from (as `Spec::variant_of`): once it's done, Keep hands its result
+ * to its parent.
+ */
+variant_of?: string, 
+/**
  * It was started without its harness's skip-every-check mode (`Spec::allow_bypass` off), so
  * an agent it starts can't have it either.
  */

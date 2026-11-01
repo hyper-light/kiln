@@ -66,6 +66,8 @@ export interface SubagentNode {
   perms?: Perms;
   /** What what it's under lets it do (its parent's, as narrowed): none, no limits. */
   over?: Perms;
+  /** A person branched it from another (`variant_of`). */
+  variant?: boolean;
 }
 
 const RANK: Record<Grant, number> = { off: 0, ask: 1, allow: 2 };
@@ -284,6 +286,7 @@ export function subagentTree(root: AgentInfo, list: readonly AgentInfo[]): Subag
             pausable: a.status !== "exited" && !above,
             perms: a.perms,
             over,
+            variant: a.variant_of != null,
           });
           walk(a, a.id, depth + 1, above || own, within(a.perms, over));
         },
@@ -340,6 +343,21 @@ export interface ThreadFrom {
   session?: string;
   /** Done, failed or stopped: its word, and when. */
   end?: { stand: NodeStand; word: string; at?: number };
+  /** A finished variant: Keep sends its parent (`to`) these words. */
+  keep?: { to: string; text: string };
+}
+
+/**
+ * What Keep on a finished variant (`variant_of`) sends its parent: to use its result in place of
+ * the one it varied, and how to read it whole. None: it isn't a variant, or has no parent.
+ */
+export function keepOf(v: AgentInfo, list: readonly AgentInfo[]): { to: string; text: string } | undefined {
+  if (!v.variant_of || !v.parent) return undefined;
+  const [session, task] = v.variant_of.split("/");
+  const owner = list.find((a) => a.id === session);
+  const of = task ? owner?.subagents?.find((b) => b.id === task)?.description : owner && agentLabel(owner);
+  const name = agentLabel(v);
+  return { to: v.parent, text: `Keep “${name}”, the variant of “${of ?? v.variant_of}”: use its result in place of that one's. Read it whole with agents_result (${v.id}).` };
 }
 
 /** Its thread's `ThreadFrom`, from its path (`crumbs`, it last) and its node in the tree (`here`). */

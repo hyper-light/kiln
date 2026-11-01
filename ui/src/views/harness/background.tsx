@@ -5,7 +5,7 @@
  */
 import * as React from "react";
 import { Fold } from "./fold";
-import { ChevronRight, Square } from "lucide-react";
+import { ChevronRight, GitFork, Square } from "lucide-react";
 import { harnessApi, useSession, type AgentInfo, type Approval, type Command, type SessionStore, type State, type Task } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { Confirm } from "@/components/ui/misc";
@@ -511,7 +511,10 @@ function DockNode({
         </span>
         <TreePath path={r.path} stand={r.stand} className="dn-path" x0={9} dx={10} y={17} width={40} />
         <button type="button" className="dn-main" onClick={open}>
-          <span className="dn-name">{r.name}</span>
+          <span className="dn-name">
+            {r.variant && <GitFork size={12} className="tree-fork" role="img" aria-label="Variant" />}
+            {r.name}
+          </span>
           <span className="dn-line">
             <span className="dn-word">
               <i aria-hidden="true" />

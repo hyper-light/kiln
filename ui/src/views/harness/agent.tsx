@@ -39,6 +39,7 @@ import { ActivityLine } from "./background";
 import { ThreadFromContext, Timeline, type ReplyTarget } from "./timeline";
 import { PauseButton } from "./subagent-pause";
 import { PermsPanel } from "./subagent-perms";
+import { BranchPanel } from "./subagent-branch";
 import { BesideTerminals, openBeside as openTerminal } from "./beside";
 import { useDrafts } from "./state";
 import { PlanSourceContext } from "@/views/plans/save";
@@ -47,7 +48,7 @@ import { revealReview } from "@/views/plans/reveal";
 import { useEndWithChildren } from "./family";
 import { LoadingMark, PrismLabel } from "./signals";
 import { asAnswered, markAnswered, stillAsked, unmark, useAnswered } from "./answered";
-import { liveRoot, subagentRows, subagentTree, takesMessage, threadCrumbs, threadFrom, topOf, type Crumb, type SubagentNode, type ThreadFrom } from "./subagent-tree";
+import { keepOf, liveRoot, subagentRows, subagentTree, takesMessage, threadCrumbs, threadFrom, topOf, type Crumb, type SubagentNode, type ThreadFrom } from "./subagent-tree";
 import { AboutContext } from "@/components/code/about";
 
 type PhoneTab = "work" | InspectorTab;
@@ -214,7 +215,8 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
   const panel = panelFor?.thread === threadKey ? panelFor.panel : null;
   const limits = useSession(sessionStore(path?.here?.session ?? id), (s) => (s.meta?.features ?? []).includes("limits"));
   // Who started the thread shown, for its timeline: a key, so its turns only render again when that changes.
-  const fromKey = JSON.stringify(path ? threadFrom(path.crumbs, path.here, { via: sub ? null : taskInfo?.via, session: sub ? id : undefined }) : null);
+  const keep = sub && path?.here?.stand === "done" ? keepOf(sub, everyone) : undefined;
+  const fromKey = JSON.stringify(path ? { ...threadFrom(path.crumbs, path.here, { via: sub ? null : taskInfo?.via, session: sub ? id : undefined }), keep } : null);
   const from = React.useMemo(() => JSON.parse(fromKey) as ThreadFrom | null, [fromKey]);
 
   // The matches, in the thread shown; a new search starts at the newest, and the one shown stays
@@ -319,6 +321,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
       {findOpen && dropped > 0 && <EarlierMatches agent={subId ?? id} q={findQ} before={findEvents[0]?.at} />}
       {path && <ThreadCrumbs crumbs={path.crumbs} here={path.here} sub={sub} panel={panel} onPanel={(p) => setPanelFor(p && { panel: p, thread: threadKey })} onClose={mainThread} />}
       {path?.here && panel === "perms" && <PermsPanel key={path.here.key} n={path.here} can={limits && takesMessage(path.here)} />}
+      {path?.here && panel === "branch" && <BranchPanel key={path.here.key} n={path.here} can={path.here.stand !== "offline"} onDone={() => setPanelFor(null)} />}
       <ThreadFromContext.Provider value={from}>
         {sub ? (
           <React.Suspense fallback={<LoadingMark />}>
@@ -553,8 +556,8 @@ function useThreadPath(
   }, [open, everyone, id, info, sub, task, name, tasks, asks, done]);
 }
 
-/** What opens under a subagent's crumbs: what it may do. */
-type ThreadPanel = "perms";
+/** What opens under a subagent's crumbs: what it may do, or a branch of it. */
+type ThreadPanel = "perms" | "branch";
 
 /**
  * Over a subagent's thread: its whole path, earlier names giving way first, each earlier one where
@@ -599,7 +602,7 @@ function ThreadCrumbs({
         ))}
       </nav>
       <PauseButton n={node} className="hx-icon" />
-      <button type="button" className="hx-icon" aria-label="Branch" disabled>
+      <button type="button" className="hx-icon" aria-label="Branch" aria-expanded={panel === "branch"} disabled={!here} onClick={() => onPanel(panel === "branch" ? null : "branch")}>
         <GitFork size={14} />
       </button>
       <button type="button" className="hx-icon" aria-label="Permissions" aria-expanded={panel === "perms"} disabled={!here} onClick={() => onPanel(panel === "perms" ? null : "perms")}>

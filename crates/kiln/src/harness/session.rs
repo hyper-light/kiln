@@ -103,6 +103,10 @@ pub struct Spec {
     /// folder (`crate::workspace`), made on its machine before it starts and kept with it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<crate::workspace::Workspace>,
+    /// What a person branched it from (`Command::Branch`): a session's id, or `<session>/<task>`
+    /// for one of that session's harness's own subagents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant_of: Option<String>,
 }
 
 fn yes() -> bool {
@@ -140,6 +144,7 @@ impl Default for Spec {
             helper: None,
             subagent: false,
             workspace: None,
+            variant_of: None,
         }
     }
 }
@@ -438,6 +443,11 @@ pub struct Info {
     /// parent's row, not as an agent of its own.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub subagent: bool,
+    /// What a person branched it from (as `Spec::variant_of`): once it's done, Keep hands its result
+    /// to its parent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub variant_of: Option<String>,
     /// It was started without its harness's skip-every-check mode (`Spec::allow_bypass` off), so
     /// an agent it starts can't have it either.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -1156,6 +1166,7 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         plan_run: spec.plan_run.clone(),
         helper: spec.helper.clone(),
         subagent: spec.subagent,
+        variant_of: spec.variant_of.clone(),
         no_bypass: !spec.allow_bypass,
         workspace: spec.workspace.clone(),
     };
@@ -2264,6 +2275,29 @@ fn pause_session(s: &Session, on: bool) {
     }
 }
 
+/// A person's branch of it, or of one of its harness's own subagents (`Command::Branch`): a new
+/// session on this machine (`goback::branch_spec`), or why not, said in its conversation.
+fn branch(s: &Session, files: &Files, words: &str, top: bool, task: Option<&str>) {
+    let own = s.resume_spec();
+    let core = s.core.lock();
+    let can_fork = core.meta.features.iter().any(|f| f == "resume");
+    let task = match task {
+        None => None,
+        Some(t) => match core.state.tasks.iter().find(|x| x.subagent() && (x.id == t || x.tool_id.as_deref() == Some(t))) {
+            Some(x) => Some((x.id.clone(), super::goback::thread_words(&core, x.tool_id.as_deref().unwrap_or(""), x.prompt.as_deref()))),
+            None => {
+                drop(core);
+                s.core.lock().upsert(&format!("branch-refused-{}", Core::now()), None, super::model::Body::Notice { level: Level::Warn, text: "Not branched: it has no such subagent.".to_owned() });
+                return;
+            }
+        },
+    };
+    let conversation = if task.is_none() && !(can_fork && own.resume.is_some()) { super::goback::branch_prompt(&core, None) } else { String::new() };
+    drop(core);
+    let from = super::goback::BranchFrom { id: &s.id, own, can_fork, conversation, task: task.as_ref().map(|(t, w)| (t.as_str(), w.clone())) };
+    (files.spawn)(super::goback::branch_spec(from, words, top));
+}
+
 /// How a move is getting on before it starts (its repository being copied there).
 fn moving_note(s: &Session, text: &str) {
     s.core.lock().upsert("move-pending", None, super::model::Body::Notice { level: Level::Info, text: text.to_owned() });
@@ -3370,6 +3404,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                 pause_session(&s, on);
                                 on_change();
                             }
+                            // A person's branch: a new session beside it, or of its own.
+                            Command::Branch { words, top, task } => {
+                                branch(&s, &files, &words, top, task.as_deref());
+                                on_change();
+                            }
                             // What a person lets the whole of it do (the server narrowed it to its parent's).
                             Command::Perms { perms, task: None } => {
                                 let mut core = s.core.lock();
@@ -3866,6 +3905,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     // Paused while it isn't running: its processes are held as soon as it has any.
                     Command::Pause { on, task: None } => {
                         pause_session(&s, on);
+                        on_change();
+                    }
+                    // Branched while it isn't running: from its conversation as it was.
+                    Command::Branch { words, top, task } => {
+                        branch(&s, &files, &words, top, task.as_deref());
                         on_change();
                     }
                     // Its perms, set while it isn't running: they hold from its next start.
@@ -4730,6 +4774,7 @@ mod tests {
             reach: None,
             pause: None,
             frozen: None,
+            variant_of: None,
             perms: None,
             room_wait: None,
             last_turn: None,

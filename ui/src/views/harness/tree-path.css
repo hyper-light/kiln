@@ -54,3 +54,11 @@
 .tp[data-stand="stopped"] .tp-mark {
   stroke: #d1aaad;
 }
+
+/* A variant a person branched from another: the fork before its name. */
+.tree-fork {
+  display: inline-block;
+  margin-right: 5px;
+  vertical-align: -1px;
+  color: #b8a6d5;
+}

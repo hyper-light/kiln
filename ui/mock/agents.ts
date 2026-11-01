@@ -971,6 +971,44 @@ function pauseMember(m: Member, on: boolean, task?: string) {
   }
 }
 
+/** The variants made here (`branchMember`, `treeVariant`): taken back by `POST /api/mock/variants`. */
+const madeVariants: string[] = [];
+
+/** A variant joins the list, or leaves it. */
+function variantIn(v: Member) {
+  family.set(v.info.id, v);
+  madeVariants.push(v.info.id);
+  tell(v);
+}
+
+/**
+ * A person's branch (`Command::Branch`), as kiln makes it: a session beside it under the same
+ * agent (or, of one of its harness's own, a subagent of it), or of its own (`top`), named by their
+ * words and saying what it was branched from.
+ */
+function branchMember(m: Member, words: string, top: boolean, task?: string) {
+  const id = `${m.info.id}-v${madeVariants.length + 1}`;
+  const v = member(id, m.info.kind === "codex" ? "codex" : "claude", m.info.target, words, "running", m.info.mode, words, "Starting from where it was.", {
+    parent: top ? undefined : task ? m.info.id : m.info.parent,
+    subagent: top ? false : task ? true : m.info.subagent,
+    variant_of: task ? `${m.info.id}/${task}` : m.info.id,
+    doing: "Starting from where it was",
+  });
+  v.info.created_at = Date.now();
+  variantIn(v);
+}
+
+/** A finished variant of Follower catch-up (`POST /api/mock/tree-variant`), for Keep's tests only. */
+function treeVariant() {
+  const v = member("tree-s2v", "codex", "agent:metal-epyc-01", "Catch up in 64-entry batches", "idle", "untrusted", "Catch up in 64-entry batches.", "Caught up in 3.1 s, batching 64 entries at a time.", {
+    parent: "tree-lead",
+    subagent: true,
+    variant_of: "tree-s2",
+  });
+  v.info.created_at = (family.get("tree-s2")?.info.created_at ?? Date.now()) + 1;
+  variantIn(v);
+}
+
 /** What a person lets one of them do (`Command::Perms`), or one of its harness's own (`task`), as kiln keeps it. */
 function permsMember(m: Member, perms: Perms | undefined, task?: string) {
   if (task) {
@@ -1686,14 +1724,29 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
     json(res, 200, {});
     return true;
   }
+  if (p === "/api/mock/tree-variant" && m === "POST") {
+    treeVariant();
+    json(res, 200, {});
+    return true;
+  }
+  // The variants made here taken back, for the next tests.
+  if (p === "/api/mock/variants" && m === "POST") {
+    for (const id of madeVariants.splice(0)) {
+      family.delete(id);
+      emitEvent({ type: "harness_closed", id });
+    }
+    json(res, 200, {});
+    return true;
+  }
   // A command without its socket (a request answered from Mission control's row or a card): taken as its harness would.
   const cm = p.match(/^\/api\/harness\/sessions\/([^/]+)\/command$/);
   const told = cm ? family.get(decodeURIComponent(cm[1] ?? "")) : undefined;
   if (cm && told && m === "POST") {
-    const c = await body<{ type?: string; id?: string; decision?: string; text?: string; task?: string; mode?: string; on?: boolean; perms?: Perms }>(req);
+    const c = await body<{ type?: string; id?: string; decision?: string; text?: string; task?: string; mode?: string; on?: boolean; perms?: Perms; words?: string; top?: boolean }>(req);
     takeAnswer(told, c);
     if (c.type === "pause") pauseMember(told, c.on === true, c.task);
     if (c.type === "perms") permsMember(told, c.perms, c.task);
+    if (c.type === "branch" && c.words) branchMember(told, c.words, c.top === true, c.task);
     // A message sent without its socket (to one of a lead's subagents, from its page): to a subagent of its harness's own, or to it.
     if (c.type === "send" && c.text) {
       if (c.task) tellSubagent(told, c.task, c.id ?? `sub-${Date.now()}`, c.text, c.mode ?? "queue");

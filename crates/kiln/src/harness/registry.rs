@@ -1996,6 +1996,7 @@ impl Registry {
                         plan_run: spec.plan_run.clone(),
                         helper: spec.helper.clone(),
                         subagent: spec.subagent,
+                        variant_of: spec.variant_of.clone(),
                         no_bypass: !spec.allow_bypass,
                         workspace: spec.workspace.clone(),
                     };
