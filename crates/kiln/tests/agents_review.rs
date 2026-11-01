@@ -183,3 +183,60 @@ fn w26_r18_agents_words_are_signed_as_the_agent() -> anyhow::Result<()> {
     assert!(matches!(&signer.actor, kiln_ci::identity::chain::Actor::Agent { agent, person, .. } if *agent == id && person == "admin"), "its verdict, as the agent for its person: {v}");
     Ok(())
 }
+
+/// W26-R18's switch, per repository: agents fix code from agents' feedback only where a person
+/// with the land queue's capability (`diffs.land`) turned it on. Off by default, and saying so;
+/// a developer reads it and is refused changing it; a maintainer turns it on and off, each kept
+/// with who and when, and audited; another repository stays off.
+#[test]
+fn w26_r18_agents_fix_from_agents_feedback_only_where_turned_on() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options::default())?;
+    for name in ["acme/fixes", "acme/other"] {
+        let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&serde_json::json!({"name": name, "mode": "native"})))?;
+        anyhow::ensure!(st == 200, "{name}: {st} {body}");
+    }
+    let mint = |name: &str, grant: &str| -> anyhow::Result<String> {
+        let (st, body) = http(s.port, "POST", "/api/users", &s.admin, Some(&serde_json::json!({ "name": name, "grants": [grant] })))?;
+        anyhow::ensure!((200..300).contains(&st), "{name}: {st} {body}");
+        let (st, body) = http(s.port, "POST", "/api/tokens", &s.admin, Some(&serde_json::json!({ "kind": "pat", "user": name, "grants": [grant] })))?;
+        anyhow::ensure!((200..300).contains(&st), "{name}'s token: {st} {body}");
+        serde_json::from_str::<Value>(&body)?.get("token").and_then(Value::as_str).map(str::to_owned).ok_or_else(|| anyhow::anyhow!("no token in {body}"))
+    };
+    let (dev, lead) = (mint("dev", "developer")?, mint("lead", "maintainer")?);
+    let switch = |token: &str, repo: &str, body: Option<Value>| -> anyhow::Result<(u16, Value)> {
+        let path = format!("/api/repos/{repo}/agent-fixes");
+        let (st, text) = http(s.port, if body.is_some() { "PUT" } else { "GET" }, &path, token, body.as_ref())?;
+        Ok((st, serde_json::from_str(&text).unwrap_or(Value::String(text))))
+    };
+    let on = |v: &Value| v.get("agents_fix").and_then(Value::as_bool);
+    let may = |v: &Value| v.get("may_change").and_then(Value::as_bool);
+
+    let (st, v) = switch(&dev, "acme/fixes", None)?;
+    anyhow::ensure!(st == 200 && on(&v) == Some(false) && may(&v) == Some(false) && v.get("set_by").is_some_and(Value::is_null), "off by default, and a developer can't change it: {st} {v}");
+    anyhow::ensure!(field(&v, "says").contains("goes to that change's agent"), "it says what it does: {v}");
+    let (st, v) = switch(&dev, "acme/fixes", Some(serde_json::json!({ "agents_fix": true })))?;
+    anyhow::ensure!(st == 403 && v.to_string().contains("diffs.land"), "a developer is refused: {st} {v}");
+
+    let (st, v) = switch(&lead, "acme/fixes", Some(serde_json::json!({ "agents_fix": "yes" })))?;
+    anyhow::ensure!(st == 400, "true or false: {st} {v}");
+    let (st, v) = switch(&lead, "acme/fixes", Some(serde_json::json!({ "agents_fix": true })))?;
+    anyhow::ensure!(st == 200 && on(&v) == Some(true) && may(&v) == Some(true), "a maintainer turns it on: {st} {v}");
+    anyhow::ensure!(field(&v, "set_by").contains("lead") && v.get("set_at").and_then(Value::as_i64).is_some_and(|t| t > 0), "who and when: {v}");
+    let (st, v) = switch(&dev, "acme/fixes", None)?;
+    anyhow::ensure!(st == 200 && on(&v) == Some(true) && field(&v, "set_by").contains("lead"), "the developer reads it on: {st} {v}");
+    let (st, v) = switch(&dev, "acme/other", None)?;
+    anyhow::ensure!(st == 200 && on(&v) == Some(false), "another repository stays off: {st} {v}");
+    let (st, v) = switch(&lead, "acme/fixes", Some(serde_json::json!({ "agents_fix": false })))?;
+    anyhow::ensure!(st == 200 && on(&v) == Some(false) && field(&v, "set_by").contains("lead"), "and off again, by whom: {st} {v}");
+    let (st, v) = switch(&s.admin, "acme/none", None)?;
+    anyhow::ensure!(st == 404, "no such repository: {st} {v}");
+
+    // Each change is a note on its request's audit row (`audit::note`).
+    let (st, audit) = http(s.port, "GET", "/api/audit?limit=200", &s.admin, None)?;
+    anyhow::ensure!(st == 200, "{st} {audit}");
+    for want in ["repo.agent_fixes: acme/fixes: agents fix from agents' feedback on", "repo.agent_fixes: acme/fixes: agents fix from agents' feedback off"] {
+        anyhow::ensure!(audit.contains(want), "{want} in the audit: {audit}");
+    }
+    Ok(())
+}

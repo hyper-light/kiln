@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::identity::chain::{Actor, Holder, Identity};
 
+pub mod agents;
+
 /// A diff's state (review.md): `draft` and `needs-review` to `landed`, or `abandoned`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

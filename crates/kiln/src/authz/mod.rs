@@ -409,6 +409,9 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/repos/*/lands/*", "diffs.read", At::Repo(2)),
     // A host's changes into its host's own queue (docs/ci.md W28-R109): landing them.
     r("POST", "/api/repos/*/queue", "diffs.land", At::Repo(2)),
+    // Whether agents fix code from agents' feedback (docs/ci.md W26-R18): the land queue's capability changes it.
+    r("GET", "/api/repos/*/agent-fixes", "diffs.read", At::Repo(2)),
+    r("PUT", "/api/repos/*/agent-fixes", "diffs.land", At::Repo(2)),
     r("DELETE", "/api/queue/*", "queue.manage", At::Entry(2)),
     // Review holds, lets go of or withdraws a land queue entry (docs/ci.md W28-R104).
     r("POST", "/api/queue/*/hold", "diffs.review", At::Entry(2)),

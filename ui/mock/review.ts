@@ -1035,6 +1035,11 @@ function textOf(patch: string, path: string): string | null {
 /** A small PNG (32×32, a check of kiln's grey and green), for the image diff. */
 const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAO0lEQVR42mPQ1rPEilac3IMVkaqeYdSCUQuGgAXUMgiX+lELRi0YChaMFhWjFoxaMFofjFowaoG2niUAm6N+TBJRp68AAAAASUVORK5CYII=", "base64");
 
+/** Each repository's agent fixes switch (W26-R18), as `ci/agent_fixes.rs` keeps it: off until set. */
+const agentFixes = new Map<string, { agents_fix: boolean; set_by: string; set_at: number }>();
+const AGENT_FIXES_SAYS =
+  "On: an agent's comment on an agent's change goes to that change's agent, which pushes a fix and answers in the thread. Expect more versions and CI runs. Off: agents' comments wait for a person, who can Hand off.";
+
 export async function handleReview(req: http.IncomingMessage, res: http.ServerResponse, url: URL, ctx: Ctx): Promise<boolean> {
   const p = url.pathname;
   const m = req.method ?? "GET";
@@ -1048,6 +1053,16 @@ export async function handleReview(req: http.IncomingMessage, res: http.ServerRe
     return (ctx.json(res, 200, { id: b, trunk: "main", repo: REPO, diffs: list }), true);
   }
   if (a === "repos" && c === "queue" && m === "GET") return (ctx.json(res, 200, { entries: decodeURIComponent(b ?? "") === REPO ? queue : [] }), true);
+  if (a === "repos" && c === "agent-fixes" && (m === "GET" || m === "PUT")) {
+    const repo = decodeURIComponent(b ?? "");
+    if (m === "PUT") {
+      const body = await ctx.body<{ agents_fix?: unknown }>(req);
+      if (typeof body.agents_fix !== "boolean") return (ctx.err(res, 400, "`agents_fix`: true or false"), true);
+      agentFixes.set(repo, { agents_fix: body.agents_fix, set_by: "admin", set_at: Math.floor(Date.now() / 1000) });
+    }
+    const set = agentFixes.get(repo);
+    return (ctx.json(res, 200, { repo, agents_fix: set?.agents_fix ?? false, set_by: set?.set_by ?? null, set_at: set?.set_at ?? null, says: AGENT_FIXES_SAYS, may_change: true }), true);
+  }
   if (a === "queue" && b && m === "DELETE") {
     const q = queue.find((x) => x.id === b);
     if (q) q.state = "cancelled";

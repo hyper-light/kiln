@@ -36,6 +36,7 @@ import { SyncActivity } from "./sync-activity";
 import { ScopeSecrets } from "../settings-ci";
 import { RepoKeep } from "../keep/repo";
 import { Providers } from "./providers";
+import { RepoReview } from "./review";
 import "./repos.css";
 
 /** Folders kept the same on several machines; read often, they move by the second. */
@@ -619,6 +620,12 @@ function Details({
         // What runs its CI (W23-R07), when its host makes a choice possible.
         <Loadable label="what runs its CI" fallback={<></>}>
           <Providers repo={r.name} />
+        </Loadable>
+      )}
+      {r && (
+        // Whether agents fix code from agents' feedback (W26-R18): off until someone who lands turns it on.
+        <Loadable label="its review" fallback={<Hold height={112} />}>
+          <RepoReview repo={r.name} />
         </Loadable>
       )}
       {!e.key.startsWith("here:") && (

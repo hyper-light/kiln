@@ -1814,6 +1814,9 @@ pub async fn route(hub: &Arc<Hub>, method: &Method, segs: &[&str], q: &HashMap<S
         (&Method::POST, ["comments", id, "apply"]) => ok(super::review::apply_suggestion(hub, id, caller, body).await?),
         (&Method::GET, ["repos", repo, "queue"]) => ok(super::land::list(hub, repo).await?),
         (&Method::GET, ["repos", repo, "lands", commit]) => ok(super::lands::get(hub, repo, commit).await?),
+        // W26-R18: whether agents fix code from agents' feedback, on the repository's page in Repos.
+        (&Method::GET, ["repos", repo, "agent-fixes"]) => ok(super::agent_fixes::route(hub, repo, caller, None).await?),
+        (&Method::PUT, ["repos", repo, "agent-fixes"]) => ok(super::agent_fixes::route(hub, repo, caller, Some(body)).await?),
         // W28-R109: a host's changes into its host's own queue, each at the head Review cleared.
         (&Method::POST, ["repos", repo, "queue"]) => ok(super::land::enqueue_route(hub, repo, body, &caller.name).await?),
         (&Method::GET, ["stacks", id]) => ok(stack(hub, id).await?),
