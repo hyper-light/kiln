@@ -30,7 +30,7 @@ import { inScope, useScope, type Sub } from "./changes";
 import { useListener } from "./dom";
 import { FindBar, findIn, type FindNow } from "./find";
 import { EarlierMatches } from "./said";
-import { AgentHeader, useTurnState, type BorderState } from "./head";
+import { AgentHeader } from "./head";
 import { Inspector, type InspectorTab } from "./inspector";
 import { DesktopLayout, INSPECTOR_COLLAPSED } from "./desktop";
 import { AskedLine } from "./asked";
@@ -111,8 +111,6 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
   const kiln = React.useMemo(() => kilnSubagentsOf(everyone, id), [everyone, id]);
   // Every agent it started through kiln (its goals' and plan steps' too): the Changes tab's By lists them.
   const started = React.useMemo(() => everyone.filter((a) => a.parent === id).map((a): Sub => ({ id: a.id, label: a.name, kind: a.target.replace(/^agent:/, "") })), [everyone, id]);
-  // The head's pause button's state: the composer's border wears it, whichever thread it writes to.
-  const turn = useTurnState(store, kiln);
   // One of those, its thread shown here: a session of its own.
   const sub = taskId ? (kiln.find((a) => a.id === taskId) ?? null) : null;
   // Mission Control links by the stable task id; the timeline groups its events by spawn call.
@@ -328,7 +326,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
       )}
       {sub ? (
         <React.Suspense fallback={<LoadingMark />}>
-          <KilnThread key={sub.id} id={sub.id} onTerminal={openBeside} find={find} turn={turn} />
+          <KilnThread key={sub.id} id={sub.id} onTerminal={openBeside} find={find} />
         </React.Suspense>
       ) : (
         <>
@@ -362,7 +360,6 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
             toMain={task !== null}
             task={task}
             kiln={kiln}
-            turn={turn}
             onView={openView}
             onTerminal={openBeside}
             onOpenTask={openTask}
@@ -540,18 +537,7 @@ function Head({ store, cwd, send, onUsage, onSettings, onFind }: { store: Sessio
  * thread where the conversation is, what it asks you answered there, and the composer writing to
  * it. What's only on its page of its own (its settings, its own subagents' threads) opens there.
  */
-function KilnThread({
-  id,
-  onTerminal,
-  find,
-  turn,
-}: {
-  id: string;
-  onTerminal: (o: { what: "shell" | "screen"; command?: string }) => void;
-  find?: { q: string; now: FindNow | null };
-  /** The agent's pause button's state, on the composer's border. */
-  turn: BorderState;
-}) {
+function KilnThread({ id, onTerminal, find }: { id: string; onTerminal: (o: { what: "shell" | "screen"; command?: string }) => void; find?: { q: string; now: FindNow | null } }) {
   const store = sessionStore(id);
   useSessionReady(store);
   const navigate = useNavigate();
@@ -593,7 +579,6 @@ function KilnThread({
         attachments={attachments}
         toMain={false}
         task={null}
-        turn={turn}
         onView={() => ownPage()}
         onTerminal={onTerminal}
         onOpenTask={ownPage}
@@ -614,7 +599,6 @@ function Dock({
   toMain,
   task,
   kiln,
-  turn,
   onView,
   onTerminal,
   onOpenTask,
@@ -631,8 +615,6 @@ function Dock({
   task: string | null;
   /** The subagents kiln started for its goals or plan steps, beside its harness's own. */
   kiln?: readonly AgentInfo[];
-  /** The agent's pause button's state, on the composer's border. */
-  turn: BorderState;
   onView: (view: string) => void;
   onTerminal: (o: { what: "shell" | "screen"; command?: string }) => void;
   onOpenTask: (toolId: string) => void;
@@ -687,7 +669,7 @@ function Dock({
       ) : null}
       <PausedLine store={store} send={send} onLogin={() => onView("login")} />
       <AskedLine store={store} />
-      <Composer store={store} agent={id} attachments={attachments} toMain={toMain} task={task} turn={turn} onView={onView} onTerminal={onTerminal} replyTo={reply} onClearReply={onClearReply} />
+      <Composer store={store} agent={id} attachments={attachments} toMain={toMain} task={task} onView={onView} onTerminal={onTerminal} replyTo={reply} onClearReply={onClearReply} />
     </div>
   );
 }
