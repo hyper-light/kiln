@@ -8753,8 +8753,11 @@ resolution makes, a comment, a resolution, an approval and each mark of the Revi
     change opened with `draft` is a draft on kiln, GitHub (REST's flag), GitLab (its title) and
     Bitbucket (its flag), and a new version leaves it one. `ready` marks it ready for review; with
     no edit since the last version, nothing is pushed. The agent's change says whether it's a
-    draft (`draft`, read again from kiln's state or the host's mirrored pull request). Ship's Ready
-    (`POST /api/ship/ready`) marks an agent's draft ready for its person, or for one who can land.
+    draft (`draft`, read again from kiln's state or the host's mirrored pull request).
+  - **Who may mark an agent's draft ready.** The agent's person may mark their agent's draft ready
+    for review, from Ship (Ready on its row, `POST /api/ship/ready`); so may anyone who can land on
+    the repository (`diffs.land`). Anyone else is refused, saying why. kiln's own `ci.diffs.ready`
+    stays the author's, or an owner's.
 - *Tests.*
   - kiln-ci: `review.rs` (`w26_r11_*`, `w26_r12_a_resolved_conflict_waits_on_its_commit`),
     `suggest.rs` (`w26_r10_*`), `conflicts.rs` (`w26_r12_*`). The Search suite on its simulator
