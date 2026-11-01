@@ -621,6 +621,19 @@ impl SimForge {
         Ok(sha)
     }
 
+    /// A commit made elsewhere, `sha` on `parents`, with `branch` moved to it (made if new): a test's
+    /// real commits, so what kiln builds in its mirror lines up with what the host has.
+    pub fn adopt(&self, repo: &str, branch: &str, sha: &str, parents: &[&str]) -> Result<(), Refusal> {
+        let mut e = self.inner.lock();
+        let r = e.repo(repo)?;
+        r.commits.insert(sha.to_owned(), Commit { parents: parents.iter().map(|p| (*p).to_owned()).collect() });
+        r.branches.insert(branch.to_owned(), sha.to_owned());
+        let touched: Vec<u64> = r.changes.values().filter(|c| c.head_ref == branch && c.state == State::Open).map(|c| c.number).collect();
+        r.bump_all(&touched);
+        r.version = r.version.saturating_add(1);
+        Ok(())
+    }
+
     /// `branch`'s head.
     pub fn tip(&self, repo: &str, branch: &str) -> Option<String> {
         self.inner.lock().repos.get(repo).and_then(|r| r.branches.get(branch).cloned())

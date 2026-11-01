@@ -194,6 +194,10 @@ pub fn landed(commit: &str, land: &Land) -> Result<String, String> {
         (false, false) => format!("in a batch of {} under the candidate tested, {}", land.batch.len(), short(&land.candidate)),
         (_, true) => format!("in a batch of {} applied again onto {} after the candidate tested, {}", land.batch.len(), short(&land.from), short(&land.candidate)),
     };
+    // Merged by its host after kiln's queue tested it (W26-R19): the candidate tested, the host's commit.
+    if land.via == crate::land::queue::HOST_MERGES {
+        return Ok(format!("landed on {}: kiln's queue tested candidate {}, and its host merged it ({} checks passed)", land.trunk, short(&land.candidate), land.checks.len()));
+    }
     // A host's own queue tested and landed it (W26-R19): kiln's server says what it saw.
     if !land.via.is_empty() {
         return Ok(format!("landed on {} by its host's {}, as kiln saw it land ({} checks passed)", land.trunk, land.via, land.checks.len()));
@@ -524,6 +528,8 @@ mod tests {
         assert_eq!(landed(&commit, &land), Ok("landed on main by its queue, the candidate tested (1 checks passed)".into()));
         let seen = Land { via: "merge queue".into(), ..land.clone() };
         assert_eq!(landed(&commit, &seen), Ok("landed on main by its host's merge queue, as kiln saw it land (1 checks passed)".into()), "W26-R19");
+        let merged = Land { via: crate::land::queue::HOST_MERGES.into(), ..land.clone() };
+        assert_eq!(landed(&commit, &merged), Ok("landed on main: kiln's queue tested candidate ccccccc, and its host merged it (1 checks passed)".into()), "W26-R19");
         assert_eq!(landed(&"d".repeat(40), &land), Err("the queue moved main to ccccccc, which doesn't carry ddddddd".into()), "a commit that wasn't tested");
         let again = Land { from: "e".repeat(40), to: "f".repeat(40), rebased: true, batch: vec![Landed { diff: "D1".into(), version: 2, commit: "f".repeat(40), verdicts: vec![] }], ..land.clone() };
         assert_eq!(landed(&"f".repeat(40), &again), Ok("landed on main by its queue, in a batch of 1 applied again onto eeeeeee after the candidate tested, ccccccc (1 checks passed)".into()), "applied again, it says so");

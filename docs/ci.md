@@ -8750,16 +8750,34 @@ resolution makes, a comment, a resolution, an approval and each mark of the Revi
     kiln's mirror has the commit, else none. It's kept in `land_signatures` and the trail, read back
     by `GET /api/repos/:repo/lands/:commit`, and `kiln verify` reads it as "landed on main by its
     host's merge queue, as kiln saw it land". The land's record keeps its trunk's policy.
-  - *Tests:* kiln-ci `w26_r19_a_host_pulls_gate`, `w26_r19_a_host_queues_land_reads_back`; kiln-cd
-    `w26_r19_the_land_stage_says_where_the_queue_has_it`; kiln
-    `w26_r19_a_host_pull_enters_its_hosts_queue_only_when_clear` (GitHub's merge queue and
-    GitLab's merge trains through the forge seam's simulator),
-    `w26_r19_a_host_queues_land_is_signed_into_the_trail`, and the hosting test
-    `w26_r19_d41_lands_through_the_queue`; Playwright `ship-land.spec.ts`.
-  - *Not yet:* hosts without a queue (Bitbucket; GitHub without one) land through W28's queue,
-    tested in kiln's mirror and merged at the head it tested. That's the Merge Queues agent's queue
-    to build, and until then such a change is refused (422). Thread kinds on a host's pull request
-    aren't kept, so the gate counts its open threads by the trunk's `resolve_threads`.
+  - *Tests:*
+    - kiln-ci: `w26_r19_a_host_pulls_gate`, `w26_r19_a_host_queues_land_reads_back`,
+      `w26_r19_a_host_merges_only_what_kiln_tested`.
+    - kiln-cd: `w26_r19_the_land_stage_says_where_the_queue_has_it`.
+    - kiln: `w26_r19_a_host_pull_enters_its_hosts_queue_only_when_clear` (GitHub's merge queue and
+      GitLab's merge trains through the forge seam's simulator),
+      `w26_r19_a_host_queues_land_is_signed_into_the_trail`, and
+      `w26_r19_a_host_without_a_queue_lands_through_kilns` (a real mirror beside the simulator:
+      merged at the head tested, built again when the trunk moved before the merge, out when the
+      head moved).
+    - The hosting test `w26_r19_d41_lands_through_the_queue`.
+    - Playwright: `ship-land.spec.ts`.
+  - **Hosts without a queue** (Bitbucket; GitHub without one) land through W28's queue, built with
+    the Merge Queues agent. The forge seam's `abilities(repo).queue` being none gives the route
+    `kiln, merged on its host` (`queue::Route::HostMerges`).
+    - The entry goes through the queue's own `see` and `build_step` in kiln's mirror: each change's
+      head is merged onto the trunk's tip there, and the candidate's workflows run as any
+      candidate's do, under `policy.land.checks`.
+    - Once it passes, Review's gate is asked again, the mirror is fetched, and
+      `kiln_ci::land::queue::host_merge` decides. The host merges each change (`forge.merge`, at the
+      head tested) only while its trunk is still the candidate's base. A trunk that moved builds
+      the candidate again; a head that moved takes the entry out (`INVALID_MERGE_COMMIT`).
+    - The land is recorded with the candidate's runs and signed as kiln's queue tested it. The
+      statement's `to` is the host's merge commit, its `candidate` kiln's, and its `via` the route.
+      `kiln verify` reads it as "kiln's queue tested candidate …, and its host merged it".
+  - *Not yet:* thread kinds on a host's pull request aren't kept, so the gate counts its open
+    threads by the trunk's `resolve_threads`. A host change's files aren't read into the conflict
+    graph, so each host entry is a component of its own.
 - *Tests.*
   - kiln-ci: `review.rs` (`w26_r11_*`, `w26_r12_a_resolved_conflict_waits_on_its_commit`),
     `suggest.rs` (`w26_r10_*`), `conflicts.rs` (`w26_r12_*`). The Search suite on its simulator
@@ -9760,8 +9778,10 @@ the queue)
   githost directly for it; kiln's own git server has no forge, so its repositories land on W28's.
   `POST /api/repos/:repo/queue` (`ci.queue.enqueue`, `{ trunk?, changes: [{ number, head }] }`,
   bottom first) puts a host's changes in: each read on its host first, a change whose head isn't the
-  one Review cleared is refused (409, naming the head it moved to), as is one merged or closed, and a
-  repository whose host has no queue for it (422). What it does next is each entry's in
+  one Review cleared is refused (409, naming the head it moved to), as is one merged or closed, or one
+  Review's gate holds (W26-R19). A repository whose host has no queue for it lands through kiln's
+  queue, its host merging what kiln tested (route `kiln, merged on its host`, W26-R19). What it does
+  next is each entry's in
   `GET /api/repos/:repo/queue`: `state` (queued, testing, landed, ejected with `reason`), `route`,
   `host` (each change's `state`, `entered`, `queued` and merged `commit`) and, once landed, `record`.
 

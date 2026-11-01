@@ -121,7 +121,8 @@ pub fn read(payload_type: &str, s: &Statement) -> Result<Land, String> {
     if !(is_sha(&land.to) && is_sha(&land.candidate) && seen(&land.from) && seen(&land.base)) {
         return Err("its from, to, candidate or base isn't a whole commit".into());
     }
-    if !land.rebased && land.to != land.candidate {
+    // A host that merged what kiln's queue tested made its own commit of it (`via`, W26-R19).
+    if !land.rebased && land.to != land.candidate && land.via.is_empty() {
         return Err(format!("it moved the trunk to {}, not the candidate it tested, {}, and wasn't applied again", land.to, land.candidate));
     }
     if land.batch.is_empty() {
@@ -188,6 +189,9 @@ mod tests {
         assert_eq!(read(PAYLOAD_LAND, &statement(&unseen))?, unseen);
         let kilns = Land { via: String::new(), ..unseen };
         assert!(read(PAYLOAD_LAND, &statement(&kilns)).is_err_and(|e| e.contains("isn't a whole commit")), "kiln's own queue always names its tip");
+        // Merged by its host after kiln's queue tested it: the host's own commit, not the candidate.
+        let merged = Land { via: crate::land::queue::HOST_MERGES.into(), to: sha('9'), ..d41_d42() };
+        assert_eq!(read(PAYLOAD_LAND, &statement(&merged))?.to, sha('9'));
         Ok(())
     }
 

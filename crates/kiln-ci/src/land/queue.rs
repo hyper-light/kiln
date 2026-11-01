@@ -514,7 +514,13 @@ pub struct Record {
 pub enum Route {
     Kiln,
     Host { queue: String },
+    /// A repository on a host that has no queue for it (docs/ci.md W26-R19): kiln's queue tests
+    /// its changes in kiln's mirror, and its host merges each at the head tested.
+    HostMerges,
 }
+
+/// [`Route::HostMerges`]'s name, as entries and land records keep it.
+pub const HOST_MERGES: &str = "kiln, merged on its host";
 
 impl Route {
     /// The route `abilities(repo).queue` gives: its host queue's name, if it has one.
@@ -525,12 +531,44 @@ impl Route {
         }
     }
 
+    /// The route of a repository on a host (docs/ci.md W26-R19): its host's queue where it has one
+    /// on, else kiln's queue with the host merging what it tested.
+    pub fn of_host(host_queue: Option<&str>) -> Route {
+        host_queue.map_or(Route::HostMerges, |q| Route::Host { queue: q.to_owned() })
+    }
+
     pub fn name(&self) -> &str {
         match self {
             Route::Kiln => "kiln",
             Route::Host { queue } => queue,
+            Route::HostMerges => HOST_MERGES,
         }
     }
+}
+
+/// What a change kiln's queue tested comes to when its host would merge it (docs/ci.md W26-R19).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostMerge {
+    /// Merge it on its host, at the head tested.
+    Merge,
+    /// The trunk moved since the candidate was built on it: build it again, on the trunk as it is.
+    Rebuild { why: String },
+    /// Its head moved past the one tested (and Review cleared): out of the queue.
+    Out { why: String },
+}
+
+/// Whether kiln has its host merge a change its queue tested (docs/ci.md W26-R19): only at the head
+/// tested, onto the trunk the candidate was built on (`base`). A head that moved takes it out (its
+/// new head is Review's again); a trunk that moved builds the candidate again.
+pub fn host_merge(base: &str, trunk_now: &str, tested_head: &str, head_now: &str) -> HostMerge {
+    let short = |s: &str| s.get(..7).unwrap_or(s).to_owned();
+    if head_now != tested_head {
+        return HostMerge::Out { why: format!("its head moved to {} after {} was tested, past what Review cleared", short(head_now), short(tested_head)) };
+    }
+    if trunk_now != base {
+        return HostMerge::Rebuild { why: format!("the trunk moved to {} since its candidate was built on {}: built again", short(trunk_now), short(base)) };
+    }
+    HostMerge::Merge
 }
 
 /// Where a host's change is, as read back through the seam.

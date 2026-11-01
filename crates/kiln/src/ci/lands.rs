@@ -116,9 +116,17 @@ pub async fn sign(hub: &Hub, repo: &Repo, trunk: &str, moved: &Moved<'_>, carrie
 /// what it saw: `via`, the host's queue, tested and merged `carried` (each change as `#n`, the
 /// version of it Review cleared, and the commit it merged as) onto `trunk`, the last its head now.
 /// The tip it went onto is named where kiln's mirror has the commit; its checks are the runs kiln
-/// knows of on it. Kept and taken into the trail as [`sign`]'s are. Its digest.
-pub async fn sign_host(hub: &Hub, repo: &Repo, trunk: &str, via: &str, carried: &[(String, u32, String)]) -> anyhow::Result<String> {
+/// knows of on it. Where kiln's queue tested it and the host only merged it, `tested` is the
+/// candidate and its base, onto which the host merged it: its checks are the candidate's. Kept and
+/// taken into the trail as [`sign`]'s are. Its digest.
+pub async fn sign_host(hub: &Hub, repo: &Repo, trunk: &str, via: &str, tested: Option<(&str, &str)>, carried: &[(String, u32, String)]) -> anyhow::Result<String> {
     let to = carried.last().map(|(_, _, c)| c.clone()).ok_or_else(|| anyhow::anyhow!("no change landed"))?;
+    if let Some((candidate, base)) = tested {
+        let batch = carried.iter().map(|(diff, version, commit)| Landed { diff: diff.clone(), version: *version, commit: commit.clone(), verdicts: Vec::new() }).collect();
+        let checks = checks_on(hub, &repo.id, candidate).await?;
+        let land = Land { repo: repo.name.clone(), trunk: trunk.to_owned(), from: base.to_owned(), to, candidate: candidate.to_owned(), base: base.to_owned(), rebased: false, batch, checks, via: via.to_owned() };
+        return keep(hub, &repo.id, &land).await;
+    }
     let from = match crate::gitops::ensure_commit(hub, repo, &to).await {
         Ok(mirror) => {
             let (dir, parent) = (mirror.to_string_lossy().into_owned(), format!("{to}^1"));
