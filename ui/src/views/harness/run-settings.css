@@ -322,6 +322,18 @@ span.rs-bolt,
   background: linear-gradient(90deg, #a4cec2, #a4b0d6, #c3a5cf, #d2bda2);
   transition: width 0.15s cubic-bezier(0.16, 1, 0.3, 1);
 }
+/* A scale's lit track (run-settings.tsx's EffortLine and PermissionLine; effort-light.ts and
+   permission-light.ts): a canvas the track's height with its line on the rail, over the rail and
+   under the knob, drawing the track's stops itself (.rs-tick[data-drawn]); it reaches 12px past each
+   end (BLEED) for the stops there and their glow. */
+.rs-lit {
+  position: absolute;
+  top: -20px;
+  left: -12px;
+  width: calc(100% + 24px);
+  height: 40px;
+  pointer-events: none;
+}
 .rs-tick {
   position: absolute;
   top: 0;
@@ -336,6 +348,11 @@ span.rs-bolt,
 }
 .rs-tick[data-warn] {
   background: #5a4a38;
+}
+/* A lit track (.rs-lit) draws its scale's stops; these keep their place unseen, so a tap at the
+   track's very end still lands on its stop. */
+.rs-tick[data-drawn] {
+  opacity: 0;
 }
 .rs-knob {
   position: absolute;
