@@ -205,7 +205,8 @@ fn w26_r18_agents_fix_from_agents_feedback_only_where_turned_on() -> anyhow::Res
     };
     let (dev, lead) = (mint("dev", "developer")?, mint("lead", "maintainer")?);
     let switch = |token: &str, repo: &str, body: Option<Value>| -> anyhow::Result<(u16, Value)> {
-        let path = format!("/api/repos/{repo}/agent-fixes");
+        // The repository's name is one segment, as the UI sends it (`acme%2Ffixes`).
+        let path = format!("/api/repos/{}/agent-fixes", repo.replace('/', "%2F"));
         let (st, text) = http(s.port, if body.is_some() { "PUT" } else { "GET" }, &path, token, body.as_ref())?;
         Ok((st, serde_json::from_str(&text).unwrap_or(Value::String(text))))
     };
