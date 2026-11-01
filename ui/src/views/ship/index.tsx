@@ -30,7 +30,7 @@ import { whoSaid } from "@/api/review";
 import { SelectField } from "@/components/ui/misc";
 import { useGlide, useListHold } from "@/views/harness/list-tools";
 import { JobsPane } from "./jobs";
-import { ShipCommits, type Narrow } from "./commits";
+import { ShipCommits, ShipCommitsSlot, type Narrow } from "./commits";
 import { ShipOutput } from "./output";
 import { ReviewFiles, ShipLanes, warmReview } from "./review";
 import { SectionHead } from "./head";
@@ -431,7 +431,7 @@ function RepoDropdown({ head, narrow, reveal }: { head: ShipCommit; narrow: Narr
       commit={commit}
       reveal={reveal}
       commits={
-        <Loadable label="Loading its commits" className="sc-slot">
+        <Loadable label="Loading its commits" fallback={<ShipCommitsSlot repo={head.repo} />}>
           <ShipCommits repo={head.repo} narrow={narrow} picked={commit.sha} onPick={setPicked} />
         </Loadable>
       }

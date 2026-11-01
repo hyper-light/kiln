@@ -10,6 +10,7 @@
 import * as React from "react";
 import { whoSaid } from "@/api/review";
 import { shipApi, type ShipCommit, type ShipQuery } from "@/api/ship";
+import { Loading } from "@/components/ui/loading";
 import { StatusGlyph } from "@/components/ui/status-glyph";
 import { STATES, type GlyphState } from "@/components/ui/status-glyph-spec";
 import { formatDuration, spanSeconds } from "@/lib/format";
@@ -81,6 +82,82 @@ export function ShipCommits({ repo, narrow, picked, onPick }: { repo: string; na
   // A press acts on the page shown: pressed again before the next is in, it does nothing more.
   const depth = before.length;
   return (
+    <Frame
+      repo={repo}
+      per={per}
+      onPer={(n) =>
+        startTransition(() => {
+          setPer(n);
+          setBefore([]);
+        })
+      }
+      newer={depth === 0 && !arrived ? null : () => (depth === 0 ? setHeld({ key, lines: fetched }) : startTransition(() => setBefore((b) => (b.length === depth ? b.slice(0, -1) : b))))}
+      range={lines.length > 0 ? `${first}–${first + lines.length - 1}` : "—"}
+      older={next === null ? null : () => startTransition(() => setBefore((b) => (b.length !== depth ? b : [...b, next])))}
+    >
+      {lines.map((c) => {
+        const on = machinesOf(c) || "—";
+        return (
+          <li key={c.sha} className="sc-c" data-sel={c.sha === picked || undefined}>
+            <button type="button" className="sc-b" aria-pressed={c.sha === picked} onClick={() => onPick(c)}>
+              <StatusGlyph state={glyphOf(c)} size={14} />
+              <span className="sc-sha">{c.short}</span>
+              <span className="sc-msg">{c.message || c.change?.title || c.short}</span>
+              <span className="sc-who">{whoSaid(c.author)}</span>
+              <span className="sc-on" title={on}>
+                {on}
+              </span>
+              <span className="sc-took">
+                <RunTime ran={c.ran} />
+              </span>
+              <RelTime className="sc-ago" ts={c.at} />
+              <span className="sc-l2">
+                <b>{c.short}</b> · {whoSaid(c.author)} · {on} · <RunTime ran={c.ran} />
+              </span>
+            </button>
+          </li>
+        );
+      })}
+    </Frame>
+  );
+}
+
+/**
+ * The commits while they load: the section itself, its controls dimmed and its list a page tall
+ * and empty, so nothing below moves when they come (Loadable's `fallback`).
+ */
+export function ShipCommitsSlot({ repo }: { repo: string }) {
+  return (
+    <Frame repo={repo} per={10} onPer={null} newer={null} range="—" older={null}>
+      <li className="sc-wait">
+        <Loading label="Loading its commits" />
+      </li>
+    </Frame>
+  );
+}
+
+/**
+ * The section, loaded or not: its head with the page sizes, the columns' names, the list (at least
+ * a page tall: `--sc-per`) and the pager. A null action's control is dimmed, never gone.
+ */
+function Frame({
+  repo,
+  per,
+  onPer,
+  newer,
+  range,
+  older,
+  children,
+}: {
+  repo: string;
+  per: PerPage;
+  onPer: ((n: PerPage) => void) | null;
+  newer: (() => void) | null;
+  range: string;
+  older: (() => void) | null;
+  children: React.ReactNode;
+}) {
+  return (
     <section aria-label="Commits" className="ship-sec ship-commits">
       <SectionHead label="Commits">
         <span className="sc-per" role="group" aria-label="Commits a page">
@@ -88,17 +165,7 @@ export function ShipCommits({ repo, narrow, picked, onPick }: { repo: string; na
           {PER_PAGE.map((n, i) => (
             <React.Fragment key={n}>
               {i > 0 && <span aria-hidden="true">·</span>}
-              <button
-                type="button"
-                aria-pressed={per === n}
-                aria-label={`${n} a page`}
-                onClick={() =>
-                  startTransition(() => {
-                    setPer(n);
-                    setBefore([]);
-                  })
-                }
-              >
+              <button type="button" aria-pressed={per === n} aria-label={`${n} a page`} disabled={onPer === null} onClick={() => onPer?.(n)}>
                 {n}
               </button>
             </React.Fragment>
@@ -116,40 +183,14 @@ export function ShipCommits({ repo, narrow, picked, onPick }: { repo: string; na
           <span>when</span>
         </div>
         <ol className="sc-list" aria-label={`${repo}'s commits`} style={{ "--sc-per": per } as React.CSSProperties}>
-          {lines.map((c) => {
-            const on = machinesOf(c) || "—";
-            return (
-              <li key={c.sha} className="sc-c" data-sel={c.sha === picked || undefined}>
-                <button type="button" className="sc-b" aria-pressed={c.sha === picked} onClick={() => onPick(c)}>
-                  <StatusGlyph state={glyphOf(c)} size={14} />
-                  <span className="sc-sha">{c.short}</span>
-                  <span className="sc-msg">{c.message || c.change?.title || c.short}</span>
-                  <span className="sc-who">{whoSaid(c.author)}</span>
-                  <span className="sc-on" title={on}>
-                    {on}
-                  </span>
-                  <span className="sc-took">
-                    <RunTime ran={c.ran} />
-                  </span>
-                  <RelTime className="sc-ago" ts={c.at} />
-                  <span className="sc-l2">
-                    <b>{c.short}</b> · {whoSaid(c.author)} · {on} · <RunTime ran={c.ran} />
-                  </span>
-                </button>
-              </li>
-            );
-          })}
+          {children}
         </ol>
         <div className="sc-pager">
-          <button
-            type="button"
-            disabled={depth === 0 && !arrived}
-            onClick={() => (depth === 0 ? setHeld({ key, lines: fetched }) : startTransition(() => setBefore((b) => (b.length === depth ? b.slice(0, -1) : b))))}
-          >
+          <button type="button" disabled={newer === null} onClick={() => newer?.()}>
             Newer
           </button>
-          <span>{lines.length > 0 ? `${first}–${first + lines.length - 1}` : "—"}</span>
-          <button type="button" disabled={next === null} onClick={() => startTransition(() => setBefore((b) => (next === null || b.length !== depth ? b : [...b, next])))}>
+          <span>{range}</span>
+          <button type="button" disabled={older === null} onClick={() => older?.()}>
             Older
           </button>
         </div>

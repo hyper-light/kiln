@@ -1146,9 +1146,6 @@
   margin-bottom: 16px;
   border-bottom: 1px solid var(--k-line, #2a2c31);
 }
-.sc-slot {
-  min-height: 430px;
-}
 .sc-per {
   display: inline-flex;
   align-items: center;
@@ -1194,6 +1191,10 @@
   padding: 0;
   list-style: none;
   min-height: calc(var(--sc-per, 10) * 30px);
+}
+/* The stand-in's one line: the loader at the list's top, the list's height its own. */
+.sc-wait {
+  padding: 12px 0;
 }
 .sc-b {
   all: unset;
@@ -1291,19 +1292,18 @@
   .sc-h {
     display: none;
   }
-  .sc-slot {
-    min-height: 600px;
-  }
+  /* A line's two rows at a height of their own, so a page's height is known before it comes: its
+     stand-in is as tall, and nothing under it moves. */
   .sc-list {
-    min-height: calc(var(--sc-per, 10) * 46px);
+    min-height: calc(var(--sc-per, 10) * 52px);
   }
   .sc-b {
-    height: auto;
-    min-height: 46px;
+    height: 52px;
     grid-template-columns: 20px minmax(0, 1fr) auto;
     grid-template-rows: auto auto;
+    align-content: center;
     row-gap: 2px;
-    padding: 6px 8px 6px 10px;
+    padding: 0 8px 0 10px;
   }
   .sc-b > .sg {
     grid-row: 1 / 3;

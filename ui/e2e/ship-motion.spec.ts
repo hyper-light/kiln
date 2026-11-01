@@ -63,6 +63,8 @@ test("with reduced motion, nothing on Ship moves as commits arrive, a row opens 
     const row = repoRow(page);
     await expect(row.locator(".ship-text")).toContainText(/^(agent: |release: )/, { timeout: 20_000 });
     // A row opens by its Diff (Review) button and its Files come into view: by one jump, not a scroll.
+    // The row in view first (kiln's needn't be the first now): reaching it is the test's scroll.
+    await row.getByRole("button", { name: /^Open / }).scrollIntoViewIfNeeded();
     await page.evaluate(() => {
       const w = window as unknown as { ys: number[] };
       w.ys = [];
