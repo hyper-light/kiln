@@ -483,6 +483,36 @@ mod tests {
         assert!(compare_url("https://bitbucket.org/w/r.git", "main", "agents/x").is_some_and(|u| u.contains("pull-requests/new")));
         assert_eq!(compare_url("git@git.internal:a/b.git", "main", "x"), None);
     }
+
+    /// Commits and Compare are asked only of a runner that has said it can answer them (the Changes
+    /// panel plan 01a194444b1d, step 4): one too old to is refused without being asked, saying so,
+    /// and the Changes tab greys the mode out with that reason. Once it has said so, it's asked.
+    #[test]
+    fn commits_are_asked_only_of_a_runner_that_says_it_can_and_an_older_one_is_told_why_not() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let hello = crate::proto::Hello { protocol: crate::proto::VERSION, name: "box".into(), labels: vec![], slots: 1, hostname: "box".into(), os: "linux".into(), arch: "x86_64".into(), version: "0.0.9".into(), ephemeral: false, dedicated_job: None, running: vec![], terminal: true };
+            {
+                let mut instances = hub.instances.lock();
+                assert!(instances.join(1, "box", hello, 1).newest);
+                instances.set_build(1, "0.0.9".into(), crate::proto::CAP_WORKSPACE);
+            }
+            let info = Info { id: "a1".into(), target: "agent:box".into(), cwd: "/w/app".into(), ..Info::default() };
+            let commits = crate::workspace::Ask::Commits { branch: None, trunk: None, since_head: None, since_at: None, picks: vec![] };
+            let too_old = (StatusCode::CONFLICT, "box's kiln is too old to do this: upgrade it (System → Updates)".to_owned());
+            for ask in [&commits, &crate::workspace::Ask::Refs] {
+                assert_eq!(ask_machine(&hub, &info, ask).await.err(), Some(too_old.clone()), "{ask:?}");
+            }
+            // Once it has said so, it's asked: no runner is connected here to answer, so the question waits.
+            hub.instances.lock().set_wide(1, crate::proto::CAP_WORKSPACE_COMMITS | crate::proto::CAP_WORKSPACE_COMPARE);
+            for ask in [&commits, &crate::workspace::Ask::Refs] {
+                if let Ok(Err(refused)) = crate::rt::timeout(std::time::Duration::from_millis(300), ask_machine(&hub, &info, ask)).await {
+                    assert_ne!(refused, too_old, "{ask:?}");
+                }
+            }
+            Ok(())
+        })
+    }
 }
 
 /// `agents.change` end to end on a hub of its own, under a timeout: an agent kiln runs on the
