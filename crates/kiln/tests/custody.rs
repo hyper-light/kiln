@@ -173,3 +173,65 @@ fn w27_r08_records_through_the_api_and_the_cli() -> anyhow::Result<()> {
     assert!(exported.get("revocations").and_then(Value::as_array).is_some_and(|v| v.iter().any(|r| field(r, "reason") == "sam's laptop lost")), "{exported}");
     Ok(())
 }
+
+/// W27-R08 (the Transfers plan's step 16): custody end to end, on a test cluster
+/// (`common::production`: `KILN_CUSTODY_KUBECONFIG`, and the registries it reaches). acme/app's commit
+/// is built by a leg on fedora-2, which pushes pause's two-platform index to kiln's registry, and
+/// KilnCD releases it to production. `kiln custody walk` from a running pod's receipt names each
+/// hop back to the commit, each signed: the pod, its node, the cluster, CD, kiln's registry, the
+/// leg, fedora-2's runner, and kiln's hand-on of the commit, where the chain begins. Then each break
+/// that path can play is refused where it would be used and recorded: a hop's record removed, then
+/// changed where kiln keeps it (the walk names each); a receipt of CD's hand-on to the cluster signed
+/// by someone else than the cluster's taker (kept, its break recorded as not the taker's); and a
+/// pod's image swapped (the break at its receipt, production's registration needing a person). The
+/// other kinds, on other paths, have tests of their own (docs/ci.md W27-R08, Tests).
+#[cfg(unix)]
+#[test]
+#[ignore = "needs a test cluster (KILN_CUSTODY_KUBECONFIG), and registry.k8s.io and docker.io"]
+fn w27_r08_custody_end_to_end() -> anyhow::Result<()> {
+    use common::production::{degraded, get, released, swapped, verified};
+    let r = released()?;
+    let (s, ns, commit) = (&r.s, r.cluster.namespace.as_str(), r.commit.as_str());
+    let custody = verified(s)?;
+    let pod = custody.get("pods").and_then(Value::as_array).and_then(|p| p.first()).cloned().ok_or_else(|| anyhow::anyhow!("no pod: {custody:#}"))?;
+    let record = field(&pod, "record").to_owned();
+
+    // `kiln custody walk` on the running pod: each hop back to the commit, signed, in words.
+    let said = cli(s.port, &s.admin, &["custody", "walk", &record])?;
+    assert!(said.starts_with(&format!("{record}: unbroken, each of its ")), "{said}");
+    for words in [format!("kiln for pod {ns}/"), " from node ".into(), "cluster e2e".into(), "kiln's CD handed ".into(), "'s leg build on fedora-2".into(), "the runner on fedora-2 received ".into(), ", where the chain begins".into()] {
+        assert!(said.contains(&words), "{words:?} in {said}");
+    }
+    let walk = get(s, &format!("/api/custody/walk?digest={record}"))?;
+    let hops = walk.get("hops").and_then(Value::as_array).cloned().unwrap_or_default();
+    let began = |h: &&Value| h.get("began") == Some(&json!(true));
+    assert!(hops.iter().filter(began).any(|h| h.get("subject").and_then(Value::as_array).into_iter().flatten().any(|t| t.pointer("/digest/gitCommit") == Some(&json!(commit)))), "back to the commit: {walk:#}");
+
+    // A hop's record removed, then changed where kiln keeps it: the walk names each break.
+    common::custody::walked_and_broken(s.port, &s.admin, &r.dir.path().join("data/kiln.db"), &record)?;
+
+    // CD's hand-on to the cluster, received by someone the cluster isn't: kept, its break recorded as
+    // not the taker's, and its walk names it.
+    let handed = hops.iter().find(|h| field(h, "kind") == "handed-on" && field(h, "custodian").ends_with("/server/cd")).cloned().ok_or_else(|| anyhow::anyhow!("no hand-on of CD's: {walk:#}"))?;
+    let cookie = person(s.port, &s.admin, "mallory")?;
+    let mallory = certified(s.port, Auth::Cookie(&cookie))?;
+    let things: Vec<Subject> = serde_json::from_value(handed.get("subject").cloned().unwrap_or_default())?;
+    let body = Body { from: Some(field(&handed, "custodian").to_owned()), why: "what was handed to the cluster".into(), ..Body::new(Kind::Received, "") };
+    let other = Statement { subject: things, follows: vec![field(&handed, "record").to_owned()], ..Statement::new(to_value(&body)) };
+    let (st, v) = hand(s.port, Auth::Cookie(&cookie), &mallory.sign(&other)?)?;
+    assert_eq!(st, 201, "{v}");
+    assert!(field(&v, "broke").contains("not to"), "{v}");
+    let digest = mallory.digest(&other)?;
+    let breaks = get(s, "/api/custody/breaks")?;
+    assert!(breaks.get("breaks").and_then(Value::as_array).is_some_and(|b| b.iter().any(|b| field(b, "kind") == "not-the-taker" && field(b, "record") == digest)), "{breaks:#}");
+    let w = get(s, &format!("/api/custody/walk?digest={digest}"))?;
+    assert_eq!((w.get("unbroken"), w.pointer("/break/kind")), (Some(&json!(false)), Some(&json!("not-the-taker"))), "{w:#}");
+
+    // A pod's image swapped: the break at its receipt, and production's registration needs a person.
+    let name = field(&pod, "pod").to_owned();
+    let broke_at = swapped(&r, &name)?;
+    let w = get(s, &format!("/api/custody/walk?digest={broke_at}"))?;
+    assert_eq!((w.get("unbroken"), w.pointer("/break/kind")), (Some(&json!(false)), Some(&json!("changed"))), "{w:#}");
+    degraded(s, &name)?;
+    Ok(())
+}
