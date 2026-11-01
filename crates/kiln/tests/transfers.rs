@@ -1479,6 +1479,9 @@ fn w27_r08_relays_a_runners_relay_of_its_agents_calls() -> anyhow::Result<()> {
     let (server, runner) = (std::fs::read_to_string(dir.path().join("server.log")).unwrap_or_default(), std::fs::read_to_string(dir.path().join("box-a.log")).unwrap_or_default());
     assert!(!server.contains("passed this act on with no record") && !runner.contains("passed on to kiln unrecorded"), "no act relayed without its record");
     assert_eq!(relay_breaks(port, admin, "/machine/box-a/")?, Vec::<Value>::new(), "each passed on unchanged");
+    // Walked as `kiln custody walk` walks it (the Transfers plan's step 15): a call's chain, and with
+    // one hop's record removed, then changed where kiln keeps it, the break named at that hop.
+    common::custody::walked_and_broken(port, admin, &dir.path().join("data/kiln.db"), receipts.first().map(String::as_str).unwrap_or_default())?;
     Ok(())
 }
 
@@ -1554,6 +1557,9 @@ fn w27_r08_relays_kilns_relay_of_an_agents_words() -> anyhow::Result<()> {
     assert_eq!(stream_counts(&v, "/server", "words to "), (1, 0), "kiln's record of the words, numbered: {v}");
     assert!(v.get("unanswered").and_then(Value::as_array).is_some_and(Vec::is_empty), "{v}");
     assert_eq!(relay_breaks(port, admin, "kiln://")?, Vec::<Value>::new(), "each passed on unchanged");
+    // Walked as `kiln custody walk` walks it (step 15): the words' chain through both relays, and with
+    // one hop's record removed, then changed where kiln keeps it, the break named at that hop.
+    common::custody::walked_and_broken(port, admin, &dir.path().join("data/kiln.db"), &receipt)?;
     Ok(())
 }
 

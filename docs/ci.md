@@ -9758,9 +9758,11 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
   `chaos`, `identities`'s `w27_r08_custody_walk` (steps 11 and 12's chains, an image a leg made
   back to the landed commit and a binary through kiln's store of bytes: each unbroken and said hop
   by hop, its export checking against kiln's CA certificate alone, and each with one hop's record
-  removed, then changed where kiln keeps it, naming its break at that hop; step 13's chains join it
-  as they land), and on a test cluster `custody_production`'s `w27_r08_custody_to_production` walks
-  a pod's chain back to the commit the same way. Simulation
+  removed, then changed where kiln keeps it, naming its break at that hop), `transfers`'s
+  `w27_r08_relays_a_runners_relay_of_its_agents_calls` and `w27_r08_relays_kilns_relay_of_an_agents_words`
+  walk step 13's chains (an agent's call through its runner; an agent's words through its runner and
+  kiln) the same way, and on a test cluster `custody_production`'s `w27_r08_custody_to_production`
+  walks a pod's chain back to the commit the same way. Simulation
   (the Transfers plan's step 15, W27-R08):
   `sim::custody::tests::w27_r08_no_broken_chain_walks_as_unbroken` (docs/sim.md's custody model:
   things handed on directly and through one or two relays, under kiln-sim's nemesis, the relays
