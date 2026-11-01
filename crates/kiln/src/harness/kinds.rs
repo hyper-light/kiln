@@ -248,12 +248,20 @@ fn local_connection(spec:&Spec)->Option<(&'static str,Option<&str>)> {
 }
 
 /// U16: resolve once, only where the real provider exports a persistent helper.
-/// Unbound/manual/custom contexts refuse this helper demand, not ordinary startup.
+/// Unbound/manual/custom contexts refuse this helper demand, not ordinary startup: such a
+/// runner (`kiln agent` by hand, a test's) starts the harness without its local helper. Only a
+/// bound supervisor that is busy refuses the start, which the session tries again.
 #[cfg(unix)]
 async fn local_tools(spec:&Spec)->anyhow::Result<Option<(std::path::PathBuf,&'static str,Option<&str>)>> {
     let Some((socket,prefer))=local_connection(spec) else {return Ok(None)};
-    let context=crate::bluegreen::Supervisor::installed_cli().await?;
-    Ok(Some((context.path().to_path_buf(),socket,prefer)))
+    match crate::bluegreen::Supervisor::installed_cli().await {
+        Ok(context)=>Ok(Some((context.path().to_path_buf(),socket,prefer))),
+        Err(crate::bluegreen::InstalledCliRefusal::Unsupported)=>{
+            tracing::debug!("U16: no installed helper context for this process: the session starts without kiln's local MCP helper");
+            Ok(None)
+        }
+        Err(busy)=>Err(busy.into()),
+    }
 }
 #[cfg(not(unix))]
 async fn local_tools(_spec:&Spec)->anyhow::Result<Option<(std::path::PathBuf,&'static str,Option<&str>)>> {Ok(None)}
