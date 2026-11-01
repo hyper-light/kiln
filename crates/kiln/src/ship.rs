@@ -231,6 +231,9 @@ struct HandoffRec {
 /// An open thread on a change: its kind, where it is, who opened it and its first words.
 #[derive(Debug, Clone, Default)]
 struct ThreadRec {
+    /// Its id, and the revision it was opened on (W26-R18: Hand off names each).
+    id: String,
+    version: u32,
     kind: String,
     file: Option<String>,
     line: Option<i64>,
@@ -282,6 +285,9 @@ struct ChangeRec {
     reviews: Vec<(String, String, i64, String, Option<u32>)>,
     /// (version, rebase only, at)
     pushes: Vec<(u32, bool, i64)>,
+    /// Its revisions that fix: an agent's fix or a suggestion applied, by why or by the thread
+    /// they answer (W26-R04, R18).
+    fixes: Vec<u32>,
     threads: Vec<ThreadRec>,
     replies: Vec<(String, i64)>,
     /// The land queue's latest entry landing this change: its state and why.
@@ -437,6 +443,9 @@ fn load_change(c: &rusqlite::Connection, repo_id: &str, sha: &str) -> anyhow::Re
             None if thread.is_some() => "fix",
             None => "push",
         };
+        if kind == "fix" {
+            ch.fixes.push(v);
+        }
         marks.push(MarkRec {
             id: format!("{id}:v{v}"),
             kind,
@@ -457,10 +466,12 @@ fn load_change(c: &rusqlite::Connection, repo_id: &str, sha: &str) -> anyhow::Re
         .collect::<Result<_, _>>()?;
     approval_marks(&mut marks, &id, &ch.reviewers, &ch.reviews);
     let mut st = c.prepare(
-        "SELECT t.kind, t.file, t.start_line, t.created_by, (SELECT c.body FROM review_comments c WHERE c.thread_id = t.id AND c.published = 1 ORDER BY c.created_at, c.rowid LIMIT 1)
+        "SELECT t.kind, t.file, t.start_line, t.created_by, (SELECT c.body FROM review_comments c WHERE c.thread_id = t.id AND c.published = 1 ORDER BY c.created_at, c.rowid LIMIT 1), t.id, t.version
          FROM review_threads t WHERE t.diff_id = ?1 AND t.state = 'open' AND EXISTS (SELECT 1 FROM review_comments c WHERE c.thread_id = t.id AND c.published = 1) ORDER BY t.created_at, t.id",
     )?;
-    ch.threads = st.query_map([&id], |r| Ok(ThreadRec { kind: r.get(0)?, file: r.get(1)?, line: r.get(2)?, by: r.get(3)?, said: r.get::<_, Option<String>>(4)?.unwrap_or_default() }))?.collect::<Result<_, _>>()?;
+    ch.threads = st
+        .query_map([&id], |r| Ok(ThreadRec { kind: r.get(0)?, file: r.get(1)?, line: r.get(2)?, by: r.get(3)?, said: r.get::<_, Option<String>>(4)?.unwrap_or_default(), id: r.get(5)?, version: r.get(6)? }))?
+        .collect::<Result<_, _>>()?;
     // Each thread's published comments, oldest first (the first is its opening one).
     let mut by_thread: HashMap<String, Vec<(String, String, i64)>> = HashMap::new();
     let mut st = c.prepare("SELECT c.thread_id, c.id, c.author, c.created_at FROM review_comments c JOIN review_threads t ON t.id = c.thread_id WHERE t.diff_id = ?1 AND c.published = 1 ORDER BY c.created_at, c.rowid")?;
@@ -629,6 +640,8 @@ fn load_pull(c: &rusqlite::Connection, repo_id: &str, host: &str, number: i64, n
         reviewers: asked,
         reviews,
         pushes: heads.iter().map(|(k, _, t)| (*k, false, *t)).collect(),
+        // Its host keeps no why for a head, so none reads as a fix.
+        fixes: Vec::new(),
         threads,
         replies: Vec::new(),
         queue: None,
@@ -650,6 +663,8 @@ fn review_of(ch: &ChangeRec, sha: &str, handed: Option<&HandoffRec>, held: Optio
     if !ch.head || ch.state == "abandoned" {
         return None;
     }
+    // Handed off at this revision and replaced by a fix since (W26-R18): which version fixed it.
+    let fixed_in = handed.filter(|_| sha != ch.tip()).and_then(|_| ch.fixes.iter().copied().filter(|v| *v > ch.n).min()).map(|v| format!("v{v}"));
     let handed = handed.filter(|_| sha == ch.tip());
     let held = held.filter(|_| sha == ch.tip()).and_then(|h| h.why.clone());
     let mut ev: Vec<(i64, u8, turn::Event)> = Vec::new();
@@ -728,7 +743,7 @@ fn review_of(ch: &ChangeRec, sha: &str, handed: Option<&HandoffRec>, held: Optio
     let about = held.filter(|_| state != ReviewState::Fixing).unwrap_or(about);
     let tip = ch.tip();
     let superseded_by = (sha != tip).then(|| if ch.n < ch.latest { format!("v{}", ch.latest) } else { short(tip) });
-    Some(Review { state, turn: whose, author, open, conflicts: gate.conflicts, fixing: handed.map(|h| h.to.clone()), about, superseded_by })
+    Some(Review { state, turn: whose, author, open, conflicts: gate.conflicts, fixing: handed.map(|h| h.to.clone()), about, superseded_by, fixed_in })
 }
 
 fn short(sha: &str) -> String {
@@ -1982,6 +1997,8 @@ fn handed_text(rec: &Records, ch: &ChangeRec, conflicts: &[kiln_ci::review::Conf
         text.push_str(&format!("\n\nIt conflicts with where it lands: {}. Resolve them in a new version (agents.change).", places.join(", ")));
     }
     if !threads.is_empty() {
+        // Thread by thread (W26-R18): each one's id, where it is and the revision it's on, and
+        // whether an agent opened it (agents' feedback a person sends on).
         text.push_str(&format!("\n\nIts open threads ({}):", threads.len()));
         for t in threads {
             let place = match (&t.file, t.line) {
@@ -1989,9 +2006,15 @@ fn handed_text(rec: &Records, ch: &ChangeRec, conflicts: &[kiln_ci::review::Conf
                 (Some(f), None) => f.clone(),
                 _ => "the conversation".to_string(),
             };
-            text.push_str(&format!("\n- {place} ({}), {}: {}", t.kind, shown(&t.by), first_words(&t.said)));
+            let agents = if t.by.starts_with("agent:") { " (an agent's)" } else { "" };
+            text.push_str(&format!("\n- thread {}, {place} on version {} ({}), {}{agents}: {}", t.id, t.version, t.kind, shown(&t.by), first_words(&t.said)));
         }
-        text.push_str(&format!("\n\nAnswer each in its thread (ci.diffs.threads {{\"diff\": \"{}\"}} lists them, ci.diffs.reply answers one) and make what they ask in a new version (agents.change).", ch.name));
+        let ids: Vec<String> = threads.iter().map(|t| format!("\"{}\"", t.id)).collect();
+        text.push_str(&format!(
+            "\n\nAnswer each in its thread: ci.diffs.reply {{\"diff\": \"{}\", \"thread\": <its id>, \"body\": …}}. Make what they ask in a new version that answers them: agents.change {{\"answers\": [{}]}}.",
+            ch.name,
+            ids.join(", ")
+        ));
     }
     if let Some((leg, excerpt)) = failed {
         let run_of = |l: &LegRec| rec.runs.iter().find(|r| r.id == l.run_id).map(|r| r.pipeline.as_str()).unwrap_or_default();
@@ -3168,7 +3191,11 @@ mod tests {
             let base = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
             let told = handed_text(&rec, &ch, &ch.conflicts, &ch.threads, None, &base, &owner.name);
             anyhow::ensure!(
-                told.contains("your change D41 (version 1, commit 4141414)") && told.contains("- crates/kiln-ci/src/plan/matrix.rs:42 (question), kim: empty matrix meant?") && told.contains("ci.diffs.reply") && told.ends_with("/diffs/D41"),
+                told.contains("your change D41 (version 1, commit 4141414)")
+                    && told.contains("- thread th1, crates/kiln-ci/src/plan/matrix.rs:42 on version 1 (question), kim: empty matrix meant?")
+                    && told.contains("ci.diffs.reply")
+                    && told.contains("agents.change {\"answers\": [\"th1\"]}")
+                    && told.ends_with("/diffs/D41"),
                 "{told}"
             );
             let handed = hand_off_in(&hub, &owner, &body).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
@@ -3182,7 +3209,7 @@ mod tests {
                 }
                 crate::rt::sleep(std::time::Duration::from_millis(20)).await;
             }
-            anyhow::ensure!(got.contains("your change D41 (version 1, commit 4141414)") && got.contains("matrix.rs:42 (question), kim: empty matrix meant?"), "it heard: {got}");
+            anyhow::ensure!(got.contains("your change D41 (version 1, commit 4141414)") && got.contains("matrix.rs:42 on version 1 (question), kim: empty matrix meant?"), "it heard: {got}");
             let page = list_in(&hub.store, &HashMap::new(), None, None, runners(), &[], NOW_S * 1000).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             let (stand, line, _) = stand_of(&page, "4141414");
             anyhow::ensure!(stand == "checking" && line.ends_with("fixing · kim's thread"), "{stand}: {line}");
@@ -3199,6 +3226,96 @@ mod tests {
             hub.store.call(|c| Ok(c.execute("DELETE FROM ship_handoffs", []).map(|_| ())?)).await?;
             let why = hand_off_in(&hub, &owner, &body).await.err().map(|(c, m)| (c.as_u16(), m)).unwrap_or_default();
             anyhow::ensure!(why.0 == 409 && why.1.contains("D41's agent isn't running now"), "{why:?}");
+            Ok(())
+        })
+    }
+
+    /// W26-R18, Hand off thread by thread, on a stacked diff (D41), a branch change request (CR13)
+    /// and a draft one (CR14), each its author's agent's and each with two open threads, kim's and
+    /// a review agent's. Handed off, its agent is told each thread's id, place and revision (oldest
+    /// first, then by id), the agent's marked as an agent's, and how to answer them; its row reads that agent fixing (a
+    /// draft stays a draft, W26-R02). Once the agent's fix comes as v2, the handed revision's row
+    /// says it was fixed in v2.
+    #[cfg(unix)]
+    #[test]
+    fn w26_r18_hand_off_names_each_thread_marks_agents_and_says_fixed_in() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        within(async {
+            let hub = crate::hub::tests::scratch_hub_with(|c| c.terminal.enabled = true).await?;
+            let h = std::sync::Arc::clone(&hub);
+            crate::rt::spawn(async move {
+                let _ = crate::harness::registry::Registry::run_local(h).await;
+            });
+            // (diff id, number, kind, state, branch, its v1 commit, its v2 commit, its name)
+            let changes = [
+                ("d41", 41, "diff", "needs-review", "NULL", "4141414aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "4242424aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "D41"),
+                ("cr13", 13, "change_request", "needs-review", "'b13'", "5151515aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "5252525aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "CR13"),
+                ("cr14", 14, "change_request", "draft", "'b14'", "6161616aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "6262626aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "CR14"),
+            ];
+            // Each change's agent, which stays up and says nothing, keeping what it's given: it never
+            // ends the turn a hand-off starts, so one agent would be sent only the first.
+            let dir = tempfile::tempdir()?;
+            let mut agents = Vec::new();
+            for (.., name) in &changes {
+                let (program, heard) = (dir.path().join(format!("quiet-claude-{name}")), dir.path().join(format!("heard-{name}.jsonl")));
+                std::fs::write(&program, format!("#!/bin/sh\nexec cat >> '{}'\n", heard.display()))?;
+                std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))?;
+                let spec = crate::harness::session::Spec { kind: "claude".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), program: Some(program.to_string_lossy().into_owned()), ..Default::default() };
+                let agent = hub.harness.open(&hub, "local", spec, 1).await.map_err(|e| anyhow::anyhow!("{e:#}"))?.into_iter().next().map(|i| i.id).ok_or_else(|| anyhow::anyhow!("nothing opened"))?;
+                agents.push((agent, heard));
+            }
+            let t = NOW_S - 600;
+            let mut sql = fixture();
+            for ((id, n, kind, state, branch, v1, _, _), (agent, _)) in changes.iter().zip(&agents) {
+                sql.push_str(&format!(
+                    "INSERT INTO diffs (id, repo_id, number, kind, title, author, author_kind, author_for, state, trunk, branch, created_at, updated_at) VALUES ('{id}', 'kiln', {n}, '{kind}', 'legs {n}', 'agent:{agent}', 'agent', 'user:sam', '{state}', 'main', {branch}, {t}, {t});
+                     INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, message, pushed_by, created_at) VALUES ('{id}', 1, '{v1}', 'p', 'b', 'legs {n}', 'agent:{agent}', {t});
+                     INSERT INTO review_threads (id, diff_id, version, file, start_line, state, created_by, created_at, kind) VALUES ('{id}k', '{id}', 1, 'src/a.rs', 3, 'open', 'user:kim', {t}, 'question'), ('{id}a', '{id}', 1, 'src/a.rs', 9, 'open', 'agent:review@box-a', {t}, 'issue');
+                     INSERT INTO review_comments (id, thread_id, author, body, created_at, updated_at, published) VALUES ('{id}kc', '{id}k', 'user:kim', 'why three?', {t}, {t}, 1), ('{id}ac', '{id}a', 'agent:review@box-a', 'an empty matrix should mean no legs', {t}, {t}, 1);"
+                ));
+            }
+            hub.store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            let owner = crate::authz::Caller::owner();
+            let page = || {
+                let store = hub.store.clone();
+                async move { list_in(&store, &HashMap::new(), None, None, runners(), &[], NOW_S * 1000).await.map_err(|(_, m)| anyhow::anyhow!(m)) }
+            };
+            for ((id, _, _, state, _, v1, _, name), (_, heard)) in changes.iter().zip(&agents) {
+                let handed = hand_off_in(&hub, &owner, &json!({ "repo": "hyper-light/kiln", "sha": v1 })).await.map_err(|(c, m)| anyhow::anyhow!("{name}: {c}: {m}"))?;
+                anyhow::ensure!(handed.pointer("/handed/what") == Some(&json!(["threads"])), "{name}: {handed}");
+                let mut got = String::new();
+                for _ in 0..250 {
+                    got = std::fs::read_to_string(heard).unwrap_or_default();
+                    if got.contains(&format!("your change {name} (version 1")) {
+                        break;
+                    }
+                    crate::rt::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                anyhow::ensure!(
+                    got.contains(&format!("- thread {id}k, src/a.rs:3 on version 1 (question), kim: why three?"))
+                        && got.contains(&format!("- thread {id}a, src/a.rs:9 on version 1 (issue), "))
+                        && got.contains("(an agent's): an empty matrix should mean no legs")
+                        && got.contains(&format!("agents.change {{\\\"answers\\\": [\\\"{id}a\\\", \\\"{id}k\\\"]}}")),
+                    "{name}: each thread, the agent's marked, and how to answer them: {got}"
+                );
+                let (stand, line, _) = stand_of(&page().await?, v1.get(..7).unwrap_or_default());
+                let (want, start) = if *state == "draft" { ("waiting", "Draft · ") } else { ("checking", "") };
+                anyhow::ensure!(stand == want && line.starts_with(start) && line.ends_with(" fixing · 2 threads"), "{name} reads its agent fixing: {stand}: {line}");
+            }
+            // The agents' fixes come, each v2 answering both threads.
+            let mut sql = String::new();
+            for ((id, _, _, _, _, _, v2, _), (agent, _)) in changes.iter().zip(&agents) {
+                sql.push_str(&format!(
+                    "INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, message, pushed_by, created_at, why, thread, note) VALUES ('{id}', 2, '{v2}', 'p', 'b', 'no legs', 'agent:{agent}', {}, 'agent''s fix', '{id}k', 'answers {id}k, {id}a');",
+                    t + 60
+                ));
+            }
+            hub.store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            let after = page().await?;
+            for (_, _, _, _, _, v1, _, name) in &changes {
+                let (stand, line, _) = stand_of(&after, v1.get(..7).unwrap_or_default());
+                anyhow::ensure!((stand.as_str(), line.as_str()) == ("fixed", "Fixed in v2"), "{name}'s handed revision says which version fixed it: {stand}: {line}");
+            }
             Ok(())
         })
     }

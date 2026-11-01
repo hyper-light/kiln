@@ -207,6 +207,9 @@ pub struct Review {
     pub about: String,
     /// The revision that replaced this commit's (`v6`): the commit then stands superseded.
     pub superseded_by: Option<String>,
+    /// What was handed off at this revision, fixed by a later one (`v6`, W26-R18): replaced, it
+    /// says which version fixed it.
+    pub fixed_in: Option<String>,
 }
 
 /// A commit's records, as the server read them.
@@ -462,6 +465,7 @@ pub fn standing(j: &Journey, now: i64) -> Standing {
 pub fn standing_as(j: &Journey, now: i64, yours: bool) -> Standing {
     let pips = pips(j, now);
     let (stand, line) = match &j.review {
+        Some(Review { superseded_by: Some(_), fixed_in: Some(v), .. }) => (Stand::Fixed, format!("Fixed in {v}")),
         Some(Review { superseded_by: Some(by), .. }) => (Stand::Superseded, format!("Replaced by {by}")),
         Some(r) => ranked(j, r, yours),
         None => stand_and_line(j),
@@ -694,7 +698,7 @@ mod tests {
     fn under_review(state: ReviewState, turn: &[&str], about: &str) -> Journey {
         let mut j = landed(Author::Person("sam".into()));
         j.land = Land::NotYet;
-        j.review = Some(Review { state, turn: turn.iter().map(|t| t.to_string()).collect(), author: "user:sam".into(), open: Kinds::default(), conflicts: 0, fixing: None, about: about.into(), superseded_by: None });
+        j.review = Some(Review { state, turn: turn.iter().map(|t| t.to_string()).collect(), author: "user:sam".into(), open: Kinds::default(), conflicts: 0, fixing: None, about: about.into(), superseded_by: None, fixed_in: None });
         j
     }
 
@@ -828,6 +832,18 @@ mod tests {
                 assert_eq!((s.stand, s.line.as_str()), (Stand::Superseded, "Replaced by v6"), "{state:?}, yours: {yours}");
             }
         }
+    }
+
+    /// W26-R18: a revision whose threads were handed off to its author's agent, replaced since by
+    /// that agent's fix, says which version fixed it.
+    #[test]
+    fn w26_r18_a_handed_off_revision_says_which_version_fixed_it() {
+        let mut j = under_review(ReviewState::Fixing, &[], "kim's thread");
+        if let Some(r) = j.review.as_mut() {
+            (r.superseded_by, r.fixed_in) = (Some("v6".into()), Some("v6".into()));
+        }
+        let s = standing_as(&j, 0, false);
+        assert_eq!((s.stand, s.line.as_str()), (Stand::Fixed, "Fixed in v6"));
     }
 
     #[test]

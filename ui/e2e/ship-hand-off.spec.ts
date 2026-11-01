@@ -3,8 +3,10 @@
  * person's failed commit offers Hand off first, then Retry; handed off, its failure is on the agent
  * the repository has attached (ci-doctor) and its row says so, with Retry alone. An agent's change
  * hands its open thread to its author's agent; its row then reads that agent at work, with no Hand
- * off and Review pair. The row holds its height throughout. What a browser hands off is its own
- * (the mock keeps it by user agent), reset before and after.
+ * off and Review pair. An agent's stacked diff and change request alike hand both their threads
+ * over, read fixing, and once the agent's fix is in, the handed revision says "Fixed in v2", folded
+ * under v2. The row holds its height throughout. What a browser hands off is its own (the mock
+ * keeps it by user agent), reset before and after.
  */
 import { expect, test, type Page } from "@playwright/test";
 
@@ -53,6 +55,43 @@ test("a change's open thread goes to its author's agent, and its row reads that 
     await page.request.post("/api/mock/ship/hand-off?reset=1");
   }
 });
+
+/** A row's own line (its head), whose height holds while what it says changes. */
+const headHeight = async (row: ReturnType<typeof rowOf>) => (await row.locator(":scope > .ship-r").boundingBox())?.height ?? 0;
+
+for (const [kind, name, title, sha] of [
+  ["diff", "D45", "matrix: cap the expansion", "d5".repeat(20)],
+  ["request", "CR15", "sched: cap a share", "c5".repeat(20)],
+] as const) {
+  test(`w26_r18 an agent's ${kind === "diff" ? "stacked diff" : "change request"} hands both its threads to its agent, reads fixing, then fixed in v2`, async ({ page }) => {
+    await page.request.post("/api/mock/ship/hand-off?reset=1");
+    await page.request.post(`/api/mock/ship/arrive?agent=${kind}`);
+    try {
+      await page.goto("/ship");
+      const row = rowOf(page, title);
+      await expect(row).toContainText(name);
+      await expect(row).toContainText("kim: what caps it? · 2 threads");
+      const before = await headHeight(row);
+
+      await row.getByRole("button", { name: "Hand off" }).click();
+      await expect(row).toContainText("matrix fixing · 2 threads");
+      await expect(row.getByRole("button", { name: "Hand off" })).toHaveCount(0);
+      expect(await headHeight(row)).toBe(before);
+
+      // The agent's fix is in: v2 on top, the handed revision folded under it, saying which version fixed it.
+      expect((await page.request.post(`/api/mock/ship/fixed?sha=${sha}`)).status()).toBe(200);
+      await page.reload();
+      const tip = rowOf(page, title);
+      await expect(tip).toContainText("Checks running");
+      expect(await headHeight(tip)).toBe(before);
+      await tip.getByRole("button", { name: new RegExp(`Show 1 more commit of ${name}`) }).click();
+      await expect(tip.getByRole("list", { name: `The other commits of ${name}` })).toContainText("Fixed in v2");
+    } finally {
+      await page.request.post("/api/mock/ship/hand-off?reset=1");
+      await page.request.post("/api/mock/ship/arrive?clear=1");
+    }
+  });
+}
 
 test("asked again, Hand off says there's nothing open to hand", async ({ page }) => {
   await page.request.post("/api/mock/ship/hand-off?reset=1");

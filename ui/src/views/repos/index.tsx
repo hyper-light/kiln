@@ -52,7 +52,8 @@ const CHIPS = 3;
 
 /**
  * The page's toggles, in the URL: which form is open (`?add=1`, `?sync=1`), a kind to show
- * (`?show=built|synced`, until the filter changes) and a repository to open (`?repo=<key>`).
+ * (`?show=built|synced`, until the filter changes), a repository to open (`?repo=<key>`, or its
+ * name) and a section of it to bring into view (`&section=review`, as Ship's agent fixes links).
  */
 function useRepoParams() {
   const [params, setParams] = useSearchParams();
@@ -64,7 +65,7 @@ function useRepoParams() {
     }
     setParams(n, { replace: true });
   };
-  return { adding: params.get("add") === "1", syncing: params.get("sync") === "1", show: params.get("show"), repo: params.get("repo"), set };
+  return { adding: params.get("add") === "1", syncing: params.get("sync") === "1", show: params.get("show"), repo: params.get("repo"), section: params.get("section"), set };
 }
 
 /** The Sync section, opened on one repo's activity, brought into view. */
@@ -119,7 +120,7 @@ export default function Repos() {
 }
 
 function ReposBody() {
-  const { adding, syncing, show, repo, set } = useRepoParams();
+  const { adding, syncing, show, repo, section, set } = useRepoParams();
   warm(reposRes, recentRunsRes(200), syncRes, placesRes);
   const repos = useRepos();
   const lastRuns = useRecentRuns(200).data;
@@ -134,10 +135,9 @@ function ReposBody() {
   };
   const [q, setQ] = React.useState("");
   const [opened, setOpened] = React.useState<Panel | null>(null);
-  const open: Panel | null = opened ?? (repo ? { key: repo, what: "details" } : null);
   const setOpen = (p: Panel | null) => {
     setOpened(p);
-    if (repo) set({ repo: null });
+    if (repo || section) set({ repo: null, section: null });
   };
   const [polling, setPolling] = React.useState<Set<string>>(new Set());
   const [notice, setNoticeState] = React.useState<Notice>(null);
@@ -148,6 +148,9 @@ function ReposBody() {
   };
 
   const entries = React.useMemo(() => entriesOf(places.data, repos.data, sync.data, lastRuns), [places.data, repos.data, sync.data, lastRuns]);
+  // The repository the URL names, by its key or its name (the one kiln builds first).
+  const asked = repo ? (entries.find((e) => e.key === repo) ?? entries.find((e) => e.built?.name === repo) ?? entries.find((e) => e.name === repo))?.key : undefined;
+  const open: Panel | null = opened ?? (repo ? { key: asked ?? repo, what: "details" } : null);
   const machines = React.useMemo(() => new Map(places.data.machines.map((m) => [m.name, m])), [places.data]);
   const machineNames = React.useMemo(() => [...machines.keys()].sort(), [machines]);
   const dims = React.useMemo(() => new Map(entries.map((e) => [e.key, dimsOf(e, machines)])), [entries, machines]);
@@ -324,6 +327,7 @@ function ReposBody() {
                       }}
                       onChange={changed}
                       onActivity={(id) => showActivity(set, id)}
+                      reveal={!opened ? section : null}
                     />
                   )}
                 </Row>
@@ -566,6 +570,7 @@ function Details({
   onDeleted,
   onChange,
   onActivity,
+  reveal,
 }: {
   entry: Entry;
   machines: Map<string, PlaceMachine>;
@@ -579,6 +584,8 @@ function Details({
   onChange: () => void;
   /** Open the Sync section on a synced repo's activity. */
   onActivity: (repo: string) => void;
+  /** The section the URL brings into view (`review`). */
+  reveal?: string | null;
 }) {
   const r = e.built;
   return (
@@ -625,7 +632,7 @@ function Details({
       {r && (
         // Whether agents fix code from agents' feedback (W26-R18): off until someone who lands turns it on.
         <Loadable label="its review" fallback={<Hold height={112} />}>
-          <RepoReview repo={r.name} />
+          <RepoReview repo={r.name} reveal={reveal === "review"} />
         </Loadable>
       )}
       {!e.key.startsWith("here:") && (

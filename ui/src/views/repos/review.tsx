@@ -12,7 +12,11 @@ import { errorMessage } from "@/lib/hooks";
 /** Why someone who can't change the switch can't. */
 export const CANT_CHANGE = "Only someone who can land its changes (diffs.land) turns it on or off.";
 
-export function RepoReview({ repo }: { repo: string }) {
+/** Brings the section into view as it's drawn, when Ship's agent fixes linked to it. */
+const revealHere = (el: HTMLElement | null) => el?.scrollIntoView({ block: "center" });
+
+/** `reveal`: the URL asked for this section, so it's brought into view as it's drawn. */
+export function RepoReview({ repo, reveal }: { repo: string; reveal?: boolean }) {
   const res = useRes(agentFixesRes(repo));
   const v = res.data;
   // What it's being turned to, until the server says it is.
@@ -34,7 +38,7 @@ export function RepoReview({ repo }: { repo: string }) {
     }
   };
   return (
-    <section className="repo-section" aria-label="Review">
+    <section className="repo-section" aria-label="Review" ref={reveal ? revealHere : undefined}>
       <h4 className="field-label">Review</h4>
       <button
         type="button"
