@@ -806,6 +806,30 @@ impl Core {
         self.own_kept
     }
 
+    /// How `by` left the files it changed in its repository's working trees (Compare's agent
+    /// points, `crate::workspace::git::Point::Agent`): each as the next one to change it found it,
+    /// or as it is now where `by` was the latest, or where how it left it isn't known.
+    pub fn version_of(&self, by: &str) -> Vec<crate::workspace::git::LeftFile> {
+        use crate::workspace::git::{Left, LeftFile};
+        let mut out = Vec::new();
+        for (abs, change) in &self.changes {
+            if change.tree.is_none() || !change.by.iter().any(|b| b == by) {
+                continue;
+            }
+            let after = match self.turns.get(abs) {
+                Some(Some(turns)) => turns.iter().rposition(|t| t.by == by).and_then(|i| turns.get(i + 1)).map(|t| &t.before),
+                _ => None,
+            };
+            let left = match after {
+                Some(Began::Text(t)) => Left::Text(t.clone()),
+                Some(Began::Absent) => Left::Absent,
+                _ => Left::Now,
+            };
+            out.push(LeftFile { path: change.path.clone(), abs: abs.clone(), left });
+        }
+        out
+    }
+
     /// Ask, off the event loop, what `by` did alone to each file they changed that another did too
     /// (`Command::OwnEdits`): answered to `client` (`super::diff::own_edits`). Files only they
     /// changed need nothing: their change is the session's.

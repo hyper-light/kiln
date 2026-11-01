@@ -33,6 +33,8 @@ export type { Command } from "./Command";
 export type { Comment } from "./Comment";
 export type { CommitLog } from "./CommitLog";
 export type { Compacting } from "./Compacting";
+export type { CompareRefs } from "./CompareRefs";
+export type { Compared } from "./Compared";
 export type { ConflictChange } from "./ConflictChange";
 export type { Control } from "./Control";
 export type { ControlKind } from "./ControlKind";

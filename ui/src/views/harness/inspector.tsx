@@ -27,6 +27,7 @@ import { WorkspaceBar } from "./workspace-bar";
 import { SubagentOutput } from "./task-output";
 import { SessionChanges, inScope, useScope, type OwnSource, type Sub } from "./changes";
 import type { CommitsSource } from "./commits";
+import type { CompareSource } from "./compare";
 
 const NO_EVENTS: HEvent[] = [];
 const NO_AGENTS: readonly AgentInfo[] = [];
@@ -98,6 +99,11 @@ export const Changes = React.memo(function Changes({
   const files = React.useMemo(() => (changes ? fromServer(changes) : (local ?? [])), [changes, local]);
   // Its branch's commits, asked of its machine (Commits).
   const commits = React.useMemo<CommitsSource | undefined>(() => (agentId ? { id: agentId, ask: (picks, branch) => harnessApi.commits(agentId, picks, branch) } : undefined), [agentId]);
+  // What it has to compare, and two points compared, asked of its machine (Compare).
+  const compare = React.useMemo<CompareSource | undefined>(
+    () => (agentId ? { id: agentId, refs: () => harnessApi.refs(agentId), compare: (from, to, split, path) => harnessApi.compare(agentId, from, to, split, path) } : undefined),
+    [agentId],
+  );
   const wsBar = agentId && volumeOver ? <WorkspaceBar agentId={agentId} over={volumeOver} /> : null;
   if (files.length === 0)
     return (
@@ -114,7 +120,7 @@ export const Changes = React.memo(function Changes({
           <ChangeBar agentId={agentId} />
         </Loadable>
       )}
-      <SessionChanges files={files} cwd={cwd} self={self} subs={subs} own={own} commits={commits} />
+      <SessionChanges files={files} cwd={cwd} self={self} subs={subs} own={own} commits={commits} compare={compare} />
     </div>
   );
 });

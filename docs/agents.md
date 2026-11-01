@@ -622,6 +622,8 @@ code-mode function (`kiln.agents.start`) and, from a kiln shell, a CLI command.
 | `agents.changes` | `GET /api/harness/changes` | `agent?` → `{changes: [Change]}`, newest first |
 | `agents.workspace` | `GET /api/harness/agents/:id/workspace` | → `{workspace: {kind, over, sub, volume, mount} \| null, drift: [path]}` ("Workspaces of their own", below) |
 | `agents.commits` | `GET /api/harness/agents/:id/commits?picks=&branch=&trunk=` | → `{log: {top, head, branch, trunk, base, dirty: {files, added, removed} \| null, commits: [{sha, parents, subject, author, at, files, added, removed, session}], more, told, branches, listed}, picked: {from, files: [FileChange], needs: {pick, commit, subject}} \| null}` ("Commits", below) |
+| `agents.refs` | `GET /api/harness/agents/:id/refs` | → `{refs: {branches, tags, commits: [{sha, subject, at, ...}], trunk}}` ("Compare", below) |
+| `agents.compare` | `GET /api/harness/agents/:id/compare?from=&to=&split=&path=` | → `{compared: {files: [FileChange], counts_only, split, changed_by: {path: [who]}}}`; a point is `now`, `began`, `agent:<who>` or a branch, tag or commit ("Compare", below) |
 | `agents.land` | `POST /api/harness/agents/:id/land` | `{}` → `{plan, excludes, can_write, why_not?}`; `{manifest}` (that plan's; a person only) → `{landed}`, or `{changed, plan, …}` with nothing written when the plan isn't that one any more |
 
 Each takes an input type of its own (`crate::ops::Input`), as every operation of the registry
@@ -843,7 +845,7 @@ agents"). Its head says what's shown, a row each, each choice in a menu:
 
 - **Session**: the files it changed since it began, each against how it was before.
 - **Commits**: its branch's commits, and what the picked ones change together (see "Commits").
-  Compare is turned off: not in this version of kiln yet.
+- **Compare**: what changes from one point to another (see "Compare").
 - **Scope**: Project at first, then User, then All (see "Who changed a file, and whose it is"). The
   browser keeps the choice.
 - **By**: everyone, the agent itself, or one of its harness's subagents, each with how many of the
@@ -879,6 +881,28 @@ included) is on top. Its machine answers, in the working tree its work is in (`a
 
 A runner answers only with `CAP_WORKSPACE_COMMITS` (docs/wire.md). Without it, or in a folder that
 isn't a repository, Commits is turned off, saying why.
+
+## Compare
+
+The Changes tab's Compare shows what changes from one point to another, From and To each picked in
+place from a list that filters as you type:
+
+- **This session:** Now (the folder as it is, untracked files too, as `git add -A` would take it,
+  in a scratch index beside the folder), Before it began (the commit it began at, `started_head`),
+  and each agent's version: the agent itself or one of its subagents, its files as it left them
+  (see "One subagent's own edits") over how the folder was as the session began. Only its machine
+  knows how they left them, so the server's own agents' versions are refused, saying so.
+- **Elsewhere:** its repository's branches (its own, then its remote's), tags and latest commits
+  (`agents.refs`).
+- **Between commits**, "Only what To adds since they split" (git's three-dot diff) is on at first;
+  it sits in the head's menu with Swap. Two agents' versions compare plainly, From → To, each
+  file's line naming who of them changed it, or saying both did.
+- **Large compares** (past 300 files or 20,000 lines) come as counts first, and a file's lines once
+  it's opened (`agents.compare` with `path`).
+
+From is its trunk at first, To is Now. A runner answers only with `CAP_WORKSPACE_COMPARE`
+(docs/wire.md); without it, or in a folder that isn't a repository, Compare is turned off, saying
+why.
 
 ## Who changed a file, and whose it is
 

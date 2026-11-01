@@ -17,6 +17,7 @@ import { relativeTime } from "@/lib/format";
 import { DiffStat, FileDiffView } from "./diff";
 import { diffStats, relPath, type ChangedFile } from "./derive";
 import { CommitsMode, CommitsView, type CommitsSource } from "./commits";
+import { CompareMode, CompareView, type CompareSource } from "./compare";
 import "./changes.css";
 
 /** Whose files a scope shows: this project's; everything changed for the person; the agents' own too. */
@@ -190,11 +191,11 @@ export function sortRows(rows: Row[], sort: SortKey, who?: (r: Row) => number): 
   return rows.sort((a, b) => band(a) - band(b) || order[sort](a, b));
 }
 
-/** What the tab shows: the session's changes, picked commits', or (its own step) two points compared. */
-export type Mode = "session" | "commits";
+/** What the tab shows: the session's changes, picked commits', or two points compared. */
+export type Mode = "session" | "commits" | "compare";
 
-/** The head's first row: what it shows, in the composer's mode words, and Sort at its right edge. Commits is turned off, saying why, where its machine can't list them (`commits`, read through Suspense). */
-export function ModeRow({ mode, onMode, commits }: { mode: Mode; onMode: (m: Mode) => void; commits?: React.ReactNode }) {
+/** The head's first row: what it shows, in the composer's mode words, and Sort at its right edge, its menu with what the view adds (`menu`). Commits and Compare are turned off, saying why, where its machine can't answer them (`commits`, `compare`, read through Suspense). */
+export function ModeRow({ mode, onMode, commits, compare, menu }: { mode: Mode; onMode: (m: Mode) => void; commits?: React.ReactNode; compare?: React.ReactNode; menu?: React.ReactNode }) {
   const [sort, setSort] = usePref<SortKey>("kiln.changes.sort", "path");
   const sortOf = SORTS.find((s) => s.id === sort);
   return (
@@ -208,9 +209,11 @@ export function ModeRow({ mode, onMode, commits }: { mode: Mode; onMode: (m: Mod
             Commits
           </button>
         )}
-        <button type="button" role="radio" aria-checked="false" disabled title="Not in this version of kiln yet">
-          Compare
-        </button>
+        {compare ?? (
+          <button type="button" role="radio" aria-checked="false" disabled title="Not in this version of kiln yet">
+            Compare
+          </button>
+        )}
       </div>
       <DropdownMenu.Root>
         <DropdownMenu.Trigger asChild>
@@ -235,6 +238,7 @@ export function ModeRow({ mode, onMode, commits }: { mode: Mode; onMode: (m: Mod
                 </DropdownMenu.RadioItem>
               ))}
             </DropdownMenu.RadioGroup>
+            {menu}
           </DropdownMenu.Content>
         </DropdownMenu.Portal>
       </DropdownMenu.Root>
@@ -242,7 +246,7 @@ export function ModeRow({ mode, onMode, commits }: { mode: Mode; onMode: (m: Mod
   );
 }
 
-/** The files a view shows, a flat list, each saying on the line under it what `line` says, and below them the picked one's diff (every one's, none picked). `notes`: what's said under a file's diffs; `pending`: files whose numbers wait for an answer. */
+/** The files a view shows, a flat list, each saying on the line under it what `line` says, and below them the picked one's diff (every one's, none picked). `notes`: what's said under a file's diffs; `pending`: files whose numbers wait for an answer; `diffOf`: a file's diff where the view reads it itself (`alone`: it's the one picked). */
 export function FileList({
   rows,
   line,
@@ -251,6 +255,7 @@ export function FileList({
   none,
   notes,
   pending,
+  diffOf,
 }: {
   rows: Row[];
   line: (r: Row) => string;
@@ -259,6 +264,7 @@ export function FileList({
   none: string;
   notes?: Map<string, string | undefined>;
   pending?: Set<string>;
+  diffOf?: (r: Row, alone: boolean) => React.ReactNode;
 }) {
   const picked = sel !== null && rows.some((r) => r.key === sel) ? sel : null;
   const shown = picked ? rows.filter((r) => r.key === picked) : rows;
@@ -310,18 +316,20 @@ export function FileList({
       <div className="hx-stack">
         {shown.map((r) => (
           <React.Fragment key={r.key}>
-            {r.file.edits.map((e, i) => (
-              <div key={`${r.key}-${i}`}>
-                {r.file.edits.length > 1 && (
-                  <div className="hx-dim mb-1 text-[11px]">
-                    edit {i + 1} of {r.file.edits.length}
-                    {e.call?.status === "error" ? " · failed" : ""}
-                  </div>
-                )}
-                <FileDiffView diff={e.diff} label={r.tree ? `${treeWord(r.tree)}: ${r.name}` : r.name} defaultOpen={shown.length <= 4} />
-                {r.file.truncated && <div className="hx-dim mt-1 text-[11px]">Diff shortened — the file changed a lot.</div>}
-              </div>
-            ))}
+            {diffOf && diffOf(r, picked !== null)}
+            {!diffOf &&
+              r.file.edits.map((e, i) => (
+                <div key={`${r.key}-${i}`}>
+                  {r.file.edits.length > 1 && (
+                    <div className="hx-dim mb-1 text-[11px]">
+                      edit {i + 1} of {r.file.edits.length}
+                      {e.call?.status === "error" ? " · failed" : ""}
+                    </div>
+                  )}
+                  <FileDiffView diff={e.diff} label={r.tree ? `${treeWord(r.tree)}: ${r.name}` : r.name} defaultOpen={shown.length <= 4} />
+                  {r.file.truncated && <div className="hx-dim mt-1 text-[11px]">Diff shortened — the file changed a lot.</div>}
+                </div>
+              ))}
             {notes?.get(r.key) && <div className="hx-dim mt-1 text-[11px]">{notes.get(r.key)}</div>}
           </React.Fragment>
         ))}
@@ -331,7 +339,23 @@ export function FileList({
 }
 
 /** `files`: the session's changeset. `self`: the agent's name; `subs`: its harness's subagents, in the order they began. `own`: where one's own part of a file comes from; `commits`, its branch's commits. */
-export function SessionChanges({ files, cwd, self, subs, own, commits }: { files: ChangedFile[]; cwd: string; self: string; subs: readonly Sub[]; own?: OwnSource; commits?: CommitsSource }) {
+export function SessionChanges({
+  files,
+  cwd,
+  self,
+  subs,
+  own,
+  commits,
+  compare,
+}: {
+  files: ChangedFile[];
+  cwd: string;
+  self: string;
+  subs: readonly Sub[];
+  own?: OwnSource;
+  commits?: CommitsSource;
+  compare?: CompareSource;
+}) {
   const [mode, setMode] = React.useState<Mode>("session");
   const [scope, setScope] = useScope();
   const [sort] = usePref<SortKey>("kiln.changes.sort", "path");
@@ -381,8 +405,22 @@ export function SessionChanges({ files, cwd, self, subs, own, commits }: { files
       <CommitsMode source={commits} on={mode === "commits"} onPick={() => setMode("commits")} />
     </React.Suspense>
   );
-  const modeRow = <ModeRow mode={mode} onMode={setMode} commits={commitsMode} />;
+  // Compare: on once its machine has said what it has to compare.
+  const compareMode = compare && (
+    <React.Suspense
+      fallback={
+        <button type="button" role="radio" aria-checked="false" disabled title="Asking its machine what it has to compare">
+          Compare
+        </button>
+      }
+    >
+      <CompareMode source={compare} on={mode === "compare"} onPick={() => setMode("compare")} />
+    </React.Suspense>
+  );
+  const head = (menu: React.ReactNode) => <ModeRow mode={mode} onMode={setMode} commits={commitsMode} compare={compareMode} menu={menu} />;
+  const modeRow = head(null);
   if (mode === "commits" && commits) return <CommitsView source={commits} cwd={cwd} head={modeRow} />;
+  if (mode === "compare" && compare) return <CompareView source={compare} cwd={cwd} head={head} self={self} subs={subs} />;
 
   const line = (r: Row): string => {
     const ids = r.file.by ?? [];

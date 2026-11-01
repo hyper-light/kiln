@@ -74,6 +74,9 @@ fn roots(c: &mut Collect<'_>) {
     // The Changes tab's Commits (`agents.commits`).
     c.visit::<crate::workspace::git::Log>();
     c.visit::<crate::workspace::git::Picked>();
+    // Compare (`agents.refs`, `agents.compare`).
+    c.visit::<crate::workspace::git::Refs>();
+    c.visit::<crate::workspace::git::Compared>();
 }
 
 /// Every file as it should be, by its name in [`dir`], the index among them.

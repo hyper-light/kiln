@@ -368,6 +368,98 @@
 .cx-commits + .cx-files {
   margin-top: 0;
 }
+/* Compare (compare.tsx): From and To picked in place, the list under its row in the head, on the
+   head's grid (a point's icon under the values' icons); a filter line on top. */
+.cx-pick {
+  margin: 0 -14px;
+  border-top: 1px solid #15171a;
+  background: #0b0c0e;
+}
+.cx-filter {
+  display: block;
+  width: 100%;
+  height: 40px;
+  padding: 0 14px 0 58px;
+  border: 0;
+  border-bottom: 1px solid #1f2125;
+  outline: 0;
+  background: transparent;
+  color: #e4e5e7;
+  font-size: 12.5px;
+}
+.cx-filter::placeholder {
+  color: #6d7078;
+}
+.cx-pick .cx-menu-label {
+  padding: 8px 14px 4px 58px;
+}
+.cx-ref {
+  position: relative;
+  display: grid;
+  grid-template-columns: 44px 21px minmax(0, 1fr) auto;
+  align-items: center;
+  width: 100%;
+  min-height: 36px;
+  padding: 0 14px;
+  color: #e4e5e7;
+  font-size: 12px;
+  text-align: left;
+}
+.cx-ref > svg {
+  grid-column: 2;
+  color: #8b8e96;
+}
+.cx-ref:hover {
+  background: #0f1013;
+}
+.cx-ref[aria-pressed="true"] {
+  background: rgb(186 176 227 / 7%);
+}
+.cx-ref[aria-pressed="true"]::before {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 2px;
+  background: #bab0e3;
+  opacity: 0.85;
+  content: "";
+}
+.cx-ref-t {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cx-ref-t em {
+  padding-left: 8px;
+  color: #7d808a;
+  font-style: normal;
+}
+.cx-ref small {
+  padding-left: 12px;
+  color: #6d7078;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  white-space: nowrap;
+}
+.cx-pick-none {
+  padding: 12px 14px 12px 58px;
+  color: #8b8e96;
+  font-size: 12px;
+}
+.cx-note {
+  margin: 0 -14px;
+  padding: 10px 14px;
+  border-bottom: 1px solid #17191d;
+  color: #8b8e96;
+  font-size: 11.5px;
+}
+.cx-menu-sep {
+  height: 1px;
+  margin: 4px 0;
+  background: #1f2125;
+}
 /* Its menus: Mission control's Actions menu's look, an item's what-it-is under its name. */
 .cx-menu {
   width: min(330px, calc(100vw - 28px));

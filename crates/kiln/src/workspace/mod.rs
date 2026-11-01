@@ -125,6 +125,24 @@ pub enum Ask {
     },
     /// Experiment `experiment` is over: its worktrees go ([`measure::unmeasure`]).
     Unmeasure { experiment: String },
+    /// Its repository's branches, tags and latest commits, for Compare's pickers ([`git::refs`]).
+    /// Only a runner with [`crate::proto::CAP_WORKSPACE_COMPARE`] is asked.
+    Refs,
+    /// What changes from one point to another ([`git::compare`]): the Changes tab's Compare. An
+    /// agent's point is its files as it left them, which only its machine knows (`versions`).
+    Compare {
+        from: git::Point,
+        to: git::Point,
+        /// From where they split (git's three-dot).
+        #[serde(default)]
+        split: bool,
+        /// One file alone, its lines whatever the compare's size.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        /// The commit its session began at.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since_head: Option<String>,
+    },
     /// Its branch's commits since its trunk, its session's own marked ([`git::log`]), and, with
     /// `picks`, what those commits change together ([`git::picked`]): the Changes tab's Commits.
     /// Only a runner with [`crate::proto::CAP_WORKSPACE_COMMITS`] is asked.
@@ -150,6 +168,7 @@ impl Ask {
     pub fn wide_cap(&self) -> u64 {
         match self {
             Self::Commits { .. } => crate::proto::CAP_WORKSPACE_COMMITS,
+            Self::Refs | Self::Compare { .. } => crate::proto::CAP_WORKSPACE_COMPARE,
             _ => 0,
         }
     }
@@ -223,10 +242,12 @@ pub const WAIT: Duration = Duration::from_secs(240);
 /// working tree its work is in (`work`: its folder's, or a worktree it went into,
 /// [`crate::harness::session::Info::work_dir`]), the files a finding cites under its folder
 /// (`cwd`), and its workspace `ws` when it has one of its own: `{"facts"}`, `{"made", "said"}`,
-/// `{"drift"}`, `{"plan"}`, `{"landed"}`, or `{"error"}`.
-pub async fn serve(cwd: &Path, work: &Path, ws: Option<&Workspace>, ask: Ask) -> Value {
+/// `{"drift"}`, `{"plan"}`, `{"landed"}`, or `{"error"}`. `versions`: how those who changed its
+/// files left them, for a compare of an agent's point (its session's machine knows them).
+pub async fn serve(cwd: &Path, work: &Path, ws: Option<&Workspace>, ask: Ask, versions: &git::Versions) -> Value {
     let r = match ask {
         Ask::Cite { looks } => Ok(json!({"looks": crate::research::check::local(cwd, looks).await})),
+        Ask::Compare { from, to, split, path, since_head } => git::compare(work, &from, &to, split, path.as_deref(), since_head.as_deref(), versions).await.map(|c| json!({"compared": c})),
         ask => answer(work, ws, ask).await,
     };
     match r {
@@ -276,6 +297,8 @@ async fn answer(cwd: &Path, ws: Option<&Workspace>, ask: Ask) -> anyhow::Result<
         Ask::Measured { key, stop } => Ok(measure::measured(&key, stop)),
         Ask::Unmeasure { experiment } => measure::unmeasure(cwd, &experiment).await,
         Ask::Cite { looks } => Ok(json!({"looks": crate::research::check::local(cwd, looks).await})),
+        Ask::Refs => Ok(json!({"refs": git::refs(cwd).await?})),
+        Ask::Compare { .. } => anyhow::bail!("a compare is answered with its versions (`serve`)"),
         Ask::Commits { branch, trunk, since_head, since_at, picks } => {
             let log = git::log(cwd, branch.as_deref(), trunk.as_deref(), since_head.as_deref(), since_at).await?;
             let picked = if picks.is_empty() { None } else { Some(git::picked(cwd, branch.as_deref(), &picks).await?) };

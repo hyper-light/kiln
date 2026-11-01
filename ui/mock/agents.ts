@@ -1766,6 +1766,69 @@ const MAIN_COMMITS = [
   },
 ];
 
+/** How each who changed fam-orch's files left them, as changes over how its folder was as it began (Compare's agent points). */
+const ORCH_VERSIONS: Record<string, ReturnType<typeof changed>[]> = {
+  main: [
+    changed(
+      "crates/kiln/src/plans/planner.rs",
+      [
+        "     let order = plan.steps();",
+        "-    let first = order.first();",
+        "+    let ready = order.iter().filter(|s| s.needs.is_empty());",
+        "+    let first = ready.clone().next();",
+        "     first.map(Step::start)",
+      ],
+      Date.now(),
+    ),
+    changed("crates/kiln/src/plans/mod.rs", [" pub mod planner;", "-pub mod order;", "+pub(crate) mod order;"], Date.now()),
+  ],
+  toolu_planner: [
+    changed("docs/plans.md", ["+## Steps side by side", "+", "+A step that waits for nothing starts at once; the rest wait for", "+what they need."], Date.now(), true),
+    changed("crates/kiln/src/plans/mod.rs", [" pub mod planner;", " pub mod order;", "+pub mod ready;"], Date.now()),
+  ],
+  toolu_opt: [
+    changed("crates/kiln/src/http/quic.rs", ["     let conn = endpoint.connect(addr)?;", "-    let stream = conn.open_bi().await?;", "+    let (mut send, recv) = conn.open_bi().await?;"], Date.now()),
+  ],
+};
+
+/** A change turned around: what it added, removed; new, deleted. */
+function reversed(f: ReturnType<typeof changed>): ReturnType<typeof changed> {
+  const lines = (f.hunks[0]?.lines ?? []).map((l) => (l.startsWith("+") ? `-${l.slice(1)}` : l.startsWith("-") ? `+${l.slice(1)}` : l));
+  const { created, ...rest } = f as ReturnType<typeof changed> & { created?: boolean };
+  return {
+    ...rest,
+    ...(created ? { deleted: true } : {}),
+    added: f.removed,
+    removed: f.added,
+    hunks: [{ ...(f.hunks[0] ?? { old_start: 1, new_start: 1 }), old_lines: f.hunks[0]?.new_lines ?? 0, new_lines: f.hunks[0]?.old_lines ?? 0, lines }],
+  } as ReturnType<typeof changed>;
+}
+
+/** Two points of fam-orch's compared: two agents' versions file by file, each saying who changed it; any other pair, its session's change. */
+function compareOf(a: AgentInfo, from: string, to: string, split: boolean, path?: string): Record<string, unknown> {
+  if (a.id !== "fam-orch") return { error: `${a.cwd} isn't in a git repository` };
+  const agent = (p: string) => (p.startsWith("agent:") ? p.slice(6) : null);
+  const [x, y] = [agent(from), agent(to)];
+  let files: ReturnType<typeof changed>[];
+  const changedBy: Record<string, string[]> = {};
+  if (x && y) {
+    const xs = ORCH_VERSIONS[x] ?? [];
+    const ys = ORCH_VERSIONS[y] ?? [];
+    const paths = [...new Set([...xs, ...ys].map((f) => f.path))].sort();
+    files = paths.map((p) => {
+      const fx = xs.find((f) => f.path === p);
+      const fy = ys.find((f) => f.path === p);
+      changedBy[p] = [fx && x, fy && y].filter((w): w is string => Boolean(w));
+      if (fx && fy) return { ...fy, added: fx.removed + fy.added, removed: fx.added + fy.removed, hunks: [...reversed(fx).hunks, ...fy.hunks] };
+      return fy ?? reversed(fx as ReturnType<typeof changed>);
+    });
+  } else {
+    files = [...ORCH_COMMITS[1]!.files, ...ORCH_COMMITS[0]!.files, ...ORCH_NOW].filter((f, i, all) => all.findIndex((g) => g.path === f.path) === i);
+  }
+  if (path) files = files.filter((f) => f.path === path);
+  return { compared: { files, split: split && !(x && y), ...(x && y ? { changed_by: changedBy } : {}) } };
+}
+
 /** An agent's commits and, with `picks`, what they change together: fam-orch's from its machine; another's folder isn't a repository. */
 function commitsOf(a: AgentInfo, picks: string[], branch?: string): Record<string, unknown> {
   if (a.id !== "fam-orch") return { error: `${a.cwd} isn't in a git repository` };
@@ -1943,7 +2006,7 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
     }
     return true;
   }
-  const am = p.match(/^\/api\/harness\/agents\/([^/]+)(?:\/(result|children|stop|send|interrupt|change|workspace|land|commits))?$/);
+  const am = p.match(/^\/api\/harness\/agents\/([^/]+)(?:\/(result|children|stop|send|interrupt|change|workspace|land|commits|refs|compare))?$/);
   if (!am) return false;
   const id = decodeURIComponent(am[1] ?? "");
   const what = am[2];
@@ -1966,6 +2029,28 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
       branch: changes.get(id)?.branch ?? null,
       change_request: changes.get(id) ?? null,
     });
+  } else if (what === "refs" && m === "GET") {
+    if (a.id !== "fam-orch") json(res, 409, { error: `${a.cwd} isn't in a git repository` });
+    else
+      json(res, 200, {
+        refs: {
+          branches: ["plans/side-by-side", "main", "fix/retry-storm", "origin/main", "origin/plans/side-by-side"],
+          tags: ["v0.2.0", "v0.1.9"],
+          commits: ORCH_COMMITS.map(({ files, ...c }) => ({
+            ...c,
+            parents: [],
+            author: "Release prep",
+            files: files.length,
+            added: files.reduce((n, f) => n + f.added, 0),
+            removed: files.reduce((n, f) => n + f.removed, 0),
+          })),
+          trunk: "origin/main",
+        },
+      });
+  } else if (what === "compare" && m === "GET") {
+    const q = (k: string) => url.searchParams.get(k) ?? "";
+    const answer = compareOf(a, q("from"), q("to"), q("split") !== "false", q("path") || undefined);
+    json(res, "error" in answer ? 409 : 200, answer);
   } else if (what === "commits" && m === "GET") {
     const picks = (url.searchParams.get("picks") ?? "").split(",").filter(Boolean);
     const answer = commitsOf(a, picks, url.searchParams.get("branch") ?? undefined);

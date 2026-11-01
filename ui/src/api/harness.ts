@@ -16,6 +16,8 @@ import type {
   Attachment,
   Command,
   CommitLog,
+  CompareRefs,
+  Compared,
   ControlOption,
   FileChange,
   Event as HEvent,
@@ -45,6 +47,8 @@ export type {
   Command,
   CommitLog,
   Compacting,
+  CompareRefs,
+  Compared,
   Control,
   ControlOption,
   Decision,
@@ -494,6 +498,14 @@ export const harnessApi = {
     if (branch) q.set("branch", branch);
     const qs = q.toString();
     return call<{ log: CommitLog; picked: PickedCommits | null }>("GET", `/api/harness/agents/${encodeURIComponent(id)}/commits${qs ? `?${qs}` : ""}`);
+  },
+  /** Its repository's branches, tags and latest commits, for Compare's pickers (`agents.refs`). */
+  refs: (id: string) => call<{ refs: CompareRefs }>("GET", `/api/harness/agents/${encodeURIComponent(id)}/refs`),
+  /** What changes from one point to another (`agents.compare`): `now`, `began`, `agent:<who>`, or a branch, tag or commit; `path`, one file's lines. */
+  compare: (id: string, from: string, to: string, split: boolean, path?: string) => {
+    const q = new URLSearchParams({ from, to, split: String(split) });
+    if (path) q.set("path", path);
+    return call<{ compared: Compared }>("GET", `/api/harness/agents/${encodeURIComponent(id)}/compare?${q.toString()}`);
   },
   /** What writing its workspace to its folder would do. */
   planLanding: (id: string) => call<LandingPlan>("POST", `/api/harness/agents/${encodeURIComponent(id)}/land`, {}),

@@ -451,8 +451,9 @@ takes a new bit, never one that means something already, even in the other direc
 | 40 | `CAP_CHANGES_PATCH` | `ServerMsg::Caps` | the server takes a session's changeset as what changed in it (`Update::ChangesPatch`), so a runner sends the files an agent touched, not the whole changeset |
 | 41 | `CAP_UNREAD` | `AgentMsg::Caps`, `ServerMsg::Caps` | this side takes word that a frame of its couldn't be read (`Unread`, "What can't be read") |
 | 42 | `CAP_WORKSPACE_COMMITS` | `AgentMsg::Caps` | the runner answers `Workspace`'s `commits`: a branch's commits since its trunk, its session's own marked, and what picked ones change together (agents.md, "Commits") |
+| 43 | `CAP_WORKSPACE_COMPARE` | `AgentMsg::Caps` | the runner answers `Workspace`'s `refs` and `compare`: a repository's branches, tags and latest commits, and what changes from one point to another (agents.md, "Compare") |
 
-Bits from 43 are free. Take the next one, and add its row here in the same change.
+Bits from 44 are free. Take the next one, and add its row here in the same change.
 
 ## The lab
 

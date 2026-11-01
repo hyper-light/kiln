@@ -821,6 +821,252 @@ pub async fn picked(cwd: &Path, branch: Option<&str>, picks: &[String]) -> anyho
     Ok(Picked { from, files, needs })
 }
 
+/// A point Compare's From or To picks.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Point {
+    /// The folder as it is now, untracked files too (as `git add -A` would take it).
+    Now,
+    /// As its session began: the commit its folder had checked out then.
+    Began,
+    /// A branch, a tag or a commit.
+    Ref { name: String },
+    /// One who changed its files (`main`, the agent itself, or a subagent run): the folder as its
+    /// session began, with the files it changed as it left them.
+    Agent { by: String },
+}
+
+/// One who changed files' version of one: as they left it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Left {
+    Text(std::sync::Arc<str>),
+    Absent,
+    /// As it is now: the latest to change it, or how they left it isn't known.
+    Now,
+}
+
+/// A file one who changed files left: where it is in its repository, where on disk (in whichever
+/// of its working trees), and how they left it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LeftFile {
+    pub path: String,
+    pub abs: String,
+    pub left: Left,
+}
+
+/// Each one who changed files' version of them, by who (`super::super::harness::model::FileChange::by`'s names).
+pub type Versions = std::collections::HashMap<String, Vec<LeftFile>>;
+
+/// What Compare's pickers offer of a repository besides the session's own points ([`refs`]).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "CompareRefs"))]
+pub struct Refs {
+    /// Its branches, the latest committed to first; its remote's after its own.
+    pub branches: Vec<String>,
+    pub tags: Vec<String>,
+    /// The latest commits on the branch checked out.
+    pub commits: Vec<Logged>,
+    /// Its trunk (`origin/main`), when it has one: From at first.
+    pub trunk: Option<String>,
+}
+
+/// Most of each kind [`refs`] offers.
+const REFS_MOST: usize = 50;
+
+/// `cwd`'s repository's branches (its own, then its remote's), tags and latest commits, for
+/// Compare's pickers.
+pub async fn refs(cwd: &Path) -> anyhow::Result<Refs> {
+    let f = facts(cwd).await?;
+    let top = PathBuf::from(&f.top);
+    let list = |pattern: &'static str, sort: &'static str| {
+        let mut c = git(&top);
+        c.args(["for-each-ref", sort, &format!("--count={REFS_MOST}"), "--format=%(refname:short)", pattern]);
+        c
+    };
+    let mut branches: Vec<String> = ask(list("refs/heads", "--sort=-committerdate")).await.unwrap_or_default().lines().map(str::to_owned).collect();
+    branches.extend(ask(list("refs/remotes", "--sort=-committerdate")).await.unwrap_or_default().lines().filter(|b| !b.ends_with("/HEAD")).map(str::to_owned));
+    let tags = ask(list("refs/tags", "--sort=-creatordate")).await.unwrap_or_default().lines().map(str::to_owned).collect();
+    let commits = match &f.head {
+        Some(_) => {
+            let mut c = git(&top);
+            c.args(["log", "--first-parent", "--no-renames", "--numstat", "--format=%x1e%H%x1f%P%x1f%an%x1f%ct%x1f%s", &format!("-n{REFS_MOST}"), "HEAD"]);
+            parse_log(&run(c, GIT_TIMEOUT).await?)
+        }
+        None => Vec::new(),
+    };
+    let trunk = f.default_branch.map(|b| format!("origin/{b}")).filter(|t| branches.contains(t)).or_else(|| ["origin/main", "origin/master", "main", "master"].into_iter().map(str::to_owned).find(|t| branches.contains(t)));
+    Ok(Refs { branches, tags, commits, trunk })
+}
+
+/// Two points compared ([`compare`]): what changes from one to the other.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "Compared"))]
+pub struct Compared {
+    pub files: Vec<crate::harness::model::FileChange>,
+    /// Too many to send whole: their counts only; a file's lines come when it's asked for alone.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub counts_only: bool,
+    /// Compared from where they split (git's three-dot), as asked; off where one of them isn't a
+    /// commit's (two agents' versions).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub split: bool,
+    /// For two agents' versions: of each file (by its path), which of them changed it.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub changed_by: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+/// Most files, and lines, a compare sends whole; past them, counts first.
+const COMPARE_FILES: usize = 300;
+const COMPARE_LINES: usize = 20_000;
+
+/// A point as a tree, and the commit it stands on (for where two split).
+struct Resolved {
+    tree: String,
+    commit: Option<String>,
+    /// An agent's: the paths it changed.
+    touched: Option<Vec<String>>,
+}
+
+/// `point` in `top`'s repository: `began` the commit its session began at (else the one checked
+/// out), `versions` who changed files' versions of them.
+async fn resolve(top: &Path, head: Option<&str>, began: Option<&str>, point: &Point, versions: &Versions) -> anyhow::Result<Resolved> {
+    let began = began.or(head);
+    match point {
+        Point::Now => Ok(Resolved { tree: now_tree(top, head).await?, commit: head.map(str::to_owned), touched: None }),
+        Point::Began => {
+            let b = began.ok_or_else(|| anyhow::anyhow!("its folder has no commit to say how it was as it began"))?;
+            Ok(Resolved { tree: tree_of(top, b).await?, commit: Some(b.to_owned()), touched: None })
+        }
+        Point::Ref { name } => {
+            let mut c = git(top);
+            c.args(["rev-parse", "--verify", "--quiet", &format!("{name}^{{commit}}")]);
+            let sha = ask(c).await.ok_or_else(|| anyhow::anyhow!("there's no branch, tag or commit {name} here"))?;
+            Ok(Resolved { tree: tree_of(top, &sha).await?, commit: Some(sha), touched: None })
+        }
+        Point::Agent { by } => {
+            let files = versions.get(by).ok_or_else(|| anyhow::anyhow!("how {by} left its files is known only on the machine it works on"))?;
+            let scratch = Scratch(std::env::temp_dir().join(format!("kiln-version-{}.index", crate::util::new_id())));
+            let mut c = git(top);
+            c.env("GIT_INDEX_FILE", &scratch.0);
+            match began {
+                Some(b) => c.args(["read-tree", b]),
+                None => c.args(["read-tree", "--empty"]),
+            };
+            run(c, GIT_TIMEOUT).await?;
+            for f in files {
+                match &f.left {
+                    Left::Text(t) => {
+                        let mut c = git(top);
+                        c.args(["hash-object", "-w", "--stdin"]);
+                        let blob = with_stdin(c, t.as_bytes()).await?;
+                        let mut c = git(top);
+                        c.env("GIT_INDEX_FILE", &scratch.0).args(["update-index", "--add", "--cacheinfo", &format!("100644,{blob},{}", f.path)]);
+                        run(c, GIT_TIMEOUT).await?;
+                    }
+                    Left::Absent => {
+                        let mut c = git(top);
+                        c.env("GIT_INDEX_FILE", &scratch.0).args(["update-index", "--force-remove", "--", &f.path]);
+                        run(c, GIT_TIMEOUT).await?;
+                    }
+                    Left::Now => {
+                        // As it is on disk, in whichever working tree it's in; gone, it's gone.
+                        let mut c = git(top);
+                        c.args(["hash-object", "-w", "--no-filters", "--", &f.abs]);
+                        let mut c2 = git(top);
+                        match run(c, GIT_TIMEOUT).await {
+                            Ok(blob) => c2.env("GIT_INDEX_FILE", &scratch.0).args(["update-index", "--add", "--cacheinfo", &format!("100644,{blob},{}", f.path)]),
+                            Err(_) => c2.env("GIT_INDEX_FILE", &scratch.0).args(["update-index", "--force-remove", "--", &f.path]),
+                        };
+                        run(c2, GIT_TIMEOUT).await?;
+                    }
+                }
+            }
+            let mut c = git(top);
+            c.env("GIT_INDEX_FILE", &scratch.0).arg("write-tree");
+            let tree = run(c, GIT_TIMEOUT).await?;
+            Ok(Resolved { tree, commit: began.map(str::to_owned), touched: Some(files.iter().map(|f| f.path.clone()).collect()) })
+        }
+    }
+}
+
+/// What changes from `from` to `to` in `cwd`'s repository: with `split`, from where they split
+/// (git's three-dot), where both stand on commits, never between two agents' versions; `path`:
+/// that file alone, its lines whatever the compare's size. `began`: the commit its session began
+/// at; `versions`: who changed files' versions of them.
+pub async fn compare(cwd: &Path, from: &Point, to: &Point, split: bool, path: Option<&str>, began: Option<&str>, versions: &Versions) -> anyhow::Result<Compared> {
+    let f = facts(cwd).await?;
+    let top = PathBuf::from(&f.top);
+    let head = f.head.as_deref();
+    let a = resolve(&top, head, began, from, versions).await?;
+    let b = resolve(&top, head, began, to, versions).await?;
+    let agents = a.touched.is_some() && b.touched.is_some();
+    let mut out = Compared::default();
+    let mut base = a.tree.clone();
+    if split && !agents
+        && let (Some(x), Some(y)) = (&a.commit, &b.commit)
+    {
+        let mut c = git(&top);
+        c.args(["merge-base", x, y]);
+        if let Some(m) = ask(c).await {
+            base = tree_of(&top, &m).await?;
+            out.split = true;
+        }
+    }
+    let mut c = git(&top);
+    c.args(["diff", "--no-renames", "--numstat", &base, &b.tree]);
+    let numstat = run(c, GIT_TIMEOUT).await?;
+    let (mut files, mut lines) = (0usize, 0usize);
+    for l in numstat.lines().filter(|l| !l.trim().is_empty()) {
+        let mut cols = l.split('\t');
+        files += 1;
+        lines += cols.next().unwrap_or_default().parse::<usize>().unwrap_or(0) + cols.next().unwrap_or_default().parse::<usize>().unwrap_or(0);
+    }
+    let whole = path.is_some() || (files <= COMPARE_FILES && lines <= COMPARE_LINES);
+    let mut c = git(&top);
+    c.args(["diff", "--no-renames", "--no-color", "--no-ext-diff", "--no-textconv", "-U3", &base, &b.tree]);
+    if let Some(p) = path {
+        c.args(["--", p]);
+    }
+    if whole {
+        out.files = crate::harness::diff::git_changes(&run(c, GIT_TIMEOUT).await?, &f.top, crate::util::now_ms());
+    } else {
+        // Counts first: each file as numstat says, its lines when asked for alone.
+        out.counts_only = true;
+        let mut c = git(&top);
+        c.args(["diff", "--no-renames", "--numstat", "--summary", &base, &b.tree]);
+        let text = run(c, GIT_TIMEOUT).await?;
+        let created: Vec<&str> = text.lines().filter_map(|l| l.trim().strip_prefix("create mode ")).filter_map(|l| l.split_once(' ').map(|(_, p)| p)).collect();
+        let deleted: Vec<&str> = text.lines().filter_map(|l| l.trim().strip_prefix("delete mode ")).filter_map(|l| l.split_once(' ').map(|(_, p)| p)).collect();
+        for l in text.lines().filter(|l| l.contains('\t')) {
+            let mut cols = l.split('\t');
+            let (add, del, p) = (cols.next().unwrap_or_default(), cols.next().unwrap_or_default(), cols.next().unwrap_or_default());
+            out.files.push(crate::harness::model::FileChange {
+                path: p.to_owned(),
+                tree: Some(f.top.clone()),
+                created: created.contains(&p),
+                deleted: deleted.contains(&p),
+                added: add.parse().unwrap_or(0),
+                removed: del.parse().unwrap_or(0),
+                hunks: Vec::new(),
+                truncated: true,
+                at: crate::util::now_ms(),
+                by: Vec::new(),
+                place: Some(crate::harness::model::FilePlace::Project),
+            });
+        }
+    }
+    // Two agents' versions: which of them changed each file.
+    if let (Point::Agent { by: x }, Point::Agent { by: y }, Some(ta), Some(tb)) = (from, to, &a.touched, &b.touched) {
+        for file in &out.files {
+            let who: Vec<String> = [(x, ta), (y, tb)].into_iter().filter(|(_, t)| t.contains(&file.path)).map(|(w, _)| w.clone()).collect();
+            out.changed_by.insert(file.path.clone(), who);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -1079,6 +1325,65 @@ mod tests {
             assert_eq!(counted(&now), vec![("y.txt".to_owned(), 2, 1)]);
             // A commit not on the branch's line is refused.
             assert!(picked(&top, None, &["0123456789abcdef".to_owned()]).await.is_err());
+            anyhow::Ok(())
+        })
+    }
+
+    /// Compare (the Changes panel plan 01a194444b1d, step 5): between branches that both moved since
+    /// they split, from where they split only what To adds; without, every difference.
+    #[test]
+    fn compare_between_branches_that_both_moved_splits_or_shows_every_difference() -> anyhow::Result<()> {
+        let d = repo()?;
+        let top = d.path().to_path_buf();
+        sh(&top, "git checkout -q -b feature")?;
+        commit_at(&top, "f.txt", "f\\n", "on the branch", 2_000)?;
+        sh(&top, "git checkout -q main")?;
+        commit_at(&top, "m.txt", "m\\n", "on main", 3_000)?;
+        crate::rt::block_on(async move {
+            let name = |n: &str| Point::Ref { name: n.to_owned() };
+            let files = |c: &Compared| c.files.iter().map(|f| (f.path.clone(), f.created, f.deleted)).collect::<Vec<_>>();
+            let only = compare(&top, &name("main"), &name("feature"), true, None, None, &Versions::new()).await?;
+            assert_eq!((files(&only), only.split), (vec![("f.txt".to_owned(), true, false)], true));
+            let every = compare(&top, &name("main"), &name("feature"), false, None, None, &Versions::new()).await?;
+            assert_eq!((files(&every), every.split), (vec![("f.txt".to_owned(), true, false), ("m.txt".to_owned(), false, true)], false));
+            // Now: the folder as it is, a new untracked file too.
+            sh(&top, "echo n > n.txt")?;
+            let now = compare(&top, &name("main"), &Point::Now, true, None, None, &Versions::new()).await?;
+            assert_eq!(files(&now), vec![("n.txt".to_owned(), true, false)]);
+            anyhow::Ok(())
+        })
+    }
+
+    /// Two agents' versions, each its files as it left them over how the folder was as the session
+    /// began: compared From → To plainly, each file saying which of them changed it; turned around,
+    /// what one added reads as deleted.
+    #[test]
+    fn two_agents_versions_compare_and_name_who_changed_each_file() -> anyhow::Result<()> {
+        let d = repo()?;
+        let top = d.path().to_path_buf();
+        let began = out(&top, &["rev-parse", "HEAD"])?;
+        let at = |p: &str| top.join(p).to_string_lossy().into_owned();
+        let mut versions = Versions::new();
+        versions.insert("toolu_x".into(), vec![LeftFile { path: "a".into(), abs: at("a"), left: Left::Text("x's a\n".into()) }, LeftFile { path: "new.txt".into(), abs: at("new.txt"), left: Left::Text("x's own\n".into()) }]);
+        versions.insert("toolu_y".into(), vec![LeftFile { path: "a".into(), abs: at("a"), left: Left::Text("y's a\n".into()) }, LeftFile { path: "b".into(), abs: at("b"), left: Left::Absent }]);
+        crate::rt::block_on(async move {
+            let (x, y) = (Point::Agent { by: "toolu_x".into() }, Point::Agent { by: "toolu_y".into() });
+            let c = compare(&top, &x, &y, true, None, Some(&began), &versions).await?;
+            let seen = |c: &Compared| c.files.iter().map(|f| (f.path.clone(), f.created, f.deleted, c.changed_by.get(&f.path).cloned().unwrap_or_default())).collect::<Vec<_>>();
+            assert!(!c.split, "two agents' versions compare plainly");
+            assert_eq!(
+                seen(&c),
+                vec![
+                    ("a".to_owned(), false, false, vec!["toolu_x".to_owned(), "toolu_y".to_owned()]),
+                    ("b".to_owned(), false, true, vec!["toolu_y".to_owned()]),
+                    ("new.txt".to_owned(), false, true, vec!["toolu_x".to_owned()]),
+                ]
+            );
+            // Swapped: the file only x added reads as added now, b as y's deletion undone.
+            let back = compare(&top, &y, &x, true, None, Some(&began), &versions).await?;
+            assert_eq!(back.files.iter().map(|f| (f.path.clone(), f.created, f.deleted)).collect::<Vec<_>>(), vec![("a".to_owned(), false, false), ("b".to_owned(), true, false), ("new.txt".to_owned(), true, false)]);
+            // An agent whose versions this machine doesn't keep is refused, saying why.
+            assert!(compare(&top, &Point::Agent { by: "toolu_z".into() }, &Point::Now, true, None, Some(&began), &versions).await.is_err());
             anyhow::Ok(())
         })
     }

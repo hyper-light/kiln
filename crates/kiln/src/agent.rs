@@ -2442,8 +2442,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     let work = if o.outpost { 0 } else { proto::CAP_WORK };
                     let headroom_cap = if headroom.is_some() { proto::CAP_HEADROOM } else { 0 };
                     let limit = if harness.is_some() { proto::CAP_AGENT_LIMIT } else { 0 };
-                    // Running agents, it answers what their branches' commits are (the Changes tab's Commits).
-                    let commits = if harness.is_some() { proto::CAP_WORKSPACE_COMMITS } else { 0 };
+                    // Running agents, it answers what their branches' commits are and compares two points
+                    // of their repositories (the Changes tab's Commits and Compare).
+                    let commits = if harness.is_some() { proto::CAP_WORKSPACE_COMMITS | proto::CAP_WORKSPACE_COMPARE } else { 0 };
                     if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit | proto::CAP_IDENTITY | headroom_cap | proto::CAP_UNREAD | commits }) {
                         net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                     }
@@ -2903,12 +2904,22 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         let found = harness.as_ref().and_then(|h| h.get(&session)).map(|s| {
                             let ws = s.spec.lock().workspace.clone();
                             let info = s.info();
-                            (std::path::PathBuf::from(&info.cwd), std::path::PathBuf::from(info.work_dir()), ws)
+                            // A compare of an agent's point: how it left its files, as its session keeps them.
+                            let mut versions = crate::workspace::git::Versions::new();
+                            if let crate::workspace::Ask::Compare { from, to, .. } = ask.as_ref() {
+                                let core = s.core.lock();
+                                for p in [from, to] {
+                                    if let crate::workspace::git::Point::Agent { by } = p {
+                                        versions.insert(by.clone(), core.version_of(by));
+                                    }
+                                }
+                            }
+                            (std::path::PathBuf::from(&info.cwd), std::path::PathBuf::from(info.work_dir()), ws, versions)
                         });
                         crate::rt::spawn(async move {
                             let answer = match found {
                                 None => serde_json::json!({"error": "no such agent on this machine"}),
-                                Some((cwd, work, ws)) => crate::workspace::serve(&cwd, &work, ws.as_ref(), *ask).await,
+                                Some((cwd, work, ws, versions)) => crate::workspace::serve(&cwd, &work, ws.as_ref(), *ask, &versions).await,
                             };
                             let _ = up.send(Up::Term(AgentMsg::Answer { req, json: Some(answer.to_string()) })).await;
                         });
