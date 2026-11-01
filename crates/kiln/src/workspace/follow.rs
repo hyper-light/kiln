@@ -356,12 +356,13 @@ mod tests {
             .collect()
     }
 
-    /// W26-R18: a person's comment reaches the agent with its place. Three agents (kiln's fake
+    /// W26-R18: a person's comment reaches the agent with its place. Four agents (kiln's fake
     /// harness), each with a change of its own: a branch change request, a diff of a plan run's
-    /// stack (its run over), a draft change request. On each, kim starts a thread on src/a.rs lines
-    /// 10–12 and replies in it, as kiln's events say them: the reply's event names its thread and
-    /// no place. Each agent hears both with the thread, its file and lines, the version and its
-    /// commit, and kim's words quoted as hers.
+    /// stack (its run over), a draft change request, and a draft diff of a stack (the bottom of a
+    /// stack its agent pushed with `-o draft`). On each, kim starts a thread on src/a.rs lines 10–12
+    /// and replies in it, as kiln's events say them: the reply's event names its thread and no
+    /// place. Each agent hears both with the thread, its file and lines, the version and its commit,
+    /// whether the change is a draft, and kim's words quoted as hers.
     #[cfg(unix)]
     #[test]
     fn w26_r18_a_persons_reply_reaches_the_agent_with_its_place() -> anyhow::Result<()> {
@@ -378,15 +379,18 @@ mod tests {
             let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake-claude/claude");
             hub.store.call(|c| Ok(c.execute_batch("INSERT INTO repos (id, name, clone_url, created_at) VALUES ('acme', 'acme/app', 'https://example.invalid/app.git', 1);")?)).await?;
             let mut agents = Vec::new();
-            for (n, kind, state, name) in [(1u32, "change_request", "needs-review", "CR1"), (2, "diff", "needs-review", "D2"), (3, "change_request", "draft", "CR3")] {
+            for (n, kind, state, name) in [(1u32, "change_request", "needs-review", "CR1"), (2, "diff", "needs-review", "D2"), (3, "change_request", "draft", "CR3"), (4, "diff", "draft", "D4")] {
                 let dir = tempfile::tempdir()?;
                 std::fs::write(dir.path().join(".fake-claude-messages"), "")?;
                 let env = vec![("FAKE_CLAUDE_LINES".to_owned(), "1".to_owned()), ("FAKE_CLAUDE_EVERY_MS".to_owned(), "10".to_owned())];
                 let spec = crate::harness::session::Spec { kind: "claude".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), program: Some(fake.into()), env, ..Default::default() };
                 let agent = hub.harness.open(&hub, "local", spec, 1).await.map_err(|e| anyhow::anyhow!("{e:#}"))?.into_iter().next().map(|i| i.id).ok_or_else(|| anyhow::anyhow!("nothing opened"))?;
                 let commit = n.to_string().repeat(40);
+                // D4 is a stack's, as a push with `-o draft` makes it: a draft diff in a stack of its own.
+                let (stack_row, stack_id) = if n == 4 { (format!("INSERT INTO stacks (id, repo_id, trunk, created_at) VALUES ('s{n}', 'acme', 'main', 1);"), format!("'s{n}'")) } else { (String::new(), "NULL".to_owned()) };
                 let sql = format!(
-                    "INSERT INTO diffs (id, repo_id, number, kind, title, author, author_kind, author_for, state, trunk, created_at, updated_at) VALUES ('d{n}', 'acme', {n}, '{kind}', 'change {n}', 'agent:{agent}', 'agent', 'user:kim', '{state}', 'main', 1, 1);
+                    "{stack_row}
+                     INSERT INTO diffs (id, repo_id, number, kind, title, author, author_kind, author_for, state, trunk, stack_id, created_at, updated_at) VALUES ('d{n}', 'acme', {n}, '{kind}', 'change {n}', 'agent:{agent}', 'agent', 'user:kim', '{state}', 'main', {stack_id}, 1, 1);
                      INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, message, pushed_by, created_at) VALUES ('d{n}', 1, '{commit}', 'p', 'b', 'change {n}', 'agent:{agent}', 1);
                      INSERT INTO review_threads (id, diff_id, version, file, side, start_line, end_line, state, created_by, created_at, kind) VALUES ('th{n}', 'd{n}', 1, 'src/a.rs', 'new', 10, 12, 'open', 'user:kim', 1, 'question');
                      INSERT INTO review_comments (id, thread_id, author, body, created_at, updated_at, published) VALUES ('c{n}a', 'th{n}', 'user:kim', 'why ten?', 1, 1, 1), ('c{n}b', 'th{n}', 'user:kim', 'still empty here?', 2, 2, 1);"
@@ -418,7 +422,7 @@ mod tests {
                 hub.emit(&crate::wire::events::ServerEvent::Comment(Box::new(event(&format!("c{n}b"), "still empty here?", false))));
             }
             for (n, name, _, dir) in &agents {
-                let draft = if *n == 3 { "draft " } else { "" };
+                let draft = if matches!(n, 3 | 4) { "draft " } else { "" };
                 let first = format!("kim (your person) started thread th{n} on your {draft}change {name}, on src/a.rs lines 10–12 (version 1, commit {}).", n.to_string().repeat(7));
                 let reply = format!("kim (your person) replied in thread th{n} on your {draft}change {name}, on src/a.rs lines 10–12 (version 1, commit {}).", n.to_string().repeat(7));
                 let mut got = Vec::new();
