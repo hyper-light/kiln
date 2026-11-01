@@ -52,7 +52,10 @@ animation, sound, forms.
   opaque origin, with no kiln cookies, no storage and no access to the page that frames it. It loads
   only its own files, kiln's fonts, and what it makes itself (`data:`, `blob:`). Only kiln may
   frame it, and its address is never sent on as a referrer. The conversation's frame is sandboxed
-  the same way.
+  the same way. The policy names the page's folder and kiln's fonts at the address the viewer
+  reached them at (`https://kiln.dev/v/<id>/`), beside `'self'`: in a document its frame
+  sandboxes, WebKit, every browser on iOS, matches `'self'` with nothing, and phones were refused
+  a page's own scripts, pictures and fonts.
 - **Its own address (optional).** With `[server] pages_url` set (`https://kiln-pages.example`), pages
   are served only there, and kiln's own address sends `/v/` there. Use a site of its own (another
   registrable domain, not a subdomain of kiln's) so browsers keep pages in processes apart from
