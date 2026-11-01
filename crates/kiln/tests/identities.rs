@@ -1555,7 +1555,8 @@ fn w27_ac02_keys() -> anyhow::Result<()> {
     };
     let mut keys = Vec::new();
     for f in walk(dir.path())? {
-        let name = f.to_string_lossy().into_owned();
+        // Inside the test's folder: CI's pods keep temporary folders under /work.
+        let name = format!("/{}", f.strip_prefix(dir.path()).unwrap_or(&f).to_string_lossy());
         if name.contains("/githome/") || name.contains("/tree/") || name.contains("/work") {
             continue;
         }
