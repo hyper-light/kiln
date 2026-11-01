@@ -3248,8 +3248,8 @@ fn w05_r40_a_gang_kept_off_a_runner_that_refused_it_goes_back_when_it_has_no_pla
 /// when an exclusive leg ends, the first whole only after: when it ends, the first, with room by
 /// room alone, isn't the first of the class waiting for room, so the class's room is worked out
 /// again without it; it starts then, and the second, its room kept from the first's end, after.
-/// Each counted as waiting while the other's room held it off, they took that room from each other
-/// for good, the engine never done with the input.
+/// Each counted as waiting while the other's room held it off, they took that room from each
+/// other, and neither started (in the model's seeds, the engine was never done with the input).
 #[test]
 fn w05_r40_two_whole_gangs_of_a_class_start_in_turn_not_taking_its_room_from_each_other() {
     let mut sim = Sim::new(Config { backfill: true, ..Config::default() });
