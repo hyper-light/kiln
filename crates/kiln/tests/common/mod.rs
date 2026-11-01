@@ -20,6 +20,12 @@ use serde_json::{Value, json};
 
 pub const BIN: &str = env!("CARGO_BIN_EXE_kiln");
 
+/// What a test's kiln servers and runners keep free of their volume for warm workspaces
+/// (`KILN_WARM_FLOOR`, W24-R15): nothing. Their volume is the machine's, shared with whatever else
+/// fills it, and its default floor (a tenth of it, at most 100 GiB) ran every warm leg cold on a
+/// gate's host at 70 GiB free. The floor's own tests set theirs.
+pub const WARM_FLOOR: (&str, &str) = ("KILN_WARM_FLOOR", "0");
+
 /// The value at `path` in `v` (null where there is none), as `serde_json`'s indexing gives it.
 pub fn at<'a>(v: &'a Value, path: &[&str]) -> &'a Value {
     static NULL: Value = Value::Null;
@@ -298,7 +304,7 @@ host_seconds = {host_seconds}
             _ => Command::new(BIN),
         };
         // A clean environment and a home of its own: nothing of this machine's leaks in.
-        c.env_clear().env("HOME", home).env("LANG", "C.UTF-8").env("RUST_LOG", "info,kiln::observe=debug").env("KILN_LOG", "info,kiln::observe=debug");
+        c.env_clear().env("HOME", home).env("LANG", "C.UTF-8").env("RUST_LOG", "info,kiln::observe=debug").env("KILN_LOG", "info,kiln::observe=debug").env(WARM_FLOOR.0, WARM_FLOOR.1);
         #[cfg(not(windows))]
         c.env("PATH", "/usr/local/bin:/usr/bin:/bin");
         // Windows: the profile is the home kiln reads first, a process needs its system's folders,
@@ -1059,11 +1065,18 @@ fn start_full(dir: &Path, o: &Options<'_>, https: bool, cd: bool, env: &[(&str, 
 /// `GIT_CONFIG_GLOBAL` (ci/gate.sh's own empty file) would reach its jobs' steps, where
 /// `actions/checkout` writes credentials to the global configuration and then edits
 /// `$HOME/.gitconfig` under a home of its own ("Unable to replace auth placeholder", W14-AC05).
+/// Its warm workspaces keep no floor of the machine's volume ([`WARM_FLOOR`]).
 fn server_command(dir: &Path, log: std::fs::File) -> anyhow::Result<Command> {
     let home = dir.join("home");
     std::fs::create_dir_all(&home)?;
     let mut cmd = kiln();
-    cmd.args(["--config", &dir.join("kiln.toml").to_string_lossy(), "server"]).env("HOME", &home).env_remove("GIT_CONFIG_GLOBAL").env("NO_COLOR", "1").stdout(log.try_clone()?).stderr(log);
+    cmd.args(["--config", &dir.join("kiln.toml").to_string_lossy(), "server"])
+        .env("HOME", &home)
+        .env_remove("GIT_CONFIG_GLOBAL")
+        .env("NO_COLOR", "1")
+        .env(WARM_FLOOR.0, WARM_FLOOR.1)
+        .stdout(log.try_clone()?)
+        .stderr(log);
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     Ok(cmd)

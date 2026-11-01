@@ -70,6 +70,7 @@ pub fn runner_env(dir: &Path, port: u16, name: &str, chaos: Option<&str>, talk: 
         // Git's global configuration its home's, as a server's is (`common::server_command`).
         .env_remove("GIT_CONFIG_GLOBAL")
         .env("NO_COLOR", "1")
+        .env(super::WARM_FLOOR.0, super::WARM_FLOOR.1)
         .env("FAKE_CLAUDE_LINES", talk.lines.to_string())
         .env("FAKE_CLAUDE_EVERY_MS", talk.every_ms.to_string())
         .envs(env.iter().copied())
