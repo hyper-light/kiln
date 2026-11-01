@@ -132,6 +132,12 @@ link drops — its server connection, the server, the other runner's — it open
 waits for its asker 15 minutes without a link (`linger`), then is stopped. A link quiet for 15 s
 is pinged; at 45 s it is replaced.
 
+A detached run (`--detach`, §4.2) waits for no one: it asks for a linger of for ever
+(`wire::DETACHED`), and once it holds 16 MiB of output with no link up, or with none of it taken for
+10 s, its oldest output gives way (counted in its exit's `lost`, and an asker that comes back sees
+the jump in offsets) instead of the command waiting. A runner from before keeps it as long, but
+makes it wait on its output as on any run's.
+
 Nothing on the runner waits on reach (its input is unbounded, bounded in practice by the windows),
 and reach never waits on the runner: output to the server is batched, many messages per frame.
 
@@ -156,6 +162,12 @@ people's tools live on), plus `KILN_REACH_FROM=<asking runner>`. A named shell (
 tool's `shell`) carries its working folder and exported variables from one run to the next.
 Signals: Ctrl-C on `kiln run` goes over as SIGINT; a client that goes away stops its run
 (SIGTERM, then SIGKILL after 5 s) unless it said `--detach`. `--timeout` stops it too.
+
+`--detach` keeps the command running to its end whatever becomes of `kiln run`: Ctrl-C or SIGTERM
+on it, or its going away, leaves the command running, on another runner or on its own. The asking
+runner follows a detached run on alone: it takes its output and lets it go, so the run never waits
+on it, and it makes the link again after a drop, so the doer never waits for it either; it forgets
+the run when the run ends. It isn't a run an upgrade of the asking runner waits for.
 
 ## 5. Sync
 
