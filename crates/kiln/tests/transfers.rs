@@ -1154,31 +1154,77 @@ fn w27_ac04_approval_carried() -> anyhow::Result<()> {
 /// run ([`synced_runs`]). Each signed by both sides and walking unbroken, and each changed on its
 /// way (a test build's faults: box-b's `peer_object_changed` and `feed_changed`, the server's
 /// `blob_changed`, box-d's `sync_file_changed`) refused where it would be used and recorded as a
-/// break at its hop.
+/// break at its hop. Failing, it keeps its folder (the server's and each box's logs and state) and
+/// says where.
 #[cfg(feature = "chaos")]
 #[test]
 fn w27_r08_custody_between_machines() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
+    match between_machines(dir.path()) {
+        Ok(()) => Ok(()),
+        Err(e) => Err(e.context(format!("its folder, the server's and each box's logs among it, is kept at {}", dir.keep().display()))),
+    }
+}
+
+/// [`w27_r08_custody_between_machines`] in `dir`: every box started together, each path's part once
+/// every box's reach directory holds the others.
+#[cfg(feature = "chaos")]
+fn between_machines(dir: &Path) -> anyhow::Result<()> {
     let changed = format!("blob_changed=binaries/kiln-{CHANGED_BINARY}");
-    let s = common::start_env(dir.path(), &Options::default(), false, &[("KILN_CHAOS", changed.as_str())])?;
+    let s = common::start_env(dir, &Options::default(), false, &[("KILN_CHAOS", changed.as_str())])?;
     let (port, admin) = (s.port, s.admin.as_str());
-    let cwd = dir.path().join("work-here");
-    let _harnesses = Harnesses::new(&cwd, &dir.path().join("home"))?;
-    let claude = dir.path().join("home").join(".claude").to_string_lossy().into_owned();
+    let cwd = dir.join("work-here");
+    let _harnesses = Harnesses::new(&cwd, &dir.join("home"))?;
+    let claude = dir.join("home").join(".claude").to_string_lossy().into_owned();
     let env = [("FAKE_CLAUDE_RECORD", "1"), ("CLAUDE_CONFIG_DIR", claude.as_str())];
-    let (_a, log_a) = agents::runner_with(dir.path(), port, "box-a", None, TALK, &env)?;
-    let (_b, log_b) = agents::runner_with(dir.path(), port, "box-b", Some("peer_object_changed,feed_changed"), TALK, &env)?;
-    // kiln run's (synced_runs): box-c hosts a session, box-d's syncs change on their way. All four
-    // are up before any runner reads the directory, which a runner keeps 30 s.
-    let (_c, log_c) = agents::runner_with(dir.path(), port, "box-c", None, TALK, &env)?;
-    let (_d, log_d) = agents::runner_with(dir.path(), port, "box-d", Some("sync_file_changed"), TALK, &[])?;
-    for (name, log) in [("box-a", &log_a), ("box-b", &log_b), ("box-c", &log_c), ("box-d", &log_d)] {
+    // Every box started before any is waited for. kiln run's (synced_runs): box-c hosts a session,
+    // box-d's syncs change on their way.
+    let (_a, log_a) = agents::runner_with(dir, port, "box-a", None, TALK, &env)?;
+    let (_b, log_b) = agents::runner_with(dir, port, "box-b", Some("peer_object_changed,feed_changed"), TALK, &env)?;
+    let (_c, log_c) = agents::runner_with(dir, port, "box-c", None, TALK, &env)?;
+    let (_d, log_d) = agents::runner_with(dir, port, "box-d", Some("sync_file_changed"), TALK, &[])?;
+    let boxes = [("box-a", &log_a), ("box-b", &log_b), ("box-c", &log_c), ("box-d", &log_d)];
+    for (name, log) in boxes {
         agents::connected(port, admin, name, log, Duration::from_secs(60))?;
     }
-    peers_objects(dir.path(), port, admin)?;
-    store_of_bytes(dir.path(), port, admin)?;
-    feed_batches(dir.path(), port, admin, &cwd)?;
-    synced_runs(dir.path(), port, admin)?;
+    reach_directories_hold(dir, &boxes.map(|(name, _)| name), Duration::from_secs(90))?;
+    peers_objects(dir, port, admin)?;
+    store_of_bytes(dir, port, admin)?;
+    feed_batches(dir, port, admin, &cwd)?;
+    synced_runs(dir, port, admin)?;
+    Ok(())
+}
+
+/// Until each of `boxes` sees every other in its reach directory, taking reach links: the directory
+/// a runner checks a link against, which it keeps 30 s (one that announced after its last read is
+/// refused till then, kiln's bug to fix). Asked over each box's own reach socket, before the first
+/// link.
+#[cfg(feature = "chaos")]
+fn reach_directories_hold(dir: &Path, boxes: &[&str], within: Duration) -> anyhow::Result<()> {
+    use kiln::reach::local::{Client, Ev, Req};
+    for name in boxes {
+        let mut last = String::new();
+        until(within, || {
+            // A socket not up yet, or no directory in its answer: ask again.
+            let Ok(mut c) = Client::connect(&kiln::reach::local::path(name, &dir.join(format!("{name}-state")))) else { return Ok(None) };
+            if c.send(&Req::Runners { want: None }).is_err() {
+                return Ok(None);
+            }
+            let json = loop {
+                match c.event() {
+                    Ok(Some(Ev::Runners(json))) => break json,
+                    Ok(Some(Ev::Error(_)) | None) | Err(_) => return Ok(None),
+                    Ok(Some(_)) => {}
+                }
+            };
+            let v: Value = serde_json::from_str(&json)?;
+            let seen: Vec<&str> = v.get("runners").and_then(Value::as_array).into_iter().flatten().filter_map(|r| r.pointer("/runner/name").and_then(Value::as_str)).collect();
+            let all = boxes.iter().all(|b| b == name || seen.contains(b));
+            last = json;
+            Ok(all.then_some(()))
+        })
+        .map_err(|e| anyhow::anyhow!("{name}'s reach directory doesn't hold the others: {e}; it says {last}"))?;
+    }
     Ok(())
 }
 
