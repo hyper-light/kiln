@@ -10,7 +10,7 @@ import { expect, test, type Locator } from "@playwright/test";
 const REAL = !!process.env.E2E_BASE_URL;
 test.skip(REAL, "drives the mock's commits");
 
-/** The output's width, its place's inner width (the pane's side, or under the line on a phone), and where it sits. */
+/** The output's width, its place's inner width (the pane's side, or under the line on a phone), where it sits, and its job. */
 const measure = (row: Locator) =>
   row.evaluate((li) => {
     const out = li.querySelector(".ship-output");
@@ -19,7 +19,7 @@ const measure = (row: Locator) =>
     const cs = getComputedStyle(place);
     const inner = place.getBoundingClientRect().width - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight) - parseFloat(cs.borderLeftWidth) - parseFloat(cs.borderRightWidth);
     const r = out.getBoundingClientRect();
-    return { width: r.width, lanes: inner, top: Math.round(r.top), height: Math.round(r.height) };
+    return { width: r.width, lanes: inner, top: Math.round(r.top), height: Math.round(r.height), job: out.getAttribute("data-job") };
   });
 
 for (const width of [1440, 1280, 1000, 800, 600, 390, 320]) {
@@ -36,9 +36,9 @@ for (const width of [1440, 1280, 1000, 800, 600, 390, 320]) {
     // under way, which on a narrow pane puts the output under the next job's line once it starts.
     await row.locator('.jp-j[data-at="true"] .jp-line').first().click();
     await expect(row.locator(".ship-output .xterm")).toBeVisible({ timeout: 15_000 });
-    const first = await measure(row);
-    expect(first).not.toBeNull();
-    expect(Math.abs((first?.width ?? 0) - (first?.lanes ?? 0))).toBeLessThanOrEqual(1);
+    const placed = await measure(row);
+    expect(placed).not.toBeNull();
+    expect(Math.abs((placed?.width ?? 0) - (placed?.lanes ?? 0))).toBeLessThanOrEqual(1);
 
     // What's measured is lines arriving, so the fonts are in first (a late swap isn't a line).
     await page.evaluate(() => document.fonts.ready.then(() => undefined));
@@ -62,15 +62,23 @@ for (const width of [1440, 1280, 1000, 800, 600, 390, 320]) {
           }
         }).observe({ type: "layout-shift" });
       });
-    await page.waitForTimeout(3000);
-    const after = await measure(row);
+    // As its job prints, nothing moves. The mock's live run can end within the 3 s, its next run's
+    // job taking the place: a window that saw that (the output loading again, or another job's) is
+    // watched again, three at most.
+    const watch = async () => {
+      if (browserName === "chromium") await page.evaluate(() => Object.assign(window as unknown as { __shift: number; __moved: string[] }, { __shift: 0, __moved: [] }));
+      const first = await measure(row);
+      await page.waitForTimeout(3000);
+      return { first, after: await measure(row) };
+    };
+    let seen = await watch();
+    for (let i = 0; i < 2 && (seen.after === null || seen.after.job !== seen.first?.job); i++) seen = await watch();
+    const { first, after } = seen;
     expect(after?.top).toBe(first?.top);
     expect(after?.height).toBe(first?.height);
     if (browserName === "chromium") {
-      const seen = await page
-        .evaluate(() => window as unknown as { __shift: number; __moved: string[] })
-        .then(() => page.evaluate(() => ({ shift: (window as unknown as { __shift: number }).__shift, moved: (window as unknown as { __moved: string[] }).__moved })));
-      expect(seen.shift, `what moved: ${seen.moved.join(" | ")}`).toBe(0);
+      const shift = await page.evaluate(() => ({ shift: (window as unknown as { __shift: number }).__shift, moved: (window as unknown as { __moved: string[] }).__moved }));
+      expect(shift.shift, `what moved: ${shift.moved.join(" | ")}`).toBe(0);
     }
   });
 }
