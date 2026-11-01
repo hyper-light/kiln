@@ -1,14 +1,18 @@
 //! A runner's front door while it holds a replica of kiln's records (docs/p2p.md, P2): requests
 //! are served one by one. The owner's reads of what the replica holds ([`crate::reads`]) are
 //! answered here, once the replica holds every write the server had made when asked; everything
-//! else goes to the server as it came, a WebSocket piped through.
+//! else goes to the server as it came (a read on a connection kept from an earlier request when
+//! one is free), a WebSocket piped through.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
+use http_body::Body as _;
 use http_body_util::BodyExt as _;
+use kiln_http::Incoming;
+use kiln_http::client::http1::SendRequest;
 
 use super::proxy::Upstream;
 use crate::http::io::{RtFuturesIo, RtIo};
@@ -29,6 +33,13 @@ const STALE_FOR: Duration = Duration::from_secs(30);
 const HOP: [&str; 8] = ["connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade"];
 /// What an answer from the replica says: the runner, and the last write its replica held.
 pub const READ_HEADER: &str = "kiln-read";
+/// Connections to the server kept for the requests after, at most. A page's pictures and frames
+/// go on connections earlier requests opened, as they do when a browser's connection is piped
+/// whole: one new connection each, on a busy server that takes them late, lost a phone most of
+/// them (502s) while kiln's own requests, retried, got through.
+const IDLE: usize = 16;
+/// Tries at a new connection to the server before a request is answered 502.
+const DIALS: u32 = 3;
 
 /// The front door's handler with a replica here.
 pub struct Door {
@@ -40,13 +51,15 @@ pub struct Door {
     owners: parking_lot::Mutex<HashMap<String, (bool, Instant)>>,
     /// Until when the server answers every read: the replica didn't catch up the last time.
     stale_until: parking_lot::Mutex<Option<Instant>>,
+    /// Connections to the server, kept for the next requests ([`IDLE`] at most).
+    idle: parking_lot::Mutex<Vec<SendRequest<srv::Body>>>,
 }
 
 impl Door {
     pub fn new(upstream: Upstream, learner: Arc<Learner>) -> anyhow::Result<Self> {
         let plain = Arc::new(ClientTls::new(crate::http::client::Roots::WebPki, None)?);
         let machine = learner.machine().to_owned();
-        Ok(Self { upstream, plain, learner, machine, owners: parking_lot::Mutex::new(HashMap::new()), stale_until: parking_lot::Mutex::new(None) })
+        Ok(Self { upstream, plain, learner, machine, owners: parking_lot::Mutex::new(HashMap::new()), stale_until: parking_lot::Mutex::new(None), idle: parking_lot::Mutex::new(Vec::new()) })
     }
 
     /// Whether it's the handler for this replica and this upstream.
@@ -98,7 +111,7 @@ impl Door {
                     req.headers_mut().insert(k, HeaderValue::from_str(&v)?);
                 }
             }
-            let resp = crate::http::io::send(self.tls(), &self.upstream.host, self.upstream.port, self.upstream.tls.is_some(), req).await?;
+            let resp = self.send(req, true).await?;
             anyhow::ensure!(resp.status().is_success(), "the server answered {}", resp.status());
             let body = resp.into_body().collect().await?.to_bytes();
             Ok::<_, anyhow::Error>(serde_json::from_slice::<serde_json::Value>(&body)?.get("owner").and_then(serde_json::Value::as_bool).unwrap_or(false))
@@ -123,6 +136,69 @@ impl Door {
         }
     }
 
+    /// `up` to the server, its connection kept once the answer is read. A read without a body
+    /// (`again`) goes on a kept connection when one is free, and once more on a new one if that
+    /// one was gone (the server closes one idle 20 s); anything else goes on a new connection, as
+    /// it can't go twice.
+    async fn send(&self, up: http::Request<srv::Body>, again: bool) -> anyhow::Result<http::Response<Incoming>> {
+        let (s, resp) = match again.then(|| self.kept()).flatten() {
+            Some(mut s) => {
+                let (method, uri, headers) = (up.method().clone(), up.uri().clone(), up.headers().clone());
+                match s.send_request(up).await {
+                    Ok(resp) => (s, resp),
+                    Err(_) => {
+                        let mut up = http::Request::builder().method(method).uri(uri).body(srv::empty())?;
+                        *up.headers_mut() = headers;
+                        let mut s = self.dial().await?;
+                        let resp = s.send_request(up).await?;
+                        (s, resp)
+                    }
+                }
+            }
+            None => {
+                let mut s = self.dial().await?;
+                let resp = s.send_request(up).await?;
+                (s, resp)
+            }
+        };
+        let mut idle = self.idle.lock();
+        if idle.len() < IDLE {
+            idle.push(s);
+        }
+        Ok(resp)
+    }
+
+    /// A kept connection that takes a request now; the ones the server closed let go.
+    fn kept(&self) -> Option<SendRequest<srv::Body>> {
+        let mut idle = self.idle.lock();
+        idle.retain(|s| !s.is_closed());
+        let i = idle.iter().position(SendRequest::is_ready)?;
+        Some(idle.swap_remove(i))
+    }
+
+    /// A new connection to the server (HTTP/1.1; TLS for an `https://` server).
+    async fn dial(&self) -> anyhow::Result<SendRequest<srv::Body>> {
+        let (host, port, https) = (self.upstream.host.as_str(), self.upstream.port, self.upstream.tls.is_some());
+        let tcp = redial(|| crate::http::io::connect_out(host, port, https)).await?;
+        let sender = if https {
+            let stream = TlsStream::connect(RtFuturesIo::new(tcp), self.tls().config()?, crate::http::tls::server_name(host)?).await.map_err(|e| anyhow::anyhow!("TLS to {host}: {e}"))?;
+            let (sender, conn) = kiln_http::client::http1::handshake::<_, srv::Body>(stream).await?;
+            crate::rt::spawn_local(async move {
+                let _ = conn.await;
+            })
+            .map_err(|e| anyhow::anyhow!("spawn connection task: {e}"))?;
+            sender
+        } else {
+            let (sender, conn) = kiln_http::client::http1::handshake::<_, srv::Body>(RtIo::new(tcp)).await?;
+            crate::rt::spawn_local(async move {
+                let _ = conn.await;
+            })
+            .map_err(|e| anyhow::anyhow!("spawn connection task: {e}"))?;
+            sender
+        };
+        Ok(sender)
+    }
+
     /// `req` to the server as it came: a WebSocket piped, anything else streamed.
     async fn forward(&self, req: Request) -> Response {
         let r = if crate::http::ws::is_upgrade(&req) { self.forward_ws(req).await } else { self.forward_http(req).await };
@@ -134,9 +210,11 @@ impl Door {
 
     async fn forward_http(&self, req: Request) -> anyhow::Result<Response> {
         let (parts, body) = req.into_parts();
+        // A read with nothing to send can go again; a write might have been done the first time.
+        let again = matches!(parts.method, Method::GET | Method::HEAD) && body.is_end_stream();
         let mut up = http::Request::builder().method(parts.method).uri(target(&parts.uri)).body(body.map_err(std::io::Error::other).boxed())?;
         *up.headers_mut() = without_hops(&parts.headers);
-        let resp = crate::http::io::send(self.tls(), &self.upstream.host, self.upstream.port, self.upstream.tls.is_some(), up).await?;
+        let resp = self.send(up, again).await?;
         let (mut head, body) = resp.into_parts();
         for k in HOP {
             head.headers.remove(k);
@@ -155,7 +233,7 @@ impl Door {
         headers.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
         *up.headers_mut() = headers;
         let (host, port) = (self.upstream.host.clone(), self.upstream.port);
-        let tcp = crate::http::io::connect(&host, port).await?;
+        let tcp = redial(|| crate::http::io::connect(&host, port)).await?;
         let mut sender = match &self.upstream.tls {
             Some(ct) => {
                 let stream = TlsStream::connect(RtFuturesIo::new(tcp), ct.config()?, crate::http::tls::server_name(&host)?).await.map_err(|e| anyhow::anyhow!("TLS to {host}: {e}"))?;
@@ -216,6 +294,23 @@ fn target(uri: &http::Uri) -> String {
     uri.path_and_query().map_or("/", http::uri::PathAndQuery::as_str).to_owned()
 }
 
+/// `connect` tried up to [`DIALS`] times, a moment apart: a server on a busy machine takes a new
+/// connection late or drops its first packets, and the next try often gets through.
+async fn redial<T, F: std::future::Future<Output = anyhow::Result<T>>>(mut connect: impl FnMut() -> F) -> anyhow::Result<T> {
+    let mut tried = 1;
+    loop {
+        match connect().await {
+            Ok(t) => return Ok(t),
+            Err(e) if tried >= DIALS => return Err(e),
+            Err(e) => {
+                tracing::debug!(error = %format!("{e:#}"), tried, "front door: kiln's server didn't take a connection; trying again");
+                crate::rt::sleep(Duration::from_millis(200 * u64::from(tried))).await;
+                tried += 1;
+            }
+        }
+    }
+}
+
 /// A request's headers as they go on: all but those about its connection.
 fn without_hops(incoming: &HeaderMap) -> HeaderMap {
     let mut h = HeaderMap::new();
@@ -231,7 +326,7 @@ fn without_hops(incoming: &HeaderMap) -> HeaderMap {
 mod tests {
     use std::io::{Read as _, Write as _};
     use std::net::SocketAddr;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use anyhow::Context as _;
 
@@ -292,6 +387,139 @@ mod tests {
         let (head, body) = out.split_once("\r\n\r\n").unwrap_or((out.as_str(), ""));
         let status = head.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
         Ok((status, head.to_ascii_lowercase(), body.to_owned()))
+    }
+
+    /// `POST path` of the door with `body`: the status and the body.
+    fn post(at: SocketAddr, path: &str, body: &str) -> anyhow::Result<(u16, String)> {
+        let mut s = std::net::TcpStream::connect(at)?;
+        s.set_read_timeout(Some(Duration::from_secs(20)))?;
+        write!(s, "POST {path} HTTP/1.1\r\nhost: kiln.test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len())?;
+        let mut out = String::new();
+        s.read_to_string(&mut out)?;
+        let (head, body) = out.split_once("\r\n\r\n").unwrap_or((out.as_str(), ""));
+        Ok((head.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0), body.to_owned()))
+    }
+
+    /// kiln's server, standing in, keeping each connection for the next request: an answer says
+    /// its path and the connection it came on (counted from 1). `close_second`: a connection's
+    /// second request is read and the connection closed unanswered, as a server closing a kept
+    /// connection as a request goes on it.
+    fn kept_upstream(close_second: bool) -> anyhow::Result<(String, Arc<AtomicUsize>)> {
+        let l = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let url = format!("http://{}", l.local_addr()?);
+        let conns = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&conns);
+        std::thread::spawn(move || {
+            for s in l.incoming().flatten() {
+                let n = counted.fetch_add(1, Ordering::SeqCst) + 1;
+                std::thread::spawn(move || answer(s, n, close_second));
+            }
+        });
+        Ok((url, conns))
+    }
+
+    /// One connection's requests, answered in turn ([`kept_upstream`]).
+    fn answer(mut s: std::net::TcpStream, conn: usize, close_second: bool) {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 4096];
+        for asked in 1.. {
+            let head_end = loop {
+                if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break i + 4;
+                }
+                match s.read(&mut chunk) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => buf.extend_from_slice(chunk.get(..n).unwrap_or_default()),
+                }
+            };
+            let head = String::from_utf8_lossy(buf.get(..head_end).unwrap_or_default()).to_ascii_lowercase();
+            let len = head.lines().find_map(|l| l.strip_prefix("content-length:")).and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(0);
+            while buf.len() < head_end + len {
+                match s.read(&mut chunk) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => buf.extend_from_slice(chunk.get(..n).unwrap_or_default()),
+                }
+            }
+            let path = head.split_whitespace().nth(1).unwrap_or("/").to_owned();
+            buf = buf.get(head_end + len..).map(<[u8]>::to_vec).unwrap_or_default();
+            if close_second && asked == 2 {
+                return;
+            }
+            let body = format!("upstream {path} on {conn}");
+            if write!(s, "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: {}\r\n\r\n{body}", body.len()).is_err() {
+                return;
+            }
+        }
+    }
+
+    /// The door, its replica a bare copy of a server's records: what's asked of it here is
+    /// forwarded, as every request but the owner's reads is.
+    fn door_to(url: &str, dir: &std::path::Path) -> anyhow::Result<Arc<Door>> {
+        let server = Store::open_grouped(&dir.join("kiln.db"), &dir.join("cluster"))?;
+        let fetch: Fetch = Arc::new(move |dest: &std::path::Path| {
+            let (s, d) = (server.clone(), dest.to_path_buf());
+            crate::rt::block_on(async move { s.copy_for_learner(d).await })
+        });
+        let db = dir.join("runner").join("kiln.db");
+        let replica = Arc::new(Group::learner(&db, &dir.join("runner").join("cluster"), group::member_of("runner-1"), fetch)?);
+        let (learner, _) = Learner::around(replica, db, "runner-1")?;
+        Ok(Arc::new(Door::new(Upstream::parse(url, &[])?, Arc::new(learner))?))
+    }
+
+    /// P2: a page's pictures and frames go to the server on a connection earlier requests opened,
+    /// not each on a new one: new connections to a busy server came late, and phones, whose HTTPS
+    /// is the front door, lost most of a conversation's pictures and pages to 502s.
+    #[test]
+    fn p2_forwarded_requests_go_on_kept_connections() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (url, conns) = kept_upstream(false)?;
+        let at = serve(door_to(&url, dir.path())?)?;
+        for i in 0..6 {
+            let path = format!("/api/harness/sessions/s/files/{i}");
+            let (status, head, body) = get(at, &path, Some("kiln_session=owner"))?;
+            assert_eq!((status, body), (200, format!("upstream {path} on 1")), "{head}");
+        }
+        assert_eq!(conns.load(Ordering::SeqCst), 1, "the six went on one connection");
+        Ok(())
+    }
+
+    /// P2: a connection the server didn't take (a busy machine drops a new one's first packets, a
+    /// server starting refuses it) is tried again before the request is answered 502.
+    #[test]
+    fn p2_a_connection_the_server_did_not_take_is_tried_again() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        // An address nothing listens on yet: the server comes up there after the first try.
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?;
+        let at = serve(door_to(&format!("http://{addr}"), dir.path())?)?;
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            if let Ok((s, _)) = std::net::TcpListener::bind(addr).and_then(|l| l.accept()) {
+                answer(s, 1, false);
+            }
+        });
+        let (status, head, body) = get(at, "/v/0123/page.html", None)?;
+        assert_eq!((status, body.as_str()), (200, "upstream /v/0123/page.html on 1"), "{head}");
+        Ok(())
+    }
+
+    /// P2: a read that went on a kept connection the server closed as it went (it closes one idle
+    /// 20 s) goes again on a new connection; a write goes on a new connection from the first, as
+    /// it can't go twice.
+    #[test]
+    fn p2_a_read_a_kept_connection_lost_goes_again_and_a_write_goes_on_a_new_one() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        // Each connection's second request is read and the connection closed unanswered.
+        let (url, conns) = kept_upstream(true)?;
+        let at = serve(door_to(&url, dir.path())?)?;
+        let (status, _, body) = get(at, "/api/a", None)?;
+        assert_eq!((status, body.as_str()), (200, "upstream /api/a on 1"));
+        let (status, _, body) = get(at, "/api/b", None)?;
+        assert_eq!((status, body.as_str()), (200, "upstream /api/b on 2"), "sent again, on a new connection");
+        // Not on the second connection, kept, which would drop it.
+        let (status, body) = post(at, "/api/c", "{}")?;
+        assert_eq!((status, body.as_str()), (200, "upstream /api/c on 3"));
+        assert_eq!(conns.load(Ordering::SeqCst), 3);
+        Ok(())
     }
 
     fn add_run(store: &Store, id: &str) -> anyhow::Result<()> {

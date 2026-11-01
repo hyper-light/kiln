@@ -864,6 +864,7 @@ impl Registry {
         let local = Host::with_clock(tx, Some(dir.join("local.json")), Limits::default(), clock);
         // The server's own agents' workspaces of their own are kept beside their record.
         crate::workspace::slates::init(&dir);
+        super::whose::note_kiln(&dir);
         let keeper = Keeper::new(&dir);
         let visuals = super::visuals::Visuals::new(&dir);
         Self {
@@ -1743,6 +1744,16 @@ impl Registry {
             super::archive::closed(hub, &id);
             hub.emit(&crate::wire::events::ServerEvent::HarnessClosed { id: id.to_string() });
         }
+    }
+
+    /// Of the sessions a runner of `machine` just said it holds (`held`), those this server still
+    /// has as disconnected. Its link dropped and came back, and only a session's own update clears
+    /// that, so one that's quiet (idle, ended, waiting on a person) stays offline while its machine
+    /// is connected. Their snapshots are asked for ([`Command::Snapshot`]).
+    pub fn still_disconnected(&self, machine: &str, held: &[String]) -> Vec<String> {
+        let at = Location::Machine(machine.to_owned());
+        let g = self.mirrors.lock();
+        held.iter().filter(|id| g.get(*id).is_some_and(|m| m.location == at && m.info.status == Status::Disconnected)).cloned().collect()
     }
 
     /// Session `id` is held by runner process `instance` of its machine, as that process said:
@@ -3142,6 +3153,30 @@ mod tests {
             assert_eq!(hub.harness.left_behind("box-a", &report(&[("twin", 0), ("arriving", 1), ("here", 0)])), ["twin"]);
             let before = crate::harness::host::Inventory { sessions: vec!["twin".into()], ..Default::default() };
             assert!(hub.harness.left_behind("box-a", &before).is_empty(), "a runner from before says no epochs");
+            Ok(())
+        })
+    }
+
+    /// A runner's link dropped and came back to the same server: the sessions it holds that have
+    /// said nothing since still read disconnected, offline while their machine is connected (19
+    /// agents on three machines, 2026-11-01). Its report finds them, for their snapshots.
+    #[test]
+    fn a_report_finds_its_sessions_that_still_read_disconnected() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = Location::Machine("box".into());
+            let info = |id: &str| Info { id: id.into(), kind: "claude".into(), ..Info::default() };
+            for id in ["quiet", "busy"] {
+                hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(info(id)), since: None });
+            }
+            hub.harness.ingest(&hub, &Location::Machine("elsewhere".into()), "away", Update::Open { info: Box::new(info("away")), since: None });
+            hub.harness.machine_lost(&hub, "box");
+            hub.harness.machine_lost(&hub, "elsewhere");
+            // Back: one has something to say at once, the other is quiet.
+            hub.harness.ingest(&hub, &there, "busy", Update::Open { info: Box::new(info("busy")), since: None });
+            let held = ["quiet", "busy", "away", "unknown"].map(str::to_owned);
+            let stale = hub.harness.still_disconnected("box", &held);
+            anyhow::ensure!(stale == ["quiet"], "only its own quiet session: {stale:?}");
             Ok(())
         })
     }

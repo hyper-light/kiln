@@ -1658,6 +1658,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let harness = (!o.ephemeral && o.terminal).then(|| {
         // Agents' workspaces of their own: one place per machine, whichever runner process holds them.
         crate::workspace::slates::init(&o.state_dir);
+        // What an agent changes in the runner's own folders is an agent's own (docs/agents.md).
+        crate::harness::whose::note_kiln(&o.state_dir);
         let waits = cfg!(unix) && take_over_pending.is_some() && !crate::convo::off();
         if !waits {
             convo = crate::convo::open(&own_dir, crate::config::Conversations::default().upkeep());
@@ -2569,7 +2571,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     let headroom_cap = if headroom.is_some() { proto::CAP_HEADROOM } else { 0 };
                     let limit = if harness.is_some() { proto::CAP_AGENT_LIMIT } else { 0 };
                     let custody = if crate::runner::custody::signs() { proto::CAP_CUSTODY } else { 0 };
-                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit | proto::CAP_IDENTITY | proto::CAP_LEG_SIGNS | headroom_cap | proto::CAP_UNREAD | custody }) {
+                    // Running agents, it answers what their branches' commits are and compares two points
+                    // of their repositories (the Changes tab's Commits and Compare).
+                    let commits = if harness.is_some() { proto::CAP_WORKSPACE_COMMITS | proto::CAP_WORKSPACE_COMPARE } else { 0 };
+                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit | proto::CAP_IDENTITY | proto::CAP_LEG_SIGNS | headroom_cap | proto::CAP_UNREAD | custody | commits }) {
                         net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                     }
                 }
@@ -3086,12 +3091,22 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             let ws = s.spec.lock().workspace.clone();
                             let info = s.info();
                             let sign = crate::runner::identity::enabled().then(|| crate::runner::identity::slot("agent", Some(&session), Some(info.epoch)));
-                            (std::path::PathBuf::from(&info.cwd), std::path::PathBuf::from(info.work_dir()), ws, sign)
+                            // A compare of an agent's point: how it left its files, as its session keeps them.
+                            let mut versions = crate::workspace::git::Versions::new();
+                            if let crate::workspace::Ask::Compare { from, to, .. } = ask.as_ref() {
+                                let core = s.core.lock();
+                                for p in [from, to] {
+                                    if let crate::workspace::git::Point::Agent { by } = p {
+                                        versions.insert(by.clone(), core.version_of(by));
+                                    }
+                                }
+                            }
+                            (std::path::PathBuf::from(&info.cwd), std::path::PathBuf::from(info.work_dir()), ws, versions, sign)
                         });
                         crate::rt::spawn(async move {
                             let answer = match found {
                                 None => serde_json::json!({"error": "no such agent on this machine"}),
-                                Some((cwd, work, ws, sign)) => crate::workspace::serve(&cwd, &work, ws.as_ref(), *ask, sign.as_deref()).await,
+                                Some((cwd, work, ws, versions, sign)) => crate::workspace::serve(&cwd, &work, ws.as_ref(), *ask, &versions, sign.as_deref()).await,
                             };
                             let _ = up.send(Up::Term(AgentMsg::Answer { req, json: Some(answer.to_string()) })).await;
                         });
@@ -5472,7 +5487,7 @@ mod tests {
     fn change(path: &str, lines: usize) -> crate::harness::model::FileChange {
         let n = u32::try_from(lines).unwrap_or(u32::MAX);
         let lines = (0..lines).map(|i| format!("+    let value_{i} = compute(argument_{i}, &context); // line {i}")).collect();
-        crate::harness::model::FileChange { path: path.into(), tree: None, created: false, deleted: false, added: n, removed: 0, hunks: vec![crate::harness::model::Hunk { old_start: 1, old_lines: 0, new_start: 1, new_lines: n, lines }], truncated: false, at: 1 }
+        crate::harness::model::FileChange { path: path.into(), tree: None, created: false, deleted: false, added: n, removed: 0, hunks: vec![crate::harness::model::Hunk { old_start: 1, old_lines: 0, new_start: 1, new_lines: n, lines }], truncated: false, at: 1, by: Vec::new(), place: None }
     }
 
     /// A long session's changeset, as one's was: 43 files whose diffs are thousands of short lines,

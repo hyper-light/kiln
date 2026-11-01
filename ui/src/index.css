@@ -1858,7 +1858,8 @@ html.fills-window body {
   position: fixed;
   z-index: 120;
   right: 16px;
-  bottom: max(16px, env(safe-area-inset-bottom, 0px));
+  /* Above an agent's message box where they'd cover it (--dock-height, agent.tsx). */
+  bottom: max(16px, env(safe-area-inset-bottom, 0px), calc(var(--dock-height, 0px) + 16px));
   display: flex;
   flex-direction: column;
   gap: 8px;

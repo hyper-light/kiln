@@ -472,21 +472,21 @@ pub const CAP_CHANGES_PATCH: u64 = 1 << 40;
 /// [`ServerMsg::Caps`] capability: the server gives an agent session its own git credential for
 /// kiln's repositories (the operation `agents.credential`, docs/ci.md W27-R03), so a runner sets its
 /// sessions' git to push as the agent. Without it, a runner leaves their pushes as they were.
-/// (Bit 41 is main's `CAP_UNREAD`.)
-pub const CAP_AGENT_GIT: u64 = 1 << 42;
+/// (Bits 41 to 43 are main's `CAP_UNREAD`, `CAP_WORKSPACE_COMMITS` and `CAP_WORKSPACE_COMPARE`.)
+pub const CAP_AGENT_GIT: u64 = 1 << 44;
 
 /// [`AgentMsg::Caps`] and [`ServerMsg::Caps`] capability: a leg signs as itself what it hands on
 /// (docs/ci.md W27-R05, R06). A runner that says its legs sign their results at their end
 /// ([`AgentMsg::LegResults`]) and the provenance kiln writes of what they built when asked
-/// ([`ServerMsg::SignAsLeg`]); a server that says it takes them. (Bit 41 is main's `CAP_UNREAD`,
-/// 42 `CAP_AGENT_GIT`.)
-pub const CAP_LEG_SIGNS: u64 = 1 << 43;
+/// ([`ServerMsg::SignAsLeg`]); a server that says it takes them. (Bits 41 to 43 are main's, 44
+/// `CAP_AGENT_GIT`.)
+pub const CAP_LEG_SIGNS: u64 = 1 << 45;
 
 /// [`AgentMsg::Caps`] and [`ServerMsg::Caps`] capability: custody (docs/ci.md W27-R08). A runner
 /// that says it signs its agent sessions' hand-overs (a hand-on as it lets one go, a receipt as it
 /// takes one) and sends them ([`AgentMsg::Custody`]); a server that says it takes them
-/// (`crate::custody::take`). (Bit 41 is main's `CAP_UNREAD`, 42 `CAP_AGENT_GIT`, 43 `CAP_LEG_SIGNS`.)
-pub const CAP_CUSTODY: u64 = 1 << 44;
+/// (`crate::custody::take`). (Bits 41 to 43 are main's, 44 `CAP_AGENT_GIT`, 45 `CAP_LEG_SIGNS`.)
+pub const CAP_CUSTODY: u64 = 1 << 46;
 
 /// What an [`AgentMsg::Identity`] asks for: a certificate for the key of `csr`, as `kind` says.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -551,6 +551,19 @@ pub struct IdentityGiven {
 /// [`CAP_IDENTITY`], 39 headroom's [`CAP_HEADROOM`], 40 changesets' patches'
 /// [`CAP_CHANGES_PATCH`].
 pub const CAP_UNREAD: u64 = 1 << 41;
+
+/// [`AgentMsg::Caps`] capability: the runner answers [`ServerMsg::Workspace`]'s `commits`
+/// (`crate::workspace::Ask::Commits`): a branch's commits since its trunk, its session's own
+/// marked, and what picked ones change together, for the Changes tab's Commits (docs/agents.md).
+/// A runner without it isn't asked, and Commits says why. Bit 41 is [`CAP_UNREAD`].
+pub const CAP_WORKSPACE_COMMITS: u64 = 1 << 42;
+
+/// [`AgentMsg::Caps`] capability: the runner answers [`ServerMsg::Workspace`]'s `refs` and `compare`
+/// (`crate::workspace::Ask::Refs`, `Ask::Compare`): a repository's branches, tags and latest
+/// commits, and what changes from one point to another (the folder now, as its session began, a
+/// branch, tag or commit, an agent's files as it left them), for the Changes tab's Compare
+/// (docs/agents.md). Bit 42 is [`CAP_WORKSPACE_COMMITS`].
+pub const CAP_WORKSPACE_COMPARE: u64 = 1 << 43;
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1185,7 +1198,8 @@ mod tests {
         assert_eq!(b.first().copied(), headroom.first().map(|i| i + 1));
         assert_eq!(decode::<ServerMsg>(&b)?, ask);
         assert_eq!((last.first(), b.first()), (Some(&57), Some(&64)), "after main's LinkUnread (57) and ReachRefused (63)");
-        assert!(CAP_LEG_SIGNS.is_power_of_two() && CAP_LEG_SIGNS > CAP_AGENT_GIT && CAP_LEG_SIGNS > CAP_CHANGES_PATCH && CAP_LEG_SIGNS & CAP_UNREAD == 0);
+        assert!(CAP_LEG_SIGNS.is_power_of_two() && CAP_LEG_SIGNS > CAP_AGENT_GIT && CAP_LEG_SIGNS > CAP_CHANGES_PATCH && CAP_LEG_SIGNS & (CAP_UNREAD | CAP_WORKSPACE_COMMITS | CAP_WORKSPACE_COMPARE) == 0);
+        assert!(CAP_AGENT_GIT.is_power_of_two() && CAP_AGENT_GIT & (CAP_UNREAD | CAP_WORKSPACE_COMMITS | CAP_WORKSPACE_COMPARE) == 0, "W27's bits come after main's");
         Ok(())
     }
 
@@ -1313,8 +1327,8 @@ mod tests {
     }
 
     /// W27-R08: custody records come after every older variant (the legs' signing, W27-R05, last
-    /// before them), and their bit is a new one: past main's `CAP_UNREAD` (41), `CAP_AGENT_GIT`
-    /// (42) and `CAP_LEG_SIGNS` (43).
+    /// before them), and their bit is a new one: past main's `CAP_UNREAD`, `CAP_WORKSPACE_COMMITS`
+    /// and `CAP_WORKSPACE_COMPARE` (41 to 43), `CAP_AGENT_GIT` (44) and `CAP_LEG_SIGNS` (45).
     #[test]
     fn w27_r08_custody_is_appended_after_headroom() -> anyhow::Result<()> {
         let legs = encode(&AgentMsg::LegSignature { job: "j".into(), nonce: "n".into(), bundle: None, error: None })?;
@@ -1322,8 +1336,8 @@ mod tests {
         let b = encode(&custody)?;
         assert_eq!(b.first().copied(), legs.first().map(|i| i + 1), "AgentMsg::Custody comes right after LegSignature");
         assert_eq!(decode::<AgentMsg>(&b)?, custody);
-        let before = CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD | CAP_AGENT_GIT | CAP_LEG_SIGNS;
-        assert!(CAP_CUSTODY.is_power_of_two() && CAP_CUSTODY == 1 << 44 && CAP_CUSTODY & before == 0);
+        let before = CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD | CAP_WORKSPACE_COMMITS | CAP_WORKSPACE_COMPARE | CAP_AGENT_GIT | CAP_LEG_SIGNS;
+        assert!(CAP_CUSTODY.is_power_of_two() && CAP_CUSTODY == 1 << 46 && CAP_CUSTODY & before == 0);
         // The server's ask for a receipt of work handed (step 6), after the legs' SignAsLeg.
         let sign_as_leg = encode(&ServerMsg::SignAsLeg { job: "j".into(), nonce: "n".into(), payload_type: String::new(), payload: Vec::new() })?;
         let asked = ServerMsg::Custody { json: "{}".into() };
@@ -1353,6 +1367,8 @@ mod tests {
         // and custody (58 to 60, 64 and 65).
         assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (61, 66), "each table has every variant once");
         assert!(CAP_UNREAD.is_power_of_two() && CAP_UNREAD == 1 << 41 && CAP_UNREAD & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH) == 0);
+        assert!(CAP_WORKSPACE_COMMITS.is_power_of_two() && CAP_WORKSPACE_COMMITS == 1 << 42 && CAP_WORKSPACE_COMMITS & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD) == 0);
+        assert!(CAP_WORKSPACE_COMPARE.is_power_of_two() && CAP_WORKSPACE_COMPARE == 1 << 43 && CAP_WORKSPACE_COMPARE & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD | CAP_WORKSPACE_COMMITS) == 0);
         Ok(())
     }
 

@@ -19,7 +19,8 @@ agents: Array<string>,
  * Features this adapter drives for this harness: "steer", "send_now", "queue_cancel",
  * "interrupt", "set_mode", "set_model", "set_effort", "set_speed", "stop_task", "file_suggestions",
  * "resume", "attachments", "images", "overrides", "switch_harness" (a model of another
- * harness: `Command::SetModel::kind`).
+ * harness: `Command::SetModel::kind`), "own_edits" (`Command::OwnEdits`: the session answers
+ * it whatever its harness).
  */
 features: Array<string>, 
 /**

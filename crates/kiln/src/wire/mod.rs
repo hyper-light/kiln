@@ -327,6 +327,7 @@ classes! {
         Command::MaxSubagents { .. } => REFUSED,
         Command::MoveOnLimit { .. } => REFUSED,
         Command::LimitHold { .. } => REFUSED,
+        Command::OwnEdits { .. } => Class::Ask,
     }
 }
 
