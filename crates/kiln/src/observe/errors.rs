@@ -372,7 +372,7 @@ impl Issues {
             if v.leader == 0 || v.leader != v.member {
                 continue;
             }
-            let Some(store) = o.store() else { continue };
+            let Some(store) = o.store_replayed() else { continue };
             let me = self.clone();
             // The metric read a round of series at a time; each new issue's first error searched for
             // in the records as they are then, the store let go.

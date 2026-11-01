@@ -55,10 +55,16 @@ person sends "now" never waits.
 
 **Pacing.** When running work wants more than a budget, the budget is water-filled class by class,
 max-min fair within a class, and each group runs that share of every period (`cgroup.freeze`):
-only for the resource that's short. Groups are each agent session's cgroup and, with `escapes`
-on, the user's transient units (`systemd-run --user`: agents' builds). Those are paced only by the
-machine's installed runner: the one its supervisor started (its parent is the process serving the
-supervisor's control socket it was given), holding `$XDG_RUNTIME_DIR/kiln-headroom-escapes.lock`
+only for the resource that's short. The pacer looks every 50 ms and a period is at least a second.
+A group earns its share of the time that passes and spends the time it runs: it starts a slice once
+it has earned one (its share of a period, and at least a tick) and runs until that is spent. So a
+share above zero always runs and over time gets exactly its share (a 5 ms period, which a fast
+disk's probe asks for, once gave every share under a fifth no time at all). A group's CPU and
+writes are measured over at least a period too, and the engine is told the part of that time the
+group was let run, not the share it was given. Groups are each agent session's cgroup
+and, with `escapes` on, the user's transient units (`systemd-run --user`: agents' builds). Those
+are paced only by the machine's installed runner: the one its supervisor started (its parent is
+the process serving the supervisor's control socket it was given), holding `$XDG_RUNTIME_DIR/kiln-headroom-escapes.lock`
 (tried again until held, so a runner that took over from another takes it once that one is gone).
 A runner a test or a person started paces its own sessions only. Units kiln itself runs in, units
 the desktop starts for a person (`app-…`, `dbus-…`, `xdg-…`) and kiln's guards
@@ -125,7 +131,7 @@ decides.
   have gone wrong;
 - each target's tolerance: how slow it may get before it's harmed. A target that declares one
   (a Kubernetes probe's timeout, a systemd watchdog) brings its own;
-- the probe-load share: how much of a served target's time its probes may take.
+- the probe-load share: how much of each target's time its probes may take.
 
 **Everything else:**
 
@@ -136,7 +142,7 @@ decides.
 | The alarm threshold | the higher of: the (allowed + 1)-th largest harmless excursion recorded, where allowed = budget x days recorded; and the height the record's own exponential tail (count and sum of its excursions, CUSUM's near-exponential excursions per Siegmund) puts at the budget's rate |
 | Harm | a sample, or a probe still out, at the tolerance |
 | A new regime | a fall below the calm the lower CUSUM detects with the same calibration |
-| The probe interval | (tolerance - longest measured lag) / (expected samples to alarm + 1), never under the probe's own measured cost, and for a served target never under its service time / load share |
+| The probe interval | (tolerance - longest measured lag) / (expected samples to alarm + 1), leaving the lag out once it reaches the tolerance (no probe rate wins that time back); never under the probe's own measured cost / load share, for a disk as for a server |
 | The write and CPU budgets | each, for kiln's own work: bisection between the highest level held calm and the lowest level trouble began at; doubling while there is no unsafe level; halving the gap is the only step. Trouble cuts both (either may be the cause) unless the disks are delivering all they were measured to take, when only writes are cut; each is raised on its own where it limits (what runs wants more, or work waiting would take it past) |
 | A level held | the mean kiln's work used over the hold (its integral over time), not its peak: a burst a buffer took isn't a rate the machine sustains |
 | A bound tried | once the bisection's gap is finer than the pacer applies (a share is whole percent: what's wanted / 100), the bound itself; held calm there, it was wrong and the next bound up (any higher level trouble began at) takes its place |
@@ -242,6 +248,13 @@ check meant to (all of kiln's work idle for longer than the slowest recovery, 22
 never holds with hundreds of sessions, so about 290 sessions and every gate stayed stopped for two
 hours, until the runner was rolled back. Now a cut that doesn't speed the probes up is undone and
 not repeated while kiln writes no more, and the night is a trace.
+
+That night's 221 s lag stayed in adacachy's learned state, and on 10-30 it showed what it did to
+probing: with the lag past the 1 s tolerance, the time left to act came out at nothing, so every
+probe ran as fast as its floor let it. Production's server was probed about 270 times a second,
+and each runner's disk back to back, since a disk had no load share to hold it. Now a lag past the
+tolerance leaves the interval as it is without one, and a disk is held to the load share like a
+server.
 
 ## Debug builds
 

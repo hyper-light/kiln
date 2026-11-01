@@ -85,7 +85,11 @@ replaced while it runs. The new build comes up beside it, and takes over only on
 3. Once it's ready, the runner hands it every agent session and terminal over a local socket.
    Their processes keep running: pipes and PTYs are passed across, not reopened. A reply that was
    streaming goes on, and background commands never stop. Whatever reaches the old runner
-   meanwhile (a message for an agent, keystrokes, a new session) goes on to the new build.
+   meanwhile (a message for an agent, keystrokes, a new session) goes on to the new build. Its
+   conversation stores go first: let go of, moved into the new build's folder and gone on with
+   there under the same ids, so nothing is sent to the server again (docs/conversations.md, "A
+   runner's upgrade"). A new build from before takes none, and opens its own; one that can't open
+   them sets them aside, kept whole, and opens its own: the stores never hold an upgrade back.
 4. The supervisor promotes the new build, and the server sends it new work from then on. The old
    runner finishes the jobs it's running (jobs aren't moved yet), then exits. The supervisor keeps
    the new build, and starts it again after a restart or reboot.
@@ -172,6 +176,9 @@ runner's credentials would change under it):
 - **It works for another server:** joining stops it first, once asked (or with `--yes`). Its agents
   stay with that server.
 - **The server can't be asked:** nothing is joined. Try again once it answers.
+- **It is the server's own machine, and the server runs its local agent:** that agent is the
+  machine's runner, so joining under its name is refused (409) rather than enrolled as `<name>-2`.
+  Turn the server's off (`[local_agent] enabled = false`) to run a separate runner there.
 
 **Handing over.** While a machine has more than one runner process (a take-over, an upgrade beside
 the running runner, or one left over from before), the server has each older process hand its

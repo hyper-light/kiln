@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::time::{Duration, Instant};
 
-use common::{Fleet, at, now_ms};
+use common::{Fleet, at, now_ms, raw};
 use serde_json::{Value, json};
 
 const WINDOW: i64 = 10_000;
@@ -342,6 +342,69 @@ fn metrics_from_logs_count_each_window_once_through_late_records_and_a_restart()
     anyhow::ensure!(names == ["checkout.errors", "checkout.latency", "bytes"], "{names:?}");
     let st = at(&listed, &["log_metrics"]).as_array().and_then(|a| a.first()).map(|m| at(m, &["status"]).clone()).unwrap_or(Value::Null);
     anyhow::ensure!(at(&st, &["window"]).as_i64().is_some_and(|w| w >= t0), "its status: {st:#}");
+    f.stop_gently();
+    Ok(())
+}
+
+/// OTLP/JSON server spans of `service`, `n` in each window starting at `windows` (ms): each its own
+/// trace, a millisecond's request a second into its window.
+fn spans_in(service: &str, windows: &[i64], n: u64) -> Vec<u8> {
+    let mut spans = Vec::new();
+    for (k, w) in windows.iter().enumerate() {
+        for i in 0..n {
+            let start = (*w as u64 + 1_000 + i) * 1_000_000;
+            let id = (k as u64) << 16 | i;
+            spans.push(json!({
+                "traceId": format!("{:032x}", 0x1a7e_0000_0000_u64 + id), "spanId": format!("{:016x}", 0x5ba0_0000_u64 + id),
+                "name": "GET /late", "kind": 2,
+                "startTimeUnixNano": start.to_string(), "endTimeUnixNano": (start + 1_000_000).to_string(),
+            }));
+        }
+    }
+    serde_json::to_vec(&json!({ "resourceSpans": [{ "resource": { "attributes": [{ "key": "service.name", "value": { "stringValue": service } }] }, "scopeSpans": [{ "spans": spans }] }] })).unwrap()
+}
+
+#[test]
+#[ignore = "starts real processes"]
+fn spans_late_for_windows_counted_as_the_server_started_are_counted() -> anyhow::Result<()> {
+    // Goal 47bbcf7e, found by the ClickHouse comparison: as the server starts it counts every window
+    // of its horizon (empty here), and spans then come for windows 15 to 17 minutes old, within
+    // Datadog's twenty minutes. Each is counted: waiting half a window's age to count it again took
+    // every window first counted over 13⅓ minutes after it ended past the horizon, uncounted (these
+    // were, at 15 to 17 minutes, or some 14 at the least should the start's counting have come a
+    // minute before the spans; three minutes are left for the spans to be applied in, a loaded
+    // machine's lag).
+    let mut f = Fleet::new()?;
+    let ingest = std::fs::read_to_string(f.root.path().join("server/observe/ingest.token"))?.trim().to_owned();
+    let counting = || -> anyhow::Result<Value> { Ok(at(&f.call("GET", "/api/observe/v1/span_metrics", None)?, &["counting"]).clone()) };
+    let start = Instant::now();
+    loop {
+        let c = counting()?;
+        // Oldest first: the horizon's windows counted, those the spans will come for among the first.
+        if at(&c, &["windows_counted"]).as_u64().unwrap_or(0) >= (20 * 60_000 / WINDOW) as u64 {
+            break;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(90), "the start's counting of the horizon: {c:#}");
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let now = now_ms();
+    let windows: Vec<i64> = (0..12).map(|k| window(now - 15 * 60_000) - k * WINDOW - WINDOW).collect();
+    let (code, b) = raw(f.http, "POST", "/v1/traces", &format!("Authorization: Bearer {ingest}\r\nContent-Type: application/json\r\n"), &spans_in("late", &windows, 20))?;
+    anyhow::ensure!(code == 200, "the spans: {code} {}", String::from_utf8_lossy(&b));
+    let want: BTreeMap<(String, i64), f64> = windows.iter().map(|w| ((String::new(), *w), 20.0)).collect();
+    let (from, to) = (windows.iter().min().copied().unwrap_or(now) - WINDOW, windows.iter().max().copied().unwrap_or(now) + 2 * WINDOW);
+    // Each window's hits whatever the series say of their tags: the windows' sums.
+    let hits = || -> anyhow::Result<BTreeMap<(String, i64), f64>> {
+        let mut by: BTreeMap<(String, i64), f64> = BTreeMap::new();
+        for ((_, w), v) in metric(&f, "sum:trace.hits{service:late}.as_count()", from, to)? {
+            *by.entry((String::new(), w)).or_default() += v;
+        }
+        Ok(by)
+    };
+    holds(&f, "trace.hits of the late windows", &want, Duration::from_secs(5 * 60), hits)?;
+    let c = counting()?;
+    anyhow::ensure!(at(&c, &["windows_expired"]).as_u64() == Some(0), "a window left the horizon with spans uncounted: {c:#}");
+    eprintln!("late for windows counted at the start: {c}");
     f.stop_gently();
     Ok(())
 }

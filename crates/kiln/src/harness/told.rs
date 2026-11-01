@@ -346,7 +346,7 @@ fn line(c: &Info) -> String {
                 _ => "",
             };
             let said = if said.is_empty() { String::new() } else { format!(": {said}") };
-            format!("{who}, which you started, ended its turn{how}{said}. agents_result {{\"agent\": \"{}\"}} has its whole reply and what it changed.", c.id)
+            format!("{} agents_result {{\"agent\": \"{}\"}} has its whole reply and what it changed.", sentence(&format!("{who}, which you started, ended its turn{how}{said}")), c.id)
         }
         "needs_you" => {
             let asks: Vec<String> = c.approvals.iter().map(|a| a.title.clone()).filter(|t| !t.trim().is_empty()).collect();
@@ -355,11 +355,18 @@ fn line(c: &Info) -> String {
         }
         "stopped" => {
             let why = c.exit.as_ref().and_then(|e| e.error.clone()).map(|e| format!(": {}", super::model::clip_middle(e.trim(), SAID_MAX).0)).unwrap_or_default();
-            format!("{who}, which you started, stopped{why}.")
+            sentence(&format!("{who}, which you started, stopped{why}"))
         }
         "paused" => format!("{who}, which you started, is paused at a usage limit: it goes on when the limit resets."),
         _ => format!("{who}, which you started, ended."),
     }
+}
+
+/// `words` as a sentence: a full stop after them, unless they end in one of their own (a child's
+/// last words often do).
+fn sentence(words: &str) -> String {
+    let words = words.trim_end();
+    if words.ends_with(['.', '!', '?', '…']) { words.to_owned() } else { format!("{words}.") }
 }
 
 /// Whether `agent` has children at work: an agent that ended its turn to let them work isn't
@@ -476,6 +483,20 @@ mod tests {
         crashed.exit = Some(crate::harness::model::ExitInfo { code: Some(1), error: Some("claude exited with 1".into()), ..Default::default() });
         assert!(line(&crashed).contains("stopped: claude exited with 1"), "{}", line(&crashed));
         Ok(())
+    }
+
+    /// A child's last words end the sentence they're in once: a full stop of their own (or another
+    /// ending) isn't followed by kiln's.
+    #[test]
+    fn a_child_s_last_words_end_its_line_with_one_full_stop() {
+        for (said, then) in [("Fixed the parser.", "the parser. agents_result"), ("Shipped it!", "it! agents_result"), ("Is the lexer next?", "next? agents_result"), ("Docs updated", "updated. agents_result")] {
+            let text = line(&child("c7", Status::Idle, 5, said));
+            assert!(text.contains(then) && !text.contains(".."), "{text}");
+        }
+        assert!(line(&child("c6", Status::Idle, 5, "")).contains("ended its turn. agents_result"), "no last words: the sentence still ends");
+        let mut crashed = child("c5", Status::Exited, 5, "");
+        crashed.exit = Some(crate::harness::model::ExitInfo { code: Some(1), error: Some("claude exited with 1.".into()), ..Default::default() });
+        assert!(line(&crashed).ends_with("stopped: claude exited with 1."), "{}", line(&crashed));
     }
 
     /// A parent at work on one long turn, its queue empty.

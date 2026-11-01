@@ -135,6 +135,16 @@ is pinged; at 45 s it is replaced.
 Nothing on the runner waits on reach (its input is unbounded, bounded in practice by the windows),
 and reach never waits on the runner: output to the server is batched, many messages per frame.
 
+A message either side can't read (a kind its build doesn't know, or bytes that aren't one) is
+answered in the link with what it was, a code and why (`Say::Unread`, `Ask::Unread`, appended last),
+and the link ends; a runner from before ends it on that as it would on any garbage, and its session
+goes on on a new link. The runner that couldn't read it tells the server (`AgentMsg::LinkUnread`, to
+one that says `CAP_UNREAD`), which notes it against the runner that sent it, checking the link's ends
+against its relay's (docs/wire.md, "What can't be read"). What the relay refuses it says with a code
+too (`ServerMsg::ReachRefused`): a link id taken, a link to itself, too many links, a runner that
+doesn't take links or doesn't accept them, one not connected, a link closed. A frame from a runner
+that isn't one of a link's ends, or from a job's pod, goes nowhere, and is noted.
+
 ### 4.2 Runs
 
 Shell text, run by `bash -c` (`sh` where there is none; on Windows, Git for Windows' bash, found on
@@ -310,6 +320,10 @@ on its own machine, with its own tools. Its tools:
 | `goals_*` | its goal stack (docs/goals.md): without `agent`, its own |
 | `research_*`, `conversations_search` | research it records, each finding graded by kiln from its sources (docs/research.md), and every agent's conversations kiln keeps |
 | `plans_*` | plans kept, run (on itself without `session` or `new`; one agent per step, in its harness, on its machine and in its folder unless it says otherwise) and followed (docs/plans.md); a plan's versions and deleting one are code mode's |
+
+Each of its own tools (and each `kiln.machines.*` operation below) reads its arguments as a type
+(`reach::mcp::input`), its `inputSchema` made from it. A call that doesn't fit is a tool error
+saying where and why, and the server hears of it (docs/wire.md, `mcp_reach`).
 
 The `agents_*`, `goals_*`, `research_*` and `plans_*` tools are the ones the kiln server says agents
 have (its answer for the operations names them), each as the server describes it, so a server

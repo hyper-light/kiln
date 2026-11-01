@@ -52,13 +52,18 @@ fn build() -> anyhow::Result<&'static Build> {
 /// One install at a time in this process (another process waits on the folder's own lock).
 static INSTALLING: futures::lock::Mutex<()> = futures::lock::Mutex::new(());
 
+/// Where the browser's executable is under `dir`, once [`ensure`] put it there.
+pub fn exe_in(dir: &Path) -> anyhow::Result<PathBuf> {
+    Ok(dir.join("browser").join(VERSION).join(build()?.exe))
+}
+
 /// The browser's executable under `dir`, downloading and unpacking it first when it isn't there.
 /// The first time on a machine that's a download of about 200 MB.
 pub async fn ensure(dir: &Path) -> anyhow::Result<PathBuf> {
     let b = build()?;
     let home = dir.join("browser");
     let root = home.join(VERSION);
-    let exe = root.join(b.exe);
+    let exe = exe_in(dir)?;
     if exe.exists() {
         return Ok(exe);
     }

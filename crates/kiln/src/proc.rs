@@ -6,6 +6,14 @@
 
 pub use crate::os::proc::{Detached, Duplex, Running, adopt_duplex, interrupt_group, kill_orphan_group, output, spawn_duplex, spawn_duplex_in, spawn_group, stdout_stream, terminate_group, terminate_tree, wait_pid_exit};
 
+/// [`spawn_duplex_in`] on the blocking pool, never on a shard: joining a group can wait. A group
+/// headroom paces is frozen for part of each period, and so is a process that joins it between
+/// fork and exec, while `spawn` waits for that exec. On a shard the wait stops everything else the
+/// shard serves, its listeners too (the front door stopped answering while one waited).
+pub async fn spawn_duplex_in_pool(cmd: std::process::Command, group: Option<crate::os::contain::Group>) -> anyhow::Result<Duplex> {
+    crate::rt::blocking(move || spawn_duplex_in(cmd, group.as_ref())).await?
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

@@ -75,6 +75,8 @@ pub enum ServerEvent {
     Landed(Box<Landed>),
     /// A leg built an image into kiln's registry.
     CiImage { repo: String, name: String, digest: String, platforms: Vec<String> },
+    /// A commit's verdict on a lane changed (docs/ci.md W28-R59).
+    CiVerdict(Box<CiVerdict>),
     /// An experiment changed.
     Experiment { repo: String, experiment: Box<ExperimentBrief> },
     /// A person's inbox changed.
@@ -122,6 +124,9 @@ pub enum ServerEvent {
     /// A change's conflicts changed (W26-R12): its replay found some, one was resolved or taken
     /// back, or their resolution was committed.
     Conflict(Box<ConflictChange>),
+    /// What the page sent up this socket that couldn't be read: to that socket alone, never
+    /// [`crate::hub::Hub::emit`]ted.
+    Refused(crate::wire::ui::Refused),
     /// Something happened to a run or a diff that notification rules hear (`run.failed`,
     /// `mention` ...): the tag is its [`NoticeKind`].
     #[serde(untagged)]
@@ -354,6 +359,22 @@ pub struct ExperimentBrief {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub decision: Option<crate::ci::experiments::Decision>,
+}
+
+/// A commit's verdict on a lane (its workflow on its branch) that changed since it was last kept
+/// (docs/ci.md W28-R59): its kind and why, and the whole verdict as `ci.verdict` gives it, its
+/// commits by SHA.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+pub struct CiVerdict {
+    pub repo: String,
+    pub workflow: String,
+    pub branch: String,
+    pub sha: String,
+    #[cfg_attr(test, ts(type = "\"direct\" | \"covered\" | \"pending\" | \"suspect\" | \"culprit\""))]
+    pub kind: kiln_ci::verdict::Kind,
+    pub why: String,
+    pub verdict: Value,
 }
 
 /// A release that moved on; one waiting for approval says so (`needs`) and who may give it.
@@ -758,6 +779,20 @@ mod tests {
         same(
             ServerEvent::Notices(Notices { principal: "owner".into(), keys: vec!["k".into()], how: "seen".into(), at: 5, tags: vec![] }),
             json!({ "type": "notices", "principal": "owner", "keys": ["k"], "how": "seen", "at": 5, "tags": [] }),
+        )?;
+        // W28-R59's `ci_verdict`, as its `json!` was before the wire was typed.
+        let verdict = json!({ "commit": "abc", "kind": "covered", "why": "covered by def's pass", "checks": [] });
+        same(
+            ServerEvent::CiVerdict(Box::new(CiVerdict {
+                repo: "acme/app".into(),
+                workflow: ".kiln/ci.yaml".into(),
+                branch: "main".into(),
+                sha: "abc".into(),
+                kind: kiln_ci::verdict::Kind::Covered,
+                why: "covered by def's pass".into(),
+                verdict: verdict.clone(),
+            })),
+            json!({ "type": "ci_verdict", "repo": "acme/app", "workflow": ".kiln/ci.yaml", "branch": "main", "sha": "abc", "kind": "covered", "why": "covered by def's pass", "verdict": verdict }),
         )?;
         Ok(())
     }

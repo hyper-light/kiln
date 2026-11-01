@@ -18,6 +18,7 @@ export interface Prefill {
   target?: string;
   cwd?: string;
   shell?: string;
+  /** A mode of `kind` (else of the harness the composer is on): another harness picked takes it at the same latitude. */
   mode?: string;
   model?: string;
   effort?: string;

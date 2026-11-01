@@ -259,10 +259,8 @@ impl Runner {
     }
 
     /// What the server said (`ServerMsg::Sync`).
-    pub fn heard(&self, json: &str, raft: Vec<u8>) {
-        if let Some(msg) = wire::decode(json) {
-            let _ = self.tx.send(Input::Heard(Box::new(msg), raft));
-        }
+    pub fn heard(&self, msg: wire::Msg, raft: Vec<u8>) {
+        let _ = self.tx.send(Input::Heard(Box::new(msg), raft));
     }
 
     /// The link to the server came up, or went down.

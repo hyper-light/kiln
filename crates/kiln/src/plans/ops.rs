@@ -7,7 +7,7 @@ use http::{Method, StatusCode};
 use serde_json::{Value, json};
 
 use super::{Error, Mode, New, Patch, Target};
-use crate::ops::{Cx, Fail, Op, Out, path};
+use crate::ops::{Cx, Fail, Input, Op, Out, path};
 
 fn fail(e: Error) -> Fail {
     match e {
@@ -26,44 +26,16 @@ fn id_of(v: &Value) -> Result<String, Fail> {
     v.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned).ok_or_else(|| (StatusCode::BAD_REQUEST, "`id` is required".into()))
 }
 
-/// A step's criteria, for agents: each in words, or a measure against a threshold.
-fn criteria_schema() -> Value {
-    json!({
-        "type": "array",
-        "description": "Criteria: {kind: \"qualitative\", text} in words, or {kind: \"quantitative\", target (what's measured, e.g. \"p99.9 latency\"), op (lt, le, eq, ne, ge, gt, between, within, rises_at_least, falls_at_least, rises_at_most, falls_at_most), value (a number; for rises/falls a percentage), value2 (between: the upper bound; within: the tolerance), unit (\"ms\", \"%\"), baseline (rises/falls: compared with what), measured (how it's measured)}.",
-        "items": {"type": "object", "properties": {"kind": {"type": "string", "enum": ["qualitative", "quantitative"]}}, "required": ["kind"]}
-    })
-}
-
-/// A plan's steps, for agents: each its parts, and the steps it waits for.
-fn items_schema() -> Value {
-    json!({
-        "type": "array",
-        "description": "The plan's steps: each its title, what to do, examples, its acceptance criteria, its tests, and the steps it waits for (`needs`).",
-        "items": {"type": "object", "properties": {
-            "title": {"type": "string"},
-            "description": {"type": "string"},
-            "examples": {"type": "string"},
-            "acceptance": criteria_schema(),
-            "testing": {"type": "array", "description": "Tests: each a scenario and the criteria it passes by.", "items": {"type": "object", "properties": {"scenario": {"type": "string"}, "criteria": criteria_schema()}}},
-            "needs": {"type": "array", "items": {"type": "integer", "minimum": 1}, "description": "The steps (by number, from 1) this one waits for: run with an agent per step, it starts once each is met, and steps that don't wait for each other run side by side. Left out of every step: each waits for the one before."},
-            "basis": {"type": "array", "items": {"type": "string"}, "description": "The findings of the plan's research this step rests on (their ids: f1, f2 …)."}
-        }, "required": ["title"]}
-    })
-}
-
-fn schema(props: Value, required: &[&str]) -> Value {
-    json!({"type": "object", "properties": props, "required": required, "additionalProperties": false})
-}
-
-const ID: &str = "The plan's id.";
-
 async fn list(cx: Cx, v: Value) -> Out {
     let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_owned);
     // An agent's (made in its conversation), and the one it proposed (plan mode), when asked.
     let session = s("session").filter(|x| !x.trim().is_empty());
     let proposed = v.get("proposed").and_then(|p| p.as_bool().or_else(|| p.as_str().map(|s| s == "true" || s == "1"))).unwrap_or(false);
     let plans = super::of_source(super::list(&cx.hub, s("q"), s("tag")).await.map_err(fail)?, session.as_deref(), proposed);
+    // In brief: what each is and where it stands, without its words, items or steps' titles.
+    if v.get("brief").is_some_and(|b| b.as_bool().unwrap_or_else(|| matches!(b.as_str(), Some("1" | "true")))) {
+        return json_of(&json!({"plans": plans.iter().map(super::brief).collect::<Vec<_>>()}));
+    }
     json_of(&json!({"plans": plans}))
 }
 
@@ -173,6 +145,8 @@ async fn ready(cx: Cx, v: Value) -> Out {
     if !matches!(then, "goals" | "agents" | "review") {
         return Err((StatusCode::BAD_REQUEST, "`then` is goals, agents or review".into()));
     }
+    // Sent back for changes by the person reviewing it (`plans.review`, revise): it comes back to them.
+    let then = if super::review::last(&cx.hub, &id).await.map_err(fail)?.is_some_and(|r| r.answer == super::review::Answer::Revise) { "review" } else { then };
     let skipped: Option<crate::research::Skipped> =
         v.get("skipped").cloned().filter(|s| !s.is_null()).map(serde_json::from_value).transpose().map_err(|e| (StatusCode::BAD_REQUEST, format!("`skipped`: {e}")))?;
     let was_planning = p.phase == "planning";
@@ -223,6 +197,33 @@ async fn ready(cx: Cx, v: Value) -> Out {
     }
     cx.hub.store.audit(cx.caller.name.clone(), "plan.ready".into(), format!("{} (v{})", plan.title, plan.version)).await;
     Ok(out)
+}
+
+/// A person's answer to a plan its agent's goal stack waits on (`super::review`): approve, reject, or
+/// revise with their words; for the version they looked at. A person's: an agent can't answer one.
+async fn review(cx: Cx, v: Value) -> Out {
+    if cx.caller.agent.is_some() {
+        return Err((StatusCode::FORBIDDEN, "a plan waiting on a person's review is answered by a person, in its agent's Plan tab".into()));
+    }
+    let id = id_of(&v)?;
+    let answer = match v.get("answer").and_then(Value::as_str) {
+        Some("approve") => super::review::Answer::Approve,
+        Some("reject") => super::review::Answer::Reject,
+        Some("revise") => super::review::Answer::Revise,
+        _ => return Err((StatusCode::BAD_REQUEST, "`answer` is approve, reject or revise".into())),
+    };
+    let asked = super::review::Asked {
+        answer: Some(answer),
+        words: v.get("words").and_then(Value::as_str).map(str::to_owned),
+        version: v.get("version").and_then(Value::as_i64),
+        key: scoped_key(&cx, &v)?,
+    };
+    let p = super::get(&cx.hub, &id).await.map_err(fail)?;
+    let agent = p.source.as_ref().and_then(|s| s.goal.as_ref()).map(|g| g.agent.clone()).unwrap_or_default();
+    let by = crate::goals::By::of(&cx.hub, &cx.caller, &agent);
+    let (plan, stack) = super::review::answer(&cx.hub, &id, asked, &cx.caller.name, &by).await.map_err(fail)?;
+    cx.hub.store.audit(cx.caller.name.clone(), "plan.review".into(), format!("{} (v{}): {}", p.title, p.version, v.get("answer").and_then(Value::as_str).unwrap_or_default())).await;
+    json_of(&json!({"plan": plan, "stack": stack}))
 }
 
 async fn versions(cx: Cx, v: Value) -> Out {
@@ -319,10 +320,10 @@ pub fn list_ops() -> Vec<Op> {
     vec![
         Op {
             name: "plans.list",
-            summary: "Plans kept in kiln, newest change first; `q` matches title, text or tags, `tag` keeps one tag, `session` an agent's (made in its conversation), and `proposed` the one each agent proposed (plan mode), kept by kiln.",
+            summary: "Plans kept in kiln, newest change first; `q` matches title, text or tags, `tag` keeps one tag, `session` an agent's (made in its conversation), and `proposed` the one each agent proposed (plan mode), kept by kiln; `brief` gives each without its words, items or steps' titles (`step_count` says how many), for a long list.",
             read_only: true,
             destructive: false,
-            input: || schema(json!({"q": {"type": "string"}, "tag": {"type": "string"}, "session": {"type": "string"}, "proposed": {"type": "boolean"}}), &[]),
+            input: Input::of::<input::PlansList>(),
             route: |_| Ok((Method::GET, path(&["api", "plans"]))),
             run: |cx, v| Box::pin(list(cx, v)),
         },
@@ -331,7 +332,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "One plan: its title, markdown and steps (the items of its top-level lists).",
             read_only: true,
             destructive: false,
-            input: || schema(json!({"id": {"type": "string", "description": ID}}), &["id"]),
+            input: Input::of::<input::PlansGet>(),
             route: |v| Ok((Method::GET, path(&["api", "plans", &id_of(v)?]))),
             run: |cx, v| Box::pin(get(cx, v)),
         },
@@ -340,18 +341,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "Keep a plan in kiln (the plan you made, for the person to change, share and run later), with your session (its Plan tab lists it): its text and/or its steps (`items`: each with description, examples, acceptance criteria, testing); without them, its text's top-level list items are its steps.",
             read_only: false,
             destructive: false,
-            input: || {
-                schema(
-                    json!({
-                        "title": {"type": "string", "description": "Short; taken from the first heading when left out."},
-                        "body": {"type": "string", "description": "The plan's text, in markdown (optional with items)."},
-                        "items": items_schema(),
-                        "tags": {"type": "array", "items": {"type": "string"}},
-                        "source": {"type": "object", "description": "Where it came from: {session, harness, machine, cwd, agent}."}
-                    }),
-                    &[],
-                )
-            },
+            input: Input::of::<input::PlansCreate>(),
             route: |_| Ok((Method::POST, path(&["api", "plans"]))),
             run: |cx, v| Box::pin(create(cx, v)),
         },
@@ -360,7 +350,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "Change a plan's title, text or tags; a new title or text is a new version.",
             read_only: false,
             destructive: false,
-            input: || schema(json!({"id": {"type": "string", "description": ID}, "title": {"type": "string"}, "body": {"type": "string"}, "items": items_schema(), "tags": {"type": "array", "items": {"type": "string"}}}), &["id"]),
+            input: Input::of::<input::PlansUpdate>(),
             route: |v| Ok((Method::PATCH, path(&["api", "plans", &id_of(v)?]))),
             run: |cx, v| Box::pin(update(cx, v)),
         },
@@ -369,25 +359,25 @@ pub fn list_ops() -> Vec<Op> {
             summary: "Say a plan in its planning phase (one made from a goal: goals_plan) is ready: it has steps, its research has sources inside and outside (or `skipped` says why not), and each step rests only on findings of its research (`basis`). What's weak comes back as warnings: say them. A plan made from a goal then goes on as `then` says: `goals` (the default: its steps become the goal's parts on its agent, each splittable into its acceptance criteria and tests), `review` (the same, the stack paused for the person to look at the plan first), or `agents` (it runs with an agent per step, as its `needs` say; the goal waits for the run). Once every step is met, so is the goal.",
             read_only: false,
             destructive: false,
-            input: || {
-                schema(
-                    json!({
-                        "id": {"type": "string", "description": ID},
-                        "then": {"type": "string", "enum": ["goals", "review", "agents"]},
-                        "skipped": {"type": "object", "properties": {"internal": {"type": "string"}, "external": {"type": "string"}}, "description": "Why its research has no internal, or no external, sources."}
-                    }),
-                    &["id"],
-                )
-            },
+            input: Input::of::<input::PlansReady>(),
             route: |v| Ok((Method::POST, path(&["api", "plans", &id_of(v)?, "ready"]))),
             run: |cx, v| Box::pin(ready(cx, v)),
+        },
+        Op {
+            name: "plans.review",
+            summary: "A person's answer to a plan its agent's goal stack waits on (one said ready with `then: review`), for the `version` they looked at: `approve` (the stack resumes: its steps go to the agent), `reject` (its steps come off the stack, the goal it was made from is skipped, the agent is told, and the stack waits for them), or `revise` with `words` (the agent changes it as they say, and it comes back to them for review). A person's to give, in the agent's Plan tab: agents can't. `key`: asked again under it, it's answered as things stand.",
+            read_only: false,
+            destructive: false,
+            input: Input::of::<input::PlansReview>(),
+            route: |v| Ok((Method::POST, path(&["api", "plans", &id_of(v)?, "review"]))),
+            run: |cx, v| Box::pin(review(cx, v)),
         },
         Op {
             name: "plans.versions",
             summary: "Every version of a plan, newest first.",
             read_only: true,
             destructive: false,
-            input: || schema(json!({"id": {"type": "string", "description": ID}}), &["id"]),
+            input: Input::of::<input::PlansVersions>(),
             route: |v| Ok((Method::GET, path(&["api", "plans", &id_of(v)?, "versions"]))),
             run: |cx, v| Box::pin(versions(cx, v)),
         },
@@ -396,23 +386,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "Run a plan, or some of its steps (`only`), on an agent: `session` (one that runs) or `new` {target: local|agent:<machine>, kind, cwd}; `mode` message (the whole plan), steps (each step a queued message), goals (its steps become goals on that agent's goal stack; `split`: each step a goal stack of its acceptance criteria and tests), or agents (each step held to as a goal by an agent of its own, or by the main agent, as its steps' `needs` say: steps that don't wait for each other run side by side; plans.runs.get follows it). An agent that gives neither `session` nor `new` runs it itself; one agent per step, its steps' agents start in its harness, on its machine and in its folder unless it says otherwise, and a step given to `main` (in `steps`, {agent: \"main\"}) goes on its own goal stack instead.",
             read_only: false,
             destructive: false,
-            input: || {
-                schema(
-                    json!({
-                        "id": {"type": "string", "description": ID},
-                        "session": {"type": "string", "description": "The agent it runs on; agents: the main agent, that steps given to `main` go to (left out: you)."},
-                        "new": {"type": "object", "properties": {"target": {"type": "string"}, "on": {"type": "string"}, "kind": {"type": "string"}, "cwd": {"type": "string"}, "model": {"type": "string"}, "effort": {"type": "string"}, "mode": {"type": "string"}}},
-                        "mode": {"type": "string", "enum": ["message", "steps", "goals", "agents"], "description": "message: the whole plan at once; steps: a message a turn; goals: each step a goal in the agent's goal stack; agents: each step held to as a goal by an agent of its own (with `new`: on, kind, cwd, model, effort, mode) or by the main agent, each starting once the steps it waits for are met."},
-                        "steps": {"type": "array", "description": "agents: where and how each step runs, over `new` (by its place in the list): {on, kind, cwd, model, effort, mode}, or {agent: \"main\"} (or an agent's id) to give the step to that agent: its goal goes on that agent's goal stack, and no agent is started for it.", "items": {"type": "object"}},
-                        "parallel": {"type": "boolean", "description": "agents: in a plan whose steps don't say what they wait for (`needs`), run them all side by side rather than each once the one before is met. Side by side in one folder, each step's agent keeps to its own files; give steps folders or machines of their own with `steps`."},
-                        "max_parallel": {"type": "integer", "minimum": 1, "description": "agents: steps at work at once, at the most (left out: every step that's ready)."},
-                        "only": {"type": "array", "items": {"type": "integer", "minimum": 1}, "description": "Only these steps, by their numbers from 1 (left out: every step); each keeps its number. The steps they wait for outside them are taken as done."},
-                        "split": {"type": "boolean", "description": "goals: each step goes on the stack as a goal stack of its own: its acceptance criteria and tests, a goal each, before it."},
-                        "key": {"type": "string", "description": "An idempotency key of yours, made once for this run (1 to 256 bytes). Run again with it (its answer lost), it's the same run, in every mode: its messages go once, its steps' agents start once, and it's answered as it was. Without it, each call is another run: pass it whenever you may ask again."}
-                    }),
-                    &["id"],
-                )
-            },
+            input: Input::of::<input::PlansRun>(),
             route: |v| Ok((Method::POST, path(&["api", "plans", &id_of(v)?, "run"]))),
             run: |cx, v| Box::pin(run(cx, v)),
         },
@@ -421,7 +395,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "Plan runs of one agent per step, newest first, each with its plan's title, how it stands (running, stopped, done) and how many of its steps are met; `active` for those under way.",
             read_only: true,
             destructive: false,
-            input: || schema(json!({"active": {"type": "boolean"}}), &[]),
+            input: Input::of::<input::PlansRunsList>(),
             route: |_| Ok((Method::GET, path(&["api", "plans", "runs"]))),
             run: |cx, v| Box::pin(runs_list(cx, v)),
         },
@@ -430,7 +404,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "A plan run of one agent per step: each step with its goal, its agent and where it stands (waiting, working, needs_you, yours, met, unmet, stopped), what it changed, and the run's state and why.",
             read_only: true,
             destructive: false,
-            input: || schema(json!({"run": {"type": "string", "description": "The run's id (plans.run gives it)."}}), &["run"]),
+            input: Input::of::<input::PlansRunsGet>(),
             route: |v| Ok((Method::GET, path(&["api", "plans", "runs", &run_of(v)?]))),
             run: |cx, v| Box::pin(runs_get(cx, v)),
         },
@@ -439,7 +413,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "Stop a plan run: no next step starts, and the agents of the steps under way are interrupted and no longer held to their goals.",
             read_only: false,
             destructive: true,
-            input: || schema(json!({"run": {"type": "string"}}), &["run"]),
+            input: Input::of::<input::PlansRunsStop>(),
             route: |v| Ok((Method::POST, path(&["api", "plans", "runs", &run_of(v)?, "stop"]))),
             run: |cx, v| Box::pin(runs_stop(cx, v)),
         },
@@ -448,7 +422,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "Try a step of a plan run again with a new agent (its agent before, if it still runs, ends), the run going on from there.",
             read_only: false,
             destructive: false,
-            input: || schema(json!({"run": {"type": "string"}, "step": {"type": "integer", "minimum": 1, "description": "The step's number, from 1."}, "try": {"type": "integer", "description": "The try it replaces: the step's `tries` as plans_runs_get shows them. Asked again (its answer lost) once the step was tried again, nothing more starts. Without it, each call starts another agent: pass it."}}), &["run", "step"]),
+            input: Input::of::<input::PlansRunsRetry>(),
             route: |v| Ok((Method::POST, path(&["api", "plans", "runs", &run_of(v)?, "steps", &step_of(v)?.to_string(), "retry"]))),
             run: |cx, v| Box::pin(runs_retry(cx, v)),
         },
@@ -457,11 +431,265 @@ pub fn list_ops() -> Vec<Op> {
             summary: "Delete a plan, its versions and its runs.",
             read_only: false,
             destructive: true,
-            input: || schema(json!({"id": {"type": "string", "description": ID}}), &["id"]),
+            input: Input::of::<input::PlansDelete>(),
             route: |v| Ok((Method::DELETE, path(&["api", "plans", &id_of(v)?]))),
             run: |cx, v| Box::pin(delete(cx, v)),
         },
     ]
+}
+
+/// What each of these operations takes (`crate::ops::Input`): its JSON Schema is generated from
+/// its type, each field's description from its doc comment.
+pub mod input {
+    use schemars::JsonSchema;
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct PlansList {
+        pub q: Option<String>,
+        pub tag: Option<String>,
+        pub session: Option<String>,
+        pub proposed: Option<bool>,
+        /// Each in brief: without its words, items or steps' titles.
+        pub brief: Option<bool>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct PlansGet {
+        /// The plan's id.
+        pub id: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum CriterionKind {
+        Qualitative,
+        Quantitative,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    pub struct Criterion {
+        pub kind: CriterionKind,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    pub struct Test {
+        pub scenario: Option<String>,
+        /// Criteria: {kind: "qualitative", text} in words, or {kind: "quantitative", target (what's
+        /// measured, e.g. "p99.9 latency"), op (lt, le, eq, ne, ge, gt, between, within,
+        /// rises_at_least, falls_at_least, rises_at_most, falls_at_most), value (a number; for
+        /// rises/falls a percentage), value2 (between: the upper bound; within: the tolerance),
+        /// unit ("ms", "%"), baseline (rises/falls: compared with what), measured (how it's
+        /// measured)}.
+        pub criteria: Option<Vec<Criterion>>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    pub struct Step {
+        pub title: String,
+        pub description: Option<String>,
+        pub examples: Option<String>,
+        /// Criteria: {kind: "qualitative", text} in words, or {kind: "quantitative", target (what's
+        /// measured, e.g. "p99.9 latency"), op (lt, le, eq, ne, ge, gt, between, within,
+        /// rises_at_least, falls_at_least, rises_at_most, falls_at_most), value (a number; for
+        /// rises/falls a percentage), value2 (between: the upper bound; within: the tolerance),
+        /// unit ("ms", "%"), baseline (rises/falls: compared with what), measured (how it's
+        /// measured)}.
+        pub acceptance: Option<Vec<Criterion>>,
+        /// Tests: each a scenario and the criteria it passes by.
+        pub testing: Option<Vec<Test>>,
+        /// The steps (by number, from 1) this one waits for: run with an agent per step, it starts
+        /// once each is met, and steps that don't wait for each other run side by side. Left out of
+        /// every step: each waits for the one before.
+        #[schemars(inner(range(min = 1)))]
+        pub needs: Option<Vec<i64>>,
+        /// The findings of the plan's research this step rests on (their ids: f1, f2 …).
+        pub basis: Option<Vec<String>>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct PlansCreate {
+        /// Short; taken from the first heading when left out.
+        pub title: Option<String>,
+        /// The plan's text, in markdown (optional with items).
+        pub body: Option<String>,
+        /// The plan's steps: each its title, what to do, examples, its acceptance criteria, its
+        /// tests, and the steps it waits for (`needs`).
+        pub items: Option<Vec<Step>>,
+        pub tags: Option<Vec<String>>,
+        /// Where it came from: {session, harness, machine, cwd, agent}.
+        pub source: Option<serde_json::Map<String, serde_json::Value>>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct PlansUpdate {
+        /// The plan's id.
+        pub id: String,
+        pub title: Option<String>,
+        pub body: Option<String>,
+        /// The plan's steps: each its title, what to do, examples, its acceptance criteria, its
+        /// tests, and the steps it waits for (`needs`).
+        pub items: Option<Vec<Step>>,
+        pub tags: Option<Vec<String>>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum PlansReadyThen {
+        Goals,
+        Review,
+        Agents,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    pub struct PlansReadySkipped {
+        pub internal: Option<String>,
+        pub external: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct PlansReady {
+        /// The plan's id.
+        pub id: String,
+        pub then: Option<PlansReadyThen>,
+        /// Why its research has no internal, or no external, sources.
+        pub skipped: Option<PlansReadySkipped>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum PlansReviewAnswer {
+        Approve,
+        Reject,
+        Revise,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct PlansReview {
+        /// The plan's id.
+        pub id: String,
+        pub answer: PlansReviewAnswer,
+        /// Revise: what should change, in the person's words.
+        pub words: Option<String>,
+        /// The version looked at (none: as it is now).
+        pub version: Option<i64>,
+        /// An idempotency key: asked again under it (its answer lost), it's answered as things
+        /// stand and nothing more is done (CP-T3.2). Without it, an answer asked again once the
+        /// first went through is refused, nothing waiting on the review any more: pass it.
+        pub key: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct PlansVersions {
+        /// The plan's id.
+        pub id: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    pub struct PlansRunNew {
+        pub target: Option<String>,
+        pub on: Option<String>,
+        pub kind: Option<String>,
+        pub cwd: Option<String>,
+        pub model: Option<String>,
+        pub effort: Option<String>,
+        pub mode: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum PlansRunMode {
+        Message,
+        Steps,
+        Goals,
+        Agents,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct PlansRun {
+        /// The plan's id.
+        pub id: String,
+        /// The agent it runs on; agents: the main agent, that steps given to `main` go to (left
+        /// out: you).
+        pub session: Option<String>,
+        pub new: Option<PlansRunNew>,
+        /// message: the whole plan at once; steps: a message a turn; goals: each step a goal in the
+        /// agent's goal stack; agents: each step held to as a goal by an agent of its own (with
+        /// `new`: on, kind, cwd, model, effort, mode) or by the main agent, each starting once the
+        /// steps it waits for are met.
+        pub mode: Option<PlansRunMode>,
+        /// agents: where and how each step runs, over `new` (by its place in the list): {on, kind,
+        /// cwd, model, effort, mode}, or {agent: "main"} (or an agent's id) to give the step to
+        /// that agent: its goal goes on that agent's goal stack, and no agent is started for it.
+        pub steps: Option<Vec<serde_json::Map<String, serde_json::Value>>>,
+        /// agents: in a plan whose steps don't say what they wait for (`needs`), run them all side
+        /// by side rather than each once the one before is met. Side by side in one folder, each
+        /// step's agent keeps to its own files; give steps folders or machines of their own with
+        /// `steps`.
+        pub parallel: Option<bool>,
+        /// agents: steps at work at once, at the most (left out: every step that's ready).
+        #[schemars(range(min = 1))]
+        pub max_parallel: Option<i64>,
+        /// Only these steps, by their numbers from 1 (left out: every step); each keeps its number.
+        /// The steps they wait for outside them are taken as done.
+        #[schemars(inner(range(min = 1)))]
+        pub only: Option<Vec<i64>>,
+        /// goals: each step goes on the stack as a goal stack of its own: its acceptance criteria
+        /// and tests, a goal each, before it.
+        pub split: Option<bool>,
+        /// An idempotency key of yours, made once for this run (1 to 256 bytes). Run again with it
+        /// (its answer lost), it's the same run, in every mode: its messages go once, its steps'
+        /// agents start once, and it's answered as it was. Without it, each call is another run:
+        /// pass it whenever you may ask again.
+        pub key: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct PlansRunsList {
+        pub active: Option<bool>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct PlansRunsGet {
+        /// The run's id (plans.run gives it).
+        pub run: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct PlansRunsStop {
+        pub run: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct PlansRunsRetry {
+        pub run: String,
+        /// The step's number, from 1.
+        #[schemars(range(min = 1))]
+        pub step: i64,
+        /// The try it replaces: the step's `tries` as plans_runs_get shows them. Asked again (its
+        /// answer lost) once the step was tried again, nothing more starts. Without it, each call
+        /// starts another agent: pass it.
+        pub r#try: Option<i64>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct PlansDelete {
+        /// The plan's id.
+        pub id: String,
+    }
 }
 
 /// Where a plan is kept: with the session of the agent that keeps it.

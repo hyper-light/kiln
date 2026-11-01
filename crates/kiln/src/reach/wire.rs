@@ -41,7 +41,17 @@ pub enum Ask {
     /// [`Say::ObjectMissing`]); the asker asks again from where it got to. Appended last:
     /// postcard numbers variants by place.
     Object { id: u64, repo: String, digest: String, offset: u64 },
+    /// Word that a message of the other end's couldn't be read here (`crate::wire::unread`): what
+    /// it was (never what it said), a code and why. The link ends after it; a runner from before,
+    /// which can't read this either, ends it as it would on any garbage. Appended last: postcard
+    /// encodes variants by index.
+    Unread { what: String, code: crate::wire::unread::Code, why: String },
 }
+
+/// How many variants [`Ask`] has: a newer peer's past them is `unknown`.
+pub const ASK_VARIANTS: usize = 12;
+/// How many variants [`Say`] has.
+pub const SAY_VARIANTS: usize = 12;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Resume {
@@ -74,6 +84,9 @@ pub enum Say {
     ObjectData { id: u64, offset: u64, data: Vec<u8>, last: bool },
     /// The object asked for isn't here, for that repository.
     ObjectMissing { id: u64 },
+    /// Word that a message of the asker's couldn't be read here, as [`Ask::Unread`]. Appended last:
+    /// postcard encodes variants by index.
+    Unread { what: String, code: crate::wire::unread::Code, why: String },
 }
 
 /// The machine a link reached.
@@ -199,6 +212,21 @@ impl Deframer {
         self.buf.extend_from_slice(data);
     }
 
+    /// The next whole message of a link's protocol (an enum of `variants` variants), if one
+    /// arrived; or why what came can't be one (`crate::proto::read`: a variant past them is
+    /// `unknown`, the rest, and a message too large, `malformed`). An error ends the link.
+    pub fn read<T: for<'de> Deserialize<'de>>(&mut self, variants: usize) -> Result<Option<T>, crate::proto::Unreadable> {
+        let Some(head) = self.buf.first_chunk::<4>() else { return Ok(None) };
+        let len = usize::try_from(u32::from_be_bytes(*head)).unwrap_or(usize::MAX);
+        if len > MAX_MESSAGE {
+            return Err(crate::proto::Unreadable::Malformed { variant: None, why: format!("a message of {len} bytes, over the {MAX_MESSAGE}-byte limit") });
+        }
+        let Some(body) = self.buf.get(4..4 + len) else { return Ok(None) };
+        let msg = crate::proto::read(body, || variants)?;
+        self.buf.drain(..4 + len);
+        Ok(Some(msg))
+    }
+
     /// The next whole message, if one arrived. An error (too large, undecodable) ends the link.
     pub fn take<T: for<'de> Deserialize<'de>>(&mut self) -> anyhow::Result<Option<T>> {
         let Some(head) = self.buf.first_chunk::<4>() else { return Ok(None) };
@@ -239,6 +267,30 @@ mod tests {
             }
         }
         assert_eq!(got, msgs);
+        Ok(())
+    }
+
+    /// Word that a message couldn't be read is appended last in both, after every older variant,
+    /// and the counts say so.
+    #[test]
+    fn word_of_an_unread_message_is_appended_last() -> anyhow::Result<()> {
+        use crate::wire::unread::Code;
+        let ask = postcard::to_allocvec(&Ask::Unread { what: "variant 12".into(), code: Code::Unknown, why: "Say has 12 variants".into() })?;
+        let say = postcard::to_allocvec(&Say::Unread { what: "Ask".into(), code: Code::Malformed, why: "cut short".into() })?;
+        assert_eq!((ask.first().copied(), say.first().copied()), (u8::try_from(ASK_VARIANTS - 1).ok(), u8::try_from(SAY_VARIANTS - 1).ok()));
+        let mut d = Deframer::default();
+        d.push(&frame(&Ask::Ping { at: 1 })?);
+        assert_eq!(d.read::<Ask>(ASK_VARIANTS).ok().flatten(), Some(Ask::Ping { at: 1 }));
+        // A newer peer's kind, one cut short inside its length, and one too large.
+        let mut d = Deframer::default();
+        d.push(&[0, 0, 0, 1, 12]);
+        assert!(d.read::<Ask>(ASK_VARIANTS).is_err_and(|e| e.code() == Code::Unknown && e.what() == "variant 12"));
+        let mut d = Deframer::default();
+        d.push(&[0, 0, 0, 1, 2]);
+        assert!(d.read::<Ask>(ASK_VARIANTS).is_err_and(|e| e.code() == Code::Malformed));
+        let mut d = Deframer::default();
+        d.push(&u32::MAX.to_be_bytes());
+        assert!(d.read::<Say>(SAY_VARIANTS).is_err_and(|e| e.code() == Code::Malformed));
         Ok(())
     }
 

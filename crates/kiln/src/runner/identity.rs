@@ -125,8 +125,7 @@ pub fn ask(kind: &str, of: Option<&str>, epoch: Option<u64>) -> anyhow::Result<S
 /// The server's answer: the certificate kept for its slot (and written, public, under
 /// `<state>/identities/<file>.pem`, `file` named by `label`), or why there's none, logged. One for
 /// a key let go of meanwhile (a leg that ended first) is kept nowhere.
-pub fn given(json: &str, state_dir: &Path, label: &str) -> anyhow::Result<()> {
-    let g: IdentityGiven = serde_json::from_str(json)?;
+pub fn given(g: IdentityGiven, state_dir: &Path, label: &str) -> anyhow::Result<()> {
     let slot = slot(&g.kind, g.of.as_deref(), g.epoch);
     let Some(pem) = g.cert_pem else {
         tracing::warn!(identity = %slot, error = %g.error.unwrap_or_default(), "kiln issued no identity");
@@ -196,7 +195,7 @@ mod tests {
         assert!(!asked.contains("PRIVATE"), "only a CSR leaves: {asked}");
         let identity = Identity::new(pki.organization(), Actor::Agent { person: "sam".into(), agent: "w27-r02-key".into(), epoch: 1, held_by: None });
         let given_json = answer(&pki, &asked, &identity)?;
-        given(&given_json, dir.path(), "main")?;
+        given(serde_json::from_str(&given_json)?, dir.path(), "main")?;
         let held = slot("agent", Some("w27-r02-key"), Some(1));
         let file = dir.path().join("identities/main-agent_w27-r02-key_1.pem");
         assert!(file.exists(), "the certificate is written, public");
@@ -211,7 +210,7 @@ mod tests {
         forget(&held);
         assert!(sign(&held, b"x").is_err(), "a key let go of signs nothing");
         assert!(!file.exists(), "its certificate's file goes with it");
-        given(&given_json, dir.path(), "main")?;
+        given(serde_json::from_str(&given_json)?, dir.path(), "main")?;
         assert!(cert(&held).is_none() && !file.exists(), "a certificate for a key let go of is kept nowhere");
         Ok(())
     }

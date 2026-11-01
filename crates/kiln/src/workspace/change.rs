@@ -126,19 +126,19 @@ fn fail(code: StatusCode, msg: impl Into<String>) -> Fail {
 
 /// Asks the machine agent `info` works on about its folder: the answer's JSON, or why not.
 pub async fn ask_machine(hub: &Hub, info: &Info, ask: &super::Ask) -> Result<Value, Fail> {
-    let json = serde_json::to_string(ask).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let machine = crate::harness::wait::machine(&info.target).to_owned();
     let answer = if machine == "local" {
-        super::serve(std::path::Path::new(&info.cwd), std::path::Path::new(info.work_dir()), info.workspace.as_ref(), &json).await
+        super::serve(std::path::Path::new(&info.cwd), std::path::Path::new(info.work_dir()), info.workspace.as_ref(), ask.clone()).await
     } else {
+        let json = serde_json::to_string(ask).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let id = info.id.clone();
         let got = hub
-            .ask_runner(&machine, crate::proto::CAP_WORKSPACE, super::WAIT, move |req| crate::proto::ServerMsg::Workspace { req, session: id, json })
+            .ask_runner::<Value>(&machine, crate::proto::CAP_WORKSPACE, super::WAIT, move |req| crate::proto::ServerMsg::Workspace { req, session: id, json })
             .await
             .map_err(|e| fail(StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
         match got {
             None => return Err(fail(StatusCode::CONFLICT, format!("{machine}'s kiln is too old to do this: upgrade it (System → Updates)"))),
-            Some(text) => text.and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(Value::Null),
+            Some(answer) => answer.unwrap_or(Value::Null),
         }
     };
     if let Some(e) = answer.get("error").and_then(Value::as_str) {

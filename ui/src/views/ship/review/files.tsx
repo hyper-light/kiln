@@ -118,11 +118,12 @@ const refresh = () => {
 /** Shared empties and a no-op, so stable references stay stable (W26-R15). */
 const EMPTY_THREADS: Thread[] = [];
 
-/** Who asking about code goes to (components/code/about.tsx): its author, where an agent wrote it
- * (`agent:<id>`, as its agent token pushed it); none for a person's, as on the review page. */
-function aboutOf(author: string): AboutAgent | null {
-  const id = author.startsWith("agent:") ? (author.slice("agent:".length).split(" ")[0] ?? "") : "";
-  return id ? { id, name: whoSaid(author), subagents: true, busy: false } : null;
+/** Who asking about code goes to (components/code/about.tsx): the agent that made the commit, as
+ * Ship's read model says it (`made_by`, ship.rs: one place, which Chain of Ownership fills for every
+ * commit in time). Code no agent of kiln's made stays inert, as on the review page: today a person's
+ * change, a lone commit and a host's pull request. `name`: how the card names it. */
+function aboutOf(agent: string | null | undefined, name?: string): AboutAgent | null {
+  return agent ? { id: agent, name: name ?? agent, subagents: true, busy: false } : null;
 }
 const noop = () => {};
 
@@ -307,7 +308,8 @@ function KilnFiles({ item }: { item: ShipCommit }) {
       ),
     [key],
   );
-  const about = React.useMemo(() => aboutOf(d.author), [d.author]);
+  const maker = item.made_by?.agent;
+  const about = React.useMemo(() => aboutOf(maker, whoSaid(d.author)), [maker, d.author]);
   const ctx: FilesCtx = React.useMemo(
     () => ({ ops: fullOps, threads: shown, conflicts, rowsByFile, version, draft, setDraft, open: setWhole, q, linesOf, viewed }),
     [fullOps, shown, conflicts, rowsByFile, version, draft, q, linesOf, viewed],
@@ -503,7 +505,8 @@ function CommitFiles({ item }: { item: ShipCommit }) {
     }),
     [ops],
   );
-  const about = React.useMemo(() => aboutOf(item.author), [item.author]);
+  const maker = item.made_by?.agent;
+  const about = React.useMemo(() => aboutOf(maker), [maker]);
   const ctx: FilesCtx = React.useMemo(
     () => ({ ops: fullOps, threads: EMPTY_THREADS, conflicts: [], rowsByFile, version: 1, draft, setDraft, open: setWhole, q: "", linesOf }),
     [fullOps, rowsByFile, draft, linesOf],

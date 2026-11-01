@@ -335,6 +335,11 @@
     flex-direction: column;
     gap: 2px;
   }
+  /* A column sizes its text to all it says: held to the line's width, a failed job's whole note
+     ends in an ellipsis rather than standing the page wider than the screen (Ada, 2026-10-30). */
+  .ship-line > .ship-text {
+    max-width: 100%;
+  }
   .ship-rider {
     grid-template-columns: minmax(0, 1fr) auto;
   }
