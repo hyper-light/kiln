@@ -182,7 +182,7 @@ pub fn ops() -> &'static [Op] {
                 }),
             op!("ci.runs.ask", "As an agent, ask for a run of a workflow that takes kiln's `agent` event (`on: { agent: { agents, inputs } }`, its `agents` naming you or `*`), at a branch or tag, with its inputs. You are the run's actor.", ro: false, destructive: false,
                 input: Input::of::<input::CiRunsAsk>(),
-                route: Routes(vec![Definition::new("POST", &[Part::Literal("api"), Part::Literal("ci"), Part::Literal("repos"), Part::Field("repo"), Part::Literal("agent")], &[], "runs.trigger", ScopeAt::Repo(3))]),
+                route: Routes(vec![Definition::new("POST", &[Part::Literal("api"), Part::Literal("ci"), Part::Literal("repos"), Part::Field("repo"), Part::Literal("agent")], &[], "runs.trigger", ScopeAt::Repo(3)).reply(Reply::Empty)]),
                 run: |cx: Cx, v: Value| async move {
                     let repo = text(&v, "repo")?;
                     let repos = cx.hub.store.repos().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
@@ -277,7 +277,7 @@ pub fn ops() -> &'static [Op] {
                 run: |cx: Cx, v: Value| async move { let q = query(&v, &["repo"]); super::uploads::build(&cx.hub, Some(&cx.caller), &q, v).await }),
             op!("ci.actions.try", "Try an action as you have it, saved or not (W21-R07): it runs once with `inputs` on what `runs_on` names (a label or a runner), its outputs the job's. Watch the run and read its log after.", ro: false, destructive: false,
                 input: Input::of::<input::CiActionsTry>(),
-                route: Routes(vec![Definition::new("POST", &[Part::Literal("api"), Part::Literal("ci"), Part::Literal("repos"), Part::Field("repo"), Part::Literal("actions"), Part::Literal("try")], &[], "runs.trigger", ScopeAt::Repo(3))]),
+                route: Routes(vec![Definition::new("POST", &[Part::Literal("api"), Part::Literal("ci"), Part::Literal("repos"), Part::Field("repo"), Part::Literal("actions"), Part::Literal("try")], &[], "runs.trigger", ScopeAt::Repo(3)).reply(Reply::Json(201))]),
                 run: |cx: Cx, v: Value| async move { let repo = text(&v, "repo")?; super::uploads::try_action(&cx.hub, Some(&cx.caller), &repo, v).await }),
             op!("ci.workflows.labels", "What a workflow's `runs-on` may name in a repository: its runners' labels (and GitHub's for self-hosted runners), its pools' and the routing rules', each with where it comes from. A label none has waits for one.", ro: true, destructive: false,
                 input: Input::of::<input::CiWorkflowsLabels>(),

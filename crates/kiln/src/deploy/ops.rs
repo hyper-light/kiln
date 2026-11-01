@@ -198,7 +198,7 @@ pub fn ops() -> &'static [Op] {
                 run: |cx: Cx, v: Value| async move { answer(flow::register(&*service()?, &cx.caller.name, &text(&v, "app")?, &text(&v, "environment")?).await?) }),
             op!("deploy.registrations.delete", "Remove an app from an environment: what it runs there goes with it, unless `keep`.", ro: false, destructive: true,
                 input: Input::of::<input::DeployRegistrationsDelete>(),
-                route: Routes(vec![Definition::new("DELETE", &[Part::Literal("api"), Part::Literal("deploy"), Part::Literal("apps"), Part::Field("app"), Part::Literal("environments"), Part::Field("environment")], &[], "environments.manage", ScopeAt::Server)]),
+                route: Routes(vec![Definition::new("DELETE", &[Part::Literal("api"), Part::Literal("deploy"), Part::Literal("apps"), Part::Field("app"), Part::Literal("environments"), Part::Field("environment")], &[], "environments.manage", ScopeAt::Server).reply(Reply::Empty)]),
                 run: |cx: Cx, v: Value| async move {
                     let (app, env) = (text(&v, "app")?, text(&v, "environment")?);
                     flow::deregister(&*service()?, &Who::of(&cx.caller), &app, &env, v.get("keep").and_then(Value::as_bool).unwrap_or(false)).await?;
