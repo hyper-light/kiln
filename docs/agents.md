@@ -641,6 +641,7 @@ code-mode function (`kiln.agents.start`) and, from a kiln shell, a CLI command.
 | `agents.refs` | `GET /api/harness/agents/:id/refs` | → `{refs: {branches, tags, commits: [{sha, subject, at, ...}], trunk}}` ("Compare", below) |
 | `agents.compare` | `GET /api/harness/agents/:id/compare?from=&to=&split=&path=` | → `{compared: {files: [FileChange], counts_only, split, changed_by: {path: [who]}}}`; a point is `now`, `began`, `agent:<who>` or a branch, tag or commit ("Compare", below) |
 | `agents.land` | `POST /api/harness/agents/:id/land` | `{}` → `{plan, excludes, can_write, why_not?}`; `{manifest}` (that plan's; a person only) → `{landed}`, or `{changed, plan, …}` with nothing written when the plan isn't that one any more |
+| `agents.credential` | `POST /api/harness/agents/:id/credential` | → `{token, expires_at}`: the agent's own token for git, for a day, so its pushes to kiln's repositories go as the agent, for its person (ci.md W27-R03). Only that very agent is given it, as its runner asks when its git needs it: never a person or another agent, and it's no tool of an agent's |
 
 Each takes an input type of its own (`crate::ops::Input`), as every operation of the registry
 does (kiln's own, CI's, releases' and deployments'): its JSON Schema (the MCP tool's
@@ -1418,6 +1419,22 @@ working: what you send is kept in your browser ("Kept here", editable and remova
 reloads) and goes to the agent in order once it can take it, ahead of anything sent after.
 Files attached go along when they were uploaded; ones that couldn't be (no server) stay with the
 page until it reloads.
+
+### A copy left behind
+
+An agent that goes on on another machine while its own is cut off (moved there from the server's
+copy) leaves its copy running where it was, at the epoch it left (docs/ci.md W27-R08). kiln fences
+what that copy does through it. Each act an agent makes through kiln (a kiln operation it calls, a
+page it shows, a run on another machine) is signed by the runner process holding it, with the
+agent's key at its epoch, and kiln takes it only from the agent's holder now. The copy's acts are
+refused, answered with why (the epoch it's at, and where and when the agent went on), and recorded
+with who signed them, that epoch and the transfer the agent went on with (`kiln transfers
+refused`). One its runner couldn't put to kiln while cut off isn't done, and kiln hears of it once
+the runner is back.
+At the runner's first word back, kiln tells it to let go of the copy. What kiln can't refuse is
+what the copy does on its own machine without kiln (the files it edits there, the commands it runs
+there): that goes on until its runner hears from kiln. A runner from before signed acts is taken by
+its machine, as before.
 
 ### What you sent, at once
 

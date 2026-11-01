@@ -216,3 +216,24 @@ for (const width of [320, 390, 1280]) {
     }
   });
 }
+
+test("a long value, a pod's error, is cut short within its line and leaves the job's name its place", async ({ page }) => {
+  const { pane } = await open(page);
+  // A job that failed before it ran says why in its value, as production's did on 2026-11-01: a pod's
+  // error, longer than the line. Before, it took the whole line, the name none of it, and ran on over
+  // the output beside the list.
+  const why =
+    "pod kiln-1de969f7e0-0: ImagePullBackOff: Back-off pulling image \"kiln:d50f1fd322748e4665219a44add58bf801d8b12b\": ErrImagePull: Error response from daemon: pull access denied for kiln, repository does not exist or may require 'docker login'";
+  const box = await pane
+    .locator(".jp-j[data-job]")
+    .first()
+    .evaluate((li, text) => {
+      const [line, n, v] = [li.querySelector(".jp-line"), li.querySelector(".n"), li.querySelector(".v")];
+      if (!line || !n || !v) return null;
+      v.textContent = text;
+      return { line: line.getBoundingClientRect().toJSON() as DOMRect, n: n.getBoundingClientRect().width, v: v.getBoundingClientRect().right };
+    }, why);
+  expect(box, "a job's line, its name and its value").not.toBeNull();
+  expect(box?.v ?? Infinity, "the value ends inside its line").toBeLessThanOrEqual((box?.line.right ?? 0) + 0.5);
+  expect(box?.n ?? 0, "the job's name keeps its place").toBeGreaterThanOrEqual((box?.line.width ?? Infinity) * 0.4);
+});

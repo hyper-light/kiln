@@ -725,6 +725,9 @@ enum Ctl {
     /// There may be room on its machine for it to go to work: what waited for that goes, if it
     /// may now (`super::limit`).
     Room,
+    /// Its hand-over to this process is recorded (docs/ci.md W27-R08: a blue/green upgrade's): it
+    /// goes on at this epoch, its state saying so.
+    Epoch(u64),
     /// Its harness's hook asks before a tool call (Codex's, `codex::hook_args`): the answer goes to
     /// `reply`, at once or once what holds the call lets it go (`hold`).
     Hook(serde_json::Value, futures::channel::oneshot::Sender<serde_json::Value>),
@@ -828,6 +831,11 @@ impl Session {
     /// There may be room on its machine now for it to go to work ([`Ctl::Room`]).
     pub fn room(&self) {
         let _ = self.ctl.try_send(Ctl::Room);
+    }
+
+    /// It goes on at `epoch` ([`Ctl::Epoch`]): its hand-over to this process is recorded.
+    pub fn go_on_at(&self, epoch: u64) {
+        let _ = self.ctl.try_send(Ctl::Epoch(epoch));
     }
 
     /// Hand its harness process to this process's next image (an in-place upgrade, next):
@@ -1276,6 +1284,14 @@ fn queued(c: Command) -> Option<super::model::QueueItem> {
             Some(super::model::QueueItem { id: id.unwrap_or_else(crate::util::new_id), text, at, attachments: Vec::new(), overrides: None, reply_to: None })
         }
         _ => None,
+    }
+}
+
+/// The session goes on at `epoch` (epochs only rise): its state says so, sent with its next flush.
+fn raise_epoch(core: &mut Core, epoch: u64) {
+    if core.state.epoch < epoch {
+        core.state.epoch = epoch;
+        core.touch_state();
     }
 }
 
@@ -2627,6 +2643,7 @@ async fn files_in(s: &Session, sink: &Sink, mark: &crate::sync::runner::Mark, ct
                 Ok(Ctl::Close) | Err(_) => return Arrived::End { let_go: false },
                 // What it carries goes once it's on, asking for room then.
                 Ok(Ctl::Room) => {}
+                Ok(Ctl::Epoch(e)) => raise_epoch(&mut s.core.lock(), e),
                 // No harness of its runs here to hold a call.
                 Ok(Ctl::Hook(_, reply)) => {
                     let _ = reply.send(serde_json::json!({}));
@@ -2709,6 +2726,8 @@ where
         _ => Carry::Nothing,
     };
     let mut pkg = super::moving::pack(&s.id, spec, &cwd, &mv.to, &cwd, carry, events, state);
+    // Signed for as it goes, by its identity at the epoch it leaves (docs/ci.md W27-R08).
+    pkg.hand_on = crate::runner::custody::hand_on(&s.id, pkg.state.epoch, &pkg.events, "taken over by this machine's newer runner process");
     // Its harness's own record is here already: it goes on from it, nothing started anew.
     if matches!(pkg.carry, Carry::Nothing) {
         pkg.spec.resume = resume;
@@ -2905,6 +2924,8 @@ async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move, ids: &Carri
     // Paused for a limit: it goes on there, where it moved for room, the cut-off turn first.
     let cut = picks_up_there(&mut state);
     let mut pkg = super::moving::pack(&s.id, spec, &mv.cwd, &me, &from_cwd, carry, events, state);
+    // Signed for as it goes, by its identity at the epoch it leaves (docs/ci.md W27-R08).
+    pkg.hand_on = crate::runner::custody::hand_on(&s.id, pkg.state.epoch, &pkg.events, "moved to another machine");
     if let Some(home) = home {
         pkg = pkg.with_home(home);
     }
@@ -3221,6 +3242,22 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     None => match kind.launch(&spec, &s.id) {
                         Ok(mut p) => {
                             p.env(super::survivors::MARK, &s.id);
+                            // Its git signs as the agent, through this runner (W27-R03), where the
+                            // server issues identities, and pushes to kiln as the agent where the
+                            // server gives it a credential of its own; the person's own
+                            // configuration, key and credential never.
+                            let (sign, kiln) = (crate::runner::identity::enabled(), crate::runner::identity::kiln_git());
+                            if sign || !kiln.is_empty() {
+                                match crate::gitsign::installed() {
+                                    Ok(program) => {
+                                        let had = std::env::var("GIT_CONFIG_COUNT").ok().and_then(|n| n.parse().ok()).unwrap_or(0);
+                                        for (k, v) in crate::gitsign::git_env(&program, sign.then_some(crate::gitsign::AGENT_KEY), &kiln, had) {
+                                            p.env(k, v);
+                                        }
+                                    }
+                                    Err(e) => tracing::warn!(session = %s.id, error = %format!("{e:#}"), "its git won't sign or push as the agent"),
+                                }
+                            }
                             crate::proc::spawn_duplex_in_pool(p, crate::os::contain::Group::of(&s.id)).await
                         }
                         Err(e) => Err(e),
@@ -3526,6 +3563,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                             }
                             adapter.room(&mut core);
                         }
+                        Ev::Ctl(Some(Ctl::Epoch(e))) => raise_epoch(&mut s.core.lock(), e),
                         // Its harness's hook asks before a tool call: the adapter answers, at once or
                         // once a person lets the call go.
                         Ev::Ctl(Some(Ctl::Hook(input, reply))) => adapter.hook(&mut s.core.lock(), input, reply),
@@ -4000,6 +4038,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         break;
                     }
                 }
+                Ev::Ctl(Some(Ctl::Epoch(e))) => raise_epoch(&mut s.core.lock(), e),
                 Ev::Ctl(ctl @ (Some(Ctl::Close | Ctl::LetGo) | None)) => {
                     // Ending the agent ends what it left running that kiln took back over, and the
                     // rest of its group of processes, which then goes.

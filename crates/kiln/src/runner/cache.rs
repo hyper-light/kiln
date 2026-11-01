@@ -289,6 +289,8 @@ pub struct Found {
     pub key: String,
     pub downloaded: u64,
     pub local_bytes: u64,
+    /// Its content's SHA-256 (hex), as checked whole; none when only looked up.
+    pub digest: Option<String>,
 }
 
 /// The first entry `keys` name (the first key, then each restore key, as GitHub looks), its
@@ -302,7 +304,7 @@ pub async fn restore(svc: &Service<'_>, keys: &[String], version: &str, scope: &
     let id = v.get("id").and_then(Value::as_i64).unwrap_or_default();
     let key = v.get("key").and_then(Value::as_str).unwrap_or_default().to_owned();
     if look_only {
-        return Ok(Some(Found { key, downloaded: 0, local_bytes: 0 }));
+        return Ok(Some(Found { key, downloaded: 0, local_bytes: 0, digest: None }));
     }
     let want = v.pointer("/object/digest").and_then(Value::as_str).unwrap_or_default().to_owned();
     let list: Vec<(String, u64)> = v.pointer("/object/chunks").cloned().map(serde_json::from_value).transpose()?.unwrap_or_default();
@@ -335,7 +337,7 @@ pub async fn restore(svc: &Service<'_>, keys: &[String], version: &str, scope: &
     f.flush()?;
     let got = hex::encode(whole.finalize());
     anyhow::ensure!(got == want, "the cache's content hashes to sha256:{got}, not sha256:{want}");
-    Ok(Some(Found { key, downloaded, local_bytes }))
+    Ok(Some(Found { key, downloaded, local_bytes, digest: Some(got) }))
 }
 
 /// What a save sent.
@@ -343,6 +345,8 @@ pub struct Saved {
     pub chunks: usize,
     pub uploaded: u64,
     pub size: u64,
+    /// Its content's SHA-256 (hex).
+    pub digest: String,
 }
 
 /// `archive` as the entry `key`: its chunks cut, those the repository's caches lack uploaded
@@ -383,7 +387,7 @@ pub async fn save(svc: &Service<'_>, key: &str, version: &str, scope: &str, loca
         return Ok(None);
     }
     anyhow::ensure!((200..300).contains(&status), "{}", v.get("message").and_then(Value::as_str).unwrap_or("the cache refused the save"));
-    Ok(Some(Saved { chunks: list.len(), uploaded, size }))
+    Ok(Some(Saved { chunks: list.len(), uploaded, size, digest }))
 }
 
 /// Where this runner keeps one of a job's v1 `cache:` folders (docs/ci.md W02-R06, W24-R11):

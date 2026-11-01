@@ -6,14 +6,21 @@
 //! a minute as the backstop; every read sends the ETag it last got, so what hasn't changed answers
 //! 304, which GitHub doesn't count. When to read what is `kiln_ci::mirror`'s to say; this reads and
 //! writes.
+//!
+//! What the host verified of each commit's signature is kept too, in `host_verifications` (docs/ci.md
+//! W27-R03): GitHub's verdicts come on the commits it reads already; GitLab is asked of each commit
+//! it hasn't one of, once; Bitbucket verifies none, so each of its commits is kept `unknown`, saying
+//! so.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use kiln_ci::mirror::{Cadence, Mirror, Want};
+use kiln_seams::forge::{BITBUCKET_UNVERIFIED, Signature, Verification};
 use rusqlite::{OptionalExtension as _, params};
 use serde_json::{Value, json};
 
+use super::forge::{gitlab_signature_of, github_verification};
 use super::pulls::{self, On};
 use crate::hub::Hub;
 use crate::store::{Repo, Store};
@@ -144,6 +151,110 @@ fn commits_of(host: Host, v: &Value) -> Vec<String> {
         Host::Gitlab => v.as_array().into_iter().flatten().rev().map(|c| text(c, "/id")).collect(),
         Host::Bitbucket => v.get("values").and_then(Value::as_array).into_iter().flatten().rev().map(|c| text(c, "/hash")).collect(),
     }
+}
+
+/// A verdict's word, as `host_verifications` keeps it.
+fn signature_word(s: Signature) -> &'static str {
+    match s {
+        Signature::Verified => "verified",
+        Signature::Unverified => "unverified",
+        Signature::Unsigned => "unsigned",
+        Signature::Unknown => "unknown",
+    }
+}
+
+/// What the host verified of each of a pull request's commits, `listed` as its commits were read:
+/// GitHub's verdicts are on them; GitLab is asked of each commit kiln has none of from it yet;
+/// Bitbucket verifies none.
+async fn verdicts_of<F: Fetch>(store: &Store, r: &Mirrored, fetch: &F, listed: &Value) -> Vec<Verification> {
+    let unknown = |sha: String| Verification { sha, state: Signature::Unknown, reason: BITBUCKET_UNVERIFIED.to_owned(), signer: None, verified_at: None };
+    match r.host {
+        Host::Github => listed.as_array().into_iter().flatten().map(github_verification).filter(|v| !v.sha.is_empty()).collect(),
+        Host::Bitbucket => commits_of(r.host, listed).into_iter().filter(|s| !s.is_empty()).map(unknown).collect(),
+        Host::Gitlab => {
+            let shas: Vec<String> = commits_of(r.host, listed).into_iter().filter(|s| !s.is_empty()).collect();
+            let (repo, asked) = (r.repo_id.clone(), shas.clone());
+            let known: HashSet<String> = store
+                .call(move |c| {
+                    let mut q = c.prepare("SELECT 1 FROM host_verifications WHERE repo_id = ?1 AND sha = ?2 AND host = 'gitlab'")?;
+                    let mut out = HashSet::new();
+                    for sha in asked {
+                        if q.exists(params![repo, sha])? {
+                            out.insert(sha);
+                        }
+                    }
+                    Ok(out)
+                })
+                .await
+                .unwrap_or_default();
+            let id = super::gitlab::id(&r.name);
+            let mut out = Vec::new();
+            for sha in shas.into_iter().filter(|s| !known.contains(s)) {
+                match fetch.get(&format!("/projects/{id}/repository/commits/{sha}/signature"), None).await {
+                    Ok(got) => match gitlab_signature_of(&sha, got.status, &got.body) {
+                        Some(v) => out.push(v),
+                        None => tracing::debug!(repo = %r.name, %sha, status = got.status, said = %super::gitlab::said(&got.body), "GitLab didn't say what it verified of a commit"),
+                    },
+                    Err(e) => tracing::debug!(repo = %r.name, %sha, error = %format!("{e:#}"), "GitLab didn't say what it verified of a commit"),
+                }
+            }
+            out
+        }
+    }
+}
+
+/// Keeps `verdicts` in `host_verifications`, `at` (unix s): a verdict read again unchanged keeps
+/// when kiln first read it.
+async fn record(store: &Store, repo_id: &str, host: Host, verdicts: Vec<Verification>, at: i64) -> anyhow::Result<()> {
+    if verdicts.is_empty() {
+        return Ok(());
+    }
+    let (repo, host) = (repo_id.to_owned(), host.word());
+    store
+        .call(move |c| {
+            let tx = c.savepoint()?;
+            {
+                let mut q = tx.prepare(
+                    "INSERT INTO host_verifications (repo_id, sha, host, state, reason, signer, verified_at, read_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                     ON CONFLICT (repo_id, sha) DO UPDATE SET host = excluded.host, state = excluded.state, reason = excluded.reason, signer = excluded.signer, verified_at = excluded.verified_at, read_at = excluded.read_at
+                     WHERE host IS NOT excluded.host OR state IS NOT excluded.state OR reason IS NOT excluded.reason OR signer IS NOT excluded.signer OR verified_at IS NOT excluded.verified_at",
+                )?;
+                for v in &verdicts {
+                    // Read anew or changed: in the trail as kiln's word for what the host said.
+                    if q.execute(params![repo, v.sha, host, signature_word(v.state), v.reason, v.signer, v.verified_at, at])? > 0 {
+                        let said = kiln_ci::identity::trail::checked_by_host(&repo, host, &v.sha, signature_word(v.state), Some(&v.reason), v.signer.as_deref(), v.verified_at, at);
+                        crate::trail::own(&tx, kiln_ci::identity::trail::PAYLOAD_CHECKED, &said, at)?;
+                    }
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+}
+
+/// What the host verified of each of pull request `number`'s commits, as kept (docs/ci.md W27-R03):
+/// oldest first, its head last, `[{ sha, state, reason, signer, verified_at, read_at }]`; one kiln
+/// has no verdict on yet is `unknown`, saying so.
+pub async fn signatures(store: &Store, repo_id: &str, host: &str, number: u64) -> anyhow::Result<Vec<Value>> {
+    let (repo, host, num) = (repo_id.to_owned(), host.to_owned(), i64::try_from(number).unwrap_or(i64::MAX));
+    store
+        .call(move |c| {
+            let mut shas: Vec<String> = c.prepare("SELECT sha FROM host_pull_commits WHERE repo_id = ?1 AND host = ?2 AND number = ?3 ORDER BY position")?.query_map(params![repo, host, num], |r| r.get(0))?.collect::<Result<_, _>>()?;
+            shas.extend(c.query_row("SELECT sha FROM host_pull_heads WHERE repo_id = ?1 AND host = ?2 AND number = ?3 ORDER BY n DESC LIMIT 1", params![repo, host, num], |r| r.get::<_, String>(0)).optional()?);
+            let mut q = c.prepare("SELECT state, reason, signer, verified_at, read_at FROM host_verifications WHERE repo_id = ?1 AND sha = ?2")?;
+            let mut out = Vec::new();
+            for sha in shas {
+                let kept = q
+                    .query_row(params![repo, sha], |r| {
+                        Ok(json!({ "sha": sha, "state": r.get::<_, String>(0)?, "reason": r.get::<_, String>(1)?, "signer": r.get::<_, Option<String>>(2)?, "verified_at": r.get::<_, Option<i64>>(3)?, "read_at": r.get::<_, i64>(4)? }))
+                    })
+                    .optional()?;
+                out.push(kept.unwrap_or_else(|| json!({ "sha": sha, "state": "unknown", "reason": "kiln hasn't read what the host verified of it yet", "signer": null, "verified_at": null, "read_at": null })));
+            }
+            Ok(out)
+        })
+        .await
 }
 
 /// A pull request's reviews: who, approve | request_changes | comment, when (unix s).
@@ -291,6 +402,9 @@ async fn refresh<F: Fetch>(store: &Store, r: &Mirrored, fetch: &F, st: &mut Stat
     };
     let comments = read(fetch, st, &comments_path).await?;
     let fresh = |g: &Got| g.status == 200;
+    if fresh(&commits) {
+        record(store, &r.repo_id, r.host, verdicts_of(store, r, fetch, &commits.body).await, now / 1000).await?;
+    }
     let p = fresh(&pull).then(|| pull_of(r.host, &pull.body));
     let commits = fresh(&commits).then(|| commits_of(r.host, &commits.body));
     let reviews = match (r.host, &reviews) {

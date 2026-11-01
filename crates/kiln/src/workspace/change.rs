@@ -128,8 +128,9 @@ fn fail(code: StatusCode, msg: impl Into<String>) -> Fail {
 pub async fn ask_machine(hub: &Hub, info: &Info, ask: &super::Ask) -> Result<Value, Fail> {
     let machine = crate::harness::wait::machine(&info.target).to_owned();
     let answer = if machine == "local" {
-        // The server's own agents: their versions aren't kept here, so an agent's point is refused, saying so.
-        super::serve(std::path::Path::new(&info.cwd), std::path::Path::new(info.work_dir()), info.workspace.as_ref(), ask.clone(), &super::git::Versions::new()).await
+        // The server's own agents: their versions aren't kept here, so an agent's point is refused,
+        // saying so; and the server holds no agent's key, so what it commits of one stays unsigned.
+        super::serve(std::path::Path::new(&info.cwd), std::path::Path::new(info.work_dir()), info.workspace.as_ref(), ask.clone(), &super::git::Versions::new(), None).await
     } else {
         // A question only a newer runner answers isn't sent to one that can't.
         let wide = ask.wide_cap();

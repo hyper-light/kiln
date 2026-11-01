@@ -1603,6 +1603,8 @@ impl Hub {
         match ev {
             NetEvent::Connected { peer, name, binding } => {
                 self.tunnels.connected(peer, binding);
+                // A runner connecting again comes back under the peer id it joined with.
+                self.instances.lock().connected(peer);
                 if let Some(n) = name {
                     self.pending_peers.lock().insert(peer, n);
                 }
@@ -1953,6 +1955,9 @@ impl Hub {
             AgentMsg::Hello(_) | AgentMsg::Instance(_) => {}
             // What carries JSON came read (`wire::payload_of`), to `on_read`.
             AgentMsg::AiSessions { .. }
+            | AgentMsg::LegResults { .. }
+            | AgentMsg::LegSignature { .. }
+            | AgentMsg::Custody { .. }
             | AgentMsg::Identity { .. }
             | AgentMsg::Observe { .. }
             | AgentMsg::HeadroomStatus { .. }
@@ -2324,7 +2329,7 @@ impl Hub {
                     self.reach.lock().announce(agent, a);
                 }
             }
-            FromRunner::ReachAsk { req, ask } => match *ask {
+            FromRunner::ReachAsk { req, ask, raw } => match *ask {
                 crate::reach::Question::Directory => {
                     let answer = serde_json::json!({ "runners": self.reach_directory() });
                     self.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
@@ -2352,7 +2357,7 @@ impl Hub {
                 ask => {
                     let (hub, runner) = (Arc::clone(self), agent.to_owned());
                     crate::rt::spawn(async move {
-                        let answer = crate::mcp::runner_ask(&hub, &runner, &ask).await;
+                        let answer = crate::mcp::runner_ask(&hub, &runner, peer, &ask, &raw).await;
                         hub.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
                     });
                 }
@@ -2361,6 +2366,23 @@ impl Hub {
             FromRunner::AgentLimit(held) => crate::harness::limit::on_held(self, peer, agent, held),
             // An identity it asks for, for a key it made and keeps (docs/ci.md W27-R01).
             FromRunner::Identity(ask) => crate::identities::on_ask(self, peer, agent, ask).await,
+            // A leg's records, signed as the leg on its runner at its end (docs/ci.md W27-R05).
+            FromRunner::LegResults { job, bundles } => {
+                if self.owns_job(peer, &job) {
+                    crate::ci::signed::taken(self, agent, &job, bundles).await;
+                }
+            }
+            // The provenance kiln wrote of what a leg built, signed as the leg, or why not (W27-R06).
+            FromRunner::LegSignature { job, nonce, bundle, error } => {
+                if self.owns_job(peer, &job) {
+                    crate::ci::attest::leg_signed(self, agent, &job, &nonce, bundle, error).await;
+                }
+            }
+            // A signed custody record of one of its sessions' hand-overs (docs/ci.md W27-R08).
+            FromRunner::Custody(record) => {
+                let (hub, machine) = (Arc::clone(self), agent.to_owned());
+                crate::rt::spawn(async move { crate::custody::on_runner(&hub, peer, &machine, record).await });
+            }
             // Its replica's word in observe's group (docs/observe.md §5).
             FromRunner::Observe { msg, bytes } => crate::observe::hub::heard(agent, *msg, bytes),
             FromRunner::Harness { session, update } => match *update {
@@ -2417,7 +2439,14 @@ impl Hub {
                     if let Some(label) = holder {
                         self.harness.held_by(&session, &label);
                     }
+                    // Opened: the work kiln handed it as it started is asked to be signed for, as
+                    // it takes it up (docs/ci.md W27-R08).
+                    let opened = matches!(u, crate::harness::core::Update::Open { .. });
                     self.harness.ingest_from(self, &crate::harness::registry::Location::Machine(agent.to_owned()), &session, u, shipped);
+                    if opened {
+                        let (hub, id) = (Arc::clone(self), session.clone());
+                        crate::rt::spawn(async move { crate::custody::ask_open(&hub, &id).await });
+                    }
                     if closed {
                         self.check_retire().await;
                         self.check_handover().await;
@@ -2426,12 +2455,21 @@ impl Hub {
             },
             FromRunner::HarnessInventory(inv) => {
                 let mut inv = *inv;
-                // A copy it kept of a session that went on elsewhere since isn't its own (it
-                // lets go of it once it announces it).
+                // A copy it kept of a session that went on elsewhere since isn't its own: it's
+                // told to let go of it now, at its runner's first word since, not once the copy
+                // announces it again (W27-R08: the twin of 2026-10-25 ran on for ten minutes).
+                // One just arriving, its Open on its way, is kept.
+                let left = self.harness.left_behind(agent, &inv);
                 inv.sessions.retain(|id| self.harness.runs_on(id, agent));
+                for id in &left {
+                    crate::mcp::let_go(self, agent, peer, id).await;
+                }
                 // This process's sessions are its own; another process of the machine keeps
                 // the ones it holds (the registry forgets sessions a report leaves out), and
                 // so does one that isn't connected now (`Registry::holder`).
+                // Work kiln handed them that no receipt answers yet is asked for again.
+                let (hub, held) = (Arc::clone(self), inv.sessions.clone());
+                crate::rt::spawn(async move { crate::custody::ask_again(&hub, peer, &held).await });
                 let (me, present, others) = {
                     let mut inst = self.instances.lock();
                     for id in &inv.sessions {
@@ -2663,7 +2701,7 @@ impl Hub {
         }
         // It keeps the channel (docs/wire.md): said first, so a runner that keeps it too knows on
         // Welcome not to send its sessions whole. An older runner skips the frame.
-        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_HANDOVER | proto::CAP_WORK | proto::CAP_AGENT_LIMIT | proto::CAP_IDENTITY | proto::CAP_HEADROOM | proto::CAP_CHANGES_PATCH | proto::CAP_UNREAD }).await;
+        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_HANDOVER | proto::CAP_WORK | proto::CAP_AGENT_LIMIT | proto::CAP_IDENTITY | proto::CAP_HEADROOM | proto::CAP_CHANGES_PATCH | proto::CAP_UNREAD | proto::CAP_AGENT_GIT | proto::CAP_LEG_SIGNS | proto::CAP_CUSTODY }).await;
         // What its sessions' copies have here, so a stream it starts sends only what they lack
         // (`crate::wire::sums`): a few dozen sessions a frame, each about a kilobyte.
         for part in self.harness.kept_on(&name).chunks(KEPT_A_FRAME) {
@@ -2789,6 +2827,13 @@ impl Hub {
     pub fn runner_caps(&self, name: &str) -> u32 {
         let inst = self.instances.lock();
         inst.newest(name).and_then(|p| inst.get(p)).map_or(0, |i| i.caps)
+    }
+
+    /// Whether a machine's newest runner process has said its build and what it can do (`Build`,
+    /// which every runner but a pod sends as it connects, once it's worked its build out).
+    pub fn runner_built(&self, name: &str) -> bool {
+        let inst = self.instances.lock();
+        inst.newest(name).and_then(|p| inst.get(p)).is_some_and(|i| i.build.is_some())
     }
 
     /// What a machine's newest runner can do in 64 bits: `Build`'s 32 and the rest
@@ -3312,6 +3357,14 @@ impl Hub {
 
     fn pick_agent(&self, job: &Job) -> Option<String> {
         let declined = self.declined.lock().clone();
+        // A v1 job is written for what its runner can do, so a runner that hasn't said yet (it
+        // connected a moment ago) waits for its `Build`: one written before, its capabilities
+        // reading none, went to it out of step, read with no steps and passed without running
+        // (W05-R22). A pod never says, and its jobs are written for this build's own.
+        let built: std::collections::HashSet<String> = {
+            let names: Vec<String> = self.agents.lock().values().map(|a| a.name.clone()).collect();
+            names.into_iter().filter(|n| self.runner_built(n)).collect()
+        };
         let g = self.agents.lock();
         let incoming = job.spec.as_ref().map_or(kiln_ci::sched::state::Incoming::Ordinary, |s| v1_incoming(s.exclusive, &s.resources));
         let asked = job.spec.as_ref().map(|s| v1_asked(&s.resources)).unwrap_or_default();
@@ -3319,6 +3372,7 @@ impl Hub {
         let found = g
             .values()
             .filter(|a| a.connected && !a.draining && !a.exclusive && a.skew.takes_work())
+            .filter(|a| a.ephemeral || built.contains(&a.name))
             .filter(|a| !a.running.contains(&job.id))
             .filter(|a| {
                 declined

@@ -583,7 +583,7 @@
 }
 .jp-line {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) fit-content(50%);
   align-items: center;
   gap: 8px;
   padding: 0 8px 0 4px;
@@ -602,13 +602,17 @@
   white-space: nowrap;
 }
 /* A line's value, one width as it turns ("running" to "1m 05s"), read from its start: Chromium counts
-   end-aligned text that changes length as moved, so neither the value nor its words move. */
+   end-aligned text that changes length as moved, so neither the value nor its words move. A long one
+   (a pod's error) takes at most half the line and is cut short there, so the job's name keeps its
+   place and nothing runs past the line. */
 .jp-j .v {
   min-width: 7ch;
+  overflow: hidden;
   color: #8b8e96;
   font-family: var(--font-mono, ui-monospace, monospace);
   font-size: 10.5px;
   text-align: start;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 /* On a phone: under the picked line, the strip again and the job's output. */

@@ -151,7 +151,7 @@ pub async fn open(d: &Deploy, rr: &RepoRef) -> Result<Remote, String> {
         other => return Err(format!("{other}: kiln reaches release repositories on github, gitlab and bitbucket")),
     };
     let root = d.hub.cfg.data("deploy").join(host.kind()).join(crate::githost::host_of(host.web()).replace([':', '/'], "_"));
-    Ok(Remote { host, name: rr.repo.clone(), branch: rr.branch.clone(), mirror: Hosted::new(&root), mirrors: Arc::clone(&d.remote) })
+    Ok(Remote { host, name: rr.repo.clone(), branch: rr.branch.clone(), mirror: Hosted::new(&root).signing_as(Arc::clone(&d.hub.pki), "cd"), mirrors: Arc::clone(&d.remote) })
 }
 
 /// The GitLab `[[ci.gitlab]]` names whose token covers the project `path`.

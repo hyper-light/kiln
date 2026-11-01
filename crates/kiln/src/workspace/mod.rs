@@ -243,12 +243,14 @@ pub const WAIT: Duration = Duration::from_secs(240);
 /// [`crate::harness::session::Info::work_dir`]), the files a finding cites under its folder
 /// (`cwd`), and its workspace `ws` when it has one of its own: `{"facts"}`, `{"made", "said"}`,
 /// `{"drift"}`, `{"plan"}`, `{"landed"}`, or `{"error"}`. `versions`: how those who changed its
-/// files left them, for a compare of an agent's point (its session's machine knows them).
-pub async fn serve(cwd: &Path, work: &Path, ws: Option<&Workspace>, ask: Ask, versions: &git::Versions) -> Value {
+/// files left them, for a compare of an agent's point (its session's machine knows them). The
+/// commits it makes of the agent's work are signed as the agent with the key this machine holds in
+/// slot `sign` (W27-R03; `None`: none here, so unsigned), never with the person's.
+pub async fn serve(cwd: &Path, work: &Path, ws: Option<&Workspace>, ask: Ask, versions: &git::Versions, sign: Option<&str>) -> Value {
     let r = match ask {
         Ask::Cite { looks } => Ok(json!({"looks": crate::research::check::local(cwd, looks).await})),
         Ask::Compare { from, to, split, path, since_head } => git::compare(work, &from, &to, split, path.as_deref(), since_head.as_deref(), versions).await.map(|c| json!({"compared": c})),
-        ask => answer(work, ws, ask).await,
+        ask => answer(work, ws, ask, sign).await,
     };
     match r {
         Ok(v) => v,
@@ -265,7 +267,7 @@ fn own(ws: Option<&Workspace>) -> anyhow::Result<(&slates::Made, &str)> {
     }
 }
 
-async fn answer(cwd: &Path, ws: Option<&Workspace>, ask: Ask) -> anyhow::Result<Value> {
+async fn answer(cwd: &Path, ws: Option<&Workspace>, ask: Ask, sign: Option<&str>) -> anyhow::Result<Value> {
     match ask {
         Ask::Look => {
             let (m, over) = own(ws)?;
@@ -308,14 +310,14 @@ async fn answer(cwd: &Path, ws: Option<&Workspace>, ask: Ask) -> anyhow::Result<
             let facts = git::facts(cwd).await?;
             let top = Path::new(&facts.top);
             let who = git::identity(top, &c.fallback).await;
-            let Some(made) = git::commit(top, facts.head.as_deref(), c.paths.as_deref(), &c.message, &who).await? else {
+            let Some(made) = git::commit(top, facts.head.as_deref(), c.paths.as_deref(), &c.message, &who, sign).await? else {
                 anyhow::bail!("there's nothing to commit: the agent's files are as the folder's last commit has them");
             };
             let said = git::push(top, &c.to, &format!("+{}:{}", made.sha, c.to_ref), c.bearer.as_deref()).await?;
             Ok(json!({"made": made, "said": said}))
         }
         Ask::Stack(s) => {
-            let Some(made) = git::commit_on(cwd, s.on.as_deref(), &s.paths, &s.message, &s.fallback).await? else {
+            let Some(made) = git::commit_on(cwd, s.on.as_deref(), &s.paths, &s.message, &s.fallback, sign).await? else {
                 return Ok(json!({"nothing": true}));
             };
             let facts = git::facts(cwd).await?;
@@ -327,7 +329,7 @@ async fn answer(cwd: &Path, ws: Option<&Workspace>, ask: Ask) -> anyhow::Result<
             let facts = git::facts(cwd).await?;
             let top = Path::new(&facts.top);
             let who = git::identity(top, &r.fallback).await;
-            let made = git::restack(top, &r.commits, &r.paths, r.message.as_deref(), &who).await?;
+            let made = git::restack(top, &r.commits, &r.paths, r.message.as_deref(), &who, sign).await?;
             let pushes: Vec<Push> = made.iter().zip(&r.refs).filter_map(|(m, to)| to.clone().map(|to_ref| Push { sha: m.sha.clone(), to_ref, bearer: r.bearer.clone() })).collect();
             let (pushed, said, error) = push_all(top, r.to.as_deref(), &pushes).await;
             Ok(json!({"made": made, "pushed": pushed, "said": said, "push_error": error}))

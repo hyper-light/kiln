@@ -3,8 +3,10 @@
 //! rate limit as the host counts it (a read answered 304 free), the host's rate-limit headers on
 //! every answer, then answered from the simulator in the host's own shape: GitHub's pulls,
 //! stacks, asynchronous merges, pending reviews and GraphQL merge queue; GitLab's merge requests,
-//! rebases, merge trains and draft notes; Bitbucket's pull requests and comments. Who asks is the
-//! token: `Bearer person:<login>` is that person, any other kiln.
+//! rebases, merge trains and draft notes; Bitbucket's pull requests and comments; and what each
+//! verified of a change's commits' signatures (GitHub's commits' `verification`, GitLab's signature
+//! of each commit, Bitbucket's commits with none). Who asks is the token: `Bearer person:<login>` is
+//! that person, any other kiln.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -112,6 +114,22 @@ fn bb_pr(c: &Change) -> Value {
 
 fn gl_position(l: &Option<Line>) -> Value {
     l.as_ref().map_or(Value::Null, |l| json!({ "position_type": "text", "new_path": l.path, "new_line": l.line }))
+}
+
+/// One of a pull request's commits as GitHub lists it, with its `verification`.
+fn gh_commit(v: &Verification) -> Value {
+    let verified_at = v.verified_at.and_then(|t| time::OffsetDateTime::from_unix_timestamp(t).ok()).and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok());
+    let signature = (v.state != Signature::Unsigned).then_some("-----BEGIN PGP SIGNATURE-----");
+    json!({ "sha": v.sha, "commit": { "verification": { "verified": v.state == Signature::Verified, "reason": v.reason, "signature": signature, "payload": Value::Null, "verified_at": verified_at } },
+            "committer": v.signer.as_ref().map(|login| json!({ "login": login })) })
+}
+
+/// A page of `all`: the `page`th (from 1) of `per`.
+fn paged<T: Clone>(all: &[T], a: &Ask, per_key: &str, per_default: usize) -> (Vec<T>, bool) {
+    let n = |k: &str, d: usize| a.query.get(k).and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0).unwrap_or(d);
+    let (per, page) = (n(per_key, per_default), n("page", 1));
+    let from = per.saturating_mul(page.saturating_sub(1));
+    (all.iter().skip(from).take(per).cloned().collect(), all.len() > from.saturating_add(per))
 }
 
 fn verdict(event: &str) -> Verdict {
@@ -287,6 +305,10 @@ impl FakeForge {
                     MergeResult::Merged { commit, .. } => (200, json!({ "uuid": id, "status": "merged", "merge_commit_oid": commit }), None),
                     MergeResult::Failed { why } => (200, json!({ "uuid": id, "status": "failed", "message": why }), None),
                 }
+            }
+            (&M::GET, ["pulls", n, "commits"]) => {
+                let (page, _) = paged(&now(s.verifications(repo, num(n)?))?, a, "per_page", 30);
+                (200, json!(page.iter().map(gh_commit).collect::<Vec<_>>()), None)
             }
             (&M::GET, ["pulls", n, "reviews"]) => {
                 let n = num(n)?;
@@ -469,6 +491,18 @@ impl FakeForge {
                 num(n)?;
                 (201, json!({}), None)
             }
+            (&M::GET, ["merge_requests", n, "commits"]) => {
+                let newest: Vec<String> = now(s.verifications(repo, num(n)?))?.into_iter().rev().map(|v| v.sha).collect();
+                let (page, _) = paged(&newest, a, "per_page", 20);
+                (200, json!(page.iter().map(|sha| json!({ "id": sha, "short_id": sha.get(..8).unwrap_or(sha) })).collect::<Vec<_>>()), None)
+            }
+            (&M::GET, ["repository", "commits", sha, "signature"]) => {
+                let v = s.verification_of(repo, sha)?;
+                match v.state {
+                    Signature::Unsigned => (404, json!({ "message": "404 Signature Not Found" }), None),
+                    _ => (200, json!({ "signature_type": "PGP", "verification_status": v.reason, "gpg_key_user_email": v.signer, "commit_source": "gitaly" }), None),
+                }
+            }
             (&M::GET, ["merge_requests", n, "notes"]) => {
                 let out: Vec<Value> =
                     now(s.comments(repo, num(n)?))?.iter().map(|c| json!({ "id": c.id, "body": c.body, "author": { "username": c.author }, "system": false, "position": gl_position(&c.line) })).collect();
@@ -537,6 +571,13 @@ impl FakeForge {
             (&M::POST, ["pullrequests", n, "approve" | "request-changes"]) => {
                 num(n)?;
                 (200, json!({}), None)
+            }
+            (&M::GET, ["pullrequests", n, "commits"]) => {
+                let newest: Vec<String> = now(s.verifications(repo, num(n)?))?.into_iter().rev().map(|v| v.sha).collect();
+                let (page, more) = paged(&newest, a, "pagelen", 10);
+                let at = a.query.get("page").and_then(|p| p.parse::<usize>().ok()).unwrap_or(1);
+                let next = more.then(|| format!("{}?pagelen={}&page={}", a.path, a.query.get("pagelen").map_or("10", String::as_str), at.saturating_add(1)));
+                (200, json!({ "values": page.iter().map(|sha| json!({ "hash": sha })).collect::<Vec<_>>(), "next": next }), None)
             }
             _ => return Err(Refusal::NotFound { what: format!("{} {}", a.method, a.path) }),
         })
@@ -682,6 +723,57 @@ fn w26_ac09_fifty_open_pull_requests_cost_at_most_600_github_requests_an_hour() 
             assert_eq!(Some(c.head_sha.clone()), sim.tip(REPO, &c.head_ref), "change {n} as watched");
         }
         assert_eq!((watch.changes.len(), pushes), (50, 60));
+        Ok(())
+    })
+}
+
+/// W27-R03: githost reads what GitHub verified of a pull request of 251 commits: its first 250,
+/// oldest first, in three requests of 100.
+#[test]
+fn w27_r03_githost_reads_a_pull_requests_first_250_commits_in_three_requests() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let sim = SimForge::github();
+        let forge = forge_on(&start(sim.clone()).await?, &sim);
+        let mut pushed = Vec::new();
+        for i in 0..251 {
+            pushed.push(sim.push(REPO, "long", if i == 0 { TRUNK } else { "long" }, &format!("commit {i}"))?);
+        }
+        let first = pushed.first().cloned().unwrap_or_default();
+        sim.sign(REPO, &first, Signing::Known { signer: "alice".into() })?;
+        let n = forge.open(REPO, Open { head: "long".into(), base: TRUNK.into(), title: "long".into(), by: "alice".into() }).await?.number;
+        let before = sim.counted();
+        let read = forge.verifications(REPO, n).await?;
+        assert_eq!(sim.counted() - before, 3, "requests for 250 commits");
+        assert_eq!(read.iter().map(|v| v.sha.clone()).collect::<Vec<_>>(), pushed.get(..COMMITS_MOST).map(<[String]>::to_vec).unwrap_or_default());
+        let v = read.first().cloned().ok_or_else(|| anyhow::anyhow!("no commits"))?;
+        assert_eq!((v.state, v.reason.as_str(), v.signer.as_deref()), (Signature::Verified, "valid", Some("alice")));
+        assert_eq!(v.verified_at, i64::try_from(sim.now()).ok(), "verified as it was pushed, GitHub's time read back");
+        assert!(read.iter().skip(1).all(|v| v.state == Signature::Unsigned && v.reason == "unsigned"), "the rest unsigned");
+        Ok(())
+    })
+}
+
+/// W27-R03: githost asks GitLab for each commit's signature once: read again, a merge request's
+/// commits cost only their list.
+#[test]
+fn w27_r03_githost_asks_gitlab_for_each_commits_signature_once() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let sim = SimForge::gitlab();
+        let forge = forge_on(&start(sim.clone()).await?, &sim);
+        let a = sim.push(REPO, "mr", TRUNK, "a")?;
+        sim.sign(REPO, &a, Signing::Known { signer: "alice@example.com".into() })?;
+        let b = sim.push(REPO, "mr", "mr", "b")?;
+        sim.sign(REPO, &b, Signing::UnknownKey)?;
+        sim.push(REPO, "mr", "mr", "c")?;
+        let n = forge.open(REPO, Open { head: "mr".into(), base: TRUNK.into(), title: "mr".into(), by: "alice".into() }).await?.number;
+        let before = sim.counted();
+        let first = forge.verifications(REPO, n).await?;
+        assert_eq!(sim.counted() - before, 4, "the list and each commit's signature");
+        let said: Vec<(Signature, &str, Option<&str>)> = first.iter().map(|v| (v.state, v.reason.as_str(), v.signer.as_deref())).collect();
+        assert_eq!(said, vec![(Signature::Verified, "verified", Some("alice@example.com")), (Signature::Unverified, "unknown_key", None), (Signature::Unsigned, "unsigned", None)]);
+        let again = sim.counted();
+        assert_eq!(forge.verifications(REPO, n).await?, first);
+        assert_eq!(sim.counted() - again, 1, "read again: the list alone");
         Ok(())
     })
 }

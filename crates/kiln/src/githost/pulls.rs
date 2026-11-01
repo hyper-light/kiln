@@ -8,7 +8,8 @@
 //!   comment), and merging by the host's methods.
 //!
 //! Every provider's checks of the head commit come from kiln's own tables
-//! (`crate::ci::providers::checks`).
+//! (`crate::ci::providers::checks`), and what the host verified of each commit's signature from
+//! what the mirror keeps (`super::mirror::signatures`, docs/ci.md W27-R03).
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
@@ -309,7 +310,8 @@ fn files_of_diff(diff: &str) -> Vec<Value> {
         .collect()
 }
 
-/// One change with its conversation, threads, reviews, files and the host's merge methods.
+/// One change with its conversation, threads, reviews, files, the host's merge methods, and what
+/// the host verified of each of its commits.
 pub async fn get(hub: &Hub, repo: &Repo, number: u64) -> anyhow::Result<Value> {
     let mut out = match on(hub, repo).await? {
         On::Github(app, name) => {
@@ -486,6 +488,12 @@ pub async fn get(hub: &Hub, repo: &Repo, number: u64) -> anyhow::Result<Value> {
         let sha = o.get("sha").and_then(Value::as_str).unwrap_or_default().to_owned();
         let checks = crate::ci::providers::checks(hub, &repo.id, &sha).await.unwrap_or_else(|(_, e)| json!({ "error": e }));
         o.insert("checks".into(), checks);
+        let host = o.get("host").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let signatures = match super::mirror::signatures(&hub.store, &repo.id, &host, number).await {
+            Ok(commits) => json!({ "commits": commits }),
+            Err(e) => json!({ "error": format!("{e:#}") }),
+        };
+        o.insert("signatures".into(), signatures);
     }
     Ok(out)
 }

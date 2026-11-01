@@ -218,6 +218,7 @@ fn seams() -> Vec<Seam> {
                 format!("titles to {} bytes", forge::TITLE_MAX),
                 format!("{} merge requests a stack at most", forge::GITLAB_STACK_MOST),
                 format!("GitHub {} requests an hour, GitLab {}, Bitbucket {}", forge::GITHUB_HOURLY, forge::GITLAB_HOURLY, forge::BITBUCKET_HOURLY),
+                format!("a change's first {} commits", forge::COMMITS_MOST),
             ],
         },
         Seam {

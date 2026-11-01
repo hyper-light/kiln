@@ -111,7 +111,7 @@ fn shell() -> Option<String> {
 }
 
 #[cfg(unix)]
-fn request(req: &Request) -> anyhow::Result<Value> {
+pub(crate) fn request(req: &Request) -> anyhow::Result<Value> {
     request_for(req, std::time::Duration::from_secs(30))
 }
 
@@ -139,7 +139,7 @@ fn request_at(path: &std::path::Path, req: &Request, wait: std::time::Duration) 
 }
 
 #[cfg(not(unix))]
-fn request(_req: &Request) -> anyhow::Result<Value> {
+pub(crate) fn request(_req: &Request) -> anyhow::Result<Value> {
     anyhow::bail!("kiln spawn is not available on Windows yet")
 }
 

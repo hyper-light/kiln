@@ -1105,14 +1105,16 @@ mod tests {
     fn a_frame_made_unreadable_goes_marked_and_is_read_unmarked() {
         let mut o = Outbox::default();
         let (peer, lane) = (7, crate::proto::LANE_TERM);
-        o.faults = vec![(Shed { lane, variant: Some(46), every: 1, act: Act::Unknown(60) }, 0x9e37_79b9_7f4a_7c15)];
+        // One past the runner's last message, as many as there are (W27's came after main's 60).
+        let past = u8::try_from(crate::wire::agent_classes().len()).unwrap_or(u8::MAX);
+        o.faults = vec![(Shed { lane, variant: Some(46), every: 1, act: Act::Unknown(past) }, 0x9e37_79b9_7f4a_7c15)];
         let frame = vec![46u8, 1, 2, 3];
         assert_eq!(o.push(peer, lane, Kind::Term, frame.clone()), Push::Queued);
         let sent = o.queues.get(&(peer, lane)).and_then(|q| q.front()).map(|(_, d)| d.clone()).unwrap_or_default();
         assert!(sent.starts_with(&MARK), "{sent:?}");
-        assert_eq!(unmarked(&sent), [60u8, 1, 2, 3], "its index one past, the mark off");
+        assert_eq!(unmarked(&sent), [past, 1, 2, 3], "its index one past, the mark off");
         assert_eq!(unmarked(&frame), frame, "one not made unreadable is read as it went");
-        assert!(matches!(crate::proto::read_agent(&sent), Err(crate::proto::Unreadable::Unknown { index: 60, .. })), "read as it was made");
+        assert!(matches!(crate::proto::read_agent(&sent), Err(crate::proto::Unreadable::Unknown { index, .. }) if index == u64::from(past)), "read as it was made");
     }
 
     async fn next_event(rx: &async_channel::Receiver<NetEvent>, deadline: Instant) -> anyhow::Result<NetEvent> {

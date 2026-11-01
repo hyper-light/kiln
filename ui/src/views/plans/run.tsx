@@ -126,7 +126,7 @@ function Run({ v, onChange }: { v: PlanRunView; onChange: (v: PlanRunView) => vo
       {v.state !== "running" && error && <span className="plan-error">{error}</span>}
       <ol className="run-steps">
         {v.steps.map((s) => (
-          <Step key={s.n} s={s} stack={v.stack} busy={busy} onAct={(a) => void act(`${s.n}:${a}`, () => plansApi.step(v.id, s.n, a, s.tries))} />
+          <Step key={s.n} run={v.id} s={s} stack={v.stack} busy={busy} onAct={(a) => void act(`${s.n}:${a}`, () => plansApi.step(v.id, s.n, a, s.tries))} />
         ))}
       </ol>
     </>
@@ -175,7 +175,7 @@ function StepReview({ e, agentId, provider }: { e: StackStep; agentId: string | 
   );
 }
 
-function Step({ s, stack, busy, onAct }: { s: RunStep; stack: RunStack | null; busy: string | null; onAct: (a: "retry" | "take" | "met") => void }) {
+function Step({ run, s, stack, busy, onAct }: { run: string; s: RunStep; stack: RunStack | null; busy: string | null; onAct: (a: "retry" | "take" | "met") => void }) {
   const e = stack?.steps.find((x) => x.n === s.n);
   const a = s.agent;
   const live = s.stand === "working" || s.stand === "needs_you";
@@ -240,6 +240,11 @@ function Step({ s, stack, busy, onAct }: { s: RunStep; stack: RunStack | null; b
             </Button>
           )}
         </div>
+      )}
+      {(live || s.stand === "unmet" || s.stand === "stopped") && (
+        <p className="plan-dim run-what">
+          Taken over here, kiln signs your receipt of it for you: this browser has no key. To sign it yourself, <code>kiln login</code>, then <code>{`kiln plans take ${run} ${s.n}`}</code>.
+        </p>
       )}
     </li>
   );

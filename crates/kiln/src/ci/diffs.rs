@@ -525,6 +525,19 @@ pub async fn submit(hub: &Arc<Hub>, s: Submission<'_>) -> Result<Vec<Outcome>, S
     let started_by = s.started_by.clone();
     let by_text = started_by.as_ref().map(Value::to_string);
     let rows: Vec<(Planned, Option<(String, Option<String>)>)> = planned.into_iter().map(|p| { let f = found.get(&p.change).map(|(id, stack, _)| (id.clone(), stack.clone())); (p, f) }).collect();
+    // A new version of a change pushed as its author by one it changed hands from: refused, and
+    // recorded with the transfer that superseded them (docs/ci.md W27-R08).
+    for (p, existing) in &rows {
+        if let (Step::Version { .. }, Some((id, _))) = (&p.step, existing)
+            && let Ok(Some(d)) = find(hub, id).await
+            && !d.author.eq_ignore_ascii_case(&author)
+        {
+            let (_, why) = not_theirs(hub, &d, &author, "push of a version", &format!("push by {pushed_by}")).await;
+            if why.contains("changed hands") {
+                return Err(why);
+            }
+        }
+    }
     let (outcomes, fresh, asked, absorbed) = hub
         .store
         .call(move |c| {
@@ -1516,6 +1529,130 @@ async fn get(hub: &Hub, d: &Diff) -> Result<Value, Fail> {
     Ok(v)
 }
 
+/// A diff's authorship as its hand-overs name it (docs/ci.md W27-R08; the Transfers plan's step
+/// 7): "change <repo> <name>", by its repository and id.
+fn change_work(d: &Diff) -> kiln_ci::identity::statement::Subject {
+    crate::custody::work(&format!("change {} {}", d.repo, d.name), &[&d.repo, &d.id])
+}
+
+/// The identity author `author` (`user:kim`, `agent:<id>`, the owner) signs as: a person's, or an
+/// agent session's as kiln last certified it.
+pub(crate) async fn identity_of(hub: &Hub, author: &str) -> String {
+    let org = hub.pki.organization();
+    if let Some(id) = author.strip_prefix("agent:") {
+        if let Ok(Some((_, holder))) = crate::identities::newest_holder(&hub.store, id).await {
+            return holder;
+        }
+        if let Ok(at) = crate::identities::agent_at(hub, id, hub.harness.epoch_of(id)).await {
+            return at;
+        }
+    }
+    crate::custody::person_uri(&org, &crate::identities::person_of(author))
+}
+
+/// `d`'s authorship changes hands from `from` to `to` (authors as diffs name them), signed: kiln's
+/// take for `from`, who isn't here to sign (commandeered from them), or their own hand-on when given
+/// (`given`: its digest); then `to`'s receipt, an agent's asked of its runner, a person's kiln's for
+/// them on their signed-in session (their own, when they sign it: [`take`]). Its digest.
+async fn hand_authorship(hub: &Hub, d: &Diff, from: &str, to: &str, why: &str, given: Option<String>) -> Option<String> {
+    let (giver, taker, thing) = (identity_of(hub, from).await, identity_of(hub, to).await, change_work(d));
+    let hand_on = match given {
+        Some(h) => h,
+        None => match crate::custody::hand_work(hub, thing.clone(), &taker, &format!("{why}: kiln's take for {from}, who didn't sign it"), crate::custody::Giver::For(giver.clone())).await {
+            Ok((digest, _)) => digest,
+            Err(e) => {
+                tracing::warn!(target: "kiln.custody", diff = %d.name, error = %format!("{e:#}"), "a change's authorship changed hands unsigned: kiln's take wasn't kept");
+                return None;
+            }
+        },
+    };
+    received_authorship(hub, d, to, &taker, &hand_on, &giver, why).await;
+    Some(hand_on)
+}
+
+/// `to` (identity `taker`) receives `d`'s authorship, handed on as `hand_on` by `giver`: an agent's
+/// receipt asked of its runner, a person's kiln's for them on their signed-in session.
+async fn received_authorship(hub: &Hub, d: &Diff, to: &str, taker: &str, hand_on: &str, giver: &str, why: &str) {
+    if let Some(agent) = to.strip_prefix("agent:") {
+        if let Ok(Some((_, bundle))) = crate::custody::waiting_for(&hub.store, taker, &change_work(d)).await {
+            crate::custody::ask_receipt(hub, agent, &bundle).await;
+        }
+        return;
+    }
+    if let Err(e) = crate::custody::receive_for(hub, taker, change_work(d), hand_on, giver, why).await {
+        tracing::warn!(target: "kiln.custody", diff = %d.name, error = %format!("{e:#}"), "a change's new author's receipt wasn't kept");
+    }
+}
+
+/// Author `who` acting on `d` (`action`), which isn't theirs: refused. A former author of it (the
+/// change handed on from them since) is refused saying so, and recorded with the transfer that
+/// superseded them (docs/ci.md W27-R08).
+async fn not_theirs(hub: &Hub, d: &Diff, who: &str, action: &str, came_from: &str) -> Fail {
+    let me = identity_of(hub, who).await;
+    match crate::custody::handed_from(&hub.store, &hub.pki.organization(), &me, &change_work(d)).await {
+        Ok(Some(transfer)) => {
+            let why = format!("{} changed hands: its author is {} now (transfer {transfer}); {who}'s {action} as its author is refused", d.name, d.author);
+            if let Err(e) = crate::custody::refused_former(&hub.store, &format!("{action} of {} {}", d.repo, d.name), &me, &why, &transfer, came_from, crate::util::now_unix()).await {
+                tracing::warn!(target: "kiln.custody", diff = %d.name, error = %format!("{e:#}"), "a former author's refusal wasn't recorded");
+            }
+            (StatusCode::FORBIDDEN, why)
+        }
+        _ => (StatusCode::FORBIDDEN, format!("{} is {}'s: commandeer it first", d.name, d.author)),
+    }
+}
+
+/// The author gives `d` to `to` (`user:<name>`, `agent:<id>`), signed (docs/ci.md W27-R08): their
+/// own hand-on when they send it signed on their device (`hand_on`), else kiln's take for them on
+/// their signed-in session; `d` stays theirs until `to` takes it ([`take`]).
+async fn give(hub: &Hub, d: &Diff, caller: &Caller, body: &Value) -> Result<Value, Fail> {
+    let who = author_of(&caller.name, Some(caller.kind)).0;
+    if !(caller.is_owner() || d.author.eq_ignore_ascii_case(&who)) {
+        return Err(not_theirs(hub, d, &who, "give", &format!("api:{}", caller.name)).await);
+    }
+    let to = body.get("to").and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty()).ok_or_else(|| (StatusCode::BAD_REQUEST, "`to`: whom to give it to (user:<name>, agent:<id>)".to_owned()))?;
+    if to.eq_ignore_ascii_case(&d.author) {
+        return Err((StatusCode::CONFLICT, format!("{} is {to}'s already", d.name)));
+    }
+    let (giver, taker, thing) = (identity_of(hub, &d.author).await, identity_of(hub, to).await, change_work(d));
+    let why = format!("{} given to {to} by {}", d.name, d.author);
+    let hand_on = match body.get("hand_on") {
+        Some(b) => crate::custody::person_hand_on(hub, &giver, &taker, &thing, b, &format!("api:{}", caller.name)).await.map_err(fail)?.map_err(|w| (StatusCode::UNPROCESSABLE_ENTITY, w))?,
+        None => {
+            let why = format!("{why}: kiln's take for them, on their signed-in session; their own signature is missing: no key on the device that asked");
+            crate::custody::hand_work(hub, thing, &taker, &why, crate::custody::Giver::For(giver)).await.map_err(fail)?.0
+        }
+    };
+    hub.store.audit(caller.name.clone(), "diffs.give".into(), format!("{} {} to {to}", d.repo, d.name)).await;
+    Ok(json!({ "given": { "to": to, "hand_on": hand_on }, "author": d.author }))
+}
+
+/// `caller` takes `d`, given to them ([`give`]): their receipt, their own when they send it signed
+/// on their device (`receipt`), else kiln's for them; `d` is theirs from then on (docs/ci.md
+/// W27-R08).
+async fn take(hub: &Hub, d: &Diff, caller: &Caller, body: &Value) -> Result<Value, Fail> {
+    let who = author_of(&caller.name, Some(caller.kind)).0;
+    let me = identity_of(hub, &who).await;
+    let Some((hand_on, _)) = crate::custody::waiting_for(&hub.store, &me, &change_work(d)).await.map_err(fail)? else {
+        return Err((StatusCode::CONFLICT, format!("{} wasn't given to {who}", d.name)));
+    };
+    match body.get("receipt") {
+        Some(r) => {
+            crate::custody::person_receipt(hub, &me, &hand_on, r, &format!("api:{}", caller.name)).await.map_err(fail)?.map_err(|w| (StatusCode::UNPROCESSABLE_ENTITY, w))?;
+        }
+        None => received_authorship(hub, d, &who, &me, &hand_on, &identity_of(hub, &d.author).await, &format!("{} given to {who}", d.name)).await,
+    }
+    let (id, author, for_c) = (d.id.clone(), who.clone(), acting_for(&caller.name));
+    hub.store
+        .call(move |c| {
+            c.execute("UPDATE diffs SET author = ?2, author_for = ?3, updated_at = ?4 WHERE id = ?1", params![id, author, for_c, crate::util::now_unix()])?;
+            Ok(())
+        })
+        .await
+        .map_err(fail)?;
+    hub.store.audit(caller.name.clone(), "diffs.take".into(), format!("{} {}", d.repo, d.name)).await;
+    Ok(json!({ "author": who, "hand_on": hand_on }))
+}
+
 /// The author's actions (and commandeering): `ready`, `abandon`, `reclaim`, `commandeer`.
 async fn act(hub: &Hub, d: &Diff, action: &str, caller: &Caller) -> Result<Value, Fail> {
     let who = author_of(&caller.name, Some(caller.kind)).0;
@@ -1524,7 +1661,7 @@ async fn act(hub: &Hub, d: &Diff, action: &str, caller: &Caller) -> Result<Value
     let (to, author) = match action {
         "commandeer" if state.is_open() => (state, Some(who.clone())),
         "commandeer" => return Err((StatusCode::CONFLICT, format!("{} is {}: reclaim it first", d.name, d.state))),
-        _ if !theirs => return Err((StatusCode::FORBIDDEN, format!("{} is {}'s: commandeer it first", d.name, d.author))),
+        _ if !theirs => return Err(not_theirs(hub, d, &who, action, &format!("api:{}", caller.name)).await),
         "ready" if state == State::Draft => (State::NeedsReview, None),
         "ready" => return Err((StatusCode::CONFLICT, format!("{} is {}, not a draft", d.name, d.state))),
         "abandon" if state.is_open() && state != State::Landing => (State::Abandoned, None),
@@ -1545,6 +1682,12 @@ async fn act(hub: &Hub, d: &Diff, action: &str, caller: &Caller) -> Result<Value
         .await
         .map_err(fail)?;
     hub.store.audit(caller.name.clone(), format!("diffs.{action}"), format!("{} {}", d.repo, d.name)).await;
+    // Commandeered, its authorship changes hands signed: kiln's take for the author it was taken
+    // from, and the new author's receipt (docs/ci.md W27-R08).
+    if action == "commandeer" && !d.author.eq_ignore_ascii_case(&who) {
+        let why = format!("{} commandeered by {who} from {}", d.name, d.author);
+        hand_authorship(hub, d, &d.author, &who, &why, None).await;
+    }
     // GitHub's events for it (W03-R02's native table): workflows see the diff as it is now.
     let event = match action {
         "ready" => Some("ready_for_review"),
@@ -1664,6 +1807,7 @@ pub async fn route(hub: &Arc<Hub>, method: &Method, segs: &[&str], q: &HashMap<S
         (&Method::POST, ["repos", repo, "submit"]) => ok(submit_patches(hub, repo, caller, body).await?),
         (&Method::POST, ["comments", id, "apply"]) => ok(super::review::apply_suggestion(hub, id, caller, body).await?),
         (&Method::GET, ["repos", repo, "queue"]) => ok(super::land::list(hub, repo).await?),
+        (&Method::GET, ["repos", repo, "lands", commit]) => ok(super::lands::get(hub, repo, commit).await?),
         // W28-R109: a host's changes into its host's own queue, each at the head Review cleared.
         (&Method::POST, ["repos", repo, "queue"]) => ok(super::land::enqueue_route(hub, repo, body, &caller.name).await?),
         (&Method::GET, ["stacks", id]) => ok(stack(hub, id).await?),
@@ -1689,6 +1833,7 @@ pub async fn route(hub: &Arc<Hub>, method: &Method, segs: &[&str], q: &HashMap<S
         }
         (&Method::POST, ["review", "inbox", "read"]) => ok(super::inbox::read(hub, caller, body).await?),
         (&Method::PATCH, ["comments", id]) => ok(super::review::edit(hub, id, caller, body).await?),
+        (&Method::POST, ["comments", id, "statement"]) => ok(super::verdicts::edit_statement(hub, id, caller, body).await?),
         (&Method::DELETE, ["comments", id]) => ok(super::review::delete(hub, id, caller).await?),
         (&Method::DELETE, ["queue", id]) => ok(super::land::cancel(hub, id, caller).await?),
         // Review holds, lets go of or withdraws an entry (docs/ci.md W28-R104).
@@ -1756,6 +1901,8 @@ pub async fn route(hub: &Arc<Hub>, method: &Method, segs: &[&str], q: &HashMap<S
                 (&Method::POST, ["conflicts", id, "resolution"]) => ok(super::conflicts::resolve(hub, &d, id, caller, body).await?),
                 (&Method::DELETE, ["conflicts", id, "resolution"]) => ok(super::conflicts::undo(hub, &d, id, caller).await?),
                 (&Method::POST, ["review"]) => ok(super::review::review(hub, &d, caller, body).await?),
+                (&Method::POST, ["statement"]) => ok(super::verdicts::statement(hub, &d, caller, body).await?),
+                (&Method::GET, ["verdicts"]) => ok(super::verdicts::list(hub, &d).await?),
                 (&Method::POST, ["viewed"]) => ok(super::review::viewed(hub, &d, caller, body).await?),
                 (&Method::GET, ["land"]) => ok(super::review::readiness(hub, &d).await?.json()),
                 (&Method::POST, ["land"]) => {
@@ -1769,6 +1916,20 @@ pub async fn route(hub: &Arc<Hub>, method: &Method, segs: &[&str], q: &HashMap<S
                         return Err((StatusCode::FORBIDDEN, format!("{action} needs `diffs.submit`")));
                     }
                     ok(act(hub, &d, action, caller).await?)
+                }
+                // A review request passed on to another reviewer, and taken by them, signed (W27-R08).
+                (&Method::POST, ["reviewers", action @ ("pass" | "take")]) => {
+                    if !caller.can("diffs.review", &Scope::Repo { repo: d.repo.clone() }) {
+                        return Err((StatusCode::FORBIDDEN, format!("{action} needs `diffs.review`")));
+                    }
+                    ok(if *action == "pass" { super::review::pass(hub, &d, caller, body).await? } else { super::review::take_passed(hub, &d, caller, body).await? })
+                }
+                // A change given to another author, and taken by them, signed (W27-R08).
+                (&Method::POST, [action @ ("give" | "take")]) => {
+                    if !caller.can("diffs.submit", &Scope::Repo { repo: d.repo.clone() }) {
+                        return Err((StatusCode::FORBIDDEN, format!("{action} needs `diffs.submit`")));
+                    }
+                    ok(if *action == "give" { give(hub, &d, caller, body).await? } else { take(hub, &d, caller, body).await? })
                 }
                 (&Method::PATCH, []) => {
                     if !caller.can("diffs.submit", &Scope::Repo { repo: d.repo.clone() }) {

@@ -561,6 +561,34 @@ fn c19<F: ForgeFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     })
 }
 
+fn c20<F: ForgeFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
+    Box::pin(async move {
+        let verifies = abilities(f).await?.verifies;
+        same("whether it verifies signatures", verifies, f.host() != Host::Bitbucket)?;
+        let sign = |sha: &str, how: Signing| f.git().sign(f.repo(), sha, how).map_err(|e| format!("sign {sha}: {e}"));
+        let known = push(f, "signed", TRUNK, "by a key the host has")?;
+        sign(&known, Signing::Known { signer: "alice".into() })?;
+        let unknown = push(f, "signed", "signed", "by a key it hasn't")?;
+        sign(&unknown, Signing::UnknownKey)?;
+        let unsigned = push(f, "signed", "signed", "unsigned")?;
+        let c = open(f, "signed", TRUNK, "alice").await?;
+        let got = fine("verifications", f.forge().verifications(f.repo(), c.number).await)?;
+        same("its commits, oldest first", got.iter().map(|v| v.sha.as_str()).collect::<Vec<_>>(), vec![known.as_str(), unknown.as_str(), unsigned.as_str()])?;
+        ensure(got.iter().all(|v| !v.reason.trim().is_empty()), || format!("a verdict without its reason: {got:?}"))?;
+        let said: Vec<(Signature, Option<&str>)> = got.iter().map(|v| (v.state, v.signer.as_deref())).collect();
+        let want = if verifies {
+            vec![(Signature::Verified, Some("alice")), (Signature::Unverified, None), (Signature::Unsigned, None)]
+        } else {
+            vec![(Signature::Unknown, None); 3]
+        };
+        same("what the host verified of each", said, want)?;
+        match refused("a change never opened", f.forge().verifications(f.repo(), 9999).await)? {
+            Refusal::NotFound { .. } => Ok(()),
+            other => Err(format!("a change never opened: refused {other:?}, not NotFound")),
+        }
+    })
+}
+
 /// The `Forge` contract, clause by clause (docs/seams.md, "Forge").
 pub fn cases<F: ForgeFixture>() -> Vec<Case<F>> {
     vec![
@@ -583,6 +611,7 @@ pub fn cases<F: ForgeFixture>() -> Vec<Case<F>> {
         Case { id: "FORGE-17", says: "a merged change refuses updates, merges, queueing, stacking and drafts: Closed", check: c17::<F> },
         Case { id: "FORGE-18", says: "bad requests are refused Invalid and change nothing: a branch that isn't there, a change into itself or from a branch with one open, a blank title, a blank or long comment, an empty stack", check: c18::<F> },
         Case { id: "FORGE-19", says: "unstacking takes a stack's unmerged changes out of it, leaving those queued in place, and dissolves it once none are left; a host that can't refuses Unsupported", check: c19::<F> },
+        Case { id: "FORGE-20", says: "a change's commits are read oldest first with what the host verified of each signature, and why: one by a key the host has as its signer's Verified, naming them; one by a key it hasn't Unverified; one unsigned Unsigned; a host that verifies none (its abilities say) says Unknown of each; a change never opened is refused NotFound", check: c20::<F> },
     ]
 }
 

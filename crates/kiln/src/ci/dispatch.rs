@@ -2543,6 +2543,10 @@ impl Dispatch {
         if let Err(e) = super::secrets::record_uses(&self.hub, leg, used_ids).await {
             tracing::warn!(leg, error = %format!("{e:#}"), "secret uses could not be recorded");
         }
+        // What kiln hands the leg, as its receipt of it will name it (docs/ci.md W27-R05).
+        if let Err(e) = super::signed::handed(&self.hub, leg, attempt, &json).await {
+            tracing::warn!(leg, error = %format!("{e:#}"), "what the leg was handed could not be recorded");
+        }
         // In a `k8s` pool's pod it runs in the pod's own container (W13-R07): a terminal into it is
         // an exec into the pod, not a shell on a machine (W17-R01).
         let recorded = if self.hub.pod_executors.lock().contains_key(runner) { "k8s" } else { executor.as_deref().unwrap_or("host") };
@@ -2845,18 +2849,7 @@ impl Dispatch {
                 self.hub.emit_job(leg).await;
             }
             JobEventV2::StepFinished { idx, outcome, conclusion, exit_code, outputs } => {
-                let status = match conclusion {
-                    wire::Conclusion::Success => {
-                        if outcome == wire::Conclusion::Failure {
-                            Status::Failed
-                        } else {
-                            Status::Succeeded
-                        }
-                    }
-                    wire::Conclusion::Failure => Status::Failed,
-                    wire::Conclusion::Cancelled => Status::Cancelled,
-                    wire::Conclusion::Skipped => Status::Skipped,
-                };
+                let status = runs::step_status(outcome, conclusion);
                 let word = |c: wire::Conclusion| serde_json::to_value(c).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default();
                 runs::step_finished(&self.hub, leg, idx, status, &word(outcome), &word(conclusion), exit_code, serde_json::to_string(&outputs).unwrap_or_default()).await?;
                 self.hub.logs.step(leg, idx, status.as_str());
