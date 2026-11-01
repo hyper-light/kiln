@@ -1148,12 +1148,13 @@ fn w27_ac04_approval_carried() -> anyhow::Result<()> {
 }
 
 /// W27-R08 (the Transfers plan's step 12): custody between machines, a part for each path of
-/// docs/ci.md W27's inventory, each a helper of its own the test calls in turn on one kiln and two
+/// docs/ci.md W27's inventory, each a helper of its own the test calls in turn on one kiln and its
 /// runners: a runner's objects from its peers ([`peers_objects`]), kiln's store of bytes
-/// ([`store_of_bytes`]) and the conversation feed ([`feed_batches`]). Each signed by both sides
-/// and walking unbroken, and each changed on its way (a test build's faults: box-b's
-/// `peer_object_changed` and `feed_changed`, the server's `blob_changed`) refused where it would be
-/// used and recorded as a break at its hop.
+/// ([`store_of_bytes`]), the conversation feed ([`feed_batches`]), and kiln run's sync and a reach
+/// run ([`synced_runs`]). Each signed by both sides and walking unbroken, and each changed on its
+/// way (a test build's faults: box-b's `peer_object_changed` and `feed_changed`, the server's
+/// `blob_changed`, box-d's `sync_file_changed`) refused where it would be used and recorded as a
+/// break at its hop.
 #[cfg(feature = "chaos")]
 #[test]
 fn w27_r08_custody_between_machines() -> anyhow::Result<()> {
@@ -1167,12 +1168,17 @@ fn w27_r08_custody_between_machines() -> anyhow::Result<()> {
     let env = [("FAKE_CLAUDE_RECORD", "1"), ("CLAUDE_CONFIG_DIR", claude.as_str())];
     let (_a, log_a) = agents::runner_with(dir.path(), port, "box-a", None, TALK, &env)?;
     let (_b, log_b) = agents::runner_with(dir.path(), port, "box-b", Some("peer_object_changed,feed_changed"), TALK, &env)?;
-    for (name, log) in [("box-a", &log_a), ("box-b", &log_b)] {
+    // kiln run's (synced_runs): box-c hosts a session, box-d's syncs change on their way. All four
+    // are up before any runner reads the directory, which a runner keeps 30 s.
+    let (_c, log_c) = agents::runner_with(dir.path(), port, "box-c", None, TALK, &env)?;
+    let (_d, log_d) = agents::runner_with(dir.path(), port, "box-d", Some("sync_file_changed"), TALK, &[])?;
+    for (name, log) in [("box-a", &log_a), ("box-b", &log_b), ("box-c", &log_c), ("box-d", &log_d)] {
         agents::connected(port, admin, name, log, Duration::from_secs(60))?;
     }
     peers_objects(dir.path(), port, admin)?;
     store_of_bytes(dir.path(), port, admin)?;
     feed_batches(dir.path(), port, admin, &cwd)?;
+    synced_runs(dir.path(), port, admin)?;
     Ok(())
 }
 
@@ -1283,6 +1289,119 @@ fn peers_objects(dir: &Path, port: u16, admin: &str) -> anyhow::Result<()> {
     assert_eq!((custodian(record)?, custodian(follows)?), (a_uri, b_uri), "box-a's receipt of box-b's hand-on: {broke}");
     let r = a.request("HEAD", &format!("/_kiln/cas/v1/objects/{changed}"), &[("authorization", &a_token)], b"")?;
     assert_eq!(r.status, 404, "box-a kept nothing of the changed copy");
+    Ok(())
+}
+
+/// A chain's hops as (kind, custodian, whom it's held for, the delegation it's under).
+#[cfg(feature = "chaos")]
+fn hops_held(v: &Value) -> Vec<(String, String, String, String)> {
+    v.get("hops").and_then(Value::as_array).into_iter().flatten().map(|h| (field(h, "kind").to_owned(), field(h, "custodian").to_owned(), field(h, "for").to_owned(), field(h, "under").to_owned())).collect()
+}
+
+/// [`w27_r08_custody_between_machines`]'s kiln run's sync and reach run (the Transfers plan's step
+/// 12, its example), on the runners it started: kiln run on box-b for an agent session on box-c. The session hands its
+/// workspace (its folder's tree, by `kiln run --reuse`'s digest) and the run on to box-b's runner
+/// process, with a delegation to receive both for it; box-b receives each for the session under
+/// that delegation, and hands the run's output back, which the session receives: every hop signed
+/// by both sides. Then box-d, whose sync changes a file on its way (its `sync_file_changed`), runs on
+/// box-b: box-b refuses the copy before anything runs in it, and kiln records the break at that hop
+/// and the refusal.
+#[cfg(feature = "chaos")]
+fn synced_runs(dir: &Path, port: u16, admin: &str) -> anyhow::Result<()> {
+    use kiln::reach::local::{Client, Ev, Req, RunReq};
+    let cwd = dir.join("work-c");
+    let home = dir.join("home");
+    let _harnesses = Harnesses::new(&cwd, &home)?;
+    let id = agents::open_session(port, admin, "box-c", &cwd, Duration::from_secs(60))?;
+    let epoch = first_epoch(port, admin, &id)?;
+    let harness: i64 = until(Duration::from_secs(60), || {
+        let said = std::fs::read_to_string(cwd.join(".fake-claude-messages"))?;
+        Ok(said.lines().find_map(|l| serde_json::from_str::<Value>(l).ok()?.get("pid")?.as_i64()))
+    })?;
+    // The session's workspace, a repository in its folder, and its run on box-b, as the session's
+    // own child.
+    let repo = cwd.join("app");
+    std::fs::create_dir_all(&repo)?;
+    let said = "built on box-b for the session\n";
+    std::fs::write(repo.join("data.txt"), said)?;
+    for args in [&["init", "-q"][..], &["add", "."], &["commit", "-qm", "one"]] {
+        git(&home, &repo, args)?;
+    }
+    let tree = kiln::reach::reuse::tree(&repo)?;
+    std::fs::write(cwd.join(format!(".fake-claude-acts-{harness}")), format!("cd {} && {} run --on box-b -- cat data.txt\n", repo.display(), env!("CARGO_BIN_EXE_kiln")))?;
+    let acted = until(Duration::from_secs(120), || Ok(std::fs::read_to_string(cwd.join(".fake-claude-acted")).ok().filter(|t| !t.is_empty())))?;
+    let run: Value = serde_json::from_str(acted.lines().next().unwrap_or_default())?;
+    assert!(run.get("code") == Some(&json!(0)) && field(&run, "out").contains(said.trim_end()), "the session's run on box-b: {run}");
+    let chain_of = |d: &str| -> anyhow::Result<Value> {
+        let (_, body) = http(port, "GET", &format!("/api/custody?digest=sha256:{d}"), admin, None)?;
+        Ok(serde_json::from_str(&body).unwrap_or_default())
+    };
+    let unbroken = |d: &str, n: usize| {
+        until(Duration::from_secs(90), || {
+            let v = chain_of(d)?;
+            Ok((v.get("unbroken") == Some(&json!(true)) && hops_held(&v).len() == n).then_some(v))
+        })
+        .map_err(|e| anyhow::anyhow!("{e}: {}\n{}", chain_of(d).unwrap_or_default(), said_of(dir, port, admin, &id)))
+    };
+    let session = format!("/agent/{id}/epoch/{epoch}");
+    let (on_c, on_b) = (format!("{session}/machine/box-c/"), "/machine/box-b/".to_owned());
+    // The workspace: the session's hand-on on box-c, box-b's receipt for it under its delegation.
+    let ws = unbroken(&tree, 2)?;
+    match hops_held(&ws).as_slice() {
+        [(r, taker, held, under), (h, giver, _, _)] if r == "received" && taker.contains(&on_b) && held.ends_with(&session) && !under.is_empty() && h == "handed-on" && giver.contains(&on_c) => {}
+        other => anyhow::bail!("box-b's receipt of the session's workspace, for it under its delegation: {other:?}"),
+    }
+    assert!(half_named(&ws) == 0, "each hop names both sides, signed: {ws}");
+    // The run and its output, walked back from the output the session received.
+    let out = unbroken(&kiln::util::sha256_hex(said.as_bytes()), 4)?;
+    match hops_held(&out).as_slice() {
+        [(r_out, s1, _, _), (h_out, b1, _, _), (r_run, b2, held, under), (h_run, s2, _, _)]
+            if (r_out.as_str(), h_out.as_str(), r_run.as_str(), h_run.as_str()) == ("received", "handed-on", "received", "handed-on")
+                && s1.contains(&on_c)
+                && b1.contains(&on_b)
+                && b2.contains(&on_b)
+                && held.ends_with(&session)
+                && !under.is_empty()
+                && s2.contains(&on_c) => {}
+        other => anyhow::bail!("the session's run on box-b and its output back: {other:?}"),
+    }
+    assert!(half_named(&out) == 0, "each hop names both sides, signed: {out}");
+    // A synced file changed on its way: refused on box-b before anything ran, the break recorded
+    // at that hop, and the refusal.
+    let other = dir.join("work-d");
+    std::fs::create_dir_all(&other)?;
+    std::fs::write(other.join("data.txt"), "box-d's tree\n")?;
+    for args in [&["init", "-q"][..], &["add", "."], &["commit", "-qm", "one"]] {
+        git(&home, &other, args)?;
+    }
+    let mut c = Client::connect(&kiln::reach::local::path("box-d", &dir.join("box-d-state")))?;
+    c.send(&Req::Run(Box::new(RunReq { target: "box-b".into(), command: "cat data.txt".into(), cwd: Some(other.to_string_lossy().into_owned()), sync: true, ..RunReq::default() })))?;
+    let mut evs = Vec::new();
+    while let Some(e) = c.event()? {
+        let end = matches!(e, Ev::Exit { .. } | Ev::Error(_));
+        evs.push(e);
+        if end {
+            break;
+        }
+    }
+    assert!(evs.iter().any(|e| matches!(e, Ev::Error(why) if why.contains("refused"))) && !evs.iter().any(|e| matches!(e, Ev::Output { .. })), "the changed copy is refused before anything runs: {evs:?}");
+    let broke = until(Duration::from_secs(90), || {
+        let (_, body) = http(port, "GET", "/api/custody/breaks", admin, None)?;
+        let breaks: Vec<Value> = serde_json::from_str::<Value>(&body)?.get("breaks").and_then(Value::as_array).cloned().unwrap_or_default();
+        Ok(breaks.into_iter().find(|b| field(b, "kind") == "changed" && field(b, "detail").contains("workspace ")))
+    })
+    .map_err(|e| anyhow::anyhow!("{e}: {}", said_of(dir, port, admin, &id)))?;
+    let db = rusqlite::Connection::open(dir.join("data/kiln.db"))?;
+    let custodian = |d: &str| -> anyhow::Result<String> { Ok(db.query_row("SELECT custodian FROM custody WHERE digest = ?1", [d], |r| r.get(0))?) };
+    let (record, follows) = (field(&broke, "record"), broke.pointer("/around/1").and_then(Value::as_str).unwrap_or_default());
+    let (took, gave) = (custodian(record)?, custodian(follows)?);
+    assert!(took.contains(&on_b) && gave.contains("/machine/box-d/"), "box-b's receipt of what came, box-d's hand-on of what it sent: {broke}");
+    let refused = until(Duration::from_secs(60), || {
+        let (_, body) = http(port, "GET", "/api/transfers/refused", admin, None)?;
+        let v: Value = serde_json::from_str(&body).unwrap_or_default();
+        Ok(v.get("refused").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().find(|r| field(r, "act") == "a hand-over between machines" && field(r, "why").contains("box-d")))
+    })?;
+    assert!(field(&refused, "came_from").starts_with("runner box-b"), "box-b recorded what it refused: {refused}");
     Ok(())
 }
 

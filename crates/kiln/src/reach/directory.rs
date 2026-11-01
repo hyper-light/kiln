@@ -28,6 +28,10 @@ pub struct RunnerInfo {
     /// Its reach identity's fingerprint ([`super::e2e::fingerprint_of_spki`]).
     #[serde(default)]
     pub fingerprint: Option<String>,
+    /// The reach version it speaks, as it announced it ([`super::wire::VERSION`]): a link to it
+    /// opens at the lower of this and the asker's. None from a server from before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reach_version: Option<u32>,
     #[serde(default)]
     pub cpus: u32,
     /// Busy share of all cores, 0–100, at the last sample.

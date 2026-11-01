@@ -57,6 +57,9 @@
 //! - `feed_changed`: the first batch of a conversation store's feed this process signs for has a
 //!   byte changed after it signed its hand-on, once (docs/ci.md W27-R08): the taker refuses it,
 //!   kiln records the break, and the batch goes again as it was.
+//! - `sync_file_changed`: the first piece of a file this runner syncs to another (`kiln run`), `.git`
+//!   aside, has a byte changed after it hashed it, as in transit (docs/ci.md W27-R08): the other
+//!   runner refuses the copy and kiln records the break.
 //! - `copy=<path>`: every frame this runner sends, appended to `path` as it goes below the channel
 //!   (its lane and length, then its bytes), so a test can say what crossed the network (W27-R02).
 //! - `keys=<path>`: each identity key this runner process makes (`crate::runner::identity`),
@@ -113,6 +116,8 @@ pub struct Chaos {
     pub blob_changed: Option<String>,
     /// The first batch of a feed it signs for changes after its hand-on, once (`feed_changed`).
     pub feed_changed: bool,
+    /// A file it syncs to another runner changes after it hashed it (`sync_file_changed`).
+    pub sync_file_changed: bool,
     /// Where every frame this process sends is copied (`copy=`).
     pub copy: Option<std::path::PathBuf>,
     /// Where each identity key this process makes is copied (`keys=`).
@@ -183,6 +188,7 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
                 anyhow::ensure!(!v.is_empty(), "chaos `blob_changed` takes an object's key");
                 c.blob_changed = Some(v.to_owned());
             }
+            "sync_file_changed" => c.sync_file_changed = true,
             "copy" | "keys" => {
                 anyhow::ensure!(!v.is_empty(), "chaos `{k}` takes a file's path");
                 let path = Some(std::path::PathBuf::from(v));
@@ -193,7 +199,7 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
                 }
             }
             "seed" => c.seed = v.parse().map_err(|_| anyhow::anyhow!("chaos `seed` takes a number, not `{v}`"))?,
-            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, lag, oom, disk, corrupt, fetch, platform, rebuild, shed, twice, late, seed, fanout, old, unsigned, stale_words, tarball_changed, no_git, peer_object_changed, blob_changed, feed_changed, copy or keys"),
+            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, lag, oom, disk, corrupt, fetch, platform, rebuild, shed, twice, late, seed, fanout, old, unsigned, stale_words, tarball_changed, no_git, peer_object_changed, blob_changed, feed_changed, sync_file_changed, copy or keys"),
         }
     }
     Ok(c)
@@ -430,6 +436,7 @@ mod tests {
                 peer_object_changed: false,
                 blob_changed: None,
                 feed_changed: false,
+                sync_file_changed: false,
                 copy: None,
                 keys: None
             }
@@ -438,6 +445,7 @@ mod tests {
         assert_eq!(parse("blob_changed=artifacts/7/app")?.blob_changed.as_deref(), Some("artifacts/7/app"));
         assert!(parse("blob_changed").is_err(), "it names an object's key");
         assert!(parse("feed_changed")?.feed_changed);
+        assert!(parse("sync_file_changed")?.sync_file_changed);
         assert_eq!(parse("platform=darwin/arm64")?.platform.as_deref(), Some("darwin/arm64"));
         // W27-R02's test copies: what a runner sends, and the keys it makes.
         let c = parse("copy=/tmp/a.frames,keys=/tmp/a.keys")?;
