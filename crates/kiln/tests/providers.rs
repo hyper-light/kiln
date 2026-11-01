@@ -726,10 +726,18 @@ fn w26_r18_an_agents_draft_on_each_host_until_it_says_ready() -> anyhow::Result<
             anyhow::ensure!(st == 200, "{host}: agents.change {ask}: {st} {body}");
             Ok(serde_json::from_str::<Value>(&body)?.get("change_request").cloned().unwrap_or_default())
         };
+        // What agents.changes says of its change being a draft.
+        let listed = || -> anyhow::Result<Value> {
+            let (st, body) = http(port, "GET", &format!("/api/harness/changes?agent={id}"), admin, None)?;
+            anyhow::ensure!(st == 200, "{host}: agents.changes: {st} {body}");
+            let v: Value = serde_json::from_str(&body)?;
+            Ok(v.get("changes").and_then(Value::as_array).into_iter().flatten().find(|c| c.get("agent").and_then(Value::as_str) == Some(id.as_str())).and_then(|c| c.get("draft")).cloned().unwrap_or_default())
+        };
 
         edit(1)?;
         let r = change(json!({ "title": "cap the expansion", "draft": true }))?;
         assert_eq!((s(&r, "/change"), r.get("draft")), ("#21", Some(&json!(true))), "{host}: opened, a draft: {r}");
+        assert_eq!(listed()?, json!(true), "{host}: agents.changes says it's a draft");
         let sent = calls(c, "POST", opened);
         match host {
             "gl" => assert_eq!(sent.first().map(|b| s(b, "/title")), Some("Draft: cap the expansion"), "GitLab's draft is its title: {sent:?}"),
@@ -740,9 +748,11 @@ fn w26_r18_an_agents_draft_on_each_host_until_it_says_ready() -> anyhow::Result<
         let r = change(json!({}))?;
         assert_eq!((r.get("version"), r.get("draft")), (Some(&json!(2)), Some(&json!(true))), "{host}: a new version leaves it a draft: {r}");
         assert_eq!(calls(c, "POST", opened).len(), 1, "{host}: a new version opens nothing");
+        assert_eq!(listed()?, json!(true), "{host}: agents.changes says it's a draft still");
 
         let r = change(json!({ "ready": true }))?;
         assert_eq!((r.get("version"), r.get("draft")), (Some(&json!(2)), Some(&json!(false))), "{host}: ready, with nothing new pushed: {r}");
+        assert_eq!(listed()?, json!(false), "{host}: agents.changes says it's ready");
         match host {
             "gh" => {
                 let asked = calls(c, "POST", "/graphql");

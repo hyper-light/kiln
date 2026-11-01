@@ -565,6 +565,8 @@ fn w26_r18_an_agents_draft_stays_one_until_it_says_ready() -> anyhow::Result<()>
     let w = Ac10::new(false)?;
     let cr = w.open(true)?;
     let draft = |r: &Value| r.pointer("/change_request/draft").cloned().unwrap_or_default();
+    let opened = w.run(&w.matrix, "opened", "return await kiln.agents.changes({});")?;
+    anyhow::ensure!(opened.to_string().contains("\"draft\":true"), "agents.changes says {cr} is a draft once opened: {opened}");
     let before = w.lines_added()?;
     w.send(&w.matrix, "edit second")?;
     w.until_edited(before)?;
@@ -580,6 +582,8 @@ fn w26_r18_an_agents_draft_stays_one_until_it_says_ready() -> anyhow::Result<()>
     anyhow::ensure!(draft(&ready) == serde_json::json!(false) && state == "needs-review" && versions.len() == 2, "ready alone marks {cr} ready, pushing nothing: {state}, {} versions: {ready}", versions.len());
     let (_, line) = w.ship(&cr)?;
     anyhow::ensure!(!line.starts_with("Draft"), "Ship reads {cr} as asking for review now: {line}");
+    let readied = w.run(&w.matrix, "readied", "return await kiln.agents.changes({});")?;
+    anyhow::ensure!(readied.to_string().contains("\"draft\":false"), "agents.changes says {cr} is ready: {readied}");
     let again = w.run(&w.matrix, "ready-again", "try { return JSON.stringify(await kiln.agents.change({ready: true})); } catch (e) { return String((e && e.message) || e); }")?;
     anyhow::ensure!(again.as_str().is_some_and(|t| t.contains("isn't a draft: it's ready for review already")), "asked again, it says so: {again}");
     Ok(())
