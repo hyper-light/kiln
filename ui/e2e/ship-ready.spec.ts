@@ -1,15 +1,15 @@
 /**
  * Ship's Ready (docs/ci.md W26-R18, drafts): an agent's draft, a change request on kiln or a pull
- * request on GitHub, offers Ready on its row; its person presses it and the row reads waiting on
- * review, Ready gone, the row's line at its height. What a browser marks ready is its own (the
- * mock keeps it by user agent), reset before and after.
+ * request on GitHub, offers Ready on its repository's row, whose newest it is (W26-R29); its person
+ * presses it and the row reads waiting on review, Ready gone, the row's line at its height. What a
+ * browser marks ready is its own (the mock keeps it by user agent), reset before and after.
  */
 import { expect, test, type Page } from "@playwright/test";
 
 const REAL = !!process.env.E2E_BASE_URL;
 test.skip(REAL, "drives the mock's commits");
 
-const rowOf = (page: Page, text: string) => page.getByRole("list", { name: "Commits", exact: true }).locator(":scope > li", { hasText: text }).first();
+const rowOf = (page: Page, text: string) => page.getByRole("list", { name: "Repositories", exact: true }).locator(":scope > li", { hasText: text }).first();
 
 /** A row's own line (its head), whose height holds while what it says changes. */
 const headHeight = async (row: ReturnType<typeof rowOf>) => (await row.locator(":scope > .ship-r").boundingBox())?.height ?? 0;

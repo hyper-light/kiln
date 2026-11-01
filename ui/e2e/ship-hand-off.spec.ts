@@ -5,8 +5,8 @@
  * the repository has attached (ci-doctor) and its row says so, with Retry alone. An agent's change
  * hands its open thread to its author's agent; its row then reads that agent at work, with no Hand
  * off and Review pair. An agent's stacked diff and change request alike hand both their threads
- * over, read fixing, and once the agent's fix is in, the handed revision says "Fixed in v2", folded
- * under v2. The row holds its height throughout. What a browser hands off is its own (the mock
+ * over, read fixing, and once the agent's fix is in, v2 is the repository's newest and the handed
+ * revision's page says "Fixed in v2". The row holds its height throughout. What a browser hands off is its own (the mock
  * keeps it by user agent), reset before and after.
  */
 import { expect, test, type Page } from "@playwright/test";
@@ -80,14 +80,17 @@ for (const [kind, name, title, sha] of [
       await expect(row.getByRole("button", { name: "Hand off" })).toHaveCount(0);
       expect(await headHeight(row)).toBe(before);
 
-      // The agent's fix is in: v2 on top, the handed revision folded under it, saying which version fixed it.
+      // The agent's fix is in: v2 is the repository's newest, its checks running, and the handed
+      // revision's own page says which version fixed it, once (rows fold nothing since W26-R29).
       expect((await page.request.post(`/api/mock/ship/fixed?sha=${sha}`)).status()).toBe(200);
       await page.reload();
       const tip = rowOf(page, title);
       await expect(tip).toContainText("Checks running");
       expect(await headHeight(tip)).toBe(before);
-      await tip.getByRole("button", { name: new RegExp(`Show 1 more commit of ${name}`) }).click();
-      await expect(tip.getByRole("list", { name: `The other commits of ${name}` })).toContainText("Fixed in v2");
+      await page.goto(`/ship/hyper-light/kiln/${sha}`);
+      const handed = page.getByRole("region", { name: "Commit", exact: true });
+      await expect(handed.locator(".ship-stand")).toHaveText("Superseded");
+      await expect(handed.locator(".ship-commit__line")).toHaveText("Fixed in v2");
     } finally {
       await page.request.post("/api/mock/ship/hand-off?reset=1");
       await page.request.post("/api/mock/ship/arrive?clear=1");

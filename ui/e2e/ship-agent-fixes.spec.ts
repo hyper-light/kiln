@@ -5,6 +5,7 @@
  * place, so nothing moves. The repository's setting is put back off after.
  */
 import { expect, test, type BrowserContext, type Locator, type Page } from "@playwright/test";
+import { pickCommit } from "./ship-pick";
 
 const REAL = !!process.env.E2E_BASE_URL;
 test.skip(REAL, "drives the mock's commits");
@@ -12,12 +13,11 @@ test.skip(REAL, "drives the mock's commits");
 const REPO = "hyper-light/kiln";
 const FIXES = `/api/repos/${encodeURIComponent(REPO)}/agent-fixes`;
 
-/** D41's Conversation, opened by its row's Review, in a page of its own. */
+/** D41's Conversation, picked among its repository's commits (W26-R29), in a page of its own. */
 async function conversation(context: BrowserContext): Promise<{ page: Page; convo: Locator }> {
   const page = await context.newPage();
   await page.goto("/ship");
-  const row = page.getByRole("list", { name: "Commits", exact: true }).locator(":scope > li", { hasText: "pipeline: dynamic matrices" }).first();
-  await row.getByRole("button", { name: "Review" }).click();
+  const row = await pickCommit(page, "pipeline: dynamic matrices", REPO);
   const convo = row.getByRole("region", { name: "Conversation" });
   await convo.locator(".rv-switch").waitFor();
   return { page, convo };
