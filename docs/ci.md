@@ -9754,8 +9754,224 @@ is kiln research `01a1947b2b0270fa9d1e32d07aebaa7e` (44 findings, 37 sources) an
 - No drafts on GitHub, GitLab or Bitbucket: `githost::open_change` takes no draft flag.
 - Code workflows, Firecracker actions and Shards actions are not built.
 
-The plan's steps 2 to 4 add W29's requirements, and its step 5 adds the acceptance criteria and
-scenarios.
+**Requirements: the view, its read model, the pane and editing**
+
+- **W29-R01 Ship's third view.** `/ship/pipelines` (route `ui/src/routes/_app.ship_.pipelines.tsx`,
+  view `ui/src/views/ship/pipelines.tsx`). Its link is the third in `ShipViews`, after Commits and
+  Deploys (W26-R24). The page keeps Ship's intro and its facet box ("Repository, workflow, action,
+  kind, machine…"). `?repo=&path=` opens that row and scrolls it into view, as `?app=` does for
+  Deploys.
+- **W29-R02 Rows by repository.** Each workflow, reusable workflow and action at its repository's
+  default-branch head is one row, and so is each draft (W29-R10).
+  - Rows are grouped under their repository's heading, whose words say what's there and what needs
+    someone: "7 workflows · 1 failing · 1 waits on you", or "shared · 6 actions · 1 workflow ·
+    1 draft".
+  - A row is Ship's own: the name (with DRAFT beside it for a draft); its stand's word (Review,
+    Failing, Can't run, Not saved, Unpublished, Update, Passing, Released, Not run here, Off); one
+    line saying what it is and does; three pips; who changed it last and when; and where it is: a
+    branch, a tag (a tag's mark) or a change (`#214`), and its commit.
+  - The pips:
+    - **Checks**: W02's checks and the server's (KCI6007's labels, the action policy) at its commit.
+    - **Runs on**: whether a machine connected now can take every job (W05-R20's explanation, bare
+      metal by default).
+    - **Latest**: for a workflow, its newest run on the default branch; for an action or reusable
+      workflow, its newest tag's own checks.
+  - Order: what needs someone first (Review, Failing, Can't run), then drafts, then the rest by
+    name. Each repository ends with a New row (W29-R08).
+  - Facets: repository, kind (workflow, reusable workflow, composite, JavaScript, Docker,
+    Firecracker, Shards), dialect (GitHub's, kiln's, code), stand, machine kind (bare metal, docker,
+    compose, firecracker, shards, kubernetes) and shared.
+- **W29-R03 The read model and its API.** `crates/kiln/src/ship/pipelines.rs`, held in memory as
+  Ship's commits and Deploys are.
+  - It's gathered from:
+    - `ci::load::load` at each repository's default-branch head (its workflows, actions and
+      diagnostics);
+    - `wf::outline` (jobs, needs, matrix);
+    - W05-R20's routing explanation;
+    - runs of both engines, by workflow path;
+    - drafts (W29-R10), tags (W29-R21) and consumers (W29-R20).
+  - It's gathered again when a default branch or a tag moves, a run or job changes, or a draft is
+    saved or reviewed. Then a `pipelines {repo}` event, appended to the wire events, tells pages to
+    ask again.
+  - `GET /api/ship/pipelines?q=&repo=` gives `{ repos: ShipPipelineRepo[] }`. Each is
+    `{ repo, say, needs, access, rows: ShipPipelineRow[] }`.
+  - `GET /api/ship/pipelines/:owner/:name?path=&ref=` gives a `ShipPipelinePane` (W29-R04).
+  - A caller sees only the repositories it may read (`runs.read`, as `ci.workflows.*`), and another
+    repository's shared actions and reusable workflows as its Access allows (W29-R17).
+  - Every field is new, and a client takes any as missing (Ship's rule).
+- **W29-R04 The pane.** An opened row is the jobs pane's anatomy (W26-R23): `ShipPipelinePane
+  { head, strip, groups, detail }`.
+  - **The head** is the title (with DRAFT for a draft), and its path, dialect, ref and commit.
+  - **The strip** (`ShipPipelineStrip { said, pick, verbs }`):
+    - one or two lines saying what's picked;
+    - its pick words: "failed last run · changed in a draft · all", "plan for: <events>" (W29-R07),
+      "start from: …" (W29-R08);
+    - its verbs. Run · Save draft · Ready · Discard for a workflow or action (W29-R11 to R14).
+      Release for a shared repository's action or reusable workflow, asked again in the strip with
+      Keep (W29-R21). Create draft · Cancel for New (W29-R08).
+    - A verb that doesn't apply is dimmed, with its `why_not`, never hidden.
+  - **A workflow's groups:**
+    - Triggers: each `on:` entry (W29-R06).
+    - Stage 1, 2…: jobs by how far down their `needs` go, each with its machine kind and labels.
+    - Uses: each `uses:`, where it comes from (GitHub, a kiln repository, built in), its pin, and
+      whether a newer tag is out.
+    - Secrets and variables: names only, from W09's `ci.workflows.names`.
+    - Runs: the newest on the default branch, each with what started it.
+    - Settings: turned on, machines, concurrency.
+  - **An action's groups:**
+    - Inputs and Outputs.
+    - Steps (composite); or its main, pre and post (JavaScript); or its image and entrypoint
+      (Docker); or its image, resources and egress (microVM, W29-R29 and R30).
+    - Versions: main's tip and the tags.
+    - Used by (W29-R20).
+    - Settings: the repository's Access (W29-R17).
+  - **A line** (`ShipPipelineLine { key, kind, name, value, state, draft? }`) is the jobs pane's
+    line: its glyph, its kind word, its name and its value. The picked line is a square tint with a
+    straight 2px edge.
+  - **The detail** sits beside the list on a desktop and under the picked line on a phone. Its
+    views (`ShipPipelineDetail { name, views, … }`) depend on what's picked:
+    - a job: YAML · Plan · Last run;
+    - a trigger: Times (a schedule) or Filters, then YAML · Plan;
+    - a use: the action's own summary and versions;
+    - a run: its jobs pane (W26-R23);
+    - the whole file: YAML · Flow (· Code, W29-R27) · Plan;
+    - an action: Changes · YAML · Try it (W21-R07).
+  - Every verb is `POST /api/ship/pipelines { repo, path, verb, … }`. Each goes to its CI operation
+    (`ci.runs.trigger`, `ci.workflows.edit`, `ci.actions.try`, and W29's own) through the ops
+    registry, as the caller, so its rights and its audit are the operation's (as W26-R24's are).
+  - The pane's height is held: nothing moves as lines are picked, verbs act or runs go on.
+- **W29-R05 Inline editing, backed by tree-sitter.** The file is edited where it's shown, in the
+  detail. There's no edit mode: typing starts a draft (W29-R10).
+  - CodeMirror 6 (W21-R01's component) keeps input on every device, W21-R01's completion, lint and
+    search.
+  - Its colours and structure come from kiln's tree-sitter engine (`ui/src/lib/syntax`, the
+    grammars Vorpal compiles). A view plugin turns `Highlighter` tokens into decorations with
+    `components/code/syntax.css`'s classes, so code reads as it does in Ship's Files.
+  - New for workflow and action files: `run:` is parsed as its `shell:` (bash by default; pwsh,
+    python), by a kiln query (`queries/workflow-injections.scm`), and `${{ }}` is marked as W01's
+    expressions.
+  - The picked part (a job, a step, a trigger) is its syntax node: its lines are tinted, it folds
+    as a node, and the Flow view's edits rewrite only that node, comments kept (as
+    `lib/workflow-doc.ts` does).
+  - Diagnostics come from `POST /api/ci/validate`, debounced 300 ms (W21-R01). They sit under the
+    code as Problems, each with its code, line and fix, never in a popup.
+- **W29-R06 The Flow view covers every key**, extending W21-R06 (`lib/workflow-doc.ts`).
+  - **Triggers:** an editor for each W03 event and each of kiln's (W03-R09).
+    - Add a trigger lists 18 kinds in groups:
+      - Code: push, pull request, diff, land, merge group, create and delete.
+      - Time: schedule.
+      - People and agents: manual (with typed inputs), agent, comment, review.
+      - Other workflows: pipeline (`workflow_run`), called (`workflow_call`).
+      - Deploys and releases: deploy, release, package.
+      - Outside kiln: webhook, dispatch.
+    - Each kind is marked GitHub's, kiln's or both, with "show: all · GitHub's · kiln's".
+    - Each opens its filters: branches, tags, paths, types, inputs.
+    - A schedule shows its cron, time zone, jitter, skip-if-unchanged and catch-up (W03-R10), and
+      its next runs from W03's cron, daylight-saving changes included.
+    - A kiln-only trigger in a GitHub-dialect file is written to its overlay (W02), so the file
+      keeps working on GitHub.
+  - **Jobs:** needs; `runs-on`, as labels and a machine kind (bare metal by default, or docker,
+    compose, firecracker, shards, kubernetes); matrix (W21-R06's); environment; concurrency;
+    permissions; outputs; timeout; `if`.
+  - **Steps:** name, `run` or `uses`, `with` (from the action's inputs, W07-R12), env, `if`, shell,
+    working directory, continue-on-error.
+  - **A reusable workflow's interface:** its `workflow_call` inputs (typed), outputs and secrets.
+  - Every edit rewrites the YAML through the comment-keeping document model.
+- **W29-R07 The plan for each event, and its difference.**
+  - The strip's "plan for:" picks one of the workflow's triggers. Its plan is `POST
+    /api/ci/plan-preview` (W04-R29) of the editor's text, with each leg's routing against the
+    machines connected now (W05-R20).
+  - A draft also gets the published version's plan for the same event. The difference is shown:
+    jobs and legs added, removed or changed, and where each would run.
+  - The Plan view lists the legs. "Where it would run" names the machines that can take the picked
+    job now.
+  - A code workflow's plan comes from its program (W29-R27).
+- **W29-R08 New.** The last row of each repository opens in place.
+  - **Make:**
+    - Workflow, Reusable workflow;
+    - Composite action, JavaScript action, Docker action;
+    - Firecracker action, Shards action (kiln's own kinds, W29-R29 and R30).
+  - **Write it in:** YAML in GitHub's dialect or kiln's, or TypeScript, then the other SDK
+    languages (W29-R27, R28).
+  - **Start from:**
+    - blank;
+    - recommended for this repository, by detection (plan 01a174b2's `kiln_ci::detect`);
+    - a starter (GitHub's starter workflows, fixture F-03);
+    - a copy of a pipeline the caller can read.
+  - **Name and path:** `.github/workflows/<name>.yml`, `.kiln/<name>.yaml`,
+    `.github/actions/<name>/action.yml` or `.kiln/actions/<name>/`.
+  - **The files it makes**, beside what happens next:
+    - JavaScript: `action.yml`, `src/index.ts` and `package.json`;
+    - Docker: `action.yml`, the `Dockerfile` and its entrypoint;
+    - microVM: `action.yml`, the image's `Dockerfile` and `run.sh`.
+  - Scaffolds are pure (`kiln_ci::scaffold`). Create draft is `POST /api/ship/pipelines { verb:
+    "new", repo, kind, name, language, from }`, and makes a draft (W29-R10, R11).
+- **W29-R09 Where the editor is reached.**
+  - From every Pipelines row.
+  - From a commit's jobs pane: "Edit workflow" on a run's workflow (W26-R23).
+  - From a run's page, whose "Edit workflow" opens `/ship/pipelines?repo=&path=&ref=`.
+  - `/workflows` redirects there, keeping its query.
+  - Agents get the same through `ci.workflows.*`, and through `ship.pipelines.list`, `.get` and
+    `.act` in the one route table (W20-R01).
+
+**W29's routes, events and types** (step 2's; later steps add theirs)
+
+| Route or event | Operation | Gives |
+| --- | --- | --- |
+| `GET /api/ship/pipelines?q=&repo=` | `ship.pipelines.list` | `{ repos: ShipPipelineRepo[] }` |
+| `GET /api/ship/pipelines/:owner/:name?path=&ref=` | `ship.pipelines.get` | `ShipPipelinePane` |
+| `POST /api/ship/pipelines { repo, path, verb, … }` | `ship.pipelines.act` | what the verb's operation answers, and the pane again |
+| event `pipelines { repo }` | | pages ask again |
+
+The TypeScript types (`ui/src/api/ship.ts`), each a Rust struct of `ship::pipelines`:
+`ShipPipelineRepo`, `ShipPipelineRow`, `ShipPipelinePane`, `ShipPipelineStrip`,
+`ShipPipelineLine`, `ShipPipelineDetail`, `ShipPipelineVerb { verb, label, enabled, why_not? }`.
+
+**W29's stills, part by part.** Every part of the approved stills (`pl-1` to `pl-9`, at 390 and 1280
+px), and the requirement that delivers it. Requirements past R09 are written in the steps after this
+one. A phone shows the same parts, with the detail under the picked line (W29-R04).
+
+| Still | Part | Requirement |
+| --- | --- | --- |
+| pl-1 list | Ship's intro, kept as it is | R01 |
+| pl-1 list | Ship's views: Commits · Deploys · Pipelines | R01 |
+| pl-1 list | The facet box: repository, workflow, action, kind, machine | R02 |
+| pl-1 list | A repository's heading and its words ("shared · …" too) | R02, R17 |
+| pl-1 list | A row's name, stand word, line, pips, who and when, ref and commit | R02, R03 |
+| pl-1 list | DRAFT beside a draft's title; Review, Not saved, Unpublished, Update | R02, R10 |
+| pl-1 list | Can't run (a Shards action with no machine for it) | R02, R30 |
+| pl-1 list | Not run here (a GitHub workflow a `.kiln/` workflow takes the place of) | R02 (W02-R02) |
+| pl-1 list | The New row at each repository's end | R08 |
+| pl-1 list | A row's chevron: the row opens in place | R04 |
+| pl-2 workflow | The pane's head: title, path, dialect, ref, commit | R04 |
+| pl-2 workflow | The strip: what's picked, "pick:" words, Run · Save draft · Ready · Discard | R04, R11–R14 |
+| pl-2 workflow | Triggers, stages, uses (a newer tag out), secrets and variables, runs | R04, R06, R20 |
+| pl-2 workflow | Settings: turned on; machines, bare metal unless a job says | R04, R15, R16 |
+| pl-2 workflow | The picked line's tint and edge; the detail beside it | R04 |
+| pl-2 workflow | YAML · Plan · Last run; the code in tree-sitter's colours; the job's lines tinted | R04, R05 |
+| pl-2 workflow | "Where it would run" | R07 |
+| pl-3 draft | DRAFT beside the title (row and head); Not saved; the strip's words | R10 |
+| pl-3 draft | "plan for:" an event; Run, Save draft, Ready, Discard all lit | R07, R11–R14 |
+| pl-3 draft | A new job's line; the added lines' edge; the caret: typing in place | R05, R06, R10 |
+| pl-3 draft | The underlined tag; Problems under the code (KCI6002, pin it) | R05, R25 |
+| pl-3 draft | The plan's difference from what's published (+1 job, the rest the same) | R07 |
+| pl-4 code | A TypeScript workflow: Code · Flow · What it makes; planned in the sandbox | R27 |
+| pl-4 code | Its plan for a schedule or a manual run | R07, R27 |
+| pl-5 action | Inputs, Steps (composite), Versions (tags), Used by, Settings (Access) | R04, R17, R20, R21 |
+| pl-5 action | Release asked in the strip: Keep · Release | R21 |
+| pl-5 action | Changes since the last tag; what the release changes for those who use it | R21, R22 |
+| pl-5 action | Try it | R04 (W21-R07) |
+| pl-6 new | The New row opened: the strip, "start from:", Create draft · Cancel | R08 |
+| pl-6 new | Make: seven kinds, Firecracker and Shards among them; Write it in | R08, R27, R29, R30 |
+| pl-6 new | Name and path; the files it makes; `runs.using: firecracker`; what happens, and how others use it once a tag has it | R08, R10, R18, R21, R29 |
+| pl-7 update | Update, DRAFT and `#88` on a consumer's row | R10, R22 |
+| pl-7 update | The use's line "→ v2.4.0 in #88"; the change's lines; what v2.4.0 changes for it | R22, R25 |
+| pl-7 update | The draft's own run | R14 |
+| pl-7 update | Jobs: a call of ci-kit's reusable workflow (`rust / check`) | R04, R06 |
+| pl-8 triggers | Six kinds of trigger as lines; Add a trigger | R06 |
+| pl-8 triggers | A schedule's next runs, daylight saving included; its options | R06 |
+| pl-8 triggers | "plan for:" each trigger; runs by what started them | R04, R07 |
+| pl-9 add a trigger | 18 kinds in six groups, each GitHub's, kiln's or both; "show:" | R06 |
 
 ## 4. API, events, CLI and MCP reference
 
