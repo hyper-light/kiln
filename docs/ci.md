@@ -9540,6 +9540,36 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
     its log (its sequence and the digest of the entries since); each learner receives them once it
     has applied them.
   - *The server giving a leg to a runner* (step 11, above).
+- *To production* (step 14; `kiln_ci::identity::deployed`, `crate::cd::custody`, migration
+  `w27_cd_custody`): a KilnCD sync of an app to a Kubernetes cluster that succeeded leaves CD's
+  hand-on to the cluster (`kubernetes://<cluster>`) of the manifests it applied, by the SHA-256 of
+  the objects as it sent them, and of each image their pod templates name by digest, following
+  CD's receipt of the image: from kiln's registry, which hands on what a leg pushed (its receipt of
+  the leg's hand-on), or from outside kiln, where the image's chain begins. kiln's server receives
+  them for the cluster, which holds no identity of kiln's, on the strength of its API server's
+  answers: the manifests by the digest of what the answers hold of what CD sent (`kiln_cd::diff`'s
+  comparison), so an apply a webhook changed breaks the chain there, saying where. As the rollout
+  goes on, every minute after and whenever a release asks, kiln looks at the app's pods: for each
+  container the manifests name, of each running pod, the cluster hands its image to the pod's node
+  (`…/node/<name>`) and the node receives it, its receipt naming the manifest it pulls for its
+  platform; the node hands the pod (`…/<namespace>/pod/<name>`)
+  its platform's manifest, made from the image (the index's resolution, by its node's
+  `nodeInfo`, the index read from kiln's registry by digest when kiln holds it, else from its
+  own registry); and the pod's receipt is of what its status's image ID says it runs, read
+  through that resolution (Docker and containerd report the index, CRI-O the manifest, an image
+  loaded without a registry its config). A pod running anything else breaks the chain at its
+  receipt, recorded as kiln takes it. `GET /api/cd/apps/:app/custody` (`cd.apps.custody`) shows the
+  last sync's records, each pod's container (its node, platform, reported image, what its deploy
+  handed on for that platform, what it runs, its receipt) and the verdict: verified, waiting,
+  broken or unverifiable (an image named by tag alone). An environment requiring a verified chain
+  (`gates.require_chain`, W27-R11) counts a release synced and healthy only once its pods are
+  verified (waiting holds it; broken or unverifiable is Degraded, saying why), and once a release
+  runs there a pod that breaks its chain makes the registration need a person, so nothing promotes
+  into it by itself; an `after` of such an environment refuses an upstream whose pods break their
+  chain there. A promotion's hand-on (step 8) follows CD's receipt of its images for the upstream
+  environment's deploy, so its chain walks back through what was deployed there. kiln-ci's custody
+  takes a thing by its name and a digest both records agree on first: a leg's hand-on names an
+  image's index and each platform's manifest by one name.
 - *A resume from the server's store* is kiln's take: signed with the server's own key for the
   identity kiln last certified the session as at that epoch (`identities::holder_at`), to the next,
   saying when kiln last heard from the machine; kiln keeps it at once, the package carries it, and
@@ -9651,7 +9681,18 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
   applied unchecked, a resume that keeps the epoch it leaves, a release only on the copy's own
   announcement, no addressee check: each found by a seed that passes without it) and
   `w27_ac05_a_transfers_seed_replays_exactly`. Nightly: `.kiln/custody-lab.yaml`, and the transfers
-  model's 20,000 seeds in `.kiln/sim.yaml`.
+  model's 20,000 seeds in `.kiln/sim.yaml`. To production (step 14): kiln-ci's
+  `w27_r08_a_deploy_walks_from_the_land_to_its_pods` (a multi-platform image built from the land,
+  through kiln's registry, CD, the cluster and two nodes, amd64 and arm64, each pod its platform's
+  manifest: unbroken through the resolution; a pod swapped to another image broken at its receipt),
+  `w27_r08_an_index_and_its_manifests_go_by_one_name`, `deployed`'s `w27_r08_*` (pinned images,
+  each runtime's image IDs, the resolution, a sync's manifests), `cd::custody`'s `w27_r08_*`; and,
+  on a test cluster (`#[ignore]`d: `KILN_CUSTODY_KUBECONFIG`), `custody_production`'s
+  `w27_r08_custody_to_production` (pause 3.10's amd64 and arm64 as one index, built and pushed by a
+  leg, released to production through KilnCD: both pods verified, each walking back through its
+  node's resolution to the commit; then production requiring a verified chain and one pod's image
+  swapped by `kubectl set image`: the break recorded at its receipt, the registration needing a
+  person).
 - *Not yet.* A session's package isn't yet addressed to the process it goes to (its hand-on is to
   the session at its next epoch); a runner's Open at a later epoch still raises the epoch the
   registry keeps (what its inbox and updates are fenced by) before its transfer is recorded, though
@@ -9663,8 +9704,12 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
   from a linked server's environment, which this server's CD doesn't sign for, nor KilnCD's apps'
   syncs, which take no `after`; Ship's journey listing a replant's transfers beside its runners
   (its job does); a pod's leg, its own runner, whose inputs aren't a runner process's to hand on;
-  images a leg pushes to a registry outside kiln, which signs no receipt; machines, intermediaries
-  and production (steps 12 to 16).
+  images a leg pushes to a registry outside kiln, which signs no receipt; machines and
+  intermediaries (steps 12, 13, 15, 16). To production: a registry an image is copied through to a
+  cluster (a mirror) isn't a custodian of its own (the digests agreeing stand for it); a sync to a
+  provider's target (ECS, Lambda, Fly…) records no custody; the manifests' own chain begins at
+  CD's hand-on (its render from git isn't recorded); a pod's container its manifests don't name (a
+  webhook's sidecar) isn't judged; Argo CD's syncs, which aren't kiln's.
 
 ### W28 Demand-driven CI: adopt, cover, stagger, land by conflict graph
 

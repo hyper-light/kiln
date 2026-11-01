@@ -410,14 +410,17 @@ fn shared<'a>(a: &'a Subject, b: &'a Subject) -> Vec<(&'a String, &'a String, &'
     a.digest.iter().filter_map(|(alg, hex)| b.digest.get(alg).map(|other| (alg, hex, other))).collect()
 }
 
-/// `here`'s things against `there`'s: a thing is the same thing by its name, else by a digest the
-/// two agree on; the same thing must agree on every algorithm both name, and both must name one.
+/// `here`'s things against `there`'s: a thing is the same thing by its name and a digest the two
+/// agree on (an image's index and its platforms' manifests go by one name), else by its name, else
+/// by a digest the two agree on, one not matched yet first; the same thing must agree on every
+/// algorithm both name, and both must name one.
 fn compare(here: &[Subject], there: &[Subject]) -> Compared {
     let mut matched: BTreeSet<usize> = BTreeSet::new();
     let mut only_here = Vec::new();
     for h in here {
-        let by_name = there.iter().position(|t| t.name == h.name);
-        let found = by_name.or_else(|| there.iter().position(|t| shared(h, t).iter().any(|(_, a, b)| a == b)));
+        let agrees = |t: &Subject| shared(h, t).iter().any(|(_, a, b)| a == b);
+        let first = |is: &dyn Fn(&Subject) -> bool| there.iter().enumerate().position(|(i, t)| is(t) && !matched.contains(&i)).or_else(|| there.iter().position(is));
+        let found = first(&|t| t.name == h.name && agrees(t)).or_else(|| first(&|t| t.name == h.name)).or_else(|| first(&agrees));
         let Some(i) = found else {
             only_here.push(h.name.clone());
             continue;
@@ -1363,6 +1366,89 @@ mod tests {
         let h_obj = kept.take(&ca, &session, &reach_hand_on(HELD, JUPITER, None, object.clone(), Vec::new(), "an object"), AT - 9)?;
         let wider = kept.take(&ca, &jupiter, &reach_receipt(JUPITER, HELD, Some(SESSION), object, &h_obj, Some(&g), "an object"), AT - 8)?;
         not_entitled(&kept, &wider, "receive:object");
+        Ok(())
+    }
+
+    /// W27-R08 (the Transfers plan's step 14): an image's index and its platforms' manifests, pushed
+    /// by one leg, go by one name; each is the same thing as the one of its name with its digest. One
+    /// of them changed still breaks as changed, naming the digest it was.
+    #[test]
+    fn w27_r08_an_index_and_its_manifests_go_by_one_name() -> anyhow::Result<()> {
+        let ca = ca()?;
+        let (fedora, server) = (Signer::new(&ca, FEDORA)?, Signer::new(&ca, SERVER)?);
+        let pushed = [thing("image acme/web", '2'), thing("image acme/web", '3'), thing("image acme/web", '1')];
+        let mut kept = Kept::default();
+        let built = kept.take(&ca, &fedora, &record(Kind::HandedOn, &pushed, Some(SERVER), None, &[], "legs", 1), AT - 3)?;
+        let stored = kept.take(&ca, &server, &record(Kind::Received, &pushed, None, Some(FEDORA), &[&built], "registry", 1), AT - 2)?;
+        assert_eq!(walk(&stored, &kept.records, SERVER)?.hops.len(), 2);
+        let swapped = [thing("image acme/web", '2'), thing("image acme/web", '9'), thing("image acme/web", '1')];
+        let other = kept.take(&ca, &server, &record(Kind::Received, &swapped, None, Some(FEDORA), &[&built], "registry", 2), AT - 1)?;
+        let r = hop(&other, &kept.records, SERVER);
+        assert!(matches!(&r, Err(Break::Changed { digest, .. }) if digest.was == sha('3') && digest.now == sha('9')), "{r:?}");
+        Ok(())
+    }
+
+    /// W27-R08 (the Transfers plan's step 14): a deploy's chain, from the land to each pod. The leg
+    /// builds a multi-platform image (an index and its amd64 and arm64 manifests, one name) and hands
+    /// it to kiln's registry; kiln hands it on to CD for the app's deploys; CD hands the sync's
+    /// manifests and the image to cluster e2e, as the deploy names it; kiln receives them for the
+    /// cluster; the cluster hands it to node m02 (amd64) and node m03 (arm64); each node hands its pod
+    /// its platform's manifest, the index's resolution; each pod runs it, Docker reporting the index.
+    /// Walked back from either pod's receipt: unbroken through the resolution, to the land. A pod
+    /// whose image was swapped runs another: its receipt breaks the chain there.
+    #[test]
+    fn w27_r08_a_deploy_walks_from_the_land_to_its_pods() -> anyhow::Result<()> {
+        use crate::identity::deployed::{self as d, Resolution, Runs};
+        let ca = ca()?;
+        let (server, fedora, cd) = (Signer::new(&ca, SERVER)?, Signer::new(&ca, FEDORA)?, Signer::new(&ca, CD)?);
+        let mut kept = Kept::default();
+        let c = thing("commit 4c1e2a", 'c');
+        let (index, amd, arm) = (sha('1'), sha('2'), sha('3'));
+        let pushed: Vec<Subject> = [&amd, &arm, &index].into_iter().map(|h| d::image("acme/web", h)).collect();
+        let landed = kept.take(&ca, &server, &record(Kind::HandedOn, std::slice::from_ref(&c), Some(FEDORA), None, &[], "land", 1), AT - 90)?;
+        let checkout = kept.take(&ca, &fedora, &record(Kind::Received, std::slice::from_ref(&c), None, Some(SERVER), &[&landed], "legs", 1), AT - 80)?;
+        let built = kept.take(&ca, &fedora, &record(Kind::HandedOn, &pushed, Some(SERVER), None, &[&checkout], "legs", 2), AT - 70)?;
+        let stored = kept.take(&ca, &server, &record(Kind::Received, &pushed, None, Some(FEDORA), &[&built], "registry", 1), AT - 60)?;
+        let app = "shop/web-production";
+        let to_cd = kept.take(&ca, &server, &d::registry_hand_on(SERVER, CD, d::image("acme/web", &index), &stored, app), AT - 50)?;
+        let holding = kept.take(&ca, &cd, &d::cd_receipt(CD, SERVER, d::image("acme/web", &index), Some(&to_cd), app), AT - 49)?;
+        let (name, image) = ("localhost:5000/acme/web", d::image("localhost:5000/acme/web", &index));
+        let deployed = vec![d::manifests(app, "9598c1e546", &sha('a'), 3), image.clone()];
+        let handed = kept.take(&ca, &cd, &d::hand_on(CD, "e2e", deployed.clone(), vec![holding.clone()], "sync 1 of shop/web-production", AT - 40), AT - 40)?;
+        let applied = kept.take(&ca, &server, &d::cluster_receipt(SERVER, "e2e", CD, deployed, &handed, "as its API server answered"), AT - 39)?;
+        let reported = format!("docker-pullable://{name}@sha256:{index}");
+        let mut pods = Vec::new();
+        for (node, platform, manifest, config) in [("m02", "linux/amd64", &amd, 'x'), ("m03", "linux/arm64", &arm, 'y')] {
+            let given = kept.take(&ca, &server, &d::to_node(SERVER, "e2e", node, vec![image.clone()], &applied, "the pods of shop/web-production it scheduled there"), AT - 30)?;
+            let got = kept.take(&ca, &server, &d::node_receipt(SERVER, "e2e", node, vec![image.clone()], &given, "its pods' image"), AT - 29)?;
+            let r = Resolution { image: index.clone(), platform: platform.into(), manifest: manifest.clone(), config: sha(config) };
+            let pod = d::pod_uri("e2e", "shop", &format!("web-{node}"));
+            let to_pod = kept.take(&ca, &server, &d::to_pod(SERVER, "e2e", node, &pod, name, &r, &got, "its container web"), AT - 20)?;
+            assert_eq!(d::runs(&r, &reported), Runs::Follows, "Docker reports the index the deploy named");
+            let runs = kept.take(&ca, &server, &d::pod_receipt(SERVER, "e2e", node, &pod, name, &r, manifest, &reported, &to_pod, "its container web"), AT - 10)?;
+            pods.push((runs, to_pod, got, r, pod, node));
+        }
+        for (runs, to_pod, got, r, pod, node) in &pods {
+            let w = walk(runs, &kept.records, SERVER)?;
+            let custodians: Vec<(Kind, &str, Option<&str>)> = w.hops.iter().map(|h| (h.kind, h.custodian.as_str(), h.taken_for.as_deref())).collect();
+            let (cluster, node_uri) = (d::cluster_uri("e2e"), d::node_uri("e2e", node));
+            for want in [(Kind::Received, SERVER, Some(pod.as_str())), (Kind::Taken, SERVER, Some(node_uri.as_str())), (Kind::Received, SERVER, Some(node_uri.as_str())), (Kind::Taken, SERVER, Some(cluster.as_str())), (Kind::Received, SERVER, Some(cluster.as_str())), (Kind::HandedOn, CD, None), (Kind::Received, CD, None), (Kind::HandedOn, SERVER, None), (Kind::Received, SERVER, None), (Kind::HandedOn, FEDORA, None), (Kind::Received, FEDORA, None)] {
+                assert!(custodians.contains(&want), "{want:?} in {custodians:?}");
+            }
+            // Through the index's resolution: the node's hand-on of its platform's manifest is made
+            // from its receipt of the index.
+            let resolved = w.hops.iter().find(|h| &h.record == to_pod).ok_or_else(|| anyhow::anyhow!("no resolution in {:#?}", w.hops))?;
+            assert_eq!((resolved.made_from.clone(), resolved.subject.first().and_then(|t| t.digest.get("sha256")).cloned()), (vec![got.clone()], Some(r.manifest.clone())));
+            assert!(w.began.contains(&landed), "back to the land: {:?}", w.began);
+            assert!(unanswered(&kept.records).is_empty(), "{:?}", unanswered(&kept.records));
+        }
+        // A pod whose image was swapped after the deploy reports another: it breaks the chain there.
+        let (_, to_pod, _, r, pod, node) = pods.first().ok_or_else(|| anyhow::anyhow!("no pods"))?;
+        let other = sha('9');
+        assert_eq!(d::runs(r, &format!("docker-pullable://registry.k8s.io/pause@sha256:{other}")), Runs::Other(other.clone()));
+        let swapped = kept.take(&ca, &server, &d::pod_receipt(SERVER, "e2e", node, pod, name, r, &other, "docker-pullable://registry.k8s.io/pause", to_pod, "its container web"), AT)?;
+        let b = walk(&swapped, &kept.records, SERVER);
+        assert!(matches!(&b, Err(Break::Changed { record, thing, digest, .. }) if record == &swapped && thing == "image localhost:5000/acme/web for linux/amd64" && digest.was == amd && digest.now == other), "{b:?}");
         Ok(())
     }
 
