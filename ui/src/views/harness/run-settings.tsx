@@ -20,9 +20,12 @@
  */
 import * as React from "react";
 import type { ControlOption, ModelOption, ModeOption } from "@/api/harness";
+import { useMotionPreference } from "@/components/shell/motion";
 import { cn } from "@/lib/utils";
 import { useListener } from "./dom";
+import { clocksAt, effortFrame, HEIGHT as LINE_HEIGHT, tickClocks, type Clocks } from "./effort-light";
 import { boltLabel, boltState, lit, nextSpeed, speedName, type SpeedLine } from "./speed";
+import { easeOut, newFrame, paint, smooth } from "./stands-light";
 import "./run-settings.css";
 
 type Kind = "mode" | "model" | "effort";
@@ -278,9 +281,11 @@ export function WordRow({ label, words, value, onPick }: { label: string; words:
 /**
  * An ordered setting as one track: the choice's name and what it does above, the stops below.
  * Tap a stop or slide along the track (the name follows the finger; it applies where it's let go);
- * arrow keys, Home and End move a stop at a time.
+ * arrow keys, Home and End move a stop at a time. `live` (effort's): the track up to the knob is a
+ * line of light whose particles swarm the more the further along it is (EffortLine), which draws
+ * the stops too, each it has reached a bead of its light.
  */
-export function Scale({ label, words, value, armed, onPick }: { label: string; words: Word[]; value: string; armed?: string; onPick: (w: Word) => void }) {
+export function Scale({ label, words, value, armed, onPick, live }: { label: string; words: Word[]; value: string; armed?: string; onPick: (w: Word) => void; live?: boolean }) {
   const rail = React.useRef<HTMLDivElement>(null);
   const [drag, setDrag] = React.useState<number | null>(null);
   const n = words.length;
@@ -343,9 +348,17 @@ export function Scale({ label, words, value, armed, onPick }: { label: string; w
           }}
         >
           <div ref={rail} className="rs-rail">
-            <i className="rs-fill" style={{ width: `${pct(shown)}%` }} aria-hidden="true" />
+            {live ? <EffortLine at={pct(shown)} level={n > 1 ? shown / (n - 1) : 1} stops={n} /> : <i className="rs-fill" style={{ width: `${pct(shown)}%` }} aria-hidden="true" />}
             {words.map((x, i) => (
-              <i key={x.id} className="rs-tick" data-on={i <= shown ? "" : undefined} data-warn={x.dangerous ? "" : undefined} style={{ left: `${pct(i)}%` }} aria-hidden="true" />
+              <i
+                key={x.id}
+                className="rs-tick"
+                data-on={i <= shown ? "" : undefined}
+                data-warn={x.dangerous ? "" : undefined}
+                data-drawn={live ? "" : undefined}
+                style={{ left: `${pct(i)}%` }}
+                aria-hidden="true"
+              />
             ))}
             <i className="rs-knob" data-warn={w?.dangerous ? "" : undefined} style={{ left: `${pct(shown)}%` }} aria-hidden="true" />
           </div>
@@ -359,6 +372,121 @@ export function Scale({ label, words, value, armed, onPick }: { label: string; w
       )}
     </div>
   );
+}
+
+/** How long a change of notch takes to settle: the line's length (with the knob), and its energy and paces (eased in and out, so it speeds up or slows down into the new notch). */
+const FILL_MS = 150;
+const LEVEL_MS = 900;
+/** The moment a still line is drawn at. */
+const STILL = 1.3;
+type Easing = { from: number; to: number; since: number };
+const easing = (e: Easing, now: number, ms: number, curve = easeOut) => e.from + (e.to - e.from) * curve((now - e.since) / ms);
+const energyNow = (e: Easing, now: number) => easing(e, now, LEVEL_MS, smooth);
+/** How far the lit track's canvas reaches past each end of the track (run-settings.css .rs-lit), for the stops there and their glow. */
+const BLEED = 12;
+
+/**
+ * Effort's lit track (effort-light.ts): from the start to the knob (`at`, a percentage of the
+ * track), a string of light tapering out from a calm thread at the start to a swarm at the knob,
+ * the more the higher the notch (`level`, 0 to 1), with the track's `stops`, evenly spaced: grey
+ * past the knob, stirring a little the nearer it they are, and beads of its light where it has
+ * reached them.
+ * Drawn each frame (at most every 33 ms) while it's on screen and motion plays; still (Kiln's
+ * toggle, or reduced motion) it's drawn at rest. A change of notch moves its end with the knob
+ * (what's lit already stays as it was) and eases its paces in and out over most of a second, its
+ * clocks counting on at the paces as they ease, so it speeds up or slows down from where it is; a
+ * step up lifts it from the knob, a step down lets it settle.
+ */
+function EffortLine({ at, level, stops }: { at: number; level: number; stops: number }) {
+  const { paused } = useMotionPreference();
+  const kept = React.useRef({
+    at: { from: at, to: at, since: -Infinity },
+    level: { from: level, to: level, since: -Infinity },
+    kick: -Infinity,
+    size: 0,
+    down: false,
+    clocks: null as Clocks | null,
+    then: 0,
+  });
+  const attach = React.useCallback(
+    (canvas: HTMLCanvasElement | null) => {
+      const ctx = canvas?.getContext("2d");
+      if (!canvas || !ctx) return;
+      const k = kept.current;
+      const begun = performance.now();
+      // From wherever it is now to the new notch; a step up strikes it, a step down lets it settle.
+      k.at = { from: easing(k.at, begun, FILL_MS), to: at, since: begun };
+      const was = k.level.to;
+      k.level = { from: energyNow(k.level, begun), to: level, since: begun };
+      if (Math.abs(level - was) > 1e-6 && !paused) {
+        k.kick = begun;
+        k.down = level < was;
+        k.size = k.down ? 0.6 + 1.2 * was : 1 + 2.5 * level;
+      }
+      let raf = 0;
+      let last = -Infinity;
+      let visible = true;
+      // The track's width (the canvas's, less what it reaches past each end), and its stops along it.
+      let width = canvas.getBoundingClientRect().width - 2 * BLEED;
+      const marks: number[] = [];
+      const frame = newFrame();
+      const draw = (now: number) => {
+        if (width <= 0) return;
+        const dpr = Math.min(3, window.devicePixelRatio || 1);
+        const w = Math.round((width + 2 * BLEED) * dpr);
+        const h = Math.round(LINE_HEIGHT * dpr);
+        if (canvas.width !== w || canvas.height !== h) {
+          canvas.width = w;
+          canvas.height = h;
+        }
+        ctx.setTransform(dpr, 0, 0, dpr, BLEED * dpr, 0);
+        ctx.clearRect(-BLEED, 0, width + 2 * BLEED, LINE_HEIGHT);
+        marks.length = 0;
+        for (let i = 0; i < stops; i++) marks.push(stops > 1 ? (i / (stops - 1)) * width : 0);
+        const fill = (easing(k.at, now, FILL_MS) / 100) * width;
+        const lv = energyNow(k.level, now);
+        const t = paused ? STILL : now / 1000;
+        // Its clocks count on at the paces of the notch as it eases, from where they stood.
+        if (!k.clocks) k.clocks = clocksAt(t, lv);
+        else if (!paused) tickClocks(k.clocks, Math.min(0.1, Math.max(0, now - k.then) / 1000), lv);
+        k.then = now;
+        const kick = { ago: (now - k.kick) / 1000, size: k.size, down: k.down };
+        paint(ctx, effortFrame(fill, lv, t, { kick, stops: marks, clocks: paused ? clocksAt(STILL, lv) : k.clocks, into: frame }));
+      };
+      const tick = (now: number) => {
+        raf = 0;
+        if (!visible) return;
+        if (now - last >= 33) {
+          last = now;
+          draw(now);
+        }
+        if (!paused || now - k.level.since < LEVEL_MS) raf = requestAnimationFrame(tick);
+      };
+      const start = () => {
+        if (!raf) raf = requestAnimationFrame(tick);
+      };
+      const sized = new ResizeObserver((entries) => {
+        const box = entries[0]?.contentRect.width;
+        if (box !== undefined) width = box - 2 * BLEED;
+        draw(performance.now());
+      });
+      const seen = new IntersectionObserver((entries) => {
+        visible = entries.some((e) => e.isIntersecting);
+        if (visible) start();
+      });
+      sized.observe(canvas);
+      seen.observe(canvas);
+      draw(begun);
+      start();
+      return () => {
+        cancelAnimationFrame(raf);
+        sized.disconnect();
+        seen.disconnect();
+      };
+    },
+    [at, level, stops, paused],
+  );
+  return <canvas ref={attach} className="rs-lit" aria-hidden="true" />;
 }
 
 /* ------------------------------------------------------------------ the model */
@@ -754,7 +882,7 @@ export function RunSettings({
     const current = k === "mode" && modeCanReapply && isPreset(shown(k)) ? s.words.find((x) => x.id === shown(k)) : undefined;
     return (
       <>
-        <Scale label={KEY[k]} words={s.words} value={shown(k)} armed={w?.id} onPick={pick} />
+        <Scale label={KEY[k]} words={s.words} value={shown(k)} armed={w?.id} onPick={pick} live={k === "effort"} />
         {w && (
           <p className="rs-desc rs-confirm-line" data-tone="warn">
             {CONFIRM}{" "}
