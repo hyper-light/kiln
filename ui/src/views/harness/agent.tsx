@@ -217,6 +217,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
   const [panelFor, setPanelFor] = React.useState<{ panel: ThreadPanel; thread: string } | null>(null);
   const panel = panelFor?.thread === threadKey ? panelFor.panel : null;
   const limits = useSession(sessionStore(path?.here?.session ?? id), (s) => (s.meta?.features ?? []).includes("limits"));
+  const webWhole = useSession(sessionStore(path?.here?.session ?? id), (s) => (s.meta?.features ?? []).includes("web_whole"));
   // Who started the thread shown, for its timeline: a key, so its turns only render again when that changes.
   const keep = sub && path?.here?.stand === "done" ? keepOf(sub, everyone) : undefined;
   const fromKey = JSON.stringify(path ? { ...threadFrom(path.crumbs, path.here, { via: sub ? null : taskInfo?.via, session: sub ? id : undefined }), keep } : null);
@@ -323,7 +324,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
       )}
       {findOpen && dropped > 0 && <EarlierMatches agent={subId ?? id} q={findQ} before={findEvents[0]?.at} />}
       {path && <ThreadCrumbs crumbs={path.crumbs} here={path.here} sub={sub} panel={panel} onPanel={(p) => setPanelFor(p && { panel: p, thread: threadKey })} onClose={mainThread} />}
-      {path?.here && panel === "perms" && <PermsPanel key={path.here.key} n={path.here} can={limits && takesMessage(path.here)} />}
+      {path?.here && panel === "perms" && <PermsPanel key={path.here.key} n={path.here} can={limits && takesMessage(path.here)} webWhole={webWhole} />}
       {path?.here && panel === "branch" && <BranchPanel key={path.here.key} n={path.here} can={path.here.stand !== "offline"} onDone={() => setPanelFor(null)} />}
       <ThreadFromContext.Provider value={from}>
         {sub ? (

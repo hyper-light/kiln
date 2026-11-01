@@ -140,6 +140,12 @@ impl Kind {
                 if let Some((kiln, sock, prefer)) = local_tools(spec) {
                     p.args(crate::reach::mcp::codex_config(&kiln, sock, prefer, session));
                 }
+                // kiln's hook before each tool call, trusted for this session alone: what holds a
+                // subagent (a pause, what it may do) holds its calls (docs/agents.md).
+                #[cfg(unix)]
+                if let (Some(sock), Ok(kiln)) = (super::socket::served(), crate::os::this_kiln()) {
+                    p.args(super::codex::hook_args(&kiln, sock));
+                }
             }
             Protocol::Acp(args) => {
                 p.args(args);
@@ -453,8 +459,13 @@ impl Adapter {
             Self::Codex(a) => super::subagent::settle(core, |core, t| a.takes(core, t)),
             Self::Acp(_) | Self::Agy(_) => super::subagent::settle(core, |_, _| (Vec::new(), None)),
         }
-        // Held at its next tool call: Claude Code asks kiln before each (`claude::HOLD_HOOK`).
-        let can = matches!(self, Self::Claude(_));
+        // Held at its next tool call: Claude Code asks kiln before each (`claude::HOLD_HOOK`), and so
+        // does Codex once it trusts kiln's hook (`codex::hook_args`).
+        let can = match self {
+            Self::Claude(_) => true,
+            Self::Codex(a) => a.holds_calls(),
+            Self::Acp(_) | Self::Agy(_) => false,
+        };
         super::subagent::settle_pausable(core, |t| can && t.tool_id.is_some());
     }
 
@@ -592,6 +603,26 @@ impl Adapter {
             Self::Agy(a) => a.room(core),
         }
         self.drain_subagents(core);
+    }
+
+    /// What the person lets the session do changed (`Command::Perms` for the whole session): what
+    /// only its harness's own settings hold follows (Codex's web search).
+    pub fn perms_changed(&mut self, core: &mut Core) {
+        if let Self::Codex(a) = self {
+            a.perms_changed(core);
+        }
+    }
+
+    /// Its harness's hook asks before a tool call (`input`): the answer goes to `reply`, at once or
+    /// once a person lets the call go (`hold`). Only Codex's hook asks this way; Claude Code's comes
+    /// over its own control protocol.
+    pub fn hook(&mut self, core: &mut Core, input: serde_json::Value, reply: futures::channel::oneshot::Sender<serde_json::Value>) {
+        match self {
+            Self::Codex(a) => a.hook(core, input, reply),
+            Self::Claude(_) | Self::Acp(_) | Self::Agy(_) => {
+                let _ = reply.send(serde_json::json!({}));
+            }
+        }
     }
 
     /// Something waits to go to its harness: kiln's queue, what its adapter holds till its harness

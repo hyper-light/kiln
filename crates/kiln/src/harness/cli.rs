@@ -118,8 +118,13 @@ fn request(req: &Request) -> anyhow::Result<Value> {
 /// A request whose answer may take up to `wait` (a wait for agents).
 #[cfg(unix)]
 fn request_for(req: &Request, wait: std::time::Duration) -> anyhow::Result<Value> {
-    let path = socket()?;
-    let mut s = std::os::unix::net::UnixStream::connect(&path).map_err(|e| anyhow::anyhow!("cannot reach kiln at {}: {e}", path.display()))?;
+    request_at(&socket()?, req, wait)
+}
+
+/// [`request_for`], to the socket at `path`.
+#[cfg(unix)]
+fn request_at(path: &std::path::Path, req: &Request, wait: std::time::Duration) -> anyhow::Result<Value> {
+    let mut s = std::os::unix::net::UnixStream::connect(path).map_err(|e| anyhow::anyhow!("cannot reach kiln at {}: {e}", path.display()))?;
     s.set_read_timeout(Some(wait))?;
     let mut line = serde_json::to_vec(req)?;
     line.push(b'\n');
@@ -136,6 +141,43 @@ fn request_for(req: &Request, wait: std::time::Duration) -> anyhow::Result<Value
 #[cfg(not(unix))]
 fn request(_req: &Request) -> anyhow::Result<Value> {
     anyhow::bail!("kiln spawn is not available on Windows yet")
+}
+
+/// `kiln harness-hook`: a harness's hook before each of its tool calls (Codex's, given by kiln as
+/// it starts it: `codex::hook_args`).
+#[derive(clap::Args, Debug)]
+pub struct HarnessHookArgs {
+    /// The harness socket of the runner the session is on.
+    #[arg(long)]
+    pub sock: std::path::PathBuf,
+}
+
+/// The hook's input (stdin) goes to the session it runs in, told by its process, and the session's
+/// answer is printed once it gives it: a call a person holds waits for them, up to a week. What goes
+/// wrong lets the call go (nothing printed): a kiln that can't be reached holds nothing.
+#[cfg(unix)]
+pub fn harness_hook(a: HarnessHookArgs) -> anyhow::Result<()> {
+    let mut input = String::new();
+    if let Err(e) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input) {
+        eprintln!("kiln: the hook's input was unreadable: {e}");
+        return Ok(());
+    }
+    let input = serde_json::from_str(&input).unwrap_or(Value::Null);
+    match request_at(&a.sock, &Request::Hook { input }, std::time::Duration::from_secs(8 * 24 * 3600)) {
+        Ok(v) => {
+            if let Some(answer) = v.get("answer").filter(|a| a.as_object().is_some_and(|o| !o.is_empty())) {
+                println!("{answer}");
+            }
+        }
+        Err(e) => eprintln!("kiln: {e:#}"),
+    }
+    Ok(())
+}
+
+/// No harness socket on Windows yet: nothing of kiln's holds the call.
+#[cfg(not(unix))]
+pub fn harness_hook(_a: HarnessHookArgs) -> anyhow::Result<()> {
+    Ok(())
 }
 
 #[cfg(not(unix))]

@@ -84,6 +84,12 @@ pub enum Request {
         #[serde(default)]
         terminal: Option<String>,
     },
+    /// A harness's hook asking before a tool call (`kiln harness-hook`, `codex::hook_args`): the
+    /// session it's for is the one whose process asks; its answer (`answer`) may wait for a person.
+    Hook {
+        #[serde(default)]
+        input: Value,
+    },
 }
 
 /// Who asks the server, as the socket tells them apart.
@@ -179,6 +185,11 @@ pub async fn answer(host: &Host, req: Request, peer: Option<u32>, forward: Optio
         Request::Stop { id: Some(id), .. } if agent.is_some() => as_agent("agents.stop", json!({"agent": id})).await,
         Request::Interrupt { id: Some(id), .. } if agent.is_some() => as_agent("agents.interrupt", json!({"agent": id})).await,
         Request::Stop { id: None, .. } | Request::Interrupt { id: None, .. } if agent.is_some() => json!({"ok": false, "error": "say which agent (its id): an agent stops only the agents it started"}),
+        // Its harness's hook, told by its process: what holds the call answers, maybe later.
+        Request::Hook { input } => match agent.as_deref().and_then(|a| host.get(a)) {
+            Some(s) => json!({"ok": true, "answer": s.hook(input).await}),
+            None => json!({"ok": true, "answer": {}}),
+        },
         other => handle(host, other),
     }
 }
@@ -293,6 +304,8 @@ pub fn handle(host: &Host, req: Request) -> Value {
             json!({"ok": ok, "message": message})
         }
         Request::Op { .. } => json!({"ok": false, "error": "kiln's operations go to the kiln server"}),
+        // Not an agent kiln runs here: nothing of kiln's holds the call.
+        Request::Hook { .. } => json!({"ok": true, "answer": {}}),
     }
 }
 

@@ -3,7 +3,9 @@
  * each Allow, Ask or Off; the folder its file calls stay in; how many minutes and tokens it may
  * use. A choice wider than what it's under lets is off (subagent-tree.ts `wider`). Each change goes
  * at once (`Command::Perms`): to a subagent kiln started, its session; to one of its harness's own,
- * by its task, its agent's session. Every choice sits at the panel's right edge.
+ * by its task, its agent's session. Every choice sits at the panel's right edge. Where its harness
+ * sets web search for the whole agent alone (`web_whole`: Codex's is hosted, out of any hook's
+ * reach), a subagent of its own has no Web choice and the agent no Ask, and the panel says so.
  */
 import * as React from "react";
 import { Clock, Eye, Folder, Globe, Pencil, SquareTerminal, X } from "lucide-react";
@@ -30,7 +32,9 @@ const count = (v: string) => {
   return d === "" ? undefined : Math.max(1, Number(d));
 };
 
-export function PermsPanel({ n, can }: { n: Pick<SubagentNode, "kind" | "session" | "task" | "name" | "perms" | "over">; can: boolean }) {
+export function PermsPanel({ n, can, webWhole = false }: { n: Pick<SubagentNode, "kind" | "session" | "task" | "name" | "perms" | "over">; can: boolean; webWhole?: boolean }) {
+  // One of its harness's own subagents (else a session of its own).
+  const own = n.kind === "harness" && !!n.task;
   // What it's set to here, at once (its next state says so too). Each of its states is new: what
   // it's set to is taken again only when that changed. A field typed in keeps what's typed until
   // it's left, whatever else changes meanwhile (each is keyed by its own value).
@@ -54,21 +58,25 @@ export function PermsPanel({ n, can }: { n: Pick<SubagentNode, "kind" | "session
   };
   return (
     <div className="hx-perm" role="group" aria-label={`What ${n.name} may do`}>
-      {KINDS.map((k) => (
-        <React.Fragment key={k.key}>
-          <span className="hx-perm-k">
-            {k.icon}
-            {k.label}
-          </span>
-          <span className="hx-perm-seg" role="group" aria-label={k.label}>
-            {GRANTS.map((g) => (
-              <button key={g} type="button" aria-pressed={now[k.key] === g} disabled={!can || wider(g, n.over?.[k.key])} onClick={() => change({ [k.key]: g })}>
-                {WORD[g]}
-              </button>
-            ))}
-          </span>
-        </React.Fragment>
-      ))}
+      {KINDS.map((k) => {
+        const whole = webWhole && k.key === "web";
+        return (
+          <React.Fragment key={k.key}>
+            <span className="hx-perm-k">
+              {k.icon}
+              {k.label}
+            </span>
+            <span className="hx-perm-seg" role="group" aria-label={k.label}>
+              {GRANTS.map((g) => (
+                <button key={g} type="button" aria-pressed={now[k.key] === g} disabled={!can || wider(g, n.over?.[k.key]) || (whole && (own || g === "ask"))} onClick={() => change({ [k.key]: g })}>
+                  {WORD[g]}
+                </button>
+              ))}
+            </span>
+            {whole && <span className="hx-perm-why">{own ? "Web search is set for the whole agent." : "It can't ask before a web search."}</span>}
+          </React.Fragment>
+        );
+      })}
       <span className="hx-perm-k">
         <Folder size={14} aria-hidden="true" />
         Where

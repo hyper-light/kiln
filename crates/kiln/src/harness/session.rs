@@ -725,6 +725,9 @@ enum Ctl {
     /// There may be room on its machine for it to go to work: what waited for that goes, if it
     /// may now (`super::limit`).
     Room,
+    /// Its harness's hook asks before a tool call (Codex's, `codex::hook_args`): the answer goes to
+    /// `reply`, at once or once what holds the call lets it go (`hold`).
+    Hook(serde_json::Value, futures::channel::oneshot::Sender<serde_json::Value>),
 }
 
 /// A session handed from this image of the process to the next (an in-place upgrade) with its
@@ -809,6 +812,17 @@ impl Session {
 
     pub fn close(&self) {
         let _ = self.ctl.try_send(Ctl::Close);
+    }
+
+    /// Its harness's hook asks about a tool call (`input`, as the harness gives it): the hook's
+    /// answer, once the session gives it (a call a person holds waits for them). Nothing (`{}`) lets
+    /// the call go: the session ended, or nothing holds it.
+    pub async fn hook(&self, input: serde_json::Value) -> serde_json::Value {
+        let (tx, rx) = futures::channel::oneshot::channel();
+        if self.ctl.send(Ctl::Hook(input, tx)).await.is_err() {
+            return serde_json::json!({});
+        }
+        rx.await.unwrap_or_else(|_| serde_json::json!({}))
     }
 
     /// There may be room on its machine now for it to go to work ([`Ctl::Room`]).
@@ -2613,6 +2627,10 @@ async fn files_in(s: &Session, sink: &Sink, mark: &crate::sync::runner::Mark, ct
                 Ok(Ctl::Close) | Err(_) => return Arrived::End { let_go: false },
                 // What it carries goes once it's on, asking for room then.
                 Ok(Ctl::Room) => {}
+                // No harness of its runs here to hold a call.
+                Ok(Ctl::Hook(_, reply)) => {
+                    let _ = reply.send(serde_json::json!({}));
+                }
             },
             () = tick => {}
         }
@@ -3443,6 +3461,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                 let mut core = s.core.lock();
                                 core.state.perms = perms;
                                 core.touch_state();
+                                adapter.perms_changed(&mut core);
                                 drop(core);
                                 on_change();
                             }
@@ -3503,6 +3522,9 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                             }
                             adapter.room(&mut core);
                         }
+                        // Its harness's hook asks before a tool call: the adapter answers, at once or
+                        // once a person lets the call go.
+                        Ev::Ctl(Some(Ctl::Hook(input, reply))) => adapter.hook(&mut s.core.lock(), input, reply),
                         Ev::Ctl(Some(Ctl::HandOver(reply))) => {
                             // This image of the process ends next (an in-place upgrade): the next
                             // one goes on with this very process. What it has said so far is taken
@@ -3955,6 +3977,10 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                 // No process to hand over: the next image starts it from its record.
                 Ev::Ctl(Some(Ctl::HandOver(reply))) => {
                     let _ = reply.send(None);
+                }
+                // No harness of its runs now to hold a call.
+                Ev::Ctl(Some(Ctl::Hook(_, reply))) => {
+                    let _ = reply.send(serde_json::json!({}));
                 }
                 // There may be room on its machine now: it starts again if anything waits for that,
                 // the first message in its queue first.

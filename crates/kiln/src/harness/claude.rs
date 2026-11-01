@@ -1624,37 +1624,26 @@ impl Claude {
     /// A person pauses subagent `task` (its next tool call, and those of the subagents under it,
     /// wait for their answer), or resumes it: what waited goes on, unless a pause above it holds it.
     fn pause_subagent(&mut self, core: &mut Core, task: &str, on: bool) {
-        let Some(t) = core.state.tasks.iter().position(|t| t.subagent() && (t.id == task || t.tool_id.as_deref() == Some(task))) else {
+        if !super::hold::pause(core, task, on) {
             self.notice(core, Level::Warn, "Not paused: it has no such subagent.".to_owned(), None);
             return;
-        };
-        if let Some(t) = core.state.tasks.get_mut(t) {
-            t.paused_at = on.then(Core::now);
         }
-        core.touch_state();
         if !on {
             self.release_held(core);
         }
     }
 
     /// What a person lets subagent `task` do (none: no limits of its own), never more than its
-    /// session and the subagent it's under let it ([`perms_over`]).
+    /// session and the subagent it's under let it (`hold::perms_over`).
     fn set_perms(&mut self, core: &mut Core, task: &str, perms: Option<Perms>) {
-        let Some(i) = core.state.tasks.iter().position(|t| t.subagent() && (t.id == task || t.tool_id.as_deref() == Some(task))) else {
+        if !super::hold::set_perms(core, task, perms) {
             self.notice(core, Level::Warn, "Not limited: it has no such subagent.".to_owned(), None);
-            return;
-        };
-        let up = core.state.tasks.get(i).and_then(|t| t.parent_task.clone());
-        let over = perms_over(core, up.as_deref());
-        if let Some(t) = core.state.tasks.get_mut(i) {
-            t.perms = perms.map(|p| Perms::within(Some(&p), over.as_ref()).unwrap_or(p));
         }
-        core.touch_state();
     }
 
     /// The calls held for a pause that no longer holds them get their answer, and go on.
     fn release_held(&mut self, core: &mut Core) {
-        let (still, free): (Vec<_>, Vec<_>) = std::mem::take(&mut self.held_calls).into_iter().partition(|(_, task)| paused(core, task));
+        let (still, free): (Vec<_>, Vec<_>) = std::mem::take(&mut self.held_calls).into_iter().partition(|(_, task)| super::hold::paused(core, task));
         self.held_calls = still;
         for (req, _) in free {
             core.write(&json!({"type": "control_response", "response": {"subtype": "success", "request_id": req, "response": {}}}));
@@ -2220,7 +2209,7 @@ impl Claude {
         if str_of(req, "callback_id") == Some(HOLD_HOOK) {
             let task = call_task(core, req);
             // A paused subagent's call waits: answered when it's resumed (`release_held`).
-            if let Some(t) = task.as_ref().filter(|t| paused(core, t)) {
+            if let Some(t) = task.as_ref().filter(|t| super::hold::paused(core, t)) {
                 self.held_calls.push((id.to_owned(), t.clone()));
                 return;
             }
@@ -3725,110 +3714,16 @@ fn call_task(core: &Core, req: &Value) -> Option<String> {
     found.filter(|t| t.subagent()).map(|t| t.id.clone())
 }
 
-/// What a call in subagent `task` (none: the agent's own) may do: its session's perms, narrowed
-/// by each subagent's from the outermost to `task`. None: no limits.
-fn perms_over(core: &Core, task: Option<&str>) -> Option<Perms> {
-    let mut line: Vec<&Perms> = Vec::new();
-    let mut at = task.and_then(|t| core.state.tasks.iter().find(|u| u.id == t));
-    for _ in 0..=core.state.tasks.len() {
-        let Some(t) = at else { break };
-        if let Some(p) = &t.perms {
-            line.push(p);
-        }
-        at = t.parent_task.as_deref().and_then(|p| core.state.tasks.iter().find(|u| u.id == p));
-    }
-    line.into_iter().rev().fold(core.state.perms.clone(), |over, p| Perms::within(Some(p), over.as_ref()))
-}
-
 /// What a person's perms say of a hook's tool call (`req`) in subagent `task` (none: the agent's
 /// own): refused ("deny") or asked ("ask"), and why, in words the agent reads; none where they let it
-/// go as it would.
+/// go as it would (`hold::verdict`, by what kind of call it is and the files it names).
 fn limit(core: &Core, task: Option<&str>, req: &Value) -> Option<(&'static str, String)> {
-    use super::model::Grant;
-    let perms = perms_over(core, task)?;
     let input = req.get("input");
     let name = input.and_then(|i| str_of(i, "tool_name")).unwrap_or("");
     let args = input.and_then(|i| i.get("tool_input")).cloned().unwrap_or(Value::Null);
-    let cwd = core.state.cwd.as_str();
-    // Past its limits, it finishes with what it has: its own task's time and tokens, or the session's.
-    let t = task.and_then(|t| core.state.tasks.iter().find(|x| x.id == t));
-    let since = t.map(|t| t.started).or_else(|| core.events().next().map(|e| e.at)).unwrap_or_else(Core::now);
-    let used = t.map_or(core.state.usage.input_tokens + core.state.usage.output_tokens, |t| t.tokens);
-    let finish = "Make no more tool calls: finish now with what you have.";
-    if let Some(m) = perms.minutes
-        && Core::now() - since > i64::from(m) * 60_000
-    {
-        return Some(("deny", format!("Your {m} minutes are up (a person's limit on you). {finish}")));
-    }
-    if let Some(n) = perms.tokens
-        && used >= n
-    {
-        return Some(("deny", format!("You've used your {n} tokens (a person's limit on you). {finish}")));
-    }
-    let (kind, _, _) = describe(name, &args, cwd);
-    let (grant, what) = match kind {
-        ToolKind::Read | ToolKind::Search => (perms.read, "read files"),
-        ToolKind::Edit => (perms.edit, "change files"),
-        ToolKind::Shell | ToolKind::Mcp => (perms.run, "run commands"),
-        ToolKind::Web => (perms.web, "use the web"),
-        _ => return None,
-    };
-    match grant {
-        Grant::Off => return Some(("deny", format!("You may not {what} (a person turned it off for you). Do without it, or say what you'd need."))),
-        Grant::Ask => return Some(("ask", format!("A person sees each time you {what}."))),
-        Grant::Allow => {}
-    }
-    // Its folder: a file call stays in it; a command can reach anywhere, so a person sees each.
-    let folder = perms.folder.as_deref()?;
-    let root = lexical(folder, cwd);
-    match kind {
-        ToolKind::Read | ToolKind::Search | ToolKind::Edit => {
-            let paths: Vec<&str> = ["file_path", "notebook_path", "path"].iter().filter_map(|k| str_of(&args, k)).collect();
-            let paths = if paths.is_empty() { vec![cwd] } else { paths };
-            paths
-                .into_iter()
-                .find(|p| {
-                    let at = lexical(p, cwd);
-                    at != root && !at.starts_with(&format!("{root}/"))
-                })
-                .map(|p| ("deny", format!("{p} is outside your folder, {folder} (a person's limit on you). Stay in it.")))
-        }
-        ToolKind::Shell => Some(("ask", format!("Your folder is {folder}, and a command can reach outside it: a person sees each."))),
-        _ => None,
-    }
-}
-
-/// Path `p` from folder `cwd`, its `.` and `..` worked out as written (no links followed), with
-/// Windows' separators and drives taken as `/` and a first part.
-fn lexical(p: &str, cwd: &str) -> String {
-    let (p, cwd) = (p.replace('\\', "/"), cwd.replace('\\', "/"));
-    let absolute = p.starts_with('/') || p.as_bytes().get(1) == Some(&b':');
-    let joined = if absolute { p } else { format!("{cwd}/{p}") };
-    let mut parts: Vec<&str> = Vec::new();
-    for part in joined.split('/') {
-        match part {
-            "" | "." => {}
-            ".." => {
-                parts.pop();
-            }
-            other => parts.push(other),
-        }
-    }
-    format!("/{}", parts.join("/"))
-}
-
-/// Subagent `task`, or one it's under, is paused by a person (`Task::paused_at`).
-fn paused(core: &Core, task: &str) -> bool {
-    let mut at = core.state.tasks.iter().find(|t| t.id == task);
-    // A chain no deeper than the tasks there are: a loop of parents ends.
-    for _ in 0..=core.state.tasks.len() {
-        let Some(t) = at else { return false };
-        if t.paused_at.is_some() {
-            return true;
-        }
-        at = t.parent_task.as_deref().and_then(|p| core.state.tasks.iter().find(|u| u.id == p));
-    }
-    false
+    let (kind, _, _) = describe(name, &args, core.state.cwd.as_str());
+    let paths: Vec<&str> = ["file_path", "notebook_path", "path"].iter().filter_map(|k| str_of(&args, k)).collect();
+    super::hold::verdict(core, task, kind, &paths)
 }
 
 fn set_tool_status(core: &mut Core, id: &str, status: ToolStatus) {

@@ -1558,22 +1558,31 @@ end (docs/headroom.md, "A person's pause"). `state.frozen` says since when; a ru
 pause says why, and one that restarts holds a paused session again. The server sends the pause,
 and its end, to every subagent kiln started under it. With `task`, that subagent of its harness's
 own is held at its next tool call: kiln has a hook on every one of Claude Code's tool calls (a
-`PreToolUse` matcher for every tool, its answer awaited up to 7 days), and the call of a paused
-subagent, or of one under it, waits for its answer until it's resumed (`tasks[].paused_at`).
-`tasks[].pausable` says which can be held so: Claude Code's while they go; not Codex's, ACP
-agents' or Antigravity's. What a pause holds says Paused; the one paused offers Resume, and those
-under it wait for that.
+`PreToolUse` matcher for every tool, its answer awaited up to 7 days), and on each of Codex's local
+ones (commands, `apply_patch`, MCP calls and its read tools): a `PreToolUse` command hook kiln gives
+in the session's flags, with that hook's trust for this session alone (the hash Codex trusts it
+by), so the person's own hooks keep theirs. Its command, `kiln harness-hook`, hands the call to the
+runner's harness socket, which knows the session by the asking process; Codex names no subagent,
+so kiln tells it by the call's turn. The call of a paused subagent, or of one under it, waits for
+its answer until it's resumed (`tasks[].paused_at`). `tasks[].pausable` says which can be held so:
+Claude Code's while they go; Codex's once Codex lists kiln's hook as trusted (a session whose hook
+it doesn't trust says why); not ACP agents' or Antigravity's. What a pause holds says Paused; the
+one paused offers Resume, and those under it wait for that.
 
 **What each may do** (`perms`, `{perms?, task?}`): Read, Edit, Run and Web, each `allow`, `ask` or
 `off`; a `folder` its file calls stay in; the most `minutes` and `tokens` it may use. Never more
 than what it's under: the server narrows a session's to its parent's, and the subagents kiln
 started under it to its own (narrowing one narrows those under it; widening it widens none);
-Claude Code's adapter narrows one of its own subagents' to its session's and the one it's under.
-They hold at each of Claude Code's tool calls, in the same hook: `off` refuses the call with the
-reason, `ask` makes it ask the person, a file outside its folder is refused (a command there asks),
-and past its minutes or tokens each call is refused and it's told to finish. The shield on the
-thread's crumbs opens the panel under them, every choice at its right edge; a session whose
-harness kiln doesn't answer that way (no `limits` in its `meta.features`) has it off.
+Claude Code's and Codex's adapters narrow one of their own subagents' to the session's and the one
+it's under. They hold at each tool call the same hook sees: `off` refuses the call with the reason,
+`ask` makes it ask the person (Codex's hook can't ask, so kiln holds the call and asks them
+itself), a file outside its folder is refused (a command there asks; for Codex, the files an
+`apply_patch` names), and past its minutes or tokens each call is refused and it's told to finish.
+Codex's web search is hosted, out of any hook's reach (`web_whole` in its `meta.features`): `off`,
+and `ask`, which it can't do, turn it off for the session's threads (`web_search = "disabled"`), as
+it starts again once idle, the conversation going on; a subagent of its own has no Web choice. The
+shield on the thread's crumbs opens the panel under them, every choice at its right edge; a
+session whose harness kiln doesn't answer that way (no `limits` in its `meta.features`) has it off.
 
 **Branching** (`branch`, `{words, top?, task?}`). The fork on a subagent's crumbs takes what
 changes, then a Variant or a New agent, and its runner makes the new session on its machine. A

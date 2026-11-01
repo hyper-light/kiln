@@ -1033,6 +1033,34 @@ function treeVariant() {
   variantIn(v);
 }
 
+/**
+ * A Codex agent working through two subagents of its own (`POST /api/mock/codex-kids`), for the tests
+ * of holding a Codex subagent (kiln's hook before each of its tool calls): taken back with the
+ * variants.
+ */
+function codexKids() {
+  const t = Date.now() - 10 * 60_000;
+  const m = member("codex-kids", "codex", "local", "Parser port", "running", "untrusted", "Port the parser to the new grammar.", "Its two parts are out on subagents.", {
+    doing: "Waiting for its subagents",
+  });
+  m.info.created_at = t;
+  const kid = (id: string, description: string, started: number): Task => ({
+    ...defaultTask(),
+    id,
+    tool_id: `call_${id}`,
+    description,
+    class: "agent",
+    kind: "spawn_agent",
+    status: "running",
+    started,
+    last_tool: "Bash",
+    pausable: true,
+  });
+  m.tasks = [kid("ck-a", "Port the lexer", t + 60_000), kid("ck-b", "Port the parser tests", t + 120_000)];
+  leaves(m);
+  variantIn(m);
+}
+
 /** What a person lets one of them do (`Command::Perms`), or one of its harness's own (`task`), as kiln keeps it. */
 function permsMember(m: Member, perms: Perms | undefined, task?: string) {
   if (task) {
@@ -1409,7 +1437,8 @@ export function handleFamilySession(ws: WebSocket, id: string): boolean {
     if (under) send({ t: "ack", id: under, outcome: "taken" });
   });
   send({ t: "open", info: m.info });
-  send({ t: "meta", meta: { ...META, version: m.info.kind === "claude" ? "2.3.1" : "0.46.0" } });
+  // Codex sets its web search for the whole agent alone (`web_whole`).
+  send({ t: "meta", meta: { ...META, version: m.info.kind === "claude" ? "2.3.1" : "0.46.0", features: m.info.kind === "codex" ? [...META.features, "web_whole"] : META.features } });
   send({ t: "state", state: stateOf(m) });
   send({ t: "events", events: m.events });
   const files = CHANGESETS[id];
@@ -2172,6 +2201,11 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
   }
   if (p === "/api/mock/tree-variant" && m === "POST") {
     treeVariant();
+    json(res, 200, {});
+    return true;
+  }
+  if (p === "/api/mock/codex-kids" && m === "POST") {
+    codexKids();
     json(res, 200, {});
     return true;
   }

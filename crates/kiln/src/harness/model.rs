@@ -1697,7 +1697,9 @@ pub struct Meta {
     /// "interrupt", "set_mode", "set_model", "set_effort", "set_speed", "stop_task", "file_suggestions",
     /// "resume", "attachments", "images", "overrides", "switch_harness" (a model of another
     /// harness: `Command::SetModel::kind`), "own_edits" (`Command::OwnEdits`: the session answers
-    /// it whatever its harness).
+    /// it whatever its harness), "limits" (a person's pause and what each may do hold at its own
+    /// subagents' tool calls: `Command::Pause`, `Command::Perms` with a task), "web_whole" (its web
+    /// search is set for the whole agent, allowed or off: no call of it can be held or asked).
     #[serde(default)]
     pub features: Vec<String>,
     /// Effort / reasoning levels the harness offers (empty: none).
