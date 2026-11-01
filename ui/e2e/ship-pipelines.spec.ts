@@ -99,8 +99,9 @@ test("an opened workflow is the jobs pane's anatomy: the strip, its groups, the 
   await expect(pane.locator(".jp-j[data-at]")).toHaveAttribute("data-key", "jobs.rust");
   const detail = pane.locator(".ppl-detail");
   await expect(detail.getByRole("tab")).toHaveText(["YAML", "Plan", "Last run"]);
-  await expect(detail.locator(".ppl-code li[data-at]").first()).toContainText("rust:");
-  await expect(detail.locator(".ppl-code li[data-at]")).toHaveCount(11);
+  // Edited in place: the job's lines tinted in the editor, opened at a line above them.
+  await expect(detail.locator(".cm-line.cm-picked").first()).toContainText("rust:");
+  await expect.poll(() => detail.locator(".cm-scroller").evaluate((e) => e.scrollTop)).toBeGreaterThan(0);
   // Beside the list on a desktop; right under its line on a phone.
   if (isMobile) await expect(pane.locator('.jp-j[data-key="jobs.rust"] + li.jp-detail .ppl-detail')).toBeVisible();
   else await expect(pane.locator(".ppl-side .ppl-detail")).toBeVisible();
@@ -165,4 +166,35 @@ test("nothing moves as lines are picked and views switched: the list holds still
   await pane.locator('.jp-j[data-key="on.schedule"] .jp-line').click();
   await expect(pane.locator(".ppl-detail").getByRole("tab")).toHaveText(["Times", "YAML", "Plan"]);
   expect(await heightOf()).toBe(height);
+});
+
+test("the file is edited where it's shown: kiln's colours, run: as bash; typing starts a draft; its problems under it with their fixes; nothing floats", async ({ page, isMobile }) => {
+  const pane = await openPane(page, isMobile, "hyper-light/kiln", ".kiln/ci.yaml");
+  const code = pane.locator(".ppl-detail .cm-content");
+  await expect(code).toBeVisible();
+  // kiln's tree-sitter colours: keys as properties, a run: line as bash (its command a function).
+  await expect(pane.locator(".ppl-detail .cm-line .hl-prop", { hasText: "runs-on" }).first()).toBeVisible();
+  await expect(pane.locator(".ppl-detail .cm-line .hl-fn", { hasText: "cargo" }).first()).toBeVisible();
+  // A job typed at the end, its use following a tag (the end reached as a person would, on any platform).
+  await pane.locator(".ppl-detail .cm-scroller").evaluate((e) => (e.scrollTop = e.scrollHeight));
+  await pane.locator(".ppl-detail .cm-line").last().click();
+  await page.keyboard.press("End");
+  await page.keyboard.insertText("\n  helm-lint:\n    runs-on: [baremetal, linux]\n    steps:\n      - uses: azure/setup-helm@v4\n");
+  // Not saved: the row and the head say so, and Save draft is on.
+  const row = page.locator('.ppl-row[data-key="hyper-light/kiln:.kiln/ci.yaml"]');
+  await expect(row.locator(".ship-r .ship-stand")).toHaveText("Not saved");
+  await expect(pane.locator(".ppl-kicker .ppl-draft")).toBeVisible();
+  await expect(pane.locator(".jp-said")).toContainText("Not saved yet");
+  await expect(pane.locator(".ppl-verbs button", { hasText: "Save draft" })).not.toHaveAttribute("data-dim");
+  // Its problems sit under the code once typing stops: the pin, with its fix.
+  const problems = pane.getByLabel("Problems");
+  await expect(problems.locator("li")).toHaveCount(1);
+  await expect(problems.locator("li")).toContainText("KCI6002");
+  await problems.getByRole("button", { name: "Pin it to 1a275c3" }).click();
+  await expect(code).toContainText("azure/setup-helm@1a275c3f0b9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c");
+  await expect(problems.locator("li")).toHaveCount(0);
+  // Nothing floats over the page, hovering the code or not.
+  await pane.locator(".ppl-detail .cm-line", { hasText: "helm-lint" }).hover();
+  await expect(page.locator(".cm-tooltip, [role=dialog]")).toHaveCount(0);
+  expect(await sideways(page)).toBe(0);
 });

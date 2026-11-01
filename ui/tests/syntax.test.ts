@@ -127,6 +127,29 @@ test("what's written inside another language waits for that language, then reads
   assert.equal(await classOfWord("markdown", "```nosuchlang\nimport os\n```\n", "import"), "");
 });
 
+test("w29_r05_a_workflows_run_reads_as_the_shell_it_runs_in", async () => {
+  // bash's commands and Python's and PowerShell's keywords tell the three apart.
+  const wf = (steps: string, defaults = "", jobDefaults = "") => `name: ci\n${defaults}jobs:\n  build:\n${jobDefaults}    runs-on: [baremetal]\n    steps:\n${steps}`;
+  const python = "    defaults:\n      run:\n        shell: python\n";
+  const wfPython = "defaults:\n  run:\n    shell: python\n";
+  // bash, unless a `shell:` says otherwise.
+  assert.equal(await classOfWord("workflow", wf("      - run: import os\n"), "import"), "hl-fn");
+  // The step's own, before or after its `run:`, a block scalar too.
+  assert.equal(await classOfWord("workflow", wf("      - shell: python\n        run: import os\n"), "import"), "hl-kw");
+  assert.equal(await classOfWord("workflow", wf("      - run: import os\n        shell: python\n"), "import"), "hl-kw");
+  assert.equal(await classOfWord("workflow", wf("      - shell: pwsh\n        run: |\n          foreach ($f in $files) { Write-Host $f }\n"), "foreach"), "hl-kw");
+  // Else its job's defaults, else the workflow's; the nearer wins.
+  assert.equal(await classOfWord("workflow", wf("      - run: import os\n", "", python), "import"), "hl-kw");
+  assert.equal(await classOfWord("workflow", wf("      - run: import os\n", wfPython), "import"), "hl-kw");
+  assert.equal(await classOfWord("workflow", wf("      - run: foreach ($f in $x) { $f }\n", wfPython, "    defaults:\n      run:\n        shell: pwsh\n"), "foreach"), "hl-kw");
+  assert.equal(await classOfWord("workflow", wf("      - shell: bash\n        run: import os\n", "", python), "import"), "hl-fn");
+  // A composite action's step, its shell beside it.
+  assert.equal(await classOfWord("workflow", "name: setup\nruns:\n  using: composite\n  steps:\n    - run: import os\n      shell: python\n", "import"), "hl-kw");
+  // A `defaults: run:` is no script; other YAML reads as YAML.
+  assert.equal(await classOfWord("workflow", wf("      - run: echo\n", "", python), "shell"), "hl-prop");
+  assert.equal(await classOfWord("yaml", wf("      - run: import os\n"), "import"), "hl-str");
+});
+
 test("PHP without <?php is PHP alone", async () => {
   assert.equal(await classOfWord("php", "$n = strlen('a');", "strlen"), "hl-fn");
   assert.equal(await classOfWord("php", "<?php $n = strlen('a'); ?>\n<b>x</b>", "b"), "hl-tag");
@@ -163,7 +186,11 @@ test("a language is found by its path, its fence and its first line", () => {
   assert.equal(path("Makefile"), "make");
   assert.equal(path("CMakeLists.txt"), "cmake");
   assert.equal(path("Cargo.lock"), "toml");
-  assert.equal(path(".kiln/ci.yaml"), "yaml");
+  // A workflow's or an action's YAML reads its `run:` as its shell (W29-R05); other YAML is YAML.
+  assert.equal(path(".kiln/ci.yaml"), "workflow");
+  assert.equal(path(".github/workflows/ci.yml"), "workflow");
+  assert.equal(path(".github/actions/setup/action.yml"), "workflow");
+  assert.equal(path("deploy/values.yaml"), "yaml");
   assert.equal(path("analysis.R"), "r");
   assert.equal(path(".bashrc"), "bash");
   assert.equal(path("main.tf"), "hcl");

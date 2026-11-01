@@ -1628,3 +1628,34 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* The file edited in place (W29-R05): the editor over its problems, one height between them. */
+.ppl-yaml {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) 96px;
+}
+/* W21's editor holds 420px at the least (index.css); here it's its frame's height. */
+.ppl-yaml .code-editor,
+.ppl-yaml .code-editor .cm-editor {
+  min-height: 0;
+  height: 100%;
+}
+.ppl-problems {
+  overflow: auto;
+  border-top: 1px solid var(--k-line-2, #1f2125);
+}
+.ppl-problems .n {
+  white-space: normal;
+}
+.ppl-fix {
+  all: unset;
+  flex: none;
+  cursor: pointer;
+  color: #e2cfae;
+  font-size: 12px;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.ppl-fix:focus-visible {
+  outline: 2px solid #a6c4ed;
+  outline-offset: 2px;
+}

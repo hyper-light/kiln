@@ -8,7 +8,7 @@
  * projects running side by side don't see each other's.
  */
 import type http from "node:http";
-import { parse } from "yaml";
+import { parse, parseDocument } from "yaml";
 import type { ShipPipelineDraft, ShipPipelineGroup, ShipPipelineLine, ShipPipelinePane, ShipPipelineRepo, ShipPipelineRow, ShipPipelineVerb, ShipPipelines } from "../src/api/ship.ts";
 import { FILES, RUNS, TAGS, UPDATES, USED_BY } from "./pipelines-files.ts";
 
@@ -709,6 +709,40 @@ function preview(body: Obj): unknown {
   };
 }
 
+/** Commits the mock knows tags name today, for KCI6002's fix. */
+const PINS: Record<string, string> = { "azure/setup-helm@v4": "1a275c3f0b9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c" };
+
+/**
+ * `POST /api/ci/validate` (W02, as the editor asks it): text that isn't YAML is an error where it
+ * stops reading; a third party's action followed by a tag is KCI6002, which this mock's repositories
+ * require pinned (a warning), with its fix where the mock knows the commit.
+ */
+function validate(body: Obj): unknown {
+  const text = String(body.content ?? "");
+  const diagnostics: unknown[] = [];
+  const doc = parseDocument(text);
+  for (const e of doc.errors) {
+    const [line, col] = [e.linePos?.[0]?.line ?? 1, e.linePos?.[0]?.col ?? 1];
+    diagnostics.push({ code: "KCI1001", severity: "error", message: e.message.split("\n")[0], path: body.path, range: { start: { line, col }, end: { line, col: col + 1 } } });
+  }
+  text.split("\n").forEach((l, i) => {
+    const m = /uses:\s*([^\s#@]+)@([^\s#]+)/.exec(l);
+    if (!m || !m[1] || !m[2] || /^(kiln\/|\.\/|hyper-light\/|actions\/)/.test(m[1]) || /^[0-9a-f]{40}$/.test(m[2])) return;
+    const at = (m.index ?? 0) + m[0].length - m[2].length + 1;
+    const range = { start: { line: i + 1, col: at }, end: { line: i + 1, col: at + m[2].length } };
+    const sha = PINS[`${m[1]}@${m[2]}`];
+    diagnostics.push({
+      code: "KCI6002",
+      severity: "warning",
+      message: `\`${m[1]}@${m[2]}\` follows a tag or branch: pin it to a full commit SHA so it can't change under you`,
+      path: body.path,
+      range,
+      ...(sha ? { fix: { title: `Pin it to ${sha.slice(0, 7)}`, edits: [{ range, text: sha }] } } : {}),
+    });
+  });
+  return { kind: String(body.path ?? "").endsWith("action.yml") ? "action" : "workflow", dialect: String(body.path ?? "").startsWith(".kiln/") ? "kiln" : "gha", diagnostics, outline: null };
+}
+
 /** What each browser sent `POST /api/ship/pipelines`, by its user agent. */
 const sent = new Map<string, Record<string, unknown>[]>();
 const bodiesOf = (ua: string) => {
@@ -747,6 +781,10 @@ export async function handlePipelines(req: http.IncomingMessage, res: http.Serve
   const labels = m === "GET" ? p.match(/^\/api\/ci\/repos\/(.+)\/labels$/) : null;
   if (labels) {
     ctx.json(res, 200, { labels: LABELS });
+    return true;
+  }
+  if (p === "/api/ci/validate" && m === "POST") {
+    ctx.json(res, 200, validate(await readJson(req)));
     return true;
   }
   if (p === "/api/ci/plan-preview" && m === "POST") {

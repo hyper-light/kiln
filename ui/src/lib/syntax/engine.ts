@@ -9,7 +9,11 @@
  *   capture the same text, the later one wins (or the first, for queries written that way:
  *   languages.ts), unless one is given a higher `priority`;
  * - languages written inside others (a `<script>` in HTML, a fenced block in Markdown, PHP's HTML)
- *   are found by the injections query and highlighted in place, in their own colours.
+ *   are found by the injections query and highlighted in place, in their own colours. Two of
+ *   kiln's own properties serve its queries: `kiln.replaces` (this pattern's language stands alone
+ *   in its text, in place of what earlier patterns inject there) and `kiln.block-scalar` (a YAML
+ *   `|` or `>` block reads from the line after its indicator, without the indentation its lines
+ *   share).
  *
  * Predicates web-tree-sitter leaves to its caller are honoured here: Neovim's `#lua-match?`,
  * `#has-ancestor?` and `#has-parent?`, `#contains?`, `#kind-eq?`, and `#offset!` on injections.
@@ -375,6 +379,9 @@ function holds(preds: readonly QueryPredicate[] | undefined, m: QueryMatch, text
 interface Injection {
   lang: string;
   ranges: Range[];
+  /** The pattern that found it, and whether it stands alone in its text (`kiln.replaces`). */
+  pattern: number;
+  replaces: boolean;
 }
 
 /** What an injections query finds: each language written in the text, and the ranges of it. */
@@ -391,18 +398,62 @@ function injectionsOf(q: Query, matches: QueryMatch[], text: string, self: strin
     const ranges: Range[] = [];
     for (const c of m.captures) {
       if (c.name !== "injection.content") continue;
-      ranges.push(...contentRanges(c.node, "injection.include-children" in props, offset && offset.operands[0]?.type === "capture" && offset.operands[0].name === c.name ? offset : undefined));
+      const block = "kiln.block-scalar" in props ? blockLines(c.node, text) : null;
+      ranges.push(
+        ...(block ?? contentRanges(c.node, "injection.include-children" in props, offset && offset.operands[0]?.type === "capture" && offset.operands[0].name === c.name ? offset : undefined)),
+      );
     }
     if (!ranges.length) continue;
+    const replaces = "kiln.replaces" in props;
     if ("injection.combined" in props) {
       const key = `${m.patternIndex}\0${lang}`;
       const had = combined.get(key);
       if (had) had.ranges.push(...ranges);
-      else combined.set(key, { lang, ranges });
-    } else single.push({ lang, ranges: tidy(ranges) });
+      else combined.set(key, { lang, ranges, pattern: m.patternIndex, replaces });
+    } else single.push({ lang, ranges: tidy(ranges), pattern: m.patternIndex, replaces });
   }
-  for (const c of combined.values()) single.push({ lang: c.lang, ranges: tidy(c.ranges) });
-  return single;
+  for (const c of combined.values()) single.push({ lang: c.lang, ranges: tidy(c.ranges), pattern: c.pattern, replaces: c.replaces });
+  // A later pattern that says `kiln.replaces` takes the place of what earlier ones inject into the
+  // same text: a step's own `shell:` over its job's, over bash (queries/workflow-injections.scm).
+  const textOf = (inj: Injection) => inj.ranges.map((r) => `${r.startIndex}:${r.endIndex}`).join(",");
+  return single.filter((a) => !single.some((b) => b !== a && b.replaces && b.pattern > a.pattern && textOf(b) === textOf(a)));
+}
+
+/**
+ * A YAML block scalar's lines (`run: |`), as the language written in it reads them: from the line
+ * after its indicator, each without the indentation they all share. Null for what isn't one.
+ */
+function blockLines(n: Node, text: string): Range[] | null {
+  if (!/[|>]/.test(text.charAt(n.startIndex))) return null;
+  const first = text.indexOf("\n", n.startIndex);
+  if (first < 0 || first + 1 >= n.endIndex) return [];
+  const lines: { at: number; end: number }[] = [];
+  for (let at = first + 1; at < n.endIndex;) {
+    const nl = text.indexOf("\n", at);
+    const end = nl < 0 || nl >= n.endIndex ? n.endIndex : nl + 1;
+    lines.push({ at, end });
+    at = end;
+  }
+  const lead = (l: { at: number; end: number }) => {
+    let i = l.at;
+    while (i < l.end && text.charAt(i) === " ") i++;
+    return i - l.at;
+  };
+  const indents = lines.filter((l) => text.slice(l.at, l.end).trim() !== "").map(lead);
+  const cut = indents.length ? Math.min(...indents) : 0;
+  const row = n.startPosition.row + 1;
+  return lines
+    .map((l, k): Range => {
+      const start = Math.min(l.at + cut, l.end);
+      const ends = text.charAt(l.end - 1) === "\n";
+      return {
+        startIndex: start,
+        endIndex: l.end,
+        startPosition: { row: row + k, column: start - l.at },
+        endPosition: ends ? { row: row + k + 1, column: 0 } : { row: row + k, column: l.end - l.at },
+      };
+    })
+    .filter((r) => r.endIndex > r.startIndex);
 }
 
 /**

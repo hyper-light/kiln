@@ -9,8 +9,9 @@
  */
 import * as React from "react";
 import { ChevronDown, FileText, Plus, Tag } from "lucide-react";
-import { ci } from "@/api/ci";
+import { ci, type CiDiagnostic } from "@/api/ci";
 import { shipApi, type ShipPipelineAct, type ShipPipelineGroup, type ShipPipelineLine, type ShipPipelinePane, type ShipPipelineRepo, type ShipPipelineRow, type ShipPipelineVerb } from "@/api/ship";
+import type { Diagnostic } from "@/components/code/editor";
 import { Toks } from "@/components/code/highlighted";
 import { FacetBox, type Chosen } from "@/components/ui/facet-box";
 import { Loadable, Loading } from "@/components/ui/loading";
@@ -28,6 +29,9 @@ import { FlowView } from "@/views/ci/flow-view";
 import { glyphOf, optionsOf } from "./model";
 import "./ship.css";
 import { ShipViews } from "./views";
+
+const CodeEditor = React.lazy(() => import("@/components/code/editor"));
+type Editor = Parameters<NonNullable<React.ComponentProps<typeof CodeEditor>["onView"]>>[0];
 
 /** The event after which Pipelines asks again (W29-R03): a repository's rows changed. */
 const PIPELINE_EVENTS = ["pipelines"] as const;
@@ -187,19 +191,21 @@ export function DraftMark() {
 
 /** A workflow or action as Ship's row: its name, its stand and line, its pips, who changed it and when, where it is. No buttons but to open it. */
 function PipelineRow({ repo, row, open, landed, onOpen }: { repo: ShipPipelineRepo; row: ShipPipelineRow; open: boolean; landed: boolean; onOpen: (open: boolean) => void }) {
+  // Typed in and not saved: the row says so, as a draft does (W29-R10's Not saved).
+  const [notSaved, setNotSaved] = React.useState(() => unsaved.has(row.key));
   return (
     <li className="ship-row dp-row ppl-row" data-stand={row.stand} data-key={row.key} ref={landed ? intoView : undefined}>
       <div className="ship-r">
         <button type="button" className="ship-main" aria-expanded={open} onClick={() => onOpen(!open)}>
           <span className="ship-name ppl-name">
             <span className="ppl-title">{row.name}</span>
-            {row.draft ? <DraftMark /> : null}
+            {row.draft || notSaved ? <DraftMark /> : null}
           </span>
           <span className="ship-line">
-            <span className="ship-stand" data-stand={row.stand}>
-              {row.word}
+            <span className="ship-stand" data-stand={notSaved ? "waiting" : row.stand}>
+              {notSaved ? "Not saved" : row.word}
             </span>
-            <span className="ship-text">{row.line}</span>
+            <span className="ship-text">{notSaved ? "yours · changed here, not saved yet" : row.line}</span>
           </span>
         </button>
         <span className="ship-pips">
@@ -231,7 +237,7 @@ function PipelineRow({ repo, row, open, landed, onOpen }: { repo: ShipPipelineRe
       {open ? (
         <div className="ship-open dp-open">
           <Loadable label={`Loading ${row.name}`} fallback={<Loading label={`Loading ${row.name}`} block className="dp-slot" />}>
-            <PipelinePane repo={repo} row={row} />
+            <PipelinePane repo={repo} row={row} onChanged={setNotSaved} />
           </Loadable>
         </div>
       ) : null}
@@ -274,6 +280,9 @@ function NewRow({ repo, open, onOpen }: { repo: ShipPipelineRepo; open: boolean;
   );
 }
 
+/** Each row's text as it's being written, by its key, kept while the page is open (W29-R05: typing starts a draft). */
+const unsaved = new Map<string, string>();
+
 /** A pick's key: a pane line's (`on.push`, `jobs.rust`, `uses.kiln/checkout@v1`, `versions.head`). */
 type Key = string;
 
@@ -289,8 +298,8 @@ interface StripVerb {
 }
 
 /** The detail's code, held to this many lines, scrolling inside itself: beside the list, and under its line on a phone. */
-const SIDE_ROWS = 18;
-const PHONE_ROWS = 14;
+const SIDE_ROWS = 24;
+const PHONE_ROWS = 20;
 
 /** What's shown before anything's picked: the update's change, a workflow's first job, an action's tip, else the first line. */
 function firstPick(p: ShipPipelinePane): Key | null {
@@ -368,7 +377,8 @@ function wordsOf(l: ShipPipelineLine): { kind: string | null; name: string; valu
 }
 
 /** A line's glyph: its own state where it has one; a setting off or a note as not yet; the rest as there. */
-const glyphFor = (l: ShipPipelineLine): string => l.state ?? (l.kind === "note" || (l.kind === "setting" && l.key !== "settings.on") ? "none" : "passed");
+const glyphFor = (l: ShipPipelineLine): string =>
+  l.state ?? (l.kind === "version" && l.key !== "versions.head" ? "tag" : l.kind === "note" || (l.kind === "setting" && l.key !== "settings.on") ? "none" : "passed");
 
 /** What a picked line's detail shows (W29-R04): a job's YAML · Plan · Last run, a trigger's Times or Filters, a use's own, a run's jobs; an action's Changes · YAML · Try it. */
 function viewsFor(p: ShipPipelinePane, l: ShipPipelineLine | null): string[] {
@@ -401,7 +411,7 @@ function eventOf(p: ShipPipelinePane, l: ShipPipelineLine | null): string | null
 }
 
 /** An opened workflow or action (W29-R04): its head, the strip, its groups, and the picked line's detail beside them (under its line on a phone). */
-function PipelinePane({ repo, row }: { repo: ShipPipelineRepo; row: ShipPipelineRow }) {
+function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: ShipPipelineRow; onChanged: (changed: boolean) => void }) {
   const draft = row.draft?.id ?? null;
   const pane = useSuspenseResource(`ship/pipeline/${repo.repo}/${row.path}/${draft ?? ""}`, (s) => shipApi.pipeline(repo.repo, row.path, { draft }, s), { on: PIPELINE_EVENTS, pollMs: 15_000 });
   const p = pane.data;
@@ -412,21 +422,30 @@ function PipelinePane({ repo, row }: { repo: ShipPipelineRepo; row: ShipPipeline
   const [armed, setArmed] = React.useState<ShipPipelineVerb | null>(null);
   const [busy, setBusy] = React.useState(false);
   // The file as it's being written: typing (or the Flow view) starts a draft, Not saved until it's saved (W29-R05, R10).
-  const [text, setText] = React.useState(p.detail.text);
+  const [text, setText] = React.useState(() => unsaved.get(row.key) ?? p.detail.text);
   const changed = text !== p.detail.text;
+  const edit = (t: string) => {
+    setText(t);
+    if (t === p.detail.text) unsaved.delete(row.key);
+    else unsaved.set(row.key, t);
+    onChanged(t !== p.detail.text);
+    setSaid(null);
+  };
   const lines = p.groups.flatMap((g) => g.lines);
   const at = picked && lines.some((l) => l.key === picked) ? picked : firstPick(p);
   const line = lines.find((l) => l.key === at) ?? null;
   const groupOf = (k: Key) => p.groups.find((g) => g.lines.some((l) => l.key === k))?.name ?? "";
   const where = [h.path, h.dialect ? `${DIALECT_WORD[h.dialect] ?? h.dialect} dialect` : `${KIND_WORD[h.kind] ?? h.kind} action`, h.ref, h.commit.slice(0, 7)].filter(Boolean).join(" · ");
-  const act = async (body: Omit<ShipPipelineAct, "repo" | "path">, done: React.ReactNode) => {
+  const act = async (body: Omit<ShipPipelineAct, "repo" | "path">, done: React.ReactNode): Promise<boolean> => {
     setBusy(true);
     setArmed(null);
     try {
       await shipApi.pipelinesAct({ repo: repo.repo, path: h.path, ...body });
       setSaid({ text: done, refused: false });
+      return true;
     } catch (e) {
       setSaid({ text: errorMessage(e), refused: true });
+      return false;
     } finally {
       setBusy(false);
       pane.reload();
@@ -443,12 +462,13 @@ function PipelinePane({ repo, row }: { repo: ShipPipelineRepo; row: ShipPipeline
           </>,
         );
       case "save_draft":
+        // Saved, it's the draft's row now: this one reads as published again.
         return void act(
           { verb: "save_draft", content: text },
           <>
             Saved <b>{h.title}</b> as a draft: unpublished until it lands.
           </>,
-        );
+        ).then((ok) => ok && edit(p.detail.text));
       case "ready":
         return void act(
           { verb: "ready" },
@@ -504,7 +524,8 @@ function PipelinePane({ repo, row }: { repo: ShipPipelineRepo; row: ShipPipeline
     setSaid(null);
     setArmed(null);
   };
-  const detail = <Detail key={at ?? "file"} pane={p} line={line} text={text} onText={setText} rows={phone ? PHONE_ROWS : SIDE_ROWS} />;
+  const editable = p.strip.verbs.some((v) => v.verb === "save_draft" && v.enabled);
+  const detail = <Detail key={at ?? "file"} pane={p} line={line} text={text} onText={edit} editable={editable} rows={phone ? PHONE_ROWS : SIDE_ROWS} />;
   // On a phone, the picked line's detail is right under it, as the approved stills draw it.
   const below = (k: Key) => (phone && k === at ? <li className="jp-detail">{detail}</li> : null);
   return (
@@ -586,7 +607,7 @@ function PaneLine({ line, at, onLine }: { line: ShipPipelineLine; at: boolean; o
 }
 
 /** The picked line's detail (W29-R04): its name and the file's, its views, and the view shown. */
-function Detail({ pane, line, text, onText, rows }: { pane: ShipPipelinePane; line: ShipPipelineLine | null; text: string; onText: (t: string) => void; rows: number }) {
+function Detail({ pane, line, text, onText, editable, rows }: { pane: ShipPipelinePane; line: ShipPipelineLine | null; text: string; onText: (t: string) => void; editable: boolean; rows: number }) {
   const views = viewsFor(pane, line);
   const [view, setView] = React.useState(views[0] ?? "YAML");
   const shown = views.includes(view) ? view : (views[0] ?? "YAML");
@@ -605,18 +626,34 @@ function Detail({ pane, line, text, onText, rows }: { pane: ShipPipelinePane; li
       </div>
       <div className="ppl-dbody" style={{ "--rows": rows } as React.CSSProperties}>
         <Loadable label={`Loading ${shown}`} fallback={<Loading label={`Loading ${shown}`} block className="ppl-slot" />}>
-          <View view={shown} pane={pane} line={line} text={text} onText={onText} rows={rows} />
+          <View view={shown} pane={pane} line={line} text={text} onText={onText} editable={editable} rows={rows} />
         </Loadable>
       </div>
     </div>
   );
 }
 
-function View({ view, pane, line, text, onText, rows }: { view: string; pane: ShipPipelinePane; line: ShipPipelineLine | null; text: string; onText: (t: string) => void; rows: number }) {
+function View({
+  view,
+  pane,
+  line,
+  text,
+  onText,
+  editable,
+  rows,
+}: {
+  view: string;
+  pane: ShipPipelinePane;
+  line: ShipPipelineLine | null;
+  text: string;
+  onText: (t: string) => void;
+  editable: boolean;
+  rows: number;
+}) {
   const h = pane.head;
   switch (view) {
     case "YAML":
-      return <CodeView text={text} path={h.path} spot={line ? spotOf(text, line) : null} rows={rows} />;
+      return editable ? <YamlView pane={pane} line={line} text={text} onText={onText} /> : <CodeView text={text} path={h.path} spot={line ? spotOf(text, line) : null} rows={rows} />;
     case "Flow":
       return <FlowView repo={pane.repo} text={text} onChange={onText} />;
     case "Plan":
@@ -644,6 +681,96 @@ function View({ view, pane, line, text, onText, rows }: { view: string; pane: Sh
     default:
       return null;
   }
+}
+
+/** What a file reads as: an action's action.yml and a workflow's YAML as a workflow (`run:` as its shell, W29-R05), the rest by its path. */
+const syntaxOf = (h: ShipPipelinePane["head"]): string | undefined => (!["workflow", "reusable"].includes(h.kind) || /\.ya?ml$/i.test(h.path) ? "workflow" : resolveLanguage(null, h.path)?.id);
+
+/** The file a pane's path names, as the validator reads it: an action's action.yml. */
+const fileOf = (h: ShipPipelinePane["head"]) => (["workflow", "reusable"].includes(h.kind) ? h.path : `${h.path}/action.yml`);
+
+/** An offset of `text` at a line and column, both from 1. */
+function offsetOf(text: string, at: { line: number; col: number }): number {
+  let off = 0;
+  for (let i = 1; i < at.line; i++) {
+    const nl = text.indexOf("\n", off);
+    if (nl < 0) return text.length;
+    off = nl + 1;
+  }
+  return Math.min(text.length, off + Math.max(0, at.col - 1));
+}
+
+/**
+ * The file where it's shown, edited in place (W29-R05): typing starts the draft, Not saved until
+ * it's saved. Checked 300 ms after typing stops; its errors and warnings sit under it, each with its
+ * fix, never in a popup.
+ */
+function YamlView({ pane, line, text, onText }: { pane: ShipPipelinePane; line: ShipPipelineLine | null; text: string; onText: (t: string) => void }) {
+  const h = pane.head;
+  const syntax = syntaxOf(h);
+  const [problems, setProblems] = React.useState<CiDiagnostic[]>([]);
+  const editor = React.useRef<Editor>(null);
+  const lint = async (t: string): Promise<Diagnostic[]> => {
+    if (syntax !== "workflow") return [];
+    try {
+      const r = await ci.validate(fileOf(h), t, pane.repo);
+      const shown = r.diagnostics.filter((d) => d.severity === "error" || d.severity === "warning");
+      setProblems(shown);
+      return shown.map((d) => {
+        const from = offsetOf(t, d.range.start);
+        return { from, to: Math.max(from + 1, offsetOf(t, d.range.end)), severity: d.severity === "error" ? "error" : "warning", message: d.message };
+      });
+    } catch {
+      setProblems([]);
+      return [];
+    }
+  };
+  const fix = (d: CiDiagnostic) => {
+    const v = editor.current;
+    if (!v || !d.fix) return;
+    const t = v.state.doc.toString();
+    v.dispatch({ changes: d.fix.edits.map((e) => ({ from: offsetOf(t, e.range.start), to: offsetOf(t, e.range.end), insert: e.text })) });
+  };
+  return (
+    <div className="ppl-yaml">
+      <CodeEditor
+        value={text}
+        onChange={onText}
+        lint={lint}
+        label={`${h.path}, edited in place: typing starts a draft`}
+        syntax={syntax}
+        inline
+        tint={line ? spotOf(text, line) : null}
+        onView={(v) => {
+          editor.current = v;
+        }}
+      />
+      <div className="ppl-problems" aria-label="Problems">
+        <div className="jp-g">
+          <span>Problems</span>
+          <span>{problems.length || "none"}</span>
+        </div>
+        <ul className="ppl-lines">
+          {problems.map((d, i) => (
+            <li key={`${d.code}-${d.range.start.line}-${i}`} data-severity={d.severity}>
+              <StatusGlyph state={d.severity === "error" ? "failed" : "flag"} size={12} />
+              <span className="n">
+                <em>{d.code}</em>
+                line {d.range.start.line}: {d.message}
+              </span>
+              {d.fix ? (
+                <button type="button" className="ppl-fix" onClick={() => fix(d)}>
+                  {d.fix.title}
+                </button>
+              ) : (
+                <span className="v">{d.severity}</span>
+              )}
+            </li>
+          ))}
+        </ul>
+      </div>
+    </div>
+  );
 }
 
 /** Lines as the detail lists them: a glyph, the words, a value. */
