@@ -205,6 +205,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W24 | Incremental CI: fingerprints, reuse, warm state, shared caches | W04, W05, W06, W08, W13, W18 | ready | specified (2026-10-24): R01–R31, AC01–AC15; milestones M0–M7 and M1e are kiln goals with plans |
 | W26 | Review in Ship: changes as Ship items, each owning its review | W14, W23, W27, Ship (the CI/CD Integration plan) | in progress | R06–R15 built: each item's dropdown owns its review (Files and the Conversation, search on vorpal, kinds and the gate, suggestions and conflicts as revisions, the Review lanes), unsigned until W27-R03; AC06 in Chromium, not yet WebKit; specified (2026-10-25): R01–R20, AC01–AC11; plan `01a175b7d5e1772f8d3c7cb28e50ab2b` |
 | W27 | Attested end to end: identities, signatures, hand-offs, the trail | W10, W18, W26 | in progress | specified (2026-10-25): R01–R12, AC01–AC08; research `01a175c54441773fa28bf1488b82e6aa`; identities built (R01, R02, R12; AC01, AC02): plan `01a17856b1b0712babf8dfd37ce48756` |
+| W29 | Pipelines in Ship: author, run, share and lock workflows and actions | W02, W03, W04, W07, W13, W14, W21, W23, W26 | ready | specified (2026-10-31): R01–R31, AC01–AC29, S01–S17; the design approved on stills `pl-1` to `pl-9`; plan `01a19474452d7084bae269952cc6c26a` |
 
 ---
 
@@ -921,7 +922,10 @@ references, lints and their fixes), `schema.rs` (JSON Schemas from `keys.rs`), `
 `pipeline::from_ir` maps the new model to v1's, which is how W02-AC04 compares them.
 
 **Interfaces.** Gives the IR to W03 (`on`), W04 (everything else), W07 (action metadata), W20
-(validation for agents), W21 (schemas, diagnostics). Takes W01's parser.
+(validation for agents), W21 (schemas, diagnostics). Takes W01's parser. W29 adds file kinds
+(`.kiln/<name>.ts` and `.js`, W29-R27; `.kiln/<name>.<ext>` and `program:`, W29-R28), the action
+kinds `firecracker` and `shards` (W29-R29, R30), and the codes in W29's diagnostics. Pipelines'
+editor shows W02's diagnostics as Problems (W29-R05).
 
 **Acceptance criteria**
 
@@ -1130,7 +1134,9 @@ creates runs. The schedule loop moves to `ci/schedule.rs` with a time-zone-aware
 (`kiln_ci::trigger::cron`, tested against DST tables).
 
 **Interfaces.** Takes the IR (W02). Gives runs to the planner (W04). W14 and W15 call
-`ci::events::emit(Event)`. W20 exposes `agent` triggers.
+`ci::events::emit(Event)`. W20 exposes `agent` triggers. W29's Flow view edits every trigger
+(W29-R06). W29-R10 keeps drafts from triggering: no run for a ref under `kiln/draft/`, and
+`[skip ci]` heads on a host (W03-R06).
 
 **Acceptance criteria**
 
@@ -1499,7 +1505,9 @@ one `jobs` row per leg (with `job_id`, `matrix`, `leg_index`), created as legs b
 
 **Interfaces.** Takes the IR (W02), events (W03), expressions (W01), timing history (W16).
 Gives `LegSpec`s to the scheduler (W05) and the runner assignment (W06), outputs and needs
-contexts to every later evaluation, and plan previews to W20 and W21.
+contexts to every later evaluation, and plan previews to W20 and W21. W29 shows a plan preview for
+each event, with a draft's difference from what's published (W29-R07). W29-R31 loads W04-R25's
+templates as reusable workflows.
 
 **Acceptance criteria**
 
@@ -2490,7 +2498,9 @@ plus kiln's own actions.
   versions, SHAs and their `action.yml` inputs and outputs, for the editor's completion (W21).
 
 **Interfaces.** Takes W02's metadata parser, W06's runtime, W08's blob store, W14's facade.
-Gives step execution for `uses:`.
+Gives step execution for `uses:`. W29 grows resolution and the catalog: Access on every `uses:`
+(W29-R17, R19), plain names through native sources (W29-R18), a catalog of what repositories share
+(W29-R20), releases by tag (W29-R21), update drafts (W29-R22) and locks (W29-R23 to R26).
 
 **Acceptance criteria**
 
@@ -3134,7 +3144,9 @@ become server-scope secrets).
   Every change is audited (W19).
 
 **Interfaces.** Takes W01's references, W04's plan, W11's broker. Gives values to W06 (delivery
-and masking), names to the editor's completion (W21; names only).
+and masking), names to the editor's completion (W21; names only). Pipelines' pane shows a
+workflow's secret and variable names (W29-R04), and an update draft names the secrets a new version
+declares (W29-R22).
 
 **Acceptance criteria**
 
@@ -4038,7 +4050,8 @@ support (G-11, G-18, G-25, G-27, G-28).
   silicon Macs Linux arm64 microVMs; QEMU emulation as a declared fact (W04-R13).
 
 **Interfaces.** Gives facts and pools to W05, executors to W06, terminals to W17, the egress
-enforcement points to W18, agent isolation to W20.
+enforcement points to W18, agent isolation to W20. W29 runs microVM actions on its executors
+(W29-R29, R30) and plan legs on them (W29-R28), and adds the `compose` executor (W29-R16).
 
 **Acceptance criteria**
 
@@ -4732,6 +4745,11 @@ adapts [review.md](review.md), which it replaces.
   `published`), `reviews` (`diff`, `version`, `reviewer`, `action`, `body`, `created_at`),
   `land_queue` (`trunk`, `entry`, `diffs`, `strategy`, `state`, `batch`, `run`, `reason`),
   `viewed_files` (`diff`, `user`, `file`, `version`). All writes are audited.
+
+**With W29.** A draft pipeline is a draft diff (W29-R10 to R13). A released full version is a tag
+that hosting's push policy never moves or deletes (W29-R21). A lock's conflict on landing is
+resolved by regenerating it (W29-R25).
+
 
 **Acceptance criteria**
 
@@ -6842,6 +6860,11 @@ image builder), review, environments, settings, insights (G-06, G-08, G-09, G-11
   field, pill buttons); no modals, sheets or floating panels; changes are scoped to what each
   workstream asks for.
 
+**With W29.** The workflow editor becomes Ship's Pipelines view, and `/workflows` redirects there
+(W29-R05, R06, R09). W21-R01's component, completion and lint, W21-R06's Flow and W21-R07's Try it
+are its parts.
+
+
 **Acceptance criteria**
 
 - **W21-AC01** For each page: a Playwright script runs in Chromium and WebKit at 1440×900 and
@@ -7590,7 +7613,9 @@ act on the same things:
   *E2E, user-assisted.*
 
 **Interfaces.** Uses deploy-api.md §7's git hosts (shared with CD), W10's identity, W11's
-credentials, W14's review pages, W19's insights and notifications, and W21.
+credentials, W14's review pages, W19's insights and notifications, and W21. W29 uses the git-host
+interface for drafts (`open_change`'s `draft`, and `ready_change`: W29-R11, R12), GitHub's
+dispatch, switch and Access (W29-R14, R15, R17), and releases (W29-R21).
 
 **Progress.** In progress.
 
@@ -8610,6 +8635,11 @@ repository):
 | Whose turn | kiln | kiln | kiln | kiln |
 | Batched review | native | its pending review | its draft notes | kiln: held, then posted together |
 | Checks | every provider's runs of the commit (KilnCI, GitHub Actions, GitLab CI/CD, Bitbucket Pipelines), W23's contract | | | |
+
+**With W29.** Pipelines is Ship's third view, beside Commits and Deploys (W29-R01). Its pane has
+W26-R23's jobs pane's anatomy (W29-R04), and a draft's review is its change's own, in that change's
+dropdown (W29-R10).
+
 
 **Acceptance criteria**
 
@@ -9988,7 +10018,8 @@ is kiln research `01a1947b2b0270fa9d1e32d07aebaa7e` (44 findings, 37 sources) an
     - A draft never runs on the host: GitHub dispatches only workflows on the default branch.
   - **An action** runs by Try it (W21-R07), which this verb also takes.
 - **W29-R15 Turning a workflow off and on.** `POST /api/ship/pipelines { verb: "turn_off" |
-  "turn_on", repo, path, why? }` goes to the new `ci.workflows.disable` and `ci.workflows.enable`.
+  "turn_on", repo, path, why? }` goes to the new `ci.workflows.disable` and `ci.workflows.enable`
+  (`POST /api/ci/repos/:repo/workflows/:path/disable`, `/enable`).
   - A new table (migration `…_w29_r15_workflow_switch`) keeps `(repo, path, on, by, at, why)`.
   - While a workflow is off, its triggers start nothing and Run refuses, each saying who turned it
     off, when and why. Its runs under way finish.
@@ -10126,7 +10157,7 @@ endpoint, for a repository kiln hosts and for one on GitHub:
   (W02-R10) and `on.workflow_call`. The catalog is kiln's addition: GitHub's Marketplace lists
   public actions, not what an organization's repositories share.
 - **W29-R21 Release by tag.** `POST /api/ship/pipelines { verb: "release", repo, sha, tag, major? }`
-  goes to `ci.releases.tag`, new (`POST /api/ci/releases { repo, sha, tag, major? }`).
+  goes to `ci.releases.tag`, new (`POST /api/ci/repos/:repo/releases { sha, tag, major? }`).
   - `tag` is a full version, `vMAJOR.MINOR.PATCH`, a pre-release suffix allowed. `major`, true
     unless the tag is a pre-release, moves the floating `vMAJOR` and `vMAJOR.MINOR` to the same
     commit.
@@ -10262,8 +10293,8 @@ endpoint, for a repository kiln hosts and for one on GitHub:
     draft's locks through `ci.locks.update`, rather than rewriting the `uses:`.
   - A lock never needs merging by hand. A conflict in a lock, on landing or on a replay (W26-R16),
     is resolved by regenerating it from the merged workflows, as npm and pnpm do with theirs.
-  - `ci.locks.update` (new, `POST /api/ci/locks/update { repo, ref? }`) regenerates a
-    repository's locks into a draft. `ci.locks.verify` (new, `GET /api/ci/locks/verify?repo=&sha=`)
+  - `ci.locks.update` (new, `POST /api/ci/repos/:repo/locks { ref? }`) regenerates a repository's
+    locks into a draft. `ci.locks.verify` (new, `GET /api/ci/repos/:repo/locks/verify?sha=`)
     answers `{ fresh, stale: [{ workflow, uses, locked, now }] }`, so a required check can verify
     them.
   - Both locks come from `kiln_ci::lock::regenerate` (new, pure): the workflows and their
@@ -10427,11 +10458,11 @@ lockfile, which pins commit A. An attacker moves `v45` and `v45.0.7` to commit M
 | R18 Plain names | `actions::source`; `[[ci.actions.sources]]`'s `native = true` (W07-R02) | the name's form, `owner/repo[/path]@ref` | completion that writes the plain name for a native owner |
 | R19 One check | `Remote::usable_by`, grown; `reusable::remote`; `actions::resolve`; `KCI4022` | a reusable workflow that isn't shared fails the run as it starts | none: it closes the gap the audit found |
 | R20 The catalog | `GET /api/ci/actions?q=&kind=&owner=` (`ci.actions.list`); `GET /api/ci/actions/:owner/:repo?path=` (`ci.actions.get`) | inputs, outputs and secrets as `action.yml` and `on.workflow_call` declare them | a catalog of what repositories share |
-| R21 Release by tag | verb `release`; `POST /api/ci/releases` (`ci.releases.tag`); `ci::hosting::refused`; GitHub's `git/tags`, `git/refs` and `releases` | a tag is the whole repository's; GitHub's releases, immutable ones too | full versions that never move on kiln; checks before a tag |
+| R21 Release by tag | verb `release`; `POST /api/ci/repos/:repo/releases` (`ci.releases.tag`); `ci::hosting::refused`; GitHub's `git/tags`, `git/refs` and `releases` | a tag is the whole repository's; GitHub's releases, immutable ones too | full versions that never move on kiln; checks before a tag |
 | R22 Update drafts | `.kiln/config.yaml`'s `updates`; `ci::updates`; `kiln_ci::wf::action_diff`; `ShipPipelineDetail` | Dependabot's shape: a cooldown, groups, the lock regenerated in the same change | drafts for what kiln hosts, and what each update changes |
 | R23 GitHub's lockfile | `.github/workflows/actions.lock`; `kiln_ci::lock::github`; `KCI1022`, `KCI4050` to `KCI4053`, `KCI4057` | all of it: the file and its checks | none |
 | R24 kiln's lock | `.kiln/lock`; `kiln_ci::lock::kiln`; `KCI4054` | W29-R23's checks, for each entry of the same kind | reusable workflows, images, runtimes, `.kiln/` workflows and sources kiln hosts |
-| R25 kiln writes the locks | `ci.locks.update` (`POST /api/ci/locks/update`); `ci.locks.verify` (`GET /api/ci/locks/verify`); `kiln_ci::lock::regenerate` | `gh actions-lock --verify`'s checks | locks in every draft; a conflict resolved by regenerating |
+| R25 kiln writes the locks | `ci.locks.update` (`POST /api/ci/repos/:repo/locks`); `ci.locks.verify` (`GET /api/ci/repos/:repo/locks/verify`); `kiln_ci::lock::regenerate` | `gh actions-lock --verify`'s checks | locks in every draft; a conflict resolved by regenerating |
 | R26 Requiring locks | `[ci.locks]`'s `require` and `moved_tags`; `.kiln/config.yaml`'s `require_lock` and `moved_tags`; `KCI4055`, `KCI4056`; `tag_moved` (W19) | "Require lockfile", report first as GitHub's evaluate mode | moved tags flagged, and refused without a lock |
 | R27 TypeScript | `.kiln/<name>.ts` and `.js`; `@kiln/sdk`; `GET /api/ci/sdk/kiln.d.ts`; `mcp::code`'s limits; `POST /api/ci/plan-preview`; `KCI1030` to `KCI1033` | the GitHub workflow it can emit | all of it |
 | R28 Other languages | `.kiln/<name>.<ext>`; `program:`; the plan leg (`SOURCE_DATE_EPOCH`, `KILN_EVENT_PATH`); a new SQLite table; `KCI1030` to `KCI1032` | none | all of it |
@@ -10472,13 +10503,13 @@ lockfile, which pins commit A. An attacker moves `v45` and `v45.0.7` to commit M
 | verb `ready` (W29-R12) | `ci.diffs.ready`; `githost::ready_change`, new | the change asking for review |
 | verb `discard` (W29-R13) | `ci.diffs.abandon`; `githost::close_change`, `delete_branch` | the change closed |
 | verb `run` (W29-R14) | `ci.runs.trigger`, grown: `sha`, `event`, `jobs` | the run |
-| verbs `turn_off`, `turn_on` (W29-R15) | `ci.workflows.disable`, `ci.workflows.enable`, new | the switch, who and why |
+| verbs `turn_off`, `turn_on` (W29-R15); `POST /api/ci/repos/:repo/workflows/:path/{disable,enable}` | `ci.workflows.disable`, `ci.workflows.enable`, new | the switch, who and why |
 | verb `settings` (W29-R16, R17, R22, R26) | `ci.workflows.edit`, grown to `.kiln/config.yaml`, as a draft | the draft |
-| verb `release` (W29-R21); `POST /api/ci/releases { repo, sha, tag, major? }` | `ci.releases.tag`, new | the tag (and GitHub's release) |
+| verb `release` (W29-R21); `POST /api/ci/repos/:repo/releases { sha, tag, major? }` | `ci.releases.tag`, new | the tag (and GitHub's release) |
 | `GET /api/ci/actions?q=&kind=&owner=` (W29-R20) | `ci.actions.list`, grown | actions and reusable workflows the caller may use |
 | `GET /api/ci/actions/:owner/:repo?path=` (W29-R20) | `ci.actions.get`, new | versions, access, consumers |
-| `POST /api/ci/locks/update { repo, ref? }` (W29-R25) | `ci.locks.update`, new | a draft of the regenerated locks |
-| `GET /api/ci/locks/verify?repo=&sha=` (W29-R25) | `ci.locks.verify`, new | `{ fresh, stale: [{ workflow, uses, locked, now }] }` |
+| `POST /api/ci/repos/:repo/locks { ref? }` (W29-R25) | `ci.locks.update`, new | a draft of the regenerated locks |
+| `GET /api/ci/repos/:repo/locks/verify?sha=` (W29-R25) | `ci.locks.verify`, new | `{ fresh, stale: [{ workflow, uses, locked, now }] }` |
 | `GET /api/ci/sdk/kiln.d.ts` (W29-R27) | | the SDK's types for the editor |
 | notification `tag_moved` (W29-R26, W19) | | a full version that resolves to another commit |
 | event `pipelines { repo }` | | pages ask again |
@@ -10532,6 +10563,158 @@ picked line (W29-R04).
 | pl-8 triggers | A schedule's next runs, daylight saving included; its options | R06 |
 | pl-8 triggers | "plan for:" each trigger; runs by what started them | R04, R07 |
 | pl-9 add a trigger | 18 kinds in six groups, each GitHub's, kiln's or both; "show:" | R06 |
+
+**Acceptance criteria**
+
+Each names the requirements it holds and how it's checked. UI checks run in Chromium and WebKit, at
+390 and 1280 px.
+
+- **W29-AC01 The view** (R01, R02, R04, R09). `/ship/pipelines` is Ship's third view, after Commits
+  and Deploys, and `?repo=&path=` opens that row in view. Every part of stills `pl-1` to `pl-9` is
+  there at both widths. Nothing moves as rows open, lines are picked or runs go on; nothing scrolls
+  sideways; nothing opens over the page. *Playwright.*
+- **W29-AC02 Rows** (R02, R03). Over a fixture of three repositories (GitHub's dialect, kiln's, and
+  a shared library with every action kind and a draft), the read model makes one row for each
+  workflow, reusable workflow, action and draft, under its repository. Each row has its stand's
+  word, its pips, its ref and its commit, in R02's order, and each facet filters. *Unit tests
+  (`ship::pipelines`) and an API test.*
+- **W29-AC03 Fresh** (R03). A default branch, a tag, a run or a draft that changes reaches the page
+  through a `pipelines` event within 2 s (p95 over 20 changes). `GET /api/ship/pipelines` answers
+  from memory within 50 ms (p99, 200 repositories and 2,000 rows, release build). A caller sees only
+  what it may read. *Integration test and a bench.*
+- **W29-AC04 Verbs as their operations** (R04, R11 to R15, R21). Each verb goes to its operation as
+  the caller. A caller without the operation's right gets its refusal, and the audit log has the
+  operation's entry (W19-AC04). A verb that doesn't apply is dimmed, with its `why_not`. *API tests,
+  one for each verb.*
+- **W29-AC05 Inline editing** (R05). Typing in the detail starts a draft (Not saved), with W21-R01's
+  completion, lint and search. The editor's token classes equal Ship's Files' for the same file,
+  token by token. `run:` is coloured as its shell, and `${{ }}` as W01's expressions. Problems list
+  `POST /api/ci/validate`'s diagnostics under the code, with their fixes. *Unit tests
+  (`ui/src/lib/syntax`) and Playwright.*
+- **W29-AC06 Every key and every trigger** (R06). Each of Add a trigger's 18 kinds round-trips. It's
+  added through Flow and written to the YAML (or to the overlay, for a kiln-only kind in a
+  GitHub-dialect file). W02 reads it back with no diagnostics, and W04 plans it for its event. A
+  Flow edit rewrites only its node, comments kept. A schedule's next runs match W03's cron across a
+  daylight-saving change. *Unit tests (`lib/workflow-doc.ts` and `kiln_ci`).*
+- **W29-AC07 Plans and their differences** (R07). For each trigger of a fixture workflow, "plan
+  for:" shows `plan-preview`'s legs and their routing. A draft that adds a job shows "+1 job" and the
+  rest the same. *API test and Playwright.*
+- **W29-AC08 New** (R08). Each of the seven kinds, in each language offered and from each start,
+  makes a draft whose files validate with no errors and plan. `kiln_ci::scaffold` makes the same
+  bytes for the same input. *Unit tests and an API test.*
+- **W29-AC09 Reached** (R09). "Edit workflow" on a commit's jobs pane and on a run's page opens the
+  workflow's row at its ref. `/workflows?…` redirects there, keeping its query. `ship.pipelines.*`
+  answer agents as the API does. *Playwright and an API test.*
+- **W29-AC10 Drafts don't run on their own** (R10). On kiln's hosting and on GitHub's simulator, a
+  draft's pushes, its change, its diff and its schedules start no run. Another repository's `uses:`
+  of a `kiln/draft/` ref is refused, saying it's a draft. *Integration tests on real git.*
+- **W29-AC11 Save, Ready and Discard on every host** (R11, R12, R13). Against kiln's hosting and the
+  GitHub, GitLab and Bitbucket simulators, each row of the per-host table does what it says,
+  `[skip ci]` heads included. *`cargo test -p kiln-seams` (the forge seam's conformance suite) and
+  integration tests.*
+- **W29-AC12 Run by hand** (R14). A published workflow runs with typed inputs and a chosen set of
+  jobs, with what they need. Without its trigger, Run is dimmed, saying so. A draft's run is marked
+  a draft's, reports no status and stops before any environment. Where GitHub is the provider,
+  GitHub's dispatch is called too. *Integration tests with GitHub's simulator.*
+- **W29-AC13 Off and on** (R15). A workflow turned off starts nothing on its triggers and refuses
+  Run, saying who turned it off, when and why. Its runs under way finish, and the switch survives a
+  restart. Where GitHub is the provider, GitHub's disable and enable are called. *Integration
+  test.*
+- **W29-AC14 The engine on, starting nothing on its own** (R16). With `[ci] enabled = true` and
+  `github_workflows = "off"`, pushes to every fixture repository start no engine run, while Run,
+  Try it and plan previews work. A repository whose `.kiln/config.yaml` turns `github_workflows` or
+  `kiln_workflows` on runs on the engine, and no other does. A leg that asks for no executor runs
+  on bare metal (`host`). `executor: compose` runs a job container and its services as one
+  project. *Integration tests; production checked after each stage's deploy.*
+- **W29-AC15 Access** (R17, R19). For each level, a use from the same owner, from another owner and
+  from everyone is allowed or refused (`KCI4022`) as the level says. That holds for steps, for
+  composite actions' own steps and for reusable workflows, nested four deep. GitHub's
+  `access_level` values map as R17 says. *Unit tests and an integration test with GitHub's
+  simulator.*
+- **W29-AC16 Plain names** (R18). With a native source for an owner, `owner/repo/path@ref` resolves
+  to kiln's own repository, for an action and for a reusable workflow; without one, to GitHub. A
+  repository called `actions/checkout`, made on kiln, changes nothing for anyone's
+  `actions/checkout`. *Integration test.*
+- **W29-AC17 The catalog** (R20). `ci.actions.list` lists a fixture's actions in every path, and its
+  reusable workflows with their inputs, outputs and secrets: only those the caller may use. `kind=`
+  filters each of the six kinds. `ci.actions.get` gives the versions with their checks, the access,
+  and the consumers from runs' pins and locks. *API test.*
+- **W29-AC18 Release** (R21). Release tags a commit whose checks passed, and otherwise asks again,
+  naming the checks that failed. `major` moves `vN` and `vN.M`. On GitHub's simulator, it makes the
+  tag and the release. A push that moves or deletes a released full version, in a repository kiln
+  hosts, is refused with R21's message, and the name can't be used again. *Integration test on
+  real git, and GitHub's simulator.*
+- **W29-AC19 Update drafts** (R22). With updates on, a release of something a repository uses opens,
+  after the cooldown, one update draft per update (or per group). The draft moves the refs,
+  regenerates the locks, and shows the inputs, secrets, permissions, egress and plan that change. A
+  moved tag opens none. With Dependabot's `github-actions` updates on, kiln opens drafts only for
+  what kiln hosts. With updates off, none opens. *Integration test with a test clock.*
+- **W29-AC20 GitHub's lockfile** (R23). kiln and `gh actions-lock` write the same `actions.lock`
+  for the same tree: for `gh actions-lock`'s own fixtures and for three of F-02's repositories. Each
+  of `KCI4050` to `KCI4053`, and the `KCI4057` warning, comes from the case GitHub's documentation
+  gives for it, before any job starts. *Unit tests (`kiln_ci::lock::github`) and an integration
+  test.*
+- **W29-AC21 kiln's lock** (R24). `.kiln/lock` locks a cross-repository reusable workflow (seeded
+  from the callee's lock), every kind of image by digest, a Dockerfile's base image, and Node's
+  build. An image whose digest changed under its tag is refused. When the two locks disagree, the
+  run fails with `KCI4054`, showing both entries. *Unit tests and an integration test.*
+- **W29-AC22 kiln writes the locks** (R25). Save draft, New and update drafts write their locks in
+  the same change, the same bytes `ci.locks.update` writes. A lock's conflict, on landing or on a
+  replay, is resolved by regenerating it, with no person. `ci.locks.verify` answers as
+  `gh actions-lock --verify` does on the same tree. *Integration test on real git.*
+- **W29-AC23 Requiring locks, and moved tags** (R26). Under `report`, an unlocked workflow runs,
+  annotated. Under `enforce`, it's refused before any job starts (`KCI4055`). The stricter of the
+  server's and the repository's settings decides. A full version's moved tag is flagged on the run,
+  on the catalog entry and by a `tag_moved` notification. Under `moved_tags: refuse` it's refused
+  (`KCI4056`). *Integration test.*
+- **W29-AC24 The tj-actions replay** (R21 to R26). W29-S04 runs against a mirror of a fixture
+  `changed-files`, whose `v45` and `v45.0.7` move to a commit M. In every step of the scenario, no
+  job runs M. *Integration test on real git: plan 01a19474's step 8.*
+- **W29-AC25 TypeScript workflows** (R07, R27). kiln's own `.kiln/ci.yaml`, rewritten in TypeScript,
+  makes a plan structurally equal to the YAML's. A TypeScript workflow plans within 20 ms on the
+  server (p99 over kiln's workflows, release build). Diagnostics point at the TypeScript line and
+  column, and each of `KCI1030` to `KCI1033` comes from its case. *Unit tests and a bench (plan
+  01a174b2's step 3).*
+- **W29-AC26 Every other language** (R28). Plan 01a174b2's nine-language example makes the same plan
+  in each language. An unchanged program's plan comes from the store within 50 ms (p99 over 100
+  pushes). A fork bomb, 10 GiB of output, an infinite loop, a DNS lookup and a read of
+  `/proc/self/environ` each end with their named refusal. *Integration tests on docker and
+  firecracker plan legs.*
+- **W29-AC27 Firecracker actions** (R29). A Firecracker action runs on a machine with KVM. It gets its
+  inputs and sets its outputs as a Docker action does, and reaches its declared egress and nothing
+  else. On a fleet without KVM, its plan fails with `KCI4033`. In a GitHub-dialect workflow, the
+  editor warns with `KCI5003`. *Integration test on a runner with KVM.*
+- **W29-AC28 Shards actions** (R30). Until CP-T7.2, a Shards action's plan fails with `KCI4034`, and
+  its row says Can't run. A Docker action on a shards leg is refused with `KCI4030`. *Unit tests.*
+- **W29-AC29 Templates** (R31). A job's `uses: ./templates/x.yaml` and `kiln://owner/repo/path@ref`
+  run as reusable workflows, with their inputs, outputs and secrets passed. A step's `uses:` of a
+  template is refused (`KCI4006`), pointing to a composite action. The validator and the loader
+  agree on every fixture. *Unit and integration tests.*
+
+**Scenarios**
+
+| ID | Given | Then | Requirements |
+| --- | --- | --- | --- |
+| W29-S01 | A phone (390 px) opens `/ship/pipelines` over three repositories, with a failing workflow and a draft | The failing workflow's row comes first, and the draft's DRAFT sits beside its title. Opening a row moves nothing, and nothing scrolls sideways | R01, R02, R03, R04 |
+| W29-S02 | A person picks a job in a workflow's pane and types a step, `uses: actions/cache@v4`, into its YAML | Not saved shows, and `run:` lines stay coloured as bash. KCI6002 is listed under the code with "pin it" and "lock it". Save draft opens a draft diff, with the lock in it | R05, R10, R11, R25 |
+| W29-S03 | In a GitHub-dialect workflow, Flow adds a `schedule` trigger and kiln's `diff` trigger | The schedule goes into the YAML, with its next runs shown. The `diff` trigger goes into the overlay, so the file still validates as GitHub's. "plan for:" lists both | R06, R07 |
+| W29-S04 | The tj-actions replay above: a consumer locked to commit A, and `v45` and `v45.0.7` moved to M | M never runs: each of the replay's seven steps refuses, or holds A | R21, R22, R23, R24, R25, R26 |
+| W29-S05 | New makes a Docker action from a starter, in a repository shared with its owner | A draft with `action.yml`, a `Dockerfile` and an entrypoint, its row Unpublished. Ready asks for review; landing publishes it; Release `v1.0.0` makes `v1.0.0` and `v1` | R08, R10, R12, R21 |
+| W29-S06 | An agent opens "Edit workflow" from a failed run's page, then calls `ship.pipelines.act { verb: "run", jobs: ["test"] }` | The row opens at the run's ref. The run starts `test` and what it needs, and nothing else | R09, R14 |
+| W29-S07 | A draft on GitHub, GitHub the provider: its branch is pushed, its pull request opened, and a schedule comes due | Nothing runs, on kiln or on GitHub. The author's Run runs it on kiln's engine only, reporting no status. Discard closes the pull request and deletes the branch | R10, R11, R13, R14 |
+| W29-S08 | A workflow turned off with "flaky runner", then a push | Nothing starts. Run refuses, with who, when and "flaky runner". GitHub's copy is disabled too | R15 |
+| W29-S09 | Production after `9ce4e445d0` deploys, then a push to every repository | No engine run starts. Run on one workflow runs on bare metal. Once one repository's `.kiln/config.yaml` turns `github_workflows` on, that repository's pushes run on the engine | R16 |
+| W29-S10 | `acme/web` uses `platform/ci-kit/.github/workflows/rust.yml@v2` and `platform/ci-kit/.github/actions/cache@v2`, with `platform` a native owner and ci-kit's `share: owner` | Both are refused with `KCI4022`: another owner's. After `share: everyone`, both resolve to kiln's own copy, and the catalog lists them with `acme/web` among their consumers | R17, R18, R19, R20 |
+| W29-S11 | ci-kit releases `v2.4.0`, which adds a required input and a secret; `acme/app` has `updates: { actions: on, cooldown: 3d }` | Three days later, `acme/app` gets one update draft, "→ v2.4.0", naming the new input and secret, with its locks regenerated. Nothing runs `v2.4.0` on `acme/app`'s triggers until the draft lands | R21, R22, R25 |
+| W29-S12 | Two drafts that each add an action land one after the other, and their `.kiln/lock` changes conflict | The second's replay regenerates the lock, with no person. `ci.locks.verify` says it's fresh | R24, R25 |
+| W29-S13 | `.kiln/ci.ts`, kiln's own CI in TypeScript, open in the Code view, and a job renamed | The plan follows as it's typed, and "What it makes" shows the YAML. An `enum` typed in is refused with `KCI1033` at its line | R27 |
+| W29-S14 | `.kiln/release.yaml` with `program: { run: [python3, ci/plan.py] }`, whose program opens `https://example.com` | The plan fails with `KCI1032`, naming `example.com`. Without the call it plans, and a push that doesn't change it plans from the store | R28 |
+| W29-S15 | A Firecracker action with `egress: [api.github.com]` fetches `api.github.com` and `example.com`, in a GitHub-dialect workflow | The first answers. The second is refused by the egress proxy, and that's recorded. The editor warns with `KCI5003`. On a fleet without KVM, the plan fails with `KCI4033` | R29 |
+| W29-S16 | A Shards action, today | `KCI4034`, "no machine runs shards microVMs yet", and the row says Can't run | R30 |
+| W29-S17 | A kiln-dialect job `uses: ./templates/rust-check.yaml` with `with: { toolchain: stable }`, and a step with the same `uses:` | The job runs the template as a reusable workflow. The step is refused with `KCI4006`, pointing to `.kiln/actions/<name>/action.yml` | R31 |
+
+**Progress.** Specified (2026-10-31), on branch `ci-w29-pipelines`: R01–R31, AC01–AC29 and S01–S17.
+Nothing is built yet. Plan `01a19474452d7084bae269952cc6c26a` builds it, one step at a time.
 
 ## 4. API, events, CLI and MCP reference
 
@@ -10652,6 +10835,13 @@ errors as `{ error, code, details? }`. Today's routes (`/api/runs`, `/api/jobs/.
 | POST | `/api/auth/passkey/options` · `/api/auth/passkey` · `/api/auth/password` (`{ name, password }`) | signing in with a passkey, or a person's name and password | open | W10 |
 | GET · POST · DELETE | `/api/me/passkeys` · `/api/me/passkeys/options` · `/api/me/passkeys/:id` | one's own passkeys: listed, made, removed | signed in, as oneself | W10 |
 | GET · PUT | `/api/me/password` | a person's own password (`{ password, current }`; empty removes it) | signed in, as oneself | W10 |
+| GET | `/api/ship/pipelines?q=&repo=` · `/api/ship/pipelines/:owner/:name?path=&ref=` | `ship.pipelines.list`, `.get` | runs.read | W29 |
+| POST | `/api/ship/pipelines` (`{ repo, path, verb, … }`) | `ship.pipelines.act` (each verb as its operation, as the caller) | the verb's operation's | W29 |
+| GET | `/api/ci/actions/:owner/:repo?path=` | `ci.actions.get` (versions, access, consumers) | runs.read | W29 |
+| POST | `/api/ci/repos/:repo/releases` | `ci.releases.tag` (`{ sha, tag, major? }`) | diffs.land | W29 |
+| POST · GET | `/api/ci/repos/:repo/locks` · `/api/ci/repos/:repo/locks/verify?sha=` | `ci.locks.update`, `ci.locks.verify` | workflows.edit · runs.read | W29 |
+| POST | `/api/ci/repos/:repo/workflows/:path/disable` · `/enable` | `ci.workflows.disable`, `.enable` (`{ why? }`) | workflows.edit | W29 |
+| GET | `/api/ci/sdk/kiln.d.ts` | the TypeScript SDK's types | none (public within the API) | W29 |
 
 GitHub-compatible runtime services (W08, W10), the facade (W14) and the registry (W12) are listed
 in §2.6; they are not part of the route table's public API but are authenticated by the same
@@ -10665,7 +10855,8 @@ progress), `ci_step`, `ci_annotation`, `ci_artifact`, `ci_runner` (facts, health
 `ci_routing` (rules changed), `diff`, `diff_version`, `review`, `comment`, `queue`, `deployment`,
 `environment`, `incident`, `experiment`, `notification`, `ci_verdict` (a commit's verdict on a lane
 changed: `repo`, `workflow`, `branch`, `sha`, `kind`, `why`, the verdict; W28-R59). Today's `run`,
-`job`, `agent`, `sample`, `queue` messages stay.
+`job`, `agent`, `sample`, `queue` messages stay. W29 appends `pipelines` (`repo`) to them, sent when
+a repository's Pipelines rows change (W29-R03).
 
 ### 4.3 CLI
 
@@ -10692,6 +10883,9 @@ kiln gocacheprog                        kiln rustc   (W24: the runner's cache he
 ### 4.4 MCP names
 
 W24's operations: `ci.work.why`, `ci.work.status`, `ci.work.warm`, `ci.work.verify`, `ci.work.gc` and `ci.work.reap.*` (`kiln.ci.work.*` in code mode).
+
+W29's operations: `ship.pipelines.list`, `.get` and `.act`; `ci.actions.get`; `ci.releases.tag`;
+`ci.locks.update` and `ci.locks.verify`; `ci.workflows.disable` and `.enable`.
 
 Code mode: `kiln.ci.<area>.<verb>(input)` (e.g. `kiln.ci.runs.rerun({ run, mode: "failed" })`),
 diffs and review among them (`kiln.ci.diffs.*`), the hosts' pull requests (`kiln.host.pulls.*`),
@@ -10881,6 +11075,17 @@ per leg (W06-R16); kiln dialect's v1 forms and defaults (W02-R06); unmasked shor
 requires a merge queue (a merge of a job's own refused, auto-merge waiting for the queue, a job
 landing only what its run's starter may: W14-R11).
 
+### A.10 Sharing, releases and locks
+
+| Feature | Status | Where |
+| --- | --- | --- |
+| Access to a repository's actions and reusable workflows (`GET /repos/{owner}/{repo}/actions/permissions/access`) | S (+K everyone on this kiln) | W29-R17, W29-R19 |
+| `.github/workflows/actions.lock` (`gh actions-lock`), transitive actions included | S | W29-R23 |
+| The lockfile's "Require lockfile" policy, with its evaluate mode | S (`require_lock: report` and `enforce`) | W29-R26 |
+| Immutable releases | S (+K a full version never moves in a repository kiln hosts) | W29-R21 |
+| Draft pull requests (REST `draft: true`, GraphQL `markPullRequestReadyForReview`) | S | W29-R11, W29-R12 |
+| Disabling and enabling a workflow | S | W29-R15 |
+
 ## Appendix B. Where each context is available
 
 GitHub-exact, from GitHub's "context availability" table. W02 rejects a context used where it is
@@ -11057,6 +11262,7 @@ in `.github/workflows`. Each key's semantics are in the requirement cited.
 | workflow | `coalesce: { quiet, max-wait, when }`, `cadence: { on: free } \| { every }` (O) | W28-R61, W28-R62 |
 | workflow | `routing: { infer: true }` (O) | W05-R19 |
 | workflow | `run-env: true` | W04-R21 |
+| workflow | `program: { run, image, timeout, memory }`: the workflow is what the program prints | W29-R28 |
 | workflow | `kiln: { honour-skip-ci }` (O) | W03-R06 |
 | workflow | `checkout: auto \| false` (default `auto`) | W06-R14 |
 | on | `diff`, `land`, `review`, `comment`, `pipeline`, `agent`, `deploy`, `webhook`; v1 `manual`, `tag`, string `schedule` | W03-R09, W02-R06 |
@@ -11081,18 +11287,22 @@ in `.github/workflows`. Each key's semantics are in the requirement cited.
 | job | `deploy: { app, environment }` | W15-R05 |
 | job | `agents: { rerun: false, … }` (O) | W20-R09 |
 | job | `permissions` extras: `binaries`, `environments`, `registry` (O) | W10-R04 |
-| job, step | `uses:` templates (`./templates/...`, `kiln://`), `kiln/*@v1` actions | W04-R25, W07-R10 |
+| job | `uses:` templates (`./templates/...`, `kiln://`), as reusable workflows | W04-R25, W29-R31 |
+| step | `kiln/*@v1` actions | W07-R10 |
 | step | `with-secrets: { NAME: OTHER }` | W09-R07 |
 | step | `test-results: { path, format }` (O) | W16-R01 |
 | step | `tty: true` (v1) | W06 |
 | expressions | the W01-R14 additions | W01-R14 |
 | expressions | `affected(ecosystem, …)`: the packages the change affects and everything depending on them | W24 |
 | files | `$KILN_OUTPUT_JSON`, `$KILN_RUN_ENV`, `$KILN_METRICS`, `$KILN_SHARD_ITEMS` | W04, W16 |
+| files | `.kiln/<name>.ts` and `.js` (`@kiln/sdk`), and `.kiln/<name>.<ext>` in other languages | W29-R27, W29-R28 |
+| action (`action.yml`) | `runs.using: firecracker` (`image`, `resources`, `egress`, `args`, `entrypoint`) and `runs.using: shards` (`image` or `agentfile`) | W29-R29, W29-R30 |
 
 Policy files read from trunk: `.kiln/review.yaml`, `owners.yaml`, `environments.yaml`,
 `agents.yaml`, `quarantine.yaml`, `routing.yaml`, `notify.yaml`, `deploy.yaml` (CD) and
 `config.yaml` (repository CI settings: `github_workflows`, `github_api`,
-`default_token_permissions`, actions policy, untrusted policy).
+`default_token_permissions`, actions policy, untrusted policy; W29's `share`, `updates`,
+`require_lock`, `moved_tags` and `kiln_workflows`). `.kiln/lock` is machine-written (W29-R24).
 
 A kiln-dialect workflow that uses most of the above:
 
