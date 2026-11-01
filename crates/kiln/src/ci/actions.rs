@@ -90,6 +90,19 @@ impl Remote {
         self.native || hub.cfg.ci.actions.source_of(&self.owner).is_some_and(|s| s.native)
     }
 
+    /// Whether `sha`, the commit it pinned, is one only a draft's branch reaches of another of
+    /// kiln's repositories (docs/ci.md W29-R10, kiln's addition): named by its commit (`@<sha>`,
+    /// whole or abbreviated) and reached by no branch or tag but a draft's, it's the draft's, and
+    /// refused as a draft's ref is (KCI4023). For an action and a reusable workflow alike, and
+    /// wherever the name leads to kiln's own: `kiln://`, or a native source's plain name.
+    async fn draft_only(&self, hub: &Hub, caller: &str, sha: &str) -> Result<(), String> {
+        let by_commit = !self.git_ref.is_empty() && self.git_ref.bytes().all(|b| b.is_ascii_hexdigit()) && sha.to_ascii_lowercase().starts_with(&self.git_ref.to_ascii_lowercase());
+        if by_commit && self.hosted(hub) && !self.full().eq_ignore_ascii_case(caller) && !published(hub, self, sha).await.unwrap_or(true) {
+            return Err(format!("KCI4023 `{}@{}` names a commit only a draft reaches (a branch under {}), which is its author's until it's published", self.named(), self.git_ref, kiln_ci::drafts::DRAFT_PREFIX));
+        }
+        Ok(())
+    }
+
     /// Whether workflows of repository `caller` may use it (docs/ci.md W29-R17, R19): one of
     /// kiln's own repositories as its Access says, for an action and a reusable workflow alike;
     /// GitHub's own are GitHub's to allow. A refusal is KCI4022's.
@@ -214,6 +227,10 @@ pub async fn resolve(hub: &Hub, repo: &Repo, sha: &str, wf: &Workflow) -> Result
         }
         let key = u.strip_prefix("./").unwrap_or(&u);
         if let Some(w) = called.get(&u).or_else(|| called.get(key)) {
+            // The commit a remote one was pinned at, as an action's is (W29-R10).
+            if let (Some(r), Some(o)) = (Remote::parse(&u), w.origin.as_ref()) {
+                r.draft_only(hub, &repo.name, &o.sha).await?;
+            }
             calls.extend(w.jobs.iter().filter_map(|j| j.uses.clone()).map(|x| (x, depth + 1)));
             reached.push(w);
         }
@@ -323,13 +340,8 @@ pub async fn resolve(hub: &Hub, repo: &Repo, sha: &str, wf: &Workflow) -> Result
         };
         // A commit of another of kiln's repositories that only a draft's branch reaches is the
         // draft's (W29-R10, kiln's addition): refused, as a draft's ref is.
-        if let Ok(sha) = &pinned
-            && r.native
-            && !r.full().eq_ignore_ascii_case(&repo.name)
-            && r.git_ref.eq_ignore_ascii_case(sha)
-            && !published(hub, &r, sha).await.unwrap_or(true)
-        {
-            return Err(format!("KCI4023 `{uses}` names a commit only a draft reaches (a branch under {}), which is its author's until it's published", kiln_ci::drafts::DRAFT_PREFIX));
+        if let Ok(sha) = &pinned {
+            r.draft_only(hub, &repo.name, sha).await?;
         }
         // One that can't be resolved fails the jobs that use it, not the run (W07-R03).
         let sha = match pinned {

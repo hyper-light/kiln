@@ -414,32 +414,58 @@ fn w29_r10_no_trigger_runs_a_draft() -> anyhow::Result<()> {
 }
 
 /// W29-R10: no other repository can use a draft. A `uses:` of another repository's draft branch,
-/// or of a commit only that branch reaches, fails its run before any job starts (KCI4023); its
-/// published branch is used as ever.
+/// or of a commit only that branch reaches (whole or abbreviated), fails its run before any job
+/// starts (KCI4023): through `kiln://`, through a plain name a native source sends to kiln, and as
+/// a job's reusable workflow call. Its published branch is used as ever, each way.
 #[test]
 fn w29_r10_no_other_repository_uses_a_draft() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", extra: "" })?;
+    // acme's plain names are kiln's own repositories (W29-R18).
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true\n[[ci.actions.sources]]\nowners = [\"acme\"]\nnative = true\n", extra: "" })?;
     let home = dir.path().join("githome");
     std::fs::create_dir_all(&home)?;
     // Shared with its owner's repositories (W29-R17): a draft is refused all the same.
     let kit = hosted_with(&s, &home, dir.path(), "acme/kit", &[(".kiln/config.yaml", "share: owner\n")])?;
     let action = |said: &str| format!("name: x\nruns:\n  using: composite\n  steps:\n    - run: echo {said}\n      shell: bash\n");
-    push_files(&home, &kit, "main", &[(".github/actions/x/action.yml", &action("published"))])?;
+    let build = "name: build\non: workflow_call\njobs:\n  b:\n    runs-on: local\n    steps:\n      - run: echo built\n";
+    push_files(&home, &kit, "main", &[(".github/actions/x/action.yml", &action("published")), (".github/workflows/build.yml", build)])?;
     let drafted = push_files(&home, &kit, "kiln/draft/x-01a19f2c", &[(".github/actions/x/action.yml", &action("drafted"))])?;
+    let short = drafted.get(..12).unwrap_or_default().to_owned();
     let app = hosted(&s, &home, dir.path(), "acme/app")?;
-    let using = |name: &str, at: &str| format!("name: {name}\non: push\njobs:\n  a:\n    runs-on: local\n    steps:\n      - uses: kiln://acme/kit/.github/actions/x@{at}\n");
-    push_files(&home, &app, "main", &[(".kiln/branch.yaml", &using("branch", "kiln/draft/x-01a19f2c")), (".kiln/commit.yaml", &using("commit", &drafted)), (".kiln/ok.yaml", &using("ok", "main"))])?;
-    let done = |path: &'static str| move |r: &Value| r.get("workflow").and_then(Value::as_str) == Some(path) && r.get("finished_at").is_some_and(|f| !f.is_null());
-    for path in [".kiln/branch.yaml", ".kiln/commit.yaml"] {
+    let step = |name: &str, uses: &str| format!("name: {name}\non: push\njobs:\n  a:\n    runs-on: local\n    steps:\n      - uses: {uses}\n");
+    let call = |name: &str, uses: &str| format!("name: {name}\non: push\njobs:\n  c:\n    uses: {uses}\n");
+    // Each draft-only pin, and the same name at the published branch.
+    let refused = [
+        (".kiln/branch.yaml", step("branch", "kiln://acme/kit/.github/actions/x@kiln/draft/x-01a19f2c")),
+        (".kiln/commit.yaml", step("commit", &format!("kiln://acme/kit/.github/actions/x@{drafted}"))),
+        (".kiln/short.yaml", step("short", &format!("kiln://acme/kit/.github/actions/x@{short}"))),
+        (".kiln/plain.yaml", step("plain", &format!("acme/kit/.github/actions/x@{drafted}"))),
+        (".kiln/call.yaml", call("call", &format!("kiln://acme/kit/.github/workflows/build.yml@{drafted}"))),
+        (".kiln/call-plain.yaml", call("call-plain", &format!("acme/kit/.github/workflows/build.yml@{drafted}"))),
+    ];
+    let used = [
+        (".kiln/ok.yaml", step("ok", "kiln://acme/kit/.github/actions/x@main")),
+        (".kiln/plain-ok.yaml", step("plain-ok", "acme/kit/.github/actions/x@main")),
+        (".kiln/call-ok.yaml", call("call-ok", "acme/kit/.github/workflows/build.yml@main")),
+    ];
+    let files: Vec<(&str, &str)> = refused.iter().chain(used.iter()).map(|(p, t)| (*p, t.as_str())).collect();
+    push_files(&home, &app, "main", &files)?;
+    let done = |path: &str| {
+        let path = path.to_owned();
+        move |r: &Value| r.get("workflow").and_then(Value::as_str) == Some(path.as_str()) && r.get("finished_at").is_some_and(|f| !f.is_null())
+    };
+    for (path, _) in &refused {
         let seen = until_run(&s, "acme/app", &format!("of {path}, finished"), done(path))?;
         let run = seen.iter().find(|r| done(path)(r)).cloned().unwrap_or_default();
         assert!(at(&run, "/error").contains("KCI4023"), "{path}: {run}");
+        assert_eq!(at(&run, "/conclusion"), "startup_failure", "before any job: {path}: {run}");
     }
-    let seen = until_run(&s, "acme/app", "of .kiln/ok.yaml, finished", done(".kiln/ok.yaml"))?;
-    let ok = seen.iter().find(|r| done(".kiln/ok.yaml")(r)).cloned().unwrap_or_default();
-    assert!(!at(&ok, "/error").contains("KCI4023"), "a published branch is used as ever: {ok}");
-    assert_eq!(at(&ok, "/conclusion"), "success", "{ok}");
+    for (path, _) in &used {
+        let seen = until_run(&s, "acme/app", &format!("of {path}, finished"), done(path))?;
+        let run = seen.iter().find(|r| done(path)(r)).cloned().unwrap_or_default();
+        assert!(!at(&run, "/error").contains("KCI4023"), "a published branch is used as ever: {path}: {run}");
+        assert_eq!(at(&run, "/conclusion"), "success", "{path}: {run}\n{}", s.log());
+    }
     Ok(())
 }
 
