@@ -27,6 +27,12 @@ cache:
 config:
   kubernetes:
     max_pods: 64
+    # CI's pods go to the node tagged kiln-ci=big, kiln-m02 (48 GiB). The other nodes' containers are
+    # capped at 16 GiB though Kubernetes sees the host's memory on each, so a big job there was killed
+    # (the rust job's lib-test build, from run #1522 on) or starved etcd (2026-10-29). The tag, on the
+    # node and not in this repository: kubectl label node kiln-m02 kiln-ci=big (Ada, 2026-11-01).
+    node_selector:
+      kiln-ci: big
 
 # Production's memory limit (Ada, 2026-10-24). kiln:61b07ceb's start peaked at the chart's 2Gi,
 # which tripped the guard's memory check (share over 0.8) and rolled it back into a crash loop. The
