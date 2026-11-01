@@ -1286,10 +1286,34 @@ fn page_ancestors(hub: &Hub) -> String {
     format!("frame-ancestors {}", if origins.is_empty() { "'none'".to_owned() } else { origins.join(" ") })
 }
 
-/// Headers every answer of a page's carries: its sandbox, no referrer (its address is its key), and
-/// to any origin (the page's own is opaque), for fonts and modules.
-fn page_headers(hub: &Hub, h: &mut header::HeaderMap) {
-    let policy = format!("{PAGE_POLICY}; {}", page_ancestors(hub));
+/// Page `id`'s own files and kiln's fonts by the address `req` reached them at, for its policy to
+/// name beside `'self'`: in a document its frame sandboxes (the conversation's frame does), WebKit,
+/// every browser on iOS, matches `'self'` with nothing, and phones were refused the page's own
+/// scripts, pictures and fonts. Only a name and a port make one (no header adds to the policy).
+fn page_sources(hub: &Hub, req: &Request, id: &str) -> String {
+    let asked = req.uri().authority().map(|a| a.as_str().to_owned()).or_else(|| srv::header_str(req, &header::HOST).map(str::to_owned)).unwrap_or_default();
+    named_sources(&asked, is_secure(hub, req), id)
+}
+
+/// [`page_sources`] for a page reached at `asked` (its `Host`), over HTTPS when `secure`.
+fn named_sources(asked: &str, secure: bool, id: &str) -> String {
+    let asked = asked.to_ascii_lowercase();
+    if asked.is_empty() || !asked.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':')) {
+        return String::new();
+    }
+    let scheme = if secure { "https" } else { "http" };
+    format!(" {scheme}://{asked}/v/{id}/ {scheme}://{asked}/v/_/fonts/")
+}
+
+/// [`PAGE_POLICY`] with `sources` beside each `'self'`, then who may frame it.
+fn page_policy(sources: &str, ancestors: &str) -> String {
+    format!("{}; {ancestors}", PAGE_POLICY.replace("'self'", &format!("'self'{sources}")))
+}
+
+/// Headers every answer of page `id`'s carries: its sandbox, no referrer (its address is its key),
+/// and to any origin (the page's own is opaque), for fonts and modules.
+fn page_headers(hub: &Hub, req: &Request, id: &str, h: &mut header::HeaderMap) {
+    let policy = page_policy(&page_sources(hub, req, id), &page_ancestors(hub));
     if let Ok(v) = header::HeaderValue::from_str(&policy) {
         h.insert(header::CONTENT_SECURITY_POLICY, v);
     }
@@ -1314,7 +1338,7 @@ async fn page(hub: &Arc<Hub>, id: &str, req: &Request) -> R {
         if let Ok(to) = header::HeaderValue::from_str(&format!("/v/{}{}", v.id, crate::harness::visuals::url_path(&v.entry))) {
             r.headers_mut().insert(header::LOCATION, to);
         }
-        page_headers(hub, r.headers_mut());
+        page_headers(hub, req, &v.id, r.headers_mut());
         return Ok(r);
     }
     let at = srv::decode(rest);
@@ -1325,7 +1349,7 @@ async fn page(hub: &Arc<Hub>, id: &str, req: &Request) -> R {
     let meta = crate::harness::files::Meta { size, mtime: 0, mime: used.mime.clone(), width: None, height: None };
     let etag = format!("\"{}\"", used.sha);
     if let Some(mut r) = unchanged(req, &etag, true) {
-        page_headers(hub, r.headers_mut());
+        page_headers(hub, req, &v.id, r.headers_mut());
         return Ok(r);
     }
     let Ok(range) = byte_range(req, size) else { return Ok(unsatisfiable(size)) };
@@ -1357,7 +1381,7 @@ async fn page(hub: &Arc<Hub>, id: &str, req: &Request) -> R {
     let name = used.path.rsplit('/').next().unwrap_or("file").to_owned();
     let mut r = file_response(&meta, &name, &etag, true, range, srv::channel_body(rx));
     // The page's own policy, for it and for every file of it (a script or a style is the page's).
-    page_headers(hub, r.headers_mut());
+    page_headers(hub, req, &v.id, r.headers_mut());
     Ok(r)
 }
 
@@ -5905,5 +5929,26 @@ mod tests {
         let ps1 = include_str!("../assets/install-agent.ps1");
         assert!(ps1.contains("[switch]$Outpost"));
         assert!(ps1.contains("@('outpost', '--server', $Server, '--state-dir', $dir)"));
+    }
+
+    /// docs/previews.md, "Sandboxed": a shown page's policy names its own folder and kiln's fonts at
+    /// the address it was reached at, beside `'self'`, which WebKit (every browser on iOS) matches
+    /// with nothing in the conversation's sandboxed frame: phones were refused a page's own scripts,
+    /// pictures and fonts. A `Host` that isn't a name and a port adds nothing to it.
+    #[test]
+    fn a_page_s_policy_names_its_own_files_where_it_was_reached() {
+        let id = "0582dcb7c0e9dbd3a891b242896e61c8";
+        let phone = named_sources("Kiln.dev", true, id);
+        assert_eq!(phone, format!(" https://kiln.dev/v/{id}/ https://kiln.dev/v/_/fonts/"));
+        assert_eq!(named_sources("192.168.1.77:7070", false, id), format!(" http://192.168.1.77:7070/v/{id}/ http://192.168.1.77:7070/v/_/fonts/"));
+        for odd in ["", "kiln.dev; script-src *", "kiln.dev https://elsewhere.example", "kiln.dev,evil", "u@kiln.dev", "[fd7a::1]:443"] {
+            assert_eq!(named_sources(odd, true, id), "", "{odd:?}");
+        }
+        let policy = page_policy(&phone, "frame-ancestors 'self'");
+        for d in ["default-src", "script-src", "style-src", "img-src", "media-src", "font-src", "connect-src", "worker-src", "frame-src"] {
+            assert!(policy.contains(&format!("{d} 'self' https://kiln.dev/v/{id}/ https://kiln.dev/v/_/fonts/ ")), "{d}: {policy}");
+        }
+        assert!(policy.starts_with("sandbox allow-scripts ") && policy.ends_with("; frame-ancestors 'self'"), "{policy}");
+        assert_eq!(page_policy("", "frame-ancestors 'self'"), format!("{PAGE_POLICY}; frame-ancestors 'self'"), "none named: the policy as it was");
     }
 }
