@@ -64,6 +64,9 @@ pub fn kiln() -> Command {
     for var in NOT_INHERITED {
         cmd.env_remove(var);
     }
+    if let Ok(level) = std::env::var("KILN_TEST_LOG") {
+        cmd.env("KILN_LOG", level);
+    }
     cmd
 }
 
