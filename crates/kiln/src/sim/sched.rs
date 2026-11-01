@@ -40,6 +40,10 @@
 //! - G10: a runner acts only on a grant the store has had; the engine holds each leg's grant, and
 //!   its attempt, exactly as the store does, through every restart; an attempt that ended is never
 //!   granted again.
+//! - G4 (docs/needs.md E4.6): no gang runs in part, some members under a grant, others waiting.
+//! - G6: an item that held one room kept for it until it started (W05-R39, backfilling on, among
+//!   legs with p90s, big items wanting a runner whole and gangs) started by its bound: the room's
+//!   time plus how far the grants it waited for ran past their expected ends.
 //!
 //! Once the nemesis has stopped, every leg settles, but one that waits, as W05-R13 says it does, for
 //! another runner than the only one big enough to hold it, which refused it (`stranded`).
@@ -51,7 +55,7 @@ use std::time::Duration;
 use kiln_ci::facts::{Cpu, Mem, RunnerFacts};
 use kiln_ci::sched::retry::{Failed, FailureClass, RetryOn, RetryPolicy, RunnerChoice};
 use kiln_ci::sched::routing::{LegRoute, RunnerView};
-use kiln_ci::sched::state::{Command, Config, Cpus, Fence, Incoming, Input, LeaseLoss, LegIn, Loss, Outcome, Resources, RunnerIn, Scheduler, WaitReason};
+use kiln_ci::sched::state::{Command, Config, Cpus, DEFAULT_TIMEOUT_MS, Fence, Gang, Incoming, Input, LeaseLoss, LegIn, Loss, MUTANT, Mutant, Outcome, Resources, RunnerIn, Scheduler, WaitReason};
 use kiln_sim::net::{Fate, Node};
 use kiln_sim::{Faults, Net, Queue, Rng, Trace};
 
@@ -80,6 +84,11 @@ pub enum Mutation {
     SameEpoch,
     /// A runner lets a stop grant run on past its lease's end.
     StopRunsOn,
+    /// The engine grants a leg into room kept for another, past that room's time, where it doesn't
+    /// fit beside it (docs/needs.md E4.6; kiln-ci's `mutants`).
+    BackfillPast,
+    /// The engine starts a gang without its last member.
+    GangInPart,
 }
 
 /// A grant as frames name it: its leg, attempt and fence.
@@ -200,6 +209,12 @@ pub struct Counts {
     /// Legs left waiting for another runner than the only one big enough, which refused them
     /// (W05-R13's `other-runner`).
     pub stranded: u64,
+    /// Room kept for an item (W05-R39), each one the engine kept; and those that stood until their
+    /// item started (G6's).
+    pub reserved: u64,
+    pub reserved_started: u64,
+    /// Gangs started whole (W05-R40).
+    pub gangs: u64,
 }
 
 impl Counts {
@@ -223,6 +238,9 @@ impl Counts {
         self.expired += o.expired;
         self.stopped += o.stopped;
         self.stranded += o.stranded;
+        self.reserved += o.reserved;
+        self.reserved_started += o.reserved_started;
+        self.gangs += o.gangs;
     }
 }
 
@@ -267,6 +285,27 @@ struct Runner {
     frozen: Option<Frozen>,
     /// When its next look at its leases is due.
     look: Option<Duration>,
+}
+
+/// A grant the engine made (G6): its leg, fence and runner, when it started, its two ends as the
+/// engine reckons them from its leg (W05-R38), and when the store took it to have ended.
+struct Seen {
+    leg: String,
+    fence: Fence,
+    runner: usize,
+    start: i64,
+    expected: i64,
+    hard: i64,
+    end: Option<i64>,
+}
+
+/// An item's stretch holding one room kept for it (W05-R39, R40): since `from`, from the room's
+/// time `at`, on `runner`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Holding {
+    from: i64,
+    at: i64,
+    runner: usize,
 }
 
 /// What the store keeps of a leg, which a crash keeps: queued at an attempt, running under a grant
@@ -322,6 +361,11 @@ struct Sim {
     stored: BTreeSet<(String, Fence)>,
     ended: BTreeSet<(String, u32)>,
     acted: BTreeMap<String, Fence>,
+    /// G6 and G4 (docs/needs.md E4.6): every grant made, as [`Seen`]; each item's stretch holding a
+    /// room kept for it; the gangs running whole.
+    seen: Vec<Seen>,
+    holding: BTreeMap<String, Holding>,
+    whole: BTreeSet<String>,
     /// The first thing the checker found wrong.
     failed: Option<String>,
     counts: Counts,
@@ -385,7 +429,8 @@ impl Sim {
         let lease = model.span(Duration::from_secs(8), Duration::from_secs(30));
         let lock = model.span(Duration::from_secs(1), Duration::from_secs(10));
         let grace = model.span(Duration::from_secs(4), Duration::from_secs(40));
-        let cfg = Config { lease: Some(ms(lease)), lock_delay: ms(lock), ..Config::default() };
+        // Room kept for big items and gangs (W05-R39, R40), as backfilling keeps it.
+        let cfg = Config { lease: Some(ms(lease)), lock_delay: ms(lock), backfill: true, ..Config::default() };
         let n = model.range(2, 4);
         let runners = (0..n)
             .map(|i| {
@@ -423,6 +468,9 @@ impl Sim {
             stored: BTreeSet::new(),
             ended: BTreeSet::new(),
             acted: BTreeMap::new(),
+            seen: Vec::new(),
+            holding: BTreeMap::new(),
+            whole: BTreeSet::new(),
             failed: None,
             counts: Counts::default(),
             steps: 0,
@@ -438,6 +486,10 @@ impl Sim {
         // unroutable, for good (W05-R24), and settles never. A quarter stop when their lease is
         // lost, as deployments do (W05-R34); half retry a lost runner up to three times.
         let sizes: Vec<(u64, u64)> = sim.runners.iter().filter_map(|x| x.size).map(|s| (s.cpu.get() / 1000, s.mem / GIB)).collect();
+        // What docs/needs.md E4.6 draws besides, from a stream of its own, so the draws above are as
+        // they were: each leg's p90, from three fifths of how long it takes to a fifth past it (W05-R38).
+        let mut more = rng.stream("big");
+        let p90 = |more: &mut Rng, took: Duration| u64::try_from(more.span(took * 3 / 5, took * 6 / 5).as_millis()).ok();
         for i in 0..model.range(6, 24) {
             let at = model.span(Duration::ZERO, until);
             let (cpus, gib) = model.pick(&sizes).copied().unwrap_or((u64::MAX, u64::MAX));
@@ -463,11 +515,39 @@ impl Sim {
                 exclusive: model.chance(150),
                 request,
                 cost: u64::try_from(took.as_millis()).ok(),
+                p90: p90(&mut more, took),
                 retry,
                 on_lease_loss,
                 ..LegIn::default()
             };
             sim.queue.push(at, Ev::Queued(Box::new(leg)));
+        }
+        // Big items: a leg or two wanting a runner whole, among the rest (W05-R39).
+        for i in 0..more.range(1, 2) {
+            let at = more.span(Duration::ZERO, until);
+            let took = more.span(Duration::from_secs(10), Duration::from_secs(90));
+            let id = format!("b{i}");
+            sim.took.insert(id.clone(), took);
+            let leg = LegIn { id, run: format!("big{i}"), repo: format!("acme/r{}", more.below(3)), exclusive: true, cost: u64::try_from(took.as_millis()).ok(), p90: p90(&mut more, took), ..LegIn::default() };
+            sim.queue.push(at, Ev::Queued(Box::new(leg)));
+        }
+        // Gangs of two or three, a job's legs queued together (W05-R40), as many as the runners
+        // have slots at most: a gang no fleet could hold waits for good, as a leg no runner could
+        // hold does.
+        let slots: u64 = sim.runners.iter().map(|x| u64::from(x.input.slots)).sum();
+        for g in 0..more.range(0, 2) {
+            let (at, size) = (more.span(Duration::ZERO, until), more.range(2, 3).min(slots));
+            let took = more.span(Duration::from_secs(10), Duration::from_secs(60));
+            if size < 2 {
+                continue;
+            }
+            let gang = Gang { id: format!("gang{g}"), size: u32::try_from(size).unwrap_or(2) };
+            for m in 0..size {
+                let id = format!("g{g}m{m}");
+                sim.took.insert(id.clone(), took);
+                let leg = LegIn { id, run: gang.id.clone(), repo: "acme/r0".into(), gang: Some(gang.clone()), cost: u64::try_from(took.as_millis()).ok(), p90: p90(&mut more, took), ..LegIn::default() };
+                sim.queue.push(at, Ev::Queued(Box::new(leg)));
+            }
         }
         // Partitions: a runner cut off from the server for a while.
         for _ in 0..model.range(0, 4) {
@@ -642,8 +722,11 @@ impl Sim {
                     if let Some(s) = self.server.as_mut() {
                         s.grants.remove(&leg);
                     }
-                    // Its attempt over in the store; its next (a `Retry`) or its end follows.
-                    self.ended.insert((leg.clone(), attempt));
+                    // Its attempt over in the store; its next (a `Retry`) or its end follows. One its
+                    // gang took back goes again at the same attempt (W05-R40), as a refused one does.
+                    if why != Loss::Gang {
+                        self.ended.insert((leg.clone(), attempt));
+                    }
                     self.store.insert(leg, Kept::Queued { attempt });
                 }
                 Command::Cancel { leg, .. } => {
@@ -692,6 +775,12 @@ impl Sim {
             self.fail(format!("G10: {leg}'s attempt {attempt} granted again (under {fence:?}), though it ended"));
         }
         self.issued.insert(fence, (leg.clone(), attempt));
+        // Its two ends as the engine reckons them (W05-R38), for G6.
+        let (now, input) = (self.ms(), self.legs.get(&leg));
+        let ms_of = |m: u64| i64::try_from(m).unwrap_or(i64::MAX / 4);
+        let hard = now.saturating_add(ms_of(input.and_then(|l| l.timeout).unwrap_or(DEFAULT_TIMEOUT_MS)));
+        let expected = input.and_then(|l| l.p90.or(l.cost)).map_or(hard, |m| now.saturating_add(ms_of(m)).min(hard));
+        self.seen.push(Seen { leg: leg.clone(), fence, runner: r, start: now, expected, hard, end: None });
         let grant = Grant { leg: leg.clone(), attempt, fence };
         self.store.insert(leg.clone(), Kept::Running { runner: r, grant: grant.clone() });
         self.stored.insert((leg.clone(), fence));
@@ -740,9 +829,13 @@ impl Sim {
     }
 
     /// `gone`'s attempts lost with their runner, as the dispatcher loses them: over in the store,
-    /// then the engine told.
+    /// then the engine told. One that ended already, as one before it took its gang with it (W05-R40),
+    /// is left as it is, as the store's attempt, ended, takes no end again.
     fn lose(&mut self, gone: Vec<(String, u32)>) {
         for (leg, attempt) in gone {
+            if !matches!(self.store.get(&leg), Some(Kept::Running { grant, .. }) if grant.attempt == attempt) {
+                continue;
+            }
             if let Some(s) = self.server.as_mut() {
                 s.grants.remove(&leg);
             }
@@ -1114,6 +1207,8 @@ impl Sim {
                     return Ok(());
                 }
                 self.counts.crashes += 1;
+                // Room kept goes with it: a restart works it out again (W05-R39), the bound with it.
+                self.holding.clear();
                 // What was on its way to it, and its timers, go with it; and every connection to it.
                 self.queue.retain(|e| !matches!(e, Ev::ToServer { .. } | Ev::Tick));
                 let sessions: Vec<(usize, u32)> = self.runners.iter().enumerate().map(|(r, x)| (r, x.session)).collect();
@@ -1164,11 +1259,13 @@ impl Sim {
     }
 
     /// At every step: no runner holds more than its capacity (W05-R03); the engine holds each leg's
-    /// grant and attempt exactly as the store does (G10); and nothing the checker found on the way.
+    /// grant and attempt exactly as the store does (G10); G4 and G6 (docs/needs.md E4.6:
+    /// [`Self::gangs_and_room`]); and nothing the checker found on the way.
     fn check(&mut self) -> Result<(), String> {
         if let Some(why) = self.failed.take() {
             return Err(why);
         }
+        self.gangs_and_room()?;
         for x in &self.runners {
             let jobs: Vec<Incoming> = x.jobs.values().map(|j| j.holds).collect();
             within(x.input.slots, x.size, &jobs).map_err(|why| format!("{}: {why}: {:?}", x.input.id, x.jobs.keys().collect::<Vec<_>>()))?;
@@ -1186,6 +1283,81 @@ impl Sim {
             }
         }
         Ok(())
+    }
+
+    /// G4 and G6 (docs/needs.md E4.6). G4: no gang runs in part, some members under a grant while
+    /// others wait in the store. G6: an item that held one room kept for it until it started, started
+    /// by its bound: that room's time plus how far the grants it waited for (those on its runner, or
+    /// on its gang's members' runners, expected to end by then) ran past their expected ends, as the
+    /// store saw them end, each no further than its hard end. Room kept that goes (worked out again
+    /// later or elsewhere, its runner gone, a class before its own granted into it, a restart) starts
+    /// the bound again from the next.
+    fn gangs_and_room(&mut self) -> Result<(), String> {
+        let now = self.ms();
+        for g in self.seen.iter_mut().filter(|g| g.end.is_none()) {
+            if !matches!(self.store.get(&g.leg), Some(Kept::Running { grant, .. }) if grant.fence == g.fence) {
+                g.end = Some(now);
+            }
+        }
+        let mut gangs: BTreeMap<String, (Vec<String>, Vec<String>, u32)> = BTreeMap::new();
+        for (id, l) in &self.legs {
+            let Some(g) = &l.gang else { continue };
+            let e = gangs.entry(g.id.clone()).or_insert_with(|| (Vec::new(), Vec::new(), g.size));
+            match self.store.get(id) {
+                Some(Kept::Running { .. }) => e.0.push(id.clone()),
+                Some(Kept::Queued { .. }) => e.1.push(id.clone()),
+                _ => {}
+            }
+        }
+        for (g, (running, waiting, size)) in gangs {
+            if !running.is_empty() && !waiting.is_empty() {
+                return Err(format!("G4: gang {g} runs in part: {running:?} run, {waiting:?} wait"));
+            }
+            if running.is_empty() {
+                self.whole.remove(&g);
+            } else if u32::try_from(running.len()).unwrap_or(0) >= size && self.whole.insert(g) {
+                self.counts.gangs += 1;
+            }
+        }
+        let Some(s) = self.server.as_ref() else {
+            self.holding.clear();
+            return Ok(());
+        };
+        let kept: Vec<(String, usize, i64)> = s.engine.kept_items().into_iter().filter_map(|(l, r, at)| self.runners.iter().position(|x| x.input.id == r).map(|r| (l, r, at))).collect();
+        for (leg, runner, at) in &kept {
+            // Room worked out again, later or elsewhere, is other room: the bound starts again.
+            if self.holding.get(leg).is_some_and(|h| h.at != *at || h.runner != *runner) {
+                self.holding.remove(leg);
+            }
+            if !self.holding.contains_key(leg) {
+                self.counts.reserved += 1;
+                self.holding.insert(leg.clone(), Holding { from: now, at: *at, runner: *runner });
+            }
+        }
+        let gone: Vec<String> = self.holding.keys().filter(|l| !kept.iter().any(|(k, _, _)| k == *l)).cloned().collect();
+        let closed: Vec<(String, Holding)> = gone.iter().filter_map(|l| self.holding.remove(l).map(|h| (l.clone(), h))).collect();
+        let seen = &self.seen;
+        let started = |leg: &str| seen.iter().rev().find(|g| g.leg == leg).is_some_and(|g| g.start == now);
+        let gang_of = |leg: &str| self.legs.get(leg).and_then(|l| l.gang.as_ref()).map(|g| g.id.clone());
+        // A gang starts once room is free for all its members: each waited for all their runners.
+        let mut crews: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
+        for (l, h) in closed.iter().filter(|(l, _)| started(l)) {
+            if let Some(g) = gang_of(l) {
+                crews.entry(g).or_default().insert(h.runner);
+            }
+        }
+        let mut late = None;
+        let mut n = 0;
+        for (l, h) in closed.iter().filter(|(l, _)| started(l)) {
+            n += 1;
+            let runners = gang_of(l).and_then(|g| crews.get(&g).cloned()).unwrap_or_else(|| BTreeSet::from([h.runner]));
+            let over = seen.iter().filter(|g| runners.contains(&g.runner) && g.leg != *l && g.expected <= h.at && g.start <= now && g.end.is_none_or(|e| e > h.from)).map(|g| (g.end.unwrap_or(now).min(g.hard) - g.expected).max(0)).max().unwrap_or(0);
+            if now > h.at.saturating_add(over) && late.is_none() {
+                late = Some(format!("G6: {l}, room kept for it on r{} from {} ms (since {} ms), started at {now} ms, past its bound {} ms", h.runner, h.at, h.from, h.at.saturating_add(over)));
+            }
+        }
+        self.counts.reserved_started += n;
+        late.map_or(Ok(()), Err)
     }
 
     fn run(&mut self) -> Result<(), String> {
@@ -1239,8 +1411,16 @@ pub fn run(seed: u64, keep: usize) -> Result<(Counts, u64), String> {
 
 /// One seed's run with `mutation` planted.
 pub fn run_with(seed: u64, keep: usize, mutation: Option<Mutation>) -> Result<(Counts, u64), String> {
+    // The engine's own planted bugs (kiln-ci's `mutants`), on this thread while the seed runs.
+    let mutant = match mutation {
+        Some(Mutation::BackfillPast) => Some(Mutant::PastReservation),
+        Some(Mutation::GangInPart) => Some(Mutant::GangInPart),
+        _ => None,
+    };
+    MUTANT.with(|m| m.set(mutant));
     let mut sim = Sim::new(seed, keep, mutation);
     let ran = sim.run();
+    MUTANT.with(|m| m.set(None));
     let tail = if sim.trace.keeps() { format!("\n--- its last steps:\n{}", sim.trace.tail_text()) } else { String::new() };
     match ran {
         Ok(()) => {
@@ -1259,10 +1439,11 @@ mod tests {
 
     use super::*;
 
-    /// docs/needs.md E1.6 and E3.8: the engine, its store and runners over the seed budget, under
-    /// the nemesis (frames lost, doubled and late, links cut, the server crashing, runners paused
-    /// past their lease and asleep): at every step no runner holds more than its capacity, and G2
-    /// and G10 hold; every leg settles once the nemesis stops; and every fault happened.
+    /// docs/needs.md E1.6, E3.8 and E4.6: the engine, its store and runners over the seed budget,
+    /// under the nemesis (frames lost, doubled and late, links cut, the server crashing, runners
+    /// paused past their lease and asleep): at every step no runner holds more than its capacity,
+    /// and G2, G4, G6 and G10 hold; every leg settles once the nemesis stops; and every fault
+    /// happened, room was kept and gangs started.
     #[test]
     fn the_engine_and_runners_hold_their_capacity_and_settle_every_leg_under_the_nemesis() -> Result<(), String> {
         let mut all = Counts::default();
@@ -1291,6 +1472,9 @@ mod tests {
                 ("grants expired", all.expired),
                 ("stop grants stopped at their lease's end", all.stopped),
                 ("failed legs", all.failed),
+                ("room kept for an item", all.reserved),
+                ("room kept that stood until its item started", all.reserved_started),
+                ("gangs started whole", all.gangs),
             ];
             if let Some((what, _)) = none.iter().find(|(_, n)| *n == 0) {
                 return Err(format!("no {what} over the budget: the model didn't test what it says"));
@@ -1339,6 +1523,20 @@ mod tests {
     #[test]
     fn a_stop_grant_that_runs_on_past_its_lease_is_caught() -> Result<(), String> {
         caught(Mutation::StopRunsOn)
+    }
+
+    /// docs/needs.md E4.6's bugs planted in the engine (kiln-ci's `mutants`): a backfill granted
+    /// past the room kept for another, where it doesn't fit beside it (G6: that item starts past its
+    /// bound).
+    #[test]
+    fn a_backfill_past_its_reservation_is_caught() -> Result<(), String> {
+        caught(Mutation::BackfillPast)
+    }
+
+    /// A gang started without its last member (G4: it runs in part).
+    #[test]
+    fn a_gang_granted_in_part_is_caught() -> Result<(), String> {
+        caught(Mutation::GangInPart)
     }
 
     /// docs/sim.md's bug 10: the seeds where a leg lost with its runner waited for good for another

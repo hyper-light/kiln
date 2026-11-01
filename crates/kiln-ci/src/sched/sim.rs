@@ -9,7 +9,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
 use super::retry::{Failed, FailureClass};
-use super::state::{Command, Config, DIMS, Fence, Input, LegIn, Outcome, Resources, RunnerIn, Scheduler, WaitReason, offers};
+use super::state::{Command, Config, DEFAULT_TIMEOUT_MS, DIMS, Fence, Input, LegIn, Outcome, Resources, RunnerIn, Scheduler, WaitReason, offers};
 
 /// Something the simulation does at a time.
 #[derive(Debug, Clone)]
@@ -28,6 +28,36 @@ pub struct Assigned {
     pub leg: String,
     pub runner: String,
     pub attempt: u32,
+}
+
+/// A grant as the simulation saw it (W05-R38): its leg, attempt and runner, when it started, its
+/// expected and hard ends as the engine reckons them from its leg (its p90, else its cost, else its
+/// timeout; its timeout), and when the engine took it to have ended.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Grant {
+    pub leg: String,
+    pub attempt: u32,
+    pub runner: String,
+    pub start: i64,
+    pub expected: i64,
+    pub hard: i64,
+    pub end: Option<i64>,
+}
+
+/// A stretch an item held one room kept for it (W05-R39, R40; docs/needs.md G6): from when the room
+/// was kept (`from`), from that room's time (`at`), on its runner, until the item started
+/// (`started`) or the room went, the item waiting (worked out again elsewhere or later, its runner
+/// gone, a class before its own granted into it). Its `bound`, once it started: `at` plus how far
+/// the grants it waited for (those on its runner, and on its gang's members' runners, expected to
+/// end by `at`) ran past their expected ends, each no further than its hard end.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Held {
+    pub leg: String,
+    pub from: i64,
+    pub at: i64,
+    pub runners: BTreeSet<String>,
+    pub started: Option<i64>,
+    pub bound: Option<i64>,
 }
 
 /// A simulated fleet.
@@ -82,6 +112,16 @@ pub struct Sim {
     /// grant's fence, which its runner's heartbeats name.
     pub lost: Vec<(i64, String, u32, String)>,
     fences: BTreeMap<String, Fence>,
+    /// Each leg as it was queued, and how many of its next grants its runner refuses.
+    inputs: BTreeMap<String, LegIn>,
+    refusals: BTreeMap<String, u32>,
+    /// Every grant, as [`Grant`] says; the stretches items held kept room, closed (`held`) and
+    /// open; and each time a grant batch took part of a gang: (time, gang, members granted, its
+    /// size) (G4).
+    pub grants: Vec<Grant>,
+    pub held: Vec<Held>,
+    holding: BTreeMap<String, Held>,
+    pub in_part: Vec<(i64, String, u32, u32)>,
 }
 
 impl Sim {
@@ -120,7 +160,19 @@ impl Sim {
             silences: Vec::new(),
             lost: Vec::new(),
             fences: BTreeMap::new(),
+            inputs: BTreeMap::new(),
+            refusals: BTreeMap::new(),
+            grants: Vec::new(),
+            held: Vec::new(),
+            holding: BTreeMap::new(),
+            in_part: Vec::new(),
         }
+    }
+
+    /// `leg`'s next `times` grants are refused by the runners they're sent to, as a runner's own
+    /// admission refuses one (W05-R02).
+    pub fn refuse(&mut self, leg: &str, times: u32) {
+        self.refusals.insert(leg.to_owned(), times);
     }
 
     /// Each runner renews the grants it holds every `ms` from when it comes up (W05-R34), naming
@@ -160,6 +212,7 @@ impl Sim {
         self.durations.insert(leg.id.clone(), duration);
         self.repos.insert(leg.id.clone(), leg.repo.clone());
         self.asks.insert(leg.id.clone(), (leg.request, leg.exclusive));
+        self.inputs.insert(leg.id.clone(), leg.clone());
         self.input(t, Input::LegQueued(Box::new(leg)));
     }
 
@@ -177,6 +230,7 @@ impl Sim {
             self.queue.pop();
             self.now = t;
             let Some(ev) = self.events.remove(&id) else { continue };
+            let granted = self.assigned.len();
             let cmds = match ev {
                 Ev::Input(i) => self.sched.handle(*i, t),
                 Ev::Tick => self.sched.handle(Input::Tick, t),
@@ -200,6 +254,7 @@ impl Sim {
                         continue;
                     }
                     let Some((runner, start, _)) = self.running.remove(&leg) else { continue };
+                    self.ended(&leg, attempt);
                     if let Some(repo) = self.repos.get(&leg) {
                         self.busy.push((repo.clone(), start, t));
                     }
@@ -213,8 +268,73 @@ impl Sim {
                 }
             };
             self.apply(cmds);
+            self.watch(granted);
         }
         self.now = self.now.max(until);
+    }
+
+    /// After each event: the stretches items hold kept room, opened, followed onto the runners
+    /// their room moves to, and closed, each one that started then with its bound (G6); and each
+    /// gang the event's grants took part of (G4).
+    fn watch(&mut self, granted: usize) {
+        let now = self.now;
+        let started: BTreeSet<String> = self.assigned.get(granted..).unwrap_or_default().iter().map(|a| a.leg.clone()).collect();
+        let kept = self.sched.kept_items();
+        for (leg, runner, at) in &kept {
+            // Room worked out again, later or elsewhere, is other room: the one it had went.
+            if self.holding.get(leg).is_some_and(|h| h.at != *at || !h.runners.contains(runner))
+                && let Some(h) = self.holding.remove(leg)
+            {
+                self.held.push(h);
+            }
+            self.holding.entry(leg.clone()).or_insert_with(|| Held { leg: leg.clone(), from: now, at: *at, runners: BTreeSet::from([runner.clone()]), started: None, bound: None });
+        }
+        let gone: Vec<String> = self.holding.keys().filter(|l| !kept.iter().any(|(k, _, _)| k == *l)).cloned().collect();
+        let closed: Vec<Held> = gone.iter().filter_map(|l| self.holding.remove(l)).collect();
+        // A gang starts once room is free for all its members: each waited for the grants on all
+        // their runners.
+        let gang_of = |leg: &str| self.inputs.get(leg).and_then(|l| l.gang.as_ref()).map(|g| g.id.clone());
+        let mut crews: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for h in closed.iter().filter(|h| started.contains(&h.leg)) {
+            if let Some(g) = gang_of(&h.leg) {
+                crews.entry(g).or_default().extend(h.runners.iter().cloned());
+            }
+        }
+        for mut h in closed {
+            if started.contains(&h.leg) {
+                let runners = gang_of(&h.leg).and_then(|g| crews.get(&g)).unwrap_or(&h.runners);
+                let over = self
+                    .grants
+                    .iter()
+                    .filter(|g| runners.contains(&g.runner) && g.leg != h.leg && g.expected <= h.at && g.start <= now && g.end.is_none_or(|e| e > h.from))
+                    .map(|g| (g.end.unwrap_or(now).min(g.hard) - g.expected).max(0))
+                    .max()
+                    .unwrap_or(0);
+                (h.started, h.bound) = (Some(now), Some(h.at + over));
+            }
+            self.held.push(h);
+        }
+        // A gang's grants come all at once or not at all.
+        let mut gangs: BTreeMap<String, (u32, u32)> = BTreeMap::new();
+        for leg in &started {
+            if let Some(g) = self.inputs.get(leg).and_then(|l| l.gang.as_ref()) {
+                let e = gangs.entry(g.id.clone()).or_insert((0, g.size));
+                e.0 += 1;
+            }
+        }
+        for (g, (n, size)) in gangs {
+            if n < size {
+                self.in_part.push((now, g, n, size));
+            }
+        }
+    }
+
+    /// The grant of `leg`'s `attempt` ended, as the engine takes it, now.
+    fn ended(&mut self, leg: &str, attempt: u32) {
+        let now = self.now;
+        if let Some(g) = self.grants.iter_mut().rev().find(|g| g.leg == leg && g.attempt == attempt && g.end.is_none()) {
+            g.end = Some(now);
+        }
     }
 
     fn apply(&mut self, cmds: Vec<Command>) {
@@ -226,6 +346,19 @@ impl Sim {
                 Command::Assign { leg, runner, attempt, fence, .. } => {
                     self.fences.insert(leg.clone(), fence);
                     self.assigned.push(Assigned { at: self.now, leg: leg.clone(), runner: runner.clone(), attempt });
+                    // Its ends as the engine reckons them (W05-R38).
+                    let input = self.inputs.get(&leg);
+                    let ms = |m: u64| i64::try_from(m).unwrap_or(i64::MAX / 4);
+                    let hard = self.now + ms(input.and_then(|l| l.timeout).unwrap_or(DEFAULT_TIMEOUT_MS));
+                    let expected = input.and_then(|l| l.p90.or(l.cost)).map_or(hard, |m| (self.now + ms(m)).min(hard));
+                    self.grants.push(Grant { leg: leg.clone(), attempt, runner: runner.clone(), start: self.now, expected, hard, end: None });
+                    // One its runner refuses (W05-R02) never runs there.
+                    if let Some(n) = self.refusals.get_mut(&leg).filter(|n| **n > 0) {
+                        *n -= 1;
+                        self.ended(&leg, attempt);
+                        self.input(self.now, Input::Rejected { leg, fence });
+                        continue;
+                    }
                     let d = self.durations_on.get(&(leg.clone(), runner.clone())).or_else(|| self.durations.get(&leg)).copied().unwrap_or(60_000);
                     self.running.insert(leg.clone(), (runner, self.now, attempt));
                     self.at(self.now + d, Ev::Finish { leg, attempt });
@@ -236,6 +369,7 @@ impl Sim {
                         self.failures.remove(&leg);
                         let now = self.now;
                         if let Some((runner, start, _)) = self.running.remove(&leg) {
+                            self.ended(&leg, attempt);
                             if let Some(repo) = self.repos.get(&leg) {
                                 self.busy.push((repo.clone(), start, now));
                             }
@@ -272,7 +406,10 @@ impl Sim {
                 Command::Adopted { leg, from, outcome } => self.adopted.push((self.now, leg, from, outcome)),
                 // The attempt runs on where it was, and says it ended when it does (a CI leg
                 // runs to its end): the slot-time it takes there still counts.
-                Command::Lost { leg, attempt, runner, .. } => self.lost.push((self.now, leg, attempt, runner)),
+                Command::Lost { leg, attempt, runner, .. } => {
+                    self.ended(&leg, attempt);
+                    self.lost.push((self.now, leg, attempt, runner));
+                }
                 Command::Demand { leg, decision } => self.decisions.push((self.now, leg, decision.why())),
             }
         }

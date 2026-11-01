@@ -869,11 +869,12 @@ pub const REFUSED_AGAIN_MS: i64 = 15_000;
 /// A leg's timeout when its job says none (W05-R38): 360 minutes, GitHub's.
 pub const DEFAULT_TIMEOUT_MS: Ms = 360 * 60_000;
 
-/// A bug planted in the engine for the reference engine to catch (docs/needs.md E4.5): in tests
-/// only, on one thread at a time; the engine's own checks of what it breaks stand aside for it.
-#[cfg(test)]
+/// A bug planted in the engine for the reference engine (docs/needs.md E4.5) and kiln-sim's model
+/// (E4.6, the `mutants` feature) to catch: in tests only, on one thread at a time; the engine's own
+/// checks of what it breaks stand aside for it.
+#[cfg(any(test, feature = "mutants"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Mutant {
+pub enum Mutant {
     /// Room kept holds nothing back: a leg is granted where it would still run at the room's time
     /// without fitting beside it then (W05-R39).
     PastReservation,
@@ -881,13 +882,13 @@ pub(super) enum Mutant {
     GangInPart,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "mutants"))]
 thread_local! {
-    pub(super) static MUTANT: std::cell::Cell<Option<Mutant>> = const { std::cell::Cell::new(None) };
+    pub static MUTANT: std::cell::Cell<Option<Mutant>> = const { std::cell::Cell::new(None) };
 }
 
 /// The bug planted on this thread, if one is.
-#[cfg(test)]
+#[cfg(any(test, feature = "mutants"))]
 fn mutant() -> Option<Mutant> {
     MUTANT.with(std::cell::Cell::get)
 }
@@ -3727,7 +3728,7 @@ impl Scheduler {
         if k.holds(&l.input.id) || l.req.pool.is_some() || Due::of(&l.input, self.now).expected <= k.at {
             return true;
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "mutants"))]
         if mutant() == Some(Mutant::PastReservation) {
             return true;
         }
@@ -3873,7 +3874,7 @@ impl Scheduler {
             return false;
         }
         let Some(plan) = self.gang_plan(g) else { return false };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "mutants"))]
         let plan = {
             let mut plan = plan;
             if mutant() == Some(Mutant::GangInPart) && plan.len() > 1 {
@@ -4434,6 +4435,12 @@ impl Scheduler {
     /// The current wait reason of a leg, if it waits.
     pub fn reason(&self, id: &str) -> Option<&WaitReason> {
         self.legs.get(id).and_then(|l| l.reason.as_ref())
+    }
+
+    /// The legs room is kept for (W05-R39, R40), each with its runner and the room's time: what
+    /// the simulators measure G6 by.
+    pub fn kept_items(&self) -> Vec<(String, String, i64)> {
+        self.reserved.values().flat_map(|k| k.items.iter().map(move |(l, r)| (l.clone(), r.clone(), k.at))).collect()
     }
 
     /// The gang a leg is a member of (W05-R40), if it's one's: the dispatcher writes a gang's

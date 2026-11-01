@@ -117,7 +117,7 @@ workspace = true
 # The UI's wire types, rendered to ui/src/api/wire/ by `wire::ts` (test builds alone: the release
 # binary doesn't carry it).
 ts-rs = { version = "12.0.1", features = ["serde-json-impl", "no-serde-warnings"] }
-kiln-ci = { path = "../kiln-ci", features = ["ts"] }
+kiln-ci = { path = "../kiln-ci", features = ["ts", "mutants"] }
 kiln-cd = { path = "../kiln-cd", features = ["ts"] }
 kiln-sim = { path = "../kiln-sim" }
 tempfile = "3.27.0"

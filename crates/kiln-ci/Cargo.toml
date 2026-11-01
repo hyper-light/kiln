@@ -8,6 +8,9 @@ license.workspace = true
 [features]
 # TypeScript for the types kiln's UI reads (kiln's `wire::ts`).
 ts = ["dep:ts-rs"]
+# Bugs planted in the scheduler for kiln-sim's model to catch (docs/needs.md E4.6): kiln's test
+# builds alone turn it on.
+mutants = []
 
 [dependencies]
 # The UI's wire types (kiln's `wire::ts`, in its test builds alone).

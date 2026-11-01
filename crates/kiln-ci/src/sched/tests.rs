@@ -3145,3 +3145,97 @@ fn w05_r40_a_restart_rebuilds_a_gang_as_it_ran() {
     assert_eq!(["m0", "m1"].map(|m| s.grant(m).map(|g| g.0)), [Some(2); 2]);
     assert_eq!(s.check_grants(), Ok(()));
 }
+
+/// A stream of 1-CPU legs on the simulation's runners, one each `every` ms until `until`, each
+/// expected to take a minute (its p90) and taking from half a minute to a fifth past it, within its
+/// 10-minute timeout (docs/needs.md E4.6).
+fn stream(sim: &mut Sim, d: &mut Draw, every: usize, until: i64, cpus: impl Fn(&mut Draw) -> u64) {
+    for (i, t) in (0..until).step_by(every).enumerate() {
+        let ran = MIN / 2 + i64::try_from(d.below(42_000)).unwrap_or(0);
+        let n = cpus(d);
+        sim.leg(t, LegIn { timeout: u64::try_from(10 * MIN).ok(), ..asking(&format!("s{i}"), n, MIN) }, ran);
+    }
+}
+
+/// W05-AC17, docs/needs.md E4.6 (G6): a 12-CPU leg among a steady stream of 1-CPU legs on one
+/// 16-CPU runner, one every 4 s, each taking from half its p90 to a fifth past it: in each of 1,000
+/// seeds room is kept for it, and it starts by its bound, its room's first time plus how far the
+/// grants it waited for ran past their expected ends. Without backfilling it doesn't start within
+/// three hours, as E4's probe found.
+#[test]
+fn w05_ac17_a_12_cpu_leg_among_a_stream_of_1_cpu_legs_starts_by_its_bound() {
+    let run = |seed: u64, backfill: bool, until: i64| {
+        let mut d = Draw(seed);
+        let mut sim = Sim::new(backfilling(backfill));
+        sim.runner(0, sized("r", 16));
+        stream(&mut sim, &mut d, 4_000, until, |_| 1);
+        sim.leg(5 * MIN, LegIn { timeout: u64::try_from(60 * MIN).ok(), ..asking("big", 12, 10 * MIN) }, 10 * MIN);
+        sim.run(until);
+        sim
+    };
+    let mut late = Vec::new();
+    for seed in 0..1000 {
+        let sim = run(seed, true, 20 * MIN);
+        match sim.held.iter().find(|h| h.leg == "big" && h.started.is_some()) {
+            Some(h) if h.started <= h.bound => {}
+            other => late.push((seed, other.cloned())),
+        }
+    }
+    assert!(late.is_empty(), "{} of 1,000 seeds didn't start by their bound; the first: {:?}", late.len(), late.first());
+    for seed in 0..3 {
+        assert_eq!(run(seed, false, 3 * 60 * MIN).started("big"), None, "seed {seed} without backfilling");
+    }
+}
+
+/// W05-AC18, docs/needs.md E4.6 (G4): a gang of three 4-CPU members among competing 1- and 2-CPU
+/// legs on three or four runners of 4 or 8 CPUs, a member refused by its runner in a third of the
+/// seeds and a runner lost (and back two minutes later) in a third: in each of 1,000 seeds no grant
+/// takes part of the gang; and room kept for it that stood until it started saw it start by its
+/// bound (that room's time where nothing it waited for ran over). Room that went (a take-back, a
+/// runner lost, room worked out again once a grant ran past its expected end) starts the bound
+/// again from the next.
+#[test]
+fn w05_ac18_a_gang_of_three_never_starts_in_part() {
+    use super::state::Gang;
+    let (mut in_part, mut late, mut kept, mut started, mut refused, mut lost) = (Vec::new(), Vec::new(), 0, 0, 0, 0);
+    for seed in 0..1000 {
+        let mut d = Draw(seed);
+        let mut sim = Sim::new(backfilling(true));
+        let runners: Vec<RunnerIn> = (0..3 + d.below(2)).map(|i| sized(&format!("r{i}"), 4 + 4 * d.below(2))).collect();
+        for r in &runners {
+            sim.runner(0, r.clone());
+        }
+        stream(&mut sim, &mut d, 10_000, 30 * MIN, |d| 1 + d.below(2));
+        for m in 0..3 {
+            sim.leg(2 * MIN, LegIn { gang: Some(Gang { id: "sim".into(), size: 3 }), timeout: u64::try_from(60 * MIN).ok(), ..asking(&format!("m{m}"), 4, 5 * MIN) }, 5 * MIN);
+        }
+        if d.below(3) == 0 {
+            refused += 1;
+            sim.refuse(&format!("m{}", d.below(3)), 1);
+        }
+        if d.below(3) == 0
+            && let Some(r) = runners.get(usize::try_from(d.below(runners.len() as u64)).unwrap_or(0))
+        {
+            lost += 1;
+            let at = 2 * MIN + i64::try_from(d.below(10 * 60_000)).unwrap_or(0);
+            sim.input(at, Input::RunnerLost { runner: r.id.clone() });
+            sim.runner(at + 2 * MIN, r.clone());
+        }
+        sim.run(90 * MIN);
+        in_part.extend(sim.in_part.iter().map(|x| (seed, x.clone())));
+        for h in sim.held.iter().filter(|h| h.leg.starts_with('m')) {
+            kept += 1;
+            if let (Some(s), Some(b)) = (h.started, h.bound) {
+                started += 1;
+                if s > b {
+                    late.push((seed, h.clone()));
+                }
+            }
+        }
+        assert!(["m0", "m1", "m2"].iter().all(|m| sim.started(m).is_some()), "seed {seed}: the gang never started");
+    }
+    assert!(in_part.is_empty(), "{} grants took part of the gang; the first: {:?}", in_part.len(), in_part.first());
+    assert!(late.is_empty(), "{} members started past their bound; the first: {:?}", late.len(), late.first());
+    eprintln!("w05_ac18: room kept for the gang's members {kept} times, {started} of them starting from it; {refused} seeds with a refusal, {lost} with a runner lost");
+    assert!(kept > 0 && started > 0 && refused > 0 && lost > 0, "kept {kept}, started {started}, refused {refused}, lost {lost}");
+}
