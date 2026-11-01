@@ -50,6 +50,9 @@ reaching a process it isn't for.
   hand-on of what it made names the images its token pushed to kiln's registry. A walk from an
   artifact or an image goes back through every hop. A tarball changed on its way is refused before
   the leg runs, and the break recorded.
+- The custody simulation (`sim::custody`, step 15): things handed on through relays that drop,
+  change, swap and replay what they carry, under kiln-sim's nemesis, walked by kiln-ci's custody
+  core: no chain with a break walks as unbroken, and each of three planted bugs is found.
 - Between machines (step 12, so far): docs/ci.md W27 lists every path where one machine takes
   something from another. A runner's object from a peer's cache is handed on by the peer and
   received by the runner that fetched it, each signing; a copy changed on its way is refused, and

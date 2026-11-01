@@ -9680,8 +9680,17 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
   `w27_ac05_the_transfers_model_finds_each_planted_bug` (an act check by machine, a word passed on
   applied unchecked, a resume that keeps the epoch it leaves, a release only on the copy's own
   announcement, no addressee check: each found by a seed that passes without it) and
-  `w27_ac05_a_transfers_seed_replays_exactly`. Nightly: `.kiln/custody-lab.yaml`, and the transfers
-  model's 20,000 seeds in `.kiln/sim.yaml`. To production (step 14): kiln-ci's
+  `w27_ac05_a_transfers_seed_replays_exactly`. Simulation (the Transfers plan's step 15, W27-R08):
+  `sim::custody::tests::w27_r08_no_broken_chain_walks_as_unbroken` (docs/sim.md's custody model:
+  things handed on directly and through one or two relays, under kiln-sim's nemesis, the relays
+  dropping, changing, swapping and replaying what they carry and losing their own records, each
+  taker checking what came against its giver's hand-on, through kiln-ci's hop, walk and gaps: over
+  its 200 seeds, no chain with a break walked as unbroken, nothing used other than what its giver
+  handed on, nothing a relay passed on unseen, and once the world calms every thing handed on used
+  and walking unbroken), `w27_r08_the_custody_model_finds_each_planted_bug` (a relay that doesn't
+  number its records, a hop that doesn't check the digest, a walk that skips a hop: each found by a
+  seed that passes without it) and `w27_r08_a_custody_seed_replays_exactly`. Nightly:
+  `.kiln/custody-lab.yaml`, and the transfers and custody models' 20,000 seeds in `.kiln/sim.yaml`. To production (step 14): kiln-ci's
   `w27_r08_a_deploy_walks_from_the_land_to_its_pods` (a multi-platform image built from the land,
   through kiln's registry, CD, the cluster and two nodes, amd64 and arm64, each pod its platform's
   manifest: unbroken through the resolution; a pod swapped to another image broken at its receipt),
