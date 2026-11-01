@@ -3,7 +3,8 @@
 //! only where the repository lets agents fix code from agents' feedback, its switch on its page in
 //! Repos, off until turned on; and then only until agents have started [`FIXES_PER_THREAD`] fixes
 //! in one thread since a person last spoke there, so two agents can't keep each other going. An
-//! agent's own words never go back to it. Every input is passed in; each refusal says why.
+//! agent's own words never go back to it, and an agent that has ended is sent nothing. Every input
+//! is passed in; each refusal says why.
 
 /// Who said it, as review keeps principals: `user:kim` (a person, by any of their tokens),
 /// `agent:<session>` (an agent), `job:<leg>` (a CI job).
@@ -29,6 +30,10 @@ impl Speaker {
 
 /// Agent-started fixes one thread takes before it waits for a person.
 pub const FIXES_PER_THREAD: u32 = 3;
+
+/// Why a version exists when it answers threads and an agent pushed it (docs/ci.md W26-R04): an
+/// agent's fix, its thread the first it answers.
+pub const AGENT_FIX: &str = "agent's fix";
 
 /// What's known as a comment on an agent's change comes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,20 +80,30 @@ pub enum Route {
     Hold(Why),
 }
 
-/// Whether `h`'s comment reaches its change's agent.
+/// Whether `h`'s comment reaches its change's agent. Agents' words with the switch off go nowhere
+/// whether or not the agent runs: starting it again wouldn't send them.
 pub fn route(h: Heard) -> Route {
+    let agents = h.speaker != Speaker::Person;
     if h.own {
-        return Route::Hold(Why::Own);
+        Route::Hold(Why::Own)
+    } else if agents && !h.agents_fix {
+        Route::Hold(Why::Switch)
+    } else if !h.runs {
+        Route::Hold(Why::Ended)
+    } else if agents && h.fixes >= FIXES_PER_THREAD {
+        Route::Hold(Why::Bound)
+    } else {
+        Route::Tell
     }
-    if !h.runs {
-        return Route::Hold(Why::Ended);
-    }
-    match h.speaker {
-        Speaker::Person => Route::Tell,
-        Speaker::Agent | Speaker::Job if !h.agents_fix => Route::Hold(Why::Switch),
-        Speaker::Agent | Speaker::Job if h.fixes >= FIXES_PER_THREAD => Route::Hold(Why::Bound),
-        Speaker::Agent | Speaker::Job => Route::Tell,
-    }
+}
+
+/// Fixes agents' feedback has started in a thread since a person last spoke there: of `fixes` (when
+/// each version was made whose why is an agent's fix answering the thread), those made at or after
+/// the newest of `said` (each of its comments' principal and when) a person wrote. Every fix counts
+/// while no person has spoken; one made the second a person spoke counts.
+pub fn fixes_since_a_person(said: &[(&str, i64)], fixes: &[i64]) -> u32 {
+    let since = said.iter().filter(|(p, _)| Speaker::of(p) == Speaker::Person).map(|(_, at)| *at).max();
+    u32::try_from(fixes.iter().filter(|at| since.is_none_or(|s| **at >= s)).count()).unwrap_or(u32::MAX)
 }
 
 #[cfg(test)]
@@ -132,5 +147,26 @@ mod tests {
         assert_eq!(route(Heard { own: true, ..heard("agent:01a19c0f@box-a", true, 0) }), Route::Hold(Why::Own));
         assert_eq!(route(Heard { runs: false, ..heard("user:kim", true, 0) }), Route::Hold(Why::Ended));
         assert_eq!(route(Heard { runs: false, ..heard("agent:01a19c0f@box-a", true, 0) }), Route::Hold(Why::Ended));
+    }
+
+    /// W26-AC10: with the switch off, agents' words go nowhere for the switch, not for an ended
+    /// agent (starting it again wouldn't send them); with it on, an ended agent holds them.
+    #[test]
+    fn w26_ac10_the_switch_comes_before_an_ended_agent() {
+        assert_eq!(route(Heard { runs: false, ..heard("agent:01a19c0f@box-a", false, 0) }), Route::Hold(Why::Switch));
+        assert_eq!(route(Heard { runs: false, ..heard("job:lint", false, 0) }), Route::Hold(Why::Switch));
+        assert_eq!(route(Heard { runs: false, ..heard("agent:01a19c0f@box-a", true, FIXES_PER_THREAD) }), Route::Hold(Why::Ended));
+    }
+
+    /// W26-AC10's bound, counted: agents' fixes in a thread since a person last spoke there, a fix
+    /// the same second counting; with no person in it, every fix counts.
+    #[test]
+    fn w26_ac10_a_person_starts_the_threads_count_again() {
+        let said = [("agent:review@box-a", 10), ("user:kim", 20), ("agent:review@box-a", 30)];
+        assert_eq!(fixes_since_a_person(&said, &[15, 25, 35]), 2);
+        assert_eq!(fixes_since_a_person(&said, &[20]), 1, "made the second kim spoke");
+        assert_eq!(fixes_since_a_person(&[("agent:review@box-a", 1), ("job:lint", 2)], &[3, 4, 5]), 3);
+        assert_eq!(fixes_since_a_person(&[("pat:01ab of user:kim", 50)], &[10, 20]), 0, "a person's token is the person");
+        assert_eq!(route(heard("agent:review@box-a", true, fixes_since_a_person(&said, &[25, 35, 45]))), Route::Hold(Why::Bound));
     }
 }

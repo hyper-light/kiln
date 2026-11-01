@@ -202,6 +202,10 @@ export interface Thread {
   resolved_by?: string | null;
   resolved_at?: number | null;
   resolution?: string | null;
+  /** The version that fixed it (W26-R18): the first that answers it. */
+  fixed_in?: number | null;
+  /** Open, after agents started their fixes in it since a person spoke there: it waits for a person, and says why. */
+  waits?: string | null;
 }
 
 /** The gate (W26-R11) as it stands for you approving: a blocking thread or a conflict holds it, open issues warn, open nits inform. */

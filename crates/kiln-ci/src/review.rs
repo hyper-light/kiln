@@ -126,7 +126,8 @@ pub fn title_and_summary(message: &str) -> (String, String) {
 /// A push's options (`git push -o …`): `draft`, `ready`, `reviewer=ada,agent:review`
 /// (repeatable), `message=…` (a note on the new versions), `topic=…`, `title=…` (a change
 /// request's), `change=<sha>:<D41|new>` (repeatable: which change a commit is, when kiln asked,
-/// W26-R03); unknown ones are said back.
+/// W26-R03), `answer=<thread>` (repeatable: a thread the new version answers, W26-R18); unknown ones
+/// are said back.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Options {
     pub draft: bool,
@@ -138,6 +139,8 @@ pub struct Options {
     pub title: Option<String>,
     /// Answers to kiln's questions of which change a commit is.
     pub answers: Vec<crate::identity::Answer>,
+    /// The threads the new version answers: a fix of theirs, an agent's when an agent pushed it.
+    pub threads: Vec<String>,
     pub unknown: Vec<String>,
 }
 
@@ -154,6 +157,13 @@ pub fn options<S: AsRef<str>>(given: &[S]) -> Options {
             ("topic", Some(v)) if !v.is_empty() => o.topic = Some(v.to_owned()),
             ("title", Some(v)) if !v.is_empty() => o.title = Some(v.to_owned()),
             ("change", Some(v)) if crate::identity::answer(v).is_some() => o.answers.extend(crate::identity::answer(v)),
+            ("answer", Some(v)) if !v.is_empty() => {
+                for t in v.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+                    if !o.threads.iter().any(|x| x == t) {
+                        o.threads.push(t.to_owned());
+                    }
+                }
+            }
             _ => o.unknown.push(opt.to_owned()),
         }
     }
@@ -780,6 +790,15 @@ mod tests {
         // W26-R03: answers to which change a commit is.
         use crate::identity::{Answer, Choice};
         assert_eq!(o.answers, [Answer { commit: "abc1234".into(), choice: Choice::Change("D41".into()) }, Answer { commit: "def5678".into(), choice: Choice::New }]);
+    }
+
+    /// W26-R18: a push names the threads its new version answers, each once, in the order given.
+    #[test]
+    fn w26_r18_a_push_names_the_threads_it_answers() {
+        let o = options(&["answer=th1", "answer=th2, th3", "answer=th1", "answer="]);
+        assert_eq!(o.threads, ["th1", "th2", "th3"]);
+        assert_eq!(o.unknown, ["answer="]);
+        assert!(options(&["draft"]).threads.is_empty());
     }
 
     fn commit(sha: &str, parent: &str, id: &str, title: &str, patch: &str) -> Commit {

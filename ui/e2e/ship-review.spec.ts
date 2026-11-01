@@ -47,6 +47,14 @@ test("an agent's reply reads as the agent for its person, and each seal says who
   expect(a?.height).toBe(s?.height);
 });
 
+test("a thread a version answered says which version fixed it, as a suggestion says it was applied (W26-R18)", async ({ page }) => {
+  const row = await open(page, "pipeline: dynamic matrices");
+  // kim's thread on the whole change, resolved once v2 answered it (the mock's t4).
+  const done = row.locator(".rv-thread[data-done='1']", { hasText: "fixed in v2" });
+  await expect(done).toHaveCount(1);
+  await expect(done.locator(".rv-done")).toHaveText(/^\d+ · resolved.* · fixed in v2$/);
+});
+
 test("nothing in Files or the Conversation scrolls sideways but a comment's code, which keeps each line on one line, at every width (W21-AC01)", async ({ page }) => {
   const row = await open(page, "pipeline: dynamic matrices");
   await expect(row.locator(".md-code-body").first()).toBeVisible();

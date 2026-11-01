@@ -287,6 +287,25 @@ function EditBody({ body, busy, onSave, onCancel }: { body: string; busy: boolea
  * The thread: its comments, then Reply and Resolve aligned under the last, or the composer while
  * its reply is written. A resolved thread folds to one line ("3 · resolved by kim") with Reopen.
  */
+/** What came of an open thread (W26-R18): the version that fixed it, as a suggestion says it was
+ * applied; or, once agents started their fixes in it since a person spoke there, that it waits for
+ * a person, the whole why in its title. At the end of the thread's buttons, so nothing moves. */
+export function ThreadFix({ t }: { t: Pick<Thread, "fixed_in" | "waits"> }) {
+  if (t.waits)
+    return (
+      <span className="rv-fix" data-waits="1" title={t.waits}>
+        waits for a person
+      </span>
+    );
+  if (t.fixed_in == null) return null;
+  return (
+    <span className="rv-fix md-applied">
+      <Check size={13} aria-hidden="true" />
+      fixed in v{t.fixed_in}
+    </span>
+  );
+}
+
 export const ThreadView = React.memo(
   function ThreadView({
     t,
@@ -319,6 +338,7 @@ export const ThreadView = React.memo(
             <Check size={13} aria-hidden="true" />
             <span>
               {t.comments.length} · resolved{t.resolved_by ? ` by ${whoSaid(t.resolved_by)}` : ""}
+              {t.fixed_in != null ? ` · fixed in v${t.fixed_in}` : ""}
             </span>
           </span>
           {ops.kiln && (
@@ -375,6 +395,7 @@ export const ThreadView = React.memo(
                 <span>Resolve</span>
               </button>
             )}
+            <ThreadFix t={t} />
           </div>
         )}
       </div>

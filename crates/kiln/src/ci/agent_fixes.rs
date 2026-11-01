@@ -37,6 +37,29 @@ pub async fn on(hub: &Hub, repo_id: &str) -> bool {
     of(hub, repo_id).await.0
 }
 
+/// The switch of the repository named `repo` (`owner/name`), as [`of`] answers it.
+pub async fn of_named(hub: &Hub, repo: &str) -> (bool, Option<(String, i64)>) {
+    let name = repo.to_owned();
+    let row = hub
+        .store
+        .call(move |c| {
+            Ok(c.query_row("SELECT f.agents_fix, f.set_by, f.set_at FROM review_agent_fixes f JOIN repos r ON r.id = f.repo_id WHERE r.name = ?1", [&name], |r| Ok((r.get::<_, bool>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))
+                .optional()?)
+        })
+        .await
+        .ok()
+        .flatten();
+    row.map_or((false, None), |(on, by, at)| (on, Some((by, at))))
+}
+
+/// Who set a switch and when, in words: `turned on by ada, 31 Oct 2026`.
+pub fn set_words(on: bool, set: Option<&(String, i64)>) -> String {
+    let state = if on { "on" } else { "off" };
+    let Some((by, at)) = set else { return format!("{state} until someone turns it on") };
+    let day = time::OffsetDateTime::from_unix_timestamp(*at).ok().and_then(|t| t.format(&time::macros::format_description!("[day padding:none] [month repr:short] [year]")).ok());
+    format!("turned {state} by {}{}", kiln_ci::review::named(by), day.map(|d| format!(", {d}")).unwrap_or_default())
+}
+
 /// `GET` or `PUT /api/repos/:repo/agent-fixes` (`{agents_fix}`): the switch, who set it and when,
 /// what it does, and whether the caller may change it (`diffs.land` on the repository). A change is
 /// audited.

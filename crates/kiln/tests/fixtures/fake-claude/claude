@@ -17,7 +17,11 @@ they come, a turn under way or not; user messages wait their turn. Each message'
 Code's are, so a second turn's lines are new events, not the first's again. It calls no model and
 reads no account. With FAKE_CLAUDE_ACT set, each user message's text is given to that program (on
 its stdin, in the session's folder) before the turn's lines, as an agent would act on it (the
-conflict ladder's tests, docs/ci.md W26-R17).
+conflict ladder's tests, docs/ci.md W26-R17). When that program leaves `.fake-claude-edited` in the
+folder (paths in it, one a line, each file's text before in `.fake-claude-before/<path>` unless it's
+new), the turn says it edited them, an Edit and its result with the file as it was, as Claude Code
+says an edit, so kiln counts what changed there as the agent's (an agent's change, docs/ci.md
+W26-R18); both are removed.
 """
 import json
 import os
@@ -141,6 +145,22 @@ def main():
         if command is not None:
             out({"type": "command_lifecycle", "command_uuid": command, "state": "started", "uuid": str(uuid.uuid4()), "session_id": session})
         out({"type": "system", "subtype": "init", "cwd": os.getcwd(), "session_id": session, "tools": [], "mcp_servers": [], "model": "claude-opus-5-5", "permissionMode": "default", "claude_code_version": VERSION})
+        edited = os.path.join(os.getcwd(), ".fake-claude-edited")
+        if os.path.exists(edited):
+            with open(edited) as f:
+                paths = [line.strip() for line in f if line.strip()]
+            os.remove(edited)
+            for i, rel in enumerate(paths):
+                full = os.path.join(os.getcwd(), rel)
+                kept = os.path.join(os.getcwd(), ".fake-claude-before", rel)
+                before = None
+                if os.path.exists(kept):
+                    with open(kept) as f:
+                        before = f.read()
+                    os.remove(kept)
+                tool = f"toolu_{os.getpid()}_{turn}_{i}"
+                out({"type": "assistant", "message": {"id": f"msg_{os.getpid()}_{turn}_edit{i}", "type": "message", "role": "assistant", "model": "claude-opus-5-5", "content": [{"type": "tool_use", "id": tool, "name": "Edit", "input": {"file_path": full, "old_string": "", "new_string": "", "replace_all": False}}], "stop_reason": None, "usage": {"input_tokens": 1, "output_tokens": 1}}, "parent_tool_use_id": None, "session_id": session})
+                out({"type": "user", "message": {"role": "user", "content": [{"tool_use_id": tool, "type": "tool_result", "content": "edited"}]}, "tool_use_result": {"filePath": full, "originalFile": before}, "parent_tool_use_id": None, "session_id": session})
         if turn == 1 and GO and "--resume" not in args:
             while not os.path.exists(GO):
                 time.sleep(0.05)

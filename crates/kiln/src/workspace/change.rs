@@ -98,6 +98,27 @@ pub struct Want {
     pub trunk: Option<String>,
     /// Failing checks go to the agent (default: yes).
     pub fix_checks: Option<bool>,
+    /// The threads of its change a new version answers (W26-R18): an agent's fix of theirs.
+    pub answers: Option<Vec<String>>,
+}
+
+impl Want {
+    /// The push options a new version in kiln's own review carries, after `%` in its ref (none:
+    /// no `%`): `draft`, and `answer=<thread>` for each thread it answers. A thread is named by its
+    /// id: letters, digits, `-` and `_`.
+    pub fn ref_options(&self) -> Result<String, Fail> {
+        let mut opts: Vec<String> = Vec::new();
+        if self.draft {
+            opts.push("draft".to_owned());
+        }
+        for t in self.answers.iter().flatten().map(|t| t.trim()).filter(|t| !t.is_empty()) {
+            if !t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+                return Err(fail(StatusCode::BAD_REQUEST, format!("`answers`: {t:?} isn't a thread's id (letters, digits, - and _)")));
+            }
+            opts.push(format!("answer={t}"));
+        }
+        Ok(if opts.is_empty() { String::new() } else { format!("%{}", opts.join(",")) })
+    }
 }
 
 /// Agent `agent`'s change request, if it has one.
@@ -301,6 +322,7 @@ pub async fn open(hub: &Arc<Hub>, actor: &str, info: &Info, want: Want) -> Resul
     }
     message.push_str(&format!("\n\nKiln-Agent: {} ({}, {})\n", info.name, info.kind, info.id));
     let opener = hub.store.kv_get(crate::mcp::opener_key(&info.id)).await.ok().flatten().unwrap_or_else(|| "owner".to_owned());
+    let ref_options = want.ref_options()?;
     // Where it goes, and as whom.
     let (to, to_ref, bearer, token_id) = if native {
         let Some((repo, _)) = &found else { return Err(fail(StatusCode::INTERNAL_SERVER_ERROR, "no repository")) };
@@ -310,8 +332,7 @@ pub async fn open(hub: &Arc<Hub>, actor: &str, info: &Info, want: Want) -> Resul
             .await
             .map_err(|e| fail(StatusCode::FORBIDDEN, format!("an agent token for {}: {e:#}", info.name)))?;
         let url = format!("{}/git/{}.git", hub.cfg.server.public_url.trim_end_matches('/'), repo.name);
-        let draft = if want.draft { "%draft" } else { "" };
-        (url, format!("refs/for/{trunk}/branch/{branch}{draft}"), Some(token), Some(id))
+        (url, format!("refs/for/{trunk}/branch/{branch}{ref_options}"), Some(token), Some(id))
     } else {
         let remote = match &found {
             Some((_, name)) => name.clone(),

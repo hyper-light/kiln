@@ -704,7 +704,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "agents.change",
-            summary: "Open a change request from an agent's work (yours, or an agent's you started), or push a new version of the one it has: the files it changed, committed on its folder's last commit as `agents/<what it's about>-<id>` (the folder's branch, index and working tree untouched) and pushed for review, its author the agent, for its person. Into kiln's own review for a repository kiln hosts; as a pull request for one on GitHub, GitLab or Bitbucket (the branch pushed, and the request opened when kiln has an integration there, else a link to open it). Comments, requested changes, failing checks (with `fix_checks`) and the land queue then come back to the agent as messages. `title` (else what the agent is about), `body`, `draft`, `trunk` (else the repository's default).",
+            summary: "Open a change request from an agent's work (yours, or an agent's you started), or push a new version of the one it has: the files it changed, committed on its folder's last commit as `agents/<what it's about>-<id>` (the folder's branch, index and working tree untouched) and pushed for review, its author the agent, for its person. Into kiln's own review for a repository kiln hosts; as a pull request for one on GitHub, GitLab or Bitbucket (the branch pushed, and the request opened when kiln has an integration there, else a link to open it). Comments, requested changes, failing checks (with `fix_checks`) and the land queue then come back to the agent as messages. `title` (else what the agent is about), `body`, `draft`, `trunk` (else the repository's default), `answers` (the threads a new version answers, in kiln's own review).",
             read_only: false,
             destructive: false,
             input: Input::of::<input::AgentsChange>(),
@@ -970,6 +970,9 @@ pub mod input {
         pub trunk: Option<String>,
         /// Failing checks go to the agent to fix (the default).
         pub fix_checks: Option<bool>,
+        /// The threads of its change this new version answers (kiln's own review, by their ids):
+        /// the version is an agent's fix of theirs, and each says which version fixed it.
+        pub answers: Option<Vec<String>>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]

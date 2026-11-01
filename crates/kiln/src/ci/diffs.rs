@@ -601,10 +601,12 @@ pub async fn submit(hub: &Arc<Hub>, s: Submission<'_>) -> Result<Vec<Outcome>, S
                     (_, None) => anyhow::bail!("a diff that was there isn't"),
                 };
                 if kind != "unchanged" {
+                    // The threads of its own it answers (`-o answer=`, W26-R18).
+                    let (why, thread, note) = answering(&tx, &diff_id, &opts.threads, author_kind == "agent", opts.message.clone())?;
                     tx.execute(
-                        "INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, patch_id, message, note, rebase_only, pushed_by, created_at, started_by)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                        params![diff_id, n, p.sha, p.parent, base, patch_id, message, opts.message, rebase_only, pushed_by, now, by_text],
+                        "INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, patch_id, message, note, rebase_only, pushed_by, created_at, started_by, why, thread)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                        params![diff_id, n, p.sha, p.parent, base, patch_id, message, note, rebase_only, pushed_by, now, by_text, why, thread],
                     )?;
                     let draft: String = tx.query_row("SELECT state FROM diffs WHERE id = ?1", [&diff_id], |r| r.get(0))?;
                     let labels = label_names(&tx, &diff_id)?;
@@ -1080,6 +1082,32 @@ pub async fn find(hub: &Hub, key: &str) -> anyhow::Result<Option<Diff>> {
             Ok(c.query_row(&sql, params![key, number, kind], diff_row).optional()?)
         })
         .await
+}
+
+/// What a new version of diff `diff_id` answers (W26-R18), of the threads its push named (`-o
+/// answer=`): those that are `diff_id`'s own. With any, it names the first (`thread`), its why is an
+/// agent's fix when an agent pushed it, and its note lists them all (`answers th1, th2`) after the
+/// push's own note: `(why, thread, note)`.
+pub(crate) fn answering(c: &rusqlite::Connection, diff_id: &str, threads: &[String], by_agent: bool, note: Option<String>) -> rusqlite::Result<(Option<&'static str>, Option<String>, Option<String>)> {
+    let mut mine: Vec<&str> = Vec::new();
+    for t in threads {
+        if c.query_row("SELECT EXISTS (SELECT 1 FROM review_threads WHERE id = ?1 AND diff_id = ?2)", params![t, diff_id], |r| r.get::<_, bool>(0))? {
+            mine.push(t);
+        }
+    }
+    let Some(first) = mine.first().map(|t| (*t).to_owned()) else { return Ok((None, None, note)) };
+    let listed = format!("answers {}", mine.join(", "));
+    let note = match note.filter(|n| !n.trim().is_empty()) {
+        Some(n) => format!("{n}\n{listed}"),
+        None => listed,
+    };
+    Ok((by_agent.then_some(kiln_ci::review::agents::AGENT_FIX), Some(first), Some(note)))
+}
+
+/// Whether a version answers thread `thread` (W26-R18), by its `first` thread and its `note`: it
+/// names it first, or its note lists it.
+pub(crate) fn answers(first: Option<&str>, note: Option<&str>, thread: &str) -> bool {
+    first == Some(thread) || note.is_some_and(|n| n.lines().filter_map(|l| l.strip_prefix("answers ")).any(|ts| ts.split(", ").any(|t| t == thread)))
 }
 
 pub(crate) async fn versions(hub: &Hub, d: &Diff) -> anyhow::Result<Vec<Version>> {

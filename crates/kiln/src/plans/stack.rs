@@ -595,6 +595,13 @@ pub async fn amend(hub: &Arc<Hub>, actor: &str, info: &Info, want: &Want, run: &
             _ => None,
         })
         .collect();
+    // The threads it answers (W26-R18) ride on the push of the stack's top: kiln marks the version
+    // of the diff each is on.
+    let answers = Want { draft: false, ..want.clone() }.ref_options()?;
+    let refs: Vec<Option<String>> = match (st.provider.as_str(), answers.strip_prefix('%')) {
+        ("kiln", Some(more)) => refs.into_iter().map(|r| r.map(|r| if r.contains('%') { format!("{r},{more}") } else { format!("{r}%{more}") })).collect(),
+        _ => refs,
+    };
     let opener = hub.store.kv_get(crate::mcp::opener_key(&info.id)).await.ok().flatten().unwrap_or_else(|| "owner".to_owned());
     let minted = if st.provider == "kiln" { Some(token(hub, &st, &info.id, &opener).await.map_err(|m| (StatusCode::FORBIDDEN, m))?) } else { None };
     let ask = Ask::Restack(Restack {

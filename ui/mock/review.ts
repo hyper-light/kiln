@@ -515,6 +515,9 @@ interface MockThread {
   kind?: "question" | "nit" | "issue" | "blocking";
   resolved_by?: string | null;
   resolved_at?: number | null;
+  /** The version that fixed it, and whether it waits for a person (W26-R18). */
+  fixed_in?: number | null;
+  waits?: string | null;
   comments: MockComment[];
 }
 
@@ -624,6 +627,7 @@ const threads: MockThread[] = [
     state: "resolved",
     created_by: "user:kim",
     created_at: now() - 90000,
+    fixed_in: 2,
     comments: [{ id: "c5", author: "user:kim", body: "Could this land after D40's outputs? It reads them.", suggestion: null, created_at: now() - 90000, published: true }],
   },
   {
@@ -754,6 +758,8 @@ function threadsOf(d: MockDiff) {
       resolved_by: t.resolved_by ?? null,
       resolved_at: t.resolved_at ?? null,
       resolution: null,
+      fixed_in: t.fixed_in ?? null,
+      waits: t.waits ?? null,
       comments: t.comments
         .filter((c) => c.published || c.author === ME)
         .map((c) => ({

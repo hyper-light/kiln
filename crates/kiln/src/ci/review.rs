@@ -102,7 +102,12 @@ pub async fn threads(hub: &Hub, d: &Diff, viewer: &str) -> Result<Vec<Value>, Fa
     let signed = signatures(hub, d).await?;
     let agents = agents_of(hub, comments.iter().map(|c| c.2.as_str())).await;
     let mut by: HashMap<String, Vec<Value>> = HashMap::new();
+    // Who spoke in each thread and when, of what's published: what agents' fixes there count from.
+    let mut said: HashMap<String, Vec<(String, i64)>> = HashMap::new();
     for (cid, tid, author, body, suggestion, at, published, deleted) in comments {
+        if published {
+            said.entry(tid.clone()).or_default().push((author.clone(), at));
+        }
         // Its suggestions (W26-R10): its body's blocks, then the old field, each saying which
         // revision applied it.
         let made = applied.get(&cid);
@@ -114,14 +119,14 @@ pub async fn threads(hub: &Hub, d: &Diff, viewer: &str) -> Result<Vec<Value>, Fa
         // whoever gave it, an agent as the agent for its person.
         let signer = signed.get(&cid);
         let identity = signer.and_then(|(uri, _)| kiln_ci::identity::chain::Identity::parse(uri).ok());
-        let (mut name, newest) = agents.get(author.split(' ').next().unwrap_or(&author)).cloned().unwrap_or_default();
-        // A signed agent's identity names its whole session: its name, when the principal alone
-        // found none.
-        if name.is_none()
-            && let Some(kiln_ci::identity::chain::Actor::Agent { agent, .. }) = identity.as_ref().map(|i| &i.actor)
-        {
-            name = hub.harness.info(agent).map(|i| i.name).filter(|n| !n.trim().is_empty());
-        }
+        let (found, newest) = agents.get(author.split(' ').next().unwrap_or(&author)).cloned().unwrap_or_default();
+        // A signed agent's identity names its whole session: its name first, as a principal names
+        // only its id's start, which agents begun within a minute on one runner share.
+        let signed_name = match identity.as_ref().map(|i| &i.actor) {
+            Some(kiln_ci::identity::chain::Actor::Agent { agent, .. }) => hub.harness.info(agent).map(|i| i.name).filter(|n| !n.trim().is_empty()),
+            _ => None,
+        };
+        let name = signed_name.or(found);
         let line = kiln_ci::review::byline(&author, name.as_deref(), identity.as_ref(), newest.as_ref());
         let seal = signer.map(|(uri, taken)| json!({ "by": uri, "who": line.words(), "at": taken }));
         by.entry(tid).or_default().push(json!({ "id": cid, "author": author, "by": line, "signed": seal, "body": body, "suggestion": suggestion, "created_at": at, "draft": !published, "deleted": deleted, "suggestions": suggests }));
@@ -143,10 +148,17 @@ pub async fn threads(hub: &Hub, d: &Diff, viewer: &str) -> Result<Vec<Value>, Fa
                 o.insert("outdated".into(), json!(outdated));
             }
         }
+        // The version that fixed it (W26-R18): the first that answers it. While it's open, it waits
+        // for a person once agents have started their fixes in it since a person spoke there.
+        let fixed_in = versions.iter().find(|v| super::diffs::answers(v.thread.as_deref(), v.note.as_deref(), &tid)).map(|v| v.n);
+        let fixes: Vec<i64> = versions.iter().filter(|v| v.why.as_deref() == Some(kiln_ci::review::agents::AGENT_FIX) && super::diffs::answers(v.thread.as_deref(), v.note.as_deref(), &tid)).map(|v| v.created_at).collect();
+        let spoke: Vec<(&str, i64)> = said.get(&tid).into_iter().flatten().map(|(p, at)| (p.as_str(), *at)).collect();
+        let waits = (state == "open" && kiln_ci::review::agents::fixes_since_a_person(&spoke, &fixes) >= kiln_ci::review::agents::FIXES_PER_THREAD).then(|| kiln_ci::review::agents::Why::Bound.words());
         out.push(json!({
             "id": tid, "version": version, "file": file, "side": side, "start_line": start, "end_line": end, "state": state, "created_by": created_by, "created_at": at,
             "outdated": now.is_none(), "now": now.unwrap_or(Value::Null), "comments": list,
             "kind": Kind::read(&kind).as_str(), "resolved_by": resolved_by, "resolved_at": resolved_at, "resolution": resolution,
+            "fixed_in": fixed_in, "waits": waits,
         }));
     }
     Ok(out)

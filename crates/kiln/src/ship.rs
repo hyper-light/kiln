@@ -224,6 +224,8 @@ struct HandoffRec {
     what: String,
     to: String,
     version: Option<u32>,
+    /// Why kiln handed it, or held it (W26-R18); none for a person's.
+    why: Option<String>,
 }
 
 /// An open thread on a change: its kind, where it is, who opened it and its first words.
@@ -641,12 +643,15 @@ fn load_pull(c: &rusqlite::Connection, repo_id: &str, host: &str, number: i64, n
 /// version's head stands superseded; a change request's other commits, and an abandoned change's,
 /// carry none.
 /// The review of the change `ch` on its commit `sha`; `handed`, its threads or conflicts handed to
-/// its author's agent at this revision (W26-R18), which reads fixing while the revision is live.
-fn review_of(ch: &ChangeRec, sha: &str, handed: Option<&HandoffRec>) -> Option<Review> {
+/// its author's agent at this revision (W26-R18), which reads fixing while the revision is live;
+/// `held`, agents' feedback kiln kept from its ended agent at this revision, whose why the review
+/// says.
+fn review_of(ch: &ChangeRec, sha: &str, handed: Option<&HandoffRec>, held: Option<&HandoffRec>) -> Option<Review> {
     if !ch.head || ch.state == "abandoned" {
         return None;
     }
     let handed = handed.filter(|_| sha == ch.tip());
+    let held = held.filter(|_| sha == ch.tip()).and_then(|h| h.why.clone());
     let mut ev: Vec<(i64, u8, turn::Event)> = Vec::new();
     ev.extend(ch.reviewers.iter().map(|(w, at)| (*at, 0, turn::Event::Asked(w.clone()))));
     ev.extend(ch.pushes.iter().filter(|(v, _, _)| *v > 1).map(|(_, rebase_only, at)| (*at, 1, turn::Event::Pushed { rebase_only: *rebase_only })));
@@ -698,6 +703,12 @@ fn review_of(ch: &ChangeRec, sha: &str, handed: Option<&HandoffRec>) -> Option<R
         Standing::Approved => ReviewState::Approved,
     };
     let said = |t: &ThreadRec| format!("{}: {}", shown(&t.by), first_words(&t.said));
+    // What its agent was handed: the file in conflict, or whose thread (how many, when several).
+    let handed_about = || match (handed.map(|h| h.what.as_str()), ch.threads.as_slice()) {
+        (Some("conflicts"), _) => ch.conflicts.first().map(|k| kiln_ci::review::place(Some(&k.file), k.line)).unwrap_or_else(|| "its conflicts".to_string()),
+        (_, [one]) => format!("{}'s thread", shown(&one.by)),
+        (_, many) => format!("{} threads", many.len()),
+    };
     let about = match state {
         ReviewState::Blocked => ch.threads.iter().rev().find(|t| Kind::read(&t.kind) == Kind::Blocking).map(|t| match (&t.file, t.line) {
             (Some(f), Some(l)) => format!("{}:{l}", f.rsplit('/').next().unwrap_or(f)),
@@ -707,15 +718,14 @@ fn review_of(ch: &ChangeRec, sha: &str, handed: Option<&HandoffRec>) -> Option<R
         ReviewState::Changes => ch.reviews.iter().rev().find(|r| r.1 == "request_changes").map(|r| first_words(&r.3)),
         ReviewState::Conflict => ch.conflicts.first().map(|k| kiln_ci::review::place(Some(&k.file), k.line)),
         ReviewState::Requested => ch.threads.last().map(said),
-        // What its agent was handed: the file in conflict, or whose thread (how many, when several).
-        ReviewState::Fixing => Some(match (handed.map(|h| h.what.as_str()), ch.threads.as_slice()) {
-            (Some("conflicts"), _) => ch.conflicts.first().map(|k| kiln_ci::review::place(Some(&k.file), k.line)).unwrap_or_else(|| "its conflicts".to_string()),
-            (_, [one]) => format!("{}'s thread", shown(&one.by)),
-            (_, many) => format!("{} threads", many.len()),
-        }),
+        ReviewState::Fixing => Some(handed_about()),
+        // A draft stays a draft (W26-R02), and says who is at work on it (W26-AC10).
+        ReviewState::Draft => handed.map(|h| format!("{} fixing · {}", h.to, handed_about())),
         _ => None,
     }
     .unwrap_or_default();
+    // What kiln held, and why: the fix waits for a person (W26-R18).
+    let about = held.filter(|_| state != ReviewState::Fixing).unwrap_or(about);
     let tip = ch.tip();
     let superseded_by = (sha != tip).then(|| if ch.n < ch.latest { format!("v{}", ch.latest) } else { short(tip) });
     Some(Review { state, turn: whose, author, open, conflicts: gate.conflicts, fixing: handed.map(|h| h.to.clone()), about, superseded_by })
@@ -899,8 +909,8 @@ fn load_with(c: &rusqlite::Connection, ctx: &RepoCtx, sha: &str, first_row: i64)
     let mut st = c.prepare("SELECT tag_name FROM ci_releases WHERE repo_id = ?1 AND target_commitish = ?2 ORDER BY id")?;
     rec.tags = st.query_map(params![repo_id, sha], |r| r.get(0))?.collect::<Result<_, _>>()?;
     rec.change = load_change(c, &repo_id, &sha)?;
-    let mut st = c.prepare("SELECT what, to_name, version FROM ship_handoffs WHERE repo_id = ?1 AND sha = ?2 ORDER BY at, id")?;
-    rec.handoffs = st.query_map(params![repo_id, sha], |r| Ok(HandoffRec { what: r.get(0)?, to: r.get(1)?, version: r.get(2)? }))?.collect::<Result<_, _>>()?;
+    let mut st = c.prepare("SELECT what, to_name, version, why FROM ship_handoffs WHERE repo_id = ?1 AND sha = ?2 ORDER BY at, id")?;
+    rec.handoffs = st.query_map(params![repo_id, sha], |r| Ok(HandoffRec { what: r.get(0)?, to: r.get(1)?, version: r.get(2)?, why: r.get(3)? }))?.collect::<Result<_, _>>()?;
     Ok(rec)
 }
 
@@ -1034,8 +1044,13 @@ fn journey_of(rec: &Records, runners: &[RunnerSeen], now: i64) -> Journey {
 
     // Handed off (W26-R18): its failure to whoever took it; its review to its author's agent, at this revision.
     let handled_by = rec.handoffs.iter().rev().find(|h| h.what == "checks").map(|h| h.to.clone());
-    let handed = change.and_then(|ch| rec.handoffs.iter().rev().find(|h| h.what != "checks" && h.version.is_none_or(|v| v == ch.n)));
-    let review = change.and_then(|ch| review_of(ch, &rec.sha, handed));
+    // The newest at this revision counts: kiln holding agents' feedback for a person, or a hand-off.
+    let live = change.and_then(|ch| rec.handoffs.iter().rev().find(|h| h.what != "checks" && h.version.is_none_or(|v| v == ch.n)));
+    let (handed, held) = match live {
+        Some(h) if h.what == HELD => (None, Some(h)),
+        h => (h, None),
+    };
+    let review = change.and_then(|ch| review_of(ch, &rec.sha, handed, held));
     Journey { author, land, checks, build, staging, production, replant, in_production, handled_by, fixed_by: None, review }
 }
 
@@ -1993,6 +2008,32 @@ fn handed_text(rec: &Records, ch: &ChangeRec, conflicts: &[kiln_ci::review::Conf
     text
 }
 
+/// What kiln keeps, as a hand-off's `what`, when it holds agents' feedback for a person (W26-R18).
+pub const HELD: &str = "held";
+
+/// What kiln itself did with agents' feedback on a change (W26-R18), kept as Ship reads hand-offs:
+/// at revision `version` of the change, its commit `sha` in repository `repo` (its name or id), the change's
+/// threads handed to agent `agent` (`to`, its name; `what` `threads`), which reads fixing until the
+/// next revision, or held for a person (`what` [`HELD`]), which the item says; `why`, in words.
+/// Audited, as kiln's own doing.
+#[allow(clippy::too_many_arguments)]
+pub async fn kiln_kept(hub: &Hub, repo: &str, sha: &str, version: u32, what: &str, to: &str, agent: &str, why: &str) -> anyhow::Result<()> {
+    let (repo2, sha, what, to, agent, why2, at) = (repo.to_owned(), sha.to_owned(), what.to_owned(), to.to_owned(), agent.to_owned(), why.to_owned(), crate::util::now_unix());
+    let audit = format!("{repo}@{} {what} to {to}: {why}", short(&sha));
+    hub.store
+        .call(move |c| {
+            let repo_id: String = c.query_row("SELECT id FROM repos WHERE name = ?1 OR id = ?1", [&repo2], |r| r.get(0))?;
+            c.execute(
+                "INSERT INTO ship_handoffs (repo_id, sha, what, to_name, agent, incident, version, by, at, why) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, 'kiln', ?7, ?8)",
+                params![repo_id, sha, what, to, agent, version, at, why2],
+            )?;
+            Ok(())
+        })
+        .await?;
+    hub.store.audit("kiln".into(), "ship.hand_off".into(), audit).await;
+    Ok(())
+}
+
 /// Keeps a Hand off of `rec`'s commit, one row for each of `what` (W26-R18): to whom (`to`, its
 /// agent and the incident it opened), the change's revision for its review, by whom, now.
 #[allow(clippy::too_many_arguments)]
@@ -2922,6 +2963,36 @@ mod tests {
             cache.refresh(&store, &runners(), &[], now + FRESH_MS).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             let held = from_memory(&cache, Some(&sam));
             assert_eq!((stand_of(&held, "3333333"), stand_of(&held, "4141414")), (failing, fixing), "the hand-off's trigger brought them into memory");
+            Ok(())
+        })
+    }
+
+    /// W26-AC10: what kiln did with agents' feedback, as the item reads it. Held for a person (its
+    /// agent ended), the review says why at that revision, and the item doesn't read fixing; handed
+    /// by kiln after that, the newest counts and it reads the agent fixing.
+    #[test]
+    fn w26_ac10_agents_feedback_kiln_held_says_why_and_kilns_hand_off_reads_fixing() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = crate::store::Store::open(&dir.path().join("kiln.db"))?;
+        crate::rt::block_on(async move {
+            let sql = fixture() + &d41("agent:matrix");
+            store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            let now = NOW_S * 1000;
+            let sam: HashSet<String> = ["user:sam".to_string()].into();
+            let page = || {
+                let (store, sam) = (store.clone(), sam.clone());
+                async move { list_in(&store, &HashMap::new(), None, Some(&sam), runners(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m)) }
+            };
+            let sql = format!("INSERT INTO ship_handoffs (repo_id, sha, what, to_name, agent, incident, version, by, at, why) VALUES ('kiln', '{D41}', 'held', 'Matrix agent', 'matrix', NULL, 1, 'kiln', {NOW_S}, 'The fix waits for a person to start or resume Matrix agent');");
+            store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            assert_eq!(stand_of(&page().await?, "4141414"), row("needs_you", "The fix waits for a person to start or resume Matrix agent · 1 thread", &["hand_off", "review"]));
+            let sql = format!("INSERT INTO ship_handoffs (repo_id, sha, what, to_name, agent, incident, version, by, at, why) VALUES ('kiln', '{D41}', 'threads', 'Matrix agent', 'matrix', NULL, 1, 'kiln', {}, 'kiln/kiln lets agents fix code from agents'' feedback');", NOW_S + 1);
+            store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            assert_eq!(stand_of(&page().await?, "4141414"), row("checking", "Matrix agent fixing · kim's thread", &[]));
+            // A draft stays a draft (W26-R02), naming who is at work on it.
+            store.call(|c| Ok(c.execute("UPDATE diffs SET state = 'draft' WHERE id = 'd41'", []).map(|_| ())?)).await?;
+            let (stand, line, _) = stand_of(&page().await?, "4141414");
+            assert_eq!((stand.as_str(), line.as_str()), ("waiting", "Draft · Matrix agent fixing · kim's thread"));
             Ok(())
         })
     }

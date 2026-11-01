@@ -841,6 +841,14 @@
   align-items: center;
   padding: 8px 8px 8px 16px;
 }
+/* What came of an open thread (W26-R18): fixed in a version, or waiting for a person. */
+.rv-fix {
+  margin-left: auto;
+  font-size: 12px;
+}
+.rv-fix[data-waits] {
+  color: var(--color-warn);
+}
 .rv-done {
   display: inline-flex;
   gap: 6px;
