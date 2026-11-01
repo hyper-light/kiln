@@ -217,8 +217,9 @@ The channel makes up for what of these it carried, without waiting for a reconne
   terminal output) is sent again, and the receiver takes it once.
 - A closed connection resumes as every reconnect does (`Have`).
 - What each side has (`Have`) is said again every few seconds, the runner's with its samples and
-  the server's every 5 s. A lost one doesn't hold a link's sends up: a sender's sends wait for the
-  first, and it takes the ones after as answers only.
+  the server's every 5 s, and a runner's twice more in a link's first seconds, a second apart. A
+  lost one doesn't hold a link's sends up for long: a sender's sends wait for the first, and it
+  takes the ones after as answers only.
 
 What a runner's QUIC layer drops it tells the server with its samples (`NetDrops`), once that
 changes. The runner's page shows both sides' counts, and the server exports what each runner last
