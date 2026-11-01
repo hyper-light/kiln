@@ -16,6 +16,7 @@ import { Loadable } from "@/components/ui/loading";
 import { PageIntro, SelectField } from "@/components/ui/misc";
 import { Segmented } from "@/components/ui/tabs";
 import { useRes, type Res } from "@/lib/data";
+import { useFieldText } from "@/lib/hooks";
 import { Link } from "@/lib/router";
 import { cn } from "@/lib/utils";
 import { indexesRes } from "./indexes";
@@ -202,7 +203,7 @@ export function LogsExplorer({ kind }: { kind: keyof typeof KINDS }) {
         }
       />
       <ObserveNav />
-      <SearchForm key={q} initial={q} onSearch={setQ} placeholder={kind === "events" ? "service:kiln.ci status:error" : 'service:api status:error "connection refused"'} />
+      <SearchForm initial={q} onSearch={setQ} placeholder={kind === "events" ? "service:kiln.ci status:error" : 'service:api status:error "connection refused"'} />
       {kind === "logs" && rehydration ? (
         <Loadable key={`v/${rehydration}`} label="the rehydration" fallback={<Hold height={146} />}>
           <Historical id={rehydration} onPick={pick} body={body} />
@@ -289,7 +290,7 @@ function Historical({ id, onPick, body }: { id: string; onPick: (id: string) => 
 }
 
 export function SearchForm({ initial, onSearch, placeholder }: { initial: string; onSearch: (q: string) => void; placeholder: string }) {
-  const [draft, setDraft] = React.useState(initial);
+  const [draft, setDraft] = useFieldText(initial);
   return (
     <form
       className="mb-4 flex flex-wrap items-end gap-3"

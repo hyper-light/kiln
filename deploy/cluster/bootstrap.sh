@@ -291,6 +291,10 @@ start_cluster() {
     minikube -p "$PROFILE" addons enable metrics-server >/dev/null
     minikube -p "$PROFILE" addons enable storage-provisioner-rancher >/dev/null
     kc wait --for=condition=Ready nodes --all --timeout=300s >/dev/null
+    # minikube gives every kubelet the reservation above: each node's from its own container's size,
+    # for a node resized on its own (`docker update --memory`).
+    KILN_MINIKUBE_PROFILE="$PROFILE" KILN_SYSTEM_HEADROOM_KIB="$SYSTEM_HEADROOM_KIB" "$SCRIPT_DIR/size-nodes.sh" ||
+        warn "some nodes keep a reservation that isn't their size (above); run deploy/cluster/size-nodes.sh again later"
     # `standard` (hostpath) stays the default class; `local-path` is used explicitly for state
     # that must stay on one node (kiln data, git server, Prometheus TSDB).
     for _ in $(seq 1 30); do kc get storageclass local-path >/dev/null 2>&1 && break; sleep 2; done

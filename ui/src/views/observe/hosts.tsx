@@ -4,13 +4,13 @@
  * load, memory and disk, what reports it and its apps; found by a part of its name or by a tag,
  * sorted by any of its figures.
  */
-import * as React from "react";
 import { observeApi, type Host, type HostQuery } from "@/api/observe";
 import { TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { PageIntro, SelectField } from "@/components/ui/misc";
 import { useRes, type Res } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
+import { useFieldText } from "@/lib/hooks";
 import { Link } from "@/lib/router";
 import { ObserveNav, compact, useParam } from "./parts";
 
@@ -68,7 +68,7 @@ export default function Hosts() {
         lead="Every host that reports, from kiln's runners, Datadog's Agent and OpenTelemetry's resources: whether it is reporting, its CPU, I/O wait, load, memory and disk, and what reports it."
       />
       <ObserveNav />
-      <Search key={q} q={q} onQ={setQ} sort={sort} onSort={setSort} />
+      <Search q={q} onQ={setQ} sort={sort} onSort={setSort} />
       <Loadable key={`${q}/${sort}`} label="the hosts" fallback={<TableHold head={<Head />} rows={6} />}>
         <List q={q} sort={sort} />
       </Loadable>
@@ -77,7 +77,7 @@ export default function Hosts() {
 }
 
 function Search({ q, onQ, sort, onSort }: { q: string; onQ: (q: string) => void; sort: string; onSort: (s: string) => void }) {
-  const [text, setText] = React.useState(q);
+  const [text, setText] = useFieldText(q);
   return (
     <form
       className="mb-4 flex flex-wrap items-end gap-3"
