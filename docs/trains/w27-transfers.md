@@ -149,6 +149,9 @@ reaching a process it isn't for.
   enums (index 12), and `ASK_VARIANTS` and `SAY_VARIANTS` become 13; then
   `reach::wire`'s `w27_r08_custody_frames_are_appended_after_every_older_variant` names `Unread`
   as the variant `Custody` comes after.
+- **Merging main: `runner_ask`'s split.** main's `mcp::runner_ask` takes the ask both typed and as
+  it came (`ask: &Question, raw: &Value`). Step 13's `relays::Relays::placed` reads `passed_on` from
+  the ask's JSON, so it takes `raw`.
 - **Config:** nothing new in kiln.toml.
 - **First start:** the migrations add tables and indexes (`ci_leg_pushed` with step 11;
   `cd_custody_syncs`, `cd_custody_pods` and an index on `registry_manifests` with step 14's
