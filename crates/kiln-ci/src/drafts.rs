@@ -70,13 +70,14 @@ pub const GITHUB_READY: &str = "mutation($id: ID!) { markPullRequestReadyForRevi
 
 /// Why `event` starts no run of the workflow at `path` (W29-R10), or None: nothing runs on a
 /// draft's branch; and a draft diff doesn't run a workflow whose own file it changes, whatever
-/// its `drafts` says (a draft's own triggers don't count).
+/// its `drafts` says (a draft's own triggers don't count), in either dialect: its `pull_request`
+/// and its `diff` alike. `pull_request_target` runs the trunk's workflows, published ones.
 pub fn held_back(event: &crate::trigger::event::Event, path: &str) -> Option<&'static str> {
     if is_draft_ref(&event.git_ref) {
         return Some("it's a draft's branch: a draft runs only by its author's Run (W29-R10)");
     }
     let flag = event.payload.pointer("/kiln/diff/draft");
-    let draft = event.name == "diff" && (flag == Some(&serde_json::Value::Bool(true)) || flag.and_then(serde_json::Value::as_str) == Some("true"));
+    let draft = matches!(event.name.as_str(), "diff" | "pull_request") && (flag == Some(&serde_json::Value::Bool(true)) || flag.and_then(serde_json::Value::as_str) == Some("true"));
     if draft && event.changed.as_ref().is_some_and(|c| c.iter().any(|p| p == path)) {
         return Some("a draft diff doesn't run the workflow it drafts (W29-R10)");
     }
@@ -148,6 +149,11 @@ mod tests {
         assert!(held_back(&diff(true, &[".kiln/self.yaml"]), ".kiln/self.yaml").is_some(), "its own triggers don't count");
         assert_eq!(held_back(&diff(true, &[".kiln/self.yaml"]), ".kiln/watch.yaml"), None, "another workflow's `drafts: true` does");
         assert_eq!(held_back(&diff(false, &[".kiln/self.yaml"]), ".kiln/self.yaml"), None, "a diff that isn't a draft runs what it changes");
+        // GitHub's dialect hears the same draft diff as `pull_request`; `pull_request_target`
+        // runs the trunk's own, published workflows.
+        let named = |name: &str| Event { name: name.into(), ..diff(true, &[".github/workflows/ci.yml"]) };
+        assert!(held_back(&named("pull_request"), ".github/workflows/ci.yml").is_some());
+        assert_eq!(held_back(&named("pull_request_target"), ".github/workflows/ci.yml"), None);
         // Another repository's draft is refused; the draft's own repository may name it.
         assert!(uses_of_another("acme/kit/.github/actions/x@kiln/draft/x-1", "acme/app").is_some());
         assert!(uses_of_another("kiln://acme/kit/x@kiln/draft/x-1", "acme/app").is_some());

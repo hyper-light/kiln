@@ -486,23 +486,68 @@ fn kiln_with_ci() -> anyhow::Result<(Server, tempfile::TempDir)> {
     Ok((s, dir))
 }
 
-/// W29-R12: Ready asks for review. On kiln the draft diff leaves draft; on GitHub the draft's
-/// head is committed again asking to skip nothing, then GraphQL marks the pull request ready; the
-/// record says review, and Ready again is refused.
+/// The runs of `path` in `repo` that aren't its trunk's: a diff's.
+fn diff_runs(s: &Server, repo: &str, path: &str) -> anyhow::Result<usize> {
+    Ok(runs(s, repo)?.iter().filter(|r| at(r, "/workflow") == path && at(r, "/branch") != "main").count())
+}
+
+/// Until `path` has `n` runs of a diff in `repo`, and still has after 2 s: never more.
+fn exactly(s: &Server, repo: &str, path: &str, n: usize) -> anyhow::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while diff_runs(s, repo, path)? < n {
+        anyhow::ensure!(Instant::now() < deadline, "{path} has fewer than {n} runs of a diff: {:?}\n{}", runs(s, repo)?, s.log());
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(diff_runs(s, repo, path)?, n, "{path}: {:?}", runs(s, repo)?);
+    Ok(())
+}
+
+/// W29-R12: Ready asks for review. On kiln the draft diff leaves draft, and the workflow it drafts,
+/// held back while it was a draft in either dialect (W29-R10), starts once: a GitHub-dialect
+/// `pull_request` one as the synchronize the draft held back, a kiln-dialect `on: diff` one from
+/// the version's `diff` event. On GitHub the draft's head is committed again asking to skip
+/// nothing, then GraphQL marks the pull request ready. The record says review, and Ready again is
+/// refused.
 #[test]
 fn w29_r12_ready_asks_for_review() -> anyhow::Result<()> {
     let save = json!({ "repo": "acme/app", "path": ".github/workflows/ci.yml", "verb": "save_draft", "content": TRY_ONE, "title": "Try a matrix" });
     let ready = json!({ "repo": "acme/app", "path": ".github/workflows/ci.yml", "verb": "ready" });
 
-    let (s, _dir) = kiln_with_ci()?;
-    let (st, saved) = act(&s, &save)?;
+    // On kiln, a workflow the draft doesn't change runs on its diff: the diff's events came.
+    let (s, dir) = kiln_with_ci()?;
+    let (home, work) = (dir.path().join("githome"), dir.path().join("app"));
+    let watch = "name: watch\non: pull_request\njobs:\n  w:\n    runs-on: local\n    steps:\n      - run: echo watched\n";
+    push_files(&home, &work, "main", &[(".github/workflows/watch.yml", watch)])?;
+    let on_pr = "name: ci\non: pull_request\njobs:\n  build:\n    runs-on: local\n    steps:\n      - run: echo reviewed\n";
+    let (st, saved) = act(&s, &json!({ "repo": "acme/app", "path": ".github/workflows/ci.yml", "verb": "save_draft", "content": on_pr, "title": "Check pull requests" }))?;
     assert_eq!(st, 200, "{saved}");
     let name = at(&saved, "/draft/name").to_owned();
+    exactly(&s, "acme/app", ".github/workflows/watch.yml", 1)?;
+    assert_eq!(diff_runs(&s, "acme/app", ".github/workflows/ci.yml")?, 0, "held back while it's a draft");
     let (st, out) = act(&s, &ready)?;
     assert_eq!((st, at(&out, "/draft/state")), (200, "review"), "{out}");
     assert_eq!(at(&get(&s, &format!("/api/diffs/{name}"))?, "/state"), "needs-review");
+    exactly(&s, "acme/app", ".github/workflows/ci.yml", 1)?;
     let (st, again) = act(&s, &ready)?;
     assert_eq!(st, 409, "in review already: {again}");
+
+    // In kiln's dialect, the `on: diff` one: held while it's a draft, then once.
+    let dir = tempfile::tempdir()?;
+    let k = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", extra: "" })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let work = hosted(&k, &home, dir.path(), "acme/app")?;
+    let kiln_watch = "name: watch\non:\n  diff:\n    drafts: true\njobs:\n  w:\n    runs-on: local\n    steps:\n      - run: echo watched\n";
+    push_files(&home, &work, "main", &[(".kiln/watch.yaml", kiln_watch), (".kiln/ci.yaml", "name: ci\non: push\njobs:\n  b:\n    runs-on: local\n    steps:\n      - run: echo pushed\n")])?;
+    let on_diff = "name: ci\non: diff\njobs:\n  b:\n    runs-on: local\n    steps:\n      - run: echo reviewed\n";
+    let (st, saved) = act(&k, &json!({ "repo": "acme/app", "path": ".kiln/ci.yaml", "verb": "save_draft", "content": on_diff, "title": "Check diffs" }))?;
+    assert_eq!(st, 200, "{saved}");
+    exactly(&k, "acme/app", ".kiln/watch.yaml", 1)?;
+    assert_eq!(diff_runs(&k, "acme/app", ".kiln/ci.yaml")?, 0, "held back while it's a draft");
+    let (st, out) = act(&k, &json!({ "repo": "acme/app", "path": ".kiln/ci.yaml", "verb": "ready" }))?;
+    assert_eq!((st, at(&out, "/draft/state")), (200, "review"), "{out}");
+    exactly(&k, "acme/app", ".kiln/ci.yaml", 1)?;
 
     let g = on_github()?;
     let (st, saved) = act(&g.s, &save)?;

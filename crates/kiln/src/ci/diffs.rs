@@ -930,7 +930,18 @@ pub(crate) async fn activity(hub: &Hub, repo: &Repo, d: &Diff, action: &str, by:
     if !hub.ci.enabled() || by_job(by) {
         return Ok(());
     }
-    let Some(v) = versions(hub, d).await?.pop() else { return Ok(()) };
+    let Some((e, sha, _)) = activity_event(hub, repo, d, action, by, tweak).await? else { return Ok(()) };
+    let commit = super::load::load(hub, repo, &sha).await?;
+    for l in commit.workflows.iter().filter(|l| l.runs && (l.dialect == kiln_ci::expr::Dialect::Gha || hub.cfg.ci.kiln_workflows)) {
+        super::events::start(hub, repo, &e, l, &d.title, &d.author, Value::Null).await?;
+    }
+    target(hub, repo, &d.trunk, &e, &d.title, &d.author).await
+}
+
+/// [`activity`]'s event for `action`, and the commit of the diff's latest version it's at and that
+/// version's base; none before the diff has a version.
+async fn activity_event(hub: &Hub, repo: &Repo, d: &Diff, action: &str, by: &str, tweak: impl FnOnce(&mut serde_json::Map<String, Value>)) -> anyhow::Result<Option<(Event, String, String)>> {
+    let Some(v) = versions(hub, d).await?.pop() else { return Ok(None) };
     let ctx = super::events::facts(hub, repo).await.repo;
     let (title, summary) = (d.title.clone(), d.summary.clone());
     let f = Fresh { number: d.number, n: v.n, sha: v.commit.clone(), parent: v.parent.clone(), title, summary, message: String::new(), draft: d.state == "draft", rebase_only: v.rebase_only, branch: d.branch.clone(), labels: labels(hub, &d.id).await, started_by: v.started_by.clone() };
@@ -950,11 +961,33 @@ pub(crate) async fn activity(hub: &Hub, repo: &Repo, d: &Diff, action: &str, by:
     if let Some(p) = e.payload.as_object_mut() {
         tweak(p);
     }
-    let commit = super::load::load(hub, repo, &v.commit).await?;
-    for l in commit.workflows.iter().filter(|l| l.runs && (l.dialect == kiln_ci::expr::Dialect::Gha || hub.cfg.ci.kiln_workflows)) {
-        super::events::start(hub, repo, &e, l, &d.title, &d.author, Value::Null).await?;
+    Ok(Some((e, v.commit, v.base)))
+}
+
+/// What W29-R10 held back while `d` was a draft, started now that it's ready (docs/ci.md W29-R12):
+/// each workflow whose own file the diff changes, on its latest version, as the version's events
+/// would have started it (`pull_request`'s `synchronize`, kiln's `diff`). One whose `types` name
+/// `ready_for_review` has started from the ready event already: it doesn't start again.
+async fn held_back_runs(hub: &Hub, repo: &Repo, d: &Diff, by: &str) -> anyhow::Result<()> {
+    if !hub.ci.enabled() || by_job(by) {
+        return Ok(());
     }
-    target(hub, repo, &d.trunk, &e, &d.title, &d.author).await
+    let (Some((mut ready, sha, base)), Some((mut sync, _, _))) = (activity_event(hub, repo, d, "ready_for_review", by, |_| {}).await?, activity_event(hub, repo, d, "synchronize", by, |_| {}).await?) else { return Ok(()) };
+    // What the diff changes, as a version's push says it (`paths:` and the hold read it).
+    let changed = gitops::changed_files(hub, repo, &base, &sha).await.unwrap_or_default();
+    (ready.changed, sync.changed) = (Some(changed.clone()), Some(changed.clone()));
+    // kiln's own event for the version, beside GitHub's, as a version's push sends them.
+    let diff = Event { name: "diff".into(), action: String::new(), ..sync.clone() };
+    let commit = super::load::load(hub, repo, &sha).await?;
+    for l in commit.workflows.iter().filter(|l| l.runs && (l.dialect == kiln_ci::expr::Dialect::Gha || hub.cfg.ci.kiln_workflows) && changed.contains(&l.path)) {
+        if l.workflow.as_ref().is_some_and(|w| kiln_ci::trigger::matches(w, &ready).is_ok()) {
+            continue;
+        }
+        for e in [&sync, &diff] {
+            super::events::start(hub, repo, e, l, &d.title, &d.author, Value::Null).await?;
+        }
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------------ reads
@@ -1572,6 +1605,12 @@ async fn act(hub: &Hub, d: &Diff, action: &str, caller: &Caller) -> Result<Value
         let started = if event == "closed" { closed(hub, &repo, &now, false, &by).await } else { activity(hub, &repo, &now, event, &by, |_| {}).await };
         if let Err(e) = started {
             tracing::warn!(diff = %d.name, %event, error = %format!("{e:#}"), "its workflows didn't start");
+        }
+        if action == "ready"
+            && d.state == "draft"
+            && let Err(e) = held_back_runs(hub, &repo, &now, &by).await
+        {
+            tracing::warn!(diff = %d.name, error = %format!("{e:#}"), "what the draft held back didn't start");
         }
     }
     Ok(json!({ "diff": d.name, "state": to.as_str(), "author": author.unwrap_or_else(|| d.author.clone()) }))
