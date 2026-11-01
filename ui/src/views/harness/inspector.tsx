@@ -25,7 +25,7 @@ import { ChangeBar } from "./change-bar";
 import { Fold, FoldOpen } from "./fold";
 import { WorkspaceBar } from "./workspace-bar";
 import { SubagentOutput } from "./task-output";
-import { SessionChanges, inScope, useScope, type Sub } from "./changes";
+import { SessionChanges, inScope, useScope, type OwnSource, type Sub } from "./changes";
 
 const NO_EVENTS: HEvent[] = [];
 const NO_AGENTS: readonly AgentInfo[] = [];
@@ -73,7 +73,7 @@ function useSubs(tasks: readonly Task[] | undefined): readonly Sub[] {
   return kept.subs;
 }
 
-/** `events`: only its edits matter (the changeset is worked out from them when the server sends none). `agentId`: its change request goes above them, and `volumeOver`, the folder its workspace of its own is laid over. `self`: the agent's name, and `subs` its harness's subagents, for who changed each file. */
+/** `events`: only its edits matter (the changeset is worked out from them when the server sends none). `agentId`: its change request goes above them, and `volumeOver`, the folder its workspace of its own is laid over. `self`: the agent's name, and `subs` its harness's subagents, for who changed each file; `own`, where what one of them changed alone comes from. */
 export const Changes = React.memo(function Changes({
   events,
   changes,
@@ -82,6 +82,7 @@ export const Changes = React.memo(function Changes({
   volumeOver,
   self,
   subs,
+  own,
 }: {
   events: HEvent[];
   changes: ServerChange[] | null;
@@ -90,6 +91,7 @@ export const Changes = React.memo(function Changes({
   volumeOver?: string;
   self: string;
   subs: readonly Sub[];
+  own?: OwnSource;
 }) {
   const local = React.useMemo(() => (changes ? null : changesetOf(events)), [events, changes]);
   const files = React.useMemo(() => (changes ? fromServer(changes) : (local ?? [])), [changes, local]);
@@ -109,7 +111,7 @@ export const Changes = React.memo(function Changes({
           <ChangeBar agentId={agentId} />
         </Loadable>
       )}
-      <SessionChanges files={files} cwd={cwd} self={self} subs={subs} />
+      <SessionChanges files={files} cwd={cwd} self={self} subs={subs} own={own} />
     </div>
   );
 });
@@ -343,6 +345,12 @@ export function Inspector({
   // At work now: the goal under way shimmers.
   const working = useSession(store, (s) => s.info?.status === "running");
   const meta = useSession(store, (s) => s.meta);
+  // What one who changed its files did alone: its session answers, or its events show it edit by edit.
+  const answers = meta?.features.includes("own_edits") ?? false;
+  const own = React.useMemo<OwnSource>(
+    () => ({ id: store.id, answers, ask: (by) => store.request((client) => ({ type: "own_edits", client, by }), 8000), events: () => store.get().events }),
+    [store, answers],
+  );
   // What's worked out from the conversation stays as it was while it streams, unless it's what changed.
   const edits = useSameList(React.useMemo(() => (changes ? NO_EVENTS : editsOf(events)), [changes, events]));
   // What the Changes tab counts is what its scope shows: this project's files at first.
@@ -381,7 +389,7 @@ export function Inspector({
         {actions}
       </div>
       <div className="hx-inspector-body">
-        {tab === "changes" && <Changes events={edits} changes={changes} cwd={cwd} agentId={agentId} volumeOver={volumeOver} self={self} subs={subs} />}
+        {tab === "changes" && <Changes events={edits} changes={changes} cwd={cwd} agentId={agentId} volumeOver={volumeOver} self={self} subs={subs} own={own} />}
         {tab === "plan" && (
           <div className="in-secs">
             <PlanSourceContext.Provider value={agentId ? { session: agentId } : null}>

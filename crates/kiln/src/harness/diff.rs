@@ -290,26 +290,50 @@ const MAX_CHANGE_LINES: usize = 4_000;
 /// file). Returns the change (None: no net change) and, when the baseline had to be worked out
 /// from the file (`Baseline::Reverse`), the baseline found, to keep for later changes.
 pub fn file_change(job: &super::core::ChangeJob) -> (Option<super::model::FileChange>, Option<super::core::Baseline>) {
-    use super::core::Baseline;
-    let path = std::path::Path::new(&job.abs);
+    change_from(job, read_now(&job.abs))
+}
+
+/// A file as it is on disk now: None when there is none, `Err` when it's too large or not text.
+pub fn read_now(abs: &str) -> Option<Result<String, ()>> {
+    let path = std::path::Path::new(abs);
     let meta = std::fs::metadata(path).ok().filter(|m| m.is_file());
-    let now: Option<Result<String, ()>> = meta.map(|m| {
+    meta.map(|m| {
         if m.len() > MAX_FILE {
             return Err(());
         }
         std::fs::read(path).ok().and_then(|b| String::from_utf8(b).ok()).ok_or(())
-    });
+    })
+}
+
+/// How a file was before `hunks` were applied to it, given how it is now.
+fn reversed(now: Option<&Result<String, ()>>, hunks: &[Hunk]) -> super::core::Baseline {
+    use super::core::Baseline;
+    match now {
+        Some(Ok(text)) => reverse_apply(text, hunks).map_or(Baseline::TooLarge, Baseline::Text),
+        Some(Err(())) => Baseline::TooLarge,
+        // Gone already: what it was is what the patch removed.
+        None => Baseline::Text(hunks.iter().flat_map(|h| h.lines.iter()).filter_map(|l| l.strip_prefix('-').or_else(|| l.strip_prefix(' '))).map(|l| format!("{l}\n")).collect()),
+    }
+}
+
+fn change_from(job: &super::core::ChangeJob, now: Option<Result<String, ()>>) -> (Option<super::model::FileChange>, Option<super::core::Baseline>) {
+    use super::core::Baseline;
     if let Baseline::Reverse(hunks) = &job.baseline {
-        let resolved = match &now {
-            Some(Ok(text)) => reverse_apply(text, hunks).map_or(Baseline::TooLarge, Baseline::Text),
-            Some(Err(())) => Baseline::TooLarge,
-            // Gone already: what it was is what the patch removed.
-            None => Baseline::Text(hunks.iter().flat_map(|h| h.lines.iter()).filter_map(|l| l.strip_prefix('-').or_else(|| l.strip_prefix(' '))).map(|l| format!("{l}\n")).collect()),
-        };
-        let job = super::core::ChangeJob { abs: job.abs.clone(), rel: job.rel.clone(), baseline: resolved.clone() };
+        let resolved = reversed(now.as_ref(), hunks);
+        let job = super::core::ChangeJob { abs: job.abs.clone(), rel: job.rel.clone(), baseline: resolved.clone(), turn: None };
         return (compare(&job, now), Some(resolved));
     }
     (compare(job, now), None)
+}
+
+/// What a change job found ([`placed_change`]): the file's change (None: no net change), and how
+/// it was where that had to be worked out from the file as it is: before the session (its
+/// baseline), and as its newest turn began (`ChangeJob::turn`, by its number).
+#[derive(Debug, Default)]
+pub struct Found {
+    pub change: Option<super::model::FileChange>,
+    pub baseline: Option<super::core::Baseline>,
+    pub turn: Option<(usize, super::core::Baseline)>,
 }
 
 /// [`file_change`], the change placed in its working tree when that's one of the repository of
@@ -317,8 +341,10 @@ pub fn file_change(job: &super::core::ChangeJob) -> (Option<super::model::FileCh
 /// git names it. Its other files keep the path the harness gave. And whose it is
 /// (`super::whose`): `folders` are those the session has worked in, `roots` the machine's.
 /// Blocking.
-pub fn placed_change(job: &super::core::ChangeJob, home: &str, folders: &[String], roots: &super::whose::Roots) -> (Option<super::model::FileChange>, Option<super::core::Baseline>) {
-    let (mut change, resolved) = file_change(job);
+pub fn placed_change(job: &super::core::ChangeJob, home: &str, folders: &[String], roots: &super::whose::Roots) -> Found {
+    let now = read_now(&job.abs);
+    let turn = job.turn.as_ref().map(|(n, hunks)| (*n, reversed(now.as_ref(), hunks)));
+    let (mut change, baseline) = change_from(job, now);
     if let Some(c) = change.as_mut() {
         let abs = std::path::Path::new(&job.abs);
         if !home.is_empty()
@@ -330,7 +356,55 @@ pub fn placed_change(job: &super::core::ChangeJob, home: &str, folders: &[String
         let project = super::whose::in_project(abs, c.tree.is_some(), folders, &roots.home);
         c.place = Some(super::whose::place_of(abs, project, roots));
     }
-    (change, resolved)
+    Found { change, baseline, turn }
+}
+
+/// What `ask.by` did alone to files another changed too (`Command::OwnEdits`), as its reply says
+/// it: `{"by", "files": [{"path", "tree", "edits": [FileChange, one a turn], "kept": true}]}`, a
+/// file whose turns aren't all known `"kept": false` and why (`"cap"`, `"unknown"`): the panel
+/// shows its edits one by one from its events. `read` reads a file as it is now (the disk, off the
+/// event loop).
+pub fn own_edits(ask: &super::core::OwnAsk, read: impl Fn(&str) -> Option<Result<String, ()>>) -> serde_json::Value {
+    use super::core::{After, Baseline, Began};
+    let base = |b: &Began| match b {
+        Began::Absent => Baseline::Absent,
+        Began::Text(t) => Baseline::Text(t.to_string()),
+        _ => Baseline::TooLarge,
+    };
+    let as_now = |b: &Began| match b {
+        Began::Absent => None,
+        Began::Text(t) => Some(Ok(t.to_string())),
+        _ => Some(Err(())),
+    };
+    let files: Vec<serde_json::Value> = ask
+        .files
+        .iter()
+        .map(|f| {
+            let turns = match &f.turns {
+                Ok(turns) => turns,
+                Err(why) => return serde_json::json!({"path": f.change.path, "tree": f.change.tree, "kept": false, "why": why}),
+            };
+            let edits: Vec<super::model::FileChange> = turns
+                .iter()
+                .filter_map(|(before, after)| {
+                    let now = match after {
+                        After::Next(b) => as_now(b),
+                        After::Now => read(&f.abs),
+                    };
+                    let job = super::core::ChangeJob { abs: f.abs.clone(), rel: f.change.path.clone(), baseline: base(before), turn: None };
+                    // Too large to keep as it began (or ended): changed, its lines not shown (`compare`'s blank).
+                    let mut c = compare(&job, now)?;
+                    c.tree.clone_from(&f.change.tree);
+                    c.place = f.change.place;
+                    c.by = vec![ask.by.clone()];
+                    c.at = f.change.at;
+                    Some(c)
+                })
+                .collect();
+            serde_json::json!({"path": f.change.path, "tree": f.change.tree, "edits": edits, "kept": true})
+        })
+        .collect();
+    serde_json::json!({"by": ask.by, "files": files})
 }
 
 fn compare(job: &super::core::ChangeJob, now: Option<Result<String, ()>>) -> Option<super::model::FileChange> {
@@ -498,7 +572,7 @@ mod tests {
         let f = dir.path().join("a.txt");
         let abs = f.to_string_lossy().into_owned();
         std::fs::write(&f, "one\ntwo\nthree\n")?;
-        let job = |b: Baseline| ChangeJob { abs: abs.clone(), rel: "a.txt".into(), baseline: b };
+        let job = |b: Baseline| ChangeJob { abs: abs.clone(), rel: "a.txt".into(), baseline: b, turn: None };
         // Edited twice since the baseline: one change, counted once.
         let c = file_change(&job(Baseline::Text("one\n2\nthree\n".into()))).0.ok_or_else(|| anyhow::anyhow!("no change"))?;
         assert_eq!((c.added, c.removed, c.created, c.deleted), (1, 1, false, false));
@@ -517,6 +591,23 @@ mod tests {
         let c = file_change(&job(Baseline::Text("x\ny\n".into()))).0.ok_or_else(|| anyhow::anyhow!("no change"))?;
         assert!(c.deleted && c.removed == 2);
         assert!(file_change(&job(Baseline::Absent)).0.is_none());
+        Ok(())
+    }
+
+    /// A turn begun by a harness that reports patches (Codex's) is worked out by its change job:
+    /// the file as the job finds it, the patch undone (the Changes panel plan 01a194444b1d, step 3).
+    #[test]
+    fn a_patch_harness_turn_is_worked_out_from_the_file_by_its_change_job() -> anyhow::Result<()> {
+        use super::super::core::{Baseline, ChangeJob};
+        let dir = tempfile::tempdir()?;
+        let f = dir.path().join("a.txt");
+        let abs = f.to_string_lossy().into_owned();
+        std::fs::write(&f, "one\nTWO\nthree\n")?;
+        let patch = parse_unified("--- a/a.txt\n+++ b/a.txt\n@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n");
+        let job = ChangeJob { abs, rel: "a.txt".into(), baseline: Baseline::Text("one\ntwo\nthree\n".into()), turn: Some((1, patch)) };
+        let found = placed_change(&job, "", &[], &super::super::whose::Roots::here(&[]));
+        assert_eq!(found.turn, Some((1, Baseline::Text("one\ntwo\nthree\n".into()))));
+        assert_eq!(found.change.map(|c| (c.added, c.removed)), Some((1, 1)));
         Ok(())
     }
 }

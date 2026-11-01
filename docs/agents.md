@@ -845,7 +845,8 @@ agents"). Its head says what's shown, a row each, each choice in a menu:
 - **Scope**: Project at first, then User, then All (see "Who changed a file, and whose it is"). The
   browser keeps the choice.
 - **By**: everyone, the agent itself, or one of its harness's subagents, each with how many of the
-  files at that scope it changed. Narrowed to one, a file someone else changed too says who.
+  files at that scope it changed. Narrowed to one, a file someone else changed too shows only their
+  part and says who else changed it (see "One subagent's own edits").
 
 The head's last row carries what's shown in all (`+added −removed`), and Sort (by path, latest change,
 most changed, new, changed or deleted, or who changed it) sits at its right. Its files are a flat
@@ -878,6 +879,29 @@ changed it and whose it is, for the Changes tab's By and Scope:
 A file with neither (from a runner older than these) is read as this project's. The state's
 `files_changed`, `lines_added` and `lines_removed` (the tab's count, Mission control's) count this
 project's files only; the rest stay in the changeset, for the scope that shows them.
+
+## One subagent's own edits
+
+Narrowed to one who changed its files (By), the Changes tab shows each file as they changed it alone.
+A file only they changed shows the session's change to it. A file someone else changed too shows
+their part, and the line under it names who else changed it:
+
+- **What's kept.** The session's core keeps, for each file, who changed it in turn, and how the file
+  was as each turn began: the session's baseline for the first, then how the next one found it, as
+  its harness said before its edit (Claude Code's `originalFile`; Codex's patch, undone from the
+  file by its change job; an ACP agent's old text). One's part is each of their turns, from how they
+  found the file to how the next one did, or to how it is now for the latest. Taken in turns, one
+  after another, that's their edits alone; one who came back to it after another shows each of their
+  turns, edit by edit. An in-place upgrade keeps it all (`Frozen`).
+- **How it's asked for.** The panel asks on the session's stream (`own_edits {client, by}`) and the
+  session answers that client alone (`reply`), as file suggestions are answered, so the stream itself
+  doesn't grow: `{by, files: [{path, tree, kept: true, edits: [one FileChange a turn]}]}`, worked out
+  off the event loop. Sessions whose features have `own_edits` answer, whatever their harness.
+- **The cap.** The session keeps 64 MiB of files as turns began at them at most (the baselines
+  aside), and 256 turns a file. Past it, or where its harness didn't say how it found a file (a shell
+  command changed it), or where the runner started again since, a file's answer is `kept: false` with
+  why (`cap`, `unknown`): the panel then shows their edits one by one from the conversation's events,
+  and says so under them. It does the same for a runner that doesn't answer, saying that.
 
 ## Change requests from agents
 

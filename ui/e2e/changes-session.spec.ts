@@ -89,8 +89,8 @@ test("By narrows to one who changed them; a file someone else changed too says s
   await expect(files(page)).toHaveCount(3);
   await expect(page.locator(".cx-file", { hasText: "mod.rs" }).locator(".cx-by")).toHaveText("also changed by Release prep");
   await expect(page.locator(".cx-file", { hasText: "plans.md" }).first().locator(".cx-by")).toHaveText("Plan the planner goal");
-  // The head's total is what it shows.
-  await expect(page.locator(".cx-total .hx-stat")).toHaveText(/\+7/);
+  // The head's total is what it shows: of mod.rs, which the agent changed too, only the planner's part (step 3).
+  await expect(page.locator(".cx-total .hx-stat")).toHaveText(/\+6/);
   await pick(page, "By", /^Everyone/);
   await pick(page, "Scope", /^Project/);
   await expect(files(page)).toHaveCount(4);
@@ -136,4 +136,52 @@ test("opening and closing Scope, By and Sort moves nothing on the page", async (
     await expect(page.getByRole("menu")).toBeHidden();
     expect(await boxes(), `${name} closed`).toEqual(before);
   }
+});
+
+/** Its added and removed lines, as the diff below the list shows them. */
+const changed = (page: Page) =>
+  page
+    .locator(".hx-changes > .hx-stack .hx-row[data-kind=add] .hx-code, .hx-changes > .hx-stack .hx-row[data-kind=del] .hx-code")
+    .evaluateAll((els) => els.map((e) => `${e.closest(".hx-row")?.getAttribute("data-kind") === "add" ? "+" : "-"}${e.textContent ?? ""}`));
+
+test("narrowed to one who changed it, a file another changed too shows only their part, or their edits one by one", async ({ page }) => {
+  test.skip(REAL, "the mock's agents");
+  await open(page);
+  // The planner added a line to mod.rs after the agent changed another: its part is its line alone.
+  await pick(page, "By", /^Plan the planner goal/);
+  const mod = page.locator(".cx-file", { hasText: "mod.rs" });
+  // Asked of its session: the session's numbers, dimmed, till its answer comes.
+  await expect(mod).toHaveAttribute("data-pending", "true");
+  await expect(mod.locator(".hx-stat")).toHaveText("+1−0");
+  await expect(mod).not.toHaveAttribute("data-pending");
+  await expect(mod.locator(".cx-by")).toHaveText("also changed by Release prep");
+  await mod.click();
+  await expect.poll(() => changed(page)).toEqual(["+pub mod ready;"]);
+  await mod.click();
+  // The agent itself: its own line of mod.rs, and of quic.rs its one line after the optimizer's.
+  await pick(page, "By", /^Release prep/);
+  await expect(mod.locator(".hx-stat")).toHaveText("+1−1");
+  const quic = page.locator(".cx-file", { hasText: "quic.rs" });
+  await expect(quic.locator(".hx-stat")).toHaveText("+1−0");
+  await quic.click();
+  await expect.poll(() => changed(page)).toEqual(["+    send.finish()?;"]);
+  await quic.click();
+  // The optimizer's part of quic.rs is past what the session keeps: its edits one by one, from the conversation, and it says so.
+  await pick(page, "By", /^Plan the API optimization goal/);
+  await expect(quic.locator(".hx-stat")).toHaveText("+3−2");
+  await quic.click();
+  await expect(page.locator(".hx-changes > .hx-stack")).toContainText("Its edits one by one: this session keeps no more copies to compare them by (64 MiB at most).");
+  await expect
+    .poll(() => changed(page))
+    .toEqual([
+      "-    let stream = conn.open_bi().await?;",
+      "-    stream.write_all(&req).await?;",
+      "+    let (mut send, recv) = conn.open_bi().await?;",
+      "+    send.write_all(&req).await?;",
+      "+    read_answer(recv).await",
+    ]);
+  // Everyone: the session's change, whole.
+  await quic.click();
+  await pick(page, "By", /^Everyone/);
+  await expect(quic.locator(".hx-stat")).toHaveText("+4−2");
 });

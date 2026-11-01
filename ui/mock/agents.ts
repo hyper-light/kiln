@@ -378,6 +378,30 @@ for (const m of [
       false,
       kiln("research_add"),
     ),
+    // Its edit of quic.rs, which the agent changed after it: shown one by one where its part isn't kept (OWN).
+    call("toolu_opt", now - 7 * 60_000, "Edit", "edit", "crates/kiln/src/http/quic.rs", { file_path: "/home/ada/src/kiln/crates/kiln/src/http/quic.rs" }, false, {
+      diffs: [
+        {
+          path: "crates/kiln/src/http/quic.rs",
+          hunks: [
+            {
+              old_start: 120,
+              old_lines: 3,
+              new_start: 120,
+              new_lines: 4,
+              lines: [
+                "     let conn = endpoint.connect(addr)?;",
+                "-    let stream = conn.open_bi().await?;",
+                "-    stream.write_all(&req).await?;",
+                "+    let (mut send, recv) = conn.open_bi().await?;",
+                "+    send.write_all(&req).await?;",
+                "+    read_answer(recv).await",
+              ],
+            },
+          ],
+        },
+      ],
+    }),
     call("toolu_opt", now - 6 * 60_000, "Bash", "shell", "ssh fedora 'cd ~/src/amphora && ./bench/run.sh s3-put'", { command: "ssh fedora 'cd ~/src/amphora && ./bench/run.sh s3-put'" }, false, {
       status: "error",
       exit_code: 255,
@@ -1033,7 +1057,7 @@ const META: Meta = {
   models: [],
   commands: [{ name: "btw", description: "Ask a side question without interrupting", hint: "<question>", group: "Session", args: "required", route: { kind: "prompt" } }],
   agents: [],
-  features: ["interrupt", "set_mode", "steer"],
+  features: ["interrupt", "set_mode", "steer", "own_edits"],
 };
 
 /** How a person's message reaches one of its subagents, as its harness lets one in (harness/subagent.rs): a Codex one on its own thread, a Claude Code one by way of its agent (not once stopped). */
@@ -1106,7 +1130,7 @@ export function handleFamilySession(ws: WebSocket, id: string): boolean {
   viewers.set(id, seen.add(ws));
   ws.on("close", () => seen.delete(ws));
   ws.on("message", (raw) => {
-    type Cmd = { type?: string; task?: string; id?: string; text?: string; mode?: string; index?: number };
+    type Cmd = { type?: string; task?: string; id?: string; text?: string; mode?: string; index?: number; client?: string; by?: string };
     let frame: Cmd & { t?: string; c?: Cmd };
     try {
       frame = JSON.parse(raw.toString()) as typeof frame;
@@ -1121,6 +1145,10 @@ export function handleFamilySession(ws: WebSocket, id: string): boolean {
     if (c.type === "stop_task" && c.task) setTimeout(() => stopTask(m, c.task ?? ""), 700);
     if (c.type === "send" && c.task && c.text) tellSubagent(m, c.task, c.id ?? `sub-${Date.now()}`, c.text, c.mode ?? "queue");
     if (c.type?.startsWith("queue_")) subagentQueue(m, c);
+    // What one who changed its files did alone, as its session keeps it (docs/agents.md, "One subagent's own edits").
+    // Its machine takes a moment, as a runner's round trip does: the panel shows the session's numbers dimmed till then.
+    const ask = c.type === "own_edits" && c.client && c.by ? { client: c.client, by: c.by } : null;
+    if (ask) setTimeout(() => send({ t: "reply", client: ask.client, value: { by: ask.by, files: OWN[id]?.[ask.by] ?? [] } }), 1500);
     if (under) send({ t: "ack", id: under, outcome: "taken" });
   });
   send({ t: "open", info: m.info });
@@ -1175,7 +1203,7 @@ const CHANGESETS: Record<string, unknown[]> = {
           old_lines: 2,
           new_start: 3,
           new_lines: 3,
-          lines: [" pub mod planner;", "-pub mod order;", "+pub mod order;", "+pub mod ready;"],
+          lines: [" pub mod planner;", "-pub mod order;", "+pub(crate) mod order;", "+pub mod ready;"],
         },
       ],
       by: ["main", "toolu_planner"],
@@ -1222,7 +1250,7 @@ const CHANGESETS: Record<string, unknown[]> = {
           ],
         },
       ],
-      by: ["toolu_opt"],
+      by: ["toolu_opt", "main"],
       place: "project",
     },
     {
@@ -1324,6 +1352,68 @@ const CHANGESETS: Record<string, unknown[]> = {
       ],
     },
   ],
+};
+
+/** What each who changed fam-orch's files did alone to those another changed too, as its session answers (`own_edits`): mod.rs is the agent's and then the planner's; of quic.rs, the optimizer's part is past what the session keeps, so its edits show one by one. */
+const OWN: Record<string, Record<string, unknown[]>> = {
+  "fam-orch": {
+    main: [
+      {
+        path: "crates/kiln/src/plans/mod.rs",
+        tree: "/home/ada/src/kiln",
+        kept: true,
+        edits: [
+          {
+            path: "crates/kiln/src/plans/mod.rs",
+            tree: "/home/ada/src/kiln",
+            added: 1,
+            removed: 1,
+            at: Date.now() - 240000,
+            hunks: [{ old_start: 3, old_lines: 2, new_start: 3, new_lines: 2, lines: [" pub mod planner;", "-pub mod order;", "+pub(crate) mod order;"] }],
+            by: ["main"],
+            place: "project",
+          },
+        ],
+      },
+      {
+        path: "crates/kiln/src/http/quic.rs",
+        tree: "/home/ada/src/kiln",
+        kept: true,
+        edits: [
+          {
+            path: "crates/kiln/src/http/quic.rs",
+            tree: "/home/ada/src/kiln",
+            added: 1,
+            removed: 0,
+            at: Date.now() - 540000,
+            hunks: [{ old_start: 121, old_lines: 2, new_start: 121, new_lines: 3, lines: ["     send.write_all(&req).await?;", "+    send.finish()?;", "     read_answer(recv).await"] }],
+            by: ["main"],
+            place: "project",
+          },
+        ],
+      },
+    ],
+    toolu_planner: [
+      {
+        path: "crates/kiln/src/plans/mod.rs",
+        tree: "/home/ada/src/kiln",
+        kept: true,
+        edits: [
+          {
+            path: "crates/kiln/src/plans/mod.rs",
+            tree: "/home/ada/src/kiln",
+            added: 1,
+            removed: 0,
+            at: Date.now() - 240000,
+            hunks: [{ old_start: 3, old_lines: 2, new_start: 3, new_lines: 3, lines: [" pub mod planner;", " pub(crate) mod order;", "+pub mod ready;"] }],
+            by: ["toolu_planner"],
+            place: "project",
+          },
+        ],
+      },
+    ],
+    toolu_opt: [{ path: "crates/kiln/src/http/quic.rs", tree: "/home/ada/src/kiln", kept: false, why: "cap" }],
+  },
 };
 
 function end(id: string): boolean {

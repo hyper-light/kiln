@@ -1586,7 +1586,8 @@ pub struct Meta {
     /// Features this adapter drives for this harness: "steer", "send_now", "queue_cancel",
     /// "interrupt", "set_mode", "set_model", "set_effort", "set_speed", "stop_task", "file_suggestions",
     /// "resume", "attachments", "images", "overrides", "switch_harness" (a model of another
-    /// harness: `Command::SetModel::kind`).
+    /// harness: `Command::SetModel::kind`), "own_edits" (`Command::OwnEdits`: the session answers
+    /// it whatever its harness).
     #[serde(default)]
     pub features: Vec<String>,
     /// Effort / reasoning levels the harness offers (empty: none).
@@ -1913,6 +1914,13 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(test, ts(optional))]
         account: Option<String>,
+    },
+    /// What `by` (as [`FileChange::by`] names them) did alone to each file they changed that
+    /// another did too, for the Changes tab narrowed to them; answered as a `reply` update to
+    /// `client` (`super::diff::own_edits`). A session whose features have "own_edits" answers it.
+    OwnEdits {
+        client: String,
+        by: String,
     },
 }
 

@@ -3,16 +3,19 @@
  * 01a194444b1d, step 2): its head on one grid, a label at the edge, then its value, then the view's
  * total at the right edge; Scope, By and Sort as menus like Mission control's Actions; and its
  * files as a flat list, each saying who changed it, those outside the project under bands of their
- * own. Commits and Compare come with their own steps: turned off until then, not hidden.
+ * own. Commits and Compare come with their own steps: turned off until then, not hidden. Narrowed
+ * to one who changed them, a file another changed too shows only their part, as the session
+ * answers it (step 3, "One subagent's own edits"), or their edits one by one from the conversation
+ * where it can't, saying why.
  */
 import * as React from "react";
 import { DropdownMenu } from "radix-ui";
 import { ArrowDownUp, Bot, Check, ChartNoAxesColumn, ChevronDown, Clock, FilePlus2, Folder, Layers, User, Users, type LucideIcon } from "lucide-react";
-import type { FilePlace } from "@/api/harness";
+import type { FileChange, FilePlace, HEvent } from "@/api/harness";
 import { usePref } from "@/lib/prefs";
 import { relativeTime } from "@/lib/format";
 import { DiffStat, FileDiffView } from "./diff";
-import { relPath, type ChangedFile } from "./derive";
+import { diffStats, relPath, type ChangedFile } from "./derive";
 import "./changes.css";
 
 /** Whose files a scope shows: this project's; everything changed for the person; the agents' own too. */
@@ -60,6 +63,98 @@ export interface Sub {
   kind?: string;
 }
 
+/** Where one's own part of a file comes from: its session, asked (`own_edits`), and the conversation where it can't say. */
+export interface OwnSource {
+  /** The session's id. */
+  id: string;
+  /** Its session answers (its features have "own_edits"). */
+  answers: boolean;
+  /** Its answer for `by` (null: none came). */
+  ask: (by: string) => Promise<unknown>;
+  /** Its events as they are now: their edits, one by one. */
+  events: () => readonly HEvent[];
+}
+
+/** One's own part of each file another changed too, as its session answers it (docs/agents.md, "One subagent's own edits"). */
+interface OwnReply {
+  by: string;
+  files: { path: string; tree?: string | null; kept: boolean; why?: string; edits?: FileChange[] }[];
+}
+
+/** Answers kept by what they're for (the session, who, and the files as they are), the latest few. */
+const ANSWERS = new Map<string, Promise<OwnReply | null>>();
+
+function answerFor(own: OwnSource, by: string, stamp: string): Promise<OwnReply | null> {
+  const key = `${own.id}\u0000${by}\u0000${stamp}`;
+  let p = ANSWERS.get(key);
+  if (!p) {
+    p = own.ask(by).then((v) => {
+      const r = v as Partial<OwnReply> | null;
+      return r && r.by === by && Array.isArray(r.files) ? (r as OwnReply) : null;
+    });
+    ANSWERS.set(key, p);
+    for (const k of [...ANSWERS.keys()].slice(0, Math.max(0, ANSWERS.size - 16))) ANSWERS.delete(k);
+  }
+  return p;
+}
+
+/** What a file's part stands on: who changed it, how much, and when. */
+const stampOf = (f: ChangedFile) => `${f.tree ?? ""}\u0000${f.path}\u0000${f.add}\u0000${f.del}\u0000${f.at ?? 0}\u0000${(f.by ?? []).join(",")}`;
+
+/** Why a file shows one's edits one by one rather than their part as a whole. */
+const ONE_BY_ONE: Record<string, string> = {
+  cap: "Its edits one by one: this session keeps no more copies to compare them by (64 MiB at most).",
+  unknown: "Its edits one by one: kiln didn't see how it found this file.",
+  silent: "Its edits one by one: its machine didn't answer.",
+  cannot: "Its edits one by one: its machine's kiln can't single out its part yet.",
+};
+
+/** `by`'s edits of `f` as the conversation shows them, one by one. */
+function editsFrom(events: readonly HEvent[], by: string, f: ChangedFile, cwd: string): ChangedFile["edits"] {
+  const abs = (p: string) => (p.startsWith("/") ? p : `${cwd.replace(/\/+$/, "")}/${p}`);
+  const want = f.tree ? `${f.tree.replace(/\/+$/, "")}/${f.path}` : abs(f.path);
+  const out: ChangedFile["edits"] = [];
+  for (const e of events) {
+    if (e.kind !== "tool" || e.tool !== "edit" || e.status === "denied" || (e.parent ?? AGENT) !== by) continue;
+    for (const d of e.diffs ?? []) if (abs(d.path) === want || (!d.path.startsWith("/") && want.endsWith(`/${d.path}`))) out.push({ call: e, diff: d });
+  }
+  return out;
+}
+
+/** `f` as `by` changed it alone, with why it's shown edit by edit where it is. `reply`: undefined while it's asked (`pending`: the session's change shows till then). */
+function partOf(f: ChangedFile, by: string, reply: OwnReply | null | undefined, own: OwnSource | undefined, cwd: string): { file: ChangedFile; note?: string; pending?: boolean } {
+  const theirs = (why: string) => {
+    const edits = own ? editsFrom(own.events(), by, f, cwd) : [];
+    const { add, del } = diffStats(edits.map((e) => e.diff));
+    return { file: { ...f, add, del, truncated: false, edits }, note: ONE_BY_ONE[why] ?? ONE_BY_ONE.unknown };
+  };
+  if (!own) return { file: f };
+  if (!own.answers) return theirs("cannot");
+  if (reply === undefined) return { file: f, pending: true };
+  if (reply === null) return theirs("silent");
+  const it = reply.files.find((o) => (o.tree ?? "") === (f.tree ?? "") && o.path === f.path);
+  if (!it) return { file: f };
+  if (!it.kept) return theirs(it.why ?? "unknown");
+  const edits = it.edits ?? [];
+  return {
+    file: {
+      ...f,
+      created: edits[0]?.created ?? false,
+      deleted: edits.at(-1)?.deleted ?? false,
+      truncated: edits.some((e) => e.truncated),
+      add: edits.reduce((n, e) => n + e.added, 0),
+      del: edits.reduce((n, e) => n + e.removed, 0),
+      edits: edits.map((e) => ({ call: null, diff: { path: f.path, created: e.created, hunks: e.hunks } })),
+    },
+  };
+}
+
+/** The answer for `by` about `stamp`'s files, read through Suspense; none to ask, nothing. */
+function Asked({ own, by, stamp, children }: { own: OwnSource | undefined; by: string; stamp: string; children: (reply: OwnReply | null | undefined) => React.ReactNode }) {
+  const reply = own?.answers && stamp ? React.use(answerFor(own, by, stamp)) : undefined;
+  return children(reply);
+}
+
 /** A file as the list shows it: where it is, from its folder (or its own working tree's top), and the worktree it's in when that isn't its folder's. */
 interface Row {
   key: string;
@@ -81,8 +176,8 @@ function treeWord(tree: string): string {
 
 const KIND_RANK = (f: ChangedFile) => (f.created ? 0 : f.deleted ? 2 : 1);
 
-/** `files`: the session's changeset. `self`: the agent's name; `subs`: its harness's subagents, in the order they began. */
-export function SessionChanges({ files, cwd, self, subs }: { files: ChangedFile[]; cwd: string; self: string; subs: readonly Sub[] }) {
+/** `files`: the session's changeset. `self`: the agent's name; `subs`: its harness's subagents, in the order they began. `own`: where one's own part of a file comes from. */
+export function SessionChanges({ files, cwd, self, subs, own }: { files: ChangedFile[]; cwd: string; self: string; subs: readonly Sub[]; own?: OwnSource }) {
   const [scope, setScope] = useScope();
   const [sort, setSort] = usePref<SortKey>("kiln.changes.sort", "path");
   const [by, setBy] = React.useState<string>("all");
@@ -96,9 +191,23 @@ export function SessionChanges({ files, cwd, self, subs }: { files: ChangedFile[
     return out;
   }, [files, self, subs, who]);
   const scoped = React.useMemo(() => files.filter((f) => inScope(f, scope)), [files, scope]);
-  const rows = React.useMemo(() => {
-    const mine = by === "all" ? scoped : scoped.filter((f) => (f.by ?? [AGENT]).includes(by));
-    const rows = mine.map((f) => rowOf(f, cwd));
+  const mine = React.useMemo(() => (by === "all" ? scoped : scoped.filter((f) => (f.by ?? [AGENT]).includes(by))), [scoped, by]);
+  // Narrowed to one of them: what of the files another changed too is theirs, asked of the session; the answer before it holds while the next is asked.
+  const shared = by === "all" ? [] : mine.filter((f) => (f.by?.length ?? 0) > 1);
+  const stamp = own?.answers && shared.length > 0 ? shared.map(stampOf).join("\u0001") : "";
+  const askedBy = React.useDeferredValue(by);
+  const asked = React.useDeferredValue(stamp);
+  const sorted = (reply: OwnReply | null | undefined) => {
+    const parts = new Map<string, string | undefined>();
+    const pending = new Set<string>();
+    const rows = mine.map((f) => {
+      if (by === "all" || (f.by?.length ?? 0) < 2) return rowOf(f, cwd);
+      const p = partOf(f, by, reply === undefined || reply?.by === by ? reply : undefined, own, cwd);
+      const r = rowOf(p.file, cwd);
+      parts.set(r.key, p.note);
+      if (p.pending) pending.add(r.key);
+      return r;
+    });
     const order: Record<SortKey, (a: Row, b: Row) => number> = {
       path: (a, b) => a.name.localeCompare(b.name),
       latest: (a, b) => (b.file.at ?? 0) - (a.file.at ?? 0) || a.name.localeCompare(b.name),
@@ -107,12 +216,8 @@ export function SessionChanges({ files, cwd, self, subs }: { files: ChangedFile[
       who: (a, b) => people.findIndex((p) => p.id === (a.file.by ?? [AGENT])[0]) - people.findIndex((p) => p.id === (b.file.by ?? [AGENT])[0]) || a.name.localeCompare(b.name),
     };
     const band = (r: Row) => ["project", "user", "agent"].indexOf(placeOf(r.file));
-    return rows.sort((a, b) => band(a) - band(b) || order[sort](a, b));
-  }, [scoped, by, cwd, sort, people]);
-  const add = rows.reduce((n, r) => n + r.file.add, 0);
-  const del = rows.reduce((n, r) => n + r.file.del, 0);
-  const picked = sel !== null && rows.some((r) => r.key === sel) ? sel : null;
-  const shown = picked ? rows.filter((r) => r.key === picked) : rows;
+    return { rows: rows.sort((a, b) => band(a) - band(b) || order[sort](a, b)), notes: parts, pending };
+  };
   const count = (id: string) => scoped.filter((f) => (f.by ?? [AGENT]).includes(id)).length;
   const byLabel = by === "all" ? "Everyone" : who(by);
   const scopeOf = SCOPE[scope];
@@ -124,6 +229,86 @@ export function SessionChanges({ files, cwd, self, subs }: { files: ChangedFile[
     if (by === "all") return ids.length ? `${ids.map(who).join(", ")}${tree}` : tree.slice(3);
     const others = ids.filter((id) => id !== by);
     return others.length ? `also changed by ${others.map(who).join(", ")}` : `${who(by)}${tree}`;
+  };
+
+  /** What shows what one did alone: as the session's answer has it once it's in, the session's change till then. */
+  const withOwn = (show: (reply: OwnReply | null | undefined) => React.ReactNode) => (
+    <React.Suspense fallback={show(undefined)}>
+      <Asked own={own} by={askedBy} stamp={asked}>
+        {show}
+      </Asked>
+    </React.Suspense>
+  );
+
+  const list = ({ rows, notes, pending }: ReturnType<typeof sorted>) => {
+    const picked = sel !== null && rows.some((r) => r.key === sel) ? sel : null;
+    const shown = picked ? rows.filter((r) => r.key === picked) : rows;
+    return (
+      <>
+        {rows.length === 0 ? (
+          <div className="cx-none">{scope === "project" && by === "all" ? "Nothing in this project changed." : "Nothing here at this scope."}</div>
+        ) : (
+          <div className="cx-files">
+            {rows.map((r, i) => {
+              const band = BAND[placeOf(r.file)];
+              const slash = r.name.lastIndexOf("/");
+              const when = r.file.at ? relativeTime(Math.floor(r.file.at / 1000)).replace(/ ago$/, "") : "";
+              const words = line(r);
+              return (
+                <React.Fragment key={r.key}>
+                  {band && placeOf(r.file) !== placeOf(rows[i - 1]?.file ?? { place: "project" }) && <div className="cx-band">{band}</div>}
+                  <button
+                    type="button"
+                    className="cx-file"
+                    aria-pressed={picked === r.key}
+                    data-pending={pending.has(r.key) || undefined}
+                    onClick={() => setSel(picked === r.key ? null : r.key)}
+                    title={r.tree ? `${r.tree}/${r.name}` : r.name}
+                  >
+                    <span className="cx-path">
+                      {slash > 0 && (
+                        <span className="cx-path-dir">
+                          <span dir="ltr">{r.name.slice(0, slash + 1)}</span>
+                        </span>
+                      )}
+                      <span className="cx-path-name">{r.name.slice(slash + 1)}</span>
+                      {r.file.created && <span className="hx-tag">new</span>}
+                      {r.file.deleted && <span className="hx-tag hx-tag-bad">deleted</span>}
+                    </span>
+                    <DiffStat add={r.file.add} del={r.file.del} />
+                    {(words || when) && (
+                      <>
+                        <span className="cx-by">{words}</span>
+                        <span className="cx-when">{when}</span>
+                      </>
+                    )}
+                  </button>
+                </React.Fragment>
+              );
+            })}
+          </div>
+        )}
+        <div className="hx-stack">
+          {shown.map((r) => (
+            <React.Fragment key={r.key}>
+              {r.file.edits.map((e, i) => (
+                <div key={`${r.key}-${i}`}>
+                  {r.file.edits.length > 1 && (
+                    <div className="hx-dim mb-1 text-[11px]">
+                      edit {i + 1} of {r.file.edits.length}
+                      {e.call?.status === "error" ? " · failed" : ""}
+                    </div>
+                  )}
+                  <FileDiffView diff={e.diff} label={r.tree ? `${treeWord(r.tree)}: ${r.name}` : r.name} defaultOpen={shown.length <= 4} />
+                  {r.file.truncated && <div className="hx-dim mt-1 text-[11px]">Diff shortened — the file changed a lot.</div>}
+                </div>
+              ))}
+              {notes.get(r.key) && <div className="hx-dim mt-1 text-[11px]">{notes.get(r.key)}</div>}
+            </React.Fragment>
+          ))}
+        </div>
+      </>
+    );
   };
 
   return (
@@ -252,61 +437,17 @@ export function SessionChanges({ files, cwd, self, subs }: { files: ChangedFile[
               </DropdownMenu.Content>
             </DropdownMenu.Portal>
           </DropdownMenu.Root>
-          <span className="cx-total">{rows.length > 0 && <DiffStat add={add} del={del} />}</span>
+          <span className="cx-total">
+            {withOwn((reply) => {
+              const { rows, pending } = sorted(reply);
+              return (
+                rows.length > 0 && <DiffStat add={rows.reduce((n, r) => n + r.file.add, 0)} del={rows.reduce((n, r) => n + r.file.del, 0)} className={pending.size > 0 ? "cx-pending" : undefined} />
+              );
+            })}
+          </span>
         </div>
       </div>
-      {rows.length === 0 ? (
-        <div className="cx-none">{scope === "project" && by === "all" ? "Nothing in this project changed." : "Nothing here at this scope."}</div>
-      ) : (
-        <div className="cx-files">
-          {rows.map((r, i) => {
-            const band = BAND[placeOf(r.file)];
-            const slash = r.name.lastIndexOf("/");
-            const when = r.file.at ? relativeTime(Math.floor(r.file.at / 1000)).replace(/ ago$/, "") : "";
-            const words = line(r);
-            return (
-              <React.Fragment key={r.key}>
-                {band && placeOf(r.file) !== placeOf(rows[i - 1]?.file ?? { place: "project" }) && <div className="cx-band">{band}</div>}
-                <button type="button" className="cx-file" aria-pressed={picked === r.key} onClick={() => setSel(picked === r.key ? null : r.key)} title={r.tree ? `${r.tree}/${r.name}` : r.name}>
-                  <span className="cx-path">
-                    {slash > 0 && (
-                      <span className="cx-path-dir">
-                        <span dir="ltr">{r.name.slice(0, slash + 1)}</span>
-                      </span>
-                    )}
-                    <span className="cx-path-name">{r.name.slice(slash + 1)}</span>
-                    {r.file.created && <span className="hx-tag">new</span>}
-                    {r.file.deleted && <span className="hx-tag hx-tag-bad">deleted</span>}
-                  </span>
-                  <DiffStat add={r.file.add} del={r.file.del} />
-                  {(words || when) && (
-                    <>
-                      <span className="cx-by">{words}</span>
-                      <span className="cx-when">{when}</span>
-                    </>
-                  )}
-                </button>
-              </React.Fragment>
-            );
-          })}
-        </div>
-      )}
-      <div className="hx-stack">
-        {shown.map((r) =>
-          r.file.edits.map((e, i) => (
-            <div key={`${r.key}-${i}`}>
-              {r.file.edits.length > 1 && (
-                <div className="hx-dim mb-1 text-[11px]">
-                  edit {i + 1} of {r.file.edits.length}
-                  {e.call?.status === "error" ? " · failed" : ""}
-                </div>
-              )}
-              <FileDiffView diff={e.diff} label={r.tree ? `${treeWord(r.tree)}: ${r.name}` : r.name} defaultOpen={shown.length <= 4} />
-              {r.file.truncated && <div className="hx-dim mt-1 text-[11px]">Diff shortened — the file changed a lot.</div>}
-            </div>
-          )),
-        )}
-      </div>
+      {withOwn((reply) => list(sorted(reply)))}
     </>
   );
 }

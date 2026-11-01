@@ -23,7 +23,7 @@ use super::model::{
 use super::claude::{McpAdd, mcp_status_words, safe_command, valid_server_name};
 
 /// What a session of it can do, said when it starts (and again after an in-place upgrade).
-pub(super) const FEATURES: &[&str] = &["steer", "send_now", "queue", "queue_steer", "interrupt", "set_mode", "permissions_live", "set_model", "set_effort", "set_speed", "file_suggestions", "resume", "attachments", "images", "overrides", "switch_harness"];
+pub(super) const FEATURES: &[&str] = &["steer", "send_now", "queue", "queue_steer", "interrupt", "set_mode", "permissions_live", "set_model", "set_effort", "set_speed", "file_suggestions", "resume", "attachments", "images", "overrides", "switch_harness", "own_edits"];
 /// It turns nothing on or off once it runs.
 pub(super) const LEARNED: &[&str] = &[];
 
@@ -1464,7 +1464,7 @@ impl Codex {
             Command::SetSpeed { speed } => self.notice(core, Level::Warn, format!("{speed}: not a speed Codex lists for its models")),
             Command::Control { id, value } => self.control(core, &id, value),
             // The session itself does these (a move is not the harness's business).
-            Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } => {}
+            Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } | Command::OwnEdits { .. } => {}
             // A terminal Codex left running: Codex has no way to stop it from outside, so kiln stops
             // the process itself (the newest one under Codex running that command).
             // A subagent: its turn under way is interrupted, as a person asked.

@@ -221,8 +221,8 @@ pub fn view(file: &Path, cwd: &str, started: Option<i64>) -> Option<serde_json::
     let roots = super::whose::Roots::here(&[]);
     let folders = [cwd.to_owned()];
     for job in std::mem::take(&mut core.change_jobs) {
-        let (change, resolved) = super::diff::placed_change(&job, cwd, &folders, &roots);
-        core.set_change(&job.abs, change, resolved);
+        let found = super::diff::placed_change(&job, cwd, &folders, &roots);
+        core.found(&job.abs, found);
     }
     let events: Vec<&super::model::Event> = core.events().collect();
     Some(json!({"events": events, "state": core.state, "changes": core.changes()}))

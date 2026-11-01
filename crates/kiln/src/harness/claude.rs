@@ -22,7 +22,7 @@ use super::model::{
 };
 
 /// What a session of it can do, said when it starts (and again after an in-place upgrade).
-pub(super) const FEATURES: &[&str] = &["steer", "send_now", "queue", "queue_steer", "interrupt", "set_mode", "set_model", "set_effort", "set_speed", "stop_task", "file_suggestions", "resume", "attachments", "images", "switch_harness"];
+pub(super) const FEATURES: &[&str] = &["steer", "send_now", "queue", "queue_steer", "interrupt", "set_mode", "set_model", "set_effort", "set_speed", "stop_task", "file_suggestions", "resume", "attachments", "images", "switch_harness", "own_edits"];
 /// It turns nothing on or off once it runs.
 pub(super) const LEARNED: &[&str] = &[];
 
@@ -833,7 +833,7 @@ impl Claude {
             }
             // Restarts and snapshots are the session's (it owns the process and the sink).
             // The session itself does these (a move is not the harness's business).
-            Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } => {}
+            Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } | Command::OwnEdits { .. } => {}
             Command::McpEnable { name, enabled } => {
                 let what = format!("{} {name}", if enabled { "Enable" } else { "Disable" });
                 self.request(core, Pending::McpChange(what), json!({"subtype": "mcp_toggle", "serverName": name, "enabled": enabled}));

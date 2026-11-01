@@ -154,8 +154,8 @@ An agent session's commands ride these streams too: `HarnessOpen`, `HarnessCmd`,
   ends it. Its sender sends it again under its id, wherever its session runs then; parked, it
   would go to the copy there with no epoch even after its session went on elsewhere (CP-T3.2,
   until CP-T3.3 parks it under its epoch).
-- **Asks**, which go as asks do, answered by what they ask for: `Suggest`, `Snapshot`, `McpAuth`
-  and `SkillView`.
+- **Asks**, which go as asks do, answered by what they ask for: `Suggest`, `Snapshot`, `McpAuth`,
+  `SkillView` and `OwnEdits`.
 - **Live**, refused at once while its runner is away: every other command (an interrupt, a model,
   effort or mode to change to, a move, a restart, the MCP servers' and skills' commands ...).
 
@@ -683,6 +683,7 @@ travels in `HarnessCmd`.
 | `MaxSubagents` | command, refused while away | As `AutoResume`. | Fire-and-forget. |
 | `MoveOnLimit` | command, refused while away | As `AutoResume`. | Fire-and-forget. |
 | `LimitHold` | command, refused while away | The server works the hold out again once the machine is back. | Fire-and-forget. |
+| `OwnEdits` | ask | Answered by a `Reply` to its client: what one who changed its files did alone (docs/agents.md, "One subagent's own edits"). | New: a session whose features have `own_edits` answers it. |
 
 ## Updates of a session: `Update`
 

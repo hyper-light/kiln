@@ -190,6 +190,123 @@ pub struct ChangeJob {
     pub abs: String,
     pub rel: String,
     pub baseline: Baseline,
+    /// Its newest turn ([`Turn`]), by its number, when how the file was as it began is still to be
+    /// worked out from the file as it is now: these hunks undone.
+    pub turn: Option<(usize, Vec<super::model::Hunk>)>,
+}
+
+/// A turn at a file: one who changed it, from how they found it to how the next one to change it
+/// did (or, for the latest, how it is now). What one of them changed alone is their turns' changes
+/// (`Command::OwnEdits`; docs/agents.md, "One subagent's own edits").
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Turn {
+    /// The agent itself ([`super::model::BY_AGENT`]) or a subagent run, as [`super::model::FileChange::by`] names them.
+    pub by: String,
+    pub before: Began,
+}
+
+/// How a file was as one who changed it began a turn at it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Began {
+    /// The session's baseline (the first turn's).
+    Baseline,
+    /// It did not exist.
+    Absent,
+    Text(#[serde(with = "shared_text")] std::sync::Arc<str>),
+    /// Too large to keep, as a baseline is: their part shows as changed, without its lines.
+    TooLarge,
+    /// Still to work out: the file as its change job finds it, these hunks undone (a harness that
+    /// reports patches).
+    Reverse(Vec<super::model::Hunk>),
+    /// Not kept: the session kept as much as it may ([`OWN_MAX`]), or its harness didn't say how the
+    /// file was (a shell command changed it).
+    Unkept(Unkept),
+}
+
+/// Why how a file was as a turn began isn't kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Unkept {
+    /// The session keeps [`OWN_MAX`] of them at most.
+    Cap,
+    /// Its harness didn't say, or it couldn't be worked out.
+    Unknown,
+}
+
+/// Text shared between a turn and what asks for it, written whole.
+mod shared_text {
+    pub fn serialize<S: serde::Serializer>(t: &std::sync::Arc<str>, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(t)
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<std::sync::Arc<str>, D::Error> {
+        <String as serde::Deserialize>::deserialize(d).map(std::sync::Arc::from)
+    }
+}
+
+/// Most a session keeps of its files as they were when one who changed them began a turn (the
+/// first turn's, its baseline, aside): past it, one's own edits of a file show one by one from its
+/// events.
+pub const OWN_MAX: usize = 64 << 20;
+/// Most turns kept per file: past them, nobody's own edits of it are known.
+const MAX_TURNS: usize = 256;
+
+/// What one who changed files did to those another changed too ([`Core::ask_own`]): for each, its
+/// turns at it, each from how it found the file to how the next one did ([`After`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OwnAsk {
+    pub by: String,
+    pub files: Vec<OwnFile>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OwnFile {
+    pub abs: String,
+    /// The session's change to it: its place, its path and who changed it.
+    pub change: super::model::FileChange,
+    /// Its turns: how it found the file, and how it left it; or why they aren't all known.
+    pub turns: Result<Vec<(Began, After)>, Unkept>,
+}
+
+/// How one left a file at the end of a turn.
+#[derive(Debug, Clone, PartialEq)]
+pub enum After {
+    /// As the next one found it.
+    Next(Began),
+    /// As it is now: the latest to change it.
+    Now,
+}
+
+/// `by`'s turns at a file whose turns are `turns` and baseline `baseline`: how they found it, how
+/// they left it. Not all known: why.
+fn own_turns(turns: &[Turn], by: &str, baseline: Option<&Baseline>) -> Result<Vec<(Began, After)>, Unkept> {
+    let known = |b: &Began| match b {
+        Began::Unkept(why) => Err(*why),
+        Began::Reverse(_) => Err(Unkept::Unknown),
+        _ => Ok(()),
+    };
+    let mut out = Vec::new();
+    for (i, t) in turns.iter().enumerate().filter(|(_, t)| t.by == by) {
+        let before = match &t.before {
+            Began::Baseline => match baseline {
+                Some(Baseline::Absent) => Began::Absent,
+                Some(Baseline::Text(s)) => Began::Text(s.as_str().into()),
+                Some(Baseline::TooLarge) => Began::TooLarge,
+                Some(Baseline::Reverse(_)) | None => Began::Unkept(Unkept::Unknown),
+            },
+            b => b.clone(),
+        };
+        known(&before)?;
+        let after = match turns.get(i + 1) {
+            Some(next) => {
+                known(&next.before)?;
+                After::Next(next.before.clone())
+            }
+            None => After::Now,
+        };
+        out.push((before, after));
+    }
+    Ok(out)
 }
 
 /// A go-back operation done by kiln (`harness::goback`) where a harness lacks it natively.
@@ -224,6 +341,9 @@ pub enum Effect {
     /// Answer `client` with the first of these files that can be read (`{"content", "path"}`),
     /// or `{"error"}`.
     Read { client: String, paths: Vec<String> },
+    /// Answer `client` with what one who changed files did to them alone (`Command::OwnEdits`),
+    /// worked out off the event loop (`super::diff::own_edits`).
+    Own { client: String, ask: OwnAsk },
     /// Read the end of the harness's own transcript of `session` (Claude Code's, under its
     /// configuration directory `config`). The lines come back as a run's end (`run_done`, code 0,
     /// one record a line; code 1 when it can't be read) under `job`.
@@ -319,6 +439,14 @@ pub struct Core {
     changes_dirty: bool,
     /// Who changed each file, in the order they first did ([`super::model::FileChange::by`]).
     by: HashMap<String, Vec<String>>,
+    /// Who changed each file in turn, and how each found it ([`Turn`]); None for a file with more
+    /// turns than are kept ([`MAX_TURNS`]).
+    turns: HashMap<String, Option<Vec<Turn>>>,
+    /// Bytes of files kept in `turns` ([`OWN_MAX`] at most).
+    own_kept: usize,
+    /// How the file the adapter says next it changed was before this edit ([`Core::note_baseline`]):
+    /// a turn it begins starts from it.
+    edit_before: Option<(String, Baseline)>,
     /// The folders it has worked in, the first it had first: their files are this project's
     /// ([`super::whose`]).
     folders: Vec<String>,
@@ -361,6 +489,9 @@ pub struct Frozen {
     next_seq: u64,
     baselines: HashMap<String, Baseline>,
     changes: std::collections::BTreeMap<String, super::model::FileChange>,
+    /// Who changed each file in turn (`Core::turns`); none from an image before them.
+    #[serde(default)]
+    turns: HashMap<String, Option<Vec<Turn>>>,
     /// Task output kiln keeps itself: its bytes (base64), and how many there have been.
     task_output: HashMap<String, (String, u64)>,
     stream: Vec<(String, String)>,
@@ -395,6 +526,9 @@ impl Core {
             changes: std::collections::BTreeMap::new(),
             changes_dirty: false,
             by: HashMap::new(),
+            turns: HashMap::new(),
+            own_kept: 0,
+            edit_before: None,
             folders: Vec::new(),
             effects: Vec::new(),
             task_output: HashMap::new(),
@@ -430,6 +564,7 @@ impl Core {
             next_seq: self.next_seq,
             baselines: self.baselines.clone(),
             changes: self.changes.clone(),
+            turns: self.turns.clone(),
             task_output: self.task_output.iter().map(|(id, t)| (id.clone(), (base64::engine::general_purpose::STANDARD.encode(t.data.iter().copied().collect::<Vec<u8>>()), t.total))).collect(),
             stream: self.stream.clone(),
             changed: self.changed.clone(),
@@ -455,6 +590,8 @@ impl Core {
         c.by = f.changes.iter().filter(|(_, ch)| !ch.by.is_empty()).map(|(abs, ch)| (abs.clone(), ch.by.clone())).collect();
         c.changes = f.changes;
         c.changes_dirty = !c.changes.is_empty();
+        c.own_kept = f.turns.values().flatten().flatten().map(|t| if let Began::Text(s) = &t.before { s.len() } else { 0 }).sum();
+        c.turns = f.turns;
         c.task_output = f
             .task_output
             .into_iter()
@@ -574,10 +711,16 @@ impl Core {
         }
     }
 
-    /// The agent is about to change (or just changed) `abs`; `before` is how it was. Only the
-    /// first one counts: the changeset is relative to how the file was before the session.
+    /// The agent is about to change (or just changed) `abs`; `before` is how it was. The first is
+    /// its baseline: the changeset is relative to how the file was before the session. A later one
+    /// is where a turn the edit begins starts from ([`Turn`]).
     pub fn note_baseline(&mut self, abs: &str, before: Baseline) {
-        if self.baselines.contains_key(abs) || self.baselines.len() >= MAX_CHANGED_FILES {
+        if self.baselines.contains_key(abs) {
+            // How it was before this edit: a turn the edit begins starts from it.
+            self.edit_before = Some((abs.to_owned(), before));
+            return;
+        }
+        if self.baselines.len() >= MAX_CHANGED_FILES {
             return;
         }
         self.baselines.insert(abs.to_owned(), before);
@@ -586,13 +729,100 @@ impl Core {
     /// Recompute `abs` (shown as `rel`) once the brain gets to it, `by` having changed it: the agent
     /// itself ([`super::model::BY_AGENT`]) or a subagent run of its harness's.
     pub fn want_change(&mut self, abs: &str, rel: &str, by: &str) {
+        let before = self.edit_before.take().filter(|(a, _)| a == abs).map(|(_, b)| b);
         let Some(baseline) = self.baselines.get(abs).cloned() else { return };
         let who = self.by.entry(abs.to_owned()).or_default();
         if !who.iter().any(|w| w == by) {
             who.push(by.to_owned());
         }
+        let turn = self.take_turn(abs, by, before);
         self.change_jobs.retain(|j| j.abs != abs);
-        self.change_jobs.push(ChangeJob { abs: abs.to_owned(), rel: rel.to_owned(), baseline });
+        self.change_jobs.push(ChangeJob { abs: abs.to_owned(), rel: rel.to_owned(), baseline, turn });
+    }
+
+    /// `by` changed `abs`, which was `before` as they did when its harness said: a turn of theirs
+    /// begins unless the last was theirs. Returns the turn to work out how it began from the file
+    /// (its change job's), when that's still to do.
+    fn take_turn(&mut self, abs: &str, by: &str, before: Option<Baseline>) -> Option<(usize, Vec<super::model::Hunk>)> {
+        let slot = self.turns.entry(abs.to_owned()).or_insert_with(|| Some(Vec::new()));
+        let turns = slot.as_mut()?;
+        if let Some(last) = turns.last() {
+            if last.by == by {
+                return None;
+            }
+            if turns.len() >= MAX_TURNS {
+                *slot = None;
+                return None;
+            }
+        }
+        let began = if turns.is_empty() {
+            Began::Baseline
+        } else {
+            match before {
+                Some(Baseline::Absent) => Began::Absent,
+                Some(Baseline::TooLarge) => Began::TooLarge,
+                Some(Baseline::Reverse(hunks)) => Began::Reverse(hunks),
+                Some(Baseline::Text(t)) if self.own_kept + t.len() <= OWN_MAX => {
+                    self.own_kept += t.len();
+                    Began::Text(t.into())
+                }
+                Some(Baseline::Text(_)) => Began::Unkept(Unkept::Cap),
+                None => Began::Unkept(Unkept::Unknown),
+            }
+        };
+        let work = if let Began::Reverse(h) = &began { Some((turns.len(), h.clone())) } else { None };
+        turns.push(Turn { by: by.to_owned(), before: began });
+        work
+    }
+
+    /// What a file's change job found ([`super::diff::placed_change`]).
+    pub fn found(&mut self, abs: &str, found: super::diff::Found) {
+        if let Some((n, began)) = found.turn {
+            self.set_turn(abs, n, began);
+        }
+        self.set_change(abs, found.change, found.baseline);
+    }
+
+    /// How a file was as its turn `n` began, worked out by its change job ([`ChangeJob::turn`]).
+    pub fn set_turn(&mut self, abs: &str, n: usize, found: Baseline) {
+        let Some(turn) = self.turns.get_mut(abs).and_then(Option::as_mut).and_then(|t| t.get_mut(n)) else { return };
+        if !matches!(turn.before, Began::Reverse(_)) {
+            return;
+        }
+        turn.before = match found {
+            Baseline::Absent => Began::Absent,
+            Baseline::TooLarge => Began::TooLarge,
+            Baseline::Text(t) if self.own_kept + t.len() <= OWN_MAX => {
+                self.own_kept += t.len();
+                Began::Text(t.into())
+            }
+            Baseline::Text(_) => Began::Unkept(Unkept::Cap),
+            Baseline::Reverse(_) => Began::Unkept(Unkept::Unknown),
+        };
+    }
+
+    /// Bytes kept of files as turns began at them ([`OWN_MAX`] at most).
+    pub fn own_kept(&self) -> usize {
+        self.own_kept
+    }
+
+    /// Ask, off the event loop, what `by` did alone to each file they changed that another did too
+    /// (`Command::OwnEdits`): answered to `client` (`super::diff::own_edits`). Files only they
+    /// changed need nothing: their change is the session's.
+    pub fn ask_own(&mut self, client: String, by: &str) {
+        let mut files = Vec::new();
+        for (abs, change) in &self.changes {
+            if change.by.len() < 2 || !change.by.iter().any(|b| b == by) {
+                continue;
+            }
+            let turns = match self.turns.get(abs) {
+                Some(Some(turns)) => own_turns(turns, by, self.baselines.get(abs)),
+                // More turns than are kept, or none from before a restart.
+                Some(None) | None => Err(Unkept::Unknown),
+            };
+            files.push(OwnFile { abs: abs.clone(), change: change.clone(), turns });
+        }
+        self.effects.push(Effect::Own { client, ask: OwnAsk { by: by.to_owned(), files } });
     }
 
     /// Only one recomputation per file runs; later edits wait as its latest pending job.
@@ -1389,7 +1619,7 @@ mod tests {
         c.set_change("/a.rs", None, Some(baseline.clone()));
         assert_eq!(c.changes(), vec![before]);
         assert!(c.take_out().is_empty());
-        assert_eq!(c.take_change_jobs(), vec![ChangeJob { abs: "/a.rs".into(), rel: "latest.rs".into(), baseline }]);
+        assert_eq!(c.take_change_jobs(), vec![ChangeJob { abs: "/a.rs".into(), rel: "latest.rs".into(), baseline, turn: None }]);
         c.start_change("/a.rs");
         let latest = change(2, 3);
         c.set_change("/a.rs", Some(latest.clone()), None);
@@ -1464,6 +1694,127 @@ mod tests {
         c.set_change("/h/.claude/projects/w/memory/m.md", Some(change("/h/.claude/projects/w/memory/m.md", 5, Some(FilePlace::Agent))), None);
         c.set_change("/w/b.rs", Some(change("b.rs", 2, None)), None);
         assert_eq!((c.changes().len(), c.state.files_changed, c.state.lines_added), (4, 2, 5));
+    }
+
+    /// One edit each, in turn, its harness saying how the file was before it (Claude Code's
+    /// `originalFile`); the session's change to it, as its change job found it.
+    fn edited_in_turns(c: &mut Core, abs: &str, versions: &[&str], by: &[&str]) {
+        use super::super::model::{FileChange, FilePlace};
+        for (v, who) in versions.iter().zip(by) {
+            c.note_baseline(abs, Baseline::Text((*v).to_owned()));
+            c.want_change(abs, "a.rs", who);
+        }
+        for j in c.take_change_jobs() {
+            c.start_change(&j.abs);
+        }
+        let change = FileChange { path: "a.rs".into(), tree: Some("/w".into()), created: false, deleted: false, added: 1, removed: 1, hunks: Vec::new(), truncated: false, at: 1, by: Vec::new(), place: Some(FilePlace::Project) };
+        c.set_change(abs, Some(change), None);
+    }
+
+    /// What `by` did alone to the files another changed too, as the session answers it.
+    fn own(c: &mut Core, by: &str, now: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+        c.ask_own("v1".into(), by);
+        let Some(Effect::Own { client, ask }) = c.effects.pop() else { anyhow::bail!("no ask") };
+        anyhow::ensure!(client == "v1" && ask.by == by);
+        let reply = super::super::diff::own_edits(&ask, |_| Some(Ok(now.to_owned())));
+        Ok(reply.get("files").and_then(serde_json::Value::as_array).cloned().unwrap_or_default())
+    }
+
+    /// The Changes tab narrowed to one who changed a file another changed too shows only their
+    /// part (the Changes panel plan 01a194444b1d, step 3).
+    #[test]
+    fn two_subagents_and_the_agent_edit_one_file_in_turns_and_each_ones_diff_is_its_own_edits() -> anyhow::Result<()> {
+        use super::super::model::{BY_AGENT, FileChange};
+        let mut c = Core::new();
+        let v = ["one\ntwo\nthree\n", "ONE\ntwo\nthree\n", "ONE\nTWO\nthree\n", "ONE\nTWO\nTHREE\n"];
+        edited_in_turns(&mut c, "/w/a.rs", &[v[0], v[1], v[2]], &[BY_AGENT, "toolu_a", "toolu_b"]);
+        for (by, gone, came) in [(BY_AGENT, "-one", "+ONE"), ("toolu_a", "-two", "+TWO"), ("toolu_b", "-three", "+THREE")] {
+            let files = own(&mut c, by, v[3])?;
+            let [file] = files.as_slice() else { anyhow::bail!("{by}: {files:?}") };
+            assert_eq!(file.get("kept"), Some(&serde_json::Value::Bool(true)), "{by}");
+            let edits: Vec<FileChange> = serde_json::from_value(file.get("edits").cloned().unwrap_or_default())?;
+            let [edit] = edits.as_slice() else { anyhow::bail!("{by}: {edits:?}") };
+            let lines: Vec<&str> = edit.hunks.iter().flat_map(|h| h.lines.iter()).map(String::as_str).filter(|l| l.starts_with(['+', '-'])).collect();
+            assert_eq!((edit.added, edit.removed, lines), (1, 1, vec![gone, came]), "{by}");
+            assert_eq!((edit.tree.as_deref(), edit.by.clone()), (Some("/w"), vec![by.to_owned()]));
+        }
+        // One who changed nothing here has nothing of it; an in-place upgrade keeps the turns.
+        assert!(own(&mut c, "toolu_other", v[3])?.is_empty());
+        let mut thawed = Core::thaw(c.freeze());
+        assert_eq!((thawed.own_kept(), own(&mut thawed, "toolu_a", v[3])?), (c.own_kept(), own(&mut c, "toolu_a", v[3])?));
+        Ok(())
+    }
+
+    /// One who changed it again after another did has its turns one by one, each its own; a turn
+    /// whose start its harness didn't say (a shell command's change) isn't known.
+    #[test]
+    fn turns_taken_in_between_are_each_its_own_and_an_unsaid_start_is_unknown() -> anyhow::Result<()> {
+        use super::super::model::{BY_AGENT, FileChange};
+        let mut c = Core::new();
+        let v = ["a\nb\n", "A\nb\n", "A\nB\n"];
+        edited_in_turns(&mut c, "/w/a.rs", &[v[0], v[1]], &[BY_AGENT, "toolu_a"]);
+        // The agent again, its edit's start said: two turns of its own.
+        c.note_baseline("/w/a.rs", Baseline::Text(v[2].to_owned()));
+        c.want_change("/w/a.rs", "a.rs", BY_AGENT);
+        let files = own(&mut c, BY_AGENT, "A!\nB\n")?;
+        let edits: Vec<FileChange> = serde_json::from_value(files.first().and_then(|f| f.get("edits")).cloned().unwrap_or_default())?;
+        assert_eq!(edits.iter().map(|e| (e.added, e.removed)).collect::<Vec<_>>(), vec![(1, 1), (1, 1)]);
+        // A subagent's shell command changed it: how it found it isn't known.
+        c.want_change("/w/a.rs", "a.rs", "toolu_b");
+        for j in c.take_change_jobs() {
+            c.start_change(&j.abs);
+        }
+        let was = c.changes().first().cloned().ok_or_else(|| anyhow::anyhow!("no change"))?;
+        c.set_change("/w/a.rs", Some(FileChange { added: 2, ..was }), None);
+        let files = own(&mut c, "toolu_b", "A!\nB\n")?;
+        assert_eq!(files.first().map(|f| (f.get("kept").cloned(), f.get("why").cloned())), Some((Some(serde_json::json!(false)), Some(serde_json::json!("unknown")))));
+        Ok(())
+    }
+
+    /// What it keeps of files as turns began is 64 MiB at most, however much they edit: past it, a
+    /// turn isn't kept, and asked for, it says so (its edits show one by one from its events).
+    #[test]
+    fn what_it_keeps_for_subagents_own_edits_is_64_mib_at_most() -> anyhow::Result<()> {
+        use super::super::model::{BY_AGENT, FileChange};
+        let mut c = Core::new();
+        let big = "x\n".repeat(1 << 19); // 1 MiB
+        for i in 0..80 {
+            let abs = format!("/w/{i}.rs");
+            c.note_baseline(&abs, Baseline::Text(big.clone()));
+            c.want_change(&abs, "f.rs", BY_AGENT);
+            c.note_baseline(&abs, Baseline::Text(big.clone()));
+            c.want_change(&abs, "f.rs", "toolu_a");
+            assert!(c.own_kept() <= OWN_MAX, "{i}: {}", c.own_kept());
+            for j in c.take_change_jobs() {
+                c.start_change(&j.abs);
+            }
+        }
+        assert_eq!(c.own_kept(), OWN_MAX);
+        for i in [0, 79] {
+            let change = FileChange { path: format!("{i}.rs"), tree: None, created: false, deleted: false, added: 1, removed: 0, hunks: Vec::new(), truncated: true, at: 1, by: Vec::new(), place: None };
+            c.set_change(&format!("/w/{i}.rs"), Some(change), None);
+        }
+        let files = own(&mut c, "toolu_a", &big)?;
+        let kept: Vec<(Option<&str>, Option<&serde_json::Value>, Option<&serde_json::Value>)> = files.iter().map(|f| (f.get("path").and_then(serde_json::Value::as_str), f.get("kept"), f.get("why"))).collect();
+        assert_eq!(kept, vec![(Some("0.rs"), Some(&serde_json::json!(true)), None), (Some("79.rs"), Some(&serde_json::json!(false)), Some(&serde_json::json!("cap")))]);
+        Ok(())
+    }
+
+    /// A turn begun by a harness that reports patches is worked out by the file's change job, and
+    /// what it keeps counts toward the cap.
+    #[test]
+    fn a_patch_turn_waits_for_its_change_job() {
+        use super::super::model::{BY_AGENT, Hunk};
+        let mut c = Core::new();
+        c.note_baseline("/w/a.rs", Baseline::Text("a\n".into()));
+        c.want_change("/w/a.rs", "a.rs", BY_AGENT);
+        let hunks = vec![Hunk { old_start: 1, old_lines: 1, new_start: 1, new_lines: 1, lines: vec!["-b".into(), "+c".into()] }];
+        c.note_baseline("/w/a.rs", Baseline::Reverse(hunks.clone()));
+        c.want_change("/w/a.rs", "a.rs", "kid");
+        let jobs = c.take_change_jobs();
+        assert_eq!(jobs.iter().map(|j| j.turn.clone()).collect::<Vec<_>>(), vec![Some((1, hunks))]);
+        c.found("/w/a.rs", super::super::diff::Found { change: None, baseline: None, turn: Some((1, Baseline::Text("b\n".into()))) });
+        assert_eq!(c.own_kept(), 2);
     }
 
     #[test]
