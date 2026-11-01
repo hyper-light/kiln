@@ -487,6 +487,19 @@ pub struct IdentityGiven {
 /// [`CAP_CHANGES_PATCH`].
 pub const CAP_UNREAD: u64 = 1 << 41;
 
+/// [`AgentMsg::Caps`] capability: the runner answers [`ServerMsg::Workspace`]'s `commits`
+/// (`crate::workspace::Ask::Commits`): a branch's commits since its trunk, its session's own
+/// marked, and what picked ones change together, for the Changes tab's Commits (docs/agents.md).
+/// A runner without it isn't asked, and Commits says why. Bit 41 is [`CAP_UNREAD`].
+pub const CAP_WORKSPACE_COMMITS: u64 = 1 << 42;
+
+/// [`AgentMsg::Caps`] capability: the runner answers [`ServerMsg::Workspace`]'s `refs` and `compare`
+/// (`crate::workspace::Ask::Refs`, `Ask::Compare`): a repository's branches, tags and latest
+/// commits, and what changes from one point to another (the folder now, as its session began, a
+/// branch, tag or commit, an agent's files as it left them), for the Changes tab's Compare
+/// (docs/agents.md). Bit 42 is [`CAP_WORKSPACE_COMMITS`].
+pub const CAP_WORKSPACE_COMPARE: u64 = 1 << 43;
+
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InstanceHello {
@@ -1231,6 +1244,8 @@ mod tests {
         // Step 5 appended `LinkUnread` (57) and `ReachRefused` (63) after them.
         assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (58, 64), "each table has every variant once");
         assert!(CAP_UNREAD.is_power_of_two() && CAP_UNREAD == 1 << 41 && CAP_UNREAD & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH) == 0);
+        assert!(CAP_WORKSPACE_COMMITS.is_power_of_two() && CAP_WORKSPACE_COMMITS == 1 << 42 && CAP_WORKSPACE_COMMITS & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD) == 0);
+        assert!(CAP_WORKSPACE_COMPARE.is_power_of_two() && CAP_WORKSPACE_COMPARE == 1 << 43 && CAP_WORKSPACE_COMPARE & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD | CAP_WORKSPACE_COMMITS) == 0);
         Ok(())
     }
 

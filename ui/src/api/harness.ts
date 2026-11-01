@@ -15,6 +15,9 @@ import type {
   AgentInfo,
   Attachment,
   Command,
+  CommitLog,
+  CompareRefs,
+  Compared,
   ControlOption,
   FileChange,
   Event as HEvent,
@@ -22,6 +25,7 @@ import type {
   Meta,
   ModelOption,
   ModeOption,
+  PickedCommits,
   SendMode,
   SessionDown,
   SessionUp,
@@ -41,7 +45,10 @@ export type {
   Attachment,
   ChoiceAnswer,
   Command,
+  CommitLog,
   Compacting,
+  CompareRefs,
+  Compared,
   Control,
   ControlOption,
   Decision,
@@ -50,6 +57,7 @@ export type {
   FileChange,
   FileDiff,
   FileMeta,
+  FilePlace,
   HeldGoals as Held,
   Event as HEvent,
   HookInfo,
@@ -59,12 +67,15 @@ export type {
   Known,
   Level,
   Limit,
+  LoggedCommit,
   McpServer,
   Meta,
   ModelOption,
   ModeOption,
   MovePlan,
   Pause,
+  PickedCommits,
+  PickNeeds,
   Plugin,
   Question,
   QuestionOption,
@@ -480,6 +491,22 @@ export const harnessApi = {
   workspaces: () => call<WorkspacesAvailable>("GET", "/api/harness/workspaces"),
   /** An agent's workspace of its own, and the files under it changed on disk since it changed them. */
   workspace: (id: string) => call<{ workspace: AgentInfo["workspace"] | null; drift: string[] }>("GET", `/api/harness/agents/${encodeURIComponent(id)}/workspace`),
+  /** Its branch's commits (or `branch`'s) since its trunk, its session's own marked; with `picks`, what those change together (`agents.commits`). */
+  commits: (id: string, picks: readonly string[] = [], branch?: string) => {
+    const q = new URLSearchParams();
+    if (picks.length) q.set("picks", picks.join(","));
+    if (branch) q.set("branch", branch);
+    const qs = q.toString();
+    return call<{ log: CommitLog; picked: PickedCommits | null }>("GET", `/api/harness/agents/${encodeURIComponent(id)}/commits${qs ? `?${qs}` : ""}`);
+  },
+  /** Its repository's branches, tags and latest commits, for Compare's pickers (`agents.refs`). */
+  refs: (id: string) => call<{ refs: CompareRefs }>("GET", `/api/harness/agents/${encodeURIComponent(id)}/refs`),
+  /** What changes from one point to another (`agents.compare`): `now`, `began`, `agent:<who>`, or a branch, tag or commit; `path`, one file's lines. */
+  compare: (id: string, from: string, to: string, split: boolean, path?: string) => {
+    const q = new URLSearchParams({ from, to, split: String(split) });
+    if (path) q.set("path", path);
+    return call<{ compared: Compared }>("GET", `/api/harness/agents/${encodeURIComponent(id)}/compare?${q.toString()}`);
+  },
   /** What writing its workspace to its folder would do. */
   planLanding: (id: string) => call<LandingPlan>("POST", `/api/harness/agents/${encodeURIComponent(id)}/land`, {}),
   /** Write it exactly as the plan whose manifest this is (a person's go-ahead); if it changed since, nothing is written and the new plan comes back. */

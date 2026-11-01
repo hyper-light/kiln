@@ -4,11 +4,10 @@
  */
 import * as React from "react";
 import { Bot, Square } from "lucide-react";
-import { useSession, type AgentInfo, type Command, type FileChange as ServerChange, type HEvent, type Meta, type SessionStore, type State, type Task } from "@/api/harness";
+import { harnessApi, useSession, type AgentInfo, type Command, type FileChange as ServerChange, type HEvent, type Meta, type SessionStore, type State, type Task } from "@/api/harness";
 import { cn } from "@/lib/utils";
-import { agentLabel, changesetOf, duration, editsOf, money, relPath, runsOf, taskDot, taskLive, tokens, useSameList, type ChangedFile, type ToolEvent } from "./derive";
+import { agentLabel, changesetOf, duration, editsOf, money, runsOf, taskDot, taskLive, tokens, useSameList, type ToolEvent } from "./derive";
 import { kilnStatus } from "./tasks";
-import { DiffStat, FileDiffView } from "./diff";
 import { Output, Prose } from "./parts";
 import { LimitMeter, StatusList } from "./limits";
 import { McpPanel, SkillsPanel } from "./tools";
@@ -26,6 +25,9 @@ import { ChangeBar } from "./change-bar";
 import { Fold, FoldOpen } from "./fold";
 import { WorkspaceBar } from "./workspace-bar";
 import { SubagentOutput } from "./task-output";
+import { SessionChanges, fromServer, inScope, useScope, type OwnSource, type Sub } from "./changes";
+import type { CommitsSource } from "./commits";
+import type { CompareSource } from "./compare";
 
 const NO_EVENTS: HEvent[] = [];
 const NO_AGENTS: readonly AgentInfo[] = [];
@@ -43,43 +45,50 @@ function ToolSection({ id, title, count, children }: { id: string; title: string
   );
 }
 
-/** The server's cumulative changeset as the file list and diffs show it (one diff per file). */
-function fromServer(files: ServerChange[]): ChangedFile[] {
-  return files.map((f) => ({
-    path: f.path,
-    tree: f.tree,
-    created: Boolean(f.created),
-    add: f.added,
-    del: f.removed,
-    edits: [{ call: null, diff: { path: f.path, created: f.created, hunks: f.hunks } }],
-    deleted: Boolean(f.deleted),
-    truncated: Boolean(f.truncated),
-  }));
+/** Its harness's subagents (their runs' ids, what each was asked, its kind), the same list while they stay the same: what the Changes tab's By names. */
+function useSubs(tasks: readonly Task[] | undefined): readonly Sub[] {
+  const subs = (tasks ?? []).filter((t) => !isBackground(t) && t.tool_id).map((t): Sub => ({ id: t.tool_id ?? t.id, label: t.description, kind: t.kind || undefined }));
+  const key = subs.map((s) => `${s.id}\u0000${s.label}\u0000${s.kind ?? ""}`).join("\u0001");
+  // The same subagents, by what they are, keep the same list (as useSameList keeps its).
+  const [kept] = React.useState(() => ({ key, subs }));
+  if (kept.key !== key) {
+    kept.key = key;
+    kept.subs = subs;
+  }
+  return kept.subs;
 }
 
-/** `events`: only its edits matter (the changeset is worked out from them when the server sends none). `agentId`: its change request goes above them, and `volumeOver`, the folder its workspace of its own is laid over. */
+/** `events`: only its edits matter (the changeset is worked out from them when the server sends none). `agentId`: its change request goes above them, and `volumeOver`, the folder its workspace of its own is laid over. `self`: the agent's name, and `subs` its harness's subagents, for who changed each file; `own`, where what one of them changed alone comes from. */
 export const Changes = React.memo(function Changes({
   events,
   changes,
   cwd,
   agentId,
   volumeOver,
+  self,
+  subs,
+  own,
+  started,
 }: {
   events: HEvent[];
   changes: ServerChange[] | null;
   cwd: string;
   agentId?: string;
   volumeOver?: string;
+  self: string;
+  subs: readonly Sub[];
+  own?: OwnSource;
+  started?: readonly Sub[];
 }) {
   const local = React.useMemo(() => (changes ? null : changesetOf(events)), [events, changes]);
   const files = React.useMemo(() => (changes ? fromServer(changes) : (local ?? [])), [changes, local]);
-  // A file in another working tree than its folder's (a worktree it left, the checkout it went
-  // from) is shown where it is; in its folder's, by its path there.
-  const nameOf = (f: ChangedFile) => relPath(f.tree && f.tree !== cwd && !cwd.startsWith(`${f.tree}/`) ? `${f.tree}/${f.path}` : f.path, cwd);
-  const [sel, setSel] = React.useState<string | null>(null);
-  const shown: ChangedFile[] = sel ? files.filter((f) => nameOf(f) === sel) : files;
-  const add = files.reduce((n, f) => n + f.add, 0);
-  const del = files.reduce((n, f) => n + f.del, 0);
+  // Its branch's commits, asked of its machine (Commits).
+  const commits = React.useMemo<CommitsSource | undefined>(() => (agentId ? { id: agentId, ask: (picks, branch) => harnessApi.commits(agentId, picks, branch) } : undefined), [agentId]);
+  // What it has to compare, and two points compared, asked of its machine (Compare).
+  const compare = React.useMemo<CompareSource | undefined>(
+    () => (agentId ? { id: agentId, refs: () => harnessApi.refs(agentId), compare: (from, to, split, path) => harnessApi.compare(agentId, from, to, split, path) } : undefined),
+    [agentId],
+  );
   const wsBar = agentId && volumeOver ? <WorkspaceBar agentId={agentId} over={volumeOver} /> : null;
   if (files.length === 0)
     return (
@@ -96,44 +105,7 @@ export const Changes = React.memo(function Changes({
           <ChangeBar agentId={agentId} />
         </Loadable>
       )}
-      <div className="hx-files">
-        <button type="button" className="hx-file" aria-pressed={sel === null} onClick={() => setSel(null)}>
-          <span className="hx-file-name">All files · {files.length}</span>
-          <DiffStat add={add} del={del} />
-        </button>
-        {files.map((f) => {
-          const rel = nameOf(f);
-          const slash = rel.lastIndexOf("/");
-          return (
-            <button key={rel} type="button" className="hx-file" aria-pressed={sel === rel} onClick={() => setSel(sel === rel ? null : rel)} title={rel}>
-              <span className="hx-file-name">
-                {slash > 0 && <span className="hx-dim">{rel.slice(0, slash + 1)}</span>}
-                {rel.slice(slash + 1)}
-                {f.created && <span className="hx-tag ml-1.5">new</span>}
-                {f.deleted && <span className="hx-tag hx-tag-bad ml-1.5">deleted</span>}
-                {f.edits.length > 1 && <span className="hx-dim ml-1.5">×{f.edits.length}</span>}
-              </span>
-              <DiffStat add={f.add} del={f.del} />
-            </button>
-          );
-        })}
-      </div>
-      <div className="hx-stack">
-        {shown.map((f) =>
-          f.edits.map((e, i) => (
-            <div key={`${nameOf(f)}-${i}`}>
-              {f.edits.length > 1 && (
-                <div className="hx-dim mb-1 text-[11px]">
-                  edit {i + 1} of {f.edits.length}
-                  {e.call?.status === "error" ? " · failed" : ""}
-                </div>
-              )}
-              <FileDiffView diff={e.diff} label={nameOf(f)} defaultOpen={shown.length <= 4} />
-              {f.truncated && <div className="hx-dim mt-1 text-[11px]">Diff shortened — the file changed a lot.</div>}
-            </div>
-          )),
-        )}
-      </div>
+      <SessionChanges files={files} cwd={cwd} self={self} subs={subs} own={own} commits={commits} compare={compare} started={started} />
     </div>
   );
 });
@@ -335,9 +307,12 @@ export function Inspector({
   harness,
   send,
   kiln = NO_AGENTS,
+  started,
 }: {
   /** The subagents kiln started for its goals or plan steps (sessions of their own), listed with its harness's own. */
   kiln?: readonly AgentInfo[];
+  /** Every agent it started through kiln: the Changes tab's By lists them, each read from its own session. */
+  started?: readonly Sub[];
   /** The agent, and how to send it commands (background tasks: output, stop). */
   agentId?: string;
   /** The agent's harness, by name ("Claude Code"). */
@@ -360,12 +335,23 @@ export function Inspector({
   // The folder its workspace of its own is laid over, once made (a string: Changes stays memoized).
   const volumeOver = useSession(store, (s) => (s.info?.workspace?.made ? (s.info.workspace.over ?? "") : undefined));
   const state = useSession(store, (s) => s.state);
+  // Who changed each file: the agent, by its name, and its harness's subagents.
+  const self = useSession(store, (s) => (s.info ? agentLabel(s.info) : "The agent"));
+  const subs = useSubs(state?.tasks);
+  const [scope] = useScope();
   // At work now: the goal under way shimmers.
   const working = useSession(store, (s) => s.info?.status === "running");
   const meta = useSession(store, (s) => s.meta);
+  // What one who changed its files did alone: its session answers, or its events show it edit by edit.
+  const answers = meta?.features.includes("own_edits") ?? false;
+  const own = React.useMemo<OwnSource>(
+    () => ({ id: store.id, answers, ask: (by) => store.request((client) => ({ type: "own_edits", client, by }), 8000), events: () => store.get().events }),
+    [store, answers],
+  );
   // What's worked out from the conversation stays as it was while it streams, unless it's what changed.
   const edits = useSameList(React.useMemo(() => (changes ? NO_EVENTS : editsOf(events)), [changes, events]));
-  const fileCount = React.useMemo(() => (changes ? changes.length : changesetOf(edits).length), [changes, edits]);
+  // What the Changes tab counts is what its scope shows: this project's files at first.
+  const fileCount = React.useMemo(() => (changes ? changes.filter((f) => inScope(f, scope)).length : changesetOf(edits).length), [changes, edits, scope]);
   const runs = useSameList(React.useMemo(() => (tab === "tools" ? runsOf(events) : []), [events, tab]));
   const todos = state?.todos ?? [];
   const done = todos.filter((t) => t.status === "completed").length;
@@ -400,7 +386,7 @@ export function Inspector({
         {actions}
       </div>
       <div className="hx-inspector-body">
-        {tab === "changes" && <Changes events={edits} changes={changes} cwd={cwd} agentId={agentId} volumeOver={volumeOver} />}
+        {tab === "changes" && <Changes events={edits} changes={changes} cwd={cwd} agentId={agentId} volumeOver={volumeOver} self={self} subs={subs} own={own} started={started} />}
         {tab === "plan" && (
           <div className="in-secs">
             <PlanSourceContext.Provider value={agentId ? { session: agentId } : null}>
