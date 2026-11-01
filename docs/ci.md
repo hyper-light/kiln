@@ -10759,14 +10759,18 @@ Its step 4, drafts, is built (R10–R14, with R04's verbs and R09's `ship.pipeli
   each commit saying `[skip ci]`, with a draft change (`githost::open_change`'s `draft`). Each is
   recorded in `ci_pipeline_drafts`.
 - No trigger runs a draft, and no other repository uses one (R10). Nothing runs on a draft's
-  branch, and the plan preview says why. A draft diff doesn't run its own workflow. Another
+  branch, and the plan preview says why. A draft diff doesn't run its own workflow, in either
+  dialect: its `pull_request` and its `diff` alike. Another
   repository's `uses:` of a draft's ref, or of a commit only a draft reaches, fails its run before
   any job (`KCI4023`). That holds for an action and a reusable workflow call alike, named through
   `kiln://` or a native source's plain name, by the whole commit or an abbreviation of it
   (`Remote::draft_only`).
 - Ready (R12) and Discard (R13) are verbs of `POST /api/ship/pipelines`. On a host, Ready commits
   the same tree again asking to skip nothing, then marks the change ready
-  (`githost::ready_change`); Discard closes the change and deletes its branch.
+  (`githost::ready_change`), so the host's CI starts. On kiln, Ready starts what the draft held
+  back, once: each workflow whose own file the diff changes, on its latest version, as the
+  version's `synchronize` and `diff` would have, unless its `types` took ready_for_review
+  already. Discard closes the change and deletes its branch.
 - Run (R14): `ci.runs.trigger` gains `sha`, `event`, `jobs` and `draft`. A draft runs as its
   author's test, as the run of a commit of its own (`runs.draft` marks it). It reports no status
   to its change, and a job naming an environment stops before it deploys.
@@ -10791,10 +10795,10 @@ Its step 5, sharing, is built (R17–R20):
   action's pane and a reusable workflow's have Used by and the Access in Settings.
 
 Not built yet: New (R08); GitHub's own dispatch where GitHub is the provider (R14); turning a
-workflow off and on (R15). Sharing step 3 found two gaps. R10's is closed: a draft-only commit
-pinned through a native source's plain name, or by a reusable call, was let through. Next is
-R12's: a kiln draft's own workflow should start when it's marked Ready. Then releases and update
-drafts (R21, R22, the plan's step 6). The tab (R01) and editing (R05, R06) come with the plan's
+workflow off and on (R15). Sharing step 3 found two gaps. Both are closed. R10's: a draft-only commit
+pinned through a native source's plain name, or by a reusable call, was let through. R12's: a
+kiln draft's own workflow didn't start when it was marked Ready, and a GitHub-dialect one wasn't
+held while it was a draft. Next are releases and update drafts (R21, R22, the plan's step 6). The tab (R01) and editing (R05, R06) come with the plan's
 step 7.
 
 ## 4. API, events, CLI and MCP reference
