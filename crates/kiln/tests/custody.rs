@@ -154,5 +154,22 @@ fn w27_r08_records_through_the_api_and_the_cli() -> anyhow::Result<()> {
     assert!(shown.contains(&sam.uri) || shown.contains("sam of"), "{shown}");
     assert!(cli(port, admin, &["custody", "breaks"])?.contains("changed"));
     assert!(cli(port, admin, &["transfers", "refused"])?.contains(&sam.uri));
+    // `kiln custody walk` (the Transfers plan's step 15): each hop in words; exported, every record
+    // it read as signed, each checking against kiln's CA certificate alone, with the revocations
+    // kiln holds (sam's among them).
+    let export = dir.path().join("walk.json");
+    let said = cli(port, admin, &["custody", "walk", &r1, "--export", &export.to_string_lossy()])?;
+    assert!(said.starts_with(&format!("{r1}: unbroken, each of its 3 hop(s) signed")), "{said}");
+    assert!(said.contains("sam received workspace tree from kiln") && said.contains("kiln passed workspace tree on to sam") && said.contains(", where the chain begins"), "{said}");
+    assert!(said.contains("exported to "), "{said}");
+    let exported: Value = serde_json::from_str(&std::fs::read_to_string(&export)?)?;
+    let ca = kiln::pki::der_of(field(&exported, "root"))?;
+    let records = exported.get("records").and_then(Value::as_array).cloned().unwrap_or_default();
+    assert!(records.len() >= 3, "{exported}");
+    for r in &records {
+        let c = kiln_ci::identity::statement::verify(r.get("bundle").unwrap_or(&Value::Null), &ca, &[], kiln::util::now_unix())?;
+        assert_eq!(c.digest, field(r, "digest"), "{r}");
+    }
+    assert!(exported.get("revocations").and_then(Value::as_array).is_some_and(|v| v.iter().any(|r| field(r, "reason") == "sam's laptop lost")), "{exported}");
     Ok(())
 }
