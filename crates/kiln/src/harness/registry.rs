@@ -1982,6 +1982,7 @@ impl Registry {
                         reach: spec.reach.clone(),
                         pause: None,
                         frozen: None,
+                        perms: None,
                         room_wait: None,
                         last_turn: None,
                         keep_off: false,
@@ -2321,6 +2322,20 @@ impl Registry {
                     let _ = Box::pin(self.dispatch_one(hub, &sub, Command::Pause { on: *on, task: None })).await;
                 }
             }
+        }
+        // What a person lets a session do: never more than its parent's, and the subagents kiln
+        // started under it narrowed by it, each sent its own.
+        if let Command::Perms { perms, task: None } = &c {
+            let all = self.list();
+            let mut mine = None;
+            for (sid, p) in super::lineage::perms_down(&all, id, perms.as_ref()) {
+                if sid == id {
+                    mine = Some(p);
+                } else if all.iter().any(|i| i.id == sid && i.status != Status::Exited) {
+                    let _ = Box::pin(self.dispatch_one(hub, &sid, Command::Perms { perms: p, task: None })).await;
+                }
+            }
+            return Box::pin(self.dispatch_one(hub, id, Command::Perms { perms: mine.flatten(), task: None })).await;
         }
         Box::pin(self.dispatch_one(hub, id, c)).await
     }

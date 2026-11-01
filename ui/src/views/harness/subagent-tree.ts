@@ -8,6 +8,8 @@
  * it. While it needs you, its own piece is tan.
  */
 import type { AgentInfo, Approval, ApprovalBrief, HEvent, SubagentBrief, Task } from "@/api/harness";
+import type { Grant } from "@/api/wire/Grant";
+import type { Perms } from "@/api/wire/Perms";
 import { agentLabel, plain } from "./derive";
 import { standOf } from "./mission-rows";
 import { askWords, isSubagent, kilnSubagentsOf } from "./tasks";
@@ -60,7 +62,34 @@ export interface SubagentNode {
   paused?: "own" | "above";
   /** A person can pause it from here, or resume its own pause: it goes, its harness can hold it, and no pause over it holds it. */
   pausable: boolean;
+  /** What a person lets it do, its own (`Perms`): never more than `over`. */
+  perms?: Perms;
+  /** What what it's under lets it do (its parent's, as narrowed): none, no limits. */
+  over?: Perms;
 }
+
+const RANK: Record<Grant, number> = { off: 0, ask: 1, allow: 2 };
+
+/** `mine`, never more than `up` lets (model.rs `Perms::narrow`, `Perms::within`): the narrower grant of each kind, the folder inside `up`'s, the smaller limits. */
+export function within(mine: Perms | undefined, up: Perms | undefined): Perms | undefined {
+  if (!mine || !up) return mine ?? up;
+  const least = <T extends number>(a: T | undefined, b: T | undefined) => (a != null && b != null ? (Math.min(a, b) as T) : (a ?? b));
+  const lower = (a: Grant, b: Grant): Grant => (RANK[a] <= RANK[b] ? a : b);
+  const trim = (f: string | undefined) => f?.replace(/\/+$/, "");
+  const [f, g] = [trim(mine.folder), trim(up.folder)];
+  return {
+    read: lower(mine.read, up.read),
+    edit: lower(mine.edit, up.edit),
+    run: lower(mine.run, up.run),
+    web: lower(mine.web, up.web),
+    folder: g == null ? f : f != null && (f === g || f.startsWith(`${g}/`)) ? f : g,
+    minutes: least(mine.minutes, up.minutes),
+    tokens: least(mine.tokens, up.tokens),
+  };
+}
+
+/** A grant `up` doesn't let (wider than its): not offered. */
+export const wider = (g: Grant, up: Grant | undefined) => up != null && RANK[g] > RANK[up];
 
 /** A row's piece of the path along one lane: from its top or its mark, to its mark or its bottom. */
 export interface Piece {
@@ -98,6 +127,7 @@ export function briefsOf(tasks: readonly Task[]): Brief[] {
     last_tool: t.last_tool,
     pausable: t.pausable,
     paused_at: t.paused_at,
+    perms: t.perms,
     summary: t.summary,
   }));
 }
@@ -185,17 +215,18 @@ export function subagentTree(root: AgentInfo, list: readonly AgentInfo[]): Subag
   const out: SubagentNode[] = [];
   const seen = new Set<string>();
   // `above`: a person paused something over these (the session they're in, a subagent they're under).
-  const walk = (owner: AgentInfo, parent: string | null, depth: number, above: boolean) => {
+  // `over`: what the session they're in lets them (its perms, as narrowed by those over it).
+  const walk = (owner: AgentInfo, parent: string | null, depth: number, above: boolean, over: Perms | undefined) => {
     const briefs: Brief[] = (owner.subagents ?? []).filter((b) => !list.some((a) => a.id === b.id && a.subagent === true));
     const ids = new Set(briefs.map((b) => b.id));
     const harness = (under: string | undefined) => briefs.filter((b) => (under ? b.parent_task === under : !b.parent_task || !ids.has(b.parent_task)));
-    const place = (b: Brief, parentKey: string | null, d: number, over: boolean) => {
+    const place = (b: Brief, parentKey: string | null, d: number, pausedOver: boolean, permsOver: Perms | undefined) => {
       const key = `${owner.id}/${b.id}`;
       if (seen.has(key)) return;
       seen.add(key);
       const ask = askOf(owner.approvals, b);
       const own = b.paused_at != null;
-      const stand = harnessStand(b, ask, own || over);
+      const stand = harnessStand(b, ask, own || pausedOver);
       // What it's at: its harness's summary of it where the live state has one (Claude Code's progress, or what it reported), else its last tool.
       const line = ask ? askWords(ask) : stand === "done" ? (b.summary ?? "") : b.summary || b.last_tool || "";
       out.push({
@@ -215,14 +246,16 @@ export function subagentTree(root: AgentInfo, list: readonly AgentInfo[]): Subag
         started: b.started,
         ended: b.ended,
         href: threadHref(root.id, owner.id, b.id),
-        paused: own ? "own" : over ? "above" : undefined,
-        pausable: !!b.pausable && !over,
+        paused: own ? "own" : pausedOver ? "above" : undefined,
+        pausable: !!b.pausable && !pausedOver,
+        perms: b.perms,
+        over: permsOver,
       });
-      for (const c of harness(b.id).sort((x, y) => x.started - y.started)) place(c, key, d + 1, over || own);
+      for (const c of harness(b.id).sort((x, y) => x.started - y.started)) place(c, key, d + 1, pausedOver || own, within(b.perms, permsOver));
     };
     const kiln = kilnSubagentsOf(list, owner.id);
     const items = [
-      ...harness(undefined).map((b) => ({ at: b.started, go: () => place(b, parent, depth, above) })),
+      ...harness(undefined).map((b) => ({ at: b.started, go: () => place(b, parent, depth, above, over) })),
       ...kiln.map((a) => ({
         at: a.created_at,
         go: () => {
@@ -249,14 +282,16 @@ export function subagentTree(root: AgentInfo, list: readonly AgentInfo[]): Subag
             href: threadHref(root.id, owner.id, a.id),
             paused: own ? "own" : above ? "above" : undefined,
             pausable: a.status !== "exited" && !above,
+            perms: a.perms,
+            over,
           });
-          walk(a, a.id, depth + 1, above || own);
+          walk(a, a.id, depth + 1, above || own, within(a.perms, over));
         },
       })),
     ].sort((x, y) => x.at - y.at);
     for (const it of items) it.go();
   };
-  walk(root, null, 0, root.frozen != null);
+  walk(root, null, 0, root.frozen != null, root.perms);
   return out;
 }
 

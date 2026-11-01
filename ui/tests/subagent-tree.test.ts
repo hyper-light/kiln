@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { AgentInfo } from "../src/api/harness.ts";
-import { briefsOf, stepLive, subagentRows, subagentTree, threadCrumbs, threadHref, topOf, treePaths, type Brief } from "../src/views/harness/subagent-tree.ts";
+import { briefsOf, stepLive, subagentRows, subagentTree, threadCrumbs, threadHref, topOf, treePaths, within, wider, type Brief } from "../src/views/harness/subagent-tree.ts";
+import type { Perms } from "../src/api/wire/Perms.ts";
 
 const agent = (id: string, rest: Partial<AgentInfo> = {}): AgentInfo => ({
   id,
@@ -184,6 +185,7 @@ test("a live state's tasks as the list has them: only subagents, with what they'
       last_tool: "Bash",
       pausable: undefined,
       paused_at: undefined,
+      perms: undefined,
       summary: "Running the tests",
     },
   ]);
@@ -244,4 +246,24 @@ test("a person's pause: its own says Paused and can be resumed; what's under it 
   // Live and not paused: Pause.
   const free = subagentTree(lead, [lead, kiln("f", "pl", 1)]).find((n) => n.key === "f");
   assert.deepEqual([free?.stand, free?.paused, free?.pausable], ["working", undefined, true]);
+});
+
+test("what a subagent may do: never more than what it's under (model.rs Perms::narrow), and each node knows what's over it", () => {
+  const up: Perms = { read: "allow", edit: "ask", run: "off", web: "ask", folder: "/w/kiln/", minutes: 30 };
+  const asked: Perms = { read: "ask", edit: "allow", run: "allow", web: "off", folder: "/w/kiln/crates/raft", minutes: 90, tokens: 50_000 };
+  assert.deepEqual(within(asked, up), { read: "ask", edit: "ask", run: "off", web: "off", folder: "/w/kiln/crates/raft", minutes: 30, tokens: 50_000 });
+  assert.equal(within({ ...asked, folder: "/w/kiln-other" }, up)?.folder, "/w/kiln", "beside its parent's folder, not in it: its parent's");
+  assert.equal(within(undefined, undefined), undefined);
+  assert.deepEqual(within(undefined, up), up);
+  assert.ok(wider("allow", "ask") && !wider("ask", "ask") && !wider("allow", undefined));
+  const lead = agent("pl", { perms: { read: "allow", edit: "allow", run: "ask", web: "allow" } });
+  const own: Perms = { read: "allow", edit: "off", run: "allow", web: "allow" };
+  const list = [lead, kiln("pk", "pl", 1, { perms: own, subagents: [brief("ph", 2)] })];
+  const by = new Map(subagentTree(lead, list).map((n) => [n.key, n]));
+  assert.deepEqual([by.get("pk")?.perms, by.get("pk")?.over], [own, lead.perms]);
+  assert.deepEqual(
+    by.get("pk/ph")?.over,
+    { read: "allow", edit: "off", run: "ask", web: "allow", folder: undefined, minutes: undefined, tokens: undefined },
+    "under its session: that one's, as narrowed by its agent's",
+  );
 });

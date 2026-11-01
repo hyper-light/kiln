@@ -31,6 +31,7 @@
 import type http from "node:http";
 import type { WebSocket } from "ws";
 import type { AgentInfo, Approval, HEvent, Meta, State, SubagentBrief, Task, Todo } from "../src/api/harness.ts";
+import type { Perms } from "../src/api/wire/Perms.ts";
 import { defaultInfo, defaultMeta, defaultState, defaultTask } from "./defaults.ts";
 import { PROPOSED } from "./pages.ts";
 import { forgetMarks } from "./push.ts";
@@ -515,7 +516,7 @@ function leaves(m: Member) {
   const live = tasks.filter((t) => t.status === "running" || t.status === "pending" || t.status === "paused");
   m.info.subagents = tasks
     .filter((t) => t.class === "agent")
-    .map((t): SubagentBrief => ({ id: t.id, tool_id: t.tool_id, description: t.description, status: t.status, parent_task: t.parent_task, started: t.started, ended: t.ended, last_tool: t.last_tool, pausable: t.pausable, paused_at: t.paused_at }));
+    .map((t): SubagentBrief => ({ id: t.id, tool_id: t.tool_id, description: t.description, status: t.status, parent_task: t.parent_task, started: t.started, ended: t.ended, last_tool: t.last_tool, pausable: t.pausable, paused_at: t.paused_at, perms: t.perms }));
   m.info.tasks_running = live.length;
   m.info.left_behind = live.length;
 }
@@ -843,6 +844,7 @@ const treeLeadAsk: Approval = {
     parent: "tree-lead",
     subagent: true,
     doing: "Running cargo test -p hyper-raft election",
+    perms: { read: "allow", edit: "allow", run: "ask", web: "allow" },
   });
   s1.info.created_at = t + 60_000;
   s1.tasks = [
@@ -967,6 +969,17 @@ function pauseMember(m: Member, on: boolean, task?: string) {
     x.info.frozen = on ? Date.now() : undefined;
     tell(x);
   }
+}
+
+/** What a person lets one of them do (`Command::Perms`), or one of its harness's own (`task`), as kiln keeps it. */
+function permsMember(m: Member, perms: Perms | undefined, task?: string) {
+  if (task) {
+    const t = m.tasks?.find((x) => x.id === task || x.tool_id === task);
+    if (!t) return;
+    t.perms = perms;
+    leaves(m);
+  } else m.info.perms = perms;
+  tell(m);
 }
 
 /** What a person answered one of them (`approve`), as its harness takes it: the request goes, and it works on. */
@@ -1237,7 +1250,7 @@ const META: Meta = {
   models: [],
   commands: [{ name: "btw", description: "Ask a side question without interrupting", hint: "<question>", group: "Session", args: "required", route: { kind: "prompt" } }],
   agents: [],
-  features: ["interrupt", "set_mode", "steer"],
+  features: ["interrupt", "set_mode", "steer", "limits"],
 };
 
 /** How a person's message reaches one of its subagents, as its harness lets one in (harness/subagent.rs): a Codex one on its own thread, a Claude Code one by way of its agent (not once stopped). */
@@ -1299,6 +1312,7 @@ function stateOf(m: Member): State {
     usage: { cost_usd: m.info.cost_usd, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, turns: 1 },
     dropped: 0,
     frozen: m.info.frozen,
+    perms: m.info.perms,
   };
 }
 
@@ -1676,9 +1690,10 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
   const cm = p.match(/^\/api\/harness\/sessions\/([^/]+)\/command$/);
   const told = cm ? family.get(decodeURIComponent(cm[1] ?? "")) : undefined;
   if (cm && told && m === "POST") {
-    const c = await body<{ type?: string; id?: string; decision?: string; text?: string; task?: string; mode?: string; on?: boolean }>(req);
+    const c = await body<{ type?: string; id?: string; decision?: string; text?: string; task?: string; mode?: string; on?: boolean; perms?: Perms }>(req);
     takeAnswer(told, c);
     if (c.type === "pause") pauseMember(told, c.on === true, c.task);
+    if (c.type === "perms") permsMember(told, c.perms, c.task);
     // A message sent without its socket (to one of a lead's subagents, from its page): to a subagent of its harness's own, or to it.
     if (c.type === "send" && c.text) {
       if (c.task) tellSubagent(told, c.task, c.id ?? `sub-${Date.now()}`, c.text, c.mode ?? "queue");

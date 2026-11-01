@@ -659,6 +659,98 @@ textarea.hx-input {
   white-space: nowrap;
   color: var(--color-bright);
 }
+/* What a person lets a subagent do: under its crumbs, in the thread's flow, every choice at the
+   panel's right edge. */
+.hx-perm {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  column-gap: 14px;
+  padding: 4px 16px 8px;
+  border-bottom: 1px solid #1d1f23;
+  background: #0d0c12;
+}
+.hx-perm-k {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 36px;
+  font-size: 12.5px;
+  color: #c3c5cb;
+}
+.hx-perm-k > svg {
+  color: #8f929b;
+}
+.hx-perm > .hx-perm-seg,
+.hx-perm > .hx-perm-where,
+.hx-perm > .hx-perm-limits {
+  justify-self: end;
+}
+.hx-perm-seg {
+  display: flex;
+  align-items: stretch;
+  height: 36px;
+}
+.hx-perm-seg button {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 10px;
+  border-bottom: 1px solid #2a2d33;
+  font-size: 12.5px;
+  color: #8f929b;
+}
+.hx-perm-seg button[aria-pressed="true"] {
+  border-bottom: 2px solid #cdc6ea;
+  color: var(--color-bright);
+}
+.hx-perm-seg button:disabled {
+  color: #44464d;
+  cursor: default;
+}
+.hx-perm-where,
+.hx-perm-limits {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  height: 36px;
+}
+.hx-perm-where input,
+.hx-perm-limits input {
+  height: 26px;
+  padding: 0 6px;
+  border: 0;
+  border-bottom: 1px solid #3a3d45;
+  background: transparent;
+  outline: 0;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: #c3c5cb;
+}
+.hx-perm-where input {
+  width: 220px;
+  min-width: 0;
+  text-align: right;
+}
+.hx-perm-limits input {
+  width: 74px;
+  text-align: right;
+}
+.hx-perm-where input:focus,
+.hx-perm-limits input:focus {
+  border-bottom-color: #cdc6ea;
+}
+.hx-perm-where input::placeholder,
+.hx-perm-limits input::placeholder {
+  color: #5b5e66;
+}
+@media (max-width: 520px) {
+  .hx-perm-where input {
+    width: 150px;
+  }
+  .hx-perm-seg button {
+    padding: 0 8px;
+  }
+}
 
 /* Find in the conversation: a bar over it, in its flow like the crumbs; the matches are painted in
    place (CSS Custom Highlights), the one shown brighter. */

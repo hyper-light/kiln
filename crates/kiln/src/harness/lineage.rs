@@ -439,6 +439,23 @@ pub fn subagents_under(all: &[Info], id: &str) -> Vec<String> {
     out
 }
 
+/// What each session is sent when a person sets session `id`'s perms (`Command::Perms`): its own,
+/// never more than its parent's; then each subagent kiln started under it, nearest first, its own
+/// never more than its parent's new ones. Narrowing one narrows those under it; widening one
+/// widens none (each was narrowed when it was set).
+pub fn perms_down(all: &[Info], id: &str, perms: Option<&super::model::Perms>) -> Vec<(String, Option<super::model::Perms>)> {
+    use super::model::Perms;
+    let of = |x: &str| all.iter().find(|i| i.id == x);
+    let parent = of(id).and_then(|i| i.parent.as_deref()).and_then(of).and_then(|p| p.perms.as_ref());
+    let mut now: Vec<(String, Option<Perms>)> = vec![(id.to_owned(), Perms::within(perms, parent))];
+    for sub in subagents_under(all, id) {
+        let Some(info) = of(&sub) else { continue };
+        let up = info.parent.as_deref().and_then(|p| now.iter().find(|(x, _)| x == p)).and_then(|(_, p)| p.as_ref());
+        now.push((sub, Perms::within(info.perms.as_ref(), up)));
+    }
+    now
+}
+
 /// The agents still running that agent `id` started, and theirs, nearest first.
 pub fn live_descendants(all: &[Info], id: &str) -> Vec<Info> {
     descendants(all, id).into_iter().filter(|c| c.status != Status::Exited).collect()
@@ -1181,6 +1198,23 @@ mod tests {
         assert!(subagents_under(&all, "s1a").is_empty());
     }
 
+    #[test]
+    fn a_session_s_perms_are_its_parent_s_at_most_and_narrow_the_subagents_under_it() {
+        use super::super::model::{Grant, Perms};
+        let sub = |id: &str, parent: &str, perms: Option<Perms>| Info { subagent: true, perms, ..info(id, Some(parent), Status::Running) };
+        let lead = Info { perms: Some(Perms { run: Grant::Ask, ..Perms::default() }), ..info("lead", None, Status::Idle) };
+        let all = vec![lead, sub("s1", "lead", None), sub("s1a", "s1", Some(Perms { web: Grant::Off, ..Perms::default() })), sub("s2", "lead", None)];
+        let sent = perms_down(&all, "s1", Some(&Perms { edit: Grant::Off, ..Perms::default() }));
+        let by = |id: &str| sent.iter().find(|(x, _)| x == id).and_then(|(_, p)| p.clone());
+        // Its own, held to its parent's Ask on run.
+        assert_eq!(by("s1"), Some(Perms { edit: Grant::Off, run: Grant::Ask, ..Perms::default() }));
+        // Under it: its own Off on web kept, and its new parent's narrowing on top.
+        assert_eq!(by("s1a"), Some(Perms { edit: Grant::Off, run: Grant::Ask, web: Grant::Off, ..Perms::default() }));
+        assert!(by("s2").is_none() && sent.len() == 2, "a sibling isn't touched");
+        // Cleared, it's its parent's.
+        assert_eq!(perms_down(&all, "s1", None).first().and_then(|(_, p)| p.clone()), Some(Perms { run: Grant::Ask, ..Perms::default() }));
+    }
+
     /// docs/agentic.md P2 (Ada's decisions 4 and 6, 2026-10-24): one pool of subagents at work per
     /// agent, whatever each does. An agent it started holds a place while it works, waits on a
     /// person, or is held to a goal still to go (between turns too); idle with its work done (a met
@@ -1196,7 +1230,7 @@ mod tests {
         }
         assert!(!in_pool(&child("pool-done", Status::Idle), &held), "idle, its work done");
         assert!(!in_pool(&child("pool-between", Status::Exited), &held), "ended, though its stack still holds the goal");
-        let sub = |status: &str| super::super::session::SubagentBrief { id: status.into(), tool_id: None, description: String::new(), status: status.into(), parent_task: None, started: 0, ended: None, last_tool: None, pausable: false, paused_at: None };
+        let sub = |status: &str| super::super::session::SubagentBrief { id: status.into(), tool_id: None, description: String::new(), status: status.into(), parent_task: None, started: 0, ended: None, last_tool: None, pausable: false, paused_at: None, perms: None };
         let parent = Info { subagents: ["running", "pending", "paused", "completed", "failed"].into_iter().map(sub).collect(), ..info("p", None, Status::Running) };
         assert_eq!(own_at_work(&parent), 3, "its harness's own still going");
         assert_eq!(most(None, None), (None, None), "no setting: no limit at all");

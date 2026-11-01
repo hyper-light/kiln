@@ -7,6 +7,7 @@ import type { Limit } from "./Limit";
 import type { MovePlan } from "./MovePlan";
 import type { Objective } from "./Objective";
 import type { Pause } from "./Pause";
+import type { Perms } from "./Perms";
 import type { RefusedMessages } from "./RefusedMessages";
 import type { SessionStatus } from "./SessionStatus";
 import type { SubagentBrief } from "./SubagentBrief";
@@ -83,6 +84,10 @@ pause?: Pause,
  * A person paused it: its processes stopped since (as `State::frozen`).
  */
 frozen?: number, 
+/**
+ * What a person lets it do (as `State::perms`).
+ */
+perms?: Perms, 
 /**
  * Since when it waits for room on its machine to go to work (as `State::room_wait`).
  */

@@ -189,6 +189,10 @@ pub struct SubagentBrief {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub paused_at: Option<i64>,
+    /// What a person lets it do (as `Task::perms`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub perms: Option<super::model::Perms>,
 }
 
 impl SubagentBrief {
@@ -207,6 +211,7 @@ impl SubagentBrief {
                 last_tool: t.last_tool.as_deref().map(|s| super::model::clip_middle(s, 200).0),
                 pausable: t.pausable,
                 paused_at: t.paused_at,
+                perms: t.perms.clone(),
             })
             .collect()
     }
@@ -380,6 +385,10 @@ pub struct Info {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub frozen: Option<i64>,
+    /// What a person lets it do (as `State::perms`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub perms: Option<super::model::Perms>,
     /// Since when it waits for room on its machine to go to work (as `State::room_wait`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub room_wait: Option<i64>,
@@ -513,6 +522,7 @@ impl Info {
         self.reach.clone_from(&s.reach);
         self.pause.clone_from(&s.pause);
         self.frozen = s.frozen;
+        self.perms.clone_from(&s.perms);
         self.room_wait = s.room_wait;
         self.last_turn.clone_from(&s.last_turn);
         self.move_on_limit = s.move_on_limit;
@@ -1132,6 +1142,7 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         reach: spec.reach.clone(),
         pause: None,
         frozen: None,
+        perms: None,
         room_wait: None,
         last_turn: None,
         keep_off: false,
@@ -3359,6 +3370,14 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                 pause_session(&s, on);
                                 on_change();
                             }
+                            // What a person lets the whole of it do (the server narrowed it to its parent's).
+                            Command::Perms { perms, task: None } => {
+                                let mut core = s.core.lock();
+                                core.state.perms = perms;
+                                core.touch_state();
+                                drop(core);
+                                on_change();
+                            }
                             Command::MaxSubagents { count } => {
                                 let mut core = s.core.lock();
                                 core.state.max_subagents = count.filter(|n| *n >= 1);
@@ -3847,6 +3866,14 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     // Paused while it isn't running: its processes are held as soon as it has any.
                     Command::Pause { on, task: None } => {
                         pause_session(&s, on);
+                        on_change();
+                    }
+                    // Its perms, set while it isn't running: they hold from its next start.
+                    Command::Perms { perms, task: None } => {
+                        let mut core = s.core.lock();
+                        core.state.perms = perms;
+                        core.touch_state();
+                        drop(core);
                         on_change();
                     }
                     c => adapter.command(&mut s.core.lock(), c),
@@ -4703,6 +4730,7 @@ mod tests {
             reach: None,
             pause: None,
             frozen: None,
+            perms: None,
             room_wait: None,
             last_turn: None,
             keep_off: false,

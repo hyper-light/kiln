@@ -323,6 +323,7 @@ classes! {
         Command::MoveOnLimit { .. } => REFUSED,
         Command::LimitHold { .. } => REFUSED,
         Command::Pause { .. } => REFUSED,
+        Command::Perms { .. } => REFUSED,
     }
 }
 

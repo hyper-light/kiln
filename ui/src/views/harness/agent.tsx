@@ -38,6 +38,7 @@ import { useMarkSeen } from "./seen";
 import { ActivityLine } from "./background";
 import { ThreadFromContext, Timeline, type ReplyTarget } from "./timeline";
 import { PauseButton } from "./subagent-pause";
+import { PermsPanel } from "./subagent-perms";
 import { BesideTerminals, openBeside as openTerminal } from "./beside";
 import { useDrafts } from "./state";
 import { PlanSourceContext } from "@/views/plans/save";
@@ -207,6 +208,11 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
     });
   const taskName = taskInfo?.description;
   const path = useThreadPath(store, id, info ?? undefined, sub, taskInfo?.id ?? taskId, taskName);
+  // What's open under its crumbs, for the thread it was opened for; and whether its session's harness lets kiln limit each call.
+  const threadKey = sub?.id ?? taskInfo?.id ?? taskId ?? "";
+  const [panelFor, setPanelFor] = React.useState<{ panel: ThreadPanel; thread: string } | null>(null);
+  const panel = panelFor?.thread === threadKey ? panelFor.panel : null;
+  const limits = useSession(sessionStore(path?.here?.session ?? id), (s) => (s.meta?.features ?? []).includes("limits"));
   // Who started the thread shown, for its timeline: a key, so its turns only render again when that changes.
   const fromKey = JSON.stringify(path ? threadFrom(path.crumbs, path.here, { via: sub ? null : taskInfo?.via, session: sub ? id : undefined }) : null);
   const from = React.useMemo(() => JSON.parse(fromKey) as ThreadFrom | null, [fromKey]);
@@ -311,7 +317,8 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
         />
       )}
       {findOpen && dropped > 0 && <EarlierMatches agent={subId ?? id} q={findQ} before={findEvents[0]?.at} />}
-      {path && <ThreadCrumbs crumbs={path.crumbs} here={path.here} sub={sub} onClose={mainThread} />}
+      {path && <ThreadCrumbs crumbs={path.crumbs} here={path.here} sub={sub} panel={panel} onPanel={(p) => setPanelFor(p && { panel: p, thread: threadKey })} onClose={mainThread} />}
+      {path?.here && panel === "perms" && <PermsPanel key={path.here.key} n={path.here} can={limits && takesMessage(path.here)} />}
       <ThreadFromContext.Provider value={from}>
         {sub ? (
           <React.Suspense fallback={<LoadingMark />}>
@@ -546,14 +553,32 @@ function useThreadPath(
   }, [open, everyone, id, info, sub, task, name, tasks, asks, done]);
 }
 
+/** What opens under a subagent's crumbs: what it may do. */
+type ThreadPanel = "perms";
+
 /**
  * Over a subagent's thread: its whole path, earlier names giving way first, each earlier one where
  * its thread opens (the first its agent's main thread); then pause, branch and its permissions;
  * its page of its own (one kiln started); and back to the main thread.
  */
-function ThreadCrumbs({ crumbs, here, sub, onClose }: { crumbs: readonly Crumb[]; here: SubagentNode | undefined; sub: AgentInfo | null; onClose: () => void }) {
+function ThreadCrumbs({
+  crumbs,
+  here,
+  sub,
+  panel,
+  onPanel,
+  onClose,
+}: {
+  crumbs: readonly Crumb[];
+  here: SubagentNode | undefined;
+  sub: AgentInfo | null;
+  /** The panel open under the line. */
+  panel: ThreadPanel | null;
+  onPanel: (p: ThreadPanel | null) => void;
+  onClose: () => void;
+}) {
   const last = crumbs.length - 1;
-  // Not in its tree: nothing to pause from here.
+  // Not in its tree: nothing to pause or limit from here.
   const node = here ?? { kind: "kiln" as const, session: crumbs[last]?.key ?? "", name: crumbs[last]?.name ?? "", pausable: false };
   return (
     <div className="hx-crumbs">
@@ -577,7 +602,7 @@ function ThreadCrumbs({ crumbs, here, sub, onClose }: { crumbs: readonly Crumb[]
       <button type="button" className="hx-icon" aria-label="Branch" disabled>
         <GitFork size={14} />
       </button>
-      <button type="button" className="hx-icon" aria-label="Permissions" disabled>
+      <button type="button" className="hx-icon" aria-label="Permissions" aria-expanded={panel === "perms"} disabled={!here} onClick={() => onPanel(panel === "perms" ? null : "perms")}>
         <Shield size={14} />
       </button>
       {/* What's only on its page of its own (its changes, its settings). */}

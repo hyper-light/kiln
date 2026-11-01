@@ -585,6 +585,11 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub paused_at: Option<i64>,
+    /// What a person lets it do (`Command::Perms` with its `task`), within its session's and the
+    /// subagent's it's under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub perms: Option<Perms>,
 }
 
 fn is_zero_u64(n: &u64) -> bool {
@@ -1329,6 +1334,11 @@ pub struct State {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub frozen: Option<i64>,
+    /// What a person lets it do (`Command::Perms`): every call of its own and of its harness's
+    /// subagents, within its parent's (the server narrows it so).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub perms: Option<Perms>,
 }
 
 /// One of kiln's own messages its harness was handed (`State::given`).
@@ -1400,6 +1410,86 @@ pub struct TurnEnd {
     /// `State::kept` when it ended: kiln started it and that many before it.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub kept: u32,
+}
+
+/// How far a subagent may go with one kind of tool call (`Perms`), narrowest first: not at all,
+/// asking a person each time, or as what it's under lets it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum Grant {
+    Off,
+    Ask,
+    #[default]
+    Allow,
+}
+
+/// What a person lets a subagent do (`Command::Perms`): each kind of tool call, the folder its file
+/// calls stay in, and how long and how much it may work. Never more than what it's under lets it
+/// ([`Perms::narrow`]).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+pub struct Perms {
+    /// Reading and searching files.
+    #[serde(default)]
+    pub read: Grant,
+    /// Changing files.
+    #[serde(default)]
+    pub edit: Grant,
+    /// Running commands, and MCP tools' calls.
+    #[serde(default)]
+    pub run: Grant,
+    /// Fetching and searching the web.
+    #[serde(default)]
+    pub web: Grant,
+    /// The folder its file calls stay in (absolute, or under its own folder).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub folder: Option<String>,
+    /// The most minutes it works, from when it started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub minutes: Option<u32>,
+    /// The most tokens it uses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub tokens: Option<u64>,
+}
+
+impl Perms {
+    /// These, never more than `up` lets: the narrower grant of each kind, the folder inside `up`'s
+    /// (`up`'s own where this one isn't in it), and the smaller of each limit.
+    #[must_use]
+    pub fn narrow(&self, up: &Perms) -> Perms {
+        let trim = |f: &str| f.trim_end_matches('/').to_owned();
+        let folder = match (self.folder.as_deref().map(trim), up.folder.as_deref().map(trim)) {
+            (Some(mine), Some(theirs)) if mine == theirs || mine.starts_with(&format!("{theirs}/")) => Some(mine),
+            (_, Some(theirs)) => Some(theirs),
+            (mine, None) => mine,
+        };
+        let least = |a: Option<u64>, b: Option<u64>| match (a, b) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        Perms {
+            read: self.read.min(up.read),
+            edit: self.edit.min(up.edit),
+            run: self.run.min(up.run),
+            web: self.web.min(up.web),
+            folder,
+            minutes: least(self.minutes.map(u64::from), up.minutes.map(u64::from)).and_then(|m| u32::try_from(m).ok()),
+            tokens: least(self.tokens, up.tokens),
+        }
+    }
+
+    /// `mine` (none: no limits of its own), never more than `up` lets (none: no limits above).
+    #[must_use]
+    pub fn within(mine: Option<&Perms>, up: Option<&Perms>) -> Option<Perms> {
+        match (mine, up) {
+            (Some(m), Some(u)) => Some(m.narrow(u)),
+            (m, u) => m.or(u).cloned(),
+        }
+    }
 }
 
 /// Why a session waits, and until when (`State::pause`).
@@ -1909,6 +1999,18 @@ pub enum Command {
         #[cfg_attr(test, ts(optional))]
         task: Option<String>,
     },
+    /// What a person lets it do (none: no limits of its own). Without `task`: the whole of it, its
+    /// harness's subagents too, within its parent's; the server narrows it so, and narrows the
+    /// subagents kiln started under it by it. With `task`: that subagent of its harness's own,
+    /// within the session's and the subagent's it's under.
+    Perms {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
+        perms: Option<Perms>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
+        task: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -2039,6 +2141,25 @@ pub fn clip_json(v: &serde_json::Value, max: usize) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_subagent_s_perms_never_let_it_do_more_than_what_it_s_under() {
+        let up = Perms { read: Grant::Allow, edit: Grant::Ask, run: Grant::Off, web: Grant::Ask, folder: Some("/w/kiln/".into()), minutes: Some(30), tokens: None };
+        let asked = Perms { read: Grant::Ask, edit: Grant::Allow, run: Grant::Allow, web: Grant::Off, folder: Some("/w/kiln/crates/raft".into()), minutes: Some(90), tokens: Some(50_000) };
+        let got = asked.narrow(&up);
+        assert_eq!((got.read, got.edit, got.run, got.web), (Grant::Ask, Grant::Ask, Grant::Off, Grant::Off), "the narrower of each");
+        assert_eq!(got.folder.as_deref(), Some("/w/kiln/crates/raft"), "a folder inside its parent's stays");
+        assert_eq!((got.minutes, got.tokens), (Some(30), Some(50_000)), "the smaller of each limit");
+        // A folder beside its parent's, not in it, is its parent's; one under a sibling's name isn't in it.
+        let beside = Perms { folder: Some("/w/kiln-other".into()), ..Perms::default() };
+        assert_eq!(beside.narrow(&up).folder.as_deref(), Some("/w/kiln"));
+        // None of its own: its parent's; none above: its own.
+        assert_eq!(Perms::within(None, Some(&up)), Some(up.clone()));
+        assert_eq!(Perms::within(Some(&asked), None), Some(asked.clone()));
+        assert_eq!(Perms::within(None, None), None);
+        assert!(Grant::Off < Grant::Ask && Grant::Ask < Grant::Allow);
+        assert_eq!(serde_json::to_value(&got).ok(), Some(serde_json::json!({"read": "ask", "edit": "ask", "run": "off", "web": "off", "folder": "/w/kiln/crates/raft", "minutes": 30, "tokens": 50000})));
+    }
 
     #[test]
     fn a_catalog_has_one_entry_per_name_and_no_alias_hides_one() {

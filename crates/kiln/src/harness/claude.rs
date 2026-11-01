@@ -16,13 +16,13 @@ use serde_json::{Value, json};
 
 use super::core::{Core, Effect, PreviewJob};
 use super::model::{
-    AlwaysOption, Approval, Body, Command, Control, ControlKind, ControlOption, ControlScope, Decision, Delivery, ExitInfo, FileDiff, HookInfo, Hunk, Known, Level, Limit, McpServer, McpStatus,
+    AlwaysOption, Approval, Body, Command, Control, ControlKind, ControlOption, ControlScope, Decision, Delivery, ExitInfo, FileDiff, HookInfo, Hunk, Known, Level, Limit, McpServer, McpStatus, Perms,
     McpTool, ModeOption, ModelOption, Objective, Plugin, Question, QuestionOption, QueueItem, SendMode, Skill, SlashCommand, Status, StatusItem, Task, Todo, Tone, ToolCall, ToolKind, ToolStatus,
     ChoiceAnswer, OUTPUT_MAX, Route, account_id, choices_of, clip_json, clip_middle, mask_emails, plan_label, safe_url, same_account, sort_catalog,
 };
 
 /// What a session of it can do, said when it starts (and again after an in-place upgrade).
-pub(super) const FEATURES: &[&str] = &["steer", "send_now", "queue", "queue_steer", "interrupt", "set_mode", "set_model", "set_effort", "set_speed", "stop_task", "file_suggestions", "resume", "attachments", "images", "switch_harness"];
+pub(super) const FEATURES: &[&str] = &["steer", "send_now", "queue", "queue_steer", "interrupt", "set_mode", "set_model", "set_effort", "set_speed", "stop_task", "limits", "file_suggestions", "resume", "attachments", "images", "switch_harness"];
 /// It turns nothing on or off once it runs.
 pub(super) const LEARNED: &[&str] = &[];
 
@@ -833,8 +833,9 @@ impl Claude {
                 }
             }
             // A pause's commands are the session's (`harness::pause`), as is a person's of the whole of it.
-            Command::Resume | Command::AutoResume { .. } | Command::PauseAt { .. } | Command::MaxSubagents { .. } | Command::MoveOnLimit { .. } | Command::LimitHold { .. } | Command::Pause { task: None, .. } => {}
+            Command::Resume | Command::AutoResume { .. } | Command::PauseAt { .. } | Command::MaxSubagents { .. } | Command::MoveOnLimit { .. } | Command::LimitHold { .. } | Command::Pause { task: None, .. } | Command::Perms { task: None, .. } => {}
             Command::Pause { on, task: Some(task) } => self.pause_subagent(core, &task, on),
+            Command::Perms { perms, task: Some(task) } => self.set_perms(core, &task, perms),
             Command::SetEffort { effort } => {
                 self.request(core, Pending::ApplySettings, json!({"subtype": "apply_flag_settings", "settings": {"effortLevel": effort}}));
                 core.state.effort = effort;
@@ -1636,6 +1637,21 @@ impl Claude {
         }
     }
 
+    /// What a person lets subagent `task` do (none: no limits of its own), never more than its
+    /// session and the subagent it's under let it ([`perms_over`]).
+    fn set_perms(&mut self, core: &mut Core, task: &str, perms: Option<Perms>) {
+        let Some(i) = core.state.tasks.iter().position(|t| t.subagent() && (t.id == task || t.tool_id.as_deref() == Some(task))) else {
+            self.notice(core, Level::Warn, "Not limited: it has no such subagent.".to_owned(), None);
+            return;
+        };
+        let up = core.state.tasks.get(i).and_then(|t| t.parent_task.clone());
+        let over = perms_over(core, up.as_deref());
+        if let Some(t) = core.state.tasks.get_mut(i) {
+            t.perms = perms.map(|p| Perms::within(Some(&p), over.as_ref()).unwrap_or(p));
+        }
+        core.touch_state();
+    }
+
     /// The calls held for a pause that no longer holds them get their answer, and go on.
     fn release_held(&mut self, core: &mut Core) {
         let (still, free): (Vec<_>, Vec<_>) = std::mem::take(&mut self.held_calls).into_iter().partition(|(_, task)| paused(core, task));
@@ -2201,11 +2217,16 @@ impl Claude {
     /// may run at once (`State::max_subagents`), counting those running and those it let start
     /// that haven't yet. Anything else goes on as asked.
     fn hook_callback(&mut self, core: &mut Core, id: &str, req: &Value) {
-        // A paused subagent's call waits: answered when it's resumed (`release_held`).
-        if str_of(req, "callback_id") == Some(HOLD_HOOK)
-            && let Some(task) = call_task(core, req).filter(|t| paused(core, t))
-        {
-            self.held_calls.push((id.to_owned(), task));
+        if str_of(req, "callback_id") == Some(HOLD_HOOK) {
+            let task = call_task(core, req);
+            // A paused subagent's call waits: answered when it's resumed (`release_held`).
+            if let Some(t) = task.as_ref().filter(|t| paused(core, t)) {
+                self.held_calls.push((id.to_owned(), t.clone()));
+                return;
+            }
+            // What a person lets it do: refused, asked, or let go as it would.
+            let out = limit(core, task.as_deref(), req).map_or(json!({}), |(decision, why)| json!({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": decision, "permissionDecisionReason": why}}));
+            core.write(&json!({"type": "control_response", "response": {"subtype": "success", "request_id": id, "response": out}}));
             return;
         }
         let mut out = json!({});
@@ -3703,6 +3724,98 @@ fn call_task(core: &Core, req: &Value) -> Option<String> {
     found.filter(|t| t.subagent()).map(|t| t.id.clone())
 }
 
+/// What a call in subagent `task` (none: the agent's own) may do: its session's perms, narrowed
+/// by each subagent's from the outermost to `task`. None: no limits.
+fn perms_over(core: &Core, task: Option<&str>) -> Option<Perms> {
+    let mut line: Vec<&Perms> = Vec::new();
+    let mut at = task.and_then(|t| core.state.tasks.iter().find(|u| u.id == t));
+    for _ in 0..=core.state.tasks.len() {
+        let Some(t) = at else { break };
+        if let Some(p) = &t.perms {
+            line.push(p);
+        }
+        at = t.parent_task.as_deref().and_then(|p| core.state.tasks.iter().find(|u| u.id == p));
+    }
+    line.into_iter().rev().fold(core.state.perms.clone(), |over, p| Perms::within(Some(p), over.as_ref()))
+}
+
+/// What a person's perms say of a hook's tool call (`req`) in subagent `task` (none: the agent's
+/// own): refused ("deny") or asked ("ask"), and why, in words the agent reads; none where they let it
+/// go as it would.
+fn limit(core: &Core, task: Option<&str>, req: &Value) -> Option<(&'static str, String)> {
+    use super::model::Grant;
+    let perms = perms_over(core, task)?;
+    let input = req.get("input");
+    let name = input.and_then(|i| str_of(i, "tool_name")).unwrap_or("");
+    let args = input.and_then(|i| i.get("tool_input")).cloned().unwrap_or(Value::Null);
+    let cwd = core.state.cwd.as_str();
+    // Past its limits, it finishes with what it has: its own task's time and tokens, or the session's.
+    let t = task.and_then(|t| core.state.tasks.iter().find(|x| x.id == t));
+    let since = t.map(|t| t.started).or_else(|| core.events().next().map(|e| e.at)).unwrap_or_else(Core::now);
+    let used = t.map_or(core.state.usage.input_tokens + core.state.usage.output_tokens, |t| t.tokens);
+    let finish = "Make no more tool calls: finish now with what you have.";
+    if let Some(m) = perms.minutes
+        && Core::now() - since > i64::from(m) * 60_000
+    {
+        return Some(("deny", format!("Your {m} minutes are up (a person's limit on you). {finish}")));
+    }
+    if let Some(n) = perms.tokens
+        && used >= n
+    {
+        return Some(("deny", format!("You've used your {n} tokens (a person's limit on you). {finish}")));
+    }
+    let (kind, _, _) = describe(name, &args, cwd);
+    let (grant, what) = match kind {
+        ToolKind::Read | ToolKind::Search => (perms.read, "read files"),
+        ToolKind::Edit => (perms.edit, "change files"),
+        ToolKind::Shell | ToolKind::Mcp => (perms.run, "run commands"),
+        ToolKind::Web => (perms.web, "use the web"),
+        _ => return None,
+    };
+    match grant {
+        Grant::Off => return Some(("deny", format!("You may not {what} (a person turned it off for you). Do without it, or say what you'd need."))),
+        Grant::Ask => return Some(("ask", format!("A person sees each time you {what}."))),
+        Grant::Allow => {}
+    }
+    // Its folder: a file call stays in it; a command can reach anywhere, so a person sees each.
+    let folder = perms.folder.as_deref()?;
+    let root = lexical(folder, cwd);
+    match kind {
+        ToolKind::Read | ToolKind::Search | ToolKind::Edit => {
+            let paths: Vec<&str> = ["file_path", "notebook_path", "path"].iter().filter_map(|k| str_of(&args, k)).collect();
+            let paths = if paths.is_empty() { vec![cwd] } else { paths };
+            paths
+                .into_iter()
+                .find(|p| {
+                    let at = lexical(p, cwd);
+                    at != root && !at.starts_with(&format!("{root}/"))
+                })
+                .map(|p| ("deny", format!("{p} is outside your folder, {folder} (a person's limit on you). Stay in it.")))
+        }
+        ToolKind::Shell => Some(("ask", format!("Your folder is {folder}, and a command can reach outside it: a person sees each."))),
+        _ => None,
+    }
+}
+
+/// Path `p` from folder `cwd`, its `.` and `..` worked out as written (no links followed), with
+/// Windows' separators and drives taken as `/` and a first part.
+fn lexical(p: &str, cwd: &str) -> String {
+    let (p, cwd) = (p.replace('\\', "/"), cwd.replace('\\', "/"));
+    let absolute = p.starts_with('/') || p.as_bytes().get(1) == Some(&b':');
+    let joined = if absolute { p } else { format!("{cwd}/{p}") };
+    let mut parts: Vec<&str> = Vec::new();
+    for part in joined.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    format!("/{}", parts.join("/"))
+}
+
 /// Subagent `task`, or one it's under, is paused by a person (`Task::paused_at`).
 fn paused(core: &Core, task: &str) -> bool {
     let mut at = core.state.tasks.iter().find(|t| t.id == task);
@@ -4630,6 +4743,65 @@ mod tests {
         c.command(&mut core, Command::Pause { on: false, task: Some("a8".into()) });
         assert!(core.take_writes().is_empty());
         assert!(core.state.tasks.iter().all(|t| t.paused_at.is_none()));
+        Ok(())
+    }
+
+    /// What a person lets a subagent do holds at each of its tool calls: Off refuses, Ask asks, its
+    /// folder keeps its file calls in it (a command asks), a subagent under it is held to it, and past
+    /// its tokens it's told to finish. The agent's own calls go as they would.
+    #[test]
+    fn a_subagent_s_perms_hold_at_each_of_its_tool_calls() -> anyhow::Result<()> {
+        use super::super::model::{Grant, Perms};
+        let mut c = Claude::new(false);
+        let mut core = Core::new();
+        core.state.cwd = "/w/kiln".into();
+        c.start(&mut core);
+        let call = |id: &str, name: &str, input: Value, parent: Option<&str>| json!({"type": "assistant", "message": {"id": format!("msg_{id}"), "model": "m", "content": [{"type": "tool_use", "id": id, "name": name, "input": input}]}, "parent_tool_use_id": parent}).to_string();
+        for l in [
+            call("toolu_5", "Agent", json!({"description": "Audit", "prompt": "audit", "run_in_background": true}), None),
+            r#"{"type":"system","subtype":"task_started","task_id":"a5","tool_use_id":"toolu_5","description":"Audit","task_type":"local_agent","is_backgrounded":true}"#.to_owned(),
+            call("toolu_8", "Agent", json!({"description": "Deeper", "prompt": "deeper"}), Some("toolu_5")),
+            r#"{"type":"system","subtype":"task_started","task_id":"a8","tool_use_id":"toolu_8","parent_task_id":"a5","description":"Deeper","task_type":"local_agent"}"#.to_owned(),
+            call("toolu_r1", "Read", json!({"file_path": "crates/raft/vote.rs"}), Some("toolu_5")),
+            call("toolu_r2", "Read", json!({"file_path": "crates/raft/../../../etc/passwd"}), Some("toolu_5")),
+            call("toolu_e1", "Edit", json!({"file_path": "crates/raft/vote.rs", "old_string": "a", "new_string": "b"}), Some("toolu_5")),
+            call("toolu_w1", "WebFetch", json!({"url": "https://example.com", "prompt": "read"}), Some("toolu_5")),
+            call("toolu_b1", "Bash", json!({"command": "cargo test"}), Some("toolu_5")),
+            call("toolu_n1", "Edit", json!({"file_path": "crates/raft/log.rs", "old_string": "a", "new_string": "b"}), Some("toolu_8")),
+            call("toolu_m1", "Edit", json!({"file_path": "README.md", "old_string": "a", "new_string": "b"}), None),
+        ] {
+            c.line(&mut core, &l);
+        }
+        // Over the session, Run asks; the subagent's own ask for Allow is narrowed to it.
+        core.state.perms = Some(Perms { run: Grant::Ask, ..Perms::default() });
+        c.command(&mut core, Command::Perms { perms: Some(Perms { edit: Grant::Off, web: Grant::Ask, folder: Some("crates/raft".into()), tokens: Some(1000), ..Perms::default() }), task: Some("a5".into()) });
+        let a5 = core.state.tasks.iter().find(|t| t.id == "a5").and_then(|t| t.perms.clone());
+        assert_eq!(a5.map(|p| (p.edit, p.web, p.run)), Some((Grant::Off, Grant::Ask, Grant::Ask)));
+        let _ = core.take_writes();
+        // Claude Code's hook for a call, and what kiln says of it: the decision and why, or nothing.
+        let decide = |c: &mut Claude, core: &mut Core, tool: &str, name: &str| -> anyhow::Result<Option<(String, String)>> {
+            let input = core.get(tool).and_then(|e| match &e.body {
+                Body::Tool(t) => Some(t.input.clone()),
+                _ => None,
+            });
+            let req = json!({"type": "control_request", "request_id": format!("h-{tool}"), "request": {"subtype": "hook_callback", "callback_id": HOLD_HOOK, "tool_use_id": tool, "input": {"hook_event_name": "PreToolUse", "tool_name": name, "tool_input": input}}});
+            c.line(core, &req.to_string());
+            let v: Value = serde_json::from_str(core.take_writes().first().map(String::as_str).unwrap_or("{}"))?;
+            let out = v.pointer("/response/response/hookSpecificOutput");
+            Ok(out.map(|o| (str_of(o, "permissionDecision").unwrap_or("").to_owned(), str_of(o, "permissionDecisionReason").unwrap_or("").to_owned())))
+        };
+        assert_eq!(decide(&mut c, &mut core, "toolu_r1", "Read")?, None, "a read in its folder goes as it would");
+        assert!(decide(&mut c, &mut core, "toolu_r2", "Read")?.is_some_and(|(d, why)| d == "deny" && why.contains("outside your folder, crates/raft")), "a path that climbs out of it is outside");
+        assert!(decide(&mut c, &mut core, "toolu_e1", "Edit")?.is_some_and(|(d, why)| d == "deny" && why.contains("may not change files")));
+        assert!(decide(&mut c, &mut core, "toolu_w1", "WebFetch")?.is_some_and(|(d, _)| d == "ask"));
+        assert!(decide(&mut c, &mut core, "toolu_b1", "Bash")?.is_some_and(|(d, _)| d == "ask"), "Run asks, over the session");
+        assert!(decide(&mut c, &mut core, "toolu_n1", "Edit")?.is_some_and(|(d, _)| d == "deny"), "a subagent under it is held to it");
+        assert_eq!(decide(&mut c, &mut core, "toolu_m1", "Edit")?, None, "the agent's own edit goes as it would");
+        // Past its tokens: told to finish.
+        if let Some(t) = core.state.tasks.iter_mut().find(|t| t.id == "a5") {
+            t.tokens = 1000;
+        }
+        assert!(decide(&mut c, &mut core, "toolu_r1", "Read")?.is_some_and(|(d, why)| d == "deny" && why.contains("finish now")));
         Ok(())
     }
 
