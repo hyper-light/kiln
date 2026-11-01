@@ -261,14 +261,18 @@ start_cluster() {
             --extra-config="$(kubelet_reservation)" \
             --wait=all
     fi
-    local alloc_cpu
-    alloc_cpu="$(kc get node "$PROFILE" -o jsonpath='{.status.allocatable.cpu}' 2>/dev/null || true)"
+    # The nodes' CPUs together, in millicores: size-nodes.sh shares them out by memory, so one node's
+    # needn't be the profile's.
+    local alloc_cpu want_total=""
+    alloc_cpu="$(kc get nodes -o jsonpath='{.items[*].status.allocatable.cpu}' 2>/dev/null |
+        python3 -c 'import sys; print(sum(int(q[:-1]) if q.endswith("m") else int(float(q) * 1000) for q in sys.stdin.read().split()))' 2>/dev/null || true)"
     local want_cpu=""
     if [ -f "${MINIKUBE_HOME:-$HOME/.minikube}/profiles/$PROFILE/config.json" ]; then
         want_cpu="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1]))["CPUs"]; print(f"{c*1000-int(sys.argv[2])}m")' \
             "${MINIKUBE_HOME:-$HOME/.minikube}/profiles/$PROFILE/config.json" "$SYSTEM_HEADROOM_MILLICPU" 2>/dev/null || true)"
+        [ -n "$want_cpu" ] && want_total=$((${want_cpu%m} * $(kc get nodes --no-headers 2>/dev/null | wc -l)))
     fi
-    if [ -n "$alloc_cpu" ] && [ -n "$want_cpu" ] && [ "$alloc_cpu" != "$want_cpu" ]; then
+    if [ -n "$alloc_cpu" ] && [ -n "$want_total" ] && [ "$alloc_cpu" != "$want_total" ]; then
         # The node size minikube was created with (docker's NanoCpus is 0 under the docker driver).
         local profile_json="${MINIKUBE_HOME:-$HOME/.minikube}/profiles/$PROFILE/config.json"
         [ -n "$NODE_CPUS" ] || NODE_CPUS="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["CPUs"])' "$profile_json")"
@@ -276,7 +280,7 @@ start_cluster() {
         if [ "${NODE_CPUS:-0}" -lt 1 ] || [ "${NODE_MEMORY_MB:-0}" -lt 1024 ]; then
             die "cannot determine node size from $profile_json; pass --cpus and --memory"
         fi
-        log "nodes advertise ${alloc_cpu} CPUs (want ${want_cpu}); reserving in the kubelet: $(kubelet_reservation)"
+        log "nodes advertise ${alloc_cpu}m CPUs together (want ${want_total}m); reserving in the kubelet: $(kubelet_reservation)"
         minikube start -p "$PROFILE" --extra-config="$(kubelet_reservation)"
         local n
         for n in $(kc get nodes -o jsonpath='{.items[*].metadata.name}'); do
@@ -291,9 +295,10 @@ start_cluster() {
     minikube -p "$PROFILE" addons enable metrics-server >/dev/null
     minikube -p "$PROFILE" addons enable storage-provisioner-rancher >/dev/null
     kc wait --for=condition=Ready nodes --all --timeout=300s >/dev/null
-    # minikube gives every kubelet the reservation above: each node's from its own container's size,
-    # for a node resized on its own (`docker update --memory`).
-    KILN_MINIKUBE_PROFILE="$PROFILE" KILN_SYSTEM_HEADROOM_KIB="$SYSTEM_HEADROOM_KIB" "$SCRIPT_DIR/size-nodes.sh" ||
+    # minikube gives every kubelet the reservation above: each node's memory from its own container's
+    # size (a node resized on its own: `docker update --memory`), and its share of the CPUs to match.
+    KILN_MINIKUBE_PROFILE="$PROFILE" KILN_NODE_CPUS="$NODE_CPUS" KILN_SYSTEM_HEADROOM_KIB="$SYSTEM_HEADROOM_KIB" \
+        KILN_SYSTEM_HEADROOM_MILLICPU="$SYSTEM_HEADROOM_MILLICPU" "$SCRIPT_DIR/size-nodes.sh" ||
         warn "some nodes keep a reservation that isn't their size (above); run deploy/cluster/size-nodes.sh again later"
     # `standard` (hostpath) stays the default class; `local-path` is used explicitly for state
     # that must stay on one node (kiln data, git server, Prometheus TSDB).
