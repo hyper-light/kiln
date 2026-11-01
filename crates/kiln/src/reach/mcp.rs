@@ -856,8 +856,12 @@ fn signed_by_the_agent(server: &Server, name: &str, mut input: Value) -> Result<
     let kind = if name == "ci.diffs.review" { "verdict" } else { "comment" };
     let text = |k: &str| input.get(k).and_then(Value::as_str).map(str::to_owned);
     let (words, action, suggestion) = (text("body").unwrap_or_default(), text("action").unwrap_or_default(), text("suggestion"));
-    // What it says, not where (its lines, its thread) nor whether it's published now.
-    let mut ask: serde_json::Map<String, Value> = ["diff", "action", "body", "suggestion", "version"].into_iter().filter_map(|k| input.get(k).map(|v| (k.to_owned(), v.clone()))).collect();
+    // What it says and where, as the comment's own check reads its place (its thread, its file's
+    // lines, a `line` its first), not whether it's published now.
+    let mut ask: serde_json::Map<String, Value> = ["diff", "action", "body", "suggestion", "version", "thread", "file", "side", "start_line", "end_line"].into_iter().filter_map(|k| input.get(k).map(|v| (k.to_owned(), v.clone()))).collect();
+    if let (false, Some(line)) = (ask.contains_key("start_line"), input.get("line")) {
+        ask.insert("start_line".into(), line.clone());
+    }
     ask.insert("kind".into(), json!(kind));
     let ask = Value::Object(ask);
     let to_sign = server.ask(json!({"op": "call", "name": "ci.diffs.statement", "input": ask})).map_err(|e| json!({"error": format!("{e:#}")}))?;
