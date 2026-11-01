@@ -203,7 +203,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W23 | CI providers: KilnCI, GitHub Actions, GitLab CI/CD, Bitbucket Pipelines | W03, W14, deploy-api.md §7 | in progress | the git-host interface (kiln, GitHub, GitLab, Bitbucket); the provider core; GitHub Actions, GitLab CI/CD and Bitbucket Pipelines behind one contract (runs, jobs, logs, rerun, cancel, dispatch, artifacts, approvals, environments, checks, lint, webhooks; AC01); the hosts' pull requests through one API (R06); events for agents; SSO with GitHub, GitLab and Bitbucket, and acting on the host as the person |
 | W24 | Incremental CI: fingerprints, reuse, warm state, shared caches | W04, W05, W06, W08, W13, W18 | ready | specified (2026-10-24): R01–R31, AC01–AC15; milestones M0–M7 and M1e are kiln goals with plans |
 | W26 | Review in Ship: changes as Ship items, each owning its review | W14, W23, W27, Ship (the CI/CD Integration plan) | in progress | R06–R15 built: each item's dropdown owns its review (Files and the Conversation, search on vorpal, kinds and the gate, suggestions and conflicts as revisions, the Review lanes), unsigned until W27-R03; AC06 in Chromium, not yet WebKit; specified (2026-10-25): R01–R20, AC01–AC11; plan `01a175b7d5e1772f8d3c7cb28e50ab2b` |
-| W27 | Attested end to end: identities, signatures, hand-offs, the trail | W10, W18, W26 | in progress | specified (2026-10-25): R01–R12, AC01–AC08; research `01a175c54441773fa28bf1488b82e6aa`; identities built (R01, R02, R12; AC01, AC02): plan `01a17856b1b0712babf8dfd37ce48756`; hand-offs built (R08; AC05: the 14:18 drop and the twin played again, refused and recorded, and the transfers simulation): plan `01a17856b1b477eda14a574ae312a123` |
+| W27 | Attested end to end: identities, signatures, hand-offs, the trail | W10, W18, W26 | in progress | specified (2026-10-25): R01–R12, AC01–AC08; research `01a175c54441773fa28bf1488b82e6aa`; identities built (R01, R02, R12; AC01, AC02): plan `01a17856b1b0712babf8dfd37ce48756`; hand-offs built (R08; AC05: the 14:18 drop and the twin played again, refused and recorded, and the transfers simulation): plan `01a17856b1b477eda14a574ae312a123`; custody built there too (R08: between machines, through relays and to production's pods, walked by `kiln custody walk` and modelled by `sim::custody`; the cluster group's copies wait for Ada's word) |
 
 ---
 
@@ -9307,9 +9307,12 @@ delegation of it.
 - *Not yet.* The environment's page doesn't show `require_chain` or `production` (an edit there
   keeps them).
 
-**Built: custody, and agent sessions handed over signed (R08, in part).** Plan
-`01a17856b1b477eda14a574ae312a123`, its steps 1 to 6 and step 7's changes and review requests;
-research `01a18abf2d28762d92104dca2fbfbf89`.
+**Built: custody, every hand-over signed by both sides (R08; all but the cluster group's copies).**
+Plan `01a17856b1b477eda14a574ae312a123`, its 16 steps: the records, sessions' hand-overs, acts and
+words, work, changes, review requests, carried approvals, promotions and the replant (steps 1 to
+10); a leg's inputs (11); between machines (12; its cluster group waits for Ada's word on T2's
+files); relays (13); production (14); the walk and its simulation (15); and end to end (16).
+Research `01a18abf2d28762d92104dca2fbfbf89`.
 
 - *Custody records* are signed statements (`kiln_ci::identity::statement`) whose body says the
   things they're about were handed on, received, passed on unchanged by a relay, or taken by kiln's
@@ -9762,7 +9765,13 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
   `w27_r08_relays_a_runners_relay_of_its_agents_calls` and `w27_r08_relays_kilns_relay_of_an_agents_words`
   walk step 13's chains (an agent's call through its runner; an agent's words through its runner and
   kiln) the same way, and on a test cluster `custody_production`'s `w27_r08_custody_to_production`
-  walks a pod's chain back to the commit the same way. Simulation
+  walks a pod's chain back to the commit the same way. End to end (step 16): on a test cluster,
+  `custody`'s `w27_r08_custody_end_to_end` (`#[ignore]`d without `KILN_CUSTODY_KUBECONFIG`, the
+  scenario `common::production`'s, shared with `custody_production`): `kiln custody walk` from a
+  running pod's receipt names each hop back to the commit, each signed; then a hop's record
+  removed, then changed where kiln keeps it, a receipt of CD's hand-on to the cluster signed by
+  someone else than its taker (`not-the-taker`), and a pod's image swapped, each refused where it
+  would be used and recorded. The other kinds of break, on other paths, are the tests above. Simulation
   (the Transfers plan's step 15, W27-R08):
   `sim::custody::tests::w27_r08_no_broken_chain_walks_as_unbroken` (docs/sim.md's custody model:
   things handed on directly and through one or two relays, under kiln-sim's nemesis, the relays

@@ -79,6 +79,14 @@ A runner's reach identity is a P-384 key generated on the machine (`<state>/reac
 `0600`, never sent anywhere) in a long-lived self-signed certificate naming the runner. Its
 fingerprint is the SHA-256 of the key's SubjectPublicKeyInfo.
 
+The relay records what it forwards (docs/ci.md W27-R08's relays). It can't read a link's frames, so
+it chains each way's frames by their ciphertext's digest (`kiln-frames-v1`) into runs, cut at 1,024
+frames or 10 seconds, the last at the link's close. Each run is a record kiln signs, numbered on
+its stream to the link's far end, which answers with its receipt of the frames as they came. A
+frame dropped, swapped or changed in the relay breaks that hop, refused where its end reads the
+link and recorded naming the relay. Both runners and the server say `CAP_RELAYS`; with a runner from
+before at either end, frames go as before, unrecorded.
+
 ### 3.2 Trust
 
 The first time two runners meet, each trusts the key the server's directory lists for the other,

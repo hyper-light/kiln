@@ -10,12 +10,20 @@ W27-R08 and W27-AC05). Every hand-over in kiln is now a transfer, and each is si
 What a copy left behind does through kiln is refused and recorded, and so is a hand-over's word
 reaching a process it isn't for.
 
-**Where it stands (2026-10-30, when written):**
+**Where it stands (2026-11-01, when written):**
 - **Merged:** no. It's the local branch `w27-custody`, built on the signing plan's `w27-sign`
   (merged in at aa163ed7f3) and its signed verdicts (532d8a031a, from `w27-verdicts`), which land
-  first. Landing, pushing and deploying wait for Ada's word.
+  first. Steps 11 to 16 are on it: step 12's sync and reach run from `w27-s12-reach`, step 13 from
+  `w27-relays` (ee47b78d3e), step 14 from `w27-custody-production` (e474474b02), step 15 from
+  `w27-custody-sim`. Landing, pushing and deploying wait for Ada's word.
 - **Deployed:** no.
-- **Checked:**
+- **Checked at f20c3107dd** (2026-11-01, through kiln's MCP `run` on fedora-2): clippy plain and
+  with `chaos`; kiln-ci's identity tests, 90; the kiln library's custody, relays, reach, runner,
+  proto, migrations, blue/green, agent, harness, CD, deploy, simulation and authz tests, 282;
+  `tests/custody.rs`; with `chaos`, every test of `tests/transfers.rs` (16) and identities' walk
+  and custody build; in a release build with `chaos`, the 14:18 drop, the session hand-overs, the
+  replant and every relays test (14). Both simulations' 200 seeds, each planted bug found.
+- **Checked before:**
   - clippy for kiln with all targets, clean;
   - the kiln library's W27, custody, deploy, updates, blue/green, agent and harness-host tests;
   - in a release build with the `chaos` faults, every test of `tests/transfers.rs` and
@@ -53,7 +61,7 @@ reaching a process it isn't for.
 - The custody simulation (`sim::custody`, step 15): things handed on through relays that drop,
   change, swap and replay what they carry, under kiln-sim's nemesis, walked by kiln-ci's custody
   core: no chain with a break walks as unbroken, and each of three planted bugs is found.
-- Between machines (step 12, so far): docs/ci.md W27 lists every path where one machine takes
+- Between machines (step 12, all but the cluster group): docs/ci.md W27 lists every path where one machine takes
   something from another. A runner's object from a peer's cache is handed on by the peer and
   received by the runner that fetched it, each signing; a copy changed on its way is refused, and
   the break recorded. No runner in production asks a peer yet: nothing mints its cache's tokens.
@@ -66,6 +74,23 @@ reaching a process it isn't for.
   that runner receives each for the session under it, and hands the output back, which the session
   receives. A copy changed on its way is refused before anything runs in it, and the break
   recorded; so is a run or an output that isn't what was handed on.
+- Relays (step 13): every intermediary records what it passes on, unchanged, numbered on a stream
+  of its own to its receiver: a runner relaying its agents' calls to kiln, kiln relaying an agent's
+  words to the runner holding the agent they're for, kiln relaying reach links' frames, and
+  blue/green's old build forwarding to the new one. A drop, swap or alteration is refused where
+  it's used and recorded as a break naming the relay. `GET /api/custody/relays` lists each relay's
+  streams.
+- To production (step 14): a KilnCD sync hands its cluster the manifests it applied and the images
+  they name, by digest, and kiln follows each image through its node's resolution of the index to
+  what each pod runs. A pod running anything else is a break, and an environment requiring a
+  verified chain (`gates.require_chain`) doesn't count that deploy healthy.
+  `GET /api/cd/apps/:app/custody` shows it.
+- The walk (step 15): `kiln custody walk <digest>` (`GET /api/custody/walk`) walks a thing's chain
+  back from where it's used to where it was made, each hop in words, or names its first break;
+  `--export` writes every record it read as signed, with kiln's CA certificate and its
+  revocations, for an auditor to check without kiln.
+- End to end (step 16): on a test cluster, a running pod's chain walks back to its commit, and each
+  break that path can play is refused where it would be used and recorded.
 
 ## Deploying it
 
@@ -79,10 +104,13 @@ reaching a process it isn't for.
   - `AgentMsg`: `HeadroomStatus`, `Unread`, `LinkUnread`, then `LegResults`, `LegSignature`,
     then `Custody`;
   - `ServerMsg`: `Headroom`, `Unread`, `ReachRefused`, then `SignAsLeg`, then `Custody`.
-  Then update `proto::w27_r08_custody_is_appended_after_headroom` to name the new indices. The
-  capability bits don't collide: 41 is main's `CAP_UNREAD`; 42, 43 and 44 are `CAP_AGENT_GIT`,
-  `CAP_LEG_SIGNS` and `CAP_CUSTODY`. Diff the tails against production's commit again before the
-  runners take it.
+  Then update `proto::w27_r08_custody_is_appended_after_headroom` to name the new indices.
+- **The capability bits collide too** (main at f122a88b3e, 2026-11-01): main has
+  `CAP_WORKSPACE_COMMITS` (42) and `CAP_WORKSPACE_COMPARE` (43). The landing merge moves W27's
+  `CAP_AGENT_GIT`, `CAP_LEG_SIGNS` and `CAP_CUSTODY` to 44, 45 and 46 (their tests with them);
+  `CAP_RELAYS` is 47 already. unify/takeover was told bits from 47 too, so whichever lands second
+  renumbers. Diff the tails against production's commit again before the runners take it
+  (`wire.py`).
 - **Merging main into it (Ship, from CI/CD Integration, 2026-10-31).** main's `ship.rs`
   `hand_off_in` (88de8655b6, b1ef50d5ce, not in this branch) takes a commit's author from
   `made_by(&rec).agent`, not `authors_agent`. This branch's `handing()` (the browser-signed Hand
@@ -108,6 +136,12 @@ reaching a process it isn't for.
   (`Announce.version`, already there); the server's directory says it (`RunnerInfo.reach_version`,
   a new optional field). `AgentMsg::Custody` carries a new JSON shape, `{"refused_hop": …}`, which
   a server from before refuses as an unreadable record, as it does any it can't read.
+- **Step 13 on the wire:** one new bit, `CAP_RELAYS` (47). With it, a runner sends its record of
+  each act it passes on (`passed_on` beside the ask) and checks what kiln relays to it (`relayed`
+  in an agent's words; kiln's records of a reach link's frames, in `ServerMsg::Custody`'s new
+  `{"reach": …}` shape); without it on either side, things go as before. Blue/green's old and new
+  builds of one runner speak `Frame::Forward`'s `passed_on` between themselves.
+- **Step 14 on the wire:** nothing new. CD's records stay on the server.
 - **kiln's store of bytes, after it:** a whole get of an object whose bytes don't hash to its etag
   is refused (`BadChecksum`), where it used to be served as the store gave it.
 - **Merging main: reach's variants.** main has `Ask::Unread` and `Say::Unread` (index 11 on each),
@@ -116,22 +150,32 @@ reaching a process it isn't for.
   `reach::wire`'s `w27_r08_custody_frames_are_appended_after_every_older_variant` names `Unread`
   as the variant `Custody` comes after.
 - **Config:** nothing new in kiln.toml.
-- **First start:** the migrations only add tables (`ci_leg_pushed` with step 11).
+- **First start:** the migrations add tables and indexes (`ci_leg_pushed` with step 11;
+  `cd_custody_syncs`, `cd_custody_pods` and an index on `registry_manifests` with step 14's
+  `w27_cd_custody`) and one column with a default (`custody_breaks.relay`, with step 13's
+  `w27_relays`). Both of the last two are stamped 20261101-0200: kiln applies them by name, and
+  they touch different tables.
 
 ## Watching it
 
 - `kiln transfers refused`: what kiln refused, and why. A copy left behind acting shows here.
 - `kiln transfers unsigned`: hand-overs that went unsigned, and which side is from before.
 - `GET /api/custody/breaks`: chains that don't walk. It should stay empty.
+- `kiln custody walk <digest>`: a thing's chain, in words, or its first break.
+- `GET /api/custody/relays`: each relay's streams, numbers missing and records unanswered.
+- `GET /api/cd/apps/:app/custody`: whether each pod runs what its deploy handed on.
 
 ## Rollback
 
-- Back to the release before: its migration runner ignores the tables it doesn't know, and no
-  setting needs to come out of kiln.toml.
+- Back to the release before: its migration runner ignores the tables it doesn't know, and an
+  older build never names `custody_breaks.relay`; no setting needs to come out of kiln.toml.
 - Hand-overs go unsigned again, as before.
 
 ## Open
 
-- Steps 12–16: machines, intermediaries, production, the walk and its simulation, and the end to
-  end. Ada approved plan v7 on 2026-10-31; step 11 is built, and step 12's peers' objects.
+- Step 12's cluster group (its learners' copies and log): waits on Ada's word on T2's files.
+- The blob stores stand in for Mantle's puts and gets until CP-T10.2 vendors it (put to Ada).
+- A runner keeps its reach directory 30 s and refuses a runner that announced after its last read
+  (put to Ada: re-read once before refusing).
+- Step 16's end to end runs on the test cluster, then the gate on this branch.
 - A session's `Open` at a later epoch isn't signed itself (docs/reach.md, "Not yet").
