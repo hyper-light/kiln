@@ -3,7 +3,7 @@
  * changeset, the commands it ran. Pure functions of the event list, memoized by the caller.
  */
 import { useState } from "react";
-import type { FileDiff, HEvent, Task, ToolCall, ToolKind } from "@/api/harness";
+import type { FileDiff, FilePlace, HEvent, Task, ToolCall, ToolKind } from "@/api/harness";
 import { isShowPage } from "./page-of";
 import { isShowLive } from "./live-of";
 
@@ -332,6 +332,12 @@ export interface ChangedFile {
   del: number;
   /** Every edit to the file, in order, with the call that made it (one cumulative diff, call null, from the server). */
   edits: { call: ToolEvent | null; diff: FileDiff }[];
+  /** Who changed it, in the order they first did: `main` (the agent itself) or a subagent run by its spawning call's id. */
+  by?: string[];
+  /** Whose it is; none (an older runner) is this project's. */
+  place?: FilePlace;
+  /** Unix ms of its last change (the server's). */
+  at?: number;
 }
 
 /** Everything the agent changed (or proposed and was refused), file by file. */

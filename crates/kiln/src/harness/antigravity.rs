@@ -30,7 +30,7 @@ use super::model::{
 use super::session::Spec;
 
 /// What a session of it can do, said when it starts (and again after an in-place upgrade).
-pub(super) const FEATURES: &[&str] = &["send_now", "queue", "interrupt", "set_mode", "set_model", "set_effort", "resume", "attachments", "switch_harness"];
+pub(super) const FEATURES: &[&str] = &["send_now", "queue", "interrupt", "set_mode", "set_model", "set_effort", "resume", "attachments", "switch_harness", "own_edits"];
 /// It turns nothing on or off once it runs.
 pub(super) const LEARNED: &[&str] = &[];
 
@@ -289,7 +289,7 @@ impl Agy {
             Command::Control { id, value } => {
                 super::goback::control(core, &id, value.as_ref());
             }
-            Command::StopTask { .. } | Command::StopTasks | Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } => {}
+            Command::StopTask { .. } | Command::StopTasks | Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } | Command::OwnEdits { .. } => {}
             // A pause's commands are the session's (`harness::pause`).
             Command::Resume | Command::AutoResume { .. } | Command::PauseAt { .. } | Command::MaxSubagents { .. } | Command::MoveOnLimit { .. } | Command::LimitHold { .. } | Command::Pause { .. } | Command::Perms { .. } | Command::Branch { .. } => {}
             // Its own commands and skills run as "/name args" messages.

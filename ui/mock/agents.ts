@@ -382,6 +382,30 @@ for (const m of [
       false,
       kiln("research_add"),
     ),
+    // Its edit of quic.rs, which the agent changed after it: shown one by one where its part isn't kept (OWN).
+    call("toolu_opt", now - 7 * 60_000, "Edit", "edit", "crates/kiln/src/http/quic.rs", { file_path: "/home/ada/src/kiln/crates/kiln/src/http/quic.rs" }, false, {
+      diffs: [
+        {
+          path: "crates/kiln/src/http/quic.rs",
+          hunks: [
+            {
+              old_start: 120,
+              old_lines: 3,
+              new_start: 120,
+              new_lines: 4,
+              lines: [
+                "     let conn = endpoint.connect(addr)?;",
+                "-    let stream = conn.open_bi().await?;",
+                "-    stream.write_all(&req).await?;",
+                "+    let (mut send, recv) = conn.open_bi().await?;",
+                "+    send.write_all(&req).await?;",
+                "+    read_answer(recv).await",
+              ],
+            },
+          ],
+        },
+      ],
+    }),
     call("toolu_opt", now - 6 * 60_000, "Bash", "shell", "ssh fedora 'cd ~/src/amphora && ./bench/run.sh s3-put'", { command: "ssh fedora 'cd ~/src/amphora && ./bench/run.sh s3-put'" }, false, {
       status: "error",
       exit_code: 255,
@@ -1288,7 +1312,7 @@ const META: Meta = {
   models: [],
   commands: [{ name: "btw", description: "Ask a side question without interrupting", hint: "<question>", group: "Session", args: "required", route: { kind: "prompt" } }],
   agents: [],
-  features: ["interrupt", "set_mode", "steer", "limits"],
+  features: ["interrupt", "set_mode", "steer", "limits", "own_edits"],
 };
 
 /** How a person's message reaches one of its subagents, as its harness lets one in (harness/subagent.rs): a Codex one on its own thread, a Claude Code one by way of its agent (not once stopped). */
@@ -1363,7 +1387,7 @@ export function handleFamilySession(ws: WebSocket, id: string): boolean {
   viewers.set(id, seen.add(ws));
   ws.on("close", () => seen.delete(ws));
   ws.on("message", (raw) => {
-    type Cmd = { type?: string; task?: string; id?: string; text?: string; mode?: string; index?: number };
+    type Cmd = { type?: string; task?: string; id?: string; text?: string; mode?: string; index?: number; client?: string; by?: string };
     let frame: Cmd & { t?: string; c?: Cmd };
     try {
       frame = JSON.parse(raw.toString()) as typeof frame;
@@ -1378,6 +1402,10 @@ export function handleFamilySession(ws: WebSocket, id: string): boolean {
     if (c.type === "stop_task" && c.task) setTimeout(() => stopTask(m, c.task ?? ""), 700);
     if (c.type === "send" && c.task && c.text) tellSubagent(m, c.task, c.id ?? `sub-${Date.now()}`, c.text, c.mode ?? "queue");
     if (c.type?.startsWith("queue_")) subagentQueue(m, c);
+    // What one who changed its files did alone, as its session keeps it (docs/agents.md, "One subagent's own edits").
+    // Its machine takes a moment, as a runner's round trip does: the panel shows the session's numbers dimmed till then.
+    const ask = c.type === "own_edits" && c.client && c.by ? { client: c.client, by: c.by } : null;
+    if (ask) setTimeout(() => send({ t: "reply", client: ask.client, value: { by: ask.by, files: OWN[id]?.[ask.by] ?? [] } }), 1500);
     if (under) send({ t: "ack", id: under, outcome: "taken" });
   });
   send({ t: "open", info: m.info });
@@ -1392,6 +1420,167 @@ export function handleFamilySession(ws: WebSocket, id: string): boolean {
 
 /** What the family's agents changed, as their machines report it. */
 const CHANGESETS: Record<string, unknown[]> = {
+  // The lead's own work, its two subagents' and, outside the project, the person's and the agents' own
+  // (docs/agents.md, "Who changed a file, and whose it is"): the Changes tab's Scope and By.
+  "fam-orch": [
+    {
+      path: "crates/kiln/src/plans/planner.rs",
+      tree: "/home/ada/src/kiln",
+      added: 3,
+      removed: 1,
+      at: Date.now() - 120000,
+      hunks: [
+        {
+          old_start: 40,
+          old_lines: 3,
+          new_start: 40,
+          new_lines: 5,
+          lines: [
+            "     let order = plan.steps();",
+            "-    let first = order.first();",
+            "+    // Steps that wait for nothing go first, side by side.",
+            "+    let ready = order.iter().filter(|s| s.needs.is_empty());",
+            "+    let first = ready.clone().next();",
+            "     first.map(Step::start)",
+          ],
+        },
+      ],
+      by: ["main"],
+      place: "project",
+    },
+    {
+      path: "crates/kiln/src/plans/mod.rs",
+      tree: "/home/ada/src/kiln",
+      added: 2,
+      removed: 1,
+      at: Date.now() - 240000,
+      hunks: [
+        {
+          old_start: 3,
+          old_lines: 2,
+          new_start: 3,
+          new_lines: 3,
+          lines: [" pub mod planner;", "-pub mod order;", "+pub(crate) mod order;", "+pub mod ready;"],
+        },
+      ],
+      by: ["main", "toolu_planner"],
+      place: "project",
+    },
+    {
+      path: "docs/plans.md",
+      tree: "/home/ada/src/kiln",
+      added: 3,
+      removed: 0,
+      at: Date.now() - 360000,
+      hunks: [
+        {
+          old_start: 88,
+          old_lines: 1,
+          new_start: 88,
+          new_lines: 4,
+          lines: [" ## Steps side by side", "+", "+A step that waits for nothing starts at once; the rest wait for", "+what they need."],
+        },
+      ],
+      by: ["toolu_planner"],
+      place: "project",
+    },
+    {
+      path: "crates/kiln/src/http/quic.rs",
+      tree: "/home/ada/src/kiln",
+      added: 4,
+      removed: 2,
+      at: Date.now() - 540000,
+      hunks: [
+        {
+          old_start: 120,
+          old_lines: 3,
+          new_start: 120,
+          new_lines: 5,
+          lines: [
+            "     let conn = endpoint.connect(addr)?;",
+            "-    let stream = conn.open_bi().await?;",
+            "-    stream.write_all(&req).await?;",
+            "+    let (mut send, recv) = conn.open_bi().await?;",
+            "+    send.write_all(&req).await?;",
+            "+    send.finish()?;",
+            "+    read_answer(recv).await",
+          ],
+        },
+      ],
+      by: ["toolu_opt", "main"],
+      place: "project",
+    },
+    {
+      path: "/home/ada/Projects/hyper-raft/src/log.rs",
+      added: 1,
+      removed: 0,
+      at: Date.now() - 1200000,
+      hunks: [
+        {
+          old_start: 77,
+          old_lines: 2,
+          new_start: 77,
+          new_lines: 3,
+          lines: [" pub fn append(&mut self, e: Entry) -> Index {", "+    debug_assert!(e.term >= self.last_term());", "     self.entries.push(e);"],
+        },
+      ],
+      by: ["main"],
+      place: "user",
+    },
+    {
+      path: "/home/ada/.zshrc",
+      added: 1,
+      removed: 0,
+      at: Date.now() - 1320000,
+      hunks: [
+        {
+          old_start: 41,
+          old_lines: 1,
+          new_start: 41,
+          new_lines: 2,
+          lines: [' export PATH="$HOME/.local/bin:$PATH"', "+export KILN_PLAN_TRACE=1"],
+        },
+      ],
+      by: ["main"],
+      place: "user",
+    },
+    {
+      path: "/home/ada/.claude/projects/-home-ada-src-kiln/memory/plans.md",
+      created: true,
+      added: 2,
+      removed: 0,
+      at: Date.now() - 60000,
+      hunks: [
+        {
+          old_start: 1,
+          old_lines: 0,
+          new_start: 1,
+          new_lines: 2,
+          lines: ["+# Plans", "+- steps that wait for nothing start first"],
+        },
+      ],
+      by: ["main"],
+      place: "agent",
+    },
+    {
+      path: "/tmp/planner-bench/run.sh",
+      created: true,
+      added: 2,
+      removed: 0,
+      at: Date.now() - 660000,
+      hunks: [
+        {
+          old_start: 1,
+          old_lines: 0,
+          new_start: 1,
+          new_lines: 2,
+          lines: ["+#!/bin/sh", "+cargo bench -p kiln planner"],
+        },
+      ],
+      by: ["toolu_planner"],
+      place: "agent",
+    },
+  ],
   "fam-tests": [
     {
       path: "/home/ada/.local/state/kiln/workspaces/kiln-famtests/crates/kiln/src/http/client.rs",
@@ -1420,6 +1609,68 @@ const CHANGESETS: Record<string, unknown[]> = {
       ],
     },
   ],
+};
+
+/** What each who changed fam-orch's files did alone to those another changed too, as its session answers (`own_edits`): mod.rs is the agent's and then the planner's; of quic.rs, the optimizer's part is past what the session keeps, so its edits show one by one. */
+const OWN: Record<string, Record<string, unknown[]>> = {
+  "fam-orch": {
+    main: [
+      {
+        path: "crates/kiln/src/plans/mod.rs",
+        tree: "/home/ada/src/kiln",
+        kept: true,
+        edits: [
+          {
+            path: "crates/kiln/src/plans/mod.rs",
+            tree: "/home/ada/src/kiln",
+            added: 1,
+            removed: 1,
+            at: Date.now() - 240000,
+            hunks: [{ old_start: 3, old_lines: 2, new_start: 3, new_lines: 2, lines: [" pub mod planner;", "-pub mod order;", "+pub(crate) mod order;"] }],
+            by: ["main"],
+            place: "project",
+          },
+        ],
+      },
+      {
+        path: "crates/kiln/src/http/quic.rs",
+        tree: "/home/ada/src/kiln",
+        kept: true,
+        edits: [
+          {
+            path: "crates/kiln/src/http/quic.rs",
+            tree: "/home/ada/src/kiln",
+            added: 1,
+            removed: 0,
+            at: Date.now() - 540000,
+            hunks: [{ old_start: 121, old_lines: 2, new_start: 121, new_lines: 3, lines: ["     send.write_all(&req).await?;", "+    send.finish()?;", "     read_answer(recv).await"] }],
+            by: ["main"],
+            place: "project",
+          },
+        ],
+      },
+    ],
+    toolu_planner: [
+      {
+        path: "crates/kiln/src/plans/mod.rs",
+        tree: "/home/ada/src/kiln",
+        kept: true,
+        edits: [
+          {
+            path: "crates/kiln/src/plans/mod.rs",
+            tree: "/home/ada/src/kiln",
+            added: 1,
+            removed: 0,
+            at: Date.now() - 240000,
+            hunks: [{ old_start: 3, old_lines: 2, new_start: 3, new_lines: 3, lines: [" pub mod planner;", " pub(crate) mod order;", "+pub mod ready;"] }],
+            by: ["toolu_planner"],
+            place: "project",
+          },
+        ],
+      },
+    ],
+    toolu_opt: [{ path: "crates/kiln/src/http/quic.rs", tree: "/home/ada/src/kiln", kept: false, why: "cap" }],
+  },
 };
 
 function end(id: string): boolean {
@@ -1681,6 +1932,201 @@ async function handleAttached(req: http.IncomingMessage, res: http.ServerRespons
   return false;
 }
 
+/** fam-orch's branch as its machine lists it (`agents.commits`, docs/agents.md "Commits"): two commits of its session's, two from before it, and what isn't committed yet; the docs commit needs the one that made the plan's steps say what they need. */
+const ORCH_TREE = "/home/ada/src/kiln";
+function changed(path: string, lines: string[], at: number, created = false) {
+  const added = lines.filter((l) => l.startsWith("+")).length;
+  const removed = lines.filter((l) => l.startsWith("-")).length;
+  return {
+    path,
+    tree: ORCH_TREE,
+    ...(created && { created }),
+    added,
+    removed,
+    hunks: [{ old_start: created ? 0 : 1, old_lines: lines.length - added, new_start: 1, new_lines: lines.length - removed, lines }],
+    at,
+    place: "project",
+  };
+}
+const ORCH_COMMITS = (() => {
+  const t = Date.now();
+  return [
+    {
+      sha: "c4f1e2a9b0d3e5f60718293a4b5c6d7e8f901234",
+      subject: "Planner: steps that wait for nothing go first",
+      at: t - 4 * 60_000,
+      session: true,
+      files: [
+        changed(
+          "crates/kiln/src/plans/planner.rs",
+          [
+            "     let order = plan.steps();",
+            "-    let first = order.first();",
+            "+    let ready = order.iter().filter(|s| s.needs.is_empty());",
+            "+    let first = ready.clone().next();",
+            "+    // Steps that wait for nothing go first, side by side.",
+            "     first.map(Step::start)",
+          ],
+          t - 4 * 60_000,
+        ),
+      ],
+    },
+    {
+      sha: "9b8e7d6c5a4132f1e0d9c8b7a6f5e4d3c2b1a090",
+      subject: "Docs: steps side by side",
+      at: t - 9 * 60_000,
+      session: true,
+      files: [changed("docs/plans.md", [" ## Steps side by side", "+", "+A step that waits for nothing starts at once; the rest wait for", "+what they need."], t - 9 * 60_000)],
+    },
+    {
+      sha: "5d4c3b2a1f0918273645aabbccddeeff00112233",
+      subject: "Plans: a step says what it needs",
+      at: t - 2 * 3_600_000,
+      session: false,
+      files: [
+        changed("docs/plans.md", ["+# Plans", "+", "+## Steps side by side"], t - 2 * 3_600_000, true),
+        changed("crates/kiln/src/plans/step.rs", ["     pub title: String,", "+    pub needs: Vec<usize>,"], t - 2 * 3_600_000),
+      ],
+    },
+    {
+      sha: "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d",
+      subject: "Plans: read a plan's steps in order",
+      at: t - 5 * 3_600_000,
+      session: false,
+      files: [changed("crates/kiln/src/plans/mod.rs", [" pub mod planner;", "+pub mod order;"], t - 5 * 3_600_000)],
+    },
+  ];
+})();
+const ORCH_NOW = [
+  changed(
+    "crates/kiln/src/plans/ready.rs",
+    ["+/// The steps that wait for nothing.", "+pub fn ready(plan: &Plan) -> Vec<&Step> {", "+    plan.steps().iter().filter(|s| s.needs.is_empty()).collect()", "+}"],
+    Date.now(),
+    true,
+  ),
+  changed("crates/kiln/src/plans/mod.rs", [" pub mod planner;", "-pub mod order;", "+pub(crate) mod order;", "+pub mod ready;"], Date.now()),
+];
+const MAIN_COMMITS = [
+  {
+    sha: "bd1f2a7e0c9b8a7f6e5d4c3b2a1908f7e6d5c4b3",
+    subject: "Seams: a conformance suite per seam",
+    at: Date.now() - 6 * 3_600_000,
+    session: false,
+    files: [changed("crates/kiln-seams/src/lib.rs", [" pub mod seam;", "+pub mod conformance;"], Date.now() - 6 * 3_600_000)],
+  },
+  {
+    sha: "4c09e11d2e3f405162738495a6b7c8d9e0f1a2b3",
+    subject: "Ship: rows say who's waiting",
+    at: Date.now() - 9 * 3_600_000,
+    session: false,
+    files: [changed("ui/src/views/ship/views.tsx", ["-  <Row />", "+  <Row waiting />"], Date.now() - 9 * 3_600_000)],
+  },
+];
+
+/** How each who changed fam-orch's files left them, as changes over how its folder was as it began (Compare's agent points). */
+const ORCH_VERSIONS: Record<string, ReturnType<typeof changed>[]> = {
+  main: [
+    changed(
+      "crates/kiln/src/plans/planner.rs",
+      [
+        "     let order = plan.steps();",
+        "-    let first = order.first();",
+        "+    let ready = order.iter().filter(|s| s.needs.is_empty());",
+        "+    let first = ready.clone().next();",
+        "     first.map(Step::start)",
+      ],
+      Date.now(),
+    ),
+    changed("crates/kiln/src/plans/mod.rs", [" pub mod planner;", "-pub mod order;", "+pub(crate) mod order;"], Date.now()),
+  ],
+  toolu_planner: [
+    changed("docs/plans.md", ["+## Steps side by side", "+", "+A step that waits for nothing starts at once; the rest wait for", "+what they need."], Date.now(), true),
+    changed("crates/kiln/src/plans/mod.rs", [" pub mod planner;", " pub mod order;", "+pub mod ready;"], Date.now()),
+  ],
+  toolu_opt: [
+    changed("crates/kiln/src/http/quic.rs", ["     let conn = endpoint.connect(addr)?;", "-    let stream = conn.open_bi().await?;", "+    let (mut send, recv) = conn.open_bi().await?;"], Date.now()),
+  ],
+};
+
+/** A change turned around: what it added, removed; new, deleted. */
+function reversed(f: ReturnType<typeof changed>): ReturnType<typeof changed> {
+  const lines = (f.hunks[0]?.lines ?? []).map((l) => (l.startsWith("+") ? `-${l.slice(1)}` : l.startsWith("-") ? `+${l.slice(1)}` : l));
+  const { created, ...rest } = f as ReturnType<typeof changed> & { created?: boolean };
+  return {
+    ...rest,
+    ...(created ? { deleted: true } : {}),
+    added: f.removed,
+    removed: f.added,
+    hunks: [{ ...(f.hunks[0] ?? { old_start: 1, new_start: 1 }), old_lines: f.hunks[0]?.new_lines ?? 0, new_lines: f.hunks[0]?.old_lines ?? 0, lines }],
+  } as ReturnType<typeof changed>;
+}
+
+/** Two points of fam-orch's compared: two agents' versions file by file, each saying who changed it; any other pair, its session's change. */
+function compareOf(a: AgentInfo, from: string, to: string, split: boolean, path?: string): Record<string, unknown> {
+  if (a.id !== "fam-orch") return { error: `${a.cwd} isn't in a git repository` };
+  const agent = (p: string) => (p.startsWith("agent:") ? p.slice(6) : null);
+  const [x, y] = [agent(from), agent(to)];
+  let files: ReturnType<typeof changed>[];
+  const changedBy: Record<string, string[]> = {};
+  if (x && y) {
+    const xs = ORCH_VERSIONS[x] ?? [];
+    const ys = ORCH_VERSIONS[y] ?? [];
+    const paths = [...new Set([...xs, ...ys].map((f) => f.path))].sort();
+    files = paths.map((p) => {
+      const fx = xs.find((f) => f.path === p);
+      const fy = ys.find((f) => f.path === p);
+      changedBy[p] = [fx && x, fy && y].filter((w): w is string => Boolean(w));
+      if (fx && fy) return { ...fy, added: fx.removed + fy.added, removed: fx.added + fy.removed, hunks: [...reversed(fx).hunks, ...fy.hunks] };
+      return fy ?? reversed(fx as ReturnType<typeof changed>);
+    });
+  } else {
+    files = [...ORCH_COMMITS[1]!.files, ...ORCH_COMMITS[0]!.files, ...ORCH_NOW].filter((f, i, all) => all.findIndex((g) => g.path === f.path) === i);
+  }
+  if (path) files = files.filter((f) => f.path === path);
+  return { compared: { files, split: split && !(x && y), ...(x && y ? { changed_by: changedBy } : {}) } };
+}
+
+/** An agent's commits and, with `picks`, what they change together: fam-orch's from its machine; another's folder isn't a repository. */
+function commitsOf(a: AgentInfo, picks: string[], branch?: string): Record<string, unknown> {
+  if (a.id !== "fam-orch") return { error: `${a.cwd} isn't in a git repository` };
+  const onMain = branch === "main";
+  const list = onMain ? MAIN_COMMITS : ORCH_COMMITS;
+  const sum = (files: { added: number; removed: number }[]) => ({ files: files.length, added: files.reduce((n, f) => n + f.added, 0), removed: files.reduce((n, f) => n + f.removed, 0) });
+  const log = {
+    top: ORCH_TREE,
+    head: ORCH_COMMITS[0]?.sha ?? null,
+    branch: "plans/side-by-side",
+    trunk: onMain ? null : "origin/main",
+    base: onMain ? null : "0f0e0d0c0b0a09080706050403020100ffeeddcc",
+    dirty: onMain ? null : sum(ORCH_NOW),
+    commits: list.map(({ files, ...c }) => ({ ...c, parents: [], author: "Release prep", ...sum(files), session: onMain ? undefined : c.session || undefined })),
+    told: onMain ? "none" : "head",
+    branches: ["plans/side-by-side", "main", "fix/retry-storm"],
+    ...(onMain && { listed: "main" }),
+  };
+  if (!picks.length) return { log, picked: null };
+  // Oldest first, what isn't committed yet last.
+  const line = [...list.map((c) => c.sha).reverse(), ...(onMain ? [] : ["now"])];
+  const at = picks
+    .map((p) => line.findIndex((s) => s === p || s.startsWith(p)))
+    .filter((i) => i >= 0)
+    .sort((x, y) => x - y);
+  const filesOf = (i: number) => (line[i] === "now" ? ORCH_NOW : (list.find((c) => c.sha === line[i])?.files ?? []));
+  const docs = "9b8e7d6c5a4132f1e0d9c8b7a6f5e4d3c2b1a090";
+  const steps = "5d4c3b2a1f0918273645aabbccddeeff00112233";
+  const first = at[0] ?? 0;
+  if (!onMain && at.some((i) => line[i] === docs) && !at.some((i) => line[i] === steps) && first < line.indexOf(steps)) {
+    return { log, picked: { from: line[first - 1] ?? "", files: [], needs: { pick: docs, commit: steps, subject: "Plans: a step says what it needs" } } };
+  }
+  const byPath = new Map<string, ReturnType<typeof changed>>();
+  for (const i of at)
+    for (const f of filesOf(i)) {
+      const had = byPath.get(f.path);
+      byPath.set(f.path, had ? { ...had, added: had.added + f.added, removed: had.removed + f.removed, hunks: [...had.hunks, ...f.hunks] } : f);
+    }
+  return { log, picked: { from: line[first - 1] ?? "", files: [...byPath.values()] } };
+}
+
 /** What a person asked about (agents.about), and the helpers answering. */
 interface AboutQ {
   path: string;
@@ -1849,7 +2295,7 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
     }
     return true;
   }
-  const am = p.match(/^\/api\/harness\/agents\/([^/]+)(?:\/(result|children|stop|send|interrupt|change|workspace|land))?$/);
+  const am = p.match(/^\/api\/harness\/agents\/([^/]+)(?:\/(result|children|stop|send|interrupt|change|workspace|land|commits|refs|compare))?$/);
   if (!am) return false;
   const id = decodeURIComponent(am[1] ?? "");
   const what = am[2];
@@ -1872,6 +2318,32 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
       branch: changes.get(id)?.branch ?? null,
       change_request: changes.get(id) ?? null,
     });
+  } else if (what === "refs" && m === "GET") {
+    if (a.id !== "fam-orch") json(res, 409, { error: `${a.cwd} isn't in a git repository` });
+    else
+      json(res, 200, {
+        refs: {
+          branches: ["plans/side-by-side", "main", "fix/retry-storm", "origin/main", "origin/plans/side-by-side"],
+          tags: ["v0.2.0", "v0.1.9"],
+          commits: ORCH_COMMITS.map(({ files, ...c }) => ({
+            ...c,
+            parents: [],
+            author: "Release prep",
+            files: files.length,
+            added: files.reduce((n, f) => n + f.added, 0),
+            removed: files.reduce((n, f) => n + f.removed, 0),
+          })),
+          trunk: "origin/main",
+        },
+      });
+  } else if (what === "compare" && m === "GET") {
+    const q = (k: string) => url.searchParams.get(k) ?? "";
+    const answer = compareOf(a, q("from"), q("to"), q("split") !== "false", q("path") || undefined);
+    json(res, "error" in answer ? 409 : 200, answer);
+  } else if (what === "commits" && m === "GET") {
+    const picks = (url.searchParams.get("picks") ?? "").split(",").filter(Boolean);
+    const answer = commitsOf(a, picks, url.searchParams.get("branch") ?? undefined);
+    json(res, "error" in answer ? 409 : 200, answer);
   } else if (what === "workspace" && m === "GET") {
     json(res, 200, { workspace: a.workspace ?? null, drift: a.workspace ? ["/crates/kiln/src/http/client.rs (Modified)"] : [] });
   } else if (what === "land" && m === "POST") {

@@ -23,7 +23,7 @@ use super::model::{
 use super::claude::{McpAdd, mcp_status_words, safe_command, valid_server_name};
 
 /// What a session of it can do, said when it starts (and again after an in-place upgrade).
-pub(super) const FEATURES: &[&str] = &["steer", "send_now", "queue", "queue_steer", "interrupt", "set_mode", "permissions_live", "set_model", "set_effort", "set_speed", "file_suggestions", "resume", "attachments", "images", "overrides", "switch_harness"];
+pub(super) const FEATURES: &[&str] = &["steer", "send_now", "queue", "queue_steer", "interrupt", "set_mode", "permissions_live", "set_model", "set_effort", "set_speed", "file_suggestions", "resume", "attachments", "images", "overrides", "switch_harness", "own_edits"];
 /// It turns nothing on or off once it runs.
 pub(super) const LEARNED: &[&str] = &[];
 
@@ -1464,7 +1464,7 @@ impl Codex {
             Command::SetSpeed { speed } => self.notice(core, Level::Warn, format!("{speed}: not a speed Codex lists for its models")),
             Command::Control { id, value } => self.control(core, &id, value),
             // The session itself does these (a move is not the harness's business).
-            Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } => {}
+            Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } | Command::OwnEdits { .. } => {}
             // A terminal Codex left running: Codex has no way to stop it from outside, so kiln stops
             // the process itself (the newest one under Codex running that command).
             // A subagent: its turn under way is interrupted, as a person asked.
@@ -3096,7 +3096,8 @@ impl Codex {
     }
 
     /// A native child's work stays under its spawning call. None of these events may settle
-    /// the parent's turn, replace its answer, account its tokens, or change its files.
+    /// the parent's turn, replace its answer or account its tokens; its edits join the session's
+    /// changeset, credited to that call.
     fn child_notification(&mut self, core: &mut Core, thread: &str, method: &str, p: &Value) {
         let Some(parent) = core.state.tasks.iter().find(|t| t.id == thread).and_then(|t| t.tool_id.clone()) else { return };
         let child = self.children.entry(thread.to_owned()).or_default();
@@ -3800,7 +3801,12 @@ impl Codex {
                     "declined" => ToolStatus::Denied,
                     _ => ToolStatus::Running,
                 };
-                if thread.is_none() && done && status == ToolStatus::Done {
+                // Its subagents' count too, each credited to the call that spawned it (Ada, 2026-10-31);
+                // a child's edit read again (from its history, after its notification) only once.
+                let counted = thread.is_some() && core.get(&id).is_some_and(|e| matches!(&e.body, Body::Tool(t) if t.status == ToolStatus::Done));
+                if done && status == ToolStatus::Done && !counted {
+                    // A subagent with no spawning call here (multi-agent v2's) by its thread, its task's id.
+                    let by = parent.clone().or_else(|| thread.map(str::to_owned)).unwrap_or_else(|| super::model::BY_AGENT.to_owned());
                     for c in &changes {
                         let Some(path) = c.get("path").and_then(Value::as_str) else { continue };
                         let abs = if std::path::Path::new(path).is_absolute() { path.to_owned() } else { format!("{}/{path}", cwd.trim_end_matches('/')) };
@@ -3811,7 +3817,7 @@ impl Codex {
                             _ => Baseline::Reverse(super::diff::parse_unified(diff)),
                         };
                         core.note_baseline(&abs, baseline);
-                        core.want_change(&abs, &super::claude::rel(path, &cwd));
+                        core.want_change(&abs, &super::claude::rel(path, &cwd), &by);
                     }
                 }
                 let title = diffs.iter().map(|d| d.path.clone()).collect::<Vec<_>>().join(", ");
@@ -6243,6 +6249,33 @@ mod tests {
         assert_eq!(core.state.status, Status::Idle);
     }
 
+    /// A Codex subagent's edit joins its session's changeset, credited to the call that spawned
+    /// it (Ada, 2026-10-31: every harness's subagents count), as the agent's own edits are.
+    #[test]
+    fn a_codex_subagents_edit_joins_the_changeset_credited_to_its_spawning_call() -> anyhow::Result<()> {
+        use crate::harness::model::{BY_AGENT, FileChange};
+        let (mut c, mut core, _) = opened();
+        let edit = |id: &str, path: &str| json!({"type": "fileChange", "id": id, "status": "completed", "changes": [{"path": path, "kind": {"type": "update"}, "diff": "@@ -1,1 +1,1 @@\n-old\n+new\n"}]});
+        feed(&mut c, &mut core, &[
+            json!({"method": "turn/started", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "inProgress", "items": []}}}),
+            json!({"method": "item/completed", "params": {"threadId": "th1", "turnId": "t1", "item": {"type": "collabAgentToolCall", "id": "spawn-kid", "tool": "spawnAgent", "senderThreadId": "th1", "receiverThreadIds": ["kid"], "status": "completed", "agentsStates": {"kid": {"status": "running"}}, "prompt": "Fix the parser"}}}),
+            json!({"method": "turn/started", "params": {"threadId": "kid", "turn": {"id": "kid-turn", "status": "inProgress", "items": []}}}),
+            json!({"method": "item/completed", "params": {"threadId": "kid", "turnId": "kid-turn", "item": edit("kid-edit", "/work/parser.rs")}}),
+            json!({"method": "item/completed", "params": {"threadId": "th1", "turnId": "t1", "item": edit("own-edit", "/work/main.rs")}}),
+        ]);
+        let jobs = core.take_change_jobs();
+        let paths: Vec<&str> = jobs.iter().map(|j| j.abs.as_str()).collect();
+        anyhow::ensure!(paths.contains(&"/work/parser.rs") && paths.contains(&"/work/main.rs"), "both edits join the changeset: {paths:?}");
+        for j in &jobs {
+            core.start_change(&j.abs);
+            let change = FileChange { path: j.rel.clone(), tree: None, created: false, deleted: false, added: 1, removed: 1, hunks: Vec::new(), truncated: true, at: 1, by: Vec::new(), place: None };
+            core.set_change(&j.abs, Some(change), None);
+        }
+        let by: Vec<(String, Vec<String>)> = core.changes().into_iter().map(|f| (f.path, f.by)).collect();
+        assert_eq!(by, vec![("main.rs".to_owned(), vec![BY_AGENT.to_owned()]), ("parser.rs".to_owned(), vec!["spawn-kid".to_owned()])]);
+        Ok(())
+    }
+
     #[test]
     fn opening_a_thread_keeps_its_runtime_status_before_draining_the_queue() {
         for (status, expected) in [
@@ -6362,7 +6395,10 @@ mod tests {
         assert_eq!(task.summary.as_deref(), Some("The dropdown now lists the available models."));
         assert!(task.prompt.is_none(), "encrypted assignments must not be invented");
         assert_eq!((core.state.summary.as_str(), core.state.goal.as_str(), core.state.status), ("Parent answer", "Parent assignment", Status::Idle));
-        assert!(core.change_jobs.is_empty());
+        // Its edit joins the session's changeset (Ada, 2026-10-31), once: read again live, it isn't counted again.
+        assert_eq!(core.take_change_jobs().iter().map(|j| j.abs.as_str()).collect::<Vec<_>>(), vec!["/child/a.rs"]);
+        feed(&mut c, &mut core, &[json!({"method": "item/completed", "params": {"threadId": "child", "turnId": "child-turn", "item": {"type": "fileChange", "id": "edit", "status": "completed", "changes": [{"path": "/child/a.rs", "kind": {"type": "add"}, "diff": "+new"}]}}})]);
+        assert!(core.take_change_jobs().is_empty());
         assert!(core.get("child:child:answer").is_some_and(|e| e.parent.as_deref() == Some("spawn")));
         assert!(core.get("child:child:command").is_some_and(|e| matches!(&e.body, Body::Tool(t) if t.output.as_deref() == Some("passed") && t.ended == Some(t.started + 250))));
         assert!(written(&mut core).is_empty(), "a child's messages to its parent must not read the parent as another child");

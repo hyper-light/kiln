@@ -262,6 +262,35 @@ pub struct FileChange {
     pub truncated: bool,
     /// Unix ms of the last change.
     pub at: i64,
+    /// Who changed it, in the order they first did: the agent itself ([`BY_AGENT`]) or a subagent
+    /// run of its harness's, by its spawning call's id (as its events' [`Event::parent`] names it).
+    /// None from a runner that doesn't say.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub by: Vec<String>,
+    /// Whose it is: the Changes tab's scope shows this project's at first. None from a runner that
+    /// doesn't say: read as this project's, so it shows at every scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub place: Option<FilePlace>,
+}
+
+/// [`FileChange::by`]'s name for the agent itself, beside its subagents' runs.
+pub const BY_AGENT: &str = "main";
+
+/// Whose a changed file is (docs/agents.md, "Who changed a file, and whose it is").
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum FilePlace {
+    /// This project's: in the agent's folder or one it moved to, or in a working tree of their
+    /// repository, wherever that is.
+    Project,
+    /// Anything else it changed for the person: another repository, their home folder's files, the
+    /// instructions and settings they keep in a harness's folder.
+    User,
+    /// An agent's own: a harness's state (its memory, transcripts, caches), kiln's own folders, and
+    /// the machine's cache and temporary files.
+    Agent,
 }
 
 impl FileChange {
@@ -1155,6 +1184,12 @@ pub struct State {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub tree: Option<String>,
+    /// The commit its folder had checked out as it began: the commits after it are this session's
+    /// (the Changes tab's Commits). None for a session from before kiln kept it, or one begun
+    /// outside a repository: its own are told by when they were made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub started_head: Option<String>,
     #[serde(default)]
     pub model: String,
     #[serde(default)]
@@ -1661,7 +1696,8 @@ pub struct Meta {
     /// Features this adapter drives for this harness: "steer", "send_now", "queue_cancel",
     /// "interrupt", "set_mode", "set_model", "set_effort", "set_speed", "stop_task", "file_suggestions",
     /// "resume", "attachments", "images", "overrides", "switch_harness" (a model of another
-    /// harness: `Command::SetModel::kind`).
+    /// harness: `Command::SetModel::kind`), "own_edits" (`Command::OwnEdits`: the session answers
+    /// it whatever its harness).
     #[serde(default)]
     pub features: Vec<String>,
     /// Effort / reasoning levels the harness offers (empty: none).
@@ -1988,6 +2024,13 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(test, ts(optional))]
         account: Option<String>,
+    },
+    /// What `by` (as [`FileChange::by`] names them) did alone to each file they changed that
+    /// another did too, for the Changes tab narrowed to them; answered as a `reply` update to
+    /// `client` (`super::diff::own_edits`). A session whose features have "own_edits" answers it.
+    OwnEdits {
+        client: String,
+        by: String,
     },
     /// A person pauses it (`on`), or resumes it. Without `task`: its processes stop where they are,
     /// held by its machine's pacer under its guard, and so does every subagent kiln started under

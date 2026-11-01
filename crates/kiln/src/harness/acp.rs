@@ -21,7 +21,7 @@ use super::model::{
 };
 
 /// What a session of it can do, said when it starts (and again after an in-place upgrade).
-pub(super) const FEATURES: &[&str] = &["send_now", "queue", "interrupt", "set_mode", "resume", "attachments", "switch_harness"];
+pub(super) const FEATURES: &[&str] = &["send_now", "queue", "interrupt", "set_mode", "resume", "attachments", "switch_harness", "own_edits"];
 /// What it turns on or off once it runs, as the agent says what it takes (steering; its model,
 /// effort and speed options): kept as they were across an in-place upgrade.
 pub(super) const LEARNED: &[&str] = &["steer", "queue_steer", "set_model", "set_effort", "set_speed"];
@@ -467,7 +467,7 @@ impl Acp {
                     self.change(core, id, value);
                 }
             }
-            Command::StopTask { .. } | Command::StopTasks | Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } => {}
+            Command::StopTask { .. } | Command::StopTasks | Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } | Command::OwnEdits { .. } => {}
             // A pause's commands are the session's (`harness::pause`).
             Command::Resume | Command::AutoResume { .. } | Command::PauseAt { .. } | Command::MaxSubagents { .. } | Command::MoveOnLimit { .. } | Command::LimitHold { .. } | Command::Pause { .. } | Command::Perms { .. } | Command::Branch { .. } => {}
             // An ACP agent reports no MCP servers or skills of its own (its client hands it MCP
@@ -1467,7 +1467,7 @@ impl Acp {
                         let abs = if std::path::Path::new(&path).is_absolute() { path.clone() } else { format!("{}/{path}", core.state.cwd.trim_end_matches('/')) };
                         let rel = super::claude::rel(&path, &core.state.cwd);
                         core.note_baseline(&abs, old.map_or(Baseline::Absent, Baseline::Text));
-                        core.want_change(&abs, &rel);
+                        core.want_change(&abs, &rel, super::model::BY_AGENT);
                     }
                 }
                 if matches!(call.status, ToolStatus::Running | ToolStatus::Pending) {

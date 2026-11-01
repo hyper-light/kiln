@@ -22,7 +22,7 @@ use super::model::{
 };
 
 /// What a session of it can do, said when it starts (and again after an in-place upgrade).
-pub(super) const FEATURES: &[&str] = &["steer", "send_now", "queue", "queue_steer", "interrupt", "set_mode", "set_model", "set_effort", "set_speed", "stop_task", "limits", "file_suggestions", "resume", "attachments", "images", "switch_harness"];
+pub(super) const FEATURES: &[&str] = &["steer", "send_now", "queue", "queue_steer", "interrupt", "set_mode", "set_model", "set_effort", "set_speed", "stop_task", "limits", "file_suggestions", "resume", "attachments", "images", "switch_harness", "own_edits"];
 /// It turns nothing on or off once it runs.
 pub(super) const LEARNED: &[&str] = &[];
 
@@ -851,7 +851,7 @@ impl Claude {
             }
             // Restarts and snapshots are the session's (it owns the process and the sink).
             // The session itself does these (a move is not the harness's business).
-            Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } => {}
+            Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } | Command::OwnEdits { .. } => {}
             Command::McpEnable { name, enabled } => {
                 let what = format!("{} {name}", if enabled { "Enable" } else { "Disable" });
                 self.request(core, Pending::McpChange(what), json!({"subtype": "mcp_toggle", "serverName": name, "enabled": enabled}));
@@ -2957,7 +2957,8 @@ impl Claude {
             ToolStatus::Done
         };
         if status == ToolStatus::Done {
-            track_changes(core, structured);
+            let by = core.get(tid).and_then(|e| e.parent.clone()).unwrap_or_else(|| super::model::BY_AGENT.to_owned());
+            track_changes(core, structured, &by);
             follow_worktree(core, &name, structured);
         }
         self.relayed(core, tid, status == ToolStatus::Done, &text);
@@ -3875,8 +3876,9 @@ pub fn doing(t: &ToolCall) -> String {
     }
 }
 
-/// Note the files a finished edit changed, for the session's changeset.
-fn track_changes(core: &mut Core, structured: &Value) {
+/// Note the files a finished edit changed, for the session's changeset, `by` having made it (the
+/// agent itself, or the subagent run its call is in).
+fn track_changes(core: &mut Core, structured: &Value, by: &str) {
     use super::core::{BASELINE_MAX, Baseline};
     let Some(o) = structured.as_object() else { return };
     let cwd = core.state.cwd.clone();
@@ -3893,13 +3895,13 @@ fn track_changes(core: &mut Core, structured: &Value) {
             };
             core.note_baseline(&a, before);
         }
-        core.want_change(&a, &rel(fp, &cwd));
+        core.want_change(&a, &rel(fp, &cwd), by);
     }
     // Files a shell command changed that the agent had read or edited before.
     if let Some(files) = o.get("bashEditDiff").and_then(|b| b.get("files")).and_then(Value::as_array) {
         for f in files {
             if let Some(fp) = f.get("filePath").and_then(Value::as_str) {
-                core.want_change(&abs(fp), &rel(fp, &cwd));
+                core.want_change(&abs(fp), &rel(fp, &cwd), by);
             }
         }
     }

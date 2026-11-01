@@ -54,7 +54,13 @@ reach?: string, cwd: string,
  * or a worktree of its repository), once it has changed a file in one. What's asked of git
  * about its work is asked there (`Info::work_dir`).
  */
-tree?: string, model: string, mode: string, title: string, 
+tree?: string, 
+/**
+ * The commit its folder had checked out as it began: the commits after it are this session's
+ * (the Changes tab's Commits). None for a session from before kiln kept it, or one begun
+ * outside a repository: its own are told by when they were made.
+ */
+started_head?: string, model: string, mode: string, title: string, 
 /**
  * The session's name as a person last gave it (empty: the one it started with).
  */

@@ -981,6 +981,14 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         }
         (&Method::GET, ["api", "harness", "changes"]) => boxed(|| own_op(&hub, &caller, "agents.changes", query_value(&q))).await,
         (&Method::GET, ["api", "harness", "agents", id, "workspace"]) => boxed(|| own_op(&hub, &caller, "agents.workspace", json!({ "agent": id }))).await,
+        (&Method::GET, ["api", "harness", "agents", id, what @ ("commits" | "refs" | "compare")]) => {
+            let mut v = query_value(&q);
+            if let Some(o) = v.as_object_mut() {
+                o.insert("agent".into(), json!(id));
+            }
+            let op = format!("agents.{what}");
+            boxed(|| own_op(&hub, &caller, &op, v)).await
+        }
         (&Method::POST, ["api", "harness", "agents", id, what @ ("send" | "interrupt" | "stop" | "change" | "land" | "about")]) => {
             let (id, name) = ((*id).to_owned(), format!("agents.{what}"));
             // A send's idempotency key may come as the standard header (CP-T3.2).

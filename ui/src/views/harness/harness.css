@@ -908,6 +908,9 @@ textarea.hx-input {
   flex: 1;
   min-width: 0;
   min-height: 0;
+  /* Never sideways: what's wide wraps or scrolls in its own box (a code block, a table), and what
+     still runs past the edge is cut there, rather than the whole conversation sliding under you. */
+  overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
   /* The conversation keeps your place itself (timeline.tsx), the same in every browser. */
@@ -1331,6 +1334,8 @@ textarea.hx-input {
   padding: 4px 8px;
   font-size: 12px;
   color: var(--color-subtle);
+  /* A path, an address or an id breaks where it must: whole, it runs past the column. */
+  overflow-wrap: anywhere;
 }
 .hx-notice[data-level="warn"] {
   color: var(--color-warn);
@@ -1618,6 +1623,8 @@ textarea.hx-input {
   border-radius: 14px;
   background: linear-gradient(180deg, rgb(203 182 154 / 8%), rgb(203 182 154 / 2%));
   box-shadow: 0 10px 30px rgb(0 0 0 / 35%);
+  /* What it asks (an address, a tool's name, its reason) breaks where it must, inside the card. */
+  overflow-wrap: anywhere;
 }
 .hx-approval-danger {
   border-color: rgb(209 170 173 / 50%);
