@@ -10,7 +10,7 @@
  * ends selecting. Picking more moves nothing (the list, the head, its buttons, the composer's one-line
  * To line), and nothing scrolls sideways. Messaging them, the composer has the rows it has as it starts
  * an agent (its line, the box, the To line where More options is), so it turns with no room left empty.
- * The head's controls sit on its hairline's ends. On a desktop and a phone.
+ * The head's controls sit on its hairline's ends, with room over and under its buttons. On a desktop and a phone.
  */
 import { expect, test, type Page } from "@playwright/test";
 
@@ -217,30 +217,41 @@ test("messaging those picked, the composer has starting's rows: its line, the bo
 
 /**
  * The list's head against the hairline under it (the list's own top edge): how far the first of its
- * controls shown starts from the list's left, and the last ends from its right, in whole pixels.
+ * controls shown starts from the list's left, and the last ends from its right; and the room over and
+ * under its buttons, in the head's own box. In whole pixels.
  */
 function headEdges(page: Page) {
   return page.evaluate(() => {
     const list = document.querySelector(".ms-list")?.getBoundingClientRect();
     const head = document.querySelector(".ms-listhead");
     if (!list || !head) return null;
-    const shown = [...head.querySelectorAll<HTMLElement>(".ms-all input, .ms-count, .ms-head-end button")]
-      .filter((el) => el.getBoundingClientRect().width > 0 && !el.closest("[inert]"))
-      .map((el) => el.getBoundingClientRect());
-    if (shown.length === 0) return null;
-    return { left: Math.round(Math.min(...shown.map((b) => b.left)) - list.left) + 0, right: Math.round(list.right - Math.max(...shown.map((b) => b.right))) + 0 };
+    const box = head.getBoundingClientRect();
+    const shown = (s: string) => [...head.querySelectorAll<HTMLElement>(s)].filter((el) => el.getBoundingClientRect().width > 0 && !el.closest("[inert]")).map((el) => el.getBoundingClientRect());
+    const all = shown(".ms-all input, .ms-count, .ms-head-end button");
+    const buttons = shown(".ms-head-end button");
+    if (all.length === 0 || buttons.length === 0) return null;
+    return {
+      left: Math.round(Math.min(...all.map((b) => b.left)) - list.left) + 0,
+      right: Math.round(list.right - Math.max(...all.map((b) => b.right))) + 0,
+      above: Math.round(Math.min(...buttons.map((b) => b.top)) - box.top) + 0,
+      below: Math.round(box.bottom - Math.max(...buttons.map((b) => b.bottom))) + 0,
+    };
   });
 }
 
-test("the list's head sits on its hairline's ends, as the filter and the sort over it do: its check or ring at the left, its last button at the right", async ({ page }) => {
+test("the list's head sits on its hairline's ends, as the filter and the sort over it do, its check or ring at the left and its last button at the right, with room over and under its buttons", async ({
+  page,
+}) => {
   test.skip(REAL, "the mock's agents");
   await page.goto("/agents");
   await expect(page.locator("li.ms-row").first()).toBeVisible();
+  // As far over and under its buttons as they are apart.
+  const placed = { left: 0, right: 0, above: 8, below: 8 };
   // By touch, before selecting: the count at its left (the ring not there yet), Select at its right.
-  if (await touchScreen(page)) await expect.poll(() => headEdges(page)).toEqual({ left: 0, right: 0 });
+  if (await touchScreen(page)) await expect.poll(() => headEdges(page)).toEqual(placed);
   await pick(page, "fam-orch", "att-ci");
   await expect(bulk(page, 2)).toBeVisible();
-  await expect.poll(() => headEdges(page)).toEqual({ left: 0, right: 0 });
+  await expect.poll(() => headEdges(page)).toEqual(placed);
 });
 
 test("Clear, or putting back the last one picked, ends selecting", async ({ page }) => {
