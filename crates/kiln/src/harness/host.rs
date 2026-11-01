@@ -682,7 +682,9 @@ pub struct Host {
     snapshot: Option<snapshot::Snapshot>,
     /// U05: same configured Records namespace and original conversation actor; none when off.
     session_namespace: Option<crate::records::SessionNamespace>,
-    _owner_lock: Option<std::fs::File>,
+    /// U17: released by its own drop (`crate::util::FileLock`), not only once every inherited
+    /// copy of it closes: a child spawned meanwhile keeps a copy until it execs.
+    _owner_lock: Option<crate::util::FileLock>,
     save_lock: Mutex<()>,
     restoring: AtomicBool,
     restore_failed: AtomicBool,
@@ -808,18 +810,17 @@ impl Host {
         let (sessions, machine) = records;
         // U17: CAS fences writes, not already-started harness processes. Only one process may
         // restore a host scope from its bootstrap directory at a time.
-        let owner_lock = file.as_ref().map(|path| -> anyhow::Result<std::fs::File> {
+        let owner_lock = file.as_ref().map(|path| -> anyhow::Result<crate::util::FileLock> {
             if let Some(dir) = path.parent() { std::fs::create_dir_all(dir)?; }
             let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path.with_extension("owner.lock"))?;
-            lock.try_lock().map_err(|e| anyhow::anyhow!("U17 session host {scope} is already owned or cannot be locked: {e}"))?;
-            Ok(lock)
+            crate::util::FileLock::try_lock(lock).map_err(|e| anyhow::anyhow!("U17 session host {scope} is already owned or cannot be locked: {e}"))
         }).transpose()?;
         let (snapshot, _) = snapshot::Snapshot::open::<Vec<Saved>>(sessions.clone(), scope, file.as_deref())?;
         let handovers = file.as_ref().and_then(|f| f.parent()).map(|dir| Handovers::with_records(dir, machine.clone())).transpose()?;
         Ok(Self::build(sink, file, limits, clock, Some(sessions), Some((snapshot, handovers, owner_lock, namespace)), crate::metrics::agents()))
     }
 
-    fn build(sink: Sink, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>, records: Option<Arc<dyn kiln_seams::Records>>, persistence: Option<(snapshot::Snapshot, Option<Handovers>, Option<std::fs::File>, Option<crate::records::SessionNamespace>)>, metrics: &'static crate::metrics::AgentMetrics) -> Arc<Self> {
+    fn build(sink: Sink, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>, records: Option<Arc<dyn kiln_seams::Records>>, persistence: Option<(snapshot::Snapshot, Option<Handovers>, Option<crate::util::FileLock>, Option<crate::records::SessionNamespace>)>, metrics: &'static crate::metrics::AgentMetrics) -> Arc<Self> {
         // The models its harnesses' sessions list are kept beside its record of them.
         if let Some(dir) = file.as_ref().and_then(|f| f.parent()) {
             super::kinds::keep_models_in(dir.join("harness-models.json"));
