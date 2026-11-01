@@ -60,6 +60,9 @@ pub struct Given {
     pub reply: Option<async_channel::Sender<String>>,
     /// The run is a culprit-finding try (W28-R57): only kiln's bisections set it.
     pub culprit: Option<Try>,
+    /// The run is its author's of this Pipelines draft (docs/ci.md W29-R14): it reports no status
+    /// to its change, and deploys nothing.
+    pub draft: Option<String>,
 }
 
 /// A culprit-finding try (docs/ci.md W28-R57), as kiln's bisection starts it. A gate's goes at
@@ -1444,6 +1447,9 @@ impl Dispatch {
             input: String::new(),
         };
         let (number, rowid) = runs::create(&self.hub, &s.repo, new).await?;
+        if let Some(d) = &s.given.draft {
+            runs::set_draft(&self.hub, &id, d).await?;
+        }
         if let Some(r) = &s.given.reply {
             let _ = r.try_send(id.clone());
         }
@@ -1976,7 +1982,10 @@ impl Dispatch {
         // A preview that went with its change takes only its change's closing runs (W15-R07).
         let closing = self.runs.get(&run).is_some_and(|r| r.event.action == "closed");
         let gone = def.preview.as_ref().and_then(|p| p.removed.clone()).filter(|_| !closing);
-        let verdict = if let Some(why) = gone {
+        let verdict = if runs::draft_of(&self.hub, &run).await?.is_some() {
+            // A draft's run deploys nothing (docs/ci.md W29-R14).
+            kiln_ci::env::Gate::Refused(format!("this run is a draft's, by its author's hand: it doesn't deploy to {} until the draft is published", def.name))
+        } else if let Some(why) = gone {
             kiln_ci::env::Gate::Refused(format!("{} went ({why}): it takes no more deployments", def.name))
         } else if !records && !p.gates.is_empty() {
             // As GitHub's custom protection rules can't be.

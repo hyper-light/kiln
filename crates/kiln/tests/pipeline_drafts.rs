@@ -507,3 +507,80 @@ fn w29_r13_discard() -> anyhow::Result<()> {
     assert_eq!(g.sent("DELETE", &format!("/repos/acme/app/git/refs/heads/{branch}")).len(), 1);
     Ok(())
 }
+
+/// Until run `id` is finished: `{ run, legs }`.
+fn finished(s: &Server, id: &str) -> anyhow::Result<Value> {
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        let run = get(s, &format!("/api/ci/runs/{id}"))?;
+        if run.pointer("/run/finished_at").is_some_and(|f| !f.is_null()) {
+            return Ok(run);
+        }
+        anyhow::ensure!(Instant::now() < deadline, "run {id} didn't finish: {run}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// A run's legs, by job.
+fn legs(run: &Value) -> Vec<(String, String, String)> {
+    run.get("legs").and_then(Value::as_array).into_iter().flatten().map(|l| (at(l, "/job").to_owned(), at(l, "/conclusion").to_owned(), at(l, "/error").to_owned())).collect()
+}
+
+/// W29-R14: a draft runs by its author's hand, as the event they pick: a run of a commit of its
+/// own, so its diff counts no check of it, marked the draft's, its job that names an environment
+/// stopped before it deploys, saying why. A published workflow without workflow_dispatch doesn't
+/// run by hand, saying so.
+#[test]
+fn w29_r14_run_a_draft_by_hand() -> anyhow::Result<()> {
+    let (s, _dir) = kiln_with_ci()?;
+    let path = ".github/workflows/try.yml";
+    let draft = "name: try\non: push\njobs:\n  build:\n    runs-on: local\n    steps:\n      - run: echo built\n  deploy:\n    needs: build\n    runs-on: local\n    environment: production\n    steps:\n      - run: echo deployed\n";
+    let (st, saved) = act(&s, &json!({ "repo": "acme/app", "path": path, "verb": "save_draft", "content": draft, "title": "Try a deploy" }))?;
+    assert_eq!(st, 200, "{saved}");
+    let (st, ran) = act(&s, &json!({ "repo": "acme/app", "path": path, "verb": "run", "event": "push" }))?;
+    assert_eq!(st, 200, "{ran}");
+    let id = at(&ran, "/runs/0/id").to_owned();
+    let run = finished(&s, &id)?;
+    assert_eq!(at(&run, "/run/draft"), at(&saved, "/draft/id"), "marked the draft's: {run}");
+    let diff = get(&s, &format!("/api/diffs/{}", at(&saved, "/draft/name")))?;
+    let versions: Vec<&str> = diff.get("versions").and_then(Value::as_array).into_iter().flatten().filter_map(|v| v.get("commit").and_then(Value::as_str)).collect();
+    assert!(!versions.contains(&at(&run, "/run/sha")), "a commit of its own: {run} {diff}");
+    assert!(!diff.get("runs").and_then(Value::as_array).into_iter().flatten().any(|r| r.get("id").and_then(Value::as_str) == Some(id.as_str())), "its diff counts no check of it: {diff}");
+    let by_job = legs(&run);
+    assert!(by_job.iter().any(|(j, c, _)| j == "build" && c == "success"), "{by_job:?}");
+    assert!(by_job.iter().any(|(j, c, e)| j == "deploy" && c != "success" && e.contains("draft")), "it doesn't deploy, saying why: {by_job:?}");
+    // The published workflow takes only `push`: it doesn't run by hand.
+    let (st, said) = act(&s, &json!({ "repo": "acme/app", "path": ".github/workflows/ci.yml", "verb": "run" }))?;
+    assert_eq!(st, 422, "{said}");
+    assert!(said.to_string().contains("workflow_dispatch"), "{said}");
+    Ok(())
+}
+
+/// W29-R14: Run with chosen jobs runs those and what they need, nothing else.
+#[test]
+fn w29_r14_run_chosen_jobs() -> anyhow::Result<()> {
+    let (s, dir) = kiln_with_ci()?;
+    let home = dir.path().join("githome");
+    let work = dir.path().join("app");
+    let pick = "name: pick\non: workflow_dispatch\njobs:\n  b:\n    runs-on: local\n    steps:\n      - run: echo b\n  a:\n    needs: b\n    runs-on: local\n    steps:\n      - run: echo a\n  c:\n    runs-on: local\n    steps:\n      - run: echo c\n";
+    push_files(&home, &work, "main", &[(".github/workflows/pick.yml", pick)])?;
+    // Asked again until kiln has the push.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let (st, ran) = act(&s, &json!({ "repo": "acme/app", "path": ".github/workflows/pick.yml", "verb": "run", "jobs": ["a"] }))?;
+        if st == 200 {
+            break;
+        }
+        anyhow::ensure!(st == 404 && Instant::now() < deadline, "{st} {ran}");
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    let seen = until_run(&s, "acme/app", "of pick.yml by hand", |r| r.get("workflow").and_then(Value::as_str) == Some(".github/workflows/pick.yml") && r.get("event").and_then(Value::as_str) == Some("workflow_dispatch"))?;
+    let id = seen.iter().find(|r| r.get("event").and_then(Value::as_str) == Some("workflow_dispatch")).map(|r| at(r, "/id").to_owned()).unwrap_or_default();
+    let run = finished(&s, &id)?;
+    let mut jobs: Vec<String> = legs(&run).into_iter().map(|(j, ..)| j).collect();
+    jobs.sort();
+    assert_eq!(jobs, ["a", "b"], "a and what it needs: {run}");
+    let (st, said) = act(&s, &json!({ "repo": "acme/app", "path": ".github/workflows/pick.yml", "verb": "run", "jobs": ["nope"] }))?;
+    assert_eq!(st, 404, "{said}");
+    Ok(())
+}

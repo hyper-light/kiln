@@ -460,3 +460,15 @@ pub async fn run_of(hub: &Hub, leg: &str) -> anyhow::Result<Option<Run>> {
         None => Ok(None),
     }
 }
+
+/// Marks run `id` a run of Pipelines draft `draft` by its author's hand (docs/ci.md W29-R14).
+pub async fn set_draft(hub: &Hub, id: &str, draft: &str) -> anyhow::Result<()> {
+    let (id, draft) = (id.to_owned(), draft.to_owned());
+    hub.store.call(move |c| Ok(c.execute("UPDATE runs SET draft = ?2 WHERE id = ?1", rusqlite::params![id, draft]).map(|_| ())?)).await
+}
+
+/// The Pipelines draft run `id` is a run of, if it's one (W29-R14).
+pub async fn draft_of(hub: &Hub, id: &str) -> anyhow::Result<Option<String>> {
+    let id = id.to_owned();
+    hub.store.call(move |c| Ok(c.query_row("SELECT draft FROM runs WHERE id = ?1", [&id], |r| r.get::<_, Option<String>>(0)).optional()?.flatten())).await
+}

@@ -39,11 +39,13 @@ fn run_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
         "approval": r.get::<_, Option<String>>(20)?, "approved_by": r.get::<_, Option<String>>(21)?,
         // W23: where it ran (`kiln`, `github-actions`, …), and its page and number there.
         "provider": r.get::<_, String>(22)?, "external_url": r.get::<_, Option<String>>(23)?, "external_number": r.get::<_, Option<i64>>(24)?,
+        // W29-R14: the Pipelines draft it's a run of, by its author's hand.
+        "draft": r.get::<_, Option<String>>(25)?,
     }))
 }
 
 const RUN_SELECT: &str = "SELECT r.id, r.number, p.name, r.workflow_id, r.pipeline, r.run_name, r.event, r.branch, r.sha, r.actor, r.status, r.conclusion, r.trust, r.attempt,
-     r.created_at, r.started_at, r.finished_at, r.error, r.message, r.rowid, r.approval, r.approved_by, r.provider, r.external_url, r.external_number FROM runs r JOIN repos p ON p.id = r.repo_id WHERE r.workflow_id IS NOT NULL";
+     r.created_at, r.started_at, r.finished_at, r.error, r.message, r.rowid, r.approval, r.approved_by, r.provider, r.external_url, r.external_number, r.draft FROM runs r JOIN repos p ON p.id = r.repo_id WHERE r.workflow_id IS NOT NULL";
 
 /// `GET /api/ci/runs?…`: the engine's runs, newest first, cursor-paged; of the repositories the
 /// caller may read (W10).

@@ -447,7 +447,7 @@ async fn runs_of(hub: &Hub, repo: &Repo, branch: &str, released: Option<&str>) -
         .call(move |c| {
             let mut st = c.prepare(
                 "SELECT r.pipeline, COALESCE(w.path, ''), r.status FROM runs r LEFT JOIN ci_workflows w ON w.id = r.workflow_id
-                 WHERE r.repo_id = ?1 AND r.branch = ?2 ORDER BY r.created_at DESC LIMIT ?3",
+                 WHERE r.repo_id = ?1 AND r.branch = ?2 AND r.draft IS NULL ORDER BY r.created_at DESC LIMIT ?3",
             )?;
             let mut by: HashMap<String, (Option<Outcome>, bool)> = HashMap::new();
             let rows = st.query_map(rusqlite::params![id, branch, RUNS_LOOK], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
@@ -566,7 +566,9 @@ pub async fn list(hub: &Arc<Hub>, q: &HashMap<String, String>, caller: &crate::a
 /// right on the repository:
 /// - `save_draft` (`content`, `title`): `ci.workflows.edit` with `draft` (W29-R11);
 /// - `ready`: the caller's draft of the file asks for review (W29-R12);
-/// - `discard`: the caller's draft of it is gone (W29-R13).
+/// - `discard`: the caller's draft of it is gone (W29-R13);
+/// - `run` (`event`, `jobs`, `inputs`, `ref`, `sha`): the caller's draft of it as their test, or the
+///   published workflow by hand (`ci.runs.trigger`, W29-R14).
 pub async fn act(hub: &Arc<Hub>, caller: &crate::authz::Caller, body: &Value) -> Result<Response, Fail> {
     let text = |k: &str| body.get(k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
     let need = |k: &str| text(k).ok_or_else(|| (StatusCode::BAD_REQUEST, format!("`{k}` is required")));
@@ -596,8 +598,19 @@ pub async fn act(hub: &Arc<Hub>, caller: &crate::authz::Caller, body: &Value) ->
                 .ok_or_else(|| (StatusCode::NOT_FOUND, format!("you have no draft of {path} in {}", repo.name)))?;
             if verb == "ready" { crate::ci::pipeline_drafts::ready(hub, caller, &repo, &mut d).await? } else { crate::ci::pipeline_drafts::discard(hub, caller, &repo, &mut d).await? }
         }
-        "run" => return Err((StatusCode::BAD_REQUEST, "Run comes with run by hand (docs/ci.md W29-R14)".to_owned())),
-        other => return Err((StatusCode::BAD_REQUEST, format!("`verb` is save_draft, ready or discard, not `{other}`"))),
+        "run" => {
+            // The caller's draft of the file runs as their test; else the published workflow, by
+            // hand (W29-R14).
+            let (author, _) = crate::ci::diffs::author_of(&caller.name, Some(caller.kind));
+            let drafted = crate::ci::pipeline_drafts::open_for(hub, &repo.name, path, &author).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?.is_some();
+            let mut ask = body.clone();
+            if let Some(o) = ask.as_object_mut() {
+                o.insert("workflow".into(), Value::String(path.to_owned()));
+                o.insert("draft".into(), Value::Bool(drafted));
+            }
+            crate::ci::events::by_hand(hub, caller, &repo, &ask).await?
+        }
+        other => return Err((StatusCode::BAD_REQUEST, format!("`verb` is save_draft, ready, discard or run, not `{other}`"))),
     };
     heard(&repo.name);
     Ok(srv::json(StatusCode::OK, &out))

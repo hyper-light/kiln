@@ -436,7 +436,8 @@ pub async fn dispatch_run(hub: &Hub, repo: &Repo, git_ref: &str, which: &str, of
 /// it needs.
 pub async fn dispatch_at(hub: &Hub, repo: &Repo, sha: &str, which: &str, job: Option<&str>, offered: &serde_json::Map<String, serde_json::Value>, actor: &str) -> Result<String, Refused> {
     let full_ref = format!("refs/heads/{}", facts(hub, repo).await.default_branch);
-    dispatch_with(hub, repo, (full_ref, sha.to_owned()), (which, job), offered, actor, None, true).await?.ok_or_else(|| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{which} didn't start")))
+    let jobs: Vec<String> = job.map(str::to_owned).into_iter().collect();
+    dispatch_with(hub, repo, (full_ref, sha.to_owned()), (which, &jobs), offered, actor, None, true).await?.ok_or_else(|| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{which} didn't start")))
 }
 
 /// A workflow kiln wrote itself (a CD provider's jobs on its runners, docs/cd-targets.md §2.2),
@@ -481,7 +482,48 @@ async fn dispatch(
         return Err(refused(http::StatusCode::NOT_FOUND, "The CI engine is off ([ci] enabled)."));
     }
     let at = named_ref(hub, repo, git_ref).await?;
-    dispatch_with(hub, repo, at, (which, None), given, actor, started_by, offered).await
+    dispatch_with(hub, repo, at, (which, &[]), given, actor, started_by, offered).await
+}
+
+/// Run by hand (docs/ci.md W29-R14; `ci.runs.trigger`, as `caller`, who needs `runs.trigger`). A
+/// published workflow (`workflow`, its path or file name) runs as `workflow_dispatch`: at `ref`
+/// (the default branch when left out), or at commit `sha` standing for it, and with `jobs` only
+/// those and what they need. With `draft`, the caller's draft of the workflow's file runs
+/// instead, as its author's test for `event` (`push` unless said): a run of a commit of its own,
+/// marked the draft's ([`super::uploads::draft_run`]).
+pub async fn by_hand(hub: &Hub, caller: &crate::authz::Caller, repo: &Repo, ask: &serde_json::Value) -> Result<serde_json::Value, super::Fail> {
+    use serde_json::Value;
+    let text = |k: &str| ask.get(k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
+    let which = text("workflow").or_else(|| text("path")).ok_or_else(|| (http::StatusCode::BAD_REQUEST, "`workflow` names the workflow to run".to_owned()))?;
+    if !caller.can("runs.trigger", &crate::authz::Scope::Repo { repo: repo.name.clone() }) {
+        return Err((http::StatusCode::FORBIDDEN, format!("running {which} by hand needs `runs.trigger` on {}", repo.name)));
+    }
+    let jobs: Vec<String> = ask.get("jobs").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default();
+    let inputs = ask.get("inputs").and_then(Value::as_object).cloned().unwrap_or_default();
+    if ask.get("draft").and_then(Value::as_bool) == Some(true) {
+        let (author, _) = super::diffs::author_of(&caller.name, Some(caller.kind));
+        let d = super::pipeline_drafts::open_for(hub, &repo.name, &which, &author)
+            .await
+            .map_err(|e| (http::StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
+            .ok_or_else(|| (http::StatusCode::NOT_FOUND, format!("you have no draft of {which} in {}: a draft runs only by its author's hand", repo.name)))?;
+        return super::uploads::draft_run(hub, repo, &d, caller, &text("event").unwrap_or_else(|| "push".into()), &jobs, inputs).await;
+    }
+    if let Some(e) = text("event").filter(|e| e != "workflow_dispatch" && e != "manual") {
+        return Err((http::StatusCode::BAD_REQUEST, format!("a published workflow runs by hand as workflow_dispatch, not as `{e}`: a draft runs as the event you pick (W29-R14)")));
+    }
+    let git_ref = match text("ref") {
+        Some(r) => r,
+        None => facts(hub, repo).await.default_branch,
+    };
+    let (full_ref, mut sha) = named_ref(hub, repo, &git_ref).await.map_err(|r| (r.status, r.message))?;
+    if let Some(s) = text("sha") {
+        if s.len() != 40 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err((http::StatusCode::BAD_REQUEST, "`sha` is a commit's 40 hex digits".to_owned()));
+        }
+        sha = s;
+    }
+    dispatch_with(hub, repo, (full_ref, sha.clone()), (&which, &jobs), &inputs, &caller.name, caller.started_by(), false).await.map_err(|r| (r.status, r.message))?;
+    Ok(serde_json::json!({ "dispatched": true, "ref": git_ref, "sha": sha }))
 }
 
 /// [`dispatch`] at a ref and commit resolved already: workflow `which`, or one job of it and the
@@ -491,7 +533,7 @@ async fn dispatch_with(
     hub: &Hub,
     repo: &Repo,
     (full_ref, sha): (String, String),
-    (which, job): (&str, Option<&str>),
+    (which, jobs): (&str, &[String]),
     given: &serde_json::Map<String, serde_json::Value>,
     actor: &str,
     started_by: Option<serde_json::Value>,
@@ -505,13 +547,12 @@ async fn dispatch_with(
         return Err(refused(http::StatusCode::NOT_FOUND, format!("Workflow {which} not found at {full_ref}")));
     };
     let only;
-    let l = match job {
-        None => l,
-        Some(job) => {
-            let w = l.workflow.as_ref().and_then(|w| super::uploads::only_job(w, job)).ok_or_else(|| refused(http::StatusCode::NOT_FOUND, format!("{} has no job `{job}`", l.path)))?;
-            only = load::Loaded { workflow: Some(w), ..l.clone() };
-            &only
-        }
+    let l = if jobs.is_empty() {
+        l
+    } else {
+        let w = l.workflow.as_ref().and_then(|w| super::uploads::only_jobs(w, jobs)).ok_or_else(|| refused(http::StatusCode::NOT_FOUND, format!("{} has no job {}", l.path, jobs.iter().map(|j| format!("`{j}`")).collect::<Vec<_>>().join(", "))))?;
+        only = load::Loaded { workflow: Some(w), ..l.clone() };
+        &only
     };
     let declared = l.workflow.as_ref().and_then(|w| w.on.iter().find(|t| t.event == "workflow_dispatch")).map(|t| t.inputs.clone());
     let Some(declared) = declared else {

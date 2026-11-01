@@ -142,20 +142,14 @@ pub fn ops() -> &'static [Op] {
                 input: Input::of::<input::CiRunsGet>(),
                 route: |v| Ok((Method::GET, path(&["runs", &text(v, "run")?]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move { answer(super::runs_api::get(&cx.hub, &text(&v, "run")?, &HashMap::new()).await).await }),
-            op!("ci.runs.trigger", "Start a workflow by hand (`workflow_dispatch`) at a branch or tag, with its inputs.", ro: false, destructive: false,
+            op!("ci.runs.trigger", "Start a workflow by hand (`workflow_dispatch`) at a branch or tag (or a commit, `sha`, standing for it), with its inputs; with `jobs`, only those and the jobs they need. With `draft`, run your Pipelines draft of the workflow instead, as your test of it for `event` (push by default): marked a draft's, it reports no status to its change and deploys nothing (W29-R14).", ro: false, destructive: false,
                 input: Input::of::<input::CiRunsTrigger>(),
                 route: |v| Ok((Method::POST, path(&["repos", &text(v, "repo")?, "dispatch"]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move {
                     let repo = text(&v, "repo")?;
                     let repos = cx.hub.store.repos().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
                     let r = repos.into_iter().find(|r| r.name == repo || r.id == repo).ok_or_else(|| (StatusCode::NOT_FOUND, format!("no repository `{repo}`")))?;
-                    let git_ref = match v.get("ref").and_then(Value::as_str).filter(|s| !s.is_empty()) {
-                        Some(x) => x.to_owned(),
-                        None => super::events::facts(&cx.hub, &r).await.default_branch,
-                    };
-                    let inputs = v.get("inputs").and_then(Value::as_object).cloned().unwrap_or_default();
-                    super::events::workflow_dispatch(&cx.hub, &r, &git_ref, &text(&v, "workflow")?, &inputs, &by(&cx), cx.caller.started_by()).await.map_err(|e| (e.status, e.message))?;
-                    Ok(json!({ "dispatched": true, "ref": git_ref }))
+                    super::events::by_hand(&cx.hub, &cx.caller, &r, &v).await
                 }),
             op!("ci.runs.ask", "As an agent, ask for a run of a workflow that takes kiln's `agent` event (`on: { agent: { agents, inputs } }`, its `agents` naming you or `*`), at a branch or tag, with its inputs. You are the run's actor.", ro: false, destructive: false,
                 input: Input::of::<input::CiRunsAsk>(),
@@ -909,7 +903,7 @@ pub fn ops() -> &'static [Op] {
                 input: Input::of::<input::ShipPipelinesGet>(),
                 route: |v| { let (owner, name) = owner_name(v)?; Ok((Method::GET, path(&["ship", "pipelines", &owner, &name]), query(v, &["path", "ref"]))) },
                 run: |cx: Cx, v: Value| async move { let (owner, name) = owner_name(&v)?; answer(crate::ship::pipelines::get(&cx.hub, &owner, &name, &query(&v, &["path", "ref"]), &cx.caller).await).await }),
-            op!("ship.pipelines.act", "A verb of a workflow's or action's strip in Ship's Pipelines (W29-R04), on your own work, as its own operation and with its right: `save_draft` (`content`, `title`: a draft diff, or on a host a draft change from a branch of its own, W29-R11), `ready` (your draft of the file asks for review, W29-R12) or `discard` (your draft of it closed, its branch deleted, W29-R13).", base: "", ro: false, destructive: true,
+            op!("ship.pipelines.act", "A verb of a workflow's or action's strip in Ship's Pipelines (W29-R04), on your own work, as its own operation and with its right: `save_draft` (`content`, `title`: a draft diff, or on a host a draft change from a branch of its own, W29-R11), `ready` (your draft of the file asks for review, W29-R12) or `discard` (your draft of it closed, its branch deleted, W29-R13) or `run` (your draft as your test, for `event`; else the published workflow by hand, W29-R14).", base: "", ro: false, destructive: true,
                 input: Input::of::<input::ShipPipelinesAct>(),
                 route: |_| Ok((Method::POST, path(&["ship", "pipelines"]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move { answer(crate::ship::pipelines::act(&cx.hub, &cx.caller, &v).await).await }),
@@ -964,6 +958,14 @@ pub mod input {
         /// A branch or tag; the default branch when left out.
         pub r#ref: Option<String>,
         pub inputs: Option<serde_json::Map<String, serde_json::Value>>,
+        /// A commit (40 hex digits) to run, standing for `ref` (W29-R14).
+        pub sha: Option<String>,
+        /// Your draft's event (`push` by default); a published workflow runs as `workflow_dispatch`.
+        pub event: Option<String>,
+        /// Only these jobs, and the jobs they need.
+        pub jobs: Option<Vec<String>>,
+        /// Run your Pipelines draft of the workflow's file, as your test of it (W29-R14).
+        pub draft: Option<bool>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
@@ -2568,6 +2570,7 @@ pub mod input {
         SaveDraft,
         Ready,
         Discard,
+        Run,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
@@ -2582,6 +2585,16 @@ pub mod input {
         pub content: Option<String>,
         /// Save draft's title (`Edit <path>` when left out).
         pub title: Option<String>,
+        /// Run's event, for your draft (`push` by default).
+        pub event: Option<String>,
+        /// Run's jobs: only these and the jobs they need.
+        pub jobs: Option<Vec<String>>,
+        /// Run's `workflow_dispatch` inputs.
+        pub inputs: Option<serde_json::Map<String, serde_json::Value>>,
+        /// Run's branch or tag, for a published workflow.
+        pub r#ref: Option<String>,
+        /// Run's commit, standing for `ref`.
+        pub sha: Option<String>,
     }
 }
 
