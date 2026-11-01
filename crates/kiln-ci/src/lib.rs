@@ -47,6 +47,7 @@ pub mod insights;
 pub mod land;
 pub mod mirror;
 pub mod oidc;
+pub mod pipelines;
 pub mod plan;
 pub mod policy;
 pub mod results;

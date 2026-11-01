@@ -9794,12 +9794,13 @@ is kiln research `01a1947b2b0270fa9d1e32d07aebaa7e` (44 findings, 37 sources) an
 - **W29-R02 Rows by repository.** Each workflow, reusable workflow and action at its repository's
   default-branch head is one row, and so is each draft (W29-R10).
   - Rows are grouped under their repository's heading, whose words say what's there and what needs
-    someone: "7 workflows · 1 failing · 1 waits on you", or "shared · 6 actions · 1 workflow ·
-    1 draft".
+    someone: "7 workflows · 1 failing · 1 waits on you", "shared · 6 actions · 1 workflow ·
+    1 draft", or, with an update draft, "3 workflows · ci-kit v2.4.0 is out".
   - A row is Ship's own: the name (with DRAFT beside it for a draft); its stand's word (Review,
-    Failing, Can't run, Not saved, Unpublished, Update, Passing, Released, Not run here, Off); one
-    line saying what it is and does; three pips; who changed it last and when; and where it is: a
-    branch, a tag (a tag's mark) or a change (`#214`), and its commit.
+    Failing, Can't run, Not saved, Unpublished, Update, Passing, Released, Not run here, Off, and
+    Not run yet for a workflow with no runs, Not released for an action or reusable workflow with
+    no tag); one line saying what it is and does; three pips; who changed it last and when; and
+    where it is: a branch, a tag (a tag's mark) or a change (`#214`), and its commit.
   - The pips:
     - **Checks**: W02's checks and the server's (KCI6007's labels, the action policy) at its commit.
     - **Runs on**: whether a machine connected now can take every job (W05-R20's explanation, bare
@@ -9807,7 +9808,9 @@ is kiln research `01a1947b2b0270fa9d1e32d07aebaa7e` (44 findings, 37 sources) an
     - **Latest**: for a workflow, its newest run on the default branch; for an action or reusable
       workflow, its newest tag's own checks.
   - Order: what needs someone first (Review, Failing, Can't run), then drafts, then the rest by
-    name. Each repository ends with a New row (W29-R08).
+    name. Each repository ends with a New row (W29-R08). Among what needs someone, Review comes
+    first, then Failing, then Can't run. `kiln_ci::pipelines` decides each row's stand, word, pips
+    and place, from facts the server passes in.
   - Facets: repository, kind (workflow, reusable workflow, composite, JavaScript, Docker,
     Firecracker, Shards), dialect (GitHub's, kiln's, code), stand, machine kind (bare metal, docker,
     compose, firecracker, shards, kubernetes) and shared.
