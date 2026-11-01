@@ -457,6 +457,21 @@ export interface CiPreview {
   } | null;
   /** Each job's matrix as written (W21-R06's matrix view). */
   matrices?: Record<string, CiMatrix>;
+  /** Each schedule's options and next runs, as W03's cron reads them (W29-R06's Times view). */
+  schedules?: CiSchedule[];
+}
+
+/** A schedule of a workflow's, as the preview says it: its options, and its next three runs (or why it has none). */
+export interface CiSchedule {
+  cron: string;
+  timezone: string | null;
+  skip_if_unchanged: boolean;
+  catch_up: boolean;
+  jitter: string | null;
+  inputs: Record<string, unknown>;
+  /** Each next run (unix seconds), with a change of its zone's offset in the day before it. */
+  next: { at: number; shift?: { at: number; local: string; ends: boolean } }[] | null;
+  error: string | null;
 }
 
 /** A job's matrix as written: its axes' values (or the expression that makes them), `include`, `exclude` and `where`; or the expression that makes it whole. */

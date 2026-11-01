@@ -1457,6 +1457,7 @@
 }
 .ppl-detail {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   align-content: start;
   min-width: 0;
 }
@@ -1658,4 +1659,83 @@
 .ppl-fix:focus-visible {
   outline: 2px solid #a6c4ed;
   outline-offset: 2px;
+}
+/* Add a trigger's kinds (W29-R06): each a line to pick, whose it is on its right. */
+.ppl-kind {
+  all: unset;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 28px;
+  cursor: pointer;
+}
+.ppl-kinds .ppl-lines li {
+  padding: 0;
+}
+.ppl-kind[aria-disabled] {
+  opacity: 0.45;
+  cursor: default;
+}
+.ppl-kind:not([aria-disabled]):hover {
+  background: rgb(255 255 255 / 0.03);
+}
+.ppl-kind:focus-visible {
+  outline: 2px solid #a6c4ed;
+  outline-offset: -2px;
+}
+.ppl-kind .n b,
+.ppl-fields .n b {
+  color: #e4e5e7;
+  font-weight: 400;
+}
+/* A trigger's filters and a schedule's options, each edited where it's shown. */
+.ppl-fields li {
+  gap: 12px;
+}
+.ppl-fields .n {
+  white-space: normal;
+}
+.ppl-input {
+  all: unset;
+  box-sizing: border-box;
+  /* No width of its own (an input's is twenty characters): the line gives it its share. */
+  flex: 1 1 40%;
+  width: 0;
+  min-width: 0;
+  height: 24px;
+  padding: 0 8px;
+  border-bottom: 1px solid var(--k-line, #2a2c31);
+  color: #d4dde8;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11.5px;
+}
+.ppl-input:focus-visible {
+  border-bottom-color: #a6c4ed;
+}
+.ppl-switch {
+  all: unset;
+  flex: none;
+  min-width: 34px;
+  cursor: pointer;
+  color: #8b8e96;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11px;
+  text-align: end;
+}
+.ppl-switch[aria-checked="true"] {
+  color: #bfdccf;
+}
+.ppl-switch:focus-visible {
+  outline: 2px solid #a6c4ed;
+  outline-offset: 2px;
+}
+.ppl-out {
+  display: inline-block;
+  margin: 8px;
+}
+/* On a phone the detail under its line is the screen's width at most: a long line ends in an ellipsis. */
+.ppl .jp-detail {
+  grid-template-columns: minmax(0, 1fr);
 }

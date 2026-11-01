@@ -671,6 +671,42 @@ function paneOf(repo: string, row: ShipPipelineRow): ShipPipelinePane {
 /** The labels the mock's machines carry, for the Flow view's and Try it's pickers. */
 const LABELS = ["baremetal", "linux", "docker", "bench", "macos", "arm64", "x86_64"].map((label) => ({ label, from: ["runner" as const] }));
 
+/** A minute's wall clock in `tz`, as Intl reads it. */
+function wall(ms: number, tz: string): { y: number; mo: number; d: number; h: number; mi: number } {
+  const parts = new Intl.DateTimeFormat("en-US", { timeZone: tz, hourCycle: "h23", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }).formatToParts(new Date(ms));
+  const get = (k: string) => Number(parts.find((x) => x.type === k)?.value ?? 0);
+  return { y: get("year"), mo: get("month"), d: get("day"), h: get("hour"), mi: get("minute") };
+}
+/** `tz`'s offset from UTC at `ms`, in ms. */
+const offsetAt = (ms: number, tz: string) => {
+  const w = wall(ms, tz);
+  return Date.UTC(w.y, w.mo - 1, w.d, w.h, w.mi) - Math.floor(ms / 60_000) * 60_000;
+};
+
+/**
+ * A daily schedule's next three runs (`M H * * *`, what the mock's files say), its local time read in
+ * its zone as W03's cron reads it, with the zone's change of offset in the day before each. The
+ * server's are `kiln_ci::trigger::cron::next_runs`; this is the mock's stand-in.
+ */
+function nextDaily(cron: string, tz: string | null): { at: number; shift?: { at: number; local: string; ends: boolean } }[] | null {
+  const m = /^(\d+) (\d+) \* \* \*$/.exec(cron.trim());
+  if (!m) return null;
+  const zone = tz ?? "UTC";
+  const [mi, h] = [Number(m[1]), Number(m[2])];
+  const today = wall(Date.now(), zone);
+  const out: { at: number; shift?: { at: number; local: string; ends: boolean } }[] = [];
+  for (let k = 0; k < 5 && out.length < 3; k++) {
+    const day = new Date(Date.UTC(today.y, today.mo - 1, today.d + k));
+    const guess = Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate(), h, mi);
+    let t = guess - offsetAt(guess, zone);
+    t = guess - offsetAt(t, zone);
+    if (t <= Date.now()) continue;
+    const [was, now] = [offsetAt(t - 86_400_000, zone), offsetAt(t, zone)];
+    out.push({ at: Math.floor(t / 1000), ...(was !== now ? { shift: { at: Math.floor(t / 1000) - 3600, local: "02:00", ends: now < was } } : {}) });
+  }
+  return out;
+}
+
 /** `POST /api/ci/plan-preview` (W04-R29), as the mock plans: a job's legs by its matrix, where linux legs would run. */
 function preview(body: Obj): unknown {
   const text = String(body.content ?? FILES[`${String(body.repo)}:${String(body.path)}`] ?? "");
@@ -696,6 +732,20 @@ function preview(body: Obj): unknown {
       routing: { labels, image: null, executors: ["baremetal"], runners: labels.includes("macos") ? [fit("metal-mac-mini")] : [fit("fedora"), fit("adacachy")] },
     }));
   });
+  const schedules = (Array.isArray(obj(doc.on).schedule) ? (obj(doc.on).schedule as unknown[]) : []).map(obj).map((s) => {
+    const tz = s.timezone ? String(s.timezone) : null;
+    const next = nextDaily(String(s.cron), tz);
+    return {
+      cron: String(s.cron),
+      timezone: tz,
+      skip_if_unchanged: s["skip-if-unchanged"] === true,
+      catch_up: s["catch-up"] === true,
+      jitter: s.jitter ? String(s.jitter) : null,
+      inputs: obj(s.inputs),
+      next,
+      error: next ? null : `the mock reads daily crons only, not ${String(s.cron)}`,
+    };
+  });
   return {
     repo: body.repo,
     ref: "main",
@@ -706,6 +756,7 @@ function preview(body: Obj): unknown {
     why: null,
     diagnostics: [],
     plan: { name: String(doc.name ?? ""), legs, decided: [], removed: {}, later: [] },
+    schedules,
   };
 }
 

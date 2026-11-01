@@ -9,7 +9,7 @@
  */
 import * as React from "react";
 import { ChevronDown, FileText, Minus, Plus, Tag } from "lucide-react";
-import { ci, type CiDiagnostic, type CiPreview } from "@/api/ci";
+import { ci, type CiDiagnostic, type CiPreview, type CiSchedule } from "@/api/ci";
 import { shipApi, type ShipPipelineAct, type ShipPipelineGroup, type ShipPipelineLine, type ShipPipelinePane, type ShipPipelineRepo, type ShipPipelineRow, type ShipPipelineVerb } from "@/api/ship";
 import type { Diagnostic } from "@/components/code/editor";
 import { Toks } from "@/components/code/highlighted";
@@ -21,6 +21,9 @@ import { GLYPHS, PIPELINE_STAGES, type GlyphState, type Pip } from "@/components
 import { errorMessage, useMediaQuery } from "@/lib/hooks";
 import { jobsOf, planLines, whereWords, type PlanJob, type PlanLine } from "@/lib/plan-diff";
 import { manualInputs, spotOf, type Spot } from "@/lib/pipeline-spot";
+import { TRIGGER_GROUPS, TRIGGER_KINDS, triggerKeys, triggerLines, type TriggerKind } from "@/lib/triggers";
+import { addTrigger, EditRefused, removeTrigger, setScheduleField, setTriggerFilter } from "@/lib/workflow-doc";
+import { parse as parseYaml } from "yaml";
 import { Link, useSearchParams } from "@/lib/router";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { relativeTime } from "@/lib/format";
@@ -395,6 +398,8 @@ function viewsFor(p: ShipPipelinePane, l: ShipPipelineLine | null): string[] {
       return ["Use", "YAML"];
     case "run":
       return ["Run"];
+    case "add":
+      return ["Add a trigger"];
     case "change":
     case "upstream":
     case "note":
@@ -461,13 +466,19 @@ function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: S
     onChanged(t !== p.detail.text);
     setSaid(null);
   };
-  const lines = p.groups.flatMap((g) => g.lines);
+  // The Triggers group follows what's typed, and ends with Add a trigger where the file can be edited (W29-R06).
+  const workflow = ["workflow", "reusable"].includes(h.kind);
+  const kiln = h.dialect === "kiln";
+  const editable = p.strip.verbs.some((v) => v.verb === "save_draft" && v.enabled);
+  const typed = workflow && changed ? triggerLines(text, kiln) : null;
+  const groups = p.groups.map((g) => (g.name === "Triggers" && workflow ? { ...g, lines: [...(typed ?? g.lines), ...(editable ? [ADD_TRIGGER] : [])] } : g));
+  const lines = groups.flatMap((g) => g.lines);
   const at = picked && lines.some((l) => l.key === picked) ? picked : firstPick(p);
   const line = lines.find((l) => l.key === at) ?? null;
-  const groupOf = (k: Key) => p.groups.find((g) => g.lines.some((l) => l.key === k))?.name ?? "";
+  const groupOf = (k: Key) => groups.find((g) => g.lines.some((l) => l.key === k))?.name ?? "";
   // The plan is for one of its triggers' events (W29-R07): a picked trigger's, else the one "plan for:" picks, else its first.
-  const workflow = ["workflow", "reusable"].includes(h.kind);
-  const triggers = p.groups.find((g) => g.name === "Triggers")?.lines ?? [];
+  const triggers = (groups.find((g) => g.name === "Triggers")?.lines ?? []).filter((l) => l.kind === "trigger");
+  const [show, setShow] = React.useState<Shown>("all");
   const [planFor, setPlanFor] = React.useState<string | null>(null);
   const event = line?.kind === "trigger" ? eventKey(line) : planFor && triggers.some((t) => eventKey(t) === planFor) ? planFor : triggers[0] ? eventKey(triggers[0]) : null;
   const pickEvent = (e: string) => {
@@ -544,6 +555,10 @@ function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: S
     (armed.asks ?? `${armed.label}?`)
   ) : said ? (
     said.text
+  ) : line?.kind === "add" ? (
+    <>
+      <b>Add a trigger</b> · pick what starts it; its filters open under it and the YAML gains its lines, as a draft
+    </>
   ) : changed ? (
     <>Not saved yet · a draft runs on no trigger until it lands</>
   ) : line ? (
@@ -577,8 +592,30 @@ function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: S
     setSaid(null);
     setArmed(null);
   };
-  const editable = p.strip.verbs.some((v) => v.verb === "save_draft" && v.enabled);
-  const detail = <Detail key={`${at ?? "file"}|${event ?? ""}`} pane={p} line={line} text={text} onText={edit} editable={editable} ask={ask} rows={phone ? PHONE_ROWS : SIDE_ROWS} />;
+  // What the detail edits the file with: a change made (or refused, saying why), a kind added and picked.
+  const tools: Tools = {
+    kiln,
+    show,
+    change: (make) => {
+      try {
+        edit(make(text));
+      } catch (e) {
+        setSaid({ text: e instanceof EditRefused ? e.message : errorMessage(e), refused: true });
+      }
+    },
+    say: (why) => setSaid({ text: why, refused: true }),
+    addKind: (k) => {
+      const keys = kiln ? k.kiln : k.gha;
+      if (!keys) return setSaid({ text: overlayWhy(h.path), refused: true });
+      try {
+        edit(addTrigger(text, keys, k.first(kiln)));
+        setPicked(`on.${kiln && keys[0] === "manual" ? "workflow_dispatch" : (keys[0] ?? "")}`);
+      } catch (e) {
+        setSaid({ text: e instanceof EditRefused ? e.message : errorMessage(e), refused: true });
+      }
+    },
+  };
+  const detail = <Detail key={`${at ?? "file"}|${event ?? ""}`} pane={p} line={line} text={text} onText={edit} editable={editable} ask={ask} tools={tools} rows={phone ? PHONE_ROWS : SIDE_ROWS} />;
   // On a phone, the picked line's detail is right under it, as the approved stills draw it.
   const below = (k: Key) => (phone && k === at ? <li className="jp-detail">{detail}</li> : null);
   return (
@@ -596,7 +633,19 @@ function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: S
             <div className="jp-said" aria-live="polite">
               {say}
             </div>
-            {workflow && triggers.length ? (
+            {line?.kind === "add" ? (
+              <div className="jp-q">
+                <span>show:</span>
+                {(["all", "github", "kiln"] as const).map((w, i) => (
+                  <React.Fragment key={w}>
+                    {i ? <span aria-hidden>·</span> : null}
+                    <button type="button" aria-pressed={show === w} onClick={() => setShow(w)}>
+                      {w === "all" ? "all" : w === "github" ? "GitHub's" : "kiln's"}
+                    </button>
+                  </React.Fragment>
+                ))}
+              </div>
+            ) : workflow && triggers.length ? (
               <div className="jp-q">
                 <span>plan for:</span>
                 {triggers.map((t, i) => (
@@ -632,7 +681,7 @@ function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: S
         </div>
         <div className="jp-body ppl-body">
           <ol className="jp-list ppl-list" aria-label={`${h.title}'s parts`}>
-            {p.groups.map((g) => (
+            {groups.map((g) => (
               <React.Fragment key={g.name}>
                 <li className="jp-g" data-group={g.name}>
                   <span>{g.name}</span>
@@ -654,13 +703,278 @@ function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: S
   );
 }
 
+/** Add a trigger's line, last in Triggers where the file can be edited (W29-R06). */
+const ADD_TRIGGER: ShipPipelineLine = { key: "add-trigger", kind: "add", name: "Add a trigger", value: `${TRIGGER_KINDS.length} kinds` };
+
+/** Which kinds Add a trigger lists: all, or what GitHub's or kiln's dialect says. */
+type Shown = "all" | "github" | "kiln";
+
+/** What the detail edits the file with (W29-R06): a change made in its text, a kind added, why something can't be. */
+interface Tools {
+  kiln: boolean;
+  show: Shown;
+  change: (make: (text: string) => string) => void;
+  addKind: (k: TriggerKind) => void;
+  say: (why: string) => void;
+}
+
+/** A workflow file's stem (`ci` of `.github/workflows/ci.yml`), as its overlay is named. */
+const stemOf = (path: string) => (path.split("/").pop() ?? path).replace(/\.ya?ml$/, "");
+
+/** Why a kiln-only trigger isn't added to a GitHub workflow here (W29-R06: it goes in the workflow's overlay). */
+const overlayWhy = (path: string) => `kiln's own: a GitHub workflow keeps working on GitHub with it in .kiln/overlays/${stemOf(path)}.yaml, which drafts of more than one file write (W29-R08)`;
+
+/** Add a trigger (W29-R06): the 18 kinds in six groups, each GitHub's, kiln's or both; picking one adds its lines, a draft, and opens its filters. */
+function AddTrigger({ pane, text, tools }: { pane: ShipPipelinePane; text: string; tools: Tools }) {
+  const written = new Set(triggerKeys(text, tools.kiln).values());
+  const shown = TRIGGER_KINDS.filter((k) => tools.show === "all" || k.whose === "both" || k.whose === tools.show);
+  return (
+    <div className="ppl-kinds" aria-label="Add a trigger">
+      {TRIGGER_GROUPS.map((g) => {
+        const kinds = shown.filter((k) => k.group === g);
+        if (!kinds.length) return null;
+        return (
+          <React.Fragment key={g}>
+            <div className="jp-g">
+              <span>{g}</span>
+              <span />
+            </div>
+            <ul className="ppl-lines">
+              {kinds.map((k) => {
+                const keys = tools.kiln ? k.kiln : k.gha;
+                const why = !keys ? overlayWhy(pane.head.path) : keys.some((key) => written.has(key)) ? `it has a ${k.words} trigger already: pick it in Triggers to change its filters` : null;
+                return (
+                  <li key={k.id} data-kind={k.id}>
+                    <button type="button" className="ppl-kind" aria-disabled={why ? true : undefined} onClick={() => (why ? tools.say(why) : tools.addKind(k))}>
+                      <StatusGlyph state="none" size={12} />
+                      <span className="n">
+                        <b>{k.words}</b> · {k.say}
+                      </span>
+                      <span className="v">{k.whose === "both" ? "both" : k.whose === "kiln" ? "kiln" : "GitHub"}</span>
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          </React.Fragment>
+        );
+      })}
+    </div>
+  );
+}
+
+/** The filters each event takes (W03, W29-R06), offered where a trigger has none of them yet. */
+const FILTERS: Record<string, string[]> = {
+  push: ["branches", "branches-ignore", "tags", "tags-ignore", "paths", "paths-ignore"],
+  pull_request: ["types", "branches", "branches-ignore", "paths", "paths-ignore"],
+  pull_request_review: ["types"],
+  review: ["types"],
+  merge_group: ["types"],
+  workflow_run: ["workflows", "types", "branches"],
+  pipeline: ["name", "conclusion", "branches"],
+  release: ["types"],
+  registry_package: ["types"],
+  repository_dispatch: ["types"],
+  diff: ["trunks", "paths", "drafts"],
+  deploy: ["app", "environment", "states"],
+  webhook: ["hook", "filter"],
+  comment: ["commands"],
+  agent: ["agents"],
+};
+/** Filters that are lists: written as words split by commas. */
+const LISTS = new Set(["branches", "branches-ignore", "tags", "tags-ignore", "paths", "paths-ignore", "types", "workflows", "conclusion", "trunks", "states", "commands", "agents"]);
+
+/** A trigger's value in the text, by its key (a mapping, or nothing under it). */
+function triggerValue(text: string, key: string): Record<string, unknown> {
+  try {
+    const on = (parseYaml(text) as { on?: unknown } | null)?.on;
+    const v = on && typeof on === "object" && !Array.isArray(on) ? (on as Record<string, unknown>)[key] : null;
+    return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+}
+
+/** Words split by commas, as a list filter is typed. */
+const wordsIn = (s: string) =>
+  s
+    .split(",")
+    .map((w) => w.trim())
+    .filter(Boolean);
+
+/** A field that writes when it's left or Enter is pressed, not at every key: the YAML changes once per edit. */
+function Field({ value, label, onSet }: { value: string; label: string; onSet: (v: string) => void }) {
+  return (
+    <input
+      key={value}
+      className="ppl-input"
+      aria-label={label}
+      defaultValue={value}
+      spellCheck={false}
+      onBlur={(e) => {
+        if (e.currentTarget.value !== value) onSet(e.currentTarget.value);
+      }}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") e.currentTarget.blur();
+      }}
+    />
+  );
+}
+
+function Switch({ on, label, onSet }: { on: boolean; label: string; onSet: (v: boolean) => void }) {
+  return (
+    <button type="button" role="switch" className="ppl-switch" aria-checked={on} aria-label={label} onClick={() => onSet(!on)}>
+      {on ? "on" : "off"}
+    </button>
+  );
+}
+
+/** A trigger's filters, edited where they're shown (W29-R06): a list as words split by commas, a word, a switch; what's deeper in the YAML. */
+function TriggerFilters({ text, line, tools }: { text: string; line: ShipPipelineLine; tools: Tools }) {
+  const event = eventKey(line);
+  const key = triggerKeys(text, tools.kiln).get(event) ?? event;
+  const value = triggerValue(text, key);
+  const fields = [...new Set([...Object.keys(value), ...(FILTERS[key] ?? FILTERS[event] ?? [])])];
+  const set = (f: string, v: string[] | string | boolean | null) => tools.change((t) => setTriggerFilter(t, key, f, v));
+  return (
+    <div className="ppl-fields-view">
+      <ul className="ppl-lines ppl-fields" aria-label={`${line.name}'s filters`}>
+        {fields.map((f) => {
+          const v = value[f];
+          return (
+            <li key={f} data-field={f}>
+              <span className="n">{f}</span>
+              {typeof v === "boolean" ? (
+                <Switch on={v} label={f} onSet={(on) => set(f, on)} />
+              ) : v !== undefined && v !== null && typeof v === "object" && !Array.isArray(v) ? (
+                <span className="v">{Object.keys(v).join(", ")} · edit it in the YAML</span>
+              ) : (
+                <Field
+                  value={Array.isArray(v) ? v.map(String).join(", ") : v === undefined || v === null ? "" : String(v)}
+                  label={f}
+                  onSet={(s) => set(f, LISTS.has(f) || Array.isArray(v) ? wordsIn(s) : s.trim() || null)}
+                />
+              )}
+            </li>
+          );
+        })}
+      </ul>
+      <button type="button" className="ppl-fix ppl-out" onClick={() => tools.change((t) => removeTrigger(t, key))}>
+        Take this trigger out
+      </button>
+    </div>
+  );
+}
+
+/** A run's minute in its zone and in UTC, with daylight saving's change said: `Sun, Nov 1, 03:00 PST · 11:00 UTC (daylight saving ends at 02:00)`. */
+function runWords(r: NonNullable<CiSchedule["next"]>[number], tz: string | null): string {
+  const at = new Date(r.at * 1000);
+  const local = new Intl.DateTimeFormat("en-US", {
+    timeZone: tz ?? "UTC",
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+    timeZoneName: "short",
+  }).format(at);
+  const utc = new Intl.DateTimeFormat("en-US", { timeZone: "UTC", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(at);
+  const shift = r.shift ? ` (daylight saving ${r.shift.ends ? "ends" : "starts"} at ${r.shift.local})` : "";
+  return `${local}${tz && tz !== "UTC" ? ` · ${utc} UTC` : ""}${shift}`;
+}
+
+/** How far off a run is, in days: today, tomorrow, in 3 days. */
+function fromNow(at: number): string {
+  const days = Math.round((at * 1000 - Date.now()) / 86_400_000);
+  return days <= 0 ? "today" : days === 1 ? "tomorrow" : `in ${days} days`;
+}
+
+/** A schedule's next runs, from W03's cron as the server reads them, and its options, each edited where it's shown (W29-R06, W03-R10). */
+function ScheduleTimes({ pane, text, tools, editable }: { pane: ShipPipelinePane; text: string; tools: Tools; editable: boolean }) {
+  const preview = useSuspenseResource(`ci/schedules/${pane.repo}/${pane.head.path}/${hashOf(text)}`, () =>
+    ci.preview({ repo: pane.repo, path: pane.head.path, content: text, event: "schedule" }),
+  ).data;
+  const set = (i: number, field: string, v: string | boolean | null) => tools.change((t) => setScheduleField(t, i, field, v));
+  const schedules = preview.schedules ?? [];
+  if (!schedules.length) return <p className="ppl-empty">{preview.why ?? "Its schedule can't be read yet: fix the YAML first."}</p>;
+  return (
+    <div className="ppl-times">
+      {schedules.map((s, i) => (
+        <React.Fragment key={`${i}-${s.cron}`}>
+          <div className="jp-g">
+            <span>Its next runs{schedules.length > 1 ? ` · ${s.cron}` : ""}</span>
+            <span />
+          </div>
+          <ul className="ppl-lines" aria-label={`${s.cron}'s next runs`}>
+            {s.error ? (
+              <li>
+                <StatusGlyph state="failed" size={12} />
+                <span className="n">{s.error}</span>
+              </li>
+            ) : (
+              (s.next ?? []).map((r) => (
+                <li key={r.at}>
+                  <StatusGlyph state="none" size={12} />
+                  <span className="n">{runWords(r, s.timezone)}</span>
+                  <span className="v">{fromNow(r.at)}</span>
+                </li>
+              ))
+            )}
+          </ul>
+          <div className="jp-g">
+            <span>Its options</span>
+            <span />
+          </div>
+          <ul className="ppl-lines ppl-fields" aria-label={`${s.cron}'s options`}>
+            <li data-field="timezone">
+              <span className="n">
+                <b>Time zone</b> · a missing local time runs at the next minute, a repeated one once
+              </span>
+              {editable ? <Field value={s.timezone ?? ""} label="Time zone" onSet={(v) => set(i, "timezone", v.trim() || null)} /> : <span className="v">{s.timezone ?? "UTC"}</span>}
+            </li>
+            <li data-field="skip-if-unchanged">
+              <span className="n">
+                <b>Skip if unchanged</b> · no run when its branch hasn&apos;t moved since the last one passed
+              </span>
+              {editable ? <Switch on={s.skip_if_unchanged} label="Skip if unchanged" onSet={(v) => set(i, "skip-if-unchanged", v)} /> : <span className="v">{s.skip_if_unchanged ? "on" : "off"}</span>}
+            </li>
+            <li data-field="catch-up">
+              <span className="n">
+                <b>Catch up</b> after downtime · off is GitHub&apos;s: missed times are dropped
+              </span>
+              {editable ? <Switch on={s.catch_up} label="Catch up" onSet={(v) => set(i, "catch-up", v)} /> : <span className="v">{s.catch_up ? "on" : "off"}</span>}
+            </li>
+            <li data-field="jitter">
+              <span className="n">
+                <b>Jitter</b> · a delay the same each time, so schedules spread out
+              </span>
+              {editable ? <Field value={s.jitter ?? ""} label="Jitter" onSet={(v) => set(i, "jitter", v.trim() || null)} /> : <span className="v">{s.jitter ?? "off"}</span>}
+            </li>
+            <li data-field="inputs">
+              <span className="n">
+                <b>Inputs</b> · what a scheduled run is given
+              </span>
+              <span className="v">
+                {Object.entries(s.inputs)
+                  .map(([k, v]) => `${k} = ${String(v)}`)
+                  .join(", ") || "none"}
+              </span>
+            </li>
+          </ul>
+        </React.Fragment>
+      ))}
+    </div>
+  );
+}
+
 /** One line: its glyph, its kind word and name, its value; picking it shows its detail. */
 function PaneLine({ line, at, onLine }: { line: ShipPipelineLine; at: boolean; onLine: (k: Key) => void }) {
   const w = wordsOf(line);
   return (
     <li className="jp-j" data-key={line.key} data-sel={at || undefined} data-at={at || undefined} data-state={line.state}>
       <span className="jp-glyph" aria-hidden="true">
-        <StatusGlyph state={glyphOf(glyphFor(line))} size={12} />
+        {line.kind === "add" ? <Plus size={12} /> : <StatusGlyph state={glyphOf(glyphFor(line))} size={12} />}
       </span>
       <button type="button" className="jp-line" aria-current={at || undefined} onClick={() => onLine(line.key)}>
         <span className="n">
@@ -681,6 +995,7 @@ function Detail({
   onText,
   editable,
   ask,
+  tools,
   rows,
 }: {
   pane: ShipPipelinePane;
@@ -689,6 +1004,7 @@ function Detail({
   onText: (t: string) => void;
   editable: boolean;
   ask: PlanAsk;
+  tools: Tools;
   rows: number;
 }) {
   const views = viewsFor(pane, line);
@@ -699,7 +1015,7 @@ function Detail({
     <div className="ppl-detail">
       <div className="ppl-dhead">
         <span className="ppl-dname">{name}</span>
-        <span className="dp-w ppl-views" role="tablist" aria-label="Views">
+        <span className="dp-w ppl-views" role="tablist" aria-label="Views" hidden={views.length < 2}>
           {views.map((v) => (
             <button key={v} type="button" role="tab" aria-selected={v === shown} onClick={() => setView(v)}>
               {v}
@@ -709,7 +1025,7 @@ function Detail({
       </div>
       <div className="ppl-dbody" style={{ "--rows": rows } as React.CSSProperties}>
         <Loadable label={`Loading ${shown}`} fallback={<Loading label={`Loading ${shown}`} block className="ppl-slot" />}>
-          <View view={shown} pane={pane} line={line} text={text} onText={onText} editable={editable} ask={ask} rows={rows} />
+          <View view={shown} pane={pane} line={line} text={text} onText={onText} editable={editable} ask={ask} tools={tools} rows={rows} />
         </Loadable>
       </div>
     </div>
@@ -724,6 +1040,7 @@ function View({
   onText,
   editable,
   ask,
+  tools,
   rows,
 }: {
   view: string;
@@ -733,6 +1050,7 @@ function View({
   onText: (t: string) => void;
   editable: boolean;
   ask: PlanAsk;
+  tools: Tools;
   rows: number;
 }) {
   const h = pane.head;
@@ -748,8 +1066,12 @@ function View({
     case "Last run":
     case "Run":
       return <Lines lines={(pane.groups.find((g) => g.name === "Runs")?.lines ?? []).filter((l) => view === "Last run" || l.key === line?.key)} empty="No run yet on its default branch." />;
+    case "Add a trigger":
+      return <AddTrigger pane={pane} text={text} tools={tools} />;
     case "Times":
+      return line ? <ScheduleTimes pane={pane} text={text} tools={tools} editable={editable} /> : null;
     case "Filters":
+      if (editable && line) return <TriggerFilters text={text} line={line} tools={tools} />;
       return (
         <Lines
           lines={(line?.value ?? "")

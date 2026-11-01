@@ -681,3 +681,37 @@ fn w29_r21_r22_release_and_updates_in_ship() -> anyhow::Result<()> {
     assert!(at(&p, "/detail/text").contains("setup@v1.1.0"), "{p}");
     Ok(())
 }
+
+/// W29-R06's Times view: a workflow's preview carries each schedule's options and its next three
+/// runs, read as W03's cron reads them (its time zone, daylight saving and all), as
+/// `kiln_ci::trigger::cron::next_runs` makes them at the moment it's asked.
+#[test]
+fn w29_r06_schedule_times_in_the_preview() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: false, ci: "kiln_workflows = true", extra: "" })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let work = hosted(&s, &home, dir.path(), "acme/sched", &[], None)?;
+    // Its commit named: the preview reads refs through the mirror, which catches up after a push.
+    let sha = git(&home, &work, &["rev-parse", "HEAD"])?.trim().to_owned();
+    let content = "name: smoke\non:\n  schedule:\n    - cron: \"0 3 * * *\"\n      timezone: America/Los_Angeles\n      skip-if-unchanged: true\n      inputs: { target: production }\n    - cron: \"*/30 * * * *\"\njobs:\n  smoke:\n    runs-on: local\n    steps:\n      - run: echo smoke\n";
+    let unix = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX)).unwrap_or_default();
+    let before = unix();
+    let (st, body) = http(s.port, "POST", "/api/ci/plan-preview", &s.admin, Some(&json!({ "repo": "acme/sched", "ref": "main", "sha": sha, "path": ".kiln/smoke.yaml", "content": content, "event": "schedule" })))?;
+    let after = unix();
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let v: Value = serde_json::from_str(&body)?;
+    let schedules = v.get("schedules").and_then(Value::as_array).cloned().unwrap_or_default();
+    let (Some(first), Some(second), 2) = (schedules.first(), schedules.get(1), schedules.len()) else { anyhow::bail!("both schedules: {v}") };
+    for (s, cron, tz) in [(first, "0 3 * * *", Some("America/Los_Angeles")), (second, "*/30 * * * *", None)] {
+        assert_eq!(field(s, "cron"), cron);
+        assert_eq!(s.get("timezone").and_then(Value::as_str), tz);
+        let want = |now: i64| serde_json::to_value(kiln_ci::trigger::cron::next_runs(cron, tz, now, 3).unwrap_or_default()).unwrap_or_default();
+        let next = s.get("next").cloned().unwrap_or_default();
+        assert!(next == want(before) || next == want(after), "{cron}: {next} is next_runs' at {before} or {after}");
+        assert_eq!(next.as_array().map(Vec::len), Some(3), "{s}");
+    }
+    assert_eq!(first.get("skip_if_unchanged"), Some(&json!(true)));
+    assert_eq!(first.pointer("/inputs/target").and_then(Value::as_str), Some("production"));
+    Ok(())
+}

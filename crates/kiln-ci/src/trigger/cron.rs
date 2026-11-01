@@ -141,6 +141,53 @@ impl Cron {
     }
 }
 
+/// A schedule's next run, as Ship's Pipelines shows it (docs/ci.md W29-R06): its minute (unix
+/// seconds), and a change of its zone's offset in the day before it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct NextRun {
+    pub at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shift: Option<Shift>,
+}
+
+/// A zone's change of offset: when (unix seconds, its first minute at the new offset), the wall
+/// time it happened at on the old clock (`02:00`), and whether daylight saving ends or starts.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Shift {
+    pub at: i64,
+    pub local: String,
+    pub ends: bool,
+}
+
+/// A schedule's next `n` runs after `now` (looking 60 days ahead), read in `timezone` (UTC when
+/// none), with W03-R10's daylight-saving rules: what W29-R06's Times view lists.
+pub fn next_runs(cron: &str, timezone: Option<&str>, now: i64, n: usize) -> Result<Vec<NextRun>, String> {
+    let c = Cron::parse(cron)?;
+    let tz = zone(timezone)?;
+    Ok(c.fires_in(now, now.saturating_add(60 * 24 * 3600), &tz, n).into_iter().map(|at| NextRun { at, shift: shift_before(&tz, at) }).collect())
+}
+
+/// Where `tz`'s offset changes in the day before `at`, found by halving to the minute.
+fn shift_before(tz: &TimeZone, at: i64) -> Option<Shift> {
+    let off = |t: i64| Timestamp::from_second(t).ok().map(|ts| tz.to_offset(ts).seconds());
+    let (mut lo, mut hi) = (at.saturating_sub(86_400), at);
+    let (was, now) = (off(lo)?, off(hi)?);
+    if was == now {
+        return None;
+    }
+    while hi - lo > 60 {
+        let mid = lo + (hi - lo) / 2;
+        if off(mid)? == was {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let at = hi - hi.rem_euclid(60);
+    let wall = (at + i64::from(was)).rem_euclid(86_400);
+    Some(Shift { at, local: format!("{:02}:{:02}", wall / 3600, (wall % 3600) / 60), ends: now < was })
+}
+
 /// A humane duration in seconds: `90`, `90s`, `15m`, `2h`, `1d` (`jitter:`, W03-R10).
 pub fn seconds(s: &str) -> Option<u64> {
     let s = s.trim();
@@ -254,4 +301,26 @@ mod tests {
         assert!(a < 300);
         assert_eq!(jitter("x", 0), 0);
     }
+
+    #[test]
+    fn w29_r06_next_runs_and_daylight_saving() {
+        // 2026-10-31 18:00 UTC (11:00 PDT): three days of 03:00 Los Angeles time, the first after
+        // the clocks go back at 02:00 PDT on November 1.
+        let now = 1_793_469_600;
+        let runs = next_runs("0 3 * * *", Some("America/Los_Angeles"), now, 3).unwrap_or_default();
+        let at: Vec<i64> = runs.iter().map(|r| r.at).collect();
+        // 03:00 PST is 11:00 UTC.
+        assert_eq!(at, vec![1_793_530_800, 1_793_617_200, 1_793_703_600]);
+        assert_eq!(runs.first().and_then(|r| r.shift.clone()), Some(Shift { at: 1_793_523_600, local: "02:00".into(), ends: true }));
+        assert!(runs.iter().skip(1).all(|r| r.shift.is_none()));
+        // Spring forward: 2027-03-14 02:00 PST jumps to 03:00 PDT; asked the day before.
+        let spring = next_runs("30 3 * * *", Some("America/Los_Angeles"), 1_804_953_600, 1).unwrap_or_default();
+        assert_eq!(spring.first().map(|r| r.at), Some(1_805_020_200));
+        assert_eq!(spring.first().and_then(|r| r.shift.as_ref()).map(|s| (s.local.as_str(), s.ends)), Some(("02:00", false)));
+        // UTC has no shifts; a cron or zone that isn't one says why.
+        assert!(next_runs("*/30 * * * *", None, now, 4).unwrap_or_default().iter().all(|r| r.shift.is_none() && r.at % 1800 == 0));
+        assert!(next_runs("0 3 * *", None, now, 1).is_err());
+        assert!(next_runs("0 3 * * *", Some("Mars/Olympus"), now, 1).is_err());
+    }
+
 }

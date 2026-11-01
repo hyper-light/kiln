@@ -108,7 +108,7 @@ test("an opened workflow is the jobs pane's anatomy: the strip, its groups, the 
   // A trigger: its Filters, YAML and Plan; the plan is its event's.
   await pane.locator('.jp-j[data-key="on.push"] .jp-line').click();
   await expect(detail.getByRole("tab")).toHaveText(["Filters", "YAML", "Plan"]);
-  await expect(detail.locator(".ppl-lines")).toContainText("branches main");
+  await expect(detail.locator('li[data-field="branches"] input')).toHaveValue("main");
   const asked = page.waitForRequest((r) => r.url().endsWith("/api/ci/plan-preview") && r.method() === "POST");
   await detail.getByRole("tab", { name: "Plan" }).click();
   expect((await asked).postDataJSON()).toMatchObject({ repo: "hyper-light/kiln", path: ".kiln/ci.yaml", event: "push" });
@@ -230,5 +230,48 @@ test("the plan for each event: plan for: picks it, a picked job says where it wo
   // The Plan view says the same, against what's published.
   await pane.locator(".ppl-detail").getByRole("tab", { name: "Plan" }).click();
   await expect(pane.locator(".ppl-detail .ppl-lines li[data-mark=added]")).toContainText("helm-lint, a new job");
+  expect(await sideways(page)).toBe(0);
+});
+
+test("Add a trigger: 18 kinds in six groups, shown by whose; picking one adds its lines as a draft and opens its filters; a schedule's times and options", async ({ page, isMobile }) => {
+  const pane = await openPane(page, isMobile, "hyper-light/kiln", ".kiln/smoke.yaml");
+  await pane.locator('.jp-j[data-key="add-trigger"] .jp-line').click();
+  const kinds = pane.getByLabel("Add a trigger");
+  await expect(kinds.locator("li[data-kind]")).toHaveCount(18);
+  await expect(kinds.locator(".jp-g > span:first-child")).toHaveText(["Code", "Time", "People and agents", "Other workflows", "Deploys and releases", "Outside kiln"]);
+  await expect(pane.locator(".jp-said")).toContainText("pick what starts it");
+  // show: kiln's lists kiln's own and both; GitHub's the rest and both.
+  const show = pane.locator(".jp-q");
+  await show.getByRole("button", { name: "kiln's" }).click();
+  await expect(kinds.locator("li[data-kind]")).toHaveCount(10);
+  await show.getByRole("button", { name: "GitHub's" }).click();
+  await expect(kinds.locator("li[data-kind]")).toHaveCount(12);
+  await show.getByRole("button", { name: "all" }).click();
+  // One it has already: dimmed, saying so.
+  await kinds.locator('li[data-kind="schedule"] button').click({ force: true });
+  await expect(pane.locator(".jp-said")).toContainText("it has a schedule trigger already");
+  // A push: its lines added, Not saved, its filters open under it.
+  await kinds.locator('li[data-kind="push"] button').click();
+  await expect(page.locator('.ppl-row[data-key="hyper-light/kiln:.kiln/smoke.yaml"] .ship-r .ship-stand')).toHaveText("Not saved");
+  await expect(pane.locator(".jp-j[data-at]")).toHaveAttribute("data-key", "on.push");
+  const filters = pane.getByLabel("push's filters");
+  await expect(filters.locator("li[data-field]")).toHaveCount(6);
+  await expect(filters.locator('li[data-field="branches"] input')).toHaveValue("main");
+  // A filter typed: the YAML gains it.
+  await filters.locator('li[data-field="tags"] input').fill("v*, release-*");
+  await filters.locator('li[data-field="tags"] input').press("Enter");
+  await expect(filters.locator('li[data-field="tags"] input')).toHaveValue("v*, release-*");
+  await pane.locator(".ppl-detail").getByRole("tab", { name: "YAML" }).click();
+  await expect(pane.locator(".ppl-detail .cm-content")).toContainText("release-*");
+  // The schedule: its next three runs in its zone and UTC, and its options, each changed where it's shown.
+  await pane.locator('.jp-j[data-key="on.schedule"] .jp-line').click();
+  const times = pane.getByLabel("0 3 * * *'s next runs");
+  await expect(times.locator("li")).toHaveCount(3);
+  await expect(times.locator("li").first()).toContainText(/03:00 P[SD]T · 1[01]:00 UTC/);
+  const options = pane.getByLabel("0 3 * * *'s options");
+  await expect(options.locator('li[data-field="skip-if-unchanged"] [role=switch]')).toHaveAttribute("aria-checked", "true");
+  await options.locator('li[data-field="catch-up"] [role=switch]').click();
+  await expect(pane.getByLabel("0 3 * * *'s options").locator('li[data-field="catch-up"] [role=switch]')).toHaveAttribute("aria-checked", "true");
+  await expect(page.locator(".cm-tooltip, [role=dialog]")).toHaveCount(0);
   expect(await sideways(page)).toBe(0);
 });

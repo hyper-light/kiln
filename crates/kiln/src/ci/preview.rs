@@ -10,7 +10,8 @@
 //! The answer: the workflow's diagnostics, whether the event starts it (and why not), and the
 //! plan: legs with their values and routing against the runners connected now, what was decided
 //! and why, combinations removed, and jobs decided only when their needs finish; and each job's
-//! matrix as written, for the builder's matrix view (W21-R06).
+//! matrix as written, for the builder's matrix view (W21-R06); and each schedule's next runs, as
+//! W03's cron will read them (Ship's Pipelines' Times view, W29-R06).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -81,6 +82,7 @@ pub async fn of(hub: &Arc<Hub>, caller: Option<&crate::authz::Caller>, b: Value)
     // What the action policies refuse among its own `uses:` (a run checks the nested ones too).
     let policy = super::actions::refusals(&super::actions::policies(hub, &repo).await, super::actions::uses_of(&w));
     let matrices = matrices(&w);
+    let schedules = schedules(&w, crate::util::now_unix());
     let (tx, rx) = async_channel::bounded(1);
     let start = Start { repo, event, path, workflow: Arc::new(w), message: String::new(), author: String::new(), actions: Default::default(), inputs, given: Default::default() };
     hub.ci.send(Msg::Preview { start: Box::new(start), reply: tx });
@@ -89,7 +91,24 @@ pub async fn of(hub: &Arc<Hub>, caller: Option<&crate::authz::Caller>, b: Value)
         _ => return Err((StatusCode::SERVICE_UNAVAILABLE, "The CI dispatcher didn't answer.".into())),
     };
     let why = matched.as_ref().err().map(ToString::to_string);
-    Ok(srv::json(StatusCode::OK, &merge(base, json!({ "event": event_name, "runs": matched.is_ok() && policy.is_empty(), "why": why, "policy": policy, "plan": plan, "matrices": matrices }))))
+    Ok(srv::json(StatusCode::OK, &merge(base, json!({ "event": event_name, "runs": matched.is_ok() && policy.is_empty(), "why": why, "policy": policy, "plan": plan, "matrices": matrices, "schedules": schedules }))))
+}
+
+/// Each schedule's options and its next three runs after `now`, daylight-saving changes said
+/// (W29-R06); a cron or zone that can't be read says why instead.
+fn schedules(w: &kiln_ci::wf::Workflow, now: i64) -> Vec<Value> {
+    w.on.iter()
+        .filter(|t| t.event == "schedule")
+        .flat_map(|t| t.schedules.iter())
+        .map(|s| {
+            let next = kiln_ci::trigger::cron::next_runs(&s.cron, s.timezone.as_deref(), now, 3);
+            let inputs: serde_json::Map<String, Value> = s.inputs.iter().map(|(k, v)| (k.clone(), serde_json::to_value(v).unwrap_or(Value::Null))).collect();
+            json!({
+                "cron": s.cron, "timezone": s.timezone, "skip_if_unchanged": s.skip_if_unchanged, "catch_up": s.catch_up,
+                "jitter": s.jitter, "inputs": inputs, "next": next.as_ref().ok(), "error": next.err(),
+            })
+        })
+        .collect()
 }
 
 /// Each job's matrix as written (W21-R06's matrix view): its axes and their values (or the
