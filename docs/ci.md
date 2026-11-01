@@ -4283,6 +4283,15 @@ enforcement points to W18, agent isolation to W20.
     handles rare in tests. *Left*: the container's overlay makes no file handles, so fanotify's
     watchers fail in it (TypeScript's `fswatch` tests, 126 of them, corpus pass 1024b) where a
     hosted runner's ext4 has them; a microVM leg (W13-R05) has an ext4 of its own;
+  - a leg given the host's Docker socket gets the capabilities profilers run with in its
+    container, SYS_ADMIN, BPF, PERFMON, DAC_READ_SEARCH and SYS_RESOURCE (`--cap-add`), as a
+    hosted runner's root has them (2026-10-25): a binary holding them as file capabilities can't
+    start where the container's bounding set lacks them (capabilities(7)), and CodSpeed's
+    memtrack (ruff's instrumented benchmarks, corpus pass 1025c) failed to spawn. Such a leg could
+    start any container anyway, as its seccomp is lifted for. *Left*: the rest of a root's
+    (SYS_MODULE, SYS_TIME, SYS_BOOT and the like would reach the host's kernel and clock); a leg
+    without the socket keeps Docker's defaults (`w13_r04_a_socket_legs_container_holds_a_profilers_capabilities`,
+    `w13_r04_a_profilers_binary_starts_with_the_capabilities`);
   - `/opt` is open to all, as GitHub's images leave it (`chmod -R 777 /opt`): steps make their own
     directories there without sudo (neovim's `old-cmake` job);
   - the runner user's `~/.cargo/bin`, `~/.config/composer/vendor/bin` and `~/.dotnet/tools` are
