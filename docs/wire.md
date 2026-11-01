@@ -163,8 +163,8 @@ An agent session's commands ride these streams too: `HarnessOpen`, `HarnessCmd`,
   ends it. Its sender sends it again under its id, wherever its session runs then; parked, it
   would go to the copy there with no epoch even after its session went on elsewhere (CP-T3.2,
   until CP-T3.3 parks it under its epoch).
-- **Asks**, which go as asks do, answered by what they ask for: `Suggest`, `Snapshot`, `McpAuth`
-  and `SkillView`.
+- **Asks**, which go as asks do, answered by what they ask for: `Suggest`, `Snapshot`, `McpAuth`,
+  `SkillView` and `OwnEdits`.
 - **Live**, refused at once while its runner is away: every other command (an interrupt, a model,
   effort or mode to change to, a move, a restart, the MCP servers' and skills' commands ...).
 
@@ -459,26 +459,28 @@ takes a new bit, never one that means something already, even in the other direc
 | 39 | `CAP_HEADROOM` | `AgentMsg::Caps`, `ServerMsg::Caps` | headroom: the runner keeps its machine's from settings the server sends and says how it does, the server takes that (`Headroom`, `HeadroomStatus`; docs/headroom.md) |
 | 40 | `CAP_CHANGES_PATCH` | `ServerMsg::Caps` | accepts patches to a session's changeset (`Update::ChangesPatch`), retaining the whole changeset in Amphora |
 | 41 | `CAP_UNREAD` | `AgentMsg::Caps`, `ServerMsg::Caps` | this side takes word that a frame of its couldn't be read (`Unread`, "What can't be read") |
-| 42 | `CAP_HARNESS_RELEASE` | `AgentMsg::Caps` | U15: release a stale session copy, independently of the retired conversation-feed capability |
-| 43 | `CAP_JOB_ATTEMPT` | `AgentMsg::Caps`, `ServerMsg::Caps` | exact job completion attempts and matching receipts |
-| 44 | `CAP_OPEN_ONCE` | `AgentMsg::Caps` | durable keyed session acceptance before Taken |
-| 45 | `CAP_RETAINED_RECEIVED` | `AgentMsg::Caps`, `ServerMsg::Caps` | retained evidence spooled in shared Amphora until its exact durable receipt |
-| 46 | `CAP_RESOURCE_OWNERSHIP` | `AgentMsg::Caps` | strict execution containment and sole-Scheduler resource ownership; required for new CI work |
-| 47 | `CAP_FIRECRACKER_SHAPE` | `AgentMsg::Caps`, `ServerMsg::Caps` | authenticated runner-process identity and immutable executor grant shapes in Ready and stopped receipts |
-| 48 | `CAP_AMPHORA` | `AgentMsg::Caps`, `ServerMsg::Caps` | U15: typed opaque Amphora transport; distinct from the retired learner bit |
-| 49 | `CAP_UNIFIED_LAYOUT` | `AgentMsg::Caps`, `ServerMsg::Caps` | U15: the unification wire layout appended after main's unread messages, independent of whether this peer currently carries Amphora traffic |
+| 42 | `CAP_WORKSPACE_COMMITS` | `AgentMsg::Caps` | the runner answers `Workspace`'s `commits`: a branch's commits since its trunk, its session's own marked, and what picked ones change together (agents.md, "Commits") |
+| 43 | `CAP_WORKSPACE_COMPARE` | `AgentMsg::Caps` | the runner answers `Workspace`'s `refs` and `compare`: a repository's branches, tags and latest commits, and what changes from one point to another (agents.md, "Compare") |
+| 47 | `CAP_HARNESS_RELEASE` | `AgentMsg::Caps` | U15: release a stale session copy, independently of the retired conversation-feed capability |
+| 48 | `CAP_JOB_ATTEMPT` | `AgentMsg::Caps`, `ServerMsg::Caps` | exact job completion attempts and matching receipts |
+| 49 | `CAP_OPEN_ONCE` | `AgentMsg::Caps` | durable keyed session acceptance before Taken |
+| 50 | `CAP_RETAINED_RECEIVED` | `AgentMsg::Caps`, `ServerMsg::Caps` | retained evidence spooled in shared Amphora until its exact durable receipt |
+| 51 | `CAP_RESOURCE_OWNERSHIP` | `AgentMsg::Caps` | strict execution containment and sole-Scheduler resource ownership; required for new CI work |
+| 52 | `CAP_FIRECRACKER_SHAPE` | `AgentMsg::Caps`, `ServerMsg::Caps` | authenticated runner-process identity and immutable executor grant shapes in Ready and stopped receipts |
+| 53 | `CAP_AMPHORA` | `AgentMsg::Caps`, `ServerMsg::Caps` | U15: typed opaque Amphora transport; distinct from the retired learner bit |
+| 54 | `CAP_UNIFIED_LAYOUT` | `AgentMsg::Caps`, `ServerMsg::Caps` | U15: the unification wire layout appended after main's unread messages, independent of whether this peer currently carries Amphora traffic |
+| 55 | `CAP_EXPLICIT_ACTIVATION` | AgentMsg::Caps, ServerMsg::Caps | existing role-specific explicit activation owner; not release approval |
+| 56 | `CAP_ORDINARY_EXECUTION_DEBT` | AgentMsg::Caps, ServerMsg::Caps | existing paired original ordinary admission and sequenced physical debt |
+| 57 | `CAP_JOB_LOG_V1` | RESERVED, NOT ADVERTISED | U05 original native producer capture, durable bounded outbox and own canonical receipt; requires layout, wire, attempt, resource ownership and ordinary debt |
+| 58 | `CAP_LOG_END_MARK` | `AgentMsg::Caps`, `ServerMsg::Caps` | a leg's log is all sent once the runner says so on the LOGS lane: an empty `LogChunk` at step `u32::MAX` (`LOG_END_STEP`), after the leg's last output and before its result; the server takes the result once that mark has come and what came before it is accepted (bounded) |
 
-| 50 | `CAP_EXPLICIT_ACTIVATION` | AgentMsg::Caps, ServerMsg::Caps | existing role-specific explicit activation owner; not release approval |
-| 51 | `CAP_ORDINARY_EXECUTION_DEBT` | AgentMsg::Caps, ServerMsg::Caps | existing paired original ordinary admission and sequenced physical debt |
-| 52 | `CAP_JOB_LOG_V1` | RESERVED, NOT ADVERTISED | U05 original native producer capture, durable bounded outbox and own canonical receipt; requires layout, wire, attempt, resource ownership and ordinary debt |
-| 53 | `CAP_LOG_END_MARK` | `AgentMsg::Caps`, `ServerMsg::Caps` | a leg's log is all sent once the runner says so on the LOGS lane: an empty `LogChunk` at step `u32::MAX` (`LOG_END_STEP`), after the leg's last output and before its result; the server takes the result once that mark has come and what came before it is accepted (bounded) |
-
-Bits from 54 are free. A reserved bit is not evidence that its complete route is active.
+Bits from 59 are free. Take the next one, and add its row here in the same change. A reserved bit
+is not evidence that its complete route is active.
 
 Main's unread messages retain their deployed indices: runner messages 56 and 57, server
 messages 62 and 63, and reach ask 11. The private unification messages follow them. Both peers
 announce `CAP_UNIFIED_LAYOUT` even when their Amphora carrier is inactive. A peer advertising
-private bits 42 through 48 without this layout capability is refused before those extensions
+private bits 47 through 53 without this layout capability is refused before those extensions
 can be dispatched. Earlier experimental snapshots that used bit 41 for Amphora are incompatible;
 bit 41 alone means main's `CAP_UNREAD`. It cannot identify an earlier experimental codec or
 authorize replay of opaque persisted bytes from that codec.
@@ -603,7 +605,7 @@ Four edges are left, and the lab steers clear of each:
 | `Amphora` | carried (Amphora) | U15: bounded opaque product transport, with authenticated member routes. | Amphora owns acknowledgement, resend, recovery and membership; Kiln only frames bytes. |
 | `RunnerProcess` | handshake | U01: one authenticated process identity, repeated when that process reconnects. It identifies the producer; it does not prove that a process or its executions stopped. | To a server announcing `CAP_FIRECRACKER_SHAPE`, under `CAP_UNIFIED_LAYOUT`. |
 
-| `JobLogChunkV1` | stream | Original bound attempt's captured chunk, sequence, step offset and rolling root. Direct channel Item on lane10/Kind::Log. | HELD; reserved bit52 is not advertised. |
+| `JobLogChunkV1` | stream | Original bound attempt's captured chunk, sequence, step offset and rolling root. Direct channel Item on lane10/Kind::Log. | HELD; reserved bit 57 is not advertised. |
 | `JobLogEndV1` | stream | Original captured frontier, explicit complete/truncated/incomplete disposition and exact canonical result bytes. Not physical stop or full historical-view proof. | HELD; no producer activates this requirement today. |
 
 
@@ -726,6 +728,7 @@ travels in `HarnessCmd`.
 | `MaxSubagents` | command, refused while away | As `AutoResume`. | Fire-and-forget. |
 | `MoveOnLimit` | command, refused while away | As `AutoResume`. | Fire-and-forget. |
 | `LimitHold` | command, refused while away | The server works the hold out again once the machine is back. | Fire-and-forget. |
+| `OwnEdits` | ask | Answered by a `Reply` to its client: what one who changed its files did alone (docs/agents.md, "One subagent's own edits"). | New: a session whose features have `own_edits` answers it. |
 
 ## Updates of a session: `Update`
 

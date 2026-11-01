@@ -352,6 +352,14 @@ reads from it (`crates/kiln/src/store/learner.rs`, `crates/kiln/src/frontdoor/re
   in the server's memory. Whether credentials are the owner's, the server says (`/api/cluster/owner`),
   and the runner keeps its word for 30 s. The server's routes answer from the same code
   (`crate::reads`), so an answer is the same wherever it's read.
+- **Forwarding.** A read without a body goes to the server on a connection kept from an earlier
+  request when one is free (16 kept at most), as a browser's own requests do when its connection
+  is piped whole, and again on a new one if the kept one was gone (the server closes one idle for
+  20 s). A write goes on a new connection, as it can't go twice. A new connection the server
+  doesn't take is tried three times before the request is answered 502. One new connection for
+  each request, as before, lost phones most of a conversation's pictures and pages on a busy
+  server, whose new connections came late, while the page itself, its requests retried, looked
+  fine.
 - **Seen live:** `/healthz/server`'s `store` counts the learners and gives kiln.db's size.
 - **Off:** `[cluster] learners = false` (or `KILN_CLUSTER_LEARNERS=0`) adds none, and each runner,
   as it reconnects, is told to let its replica go: its front door pipes to the server again. The

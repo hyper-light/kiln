@@ -47,7 +47,7 @@ pub const LANE_STREAM: u32 = 8;
 /// runners announcing [`CAP_PORTS`].
 pub const LANE_PORTS: u32 = 9;
 /// U05: negotiated producer log channel, direct channel::Frame, still Kind::Log/Agent-Bulk.
-/// Bit52 is reserved; this held phase1 implementation never advertises it.
+/// Bit 57 is reserved; this held phase1 implementation never advertises it.
 pub const LANE_JOB_LOG: u32 = 10;
 
 /// A lane's name, as metrics and runner pages say it.
@@ -476,38 +476,38 @@ pub const CAP_HEADROOM: u64 = 1 << 39;
 pub const CAP_CHANGES_PATCH: u64 = 1 << 40;
 
 /// U15: typed Amphora transport, independent of the retired Kiln learner protocol.
-pub const CAP_AMPHORA: u64 = 1 << 48;
+pub const CAP_AMPHORA: u64 = 1 << 53;
 /// U15: takes HarnessRelease independently of the retired conversation-feed capability.
-pub const CAP_HARNESS_RELEASE: u64 = 1 << 42;
+pub const CAP_HARNESS_RELEASE: u64 = 1 << 47;
 /// U03: attempt-fenced job completions and receipts, supported by both peers.
-pub const CAP_JOB_ATTEMPT: u64 = 1 << 43;
+pub const CAP_JOB_ATTEMPT: u64 = 1 << 48;
 /// U04/U17: HarnessOpen acknowledges a stable session id only after durable keyed acceptance.
-pub const CAP_OPEN_ONCE: u64 = 1 << 44;
+pub const CAP_OPEN_ONCE: u64 = 1 << 49;
 /// U03: exact durable retained-event receipts, independent of completion and wire epochs.
-pub const CAP_RETAINED_RECEIVED: u64 = 1 << 45;
+pub const CAP_RETAINED_RECEIVED: u64 = 1 << 50;
 /// U01/U03: strict execution containment and sole-Scheduler resource ownership.
-pub const CAP_RESOURCE_OWNERSHIP: u64 = 1 << 46;
+pub const CAP_RESOURCE_OWNERSHIP: u64 = 1 << 51;
 /// U01: authenticated process identity, immutable Firecracker shapes and matching Ready receipts.
 /// This bit does not imply the separate U07 cache or CPU/memory kernel limit contract.
-pub const CAP_FIRECRACKER_SHAPE: u64 = 1 << 47;
+pub const CAP_FIRECRACKER_SHAPE: u64 = 1 << 52;
 /// This peer uses the unified extensions appended after main's unread protocol. Always
 /// advertised, even when it owns no Amphora replica. This is a codec layout, not ownership.
 /// The earlier private experimental layout is unsupported; it has no compatibility decoder.
-pub const CAP_UNIFIED_LAYOUT: u64 = 1 << 49;
+pub const CAP_UNIFIED_LAYOUT: u64 = 1 << 54;
 /// U16 controlled-upgrade law, on this authenticated connection: a server uses the sole
 /// CI/CD coordinator with pinned admission; a runner owns a live explicit activation backend.
 /// This is role-specific software capability, never cryptographic approval of a release/job.
-pub const CAP_EXPLICIT_ACTIVATION: u64 = 1 << 50;
+pub const CAP_EXPLICIT_ACTIVATION: u64 = 1 << 55;
 /// U01/U03: paired durable ordinary grant/admission and sequenced physical debt law.
-pub const CAP_ORDINARY_EXECUTION_DEBT: u64 = 1 << 51;
+pub const CAP_ORDINARY_EXECUTION_DEBT: u64 = 1 << 56;
 /// U05: RESERVED paired native producer-log protocol. Neither peer advertises it until
 /// original registration, producer outbox, canonical receipts and terminal effects compose.
-pub const CAP_JOB_LOG_V1: u64 = 1 << 52;
+pub const CAP_JOB_LOG_V1: u64 = 1 << 57;
 /// A leg's log is all sent once its runner says so on the LOGS lane, after the leg's last output
 /// and before its result: an empty [`LogChunk`] at [`LOG_END_STEP`]. A server that takes it holds
 /// the leg's result until that mark has come and what came before it is accepted (W05: a result
 /// on the control lane overtook a leg's last lines, queued behind another leg's on the log lane).
-pub const CAP_LOG_END_MARK: u64 = 1 << 53;
+pub const CAP_LOG_END_MARK: u64 = 1 << 58;
 /// The step of a [`CAP_LOG_END_MARK`] mark, which no step has. An empty chunk was already a no-op.
 pub const LOG_END_STEP: u32 = u32::MAX;
 
@@ -574,6 +574,19 @@ pub struct IdentityGiven {
 /// [`CAP_IDENTITY`], 39 headroom's [`CAP_HEADROOM`], 40 changesets' patches'
 /// [`CAP_CHANGES_PATCH`].
 pub const CAP_UNREAD: u64 = 1 << 41;
+
+/// [`AgentMsg::Caps`] capability: the runner answers [`ServerMsg::Workspace`]'s `commits`
+/// (`crate::workspace::Ask::Commits`): a branch's commits since its trunk, its session's own
+/// marked, and what picked ones change together, for the Changes tab's Commits (docs/agents.md).
+/// A runner without it isn't asked, and Commits says why. Bit 41 is [`CAP_UNREAD`].
+pub const CAP_WORKSPACE_COMMITS: u64 = 1 << 42;
+
+/// [`AgentMsg::Caps`] capability: the runner answers [`ServerMsg::Workspace`]'s `refs` and `compare`
+/// (`crate::workspace::Ask::Refs`, `Ask::Compare`): a repository's branches, tags and latest
+/// commits, and what changes from one point to another (the folder now, as its session began, a
+/// branch, tag or commit, an agent's files as it left them), for the Changes tab's Compare
+/// (docs/agents.md). Bit 42 is [`CAP_WORKSPACE_COMMITS`].
+pub const CAP_WORKSPACE_COMPARE: u64 = 1 << 43;
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1264,8 +1277,8 @@ mod tests {
         assert_eq!(decode::<ServerMsg>(&s)?, server);
         let legacy = ServerMsg::Cluster { json: r#"{"t":"leave"}"#.into(), raft: Vec::new() };
         assert_eq!(decode::<ServerMsg>(&encode(&legacy)?)?, legacy);
-        assert_eq!(CAP_AMPHORA, 1 << 48);
-        assert_eq!(CAP_HARNESS_RELEASE, 1 << 42);
+        assert_eq!(CAP_AMPHORA, 1 << 53);
+        assert_eq!(CAP_HARNESS_RELEASE, 1 << 47);
         assert_eq!(CAP_HARNESS_RELEASE & CAP_AMPHORA, 0);
         Ok(())
     }
@@ -1276,9 +1289,9 @@ mod tests {
         let bytes = encode(&receipt)?;
         assert_eq!(bytes.first(), Some(&66));
         assert_eq!(decode::<ServerMsg>(&bytes)?, receipt);
-        assert_eq!(CAP_RETAINED_RECEIVED, 1 << 45);
-        assert_eq!(CAP_RESOURCE_OWNERSHIP, 1 << 46);
-        assert_eq!(CAP_FIRECRACKER_SHAPE, 1 << 47);
+        assert_eq!(CAP_RETAINED_RECEIVED, 1 << 50);
+        assert_eq!(CAP_RESOURCE_OWNERSHIP, 1 << 51);
+        assert_eq!(CAP_FIRECRACKER_SHAPE, 1 << 52);
         let previous = encode(&AgentMsg::JobFinishedV2 { result: JobResult { job: "fixture".into(), status: Status::Succeeded, exit_code: Some(0), error: None, peak_rss: None, cpu_seconds: None }, attempt: 1 })?;
         let process = AgentMsg::RunnerProcess { nonce: "a".repeat(43) };
         let encoded = encode(&process)?;
@@ -1293,11 +1306,11 @@ mod tests {
         let unified = CAP_AMPHORA | CAP_HARNESS_RELEASE | CAP_JOB_ATTEMPT | CAP_OPEN_ONCE | CAP_RETAINED_RECEIVED | CAP_RESOURCE_OWNERSHIP;
         assert_eq!(unified.count_ones(), 6);
         assert_eq!(unified & current_main, 0, "unified capabilities follow the deployed main bits");
-        assert_eq!(CAP_UNIFIED_LAYOUT, 1 << 49);
-        assert_eq!(CAP_EXPLICIT_ACTIVATION, 1 << 50);
-        assert_eq!(CAP_ORDINARY_EXECUTION_DEBT,1 << 51);
+        assert_eq!(CAP_UNIFIED_LAYOUT, 1 << 54);
+        assert_eq!(CAP_EXPLICIT_ACTIVATION, 1 << 55);
+        assert_eq!(CAP_ORDINARY_EXECUTION_DEBT,1 << 56);
         assert_eq!(CAP_ORDINARY_EXECUTION_DEBT & (CAP_EXPLICIT_ACTIVATION | CAP_UNIFIED_LAYOUT | unified | current_main),0);
-        assert_eq!(CAP_JOB_LOG_V1, 1 << 52);
+        assert_eq!(CAP_JOB_LOG_V1, 1 << 57);
         assert_eq!(CAP_JOB_LOG_V1 & (CAP_ORDINARY_EXECUTION_DEBT | CAP_EXPLICIT_ACTIVATION | CAP_UNIFIED_LAYOUT | unified | current_main | CAP_FIRECRACKER_SHAPE), 0);
         assert!(check_unified_layout(CAP_JOB_LOG_V1).is_err());
         let paired = CAP_UNIFIED_LAYOUT | CAP_WIRE | CAP_JOB_ATTEMPT | CAP_RESOURCE_OWNERSHIP | CAP_ORDINARY_EXECUTION_DEBT | CAP_JOB_LOG_V1;
@@ -1322,7 +1335,7 @@ mod tests {
 
     #[test]
     fn u17_open_once_capability_is_a_new_bit() {
-        assert_eq!(CAP_OPEN_ONCE, 1 << 44);
+        assert_eq!(CAP_OPEN_ONCE, 1 << 49);
         assert!(CAP_OPEN_ONCE.is_power_of_two());
         assert_eq!(CAP_OPEN_ONCE & (CAP_JOB_ATTEMPT | CAP_HARNESS_RELEASE | CAP_AMPHORA | CAP_WIRE), 0);
     }
@@ -1340,7 +1353,7 @@ mod tests {
         let bytes = encode(&receipt)?;
         assert_eq!(bytes.first(), Some(&65));
         assert_eq!(decode::<ServerMsg>(&bytes)?, receipt);
-        assert_eq!(CAP_JOB_ATTEMPT, 1 << 43);
+        assert_eq!(CAP_JOB_ATTEMPT, 1 << 48);
         // U05: append-only framing and the borrowed Item refer to the SAME original body.
         let owner = kiln_ci::wire::OrdinaryOwnerV1 { version: 1, grant: "grant-fixture".into(), execution: "ci-fixture".into(), allocation: "retained-fixture".into(), job: "leg".into(), attempt: 7, host: "fixture-host".into(), process_nonce: "a".repeat(43), publication_epoch: "epoch-fixture".into(), connection: "0".repeat(64), command: kiln_ci::wire::OrdinaryCommandV1 { stream: "l:1.1".into(), seq: 1 } };
         let binding = JobLogBindingV1 { contract: JobLogContractV1 { version: 1, capture_limit: 100 }, owner };
@@ -1469,6 +1482,8 @@ mod tests {
         // Step 5 appended `LinkUnread` (57) and `ReachRefused` (63) after them.
         assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (63, 68), "each table has every variant once");
         assert!(CAP_UNREAD.is_power_of_two() && CAP_UNREAD == 1 << 41 && CAP_UNREAD & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH) == 0);
+        assert!(CAP_WORKSPACE_COMMITS.is_power_of_two() && CAP_WORKSPACE_COMMITS == 1 << 42 && CAP_WORKSPACE_COMMITS & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD) == 0);
+        assert!(CAP_WORKSPACE_COMPARE.is_power_of_two() && CAP_WORKSPACE_COMPARE == 1 << 43 && CAP_WORKSPACE_COMPARE & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD | CAP_WORKSPACE_COMMITS) == 0);
         Ok(())
     }
 

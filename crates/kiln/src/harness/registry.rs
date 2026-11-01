@@ -957,6 +957,7 @@ impl Registry {
     fn assemble(dir: std::path::PathBuf, bus: Arc<dyn kiln_seams::Bus>, local: Arc<Host>, rx: async_channel::Receiver<(String, Update)>, convo: Option<crate::convo::store::Store>, visuals: super::visuals::Visuals, keeper: Keeper) -> Self {
         // The server's own agents' workspaces of their own are kept beside their record.
         crate::workspace::slates::init(&dir);
+        super::whose::note_kiln(&dir);
         Self {
             mirrors: Mutex::new(HashMap::new()),
             bus,
@@ -1937,6 +1938,16 @@ impl Registry {
             hub.emit(&crate::wire::events::ServerEvent::HarnessClosed { id: id.to_string() });
         }
         Ok(())
+    }
+
+    /// Of the sessions a runner of `machine` just said it holds (`held`), those this server still
+    /// has as disconnected. Its link dropped and came back, and only a session's own update clears
+    /// that, so one that's quiet (idle, ended, waiting on a person) stays offline while its machine
+    /// is connected. Their snapshots are asked for ([`Command::Snapshot`]).
+    pub fn still_disconnected(&self, machine: &str, held: &[String]) -> Vec<String> {
+        let at = Location::Machine(machine.to_owned());
+        let g = self.mirrors.lock();
+        held.iter().filter(|id| g.get(*id).is_some_and(|m| m.location == at && m.info.status == Status::Disconnected)).cloned().collect()
     }
 
     /// Session `id` is held by runner process `instance` of its machine, as that process said:
@@ -3455,6 +3466,30 @@ mod tests {
             let kept = hub.harness.persisted_control().ok_or_else(|| anyhow::anyhow!("missing canonical holder state"))?.holders;
             anyhow::ensure!(kept.get("old-1").map(String::as_str) == Some("01a14794") && !kept.contains_key("old-2"), "{kept:?}");
             anyhow::ensure!(!hub.harness.dir.join("holders.json").exists(), "canonical holder updates must not create a sidecar");
+            Ok(())
+        })
+    }
+
+    /// A runner's link dropped and came back to the same server: the sessions it holds that have
+    /// said nothing since still read disconnected, offline while their machine is connected (19
+    /// agents on three machines, 2026-11-01). Its report finds them, for their snapshots.
+    #[test]
+    fn a_report_finds_its_sessions_that_still_read_disconnected() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = Location::Machine("box".into());
+            let info = |id: &str| Info { id: id.into(), kind: "claude".into(), ..Info::default() };
+            for id in ["quiet", "busy"] {
+                hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(info(id)), since: None });
+            }
+            hub.harness.ingest(&hub, &Location::Machine("elsewhere".into()), "away", Update::Open { info: Box::new(info("away")), since: None });
+            hub.harness.machine_lost(&hub, "box");
+            hub.harness.machine_lost(&hub, "elsewhere");
+            // Back: one has something to say at once, the other is quiet.
+            hub.harness.ingest(&hub, &there, "busy", Update::Open { info: Box::new(info("busy")), since: None });
+            let held = ["quiet", "busy", "away", "unknown"].map(str::to_owned);
+            let stale = hub.harness.still_disconnected("box", &held);
+            anyhow::ensure!(stale == ["quiet"], "only its own quiet session: {stale:?}");
             Ok(())
         })
     }

@@ -262,6 +262,22 @@ impl Dirs {
         self.config().join("goose")
     }
 
+    /// Each harness's home: what's in it is its own, but for what a person keeps there to tell it
+    /// what to do (`super::whose`).
+    pub fn harness_homes(&self) -> Vec<PathBuf> {
+        vec![self.claude(), self.codex(), self.antigravity(), self.gemini(), self.goose()]
+    }
+
+    /// The machine's home folder.
+    pub fn home(&self) -> &Path {
+        &self.home
+    }
+
+    /// The person's cache folder (`XDG_CACHE_HOME`; else `~/Library/Caches` on macOS, `~/.cache`).
+    pub fn cache(&self) -> PathBuf {
+        self.var("XDG_CACHE_HOME").unwrap_or_else(|| if cfg!(target_os = "macos") { self.home.join("Library").join("Caches") } else { self.home.join(".cache") })
+    }
+
     /// `path` as the person knows it: from their home, else whole.
     fn shown(&self, path: &Path) -> String {
         match path.strip_prefix(&self.home) {

@@ -71,6 +71,11 @@ pub const COMMAND_WITHIN: Duration = Duration::from_secs(30);
 const HAVE_AGAIN: Duration = Duration::from_secs(5);
 /// How many sessions' digests one `ServerMsg::Kept` carries at the most.
 const KEPT_A_FRAME: usize = 32;
+/// How long after a runner says what it holds its sessions that still read disconnected are asked
+/// for their snapshots: time for the snapshots its streams send by themselves (a new server) to
+/// come first.
+const STALE_GRACE: Duration = Duration::from_secs(15);
+
 /// How long an outpost invite works ([`OutpostInvites`]).
 pub const OUTPOST_INVITE_TTL: Duration = Duration::from_secs(3600);
 
@@ -2731,6 +2736,29 @@ impl Hub {
                     }
                     inst.reported(peer);
                 }
+                // Those it holds that still read disconnected a little later: its link dropped and
+                // came back, and they've had nothing to say since. Their snapshots bring them back
+                // as they are. Not at once: after a server restart every session reads disconnected
+                // until its stream's snapshot comes, which a request now would only build twice.
+                if !self.harness.still_disconnected(agent, &own).is_empty() {
+                    let (hub, machine, held) = (Arc::clone(self), agent.to_owned(), own.clone());
+                    crate::rt::spawn(async move {
+                        crate::rt::sleep(STALE_GRACE).await;
+                        if !hub.agents.lock().get(&machine).is_some_and(|a| a.connected) {
+                            return;
+                        }
+                        let stale = hub.harness.still_disconnected(&machine, &held);
+                        if stale.is_empty() {
+                            return;
+                        }
+                        tracing::info!(%machine, sessions = stale.len(), "sessions its runner holds still read disconnected after it reconnected: asking for their snapshots");
+                        // One at a time: each is the session's whole timeline, built on its runner.
+                        for id in stale {
+                            let sent = hub.harness.command(&hub, &id, crate::harness::model::Command::Snapshot).await;
+                            tracing::debug!(session = %id, ?sent, "asked a session still read disconnected for its snapshot");
+                        }
+                    });
+                }
                 // Hand-overs dropped as it went away get their word now it's back.
                 self.handovers_dropped(agent, peer, &own).await;
                 self.check_retire().await;
@@ -3516,7 +3544,7 @@ pub(crate) mod tests {
             let completion = AgentMsg::JobFinishedV2 { result: JobResult { job: "physical".into(), status: Status::Succeeded, exit_code: Some(0), error: None, peak_rss: None, cpu_seconds: None }, attempt: 3 };
             assert!(hub.accepts_layout(1, &completion, Some(former)).await?);
             // Exercise the reproduced window directly: Connected changed the live connection
-            // map, but Hello has not replaced the old joined Instance (its bit49 is still set).
+            // map, but Hello has not replaced the old joined Instance (its CAP_UNIFIED_LAYOUT bit is still set).
             hub.instances.lock().connected(1, 2, Some([2; 32]));
             assert!(!hub.accepts_layout(1, &completion, Some(current)).await?, "new current origin cannot borrow former joined proof");
             assert!(hub.accepts_layout(1, &completion, Some(former)).await.is_err(), "stale origin cannot borrow cached proof");

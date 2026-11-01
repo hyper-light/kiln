@@ -5,7 +5,8 @@
  * deselects it rather than opening it. A swipe right toggles one row without holding. A row's own
  * buttons (Allow, its menu…) work as ever. With a mouse nothing changes: rows keep their checkbox.
  *
- * Rows are found by `data-agent` under the element the returned props go on.
+ * Rows are found by `data-agent` under the element the returned props go on, or by the attribute
+ * `rows` names (the Changes tab's commits, `data-commit`), each row the button `main` names.
  */
 import type * as React from "react";
 import { flushSync } from "react-dom";
@@ -20,7 +21,7 @@ const SWIPE = 56;
 const SWIPE_MAX = 88;
 
 /** A row's own controls: they never start a selection. Its name (the button that opens it) does. */
-const OWN = "a, input, select, textarea, label, [role='menuitem'], button:not(.ms-main)";
+const own = (main: string) => `a, input, select, textarea, label, [role='menuitem'], button:not(${main})`;
 
 interface Press {
   id: number;
@@ -59,19 +60,22 @@ function steady(row: HTMLElement, go: () => void) {
   if (Math.abs(moved) >= 1) window.scrollBy(0, moved);
 }
 
-/** The props for the element around the rows. */
-export function touchSelect(get: () => TouchSelect) {
+/** The props for the element around the rows: Mission control's agents, or the rows `rows` (a `data-` attribute's name) says, each the button `main` says. `onHold`: a press is held now (true), and let go (false). */
+export function touchSelect(get: () => TouchSelect, { rows = "agent", main = ".ms-main", onHold }: { rows?: string; main?: string; onHold?: (held: boolean) => void } = {}) {
   let press: Press | null = null;
   /** The click that follows a hold or a swipe isn't a tap. */
   let swallow = false;
   /** What pressed last: a click doesn't say in every browser (Safari's). */
   let by = "mouse";
-  const rowOf = (target: EventTarget | null) => (target instanceof Element ? target.closest<HTMLElement>("[data-agent]") : null);
+  const OWN = own(main);
+  const rowOf = (target: EventTarget | null) => (target instanceof Element ? target.closest<HTMLElement>(`[data-${rows}]`) : null);
+  const idOf = (row: HTMLElement | null) => row?.getAttribute(`data-${rows}`) || undefined;
   const end = () => {
     if (!press) return;
     window.clearTimeout(press.timer);
     const p = press;
     press = null;
+    if (p.held) onHold?.(false);
     if (p.swiping) {
       p.row.style.transition = "transform 0.18s ease";
       p.row.style.transform = "";
@@ -85,7 +89,7 @@ export function touchSelect(get: () => TouchSelect) {
     const p = press;
     if (!p?.held) return;
     const row = rowOf(document.elementFromPoint(x, y));
-    const under = row?.dataset.agent;
+    const under = idOf(row);
     const s = get();
     if (row && under && s.isSelected(under) !== p.to) steady(row, () => s.set([under], p.to));
   };
@@ -117,7 +121,7 @@ export function touchSelect(get: () => TouchSelect) {
       by = e.pointerType;
       if (e.pointerType === "mouse" || !e.isPrimary) return;
       const row = rowOf(e.target);
-      const agent = row?.dataset.agent;
+      const agent = idOf(row);
       if (!row || !agent || (e.target as Element).closest(OWN)) return;
       end();
       swallow = false;
@@ -126,6 +130,7 @@ export function touchSelect(get: () => TouchSelect) {
         if (press !== p) return;
         const s = get();
         p.held = true;
+        onHold?.(true);
         p.to = !s.isSelected(agent);
         steady(row, () => s.set([agent], p.to));
         swallow = true;
@@ -184,7 +189,7 @@ export function touchSelect(get: () => TouchSelect) {
     },
     onClickCapture: (e: React.MouseEvent) => {
       const row = rowOf(e.target);
-      const agent = row?.dataset.agent;
+      const agent = idOf(row);
       if (!row || !agent || (e.target as Element).closest(OWN)) return;
       if (swallow) {
         swallow = false;

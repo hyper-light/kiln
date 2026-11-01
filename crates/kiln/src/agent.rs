@@ -1863,6 +1863,8 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
         // U05/U17: Records, conversations and the work ledger share this host owner. Opening or
         // importing failure is a startup error; continuing empty would discard recovery state.
         crate::workspace::slates::init(&o.state_dir);
+        // What an agent changes in the runner's own folders is an agent's own (docs/agents.md).
+        crate::harness::whose::note_kiln(&o.state_dir);
         let held = crate::harness::limit::held(limit_asked, limit_config);
         if held.from != crate::harness::limit::Source::Default {
             tracing::info!(max_sessions = held.max_sessions, from = ?held.from, "agent sessions: this machine has at most this many at work at once");
@@ -2993,12 +2995,15 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                     let work = if o.outpost { 0 } else { proto::CAP_WORK };
                     let headroom_cap = if headroom.is_some() { proto::CAP_HEADROOM } else { 0 };
                     let limit = if harness.is_some() { proto::CAP_AGENT_LIMIT } else { 0 };
+                    // Running agents, it answers what their branches' commits are and compares two points
+                    // of their repositories (the Changes tab's Commits and Compare).
+                    let commits = if harness.is_some() { proto::CAP_WORKSPACE_COMMITS | proto::CAP_WORKSPACE_COMPARE } else { 0 };
                     let open_once = if harness.is_some() { proto::CAP_OPEN_ONCE } else { 0 };
                     // The updated paths refuse work if strict containment/admission cannot be established.
                     let ownership = if !o.outpost && cfg!(any(target_os = "linux", target_os = "macos", windows)) { proto::CAP_RESOURCE_OWNERSHIP } else { 0 };
                     let firecracker_shape = if !o.outpost && cfg!(target_os = "linux") { proto::CAP_FIRECRACKER_SHAPE } else { 0 };
                     let amphora = if carrier_active.load(std::sync::atomic::Ordering::Acquire) { proto::CAP_AMPHORA } else { 0 };
-                    local_wide_caps = built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | proto::CAP_HARNESS_RELEASE | proto::CAP_JOB_ATTEMPT | proto::CAP_LOG_END_MARK | proto::CAP_RETAINED_RECEIVED | ownership | firecracker_shape | open_once | work | limit | proto::CAP_IDENTITY | headroom_cap | amphora | proto::CAP_UNREAD | proto::CAP_UNIFIED_LAYOUT | if explicit_activation { proto::CAP_EXPLICIT_ACTIVATION } else { 0 };
+                    local_wide_caps = built | commits | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | proto::CAP_HARNESS_RELEASE | proto::CAP_JOB_ATTEMPT | proto::CAP_LOG_END_MARK | proto::CAP_RETAINED_RECEIVED | ownership | firecracker_shape | open_once | work | limit | proto::CAP_IDENTITY | headroom_cap | amphora | proto::CAP_UNREAD | proto::CAP_UNIFIED_LAYOUT | if explicit_activation { proto::CAP_EXPLICIT_ACTIVATION } else { 0 };
                     if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: local_wide_caps }) {
                         net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                     }
@@ -3520,12 +3525,22 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                         let found = harness.as_ref().and_then(|h| h.get(&session)).map(|s| {
                             let ws = s.spec.lock().workspace.clone();
                             let info = s.info();
-                            (std::path::PathBuf::from(&info.cwd), std::path::PathBuf::from(info.work_dir()), ws)
+                            // A compare of an agent's point: how it left its files, as its session keeps them.
+                            let mut versions = crate::workspace::git::Versions::new();
+                            if let crate::workspace::Ask::Compare { from, to, .. } = ask.as_ref() {
+                                let core = s.core.lock();
+                                for p in [from, to] {
+                                    if let crate::workspace::git::Point::Agent { by } = p {
+                                        versions.insert(by.clone(), core.version_of(by));
+                                    }
+                                }
+                            }
+                            (std::path::PathBuf::from(&info.cwd), std::path::PathBuf::from(info.work_dir()), ws, versions)
                         });
                         crate::rt::spawn(async move {
                             let answer = match found {
                                 None => serde_json::json!({"error": "no such agent on this machine"}),
-                                Some((cwd, work, ws)) => crate::workspace::serve(&cwd, &work, ws.as_ref(), *ask).await,
+                                Some((cwd, work, ws, versions)) => crate::workspace::serve(&cwd, &work, ws.as_ref(), *ask, &versions).await,
                             };
                             let _ = up.send(Up::Term(AgentMsg::Answer { req, json: Some(answer.to_string()) })).await;
                         });
@@ -6173,7 +6188,7 @@ mod tests {
     fn change(path: &str, lines: usize) -> crate::harness::model::FileChange {
         let n = u32::try_from(lines).unwrap_or(u32::MAX);
         let lines = (0..lines).map(|i| format!("+    let value_{i} = compute(argument_{i}, &context); // line {i}")).collect();
-        crate::harness::model::FileChange { path: path.into(), tree: None, created: false, deleted: false, added: n, removed: 0, hunks: vec![crate::harness::model::Hunk { old_start: 1, old_lines: 0, new_start: 1, new_lines: n, lines }], truncated: false, at: 1 }
+        crate::harness::model::FileChange { path: path.into(), tree: None, created: false, deleted: false, added: n, removed: 0, hunks: vec![crate::harness::model::Hunk { old_start: 1, old_lines: 0, new_start: 1, new_lines: n, lines }], truncated: false, at: 1, by: Vec::new(), place: None }
     }
 
     /// A long session's changeset, as one's was: 43 files whose diffs are thousands of short lines,
