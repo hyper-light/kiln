@@ -1364,8 +1364,9 @@ fn reach_said(dir: &Path) -> String {
         .iter()
         .map(|n| {
             let text = std::fs::read_to_string(n).unwrap_or_default();
-            let lines: Vec<&str> = text.lines().filter(|l| ["reach", "relay", "frames", "custody", "panicked", "WARN", "ERROR"].iter().any(|w| l.contains(w))).collect();
-            format!("{}:\n{}", n.display(), lines.get(lines.len().saturating_sub(60)..).unwrap_or(&[]).join("\n"))
+            // Not a busy receiver's port, said every 5 s.
+            let lines: Vec<&str> = text.lines().filter(|l| ["reach", "relay", "frames", "custody", "panicked", "WARN", "ERROR"].iter().any(|w| l.contains(w)) && !l.contains("port is held")).collect();
+            format!("{}:\n{}", n.display(), lines.get(lines.len().saturating_sub(80)..).unwrap_or(&[]).join("\n"))
         })
         .collect();
     logs.join("\n")
