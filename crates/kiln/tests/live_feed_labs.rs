@@ -110,7 +110,9 @@ impl Socket {
         Ok(s)
     }
 
-    /// Reads what's there; false when nothing came within the read timeout.
+    /// Reads what's there; false when nothing came within the read timeout, or the read was
+    /// interrupted: a read with a timeout isn't restarted (EINTR) when a signal comes, or when the
+    /// test's cgroup is frozen and thawed (a loaded machine's pacing), and nothing came of it.
     fn fill(&mut self) -> anyhow::Result<bool> {
         let mut chunk = [0u8; 65536];
         match self.stream.read(&mut chunk) {
@@ -119,7 +121,7 @@ impl Socket {
                 self.buf.extend_from_slice(chunk.get(..n).unwrap_or_default());
                 Ok(true)
             }
-            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => Ok(false),
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted) => Ok(false),
             Err(e) => Err(e.into()),
         }
     }
