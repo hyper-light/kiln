@@ -573,9 +573,13 @@ fn w26_r18_an_agents_draft_stays_one_until_it_says_ready() -> anyhow::Result<()>
     anyhow::ensure!(v2.pointer("/change_request/version") == Some(&serde_json::json!(2)) && draft(&v2) == serde_json::json!(true) && state == "draft", "a new version leaves {cr} a draft: {state}: {v2}");
     let listed = w.run(&w.matrix, "listed", "return await kiln.agents.changes({});")?;
     anyhow::ensure!(listed.to_string().contains("\"draft\":true"), "agents.changes says {cr} is a draft: {listed}");
+    let (_, line) = w.ship(&cr)?;
+    anyhow::ensure!(line.starts_with("Draft"), "Ship reads {cr} a draft, no one's turn: {line}");
     let ready = w.run(&w.matrix, "ready", "return await kiln.agents.change({ready: true});")?;
     let (versions, state, _) = w.change(&cr)?;
     anyhow::ensure!(draft(&ready) == serde_json::json!(false) && state == "needs-review" && versions.len() == 2, "ready alone marks {cr} ready, pushing nothing: {state}, {} versions: {ready}", versions.len());
+    let (_, line) = w.ship(&cr)?;
+    anyhow::ensure!(!line.starts_with("Draft"), "Ship reads {cr} as asking for review now: {line}");
     let again = w.run(&w.matrix, "ready-again", "try { return JSON.stringify(await kiln.agents.change({ready: true})); } catch (e) { return String((e && e.message) || e); }")?;
     anyhow::ensure!(again.as_str().is_some_and(|t| t.contains("isn't a draft: it's ready for review already")), "asked again, it says so: {again}");
     Ok(())
