@@ -949,7 +949,7 @@ pub fn relayed_words(session: &str, json: &str, root: &[u8], machine: &str, inst
     // For this session: as its sender named it (its id, or the start of it), or, named otherwise (by
     // its name), as kiln's record of passing them on says it found it.
     let to = said("/input/agent");
-    let kilns_for = checked.iter().filter_map(|c| kiln_ci::identity::custody::body(c).ok()).filter_map(|b| b.held_for).any(|f| f == session || f.contains(&format!("/agent/{session}/")));
+    let kilns_for = checked.iter().flat_map(|c| c.statement.subject.iter()).filter_map(|t| t.annotations.get("for").and_then(Value::as_str)).any(|f| f == session || f.contains(&format!("/agent/{session}/")));
     let for_here = (!to.is_empty() && session.starts_with(&to)) || kilns_for;
     if !covers || signed.payload_type != kiln_ci::identity::custody::PAYLOAD_ACT || said("/name") != "agents.send" || said("/input/text") != words || !for_here {
         let now = if said("/input/text") == words { format!("an ask its act doesn't cover, to {to}") } else { format!("words other than those its sender signed: {words:?}") };

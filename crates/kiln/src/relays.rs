@@ -334,15 +334,14 @@ pub async fn words(hub: &Hub, to: &str, carried: Carried) -> Option<(Value, u64,
         let last = carried.records.last().ok_or_else(|| anyhow::anyhow!("no relay's record came with it"))?;
         let from = crate::custody::statement_in(&last.to_string()).and_then(|s| s.body.get("by").and_then(Value::as_str).map(str::to_owned)).unwrap_or_default();
         let op = "call agents.send";
-        let thing = act_thing(&carried.session, op, &crate::custody::digest_of(&carried.act));
+        let mut thing = act_thing(&carried.session, op, &crate::custody::digest_of(&carried.act));
+        // For whom: the session kiln found the words are for, as its identity names it. An
+        // annotation, not the record's `for`: kiln passes them on, it doesn't hold them for it.
+        let recipient = crate::identities::agent_uri(&hub.store, to).await?.unwrap_or_else(|| to.to_owned());
+        thing.annotations.insert("for".into(), Value::String(recipient));
         let stream = format!("words to {to_uri}, from kiln started {}{}", *STARTED, if answers { "" } else { UNANSWERED });
         let pass = Pass { by: &server, from: &from, to: &to_uri, stream: &stream, seq: hub.relays.next(&stream), why: "an agent's words, passed on to the runner process holding the agent they're for" };
-        let mut s = relay::passed_on(&pass, vec![thing], vec![crate::custody::digest_of(last)]);
-        // For whom: the session kiln found the words are for, as its identity names it.
-        let held_for = crate::identities::agent_uri(&hub.store, to).await?.unwrap_or_else(|| to.to_owned());
-        if let Some(o) = s.body.as_object_mut() {
-            o.insert("for".into(), Value::String(held_for));
-        }
+        let s = relay::passed_on(&pass, vec![thing], vec![crate::custody::digest_of(last)]);
         let bundle = crate::custody::server_signed(&hub.pki, &s)?;
         match crate::custody::take(&hub.store, &hub.pki.ca_der, &org, &bundle, "kiln's server", crate::util::now_unix()).await? {
             Ok(_) => {}
