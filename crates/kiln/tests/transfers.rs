@@ -1147,35 +1147,85 @@ fn w27_ac04_approval_carried() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// W27-R08 (the Transfers plan's step 12): custody between machines. A runner's objects from its
-/// peers (W24-R27): box-a and box-b each hold an object of acme/app's cache. box-b's cache, asked
-/// for box-a's, fetches it from box-a over their link: box-a signs its hand-on to box-b's runner
-/// process, and box-b its receipt of what the copy hashed to, so the chain walks unbroken with both
-/// sides signed. What box-b sends changes on its way (its `peer_object_changed` fault): box-a
-/// refuses the copy and keeps nothing of it, and kiln records the break at that hop, between
-/// box-b's hand-on and box-a's receipt. Each cache is asked with a token minted by its runner's
-/// key, as a build there holds one (W24-R24).
+/// W27-R08 (the Transfers plan's step 12): custody between machines, a part for each path of
+/// docs/ci.md W27's inventory, each a helper of its own the test calls in turn on one kiln and two
+/// runners: a runner's objects from its peers ([`peers_objects`]), kiln's store of bytes
+/// ([`store_of_bytes`]) and the conversation feed ([`feed_batches`]). Each signed by both sides
+/// and walking unbroken, and each changed on its way (a test build's faults: box-b's
+/// `peer_object_changed` and `feed_changed`, the server's `blob_changed`) refused where it would be
+/// used and recorded as a break at its hop.
 #[cfg(feature = "chaos")]
 #[test]
 fn w27_r08_custody_between_machines() -> anyhow::Result<()> {
-    use kiln::reach::local::{Client, Ev, Req, RunReq};
-    use kiln::runner::work::client::{Conn, Endpoint};
-    use kiln::runner::work::token::{Claims, Keyring};
     let dir = tempfile::tempdir()?;
-    let s = start(dir.path(), &Options::default())?;
-    let (port, admin, repo) = (s.port, s.admin.as_str(), "acme/app");
-    let (_a, log_a) = agents::runner_with(dir.path(), port, "box-a", None, TALK, &[])?;
-    let (_b, log_b) = agents::runner_with(dir.path(), port, "box-b", Some("peer_object_changed"), TALK, &[])?;
+    let changed = format!("blob_changed=binaries/kiln-{CHANGED_BINARY}");
+    let s = common::start_env(dir.path(), &Options::default(), false, &[("KILN_CHAOS", changed.as_str())])?;
+    let (port, admin) = (s.port, s.admin.as_str());
+    let cwd = dir.path().join("work-here");
+    let _harnesses = Harnesses::new(&cwd, &dir.path().join("home"))?;
+    let claude = dir.path().join("home").join(".claude").to_string_lossy().into_owned();
+    let env = [("FAKE_CLAUDE_RECORD", "1"), ("CLAUDE_CONFIG_DIR", claude.as_str())];
+    let (_a, log_a) = agents::runner_with(dir.path(), port, "box-a", None, TALK, &env)?;
+    let (_b, log_b) = agents::runner_with(dir.path(), port, "box-b", Some("peer_object_changed,feed_changed"), TALK, &env)?;
     for (name, log) in [("box-a", &log_a), ("box-b", &log_b)] {
         agents::connected(port, admin, name, log, Duration::from_secs(60))?;
     }
-    // Each runner's cache, started as `kiln run --reuse` starts it, with a token for acme/app's
-    // trusted scope there.
+    peers_objects(dir.path(), port, admin)?;
+    store_of_bytes(dir.path(), port, admin)?;
+    feed_batches(dir.path(), port, admin, &cwd)?;
+    Ok(())
+}
+
+/// The platform whose binary the server's `blob_changed` changes as it's read
+/// ([`w27_r08_custody_between_machines`]).
+#[cfg(feature = "chaos")]
+const CHANGED_BINARY: &str = "aarch64-pc-windows-msvc";
+
+/// The custody of record `record` (its digest) as kiln took it: its signer.
+#[cfg(feature = "chaos")]
+fn custodian_of(dir: &Path, record: &str) -> anyhow::Result<String> {
+    let db = rusqlite::Connection::open(dir.join("data/kiln.db"))?;
+    Ok(db.query_row("SELECT custodian FROM custody WHERE digest = ?1", [record], |r| r.get(0))?)
+}
+
+/// The breaks kiln recorded, newest first.
+#[cfg(feature = "chaos")]
+fn breaks_now(port: u16, admin: &str) -> anyhow::Result<Vec<Value>> {
+    let (_, body) = http(port, "GET", "/api/custody/breaks", admin, None)?;
+    Ok(serde_json::from_str::<Value>(&body)?.get("breaks").and_then(Value::as_array).cloned().unwrap_or_default())
+}
+
+/// A thing's chain by its digest (`sha256:<hex>`), as kiln walks it now.
+#[cfg(feature = "chaos")]
+fn chain_of_digest(port: u16, admin: &str, digest: &str) -> anyhow::Result<Value> {
+    let (_, body) = http(port, "GET", &format!("/api/custody?digest={digest}"), admin, None)?;
+    Ok(serde_json::from_str(&body).unwrap_or_default())
+}
+
+/// A chain's hops: each one's kind, and its custodian (kiln's for someone: whom for).
+#[cfg(feature = "chaos")]
+fn hops_of(v: &Value) -> Vec<(String, String)> {
+    v.get("hops").and_then(Value::as_array).into_iter().flatten().map(|h| (field(h, "kind").to_owned(), h.get("taken_for").and_then(Value::as_str).unwrap_or(field(h, "custodian")).to_owned())).collect()
+}
+
+/// A runner's objects from its peers (W24-R27): box-a and box-b each hold an object of acme/app's
+/// cache. box-b's cache, asked for box-a's, fetches it from box-a over their link: box-a signs its
+/// hand-on to box-b's runner process, and box-b its receipt of what the copy hashed to, so the
+/// chain walks unbroken with both sides signed. What box-b sends changes on its way (its
+/// `peer_object_changed`): box-a refuses the copy and keeps nothing of it, and kiln records the
+/// break at that hop, between box-b's hand-on and box-a's receipt. Each cache is asked with a
+/// token minted by its runner's key, as a build there holds one (W24-R24).
+#[cfg(feature = "chaos")]
+fn peers_objects(dir: &Path, port: u16, admin: &str) -> anyhow::Result<()> {
+    use kiln::reach::local::{Client, Ev, Req, RunReq};
+    use kiln::runner::work::client::{Conn, Endpoint};
+    use kiln::runner::work::token::{Claims, Keyring};
+    let repo = "acme/app";
     let open = |name: &str| -> anyhow::Result<(Conn, String)> {
-        let mut c = Client::connect(&kiln::reach::local::path(name, &dir.path().join(format!("{name}-state"))))?;
+        let mut c = Client::connect(&kiln::reach::local::path(name, &dir.join(format!("{name}-state"))))?;
         c.send(&Req::RunReuse(Box::new(RunReq { target: name.into(), command: "true".into(), ..RunReq::default() })))?;
         while !matches!(c.event()?, Some(Ev::Exit { .. } | Ev::Error(_)) | None) {}
-        let at = dir.path().join(format!("{name}-work")).join("_cas");
+        let at = dir.join(format!("{name}-work")).join("_cas");
         anyhow::ensure!(at.join("key").exists(), "{name}'s cache didn't start");
         let exp = i64::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs())? + 3600;
         let token = Keyring::open(&at)?.mint(&Claims { repo: repo.into(), domain: "trusted".into(), read: true, write: true, exp, grant: None });
@@ -1206,7 +1256,7 @@ fn w27_r08_custody_between_machines() -> anyhow::Result<()> {
         let v = chain_of(&x)?;
         Ok((v.get("unbroken") == Some(&json!(true)) && hops(&v).len() == 2).then_some(v))
     })
-    .map_err(|e| anyhow::anyhow!("{e}: {}\n{}", chain_of(&x).unwrap_or_default(), said_of(dir.path(), port, admin, &x)))?;
+    .map_err(|e| anyhow::anyhow!("{e}: {}\n{}", chain_of(&x).unwrap_or_default(), said_of(dir, port, admin, &x)))?;
     let (b_uri, a_uri) = match hops(&v).as_slice() {
         [(r, taker), (h, giver)] if r == "received" && h == "handed-on" && taker.contains("/machine/box-b/") && giver.contains("/machine/box-a/") => (taker.clone(), giver.clone()),
         other => anyhow::bail!("box-b's receipt of box-a's hand-on: {other:?}"),
@@ -1226,12 +1276,87 @@ fn w27_r08_custody_between_machines() -> anyhow::Result<()> {
         let breaks: Vec<Value> = serde_json::from_str::<Value>(&body)?.get("breaks").and_then(Value::as_array).cloned().unwrap_or_default();
         Ok(breaks.into_iter().find(|b| field(b, "kind") == "changed" && field(b, "detail").contains("object of acme/app")))
     })
-    .map_err(|e| anyhow::anyhow!("{e}: {}", said_of(dir.path(), port, admin, &y)))?;
-    let db = rusqlite::Connection::open(dir.path().join("data/kiln.db"))?;
+    .map_err(|e| anyhow::anyhow!("{e}: {}", said_of(dir, port, admin, &y)))?;
+    let db = rusqlite::Connection::open(dir.join("data/kiln.db"))?;
     let custodian = |d: &str| -> anyhow::Result<String> { Ok(db.query_row("SELECT custodian FROM custody WHERE digest = ?1", [d], |r| r.get(0))?) };
     let (record, follows) = (field(&broke, "record"), broke.pointer("/around/1").and_then(Value::as_str).unwrap_or_default());
     assert_eq!((custodian(record)?, custodian(follows)?), (a_uri, b_uri), "box-a's receipt of box-b's hand-on: {broke}");
     let r = a.request("HEAD", &format!("/_kiln/cas/v1/objects/{changed}"), &[("authorization", &a_token)], b"")?;
     assert_eq!(r.status, 404, "box-a kept nothing of the changed copy");
+    Ok(())
+}
+
+/// kiln's store of bytes: two binaries for other platforms uploaded, each kept in the store and
+/// downloaded whole. One walks unbroken: kiln's hand-on to the store and its receipt for it, kiln's
+/// take for the store and its receipt of what it read. The other the server's `blob_changed`
+/// changes as it's read: its download ends short, and the break is recorded where kiln received
+/// other bytes than it took for the store.
+#[cfg(feature = "chaos")]
+fn store_of_bytes(dir: &Path, port: u16, admin: &str) -> anyhow::Result<()> {
+    let binary = |seed: u32| -> Vec<u8> {
+        let mut b = b"\x7fELF".to_vec();
+        b.extend((0..(2u32 << 20)).map(|i| ((i.wrapping_add(seed).wrapping_mul(2_654_435_761)) >> 24) as u8));
+        b
+    };
+    let headers = format!("Authorization: Bearer {admin}\r\nContent-Type: application/octet-stream\r\n");
+    let (kept, changed) = ((binary(1), "aarch64-apple-darwin"), (binary(2), CHANGED_BINARY));
+    for (bytes, target) in [&kept, &changed] {
+        let (st, body) = common::raw(port, "POST", &format!("/api/updates/binaries?target={target}"), &headers, bytes)?;
+        anyhow::ensure!(st == 200, "the upload for {target}: {st} {}", String::from_utf8_lossy(&body));
+    }
+    let (st, got) = common::raw(port, "GET", &format!("/dl/kiln/{}", kept.1), "", b"")?;
+    anyhow::ensure!(st == 200 && got == kept.0, "{}: {st}, {} bytes", kept.1, got.len());
+    let store = |v: &Value| hops_of(v).get(1).map(|h| h.1.clone()).unwrap_or_default();
+    let v = until(Duration::from_secs(30), || {
+        let v = chain_of_digest(port, admin, &format!("sha256:{}", kiln::util::sha256_hex(&kept.0)))?;
+        Ok((v.get("unbroken") == Some(&json!(true)) && hops_of(&v).len() == 4).then_some(v))
+    })
+    .map_err(|e| anyhow::anyhow!("{e}: {}", chain_of_digest(port, admin, &format!("sha256:{}", kiln::util::sha256_hex(&kept.0))).unwrap_or_default()))?;
+    let kinds: Vec<String> = hops_of(&v).into_iter().map(|h| h.0).collect();
+    assert_eq!(kinds, ["received", "taken", "received", "handed-on"], "{v}");
+    assert!(store(&v).contains("/blobs/"), "kiln for its store of bytes: {v}");
+    assert!(half_named(&v) == 0, "{v}");
+    // Changed as it's read: the download ends short, and the break is recorded at the take.
+    let short = common::raw(port, "GET", &format!("/dl/kiln/{}", changed.1), "", b"");
+    assert!(short.as_ref().map_or(true, |(_, b)| *b != changed.0), "a changed binary is never served whole");
+    let broke = until(Duration::from_secs(30), || Ok(breaks_now(port, admin)?.into_iter().find(|b| field(b, "kind") == "changed" && field(b, "detail").contains(&format!("object binaries/kiln-{}", changed.1)))))?;
+    let server = custodian_of(dir, field(&broke, "record"))?;
+    assert!(server.ends_with("/server"), "kiln's receipt of what it read: {broke}");
+    Ok(())
+}
+
+/// The conversation feed: box-a's and box-b's agent sessions' rows go to the server's store a
+/// batch at a time, each signed by both sides: the runner's hand-on of it and kiln's receipt,
+/// walking unbroken. box-b's first batch signed for changes on its way (its `feed_changed`): the
+/// server refuses it, the break is recorded, and the batch goes again as it was and is taken.
+#[cfg(feature = "chaos")]
+fn feed_batches(dir: &Path, port: u16, admin: &str, cwd: &Path) -> anyhow::Result<()> {
+    let a = agents::open_session(port, admin, "box-a", cwd, Duration::from_secs(60))?;
+    agents::open_session(port, admin, "box-b", cwd, Duration::from_secs(60))?;
+    let db = rusqlite::Connection::open(dir.join("data/kiln.db"))?;
+    // kiln's receipts of runners' batches, and whose hand-on each follows.
+    let receipts = || -> anyhow::Result<Vec<(String, String)>> {
+        let mut q = db.prepare("SELECT c.digest, h.custodian FROM custody c JOIN custody_things t ON t.record = c.digest JOIN custody_follows f ON f.record = c.digest JOIN custody h ON h.digest = f.follows WHERE t.name LIKE 'conversation store %' AND c.kind = 'received' AND c.custodian LIKE '%/server'")?;
+        let rows = q.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    };
+    // Each runner's batch, received as handed on: one of its chains walks unbroken.
+    let unbroken = |m: &str| -> anyhow::Result<Option<Value>> {
+        for (record, giver) in receipts()? {
+            if giver.contains(&format!("/machine/{m}/")) {
+                let v = chain_of_digest(port, admin, &record)?;
+                if v.get("unbroken") == Some(&json!(true)) && half_named(&v) == 0 && hops_of(&v).into_iter().map(|h| h.0).collect::<Vec<_>>() == ["received", "handed-on"] {
+                    return Ok(Some(v));
+                }
+            }
+        }
+        Ok(None)
+    };
+    until(Duration::from_secs(120), || Ok(unbroken("box-a")?.zip(unbroken("box-b")?))).map_err(|e| anyhow::anyhow!("{e}: {:?}\n{}", receipts(), said_of(dir, port, admin, &a)))?;
+    // box-b's batch, changed on its way: refused and recorded, then taken as it was.
+    let broke = breaks_now(port, admin)?.into_iter().find(|x| field(x, "kind") == "changed" && field(x, "detail").contains("conversation store"));
+    let broke = broke.ok_or_else(|| anyhow::anyhow!("no break recorded for box-b's changed batch"))?;
+    let follows = broke.pointer("/around/1").and_then(Value::as_str).unwrap_or_default();
+    assert!(custodian_of(dir, follows)?.contains("/machine/box-b/"), "box-b's hand-on: {broke}");
     Ok(())
 }

@@ -9487,15 +9487,37 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
     cache service is asked for an object it lacks, with a token its runner minted, and nothing
     mints one yet (`harness::builds::cache_env` isn't called, W24-R24), so no runner in production
     asks a peer today: the records are there for when one does.
-  - *The blob stores' puts and gets* (`kiln_seams::blobs`, `blobs::io::put_file`, `read_stream`):
-    kiln's server hands an object on by its SHA-256, the store's etag; the store has no identity of
-    kiln's, so the server's receipt of the etag it got back stands for it (a mismatch is refused,
-    as `put_file` does, and recorded). Mantle's puts and gets go the same way once Mantle is in
-    kiln (docs/mantle.md, CP-T10.2).
-  - *The conversation feed* (`convo::feed`: a runner's `Shipper` → the server's `Intake`, and the
-    server to its mirrors and back for a restore): each batch handed on by the SHA-256 of its rows,
-    received by the server once its store takes it (the receipt with its ack); a mirror's the same
-    way.
+  - *The blob stores' puts and gets* (`kiln_seams::blobs`; `custody::blobs::Attested`, the
+    server's store as `Hub::new_on` opens it): the store has no identity of kiln's, so kiln's
+    server signs for it, as for a person with no key. A put is kiln's hand-on to the store, by the
+    SHA-256 of what it sent, and its receipt for the store, by the etag the store answered. A whole
+    read (a get of all of it, or one reader's ranges from its first byte to its last, as
+    `blobs::io::read_stream` asks them) is kiln's take for the store, by the etag the store says,
+    following kiln's receipt of the put that left it so, and kiln's receipt of what it read. An
+    object that came into the store another way (kept before kiln recorded custody, taken in where
+    it lay, put back by a rollback's reconcile, adopted by an S3 store, copied by `kiln blobs copy`)
+    begins its chain at that take, with no break. A digest that changes across a hop breaks there,
+    recorded; a whole get whose bytes aren't what the store says is refused (`BadChecksum`, the
+    seam's refusal of a checksum that doesn't hold, used here for a read; `blobs::Metered`, inside
+    the wrapper, counts the store's answer as it came, and the refusal is logged on `kiln.custody`).
+    A reader followed range by range is let go, with no receipt, after 10 minutes without a range
+    or past 64 readers at once. Objects whose key names their content (`cas/`, `sync/`) get no
+    records: every read checks them by name, and a whole get that fails is refused and audited
+    (`blobs.read`). An S3's presigned URLs carry bytes kiln never sees. The blob stores stand in for
+    Mantle here, which isn't in kiln yet: Mantle's puts and gets take the same hand-on and receipt
+    once CP-T10.2 vendors it (docs/mantle.md), and a Mantle cell can then sign its own receipt of a
+    put where kiln's server signs for the store today.
+  - *The conversation feed* (`convo::feed`: a runner's `Shipper` → the server's `Intake`, the
+    server to its mirrors, and a mirror's copy back for a restore): each end has a
+    `convo::feed::Custodian` (`runner::custody::Feed` on a runner, `custody::feeds` on the server).
+    The giver signs its hand-on of each batch, by the SHA-256 of its rows as JSON, and it goes with
+    the batch's first part (`Msg::Batch`'s optional `hand_on`; a taker from before ignores it).
+    The taker hashes what came before its store takes any of it. As signed for, it's taken and the
+    taker signs its receipt; otherwise it's refused (the giver is told to go on from where the
+    taker stands, and sends it again), and the receipt of what came records the break. The server
+    keeps a runner's hand-on with its receipt; its hand-on to a mirror names the runner process
+    keeping the copy now, and goes signed only to one that takes custody. A giver from before
+    sends no hand-on, and its batches are taken as before.
   - *The cluster group* (`store::group`, `store::learner`): the server, the group's one voter,
     hands its learners each copy by its SHA-256 (`cluster_copy`) and, at intervals, a checkpoint of
     its log (its sequence and the digest of the entries since); each learner receives them once it
@@ -9571,11 +9593,25 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
   `tarball_changed`, the leg refused before any step and the break recorded where fedora-2's runner
   received other bytes than kiln handed on). Between machines (step 12): kiln-ci's
   `w27_r08_a_peers_object_changes_hands_signed_by_both` (the taker's build of the holder's hand-on
-  has its digest; a copy that hashed to something else breaks at that hop), and, with `chaos`,
-  `transfers`'s `w27_r08_custody_between_machines` (box-b's cache fetches box-a's object over their
-  link: box-a's hand-on and box-b's receipt, unbroken; box-b's copy changed on its way to box-a by
-  its `peer_object_changed`: never served, nothing of it kept, the break recorded between box-b's
-  hand-on and box-a's receipt). Simulation (the Transfers plan's step 9, W27-AC05):
+  has its digest; a copy that hashed to something else breaks at that hop);
+  `custody::blobs::w27_r08_kilns_store_of_bytes_is_signed_for_at_each_put_and_whole_read` (a put,
+  a whole get, a stream of ranges and a file put in parts each walk unbroken; read again, kept
+  once; nothing for keys named by their content) and
+  `w27_r08_an_object_read_back_changed_is_refused_and_its_break_recorded` (bytes the store changed
+  under kiln: refused, a break; an object that came in past kiln's puts: its chain begins at kiln's
+  take, no break; one named by its content refused and audited); `convo::feed::w27_r08_a_feeds_batch_is_taken_only_as_its_giver_signed_for_it`
+  (changed on its way: refused, nothing taken, the receipt of what came; as signed for, taken and
+  received; from a giver from before, taken as before) and
+  `w27_r08_a_shipper_hands_on_each_batch_it_sends`; and, with `chaos`,
+  `transfers`'s `w27_r08_custody_between_machines`, a helper for each path: peers' objects (box-b's
+  cache fetches box-a's object over their link: box-a's hand-on and box-b's receipt, unbroken;
+  box-b's copy changed on its way to box-a by its `peer_object_changed`: never served, nothing of
+  it kept, the break recorded between box-b's hand-on and box-a's receipt); kiln's store of bytes
+  (two binaries uploaded and downloaded: one walks unbroken through kiln's records for the store,
+  the other changed as it's read by the server's `blob_changed`: its download ends short, the break
+  recorded at the take); the feed (box-a's and box-b's sessions' batches each received as handed
+  on; box-b's first, changed on its way by its `feed_changed`, refused and recorded, then taken as
+  it was). Simulation (the Transfers plan's step 9, W27-AC05):
   `sim::transfers::tests::w27_ac05_no_stale_act_is_ever_applied` (docs/sim.md's transfers model:
   moves, resumes from kiln's copy while a machine is cut off, take-overs with the old process still
   acting, blue/green upgrades and their rollbacks, the server restarting with its count stale, under

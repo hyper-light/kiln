@@ -115,6 +115,8 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     if let Err(e) = crate::identities::own_identities(&hub.store, &pki).await {
         tracing::warn!(error = %format!("{e:#}"), "the server's and CD's identities weren't issued");
     }
+    // The conversation feeds' batches signed for at the server's ends (docs/ci.md W27-R08).
+    crate::custody::feeds::install(&hub);
     hub.runners_before.store(runners_before, std::sync::atomic::Ordering::Relaxed);
     // Where kiln keeps its bytes (docs/blobs.md): what was kept before taken in, what's kept read.
     crate::blobs::start(&hub).await;

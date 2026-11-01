@@ -54,6 +54,10 @@ reaching a process it isn't for.
   something from another. A runner's object from a peer's cache is handed on by the peer and
   received by the runner that fetched it, each signing; a copy changed on its way is refused, and
   the break recorded. No runner in production asks a peer yet: nothing mints its cache's tokens.
+  kiln's store of bytes: kiln signs for the store at each put and whole read of an object whose
+  key doesn't name its content (binaries, transcripts); a read whose bytes aren't what the store
+  says is refused, and its break recorded. The conversation feed: each batch goes with its giver's
+  hand-on, and the taker refuses one that isn't what it says before taking any of it.
 
 ## Deploying it
 
@@ -86,9 +90,13 @@ reaching a process it isn't for.
   the tarball's comes in a response header (`Kiln-Custody-Hand-On`) and a cache's in a new field of
   the lookup's answer, both ignored by a runner from before. A runner asks `/_kiln/pushed` at a
   leg's end; a server from before answers 404, and the leg's hand-on names no images, as before.
-- **Step 12 on the wire:** none on reach's links. A runner asks the server which process of a
-  peer takes reach (`ReachAsk` op `custody`); a server from before doesn't know the op, the runner
-  hears no URI, and nothing is signed for that peer, as before.
+- **Step 12 on the wire:** none on reach's links (the sync and the run's, reach version 2, come
+  with the Step 12 agent's branch). A runner asks the server which process of a peer takes reach
+  (`ReachAsk` op `custody`); a server from before doesn't know the op, the runner hears no URI,
+  and nothing is signed for that peer, as before. The feed's `Msg::Batch` has an optional
+  `hand_on` (JSON): a taker from before ignores it, and a giver from before sends none.
+- **kiln's store of bytes, after it:** a whole get of an object whose bytes don't hash to its etag
+  is refused (`BadChecksum`), where it used to be served as the store gave it.
 - **Config:** nothing new in kiln.toml.
 - **First start:** the migrations only add tables (`ci_leg_pushed` with step 11).
 

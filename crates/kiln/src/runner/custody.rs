@@ -276,6 +276,48 @@ pub(crate) fn peer_object_taken(from: &str, repo: &str, want: &str, got: &str) {
     }
 }
 
+/// This runner process's ends of conversation store feeds (docs/ci.md W27-R08; the Transfers plan's
+/// step 12; `crate::convo::feed::Custodian`): its hand-on of each batch it sends kiln's server (of
+/// its own store, or of its copy of the server's sent back to restore it), and its receipt of each
+/// batch of the server's store it takes into its copy. Signed as this process, once kiln takes
+/// custody from it; the server keeps the hand-ons that come with the batches, and this process's
+/// receipts go to kiln with its other records.
+pub struct Feed;
+
+impl crate::convo::feed::Custodian for Feed {
+    fn hand_on(&self, thing: Subject) -> futures::future::BoxFuture<'_, Option<String>> {
+        Box::pin(async move {
+            if !sends() {
+                return None;
+            }
+            let by = identity::uri("runner")?;
+            // kiln's server, of the organization this process is certified in.
+            let org = by.strip_prefix("kiln://")?.split('/').next()?.to_owned();
+            let body = Body { to: Some(crate::custody::server_uri(&org)), why: "a batch of this runner's conversation store".into(), ..Body::new(Kind::HandedOn, &by) };
+            match sign("runner", &by, &Statement { subject: vec![thing], ..Statement::new(to_value(&body)) }) {
+                Ok(b) => Some(b.to_string()),
+                Err(e) => {
+                    tracing::warn!(target: "kiln.custody", error = %format!("{e:#}"), "this runner's hand-on of a conversation store's batch couldn't be signed");
+                    None
+                }
+            }
+        })
+    }
+
+    fn received(&self, _machine: &str, hand_on: &str, thing: Subject) {
+        if !sends() {
+            return;
+        }
+        let (Some(by), Ok(given)) = (identity::uri("runner"), serde_json::from_str::<Value>(hand_on)) else { return };
+        let Some(from) = giver_of(&given) else { return };
+        let body = Body { from: Some(from), why: "a batch of kiln's conversation store, for the copy this runner keeps".into(), ..Body::new(Kind::Received, &by) };
+        match sign("runner", &by, &Statement { subject: vec![thing], follows: vec![digest_of(&given)], ..Statement::new(to_value(&body)) }) {
+            Ok(b) => queue(&b),
+            Err(e) => tracing::warn!(target: "kiln.custody", error = %format!("{e:#}"), "this runner's receipt of a batch of kiln's conversation store couldn't be signed"),
+        }
+    }
+}
+
 /// The digest of a bundle's statement ("" when it can't be read).
 pub(crate) fn digest_of(bundle: &Value) -> String {
     use base64::Engine as _;

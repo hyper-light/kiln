@@ -51,6 +51,12 @@
 //! - `peer_object_changed`: an object of its cache this runner sends a peer has a byte changed after
 //!   it signed its hand-on of it, as in transit (docs/ci.md W27-R08, W24-R27): the peer refuses it
 //!   and kiln records the break.
+//! - `blob_changed=<key>`: the server's: the object at `key` reads back from its store of bytes
+//!   with its first byte changed, as a store whose bytes changed under kiln (docs/ci.md W27-R08):
+//!   the read is refused and kiln records the break.
+//! - `feed_changed`: the first batch of a conversation store's feed this process signs for has a
+//!   byte changed after it signed its hand-on, once (docs/ci.md W27-R08): the taker refuses it,
+//!   kiln records the break, and the batch goes again as it was.
 //! - `copy=<path>`: every frame this runner sends, appended to `path` as it goes below the channel
 //!   (its lane and length, then its bytes), so a test can say what crossed the network (W27-R02).
 //! - `keys=<path>`: each identity key this runner process makes (`crate::runner::identity`),
@@ -102,6 +108,11 @@ pub struct Chaos {
     pub no_git: bool,
     /// An object it sends a peer changes after its hand-on (`peer_object_changed`).
     pub peer_object_changed: bool,
+    /// The server's: the object at this key reads back changed from its store of bytes
+    /// (`blob_changed=`).
+    pub blob_changed: Option<String>,
+    /// The first batch of a feed it signs for changes after its hand-on, once (`feed_changed`).
+    pub feed_changed: bool,
     /// Where every frame this process sends is copied (`copy=`).
     pub copy: Option<std::path::PathBuf>,
     /// Where each identity key this process makes is copied (`keys=`).
@@ -167,6 +178,11 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
             "tarball_changed" => c.tarball_changed = true,
             "no_git" => c.no_git = true,
             "peer_object_changed" => c.peer_object_changed = true,
+            "feed_changed" => c.feed_changed = true,
+            "blob_changed" => {
+                anyhow::ensure!(!v.is_empty(), "chaos `blob_changed` takes an object's key");
+                c.blob_changed = Some(v.to_owned());
+            }
             "copy" | "keys" => {
                 anyhow::ensure!(!v.is_empty(), "chaos `{k}` takes a file's path");
                 let path = Some(std::path::PathBuf::from(v));
@@ -177,7 +193,7 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
                 }
             }
             "seed" => c.seed = v.parse().map_err(|_| anyhow::anyhow!("chaos `seed` takes a number, not `{v}`"))?,
-            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, lag, oom, disk, corrupt, fetch, platform, rebuild, shed, twice, late, seed, fanout, old, unsigned, stale_words, tarball_changed, no_git, peer_object_changed, copy or keys"),
+            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, lag, oom, disk, corrupt, fetch, platform, rebuild, shed, twice, late, seed, fanout, old, unsigned, stale_words, tarball_changed, no_git, peer_object_changed, blob_changed, feed_changed, copy or keys"),
         }
     }
     Ok(c)
@@ -412,11 +428,16 @@ mod tests {
                 tarball_changed: false,
                 no_git: false,
                 peer_object_changed: false,
+                blob_changed: None,
+                feed_changed: false,
                 copy: None,
                 keys: None
             }
         );
         assert!(parse("tarball_changed")?.tarball_changed && parse("no_git")?.no_git && parse("peer_object_changed")?.peer_object_changed);
+        assert_eq!(parse("blob_changed=artifacts/7/app")?.blob_changed.as_deref(), Some("artifacts/7/app"));
+        assert!(parse("blob_changed").is_err(), "it names an object's key");
+        assert!(parse("feed_changed")?.feed_changed);
         assert_eq!(parse("platform=darwin/arm64")?.platform.as_deref(), Some("darwin/arm64"));
         // W27-R02's test copies: what a runner sends, and the keys it makes.
         let c = parse("copy=/tmp/a.frames,keys=/tmp/a.keys")?;
