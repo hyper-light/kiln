@@ -221,6 +221,18 @@ impl Kind {
                 tracing::warn!(error = %format!("{e:#}"), "kiln's page tools couldn't be allowed in Antigravity's settings: agy decides on them as on its other tools");
             }
         }
+        // kiln's hook in agy's own hooks.json, the only place agy reads hooks from: every
+        // conversation's tool calls, model calls and stops come to kiln, so a person's pause and
+        // what each subagent may do hold them (docs/agents.md). One agy runs outside kiln passes.
+        #[cfg(unix)]
+        if self.protocol == Protocol::AgyStreamJson
+            && let Ok(kiln) = crate::os::this_kiln()
+        {
+            let hooks = crate::os::home_dir().join(".gemini/config/hooks.json");
+            if let Err(e) = crate::rt::blocking(move || agy_hooks_in(&hooks, &kiln.to_string_lossy())).await.and_then(|r| r) {
+                tracing::warn!(error = %format!("{e:#}"), "kiln's hook couldn't be put in Antigravity's hooks.json: its subagents can't be paused or limited");
+            }
+        }
     }
 }
 
@@ -239,6 +251,24 @@ fn agy_allow_in(path: &std::path::Path) -> anyhow::Result<bool> {
         Err(e) => return Err(e.into()),
     };
     let Some(next) = crate::reach::mcp::agy_allow(&settings) else { return Ok(false) };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    crate::runner::auth::write_private(path, &serde_json::to_vec_pretty(&next)?)?;
+    Ok(true)
+}
+
+/// kiln's hook entry for this kiln binary (`kiln`) in agy's hooks.json at `path`
+/// (`antigravity::hooks_with`): its other hooks kept, written whole and readable by its user alone,
+/// only when it differs; a file it can't read is left as it is. Whether it wrote.
+#[cfg(unix)]
+fn agy_hooks_in(path: &std::path::Path, kiln: &str) -> anyhow::Result<bool> {
+    let config = match std::fs::read(path) {
+        Ok(b) => serde_json::from_slice::<serde_json::Value>(&b)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(e.into()),
+    };
+    let Some(next) = super::antigravity::hooks_with(&config, kiln) else { return Ok(false) };
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -448,7 +478,7 @@ impl Adapter {
             Self::Claude(a) => a.send_task(core, &t, m, mode),
             Self::Codex(a) => a.send_task(core, &t, m, mode),
             Self::Acp(a) => a.send_task(core, &t, m),
-            Self::Agy(_) => super::subagent::refuse(core, task, &m, "its harness takes no message for it from kiln."),
+            Self::Agy(a) => a.send_task(core, &t, m, mode),
         }
     }
 
@@ -459,7 +489,7 @@ impl Adapter {
             Self::Claude(a) => super::subagent::settle(core, |core, t| a.takes(core, t)),
             Self::Codex(a) => super::subagent::settle(core, |core, t| a.takes(core, t)),
             Self::Acp(a) => super::subagent::settle(core, |core, t| a.takes(core, t)),
-            Self::Agy(_) => super::subagent::settle(core, |_, _| (Vec::new(), None)),
+            Self::Agy(a) => super::subagent::settle(core, |core, t| a.takes(core, t)),
         }
         // Held at its next tool call: Claude Code asks kiln before each (`claude::HOLD_HOOK`), and so
         // does Codex once it trusts kiln's hook (`codex::hook_args`).
@@ -468,7 +498,8 @@ impl Adapter {
             Self::Codex(a) => a.holds_calls(),
             // At each call an ACP agent asks about, where it names its subagent (opencode's).
             Self::Acp(_) => true,
-            Self::Agy(_) => false,
+            // And Antigravity, once kiln's hook in its hooks.json is heard (`antigravity::hooks_with`).
+            Self::Agy(a) => a.holds_calls(),
         };
         super::subagent::settle_pausable(core, |t| can && t.tool_id.is_some());
     }
@@ -619,15 +650,18 @@ impl Adapter {
     }
 
     /// Its harness's hook asks before a tool call (`input`): the answer goes to `reply`, at once or
-    /// once a person lets the call go (`hold`). Only Codex's hook asks this way; Claude Code's comes
-    /// over its own control protocol.
+    /// once a person lets the call go (`hold`). Codex's and Antigravity's hooks ask this way; Claude
+    /// Code's comes over its own control protocol.
     pub fn hook(&mut self, core: &mut Core, input: serde_json::Value, reply: futures::channel::oneshot::Sender<serde_json::Value>) {
         match self {
             Self::Codex(a) => a.hook(core, input, reply),
-            Self::Claude(_) | Self::Acp(_) | Self::Agy(_) => {
+            Self::Agy(a) => a.hook(core, input, reply),
+            Self::Claude(_) | Self::Acp(_) => {
                 let _ = reply.send(serde_json::json!({}));
             }
         }
+        // What the hook told of its subagents (Antigravity's: one ended, its hook heard).
+        self.settle_subagents(core);
     }
 
     /// Something waits to go to its harness: kiln's queue, what its adapter holds till its harness
@@ -942,6 +976,55 @@ mod tests {
         assert!(!agy_allow_in(&path)?);
         std::fs::write(&path, "{not json")?;
         assert!(agy_allow_in(&path).is_err());
+        assert_eq!(std::fs::read(&path)?, b"{not json");
+        Ok(())
+    }
+
+    /// kiln's hook goes into agy's hooks.json beside the person's own, once, for this kiln binary
+    /// (another rewrites it); hooks it can't read are left as they are. Run as agy runs it (a
+    /// shell), it hands each event to this kiln, and where the binary is gone (a version pruned,
+    /// kiln uninstalled) it passes, so the person's own agy goes on as without kiln.
+    #[cfg(unix)]
+    #[test]
+    fn antigravitys_hooks_get_kilns_hook_once() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("config/hooks.json");
+        let read = |p: &std::path::Path| -> anyhow::Result<serde_json::Value> { Ok(serde_json::from_slice(&std::fs::read(p)?)?) };
+        let command = |v: &serde_json::Value, ev: &str| v.pointer(&format!("/kiln/{ev}/0/hooks/0/command")).or_else(|| v.pointer(&format!("/kiln/{ev}/0/command"))).and_then(serde_json::Value::as_str).map(str::to_owned).unwrap_or_default();
+        let run = |command: &str| -> anyhow::Result<String> { Ok(String::from_utf8(std::process::Command::new("sh").arg("-c").arg(command).output()?.stdout)?.trim().to_owned()) };
+        let gone = dir.path().join("versions/old/kiln");
+        let gone = gone.to_string_lossy();
+        assert!(agy_hooks_in(&path, &gone)?);
+        let made = read(&path)?;
+        assert_eq!(made.pointer("/kiln/PreToolUse/0/matcher"), Some(&serde_json::json!("*")));
+        assert_eq!(made.pointer("/kiln/PreToolUse/0/hooks/0/timeout"), Some(&serde_json::json!(super::super::antigravity::HOOK_FOR_S)));
+        // Its binary gone: each event passes.
+        assert_eq!(run(&command(&made, "PreToolUse"))?, r#"{"decision":"allow"}"#);
+        assert_eq!(run(&command(&made, "PreInvocation"))?, "{}");
+        assert_eq!(run(&command(&made, "Stop"))?, r#"{"decision":""}"#);
+        // There: the event goes to it (a stand-in that says what it was asked), a path with a
+        // space and a quote in it too.
+        let bin = dir.path().join("it's kiln/kiln");
+        std::fs::create_dir_all(bin.parent().ok_or_else(|| anyhow::anyhow!("no parent"))?)?;
+        std::fs::write(&bin, "#!/bin/sh\necho \"$@\"\n")?;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))?;
+        assert!(agy_hooks_in(&path, &bin.to_string_lossy())?);
+        let there = read(&path)?;
+        assert_eq!(run(&command(&there, "PreToolUse"))?, "harness-hook --agy PreToolUse");
+        assert_eq!(run(&command(&there, "Stop"))?, "harness-hook --agy Stop");
+        // The person's own: kept; once there, left alone; another kiln, rewritten.
+        std::fs::write(&path, r#"{"lint":{"PostToolUse":[{"matcher":"write_to_file","hooks":[{"command":"./lint.sh"}]}]}}"#)?;
+        assert!(agy_hooks_in(&path, "/k/kiln")?);
+        let kept = read(&path)?;
+        assert_eq!(kept.pointer("/lint/PostToolUse/0/hooks/0/command"), Some(&serde_json::json!("./lint.sh")));
+        assert!(command(&kept, "PreInvocation").contains("k='/k/kiln';"));
+        assert_eq!(std::fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+        assert!(!agy_hooks_in(&path, "/k/kiln")?);
+        assert!(agy_hooks_in(&path, "/k2/kiln")?);
+        assert!(read(&path)?.get("lint").is_some());
+        std::fs::write(&path, "{not json")?;
+        assert!(agy_hooks_in(&path, "/k/kiln").is_err());
         assert_eq!(std::fs::read(&path)?, b"{not json");
         Ok(())
     }

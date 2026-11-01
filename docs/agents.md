@@ -76,6 +76,22 @@ again on the same conversation. A new model, effort or mode is a flag, so it sta
 between turns. Files you attach go to it as their paths on its machine; its models come from
 `agy models`.
 
+Its subagents (`invoke_subagent`, each a conversation of agy's own) are tasks of the session: the
+stream names each one its agent starts (a `subagent` step's `subagent_info`: its conversation, role,
+type and first prompt), under the call that started it, its transcript as its output. Their own
+steps aren't in the stream, so kiln hears of them from its hook: agy reads hooks only from its
+hooks.json, so kiln puts one entry, `kiln`, in `~/.gemini/config/hooks.json` as an agent starts
+(beside the person's own, rewritten only when this kiln's path differs): `PreToolUse` for every tool
+(its answer awaited up to 7 days; past that agy fails the call), `PreInvocation` and `Stop`, each
+`kiln harness-hook --agy <event>` behind a shell guard: the entry stays in the person's hooks.json,
+and once that kiln binary is gone (its version pruned, kiln uninstalled) it answers agy's pass
+itself, as agy fails a call whose hook fails. It hands each to the runner's harness socket (`KILN_HARNESS_SOCK`,
+which agy hands on), with its conversation's tokens so far from its transcript; agy run outside kiln
+gets the answer that changes nothing (`allow`). A subagent's `Stop` ends its task (completed); its
+agent's `manage_subagents` kill, stopped. A subagent's own subagents are named nowhere kiln reads
+(not in the stream, and a hook names only the conversation it's in), so they aren't in the tree;
+the session's limits hold their calls.
+
 An agent goes on in any other of these harnesses, its conversation carried over: picking another
 harness's model in the head's line (`set_model` with `kind`; a harness that lists no models yet
 offers its own default) switches it once the turn under way ends. The conversation is read from
@@ -1464,7 +1480,9 @@ messages for its subagents wait in their queues too.
 | Codex (multi-agent v1, its default) | on the subagent's own thread: `turn/start` (with the session's permissions then), `turn/steer` into its turn, `turn/interrupt` then `turn/start` for now; Codex says it back under kiln's id (`clientUserMessageId`) | queue, steer, now while it works; queue (a turn at once) between turns |
 | Codex (multi-agent v2; a subagent this process didn't spawn) | Codex refuses input there (`direct app-server input is not allowed for multi-agent v2 sub-agents`), so kiln asks the agent, in its turn, to pass it on with its own agent tools (`send_message`, `followup_task`; v1's `send_input`); delivered once the agent's call reaches it | queue, steer; agents it started itself only |
 | Claude Code | it takes nothing for a subagent from kiln (2.1.309 and 2.1.310 answer `send_task_message` "Unsupported control request subtype" in `-p`, and a prompt naming the subagent's call goes to the agent), so kiln asks the agent, in its turn, to pass it on with its SendMessage tool: at the subagent's next tool round while it works in the background, or resuming it once it has finished; under way when the agent's SendMessage to it starts, delivered when that succeeds | queue, steer while it works in the background; queue while in the foreground (its agent's turn waits on it) or once it finished; none once stopped (Claude Code doesn't resume one stopped) |
-| ACP agents, Antigravity CLI | kiln has no subagent threads for them | none |
+| Antigravity CLI | before the subagent's next model call: kiln's hook (below) answers agy's `PreInvocation` in that subagent's conversation with the message (`injectSteps`, a `userMessage`; the files attached by their paths); under way then, delivered once it goes on past that call. Not once it has ended (agy calls a stopped subagent's model no more), nor before kiln's hook is heard from it | steer while it goes |
+| ACP agents (opencode) | kiln can't prompt an opencode subagent itself (an ACP prompt goes to a session kiln opened), so it asks the agent, once its turn is free, to pass it on with opencode's subagent tool, which takes a follow-up by the subagent's session id, running or ended; sent once kiln asks | queue |
+| ACP agents (Gemini CLI, Goose, Amp, Devin) | kiln has no subagent threads for them: their subagents aren't reported over ACP (below) | none |
 
 What kiln asks an agent to pass on carries the person's words as written (the files attached by
 their paths) and is kiln's own message in its timeline (`kiln-relay-<message id>`); a turn that
@@ -1528,7 +1546,7 @@ their `server` and `tool_short`; skill calls their `skill`.
 
 An agent's subagents show as one tree: those kiln started for it (sessions of their own, `subagent`
 with it as `parent`, and theirs) and its harness's own (`subagents` in lists, nested by
-`parent_task`), each under what started it, in the order they started. Mission control's row of
+`parent_task`; Antigravity's from its stream, but not a subagent's own), each under what started it, in the order they started. Mission control's row of
 an agent with subagents has a toggle (the subagent mark and a chevron) that opens the tree under
 it in the row's own columns: each subagent's piece of the path (the lines of those it's under
 passing by, a curve into its own mark), its name, its word and what it's at, its machine, time and
@@ -1563,24 +1581,30 @@ ones (commands, `apply_patch`, MCP calls and its read tools): a `PreToolUse` com
 in the session's flags, with that hook's trust for this session alone (the hash Codex trusts it
 by), so the person's own hooks keep theirs. Its command, `kiln harness-hook`, hands the call to the
 runner's harness socket, which knows the session by the asking process; Codex names no subagent,
-so kiln tells it by the call's turn. The call of a paused subagent, or of one under it, waits for
+so kiln tells it by the call's turn. Antigravity's are on each of its tool calls too: kiln's entry
+in agy's hooks.json (above), the subagent told by the call's conversation. The call of a paused subagent, or of one under it, waits for
 its answer until it's resumed (`tasks[].paused_at`). `tasks[].pausable` says which can be held so:
 Claude Code's while they go; Codex's once Codex lists kiln's hook as trusted (a session whose hook
-it doesn't trust says why); an ACP agent's where its requests name them (opencode's, below); not Antigravity's. What a pause holds says Paused; the
+it doesn't trust says why); an ACP agent's where its requests name them (opencode's, below);
+Antigravity's once kiln's hook is heard from it (its first hook turns `limits` on in its
+`meta.features`). What a pause holds says Paused; the
 one paused offers Resume, and those under it wait for that.
 
 **What each may do** (`perms`, `{perms?, task?}`): Read, Edit, Run and Web, each `allow`, `ask` or
 `off`; a `folder` its file calls stay in; the most `minutes` and `tokens` it may use. Never more
 than what it's under: the server narrows a session's to its parent's, and the subagents kiln
 started under it to its own (narrowing one narrows those under it; widening it widens none);
-Claude Code's and Codex's adapters narrow one of their own subagents' to the session's and the one
-it's under. They hold at each tool call the same hook sees: `off` refuses the call with the reason,
-`ask` makes it ask the person (Codex's hook can't ask, so kiln holds the call and asks them
-itself), a file outside its folder is refused (a command there asks; for Codex, the files an
+Claude Code's, Codex's and Antigravity's adapters narrow one of their own subagents' to the
+session's and the one it's under. They hold at each tool call the same hook sees: `off` refuses the call with the reason,
+`ask` makes it ask the person (Codex's hook can't ask, nor can headless agy, so kiln holds the call
+and asks them itself; a yes is agy's `auto_approve`, so it goes even where agy's mode would deny it,
+and a no its `deny` with their words), a file outside its folder is refused (a command there asks; for Codex, the files an
 `apply_patch` names), and past its minutes or tokens each call is refused and it's told to finish.
 Codex's web search is hosted, out of any hook's reach (`web_whole` in its `meta.features`): `off`,
 and `ask`, which it can't do, turn it off for the session's threads (`web_search = "disabled"`), as
-it starts again once idle, the conversation going on; a subagent of its own has no Web choice. The
+it starts again once idle, the conversation going on; a subagent of its own has no Web choice.
+Antigravity's web tools (`search_web`, `read_url_content`, `browser_*`) are calls its hook sees, so
+Web holds per call there as each other kind does. The
 shield on the thread's crumbs opens the panel under them, every choice at its right edge; a
 session whose harness kiln doesn't answer that way (no `limits` in its `meta.features`) has it off.
 
