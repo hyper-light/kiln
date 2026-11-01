@@ -151,17 +151,32 @@ pub fn manifests(app: &str, revision: &str, hex: &str, objects: usize) -> Subjec
     Subject { name: format!("manifests of {app}{at}"), digest: sha256(hex), size: None, annotations }
 }
 
-/// The SHA-256 (hex) of `objects`, each as canonical JSON (serde_json's maps are sorted), in the
+/// The SHA-256 (hex) of `objects`, each as canonical JSON (every object's keys sorted), in the
 /// order given: the caller sorts them (by kind, namespace and name).
 pub fn digest_of_objects(objects: &[Value]) -> String {
     use sha2::Digest as _;
     let mut h = sha2::Sha256::new();
     for o in objects {
-        let bytes = serde_json::to_vec(o).unwrap_or_default();
+        let bytes = serde_json::to_vec(&sorted(o)).unwrap_or_default();
         h.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
         h.update(&bytes);
     }
     super::chain::hex(&h.finalize())
+}
+
+/// `v` with every object's keys in sorted order, whatever order serde_json keeps a map's keys in: a
+/// build with its `preserve_order` (one crate of the build asking for it is enough) keeps them as
+/// inserted.
+fn sorted(v: &Value) -> Value {
+    match v {
+        Value::Object(m) => {
+            let mut keys: Vec<&String> = m.keys().collect();
+            keys.sort();
+            Value::Object(keys.into_iter().filter_map(|k| m.get(k).map(|x| (k.clone(), sorted(x)))).collect())
+        }
+        Value::Array(a) => Value::Array(a.iter().map(sorted).collect()),
+        other => other.clone(),
+    }
 }
 
 /// A statement of `body` about `subject`, following `follows`.
@@ -329,5 +344,14 @@ mod tests {
         assert_eq!(digest_of_objects(&[reordered, service]), d, "a map's keys in any order are one object");
         let m = manifests("shop/web", "4c1e2a", &d, 2);
         assert_eq!((m.name.as_str(), m.annotations.get("objects")), ("manifests of shop/web at 4c1e2a", Some(&Value::from(2))));
+    }
+
+    /// W27-R08: the objects' JSON is canonical whatever order serde_json keeps a map's keys in (a
+    /// build with its `preserve_order`, the workspace's, keeps them as inserted): every object's
+    /// keys sorted, at every depth.
+    #[test]
+    fn w27_r08_a_syncs_objects_are_hashed_with_their_keys_sorted() {
+        let o = serde_json::json!({"spec": {"replicas": 2, "selector": {}}, "kind": "Deployment", "metadata": {"name": "web", "labels": [{"z": 1, "a": 2}]}});
+        assert_eq!(serde_json::to_string(&sorted(&o)).unwrap_or_default(), r#"{"kind":"Deployment","metadata":{"labels":[{"a":2,"z":1}],"name":"web"},"spec":{"replicas":2,"selector":{}}}"#);
     }
 }
