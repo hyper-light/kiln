@@ -14,10 +14,29 @@ use serde_json::Value;
 use crate::convo::feed::Custodian;
 use crate::hub::Hub;
 
+/// Receipts waiting for the task that keeps them, at the most: past it, kiln is that far behind,
+/// and a batch's receipt is let go (said so), its hand-on unanswered.
+const RECEIPTS_MAX: usize = 1024;
+
 /// Gives the server's intake and its mirrors their custodians, once its own identity can sign.
+/// Called on the runtime: the intake's receipts are kept by a task of their own, so its thread
+/// never waits on them.
 pub fn install(hub: &Arc<Hub>) {
     if let Some(intake) = &hub.harness.feed {
-        intake.sign_with(Arc::new(Taker(Arc::downgrade(hub))));
+        let (tx, rx) = async_channel::bounded::<Receipt>(RECEIPTS_MAX);
+        let w = Arc::downgrade(hub);
+        crate::rt::spawn(async move {
+            while let Ok(r) = rx.recv().await {
+                let Some(hub) = w.upgrade() else { return };
+                // The runner's hand-on as the batch carried it, then kiln's receipt of what came.
+                kept(&hub, &r.given, &r.came_from).await;
+                match super::server_signed(&hub.pki, &r.receipt) {
+                    Ok(b) => kept(&hub, &b, "kiln").await,
+                    Err(e) => tracing::warn!(target: "kiln.custody", error = %format!("{e:#}"), "kiln's receipt of a conversation feed's batch couldn't be signed"),
+                }
+            }
+        });
+        intake.sign_with(Arc::new(Taker { hub: Arc::downgrade(hub), tx }));
     }
     if let Some(mirrors) = &hub.harness.copies {
         let w = Arc::downgrade(hub);
@@ -35,8 +54,19 @@ async fn kept(hub: &Hub, bundle: &Value, came_from: &str) {
     }
 }
 
-/// The server's intake of runners' stores (and of mirrors' copies sent back to restore its own).
-struct Taker(Weak<Hub>);
+/// The server's intake of runners' stores (and of mirrors' copies sent back to restore its own):
+/// its receipts go to the task [`install`] started.
+struct Taker {
+    hub: Weak<Hub>,
+    tx: async_channel::Sender<Receipt>,
+}
+
+/// A batch's records for that task: its runner's hand-on, kiln's receipt to sign, what it came over.
+struct Receipt {
+    given: Value,
+    receipt: Statement,
+    came_from: String,
+}
 
 impl Custodian for Taker {
     fn hand_on(&self, _thing: Subject) -> BoxFuture<'_, Option<String>> {
@@ -44,20 +74,14 @@ impl Custodian for Taker {
     }
 
     fn received(&self, machine: &str, hand_on: &str, thing: Subject) {
-        let (Some(hub), Ok(given)) = (self.0.upgrade(), serde_json::from_str::<Value>(hand_on)) else { return };
+        let (Some(hub), Ok(given)) = (self.hub.upgrade(), serde_json::from_str::<Value>(hand_on)) else { return };
         let Some(giver) = crate::runner::custody::giver_of(&given) else { return };
         let server = super::server_uri(&hub.pki.organization());
         let body = Body { from: Some(giver), why: "a batch of a runner's conversation store, taken into kiln's".into(), ..Body::new(Kind::Received, &server) };
         let receipt = Statement { subject: vec![thing], follows: vec![crate::runner::custody::digest_of(&given)], ..Statement::new(to_value(&body)) };
-        let came_from = format!("runner {machine}");
-        crate::rt::spawn(async move {
-            // The runner's hand-on as the batch carried it, then kiln's receipt of what came.
-            kept(&hub, &given, &came_from).await;
-            match super::server_signed(&hub.pki, &receipt) {
-                Ok(b) => kept(&hub, &b, "kiln").await,
-                Err(e) => tracing::warn!(target: "kiln.custody", error = %format!("{e:#}"), "kiln's receipt of a conversation feed's batch couldn't be signed"),
-            }
-        });
+        if self.tx.try_send(Receipt { given, receipt, came_from: format!("runner {machine}") }).is_err() {
+            tracing::warn!(target: "kiln.custody", %machine, "kiln is behind keeping its receipts of conversation feeds' batches: this one is let go, its hand-on unanswered");
+        }
     }
 }
 
