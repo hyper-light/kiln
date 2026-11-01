@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { AgentInfo } from "../src/api/harness.ts";
-import { briefsOf, subagentRows, subagentTree, threadHref, treePaths, type Brief } from "../src/views/harness/subagent-tree.ts";
+import { briefsOf, stepLive, subagentRows, subagentTree, threadHref, treePaths, type Brief } from "../src/views/harness/subagent-tree.ts";
 
 const agent = (id: string, rest: Partial<AgentInfo> = {}): AgentInfo => ({
   id,
@@ -152,4 +152,12 @@ test("a live state's tasks as the list has them: only subagents, with what they'
     { id: "sh", description: "npm run dev", status: "running", started: 2, class: "shell" },
   ]);
   assert.deepEqual(b, [{ id: "s", tool_id: undefined, description: "Audit", status: "running", parent_task: undefined, started: 1, ended: undefined, last_tool: "Bash", summary: "Running the tests" }]);
+});
+
+test("the agent at a plan's step, live: what it's doing since its turn started, or what it asks; its thread and the session that answers", () => {
+  const at = agent("s1", { doing: "Running cargo test", turn_started: 500 });
+  assert.deepEqual(stepLive(at, "/agents/lead?task=s1"), { line: "Running cargo test", ask: undefined, started: 500, href: "/agents/lead?task=s1", session: "s1" });
+  const ap = { id: "ap", tool: "shell" as const, tool_name: "Bash", title: "cargo test catch_up", at: 5 };
+  const asking = agent("s2", { status: "waiting", approvals: [ap] });
+  assert.deepEqual(stepLive(asking, "/agents/lead?task=s2"), { line: "Bash: cargo test catch_up", ask: ap, started: 0, href: "/agents/lead?task=s2", session: "s2" });
 });

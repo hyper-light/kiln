@@ -11,6 +11,7 @@ import type { AgentInfo, Approval, ApprovalBrief, SubagentBrief, Task } from "@/
 import { agentLabel, plain } from "./derive";
 import { standOf } from "./mission-rows";
 import { askWords, isSubagent, kilnSubagentsOf } from "./tasks";
+import type { StepLive } from "./goal-plan-layout";
 
 /** Its machine, as Mission control's rows name it (parts.tsx's `machineName`; that module brings the page's styles with it). */
 const machineName = (target: string) => (target === "local" ? "server" : target.replace(/^agent:/, ""));
@@ -155,6 +156,12 @@ function kilnLine(a: AgentInfo, stand: NodeStand): string {
   if (stand === "failed" || stand === "stopped") return a.exit?.error ?? "";
   if (stand === "offline") return "Its machine is offline";
   return a.doing || a.activity || "";
+}
+
+/** An agent at a plan's step, as the step shows it (goal-plan-layout.ts `StepLive`): what it's doing or asks, since when, and where its thread opens. */
+export function stepLive(a: AgentInfo, href: string): StepLive {
+  const stand = kilnStand(a);
+  return { line: kilnLine(a, stand), ask: stand === "needs" ? a.approvals[0] : undefined, started: a.turn_started ?? a.created_at, href, session: a.id };
 }
 
 /** Where a subagent's thread opens: its agent's page, it shown there (`own`: a kiln subagent's own page, not redirected into its agent's). */
