@@ -255,6 +255,17 @@ async fn judge(d: &Deploy, r: &Release, env: &Environment, app: &App, checks: &[
                 Some(x) => {
                     evidence.insert("release".into(), json!(x.release));
                     evidence.insert("since".into(), json!(x.since));
+                    // What runs there by its pods' custody (docs/ci.md W27-R08, R11): where this
+                    // environment requires a verified chain, one whose pods run what wasn't deployed
+                    // there hasn't run it.
+                    if let Some(verdict) = upstream_custody(app, upstream).await {
+                        evidence.insert("custody".into(), serde_json::to_value(&verdict).unwrap_or(Value::Null));
+                        if let (Some(true), crate::cd::custody::Verdict::Broken { why }) = (g.require_chain, &verdict) {
+                            let why = format!("{version} runs in {upstream}, but not as it was deployed there: {why}");
+                            results.push(result(&gate, false, why.clone(), Value::Object(evidence)));
+                            return Ok(Verdict::Refuse { results, why });
+                        }
+                    }
                     results.push(result(&gate, true, format!("{version} runs in {upstream} (release {})", x.release), Value::Object(evidence)));
                     if let Some(s) = soak
                         && now - x.since < s
@@ -435,6 +446,17 @@ struct Ran {
     version: Option<String>,
     artifacts: BTreeMap<String, Artifact>,
     since: i64,
+}
+
+/// Whether the pods of `app`'s KilnCD app in environment `upstream` run what its deploy handed on
+/// there (docs/ci.md W27-R08), as last looked at; none where KilnCD doesn't deploy it.
+async fn upstream_custody(app: &App, upstream: &str) -> Option<crate::cd::custody::Verdict> {
+    let cd = crate::cd::get()?;
+    let id = super::kilncd::app_id(app, upstream);
+    if !cd.apps.read().contains_key(&id) {
+        return None;
+    }
+    Some(crate::cd::custody::verdict(&cd, &id, false).await)
 }
 
 /// An upstream environment of this server's.

@@ -637,7 +637,7 @@ pub fn giver_of(bundle: &Value) -> Option<String> {
 
 /// The receipt by which `holder` came to hold `thing`, its newest of it: one it signed, or kiln's
 /// for it (a person with no key on the device that asked). None if kiln has none.
-async fn held_with(store: &Store, org: &str, holder: &str, thing: &statement::Subject) -> anyhow::Result<Option<String>> {
+pub(crate) async fn held_with(store: &Store, org: &str, holder: &str, thing: &statement::Subject) -> anyhow::Result<Option<String>> {
     let Some((algorithm, hex)) = thing.digest.iter().next().map(|(a, h)| (a.clone(), h.clone())) else { return Ok(None) };
     let rows: Vec<(String, String, String)> = store
         .call(move |c| {
