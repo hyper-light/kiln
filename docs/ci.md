@@ -8493,10 +8493,11 @@ a time. The design was agreed on a live mock built on Ship's own prototype
 - **W26-R01 Changes in Ship, by commit.** Ship's unit stays the commit (or tag). A stacked diff is
   one commit, its row carrying the diff's review; a branch pull request (kiln's change requests and
   hosts' pull requests, W23-R06) is its commits, its head commit's row carrying the request's review
-  and its other commits folded under it. A new revision's commit supersedes the one it replaces, as
-  Ship's rows already do, and after it lands the commit carries on. Rows, glyphs, stand words,
-  author lines and paired actions are Ship's, with nothing special-cased; Ship's per-commit read
-  model grows to review: one read model, not two.
+  and its other commits folded under it (since W26-R29, Ship's rows are repositories, and a change's
+  commits are lines among its repository's commits). A new revision's commit supersedes the one it
+  replaces, as Ship's rows already do, and after it lands the commit carries on. Rows, glyphs, stand
+  words, author lines and paired actions are Ship's, with nothing special-cased; Ship's per-commit
+  read model grows to review: one read model, not two.
 - **W26-R02 Review is the first stage.** Ship's journey strip reads review, land, checks, build,
   staging, production, replant. Review states (needs you, agent fixing, waiting on others,
   conflicts, approved) map onto Ship's stands and its needs-you-first order. Ship's facets gain host
