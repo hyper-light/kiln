@@ -21,8 +21,9 @@ agents: Array<string>,
  * "resume", "attachments", "images", "overrides", "switch_harness" (a model of another
  * harness: `Command::SetModel::kind`), "own_edits" (`Command::OwnEdits`: the session answers
  * it whatever its harness), "limits" (a person's pause and what each may do hold at its own
- * subagents' tool calls: `Command::Pause`, `Command::Perms` with a task), "web_whole" (its web
- * search is set for the whole agent, allowed or off: no call of it can be held or asked).
+ * subagents' tool calls: `Command::Pause`, `Command::Perms` with a task), "limits_asked" (they
+ * hold only at the calls it asks about before making them: an ACP agent's), "web_whole" (its
+ * web search is set for the whole agent, allowed or off: no call of it can be held or asked).
  */
 features: Array<string>, 
 /**
