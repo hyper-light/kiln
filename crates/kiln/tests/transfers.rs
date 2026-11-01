@@ -1338,6 +1338,480 @@ fn peers_objects(dir: &Path, port: u16, admin: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What kiln has of the relays' streams (`GET /api/custody/relays`), its records no receipt
+/// answered `lapse` seconds on each recorded as a break naming its relay.
+fn relays(port: u16, admin: &str, lapse: i64) -> anyhow::Result<Value> {
+    let (st, body) = http(port, "GET", &format!("/api/custody/relays?lapse={lapse}"), admin, None)?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    Ok(serde_json::from_str(&body)?)
+}
+
+/// Relay `relay`'s streams (by a part of its identity's URI) whose names start `stream`: how many
+/// records kiln has on them, and how many numbers are missing between them.
+fn stream_counts(v: &Value, relay: &str, stream: &str) -> (u64, u64) {
+    let of: Vec<&Value> = v.get("streams").and_then(Value::as_array).into_iter().flatten().filter(|s| field(s, "relay").contains(relay) && field(s, "stream").starts_with(stream)).collect();
+    let n = |s: &&Value, k: &str| s.get(k).and_then(Value::as_u64).unwrap_or_default();
+    (of.iter().map(|s| n(s, "records")).sum(), of.iter().map(|s| n(s, "missing")).sum())
+}
+
+/// The breaks kiln recorded naming a relay (by a part of its identity's URI).
+fn relay_breaks(port: u16, admin: &str, relay: &str) -> anyhow::Result<Vec<Value>> {
+    let (st, body) = http(port, "GET", "/api/custody/breaks", admin, None)?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    Ok(serde_json::from_str::<Value>(&body)?.get("breaks").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().filter(|b| field(b, "relay").contains(relay)).collect())
+}
+
+/// Kiln's receipts of what a relay passed on to `taker` (by a part of its URI), newest first.
+fn receipts_by(dir: &Path, taker: &str) -> anyhow::Result<Vec<String>> {
+    let db = rusqlite::Connection::open(dir.join("data/kiln.db"))?;
+    let mut q = db.prepare("SELECT r.digest FROM custody r JOIN custody_follows f ON f.record = r.digest JOIN custody p ON p.digest = f.follows WHERE r.kind = 'received' AND p.kind = 'passed-on' AND r.custodian LIKE ?1 ORDER BY r.taken_at DESC")?;
+    let rows = q.query_map([format!("%{taker}%")], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+    Ok(rows)
+}
+
+/// The kinds and custodians of the hops of the chain walked from record `digest`, once it walks
+/// unbroken.
+fn walked_hops(port: u16, admin: &str, digest: &str) -> anyhow::Result<Vec<(String, String)>> {
+    let (st, body) = http(port, "GET", &format!("/api/custody?digest={digest}"), admin, None)?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let v: Value = serde_json::from_str(&body)?;
+    anyhow::ensure!(v.get("unbroken") == Some(&json!(true)), "{digest}'s chain doesn't walk: {v}");
+    Ok(v.get("hops").and_then(Value::as_array).into_iter().flatten().map(|h| (field(h, "kind").to_owned(), field(h, "custodian").to_owned())).collect())
+}
+
+/// Until runner `from`'s reach (in `dir`) has runner `to` taking links: a link opened sooner is
+/// refused before kiln's relay passes a frame on.
+fn reach_ready(dir: &Path, from: &str, to: &str) -> anyhow::Result<()> {
+    use kiln::reach::local::{Client, Ev, Req};
+    let asked = || -> anyhow::Result<Option<()>> {
+        let mut c = Client::connect(&kiln::reach::local::path(from, &dir.join(format!("{from}-state"))))?;
+        c.send(&Req::Runners { want: Some(to.to_owned()) })?;
+        loop {
+            match c.event()? {
+                Some(Ev::Runners(json)) => {
+                    let v: Value = serde_json::from_str(&json)?;
+                    let named = format!("\"{to}\"");
+                    return Ok(v.get("runners").and_then(Value::as_array).into_iter().flatten().any(|c| c.to_string().contains(&named)).then_some(()));
+                }
+                Some(Ev::Error(_)) | None => return Ok(None),
+                Some(_) => {}
+            }
+        }
+    };
+    until(Duration::from_secs(90), || Ok(asked().ok().flatten())).map_err(|e| anyhow::anyhow!("{to} taking {from}'s reach links: {e}: {}", reach_said(dir)))
+}
+
+/// What the server and the runner processes in `dir` logged about reach links and relays: why a
+/// test of them didn't go through.
+fn reach_said(dir: &Path) -> String {
+    let mut names: Vec<std::path::PathBuf> = std::fs::read_dir(dir).map(|d| d.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "log")).collect()).unwrap_or_default();
+    names.sort();
+    let logs: Vec<String> = names
+        .iter()
+        .map(|n| {
+            let text = std::fs::read_to_string(n).unwrap_or_default();
+            // Not a busy receiver's port, said every 5 s.
+            let lines: Vec<&str> = text.lines().filter(|l| ["reach", "relay", "frames", "custody", "panicked", "WARN", "ERROR"].iter().any(|w| l.contains(w)) && !l.contains("port is held")).collect();
+            format!("{}:\n{}", n.display(), lines.get(lines.len().saturating_sub(80)..).unwrap_or(&[]).join("\n"))
+        })
+        .collect();
+    logs.join("\n")
+}
+
+/// Asks kiln `name` as agent session `id`'s MCP server asks it, through runner `runner`'s socket
+/// (in `dir`): its answer, or why not.
+fn ask_as(dir: &Path, runner: &str, id: &str, name: &str, input: Value) -> anyhow::Result<String> {
+    use kiln::reach::local::{Client, Ev, Req};
+    let mut c = Client::connect(&kiln::reach::local::path(runner, &dir.join(format!("{runner}-state"))))?;
+    c.send(&Req::Ask { json: json!({"op": "call", "session": id, "name": name, "input": input}).to_string() })?;
+    Ok(match c.event()? {
+        Some(Ev::Answer(a)) => a,
+        Some(Ev::Error(e)) => e,
+        other => format!("{other:?}"),
+    })
+}
+
+/// A runner `name` connected to the server at `port`, its own identity certified, with a session
+/// open on it whose acts are signed (its identity at its first epoch certified): the runner and
+/// the session.
+fn signing_session(dir: &Path, port: u16, admin: &str, name: &str, chaos: Option<&str>) -> anyhow::Result<(agents::Runner, String)> {
+    let (r, log) = agents::runner_with(dir, port, name, chaos, TALK, &[])?;
+    agents::connected(port, admin, name, &log, Duration::from_secs(120))?;
+    until(Duration::from_secs(60), || {
+        let (st, body) = http(port, "GET", "/api/identities?kind=runner", admin, None)?;
+        anyhow::ensure!(st == 200, "{st} {body}");
+        let v: Value = serde_json::from_str(&body)?;
+        let mark = format!("/machine/{name}/");
+        Ok(v.get("identities").and_then(Value::as_array).is_some_and(|l| l.iter().any(|i| field(i, "subject").contains(&mark) && !field(i, "verified").is_empty())).then_some(()))
+    })?;
+    let id = agents::open_session(port, admin, name, &dir.join("work-here"), Duration::from_secs(60))?;
+    first_epoch(port, admin, &id)?;
+    Ok((r, id))
+}
+
+/// W27-R08's relays (the Transfers plan's step 13): a runner relays its agent's calls to kiln. Each
+/// act goes with the runner's record of passing it on, numbered on its stream, and kiln's receipt
+/// follows; a call's chain walks from kiln's receipt to the runner's record, which the agent's own
+/// act began. No call passed on without its record: the stream holds one per call, none missing,
+/// none unanswered.
+#[test]
+fn w27_r08_relays_a_runners_relay_of_its_agents_calls() -> anyhow::Result<()> {
+    const CALLS: u64 = 4;
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options::default())?;
+    let (port, admin) = (s.port, s.admin.as_str());
+    let _harnesses = Harnesses::new(&dir.path().join("work-here"), &dir.path().join("home"))?;
+    let (_a, id) = signing_session(dir.path(), port, admin, "box-a", None)?;
+    for _ in 0..CALLS {
+        let a = ask_as(dir.path(), "box-a", &id, "goals.get", json!({"agent": id}))?;
+        anyhow::ensure!(!a.contains("\"error\""), "the call answered: {a}");
+    }
+    let v = until(Duration::from_secs(60), || {
+        let v = relays(port, admin, 0)?;
+        Ok((stream_counts(&v, "/machine/box-a/", "calls to kiln") == (CALLS, 0) && v.get("unanswered").and_then(Value::as_array).is_some_and(Vec::is_empty)).then_some(v))
+    })
+    .map_err(|e| anyhow::anyhow!("{e}: {}", relays(port, admin, 0).unwrap_or_default()))?;
+    assert!(v.get("unanswered").and_then(Value::as_array).is_some_and(Vec::is_empty), "each answered by kiln's receipt: {v}");
+    let receipts = receipts_by(dir.path(), "/server")?;
+    assert_eq!(u64::try_from(receipts.len())?, CALLS, "a receipt of kiln's for each call");
+    let hops = walked_hops(port, admin, receipts.first().map(String::as_str).unwrap_or_default())?;
+    assert!(matches!(hops.as_slice(), [(r, server), (p, runner)] if r == "received" && server.ends_with("/server") && p == "passed-on" && runner.contains("/machine/box-a/")), "{hops:?}");
+    let (server, runner) = (std::fs::read_to_string(dir.path().join("server.log")).unwrap_or_default(), std::fs::read_to_string(dir.path().join("box-a.log")).unwrap_or_default());
+    assert!(!server.contains("passed this act on with no record") && !runner.contains("passed on to kiln unrecorded"), "no act relayed without its record");
+    assert_eq!(relay_breaks(port, admin, "/machine/box-a/")?, Vec::<Value>::new(), "each passed on unchanged");
+    Ok(())
+}
+
+/// W27-R08's relays: runners that drop, swap or alter every second act of their agents' they pass on
+/// (test builds' faults). kiln refuses the altered and the swapped, saying why, and records each as
+/// a break naming the runner; a dropped one never comes, and the next shows the gap, a break naming
+/// the runner too, which a walk through that runner's stream says again.
+#[cfg(feature = "chaos")]
+#[test]
+fn w27_r08_relays_that_drop_swap_or_alter_an_agents_call_are_caught() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options::default())?;
+    let (port, admin) = (s.port, s.admin.as_str());
+    let _harnesses = Harnesses::new(&dir.path().join("work-here"), &dir.path().join("home"))?;
+    for fault in ["alter", "swap", "drop"] {
+        let name = format!("box-{fault}");
+        let (_r, id) = signing_session(dir.path(), port, admin, &name, Some(&format!("relay_calls={fault}")))?;
+        // Each act another than the one before (a swap of the same act would be none): calls 2 and
+        // 4 are agents.get, between goals.gets.
+        let op = |i: usize| if i.is_multiple_of(2) { "goals.get" } else { "agents.get" };
+        let answers: Vec<String> = (0..5).map(|i| ask_as(dir.path(), &name, &id, op(i), json!({"agent": id}))).collect::<anyhow::Result<_>>()?;
+        let refused: Vec<&String> = answers.iter().filter(|a| a.contains("refused")).collect();
+        let relay = format!("/machine/{name}/");
+        let breaks = until(Duration::from_secs(60), || {
+            let b = relay_breaks(port, admin, &relay)?;
+            Ok((b.len() >= 2).then_some(b))
+        })
+        .map_err(|e| anyhow::anyhow!("{fault}: {e}: answers {answers:?}"))?;
+        let kinds: Vec<&str> = breaks.iter().map(|b| field(b, "kind")).collect();
+        match fault {
+            "alter" | "swap" => {
+                assert_eq!(refused.len(), 2, "{fault}: calls 2 and 4 refused where kiln took them: {answers:?}");
+                let kind = if fault == "alter" { "changed" } else { "swapped" };
+                assert!(kinds.iter().filter(|k| **k == kind).count() >= 2, "{fault}: {kinds:?}");
+                assert!(breaks.iter().filter(|b| field(b, "kind") == kind).all(|b| field(b, "refused").contains("agents.get")), "{fault}: what was refused named: {breaks:?}");
+            }
+            _ => {
+                assert!(answers.get(1).is_some_and(|a| a.contains("dropped")) && answers.get(3).is_some_and(|a| a.contains("dropped")), "drop: calls 2 and 4 never reached kiln: {answers:?}");
+                assert!(answers.get(2).is_some_and(|a| !a.contains("error")), "drop: the call after a gap is taken: {answers:?}");
+                assert!(kinds.iter().filter(|k| **k == "dropped").count() >= 2, "drop: {kinds:?}");
+                assert!(breaks.iter().any(|b| field(b, "detail").contains("record 2 on calls to kiln") && field(b, "detail").contains("never came")), "drop: {breaks:?}");
+                // A walk through that stream says so too: its records are numbered with a gap.
+                let v = relays(port, admin, 3600)?;
+                let (records, missing) = stream_counts(&v, &relay, "calls to kiln");
+                assert_eq!((records, missing), (3, 2), "drop: 3 records kept, 2 numbers never came: {v}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// W27-R08's relays: kiln relays one agent's words to another's runner. The sender's act passes
+/// through unchanged, signed end to end: its runner records passing it on to kiln, kiln records
+/// passing it on to the recipient's runner process, numbered on its stream to it, and that process
+/// checks the act and both records before its session takes the words, then signs its receipt. The
+/// words' chain walks from that receipt through both relays.
+#[test]
+fn w27_r08_relays_kilns_relay_of_an_agents_words() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options::default())?;
+    let (port, admin) = (s.port, s.admin.as_str());
+    let _harnesses = Harnesses::new(&dir.path().join("work-here"), &dir.path().join("home"))?;
+    let (_a, a) = signing_session(dir.path(), port, admin, "box-a", None)?;
+    let (_b, b) = signing_session(dir.path(), port, admin, "box-b", None)?;
+    let said = ask_as(dir.path(), "box-a", &a, "agents.send", json!({"agent": b, "text": "the build is green"}))?;
+    anyhow::ensure!(said.contains("\"sent\":true"), "{said}");
+    let receipt = until(Duration::from_secs(60), || Ok(receipts_by(dir.path(), "/machine/box-b/")?.into_iter().next()))?;
+    let hops = walked_hops(port, admin, &receipt)?;
+    let kinds: Vec<(&str, bool)> = hops.iter().map(|(k, c)| (k.as_str(), c.ends_with("/server"))).collect();
+    assert_eq!(kinds, vec![("received", false), ("passed-on", true), ("passed-on", false)], "box-b's receipt, kiln's record, box-a's: {hops:?}");
+    assert!(hops.first().is_some_and(|(_, c)| c.contains("/machine/box-b/")) && hops.get(2).is_some_and(|(_, c)| c.contains("/machine/box-a/")), "{hops:?}");
+    let v = relays(port, admin, 0)?;
+    assert_eq!(stream_counts(&v, "/server", "words to "), (1, 0), "kiln's record of the words, numbered: {v}");
+    assert!(v.get("unanswered").and_then(Value::as_array).is_some_and(Vec::is_empty), "{v}");
+    assert_eq!(relay_breaks(port, admin, "kiln://")?, Vec::<Value>::new(), "each passed on unchanged");
+    Ok(())
+}
+
+/// W27-R08's relays: a faulty relay of agents' words at kiln (test builds' faults): every second
+/// message's words changed after kiln recorded passing them on, another's swapped in, or dropped.
+/// The changed and the swapped are refused by the recipient's runner, its session never given
+/// them, and the break recorded naming kiln's server; the dropped is kiln's record no receipt
+/// follows, recorded so.
+#[cfg(feature = "chaos")]
+#[test]
+fn w27_r08_relays_that_drop_swap_or_alter_an_agents_words_are_caught() -> anyhow::Result<()> {
+    for fault in ["alter", "swap", "drop"] {
+        let dir = tempfile::tempdir()?;
+        let spec = format!("relay_words={fault}");
+        let s = common::start_env(dir.path(), &Options::default(), false, &[("KILN_CHAOS", spec.as_str())])?;
+        let (port, admin) = (s.port, s.admin.as_str());
+        let _harnesses = Harnesses::new(&dir.path().join("work-here"), &dir.path().join("home"))?;
+        let (_a, a) = signing_session(dir.path(), port, admin, "box-a", None)?;
+        let (_b, b) = signing_session(dir.path(), port, admin, "box-b", None)?;
+        let first = ask_as(dir.path(), "box-a", &a, "agents.send", json!({"agent": b, "text": "the build is green"}))?;
+        anyhow::ensure!(first.contains("\"sent\":true"), "{fault}: {first}");
+        until(Duration::from_secs(60), || Ok(receipts_by(dir.path(), "/machine/box-b/")?.into_iter().next()))?;
+        let second = ask_as(dir.path(), "box-a", &a, "agents.send", json!({"agent": b, "text": "the deploy is done"}))?;
+        // A while for the recipient's receipt or its word of a break; then kiln's records no
+        // receipt answers are recorded as breaks, as kiln does once they lapse.
+        std::thread::sleep(Duration::from_secs(15));
+        let (st, body) = http(port, "POST", "/api/custody/relays?lapse=10", admin, None)?;
+        anyhow::ensure!(st == 200, "{st} {body}");
+        let breaks = until(Duration::from_secs(60), || {
+            let b = relay_breaks(port, admin, "/server")?;
+            Ok((!b.is_empty()).then_some(b))
+        })
+        .map_err(|e| anyhow::anyhow!("{fault}: {e}: the second said {second}"))?;
+        let kind = match fault {
+            "alter" => "changed",
+            "swap" => "swapped",
+            _ => "no-receipt",
+        };
+        assert!(breaks.iter().any(|b| field(b, "kind") == kind), "{fault}: a break naming kiln's server: {breaks:?}");
+        if fault == "drop" {
+            assert!(second.contains("\"sent\":true"), "dropped on the way, as said sent: {second}");
+        } else {
+            assert!(second.contains("isn't valid") && !second.contains("\"sent\":true"), "{fault}: refused where its session would take it: {second}");
+            assert!(breaks.iter().any(|b| field(b, "kind") == kind && field(b, "refused").contains("message ") && field(b, "detail").contains("runner box-b")), "{fault}: {breaks:?}");
+        }
+    }
+    Ok(())
+}
+
+/// W27-R08's relays: kiln relays a reach link's frames between two runners, unread: it records
+/// each run of them by the chain of their ciphertext's digests, numbered on its stream to each end,
+/// and each end answers with its receipt of the frames as they came. Every frame passed on is in a
+/// run kiln recorded, each answered; a run's chain walks from the receipt to kiln's record.
+#[test]
+fn w27_r08_relays_kilns_relay_of_a_reach_links_frames() -> anyhow::Result<()> {
+    use kiln::reach::local::{Client, Ev, Req, RunReq};
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options::default())?;
+    let (port, admin) = (s.port, s.admin.as_str());
+    let (_a, log_a) = agents::runner_with(dir.path(), port, "box-a", None, TALK, &[])?;
+    let (_b, log_b) = agents::runner_with(dir.path(), port, "box-b", None, TALK, &[])?;
+    for (name, log) in [("box-a", &log_a), ("box-b", &log_b)] {
+        agents::connected(port, admin, name, log, Duration::from_secs(120))?;
+    }
+    reach_ready(dir.path(), "box-a", "box-b")?;
+    let ran = until(Duration::from_secs(90), || {
+        let mut c = Client::connect(&kiln::reach::local::path("box-a", &dir.path().join("box-a-state")))?;
+        c.send(&Req::Run(Box::new(RunReq { target: "box-b".into(), command: "echo relayed by kiln".into(), ..RunReq::default() })))?;
+        let mut out = Vec::new();
+        loop {
+            match c.event()? {
+                Some(Ev::Exit { .. }) => return Ok(Some(String::from_utf8_lossy(&out).into_owned())),
+                Some(Ev::Output { data, .. }) => out.extend(data),
+                Some(Ev::Error(_)) | None => return Ok(None),
+                Some(_) => {}
+            }
+        }
+    })?;
+    assert!(ran.contains("relayed by kiln"), "{ran}");
+    // kiln records a run within 10 s of its first frame; each end's receipt comes at its next beat.
+    // A run recorded since may be a beat ahead of its receipt: those 20 s old or more are answered.
+    until(Duration::from_secs(90), || Ok((!receipts_by(dir.path(), "/machine/box-b/")?.is_empty() && !receipts_by(dir.path(), "/machine/box-a/")?.is_empty()).then_some(())))
+        .map_err(|e| anyhow::anyhow!("{e}: each end's receipt: {}", relays(port, admin, 20).unwrap_or_default()))?;
+    let v = until(Duration::from_secs(90), || {
+        let v = relays(port, admin, 20)?;
+        let (to_b, to_a) = (stream_counts(&v, "/server", "reach link "), v.get("unanswered").and_then(Value::as_array).map_or(0, Vec::len));
+        Ok((to_b.0 >= 2 && to_b.1 == 0 && to_a == 0).then_some(v))
+    })
+    .map_err(|e| anyhow::anyhow!("{e}: {}", relays(port, admin, 20).unwrap_or_default()))?;
+    let streams: Vec<&str> = v.get("streams").and_then(Value::as_array).into_iter().flatten().map(|s| field(s, "stream")).filter(|s| s.starts_with("reach link ")).collect();
+    assert!(streams.iter().any(|s| s.contains("/machine/box-a/")) && streams.iter().any(|s| s.contains("/machine/box-b/")), "a stream to each end: {streams:?}");
+    let receipt = receipts_by(dir.path(), "/machine/box-b/")?.into_iter().next().ok_or_else(|| anyhow::anyhow!("no receipt by box-b"))?;
+    let hops = walked_hops(port, admin, &receipt).map_err(|e| anyhow::anyhow!("{e}: {}", reach_said(dir.path())))?;
+    assert!(matches!(hops.as_slice(), [(r, b), (p, server)] if r == "received" && b.contains("/machine/box-b/") && p == "passed-on" && server.ends_with("/server")), "{hops:?}");
+    // Each run's receipt names the frames as kiln's relay passed them on: no break.
+    assert_eq!(relay_breaks(port, admin, "/server")?, Vec::<Value>::new(), "each passed on unchanged");
+    Ok(())
+}
+
+/// W27-R08's relays: kiln's relay of a reach link's frames, faulty (a test build's: frames 2, 4 …
+/// each way dropped, swapped or altered). The link's end can't read them, so the run fails there;
+/// and its receipt of the frames as they came differs from kiln's record of them, a break recorded
+/// naming kiln's server.
+#[cfg(feature = "chaos")]
+#[test]
+fn w27_r08_relays_that_drop_swap_or_alter_a_reach_links_frames_are_caught() -> anyhow::Result<()> {
+    use kiln::reach::local::{Client, Ev, Req, RunReq};
+    for fault in ["alter", "swap", "drop"] {
+        let dir = tempfile::tempdir()?;
+        let spec = format!("relay_frames={fault}");
+        let s = common::start_env(dir.path(), &Options::default(), false, &[("KILN_CHAOS", spec.as_str())])?;
+        let (port, admin) = (s.port, s.admin.as_str());
+        let (_a, log_a) = agents::runner_with(dir.path(), port, "box-a", None, TALK, &[])?;
+        let (_b, log_b) = agents::runner_with(dir.path(), port, "box-b", None, TALK, &[])?;
+        for (name, log) in [("box-a", &log_a), ("box-b", &log_b)] {
+            agents::connected(port, admin, name, log, Duration::from_secs(120))?;
+        }
+        reach_ready(dir.path(), "box-a", "box-b")?;
+        // A run whose link failed before kiln's relay passed a frame of it on (refused on the way)
+        // goes again: kiln records a run of frames within 10 s of its first, and its last as the
+        // link closes.
+        for tries in 1.. {
+            let mut c = Client::connect(&kiln::reach::local::path("box-a", &dir.path().join("box-a-state")))?;
+            c.send(&Req::Run(Box::new(RunReq { target: "box-b".into(), command: "echo relayed by kiln".into(), ..RunReq::default() })))?;
+            // Its events, on their own: a link that stalls (a frame dropped) ends only as its
+            // handshake is given up.
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let exited = loop {
+                    match c.event() {
+                        Ok(Some(Ev::Exit { .. })) => break true,
+                        Ok(Some(Ev::Error(_)) | None) | Err(_) => break false,
+                        Ok(Some(_)) => {}
+                    }
+                };
+                let _ = tx.send(exited);
+            });
+            let exited = rx.recv_timeout(Duration::from_secs(240)).unwrap_or(false);
+            assert!(!exited, "{fault}: a link whose frames changed on the way can't be read: the run never went");
+            let passed = until(Duration::from_secs(40), || Ok(relays(port, admin, 0).ok().filter(|v| stream_counts(v, "/server", "reach link ").0 > 0)));
+            if passed.is_ok() {
+                break;
+            }
+            anyhow::ensure!(tries < 3, "{fault}: kiln's relay passed no frame of {tries} runs' links on: {}", reach_said(dir.path()));
+        }
+        let breaks = until(Duration::from_secs(90), || {
+            let (st, body) = http(port, "POST", "/api/custody/relays?lapse=20", admin, None)?;
+            anyhow::ensure!(st == 200, "{st} {body}");
+            let b = relay_breaks(port, admin, "/server")?;
+            Ok(b.iter().any(|b| matches!(field(b, "kind"), "changed" | "no-receipt")).then_some(b))
+        })
+        .map_err(|e| {
+            let (_, all) = http(port, "GET", "/api/custody/breaks", admin, None).unwrap_or_default();
+            anyhow::anyhow!("{fault}: {e}: relays {}; breaks {all}; {}", relays(port, admin, 0).unwrap_or_default(), reach_said(dir.path()))
+        })?;
+        assert!(breaks.iter().any(|b| field(b, "detail").contains("reach link")), "{fault}: the break names the link's frames: {breaks:?}");
+    }
+    Ok(())
+}
+
+/// W27-R08's relays: blue/green's old build forwards kiln's frames to the new one. Another agent's
+/// words keep coming to a session as its runner is upgraded; those that reach the old build once it
+/// has handed everything over go on to the new build, each with the old build's record of passing
+/// the sender's act on (following kiln's record of it), numbered on its stream to the new build,
+/// which checks the act and every record before its session takes the words, and signs its
+/// receipt. In a test build the runner tells kiln everything three seconds late (`delay`), so kiln
+/// goes on sending the words to the old build a while after it hands the session over, whatever the
+/// timing. Every frame of signed words forwarded has its record, none missing, each answered. With
+/// the old build faulty (a test build's `relay_forward`: every second such frame dropped,
+/// swapped for the one before, or altered), the new build refuses each not as recorded, and sees
+/// the gap a dropped one leaves; kiln records each break naming the old build.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "needs a release build: an upgrade downloads the server's own kiln, and a debug one is larger than kiln serves (updates::MAX_BINARY)")]
+fn w27_r08_relays_blue_greens_forwarder() -> anyhow::Result<()> {
+    let faults: &[Option<&str>] = if cfg!(feature = "chaos") { &[None, Some("relay_forward=alter"), Some("relay_forward=swap"), Some("relay_forward=drop")] } else { &[None] };
+    for fault in faults {
+        let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))?;
+        let s = start(dir.path(), &Options::default())?;
+        let (port, admin) = (s.port, s.admin.as_str());
+        let _harnesses = Harnesses::new(&dir.path().join("work-here"), &dir.path().join("home"))?;
+        let before_build = dir.path().join("kiln-before");
+        let mut bytes = std::fs::read(env!("CARGO_BIN_EXE_kiln"))?;
+        bytes.push(0);
+        std::fs::write(&before_build, bytes)?;
+        std::fs::set_permissions(&before_build, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
+        let spec = [cfg!(feature = "chaos").then_some("delay=3s"), *fault].into_iter().flatten().collect::<Vec<_>>().join(",");
+        let env: Vec<(&str, &str)> = (!spec.is_empty()).then_some(("KILN_CHAOS", spec.as_str())).into_iter().collect();
+        let (_box_a, log) = supervised(dir.path(), port, "box-a", &before_build, &env)?;
+        agents::connected(port, admin, "box-a", &log, Duration::from_secs(60))?;
+        let a = agents::open_session(port, admin, "box-a", &dir.path().join("work-here"), Duration::from_secs(60))?;
+        first_epoch(port, admin, &a)?;
+        let (_box_b, b) = signing_session(dir.path(), port, admin, "box-b", None)?;
+        // b's words to a, from eight senders at once (each waits for kiln to deliver its words), every
+        // tenth of a second, while a's runner is upgraded.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let words: Vec<_> = (0..8u32)
+            .map(|t| {
+                let (sending, home, (to, from)) = (std::sync::Arc::clone(&stop), dir.path().to_path_buf(), (a.clone(), b.clone()));
+                std::thread::spawn(move || {
+                    let mut n = 0u32;
+                    while !sending.load(std::sync::atomic::Ordering::Relaxed) {
+                        n += 1;
+                        let _ = ask_as(&home, "box-b", &from, "agents.send", json!({"agent": to, "text": format!("message {t}.{n} as its runner is upgraded")}));
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                })
+            })
+            .collect();
+        let (st, body) = http(port, "POST", "/api/updates/runners/box-a", admin, None)?;
+        anyhow::ensure!(st == 202, "{st} {body}");
+        let job = serde_json::from_str::<Value>(&body)?.get("id").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let done = until(Duration::from_secs(300), || {
+            let (_, j) = http(port, "GET", &format!("/api/updates/jobs/{job}"), admin, None)?;
+            let v: Value = serde_json::from_str(&j).unwrap_or_default();
+            Ok(matches!(field(&v, "state"), "done" | "failed" | "succeeded").then_some(v))
+        });
+        std::thread::sleep(Duration::from_secs(5));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for w in words {
+            let _ = w.join();
+        }
+        done.map_err(|e| anyhow::anyhow!("{fault:?}: the upgrade: {e}"))?;
+        let blue = "/machine/box-a/instance/main";
+        let v = until(Duration::from_secs(90), || {
+            let v = relays(port, admin, 20)?;
+            let (n, missing) = stream_counts(&v, blue, "frames forwarded to ");
+            let unanswered = v.get("unanswered").and_then(Value::as_array).map_or(0, |u| u.iter().filter(|r| field(r, "relay").contains(blue)).count());
+            // A faulty forwarder's refused records never reach kiln's streams: their breaks are
+            // checked below.
+            Ok((n >= 2 && (fault.is_some() || (missing == 0 && unanswered == 0))).then_some(v))
+        })
+        .map_err(|e| anyhow::anyhow!("{fault:?}: {e}: {}", relays(port, admin, 0).unwrap_or_default()))?;
+        let (forwarded, _) = stream_counts(&v, blue, "frames forwarded to ");
+        match fault {
+            None => {
+                let receipts = receipts_by(dir.path(), "/machine/box-a/")?.into_iter().filter(|r| walked_hops(port, admin, r).is_ok_and(|h| h.get(1).is_some_and(|(_, c)| c.ends_with(blue)))).count();
+                assert_eq!(u64::try_from(receipts)?, forwarded, "the new build's receipt of each frame of words forwarded: {v}");
+                assert_eq!(relay_breaks(port, admin, blue)?, Vec::<Value>::new(), "each passed on unchanged");
+            }
+            Some(f) => {
+                let breaks = until(Duration::from_secs(60), || {
+                    let b = relay_breaks(port, admin, blue)?;
+                    Ok((!b.is_empty()).then_some(b))
+                })?;
+                let kind = if f.ends_with("drop") {
+                    "dropped"
+                } else if f.ends_with("swap") {
+                    "swapped"
+                } else {
+                    "changed"
+                };
+                assert!(breaks.iter().any(|b| field(b, "kind") == kind), "{f}: {breaks:?}");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A chain's hops as (kind, custodian, whom it's held for, the delegation it's under).
 #[cfg(feature = "chaos")]
 fn hops_held(v: &Value) -> Vec<(String, String, String, String)> {

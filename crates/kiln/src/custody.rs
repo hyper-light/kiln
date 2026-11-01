@@ -70,7 +70,7 @@ fn kind_name(k: Kind) -> String {
 }
 
 /// The digest of a bundle's statement, read without checking it ("" when it can't be read).
-fn digest_of(bundle: &Value) -> String {
+pub(crate) fn digest_of(bundle: &Value) -> String {
     let env = bundle.get("dsseEnvelope");
     let ty = env.and_then(|e| e.get("payloadType")).and_then(Value::as_str);
     let payload = env.and_then(|e| e.get("payload")).and_then(Value::as_str).and_then(|p| base64::engine::general_purpose::STANDARD.decode(p).ok());
@@ -225,6 +225,16 @@ pub async fn on_runner(hub: &crate::hub::Hub, peer: crate::instances::PeerId, ma
         }
         return tracing::info!(target: "kiln.custody", %machine, %instance, session = %text("session"), why = %text("why"), "a runner process didn't do an act: kiln was out of its reach");
     }
+    // A break it found in what a relay passed on to it, and what it refused because of it (W27-R08's
+    // relays): kiln's words, a fellow agent's, blue/green's frames, a reach link's.
+    if let Some(r) = bundle.get("relay_break") {
+        if let Err(e) = crate::relays::reported(hub, machine, &instance, r).await {
+            tracing::warn!(target: "kiln.custody", %machine, error = %format!("{e:#}"), "a break a runner found in what a relay passed on couldn't be recorded");
+        }
+        let said = |k: &str| r.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+        let (relay, detail) = (said("relay"), said("detail"));
+        return tracing::info!(target: "kiln.custody", %machine, %instance, %relay, %detail, "a runner process found a break in what a relay passed on");
+    }
     // A hand-over's word it refused, not being the process it was for (W27-R08; the 14:18 drop).
     if let Some(r) = bundle.get("refused_word") {
         let text = |k: &str| r.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
@@ -309,6 +319,16 @@ pub fn word_signed(sign: &dyn Fn(&str, &statement::Statement) -> anyhow::Result<
     Ok(v.to_string())
 }
 
+/// Keeps the word kiln's server signed beside command `json` ([`word`]), so a walk through a relay
+/// that passes it on (blue/green's old build: docs/ci.md W27-R08's relays) reaches it.
+pub(crate) async fn keep_word(store: &Store, root: &[u8], json: &str) {
+    let word = serde_json::from_str::<Value>(json).ok().and_then(|v| v.get("word").and_then(Value::as_str).and_then(|w| serde_json::from_str::<Value>(w).ok()));
+    let Some(bundle) = word else { return };
+    if let Err(e) = keep_originator(store, root, &bundle, "kiln's server", crate::util::now_unix()).await {
+        tracing::warn!(target: "kiln.custody", error = %format!("{e:#}"), "a hand-over's word kiln signed wasn't kept");
+    }
+}
+
 /// The command a hand-over's word signs (`v`, as sent): its JSON without the word, as `serde_json`
 /// writes it again, which the server and the runner write alike.
 pub fn unworded(v: &Value) -> String {
@@ -321,6 +341,18 @@ pub fn without(v: &Value, key: &str) -> String {
     let mut v = v.clone();
     if let Some(o) = v.as_object_mut() {
         o.remove(key);
+    }
+    v.to_string()
+}
+
+/// What an agent session's act signs of ask `v`, as sent: the ask without the act beside it, nor
+/// the runner's record of passing it on (`passed_on`, added after the act was signed: docs/ci.md
+/// W27-R08's relays), as `serde_json` writes it again.
+pub fn signed_part(v: &Value) -> String {
+    let mut v = v.clone();
+    if let Some(o) = v.as_object_mut() {
+        o.remove("act");
+        o.remove("passed_on");
     }
     v.to_string()
 }
@@ -367,7 +399,7 @@ pub async fn act_counts(hub: &crate::hub::Hub, machine: &str, instance: &str, si
         refuse(&hub.store, record(String::new(), Some(e), why.clone(), None)).await?;
         return Ok(Err(why));
     };
-    let what = without(ask, "act");
+    let what = signed_part(ask);
     let revocations = crate::identities::revocations(&hub.store).await?;
     match act_check(&act, &hub.pki.ca_der, &revocations, &held, what.as_bytes(), at) {
         Ok(()) => Ok(Ok(())),
@@ -1091,15 +1123,48 @@ async fn check(store: &Store, root: &[u8], org: &str, digest: &str, revocations:
         Err(b) => {
             let mut around = follows;
             around.insert(0, digest.to_owned());
-            record_break(store, digest, &b, &around, at).await?;
+            record_break(store, digest, &b, &around, &relay_named(&b, digest, &map), at).await?;
             Ok(Some(b.to_string()))
         }
     }
 }
 
-/// Records break `b` at record `record`, with the records around it, once.
-async fn record_break(store: &Store, record: &str, b: &Break, around: &[String], at: i64) -> anyhow::Result<()> {
-    let (r, kind, detail, around_json) = (record.to_owned(), b.code().to_owned(), b.to_string(), serde_json::to_string(around)?);
+/// Records break `b` at record `record`, with the records around it, once; naming `relay` when
+/// it's in what a relay passed on ([`relay_named`]).
+async fn record_break(store: &Store, record: &str, b: &Break, around: &[String], relay: &str, at: i64) -> anyhow::Result<()> {
+    insert_break(store, record, b.code(), &b.to_string(), around, "", relay, at).await
+}
+
+/// The relay break `b` at record `record` names, when it's in what a relay passed on (docs/ci.md
+/// W27-R08's relays): the broken record's signer when it's a relay's record, else the signer of the
+/// relay's record it follows; "" for none.
+fn relay_named(b: &Break, record: &str, map: &BTreeMap<String, Checked>) -> String {
+    let passed = |d: &str| map.get(d).filter(|c| custody::body(c).is_ok_and(|b| b.kind == Kind::PassedOn)).map(|c| c.custodian.clone());
+    let from = match b {
+        Break::Changed { from, .. }
+        | Break::NoCommonDigest { from, .. }
+        | Break::NotHandedOn { from, .. }
+        | Break::NotAll { from, .. }
+        | Break::NotTheTaker { from, .. }
+        | Break::NotTheGiver { from, .. }
+        | Break::NotTheHolder { from, .. } => Some(from.as_str()),
+        _ => None,
+    };
+    passed(record).or_else(|| from.and_then(passed)).unwrap_or_default()
+}
+
+/// Records a break found in what relay `relay` (its identity's URI) passed on (docs/ci.md
+/// W27-R08's relays): at record `record`, the relay's record by its digest; its kind (`code`, as
+/// `kiln_ci::identity::relay::Unrelayed::code` names it) and words; the records around it; and
+/// what was refused because of it, if anything. Once.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn relay_break(store: &Store, record: &str, code: &str, detail: &str, around: &[String], refused: &str, relay: &str, at: i64) -> anyhow::Result<()> {
+    insert_break(store, record, code, detail, around, refused, relay, at).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_break(store: &Store, record: &str, kind: &str, detail: &str, around: &[String], refused: &str, relay: &str, at: i64) -> anyhow::Result<()> {
+    let (r, kind, detail, around_json, refused, relay) = (record.to_owned(), kind.to_owned(), detail.to_owned(), serde_json::to_string(around)?, refused.to_owned(), relay.to_owned());
     let (rr, dd) = (r.clone(), detail.clone());
     let new = store
         .call(move |c| {
@@ -1107,7 +1172,7 @@ async fn record_break(store: &Store, record: &str, b: &Break, around: &[String],
             if seen.is_some() {
                 return Ok(false);
             }
-            c.execute("INSERT INTO custody_breaks (record, kind, detail, around, at) VALUES (?1, ?2, ?3, ?4, ?5)", params![r, kind, detail, around_json, at])?;
+            c.execute("INSERT INTO custody_breaks (record, kind, detail, around, refused, relay, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![r, kind, detail, around_json, refused, relay, at])?;
             Ok(true)
         })
         .await?;
@@ -1117,6 +1182,24 @@ async fn record_break(store: &Store, record: &str, b: &Break, around: &[String],
         crate::audit::write(store, entry).await;
     }
     Ok(())
+}
+
+/// Records that kiln, or a runner process, refused `what`, which relay `relay` passed on, for
+/// `why` (docs/ci.md W27-R08's relays): the relay's record by its digest and envelope, and what it
+/// came over.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn refused_relayed(store: &Store, digest: &str, what: &str, relay: &str, why: &str, envelope: &str, came_from: &str, at: i64) -> anyhow::Result<()> {
+    let r = Refusal { digest: digest.to_owned(), act: what.to_owned(), signer: relay.to_owned(), why: why.to_owned(), envelope: envelope.to_owned(), came_from: came_from.to_owned(), at, ..Refusal::default() };
+    refuse(store, r).await
+}
+
+/// Keeps `bundle`, an originator's own signed statement that a relay passed on (an agent session's
+/// act: docs/ci.md W27-R08's relays), by its digest, so a walk from a relay's record finds it: not
+/// a custody record, so of no kind; checked as of `at`, revocations aside (whether the act counts
+/// is its own check's). Whether it's new.
+pub(crate) async fn keep_originator(store: &Store, root: &[u8], bundle: &Value, came_from: &str, at: i64) -> anyhow::Result<bool> {
+    let c = statement::verify(bundle, root, &[], at).map_err(|e| anyhow::anyhow!("{e}"))?;
+    keep(store, &c, None, None, bundle, came_from).await
 }
 
 /// Records refusal `r`, and audits it.
@@ -1379,8 +1462,17 @@ async fn walked(store: &Store, root: &[u8], org: &str, digest: &str, at: i64) ->
         Err(b) => {
             let b = unchecked(store, root, &revocations, b).await?;
             let at_record = break_record(&b).unwrap_or(&from).to_owned();
-            record_break(store, &at_record, &b, std::slice::from_ref(&from), at).await?;
-            json!({ "from": from, "unbroken": false, "break": { "kind": b.code(), "record": at_record, "detail": b.to_string() } })
+            // A gap in a relay's stream names the relay: records it passed on never came.
+            let relay = match &b {
+                Break::Gap(statement::Gap::Missing { custodian, stream, .. } | statement::Gap::Twice { custodian, stream, .. })
+                    if map.values().any(|c| c.custodian == *custodian && c.statement.stream.as_deref() == Some(stream) && custody::body(c).is_ok_and(|b| b.kind == Kind::PassedOn)) =>
+                {
+                    custodian.clone()
+                }
+                _ => relay_named(&b, &at_record, &map),
+            };
+            record_break(store, &at_record, &b, std::slice::from_ref(&from), &relay, at).await?;
+            json!({ "from": from, "unbroken": false, "break": { "kind": b.code(), "record": at_record, "detail": b.to_string(), "relay": relay } })
         }
     };
     Ok(Some((v, read)))
@@ -1549,11 +1641,13 @@ pub async fn breaks(store: &Store, limit: usize) -> anyhow::Result<Vec<Value>> {
     let n = i64::try_from(limit).unwrap_or(i64::MAX);
     store
         .call(move |c| {
-            let mut q = c.prepare("SELECT record, kind, detail, around, refused, at FROM custody_breaks ORDER BY at DESC, id DESC LIMIT ?1")?;
+            let mut q = c.prepare("SELECT record, kind, detail, around, refused, at, relay FROM custody_breaks ORDER BY at DESC, id DESC LIMIT ?1")?;
             let rows = q
                 .query_map([n], |r| {
                     let around: String = r.get(3)?;
-                    Ok(json!({ "record": r.get::<_, String>(0)?, "kind": r.get::<_, String>(1)?, "detail": r.get::<_, String>(2)?, "around": serde_json::from_str::<Value>(&around).unwrap_or(Value::Null), "refused": r.get::<_, String>(4)?, "at": r.get::<_, i64>(5)? }))
+                    // The relay, when it's in what one passed on (docs/ci.md W27-R08's relays).
+                    let relay: String = r.get(6)?;
+                    Ok(json!({ "record": r.get::<_, String>(0)?, "kind": r.get::<_, String>(1)?, "detail": r.get::<_, String>(2)?, "around": serde_json::from_str::<Value>(&around).unwrap_or(Value::Null), "refused": r.get::<_, String>(4)?, "at": r.get::<_, i64>(5)?, "relay": relay }))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(rows)

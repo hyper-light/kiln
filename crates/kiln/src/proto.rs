@@ -458,6 +458,16 @@ pub const CAP_LEG_SIGNS: u64 = 1 << 43;
 /// (`crate::custody::take`). (Bit 41 is main's `CAP_UNREAD`, 42 `CAP_AGENT_GIT`, 43 `CAP_LEG_SIGNS`.)
 pub const CAP_CUSTODY: u64 = 1 << 44;
 
+/// [`AgentMsg::Caps`] and [`ServerMsg::Caps`] capability: relays record what they pass on
+/// (docs/ci.md W27-R08's relays). A runner that says it sends its record of each act of its agents'
+/// it passes on to kiln (`passed_on` beside the ask), checks what kiln relays to it (an agent's words
+/// with their records, `relayed`; kiln's records of a reach link's frames) and signs its receipts;
+/// a server that says it checks the runner's records and relays so. Neither sends the other these
+/// without it. (Bits 41 to 44 are `CAP_UNREAD`, `CAP_AGENT_GIT`, `CAP_LEG_SIGNS`, `CAP_CUSTODY`. Bit
+/// 47, not 45: as W27 lands, its own bits move to 44 to 46, after main's `CAP_WORKSPACE_COMMITS` and
+/// `CAP_WORKSPACE_COMPARE`, 42 and 43.)
+pub const CAP_RELAYS: u64 = 1 << 47;
+
 /// What an [`AgentMsg::Identity`] asks for: a certificate for the key of `csr`, as `kind` says.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -1166,6 +1176,13 @@ mod tests {
     /// W27-R08: custody records come after every older variant (the legs' signing, W27-R05, last
     /// before them), and their bit is a new one: past main's `CAP_UNREAD` (41), `CAP_AGENT_GIT`
     /// (42) and `CAP_LEG_SIGNS` (43).
+    /// W27-R08's relays: their bit is a new one, past custody's (44).
+    #[test]
+    fn w27_r08_relays_bit_is_a_new_one() {
+        let before = CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_AGENT_GIT | CAP_LEG_SIGNS | CAP_CUSTODY | (1 << 41);
+        assert!(CAP_RELAYS.is_power_of_two() && CAP_RELAYS == 1 << 47 && CAP_RELAYS & before == 0);
+    }
+
     #[test]
     fn w27_r08_custody_is_appended_after_headroom() -> anyhow::Result<()> {
         let legs = encode(&AgentMsg::LegSignature { job: "j".into(), nonce: "n".into(), bundle: None, error: None })?;

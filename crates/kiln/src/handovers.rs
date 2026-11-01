@@ -270,7 +270,12 @@ impl Hub {
             _ => self.harness.epoch_of(session),
         };
         match crate::custody::word(&self.pki, session, &json, agent, &instance, epoch) {
-            Ok(worded) => Some(worded),
+            Ok(worded) => {
+                // Kept, so a walk through a relay that passes it on (blue/green's old build) reaches
+                // it (docs/ci.md W27-R08's relays).
+                crate::custody::keep_word(&self.store, &self.pki.ca_der, &worded).await;
+                Some(worded)
+            }
             Err(e) => {
                 tracing::warn!(target: "kiln.custody", %session, %agent, %instance, error = %format!("{e:#}"), "a hand-over's word couldn't be signed: the process it's for refuses it unsigned");
                 Some(json)

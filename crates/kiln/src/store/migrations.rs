@@ -203,7 +203,8 @@ mod tests {
         assert_eq!(columns("custody")?, ["digest", "payload_type", "kind", "custodian", "counterpart", "stream", "seq", "under", "envelope", "came_from", "taken_at"]);
         assert_eq!(columns("custody_follows")?, ["record", "follows"]);
         assert_eq!(columns("custody_things")?, ["record", "name", "algorithm", "hex"]);
-        assert_eq!(columns("custody_breaks")?, ["id", "record", "kind", "detail", "around", "refused", "at"]);
+        // `relay`: the relays' (the Transfers plan's step 13, migration w27_relays).
+        assert_eq!(columns("custody_breaks")?, ["id", "record", "kind", "detail", "around", "refused", "at", "relay"]);
         assert_eq!(columns("transfer_refusals")?, ["id", "digest", "act", "signer", "why", "envelope", "came_from", "at", "epoch", "superseded_by"]);
         let insert = "INSERT INTO custody (digest, payload_type, kind, custodian, envelope, taken_at) VALUES ('sha256:aa', 'application/vnd.kiln.custody+json', 'received', 'kiln://hyper-light/server', '{}', 1)";
         c.execute(insert, [])?;
@@ -251,6 +252,29 @@ mod tests {
         }
         assert_eq!(epoch_of("-- kiln:epoch 3\nALTER TABLE x DROP COLUMN y;"), Some(3));
         assert_eq!(epoch_of("CREATE TABLE x (y);\n-- kiln:epoch 3"), None, "only the first line says");
+    }
+
+    /// W27-R08's relays (the Transfers plan's step 13): a break names the relay it was found in,
+    /// `''` for a break kiln found elsewhere (every break recorded before); kiln finds the relays'
+    /// records by their kind and when it took them. No epoch raised, so older builds still open
+    /// the database (they never name the column).
+    #[test]
+    fn w27_r08_relays_column() -> anyhow::Result<()> {
+        const MINE: &str = "20261101-0200_w27_relays";
+        let mut c = Connection::open_in_memory()?;
+        c.execute_batch(crate::store::SCHEMA)?;
+        let (before, after): (Vec<(&str, &str)>, Vec<(&str, &str)>) = MIGRATIONS.iter().copied().partition(|(n, _)| *n < MINE);
+        apply_list(&mut c, &before)?;
+        c.execute("INSERT INTO custody_breaks (record, kind, detail, at) VALUES ('sha256:aa', 'changed', 'before relays', 1)", [])?;
+        assert!(after.first().is_some_and(|(n, _)| *n == MINE), "{MINE} is shipped");
+        apply_list(&mut c, &after)?;
+        let relay: String = c.query_row("SELECT relay FROM custody_breaks WHERE detail = 'before relays'", [], |r| r.get(0))?;
+        assert_eq!(relay, "", "a break from before names no relay");
+        c.execute("INSERT INTO custody_breaks (record, kind, detail, at, relay) VALUES ('sha256:bb', 'dropped', 'a gap', 2, 'kiln://hyper-light/person/ada/machine/adacachy/instance/01a14794')", [])?;
+        let index: i64 = c.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'custody_kind_taken'", [], |r| r.get(0))?;
+        assert_eq!(index, 1);
+        assert!(epoch_of(MIGRATIONS.iter().find(|(n, _)| *n == MINE).map(|(_, sql)| *sql).unwrap_or_default()).is_none(), "no epoch raised");
+        Ok(())
     }
 
     #[test]
