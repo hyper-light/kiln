@@ -610,14 +610,16 @@ mod tests {
 
     async fn pruned(convo:&crate::convo::store::Store,session:&str)->anyhow::Result<()> {
         let (c,session)=(convo.clone(),session.to_owned());
-        c.wake_maintenance();
         crate::rt::blocking(move || ->anyhow::Result<()> {
             let until=std::time::Instant::now()+Duration::from_secs(30);
-            while !c.marks(&session)?.is_empty() {
+            // Woken as the archive's owner wakes it, and asked more seldom than the store's writer
+            // waits, idle, before it looks again (2 s): its upkeep runs only while nothing is asked.
+            loop {
+                c.wake_maintenance();
+                if c.marks(&session)?.is_empty() { return Ok(()); }
                 anyhow::ensure!(std::time::Instant::now()<until,"owner retention did not prune its positively archived snapshot");
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(Duration::from_millis(2_200));
             }
-            Ok(())
         }).await?
     }
 

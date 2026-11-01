@@ -421,13 +421,6 @@ impl Store {
         Self::start_initialized(engine, upkeep, limits, i64::MAX, None)
     }
 
-    /// The existing archive owner installs its initial hold before the writer can run.
-    /// Ordinary constructors retain their unbounded initial cutoff and original upkeep.
-    #[cfg(test)]
-    pub(crate) fn start_with_initial_hold(engine: Box<dyn Engine>, upkeep: Upkeep, initial_hold: i64) -> anyhow::Result<Self> {
-        Self::start_initialized(engine, upkeep, AdmissionLimits::default(), initial_hold, None)
-    }
-
     pub(crate) fn start_with_maintenance(engine: Box<dyn Engine>, upkeep: Upkeep, initial_hold: i64, authority: Option<super::retention::Authority>) -> anyhow::Result<Self> {
         Self::start_initialized(engine, upkeep, AdmissionLimits::default(), initial_hold, authority)
     }
@@ -1391,7 +1384,24 @@ mod tests {
         // after this actor starts: its initial hold must precede the first prune turn.
         engine.apply(&[session("before"), line("before", 0), Row::Closed { session: "before".into(), at: held - 60_000 },
             session("held"), line("held", 0), Row::Closed { session: "held".into(), at: held }])?;
-        let store = Store::start_with_initial_hold(Box::new(engine), Upkeep { keep_closed: Some(Duration::from_secs(60)), compact: None }, held)?;
+        // CP-T10.1/U15: no record goes before the archive answers for it, and only the archive's
+        // owner prunes. Here the owner gave both up (an answer), each close observed as it ended.
+        let policy = super::super::retention::Policy { keep_closed_ms: Some(60_000), keep_archived_ms: None, hold_extra_ms: 0 };
+        let authority = super::super::retention::register(&host, "archive", policy)?.ok_or_else(|| anyhow::anyhow!("no archive owner"))?;
+        let owner = authority.clone();
+        host.database().call(crate::store::deadline(), move |conn| {
+            while !super::super::retention::backfill_step(conn, &owner)? {}
+            for (session, ended) in [("before", held - 60_000), ("held", held)] {
+                conn.execute("UPDATE convo_retention SET observed_ms=?2 WHERE session=?1", crate::sql::params![session, ended])?;
+                let (close, accepted) = conn.query_row("SELECT close_rev,accepted_rev FROM convo_retention WHERE session=?1", [session], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+                let given = conn.execute("UPDATE transcript_archives SET status='given-up',done_ms=0,manifest=NULL,close_rev=?2,accepted_rev=?3,owner_generation=?4,policy_version=?5 WHERE session=?1",
+                    crate::sql::params![session, close, accepted, owner.generation, owner.policy_version])?;
+                anyhow::ensure!(given == 1, "no archive obligation for {session}");
+            }
+            Ok(())
+        })?;
+        engine.maintenance(Some(authority.clone()))?;
+        let store = Store::start_with_maintenance(Box::new(engine), Upkeep { keep_closed: Some(Duration::from_secs(60)), compact: None }, held, Some(authority))?;
         let until = Instant::now() + Duration::from_secs(15);
         while !store.marks("before")?.is_empty() {
             anyhow::ensure!(Instant::now() < until, "the record of a session that ended before the hold was kept");
@@ -1399,10 +1409,13 @@ mod tests {
         }
         assert_eq!(store.marks("held")?.len(), 1, "a session that ended at the hold keeps its record");
         store.hold_prune(held + 1);
-        // Asked more seldom than the writer waits, idle, before it looks again.
+        // Asked more seldom than the writer waits, idle, before it looks again. The archive's
+        // owner wakes the upkeep as it answers for sessions; a pass that only finished the last
+        // one's sessions isn't a look past the hold.
         let until = Instant::now() + Duration::from_secs(30);
         while !store.marks("held")?.is_empty() {
             anyhow::ensure!(Instant::now() < until, "the hold moved past it, the record was still kept");
+            store.wake_maintenance();
             std::thread::sleep(LOOK_FILE + SQUEEZE_EVERY);
         }
         Ok(())
