@@ -1407,8 +1407,7 @@
   justify-content: space-between;
   align-items: baseline;
   gap: 4px 16px;
-  padding: 8px 0 12px;
-  border-bottom: 1px solid var(--k-line, #2a2c31);
+  padding: 8px 10px 2px;
   color: #8b8e96;
   font-size: 11px;
 }
@@ -1421,4 +1420,211 @@
 .ppl-kicker > :last-child {
   min-width: 0;
   overflow-wrap: anywhere;
+}
+/* An opened workflow or action (W29-R04): the kicker, then the jobs pane's anatomy. Its list and the
+   picked line's detail at one height on a desktop, each scrolling inside itself; on a phone the
+   detail under its line, its views one height. */
+.ppl {
+  display: grid;
+  gap: 10px;
+}
+.ppl-verbs {
+  grid-template-columns: none;
+  grid-auto-flow: column;
+  grid-auto-columns: 80px;
+}
+.ppl-verbs[data-armed] {
+  grid-auto-columns: 80px 166px;
+}
+.ppl-verbs button[data-dim] {
+  opacity: 0.35;
+  cursor: default;
+}
+.ppl-verbs button[aria-disabled]:not([data-dim]) {
+  opacity: 0.6;
+  cursor: progress;
+}
+.ppl-body {
+  height: 620px;
+}
+.ppl-list {
+  height: 100%;
+  overflow: auto;
+}
+.ppl-side {
+  height: 100%;
+  overflow: auto;
+}
+.ppl-detail {
+  display: grid;
+  align-content: start;
+  min-width: 0;
+}
+.ppl-dhead {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  height: 36px;
+  padding: 0 4px 0 8px;
+  border-bottom: 1px solid var(--k-line-2, #1f2125);
+}
+.ppl-dname {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #c9ccd3;
+  font-size: 12.5px;
+}
+.ppl-views {
+  flex: none;
+}
+.ppl-views button {
+  all: unset;
+  cursor: pointer;
+  color: #6d7078;
+}
+.ppl-views button[aria-selected="true"] {
+  color: #e4e5e7;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.ppl-views button:focus-visible {
+  outline: 2px solid #a6c4ed;
+  outline-offset: 2px;
+}
+/* Every view one height, the code's: switching views moves nothing. */
+.ppl-dbody {
+  height: calc(var(--rows) * 19px + 16px);
+  overflow: hidden;
+}
+.ppl-dbody > * {
+  height: 100%;
+  overflow: auto;
+}
+.ppl-slot {
+  height: 100%;
+}
+.ppl-code {
+  margin: 0;
+  padding: 8px 0;
+  list-style: none;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
+  line-height: 19px;
+  color: #d4dde8;
+}
+.ppl-code li {
+  display: grid;
+  grid-template-columns: 4ch minmax(0, 1fr);
+  gap: 12px;
+  padding: 0 8px 0 0;
+}
+.ppl-code li[data-at] {
+  background: rgb(255 255 255 / 0.035);
+}
+.ppl-code code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.ppl-ln {
+  color: #4f545e;
+  text-align: right;
+  user-select: none;
+}
+.ppl-code li[data-at] .ppl-ln {
+  color: #8b8e96;
+}
+.ppl-lines {
+  margin: 0;
+  padding: 6px 0;
+  list-style: none;
+}
+.ppl-lines li {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 28px;
+  padding: 0 8px;
+  color: #b9bbc2;
+  font-size: 12.5px;
+}
+.ppl-lines .n {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ppl-lines .n em {
+  margin-right: 6px;
+  color: #8b8e96;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10px;
+  font-style: normal;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.ppl-lines .v {
+  color: #8b8e96;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+.ppl-empty {
+  margin: 0;
+  padding: 10px 8px;
+  color: #8b8e96;
+  font-size: 12.5px;
+}
+@media (max-width: 700px) {
+  .ppl-verbs,
+  .ppl-verbs[data-armed] {
+    grid-auto-flow: row;
+    grid-auto-columns: auto;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+  .ppl-body {
+    height: auto;
+  }
+  .ppl-list,
+  .ppl-side {
+    height: auto;
+    overflow: visible;
+  }
+}
+/* A line's value gives way to its name: it ends in an ellipsis before it pushes anything past the
+   screen (the detail says it whole). */
+.ppl .jp-line {
+  display: flex;
+  justify-content: space-between;
+}
+.ppl .jp-j .n {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.ppl .jp-j .v {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 55%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ppl-lines li {
+  display: flex;
+}
+.ppl-lines li > svg {
+  flex: none;
+  margin: 0 4px;
+}
+.ppl-lines .n {
+  flex: 1 1 auto;
+}
+.ppl-lines .v {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 60%;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }

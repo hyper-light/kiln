@@ -79,3 +79,90 @@ test("?repo=&path= opens that row and brings it into view", async ({ page, isMob
   await expect(page).not.toHaveURL(/path=/);
   expect(await sideways(page)).toBe(0);
 });
+
+/** The opened row's pane, at `path` of `repo` (a draft's with `draft`). */
+async function openPane(page: Page, isMobile: boolean, repo: string, path: string, draft?: string) {
+  await atStillWidth(page, isMobile);
+  await page.goto(`/ship/pipelines?repo=${encodeURIComponent(repo)}&path=${encodeURIComponent(path)}${draft ? `&draft=${draft}` : ""}`);
+  await notices(page);
+  const pane = page.getByRole("region", { name: "Pipeline" });
+  await expect(pane.locator(".jp-strip")).toBeVisible({ timeout: 15_000 });
+  return pane;
+}
+
+test("an opened workflow is the jobs pane's anatomy: the strip, its groups, the picked line's detail beside them or under its line", async ({ page, isMobile }) => {
+  const pane = await openPane(page, isMobile, "hyper-light/kiln", ".kiln/ci.yaml");
+  await expect(pane.locator(".jp-g > span:first-child")).toHaveText(["Triggers", "Stage 1", "Stage 2", "Uses", "Secrets and variables", "Runs", "Settings"]);
+  await expect(pane.locator('.jp-g[data-group="Stage 1"] > span:last-child')).toHaveText("3 jobs at once");
+  await expect(pane.locator('.jp-g[data-group="Stage 2"] > span:last-child')).toHaveText("after rust and ui");
+  // The first job is picked: YAML · Plan · Last run, its lines tinted in the code.
+  await expect(pane.locator(".jp-j[data-at]")).toHaveAttribute("data-key", "jobs.rust");
+  const detail = pane.locator(".ppl-detail");
+  await expect(detail.getByRole("tab")).toHaveText(["YAML", "Plan", "Last run"]);
+  await expect(detail.locator(".ppl-code li[data-at]").first()).toContainText("rust:");
+  await expect(detail.locator(".ppl-code li[data-at]")).toHaveCount(11);
+  // Beside the list on a desktop; right under its line on a phone.
+  if (isMobile) await expect(pane.locator('.jp-j[data-key="jobs.rust"] + li.jp-detail .ppl-detail')).toBeVisible();
+  else await expect(pane.locator(".ppl-side .ppl-detail")).toBeVisible();
+  // A trigger: its Filters, YAML and Plan; the plan is its event's.
+  await pane.locator('.jp-j[data-key="on.push"] .jp-line').click();
+  await expect(detail.getByRole("tab")).toHaveText(["Filters", "YAML", "Plan"]);
+  await expect(detail.locator(".ppl-lines")).toContainText("branches main");
+  const asked = page.waitForRequest((r) => r.url().endsWith("/api/ci/plan-preview") && r.method() === "POST");
+  await detail.getByRole("tab", { name: "Plan" }).click();
+  expect((await asked).postDataJSON()).toMatchObject({ repo: "hyper-light/kiln", path: ".kiln/ci.yaml", event: "push" });
+  await expect(detail.locator(".ppl-lines li")).toHaveCount(5);
+  await expect(detail.locator(".ppl-lines li").filter({ hasText: "release-binary" })).toContainText("3 legs");
+  // The verbs: Run, and the rest dimmed, never hidden; a dimmed one says why.
+  const verbs = pane.locator(".ppl-verbs button");
+  await expect(verbs).toHaveText(["Run", "Save draft", "Ready", "Discard"]);
+  await expect(pane.locator(".ppl-verbs button[data-dim]")).toHaveCount(3);
+  // Dimmed is aria-disabled, which Playwright won't click; a person's click still says why.
+  await verbs.filter({ hasText: "Ready" }).click({ force: true });
+  await expect(pane.locator(".jp-said")).toHaveText("Ready is for a draft (W29-R12)");
+  await expect(page.locator("[role=dialog], .cm-tooltip")).toHaveCount(0);
+  expect(await sideways(page)).toBe(0);
+});
+
+test("an action's pane: its inputs, steps, versions, who uses it and its access; Changes · YAML · Try it; Release among its verbs", async ({ page, isMobile }) => {
+  const pane = await openPane(page, isMobile, "hyper-light/ci-kit", ".github/actions/setup-rust");
+  await expect(pane.locator(".jp-g > span:first-child")).toHaveText(["Inputs", "Outputs", "Steps", "Versions", "Used by", "Settings"]);
+  await expect(pane.locator(".jp-j[data-at]")).toHaveAttribute("data-key", "versions.head");
+  await expect(pane.locator(".ppl-detail").getByRole("tab")).toHaveText(["Changes", "YAML", "Try it"]);
+  await expect(pane.locator('.jp-g[data-group="Used by"] > span:last-child')).toHaveText("3 repositories");
+  await expect(pane.locator(".ppl-verbs button")).toHaveText(["Run", "Save draft", "Ready", "Discard", "Release"]);
+  await expect(pane.locator(".ppl-kicker")).toContainText(".github/actions/setup-rust · Composite action · main · e41a9c2");
+  expect(await sideways(page)).toBe(0);
+});
+
+test("kiln's update draft: DRAFT on its head, what changes for its repository first, then upstream", async ({ page, isMobile }) => {
+  const pane = await openPane(page, isMobile, "hyper-light/quiver", ".github/workflows/ci.yml", "d-update-88");
+  await expect(pane.locator(".ppl-kicker .ppl-draft")).toHaveText("DRAFT");
+  await expect(pane.locator(".jp-g > span:first-child").first()).toHaveText("What changes for it");
+  await expect(pane.locator(".jp-j[data-at]")).toHaveAttribute("data-key", "changes.input targets");
+  await expect(pane.locator(".ppl-detail").getByRole("tab")).toHaveText(["Changes", "YAML", "Plan"]);
+  expect(await sideways(page)).toBe(0);
+});
+
+test("nothing moves as lines are picked and views switched: the list holds still, every view one height", async ({ page, isMobile }) => {
+  const pane = await openPane(page, isMobile, "hyper-light/kiln", ".kiln/smoke.yaml");
+  const tops = () => pane.locator(".jp-j").evaluateAll((els) => els.map((e) => Math.round(e.getBoundingClientRect().top + window.scrollY)));
+  const heightOf = () => pane.locator(".ppl-dbody").evaluate((e) => e.getBoundingClientRect().height);
+  const height = await heightOf();
+  for (const tab of ["Plan", "Last run", "YAML"]) {
+    await pane.locator(".ppl-detail").getByRole("tab", { name: tab }).click();
+    expect(await heightOf()).toBe(height);
+  }
+  if (!isMobile) {
+    // Beside the list, the detail changes nothing of it.
+    const before = await tops();
+    for (const key of ["on.schedule", "on.deploy", "jobs.report", "uses.kiln/notify@v1", "runs.87"]) {
+      await pane.locator(`.jp-j[data-key="${key}"] .jp-line`).click();
+      await expect(pane.locator(".jp-j[data-at]")).toHaveAttribute("data-key", key);
+      expect(await tops()).toEqual(before);
+    }
+  }
+  await pane.locator('.jp-j[data-key="on.schedule"] .jp-line').click();
+  await expect(pane.locator(".ppl-detail").getByRole("tab")).toHaveText(["Times", "YAML", "Plan"]);
+  expect(await heightOf()).toBe(height);
+});
