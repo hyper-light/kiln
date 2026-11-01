@@ -730,9 +730,10 @@ async fn after_push(hub: &Arc<Hub>, repo: &Repo, p: &str, by: &super::cr::By, tr
     }
     let summary = updates.iter().map(|u| format!("{} {}..{}", u.name, short(&u.old), short(&u.new))).collect::<Vec<_>>().join(", ");
     hub.store.audit(by.pushed_by.clone(), "repo.push".into(), format!("{}: {summary}", repo.name)).await;
-    // The poller takes the new refs now: events, runs.
+    // The poller takes the new refs now: events, runs. Ship's Pipelines reads its rows again.
     if updates.iter().any(|u| !u.name.starts_with("refs/for/")) {
         crate::gitops::want(hub, &repo.id);
+        crate::ship::pipelines::heard(&repo.name);
     }
     said
 }

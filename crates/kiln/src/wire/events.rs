@@ -127,6 +127,9 @@ pub enum ServerEvent {
     /// What the page sent up this socket that couldn't be read: to that socket alone, never
     /// [`crate::hub::Hub::emit`]ted.
     Refused(crate::wire::ui::Refused),
+    /// A repository's rows in Ship's Pipelines changed (docs/ci.md W29-R03): pages showing it ask
+    /// again.
+    Pipelines { repo: String },
     /// Something happened to a run or a diff that notification rules hear (`run.failed`,
     /// `mention` ...): the tag is its [`NoticeKind`].
     #[serde(untagged)]

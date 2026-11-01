@@ -17,6 +17,10 @@
 //!   first, cursor-paged; `host` (kiln, github, gitlab, bitbucket) and `kind` (diff, request, commit)
 //!   filter, and `lens=review` keeps the changes' commits (W26-R02).
 //! - `GET /api/ship/commits/:repo/:sha`: one commit, its records and where it stands.
+//!
+//! Its Pipelines view (docs/ci.md W29) is [`pipelines`].
+
+pub mod pipelines;
 
 use std::collections::{HashMap, HashSet};
 

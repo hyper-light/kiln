@@ -366,7 +366,8 @@ pub fn standing(f: &Facts) -> Standing {
         Some(Draft::Unpublished) => ("waiting", "Unpublished", 1),
         Some(Draft::Update) => ("waiting", "Update", 1),
         None if f.off => ("superseded", "Off", 2),
-        None if !f.runs => ("superseded", "Not run here", 2),
+        // A reusable workflow is called, not triggered: it's used wherever its file isn't run.
+        None if !f.runs && f.kind == Kind::Workflow => ("superseded", "Not run here", 2),
         None if f.errors > 0 || f.routable == Some(false) => ("needs_you", "Can't run", 0),
         None if f.latest == Some(Outcome::Failed) => ("failing", "Failing", 0),
         None if f.released.is_some() => ("shipped", "Released", 2),
@@ -375,6 +376,33 @@ pub fn standing(f: &Facts) -> Standing {
         None => ("waiting", "Not run yet", 2),
     };
     Standing { stand, word, pips: [checks, runs_on, latest], rank }
+}
+
+/// A full version's parts (W29-R21): `vMAJOR.MINOR.PATCH` or `MAJOR.MINOR.PATCH`, with a
+/// pre-release after `-`; a floating `v2` or `v2.4` isn't one.
+pub fn full_version(tag: &str) -> Option<(u64, u64, u64, Option<&str>)> {
+    let t = tag.strip_prefix('v').unwrap_or(tag);
+    let (core, pre) = match t.split_once('-') {
+        Some((c, p)) if !p.is_empty() => (c, Some(p)),
+        Some(_) => return None,
+        None => (t, None),
+    };
+    let mut parts = core.split('.');
+    let mut next = || parts.next().filter(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())).and_then(|p| p.parse::<u64>().ok());
+    let (major, minor, patch) = (next()?, next()?, next()?);
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch, pre))
+}
+
+/// The newest full version among a repository's tags, by semver's precedence: a release comes
+/// after its own pre-releases (a tag is the whole repository's, W29-R21).
+pub fn newest_release<'a>(tags: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    tags.into_iter()
+        .filter_map(|t| full_version(t).map(|(a, b, c, pre)| ((a, b, c, pre.is_none(), pre.unwrap_or_default()), t)))
+        .max_by(|(x, _), (y, _)| x.cmp(y))
+        .map(|(_, t)| t)
 }
 
 /// A repository's rows in W29-R02's order: what needs someone first (Review, then Failing, then
@@ -550,6 +578,25 @@ mod tests {
             row("rust-check", Facts { released: Some("v2.4.0".into()), ..facts(Kind::Reusable) }),
         ];
         assert_eq!(heading(&lib, true), ("shared · 3 actions · 1 workflow · 1 draft".to_owned(), 0));
+    }
+
+    #[test]
+    fn w29_r21_full_versions_and_the_newest_release() {
+        assert_eq!(full_version("v2.4.1"), Some((2, 4, 1, None)));
+        assert_eq!(full_version("1.0.0-rc.1"), Some((1, 0, 0, Some("rc.1"))));
+        for floating in ["v2", "v2.4", "v2.4.1.0", "v2.x.1", "latest", "v1.2.3-", "", "v"] {
+            assert_eq!(full_version(floating), None, "{floating:?}");
+        }
+        assert_eq!(newest_release(["v1.9.9", "v1.10.0", "v2", "nightly"]), Some("v1.10.0"));
+        assert_eq!(newest_release(["v2.0.0-rc.1", "v1.10.0"]), Some("v2.0.0-rc.1"));
+        assert_eq!(newest_release(["v2.0.0-rc.2", "v2.0.0", "v2.0.0-rc.10"]), Some("v2.0.0"));
+        assert_eq!(newest_release(["v2", "main"]), None);
+    }
+
+    #[test]
+    fn w29_r02_a_reusable_workflow_is_never_not_run_here() {
+        let s = standing(&Facts { runs: false, routable: None, ..facts(Kind::Reusable) });
+        assert_eq!((s.stand, s.word), ("waiting", "Not released"));
     }
 
     /// The approved stills' rows (`~/.cache/kiln-pipelines-design/design.mjs`, ROWS), each as the
