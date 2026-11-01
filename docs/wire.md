@@ -471,8 +471,9 @@ takes a new bit, never one that means something already, even in the other direc
 | 50 | `CAP_EXPLICIT_ACTIVATION` | AgentMsg::Caps, ServerMsg::Caps | existing role-specific explicit activation owner; not release approval |
 | 51 | `CAP_ORDINARY_EXECUTION_DEBT` | AgentMsg::Caps, ServerMsg::Caps | existing paired original ordinary admission and sequenced physical debt |
 | 52 | `CAP_JOB_LOG_V1` | RESERVED, NOT ADVERTISED | U05 original native producer capture, durable bounded outbox and own canonical receipt; requires layout, wire, attempt, resource ownership and ordinary debt |
+| 53 | `CAP_LOG_END_MARK` | `AgentMsg::Caps`, `ServerMsg::Caps` | a leg's log is all sent once the runner says so on the LOGS lane: an empty `LogChunk` at step `u32::MAX` (`LOG_END_STEP`), after the leg's last output and before its result; the server takes the result once that mark has come and what came before it is accepted (bounded) |
 
-Bits from 53 are free. A reserved bit is not evidence that its complete route is active.
+Bits from 54 are free. A reserved bit is not evidence that its complete route is active.
 
 Main's unread messages retain their deployed indices: runner messages 56 and 57, server
 messages 62 and 63, and reach ask 11. The private unification messages follow them. Both peers
@@ -868,7 +869,8 @@ unpooled OrdinaryOwnerV1, matching authenticated process/stamp and actual prepar
 Execution. Positive keep_on_failure_minutes, inherited/pooled/foreign executors and
 unknown native kinds refuse before any writer starts. Debug verbosity is unchanged.
 
-The existing LOGS lane2 remains its old LogChunk codec. Appended lane10 is Bulk
+The existing LOGS lane2 remains its old LogChunk codec. To a server that says `CAP_LOG_END_MARK`, a runner
+ends each leg's log there with an empty chunk at step `u32::MAX`; it sends no mark to any other server. Appended lane10 is Bulk
 Kind::Log carrying the existing channel Frame; Item variant0 contains one direct
 AgentMsg::JobLogChunkV1 or JobLogEndV1. Their hashes bind a fixed explicit original
 owner tuple, not a later connection or the latest job attempt. The actual current

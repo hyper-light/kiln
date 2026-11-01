@@ -2998,7 +2998,7 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                     let ownership = if !o.outpost && cfg!(any(target_os = "linux", target_os = "macos", windows)) { proto::CAP_RESOURCE_OWNERSHIP } else { 0 };
                     let firecracker_shape = if !o.outpost && cfg!(target_os = "linux") { proto::CAP_FIRECRACKER_SHAPE } else { 0 };
                     let amphora = if carrier_active.load(std::sync::atomic::Ordering::Acquire) { proto::CAP_AMPHORA } else { 0 };
-                    local_wide_caps = built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | proto::CAP_HARNESS_RELEASE | proto::CAP_JOB_ATTEMPT | proto::CAP_RETAINED_RECEIVED | ownership | firecracker_shape | open_once | work | limit | proto::CAP_IDENTITY | headroom_cap | amphora | proto::CAP_UNREAD | proto::CAP_UNIFIED_LAYOUT | if explicit_activation { proto::CAP_EXPLICIT_ACTIVATION } else { 0 };
+                    local_wide_caps = built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | proto::CAP_HARNESS_RELEASE | proto::CAP_JOB_ATTEMPT | proto::CAP_LOG_END_MARK | proto::CAP_RETAINED_RECEIVED | ownership | firecracker_shape | open_once | work | limit | proto::CAP_IDENTITY | headroom_cap | amphora | proto::CAP_UNREAD | proto::CAP_UNIFIED_LAYOUT | if explicit_activation { proto::CAP_EXPLICIT_ACTIVATION } else { 0 };
                     if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: local_wide_caps }) {
                         net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                     }
@@ -3710,6 +3710,7 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                         let microvm = (leg.a.executor.kind == "firecracker").then(|| microvm_ca.clone());
                         let scope = Arc::clone(&execution);
                         let strict_up=uplink.clone();
+                        let end_mark = server_job_log_caps & proto::CAP_LOG_END_MARK != 0;
                         crate::rt::spawn(async move {
                           let result = scope.scope(async move {
                             #[cfg(target_os = "linux")]
@@ -3736,6 +3737,11 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                                     Ok(Err(error)) => tracing::warn!(error=%format!("{error:#}"),"original producer End remains incomplete/pending"),
                                     Err(_) => tracing::warn!(job=%result.job,"the leg's log End wasn't taken in time; its result goes ahead of it"),
                                 }
+                            }
+                            // Its log is all sent: a mark on the log lane behind its last lines, which
+                            // the server waits for before it takes the result (proto::CAP_LOG_END_MARK).
+                            if end_mark {
+                                strict_up.log(&result.job, proto::LOG_END_STEP, Vec::new()).await;
                             }
                             let _ = done.send((result, attempt)).await;
                         });

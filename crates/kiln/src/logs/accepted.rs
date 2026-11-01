@@ -1632,6 +1632,9 @@ impl Owner {
 impl super::Logs {
     pub(super) fn accepted_context(&self)->anyhow::Result<Context> {self.io.lock().context.clone().ok_or_else(||anyhow::anyhow!("accepted Logs owner is unbound"))}
     pub(crate) fn observe_frame(&self,observed:Observed) {self.io.lock().queue(observed)}
+    /// Whether log input received for job `job` is still being accepted (queued, in flight or
+    /// owed): its leg is over only once it's not, so a read then has what was received.
+    pub(crate) fn settling(&self,job:&str)->bool {let owner=self.io.lock();owner.bound() && owner.occupied(job)}
     /// Root has already authenticated the original registration and outer stream/seq.
     /// The whole original grant and reporting connection enter owner custody before any
     /// cancelable storage wait. A later connection is never substituted for this route.

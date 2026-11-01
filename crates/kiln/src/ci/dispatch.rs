@@ -997,6 +997,10 @@ fn saved_graph(v: &serde_json::Value) -> Option<Arc<kiln_ci::work::graph::Graph>
 /// How soon a leg held by its environment's promotion or custom gates is looked at again.
 const GATE_AGAIN_SECS: i64 = 15;
 
+/// How long a finished leg waits for its log (its runner's end mark, and what the server has
+/// received of it accepted) before it's over all the same ([`Dispatch::completion`]).
+const LOG_SETTLE_MS: i64 = 30_000;
+
 /// Whether a check's conclusion lets a gate pass (a check skipped by its own rules does).
 fn passes(conclusion: &str) -> bool {
     matches!(conclusion, "success" | "neutral" | "skipped")
@@ -1107,6 +1111,8 @@ struct Dispatch {
     pipeline_retries:HashMap<String,live_retry::Pending>,
     admission: admission::State,
     pending_losses: HashMap<String, (u32, String)>,
+    /// Finished legs waiting for their log, since when (ms).
+    log_settle: HashMap<(String, u32), i64>,
     hub: Arc<Hub>,
     sched: Scheduler,
     /// The routing rules by source (W05-R21); the scheduler holds them in order.
@@ -1264,7 +1270,7 @@ pub fn spawn(hub: Arc<Hub>) {
         (cfg.pools, cfg.reservations) = super::pools::sources(&hub).await;
         let mut d = Dispatch {
             admission: admission::State::default(),
-            pending_losses: HashMap::new(), pipeline_retries:HashMap::new(),
+            pending_losses: HashMap::new(), pipeline_retries:HashMap::new(), log_settle: HashMap::new(),
             hub: Arc::clone(&hub),
             sched: Scheduler::new(cfg),
             routing: sources,
@@ -2996,6 +3002,8 @@ impl Dispatch {
 
     async fn assign(&mut self, leg: &str, runner: &str, attempt: u32, placed: Placement) -> anyhow::Result<()> {
         let Placement { executor, image, docker, slot } = placed;
+        // An earlier attempt's mark that its log was all sent isn't this one's.
+        self.hub.logs.forget_end(leg);
         let Some(l) = self.legs.get(leg) else { return Ok(()) };
         let Some(r) = self.runs.get(&l.run) else { return Ok(()) };
         let (cache_mode, cache) = cache_access(&l.spec, r);
@@ -3656,6 +3664,25 @@ impl Dispatch {
             // independently, before this logical result/effect gate.
             return Ok(());
         }
+        // A leg is over once its log is, so a read then has its last lines: its runner's mark that
+        // all of it is sent has come (proto::CAP_LOG_END_MARK; the result comes on the control
+        // lane, the log on the log lane, maybe behind other legs'), and what the server received of
+        // it is accepted (a log frame is accepted durably after it arrives). Asked again on a timer
+        // (drain_completions), for LOG_SETTLE_MS at most.
+        let unsent = self.hub.runner_wide_caps(agent) & crate::proto::CAP_LOG_END_MARK != 0 && !self.hub.logs.end_marked(job);
+        if unsent || self.hub.logs.settling(job) {
+            let now = now_ms();
+            // Waits no completion asks about any more (their legs went another way) go.
+            self.log_settle.retain(|_, since| now.saturating_sub(*since) < 2 * LOG_SETTLE_MS);
+            let since = *self.log_settle.entry((job.to_owned(), attempt)).or_insert(now);
+            if now.saturating_sub(since) < LOG_SETTLE_MS {
+                self.timers.insert(now.saturating_add(200));
+                return Ok(());
+            }
+            tracing::warn!(job, attempt, unsent, "the leg's log wasn't all in; it's over all the same");
+        }
+        self.log_settle.remove(&(job.to_owned(), attempt));
+        self.hub.logs.forget_end(job);
         if self.legs.get(job).is_some_and(|l| l.attempt == attempt && l.agent.as_deref() == Some(agent)) {
             self.finished(agent, result).await?;
         }
@@ -4478,7 +4505,7 @@ mod tests {
             let dispatcher = || Dispatch {
                 hub: Arc::clone(&hub), sched: Scheduler::new(sched_config(&hub, Vec::new())), routing: Default::default(),
                 held: HashMap::new(), runs: HashMap::new(), legs: HashMap::new(), timers: BTreeSet::new(), next: Vec::new(),
-                in_commands: false, pods: HashSet::new(), absent_after: None, decisions: HashMap::new(), warm: HashMap::new(), warm_seq: 0, admission: admission::State::default(), pending_losses: HashMap::new(), pipeline_retries:HashMap::new(),
+                in_commands: false, pods: HashSet::new(), absent_after: None, decisions: HashMap::new(), warm: HashMap::new(), warm_seq: 0, admission: admission::State::default(), pending_losses: HashMap::new(), pipeline_retries:HashMap::new(), log_settle: HashMap::new(),
             };
             // U01: fresh unbound native rows must still refuse before any legacy
             // import. Full restore imports first, so exercise its retained guard directly.

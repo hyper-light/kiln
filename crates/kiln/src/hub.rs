@@ -1685,6 +1685,9 @@ impl Hub {
                         let (job,step,origin)=(chunk.job.to_owned(),chunk.idx,data.origin());
                         self.logs.observe_frame(crate::logs::accepted::Observed{job,step,input:crate::logs::accepted::Input::Frame(data,from..end),origin,answer:None});
                     }
+                    // Its leg's log is all sent (proto::CAP_LOG_END_MARK): what came before on this
+                    // lane is observed, and the leg's result is taken once that's accepted.
+                    Ok(chunk) if chunk.data.is_empty() && chunk.idx == proto::LOG_END_STEP && self.owns_job(peer, chunk.job) => self.logs.mark_end(chunk.job),
                     Ok(_) => {}
                     Err(error) => self.unreadable(peer, Wire::Runner, "a log chunk".to_owned(), error.code(), error.why("LogChunk"), true).await,
                 }
@@ -2914,7 +2917,7 @@ impl Hub {
         // It keeps the channel (docs/wire.md): said first, so a runner that keeps it too knows on
         // Welcome not to send its sessions whole. An older runner skips the frame.
         let amphora = if self.cfg.cluster.replica.is_some() && self.replica_carrier_active.get().is_some_and(|active| active.load(Ordering::Acquire)) { proto::CAP_AMPHORA } else { 0 };
-        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_HANDOVER | proto::CAP_WORK | proto::CAP_AGENT_LIMIT | proto::CAP_JOB_ATTEMPT | proto::CAP_RETAINED_RECEIVED | proto::CAP_IDENTITY | proto::CAP_HEADROOM | proto::CAP_CHANGES_PATCH | proto::CAP_FIRECRACKER_SHAPE | amphora | proto::CAP_UNREAD | proto::CAP_UNIFIED_LAYOUT | proto::CAP_EXPLICIT_ACTIVATION | proto::CAP_ORDINARY_EXECUTION_DEBT }).await;
+        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_LOG_END_MARK | proto::CAP_HANDOVER | proto::CAP_WORK | proto::CAP_AGENT_LIMIT | proto::CAP_JOB_ATTEMPT | proto::CAP_RETAINED_RECEIVED | proto::CAP_IDENTITY | proto::CAP_HEADROOM | proto::CAP_CHANGES_PATCH | proto::CAP_FIRECRACKER_SHAPE | amphora | proto::CAP_UNREAD | proto::CAP_UNIFIED_LAYOUT | proto::CAP_EXPLICIT_ACTIVATION | proto::CAP_ORDINARY_EXECUTION_DEBT }).await;
         // What its sessions' copies have here, so a stream it starts sends only what they lack
         // (`crate::wire::sums`): a few dozen sessions a frame, each about a kilobyte.
         for part in self.harness.kept_on(&name).chunks(KEPT_A_FRAME) {

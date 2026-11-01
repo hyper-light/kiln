@@ -503,6 +503,13 @@ pub const CAP_ORDINARY_EXECUTION_DEBT: u64 = 1 << 51;
 /// U05: RESERVED paired native producer-log protocol. Neither peer advertises it until
 /// original registration, producer outbox, canonical receipts and terminal effects compose.
 pub const CAP_JOB_LOG_V1: u64 = 1 << 52;
+/// A leg's log is all sent once its runner says so on the LOGS lane, after the leg's last output
+/// and before its result: an empty [`LogChunk`] at [`LOG_END_STEP`]. A server that takes it holds
+/// the leg's result until that mark has come and what came before it is accepted (W05: a result
+/// on the control lane overtook a leg's last lines, queued behind another leg's on the log lane).
+pub const CAP_LOG_END_MARK: u64 = 1 << 53;
+/// The step of a [`CAP_LOG_END_MARK`] mark, which no step has. An empty chunk was already a no-op.
+pub const LOG_END_STEP: u32 = u32::MAX;
 
 pub(crate) fn check_job_log_caps(caps: u64) -> Result<(), &'static str> {
     let required = CAP_UNIFIED_LAYOUT | CAP_WIRE | CAP_JOB_ATTEMPT

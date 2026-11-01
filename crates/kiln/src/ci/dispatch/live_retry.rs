@@ -428,7 +428,7 @@ pub(super) async fn exercise_active_retry()->anyhow::Result<()> {
         Ok(())
     }).await?;
     super::super::legacy::import_run(&hub,"active-retry").await?;
-    let mut d=Dispatch {pipeline_retries:Default::default(),admission:admission::State::default(),pending_losses:Default::default(),hub:Arc::clone(&hub),sched:Scheduler::new(sched_config(&hub,Vec::new())),routing:Default::default(),held:Default::default(),runs:Default::default(),legs:Default::default(),timers:Default::default(),next:Vec::new(),in_commands:false,pods:Default::default(),absent_after:None,decisions:Default::default(),warm:Default::default(),warm_seq:0};
+    let mut d=Dispatch {pipeline_retries:Default::default(),admission:admission::State::default(),pending_losses:Default::default(), log_settle: Default::default(),hub:Arc::clone(&hub),sched:Scheduler::new(sched_config(&hub,Vec::new())),routing:Default::default(),held:Default::default(),runs:Default::default(),legs:Default::default(),timers:Default::default(),next:Vec::new(),in_commands:false,pods:Default::default(),absent_after:None,decisions:Default::default(),warm:Default::default(),warm_seq:0};
     d.restore_admission().await?;
     let (model,input):(String,String)=hub.store.call(|c|Ok(c.query_row("SELECT workflow,input FROM ci_plans WHERE run_id='active-retry'",[],|r|Ok((r.get(0)?,r.get(1)?)))?)).await?;
     d.replay("active-retry",&model,&input).await?;

@@ -335,7 +335,7 @@ mod tests {
     fn dispatcher(hub: Arc<Hub>) -> Dispatch {
         Dispatch { hub, sched: Scheduler::new(Config::default()), routing: Default::default(), held: Default::default(), runs: Default::default(), legs: Default::default(),
             timers: Default::default(), next: Vec::new(), in_commands: false, pods: Default::default(), absent_after: None, decisions: Default::default(), warm: Default::default(),
-            warm_seq: 0, admission: Default::default(), pending_losses: Default::default(), pipeline_retries:Default::default() }
+            warm_seq: 0, admission: Default::default(), pending_losses: Default::default(), log_settle: Default::default(), pipeline_retries:Default::default() }
     }
 
     async fn fixture(hub: &Hub) -> anyhow::Result<String> {

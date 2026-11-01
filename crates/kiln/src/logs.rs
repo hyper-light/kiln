@@ -6,7 +6,7 @@
 //! A per-job byte cap bounds accepted bytes. `<step>.times` records projected byte offsets
 //! and arrival times for Ship's Output (plan 01a1856fe81375b1bd1d1d86f270a45b, step9).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -44,6 +44,8 @@ pub struct Logs {
     // U05: the SAME retained I/O survives net_loop supervision. Futures capture Projection,
     // never Logs/Hub, so this owner has no self-retaining Arc cycle.
     io: Arc<Mutex<accepted::Owner>>,
+    /// The legs whose runner said their log is all sent ([`Logs::mark_end`]).
+    ended: Arc<Mutex<HashSet<String>>>,
 }
 
 #[derive(Clone)]
@@ -53,7 +55,7 @@ pub(super) struct Projection {
 
 impl Projection {
     fn logs(&self)->Logs {
-        Logs{dir:self.dir.clone(),max_bytes:self.max_bytes,live:Arc::clone(&self.live),io:Arc::new(Mutex::new(accepted::Owner::default()))}
+        Logs{dir:self.dir.clone(),max_bytes:self.max_bytes,live:Arc::clone(&self.live),io:Arc::new(Mutex::new(accepted::Owner::default())),ended:Arc::default()}
     }
     fn max_bytes(&self)->u64 {self.max_bytes}
     fn append(&self,job:&str,step:u32,bytes:&[u8]) {self.logs().project(job,step,bytes)}
@@ -195,7 +197,23 @@ fn safe(id: &str) -> String {
 
 impl Logs {
     pub fn new(dir: PathBuf, max_bytes: u64) -> Self {
-        Self { dir, max_bytes, live: Arc::new(Mutex::new(HashMap::new())),io:Arc::new(Mutex::new(accepted::Owner::default())) }
+        Self { dir, max_bytes, live: Arc::new(Mutex::new(HashMap::new())),io:Arc::new(Mutex::new(accepted::Owner::default())), ended: Arc::default() }
+    }
+
+    /// Leg `job`'s runner said its log is all sent (`proto::CAP_LOG_END_MARK`): what came before
+    /// the mark on its lane is in the accepted owner's hands ([`Logs::settling`] until accepted).
+    pub(crate) fn mark_end(&self, job: &str) {
+        self.ended.lock().insert(job.to_owned());
+    }
+
+    /// Whether [`Logs::mark_end`] came for `job` since [`Logs::forget_end`].
+    pub(crate) fn end_marked(&self, job: &str) -> bool {
+        self.ended.lock().contains(job)
+    }
+
+    /// `job`'s mark let go of: its result was taken, or another attempt of it starts.
+    pub(crate) fn forget_end(&self, job: &str) {
+        self.ended.lock().remove(job);
     }
 
     pub(crate) fn bind_accepted(&self,store:crate::store::Store,blobs:Arc<dyn kiln_seams::blobs::Blobs>,host:String) {
@@ -526,6 +544,41 @@ mod tests {
             assert_eq!(logs.times("job1", 1).await.iter().map(|(at, _)| *at).collect::<Vec<_>>(), vec![0]);
             assert!(logs.times("job2", 0).await.is_empty());
             assert_eq!(times_of("0 1700000000000\n12 17000000\nnot a line\n40"), vec![(0, 1_700_000_000_000), (12, 17_000_000)]);
+            Ok(())
+        })
+    }
+
+    /// A leg is over only once the log the server has received of it is accepted
+    /// (`ci::dispatch`'s completion waits while it settles): a job's log input is settling from
+    /// the moment it's queued until the owner has accepted it.
+    #[test]
+    fn a_job_s_log_settles_once_what_was_received_of_it_is_accepted() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            // A running leg of a run: only a kiln job's log is taken.
+            hub.store.call(|c| {
+                c.execute("INSERT INTO repos (id,name,clone_url,created_at) VALUES ('settle-repo','settle-repo','file:///settle',1)", [])?;
+                c.execute("INSERT INTO runs (id,repo_id,number,pipeline,event,branch,sha,status,created_at,workflow_id) VALUES ('settle-run','settle-repo',1,'ci','push','main','abc','running',1,'ci.yml')", [])?;
+                c.execute("INSERT INTO jobs (id,run_id,key,display,status,labels,needs,spec,attempt) VALUES ('leg-a','settle-run','build','build','running','[]','[]','{}',1)", [])?;
+                Ok(())
+            }).await?;
+            anyhow::ensure!(!hub.logs.settling("leg-a") && !hub.logs.end_marked("leg-a"), "settling or marked with nothing received");
+            let append = hub.logs.append_server("leg-a".into(), 0, b"its last line\n".to_vec());
+            futures::pin_mut!(append);
+            // Polled once, it's the owner's to accept: queued, not yet in the log.
+            if let std::task::Poll::Ready(receipt) = futures::poll!(append.as_mut()) {
+                anyhow::bail!("accepted on its first poll, nothing to see settling: {:?}", receipt.map(|r| r.accepted));
+            }
+            anyhow::ensure!(hub.logs.settling("leg-a"), "not settling while queued");
+            anyhow::ensure!(!hub.logs.settling("leg-b"), "another job settles with it");
+            anyhow::ensure!(append.await?.accepted, "not accepted");
+            anyhow::ensure!(!hub.logs.settling("leg-a"), "still settling once accepted");
+            anyhow::ensure!(hub.logs.read("leg-a", 0).await == b"its last line\n", "the accepted line isn't read");
+            // Its runner's mark that all of it is sent, until its result is taken (proto::CAP_LOG_END_MARK).
+            hub.logs.mark_end("leg-a");
+            anyhow::ensure!(hub.logs.end_marked("leg-a") && !hub.logs.end_marked("leg-b"), "the mark isn't the leg's alone");
+            hub.logs.forget_end("leg-a");
+            anyhow::ensure!(!hub.logs.end_marked("leg-a"), "the mark outlived its result");
             Ok(())
         })
     }
