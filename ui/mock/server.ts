@@ -21,6 +21,7 @@ import { defaultRunner } from "./defaults.ts";
 import { AUTHORS, REPOS, commitMessage, hashStr, mockDirList, mulberry32, pick, pipelineFor, sha, stepLog, type JobTpl, type LogPlan, type Toolchain } from "./data.ts";
 import { handleAccounts, handleDemoSession, setDemoEmit } from "./accounts.ts";
 import { handleFamily, handleFamilySession, refuseAgent, setFamilyEmit } from "./agents.ts";
+import { handlePlanReview, handleReviewSession, reviewInfos, setReviewEmit } from "./plan-review.ts";
 import { ahead, note, runnerRefused } from "./refused.ts";
 import { handleGoals } from "./goals.ts";
 import { handlePrograms } from "./programs.ts";
@@ -29,6 +30,7 @@ import { handleSettings } from "./settings.ts";
 import { handleMachines } from "./machines.ts";
 import { handleKeep } from "./keep.ts";
 import { handleReap } from "./reap.ts";
+import { handleExperiments } from "./experiments.ts";
 import { handlePlaces } from "./places.ts";
 import { handleLongFiles, handleLongSession, handleShownPages, longInfo, searchSaid, sendAway, setLongEmit } from "./conversation.ts";
 import { fastInfos, handleFastSession } from "./fast.ts";
@@ -501,6 +503,7 @@ function emit(ev: ServerEvent) {
 setLongEmit((ev) => emit(ev as ServerEvent));
 setDemoEmit((ev) => emit(ev as ServerEvent));
 setFamilyEmit((ev) => emit(ev as ServerEvent));
+setReviewEmit((ev) => emit(ev as ServerEvent));
 
 function queueCounts() {
   let queued = 0;
@@ -1496,18 +1499,22 @@ const server = http.createServer(async (req, res) => {
     const opened = /^\/api\/harness\/sessions\/([^/]+)\/opened$/.exec(p);
     if (opened && m === "GET") return json(res, 200, []);
     if (opened && m === "POST") return err(res, 409, "opening an app on your device needs pages' own site: set [server] pages_url (docs/previews.md)");
+    // ---- plans waiting on a person's review (their stacks, plans and research first) ----
+    if (await handlePlanReview(req, res, url)) return;
     // ---- goal stacks ----
     if (await handleGoals(req, res, url)) return;
     if (await handlePrograms(req, res, url)) return;
     // ---- agents that run agents ----
     if (await handleShip(req, res, url, { json, liveJob, liveRun, push: () => void startRun(repos.find((r) => r.name === "hyper-light/kiln") ?? repos[0]!, { branch: "main", event: "push" }) })) return;
-    if (await handleFamily(req, res, url, () => [longInfo(), ...fastInfos()])) return;
+    if (await handleFamily(req, res, url, () => [longInfo(), ...fastInfos(), ...reviewInfos()])) return;
     // ---- harness accounts (and the demo agents to see them from) ----
     if (await handleMachines(req, res, url, { json, body })) return;
     // ---- copies runners keep of other runners' trees (docs/reach.md §5.1) ----
     if (await handleKeep(req, res, url, { json, body })) return;
     // ---- the reaper's policies (W24-R31) ----
     if (await handleReap(req, res, url, { json, body })) return;
+    // ---- experiments from an agent's question (docs/ci.md W20-R11) ----
+    if (await handleExperiments(req, res, url, { json, body })) return;
     if (await handleAccounts(req, res, url)) return;
     if (p === "/api/overview") return json(res, 200, overview());
 
@@ -1906,6 +1913,7 @@ server.on("upgrade", (req, socket, head) => {
     if (
       hm &&
       (handleDemoSession(ws, decodeURIComponent(hm[1]!)) ||
+        handleReviewSession(ws, decodeURIComponent(hm[1]!)) ||
         handleFamilySession(ws, decodeURIComponent(hm[1]!)) ||
         handleFastSession(ws, decodeURIComponent(hm[1]!), url.searchParams.get("patch") === "state") ||
         handleLongSession(ws, decodeURIComponent(hm[1]!), url.searchParams.get("z") === "gzip", url.searchParams.get("patch") === "state"))

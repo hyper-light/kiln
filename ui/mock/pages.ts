@@ -1082,22 +1082,23 @@ const RESEARCH = {
           "pl_planner",
           "The planner, researched and audited",
           [
-            "DuckDB enumerates join orders with DPhyp and falls back to a greedy order past 12 relations.",
-            "Umbra's adaptive compilation picks its plan before it compiles, from the same cost model.",
-            "Our planner costs a join by its inputs' row counts alone, with no distinct counts.",
+            ["DuckDB enumerates join orders with DPhyp and falls back to a greedy order past 12 relations.", 92],
+            ["Umbra's adaptive compilation picks its plan before it compiles, from the same cost model.", 74],
+            ["Our planner costs a join by its inputs' row counts alone, with no distinct counts.", 88],
           ],
-          { A: 2, B: 1 },
         ],
-        ["rs_store", "pl_store", "Build the data storage/transfer layer", [], {}],
+        ["rs_store", "pl_store", "Build the data storage/transfer layer", []],
         [
           "rs_opt",
           "pl_opt",
           "Optimize the QUIC API and s3 HTTP API",
-          ["The s3 API's PUT path copies each part twice before it reaches the store.", "hyper-quic's send path allocates a frame per write."],
-          { B: 1, C: 1 },
+          [
+            ["The s3 API's PUT path copies each part twice before it reaches the store.", 76],
+            ["hyper-quic's send path allocates a frame per write.", 58],
+          ],
         ],
       ] as const
-    ).map(([id, plan, question, claims, grades]) => [
+    ).map(([id, plan, question, claims]) => [
       id,
       {
         id,
@@ -1106,17 +1107,28 @@ const RESEARCH = {
         by: "agent:Release prep",
         plan,
         sources: [],
-        findings: claims.map((claim, i) => ({
+        findings: claims.map(([claim, score], i) => ({
           id: `${id}-f${i + 1}`,
           claim,
           cites: [],
           against: [],
           at: Date.now() - 60_000,
-          confidence: conf(80, "1 independent source; 1 of 1 quotes found where cited"),
+          confidence: conf(score, "1 independent source; 1 of 1 quotes found where cited"),
           against_weights: [],
         })),
         skipped: {},
-        summary: { findings: claims.length, grades, sources: claims.length, internal: claims.length, external: 0, checking: 0 },
+        summary: {
+          findings: claims.length,
+          grades: claims.reduce<Record<string, number>>((g, [, score]) => {
+            const grade = conf(score, "").grade;
+            g[grade] = (g[grade] ?? 0) + 1;
+            return g;
+          }, {}),
+          sources: claims.length,
+          internal: claims.length,
+          external: 0,
+          checking: 0,
+        },
         created_at: Date.now() - 10 * 60_000,
         updated_at: Date.now() - 60_000,
       },
@@ -1745,11 +1757,29 @@ export async function handlePages(req: http.IncomingMessage, res: http.ServerRes
 
   // Research
   if (p === "/api/research" && m === "GET") {
-    // One agent's, one plan's, or all, as the server answers.
+    // One agent's, one plan's, or all, newest first; holding the words asked for (`q`); in brief (`brief`), as the server answers.
     const agent = url.searchParams.get("agent");
     const plan = url.searchParams.get("plan");
-    const all = Object.values(RESEARCH) as { agent?: string | null; plan?: string | null }[];
-    return (void json(res, 200, { research: all.filter((r) => (!agent || r.agent === agent) && (!plan || r.plan === plan)) }), true);
+    const words = (url.searchParams.get("q") ?? "").trim().toLowerCase();
+    type Kept = {
+      id: string;
+      question: string;
+      agent?: string | null;
+      by: string;
+      plan?: string | null;
+      summary: unknown;
+      findings: { claim: string; cites: { quote?: string }[]; confidence: { grade: string; score: number } }[];
+      sources: { title: string; locator: string }[];
+      created_at: number;
+      updated_at: number;
+    };
+    const holds = (r: Kept) => !words || [r.question, ...r.findings.flatMap((f) => [f.claim, ...f.cites.map((c) => c.quote ?? "")]), ...r.sources.flatMap((x) => [x.title, x.locator])].some((t) => t.toLowerCase().includes(words));
+    const all = (Object.values(RESEARCH) as Kept[]).filter((r) => (!agent || r.agent === agent) && (!plan || r.plan === plan) && holds(r)).sort((x, y) => y.updated_at - x.updated_at);
+    const brief = (r: Kept) => {
+      const ranked = [...r.findings].sort((x, y) => y.confidence.score - x.confidence.score);
+      return { id: r.id, question: r.question, agent: r.agent ?? null, by: r.by, plan: r.plan ?? null, summary: r.summary, grades: ranked.map((f) => f.confidence.grade), best: ranked[0]?.claim ?? null, created_at: r.created_at, updated_at: r.updated_at };
+    };
+    return (void json(res, 200, { research: url.searchParams.get("brief") === "1" ? all.map(brief) : all }), true);
   }
   if ((mm = p.match(/^\/api\/research\/([^/]+)$/)) && m === "GET") {
     const r = RESEARCH[decodeURIComponent(mm[1]!)];
@@ -1757,18 +1787,21 @@ export async function handlePages(req: http.IncomingMessage, res: http.ServerRes
   }
   // Plans
   if (p === "/api/plans" && m === "GET") {
-    // An agent's (`session`), and the plan each agent proposed (`proposed`), when asked.
+    // An agent's (`session`), and the plan each agent proposed (`proposed`), when asked; newest first, holding the words asked for (`q`); in brief (`brief`).
     const session = url.searchParams.get("session");
     const proposed = url.searchParams.get("proposed") === "1";
+    const words = (url.searchParams.get("q") ?? "").trim().toLowerCase();
     const of = (pl: (typeof PLANS)[number]) => (pl as { source?: { session?: string; proposed?: boolean } | null }).source;
-    return (
-      void json(
-        res,
-        200,
-        PLANS.filter((pl) => (!session || of(pl)?.session === session) && (!proposed || of(pl)?.proposed)),
-      ),
-      true
-    );
+    const found = PLANS.filter(
+      (pl) => (!session || of(pl)?.session === session) && (!proposed || of(pl)?.proposed) && (!words || [pl.title, pl.body, ...pl.steps, ...pl.tags].some((t) => t.toLowerCase().includes(words))),
+    ).sort((x, y) => y.updated_at - x.updated_at);
+    const brief = (pl: (typeof PLANS)[number]) => {
+      const { body, items, steps, ...rest } = pl;
+      void body;
+      void items;
+      return { ...rest, step_count: steps.length };
+    };
+    return (void json(res, 200, url.searchParams.get("brief") === "1" ? found.map(brief) : found), true);
   }
   if ((mm = p.match(/^\/api\/plans\/([^/]+)(\/versions|\/runs)?$/)) && m === "GET") {
     const pl = PLANS.find((x) => x.id === decodeURIComponent(mm![1]!));

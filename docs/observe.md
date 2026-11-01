@@ -1041,9 +1041,14 @@ timestamp within the past 20 minutes"); they are stored and searched as any.
 (a batch a write's records, however many of its items hold them), the 99th percentile over the last
 five minutes, a quarter more, 2 to 30 s (learned as records come, so a fleet whose records take
 longer waits longer, and in the steady state each window is counted once). A window
-counted and then given more waits half as long as it has been since it ended before it is counted
-again, so however records trickle in, one is counted some fifteen times at the most; counting takes
-a quarter of each second at the most, never-counted windows first. A window a retention has cut
+counted and then given more waits half as long as it has been since it ended, or half as long as it
+has left of its twenty minutes if that is less, before it is counted again: however records trickle
+in, one is counted 25 times at the most (18 with a settle of 30 s), the last within a second of its
+twenty minutes' end, never left past them with records uncounted. (Half its age alone took a window first counted over 13⅓ minutes after it ended,
+as every window of the horizon is when the server starts, past its twenty minutes: records that
+came for it in time were never counted. The ClickHouse comparison found it, 2026-10-30.) Counting
+takes a quarter of each second at the most: a window within a minute of leaving the horizon first,
+then never-counted windows, oldest first. A window a retention has cut
 into (some of its records let go) is not counted, so no count is short: judged by the indexes still
 kept, an index's own retention and the logs'. Not by an index removed: its part's cutoff is stated
 now, and each minute while it holds rows, to let its records go at once, and judged by that, every
@@ -5085,6 +5090,23 @@ spans' trace metrics counted 18.2 s after it), and 179 of the browser suite's 18
 was WebKit's on a phone, the notebooks' first navigation interrupted by the incidents scenario's
 cleanup's, which that scenario had let go on unawaited (each scenario now starts from a blank
 page, de722eb4: with it, all 180 pass against the same server).
+
+Then, with main merged in as observe lands (2026-10-29, at b62672456d, adacachy shared with others'
+gates and production), the loads in a release build, with what they cost: the points' flood took
+393.9 M points in 20 s (19.7 M a second), none refused, a request's p50 0.24 ms and p99 0.54 ms,
+readable 73 ms after, the server 4.4 cores and 400 MiB at its peak, the runner 3.4 and 213 MiB,
+0.000 minor faults a point; the logs' 257 k records a second (1.5% of requests refused and sent
+again), its monitors finding every record 10.5 s after and its metrics from logs counting each once,
+the server 2.5 cores, 562 MiB, 0.016 faults a record; the traces' 641 k spans a second (0.6%
+refused), trace metrics counted 4.0 s after, the server 0.9 cores, 516 MiB, 0.005 faults a span; a
+runner whose server went away refusing 0.51 s after it (its target: 1 s), every point it took stored
+once. Each one's replicas agreed. A 20-minute soak held its level (the server's highest 266 MiB in
+the second third, 274 in the last; the runner's 107 and 98). And every live file passes: on adacachy
+at b62672456d, then, once the host's Docker daemon had stalled production's container for a while
+and Docker's tests moved off it, on fedora at 56247dcf6d: 65 scenarios, Docker's among them and kiln
+CD's (its own minikube profile, removed after). The containers' check had taken a container Docker
+was restarting (no process, so no cgroup to read) for one it runs; it asks for those running now
+(56247dcf6d).
 
 **On Windows** (2026-10-24, jupiter: Windows 11, x86_64, MSVC, Git for Windows' own
 `core.autocrlf`): 42 of the scenarios below pass there, at 7f607f14, ef10dc30 and 4747aca3 (the same

@@ -27,7 +27,7 @@ pub use admit::{Class, Decision, Demand, Waiting};
 pub use pace::Pace;
 
 /// What a person decides (everything else is measured): how many false alarms a day they'll
-/// accept, and how much of a served target's time its probes may take.
+/// accept, and how much of each target's time its probes may take.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Policy {
     pub false_alarms_per_day: f64,
@@ -39,8 +39,6 @@ pub struct Policy {
 pub struct Target {
     pub name: String,
     pub tolerance_us: f64,
-    /// It serves others (an HTTP or TCP target): its probes are held to the load share.
-    pub served: bool,
 }
 
 /// What the engine learned, kept between runs.
@@ -271,8 +269,7 @@ impl Engine {
         let d = self.learned.detectors.get(&t.name);
         let cost = d.and_then(detect::Detector::calm_us).unwrap_or(0.0);
         let delay = d.map_or(1.0, |d| d.delay_samples(self.policy.false_alarms_per_day));
-        let service = t.served.then_some((cost, self.policy.probe_load_share));
-        detect::interval_us(t.tolerance_us, self.learned.knee.lag_us.unwrap_or(0.0), delay, cost, service)
+        detect::interval_us(t.tolerance_us, self.learned.knee.lag_us.unwrap_or(0.0), delay, cost, self.policy.probe_load_share)
     }
 
     pub fn step(&mut self, o: &Observation) -> Plan {
@@ -592,7 +589,7 @@ mod tests {
     fn engine() -> Engine {
         Engine::new(
             Policy { false_alarms_per_day: 1.0, probe_load_share: 0.1 },
-            vec![Target { name: "disk".into(), tolerance_us: 1e6, served: false }],
+            vec![Target { name: "disk".into(), tolerance_us: 1e6 }],
             Learned::default(),
             0,
         )
@@ -600,6 +597,34 @@ mod tests {
 
     fn group(id: &str, w: f64, share: f64) -> Group {
         Group { id: id.into(), key: id.into(), class: Class::Agent, protected: false, write_bps: w, cpu_cores: 1.0, mem_bytes: 1e9, share }
+    }
+
+    /// 2026-10-30: a cut lag learned on 10-28 (221 s), past the 1 s tolerance, had adacachy's
+    /// runner probe production's server about 270 times a second and its disk back to back. A lag
+    /// past the tolerance no longer speeds probing, and the disk is held to the load share too.
+    #[test]
+    fn a_lag_past_the_tolerance_leaves_probing_at_its_calm_pace() -> anyhow::Result<()> {
+        let targets = vec![Target { name: "disk".into(), tolerance_us: 1e6 }, Target { name: "server".into(), tolerance_us: 1e6 }];
+        let run = |lag: Option<f64>| {
+            let mut learned = Learned::default();
+            learned.knee.lag_us = lag;
+            let mut e = Engine::new(Policy { false_alarms_per_day: 1.0, probe_load_share: 0.1 }, targets.clone(), learned, 0);
+            let mut every = BTreeMap::new();
+            for i in 0..100u64 {
+                every = e.step(&Observation { now_us: i * 1_000_000, answers: vec![("disk".into(), Answer::Took(9_200.0)), ("server".into(), Answer::Took(145.0))], mem_free: 1e11, ..Observation::default() }).probe_every_us;
+            }
+            (every, e.learned.knee.lag_us)
+        };
+        let (calm, _) = run(None);
+        let (stale, kept) = run(Some(221e6));
+        anyhow::ensure!(kept == Some(221e6), "the lag is still the one learned: {kept:?}");
+        for name in ["disk", "server"] {
+            let (c, s) = (calm.get(name).copied().unwrap_or(0.0), stale.get(name).copied().unwrap_or(0.0));
+            anyhow::ensure!(c > 0.0 && (s - c).abs() <= c * 1e-9, "{name}: every {s} µs with the stale lag, {c} µs without");
+        }
+        // A 9.2 ms fsync takes at most a tenth of the disk's time.
+        anyhow::ensure!(stale.get("disk").copied().unwrap_or(0.0) >= 92_000.0 * (1.0 - 1e-9), "disk probed every {:?} µs", stale.get("disk"));
+        Ok(())
     }
 
     #[test]
