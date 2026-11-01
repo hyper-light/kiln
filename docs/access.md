@@ -95,6 +95,16 @@ lead to, and `kiln verify --offline trail.json --root kiln-root.pem` checks it a
 changed. A revision's Source VSA (SLSA's source track), `kiln verify vsa <repository>@<commit>`, is
 the same check's verdict signed as kiln's server.
 
+**Custody.** Everything that changes hands in kiln is a transfer both its sides sign (docs/ci.md
+W27-R08): the holder signs its hand-on, the taker its receipt, each by digests both sides compute,
+and kiln keeps both. What a copy left behind signs, and a word reaching a process it isn't for, are
+refused and recorded (`kiln transfers refused`); a hand-over a side from before couldn't sign is
+recorded as unsigned, saying which side (`kiln transfers unsigned`). `kiln custody walk <digest>`
+(anyone with `audit.read`, as `GET /api/custody/walk`) walks a thing's chain back from where it's
+used, a pod's image, to where it was made, its commit, hop by hop, and names the first break.
+`--export <file>` writes every record the walk read as signed, with kiln's CA certificate and its
+revocations, so an auditor can check each signature and walk it again without kiln.
+
 **Jobs ask for what they need** with a new pipeline key, so no pipeline needs the admin token in
 a secret:
 
