@@ -4,7 +4,6 @@
  * CPU and memory against its limits, its host and pod, how long it has run; running ones first,
  * stopped ones an hour after; found by a part of a name or by a tag, ordered by a figure.
  */
-import * as React from "react";
 import { observeApi, type Container, type ContainerQuery } from "@/api/observe";
 import { TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
@@ -12,6 +11,7 @@ import { PageIntro, SelectField } from "@/components/ui/misc";
 import { Segmented } from "@/components/ui/tabs";
 import { useRes, type Res } from "@/lib/data";
 import { formatBytes, formatDuration } from "@/lib/format";
+import { useFieldText } from "@/lib/hooks";
 import { Link } from "@/lib/router";
 import { ObserveNav, compact, useParam, useParams } from "./parts";
 
@@ -77,7 +77,7 @@ export default function Containers() {
           <Counted q={q} show={shown} onShow={(v) => set({ state: v === "running" ? null : v })} />
         </Loadable>
         <SelectField label="Order" hideLabel value={sort} onChange={(v) => set({ sort: v === "name" ? null : v })} options={SORTS} className="min-w-[12rem]" />
-        <Search key={q} q={q} onQ={(v) => set({ q: v || null })} />
+        <Search q={q} onQ={(v) => set({ q: v || null })} />
       </div>
       <Loadable key={`${q}/${sort}/${shown}`} label="the containers" fallback={<TableHold head={<Head />} rows={6} />}>
         <List q={q} sort={sort} state={shown} />
@@ -109,7 +109,7 @@ function Counted({ q, show, onShow }: { q: string; show: State; onShow: (s: Stat
 }
 
 function Search({ q, onQ }: { q: string; onQ: (q: string) => void }) {
-  const [text, setText] = React.useState(q);
+  const [text, setText] = useFieldText(q);
   return (
     <form
       className="field w-full sm:ml-auto sm:w-80"

@@ -57,7 +57,7 @@ export default function TraceExplorer() {
       <PageIntro index={8} label="Observe" title="Traces" lead="Every span services send: search them as Datadog's trace explorer does, see how they fall over time, and open any one's trace." />
       <ObserveNav />
       <ApmTabs />
-      <SearchForm key={q} initial={q} onSearch={setQ} placeholder={'service:checkout status:error @duration:>250ms resource_name:"GET /cart"'} />
+      <SearchForm initial={q} onSearch={setQ} placeholder={'service:checkout status:error @duration:>250ms resource_name:"GET /cart"'} />
       <div className="mb-5">
         <RangePicker value={range} onChange={setRange} />
       </div>

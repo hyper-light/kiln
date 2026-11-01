@@ -179,13 +179,19 @@ interface List {
 }
 
 function DeploymentsBody() {
-  const { params, setParams, filters, sort, key } = useFilters();
+  const { params, setParams, filters: asked, sort: askedSort, key: askedKey } = useFilters();
+  // What the list reads and shows: the filters a moment behind while a new one's apps load, so the page
+  // (the field being typed in among it) stays as it is until they're in, instead of going back to its
+  // loading shape. What's picked shows at once.
+  const filters = React.useDeferredValue(asked);
+  const sort = React.useDeferredValue(askedSort);
+  const key = React.useDeferredValue(askedKey);
   const choice: Chosen = {
-    sync: filters.sync ?? [],
-    health: filters.health ?? [],
-    cluster: filters.cluster ?? [],
-    project: filters.project ?? [],
-    namespace: filters.namespace ?? [],
+    sync: asked.sync ?? [],
+    health: asked.health ?? [],
+    cluster: asked.cluster ?? [],
+    project: asked.project ?? [],
+    namespace: asked.namespace ?? [],
   };
   const setChoice = (c: Chosen) => {
     const next = new URLSearchParams(params);
@@ -203,7 +209,7 @@ function DeploymentsBody() {
     setParams(next, { replace: true });
   };
   // What's typed filters at once here and reaches the URL (and the server) a moment later.
-  const [query, setQuery] = React.useState(filters.q ?? "");
+  const [query, setQuery] = React.useState(asked.q ?? "");
   const typing = React.useRef<number | null>(null);
   const onQuery = (q: string) => {
     setQuery(q);
@@ -356,7 +362,7 @@ function DeploymentsBody() {
       <Summary s={summary} />
       <FilterBar>
         <FacetBox label="Filter apps" placeholder="Filter by name, sync, health, project, cluster…" query={query} onQuery={onQuery} facets={groups} chosen={choice} onChosen={setChoice} />
-        <SelectField label="Sort apps" hideLabel value={sort} onChange={setSort} options={SORTS} />
+        <SelectField label="Sort apps" hideLabel value={askedSort} onChange={setSort} options={SORTS} />
       </FilterBar>
 
       <div className="cd-list-head">
@@ -442,10 +448,13 @@ function DeploymentsHold() {
       <p className="cd-summary-line" aria-hidden="true">
         <span className="cd-count">{" "}</span>
       </p>
-      <FilterBar>
-        <FacetBox label="Filter apps" placeholder="Filter by name, sync, health, project, cluster…" facets={[]} chosen={{}} onChosen={noop} />
-        <SelectField label="Sort apps" hideLabel value={sort} onChange={noop} options={SORTS} />
-      </FilterBar>
+      {/* The filter's shape, not one to type in yet: words typed there would go as the list comes. */}
+      <div inert>
+        <FilterBar>
+          <FacetBox label="Filter apps" placeholder="Filter by name, sync, health, project, cluster…" facets={[]} chosen={{}} onChosen={noop} />
+          <SelectField label="Sort apps" hideLabel value={sort} onChange={noop} options={SORTS} />
+        </FilterBar>
+      </div>
       <div className="cd-list-head">
         <label className="cd-pick">
           <input type="checkbox" className="check" disabled aria-label="Select every app shown" />
