@@ -826,7 +826,7 @@ function Dock({
   const harnessSession = useSession(store, (s) => s.state?.harness_session ?? s.info?.harness_session);
   const [moving, setMoving] = React.useState(false);
   return (
-    <div className="hx-dock" onPointerDown={keepTyping} onMouseDown={keepTyping}>
+    <div className="hx-dock" ref={liftNotices} onPointerDown={keepTyping} onMouseDown={keepTyping}>
       <ActivityLine store={store} onOpenTask={onOpenTask} kiln={kiln} inThread={task} rows={rows} picks={picks} onPick={pick} />
       {status === "exited" && exit?.error && empty ? (
         <div className="hx-startfail" role="alert">
@@ -889,6 +889,34 @@ function Dock({
 function keepTyping(e: React.PointerEvent | React.MouseEvent) {
   const t = e.target as Element;
   if (document.activeElement?.classList.contains("hx-compose-input") && t.closest("button") && !t.closest("input, textarea, select")) e.preventDefault();
+}
+
+/** kiln's notifications at the window's bottom right (toasts, and the cards of other agents waiting
+ *  on you) sit above the dock wherever they'd cover it, not over the message box: at a phone's or a
+ *  tablet's width, or a desktop's with the inspector put away (W21-R13). The dock's height lifts
+ *  them (`--dock-height`, index.css). */
+function liftNotices(dock: HTMLElement | null) {
+  if (!dock) return;
+  const root = document.documentElement;
+  const measure = () => {
+    // Their column: the shell's toast stack's, which has its width even when it's empty.
+    const column = document.querySelector(".toast-viewport")?.getBoundingClientRect();
+    const box = dock.getBoundingClientRect();
+    const style = getComputedStyle(dock);
+    const covers = !!column && column.left < box.right - parseFloat(style.paddingRight) && box.left + parseFloat(style.paddingLeft) < column.right;
+    if (covers) root.style.setProperty("--dock-height", `${Math.round(box.height)}px`);
+    else root.style.removeProperty("--dock-height");
+  };
+  measure();
+  // Its border box: the side tray put away widens the dock but not its column, which its padding keeps.
+  const observer = new ResizeObserver(measure);
+  observer.observe(dock, { box: "border-box" });
+  window.addEventListener("resize", measure);
+  return () => {
+    observer.disconnect();
+    window.removeEventListener("resize", measure);
+    root.style.removeProperty("--dock-height");
+  };
 }
 
 /** A phone's tabs, with what each holds. */
@@ -959,7 +987,7 @@ function AgentLoading({ id }: { id: string }) {
         <LoadingMark />
         <PrismLabel live>Loading conversation</PrismLabel>
       </div>
-      <div className="hx-dock">
+      <div className="hx-dock" ref={liftNotices}>
         <div className="hx-composer cp">
           <div className="hx-compose-box">
             <div className="cp-field">
