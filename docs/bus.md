@@ -156,7 +156,7 @@ an "Events" row of them.
 
 ## Vendoring
 
-kiln vendors Quiver (`vendor/quiver`, at `44bae34`, whose simulation of the persisted class ran
+kiln vendors Quiver (`vendor/quiver`, at `772559a`, whose simulation of the persisted class ran
 10,000 seeds alike in two passes and lost no acknowledged publish), Focal's bus (`vendor/focal-bus`,
 branch `bus-replicated` at `b6cf8e3`) and hyper-raft (`vendor/hyper-raft`, at `c6baec2`, its `main`
 and the revision Focal's bus takes) at the revisions Quiver takes them, with Quiver's recorded
