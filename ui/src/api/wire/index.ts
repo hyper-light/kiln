@@ -55,6 +55,7 @@ export type { FileChange } from "./FileChange";
 export type { FileDiff } from "./FileDiff";
 export type { FileKey } from "./FileKey";
 export type { FileMeta } from "./FileMeta";
+export type { FilePlace } from "./FilePlace";
 export type { GateResult } from "./GateResult";
 export type { Given } from "./Given";
 export type { Gpu } from "./Gpu";

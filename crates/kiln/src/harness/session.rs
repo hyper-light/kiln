@@ -3148,6 +3148,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                 let mut ending = false;
                 // Stopped by force (`Command::ForceStop`): it starts again now, whatever is under way.
                 let mut forcing = false;
+                // Where this machine keeps what's an agent's own: whose each file it changes is.
+                let roots = std::sync::Arc::new(super::whose::Roots::here(&spec.env));
                 loop {
                     for job in jobs.previews.drain(..) {
                         let tx = pv_tx.clone();
@@ -3158,15 +3160,19 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         });
                     }
                     for job in jobs.changes.drain(..) {
-                        // Placed among its folder's repository's working trees (a worktree it went into).
-                        let home = {
+                        // Placed among its folder's repository's working trees (a worktree it went into),
+                        // and said whose it is: this project's, the person's or an agent's own.
+                        let (home, folders) = {
                             let mut core = s.core.lock();
                             core.start_change(&job.abs);
-                            core.state.cwd.clone()
+                            let cwd = core.state.cwd.clone();
+                            core.note_folder(&cwd);
+                            (cwd, core.folders().to_vec())
                         };
+                        let roots = roots.clone();
                         changes.push(async move {
                             let abs = job.abs.clone();
-                            let change = crate::rt::blocking(move || super::diff::placed_change(&job, &home)).await.unwrap_or((None, None));
+                            let change = crate::rt::blocking(move || super::diff::placed_change(&job, &home, &folders, &roots)).await.unwrap_or((None, None));
                             (abs, change)
                         });
                     }

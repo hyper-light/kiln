@@ -317,6 +317,11 @@ pub struct Core {
     /// The changeset: one entry per file that differs from its baseline (absolute path keys).
     changes: std::collections::BTreeMap<String, super::model::FileChange>,
     changes_dirty: bool,
+    /// Who changed each file, in the order they first did ([`super::model::FileChange::by`]).
+    by: HashMap<String, Vec<String>>,
+    /// The folders it has worked in, the first it had first: their files are this project's
+    /// ([`super::whose`]).
+    folders: Vec<String>,
     /// What the session has to do for the adapter (restart, branch).
     pub effects: Vec<Effect>,
     /// Output of tasks kiln keeps itself, by task id (not sent with the state).
@@ -389,6 +394,8 @@ impl Core {
             changing: HashSet::new(),
             changes: std::collections::BTreeMap::new(),
             changes_dirty: false,
+            by: HashMap::new(),
+            folders: Vec::new(),
             effects: Vec::new(),
             task_output: HashMap::new(),
             reset: false,
@@ -445,6 +452,7 @@ impl Core {
         c.state = f.state;
         c.meta = f.meta;
         c.baselines = f.baselines;
+        c.by = f.changes.iter().filter(|(_, ch)| !ch.by.is_empty()).map(|(abs, ch)| (abs.clone(), ch.by.clone())).collect();
         c.changes = f.changes;
         c.changes_dirty = !c.changes.is_empty();
         c.task_output = f
@@ -575,9 +583,14 @@ impl Core {
         self.baselines.insert(abs.to_owned(), before);
     }
 
-    /// Recompute `abs` (shown as `rel`) once the brain gets to it.
-    pub fn want_change(&mut self, abs: &str, rel: &str) {
+    /// Recompute `abs` (shown as `rel`) once the brain gets to it, `by` having changed it: the agent
+    /// itself ([`super::model::BY_AGENT`]) or a subagent run of its harness's.
+    pub fn want_change(&mut self, abs: &str, rel: &str, by: &str) {
         let Some(baseline) = self.baselines.get(abs).cloned() else { return };
+        let who = self.by.entry(abs.to_owned()).or_default();
+        if !who.iter().any(|w| w == by) {
+            who.push(by.to_owned());
+        }
         self.change_jobs.retain(|j| j.abs != abs);
         self.change_jobs.push(ChangeJob { abs: abs.to_owned(), rel: rel.to_owned(), baseline });
     }
@@ -605,6 +618,7 @@ impl Core {
             return;
         }
         if let Some(c) = change.as_mut() {
+            c.by = self.by.get(abs).cloned().unwrap_or_default();
             if let Some(before) = self.changes.get(abs) {
                 // Recomputing the same diff does not make it a newer change.
                 let at = c.at;
@@ -625,10 +639,13 @@ impl Core {
                 self.changes.remove(abs);
             }
         }
+        // What it changed is this project's files (the Changes tab's scope at first): the person's
+        // elsewhere and the agents' own are in the changeset, not in these counts.
+        let project = |c: &&super::model::FileChange| c.place.is_none_or(|p| p == super::model::FilePlace::Project);
         let s = &mut self.state;
-        s.files_changed = u32::try_from(self.changes.len()).unwrap_or(u32::MAX);
-        s.lines_added = self.changes.values().map(|c| c.added).sum();
-        s.lines_removed = self.changes.values().map(|c| c.removed).sum();
+        s.files_changed = u32::try_from(self.changes.values().filter(project).count()).unwrap_or(u32::MAX);
+        s.lines_added = self.changes.values().filter(project).map(|c| c.added).sum();
+        s.lines_removed = self.changes.values().filter(project).map(|c| c.removed).sum();
         // Its work is in the working tree of its latest change in one (a worktree it went into, or
         // its folder's own): a scratch file elsewhere doesn't move it.
         s.tree = self.changes.values().filter(|c| c.tree.is_some()).max_by_key(|c| c.at).and_then(|c| c.tree.clone());
@@ -638,6 +655,18 @@ impl Core {
 
     pub fn changes(&self) -> Vec<super::model::FileChange> {
         self.changes.values().cloned().collect()
+    }
+
+    /// It works in `dir` (its folder now): kept among the folders it has worked in.
+    pub fn note_folder(&mut self, dir: &str) {
+        if !dir.is_empty() && !self.folders.iter().any(|f| f == dir) {
+            self.folders.push(dir.to_owned());
+        }
+    }
+
+    /// The folders it has worked in, the first it had first.
+    pub fn folders(&self) -> &[String] {
+        &self.folders
     }
 
     pub fn now() -> i64 {
@@ -1337,23 +1366,23 @@ mod tests {
         let mut c = Core::new();
         let change = |added, at| FileChange {
             path: "a.rs".into(), tree: None, created: false, deleted: false, added, removed: 1,
-            hunks: Vec::new(), truncated: true, at,
+            hunks: Vec::new(), truncated: true, at, by: Vec::new(), place: None,
         };
         let before = change(1, 1);
         c.set_change("/a.rs", Some(before.clone()), None);
         c.take_out();
         c.note_baseline("/a.rs", Baseline::Reverse(Vec::new()));
-        c.want_change("/a.rs", "first.rs");
+        c.want_change("/a.rs", "first.rs", super::super::model::BY_AGENT);
         let jobs = c.take_change_jobs();
         assert_eq!(jobs.len(), 1);
         c.start_change("/a.rs");
-        c.want_change("/a.rs", "old.rs");
-        c.want_change("/a.rs", "latest.rs");
+        c.want_change("/a.rs", "old.rs", super::super::model::BY_AGENT);
+        c.want_change("/a.rs", "latest.rs", super::super::model::BY_AGENT);
         assert_eq!(c.change_jobs.len(), 1);
         assert!(c.take_change_jobs().is_empty());
         // Another file need not wait for this one.
         c.note_baseline("/b.rs", Baseline::Absent);
-        c.want_change("/b.rs", "b.rs");
+        c.want_change("/b.rs", "b.rs", super::super::model::BY_AGENT);
         assert_eq!(c.take_change_jobs().iter().map(|j| j.abs.as_str()).collect::<Vec<_>>(), vec!["/b.rs"]);
         // A superseded result can resolve the original baseline, but cannot replace the shown diff.
         let baseline = Baseline::Text("original\n".into());
@@ -1364,7 +1393,7 @@ mod tests {
         c.start_change("/a.rs");
         let latest = change(2, 3);
         c.set_change("/a.rs", Some(latest.clone()), None);
-        assert_eq!(c.changes(), vec![latest]);
+        assert_eq!(c.changes(), vec![FileChange { by: vec![super::super::model::BY_AGENT.into()], ..latest }]);
         assert_eq!((c.state.files_changed, c.state.lines_added, c.state.lines_removed), (1, 2, 1));
         assert!(c.take_out().iter().any(|u| matches!(u, Update::Changes { .. })));
     }
@@ -1375,7 +1404,7 @@ mod tests {
         let mut c = Core::new();
         let change = |path: &str, tree: Option<&str>, at| FileChange {
             path: path.into(), tree: tree.map(str::to_owned), created: true, deleted: false, added: 1, removed: 0,
-            hunks: Vec::new(), truncated: false, at,
+            hunks: Vec::new(), truncated: false, at, by: Vec::new(), place: None,
         };
         c.set_change("/r/a.rs", Some(change("a.rs", Some("/r"), 1)), None);
         assert_eq!(c.state.tree.as_deref(), Some("/r"));
@@ -1390,6 +1419,53 @@ mod tests {
         assert_eq!(c.state.tree.as_deref(), Some("/r"));
     }
 
+    /// Who changed a file is said in the order they first did: the agent, then a subagent run of
+    /// its harness's; the agent again adds nothing (docs/agents.md, "Who changed a file").
+    #[test]
+    fn a_file_says_who_changed_it_in_the_order_they_first_did() {
+        use super::super::model::{BY_AGENT, FileChange, FilePlace};
+        let mut c = Core::new();
+        let change = |added| FileChange {
+            path: "a.rs".into(), tree: None, created: false, deleted: false, added, removed: 0,
+            hunks: Vec::new(), truncated: true, at: 1, by: Vec::new(), place: Some(FilePlace::Project),
+        };
+        c.note_baseline("/w/a.rs", Baseline::Text("one\n".into()));
+        c.want_change("/w/a.rs", "a.rs", BY_AGENT);
+        for j in c.take_change_jobs() {
+            c.start_change(&j.abs);
+        }
+        c.set_change("/w/a.rs", Some(change(1)), None);
+        c.want_change("/w/a.rs", "a.rs", "toolu_sub");
+        c.want_change("/w/a.rs", "a.rs", BY_AGENT);
+        for j in c.take_change_jobs() {
+            c.start_change(&j.abs);
+        }
+        c.set_change("/w/a.rs", Some(change(2)), None);
+        let by: Vec<Vec<String>> = c.changes().into_iter().map(|f| f.by).collect();
+        assert_eq!(by, vec![vec![BY_AGENT.to_owned(), "toolu_sub".to_owned()]]);
+        // An in-place upgrade keeps who changed it.
+        let thawed = Core::thaw(c.freeze());
+        assert_eq!(thawed.by.get("/w/a.rs").cloned(), Some(vec![BY_AGENT.to_owned(), "toolu_sub".to_owned()]));
+    }
+
+    /// Its counts (the tab's, Mission control's) are this project's files: the person's elsewhere
+    /// and the agents' own stay in its changeset, out of them; one from a runner that doesn't say
+    /// whose it is counts as this project's.
+    #[test]
+    fn its_counts_are_this_projects_files() {
+        use super::super::model::{FileChange, FilePlace};
+        let mut c = Core::new();
+        let change = |path: &str, added, place| FileChange {
+            path: path.into(), tree: None, created: true, deleted: false, added, removed: 0,
+            hunks: Vec::new(), truncated: true, at: 1, by: Vec::new(), place,
+        };
+        c.set_change("/w/a.rs", Some(change("a.rs", 3, Some(FilePlace::Project))), None);
+        c.set_change("/h/.zshrc", Some(change("/h/.zshrc", 1, Some(FilePlace::User))), None);
+        c.set_change("/h/.claude/projects/w/memory/m.md", Some(change("/h/.claude/projects/w/memory/m.md", 5, Some(FilePlace::Agent))), None);
+        c.set_change("/w/b.rs", Some(change("b.rs", 2, None)), None);
+        assert_eq!((c.changes().len(), c.state.files_changed, c.state.lines_added), (4, 2, 5));
+    }
+
     #[test]
     fn unchanged_diffs_do_not_resend_the_changeset() {
         use super::super::model::{FileChange, Hunk};
@@ -1398,7 +1474,7 @@ mod tests {
         let first = FileChange {
             path: "a.rs".into(), tree: None, created: true, deleted: false, added: 1, removed: 0,
             hunks: vec![Hunk { old_start: 0, old_lines: 0, new_start: 1, new_lines: 1, lines: vec!["+one".into()] }],
-            truncated: false, at: 1,
+            truncated: false, at: 1, by: Vec::new(), place: None,
         };
         c.set_change("/a.rs", Some(first.clone()), None);
         assert!(c.take_out().iter().any(|u| matches!(u, Update::Changes { files } if files.as_slice() == std::slice::from_ref(&first))));

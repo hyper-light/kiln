@@ -2884,7 +2884,8 @@ impl Claude {
             ToolStatus::Done
         };
         if status == ToolStatus::Done {
-            track_changes(core, structured);
+            let by = core.get(tid).and_then(|e| e.parent.clone()).unwrap_or_else(|| super::model::BY_AGENT.to_owned());
+            track_changes(core, structured, &by);
             follow_worktree(core, &name, structured);
         }
         self.relayed(core, tid, status == ToolStatus::Done, &text);
@@ -3682,8 +3683,9 @@ pub fn doing(t: &ToolCall) -> String {
     }
 }
 
-/// Note the files a finished edit changed, for the session's changeset.
-fn track_changes(core: &mut Core, structured: &Value) {
+/// Note the files a finished edit changed, for the session's changeset, `by` having made it (the
+/// agent itself, or the subagent run its call is in).
+fn track_changes(core: &mut Core, structured: &Value, by: &str) {
     use super::core::{BASELINE_MAX, Baseline};
     let Some(o) = structured.as_object() else { return };
     let cwd = core.state.cwd.clone();
@@ -3700,13 +3702,13 @@ fn track_changes(core: &mut Core, structured: &Value) {
             };
             core.note_baseline(&a, before);
         }
-        core.want_change(&a, &rel(fp, &cwd));
+        core.want_change(&a, &rel(fp, &cwd), by);
     }
     // Files a shell command changed that the agent had read or edited before.
     if let Some(files) = o.get("bashEditDiff").and_then(|b| b.get("files")).and_then(Value::as_array) {
         for f in files {
             if let Some(fp) = f.get("filePath").and_then(Value::as_str) {
-                core.want_change(&abs(fp), &rel(fp, &cwd));
+                core.want_change(&abs(fp), &rel(fp, &cwd), by);
             }
         }
     }

@@ -314,15 +314,21 @@ pub fn file_change(job: &super::core::ChangeJob) -> (Option<super::model::FileCh
 
 /// [`file_change`], the change placed in its working tree when that's one of the repository of
 /// `home` (the agent's folder; a worktree it went into is one): its tree, and its path in it, as
-/// git names it. Its other files keep the path the harness gave. Blocking.
-pub fn placed_change(job: &super::core::ChangeJob, home: &str) -> (Option<super::model::FileChange>, Option<super::core::Baseline>) {
+/// git names it. Its other files keep the path the harness gave. And whose it is
+/// (`super::whose`): `folders` are those the session has worked in, `roots` the machine's.
+/// Blocking.
+pub fn placed_change(job: &super::core::ChangeJob, home: &str, folders: &[String], roots: &super::whose::Roots) -> (Option<super::model::FileChange>, Option<super::core::Baseline>) {
     let (mut change, resolved) = file_change(job);
-    if let Some(c) = change.as_mut()
-        && !home.is_empty()
-        && let Some((top, rel)) = crate::workspace::git::within(std::path::Path::new(&job.abs), std::path::Path::new(home))
-    {
-        c.tree = Some(top.to_string_lossy().into_owned());
-        c.path = rel;
+    if let Some(c) = change.as_mut() {
+        let abs = std::path::Path::new(&job.abs);
+        if !home.is_empty()
+            && let Some((top, rel)) = crate::workspace::git::within(abs, std::path::Path::new(home))
+        {
+            c.tree = Some(top.to_string_lossy().into_owned());
+            c.path = rel;
+        }
+        let project = super::whose::in_project(abs, c.tree.is_some(), folders, &roots.home);
+        c.place = Some(super::whose::place_of(abs, project, roots));
     }
     (change, resolved)
 }
@@ -357,20 +363,20 @@ fn compare(job: &super::core::ChangeJob, now: Option<Result<String, ()>>) -> Opt
         hunks.truncate(keep);
         (hunks, cut)
     };
-    let blank = |rel: &str| FileChange { path: rel.to_owned(), tree: None, created: false, deleted: false, added: 0, removed: 0, hunks: Vec::new(), truncated: true, at };
+    let blank = |rel: &str| FileChange { path: rel.to_owned(), tree: None, created: false, deleted: false, added: 0, removed: 0, hunks: Vec::new(), truncated: true, at, by: Vec::new(), place: None };
     match (&job.baseline, now) {
         (Baseline::Absent, None) => None,
         (Baseline::Absent, Some(Ok(text))) => {
             let d = created(&job.rel, &text);
             let (add, _) = count(&d.hunks);
             let (hunks, cut) = shown(d.hunks);
-            Some(FileChange { path: job.rel.clone(), tree: None, created: true, deleted: false, added: add, removed: 0, hunks, truncated: cut, at })
+            Some(FileChange { path: job.rel.clone(), tree: None, created: true, deleted: false, added: add, removed: 0, hunks, truncated: cut, at, by: Vec::new(), place: None })
         }
         (Baseline::Text(before), None) => {
             let hunks = hunks(before, "", CONTEXT);
             let (_, del) = count(&hunks);
             let (hunks, cut) = shown(hunks);
-            Some(FileChange { path: job.rel.clone(), tree: None, created: false, deleted: true, added: 0, removed: del, hunks, truncated: cut, at })
+            Some(FileChange { path: job.rel.clone(), tree: None, created: false, deleted: true, added: 0, removed: del, hunks, truncated: cut, at, by: Vec::new(), place: None })
         }
         (Baseline::Text(before), Some(Ok(text))) => {
             if *before == text {
@@ -382,7 +388,7 @@ fn compare(job: &super::core::ChangeJob, now: Option<Result<String, ()>>) -> Opt
             }
             let (add, del) = count(&all);
             let (hunks, cut) = shown(all);
-            Some(FileChange { path: job.rel.clone(), tree: None, created: false, deleted: false, added: add, removed: del, hunks, truncated: cut, at })
+            Some(FileChange { path: job.rel.clone(), tree: None, created: false, deleted: false, added: add, removed: del, hunks, truncated: cut, at, by: Vec::new(), place: None })
         }
         (Baseline::TooLarge | Baseline::Reverse(_), _) | (_, Some(Err(()))) => Some(blank(&job.rel)),
     }

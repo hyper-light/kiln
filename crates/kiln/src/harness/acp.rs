@@ -1467,7 +1467,7 @@ impl Acp {
                         let abs = if std::path::Path::new(&path).is_absolute() { path.clone() } else { format!("{}/{path}", core.state.cwd.trim_end_matches('/')) };
                         let rel = super::claude::rel(&path, &core.state.cwd);
                         core.note_baseline(&abs, old.map_or(Baseline::Absent, Baseline::Text));
-                        core.want_change(&abs, &rel);
+                        core.want_change(&abs, &rel, super::model::BY_AGENT);
                     }
                 }
                 if matches!(call.status, ToolStatus::Running | ToolStatus::Pending) {

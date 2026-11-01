@@ -262,6 +262,35 @@ pub struct FileChange {
     pub truncated: bool,
     /// Unix ms of the last change.
     pub at: i64,
+    /// Who changed it, in the order they first did: the agent itself ([`BY_AGENT`]) or a subagent
+    /// run of its harness's, by its spawning call's id (as its events' [`Event::parent`] names it).
+    /// None from a runner that doesn't say.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub by: Vec<String>,
+    /// Whose it is: the Changes tab's scope shows this project's at first. None from a runner that
+    /// doesn't say: read as this project's, so it shows at every scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub place: Option<FilePlace>,
+}
+
+/// [`FileChange::by`]'s name for the agent itself, beside its subagents' runs.
+pub const BY_AGENT: &str = "main";
+
+/// Whose a changed file is (docs/agents.md, "Who changed a file, and whose it is").
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum FilePlace {
+    /// This project's: in the agent's folder or one it moved to, or in a working tree of their
+    /// repository, wherever that is.
+    Project,
+    /// Anything else it changed for the person: another repository, their home folder's files, the
+    /// instructions and settings they keep in a harness's folder.
+    User,
+    /// An agent's own: a harness's state (its memory, transcripts, caches), kiln's own folders, and
+    /// the machine's cache and temporary files.
+    Agent,
 }
 
 impl FileChange {

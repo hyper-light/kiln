@@ -864,6 +864,7 @@ impl Registry {
         let local = Host::with_clock(tx, Some(dir.join("local.json")), Limits::default(), clock);
         // The server's own agents' workspaces of their own are kept beside their record.
         crate::workspace::slates::init(&dir);
+        super::whose::note_kiln(&dir);
         let keeper = Keeper::new(&dir);
         let visuals = super::visuals::Visuals::new(&dir);
         Self {

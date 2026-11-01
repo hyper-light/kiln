@@ -835,6 +835,32 @@ composer → More options → Workspace → Own volume; `agents.start` with `wor
   loopback on macOS. `GET /api/harness/workspaces` says which machines can, and why each other
   can't. kiln keeps one Slates instance, `kiln`, per machine (two shards).
 
+## Who changed a file, and whose it is
+
+Each file of a session's changeset (`changes {files}`, `agents.result`'s `changes.files`) says who
+changed it and whose it is, for the Changes tab's By and Scope:
+
+- **`by`**: who changed it, in the order they first did. `main` is the agent itself; anything else is
+  a subagent run of its harness, by the id of the call that spawned it (as its events' `parent` says):
+  Claude Code's Agent tool, Codex's subagent threads. Every harness's subagents' edits count, in the
+  session's changeset and so in what a change request takes.
+- **`place`**: whose it is.
+  - `project`: in a folder the session has worked in (where it started, and each it moved to), or in a
+    working tree of one of their repositories, wherever that is: a worktree under `~/.cache` is. The
+    home folder, or a folder above it, is no project's: a session started there has the repositories it
+    works in.
+  - `agent`: an agent's own. In a harness's home (`~/.claude` or `CLAUDE_CONFIG_DIR`, `~/.codex` or
+    `CODEX_HOME`, `~/.gemini`, Antigravity's, Goose's), but for what a person keeps there to tell it what
+    to do; in kiln's own folders (a runner's state); in the machine's cache (`XDG_CACHE_HOME`, else
+    `~/.cache`, macOS's `~/Library/Caches`) and temporary folders.
+  - `user`: anything else it changed for the person: another repository, their home folder's files,
+    and what they keep in a harness's home: its instructions (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`),
+    its settings (`settings.json`, `config.toml`...) and its `skills`, `commands`, `agents`, `prompts`.
+
+A file with neither (from a runner older than these) is read as this project's. The state's
+`files_changed`, `lines_added` and `lines_removed` (the tab's count, Mission control's) count this
+project's files only; the rest stay in the changeset, for the scope that shows them.
+
 ## Change requests from agents
 
 An agent's work goes up for review from its Changes tab (**Open PR**), or by the agent
@@ -1355,7 +1381,8 @@ messages and follow-up work. Read-only `thread/read` and `thread/turns/list` req
 status, latest 100 turns, elapsed time and result; live child notifications update that same
 view. Tracking never starts, resumes or attaches another executor to the child (it may interrupt
 one working with other permissions than the session's: see permission modes above). Its messages,
-commands, usage and edits stay separate from the parent's turn and changeset. A spawn call
+commands and usage stay separate from the parent's turn; its edits join the session's changeset,
+credited to its spawning call (see "Who changed a file, and whose it is"). A spawn call
 finishing does not mean the child has finished, and unavailable child history does not end the
 parent. As in Codex's own TUI, a message to a child (`send_message`, `followup_task`) doesn't
 change whether it runs: a message queued for an idle child starts no turn, and a follow-up's turn

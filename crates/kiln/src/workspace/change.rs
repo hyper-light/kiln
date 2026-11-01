@@ -429,6 +429,18 @@ mod tests {
         assert_eq!(paths_in(&changes, None), ["README.md", "notes.txt", "src/old.rs", "/tmp/scratch.txt"], "no working tree known: every file, as named");
     }
 
+    /// A subagent's file in the working tree goes up with the change request, as the agent's own
+    /// do (docs/agents.md, "Who changed a file, and whose it is"); one outside it doesn't.
+    #[test]
+    fn a_subagents_file_goes_up_with_its_change_request() {
+        let changes = serde_json::json!([
+            {"path": "src/main.rs", "tree": "/w/repo", "by": ["main"], "place": "project"},
+            {"path": "src/parser.rs", "tree": "/w/repo", "by": ["spawn-kid"], "place": "project"},
+            {"path": "/h/.codex/memories/notes.md", "by": ["spawn-kid"], "place": "agent"}
+        ]);
+        assert_eq!(paths_in(&changes, Some("/w/repo")), ["src/main.rs", "src/parser.rs"]);
+    }
+
     #[test]
     fn a_folder_s_remote_finds_the_repository_kiln_knows_it_as() {
         assert_eq!(norm_url("git@github.com:Acme/App.git"), "github.com/Acme/App");

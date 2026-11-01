@@ -418,7 +418,8 @@ async fn result(cx: Cx, v: Value) -> Out {
         .into_iter()
         .flatten()
         .map(|f| {
-            json!({"path": f.get("path"), "tree": f.get("tree"), "added": f.get("added"), "removed": f.get("removed"), "created": f.get("created").and_then(Value::as_bool).unwrap_or(false), "deleted": f.get("deleted").and_then(Value::as_bool).unwrap_or(false)})
+            // Who changed it and whose it is: its counts are this project's files only.
+            json!({"path": f.get("path"), "tree": f.get("tree"), "added": f.get("added"), "removed": f.get("removed"), "created": f.get("created").and_then(Value::as_bool).unwrap_or(false), "deleted": f.get("deleted").and_then(Value::as_bool).unwrap_or(false), "by": f.get("by"), "place": f.get("place").and_then(Value::as_str).unwrap_or("project")})
         })
         .collect();
     Ok(json!({
