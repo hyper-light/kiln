@@ -26,14 +26,21 @@ export async function pickCommit(page: Page, text: string | RegExp, repo = "hype
   const commits = row.locator("section.ship-commits");
   await expect(commits.locator(".sc-c").first()).toBeVisible({ timeout: 15_000 });
   const line = commits.locator(".sc-c", { hasText: text }).first();
-  for (let i = 0; i < 20 && (await line.count()) === 0; i++) {
-    const older = commits.getByRole("button", { name: "Older", exact: true });
-    if (await older.isDisabled()) break;
-    // The next page in before looking again: the range it says moves on.
-    const range = commits.locator(".sc-pager span");
+  const range = commits.locator(".sc-pager span");
+  /** A page turned by `button`, the next in before looking again: the range it says moves on. */
+  const turn = async (button: string) => {
     const was = (await range.textContent()) ?? "";
-    await older.click();
+    await commits.getByRole("button", { name: button, exact: true }).click();
     await expect(range).not.toHaveText(was, { timeout: 15_000 });
+  };
+  // From the first page: a pick before may have left the list further on.
+  for (let i = 0; i < 20 && !/^1–/.test((await range.textContent()) ?? "1–"); i++) {
+    if (await commits.getByRole("button", { name: "Newer", exact: true }).isDisabled()) break;
+    await turn("Newer");
+  }
+  for (let i = 0; i < 20 && (await line.count()) === 0; i++) {
+    if (await commits.getByRole("button", { name: "Older", exact: true }).isDisabled()) break;
+    await turn("Older");
   }
   await line.getByRole("button").click();
   await expect(line.getByRole("button")).toHaveAttribute("aria-pressed", "true");

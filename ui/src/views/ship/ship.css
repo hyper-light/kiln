@@ -1330,6 +1330,8 @@
     grid-row: 2;
     color: #7b7e88;
     font-size: 11.5px;
+    /* A run still going ticks at its end: its digits keep their width, so nothing after them moves. */
+    font-variant-numeric: tabular-nums;
   }
   .sc-l2 b {
     font-family: var(--mono, ui-monospace, monospace);
