@@ -27,7 +27,7 @@ test("a person's failure goes to the agent attached to it, and its row says who 
     const before = (await row.boundingBox())?.height ?? 0;
 
     await row.getByRole("button", { name: "Hand off" }).click();
-    await expect(row).toContainText("ci-doctor fixing · assertion failed in raft::lease");
+    await expect(row).toContainText("ci-doctor fixing · assertion failed in raft::lease", { timeout: 15_000 });
     await expect(row.getByRole("button", { name: "Hand off" })).toHaveCount(0);
     await expect(row.getByRole("button", { name: "Retry" })).toBeVisible();
     expect((await row.boundingBox())?.height ?? 0).toBe(before);

@@ -62,11 +62,9 @@ test("with reduced motion, nothing on Ship moves as commits arrive, a row opens 
     await page.request.post("/api/mock/ship/agents?n=6&over=3");
     const row = repoRow(page);
     await expect(row.locator(".ship-text")).toContainText(/^(agent: |release: )/, { timeout: 20_000 });
-    // A row opens, and its Diff brings its Files into view: by one jump, not a scroll. The row opened
-    // first (kiln's needn't be the first now): reaching it is the test's scroll, not the page's.
-    await row.getByRole("button", { name: /^Open / }).click();
-    const diff = row.getByRole("navigation", { name: /'s pages$/ }).getByRole("button", { name: "Diff", exact: true });
-    await expect(diff).toBeVisible({ timeout: 15_000 });
+    // A row opens, and its Diff brings its Files into view: by one jump, not a scroll. Pressed in the
+    // page: a click of Playwright's scrolls of its own to reach a control a notice covers (kiln's row
+    // needn't be the first now), and what's counted is the page's.
     await page.evaluate(() => {
       const w = window as unknown as { ys: number[] };
       w.ys = [];
@@ -76,7 +74,10 @@ test("with reduced motion, nothing on Ship moves as commits arrive, a row opens 
       };
       requestAnimationFrame(f);
     });
-    await diff.click();
+    await row.getByRole("button", { name: /^Open / }).evaluate((el) => (el as HTMLElement).click());
+    const diff = row.getByRole("navigation", { name: /'s pages$/ }).getByRole("button", { name: "Diff", exact: true });
+    await expect(diff).toBeVisible({ timeout: 15_000 });
+    await diff.evaluate((el) => (el as HTMLElement).click());
     await expect(row.locator('section[aria-label="Files"]')).toBeFocused({ timeout: 15_000 });
     await page.waitForTimeout(1_500);
     const ys = await page.evaluate(() => (window as unknown as { ys: number[] }).ys);
