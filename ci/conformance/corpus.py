@@ -671,10 +671,6 @@ LEFT = [
     (r"Could not find any NDK", "it builds for Android with cargo-ndk, which needs Android's NDK: GitHub's image has one, kiln's only in its opt-in `-android` image, whose SDK licence the user accepted (the plan's step 7): `ANDROID` routes the corpus's Android jobs to it"),
     # buildx's update-deps: another repository's releases (moby/moby's) through the facade.
     (r"(HttpError: |error: )Not Found - https://github\.com/hyper-light/kiln/blob/main/docs/ci\.md#w14", "it reads a repository kiln doesn't have through the facade's REST API (`GITHUB_API_URL`: buildx's update-deps lists moby/moby's releases), which kiln answers Not Found: its git fetches go on to GitHub (W14-R11), its API reads don't; legs' reads of github.com's API wait for W18's egress proxy and a GitHub credential (W22, left)"),
-    # CodSpeed's memory instrument: memtrack, eBPF, run with file capabilities a `docker` executor's
-    # container can't give a binary (exec: "Operation not permitted"), where a hosted runner's root
-    # has them all (corpus pass 1025c).
-    (r"Granting codspeed-memtrack the capabilities it needs", "CodSpeed's memory instrument (memtrack, eBPF) runs with CAP_SYS_ADMIN, CAP_BPF, CAP_PERFMON, CAP_DAC_READ_SEARCH and CAP_SYS_RESOURCE as file capabilities, past a `docker` executor's container's bounding set, so it can't be started, where a hosted runner's root has every capability (W13-R04, left)"),
     # TypeScript's file watcher tests take fanotify's file handles, which the docker executor's
     # container overlay doesn't make; a `/tmp` volume of its own gave them, and broke renames out
     # of /tmp (ruff's wasm-pack-action, EXDEV), so kiln went back to one file system.
