@@ -1510,6 +1510,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             }
         }
         let (shipper, said) = crate::convo::feed::Shipper::start(st);
+        // Each batch signed for as it goes (docs/ci.md W27-R08).
+        shipper.sign_with(Arc::new(crate::runner::custody::Feed));
         let up = uplink.0.clone();
         crate::rt::spawn(async move {
             while let Ok((json, data)) = said.recv().await {
@@ -3247,6 +3249,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             }
                             if let Some(st) = &mirror_store {
                                 let (ship, out) = crate::convo::feed::Shipper::start_restore(st.clone());
+                                ship.sign_with(Arc::new(crate::runner::custody::Feed));
                                 let up = uplink.0.clone();
                                 crate::rt::spawn(async move {
                                     while let Ok((json, data)) = out.recv().await {
@@ -4668,6 +4671,8 @@ fn open_mirror(dir: &std::path::Path, up: &async_channel::Sender<Up>) -> Option<
     let st = crate::convo::open_file(dir, crate::convo::MIRROR_FILE, crate::config::Conversations::default().upkeep())?;
     match crate::convo::feed::Intake::start(st.clone(), crate::convo::feed::Brings::AsItSays, None) {
         Ok((intake, out)) => {
+            // What it takes signed for as it takes it (docs/ci.md W27-R08).
+            intake.sign_with(Arc::new(crate::runner::custody::Feed));
             let up = up.clone();
             crate::rt::spawn(async move {
                 while let Ok(o) = out.recv().await {

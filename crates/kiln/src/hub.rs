@@ -510,7 +510,9 @@ impl Hub {
         join_token: String,
         shutdown: Shutdown,
     ) -> anyhow::Result<Arc<Self>> {
-        let blobs = crate::blobs::open(&cfg, &store, Arc::clone(&clock))?;
+        let mut blobs = crate::blobs::open(&cfg, &store, Arc::clone(&clock))?;
+        // What it keeps there and reads back, recorded as it changes hands (docs/ci.md W27-R08).
+        blobs.blobs = Arc::new(crate::custody::blobs::Attested::new(Arc::clone(&blobs.blobs), blobs.kind.as_str(), store.clone(), Arc::clone(&pki)));
         let generation =
             std::env::var("KILN_GENERATION").ok().and_then(|g| g.parse().ok()).unwrap_or(1);
         let discovery = Arc::new(crate::discovery::Discovery::for_server(&cfg, &pki.ca_der));

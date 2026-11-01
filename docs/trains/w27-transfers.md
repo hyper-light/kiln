@@ -54,6 +54,10 @@ reaching a process it isn't for.
   something from another. A runner's object from a peer's cache is handed on by the peer and
   received by the runner that fetched it, each signing; a copy changed on its way is refused, and
   the break recorded. No runner in production asks a peer yet: nothing mints its cache's tokens.
+  kiln's store of bytes: kiln signs for the store at each put and whole read of an object whose
+  key doesn't name its content (binaries, transcripts); a read whose bytes aren't what the store
+  says is refused, and its break recorded. The conversation feed: each batch goes with its giver's
+  hand-on, and the taker refuses one that isn't what it says before taking any of it.
   kiln run's sync and a reach run: the agent session that asked hands its workspace (by its tree's
   digest) and its run on to the other runner's process, with a delegation to receive both for it;
   that runner receives each for the session under it, and hands the output back, which the session
@@ -92,14 +96,17 @@ reaching a process it isn't for.
   the lookup's answer, both ignored by a runner from before. A runner asks `/_kiln/pushed` at a
   leg's end; a server from before answers 404, and the leg's hand-on names no images, as before.
 - **Step 12 on the wire:** a runner asks the server which process of a peer takes reach
-  (`ReachAsk` op `custody`); a server from before doesn't know the op, the runner hears no URI, and
-  nothing is signed for that peer, as before. Reach's links move to version 2 (`wire::VERSION`,
-  with `MIN_VERSION` 1): a link runs at the lower of the two ends' versions, a runner from before
-  refusing a Hello at 2 is asked again at 1, and only a link at 2 carries the new `Ask::Custody`
-  and `Say::Custody`. Runners announce their version (`Announce.version`, already there); the
-  server's directory says it (`RunnerInfo.reach_version`, a new optional field). `AgentMsg::Custody`
-  carries a new JSON shape, `{"refused_hop": …}`, which a server from before refuses as an
-  unreadable record, as it does any it can't read.
+  (`ReachAsk` op `custody`); a server from before doesn't know the op, the runner hears no URI,
+  and nothing is signed for that peer, as before. The feed's `Msg::Batch` has an optional
+  `hand_on` (JSON): a taker from before ignores it, and a giver from before sends none. Reach's
+  links move to version 2 (`wire::VERSION`, with `MIN_VERSION` 1): a link runs at the lower of
+  the two ends' versions, a runner from before refusing a Hello at 2 is asked again at 1, and only
+  a link at 2 carries the new `Ask::Custody` and `Say::Custody`. Runners announce their version
+  (`Announce.version`, already there); the server's directory says it (`RunnerInfo.reach_version`,
+  a new optional field). `AgentMsg::Custody` carries a new JSON shape, `{"refused_hop": …}`, which
+  a server from before refuses as an unreadable record, as it does any it can't read.
+- **kiln's store of bytes, after it:** a whole get of an object whose bytes don't hash to its etag
+  is refused (`BadChecksum`), where it used to be served as the store gave it.
 - **Merging main: reach's variants.** main has `Ask::Unread` and `Say::Unread` (index 11 on each),
   which this branch lacks. The landing merge keeps main's first, `Custody` after them on both
   enums (index 12), and `ASK_VARIANTS` and `SAY_VARIANTS` become 13; then

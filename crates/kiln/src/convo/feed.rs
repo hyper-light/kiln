@@ -9,15 +9,50 @@
 //! the runner says hello with its store's id, the server answers with the number it has, and the
 //! runner sends batches from there, [`WINDOW`] ahead of what the server has acknowledged. A batch
 //! larger than a frame goes in parts.
+//!
+//! Each batch changes hands signed by both sides (docs/ci.md W27-R08), once each end has a
+//! [`Custodian`]: the giver's hand-on of it, by the SHA-256 of its rows, goes with its first part,
+//! and the taker checks what came against it before its store takes any of it: a batch that isn't
+//! what its hand-on says is refused (the giver is told to go on from where the taker stands, and
+//! sends it again), and the taker's receipt of what came records the break.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures::future::BoxFuture;
+use kiln_ci::identity::statement::Subject;
 use serde::{Deserialize, Serialize};
 
 use super::store::{Changes, Store};
 use super::telemetry::{PeerView, Report, ShipStats, ShipView};
 use crate::proto;
+
+/// Who signs for one end of a feed (docs/ci.md W27-R08; the Transfers plan's step 12): a giver,
+/// its hand-on of each batch it sends; a taker, its receipt of each it takes, or would have.
+pub trait Custodian: Send + Sync {
+    /// Its signed hand-on of `thing` (a batch, by the SHA-256 of its rows) to the feed's taker, as
+    /// JSON; none when it signs none now (no identity yet, or a taker that takes no custody).
+    fn hand_on(&self, thing: Subject) -> BoxFuture<'_, Option<String>>;
+
+    /// Its receipt, as the taker of `machine`'s feed, of `thing` (what came, by its SHA-256),
+    /// following `hand_on` (the giver's, as the batch carried it): signed, and kept with it.
+    fn received(&self, machine: &str, hand_on: &str, thing: Subject);
+}
+
+/// Where a feed's end keeps its [`Custodian`]: set once its identity can sign, read per batch.
+type Signs = Arc<parking_lot::RwLock<Option<Arc<dyn Custodian>>>>;
+
+/// A batch of `store`'s feed, following `from` and reading through `upto`, by the SHA-256 of its
+/// rows as JSON (`sha256`): what a hand-on and its receipt are about.
+pub fn batch_thing(store: &str, from: u64, upto: u64, sha256: &str) -> Subject {
+    Subject { name: format!("conversation store {store} after {from} through {upto}"), digest: std::collections::BTreeMap::from([("sha256".to_owned(), sha256.to_owned())]), ..Subject::default() }
+}
+
+/// The SHA-256 a hand-on (a custody record's bundle, as JSON) says its batch has.
+fn handed(hand_on: &str) -> Option<String> {
+    crate::custody::statement_in(hand_on)?.subject.first()?.digest.get("sha256").cloned()
+}
 
 /// The feed's lane on the runner's link.
 pub const LANE: u32 = proto::LANE_CONVO;
@@ -74,6 +109,10 @@ pub enum Msg {
         zip: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         told: Option<u64>,
+        /// The giver's signed hand-on of the batch, on its first part ([`Custodian`]): a giver from
+        /// before, or one that signs none now, sends none, and a taker from before ignores it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hand_on: Option<String>,
     },
     /// Server to runner: it has `store`'s feed through `rev`.
     Ack { store: String, rev: u64 },
@@ -130,14 +169,18 @@ fn unzip(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
 /// A batch as the messages it travels in, compressed when the taker takes that (`zipped`), sent
 /// after being told to go on from `told` ([`Msg::Batch`]).
 pub fn parts(store: &str, from: u64, batch: &Changes, zipped: bool, told: Option<u64>) -> anyhow::Result<Vec<(Msg, Vec<u8>)>> {
-    let json = serde_json::to_vec(batch)?;
+    parts_of(store, from, batch.upto, serde_json::to_vec(batch)?, zipped, told, None)
+}
+
+/// [`parts`] of a batch read through `upto` as `json`, its giver's `hand_on` with its first part.
+fn parts_of(store: &str, from: u64, upto: u64, json: Vec<u8>, zipped: bool, told: Option<u64>, hand_on: Option<String>) -> anyhow::Result<Vec<(Msg, Vec<u8>)>> {
     let bytes = if zipped { zip(&json)? } else { json };
     let chunks: Vec<&[u8]> = if bytes.is_empty() { vec![&[][..]] } else { bytes.chunks(PART).collect() };
     let n = u32::try_from(chunks.len())?;
     Ok(chunks
         .into_iter()
         .enumerate()
-        .map(|(i, c)| (Msg::Batch { store: store.to_owned(), from, upto: batch.upto, part: u32::try_from(i).unwrap_or(u32::MAX), parts: n, zip: zipped, told }, c.to_vec()))
+        .map(|(i, c)| (Msg::Batch { store: store.to_owned(), from, upto, part: u32::try_from(i).unwrap_or(u32::MAX), parts: n, zip: zipped, told, hand_on: hand_on.clone().filter(|_| i == 0) }, c.to_vec()))
         .collect())
 }
 
@@ -161,6 +204,7 @@ pub enum Link {
 pub struct Shipper {
     tx: async_channel::Sender<Link>,
     stats: std::sync::Arc<ShipStats>,
+    signs: Signs,
 }
 
 /// Whether the taker has a row already (by its number): it is left out of what goes to it.
@@ -198,12 +242,18 @@ impl Shipper {
             }
         });
         let stats: std::sync::Arc<ShipStats> = std::sync::Arc::default();
-        crate::rt::spawn(ship(store, rx, out_tx, restore, skip, stats.clone()));
-        (Self { tx, stats }, out_rx)
+        let signs = Signs::default();
+        crate::rt::spawn(ship(store, rx, out_tx, restore, skip, stats.clone(), signs.clone()));
+        (Self { tx, stats, signs }, out_rx)
     }
 
     pub fn link(&self, l: Link) {
         let _ = self.tx.try_send(l);
+    }
+
+    /// Its batches go signed by `c` from now on ([`Custodian`]).
+    pub fn sign_with(&self, c: Arc<dyn Custodian>) {
+        *self.signs.write() = Some(c);
     }
 
     /// Where the feed stands, for telemetry.
@@ -230,7 +280,10 @@ struct Shipping {
     heard: Instant,
 }
 
-async fn ship(store: Store, rx: async_channel::Receiver<Link>, out: async_channel::Sender<(String, Vec<u8>)>, restore: bool, skip: Option<Skip>, stats: std::sync::Arc<ShipStats>) {
+/// A test build's `feed_changed` changed a batch of this process's once already.
+static CHANGED_ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+async fn ship(store: Store, rx: async_channel::Receiver<Link>, out: async_channel::Sender<(String, Vec<u8>)>, restore: bool, skip: Option<Skip>, stats: std::sync::Arc<ShipStats>, signs: Signs) {
     let me = store.id().to_owned();
     // A copy sent back goes through where it reads now, and no further.
     let through = if restore {
@@ -342,7 +395,28 @@ async fn ship(store: Store, rx: async_channel::Receiver<Link>, out: async_channe
             if let Some(skip) = &skip {
                 batch.rows.retain(|c| !skip(c.rev));
             }
-            let msgs = match parts(&me, from, &batch, st.zipped, st.told) {
+            let mut json = match serde_json::to_vec(&batch) {
+                Ok(j) => j,
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "conversation feed: a batch couldn't be encoded");
+                    break;
+                }
+            };
+            // Its hand-on, by the SHA-256 of what goes (docs/ci.md W27-R08).
+            let signer = signs.read().clone();
+            let hand_on = match signer {
+                Some(c) => c.hand_on(batch_thing(&me, from, batch.upto, &crate::util::sha256_hex(&json))).await,
+                None => None,
+            };
+            // A test build's `feed_changed`: the first batch signed for changes on its way, once.
+            if hand_on.is_some()
+                && crate::runner::chaos::get().is_some_and(|c| c.feed_changed)
+                && !CHANGED_ONCE.swap(true, std::sync::atomic::Ordering::Relaxed)
+                && let Some(b) = json.iter_mut().rev().find(|b| b.is_ascii_alphabetic())
+            {
+                *b ^= 0x20;
+            }
+            let msgs = match parts_of(&me, from, batch.upto, json, st.zipped, st.told, hand_on) {
                 Ok(m) => m,
                 Err(e) => {
                     tracing::warn!(error = %format!("{e:#}"), "conversation feed: a batch couldn't be encoded");
@@ -395,6 +469,8 @@ struct Partial {
     got: u32,
     zip: bool,
     bytes: Vec<u8>,
+    /// Its giver's hand-on, from its first part.
+    hand_on: Option<String>,
 }
 
 /// Where the sessions a feed brings run.
@@ -412,6 +488,7 @@ pub struct Intake {
     tx: std::sync::mpsc::SyncSender<(hyper_transport::PeerId, String, String, Vec<u8>)>,
     restores: std::sync::Arc<Restores>,
     peers: std::sync::Arc<Peers>,
+    signs: Signs,
 }
 
 /// Where each store that feeds an intake stands, by its name among the store's peers
@@ -454,11 +531,13 @@ impl Intake {
         let (out_tx, out_rx) = async_channel::bounded::<Out>(1024);
         let restores: std::sync::Arc<Restores> = std::sync::Arc::default();
         let peers: std::sync::Arc<Peers> = std::sync::Arc::default();
-        let (restoring, seen) = (restores.clone(), peers.clone());
+        let signs = Signs::default();
+        let (restoring, seen, signing) = (restores.clone(), peers.clone(), signs.clone());
         std::thread::Builder::new().name("kiln-convo-intake".into()).spawn(move || {
             let mut taking: HashMap<(hyper_transport::PeerId, String), Taking> = HashMap::new();
             while let Ok((peer, machine, json, data)) = rx.recv() {
-                let feed = Feed { store: &store, brings, restores: &restoring, echoes: echoes.as_deref(), peers: &seen };
+                let signer = signing.read().clone();
+                let feed = Feed { store: &store, brings, restores: &restoring, echoes: echoes.as_deref(), peers: &seen, custodian: signer.as_deref() };
                 for m in take(&feed, &mut taking, peer, &machine, &json, data) {
                     if out_tx.send_blocking(Out { peer, json: encode(&m) }).is_err() {
                         return;
@@ -466,7 +545,12 @@ impl Intake {
                 }
             }
         })?;
-        Ok((Self { tx, restores, peers }, out_rx))
+        Ok((Self { tx, restores, peers, signs }, out_rx))
+    }
+
+    /// The batches it takes are signed for by `c` from now on ([`Custodian`]).
+    pub fn sign_with(&self, c: Arc<dyn Custodian>) {
+        *self.signs.write() = Some(c);
     }
 
     /// Where each store that feeds this intake stands, since kiln started.
@@ -499,6 +583,8 @@ struct Feed<'a> {
     restores: &'a Restores,
     echoes: Option<&'a Echoes>,
     peers: &'a Peers,
+    /// Who signs for what it takes, once it can.
+    custodian: Option<&'a dyn Custodian>,
 }
 
 impl Feed<'_> {
@@ -538,7 +624,7 @@ fn take(feed: &Feed<'_>, taking: &mut HashMap<(hyper_transport::PeerId, String),
             taking.entry((peer, s.clone())).or_default().told = Some(rev);
             vec![Msg::From { store: s, rev, zip: true, kept: true, about: None }]
         }
-        Some(Msg::Batch { store: s, from, upto, part, parts, zip, told }) => {
+        Some(Msg::Batch { store: s, from, upto, part, parts, zip, told, hand_on }) => {
             let key = (peer, s.clone());
             // Where to go on from, about this batch: to a runner from before (it doesn't say
             // where it was told to go on from), once until a batch of it is taken. It goes on from
@@ -570,7 +656,7 @@ fn take(feed: &Feed<'_>, taking: &mut HashMap<(hyper_transport::PeerId, String),
                 return tell(taking, rev);
             }
             let t = taking.entry(key.clone()).or_default();
-            let p = t.batch.get_or_insert_with(|| Partial { from, upto, parts, got: 0, zip, bytes: Vec::new() });
+            let p = t.batch.get_or_insert_with(|| Partial { from, upto, parts, got: 0, zip, bytes: Vec::new(), hand_on });
             p.got += 1;
             p.bytes.extend_from_slice(&data);
             if p.bytes.len() > BATCH_MAX {
@@ -584,6 +670,23 @@ fn take(feed: &Feed<'_>, taking: &mut HashMap<(hyper_transport::PeerId, String),
             let Some(done) = t.batch.take() else { return Vec::new() };
             let wire = done.bytes.len() as u64;
             let read = if done.zip { unzip(&done.bytes) } else { Ok(done.bytes) };
+            // What came, checked against its giver's hand-on before anything of it is taken
+            // (docs/ci.md W27-R08): a batch that isn't what its giver signed for is refused, and
+            // the receipt of what came records the break.
+            let signed = match (&read, feed.custodian, done.hand_on.as_deref()) {
+                (Ok(b), Some(c), Some(h)) => {
+                    let got = batch_thing(&s, from, upto, &crate::util::sha256_hex(b));
+                    if got.digest.get("sha256") != handed(h).as_ref() {
+                        tracing::warn!(%machine, store = %s, from, upto, "conversation feed: a batch isn't what its giver's hand-on says: refused");
+                        c.received(machine, h, got);
+                        feed.note(machine, &s, |v| v.errors += 1);
+                        let rev = stands_now(taking);
+                        return tell(taking, rev);
+                    }
+                    Some((c, h.to_owned(), got))
+                }
+                _ => None,
+            };
             let batch: Changes = match read.and_then(|b| serde_json::from_slice(&b).map_err(anyhow::Error::from)) {
                 Ok(b) => b,
                 Err(e) => {
@@ -624,6 +727,9 @@ fn take(feed: &Feed<'_>, taking: &mut HashMap<(hyper_transport::PeerId, String),
                     });
                     // Taken: whatever comes next that doesn't follow is told where to go on.
                     taking.remove(&key);
+                    if let Some((c, h, got)) = signed {
+                        c.received(machine, &h, got);
+                    }
                     vec![Msg::Ack { store: s, rev: t.rev }]
                 }
                 Err(e) => {
@@ -654,7 +760,7 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     fn took(store: &Store, partial: &mut HashMap<(hyper_transport::PeerId, String), Taking>, peer: hyper_transport::PeerId, machine: &str, brings: Brings, json: &str, data: Vec<u8>, restores: &Restores, echoes: Option<&Echoes>) -> Vec<Msg> {
         let peers = Peers::default();
-        take(&Feed { store, brings, restores, echoes, peers: &peers }, partial, peer, machine, json, data)
+        take(&Feed { store, brings, restores, echoes, peers: &peers, custodian: None }, partial, peer, machine, json, data)
     }
 
     fn feed_all(runner: &Store, server: &Store, machine: &str, bytes: usize) -> anyhow::Result<u64> {
@@ -772,7 +878,7 @@ mod tests {
         // A part out of place: the same.
         let (m, data) = parts(runner.id(), 0, &runner.changes(0, 1 << 20)?, true, Some(0))?.into_iter().next().ok_or_else(|| anyhow::anyhow!("no part"))?;
         let Msg::Batch { store, from: f, upto, parts: n, .. } = m else { anyhow::bail!("not a batch") };
-        let astray = |told| (Msg::Batch { store: store.clone(), from: f, upto, part: 1, parts: n + 1, zip: true, told }, data.clone());
+        let astray = |told| (Msg::Batch { store: store.clone(), from: f, upto, part: 1, parts: n + 1, zip: true, told, hand_on: None }, data.clone());
         assert_eq!(send(&mut partial, 7, vec![astray(Some(0))]), from(0, 0));
         // A runner from before goes on from every answer, and what it sent before it heard one
         // doesn't follow either: told once, until a batch of it is taken.
@@ -794,8 +900,8 @@ mod tests {
         assert_eq!(answer(Msg::Hello { store: "r".into(), restore: false }, b""), Vec::new());
         assert_eq!(answer(Msg::Hello { store: "r".into(), restore: true }, b""), Vec::new());
         // A part out of place, and a batch that can't be read: the same.
-        assert_eq!(answer(Msg::Batch { store: "r".into(), from: 0, upto: 5, part: 1, parts: 2, zip: false, told: Some(0) }, b"{}"), Vec::new());
-        assert_eq!(answer(Msg::Batch { store: "r".into(), from: 0, upto: 5, part: 0, parts: 1, zip: false, told: Some(0) }, b"not json"), Vec::new());
+        assert_eq!(answer(Msg::Batch { store: "r".into(), from: 0, upto: 5, part: 1, parts: 2, zip: false, told: Some(0), hand_on: None }, b"{}"), Vec::new());
+        assert_eq!(answer(Msg::Batch { store: "r".into(), from: 0, upto: 5, part: 0, parts: 1, zip: false, told: Some(0), hand_on: None }, b"not json"), Vec::new());
     }
 
     #[test]
@@ -901,6 +1007,126 @@ mod tests {
     /// What the shipper sends next, within `wait` (None: nothing).
     async fn next_sent(out: &async_channel::Receiver<(String, Vec<u8>)>, wait: Duration) -> Option<Msg> {
         crate::rt::timeout(wait, out.recv()).await.ok().and_then(Result::ok).and_then(|(json, _)| decode(&json))
+    }
+
+    /// A test's end of a feed: as a giver, a hand-on of each batch saying what the giver's would (its
+    /// digest); as a taker, each receipt noted.
+    #[derive(Default)]
+    struct Sides {
+        received: parking_lot::Mutex<Vec<(String, Subject)>>,
+    }
+
+    impl Custodian for Sides {
+        fn hand_on(&self, thing: Subject) -> BoxFuture<'_, Option<String>> {
+            Box::pin(async move { Some(bundle_of(&thing)) })
+        }
+
+        fn received(&self, _machine: &str, hand_on: &str, thing: Subject) {
+            self.received.lock().push((hand_on.to_owned(), thing));
+        }
+    }
+
+    /// A hand-on of `thing` as a bundle's JSON, unsigned: what [`handed`] reads of one.
+    fn bundle_of(thing: &Subject) -> String {
+        use base64::Engine as _;
+        use kiln_ci::identity::statement::{PAYLOAD_CUSTODY, Statement, payload};
+        let st = Statement { subject: vec![thing.clone()], ..Statement::new(serde_json::json!({ "v": 1, "kind": "handed-on", "by": "kiln://hyper-light/person/ada/machine/box/instance/i", "to": "kiln://hyper-light/server" })) };
+        let encoded = base64::engine::general_purpose::STANDARD.encode(payload(&st).unwrap_or_default());
+        serde_json::json!({ "dsseEnvelope": { "payloadType": PAYLOAD_CUSTODY, "payload": encoded, "signatures": [] } }).to_string()
+    }
+
+    /// W27-R08 (the Transfers plan's step 12): a batch comes with its giver's hand-on, by the
+    /// SHA-256 of its rows, and the taker checks what came against it before its store takes any
+    /// of it. One that isn't what its hand-on says is refused (the giver told where to go on from)
+    /// and the receipt of what came records the break; as it was signed for, it's taken and
+    /// received; one with no hand-on (a giver from before) is taken as before, with no receipt.
+    #[test]
+    fn w27_r08_a_feeds_batch_is_taken_only_as_its_giver_signed_for_it() -> anyhow::Result<()> {
+        let (_r, runner) = super::super::store::scratch()?;
+        let (_s, server) = super::super::store::scratch()?;
+        runner.send("a1", &said("m1", 1, "one"));
+        runner.sync()?;
+        let signs = Sides::default();
+        let (restores, peers) = (Restores::default(), Peers::default());
+        let feed = Feed { store: &server, brings: Brings::TheirMachine, restores: &restores, echoes: None, peers: &peers, custodian: Some(&signs) };
+        let mut taking = HashMap::new();
+        let hello = take(&feed, &mut taking, 7, "box", &encode(&Msg::Hello { store: runner.id().to_owned(), restore: false }), Vec::new());
+        let Some(Msg::From { rev, zip, kept, .. }) = hello.into_iter().next() else { anyhow::bail!("no answer to hello") };
+        let batch = runner.changes_as(rev, BATCH_BYTES, kept)?;
+        let json = serde_json::to_vec(&batch)?;
+        let thing = batch_thing(runner.id(), rev, batch.upto, &crate::util::sha256_hex(&json));
+        let send = |taking: &mut HashMap<(hyper_transport::PeerId, String), Taking>, json: Vec<u8>, hand_on: Option<String>| -> anyhow::Result<Vec<Msg>> {
+            let mut answer = Vec::new();
+            for (m, data) in parts_of(runner.id(), rev, batch.upto, json, zip, Some(rev), hand_on)? {
+                answer = take(&feed, taking, 7, "box", &encode(&m), data);
+            }
+            Ok(answer)
+        };
+        // Changed on its way: refused, nothing of it taken, and the receipt of what came.
+        let mut changed = json.clone();
+        if let Some(b) = changed.iter_mut().rev().find(|b| b.is_ascii_alphabetic()) {
+            *b ^= 0x20;
+        }
+        let answer = send(&mut taking, changed.clone(), Some(bundle_of(&thing)))?;
+        assert!(matches!(answer.first(), Some(Msg::From { rev: r, about: Some(_), .. }) if *r == rev), "refused, told where to go on from: {answer:?}");
+        assert_eq!(server.peer(&peer_name("box", runner.id()))?, rev, "nothing taken");
+        let got = signs.received.lock().pop().map(|(_, t)| t);
+        assert_eq!(got.as_ref().and_then(|t| t.digest.get("sha256")), Some(&crate::util::sha256_hex(&changed)));
+        // As it was signed for: taken, and received.
+        let answer = send(&mut taking, json.clone(), Some(bundle_of(&thing)))?;
+        assert!(matches!(answer.first(), Some(Msg::Ack { rev: r, .. }) if *r == batch.upto), "{answer:?}");
+        assert_eq!(signs.received.lock().pop().map(|(_, t)| t), Some(thing));
+        // A giver from before: taken as before, no receipt.
+        runner.send("a1", &said("m2", 2, "two"));
+        runner.sync()?;
+        let next = runner.changes_as(batch.upto, BATCH_BYTES, kept)?;
+        let mut answer = Vec::new();
+        for (m, data) in parts(runner.id(), batch.upto, &next, zip, Some(batch.upto))? {
+            answer = take(&feed, &mut taking, 7, "box", &encode(&m), data);
+        }
+        assert!(matches!(answer.first(), Some(Msg::Ack { .. })), "{answer:?}");
+        assert!(signs.received.lock().is_empty());
+        Ok(())
+    }
+
+    /// W27-R08 (the Transfers plan's step 12): a shipper given a custodian sends each batch with its
+    /// hand-on on its first part, by the SHA-256 of what it sends, which the taker receives.
+    #[test]
+    fn w27_r08_a_shipper_hands_on_each_batch_it_sends() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let (_r, runner) = super::super::store::scratch()?;
+            let (_s, server) = super::super::store::scratch()?;
+            for i in 1..=3u64 {
+                runner.send("a1", &said(&format!("m{i}"), i, &"x".repeat(1 << 20)));
+            }
+            runner.sync()?;
+            let (ship, out) = Shipper::start(runner.clone());
+            ship.sign_with(Arc::new(Sides::default()));
+            ship.link(Link::Up);
+            let taker = Sides::default();
+            let (restores, peers) = (Restores::default(), Peers::default());
+            let feed = Feed { store: &server, brings: Brings::TheirMachine, restores: &restores, echoes: None, peers: &peers, custodian: Some(&taker) };
+            let mut taking = HashMap::new();
+            let top = runner.top()?;
+            for _ in 0..100 {
+                let Ok(Ok((json, data))) = crate::rt::timeout(Duration::from_secs(5), out.recv()).await else { break };
+                if let Some(Msg::Batch { part, hand_on, .. }) = decode(&json) {
+                    assert_eq!(hand_on.is_some(), part == 0, "its hand-on with its first part only");
+                }
+                for m in take(&feed, &mut taking, 7, "box", &json, data) {
+                    ship.link(Link::Heard(m));
+                }
+                if server.peer(&peer_name("box", runner.id()))? >= top {
+                    break;
+                }
+            }
+            let received = taker.received.lock().clone();
+            assert!(!received.is_empty(), "each batch received");
+            for (h, t) in &received {
+                assert_eq!(handed(h).as_ref(), t.digest.get("sha256"), "received as handed on");
+            }
+            Ok(())
+        })
     }
 
     #[test]

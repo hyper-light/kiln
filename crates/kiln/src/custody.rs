@@ -19,6 +19,9 @@ use serde_json::{Value, json};
 
 use crate::store::Store;
 
+pub mod blobs;
+pub mod feeds;
+
 /// The most records a walk loads: a thing's chain, and its custodians' streams.
 pub const WALK_MAX: usize = 10_000;
 /// The most breaks or refusals a list gives, newest first.
@@ -936,7 +939,7 @@ pub async fn unsigned_list(store: &Store, limit: usize) -> anyhow::Result<Vec<Va
 }
 
 /// Whether kiln keeps record `digest`.
-async fn kept(store: &Store, digest: &str) -> anyhow::Result<bool> {
+pub(crate) async fn kept(store: &Store, digest: &str) -> anyhow::Result<bool> {
     let d = digest.to_owned();
     store.call(move |c| Ok(c.query_row("SELECT 1 FROM custody WHERE digest = ?1", [&d], |_| Ok(())).optional()?.is_some())).await
 }
