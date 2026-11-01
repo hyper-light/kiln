@@ -247,14 +247,10 @@ const Row = React.memo(
   function Row({ item, narrow, reload, open, onOpen }: { item: Item; narrow: Narrow; reload: () => void; open: boolean; onOpen: (open: boolean) => void }) {
     counted("ship/row");
     const c = item.head;
-    const [riders, setRiders] = React.useState(false);
     // Each press of the Diff (Review) button, counted, so a press with the row open asks again.
     const [reveal, setReveal] = React.useState(0);
     // One environment flag: production when it runs there, else the first it runs in.
     const env = c.environments?.find((e) => e.production) ?? c.environments?.[0];
-    const n = item.riders.length;
-    // Riders say themselves as f-ship does (below); the rest of a fold says what it holds.
-    const what = item.folds === "shipped" ? `${n} more shipped` : `${n} more commit${n === 1 ? "" : "s"} of ${c.change?.name ?? "this change"}`;
     return (
       // Its review starts loading as the pointer comes onto the row or the focus into it (W26-R15).
       <li className="ship-row" data-stand={c.stand} data-glide={rowKey(item)} onPointerEnter={() => warmReview(c)} onFocus={() => warmReview(c)}>
@@ -313,43 +309,6 @@ const Row = React.memo(
             <ChevronDown size={16} />
           </button>
         </div>
-        {item.riders.length > 0 && (
-          <button type="button" className="ship-fold" aria-expanded={riders} onClick={() => setRiders(!riders)}>
-            {item.folds === "rides" ? (
-              // f-ship's riders: how many ride with the approval, and the first of them.
-              <>
-                <StatusGlyph state="queued" size={14} />
-                <span>
-                  +{n} riding ·{" "}
-                  <span className="ship-fold__sha">
-                    {item.riders
-                      .slice(0, 3)
-                      .map((r) => r.short)
-                      .join(" ")}
-                  </span>
-                  {n > 3 ? " …" : ""}
-                </span>
-              </>
-            ) : (
-              <span>
-                {riders ? "Hide" : "Show"} {what}
-              </span>
-            )}
-          </button>
-        )}
-        {riders && (
-          <ul className="ship-riders" aria-label={`The other commits of ${c.change?.name ?? c.short}`}>
-            {item.riders.map((r) => (
-              <li key={r.sha} className="ship-rider" data-stand={r.stand}>
-                <span className="ship-name">{r.message || r.short}</span>
-                <span className="ship-text">
-                  {standWord(r.stand)} · {r.line}
-                </span>
-                <span className="ship-sha">{r.short}</span>
-              </li>
-            ))}
-          </ul>
-        )}
         {open && <RepoDropdown head={c} narrow={narrow} reveal={reveal} />}
       </li>
     );

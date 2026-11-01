@@ -57,8 +57,7 @@
   min-width: 0;
 }
 .ship-main:focus-visible,
-.ship-go:focus-visible,
-.ship-fold:focus-visible {
+.ship-go:focus-visible {
   outline: 2px solid #a6c4ed;
   outline-offset: 2px;
   border-radius: 6px;
@@ -184,42 +183,6 @@
 .ship-go[aria-expanded="true"] svg {
   transform: rotate(180deg);
 }
-.ship-fold {
-  all: unset;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  box-sizing: border-box;
-  width: 100%;
-  padding: 10px 4px 10px 34px;
-  color: #8b8e96;
-  font-size: 12.5px;
-  border-top: 1px solid var(--k-line-2, #1f2125);
-  background: rgba(226, 207, 174, 0.02);
-}
-.ship-fold__sha {
-  font-family: var(--font-mono, ui-monospace, monospace);
-  font-size: 11px;
-}
-.ship-fold:hover {
-  color: #e4e5e7;
-}
-.ship-riders {
-  list-style: none;
-  margin: 0;
-  padding: 0 4px 8px 34px;
-  display: grid;
-  gap: 6px;
-}
-.ship-rider {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
-  gap: 12px;
-  align-items: baseline;
-  font-size: 12.5px;
-  color: #a1a4ad;
-}
 .ship-sha {
   font-family: var(--mono, ui-monospace, monospace);
   font-size: 11px;
@@ -339,12 +302,6 @@
      ends in an ellipsis rather than standing the page wider than the screen (Ada, 2026-10-30). */
   .ship-line > .ship-text {
     max-width: 100%;
-  }
-  .ship-rider {
-    grid-template-columns: minmax(0, 1fr) auto;
-  }
-  .ship-rider .ship-text {
-    display: none;
   }
 }
 
