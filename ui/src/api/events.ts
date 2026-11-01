@@ -54,6 +54,7 @@ const EVENT_FRAMES = {
   "preview.removed": true,
   landed: true,
   ci_image: true,
+  ci_verdict: true,
   experiment: true,
   inbox: true,
   registry_package: true,

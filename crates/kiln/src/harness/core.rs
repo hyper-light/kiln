@@ -911,6 +911,55 @@ impl Core {
         self.close(&ids, now);
     }
 
+    /// Its harness's process is gone: a message it was handed and never finished (sent, in the
+    /// harness's own queue, or under way) ends dropped, never left saying it's on its way (CP-T3.2).
+    /// It may have run, so it isn't sent again; Codex's history, read as it resumes, says one that
+    /// did. One that waits in kiln's queue, or a subagent's, still goes, unless the agent ended
+    /// (`queued`): then none of it does.
+    pub fn drop_unfinished(&mut self, queued: bool) {
+        use super::model::Delivery;
+        let waits: HashSet<String> = if queued { HashSet::new() } else { self.state.queue.iter().chain(self.state.tasks.iter().flat_map(|t| t.queue.iter())).map(|q| q.id.clone()).collect() };
+        let mut dropped = false;
+        for (id, d) in &mut self.state.delivery {
+            if matches!(d, Delivery::Sent | Delivery::Queued | Delivery::Started) && !waits.contains(id) {
+                *d = Delivery::Cancelled;
+                dropped = true;
+            }
+        }
+        if dropped {
+            self.touch_state();
+        }
+    }
+
+    /// A queue command on a message the conversation shows waiting (held for a harness that has
+    /// since ended, now in kiln's queue): taken out, it's dropped there; changed, it says its new
+    /// words there before it goes.
+    pub fn shown_queued(&mut self, c: &super::model::Command) {
+        use super::model::{Command, Delivery};
+        let (Command::QueueRemove { id } | Command::QueueEdit { id, .. }) = c else { return };
+        let waits = self.state.queue.iter().chain(self.state.tasks.iter().flat_map(|t| t.queue.iter())).any(|q| &q.id == id);
+        if !waits || !matches!(self.state.delivery.get(id), Some(Delivery::Sent | Delivery::Queued | Delivery::Started)) {
+            return;
+        }
+        match c {
+            Command::QueueRemove { .. } => {
+                self.state.delivery.insert(id.clone(), Delivery::Cancelled);
+                self.touch_state();
+            }
+            Command::QueueEdit { text: new, attachments, .. } => {
+                if let Some(e) = self.get_mut(id)
+                    && let Body::User { text, images, attachments: names, .. } = &mut e.body
+                {
+                    new.clone_into(text);
+                    if let Some(list) = attachments {
+                        (*images, *names) = super::model::attachment_summary(list);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Going on with a harness process after an upgrade: what another harness (the one before a
     /// switch) left running in the timeline, and the tasks it started, can't still be running (an
     /// older image left them so).

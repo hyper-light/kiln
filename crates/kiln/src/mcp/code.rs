@@ -173,7 +173,10 @@ function __kiln_build(names) {
     const parts = name.split(".");
     let o = root;
     for (let i = 0; i < parts.length - 1; i++) { o[parts[i]] = o[parts[i]] || {}; o = o[parts[i]]; }
-    o[parts[parts.length - 1]] = (input) => __kiln_call(name, input);
+    // A leaf landing where a node is keeps its children: kiln.ci.verdict() and kiln.ci.verdict.wait() both.
+    const leaf = (input) => __kiln_call(name, input);
+    Object.assign(leaf, o[parts[parts.length - 1]] || {});
+    o[parts[parts.length - 1]] = leaf;
   }
   return Object.freeze(root);
 }
@@ -423,6 +426,35 @@ mod tests {
     fn a_search_sees_the_hosts_registry() -> Result<(), String> {
         let out = run_on(slow(1), Mode::Search, "return registry.map(o => o.name);", Limits::default()).map_err(|e| e.message)?;
         assert_eq!(out.get("result"), Some(&json!(["machines.run", "fail"])));
+        Ok(())
+    }
+
+    /// An operation whose name is another's prefix: `ci.verdict` and `ci.verdict.wait`.
+    struct Nested;
+
+    impl Host for Nested {
+        fn names(&self) -> Vec<String> {
+            vec!["ci.verdict.wait".into(), "ci.verdict".into()]
+        }
+
+        fn registry(&self) -> Value {
+            json!([{"name": "ci.verdict.wait"}, {"name": "ci.verdict"}])
+        }
+
+        fn call(&self, name: &str, _input: Value) -> Result<Value, Value> {
+            Ok(json!(name))
+        }
+
+        fn abandon(&self) {}
+    }
+
+    /// W28-R58: a leaf landing where a node is keeps its children, whatever the registry's order:
+    /// `kiln.ci.verdict()` and `kiln.ci.verdict.wait()` are both there.
+    #[test]
+    fn w28_r58_a_leaf_keeps_the_children_of_its_node() -> Result<(), String> {
+        let program = "return [typeof kiln.ci.verdict, typeof kiln.ci.verdict.wait, await kiln.ci.verdict({}), await kiln.ci.verdict.wait({})];";
+        let out = run_on(Arc::new(Nested), Mode::Run { input: Value::Null }, program, Limits::default()).map_err(|e| e.message)?;
+        assert_eq!(out.get("result"), Some(&json!(["function", "function", "ci.verdict", "ci.verdict.wait"])), "{out}");
         Ok(())
     }
 }

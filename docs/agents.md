@@ -88,7 +88,10 @@ goes at the same latitude, never wider (an ACP agent that names its modes only o
 kiln's Ask, or Bypass from a mode that skipped every check), and the effort as near as the model
 takes. The to-dos go in the note it's given ("The plan as it stands"), and the session goes on
 with none: the new harness keeps a list of its own, so keep-going ([goals.md](goals.md)) never
-holds it to one only the old harness could change. The timeline marks the line between the two.
+holds it to one only the old harness could change. The timeline marks the line between the two. A
+message the old harness never got (one sent as Codex or an ACP agent was still starting: a harness
+that can't get going is switched out of at once) goes to the new one first, still shown queued where
+it was said, then what waited after it (docs/sends.md, "A harness that ends").
 
 ## Where a harness is found
 
@@ -282,18 +285,20 @@ server says, and counts every session it has, ended ones included, until it's up
   on this", Ask an agent, a shell's "Start agents in this shell", the command palette) fills the
   composer in and says where it came from, with Clear for your own defaults.
 - **Messaging agents.** With agents selected (or one picked by typing @ and part of a name, machine
-  or harness), the same composer writes to them, each named in the To line where the folder was,
-  in the order they were picked (each new one at the end), put back with its ×, Clear for them
-  all. The To line is one line: as many as fit, the rest folded into "+N more" after them. What's
-  written stays as it turns, and it keeps the height it had starting an agent, so the list under
-  it doesn't move as the first is picked or the last put back. A prompt goes with
-  files (the paperclip, a paste or a drop) and what you say into the mic, queued, steered or sent
-  now as an agent's own box sends it. The line above is theirs: unset, each agent keeps its own;
-  chosen (the speed too), only the agents that have it are sent to, and given it first (Reset
-  unsets them all). In the field, / lists kiln's own commands for all of them first
+  or harness), the same composer writes to them, in the rows it has starting an agent: the line
+  above the box is theirs, and under the box, where More options is, the To line names each, in
+  the order they were picked (each new one at the end), put back with its ×, Clear for them all.
+  The To line is one line: as many as fit, the rest folded into "+N more" after them. What's
+  written stays as it turns, and with the same rows (the word about the machines under them too)
+  it keeps its height, so the list under it doesn't move as the first is picked or the last put
+  back. A prompt goes with files (the paperclip, a paste or a drop) and what you say into the mic,
+  queued, steered or sent now as an agent's own box sends it. On the line above, unset, each agent
+  keeps its own; chosen (the speed too), only the agents that have it are sent to, and given it
+  first (Reset unsets them all). In the field, / lists kiln's own commands for all of them first
   (`/interrupt`, `/restart`, `/allow` and `/deny` what waits on you, `/end` those selected),
-  each asked once under the field, then the agents' own; Stop beside Send stops the turns of those
-  working. It empties as it sends, and says how it went. Every agent the list shows is Select all.
+  each asked once in a line under the To line, then the agents' own; Stop beside Send stops the
+  turns of those working. It empties as it sends, and that line says how it went; it slides open
+  and shut, so the list under it moves smoothly. Every agent the list shows is Select all.
 
 ## API
 
@@ -1370,7 +1375,9 @@ left running that the list leaves out, should its end never have come.
 
 Nothing a harness ran outlives its process: when it ends (a switch to another harness, a stop, a
 restart, a crash), its live tasks end "stopped" and its calls still under way are cancelled, all
-of them kept to read; a new process starts with nothing of an earlier one's running. What kiln
+of them kept to read; a new process starts with nothing of an earlier one's running. A message it
+was handed and never finished ends dropped; one its adapter held for it, which it never got, goes
+to the next process first (docs/sends.md, "A harness that ends"). What kiln
 took back over (`left-<pid>`: "What an agent left running") is the exception. The state keeps
 the newest 200 tasks (the oldest finished go first, with the output kiln kept of them), and a
 finished task keeps 2,000 characters of a long command (its call keeps it whole), so the state

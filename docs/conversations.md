@@ -367,11 +367,29 @@ constraints; the old SQLite recovery and mirror/upgrade procedures are not curre
   once copied the whole file in one go (`VACUUM INTO`, one transaction), which took more memory
   than the first server had: it was killed for it every minute until rolled back (2026-10-18).
 - **A runner's first feed** sends its whole store, everything it kept before the feed.
-- **A runner's upgrade** starts the new process's store anew (`<state>/instances/<id>/`): it
-  writes what each session it takes over has, and its feed sends all of it to the server. The
-  server has it already, as it is, so it writes nothing of it (a lookup a row), but the runner
-  reads it all and sends it (609k rows from adacachy on 2026-10-25). A mirror's new copy takes
-  the server's whole store again (5.7 GB). Neither store goes on with its upgrade yet.
+- **A runner's upgrade** (blue/green, docs/releases.md) hands its stores to the new build, which
+  goes on with them: its own store and, on a mirror, its copy of the server's. Once the old
+  runner has handed its sessions out and what they said last has gone into its store, it lets go
+  of each store, moves its files into the new build's folder (`<state>/instances/<id>/`) and
+  says so first (`Frame::Stores`, the new build saying it takes them: `Ready.stores`). The new
+  build opens them there, the same ids and numbers, so the server's feed of the store, and its
+  feed to the copy, go on where they are and nothing is sent again. The mirror's feed follows the
+  process the machine promotes. The stores never hold an upgrade back: one the new build can't
+  open (tried three times, a second apart) it sets aside, kept whole beside its new one
+  (`conversations.db.unopened`, `.unopened.2` and on if that's taken, its log by the same name
+  and `-wal`, so it still opens as it is), and goes on in a new store (a new copy, for a
+  mirror's), saying where in its answer (`Frame::StoresTaken`). One that can't keep a store at
+  all (not even a new one opens) leaves what it was handed in its folder under its own name, for
+  its next start, and takes the rest of the upgrade all the same: nothing is lost either way. A
+  rollback moves the files back before the new build's folder goes (a store it set aside comes
+  back from where it said, as it was, not the new one; one that couldn't be moved back keeps the
+  folder), and the old runner goes on with them. An old runner that ends before
+  it says (it died, or their link broke) leaves the new build the store in its own folder: the
+  files it had moved there, or a new one. A build from before neither says nor takes: an upgrade
+  from one opens a store of its own in the new build, which writes what each session it takes
+  over has, and its feed sends all of it to the server, which has it already, as it is, and
+  writes nothing of it (a lookup a row). Before this, every upgrade did that (609k rows from
+  adacachy on 2026-10-25), and a mirror's new copy took the server's whole store again (5.7 GB).
 
 ## Status (historical receipts)
 

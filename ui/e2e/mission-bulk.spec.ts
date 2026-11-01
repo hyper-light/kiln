@@ -8,7 +8,9 @@
  * stay), Stop their turns, End… (asked in the line, with the agents they started). Each goes to each
  * agent, a line says how it went and opens to each one's outcome. Clear, or putting back the last one,
  * ends selecting. Picking more moves nothing (the list, the head, its buttons, the composer's one-line
- * To line), and nothing scrolls sideways. On a desktop and a phone.
+ * To line), and nothing scrolls sideways. Messaging them, the composer has the rows it has as it starts
+ * an agent (its line, the box, the To line where More options is), so it turns with no room left empty.
+ * The head's controls sit on its hairline's ends. On a desktop and a phone.
  */
 import { expect, test, type Page } from "@playwright/test";
 
@@ -159,6 +161,86 @@ test("picking agents moves nothing: the list stays where it is, the head keeps i
   // Putting one back moves nothing either.
   await putBack(page, "att-ci");
   expect(await places(page, watched)).toEqual(first);
+});
+
+/** The composer's rows from the page's top, each where it starts and how tall, and the room it leaves under its section. */
+function composerRows(page: Page) {
+  return page.evaluate(() => {
+    const mode = document.querySelector(".mc-mode");
+    const sec = mode?.querySelector("section.ms-msg");
+    const at = (s: string) => {
+      const b = sec?.querySelector(s)?.getBoundingClientRect();
+      return b ? `${Math.round(b.top + scrollY)} ${Math.round(b.height)}` : null;
+    };
+    return {
+      line: at(".rs-tuner"),
+      box: at(".hx-compose-box"),
+      // Under the box: More options as it starts an agent, the To line as it messages them.
+      under: at(".mc-under, .ms-to"),
+      note: at(".mc-note"),
+      // Past the section's own margin, nothing: no room held empty under it.
+      room: mode && sec ? Math.round(mode.getBoundingClientRect().bottom - sec.getBoundingClientRect().bottom) - parseFloat(getComputedStyle(sec).marginBottom) : null,
+    };
+  });
+}
+
+test("messaging those picked, the composer has starting's rows: its line, the box, the To line where More options was, and no room left empty", async ({ page }) => {
+  test.skip(REAL, "the mock's agents");
+  await page.goto("/agents");
+  await expect(page.locator("li.ms-row").first()).toBeVisible();
+  let last = "";
+  await expect
+    .poll(
+      async () => {
+        const now = JSON.stringify(await composerRows(page));
+        const same = now === last;
+        last = now;
+        return same;
+      },
+      { intervals: [400], timeout: 15_000 },
+    )
+    .toBe(true);
+  const starting = await composerRows(page);
+  expect(starting.line && starting.box && starting.under, "the composer's rows as it starts an agent").toBeTruthy();
+  expect(starting.room).toBe(0);
+
+  await pick(page, "fam-orch", "att-ci");
+  const to = page.locator(".mc-mode .ms-to");
+  await expect(to).toContainText("Release prep");
+  // Its line says what they're held to once they've said what they understand (its room there meanwhile).
+  await expect(page.locator(".mc-mode .ms-tuner .rs-v").first()).toBeVisible();
+  // Once the turn's crossfade has eased it into place (it starts 2 px low).
+  await expect.poll(() => composerRows(page), { message: "messaging them, the composer's rows aren't starting's" }).toEqual(starting);
+  // The To line is under the box, not in it.
+  await expect(page.locator(".mc-mode .hx-compose-box .ms-to")).toHaveCount(0);
+});
+
+/**
+ * The list's head against the hairline under it (the list's own top edge): how far the first of its
+ * controls shown starts from the list's left, and the last ends from its right, in whole pixels.
+ */
+function headEdges(page: Page) {
+  return page.evaluate(() => {
+    const list = document.querySelector(".ms-list")?.getBoundingClientRect();
+    const head = document.querySelector(".ms-listhead");
+    if (!list || !head) return null;
+    const shown = [...head.querySelectorAll<HTMLElement>(".ms-all input, .ms-count, .ms-head-end button")]
+      .filter((el) => el.getBoundingClientRect().width > 0 && !el.closest("[inert]"))
+      .map((el) => el.getBoundingClientRect());
+    if (shown.length === 0) return null;
+    return { left: Math.round(Math.min(...shown.map((b) => b.left)) - list.left) + 0, right: Math.round(list.right - Math.max(...shown.map((b) => b.right))) + 0 };
+  });
+}
+
+test("the list's head sits on its hairline's ends, as the filter and the sort over it do: its check or ring at the left, its last button at the right", async ({ page }) => {
+  test.skip(REAL, "the mock's agents");
+  await page.goto("/agents");
+  await expect(page.locator("li.ms-row").first()).toBeVisible();
+  // By touch, before selecting: the count at its left (the ring not there yet), Select at its right.
+  if (await touchScreen(page)) await expect.poll(() => headEdges(page)).toEqual({ left: 0, right: 0 });
+  await pick(page, "fam-orch", "att-ci");
+  await expect(bulk(page, 2)).toBeVisible();
+  await expect.poll(() => headEdges(page)).toEqual({ left: 0, right: 0 });
 });
 
 test("Clear, or putting back the last one picked, ends selecting", async ({ page }) => {

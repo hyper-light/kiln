@@ -579,7 +579,7 @@ pub fn ops() -> &'static [Op] {
                 input: Input::of::<input::CiTestsHistory>(),
                 route: Routes(vec![Definition::new("GET", &[Part::Literal("api"), Part::Literal("ci"), Part::Literal("repos"), Part::Field("repo"), Part::Literal("tests"), Part::Field("test"), Part::Literal("history")], &["branch", "limit"], "runs.read", ScopeAt::Repo(3))]),
                 run: |cx: Cx, v: Value| async move { answer(super::results::history(&cx.hub, &text(&v, "repo")?, &text(&v, "test")?, &query(&v, &["branch", "limit"])).await).await }),
-            op!("ci.runs.bisect", "Bisect a failure: the run's job (the one that failed, by default), run again on the commits between the last it passed on (`good`: the last green run of its workflow on its branch before it, by default) and the run's (`bad`), the range halved each time, until the first commit it fails on is found. Each try is a run of that job at that commit, trusted as the run was. Follow it with ci.runs.bisects.", ro: false, destructive: false,
+            op!("ci.runs.bisect", "Bisect a failure: the run's job (the one that failed, by default), run again on the commits between the last it passed on (`good`: the last green run of its workflow on its branch before it, by default) and the run's (`bad`), until the first commit it fails on is found: a binary search, flake-aware when the check is flaky (W28-R56). Each try is a run of that job at that commit, trusted as the run was. With `test`, only the commits whose diffs could affect the test's unit are tried, each judged by the test's own result (W28-R57). Follow it with ci.runs.bisects.", ro: false, destructive: false,
                 input: Input::of::<input::CiRunsBisect>(),
                 route: Routes(vec![Definition::new("POST", &[Part::Literal("api"), Part::Literal("ci"), Part::Literal("runs"), Part::Field("run"), Part::Literal("bisect")], &[], "runs.debug", ScopeAt::Run(3)).reply(Reply::Json(202)).limit(65536)]),
                 run: |cx: Cx, v: Value| async move { answer(super::bisect::start(&cx.hub, &text(&v, "run")?, &v, &by(&cx)).await).await }),
@@ -864,6 +864,14 @@ pub fn ops() -> &'static [Op] {
                 input: Input::of::<input::CiProvidersChecks>(),
                 route: Routes(vec![Definition::new("GET", &[Part::Literal("api"), Part::Literal("ci"), Part::Literal("repos"), Part::Field("repo"), Part::Literal("commits"), Part::Field("sha"), Part::Literal("checks")], &[], "runs.read", ScopeAt::Repo(3))]),
                 run: |cx: Cx, v: Value| async move { super::providers::checks(&cx.hub, &text(&v, "repo")?, &text(&v, "sha")?).await }),
+            op!("ci.verdict", "A commit's verdict on each workflow's lane it is on (W28-R55): per unit and test, direct (its own result), covered by a later commit's (optimistic, never passed), suspect (a later commit newly failed what its diff could affect) or culprit, each with why; and the commit's, the weakest of them. `workflow` for one lane.", ro: true, destructive: false,
+                input: Input::of::<input::CiVerdict>(),
+                route: Routes(vec![Definition::new("GET", &[Part::Literal("api"), Part::Literal("ci"), Part::Literal("repos"), Part::Field("repo"), Part::Literal("commits"), Part::Field("sha"), Part::Literal("verdict")], &["workflow"], "runs.read", ScopeAt::Repo(3))]),
+                run: |cx: Cx, v: Value| async move { super::verdict::of_commit(&cx.hub, &text(&v, "repo")?, &text(&v, "sha")?, &query(&v, &["workflow"])).await }),
+            op!("ci.verdict.wait", "Wait for a commit's verdict to be final (`until: final`, the default: every lane direct, covered or culprit) or to change at all (`until: any`), for at most `timeout_s` seconds (600 at most): the verdict then (as ci.verdict gives it), whether it is final, and whether the time ran out (W28-R58).", ro: true, destructive: false,
+                input: Input::of::<input::CiVerdictWait>(),
+                route: Routes(vec![Definition::new("GET", &[Part::Literal("api"), Part::Literal("ci"), Part::Literal("repos"), Part::Field("repo"), Part::Literal("commits"), Part::Field("sha"), Part::Literal("verdict"), Part::Literal("wait")], &["workflow", "until", "timeout_s"], "runs.read", ScopeAt::Repo(3))]),
+                run: |cx: Cx, v: Value| async move { super::verdict::wait(&cx.hub, &text(&v, "repo")?, &text(&v, "sha")?, &query(&v, &["workflow", "until", "timeout_s"])).await }),
             op!("host.pulls.list", "A repository's open pull requests (merge requests) on its host, GitHub, GitLab or Bitbucket: as you, when you signed in with that host.", ro: true, destructive: false,
                 input: Input::of::<input::HostPullsList>(),
                 route: Routes(vec![Definition::new("GET", &[Part::Literal("api"), Part::Literal("ci"), Part::Literal("repos"), Part::Field("repo"), Part::Literal("pulls")], &[], "diffs.read", ScopeAt::Repo(3))]),
@@ -940,6 +948,10 @@ pub fn ops() -> &'static [Op] {
                 input: Input::of::<input::CiQueueList>(),
                 route: Routes(vec![Definition::new("GET", &[Part::Literal("api"), Part::Literal("repos"), Part::Field("repo"), Part::Literal("queue")], &[], "diffs.read", ScopeAt::Repo(2))]),
                 run: |cx: Cx, v: Value| async move { let r = text(&v, "repo")?; diffs(&cx, Method::GET, &["repos", r.as_str(), "queue"], &HashMap::new(), &Value::Null).await }),
+            op!("ci.queue.enqueue", "Put a host's changes (its pull requests) in its host's own queue, a merge queue or merge train, bottom first, each at the head Review cleared: refused if one moved since, is merged or closed, or the host has no queue for the repository.", base: "", ro: false, destructive: false,
+                input: Input::of::<input::CiQueueEnqueue>(),
+                route: Routes(vec![Definition::new("POST", &[Part::Literal("api"), Part::Literal("repos"), Part::Field("repo"), Part::Literal("queue")], &[], "diffs.land", ScopeAt::Repo(2))]),
+                run: |cx: Cx, v: Value| async move { let r = text(&v, "repo")?; diffs(&cx, Method::POST, &["repos", r.as_str(), "queue"], &HashMap::new(), &v).await }),
             op!("ci.queue.remove", "Take an entry out of the land queue (its id, from ci.queue.list).", base: "", ro: false, destructive: true,
                 input: Input::of::<input::CiQueueRemove>(),
                 route: Routes(vec![Definition::new("DELETE", &[Part::Literal("api"), Part::Literal("queue"), Part::Field("entry")], &[], "queue.manage", ScopeAt::Entry(2))]),
@@ -1947,6 +1959,9 @@ pub mod input {
         pub run: String,
         /// The job's id.
         pub job: Option<String>,
+        /// A test the job reports (W16's `suite name`): only the commits whose diffs could affect
+        /// its unit are tried, each judged by the test's own result (W28-R57).
+        pub test: Option<String>,
         /// A commit it passes on.
         pub good: Option<String>,
         /// A commit it fails on.
@@ -2626,6 +2641,53 @@ pub mod input {
     pub struct CiQueueList {
         /// The repository, `owner/name`.
         pub repo: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CiQueueEnqueue {
+        /// The repository, `owner/name`.
+        pub repo: String,
+        /// The branch they land on (the repository's default when left out).
+        pub trunk: Option<String>,
+        /// Bottom first: each `{ number, head }`, the head Review cleared.
+        pub changes: Vec<CiQueueEnqueueChange>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    pub struct CiQueueEnqueueChange {
+        pub number: i64,
+        pub head: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CiVerdict {
+        /// The repository, `owner/name`.
+        pub repo: String,
+        pub sha: String,
+        /// Only this workflow's lane.
+        pub workflow: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum CiVerdictWaitUntil {
+        Final,
+        Any,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CiVerdictWait {
+        /// The repository, `owner/name`.
+        pub repo: String,
+        pub sha: String,
+        /// Only this workflow's lane.
+        pub workflow: Option<String>,
+        pub until: Option<CiVerdictWaitUntil>,
+        #[schemars(range(min = 1, max = 600))]
+        pub timeout_s: Option<i64>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]

@@ -48,7 +48,34 @@ pub struct Pool {
     pub hosted: bool,
     /// Its pods have a Docker-capable sidecar, for Docker actions (`k8s`, W13-R07).
     pub docker: bool,
+    /// Where its legs go when their pods are late (`k8s`, W28-R80).
+    pub overflow: Option<Overflow>,
 }
+
+/// A `k8s` pool's overflow (docs/ci.md W28-R80), checked: a leg of the pool still waiting for its
+/// executor `after_ms` after it was queued runs on a runner of `hosts` instead, on the host, once
+/// one that meets its own requirements too has room for it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Overflow {
+    /// Which runners may take its legs, with its source text.
+    pub hosts: Vec<(String, Constraint)>,
+    /// How long a leg waits for its pool's executor first, in milliseconds.
+    pub after_ms: i64,
+}
+
+/// A `k8s` pool's overflow as configured: `{ hosts = "os == linux && tools has cargo", after = "5m" }`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OverflowSpec {
+    pub hosts: String,
+    pub after: Option<String>,
+}
+
+/// How long a `k8s` pool's leg waits for its pod before it may overflow, unless `after` says: 2
+/// min, past which the recorded week's pods were already in their slowest 13% (half started within
+/// 8 s), and the replay's verdicts within the hour gain as much as at 5 or 10 min for the least
+/// waste (ci/sim/README.md).
+pub const OVERFLOW_AFTER_MS: i64 = 2 * 60_000;
 
 /// What a pool's configuration says, before it's checked.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, Serialize)]
@@ -74,6 +101,9 @@ pub struct PoolSpec {
     /// A `k8s` pool's warm workspaces, kept past each pod (W24-R14).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warm: Option<PodWarm>,
+    /// Where a `k8s` pool's legs go when their pods are late (W28-R80).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overflow: Option<OverflowSpec>,
 }
 
 /// A `k8s` pool's warm workspaces (docs/ci.md W24-R14). The runner in each of its pods keeps its
@@ -234,6 +264,24 @@ impl PoolSpec {
             }
             w.check().map_err(|e| format!("pool `{name}`: {e}"))?;
         }
+        let overflow = match &self.overflow {
+            Some(o) => {
+                if self.executor != "k8s" {
+                    return Err(format!("pool `{name}`: `overflow` sends a `k8s` pool's legs to runners when their pods are late, and this pool's executors are `{}`", self.executor));
+                }
+                let src = o.hosts.trim();
+                if src.is_empty() {
+                    return Err(format!("pool `{name}`: `overflow.hosts`, the runners its legs may go to (`os == linux && tools has cargo`)"));
+                }
+                let hosts = vec![(src.to_owned(), Constraint::parse(src).map_err(|e| format!("pool `{name}`: `overflow.hosts`: {e}"))?)];
+                let after_ms = match o.after.as_deref() {
+                    Some(t) => (routing::number(t.trim()).filter(|s| *s >= 0.0 && s.is_finite()).ok_or_else(|| format!("pool `{name}`: `overflow.after` is a duration (`90s`, `5m`), not `{t}`"))? * 1000.0) as i64,
+                    None => OVERFLOW_AFTER_MS,
+                };
+                Some(Overflow { hosts, after_ms })
+            }
+            None => None,
+        };
         let max = self.max.unwrap_or(self.min_idle.max(1));
         if max == 0 || self.min_idle > max {
             return Err(format!("pool `{name}`: `min_idle` ({}) is at most `max` ({max}), which is at least 1", self.min_idle));
@@ -274,6 +322,7 @@ impl PoolSpec {
             caps: 0,
             hosted: self.executor == "k8s",
             docker: self.docker.is_some(),
+            overflow,
         })
     }
 }

@@ -73,6 +73,8 @@ pub struct Sim {
     pub adopted: Vec<(i64, String, String, Outcome)>,
     /// Demand decisions, each said once: (time, leg, why) (W28-R45).
     pub decisions: Vec<(i64, String, String)>,
+    /// Legs that overflowed their pool: (time, leg, why) (W28-R80).
+    pub overflows: Vec<(i64, String, String)>,
     /// Slot-time: (repo, start, end).
     pub busy: Vec<(String, i64, i64)>,
     /// Slot-time by leg: (leg, start, end).
@@ -108,6 +110,7 @@ impl Sim {
             runs: Vec::new(),
             adopted: Vec::new(),
             decisions: Vec::new(),
+            overflows: Vec::new(),
             busy: Vec::new(),
             busy_legs: Vec::new(),
             executor_start_ms: 500,
@@ -246,6 +249,7 @@ impl Sim {
                 Command::Retry { .. } => {}
                 Command::Adopted { leg, from, outcome } => self.adopted.push((self.now, leg, from, outcome)),
                 Command::Demand { leg, decision } => self.decisions.push((self.now, leg, decision.why())),
+                Command::Overflowed { leg, why } => self.overflows.push((self.now, leg, why)),
             }
         }
     }

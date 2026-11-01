@@ -46,6 +46,12 @@ pub struct Ci {
     /// Accepted for existing configurations (U01). Both dialects use the workflow engine
     /// regardless of this former migration switch.
     pub kiln_workflows: bool,
+    /// Culprit finding starts on its own for each new failure with two or more suspects (docs/ci.md
+    /// W28-R57). Off until declared: kiln decides it only then.
+    pub culprits: bool,
+    /// Branches whose culprit finding is a gate's: its tries go at once, at gate priority
+    /// (W28-R57); elsewhere they run at low priority.
+    pub culprit_gates: Vec<String>,
     /// Route GitHub's hosted labels (`ubuntu-latest`, `macos-latest`, …) by OS and architecture
     /// (docs/ci.md W05-R21). Off by default: then such a label must be on a runner, as it must for
     /// GitHub's self-hosted runners.
@@ -200,6 +206,8 @@ impl Default for Ci {
     fn default() -> Self {
         Self {
             enabled: true,
+            culprits: false,
+            culprit_gates: Vec::new(),
             github_workflows: kiln_ci::wf::GithubWorkflows::Off,
             kiln_workflows: true,
             github_labels: false,
