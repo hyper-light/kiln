@@ -10,8 +10,8 @@ requirements, W26-R21 to W26-R27.
 
 **Where it stands (2026-11-01, when written):**
 - **Merged:** with this file, onto main, on Ada's word, as a merge with main first. The branch is
-  ship-actions, with origin's main cd29ff4808 merged in (c09a4db27b). That holds local main too,
-  and production's e9f72ad63a.
+  ship-actions, with origin's main 786549bfc7 merged in last (88f3cbc7d9). That holds local main
+  too, and production's e9f72ad63a.
 - **Deployed:** not yet. That waits for Ada's word.
 - **Checked at the tree that lands:**
   - the UI's typecheck, lint, tests and build;
