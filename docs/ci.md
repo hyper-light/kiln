@@ -3981,6 +3981,9 @@ support (G-11, G-18, G-25, G-27, G-28).
   (memory its limit too), else the pool's; with the cache claim, v1's cache variables
   (`CARGO_HOME`, `npm_config_cache`, `UV_CACHE_DIR`, `GOMODCACHE`, `GOCACHE`,
   `BUN_INSTALL_CACHE_DIR` under `/cache`); and v1's deadline. The pool's other legs keep its pods.
+  Each pod prefers a worker node (one without the `node-role.kubernetes.io/control-plane` label);
+  with `[kubernetes] workers_only = true` it goes only to one, so a cluster's control plane keeps
+  its room for etcd and the API server, whose use runs past what they ask for.
 - **W13-R08 Job containers and services**, GitHub-exact (G-27): `container` and `services` with
   `image`, `credentials`, `env`, `ports`, `volumes`, `options`; services reachable by their ids
   from a job container, or on `localhost` with mapped ports from a job on the host; health checks
