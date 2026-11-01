@@ -1581,6 +1581,18 @@ mod tests {
         Ok(())
     }
 
+    /// docs/sim.md's bug 14 (W05-R39, R40): the seeds of E4.6's probe where two whole gangs of a
+    /// class, each with room only beside the room kept for it, took their class's room from each
+    /// other for good, the engine never done with one input (1201, 11388); and where a gang with
+    /// room took its class's room from the leg it waited behind, then started past its time (5000).
+    #[test]
+    fn the_seeds_where_gangs_took_their_class_s_room_while_they_had_room_hold() -> Result<(), String> {
+        for seed in [1201, 5000, 11388] {
+            run(seed, 0).map_err(|why| format!("seed {seed}: {why}"))?;
+        }
+        Ok(())
+    }
+
     /// docs/needs.md E1.6: a seed runs the same every time.
     #[test]
     fn a_sched_seed_replays_exactly() -> Result<(), String> {

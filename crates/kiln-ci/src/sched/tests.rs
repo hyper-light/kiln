@@ -3146,6 +3146,35 @@ fn w05_r40_a_restart_rebuilds_a_gang_as_it_ran() {
     assert_eq!(s.check_grants(), Ok(()));
 }
 
+/// W05-R39, R40 (docs/sim.md's bug 14): two whole gangs of a class, the second's room kept from
+/// when an exclusive leg ends, the first whole only after: when it ends, the first, with room by
+/// room alone, isn't the first of the class waiting for room, so the class's room is worked out
+/// again without it; it starts then, and the second, its room kept from the first's end, after.
+/// Each counted as waiting while the other's room held it off, they took that room from each other
+/// for good, the engine never done with the input.
+#[test]
+fn w05_r40_two_whole_gangs_of_a_class_start_in_turn_not_taking_its_room_from_each_other() {
+    let mut sim = Sim::new(Config { backfill: true, ..Config::default() });
+    sim.runner(0, linux("a", 3));
+    sim.runner(0, linux("b", 1));
+    sim.leg(0, LegIn { exclusive: true, p90: Some(10 * 60_000), ..leg("x", "acme/y", 60) }, 10 * MIN);
+    sim.leg(0, leg("q", "acme/y", 60), 3_000);
+    let gang = |id: &str, g: &str, size: u32| LegIn { p90: Some(5 * 60_000), ..member(id, g, size) };
+    sim.leg(1_000, gang("g0m0", "first", 2), 5 * MIN);
+    for m in ["g1m0", "g1m1", "g1m2"] {
+        sim.leg(2_000, gang(m, "second", 3), 5 * MIN);
+    }
+    sim.leg(4_000, gang("g0m1", "first", 2), 5 * MIN);
+    sim.run(5 * MIN);
+    // q's end has b pass the second over: its room is kept from x's end.
+    let second = ["g1m0", "g1m1", "g1m2"];
+    assert!(second.iter().all(|m| matches!(sim.last_wait(m), Some(WaitReason::Reserved { at, .. }) if *at == 10 * MIN)), "{:?}", second.map(|m| sim.last_wait(m)));
+    sim.run(30 * MIN);
+    assert_eq!(["g0m0", "g0m1"].map(|m| sim.started(m)), [Some(10 * MIN); 2]);
+    assert_eq!(second.map(|m| sim.started(m)), [Some(15 * MIN); 3]);
+    assert_eq!(sim.sched.check_grants(), Ok(()));
+}
+
 /// A stream of 1-CPU legs on the simulation's runners, one each `every` ms until `until`, each
 /// expected to take a minute (its p90) and taking from half a minute to a fifth past it, within its
 /// 10-minute timeout (docs/needs.md E4.6).

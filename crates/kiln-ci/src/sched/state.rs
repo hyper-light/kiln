@@ -2457,13 +2457,15 @@ impl Scheduler {
                 if self.place_gang(&g, now, out) {
                     continue;
                 }
-                stuck.insert(g);
                 if let Some(p) = passed.get_mut(c.index()) {
                     *p = true;
                 }
-                if self.cfg.backfill {
-                    self.reserve(runner, passed, c, now, out);
+                // Room kept for another that held it off, worked out again, may let it start: it's
+                // tried again then, before those behind it (W05-R39); else it's passed over.
+                if self.cfg.backfill && self.reserve(runner, passed, c, now, out) {
+                    continue;
                 }
+                stuck.insert(g);
                 continue;
             }
             let mut bests = Class::ALL.into_iter().zip(bests).filter_map(|(c, id)| id.map(|id| (c, id)));
@@ -3602,12 +3604,15 @@ impl Scheduler {
 
     /// Whether a queued leg waits for room alone (W05-R39): some runner it may run on would take
     /// it and could hold it idle, and none has room for it now. A gang's member waits for room
-    /// when its gang is whole, can't start now, and each of its members could be held somewhere
-    /// (W05-R40). One a pool's executor or a warm runner holds isn't one.
+    /// when its gang is whole, hasn't room to start now, and each of its members could be held
+    /// somewhere (W05-R40). One a pool's executor or a warm runner holds isn't one.
     fn waits_for_room(&self, id: &str) -> bool {
         let Some(l) = self.legs.get(id).filter(|l| l.state == State::Queued && l.hold.is_none() && l.req.pool.is_none()) else { return false };
+        // By room alone, as a leg's, the room kept for others aside: which item holds its class's
+        // room doesn't change which waits first (two whole gangs of a class, each with room only
+        // beside the room kept for it, took that room from each other for good: docs/sim.md).
         if let Some(g) = &l.input.gang {
-            return self.whole(&g.id) && self.gang_plan(&g.id).is_none() && self.crew_queued(&g.id).iter().all(|m| self.could_be_held(m));
+            return self.whole(&g.id) && self.room_plan(&g.id).is_none() && self.crew_queued(&g.id).iter().all(|m| self.could_be_held(m));
         }
         let Some(s) = self.sigs.get(&l.sig) else { return false };
         let mut could = false;
@@ -3813,26 +3818,37 @@ impl Scheduler {
     /// [`Self::GANG_LOOK`] places in all. A pool's member takes one of the pool's idle executors
     /// there that the members before it haven't. `None` when no way is found.
     fn gang_plan(&self, g: &str) -> Option<Vec<(String, String)>> {
+        self.plan_gang(g, true)
+    }
+
+    /// [`Self::gang_plan`] by room alone, the reservations aside (W05-R39): where a whole gang
+    /// would fit now, as a leg's [`Self::capacity`] says where it would.
+    fn room_plan(&self, g: &str) -> Option<Vec<(String, String)>> {
+        self.plan_gang(g, false)
+    }
+
+    /// [`Self::gang_plan`], held to the reservations when `held`.
+    fn plan_gang(&self, g: &str, held: bool) -> Option<Vec<(String, String)>> {
         let members = self.crew_queued(g);
         let mut plan: Vec<(String, String)> = Vec::new();
         let mut budget = Self::GANG_LOOK;
-        (!members.is_empty() && self.plan_from(&members, &mut plan, &mut budget)).then_some(plan)
+        (!members.is_empty() && self.plan_from(&members, &mut plan, &mut budget, held)).then_some(plan)
     }
 
     /// How many places [`Self::gang_plan`] tries for a gang's members at most, so a gang that
     /// can't start costs a bounded look.
     const GANG_LOOK: usize = 4096;
 
-    /// Puts the members after those in `plan` ([`Self::gang_plan`]). Whether all were put.
-    fn plan_from(&self, members: &[String], plan: &mut Vec<(String, String)>, budget: &mut usize) -> bool {
+    /// Puts the members after those in `plan` ([`Self::plan_gang`]). Whether all were put.
+    fn plan_from(&self, members: &[String], plan: &mut Vec<(String, String)>, budget: &mut usize, held: bool) -> bool {
         let Some(m) = members.get(plan.len()) else { return true };
-        for r in self.gang_places(m, plan) {
+        for r in self.gang_places(m, plan, held) {
             if *budget == 0 {
                 return false;
             }
             *budget -= 1;
             plan.push((m.clone(), r));
-            if self.plan_from(members, plan, budget) {
+            if self.plan_from(members, plan, budget, held) {
                 return true;
             }
             plan.pop();
@@ -3840,9 +3856,9 @@ impl Scheduler {
         false
     }
 
-    /// The runners a gang's member could start on beside the members `plan` puts there, best
-    /// first: the least loaded, then by name.
-    fn gang_places(&self, m: &str, plan: &[(String, String)]) -> Vec<String> {
+    /// The runners a gang's member could start on beside the members `plan` puts there, held to
+    /// the reservations there when `held`, best first: the least loaded, then by name.
+    fn gang_places(&self, m: &str, plan: &[(String, String)], held: bool) -> Vec<String> {
         let (Some(l), Some(s)) = (self.legs.get(m), self.legs.get(m).and_then(|l| self.sigs.get(&l.sig))) else { return Vec::new() };
         let mut places: Vec<(usize, &String)> = Vec::new();
         for rid in &s.eligible {
@@ -3859,7 +3875,7 @@ impl Scheduler {
                     self.room_in(r, &self.holding_with(r, |_| true, &beside), l)
                 }
             };
-            if room && self.allowed_beside(r, l, &mates) {
+            if room && (!held || self.allowed_beside(r, l, &mates)) {
                 places.push((r.running.len() + mates.len(), rid));
             }
         }

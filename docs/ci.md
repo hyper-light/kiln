@@ -2025,15 +2025,17 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   that would take it with room for it beside the members put there before it (members may share
   a runner), as the reservations there let it, the least loaded first, then by name, the members
   before it put elsewhere where one has no room (at most 4,096 places tried). When no way is
-  found, none starts; with backfilling (W05-R39) the gang keeps room for each member on the
-  runner where its room frees soonest, all from the latest of their times, and those runners
-  take only what that lets them. A member refused (W05-R02) or not granted (W05-R05) takes the
-  others' grants back (`Lost`, why `gang`), and the gang is queued again at the same attempts. A
-  member lost while it ran, before any member's attempt ended, takes the others back too: every
-  member's attempt ends lost, and the gang goes again whole at the next attempts if each may be
-  tried again (W05-R16), or else every member ends failed. A gang's member is otherwise never tried
-  again alone: once one member's attempt has ended, a member lost ends failed, `runner-lost`, and
-  the others run on. A member that comes after its gang started waits for its gang's next start.
+  found, none starts; with backfilling (W05-R39) a gang with no way by room alone (the room kept
+  for others aside, as a leg's) keeps room for each member on the runner where its room frees
+  soonest, all from the latest of their times, and those runners take only what that lets them;
+  one held off only by room kept for another waits behind it. A member refused (W05-R02) or not
+  granted (W05-R05) takes the others' grants back (`Lost`, why `gang`), and the gang is queued
+  again at the same attempts. A member lost while it ran, before any member's attempt ended, takes
+  the others back too: every member's attempt ends lost, and the gang goes again whole at the next
+  attempts if each may be tried again (W05-R16), or else every member ends failed. A gang's member
+  is otherwise never tried again alone: once one member's attempt has ended, a member lost ends
+  failed, `runner-lost`, and the others run on. A member that comes after its gang started waits
+  for its gang's next start.
   A gang that runs when the server restarts comes back as it ran (W05-R25). Commands can't be one
   of a gang until commands are placed by the engine (docs/needs.md E5): `kiln run --needs` and
   MCP's `run` refuse `together:`.

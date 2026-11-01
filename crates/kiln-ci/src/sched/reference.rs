@@ -748,7 +748,8 @@ impl Reference {
     /// A runner takes the best queued legs it has room for, in its own pick order (by the
     /// dimensions it offers), until none fits (W05-R04: new capacity looks at what that runner can
     /// serve). A whole gang whose first member comes before the best of the first class with
-    /// either starts whole, or is passed over as an item without room is (W05-R40). With
+    /// either starts whole, or is passed over as an item without room is (W05-R40), once the room
+    /// worked out again for its class and those before stands as it was. With
     /// backfilling, before it takes a leg while the first of that leg's class, or of a class before
     /// it, had no room there, those firsts keep room where it frees first, and it picks again,
     /// held to that room (W05-R39).
@@ -765,11 +766,12 @@ impl Reference {
                 if self.place_gang(&g, now) {
                     continue;
                 }
-                stuck.insert(g);
                 passed.insert(c, true);
-                if self.cfg.backfill {
-                    self.reserve(runner, &passed, c, now);
+                // Room worked out again may let it start: it's tried again, else passed over.
+                if self.cfg.backfill && self.reserve(runner, &passed, c, now) {
+                    continue;
                 }
+                stuck.insert(g);
                 continue;
             }
             let Some((class, id, over)) = self.choose(runner, &sees, now) else { return };
@@ -1124,20 +1126,29 @@ impl Reference {
     /// by name; where a member has no such runner, the members before it put elsewhere, in that
     /// order, trying at most 4,096 places in all.
     fn gang_plan(&self, g: &str) -> Option<Vec<(String, String)>> {
-        let members = self.crew_queued(g);
-        let (mut plan, mut budget) = (Vec::new(), 4096usize);
-        (!members.is_empty() && self.plan_from(&members, &mut plan, &mut budget)).then_some(plan)
+        self.plan_gang(g, true)
     }
 
-    fn plan_from(&self, members: &[String], plan: &mut Vec<(String, String)>, budget: &mut usize) -> bool {
+    /// [`Self::gang_plan`] by room alone, the room kept aside.
+    fn room_plan(&self, g: &str) -> Option<Vec<(String, String)>> {
+        self.plan_gang(g, false)
+    }
+
+    fn plan_gang(&self, g: &str, held: bool) -> Option<Vec<(String, String)>> {
+        let members = self.crew_queued(g);
+        let (mut plan, mut budget) = (Vec::new(), 4096usize);
+        (!members.is_empty() && self.plan_from(&members, &mut plan, &mut budget, held)).then_some(plan)
+    }
+
+    fn plan_from(&self, members: &[String], plan: &mut Vec<(String, String)>, budget: &mut usize, held: bool) -> bool {
         let Some(m) = members.get(plan.len()) else { return true };
-        for r in self.gang_places(m, plan) {
+        for r in self.gang_places(m, plan, held) {
             if *budget == 0 {
                 return false;
             }
             *budget -= 1;
             plan.push((m.clone(), r));
-            if self.plan_from(members, plan, budget) {
+            if self.plan_from(members, plan, budget, held) {
                 return true;
             }
             plan.pop();
@@ -1145,7 +1156,7 @@ impl Reference {
         false
     }
 
-    fn gang_places(&self, m: &str, plan: &[(String, String)]) -> Vec<String> {
+    fn gang_places(&self, m: &str, plan: &[(String, String)], held: bool) -> Vec<String> {
         let Some(l) = self.legs.get(m) else { return Vec::new() };
         let mut places: Vec<(usize, String)> = Vec::new();
         for r in self.runners.values().filter(|r| r.connected && carries(&r.input, &l.input) && self.admits(r, l)) {
@@ -1153,7 +1164,7 @@ impl Reference {
             let mut on: Vec<&LegIn> = self.on(&r.input.id).iter().filter_map(|id| self.legs.get(id)).map(|x| &x.input).collect();
             let running = on.len();
             on.extend(mates.iter().copied());
-            if room(&self.cfg, &r.input, &on, &l.input) && self.allowed(r, l, &mates) {
+            if room(&self.cfg, &r.input, &on, &l.input) && (!held || self.allowed(r, l, &mates)) {
                 places.push((running + mates.len(), r.input.id.clone()));
             }
         }
@@ -1412,11 +1423,12 @@ impl Reference {
 
     /// Whether a queued leg waits for room alone: some runner it may run on would take it and
     /// could hold it idle, and none has room for it now. A gang's member, when its gang is whole,
-    /// can't start now, and each of its members could be held somewhere.
+    /// hasn't room to start now (by room alone, the room kept aside, as a leg), and each of its
+    /// members could be held somewhere.
     fn waits_for_room(&self, id: &str) -> bool {
         let Some(l) = self.legs.get(id).filter(|l| matches!(l.at, At::Queued(..))) else { return false };
         if let Some(g) = &l.input.gang {
-            return self.whole(&g.id) && self.gang_plan(&g.id).is_none() && self.crew_queued(&g.id).iter().all(|m| self.could_be_held(m));
+            return self.whole(&g.id) && self.room_plan(&g.id).is_none() && self.crew_queued(&g.id).iter().all(|m| self.could_be_held(m));
         }
         let mut could = false;
         for r in self.runners.values().filter(|r| r.connected && carries(&r.input, &l.input)) {
