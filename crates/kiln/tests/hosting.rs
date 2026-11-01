@@ -4200,6 +4200,71 @@ fn w26_r02_a_blocking_thread_holds_a_diff_out_of_the_queue() -> anyhow::Result<(
     Ok(())
 }
 
+/// W26-R19 (Review plan step 13), D41's example: kim's blocking comment holds the change, so asked
+/// to land when ready it waits outside the queue, saying why, and the queue holds no entry of it.
+/// Resolved and approved, Review hands it over: it enters the queue and lands, its Ship strip lights
+/// Land, and the land is signed into the trail as its queue's.
+#[test]
+fn w26_r19_d41_lands_through_the_queue() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options::default())?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let url = |token: &str| format!("http://x:{token}@127.0.0.1:{}/git/acme/app.git", s.port);
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "native repository: {st} {body}");
+    let dev = person(&s, "dev", &["developer@repo:acme/app"])?;
+    let kim = person(&s, "kim", &["developer@repo:acme/app"])?;
+    let you = person(&s, "you", &["maintainer@repo:acme/app"])?;
+    must(git(&home, dir.path(), &["clone", "-q", &url(&dev), "work"]), "clone")?;
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    std::fs::write(work.join(".kiln/review.yaml"), "land:\n  approvals: 1\n")?;
+    std::fs::write(work.join("README.md"), "app\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", "origin", "main"]), "the first trunk")?;
+    commit(&home, &work, "expand.rs", "fn expand() {}\n", "pipeline: dynamic matrices", &format!("I{}", "5".repeat(40)))?;
+    must(git(&home, &work, &["push", "-q", "origin", "HEAD:refs/for/main"]), "submit")?;
+
+    // kim's blocking comment holds it: asked to land when ready, it waits outside the queue.
+    let (st, c) = post(&s, &kim, "/api/diffs/D1/comments", &json!({ "body": "empty matrix meant?", "file": "expand.rs", "start_line": 1, "kind": "blocking", "publish": true }))?;
+    anyhow::ensure!(st == 200, "comment: {c}");
+    let (st, asked) = post(&s, &you, "/api/diffs/D1/land", &json!({ "when_ready": true }))?;
+    anyhow::ensure!(st == 200, "land when ready: {asked}");
+    assert_eq!((asked.get("when_ready"), asked.get("entered")), (Some(&json!(true)), Some(&json!(false))), "{asked}");
+    let ready = api(&s, &you, "GET", "/api/diffs/D1/land")?;
+    assert_eq!(ready.get("when_ready"), Some(&json!(true)), "{ready}");
+    assert!(ready.to_string().contains("expand.rs:1: kim resolves this blocking comment first"), "{ready}");
+    let queue = api(&s, &dev, "GET", "/api/repos/acme%2Fapp/queue")?;
+    assert!(queue.get("entries").and_then(Value::as_array).is_some_and(|e| e.is_empty()), "a blocked change doesn't enter: {queue}");
+    let row = |token: &str| -> anyhow::Result<Value> { Ok(api(&s, token, "GET", "/api/ship/commits?repo=acme/app&kind=diff")?.pointer("/commits/0").cloned().unwrap_or_default()) };
+    let pip = |v: &Value, stage: &str| v.get("pips").and_then(Value::as_array).and_then(|ps| ps.iter().find(|p| p.get("stage").and_then(Value::as_str) == Some(stage))).and_then(|p| p.get("state")).and_then(Value::as_str).unwrap_or_default().to_string();
+    assert_eq!(pip(&row(&dev)?, "land"), "none", "not in the queue");
+
+    // kim resolves it and you approve: Review hands D1 to the queue, which lands it.
+    let (st, r) = http(s.port, "PATCH", &format!("/api/comments/{}", text(&c, "id")), &kim, Some(&json!({ "state": "resolved" })))?;
+    anyhow::ensure!(st == 200, "resolve: {r}");
+    let (st, r) = post(&s, &you, "/api/diffs/D1/review", &json!({ "action": "accept" }))?;
+    anyhow::ensure!(st == 200, "accept: {r}");
+    until(180, "D1 lands", || {
+        let d = api(&s, &dev, "GET", "/api/diffs/D1")?;
+        Ok((text(&d, "state") != "landed").then(|| d.to_string()))
+    })?;
+    let mut tip = Value::Null;
+    until(30, "its strip lights Land", || {
+        tip = row(&dev)?;
+        Ok((tip.pointer("/change/name").and_then(Value::as_str) != Some("D1") || pip(&tip, "land") != "passed").then(|| tip.to_string()))
+    })?;
+
+    // Signed as its queue, into the trail (W27-R07).
+    let land = api(&s, &you, "GET", &format!("/api/repos/acme%2Fapp/lands/{}", text(&tip, "sha")))?;
+    assert_eq!(land.pointer("/land/batch/0/diff").and_then(Value::as_str), Some("D1"), "{land}");
+    assert!(text(&land, "signer").contains("server"), "signed as kiln's server, whose queue it is: {land}");
+    assert!(land.pointer("/land/via").is_none(), "kiln's own queue landed it: {land}");
+    Ok(())
+}
+
 /// W26-R11, AC02 through the API, as D41 has it: kim's blocking thread holds accepting, for anyone
 /// (naming kim and the line) and for kim herself, holds landing, and stays open when someone else
 /// applies its suggestion; `force` goes past no hold. Only kim resolves it, or an owner who says why,

@@ -196,6 +196,10 @@ export interface Readiness {
   required: string[];
   strategies: string[];
   default: string | null;
+  /** The land queue's entry that holds it, and where the queue has it (docs/ci.md W26-R19). */
+  queue?: { entry: string; state: string; reason: string | null } | null;
+  /** Asked to land once its gate is clear. */
+  when_ready?: boolean;
 }
 
 export interface InboxThread {
@@ -309,7 +313,10 @@ export const reviewApi = {
   },
   viewed: (key: string, file: string, viewed: boolean) => request<{ file: string; viewed: boolean; version: number }>("POST", `/api/diffs/${enc(key)}/viewed`, { file, viewed }),
   readiness: (key: string, signal?: AbortSignal) => request<Readiness>("GET", `/api/diffs/${enc(key)}/land`, undefined, { signal }),
-  land: (key: string, strategy?: string) => request<unknown>("POST", `/api/diffs/${enc(key)}/land`, strategy ? { strategy } : {}),
+  land: (key: string, strategy?: string, whenReady?: boolean) =>
+    request<unknown>("POST", `/api/diffs/${enc(key)}/land`, { ...(strategy ? { strategy } : {}), ...(whenReady ? { when_ready: true } : {}) }),
+  /** A host's changes into its host's own queue, each at the head Review cleared (docs/ci.md W26-R19, W28-R109). */
+  enqueue: (repo: string, changes: { number: number; head: string }[]) => request<{ entry: string; route: string; state: string }>("POST", `/api/repos/${enc(repo)}/queue`, { changes }),
   act: (key: string, action: "ready" | "abandon" | "reclaim" | "commandeer") => request<unknown>("POST", `/api/diffs/${enc(key)}/${action}`, {}),
   stack: (id: string, signal?: AbortSignal) => request<Stack>("GET", `/api/stacks/${enc(id)}`, undefined, { signal }),
   queue: (repo: string, signal?: AbortSignal) => request<{ entries: QueueEntry[] }>("GET", `/api/repos/${enc(repo)}/queue`, undefined, { signal }).then((r) => r.entries),

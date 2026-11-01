@@ -629,6 +629,8 @@ const threads: MockThread[] = [
 ];
 
 const viewed = new Map<string, Set<string>>();
+/** Diffs asked to land once their gate is clear (docs/ci.md W26-R19). */
+const whenReady = new Set<string>();
 const queue: {
   id: string;
   trunk: string;
@@ -1243,11 +1245,25 @@ export async function handleReview(req: http.IncomingMessage, res: http.ServerRe
         required: ["ci"],
         strategies: d.stack ? ["stack", "stack-squash"] : ["squash", "merge", "rebase"],
         default: d.stack ? "stack" : "squash",
+        queue: d.state === "landing" ? { entry: queue.find((q) => q.diffs.includes(d.name))?.id ?? "", state: "queued", reason: null } : null,
+        when_ready: whenReady.has(d.name),
       }),
       true
     );
   }
   if (c === "land" && m === "POST") {
+    // Asked to land once its gate is clear: Review hands it over then (W26-R19).
+    const body = await ctx.body<{ when_ready?: boolean }>(req);
+    if (body.when_ready === false) {
+      const was = whenReady.delete(d.name);
+      ctx.emit({ type: "diff", diff: d.name });
+      return (ctx.json(res, 200, { when_ready: false, was }), true);
+    }
+    if (body.when_ready === true && d.state !== "accepted") {
+      whenReady.add(d.name);
+      ctx.emit({ type: "diff", diff: d.name });
+      return (ctx.json(res, 200, { when_ready: true, entered: false }), true);
+    }
     if (d.state !== "accepted") return (ctx.err(res, 409, `${d.name} needs an accept first`), true);
     d.state = "landing";
     queue.unshift({

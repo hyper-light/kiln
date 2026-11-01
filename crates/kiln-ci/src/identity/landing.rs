@@ -57,6 +57,11 @@ pub struct Land {
     pub rebased: bool,
     pub batch: Vec<Landed>,
     pub checks: Vec<Ran>,
+    /// The host's own queue that tested and landed it, where kiln's didn't (docs/ci.md W26-R19):
+    /// `merge queue` (GitHub's) or `merge train` (GitLab's). kiln's server signs what it saw land,
+    /// naming the tip it went onto (`from`, `base`) where kiln's mirror has it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub via: String,
 }
 
 impl Land {
@@ -111,7 +116,9 @@ pub fn read(payload_type: &str, s: &Statement) -> Result<Land, String> {
     if land.repo.is_empty() || land.trunk.is_empty() {
         return Err("it names no repository or trunk".into());
     }
-    if ![&land.from, &land.to, &land.candidate, &land.base].iter().all(|c| is_sha(c)) {
+    // A host's queue's land names the tip it went onto where kiln saw it, else nothing.
+    let seen = |c: &String| is_sha(c) || (!land.via.is_empty() && c.is_empty());
+    if !(is_sha(&land.to) && is_sha(&land.candidate) && seen(&land.from) && seen(&land.base)) {
         return Err("its from, to, candidate or base isn't a whole commit".into());
     }
     if !land.rebased && land.to != land.candidate {
@@ -165,7 +172,23 @@ mod tests {
                 Landed { diff: "D42".into(), version: 2, commit: sha('7'), verdicts: vec![digest('c')] },
             ],
             checks: vec![Ran { name: "ci/test".into(), conclusion: "success".into(), results: vec![digest('1'), digest('2')] }, Ran { name: "merge_group".into(), conclusion: "success".into(), results: Vec::new() }],
+            via: String::new(),
         }
+    }
+
+    /// W26-R19: a land through a host's own queue reads back naming that queue, its tip before
+    /// named where kiln saw it and left out where it didn't; kiln's own lands say no `via` at all,
+    /// so their statements are as they were.
+    #[test]
+    fn w26_r19_a_host_queues_land_reads_back() -> Result<(), String> {
+        assert!(statement(&d41_d42()).body.get("via").is_none(), "kiln's queue's land names no host queue");
+        let seen = Land { via: "merge queue".into(), ..d41_d42() };
+        assert_eq!(read(PAYLOAD_LAND, &statement(&seen))?.via, "merge queue");
+        let unseen = Land { from: String::new(), base: String::new(), ..seen.clone() };
+        assert_eq!(read(PAYLOAD_LAND, &statement(&unseen))?, unseen);
+        let kilns = Land { via: String::new(), ..unseen };
+        assert!(read(PAYLOAD_LAND, &statement(&kilns)).is_err_and(|e| e.contains("isn't a whole commit")), "kiln's own queue always names its tip");
+        Ok(())
     }
 
     /// W27-R07: D41 and D42 land on main as one batch: the land's statement names main's queue, the

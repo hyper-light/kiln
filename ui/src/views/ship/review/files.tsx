@@ -18,6 +18,7 @@ import {
   hostPullsApi,
   inboxRes,
   pullSearchRes,
+  readinessRes,
   reviewApi,
   searchRes,
   verdictsRes,
@@ -184,6 +185,7 @@ function KilnFiles({ item }: { item: ShipCommit }) {
   const comments = useRes(commentsRes(key)).data;
   const files = useRes(filesRes(key, version)).data;
   const cf = useRes(conflictsRes(key)).data;
+  const ready = useRes(readinessRes(key)).data;
   const [q, setQ] = React.useState("");
   const [draft, setDraft] = React.useState<DraftPlace | null>(null);
   const [whole, setWhole] = React.useState<string | null>(null);
@@ -327,7 +329,7 @@ function KilnFiles({ item }: { item: ShipCommit }) {
   return (
     <Frame
       sum={`${list.length} file${list.length === 1 ? "" : "s"} · +${adds} −${dels} · v${version}${ch.latest > version ? ` of ${ch.latest}` : ""}`}
-      bar={<GateRow gate={comments.gate} conflicts={{ unresolved, ready: cf.ready, total: cf.conflicts.length }} diffKey={key} superseded={ch.superseded_by} />}
+      bar={<GateRow gate={comments.gate} conflicts={{ unresolved, ready: cf.ready, total: cf.conflicts.length }} diffKey={key} superseded={ch.superseded_by} ready={ready} />}
       search={{ res: q.trim() ? searchRes(key, version, q) : null, q, onQ: setQ }}
       onJump={jump}
       convo={
@@ -415,7 +417,13 @@ function HostFiles({ item }: { item: ShipCommit }) {
   return (
     <Frame
       sum={`${pull.files.length} file${pull.files.length === 1 ? "" : "s"} · +${adds} −${dels} · ${ch.name}`}
-      bar={<HostGateRow approved={approved} onApprove={() => hostPullsApi.review(item.repo, n, "approve", "").then(() => {})} />}
+      bar={
+        <HostGateRow
+          approved={approved}
+          onApprove={() => hostPullsApi.review(item.repo, n, "approve", "").then(() => {})}
+          land={{ state: item.pips.find((p) => p.stage === "land")?.state ?? "none", onLand: () => reviewApi.enqueue(item.repo, [{ number: n, head: pull.sha }]) }}
+        />
+      }
       search={{ res: q.trim() ? pullSearchRes(item.repo, n, q) : null, q, onQ: setQ }}
       convo={
         <Conversation

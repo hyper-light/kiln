@@ -609,6 +609,58 @@ pub async fn gates_on(hub: &Hub, repo: &str, shas: Vec<String>) -> anyhow::Resul
         .await
 }
 
+/// What keeps each of a host's changes from its queue now (docs/ci.md W26-R19): Review's gate on a
+/// host's pull request, as `kiln_ci::land::host_blockers` reads what kiln mirrors of it (its state,
+/// reviews and open threads, its head's checks) by its trunk's policy. Each change held is
+/// `#n: why`; none, each is clear. One kiln hasn't mirrored, or at a head other than the one asked
+/// for, is held: Review hasn't cleared that head.
+pub async fn host_held(hub: &Hub, repo: &crate::store::Repo, trunk: &str, changes: &[(u64, String)]) -> Result<Vec<String>, Fail> {
+    let mirror = gitops::mirror_path(hub, &repo.name).to_string_lossy().into_owned();
+    let (policy, owners) = policy(hub, &mirror, trunk).await;
+    let mut held = Vec::new();
+    for (n, head) in changes {
+        let (id, number) = (repo.id.clone(), i64::try_from(*n).unwrap_or(i64::MAX));
+        type Row = (String, String, String, i64, Option<String>);
+        let row: Option<Row> = hub
+            .store
+            .call(move |c| {
+                let sql = "SELECT p.state, p.author, p.reviews, p.threads,
+                           (SELECT h.sha FROM host_pull_heads h WHERE h.repo_id = p.repo_id AND h.host = p.host AND h.number = p.number ORDER BY h.n DESC LIMIT 1)
+                           FROM host_pulls p WHERE p.repo_id = ?1 AND p.number = ?2";
+                Ok(c.query_row(sql, params![id, number], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).optional()?)
+            })
+            .await
+            .map_err(fail)?;
+        let Some((state, author, reviews, threads, seen)) = row else {
+            held.push(format!("#{n}: Review hasn't seen it"));
+            continue;
+        };
+        if seen.as_deref() != Some(head.as_str()) {
+            held.push(format!("#{n}: Review has {}, not {head}", seen.unwrap_or_default()));
+            continue;
+        }
+        let said: Vec<Value> = serde_json::from_str(&reviews).unwrap_or_default();
+        let reviews = said
+            .iter()
+            .filter_map(|r| {
+                let action = match r.get("verdict").and_then(Value::as_str)? {
+                    "approve" | "accept" => Action::Accept,
+                    "request_changes" => Action::RequestChanges,
+                    _ => Action::Comment,
+                };
+                Some((r.get("by").and_then(Value::as_str)?.to_owned(), action))
+            })
+            .collect();
+        let checks = checks_on(hub, &repo.name, head).await.map_err(fail)?;
+        let pull = land::HostPull { state, author, reviews, open_threads: usize::try_from(threads).unwrap_or(0), checks, paths: Vec::new() };
+        let why = land::host_blockers(&policy.land, &owners, &pull);
+        if !why.is_empty() {
+            held.push(format!("#{n}: {}", why.join("; ")));
+        }
+    }
+    Ok(held)
+}
+
 /// What Review says of a diff for landing now (docs/ci.md W28-R104): the single gate `land`,
 /// `land_when_ready` and the land queue's re-check just before a move ask.
 #[derive(Debug, Clone)]
@@ -673,6 +725,8 @@ pub async fn readiness_of(hub: &Hub, chain: &[Diff]) -> Result<Vec<Readiness>, F
         let json = json!({
             "blockers": shown, "accepting": f.accepting(&policy.land), "requesting": f.requesting(), "checks": f.checks, "required": policy.land.checks,
             "strategies": policy.land.strategies, "default": policy.strategy(None, d.kind != "diff").ok(), "gate": gate, "queue": queue,
+            // Asked to land once its gate is clear (docs/ci.md W26-R19).
+            "when_ready": super::land::when_ready_of(hub, d).await.is_some(),
         });
         out.push(Readiness { gate, json });
     }

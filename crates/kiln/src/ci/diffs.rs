@@ -1909,6 +1909,21 @@ pub async fn route(hub: &Arc<Hub>, method: &Method, segs: &[&str], q: &HashMap<S
                     if !caller.can("diffs.land", &Scope::Repo { repo: d.repo.clone() }) {
                         return Err((StatusCode::FORBIDDEN, "landing needs `diffs.land`".into()));
                     }
+                    // `when_ready`: Review hands it to the queue once its gate is clear (docs/ci.md
+                    // W26-R19, W14's land when ready), at once if it's clear now; `false` takes the
+                    // ask back.
+                    match body.get("when_ready").and_then(Value::as_bool) {
+                        Some(true) => {
+                            let strategy = body.get("strategy").and_then(Value::as_str);
+                            let entered = Box::pin(super::land::land_when_ready(hub, &d, &caller.name, caller.started_by(), strategy, None, None)).await?;
+                            return ok(json!({ "when_ready": true, "entered": entered }));
+                        }
+                        Some(false) => {
+                            let was = super::land::not_when_ready(hub, &d, &caller.name).await?;
+                            return ok(json!({ "when_ready": false, "was": was }));
+                        }
+                        None => {}
+                    }
                     ok(super::land::enqueue(hub, &d, caller, body).await?)
                 }
                 (&Method::POST, [action @ ("ready" | "abandon" | "reclaim" | "commandeer")]) => {

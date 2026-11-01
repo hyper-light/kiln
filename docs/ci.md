@@ -8722,6 +8722,44 @@ resolution makes, a comment, a resolution, an approval and each mark of the Revi
   reads its agent fixing, with no Hand off and Review pair, until a new revision. With nothing
   open, or no agent to take it, Hand off says why. Not yet: the switch that lets agents fix from
   agents' feedback, and "Fixed in" once the fix lands.
+- *R19*, landing through the merge queue (Review plan step 13, kiln plan
+  `01a17856b1e277c59e86661822612a25`; W28's queue is the Merge Queues agent's):
+  - **One gate before every queue.** kiln's own changes keep `review::readiness` (W28-R104). A
+    host's pull request gets the same gate, decided purely in `kiln_ci::land::host_blockers`: a
+    draft, merged or closed one isn't landing; else its reviewers' latest words, its open threads
+    and its head's checks, by its trunk's policy as kiln's mirror has it. `review::host_held`
+    reads the mirror. `POST /api/repos/:repo/queue` asks it before anything enters, and refuses a
+    change it holds (409, `Review's gate holds #12: github:kim asked for changes`), as it does one
+    kiln hasn't mirrored at that head. The queue asks it again just before each change goes into
+    its host's queue and every 10 s while it's there. A change it holds comes out, `held` (`hold:
+    gate`), saying why, and goes back in once the gate clears.
+  - **Land when ready.** `POST /api/diffs/:id/land` with `when_ready: true` has Review hand the
+    change over once its gate clears (W14's land when ready), and `GET /api/diffs/:id/land` says
+    `when_ready`. Ship's gate row has Land beside Approve: Land while the gate is clear, Land when
+    ready while it holds, then where the queue has the change ("Lands when ready", "In the queue",
+    "Testing", "Held", "Back with Review", "Landed"), disabled. A host's pull request's Land puts it
+    in its host's queue, and the gate's refusal shows under the row. Land keeps its place and width.
+  - **The queue's state at Land.** `kiln_cd::journey::Land` has `Held` (the gate or Review holds
+    it, saying why) and `Returned` (back with Review on a conflict, saying where), and `Queued`
+    counts the entries ahead of it in its component. Ship finds a host pull request's entry by its
+    number, so its strip lights Land as its host's queue lands it.
+  - **Each land signed into the trail.** kiln's queue signs its lands (W27-R07). A land through a
+    host's own queue is signed too, as kiln's server, saying what it saw (`lands::sign_host`): the
+    statement's `via` names the host's queue (`merge queue`, `merge train`), each change at the
+    version Review cleared and the commit it merged as. It names the tip it went onto where
+    kiln's mirror has the commit, else none. It's kept in `land_signatures` and the trail, read back
+    by `GET /api/repos/:repo/lands/:commit`, and `kiln verify` reads it as "landed on main by its
+    host's merge queue, as kiln saw it land". The land's record keeps its trunk's policy.
+  - *Tests:* kiln-ci `w26_r19_a_host_pulls_gate`, `w26_r19_a_host_queues_land_reads_back`; kiln-cd
+    `w26_r19_the_land_stage_says_where_the_queue_has_it`; kiln
+    `w26_r19_a_host_pull_enters_its_hosts_queue_only_when_clear` (GitHub's merge queue and
+    GitLab's merge trains through the forge seam's simulator),
+    `w26_r19_a_host_queues_land_is_signed_into_the_trail`, and the hosting test
+    `w26_r19_d41_lands_through_the_queue`; Playwright `ship-land.spec.ts`.
+  - *Not yet:* hosts without a queue (Bitbucket; GitHub without one) land through W28's queue,
+    tested in kiln's mirror and merged at the head it tested. That's the Merge Queues agent's queue
+    to build, and until then such a change is refused (422). Thread kinds on a host's pull request
+    aren't kept, so the gate counts its open threads by the trunk's `resolve_threads`.
 - *Tests.*
   - kiln-ci: `review.rs` (`w26_r11_*`, `w26_r12_a_resolved_conflict_waits_on_its_commit`),
     `suggest.rs` (`w26_r10_*`), `conflicts.rs` (`w26_r12_*`). The Search suite on its simulator

@@ -2305,6 +2305,11 @@ pub async fn enqueue_host(hub: &Arc<Hub>, repo: &Repo, trunk: &str, changes: &[(
     let (queue::Route::Host { queue: q }, Some((_, name))) = (route, reached) else {
         return Err((StatusCode::UNPROCESSABLE_ENTITY, format!("{} has no queue on its host: kiln's queue lands the diffs of repositories it hosts", repo.name)));
     };
+    // Review hands a host's changes to its queue only once its gate clears each (W26-R19).
+    let held = super::review::host_held(hub, repo, trunk, changes).await?;
+    if !held.is_empty() {
+        return Err((StatusCode::CONFLICT, format!("Review's gate holds {}", held.join("; "))));
+    }
     let host = HostEntry { repo: name, changes: changes.iter().map(|(n, head)| HostChange { number: *n, head: head.clone(), state: "open".into(), ..HostChange::default() }).collect() };
     let pinned: Vec<Pin> = changes.iter().map(|(n, head)| Pin { diff: format!("#{n}"), commit: head.clone(), ..Pin::default() }).collect();
     let id = insert(
@@ -2369,6 +2374,40 @@ pub async fn enqueue_route(hub: &Arc<Hub>, repo: &str, body: &Value, by: &str) -
     enqueue_host(hub, &r, &trunk, &changes, by).await
 }
 
+/// A host entry's changes still open there, each at the head Review cleared.
+fn open_on_host(e: &Entry) -> Vec<(u64, String)> {
+    e.host.iter().flat_map(|h| h.changes.iter().filter(|c| c.state == "open").map(|c| (c.number, c.head.clone()))).collect()
+}
+
+/// Which of change `number`'s heads kiln saw `head` as (its version, from 1): the first, where
+/// kiln's mirror never saw it.
+async fn host_version(hub: &Hub, repo_id: &str, number: u64, head: &str) -> u32 {
+    let (id, n, sha) = (repo_id.to_owned(), i64::try_from(number).unwrap_or(i64::MAX), head.to_owned());
+    let seen = hub.store.call(move |c| Ok(c.query_row("SELECT MIN(n) FROM host_pull_heads WHERE repo_id = ?1 AND number = ?2 AND sha = ?3", params![id, n, sha], |r| r.get::<_, Option<i64>>(0))?)).await;
+    seen.ok().flatten().and_then(|v| u32::try_from(v).ok()).filter(|v| *v > 0).unwrap_or(1)
+}
+
+/// Host entries Review's gate holds, asked again (docs/ci.md W26-R19): one it clears is queued,
+/// to go into its host's queue on this step.
+async fn host_recheck(hub: &Arc<Hub>, repo: &Repo, trunk: &str) -> anyhow::Result<()> {
+    for e in entries(hub, &repo.id, trunk, &["held"]).await? {
+        if e.host.is_none() || e.hold.as_deref() != Some("gate") || !due(&e.id, RECHECK) {
+            continue;
+        }
+        rechecked().lock().insert(e.id.clone(), Instant::now());
+        let held = super::review::host_held(hub, repo, trunk, &open_on_host(&e)).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+        let (id, now) = (e.id.clone(), crate::util::now_unix());
+        if held.is_empty() {
+            hub.store.call(move |c| Ok(c.execute("UPDATE land_queue SET state = 'queued', hold = NULL, reason = NULL, queued_at = ?2, updated_at = ?2 WHERE id = ?1", params![id, now]).map(|_| ())?)).await?;
+            tell(hub, &e, "queued", None).await;
+        } else if e.reason.as_deref() != Some(held.join("; ").as_str()) {
+            let why = held.join("; ");
+            hub.store.call(move |c| Ok(c.execute("UPDATE land_queue SET reason = ?2, updated_at = ?3 WHERE id = ?1", params![id, why, now]).map(|_| ())?)).await?;
+        }
+    }
+    Ok(())
+}
+
 /// How often what's on a host's queue is read back unasked, at most (a read of the queue counts
 /// against the host's rate limit; a change's conditional read costs nothing while it's unchanged).
 const HOST_QUEUE_EVERY: Duration = Duration::from_secs(30);
@@ -2379,6 +2418,7 @@ const HOST_QUEUE_EVERY: Duration = Duration::from_secs(30);
 /// moved), and the entry landed once every change merged, out once one left the queue unmerged. An
 /// entry kiln's queue would land, of a repository kiln doesn't host, is ejected, as before.
 async fn host_step(hub: &Arc<Hub>, repo: &Repo, trunk: &str) -> anyhow::Result<()> {
+    host_recheck(hub, repo, trunk).await?;
     let live = entries(hub, &repo.id, trunk, &["queued", "testing"]).await?;
     let (on_host, rest): (Vec<Entry>, Vec<Entry>) = live.into_iter().partition(|e| e.host.is_some());
     for e in rest {
@@ -2419,7 +2459,19 @@ async fn follow_host(hub: &Arc<Hub>, repo: &Repo, trunk: &str, forge: &dyn Forge
     let name = h.repo.clone();
     let mut read_back = due(&format!("host:{}", e.id), HOST_QUEUE_EVERY);
     let ons: Vec<queue::OnHost> = h.changes.iter().map(HostChange::on_host).collect();
-    if let Some(n) = queue::next_to_enqueue(&ons) {
+    let next = queue::next_to_enqueue(&ons);
+    // Review's gate, asked just before a change goes in and again while the host's queue holds it
+    // (docs/ci.md W26-R19): one it holds comes out of the host's queue and waits, held, until it
+    // clears.
+    if next.is_some() || due(&format!("gate:{}", e.id), RECHECK) {
+        rechecked().lock().insert(format!("gate:{}", e.id), Instant::now());
+        let held = super::review::host_held(hub, repo, trunk, &open_on_host(e)).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+        if !held.is_empty() {
+            off_host(hub, e).await;
+            return hold_entry(hub, e, "gate", &held.join("; "), "BRANCH_PROTECTIONS").await;
+        }
+    }
+    if let Some(n) = next {
         let head = h.changes.iter().find(|c| c.number == n).map(|c| c.head.clone()).unwrap_or_default();
         match forge.enqueue(&name, n, &head).await {
             Ok(_) => {
@@ -2469,9 +2521,22 @@ async fn follow_host(hub: &Arc<Hub>, repo: &Repo, trunk: &str, forge: &dyn Forge
             let (id, list) = (e.id.clone(), serde_json::to_string(&landed)?);
             hub.store.call(move |c| Ok(c.execute("UPDATE land_queue SET state = 'landed', commits = ?2, updated_at = ?3 WHERE id = ?1", params![id, list, crate::util::now_unix()]).map(|_| ())?)).await?;
             let via = e.route.clone().unwrap_or_default();
-            let policy = land::Policy::default();
+            // The policy it landed under is its trunk's, as kiln's mirror has it (W28-R108).
+            let mirror = crate::gitops::mirror_path(hub, &repo.name).to_string_lossy().into_owned();
+            let (policy, _) = super::review::policy(hub, &mirror, trunk).await;
             if let Err(err) = record(hub, &repo.id, trunk, e, &landed, None, &policy, &[], &via).await {
                 tracing::warn!(entry = %e.id, error = %format!("{err:#}"), "a land's record couldn't be kept");
+            }
+            // Signed into the trail as kiln's server saw it land (docs/ci.md W26-R19, W27-R07): each
+            // change bottom first, at the version Review cleared.
+            let mut carried = Vec::new();
+            for c in &h.changes {
+                if let Some(commit) = landed.get(&format!("#{}", c.number)) {
+                    carried.push((format!("#{}", c.number), host_version(hub, &repo.id, c.number, &c.head).await, commit.clone()));
+                }
+            }
+            if let Err(err) = Box::pin(super::lands::sign_host(hub, repo, trunk, &via, &carried)).await {
+                tracing::warn!(entry = %e.id, error = %format!("{err:#}"), "a land through its host's queue wasn't signed");
             }
             hub.store.audit("kiln".into(), "queue.land".into(), format!("{} {trunk}: entry {} by {}, through its host's {via}", repo.name, e.id, e.enqueued_by)).await;
             tell(hub, e, "landed", None).await;
@@ -2537,6 +2602,126 @@ mod tests {
         Ok((e.state, e.host.unwrap_or_default()))
     }
 
+    /// What kiln's mirror has of `host`'s pull request `number` (docs/ci.md W26-R01): opened by ada,
+    /// at `head`, and its reviews so far, oldest first (who and their verdict).
+    async fn mirror(hub: &Hub, repo_id: &str, host: &str, number: u64, head: &str, reviews: &[(&str, &str)]) -> anyhow::Result<()> {
+        let said: Vec<Value> = reviews.iter().zip(1_i64..).map(|((by, verdict), at)| json!({ "by": format!("{host}:{by}"), "verdict": verdict, "at": at })).collect();
+        let (repo, host, head, n, said) = (repo_id.to_owned(), host.to_owned(), head.to_owned(), i64::try_from(number)?, serde_json::to_string(&said)?);
+        hub.store
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO host_pulls (repo_id, host, number, author, state, reviews, first_seen) VALUES (?1, ?2, ?3, ?4, 'open', ?5, 0)
+                     ON CONFLICT (repo_id, host, number) DO UPDATE SET reviews = excluded.reviews",
+                    params![repo, host, n, format!("{host}:ada"), said],
+                )?;
+                c.execute("INSERT OR REPLACE INTO host_pull_heads (repo_id, host, number, n, sha, seen_at) VALUES (?1, ?2, ?3, 1, ?4, 0)", params![repo, host, n, head])?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// A repository on a host, its clone where nothing answers: kiln's mirror of it stays empty.
+    fn hosted(id: &str, name: &str) -> Repo {
+        Repo { clone_url: format!("file:///nonexistent/{id}.git"), ..repo(id, name) }
+    }
+
+    /// docs/ci.md W26-R19: a host's pull request reaches its host's queue only once Review's gate is
+    /// clear, on GitHub's merge queue and GitLab's merge trains alike. Asked to land while kim asks
+    /// for changes, it's refused, naming her; one kiln hasn't mirrored is refused too. Cleared, it
+    /// goes in at the head Review cleared. Asked for changes again while it's queued, it comes out,
+    /// held by the gate, saying why; approved again, it goes back in.
+    #[test]
+    fn w26_r19_a_host_pull_enters_its_hosts_queue_only_when_clear() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            for (sim, host, name, route) in [(seam::SimForge::github(), "github", "acme/app", "merge queue"), (seam::SimForge::gitlab(), "gitlab", "acme/lab", "merge train")] {
+                let r = hub.store.upsert_repo(hosted(&format!("r-{host}"), name)).await?;
+                sim.add_repo(name);
+                sim.set_queue(name, true);
+                sim.push(name, "one", seam::TRUNK, "one")?;
+                let one = sim.open(name, seam::Open { head: "one".into(), base: seam::TRUNK.into(), title: "change one".into(), by: "ada".into() }).await?;
+                forges().lock().insert(r.id.clone(), (Arc::new(sim.clone()) as Arc<dyn Forge>, name.to_owned()));
+                let ask = json!({ "changes": [{ "number": one.number, "head": one.head_sha }] });
+                let unseen = enqueue_route(&hub, name, &ask, "user:ada").await;
+                assert!(matches!(&unseen, Err((StatusCode::CONFLICT, why)) if why.contains("Review hasn't seen it")), "{host}: {unseen:?}");
+                // A draft is held until it's marked ready, whatever its reviews say.
+                mirror(&hub, &r.id, host, one.number, &one.head_sha, &[("kim", "approve")]).await?;
+                let (id, n) = (r.id.clone(), i64::try_from(one.number)?);
+                let mark = |state: &'static str| {
+                    let id = id.clone();
+                    hub.store.call(move |c| Ok(c.execute("UPDATE host_pulls SET state = ?3 WHERE repo_id = ?1 AND number = ?2", params![id, n, state]).map(|_| ())?))
+                };
+                mark("draft").await?;
+                let draft = enqueue_route(&hub, name, &ask, "user:ada").await;
+                assert!(matches!(&draft, Err((StatusCode::CONFLICT, why)) if why.contains(&format!("#{}: it's a draft", one.number))), "{host}: {draft:?}");
+                mark("open").await?;
+                mirror(&hub, &r.id, host, one.number, &one.head_sha, &[("kim", "request_changes")]).await?;
+                let refused = enqueue_route(&hub, name, &ask, "user:ada").await;
+                assert!(matches!(&refused, Err((StatusCode::CONFLICT, why)) if why.contains(&format!("#{}: ", one.number)) && why.contains(&format!("{host}:kim asked for changes"))), "{host}: {refused:?}");
+                assert!(sim.queued(name).await?.is_empty(), "{host}: nothing went in");
+
+                mirror(&hub, &r.id, host, one.number, &one.head_sha, &[("kim", "request_changes"), ("kim", "approve")]).await?;
+                let a = enqueue_route(&hub, name, &ask, "user:ada").await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+                assert_eq!(a.get("route").and_then(Value::as_str), Some(route));
+                let entry = a.get("entry").and_then(Value::as_str).unwrap_or_default().to_owned();
+                host_step(&hub, &r, seam::TRUNK).await?;
+                assert_eq!(sim.queued(name).await?, vec![one.number], "{host}: cleared, it's in");
+
+                mirror(&hub, &r.id, host, one.number, &one.head_sha, &[("kim", "approve"), ("kim", "request_changes")]).await?;
+                rechecked().lock().remove(&format!("gate:{entry}"));
+                host_step(&hub, &r, seam::TRUNK).await?;
+                assert!(sim.queued(name).await?.is_empty(), "{host}: held, it left the host's queue");
+                let held = entry_by_id(&hub, &entry).await?.ok_or_else(|| anyhow::anyhow!("no entry {entry}"))?;
+                assert_eq!((held.state.as_str(), held.hold.as_deref()), ("held", Some("gate")), "{host}");
+                assert!(held.reason.as_deref().is_some_and(|w| w.contains(&format!("{host}:kim asked for changes"))), "{host}: {:?}", held.reason);
+
+                mirror(&hub, &r.id, host, one.number, &one.head_sha, &[("kim", "request_changes"), ("kim", "approve")]).await?;
+                rechecked().lock().remove(&entry);
+                host_step(&hub, &r, seam::TRUNK).await?;
+                assert_eq!(sim.queued(name).await?, vec![one.number], "{host}: approved again, it's back in");
+                assert_eq!(state_of(&hub, &entry).await?.0, "testing", "{host}");
+            }
+            Ok(())
+        })
+    }
+
+    /// docs/ci.md W26-R19, W27-R07: a land through a host's own queue is signed into the trail, as
+    /// kiln's server saw it: the statement names the host's queue, the change at the version Review
+    /// cleared and the commit it merged as, and reads back from `GET /api/repos/:repo/lands/:commit`.
+    /// Its record keeps the trunk's policy.
+    #[test]
+    fn w26_r19_a_host_queues_land_is_signed_into_the_trail() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            crate::identities::own_identities(&hub.store, &hub.pki).await?;
+            let sim = seam::SimForge::github();
+            let (name, r) = ("acme/app", hub.store.upsert_repo(hosted("r-signed", "acme/app")).await?);
+            sim.add_repo(name);
+            sim.set_queue(name, true);
+            sim.push(name, "one", seam::TRUNK, "one")?;
+            let one = sim.open(name, seam::Open { head: "one".into(), base: seam::TRUNK.into(), title: "change one".into(), by: "ada".into() }).await?;
+            forges().lock().insert(r.id.clone(), (Arc::new(sim.clone()) as Arc<dyn Forge>, name.to_owned()));
+            mirror(&hub, &r.id, "github", one.number, &one.head_sha, &[("kim", "approve")]).await?;
+            let a = enqueue_route(&hub, name, &json!({ "changes": [{ "number": one.number, "head": one.head_sha }] }), "user:ada").await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let entry = a.get("entry").and_then(Value::as_str).unwrap_or_default().to_owned();
+            host_step(&hub, &r, seam::TRUNK).await?;
+            assert_eq!(sim.land_queue(name)?, vec![one.number]);
+            host_step(&hub, &r, seam::TRUNK).await?;
+            assert_eq!(state_of(&hub, &entry).await?.0, "landed");
+            let id = entry.clone();
+            let kept = hub.store.call(move |c| Ok(c.query_row(&format!("SELECT {RECORD_COLUMNS} FROM land_records WHERE entry_id = ?1"), [&id], record_row)?)).await?;
+            let commit = kept.landed.get(&format!("#{}", one.number)).cloned().unwrap_or_default();
+            let got = super::super::lands::get(&hub, name, &commit).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            assert_eq!(got.pointer("/land/via").and_then(Value::as_str), Some("merge queue"), "{got}");
+            assert_eq!(got.pointer("/land/batch/0/diff").and_then(Value::as_str), Some(format!("#{}", one.number).as_str()), "{got}");
+            assert_eq!(got.pointer("/land/to").and_then(Value::as_str), Some(commit.as_str()), "{got}");
+            assert!(got.get("signer").and_then(Value::as_str).is_some_and(|s| s.contains("server")), "signed as kiln's server: {got}");
+            let taken = hub.store.call(|c| Ok(c.query_row("SELECT COUNT(*) FROM trail WHERE payload_type = ?1", [kiln_ci::identity::landing::PAYLOAD_LAND], |x| x.get::<_, i64>(0))?)).await?;
+            assert_eq!(taken, 1, "in the trail");
+            Ok(())
+        })
+    }
+
     /// docs/ci.md W28-R109: a repository whose host has a queue on lands there, through the forge
     /// seam alone: each change put in at the head Review cleared and the queue read back, followed
     /// until it merged, the land recorded with the host's queue; Review's hold takes it out of the
@@ -2547,7 +2732,7 @@ mod tests {
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
             let sim = seam::SimForge::github();
-            let (name, r) = ("acme/app", hub.store.upsert_repo(repo("r-host", "acme/app")).await?);
+            let (name, r) = ("acme/app", hub.store.upsert_repo(hosted("r-host", "acme/app")).await?);
             sim.add_repo(name);
             sim.push(name, "one", seam::TRUNK, "one")?;
             sim.push(name, "two", seam::TRUNK, "two")?;
@@ -2568,6 +2753,10 @@ mod tests {
             assert!(matches!(&stale, Err((StatusCode::CONFLICT, why)) if why.contains(&moved)), "{stale:?}");
             let bad = enqueue_route(&hub, name, &json!({ "changes": [{ "number": three.number }] }), "user:ada").await;
             assert!(matches!(&bad, Err((StatusCode::BAD_REQUEST, _))), "{bad:?}");
+            // Review cleared both (W26-R19): a host's queue takes only what Review's gate clears.
+            for c in [&one, &two] {
+                mirror(&hub, &r.id, "github", c.number, &c.head_sha, &[("kim", "approve")]).await?;
+            }
             let a = enqueue_host(&hub, &r, seam::TRUNK, &[(one.number, one.head_sha.clone())], "user:ada").await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             let b = enqueue_host(&hub, &r, seam::TRUNK, &[(two.number, two.head_sha.clone())], "user:ada").await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             assert_eq!(a.get("route").and_then(Value::as_str), Some("merge queue"));

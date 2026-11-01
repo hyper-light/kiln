@@ -203,7 +203,9 @@ struct Records {
     runs: Vec<RunRec>,
     legs: Vec<LegRec>,
     images: Vec<String>,
-    land: Option<(String, Option<String>)>,
+    /// The land queue's latest entry with this commit as its candidate: its state, why, and how many
+    /// entries are ahead of it in its component.
+    land: Option<(String, Option<String>, u32)>,
     own: Vec<DeployRec>,
     current: Vec<DeployRec>,
     releases: Vec<ReleaseRec>,
@@ -282,8 +284,9 @@ struct ChangeRec {
     pushes: Vec<(u32, bool, i64)>,
     threads: Vec<ThreadRec>,
     replies: Vec<(String, i64)>,
-    /// The land queue's latest entry landing this change: its state and why.
-    queue: Option<(String, Option<String>)>,
+    /// The land queue's latest entry landing this change: its state, why, and how many entries are
+    /// ahead of it in its component (docs/ci.md W26-R19).
+    queue: Option<(String, Option<String>, u32)>,
     /// The conflicts its latest revision's replay onto where it lands left, each holding its gate
     /// until Commit resolution makes a revision of them (W26-R12).
     conflicts: Vec<kiln_ci::review::Conflict>,
@@ -549,9 +552,9 @@ fn load_change(c: &rusqlite::Connection, repo_id: &str, sha: &str) -> anyhow::Re
     ch.conflicts = st.query_map([&id], |r| Ok(kiln_ci::review::Conflict { file: r.get(0)?, line: r.get(1)?, taken: r.get(2)? }))?.collect::<Result<_, _>>()?;
     ch.queue = c
         .query_row(
-            "SELECT l.state, l.reason FROM land_queue l WHERE l.repo_id = ?1 AND EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(l.diffs) THEN l.diffs ELSE '[]' END) j WHERE j.value = ?2) ORDER BY l.updated_at DESC, l.rowid DESC LIMIT 1",
+            "SELECT l.state, l.reason, MAX(COALESCE(l.position, 1) - 1, 0) FROM land_queue l WHERE l.repo_id = ?1 AND EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(l.diffs) THEN l.diffs ELSE '[]' END) j WHERE j.value = ?2) ORDER BY l.updated_at DESC, l.rowid DESC LIMIT 1",
             params![repo_id, id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
     Ok(Some(ch))
@@ -629,7 +632,16 @@ fn load_pull(c: &rusqlite::Connection, repo_id: &str, host: &str, number: i64, n
         pushes: heads.iter().map(|(k, _, t)| (*k, false, *t)).collect(),
         threads,
         replies: Vec::new(),
-        queue: None,
+        // The entry that lands it, kiln's or its host's queue's (docs/ci.md W26-R19, W28-R109).
+        queue: c
+            .query_row(
+                "SELECT l.state, l.reason, MAX(COALESCE(l.position, 1) - 1, 0) FROM land_queue l WHERE l.repo_id = ?1 AND l.host IS NOT NULL
+                 AND EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(l.host) THEN l.host ELSE '{}' END, '$.changes') j WHERE json_extract(j.value, '$.number') = ?2)
+                 ORDER BY l.updated_at DESC, l.rowid DESC LIMIT 1",
+                params![repo_id, number],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?,
         // A host's pull request is replayed on its host, not here.
         conflicts: Vec::new(),
         marks,
@@ -871,7 +883,7 @@ fn load_with(c: &rusqlite::Connection, ctx: &RepoCtx, sha: &str, first_row: i64)
     rec.images = st.query_map(params![repo_id, sha], |r| r.get(0))?.collect::<Result<_, _>>()?;
 
     rec.land = c
-        .query_row("SELECT state, reason FROM land_queue WHERE repo_id = ?1 AND candidate = ?2 ORDER BY updated_at DESC LIMIT 1", params![repo_id, sha], |r| Ok((r.get(0)?, r.get(1)?)))
+        .query_row("SELECT state, reason, MAX(COALESCE(position, 1) - 1, 0) FROM land_queue WHERE repo_id = ?1 AND candidate = ?2 ORDER BY updated_at DESC LIMIT 1", params![repo_id, sha], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
         .optional()?;
 
     // This commit's latest deployment in each environment; what each runs now is the repository's.
@@ -917,10 +929,13 @@ fn journey_of(rec: &Records, runners: &[RunnerSeen], now: i64) -> Journey {
     };
     // A change's commit is in the queue when an entry lands its change, and not landed until the change is.
     let queue = rec.land.as_ref().or(change.and_then(|ch| ch.queue.as_ref()));
-    let land = match queue.map(|(s, why)| (s.as_str(), why)) {
-        Some(("testing", _)) => Land::Testing,
-        Some(("queued", _)) => Land::Queued { ahead: 0 },
-        Some(("ejected", why)) => Land::Ejected { why: why.clone().unwrap_or_default() },
+    let land = match queue.map(|(s, why, ahead)| (s.as_str(), why.clone().unwrap_or_default(), *ahead)) {
+        Some(("testing", ..)) => Land::Testing,
+        Some(("queued", _, ahead)) => Land::Queued { ahead },
+        Some(("ejected", why, _)) => Land::Ejected { why },
+        // Waiting on Review in the queue, or back with it on a conflict (docs/ci.md W26-R19, W28-R107).
+        Some(("held", why, _)) => Land::Held { why },
+        Some(("returned", why, _)) => Land::Returned { why },
         _ if change.is_some_and(|ch| !ch.is_landed()) => Land::NotYet,
         _ => Land::Landed,
     };

@@ -107,12 +107,41 @@ pub async fn sign(hub: &Hub, repo: &Repo, trunk: &str, moved: &Moved<'_>, carrie
         rebased: moved.rebased,
         batch,
         checks: checks_on(hub, &repo.id, candidate).await?,
+        via: String::new(),
     };
-    let payload = statement::payload(&landing::statement(&land)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    keep(hub, &repo.id, &land).await
+}
+
+/// A land through a host's own queue (docs/ci.md W26-R19, W27-R07), signed as kiln's server for
+/// what it saw: `via`, the host's queue, tested and merged `carried` (each change as `#n`, the
+/// version of it Review cleared, and the commit it merged as) onto `trunk`, the last its head now.
+/// The tip it went onto is named where kiln's mirror has the commit; its checks are the runs kiln
+/// knows of on it. Kept and taken into the trail as [`sign`]'s are. Its digest.
+pub async fn sign_host(hub: &Hub, repo: &Repo, trunk: &str, via: &str, carried: &[(String, u32, String)]) -> anyhow::Result<String> {
+    let to = carried.last().map(|(_, _, c)| c.clone()).ok_or_else(|| anyhow::anyhow!("no change landed"))?;
+    let from = match crate::gitops::ensure_commit(hub, repo, &to).await {
+        Ok(mirror) => {
+            let (dir, parent) = (mirror.to_string_lossy().into_owned(), format!("{to}^1"));
+            crate::gitops::run_git(hub, &["-C", &dir, "rev-parse", "--verify", &parent], crate::gitops::LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).trim().to_owned()).unwrap_or_default()
+        }
+        Err(e) => {
+            tracing::info!(repo = %repo.name, commit = %to, error = %format!("{e:#}"), "a host's land is signed without the tip it went onto: kiln's mirror hasn't its commit");
+            String::new()
+        }
+    };
+    let batch = carried.iter().map(|(diff, version, commit)| Landed { diff: diff.clone(), version: *version, commit: commit.clone(), verdicts: Vec::new() }).collect();
+    let land = Land { repo: repo.name.clone(), trunk: trunk.to_owned(), from: from.clone(), to: to.clone(), candidate: to.clone(), base: from, rebased: false, batch, checks: checks_on(hub, &repo.id, &to).await?, via: via.to_owned() };
+    keep(hub, &repo.id, &land).await
+}
+
+/// `land` signed as kiln's server, kept in `land_signatures` by the commit its trunk moved to and
+/// taken into the trail (W27-R09). Its digest.
+async fn keep(hub: &Hub, repo_id: &str, land: &Land) -> anyhow::Result<String> {
+    let payload = statement::payload(&landing::statement(land)).map_err(|e| anyhow::anyhow!("{e}"))?;
     let bundle = crate::identities::sign_as(&hub.pki, "server", landing::PAYLOAD_LAND, &payload)?;
     let digest = statement::digest(landing::PAYLOAD_LAND, &payload);
     let signer = kiln_ci::identity::chain::Identity::new(hub.pki.organization(), kiln_ci::identity::chain::Actor::Server).uri().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let (repo_id, trunk, head, candidate, base, d, at) = (repo.id.clone(), trunk.to_owned(), moved.to.to_owned(), candidate.to_owned(), moved.base.to_owned(), digest.clone(), crate::util::now_unix());
+    let (repo_id, trunk, head, candidate, base, d, at) = (repo_id.to_owned(), land.trunk.clone(), land.to.clone(), land.candidate.clone(), land.base.clone(), digest.clone(), crate::util::now_unix());
     hub.store
         .call(move |c| {
             let (tx, text) = (crate::store::tx(c)?, bundle.to_string());

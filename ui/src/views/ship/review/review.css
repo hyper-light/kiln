@@ -515,6 +515,14 @@
   opacity: 0.45;
   cursor: not-allowed;
 }
+/* Land beside Approve (docs/ci.md W26-R19): the chips take the room, and Land keeps one width whatever it says. */
+.rv-bar > .rv-ks {
+  flex: 1;
+}
+.rv-land {
+  min-width: 13em;
+  justify-content: center;
+}
 .rv-btn-go {
   background: rgb(255 255 255 / 9%);
   border-color: #4a4d58;
