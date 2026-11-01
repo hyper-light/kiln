@@ -1293,6 +1293,15 @@ struct Crew {
     ended: bool,
 }
 
+impl Crew {
+    /// Whether one of its last start's attempts has ended: as it ended, or before a restart,
+    /// which brings back only the members that still run (W05-R25), its start then fewer than
+    /// make it whole (a member settled and gone); found by docs/sim.md's model.
+    fn one_ended(&self) -> bool {
+        self.ended || self.round.len() < usize::try_from(self.size).unwrap_or(usize::MAX)
+    }
+}
+
 /// What a runner holds, as the room rule counts it (W05-R03): the share its exclusive legs hold,
 /// whether one holds it whole, how many ordinary legs run beside them, what's used of its
 /// resources, and how many legs it runs.
@@ -2725,7 +2734,7 @@ impl Scheduler {
             && !l.gone
         {
             let lost = matches!(&outcome, Outcome::Failed(f) if f.class == FailureClass::RunnerLost) && matches!(l.state, State::Assigned { .. });
-            if lost && self.gangs.get(&g).is_some_and(|c| !c.ended) {
+            if lost && self.gangs.get(&g).is_some_and(|c| !c.one_ended()) {
                 return self.gang_lost(&g, id, attempt, outcome, now, out);
             }
             if let Some(c) = self.gangs.get_mut(&g) {

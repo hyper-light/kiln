@@ -1593,6 +1593,15 @@ mod tests {
         Ok(())
     }
 
+    /// docs/sim.md's bug 15 (W05-R40, R25): the seed of E4.6's probe where a gang's member, its
+    /// mate settled before the server restarted, was lost after and tried again alone, waiting for
+    /// good for a gang that couldn't be whole.
+    #[test]
+    fn the_seed_where_a_member_was_tried_again_alone_after_a_restart_settles() -> Result<(), String> {
+        run(5147, 0).map_err(|why| format!("seed 5147: {why}"))?;
+        Ok(())
+    }
+
     /// docs/needs.md E1.6: a seed runs the same every time.
     #[test]
     fn a_sched_seed_replays_exactly() -> Result<(), String> {

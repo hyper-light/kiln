@@ -3146,6 +3146,25 @@ fn w05_r40_a_restart_rebuilds_a_gang_as_it_ran() {
     assert_eq!(s.check_grants(), Ok(()));
 }
 
+/// W05-R40, R25 (docs/sim.md's bug 15): a gang of two whose one member settled before the server
+/// restarted: the rebuild brings back only the other, its start one ended already, so lost then it
+/// ends failed, runner-lost, as it would have without the restart, not tried again alone to wait
+/// for good for a mate that won't come.
+#[test]
+fn w05_r40_a_member_lost_after_a_restart_its_mate_ended_before_is_not_tried_alone() {
+    let mut s = Scheduler::with_epoch(Config::default(), 2);
+    for r in ["a", "b"] {
+        s.handle(Input::RunnerUp(Box::new(linux(r, 1))), 0);
+    }
+    s.handle(Input::LegRunning { leg: Box::new(member("m0", "pair", 2)), runner: "a".into(), attempt: 1, fence: Fence { epoch: 1, n: 1 } }, 1);
+    assert_eq!(s.check_grants(), Ok(()));
+    let c = s.handle(Input::RunnerLost { runner: "a".into() }, 2);
+    assert!(c.iter().any(|x| matches!(x, Command::Settled { leg, outcome: Outcome::Failed(f), .. } if leg == "m0" && f.class == FailureClass::RunnerLost)), "{c:?}");
+    assert!(!c.iter().any(|x| matches!(x, Command::Retry { .. })), "{c:?}");
+    assert_eq!(s.grant("m0"), None);
+    assert_eq!(s.check_grants(), Ok(()));
+}
+
 /// W05-R39, R40 (docs/sim.md's bug 14): two whole gangs of a class, the second's room kept from
 /// when an exclusive leg ends, the first whole only after: when it ends, the first, with room by
 /// room alone, isn't the first of the class waiting for room, so the class's room is worked out
