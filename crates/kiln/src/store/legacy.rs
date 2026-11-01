@@ -54,11 +54,11 @@ impl Legacy {
         anyhow::ensure!(objects.len() <= 8192, "legacy SQL schema exceeds 8192 objects");
         // U15: compare the durable log against this exact pinned SQL snapshot. A committed tail
         // that the database lacks must be recovered offline before its state can be migrated.
-        let (applied,term) = if objects.iter().any(|o|o.kind=="table"&&o.name=="cluster_state") {
-            let (applied,term)=connection.query_row("SELECT applied,term FROM cluster_state WHERE one=1",[],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?))).optional()?.unwrap_or((0,0));
-            (u64::try_from(applied)?,u64::try_from(term)?)
-        } else { (0,0) };
-        let log=crate::replication::legacy::check(path,applied,term)?;
+        let (applied,term,seq) = if objects.iter().any(|o|o.kind=="table"&&o.name=="cluster_state") {
+            let (applied,term,seq)=connection.query_row("SELECT applied,term,seq FROM cluster_state WHERE one=1",[],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?))).optional()?.unwrap_or((0,0,0));
+            (u64::try_from(applied)?,u64::try_from(term)?,u64::try_from(seq)?)
+        } else { (0,0,0) };
+        let log=crate::replication::legacy::check(path,applied,term,seq)?;
         if objects.iter().any(|o| o.kind == "table" && o.name == "kiln_meta") {
             let epoch: Option<String> = connection.query_row("SELECT value FROM kiln_meta WHERE key='min_reader_epoch'", [], |r| r.get(0)).optional()?;
             let need = epoch.and_then(|e| e.parse::<u32>().ok()).unwrap_or(0);
@@ -147,7 +147,6 @@ impl Legacy {
 #[derive(Serialize, Deserialize)]
 enum Position { Rows { table: usize, after: Option<Cursor> }, Objects, Finished }
 
-#[cfg(unix)]
 pub(super) fn identity(source: &Path) -> anyhow::Result<String> {
     let legacy = Legacy::open(source)?;
     let identity = format!("main-sql-v1:{}", legacy.identity()?);
@@ -426,8 +425,6 @@ mod tests {
             old.execute_batch("CREATE TABLE offline_value(v TEXT); INSERT INTO offline_value VALUES('preserved');")?;
             drop(old);
             let before = std::fs::read(&original)?;
-            assert!(crate::store::Store::open(&original).is_err(), "ordinary startup cannot silently import an unfenced legacy writer");
-            assert_eq!(std::fs::read(&original)?, before);
             let rollback = offline.path().join("kiln.db-journal");
             std::fs::write(&rollback, b"rollback source whose hotness must not be guessed")?;
             let permissions = std::fs::metadata(&original)?.permissions();
@@ -458,7 +455,10 @@ mod tests {
             // Even an already-live process registry cannot turn it into a fresh activation.
             let pending = offline.path().join("kiln.db.amphora-cutover");
             std::fs::rename(&original, &pending)?;
-            assert!(crate::store::Store::open(&original).is_err());
+            // Never a fresh activation: the next start finishes the cutover, then it's put back.
+            crate::store::Store::open(&original)?;
+            assert!(original.is_dir() && !pending.exists(), "the interrupted cutover didn't go on");
+            std::fs::rename(&original, &pending)?;
             // Reconstruct the earlier crash point: durable inventory with original source
             // link still present. A failed/retried preservation barrier cannot unlink it.
             std::fs::hard_link(pending.join("source.sqlite"), &original)?;
@@ -509,6 +509,27 @@ mod tests {
             let store = crate::store::Store::open(&source)?;
             store.now(|c| { assert_eq!(c.query_row("SELECT v FROM wal_only", [], |r|r.get::<_,String>(0))?, "in-wal"); Ok(()) })?;
         }
+        Ok(())
+    }
+
+    /// U05 (2026-11-01): a build that finds a SQLite kiln.db cuts it over as it starts, with no step
+    /// of anyone's, once no other process has it open. While one does (an older build not yet
+    /// stopped), it's left as it is, and a later start takes it.
+    #[cfg(unix)]
+    #[test]
+    fn u05_a_start_cuts_over_a_kiln_db_no_other_process_has_open() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let legacy = dir.path().join("kiln.db");
+        let older = Connection::open(&legacy)?;
+        older.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE kept(v TEXT); INSERT INTO kept VALUES('carried over');")?;
+        let refused = crate::store::Store::open(&legacy).err().map(|e| format!("{e:#}")).unwrap_or_default();
+        assert!(refused.contains("once that process has stopped"), "taken while another connection had it open: {refused:?}");
+        assert!(legacy.is_file() && !dir.path().join("kiln.db.amphora-cutover").exists(), "moved while another connection had it open");
+        drop(older);
+        let store = crate::store::Store::open(&legacy)?;
+        assert!(legacy.is_dir(), "the old pathname isn't its fence");
+        assert!(Connection::open(&legacy).is_err(), "an older build can still open it");
+        store.now(|c| { assert_eq!(c.query_row("SELECT v FROM kept", [], |r| r.get::<_, String>(0))?, "carried over"); Ok(()) })?;
         Ok(())
     }
 }

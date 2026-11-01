@@ -359,9 +359,9 @@ impl Store {
         legacy::import(destination,source,fence.identity.as_deref())
     }
 
-    /// U05: callable only under the trusted supervised-OFFLINE operator boundary. Old SQL,
-    /// group/backup producers AND their automatic restart stay disabled across interruption.
-    /// This function/its lock does not establish that authority and never starts a service.
+    /// U05: the cutover [`Store::open`] makes of a kiln.db it finds, without its check that no
+    /// other process has it open: tests take a stopped fixture over with it.
+    #[cfg(test)]
     pub fn cutover_offline(data: &Path) -> anyhow::Result<()> {
         anyhow::ensure!(!data.as_os_str().is_empty(), "U05 cutover needs an explicit nonempty data directory; no configuration default is used");
         let fence=cutover::prepare(&data.join("kiln.db"))?;

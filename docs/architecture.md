@@ -206,14 +206,13 @@ pending. No runtime or gate PASS is claimed here.
 
 ### SQL format cutover and rollback
 
-A SQLite-era `kiln.db` cannot activate automatically beside the canonical Amphora owner.
-`kiln store cutover --data-dir <explicit-directory> --offline` is the supervised offline entry:
-all old SQL/group/backup producers and their automatic restart must actually remain disabled
-through interruption. The assertion and file lock do not establish that authority. It preserves
-the read-only source inside a directory at `kiln.db`, which blocks both old SQLite opens and old
-replica rename-over replacement. New acceptance requires that fence and the exact completed
-Amphora restore identity. Windows cutover is currently typed unsupported before mutation because
-this implementation cannot prove durable directory publication there. Follow the
+The first start of a unified build that finds a SQLite-era `kiln.db` cuts it over itself, once no
+other process has it open: SQLite can't leave WAL or begin an exclusive transaction while another
+connection holds the file, so a start beside an older build that still runs fails, and the next
+one takes it. It preserves the read-only source inside a directory at `kiln.db`, which blocks both
+old SQLite opens and old replica rename-over replacement, then imports it into Amphora; a start
+that stops part way goes on where it stopped. New acceptance requires that fence and the exact
+completed Amphora restore identity. Linux, macOS and Windows cut over alike. Follow the
 [SQL cutover train](trains/unification-sql-cutover.md); a SQLite-era binary is a roll-forward-only
 boundary, not a safe image rollback after canonical writes.
 

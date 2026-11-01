@@ -1106,14 +1106,6 @@ pub struct StoreArgs {
 
 #[derive(clap::Subcommand)]
 enum StoreCmd {
-    /// Offline SQL format cutover. ALL old SQL/group/backup producers and automatic restart
-    /// must actually remain disabled through interruption; the flag is an operator assertion.
-    Cutover {
-        #[arg(long)]
-        data_dir: std::path::PathBuf,
-        #[arg(long, required = true)]
-        offline: bool,
-    },
     /// Re-hash every chunk on the server's disk; any whose contents aren't their digest is moved
     /// aside (exits 1 when one is).
     Verify,
@@ -1122,17 +1114,9 @@ enum StoreCmd {
 }
 
 pub async fn store(args: StoreArgs, cfg: &Config) -> Result<()> {
-    if let StoreCmd::Cutover { data_dir, offline } = &args.cmd {
-        anyhow::ensure!(*offline, "cutover requires the explicit trusted offline operator assertion");
-        let data = data_dir.clone();
-        crate::rt::blocking(move || crate::store::Store::cutover_offline(&data)).await??;
-        println!("SQL cutover is fenced and the readonly source import is complete. Start the canonical owner; SQLite-era binary rollback is unsupported.");
-        return Ok(());
-    }
     let api = args.conn.api(cfg).await?;
     let n = |v: &Value, k: &str| v.get(k).and_then(Value::as_u64).unwrap_or_default();
     match args.cmd {
-        StoreCmd::Cutover { .. } => anyhow::bail!("offline cutover must not use the remote content-store API"),
         StoreCmd::Verify => {
             let v = run_op(&api, "ci.store.verify", json!({})).await?;
             let bad: Vec<&str> = v.get("corrupt").and_then(Value::as_array).map(|c| c.iter().filter_map(Value::as_str).collect()).unwrap_or_default();

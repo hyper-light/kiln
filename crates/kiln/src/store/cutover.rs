@@ -1,6 +1,7 @@
-//! U05/U09: an explicit supervised-offline format transition. The directory at the old
-//! pathname fences old SQLite opens AND replica replacement. The old producers and their
-//! automatic restart must remain disabled across interruption; this lock/flag is NOT proof.
+//! U05/U09: the format transition from a SQLite kiln.db, made by the build that finds one as it
+//! starts. The directory at the old pathname fences old SQLite opens AND replica replacement. A
+//! kiln.db is taken only once no other process has it open ([`supported`]'s `let_go`); its files
+//! are kept read-only in the fence and imported.
 use std::path::{Path, PathBuf};
 
 pub(super) struct Fence {
@@ -9,29 +10,23 @@ pub(super) struct Fence {
     pub identity: Option<String>,
 }
 
-#[cfg(not(unix))]
-fn unsupported() -> anyhow::Error {
-    std::io::Error::new(std::io::ErrorKind::Unsupported, "U05 offline cutover requires durable directory publication; this platform has no supported directory flush contract, so no files were changed").into()
-}
-
 pub(super) fn ensure(path: &Path) -> anyhow::Result<Fence> {
-    #[cfg(unix)] { supported::ensure(path) }
-    #[cfg(not(unix))] { let _ = path; Err(unsupported()) }
+    supported::ensure(path)
 }
+#[cfg(test)]
 pub(super) fn prepare(path: &Path) -> anyhow::Result<Fence> {
-    #[cfg(unix)] { supported::prepare(path) }
-    #[cfg(not(unix))] { let _ = path; Err(unsupported()) }
+    supported::prepare(path)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub(super) fn with_sync(path: &Path, offline: bool, flush: &mut dyn FnMut(&Path) -> anyhow::Result<()>) -> anyhow::Result<Fence> {
     supported::with_sync(path, offline, flush)
 }
 
-#[cfg(unix)]
 mod supported {
     use super::*;
     use std::io::{Read as _, Write as _};
+    #[cfg(unix)]
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     use anyhow::Context as _;
     use serde::{Deserialize, Serialize};
@@ -80,7 +75,31 @@ mod supported {
         }
         Ok(())
     }
+    #[cfg(unix)]
     fn sync(path: &Path) -> anyhow::Result<()> { std::fs::File::open(path)?.sync_all()?; Ok(()) }
+    /// Windows flushes no folder (NTFS journals what's in them), and a file only through a handle
+    /// that may write it: one made read-only here was a link to a file its own writer had flushed.
+    #[cfg(not(unix))]
+    fn sync(path: &Path) -> anyhow::Result<()> {
+        let meta = std::fs::metadata(path)?;
+        if meta.is_dir() || meta.permissions().readonly() { return Ok(()); }
+        std::fs::OpenOptions::new().write(true).open(path)?.sync_all()?;
+        Ok(())
+    }
+    /// A SQLite kiln.db is taken only once no other process has it open: its journal can't leave
+    /// WAL while another connection holds it (SQLite answers "wal"), and an exclusive transaction
+    /// can't begin while one reads or writes. Leaving WAL folds the WAL into the file, and opening it
+    /// to write rolls back a hot journal, so the file alone is then the source. A process that still
+    /// has it open (an older build not yet stopped) keeps it: this start fails, and the next takes it.
+    fn let_go(legacy: &Path) -> anyhow::Result<()> {
+        let c = rusqlite::Connection::open_with_flags(legacy, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX).with_context(|| format!("U05 open legacy SQL {}", legacy.display()))?;
+        c.busy_timeout(std::time::Duration::ZERO)?;
+        let busy = || format!("U05 another process has {} open; it's cut over to Amphora once that process has stopped", legacy.display());
+        let mode: String = c.query_row("PRAGMA journal_mode=DELETE", [], |r| r.get(0)).with_context(busy)?;
+        anyhow::ensure!(mode.eq_ignore_ascii_case("delete"), busy());
+        c.execute_batch("BEGIN EXCLUSIVE; COMMIT").with_context(busy)?;
+        Ok(())
+    }
     fn roles(legacy: &Path) -> anyhow::Result<Vec<(&'static str, PathBuf)>> {
         let parent = legacy.parent().context("U05 legacy parent")?;
         let append = |suffix: &str| { let mut name = legacy.as_os_str().to_os_string(); name.push(suffix); PathBuf::from(name) };
@@ -89,8 +108,28 @@ mod supported {
     fn entry(path: &Path, name: &str) -> anyhow::Result<Entry> {
         let meta = std::fs::symlink_metadata(path)?;
         anyhow::ensure!(meta.is_file(), "U05 retired source is not a regular file: {}", path.display());
-        Ok(Entry { name: name.into(), device: meta.dev(), inode: meta.ino(), bytes: meta.len(), modified: (meta.mtime(), meta.mtime_nsec()) })
+        Ok(Entry { name: name.into(), device: device(&meta), inode: inode(&meta), bytes: meta.len(), modified: modified(&meta)? })
     }
+    #[cfg(unix)]
+    fn device(meta: &std::fs::Metadata) -> u64 { meta.dev() }
+    #[cfg(unix)]
+    fn inode(meta: &std::fs::Metadata) -> u64 { meta.ino() }
+    #[cfg(unix)]
+    fn modified(meta: &std::fs::Metadata) -> anyhow::Result<(i64, i64)> { Ok((meta.mtime(), meta.mtime_nsec())) }
+    // Stable Rust has no file identity on Windows: its size and last write say it's unchanged.
+    #[cfg(not(unix))]
+    fn device(_meta: &std::fs::Metadata) -> u64 { 0 }
+    #[cfg(not(unix))]
+    fn inode(_meta: &std::fs::Metadata) -> u64 { 0 }
+    #[cfg(not(unix))]
+    fn modified(meta: &std::fs::Metadata) -> anyhow::Result<(i64, i64)> {
+        let since = meta.modified()?.duration_since(std::time::UNIX_EPOCH)?;
+        Ok((i64::try_from(since.as_secs())?, i64::from(since.subsec_nanos())))
+    }
+    #[cfg(unix)]
+    fn writable_bits(meta: &std::fs::Metadata) -> bool { meta.permissions().mode() & 0o222 != 0 }
+    #[cfg(not(unix))]
+    fn writable_bits(meta: &std::fs::Metadata) -> bool { !meta.permissions().readonly() }
     fn matches(path: &Path, expected: &Entry) -> anyhow::Result<()> {
         let actual = entry(path, &expected.name)?;
         anyhow::ensure!((actual.device, actual.inode, actual.bytes, actual.modified) == (expected.device, expected.inode, expected.bytes, expected.modified), "U05 preserved source changed: {}; retain all files and reconcile offline", path.display());
@@ -100,7 +139,7 @@ mod supported {
     // open performs no write: if this process can obtain a writer, SQLite's WAL/SHM fallback
     // cannot be called immutable. Refuse before opening SQLite, rather than guess privileges.
     fn readonly(path: &Path) -> anyhow::Result<()> {
-        anyhow::ensure!(std::fs::metadata(path)?.permissions().mode() & 0o222 == 0, "U05 preserved source has writable mode bits; retain it and resume trusted offline cutover");
+        anyhow::ensure!(!writable_bits(&std::fs::metadata(path)?), "U05 preserved source has writable mode bits; retain it and reconcile it by hand");
         match std::fs::OpenOptions::new().write(true).open(path) {
             Ok(_) => anyhow::bail!("U05 this process can still write the preserved input {}; use its nonprivileged readonly owner/snapshot before migration; elevated/ACL write authority is unsupported", path.display()),
             Err(error) if matches!(error.kind(), std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem) => Ok(()),
@@ -113,7 +152,7 @@ mod supported {
         let mut bytes = Vec::new();
         std::fs::File::open(dir.join(FORMAT))?.take(LIMIT + 1).read_to_end(&mut bytes)?;
         anyhow::ensure!(u64::try_from(bytes.len())? <= LIMIT, "U05 format fence metadata exceeds 16KiB");
-        let format: Format = serde_json::from_slice(&bytes).context("U05 invalid format fence; resume kiln store cutover offline")?;
+        let format: Format = serde_json::from_slice(&bytes).context("U05 invalid format fence; retain it and reconcile it by hand")?;
         anyhow::ensure!(format.version == 1 && format.files.len() <= 4, "U05 unsupported format fence");
         let roles = ["source.sqlite", "source.sqlite-wal", "source.sqlite-shm", "cluster/cluster.log"];
         let mut names = std::collections::HashSet::new();
@@ -153,10 +192,19 @@ mod supported {
     pub(super) fn ensure(path: &Path) -> anyhow::Result<Fence> { ensure_using(path, &mut sync) }
     fn ensure_using(path: &Path, flush: &mut dyn FnMut(&Path) -> anyhow::Result<()>) -> anyhow::Result<Fence> {
         let layout = layout(path)?;
+        // A cutover an earlier start began goes on from where it stopped.
+        if exists(&layout.pending)? {
+            refuse_journal(&layout)?;
+            return prepare_checked(path, true, flush);
+        }
+        // A SQLite kiln.db: cut over now, once nothing else has it open.
+        if exists(&layout.legacy)? && !std::fs::symlink_metadata(&layout.legacy)?.is_dir() {
+            let_go(&layout.legacy)?;
+            refuse_journal(&layout)?;
+            return prepare_checked(path, true, flush);
+        }
         refuse_journal(&layout)?;
-        anyhow::ensure!(!exists(&layout.pending)?, "U05 offline cutover is pending; keep old SQL producers and automatic restart disabled and resume kiln store cutover --data-dir explicitly --offline");
         if exists(&layout.legacy)? {
-            anyhow::ensure!(std::fs::symlink_metadata(&layout.legacy)?.is_dir(), "U05 unfenced legacy SQL cannot activate automatically; disable ALL old SQL/group/backup producers and automatic restart, then run kiln store cutover --data-dir explicitly --offline");
             persist_ancestry(&layout, flush)?;
             let format = read(&layout.legacy)?;
             durable(&layout.legacy, &format, flush)?;
@@ -166,6 +214,7 @@ mod supported {
         // only if the old pathname stays absent; a competing legacy creator causes refusal.
         prepare_checked(path, false, flush)
     }
+    #[cfg(test)]
     pub(super) fn prepare(path: &Path) -> anyhow::Result<Fence> { prepare_checked(path, true, &mut sync) }
     fn prepare_checked(path: &Path, offline: bool, flush: &mut dyn FnMut(&Path) -> anyhow::Result<()>) -> anyhow::Result<Fence> {
         let layout = layout(path)?;
@@ -181,9 +230,9 @@ mod supported {
             return Ok(fence(layout.legacy, format));
         }
         if !offline {
-            anyhow::ensure!(!exists(&layout.pending)?, "U05 pending cutover appeared during fresh activation; only the explicit supervised offline command may continue");
+            anyhow::ensure!(!exists(&layout.pending)?, "U05 pending cutover appeared during fresh activation; it goes on at the next start");
             for (_, original) in roles(&layout.legacy)? {
-                anyhow::ensure!(!exists(&original)?, "U05 legacy input {} appeared during fresh activation; keep it unchanged and use the explicit supervised offline cutover", original.display());
+                anyhow::ensure!(!exists(&original)?, "U05 legacy input {} appeared during fresh activation; it is cut over at the next start", original.display());
             }
         }
         if !exists(&layout.pending)? { std::fs::create_dir(&layout.pending)?; flush(layout.pending.parent().context("U05 pending parent")?)?; }
@@ -229,19 +278,36 @@ mod supported {
             read(&layout.pending)?
         };
         durable(&layout.pending, &format, flush)?;
-        // This is intentionally NOT called an atomic exchange. The trusted offline service
-        // boundary must exclude old producers/restart throughout this recoverable gap.
+        // This is intentionally NOT called an atomic exchange: no other process had the source
+        // open when it was taken (`let_go`), and once the fence is published no older build can
+        // open it again.
         for (name, original) in roles(&layout.legacy)? {
             if !exists(&original)? { continue }
             let saved = format.files.iter().find(|file| file.name == name).context("U05 unexpected old source appeared during cutover; keep all files")?;
             matches(&original, saved)?;
-            std::fs::remove_file(&original)?;
+            remove_link(&original, &layout.pending.join(name))?;
             flush(original.parent().context("U05 source parent")?)?;
         }
         anyhow::ensure!(!exists(&layout.legacy)?, "U05 old pathname reappeared; old producer/restart exclusion was violated");
         std::fs::rename(&layout.pending, &layout.legacy)?;
         flush(layout.legacy.parent().context("U05 fence parent")?)?;
         Ok(fence(layout.legacy, format))
+    }
+    /// The source's old name goes; the link kept in the fence stays read-only. On Windows a file's
+    /// read-only flag is the file's, every link's, and keeps a link from being removed: it's lifted
+    /// for the removal and set again.
+    #[cfg(unix)]
+    fn remove_link(original: &Path, _kept: &Path) -> anyhow::Result<()> { std::fs::remove_file(original)?; Ok(()) }
+    #[cfg(not(unix))]
+    #[allow(clippy::permissions_set_readonly_false, reason = "Windows: clears the read-only attribute, nothing else")]
+    fn remove_link(original: &Path, kept: &Path) -> anyhow::Result<()> {
+        let mut permissions = std::fs::metadata(original)?.permissions();
+        permissions.set_readonly(false);
+        std::fs::set_permissions(original, permissions.clone())?;
+        let removed = std::fs::remove_file(original);
+        permissions.set_readonly(true);
+        std::fs::set_permissions(kept, permissions)?;
+        Ok(removed?)
     }
     #[cfg(test)]
     pub(super) fn with_sync(path: &Path, offline: bool, flush: &mut dyn FnMut(&Path) -> anyhow::Result<()>) -> anyhow::Result<Fence> {
