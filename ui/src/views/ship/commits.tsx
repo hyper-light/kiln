@@ -63,10 +63,8 @@ export function ShipCommits({ repo, narrow, picked, onPick }: { repo: string; na
   const cursor = seen === facets ? before.at(-1) : undefined;
   const q: ShipQuery = cursor === undefined ? { repo, ...narrow, limit: per } : { repo, ...narrow, limit: per, cursor };
   const key = `ship/commits/${JSON.stringify(q)}`;
-  const page = useSuspenseResource(key, (s) => shipApi.commits(q, s), {
-    pollMs: 15_000,
-    on: ["run", "job", "review", "comment", "conflict", "cd_apps", "cd_rollout"],
-  });
+  // A line says its checks, run time and machines: runs' and jobs' events move them, not a review's.
+  const page = useSuspenseResource(key, (s) => shipApi.commits(q, s), { pollMs: 15_000, on: ["run", "job"] });
   const fetched = page.data.commits;
   // A page keeps the commits it showed first, each with its latest data, as the list keeps its rows:
   // a commit that arrives meanwhile waits for Newer, so no line moves under the one you're reading.
