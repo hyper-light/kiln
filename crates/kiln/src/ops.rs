@@ -833,7 +833,8 @@ mod tests {
             let request = http::Request::builder().uri("/api/plans").body(kiln_http::Incoming::empty())?;
             let response = super::http(owner.clone(), Method::GET, &["api", "plans"], &Default::default(), request).await.map_err(|(_, why)| anyhow::anyhow!(why))?;
             let body = response.into_body().collect().await?.to_bytes();
-            assert_eq!(serde_json::from_slice::<Value>(&body)?, read);
+            // The route answers the list itself, as the UI reads it (main's `GET /api/plans`).
+            assert_eq!(serde_json::from_slice::<Value>(&body)?, read.get("plans").cloned().ok_or_else(|| anyhow::anyhow!("plans.list answered no plans"))?);
             // U12: a typed refusal reaches no domain mutation, even for an authorized caller.
             assert!(matches!(call_checked(owner.clone(), "plans.create", json!({"title": "must not be accepted", "unexpected": true})).await, Err(CallError::Misfit(m)) if m.code() == "unknown_field" && m.path == "/unexpected"));
             let unchanged = call(owner.clone(), "plans.list", json!({})).await.map_err(|(_, why)| anyhow::anyhow!(why))?;
