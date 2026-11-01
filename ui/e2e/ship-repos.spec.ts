@@ -44,7 +44,8 @@ test("an opened repository's commits page 5, 10 and 25 at a time, Newer and Olde
   await expect(pressed(kiln, "Newer")).toBeDisabled();
   await expect(pressed(kiln, "Older")).toBeEnabled();
   const first = await lines(kiln).allInnerTexts();
-  await pressed(kiln, "Older").click();
+  // Pressed twice before the next page is in, Older turns one page: a press acts on the page shown.
+  await pressed(kiln, "Older").dblclick();
   await expect(kiln.locator(".sc-pager span")).toHaveText("6–10");
   await expect(lines(kiln)).toHaveCount(5);
   expect(await lines(kiln).allInnerTexts()).not.toEqual(first);

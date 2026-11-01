@@ -29,7 +29,11 @@ export async function pickCommit(page: Page, text: string | RegExp, repo = "hype
   for (let i = 0; i < 20 && (await line.count()) === 0; i++) {
     const older = commits.getByRole("button", { name: "Older", exact: true });
     if (await older.isDisabled()) break;
+    // The next page in before looking again: the range it says moves on.
+    const range = commits.locator(".sc-pager span");
+    const was = (await range.textContent()) ?? "";
     await older.click();
+    await expect(range).not.toHaveText(was, { timeout: 15_000 });
   }
   await line.getByRole("button").click();
   await expect(line.getByRole("button")).toHaveAttribute("aria-pressed", "true");

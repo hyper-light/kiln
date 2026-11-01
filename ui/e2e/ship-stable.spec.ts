@@ -3,8 +3,8 @@
  * against the mock's fixed rows: pick a job in the jobs pane, or walk the lanes in Detail, focus a
  * control in the open row, let the list refresh while a commit arrives, and the pane keeps its pick,
  * the lanes their walk, room and rows, the focus and the page stay, and the row stays open in its place.
- * The commit arrives in the opened row's repository (docs/ci.md W26-R29): the row says it, its newest,
- * and the commit picked, and its sections, stay.
+ * The commit arrives in the opened row's repository (docs/ci.md W26-R29): it waits behind its
+ * commits' Newer, and the row's commit, the commit picked and its sections stay.
  */
 import { expect, test } from "@playwright/test";
 import { repoRow } from "./ship-pick";
@@ -39,8 +39,10 @@ test("the jobs pane's pick and focus in an open row survive updates", async ({ p
     await expect(pane.locator(".jp-j[data-sel]")).toHaveCount(1);
     await expect(copy).toBeFocused();
     await expect(row.locator(".ship-go")).toHaveAttribute("aria-expanded", "true");
-    // The row is its repository's newest, the one that arrived; the commit picked is still D41's.
-    await expect(row.locator(".ship-text")).toHaveText(/^arrived 1 · /);
+    // Open, the row keeps the commit it shows and its commits their page, the one that arrived
+    // waiting behind Newer; the commit picked is still D41's.
+    await expect(row.locator(".ship-r .ship-sha")).toHaveText("4444444");
+    await expect(row.locator("section.ship-commits").getByRole("button", { name: "Newer", exact: true })).toBeEnabled();
     await expect(row.locator('section.ship-commits .sc-c[data-sel="true"]')).toContainText("4444444");
   } finally {
     await page.request.post("/api/mock/ship/arrive?clear=1");

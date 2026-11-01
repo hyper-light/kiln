@@ -89,7 +89,8 @@ async function openOutput(page: import("@playwright/test").Page) {
   await page.goto("/ship");
   const row = page.getByRole("list", { name: "Repositories", exact: true }).locator(":scope > li").first();
   await row.getByRole("button", { name: /^Open / }).click();
-  const last = row.locator('.jp-j[data-stage="checks"]').last();
+  // One still waiting has no output yet: the last of those that have run.
+  const last = row.locator('.jp-j[data-stage="checks"]:is([data-state="running"], [data-state="failed"], [data-state="passed"])').last();
   await expect(last).toBeVisible({ timeout: 15_000 });
   await last.locator(".jp-line").click();
   const out = row.locator(".ship-output");
@@ -153,13 +154,15 @@ test("Output as f-ship draws it: the job's glyph and Stage · job, stdout · std
   await page.setViewportSize({ width: 1280, height: 900 });
   await page.goto("/ship");
   const row = page.getByRole("list", { name: "Repositories", exact: true }).locator(":scope > li").first();
-  const sha = ((await row.locator(".ship-sha").first().textContent()) ?? "").trim();
+  // The row's commit, its repository's newest (docs/ci.md W26-R29).
+  const repo = ((await row.locator(".ship-r .ship-name").textContent()) ?? "").trim();
+  const sha = ((await row.locator(".ship-r .ship-sha").textContent()) ?? "").trim();
   await row.getByRole("button", { name: /^Open / }).click();
   await expect(row.locator('.jp-j[data-stage="checks"]').first()).toBeVisible({ timeout: 15_000 });
   // A job's line in the pane, by its name.
   const line = (name: string) => row.locator(".jp-j").filter({ has: page.locator(".n", { hasText: new RegExp(`^${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`) }) });
   // A job that ran, from the read model: picked, the card is its.
-  const detail = (await (await page.request.get(`/api/ship/commits/hyper-light/kiln/${sha}`)).json()) as {
+  const detail = (await (await page.request.get(`/api/ship/commits/${repo}/${sha}`)).json()) as {
     checks: { pipeline: string; legs: { name: string; state: string; job?: string }[] }[];
   };
   const ran = detail.checks.flatMap((c) => c.legs.filter((l) => l.job).map((l) => ({ ...l, shown: `${c.pipeline} · ${l.name}` })));

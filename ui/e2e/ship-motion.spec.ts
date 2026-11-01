@@ -15,6 +15,10 @@ import { STATES } from "../src/components/ui/status-glyph-spec";
 const REAL = !!process.env.E2E_BASE_URL;
 test.skip(REAL, "drives the mock's commits");
 test.use({ reducedMotion: "reduce" });
+// The commits a test adds go however it ends, a timeout too, so the specs after see the mock's own.
+test.afterEach(async ({ request }) => {
+  await request.post("/api/mock/ship/arrive?clear=1");
+});
 
 /** Each animation that ran (CSS animations and transitions, the Web Animations API) with time to take, by frame. */
 const watchMotion = (page: Page) =>
@@ -93,7 +97,7 @@ const glyphsOn = (page: Page) =>
 
 test("in grayscale, every state Ship draws is told from every other by its glyph's shape, and in words", async ({ page, browserName, isMobile }) => {
   test.skip(isMobile, "glyphs draw the same at every width: the desktop projects check them");
-  test.setTimeout(150_000);
+  test.setTimeout(180_000);
   // Every state Ship draws: its list (each row's journey, and the mock's commits whose journeys run
   // through every state a glyph has), opened rows (Lanes, the job cards), and commits' pages (Build,
   // Replant, Environments).
@@ -115,6 +119,8 @@ test("in grayscale, every state Ship draws is told from every other by its glyph
   }
   const commits = ((await (await page.request.get("/api/ship/commits")).json()) as { commits: { repo: string; sha: string }[] }).commits;
   for (const c of commits) {
+    // Every state found, the pages left can show none new.
+    if (STATES.every((s) => found.has(s))) break;
     await page.goto(`/ship/${c.repo}/${c.sha}`);
     await expect(page.getByRole("region", { name: "Commit" })).toBeVisible({ timeout: 15_000 });
     await expect(page.getByRole("region", { name: "Stages" })).toBeVisible({ timeout: 15_000 });

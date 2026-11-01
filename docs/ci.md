@@ -8720,7 +8720,9 @@ a time. The design was agreed on a live mock built on Ship's own prototype
 - **W26-R29 Repositories as Ship's rows.** Ada, 2026-11-01: "each item maps to a repo, and commits
   are browsable from within there".
   - Each of Ship's rows is a repository, showing its newest commit: its stand and line, its journey,
-    who and when, and its actions (`GET /api/ship/commits?by=repo`).
+    who and when, and its actions (`GET /api/ship/commits?by=repo`). While the list holds still (a
+    row open, the pointer on it), a row keeps the commit it shows: a newer one waits for the
+    release, as a new row does.
   - Opened, its first section is the repository's commits, newest first, a page at a time (5, 10,
     25, 50 or 100; ten by default), with Newer and Older, narrowed by the host and kind the list is
     narrowed by. Each line has its checks' glyph, sha, message (cut), author, the machines its jobs

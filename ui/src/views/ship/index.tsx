@@ -114,6 +114,9 @@ function ShipList() {
     const k = rowKey(it);
     const sig = JSON.stringify(it);
     const was = kept.last.get(k);
+    // Held, a row keeps the commit it shows: a newer one in its repository waits for the release, as
+    // a new row does, so the line you're reading never turns into another's (docs/ci.md W26-R29).
+    if (hold.held && kept.view === view && was && was.it.head.sha !== it.head.sha) return was.it;
     const same = was && was.sig === sig ? was.it : it;
     kept.last.set(k, { it: same, sig });
     return same;

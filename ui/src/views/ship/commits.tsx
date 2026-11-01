@@ -78,6 +78,8 @@ export function ShipCommits({ repo, narrow, picked, onPick }: { repo: string; na
   const last = lines.at(-1)?.cursor;
   const next = page.data.next_cursor === null || last === undefined ? null : last;
   const first = before.length * per + 1;
+  // A press acts on the page shown: pressed again before the next is in, it does nothing more.
+  const depth = before.length;
   return (
     <section aria-label="Commits" className="ship-sec ship-commits">
       <SectionHead label="Commits">
@@ -141,13 +143,13 @@ export function ShipCommits({ repo, narrow, picked, onPick }: { repo: string; na
         <div className="sc-pager">
           <button
             type="button"
-            disabled={before.length === 0 && !arrived}
-            onClick={() => (before.length === 0 ? setHeld({ key, lines: fetched }) : startTransition(() => setBefore((b) => b.slice(0, -1))))}
+            disabled={depth === 0 && !arrived}
+            onClick={() => (depth === 0 ? setHeld({ key, lines: fetched }) : startTransition(() => setBefore((b) => (b.length === depth ? b.slice(0, -1) : b))))}
           >
             Newer
           </button>
           <span>{lines.length > 0 ? `${first}–${first + lines.length - 1}` : "—"}</span>
-          <button type="button" disabled={next === null} onClick={() => startTransition(() => setBefore((b) => (next === null ? b : [...b, next])))}>
+          <button type="button" disabled={next === null} onClick={() => startTransition(() => setBefore((b) => (next === null || b.length !== depth ? b : [...b, next])))}>
             Older
           </button>
         </div>
