@@ -932,6 +932,9 @@ function verdictsOf(d: MockDiff) {
 
 /** D41's conflicts with main when a test turns them on (`POST /api/mock/review/conflicts`). */
 const conflictState = { on: false };
+/** Where the queue has a diff when a test says so (`POST /api/mock/review`, `{ queue: { diff, state } }`): it moves on
+ * with no one at the page (docs/ci.md W26-R19). */
+const queueState = new Map<string, string>();
 const takenResolutions = new Map<string, { take: string; lines: string[] | null; by: string; at: number }>();
 function conflictsOf(d: MockDiff): { diff: string; version: number; replay: unknown; conflicts: MockConflict[]; unresolved: number; ready: boolean } {
   const list: MockConflict[] =
@@ -1032,8 +1035,13 @@ export async function handleReview(req: http.IncomingMessage, res: http.ServerRe
     return (ctx.json(res, 200, { ok: true }), true);
   }
   if (a === "mock" && b === "review" && m === "POST") {
-    const body = await ctx.body<{ conflicts?: boolean; emit?: { type: string; diff?: string } }>(req);
+    const body = await ctx.body<{ conflicts?: boolean; queue?: { diff: string; state: string | null }; emit?: { type: string; diff?: string } }>(req);
     if (body.conflicts !== undefined) conflictState.on = body.conflicts;
+    if (body.queue) {
+      if (body.queue.state) queueState.set(body.queue.diff, body.queue.state);
+      else queueState.delete(body.queue.diff);
+      ctx.emit({ type: "diff", diff: body.queue.diff });
+    }
     if (body.emit) ctx.emit(body.emit);
     return (ctx.json(res, 200, { ok: true }), true);
   }
@@ -1245,7 +1253,11 @@ export async function handleReview(req: http.IncomingMessage, res: http.ServerRe
         required: ["ci"],
         strategies: d.stack ? ["stack", "stack-squash"] : ["squash", "merge", "rebase"],
         default: d.stack ? "stack" : "squash",
-        queue: d.state === "landing" ? { entry: queue.find((q) => q.diffs.includes(d.name))?.id ?? "", state: "queued", reason: null } : null,
+        queue: queueState.has(d.name)
+          ? { entry: "q-mock", state: queueState.get(d.name), reason: null }
+          : d.state === "landing"
+            ? { entry: queue.find((q) => q.diffs.includes(d.name))?.id ?? "", state: "queued", reason: null }
+            : null,
         when_ready: whenReady.has(d.name),
       }),
       true
