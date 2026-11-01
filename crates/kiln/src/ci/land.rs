@@ -2284,6 +2284,10 @@ struct HostChange {
     /// the next step, never waited on.
     #[serde(skip_serializing_if = "Option::is_none")]
     merging: Option<String>,
+    /// Landed by kiln already, recorded and signed into the trail (W26-R19): its entry, back in the
+    /// queue part-merged, signs only what merged since.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    landed: bool,
 }
 
 impl HostChange {
@@ -2499,9 +2503,26 @@ async fn save_host(hub: &Hub, e: &Entry) -> anyhow::Result<()> {
     hub.store.call(move |c| Ok(c.execute("UPDATE land_queue SET host = ?2, updated_at = ?3 WHERE id = ?1", params![id, text, crate::util::now_unix()]).map(|_| ())?)).await
 }
 
-/// The changes of entry `e` its host merged, bottom first, each its number and commit.
+/// The changes of entry `e` its host merged that kiln hasn't landed yet, bottom first, each its
+/// number and commit.
 fn merged_of(e: &Entry) -> Vec<(u64, String)> {
-    e.host.iter().flat_map(|h| h.changes.iter().filter(|c| c.state == "merged").map(|c| (c.number, c.commit.clone().unwrap_or_default()))).collect()
+    e.host.iter().flat_map(|h| h.changes.iter().filter(|c| c.state == "merged" && !c.landed).map(|c| (c.number, c.commit.clone().unwrap_or_default()))).collect()
+}
+
+/// Every change of entry `e` its host merged, landed before or not, as `#n` by the commit it merged
+/// as: what its record and its row say it carries.
+fn carried_by(e: &Entry) -> BTreeMap<String, String> {
+    e.host.iter().flat_map(|h| h.changes.iter().filter(|c| c.state == "merged").map(|c| (format!("#{}", c.number), c.commit.clone().unwrap_or_default()))).collect()
+}
+
+/// Entry `e`, every change of it merged, landed: its row says so, with the commits it carries and
+/// its changes as its host has them, and whoever follows it is told.
+async fn set_landed(hub: &Hub, e: &Entry) -> anyhow::Result<()> {
+    save_host(hub, e).await?;
+    let (id, list) = (e.id.clone(), serde_json::to_string(&carried_by(e))?);
+    hub.store.call(move |c| Ok(c.execute("UPDATE land_queue SET state = 'landed', commits = ?2, updated_at = ?3 WHERE id = ?1", params![id, list, crate::util::now_unix()]).map(|_| ())?)).await?;
+    tell(hub, e, "landed", None).await;
+    Ok(())
 }
 
 /// The tip `merged` (`k` changes, each one commit by `method`) went onto: `to`'s `k`th first
@@ -2524,16 +2545,16 @@ struct Landing {
     tested: bool,
 }
 
-/// Entry `e`'s changes its host merged, landed: recorded under the trunk's policy with the
-/// candidate's runs and the move they made, and signed into the trail as kiln's queue tested them,
-/// or as applied again onto the tip they went onto where they didn't land as tested.
-async fn land_merged(hub: &Arc<Hub>, repo: &Repo, trunk: &str, policy: &land::Policy, e: &Entry, how: &Landing) -> anyhow::Result<()> {
+/// Entry `e`'s changes its host merged since kiln last landed any of it, landed: recorded under the
+/// trunk's policy with the candidate's runs and the move they made (the record naming all the entry
+/// carries), signed into the trail as kiln's queue tested them, or as applied again onto the tip
+/// they went onto where they didn't land as tested, and marked landed on `e`.
+async fn land_merged(hub: &Arc<Hub>, repo: &Repo, trunk: &str, policy: &land::Policy, e: &mut Entry, how: &Landing) -> anyhow::Result<()> {
     let merged = merged_of(e);
     let Some((_, to)) = merged.last().cloned() else { return Ok(()) };
-    let landed: BTreeMap<String, String> = merged.iter().map(|(n, c)| (format!("#{n}"), c.clone())).collect();
     let mv = Move { from: how.from.clone(), to: to.clone(), rebased: !how.tested, candidate: how.candidate.clone(), base: how.base.clone() };
     let runs = runs_on(hub, &repo.id, &how.candidate).await.unwrap_or_default();
-    if let Err(err) = record(hub, &repo.id, trunk, e, &landed, Some(&mv), policy, &runs, queue::HOST_MERGES).await {
+    if let Err(err) = record(hub, &repo.id, trunk, e, &carried_by(e), Some(&mv), policy, &runs, queue::HOST_MERGES).await {
         tracing::warn!(entry = %e.id, error = %format!("{err:#}"), "a land's record couldn't be kept");
     }
     let mut carried = Vec::new();
@@ -2546,15 +2567,19 @@ async fn land_merged(hub: &Arc<Hub>, repo: &Repo, trunk: &str, policy: &land::Po
         tracing::warn!(entry = %e.id, error = %format!("{err:#}"), "a land kiln tested and its host merged wasn't signed");
     }
     hub.store.audit("kiln".into(), "queue.land".into(), format!("{} {trunk}: entry {} by {}, tested as {} and merged by its host{}", repo.name, e.id, e.enqueued_by, how.candidate, if how.tested { "" } else { ", not as tested" })).await;
+    for c in e.host.iter_mut().flat_map(|h| h.changes.iter_mut()).filter(|c| c.state == "merged") {
+        c.landed = true;
+    }
     Ok(())
 }
 
 /// A batch kiln's queue tested, of a repository whose host has no queue (docs/ci.md W26-R19),
 /// merged by its host, all of it or none.
 /// - Without the host's trunk as it is now (kiln's mirror fetched), nothing merges this step.
-/// - Every entry is decided first: Review's gate, each change as its host has it (`standing_of`),
-///   and, before anything of the batch merged, the trunk (`queue::host_merge`). One that's out, held
-///   or to be built again stops the batch: whatever merged lands, and the rest go back to the queue.
+/// - Every entry is decided first: each change as its host has it (`standing_of`), Review's gate
+///   on those still open, and, before anything of the batch merged, the trunk (`queue::host_merge`).
+///   One that's out, held or to be built again stops the batch, once no merge of it is under way:
+///   whatever merged lands, and the rest go back to the queue.
 /// - Then each change merges at the head tested, bottom first. A background merge is read on the
 ///   next step, never waited on; a refusal stops the batch the same way.
 /// - Merged whole, each entry lands, checked against what kiln tested ([`land_merged`]).
@@ -2568,7 +2593,8 @@ async fn host_land_step(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, po
     }
     let trunk_now = rev_parse(hub, path, &format!("refs/heads/{trunk}^{{commit}}")).await?;
     let mut es = by_ids(&entries(hub, &repo.id, trunk, &["testing"]).await?, ids);
-    let started = es.iter().any(|e| e.host.iter().flat_map(|h| h.changes.iter()).any(|c| c.state == "merged" || c.merging.is_some()));
+    // What kiln landed of an entry before it came back to the queue isn't this batch's.
+    let started = es.iter().any(|e| e.host.iter().flat_map(|h| h.changes.iter()).any(|c| (c.state == "merged" && !c.landed) || c.merging.is_some()));
     let (Some(candidate), Some(base)) = (es.first().and_then(|e| e.candidate.clone()), es.first().and_then(|e| e.base.clone())) else { return Ok(()) };
     // Every entry decided before anything merges.
     let mut stops: Vec<Option<(String, &'static str)>> = Vec::new();
@@ -2577,18 +2603,6 @@ async fn host_land_step(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, po
             stops.push(Some(("it isn't a host's change".to_owned(), "out")));
             continue;
         };
-        let asked: Vec<(u64, String)> = h.changes.iter().filter(|c| c.state == "open").map(|c| (c.number, c.head.clone())).collect();
-        let held = match super::review::host_held(hub, repo, trunk, &asked).await {
-            Ok(held) => held,
-            Err((_, why)) => {
-                tracing::warn!(entry = %e.id, error = %why, "Review's gate couldn't be asked before a merge: the next step asks again");
-                return Ok(());
-            }
-        };
-        if !held.is_empty() {
-            stops.push(Some((held.join("; "), "held")));
-            continue;
-        }
         let name = h.repo.clone();
         let mut stop = None;
         for c in h.changes.iter_mut().filter(|c| c.state == "open") {
@@ -2612,10 +2626,24 @@ async fn host_land_step(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, po
                 break;
             }
         }
+        if stop.is_none() {
+            match super::review::host_held(hub, repo, trunk, &open_on_host(e)).await {
+                Ok(held) if !held.is_empty() => stop = Some((held.join("; "), "held")),
+                Ok(_) => {}
+                Err((_, why)) => {
+                    tracing::warn!(entry = %e.id, error = %why, "Review's gate couldn't be asked before a merge: the next step asks again");
+                    return Ok(());
+                }
+            }
+        }
         stops.push(stop);
     }
     if stops.iter().any(Option::is_some) {
-        return stop_batch(hub, repo, path, trunk, policy, batch, &es, &stops, &candidate, &base).await;
+        // A merge under way says what merged before the batch stops: read again next step.
+        if es.iter().any(|e| e.host.iter().flat_map(|h| h.changes.iter()).any(|c| c.merging.is_some())) {
+            return Ok(());
+        }
+        return stop_batch(hub, repo, path, trunk, policy, batch, &mut es, &stops, &candidate, &base).await;
     }
     // Then each change merges, at the head tested, bottom first.
     let mut failed: Option<(usize, String)> = None;
@@ -2654,7 +2682,7 @@ async fn host_land_step(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, po
     }
     if let Some((i, why)) = failed {
         let stops: Vec<Option<(String, &'static str)>> = (0..es.len()).map(|k| (k == i).then(|| (why.clone(), "out"))).collect();
-        return stop_batch(hub, repo, path, trunk, policy, batch, &es, &stops, &candidate, &base).await;
+        return stop_batch(hub, repo, path, trunk, policy, batch, &mut es, &stops, &candidate, &base).await;
     }
     if waiting {
         return Ok(());
@@ -2674,34 +2702,37 @@ async fn host_land_step(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, po
     let tree = |c: String| async move { rev_parse(hub, path, &format!("{c}^{{tree}}")).await.ok() };
     tested &= matches!((tree(expected.clone()).await, tree(candidate.clone()).await), (Some(a), Some(b)) if a == b);
     drop_candidate(hub, path, trunk, batch).await;
-    for (e, from) in es.iter().zip(landings) {
+    for (e, from) in es.iter_mut().zip(landings) {
         land_merged(hub, repo, trunk, policy, e, &Landing { candidate: candidate.clone(), base: base.clone(), from, tested }).await?;
-        let (id, list) = (e.id.clone(), serde_json::to_string(&merged_of(e).into_iter().map(|(n, c)| (format!("#{n}"), c)).collect::<BTreeMap<_, _>>())?);
-        hub.store.call(move |c| Ok(c.execute("UPDATE land_queue SET state = 'landed', commits = ?2, updated_at = ?3 WHERE id = ?1", params![id, list, crate::util::now_unix()]).map(|_| ())?)).await?;
-        tell(hub, e, "landed", None).await;
+        set_landed(hub, e).await?;
     }
     Ok(())
 }
 
 /// A batch stopped before it merged whole (docs/ci.md W26-R19): its candidate dropped, and each
-/// entry's changes its host merged landed (not as tested: the candidate was the whole batch), then
-/// each entry out, held or queued again by `stops` (its own, or "an entry beside it didn't merge").
+/// entry's changes its host merged landed (not as tested: the candidate was the whole batch). An
+/// entry merged whole is landed; each other is out, held or queued again by `stops` (its own, or "an
+/// entry beside it didn't merge").
 #[allow(clippy::too_many_arguments)]
-async fn stop_batch(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, policy: &land::Policy, batch: &str, es: &[Entry], stops: &[Option<(String, &'static str)>], candidate: &str, base: &str) -> anyhow::Result<()> {
+async fn stop_batch(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, policy: &land::Policy, batch: &str, es: &mut [Entry], stops: &[Option<(String, &'static str)>], candidate: &str, base: &str) -> anyhow::Result<()> {
     drop_candidate(hub, path, trunk, batch).await;
-    for (e, stop) in es.iter().zip(stops) {
-        save_host(hub, e).await?;
+    for (e, stop) in es.iter_mut().zip(stops) {
         let merged = merged_of(e);
         if let Some((_, to)) = merged.last() {
             let from = went_onto(hub, repo, path, to, merged.len(), method_of(e.strategy)).await.unwrap_or_default();
             land_merged(hub, repo, trunk, policy, e, &Landing { candidate: candidate.to_owned(), base: base.to_owned(), from, tested: false }).await?;
         }
+        if e.host.as_ref().is_some_and(|h| h.changes.iter().all(|c| c.state == "merged")) {
+            set_landed(hub, e).await?;
+            continue;
+        }
+        save_host(hub, e).await?;
         let said = |why: &str| if merged.is_empty() { why.to_owned() } else { format!("{why} ({} merged and signed)", merged.iter().map(|(n, _)| format!("#{n}")).collect::<Vec<_>>().join(", ")) };
         match stop {
             Some((why, "out")) => eject(hub, e, &said(why), "INVALID_MERGE_COMMIT").await?,
             Some((why, "held")) => hold_entry(hub, e, "gate", &said(why), "BRANCH_PROTECTIONS").await?,
-            Some((why, _)) => requeue_with(hub, std::slice::from_ref(e), Some(said(why).as_str())).await?,
-            None => requeue_with(hub, std::slice::from_ref(e), Some(said("an entry beside it in its batch didn't merge").as_str())).await?,
+            Some((why, _)) => requeue_with(hub, std::slice::from_ref(&*e), Some(said(why).as_str())).await?,
+            None => requeue_with(hub, std::slice::from_ref(&*e), Some(said("an entry beside it in its batch didn't merge").as_str())).await?,
         }
     }
     Ok(())
@@ -2900,8 +2931,9 @@ async fn land_from_host(hub: &Arc<Hub>, repo: &Repo, trunk: &str, e: &Entry, h: 
     if let Err(err) = record(hub, &repo.id, trunk, e, landed, None, &policy, &[], &via).await {
         tracing::warn!(entry = %e.id, error = %format!("{err:#}"), "a land's record couldn't be kept");
     }
+    // What kiln's queue landed of it before is in the trail already (W26-R19).
     let mut carried = Vec::new();
-    for c in &h.changes {
+    for c in h.changes.iter().filter(|c| !c.landed) {
         if let Some(commit) = landed.get(&format!("#{}", c.number)) {
             carried.push((format!("#{}", c.number), host_version(hub, &repo.id, c.number, &c.head).await, commit.clone()));
         }
@@ -3324,6 +3356,140 @@ mod tests {
             let got = super::super::lands::get(&hub, lab.name, &m1).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             assert_eq!(got.pointer("/land/via").and_then(Value::as_str), Some(queue::HOST_MERGES), "{got}");
             assert_eq!(got.pointer("/land/rebased").and_then(Value::as_bool), Some(true), "only part of what kiln tested landed: {got}");
+            Ok(())
+        })
+    }
+
+    /// The forge seam's simulator, its background merges still under way while `slow` is set: a
+    /// host whose merges take a while.
+    struct Slow {
+        sim: seam::SimForge,
+        slow: std::sync::atomic::AtomicBool,
+    }
+
+    type Fut<'a, T> = futures::future::BoxFuture<'a, Result<T, seam::Refusal>>;
+
+    impl Forge for Slow {
+        fn abilities<'a>(&'a self, repo: &'a str) -> Fut<'a, seam::Abilities> { self.sim.abilities(repo) }
+        fn open<'a>(&'a self, repo: &'a str, open: seam::Open) -> Fut<'a, seam::Change> { self.sim.open(repo, open) }
+        fn change<'a>(&'a self, repo: &'a str, number: u64, etag: Option<&'a str>) -> Fut<'a, seam::Fresh<seam::Change>> { self.sim.change(repo, number, etag) }
+        fn changes<'a>(&'a self, repo: &'a str, etag: Option<&'a str>) -> Fut<'a, seam::Fresh<Vec<seam::Change>>> { self.sim.changes(repo, etag) }
+        fn update<'a>(&'a self, repo: &'a str, number: u64, update: seam::Update) -> Fut<'a, seam::Updated> { self.sim.update(repo, number, update) }
+        fn stack<'a>(&'a self, repo: &'a str, changes: Vec<u64>) -> Fut<'a, seam::Stack> { self.sim.stack(repo, changes) }
+        fn stack_add<'a>(&'a self, repo: &'a str, stack: u64, changes: Vec<u64>) -> Fut<'a, seam::Stack> { self.sim.stack_add(repo, stack, changes) }
+        fn stack_of<'a>(&'a self, repo: &'a str, number: u64) -> Fut<'a, Option<seam::Stack>> { self.sim.stack_of(repo, number) }
+        fn unstack<'a>(&'a self, repo: &'a str, stack: u64) -> Fut<'a, Option<seam::Stack>> { self.sim.unstack(repo, stack) }
+        fn merge<'a>(&'a self, repo: &'a str, number: u64, merge: seam::Merge) -> Fut<'a, seam::Merging> { self.sim.merge(repo, number, merge) }
+        fn merge_result<'a>(&'a self, repo: &'a str, number: u64, id: &'a str) -> Fut<'a, seam::MergeResult> {
+            if self.slow.load(std::sync::atomic::Ordering::SeqCst) {
+                return Box::pin(async { Ok(seam::MergeResult::Pending) });
+            }
+            self.sim.merge_result(repo, number, id)
+        }
+        fn enqueue<'a>(&'a self, repo: &'a str, number: u64, expected: &'a str) -> Fut<'a, Vec<u64>> { self.sim.enqueue(repo, number, expected) }
+        fn dequeue<'a>(&'a self, repo: &'a str, number: u64) -> Fut<'a, Vec<u64>> { self.sim.dequeue(repo, number) }
+        fn queued<'a>(&'a self, repo: &'a str) -> Fut<'a, Vec<u64>> { self.sim.queued(repo) }
+        fn draft<'a>(&'a self, repo: &'a str, number: u64, by: &'a str, draft: seam::Draft) -> Fut<'a, u64> { self.sim.draft(repo, number, by, draft) }
+        fn drafts<'a>(&'a self, repo: &'a str, number: u64, by: &'a str) -> Fut<'a, Vec<seam::Comment>> { self.sim.drafts(repo, number, by) }
+        fn publish<'a>(&'a self, repo: &'a str, number: u64, by: &'a str, verdict: seam::Verdict) -> Fut<'a, seam::Review> { self.sim.publish(repo, number, by, verdict) }
+        fn comments<'a>(&'a self, repo: &'a str, number: u64) -> Fut<'a, Vec<seam::Comment>> { self.sim.comments(repo, number) }
+        fn rate<'a>(&'a self, repo: &'a str) -> Fut<'a, seam::Rate> { self.sim.rate(repo) }
+        fn verifications<'a>(&'a self, repo: &'a str, number: u64) -> Fut<'a, Vec<seam::Verification>> { self.sim.verifications(repo, number) }
+    }
+
+    /// Entries `ids`, each built as its own candidate, put in one batch with the first's: as the
+    /// queue batches entries that meet. The batch, and kiln's mirror's path.
+    async fn one_batch(hub: &Arc<Hub>, lab: &Lab, ids: &[String]) -> anyhow::Result<(String, String)> {
+        let first = entry_by_id(hub, ids.first().map(String::as_str).unwrap_or_default()).await?.ok_or_else(|| anyhow::anyhow!("no entry"))?;
+        let (batch, cand, base) = (first.batch.unwrap_or_default(), first.candidate.unwrap_or_default(), first.base.unwrap_or_default());
+        for id in ids.iter().skip(1) {
+            let (id, b, c, s) = (id.clone(), batch.clone(), cand.clone(), base.clone());
+            hub.store.call(move |x| Ok(x.execute("UPDATE land_queue SET batch = ?2, candidate = ?3, base = ?4 WHERE id = ?1", params![id, b, c, s]).map(|_| ())?)).await?;
+        }
+        Ok((batch, lab.bare.to_string_lossy().into_owned()))
+    }
+
+    /// Entry `id` as it stands.
+    async fn entry_now(hub: &Arc<Hub>, id: &str) -> anyhow::Result<Entry> {
+        entry_by_id(hub, id).await?.ok_or_else(|| anyhow::anyhow!("no entry {id}"))
+    }
+
+    /// How many land statements the trail holds.
+    async fn lands_in_trail(hub: &Arc<Hub>) -> anyhow::Result<i64> {
+        hub.store.call(|c| Ok(c.query_row("SELECT COUNT(*) FROM trail WHERE payload_type = ?1", [kiln_ci::identity::landing::PAYLOAD_LAND], |x| x.get::<_, i64>(0))?)).await
+    }
+
+    /// docs/ci.md W26-R19: a batch stops only once no merge of it is under way, and an entry merged
+    /// whole beside one that didn't lands. #1 and #2 are tested as one candidate, and #1's merge is
+    /// under way on its host when #2's head moves: the batch waits for the merge's result, then #1
+    /// lands, signed into the trail once, and #2 is out, never merged.
+    #[test]
+    fn w26_r19_a_batch_stops_once_its_merges_are_done() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let lab = merges_lab(&hub, "r-slow", "acme/slow", &["one", "two"]).await?;
+            let ([h1, h2], [p1, p2]) = (lab.heads.as_slice(), lab.pulls.as_slice()) else { anyhow::bail!("two changes") };
+            let (ea, eb) = (hand_over(&hub, &lab, &[p1]).await?, hand_over(&hub, &lab, &[p2]).await?);
+            step_until(&hub, &lab, &ea, &["testing"], 1).await?;
+            assert_eq!(entry_now(&hub, &eb).await?.state, "testing", "both built in one step, before either merges");
+            let ids = [ea.clone(), eb.clone()];
+            let (batch, path) = one_batch(&hub, &lab, &ids).await?;
+            let (slow, policy) = (Slow { sim: lab.sim.clone(), slow: std::sync::atomic::AtomicBool::new(true) }, land::Policy::default());
+            let land_step = || host_land_step(&hub, &lab.r, &path, seam::TRUNK, &policy, &slow, &batch, &ids);
+            land_step().await?;
+            lab.sim.push(lab.name, "two", "two", "two again")?;
+            land_step().await?;
+            let (a, b) = (entry_now(&hub, &ea).await?, entry_now(&hub, &eb).await?);
+            assert_eq!((a.state.as_str(), b.state.as_str()), ("testing", "testing"), "#1's merge is under way: the batch waits");
+            assert!(a.host.iter().flat_map(|h| h.changes.iter()).any(|c| c.number == p1.number && c.merging.is_some()), "{a:?}");
+            slow.slow.store(false, std::sync::atomic::Ordering::SeqCst);
+            land_step().await?;
+            let (a, b) = (entry_now(&hub, &ea).await?, entry_now(&hub, &eb).await?);
+            assert_eq!(a.state, "landed", "merged whole: landed, not queued again");
+            assert_eq!(b.state, "ejected");
+            assert!(b.reason.as_deref().is_some_and(|w| w.contains("its head moved")), "{:?}", b.reason);
+            assert!(lab.sim.contains(lab.name, seam::TRUNK, h1) && !lab.sim.contains(lab.name, seam::TRUNK, h2));
+            assert_eq!(lands_in_trail(&hub).await?, 1, "#1's land, signed once");
+            Ok(())
+        })
+    }
+
+    /// docs/ci.md W26-R19: what kiln lands of an entry is signed once. A stack of #1 and #2, and #3
+    /// beside it, are tested as one candidate; #1 merges, then #3's head moves: #1 lands, signed, and
+    /// the stack goes back to the queue with #2 alone. When #2 lands, its statement carries #2 only,
+    /// and the entry's record names both.
+    #[test]
+    fn w26_r19_what_kiln_lands_of_an_entry_is_signed_once() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let lab = merges_lab(&hub, "r-once", "acme/once", &["one", "two", "three"]).await?;
+            let ([h1, h2, h3], [p1, p2, p3]) = (lab.heads.as_slice(), lab.pulls.as_slice()) else { anyhow::bail!("three changes") };
+            let (ea, eb) = (hand_over(&hub, &lab, &[p1, p2]).await?, hand_over(&hub, &lab, &[p3]).await?);
+            step_until(&hub, &lab, &ea, &["testing"], 1).await?;
+            assert_eq!(entry_now(&hub, &eb).await?.state, "testing", "both built in one step, before either merges");
+            let ids = [ea.clone(), eb.clone()];
+            let (batch, path) = one_batch(&hub, &lab, &ids).await?;
+            let policy = land::Policy::default();
+            let land_step = || host_land_step(&hub, &lab.r, &path, seam::TRUNK, &policy, &lab.sim, &batch, &ids);
+            land_step().await?;
+            lab.sim.push(lab.name, "three", "three", "three again")?;
+            land_step().await?;
+            let back = entry_now(&hub, &ea).await?;
+            assert_eq!(back.state, "queued");
+            assert!(back.reason.as_deref().is_some_and(|w| w.contains(&format!("#{} merged and signed", p1.number))), "{:?}", back.reason);
+            assert_eq!(entry_now(&hub, &eb).await?.state, "ejected");
+            assert_eq!(lands_in_trail(&hub).await?, 1);
+            // Back in the queue with #2 alone: built, tested and merged by its host.
+            step_until(&hub, &lab, &ea, &["landed"], 6).await?;
+            assert!(lab.sim.contains(lab.name, seam::TRUNK, h1) && lab.sim.contains(lab.name, seam::TRUNK, h2) && !lab.sim.contains(lab.name, seam::TRUNK, h3));
+            assert_eq!(lands_in_trail(&hub).await?, 2, "#1's land, then #2's: none twice");
+            let id = ea.clone();
+            let kept = hub.store.call(move |c| Ok(c.query_row(&format!("SELECT {RECORD_COLUMNS} FROM land_records WHERE entry_id = ?1"), [&id], record_row)?)).await?;
+            assert!([p1.number, p2.number].iter().all(|n| kept.landed.contains_key(&format!("#{n}"))), "the record names all the entry carries: {:?}", kept.landed);
+            let m2 = kept.landed.get(&format!("#{}", p2.number)).cloned().unwrap_or_default();
+            let got = super::super::lands::get(&hub, lab.name, &m2).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let carried: Vec<&str> = got.pointer("/land/batch").and_then(Value::as_array).into_iter().flatten().filter_map(|d| d.get("diff").and_then(Value::as_str)).collect();
+            assert_eq!(carried, [format!("#{}", p2.number).as_str()], "{got}");
             Ok(())
         })
     }

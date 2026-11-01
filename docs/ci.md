@@ -8756,10 +8756,14 @@ resolution makes, a comment, a resolution, an approval and each mark of the Revi
     - kiln-cd: `w26_r19_the_land_stage_says_where_the_queue_has_it`.
     - kiln: `w26_r19_a_host_pull_enters_its_hosts_queue_only_when_clear` (GitHub's merge queue and
       GitLab's merge trains through the forge seam's simulator),
-      `w26_r19_a_host_queues_land_is_signed_into_the_trail`, and
+      `w26_r19_a_host_queues_land_is_signed_into_the_trail`,
+      `w26_r19_a_change_its_host_merged_while_held_lands_signed`, and
       `w26_r19_a_host_without_a_queue_lands_through_kilns` (a real mirror beside the simulator:
       merged at the head tested, built again when the trunk moved before the merge, out when the
-      head moved).
+      head moved). Batches: `w26_r19_a_batch_merges_whole_or_not_at_all`,
+      `w26_r19_a_stack_merged_part_way_lands_what_merged`,
+      `w26_r19_a_batch_stops_once_its_merges_are_done` and
+      `w26_r19_what_kiln_lands_of_an_entry_is_signed_once`.
     - The hosting test `w26_r19_d41_lands_through_the_queue`.
     - Playwright: `ship-land.spec.ts`.
   - **Hosts without a queue** (Bitbucket; GitHub without one) land through W28's queue, built with
@@ -8768,16 +8772,21 @@ resolution makes, a comment, a resolution, an approval and each mark of the Revi
     - The entry goes through the queue's own `see` and `build_step` in kiln's mirror: each change's
       head is merged onto the trunk's tip there, and the candidate's workflows run as any
       candidate's do, under `policy.land.checks`.
-    - Once it passes, the batch is decided whole before anything merges: Review's gate is asked
-      again, each change is read on its host, and while nothing has merged, the mirror's trunk
-      (fetched first; if the fetch fails, nothing merges that step) goes through
+    - Once it passes, the batch is decided whole before anything merges: each change is read on
+      its host, Review's gate is asked again of those still open, and while nothing has merged,
+      the mirror's trunk (fetched first; if the fetch fails, nothing merges that step) goes through
       `kiln_ci::land::queue::host_merge`.
       - A trunk that moved builds the candidate again.
       - A head that moved, or a change closed, takes its entry out (`INVALID_MERGE_COMMIT`).
       - The rest of the batch goes back to the queue.
+      - A batch stops only once none of its merges is under way: that merge's result says what
+        merged.
     - Then the host merges each change at the head tested, bottom first. A background merge is
       read on the next step, never waited on. A change already merged counts as merged.
-    - A batch stopped part-way still lands what merged: recorded and signed, not as tested.
+    - A batch stopped part-way still lands what merged: recorded and signed, not as tested. An
+      entry merged whole lands. One merged part-way goes out, held or back to the queue, and what
+      kiln landed of it is signed once: its later land signs only what merged since, and its
+      record names all it carries.
     - Merged whole, each entry is checked against what kiln tested: the tip its merges went onto,
       read in kiln's mirror, is the one before it; the batch's tree is the candidate's. The land
       is recorded with the candidate's runs and signed with `via` naming the route. The statement's
