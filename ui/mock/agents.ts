@@ -1135,6 +1135,167 @@ export function handleFamilySession(ws: WebSocket, id: string): boolean {
 
 /** What the family's agents changed, as their machines report it. */
 const CHANGESETS: Record<string, unknown[]> = {
+  // The lead's own work, its two subagents' and, outside the project, the person's and the agents' own
+  // (docs/agents.md, "Who changed a file, and whose it is"): the Changes tab's Scope and By.
+  "fam-orch": [
+    {
+      path: "crates/kiln/src/plans/planner.rs",
+      tree: "/home/ada/src/kiln",
+      added: 3,
+      removed: 1,
+      at: Date.now() - 120000,
+      hunks: [
+        {
+          old_start: 40,
+          old_lines: 3,
+          new_start: 40,
+          new_lines: 5,
+          lines: [
+            "     let order = plan.steps();",
+            "-    let first = order.first();",
+            "+    // Steps that wait for nothing go first, side by side.",
+            "+    let ready = order.iter().filter(|s| s.needs.is_empty());",
+            "+    let first = ready.clone().next();",
+            "     first.map(Step::start)",
+          ],
+        },
+      ],
+      by: ["main"],
+      place: "project",
+    },
+    {
+      path: "crates/kiln/src/plans/mod.rs",
+      tree: "/home/ada/src/kiln",
+      added: 2,
+      removed: 1,
+      at: Date.now() - 240000,
+      hunks: [
+        {
+          old_start: 3,
+          old_lines: 2,
+          new_start: 3,
+          new_lines: 3,
+          lines: [" pub mod planner;", "-pub mod order;", "+pub mod order;", "+pub mod ready;"],
+        },
+      ],
+      by: ["main", "toolu_planner"],
+      place: "project",
+    },
+    {
+      path: "docs/plans.md",
+      tree: "/home/ada/src/kiln",
+      added: 3,
+      removed: 0,
+      at: Date.now() - 360000,
+      hunks: [
+        {
+          old_start: 88,
+          old_lines: 1,
+          new_start: 88,
+          new_lines: 4,
+          lines: [" ## Steps side by side", "+", "+A step that waits for nothing starts at once; the rest wait for", "+what they need."],
+        },
+      ],
+      by: ["toolu_planner"],
+      place: "project",
+    },
+    {
+      path: "crates/kiln/src/http/quic.rs",
+      tree: "/home/ada/src/kiln",
+      added: 4,
+      removed: 2,
+      at: Date.now() - 540000,
+      hunks: [
+        {
+          old_start: 120,
+          old_lines: 3,
+          new_start: 120,
+          new_lines: 5,
+          lines: [
+            "     let conn = endpoint.connect(addr)?;",
+            "-    let stream = conn.open_bi().await?;",
+            "-    stream.write_all(&req).await?;",
+            "+    let (mut send, recv) = conn.open_bi().await?;",
+            "+    send.write_all(&req).await?;",
+            "+    send.finish()?;",
+            "+    read_answer(recv).await",
+          ],
+        },
+      ],
+      by: ["toolu_opt"],
+      place: "project",
+    },
+    {
+      path: "/home/ada/Projects/hyper-raft/src/log.rs",
+      added: 1,
+      removed: 0,
+      at: Date.now() - 1200000,
+      hunks: [
+        {
+          old_start: 77,
+          old_lines: 2,
+          new_start: 77,
+          new_lines: 3,
+          lines: [" pub fn append(&mut self, e: Entry) -> Index {", "+    debug_assert!(e.term >= self.last_term());", "     self.entries.push(e);"],
+        },
+      ],
+      by: ["main"],
+      place: "user",
+    },
+    {
+      path: "/home/ada/.zshrc",
+      added: 1,
+      removed: 0,
+      at: Date.now() - 1320000,
+      hunks: [
+        {
+          old_start: 41,
+          old_lines: 1,
+          new_start: 41,
+          new_lines: 2,
+          lines: [' export PATH="$HOME/.local/bin:$PATH"', "+export KILN_PLAN_TRACE=1"],
+        },
+      ],
+      by: ["main"],
+      place: "user",
+    },
+    {
+      path: "/home/ada/.claude/projects/-home-ada-src-kiln/memory/plans.md",
+      created: true,
+      added: 2,
+      removed: 0,
+      at: Date.now() - 60000,
+      hunks: [
+        {
+          old_start: 1,
+          old_lines: 0,
+          new_start: 1,
+          new_lines: 2,
+          lines: ["+# Plans", "+- steps that wait for nothing start first"],
+        },
+      ],
+      by: ["main"],
+      place: "agent",
+    },
+    {
+      path: "/tmp/planner-bench/run.sh",
+      created: true,
+      added: 2,
+      removed: 0,
+      at: Date.now() - 660000,
+      hunks: [
+        {
+          old_start: 1,
+          old_lines: 0,
+          new_start: 1,
+          new_lines: 2,
+          lines: ["+#!/bin/sh", "+cargo bench -p kiln planner"],
+        },
+      ],
+      by: ["toolu_planner"],
+      place: "agent",
+    },
+  ],
   "fam-tests": [
     {
       path: "/home/ada/.local/state/kiln/workspaces/kiln-famtests/crates/kiln/src/http/client.rs",

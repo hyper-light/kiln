@@ -50,6 +50,7 @@ export type {
   FileChange,
   FileDiff,
   FileMeta,
+  FilePlace,
   HeldGoals as Held,
   Event as HEvent,
   HookInfo,

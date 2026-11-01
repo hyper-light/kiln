@@ -1,0 +1,271 @@
+/* The Changes tab's Session view (changes.tsx): one grid for everything that lines up. A 44px
+   label column at the panel's edge; values from 58px; totals, stats and ages at the right edge.
+   Flat: hairlines part its rows, a picked row is a tint with a straight 2px edge. */
+.cx-head {
+  margin: 0 -14px;
+  border-top: 1px solid #1f2125;
+  border-bottom: 1px solid #1f2125;
+}
+.cx-mrow {
+  display: flex;
+  align-items: center;
+  min-height: 40px;
+  padding: 0 14px;
+}
+/* What it shows, in the composer's mode words. */
+.cx-modes {
+  display: inline-flex;
+  gap: 16px;
+}
+.cx-modes > button {
+  position: relative;
+  padding: 9px 0;
+  color: #8f929b;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.cx-modes > button[aria-checked="true"] {
+  color: #ededee;
+}
+.cx-modes > button[aria-checked="true"]::after {
+  position: absolute;
+  right: 0;
+  bottom: 4px;
+  left: 0;
+  height: 1px;
+  background: var(--prism);
+  content: "";
+}
+.cx-modes > button:disabled {
+  color: #55585f;
+  cursor: default;
+}
+.cx-view {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 32px;
+  margin-left: auto;
+  color: #a1a4ad;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.cx-view:hover,
+.cx-view[data-state="open"] {
+  color: #ededee;
+}
+.cx-hrow {
+  position: relative;
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr) auto;
+  align-items: center;
+  min-height: 40px;
+  padding: 0 14px;
+  border-top: 1px solid #15171a;
+}
+.cx-hrow:has(> .cx-val[data-state="open"]) {
+  background: rgb(186 176 227 / 7%);
+}
+.cx-hrow:has(> .cx-val[data-state="open"])::before,
+.cx-file[aria-pressed="true"]::before {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 2px;
+  background: #bab0e3;
+  opacity: 0.85;
+  content: "";
+}
+.cx-lab {
+  color: #7d808a;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+.cx-val {
+  display: inline-flex;
+  align-items: center;
+  justify-self: start;
+  gap: 8px;
+  min-width: 0;
+  max-width: 100%;
+  min-height: 34px;
+  color: #e4e5e7;
+  font-size: 12.5px;
+  text-align: left;
+}
+.cx-val > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cx-val > svg {
+  flex: none;
+  color: #a1a4ad;
+}
+.cx-val > .cx-chev {
+  margin-left: -2px;
+  color: #6d7078;
+}
+.cx-total {
+  justify-self: end;
+  min-width: 64px;
+  padding-left: 12px;
+  text-align: right;
+}
+/* Its files: the path's folders give way from the left, so the file's name stays whole. */
+.cx-files {
+  display: flex;
+  flex-direction: column;
+  margin: 0 -14px 14px;
+}
+.cx-file {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 3px 12px;
+  width: 100%;
+  min-height: 40px;
+  padding: 8px 14px;
+  border-bottom: 1px solid #17191d;
+  text-align: left;
+}
+.cx-file:hover {
+  background: #0f1013;
+}
+.cx-file[aria-pressed="true"] {
+  background: rgb(186 176 227 / 7%);
+}
+.cx-path {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  color: #dfe3ea;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.cx-path-dir {
+  flex: 0 1000 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: #7d808a;
+  text-overflow: ellipsis;
+  direction: rtl;
+}
+.cx-path-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cx-path .hx-tag {
+  flex: none;
+  margin-left: 6px;
+}
+.cx-file > .hx-stat {
+  justify-self: end;
+}
+.cx-by {
+  grid-column: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: #8b8e96;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cx-when {
+  grid-column: 2;
+  justify-self: end;
+  color: #6d7078;
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+.cx-band {
+  min-height: 30px;
+  padding: 10px 14px 4px;
+  border-bottom: 1px solid #17191d;
+  color: #6d7078;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+.cx-none {
+  margin: 0 -14px 14px;
+  padding: 14px;
+  border-bottom: 1px solid #17191d;
+  color: #8b8e96;
+  font-size: 12px;
+}
+/* Its menus: Mission control's Actions menu's look, an item's what-it-is under its name. */
+.cx-menu {
+  width: min(330px, calc(100vw - 28px));
+}
+.cx-menu[data-state="closed"] {
+  animation: cx-menu-out 0.14s ease-in forwards;
+}
+@keyframes cx-menu-out {
+  to {
+    opacity: 0;
+    transform: translateY(3px);
+  }
+}
+.cx-menu .menu-item > svg,
+.cx-mark {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  color: #a1a4ad;
+}
+.cx-mark {
+  display: inline-grid;
+  place-items: center;
+  color: #bab0e3;
+}
+.cx-menu .menu-item[data-disabled] {
+  color: #5f626b;
+  cursor: default;
+}
+.cx-menu .menu-item[data-disabled]:hover {
+  background: none;
+}
+.cx-item {
+  flex: 1;
+  min-width: 0;
+}
+.cx-item small {
+  display: block;
+  color: #7d808a;
+  font-size: 10.5px;
+}
+.cx-n {
+  flex: none;
+  padding-left: 14px;
+  color: #6d7078;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+.cx-menu-label {
+  padding: 8px 10px 4px;
+  color: #6d7078;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+@media (prefers-reduced-motion: reduce) {
+  .cx-menu[data-state="closed"] {
+    animation: none;
+  }
+}

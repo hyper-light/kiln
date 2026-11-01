@@ -835,6 +835,24 @@ composer → More options → Workspace → Own volume; `agents.start` with `wor
   loopback on macOS. `GET /api/harness/workspaces` says which machines can, and why each other
   can't. kiln keeps one Slates instance, `kiln`, per machine (two shards).
 
+## The Changes tab
+
+An agent's Changes tab shows what it changed, its change request above (see "Change requests from
+agents"). Its head says what's shown, a row each, each choice in a menu:
+
+- **Session**: the files it changed since it began, each against how it was before. Commits and
+  Compare are turned off: not in this version of kiln yet.
+- **Scope**: Project at first, then User, then All (see "Who changed a file, and whose it is"). The
+  browser keeps the choice.
+- **By**: everyone, the agent itself, or one of its harness's subagents, each with how many of the
+  files at that scope it changed. Narrowed to one, a file someone else changed too says who.
+
+The head's last row carries what's shown in all (`+added −removed`), and Sort (by path, latest change,
+most changed, new, changed or deleted, or who changed it) sits at its right. Its files are a flat
+list, each saying on the line under it who changed it, and which worktree it's in when that isn't its
+folder's; the person's files elsewhere and the agents' own are under bands of their own. A file picked
+shows its diff alone; picked again, every file's. The tab's count is the files its scope shows.
+
 ## Who changed a file, and whose it is
 
 Each file of a session's changeset (`changes {files}`, `agents.result`'s `changes.files`) says who

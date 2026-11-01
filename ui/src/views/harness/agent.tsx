@@ -26,6 +26,7 @@ import { useAgentActions } from "./actions";
 import { MoveDialog, movable } from "./move";
 import { SettingsSheet, useAttachments, type Attachments } from "./controls";
 import { agentLabel, changesetOf, editsOf, useSameList } from "./derive";
+import { inScope, useScope } from "./changes";
 import { useListener } from "./dom";
 import { FindBar, findIn, type FindNow } from "./find";
 import { EarlierMatches } from "./said";
@@ -693,7 +694,9 @@ function PhoneTabs({ store, tab, onTab }: { store: SessionStore; tab: PhoneTab; 
   // Counted from the conversation's edits only when the server sends no changeset.
   const events = useSession(store, (s) => (s.changes ? NO_EVENTS : s.events));
   const edits = useSameList(React.useMemo(() => editsOf(events), [events]));
-  const fileCount = React.useMemo(() => (changes ? changes.length : changesetOf(edits).length), [changes, edits]);
+  // What the Changes tab counts is what its scope shows: this project's files at first.
+  const [scope] = useScope();
+  const fileCount = React.useMemo(() => (changes ? changes.filter((f) => inScope(f, scope)).length : changesetOf(edits).length), [changes, edits, scope]);
   const todos = useSession(store, (s) => s.state?.todos ?? NO_TODOS);
   const todosDone = todos.filter((t) => t.status === "completed").length;
   // A plan waiting on your review: its tab says so (review.tsx).
