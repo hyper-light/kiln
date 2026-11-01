@@ -13,6 +13,7 @@
 
 pub mod action;
 pub mod diag;
+pub mod diff;
 pub mod flow;
 pub mod front;
 pub mod ir;
@@ -25,6 +26,7 @@ pub mod yaml;
 use sha2::{Digest as _, Sha256};
 
 pub use diag::{Diag, Severity};
+pub use diff::action_diff;
 pub use ir::{Action, Job, Step, Workflow};
 pub use overlay::Overlay;
 
