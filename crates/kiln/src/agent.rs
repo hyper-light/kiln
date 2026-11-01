@@ -1233,6 +1233,10 @@ pub(crate) fn runner_conversation_upkeep() -> crate::convo::store::Upkeep {
 
 pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> { run_in(o, shutdown, crate::runner::processes::Admission::production()).await }
 
+/// How long a finished leg's result waits for its log's End to be taken by the server, so a leg
+/// that says it's over has its whole log; past it, the result goes anyway (the End follows).
+const LOG_END_BEFORE_RESULT: Duration = Duration::from_secs(30);
+
 pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::runner::processes::Admission) -> anyhow::Result<()> {
     anyhow::ensure!(o.instance.as_deref() != Some(crate::upgrade::MAIN), "U17: instance name main is reserved for the default runner; omit --instance (retained instance files are not moved)");
     // U05: resolve local host configuration once, before creating any startup state or
@@ -3438,7 +3442,6 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                             #[cfg(not(target_os = "linux"))]
                             let result = leg.run().await;
                             execution.stop().await;
-                            let _ = done.send((result.clone(), attempt)).await;
                             result
                           }).await;
                           // Logical outbox debt retains original bytes/binding only.
@@ -3446,8 +3449,17 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                           drop(scope);
                             if let Some(producer)=producer {
                                 // Actual joined runtime, never grace-stop/queue-empty inference.
-                                if let Err(error)=producer.end(&strict_up,&result).await{tracing::warn!(error=%format!("{error:#}"),"original producer End remains incomplete/pending");}
+                                // The End goes before the leg's result: once a leg says it's over,
+                                // its log is whole (W05; logs ride their own lane, sent on heartbeats,
+                                // so a result sent first was read with the last step's lines missing).
+                                // A server that doesn't take the End in time doesn't hold the result.
+                                match crate::rt::timeout(LOG_END_BEFORE_RESULT, producer.end(&strict_up,&result)).await {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(error)) => tracing::warn!(error=%format!("{error:#}"),"original producer End remains incomplete/pending"),
+                                    Err(_) => tracing::warn!(job=%result.job,"the leg's log End wasn't taken in time; its result goes ahead of it"),
+                                }
                             }
+                            let _ = done.send((result, attempt)).await;
                         });
                         continue;
                     }
