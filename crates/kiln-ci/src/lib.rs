@@ -52,6 +52,7 @@ pub mod oidc;
 pub mod pipelines;
 pub mod plan;
 pub mod policy;
+pub mod releases;
 pub mod results;
 pub mod review;
 pub mod runner;
