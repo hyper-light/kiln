@@ -83,4 +83,4 @@ none_newer?: boolean, } | { "type": "control", id: string, value?: JsonValue | n
  * The account that reached it (`account_id`): a session signed in as another by now, as
  * it knows itself, takes no hold for it. None from a server that didn't say.
  */
-account?: string, };
+account?: string, } | { "type": "pause", on: boolean, task?: string, };

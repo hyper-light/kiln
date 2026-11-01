@@ -1981,6 +1981,7 @@ impl Registry {
                         left_behind: 0,
                         reach: spec.reach.clone(),
                         pause: None,
+                        frozen: None,
                         room_wait: None,
                         last_turn: None,
                         keep_off: false,
@@ -2311,6 +2312,21 @@ impl Registry {
     /// message) its inbox's answer to wait for ([`Registry::settle`]), so a sender that goes on
     /// meanwhile (a viewer's socket) waits for nothing.
     pub async fn dispatch(&self, hub: &Hub, id: &str, c: Command) -> Pending {
+        // A person's pause of a session holds the subagents kiln started under it too, and resuming
+        // it lets them go: each still going is sent its own, its answer not waited for.
+        if let Command::Pause { on, task: None } = &c {
+            let all = self.list();
+            for sub in super::lineage::subagents_under(&all, id) {
+                if all.iter().any(|i| i.id == sub && i.status != Status::Exited) {
+                    let _ = Box::pin(self.dispatch_one(hub, &sub, Command::Pause { on: *on, task: None })).await;
+                }
+            }
+        }
+        Box::pin(self.dispatch_one(hub, id, c)).await
+    }
+
+    /// [`Registry::dispatch`], to session `id` alone.
+    async fn dispatch_one(&self, hub: &Hub, id: &str, c: Command) -> Pending {
         let Some(loc) = self.location(id) else { return Pending::Now(Sent::NoSession) };
         // Kiln's own (`goals::keep`), kept here: its harness has nothing to do with it.
         if let Command::Control { id: control, value } = &c

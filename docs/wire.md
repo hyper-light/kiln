@@ -683,6 +683,7 @@ travels in `HarnessCmd`.
 | `MaxSubagents` | command, refused while away | As `AutoResume`. | Fire-and-forget. |
 | `MoveOnLimit` | command, refused while away | As `AutoResume`. | Fire-and-forget. |
 | `LimitHold` | command, refused while away | The server works the hold out again once the machine is back. | Fire-and-forget. |
+| `Pause` | command, refused while away | A person's pause of a session (its processes, held by its machine's pacer) or of one of its harness's subagents (held at its next tool call), or its end: they press it again if it didn't apply. The server sends a session's to the subagents kiln started under it too. | New. A runner from before it can't read it, and says so. |
 
 ## Updates of a session: `Update`
 

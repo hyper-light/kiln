@@ -281,7 +281,7 @@ mod tests {
         assert_eq!(stand(&info("w3", Status::Idle)), "idle");
         assert_eq!(stand(&Info { queued: 1, ..info("w4", Status::Idle) }), "working", "a message waits in its queue");
         let sub =
-            |status: &str| crate::harness::session::SubagentBrief { id: "s".into(), tool_id: None, description: "audit".into(), status: status.into(), parent_task: None, started: 1, ended: None, last_tool: None };
+            |status: &str| crate::harness::session::SubagentBrief { id: "s".into(), tool_id: None, description: "audit".into(), status: status.into(), parent_task: None, started: 1, ended: None, last_tool: None, pausable: false, paused_at: None };
         assert_eq!(stand(&Info { subagents: vec![sub("running")], ..info("w4b", Status::Idle) }), "working", "a subagent it sent off still works");
         assert_eq!(stand(&Info { subagents: vec![sub("completed")], ..info("w4c", Status::Idle) }), "idle", "its subagents are done");
         assert_eq!(stand(&info("w5", Status::Waiting)), "needs_you");

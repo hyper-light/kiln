@@ -56,6 +56,10 @@ export interface SubagentNode {
   ended?: number;
   /** Where its thread opens: its agent's page, it shown there. */
   href: string;
+  /** A person paused it: its own pause, or one over it (its processes', or its harness's hold on a subagent above it). */
+  paused?: "own" | "above";
+  /** A person can pause it from here, or resume its own pause: it goes, its harness can hold it, and no pause over it holds it. */
+  pausable: boolean;
 }
 
 /** A row's piece of the path along one lane: from its top or its mark, to its mark or its bottom. */
@@ -92,6 +96,8 @@ export function briefsOf(tasks: readonly Task[]): Brief[] {
     started: t.started,
     ended: t.ended,
     last_tool: t.last_tool,
+    pausable: t.pausable,
+    paused_at: t.paused_at,
     summary: t.summary,
   }));
 }
@@ -116,7 +122,7 @@ export const takesMessage = (n: Pick<SubagentNode, "stand">) => n.stand !== "don
 const askOf = (approvals: readonly ApprovalBrief[], b: Brief): ApprovalBrief | undefined =>
   approvals.find((p) => p.agent != null && (p.agent === b.id || p.agent === b.tool_id || p.agent === b.description));
 
-function harnessStand(b: Brief, ask: ApprovalBrief | undefined): NodeStand {
+function harnessStand(b: Brief, ask: ApprovalBrief | undefined, paused: boolean): NodeStand {
   if (ask) return "needs";
   switch (b.status) {
     case "completed":
@@ -127,12 +133,13 @@ function harnessStand(b: Brief, ask: ApprovalBrief | undefined): NodeStand {
     case "killed":
       return "stopped";
     default:
-      // Running, waiting to start, or paused for a request already answered.
-      return "working";
+      // Running, waiting to start, or paused for a request already answered; or held by a person's pause.
+      return paused ? "paused" : "working";
   }
 }
 
-function kilnStand(a: AgentInfo): NodeStand {
+function kilnStand(a: AgentInfo, paused = false): NodeStand {
+  if (paused && a.status !== "exited") return "paused";
   switch (standOf(a, undefined)) {
     case "needs":
       return "needs";
@@ -177,16 +184,18 @@ export function threadHref(root: string, owner: string, id: string): string {
 export function subagentTree(root: AgentInfo, list: readonly AgentInfo[]): SubagentNode[] {
   const out: SubagentNode[] = [];
   const seen = new Set<string>();
-  const walk = (owner: AgentInfo, parent: string | null, depth: number) => {
+  // `above`: a person paused something over these (the session they're in, a subagent they're under).
+  const walk = (owner: AgentInfo, parent: string | null, depth: number, above: boolean) => {
     const briefs: Brief[] = (owner.subagents ?? []).filter((b) => !list.some((a) => a.id === b.id && a.subagent === true));
     const ids = new Set(briefs.map((b) => b.id));
     const harness = (under: string | undefined) => briefs.filter((b) => (under ? b.parent_task === under : !b.parent_task || !ids.has(b.parent_task)));
-    const place = (b: Brief, parentKey: string | null, d: number) => {
+    const place = (b: Brief, parentKey: string | null, d: number, over: boolean) => {
       const key = `${owner.id}/${b.id}`;
       if (seen.has(key)) return;
       seen.add(key);
       const ask = askOf(owner.approvals, b);
-      const stand = harnessStand(b, ask);
+      const own = b.paused_at != null;
+      const stand = harnessStand(b, ask, own || over);
       // What it's at: its harness's summary of it where the live state has one (Claude Code's progress, or what it reported), else its last tool.
       const line = ask ? askWords(ask) : stand === "done" ? (b.summary ?? "") : b.summary || b.last_tool || "";
       out.push({
@@ -206,18 +215,21 @@ export function subagentTree(root: AgentInfo, list: readonly AgentInfo[]): Subag
         started: b.started,
         ended: b.ended,
         href: threadHref(root.id, owner.id, b.id),
+        paused: own ? "own" : over ? "above" : undefined,
+        pausable: !!b.pausable && !over,
       });
-      for (const c of harness(b.id).sort((x, y) => x.started - y.started)) place(c, key, d + 1);
+      for (const c of harness(b.id).sort((x, y) => x.started - y.started)) place(c, key, d + 1, over || own);
     };
     const kiln = kilnSubagentsOf(list, owner.id);
     const items = [
-      ...harness(undefined).map((b) => ({ at: b.started, go: () => place(b, parent, depth) })),
+      ...harness(undefined).map((b) => ({ at: b.started, go: () => place(b, parent, depth, above) })),
       ...kiln.map((a) => ({
         at: a.created_at,
         go: () => {
           if (seen.has(a.id) || a.id === root.id) return;
           seen.add(a.id);
-          const stand = kilnStand(a);
+          const own = a.frozen != null;
+          const stand = kilnStand(a, own || above);
           const line = kilnLine(a, stand);
           out.push({
             key: a.id,
@@ -235,14 +247,16 @@ export function subagentTree(root: AgentInfo, list: readonly AgentInfo[]): Subag
             started: a.turn_started ?? a.created_at,
             ended: stand === "done" || stand === "failed" || stand === "stopped" ? a.last_activity : undefined,
             href: threadHref(root.id, owner.id, a.id),
+            paused: own ? "own" : above ? "above" : undefined,
+            pausable: a.status !== "exited" && !above,
           });
-          walk(a, a.id, depth + 1);
+          walk(a, a.id, depth + 1, above || own);
         },
       })),
     ].sort((x, y) => x.at - y.at);
     for (const it of items) it.go();
   };
-  walk(root, null, 0);
+  walk(root, null, 0, root.frozen != null);
   return out;
 }
 

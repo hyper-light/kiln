@@ -576,6 +576,15 @@ pub struct Task {
     /// Messages waiting for it to finish what it's doing, oldest first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queue: Vec<QueueItem>,
+    /// A person can pause it (`Command::Pause` with its `task`): its harness holds it at its next
+    /// tool call (Claude Code's subagents).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pausable: bool,
+    /// A person paused it (unix ms): its next tool call, and those of the subagents under it, wait
+    /// until they resume it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub paused_at: Option<i64>,
 }
 
 fn is_zero_u64(n: &u64) -> bool {
@@ -1315,6 +1324,11 @@ pub struct State {
     /// words by, said in the same state as its queue (CP-T3.2, the fourteenth adversarial check's).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub given: Vec<Given>,
+    /// A person paused it (unix ms, `Command::Pause`): its processes stopped where they are, held
+    /// by its machine's pacer (`crate::headroom::pause`) until they resume it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub frozen: Option<i64>,
 }
 
 /// One of kiln's own messages its harness was handed (`State::given`).
@@ -1884,6 +1898,16 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(test, ts(optional))]
         account: Option<String>,
+    },
+    /// A person pauses it (`on`), or resumes it. Without `task`: its processes stop where they are,
+    /// held by its machine's pacer under its guard, and so does every subagent kiln started under
+    /// it (the server sends each its own). With `task`: that subagent of its harness's own
+    /// (`Task::pausable`) is held at its next tool call, and the subagents under it with it.
+    Pause {
+        on: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
+        task: Option<String>,
     },
 }
 

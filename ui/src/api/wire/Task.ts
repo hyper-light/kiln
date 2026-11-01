@@ -62,4 +62,14 @@ via?: string,
 /**
  * Messages waiting for it to finish what it's doing, oldest first.
  */
-queue?: Array<QueueItem>, };
+queue?: Array<QueueItem>, 
+/**
+ * A person can pause it (`Command::Pause` with its `task`): its harness holds it at its next
+ * tool call (Claude Code's subagents).
+ */
+pausable?: boolean, 
+/**
+ * A person paused it (unix ms): its next tool call, and those of the subagents under it, wait
+ * until they resume it.
+ */
+paused_at?: number, };

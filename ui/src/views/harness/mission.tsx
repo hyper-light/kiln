@@ -8,7 +8,7 @@ import * as React from "react";
 import "./harness.css";
 import "./mission.css";
 import { Link, useNavigate } from "@/lib/router";
-import { ArrowUpRight, ChevronDown, ChevronRight, ChevronUp, ListChecks, Pause, X } from "lucide-react";
+import { ArrowUpRight, ChevronDown, ChevronRight, ChevronUp, ListChecks, X } from "lucide-react";
 import { api } from "@/api/client";
 import { clientId, harnessApi, type AgentInfo, type ApprovalBrief } from "@/api/harness";
 import { plansApi } from "@/api/plans";
@@ -51,6 +51,7 @@ import { subagentsAtWork, throughSubagents } from "./tasks";
 import { Stands } from "./stands";
 import { KindGlyph } from "./kind-glyph";
 import { NODE_WORD, subagentRows, type SubagentRow } from "./subagent-tree";
+import { PauseButton } from "./subagent-pause";
 import { TreePath } from "./tree-path";
 
 const WORD: Record<Stand, string> = {
@@ -342,9 +343,7 @@ function MissionNode({ r, owner, rowAsk }: { r: SubagentRow; owner: AgentInfo | 
       <span className="ms-node-actions">
         <span className="ms-decide">{ask && owner && <Decide a={owner} ap={ask} to={r.href} />}</span>
         <span className="ms-tail">
-          <button type="button" className="ms-go" disabled={r.stand === "done" || r.stand === "failed" || r.stand === "stopped"} aria-label={`Pause ${r.name}`}>
-            <Pause size={15} />
-          </button>
+          <PauseButton n={r} className="ms-go" size={15} />
           <button type="button" className="ms-go" onClick={open} aria-label={`Open ${r.name}`}>
             <ArrowUpRight size={16} />
           </button>

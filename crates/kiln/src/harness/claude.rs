@@ -183,6 +183,14 @@ struct Streamed {
 /// most the agent may run at once (`State::max_subagents`).
 const SUBAGENTS_HOOK: &str = "kiln-subagents";
 
+/// The hook kiln registers on every tool call (`initialize`): a call of a subagent a person paused
+/// (`Task::paused_at`), or of one under it, waits for its answer until they resume it.
+const HOLD_HOOK: &str = "kiln-hold";
+
+/// How long Claude Code waits for that answer (seconds): a pause longer than this lets the call go.
+/// Under the longest a JavaScript timer waits (24.8 days).
+const HOLD_FOR_S: u64 = 7 * 24 * 3600;
+
 /// Its whole state is plain data, written out when this process re-executes itself (an in-place
 /// upgrade) and read back by the next image, which goes on with the same CLI process.
 #[derive(Serialize, Deserialize)]
@@ -287,6 +295,10 @@ pub struct Claude {
     /// it ended): its conversation's parent, and its marker's key, one marker for both.
     #[serde(default)]
     compaction: Option<(Option<String>, String)>,
+    /// Tool calls of paused subagents ([`HOLD_HOOK`]), waiting for their answer: the hook's
+    /// request, and the subagent the call is in.
+    #[serde(default)]
+    held_calls: Vec<(String, String)>,
 }
 
 impl Claude {
@@ -336,6 +348,7 @@ impl Claude {
             relay_calls: HashMap::new(),
             waking: BTreeSet::new(),
             compaction: None,
+            held_calls: Vec::new(),
         }
     }
 
@@ -709,8 +722,10 @@ impl Claude {
             .map(|s| (*s).to_owned())
             .collect();
         core.touch_meta();
-        // Its Agent tool asks kiln first (whatever its permissions): the most subagents it runs.
-        self.request(core, Pending::Initialize, json!({"subtype": "initialize", "hooks": {"PreToolUse": [{"matcher": "Agent|Task", "hookCallbackIds": [SUBAGENTS_HOOK]}]}}));
+        // Its Agent tool asks kiln first (whatever its permissions): the most subagents it runs. And
+        // every tool call does: a paused subagent's waits.
+        let hooks = json!({"PreToolUse": [{"matcher": "Agent|Task", "hookCallbackIds": [SUBAGENTS_HOOK]}, {"hookCallbackIds": [HOLD_HOOK], "timeout": HOLD_FOR_S}]});
+        self.request(core, Pending::Initialize, json!({"subtype": "initialize", "hooks": hooks}));
     }
 
     /// The process ended: nothing in flight survives it.
@@ -718,6 +733,7 @@ impl Claude {
         self.turn = false;
         self.inflight.clear();
         self.pending.clear();
+        self.held_calls.clear();
         self.asks.clear();
         // Messages it was passing on to its subagents didn't get there.
         let unsent: Vec<String> = self.relays.drain().flat_map(|(_, q)| q).chain(self.relay_calls.drain().map(|(_, (_, m))| m)).collect();
@@ -816,8 +832,9 @@ impl Claude {
                     self.request(core, Pending::StopTask, json!({"subtype": "stop_task", "task_id": task}));
                 }
             }
-            // A pause's commands are the session's (`harness::pause`).
-            Command::Resume | Command::AutoResume { .. } | Command::PauseAt { .. } | Command::MaxSubagents { .. } | Command::MoveOnLimit { .. } | Command::LimitHold { .. } => {}
+            // A pause's commands are the session's (`harness::pause`), as is a person's of the whole of it.
+            Command::Resume | Command::AutoResume { .. } | Command::PauseAt { .. } | Command::MaxSubagents { .. } | Command::MoveOnLimit { .. } | Command::LimitHold { .. } | Command::Pause { task: None, .. } => {}
+            Command::Pause { on, task: Some(task) } => self.pause_subagent(core, &task, on),
             Command::SetEffort { effort } => {
                 self.request(core, Pending::ApplySettings, json!({"subtype": "apply_flag_settings", "settings": {"effortLevel": effort}}));
                 core.state.effort = effort;
@@ -1601,6 +1618,33 @@ impl Claude {
         self.drain_queue(core);
     }
 
+    // ------------------------------------------------------------------ a person's pauses
+
+    /// A person pauses subagent `task` (its next tool call, and those of the subagents under it,
+    /// wait for their answer), or resumes it: what waited goes on, unless a pause above it holds it.
+    fn pause_subagent(&mut self, core: &mut Core, task: &str, on: bool) {
+        let Some(t) = core.state.tasks.iter().position(|t| t.subagent() && (t.id == task || t.tool_id.as_deref() == Some(task))) else {
+            self.notice(core, Level::Warn, "Not paused: it has no such subagent.".to_owned(), None);
+            return;
+        };
+        if let Some(t) = core.state.tasks.get_mut(t) {
+            t.paused_at = on.then(Core::now);
+        }
+        core.touch_state();
+        if !on {
+            self.release_held(core);
+        }
+    }
+
+    /// The calls held for a pause that no longer holds them get their answer, and go on.
+    fn release_held(&mut self, core: &mut Core) {
+        let (still, free): (Vec<_>, Vec<_>) = std::mem::take(&mut self.held_calls).into_iter().partition(|(_, task)| paused(core, task));
+        self.held_calls = still;
+        for (req, _) in free {
+            core.write(&json!({"type": "control_response", "response": {"subtype": "success", "request_id": req, "response": {}}}));
+        }
+    }
+
     // ------------------------------------------------------------------ messages to subagents
 
     /// How a person's message reaches subagent `t` now. Claude Code takes none for a subagent
@@ -1780,6 +1824,7 @@ impl Claude {
             "control_cancel_request" => {
                 if let Some(id) = str_of(&v, "request_id") {
                     self.asks.remove(id);
+                    self.held_calls.retain(|(r, _)| r != id);
                     if let Some(a) = core.take_approval(id)
                         && let Some(tid) = a.tool_id
                     {
@@ -2156,6 +2201,13 @@ impl Claude {
     /// may run at once (`State::max_subagents`), counting those running and those it let start
     /// that haven't yet. Anything else goes on as asked.
     fn hook_callback(&mut self, core: &mut Core, id: &str, req: &Value) {
+        // A paused subagent's call waits: answered when it's resumed (`release_held`).
+        if str_of(req, "callback_id") == Some(HOLD_HOOK)
+            && let Some(task) = call_task(core, req).filter(|t| paused(core, t))
+        {
+            self.held_calls.push((id.to_owned(), task));
+            return;
+        }
         let mut out = json!({});
         if str_of(req, "callback_id") == Some(SUBAGENTS_HOOK) {
             let running = core.state.tasks.iter().filter(|t| t.live() && t.class.as_deref() == Some("agent") && !t.id.starts_with(super::survivors::LEFT)).count();
@@ -3637,6 +3689,34 @@ impl McpAdd {
     }
 }
 
+/// The subagent a hook's tool call (`req`) is in, by its task's id: the one the hook names
+/// (`agent_id`), else the one whose conversation the call is in (its spawning call's). None: the
+/// agent's own call.
+fn call_task(core: &Core, req: &Value) -> Option<String> {
+    let input = req.get("input");
+    let named = input.and_then(|i| str_of(i, "agent_id")).and_then(|a| core.state.tasks.iter().find(|t| t.id == a || t.tool_id.as_deref() == Some(a)));
+    let found = named.or_else(|| {
+        let call = str_of(req, "tool_use_id").or_else(|| input.and_then(|i| str_of(i, "tool_use_id")))?;
+        let spawn = core.get(call)?.parent.clone()?;
+        core.state.tasks.iter().find(|t| t.tool_id.as_deref() == Some(spawn.as_str()))
+    });
+    found.filter(|t| t.subagent()).map(|t| t.id.clone())
+}
+
+/// Subagent `task`, or one it's under, is paused by a person (`Task::paused_at`).
+fn paused(core: &Core, task: &str) -> bool {
+    let mut at = core.state.tasks.iter().find(|t| t.id == task);
+    // A chain no deeper than the tasks there are: a loop of parents ends.
+    for _ in 0..=core.state.tasks.len() {
+        let Some(t) = at else { return false };
+        if t.paused_at.is_some() {
+            return true;
+        }
+        at = t.parent_task.as_deref().and_then(|p| core.state.tasks.iter().find(|u| u.id == p));
+    }
+    false
+}
+
 fn set_tool_status(core: &mut Core, id: &str, status: ToolStatus) {
     if let Some(ev) = core.get_mut(id)
         && let Body::Tool(t) = &mut ev.body
@@ -4483,6 +4563,73 @@ mod tests {
         c.line(&mut core, &json!({"type": "control_request", "request_id": "h7", "request": {"subtype": "hook_callback", "callback_id": "other", "input": {}}}).to_string());
         let v: Value = serde_json::from_str(core.take_writes().first().map(String::as_str).unwrap_or("{}"))?;
         assert_eq!(v.pointer("/response/response"), Some(&json!({})));
+        Ok(())
+    }
+
+    /// A person pauses one of its subagents: its next tool call, and those of a subagent under it,
+    /// wait for kiln's answer until they resume it; the agent's own calls, and another subagent's,
+    /// go on as before.
+    #[test]
+    fn a_paused_subagent_s_next_tool_call_waits_until_it_s_resumed_and_so_do_those_under_it() -> anyhow::Result<()> {
+        let mut c = Claude::new(false);
+        let mut core = Core::new();
+        c.start(&mut core);
+        let init: Value = serde_json::from_str(core.take_writes().first().map(String::as_str).unwrap_or("{}"))?;
+        // Every tool call asks kiln first, for as long as a pause may last.
+        assert_eq!(init.pointer("/request/hooks/PreToolUse/1"), Some(&json!({"hookCallbackIds": [HOLD_HOOK], "timeout": HOLD_FOR_S})));
+        for l in [
+            // Two subagents, one under the first, and their next calls; and one of the agent's own.
+            r#"{"type":"assistant","message":{"id":"msg_1","model":"m","content":[{"type":"tool_use","id":"toolu_5","name":"Agent","input":{"description":"Audit","prompt":"audit","run_in_background":true}},{"type":"tool_use","id":"toolu_6","name":"Agent","input":{"description":"Docs","prompt":"docs","run_in_background":true}}]},"parent_tool_use_id":null}"#,
+            r#"{"type":"system","subtype":"task_started","task_id":"a5","tool_use_id":"toolu_5","description":"Audit","task_type":"local_agent","is_backgrounded":true}"#,
+            r#"{"type":"system","subtype":"task_started","task_id":"a6","tool_use_id":"toolu_6","description":"Docs","task_type":"local_agent","is_backgrounded":true}"#,
+            r#"{"type":"assistant","message":{"id":"msg_2","model":"m","content":[{"type":"tool_use","id":"toolu_8","name":"Agent","input":{"description":"Deeper","prompt":"deeper"}}]},"parent_tool_use_id":"toolu_5"}"#,
+            r#"{"type":"system","subtype":"task_started","task_id":"a8","tool_use_id":"toolu_8","parent_task_id":"a5","description":"Deeper","task_type":"local_agent"}"#,
+            r#"{"type":"assistant","message":{"id":"msg_3","model":"m","content":[{"type":"tool_use","id":"toolu_7","name":"Bash","input":{"command":"cargo test"}}]},"parent_tool_use_id":"toolu_5"}"#,
+            r#"{"type":"assistant","message":{"id":"msg_4","model":"m","content":[{"type":"tool_use","id":"toolu_9","name":"Read","input":{"file_path":"a.rs"}}]},"parent_tool_use_id":"toolu_8"}"#,
+            r#"{"type":"assistant","message":{"id":"msg_5","model":"m","content":[{"type":"tool_use","id":"toolu_10","name":"Read","input":{"file_path":"b.md"}}]},"parent_tool_use_id":"toolu_6"}"#,
+            r#"{"type":"assistant","message":{"id":"msg_6","model":"m","content":[{"type":"tool_use","id":"toolu_11","name":"Bash","input":{"command":"git status"}}]},"parent_tool_use_id":null}"#,
+        ] {
+            c.line(&mut core, l);
+        }
+        let _ = core.take_writes();
+        // Claude Code's hook for a call, and kiln's answer to it, if it gave one.
+        let call = |c: &mut Claude, core: &mut Core, req: &str, input: Value, tool: Option<&str>| -> Option<Value> {
+            let mut r = json!({"subtype": "hook_callback", "callback_id": HOLD_HOOK, "input": input});
+            if let (Some(t), Some(o)) = (tool, r.as_object_mut()) {
+                o.insert("tool_use_id".into(), json!(t));
+            }
+            c.line(core, &json!({"type": "control_request", "request_id": req, "request": r}).to_string());
+            core.take_writes().first().and_then(|w| serde_json::from_str(w).ok())
+        };
+        let pre = json!({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {}});
+
+        c.command(&mut core, Command::Pause { on: true, task: Some("a5".into()) });
+        assert!(core.state.tasks.iter().any(|t| t.id == "a5" && t.paused_at.is_some()));
+        assert_eq!(call(&mut c, &mut core, "h1", pre.clone(), Some("toolu_7")), None, "Audit's call waits");
+        assert_eq!(call(&mut c, &mut core, "h2", pre.clone(), Some("toolu_9")), None, "so does that of the subagent under it");
+        for (req, tool) in [("h3", "toolu_10"), ("h4", "toolu_11")] {
+            let v = call(&mut c, &mut core, req, pre.clone(), Some(tool));
+            assert_eq!(v.as_ref().and_then(|v| v.pointer("/response/request_id")), Some(&json!(req)), "Docs's call and the agent's own go on");
+        }
+        // Resumed: each call that waited goes on, answered as any other is.
+        c.command(&mut core, Command::Pause { on: false, task: Some("a5".into()) });
+        let answered: Vec<Value> = core.take_writes().iter().filter_map(|w| serde_json::from_str(w).ok()).collect();
+        assert_eq!(answered.iter().map(|v| v.pointer("/response/request_id").cloned().unwrap_or_default()).collect::<Vec<_>>(), [json!("h1"), json!("h2")]);
+        assert!(answered.iter().all(|v| v.pointer("/response/response") == Some(&json!({}))));
+
+        // One the hook names itself (`agent_id`), paused by its spawning call, under a pause of its
+        // own and one above: resuming the one above leaves it waiting.
+        c.command(&mut core, Command::Pause { on: true, task: Some("a5".into()) });
+        c.command(&mut core, Command::Pause { on: true, task: Some("toolu_8".into()) });
+        let named = json!({"hook_event_name": "PreToolUse", "agent_id": "a8", "tool_name": "Read", "tool_input": {}});
+        assert_eq!(call(&mut c, &mut core, "h5", named, None), None);
+        c.command(&mut core, Command::Pause { on: false, task: Some("a5".into()) });
+        assert!(core.take_writes().is_empty(), "its own pause still holds it");
+        // Called off by Claude Code (its subagent stopped): there's nothing to answer.
+        c.line(&mut core, r#"{"type":"control_cancel_request","request_id":"h5"}"#);
+        c.command(&mut core, Command::Pause { on: false, task: Some("a8".into()) });
+        assert!(core.take_writes().is_empty());
+        assert!(core.state.tasks.iter().all(|t| t.paused_at.is_none()));
         Ok(())
     }
 

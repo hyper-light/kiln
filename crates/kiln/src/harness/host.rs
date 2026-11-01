@@ -2223,6 +2223,7 @@ pub fn refusal(id: &str, spec: &Spec, error: &str) -> Vec<super::core::Update> {
         left_behind: 0,
         reach: spec.reach.clone(),
         pause: None,
+        frozen: None,
         room_wait: None,
         last_turn: None,
         keep_off: false,

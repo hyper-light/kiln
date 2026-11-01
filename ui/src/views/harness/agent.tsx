@@ -11,7 +11,7 @@ import * as React from "react";
 import "./harness.css";
 import "./console.css";
 import { Link, Navigate, useNavigate, useParams, useSearchParams } from "@/lib/router";
-import { ArrowLeft, ChevronRight, GitFork, Pause, RotateCcw, Shield, X } from "lucide-react";
+import { ArrowLeft, ChevronRight, GitFork, RotateCcw, Shield, X } from "lucide-react";
 import { clientId, harnessApi, lastTurnFrom, sessionStore, useSession, useSessionReady, useStopAt } from "@/api/harness";
 import type { AgentInfo, Approval, Attachment, Command, FileChange, HEvent, Meta, SendMode, SessionStore, Task, Todo } from "@/api/harness";
 import { harnessSessionsRes, useRes } from "@/lib/data";
@@ -37,6 +37,7 @@ import { PausedLine } from "./pause";
 import { useMarkSeen } from "./seen";
 import { ActivityLine } from "./background";
 import { ThreadFromContext, Timeline, type ReplyTarget } from "./timeline";
+import { PauseButton } from "./subagent-pause";
 import { BesideTerminals, openBeside as openTerminal } from "./beside";
 import { useDrafts } from "./state";
 import { PlanSourceContext } from "@/views/plans/save";
@@ -310,7 +311,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
         />
       )}
       {findOpen && dropped > 0 && <EarlierMatches agent={subId ?? id} q={findQ} before={findEvents[0]?.at} />}
-      {path && <ThreadCrumbs crumbs={path.crumbs} sub={sub} onClose={mainThread} />}
+      {path && <ThreadCrumbs crumbs={path.crumbs} here={path.here} sub={sub} onClose={mainThread} />}
       <ThreadFromContext.Provider value={from}>
         {sub ? (
           <React.Suspense fallback={<LoadingMark />}>
@@ -550,8 +551,10 @@ function useThreadPath(
  * its thread opens (the first its agent's main thread); then pause, branch and its permissions;
  * its page of its own (one kiln started); and back to the main thread.
  */
-function ThreadCrumbs({ crumbs, sub, onClose }: { crumbs: readonly Crumb[]; sub: AgentInfo | null; onClose: () => void }) {
+function ThreadCrumbs({ crumbs, here, sub, onClose }: { crumbs: readonly Crumb[]; here: SubagentNode | undefined; sub: AgentInfo | null; onClose: () => void }) {
   const last = crumbs.length - 1;
+  // Not in its tree: nothing to pause from here.
+  const node = here ?? { kind: "kiln" as const, session: crumbs[last]?.key ?? "", name: crumbs[last]?.name ?? "", pausable: false };
   return (
     <div className="hx-crumbs">
       <nav className="hx-path" aria-label="Path">
@@ -570,9 +573,7 @@ function ThreadCrumbs({ crumbs, sub, onClose }: { crumbs: readonly Crumb[]; sub:
           </React.Fragment>
         ))}
       </nav>
-      <button type="button" className="hx-icon" aria-label="Pause" disabled>
-        <Pause size={14} />
-      </button>
+      <PauseButton n={node} className="hx-icon" />
       <button type="button" className="hx-icon" aria-label="Branch" disabled>
         <GitFork size={14} />
       </button>

@@ -9,4 +9,12 @@ export type SubagentBrief = { id: string, tool_id?: string, description: string,
 /**
  * What it's doing now, in a line (`Task::last_tool`): where it is, not what it made.
  */
-last_tool?: string, };
+last_tool?: string, 
+/**
+ * A person can pause it (as `Task::pausable`).
+ */
+pausable?: boolean, 
+/**
+ * A person paused it (as `Task::paused_at`).
+ */
+paused_at?: number, };

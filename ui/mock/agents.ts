@@ -515,7 +515,7 @@ function leaves(m: Member) {
   const live = tasks.filter((t) => t.status === "running" || t.status === "pending" || t.status === "paused");
   m.info.subagents = tasks
     .filter((t) => t.class === "agent")
-    .map((t): SubagentBrief => ({ id: t.id, tool_id: t.tool_id, description: t.description, status: t.status, parent_task: t.parent_task, started: t.started, ended: t.ended, last_tool: t.last_tool }));
+    .map((t): SubagentBrief => ({ id: t.id, tool_id: t.tool_id, description: t.description, status: t.status, parent_task: t.parent_task, started: t.started, ended: t.ended, last_tool: t.last_tool, pausable: t.pausable, paused_at: t.paused_at }));
   m.info.tasks_running = live.length;
   m.info.left_behind = live.length;
 }
@@ -836,7 +836,7 @@ const treeLeadAsk: Approval = {
 {
   const t = Date.now() - 40 * 60_000;
   // Background subagents, as Claude Code runs them: they take a message queued, or steered into their work.
-  const sub = (id: string, description: string, started: number, rest: Partial<Task> = {}): Task => ({ ...defaultTask(), id, tool_id: `toolu_${id}`, description, class: "agent", kind: "local_agent", status: "running", background: true, started, stoppable: true, takes: ["queue", "steer"], ...rest });
+  const sub = (id: string, description: string, started: number, rest: Partial<Task> = {}): Task => ({ ...defaultTask(), id, tool_id: `toolu_${id}`, description, class: "agent", kind: "local_agent", status: "running", background: true, started, stoppable: true, takes: ["queue", "steer"], pausable: true, ...rest });
   const lead = member("tree-lead", "claude", "local", "Storage lead", "idle", "default", "Replicate the metadata store's log over QUIC, then rotate the release signing key.", "Its steps are out on subagents; I'll check each as it comes back.");
   lead.tasks = [sub("tl-h0", "Rotate the signing key", t + 30 * 60_000, { summary: "Signing kiln-x86_64-linux" })];
   const s1 = member("tree-s1", "claude", "agent:metal-ryzen-01", "Leader election over QUIC", "running", "default", "Step 2 of 5 of the plan \u201cReplicated log\u201d: Leader election over QUIC", "Electing a leader across three nodes.", {
@@ -847,7 +847,7 @@ const treeLeadAsk: Approval = {
   s1.info.created_at = t + 60_000;
   s1.tasks = [
     sub("ts1-a", "Check vote timeouts", t + 25 * 60_000, { summary: "Reading src/raft/vote.rs", last_tool: "Read" }),
-    sub("ts1-b", "Measure election time", t + 26 * 60_000, { status: "completed", ended: t + 30 * 60_000, summary: "Elections settle within two terms." }),
+    sub("ts1-b", "Measure election time", t + 26 * 60_000, { status: "completed", ended: t + 30 * 60_000, summary: "Elections settle within two terms.", pausable: false }),
   ];
   const spawned = (task: string, n: number, title: string, brief: string, at: number, ended?: number): HEvent[] => [
     {
@@ -942,6 +942,31 @@ function tell(m: Member) {
   const state = JSON.stringify({ t: "state", state: stateOf(m) });
   for (const ws of viewers.get(m.info.id) ?? []) if (ws.readyState === ws.OPEN) ws.send(state);
   emitEvent({ type: "harness", info: m.info });
+}
+
+/** The subagents kiln started under one of them, and theirs. */
+const subagentsUnder = (id: string): string[] => [...family.values()].filter((x) => x.info.subagent && x.info.parent === id).flatMap((x) => [x.info.id, ...subagentsUnder(x.info.id)]);
+
+/**
+ * A person's pause (`Command::Pause`), or its end, as kiln takes it: one of its harness's own held
+ * at its next tool call (`paused_at`); else it, its processes held where they are (`frozen`), and
+ * the subagents kiln started under it.
+ */
+function pauseMember(m: Member, on: boolean, task?: string) {
+  if (task) {
+    const t = m.tasks?.find((x) => x.id === task || x.tool_id === task);
+    if (!t) return;
+    t.paused_at = on ? Date.now() : undefined;
+    leaves(m);
+    tell(m);
+    return;
+  }
+  for (const id of [m.info.id, ...subagentsUnder(m.info.id)]) {
+    const x = family.get(id);
+    if (!x) continue;
+    x.info.frozen = on ? Date.now() : undefined;
+    tell(x);
+  }
 }
 
 /** What a person answered one of them (`approve`), as its harness takes it: the request goes, and it works on. */
@@ -1273,6 +1298,7 @@ function stateOf(m: Member): State {
     todos: m.info.id === "fam-orch" ? ORCH_TODOS : [],
     usage: { cost_usd: m.info.cost_usd, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, turns: 1 },
     dropped: 0,
+    frozen: m.info.frozen,
   };
 }
 
@@ -1650,8 +1676,9 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
   const cm = p.match(/^\/api\/harness\/sessions\/([^/]+)\/command$/);
   const told = cm ? family.get(decodeURIComponent(cm[1] ?? "")) : undefined;
   if (cm && told && m === "POST") {
-    const c = await body<{ type?: string; id?: string; decision?: string; text?: string; task?: string; mode?: string }>(req);
+    const c = await body<{ type?: string; id?: string; decision?: string; text?: string; task?: string; mode?: string; on?: boolean }>(req);
     takeAnswer(told, c);
+    if (c.type === "pause") pauseMember(told, c.on === true, c.task);
     // A message sent without its socket (to one of a lead's subagents, from its page): to a subagent of its harness's own, or to it.
     if (c.type === "send" && c.text) {
       if (c.task) tellSubagent(told, c.task, c.id ?? `sub-${Date.now()}`, c.text, c.mode ?? "queue");

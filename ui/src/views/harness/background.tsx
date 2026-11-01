@@ -5,7 +5,7 @@
  */
 import * as React from "react";
 import { Fold } from "./fold";
-import { ChevronRight, Pause, Square } from "lucide-react";
+import { ChevronRight, Square } from "lucide-react";
 import { harnessApi, useSession, type AgentInfo, type Approval, type Command, type SessionStore, type State, type Task } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { Confirm } from "@/components/ui/misc";
@@ -18,6 +18,7 @@ import { glyphKind, KindGlyph, type GlyphKind } from "./kind-glyph";
 import { Shimmer } from "./signals";
 import { askWords, classOf, isSubagent, kilnAtWork, kilnStatus, LEFT, stopperOf, subagentAsks, subagentRunning, subagentTasksAtWork, type SubagentAsk } from "./tasks";
 import { NODE_WORD, takesMessage, type SubagentRow } from "./subagent-tree";
+import { PauseButton } from "./subagent-pause";
 import { TreePath } from "./tree-path";
 import { useNavigate } from "@/lib/router";
 
@@ -458,7 +459,19 @@ function KilnItem({ a, mixed, onOpenTask }: { a: AgentInfo; mixed: boolean; onOp
  * its pause and its Stop; what it asks, answered under it. Its thread opens from its name: here, or
  * on the page of the subagent it's under.
  */
-function DockNode({ r, store, picked, onPick, onOpenTask }: { r: SubagentRow; store: SessionStore; picked: boolean; onPick: (keys: string[], on: boolean) => void; onOpenTask: (toolId: string) => void }) {
+function DockNode({
+  r,
+  store,
+  picked,
+  onPick,
+  onOpenTask,
+}: {
+  r: SubagentRow;
+  store: SessionStore;
+  picked: boolean;
+  onPick: (keys: string[], on: boolean) => void;
+  onOpenTask: (toolId: string) => void;
+}) {
   const navigate = useNavigate();
   const features = useSession(store, (s) => s.meta?.features ?? NO_FEATURES);
   const task = useSession(store, (s) => (r.kind === "harness" && r.session === store.id ? s.state?.tasks.find((t) => t.id === r.task) : undefined));
@@ -515,9 +528,7 @@ function DockNode({ r, store, picked, onPick, onOpenTask }: { r: SubagentRow; st
           </span>
         </button>
         <span className="dn-acts">
-          <button type="button" className="dn-pause" disabled={!live} aria-label={`Pause ${r.name}`}>
-            <Pause size={14} aria-hidden="true" />
-          </button>
+          <PauseButton n={r} className="dn-pause" />
           {stopAt !== null ? <Stopping at={stopAt}>{stopButton}</Stopping> : stopButton}
         </span>
       </div>
@@ -682,7 +693,12 @@ export function ActivityLine({
                     if (el) el.indeterminate = some;
                   }}
                   disabled={pickable.length === 0}
-                  onChange={(e) => onPick?.(pickable.map((r) => r.key), e.target.checked)}
+                  onChange={(e) =>
+                    onPick?.(
+                      pickable.map((r) => r.key),
+                      e.target.checked,
+                    )
+                  }
                   aria-label="Pick every subagent"
                 />
               ) : (
@@ -692,43 +708,45 @@ export function ActivityLine({
               )}
             </span>
           )}
-        <button type="button" className="al-line" aria-expanded={open} onClick={() => setOpen(!open)}>
-          <span className="al-summary">
-            {segments.map((s, i) => (
-              <span key={s.kind} className="al-seg">
-                {i > 0 && <span className="al-sep">·</span>}
-                {s.kind === "agent" ? (
-                  <Shimmer on={s.live} className="al-mark">
-                    {tree.length === 0 && <KindGlyph kind="agent" />}
-                    {s.text}
-                  </Shimmer>
-                ) : (
-                  <>
-                    <KindGlyph kind={s.kind} live={s.live} />
-                    {s.text}
-                  </>
-                )}
-              </span>
-            ))}
-            {needs && (
-              <span className="al-seg">
-                <span className="al-sep">·</span>
-                <span className="al-needs">
-                  <i aria-hidden="true" />
-                  {needs}
+          <button type="button" className="al-line" aria-expanded={open} onClick={() => setOpen(!open)}>
+            <span className="al-summary">
+              {segments.map((s, i) => (
+                <span key={s.kind} className="al-seg">
+                  {i > 0 && <span className="al-sep">·</span>}
+                  {s.kind === "agent" ? (
+                    <Shimmer on={s.live} className="al-mark">
+                      {tree.length === 0 && <KindGlyph kind="agent" />}
+                      {s.text}
+                    </Shimmer>
+                  ) : (
+                    <>
+                      <KindGlyph kind={s.kind} live={s.live} />
+                      {s.text}
+                    </>
+                  )}
                 </span>
-              </span>
-            )}
-          </span>
-          <ChevronRight size={12} className={cn("al-chev", open && "rotate-90")} aria-hidden="true" />
-        </button>
+              ))}
+              {needs && (
+                <span className="al-seg">
+                  <span className="al-sep">·</span>
+                  <span className="al-needs">
+                    <i aria-hidden="true" />
+                    {needs}
+                  </span>
+                </span>
+              )}
+            </span>
+            <ChevronRight size={12} className={cn("al-chev", open && "rotate-90")} aria-hidden="true" />
+          </button>
         </div>
         {open && (
           <ul className="al-list">
             {tree.length > 0
               ? tree.map((r) => <DockNode key={r.key} r={r} store={store} picked={picks.has(r.key)} onPick={(keys, on) => onPick?.(keys, on)} onOpenTask={onOpenTask} />)
               : [
-                  ...subs.map((t) => <ActivityItem key={t.id} t={t} store={store} mixed={mixed} shown={shown === t.id} onShow={() => setShown(shown === t.id ? null : t.id)} onOpenTask={onOpenTask} />),
+                  ...subs.map((t) => (
+                    <ActivityItem key={t.id} t={t} store={store} mixed={mixed} shown={shown === t.id} onShow={() => setShown(shown === t.id ? null : t.id)} onOpenTask={onOpenTask} />
+                  )),
                   ...others.map((a) => <KilnItem key={a.id} a={a} mixed={mixed} onOpenTask={onOpenTask} />),
                 ]}
             {bg.map((t) => (

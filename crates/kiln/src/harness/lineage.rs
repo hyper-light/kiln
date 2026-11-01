@@ -422,6 +422,23 @@ pub fn descendants(all: &[Info], id: &str) -> Vec<Info> {
     out
 }
 
+/// The subagents kiln started under agent `id` (`Info::subagent`, each in its parent's chat), and
+/// theirs, nearest first, ended or not: what a person's pause of it holds too (`Command::Pause`).
+pub fn subagents_under(all: &[Info], id: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut frontier = vec![id.to_owned()];
+    while let Some(p) = frontier.pop() {
+        for c in all.iter().filter(|i| i.subagent && i.parent.as_deref() == Some(p.as_str())) {
+            if c.id == id || out.contains(&c.id) {
+                continue;
+            }
+            frontier.push(c.id.clone());
+            out.push(c.id.clone());
+        }
+    }
+    out
+}
+
 /// The agents still running that agent `id` started, and theirs, nearest first.
 pub fn live_descendants(all: &[Info], id: &str) -> Vec<Info> {
     descendants(all, id).into_iter().filter(|c| c.status != Status::Exited).collect()
@@ -1153,6 +1170,17 @@ mod tests {
         assert_eq!(descendants(&all, "a").len(), 4, "ended ones too, for ending them with their parent");
     }
 
+    #[test]
+    fn a_pause_holds_the_subagents_kiln_started_under_it_and_theirs_not_agents_it_started_beside_it() {
+        let sub = |id: &str, parent: &str, status: Status| Info { subagent: true, ..info(id, Some(parent), status) };
+        let all = vec![info("lead", None, Status::Idle), sub("s1", "lead", Status::Running), sub("s1a", "s1", Status::Running), sub("s2", "lead", Status::Exited), info("own", Some("lead"), Status::Running), sub("under-own", "own", Status::Running)];
+        let mut under = subagents_under(&all, "lead");
+        under.sort();
+        assert_eq!(under, ["s1", "s1a", "s2"], "an agent it started as one of its own (not a subagent) isn't under its pause, nor what that started");
+        assert_eq!(subagents_under(&all, "s1"), ["s1a"]);
+        assert!(subagents_under(&all, "s1a").is_empty());
+    }
+
     /// docs/agentic.md P2 (Ada's decisions 4 and 6, 2026-10-24): one pool of subagents at work per
     /// agent, whatever each does. An agent it started holds a place while it works, waits on a
     /// person, or is held to a goal still to go (between turns too); idle with its work done (a met
@@ -1168,7 +1196,7 @@ mod tests {
         }
         assert!(!in_pool(&child("pool-done", Status::Idle), &held), "idle, its work done");
         assert!(!in_pool(&child("pool-between", Status::Exited), &held), "ended, though its stack still holds the goal");
-        let sub = |status: &str| super::super::session::SubagentBrief { id: status.into(), tool_id: None, description: String::new(), status: status.into(), parent_task: None, started: 0, ended: None, last_tool: None };
+        let sub = |status: &str| super::super::session::SubagentBrief { id: status.into(), tool_id: None, description: String::new(), status: status.into(), parent_task: None, started: 0, ended: None, last_tool: None, pausable: false, paused_at: None };
         let parent = Info { subagents: ["running", "pending", "paused", "completed", "failed"].into_iter().map(sub).collect(), ..info("p", None, Status::Running) };
         assert_eq!(own_at_work(&parent), 3, "its harness's own still going");
         assert_eq!(most(None, None), (None, None), "no setting: no limit at all");

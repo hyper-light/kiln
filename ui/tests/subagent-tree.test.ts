@@ -173,7 +173,19 @@ test("a live state's tasks as the list has them: only subagents, with what they'
     { id: "sh", description: "npm run dev", status: "running", started: 2, class: "shell" },
   ]);
   assert.deepEqual(b, [
-    { id: "s", tool_id: undefined, description: "Audit", status: "running", parent_task: undefined, started: 1, ended: undefined, last_tool: "Bash", summary: "Running the tests" },
+    {
+      id: "s",
+      tool_id: undefined,
+      description: "Audit",
+      status: "running",
+      parent_task: undefined,
+      started: 1,
+      ended: undefined,
+      last_tool: "Bash",
+      pausable: undefined,
+      paused_at: undefined,
+      summary: "Running the tests",
+    },
   ]);
 });
 
@@ -210,4 +222,26 @@ test("one whose parent kiln no longer lists heads its own line, and parents that
   assert.equal(topOf([kiln("o", "gone", 1)], "o")?.id, "o");
   const loop = [kiln("a", "b", 1), kiln("b", "a", 2)];
   assert.ok(["a", "b"].includes(topOf(loop, "a")?.id ?? ""));
+});
+
+test("a person's pause: its own says Paused and can be resumed; what's under it says Paused, held by the pause over it", () => {
+  const lead = agent("pl");
+  const list = [
+    lead,
+    kiln("pk", "pl", 10, { frozen: 99, subagents: [brief("ph", 11, { pausable: true }), brief("ph-done", 12, { status: "completed", pausable: false })] }),
+    kiln("pk2", "pk", 13),
+    kiln("pk-off", "pl", 20, { status: "exited" }),
+    agent("own", { parent: "pl", subagent: true, created_at: 30, subagents: [brief("oh", 31, { pausable: true, paused_at: 50 }), brief("oh-under", 32, { pausable: true, parent_task: "oh" })] }),
+  ];
+  const by = new Map(subagentTree(lead, list).map((n) => [n.key, [n.stand, n.paused, n.pausable]]));
+  assert.deepEqual(by.get("pk"), ["paused", "own", true]);
+  assert.deepEqual(by.get("pk/ph"), ["paused", "above", false], "what runs in a paused session is paused with it");
+  assert.deepEqual(by.get("pk/ph-done"), ["done", "above", false], "one that ended stays as it was");
+  assert.deepEqual(by.get("pk2"), ["paused", "above", false]);
+  assert.deepEqual(by.get("pk-off"), ["done", undefined, false], "ended: nothing to pause");
+  assert.deepEqual(by.get("own/oh"), ["paused", "own", true]);
+  assert.deepEqual(by.get("own/oh-under"), ["paused", "above", false]);
+  // Live and not paused: Pause.
+  const free = subagentTree(lead, [lead, kiln("f", "pl", 1)]).find((n) => n.key === "f");
+  assert.deepEqual([free?.stand, free?.paused, free?.pausable], ["working", undefined, true]);
 });

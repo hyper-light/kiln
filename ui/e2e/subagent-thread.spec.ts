@@ -23,7 +23,7 @@ test("a nested subagent's crumbs name its whole path, each earlier name opening 
   await expect(path.getByRole("link", { name: "Storage lead" })).toHaveAttribute("href", "/agents/tree-lead");
   await expect(path.getByRole("link", { name: "Leader election over QUIC" })).toHaveAttribute("href", "/agents/tree-lead?task=tree-s1");
   const line = page.locator(".hx-crumbs");
-  for (const name of ["Pause", "Branch", "Permissions", "Back to the main thread"]) await expect(line.getByRole("button", { name, exact: true })).toHaveCount(1);
+  for (const name of ["Pause Measure election time", "Branch", "Permissions", "Back to the main thread"]) await expect(line.getByRole("button", { name, exact: true })).toHaveCount(1);
 
   await path.getByRole("link", { name: "Leader election over QUIC" }).click();
   await expect(page).toHaveURL(/\/agents\/tree-lead\?task=tree-s1$/);

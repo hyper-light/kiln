@@ -80,6 +80,10 @@ reach?: string,
  */
 pause?: Pause, 
 /**
+ * A person paused it: its processes stopped since (as `State::frozen`).
+ */
+frozen?: number, 
+/**
  * Since when it waits for room on its machine to go to work (as `State::room_wait`).
  */
 room_wait?: number | null, 

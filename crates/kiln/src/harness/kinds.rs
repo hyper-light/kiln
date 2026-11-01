@@ -453,6 +453,9 @@ impl Adapter {
             Self::Codex(a) => super::subagent::settle(core, |core, t| a.takes(core, t)),
             Self::Acp(_) | Self::Agy(_) => super::subagent::settle(core, |_, _| (Vec::new(), None)),
         }
+        // Held at its next tool call: Claude Code asks kiln before each (`claude::HOLD_HOOK`).
+        let can = matches!(self, Self::Claude(_));
+        super::subagent::settle_pausable(core, |t| can && t.tool_id.is_some());
     }
 
     /// What waits for its subagents goes to each that can take it now (one at a time each).

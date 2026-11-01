@@ -182,6 +182,13 @@ pub struct SubagentBrief {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub last_tool: Option<String>,
+    /// A person can pause it (as `Task::pausable`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pausable: bool,
+    /// A person paused it (as `Task::paused_at`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub paused_at: Option<i64>,
 }
 
 impl SubagentBrief {
@@ -198,6 +205,8 @@ impl SubagentBrief {
                 started: t.started,
                 ended: t.ended,
                 last_tool: t.last_tool.as_deref().map(|s| super::model::clip_middle(s, 200).0),
+                pausable: t.pausable,
+                paused_at: t.paused_at,
             })
             .collect()
     }
@@ -367,6 +376,10 @@ pub struct Info {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub pause: Option<super::model::Pause>,
+    /// A person paused it: its processes stopped since (as `State::frozen`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub frozen: Option<i64>,
     /// Since when it waits for room on its machine to go to work (as `State::room_wait`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub room_wait: Option<i64>,
@@ -499,6 +512,7 @@ impl Info {
         self.left_behind = s.count_left_behind();
         self.reach.clone_from(&s.reach);
         self.pause.clone_from(&s.pause);
+        self.frozen = s.frozen;
         self.room_wait = s.room_wait;
         self.last_turn.clone_from(&s.last_turn);
         self.move_on_limit = s.move_on_limit;
@@ -1117,6 +1131,7 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         left_behind: 0,
         reach: spec.reach.clone(),
         pause: None,
+        frozen: None,
         room_wait: None,
         last_turn: None,
         keep_off: false,
@@ -2224,6 +2239,20 @@ fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>, now: 
     Move { to, cwd, note, picks_up: picks_up && !local, kind: kind.filter(|_| !local), model, local }
 }
 
+/// A person pauses it, or resumes it (`Command::Pause` without a task): its processes held stopped by
+/// its machine's pacer (`crate::headroom::pause`), now or as soon as it has any, or why they can't
+/// be, said in its conversation.
+fn pause_session(s: &Session, on: bool) {
+    let mut core = s.core.lock();
+    match crate::headroom::pause(&s.id, on) {
+        Ok(()) => {
+            core.state.frozen = on.then(Core::now);
+            core.touch_state();
+        }
+        Err(why) => core.upsert(&format!("pause-refused-{}", Core::now()), None, super::model::Body::Notice { level: Level::Warn, text: format!("Not paused: {why}.") }),
+    }
+}
+
 /// How a move is getting on before it starts (its repository being copied there).
 fn moving_note(s: &Session, text: &str) {
     s.core.lock().upsert("move-pending", None, super::model::Body::Notice { level: Level::Info, text: text.to_owned() });
@@ -2930,6 +2959,15 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
             }
         }
     }
+    // Paused by a person before this runner started (its pacer's guard started its processes again
+    // as the last runner ended): held again, or said to run if this machine can't hold it.
+    let frozen = s.core.lock().state.frozen.is_some();
+    if frozen && let Err(why) = crate::headroom::pause(&s.id, true) {
+        let mut core = s.core.lock();
+        core.state.frozen = None;
+        core.touch_state();
+        core.upsert(&format!("pause-refused-{}", Core::now()), None, super::model::Body::Notice { level: Level::Warn, text: format!("No longer paused: {why}.") });
+    }
     // Announce it, whole, before anything else: whoever mirrors it starts from all of it. One
     // that started again from the conversation store announces all but its timeline: the store
     // has that, and the server's copy gets what it lacks as the session's stream starts.
@@ -3314,6 +3352,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                 core.state.pause_at = percent.filter(|p| (1..=100).contains(p));
                                 core.touch_state();
                                 drop(core);
+                                on_change();
+                            }
+                            // A person's pause of the whole of it: its processes, held where they are.
+                            Command::Pause { on, task: None } => {
+                                pause_session(&s, on);
                                 on_change();
                             }
                             Command::MaxSubagents { count } => {
@@ -3799,6 +3842,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         core.state.pause_at = percent.filter(|p| (1..=100).contains(p));
                         core.touch_state();
                         drop(core);
+                        on_change();
+                    }
+                    // Paused while it isn't running: its processes are held as soon as it has any.
+                    Command::Pause { on, task: None } => {
+                        pause_session(&s, on);
                         on_change();
                     }
                     c => adapter.command(&mut s.core.lock(), c),
@@ -4654,6 +4702,7 @@ mod tests {
             left_behind: 0,
             reach: None,
             pause: None,
+            frozen: None,
             room_wait: None,
             last_turn: None,
             keep_off: false,
