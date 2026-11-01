@@ -45,6 +45,10 @@ const HAVE_AGAIN: Duration = Duration::from_secs(5);
 const KEPT_A_FRAME: usize = 32;
 /// How soon a refused pod launch is tried again.
 const LAUNCH_RETRY: Duration = Duration::from_secs(15);
+/// How long after a runner says what it holds its sessions that still read disconnected are asked
+/// for their snapshots: time for the snapshots its streams send by themselves (a new server) to
+/// come first.
+const STALE_GRACE: Duration = Duration::from_secs(15);
 
 /// Where a Kubernetes job's pod stands until its agent connects.
 #[derive(Debug, Clone, Copy)]
@@ -2446,18 +2450,28 @@ impl Hub {
                 let own = inv.sessions.clone();
                 inv.sessions.extend(others);
                 self.harness.inventory(self, agent, me.as_deref(), &present, inv);
-                // Those it holds that still read disconnected: its link dropped and came back, and
-                // they've had nothing to say since. Their snapshots bring them back as they are.
-                let stale = self.harness.still_disconnected(agent, &own);
-                if !stale.is_empty() {
-                    tracing::info!(machine = %agent, sessions = stale.len(), "sessions its runner holds still read disconnected after it reconnected: asking for their snapshots");
-                    for id in stale {
-                        let hub = Arc::clone(self);
-                        crate::rt::spawn(async move {
+                // Those it holds that still read disconnected a little later: its link dropped and
+                // came back, and they've had nothing to say since. Their snapshots bring them back
+                // as they are. Not at once: after a server restart every session reads disconnected
+                // until its stream's snapshot comes, which a request now would only build twice.
+                if !self.harness.still_disconnected(agent, &own).is_empty() {
+                    let (hub, machine, held) = (Arc::clone(self), agent.to_owned(), own.clone());
+                    crate::rt::spawn(async move {
+                        crate::rt::sleep(STALE_GRACE).await;
+                        if !hub.agents.lock().get(&machine).is_some_and(|a| a.connected) {
+                            return;
+                        }
+                        let stale = hub.harness.still_disconnected(&machine, &held);
+                        if stale.is_empty() {
+                            return;
+                        }
+                        tracing::info!(%machine, sessions = stale.len(), "sessions its runner holds still read disconnected after it reconnected: asking for their snapshots");
+                        // One at a time: each is the session's whole timeline, built on its runner.
+                        for id in stale {
                             let sent = hub.harness.command(&hub, &id, crate::harness::model::Command::Snapshot).await;
                             tracing::debug!(session = %id, ?sent, "asked a session still read disconnected for its snapshot");
-                        });
-                    }
+                        }
+                    });
                 }
                 // Hand-overs dropped as it went away get their word now it's back.
                 self.handovers_dropped(agent, peer, &own).await;
