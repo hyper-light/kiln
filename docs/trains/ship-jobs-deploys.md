@@ -8,10 +8,10 @@ you must also implement the backend logic"). They're stills on adacachy in
 Plan 01a18e5191f0738abebeef6c8df0e88a carried the work in ten steps, and docs/ci.md holds its
 requirements, W26-R21 to W26-R27.
 
-**Where it stands (2026-10-31, when written):**
+**Where it stands (2026-11-01, when written):**
 - **Merged:** with this file, onto main, on Ada's word, as a merge with main first. The branch is
-  ship-actions, with main c305a41e1c merged in (a67b1907f2). That's both mains together, local and
-  origin, production's 96b3afd1a8 among them.
+  ship-actions, with origin's main cd29ff4808 merged in (c09a4db27b). That holds local main too,
+  and production's e9f72ad63a.
 - **Deployed:** not yet. That waits for Ada's word.
 - **Checked at the tree that lands:**
   - the UI's typecheck, lint, tests and build;
