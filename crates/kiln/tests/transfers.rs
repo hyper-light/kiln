@@ -1168,7 +1168,11 @@ fn w27_r08_custody_between_machines() -> anyhow::Result<()> {
     let env = [("FAKE_CLAUDE_RECORD", "1"), ("CLAUDE_CONFIG_DIR", claude.as_str())];
     let (_a, log_a) = agents::runner_with(dir.path(), port, "box-a", None, TALK, &env)?;
     let (_b, log_b) = agents::runner_with(dir.path(), port, "box-b", Some("peer_object_changed,feed_changed"), TALK, &env)?;
-    for (name, log) in [("box-a", &log_a), ("box-b", &log_b)] {
+    // kiln run's (synced_runs): box-c hosts a session, box-d's syncs change on their way. All four
+    // are up before any runner reads the directory, which a runner keeps 30 s.
+    let (_c, log_c) = agents::runner_with(dir.path(), port, "box-c", None, TALK, &env)?;
+    let (_d, log_d) = agents::runner_with(dir.path(), port, "box-d", Some("sync_file_changed"), TALK, &[])?;
+    for (name, log) in [("box-a", &log_a), ("box-b", &log_b), ("box-c", &log_c), ("box-d", &log_d)] {
         agents::connected(port, admin, name, log, Duration::from_secs(60))?;
     }
     peers_objects(dir.path(), port, admin)?;
@@ -1295,7 +1299,7 @@ fn hops_held(v: &Value) -> Vec<(String, String, String, String)> {
 }
 
 /// [`w27_r08_custody_between_machines`]'s kiln run's sync and reach run (the Transfers plan's step
-/// 12, its example): kiln run on box-b for an agent session on box-c. The session hands its
+/// 12, its example), on the runners it started: kiln run on box-b for an agent session on box-c. The session hands its
 /// workspace (its folder's tree, by `kiln run --reuse`'s digest) and the run on to box-b's runner
 /// process, with a delegation to receive both for it; box-b receives each for the session under
 /// that delegation, and hands the run's output back, which the session receives: every hop signed
@@ -1308,13 +1312,6 @@ fn synced_runs(dir: &Path, port: u16, admin: &str) -> anyhow::Result<()> {
     let cwd = dir.join("work-c");
     let home = dir.join("home");
     let _harnesses = Harnesses::new(&cwd, &home)?;
-    let claude = home.join(".claude").to_string_lossy().into_owned();
-    let env = [("FAKE_CLAUDE_RECORD", "1"), ("CLAUDE_CONFIG_DIR", claude.as_str())];
-    let (_c, log_c) = agents::runner_with(dir, port, "box-c", None, TALK, &env)?;
-    let (_d, log_d) = agents::runner_with(dir, port, "box-d", Some("sync_file_changed"), TALK, &[])?;
-    for (name, log) in [("box-c", &log_c), ("box-d", &log_d)] {
-        agents::connected(port, admin, name, log, Duration::from_secs(60))?;
-    }
     let id = agents::open_session(port, admin, "box-c", &cwd, Duration::from_secs(60))?;
     let epoch = first_epoch(port, admin, &id)?;
     let harness: i64 = until(Duration::from_secs(60), || {
