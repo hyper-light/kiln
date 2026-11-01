@@ -165,6 +165,19 @@ pub fn given(json: &str, state_dir: &Path, label: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether a key is held under `slot` that kiln hasn't certified yet: asked for, not given (a
+/// refusal leaves it so).
+pub fn awaited(slot: &str) -> bool {
+    let held = HELD.lock();
+    held.keys.contains_key(slot) && !held.given.contains_key(slot)
+}
+
+/// The slot kiln's answer `json` (`ServerMsg::Identity`'s) is for, whether it gives a certificate or
+/// says why not.
+pub fn answers(json: &str) -> Option<String> {
+    serde_json::from_str::<IdentityGiven>(json).ok().map(|g| slot(&g.kind, g.of.as_deref(), g.epoch))
+}
+
 /// Whether this runner's server issues identities (`CAP_IDENTITY`), so its sessions' git signs as
 /// their agents (W27-R03, [`crate::gitsign`]): a server from before keeps them committing unsigned.
 static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -300,6 +313,33 @@ mod tests {
         assert!(!file.exists(), "its certificate's file goes with it");
         given(&given_json, dir.path(), "main")?;
         assert!(cert(&held).is_none() && !file.exists(), "a certificate for a key let go of is kept nowhere");
+        Ok(())
+    }
+
+    /// W27-R05: a key asked for is awaited until kiln certifies it (a refusal leaves it so), and an
+    /// answer says the slot it's for: what a leg that ended first waits on before it signs.
+    #[test]
+    fn w27_r05_a_key_is_awaited_from_its_ask_until_kiln_certifies_it() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pki = crate::pki::Pki::open_scratch(&dir.path().join("pki"))?;
+        let s = slot("agent", Some("w27-r05-wait"), Some(1));
+        assert!(!awaited(&s), "nothing asked");
+        let asked = ask("agent", Some("w27-r05-wait"), Some(1))?;
+        assert!(awaited(&s), "asked, not answered");
+        let refused = serde_json::to_string(&IdentityGiven { kind: "agent".into(), of: Some("w27-r05-wait".into()), epoch: Some(1), error: Some("not now".into()), ..IdentityGiven::default() })?;
+        assert_eq!(answers(&refused).as_deref(), Some(s.as_str()));
+        given(&refused, dir.path(), "main")?;
+        assert!(awaited(&s), "a refusal gives no certificate");
+        let identity = Identity::new(pki.organization(), Actor::Agent { person: "sam".into(), agent: "w27-r05-wait".into(), epoch: 1, held_by: None });
+        let certified = answer(&pki, &asked, &identity)?;
+        assert_eq!(answers(&certified).as_deref(), Some(s.as_str()));
+        given(&certified, dir.path(), "main")?;
+        assert!(!awaited(&s), "certified");
+        let a_legs = serde_json::to_string(&IdentityGiven { kind: "leg".into(), of: Some("01a1-job".into()), ..IdentityGiven::default() })?;
+        assert_eq!(answers(&a_legs), Some(slot("leg", Some("01a1-job"), None)));
+        assert_eq!(answers("not an answer"), None);
+        forget(&s);
+        assert!(!awaited(&s), "let go of");
         Ok(())
     }
 

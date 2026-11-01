@@ -9157,7 +9157,10 @@ delegation of it.
 - *Signed at its end*, in `Ev::Done`, with the leg's key before letting go of it. What the leg
   sent before it ended goes first, however far its runner is behind: an end that comes while its
   last log chunks or step ends still wait on the runner's uplink waits behind them, so its records
-  cover all it sent. `AgentMsg::LegResults` carries them all. It goes before `JobFinished`, and
+  cover all it sent. A leg that ends before kiln has certified its identity (a step of a few
+  milliseconds, while kiln signs its delegation and inputs) waits for kiln's answer, up to 30 s,
+  and then signs; with no identity by then, or one kiln refused, its records go unsigned, saying
+  why. `AgentMsg::LegResults` carries them all. It goes before `JobFinished`, and
   again with it until it's received (`CAP_LEG_SIGNS`, docs/wire.md). A `k8s` pool's pod's leg
   signs too: its runner says nothing of itself past `Build`'s caps, so it says so of the leg as it
   asks for the leg's identity (`IdentityAsk.signs`), and kiln asks the leg for provenance by that.

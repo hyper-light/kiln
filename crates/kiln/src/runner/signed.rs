@@ -328,8 +328,14 @@ fn sign_provenance_with(job: &str, nonce: &str, payload_type: &str, payload: &[u
 }
 
 /// Where leg `job`'s key is held ([`crate::runner::identity`]).
-fn leg_slot(job: &str) -> String {
+pub fn leg_slot(job: &str) -> String {
     crate::runner::identity::slot("leg", Some(job), None)
+}
+
+/// Whether leg `job`'s identity was asked for and kiln hasn't certified it yet: a leg that ends
+/// first waits for it before it signs its records (docs/ci.md W27-R05).
+pub fn identity_awaited(job: &str) -> bool {
+    crate::runner::identity::awaited(&leg_slot(job))
 }
 
 /// `payload` of `payload_type`, signed over its PAE with the key held under `slot`, in a bundle
