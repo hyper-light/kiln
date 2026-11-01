@@ -1,0 +1,308 @@
+//! Pipelines' drafts (docs/ci.md W29-R10 to R14), against a server of its own with its own runner
+//! and real `git`: a draft saved on a repository kiln hosts, and on GitHub through a fake of its
+//! API and its git.
+
+#![cfg(unix)]
+
+mod common;
+
+use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+use std::net::TcpListener;
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use base64::Engine as _;
+use common::{Got, Options, Server, Service, http, start};
+use serde_json::{Value, json};
+
+const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+
+/// `git` with no configuration but this test's, in `dir`.
+fn git(home: &Path, dir: &Path, args: &[&str]) -> anyhow::Result<String> {
+    let o = Command::new("git")
+        .args(["-c", "user.name=Ada", "-c", "user.email=ada@example.com", "-c", "init.defaultBranch=main", "-c", "credential.helper=", "-c", "commit.gpgsign=false"])
+        .args(args)
+        .current_dir(dir)
+        .env("HOME", home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env_remove("GIT_ASKPASS")
+        .env_remove("SSH_ASKPASS")
+        .output()?;
+    let out = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    anyhow::ensure!(o.status.success(), "git {args:?}: {out}");
+    Ok(out)
+}
+
+fn post(s: &Server, path: &str, body: &Value) -> anyhow::Result<Value> {
+    let (st, text) = http(s.port, "POST", path, &s.admin, Some(body))?;
+    anyhow::ensure!((200..300).contains(&st), "POST {path}: {st} {text}");
+    Ok(serde_json::from_str(&text)?)
+}
+
+fn get(s: &Server, path: &str) -> anyhow::Result<Value> {
+    let (st, text) = http(s.port, "GET", path, &s.admin, None)?;
+    anyhow::ensure!(st == 200, "GET {path}: {st} {text}");
+    Ok(serde_json::from_str(&text)?)
+}
+
+fn at<'a>(v: &'a Value, pointer: &str) -> &'a str {
+    v.pointer(pointer).and_then(Value::as_str).unwrap_or_default()
+}
+
+/// Until `name`'s first poll is done: it takes the branch as it is.
+fn polled(s: &Server, name: &str) -> anyhow::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let v = get(s, "/api/repos")?;
+        let list = v.as_array().cloned().or_else(|| v.get("repos").and_then(Value::as_array).cloned()).unwrap_or_default();
+        if list.iter().any(|r| r.get("name").and_then(Value::as_str) == Some(name) && r.get("last_polled_at").is_some_and(|t| !t.is_null())) {
+            return Ok(());
+        }
+        anyhow::ensure!(Instant::now() < deadline, "{name} wasn't polled: {v}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+const CI: &str = "name: ci\non: push\njobs:\n  build:\n    runs-on: local\n    steps:\n      - run: echo one\n";
+const TRY_ONE: &str = "name: ci\non: push\njobs:\n  build:\n    runs-on: local\n    strategy:\n      matrix:\n        n: [1, 2]\n    steps:\n      - run: echo ${{ matrix.n }}\n";
+const TRY_TWO: &str = "name: ci\non: push\njobs:\n  build:\n    runs-on: local\n    strategy:\n      matrix:\n        n: [1, 2, 3]\n    steps:\n      - run: echo ${{ matrix.n }}\n";
+
+/// W29-R11 on a repository kiln hosts: Save draft opens a draft diff, and saving again is its next
+/// version, never a second diff; kiln's record of it says so.
+#[test]
+fn w29_r11_save_draft_on_kiln() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ..Options::default() })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "native repository: {st} {body}");
+    git(&home, dir.path(), &["clone", "-q", &format!("http://x:{}@127.0.0.1:{}/git/acme/app.git", s.admin, s.port), "app"])?;
+    let work = dir.path().join("app");
+    std::fs::create_dir_all(work.join(".github/workflows"))?;
+    std::fs::write(work.join(".github/workflows/ci.yml"), CI)?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "first"])?;
+    git(&home, &work, &["push", "-q", "origin", "main"])?;
+    polled(&s, "acme/app")?;
+
+    let edit = "/api/ci/repos/acme%2Fapp/workflows/.github/workflows/ci.yml/edit";
+    let first = post(&s, edit, &json!({ "content": TRY_ONE, "draft": true, "title": "Try a matrix" }))?;
+    assert_eq!((at(&first, "/draft/kind"), at(&first, "/draft/state")), ("diff", "draft"), "{first}");
+    let name = at(&first, "/draft/name").to_owned();
+    assert!(name.starts_with('D'), "{first}");
+    let second = post(&s, edit, &json!({ "content": TRY_TWO, "draft": true, "title": "Try a matrix" }))?;
+    assert_eq!((at(&second, "/draft/id"), at(&second, "/draft/name")), (at(&first, "/draft/id"), name.as_str()), "the same draft: {second}");
+    let diff = get(&s, &format!("/api/diffs/{name}"))?;
+    assert_eq!(at(&diff, "/state"), "draft", "{diff}");
+    assert_eq!(diff.get("versions").and_then(Value::as_array).map(Vec::len), Some(2), "saved twice, one diff of two versions: {diff}");
+    // With no `state`, the list has every diff, a draft too.
+    let all = get(&s, "/api/repos/acme%2Fapp/diffs")?;
+    let diffs = all.get("diffs").and_then(Value::as_array).cloned().or_else(|| all.as_array().cloned()).unwrap_or_default();
+    assert_eq!(diffs.len(), 1, "{all}");
+    // A draft is a diff or a host's change, nothing else.
+    let (st, _) = http(s.port, "POST", edit, &s.admin, Some(&json!({ "content": TRY_TWO, "draft": true, "to": "patch" })))?;
+    assert_eq!(st, 400);
+    Ok(())
+}
+
+/// GitHub's git over smart HTTP, as GitHub serves it: `git http-backend` as a CGI behind a server
+/// of this test's, each request on a thread of its own. Its port.
+fn git_http(root: &Path) -> anyhow::Result<u16> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let root = root.to_path_buf();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let root = root.clone();
+            std::thread::spawn(move || {
+                let _ = serve_git(stream, &root);
+            });
+        }
+    });
+    Ok(port)
+}
+
+/// One request, answered by `git http-backend`.
+fn serve_git(stream: std::net::TcpStream, root: &Path) -> anyhow::Result<()> {
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut w = stream;
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let mut parts = line.split_whitespace();
+    let (method, target) = (parts.next().unwrap_or("GET").to_owned(), parts.next().unwrap_or("/").to_owned());
+    let mut headers: Vec<(String, String)> = Vec::new();
+    loop {
+        let mut h = String::new();
+        if reader.read_line(&mut h)? == 0 || h.trim_end().is_empty() {
+            break;
+        }
+        if let Some((k, v)) = h.trim_end().split_once(':') {
+            headers.push((k.trim().to_ascii_lowercase(), v.trim().to_owned()));
+        }
+    }
+    let header = |k: &str| headers.iter().find(|(h, _)| h == k).map(|(_, v)| v.clone());
+    if header("expect").is_some_and(|e| e.eq_ignore_ascii_case("100-continue")) {
+        w.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+    }
+    let mut body = Vec::new();
+    if header("transfer-encoding").is_some_and(|t| t.contains("chunked")) {
+        loop {
+            let mut size = String::new();
+            reader.read_line(&mut size)?;
+            let n = usize::from_str_radix(size.trim().split(';').next().unwrap_or("0"), 16)?;
+            let mut chunk = vec![0; n + 2];
+            reader.read_exact(&mut chunk)?;
+            if n == 0 {
+                break;
+            }
+            body.extend(chunk.get(..n).unwrap_or_default());
+        }
+    } else if let Some(n) = header("content-length").and_then(|n| n.parse::<usize>().ok()) {
+        body.resize(n, 0);
+        reader.read_exact(&mut body)?;
+    }
+    let (path, query) = target.split_once('?').unwrap_or((target.as_str(), ""));
+    let mut cgi = Command::new("git");
+    cgi.arg("http-backend")
+        .env("GIT_PROJECT_ROOT", root)
+        .env("GIT_HTTP_EXPORT_ALL", "1")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("REQUEST_METHOD", &method)
+        .env("PATH_INFO", path)
+        .env("QUERY_STRING", query)
+        .env("CONTENT_LENGTH", body.len().to_string())
+        .env("REMOTE_ADDR", "127.0.0.1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    for (h, var) in [("content-type", "CONTENT_TYPE"), ("content-encoding", "HTTP_CONTENT_ENCODING"), ("git-protocol", "GIT_PROTOCOL")] {
+        if let Some(v) = header(h) {
+            cgi.env(var, v);
+        }
+    }
+    let mut child = cgi.spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(&body)?;
+    }
+    let out = child.wait_with_output()?.stdout;
+    let (head, rest) = match out.windows(4).position(|w| w == b"\r\n\r\n") {
+        Some(i) => (out.get(..i).unwrap_or_default(), out.get(i + 4..).unwrap_or_default()),
+        None => match out.windows(2).position(|w| w == b"\n\n") {
+            Some(i) => (out.get(..i).unwrap_or_default(), out.get(i + 2..).unwrap_or_default()),
+            None => (&[][..], out.as_slice()),
+        },
+    };
+    let mut status = "200 OK".to_owned();
+    let mut response = Vec::new();
+    for h in String::from_utf8_lossy(head).lines().map(str::trim).filter(|h| !h.is_empty()) {
+        match h.strip_prefix("Status:") {
+            Some(s) => status = s.trim().to_owned(),
+            None => response.extend_from_slice(format!("{h}\r\n").as_bytes()),
+        }
+    }
+    write!(w, "HTTP/1.1 {status}\r\n")?;
+    w.write_all(&response)?;
+    write!(w, "Content-Length: {}\r\nConnection: close\r\n\r\n", rest.len())?;
+    w.write_all(rest)?;
+    Ok(())
+}
+
+/// A server whose GitHub App (its API a fake of GitHub's: the App's tokens, the Git Data API and
+/// pulls) reaches `acme/app`, whose git a server of this test's serves; polled once.
+struct OnGithub {
+    s: Server,
+    api: Service,
+    _dir: tempfile::TempDir,
+}
+
+fn on_github() -> anyhow::Result<OnGithub> {
+    let dir = tempfile::tempdir()?;
+    let kp = aws_lc_rs::rsa::KeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048).map_err(|_| anyhow::anyhow!("keygen"))?;
+    let der = aws_lc_rs::encoding::AsDer::<aws_lc_rs::encoding::Pkcs8V1Der>::as_der(&kp).map_err(|_| anyhow::anyhow!("der"))?;
+    let key = dir.path().join("app.pem");
+    std::fs::write(&key, format!("-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n", B64.encode(der.as_ref())))?;
+    let secret = dir.path().join("webhook-secret");
+    std::fs::write(&secret, "s3cret\n")?;
+    // Each commit the Git Data API makes is a new one.
+    let commits = Arc::new(AtomicU64::new(0));
+    let answer: Arc<common::Answer> = Arc::new(move |method: &str, got: &Got| {
+        let path = got.path.split('?').next().unwrap_or_default();
+        let (st, v) = match (method, path) {
+            ("GET", "/repos/acme/app/installation") => (200, json!({ "id": 7 })),
+            ("POST", "/app/installations/7/access_tokens") => (201, json!({ "token": "ghs_fake_drafts", "expires_at": "2099-01-01T00:00:00Z" })),
+            ("GET", p) if p.starts_with("/repos/acme/app/git/commits/") => (200, json!({ "sha": p.rsplit('/').next().unwrap_or_default(), "tree": { "sha": "tree0" } })),
+            ("POST", "/repos/acme/app/git/blobs") => (201, json!({ "sha": "blob1" })),
+            ("POST", "/repos/acme/app/git/trees") => (201, json!({ "sha": "tree1" })),
+            ("POST", "/repos/acme/app/git/commits") => (201, json!({ "sha": format!("{:040x}", 0xc0_ffee + commits.fetch_add(1, Ordering::SeqCst)) })),
+            ("POST", "/repos/acme/app/git/refs") => (201, json!({ "ref": got.json().get("ref").cloned().unwrap_or_default() })),
+            ("PATCH", p) if p.starts_with("/repos/acme/app/git/refs/heads/") => (200, json!({ "ref": p.trim_start_matches("/repos/acme/app/git/") })),
+            ("POST", "/repos/acme/app/pulls") => (201, json!({ "number": 12, "html_url": "https://github.example/acme/app/pull/12" })),
+            _ => (404, json!({ "message": "Not Found" })),
+        };
+        (st, v.to_string())
+    });
+    let api = Service::start(answer)?;
+    // GitHub's git: a bare repository with a workflow, served over smart HTTP.
+    let gh = dir.path().join("gh");
+    std::fs::create_dir_all(gh.join("acme"))?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    git(&home, &gh, &["init", "-q", "--bare", "acme/app.git"])?;
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(work.join(".github/workflows"))?;
+    std::fs::write(work.join(".github/workflows/ci.yml"), CI)?;
+    git(&home, &work, &["init", "-q"])?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "first"])?;
+    git(&home, &work, &["push", "-q", &gh.join("acme/app.git").to_string_lossy(), "HEAD:main"])?;
+    let port = git_http(&gh)?;
+    let ci = format!("github = {{ app_id = 99, private_key_file = \"{}\", webhook_secret_file = \"{}\", api_url = \"{}\", web_url = \"http://127.0.0.1:{port}\" }}", key.display(), secret.display(), api.url());
+    let extra = format!("[[repos]]\nname = \"acme/app\"\nclone_url = \"http://127.0.0.1:{port}/acme/app.git\"\n");
+    let s = start(dir.path(), &Options { agent: true, ci: &ci, extra: &extra })?;
+    polled(&s, "acme/app")?;
+    Ok(OnGithub { s, api, _dir: dir })
+}
+
+impl OnGithub {
+    /// The bodies of the requests sent as `method` to `path` (its query left out), in order.
+    fn sent(&self, method: &str, path: &str) -> Vec<Value> {
+        self.api.requests().into_iter().filter(|(m, g)| m == method && g.path.split('?').next() == Some(path)).map(|(_, g)| g.json()).collect()
+    }
+}
+
+/// W29-R11 on GitHub: Save draft makes a branch of the draft's own, commits to it saying
+/// `[skip ci]`, and opens a draft pull request; saving again is a new commit on that branch, on
+/// what was saved before, and no second pull request.
+#[test]
+fn w29_r11_save_draft_on_a_host() -> anyhow::Result<()> {
+    let g = on_github()?;
+    let edit = "/api/ci/repos/acme%2Fapp/workflows/.github/workflows/ci.yml/edit";
+    let first = post(&g.s, edit, &json!({ "content": TRY_ONE, "draft": true, "title": "Try a matrix" }))?;
+    let branch = at(&first, "/draft/branch").to_owned();
+    assert!(branch.starts_with("kiln/draft/ci-") && branch.len() == "kiln/draft/ci-".len() + 8, "{first}");
+    assert_eq!((at(&first, "/draft/kind"), at(&first, "/draft/name"), at(&first, "/draft/state")), ("change", "#12", "draft"), "{first}");
+    let second = post(&g.s, edit, &json!({ "content": TRY_TWO, "draft": true, "title": "Try a matrix" }))?;
+    assert_eq!((at(&second, "/draft/id"), at(&second, "/draft/branch")), (at(&first, "/draft/id"), branch.as_str()), "the same draft: {second}");
+    assert_ne!(at(&second, "/draft/head"), at(&first, "/draft/head"), "{second}");
+
+    let pulls = g.sent("POST", "/repos/acme/app/pulls");
+    assert_eq!(pulls.len(), 1, "one pull request: {pulls:?}");
+    assert_eq!((pulls.first().and_then(|p| p.get("draft")), pulls.first().and_then(|p| p.get("head"))), (Some(&json!(true)), Some(&json!(branch))), "{pulls:?}");
+    let commits = g.sent("POST", "/repos/acme/app/git/commits");
+    assert_eq!(commits.len(), 2, "{commits:?}");
+    for c in &commits {
+        assert!(c.get("message").and_then(Value::as_str).is_some_and(|m| m.ends_with("[skip ci]\n")), "a draft's commit says [skip ci]: {c}");
+    }
+    assert_eq!(commits.get(1).and_then(|c| c.get("parents")), Some(&json!([at(&first, "/draft/head")])), "the second is on the first");
+    let made = g.sent("POST", "/repos/acme/app/git/refs");
+    assert_eq!(made.iter().map(|r| r.get("ref").cloned()).collect::<Vec<_>>(), [Some(json!(format!("refs/heads/{branch}")))], "{made:?}");
+    let moved = g.sent("PATCH", &format!("/repos/acme/app/git/refs/heads/{branch}"));
+    assert_eq!(moved.iter().map(|r| r.get("sha").cloned()).collect::<Vec<_>>(), [Some(json!(at(&second, "/draft/head")))], "{moved:?}");
+    Ok(())
+}

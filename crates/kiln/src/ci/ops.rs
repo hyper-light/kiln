@@ -1718,6 +1718,9 @@ pub mod input {
         pub branch: Option<String>,
         /// The diff's, change's or commit's title (`Edit <path>` when left out).
         pub title: Option<String>,
+        /// A Pipelines draft (docs/ci.md W29-R11): a draft diff, or on a host a draft change from a
+        /// branch of its own whose commits say `[skip ci]`. A later save of your draft of the file
+        /// adds to it.
         pub draft: Option<bool>,
         pub reviewers: Option<Vec<String>>,
         pub topic: Option<String>,

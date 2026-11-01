@@ -42,6 +42,7 @@ pub mod ops;
 pub mod otel;
 #[cfg(test)]
 mod own_workflows;
+pub mod pipeline_drafts;
 #[cfg(test)]
 mod placement;
 pub mod preview;

@@ -263,6 +263,10 @@ struct EditAsk {
     branch: Option<String>,
     #[serde(default)]
     title: Option<String>,
+    /// Saved as a Pipelines draft (docs/ci.md W29-R11): a draft diff, or a host's draft change on
+    /// a branch of its own.
+    #[serde(default)]
+    draft: Option<bool>,
 }
 
 /// `POST /api/ci/repos/:repo/workflows/:path/edit { content, to?, branch?, title?, draft?,
@@ -276,6 +280,11 @@ struct EditAsk {
 /// - `branch`: a commit to `branch`, on its head (a new branch on the default branch's), refused
 ///   for what a push of it would be;
 /// - `patch`: nothing written: the patch that makes it, against the default branch.
+///
+/// With `draft` (Pipelines' Save draft, docs/ci.md W29-R11), it's a draft: a draft diff, or on a
+/// host a draft change from a branch of its own (`kiln/draft/<stem>-<id8>`) whose commits say
+/// `[skip ci]`. A later save of the caller's draft of the file adds to it: a new version of the
+/// diff, or a new commit on the branch. Its answer says the draft as kiln records it (`draft`).
 ///
 /// Each answer has the diagnostics, and the plan a push of it to the default branch makes (W20-R03).
 pub async fn edit(hub: &Arc<Hub>, caller: &Caller, repo_key: &str, path: &str, body: &Value) -> Result<Value, Fail> {
@@ -302,6 +311,7 @@ pub async fn edit(hub: &Arc<Hub>, caller: &Caller, repo_key: &str, path: &str, b
     let title = ask.title.as_deref().map(str::trim).filter(|t| !t.is_empty()).map_or_else(|| format!("Edit {file}"), str::to_owned);
     let branch = ask.branch.as_deref().map(str::trim).filter(|b| !b.is_empty());
     let mut out = match (to, &host) {
+        _ if ask.draft == Some(true) => save_draft(hub, caller, &repo, host.as_ref(), to, file, &ask.content, &title, body).await?,
         ("patch", _) => json!({ "patch": patch(hub, &repo, file, &ask.content).await? }),
         ("diff", Some(crate::githost::GitHost::Kiln)) => {
             let content = ask.content.clone();
@@ -356,18 +366,7 @@ async fn on_host(hub: &Arc<Hub>, caller: &Caller, repo: &Repo, host: &crate::git
         return Err((StatusCode::CONFLICT, format!("{branch} is there already: a change's branch is a new one")));
     }
     let base = head.clone().unwrap_or_else(|| tip.clone());
-    let (me, _) = super::diffs::author_of(&caller.name, Some(caller.kind));
-    let me = me.strip_prefix("user:").unwrap_or(&me).to_owned();
-    let author = crate::githost::Author { email: format!("{}@kiln", me.replace([' ', ':'], "-")), name: me };
-    let files = [crate::githost::Change { path: file.to_owned(), content: Some(content.as_bytes().to_vec()) }];
-    let made = host.commit_on(hub, repo, &branch, Some(&base), head.as_deref(), &files, &format!("{title}\n"), &author).await.map_err(|e| match e {
-        crate::githost::CommitError::Moved => (StatusCode::CONFLICT, format!("{branch} moved while this was saved: reload it and save again")),
-        crate::githost::CommitError::Other(e) => (StatusCode::BAD_GATEWAY, format!("{}'s host refused the commit: {e:#}", repo.name)),
-    })?;
-    let sha = match made {
-        crate::githost::Committed::New(sha) => sha,
-        crate::githost::Committed::Unchanged(_) => return Err((StatusCode::CONFLICT, format!("{file} is already so on {}: nothing to save", if change { &default } else { &branch }))),
-    };
+    let sha = commit_file(hub, caller, repo, host, (&branch, &base, head.as_deref()), (file, content), &format!("{title}\n"), if change { &default } else { &branch }).await?;
     hub.store.audit(caller.name.clone(), "ci.workflow.edit".into(), format!("{} {file} → {branch} {}", repo.name, sha.get(..12).unwrap_or(&sha))).await;
     if !change {
         return Ok(json!({ "branch": branch, "sha": sha }));
@@ -376,6 +375,106 @@ async fn on_host(hub: &Arc<Hub>, caller: &Caller, repo: &Repo, host: &crate::git
     let opened =
         host.open_change(hub, repo, &branch, &default, title, &body, false).await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("the branch {branch} is saved, but its change wasn't opened: {e:#}")))?;
     Ok(json!({ "branch": branch, "sha": sha, "change": { "number": opened.number, "url": opened.url } }))
+}
+
+/// One file committed as `caller` to `branch` of a repository's host: made on `base`, onto `head`
+/// (the branch's, when it's there). `already` names where a commit changing nothing is refused.
+#[allow(clippy::too_many_arguments)]
+async fn commit_file(hub: &Arc<Hub>, caller: &Caller, repo: &Repo, host: &crate::githost::GitHost, (branch, base, head): (&str, &str, Option<&str>), (file, content): (&str, &str), message: &str, already: &str) -> Result<String, Fail> {
+    let (me, _) = super::diffs::author_of(&caller.name, Some(caller.kind));
+    let me = me.strip_prefix("user:").unwrap_or(&me).to_owned();
+    let author = crate::githost::Author { email: format!("{}@kiln", me.replace([' ', ':'], "-")), name: me };
+    let files = [crate::githost::Change { path: file.to_owned(), content: Some(content.as_bytes().to_vec()) }];
+    let made = host.commit_on(hub, repo, branch, Some(base), head, &files, message, &author).await.map_err(|e| match e {
+        crate::githost::CommitError::Moved => (StatusCode::CONFLICT, format!("{branch} moved while this was saved: reload it and save again")),
+        crate::githost::CommitError::Other(e) => (StatusCode::BAD_GATEWAY, format!("{}'s host refused the commit: {e:#}", repo.name)),
+    })?;
+    match made {
+        crate::githost::Committed::New(sha) => Ok(sha),
+        crate::githost::Committed::Unchanged(_) => Err((StatusCode::CONFLICT, format!("{file} is already so on {already}: nothing to save"))),
+    }
+}
+
+/// Pipelines' Save draft (docs/ci.md W29-R11), the text checked already: the caller's draft of
+/// `file` opened, or added to when they have one open. On a repository kiln hosts it's a draft
+/// diff; a later save carries its `Kiln-Change`, so it's a new version of it. On a host it's a
+/// branch of its own (`kiln/draft/<stem>-<id8>`) with a draft change, each commit's message
+/// saying `[skip ci]`; a later save is a new commit on the branch. Its answer says the draft as
+/// kiln records it.
+#[allow(clippy::too_many_arguments)]
+async fn save_draft(hub: &Arc<Hub>, caller: &Caller, repo: &Repo, host: Option<&crate::githost::GitHost>, to: &str, file: &str, content: &str, title: &str, body: &Value) -> Result<Value, Fail> {
+    use super::pipeline_drafts::{self as drafts, Draft};
+    let (author, _) = super::diffs::author_of(&caller.name, Some(caller.kind));
+    let open = drafts::open_for(hub, &repo.name, file, &author).await.map_err(|e| internal(&e))?;
+    let now = crate::util::now_unix();
+    let mut d = open.clone().unwrap_or_else(|| Draft { id: crate::util::new_id(), repo: repo.name.clone(), path: file.to_owned(), author: author.clone(), state: "draft".into(), created_at: now, ..Draft::default() });
+    d.title = title.to_owned();
+    d.updated_at = now;
+    let out = match (to, host) {
+        ("diff", Some(crate::githost::GitHost::Kiln)) => {
+            // A later save names the diff's change: it's that diff's next version.
+            let title = match d.change.as_deref() {
+                Some(change) => format!("{title}\n\nKiln-Change: {change}"),
+                None => title.to_owned(),
+            };
+            let mut body = body.clone();
+            if let Some(o) = body.as_object_mut() {
+                o.insert("draft".into(), json!(true));
+            }
+            let content = content.to_owned();
+            let out = super::diffs::propose_file(hub, &repo.name, caller, file, &title, &body, move |_| Ok(content)).await?;
+            let made = out.pointer("/diffs/0").cloned().unwrap_or(Value::Null);
+            d.kind = "diff".into();
+            d.name = made.get("name").and_then(Value::as_str).map(str::to_owned);
+            d.number = made.get("number").and_then(Value::as_u64);
+            d.url = made.get("url").and_then(Value::as_str).map(str::to_owned);
+            d.change = made.get("change").and_then(Value::as_str).map(str::to_owned).or(d.change);
+            out
+        }
+        ("change", Some(h)) if !matches!(h, crate::githost::GitHost::Kiln) => {
+            if !caller.can("diffs.submit", &Scope::Repo { repo: repo.name.clone() }) {
+                return Err((StatusCode::FORBIDDEN, format!("saving a draft to {}'s host needs `diffs.submit`", repo.name)));
+            }
+            let message = kiln_ci::drafts::draft_message(title);
+            let (branch, sha) = match (d.branch.clone(), d.head.clone()) {
+                // A later save: a new commit on the draft's branch, on what kiln saved last.
+                (Some(branch), Some(head)) => {
+                    let sha = commit_file(hub, caller, repo, h, (&branch, &head, Some(&head)), (file, content), &message, &branch).await?;
+                    (branch, sha)
+                }
+                _ => {
+                    let default = super::events::facts(hub, repo).await.default_branch;
+                    let tip = load::resolve(hub, repo, &default).await.map_err(|e| internal(&e))?.ok_or_else(|| (StatusCode::UNPROCESSABLE_ENTITY, format!("{default} has no commits yet")))?;
+                    // The id's random end: its start is a time, the same for drafts made the same minute.
+                    let branch = kiln_ci::drafts::draft_branch(file, d.id.get(d.id.len().saturating_sub(8)..).unwrap_or(&d.id));
+                    let sha = commit_file(hub, caller, repo, h, (&branch, &tip, None), (file, content), &message, &default).await?;
+                    let said = format!("{title}, a draft saved in kiln's Pipelines by {}: nothing runs it until it's ready (docs/ci.md W29-R10).", caller.name);
+                    let opened = h.open_change(hub, repo, &branch, &default, title, &said, true).await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("the draft's branch {branch} is saved, but its change wasn't opened: {e:#}")))?;
+                    d.number = Some(opened.number);
+                    d.url = Some(opened.url);
+                    d.name = Some(match h {
+                        crate::githost::GitHost::Gitlab(_) => format!("!{}", opened.number),
+                        _ => format!("#{}", opened.number),
+                    });
+                    (branch, sha)
+                }
+            };
+            d.kind = "change".into();
+            d.branch = Some(branch.clone());
+            d.head = Some(sha.clone());
+            json!({ "branch": branch, "sha": sha, "change": { "number": d.number, "url": d.url } })
+        }
+        ("branch" | "patch", _) => return Err(bad(format!("a draft is saved as a diff, or as a draft change on its host, not as `{to}` (W29-R11)"))),
+        (_, None) => return Err((StatusCode::CONFLICT, format!("kiln can't write to {}: no App or credentials of its host are set up here, so a draft can't be saved", repo.name))),
+        _ => return Err(bad(format!("`to: {to}` isn't how {} takes a draft (W29-R11)", repo.name))),
+    };
+    drafts::put(hub, &d).await.map_err(|e| internal(&e))?;
+    hub.store.audit(caller.name.clone(), "ci.workflow.draft".into(), format!("{} {file} → {} {}", repo.name, d.name.as_deref().unwrap_or("draft"), if open.is_some() { "saved again" } else { "opened" })).await;
+    let mut out = out;
+    if let Some(o) = out.as_object_mut() {
+        o.insert("draft".into(), serde_json::to_value(&d).unwrap_or(Value::Null));
+    }
+    Ok(out)
 }
 
 /// The patch that makes `file` say `content`, against the default branch's head (in kiln's copy
