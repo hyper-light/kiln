@@ -76,6 +76,7 @@ const EVENT_FRAMES = {
   "runner.offline": true,
   conflict: true,
   refused: true,
+  pipelines: true,
   "run.succeeded": true,
   "run.fixed": true,
   "run.cancelled": true,

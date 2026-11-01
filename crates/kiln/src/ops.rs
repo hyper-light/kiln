@@ -363,8 +363,9 @@ fn yours(caller: &Caller, name: &str, mut input: Value) -> Value {
 /// Runs operation `name` for `cx`'s caller, when the route table lets it.
 pub async fn call(cx: Cx, name: &str, input: Value) -> Out {
     let input = yours(&cx.caller, name, if input.is_null() { json!({}) } else { input });
-    // CI's, and the hosts' pull requests (W23-R06) and experiments (W20-R11) beside them.
-    if name.starts_with("ci.") || name.starts_with("host.") || name.starts_with("experiments.") {
+    // CI's, and the hosts' pull requests (W23-R06), experiments (W20-R11) and Ship's pipelines
+    // (W29-R09) beside them.
+    if name.starts_with("ci.") || name.starts_with("host.") || name.starts_with("experiments.") || name.starts_with("ship.") {
         return crate::ci::ops::call(cx, name, input).await;
     }
     if name.starts_with("deploy.") {

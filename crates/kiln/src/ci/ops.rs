@@ -901,8 +901,22 @@ pub fn ops() -> &'static [Op] {
                 input: Input::of::<input::CiStacksGet>(),
                 route: |v| Ok((Method::GET, path(&["stacks", &text(v, "stack")?]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move { let st = text(&v, "stack")?; diffs(&cx, Method::GET, &["stacks", st.as_str()], &HashMap::new(), &Value::Null).await }),
+            op!("ship.pipelines.list", "Ship's Pipelines (docs/ci.md W29-R03): the workflows and actions of each repository you may read, at its default branch's head. Each row has its kind, dialect, stand and word, its line, its pips (Checks, Runs on, Latest), who changed it last and when, and its ref and commit; repositories with rows that need someone come first. `repo` for one repository; `q` for the rows whose name, path, kind or word has it, and every row of a repository whose name has it.", base: "", ro: true, destructive: false,
+                input: Input::of::<input::ShipPipelinesList>(),
+                route: |v| Ok((Method::GET, path(&["ship", "pipelines"]), query(v, &["q", "repo"]))),
+                run: |cx: Cx, v: Value| async move { answer(crate::ship::pipelines::list(&cx.hub, &query(&v, &["q", "repo"]), &cx.caller).await).await }),
+            op!("ship.pipelines.get", "A workflow or action as Ship's Pipelines opens it (W29-R04), at its repository's default branch or at `ref` (a branch, tag or commit): its head (title, kind, dialect, ref, commit, stand), its verbs and why each isn't there yet, its groups and its file. A workflow's groups are its triggers, stages, uses, secret and variable names (never values), runs and settings; an action's are its inputs, outputs, what it runs and its versions.", base: "", ro: true, destructive: false,
+                input: Input::of::<input::ShipPipelinesGet>(),
+                route: |v| { let (owner, name) = owner_name(v)?; Ok((Method::GET, path(&["ship", "pipelines", &owner, &name]), query(v, &["path", "ref"]))) },
+                run: |cx: Cx, v: Value| async move { let (owner, name) = owner_name(&v)?; answer(crate::ship::pipelines::get(&cx.hub, &owner, &name, &query(&v, &["path", "ref"]), &cx.caller).await).await }),
         ]
     })
+}
+
+/// A repository's owner and name (`acme/app`), its route's two segments.
+fn owner_name(v: &Value) -> Result<(String, String), Fail> {
+    let repo = text(v, "repo")?;
+    repo.split_once('/').filter(|(o, n)| !o.is_empty() && !n.is_empty()).map(|(o, n)| (o.to_owned(), n.to_owned())).ok_or_else(|| bad(format!("`repo` is owner/name, not `{repo}`")))
 }
 
 /// What each of these operations takes (`crate::ops::Input`): its JSON Schema is generated from
@@ -2516,6 +2530,28 @@ pub mod input {
     pub struct CiStacksGet {
         /// The stack's id (a diff's `stack`).
         pub stack: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct ShipPipelinesList {
+        /// Only this repository, `owner/name`.
+        pub repo: Option<String>,
+        /// Only the rows whose name, path, kind or word has this, and every row of a repository
+        /// whose name has it.
+        pub q: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct ShipPipelinesGet {
+        /// The repository, `owner/name`.
+        pub repo: String,
+        /// The workflow's or action's file, e.g. `.github/workflows/ci.yml` or `.github/actions/setup/action.yml`.
+        pub path: String,
+        /// A branch, tag or commit to read it at: its repository's default branch when left out.
+        #[serde(rename = "ref")]
+        pub at: Option<String>,
     }
 }
 

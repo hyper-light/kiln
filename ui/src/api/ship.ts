@@ -133,6 +133,110 @@ export interface ShipQuery {
   cursor?: number;
 }
 
+/** What a Pipelines row is (docs/ci.md W29-R02): a workflow, a reusable one, or an action by its `runs.using`. */
+export type ShipPipelineKind = "workflow" | "reusable" | "composite" | "javascript" | "docker" | "firecracker" | "shards" | "unknown";
+
+/**
+ * A workflow or action of a repository, as Ship's Pipelines lists it (W29-R02), at its default
+ * branch's head: its stand and word (`Can't run`, `Failing`, `Released`, …), its line, and its pips
+ * as glyph names, Checks, Runs on and Latest in that order.
+ */
+export interface ShipPipelineRow {
+  /** `owner/name:path`. */
+  key: string;
+  kind: ShipPipelineKind | string;
+  /** A workflow's: `gha` or `kiln`; null for an action. */
+  dialect: "gha" | "kiln" | null;
+  name: string;
+  path: string;
+  stand: ShipStand | string;
+  word: string;
+  line: string;
+  pips: [string, string, string];
+  /** Who changed its file last, and when (unix seconds). */
+  who: string | null;
+  when: number | null;
+  ref: string;
+  commit: string;
+  /** The repository's newest full-version tag, for an action or reusable workflow. */
+  released: string | null;
+  /** Its draft (W29-R10): null until drafts are built. */
+  draft: null;
+  /** A hash of what the row shows: the same row, the same `v`. */
+  v: string;
+}
+
+/** A repository's rows, with its heading's words (`3 actions · 1 workflow`) and how many need someone. */
+export interface ShipPipelineRepo {
+  repo: string;
+  say: string;
+  needs: number;
+  /** W29-R17's Access: `none` until sharing is built. */
+  access: string;
+  ref: string;
+  commit: string;
+  rows: ShipPipelineRow[];
+}
+
+/** A line of the pane's groups (W29-R04): a trigger, job, use, secret's or variable's name, run, setting, input, output, step, … */
+export interface ShipPipelineLine {
+  key: string;
+  kind: string;
+  name: string;
+  value: string;
+  /** A glyph's name, where the line has a state. */
+  state?: string;
+  /** A trigger's group (`Code`, `Time`, …) and whose event it is (W29-R06). */
+  group?: string;
+  whose?: "both" | "github" | "kiln";
+}
+
+export interface ShipPipelineGroup {
+  name: string;
+  lines: ShipPipelineLine[];
+}
+
+/** A verb of the pane's strip: dimmed with why while it isn't built, never hidden. */
+export interface ShipPipelineVerb {
+  verb: "run" | "save_draft" | "ready" | "discard" | "release" | string;
+  label: string;
+  enabled: boolean;
+  why_not?: string;
+}
+
+export interface ShipPipelineStrip {
+  said: string[];
+  pick: string[];
+  verbs: ShipPipelineVerb[];
+}
+
+/** The file the pane opens, and the views it has (`YAML`, `Flow`, `Plan`; an action's `Changes`, `YAML`, `Try it`). */
+export interface ShipPipelineDetail {
+  name: string;
+  views: string[];
+  text: string;
+}
+
+/** A workflow or action opened (W29-R04): `GET /api/ship/pipelines/{owner}/{name}?path=&ref=`. */
+export interface ShipPipelinePane {
+  head: {
+    title: string;
+    path: string;
+    kind: ShipPipelineKind | string;
+    dialect: "gha" | "kiln" | null;
+    ref: string;
+    commit: string;
+    draft: null;
+    stand: ShipStand | string;
+    word: string;
+    pips: [string, string, string];
+  };
+  strip: ShipPipelineStrip;
+  groups: ShipPipelineGroup[];
+  detail: ShipPipelineDetail;
+  repo: string;
+}
+
 export function shipSearch(q: ShipQuery): string {
   const p = new URLSearchParams();
   for (const [k, v] of Object.entries(q)) if (v !== undefined && v !== "") p.set(k, String(v));

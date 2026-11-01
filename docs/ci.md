@@ -205,7 +205,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W24 | Incremental CI: fingerprints, reuse, warm state, shared caches | W04, W05, W06, W08, W13, W18 | ready | specified (2026-10-24): R01–R31, AC01–AC15; milestones M0–M7 and M1e are kiln goals with plans |
 | W26 | Review in Ship: changes as Ship items, each owning its review | W14, W23, W27, Ship (the CI/CD Integration plan) | in progress | R06–R15 built: each item's dropdown owns its review (Files and the Conversation, search on vorpal, kinds and the gate, suggestions and conflicts as revisions, the Review lanes), unsigned until W27-R03; AC06 in Chromium, not yet WebKit; specified (2026-10-25): R01–R20, AC01–AC11; plan `01a175b7d5e1772f8d3c7cb28e50ab2b` |
 | W27 | Attested end to end: identities, signatures, hand-offs, the trail | W10, W18, W26 | in progress | specified (2026-10-25): R01–R12, AC01–AC08; research `01a175c54441773fa28bf1488b82e6aa`; identities built (R01, R02, R12; AC01, AC02): plan `01a17856b1b0712babf8dfd37ce48756` |
-| W29 | Pipelines in Ship: author, run, share and lock workflows and actions | W02, W03, W04, W07, W13, W14, W21, W23, W26 | ready | specified (2026-10-31): R01–R31, AC01–AC29, S01–S17; the design approved on stills `pl-1` to `pl-9`; plan `01a19474452d7084bae269952cc6c26a` |
+| W29 | Pipelines in Ship: author, run, share and lock workflows and actions | W02, W03, W04, W07, W13, W14, W21, W23, W26 | in progress | specified (2026-10-31): R01–R31, AC01–AC29, S01–S17; the design approved on stills `pl-1` to `pl-9`; the read model and API built (R02, R03, R04's pane, R09's reads); plan `01a19474452d7084bae269952cc6c26a` |
 
 ---
 
@@ -10716,8 +10716,24 @@ Each names the requirements it holds and how it's checked. UI checks run in Chro
 | W29-S16 | A Shards action, today | `KCI4034`, "no machine runs shards microVMs yet", and the row says Can't run | R30 |
 | W29-S17 | A kiln-dialect job `uses: ./templates/rust-check.yaml` with `with: { toolchain: stable }`, and a step with the same `uses:` | The job runs the template as a reusable workflow. The step is refused with `KCI4006`, pointing to `.kiln/actions/<name>/action.yml` | R31 |
 
-**Progress.** Specified (2026-10-31), on branch `ci-w29-pipelines`: R01–R31, AC01–AC29 and S01–S17.
-Nothing is built yet. Plan `01a19474452d7084bae269952cc6c26a` builds it, one step at a time.
+**Progress.** In progress, on branch `ci-w29-pipelines`. Specified on 2026-10-31: R01–R31,
+AC01–AC29 and S01–S17. Plan `01a19474452d7084bae269952cc6c26a` builds it, one step at a time.
+Its step 3, the read model and API, is built:
+- `kiln_ci::pipelines` decides each row's kind, stand, word, pips and place (R02). It also decides
+  each trigger's group, words and whose it is (R06's table), a workflow's stages and groups, and an
+  action's groups by its kind (R04). It works from facts the server passes in.
+- `ship::pipelines` holds each repository's rows in memory, at its default branch's head. It
+  gathers them again on run, job and push events and every 30 s, and sends `pipelines { repo }`
+  when they change (R03).
+- `GET /api/ship/pipelines` gives the caller the repositories it may read. Answered from memory
+  over 200 repositories and 2,000 rows, its p99 is 124 µs in a release build (AC03's read). AC03's
+  2 s for an event isn't measured yet.
+- `GET /api/ship/pipelines/:owner/:name?path=&ref=` opens one row (R04): its head, its strip's
+  verbs (dimmed, each with its `why_not`), its groups, and its file at `ref`.
+- `ship.pipelines.list` and `.get` are operations (R09). `ui/src/api/ship.ts` has their types.
+
+Next is drafts (R10–R14, the plan's step 4). The tab (R01) and editing (R05, R06) come with the
+plan's step 7.
 
 ## 4. API, events, CLI and MCP reference
 

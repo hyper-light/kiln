@@ -67,6 +67,35 @@ fn field<'a>(v: &'a Value, key: &str) -> &'a str {
     v.get(key).and_then(Value::as_str).unwrap_or_default()
 }
 
+/// What code mode's `program` returns, run by the admin over MCP.
+fn code(s: &Server, program: &str) -> anyhow::Result<Value> {
+    let (st, body) = http(s.port, "POST", "/api/mcp", &s.admin, Some(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "code_run", "arguments": { "program": program } } })))?;
+    anyhow::ensure!(st == 200, "code_run: {st} {body}");
+    let v: Value = serde_json::from_str(&body)?;
+    let text = v.pointer("/result/content/0/text").and_then(Value::as_str).unwrap_or_default();
+    anyhow::ensure!(v.pointer("/result/isError") == Some(&json!(false)), "{program}: {text}");
+    Ok(serde_json::from_str::<Value>(text)?.get("result").cloned().unwrap_or_default())
+}
+
+/// W29-R09: code mode's `program` answers as `GET route` does for the admin. The route is read
+/// before and after it, until the two agree: a run may finish between them.
+fn as_route(s: &Server, program: &str, route: &str) -> anyhow::Result<()> {
+    let read = || -> anyhow::Result<Value> {
+        let (st, body) = http(s.port, "GET", route, &s.admin, None)?;
+        anyhow::ensure!(st == 200, "GET {route}: {st} {body}");
+        Ok(serde_json::from_str(&body)?)
+    };
+    for _ in 0..10 {
+        let before = read()?;
+        let got = code(s, program)?;
+        if read()? == before {
+            assert_eq!(got, before, "{program} answers as GET {route}");
+            return Ok(());
+        }
+    }
+    anyhow::bail!("GET {route} changed each time it was read")
+}
+
 /// The events a server sends (`/api/events`), gathered until `until` passes or `stop` says.
 fn events(port: u16, token: &str, until: Instant, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<String> {
     let token = token.to_owned();
@@ -215,6 +244,10 @@ fn w29_r03_pipelines_read_model() -> anyhow::Result<()> {
     let frames = heard.join().unwrap_or_default();
     assert!(frames.contains(r#""type":"pipelines","repo":"acme/app""#), "no pipelines event for acme/app in {} bytes of events", frames.len());
 
+    // Agents have the list as an operation (W29-R09).
+    as_route(&s, "return await kiln.ship.pipelines.list({})", "/api/ship/pipelines")?;
+    as_route(&s, "return await kiln.ship.pipelines.list({ repo: 'acme/app', q: 'fail' })", "/api/ship/pipelines?repo=acme/app&q=fail")?;
+
     // A caller who may read another repository only doesn't see this one.
     let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/other", "mode": "native" })))?;
     anyhow::ensure!(st == 200, "acme/other: {st} {body}");
@@ -334,6 +367,7 @@ fn w29_r04_the_pane() -> anyhow::Result<()> {
     anyhow::ensure!(st == 200, "at v1.0.0: {st} {old}");
     assert_eq!((at(&old, "/head/title"), at(&old, "/head/commit"), at(&old, "/head/ref")), ("every event", tagged.as_str(), "v1.0.0"), "{old}");
     assert!(at(&old, "/detail/text").contains("name: every event\n"), "{old}");
+    as_route(&s, "return await kiln.ship.pipelines.get({ repo: 'acme/kit', path: '.github/workflows/every.yml', ref: 'v1.0.0' })", "/api/ship/pipelines/acme/kit?path=.github/workflows/every.yml&ref=v1.0.0")?;
 
     // What isn't there, and a repository the caller may not read, are missing.
     assert_eq!(pane(&s, &s.admin, ".github/workflows/none.yml", None)?.0, 404);
