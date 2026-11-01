@@ -224,3 +224,122 @@ fn w29_r03_pipelines_read_model() -> anyhow::Result<()> {
     assert!(!theirs.to_string().contains("acme/app"), "{theirs}");
     Ok(())
 }
+
+/// Every one of GitHub's events, as `on:` names it, in a reusable GitHub-dialect workflow.
+const EVERY_GITHUB_EVENT: &str = "name: every event\non:\n  branch_protection_rule:\n  check_run:\n  check_suite:\n  create:\n  delete:\n  deployment:\n  deployment_status:\n  discussion:\n  discussion_comment:\n  fork:\n  gollum:\n  image_version:\n  issue_comment:\n  issues:\n  label:\n  merge_group:\n  milestone:\n  page_build:\n  project:\n  project_card:\n  project_column:\n  public:\n  pull_request:\n    branches: [main]\n  pull_request_review:\n  pull_request_review_comment:\n  pull_request_target:\n  push:\n    branches: [main]\n  registry_package:\n  release:\n    types: [published]\n  repository_dispatch:\n  schedule:\n    - cron: '0 3 * * *'\n  status:\n  watch:\n  workflow_call:\n    inputs:\n      toolchain:\n        type: string\n        required: true\n    outputs:\n      built:\n        value: ${{ jobs.build.outputs.built }}\n    secrets:\n      TOKEN:\n        required: true\n  workflow_dispatch:\n  workflow_run:\n    workflows: [ci]\n    types: [completed]\njobs:\n  build:\n    runs-on: local\n    outputs:\n      built: yes\n    steps:\n      - uses: actions/checkout@v4\n      - run: echo ${{ secrets.TOKEN }} ${{ vars.REGION }}\n";
+
+/// Every one of kiln's events, in a kiln-dialect workflow.
+const EVERY_KILN_EVENT: &str = "name: every kiln event\non:\n  diff:\n  land:\n  review:\n  comment:\n  pipeline:\n    workflows: [ci]\n  agent:\n  deploy:\n  webhook:\n  manual:\n  tag:\njobs:\n  check:\n    runs-on: local\n    steps:\n      - run: echo checked\n";
+
+const ACTIONS: &[(&str, &str)] = &[
+    (".github/actions/setup/action.yml", "name: setup\ninputs:\n  toolchain:\n    required: true\noutputs:\n  path:\n    description: Where it went\nruns:\n  using: composite\n  steps:\n    - name: Install\n      run: echo installing\n      shell: bash\n"),
+    (".github/actions/comment/action.yml", "name: pr-comment\nruns:\n  using: node24\n  main: index.js\n"),
+    (".github/actions/image/action.yml", "name: build-image\nruns:\n  using: docker\n  image: Dockerfile\n  entrypoint: /entry.sh\n"),
+    (".kiln/actions/fuzz/action.yml", "name: fuzz\nruns:\n  using: firecracker\n  image: docker://alpine:3.20\n  resources:\n    cpus: 2\n  egress: [crates.io]\n"),
+    (".kiln/actions/sandbox/action.yml", "name: sandbox\nruns:\n  using: shards\n  image: docker://alpine:3.20\n"),
+];
+
+fn pane(s: &Server, token: &str, path: &str, at: Option<&str>) -> anyhow::Result<(u16, Value)> {
+    let query = match at {
+        Some(r) => format!("?path={path}&ref={r}"),
+        None => format!("?path={path}"),
+    };
+    let (st, body) = http(s.port, "GET", &format!("/api/ship/pipelines/acme/kit{query}"), token, None)?;
+    Ok((st, serde_json::from_str(&body).unwrap_or(Value::Null)))
+}
+
+fn group<'a>(p: &'a Value, name: &str) -> Vec<&'a Value> {
+    p.get("groups")
+        .and_then(Value::as_array)
+        .and_then(|g| g.iter().find(|g| field(g, "name") == name))
+        .and_then(|g| g.get("lines").and_then(Value::as_array))
+        .map(|l| l.iter().collect())
+        .unwrap_or_default()
+}
+
+/// The text at a JSON pointer, or nothing.
+fn at<'a>(v: &'a Value, pointer: &str) -> &'a str {
+    v.pointer(pointer).and_then(Value::as_str).unwrap_or_default()
+}
+
+fn group_names(p: &Value) -> Vec<String> {
+    p.get("groups").and_then(Value::as_array).map(|g| g.iter().map(|g| field(g, "name").to_owned()).collect()).unwrap_or_default()
+}
+
+#[test]
+fn w29_r04_the_pane() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: false, ci: "kiln_workflows = true\ngithub_workflows = \"auto\"", extra: "" })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/kit", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "native repository: {st} {body}");
+    git(&home, dir.path(), &["clone", "-q", &format!("http://x:{}@127.0.0.1:{}/git/acme/kit.git", s.admin, s.port), "kit"])?;
+    let work = dir.path().join("kit");
+    let mut files: Vec<(&str, &str)> = vec![(".github/workflows/every.yml", EVERY_GITHUB_EVENT), (".kiln/every.yaml", EVERY_KILN_EVENT), (".github/actions/comment/index.js", "console.log('hi');\n"), (".github/actions/image/Dockerfile", "FROM alpine:3.20\n")];
+    files.extend_from_slice(ACTIONS);
+    for (path, text) in &files {
+        let p = work.join(path);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&p, text)?;
+    }
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "the kit"])?;
+    let tagged = git(&home, &work, &["rev-parse", "HEAD"])?.trim().to_owned();
+    git(&home, &work, &["tag", "v1.0.0"])?;
+    // The workflow changes after its release.
+    std::fs::write(work.join(".github/workflows/every.yml"), EVERY_GITHUB_EVENT.replacen("name: every event", "name: every event, renamed", 1))?;
+    git(&home, &work, &["commit", "-qam", "renamed"])?;
+    git(&home, &work, &["push", "-q", "origin", "main", "v1.0.0"])?;
+    let head = git(&home, &work, &["rev-parse", "HEAD"])?.trim().to_owned();
+
+    // The two workflows' Triggers: 46 lines between them, each with its group and words.
+    let (st, gha) = pane(&s, &s.admin, ".github/workflows/every.yml", None)?;
+    anyhow::ensure!(st == 200, "the GitHub workflow's pane: {st} {gha}");
+    let (st, kiln) = pane(&s, &s.admin, ".kiln/every.yaml", None)?;
+    anyhow::ensure!(st == 200, "the kiln workflow's pane: {st} {kiln}");
+    let lines: Vec<&Value> = group(&gha, "Triggers").into_iter().chain(group(&kiln, "Triggers")).collect();
+    assert_eq!(lines.len(), 46, "{lines:?}");
+    assert!(lines.iter().all(|l| !field(l, "name").is_empty() && !field(l, "group").is_empty()), "{lines:?}");
+    assert_eq!((at(&gha, "/head/title"), at(&gha, "/head/commit"), at(&gha, "/head/kind")), ("every event, renamed", head.as_str(), "reusable"), "{gha}");
+    assert!(gha.pointer("/head/draft").is_some_and(Value::is_null));
+    // A reusable workflow's interface: its workflow_call inputs, outputs and secrets.
+    let call: Vec<(&str, &str)> = group(&gha, "Called with").iter().map(|l| (field(l, "kind"), field(l, "name"))).collect();
+    assert_eq!(call, [("input", "toolchain"), ("output", "built"), ("secret", "TOKEN")], "{gha}");
+    // Secrets and variables by name only.
+    let names: Vec<&str> = group(&gha, "Secrets and variables").iter().map(|l| field(l, "name")).collect();
+    assert_eq!(names, ["TOKEN", "REGION"]);
+    assert!(gha.get("groups").is_some_and(|g| !g.to_string().contains("${{ secrets")), "no value of a secret, or its expression, in the groups");
+    // Every verb is there, dimmed, saying when it comes.
+    let verbs = gha.pointer("/strip/verbs").and_then(Value::as_array).cloned().unwrap_or_default();
+    assert_eq!(verbs.iter().map(|v| field(v, "verb")).collect::<Vec<_>>(), ["run", "save_draft", "ready", "discard", "release"]);
+    assert!(verbs.iter().all(|v| v.get("enabled") == Some(&Value::Bool(false)) && !field(v, "why_not").is_empty()), "{verbs:?}");
+
+    // Each action kind's own groups, and its versions.
+    for (path, own) in [(".github/actions/setup/action.yml", "Steps"), (".github/actions/comment/action.yml", "Runs on Node (node24)"), (".github/actions/image/action.yml", "Image"), (".kiln/actions/fuzz/action.yml", "Firecracker microVM"), (".kiln/actions/sandbox/action.yml", "Shards microVM")] {
+        let (st, p) = pane(&s, &s.admin, path, None)?;
+        anyhow::ensure!(st == 200, "{path}'s pane: {st} {p}");
+        assert_eq!(group_names(&p), ["Inputs", "Outputs", own, "Versions", "Used by", "Settings"], "{path}");
+        let versions: Vec<&str> = group(&p, "Versions").iter().map(|l| field(l, "name")).collect();
+        assert_eq!(versions, ["the default branch's tip", "v1.0.0"], "{path}");
+    }
+    let (_, fuzz) = pane(&s, &s.admin, ".kiln/actions/fuzz/action.yml", None)?;
+    let vm: Vec<String> = group(&fuzz, "Firecracker microVM").iter().map(|l| format!("{}: {}", field(l, "name"), field(l, "value"))).collect();
+    assert_eq!(vm, ["image: docker://alpine:3.20", "resources: cpus 2", "egress: crates.io"]);
+
+    // At the tag, the file as it was then.
+    let (st, old) = pane(&s, &s.admin, ".github/workflows/every.yml", Some("v1.0.0"))?;
+    anyhow::ensure!(st == 200, "at v1.0.0: {st} {old}");
+    assert_eq!((at(&old, "/head/title"), at(&old, "/head/commit"), at(&old, "/head/ref")), ("every event", tagged.as_str(), "v1.0.0"), "{old}");
+    assert!(at(&old, "/detail/text").contains("name: every event\n"), "{old}");
+
+    // What isn't there, and a repository the caller may not read, are missing.
+    assert_eq!(pane(&s, &s.admin, ".github/workflows/none.yml", None)?.0, 404);
+    let (st, _) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/other", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "acme/other");
+    let other = person(&s, "other", &["viewer@repo:acme/other"])?;
+    assert_eq!(pane(&s, &other, ".github/workflows/every.yml", None)?.0, 404);
+    Ok(())
+}

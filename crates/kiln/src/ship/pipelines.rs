@@ -205,14 +205,29 @@ impl Model {
     }
 }
 
-/// A repository's rows at its default branch's head, or `None` when the branch has no commit.
-async fn gather(hub: &Hub, repo: &Repo, env: &Env) -> anyhow::Result<Option<Held>> {
-    let branch = repo.default_branch.clone().or_else(|| repo.branches.first().cloned()).unwrap_or_else(|| "main".to_owned());
-    let Some(sha) = crate::ci::load::resolve(hub, repo, &branch).await? else { return Ok(None) };
-    let commit = crate::ci::load::load(hub, repo, &sha).await?;
-    let dir = crate::gitops::ensure_commit(hub, repo, &sha).await?;
+/// A repository's default branch: its own, else the first it follows, else `main`.
+fn default_branch(repo: &Repo) -> String {
+    repo.default_branch.clone().or_else(|| repo.branches.first().cloned()).unwrap_or_else(|| "main".to_owned())
+}
+
+/// What a commit's rows are read against besides its files: its repository's tags, who changed
+/// each file last, and each workflow's newest runs on the default branch.
+struct Ctx {
+    /// The newest full version.
+    released: Option<String>,
+    /// Every full version with its commit, newest first (the pane's Versions).
+    versions: Vec<(String, String)>,
+    changes: Changes,
+    by_path: HashMap<String, (Option<Outcome>, bool)>,
+    released_outcome: (Option<Outcome>, bool),
+}
+
+/// The commit's files, and what its rows are read against.
+async fn context(hub: &Hub, repo: &Repo, branch: &str, sha: &str) -> anyhow::Result<(crate::ci::load::Commit, Ctx)> {
+    let commit = crate::ci::load::load(hub, repo, sha).await?;
+    let dir = crate::gitops::ensure_commit(hub, repo, sha).await?;
     let d = dir.to_string_lossy().into_owned();
-    // The tags, each with its commit (an annotated tag's peeled), and the newest full version.
+    // The tags, each with its commit (an annotated tag's peeled).
     let tags_text = git(hub, &d, &["for-each-ref", "--format=%(refname:strip=2) %(objectname) %(*objectname)", "refs/tags"]).await;
     let tags: Vec<(&str, &str)> = tags_text
         .lines()
@@ -223,66 +238,151 @@ async fn gather(hub: &Hub, repo: &Repo, env: &Env) -> anyhow::Result<Option<Held
             Some((name, w.next().unwrap_or(obj)))
         })
         .collect();
-    let released = core::newest_release(tags.iter().map(|(t, _)| *t)).map(str::to_owned);
-    let released_sha = released.as_deref().and_then(|r| tags.iter().find(|(t, _)| *t == r)).map(|(_, s)| (*s).to_owned());
-    // Who changed each file last: the head's newest commits, newest first.
-    let log = git(hub, &d, &["log", "-n", LOG_LOOK, "--format=%x00%an%x00%at", "--name-only", &sha, "--", ".github", ".kiln", "action.yml", "action.yaml"]).await;
+    let versions: Vec<(String, String)> = core::releases(tags.iter().map(|(t, _)| *t)).into_iter().filter_map(|r| tags.iter().find(|(t, _)| *t == r).map(|(t, s)| ((*t).to_owned(), (*s).to_owned()))).collect();
+    let released = versions.first().map(|(t, _)| t.clone());
+    let released_sha = versions.first().map(|(_, s)| s.clone());
+    // Who changed each file last: the commit's newest ancestors, newest first.
+    let log = git(hub, &d, &["log", "-n", LOG_LOOK, "--format=%x00%an%x00%at", "--name-only", sha, "--", ".github", ".kiln", "action.yml", "action.yaml"]).await;
     let changes = changes_of(&log);
-    let (by_path, released_outcome) = runs_of(hub, repo, &branch, released_sha.as_deref()).await?;
-    let mut rows: Vec<Row> = Vec::new();
-    for l in &commit.workflows {
-        let stem = stem_of(&l.path);
-        let kind = l.workflow.as_ref().map_or(Kind::Workflow, Kind::of_workflow);
-        let errors = l.diagnostics.iter().filter(|x| x.severity == wf::Severity::Error).count();
-        let routable = l.workflow.as_ref().filter(|_| l.runs || kind == Kind::Reusable).map(|w| crate::ci::workflows::unknown_in(w, &repo.name, &env.rules, &env.runners, &env.pools).is_empty());
-        let seen = by_path.get(&l.path).or_else(|| by_path.get(&format!("v1:{stem}"))).copied().unwrap_or_default();
-        let facts = Facts {
-            kind,
-            name: l.workflow.as_ref().and_then(|w| w.name.clone()).unwrap_or_else(|| stem.clone()),
-            path: l.path.clone(),
-            runs: l.runs,
-            errors: u32::try_from(errors).unwrap_or(u32::MAX),
-            routable,
-            latest: if kind == Kind::Reusable { released_outcome.0 } else { seen.0 },
-            running: if kind == Kind::Reusable { released_outcome.1 } else { seen.1 },
-            released: (kind == Kind::Reusable).then(|| released.clone()).flatten(),
-            ..Facts::default()
-        };
-        let line = workflow_line(l, kind, &commit.github_note);
-        let (who, when) = changes.get(&l.path).cloned().map_or((None, None), |(w, t)| (Some(w), Some(t)));
-        rows.push(Row::new(facts, Some(if l.dialect == kiln_ci::expr::Dialect::Kiln { "kiln" } else { "gha" }), line, who, when));
-    }
+    let (by_path, released_outcome) = runs_of(hub, repo, branch, released_sha.as_deref()).await?;
+    Ok((commit, Ctx { released, versions, changes, by_path, released_outcome }))
+}
+
+/// A workflow's row (W29-R02).
+fn workflow_row(repo: &Repo, l: &crate::ci::load::Loaded, ctx: &Ctx, env: &Env, github_note: &str) -> Row {
+    let stem = stem_of(&l.path);
+    let kind = l.workflow.as_ref().map_or(Kind::Workflow, Kind::of_workflow);
+    let errors = l.diagnostics.iter().filter(|x| x.severity == wf::Severity::Error).count();
+    let routable = l.workflow.as_ref().filter(|_| l.runs || kind == Kind::Reusable).map(|w| crate::ci::workflows::unknown_in(w, &repo.name, &env.rules, &env.runners, &env.pools).is_empty());
+    let seen = ctx.by_path.get(&l.path).or_else(|| ctx.by_path.get(&format!("v1:{stem}"))).copied().unwrap_or_default();
+    let facts = Facts {
+        kind,
+        name: l.workflow.as_ref().and_then(|w| w.name.clone()).unwrap_or_else(|| stem.clone()),
+        path: l.path.clone(),
+        runs: l.runs,
+        errors: u32::try_from(errors).unwrap_or(u32::MAX),
+        routable,
+        latest: if kind == Kind::Reusable { ctx.released_outcome.0 } else { seen.0 },
+        running: if kind == Kind::Reusable { ctx.released_outcome.1 } else { seen.1 },
+        released: (kind == Kind::Reusable).then(|| ctx.released.clone()).flatten(),
+        ..Facts::default()
+    };
+    let line = workflow_line(l, kind, github_note);
+    let (who, when) = ctx.changes.get(&l.path).cloned().map_or((None, None), |(w, t)| (Some(w), Some(t)));
+    Row::new(facts, Some(if l.dialect == kiln_ci::expr::Dialect::Kiln { "kiln" } else { "gha" }), line, who, when)
+}
+
+/// An action's row (W29-R02), from its `action.yml` as parsed.
+fn action_row(path: &str, action: Option<&wf::Action>, diags: &[wf::Diag], ctx: &Ctx, env: &Env) -> Row {
+    let kind = action.map_or(Kind::Unknown, Kind::of_action);
+    let folder = path.rsplit_once('/').map_or("", |(d, _)| d);
+    let errors = diags.iter().filter(|x| x.severity == wf::Severity::Error).count();
+    let routable = match kind {
+        Kind::Firecracker => Some(env.firecracker),
+        Kind::Shards => Some(env.shards),
+        _ => None,
+    };
+    let facts = Facts {
+        kind,
+        name: action.and_then(|a| a.name.clone()).unwrap_or_else(|| folder.rsplit('/').next().unwrap_or(folder).to_owned()),
+        path: path.to_owned(),
+        runs: true,
+        errors: u32::try_from(errors).unwrap_or(u32::MAX),
+        routable,
+        latest: ctx.released_outcome.0,
+        running: ctx.released_outcome.1,
+        released: ctx.released.clone(),
+        ..Facts::default()
+    };
+    let line = action_line(kind, action, errors, routable, ctx.released.as_deref());
+    // An action is its folder: a change to any of its files is a change to it.
+    let (who, when) = ctx.changes.get_folder(folder).map_or((None, None), |(w, t)| (Some(w), Some(t)));
+    Row::new(facts, None, line, who, when)
+}
+
+/// A repository's rows at its default branch's head, or `None` when the branch has no commit.
+async fn gather(hub: &Hub, repo: &Repo, env: &Env) -> anyhow::Result<Option<Held>> {
+    let branch = default_branch(repo);
+    let Some(sha) = crate::ci::load::resolve(hub, repo, &branch).await? else { return Ok(None) };
+    let (commit, ctx) = context(hub, repo, &branch, &sha).await?;
+    let mut rows: Vec<Row> = commit.workflows.iter().map(|l| workflow_row(repo, l, &ctx, env, &commit.github_note)).collect();
     for path in &commit.actions {
         let text = crate::ci::load::blob(hub, repo, &sha, path).await.unwrap_or_default();
         let (action, diags) = wf::parse_action(&text);
-        let kind = action.as_ref().map_or(Kind::Unknown, Kind::of_action);
-        let folder = path.rsplit_once('/').map_or("", |(d, _)| d);
-        let errors = diags.iter().filter(|x| x.severity == wf::Severity::Error).count();
-        let routable = match kind {
-            Kind::Firecracker => Some(env.firecracker),
-            Kind::Shards => Some(env.shards),
-            _ => None,
-        };
-        let facts = Facts {
-            kind,
-            name: action.as_ref().and_then(|a| a.name.clone()).unwrap_or_else(|| folder.rsplit('/').next().unwrap_or(folder).to_owned()),
-            path: path.clone(),
-            runs: true,
-            errors: u32::try_from(errors).unwrap_or(u32::MAX),
-            routable,
-            latest: released_outcome.0,
-            running: released_outcome.1,
-            released: released.clone(),
-            ..Facts::default()
-        };
-        let line = action_line(kind, action.as_ref(), errors, routable, released.as_deref());
-        // An action is its folder: a change to any of its files is a change to it.
-        let (who, when) = changes.get_folder(folder).map_or((None, None), |(w, t)| (Some(w), Some(t)));
-        rows.push(Row::new(facts, None, line, who, when));
+        rows.push(action_row(path, action.as_ref(), &diags, &ctx, env));
     }
     let view = core::Repo::new(repo.name.clone(), branch, sha, rows);
     let digest = view.digest;
     Ok(Some(Held { view, at: Instant::now(), digest }))
+}
+
+/// A workflow's newest runs on `branch` (both engines'), newest first, for the pane's Runs.
+async fn runs_list(hub: &Hub, repo: &Repo, branch: &str, path: &str) -> anyhow::Result<Vec<core::RunSeen>> {
+    let (id, branch, path, stem) = (repo.id.clone(), branch.to_owned(), path.to_owned(), stem_of(path));
+    hub.store
+        .call(move |c| {
+            let mut st = c.prepare(
+                "SELECT r.number, r.event, r.status FROM runs r LEFT JOIN ci_workflows w ON w.id = r.workflow_id
+                 WHERE r.repo_id = ?1 AND r.branch = ?2 AND (w.path = ?3 OR (r.workflow_id IS NULL AND r.pipeline = ?4))
+                 ORDER BY r.created_at DESC LIMIT 10",
+            )?;
+            let mut out = Vec::new();
+            for row in st.query_map(rusqlite::params![id, branch, path, stem], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))? {
+                let (number, event, status) = row?;
+                let mut seen = (None, false);
+                fold(&mut seen, &status);
+                out.push(core::RunSeen { number, event, outcome: seen.0, running: seen.1 });
+            }
+            Ok(out)
+        })
+        .await
+}
+
+/// `GET /api/ship/pipelines/:owner/:name?path=&ref=` (W29-R04): one workflow or action opened at
+/// `ref` (its repository's default branch unless given), as `kiln_ci::pipelines::pane_json`
+/// shapes it: its head, its strip's verbs, its groups and its file. A repository the caller may
+/// not read (`runs.read`) is as missing as one that isn't there.
+pub async fn get(hub: &Arc<Hub>, owner: &str, name: &str, q: &HashMap<String, String>, caller: &crate::authz::Caller) -> Result<Response, Fail> {
+    let full = format!("{owner}/{name}");
+    let missing = || (StatusCode::NOT_FOUND, format!("no repository `{full}` you may read"));
+    let internal = |e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"));
+    if let Some(names) = crate::authz::gate::readable(hub, caller, "runs.read").await
+        && !names.iter().any(|n| n == &full)
+    {
+        return Err(missing());
+    }
+    let path = q.get("path").map(String::as_str).filter(|p| !p.is_empty()).ok_or_else(|| (StatusCode::BAD_REQUEST, "`path` names the workflow or action to open".to_owned()))?;
+    let repo = hub.store.repos().await.map_err(internal)?.into_iter().find(|r| r.name == full).ok_or_else(missing)?;
+    let branch = default_branch(&repo);
+    let at = q.get("ref").filter(|r| !r.is_empty()).cloned().unwrap_or_else(|| branch.clone());
+    if !crate::ci::load::ref_ok(&at) {
+        return Err((StatusCode::BAD_REQUEST, format!("`{at}` isn't a branch, tag or commit")));
+    }
+    let sha = crate::ci::load::resolve(hub, &repo, &at).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("`{full}` has no `{at}`")))?;
+    let (commit, ctx) = context(hub, &repo, &branch, &sha).await.map_err(internal)?;
+    let none_there = || (StatusCode::NOT_FOUND, format!("`{full}` has no workflow or action at `{path}` on `{at}`"));
+    let is_workflow = commit.workflows.iter().any(|l| l.path == path);
+    if !is_workflow && !commit.actions.iter().any(|a| a == path) {
+        return Err(none_there());
+    }
+    let text = crate::ci::load::blob(hub, &repo, &sha, path).await.map_err(|_| none_there())?;
+    let env = Env::read(hub).await;
+    let (row, groups) = match commit.workflows.iter().find(|l| l.path == path) {
+        Some(l) => {
+            let row = workflow_row(&repo, l, &ctx, &env, &commit.github_note);
+            let runs = runs_list(hub, &repo, &branch, path).await.map_err(internal)?;
+            let groups = l.workflow.as_ref().map(|w| core::workflow_groups(w, &text, &runs, l.runs, &commit.github_note)).unwrap_or_default();
+            (row, groups)
+        }
+        None => {
+            let (action, diags) = wf::parse_action(&text);
+            let row = action_row(path, action.as_ref(), &diags, &ctx, &env);
+            let groups = action.as_ref().map(|a| core::action_groups(a, row.facts.kind, &text, &sha, &ctx.versions)).unwrap_or_default();
+            (row, groups)
+        }
+    };
+    let pane = core::pane_json(&core::Opened { repo: &full, row: &row, at: &at, sha: &sha, text: &text }, &groups);
+    Ok(srv::json(StatusCode::OK, &pane))
 }
 
 /// What `git -C dir <args>` prints, or nothing when it fails: what it reads is the repository's

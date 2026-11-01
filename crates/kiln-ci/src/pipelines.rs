@@ -412,13 +412,17 @@ pub fn full_version(tag: &str) -> Option<(u64, u64, u64, Option<&str>)> {
     Some((major, minor, patch, pre))
 }
 
-/// The newest full version among a repository's tags, by semver's precedence: a release comes
-/// after its own pre-releases (a tag is the whole repository's, W29-R21).
+/// A repository's full versions among its tags, newest first by semver's precedence: a release
+/// comes after its own pre-releases (a tag is the whole repository's, W29-R21).
+pub fn releases<'a>(tags: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
+    let mut out: Vec<((u64, u64, u64, bool, &str), &str)> = tags.into_iter().filter_map(|t| full_version(t).map(|(a, b, c, pre)| ((a, b, c, pre.is_none(), pre.unwrap_or_default()), t))).collect();
+    out.sort_by(|(x, _), (y, _)| y.cmp(x));
+    out.into_iter().map(|(_, t)| t).collect()
+}
+
+/// The newest full version among a repository's tags ([`releases`]' first).
 pub fn newest_release<'a>(tags: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
-    tags.into_iter()
-        .filter_map(|t| full_version(t).map(|(a, b, c, pre)| ((a, b, c, pre.is_none(), pre.unwrap_or_default()), t)))
-        .max_by(|(x, _), (y, _)| x.cmp(y))
-        .map(|(_, t)| t)
+    releases(tags).into_iter().next()
 }
 
 /// Which of two rows comes first in W29-R02's order: what needs someone first (Review, then
@@ -627,6 +631,395 @@ pub fn list_text<'a>(repos: impl IntoIterator<Item = &'a Repo>, only: Option<&[S
     body
 }
 
+/// The secrets and variables a workflow's or action's text names in its expressions
+/// (`${{ secrets.TOKEN }}`, `${{ vars.REGION }}`), each once and sorted: the pane shows names only,
+/// never a value (W29-R04).
+pub fn names_used(text: &str) -> (Vec<String>, Vec<String>) {
+    let mut secrets = std::collections::BTreeSet::new();
+    let mut vars = std::collections::BTreeSet::new();
+    let mut rest = text;
+    while let Some(open) = rest.find("${{") {
+        let after = rest.get(open + 3..).unwrap_or_default();
+        let close = after.find("}}").unwrap_or(after.len());
+        let body = after.get(..close).unwrap_or_default();
+        for (root, into) in [("secrets.", &mut secrets), ("vars.", &mut vars)] {
+            let mut b = body;
+            while let Some(at) = b.find(root) {
+                // A root, not the end of another name (`mysecrets.x`).
+                let before = b.get(..at).and_then(|x| x.chars().next_back());
+                let name: String = b.get(at + root.len()..).unwrap_or_default().chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').collect();
+                if !before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.') && !name.is_empty() {
+                    into.insert(name);
+                }
+                b = b.get(at + root.len()..).unwrap_or_default();
+            }
+        }
+        rest = after.get(close..).unwrap_or_default();
+    }
+    (secrets.into_iter().collect(), vars.into_iter().collect())
+}
+
+/// Where a `uses:` comes from (W07-R01): a file of this repository, a container image, one of
+/// kiln's own actions, a repository kiln hosts (`kiln://`), or one fetched by name (GitHub's, or
+/// wherever `[[ci.actions.sources]]` sends its owner).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UseFrom {
+    Here,
+    Image,
+    Kiln,
+    Hosted,
+    Named,
+}
+
+impl UseFrom {
+    pub fn words(self) -> &'static str {
+        match self {
+            UseFrom::Here => "this repository",
+            UseFrom::Image => "a container image",
+            UseFrom::Kiln => "kiln's own",
+            UseFrom::Hosted => "a repository kiln hosts",
+            UseFrom::Named => "fetched by name",
+        }
+    }
+}
+
+pub fn use_from(uses: &str) -> UseFrom {
+    let u = uses.trim();
+    if u.starts_with("./") || u.starts_with("$/") {
+        UseFrom::Here
+    } else if u.starts_with("docker://") {
+        UseFrom::Image
+    } else if u.starts_with("kiln://") {
+        UseFrom::Hosted
+    } else if u.starts_with("kiln/") {
+        UseFrom::Kiln
+    } else {
+        UseFrom::Named
+    }
+}
+
+/// A `uses:`'s ref, if it pins one: `owner/repo@v4` is `v4`.
+pub fn use_ref(uses: &str) -> Option<&str> {
+    uses.rsplit_once('@').map(|(_, r)| r).filter(|r| !r.is_empty())
+}
+
+/// One line of a pane's group (W29-R04's `ShipPipelineLine`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Line {
+    pub key: String,
+    /// `trigger`, `job`, `use`, `secret`, `variable`, `run`, `setting`, `input`, `output`, `step`,
+    /// `entry`, `image`, `version` or `note`.
+    pub kind: &'static str,
+    pub name: String,
+    pub value: String,
+    /// A glyph's name, where the line has a state (a run's outcome; `none` for what isn't here yet).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<&'static str>,
+    /// A trigger's group, and whose it is (W29-R06).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub whose: Option<Whose>,
+}
+
+impl Line {
+    fn new(key: impl Into<String>, kind: &'static str, name: impl Into<String>, value: impl Into<String>) -> Line {
+        Line { key: key.into(), kind, name: name.into(), value: value.into(), state: None, group: None, whose: None }
+    }
+
+    fn state(mut self, s: &'static str) -> Line {
+        self.state = Some(s);
+        self
+    }
+}
+
+/// A group of a pane: `Triggers`, `Stage 1`, `Inputs` (W29-R04).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PaneGroup {
+    pub name: String,
+    pub lines: Vec<Line>,
+}
+
+fn group(name: impl Into<String>, lines: Vec<Line>) -> PaneGroup {
+    PaneGroup { name: name.into(), lines }
+}
+
+/// A run as the pane's Runs group shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunSeen {
+    pub number: i64,
+    pub event: String,
+    pub outcome: Option<Outcome>,
+    pub running: bool,
+}
+
+/// A job's line: its name, where it runs (its labels, and bare metal unless a container is
+/// asked for) or the workflow it calls, and what it needs.
+fn job_line(j: &crate::wf::Job) -> Line {
+    let mut value = match (&j.uses, &j.runs_on) {
+        (Some(u), _) => format!("calls {u}"),
+        (None, Some(crate::wf::ir::RunsOn::Labels(l))) => l.iter().map(|t| t.src.as_str()).collect::<Vec<_>>().join(", "),
+        (None, Some(crate::wf::ir::RunsOn::Group { group, labels })) => {
+            let labels = labels.iter().map(|t| t.src.as_str()).collect::<Vec<_>>().join(", ");
+            match group {
+                Some(g) if labels.is_empty() => format!("group {}", g.src),
+                Some(g) => format!("group {} · {labels}", g.src),
+                None => labels,
+            }
+        }
+        (None, None) => String::new(),
+    };
+    if j.uses.is_none() {
+        let machine = if j.container.is_some() || j.kiln.image.is_some() { "in a container" } else { "bare metal" };
+        value = if value.is_empty() { machine.to_owned() } else { format!("{value} · {machine}") };
+    }
+    if !j.needs.is_empty() {
+        value.push_str(&format!(" · needs {}", j.needs.iter().map(|n| n.job()).collect::<Vec<_>>().join(", ")));
+    }
+    Line::new(format!("jobs.{}", j.id), "job", j.name.as_ref().map_or_else(|| j.id.clone(), |n| n.src.clone()), value)
+}
+
+fn outcome_glyph(outcome: Option<Outcome>, running: bool) -> &'static str {
+    match (running, outcome) {
+        (true, _) => "running",
+        (false, Some(Outcome::Passed)) => "passed",
+        (false, Some(Outcome::Failed)) => "failed",
+        (false, Some(Outcome::Cancelled) | None) => "none",
+    }
+}
+
+/// A workflow's groups (W29-R04): Triggers, its stages, Uses, Secrets and variables (names only),
+/// Runs, Settings, and a reusable workflow's interface.
+pub fn workflow_groups(w: &Workflow, text: &str, runs: &[RunSeen], runs_here: bool, note: &str) -> Vec<PaneGroup> {
+    let mut out = Vec::new();
+    let triggers: Vec<Line> = w
+        .on
+        .iter()
+        .map(|t| {
+            let l = trigger_line(t);
+            Line { key: format!("on.{}", t.event), kind: "trigger", name: l.words, value: l.value, state: None, group: Some(l.group.words()), whose: l.whose }
+        })
+        .collect();
+    out.push(group("Triggers", triggers));
+    if let Some(call) = w.trigger("workflow_call") {
+        let mut lines: Vec<Line> = call
+            .inputs
+            .iter()
+            .map(|i| {
+                let mut v = i.ty.clone().unwrap_or_else(|| "string".into());
+                v.push_str(if i.required { " · required" } else { "" });
+                Line::new(format!("call.inputs.{}", i.name), "input", i.name.clone(), v)
+            })
+            .collect();
+        lines.extend(call.outputs.iter().map(|o| Line::new(format!("call.outputs.{}", o.name), "output", o.name.clone(), o.value.src.clone())));
+        lines.extend(call.secrets.iter().map(|x| Line::new(format!("call.secrets.{}", x.name), "secret", x.name.clone(), if x.required { "required" } else { "optional" })));
+        out.push(group("Called with", lines));
+    }
+    for (i, ids) in stages(w).iter().enumerate() {
+        let lines = ids.iter().filter_map(|id| w.job(id)).map(job_line).collect();
+        out.push(group(format!("Stage {}", i + 1), lines));
+    }
+    let mut uses: Vec<Line> = Vec::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for j in &w.jobs {
+        let calls = j.uses.iter().map(|u| (u.as_str(), true));
+        let steps = j.steps.iter().filter_map(|s| s.uses.as_deref()).map(|u| (u, false));
+        for (u, call) in calls.chain(steps) {
+            if !seen.insert(u) {
+                continue;
+            }
+            let mut value = use_from(u).words().to_owned();
+            if call {
+                value = format!("a reusable workflow, {value}");
+            }
+            if let Some(r) = use_ref(u) {
+                value.push_str(&format!(" · {r}"));
+            }
+            uses.push(Line::new(format!("uses.{u}"), "use", u, value));
+        }
+    }
+    out.push(group("Uses", uses));
+    let (secrets, vars) = names_used(text);
+    let mut declared: Vec<String> = w.secrets.iter().map(|x| x.name.clone()).collect();
+    declared.extend(w.trigger("workflow_call").map(|t| t.secrets.iter().map(|x| x.name.clone()).collect::<Vec<_>>()).unwrap_or_default());
+    let mut names: Vec<Line> = Vec::new();
+    for n in secrets.iter().chain(declared.iter().filter(|d| !secrets.contains(d))) {
+        let value = match (secrets.contains(n), declared.contains(n)) {
+            (true, true) => "declared, used",
+            (false, true) => "declared",
+            _ => "used",
+        };
+        names.push(Line::new(format!("secrets.{n}"), "secret", n.clone(), value));
+    }
+    names.extend(vars.iter().map(|n| Line::new(format!("vars.{n}"), "variable", n.clone(), "used")));
+    out.push(group("Secrets and variables", names));
+    let runs_lines: Vec<Line> = runs
+        .iter()
+        .map(|r| {
+            let status = match (r.running, r.outcome) {
+                (true, _) => "under way",
+                (false, Some(Outcome::Passed)) => "passed",
+                (false, Some(Outcome::Failed)) => "failed",
+                (false, Some(Outcome::Cancelled)) => "cancelled",
+                (false, None) => "queued",
+            };
+            Line::new(format!("runs.{}", r.number), "run", format!("#{}", r.number), format!("{} · {status}", r.event)).state(outcome_glyph(r.outcome, r.running))
+        })
+        .collect();
+    out.push(group("Runs", runs_lines));
+    let mut settings = vec![if runs_here { Line::new("settings.on", "setting", "Turned on", "runs on its triggers") } else { Line::new("settings.on", "setting", "Not run here", note) }];
+    settings.push(Line::new("settings.machines", "setting", "Machines", "bare metal unless a job says"));
+    if let Some(c) = &w.concurrency {
+        settings.push(Line::new("settings.concurrency", "setting", "Concurrency", c.group.src.clone()));
+    }
+    out.push(group("Settings", settings));
+    out
+}
+
+/// What a microVM action's `runs` says beyond what `wf::Action` reads (W29-R29, R30's `resources`
+/// and `egress`), from its text: each `None` when not given.
+fn microvm_keys(text: &str) -> (Option<String>, Option<String>) {
+    let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(text) else { return (None, None) };
+    let runs = doc.get("runs");
+    let resources = runs.and_then(|r| r.get("resources")).and_then(|v| v.as_mapping()).map(|m| {
+        m.iter().filter_map(|(k, v)| Some(format!("{} {}", k.as_str()?, yaml_scalar(v)?))).collect::<Vec<_>>().join(", ")
+    });
+    let egress = runs.and_then(|r| r.get("egress")).and_then(|v| v.as_sequence()).map(|s| s.iter().filter_map(yaml_scalar).collect::<Vec<_>>().join(", "));
+    (resources.filter(|s| !s.is_empty()), egress.filter(|s| !s.is_empty()))
+}
+
+fn yaml_scalar(v: &serde_yaml::Value) -> Option<String> {
+    match v {
+        serde_yaml::Value::String(s) => Some(s.clone()),
+        serde_yaml::Value::Number(n) => Some(n.to_string()),
+        serde_yaml::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// An action's groups (W29-R04): Inputs and Outputs, then its kind's own (a composite's steps, a
+/// JavaScript action's entry points, a Docker action's image, a microVM's image, resources and
+/// egress), its Versions (`tags`: newest first, each with its commit), and what comes with
+/// sharing (Used by, Access: W29-R17, R20).
+pub fn action_groups(a: &Action, kind: Kind, text: &str, head: &str, tags: &[(String, String)]) -> Vec<PaneGroup> {
+    let mut out = Vec::new();
+    let inputs = a
+        .inputs
+        .iter()
+        .map(|i| {
+            let mut v = if i.required { "required".to_owned() } else { i.default.as_ref().map_or_else(|| "optional".to_owned(), |d| format!("default {}", d.src)) };
+            if let Some(d) = i.description.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+                v.push_str(&format!(" · {d}"));
+            }
+            Line::new(format!("inputs.{}", i.name), "input", i.name.clone(), v)
+        })
+        .collect();
+    out.push(group("Inputs", inputs));
+    out.push(group("Outputs", a.outputs.iter().map(|o| Line::new(format!("outputs.{}", o.name), "output", o.name.clone(), o.description.clone().unwrap_or_default())).collect()));
+    let r = &a.runs;
+    match kind {
+        Kind::Composite => {
+            let steps = r
+                .steps
+                .iter()
+                .enumerate()
+                .map(|(i, st)| {
+                    let name = st.name.as_ref().map(|n| n.src.clone()).or_else(|| st.id.clone()).unwrap_or_else(|| format!("step {}", i + 1));
+                    let value = st.uses.clone().or_else(|| st.run.as_ref().map(|x| x.src.lines().next().unwrap_or_default().to_owned())).unwrap_or_default();
+                    Line::new(format!("runs.steps.{i}"), "step", name, value)
+                })
+                .collect();
+            out.push(group("Steps", steps));
+        }
+        Kind::Javascript => {
+            let lines = [("main", &r.main), ("pre", &r.pre), ("post", &r.post)].into_iter().filter_map(|(k, v)| v.as_ref().map(|f| Line::new(format!("runs.{k}"), "entry", k, f.clone()))).collect();
+            out.push(group(format!("Runs on Node ({})", r.using), lines));
+        }
+        Kind::Docker => {
+            let mut lines = vec![Line::new("runs.image", "image", "image", r.image.clone().unwrap_or_default())];
+            lines.extend(r.entrypoint.as_ref().map(|e| Line::new("runs.entrypoint", "entry", "entrypoint", e.clone())));
+            if !r.args.is_empty() {
+                lines.push(Line::new("runs.args", "entry", "args", r.args.iter().map(|t| t.src.as_str()).collect::<Vec<_>>().join(" ")));
+            }
+            out.push(group("Image", lines));
+        }
+        Kind::Firecracker | Kind::Shards => {
+            let (resources, egress) = microvm_keys(text);
+            let mut lines = vec![Line::new("runs.image", "image", "image", r.image.clone().unwrap_or_default())];
+            lines.push(Line::new("runs.resources", "setting", "resources", resources.unwrap_or_else(|| "as the leg's".into())));
+            lines.push(Line::new("runs.egress", "setting", "egress", egress.unwrap_or_else(|| "none".into())));
+            out.push(group(if kind == Kind::Firecracker { "Firecracker microVM" } else { "Shards microVM" }, lines));
+        }
+        Kind::Workflow | Kind::Reusable | Kind::Unknown => {}
+    }
+    let mut versions = vec![Line::new("versions.head", "version", "the default branch's tip", head.get(..12).unwrap_or(head))];
+    versions.extend(tags.iter().map(|(t, sha)| Line::new(format!("versions.{t}"), "version", t.clone(), sha.get(..12).unwrap_or(sha))));
+    out.push(group("Versions", versions));
+    out.push(group("Used by", vec![Line::new("used_by", "note", "Who uses it", "comes with sharing (W29-R20)").state("none")]));
+    out.push(group("Settings", vec![Line::new("settings.access", "setting", "Access", "not shared: Access comes with sharing (W29-R17)").state("none")]));
+    out
+}
+
+/// A strip's verb (W29-R04's `ShipPipelineVerb`): dimmed, with why, until it's built; never
+/// hidden.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Verb {
+    pub verb: &'static str,
+    pub label: &'static str,
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub why_not: Option<&'static str>,
+}
+
+/// The strip's verbs for a row of `kind` (W29-R04): Run, Save draft, Ready and Discard, and
+/// Release for an action or reusable workflow. None is built yet (the master plan's steps 4 to 6),
+/// so each says when it comes.
+pub fn verbs(kind: Kind) -> Vec<Verb> {
+    let dim = |verb, label, why| Verb { verb, label, enabled: false, why_not: Some(why) };
+    let mut out = vec![
+        dim("run", "Run", "Run by hand comes with drafts (W29-R14)"),
+        dim("save_draft", "Save draft", "Drafts come next (W29-R10, R11)"),
+        dim("ready", "Ready", "Drafts come next (W29-R12)"),
+        dim("discard", "Discard", "Drafts come next (W29-R13)"),
+    ];
+    if kind.is_action() || kind == Kind::Reusable {
+        out.push(dim("release", "Release", "Releases by tag come after sharing (W29-R21)"));
+    }
+    out
+}
+
+/// What the pane's head and detail say of the opened file (W29-R04).
+#[derive(Debug, Clone)]
+pub struct Opened<'a> {
+    pub repo: &'a str,
+    pub row: &'a Row,
+    pub at: &'a str,
+    pub sha: &'a str,
+    pub text: &'a str,
+}
+
+/// An opened row's pane (W29-R04's `ShipPipelinePane { head, strip, groups, detail }`).
+pub fn pane_json(o: &Opened<'_>, groups: &[PaneGroup]) -> Value {
+    let f = &o.row.facts;
+    let views: &[&str] = if f.kind.is_action() { &["Changes", "YAML", "Try it"] } else { &["YAML", "Flow", "Plan"] };
+    json!({
+        "head": {
+            "title": f.name, "path": f.path, "kind": f.kind.as_str(), "dialect": o.row.dialect,
+            "ref": o.at, "commit": o.sha, "draft": Value::Null,
+            "stand": o.row.standing.stand, "word": o.row.standing.word, "pips": o.row.standing.pips,
+        },
+        "strip": {
+            "said": [format!("{} · {}", f.kind.words(), o.row.line)],
+            "pick": ["all"],
+            "verbs": verbs(f.kind),
+        },
+        "groups": groups,
+        "detail": { "name": f.path, "views": views, "text": o.text },
+        "repo": o.repo,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -810,6 +1203,121 @@ mod tests {
         }
     }
 
+    /// Every one of GitHub's events, as `on:` names it, in a GitHub-dialect workflow.
+    const EVERY_GITHUB_EVENT: &str = "name: every event\non:\n  branch_protection_rule:\n  check_run:\n  check_suite:\n  create:\n  delete:\n  deployment:\n  deployment_status:\n  discussion:\n  discussion_comment:\n  fork:\n  gollum:\n  image_version:\n  issue_comment:\n  issues:\n  label:\n  merge_group:\n  milestone:\n  page_build:\n  project:\n  project_card:\n  project_column:\n  public:\n  pull_request:\n    branches: [main]\n  pull_request_review:\n  pull_request_review_comment:\n  pull_request_target:\n  push:\n    branches: [main]\n    paths: ['crates/**']\n  registry_package:\n  release:\n    types: [published]\n  repository_dispatch:\n  schedule:\n    - cron: '0 3 * * *'\n  status:\n  watch:\n  workflow_call:\n    inputs:\n      toolchain:\n        type: string\n        required: true\n    outputs:\n      built:\n        value: ${{ jobs.build.outputs.built }}\n    secrets:\n      TOKEN:\n        required: true\n  workflow_dispatch:\n  workflow_run:\n    workflows: [ci]\n    types: [completed]\njobs:\n  build:\n    runs-on: [linux, x64]\n    outputs:\n      built: yes\n    steps:\n      - uses: actions/checkout@v4\n      - run: echo ${{ secrets.TOKEN }} ${{ vars.REGION }}\n  test:\n    needs: build\n    runs-on: linux\n    steps:\n      - uses: ./.github/actions/setup\n";
+
+    /// Every one of kiln's events, in a kiln-dialect workflow.
+    const EVERY_KILN_EVENT: &str = "name: every kiln event\non:\n  diff:\n  land:\n  review:\n  comment:\n  pipeline:\n    workflows: [ci]\n  agent:\n  deploy:\n  webhook:\n  manual:\n  tag:\njobs:\n  check:\n    runs-on: local\n    steps:\n      - run: echo checked\n";
+
+    #[test]
+    fn w29_r04_every_trigger_kind_in_a_pane() {
+        let mut lines = 0;
+        for (path, text, events) in [(".github/workflows/every.yml", EVERY_GITHUB_EVENT, GHA_EVENTS), (".kiln/every.yaml", EVERY_KILN_EVENT, KILN_EVENTS)] {
+            let (_, w) = crate::wf::check_model(path, text, None);
+            let w = w.unwrap_or_default();
+            let groups = workflow_groups(&w, text, &[], true, "");
+            let triggers = groups.iter().find(|g| g.name == "Triggers").map(|g| g.lines.clone()).unwrap_or_default();
+            for e in events {
+                // kiln's v1 forms are read as the events they are (W02-R06): `manual` is
+                // `workflow_dispatch`, `tag` a push of tags.
+                let key = match *e {
+                    "manual" => "on.workflow_dispatch".to_owned(),
+                    "tag" => "on.push".to_owned(),
+                    other => format!("on.{other}"),
+                };
+                let l = triggers.iter().find(|l| l.key == key);
+                assert!(l.is_some_and(|l| !l.name.is_empty() && l.group.is_some()), "{path}: `{e}` has no line with its group and words: {triggers:?}");
+            }
+            if path.starts_with(".kiln/") {
+                let tag = triggers.iter().find(|l| l.key == "on.push").map(|l| l.value.clone());
+                assert_eq!(tag.as_deref(), Some("tags *"), "v1's `tag`: {triggers:?}");
+            }
+            lines += triggers.len();
+        }
+        assert_eq!(lines, GHA_EVENTS.len() + KILN_EVENTS.len(), "46 lines between the two panes");
+    }
+
+    #[test]
+    fn w29_r04_a_workflows_groups() {
+        let (_, w) = crate::wf::check_model(".github/workflows/every.yml", EVERY_GITHUB_EVENT, None);
+        let w = w.unwrap_or_default();
+        let runs = [RunSeen { number: 12, event: "push".into(), outcome: Some(Outcome::Failed), running: false }, RunSeen { number: 13, event: "schedule".into(), outcome: None, running: true }];
+        let groups = workflow_groups(&w, EVERY_GITHUB_EVENT, &runs, true, "");
+        let names: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, ["Triggers", "Called with", "Stage 1", "Stage 2", "Uses", "Secrets and variables", "Runs", "Settings"]);
+        let lines = |n: &str| groups.iter().find(|g| g.name == n).map(|g| g.lines.clone()).unwrap_or_default();
+        let call: Vec<(&str, String)> = lines("Called with").iter().map(|l| (l.kind, l.name.clone())).collect();
+        assert_eq!(call, [("input", "toolchain".to_owned()), ("output", "built".into()), ("secret", "TOKEN".into())], "a reusable workflow's workflow_call inputs, outputs and secrets");
+        let push = lines("Triggers").into_iter().find(|l| l.key == "on.push").unwrap_or_else(|| Line::new("", "trigger", "", ""));
+        assert_eq!((push.value.as_str(), push.group, push.whose), ("branches main · paths crates/**", Some("Code"), Some(Whose::Both)));
+        assert_eq!(lines("Stage 2").first().map(|l| l.value.clone()), Some("linux · bare metal · needs build".to_owned()));
+        let uses: Vec<String> = lines("Uses").iter().map(|l| format!("{}: {}", l.name, l.value)).collect();
+        assert_eq!(uses, ["actions/checkout@v4: fetched by name · v4", "./.github/actions/setup: this repository"]);
+        let names_only: Vec<(&str, String, String)> = lines("Secrets and variables").iter().map(|l| (l.kind, l.name.clone(), l.value.clone())).collect();
+        assert_eq!(names_only, [("secret", "TOKEN".to_owned(), "declared, used".to_owned()), ("variable", "REGION".into(), "used".into())]);
+        assert!(groups.iter().flat_map(|g| &g.lines).all(|l| !l.value.contains("${{ secrets")), "names only, never a value");
+        let runs: Vec<(String, Option<&str>)> = lines("Runs").iter().map(|l| (l.value.clone(), l.state)).collect();
+        assert_eq!(runs, [("push · failed".to_owned(), Some("failed")), ("schedule · under way".into(), Some("running"))]);
+        let off = workflow_groups(&w, EVERY_GITHUB_EVENT, &[], false, "GitHub workflows not run: this commit has .kiln/ workflows");
+        assert_eq!(off.iter().find(|g| g.name == "Settings").and_then(|g| g.lines.first()).map(|l| l.name.clone()), Some("Not run here".to_owned()));
+    }
+
+    #[test]
+    fn w29_r04_an_actions_groups_by_kind() {
+        let cases = [
+            ("name: setup\ninputs:\n  toolchain:\n    description: Which toolchain\n    required: true\n  cache:\n    default: 'true'\noutputs:\n  path:\n    description: Where it went\nruns:\n  using: composite\n  steps:\n    - name: Install\n      run: echo installing\n      shell: bash\n    - uses: actions/cache@v4\n", Kind::Composite, "Steps", vec!["Install: echo installing", "step 2: actions/cache@v4"]),
+            ("name: comment\nruns:\n  using: node24\n  main: dist/index.js\n  post: dist/post.js\n", Kind::Javascript, "Runs on Node (node24)", vec!["main: dist/index.js", "post: dist/post.js"]),
+            ("name: image\nruns:\n  using: docker\n  image: Dockerfile\n  entrypoint: /entry.sh\n  args: [--fast]\n", Kind::Docker, "Image", vec!["image: Dockerfile", "entrypoint: /entry.sh", "args: --fast"]),
+            ("name: fuzz\nruns:\n  using: firecracker\n  image: docker://alpine:3.20\n  resources:\n    cpus: 2\n    memory: 4g\n  egress: [crates.io, static.rust-lang.org]\n", Kind::Firecracker, "Firecracker microVM", vec!["image: docker://alpine:3.20", "resources: cpus 2, memory 4g", "egress: crates.io, static.rust-lang.org"]),
+            ("name: sandbox\nruns:\n  using: shards\n  image: docker://alpine:3.20\n", Kind::Shards, "Shards microVM", vec!["image: docker://alpine:3.20", "resources: as the leg's", "egress: none"]),
+        ];
+        let tags = vec![("v2.4.0".to_owned(), "1234567890abcdef1234".to_owned())];
+        for (text, kind, own, want) in cases {
+            let (a, _) = crate::wf::parse_action(text);
+            let a = a.unwrap_or_default();
+            assert_eq!(Kind::of_action(&a), kind, "{text}");
+            let groups = action_groups(&a, kind, text, "a3f2c1d4e5f60718", &tags);
+            let names: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
+            assert_eq!(names, ["Inputs", "Outputs", own, "Versions", "Used by", "Settings"], "{kind:?}");
+            let lines: Vec<String> = groups.iter().find(|g| g.name == own).map(|g| g.lines.iter().map(|l| format!("{}: {}", l.name, l.value)).collect()).unwrap_or_default();
+            assert_eq!(lines, want, "{kind:?}");
+            let versions: Vec<String> = groups.iter().find(|g| g.name == "Versions").map(|g| g.lines.iter().map(|l| l.name.clone()).collect()).unwrap_or_default();
+            assert_eq!(versions, ["the default branch's tip", "v2.4.0"]);
+        }
+        let (a, _) = crate::wf::parse_action(cases_text());
+        let groups = action_groups(&a.unwrap_or_default(), Kind::Composite, cases_text(), "a3f2", &[]);
+        let inputs: Vec<String> = groups.iter().find(|g| g.name == "Inputs").map(|g| g.lines.iter().map(|l| format!("{}: {}", l.name, l.value)).collect()).unwrap_or_default();
+        assert_eq!(inputs, ["toolchain: required · Which toolchain", "cache: default true"]);
+    }
+
+    fn cases_text() -> &'static str {
+        "name: setup\ninputs:\n  toolchain:\n    description: Which toolchain\n    required: true\n  cache:\n    default: 'true'\nruns:\n  using: composite\n  steps:\n    - run: echo hi\n      shell: bash\n"
+    }
+
+    #[test]
+    fn w29_r04_verbs_are_dimmed_never_hidden() {
+        let w = verbs(Kind::Workflow);
+        assert_eq!(w.iter().map(|v| v.verb).collect::<Vec<_>>(), ["run", "save_draft", "ready", "discard"]);
+        assert!(w.iter().all(|v| !v.enabled && v.why_not.is_some_and(|y| y.contains("W29-R"))), "{w:?}");
+        assert_eq!(verbs(Kind::Composite).iter().map(|v| v.verb).collect::<Vec<_>>(), ["run", "save_draft", "ready", "discard", "release"]);
+        assert!(verbs(Kind::Reusable).iter().any(|v| v.verb == "release"));
+    }
+
+    #[test]
+    fn w29_r04_names_used_are_names_only() {
+        let text = "env:\n  T: ${{ secrets.TOKEN }}\n  R: ${{ vars.REGION }}\n  X: ${{ secrets.TOKEN }} ${{ fromJSON(vars.MATRIX) }}\n  N: ${{ mysecrets.NOPE }} secrets.OUTSIDE\n";
+        assert_eq!(names_used(text), (vec!["TOKEN".to_owned()], vec!["MATRIX".to_owned(), "REGION".into()]));
+    }
+
+    #[test]
+    fn w29_r04_where_a_use_comes_from() {
+        for (u, f) in [("./.github/actions/setup", UseFrom::Here), ("docker://alpine:3.20", UseFrom::Image), ("kiln/checkout@v1", UseFrom::Kiln), ("kiln://acme/kit/x@v2", UseFrom::Hosted), ("actions/checkout@v4", UseFrom::Named)] {
+            assert_eq!(use_from(u), f, "{u}");
+        }
+        assert_eq!(use_ref("actions/checkout@v4"), Some("v4"));
+        assert_eq!(use_ref("./local"), None);
+    }
+
     #[test]
     fn w29_r21_full_versions_and_the_newest_release() {
         assert_eq!(full_version("v2.4.1"), Some((2, 4, 1, None)));
@@ -821,6 +1329,7 @@ mod tests {
         assert_eq!(newest_release(["v2.0.0-rc.1", "v1.10.0"]), Some("v2.0.0-rc.1"));
         assert_eq!(newest_release(["v2.0.0-rc.2", "v2.0.0", "v2.0.0-rc.10"]), Some("v2.0.0"));
         assert_eq!(newest_release(["v2", "main"]), None);
+        assert_eq!(releases(["v1.0.0", "v2", "v1.10.0", "v1.2.0-rc.1", "v1.2.0"]), ["v1.10.0", "v1.2.0", "v1.2.0-rc.1", "v1.0.0"]);
     }
 
     #[test]
