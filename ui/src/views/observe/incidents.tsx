@@ -16,7 +16,7 @@ import { Segmented } from "@/components/ui/tabs";
 import { toast } from "@/components/ui/toast";
 import { useRes, warm, type Res } from "@/lib/data";
 import { formatDuration, relativeTime } from "@/lib/format";
-import { errorMessage } from "@/lib/hooks";
+import { errorMessage, useFieldText } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 import { Link, useNavigate } from "@/lib/router";
 import { ObserveNav, integrationsRes, useParam, useParams } from "./parts";
@@ -114,7 +114,7 @@ export default function Incidents() {
           options={[{ value: "", label: "Any severity" }, ...SEVERITIES.map((s) => ({ value: s, label: s === "UNKNOWN" ? "Unknown" : s }))]}
           className="min-w-[9rem]"
         />
-        <Search key={q} q={q} onQ={(v) => set({ q: v || null, offset: null })} />
+        <Search q={q} onQ={(v) => set({ q: v || null, offset: null })} />
       </div>
       <Loadable key={`${query}/${from}`} label="the incidents" fallback={<TableHold head={<Head />} rows={4} />}>
         <List query={query} from={from} onFrom={(n) => setOffset(String(n))} filtered={Boolean(base)} show={shown} onDeclare={() => setDeclaring(true)} />
@@ -136,7 +136,7 @@ function Counted({ base, show, onShow }: { base: string; show: Show; onShow: (s:
 }
 
 function Search({ q, onQ }: { q: string; onQ: (q: string) => void }) {
-  const [text, setText] = React.useState(q);
+  const [text, setText] = useFieldText(q);
   return (
     <form
       className="field w-full sm:ml-auto sm:w-80"

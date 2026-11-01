@@ -290,17 +290,31 @@ pub async fn run(handle: &Handle, me: &str, req: RunReq, ev: async_channel::Send
     }
 }
 
+/// The command `req` asks for, as a runner is asked to run it. A detached one asks its runner to
+/// wait for its asker for ever ([`wire::DETACHED`], docs/reach.md §4.2).
+fn spec_of(req: &RunReq) -> RunSpec {
+    RunSpec {
+        command: req.command.clone(),
+        env: req.env.clone(),
+        stdin: req.stdin,
+        timeout_ms: req.timeout_ms,
+        linger_ms: req.detach.then_some(wire::DETACHED),
+        shell: req.shell.clone(),
+        ..RunSpec::default()
+    }
+}
+
 async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &async_channel::Sender<Ev>, ctl: async_channel::Receiver<Req>) -> anyhow::Result<()> {
     let choice = pick(handle, me, &req.target).await?;
     let peer = choice.runner.name.clone();
     let _ = ev.send(Ev::Picked { runner: peer.clone(), why: choice.why.clone() }).await;
-    let mut spec = RunSpec { command: req.command.clone(), env: req.env.clone(), stdin: req.stdin, timeout_ms: req.timeout_ms, shell: req.shell.clone(), ..RunSpec::default() };
+    let mut spec = spec_of(&req);
     if peer == me {
         // This machine suits best: no copy, no link — the folder as it is.
         spec.cwd = req.cwd.clone().or(req.remote_cwd.clone());
         let permit = handle.admission().acquire(&peer, Want::parse(&req.target)?.needs).await?;
         let lease = handle.admission().claim(permit, me).await?;
-        return run_here(spec, ev, ctl, lease).await;
+        return run_here(spec, req.detach, ev, ctl, lease).await;
     }
     handle.connect(&peer).await?;
     if req.sync {
@@ -357,8 +371,9 @@ async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &async_channel::S
                 Ok(_) => {}
                 Err(_) => {
                     if req.detach {
-                        // It keeps running over there; nobody here follows it any more.
-                        handle.leave(&peer, Some(id), None).await;
+                        // It keeps running over there, followed on alone: its output taken and
+                        // let go, its link made again after a drop, until it ends.
+                        handle.detach(&peer, id).await;
                         return Ok(());
                     }
                     handle.send(&peer, Ask::Signal { id, signal: Signal::Terminate }).await;
@@ -374,8 +389,9 @@ async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &async_channel::S
     }
 }
 
-/// Run on this machine (it suited best): the same events, no link.
-async fn run_here(spec: RunSpec, ev: &async_channel::Sender<Ev>, ctl: async_channel::Receiver<Req>, lease: super::leases::Lease) -> anyhow::Result<()> {
+/// Run on this machine (it suited best): the same events, no link. A detached run goes on after
+/// its client, under its lease, its events read to its end so that its output never makes it wait.
+async fn run_here(spec: RunSpec, detach: bool, ev: &async_channel::Sender<Ev>, ctl: async_channel::Receiver<Req>, lease: super::leases::Lease) -> anyhow::Result<()> {
     let cwd = super::serve::resolve_cwd(&spec, None)?;
     let (tx, rx) = async_channel::bounded::<super::serve::Event>(16);
     let shell = spec.shell.as_deref().map(|s| crate::os::home_dir().join(".kiln").join("reach").join("shells").join(s));
@@ -405,6 +421,7 @@ async fn run_here(spec: RunSpec, ev: &async_channel::Sender<Ev>, ctl: async_chan
                     if !fence.load(std::sync::atomic::Ordering::Acquire) && let Some(p) = pid { super::serve::signal_group(p, s); }
                 },
                 Ok(_) => {}
+                Err(_) if detach => break,
                 Err(_) => {
                     fence.store(true, std::sync::atomic::Ordering::Release);
                     return Ok(());
@@ -412,6 +429,16 @@ async fn run_here(spec: RunSpec, ev: &async_channel::Sender<Ev>, ctl: async_chan
             },
         }
     }
+    // Its input ends with its client.
+    drop(stdin);
+    crate::rt::spawn(async move {
+        while let Ok(e) = rx.recv().await {
+            if matches!(e, super::serve::Event::Exit { .. }) {
+                return;
+            }
+        }
+    });
+    Ok(())
 }
 
 /// Serve the socket at `path` until this process exits. Unix only.
@@ -616,6 +643,15 @@ mod tests {
         anyhow::ensure!(choose_socket(all()?, "00000000").is_err(), "two live runners, neither installed, were told apart");
         anyhow::ensure!(choose_socket(vec![path("reach-lab-0-deadbeef.sock")], "4b48ed43").is_err(), "an ended runner's socket was chosen");
         Ok(())
+    }
+
+    /// A detached run asks its runner to wait for its asker for ever, and only a detached one
+    /// (docs/reach.md §4.2): a runner from before then never stops it for want of its asker.
+    #[test]
+    fn a_detached_run_asks_to_be_waited_for_for_ever() {
+        let req = RunReq { command: "true".into(), detach: true, ..RunReq::default() };
+        assert_eq!(spec_of(&req).linger_ms, Some(wire::DETACHED));
+        assert_eq!(spec_of(&RunReq { detach: false, ..req }).linger_ms, None);
     }
 }
 

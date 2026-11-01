@@ -5,10 +5,13 @@
 //!
 //! Asking side: one session per runner it talks to, carried by one link at a time. A link that
 //! drops is replaced (backoff from 200 ms to 5 s) and the session resumed: each run it follows
-//! continues from the last byte that arrived.
+//! continues from the last byte that arrived. A detached run whose client went is followed on
+//! alone: its output taken and let go, its link made again after a drop, until it ends.
 //!
 //! Doing side: a run outlives its link. Its output waits (up to [`BUFFER`], then the command waits
 //! too) until the asker's session comes back on a new link, for as long as the run's linger allows.
+//! A detached run ([`wire::DETACHED`]) waits for no one: with [`BUFFER`] held and no link, or nothing
+//! taken for [`GIVE_WAY`], its oldest output gives way, counted as lost.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -35,6 +38,9 @@ pub const BUFFER: u64 = 16 << 20;
 const FRAME: usize = 256 * 1024;
 /// How long a run waits for its asker to come back, unless it says otherwise.
 const LINGER: Duration = Duration::from_secs(15 * 60);
+/// A detached run's output held at [`BUFFER`] with a link up but none of it taken this long (an
+/// asker from before detached runs were followed, or a stalled one) gives way, as with no link.
+const GIVE_WAY: Duration = Duration::from_secs(10);
 /// A finished run nobody collected is dropped after this long without a link.
 const UNCOLLECTED: Duration = Duration::from_secs(10 * 60);
 /// A link that has not finished its handshake in this long is given up.
@@ -175,6 +181,8 @@ pub enum Local {
     SyncAsk { peer: String, ask: SyncAsk },
     /// Stop following a run or a sync.
     Leave { peer: String, run: Option<u64>, sync: Option<String> },
+    /// A detached run's client went: the run is followed on alone ([`Follow::detached`]).
+    Detach { peer: String, run: u64 },
     /// A test's: `bytes` as they are, on this node's link to `peer`, as if a message.
     #[cfg(test)]
     Garble { peer: String, bytes: Vec<u8> },
@@ -279,6 +287,12 @@ impl Handle {
 
     pub async fn leave(&self, peer: &str, run: Option<u64>, sync: Option<String>) {
         let _ = self.tx.send(In::Local(Local::Leave { peer: peer.to_owned(), run, sync })).await;
+    }
+
+    /// The client of `run`, a detached run on `peer`, went (docs/reach.md §4.2): it's followed on
+    /// without one until it ends.
+    pub async fn detach(&self, peer: &str, run: u64) {
+        let _ = self.tx.send(In::Local(Local::Detach { peer: peer.to_owned(), run })).await;
     }
 
     /// A test's: `bytes` sent as they are on this node's link to `peer`, where a message would go.
@@ -543,6 +557,10 @@ struct Follow {
     /// Output offset received up to.
     got: u64,
     exited: bool,
+    /// Its client went and it said `--detach` (docs/reach.md §4.2): its output is taken and let go,
+    /// so it never waits on this side, and its peer has work, so a link that drops is made again;
+    /// it isn't a run an upgrade waits for.
+    detached: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -618,6 +636,30 @@ struct Served {
     /// Shared with the run's forwarder: bytes held, and its wake-up when that drops.
     held: Arc<AtomicU64>,
     room: Arc<event_listener::Event>,
+    /// Its asker may never come back for it ([`wire::DETACHED`]): held output gives way rather
+    /// than make it wait.
+    detached: bool,
+    /// When its asker last took output (or its session came back on a link).
+    taken: Instant,
+    /// Output that gave way unread: what its exit says was lost.
+    dropped: u64,
+}
+
+impl Served {
+    /// A detached run's held output gives way, oldest first, down to half of [`BUFFER`], and its
+    /// command goes on: what wasn't taken counts as lost, and an asker that comes back hears of it
+    /// by the jump in offsets.
+    fn give_way(&mut self) {
+        while self.held.load(Ordering::Relaxed) > BUFFER / 2 {
+            let Some((off, _, d)) = self.buf.pop_front() else { break };
+            let end = off + d.len() as u64;
+            self.held.fetch_sub(d.len() as u64, Ordering::Relaxed);
+            self.dropped += end.saturating_sub(self.acked.max(off));
+            self.acked = self.acked.max(end);
+            self.sent = self.sent.max(end);
+        }
+        self.room.notify(usize::MAX);
+    }
 }
 
 /// A session another runner holds with this one.
@@ -1180,12 +1222,15 @@ impl Node {
                 let start = offset.max(f.got);
                 let data = data.get(usize::try_from(start - offset).unwrap_or(0)..).map(<[u8]>::to_vec).unwrap_or_default();
                 f.got = end;
-                let says = f.says.clone();
-                if lost > 0 {
-                    let note = format!("\n[kiln reach: {lost} bytes of output were dropped]\n").into_bytes();
-                    let _ = says.send(Say::Output { id, offset: start, stream: Stream::Err, data: note }).await;
+                // A detached run followed on alone: taken and let go, nobody here reads it.
+                if !f.detached {
+                    let says = f.says.clone();
+                    if lost > 0 {
+                        let note = format!("\n[kiln reach: {lost} bytes of output were dropped]\n").into_bytes();
+                        let _ = says.send(Say::Output { id, offset: start, stream: Stream::Err, data: note }).await;
+                    }
+                    let _ = says.send(Say::Output { id, offset: start, stream, data }).await;
                 }
-                let _ = says.send(Say::Output { id, offset: start, stream, data }).await;
                 self.say_on(link, &Ask::Ack { id, upto: end }).await;
             }
             Say::Exit { id, code, signal, error, end, lost } => {
@@ -1292,6 +1337,7 @@ impl Node {
                         run.acked = r.from.max(run.acked);
                         run.sent = run.acked;
                         run.exit_sent = false;
+                        run.taken = Instant::now();
                         resumed.push(r.id);
                     }
                     None => lost.push(r.id),
@@ -1346,6 +1392,9 @@ impl Node {
             }
             Ask::Ack { id, upto } => {
                 if let Some(r) = self.served.get_mut(&key).and_then(|s| s.runs.get_mut(&id)) {
+                    if upto.min(r.next) > r.acked {
+                        r.taken = Instant::now();
+                    }
                     r.acked = r.acked.max(upto.min(r.next));
                     while r.buf.front().is_some_and(|(o, _, d)| o + d.len() as u64 <= r.acked) {
                         if let Some((_, _, d)) = r.buf.pop_front() {
@@ -1475,6 +1524,9 @@ impl Node {
                 timed_out: false,
                 held,
                 room,
+                detached: spec.linger_ms == Some(wire::DETACHED),
+                taken: now,
+                dropped: 0,
             },
         );
     }
@@ -1534,8 +1586,8 @@ impl Node {
                 && let Some((code, error)) = r.exit.clone()
             {
                 r.exit_sent = true;
-                let end = r.next;
-                self.say_on(&link, &Say::Exit { id, code, signal: None, error, end, lost: 0 }).await;
+                let (end, lost) = (r.next, r.dropped);
+                self.say_on(&link, &Say::Exit { id, code, signal: None, error, end, lost }).await;
             }
             return;
         }
@@ -1685,7 +1737,7 @@ impl Node {
                 let id = p.next_id;
                 p.next_id += 1;
                 spec.id = id;
-                p.follows.insert(id, Follow { says, got: 0, exited: false });
+                p.follows.insert(id, Follow { says, got: 0, exited: false, detached: false });
                 let _ = reply.send(id);
                 self.send_or_queue(&peer, Ask::RunLeased { spec, permit }).await;
             }
@@ -1724,6 +1776,11 @@ impl Node {
                     }
                 }
             }
+            Local::Detach { peer, run } => {
+                if let Some(f) = self.peers.get_mut(&peer).and_then(|p| p.follows.get_mut(&run)) {
+                    f.detached = true;
+                }
+            }
             Local::Status { reply } => {
                 let _ = reply.send(self.status().await);
             }
@@ -1743,7 +1800,9 @@ impl Node {
 
     fn busy(&self) -> u64 {
         let doing: usize = self.served.values().map(|s| s.runs.values().filter(|r| r.exit.is_none()).count() + s.syncs.len()).sum();
-        let following: usize = self.peers.values().map(|p| p.follows.len() + p.syncs.len()).sum();
+        // A detached run followed on alone isn't waited for: nobody here reads it, and its runner
+        // goes on without this one.
+        let following: usize = self.peers.values().map(|p| p.follows.values().filter(|f| !f.detached).count() + p.syncs.len()).sum();
         u64::try_from(doing + following).unwrap_or(u64::MAX)
     }
 
@@ -1756,6 +1815,7 @@ impl Node {
                     "runner": n,
                     "state": format!("{:?}", p.state).split_whitespace().next().unwrap_or("").trim_end_matches('{').to_owned(),
                     "runs": p.follows.len(),
+                    "detached": p.follows.values().filter(|f| f.detached).count(),
                     "link": p.link,
                     "syncs": p.syncs.len(),
                     "host": p.host,
@@ -1866,6 +1926,11 @@ impl Node {
                         Some(at) if now.duration_since(at) > Duration::from_secs(5) => r.fence.store(true, Ordering::Release),
                         Some(_) => {}
                     }
+                }
+                // A detached run waits for no one (docs/reach.md §4.1): holding BUFFER with no link
+                // up, or with none of it taken for GIVE_WAY, its oldest output gives way.
+                if r.detached && r.exit.is_none() && r.held.load(Ordering::Relaxed) >= BUFFER && (detached.is_some() || r.taken.elapsed() > GIVE_WAY) {
+                    r.give_way();
                 }
                 match detached {
                     Some(d) if r.exit.is_none() && d > r.linger => {

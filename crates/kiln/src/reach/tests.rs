@@ -960,3 +960,172 @@ fn a_links_ends_are_known_open_and_lately_closed() {
     assert_eq!(r.ends("L1"), Some(("mac".into(), "linux".into())), "kept a while after it closed");
     assert_eq!(r.ends("L2"), None);
 }
+
+/// Start `req` from `me` through the local driver and, once it started, go as a client does
+/// (`kiln run --detach` killed, its terminal closed): its controls and its events dropped.
+async fn start_then_leave(lab: &Lab, me: &'static str, req: RunReq) -> anyhow::Result<()> {
+    let (ev_tx, ev_rx) = async_channel::unbounded();
+    let (ctl_tx, ctl_rx) = async_channel::unbounded::<local::Req>();
+    let handle = if me == "mac" { lab.mac.clone() } else { lab.linux.clone() };
+    crate::rt::spawn(async move { local::run(&handle, me, req, ev_tx, ctl_rx).await });
+    loop {
+        match crate::rt::timeout(Duration::from_secs(60), ev_rx.recv()).await {
+            Ok(Ok(Ev::Started { .. })) => break,
+            Ok(Ok(e @ (Ev::Exit { .. } | Ev::Error(_)))) => anyhow::bail!("it ended before its client went: {e:?}"),
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => anyhow::bail!("its events ended before it started"),
+            Err(_) => anyhow::bail!("it didn't start in 60 s"),
+        }
+    }
+    drop(ctl_tx);
+    drop(ev_rx);
+    Ok(())
+}
+
+/// What `path` holds once it holds something, within `within`.
+async fn appears(path: &std::path::Path, within: Duration) -> Option<String> {
+    let until = std::time::Instant::now() + within;
+    while std::time::Instant::now() < until {
+        if let Ok(s) = std::fs::read_to_string(path)
+            && !s.is_empty()
+        {
+            return Some(s);
+        }
+        crate::rt::sleep(Duration::from_millis(100)).await;
+    }
+    None
+}
+
+/// A count a runner's node gives of `peer` now (`runs`, `detached`), as its status says.
+async fn count_of(h: &Handle, peer: &str, key: &str) -> anyhow::Result<u64> {
+    let s = h.status().await?;
+    let peers = s.get("peers").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
+    Ok(peers.iter().find(|p| p.get("runner").and_then(serde_json::Value::as_str) == Some(peer)).and_then(|p| p.get(key)).and_then(serde_json::Value::as_u64).unwrap_or(0))
+}
+
+/// The runs a runner's node does for others now, as its status says.
+async fn serving(h: &Handle) -> anyhow::Result<u64> {
+    let s = h.status().await?;
+    Ok(s.get("serving").and_then(serde_json::Value::as_array).map(|a| a.iter().filter_map(|x| x.get("runs").and_then(serde_json::Value::as_u64)).sum()).unwrap_or(0))
+}
+
+/// Shell text that waits for `go`, then writes 20 MB (past the 16 MiB a runner holds unread),
+/// then `done` into `done`.
+fn past_the_buffer(go: &std::path::Path, done: &std::path::Path) -> String {
+    format!("until [ -e '{}' ]; do sleep 0.1; done; head -c 20000000 /dev/zero; echo done > '{}'", go.display(), done.display())
+}
+
+/// `kiln run --detach` (docs/reach.md §4.2): once its client went, the run is followed on alone by
+/// its asking runner, which takes its output and lets it go, and links again after a drop: the run
+/// goes on past 16 MiB of output nobody reads and past a lost connection. Once it ends both runners
+/// forget it, and it never was a run the asking runner's upgrade would wait for.
+#[cfg(unix)]
+#[test]
+fn a_detached_run_goes_on_after_its_client_followed_on_alone() -> anyhow::Result<()> {
+    crate::rt::block_on(async move {
+        let lab = lab().await?;
+        let dir = tempfile::tempdir()?;
+        let (go, done) = (dir.path().join("go"), dir.path().join("done"));
+        start_then_leave(&lab, "mac", RunReq { target: "linux".into(), command: past_the_buffer(&go, &done), detach: true, ..RunReq::default() }).await?;
+        let mut alone = false;
+        for _ in 0..100 {
+            if count_of(&lab.mac, "linux", "detached").await? == 1 {
+                alone = true;
+                break;
+            }
+            crate::rt::sleep(Duration::from_millis(20)).await;
+        }
+        anyhow::ensure!(alone, "mac stopped following the run when its client went");
+        anyhow::ensure!(count_of(&lab.mac, "linux", "runs").await? == 1);
+        anyhow::ensure!(lab.mac.busy() == 0, "a detached run would hold mac's upgrade");
+        // mac's connection drops and comes back while it waits: mac links to linux again for it.
+        let before = link_to(&lab.mac, "linux").await?;
+        anyhow::ensure!(before.is_some(), "no link for the run");
+        lab.ctl.send(Ctl::Drop("mac")).await?;
+        crate::rt::sleep(Duration::from_millis(500)).await;
+        lab.ctl.send(Ctl::Back("mac")).await?;
+        let mut again = false;
+        for _ in 0..200 {
+            let now = link_to(&lab.mac, "linux").await?;
+            if now.is_some() && now != before {
+                again = true;
+                break;
+            }
+            crate::rt::sleep(Duration::from_millis(50)).await;
+        }
+        anyhow::ensure!(again, "mac didn't link to linux again for the detached run");
+        std::fs::write(&go, b"")?;
+        anyhow::ensure!(appears(&done, Duration::from_secs(60)).await.as_deref() == Some("done\n"), "the detached run never got past its output");
+        let mut forgotten = false;
+        for _ in 0..200 {
+            if count_of(&lab.mac, "linux", "runs").await? == 0 && serving(&lab.linux).await? == 0 {
+                forgotten = true;
+                break;
+            }
+            crate::rt::sleep(Duration::from_millis(50)).await;
+        }
+        anyhow::ensure!(forgotten, "the ended run was kept on one side");
+        Ok(())
+    })
+}
+
+/// A detached run whose asking runner never comes back (restarted, its connection gone for good)
+/// waits for no one (docs/reach.md §4.1): it isn't stopped for want of its asker, and its output,
+/// held unread, gives way oldest first instead of making it wait, so it goes on to its end.
+#[cfg(unix)]
+#[test]
+fn a_detached_run_whose_asker_never_comes_back_goes_on_its_unread_output_giving_way() -> anyhow::Result<()> {
+    crate::rt::block_on(async move {
+        let lab = lab().await?;
+        let dir = tempfile::tempdir()?;
+        let (go, done) = (dir.path().join("go"), dir.path().join("done"));
+        start_then_leave(&lab, "mac", RunReq { target: "linux".into(), command: past_the_buffer(&go, &done), detach: true, ..RunReq::default() }).await?;
+        lab.ctl.send(Ctl::Drop("mac")).await?;
+        std::fs::write(&go, b"")?;
+        anyhow::ensure!(appears(&done, Duration::from_secs(60)).await.as_deref() == Some("done\n"), "the run waited on output nobody will read");
+        Ok(())
+    })
+}
+
+/// A detached run whose asker keeps the link up but takes none of its output (a runner from before
+/// detached runs were followed on alone: it stopped following when the client went) gives way
+/// too, once none was taken for 10 s.
+#[cfg(unix)]
+#[test]
+fn a_detached_run_whose_asker_takes_none_of_its_output_gives_way_after_a_while() -> anyhow::Result<()> {
+    use super::wire::{self, RunSpec};
+    crate::rt::block_on(async move {
+        let lab = lab().await?;
+        let dir = tempfile::tempdir()?;
+        let (go, done) = (dir.path().join("go"), dir.path().join("done"));
+        lab.mac.connect("linux").await?;
+        // A run mac follows keeps its link to linux up meanwhile.
+        let (kept, _kept_said) = async_channel::unbounded();
+        lab.mac.run("linux", RunSpec { command: "sleep 30".into(), ..RunSpec::default() }, kept).await?;
+        // Asked as a runner from before asks a detached run, then let go of.
+        let (says, _said) = async_channel::unbounded();
+        let id = lab.mac.run("linux", RunSpec { command: past_the_buffer(&go, &done), linger_ms: Some(wire::DETACHED), ..RunSpec::default() }, says).await?;
+        lab.mac.leave("linux", Some(id), None).await;
+        let t = std::time::Instant::now();
+        std::fs::write(&go, b"")?;
+        anyhow::ensure!(appears(&done, Duration::from_secs(60)).await.as_deref() == Some("done\n"), "the run waited on output its asker never takes");
+        anyhow::ensure!(t.elapsed() >= Duration::from_secs(8), "it gave way with a link up before 10 s: {:?}", t.elapsed());
+        Ok(())
+    })
+}
+
+/// `kiln run --detach` on its own runner's machine goes on after its client too, its output read
+/// to its end so that it never waits on it (docs/reach.md §4.2).
+#[cfg(unix)]
+#[test]
+fn a_detached_run_on_its_own_machine_goes_on_after_its_client() -> anyhow::Result<()> {
+    crate::rt::block_on(async move {
+        let lab = lab().await?;
+        let dir = tempfile::tempdir()?;
+        let (go, done) = (dir.path().join("go"), dir.path().join("done"));
+        start_then_leave(&lab, "mac", RunReq { target: "mac".into(), command: past_the_buffer(&go, &done), detach: true, ..RunReq::default() }).await?;
+        std::fs::write(&go, b"")?;
+        anyhow::ensure!(appears(&done, Duration::from_secs(60)).await.as_deref() == Some("done\n"), "the detached run stopped with its client");
+        Ok(())
+    })
+}

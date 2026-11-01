@@ -77,7 +77,7 @@ export default function ErrorTracking() {
         <RangePicker value={range} onChange={setRange} />
         <Segmented label="Status" value={status as IssueStatus | "all"} onChange={setStatus} options={FILTERS} />
       </div>
-      <SearchForm key={query} initial={query} onSearch={setQuery} placeholder="Words of its type, message, service or place" />
+      <SearchForm initial={query} onSearch={setQuery} placeholder="Words of its type, message, service or place" />
       <Loadable key={`${range}/${status}/${query}`} label="the issues" fallback={<TableHold head={<IssuesHead />} rows={6} />}>
         <IssuesTable range={range} status={status} query={query} />
       </Loadable>

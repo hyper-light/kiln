@@ -13,6 +13,7 @@ across several nodes. Everything is free and self-hosted.
 | `port-forward.sh` | no | forwards kiln :7070, ArgoCD :8080, Grafana :3000, Prometheus :9090 to localhost |
 | `expose-lan.sh up\|down\|status` | no | forwards this host's 7070/tcp + 7071/udp to the kiln NodePorts so bare-metal agents on other machines can join |
 | `teardown.sh [--stop\|--yes\|--purge]` | no | stop or delete the cluster |
+| `size-nodes.sh [--dry-run]` | no | tells Kubernetes each node's real memory: the kubelet's reservation from that node's own container cap, one node at a time (its pods keep running). `bootstrap.sh` and the autostart unit run it after `minikube start`, which gives every node the same reservation |
 
 ```sh
 sudo deploy/cluster/privileged-setup.sh          # once; asks for your sudo password

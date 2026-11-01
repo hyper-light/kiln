@@ -401,6 +401,12 @@ export function WholeFile({ file, ctx, map, text }: { file: PatchFile; ctx: File
   );
 }
 
+/**
+ * The whole file takes the focus as it opens, and only then: a ref made anew each render would take
+ * it back on every one (each word typed in the Files filter, each thread that comes).
+ */
+const takeFocus = (el: HTMLElement | null) => el?.focus({ preventScroll: true });
+
 function WholeBody({ file, ctx, map, text }: { file: PatchFile; ctx: FilesCtx; map: Map<string, { t: Thread; a: Anchor }[]>; text: Res<string> }) {
   const body = useResText(text);
   const rows = React.useMemo<Row[]>(() => {
@@ -423,7 +429,7 @@ function WholeBody({ file, ctx, map, text }: { file: PatchFile; ctx: FilesCtx; m
       .join("\n"),
   );
   return (
-    <div className="rv-full" role="region" aria-label={file.path} tabIndex={-1} ref={(el) => el?.focus({ preventScroll: true })} onKeyDown={(e) => e.key === "Escape" && ctx.open("")}>
+    <div className="rv-full" role="region" aria-label={file.path} tabIndex={-1} ref={takeFocus} onKeyDown={(e) => e.key === "Escape" && ctx.open("")}>
       <div className="rv-fullh">
         <span className="rv-path">{file.path}</span>
         <button type="button" className="rv-ib" aria-label="Close" title="Close" onClick={() => ctx.open("")}>
