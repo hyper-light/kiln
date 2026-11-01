@@ -456,6 +456,17 @@ async fn workspace(cx: Cx, v: Value) -> Out {
     Ok(json!({"workspace": {"kind": w.kind, "over": w.over, "sub": w.sub, "volume": w.made.as_ref().map(|m| &m.volume), "mount": w.made.as_ref().map(|m| &m.mount)}, "drift": look.get("drift").cloned().unwrap_or(json!([]))}))
 }
 
+/// Its branch's commits, its session's own after the commit it began at (else made after it
+/// began), and what `picks` change together (docs/agents.md, "Commits").
+async fn commits(cx: Cx, v: Value) -> Out {
+    let info = seen(&cx, &agent_of(&v)?).await?;
+    let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::trim).filter(|x| !x.is_empty()).map(str::to_owned);
+    let picks: Vec<String> = s("picks").map(|p| p.split(',').map(str::trim).filter(|x| !x.is_empty()).map(str::to_owned).collect()).unwrap_or_default();
+    let since_head = cx.hub.harness.state(&info.id).and_then(|st| st.started_head);
+    let ask = crate::workspace::Ask::Commits { branch: s("branch"), trunk: s("trunk"), since_head, since_at: Some(info.created_at), picks };
+    crate::workspace::change::ask_machine(&cx.hub, &info, &ask).await
+}
+
 async fn land(cx: Cx, v: Value) -> Out {
     let info = known(&cx, &agent_of(&v)?)?;
     may_steer(&cx, &info.id).await?;
@@ -677,6 +688,15 @@ pub fn list_ops() -> Vec<Op> {
             run: |cx, v| Box::pin(workspace(cx, v)),
         },
         Op {
+            name: "agents.commits",
+            summary: "An agent's branch's commits (or `branch`'s) since its trunk (`trunk`, else its remote's default branch), newest first, the ones its session made marked, and what isn't committed yet; with `picks` (commits, comma-separated, `now` for what isn't committed yet), what they change together: a run of them from the first one's parent to the last, or, with gaps, each applied in order onto the first one's parent beside the folder (one that doesn't go without a commit left out says which). Asked of its machine, in the working tree its work is in.",
+            read_only: true,
+            destructive: false,
+            input: Input::of::<input::AgentsCommits>(),
+            route: |v| Ok((Method::GET, path(&["api", "harness", "agents", &agent_of(v)?, "commits"]))),
+            run: |cx, v| Box::pin(commits(cx, v)),
+        },
+        Op {
             name: "agents.land",
             summary: "Write an agent's workspace of its own back to the folder it's laid over. Without `manifest`: the plan (what it would create, replace and delete, and any file changed on disk since, which it won't overwrite), for a person to read. With the plan's `manifest`: written exactly as that plan says, or, if anything changed since, nothing written and the new plan back (`changed`) — only a person can write, never an agent. Build output and what git ignores stay out, and so does `.git`.",
             read_only: false,
@@ -874,6 +894,22 @@ pub mod input {
     pub struct AgentsWorkspace {
         /// The agent's id (as agents.list gives it).
         pub agent: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentsCommits {
+        /// The agent's id (as agents.list gives it).
+        pub agent: String,
+        /// Commits to see together, comma-separated (`now`: what isn't committed yet).
+        #[serde(default)]
+        pub picks: Option<String>,
+        /// The branch its commits are counted from (else its remote's default branch).
+        #[serde(default)]
+        pub trunk: Option<String>,
+        /// Another of its repository's branches to list (else the one checked out).
+        #[serde(default)]
+        pub branch: Option<String>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]

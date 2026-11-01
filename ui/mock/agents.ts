@@ -1675,6 +1675,138 @@ async function handleAttached(req: http.IncomingMessage, res: http.ServerRespons
   return false;
 }
 
+/** fam-orch's branch as its machine lists it (`agents.commits`, docs/agents.md "Commits"): two commits of its session's, two from before it, and what isn't committed yet; the docs commit needs the one that made the plan's steps say what they need. */
+const ORCH_TREE = "/home/ada/src/kiln";
+function changed(path: string, lines: string[], at: number, created = false) {
+  const added = lines.filter((l) => l.startsWith("+")).length;
+  const removed = lines.filter((l) => l.startsWith("-")).length;
+  return {
+    path,
+    tree: ORCH_TREE,
+    ...(created && { created }),
+    added,
+    removed,
+    hunks: [{ old_start: created ? 0 : 1, old_lines: lines.length - added, new_start: 1, new_lines: lines.length - removed, lines }],
+    at,
+    place: "project",
+  };
+}
+const ORCH_COMMITS = (() => {
+  const t = Date.now();
+  return [
+    {
+      sha: "c4f1e2a9b0d3e5f60718293a4b5c6d7e8f901234",
+      subject: "Planner: steps that wait for nothing go first",
+      at: t - 4 * 60_000,
+      session: true,
+      files: [
+        changed(
+          "crates/kiln/src/plans/planner.rs",
+          [
+            "     let order = plan.steps();",
+            "-    let first = order.first();",
+            "+    let ready = order.iter().filter(|s| s.needs.is_empty());",
+            "+    let first = ready.clone().next();",
+            "+    // Steps that wait for nothing go first, side by side.",
+            "     first.map(Step::start)",
+          ],
+          t - 4 * 60_000,
+        ),
+      ],
+    },
+    {
+      sha: "9b8e7d6c5a4132f1e0d9c8b7a6f5e4d3c2b1a090",
+      subject: "Docs: steps side by side",
+      at: t - 9 * 60_000,
+      session: true,
+      files: [changed("docs/plans.md", [" ## Steps side by side", "+", "+A step that waits for nothing starts at once; the rest wait for", "+what they need."], t - 9 * 60_000)],
+    },
+    {
+      sha: "5d4c3b2a1f0918273645aabbccddeeff00112233",
+      subject: "Plans: a step says what it needs",
+      at: t - 2 * 3_600_000,
+      session: false,
+      files: [
+        changed("docs/plans.md", ["+# Plans", "+", "+## Steps side by side"], t - 2 * 3_600_000, true),
+        changed("crates/kiln/src/plans/step.rs", ["     pub title: String,", "+    pub needs: Vec<usize>,"], t - 2 * 3_600_000),
+      ],
+    },
+    {
+      sha: "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d",
+      subject: "Plans: read a plan's steps in order",
+      at: t - 5 * 3_600_000,
+      session: false,
+      files: [changed("crates/kiln/src/plans/mod.rs", [" pub mod planner;", "+pub mod order;"], t - 5 * 3_600_000)],
+    },
+  ];
+})();
+const ORCH_NOW = [
+  changed(
+    "crates/kiln/src/plans/ready.rs",
+    ["+/// The steps that wait for nothing.", "+pub fn ready(plan: &Plan) -> Vec<&Step> {", "+    plan.steps().iter().filter(|s| s.needs.is_empty()).collect()", "+}"],
+    Date.now(),
+    true,
+  ),
+  changed("crates/kiln/src/plans/mod.rs", [" pub mod planner;", "-pub mod order;", "+pub(crate) mod order;", "+pub mod ready;"], Date.now()),
+];
+const MAIN_COMMITS = [
+  {
+    sha: "bd1f2a7e0c9b8a7f6e5d4c3b2a1908f7e6d5c4b3",
+    subject: "Seams: a conformance suite per seam",
+    at: Date.now() - 6 * 3_600_000,
+    session: false,
+    files: [changed("crates/kiln-seams/src/lib.rs", [" pub mod seam;", "+pub mod conformance;"], Date.now() - 6 * 3_600_000)],
+  },
+  {
+    sha: "4c09e11d2e3f405162738495a6b7c8d9e0f1a2b3",
+    subject: "Ship: rows say who's waiting",
+    at: Date.now() - 9 * 3_600_000,
+    session: false,
+    files: [changed("ui/src/views/ship/views.tsx", ["-  <Row />", "+  <Row waiting />"], Date.now() - 9 * 3_600_000)],
+  },
+];
+
+/** An agent's commits and, with `picks`, what they change together: fam-orch's from its machine; another's folder isn't a repository. */
+function commitsOf(a: AgentInfo, picks: string[], branch?: string): Record<string, unknown> {
+  if (a.id !== "fam-orch") return { error: `${a.cwd} isn't in a git repository` };
+  const onMain = branch === "main";
+  const list = onMain ? MAIN_COMMITS : ORCH_COMMITS;
+  const sum = (files: { added: number; removed: number }[]) => ({ files: files.length, added: files.reduce((n, f) => n + f.added, 0), removed: files.reduce((n, f) => n + f.removed, 0) });
+  const log = {
+    top: ORCH_TREE,
+    head: ORCH_COMMITS[0]?.sha ?? null,
+    branch: "plans/side-by-side",
+    trunk: onMain ? null : "origin/main",
+    base: onMain ? null : "0f0e0d0c0b0a09080706050403020100ffeeddcc",
+    dirty: onMain ? null : sum(ORCH_NOW),
+    commits: list.map(({ files, ...c }) => ({ ...c, parents: [], author: "Release prep", ...sum(files), session: onMain ? undefined : c.session || undefined })),
+    told: onMain ? "none" : "head",
+    branches: ["plans/side-by-side", "main", "fix/retry-storm"],
+    ...(onMain && { listed: "main" }),
+  };
+  if (!picks.length) return { log, picked: null };
+  // Oldest first, what isn't committed yet last.
+  const line = [...list.map((c) => c.sha).reverse(), ...(onMain ? [] : ["now"])];
+  const at = picks
+    .map((p) => line.findIndex((s) => s === p || s.startsWith(p)))
+    .filter((i) => i >= 0)
+    .sort((x, y) => x - y);
+  const filesOf = (i: number) => (line[i] === "now" ? ORCH_NOW : (list.find((c) => c.sha === line[i])?.files ?? []));
+  const docs = "9b8e7d6c5a4132f1e0d9c8b7a6f5e4d3c2b1a090";
+  const steps = "5d4c3b2a1f0918273645aabbccddeeff00112233";
+  const first = at[0] ?? 0;
+  if (!onMain && at.some((i) => line[i] === docs) && !at.some((i) => line[i] === steps) && first < line.indexOf(steps)) {
+    return { log, picked: { from: line[first - 1] ?? "", files: [], needs: { pick: docs, commit: steps, subject: "Plans: a step says what it needs" } } };
+  }
+  const byPath = new Map<string, ReturnType<typeof changed>>();
+  for (const i of at)
+    for (const f of filesOf(i)) {
+      const had = byPath.get(f.path);
+      byPath.set(f.path, had ? { ...had, added: had.added + f.added, removed: had.removed + f.removed, hunks: [...had.hunks, ...f.hunks] } : f);
+    }
+  return { log, picked: { from: line[first - 1] ?? "", files: [...byPath.values()] } };
+}
+
 /** What a person asked about (agents.about), and the helpers answering. */
 interface AboutQ {
   path: string;
@@ -1811,7 +1943,7 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
     }
     return true;
   }
-  const am = p.match(/^\/api\/harness\/agents\/([^/]+)(?:\/(result|children|stop|send|interrupt|change|workspace|land))?$/);
+  const am = p.match(/^\/api\/harness\/agents\/([^/]+)(?:\/(result|children|stop|send|interrupt|change|workspace|land|commits))?$/);
   if (!am) return false;
   const id = decodeURIComponent(am[1] ?? "");
   const what = am[2];
@@ -1834,6 +1966,10 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
       branch: changes.get(id)?.branch ?? null,
       change_request: changes.get(id) ?? null,
     });
+  } else if (what === "commits" && m === "GET") {
+    const picks = (url.searchParams.get("picks") ?? "").split(",").filter(Boolean);
+    const answer = commitsOf(a, picks, url.searchParams.get("branch") ?? undefined);
+    json(res, "error" in answer ? 409 : 200, answer);
   } else if (what === "workspace" && m === "GET") {
     json(res, 200, { workspace: a.workspace ?? null, drift: a.workspace ? ["/crates/kiln/src/http/client.rs (Modified)"] : [] });
   } else if (what === "land" && m === "POST") {

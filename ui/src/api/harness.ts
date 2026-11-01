@@ -15,6 +15,7 @@ import type {
   AgentInfo,
   Attachment,
   Command,
+  CommitLog,
   ControlOption,
   FileChange,
   Event as HEvent,
@@ -22,6 +23,7 @@ import type {
   Meta,
   ModelOption,
   ModeOption,
+  PickedCommits,
   SendMode,
   SessionDown,
   SessionUp,
@@ -41,6 +43,7 @@ export type {
   Attachment,
   ChoiceAnswer,
   Command,
+  CommitLog,
   Compacting,
   Control,
   ControlOption,
@@ -60,12 +63,15 @@ export type {
   Known,
   Level,
   Limit,
+  LoggedCommit,
   McpServer,
   Meta,
   ModelOption,
   ModeOption,
   MovePlan,
   Pause,
+  PickedCommits,
+  PickNeeds,
   Plugin,
   Question,
   QuestionOption,
@@ -481,6 +487,14 @@ export const harnessApi = {
   workspaces: () => call<WorkspacesAvailable>("GET", "/api/harness/workspaces"),
   /** An agent's workspace of its own, and the files under it changed on disk since it changed them. */
   workspace: (id: string) => call<{ workspace: AgentInfo["workspace"] | null; drift: string[] }>("GET", `/api/harness/agents/${encodeURIComponent(id)}/workspace`),
+  /** Its branch's commits (or `branch`'s) since its trunk, its session's own marked; with `picks`, what those change together (`agents.commits`). */
+  commits: (id: string, picks: readonly string[] = [], branch?: string) => {
+    const q = new URLSearchParams();
+    if (picks.length) q.set("picks", picks.join(","));
+    if (branch) q.set("branch", branch);
+    const qs = q.toString();
+    return call<{ log: CommitLog; picked: PickedCommits | null }>("GET", `/api/harness/agents/${encodeURIComponent(id)}/commits${qs ? `?${qs}` : ""}`);
+  },
   /** What writing its workspace to its folder would do. */
   planLanding: (id: string) => call<LandingPlan>("POST", `/api/harness/agents/${encodeURIComponent(id)}/land`, {}),
   /** Write it exactly as the plan whose manifest this is (a person's go-ahead); if it changed since, nothing is written and the new plan comes back. */

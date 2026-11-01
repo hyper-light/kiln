@@ -4,7 +4,7 @@
  */
 import * as React from "react";
 import { Bot, Square } from "lucide-react";
-import { useSession, type AgentInfo, type Command, type FileChange as ServerChange, type HEvent, type Meta, type SessionStore, type State, type Task } from "@/api/harness";
+import { harnessApi, useSession, type AgentInfo, type Command, type FileChange as ServerChange, type HEvent, type Meta, type SessionStore, type State, type Task } from "@/api/harness";
 import { cn } from "@/lib/utils";
 import { agentLabel, changesetOf, duration, editsOf, money, runsOf, taskDot, taskLive, tokens, useSameList, type ChangedFile, type ToolEvent } from "./derive";
 import { kilnStatus } from "./tasks";
@@ -26,6 +26,7 @@ import { Fold, FoldOpen } from "./fold";
 import { WorkspaceBar } from "./workspace-bar";
 import { SubagentOutput } from "./task-output";
 import { SessionChanges, inScope, useScope, type OwnSource, type Sub } from "./changes";
+import type { CommitsSource } from "./commits";
 
 const NO_EVENTS: HEvent[] = [];
 const NO_AGENTS: readonly AgentInfo[] = [];
@@ -95,6 +96,8 @@ export const Changes = React.memo(function Changes({
 }) {
   const local = React.useMemo(() => (changes ? null : changesetOf(events)), [events, changes]);
   const files = React.useMemo(() => (changes ? fromServer(changes) : (local ?? [])), [changes, local]);
+  // Its branch's commits, asked of its machine (Commits).
+  const commits = React.useMemo<CommitsSource | undefined>(() => (agentId ? { id: agentId, ask: (picks, branch) => harnessApi.commits(agentId, picks, branch) } : undefined), [agentId]);
   const wsBar = agentId && volumeOver ? <WorkspaceBar agentId={agentId} over={volumeOver} /> : null;
   if (files.length === 0)
     return (
@@ -111,7 +114,7 @@ export const Changes = React.memo(function Changes({
           <ChangeBar agentId={agentId} />
         </Loadable>
       )}
-      <SessionChanges files={files} cwd={cwd} self={self} subs={subs} own={own} />
+      <SessionChanges files={files} cwd={cwd} self={self} subs={subs} own={own} commits={commits} />
     </div>
   );
 });

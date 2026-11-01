@@ -71,6 +71,9 @@ fn roots(c: &mut Collect<'_>) {
     c.visit::<super::ui::StreamUp>();
     c.visit::<super::ui::CdLogDown>();
     c.visit::<super::events::ServerEvent>();
+    // The Changes tab's Commits (`agents.commits`).
+    c.visit::<crate::workspace::git::Log>();
+    c.visit::<crate::workspace::git::Picked>();
 }
 
 /// Every file as it should be, by its name in [`dir`], the index among them.

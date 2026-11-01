@@ -1170,6 +1170,12 @@ pub struct State {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub tree: Option<String>,
+    /// The commit its folder had checked out as it began: the commits after it are this session's
+    /// (the Changes tab's Commits). None for a session from before kiln kept it, or one begun
+    /// outside a repository: its own are told by when they were made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub started_head: Option<String>,
     #[serde(default)]
     pub model: String,
     #[serde(default)]

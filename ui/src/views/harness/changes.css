@@ -212,6 +212,162 @@
   color: #8b8e96;
   font-size: 12px;
 }
+/* Commits (commits.tsx): its branch's commits on a line, newest first, a ring a commit; the label
+   column holds the rings, so they sit under the head's labels. Picked: a tint with a straight 2px
+   edge, the ring filled. Held and dragged by touch, the list doesn't scroll (touch-select.ts). */
+.cx-commits {
+  display: flex;
+  flex-direction: column;
+  margin: 0 -14px;
+  border-bottom: 1px solid #1f2125;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.cx-commit {
+  position: relative;
+  display: grid;
+  grid-template-columns: 44px 64px minmax(0, 1fr) auto;
+  align-items: center;
+  width: 100%;
+  min-height: 40px;
+  padding: 0 14px;
+  border-top: 1px solid #15171a;
+  text-align: left;
+  -webkit-touch-callout: none;
+  touch-action: pan-y;
+}
+.cx-commits > .cx-commit:first-child {
+  border-top: 0;
+}
+.cx-commit:hover {
+  background: #0f1013;
+}
+.cx-commit[data-on] {
+  background: rgb(186 176 227 / 7%);
+}
+.cx-commit[data-on]::before {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 2px;
+  background: #bab0e3;
+  opacity: 0.85;
+  content: "";
+}
+.cx-ring {
+  position: relative;
+  width: 14px;
+  height: 40px;
+  pointer-events: none;
+}
+.cx-ring::before {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 6.5px;
+  width: 1px;
+  background: #2b2e39;
+  content: "";
+}
+.cx-commit[data-first] .cx-ring::before {
+  top: 50%;
+}
+.cx-commit[data-last] .cx-ring::before {
+  bottom: 50%;
+}
+.cx-ring::after {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  width: 12px;
+  height: 12px;
+  margin-top: -7px;
+  border: 1px solid #8b8e96;
+  border-radius: 50%;
+  background: #0b0c0e;
+  content: "";
+}
+.cx-commit[data-on] .cx-ring::after {
+  border-color: #bab0e3;
+  background: #bab0e3;
+  box-shadow: inset 0 0 0 2px #0b0c0e;
+}
+.cx-commit[data-now] .cx-ring::after {
+  border-style: dashed;
+}
+.cx-sha {
+  color: #a9b4c9;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  pointer-events: none;
+}
+.cx-commit[data-now] .cx-sha {
+  color: #8f929b;
+}
+.cx-subj {
+  min-width: 0;
+  overflow: hidden;
+  color: #e4e5e7;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.cx-commit[data-before] .cx-subj,
+.cx-commit[data-before] .cx-sha {
+  color: #8b8e96;
+}
+.cx-age {
+  padding-left: 12px;
+  color: #6d7078;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.cx-cband {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr);
+  align-items: center;
+  min-height: 30px;
+  padding: 0 14px;
+  border-top: 1px solid #15171a;
+  color: #6d7078;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+.cx-all {
+  position: relative;
+  width: 12px;
+  height: 12px;
+  border: 1px solid #8b8e96;
+  border-radius: 50%;
+}
+.cx-all[data-some] {
+  border-color: #bab0e3;
+}
+.cx-all[data-some]::after {
+  position: absolute;
+  top: 50%;
+  right: 2.5px;
+  left: 2.5px;
+  height: 1.5px;
+  margin-top: -0.75px;
+  background: #bab0e3;
+  content: "";
+}
+.cx-all[data-on] {
+  border-color: #bab0e3;
+  background: #bab0e3;
+  box-shadow: inset 0 0 0 2px #0b0c0e;
+}
+.cx-commits + .cx-none,
+.cx-commits + .cx-files {
+  margin-top: 0;
+}
 /* Its menus: Mission control's Actions menu's look, an item's what-it-is under its name. */
 .cx-menu {
   width: min(330px, calc(100vw - 28px));

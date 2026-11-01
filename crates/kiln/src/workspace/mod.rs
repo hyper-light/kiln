@@ -125,6 +125,34 @@ pub enum Ask {
     },
     /// Experiment `experiment` is over: its worktrees go ([`measure::unmeasure`]).
     Unmeasure { experiment: String },
+    /// Its branch's commits since its trunk, its session's own marked ([`git::log`]), and, with
+    /// `picks`, what those commits change together ([`git::picked`]): the Changes tab's Commits.
+    /// Only a runner with [`crate::proto::CAP_WORKSPACE_COMMITS`] is asked.
+    Commits {
+        /// Another branch than the one checked out.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trunk: Option<String>,
+        /// The commit its session began at, and when it began (unix ms): its own are after it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since_head: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since_at: Option<i64>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        picks: Vec<String>,
+    },
+}
+
+impl Ask {
+    /// What a runner must have said it can do past `Build`'s 32 bits to be asked this
+    /// ([`crate::proto::AgentMsg::Caps`]); 0: [`crate::proto::CAP_WORKSPACE`] is enough.
+    pub fn wide_cap(&self) -> u64 {
+        match self {
+            Self::Commits { .. } => crate::proto::CAP_WORKSPACE_COMMITS,
+            _ => 0,
+        }
+    }
 }
 
 /// A push of one commit to one ref, as one principal.
@@ -248,6 +276,11 @@ async fn answer(cwd: &Path, ws: Option<&Workspace>, ask: Ask) -> anyhow::Result<
         Ask::Measured { key, stop } => Ok(measure::measured(&key, stop)),
         Ask::Unmeasure { experiment } => measure::unmeasure(cwd, &experiment).await,
         Ask::Cite { looks } => Ok(json!({"looks": crate::research::check::local(cwd, looks).await})),
+        Ask::Commits { branch, trunk, since_head, since_at, picks } => {
+            let log = git::log(cwd, branch.as_deref(), trunk.as_deref(), since_head.as_deref(), since_at).await?;
+            let picked = if picks.is_empty() { None } else { Some(git::picked(cwd, branch.as_deref(), &picks).await?) };
+            Ok(json!({"log": log, "picked": picked}))
+        }
         Ask::Change(c) => {
             let facts = git::facts(cwd).await?;
             let top = Path::new(&facts.top);

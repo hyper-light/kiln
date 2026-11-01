@@ -3,10 +3,10 @@
  * 01a194444b1d, step 2): its head on one grid, a label at the edge, then its value, then the view's
  * total at the right edge; Scope, By and Sort as menus like Mission control's Actions; and its
  * files as a flat list, each saying who changed it, those outside the project under bands of their
- * own. Commits and Compare come with their own steps: turned off until then, not hidden. Narrowed
- * to one who changed them, a file another changed too shows only their part, as the session
- * answers it (step 3, "One subagent's own edits"), or their edits one by one from the conversation
- * where it can't, saying why.
+ * own. Commits is its branch's commits (commits.tsx); Compare comes with its own step, turned off
+ * until then, not hidden. Narrowed to one who changed them, a file another changed too shows only
+ * their part, as the session answers it (step 3, "One subagent's own edits"), or their edits one
+ * by one from the conversation where it can't, saying why.
  */
 import * as React from "react";
 import { DropdownMenu } from "radix-ui";
@@ -16,6 +16,7 @@ import { usePref } from "@/lib/prefs";
 import { relativeTime } from "@/lib/format";
 import { DiffStat, FileDiffView } from "./diff";
 import { diffStats, relPath, type ChangedFile } from "./derive";
+import { CommitsMode, CommitsView, type CommitsSource } from "./commits";
 import "./changes.css";
 
 /** Whose files a scope shows: this project's; everything changed for the person; the agents' own too. */
@@ -43,7 +44,7 @@ export const inScope = (f: { place?: FilePlace }, scope: Scope): boolean => SCOP
 /** The band a file outside the project is listed under. */
 const BAND: Record<FilePlace, string | null> = { project: null, user: "Elsewhere", agent: "The agents' own" };
 
-type SortKey = "path" | "latest" | "most" | "kind" | "who";
+export type SortKey = "path" | "latest" | "most" | "kind" | "who";
 
 const SORTS: { id: SortKey; label: string; word: string; icon: LucideIcon }[] = [
   { id: "path", label: "Path", word: "Path", icon: Folder },
@@ -156,14 +157,14 @@ function Asked({ own, by, stamp, children }: { own: OwnSource | undefined; by: s
 }
 
 /** A file as the list shows it: where it is, from its folder (or its own working tree's top), and the worktree it's in when that isn't its folder's. */
-interface Row {
+export interface Row {
   key: string;
   file: ChangedFile;
   name: string;
   tree: string | null;
 }
 
-function rowOf(f: ChangedFile, cwd: string): Row {
+export function rowOf(f: ChangedFile, cwd: string): Row {
   const elsewhere = f.tree && f.tree !== cwd && !cwd.startsWith(`${f.tree}/`) ? f.tree : null;
   return { key: `${f.tree ?? ""}\u0000${f.path}`, file: f, name: elsewhere ? f.path : relPath(f.path, cwd), tree: elsewhere };
 }
@@ -176,10 +177,164 @@ function treeWord(tree: string): string {
 
 const KIND_RANK = (f: ChangedFile) => (f.created ? 0 : f.deleted ? 2 : 1);
 
-/** `files`: the session's changeset. `self`: the agent's name; `subs`: its harness's subagents, in the order they began. `own`: where one's own part of a file comes from. */
-export function SessionChanges({ files, cwd, self, subs, own }: { files: ChangedFile[]; cwd: string; self: string; subs: readonly Sub[]; own?: OwnSource }) {
-  const [scope, setScope] = useScope();
+/** `rows` in `sort`'s order, those outside the project after it under their bands; `who`: where a row's first changer is among those who changed them (Who). */
+export function sortRows(rows: Row[], sort: SortKey, who?: (r: Row) => number): Row[] {
+  const order: Record<SortKey, (a: Row, b: Row) => number> = {
+    path: (a, b) => a.name.localeCompare(b.name),
+    latest: (a, b) => (b.file.at ?? 0) - (a.file.at ?? 0) || a.name.localeCompare(b.name),
+    most: (a, b) => b.file.add + b.file.del - (a.file.add + a.file.del) || a.name.localeCompare(b.name),
+    kind: (a, b) => KIND_RANK(a.file) - KIND_RANK(b.file) || a.name.localeCompare(b.name),
+    who: (a, b) => (who ? who(a) - who(b) : 0) || a.name.localeCompare(b.name),
+  };
+  const band = (r: Row) => ["project", "user", "agent"].indexOf(placeOf(r.file));
+  return rows.sort((a, b) => band(a) - band(b) || order[sort](a, b));
+}
+
+/** What the tab shows: the session's changes, picked commits', or (its own step) two points compared. */
+export type Mode = "session" | "commits";
+
+/** The head's first row: what it shows, in the composer's mode words, and Sort at its right edge. Commits is turned off, saying why, where its machine can't list them (`commits`, read through Suspense). */
+export function ModeRow({ mode, onMode, commits }: { mode: Mode; onMode: (m: Mode) => void; commits?: React.ReactNode }) {
   const [sort, setSort] = usePref<SortKey>("kiln.changes.sort", "path");
+  const sortOf = SORTS.find((s) => s.id === sort);
+  return (
+    <div className="cx-mrow">
+      <div className="cx-modes" role="radiogroup" aria-label="What it shows">
+        <button type="button" role="radio" aria-checked={mode === "session"} onClick={() => onMode("session")}>
+          Session
+        </button>
+        {commits ?? (
+          <button type="button" role="radio" aria-checked="false" disabled title="Not in this version of kiln yet">
+            Commits
+          </button>
+        )}
+        <button type="button" role="radio" aria-checked="false" disabled title="Not in this version of kiln yet">
+          Compare
+        </button>
+      </div>
+      <DropdownMenu.Root>
+        <DropdownMenu.Trigger asChild>
+          <button type="button" className="cx-view" aria-label={`Sort: ${sortOf?.label ?? "Path"}`}>
+            <ArrowDownUp size={12} aria-hidden="true" />
+            {sortOf?.word ?? "Path"}
+          </button>
+        </DropdownMenu.Trigger>
+        <DropdownMenu.Portal>
+          <DropdownMenu.Content className="popover cx-menu" sideOffset={6} align="end" collisionPadding={12}>
+            <DropdownMenu.Label className="cx-menu-label">Sort</DropdownMenu.Label>
+            <DropdownMenu.RadioGroup value={sort} onValueChange={(v) => setSort(v as SortKey)}>
+              {SORTS.map((s) => (
+                <DropdownMenu.RadioItem key={s.id} value={s.id} className="menu-item">
+                  <s.icon size={14} aria-hidden="true" />
+                  <span className="flex-1">{s.label}</span>
+                  <span className="cx-mark">
+                    <DropdownMenu.ItemIndicator>
+                      <Check size={14} aria-hidden="true" />
+                    </DropdownMenu.ItemIndicator>
+                  </span>
+                </DropdownMenu.RadioItem>
+              ))}
+            </DropdownMenu.RadioGroup>
+          </DropdownMenu.Content>
+        </DropdownMenu.Portal>
+      </DropdownMenu.Root>
+    </div>
+  );
+}
+
+/** The files a view shows, a flat list, each saying on the line under it what `line` says, and below them the picked one's diff (every one's, none picked). `notes`: what's said under a file's diffs; `pending`: files whose numbers wait for an answer. */
+export function FileList({
+  rows,
+  line,
+  sel,
+  onSel,
+  none,
+  notes,
+  pending,
+}: {
+  rows: Row[];
+  line: (r: Row) => string;
+  sel: string | null;
+  onSel: (key: string | null) => void;
+  none: string;
+  notes?: Map<string, string | undefined>;
+  pending?: Set<string>;
+}) {
+  const picked = sel !== null && rows.some((r) => r.key === sel) ? sel : null;
+  const shown = picked ? rows.filter((r) => r.key === picked) : rows;
+  return (
+    <>
+      {rows.length === 0 ? (
+        <div className="cx-none">{none}</div>
+      ) : (
+        <div className="cx-files">
+          {rows.map((r, i) => {
+            const band = BAND[placeOf(r.file)];
+            const slash = r.name.lastIndexOf("/");
+            const when = r.file.at ? relativeTime(Math.floor(r.file.at / 1000)).replace(/ ago$/, "") : "";
+            const words = line(r);
+            return (
+              <React.Fragment key={r.key}>
+                {band && placeOf(r.file) !== placeOf(rows[i - 1]?.file ?? { place: "project" }) && <div className="cx-band">{band}</div>}
+                <button
+                  type="button"
+                  className="cx-file"
+                  aria-pressed={picked === r.key}
+                  data-pending={pending?.has(r.key) || undefined}
+                  onClick={() => onSel(picked === r.key ? null : r.key)}
+                  title={r.tree ? `${r.tree}/${r.name}` : r.name}
+                >
+                  <span className="cx-path">
+                    {slash > 0 && (
+                      <span className="cx-path-dir">
+                        <span dir="ltr">{r.name.slice(0, slash + 1)}</span>
+                      </span>
+                    )}
+                    <span className="cx-path-name">{r.name.slice(slash + 1)}</span>
+                    {r.file.created && <span className="hx-tag">new</span>}
+                    {r.file.deleted && <span className="hx-tag hx-tag-bad">deleted</span>}
+                  </span>
+                  <DiffStat add={r.file.add} del={r.file.del} />
+                  {(words || when) && (
+                    <>
+                      <span className="cx-by">{words}</span>
+                      <span className="cx-when">{when}</span>
+                    </>
+                  )}
+                </button>
+              </React.Fragment>
+            );
+          })}
+        </div>
+      )}
+      <div className="hx-stack">
+        {shown.map((r) => (
+          <React.Fragment key={r.key}>
+            {r.file.edits.map((e, i) => (
+              <div key={`${r.key}-${i}`}>
+                {r.file.edits.length > 1 && (
+                  <div className="hx-dim mb-1 text-[11px]">
+                    edit {i + 1} of {r.file.edits.length}
+                    {e.call?.status === "error" ? " · failed" : ""}
+                  </div>
+                )}
+                <FileDiffView diff={e.diff} label={r.tree ? `${treeWord(r.tree)}: ${r.name}` : r.name} defaultOpen={shown.length <= 4} />
+                {r.file.truncated && <div className="hx-dim mt-1 text-[11px]">Diff shortened — the file changed a lot.</div>}
+              </div>
+            ))}
+            {notes?.get(r.key) && <div className="hx-dim mt-1 text-[11px]">{notes.get(r.key)}</div>}
+          </React.Fragment>
+        ))}
+      </div>
+    </>
+  );
+}
+
+/** `files`: the session's changeset. `self`: the agent's name; `subs`: its harness's subagents, in the order they began. `own`: where one's own part of a file comes from; `commits`, its branch's commits. */
+export function SessionChanges({ files, cwd, self, subs, own, commits }: { files: ChangedFile[]; cwd: string; self: string; subs: readonly Sub[]; own?: OwnSource; commits?: CommitsSource }) {
+  const [mode, setMode] = React.useState<Mode>("session");
+  const [scope, setScope] = useScope();
+  const [sort] = usePref<SortKey>("kiln.changes.sort", "path");
   const [by, setBy] = React.useState<string>("all");
   const [sel, setSel] = React.useState<string | null>(null);
   const names = React.useMemo(() => new Map(subs.map((s) => [s.id, s.label])), [subs]);
@@ -208,20 +363,26 @@ export function SessionChanges({ files, cwd, self, subs, own }: { files: Changed
       if (p.pending) pending.add(r.key);
       return r;
     });
-    const order: Record<SortKey, (a: Row, b: Row) => number> = {
-      path: (a, b) => a.name.localeCompare(b.name),
-      latest: (a, b) => (b.file.at ?? 0) - (a.file.at ?? 0) || a.name.localeCompare(b.name),
-      most: (a, b) => b.file.add + b.file.del - (a.file.add + a.file.del) || a.name.localeCompare(b.name),
-      kind: (a, b) => KIND_RANK(a.file) - KIND_RANK(b.file) || a.name.localeCompare(b.name),
-      who: (a, b) => people.findIndex((p) => p.id === (a.file.by ?? [AGENT])[0]) - people.findIndex((p) => p.id === (b.file.by ?? [AGENT])[0]) || a.name.localeCompare(b.name),
-    };
-    const band = (r: Row) => ["project", "user", "agent"].indexOf(placeOf(r.file));
-    return { rows: rows.sort((a, b) => band(a) - band(b) || order[sort](a, b)), notes: parts, pending };
+    const first = (r: Row) => people.findIndex((p) => p.id === (r.file.by ?? [AGENT])[0]);
+    return { rows: sortRows(rows, sort, first), notes: parts, pending };
   };
   const count = (id: string) => scoped.filter((f) => (f.by ?? [AGENT]).includes(id)).length;
   const byLabel = by === "all" ? "Everyone" : who(by);
   const scopeOf = SCOPE[scope];
-  const sortOf = SORTS.find((s) => s.id === sort);
+  // Commits: on once its machine has listed them (each read through Suspense), else turned off with why.
+  const commitsMode = commits && (
+    <React.Suspense
+      fallback={
+        <button type="button" role="radio" aria-checked="false" disabled title="Asking its machine for its commits">
+          Commits
+        </button>
+      }
+    >
+      <CommitsMode source={commits} on={mode === "commits"} onPick={() => setMode("commits")} />
+    </React.Suspense>
+  );
+  const modeRow = <ModeRow mode={mode} onMode={setMode} commits={commitsMode} />;
+  if (mode === "commits" && commits) return <CommitsView source={commits} cwd={cwd} head={modeRow} />;
 
   const line = (r: Row): string => {
     const ids = r.file.by ?? [];
@@ -240,119 +401,22 @@ export function SessionChanges({ files, cwd, self, subs, own }: { files: Changed
     </React.Suspense>
   );
 
-  const list = ({ rows, notes, pending }: ReturnType<typeof sorted>) => {
-    const picked = sel !== null && rows.some((r) => r.key === sel) ? sel : null;
-    const shown = picked ? rows.filter((r) => r.key === picked) : rows;
-    return (
-      <>
-        {rows.length === 0 ? (
-          <div className="cx-none">{scope === "project" && by === "all" ? "Nothing in this project changed." : "Nothing here at this scope."}</div>
-        ) : (
-          <div className="cx-files">
-            {rows.map((r, i) => {
-              const band = BAND[placeOf(r.file)];
-              const slash = r.name.lastIndexOf("/");
-              const when = r.file.at ? relativeTime(Math.floor(r.file.at / 1000)).replace(/ ago$/, "") : "";
-              const words = line(r);
-              return (
-                <React.Fragment key={r.key}>
-                  {band && placeOf(r.file) !== placeOf(rows[i - 1]?.file ?? { place: "project" }) && <div className="cx-band">{band}</div>}
-                  <button
-                    type="button"
-                    className="cx-file"
-                    aria-pressed={picked === r.key}
-                    data-pending={pending.has(r.key) || undefined}
-                    onClick={() => setSel(picked === r.key ? null : r.key)}
-                    title={r.tree ? `${r.tree}/${r.name}` : r.name}
-                  >
-                    <span className="cx-path">
-                      {slash > 0 && (
-                        <span className="cx-path-dir">
-                          <span dir="ltr">{r.name.slice(0, slash + 1)}</span>
-                        </span>
-                      )}
-                      <span className="cx-path-name">{r.name.slice(slash + 1)}</span>
-                      {r.file.created && <span className="hx-tag">new</span>}
-                      {r.file.deleted && <span className="hx-tag hx-tag-bad">deleted</span>}
-                    </span>
-                    <DiffStat add={r.file.add} del={r.file.del} />
-                    {(words || when) && (
-                      <>
-                        <span className="cx-by">{words}</span>
-                        <span className="cx-when">{when}</span>
-                      </>
-                    )}
-                  </button>
-                </React.Fragment>
-              );
-            })}
-          </div>
-        )}
-        <div className="hx-stack">
-          {shown.map((r) => (
-            <React.Fragment key={r.key}>
-              {r.file.edits.map((e, i) => (
-                <div key={`${r.key}-${i}`}>
-                  {r.file.edits.length > 1 && (
-                    <div className="hx-dim mb-1 text-[11px]">
-                      edit {i + 1} of {r.file.edits.length}
-                      {e.call?.status === "error" ? " · failed" : ""}
-                    </div>
-                  )}
-                  <FileDiffView diff={e.diff} label={r.tree ? `${treeWord(r.tree)}: ${r.name}` : r.name} defaultOpen={shown.length <= 4} />
-                  {r.file.truncated && <div className="hx-dim mt-1 text-[11px]">Diff shortened — the file changed a lot.</div>}
-                </div>
-              ))}
-              {notes.get(r.key) && <div className="hx-dim mt-1 text-[11px]">{notes.get(r.key)}</div>}
-            </React.Fragment>
-          ))}
-        </div>
-      </>
-    );
-  };
+  const list = ({ rows, notes, pending }: ReturnType<typeof sorted>) => (
+    <FileList
+      rows={rows}
+      line={line}
+      sel={sel}
+      onSel={setSel}
+      none={scope === "project" && by === "all" ? "Nothing in this project changed." : "Nothing here at this scope."}
+      notes={notes}
+      pending={pending}
+    />
+  );
 
   return (
     <>
       <div className="cx-head">
-        <div className="cx-mrow">
-          <div className="cx-modes" role="radiogroup" aria-label="What it shows">
-            <button type="button" role="radio" aria-checked="true">
-              Session
-            </button>
-            <button type="button" role="radio" aria-checked="false" disabled title="Not in this version of kiln yet">
-              Commits
-            </button>
-            <button type="button" role="radio" aria-checked="false" disabled title="Not in this version of kiln yet">
-              Compare
-            </button>
-          </div>
-          <DropdownMenu.Root>
-            <DropdownMenu.Trigger asChild>
-              <button type="button" className="cx-view" aria-label={`Sort: ${sortOf?.label ?? "Path"}`}>
-                <ArrowDownUp size={12} aria-hidden="true" />
-                {sortOf?.word ?? "Path"}
-              </button>
-            </DropdownMenu.Trigger>
-            <DropdownMenu.Portal>
-              <DropdownMenu.Content className="popover cx-menu" sideOffset={6} align="end" collisionPadding={12}>
-                <DropdownMenu.Label className="cx-menu-label">Sort</DropdownMenu.Label>
-                <DropdownMenu.RadioGroup value={sort} onValueChange={(v) => setSort(v as SortKey)}>
-                  {SORTS.map((s) => (
-                    <DropdownMenu.RadioItem key={s.id} value={s.id} className="menu-item">
-                      <s.icon size={14} aria-hidden="true" />
-                      <span className="flex-1">{s.label}</span>
-                      <span className="cx-mark">
-                        <DropdownMenu.ItemIndicator>
-                          <Check size={14} aria-hidden="true" />
-                        </DropdownMenu.ItemIndicator>
-                      </span>
-                    </DropdownMenu.RadioItem>
-                  ))}
-                </DropdownMenu.RadioGroup>
-              </DropdownMenu.Content>
-            </DropdownMenu.Portal>
-          </DropdownMenu.Root>
-        </div>
+        {modeRow}
         <div className="cx-hrow">
           <span className="cx-lab">Scope</span>
           <DropdownMenu.Root>

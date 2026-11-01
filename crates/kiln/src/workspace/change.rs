@@ -130,6 +130,11 @@ pub async fn ask_machine(hub: &Hub, info: &Info, ask: &super::Ask) -> Result<Val
     let answer = if machine == "local" {
         super::serve(std::path::Path::new(&info.cwd), std::path::Path::new(info.work_dir()), info.workspace.as_ref(), ask.clone()).await
     } else {
+        // A question only a newer runner answers isn't sent to one that can't.
+        let wide = ask.wide_cap();
+        if wide != 0 && hub.instances.lock().wide_caps_for(&machine, &crate::instances::Owned::Agent(info.id.clone())) & wide != wide {
+            return Err(fail(StatusCode::CONFLICT, format!("{machine}'s kiln is too old to do this: upgrade it (System → Updates)")));
+        }
         let json = serde_json::to_string(ask).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let id = info.id.clone();
         let got = hub

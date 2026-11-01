@@ -621,6 +621,7 @@ code-mode function (`kiln.agents.start`) and, from a kiln shell, a CLI command.
 | `agents.change` | `POST /api/harness/agents/:id/change` | `{title?, body?, draft?, trunk?, fix_checks?}` → `{change_request: Change}`: opens its change request from its work, or pushes a new version ("Change requests from agents", below) |
 | `agents.changes` | `GET /api/harness/changes` | `agent?` → `{changes: [Change]}`, newest first |
 | `agents.workspace` | `GET /api/harness/agents/:id/workspace` | → `{workspace: {kind, over, sub, volume, mount} \| null, drift: [path]}` ("Workspaces of their own", below) |
+| `agents.commits` | `GET /api/harness/agents/:id/commits?picks=&branch=&trunk=` | → `{log: {top, head, branch, trunk, base, dirty: {files, added, removed} \| null, commits: [{sha, parents, subject, author, at, files, added, removed, session}], more, told, branches, listed}, picked: {from, files: [FileChange], needs: {pick, commit, subject}} \| null}` ("Commits", below) |
 | `agents.land` | `POST /api/harness/agents/:id/land` | `{}` → `{plan, excludes, can_write, why_not?}`; `{manifest}` (that plan's; a person only) → `{landed}`, or `{changed, plan, …}` with nothing written when the plan isn't that one any more |
 
 Each takes an input type of its own (`crate::ops::Input`), as every operation of the registry
@@ -840,8 +841,9 @@ composer → More options → Workspace → Own volume; `agents.start` with `wor
 An agent's Changes tab shows what it changed, its change request above (see "Change requests from
 agents"). Its head says what's shown, a row each, each choice in a menu:
 
-- **Session**: the files it changed since it began, each against how it was before. Commits and
-  Compare are turned off: not in this version of kiln yet.
+- **Session**: the files it changed since it began, each against how it was before.
+- **Commits**: its branch's commits, and what the picked ones change together (see "Commits").
+  Compare is turned off: not in this version of kiln yet.
 - **Scope**: Project at first, then User, then All (see "Who changed a file, and whose it is"). The
   browser keeps the choice.
 - **By**: everyone, the agent itself, or one of its harness's subagents, each with how many of the
@@ -853,6 +855,30 @@ most changed, new, changed or deleted, or who changed it) sits at its right. Its
 list, each saying on the line under it who changed it, and which worktree it's in when that isn't its
 folder's; the person's files elsewhere and the agents' own are under bands of their own. A file picked
 shows its diff alone; picked again, every file's. The tab's count is the files its scope shows.
+
+## Commits
+
+The Changes tab's Commits lists its branch's commits since its trunk (its remote's default branch,
+else `main` or `master`), newest first along its first parents, at most 200; a branch with none of
+its own since lists its latest 50. What isn't committed yet (as `git add -A` would take it, new files
+included) is on top. Its machine answers, in the working tree its work is in (`agents.commits`):
+
+- **This session's.** A session keeps the commit its folder had checked out as it began (its state's
+  `started_head`); the commits after it are its own, under a band of their own, and picked at first.
+  A session from before kiln kept it, or whose branch was rewritten since, tells its own by when they
+  were made.
+- **What's shown.** The picked commits' change, together. A run of them is one diff, from the first
+  one's parent to the last. With gaps, each picked commit is applied in order onto the first one's
+  parent in a scratch index beside the folder (its branch, index and working tree untouched); one
+  that doesn't go without a commit left out says which.
+- **Picking.** As Mission control picks agents: a tap shows one commit alone; press and hold picks
+  it, or unpicks it if it was picked, and dragging on takes each commit passed the same way, the
+  list not scrolling under the finger; with a mouse, Shift picks a run and ⌘/Ctrl adds or takes away
+  one. The This session band's ring picks all of the session's, with a dash when only some are.
+- **On** picks the branch: the one checked out, or another of its repository's (the latest dozen).
+
+A runner answers only with `CAP_WORKSPACE_COMMITS` (docs/wire.md). Without it, or in a folder that
+isn't a repository, Commits is turned off, saying why.
 
 ## Who changed a file, and whose it is
 

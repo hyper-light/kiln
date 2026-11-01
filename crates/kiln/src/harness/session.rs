@@ -2903,6 +2903,20 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
     if handed {
         s.prompted.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    // A new session (nothing in its timeline yet): the commit its folder has checked out as it
+    // begins, the commits after it its own (the Changes tab's Commits). One that came back (a
+    // restart, a move) has it, or is from before kiln kept it.
+    let new = {
+        let core = s.core.lock();
+        (core.events().next().is_none() && core.state.started_head.is_none()).then(|| core.state.cwd.clone())
+    };
+    if let Some(cwd) = new.filter(|_| !handed)
+        && let Some(head) = crate::workspace::git::head(std::path::Path::new(&cwd)).await
+    {
+        let mut core = s.core.lock();
+        core.state.started_head = Some(head);
+        core.touch_state();
+    }
     // Taking over a session: its transcript is read once it has ended (checked again before each
     // start while it has not).
     if !handed {

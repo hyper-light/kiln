@@ -407,6 +407,96 @@ pub fn own_edits(ask: &super::core::OwnAsk, read: impl Fn(&str) -> Option<Result
     serde_json::json!({"by": ask.by, "files": files})
 }
 
+/// The hunks a changeset shows of a file: those up to [`MAX_CHANGE_LINES`] lines, and whether some
+/// were left out.
+fn shown(mut hunks: Vec<Hunk>) -> (Vec<Hunk>, bool) {
+    let mut total = 0usize;
+    let mut keep = hunks.len();
+    for (i, h) in hunks.iter().enumerate() {
+        total += h.lines.len();
+        if total > MAX_CHANGE_LINES {
+            keep = i;
+            break;
+        }
+    }
+    let cut = keep < hunks.len();
+    hunks.truncate(keep);
+    (hunks, cut)
+}
+
+/// Each file `git diff --no-renames` (its default format) says changed, as a changeset shows one:
+/// its path in `top`'s working tree (`b/`'s, `a/`'s for one deleted), new or deleted, its counts
+/// and hunks, cut as a changeset's are. A binary file shows as changed, without lines.
+pub fn git_changes(diff: &str, top: &str, at: i64) -> Vec<super::model::FileChange> {
+    use super::model::{FileChange, FilePlace};
+    let mut out = Vec::new();
+    let mut sections: Vec<Vec<&str>> = Vec::new();
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            sections.push(Vec::new());
+        }
+        if let Some(s) = sections.last_mut() {
+            s.push(line);
+        }
+    }
+    for lines in sections {
+        let body = lines.iter().position(|l| l.starts_with("@@ ")).unwrap_or(lines.len());
+        let head = lines.get(..body).unwrap_or_default();
+        let path_after = |prefix: &str| head.iter().find_map(|l| l.strip_prefix(prefix)).map(unquote).filter(|p| p != "/dev/null");
+        let created = head.iter().any(|l| l.starts_with("new file mode"));
+        let deleted = head.iter().any(|l| l.starts_with("deleted file mode"));
+        let binary = head.iter().any(|l| l.starts_with("Binary files ") || *l == "GIT binary patch");
+        let Some(path) = path_after("+++ b/").or_else(|| path_after("--- a/")).or_else(|| {
+            // A file with no lines to show (binary, or only its mode changed): its name from the header.
+            head.first().and_then(|l| l.strip_prefix("diff --git a/")).and_then(|r| r.split_once(" b/")).map(|(a, _)| a.to_owned())
+        }) else {
+            continue;
+        };
+        let hunks = parse_unified(&lines.get(body..).unwrap_or_default().join("\n"));
+        let (added, removed) = hunks.iter().flat_map(|h| h.lines.iter()).fold((0u32, 0u32), |(a, r), l| match l.as_bytes().first() {
+            Some(b'+') => (a + 1, r),
+            Some(b'-') => (a, r + 1),
+            _ => (a, r),
+        });
+        let (hunks, cut) = shown(hunks);
+        out.push(FileChange { path, tree: Some(top.to_owned()), created, deleted, added, removed, hunks, truncated: cut || binary, at, by: Vec::new(), place: Some(FilePlace::Project) });
+    }
+    out
+}
+
+/// A path as git writes it in a diff's header: as it is, or C-quoted when it has to be.
+fn unquote(p: &str) -> String {
+    let Some(inner) = p.strip_prefix('"').and_then(|r| r.strip_suffix('"')) else { return p.trim_end_matches('\t').to_owned() };
+    let mut bytes = Vec::new();
+    let mut it = inner.bytes().peekable();
+    while let Some(b) = it.next() {
+        if b != b'\\' {
+            bytes.push(b);
+            continue;
+        }
+        match it.next() {
+            Some(b'n') => bytes.push(b'\n'),
+            Some(b't') => bytes.push(b'\t'),
+            Some(d @ b'0'..=b'7') => {
+                let mut v = u32::from(d - b'0');
+                for _ in 0..2 {
+                    match it.peek() {
+                        Some(&n @ b'0'..=b'7') => {
+                            v = v * 8 + u32::from(n - b'0');
+                            it.next();
+                        }
+                        _ => break,
+                    }
+                }
+                bytes.push(u8::try_from(v).unwrap_or(b'?'));
+            }
+            Some(other) => bytes.push(other),
+            None => {}
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 fn compare(job: &super::core::ChangeJob, now: Option<Result<String, ()>>) -> Option<super::model::FileChange> {
     use super::core::Baseline;
     use super::model::FileChange;
@@ -422,20 +512,6 @@ fn compare(job: &super::core::ChangeJob, now: Option<Result<String, ()>>) -> Opt
             }
         }
         (add, del)
-    };
-    let shown = |mut hunks: Vec<Hunk>| -> (Vec<Hunk>, bool) {
-        let mut total = 0usize;
-        let mut keep = hunks.len();
-        for (i, h) in hunks.iter().enumerate() {
-            total += h.lines.len();
-            if total > MAX_CHANGE_LINES {
-                keep = i;
-                break;
-            }
-        }
-        let cut = keep < hunks.len();
-        hunks.truncate(keep);
-        (hunks, cut)
     };
     let blank = |rel: &str| FileChange { path: rel.to_owned(), tree: None, created: false, deleted: false, added: 0, removed: 0, hunks: Vec::new(), truncated: true, at, by: Vec::new(), place: None };
     match (&job.baseline, now) {
