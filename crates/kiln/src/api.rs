@@ -780,6 +780,23 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             Ok(srv::json(StatusCode::OK, &json!({ "breaks": breaks })))
         })
         .await,
+        // The relays' streams (W27-R08's relays), and their records no receipt answered `lapse`
+        // seconds on (kiln's own lapse unless said); posted, those are recorded as breaks naming
+        // their relays now, as kiln does once they lapse.
+        (&Method::GET | &Method::POST, ["api", "custody", "relays"]) => {
+            let lapse = srv::query(&req).remove("lapse").and_then(|l| l.parse::<i64>().ok()).unwrap_or(crate::custody::LAPSE_AFTER);
+            let post = req.method() == Method::POST;
+            boxed(|| async {
+                let at = crate::util::now_unix();
+                let v = if post {
+                    json!({ "recorded": crate::relays::unanswered(&hub.store, lapse, at, true).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))? })
+                } else {
+                    crate::relays::view(&hub.store, lapse, at).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
+                };
+                Ok(srv::json(StatusCode::OK, &v))
+            })
+            .await
+        }
         (&Method::GET, ["api", "custody"]) => {
             let mut q = srv::query(&req);
             let (digest, name) = (q.remove("digest").unwrap_or_default(), q.remove("name"));
