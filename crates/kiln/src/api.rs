@@ -1926,14 +1926,22 @@ async fn cluster_copy(hub: &Hub, req: &Request) -> R {
         std::fs::remove_file(&path).ok();
         return Err(err(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")));
     }
-    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    let (size, rx) = copy_body(path).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("reading the copy of kiln.db: {e}")))?;
     tracing::info!(machine, bytes = size, took_ms = started.elapsed().as_millis() as u64, "a copy of kiln.db for a runner's learner");
+    let r = srv::response(StatusCode::OK, "application/octet-stream", srv::channel_body(rx));
+    Ok(srv::with_header(r, header::CONTENT_LENGTH, &size.to_string()))
+}
+
+/// Streams the copy at `path` (it goes once sent): its size, and its bytes as they're read, from
+/// the file opened now. The next copy is made once this one is handed over and clears what a stop
+/// left behind, this copy's name among it: an open file outlives its name (and Windows keeps it).
+fn copy_body(path: std::path::PathBuf) -> std::io::Result<(u64, async_channel::Receiver<Bytes>)> {
+    let mut f = std::fs::File::open(&path)?;
+    let size = f.metadata()?.len();
     let (tx, rx) = async_channel::bounded::<Bytes>(16);
     crate::rt::spawn(async move {
-        let p = path.clone();
         let _ = crate::rt::blocking(move || -> std::io::Result<()> {
             use std::io::Read as _;
-            let mut f = std::fs::File::open(&p)?;
             let mut buf = vec![0u8; 256 << 10];
             loop {
                 let n = f.read(&mut buf)?;
@@ -1945,8 +1953,7 @@ async fn cluster_copy(hub: &Hub, req: &Request) -> R {
         .await;
         std::fs::remove_file(&path).ok();
     });
-    let r = srv::response(StatusCode::OK, "application/octet-stream", srv::channel_body(rx));
-    Ok(srv::with_header(r, header::CONTENT_LENGTH, &size.to_string()))
+    Ok((size, rx))
 }
 
 /// One of the contents synced repos name (`HEAD`: whether the server has it).
@@ -5937,6 +5944,27 @@ fn back(connected: u64, before: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P2: a learner's copy streams whole though the next copy, made once this one is handed over,
+    /// clears its name (what a stop left behind) before this one's reader has run.
+    #[test]
+    fn a_learner_s_copy_streams_whole_though_its_name_goes_once_handed_over() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let path = dir.path().join("copy.db");
+            let want: Vec<u8> = (0..(3_u32 << 18)).map(|i| u8::try_from(i % 251).unwrap_or(0)).collect();
+            std::fs::write(&path, &want)?;
+            let (size, rx) = copy_body(path.clone())?;
+            // The next copy's sweep, before this one's reader has run (Windows refuses: it's open).
+            std::fs::remove_file(&path).ok();
+            let mut got = Vec::new();
+            while let Ok(chunk) = rx.recv().await {
+                got.extend_from_slice(&chunk);
+            }
+            anyhow::ensure!(u64::try_from(want.len())? == size && got == want, "streamed {} of {} bytes", got.len(), want.len());
+            Ok(())
+        })
+    }
 
     #[test]
     fn the_servers_own_machine_asking_for_its_local_agents_name_is_not_given_another_runner() {
