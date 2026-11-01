@@ -297,6 +297,9 @@ struct ChangeRec {
     conflicts: Vec<kiln_ci::review::Conflict>,
     /// The Review lane group's marks, oldest first (W26-R14).
     marks: Vec<MarkRec>,
+    /// A host's pull request kiln opened for an agent (`agents.change`): that agent's session
+    /// (W26-R18 drafts). A kiln change names its agent as its author.
+    by_agent: Option<String>,
 }
 
 impl ChangeRec {
@@ -622,6 +625,15 @@ fn load_pull(c: &rusqlite::Connection, repo_id: &str, host: &str, number: i64, n
     let asked: Vec<(String, i64)> = serde_json::from_str::<Vec<String>>(&requested).unwrap_or_default().into_iter().map(|r| (r, first_seen)).collect();
     approval_marks(&mut marks, &key, &asked, &reviews);
     marks.sort_by_key(|m| (m.at, mark_rank(m.kind)));
+    // The agent kiln opened it for, as its change record names it (agents.change, W26-R18).
+    let by_agent: Option<String> = c
+        .query_row(
+            "SELECT json_extract(v, '$.agent') FROM kv WHERE k LIKE 'agents/change/%' AND json_extract(v, '$.provider') = ?2 AND json_extract(v, '$.change') = ?3
+               AND json_extract(v, '$.repo') = (SELECT name FROM repos WHERE id = ?1) LIMIT 1",
+            params![repo_id, host, format!("#{number}")],
+            |r| r.get(0),
+        )
+        .optional()?;
     Ok(ChangeRec {
         name: format!("{}{number}", if host == "gitlab" { "!" } else { "#" }),
         kind: "request",
@@ -648,6 +660,7 @@ fn load_pull(c: &rusqlite::Connection, repo_id: &str, host: &str, number: i64, n
         // A host's pull request is replayed on its host, not here.
         conflicts: Vec::new(),
         marks,
+        by_agent,
     })
 }
 
@@ -1123,6 +1136,15 @@ fn actions(rec: &Records, j: &Journey, yours: bool) -> Vec<Value> {
             out.push(hand());
         }
         out.push(act("review", "GET", format!("/api/diffs/{}", ch.name), Value::Null));
+    }
+    // An agent's draft, marked ready for review by its person or one who may land (W26-R18): a draft
+    // has no turn, so it's on the row for whoever looks, and the endpoint says who may.
+    if let (Some(ch), Some(r)) = (rec.change.as_ref(), j.review.as_ref())
+        && r.superseded_by.is_none()
+        && r.state == ReviewState::Draft
+        && (authors_agent(ch).is_some() || ch.by_agent.is_some())
+    {
+        out.push(act("ready", "POST", "/api/ship/ready".to_string(), json!({ "repo": rec.repo, "sha": rec.sha })));
     }
     out
 }
@@ -1861,6 +1883,47 @@ pub async fn get(hub: &std::sync::Arc<Hub>, repo: &str, sha: &str, caller: Optio
 
 /// Failure lines the agent a failure is handed to gets with it.
 const HANDED_LINES: usize = 40;
+
+/// `POST /api/ship/ready` `{repo, sha}`: the row's Ready (W26-R18, drafts): an agent's draft marked
+/// ready for review by its agent's person (the change's `for`) or one who may land on the
+/// repository (`diffs.land`): kiln's own as kiln does it for them, a host's through its API
+/// (`GitHost::ready_change`, docs/ci.md W29-R12). The agent's change then says it's no draft.
+pub async fn ready(hub: &std::sync::Arc<Hub>, caller: &crate::authz::Caller, body: &Value) -> Result<Response, Fail> {
+    ready_in(hub, caller, body).await.map(|v| srv::json(StatusCode::OK, &v))
+}
+
+async fn ready_in(hub: &std::sync::Arc<Hub>, caller: &crate::authz::Caller, body: &Value) -> Result<Value, Fail> {
+    let field = |k: &str| body.get(k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
+    let (Some(repo), Some(sha)) = (field("repo"), field("sha")) else {
+        return Err((StatusCode::BAD_REQUEST, "`repo` and `sha`: the draft to mark ready".to_string()));
+    };
+    let (r, s, deploys) = (repo.clone(), sha.clone(), cd_deploys());
+    let rec = hub.store.call(move |c| load(c, &r, &s, &deploys)).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, "no such commit".to_string()))?;
+    let j = journey_of(&rec, &runners_seen(hub).await, crate::util::now_ms());
+    let draft = j.review.as_ref().is_some_and(|r| r.superseded_by.is_none() && r.state == ReviewState::Draft);
+    let Some(ch) = rec.change.as_ref().filter(|_| draft) else {
+        return Err((StatusCode::CONFLICT, format!("{} isn't a draft", rec.change.as_ref().map_or_else(|| short(&rec.sha), |ch| ch.name.clone()))));
+    };
+    let Some(agent) = authors_agent(ch).map(str::to_owned).or_else(|| ch.by_agent.clone()) else {
+        return Err((StatusCode::CONFLICT, format!("{} is its author's own draft: they mark it ready", ch.name)));
+    };
+    let person = ch.author_for.clone().filter(|p| !p.is_empty());
+    let theirs = person.as_deref().is_some_and(|p| p.eq_ignore_ascii_case(&crate::ci::diffs::author_of(&caller.name, Some(caller.kind)).0));
+    if !theirs && !caller.can("diffs.land", &crate::authz::Scope::Repo { repo: repo.clone() }) {
+        let whose = person.as_deref().map(|p| format!(" ({})", shown(p))).unwrap_or_default();
+        return Err((StatusCode::FORBIDDEN, format!("marking {} ready is for its agent's person{whose} or one who can land on {repo} (diffs.land)", ch.name)));
+    }
+    let repos = hub.store.repos().await.map_err(internal)?;
+    let target = repos.iter().find(|x| x.name == repo).ok_or_else(|| (StatusCode::NOT_FOUND, format!("no repository {repo}")))?;
+    let host = match ch.host.as_str() {
+        "kiln" => crate::githost::GitHost::Kiln,
+        _ => crate::githost::for_repo(hub, target).await.ok_or_else(|| (StatusCode::CONFLICT, format!("kiln can't reach {repo}'s host to mark {} ready", ch.name)))?,
+    };
+    crate::workspace::change::ready_where_it_is(hub, target, &host, &ch.name).await?;
+    crate::workspace::change::readied(hub, &agent, &repo, &ch.name).await;
+    hub.store.audit(caller.name.clone(), "ship.ready".into(), format!("{repo} {} marked ready for review", ch.name)).await;
+    Ok(json!({ "ready": { "change": ch.name } }))
+}
 
 /// `POST /api/ship/hand-off` `{repo, sha}`: the row's Hand off, as review-ship.html draws it
 /// (W26-R18, R02). What the commit has open goes to one agent. Its change's author's agent, while
@@ -3316,6 +3379,47 @@ mod tests {
                 let (stand, line, _) = stand_of(&after, v1.get(..7).unwrap_or_default());
                 anyhow::ensure!((stand.as_str(), line.as_str()) == ("fixed", "Fixed in v2"), "{name}'s handed revision says which version fixed it: {stand}: {line}");
             }
+            Ok(())
+        })
+    }
+
+    /// W26-R18, drafts (Ada, 2026-11-01): the Matrix agent's draft change request, made for sam,
+    /// offers Ready on its row. lee, neither its person nor able to land, is refused, saying why.
+    /// sam's Ready marks it ready for review: the row reads its review state with no Ready, and the
+    /// agent's change says it's no draft. Asked again, it's no draft to mark.
+    #[test]
+    fn w26_r18_an_agents_draft_is_marked_ready_from_ship_by_its_person() -> anyhow::Result<()> {
+        within(async {
+            const CR15: &str = "5151515aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let t = NOW_S - 600;
+            let sql = fixture()
+                + &format!(
+                    "INSERT INTO diffs (id, repo_id, number, kind, title, author, author_kind, author_for, state, trunk, branch, created_at, updated_at) VALUES ('cr15', 'kiln', 15, 'change_request', 'cap a share', 'agent:matrix-session', 'agent', 'user:sam', 'draft', 'main', 'b15', {t}, {t});
+                     INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, message, pushed_by, created_at) VALUES ('cr15', 1, '{CR15}', 'p', 'b', 'cap a share', 'agent:matrix-session', {t});"
+                );
+            hub.store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            let record = crate::workspace::change::Record { agent: "matrix-session".into(), repo: Some("hyper-light/kiln".into()), provider: "kiln".into(), change: Some("CR15".into()), review: Some("draft".into()), draft: Some(true), ..Default::default() };
+            crate::workspace::change::save(&hub, &record).await;
+            let page = || {
+                let store = hub.store.clone();
+                async move { list_in(&store, &HashMap::new(), None, None, runners(), &[], NOW_S * 1000).await.map_err(|(_, m)| anyhow::anyhow!(m)) }
+            };
+            let (stand, line, actions) = stand_of(&page().await?, "5151515");
+            anyhow::ensure!(line.starts_with("Draft") && actions.iter().any(|a| a == "ready"), "the draft offers Ready: {stand}: {line}: {actions:?}");
+            let body = json!({ "repo": "hyper-light/kiln", "sha": CR15 });
+            let refused = |r: Result<Value, Fail>| r.err().unwrap_or((StatusCode::OK, String::new()));
+            let (code, why) = refused(ready_in(&hub, &crate::authz::Caller::peer("user:lee", "viewer"), &body).await);
+            anyhow::ensure!(code == StatusCode::FORBIDDEN && why.contains("is for its agent's person (sam) or one who can land on hyper-light/kiln"), "lee: {code}: {why}");
+            let sam = crate::authz::Caller::peer("user:sam", "viewer");
+            ready_in(&hub, &sam, &body).await.map_err(|(c, m)| anyhow::anyhow!("sam: {c}: {m}"))?;
+            let state = crate::ci::diffs::find(&hub, "CR15").await?.map(|d| d.state).unwrap_or_default();
+            let (stand, line, actions) = stand_of(&page().await?, "5151515");
+            anyhow::ensure!(state == "needs-review" && !line.starts_with("Draft") && !actions.iter().any(|a| a == "ready"), "ready for review: {state}; the row: {stand}: {line}: {actions:?}");
+            let r = crate::workspace::change::of(&hub, "matrix-session").await.ok_or_else(|| anyhow::anyhow!("the agent's change went missing"))?;
+            anyhow::ensure!((r.draft, r.review.as_deref()) == (Some(false), Some("needs-review")), "the agent's change says it's no draft: {r:?}");
+            let (code, why) = refused(ready_in(&hub, &sam, &body).await);
+            anyhow::ensure!(code == StatusCode::CONFLICT && why == "CR15 isn't a draft", "again: {code}: {why}");
             Ok(())
         })
     }

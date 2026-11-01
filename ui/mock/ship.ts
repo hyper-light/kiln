@@ -350,6 +350,43 @@ const agentChange = (kind: ShipChange["kind"]): ShipCommit => {
   };
 };
 
+/** An agent's draft a test adds on top (`POST /api/mock/ship/arrive?draft=kiln|github`, W26-R18):
+ * a change request on kiln or a pull request on GitHub, not yet asked for review, with Ready. */
+const agentDraft = (host: "kiln" | "github"): ShipCommit => {
+  const [name, s, title] = host === "kiln" ? (["CR16", sha("ad"), "matrix: draft a share"] as const) : (["#22", sha("ae"), "matrix: draft on GitHub"] as const);
+  return {
+    repo: REPO,
+    sha: s,
+    short: s.slice(0, 7),
+    message: title,
+    author: "agent:matrix",
+    branch: "main",
+    at: now(),
+    stand: "waiting",
+    line: "Draft · not asked for review yet",
+    pips: pips("none", "none", "passed"),
+    environments: [],
+    tags: [],
+    runs: [],
+    cursor: 210,
+    kind: "request",
+    host,
+    change: { name, kind: "request", host, title, revision: 1, latest: 1, state: "draft", turn: [], open: { question: 0, nit: 0, issue: 0, blocking: 0 }, superseded_by: null },
+    made_by: { agent: "demo-long", person: "user:sam" },
+    fold_under: null,
+    actions: [{ name: "ready", method: "POST", path: "/api/ship/ready", body: { repo: REPO, sha: s } }],
+  };
+};
+
+/** The drafts each browser marked ready (`POST /api/ship/ready`), by its user agent as `handedBy` is. */
+const readyBy = new Map<string, Set<string>>();
+
+/** A draft once this browser marked it ready, as the server reads it: asked for review, no Ready. */
+const readyRow = (row: ShipCommit, ua: string): ShipCommit =>
+  readyBy.get(ua)?.has(row.sha) && row.change
+    ? { ...row, line: "Waiting on review", pips: row.pips.map((p) => (p.stage === "review" ? { ...p, state: "requested" } : p)), change: { ...row.change, state: "requested" }, actions: [] }
+    : row;
+
 /**
  * A burst of agents' commits (`POST /api/mock/ship/agents?n=14&over=10`; Agent pace and checks,
  * step 1): first a release production waits on you to approve, then agents' commits that ride with
@@ -553,7 +590,7 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
       (c) => (!repo || c.repo === repo) && (!q.get("host") || c.host === q.get("host")) && (!q.get("kind") || c.kind === q.get("kind")) && (q.get("lens") !== "review" || c.kind !== "commit"),
     );
     const fixes = list.filter((c) => c.change && handedBy.get(ua)?.has(c.sha) && fixedBy.get(ua)?.has(c.sha)).map(fixOf);
-    const page: ShipPage = { commits: [...fixes, ...list.map((c) => handedRow(c, ua))], next_cursor: null, pace: paceOf(all().filter((c) => !repo || c.repo === repo)) };
+    const page: ShipPage = { commits: [...fixes, ...list.map((c) => readyRow(handedRow(c, ua), ua))], next_cursor: null, pace: paceOf(all().filter((c) => !repo || c.repo === repo)) };
     ctx.json(res, 200, page);
     return true;
   }
@@ -659,6 +696,29 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
     ctx.json(res, 200, { handed: { to, agent: `agent-${to}`, ...(row.change ? {} : { incident: `inc-${row.short}` }), what: [row.change ? "threads" : "checks"] }, custody: SIGNED_FOR_YOU });
     return true;
   }
+  // A row's Ready (W26-R18): an agent's draft marked ready for review, as the server answers.
+  if (p === "/api/ship/ready" && m === "POST") {
+    let body: { repo?: unknown; sha?: unknown } = {};
+    try {
+      body = JSON.parse((await readBody(req)) || "{}") as typeof body;
+    } catch {
+      body = {};
+    }
+    const row = all().find((c) => c.repo === body.repo && c.sha === body.sha);
+    const mine = readyBy.get(ua) ?? new Set<string>();
+    if (!row?.change || mine.has(row.sha) || !(row.actions ?? []).some((a) => a.name === "ready")) {
+      ctx.json(res, row ? 409 : 404, { error: row ? `${row.change?.name ?? row.short} isn't a draft` : "no such commit" });
+      return true;
+    }
+    readyBy.set(ua, mine.add(row.sha));
+    ctx.json(res, 200, { ready: { change: row.change.name } });
+    return true;
+  }
+  if (p === "/api/mock/ship/ready" && m === "POST") {
+    if (q.get("reset")) readyBy.delete(ua);
+    ctx.json(res, 200, { ok: true });
+    return true;
+  }
   if (p === "/api/mock/ship/hand-off" && m === "POST") {
     if (q.get("reset")) {
       handedBy.delete(ua);
@@ -706,6 +766,7 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
       burstTimers.clear();
       arrived.length = 0;
     } else if (q.get("agent") === "diff" || q.get("agent") === "request") arrived.unshift(agentChange(q.get("agent") as ShipChange["kind"]));
+    else if (q.get("draft") === "kiln" || q.get("draft") === "github") arrived.unshift(agentDraft(q.get("draft") as "kiln" | "github"));
     else arrived.unshift(arrival(arrived.length + 1));
     ctx.json(res, 200, { ok: true });
     return true;

@@ -479,6 +479,21 @@ pub async fn ready_where_it_is(hub: &Arc<Hub>, repo: &Repo, h: &crate::githost::
     Ok(())
 }
 
+/// Agent `agent`'s change `name` of `repo`, marked ready for review by a person (Ship's Ready,
+/// W26-R18): its record says so. A change of another repository or number leaves it as it is.
+pub async fn readied(hub: &Hub, agent: &str, repo: &str, name: &str) {
+    let Some(mut r) = of(hub, agent).await else { return };
+    if r.repo.as_deref() != Some(repo) || r.change.as_deref().and_then(number_of) != number_of(name) {
+        return;
+    }
+    r.draft = Some(false);
+    if r.provider == "kiln" {
+        r.review = Some("needs-review".to_owned());
+    }
+    r.updated_at = crate::util::now_unix();
+    save(hub, &r).await;
+}
+
 /// Agent `info`'s draft `r` marked ready for review with nothing new to push (W26-R18).
 async fn ready_only(hub: &Arc<Hub>, actor: &str, info: &Info, r: Record) -> Result<Record, Fail> {
     let Some(name) = r.change.clone() else {
@@ -490,7 +505,10 @@ async fn ready_only(hub: &Arc<Hub>, actor: &str, info: &Info, r: Record) -> Resu
     }
     let repos = hub.store.repos().await.map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     let repo = r.repo.as_deref().and_then(|n| repos.iter().find(|x| x.name == n)).ok_or_else(|| fail(StatusCode::CONFLICT, format!("{name}'s repository isn't one kiln knows")))?;
-    let h = crate::githost::for_repo(hub, repo).await.ok_or_else(|| fail(StatusCode::CONFLICT, format!("kiln can't reach {}'s host to mark {name} ready", repo.name)))?;
+    let h = match r.provider.as_str() {
+        "kiln" => crate::githost::GitHost::Kiln,
+        _ => crate::githost::for_repo(hub, repo).await.ok_or_else(|| fail(StatusCode::CONFLICT, format!("kiln can't reach {}'s host to mark {name} ready", repo.name)))?,
+    };
     ready_where_it_is(hub, repo, &h, &name).await?;
     if matches!(h, crate::githost::GitHost::Kiln) {
         r.review = Some("needs-review".to_owned());
