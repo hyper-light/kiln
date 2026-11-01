@@ -69,6 +69,12 @@ pub struct Config {
     /// The cache whose objects this runner's peers may ask for (docs/ci.md W24-R27); `None`, the
     /// running cache service's.
     pub objects: Option<Arc<crate::runner::work::store::Store>>,
+    /// The highest reach version it speaks ([`wire::VERSION`]; a test's 1 stands in for a build from
+    /// before, which carries no custody records).
+    pub version: u32,
+    /// kiln's root (its CA, DER), which the custody records another runner hands this one chain to
+    /// (docs/ci.md W27-R08, `super::custody`).
+    pub root: Vec<u8>,
 }
 
 /// Something another runner hands this one to take over, whole: `reply` says whether it was.
@@ -131,7 +137,7 @@ const ADOPT_PIECE: usize = 1 << 20;
 impl Config {
     /// A runner's usual settings: identity under `state`, copies under `~/.kiln/reach`.
     pub fn for_runner(name: &str, state: &std::path::Path, accept: bool) -> Self {
-        Self { name: name.to_owned(), dir: state.join("reach"), accept, mirrors: crate::os::home_dir().join(".kiln").join("reach"), adopt: None, using: Arc::default(), objects: None }
+        Self { name: name.to_owned(), dir: state.join("reach"), accept, mirrors: crate::os::home_dir().join(".kiln").join("reach"), adopt: None, using: Arc::default(), objects: None, version: wire::VERSION, root: Vec::new() }
     }
 }
 
@@ -149,8 +155,9 @@ pub enum In {
     Local(Local),
     /// An event of a run this node does for another runner.
     Ran { key: (String, String), id: u64, ev: serve::Event },
-    /// What a sync this node does for another runner says.
-    Synced { key: (String, String), say: SyncSay },
+    /// What a sync this node does for another runner says: with its commit, the custody frame that
+    /// goes ahead of it and the copy's tree digest (docs/ci.md W27-R08).
+    Synced { key: (String, String), say: SyncSay, custody: Option<String>, tree: Option<String> },
     /// Whether this runner took over what another handed it.
     Adopted { key: (String, String), id: u64, error: Option<String> },
     Tick,
@@ -161,8 +168,15 @@ pub enum Local {
     Directory { reply: oneshot::Sender<anyhow::Result<Vec<RunnerInfo>>> },
     /// Link up to `peer` (if it is not), answering with the machine it is.
     Connect { peer: String, reply: oneshot::Sender<anyhow::Result<Host>> },
-    /// Run on `peer`; what the run says goes to `says`. Answers with its id.
-    Run { peer: String, spec: Box<RunSpec>, says: Says, reply: oneshot::Sender<u64> },
+    /// Run on `peer`; what the run says goes to `says`. Answers with its id: `spec`'s when it has
+    /// one ([`Local::Reserve`]), its custody frames (`custody`, JSON) going ahead of it.
+    Run { peer: String, spec: Box<RunSpec>, says: Says, reply: oneshot::Sender<u64>, custody: Vec<String> },
+    /// The id the next run on `peer` gets, and the session it's numbered in (what its custody
+    /// records name it by, docs/ci.md W27-R08).
+    Reserve { peer: String, reply: oneshot::Sender<(u64, String)> },
+    /// The version of the link up to `peer` (None: none is up), and the receipt of sync `key`'s
+    /// workspace it said, taken.
+    Custody { peer: String, key: String, reply: oneshot::Sender<(Option<u32>, Option<String>)> },
     /// Something more for a run (input, a signal, Forget).
     Ask { peer: String, ask: Ask },
     /// Follow a sync of `key` on `peer` (what it says goes to `says`), then send it `asks`.
@@ -189,6 +203,10 @@ pub struct Handle {
     announce: Announce,
     busy: Arc<AtomicU64>,
     name: String,
+    /// Where its identity and pins live, and the hashes of the trees it syncs.
+    dir: PathBuf,
+    /// kiln's root, for what other runners sign (docs/ci.md W27-R08).
+    root: Arc<Vec<u8>>,
 }
 
 static GLOBAL: std::sync::OnceLock<Handle> = std::sync::OnceLock::new();
@@ -243,7 +261,34 @@ impl Handle {
     }
 
     pub async fn run(&self, peer: &str, spec: RunSpec, says: Says) -> anyhow::Result<u64> {
-        self.ask(|reply| Local::Run { peer: peer.to_owned(), spec: Box::new(spec), says, reply }).await
+        self.run_with(peer, spec, says, Vec::new()).await
+    }
+
+    /// [`Handle::run`], its custody frames (JSON) going ahead of it on the link (docs/ci.md
+    /// W27-R08), its id `spec`'s when it has one ([`Handle::reserve`]).
+    pub async fn run_with(&self, peer: &str, spec: RunSpec, says: Says, custody: Vec<String>) -> anyhow::Result<u64> {
+        self.ask(|reply| Local::Run { peer: peer.to_owned(), spec: Box::new(spec), says, reply, custody }).await
+    }
+
+    /// The id the next run on `peer` gets, and the reach session it's numbered in.
+    pub async fn reserve(&self, peer: &str) -> anyhow::Result<(u64, String)> {
+        self.ask(|reply| Local::Reserve { peer: peer.to_owned(), reply }).await
+    }
+
+    /// The version the link up to `peer` runs at (None: none is up), and the receipt of sync `key`'s
+    /// workspace `peer` said on it, taken.
+    pub async fn custody(&self, peer: &str, key: &str) -> anyhow::Result<(Option<u32>, Option<String>)> {
+        self.ask(|reply| Local::Custody { peer: peer.to_owned(), key: key.to_owned(), reply }).await
+    }
+
+    /// Where this runner keeps the hashes of a tree it syncs as copy `key` (`super::sync::Hashes`).
+    pub fn hashes_of(&self, key: &str) -> PathBuf {
+        self.dir.join("trees").join(format!("{key}.json"))
+    }
+
+    /// kiln's root, which what other runners sign chains to (empty: none is checked).
+    pub fn root(&self) -> &[u8] {
+        &self.root
     }
 
     pub async fn send(&self, peer: &str, ask: Ask) -> bool {
@@ -408,7 +453,8 @@ impl Handle {
 pub fn start(cfg: Config) -> anyhow::Result<(Handle, async_channel::Receiver<AgentMsg>)> {
     let identity = Identity::load_or_create(&cfg.dir, &cfg.name)?;
     let pins = Pins::open(&cfg.dir);
-    let announce = Announce { fingerprint: identity.fingerprint.clone(), accept: cfg.accept, version: wire::VERSION };
+    let announce = Announce { fingerprint: identity.fingerprint.clone(), accept: cfg.accept, version: cfg.version };
+    let (dir, root) = (cfg.dir.clone(), Arc::new(cfg.root.clone()));
     let (net_tx, net_rx) = async_channel::unbounded::<In>();
     let (tx, rx) = async_channel::bounded::<In>(1024);
     // Unbounded too: the node must never wait on the agent while the agent feeds it.
@@ -449,6 +495,7 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, async_channel::Receiver<Age
         links: HashMap::new(),
         peers: HashMap::new(),
         served: HashMap::new(),
+        root: Arc::clone(&root),
     };
     let busy = Arc::new(AtomicU64::new(0));
     let counted = Arc::clone(&busy);
@@ -483,7 +530,7 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, async_channel::Receiver<Age
             counted.store(node.busy(), Ordering::Relaxed);
         }
     });
-    Ok((Handle { net: net_tx, tx, announce, busy, name: node_name }, out_rx))
+    Ok((Handle { net: net_tx, tx, announce, busy, name: node_name, dir, root }, out_rx))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -509,6 +556,13 @@ struct Link {
     /// Doer: the session the asker named in Hello.
     session: Option<String>,
     pinged: bool,
+    /// The reach version it runs at: the asker's Hello's, once the doer speaks it.
+    version: u32,
+    /// The asker heard the doer's Welcome.
+    welcomed: bool,
+    /// Custody frames that came on it (docs/ci.md W27-R08): none ever on a link below
+    /// [`wire::CUSTODY`].
+    custody: u64,
 }
 
 /// A run this side follows on another runner.
@@ -517,6 +571,11 @@ struct Follow {
     /// Output offset received up to.
     got: u64,
     exited: bool,
+    /// Its output's SHA-256 so far: each byte once, as it first came (docs/ci.md W27-R08).
+    out: sha2::Sha256,
+    /// Its custody frames, said just ahead of it on whichever link takes it (one at version 2 or
+    /// later).
+    frames: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -545,6 +604,12 @@ struct Peer {
     waiters: Vec<oneshot::Sender<anyhow::Result<Host>>>,
     last_used: Instant,
     error: Option<String>,
+    /// The version it speaks, as its refusal of a later one said (a runner from before).
+    speaks: Option<u32>,
+    /// The receipts of syncs' workspaces it said, by sync key, for their syncs to take.
+    receipts: HashMap<String, String>,
+    /// Custody frames that came from it, on any link.
+    custody: u64,
 }
 
 impl Peer {
@@ -562,6 +627,9 @@ impl Peer {
             waiters: Vec::new(),
             last_used: Instant::now(),
             error: None,
+            speaks: None,
+            receipts: HashMap::new(),
+            custody: 0,
         }
     }
 
@@ -591,6 +659,13 @@ struct Served {
     /// Shared with the run's forwarder: bytes held, and its wake-up when that drops.
     held: Arc<AtomicU64>,
     room: Arc<event_listener::Event>,
+    /// Its output's SHA-256 so far, each byte as the run said it (docs/ci.md W27-R08).
+    out: sha2::Sha256,
+    /// What it was taken as (its receipt, whom its output goes to), on a link that carries
+    /// custody; and the frame handing its output on, once it's made (sent again with its exit).
+    took: Option<super::custody::Took>,
+    custody: bool,
+    out_frame: Option<String>,
 }
 
 /// A session another runner holds with this one.
@@ -598,10 +673,25 @@ struct Session {
     link: Option<String>,
     runs: HashMap<u64, Served>,
     /// Syncs, each its own worker (file system work stays off this task).
-    syncs: HashMap<String, async_channel::Sender<SyncAsk>>,
+    syncs: HashMap<String, async_channel::Sender<(SyncAsk, Option<Commit>)>>,
     /// Hand-overs arriving, by id: the bytes so far.
     adopting: HashMap<u64, Vec<u8>>,
     detached: Option<Instant>,
+    /// Custody frames the asker sent ahead of what they hand on (docs/ci.md W27-R08), by what for:
+    /// `workspace <key>`, `run <id>`.
+    custody: HashMap<String, Value>,
+    /// Each copy's tree digest as its last sync committed it, by its key: what its runs are of.
+    trees: HashMap<String, String>,
+    /// Custody frames that came from it.
+    frames: u64,
+}
+
+/// What a sync's commit takes custody under (docs/ci.md W27-R08): the version of the link it came
+/// on, the frame the asker sent ahead of it, and kiln's root.
+struct Commit {
+    version: u32,
+    frame: Option<Value>,
+    root: Arc<Vec<u8>>,
 }
 
 enum Waiting {
@@ -629,6 +719,8 @@ struct Node {
     links: HashMap<String, Link>,
     peers: HashMap<String, Peer>,
     served: HashMap<(String, String), Session>,
+    /// kiln's root, as `cfg.root` (what other runners' custody records chain to).
+    root: Arc<Vec<u8>>,
 }
 
 impl Node {
@@ -671,7 +763,7 @@ impl Node {
             }
             In::Local(l) => self.on_local(l).await,
             In::Ran { key, id, ev } => self.on_ran(key, id, ev).await,
-            In::Synced { key, say } => self.on_synced(key, say).await,
+            In::Synced { key, say, custody, tree } => self.on_synced(key, say, custody, tree).await,
             In::Adopted { key, id, error } => {
                 if let Some(link) = self.served.get(&key).and_then(|s| s.link.clone()) {
                     self.say_on(&link, &Say::Adopted { id, error }).await;
@@ -973,14 +1065,19 @@ impl Node {
                 return;
             }
         };
+        // At the version both speak: the lower of this runner's and what the directory, or the
+        // other's refusal of a later one, says it speaks.
+        let listed = self.directory.as_ref().and_then(|(_, d)| d.iter().find(|r| r.name == name)).and_then(|r| r.reach_version);
         let Some(p) = self.peers.get_mut(name) else { return };
+        let version = [Some(self.cfg.version), listed, p.speaks].into_iter().flatten().min().unwrap_or(wire::MIN_VERSION).max(wire::MIN_VERSION);
         let id = crate::util::new_id();
         let resume: Vec<Resume> = p.follows.iter().map(|(id, f)| Resume { id: *id, from: f.got }).collect();
-        let hello = Ask::Hello { version: wire::VERSION, session: p.session.clone(), resume };
+        let hello = Ask::Hello { version, session: p.session.clone(), resume };
         p.link = Some(id.clone());
         p.state = PeerState::Connecting;
         let now = Instant::now();
-        self.links.insert(id.clone(), Link { peer: name.to_owned(), role: Role::Asker, tls, de: Deframer::default(), fingerprint: fp, opened: now, last_rx: now, sent_any: false, pinned: false, session: None, pinged: false });
+        let link = Link { peer: name.to_owned(), role: Role::Asker, tls, de: Deframer::default(), fingerprint: fp, opened: now, last_rx: now, sent_any: false, pinned: false, session: None, pinged: false, version, welcomed: false, custody: 0 };
+        self.links.insert(id.clone(), link);
         // Hello rides along: held until the handshake is done, then sent encrypted.
         self.say_on(&id, &hello).await;
     }
@@ -1024,6 +1121,19 @@ impl Node {
                 return;
             }
             let (Some(link), Some(a)) = (p.link.clone(), p.queue.pop_front()) else { return };
+            // A link below CUSTODY carries no custody frames: a runner from before would end it. A
+            // run's go just ahead of it, so a run asked again on a new link has them too.
+            let carries = self.links.get(&link).is_some_and(|l| l.version >= wire::CUSTODY);
+            if matches!(a, Ask::Custody { .. }) && !carries {
+                continue;
+            }
+            let frames = match &a {
+                Ask::Run(spec) if carries => p.follows.get(&spec.id).map(|f| f.frames.clone()).unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            for json in frames {
+                self.say_on(&link, &Ask::Custody { json }).await;
+            }
             if !self.say_on(&link, &a).await {
                 if let Some(p) = self.peers.get_mut(name) {
                     p.queue.push_front(a);
@@ -1048,9 +1158,13 @@ impl Node {
         let Some(name) = self.links.get(link).map(|l| l.peer.clone()) else { return };
         match s {
             Say::Welcome { version, host, resumed, lost } => {
-                if version != wire::VERSION {
-                    self.drop_link(link, &format!("{name} speaks reach version {version}, this runner {}", wire::VERSION), true).await;
+                let asked = self.links.get(link).map_or(wire::VERSION, |l| l.version);
+                if version != asked {
+                    self.drop_link(link, &format!("{name} answered at reach version {version}, not the {asked} this runner asked at"), true).await;
                     return;
+                }
+                if let Some(l) = self.links.get_mut(link) {
+                    l.welcomed = true;
                 }
                 let Some(p) = self.peers.get_mut(&name) else { return };
                 p.state = PeerState::Ready;
@@ -1068,8 +1182,46 @@ impl Node {
                 self.flush_queue(&name).await;
             }
             Say::Refused { reason } => {
+                // A runner from before speaks only an older version, and refuses a Hello at a later
+                // one: asked again at its own, on a new link at once (only Hello went on this one).
+                let (asked, welcomed) = self.links.get(link).map_or((wire::MIN_VERSION, true), |l| (l.version, l.welcomed));
+                if !welcomed && asked > wire::MIN_VERSION {
+                    let speaks = spoken(&reason).filter(|v| (wire::MIN_VERSION..asked).contains(v)).unwrap_or(wire::MIN_VERSION);
+                    tracing::info!(peer = %name, asked, speaks, "a runner speaks an older reach version: linking again at its own");
+                    if let Some(l) = self.links.get_mut(link) {
+                        l.tls.close();
+                    }
+                    self.send_frames(link, Some(reason.clone())).await;
+                    self.links.remove(link);
+                    crate::runner::custody::reach_closed(link);
+                    if let Some(p) = self.peers.get_mut(&name) {
+                        p.speaks = Some(speaks);
+                        p.link = None;
+                        p.state = PeerState::Idle;
+                    }
+                    self.connect_resolved(&name).await;
+                    return;
+                }
                 self.fail_peer(&name, &reason).await;
                 self.drop_link(link, &reason, true).await;
+            }
+            Say::Custody { json } => {
+                if !self.custody_on(link).await {
+                    return;
+                }
+                let Some(p) = self.peers.get_mut(&name) else { return };
+                p.custody += 1;
+                match super::custody::frame_of(&json) {
+                    Some((kind, _, key)) if kind == "workspace" => {
+                        p.receipts.insert(key, json);
+                    }
+                    Some((_, _, id)) => {
+                        if let Some(f) = id.parse::<u64>().ok().and_then(|id| p.follows.get(&id)) {
+                            let _ = f.says.send(Say::Custody { json }).await;
+                        }
+                    }
+                    None => tracing::debug!(peer = %name, "an unreadable custody frame"),
+                }
             }
             Say::Output { id, offset, stream, data } => {
                 let Some(p) = self.peers.get_mut(&name) else { return };
@@ -1083,6 +1235,10 @@ impl Node {
                 let start = offset.max(f.got);
                 let data = data.get(usize::try_from(start - offset).unwrap_or(0)..).map(<[u8]>::to_vec).unwrap_or_default();
                 f.got = end;
+                {
+                    use sha2::Digest as _;
+                    f.out.update(&data);
+                }
                 let says = f.says.clone();
                 if lost > 0 {
                     let note = format!("\n[kiln reach: {lost} bytes of output were dropped]\n").into_bytes();
@@ -1097,6 +1253,13 @@ impl Node {
                 // On one link output always comes before the exit; a shortfall is output lost.
                 let lost = lost + end.saturating_sub(f.got);
                 f.exited = true;
+                // What arrived of its output, by its SHA-256, for its follower's receipt of it
+                // (docs/ci.md W27-R08): said just before its exit, on this side only.
+                let got = {
+                    use sha2::Digest as _;
+                    hex::encode(std::mem::take(&mut f.out).finalize())
+                };
+                let _ = f.says.send(Say::Custody { json: json!({ "output_got": id, "sha256": got }).to_string() }).await;
                 let _ = f.says.send(Say::Exit { id, code, signal, error, end, lost }).await;
                 p.follows.remove(&id);
                 self.say_on(link, &Ask::Forget { id }).await;
@@ -1135,6 +1298,27 @@ impl Node {
         }
     }
 
+    /// A custody frame came on `link` (docs/ci.md W27-R08): counted, if the link runs at a version
+    /// that carries them; else the link ends, as a runner from before ends one that says what it
+    /// can't read. Whether it's taken.
+    async fn custody_on(&mut self, link: &str) -> bool {
+        let Some(version) = self.links.get(link).map(|l| l.version) else { return false };
+        if version < wire::CUSTODY {
+            self.drop_link(link, &format!("a custody frame on a link at reach version {version}"), true).await;
+            return false;
+        }
+        if let Some(l) = self.links.get_mut(link) {
+            l.custody += 1;
+        }
+        true
+    }
+
+    /// The version the link up to session `key`'s asker runs at, while one is up.
+    fn served_version(&self, key: &(String, String)) -> Option<u32> {
+        let link = self.served.get(key)?.link.as_ref()?;
+        self.links.get(link).map(|l| l.version)
+    }
+
     // ------------------------------------------------------------------ doing
 
     async fn accept(&mut self, from: String, link: String, frames: Vec<Vec<u8>>) {
@@ -1155,7 +1339,8 @@ impl Node {
             }
         };
         let now = Instant::now();
-        self.links.insert(link.clone(), Link { peer: from.clone(), role: Role::Doer, tls, de: Deframer::default(), fingerprint: fp, opened: now, last_rx: now, sent_any: true, pinned: false, session: None, pinged: false });
+        let l = Link { peer: from.clone(), role: Role::Doer, tls, de: Deframer::default(), fingerprint: fp, opened: now, last_rx: now, sent_any: true, pinned: false, session: None, pinged: false, version: wire::MIN_VERSION, welcomed: false, custody: 0 };
+        self.links.insert(link.clone(), l);
         for data in frames {
             Box::pin(self.on_frame(from.clone(), link.clone(), false, data, None)).await;
         }
@@ -1164,15 +1349,17 @@ impl Node {
     async fn on_ask(&mut self, link: &str, a: Ask) {
         let Some((peer, session)) = self.links.get(link).map(|l| (l.peer.clone(), l.session.clone())) else { return };
         if let Ask::Hello { version, session, resume } = a {
-            if version != wire::VERSION {
-                self.say_on(link, &Say::Refused { reason: format!("{} speaks reach version {}, not {version}", self.cfg.name, wire::VERSION) }).await;
+            // Any version from the oldest up to this runner's: the link runs at the asker's.
+            if !(wire::MIN_VERSION..=self.cfg.version).contains(&version) {
+                self.say_on(link, &Say::Refused { reason: format!("{} speaks reach version {}, not {version}", self.cfg.name, self.cfg.version) }).await;
                 return;
             }
             let key = (peer.clone(), session.clone());
             if let Some(l) = self.links.get_mut(link) {
                 l.session = Some(session.clone());
+                l.version = version;
             }
-            let s = self.served.entry(key.clone()).or_insert_with(|| Session { link: None, runs: HashMap::new(), syncs: HashMap::new(), adopting: HashMap::new(), detached: None });
+            let s = self.served.entry(key.clone()).or_insert_with(|| Session { link: None, runs: HashMap::new(), syncs: HashMap::new(), adopting: HashMap::new(), detached: None, custody: HashMap::new(), trees: HashMap::new(), frames: 0 });
             let old = s.link.replace(link.to_owned());
             s.detached = None;
             let mut resumed = Vec::new();
@@ -1198,7 +1385,7 @@ impl Node {
             if let Some(old) = old.filter(|o| o != link) {
                 self.drop_link(&old, "replaced by a new link", true).await;
             }
-            self.say_on(link, &Say::Welcome { version: wire::VERSION, host: self.host.clone(), resumed: resumed.clone(), lost }).await;
+            self.say_on(link, &Say::Welcome { version, host: self.host.clone(), resumed: resumed.clone(), lost }).await;
             for id in resumed {
                 self.pump(&key, id).await;
             }
@@ -1287,15 +1474,62 @@ impl Node {
                     }
                 }
             }
+            // What the asker hands on ahead of a sync's commit or a run (docs/ci.md W27-R08), kept
+            // for it.
+            Ask::Custody { json } => {
+                if !self.custody_on(link).await {
+                    return;
+                }
+                let Some(s) = self.served.get_mut(&key) else { return };
+                s.frames += 1;
+                match super::custody::frame_of(&json) {
+                    Some((kind, v, of)) if kind == "workspace" || kind == "run" => {
+                        s.custody.insert(format!("{kind} {of}"), v);
+                    }
+                    _ => tracing::debug!(peer = %key.0, "an unreadable custody frame"),
+                }
+            }
         }
     }
 
     async fn start_run(&mut self, key: &(String, String), spec: RunSpec) {
         let id = spec.id;
+        let version = self.served_version(key).unwrap_or(wire::MIN_VERSION);
         let Some(s) = self.served.get_mut(key) else { return };
         if s.runs.contains_key(&id) {
             return;
         }
+        // Taken as its asker handed it on (docs/ci.md W27-R08): refused, and recorded, if it isn't
+        // what came, or comes without its hand-on on a link that carries them.
+        let known = spec.mirror.as_deref().map(|m| s.trees.get(m).cloned());
+        let tree = known.clone().flatten().unwrap_or_default();
+        let frame = s.custody.remove(&format!("run {id}"));
+        // A copy no sync of this session committed (this process took over since): nothing here
+        // can say what tree the run is of, so it's refused, to sync again.
+        if version >= wire::CUSTODY && known.is_some_and(|t| t.is_none()) {
+            let why = "its copy wasn't synced to this process: sync it again";
+            super::custody::refused(&format!("run {id}"), &key.0, why);
+            self.refuse_run(key, id, format!("refused: {why}")).await;
+            return;
+        }
+        let took = if version >= wire::CUSTODY {
+            match super::custody::take_run(&self.root, &key.0, &key.1, &spec, &tree, frame.as_ref()) {
+                Ok((said, took)) => {
+                    if let Some(link) = s.link.clone() {
+                        self.say_on(&link, &Say::Custody { json: said }).await;
+                    }
+                    took
+                }
+                Err(why) => {
+                    super::custody::refused(&format!("run {id}"), &key.0, &why);
+                    self.refuse_run(key, id, format!("refused: {why}")).await;
+                    return;
+                }
+            }
+        } else {
+            super::custody::run_from_before(&key.0, &key.1, &spec, &tree)
+        };
+        let Some(s) = self.served.get_mut(key) else { return };
         let mirror = match spec.mirror.as_deref() {
             Some(m) => match Mirror::root_for(&self.cfg.mirrors, &key.0, m) {
                 Ok(r) => Some(r),
@@ -1363,6 +1597,10 @@ impl Node {
                 timed_out: false,
                 held,
                 room,
+                out: sha2::Sha256::default(),
+                took,
+                custody: version >= wire::CUSTODY,
+                out_frame: None,
             },
         );
     }
@@ -1388,6 +1626,10 @@ impl Node {
             serve::Event::Output { stream, data } => {
                 let off = r.next;
                 r.next += data.len() as u64;
+                {
+                    use sha2::Digest as _;
+                    r.out.update(&data);
+                }
                 r.buf.push_back((off, stream, data));
                 self.pump(&key, id).await;
             }
@@ -1423,6 +1665,23 @@ impl Node {
             {
                 r.exit_sent = true;
                 let end = r.next;
+                // Its output handed back ahead of its exit (docs/ci.md W27-R08), made once and said
+                // again with an exit said again; to a runner from before, signed but never said.
+                if r.custody || r.took.is_some() {
+                    let frame = match &r.out_frame {
+                        Some(f) => f.clone(),
+                        None => {
+                            use sha2::Digest as _;
+                            let sha = hex::encode(std::mem::take(&mut r.out).finalize());
+                            let f = super::custody::output_hand_on(r.took.as_ref(), id, &sha);
+                            r.out_frame = Some(f.clone());
+                            f
+                        }
+                    };
+                    if r.custody {
+                        self.say_on(&link, &Say::Custody { json: frame }).await;
+                    }
+                }
                 self.say_on(&link, &Say::Exit { id, code, signal: None, error, end, lost: 0 }).await;
             }
             return;
@@ -1487,6 +1746,7 @@ impl Node {
         let sync_key = match &a {
             SyncAsk::Plan { key, .. } | SyncAsk::File { key, .. } | SyncAsk::Commit { key } => key.clone(),
         };
+        let version = self.served_version(key).unwrap_or(wire::MIN_VERSION);
         let Some(s) = self.served.get_mut(key) else { return };
         if !s.syncs.contains_key(&sync_key) {
             let root = match Mirror::root_for(&self.cfg.mirrors, &key.0, &sync_key) {
@@ -1503,19 +1763,28 @@ impl Node {
             let busy = self.cfg.using.busy(&key.0, &sync_key, None);
             s.syncs.insert(sync_key.clone(), sync_worker(root, sync_key.clone(), key.clone(), self.tx.clone(), busy));
         }
+        // A commit takes the copy as the frame its asker sent ahead of it hands it on.
+        let commit = matches!(a, SyncAsk::Commit { .. }).then(|| Commit { version, frame: s.custody.remove(&format!("workspace {sync_key}")), root: Arc::clone(&self.root) });
         if let Some(w) = s.syncs.get(&sync_key)
-            && w.send(a).await.is_err()
+            && w.send((a, commit)).await.is_err()
         {
             s.syncs.remove(&sync_key);
         }
     }
 
-    async fn on_synced(&mut self, key: (String, String), say: SyncSay) {
+    async fn on_synced(&mut self, key: (String, String), say: SyncSay, custody: Option<String>, tree: Option<String>) {
+        let version = self.served_version(&key).unwrap_or(wire::MIN_VERSION);
         let Some(s) = self.served.get_mut(&key) else { return };
         if let SyncSay::Done { key: k, .. } | SyncSay::Failed { key: k, .. } = &say {
             s.syncs.remove(k);
         }
+        if let (SyncSay::Done { key: k, .. }, Some(t)) = (&say, tree) {
+            s.trees.insert(k.clone(), t);
+        }
         if let Some(link) = s.link.clone() {
+            if let Some(json) = custody.filter(|_| version >= wire::CUSTODY) {
+                self.say_on(&link, &Say::Custody { json }).await;
+            }
             self.say_on(&link, &Say::Sync(say)).await;
         }
     }
@@ -1570,14 +1839,31 @@ impl Node {
                 }
                 self.ensure_link(&peer).await;
             }
-            Local::Run { peer, mut spec, says, reply } => {
+            Local::Run { peer, mut spec, says, reply, custody } => {
                 let p = self.peers.entry(peer.clone()).or_insert_with(Peer::new);
-                let id = p.next_id;
-                p.next_id += 1;
+                let id = if spec.id > 0 {
+                    spec.id
+                } else {
+                    p.next_id += 1;
+                    p.next_id - 1
+                };
                 spec.id = id;
-                p.follows.insert(id, Follow { says, got: 0, exited: false });
+                // Its custody frames go just ahead of it, on whichever link takes it (docs/ci.md
+                // W27-R08).
+                p.follows.insert(id, Follow { says, got: 0, exited: false, out: sha2::Sha256::default(), frames: custody });
                 let _ = reply.send(id);
                 self.send_or_queue(&peer, Ask::Run(spec)).await;
+            }
+            Local::Reserve { peer, reply } => {
+                let p = self.peers.entry(peer).or_insert_with(Peer::new);
+                let id = p.next_id;
+                p.next_id += 1;
+                let _ = reply.send((id, p.session.clone()));
+            }
+            Local::Custody { peer, key, reply } => {
+                let version = self.peers.get(&peer).filter(|p| p.state == PeerState::Ready).and_then(|p| p.link.as_ref()).and_then(|l| self.links.get(l)).map(|l| l.version);
+                let receipt = self.peers.get_mut(&peer).and_then(|p| p.receipts.remove(&key));
+                let _ = reply.send((version, receipt));
             }
             Local::Ask { peer, ask } => {
                 if self.peers.contains_key(&peer) {
@@ -1639,10 +1925,16 @@ impl Node {
                     "host": p.host,
                     "error": p.error,
                     "secured": p.link.as_ref().and_then(|l| self.links.get(l)).and_then(|l| l.tls.negotiated()),
+                    "version": p.link.as_ref().and_then(|l| self.links.get(l)).map(|l| l.version),
+                    "custody": p.custody,
                 })
             })
             .collect();
-        let serving: Vec<Value> = self.served.iter().map(|((r, _), s)| json!({"runner": r, "runs": s.runs.len(), "linked": s.link.is_some()})).collect();
+        let serving: Vec<Value> = self
+            .served
+            .iter()
+            .map(|((r, _), s)| json!({"runner": r, "runs": s.runs.len(), "linked": s.link.is_some(), "version": s.link.as_ref().and_then(|l| self.links.get(l)).map(|l| l.version), "custody": s.frames}))
+            .collect();
         let pins: Vec<Value> = self.pins.all().into_iter().map(|(n, p)| json!({"runner": n, "fingerprint": p.fingerprint, "since": p.since})).collect();
         json!({
             "runner": self.cfg.name,
@@ -1766,18 +2058,27 @@ enum Msg {
     Ask(Ask),
 }
 
+/// The version a runner's refusal of a Hello says it speaks ("<runner> speaks reach version 1, not
+/// 2", every build's words).
+fn spoken(reason: &str) -> Option<u32> {
+    let (_, rest) = reason.split_once("speaks reach version ")?;
+    rest.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
+}
+
 /// A sync done for another runner: its own task, the file system work on blocking threads. What it
 /// says goes back through the node.
-fn sync_worker(root: PathBuf, key: String, session: (String, String), node: async_channel::Sender<In>, busy: super::keeper::Busy) -> async_channel::Sender<SyncAsk> {
+fn sync_worker(root: PathBuf, key: String, session: (String, String), node: async_channel::Sender<In>, busy: super::keeper::Busy) -> async_channel::Sender<(SyncAsk, Option<Commit>)> {
     // Unbounded: the node never waits on a sync; the asker's window bounds what is in flight.
-    let (tx, rx) = async_channel::unbounded::<SyncAsk>();
+    let (tx, rx) = async_channel::unbounded::<(SyncAsk, Option<Commit>)>();
     crate::rt::spawn(async move {
         let _busy = busy;
-        let say = |s: SyncSay| {
+        let said = |s: SyncSay, custody: Option<String>, tree: Option<String>| {
             let node = node.clone();
             let session = session.clone();
-            async move { node.send(In::Synced { key: session, say: s }).await.is_ok() }
+            async move { node.send(In::Synced { key: session, say: s, custody, tree }).await.is_ok() }
         };
+        let say = |s: SyncSay| said(s, None, None);
+        let peer = session.0.clone();
         let mirror = match crate::rt::blocking({
             let root = root.clone();
             move || Mirror::new(root)
@@ -1792,10 +2093,11 @@ fn sync_worker(root: PathBuf, key: String, session: (String, String), node: asyn
         };
         let mirror = Arc::new(parking_lot::Mutex::new(mirror));
         let mut reported = 0u64;
-        while let Ok(a) = rx.recv().await {
+        while let Ok((a, commit)) = rx.recv().await {
             let m = Arc::clone(&mirror);
             let root = root.clone();
-            let step = crate::rt::blocking(move || -> anyhow::Result<Option<SyncSay>> {
+            let peer = peer.clone();
+            let step = crate::rt::blocking(move || -> anyhow::Result<Option<(SyncSay, Option<String>, Option<String>)>> {
                 let mut m = m.lock();
                 match a {
                     SyncAsk::Plan { key, entries, start, more } => {
@@ -1807,8 +2109,8 @@ fn sync_worker(root: PathBuf, key: String, session: (String, String), node: asyn
                         if more {
                             return Ok(None);
                         }
-                        let paths = super::sync::need(&m.root, m.entries());
-                        Ok(Some(SyncSay::Need { key, root: m.root.to_string_lossy().into_owned(), paths }))
+                        let paths = m.needed();
+                        Ok(Some((SyncSay::Need { key, root: m.root.to_string_lossy().into_owned(), paths }, None, None)))
                     }
                     SyncAsk::File { key: _, path, offset, data, last } => {
                         m.write(&path, offset, &data, last)?;
@@ -1816,15 +2118,32 @@ fn sync_worker(root: PathBuf, key: String, session: (String, String), node: asyn
                     }
                     SyncAsk::Commit { key } => {
                         let removed = m.commit()?;
-                        Ok(Some(SyncSay::Done { key, root: m.root.to_string_lossy().into_owned(), written: m.written, removed, bytes: m.bytes }))
+                        let done = SyncSay::Done { key: key.clone(), root: m.root.to_string_lossy().into_owned(), written: m.written, removed, bytes: m.bytes };
+                        // Taken as its asker handed it on (docs/ci.md W27-R08): what the copy holds
+                        // now, by its digest, against the hand-on that came ahead of the commit.
+                        let Some(c) = commit.filter(|c| c.version >= wire::CUSTODY || crate::runner::custody::sends()) else { return Ok(Some((done, None, None))) };
+                        let tree = m.tree_digest()?;
+                        if c.version < wire::CUSTODY {
+                            super::custody::workspace_from_before(&peer, &key, &tree);
+                            return Ok(Some((done, None, Some(tree))));
+                        }
+                        match super::custody::take_workspace(&c.root, &peer, &key, c.frame.as_ref(), &tree) {
+                            Ok(frame) => Ok(Some((done, Some(frame), Some(tree)))),
+                            Err(why) => {
+                                // Refused: what it wrote is sent again next time.
+                                m.spoil()?;
+                                super::custody::refused(&format!("workspace {key}"), &peer, &why);
+                                Ok(Some((SyncSay::Failed { key, error: format!("refused: {why}") }, None, None)))
+                            }
+                        }
                     }
                 }
             })
             .await;
             match step {
-                Ok(Ok(Some(s))) => {
-                    let done = matches!(s, SyncSay::Done { .. });
-                    if !say(s).await || done {
+                Ok(Ok(Some((s, custody, tree)))) => {
+                    let done = matches!(s, SyncSay::Done { .. } | SyncSay::Failed { .. });
+                    if !said(s, custody, tree).await || done {
                         return;
                     }
                 }

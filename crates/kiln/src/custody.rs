@@ -19,6 +19,9 @@ use serde_json::{Value, json};
 
 use crate::store::Store;
 
+pub mod blobs;
+pub mod feeds;
+
 /// The most records a walk loads: a thing's chain, and its custodians' streams.
 pub const WALK_MAX: usize = 10_000;
 /// The most breaks or refusals a list gives, newest first.
@@ -169,7 +172,26 @@ pub async fn take(store: &Store, root: &[u8], org: &str, bundle: &Value, came_fr
             check(store, root, org, &waiting, &revocations, at).await?;
         }
     }
+    // A delegation: the records taken for someone under it that waited for it (they come from
+    // other machines, in any order) are checked now.
+    if kind.is_none() && !again {
+        for waiting in under_it(store, &c.digest).await? {
+            check(store, root, org, &waiting, &revocations, at).await?;
+        }
+    }
     Ok(Ok(Taken { digest: c.digest, again, broke }))
+}
+
+/// The records that act under delegation `digest`.
+async fn under_it(store: &Store, digest: &str) -> anyhow::Result<Vec<String>> {
+    let d = digest.to_owned();
+    store
+        .call(move |c| {
+            let mut q = c.prepare("SELECT digest FROM custody WHERE under = ?1")?;
+            let rows = q.query_map([d], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+            Ok(rows)
+        })
+        .await
 }
 
 /// A custody record a runner process sent ([`crate::proto::AgentMsg::Custody`]): taken as having
@@ -180,6 +202,18 @@ pub async fn on_runner(hub: &crate::hub::Hub, peer: crate::instances::PeerId, ma
         return tracing::debug!(%machine, "an unreadable custody record");
     };
     let came_from = format!("runner {machine} (instance {instance})");
+    // Something another runner handed it over a reach link that it refused where it would have
+    // used it (W27-R08: a sync's workspace, a run, a run's output not what was handed on, or with
+    // no hand-on or receipt of it).
+    if let Some(r) = bundle.get("refused_hop") {
+        let text = |k: &str| r.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+        let why = format!("{} from {}: {}", text("what"), text("from"), text("why"));
+        let refusal = Refusal { act: "a hand-over between machines".into(), why: why.clone(), came_from, at: crate::util::now_unix(), ..Refusal::default() };
+        if let Err(e) = refuse(&hub.store, refusal).await {
+            tracing::warn!(target: "kiln.custody", %machine, error = %format!("{e:#}"), "a refused hand-over between machines couldn't be recorded");
+        }
+        return tracing::info!(target: "kiln.custody", %machine, %instance, %why, "a runner process refused what another handed it");
+    }
     // An act of one of its sessions it didn't do, kiln being out of reach (W27-R08: a machine cut
     // off, as the twin's was).
     if let Some(r) = bundle.get("refused_act") {
@@ -937,7 +971,7 @@ pub async fn unsigned_list(store: &Store, limit: usize) -> anyhow::Result<Vec<Va
 }
 
 /// Whether kiln keeps record `digest`.
-async fn kept(store: &Store, digest: &str) -> anyhow::Result<bool> {
+pub(crate) async fn kept(store: &Store, digest: &str) -> anyhow::Result<bool> {
     let d = digest.to_owned();
     store.call(move |c| Ok(c.query_row("SELECT 1 FROM custody WHERE digest = ?1", [&d], |_| Ok(())).optional()?.is_some())).await
 }
@@ -1068,13 +1102,16 @@ async fn load(store: &Store, root: &[u8], digests: &[String], revocations: &[Rev
 }
 
 /// Checks record `digest`'s own hop, at `at`: a break, recorded, if it doesn't hold; none if it
-/// holds or waits for a record it follows that kiln doesn't have yet.
+/// holds or waits for a record it follows that kiln doesn't have yet, or, taken for someone, the
+/// delegation it acts under (W27-R08: another machine's, which comes in any order).
 async fn check(store: &Store, root: &[u8], org: &str, digest: &str, revocations: &[Revocation], at: i64) -> anyhow::Result<Option<String>> {
     let mine = load(store, root, &[digest.to_owned()], revocations).await?;
     let Some(r) = mine.get(digest) else { return Ok(None) };
     let follows = r.statement.follows.clone();
-    let mut map = load(store, root, &follows, revocations).await?;
-    if follows.iter().any(|f| !map.contains_key(f)) {
+    let held_for = custody::body(r).is_ok_and(|b| b.kind.takes() && b.held_for.as_deref().is_some_and(|w| !w.is_empty()));
+    let wanted: Vec<String> = follows.iter().cloned().chain(r.statement.under.clone().filter(|_| held_for)).collect();
+    let mut map = load(store, root, &wanted, revocations).await?;
+    if wanted.iter().any(|f| !map.contains_key(f)) {
         return Ok(None);
     }
     map.extend(mine);
@@ -1361,7 +1398,9 @@ pub async fn chain(store: &Store, root: &[u8], org: &str, digest: &str, at: i64)
         let got = load(store, root, &frontier, &revocations).await?;
         let mut next: BTreeSet<String> = BTreeSet::new();
         for c in got.values() {
-            next.extend(c.statement.follows.iter().filter(|f| !map.contains_key(*f) && !got.contains_key(*f)).cloned());
+            // What it follows, and the delegation it acts under (a record taken for someone is
+            // judged by it: W27-R08).
+            next.extend(c.statement.follows.iter().chain(c.statement.under.iter()).filter(|f| !map.contains_key(*f) && !got.contains_key(*f)).cloned());
         }
         map.extend(got);
         frontier = next.into_iter().filter(|d| !map.contains_key(d)).collect();
@@ -1386,6 +1425,9 @@ pub async fn chain(store: &Store, root: &[u8], org: &str, digest: &str, at: i64)
             "from": b.as_ref().and_then(|b| b.from.clone()),
             // The part of its custodian that holds them: a promotion's environment.
             "component": b.as_ref().and_then(|b| b.component.clone()),
+            // Whom it holds them for, and the delegation it takes them under (W27-R08).
+            "for": b.as_ref().and_then(|b| b.held_for.clone()),
+            "under": c.and_then(|c| c.statement.under.clone()),
             "why": b.as_ref().map(|b| b.why.clone()),
             "at": h.at,
             "subject": h.subject,
@@ -1441,7 +1483,8 @@ fn break_record(b: &Break) -> Option<&str> {
         | Break::NotTheHolder { record, .. }
         | Break::NoHandOn { record, .. }
         | Break::OutOfOrder { record, .. }
-        | Break::TakenNotByServer { record, .. } => record,
+        | Break::TakenNotByServer { record, .. }
+        | Break::NotEntitled { record, .. } => record,
         Break::Gap(_) => return None,
     })
 }

@@ -360,6 +360,11 @@ pub enum Break {
     TakenNotByServer { record: String, signer: String, server: String },
     #[error("{0}")]
     Gap(Gap),
+    /// A record that holds its things for someone (its body's `for`) without a delegation from
+    /// them that entitles its signer to (docs/ci.md W27-R08: a machine taking custody for someone
+    /// else does it under a delegation that names them and only narrows). Appended last.
+    #[error("{record} holds them for {held_for}, but not under a delegation from them that entitles it: {why}")]
+    NotEntitled { record: String, held_for: String, why: String },
 }
 
 impl Break {
@@ -380,6 +385,7 @@ impl Break {
             Self::OutOfOrder { .. } => "out-of-order",
             Self::TakenNotByServer { .. } => "taken-not-by-server",
             Self::Gap(_) => "gap",
+            Self::NotEntitled { .. } => "not-entitled",
         }
     }
 }
@@ -554,6 +560,7 @@ fn from_originator(r: &Checked, rb: &Body, p: &Checked) -> Result<(), Break> {
 pub fn hop(record: &str, records: &BTreeMap<String, Checked>, server: &str) -> Result<Hop, Break> {
     let r = records.get(record).ok_or_else(|| Break::NoRecord { record: record.to_owned(), followed_by: None })?;
     let rb = body(r)?;
+    held_under(r, &rb, records)?;
     let (mut gave, mut held, mut made_from, mut originated) = (false, false, Vec::new(), false);
     for f in &r.statement.follows {
         let p = records.get(f).ok_or_else(|| Break::NoRecord { record: f.clone(), followed_by: Some(record.to_owned()) })?;
@@ -584,6 +591,29 @@ pub fn hop(record: &str, records: &BTreeMap<String, Checked>, server: &str) -> R
     let began = (!rb.kind.takes() && !held) || from_outside || originated || unsigned;
     let taken_for = rb.taken_for.clone().filter(|_| r.custodian == server);
     Ok(Hop { record: record.to_owned(), kind: rb.kind, custodian: r.custodian.clone(), taken_for, at: r.at, subject: r.statement.subject.clone(), made_from, began })
+}
+
+/// Whether record `r` (body `b`), when it takes its things for someone (its `for`: an agent
+/// session whose run another machine does), does so under a delegation from them among `records`,
+/// the one its `under` names: one naming its signer as delegate and entitling it to receive each of
+/// its things ([`receive_scope`]), as of when kiln took it.
+fn held_under(r: &Checked, b: &Body, records: &BTreeMap<String, Checked>) -> Result<(), Break> {
+    let Some(whom) = b.held_for.as_deref().filter(|w| !w.is_empty() && b.kind.takes()) else { return Ok(()) };
+    let refuse = |why: String| Break::NotEntitled { record: r.digest.clone(), held_for: whom.to_owned(), why };
+    let Some(under) = r.statement.under.as_deref() else { return Err(refuse("it names no delegation it acts under".into())) };
+    let d = records.get(under).ok_or_else(|| Break::NoRecord { record: under.to_owned(), followed_by: Some(r.digest.clone()) })?;
+    let g = grant(d).map_err(|why| refuse(format!("{under} isn't a delegation kiln reads: {why}")))?;
+    if !names(&g.delegate, &r.custodian) {
+        return Err(refuse(format!("{under} delegates to {}, not to {}, who signed it", g.delegate, r.custodian)));
+    }
+    if !names(whom, &d.custodian) && !names(&d.custodian, whom) {
+        return Err(refuse(format!("{under} is signed by {}", d.custodian)));
+    }
+    let u = Under { statement: r.clone(), through: vec![d.clone()] };
+    for t in &r.statement.subject {
+        entitled(&u, &receive_scope(t), r.at, &[]).map_err(|e| refuse(e.to_string()))?;
+    }
+    Ok(())
 }
 
 /// Walks a thing's chain of custody back from record `from` (by its digest), where it's used,
@@ -724,8 +754,70 @@ pub fn peer_object_receipt(by: &str, from: &str, repo: &str, got: &str, hand_on:
 
 /// An object of `repo`'s cache by its SHA-256 (`sha256:<hex>` or the hex).
 fn peer_object(repo: &str, sha256: &str) -> Subject {
+    by_sha256(&format!("object of {repo}"), sha256)
+}
+
+/// `name`, by its SHA-256 (`sha256:<hex>` or the hex).
+fn by_sha256(name: &str, sha256: &str) -> Subject {
     let hex = sha256.strip_prefix("sha256:").unwrap_or(sha256).to_ascii_lowercase();
-    Subject { name: format!("object of {repo}"), digest: BTreeMap::from([("sha256".to_owned(), hex)]), ..Subject::default() }
+    Subject { name: name.to_owned(), digest: BTreeMap::from([("sha256".to_owned(), hex)]), ..Subject::default() }
+}
+
+/// What a delegation entitles the runner that runs an agent session's run on another machine to:
+/// its workspace, as the sync left it (docs/ci.md W27-R08; the Transfers plan's step 12).
+pub const RECEIVE_WORKSPACE: &str = "receive:workspace";
+/// ... and the run itself.
+pub const RECEIVE_RUN: &str = "receive:run";
+
+/// What receiving `thing` for someone takes: `receive:` and its kind, its name's first word
+/// (`receive:workspace` for "workspace kiln-…", `receive:run` for "run 3").
+pub fn receive_scope(thing: &Subject) -> String {
+    format!("receive:{}", thing.name.split_whitespace().next().unwrap_or_default())
+}
+
+/// What one runner hands another over a reach link (docs/ci.md W27-R08; the Transfers plan's step
+/// 12), by its SHA-256: the workspace a sync left as copy `key` (its tree's digest, as `kiln run
+/// --reuse` reads one), ...
+pub fn reach_workspace(key: &str, sha256: &str) -> Subject {
+    by_sha256(&format!("workspace {key}"), sha256)
+}
+
+/// ... run `id` of the asker's reach session (the digest of what it runs, where, with what and on
+/// which workspace), ...
+pub fn reach_run(id: u64, sha256: &str) -> Subject {
+    by_sha256(&format!("run {id}"), sha256)
+}
+
+/// ... and run `id`'s output (the SHA-256 of its bytes, in the order the run said them).
+pub fn reach_output(id: u64, sha256: &str) -> Subject {
+    by_sha256(&format!("output of run {id}"), sha256)
+}
+
+/// `by`'s hand-on of `thing` to `to` across a reach link, held for `held_for` (the agent session
+/// whose it is, when `by` isn't it), following `follows` (the receipt of what it was made from), for
+/// `why`. Both sides build it alike: a statement's digest leaves its signer out, and it says no
+/// time, so the taker's receipt follows it by a digest the taker works out too.
+pub fn reach_hand_on(by: &str, to: &str, held_for: Option<&str>, thing: Subject, follows: Vec<String>, why: &str) -> statement::Statement {
+    let body = Body { to: Some(to.to_owned()), held_for: held_for.map(str::to_owned), why: why.to_owned(), ..Body::new(Kind::HandedOn, by) };
+    statement::Statement { subject: vec![thing], follows, ..statement::Statement::new(to_value(&body)) }
+}
+
+/// `by`'s receipt across a reach link of `hand_on` (its digest) from `from`, of `thing` by what it
+/// got, held for `held_for` under delegation `under` (by its digest) when it takes custody for
+/// someone else. A digest that changed on the way breaks the chain at this hop.
+pub fn reach_receipt(by: &str, from: &str, held_for: Option<&str>, thing: Subject, hand_on: &str, under: Option<&str>, why: &str) -> statement::Statement {
+    let body = Body { from: Some(from.to_owned()), held_for: held_for.map(str::to_owned), why: why.to_owned(), ..Body::new(Kind::Received, by) };
+    statement::Statement { subject: vec![thing], follows: vec![hand_on.to_owned()], under: under.map(str::to_owned), ..statement::Statement::new(to_value(&body)) }
+}
+
+/// The delegation agent session `by` (its identity at its epoch) gives runner process `delegate`,
+/// which runs a run of the session's on another machine ([`PAYLOAD_DELEGATION`]): to receive the
+/// run and its workspace for the session, nothing more ([`RECEIVE_WORKSPACE`], [`RECEIVE_RUN`]).
+/// It says no end and no time: it lasts as long as the session's epoch (its signer's certificate),
+/// and the same session, epoch and runner give the same delegation, which kiln keeps once.
+pub fn reach_delegation(by: &str, delegate: &str) -> statement::Statement {
+    let grant = Grant { v: VERSION, by: by.to_owned(), delegate: delegate.to_owned(), may: vec![RECEIVE_WORKSPACE.to_owned(), RECEIVE_RUN.to_owned()], until: None };
+    statement::Statement::new(serde_json::to_value(&grant).unwrap_or(Value::Null))
 }
 
 /// An act's payload type ([`Act`]).
@@ -971,7 +1063,12 @@ mod tests {
     impl Kept {
         /// `s`, signed by `by`, taken by kiln at `at`: its digest.
         fn take(&mut self, ca: &Ca, by: &Signer, s: &Statement, at: i64) -> anyhow::Result<String> {
-            let c = verify(&by.sign(PAYLOAD_CUSTODY, s)?, &ca.der, &[], at)?;
+            self.take_as(ca, by, PAYLOAD_CUSTODY, s, at)
+        }
+
+        /// [`Kept::take`], as `payload_type` (a delegation).
+        fn take_as(&mut self, ca: &Ca, by: &Signer, payload_type: &str, s: &Statement, at: i64) -> anyhow::Result<String> {
+            let c = verify(&by.sign(payload_type, s)?, &ca.der, &[], at)?;
             let d = c.digest.clone();
             self.records.insert(d.clone(), c);
             Ok(d)
@@ -1258,6 +1355,60 @@ mod tests {
         let wrong = kept.take(&ca, &jupiter, &peer_object_receipt(JUPITER, FEDORA, "acme/app", &sha('f'), &built), AT)?;
         let r = hop(&wrong, &kept.records, SERVER);
         assert!(matches!(&r, Err(Break::Changed { from, .. }) if from == &handed), "{r:?}");
+        Ok(())
+    }
+
+    /// W27-R08 (the Transfers plan's step 12, its example): kiln run on jupiter for an agent session
+    /// at epoch 1, held by fedora-2's runner. The session hands its workspace and its run to
+    /// jupiter's runner, with a delegation to receive both for it; jupiter receives each for the
+    /// session under that delegation and hands the run's output back, which the session receives:
+    /// unbroken, every hop signed by both sides. A workspace changed on its way breaks at that hop;
+    /// a receipt for the session under no delegation of the session's to that runner entitling it
+    /// to receive the thing doesn't hold.
+    #[test]
+    fn w27_r08_a_reach_run_changes_hands_under_the_sessions_delegation() -> anyhow::Result<()> {
+        const SESSION: &str = "kiln://hyper-light/person/ada/agent/01a1751c/epoch/1";
+        const HELD: &str = "kiln://hyper-light/person/ada/agent/01a1751c/epoch/1/machine/fedora-2/instance/01a174ed";
+        let ca = ca()?;
+        let (session, jupiter, fedora) = (Signer::new(&ca, HELD)?, Signer::new(&ca, JUPITER)?, Signer::new(&ca, FEDORA)?);
+        let mut kept = Kept::default();
+        let g = kept.take_as(&ca, &session, PAYLOAD_DELEGATION, &reach_delegation(HELD, JUPITER), AT - 20)?;
+        assert_eq!(digest(PAYLOAD_DELEGATION, &payload(&session.says(&reach_delegation(HELD, JUPITER)))?), g, "the same session, epoch and runner: the same delegation");
+        let ws = reach_workspace("kiln-1b2c3d4e5f", &sha('1'));
+        let h_ws = kept.take(&ca, &session, &reach_hand_on(HELD, JUPITER, None, ws.clone(), Vec::new(), "the workspace of a run"), AT - 19)?;
+        let r_ws = kept.take(&ca, &jupiter, &reach_receipt(JUPITER, HELD, Some(SESSION), ws.clone(), &h_ws, Some(&g), "a workspace to run in"), AT - 18)?;
+        let run = reach_run(1, &sha('2'));
+        let h_run = kept.take(&ca, &session, &reach_hand_on(HELD, JUPITER, None, run.clone(), Vec::new(), "a run"), AT - 17)?;
+        let r_run = kept.take(&ca, &jupiter, &reach_receipt(JUPITER, HELD, Some(SESSION), run.clone(), &h_run, Some(&g), "a run to do"), AT - 16)?;
+        let out = reach_output(1, &sha('3'));
+        let h_out = kept.take(&ca, &jupiter, &reach_hand_on(JUPITER, SESSION, None, out.clone(), vec![r_run.clone()], "the run's output"), AT - 15)?;
+        let r_out = kept.take(&ca, &session, &reach_receipt(HELD, JUPITER, None, out.clone(), &h_out, None, "its run's output"), AT - 14)?;
+        let hops = |from: &str| -> anyhow::Result<Vec<(Kind, String)>> { Ok(walk(from, &kept.records, SERVER)?.hops.into_iter().map(|h| (h.kind, h.custodian)).collect()) };
+        assert_eq!(hops(&r_out)?, vec![(Kind::Received, HELD.to_owned()), (Kind::HandedOn, JUPITER.to_owned()), (Kind::Received, JUPITER.to_owned()), (Kind::HandedOn, HELD.to_owned())]);
+        assert_eq!(hops(&r_ws)?, vec![(Kind::Received, JUPITER.to_owned()), (Kind::HandedOn, HELD.to_owned())]);
+        assert_eq!((receive_scope(&ws), receive_scope(&run)), (RECEIVE_WORKSPACE.to_owned(), RECEIVE_RUN.to_owned()));
+        // Changed on its way: jupiter's receipt of what it got breaks at that hop.
+        let changed = kept.take(&ca, &jupiter, &reach_receipt(JUPITER, HELD, Some(SESSION), reach_workspace("kiln-1b2c3d4e5f", &sha('f')), &h_ws, Some(&g), "a workspace to run in"), AT - 13)?;
+        let r = hop(&changed, &kept.records, SERVER);
+        assert!(matches!(&r, Err(Break::Changed { from, .. }) if from == &h_ws), "{r:?}");
+        // Taken for the session: under no delegation, one to another runner, one another signed,
+        // and one that doesn't entitle receiving the thing.
+        let not_entitled = |kept: &Kept, d: &str, why: &str| {
+            let r = hop(d, &kept.records, SERVER);
+            assert!(matches!(&r, Err(Break::NotEntitled { held_for, why: w, .. }) if held_for == SESSION && w.contains(why)), "{why}: {r:?}");
+        };
+        let none = kept.take(&ca, &jupiter, &reach_receipt(JUPITER, HELD, Some(SESSION), run.clone(), &h_run, None, "a run to do"), AT - 12)?;
+        not_entitled(&kept, &none, "no delegation");
+        let to_fedora = kept.take_as(&ca, &session, PAYLOAD_DELEGATION, &reach_delegation(HELD, FEDORA), AT - 12)?;
+        let other_runner = kept.take(&ca, &jupiter, &reach_receipt(JUPITER, HELD, Some(SESSION), run.clone(), &h_run, Some(&to_fedora), "a run to do"), AT - 11)?;
+        not_entitled(&kept, &other_runner, &format!("delegates to {FEDORA}"));
+        let by_fedora = kept.take_as(&ca, &fedora, PAYLOAD_DELEGATION, &reach_delegation(FEDORA, JUPITER), AT - 11)?;
+        let others = kept.take(&ca, &jupiter, &reach_receipt(JUPITER, HELD, Some(SESSION), run.clone(), &h_run, Some(&by_fedora), "a run to do"), AT - 10)?;
+        not_entitled(&kept, &others, &format!("signed by {FEDORA}"));
+        let object = peer_object("acme/app", &sha('4'));
+        let h_obj = kept.take(&ca, &session, &reach_hand_on(HELD, JUPITER, None, object.clone(), Vec::new(), "an object"), AT - 9)?;
+        let wider = kept.take(&ca, &jupiter, &reach_receipt(JUPITER, HELD, Some(SESSION), object, &h_obj, Some(&g), "an object"), AT - 8)?;
+        not_entitled(&kept, &wider, "receive:object");
         Ok(())
     }
 

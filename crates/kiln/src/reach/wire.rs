@@ -8,8 +8,17 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The inner protocol's version; a peer with another is told so and the link ends.
-pub const VERSION: u32 = 1;
+/// The inner protocol's version this build speaks. A link runs at the asker's version when the
+/// doer speaks it too (from [`MIN_VERSION`] up); a runner from before speaks only 1, and refuses a
+/// Hello at any other, so the asker asks again at 1.
+pub const VERSION: u32 = 2;
+
+/// The oldest version a link may run at.
+pub const MIN_VERSION: u32 = 1;
+
+/// The version a link carries custody records at ([`Ask::Custody`], [`Say::Custody`]; docs/ci.md
+/// W27-R08): never on a link below it.
+pub const CUSTODY: u32 = 2;
 
 /// The largest message either side sends or accepts.
 pub const MAX_MESSAGE: usize = 4 << 20;
@@ -41,6 +50,11 @@ pub enum Ask {
     /// [`Say::ObjectMissing`]); the asker asks again from where it got to. Appended last:
     /// postcard numbers variants by place.
     Object { id: u64, repo: String, digest: String, offset: u64 },
+    /// A custody record of what this side hands the other, as JSON (docs/ci.md W27-R08): a sync's
+    /// workspace (before its [`SyncAsk::Commit`]) or a run (before its [`Ask::Run`]), its hand-on
+    /// and the delegation the other side takes it under, or why it goes unsigned. Only on a link at
+    /// [`CUSTODY`] or later. Appended last: postcard numbers variants by place.
+    Custody { json: String },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -74,6 +88,11 @@ pub enum Say {
     ObjectData { id: u64, offset: u64, data: Vec<u8>, last: bool },
     /// The object asked for isn't here, for that repository.
     ObjectMissing { id: u64 },
+    /// A custody record of this side's, as JSON (docs/ci.md W27-R08): its receipt of a sync's
+    /// workspace (before its [`SyncSay::Done`]) or of a run (before it starts), or its hand-on of a
+    /// run's output (before its [`Say::Exit`]), or why it goes unsigned. Only on a link at
+    /// [`CUSTODY`] or later. Appended last.
+    Custody { json: String },
 }
 
 /// The machine a link reached.
@@ -252,6 +271,21 @@ mod tests {
         let data = first(postcard::to_allocvec(&Say::ObjectData { id: 1, offset: 0, data: vec![1], last: true })?);
         let missing = first(postcard::to_allocvec(&Say::ObjectMissing { id: 1 })?);
         anyhow::ensure!(data == adopted.map(|i| i + 1) && missing == adopted.map(|i| i + 2), "Say's come after Adopted");
+        Ok(())
+    }
+
+    /// W27-R08 (the Transfers plan's step 12): custody frames come after every older variant, so a
+    /// link at version 1 reads as it did; and a link carries them only from [`CUSTODY`] on.
+    #[test]
+    fn w27_r08_custody_frames_are_appended_after_every_older_variant() -> anyhow::Result<()> {
+        let first = |b: Vec<u8>| b.first().copied();
+        let object = first(postcard::to_allocvec(&Ask::Object { id: 1, repo: "acme/app".into(), digest: "d".into(), offset: 0 })?);
+        let custody = first(postcard::to_allocvec(&Ask::Custody { json: "{}".into() })?);
+        anyhow::ensure!(custody == object.map(|i| i + 1), "Ask::Custody comes right after Object");
+        let missing = first(postcard::to_allocvec(&Say::ObjectMissing { id: 1 })?);
+        let said = first(postcard::to_allocvec(&Say::Custody { json: "{}".into() })?);
+        anyhow::ensure!(said == missing.map(|i| i + 1), "Say::Custody comes right after ObjectMissing");
+        anyhow::ensure!(MIN_VERSION == 1 && CUSTODY > MIN_VERSION && VERSION >= CUSTODY, "a build from before speaks 1, which carries no custody");
         Ok(())
     }
 

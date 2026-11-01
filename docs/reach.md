@@ -123,6 +123,19 @@ asker                                         doer
   Forget{id}                             ──▶
 ```
 
+A link runs at the version both ends speak (`wire::VERSION`, now 2; `MIN_VERSION`, 1). The asker
+opens at the lower of its own and the one the directory says the doer announced; a doer takes a
+Hello at any version from 1 up to its own and answers at it. A runner from before speaks only 1
+and refuses a Hello at 2 ("speaks reach version 1, not 2"): the asker opens a new link at 1 at
+once, its asks still queued. Version 2 adds one frame each way, `Ask::Custody` and `Say::Custody`
+(JSON), never on a link at 1, which a runner from before would end on: a sync's workspace and a
+run are each handed on ahead of their commit and their `Run`, the doer's receipts come back ahead
+of its `Done` and its run's start, and the run's output is handed back ahead of its `Exit`
+(docs/ci.md W27-R08, "Between machines"). A doer refuses a copy or a run that isn't what was handed
+on, or comes without its hand-on, before anything runs in it; the asker refuses a run's result whose
+output isn't what was handed back. Over a link at 1 each side signs what it can and sends it to
+kiln: a hop named, never missing.
+
 ### 4.1 Drops
 
 A run outlives its link. Its output is numbered by byte offset; the doer keeps what was not
@@ -165,7 +178,11 @@ commit the copy is made to match the list: what was sent before and is no longer
 while what was never sent (untracked and ignored build output such as `target/`, `ui/dist` and
 `node_modules`) stays, so builds over there stay incremental (docs/ci.md W24-R24). The list last
 applied is kept beside the copy (`<copy>.kiln-sent`), never in it; a copy without one is made to
-match exactly, once. The command then runs in the copy's folder matching
+match exactly, once. Each side knows the tree by its digest (`--reuse`'s: `reach::reuse::digest_of`,
+`.git` aside): the asker of the bytes it sent, the doer of what the copy holds once committed. Each
+keeps its files' hashes with their stat (`<reach dir>/trees/<key>.json`, `<copy>.kiln-hashes`), so
+only a file whose stat changed is hashed again, and a file of the copy changed there since a sync
+wrote it is sent again whatever its size and time say. The command then runs in the copy's folder matching
 where the asker was. Paths are checked (relative, plain, never through a symlink) so a list can't
 write outside the copy.
 

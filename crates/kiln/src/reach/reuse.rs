@@ -58,15 +58,22 @@ pub fn unkeyable(req: &RunReq) -> Option<&'static str> {
 /// The digest of the tree at `root` as sync sends it: every entry by path and kind, a file by its
 /// content and whether it's executable, a symlink by its target (`.git` aside).
 pub fn tree(root: &Path) -> anyhow::Result<String> {
-    use sha2::Digest as _;
     let listed = super::sync::scan(root)?;
+    digest_of(&listed.entries, |e| Ok(crate::sync::blobs::hash_file(&listed.source(&e.path))?))
+}
+
+/// [`tree`]'s digest of a tree as sync lists it (`entries`, sorted by path), each file's content by
+/// its SHA-256 as `hash` says: what a sync's custody records name its workspace by (docs/ci.md
+/// W27-R08), the asking side of the bytes it sent, the doing side of the copy it made.
+pub fn digest_of(entries: &[super::wire::Entry], mut hash: impl FnMut(&super::wire::Entry) -> anyhow::Result<String>) -> anyhow::Result<String> {
+    use sha2::Digest as _;
     let mut h = sha2::Sha256::new();
     h.update(b"kiln/run-tree/v1\0");
     let mut field = |s: &[u8]| {
         h.update((s.len() as u64).to_be_bytes());
         h.update(s);
     };
-    for e in &listed.entries {
+    for e in entries {
         if e.path == ".git" || e.path.starts_with(".git/") {
             continue;
         }
@@ -79,7 +86,7 @@ pub fn tree(root: &Path) -> anyhow::Result<String> {
             }
             EntryKind::File => {
                 field(if e.mode & 0o111 != 0 { b"x" } else { b"f" });
-                field(crate::sync::blobs::hash_file(&listed.source(&e.path))?.as_bytes());
+                field(hash(e)?.as_bytes());
             }
         }
     }

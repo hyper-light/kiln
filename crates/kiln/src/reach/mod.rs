@@ -4,6 +4,7 @@
 
 pub mod cli;
 pub mod copies;
+pub mod custody;
 pub mod directory;
 pub mod e2e;
 pub mod keep;
