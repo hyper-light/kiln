@@ -12,8 +12,8 @@ import "./harness.css";
 import "./console.css";
 import { Link, Navigate, useNavigate, useParams, useSearchParams } from "@/lib/router";
 import { ArrowLeft, ChevronRight, RotateCcw, X } from "lucide-react";
-import { harnessApi, lastTurnFrom, sessionStore, useSession, useSessionReady, useStopAt } from "@/api/harness";
-import type { AgentInfo, Command, FileChange, HEvent, Meta, SessionStore, Todo } from "@/api/harness";
+import { clientId, harnessApi, lastTurnFrom, sessionStore, useSession, useSessionReady, useStopAt } from "@/api/harness";
+import type { AgentInfo, Approval, Attachment, Command, FileChange, HEvent, Meta, SendMode, SessionStore, Task, Todo } from "@/api/harness";
 import { harnessSessionsRes, useRes } from "@/lib/data";
 import { kilnSubagentsOf } from "./tasks";
 import { Button } from "@/components/ui/button";
@@ -21,7 +21,7 @@ import { ConfirmDialog } from "@/components/ui/dialog";
 import { toast } from "@/components/ui/toast";
 import { errorMessage, useLocalStorage, useMediaQuery } from "@/lib/hooks";
 import { AccountDialog } from "./account-card";
-import { Composer } from "./composer";
+import { Composer, type ToMark } from "./composer";
 import { useAgentActions } from "./actions";
 import { MoveDialog, movable } from "./move";
 import { SettingsSheet, useAttachments, type Attachments } from "./controls";
@@ -44,7 +44,8 @@ import { useReviewWaits } from "@/views/plans/review";
 import { revealReview } from "@/views/plans/reveal";
 import { useEndWithChildren } from "./family";
 import { LoadingMark, PrismLabel } from "./signals";
-import { markAnswered, stillAsked, unmark, useAnswered } from "./answered";
+import { asAnswered, markAnswered, stillAsked, unmark, useAnswered } from "./answered";
+import { liveRoot, subagentRows, takesMessage } from "./subagent-tree";
 import { AboutContext } from "@/components/code/about";
 
 type PhoneTab = "work" | InspectorTab;
@@ -590,6 +591,93 @@ function KilnThread({
 }
 
 /** Under the conversation: what runs besides it, how it ended (when it did), and the composer. */
+const NO_TASKS: Task[] = [];
+const NO_ASKS: Approval[] = [];
+
+/** A message sent to one picked subagent: its row, its id, the session it went to, and how (over the agent's socket, or over HTTP and how that call came out). */
+interface SentTo {
+  key: string;
+  id: string;
+  session: string;
+  how: "socket" | "sending" | "sent" | "failed";
+}
+
+/**
+ * An agent's subagents as a tree for the line by its composer (subagent-tree.ts: its own harness's
+ * from its live state, kiln's and theirs from the list, less what you answered here), those picked
+ * there, and sending the next message to each picked, its own way: one of its own harness's with
+ * its task on this socket (or over HTTP when that's down); any other to its session over HTTP. A
+ * subagent at work is steered (it reads it at its next step), one that isn't gets it queued. Each
+ * one's mark: delivered once its delivery says it started or it's in its thread, waiting while it's
+ * queued (or its session paused), not sent when that failed. Nothing goes to the agent itself.
+ */
+function useSubagentPicks(store: SessionStore, id: string, info: AgentInfo | undefined, task: string | null) {
+  const everyone = useRes(harnessSessionsRes).data;
+  const done = useAnswered();
+  const tasks = useSession(store, (s) => s.state?.tasks ?? NO_TASKS);
+  const asks = useSession(store, (s) => s.state?.approvals ?? NO_ASKS);
+  const delivery = useSession(store, (s) => s.state?.delivery);
+  const events = useSession(store, (s) => s.events);
+  const list = React.useMemo(() => everyone.map((a) => asAnswered(a, done)), [everyone, done]);
+  const rows = React.useMemo(() => {
+    const base = list.find((a) => a.id === id) ?? info;
+    return base ? subagentRows(liveRoot(base, tasks, asks, done), list) : [];
+  }, [list, id, info, tasks, asks, done]);
+  const [picks, setPicks] = React.useState<ReadonlySet<string>>(() => new Set());
+  const [sent, setSent] = React.useState<readonly SentTo[]>([]);
+  const pick = React.useCallback(
+    (keys: string[], on: boolean) =>
+      setPicks((p) => {
+        const next = new Set(p);
+        for (const k of keys) {
+          if (on) next.add(k);
+          else next.delete(k);
+        }
+        return next;
+      }),
+    [],
+  );
+  // Over a subagent's thread the composer writes to that one, whatever's picked.
+  const to = React.useMemo(() => (task === null ? rows.filter((r) => picks.has(r.key) && takesMessage(r)) : []), [rows, picks, task]);
+  const sendTo = (m: { text: string; attachments?: Attachment[] }) => {
+    const base = clientId();
+    const out = to.map((r, i): SentTo => {
+      const msg = `${base}-${i}`;
+      const t = r.kind === "harness" && r.session === id ? tasks.find((x) => x.id === r.task) : undefined;
+      const mode: SendMode = r.stand === "working" && (!t || (t.takes ?? []).includes("steer")) ? "steer" : "queue";
+      const c: Command = { type: "send", id: msg, text: m.text, mode, attachments: m.attachments, ...(r.kind === "harness" && r.task ? { task: r.task } : {}) };
+      if (r.session === id && store.send(c)) return { key: r.key, id: msg, session: r.session, how: "socket" };
+      const went = (how: SentTo["how"]) => setSent((s) => s.map((x) => (x.id === msg ? { ...x, how } : x)));
+      harnessApi.command(r.session, c).then(
+        () => went("sent"),
+        () => went("failed"),
+      );
+      return { key: r.key, id: msg, session: r.session, how: "sending" };
+    });
+    setSent(out);
+  };
+  const toMarks = React.useMemo(() => {
+    const marks = new Map<string, ToMark>();
+    for (const x of sent) {
+      let mark: ToMark = "wait";
+      if (x.how === "failed") mark = "fail";
+      else if (x.how === "socket") {
+        const d = delivery?.[x.id];
+        if (d === "cancelled") mark = "fail";
+        else if (d === "started" || d === "completed") mark = "ok";
+        else if (!tasks.some((t) => t.queue?.some((q) => q.id === x.id)) && events.some((e) => e.kind === "user" && e.client_id === x.id)) mark = "ok";
+      } else if (x.how === "sent") mark = rows.find((r) => r.key === x.key)?.stand === "paused" ? "wait" : "ok";
+      marks.set(x.key, mark);
+    }
+    return marks;
+  }, [sent, delivery, tasks, events, rows]);
+  const clearTo = () => {
+    setPicks(new Set());
+    setSent([]);
+  };
+  return { rows, picks, pick, to, toMarks, sendTo, clearTo };
+}
+
 function Dock({
   store,
   id,
@@ -631,11 +719,12 @@ function Dock({
   const empty = useSession(store, (s) => s.events.length === 0);
   const resume = useSession(store, (s) => (s.meta?.features ?? []).includes("resume"));
   const info = useSession(store, (s) => s.info);
+  const { rows, picks, pick, to, toMarks, sendTo, clearTo } = useSubagentPicks(store, id, info ?? undefined, task);
   const harnessSession = useSession(store, (s) => s.state?.harness_session ?? s.info?.harness_session);
   const [moving, setMoving] = React.useState(false);
   return (
     <div className="hx-dock" onPointerDown={keepTyping} onMouseDown={keepTyping}>
-      <ActivityLine store={store} onOpenTask={onOpenTask} kiln={kiln} inThread={task} />
+      <ActivityLine store={store} onOpenTask={onOpenTask} kiln={kiln} inThread={task} rows={rows} picks={picks} onPick={pick} />
       {status === "exited" && exit?.error && empty ? (
         <div className="hx-startfail" role="alert">
           <b>This agent couldn't start.</b> {exit.error}
@@ -670,7 +759,22 @@ function Dock({
       ) : null}
       <PausedLine store={store} send={send} onLogin={() => onView("login")} />
       <AskedLine store={store} />
-      <Composer store={store} agent={id} attachments={attachments} toMain={toMain} task={task} turn={turn} onView={onView} onTerminal={onTerminal} replyTo={reply} onClearReply={onClearReply} />
+      <Composer
+        store={store}
+        agent={id}
+        attachments={attachments}
+        toMain={toMain}
+        task={task}
+        turn={turn}
+        onView={onView}
+        onTerminal={onTerminal}
+        replyTo={reply}
+        onClearReply={onClearReply}
+        to={to}
+        toMarks={toMarks}
+        onSendTo={sendTo}
+        onClearTo={clearTo}
+      />
     </div>
   );
 }

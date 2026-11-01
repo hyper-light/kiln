@@ -832,7 +832,8 @@ const treeLeadAsk: Approval = {
 };
 {
   const t = Date.now() - 40 * 60_000;
-  const sub = (id: string, description: string, started: number, rest: Partial<Task> = {}): Task => ({ ...defaultTask(), id, tool_id: `toolu_${id}`, description, class: "agent", kind: "local_agent", status: "running", background: true, started, stoppable: true, ...rest });
+  // Background subagents, as Claude Code runs them: they take a message queued, or steered into their work.
+  const sub = (id: string, description: string, started: number, rest: Partial<Task> = {}): Task => ({ ...defaultTask(), id, tool_id: `toolu_${id}`, description, class: "agent", kind: "local_agent", status: "running", background: true, started, stoppable: true, takes: ["queue", "steer"], ...rest });
   const lead = member("tree-lead", "claude", "local", "Storage lead", "idle", "default", "Replicate the metadata store's log over QUIC, then rotate the release signing key.", "Its steps are out on subagents; I'll check each as it comes back.");
   lead.tasks = [sub("tl-h0", "Rotate the signing key", t + 30 * 60_000, { summary: "Signing kiln-x86_64-linux" })];
   const s1 = member("tree-s1", "claude", "agent:metal-ryzen-01", "Leader election over QUIC", "running", "default", "Step 2 of 5 of the plan \u201cReplicated log\u201d: Leader election over QUIC", "Electing a leader across three nodes.", {
@@ -853,10 +854,12 @@ const treeLeadAsk: Approval = {
     doing: "Streaming a 10 GB snapshot",
   });
   s3.info.created_at = t + 180_000;
-  const s3a = member("tree-s3a", "claude", "agent:metal-ryzen-02", "Verify the checksum", "running", "default", "Check the snapshot's checksum against the manifest.", "Hashing the snapshot.", {
+  // Waiting for its usage limit to reset: what's sent it waits.
+  const s3a = member("tree-s3a", "claude", "agent:metal-ryzen-02", "Verify the checksum", "idle", "default", "Check the snapshot's checksum against the manifest.", "Hashing the snapshot.", {
     parent: "tree-s3",
     subagent: true,
     doing: "Hashing snapshot-0042.bin",
+    pause: { reason: "limit", label: "Session", said: "", since: t, auto: true, by: "harness", tries: 0 },
   });
   s3a.info.created_at = t + 28 * 60_000;
   s3a.tasks = [sub("ts3a-a", "Re-read the manifest", t + 29 * 60_000, { last_tool: "Read" })];
@@ -1621,7 +1624,17 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
   const cm = p.match(/^\/api\/harness\/sessions\/([^/]+)\/command$/);
   const told = cm ? family.get(decodeURIComponent(cm[1] ?? "")) : undefined;
   if (cm && told && m === "POST") {
-    takeAnswer(told, await body<{ type?: string; id?: string; decision?: string }>(req));
+    const c = await body<{ type?: string; id?: string; decision?: string; text?: string; task?: string; mode?: string }>(req);
+    takeAnswer(told, c);
+    // A message sent without its socket (to one of a lead's subagents, from its page): to a subagent of its harness's own, or to it.
+    if (c.type === "send" && c.text) {
+      if (c.task) tellSubagent(told, c.task, c.id ?? `sub-${Date.now()}`, c.text, c.mode ?? "queue");
+      else {
+        const e = { id: c.id ?? `u-${Date.now()}`, seq: Math.max(0, ...told.events.map((x) => x.seq)) + 1, at: Date.now(), kind: "user", text: c.text, client_id: c.id, origin: "human" } as HEvent;
+        told.events.push(e);
+        for (const ws of viewers.get(told.info.id) ?? []) if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ t: "events", events: [e] }));
+      }
+    }
     json(res, 200, {});
     return true;
   }

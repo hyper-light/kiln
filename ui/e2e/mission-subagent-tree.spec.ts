@@ -45,7 +45,7 @@ test("the subagents' toggle opens the tree under its row, every subagent in the 
   await expect(row.getByRole("button", { name: "Hide Storage lead's subagents" })).toHaveAttribute("aria-expanded", "true");
 
   const stands = await tree.locator(".ms-node").evaluateAll((els) => els.map((e) => e.getAttribute("data-stand")));
-  expect(stands).toEqual(["working", "working", "done", "needs", "working", "working", "working", "needs"]);
+  expect(stands).toEqual(["working", "working", "done", "needs", "working", "paused", "working", "needs"]);
   // Those that need you: each its piece of the path tan, and only theirs.
   const catchUp = tree.locator(".ms-node", { hasText: "Follower catch-up" });
   const signing = tree.locator(".ms-node", { hasText: "Rotate the signing key" });

@@ -7,7 +7,7 @@
  * it (an ancestor's, on to that one's next), the line or curve into its mark, and the line on from
  * it. While it needs you, its own piece is tan.
  */
-import type { AgentInfo, ApprovalBrief, SubagentBrief, Task } from "@/api/harness";
+import type { AgentInfo, Approval, ApprovalBrief, SubagentBrief, Task } from "@/api/harness";
 import { agentLabel, plain } from "./derive";
 import { standOf } from "./mission-rows";
 import { askWords, isSubagent, kilnSubagentsOf } from "./tasks";
@@ -94,6 +94,22 @@ export function briefsOf(tasks: readonly Task[]): Brief[] {
     summary: t.summary,
   }));
 }
+
+/**
+ * The agent as its own page has it now: its own harness's subagents and requests from its live
+ * state (with what each said), less what you answered here (`done`, answered.ts); the rest as the
+ * list has it.
+ */
+export function liveRoot(base: AgentInfo, tasks: readonly Task[], approvals: readonly Approval[], done: ReadonlyMap<string, number>): AgentInfo {
+  return {
+    ...base,
+    subagents: briefsOf(tasks),
+    approvals: approvals.filter((p) => !done.has(p.id)).map((p) => ({ id: p.id, tool: p.tool, tool_name: p.tool_name, title: p.title, at: p.at, agent: p.agent ?? undefined })),
+  };
+}
+
+/** It can take a message: it hasn't ended. */
+export const takesMessage = (n: Pick<SubagentNode, "stand">) => n.stand !== "done" && n.stand !== "failed" && n.stand !== "stopped";
 
 /** Its harness's own subagent's request: one that names it (by its task, its spawning call or what it was sent to do). */
 const askOf = (approvals: readonly ApprovalBrief[], b: Brief): ApprovalBrief | undefined =>

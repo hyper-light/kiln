@@ -2214,3 +2214,238 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
 :root[data-opening] .hx-dock .hx-compose-box {
   view-transition-name: kiln-composer;
 }
+
+/* ---------------------------------------------------------------- its subagents' tree, by the composer */
+/* The line: its subagents' mark (once open, the box that picks every one), then the line itself. */
+.al-top {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+}
+.al-slot {
+  display: grid;
+  width: 22px;
+  flex: none;
+  place-items: center;
+  margin-left: 4px;
+  color: #cdc6ea;
+}
+.al-slot + .al-line {
+  padding-left: 6px;
+}
+/* A subagent: its pick box, its piece of the path, its name and what it's at, its pause and Stop. */
+.dn-row {
+  position: relative;
+  display: grid;
+  grid-template-columns: 22px 40px minmax(0, 1fr) auto;
+  align-items: start;
+  column-gap: 8px;
+  padding: 7px 0 7px 4px;
+}
+.dn[data-picked] {
+  background: #0f0e14;
+  box-shadow: inset 2px 0 0 #8f87b3;
+}
+.dn-pick {
+  display: grid;
+  height: 20px;
+  place-items: center;
+}
+.dn .dn-path {
+  left: 34px;
+  --tp-bg: #08090a;
+}
+.dn[data-picked] .dn-path {
+  --tp-bg: #0f0e14;
+}
+.dn-main {
+  grid-column: 3;
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+  text-align: left;
+}
+.dn-name {
+  overflow: hidden;
+  color: #ededee;
+  font-size: 13.5px;
+  line-height: 20px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dn[data-stand="paused"] .dn-name {
+  color: #a9b1bf;
+}
+.dn-line {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 9px;
+}
+.dn-word {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+  color: #a1a4ad;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.dn-word > i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #7e818a;
+  transform: translateY(-1px);
+}
+.dn[data-stand="working"] .dn-word {
+  color: #cdc6ea;
+}
+.dn[data-stand="working"] .dn-word > i {
+  background: #bab0e3;
+}
+.dn[data-stand="needs"] .dn-word {
+  color: #e2cfae;
+}
+.dn[data-stand="needs"] .dn-word > i {
+  background: #d8bb95;
+}
+.dn[data-stand="paused"] .dn-word {
+  color: #b8c2d3;
+}
+.dn[data-stand="paused"] .dn-word > i {
+  background: #a6b2c6;
+}
+.dn[data-stand="done"] .dn-word {
+  color: #bfdccf;
+}
+.dn[data-stand="done"] .dn-word > i {
+  background: #a8c9bc;
+}
+.dn[data-stand="failed"] .dn-word,
+.dn[data-stand="stopped"] .dn-word {
+  color: #e2b9bd;
+}
+.dn[data-stand="failed"] .dn-word > i,
+.dn[data-stand="stopped"] .dn-word > i {
+  background: #d1aaad;
+}
+.dn-text {
+  min-width: 0;
+  overflow: hidden;
+  color: #a7a9b1;
+  font-size: 12.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dn-text[data-mono] {
+  color: #ece0ca;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+.dn-time {
+  flex: none;
+  margin-left: auto;
+  color: #7b7e88;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+.dn-acts {
+  grid-column: 4;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.dn-pause {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border-radius: 999px;
+  color: #a1a4ad;
+}
+.dn-pause:hover:not(:disabled) {
+  color: #ededee;
+}
+.dn-pause:disabled,
+.dn .al-stop:disabled {
+  opacity: 0.35;
+}
+/* What it asks, answered under its words. */
+.dn-answer {
+  display: flex;
+  gap: 8px;
+  padding: 0 0 9px calc(4px + 22px + 8px + 40px + 8px);
+}
+
+/* ---------------------------------------------------------------- the composer: who it's to */
+.hx-to {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid #25272c;
+  color: #ddd8f0;
+  font-size: 12.5px;
+}
+.hx-to-mark {
+  flex: none;
+  color: #b8a6d5;
+}
+.hx-to-names {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  gap: 12px;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  list-style: none;
+  white-space: nowrap;
+}
+.hx-to-name {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 4px;
+}
+.hx-to-name > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.hx-to-name > svg {
+  flex: none;
+}
+.hx-to-name[data-mark="ok"] > svg {
+  color: #a8c9bc;
+}
+.hx-to-name[data-mark="wait"] > svg {
+  color: #a6b2c6;
+}
+.hx-to-name[data-mark="fail"] > svg {
+  color: #d1aaad;
+}
+.hx-to-more {
+  flex: none;
+  color: #7b7e88;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+}
+.hx-to-clear {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  flex: none;
+  place-items: center;
+  border-radius: 999px;
+  color: #a1a4ad;
+}
+.hx-to-clear:hover {
+  color: #ededee;
+}
