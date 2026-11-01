@@ -20,7 +20,7 @@ import { JourneyStrip, StatusGlyph } from "@/components/ui/status-glyph";
 import { GLYPHS, PIPELINE_STAGES, type GlyphState, type Pip } from "@/components/ui/status-glyph-spec";
 import { errorMessage, useMediaQuery } from "@/lib/hooks";
 import { jobsOf, planLines, whereWords, type PlanJob, type PlanLine } from "@/lib/plan-diff";
-import { manualInputs, spotOf, type Spot } from "@/lib/pipeline-spot";
+import { manualInputs, spotOf, type ManualInput, type Spot } from "@/lib/pipeline-spot";
 import { TRIGGER_GROUPS, TRIGGER_KINDS, triggerKeys, triggerLines, type TriggerKind } from "@/lib/triggers";
 import { addTrigger, EditRefused, removeTrigger, setScheduleField, setTriggerFilter } from "@/lib/workflow-doc";
 import { parse as parseYaml } from "yaml";
@@ -456,6 +456,8 @@ function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: S
   const [said, setSaid] = React.useState<{ text: React.ReactNode; refused: boolean } | null>(null);
   const [armed, setArmed] = React.useState<ShipPipelineVerb | null>(null);
   const [busy, setBusy] = React.useState(false);
+  // Run's inputs as they're asked in the strip (W29-R14): each by its name, as typed or picked.
+  const [asking, setAsking] = React.useState<Record<string, string> | null>(null);
   // The file as it's being written: typing (or the Flow view) starts a draft, Not saved until it's saved (W29-R05, R10).
   const [text, setText] = React.useState(() => unsaved.get(row.key) ?? p.detail.text);
   const changed = text !== p.detail.text;
@@ -516,15 +518,29 @@ function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: S
       invalidate("ship/pipelines");
     }
   };
+  // Run runs what's saved: a published workflow by hand (workflow_dispatch, with its inputs), a draft as the event "plan for:" picks (W29-R14).
+  const runEvent = h.draft ? event : "workflow_dispatch";
+  const runInputs = runEvent === "workflow_dispatch" ? manualInputs(p.detail.text) : [];
+  const runNow = (values: Record<string, string>) => {
+    const missing = runInputs.find((i) => i.required && !values[i.name]);
+    if (missing) return setSaid({ text: `${missing.name} is needed to run it`, refused: true });
+    const inputs = Object.fromEntries(
+      runInputs.map((i) => [i.name, i.type === "boolean" ? values[i.name] === "true" : i.type === "number" && values[i.name] ? Number(values[i.name]) : (values[i.name] ?? "")]),
+    );
+    setAsking(null);
+    void act(
+      { verb: "run", ...(h.draft && event ? { event } : {}), ...(runInputs.length ? { inputs } : {}) },
+      <>
+        Running <b>{h.title}</b> by hand{runInputs.length ? ` with ${runInputs.map((i) => `${i.name} ${String(inputs[i.name])}`).join(", ")}` : ""}:{" "}
+        <Link to={`/ship/${repo.repo}/${h.commit}`}>its jobs</Link> show as it starts.
+      </>,
+    );
+  };
   const onVerb = (v: ShipPipelineVerb) => {
     switch (v.verb) {
       case "run":
-        return void act(
-          { verb: "run", ...(event ? { event } : {}) },
-          <>
-            Running <b>{h.title}</b>.
-          </>,
-        );
+        if (runInputs.length) return setAsking(Object.fromEntries(runInputs.map((i) => [i.name, i.default ?? (i.type === "boolean" ? "false" : (i.options[0] ?? ""))])));
+        return runNow({});
       case "save_draft":
         // Saved, it's the draft's row now: this one reads as published again.
         return void act(
@@ -551,7 +567,11 @@ function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: S
         return setArmed(v);
     }
   };
-  const say: React.ReactNode = armed ? (
+  const say: React.ReactNode = asking ? (
+    <>
+      Run <b>{h.title}</b> by hand, with its inputs:
+    </>
+  ) : armed ? (
     (armed.asks ?? `${armed.label}?`)
   ) : said ? (
     said.text
@@ -572,25 +592,31 @@ function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: S
   // A verb that doesn't apply is dimmed, never hidden; picking it says why (W29-R04).
   const whyNot = (v: ShipPipelineVerb): string | null =>
     !v.enabled ? (v.why_not ?? `${v.label} doesn't apply here`) : v.verb === "save_draft" && !changed ? "Nothing to save yet: typing in its YAML starts a draft (W29-R05)" : null;
-  const verbs: StripVerb[] = armed
+  const verbs: StripVerb[] = asking
     ? [
-        { key: "keep", label: "Keep", enabled: true, keep: true, run: () => setArmed(null) },
-        {
-          key: armed.verb,
-          label: armed.label,
-          enabled: !busy,
-          go: true,
-          run: () => void act({ verb: armed.verb as ShipPipelineAct["verb"], sha: h.commit }, <>{armed.label}: asked of the server.</>),
-        },
+        { key: "keep", label: "Keep", enabled: true, keep: true, run: () => setAsking(null) },
+        { key: "run", label: "Run", enabled: !busy, go: true, run: () => runNow(asking) },
       ]
-    : p.strip.verbs.map((v) => {
-        const why = whyNot(v);
-        return { key: v.verb, label: v.label, enabled: !why && !busy, dim: Boolean(why), run: () => (why ? setSaid({ text: why, refused: true }) : onVerb(v)) };
-      });
+    : armed
+      ? [
+          { key: "keep", label: "Keep", enabled: true, keep: true, run: () => setArmed(null) },
+          {
+            key: armed.verb,
+            label: armed.label,
+            enabled: !busy,
+            go: true,
+            run: () => void act({ verb: armed.verb as ShipPipelineAct["verb"], sha: h.commit }, <>{armed.label}: asked of the server.</>),
+          },
+        ]
+      : p.strip.verbs.map((v) => {
+          const why = whyNot(v);
+          return { key: v.verb, label: v.label, enabled: !why && !busy, dim: Boolean(why), run: () => (why ? setSaid({ text: why, refused: true }) : onVerb(v)) };
+        });
   const pick = (k: Key) => {
     setPicked(k);
     setSaid(null);
     setArmed(null);
+    setAsking(null);
   };
   // What the detail edits the file with: a change made (or refused, saying why), a kind added and picked.
   const tools: Tools = {
@@ -633,7 +659,9 @@ function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: S
             <div className="jp-said" aria-live="polite">
               {say}
             </div>
-            {line?.kind === "add" ? (
+            {asking ? (
+              <RunInputs inputs={runInputs} values={asking} onSet={(name, v) => setAsking({ ...asking, [name]: v })} />
+            ) : line?.kind === "add" ? (
               <div className="jp-q">
                 <span>show:</span>
                 {(["all", "github", "kiln"] as const).map((w, i) => (
@@ -963,6 +991,40 @@ function ScheduleTimes({ pane, text, tools, editable }: { pane: ShipPipelinePane
             </li>
           </ul>
         </React.Fragment>
+      ))}
+    </div>
+  );
+}
+
+/** Run's inputs asked in the strip, never in a dialog (W29-R14): a choice as its words, a switch, a field; each its default first. */
+function RunInputs({ inputs, values, onSet }: { inputs: ManualInput[]; values: Record<string, string>; onSet: (name: string, v: string) => void }) {
+  return (
+    <div className="jp-q ppl-inputs" aria-label="Its inputs">
+      {inputs.map((i) => (
+        <span key={i.name} className="ppl-in" data-input={i.name}>
+          <span>{i.name}:</span>
+          {i.type === "choice" && i.options.length ? (
+            i.options.map((o, n) => (
+              <React.Fragment key={o}>
+                {n ? <span aria-hidden>·</span> : null}
+                <button type="button" aria-pressed={values[i.name] === o} onClick={() => onSet(i.name, o)}>
+                  {o}
+                </button>
+              </React.Fragment>
+            ))
+          ) : i.type === "boolean" ? (
+            <Switch on={values[i.name] === "true"} label={i.name} onSet={(on) => onSet(i.name, on ? "true" : "false")} />
+          ) : (
+            <input
+              className="ppl-input"
+              aria-label={i.name}
+              inputMode={i.type === "number" ? "numeric" : undefined}
+              value={values[i.name] ?? ""}
+              placeholder={i.required ? "needed" : ""}
+              onChange={(e) => onSet(i.name, e.currentTarget.value)}
+            />
+          )}
+        </span>
       ))}
     </div>
   );

@@ -1739,3 +1739,23 @@
 .ppl .jp-detail {
   grid-template-columns: minmax(0, 1fr);
 }
+/* Run's inputs in the strip (W29-R14): each its name, then its words, switch or field. */
+.ppl-in {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.ppl-in > span:first-child {
+  color: #8b8e96;
+}
+.ppl-in .ppl-input {
+  flex: none;
+  width: 12ch;
+}
+/* On a phone the strip's words take two lines' room whatever they say (plan for:, show:, Run's inputs): the strip holds its height. */
+@media (max-width: 700px) {
+  .ppl .jp-q {
+    min-height: 40px;
+    align-content: flex-start;
+  }
+}

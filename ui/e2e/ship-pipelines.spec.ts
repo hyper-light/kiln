@@ -275,3 +275,31 @@ test("Add a trigger: 18 kinds in six groups, shown by whose; picking one adds it
   await expect(page.locator(".cm-tooltip, [role=dialog]")).toHaveCount(0);
   expect(await sideways(page)).toBe(0);
 });
+
+/** The bodies this browser sent `POST /api/ship/pipelines`, as the mock kept them. */
+const sentBodies = async (page: Page) => ((await (await page.request.get("/api/mock/ship/pipelines")).json()) as { bodies: Record<string, unknown>[] }).bodies;
+
+test("Run with inputs: the strip asks for them in place, each its default first; one with none runs at once; nothing moves", async ({ page, isMobile }) => {
+  await page.request.get("/api/mock/ship/pipelines?reset=1");
+  const pane = await openPane(page, isMobile, "hyper-light/kiln", ".kiln/smoke.yaml");
+  const strip = pane.locator(".jp-strip");
+  const height = await strip.evaluate((e) => e.getBoundingClientRect().height);
+  await pane.locator(".ppl-verbs button", { hasText: "Run" }).click();
+  // Its manual trigger's input, its default picked, asked where the strip's words were.
+  const inputs = pane.getByLabel("Its inputs");
+  await expect(inputs.locator('[data-input="target"] button[aria-pressed=true]')).toHaveText("staging");
+  await expect(pane.locator(".jp-said")).toContainText("by hand, with its inputs");
+  await expect(pane.locator(".ppl-verbs button")).toHaveText(["Keep", "Run"]);
+  expect(await strip.evaluate((e) => e.getBoundingClientRect().height)).toBe(height);
+  await inputs.locator('[data-input="target"]').getByRole("button", { name: "production" }).click();
+  await pane.locator(".ppl-verbs button", { hasText: "Run" }).click();
+  await expect(pane.locator(".jp-said")).toContainText("Running smoke by hand with target production");
+  expect((await sentBodies(page)).at(-1)).toEqual({ repo: "hyper-light/kiln", path: ".kiln/smoke.yaml", verb: "run", inputs: { target: "production" } });
+  await expect(page.locator("[role=dialog]")).toHaveCount(0);
+  // ci has no inputs: Run runs it at once.
+  const ci = await openPane(page, isMobile, "hyper-light/kiln", ".kiln/ci.yaml");
+  await ci.locator(".ppl-verbs button", { hasText: "Run" }).click();
+  await expect(ci.locator(".jp-said")).toContainText("Running ci by hand");
+  expect((await sentBodies(page)).at(-1)).toEqual({ repo: "hyper-light/kiln", path: ".kiln/ci.yaml", verb: "run" });
+  expect(await sideways(page)).toBe(0);
+});
