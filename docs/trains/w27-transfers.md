@@ -50,6 +50,10 @@ reaching a process it isn't for.
   hand-on of what it made names the images its token pushed to kiln's registry. A walk from an
   artifact or an image goes back through every hop. A tarball changed on its way is refused before
   the leg runs, and the break recorded.
+- Between machines (step 12, so far): docs/ci.md W27 lists every path where one machine takes
+  something from another. A runner's object from a peer's cache is handed on by the peer and
+  received by the runner that fetched it, each signing; a copy changed on its way is refused, and
+  the break recorded. No runner in production asks a peer yet: nothing mints its cache's tokens.
 
 ## Deploying it
 
@@ -82,6 +86,9 @@ reaching a process it isn't for.
   the tarball's comes in a response header (`Kiln-Custody-Hand-On`) and a cache's in a new field of
   the lookup's answer, both ignored by a runner from before. A runner asks `/_kiln/pushed` at a
   leg's end; a server from before answers 404, and the leg's hand-on names no images, as before.
+- **Step 12 on the wire:** none on reach's links. A runner asks the server which process of a
+  peer takes reach (`ReachAsk` op `custody`); a server from before doesn't know the op, the runner
+  hears no URI, and nothing is signed for that peer, as before.
 - **Config:** nothing new in kiln.toml.
 - **First start:** the migrations only add tables (`ci_leg_pushed` with step 11).
 
@@ -100,5 +107,5 @@ reaching a process it isn't for.
 ## Open
 
 - Steps 12–16: machines, intermediaries, production, the walk and its simulation, and the end to
-  end. Ada approved plan v7 on 2026-10-31; step 11 is built.
+  end. Ada approved plan v7 on 2026-10-31; step 11 is built, and step 12's peers' objects.
 - A session's `Open` at a later epoch isn't signed itself (docs/reach.md, "Not yet").

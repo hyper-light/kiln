@@ -2004,6 +2004,23 @@ impl Hub {
                         };
                         self.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
                     }
+                    // A runner's process that takes reach, as kiln names it (its identity's URI), for
+                    // a custody record of what passes between two runners (docs/ci.md W27-R08).
+                    Some("custody") => {
+                        let runner = ask.get("runner").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+                        let instance = {
+                            let inst = self.instances.lock();
+                            inst.newest_with(&runner, proto::CAP_REACH).and_then(|p| inst.get(p).map(|i| i.label()))
+                        };
+                        let hub = Arc::clone(self);
+                        crate::rt::spawn(async move {
+                            let uri = match instance {
+                                Some(instance) => crate::identities::runner_identity(&hub, &runner, &instance).await.ok().and_then(|i| i.uri().ok()),
+                                None => None,
+                            };
+                            hub.send_peer(peer, &ServerMsg::ReachAnswer { req, json: serde_json::json!({ "uri": uri }).to_string() }).await;
+                        });
+                    }
                     // An agent's MCP server on the runner asks for kiln's operations: answered on
                     // their own, so a slow one holds up nothing else the runner says.
                     Some("registry" | "call" | "page" | "stream" | "act") => {

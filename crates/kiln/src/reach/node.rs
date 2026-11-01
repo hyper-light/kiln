@@ -1248,9 +1248,27 @@ impl Node {
             }
             Ask::Object { id, repo, digest, offset } => {
                 let store = self.cfg.objects.clone().or_else(|| crate::runner::work::service::running().map(|s| Arc::clone(s.store())));
-                let window = crate::rt::blocking(move || object_window(store.as_deref(), &repo, &digest, offset)).await;
+                let (r, d) = (repo.clone(), digest.clone());
+                let window = crate::rt::blocking(move || object_window(store.as_deref(), &r, &d, offset)).await;
                 match window {
-                    Ok(Ok(Some(pieces))) => {
+                    Ok(Ok(Some(mut pieces))) => {
+                        // This runner's hand-on of the object to the peer that asked, signed as its
+                        // first window goes (docs/ci.md W27-R08): who the peer is, kiln says, asked
+                        // apart from this loop.
+                        if offset == 0 {
+                            let to = key.0.clone();
+                            crate::rt::spawn(async move {
+                                if let Some(uri) = crate::runner::work::peers::custodian_of(&to).await {
+                                    crate::runner::custody::peer_object_handed(&uri, &repo, &digest);
+                                }
+                            });
+                            // A test build's `peer_object_changed`: a byte changed after the hand-on.
+                            if crate::runner::chaos::get().is_some_and(|c| c.peer_object_changed)
+                                && let Some(b) = pieces.first_mut().and_then(|(_, data, _)| data.first_mut())
+                            {
+                                *b ^= 0x01;
+                            }
+                        }
                         for (offset, data, last) in pieces {
                             self.say_on(link, &Say::ObjectData { id, offset, data, last }).await;
                         }

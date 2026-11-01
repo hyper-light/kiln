@@ -659,6 +659,29 @@ pub fn to_value(b: &Body) -> Value {
     serde_json::to_value(b).unwrap_or(Value::Null)
 }
 
+/// A peer runner's hand-on of an object of its cache to the runner that asked for it (docs/ci.md
+/// W24-R27; the Transfers plan's step 12): `by` the holder, `to` the taker, the object of `repo` by
+/// its SHA-256. Both sides build it alike, and a statement's digest leaves its signer out, so the
+/// taker's receipt follows its digest without its bytes ever crossing to the taker.
+pub fn peer_object_hand_on(by: &str, to: &str, repo: &str, sha256: &str) -> statement::Statement {
+    let body = Body { to: Some(to.to_owned()), why: "an object of its cache, to the peer that asked for it".into(), ..Body::new(Kind::HandedOn, by) };
+    statement::Statement { subject: vec![peer_object(repo, sha256)], ..statement::Statement::new(to_value(&body)) }
+}
+
+/// The taker's receipt of [`peer_object_hand_on`] (its digest `hand_on`), of the object by the
+/// SHA-256 it hashed to (`got`): a copy that isn't what its name says breaks at that hop, naming
+/// the peer (`from`).
+pub fn peer_object_receipt(by: &str, from: &str, repo: &str, got: &str, hand_on: &str) -> statement::Statement {
+    let body = Body { from: Some(from.to_owned()), why: "an object of a peer's cache".into(), ..Body::new(Kind::Received, by) };
+    statement::Statement { subject: vec![peer_object(repo, got)], follows: vec![hand_on.to_owned()], ..statement::Statement::new(to_value(&body)) }
+}
+
+/// An object of `repo`'s cache by its SHA-256 (`sha256:<hex>` or the hex).
+fn peer_object(repo: &str, sha256: &str) -> Subject {
+    let hex = sha256.strip_prefix("sha256:").unwrap_or(sha256).to_ascii_lowercase();
+    Subject { name: format!("object of {repo}"), digest: BTreeMap::from([("sha256".to_owned(), hex)]), ..Subject::default() }
+}
+
 /// An act's payload type ([`Act`]).
 pub const PAYLOAD_ACT: &str = "application/vnd.kiln.act+json";
 
@@ -1167,6 +1190,28 @@ mod tests {
         let refused = kept.take(&ca, &runner, &got, AT)?;
         let r = hop(&refused, &kept.records, SERVER);
         assert!(matches!(&r, Err(Break::Changed { .. })), "{r:?}");
+        Ok(())
+    }
+
+    /// W27-R08 (the Transfers plan's step 12, W24-R27): an object a peer hands on. The holder signs
+    /// its hand-on and sends it to kiln; the taker builds the same hand-on itself, whose digest is
+    /// the same whoever builds it, and its receipt follows it: unbroken. A copy that hashed to
+    /// something else breaks at that hop, naming the peer.
+    #[test]
+    fn w27_r08_a_peers_object_changes_hands_signed_by_both() -> anyhow::Result<()> {
+        let ca = ca()?;
+        let (fedora, jupiter) = (Signer::new(&ca, FEDORA)?, Signer::new(&ca, JUPITER)?);
+        let want = format!("sha256:{}", sha('a'));
+        let mut kept = Kept::default();
+        let handed = kept.take(&ca, &fedora, &peer_object_hand_on(FEDORA, JUPITER, "acme/app", &want), AT - 2)?;
+        let built = digest(PAYLOAD_CUSTODY, &payload(&peer_object_hand_on(FEDORA, JUPITER, "acme/app", &want))?);
+        assert_eq!(built, handed, "the taker's build of the hand-on has the holder's digest");
+        let got = kept.take(&ca, &jupiter, &peer_object_receipt(JUPITER, FEDORA, "acme/app", &want, &built), AT - 1)?;
+        let w = walk(&got, &kept.records, SERVER)?;
+        assert_eq!(w.hops.iter().map(|h| (h.kind, h.custodian.as_str())).collect::<Vec<_>>(), vec![(Kind::Received, JUPITER), (Kind::HandedOn, FEDORA)]);
+        let wrong = kept.take(&ca, &jupiter, &peer_object_receipt(JUPITER, FEDORA, "acme/app", &sha('f'), &built), AT)?;
+        let r = hop(&wrong, &kept.records, SERVER);
+        assert!(matches!(&r, Err(Break::Changed { from, .. }) if from == &handed), "{r:?}");
         Ok(())
     }
 

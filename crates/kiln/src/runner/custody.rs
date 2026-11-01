@@ -245,6 +245,37 @@ pub(crate) fn send(bundle: &Value) {
     queue(bundle);
 }
 
+/// This process handed a peer runner an object of its cache (docs/ci.md W24-R27; the Transfers
+/// plan's step 12): its hand-on to that runner process (`to`, as kiln names it), signed as this
+/// process and sent to kiln. The peer builds the same hand-on, and its receipt follows it.
+pub(crate) fn peer_object_handed(to: &str, repo: &str, digest: &str) {
+    if !sends() {
+        return;
+    }
+    let Some(by) = identity::uri("runner") else { return };
+    match sign("runner", &by, &kiln_ci::identity::custody::peer_object_hand_on(&by, to, repo, digest)) {
+        Ok(b) => queue(&b),
+        Err(e) => tracing::warn!(target: "kiln.custody", %repo, object = %digest, error = %format!("{e:#}"), "this runner's hand-on of an object to a peer couldn't be signed"),
+    }
+}
+
+/// This process took an object of `repo` from the peer runner process `from` (as kiln names it):
+/// its receipt of what the copy hashed to (`got`), following the peer's hand-on of the object it
+/// asked for (`want`), built here as the peer builds it, signed as this process and sent to kiln.
+/// A copy that isn't what its name says is the break kiln records at that hop, naming the peer.
+pub(crate) fn peer_object_taken(from: &str, repo: &str, want: &str, got: &str) {
+    if !sends() {
+        return;
+    }
+    let Some(by) = identity::uri("runner") else { return };
+    let Ok(payload) = statement::payload(&kiln_ci::identity::custody::peer_object_hand_on(from, &by, repo, want)) else { return };
+    let hand_on = statement::digest(PAYLOAD_CUSTODY, &payload);
+    match sign("runner", &by, &kiln_ci::identity::custody::peer_object_receipt(&by, from, repo, got, &hand_on)) {
+        Ok(b) => queue(&b),
+        Err(e) => tracing::warn!(target: "kiln.custody", %repo, object = %want, error = %format!("{e:#}"), "this runner's receipt of a peer's object couldn't be signed"),
+    }
+}
+
 /// The digest of a bundle's statement ("" when it can't be read).
 pub(crate) fn digest_of(bundle: &Value) -> String {
     use base64::Engine as _;

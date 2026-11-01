@@ -48,6 +48,9 @@
 //!   test sees the runner refuse it before the leg runs and kiln record the break.
 //! - `no_git`: the runner acts as if git weren't installed: a leg checks its commit out from the
 //!   server's tarball, as on a machine without git (docs/ci.md W27-R08's tarball hand-on).
+//! - `peer_object_changed`: an object of its cache this runner sends a peer has a byte changed after
+//!   it signed its hand-on of it, as in transit (docs/ci.md W27-R08, W24-R27): the peer refuses it
+//!   and kiln records the break.
 //! - `copy=<path>`: every frame this runner sends, appended to `path` as it goes below the channel
 //!   (its lane and length, then its bytes), so a test can say what crossed the network (W27-R02).
 //! - `keys=<path>`: each identity key this runner process makes (`crate::runner::identity`),
@@ -97,6 +100,8 @@ pub struct Chaos {
     pub tarball_changed: bool,
     /// Acts as if git weren't installed: legs check out from the tarball (`no_git`).
     pub no_git: bool,
+    /// An object it sends a peer changes after its hand-on (`peer_object_changed`).
+    pub peer_object_changed: bool,
     /// Where every frame this process sends is copied (`copy=`).
     pub copy: Option<std::path::PathBuf>,
     /// Where each identity key this process makes is copied (`keys=`).
@@ -161,6 +166,7 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
             "stale_words" => c.stale_words = true,
             "tarball_changed" => c.tarball_changed = true,
             "no_git" => c.no_git = true,
+            "peer_object_changed" => c.peer_object_changed = true,
             "copy" | "keys" => {
                 anyhow::ensure!(!v.is_empty(), "chaos `{k}` takes a file's path");
                 let path = Some(std::path::PathBuf::from(v));
@@ -171,7 +177,7 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
                 }
             }
             "seed" => c.seed = v.parse().map_err(|_| anyhow::anyhow!("chaos `seed` takes a number, not `{v}`"))?,
-            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, lag, oom, disk, corrupt, fetch, platform, rebuild, shed, twice, late, seed, fanout, old, unsigned, stale_words, tarball_changed, no_git, copy or keys"),
+            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, lag, oom, disk, corrupt, fetch, platform, rebuild, shed, twice, late, seed, fanout, old, unsigned, stale_words, tarball_changed, no_git, peer_object_changed, copy or keys"),
         }
     }
     Ok(c)
@@ -405,11 +411,12 @@ mod tests {
                 stale_words: false,
                 tarball_changed: false,
                 no_git: false,
+                peer_object_changed: false,
                 copy: None,
                 keys: None
             }
         );
-        assert!(parse("tarball_changed")?.tarball_changed && parse("no_git")?.no_git);
+        assert!(parse("tarball_changed")?.tarball_changed && parse("no_git")?.no_git && parse("peer_object_changed")?.peer_object_changed);
         assert_eq!(parse("platform=darwin/arm64")?.platform.as_deref(), Some("darwin/arm64"));
         // W27-R02's test copies: what a runner sends, and the keys it makes.
         let c = parse("copy=/tmp/a.frames,keys=/tmp/a.keys")?;

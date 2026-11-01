@@ -9465,6 +9465,42 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
   handed on isn't used (a checkout's is refused before the leg's first step runs), and the runner's
   receipt of what it got is the break kiln records at that hop. A leg's provenance (W27-R06) is
   signed only of what its hand-on names and of materials among what it received.
+- *Between machines* (step 12): every path where one machine takes something from another, or acts
+  on another for someone, with its custodians and what each signs. Each record is a custody record
+  by digest, both sides signed; a machine taking custody for someone else does it under a
+  delegation that names them and only narrows; a digest that changes across a hop, or a hop
+  missing its receipt, is a break, refused where it would be used and recorded.
+  - *kiln run's sync of a workspace* (`reach::local::run_inner` → `reach::node::on_sync_ask`,
+    `reach::sync::Mirror`): the asking runner process hands on the tree by its digest
+    (`reach::reuse::tree`, SHA-256 over the entries, as `--reuse` reads it) to the runner process
+    that runs it, which receives it once its mirror is committed and hashes to that digest. Today
+    the wire compares sizes and times only.
+  - *A reach run* (`Ask::Run`, `reach::node::start_run`): the asking runner process hands on the
+    run (its command, folder, environment by name and the tree's digest) for the session that
+    asked, under a delegation from that session (today only the server sees the session's signed
+    act, `runner::custody::act_taken`); the runner that runs it receives it, and hands its output
+    back by digest at `Say::Exit`, received by the asker.
+  - *A runner's objects from peers* (W24-R27: `runner::work::peers::fetch` ← `reach::node::
+    object_window`): the peer holding the object hands it on by its SHA-256, and the runner that
+    fetched it receives it once it hashes to that digest (checked today, now recorded); a wrong copy
+    is refused and recorded as a break, naming the peer. A runner asks its peers only when its
+    cache service is asked for an object it lacks, with a token its runner minted, and nothing
+    mints one yet (`harness::builds::cache_env` isn't called, W24-R24), so no runner in production
+    asks a peer today: the records are there for when one does.
+  - *The blob stores' puts and gets* (`kiln_seams::blobs`, `blobs::io::put_file`, `read_stream`):
+    kiln's server hands an object on by its SHA-256, the store's etag; the store has no identity of
+    kiln's, so the server's receipt of the etag it got back stands for it (a mismatch is refused,
+    as `put_file` does, and recorded). Mantle's puts and gets go the same way once Mantle is in
+    kiln (docs/mantle.md, CP-T10.2).
+  - *The conversation feed* (`convo::feed`: a runner's `Shipper` → the server's `Intake`, and the
+    server to its mirrors and back for a restore): each batch handed on by the SHA-256 of its rows,
+    received by the server once its store takes it (the receipt with its ack); a mirror's the same
+    way.
+  - *The cluster group* (`store::group`, `store::learner`): the server, the group's one voter,
+    hands its learners each copy by its SHA-256 (`cluster_copy`) and, at intervals, a checkpoint of
+    its log (its sequence and the digest of the entries since); each learner receives them once it
+    has applied them.
+  - *The server giving a leg to a runner* (step 11, above).
 - *A resume from the server's store* is kiln's take: signed with the server's own key for the
   identity kiln last certified the session as at that epoch (`identities::holder_at`), to the next,
   saying when kiln last heard from the machine; kiln keeps it at once, the package carries it, and
@@ -9533,7 +9569,13 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
   kiln's receipt with both records at every hop, kiln's hand-on of the commit naming D1's land; the
   image's provenance, signed as the leg, of that image from that commit; then, with the server's
   `tarball_changed`, the leg refused before any step and the break recorded where fedora-2's runner
-  received other bytes than kiln handed on). Simulation (the Transfers plan's step 9, W27-AC05):
+  received other bytes than kiln handed on). Between machines (step 12): kiln-ci's
+  `w27_r08_a_peers_object_changes_hands_signed_by_both` (the taker's build of the holder's hand-on
+  has its digest; a copy that hashed to something else breaks at that hop), and, with `chaos`,
+  `transfers`'s `w27_r08_custody_between_machines` (box-b's cache fetches box-a's object over their
+  link: box-a's hand-on and box-b's receipt, unbroken; box-b's copy changed on its way to box-a by
+  its `peer_object_changed`: never served, nothing of it kept, the break recorded between box-b's
+  hand-on and box-a's receipt). Simulation (the Transfers plan's step 9, W27-AC05):
   `sim::transfers::tests::w27_ac05_no_stale_act_is_ever_applied` (docs/sim.md's transfers model:
   moves, resumes from kiln's copy while a machine is cut off, take-overs with the old process still
   acting, blue/green upgrades and their rollbacks, the server restarting with its count stale, under
