@@ -8,7 +8,7 @@ import * as React from "react";
 import "./harness.css";
 import "./mission.css";
 import { Link, useNavigate } from "@/lib/router";
-import { ArrowUpRight, ChevronRight, ListChecks, X } from "lucide-react";
+import { ArrowUpRight, ChevronDown, ChevronRight, ChevronUp, ListChecks, Pause, X } from "lucide-react";
 import { api } from "@/api/client";
 import { clientId, harnessApi, type AgentInfo, type ApprovalBrief } from "@/api/harness";
 import { plansApi } from "@/api/plans";
@@ -49,6 +49,9 @@ import { RowChange, RowReview } from "./change-bar";
 import { Shimmer } from "./signals";
 import { subagentsAtWork, throughSubagents } from "./tasks";
 import { Stands } from "./stands";
+import { KindGlyph } from "./kind-glyph";
+import { NODE_WORD, subagentRows, type SubagentRow } from "./subagent-tree";
+import { TreePath } from "./tree-path";
 
 const WORD: Record<Stand, string> = {
   needs: "Needs you",
@@ -169,6 +172,8 @@ const Row = React.memo(function Row({
   selected,
   picking,
   onSelect,
+  tree,
+  onTree,
 }: {
   a: AgentInfo;
   stand: Stand;
@@ -176,6 +181,9 @@ const Row = React.memo(function Row({
   selected: boolean;
   picking?: boolean;
   onSelect: (id: string, on: boolean) => void;
+  /** Its subagents' tree is open under it (undefined: it has none). */
+  tree?: boolean;
+  onTree?: (id: string) => void;
 }) {
   const navigate = useNavigate();
   // Who waits on you: the agent, or its subagent (answered as that one; opened in the agent's chat, its thread shown).
@@ -253,6 +261,19 @@ const Row = React.memo(function Row({
           {(stand === "finished" || stand === "ready" || stand === "ended") && (a.files_changed ?? 0) > 0 && <RowReview agentId={a.id} />}
         </span>
         <span className="ms-tail">
+          {tree !== undefined && (
+            <button
+              type="button"
+              className="ms-subs"
+              aria-expanded={tree}
+              aria-label={tree ? `Hide ${label}'s subagents` : `Show ${label}'s subagents`}
+              data-on={tree || undefined}
+              onClick={() => onTree?.(a.id)}
+            >
+              <KindGlyph kind="agent" />
+              {tree ? <ChevronUp size={12} aria-hidden="true" /> : <ChevronDown size={12} aria-hidden="true" />}
+            </button>
+          )}
           {actions.menu()}
           {actions.dialogs}
           <button type="button" className="ms-go" onClick={open} aria-label={`Open ${label}`}>
@@ -263,6 +284,75 @@ const Row = React.memo(function Row({
     </li>
   );
 });
+
+/**
+ * An agent's subagents under its row, drawn as the tree they are (subagent-tree.ts), each in the
+ * row's own columns: the path where the checkbox is, its name and what it's at, its machine and
+ * time, what to answer and its way in. `rowAsk`: the request the row itself answers, not again here.
+ */
+function MissionTree({ id, list, rowAsk }: { id: string; list: readonly AgentInfo[]; rowAsk?: string }) {
+  const root = list.find((x) => x.id === id);
+  const rows = React.useMemo(() => (root ? subagentRows(root, list) : []), [root, list]);
+  if (!root || rows.length === 0) return null;
+  return (
+    <li className="ms-tree" data-glide={`${id}:tree`}>
+      <ul className="ms-tree-rows" aria-label={`${agentLabel(root)}'s subagents`}>
+        {rows.map((r) => (
+          <MissionNode key={r.key} r={r} owner={list.find((x) => x.id === r.session)} rowAsk={rowAsk} />
+        ))}
+      </ul>
+    </li>
+  );
+}
+
+/** One subagent in the tree under its agent's row. */
+function MissionNode({ r, owner, rowAsk }: { r: SubagentRow; owner: AgentInfo | undefined; rowAsk?: string }) {
+  const navigate = useNavigate();
+  const coarse = useMediaQuery("(pointer: coarse)");
+  const open = () => navigate(r.href);
+  const ask = r.stand === "needs" && r.ask && r.ask.id !== rowAsk ? r.ask : undefined;
+  return (
+    <li className="ms-node" data-stand={r.stand}>
+      <TreePath path={r.path} stand={r.stand} className="ms-node-path" x0={coarse ? 12 : 17} dx={10} y={19} width={coarse ? 40 : 46} />
+      <button type="button" className="ms-node-main" onClick={open}>
+        <span className="ms-node-name">{r.name}</span>
+        <span className="ms-node-line">
+          <span className="ms-word">
+            <i aria-hidden="true" />
+            {NODE_WORD[r.stand]}
+          </span>
+          <span className="ms-node-text" data-mono={r.mono || undefined}>
+            {r.line}
+          </span>
+          {r.stand !== "done" && r.started > 0 && <Ago className="ms-node-time" ts={Math.floor(r.started / 1000)} />}
+        </span>
+      </button>
+      <span className="ms-node-meta">
+        <span>
+          {r.machine}
+          {r.started > 0 && (
+            <>
+              {" · "}
+              <Ago className="ms-time" ts={Math.floor((r.ended ?? r.started) / 1000)} />
+            </>
+          )}
+        </span>
+        <span>{r.harness}</span>
+      </span>
+      <span className="ms-node-actions">
+        <span className="ms-decide">{ask && owner && <Decide a={owner} ap={ask} to={r.href} />}</span>
+        <span className="ms-tail">
+          <button type="button" className="ms-go" disabled={r.stand === "done" || r.stand === "failed" || r.stand === "stopped"} aria-label={`Pause ${r.name}`}>
+            <Pause size={15} />
+          </button>
+          <button type="button" className="ms-go" onClick={open} aria-label={`Open ${r.name}`}>
+            <ArrowUpRight size={16} />
+          </button>
+        </span>
+      </span>
+    </li>
+  );
+}
 
 /** Where each agent stands (what you answered here counted as taken; the subagents kiln started for one on its row), and how many stand where (the page's lead says so). */
 function standsOf(list: AgentInfo[], seen: Record<string, number>, done: ReadonlyMap<string, number>): MissionRow[] {
@@ -675,7 +765,28 @@ function Agents() {
       focusFor={focusFor}
     />
   );
-  const renderRow = ({ a, stand, asking }: MissionRow) => <Row key={a.id} a={a} stand={stand} asking={asking} selected={selected.has(a.id)} picking={touchScreen && selecting} onSelect={select} />;
+  // The agents whose subagents' trees are open under their rows, and every agent as answered here (each tree's subagents and theirs).
+  const [trees, setTrees] = React.useState<ReadonlySet<string>>(() => new Set());
+  const toggleTree = React.useCallback(
+    (id: string) =>
+      setTrees((s) => {
+        const next = new Set(s);
+        if (!next.delete(id)) next.add(id);
+        return next;
+      }),
+    [],
+  );
+  const answeredList = React.useMemo(() => list.map((agent) => asAnswered(agent, done)), [list, done]);
+  const renderRow = ({ a, stand, asking }: MissionRow) => {
+    const subs = (a.subagents?.length ?? 0) > 0;
+    const open = subs && trees.has(a.id);
+    return (
+      <React.Fragment key={a.id}>
+        <Row a={a} stand={stand} asking={asking} selected={selected.has(a.id)} picking={touchScreen && selecting} onSelect={select} tree={subs ? open : undefined} onTree={toggleTree} />
+        {open && <MissionTree id={a.id} list={answeredList} rowAsk={(asking ?? a).approvals[0]?.id} />}
+      </React.Fragment>
+    );
+  };
   // Every agent kiln runs, the subagents on their agents' rows too: none is listed again as found on its machine.
   const everyone = React.useMemo(() => list.map((a) => ({ a })), [list]);
 

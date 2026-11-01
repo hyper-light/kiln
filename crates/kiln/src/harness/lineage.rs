@@ -1168,7 +1168,7 @@ mod tests {
         }
         assert!(!in_pool(&child("pool-done", Status::Idle), &held), "idle, its work done");
         assert!(!in_pool(&child("pool-between", Status::Exited), &held), "ended, though its stack still holds the goal");
-        let sub = |status: &str| super::super::session::SubagentBrief { id: status.into(), tool_id: None, description: String::new(), status: status.into(), parent_task: None, started: 0, ended: None };
+        let sub = |status: &str| super::super::session::SubagentBrief { id: status.into(), tool_id: None, description: String::new(), status: status.into(), parent_task: None, started: 0, ended: None, last_tool: None };
         let parent = Info { subagents: ["running", "pending", "paused", "completed", "failed"].into_iter().map(sub).collect(), ..info("p", None, Status::Running) };
         assert_eq!(own_at_work(&parent), 3, "its harness's own still going");
         assert_eq!(most(None, None), (None, None), "no setting: no limit at all");

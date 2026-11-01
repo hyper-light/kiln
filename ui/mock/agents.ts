@@ -515,7 +515,7 @@ function leaves(m: Member) {
   const live = tasks.filter((t) => t.status === "running" || t.status === "pending" || t.status === "paused");
   m.info.subagents = tasks
     .filter((t) => t.class === "agent")
-    .map((t): SubagentBrief => ({ id: t.id, tool_id: t.tool_id, description: t.description, status: t.status, started: t.started, ended: t.ended }));
+    .map((t): SubagentBrief => ({ id: t.id, tool_id: t.tool_id, description: t.description, status: t.status, parent_task: t.parent_task, started: t.started, ended: t.ended, last_tool: t.last_tool }));
   m.info.tasks_running = live.length;
   m.info.left_behind = live.length;
 }
@@ -802,6 +802,69 @@ for (const m of [
   leaves(m);
   family.set(m.info.id, m);
 }
+// /agents/tree-lead "Storage lead" (Claude Code): its plan's steps out on subagents kiln started for
+// it (sessions of their own: `subagent`, with it as `parent`), their harness's own subagents under
+// them, one of kiln's under one of those (and its own under it), one of its own harness's, and one
+// that asks you something (`ASKS`): every kind of row Mission control's tree and the composer's draw.
+const treeAsk: Approval = {
+  id: "tree-s2-ap1",
+  tool_id: null,
+  tool_name: "Bash",
+  tool: "shell",
+  title: "kiln run --on linux/amd64 -- cargo test -p hyper-raft catch_up",
+  command: "kiln run --on linux/amd64 -- cargo test -p hyper-raft catch_up",
+  input: { command: "kiln run --on linux/amd64 -- cargo test -p hyper-raft catch_up" },
+  cwd: CWD,
+  at: Date.now() - 75_000,
+};
+// And the lead's own harness's subagent asks too, through the lead (`Approval.agent`): its row answers that one; the tree, the other.
+const treeLeadAsk: Approval = {
+  id: "tree-lead-ap1",
+  tool_id: null,
+  tool_name: "Bash",
+  tool: "shell",
+  title: "gpg --detach-sign dist/kiln-x86_64-linux",
+  command: "gpg --detach-sign dist/kiln-x86_64-linux",
+  input: { command: "gpg --detach-sign dist/kiln-x86_64-linux" },
+  cwd: CWD,
+  agent: "toolu_tl-h0",
+  at: Date.now() - 50_000,
+};
+{
+  const t = Date.now() - 40 * 60_000;
+  const sub = (id: string, description: string, started: number, rest: Partial<Task> = {}): Task => ({ ...defaultTask(), id, tool_id: `toolu_${id}`, description, class: "agent", kind: "local_agent", status: "running", background: true, started, stoppable: true, ...rest });
+  const lead = member("tree-lead", "claude", "local", "Storage lead", "idle", "default", "Replicate the metadata store's log over QUIC, then rotate the release signing key.", "Its steps are out on subagents; I'll check each as it comes back.");
+  lead.tasks = [sub("tl-h0", "Rotate the signing key", t + 30 * 60_000, { summary: "Signing kiln-x86_64-linux" })];
+  const s1 = member("tree-s1", "claude", "agent:metal-ryzen-01", "Leader election over QUIC", "running", "default", "Step 2 of 5 of the plan \u201cReplicated log\u201d: Leader election over QUIC", "Electing a leader across three nodes.", {
+    parent: "tree-lead",
+    subagent: true,
+    doing: "Running cargo test -p hyper-raft election",
+  });
+  s1.info.created_at = t + 60_000;
+  s1.tasks = [
+    sub("ts1-a", "Check vote timeouts", t + 25 * 60_000, { summary: "Reading src/raft/vote.rs", last_tool: "Read" }),
+    sub("ts1-b", "Measure election time", t + 26 * 60_000, { status: "completed", ended: t + 30 * 60_000, summary: "Elections settle within two terms." }),
+  ];
+  const s2 = member("tree-s2", "codex", "agent:metal-epyc-01", "Follower catch-up", "waiting", "untrusted", "Step 3 of 5 of the plan \u201cReplicated log\u201d: Follower catch-up", "I'll partition a follower and let it catch up.", { parent: "tree-lead", subagent: true });
+  s2.info.created_at = t + 120_000;
+  const s3 = member("tree-s3", "claude", "agent:metal-ryzen-02", "Snapshot transfer", "running", "default", "Step 4 of 5 of the plan \u201cReplicated log\u201d: Snapshot transfer", "Streaming a snapshot to a lagging follower.", {
+    parent: "tree-lead",
+    subagent: true,
+    doing: "Streaming a 10 GB snapshot",
+  });
+  s3.info.created_at = t + 180_000;
+  const s3a = member("tree-s3a", "claude", "agent:metal-ryzen-02", "Verify the checksum", "running", "default", "Check the snapshot's checksum against the manifest.", "Hashing the snapshot.", {
+    parent: "tree-s3",
+    subagent: true,
+    doing: "Hashing snapshot-0042.bin",
+  });
+  s3a.info.created_at = t + 28 * 60_000;
+  s3a.tasks = [sub("ts3a-a", "Re-read the manifest", t + 29 * 60_000, { last_tool: "Read" })];
+  for (const m of [lead, s1, s2, s3, s3a]) {
+    leaves(m);
+    family.set(m.info.id, m);
+  }
+}
 /** What each of them asks, and what it does meanwhile: asked again by `POST /api/mock/asks` (so each browser test starts from it). */
 const ASKS: [string, Approval, string][] = [
   ["ask-s2", askS2, "Asking you a question"],
@@ -809,14 +872,36 @@ const ASKS: [string, Approval, string][] = [
   ["ask-own", askDocs, "Waiting for your approval"],
 ];
 function askAll(told = true) {
+  treeAsks(false, told);
   forgetMarks(ASKS.map(([, ap]) => ap.id));
   for (const [id, ap, doing] of ASKS) {
     const m = family.get(id);
     if (!m) continue;
     m.approval = ap;
-    m.info.approvals = [{ id: ap.id, tool: ap.tool, tool_name: ap.tool_name, title: ap.title, at: ap.at }];
+    m.info.approvals = [{ id: ap.id, tool: ap.tool, tool_name: ap.tool_name, title: ap.title, at: ap.at, agent: ap.agent ?? undefined }];
     m.info.status = "waiting";
     m.info.doing = doing;
+    if (told) tell(m);
+  }
+}
+/**
+ * The tree's own requests (tree-lead's subagent's and tree-s2's): asked by `POST /api/mock/tree-asks`
+ * for the tests of the subagent tree, and taken back by `POST /api/mock/asks`, so no other test has
+ * their cards over its page.
+ */
+const TREE_ASKS: [string, Approval, string, AgentInfo["status"], string][] = [
+  ["tree-s2", treeAsk, "Waiting for your approval", "running", "Partitioning a follower at index 2,000"],
+  ["tree-lead", treeLeadAsk, "Waiting for your approval", "idle", ""],
+];
+function treeAsks(on: boolean, told = true) {
+  forgetMarks(TREE_ASKS.map(([, ap]) => ap.id));
+  for (const [id, ap, asking, status, doing] of TREE_ASKS) {
+    const m = family.get(id);
+    if (!m) continue;
+    m.approval = on ? ap : undefined;
+    m.info.approvals = on ? [{ id: ap.id, tool: ap.tool, tool_name: ap.tool_name, title: ap.title, at: ap.at, agent: ap.agent ?? undefined }] : [];
+    m.info.status = on ? "waiting" : status;
+    m.info.doing = on ? asking : doing;
     if (told) tell(m);
   }
 }
@@ -1524,6 +1609,11 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
   const all = () => [...familyInfos(), ...others()];
   if (p === "/api/mock/asks" && m === "POST") {
     askAll();
+    json(res, 200, {});
+    return true;
+  }
+  if (p === "/api/mock/tree-asks" && m === "POST") {
+    treeAsks(true);
     json(res, 200, {});
     return true;
   }

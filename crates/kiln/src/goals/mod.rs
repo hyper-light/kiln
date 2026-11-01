@@ -3053,7 +3053,7 @@ mod tests {
         assert!(matches!(decide(&stack(vec![working]), Some(&info(Status::Running, None)), LATER, false, false), Next::Wait));
         // Waiting on you, or with something in its queue: not reminded.
         let mut asking = info(Status::Idle, None);
-        asking.approvals = vec![ApprovalBrief { id: "p1".into(), tool: ToolKind::Shell, tool_name: "Bash".into(), title: "cargo test".into(), at: 1 }];
+        asking.approvals = vec![ApprovalBrief { id: "p1".into(), tool: ToolKind::Shell, tool_name: "Bash".into(), title: "cargo test".into(), at: 1, agent: None }];
         assert!(matches!(decide(&native, Some(&asking), LATER, false, false), Next::Wait));
         let mut queued = info(Status::Idle, None);
         queued.queued = 1;

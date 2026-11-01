@@ -5,4 +5,8 @@
  * A native subagent as lists show it. Its work still belongs to its harness's task, not a
  * separate kiln session, so this is tracking only and carries no execution settings or output.
  */
-export type SubagentBrief = { id: string, tool_id?: string, description: string, status: string, parent_task?: string, started: number, ended?: number, };
+export type SubagentBrief = { id: string, tool_id?: string, description: string, status: string, parent_task?: string, started: number, ended?: number, 
+/**
+ * What it's doing now, in a line (`Task::last_tool`): where it is, not what it made.
+ */
+last_tool?: string, };

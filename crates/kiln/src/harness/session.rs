@@ -153,6 +153,11 @@ pub struct ApprovalBrief {
     pub tool_name: String,
     pub title: String,
     pub at: i64,
+    /// The subagent that asks, as its request names it (`Approval::agent`): a list says whose it
+    /// is without the agent's whole state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub agent: Option<String>,
 }
 
 /// A native subagent as lists show it. Its work still belongs to its harness's task, not a
@@ -173,6 +178,10 @@ pub struct SubagentBrief {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub ended: Option<i64>,
+    /// What it's doing now, in a line (`Task::last_tool`): where it is, not what it made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub last_tool: Option<String>,
 }
 
 impl SubagentBrief {
@@ -188,6 +197,7 @@ impl SubagentBrief {
                 parent_task: t.parent_task.clone(),
                 started: t.started,
                 ended: t.ended,
+                last_tool: t.last_tool.as_deref().map(|s| super::model::clip_middle(s, 200).0),
             })
             .collect()
     }
@@ -455,7 +465,7 @@ impl Info {
         self.approvals = s
             .approvals
             .iter()
-            .map(|a| ApprovalBrief { id: a.id.clone(), tool: a.tool, tool_name: a.tool_name.clone(), title: a.title.clone(), at: a.at })
+            .map(|a| ApprovalBrief { id: a.id.clone(), tool: a.tool, tool_name: a.tool_name.clone(), title: a.title.clone(), at: a.at, agent: a.agent.clone() })
             .collect();
         self.queued = s.queue.len();
         self.queue = s.queue.iter().map(|q| super::queued::Queued::of(&q.id, &q.text)).collect();
@@ -4117,6 +4127,54 @@ mod tests {
         info.apply(&st);
         assert!(st.todos.is_empty(), "{:?}", st.todos);
         assert_eq!((info.todos_done, info.todos_total), (0, 0), "nothing left open for keep-going to count");
+    }
+
+    /// A list says what each of its harness's own subagents is doing (a line), never what it
+    /// reported, and which subagent asks each request: Mission control's subagent tree draws from
+    /// the list, not the agent's whole state.
+    #[test]
+    fn a_list_says_what_each_subagent_does_and_which_subagent_asks() {
+        use super::super::model::{Approval, State, Task, ToolKind};
+        use super::Info;
+        let long = "x".repeat(500);
+        let task = |id: &str, status: &str, last: Option<&str>, summary: Option<&str>| Task {
+            id: id.into(),
+            description: format!("sub {id}"),
+            status: status.into(),
+            class: Some("agent".into()),
+            last_tool: last.map(str::to_owned),
+            summary: summary.map(str::to_owned),
+            ..Task::default()
+        };
+        let ask = Approval {
+            id: "ap1".into(),
+            tool_id: Some("toolu_1".into()),
+            tool_name: "Bash".into(),
+            tool: ToolKind::Shell,
+            title: "cargo test".into(),
+            detail: None,
+            input: serde_json::Value::Null,
+            command: Some("cargo test".into()),
+            cwd: "/w".into(),
+            diffs: Vec::new(),
+            reason: None,
+            always: Vec::new(),
+            default_to_no: false,
+            questions: Vec::new(),
+            plan: None,
+            agent: Some("a1".into()),
+            at: 5,
+        };
+        let st = State { tasks: vec![task("a1", "running", Some("Read src/raft/vote.rs"), None), task("a2", "completed", Some(&long), Some(&long))], approvals: vec![ask], ..State::default() };
+        let mut info = Info::default();
+        info.apply(&st);
+        let brief = |id: &str| info.subagents.iter().find(|b| b.id == id);
+        assert_eq!(brief("a1").and_then(|b| b.last_tool.as_deref()), Some("Read src/raft/vote.rs"));
+        let clipped = brief("a2").and_then(|b| b.last_tool.as_deref()).map_or(0, str::len);
+        assert!(clipped > 0 && clipped < long.len(), "what it's doing is clipped to a line: {clipped}");
+        let encoded = serde_json::to_value(brief("a2")).unwrap_or_default();
+        assert!(encoded.get("summary").is_none(), "what it reported stays out of the list: {encoded}");
+        assert_eq!(info.approvals.first().and_then(|a| a.agent.as_deref()), Some("a1"));
     }
 
     /// Into Devin, Antigravity or another ACP agent too: named by its own modes (kiln's Ask and
