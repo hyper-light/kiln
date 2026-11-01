@@ -198,3 +198,37 @@ test("the file is edited where it's shown: kiln's colours, run: as bash; typing 
   await expect(page.locator(".cm-tooltip, [role=dialog]")).toHaveCount(0);
   expect(await sideways(page)).toBe(0);
 });
+
+test("the plan for each event: plan for: picks it, a picked job says where it would run, a draft's plan says what changes", async ({ page, isMobile }) => {
+  const pane = await openPane(page, isMobile, "hyper-light/kiln", ".kiln/ci.yaml");
+  // Its triggers, by event, the first picked.
+  const planFor = pane.locator(".jp-q");
+  await expect(planFor).toHaveText(/plan for:\s*push to main\s*·\s*pull request\s*·\s*manual/);
+  await expect(planFor.locator("button[aria-pressed=true]")).toHaveText("push to main");
+  // The picked job's machines, under its code.
+  const under = pane.locator(".ppl-problems");
+  await expect(under).toContainText("Where it would run");
+  await expect(under).toContainText("fedora, adacachy can take it now: baremetal, linux");
+  await expect(under).toContainText("2 of 2");
+  // Another event: the Plan view asks for it.
+  await planFor.getByRole("button", { name: "pull request" }).click();
+  await expect(planFor.locator("button[aria-pressed=true]")).toHaveText("pull request");
+  const asked = page.waitForRequest((r) => r.url().endsWith("/api/ci/plan-preview") && (r.postDataJSON() as { event?: unknown }).event === "pull_request");
+  await pane.locator(".ppl-detail").getByRole("tab", { name: "Plan" }).click();
+  await asked;
+  await expect(pane.locator(".ppl-detail .ppl-lines li")).toHaveCount(5);
+  // A job typed in: the plan for a push to main says what's new, and the rest as on main (pl-3).
+  await planFor.getByRole("button", { name: "push to main" }).click();
+  await pane.locator(".ppl-detail").getByRole("tab", { name: "YAML" }).click();
+  await pane.locator(".ppl-detail .cm-scroller").evaluate((e) => (e.scrollTop = e.scrollHeight));
+  await pane.locator(".ppl-detail .cm-line").last().click();
+  await page.keyboard.press("End");
+  await page.keyboard.insertText("\n  helm-lint:\n    runs-on: [baremetal, linux]\n    steps:\n      - uses: kiln/checkout@v1\n");
+  await expect(under).toContainText("Plan for a push to main");
+  await expect(under.locator("li[data-mark=added]")).toHaveText(/helm-lint, a new job: 1 leg, on fedora or adacachy \(baremetal, linux\)\s*\+1 job/);
+  await expect(under.locator("li[data-mark=same]")).toContainText("the other 5 jobs and 7 legs as on main");
+  // The Plan view says the same, against what's published.
+  await pane.locator(".ppl-detail").getByRole("tab", { name: "Plan" }).click();
+  await expect(pane.locator(".ppl-detail .ppl-lines li[data-mark=added]")).toContainText("helm-lint, a new job");
+  expect(await sideways(page)).toBe(0);
+});

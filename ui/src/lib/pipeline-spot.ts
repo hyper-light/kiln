@@ -94,3 +94,33 @@ export function spotOf(text: string, line: { key: string; kind: string }): Spot 
   // kiln's dialect writes GitHub's `workflow_dispatch` as `manual:` (W02-R06).
   return spotAt(text, doc.contents, path) ?? (key === "on.workflow_dispatch" ? spotAt(text, doc.contents, ["on", "manual"]) : null);
 }
+
+/** A manual trigger's input (GitHub's workflow_dispatch, kiln's `manual:`), as Run asks for it (W29-R14). */
+export interface ManualInput {
+  name: string;
+  /** boolean, choice, number, environment or string (GitHub's five). */
+  type: string;
+  default: string | null;
+  options: string[];
+  required: boolean;
+  description: string | null;
+}
+
+/** A workflow's manual inputs, in the file's order: none where it has no manual trigger, or isn't YAML yet. */
+export function manualInputs(text: string): ManualInput[] {
+  const doc = parseDocument(text);
+  if (doc.errors.length) return [];
+  const on = doc.toJS() as { on?: unknown } | null;
+  const triggers = on?.on;
+  if (!triggers || typeof triggers !== "object" || Array.isArray(triggers)) return [];
+  const t = triggers as Record<string, unknown>;
+  const manual = (t.workflow_dispatch ?? t.manual) as { inputs?: Record<string, Record<string, unknown> | null> } | null | undefined;
+  return Object.entries(manual?.inputs ?? {}).map(([name, i]) => ({
+    name,
+    type: String(i?.type ?? "string"),
+    default: i?.default === undefined || i?.default === null ? null : String(i.default),
+    options: Array.isArray(i?.options) ? i.options.map(String) : [],
+    required: i?.required === true,
+    description: typeof i?.description === "string" ? i.description : null,
+  }));
+}

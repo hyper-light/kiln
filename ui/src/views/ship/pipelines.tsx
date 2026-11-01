@@ -8,8 +8,8 @@
  * effects.
  */
 import * as React from "react";
-import { ChevronDown, FileText, Plus, Tag } from "lucide-react";
-import { ci, type CiDiagnostic } from "@/api/ci";
+import { ChevronDown, FileText, Minus, Plus, Tag } from "lucide-react";
+import { ci, type CiDiagnostic, type CiPreview } from "@/api/ci";
 import { shipApi, type ShipPipelineAct, type ShipPipelineGroup, type ShipPipelineLine, type ShipPipelinePane, type ShipPipelineRepo, type ShipPipelineRow, type ShipPipelineVerb } from "@/api/ship";
 import type { Diagnostic } from "@/components/code/editor";
 import { Toks } from "@/components/code/highlighted";
@@ -19,7 +19,8 @@ import { EmptyState, PageIntro } from "@/components/ui/misc";
 import { JourneyStrip, StatusGlyph } from "@/components/ui/status-glyph";
 import { GLYPHS, PIPELINE_STAGES, type GlyphState, type Pip } from "@/components/ui/status-glyph-spec";
 import { errorMessage, useMediaQuery } from "@/lib/hooks";
-import { spotOf, type Spot } from "@/lib/pipeline-spot";
+import { jobsOf, planLines, whereWords, type PlanJob, type PlanLine } from "@/lib/plan-diff";
+import { manualInputs, spotOf, type Spot } from "@/lib/pipeline-spot";
 import { Link, useSearchParams } from "@/lib/router";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { relativeTime } from "@/lib/format";
@@ -403,11 +404,40 @@ function viewsFor(p: ShipPipelinePane, l: ShipPipelineLine | null): string[] {
   }
 }
 
-/** The event a workflow's plan is for: its picked trigger's, else its first. */
-function eventOf(p: ShipPipelinePane, l: ShipPipelineLine | null): string | null {
-  const triggers = p.groups.find((g) => g.name === "Triggers")?.lines ?? [];
-  const t = l?.kind === "trigger" ? l : triggers[0];
-  return t ? t.key.replace(/^on\./, "") : null;
+/** What a plan is asked for (W29-R07): its event, in the strip's words, and the text it's set against (a draft's published file, or the text typed over). */
+interface PlanAsk {
+  event: string | null;
+  words: string | null;
+  base: string | null;
+}
+
+/** A trigger's event, as the preview takes it (kiln's `manual:` is GitHub's workflow_dispatch). */
+const eventKey = (t: ShipPipelineLine) => t.key.replace(/^on\./, "");
+
+/** A trigger as "plan for:" says it: a push to its branch, else its event's words. */
+function eventWords(t: ShipPipelineLine): string {
+  const branch = /(?:^|· )branches ([^,·]+)/.exec(t.value)?.[1]?.trim();
+  return t.name === "push" && branch ? `push to ${branch}` : t.name;
+}
+
+/** The plan of `text` for `event` (W04-R29's preview); a manual run's with its inputs' defaults. */
+function planOf(pane: ShipPipelinePane, text: string, event: string | null): Promise<CiPreview> {
+  const inputs = Object.fromEntries(manualInputs(text).flatMap((i) => (i.default === null ? [] : [[i.name, i.default]])));
+  const ev = event === "workflow_dispatch" ? { name: event, inputs } : event;
+  return ci.preview({ repo: pane.repo, path: pane.head.path, content: text, ...(ev ? { event: ev } : {}) });
+}
+
+/** The published text's plans, asked once each while the page is open: they don't change as you type. */
+const basePlans = new Map<string, Promise<CiPreview>>();
+function basePlanOf(pane: ShipPipelinePane, base: string, event: string | null): Promise<CiPreview> {
+  const key = `${pane.repo}\0${pane.head.path}\0${event ?? ""}\0${hashOf(base)}`;
+  let had = basePlans.get(key);
+  if (!had) {
+    had = planOf(pane, base, event);
+    had.catch(() => basePlans.delete(key));
+    basePlans.set(key, had);
+  }
+  return had;
 }
 
 /** An opened workflow or action (W29-R04): its head, the strip, its groups, and the picked line's detail beside them (under its line on a phone). */
@@ -435,6 +465,29 @@ function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: S
   const at = picked && lines.some((l) => l.key === picked) ? picked : firstPick(p);
   const line = lines.find((l) => l.key === at) ?? null;
   const groupOf = (k: Key) => p.groups.find((g) => g.lines.some((l) => l.key === k))?.name ?? "";
+  // The plan is for one of its triggers' events (W29-R07): a picked trigger's, else the one "plan for:" picks, else its first.
+  const workflow = ["workflow", "reusable"].includes(h.kind);
+  const triggers = p.groups.find((g) => g.name === "Triggers")?.lines ?? [];
+  const [planFor, setPlanFor] = React.useState<string | null>(null);
+  const event = line?.kind === "trigger" ? eventKey(line) : planFor && triggers.some((t) => eventKey(t) === planFor) ? planFor : triggers[0] ? eventKey(triggers[0]) : null;
+  const pickEvent = (e: string) => {
+    setPlanFor(e);
+    if (line?.kind === "trigger") setPicked(`on.${e}`);
+    setSaid(null);
+  };
+  // What its plan is set against: a draft's published file (none for a new one), or the published text typed over.
+  const published = useSuspenseResource(
+    `ship/pipeline-base/${repo.repo}/${row.path}/${draft ?? ""}`,
+    (s) => (draft ? shipApi.pipeline(repo.repo, row.path, {}, s).catch(() => null) : Promise.resolve(null)),
+    {
+      on: PIPELINE_EVENTS,
+    },
+  ).data;
+  const ask: PlanAsk = {
+    event,
+    words: triggers.find((t) => eventKey(t) === event) ? eventWords(triggers.find((t) => eventKey(t) === event) as ShipPipelineLine) : null,
+    base: draft ? (published?.detail.text ?? null) : changed ? p.detail.text : null,
+  };
   const where = [h.path, h.dialect ? `${DIALECT_WORD[h.dialect] ?? h.dialect} dialect` : `${KIND_WORD[h.kind] ?? h.kind} action`, h.ref, h.commit.slice(0, 7)].filter(Boolean).join(" · ");
   const act = async (body: Omit<ShipPipelineAct, "repo" | "path">, done: React.ReactNode): Promise<boolean> => {
     setBusy(true);
@@ -456,7 +509,7 @@ function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: S
     switch (v.verb) {
       case "run":
         return void act(
-          { verb: "run", ...(eventOf(p, line) ? { event: eventOf(p, line) ?? undefined } : {}) },
+          { verb: "run", ...(event ? { event } : {}) },
           <>
             Running <b>{h.title}</b>.
           </>,
@@ -525,7 +578,7 @@ function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: S
     setArmed(null);
   };
   const editable = p.strip.verbs.some((v) => v.verb === "save_draft" && v.enabled);
-  const detail = <Detail key={at ?? "file"} pane={p} line={line} text={text} onText={edit} editable={editable} rows={phone ? PHONE_ROWS : SIDE_ROWS} />;
+  const detail = <Detail key={`${at ?? "file"}|${event ?? ""}`} pane={p} line={line} text={text} onText={edit} editable={editable} ask={ask} rows={phone ? PHONE_ROWS : SIDE_ROWS} />;
   // On a phone, the picked line's detail is right under it, as the approved stills draw it.
   const below = (k: Key) => (phone && k === at ? <li className="jp-detail">{detail}</li> : null);
   return (
@@ -543,17 +596,31 @@ function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: S
             <div className="jp-said" aria-live="polite">
               {say}
             </div>
-            <div className="jp-q">
-              <span>pick:</span>
-              {p.strip.pick.map((w, i) => (
-                <React.Fragment key={w}>
-                  {i ? <span aria-hidden>·</span> : null}
-                  <button type="button" aria-pressed={w === "all"}>
-                    {w}
-                  </button>
-                </React.Fragment>
-              ))}
-            </div>
+            {workflow && triggers.length ? (
+              <div className="jp-q">
+                <span>plan for:</span>
+                {triggers.map((t, i) => (
+                  <React.Fragment key={t.key}>
+                    {i ? <span aria-hidden>·</span> : null}
+                    <button type="button" aria-pressed={eventKey(t) === event} onClick={() => pickEvent(eventKey(t))}>
+                      {eventWords(t)}
+                    </button>
+                  </React.Fragment>
+                ))}
+              </div>
+            ) : (
+              <div className="jp-q">
+                <span>pick:</span>
+                {p.strip.pick.map((w, i) => (
+                  <React.Fragment key={w}>
+                    {i ? <span aria-hidden>·</span> : null}
+                    <button type="button" aria-pressed={w === "all"}>
+                      {w}
+                    </button>
+                  </React.Fragment>
+                ))}
+              </div>
+            )}
           </div>
           <div className="jp-verbs ppl-verbs" data-armed={armed ? true : undefined}>
             {verbs.map((v) => (
@@ -607,7 +674,23 @@ function PaneLine({ line, at, onLine }: { line: ShipPipelineLine; at: boolean; o
 }
 
 /** The picked line's detail (W29-R04): its name and the file's, its views, and the view shown. */
-function Detail({ pane, line, text, onText, editable, rows }: { pane: ShipPipelinePane; line: ShipPipelineLine | null; text: string; onText: (t: string) => void; editable: boolean; rows: number }) {
+function Detail({
+  pane,
+  line,
+  text,
+  onText,
+  editable,
+  ask,
+  rows,
+}: {
+  pane: ShipPipelinePane;
+  line: ShipPipelineLine | null;
+  text: string;
+  onText: (t: string) => void;
+  editable: boolean;
+  ask: PlanAsk;
+  rows: number;
+}) {
   const views = viewsFor(pane, line);
   const [view, setView] = React.useState(views[0] ?? "YAML");
   const shown = views.includes(view) ? view : (views[0] ?? "YAML");
@@ -626,7 +709,7 @@ function Detail({ pane, line, text, onText, editable, rows }: { pane: ShipPipeli
       </div>
       <div className="ppl-dbody" style={{ "--rows": rows } as React.CSSProperties}>
         <Loadable label={`Loading ${shown}`} fallback={<Loading label={`Loading ${shown}`} block className="ppl-slot" />}>
-          <View view={shown} pane={pane} line={line} text={text} onText={onText} editable={editable} rows={rows} />
+          <View view={shown} pane={pane} line={line} text={text} onText={onText} editable={editable} ask={ask} rows={rows} />
         </Loadable>
       </div>
     </div>
@@ -640,6 +723,7 @@ function View({
   text,
   onText,
   editable,
+  ask,
   rows,
 }: {
   view: string;
@@ -648,16 +732,17 @@ function View({
   text: string;
   onText: (t: string) => void;
   editable: boolean;
+  ask: PlanAsk;
   rows: number;
 }) {
   const h = pane.head;
   switch (view) {
     case "YAML":
-      return editable ? <YamlView pane={pane} line={line} text={text} onText={onText} /> : <CodeView text={text} path={h.path} spot={line ? spotOf(text, line) : null} rows={rows} />;
+      return editable ? <YamlView pane={pane} line={line} text={text} onText={onText} ask={ask} /> : <CodeView text={text} path={h.path} spot={line ? spotOf(text, line) : null} rows={rows} />;
     case "Flow":
       return <FlowView repo={pane.repo} text={text} onChange={onText} />;
     case "Plan":
-      return <PlanView pane={pane} text={text} event={eventOf(pane, line)} />;
+      return <PlanView pane={pane} text={text} ask={ask} />;
     case "Try it":
       return <TryPane repo={pane.repo} path={h.path} gitRef={h.ref} text={text} blocked={text !== pane.detail.text} />;
     case "Last run":
@@ -705,17 +790,25 @@ function offsetOf(text: string, at: { line: number; col: number }): number {
  * it's saved. Checked 300 ms after typing stops; its errors and warnings sit under it, each with its
  * fix, never in a popup.
  */
-function YamlView({ pane, line, text, onText }: { pane: ShipPipelinePane; line: ShipPipelineLine | null; text: string; onText: (t: string) => void }) {
+function YamlView({ pane, line, text, onText, ask }: { pane: ShipPipelinePane; line: ShipPipelineLine | null; text: string; onText: (t: string) => void; ask: PlanAsk }) {
   const h = pane.head;
   const syntax = syntaxOf(h);
   const [problems, setProblems] = React.useState<CiDiagnostic[]>([]);
+  // The text's plan for the strip's event, with the base's when it differs: asked as the text is checked.
+  const [plan, setPlan] = React.useState<{ now: PlanJob[]; was: PlanJob[] | null } | null>(null);
+  const workflow = ["workflow", "reusable"].includes(h.kind);
   const editor = React.useRef<Editor>(null);
   const lint = async (t: string): Promise<Diagnostic[]> => {
     if (syntax !== "workflow") return [];
     try {
-      const r = await ci.validate(fileOf(h), t, pane.repo);
+      const [r, now, was] = await Promise.all([
+        ci.validate(fileOf(h), t, pane.repo),
+        workflow ? planOf(pane, t, ask.event).catch(() => null) : null,
+        workflow && ask.base !== null ? basePlanOf(pane, ask.base, ask.event).catch(() => null) : null,
+      ]);
       const shown = r.diagnostics.filter((d) => d.severity === "error" || d.severity === "warning");
       setProblems(shown);
+      setPlan(now?.plan ? { now: jobsOf(now.plan), was: ask.base === null ? null : was?.plan ? jobsOf(was.plan) : [] } : null);
       return shown.map((d) => {
         const from = offsetOf(t, d.range.start);
         return { from, to: Math.max(from + 1, offsetOf(t, d.range.end)), severity: d.severity === "error" ? "error" : "warning", message: d.message };
@@ -725,6 +818,10 @@ function YamlView({ pane, line, text, onText }: { pane: ShipPipelinePane; line: 
       return [];
     }
   };
+  // Under the code: a picked job's machines, and a draft's plan against the published one's (pl-2, pl-3).
+  const job = line?.kind === "job" ? line.key.replace(/^jobs\./, "") : null;
+  const where = job ? (plan?.now.find((j) => j.job === job) ?? null) : null;
+  const changes = plan?.was ? planLines(plan.now, plan.was, h.ref) : null;
   const fix = (d: CiDiagnostic) => {
     const v = editor.current;
     if (!v || !d.fix) return;
@@ -745,12 +842,12 @@ function YamlView({ pane, line, text, onText }: { pane: ShipPipelinePane; line: 
           editor.current = v;
         }}
       />
-      <div className="ppl-problems" aria-label="Problems">
+      <div className="ppl-problems">
         <div className="jp-g">
           <span>Problems</span>
           <span>{problems.length || "none"}</span>
         </div>
-        <ul className="ppl-lines">
+        <ul className="ppl-lines" aria-label="Problems">
           {problems.map((d, i) => (
             <li key={`${d.code}-${d.range.start.line}-${i}`} data-severity={d.severity}>
               <StatusGlyph state={d.severity === "error" ? "failed" : "flag"} size={12} />
@@ -768,6 +865,30 @@ function YamlView({ pane, line, text, onText }: { pane: ShipPipelinePane; line: 
             </li>
           ))}
         </ul>
+        {where ? (
+          <>
+            <div className="jp-g">
+              <span>Where it would run</span>
+              <span />
+            </div>
+            <ul className="ppl-lines">
+              <li>
+                <StatusGlyph state={where.runners.length ? "passed" : "blocked"} size={12} />
+                <span className="n">{where.runners.length ? `${where.runners.join(", ")} can take it now${where.labels.length ? `: ${where.labels.join(", ")}` : ""}` : whereWords(where)}</span>
+                <span className="v">{where.of ? `${where.runners.length} of ${where.of}` : ""}</span>
+              </li>
+            </ul>
+          </>
+        ) : null}
+        {changes ? (
+          <>
+            <div className="jp-g">
+              <span>Plan for {ask.words ? `a ${ask.words}` : "its event"}</span>
+              <span />
+            </div>
+            <PlanList lines={changes} />
+          </>
+        ) : null}
       </div>
     </div>
   );
@@ -854,32 +975,32 @@ function hashOf(text: string): string {
   return h.toString(16);
 }
 
-/** The plan for an event (W04-R29's preview of the text): each job, its legs and where they'd run. */
-function PlanView({ pane, text, event }: { pane: ShipPipelinePane; text: string; event: string | null }) {
-  const plan = useSuspenseResource(`ci/plan-preview/${pane.repo}/${pane.head.path}/${event ?? ""}/${hashOf(text)}`, () =>
-    ci.preview({ repo: pane.repo, path: pane.head.path, content: text, ...(event ? { event } : {}) }),
-  ).data;
-  if (!plan.plan) return <p className="ppl-empty">{plan.why ?? "It plans nothing for this event."}</p>;
-  const jobs = [...new Set(plan.plan.legs.map((l) => l.job))];
+/** The plan for the strip's event (W04-R29's preview of the text): each job, its legs and where they'd run; a draft's against what's published. */
+function PlanView({ pane, text, ask }: { pane: ShipPipelinePane; text: string; ask: PlanAsk }) {
+  const key = `${pane.repo}/${pane.head.path}/${ask.event ?? ""}`;
+  const now = useSuspenseResource(`ci/plan-preview/${key}/${hashOf(text)}`, () => planOf(pane, text, ask.event)).data;
+  const was = useSuspenseResource(`ci/plan-base/${key}/${ask.base === null ? "-" : hashOf(ask.base)}`, () => (ask.base === null ? Promise.resolve(null) : basePlanOf(pane, ask.base, ask.event))).data;
+  if (!now.plan) return <p className="ppl-empty">{now.why ?? "It plans nothing for this event."}</p>;
+  return <PlanList lines={planLines(jobsOf(now.plan), ask.base === null ? null : was?.plan ? jobsOf(was.plan) : [], pane.head.ref)} label={`Its plan for ${ask.words ?? "its event"}`} />;
+}
+
+/** A plan's lines: a job new, gone, changed or as it was, each with its words and its count. */
+function PlanList({ lines, label }: { lines: PlanLine[]; label?: string }) {
   return (
-    <ul className="ppl-lines" aria-label={`Its plan for ${event ?? "its event"}`}>
-      {jobs.map((j) => {
-        const legs = plan.plan?.legs.filter((l) => l.job === j) ?? [];
-        const can = [...new Set(legs.flatMap((l) => (l.routing?.runners ?? []).filter((r) => r.eligible && r.connected).map((r) => r.name)))];
-        return (
-          <li key={j}>
-            <StatusGlyph state="passed" size={12} />
-            <span className="n">
-              <em>job</em>
-              {j}
-            </span>
-            <span className="v">
-              {legs.length === 1 ? "1 leg" : `${legs.length} legs`}
-              {can.length ? ` · ${can.join(", ")}` : ""}
-            </span>
-          </li>
-        );
-      })}
+    <ul className="ppl-lines" aria-label={label}>
+      {lines.map((l) => (
+        <li key={l.key} data-mark={l.mark}>
+          {l.mark === "added" ? (
+            <Plus size={12} aria-hidden="true" />
+          ) : l.mark === "removed" ? (
+            <Minus size={12} aria-hidden="true" />
+          ) : (
+            <StatusGlyph state={l.mark === "changed" ? "changes" : "passed"} size={12} />
+          )}
+          <span className="n">{l.text}</span>
+          <span className="v">{l.value}</span>
+        </li>
+      ))}
     </ul>
   );
 }

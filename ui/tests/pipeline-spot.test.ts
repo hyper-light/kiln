@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { spotOf } from "../src/lib/pipeline-spot.ts";
+import { manualInputs, spotOf } from "../src/lib/pipeline-spot.ts";
 
 const CI = `name: ci
 on:
@@ -66,4 +66,19 @@ runs:
   assert.deepEqual(spotOf(action, { key: "inputs.targets", kind: "input" }), { from: 4, to: 4 });
   assert.deepEqual(spotOf(action, { key: "runs.steps.1", kind: "step" }), { from: 9, to: 10 });
   assert.deepEqual(spotOf(action, { key: "call.inputs.depth", kind: "input" }), null);
+});
+
+test("w29_r14_a_manual_triggers_inputs", () => {
+  const smoke =
+    "on:\n  push: {}\n  manual:\n    inputs:\n      target: { type: choice, options: [staging, production], default: staging }\n      depth: { type: number, default: 3, required: true }\n      dry: { description: only say it }\n";
+  assert.deepEqual(manualInputs(smoke), [
+    { name: "target", type: "choice", default: "staging", options: ["staging", "production"], required: false, description: null },
+    { name: "depth", type: "number", default: "3", options: [], required: true, description: null },
+    { name: "dry", type: "string", default: null, options: [], required: false, description: "only say it" },
+  ]);
+  assert.deepEqual(manualInputs("on:\n  workflow_dispatch:\n    inputs:\n      go: { type: boolean, default: true }\n"), [
+    { name: "go", type: "boolean", default: "true", options: [], required: false, description: null },
+  ]);
+  assert.deepEqual(manualInputs("on: [push]\n"), []);
+  assert.deepEqual(manualInputs("on: [push\n"), []);
 });

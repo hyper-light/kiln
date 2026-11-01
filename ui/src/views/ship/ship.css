@@ -1631,7 +1631,7 @@
 /* The file edited in place (W29-R05): the editor over its problems, one height between them. */
 .ppl-yaml {
   display: grid;
-  grid-template-rows: minmax(0, 1fr) 96px;
+  grid-template-rows: minmax(0, 1fr) 132px;
 }
 /* W21's editor holds 420px at the least (index.css); here it's its frame's height. */
 .ppl-yaml .code-editor,
