@@ -721,17 +721,7 @@ mod imp {
     }
 
     pub fn groups(escapes: bool) -> Vec<Group> {
-        let mut out = Vec::new();
-        if let Some(dir) = crate::os::contain::agents_dir()
-            && let Ok(rd) = fs::read_dir(&dir)
-        {
-            for e in rd.flatten() {
-                if e.path().is_dir() {
-                    let name = e.file_name().to_string_lossy().into_owned();
-                    out.push(Group { dir: e.path(), label: name.clone(), session: Some(name) });
-                }
-            }
-        }
+        let mut out = crate::os::contain::agents_dir().map(|dir| sessions_in(&dir)).unwrap_or_default();
         if escapes && escapes_ours() && let Some(own) = own() {
             // The user's service manager (`.../user@<uid>.service`), when the runner runs under one.
             if let Some(at) = own.find(".service/").filter(|_| own.contains("/user@")) {
@@ -763,6 +753,19 @@ mod imp {
             }
         }
         out
+    }
+
+    /// The groups in the agents' folder `dir`: each agent session's (and each `kiln run`
+    /// command's). A CI step's group there (`ci-<execution>`, U01's `crate::runner::processes`)
+    /// isn't one: CI jobs are never paced (docs/headroom.md).
+    pub(super) fn sessions_in(dir: &Path) -> Vec<Group> {
+        let Ok(rd) = fs::read_dir(dir) else { return Vec::new() };
+        rd.flatten()
+            .filter(|e| e.path().is_dir())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| !name.starts_with("ci-"))
+            .map(|name| Group { dir: dir.join(&name), label: name.clone(), session: Some(name) })
+            .collect()
     }
 
     /// A unit the desktop started for a person (an app, a terminal window, D-Bus activation): never
@@ -1453,6 +1456,22 @@ mod tests {
         assert!(!crate::os::supervise::started_by_supervisor());
         let gs = groups(true);
         assert!(gs.iter().all(|g| g.session.is_some()), "{gs:?}");
+    }
+
+    /// U01 holds a CI step's processes in a group beside the agents' (`ci-<execution>`): headroom
+    /// paces the agent sessions and `kiln run`'s commands there, never the CI step.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn u01_a_ci_step_s_group_beside_the_agents_is_never_paced() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        for name in ["01a1session", "reach-01a1", "ci-01a1step"] {
+            std::fs::create_dir(dir.path().join(name))?;
+        }
+        std::fs::write(dir.path().join("cgroup.procs"), "")?;
+        let mut paced: Vec<String> = imp::sessions_in(dir.path()).into_iter().filter_map(|g| g.session).collect();
+        paced.sort();
+        assert_eq!(paced, ["01a1session", "reach-01a1"]);
+        Ok(())
     }
 
     #[test]
