@@ -205,7 +205,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W24 | Incremental CI: fingerprints, reuse, warm state, shared caches | W04, W05, W06, W08, W13, W18 | ready | specified (2026-10-24): R01–R31, AC01–AC15; milestones M0–M7 and M1e are kiln goals with plans |
 | W26 | Review in Ship: changes as Ship items, each owning its review | W14, W23, W27, Ship (the CI/CD Integration plan) | in progress | R06–R15 built: each item's dropdown owns its review (Files and the Conversation, search on vorpal, kinds and the gate, suggestions and conflicts as revisions, the Review lanes), unsigned until W27-R03; AC06 in Chromium, not yet WebKit; specified (2026-10-25): R01–R20, AC01–AC11; plan `01a175b7d5e1772f8d3c7cb28e50ab2b` |
 | W27 | Attested end to end: identities, signatures, hand-offs, the trail | W10, W18, W26 | in progress | specified (2026-10-25): R01–R12, AC01–AC08; research `01a175c54441773fa28bf1488b82e6aa`; identities built (R01, R02, R12; AC01, AC02): plan `01a17856b1b0712babf8dfd37ce48756` |
-| W29 | Pipelines in Ship: author, run, share and lock workflows and actions | W02, W03, W04, W07, W13, W14, W21, W23, W26 | in progress | specified (2026-10-31): R01–R31, AC01–AC29, S01–S17; the design approved on stills `pl-1` to `pl-9`; the read model and API built (R02, R03, R04's pane, R09's reads); plan `01a19474452d7084bae269952cc6c26a` |
+| W29 | Pipelines in Ship: author, run, share and lock workflows and actions | W02, W03, W04, W07, W13, W14, W21, W23, W26 | in progress | specified (2026-10-31): R01–R31, AC01–AC29, S01–S17; the design approved on stills `pl-1` to `pl-9`; the read model and API built (R02, R03, R04's pane, R09's reads); drafts built (R10–R14); plan `01a19474452d7084bae269952cc6c26a` |
 
 ---
 
@@ -10733,8 +10733,30 @@ Its step 3, the read model and API, is built:
   verbs (dimmed, each with its `why_not`), its groups, and its file at `ref`.
 - `ship.pipelines.list` and `.get` are operations (R09). `ui/src/api/ship.ts` has their types.
 
-Next is drafts (R10–R14, the plan's step 4). The tab (R01) and editing (R05, R06) come with the
-plan's step 7.
+Its step 4, drafts, is built (R10–R14, with R04's verbs and R09's `ship.pipelines.act`):
+- `kiln_ci::drafts` decides a draft's branch (`kiln/draft/<stem>-<id8>`), its `[skip ci]` head and
+  its Ready commit's message, GitLab's draft titles and GitHub's ready mutation. It also decides
+  what no trigger runs (`held_back`) and which `uses:` of a draft is another repository's.
+- Save draft (R11) is `ci.workflows.edit` with `draft: true`. On a repository kiln hosts it's a
+  draft diff, and a later save is that diff's next version. On a host it's a branch of its own,
+  each commit saying `[skip ci]`, with a draft change (`githost::open_change`'s `draft`). Each is
+  recorded in `ci_pipeline_drafts`.
+- No trigger runs a draft, and no other repository uses one (R10). Nothing runs on a draft's
+  branch, and the plan preview says why. A draft diff doesn't run its own workflow. Another
+  repository's `uses:` of a draft's ref, or of a commit only a draft reaches, fails its run before
+  any job (`KCI4023`).
+- Ready (R12) and Discard (R13) are verbs of `POST /api/ship/pipelines`. On a host, Ready commits
+  the same tree again asking to skip nothing, then marks the change ready
+  (`githost::ready_change`); Discard closes the change and deletes its branch.
+- Run (R14): `ci.runs.trigger` gains `sha`, `event`, `jobs` and `draft`. A draft runs as its
+  author's test, as the run of a commit of its own (`runs.draft` marks it). It reports no status
+  to its change, and a job naming an environment stops before it deploys.
+- Ship shows each draft as a row of its own with DRAFT and its state's word, and opens its pane
+  (`draft=`). Each pane's verbs are the viewer's (`verbs_for`).
+
+Not built yet: New (R08); GitHub's own dispatch where GitHub is the provider (R14); turning a
+workflow off and on (R15). The Kiln PRs agent has the `githost` changes to answer. Next is sharing
+(R17–R20, the plan's step 5). The tab (R01) and editing (R05, R06) come with the plan's step 7.
 
 ## 4. API, events, CLI and MCP reference
 
