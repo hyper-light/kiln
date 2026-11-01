@@ -205,7 +205,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W24 | Incremental CI: fingerprints, reuse, warm state, shared caches | W04, W05, W06, W08, W13, W18 | ready | specified (2026-10-24): R01–R31, AC01–AC15; milestones M0–M7 and M1e are kiln goals with plans |
 | W26 | Review in Ship: changes as Ship items, each owning its review | W14, W23, W27, Ship (the CI/CD Integration plan) | in progress | R06–R15 built: each item's dropdown owns its review (Files and the Conversation, search on vorpal, kinds and the gate, suggestions and conflicts as revisions, the Review lanes), unsigned until W27-R03; AC06 in Chromium, not yet WebKit; specified (2026-10-25): R01–R20, AC01–AC11; plan `01a175b7d5e1772f8d3c7cb28e50ab2b` |
 | W27 | Attested end to end: identities, signatures, hand-offs, the trail | W10, W18, W26 | in progress | specified (2026-10-25): R01–R12, AC01–AC08; research `01a175c54441773fa28bf1488b82e6aa`; identities built (R01, R02, R12; AC01, AC02): plan `01a17856b1b0712babf8dfd37ce48756` |
-| W29 | Pipelines in Ship: author, run, share and lock workflows and actions | W02, W03, W04, W07, W13, W14, W21, W23, W26 | in progress | specified (2026-10-31): R01–R31, AC01–AC29, S01–S17; the design approved on stills `pl-1` to `pl-9`; the read model and API built (R02, R03, R04's pane, R09's reads); drafts built (R10–R14); sharing built (R17–R20: Access, one check, the catalog, Access and Used by in Ship); plan `01a19474452d7084bae269952cc6c26a` |
+| W29 | Pipelines in Ship: author, run, share and lock workflows and actions | W02, W03, W04, W07, W13, W14, W21, W23, W26 | in progress | specified (2026-10-31): R01–R31, AC01–AC29, S01–S17; the design approved on stills `pl-1` to `pl-9`; the read model and API built (R02, R03, R04's pane, R09's reads); drafts built (R10–R14); sharing built (R17–R20: Access, one check, the catalog, Access and Used by in Ship); releases by tag and update drafts built (R21, R22); plan `01a19474452d7084bae269952cc6c26a` |
 
 ---
 
@@ -10200,7 +10200,8 @@ endpoint, for a repository kiln hosts and for one on GitHub:
     they move with `PATCH /repos/{owner}/{repo}/git/refs/tags/{tag}`.
 - **W29-R22 Update drafts for consumers.** Opt-in per consumer, from its `.kiln/config.yaml`:
   `updates: { actions: on, cooldown: 3d, group: weekly }`.
-  - `actions` is `off` unless set. `cooldown` is a duration (none unless set, as Dependabot's).
+  - `actions` is `off` unless set. `cooldown` is a duration, three days unless set, as
+    Dependabot's (whose default is three days).
     `group` is `none` (a draft per update, the default), `daily` or `weekly`.
   - When a new full version of something it uses is released, after the cooldown, kiln opens an
     update draft (W29-R10) in that repository. It moves the `uses:` refs and regenerates its locks
@@ -10526,7 +10527,7 @@ lockfile, which pins commit A. An attacker moves `v45` and `v45.0.7` to commit M
 | verb `run` (W29-R14) | `ci.runs.trigger`, grown: `sha`, `event`, `jobs` | the run |
 | verbs `turn_off`, `turn_on` (W29-R15); `POST /api/ci/repos/:repo/workflows/:path/{disable,enable}` | `ci.workflows.disable`, `ci.workflows.enable`, new | the switch, who and why |
 | verb `settings` (W29-R16, R17, R22, R26) | `ci.workflows.edit`, grown to `.kiln/config.yaml`, as a draft | the draft |
-| verb `release` (W29-R21); `POST /api/ci/repos/:repo/releases { sha, tag, major? }` | `ci.releases.tag`, new | the tag (and GitHub's release) |
+| verb `release` (W29-R21); `POST /api/ci/repos/:repo/releases { sha, tag, major?, confirm?, notes? }` | `ci.releases.tag`, new | the tag (and GitHub's release) |
 | `GET /api/ci/actions?q=&kind=&owner=&repo=` (W29-R20) | `ci.actions.list`, grown | actions and reusable workflows the caller (`repo`) may use |
 | `GET /api/ci/actions/:owner/:repo?path=` (W29-R20) | `ci.actions.get`, new | versions, access, consumers |
 | `POST /api/ci/repos/:repo/locks { ref? }` (W29-R25) | `ci.locks.update`, new | a draft of the regenerated locks |
@@ -10794,12 +10795,31 @@ Its step 5, sharing, is built (R17–R20):
 - In Ship, each repository's head says its access, and a shared one's heading says so. An
   action's pane and a reusable workflow's have Used by and the Access in Settings.
 
+Its step 6, releases by tag and update drafts, is built (R21, R22):
+- `kiln_ci::releases` decides a tag's kind, the floating tags a release moves (those it's the
+  newest stable release under: an older patch moves its `vMAJOR.MINOR`, not its `vMAJOR`), and
+  what a push may do to a tag. In a repository kiln hosts, a full version isn't moved or deleted,
+  and a name it has released (`ci_released_tags`) isn't used again. A floating version isn't
+  pushed: Release moves it. Pushes that moved floating tags before now say so.
+- Release (`ci.releases.tag`, Ship's `release` verb) makes the annotated tag and moves the
+  floating ones. On kiln that's in the repository's own git, with W14's release record. On
+  GitHub it's the tag object, its ref, the floating refs and the release. At a commit with a
+  failed check of its own, it asks again unless `confirm`. Ship's verb asks Keep · Release,
+  saying what releasing the head changes for the workflows that use it
+  (`kiln_ci::wf::action_diff`).
+- Update drafts (`ci::updates`): a release, or a new full version a mirror fetches, comes due to
+  each repository whose runs used an older one and whose `updates:` asks (`ci_pending_updates`),
+  after its cooldown. A minute's sweep opens it as a draft by kiln's updates
+  (`kiln-updates:<bucket>`), its files' `uses:` moved (`kiln_ci::updates::moved_uses`). With no
+  group, a newer release supersedes into the same draft; daily and weekly groups gather the
+  window's updates. Ship shows each as an Update row whose pane says what changes for it and
+  what changed upstream. Regenerating locks comes with locks (R25, the plan's step 8).
+
 Not built yet: New (R08); GitHub's own dispatch where GitHub is the provider (R14); turning a
 workflow off and on (R15). Sharing step 3 found two gaps. Both are closed. R10's: a draft-only commit
 pinned through a native source's plain name, or by a reusable call, was let through. R12's: a
 kiln draft's own workflow didn't start when it was marked Ready, and a GitHub-dialect one wasn't
-held while it was a draft. Next are releases and update drafts (R21, R22, the plan's step 6). The tab (R01) and editing (R05, R06) come with the plan's
-step 7.
+held while it was a draft. Next are the tab (R01) and editing (R05, R06), the plan's step 7.
 
 ## 4. API, events, CLI and MCP reference
 

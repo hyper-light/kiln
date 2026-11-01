@@ -214,6 +214,8 @@ export interface ShipPipelineVerb {
   label: string;
   enabled: boolean;
   why_not?: string;
+  /** What it asks before it acts: Release's Keep · Release, saying what it changes (W29-R21). */
+  asks?: string;
 }
 
 export interface ShipPipelineStrip {
