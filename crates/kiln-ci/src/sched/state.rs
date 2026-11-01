@@ -3767,8 +3767,10 @@ impl Scheduler {
         }
     }
 
-    /// Drops the reservations with an item no longer waiting in the queue in their class, or a
-    /// runner gone, away or draining (W05-R39).
+    /// Drops the reservations with an item no longer waiting in the queue in their class, or on a
+    /// runner that wouldn't take it now (W05-R39): gone, away or draining, or one it stays off since
+    /// it was kept (W05-R16's other runner back: room kept where it won't go held others off for
+    /// nothing, found by docs/sim.md's model).
     fn drop_stale_reservations(&mut self) {
         if self.reserved.is_empty() {
             return;
@@ -3778,7 +3780,7 @@ impl Scheduler {
             .reserved
             .iter()
             .filter(|(class, k)| {
-                !k.items.iter().all(|(leg, runner)| legs.get(leg).is_some_and(|l| l.state == State::Queued && l.key.is_some_and(|(c, _, _)| c == **class)) && runners.get(runner).is_some_and(|r| r.connected && !r.draining))
+                !k.items.iter().all(|(leg, runner)| legs.get(leg).zip(runners.get(runner)).is_some_and(|(l, r)| l.state == State::Queued && l.key.is_some_and(|(c, _, _)| c == **class) && self.admits(r, l)))
             })
             .map(|(c, _)| *c)
             .collect();

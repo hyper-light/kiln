@@ -1585,14 +1585,14 @@ impl Reference {
         }
     }
 
-    /// Room kept for a leg no longer waiting in the queue in its class, or on a runner gone, away
-    /// or draining, is dropped.
+    /// Room kept for a leg no longer waiting in the queue in its class, or on a runner that
+    /// wouldn't take it now (gone, away, draining, or one it stays off), is dropped.
     fn drop_stale(&mut self) {
         let (legs, runners) = (&self.legs, &self.runners);
         let gone: Vec<Class> = self
             .reserved
             .iter()
-            .filter(|(class, k)| !k.items.iter().all(|(leg, runner)| legs.get(leg).is_some_and(|l| matches!(&l.at, At::Queued(q) if q.class == **class)) && runners.get(runner).is_some_and(|r| r.connected && !r.draining)))
+            .filter(|(class, k)| !k.items.iter().all(|(leg, runner)| legs.get(leg).zip(runners.get(runner)).is_some_and(|(l, r)| matches!(&l.at, At::Queued(q) if q.class == **class) && self.admits(r, l))))
             .map(|(c, _)| *c)
             .collect();
         for c in gone {

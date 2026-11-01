@@ -2007,7 +2007,8 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   expected to run on and the other items kept there (EASY backfilling, Mu'alem and Feitelson); a
   grant of a class before it goes first, and the room is worked out again when next it matters.
   Elsewhere nothing changes. The room is kept until its item is granted, cancelled or no longer
-  first, its runner goes or drains, or what runs there changes under it (a runner's facts, a grant
+  first, its runner goes or drains or wouldn't take the item now (one it stays off since, as
+  W05-R16's other runner back), or what runs there changes under it (a runner's facts, a grant
   a restart rebuilds, the routing rules), and moves only to a runner where its item would fit
   sooner. Once its time passes with its item still not fitting (a grant ran past its expected end),
   nothing new goes into the room, and it's worked out again from the moved-on ends the next time it

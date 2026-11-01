@@ -2995,6 +2995,34 @@ fn w05_r39_an_exclusive_leg_reserves_its_runner_whole() {
     assert!(sim.started("long").is_some_and(|t| t >= 20 * MIN), "{:?}", sim.started("long"));
 }
 
+/// W05-R39, R16 (docs/sim.md's bug 16): a leg lost with its runner while the only other was away
+/// has its room kept on its own runner, where it may go back; once the other is back it stays off
+/// its own, and the room kept there goes with that: a leg behind it takes that runner as room
+/// frees, rather than waiting behind room kept for one that won't come.
+#[test]
+fn w05_r39_room_kept_where_its_leg_now_stays_off_is_dropped() {
+    use super::state::Class;
+    // No floors: the interactive legs go first.
+    let mut sim = Sim::new(Config { classes: Default::default(), ..backfilling(true) });
+    sim.runner(0, sized("a", 16));
+    sim.runner(0, sized("b", 16));
+    sim.leg(0, asking("z", 12, 10 * MIN), 10 * MIN);
+    sim.input(1_000, Input::RunnerLost { runner: "b".into() });
+    sim.input(2_000, Input::RunnerLost { runner: "a".into() });
+    sim.leg(3_000, LegIn { class: Class::Interactive, ..asking("y", 8, 10 * MIN) }, 10 * MIN);
+    sim.leg(3_500, asking("u", 2, MIN), MIN);
+    sim.runner(4_000, sized("a", 16));
+    sim.leg(5_000, LegIn { class: Class::Interactive, ..asking("w", 12, 30 * MIN) }, 30 * MIN);
+    sim.runner(6_000, sized("b", 16));
+    sim.leg(7_000, asking("v", 8, 20 * MIN), 20 * MIN);
+    sim.run(5 * MIN);
+    // z's room kept on a from y's end, as a came back; then b, taken by w, and z stays off a.
+    assert_eq!(reserved_at(&sim, "z").map(|(_, at)| at), Some(4_000 + 10 * MIN));
+    assert_eq!(sim.started("w"), Some(6_000));
+    assert_eq!(sim.started("v"), Some(4_000 + MIN), "v takes a as u ends");
+    assert_eq!(sim.sched.check_grants(), Ok(()));
+}
+
 /// A leg of the gang `g` of `size` (W05-R40).
 fn member(id: &str, g: &str, size: u32) -> LegIn {
     LegIn { gang: Some(super::state::Gang { id: g.into(), size }), ..leg(id, "acme/x", 60) }

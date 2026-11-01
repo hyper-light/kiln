@@ -1602,6 +1602,17 @@ mod tests {
         Ok(())
     }
 
+    /// docs/sim.md's bug 16 (W05-R39, R16): the seeds of E4.6's probe where room stood kept for a leg
+    /// on the runner it was lost on once another it could go to was back, so it went there, past
+    /// its time, while what waited behind its room didn't use it.
+    #[test]
+    fn the_seeds_where_room_stood_kept_where_its_leg_wouldn_t_go_hold() -> Result<(), String> {
+        for seed in [5607, 6165] {
+            run(seed, 0).map_err(|why| format!("seed {seed}: {why}"))?;
+        }
+        Ok(())
+    }
+
     /// docs/needs.md E1.6: a seed runs the same every time.
     #[test]
     fn a_sched_seed_replays_exactly() -> Result<(), String> {
