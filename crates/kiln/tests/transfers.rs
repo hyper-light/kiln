@@ -1735,7 +1735,9 @@ fn w27_r08_relays_blue_greens_forwarder() -> anyhow::Result<()> {
             let v = relays(port, admin, 20)?;
             let (n, missing) = stream_counts(&v, blue, "frames forwarded to ");
             let unanswered = v.get("unanswered").and_then(Value::as_array).map_or(0, |u| u.iter().filter(|r| field(r, "relay").contains(blue)).count());
-            Ok((n >= 2 && missing == 0 && (fault.is_some() || unanswered == 0)).then_some(v))
+            // A faulty forwarder's refused records never reach kiln's streams: their breaks are
+            // checked below.
+            Ok((n >= 2 && (fault.is_some() || (missing == 0 && unanswered == 0))).then_some(v))
         })
         .map_err(|e| anyhow::anyhow!("{fault:?}: {e}: {}", relays(port, admin, 0).unwrap_or_default()))?;
         let (forwarded, _) = stream_counts(&v, blue, "frames forwarded to ");
