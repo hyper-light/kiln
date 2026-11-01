@@ -560,6 +560,18 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let repo = format!("{owner}/{name}");
             boxed(|| crate::ci::diffs::ship_commit_blob(&hub, &repo, sha, &q, &caller)).await.map_err(|(c, m)| err(c, m))
         }
+        // A commit's jobs run again, paused, resumed or cancelled together (W26-R21, R22).
+        (&Method::POST, ["api", "ship", "jobs"]) => {
+            let body: serde_json::Value = boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+            boxed(|| crate::ship::jobs(&hub, &caller, &body)).await.map_err(|(c, m)| err(c, m))
+        }
+        // Ship's Deploys: every app by project, an app's pane, and the strip's verbs (W26-R24).
+        (&Method::GET, ["api", "ship", "deploys"]) => boxed(|| crate::ship::deploys::list(&hub, &q, &caller)).await.map_err(|(c, m)| err(c, m)),
+        (&Method::GET, ["api", "ship", "deploys", project, name]) => boxed(|| crate::ship::deploys::get(&hub, project, name, &caller)).await.map_err(|(c, m)| err(c, m)),
+        (&Method::POST, ["api", "ship", "deploys"]) => {
+            let body: serde_json::Value = boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+            boxed(|| crate::ship::deploys::act(&hub, &caller, &body)).await.map_err(|(c, m)| err(c, m))
+        }
         // A row's Hand off: what the commit has open, to the agent that takes it (W26-R18).
         (&Method::POST, ["api", "ship", "hand-off"]) => {
             let body: serde_json::Value = boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -659,10 +671,17 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         }
         (&Method::GET, ["api", "runs"]) => boxed(|| runs(&hub, &q, &caller)).await,
         (&Method::GET, ["api", "runs", id]) => boxed(|| run(&hub, id, &q)).await,
-        (&Method::POST, ["api", "runs", id, "cancel"]) => boxed(|| cancel(&hub, id)).await,
+        (&Method::POST, ["api", "runs", id, "cancel"]) => {
+            let id = (*id).to_owned();
+            boxed(|| cancel(&hub, &id, req)).await
+        }
         (&Method::POST, ["api", "runs", id, "retry"]) => {
             let id = (*id).to_owned();
             boxed(|| retry(&hub, &id, req)).await
+        }
+        (&Method::POST, ["api", "runs", id, verb @ ("pause" | "resume")]) => {
+            let (id, paused) = ((*id).to_owned(), *verb == "pause");
+            boxed(|| pause(&hub, &id, req, paused)).await
         }
         (&Method::GET, ["api", "jobs", id]) => boxed(|| job(&hub, id)).await,
         // What a job lacks, and an agent to install it (crate::toolfix).
@@ -2513,7 +2532,15 @@ async fn run(hub: &Hub, id: &str, q: &HashMap<String, String>) -> R {
     Ok(srv::json(StatusCode::OK, &run))
 }
 
-async fn cancel(hub: &Hub, id: &str) -> R {
+/// `POST /api/runs/:id/cancel`: the run; with `{ jobs: [ids] }` (docs/ci.md W26-R21), just those
+/// of its jobs, the run going on, each answering what became of it.
+async fn cancel(hub: &Hub, id: &str, req: Request) -> R {
+    let by = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "admin".to_owned(), |c| c.name.clone());
+    let jobs = srv::body_json::<SetReq>(req.into_body(), JSON_LIMIT).await.ok().and_then(|b| b.jobs).filter(|j| !j.is_empty());
+    if let Some(jobs) = jobs {
+        let v = crate::ci::retry::cancel_set(hub, id, jobs, &by).await.map_err(|(c, m)| err(c, m))?;
+        return Ok(srv::json(StatusCode::OK, &v));
+    }
     hub.cancel_run(id, "cancelled by user").await.map_err(|error| {
         let status = match error {
             crate::ci::dispatch::CancelError::AttemptChanged => StatusCode::CONFLICT,
@@ -2526,10 +2553,31 @@ async fn cancel(hub: &Hub, id: &str) -> R {
     Ok(srv::status(StatusCode::NO_CONTENT))
 }
 
+/// `POST /api/runs/:id/pause` and `/resume` with `{ jobs: [ids] }` (docs/ci.md W26-R22): those of
+/// the run's jobs, either engine's, paused (frozen where they run, or held before they start) or
+/// resumed, each answering what became of it.
+async fn pause(hub: &Hub, id: &str, req: Request, paused: bool) -> R {
+    let by = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "admin".to_owned(), |c| c.name.clone());
+    let jobs = srv::body_json::<SetReq>(req.into_body(), JSON_LIMIT).await.ok().and_then(|b| b.jobs).filter(|j| !j.is_empty());
+    let Some(jobs) = jobs else { return Err(err(StatusCode::BAD_REQUEST, "name the jobs: { jobs: [ids] }")) };
+    let v = crate::ci::retry::pause_set(hub, id, jobs, paused, &by).await.map_err(|(c, m)| err(c, m))?;
+    Ok(srv::json(StatusCode::OK, &v))
+}
+
 #[derive(Deserialize)]
 struct RetryReq {
     #[serde(default = "yes")]
     only_failed: bool,
+    /// Just these jobs (docs/ci.md W26-R21), passed ones too.
+    #[serde(default)]
+    jobs: Option<Vec<String>>,
+}
+
+/// A body naming some of a run's jobs (docs/ci.md W26-R21).
+#[derive(Deserialize)]
+struct SetReq {
+    #[serde(default)]
+    jobs: Option<Vec<String>>,
 }
 
 fn yes() -> bool {
@@ -2537,8 +2585,14 @@ fn yes() -> bool {
 }
 
 async fn retry(hub: &Hub, id: &str, req: Request) -> R {
-    let only_failed = srv::body_json::<RetryReq>(req.into_body(), JSON_LIMIT).await.map(|r| r.only_failed).unwrap_or(true);
-    let attempt = crate::ci::retry::run(hub, id, only_failed, "admin").await.map_err(|(code, why)| err(code, &why))?;
+    let by = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "admin".to_owned(), |c| c.name.clone());
+    let body = srv::body_json::<RetryReq>(req.into_body(), JSON_LIMIT).await.ok();
+    if let Some(jobs) = body.as_ref().and_then(|b| b.jobs.clone()).filter(|j| !j.is_empty()) {
+        let v = crate::ci::retry::retry_set(hub, id, &jobs, &by).await.map_err(|(c, m)| err(c, m))?;
+        return Ok(srv::json(StatusCode::OK, &v));
+    }
+    let only_failed = body.is_none_or(|r| r.only_failed);
+    let attempt = crate::ci::retry::run(hub, id, only_failed, &by).await.map_err(|(code, why)| err(code, &why))?;
     let jobs = hub.store.jobs(id.to_owned(), false).await?.into_iter().filter(|j| !j.status.is_terminal()).count();
     hub.emit_run(id).await;
     hub.store.audit("admin".into(), "run.retry".into(), id.to_owned()).await;

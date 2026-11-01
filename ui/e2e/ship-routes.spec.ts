@@ -1,8 +1,9 @@
 /**
- * Ship's route and nav (plan 01a175b7f20b7277b15bddd2ad001bcc, step 1), in the production build
- * against the mock: Ship sits in the nav where Runs and Deployments were; /runs and /deployments
- * are its views and keep their addresses and filters; a run's and an app's pages keep theirs, with
- * Ship the current section. Every old address lands on what it showed.
+ * Ship's route and nav (plan 01a175b7f20b7277b15bddd2ad001bcc, step 1; its views as Ada approved
+ * them on 2026-10-30, docs/ci.md W26-R24), in the production build against the mock: Ship sits in
+ * the nav where Runs and Deployments were; its views are Commits and Deploys, /runs landing on its
+ * commits and /deployments on its deploys; a run's and an app's pages keep their addresses, with
+ * Ship the current section.
  */
 import { expect, test, type Page } from "@playwright/test";
 
@@ -24,18 +25,6 @@ async function view(page: Page, name: string) {
   await expect(page.getByRole("navigation", { name: "Ship views" }).getByRole("link", { name, exact: true })).toHaveClass(/is-current/);
 }
 
-/** The first link on the page whose address starts with `prefix` and goes further. */
-async function firstBelow(page: Page, prefix: string) {
-  const link = page
-    .locator(`a[href^="${prefix}"]`)
-    .filter({ hasNot: page.locator(`[href="${prefix}"]`) })
-    .first();
-  await expect(link).toBeAttached();
-  const href = await link.getAttribute("href");
-  expect(href && href.length > prefix.length).toBeTruthy();
-  return href ?? prefix;
-}
-
 test("/ship is Ship's own address, current in the nav", async ({ page }) => {
   await page.goto("/ship");
   await expect(page.getByRole("heading", { name: "Ship.", exact: true })).toBeVisible();
@@ -43,17 +32,17 @@ test("/ship is Ship's own address, current in the nav", async ({ page }) => {
   await shipCurrent(page);
 });
 
-test("/runs lands on the runs, Ship's Runs view, its filters kept", async ({ page }) => {
+test("/runs lands on Ship's commits", async ({ page }) => {
   await page.goto("/runs?status=failed");
-  await expect(page.getByRole("heading", { name: "Runs", exact: true })).toBeVisible();
-  await expect(page).toHaveURL(/\/runs\?status=failed$/);
-  await view(page, "Runs");
+  await expect(page).toHaveURL(/\/ship$/);
+  await expect(page.getByRole("heading", { name: "Ship.", exact: true })).toBeVisible();
+  await view(page, "Commits");
   await shipCurrent(page);
 });
 
 test("/runs/:id lands on the run, Ship current", async ({ page }) => {
-  await page.goto("/runs");
-  const href = await firstBelow(page, "/runs/");
+  const runs = (await (await page.request.get("/api/runs?limit=1")).json()) as { id: string }[];
+  const href = `/runs/${runs[0]?.id ?? ""}`;
   await page.goto(href);
   await expect(page).toHaveURL(new RegExp(`${href.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`));
   await expect(
@@ -63,16 +52,17 @@ test("/runs/:id lands on the run, Ship current", async ({ page }) => {
   await shipCurrent(page);
 });
 
-test("/deployments lands on the apps, Ship's Deployments view", async ({ page }) => {
+test("/deployments lands on Ship's deploys", async ({ page }) => {
   await page.goto("/deployments");
-  await expect(page.getByRole("heading", { name: "Deployments.", exact: true })).toBeVisible();
-  await view(page, "Deployments");
+  await expect(page).toHaveURL(/\/ship\/deploys$/);
+  await expect(page.getByRole("heading", { name: "Ship.", exact: true })).toBeVisible();
+  await view(page, "Deploys");
   await shipCurrent(page);
 });
 
 test("an app's page keeps its address, Ship current", async ({ page }) => {
-  await page.goto("/deployments");
-  const href = await firstBelow(page, "/deployments/apps/");
+  const list = (await (await page.request.get("/api/cd/apps?limit=1")).json()) as { apps: { app: string }[] };
+  const href = `/deployments/apps/${list.apps[0]?.app ?? ""}`;
   await page.goto(href);
   await expect(page).toHaveURL(new RegExp(`${href.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`));
   await expect(page.getByRole("navigation", { name: "Breadcrumb" })).toBeVisible();

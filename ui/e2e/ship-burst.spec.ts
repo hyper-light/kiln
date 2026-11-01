@@ -2,8 +2,9 @@
  * Agents' pace (Agent pace and checks plan 01a175b7f2837279be2a229ee94ac1f0, step 1), against the
  * mock: 14 agents' commits land on /ship in 10 s (`POST /api/mock/ship/agents`, each starting CI as
  * a push does), and the page keeps up: 55 frames a second or more, counted from Chromium's trace at
- * 390 px, with the rows that need you first and the commits riding with the release folded under
- * it, at every change of the list and at the end.
+ * 390 px, with the rows that need you first at every change of the list and at the end. Ship's rows
+ * are repositories (docs/ci.md W26-R29): the burst is kiln's, its row ends on the newest of it, and
+ * opened, its commits' first page is the burst's newest ten.
  */
 import { expect, test } from "@playwright/test";
 
@@ -28,14 +29,14 @@ interface Burst {
   wrong: string[];
 }
 
-test("14 agents' commits in 10 s: 55 frames a second or more at 390 px, needs-you rows first, riders folded", async ({ page, browser, browserName, isMobile }) => {
+test("14 agents' commits in 10 s: 55 frames a second or more at 390 px, needs-you rows first, kiln's row on the newest", async ({ page, browser, browserName, isMobile }) => {
   test.skip(browserName !== "chromium" || isMobile, "Chromium's trace; the desktop project sets 390 px");
   test.setTimeout(90_000);
   await page.request.post("/api/mock/ship/arrive?clear=1");
   try {
     await page.setViewportSize({ width: 390, height: 844 });
     await page.goto("/ship");
-    const list = page.getByRole("list", { name: "Commits", exact: true });
+    const list = page.getByRole("list", { name: "Repositories", exact: true });
     const rows = list.locator(":scope > li.ship-row");
     await expect(rows.first()).toBeVisible({ timeout: 15_000 });
     // A pixel changed every frame, on top of everything (one under the shell's bar changes nothing on
@@ -66,8 +67,6 @@ test("14 agents' commits in 10 s: 55 frames a second or more at 390 px, needs-yo
         const stands = heads.map((r) => r.dataset.stand ?? "");
         const other = stands.findIndex((s) => s !== "needs_you");
         if (other >= 0 && stands.slice(other).includes("needs_you")) w.burst.wrong.push(`a row that needs you after one that doesn't: ${stands.join(" ")}`);
-        const alone = heads.map((r) => r.querySelector(":scope > .ship-r .ship-name")?.textContent ?? "").filter((name) => name.startsWith("agent: rider"));
-        if (alone.length > 0) w.burst.wrong.push(`riders on rows of their own: ${alone.join(", ")}`);
       };
       new MutationObserver(check).observe(ul, { childList: true });
       new MutationObserver(check).observe(ul, { subtree: true, attributes: true, attributeFilter: ["data-stand"] });
@@ -78,11 +77,9 @@ test("14 agents' commits in 10 s: 55 frames a second or more at 390 px, needs-yo
       (window as unknown as { burst: Burst }).burst.on = true;
     });
     await page.request.post("/api/mock/ship/agents?n=14&over=10");
-    // All 14 drawn: the release with its ten riders folded under it, and the three agents asking.
-    const release = rows.filter({ hasText: "release: production waits on you" });
-    // f-ship's riders row: how many ride with the approval, the first three of them, then more.
-    await expect(release.locator(".ship-fold")).toHaveText(/^\+10 riding · [0-9a-f]{7} [0-9a-f]{7} [0-9a-f]{7} …$/, { timeout: 30_000 });
-    await expect(rows.filter({ hasText: "agent: asks about flake" })).toHaveCount(3);
+    // All 14 landed: kiln's row on the newest of them.
+    const kiln = rows.filter({ has: page.locator(".ship-name", { hasText: "hyper-light/kiln" }) }).first();
+    await expect(kiln.locator(".ship-text")).toContainText("agent: rider 14", { timeout: 30_000 });
     const meter = await page.evaluate(() => {
       console.timeStamp("burst-end");
       const b = (window as unknown as { burst: Burst }).burst;
@@ -110,21 +107,16 @@ test("14 agents' commits in 10 s: 55 frames a second or more at 390 px, needs-yo
     expect(seconds, "the trace spans the burst").toBeGreaterThanOrEqual(10);
     expect(fps, said).toBeGreaterThanOrEqual(55);
     expect(meter.wrong).toEqual([]);
-    // At the end too: the rows that need you first, the burst's four among them; the riders under the release.
+    // At the end too: the rows that need you first.
     const stands = await rows.evaluateAll((els) => els.map((e) => (e as HTMLElement).dataset.stand ?? ""));
     const other = stands.findIndex((s) => s !== "needs_you");
-    expect(other, stands.join(" ")).toBeGreaterThanOrEqual(4);
-    expect(stands.slice(other), stands.join(" ")).not.toContain("needs_you");
-    await expect(rows.locator(":scope > .ship-r .ship-name", { hasText: "agent: rider" })).toHaveCount(0);
-    await release.locator(".ship-fold").click();
-    const riders = release.locator("li.ship-rider");
-    await expect(riders).toHaveCount(10);
-    await expect(riders.locator(".ship-name")).toHaveText(
-      Array.from({ length: 14 }, (_, i) => i + 1)
-        .filter((k) => k > 1 && k % 4 !== 0)
-        .map((k) => `agent: rider ${k}`)
-        .reverse(),
-    );
+    if (other >= 0) expect(stands.slice(other), stands.join(" ")).not.toContain("needs_you");
+    // Opened, kiln's commits: its first page the burst's newest ten, newest first.
+    await kiln.getByRole("button", { name: /^Open / }).click();
+    const lines = kiln.locator("section.ship-commits .sc-c .sc-msg");
+    await expect(lines).toHaveCount(10, { timeout: 15_000 });
+    await expect(lines.first()).toHaveText("agent: rider 14");
+    for (const t of await lines.allInnerTexts()) expect(t).toMatch(/^(agent|release): /);
   } finally {
     await page.request.post("/api/mock/ship/arrive?clear=1");
   }

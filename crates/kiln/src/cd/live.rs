@@ -508,7 +508,7 @@ pub fn container_of(pod: &Node, asked: Option<&str>) -> Option<String> {
 }
 
 /// One log line: its pod, its time, its text.
-fn line(pod: &str, raw: &str) -> CdLogLine {
+pub(super) fn line(pod: &str, raw: &str) -> CdLogLine {
     let raw = raw.strip_suffix('\r').unwrap_or(raw);
     let (ts, text) = match raw.split_once(' ') {
         Some((t, rest)) if t.len() >= 20 && t.as_bytes().get(4) == Some(&b'-') && t.ends_with('Z') => (t, rest),

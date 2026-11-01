@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use super::Fail;
 use crate::http::server::{self as srv, Response};
 use crate::hub::Hub;
-use crate::store::Status;
+use crate::store::{JobRetry, Status};
 
 fn internal(e: anyhow::Error) -> Fail {
     (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
@@ -201,6 +201,14 @@ fn said(p: Option<&Placement>) -> String {
     }
 }
 
+/// A line said in each of job `job`'s steps' logs.
+async fn mark(hub: &Hub, job: &str, line: &str) {
+    let steps = hub.store.job(job.to_owned()).await.ok().flatten().map(|j| j.steps).unwrap_or_default();
+    for s in steps {
+        hub.logs.mark(job, s.idx, line).await;
+    }
+}
+
 /// `GET /api/ci/legs/:id/runners`: where a finished job could run again (W05-R28): the runners
 /// of their own, each able to run it or why not; the one its last attempt ran on (`ran_on`), and
 /// whether that one can be avoided (`elsewhere`); and whether it can be retried now.
@@ -219,6 +227,140 @@ pub async fn runners(hub: &Hub, id: &str) -> Result<Response, Fail> {
             "runners": runners,
         }),
     ))
+}
+
+/// Another provider, in a person's words.
+pub(crate) fn provider_says(provider: &str) -> &str {
+    match provider {
+        super::providers::GITHUB_ACTIONS => "GitHub Actions",
+        super::providers::GITLAB_CI => "GitLab CI",
+        super::providers::BITBUCKET_PIPELINES => "Bitbucket Pipelines",
+        other => other,
+    }
+}
+
+/// Why a set of another provider's run's jobs isn't acted on here (docs/ci.md W26-R21, R22): that
+/// provider runs them, and kiln keeps only their record ([`super::providers::record`]), so running
+/// them again, stopping or pausing them in kiln's tables would change nothing that runs. Each job
+/// named answers so under `word` (`again`, `cancelled`, `paused`, `resumed`), and nothing changes.
+/// `None` for KilnCI's runs.
+async fn providers_own(hub: &Hub, run: &str, ids: &[String], word: &str) -> Result<Option<Value>, Fail> {
+    let Some((_, provider, _)) = super::providers::of_run(hub, run).await.map_err(internal)? else { return Ok(None) };
+    let why = format!("{} runs it, not kiln", provider_says(&provider));
+    let mut jobs = Vec::new();
+    for id in ids {
+        let ours = job_of(hub, id).await.is_ok_and(|j| j.run == run);
+        jobs.push(json!({ "job": id, word: false, "why": if ours { why.as_str() } else { "not a job of this run" } }));
+    }
+    Ok(Some(json!({ "kind": "provider", "run": run, "provider": provider, "jobs": jobs })))
+}
+
+/// Jobs of one run run again together (docs/ci.md W26-R21), passed ones too:
+/// - a `.kiln/` pipeline's (v1) in their run, each with the jobs that need it
+///   ([`crate::store::Store::retry_jobs`]);
+/// - legs of the CI engine's as one new attempt of their run, which runs them and what needs
+///   them again, for real (none takes an earlier result over);
+/// - another provider's: none, each saying that provider runs it.
+///
+/// Each job named answers what became of it.
+pub async fn retry_set(hub: &Hub, run: &str, ids: &[String], by: &str) -> Result<Value, Fail> {
+    if let Some(v) = providers_own(hub, run, ids, "again").await? {
+        return Ok(v);
+    }
+    if hub.ci.is_run(run) || hub.store.is_engine_run(run.to_owned()).await.map_err(internal)? {
+        let mut legs = Vec::new();
+        let mut each = Vec::new();
+        for id in ids {
+            match job_of(hub, id).await {
+                Ok(j) if j.run == run && !j.status.is_terminal() => each.push(json!({ "job": id, "again": false, "why": format!("`{}` hasn't finished: it's {}", j.key, j.status.as_str()) })),
+                Ok(j) if j.run == run => {
+                    legs.push(super::dispatch::RerunMode::Leg { job: j.job.clone().unwrap_or_default(), key: j.key.clone() });
+                    each.push(json!({ "job": id, "again": true }));
+                }
+                _ => each.push(json!({ "job": id, "again": false, "why": "not a job of this run" })),
+            }
+        }
+        if legs.is_empty() {
+            return Ok(json!({ "kind": "ci", "run": run, "jobs": each }));
+        }
+        let (tx, rx) = async_channel::bounded(1);
+        hub.ci.send(super::dispatch::Msg::Rerun { run: run.to_owned(), mode: super::dispatch::RerunMode::Set(legs), debug: false, keep_failed: None, actions: None, no_reuse: true, cold: false, placed: HashMap::new(), by: by.to_owned(), reply: tx });
+        return match crate::rt::timeout(Duration::from_secs(60), rx.recv()).await {
+            Ok(Ok(Ok(attempt))) => {
+                hub.store.audit(by.to_owned(), "ci.runs.retry_jobs".into(), format!("{run}: {}", ids.join(", "))).await;
+                Ok(json!({ "kind": "ci", "run": run, "attempt": attempt, "jobs": each }))
+            }
+            Ok(Ok(Err(e))) => Err(conflict(e)),
+            _ => Err((StatusCode::GATEWAY_TIMEOUT, "the dispatcher didn't answer".to_owned())),
+        };
+    }
+    let out = hub.store.retry_jobs(run.to_owned(), ids.to_vec()).await.map_err(internal)?;
+    let mut each = Vec::new();
+    for (id, r) in &out {
+        match r {
+            JobRetry::Again { attempt, waiting, .. } => {
+                mark(hub, id, &format!("retried by {by}: its next attempt follows")).await;
+                for w in waiting {
+                    mark(hub, w, "run again with a job it needs: its next attempt follows").await;
+                    hub.emit_job(w).await;
+                }
+                hub.emit_job(id).await;
+                each.push(json!({ "job": id, "again": true, "attempt": attempt, "waiting": waiting }));
+            }
+            JobRetry::NoSuchJob => each.push(json!({ "job": id, "again": false, "why": "not a job of this run" })),
+            JobRetry::Refused(why) => each.push(json!({ "job": id, "again": false, "why": why })),
+        }
+    }
+    hub.emit_run(run).await;
+    hub.wake.notify();
+    hub.store.audit(by.to_owned(), "runs.retry_jobs".into(), format!("{run}: {}", ids.join(", "))).await;
+    Ok(json!({ "kind": "pipeline", "run": run, "jobs": each }))
+}
+
+/// Jobs of one run stopped, the run going on (docs/ci.md W26-R21): [`Hub::cancel_jobs`], each
+/// job named answering what became of it. Another provider's run's are its own to stop.
+pub async fn cancel_set(hub: &Hub, run: &str, ids: Vec<String>, by: &str) -> Result<Value, Fail> {
+    use crate::store::JobCancel;
+    if let Some(v) = providers_own(hub, run, &ids, "cancelled").await? {
+        return Ok(v);
+    }
+    let what = ids.join(", ");
+    let each = hub.cancel_jobs(run, ids, &format!("cancelled by {by}")).await.map_err(internal)?;
+    hub.store.audit(by.to_owned(), "runs.cancel_jobs".into(), format!("{run}: {what}")).await;
+    let jobs: Vec<Value> = each
+        .iter()
+        .map(|(j, r)| match r {
+            JobCancel::Cancelled => json!({ "job": j, "cancelled": true }),
+            JobCancel::NoSuchJob => json!({ "job": j, "cancelled": false, "why": "not a job of this run" }),
+            JobCancel::Refused(why) => json!({ "job": j, "cancelled": false, "why": why }),
+        })
+        .collect();
+    Ok(json!({ "run": run, "jobs": jobs }))
+}
+
+/// Some of a run's jobs paused or resumed (docs/ci.md W26-R22), either engine's, through
+/// [`Hub::pause_jobs`]: each job's log says who paused or resumed it, and each job named answers
+/// what became of it (`paused` or `resumed`, and why not). Another provider's run's are its own.
+pub async fn pause_set(hub: &Hub, run: &str, ids: Vec<String>, paused: bool, by: &str) -> Result<Value, Fail> {
+    if let Some(v) = providers_own(hub, run, &ids, if paused { "paused" } else { "resumed" }).await? {
+        return Ok(v);
+    }
+    let what = ids.join(", ");
+    let each = hub.pause_jobs(run, ids, paused).await.map_err(internal)?;
+    let (verb, word) = if paused { ("runs.pause_jobs", "paused") } else { ("runs.resume_jobs", "resumed") };
+    hub.store.audit(by.to_owned(), verb.into(), format!("{run}: {what}")).await;
+    let mut jobs = Vec::new();
+    for (j, r) in &each {
+        match r {
+            Ok(()) => {
+                let line = if paused { format!("paused by {by}: frozen where it runs, its time limit stopped, until it's resumed") } else { format!("resumed by {by}: it goes on from where it was") };
+                mark(hub, j, &line).await;
+                jobs.push(json!({ "job": j, word: true }));
+            }
+            Err(why) => jobs.push(json!({ "job": j, word: false, "why": why })),
+        }
+    }
+    Ok(json!({ "run": run, "jobs": jobs }))
 }
 
 /// `POST /api/ci/legs/:id/retry` with `{ runner?, elsewhere? }` (W05-R28): a finished job again,

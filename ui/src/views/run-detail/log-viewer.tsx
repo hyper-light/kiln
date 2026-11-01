@@ -1,32 +1,49 @@
 import * as React from "react";
 import { ArrowDownToLine, ChevronDown, ChevronUp, Download, Search, X } from "lucide-react";
 import { api, ApiError, wsUrl } from "@/api/client";
-import { readLogFrame } from "@/api/frames";
-import type { Status } from "@/api/types";
-import type { UnreadFrame } from "@/api/wire";
+import { cdApi } from "@/api/cd";
+import { readFrame, readLogFrame } from "@/api/frames";
+import type { CdLogLine, CdResourceKey, Status } from "@/api/types";
+import type { CdLogDown, UnreadFrame } from "@/api/wire";
 import { createTerminal, ensureFont, safeFit, SEARCH_DECORATIONS, type KilnTerminal } from "@/components/terminal/xterm-setup";
 import { Tip } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { formatDuration } from "@/lib/format";
+
+/** A deployment's log socket's frames, by tag. */
+const CD_LOG_FRAMES = { lines: true, error: true, end: true, refused: true } satisfies Record<CdLogDown["type"], true>;
+/** How many of a deployment object's last lines are read, and followed from. */
+const CD_TAIL = 500;
+
+/** A deployment object's line, as a job's reads: its time (hours, minutes, seconds) dim before it. */
+function cdLine(l: CdLogLine): string {
+  const t = l.ts ? new Date(l.ts) : null;
+  const hms = t && !Number.isNaN(t.getTime()) ? t.toISOString().slice(11, 19) : "        ";
+  return `\x1b[38;2;109;112;120m${hms}\x1b[39m  ${l.text}\n`;
+}
+
+/** What a log is of: a job's step, or one of a deployment's objects (Ship's Deploys, docs/ci.md W26-R24). */
+type LogSource = { jobId: string; step: number; cd?: undefined } | { cd: { app: string; key: CdResourceKey }; jobId?: undefined; step?: undefined };
 
 const MAX_ROWS = 38;
 const MIN_ROWS = 4;
 
 /**
  * Read-only xterm.js log for one step. Streams /api/jobs/:id/logs/ws?step=N
- * (backlog then live binary frames); falls back to the REST endpoint.
+ * (backlog then live binary frames); falls back to the REST endpoint. Of a deployment's object
+ * (`cd`), its last lines and then what it writes (/api/cd/apps/:app/resources/:key/logs/ws), each
+ * with its time; falls back to reading the last lines.
  */
 export default function LogViewer({
   jobId,
   step,
+  cd,
   live,
   onStepStatus,
   rows: fixedRows,
   timed,
   bare,
-}: {
-  jobId: string;
-  step: number;
+}: LogSource & {
   live: boolean;
   onStepStatus?: (idx: number, status: Status) => void;
   /** A fixed height of this many rows (Ship's Output card): the box holds still as lines arrive. */
@@ -39,6 +56,8 @@ export default function LogViewer({
   bare?: boolean;
 }) {
   const kRef = React.useRef<KilnTerminal | null>(null);
+  // A job's step (a deployment object's log has none).
+  const stepN = step ?? 0;
   const begun = timed?.begun;
   const [follow, setFollow] = React.useState(true);
   const followRef = React.useRef(true);
@@ -170,9 +189,9 @@ export default function LogViewer({
           if (!noted) waiting.push(bytes);
           else lines(bytes);
         };
-        if (begun !== undefined)
+        if (begun !== undefined && jobId !== undefined)
           void api
-            .jobLogTimes(jobId, step)
+            .jobLogTimes(jobId, stepN)
             // Unread, no line is given a time it may not have: every gutter blank.
             .catch(() => ({ times: [] as [number, number][], size: Number.MAX_SAFE_INTEGER }))
             .then((n) => {
@@ -181,11 +200,50 @@ export default function LogViewer({
               for (const b of waiting.splice(0)) lines(b);
             });
 
+        if (cd) {
+          const read = () =>
+            cdApi
+              .logs(cd.app, cd.key, { tail_lines: CD_TAIL })
+              .then((r) => {
+                if (disposed || gotAny) return;
+                for (const l of r.lines) put(cdLine(l));
+                for (const e of r.errors) put(`\x1b[38;2;226;185;189m${e}\x1b[0m\n`);
+                if (!gotAny) k.term.write("\x1b[38;2;151;153;159m(no output)\x1b[0m");
+                setEnded(true);
+              })
+              .catch(() => {
+                if (!disposed && !gotAny) k.term.write("\x1b[38;2;151;153;159m(no output)\x1b[0m");
+              });
+          try {
+            ws = new WebSocket(wsUrl(cdApi.logsFollowPath(cd.app, cd.key, { tail_lines: CD_TAIL })));
+            ws.onmessage = (ev) => {
+              if (typeof ev.data !== "string") return;
+              const frame = readFrame<CdLogDown>(ev.data, "type", CD_LOG_FRAMES);
+              if ("unread" in frame) {
+                if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(frame.unread satisfies UnreadFrame));
+                return;
+              }
+              const msg = frame.frame;
+              if (msg.type === "lines") for (const l of msg.lines) put(cdLine(l));
+              else if (msg.type === "error") put(`\x1b[38;2;226;185;189m${msg.pod ? `${msg.pod}: ` : ""}${msg.message}\x1b[0m\n`);
+              else if (msg.type === "end") setEnded(true);
+            };
+            ws.onclose = () => {
+              if (disposed) return;
+              if (!gotAny) void read();
+              setEnded(true);
+            };
+          } catch {
+            void read();
+          }
+          return;
+        }
+        if (jobId === undefined) return;
         const fallback = () => {
           api
             // A strict fallback may finish only with this capture's own complete result.
             // Jobs without a producer contract retain their legacy response semantics.
-            .jobLogs(jobId, step, true)
+            .jobLogs(jobId, stepN, true)
             .then((text) => {
               if (disposed || gotAny || (canonical && received)) return;
               write(text);
@@ -209,7 +267,7 @@ export default function LogViewer({
         };
 
         try {
-          ws = new WebSocket(wsUrl(`/api/jobs/${encodeURIComponent(jobId)}/logs/ws?step=${step}`));
+          ws = new WebSocket(wsUrl(`/api/jobs/${encodeURIComponent(jobId)}/logs/ws?step=${stepN}`));
           ws.binaryType = "arraybuffer";
           ws.onmessage = (ev) => {
             if (typeof ev.data === "string") {
@@ -274,7 +332,8 @@ export default function LogViewer({
         kRef.current = null;
       };
     },
-    [jobId, step, begun],
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- the object's key, by its parts: a new object, a new stream
+    [jobId, step, begun, cd?.app, cd?.key.group, cd?.key.kind, cd?.key.namespace, cd?.key.name],
   );
 
   const runSearch = (dir: "next" | "prev", q = query) => {
@@ -368,11 +427,13 @@ export default function LogViewer({
             <ArrowDownToLine size={14} />
           </button>
         </Tip>
-        <Tip content="Download raw log">
-          <a className="icon-btn" data-variant="bare" data-size="sm" aria-label="Download raw log" href={api.jobLogsUrl(jobId, step)} download={`${jobId}-step-${step}.log`}>
-            <Download size={14} />
-          </a>
-        </Tip>
+        {jobId !== undefined && (
+          <Tip content="Download raw log">
+            <a className="icon-btn" data-variant="bare" data-size="sm" aria-label="Download raw log" href={api.jobLogsUrl(jobId, stepN)} download={`${jobId}-step-${stepN}.log`}>
+              <Download size={14} />
+            </a>
+          </Tip>
+        )}
       </div>
       {outputState && (
         <div role="status" className="px-3 py-1.5 text-xs text-[#969aa3]">

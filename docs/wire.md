@@ -467,20 +467,25 @@ takes a new bit, never one that means something already, even in the other direc
 | 50 | `CAP_RETAINED_RECEIVED` | `AgentMsg::Caps`, `ServerMsg::Caps` | retained evidence spooled in shared Amphora until its exact durable receipt |
 | 51 | `CAP_RESOURCE_OWNERSHIP` | `AgentMsg::Caps` | strict execution containment and sole-Scheduler resource ownership; required for new CI work |
 | 52 | `CAP_FIRECRACKER_SHAPE` | `AgentMsg::Caps`, `ServerMsg::Caps` | authenticated runner-process identity and immutable executor grant shapes in Ready and stopped receipts |
-| 53 | `CAP_AMPHORA` | `AgentMsg::Caps`, `ServerMsg::Caps` | U15: typed opaque Amphora transport; distinct from the retired learner bit |
-| 54 | `CAP_UNIFIED_LAYOUT` | `AgentMsg::Caps`, `ServerMsg::Caps` | U15: the unification wire layout appended after main's unread messages, independent of whether this peer currently carries Amphora traffic |
-| 55 | `CAP_EXPLICIT_ACTIVATION` | AgentMsg::Caps, ServerMsg::Caps | existing role-specific explicit activation owner; not release approval |
-| 56 | `CAP_ORDINARY_EXECUTION_DEBT` | AgentMsg::Caps, ServerMsg::Caps | existing paired original ordinary admission and sequenced physical debt |
-| 57 | `CAP_JOB_LOG_V1` | RESERVED, NOT ADVERTISED | U05 original native producer capture, durable bounded outbox and own canonical receipt; requires layout, wire, attempt, resource ownership and ordinary debt |
-| 58 | `CAP_LOG_END_MARK` | `AgentMsg::Caps`, `ServerMsg::Caps` | a leg's log is all sent once the runner says so on the LOGS lane: an empty `LogChunk` at step `u32::MAX` (`LOG_END_STEP`), after the leg's last output and before its result; the server takes the result once that mark has come and what came before it is accepted (bounded) |
+| 53 | `CAP_FREEZE` | `AgentMsg::Caps` | the runner freezes a job it runs where it runs and lets it go on (`Freeze`: Pause and Resume, ci.md W26-R22); Unix and Windows runners say it |
+| 54 | `CAP_AMPHORA` | `AgentMsg::Caps`, `ServerMsg::Caps` | U15: typed opaque Amphora transport; distinct from the retired learner bit |
+| 55 | `CAP_UNIFIED_LAYOUT` | `AgentMsg::Caps`, `ServerMsg::Caps` | U15: the unification wire layout appended after main's unread messages, independent of whether this peer currently carries Amphora traffic |
+| 56 | `CAP_EXPLICIT_ACTIVATION` | AgentMsg::Caps, ServerMsg::Caps | existing role-specific explicit activation owner; not release approval |
+| 57 | `CAP_ORDINARY_EXECUTION_DEBT` | AgentMsg::Caps, ServerMsg::Caps | existing paired original ordinary admission and sequenced physical debt |
+| 58 | `CAP_JOB_LOG_V1` | RESERVED, NOT ADVERTISED | U05 original native producer capture, durable bounded outbox and own canonical receipt; requires layout, wire, attempt, resource ownership and ordinary debt |
+| 59 | `CAP_LOG_END_MARK` | `AgentMsg::Caps`, `ServerMsg::Caps` | a leg's log is all sent once the runner says so on the LOGS lane: an empty `LogChunk` at step `u32::MAX` (`LOG_END_STEP`), after the leg's last output and before its result; the server takes the result once that mark has come and what came before it is accepted (bounded) |
 
-Bits from 59 are free. Take the next one, and add its row here in the same change. A reserved bit
-is not evidence that its complete route is active.
+Bits 44 to 46 are kept for W27, a line on its way: its agent git credential, leg signing and
+custody (`CAP_AGENT_GIT`, `CAP_LEG_SIGNS`, `CAP_CUSTODY`). The unification held bits from 42 on its
+branch before the Changes tab took 42 and 43; it takes 47 to 52, then, past W26-R22's `CAP_FREEZE`
+(53), 54 to 59. Bits from 60 are free. Take the next one, and add its row here in the same change.
+A reserved bit is not evidence that its complete route is active.
 
 Main's unread messages retain their deployed indices: runner messages 56 and 57, server
-messages 62 and 63, and reach ask 11. The private unification messages follow them. Both peers
+messages 62 and 63, and reach ask 11; W26-R22's `Freeze` is server message 64. The private
+unification messages follow them: runner messages 58 to 62, server messages 65 to 68. Both peers
 announce `CAP_UNIFIED_LAYOUT` even when their Amphora carrier is inactive. A peer advertising
-private bits 47 through 53 without this layout capability is refused before those extensions
+private bits 47 through 52 or 54 without this layout capability is refused before those extensions
 can be dispatched. Earlier experimental snapshots that used bit 41 for Amphora are incompatible;
 bit 41 alone means main's `CAP_UNREAD`. It cannot identify an earlier experimental codec or
 authorize replay of opaque persisted bytes from that codec.
@@ -679,6 +684,8 @@ Four edges are left, and the lab steers clear of each:
 | `Observe` | carried (observe's group) | To the runner's replica: hyper-raft's messages, and the leader's word on the writes it took. | Only to a runner announcing `CAP_OBSERVE`, on lane 5. |
 | `Unread` | ack | A frame of the runner's the server couldn't read: on which wire, what it was, why, and how many more went untold before it ("What can't be read"). | New: to runners announcing `CAP_UNREAD`. |
 | `ReachRefused` | carried (reach link) | A reach frame of the runner's the relay refused: its link, the runner it was for, why in a code (`taken`, `to_itself`, `too_many`, `not_offered`, `not_accepted`, `not_connected`, `closed`) and in words. | New: to runners announcing `CAP_UNREAD`, in place of `Reach`'s `close`. |
+| `Freeze` | command, refused while away | A running leg frozen where it runs, or let go on (Pause and Resume, ci.md W26-R22): its steps' processes stopped, its job container paused, its time limit stopped. A pause that waited for its runner to come back would stop the job later than the person asked. | New: to runners announcing `CAP_FREEZE`, on the channel ("Commands"): answered once done, refused saying why (no such leg there, or one it can't stop in place). |
+
 | `Amphora` | carried (Amphora) | U15: bounded opaque product transport, with authenticated member routes. | Amphora owns acknowledgement, resend, recovery and membership; Kiln only frames bytes. |
 
 | `JobLogReplyV1` | ack | Own canonical operation receipt or typed noncommitted outcome for the original bound producer input. Only a committed own receipt permits outbox retirement. | HELD; ordinary generic channel ACK/Have cannot retire producer bytes. |

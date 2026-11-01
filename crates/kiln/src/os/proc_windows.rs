@@ -196,6 +196,13 @@ impl Running {
         else if let Some(job) = &self.job { let _ = job.lock().kill(); }
     }
 
+    /// Its own job object, for freezing it in place (docs/ci.md W26-R22): none here, where a CI
+    /// step is held by its execution's group (U01) or a job of the runner's; it's frozen by its
+    /// process tree instead.
+    pub fn tree(&self) -> Option<crate::os::contain::Tree> {
+        None
+    }
+
     /// The exit code (`None` when the wait failed).
     pub async fn wait(&mut self) -> Option<i32> {
         (&mut self.exit).await.ok().flatten()

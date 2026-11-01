@@ -16,6 +16,8 @@
 //! - [`health`]: resource health, rule for rule as Argo CD assesses it.
 //! - [`journey`]: where a commit stands on its way from landing to replanting (Ship's stand, line
 //!   and pips), from the records the server reads for it.
+//! - [`stands`]: where each app stands as Ship's Deploys tab shows it (its stand, line and pips),
+//!   its components by owner, its history of deploys and commits, a rollout's steps.
 //! - [`lua`]: Argo CD's Lua health checks for custom resources (its resource customizations).
 //! - [`providers`]: every platform beyond Kubernetes, as clusters of objects (docs/cd-targets.md).
 //! - [`diff`]: comparing desired and live objects by field ownership.
@@ -47,9 +49,11 @@ pub mod model;
 pub mod obj;
 pub mod providers;
 pub mod render;
+pub mod autosync;
 pub mod rollback;
 pub mod rollout;
 pub mod sim;
+pub mod stands;
 pub mod state;
 // U15/B2: the retired CD Raft writer is available only to legacy fixture tests.
 #[cfg(test)]

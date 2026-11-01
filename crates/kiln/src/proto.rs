@@ -476,7 +476,7 @@ pub const CAP_HEADROOM: u64 = 1 << 39;
 pub const CAP_CHANGES_PATCH: u64 = 1 << 40;
 
 /// U15: typed Amphora transport, independent of the retired Kiln learner protocol.
-pub const CAP_AMPHORA: u64 = 1 << 53;
+pub const CAP_AMPHORA: u64 = 1 << 54;
 /// U15: takes HarnessRelease independently of the retired conversation-feed capability.
 pub const CAP_HARNESS_RELEASE: u64 = 1 << 47;
 /// U03: attempt-fenced job completions and receipts, supported by both peers.
@@ -493,21 +493,21 @@ pub const CAP_FIRECRACKER_SHAPE: u64 = 1 << 52;
 /// This peer uses the unified extensions appended after main's unread protocol. Always
 /// advertised, even when it owns no Amphora replica. This is a codec layout, not ownership.
 /// The earlier private experimental layout is unsupported; it has no compatibility decoder.
-pub const CAP_UNIFIED_LAYOUT: u64 = 1 << 54;
+pub const CAP_UNIFIED_LAYOUT: u64 = 1 << 55;
 /// U16 controlled-upgrade law, on this authenticated connection: a server uses the sole
 /// CI/CD coordinator with pinned admission; a runner owns a live explicit activation backend.
 /// This is role-specific software capability, never cryptographic approval of a release/job.
-pub const CAP_EXPLICIT_ACTIVATION: u64 = 1 << 55;
+pub const CAP_EXPLICIT_ACTIVATION: u64 = 1 << 56;
 /// U01/U03: paired durable ordinary grant/admission and sequenced physical debt law.
-pub const CAP_ORDINARY_EXECUTION_DEBT: u64 = 1 << 56;
+pub const CAP_ORDINARY_EXECUTION_DEBT: u64 = 1 << 57;
 /// U05: RESERVED paired native producer-log protocol. Neither peer advertises it until
 /// original registration, producer outbox, canonical receipts and terminal effects compose.
-pub const CAP_JOB_LOG_V1: u64 = 1 << 57;
+pub const CAP_JOB_LOG_V1: u64 = 1 << 58;
 /// A leg's log is all sent once its runner says so on the LOGS lane, after the leg's last output
 /// and before its result: an empty [`LogChunk`] at [`LOG_END_STEP`]. A server that takes it holds
 /// the leg's result until that mark has come and what came before it is accepted (W05: a result
 /// on the control lane overtook a leg's last lines, queued behind another leg's on the log lane).
-pub const CAP_LOG_END_MARK: u64 = 1 << 58;
+pub const CAP_LOG_END_MARK: u64 = 1 << 59;
 /// The step of a [`CAP_LOG_END_MARK`] mark, which no step has. An empty chunk was already a no-op.
 pub const LOG_END_STEP: u32 = u32::MAX;
 
@@ -587,6 +587,13 @@ pub const CAP_WORKSPACE_COMMITS: u64 = 1 << 42;
 /// branch, tag or commit, an agent's files as it left them), for the Changes tab's Compare
 /// (docs/agents.md). Bit 42 is [`CAP_WORKSPACE_COMMITS`].
 pub const CAP_WORKSPACE_COMPARE: u64 = 1 << 43;
+
+/// [`AgentMsg::Caps`] capability: the runner freezes a job it runs where it runs, and lets it go on
+/// (Pause and Resume, docs/ci.md W26-R22; [`ServerMsg::Freeze`]). Runners on Unix and Windows say
+/// it; a server sends `Freeze` to no other. Bits 44 to 52 are kept for lines on their way: W27's
+/// (`CAP_AGENT_GIT`, `CAP_LEG_SIGNS`, `CAP_CUSTODY`) and the unification's, which held bits from 42
+/// on their branches before the Changes tab took 42 and 43.
+pub const CAP_FREEZE: u64 = 1 << 53;
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -859,7 +866,13 @@ pub enum ServerMsg {
     /// To runners announcing [`CAP_UNREAD`], in place of [`ServerMsg::Reach`]'s `close`. Appended
     /// last: postcard encodes variants by index.
     ReachRefused { from: String, link: String, code: crate::reach::relay::Refusal, why: String },
-    /// U15: opaque product transport; appended to preserve all older postcard indices.
+    /// CI (docs/ci.md W26-R22): job `job`, running there, frozen where it runs (`frozen`: its
+    /// steps' processes stopped, its job container paused, its time limit stopped) or let go on.
+    /// Answered once done, or refused saying why. Only to runners announcing [`CAP_FREEZE`].
+    /// Appended last: postcard encodes variants by index.
+    Freeze { job: String, frozen: bool },
+    /// U15: opaque product transport; appended after W26-R22's `Freeze` (64), which main took
+    /// first, to preserve all older postcard indices.
     Amphora { frame: crate::replication::Frame },
     /// U03: receipt for exactly one attempt, negotiated with CAP_JOB_ATTEMPT.
     ReceivedV2 { job: String, attempt: u32 },
@@ -1272,12 +1285,12 @@ mod tests {
         let a = encode(&agent)?;
         let s = encode(&server)?;
         assert_eq!(a.first(), Some(&58));
-        assert_eq!(s.first(), Some(&64));
+        assert_eq!(s.first(), Some(&65));
         assert_eq!(decode::<AgentMsg>(&a)?, agent);
         assert_eq!(decode::<ServerMsg>(&s)?, server);
         let legacy = ServerMsg::Cluster { json: r#"{"t":"leave"}"#.into(), raft: Vec::new() };
         assert_eq!(decode::<ServerMsg>(&encode(&legacy)?)?, legacy);
-        assert_eq!(CAP_AMPHORA, 1 << 53);
+        assert_eq!(CAP_AMPHORA, 1 << 54);
         assert_eq!(CAP_HARNESS_RELEASE, 1 << 47);
         assert_eq!(CAP_HARNESS_RELEASE & CAP_AMPHORA, 0);
         Ok(())
@@ -1287,7 +1300,7 @@ mod tests {
     fn u03_retained_receipt_and_resource_caps_are_append_only() -> anyhow::Result<()> {
         let receipt = ServerMsg::RetainedReceived { json: "{}".into() };
         let bytes = encode(&receipt)?;
-        assert_eq!(bytes.first(), Some(&66));
+        assert_eq!(bytes.first(), Some(&67));
         assert_eq!(decode::<ServerMsg>(&bytes)?, receipt);
         assert_eq!(CAP_RETAINED_RECEIVED, 1 << 50);
         assert_eq!(CAP_RESOURCE_OWNERSHIP, 1 << 51);
@@ -1302,15 +1315,15 @@ mod tests {
         assert!(CAP_FIRECRACKER_SHAPE.is_power_of_two());
         assert_eq!(CAP_FIRECRACKER_SHAPE & (CAP_RESOURCE_OWNERSHIP | CAP_RETAINED_RECEIVED | CAP_OPEN_ONCE | CAP_JOB_ATTEMPT), 0);
         assert_eq!(CAP_RESOURCE_OWNERSHIP & (CAP_RETAINED_RECEIVED | CAP_OPEN_ONCE | CAP_JOB_ATTEMPT), 0);
-        let current_main = CAP_UNREAD | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_AGENT_LIMIT | CAP_WORK | CAP_HANDOVER | CAP_INBOX | CAP_NET_DROPS | CAP_WIRE | u64::from(u32::MAX);
+        let current_main = CAP_FREEZE | CAP_WORKSPACE_COMPARE | CAP_WORKSPACE_COMMITS | CAP_UNREAD | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_AGENT_LIMIT | CAP_WORK | CAP_HANDOVER | CAP_INBOX | CAP_NET_DROPS | CAP_WIRE | u64::from(u32::MAX);
         let unified = CAP_AMPHORA | CAP_HARNESS_RELEASE | CAP_JOB_ATTEMPT | CAP_OPEN_ONCE | CAP_RETAINED_RECEIVED | CAP_RESOURCE_OWNERSHIP;
         assert_eq!(unified.count_ones(), 6);
         assert_eq!(unified & current_main, 0, "unified capabilities follow the deployed main bits");
-        assert_eq!(CAP_UNIFIED_LAYOUT, 1 << 54);
-        assert_eq!(CAP_EXPLICIT_ACTIVATION, 1 << 55);
-        assert_eq!(CAP_ORDINARY_EXECUTION_DEBT,1 << 56);
+        assert_eq!(CAP_UNIFIED_LAYOUT, 1 << 55);
+        assert_eq!(CAP_EXPLICIT_ACTIVATION, 1 << 56);
+        assert_eq!(CAP_ORDINARY_EXECUTION_DEBT,1 << 57);
         assert_eq!(CAP_ORDINARY_EXECUTION_DEBT & (CAP_EXPLICIT_ACTIVATION | CAP_UNIFIED_LAYOUT | unified | current_main),0);
-        assert_eq!(CAP_JOB_LOG_V1, 1 << 57);
+        assert_eq!(CAP_JOB_LOG_V1, 1 << 58);
         assert_eq!(CAP_JOB_LOG_V1 & (CAP_ORDINARY_EXECUTION_DEBT | CAP_EXPLICIT_ACTIVATION | CAP_UNIFIED_LAYOUT | unified | current_main | CAP_FIRECRACKER_SHAPE), 0);
         assert!(check_unified_layout(CAP_JOB_LOG_V1).is_err());
         let paired = CAP_UNIFIED_LAYOUT | CAP_WIRE | CAP_JOB_ATTEMPT | CAP_RESOURCE_OWNERSHIP | CAP_ORDINARY_EXECUTION_DEBT | CAP_JOB_LOG_V1;
@@ -1351,7 +1364,7 @@ mod tests {
         assert_eq!(decode::<AgentMsg>(&bytes)?, completion);
         let receipt = ServerMsg::ReceivedV2 { job: "leg".into(), attempt: 7 };
         let bytes = encode(&receipt)?;
-        assert_eq!(bytes.first(), Some(&65));
+        assert_eq!(bytes.first(), Some(&66));
         assert_eq!(decode::<ServerMsg>(&bytes)?, receipt);
         assert_eq!(CAP_JOB_ATTEMPT, 1 << 48);
         // U05: append-only framing and the borrowed Item refer to the SAME original body.
@@ -1479,8 +1492,9 @@ mod tests {
         assert_eq!(encode(&down)?.first(), Some(&62));
         assert_eq!(decode::<AgentMsg>(&encode(&up)?)?, up);
         assert_eq!(decode::<ServerMsg>(&encode(&down)?)?, down);
-        // Step 5 appended `LinkUnread` (57) and `ReachRefused` (63) after them.
-        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (63, 68), "each table has every variant once");
+        // Step 5 appended `LinkUnread` (57) and `ReachRefused` (63) after them, W26-R22 `Freeze` (64),
+        // and the unification its five agent variants (58 to 62) and four server variants (65 to 68).
+        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (63, 69), "each table has every variant once");
         assert!(CAP_UNREAD.is_power_of_two() && CAP_UNREAD == 1 << 41 && CAP_UNREAD & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH) == 0);
         assert!(CAP_WORKSPACE_COMMITS.is_power_of_two() && CAP_WORKSPACE_COMMITS == 1 << 42 && CAP_WORKSPACE_COMMITS & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD) == 0);
         assert!(CAP_WORKSPACE_COMPARE.is_power_of_two() && CAP_WORKSPACE_COMPARE == 1 << 43 && CAP_WORKSPACE_COMPARE & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD | CAP_WORKSPACE_COMMITS) == 0);
@@ -1497,6 +1511,20 @@ mod tests {
         assert_eq!((encode(&up)?.first().copied(), encode(&down)?.first().copied()), (Some(57), Some(63)));
         assert_eq!(decode::<AgentMsg>(&encode(&up)?)?, up);
         assert_eq!(decode::<ServerMsg>(&encode(&down)?)?, down);
+        Ok(())
+    }
+
+    /// W26-R22: Pause's freezing is appended after every older variant, and its capability is a bit
+    /// of its own: a runner from before reads it as a variant it doesn't know, and is sent none.
+    #[test]
+    fn w26_r22_freeze_is_appended_after_every_older_variant() -> anyhow::Result<()> {
+        let down = ServerMsg::Freeze { job: "j".into(), frozen: true };
+        let refused = encode(&ServerMsg::ReachRefused { from: "a".into(), link: "L".into(), code: crate::reach::relay::Refusal::Taken, why: String::new() })?;
+        assert_eq!(encode(&down)?.first().copied(), refused.first().map(|i| i + 1), "Freeze comes right after ReachRefused");
+        assert_eq!(encode(&down)?.first(), Some(&64));
+        assert_eq!(decode::<ServerMsg>(&encode(&down)?)?, down);
+        let older = CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD | CAP_WORKSPACE_COMMITS | CAP_WORKSPACE_COMPARE;
+        assert!(CAP_FREEZE.is_power_of_two() && CAP_FREEZE & older == 0 && CAP_FREEZE & u64::from(u32::MAX) == 0);
         Ok(())
     }
 

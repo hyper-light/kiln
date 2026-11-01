@@ -100,6 +100,19 @@ fn follow_logs(hub: Arc<Hub>, cd: Arc<super::Cd>, input: Value, req: Request) ->
                 return;
             }
         };
+        // What a runner's job made (a Compose project, a host's service): followed on its hosts (W26-R26).
+        {
+            let f = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or("");
+            let k = ResKey::new(f("group"), f("kind"), f("namespace"), f("name"));
+            if super::logs::on_runners(&k) {
+                let id = f("app").to_owned();
+                let ask = super::logs::ask_of(&input, true);
+                if let Err(e) = super::logs::follow(hub, cd, id, k, ask, sock, socket).await {
+                    tracing::debug!(error = %format!("{e:#}"), "a log stream ended");
+                }
+                return;
+            }
+        }
         let found = async {
             let id = input.get("app").and_then(Value::as_str).unwrap_or("").to_owned();
             let f = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or("");

@@ -488,10 +488,11 @@ pub fn open_local(hub: &Arc<Hub>, command: Option<String>, cols: u16, rows: u16)
 }
 
 /// A terminal kiln opened for itself, upgrading an older runner ([`crate::updates::HIDDEN_MARK`])
-/// or signing a harness in or out ([`crate::accounts::MARK`]), or one beside an agent, shown on
-/// that agent's page ([`crate::harness::screen::MARK`]): never listed as anyone's terminal.
+/// or signing a harness in or out ([`crate::accounts::MARK`]), one beside an agent, shown on that
+/// agent's page ([`crate::harness::screen::MARK`]), or reading a deployment's log on its host
+/// ([`crate::cd::logs::MARK`]): never listed as anyone's terminal.
 pub fn hidden(command: Option<&str>) -> bool {
-    command.is_some_and(|c| c.contains(crate::updates::HIDDEN_MARK) || c.contains(crate::accounts::MARK) || c.contains(crate::harness::screen::MARK))
+    command.is_some_and(|c| c.contains(crate::updates::HIDDEN_MARK) || c.contains(crate::accounts::MARK) || c.contains(crate::harness::screen::MARK) || c.contains(crate::cd::logs::MARK))
 }
 
 /// Open a shell on a machine through its agent.

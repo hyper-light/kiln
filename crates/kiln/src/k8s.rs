@@ -935,6 +935,8 @@ mod tests {
             steps: Vec::new(),
             matrix: None,
             placement: None,
+            paused_at: None,
+            paused_ms: 0,
         }
     }
 

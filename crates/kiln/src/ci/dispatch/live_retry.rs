@@ -15,7 +15,8 @@ const READER_EPOCH:u32=6;
 pub(super) struct UnknownPlanLogKind(pub(super) String);
 
 pub(super) fn known_log_kind(kind:&str)->Result<(),UnknownPlanLogKind> {
-    if matches!(kind,"leg"|"cancel"|KIND|REFUSED) {Ok(())}else{Err(UnknownPlanLogKind(kind.into()))}
+    // W26-R21: some legs cancelled, the run going on, is a cancel's record of those legs.
+    if matches!(kind,"leg"|"cancel"|"cancel_leg"|KIND|REFUSED) {Ok(())}else{Err(UnknownPlanLogKind(kind.into()))}
 }
 
 #[derive(Clone,Debug,serde::Serialize,serde::Deserialize)]

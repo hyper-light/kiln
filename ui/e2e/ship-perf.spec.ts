@@ -9,14 +9,15 @@
  * data, nothing under it.
  */
 import { expect, test, type Page } from "@playwright/test";
+import { pickCommit } from "./ship-pick";
 
 const REAL = !!process.env.E2E_BASE_URL;
 test.skip(REAL, "drives the mock's commits and events");
 
 const open = async (page: Page, name: string) => {
   await page.goto("/ship");
-  const row = page.locator(".ship-row", { hasText: name }).first();
-  await row.locator(".ship-main").click();
+  // Ship's rows are repositories (W26-R29): kiln's, opened, the item picked.
+  const row = await pickCommit(page, name);
   await expect(row.locator(".rv-s").first()).toBeVisible();
   return row;
 };

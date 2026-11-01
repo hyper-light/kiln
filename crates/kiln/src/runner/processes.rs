@@ -422,6 +422,11 @@ impl std::fmt::Debug for Group {
 }
 impl Group {
     pub(crate) fn identity(&self) -> &Path { &self.record }
+    /// Its kernel group's folder (Linux): what freezes it whole (docs/ci.md W26-R22).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn cgroup_dir(&self) -> Option<PathBuf> {
+        match &self.kernel { Some(Containment::Kernel(group)) => Some(PathBuf::from(group.lease_identity())), _ => None }
+    }
     pub(crate) fn pgid(&self) -> i32 { self.pgid.load(Ordering::Acquire) }
     pub(crate) fn kill(&self) { self.start_retire(); }
     pub(crate) fn retain(&self) { self.retained.store(true, Ordering::Release); }

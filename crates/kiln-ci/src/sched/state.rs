@@ -181,6 +181,9 @@ pub struct LegIn {
     pub workflow_file: String,
     /// Where a person's retry asked it to run (W05-R28).
     pub placement: Placement,
+    /// A person paused it before (W26-R22), a server ago: it comes paused, placed nowhere until
+    /// it's resumed ([`Input::LegPaused`]).
+    pub paused: bool,
 }
 
 /// U01: durable capacity ownership, independent of a terminal plan or its specification.
@@ -340,6 +343,9 @@ pub enum Input {
     /// proof. Return only this assignment's physical accounting; logical result/log close,
     /// demands and retry decisions remain pending. Never use for a pool/parent/reach grant.
     OrdinaryExecutionReleased { leg: String, attempt: u32, runner: String },
+    /// A person paused a leg, or resumed it (W26-R22): paused, one waiting is placed nowhere until
+    /// it's resumed, and one running is frozen where it runs, keeping its runner, as it was.
+    LegPaused { leg: String, paused: bool },
 }
 
 /// What a runner has in use now, by its latest sample: what placement weighs of it besides its
@@ -464,6 +470,8 @@ pub enum WaitReason {
     Cadence { lane: String, next: i64 },
     /// Its lane's speculation window is full (W28-R68).
     Speculation { lane: String, size: u32, in_flight: u32 },
+    /// A person paused it (W26-R22): it's placed nowhere until it's resumed.
+    Paused,
     /// It's heavy on I/O, and the runners that could take it are past admission's limits
     /// (W24-R19): each, with its I/O pressure, the leg's limit there, its free disk and the floor.
     Load { held: Vec<super::load::Held> },
@@ -633,6 +641,8 @@ struct Leg {
     held: bool,
     /// While it runs: when it's expected to end (unix ms), so its runner has room again.
     ends: Option<i64>,
+    /// A person paused it (W26-R22): waiting, it fits no runner until it's resumed.
+    paused: bool,
     /// What it asks of a runner (W05-R03), kept while its pool's executor holds what it runs in:
     /// what it asks again once it overflows (W28-R80).
     asked: Resources,
@@ -1067,6 +1077,7 @@ impl Scheduler {
             Input::LegQueued(leg) => self.leg_queued(*leg, now, &mut out),
             Input::LegRunning { leg, runner, attempt } => self.adopt(*leg, runner, attempt, now, &mut out),
             Input::LegCancelled { leg, reason } => self.cancel(&leg, reason, now, &mut out),
+            Input::LegPaused { leg, paused } => self.paused(&leg, paused, now, &mut out),
             Input::LegGone { leg } => self.gone(&leg, now, &mut out),
             Input::AttemptFinished { leg, attempt, outcome } => self.finished(&leg, attempt, outcome, now, &mut out),
             Input::RetainExecution { leg, attempt } => {
@@ -1309,9 +1320,10 @@ impl Scheduler {
         self.ensure_sig(&sig, &req);
         let group = input.group.clone();
         let attempt = input.initial_attempt.max(1);
+        let paused = input.paused;
         self.legs.insert(
             id.clone(),
-            Leg { input, runtime_request, req, sig, state: State::Pending, attempt, physical_released: false, queued_at: now, arrived: now, key: None, counted: false, reason: None, avoid: None, pin: None, last_runner: None, cancelling: None, gone: false, started: None, hold: None, held: false, ends: None, asked, overflow: None },
+            Leg { input, runtime_request, req, sig, state: State::Pending, attempt, physical_released: false, queued_at: now, arrived: now, key: None, counted: false, reason: None, avoid: None, pin: None, last_runner: None, cancelling: None, gone: false, started: None, hold: None, held: false, ends: None, paused, asked, overflow: None },
         );
         match group {
             Some((key, name, cfg)) => {
@@ -1455,7 +1467,7 @@ impl Scheduler {
         }
         *self.in_progress.entry(input.repo.clone()).or_default() += 1;
         let request = input.request;
-        let (work, run, priority, started) = (input.work.clone(), input.run.clone(), input.priority, input.started);
+        let (work, run, priority, started, paused) = (input.work.clone(), input.run.clone(), input.priority, input.started, input.paused);
         let asked = input.request;
         self.legs.insert(
             id.clone(),
@@ -1481,6 +1493,7 @@ impl Scheduler {
                 hold: None,
                 held: false,
                 ends: None,
+                paused,
                 asked,
                 overflow: None,
             },
@@ -1851,7 +1864,7 @@ impl Scheduler {
     /// Whether a runner takes a leg now: it could ([`Self::room`]); and for a leg that waits for a
     /// busy warm runner, it's that one or one where the leg would take no longer (W24-R18).
     fn fits(&self, r: &Runner, l: &Leg) -> bool {
-        self.room(r, l) && self.under_target(r, l) && l.hold.as_ref().is_none_or(|h| h.runner == r.input.id || self.estimate(l, &r.input.id, &Self::wants(l)).busy_s() <= h.there_s)
+        !l.paused && self.room(r, l) && self.under_target(r, l) && l.hold.as_ref().is_none_or(|h| h.runner == r.input.id || self.estimate(l, &r.input.id, &Self::wants(l)).busy_s() <= h.there_s)
     }
 
     /// Whether a runner could take a leg now: it would ([`Self::admits`]), and has room for it
@@ -2361,6 +2374,34 @@ impl Scheduler {
         self.review_admission(now, out);
     }
 
+    /// A leg paused or resumed (W26-R22). Paused waiting, it fits no runner and says so; resumed,
+    /// the runners with room for it are tried. One running goes on holding its runner either way.
+    fn paused(&mut self, id: &str, paused: bool, now: i64, out: &mut Vec<Command>) {
+        let Some(l) = self.legs.get_mut(id) else { return };
+        if l.paused == paused || l.state == State::Done {
+            return;
+        }
+        l.paused = paused;
+        if l.state != State::Queued {
+            return;
+        }
+        if !paused {
+            for r in self.candidates(id) {
+                if !self.legs.get(id).is_some_and(|l| l.state == State::Queued && l.hold.is_none()) {
+                    break;
+                }
+                self.try_runner(&r, now, out);
+            }
+            if let Some(pool) = self.legs.get(id).filter(|l| l.state == State::Queued).and_then(|l| l.req.pool.clone()) {
+                self.scale(&pool, now, out);
+            }
+        }
+        if self.legs.get(id).is_some_and(|l| l.state == State::Queued) {
+            let reason = self.wait_reason(id);
+            self.set_reason(id, reason, out);
+        }
+    }
+
     fn settle(&mut self, id: &str, outcome: Outcome, reason: Option<String>, now: i64, out: &mut Vec<Command>) {
         // An executor made for it goes with it (a pod still starting for a cancelled leg).
         self.discard_used(id, out);
@@ -2559,7 +2600,8 @@ impl Scheduler {
     /// time left is cancelled, unless it finishes within finish_within, seeding trusted entries.
     fn contend(&mut self, id: &str, now: i64, out: &mut Vec<Command>) {
         let Some(l) = self.legs.get(id) else { return };
-        if !self.demands.live(&l.input.run) {
+        // A paused leg wants no room until it's resumed (W26-R22).
+        if l.paused || !self.demands.live(&l.input.run) {
             return;
         }
         let pool = l.req.pool.clone();
@@ -3373,8 +3415,8 @@ impl Scheduler {
         if p.hosted {
             if self.backoff.get(&(p.name.clone(), String::new())).is_some_and(|(until, _)| *until > now) { return; }
             // Each waiting leg that needs a pod of its own (W13-R07) gets one, within `max`; the
-            // shared ones are for the others.
-            let waiting = waiting_pods;
+            // shared ones are for the others. A paused one needs none until it's resumed (W26-R22).
+            let waiting: Vec<(String, bool)> = waiting_pods.into_iter().filter(|(id, _)| self.legs.get(id).is_some_and(|l| !l.paused)).collect();
             let mut room = p.max.saturating_sub(self.executors.values().filter(|e| e.pool == pool).count());
             for (leg, _) in waiting.iter().filter(|(_, own)| *own) {
                 if room == 0 {
@@ -3579,6 +3621,9 @@ impl Scheduler {
     /// Why a queued leg waits (W05-R13).
     fn wait_reason(&self, id: &str) -> WaitReason {
         let Some(l) = self.legs.get(id) else { return WaitReason::Unroutable { failing: Vec::new() } };
+        if l.paused {
+            return WaitReason::Paused;
+        }
         if let Some(q) = self.config().quotas.get(&l.input.repo)
             && self.in_progress.get(&l.input.repo).copied().unwrap_or(0) >= *q
         {

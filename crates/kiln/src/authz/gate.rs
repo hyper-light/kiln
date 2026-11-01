@@ -426,7 +426,7 @@ async fn job(hub: &Hub, t: &str) -> Option<Caller> {
         give(&["runs.read", "logs.read", "artifacts.read"], &here);
     }
     if j.may("actions", Level::Write) {
-        give(&["runs.trigger", "runs.cancel", "runs.rerun"], &here);
+        give(&["runs.trigger", "runs.cancel", "runs.rerun", "runs.pause"], &here);
     }
     if j.may("contents", Level::Write) {
         give(&["runs.trigger"], &here);

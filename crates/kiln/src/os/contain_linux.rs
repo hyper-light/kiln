@@ -1,6 +1,7 @@
 //! Each agent session's processes held together by the kernel: a cgroup (v2) of its own,
 //! `kiln-agents/<session>` under the cgroup the runner runs in (`kiln-agents-<pid>/<session>` for a
-//! runner that isn't the machine's installed one: [`prune_ended`]). Its harness joins it between fork
+//! runner that isn't the machine's installed one: [`prune_ended`]); and each CI job's steps on this
+//! machine, `kiln-jobs-<pid>/<job>` ([`Job`]). Its harness joins it between fork
 //! and exec, before it runs anything, so everything it starts is in it too, however that's
 //! parented later (a command that daemonized, `setsid`, a double fork): no process leaves its
 //! cgroup by forking. Listing an agent's processes is reading its `cgroup.procs`; whose a process
@@ -28,6 +29,9 @@ const ROOT: &str = "/sys/fs/cgroup";
 /// The folder under the runner's own cgroup that holds agents' groups (in tests, one of their own:
 /// tests often run in a live runner's cgroup).
 const AGENTS: &str = if cfg!(test) { "kiln-agents-test" } else { "kiln-agents" };
+/// The folder under the runner's own cgroup that holds its CI jobs' groups, one a runner process
+/// (`kiln-jobs-<pid>`): a job ends with the process that runs it. Headroom never paces them.
+const JOBS: &str = if cfg!(test) { "kiln-jobs-test" } else { "kiln-jobs" };
 /// How deep cgroups an agent's processes made of their own are followed.
 const DEPTH: usize = 8;
 const LAYOUT_ENV: &str = "KILN_CGROUP_LAYOUT";
@@ -208,7 +212,13 @@ fn base() -> Option<&'static Base> {
 /// instead and never holds, paces or ends another runner's agents. Those of runners that have ended
 /// go once nothing runs in them.
 fn prune_ended(own: &Path) {
-    let prefix = format!("{AGENTS}-");
+    prune_ended_of(own, AGENTS);
+}
+
+/// The `<folder>-<pid>` folders under `own` of processes that have ended, gone once nothing runs
+/// in them.
+fn prune_ended_of(own: &Path, folder: &str) {
+    let prefix = format!("{folder}-");
     for e in fs::read_dir(own).into_iter().flatten().flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
         let Some(pid) = name.strip_prefix(&prefix).and_then(|p| p.parse::<u32>().ok()) else { continue };
@@ -409,11 +419,168 @@ impl Group {
     pub fn remove(&self) {
         remove_tree(&self.dir, DEPTH);
     }
+
+    /// Removes it, and the groups its processes made in it, once nothing runs in them, on a thread
+    /// of its own (its last processes count for a moment after they're reaped): never waited for
+    /// here. What still runs keeps its group, which goes with the next runner's start.
+    pub fn release(&self) {
+        let dir = self.dir.clone();
+        if std::thread::Builder::new().name("kiln-group-release".into()).spawn(move || remove_tree(&dir, DEPTH)).is_err() {
+            prune(&self.dir, DEPTH);
+        }
+    }
 }
 
 /// The folder that holds this runner's agents' groups (headroom paces them), when it has one.
 pub fn agents_dir() -> Option<PathBuf> {
     base().map(|b| b.dir.clone())
+}
+
+/// A CI job's processes held together: a cgroup of its own, `kiln-jobs-<pid>/<job>` under the
+/// runner's own, which each of its steps joins before it runs anything (`crate::runner::freeze`).
+/// - The whole job can be frozen where it runs (`cgroup.freeze`) and let go on, whatever its steps
+///   started, however that's parented (docs/ci.md W26-R22).
+/// - A kiln one of its steps starts (a test's or a lab's runner) takes the cgroup it runs in as its
+///   own, so it holds and paces its agents in this job's group, never in the runner's
+///   `kiln-agents`, whatever build it is (the 2026-10-29 outage). Headroom never paces it.
+///
+/// Only membership is asked of it (no controllers): nothing it holds is counted or limited by it.
+#[derive(Debug, Clone)]
+pub struct Job {
+    dir: PathBuf,
+}
+
+impl Job {
+    /// The group at `dir`, made by another owner (a CI step's own, U01): frozen and let go on with
+    /// the job, never removed here.
+    pub(crate) fn at(dir: PathBuf) -> Job {
+        Job { dir }
+    }
+
+    /// Job `job`'s group, made now. `None` where this process may move no process into a cgroup
+    /// v2: its steps' process groups are stopped instead (`crate::runner::freeze`).
+    pub fn of(job: &str) -> Option<Job> {
+        let dir = jobs_base()?.dir.join(name_of(job)?);
+        if let Err(e) = fs::create_dir(&dir)
+            && e.kind() != std::io::ErrorKind::AlreadyExists
+        {
+            tracing::info!(job, error = %e, "a job's processes get no cgroup of their own: its steps' process groups are stopped to freeze it");
+            return None;
+        }
+        Some(Job { dir })
+    }
+
+    /// Makes `cmd`'s process join the group before it runs anything, as [`Group::enter`] does.
+    pub fn enter(&self, cmd: &mut Command) {
+        Group { dir: self.dir.clone() }.enter(cmd);
+    }
+
+    /// Moves process `pid` into it, started some other way (a step on a pty): what it started
+    /// before it moved stays where it was.
+    pub fn adopt(&self, pid: u32) -> bool {
+        fs::write(self.dir.join("cgroup.procs"), pid.to_string()).is_ok()
+    }
+
+    /// Every process in it now.
+    pub fn pids(&self) -> Vec<u32> {
+        let mut out = Vec::new();
+        collect(&self.dir, DEPTH, &mut out);
+        out
+    }
+
+    /// Freezes everything in it (`cgroup.freeze`), or lets it go on, and waits up to `within` for
+    /// the kernel to say it has (`cgroup.events`). A process that joins it while it's frozen is
+    /// frozen as it joins. Blocks: call it off the shards.
+    pub fn freeze(&self, frozen: bool, within: Duration) -> Result<(), String> {
+        fs::write(self.dir.join("cgroup.freeze"), if frozen { "1" } else { "0" }).map_err(|e| format!("its cgroup's freezer: {e}"))?;
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            if self.frozen() == frozen {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!("its processes weren't all {} within {} s", if frozen { "stopped" } else { "going again" }, within.as_secs()));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Whether the kernel says everything in it is frozen.
+    pub fn frozen(&self) -> bool {
+        fs::read_to_string(self.dir.join("cgroup.events")).is_ok_and(|t| t.lines().any(|l| l.trim() == "frozen 1"))
+    }
+
+    /// Gone once nothing runs in it: one try, a busy one goes as a later job starts.
+    pub fn remove(&self) {
+        let _ = fs::remove_dir(&self.dir);
+    }
+
+    /// Its `cgroup.freeze`, for tests to read.
+    #[cfg(test)]
+    pub fn freezer(&self) -> PathBuf {
+        self.dir.join("cgroup.freeze")
+    }
+}
+
+/// This runner process's folder of jobs' groups, worked out once; the folders of runner processes
+/// that have ended go once nothing runs in them, what they hold let go on first: a job its runner
+/// left frozen, gone, would be frozen for good (W26-R22).
+fn jobs_base() -> Option<&'static Base> {
+    static B: OnceLock<Option<Base>> = OnceLock::new();
+    B.get_or_init(|| {
+        let b = Base::under_own(&format!("{JOBS}-{}", std::process::id()))?;
+        if let Some(own) = b.dir.parent() {
+            thaw_ended(own, JOBS);
+            prune_ended_of(own, JOBS);
+            // The one folder builds before kept every runner process's jobs in, once nothing runs there.
+            prune(&own.join(JOBS), DEPTH);
+        }
+        Some(b)
+    })
+    .as_ref()
+}
+
+/// At a runner process's start: the jobs runner processes before it left frozen as they ended go
+/// on, as a dead runner's jobs always did (docs/ci.md W26-R22), and their folders go once empty.
+pub fn release_ended_jobs() {
+    let _ = jobs_base();
+}
+
+/// Everything in the `<folder>-<pid>` folders under `own` of processes that have ended let go on
+/// (`cgroup.freeze` 0, every group in them).
+fn thaw_ended(own: &Path, folder: &str) {
+    let prefix = format!("{folder}-");
+    for e in fs::read_dir(own).into_iter().flatten().flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(pid) = name.strip_prefix(&prefix).and_then(|p| p.parse::<u32>().ok()) else { continue };
+        if !Path::new(&format!("/proc/{pid}")).exists() && e.file_type().is_ok_and(|t| t.is_dir()) {
+            thaw_tree(&e.path(), DEPTH);
+        }
+    }
+}
+
+fn thaw_tree(dir: &Path, depth: usize) {
+    if fs::read_to_string(dir.join("cgroup.freeze")).is_ok_and(|v| v.trim() == "1") {
+        let _ = fs::write(dir.join("cgroup.freeze"), "0");
+    }
+    if depth > 0 {
+        for e in fs::read_dir(dir).into_iter().flatten().flatten() {
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                thaw_tree(&e.path(), depth - 1);
+            }
+        }
+    }
+}
+
+/// The groups of jobs that ended with something still in them ([`Job::remove`] found them busy),
+/// gone once nothing runs in them: those `running` doesn't name.
+pub fn prune_jobs(running: impl Fn(&str) -> bool) {
+    let Some(b) = jobs_base() else { return };
+    for e in fs::read_dir(&b.dir).into_iter().flatten().flatten() {
+        if e.file_type().is_ok_and(|t| t.is_dir()) && !running(&e.file_name().to_string_lossy()) {
+            prune(&e.path(), DEPTH);
+        }
+    }
 }
 
 /// The agent session process `pid` belongs to by its group, when it's in one.
@@ -465,6 +632,49 @@ fn remove_tree(dir: &Path, depth: usize) {
 /// touch the runner's: the processes it holds, whose they are, and ending them.
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// W26-R22: a job its runner process left frozen as it ended goes on once another starts: its
+    /// group is let go of, and the folder goes once nothing runs in it.
+    #[test]
+    fn w26_r22_a_job_left_frozen_by_an_ended_runner_goes_on() -> anyhow::Result<()> {
+        // This process's own start first: it lets go of ended runners' jobs once, and a test beside
+        // this one starting it meanwhile would let this one's go before it's looked at.
+        let _ = jobs_base();
+        // A runner process that has ended: no such process.
+        let gone = (4_000_000..4_100_000).find(|p| !Path::new(&format!("/proc/{p}")).exists()).ok_or_else(|| anyhow::anyhow!("no free pid"))?;
+        let Some(base) = Base::under_own(&format!("{JOBS}-{gone}")) else {
+            eprintln!("no cgroup v2 this test may write: skipped");
+            return Ok(());
+        };
+        let job = Job { dir: base.dir.join("01a1job") };
+        fs::create_dir_all(&job.dir)?;
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "while :; do :; done"]);
+        job.enter(&mut cmd);
+        let mut child = cmd.spawn()?;
+        let checked = (|| {
+            job.freeze(true, Duration::from_secs(5)).map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(job.frozen(), "frozen");
+            let own = base.dir.parent().ok_or_else(|| anyhow::anyhow!("no parent"))?;
+            thaw_ended(own, JOBS);
+            for _ in 0..100 {
+                if !job.frozen() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            anyhow::ensure!(!job.frozen(), "the ended runner's job goes on");
+            Ok(())
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        remove_tree(&base.dir, 2);
+        checked?;
+        anyhow::ensure!(!base.dir.exists(), "its folder goes once empty");
+        Ok(())
+    }
+
     /// A runner that isn't the installed one never takes another's folder, and those of runners
     /// that ended go once empty (the 2026-10-29 outage: a lab runner paced production's agents).
     #[test]
@@ -553,7 +763,46 @@ mod tests {
         Ok(())
     }
 
-    use super::*;
+    /// A CI step's kiln (a lab's runner) takes the cgroup it runs in as its own: in its job's
+    /// group, the agents' folder it makes is inside that group, never the runner's `kiln-agents`
+    /// (the 2026-10-29 outage). The job's group goes once its step has ended, and not before.
+    #[test]
+    fn a_step_s_kiln_makes_its_agents_folder_inside_its_job_s_group() -> anyhow::Result<()> {
+        // A folder of its own: the jobs' one (`kiln-jobs-test-<pid>`) holds other tests' jobs, which
+        // its pruning at the end would race.
+        let Some(base) = Base::under_own(&format!("{JOBS}-steps-{}", std::process::id())) else {
+            eprintln!("no cgroup v2 this test may write: skipped");
+            return Ok(());
+        };
+        let job = base.group("01a1job", true).ok_or_else(|| anyhow::anyhow!("no group under {}", base.dir.display()))?;
+        // The step: a shell that makes `kiln-agents` under its own cgroup, as any kiln does.
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "own=$(sed -n 's/^0:://p' /proc/self/cgroup); mkdir /sys/fs/cgroup$own/kiln-agents && echo $own; sleep 30"]).stdout(std::process::Stdio::piped()).stdin(std::process::Stdio::null());
+        job.enter(&mut cmd);
+        let mut child = cmd.spawn()?;
+        let mut line = String::new();
+        if let Some(out) = child.stdout.take() {
+            use std::io::BufRead as _;
+            std::io::BufReader::new(out).read_line(&mut line)?;
+        }
+        let made = Path::new(ROOT).join(line.trim().trim_start_matches('/')).join("kiln-agents");
+        let inside = made.starts_with(&job.dir) && made.is_dir();
+        job.release();
+        let kept_while_running = job.dir.is_dir();
+        let _ = child.kill();
+        let _ = child.wait();
+        job.release();
+        let gone = (0..100).any(|_| {
+            std::thread::sleep(Duration::from_millis(30));
+            !job.dir.exists()
+        });
+        prune(&base.dir, 1);
+        anyhow::ensure!(inside, "the step's agents folder {} isn't inside its job's group {}", made.display(), job.dir.display());
+        anyhow::ensure!(kept_while_running, "the job's group went while its step ran");
+        anyhow::ensure!(gone, "the job's group stayed after its step ended");
+        Ok(())
+    }
+
 
     #[test]
     fn what_an_agent_starts_stays_in_its_group_however_it_s_parented() -> anyhow::Result<()> {

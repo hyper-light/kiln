@@ -254,6 +254,39 @@ fn w05_ac10_wait_reasons() {
     assert_eq!(s.reason("r"), Some(&WaitReason::Retry { at: 30_010 }));
 }
 
+/// W26-R22: a waiting leg paused is placed nowhere, the legs behind it going on and saying why it
+/// waits (paused); resumed, it's placed at once where there's room. One running paused keeps its
+/// runner (it's frozen there), and nothing takes its slot; resumed, it's as it was, and its end
+/// frees its runner as any leg's does.
+#[test]
+fn w26_r22_a_paused_leg_waits_until_it_is_resumed() {
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::LegQueued(Box::new(leg("held", "acme/x", 90))), 0);
+    s.handle(Input::LegQueued(Box::new(leg("next", "acme/x", 60))), 1);
+    let c = s.handle(Input::LegPaused { leg: "held".into(), paused: true }, 2);
+    assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. })), "{c:?}");
+    assert_eq!(s.reason("held"), Some(&WaitReason::Paused));
+    // A runner comes up: the leg behind the paused one runs, ahead of it or not.
+    let c = s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 3);
+    assert_eq!(assigned(&c), ["next"]);
+    assert_eq!(s.reason("held"), Some(&WaitReason::Paused), "still paused, and saying so");
+    // Its slot free again, the paused leg still waits.
+    let c = s.handle(Input::AttemptFinished { leg: "next".into(), attempt: 1, outcome: Outcome::Success }, 4);
+    assert!(assigned(&c).is_empty(), "{c:?}");
+    // Paused again: nothing changes. Resumed: placed at once.
+    assert!(s.handle(Input::LegPaused { leg: "held".into(), paused: true }, 5).is_empty());
+    let c = s.handle(Input::LegPaused { leg: "held".into(), paused: false }, 6);
+    assert_eq!(assigned(&c), ["held"]);
+    // Running, paused: it keeps its runner; a leg that comes waits for the slot.
+    s.handle(Input::LegPaused { leg: "held".into(), paused: true }, 7);
+    let c = s.handle(Input::LegQueued(Box::new(leg("later", "acme/x", 60))), 8);
+    assert!(assigned(&c).is_empty(), "the paused leg holds its runner: {c:?}");
+    assert!(matches!(s.reason("later"), Some(WaitReason::Capacity { busy: 1, .. })), "{:?}", s.reason("later"));
+    s.handle(Input::LegPaused { leg: "held".into(), paused: false }, 9);
+    let c = s.handle(Input::AttemptFinished { leg: "held".into(), attempt: 1, outcome: Outcome::Success }, 10);
+    assert_eq!(assigned(&c), ["later"], "resumed, it ends and frees its runner");
+}
+
 /// A leg cancelled while it runs ends cancelled whatever its attempt reports, its runner lost
 /// with it included, and isn't retried.
 #[test]
