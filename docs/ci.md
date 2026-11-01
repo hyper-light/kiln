@@ -8749,7 +8749,9 @@ resolution makes, a comment, a resolution, an approval and each mark of the Revi
     version Review cleared and the commit it merged as. It names the tip it went onto where
     kiln's mirror has the commit, else none. It's kept in `land_signatures` and the trail, read back
     by `GET /api/repos/:repo/lands/:commit`, and `kiln verify` reads it as "landed on main by its
-    host's merge queue, as kiln saw it land". The land's record keeps its trunk's policy.
+    host's merge queue, as kiln saw it land". The land's record keeps its trunk's policy. A stack
+    its host's queue merges part-way, the rest leaving it unmerged, lands what merged before the
+    entry is out, saying which part merged.
   - *Tests:*
     - kiln-ci: `w26_r19_a_host_pulls_gate`, `w26_r19_a_host_queues_land_reads_back`,
       `w26_r19_a_host_merges_only_what_kiln_tested`.
@@ -8757,13 +8759,17 @@ resolution makes, a comment, a resolution, an approval and each mark of the Revi
     - kiln: `w26_r19_a_host_pull_enters_its_hosts_queue_only_when_clear` (GitHub's merge queue and
       GitLab's merge trains through the forge seam's simulator),
       `w26_r19_a_host_queues_land_is_signed_into_the_trail`,
+      `w26_r19_a_stack_its_hosts_queue_merged_part_way_lands_what_merged`,
       `w26_r19_a_change_its_host_merged_while_held_lands_signed`, and
       `w26_r19_a_host_without_a_queue_lands_through_kilns` (a real mirror beside the simulator:
       merged at the head tested, built again when the trunk moved before the merge, out when the
       head moved). Batches: `w26_r19_a_batch_merges_whole_or_not_at_all`,
       `w26_r19_a_stack_merged_part_way_lands_what_merged`,
-      `w26_r19_a_batch_stops_once_its_merges_are_done` and
-      `w26_r19_what_kiln_lands_of_an_entry_is_signed_once`.
+      `w26_r19_a_batch_stops_once_its_merges_are_done`,
+      `w26_r19_what_kiln_lands_of_an_entry_is_signed_once` and
+      `w26_r19_a_merge_its_host_wont_do_takes_its_entry_out`. Signed as tested:
+      `w26_r19_a_host_merge_of_what_kiln_tested_is_signed_as_tested` (the host's merge a real commit
+      kiln's mirror fetches).
     - The hosting test `w26_r19_d41_lands_through_the_queue`.
     - Playwright: `ship-land.spec.ts`.
   - **Hosts without a queue** (Bitbucket; GitHub without one) land through W28's queue, built with
@@ -8782,7 +8788,10 @@ resolution makes, a comment, a resolution, an approval and each mark of the Revi
       - A batch stops only once none of its merges is under way: that merge's result says what
         merged.
     - Then the host merges each change at the head tested, bottom first. A background merge is
-      read on the next step, never waited on. A change already merged counts as merged.
+      read on the next step, never waited on. A change already merged counts as merged. A merge its
+      host won't do on any step (unsupported, invalid, not linear, past a stack's bound, not found)
+      takes its entry out, saying why. One it may do later (busy, rate-limited, unreachable) is
+      tried again on the next step.
     - A batch stopped part-way still lands what merged: recorded and signed, not as tested. An
       entry merged whole lands. One merged part-way goes out, held or back to the queue, and what
       kiln landed of it is signed once: its later land signs only what merged since, and its
@@ -8800,7 +8809,9 @@ resolution makes, a comment, a resolution, an approval and each mark of the Revi
     threads by the trunk's `resolve_threads`. A host change's files aren't read into the conflict
     graph, so each host entry is a component of its own. That's safe, since `host_merge` builds a
     candidate again on any moved trunk; it's only slower, as host repositories lose commuting
-    components. It's filed for later.
+    components. It's filed for later. A host's rebase or fast-forward merge is always signed as
+    applied again: its commits don't show kiln which tip they went onto. That's conservative, never
+    claiming as tested a land kiln can't show was.
 - *Tests.*
   - kiln-ci: `review.rs` (`w26_r11_*`, `w26_r12_a_resolved_conflict_waits_on_its_commit`),
     `suggest.rs` (`w26_r10_*`), `conflicts.rs` (`w26_r12_*`). The Search suite on its simulator
