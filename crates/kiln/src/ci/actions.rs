@@ -190,6 +190,9 @@ pub async fn resolve(hub: &Hub, repo: &Repo, sha: &str, wf: &Workflow) -> Result
             continue;
         }
         allowed(&u)?;
+        if let Some(why) = kiln_ci::drafts::uses_of_another(&u, &repo.name) {
+            return Err(format!("KCI4023 {why}"));
+        }
         let key = u.strip_prefix("./").unwrap_or(&u);
         if let Some(w) = called.get(&u).or_else(|| called.get(key)) {
             calls.extend(w.jobs.iter().filter_map(|j| j.uses.clone()).map(|x| (x, depth + 1)));
@@ -234,6 +237,9 @@ pub async fn resolve(hub: &Hub, repo: &Repo, sha: &str, wf: &Workflow) -> Result
             continue;
         }
         allowed(&uses)?;
+        if let Some(why) = kiln_ci::drafts::uses_of_another(&uses, &repo.name) {
+            return Err(format!("KCI4023 {why}"));
+        }
         // `$/path`: this repository at the running commit (W07-R01), read from the server's
         // mirror, so no checkout is needed.
         if let Some(p) = uses.strip_prefix("$/") {
@@ -298,6 +304,16 @@ pub async fn resolve(hub: &Hub, repo: &Repo, sha: &str, wf: &Workflow) -> Result
                 s
             }
         };
+        // A commit of another of kiln's repositories that only a draft's branch reaches is the
+        // draft's (W29-R10, kiln's addition): refused, as a draft's ref is.
+        if let Ok(sha) = &pinned
+            && r.native
+            && !r.full().eq_ignore_ascii_case(&repo.name)
+            && r.git_ref.eq_ignore_ascii_case(sha)
+            && !published(hub, &r, sha).await.unwrap_or(true)
+        {
+            return Err(format!("KCI4023 `{uses}` names a commit only a draft reaches (a branch under {}), which is its author's until it's published", kiln_ci::drafts::DRAFT_PREFIX));
+        }
         // One that can't be resolved fails the jobs that use it, not the run (W07-R03).
         let sha = match pinned {
             Ok(sha) => sha,
@@ -365,6 +381,14 @@ fn native_source(hub: &Hub, owner: &str, repo: &str) -> anyhow::Result<String> {
 
 /// The commit `ref` names now, fetched into the mirror (W07-R02, W07-R03): a tag (peeled), a
 /// branch, or a full SHA. When the source can't be reached, a ref the mirror knows still works.
+/// Whether a branch or tag of `r`'s repository other than a draft's (W29-R10) reaches `sha`, as
+/// its mirror has them.
+async fn published(hub: &Hub, r: &Remote, sha: &str) -> anyhow::Result<bool> {
+    let d = r.mirror(hub).to_string_lossy().into_owned();
+    let out = gitops::run_git(hub, &["-C", &d, "for-each-ref", "--contains", sha, "--format=%(refname)", "refs/heads", "refs/tags"], GIT_TIMEOUT).await?;
+    Ok(String::from_utf8_lossy(&out).lines().any(|r| !r.is_empty() && !kiln_ci::drafts::is_draft_ref(r)))
+}
+
 pub(crate) async fn pin(hub: &Hub, r: &Remote) -> anyhow::Result<String> {
     pin_ref(hub, r).await.map(|(sha, _)| sha)
 }

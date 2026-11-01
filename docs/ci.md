@@ -10483,6 +10483,7 @@ lockfile, which pins commit A. An attacker moves `v45` and `v45.0.7` to commit M
 | `KCI1032` | error | a code workflow tried what plan time refuses: another import, the clock, randomness, the network or a secret (W29-R27, R28) |
 | `KCI1033` | error | TypeScript syntax that isn't erasable (W29-R27) |
 | `KCI4022` | error | a `uses:` that its owner's Access doesn't allow (W29-R17, R19) |
+| `KCI4023` | error | a `uses:` of another repository's draft: a ref under `kiln/draft/`, or (a repository kiln hosts) a commit only a draft's branch reaches (W29-R10) |
 | `KCI4033` | error | a Firecracker action that no runner with the executor can take (W29-R29) |
 | `KCI4034` | error | a shards action, while no machine runs shards microVMs (W29-R30) |
 | `KCI4050` | error | an action a locked workflow reaches isn't in its lock (W29-R23, R24) |

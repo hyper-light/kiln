@@ -74,7 +74,10 @@ pub async fn of(hub: &Arc<Hub>, caller: Option<&crate::authz::Caller>, b: Value)
     };
     let declared = w.on.iter().find(|t| t.event == "workflow_dispatch").map(|t| t.inputs.clone());
     let (event, inputs) = events::preview_event(hub, &repo, &event_name, &full_ref, &sha, payload.as_ref(), &given, declared.as_deref(), &path).await.map_err(refused)?;
-    let matched = kiln_ci::trigger::matches(&w, &event);
+    let matched = match kiln_ci::drafts::held_back(&event, &path) {
+        Some(why) => Err(why.to_owned()),
+        None => kiln_ci::trigger::matches(&w, &event),
+    };
     // What the action policies refuse among its own `uses:` (a run checks the nested ones too).
     let policy = super::actions::refusals(&super::actions::policies(hub, &repo).await, super::actions::uses_of(&w));
     let matrices = matrices(&w);

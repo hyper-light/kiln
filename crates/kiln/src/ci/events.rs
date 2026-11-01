@@ -95,6 +95,11 @@ pub async fn start_given(hub: &Hub, repo: &Repo, event: &Event, l: &load::Loaded
         }
         return Ok(true);
     };
+    // A draft runs only by its author's Run (docs/ci.md W29-R10, R14).
+    if let Some(why) = kiln_ci::drafts::held_back(event, &l.path) {
+        tracing::debug!(workflow = %l.path, %why, "workflow not run");
+        return Ok(false);
+    }
     if let Err(why) = kiln_ci::trigger::matches(w, event) {
         tracing::debug!(workflow = %l.path, %why, "workflow not run");
         return Ok(false);

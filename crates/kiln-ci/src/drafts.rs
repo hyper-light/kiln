@@ -68,6 +68,35 @@ pub fn undrafted_title(title: &str) -> Option<String> {
 /// GitHub's REST API can't.
 pub const GITHUB_READY: &str = "mutation($id: ID!) { markPullRequestReadyForReview(input: { pullRequestId: $id }) { pullRequest { isDraft } } }";
 
+/// Why `event` starts no run of the workflow at `path` (W29-R10), or None: nothing runs on a
+/// draft's branch; and a draft diff doesn't run a workflow whose own file it changes, whatever
+/// its `drafts` says (a draft's own triggers don't count).
+pub fn held_back(event: &crate::trigger::event::Event, path: &str) -> Option<&'static str> {
+    if is_draft_ref(&event.git_ref) {
+        return Some("it's a draft's branch: a draft runs only by its author's Run (W29-R10)");
+    }
+    let flag = event.payload.pointer("/kiln/diff/draft");
+    let draft = event.name == "diff" && (flag == Some(&serde_json::Value::Bool(true)) || flag.and_then(serde_json::Value::as_str) == Some("true"));
+    if draft && event.changed.as_ref().is_some_and(|c| c.iter().any(|p| p == path)) {
+        return Some("a draft diff doesn't run the workflow it drafts (W29-R10)");
+    }
+    None
+}
+
+/// Why a run of `repo` may not use `uses` (W29-R10), or None: it names another repository's ref
+/// under `kiln/draft/`. The draft's own repository may.
+pub fn uses_of_another(uses: &str, repo: &str) -> Option<String> {
+    let why = uses_draft(uses)?;
+    let target = uses.trim();
+    let target = target.strip_prefix("kiln://").unwrap_or(target);
+    let mut parts = target.split(['/', '@']);
+    let ours = match (parts.next(), parts.next()) {
+        (Some(owner), Some(name)) => format!("{owner}/{name}").eq_ignore_ascii_case(repo),
+        _ => false,
+    };
+    (!ours).then_some(why)
+}
+
 /// Why another repository may not use `uses` (W29-R10): it names a ref under `kiln/draft/`, and a
 /// draft is its author's until it's published. A local action (`./…`) and an image aren't
 /// another repository's.
@@ -107,6 +136,24 @@ mod tests {
         for u in ["acme/kit@v1", "acme/kit/.github/actions/x@main", "./.github/actions/x", "docker://alpine:3.20", "acme/kit@kiln/drafts", "acme/kit"] {
             assert_eq!(uses_draft(u), None, "{u}");
         }
+    }
+
+    #[test]
+    fn w29_r10_nothing_runs_a_draft() {
+        use crate::trigger::event::Event;
+        let push = |r: &str| Event { name: "push".into(), git_ref: r.into(), ..Event::default() };
+        assert!(held_back(&push("refs/heads/kiln/draft/ci-01a19f2c"), ".github/workflows/ci.yml").is_some_and(|w| w.contains("draft")));
+        assert_eq!(held_back(&push("refs/heads/main"), ".github/workflows/ci.yml"), None);
+        let diff = |draft: bool, changed: &[&str]| Event { name: "diff".into(), git_ref: "refs/kiln/diffs/D3/v1".into(), payload: serde_json::json!({ "kiln": { "diff": { "draft": draft } } }), changed: Some(changed.iter().map(|c| (*c).to_owned()).collect()), ..Event::default() };
+        assert!(held_back(&diff(true, &[".kiln/self.yaml"]), ".kiln/self.yaml").is_some(), "its own triggers don't count");
+        assert_eq!(held_back(&diff(true, &[".kiln/self.yaml"]), ".kiln/watch.yaml"), None, "another workflow's `drafts: true` does");
+        assert_eq!(held_back(&diff(false, &[".kiln/self.yaml"]), ".kiln/self.yaml"), None, "a diff that isn't a draft runs what it changes");
+        // Another repository's draft is refused; the draft's own repository may name it.
+        assert!(uses_of_another("acme/kit/.github/actions/x@kiln/draft/x-1", "acme/app").is_some());
+        assert!(uses_of_another("kiln://acme/kit/x@kiln/draft/x-1", "acme/app").is_some());
+        assert_eq!(uses_of_another("acme/kit/.github/actions/x@kiln/draft/x-1", "acme/kit"), None);
+        assert_eq!(uses_of_another("kiln://ACME/kit/x@kiln/draft/x-1", "acme/kit"), None);
+        assert_eq!(uses_of_another("acme/kit/.github/actions/x@v1", "acme/app"), None);
     }
 
     #[test]

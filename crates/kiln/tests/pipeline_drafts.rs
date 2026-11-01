@@ -306,3 +306,121 @@ fn w29_r11_save_draft_on_a_host() -> anyhow::Result<()> {
     assert_eq!(moved.iter().map(|r| r.get("sha").cloned()).collect::<Vec<_>>(), [Some(json!(at(&second, "/draft/head")))], "{moved:?}");
     Ok(())
 }
+
+/// A repository's runs, newest first.
+fn runs(s: &Server, repo: &str) -> anyhow::Result<Vec<Value>> {
+    let v = get(s, &format!("/api/ci/runs?repo={repo}&limit=100"))?;
+    Ok(v.get("runs").and_then(Value::as_array).cloned().unwrap_or_default())
+}
+
+/// Until a run `pick` finds is there, a repository's runs then; `what` for the failure.
+fn until_run(s: &Server, repo: &str, what: &str, pick: impl Fn(&Value) -> bool) -> anyhow::Result<Vec<Value>> {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let all = runs(s, repo)?;
+        if all.iter().any(&pick) {
+            return Ok(all);
+        }
+        anyhow::ensure!(Instant::now() < deadline, "no run {what} in {repo}: {all:?}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// A repository kiln hosts, cloned under `dir` as `name`'s last part, its first commit (README)
+/// pushed and polled.
+fn hosted(s: &Server, home: &Path, dir: &Path, name: &str) -> anyhow::Result<std::path::PathBuf> {
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": name, "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{name}: {st} {body}");
+    let leaf = name.rsplit('/').next().unwrap_or(name);
+    git(home, dir, &["clone", "-q", &format!("http://x:{}@127.0.0.1:{}/git/{name}.git", s.admin, s.port), leaf])?;
+    let work = dir.join(leaf);
+    std::fs::write(work.join("README.md"), format!("{name}\n"))?;
+    git(home, &work, &["add", "."])?;
+    git(home, &work, &["commit", "-qm", "first"])?;
+    git(home, &work, &["push", "-q", "origin", "main"])?;
+    polled(s, name)?;
+    Ok(work)
+}
+
+/// Writes `files` in `work`, commits them and pushes `branch` (made from what's checked out).
+fn push_files(home: &Path, work: &Path, branch: &str, files: &[(&str, &str)]) -> anyhow::Result<String> {
+    if git(home, work, &["rev-parse", "--abbrev-ref", "HEAD"])?.trim() != branch {
+        git(home, work, &["checkout", "-q", "-B", branch])?;
+    }
+    for (path, text) in files {
+        let p = work.join(path);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(p, text)?;
+    }
+    git(home, work, &["add", "."])?;
+    git(home, work, &["commit", "-qm", &format!("on {branch}")])?;
+    git(home, work, &["push", "-q", "origin", branch])?;
+    Ok(git(home, work, &["rev-parse", "HEAD"])?.trim().to_owned())
+}
+
+/// W29-R10: no trigger runs a draft. A push to a draft's branch starts nothing, though a workflow
+/// takes every branch, and the preview says why; a draft diff doesn't run the workflow it drafts,
+/// though that one says `drafts: true`, while another workflow's `drafts: true` runs on it.
+#[test]
+fn w29_r10_no_trigger_runs_a_draft() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", extra: "" })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let work = hosted(&s, &home, dir.path(), "acme/app")?;
+    let all = "name: all\non:\n  push:\n    branches: ['**']\njobs:\n  a:\n    runs-on: local\n    steps:\n      - run: echo pushed\n";
+    let watch = "name: watch\non:\n  diff:\n    drafts: true\njobs:\n  w:\n    runs-on: local\n    steps:\n      - run: echo watched\n";
+    // Kiln's dialect: a commit with `.kiln/` workflows leaves GitHub's to GitHub.
+    push_files(&home, &work, "main", &[(".kiln/all.yaml", all), (".kiln/watch.yaml", watch)])?;
+    until_run(&s, "acme/app", "on main", |r| r.get("branch").and_then(Value::as_str) == Some("main"))?;
+
+    // A draft's branch, then another: only the other runs.
+    push_files(&home, &work, "kiln/draft/all-01a19f2c", &[("README.md", "a draft\n")])?;
+    git(&home, &work, &["checkout", "-q", "main"])?;
+    push_files(&home, &work, "feature", &[("README.md", "a feature\n")])?;
+    let seen = until_run(&s, "acme/app", "on feature", |r| r.get("branch").and_then(Value::as_str) == Some("feature"))?;
+    assert!(!seen.iter().any(|r| r.get("branch").and_then(Value::as_str).is_some_and(|b| b.contains("kiln/draft/"))), "nothing on a draft's branch: {seen:?}");
+    let preview = post(&s, "/api/ci/plan-preview", &json!({ "repo": "acme/app", "ref": "kiln/draft/all-01a19f2c", "path": ".kiln/all.yaml", "event": "push" }))?;
+    assert_eq!(preview.get("runs"), Some(&json!(false)), "{preview}");
+    assert!(at(&preview, "/why").contains("draft"), "{preview}");
+
+    // A draft diff of a workflow of its own.
+    git(&home, &work, &["checkout", "-q", "main"])?;
+    let own = "name: self\non:\n  diff:\n    drafts: true\njobs:\n  s:\n    runs-on: local\n    steps:\n      - run: echo self\n";
+    let saved = post(&s, "/api/ci/repos/acme%2Fapp/workflows/.kiln/self.yaml/edit", &json!({ "content": own, "draft": true, "title": "A workflow of its own" }))?;
+    assert_eq!(at(&saved, "/draft/kind"), "diff", "{saved}");
+    let seen = until_run(&s, "acme/app", "of .kiln/watch.yaml on the draft diff", |r| r.get("workflow").and_then(Value::as_str) == Some(".kiln/watch.yaml"))?;
+    assert!(!seen.iter().any(|r| r.get("workflow").and_then(Value::as_str) == Some(".kiln/self.yaml")), "the draft's own workflow doesn't run on it: {seen:?}");
+    Ok(())
+}
+
+/// W29-R10: no other repository can use a draft. A `uses:` of another repository's draft branch,
+/// or of a commit only that branch reaches, fails its run before any job starts (KCI4023); its
+/// published branch is used as ever.
+#[test]
+fn w29_r10_no_other_repository_uses_a_draft() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", extra: "" })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let kit = hosted(&s, &home, dir.path(), "acme/kit")?;
+    let action = |said: &str| format!("name: x\nruns:\n  using: composite\n  steps:\n    - run: echo {said}\n      shell: bash\n");
+    push_files(&home, &kit, "main", &[(".github/actions/x/action.yml", &action("published"))])?;
+    let drafted = push_files(&home, &kit, "kiln/draft/x-01a19f2c", &[(".github/actions/x/action.yml", &action("drafted"))])?;
+    let app = hosted(&s, &home, dir.path(), "acme/app")?;
+    let using = |name: &str, at: &str| format!("name: {name}\non: push\njobs:\n  a:\n    runs-on: local\n    steps:\n      - uses: kiln://acme/kit/.github/actions/x@{at}\n");
+    push_files(&home, &app, "main", &[(".kiln/branch.yaml", &using("branch", "kiln/draft/x-01a19f2c")), (".kiln/commit.yaml", &using("commit", &drafted)), (".kiln/ok.yaml", &using("ok", "main"))])?;
+    let done = |path: &'static str| move |r: &Value| r.get("workflow").and_then(Value::as_str) == Some(path) && r.get("finished_at").is_some_and(|f| !f.is_null());
+    for path in [".kiln/branch.yaml", ".kiln/commit.yaml"] {
+        let seen = until_run(&s, "acme/app", &format!("of {path}, finished"), done(path))?;
+        let run = seen.iter().find(|r| done(path)(r)).cloned().unwrap_or_default();
+        assert!(at(&run, "/error").contains("KCI4023"), "{path}: {run}");
+    }
+    let seen = until_run(&s, "acme/app", "of .kiln/ok.yaml, finished", done(".kiln/ok.yaml"))?;
+    let ok = seen.iter().find(|r| done(".kiln/ok.yaml")(r)).cloned().unwrap_or_default();
+    assert!(!at(&ok, "/error").contains("KCI4023"), "a published branch is used as ever: {ok}");
+    assert_eq!(at(&ok, "/conclusion"), "success", "{ok}");
+    Ok(())
+}
