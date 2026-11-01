@@ -51,6 +51,7 @@ pub mod previews;
 pub mod providers;
 pub mod verdict;
 pub mod registry;
+pub mod releases;
 pub mod replies;
 pub mod signing;
 pub mod sigstore;
