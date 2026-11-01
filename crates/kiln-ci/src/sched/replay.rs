@@ -1,6 +1,6 @@
 //! E1.4 (docs/needs.md): the engine gives the same commands on every machine. Seeded scenarios
 //! (SplitMix64, as kiln-sim draws) of runners of mixed sizes and platforms, legs of mixed needs,
-//! classes, priorities and repositories, attempts finishing, failing and retried, legs cancelled
+//! classes, priorities, repositories and p90s, attempts finishing, failing and retried, legs cancelled
 //! and runners lost and back drive the engine through its simulator; in half the seeds grants are
 //! leases, renewed by runners' heartbeats, some runners falling silent past them (W05-R34), and in
 //! half it backfills, keeping room for each class's first item that fits no runner (W05-R39).
@@ -122,6 +122,9 @@ fn leg(d: &mut Draw, n: u64) -> (LegIn, i64, Vec<FailureClass>) {
     });
     let duration = 5 * SECOND + ms(d, 120 * SECOND);
     let cost = (d.below(2) == 0).then(|| u64::try_from(duration / 2 + ms(d, duration)).unwrap_or(0));
+    // Its p90 from history (W05-R38) half the time, about how long it runs, now and then less, so
+    // grants run past it.
+    let p90 = (d.below(2) == 0).then(|| u64::try_from(duration / 2 + ms(d, duration)).unwrap_or(0));
     let l = LegIn {
         id: format!("l{n}"),
         run: format!("run{}", n / 4),
@@ -132,6 +135,7 @@ fn leg(d: &mut Draw, n: u64) -> (LegIn, i64, Vec<FailureClass>) {
         request,
         retry,
         cost,
+        p90,
         actor: format!("a{}", d.below(3)),
         lane: format!("lane{}", d.below(2)),
         class: Class::ALL.get(usize::try_from(d.below(5)).unwrap_or(0)).copied().unwrap_or_default(),

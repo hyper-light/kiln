@@ -869,6 +869,29 @@ pub const REFUSED_AGAIN_MS: i64 = 15_000;
 /// A leg's timeout when its job says none (W05-R38): 360 minutes, GitHub's.
 pub const DEFAULT_TIMEOUT_MS: Ms = 360 * 60_000;
 
+/// A bug planted in the engine for the reference engine to catch (docs/needs.md E4.5): in tests
+/// only, on one thread at a time; the engine's own checks of what it breaks stand aside for it.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Mutant {
+    /// Room kept holds nothing back: a leg is granted where it would still run at the room's time
+    /// without fitting beside it then (W05-R39).
+    PastReservation,
+    /// A gang starts without its last member (W05-R40).
+    GangInPart,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static MUTANT: std::cell::Cell<Option<Mutant>> = const { std::cell::Cell::new(None) };
+}
+
+/// The bug planted on this thread, if one is.
+#[cfg(test)]
+fn mutant() -> Option<Mutant> {
+    MUTANT.with(std::cell::Cell::get)
+}
+
 /// Why a leg stays off a runner (W05-R16).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Off {
@@ -1222,6 +1245,9 @@ pub struct Scheduler {
     /// fits no runner now, or for each member of its first gang (W05-R40). Not stored: worked out
     /// again from the grants after a restart.
     reserved: BTreeMap<Class, Kept>,
+    /// Runners whose kept room ended in this input (W05-R39): each takes what fits it before the
+    /// input is done, as new capacity does (W05-R04).
+    unkept: BTreeSet<String>,
     /// Gangs by id (W05-R40): their members as they've come, and how they go.
     gangs: BTreeMap<String, Crew>,
     /// The time of the last input: explanations reckon waits from it.
@@ -1446,11 +1472,16 @@ impl Scheduler {
             Input::Tick => self.tick(now, &mut out),
             Input::Warm { runner, held } => self.warm_changed(runner, held),
         }
-        // A reservation whose item left the queue, or whose runner went, keeps nothing (W05-R39).
-        self.drop_stale_reservations();
+        // A reservation whose item left the queue, or whose runner went, keeps nothing (W05-R39);
+        // the runners whose kept room ended take what fits them, as new capacity does (W05-R04).
+        loop {
+            self.drop_stale_reservations();
+            let Some(r) = self.unkept.pop_first() else { break };
+            self.try_runner(&r, now, &mut out);
+        }
         // G4 (W05-R40), held after every input of every test: no gang runs in part.
         #[cfg(test)]
-        {
+        if mutant().is_none() {
             let g4 = self.check_gangs();
             assert!(g4.is_ok(), "{g4:?}");
         }
@@ -1759,7 +1790,7 @@ impl Scheduler {
         let id = input.id.clone();
         // What runs there changed under them: the reservations there are worked out again when
         // next they matter (W05-R39).
-        self.reserved.retain(|_, k| !k.on(&runner));
+        self.keep_reserved(|_, k| !k.on(&runner));
         // Its grant keeps its fence, and gets a lease afresh: its runner renews it once it's back,
         // or it's lost then (W05-R34).
         let expires = self.cfg.lease.map(|ms| later(now, ms));
@@ -1956,8 +1987,11 @@ impl Scheduler {
     fn set_key(&mut self, id: &str) {
         self.seq += 1;
         let (seq, aging) = (self.seq, self.config().aging_per_minute);
+        // A gang's members share a class (W05-R40): one queued while others wait joins theirs, which
+        // their wait may have raised (W05-R31).
+        let mates = self.legs.get(id).and_then(|l| l.input.gang.as_ref()).and_then(|g| self.gangs.get(&g.id)).and_then(|c| c.members.iter().filter(|m| m.as_str() != id).find_map(|m| self.legs.get(m).filter(|x| x.state == State::Queued).and_then(|x| x.key)).map(|(c, _, _)| c));
         let Some(l) = self.legs.get_mut(id) else { return };
-        let class = l.input.class;
+        let class = mates.unwrap_or(l.input.class);
         l.key = Some((class, own_order(l.input.priority, aging, l.queued_at), seq));
         l.state = State::Queued;
         let at = l.queued_at;
@@ -1995,12 +2029,19 @@ impl Scheduler {
                     self.promotions.entry(last.saturating_add(bound)).or_default().push((id, queued, from));
                     continue;
                 }
-                self.unqueue(&id);
-                if let Some(l) = self.legs.get_mut(&id) {
-                    l.key = l.key.map(|(_, k, q)| (to, k, q));
+                // A gang's members share a class (W05-R40): its queued members in that class go up
+                // with it.
+                let mates: Vec<(String, i64)> = std::iter::once((id.clone(), queued))
+                    .chain(l.input.gang.as_ref().and_then(|g| self.gangs.get(&g.id)).map(|c| c.members.iter().filter(|m| **m != id).filter_map(|m| self.legs.get(m).filter(|x| x.state == State::Queued && x.key.is_some_and(|k| k.0 == from)).map(|x| (m.clone(), x.queued_at))).collect::<Vec<_>>()).unwrap_or_default())
+                    .collect();
+                for (m, queued) in mates {
+                    self.unqueue(&m);
+                    if let Some(l) = self.legs.get_mut(&m) {
+                        l.key = l.key.map(|(_, k, q)| (to, k, q));
+                    }
+                    self.insert_queue(&m);
+                    self.promote_at(&m, queued, at, to);
                 }
-                self.insert_queue(&id);
-                self.promote_at(&id, queued, at, to);
             }
         }
     }
@@ -3060,7 +3101,7 @@ impl Scheduler {
         let id = r.id.clone();
         // What it offers may have changed: the reservations on it are worked out again when next
         // they matter (W05-R39).
-        self.reserved.retain(|_, k| !k.on(&id));
+        self.keep_reserved(|_, k| !k.on(&id));
         // A hosted executor's own runner: the executor is ready, there (W13-R07). One the
         // scheduler doesn't know is told to go.
         if let Some(e) = r.executor.clone() {
@@ -3145,7 +3186,9 @@ impl Scheduler {
         // would rather have.
         self.requeued = Some(Vec::new());
         for leg in legs {
-            let Some((attempt, fence, gone)) = self.legs.get(&leg).map(|l| (l.attempt, l.fence, l.gone)) else { continue };
+            // One its gang took back already, with a member lost here before it, ended here then
+            // (W05-R40): it may be queued again, or granted again elsewhere, since.
+            let Some((attempt, fence, gone)) = self.legs.get(&leg).filter(|l| matches!(&l.state, State::Assigned { runner: r } if r == runner)).map(|l| (l.attempt, l.fence, l.gone)) else { continue };
             // Its grant is lost with its runner (W05-R34).
             if !gone {
                 out.push(Command::Lost { leg: leg.clone(), attempt, runner: runner.to_owned(), fence, why: Loss::RunnerLost });
@@ -3170,7 +3213,7 @@ impl Scheduler {
     fn rules_changed(&mut self, rules: Vec<Rule>, now: i64, out: &mut Vec<Command>) {
         self.cfg.rules = rules;
         // Where each item may run changed: reservations are worked out again (W05-R39).
-        self.reserved.clear();
+        self.keep_reserved(|_, _| false);
         let queued: Vec<String> = self.legs.iter().filter(|(_, l)| l.state == State::Queued).map(|(k, _)| k.clone()).collect();
         for id in &queued {
             self.unqueue(id);
@@ -3488,7 +3531,7 @@ impl Scheduler {
         let mut changed = false;
         for class in Class::ALL.into_iter().filter(|c| *c <= upto && passed.get(c.index()).copied().unwrap_or(false)) {
             let Some(head) = self.head(class) else {
-                changed |= self.reserved.remove(&class).is_some();
+                changed |= self.unkeep(class);
                 continue;
             };
             let gang = self.legs.get(&head).and_then(|l| l.input.gang.as_ref()).map(|g| g.id.clone());
@@ -3505,15 +3548,24 @@ impl Scheduler {
             let Some((items, at)) = next else {
                 // No runner could take it even once its grants end: nothing kept for it.
                 if standing.is_none() {
-                    changed |= self.reserved.remove(&class).is_some();
+                    changed |= self.unkeep(class);
                 }
                 continue;
             };
+            // Worked out again as it stood (its time passed, a grant run past its hard end): nothing
+            // changed, and the runner picks on, held to it.
+            if self.reserved.get(&class).is_some_and(|k| k.items == items && k.at == at) {
+                continue;
+            }
             // Its class goes before those after it: their reservations on its runners are worked
             // out again when next they matter.
-            self.reserved.retain(|c, k| *c <= class || !items.iter().any(|(_, r)| k.on(r)));
+            self.keep_reserved(|c, k| c <= class || !items.iter().any(|(_, r)| k.on(r)));
             let legs: Vec<String> = items.iter().map(|(l, _)| l.clone()).collect();
-            self.reserved.insert(class, Kept { items, at, made: now });
+            let kept: BTreeSet<String> = items.iter().map(|(_, r)| r.clone()).collect();
+            // Room it kept elsewhere before is room no more.
+            if let Some(was) = self.reserved.insert(class, Kept { items, at, made: now }) {
+                self.unkept.extend(was.items.into_iter().map(|(_, r)| r).filter(|r| !kept.contains(r)));
+            }
             for l in legs {
                 let reason = self.wait_reason(&l);
                 self.set_reason(&l, reason, out);
@@ -3621,7 +3673,9 @@ impl Scheduler {
         let ends: Vec<i64> = running.iter().filter_map(|g| self.look(g, now)).collect();
         let (r, l) = (self.runners.get(runner)?, self.legs.get(id)?);
         let class = l.key.map(|(c, _, _)| c)?;
-        if !self.admits(r, l) || !self.could_hold(r, l) {
+        // Not one it may be routed to: a class's first item, kept room for as another of its class
+        // is passed over here, may not be one this runner could ever take.
+        if !self.sigs.get(&l.sig).is_some_and(|s| s.eligible.contains(runner)) || !self.admits(r, l) || !self.could_hold(r, l) {
             return None;
         }
         let before = self.reserved_on(runner, |c, k| c < class && !k.holds(id));
@@ -3673,6 +3727,10 @@ impl Scheduler {
         if k.holds(&l.input.id) || l.req.pool.is_some() || Due::of(&l.input, self.now).expected <= k.at {
             return true;
         }
+        #[cfg(test)]
+        if mutant() == Some(Mutant::PastReservation) {
+            return true;
+        }
         let id = &r.input.id;
         let mut plus: Vec<&Leg> = k.legs_on(id).filter_map(|i| self.legs.get(i)).collect();
         plus.extend(self.reserved_on(id, |_, o| o != k && o.at <= k.at).into_iter().filter(|(_, end)| *end > k.at).map(|(other, _)| other));
@@ -3690,7 +3748,7 @@ impl Scheduler {
         let (Some(l), Some(r)) = (self.legs.get(id), self.runners.get(runner)) else { return };
         let gone: Vec<Class> = self.reserved.iter().filter(|(_, k)| k.holds(id) || (k.on(runner) && !self.respects(r, l, k, &[]))).map(|(c, _)| *c).collect();
         for c in gone {
-            self.reserved.remove(&c);
+            self.unkeep(c);
         }
     }
 
@@ -3701,9 +3759,33 @@ impl Scheduler {
             return;
         }
         let (legs, runners) = (&self.legs, &self.runners);
-        self.reserved.retain(|class, k| {
-            k.items.iter().all(|(leg, runner)| legs.get(leg).is_some_and(|l| l.state == State::Queued && l.key.is_some_and(|(c, _, _)| c == *class)) && runners.get(runner).is_some_and(|r| r.connected && !r.draining))
-        });
+        let gone: Vec<Class> = self
+            .reserved
+            .iter()
+            .filter(|(class, k)| {
+                !k.items.iter().all(|(leg, runner)| legs.get(leg).is_some_and(|l| l.state == State::Queued && l.key.is_some_and(|(c, _, _)| c == **class)) && runners.get(runner).is_some_and(|r| r.connected && !r.draining))
+            })
+            .map(|(c, _)| *c)
+            .collect();
+        for c in gone {
+            self.unkeep(c);
+        }
+    }
+
+    /// Ends `class`'s reservation, if it has one, its runners taking what fits them before the
+    /// input is done (W05-R04). Whether it had one.
+    fn unkeep(&mut self, class: Class) -> bool {
+        let Some(k) = self.reserved.remove(&class) else { return false };
+        self.unkept.extend(k.items.into_iter().map(|(_, r)| r));
+        true
+    }
+
+    /// Keeps the reservations `keep` keeps, and ends the rest ([`Self::unkeep`]).
+    fn keep_reserved(&mut self, keep: impl Fn(Class, &Kept) -> bool) {
+        let gone: Vec<Class> = self.reserved.iter().filter(|(c, k)| !keep(**c, k)).map(|(c, _)| *c).collect();
+        for c in gone {
+            self.unkeep(c);
+        }
     }
 
     // ------------------------------------------------------------------ gangs (W05-R40)
@@ -3791,6 +3873,14 @@ impl Scheduler {
             return false;
         }
         let Some(plan) = self.gang_plan(g) else { return false };
+        #[cfg(test)]
+        let plan = {
+            let mut plan = plan;
+            if mutant() == Some(Mutant::GangInPart) && plan.len() > 1 {
+                plan.pop();
+            }
+            plan
+        };
         if let Some(c) = self.gangs.get_mut(g) {
             c.ended = false;
             c.round = plan.iter().map(|(m, _)| m.clone()).collect();
@@ -4445,6 +4535,9 @@ impl Scheduler {
     /// classes before it kept there.
     #[cfg(test)]
     fn check_reservations(&self) -> Result<(), String> {
+        if mutant().is_some() {
+            return Ok(());
+        }
         for (class, k) in &self.reserved {
             for (leg, runner) in &k.items {
                 if !self.legs.get(leg).is_some_and(|l| l.state == State::Queued && l.key.is_some_and(|(c, _, _)| c == *class)) {

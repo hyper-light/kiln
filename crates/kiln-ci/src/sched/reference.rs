@@ -61,12 +61,34 @@
 //! - Draining (W05-R34): a draining runner takes nothing, and its runner's offers leave the fleet;
 //!   the runners that legs stay off while another could take them take what fits them, in name
 //!   order; undrained, it's back as a runner that came back is.
+//! - A grant's two ends (W05-R38): expected at its start plus its p90, else its cost, else its
+//!   timeout (360 minutes unsaid), never past its hard end, its start plus its timeout; an
+//!   expected end that has passed is moved on, when room kept looks at it, to its start plus twice
+//!   the time it has run, never past its hard end, and kept there.
+//! - Room kept (W05-R39), with backfilling: as a runner picks, the first of a class, or of a class
+//!   before the leg it would take, that it would take but has no room for has that class's first
+//!   queued leg by every dimension that waits only for room keep room where it would fit soonest
+//!   (trying every runner it may run on, adding up the expected ends there, beside the room kept
+//!   for the classes before it; ties to where it would finish first, then by name), or keep the
+//!   room it had, moved only to that runner if it would fit there sooner, or worked out again once
+//!   its time has passed. A leg may then go to a runner where room is kept for its class or one
+//!   before it only if it's expected to end by the room's time, or fits beside it then. Room kept
+//!   ends when its leg is granted, leaves the queue or its class, or its runner goes, drains or
+//!   comes back; a leg granted over room of a class after its own ends that room.
+//! - Gangs (W05-R40): a gang's member goes only with its whole gang, once as many members as make
+//!   it are queued, all granted at once (trying every way of putting its members on runners with
+//!   room, as many as 4,096 places) or none; a whole gang that can't start now keeps room for each
+//!   member, all from the latest of their times. A member refused takes the others' grants back,
+//!   each queued again at its attempt once its runner has stopped it (the lock-delay); one lost
+//!   before any member ended takes them back to their next attempts, or all fail; after one ended,
+//!   none is tried again alone.
 //!
-//! Pools, warm placement, reservations, groups, quotas, admission, preferences and retry policies
-//! are outside it, and its cases don't make them.
+//! Pools, warm placement, windows kept for legs, groups, quotas, admission, preferences and retry
+//! policies are outside it, and its cases don't make them.
 //!
-//! The differential test runs [`CASES`] small random cases (at most 4 runners, 12 legs and 40
-//! inputs) through it and the engine, and compares what runs where (with each grant's fence and
+//! The differential test runs [`CASES`] small random cases (at most 4 runners, 12 legs or a gang
+//! more, and 40 inputs; big legs, gangs of 2 to 4 and backfilling in half of them) through it and
+//! the engine, and compares what runs where (with each grant's fence and
 //! expiry), what's queued and what waits to be retried after every input, checking the engine's
 //! invariants too: no runner holding more than it has room for, no leg assigned while it runs or on
 //! two runners, its queues holding the queued legs alone, its grants as `check_grants` holds. A case
@@ -78,7 +100,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::retry::{Failed, FailureClass};
 use super::routing::{LegRoute, RunnerView};
-use super::state::{Class, ClassConfig, Command, Config, Cpus, FairBy, Fence, Input, LeaseLoss, LegIn, Outcome, Resources, RunnerIn, Scheduler, default_classes, own_order};
+use super::state::{Class, ClassConfig, Command, Config, Cpus, FairBy, Fence, Gang, Input, LeaseLoss, LegIn, Outcome, Resources, RunnerIn, Scheduler, default_classes, own_order};
 use super::tests::Draw;
 use crate::facts::RunnerFacts;
 
@@ -142,7 +164,10 @@ impl Step {
                 let asks = if l.request == Resources::default() { String::new() } else { format!(", asks {} CPUs and {} GiB{}", l.request.cpu, l.request.mem / GIB, if l.request.gpu > 0 { format!(" and {} GPUs", l.request.gpu) } else { String::new() }) };
                 let cost = l.cost.map_or_else(|| "the default cost".to_owned(), |ms| format!("cost {} s", ms / 1000));
                 let stop = if l.on_lease_loss == LeaseLoss::Stop { ", stops on losing its lease" } else { "" };
-                format!("{} queued: {}, {}, priority {}{}{asks}, labels {:?}, {cost}{stop}", l.id, l.repo, l.class.as_str(), l.priority, if l.exclusive { ", exclusive" } else { "" }, l.route.labels)
+                let p90 = l.p90.map_or_else(String::new, |ms| format!(", p90 {} s", ms / 1000));
+                let timeout = l.timeout.map_or_else(String::new, |ms| format!(", timeout {} min", ms / 60_000));
+                let gang = l.gang.as_ref().map_or_else(String::new, |g| format!(", one of gang {} of {}", g.id, g.size));
+                format!("{} queued: {}, {}, priority {}{}{asks}, labels {:?}, {cost}{p90}{timeout}{stop}{gang}", l.id, l.repo, l.class.as_str(), l.priority, if l.exclusive { ", exclusive" } else { "" }, l.route.labels)
             }
             Step::Ended { leg, attempt, outcome } => {
                 let how = match outcome {
@@ -199,10 +224,13 @@ struct Queued {
 enum At {
     Queued(Queued),
     /// Running there, the `nth` leg placed, and what its placing charged fair share; its grant's
-    /// fence and expiry.
-    On { runner: String, nth: u64, charged: Box<Charged>, fence: Fence, expires: Option<i64> },
-    /// Waiting to be retried at `at`, the `seq`th to wait (a stop leg's lock-delay).
+    /// fence and expiry, and its two ends (W05-R38).
+    On { runner: String, nth: u64, charged: Box<Charged>, fence: Fence, expires: Option<i64>, ends: Ends },
+    /// Waiting to be retried at `at`, the `seq`th to wait (a stop leg's lock-delay, or a gang's
+    /// member waiting for its runner to stop it).
     Retrying { at: i64, seq: u64 },
+    /// Off its runner, its grant over, before it's queued again or settled in the same input.
+    Off,
 }
 
 #[derive(Debug, Clone)]
@@ -211,6 +239,84 @@ struct Leg {
     attempt: u32,
     at: At,
     avoid: Option<(String, Off)>,
+    /// Not queued again before then (a gang's member taken back, W05-R40).
+    not_before: Option<i64>,
+}
+
+/// A running grant's two ends (W05-R38): when it's expected to end, the end reservations go by,
+/// and when it ends at the latest; from its start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Ends {
+    from: i64,
+    expected: i64,
+    hard: i64,
+}
+
+impl Ends {
+    /// A grant of `l` started at `from`: its hard end is its start plus its timeout (360 minutes
+    /// when it says none), its expected end its start plus its p90, else its cost, never past its
+    /// hard end, else its hard end.
+    fn of(l: &LegIn, from: i64) -> Ends {
+        let ms = |m: u64| i64::try_from(m).unwrap_or(i64::MAX / 4);
+        let hard = from + ms(l.timeout.unwrap_or(360 * 60_000));
+        let expected = l.p90.or(l.cost).map_or(hard, |m| (from + ms(m)).min(hard));
+        Ends { from, expected, hard }
+    }
+
+    /// As looked at at `now`: an expected end that has passed moves on to its start plus twice the
+    /// time it has run, never past its hard end.
+    fn at(self, now: i64) -> Ends {
+        if self.expected > now {
+            return self;
+        }
+        Ends { expected: (self.from + 2 * (now - self.from).max(0)).min(self.hard), ..self }
+    }
+}
+
+/// Room kept for a class's first item that no runner has room for (W05-R39), or for each member
+/// of its first gang (W05-R40): each item on its runner, from `at`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Kept {
+    items: Vec<(String, String)>,
+    at: i64,
+}
+
+impl Kept {
+    fn holds(&self, leg: &str) -> bool {
+        self.items.iter().any(|(l, _)| l == leg)
+    }
+
+    fn on(&self, runner: &str) -> bool {
+        self.items.iter().any(|(_, r)| r == runner)
+    }
+
+    fn on_runner<'a>(&'a self, runner: &'a str) -> impl Iterator<Item = &'a String> + 'a {
+        self.items.iter().filter(move |(_, r)| r == runner).map(|(l, _)| l)
+    }
+}
+
+/// A gang (W05-R40): how many make it whole, its members as they came, and whether one of their
+/// attempts has ended since it last started, after which none is tried again alone.
+#[derive(Debug, Clone, Default)]
+struct Crew {
+    size: u32,
+    members: BTreeSet<String>,
+    ended: bool,
+}
+
+/// A leg's place as a runner picks: its tenant's standing in the dimensions the runner offers, its
+/// tenant's own order, its arrival.
+type Key = ([u128; 3], i128, u64);
+
+/// What a runner sees of a class as it picks (W05-R04, R39, R40): its best queued leg, the least
+/// by the runner's dimensions that it would take, has room for and the room kept there lets it;
+/// the least of those before it (or of all, with none) that it would take but has no room for;
+/// and the whole gang, not passed over already, whose first member comes before it.
+#[derive(Debug, Clone, Default)]
+struct Sees {
+    best: Option<(Key, String)>,
+    short: Option<Key>,
+    gang: Option<(Key, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -334,6 +440,28 @@ struct Reference {
     renewed: u64,
     expired: u64,
     locked: u64,
+    /// Room kept, by class (W05-R39, R40).
+    reserved: BTreeMap<Class, Kept>,
+    /// Runners whose kept room ended in this input: each takes what fits it before the input is
+    /// done (W05-R04).
+    unkept: BTreeSet<String>,
+    gangs: BTreeMap<String, Crew>,
+    /// The input's time.
+    now: i64,
+    /// While a lost runner's legs come back together (W05-R16), none is offered until all are.
+    batch: bool,
+    /// What the cases are meant to make it do with room kept and gangs: reservations made, moved,
+    /// and worked out again once their time passed; legs granted on a runner where room is kept
+    /// for another (backfilled), and legs that fit one but were kept out of its kept room; gangs
+    /// granted whole, kept room for whole, and taken back whole.
+    made: u64,
+    moved: u64,
+    again: u64,
+    backfilled: u64,
+    kept_out: u64,
+    whole: u64,
+    kept_whole: u64,
+    back: u64,
 }
 
 impl Reference {
@@ -356,6 +484,19 @@ impl Reference {
             renewed: 0,
             expired: 0,
             locked: 0,
+            reserved: BTreeMap::new(),
+            unkept: BTreeSet::new(),
+            gangs: BTreeMap::new(),
+            now: 0,
+            batch: false,
+            made: 0,
+            moved: 0,
+            again: 0,
+            backfilled: 0,
+            kept_out: 0,
+            whole: 0,
+            kept_whole: 0,
+            back: 0,
         }
     }
 
@@ -383,67 +524,79 @@ impl Reference {
     }
 
     fn handle(&mut self, step: &Step, now: i64) {
+        self.now = now;
         self.promote(now);
         self.expire(now);
         match step {
             // W05-R04's second look, in the engine's order: the runners that legs stayed off while
             // this one was away take what fits them, then this one takes what fits it, each in its
-            // own pick order (docs/needs.md E2.1: a runner goes by the dimensions it offers).
+            // own pick order (docs/needs.md E2.1: a runner goes by the dimensions it offers). What
+            // it offers may have changed: the room kept on it is worked out again (W05-R39).
             Step::Up(r) | Step::Undrain(r) => {
+                self.keep_reserved(|_, k| !k.on(&r.id));
                 self.runners.insert(r.id.clone(), Runner { input: r.clone(), connected: true, draining: false });
-                let avoided: BTreeSet<String> =
-                    self.legs.values().filter(|l| matches!(l.at, At::Queued(..))).filter_map(|l| l.avoid.as_ref().filter(|(_, off)| *off == Off::Lost).map(|(runner, _)| runner.clone())).collect();
-                for runner in avoided {
+                for runner in self.avoided() {
                     self.fill(&runner, now);
                 }
                 self.fill(&r.id, now);
             }
+            // Its legs come back together, then go in queue order (`place`); a gang's member takes
+            // its gang back as it comes (W05-R40). One its gang took back already ended its
+            // attempt here.
             Step::Lost(runner) => {
                 if let Some(r) = self.runners.get_mut(runner) {
                     r.connected = false;
                 }
-                let lost = Outcome::Failed(Failed { class: FailureClass::RunnerLost, exit_code: None, log_hits: Vec::new() });
+                self.batch = true;
                 for id in self.on(runner) {
-                    self.ended(&id, &lost, now);
+                    if self.runner_of(&id).as_deref() == Some(runner.as_str()) {
+                        self.finished(&id, &runner_lost(), now);
+                    }
                 }
+                self.batch = false;
+                self.place(now);
             }
+            // Queued, it's offered to the runners with room for it; a gang's member starts its
+            // gang if that's whole now (W05-R40).
             Step::Queued(l) => {
-                self.legs.insert(l.id.clone(), Leg { input: (**l).clone(), attempt: 1, at: At::Queued(Queued { class: l.class, own: 0, arrival: 0, look: None }), avoid: None });
+                self.legs.insert(l.id.clone(), Leg { input: (**l).clone(), attempt: 1, at: At::Queued(Queued { class: l.class, own: 0, arrival: 0, look: None }), avoid: None, not_before: None });
+                if let Some(g) = &l.gang {
+                    let c = self.gangs.entry(g.id.clone()).or_default();
+                    c.size = c.size.max(g.size);
+                    c.members.insert(l.id.clone());
+                }
                 self.enqueue(&l.id, now);
+                self.offer(&l.id, now);
             }
-            // W05-R04's two looks, in their order: the leg that came back is offered to the runners
-            // it may run on, then the runner it left takes what fits it.
             // The attempt may have lost its grant at this input's time, before it.
             Step::Ended { leg, attempt, outcome } => {
-                if !self.legs.get(leg).is_some_and(|l| l.attempt == *attempt && self.running(l)) {
-                    return self.place(now);
-                }
-                let left = self.runner_of(leg);
-                self.ended(leg, outcome, now);
-                if self.legs.get(leg).is_some_and(|l| matches!(l.at, At::Queued(..))) {
-                    self.offer(leg, now);
-                }
-                if let Some(r) = left {
-                    self.fill(&r, now);
+                if self.legs.get(leg).is_some_and(|l| l.attempt == *attempt && self.running(l)) {
+                    self.finished(leg, outcome, now);
                 }
             }
+            // W05-R04's two looks, in their order: the leg that came back is offered to the runners
+            // it may run on, then the runner it left takes what fits it, then those its gang's other
+            // members left, taken back with it (W05-R40).
             Step::Refused { leg, fence } => {
-                if !self.legs.get(leg).is_some_and(|l| matches!(&l.at, At::On { fence: f, .. } if f == fence)) {
-                    return self.place(now);
-                }
-                let left = self.runner_of(leg);
-                self.settle(leg, now);
-                // A runner draining refused it for that, not for the leg: the leg isn't kept off it.
-                let away = left.as_ref().and_then(|r| self.runners.get(r)).is_some_and(|r| r.draining || !r.connected);
-                if let Some(l) = self.legs.get_mut(leg)
-                    && let Some(runner) = &left
-                {
-                    if !away {
-                        l.avoid = Some((runner.clone(), Off::Refused));
+                if self.legs.get(leg).is_some_and(|l| matches!(&l.at, At::On { fence: f, .. } if f == fence)) {
+                    let left = self.runner_of(leg);
+                    self.release(leg, now);
+                    let freed = self.take_back_gang(leg, now);
+                    // A runner draining refused it for that, not for the leg: the leg isn't kept off it.
+                    let away = left.as_ref().and_then(|r| self.runners.get(r)).is_some_and(|r| r.draining || !r.connected);
+                    if let Some(l) = self.legs.get_mut(leg)
+                        && let Some(runner) = &left
+                    {
+                        if !away {
+                            l.avoid = Some((runner.clone(), Off::Refused));
+                        }
+                        self.enqueue(leg, now);
+                        self.offer(leg, now);
+                        self.fill(runner, now);
                     }
-                    self.enqueue(leg, now);
-                    self.offer(leg, now);
-                    self.fill(runner, now);
+                    for r in freed {
+                        self.fill(&r, now);
+                    }
                 }
             }
             // Each grant it names that's its own, by that fence, lives a lease from now.
@@ -466,9 +619,7 @@ impl Reference {
                 if let Some(r) = self.runners.get_mut(runner) {
                     r.draining = true;
                 }
-                let avoided: BTreeSet<String> =
-                    self.legs.values().filter(|l| matches!(l.at, At::Queued(..))).filter_map(|l| l.avoid.as_ref().filter(|(_, off)| *off == Off::Lost).map(|(runner, _)| runner.clone())).collect();
-                for r in avoided {
+                for r in self.avoided() {
                     self.fill(&r, now);
                 }
             }
@@ -484,7 +635,28 @@ impl Reference {
             }
             Step::Stale { .. } => {}
         }
+        // The runners whose kept room ended take what fits them; then nothing is left that may run
+        // somewhere, as the engine leaves it.
+        self.unkept_fill(now);
         self.place(now);
+        self.unkept_fill(now);
+    }
+
+    /// Each runner whose kept room ended takes what fits it, in name order, until none is left.
+    fn unkept_fill(&mut self, now: i64) {
+        let mut turns = 0;
+        loop {
+            turns += 1;
+            assert!(turns < 10_000, "runners whose kept room ended take what fits them forever: {:?}, room kept {:?}", self.unkept, self.reserved);
+            self.drop_stale();
+            let Some(r) = self.unkept.pop_first() else { return };
+            self.fill(&r, now);
+        }
+    }
+
+    /// The runners that queued legs stay off only while another could take them (W05-R16).
+    fn avoided(&self) -> BTreeSet<String> {
+        self.legs.values().filter(|l| matches!(l.at, At::Queued(..))).filter_map(|l| l.avoid.as_ref().filter(|(_, off)| *off == Off::Lost).map(|(runner, _)| runner.clone())).collect()
     }
 
     /// Every grant past its expiry by `now` is lost, the earliest first, then by leg (W05-R34): as
@@ -494,15 +666,7 @@ impl Reference {
             let due = self.legs.iter().filter_map(|(id, l)| if let At::On { expires: Some(e), .. } = &l.at { (*e <= now).then(|| (*e, id.clone())) } else { None }).min();
             let Some((_, id)) = due else { return };
             self.expired += 1;
-            let left = self.runner_of(&id);
-            let lost = Outcome::Failed(Failed { class: FailureClass::RunnerLost, exit_code: None, log_hits: Vec::new() });
-            self.ended(&id, &lost, now);
-            if self.legs.get(&id).is_some_and(|l| matches!(l.at, At::Queued(..))) {
-                self.offer(&id, now);
-            }
-            if let Some(r) = left {
-                self.fill(&r, now);
-            }
+            self.finished(&id, &runner_lost(), now);
         }
     }
 
@@ -513,7 +677,7 @@ impl Reference {
             .filter_map(|l| match &l.at {
                 At::On { expires, .. } => *expires,
                 At::Retrying { at, .. } => Some(*at),
-                At::Queued(..) => None,
+                At::Queued(..) | At::Off => None,
             })
             .min()
     }
@@ -560,41 +724,118 @@ impl Reference {
                 }
                 q.look = look;
             }
+            // A gang's members share a class (W05-R40): its queued members in that class go up with
+            // it.
+            if last.is_none() {
+                for m in self.mates(&id) {
+                    if let Some(At::Queued(q)) = self.legs.get_mut(&m).map(|l| &mut l.at)
+                        && q.class == class
+                    {
+                        q.class = up;
+                        q.look = look;
+                    }
+                }
+            }
         }
     }
 
-    /// A runner takes the best queued legs it has room for, in its own pick order (by the dimensions
-    /// it offers), until none fits (W05-R04: new capacity looks at what that runner can serve).
+    /// A gang's members other than `id`, if it's one's.
+    fn mates(&self, id: &str) -> Vec<String> {
+        let Some(g) = self.legs.get(id).and_then(|l| l.input.gang.as_ref()) else { return Vec::new() };
+        self.gangs.get(&g.id).map(|c| c.members.iter().filter(|m| m.as_str() != id).cloned().collect()).unwrap_or_default()
+    }
+
+    /// A runner takes the best queued legs it has room for, in its own pick order (by the
+    /// dimensions it offers), until none fits (W05-R04: new capacity looks at what that runner can
+    /// serve). A whole gang whose first member comes before the best of the first class with
+    /// either starts whole, or is passed over as an item without room is (W05-R40). With
+    /// backfilling, before it takes a leg while the first of that leg's class, or of a class before
+    /// it, had no room there, those firsts keep room where it frees first, and it picks again,
+    /// held to that room (W05-R39).
     fn fill(&mut self, runner: &str, now: i64) {
+        self.drop_stale();
+        let mut stuck: BTreeSet<String> = BTreeSet::new();
+        let mut turns = 0;
         loop {
-            let Some((id, over)) = self.pick(runner, now) else { return };
+            turns += 1;
+            let sees = self.bests(runner, &stuck);
+            assert!(turns < 10_000, "{runner} picks forever: it sees {sees:?}, room kept {:?}, gangs passed over {stuck:?}", self.reserved);
+            let mut passed: BTreeMap<Class, bool> = sees.iter().map(|(c, s)| (*c, s.short.is_some_and(|u| s.best.as_ref().is_none_or(|(b, _)| u < *b)))).collect();
+            if let Some((c, g)) = sees.iter().find(|(_, s)| s.best.is_some() || s.gang.is_some()).and_then(|(c, s)| s.gang.as_ref().map(|(_, g)| (*c, g.clone()))) {
+                if self.place_gang(&g, now) {
+                    continue;
+                }
+                stuck.insert(g);
+                passed.insert(c, true);
+                if self.cfg.backfill {
+                    self.reserve(runner, &passed, c, now);
+                }
+                continue;
+            }
+            let Some((class, id, over)) = self.choose(runner, &sees, now) else { return };
+            if self.cfg.backfill && passed.iter().any(|(c, p)| *p && *c <= class) && self.reserve(runner, &passed, class, now) {
+                continue;
+            }
             self.assign(&id, runner, now, over);
         }
     }
 
-    /// The leg a runner takes next: the best of the first class with a leg it may run, unless a
-    /// class after that one is short of its floor (W05-R31): then the first such class's best, if
-    /// it keeps the class within its floor, or once its pace has passed if not (with what's left of
-    /// its floor).
-    fn pick(&mut self, runner: &str, now: i64) -> Option<(String, Option<u128>)> {
-        let r = self.runners.get(runner)?;
-        let dims = self.dims(&r.input);
-        let mut best: BTreeMap<Class, (([u128; 3], i128, u64), String)> = BTreeMap::new();
+    /// What a runner sees of each class it may take legs of ([`Sees`]), its gang's members none of
+    /// them its best, `stuck` gangs passed over already.
+    fn bests(&mut self, runner: &str, stuck: &BTreeSet<String>) -> BTreeMap<Class, Sees> {
+        let mut sees: BTreeMap<Class, Sees> = BTreeMap::new();
+        let Some(r) = self.runners.get(runner).filter(|r| r.connected) else { return sees };
+        let (dims, held) = (self.dims(&r.input), self.reserved.values().any(|k| k.on(runner)));
+        let mut kept_out = 0;
         for (id, l) in &self.legs {
             let At::Queued(q) = &l.at else { continue };
-            if !self.may_run(l, r) {
+            if !carries(&r.input, &l.input) {
                 continue;
             }
             let key = (self.standing(q.class, &l.input, dims), q.own, q.arrival);
-            if best.get(&q.class).is_none_or(|(b, _)| key < *b) {
-                best.insert(q.class, (key, id.clone()));
+            let s = sees.entry(q.class).or_default();
+            if let Some(g) = &l.input.gang {
+                if !stuck.contains(&g.id) && self.whole(&g.id) && s.gang.as_ref().is_none_or(|(k, _)| key < *k) {
+                    s.gang = Some((key, g.id.clone()));
+                }
+                continue;
+            }
+            if self.may_run(l, r) {
+                if held && !self.allowed(r, l, &[]) {
+                    kept_out += 1;
+                    continue;
+                }
+                if s.best.as_ref().is_none_or(|(k, _)| key < *k) {
+                    s.best = Some((key, id.clone()));
+                }
+            } else if self.admits(r, l) && s.short.is_none_or(|k| key < k) {
+                s.short = Some(key);
             }
         }
-        let (first, (_, id)) = best.first_key_value()?;
+        // A whole gang counts where it comes before its class's best.
+        for s in sees.values_mut() {
+            if let (Some((g, _)), Some((b, _))) = (&s.gang, &s.best)
+                && g >= b
+            {
+                s.gang = None;
+            }
+        }
+        self.kept_out += kept_out;
+        sees
+    }
+
+    /// The leg a runner takes next of those it sees: the best of the first class with one, unless
+    /// a class after that one is short of its floor (W05-R31): then the first such class's best,
+    /// if it keeps the class within its floor, or once its pace has passed if not (with what's
+    /// left of its floor). Its class too.
+    fn choose(&mut self, runner: &str, sees: &BTreeMap<Class, Sees>, now: i64) -> Option<(Class, String, Option<u128>)> {
+        let r = self.runners.get(runner)?;
+        let mut bests = sees.iter().filter_map(|(c, s)| s.best.as_ref().map(|(_, id)| (*c, id)));
+        let (first, id) = bests.next()?;
         let fleet = self.fleet();
-        for (class, (_, x)) in best.iter().filter(|(c, _)| *c > first) {
-            let floor = u128::from(self.class_config(*class).floor) * 1000;
-            let held = self.held(*class);
+        for (class, x) in bests {
+            let floor = u128::from(self.class_config(class).floor) * 1000;
+            let held = self.held(class);
             if floor == 0 || share(&held, &fleet) >= floor {
                 continue;
             }
@@ -606,20 +847,29 @@ impl Reference {
             }
             if share(&with, &fleet) <= floor {
                 self.ahead += 1;
-                return Some((x.clone(), None));
+                return Some((class, x.clone(), None));
             }
-            if self.paced.get(class).is_none_or(|t| now >= *t) {
+            if self.paced.get(&class).is_none_or(|t| now >= *t) {
                 self.ahead += 1;
                 self.over += 1;
-                return Some((x.clone(), Some(floor - share(&held, &fleet))));
+                return Some((class, x.clone(), Some(floor - share(&held, &fleet))));
             }
         }
-        Some((id.clone(), None))
+        Some((first, id.clone(), None))
     }
 
     /// A leg queued again is offered to the runners it may run on, best first, each taking the best
-    /// legs it has room for, until it's taken (W05-R04: queuing a leg looks at its runners).
+    /// legs it has room for, until it's taken (W05-R04: queuing a leg looks at its runners); a
+    /// gang's member starts its gang if that's whole and can start now (W05-R40). None while a
+    /// lost runner's legs come back together.
     fn offer(&mut self, id: &str, now: i64) {
+        if self.batch || !self.legs.get(id).is_some_and(|l| matches!(l.at, At::Queued(..))) {
+            return;
+        }
+        if let Some(g) = self.legs.get(id).and_then(|l| l.input.gang.as_ref()).map(|g| g.id.clone()) {
+            self.place_gang(&g, now);
+            return;
+        }
         let Some(l) = self.legs.get(id) else { return };
         let mut runners: Vec<&Runner> = self.runners.values().filter(|r| self.may_run(l, r)).collect();
         runners.sort_by(|a, b| self.better(a, b));
@@ -632,40 +882,99 @@ impl Reference {
         }
     }
 
-    /// An attempt ended: one its runner lost is retried once, elsewhere when it can be (W05-R16),
-    /// a stop leg's retry waiting the lock-delay past its grant's expiry or `now`, the later
-    /// (W05-R34); the rest settle.
-    fn ended(&mut self, id: &str, outcome: &Outcome, now: i64) {
-        self.settle(id, now);
+    /// An attempt ended (W05-R16, R40): a gang's member lost while it ran, before any of its
+    /// gang's attempts ended, takes its gang with it ([`Self::gang_lost`]); else a gang's member
+    /// ends as it ended, and once one has, none of its gang is tried again alone. The rest as
+    /// [`Self::finish`] says.
+    fn finished(&mut self, id: &str, outcome: &Outcome, now: i64) {
+        let Some(l) = self.legs.get(id) else { return };
+        if let Some(g) = l.input.gang.as_ref().map(|g| g.id.clone()) {
+            let lost = matches!(outcome, Outcome::Failed(f) if f.class == FailureClass::RunnerLost) && self.running(l);
+            if lost && self.gangs.get(&g).is_some_and(|c| !c.ended) {
+                return self.gang_lost(&g, id, outcome, now);
+            }
+            if let Some(c) = self.gangs.get_mut(&g) {
+                c.ended = true;
+            }
+            return self.finish(id, outcome, false, now);
+        }
+        self.finish(id, outcome, true, now);
+    }
+
+    /// An attempt's end: one its runner lost is retried once when `retry`, elsewhere when it can be
+    /// (W05-R16), a stop leg's retry waiting the lock-delay past its grant's expiry or `now`, the
+    /// later (W05-R34), a gang's member taken back not before its runner has stopped it (W05-R40);
+    /// the rest settle. Then W05-R04's two looks: the leg queued again is offered, and the runner
+    /// it left takes what fits it.
+    fn finish(&mut self, id: &str, outcome: &Outcome, retry: bool, now: i64) {
+        let Some(l) = self.legs.get(id) else { return };
+        let At::On { runner, expires, .. } = &l.at else { return };
+        let (left, expires) = (runner.clone(), *expires);
+        self.release(id, now);
         let lock = i64::try_from(self.cfg.lock_delay).unwrap_or(i64::MAX / 4);
         let Some(l) = self.legs.get_mut(id) else { return };
-        let At::On { runner, expires, .. } = &l.at else { return };
         match outcome {
-            Outcome::Failed(f) if f.class == FailureClass::RunnerLost && l.attempt < 2 => {
+            Outcome::Failed(f) if f.class == FailureClass::RunnerLost && retry && l.attempt < 2 => {
                 l.attempt += 1;
-                l.avoid = Some((runner.clone(), Off::Lost));
-                let at = if l.input.on_lease_loss == LeaseLoss::Stop { expires.unwrap_or(now).max(now) + lock } else { now };
+                l.avoid = Some((left.clone(), Off::Lost));
+                let stop = l.input.on_lease_loss == LeaseLoss::Stop;
+                let mut at = if stop { expires.unwrap_or(now).max(now) + lock } else { now };
+                if let Some(t) = l.not_before.filter(|t| *t > now) {
+                    at = at.max(t);
+                }
                 if at > now {
                     self.waited += 1;
-                    self.locked += 1;
+                    if stop {
+                        self.locked += 1;
+                    }
                     l.at = At::Retrying { at, seq: self.waited };
                 } else {
                     self.enqueue(id, now);
+                    self.offer(id, now);
                 }
             }
-            _ => {
-                self.legs.remove(id);
+            _ => self.forget(id),
+        }
+        self.fill(&left, now);
+    }
+
+    /// A leg done for good, out of its gang.
+    fn forget(&mut self, id: &str) {
+        let gone = self.legs.remove(id);
+        if let Some(g) = gone.as_ref().and_then(|l| l.input.gang.as_ref())
+            && let Some(c) = self.gangs.get_mut(&g.id)
+        {
+            c.members.remove(id);
+            if c.members.is_empty() {
+                self.gangs.remove(&g.id);
             }
+        }
+    }
+
+    /// Its grant over: what its placing charged settled, and off its runner.
+    fn release(&mut self, id: &str, now: i64) {
+        self.settle(id, now);
+        if let Some(l) = self.legs.get_mut(id) {
+            l.at = At::Off;
         }
     }
 
     /// Queues a leg, or queues it again: in the class it came with, its place in its tenant's own
     /// order by its priority and `now`, its arrival (fair share's standing is taken as legs are
-    /// picked).
+    /// picked). One not to go again before a time waits for it as a retry does (W05-R40).
     fn enqueue(&mut self, id: &str, now: i64) {
+        if let Some(at) = self.legs.get(id).and_then(|l| l.not_before).filter(|at| *at > now) {
+            self.waited += 1;
+            if let Some(l) = self.legs.get_mut(id) {
+                l.at = At::Retrying { at, seq: self.waited };
+            }
+            return;
+        }
         self.arrivals += 1;
         let (arrival, aging) = (self.arrivals, self.cfg.aging_per_minute);
         let Some(class) = self.legs.get(id).map(|l| l.input.class) else { return };
+        // A gang's members share a class (W05-R40): one queued while others wait joins theirs.
+        let class = self.mates(id).into_iter().find_map(|m| if let Some(At::Queued(q)) = self.legs.get(&m).map(|x| &x.at) { Some(q.class) } else { None }).unwrap_or(class);
         let look = self.look(class, now);
         if let Some(l) = self.legs.get_mut(id) {
             l.at = At::Queued(Queued { class, own: own_order(l.input.priority, aging, now), arrival, look });
@@ -761,15 +1070,165 @@ impl Reference {
     }
 
     /// While some queued leg may run somewhere, the first in queue order (by class, then by every
-    /// dimension) goes to its best runner.
+    /// dimension) goes to the best runner the room kept there lets it go to (W05-R39), a gang's
+    /// member with its whole gang, if that can start now (W05-R40): as legs whose places changed
+    /// together go in turn.
     fn place(&mut self, now: i64) {
-        loop {
-            let mut order: Vec<((Class, [u128; 3], i128, u64), String)> =
-                self.legs.iter().filter_map(|(id, l)| if let At::Queued(q) = &l.at { Some(((q.class, self.standing(q.class, &l.input, [true; DIMS]), q.own, q.arrival), id.clone())) } else { None }).collect();
-            order.sort();
-            let next = order.into_iter().find_map(|(_, id)| self.best(&id).map(|r| (id, r)));
-            let Some((leg, runner)) = next else { return };
-            self.assign(&leg, &runner, now, None);
+        let mut turns = 0;
+        'next: loop {
+            turns += 1;
+            assert!(turns < 10_000, "legs placed forever: {:?}", self.queue_order());
+            for id in self.queue_order() {
+                if let Some(g) = self.legs.get(&id).and_then(|l| l.input.gang.as_ref()).map(|g| g.id.clone()) {
+                    if self.place_gang(&g, now) {
+                        continue 'next;
+                    }
+                    continue;
+                }
+                if let Some(r) = self.best(&id) {
+                    self.assign(&id, &r, now, None);
+                    continue 'next;
+                }
+            }
+            return;
+        }
+    }
+
+    /// The queued legs in queue order: by class, then by every dimension (their tenants'
+    /// standing, their own order, their arrival).
+    fn queue_order(&self) -> Vec<String> {
+        let mut order: Vec<((Class, [u128; 3], i128, u64), String)> =
+            self.legs.iter().filter_map(|(id, l)| if let At::Queued(q) = &l.at { Some(((q.class, self.standing(q.class, &l.input, [true; DIMS]), q.own, q.arrival), id.clone())) } else { None }).collect();
+        order.sort();
+        order.into_iter().map(|(_, id)| id).collect()
+    }
+
+    // ------------------------------------------------------------------ gangs (W05-R40)
+
+    /// A gang's members queued now, in queue order.
+    fn crew_queued(&self, g: &str) -> Vec<String> {
+        let members = self.gangs.get(g).map(|c| c.members.clone()).unwrap_or_default();
+        self.queue_order().into_iter().filter(|id| members.contains(id)).collect()
+    }
+
+    /// Whether a gang is whole: as many of its members queued as make it.
+    fn whole(&self, g: &str) -> bool {
+        let Some(c) = self.gangs.get(g) else { return false };
+        let queued = c.members.iter().filter(|m| self.legs.get(m.as_str()).is_some_and(|l| matches!(l.at, At::Queued(..)))).count();
+        queued >= usize::try_from(c.size.max(1)).unwrap_or(usize::MAX)
+    }
+
+    /// Where a whole gang would start now, if it can: each member, in queue order, on a runner
+    /// that would take it with room for it beside the members put there before it, as the room
+    /// kept there lets it, the least loaded first (the fewest legs, counting those members), then
+    /// by name; where a member has no such runner, the members before it put elsewhere, in that
+    /// order, trying at most 4,096 places in all.
+    fn gang_plan(&self, g: &str) -> Option<Vec<(String, String)>> {
+        let members = self.crew_queued(g);
+        let (mut plan, mut budget) = (Vec::new(), 4096usize);
+        (!members.is_empty() && self.plan_from(&members, &mut plan, &mut budget)).then_some(plan)
+    }
+
+    fn plan_from(&self, members: &[String], plan: &mut Vec<(String, String)>, budget: &mut usize) -> bool {
+        let Some(m) = members.get(plan.len()) else { return true };
+        for r in self.gang_places(m, plan) {
+            if *budget == 0 {
+                return false;
+            }
+            *budget -= 1;
+            plan.push((m.clone(), r));
+            if self.plan_from(members, plan, budget) {
+                return true;
+            }
+            plan.pop();
+        }
+        false
+    }
+
+    fn gang_places(&self, m: &str, plan: &[(String, String)]) -> Vec<String> {
+        let Some(l) = self.legs.get(m) else { return Vec::new() };
+        let mut places: Vec<(usize, String)> = Vec::new();
+        for r in self.runners.values().filter(|r| r.connected && carries(&r.input, &l.input) && self.admits(r, l)) {
+            let mates: Vec<&LegIn> = plan.iter().filter(|(_, on)| *on == r.input.id).filter_map(|(x, _)| self.legs.get(x)).map(|x| &x.input).collect();
+            let mut on: Vec<&LegIn> = self.on(&r.input.id).iter().filter_map(|id| self.legs.get(id)).map(|x| &x.input).collect();
+            let running = on.len();
+            on.extend(mates.iter().copied());
+            if room(&self.cfg, &r.input, &on, &l.input) && self.allowed(r, l, &mates) {
+                places.push((running + mates.len(), r.input.id.clone()));
+            }
+        }
+        places.sort();
+        places.into_iter().map(|(_, r)| r).collect()
+    }
+
+    /// A whole gang starts if it can, each member granted where [`Self::gang_plan`] puts it.
+    fn place_gang(&mut self, g: &str, now: i64) -> bool {
+        if !self.whole(g) {
+            return false;
+        }
+        let Some(plan) = self.gang_plan(g) else { return false };
+        if let Some(c) = self.gangs.get_mut(g) {
+            c.ended = false;
+        }
+        self.whole += 1;
+        for (m, r) in plan {
+            self.assign(&m, &r, now, None);
+        }
+        true
+    }
+
+    /// The grants of a gang's members other than `but`, refused, are taken back: each queued again
+    /// at its attempt once its runner has stopped it (the lock-delay). The runners they leave.
+    fn take_back_gang(&mut self, but: &str, now: i64) -> Vec<String> {
+        let Some(g) = self.legs.get(but).and_then(|l| l.input.gang.as_ref()).map(|g| g.id.clone()) else { return Vec::new() };
+        let peers: Vec<String> = self.gangs.get(&g).map(|c| c.members.iter().filter(|m| *m != but).cloned().collect()).unwrap_or_default();
+        let mut freed = Vec::new();
+        for p in peers {
+            let Some(runner) = self.runner_of(&p) else { continue };
+            self.back += 1;
+            freed.push(runner);
+            self.release(&p, now);
+            self.stopping(&p, now);
+            self.enqueue(&p, now);
+            self.offer(&p, now);
+        }
+        freed
+    }
+
+    /// A gang's member taken back goes again no sooner than the lock-delay, by which its runner,
+    /// told to stop it, has.
+    fn stopping(&mut self, id: &str, now: i64) {
+        let at = now + i64::try_from(self.cfg.lock_delay).unwrap_or(i64::MAX / 4);
+        if let Some(l) = self.legs.get_mut(id) {
+            l.not_before = Some(at);
+        }
+    }
+
+    /// A gang's member lost while it ran, before any of its gang's attempts ended: the others are
+    /// taken back, and every member's attempt ends lost; the gang goes again whole at the next
+    /// attempts if each may be tried again (once, W05-R16), else every member ends failed.
+    fn gang_lost(&mut self, g: &str, lost: &str, outcome: &Outcome, now: i64) {
+        let peers: Vec<(String, u32)> = self.gangs.get(g).map(|c| c.members.iter().filter(|m| *m != lost).filter_map(|m| self.legs.get(m).filter(|l| self.running(l)).map(|l| (m.clone(), l.attempt))).collect()).unwrap_or_default();
+        let again = self.legs.get(lost).is_some_and(|l| l.attempt < 2) && peers.iter().all(|(_, a)| *a < 2);
+        if let Some(c) = self.gangs.get_mut(g) {
+            c.ended = true;
+        }
+        self.back += 1;
+        self.finish(lost, outcome, again, now);
+        for (p, _) in &peers {
+            self.stopping(p, now);
+            self.finish(p, &runner_lost(), again, now);
+        }
+        if again {
+            // Only the lost member's runner was lost: the others may go back to theirs.
+            for (p, _) in &peers {
+                if let Some(l) = self.legs.get_mut(p)
+                    && l.avoid.as_ref().is_some_and(|(_, off)| *off == Off::Lost)
+                {
+                    l.avoid = None;
+                }
+            }
+            self.place_gang(g, now);
         }
     }
 
@@ -780,6 +1239,10 @@ impl Reference {
     /// class started a leg at its signature; placed over its class's floor (`over`, what was left
     /// of it), the class's pace moves on.
     fn assign(&mut self, leg: &str, runner: &str, now: i64, over: Option<u128>) {
+        if self.reserved.values().any(|k| k.on(runner) && !k.holds(leg)) {
+            self.backfilled += 1;
+        }
+        self.granted_over(leg, runner);
         let Some((l, r)) = self.legs.get(leg).zip(self.runners.get(runner)) else { return };
         let At::Queued(q) = &l.at else { return };
         let (class, fleet, holds) = (q.class, self.fleet(), self.holds(&l.input, &r.input));
@@ -824,7 +1287,8 @@ impl Reference {
         // Its grant: the next fence, and a lease from now (W05-R34).
         let (fence, expires) = (Fence { epoch: self.epoch, n: self.placed }, self.cfg.lease.map(|ms| now + i64::try_from(ms).unwrap_or(i64::MAX / 4)));
         if let Some(l) = self.legs.get_mut(leg) {
-            l.at = At::On { runner: runner.to_owned(), nth: self.placed, charged: Box::new(charged), fence, expires };
+            let ends = Ends::of(&l.input, now);
+            l.at = At::On { runner: runner.to_owned(), nth: self.placed, charged: Box::new(charged), fence, expires, ends };
         }
     }
 
@@ -857,10 +1321,11 @@ impl Reference {
         on.into_iter().map(|(_, id)| id.clone()).collect()
     }
 
-    /// The best runner a leg may run on now: least loaded, then most free slots, then name.
+    /// The best runner a leg may run on now, as the room kept there lets it: least loaded, then
+    /// most free slots, then name.
     fn best(&self, id: &str) -> Option<String> {
         let l = self.legs.get(id)?;
-        let best = self.runners.values().filter(|r| self.may_run(l, r)).min_by(|a, b| self.better(a, b));
+        let best = self.runners.values().filter(|r| self.may_run(l, r) && self.allowed(r, l, &[])).min_by(|a, b| self.better(a, b));
         best.map(|r| r.input.id.clone())
     }
 
@@ -872,9 +1337,255 @@ impl Reference {
         (na * sb).cmp(&(nb * sa)).then_with(|| sb.saturating_sub(nb).cmp(&sa.saturating_sub(na))).then_with(|| a.input.id.cmp(&b.input.id))
     }
 
+    /// Whether a runner takes a leg now: it would ([`Self::admits`]), it carries the leg's labels,
+    /// and it has room for it.
     fn may_run(&self, l: &Leg, r: &Runner) -> bool {
         let on: Vec<&LegIn> = self.on(&r.input.id).iter().filter_map(|id| self.legs.get(id)).map(|l| &l.input).collect();
-        r.connected && !r.draining && carries(&r.input, &l.input) && !self.stays_off(l, &r.input.id) && room(&self.cfg, &r.input, &on, &l.input)
+        self.admits(r, l) && carries(&r.input, &l.input) && room(&self.cfg, &r.input, &on, &l.input)
+    }
+
+    /// Whether a runner would take a leg once it has room: connected, not draining, not one the
+    /// leg stays off.
+    fn admits(&self, r: &Runner, l: &Leg) -> bool {
+        r.connected && !r.draining && !self.stays_off(l, &r.input.id)
+    }
+
+    // ------------------------------------------------------------------ room kept (W05-R39)
+
+    /// Works out the room kept for each class up to `upto` whose first leg the runner passed over
+    /// for want of room: the class's first queued leg by every dimension that waits only for room
+    /// keeps room on the runner where it would fit soonest; a whole gang, each member on the
+    /// runner where its room frees soonest, all from the latest of their times. Room kept stands
+    /// until its leg is granted, cancelled or no longer first, and moves only to where it would fit
+    /// sooner (here); once its time has passed it's worked out again. Whether any was made, moved
+    /// or dropped.
+    fn reserve(&mut self, runner: &str, passed: &BTreeMap<Class, bool>, upto: Class, now: i64) -> bool {
+        let mut changed = false;
+        for class in Class::ALL.into_iter().filter(|c| *c <= upto && passed.get(c).copied().unwrap_or(false)) {
+            let Some(head) = self.head(class) else {
+                changed |= self.unkeep(class);
+                continue;
+            };
+            let gang = self.legs.get(&head).and_then(|l| l.input.gang.as_ref()).map(|g| g.id.clone());
+            let was = self.reserved.get(&class).filter(|k| k.holds(&head)).cloned();
+            let standing = was.clone().filter(|k| k.at > now);
+            let next = match (&standing, &gang) {
+                (Some(_), Some(_)) => None,
+                (None, Some(g)) => self.soonest_gang(g, now),
+                (Some(k), None) if k.on(runner) => None,
+                (Some(k), None) => self.earliest(&head, runner, now, &[]).filter(|at| *at < k.at).map(|at| (vec![(head.clone(), runner.to_owned())], at)),
+                (None, None) => self.soonest(&head, now).map(|(on, at)| (vec![(head.clone(), on)], at)),
+            };
+            let Some((items, at)) = next else {
+                if standing.is_none() {
+                    changed |= self.unkeep(class);
+                }
+                continue;
+            };
+            // Worked out again as it stood: nothing changed.
+            if self.reserved.get(&class).is_some_and(|k| k.items == items && k.at == at) {
+                continue;
+            }
+            match (&standing, &was, &gang) {
+                (Some(_), _, _) => self.moved += 1,
+                (None, Some(_), _) => self.again += 1,
+                (None, None, Some(_)) => self.kept_whole += 1,
+                (None, None, None) => self.made += 1,
+            }
+            // Its class goes before those after it: their room on its runners is worked out again.
+            self.keep_reserved(|c, k| c <= class || !items.iter().any(|(_, r)| k.on(r)));
+            let kept: BTreeSet<String> = items.iter().map(|(_, r)| r.clone()).collect();
+            // Room it kept elsewhere before is room no more.
+            if let Some(was) = self.reserved.insert(class, Kept { items, at }) {
+                self.unkept.extend(was.items.into_iter().map(|(_, r)| r).filter(|r| !kept.contains(r)));
+            }
+            changed = true;
+        }
+        changed
+    }
+
+    /// A class's first queued leg by every dimension, among its first 64, that waits only for
+    /// room; a gang's member stands for its gang.
+    fn head(&self, class: Class) -> Option<String> {
+        self.queue_order().into_iter().filter(|id| self.legs.get(id).is_some_and(|l| matches!(&l.at, At::Queued(q) if q.class == class))).take(64).find(|id| self.waits_for_room(id))
+    }
+
+    /// Whether a queued leg waits for room alone: some runner it may run on would take it and
+    /// could hold it idle, and none has room for it now. A gang's member, when its gang is whole,
+    /// can't start now, and each of its members could be held somewhere.
+    fn waits_for_room(&self, id: &str) -> bool {
+        let Some(l) = self.legs.get(id).filter(|l| matches!(l.at, At::Queued(..))) else { return false };
+        if let Some(g) = &l.input.gang {
+            return self.whole(&g.id) && self.gang_plan(&g.id).is_none() && self.crew_queued(&g.id).iter().all(|m| self.could_be_held(m));
+        }
+        let mut could = false;
+        for r in self.runners.values().filter(|r| r.connected && carries(&r.input, &l.input)) {
+            if !self.admits(r, l) {
+                continue;
+            }
+            if self.may_run(l, r) {
+                return false;
+            }
+            could |= room(&self.cfg, &r.input, &[], &l.input);
+        }
+        could
+    }
+
+    /// Whether some runner a leg may run on would take it and could hold it idle.
+    fn could_be_held(&self, id: &str) -> bool {
+        let Some(l) = self.legs.get(id) else { return false };
+        self.runners.values().any(|r| r.connected && carries(&r.input, &l.input) && self.admits(r, l) && room(&self.cfg, &r.input, &[], &l.input))
+    }
+
+    /// The runner where a leg would fit soonest, and when: ties to where it would finish first,
+    /// then by name.
+    fn soonest(&mut self, id: &str, now: i64) -> Option<(String, i64)> {
+        self.soonest_beside(id, now, &[])
+    }
+
+    /// [`Self::soonest`], with `items` (leg, runner) put on their runners from now.
+    fn soonest_beside(&mut self, id: &str, now: i64, items: &[(String, String)]) -> Option<(String, i64)> {
+        let l = self.legs.get(id)?;
+        let ms = i64::try_from(l.input.cold.or(l.input.cost).unwrap_or(self.cfg.default_cost)).unwrap_or(i64::MAX / 4);
+        let eligible: Vec<String> = self.runners.values().filter(|r| r.connected && carries(&r.input, &l.input)).map(|r| r.input.id.clone()).collect();
+        let mut best: Option<(i64, i64, String)> = None;
+        for r in eligible {
+            let beside: Vec<String> = items.iter().filter(|(_, on)| *on == r).map(|(l, _)| l.clone()).collect();
+            let Some(at) = self.earliest(id, &r, now, &beside) else { continue };
+            if best.as_ref().is_none_or(|(a, f, n)| (at, at + ms, &r) < (*a, *f, n)) {
+                best = Some((at, at + ms, r));
+            }
+        }
+        best.map(|(at, _, r)| (r, at))
+    }
+
+    /// Where each member of a whole gang would fit soonest: in queue order, each on the runner
+    /// where its room frees first beside the members put there before it; and the latest of their
+    /// times. `None` when one fits nowhere.
+    fn soonest_gang(&mut self, g: &str, now: i64) -> Option<(Vec<(String, String)>, i64)> {
+        let (mut items, mut at) = (Vec::new(), now);
+        for m in self.crew_queued(g) {
+            let (on, t) = self.soonest_beside(&m, now, &items)?;
+            at = at.max(t);
+            items.push((m, on));
+        }
+        (!items.is_empty()).then_some((items, at))
+    }
+
+    /// When a runner is expected to have room for a queued leg: now, or as soon as enough of its
+    /// grants are expected to have ended (their expected ends looked at now, and kept as moved:
+    /// W05-R38), beside the legs of the classes before the leg's kept there, each until it's
+    /// expected to end, and beside `mates`. `None` when it wouldn't take the leg, couldn't hold it
+    /// idle, or wouldn't have room for it even so.
+    fn earliest(&mut self, id: &str, runner: &str, now: i64, mates: &[String]) -> Option<i64> {
+        self.runners.get(runner)?;
+        let ends: Vec<i64> = self.on(runner).iter().filter_map(|g| self.look_end(g, now)).collect();
+        let (r, l) = (self.runners.get(runner)?, self.legs.get(id)?);
+        let At::Queued(q) = &l.at else { return None };
+        let class = q.class;
+        if !r.connected || !carries(&r.input, &l.input) || !self.admits(r, l) || !room(&self.cfg, &r.input, &[], &l.input) {
+            return None;
+        }
+        let before = self.reserved_on(runner, |c, k| c < class && !k.holds(id));
+        let mut times: Vec<i64> = ends.into_iter().chain(before.iter().map(|(_, end)| *end)).map(|t| t.max(now)).collect();
+        times.sort_unstable();
+        times.dedup();
+        std::iter::once(now).chain(times).find(|t| {
+            let mut on: Vec<&LegIn> = self.on(runner).iter().filter_map(|g| self.legs.get(g)).filter(|g| matches!(&g.at, At::On { ends, .. } if ends.expected > *t)).map(|g| &g.input).collect();
+            on.extend(before.iter().filter(|(_, end)| end > t).filter_map(|(item, _)| self.legs.get(item)).map(|x| &x.input));
+            on.extend(mates.iter().filter_map(|m| self.legs.get(m)).map(|x| &x.input));
+            room(&self.cfg, &r.input, &on, &l.input)
+        })
+    }
+
+    /// A running leg's expected end looked at at `now`, kept as it was moved (W05-R38).
+    fn look_end(&mut self, id: &str, now: i64) -> Option<i64> {
+        let At::On { ends, .. } = &mut self.legs.get_mut(id)?.at else { return None };
+        *ends = ends.at(now);
+        Some(ends.expected)
+    }
+
+    /// The legs kept on a runner by the room `keep` keeps, each with when it's expected to end:
+    /// its room's time plus its expected duration.
+    fn reserved_on(&self, runner: &str, keep: impl Fn(Class, &Kept) -> bool) -> Vec<(String, i64)> {
+        let mut out = Vec::new();
+        for (c, k) in &self.reserved {
+            if keep(*c, k) {
+                for id in k.on_runner(runner) {
+                    if let Some(item) = self.legs.get(id) {
+                        out.push((id.clone(), Ends::of(&item.input, k.at).expected));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether a runner may take a leg now, `mates` put there with it, as the room kept there for
+    /// the leg's class and those before it, not for the leg, lets it ([`Self::respects`]).
+    fn allowed(&self, r: &Runner, l: &Leg, mates: &[&LegIn]) -> bool {
+        let class = match &l.at {
+            At::Queued(q) => q.class,
+            _ => Class::Background,
+        };
+        self.reserved.iter().filter(|(c, k)| **c <= class && k.on(&r.input.id) && !k.holds(&l.input.id)).all(|(c, k)| self.respects(r, l, *c, k, mates))
+    }
+
+    /// Whether a leg granted on a runner now, `mates` beside it, leaves the room kept there (of
+    /// class `of`) its room: it's expected to end by the room's time, or fits there then beside
+    /// the legs kept there, the grants still expected to run then, the other legs kept there that
+    /// will be running then, and its mates.
+    fn respects(&self, r: &Runner, l: &Leg, of: Class, k: &Kept, mates: &[&LegIn]) -> bool {
+        if k.holds(&l.input.id) || Ends::of(&l.input, self.now).expected <= k.at {
+            return true;
+        }
+        let id = &r.input.id;
+        let mut on: Vec<&LegIn> = self.on(id).iter().filter_map(|g| self.legs.get(g)).filter(|g| matches!(&g.at, At::On { ends, .. } if ends.at(self.now).expected > k.at)).map(|g| &g.input).collect();
+        on.extend(k.on_runner(id).filter_map(|i| self.legs.get(i)).map(|x| &x.input));
+        on.extend(self.reserved_on(id, |c, o| c != of && o.at <= k.at).into_iter().filter(|(_, end)| *end > k.at).filter_map(|(i, _)| self.legs.get(&i)).map(|x| &x.input));
+        on.extend(mates.iter().copied());
+        room(&self.cfg, &r.input, &on, &l.input)
+    }
+
+    /// Room kept that a leg granted on a runner doesn't leave: room kept for it ends, and room of a
+    /// class after its own on that runner, which it goes before, is worked out again.
+    fn granted_over(&mut self, id: &str, runner: &str) {
+        let (Some(l), Some(r)) = (self.legs.get(id), self.runners.get(runner)) else { return };
+        let gone: Vec<Class> = self.reserved.iter().filter(|(c, k)| k.holds(id) || (k.on(runner) && !self.respects(r, l, **c, k, &[]))).map(|(c, _)| *c).collect();
+        for c in gone {
+            self.unkeep(c);
+        }
+    }
+
+    /// Ends `class`'s room kept, if it has some, its runners taking what fits them before the input
+    /// is done. Whether it had some.
+    fn unkeep(&mut self, class: Class) -> bool {
+        let Some(k) = self.reserved.remove(&class) else { return false };
+        self.unkept.extend(k.items.into_iter().map(|(_, r)| r));
+        true
+    }
+
+    /// Keeps the room `keep` keeps, and ends the rest.
+    fn keep_reserved(&mut self, keep: impl Fn(Class, &Kept) -> bool) {
+        let gone: Vec<Class> = self.reserved.iter().filter(|(c, k)| !keep(**c, k)).map(|(c, _)| *c).collect();
+        for c in gone {
+            self.unkeep(c);
+        }
+    }
+
+    /// Room kept for a leg no longer waiting in the queue in its class, or on a runner gone, away
+    /// or draining, is dropped.
+    fn drop_stale(&mut self) {
+        let (legs, runners) = (&self.legs, &self.runners);
+        let gone: Vec<Class> = self
+            .reserved
+            .iter()
+            .filter(|(class, k)| !k.items.iter().all(|(leg, runner)| legs.get(leg).is_some_and(|l| matches!(&l.at, At::Queued(q) if q.class == **class)) && runners.get(runner).is_some_and(|r| r.connected && !r.draining)))
+            .map(|(c, _)| *c)
+            .collect();
+        for c in gone {
+            self.unkeep(c);
+        }
     }
 
     /// A runner the leg stays off: one that refused it; one that lost it, while another that
@@ -901,10 +1612,16 @@ impl Reference {
                 At::Retrying { at, .. } => {
                     p.2.insert(id.clone(), *at);
                 }
+                At::Off => {}
             }
         }
         p
     }
+}
+
+/// A runner-lost end of an attempt (W05-R16).
+fn runner_lost() -> Outcome {
+    Outcome::Failed(Failed { class: FailureClass::RunnerLost, exit_code: None, log_hits: Vec::new() })
 }
 
 /// What a placement costs a node of `weight` in a set of dimensions (a bitmask): the largest over
@@ -957,10 +1674,12 @@ fn runner(d: &mut Draw, n: u64) -> RunnerIn {
 }
 
 fn leg(d: &mut Draw, n: u64) -> LegIn {
-    let mut request = match d.below(3) {
+    let mut request = match d.below(4) {
         0 => Resources::default(),
         1 => Resources { cpu: Cpus::milli(500 * (1 + d.below(8))), mem: (1 + d.below(8)) * GIB, ..Resources::default() },
-        _ => Resources { cpu: Cpus::whole(1 + d.below(4)), mem: (1 + d.below(16)) * GIB, ..Resources::default() },
+        2 => Resources { cpu: Cpus::whole(1 + d.below(4)), mem: (1 + d.below(16)) * GIB, ..Resources::default() },
+        // A big one, about as big as a runner (W05-R39's items).
+        _ => Resources { cpu: Cpus::whole(4 + d.below(5)), mem: (8 + d.below(25)) * GIB, ..Resources::default() },
     };
     let exclusive = d.below(5) == 0;
     // An ordinary leg asking CPUs asks a GPU now and then.
@@ -976,6 +1695,10 @@ fn leg(d: &mut Draw, n: u64) -> LegIn {
         exclusive,
         request,
         cost: (d.below(2) == 0).then(|| 10_000 * (1 + d.below(60))),
+        // A p90 half the time, short enough that grants run past it, and a timeout now and then
+        // (W05-R38).
+        p90: (d.below(2) == 0).then(|| 5_000 * (1 + d.below(36))),
+        timeout: (d.below(3) == 0).then(|| 60_000 * (2 + d.below(20))),
         actor: format!("a{}", d.below(2)),
         lane: format!("l{}", d.below(2)),
         class: Class::ALL.get(usize::try_from(d.below(5)).unwrap_or(0)).copied().unwrap_or_default(),
@@ -1010,11 +1733,17 @@ fn case(seed: u64) -> (Config, u64, Vec<(Step, i64)>) {
     // (W05-R34).
     let lease = (d.below(2) == 0).then(|| [1, 2, 4, 8].get(usize::try_from(d.below(4)).unwrap_or(0)).copied().unwrap_or(1) * 60_000);
     let lock_delay = if d.below(2) == 0 { Config::default().lock_delay } else { 15_000 * d.below(9) };
-    let cfg = Config { resources, fair_by, classes, aging_per_minute, lease, lock_delay, ..Config::default() };
+    // Room kept for big items in half the seeds (W05-R39).
+    let backfill = d.below(2) == 0;
+    let cfg = Config { resources, fair_by, classes, aging_per_minute, lease, lock_delay, backfill, ..Config::default() };
     let epoch = d.below(5);
     let mut r = Reference::new(cfg.clone(), epoch);
-    let shapes: Vec<RunnerIn> = (0..1 + d.below(4)).map(|n| runner(&mut d, n)).collect();
-    let (most, mut queued, mut now, mut steps) = (1 + d.below(12), 0, 0, Vec::new());
+    // With backfilling, two runners at least and more legs: room kept is worked out, and moved, where
+    // runners free at different times.
+    let shapes: Vec<RunnerIn> = (0..if backfill { 2 + d.below(3) } else { 1 + d.below(4) }).map(|n| runner(&mut d, n)).collect();
+    let (most, mut queued, mut now, mut steps) = (if backfill { 4 + d.below(12) } else { 1 + d.below(12) }, 0, 0, Vec::new());
+    // A gang's members still to be queued.
+    let mut members: std::collections::VecDeque<LegIn> = std::collections::VecDeque::new();
     for _ in 0..40 {
         let before = now;
         now += ms(&mut d, 3 * MINUTE);
@@ -1024,9 +1753,20 @@ fn case(seed: u64) -> (Config, u64, Vec<(Step, i64)>) {
         let known: Vec<String> = r.legs.keys().cloned().collect();
         let step = match d.below(16) {
             0 | 1 => shapes.iter().find(|s| !up.contains(&s.id)).cloned().map(Step::Up),
-            2..=4 if queued < most => {
+            2..=4 if queued < most || !members.is_empty() => {
+                // A gang of 2 to 4 now and then (W05-R40): a job's legs, alike, queued one by one.
+                if members.is_empty() {
+                    let l = leg(&mut d, queued);
+                    if d.below(4) == 0 {
+                        let size = 2 + d.below(3);
+                        let gang = Gang { id: format!("g{queued}"), size: u32::try_from(size).unwrap_or(2) };
+                        members = (0..size).map(|i| LegIn { id: format!("l{}", queued + i), gang: Some(gang.clone()), ..l.clone() }).collect();
+                    } else {
+                        members.push_back(l);
+                    }
+                }
                 queued += 1;
-                Some(Step::Queued(Box::new(leg(&mut d, queued - 1))))
+                members.pop_front().map(|l| Step::Queued(Box::new(l)))
             }
             5..=7 => d.pick(&running).and_then(|id| r.legs.get(id)).map(|l| {
                 let outcome = match d.below(4) {
@@ -1200,7 +1940,7 @@ fn shrink(cfg: &Config, epoch: u64, steps: Vec<(Step, i64)>, why: String) -> (Ve
 fn settings(cfg: &Config) -> String {
     let classes: Vec<String> = cfg.classes.iter().map(|(c, cc)| format!("{} floor {}‰{}", c.as_str(), cc.floor, cc.bound.map_or_else(String::new, |b| format!(" bound {} min", b / 60_000)))).collect();
     let leases = cfg.lease.map_or_else(|| "no leases".to_owned(), |ms| format!("leases of {} min, lock-delay {} s", ms / 60_000, cfg.lock_delay / 1000));
-    format!("{}, fair by {:?}, aging {}‰ a minute, {}, {leases}", if cfg.resources { "resource mode" } else { "slots" }, cfg.fair_by, cfg.aging_per_minute, classes.join(", "))
+    format!("{}, fair by {:?}, aging {}‰ a minute, {}, {leases}{}", if cfg.resources { "resource mode" } else { "slots" }, cfg.fair_by, cfg.aging_per_minute, classes.join(", "), if cfg.backfill { ", backfill" } else { "" })
 }
 
 fn report(seed: u64, cfg: &Config, steps: &[(Step, i64)], why: &str) -> String {
@@ -1241,19 +1981,126 @@ fn e1_5_the_engine_agrees_with_the_reference() {
     assert!(parted.is_empty(), "{} of {CASES} cases part; the first:\n{}", parted.len(), first.unwrap_or_default());
 }
 
+/// The example of docs/needs.md E4.5: three runners of 4 CPUs, a stream of 1-CPU legs two to a
+/// runner, and a gang of two 4-CPU members queued among them. Both engines keep room for the gang
+/// on the same two runners from the same time (where their 1-CPU legs are expected to have ended),
+/// keep a long 1-CPU leg that comes later out of that room, and start the gang there together once
+/// those legs have ended; they agree after every input.
+#[test]
+fn e4_5_both_engines_keep_room_for_a_gang_and_start_it_together() {
+    use super::state::WaitReason;
+    // Runners that aren't overcommitted: two 1-CPU legs leave a 4-CPU member no room.
+    let cfg = Config { resources: true, backfill: true, overcommit_cpu: 1000, overcommit_mem: 1000, ..Config::default() };
+    let up = |id: &str| {
+        let view = RunnerView { name: id.into(), labels: vec!["x".into()], facts: RunnerFacts { os: "linux".into(), arch: "x86_64".into(), ..RunnerFacts::default() }, caps: 0, pool: None };
+        Step::Up(RunnerIn { id: id.into(), view, slots: 4, capacity: Some(Resources { cpu: Cpus::whole(4), mem: 16 * GIB, ..Resources::default() }), executor: None, draining: false })
+    };
+    let small = |id: &str| LegIn {
+        id: id.into(),
+        run: "run".into(),
+        repo: "acme/r".into(),
+        route: LegRoute { labels: vec!["x".into()], ..LegRoute::default() },
+        request: Resources { cpu: Cpus::whole(1), mem: 2 * GIB, ..Resources::default() },
+        p90: Some(MINUTE.unsigned_abs()),
+        class: Class::Batch,
+        ..LegIn::default()
+    };
+    let member = |id: &str| LegIn { gang: Some(Gang { id: "sim".into(), size: 2 }), request: Resources { cpu: Cpus::whole(4), mem: 8 * GIB, ..Resources::default() }, ..small(id) };
+    let mut steps = vec![(up("r0"), 0), (up("r1"), 0), (up("r2"), 0)];
+    for (n, at) in (1..=6).map(|n| (n, n * 1000)) {
+        steps.push((Step::Queued(Box::new(small(&format!("s{n}")))), at));
+    }
+    steps.push((Step::Queued(Box::new(member("m1"))), 10_000));
+    steps.push((Step::Queued(Box::new(member("m2"))), 10_000));
+    steps.push((Step::Queued(Box::new(LegIn { p90: Some(10 * MINUTE.unsigned_abs()), ..small("long") })), 20_000));
+    for (n, at) in (1..=6).map(|n| (n, MINUTE + n * 1000)) {
+        steps.push((Step::Ended { leg: format!("s{n}"), attempt: 1, outcome: Outcome::Success }, at));
+    }
+    let parted = run(&cfg, 0, &steps, |_| {}).err().map(|(applied, why)| report(0, &cfg, &applied, &why));
+    assert!(parted.is_none(), "{}", parted.unwrap_or_default());
+    let (mut s, mut r) = (Scheduler::with_epoch(cfg.clone(), 0), Reference::new(cfg.clone(), 0));
+    let (mut kept, mut started) = (None, None);
+    for (step, now) in &steps {
+        s.handle(step.input(), *now);
+        r.handle(step, *now);
+        let mut engine: Vec<(String, i64)> = ["m1", "m2"].iter().filter_map(|m| if let Some(WaitReason::Reserved { runner, at }) = s.reason(m) { Some((runner.clone(), *at)) } else { None }).collect();
+        engine.sort();
+        if kept.is_none() && engine.len() == 2 {
+            let reference = r.reserved.values().find(|k| k.holds("m1") && k.holds("m2")).map(|k| {
+                let mut on: Vec<(String, i64)> = k.items.iter().map(|(_, runner)| (runner.clone(), k.at)).collect();
+                on.sort();
+                on
+            });
+            assert_eq!(reference.as_ref(), Some(&engine), "both keep room for the gang on the same two runners from the same time");
+            kept = Some(engine);
+        }
+        let on: Vec<String> = ["m1", "m2"].iter().filter_map(|m| r.runner_of(m)).collect();
+        if started.is_none() && !on.is_empty() {
+            assert_eq!(on.len(), 2, "the gang starts whole, at {now}: {on:?}");
+            started = Some((on, *now));
+        }
+    }
+    let kept = kept.unwrap_or_default();
+    let (on, at) = started.unwrap_or_default();
+    assert!(kept.len() == 2 && kept.iter().all(|(_, t)| *t == at), "room kept {kept:?}, the gang started at {at}");
+    let mut on = on;
+    on.sort();
+    assert_eq!(on, kept.iter().map(|(runner, _)| runner.clone()).collect::<Vec<_>>(), "where room was kept for it");
+    assert!(r.runner_of("long").is_some_and(|x| !on.contains(&x)), "the long leg kept out of that room: {:?}", r.runner_of("long"));
+}
+
+/// The first of the cases that parts the engine from the reference with `m` planted in the
+/// engine, cut down and named; none when none does.
+fn first_parting(m: super::state::Mutant) -> Option<String> {
+    super::state::MUTANT.with(|c| c.set(Some(m)));
+    let first = (0..CASES).find_map(|seed| {
+        let (cfg, epoch, steps) = case(seed);
+        run(&cfg, epoch, &steps, |_| {}).err().map(|(applied, why)| (seed, cfg, epoch, applied, why))
+    });
+    let named = first.map(|(seed, cfg, epoch, applied, why)| {
+        let (fewer, why) = shrink(&cfg, epoch, applied, why);
+        report(seed, &cfg, &fewer, &why)
+    });
+    super::state::MUTANT.with(|c| c.set(None));
+    named
+}
+
+/// E4.5: a backfill granted past its reservation's time (room kept holding nothing back) parts
+/// the engine from the reference within the cases, which name the first.
+#[test]
+fn e4_5_a_backfill_past_its_reservation_parts() {
+    let named = first_parting(super::state::Mutant::PastReservation);
+    assert!(named.is_some(), "no case parts with backfills granted past their reservations' time");
+    println!("{}", named.unwrap_or_default());
+}
+
+/// E4.5: a gang granted in part (started without its last member) parts the engine from the
+/// reference within the cases, which name the first.
+#[test]
+fn e4_5_a_gang_granted_in_part_parts() {
+    let named = first_parting(super::state::Mutant::GangInPart);
+    assert!(named.is_some(), "no case parts with gangs granted in part");
+    println!("{}", named.unwrap_or_default());
+}
+
 /// The cases cover what the reference is for: both modes, exclusive legs held whole and in
 /// shares, legs refused and retried after a runner was lost, runners coming back, every class,
-/// legs promoted, placed ahead by a floor and placed over one; and grants renewed and expired,
-/// stop legs waiting the lock-delay, runners draining and undrained, ticks, and refusals and ends
-/// that come late.
+/// legs promoted, placed ahead by a floor and placed over one; grants renewed and expired, stop
+/// legs waiting the lock-delay, runners draining and undrained, ticks, and refusals and ends that
+/// come late; and with backfilling, big legs among small ones, room kept made, moved and worked
+/// out again once its time passed, legs granted on a runner where room is kept for another and
+/// legs kept out of it; gangs of 2 to 4 granted whole, kept room for whole and taken back whole.
 #[test]
 fn e1_5_the_cases_cover_the_rules() {
     let (mut kinds, mut modes, mut depths, mut classes) = (BTreeSet::new(), BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
     let (mut promoted, mut ahead, mut over, mut renewed, mut expired, mut locked) = (0, 0, 0, 0, 0, 0);
-    for seed in 0..500 {
+    let (mut made, mut moved, mut again, mut backfilled, mut kept_out) = (0, 0, 0, 0, 0);
+    let (mut whole, mut kept_whole, mut back, mut sizes, mut backfill) = (0, 0, 0, BTreeSet::new(), BTreeSet::new());
+    for seed in 0..4000 {
         let (cfg, epoch, steps) = case(seed);
         modes.insert(cfg.resources);
         depths.insert(cfg.fair_by.len());
+        backfill.insert(cfg.backfill);
         let mut r = Reference::new(cfg.clone(), epoch);
         for (s, now) in &steps {
             if r.applies(s) {
@@ -1261,10 +2108,13 @@ fn e1_5_the_cases_cover_the_rules() {
             }
             if let Step::Queued(l) = s {
                 classes.insert(l.class);
+                sizes.extend(l.gang.as_ref().map(|g| g.size));
             }
         }
         (promoted, ahead, over) = (promoted + r.promoted, ahead + r.ahead, over + r.over);
         (renewed, expired, locked) = (renewed + r.renewed, expired + r.expired, locked + r.locked);
+        (made, moved, again, backfilled, kept_out) = (made + r.made, moved + r.moved, again + r.again, backfilled + r.backfilled, kept_out + r.kept_out);
+        (whole, kept_whole, back) = (whole + r.whole, kept_whole + r.kept_whole, back + r.back);
         let mut lost = BTreeSet::new();
         for (s, _) in &steps {
             kinds.insert(match s {
@@ -1275,6 +2125,8 @@ fn e1_5_the_cases_cover_the_rules() {
                     lost.insert(r.clone());
                     "lost"
                 }
+                Step::Queued(l) if l.gang.is_some() => "one of a gang",
+                Step::Queued(l) if l.request.cpu >= Cpus::whole(4) && !l.exclusive => "big",
                 Step::Queued(l) if l.exclusive && l.request.cpu.is_zero() => "exclusive whole",
                 Step::Queued(l) if l.exclusive => "exclusive share",
                 Step::Queued(l) if l.request.gpu > 0 => "asks a GPU",
@@ -1296,7 +2148,13 @@ fn e1_5_the_cases_cover_the_rules() {
     assert_eq!(classes.len(), Class::ALL.len(), "every class");
     assert!(promoted > 0 && ahead > 0 && over > 0, "promoted {promoted}, ahead by a floor {ahead}, over one {over}");
     assert!(renewed > 0 && expired > 0 && locked > 0, "renewed {renewed}, expired {expired}, stop legs locked {locked}");
-    for k in ["up", "up with GPUs", "back", "lost", "queued", "asks a GPU", "exclusive whole", "exclusive share", "ended", "ended lost", "ended retried", "refused", "renewed", "drained", "undrained", "tick", "ended late"] {
+    eprintln!("the cases' room kept: made {made}, moved {moved}, worked out again {again}; legs granted beside it {backfilled}, kept out {kept_out}; gangs granted whole {whole}, kept room for whole {kept_whole}, taken back {back}");
+    assert_eq!(backfill.len(), 2, "backfilling on and off");
+    assert!(made > 0 && moved > 0 && again > 0, "room kept made {made}, moved {moved}, worked out again once passed {again}");
+    assert!(backfilled > 0 && kept_out > 0, "legs granted beside room kept {backfilled}, kept out of it {kept_out}");
+    assert!(whole > 0 && kept_whole > 0 && back > 0, "gangs granted whole {whole}, kept room for whole {kept_whole}, taken back whole {back}");
+    assert_eq!(sizes, BTreeSet::from([2, 3, 4]), "gangs of 2 to 4");
+    for k in ["up", "up with GPUs", "back", "lost", "queued", "big", "one of a gang", "asks a GPU", "exclusive whole", "exclusive share", "ended", "ended lost", "ended retried", "refused", "renewed", "drained", "undrained", "tick", "ended late"] {
         assert!(kinds.contains(k), "no case has `{k}`");
     }
 }
