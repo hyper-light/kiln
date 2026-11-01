@@ -1274,7 +1274,7 @@ async fn pipe(rx: &async_channel::Receiver<Vec<u8>>, open: bool) -> Option<Vec<u
 }
 
 enum Ev {
-    Change((String, (Option<super::model::FileChange>, Option<super::core::Baseline>))),
+    Change((String, super::diff::Found)),
     Out(Option<Vec<u8>>),
     Err(Option<Vec<u8>>),
     Ctl(Option<Ctl>),
@@ -1688,6 +1688,13 @@ fn effects(s: &Arc<Session>, kind: &'static Kind, files: &Files, done: &async_ch
                 let tx = done.clone();
                 crate::rt::spawn(async move {
                     let value = crate::rt::blocking(move || read_first(&paths)).await.unwrap_or_else(|e| serde_json::json!({"error": format!("{e:#}")}));
+                    let _ = tx.send(Done::Reply { client, value }).await;
+                });
+            }
+            super::core::Effect::Own { client, ask } => {
+                let tx = done.clone();
+                crate::rt::spawn(async move {
+                    let value = crate::rt::blocking(move || super::diff::own_edits(&ask, super::diff::read_now)).await.unwrap_or_else(|e| serde_json::json!({"error": format!("{e:#}")}));
                     let _ = tx.send(Done::Reply { client, value }).await;
                 });
             }
@@ -2917,6 +2924,20 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
     if handed {
         s.prompted.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    // A new session (nothing in its timeline yet): the commit its folder has checked out as it
+    // begins, the commits after it its own (the Changes tab's Commits). One that came back (a
+    // restart, a move) has it, or is from before kiln kept it.
+    let new = {
+        let core = s.core.lock();
+        (core.events().next().is_none() && core.state.started_head.is_none()).then(|| core.state.cwd.clone())
+    };
+    if let Some(cwd) = new.filter(|_| !handed)
+        && let Some(head) = crate::workspace::git::head(std::path::Path::new(&cwd)).await
+    {
+        let mut core = s.core.lock();
+        core.state.started_head = Some(head);
+        core.touch_state();
+    }
     // Taking over a session: its transcript is read once it has ended (checked again before each
     // start while it has not).
     if !handed {
@@ -3004,6 +3025,9 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
     // A setting its harness takes when it starts (where its commands run) changed: it starts
     // again once nothing is under way.
     let mut reloading = false;
+    // Its harness ran here, a process of its own: one that never did has no group of processes
+    // here to end when it lets go.
+    let mut ran_here = false;
     // Tasks the harness left running that a switch stopped.
     let mut left = 0usize;
     // The models it last listed (the machine keeps the list for its "new agent" and switches): not
@@ -3140,6 +3164,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
             Err(e) => error = Some(format!("{e:#}")),
             Ok(mut p) => {
                 *s.pid.lock() = Some(p.pid);
+                ran_here = true;
                 if adopted {
                     let mut core = s.core.lock();
                     // An older image may have left what the harness before a switch ran looking live.
@@ -3185,6 +3210,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                 let mut ending = false;
                 // Stopped by force (`Command::ForceStop`): it starts again now, whatever is under way.
                 let mut forcing = false;
+                // Where this machine keeps what's an agent's own: whose each file it changes is.
+                let roots = std::sync::Arc::new(super::whose::Roots::here(&spec.env));
                 loop {
                     for job in jobs.previews.drain(..) {
                         let tx = pv_tx.clone();
@@ -3195,15 +3222,19 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         });
                     }
                     for job in jobs.changes.drain(..) {
-                        // Placed among its folder's repository's working trees (a worktree it went into).
-                        let home = {
+                        // Placed among its folder's repository's working trees (a worktree it went into),
+                        // and said whose it is: this project's, the person's or an agent's own.
+                        let (home, folders) = {
                             let mut core = s.core.lock();
                             core.start_change(&job.abs);
-                            core.state.cwd.clone()
+                            let cwd = core.state.cwd.clone();
+                            core.note_folder(&cwd);
+                            (cwd, core.folders().to_vec())
                         };
+                        let roots = roots.clone();
                         changes.push(async move {
                             let abs = job.abs.clone();
-                            let change = crate::rt::blocking(move || super::diff::placed_change(&job, &home)).await.unwrap_or((None, None));
+                            let change = crate::rt::blocking(move || super::diff::placed_change(&job, &home, &folders, &roots)).await.unwrap_or_default();
                             (abs, change)
                         });
                     }
@@ -3269,6 +3300,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                     let _ = sink.send((s.id.clone(), u)).await;
                                 }
                             }
+                            // What one who changed its files did alone: the session keeps that, whatever its harness.
+                            Command::OwnEdits { client, by } => s.core.lock().ask_own(client, &by),
                             Command::Control { id, value } if id == "rename" => {
                                 if let Some(c) = name_session(&s, value.as_ref()) {
                                     adapter.command(&mut s.core.lock(), c);
@@ -3498,10 +3531,10 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                             }
                         }
                         Ev::Preview(None) => {}
-                        Ev::Change((abs, (change, resolved))) => {
-                            s.core.lock().set_change(&abs, change, resolved);
-                            while let Some(Some((abs, (change, resolved)))) = changes.next().now_or_never() {
-                                s.core.lock().set_change(&abs, change, resolved);
+                        Ev::Change((abs, found)) => {
+                            s.core.lock().found(&abs, found);
+                            while let Some(Some((abs, found))) = changes.next().now_or_never() {
+                                s.core.lock().found(&abs, found);
                             }
                         }
                         Ev::Fx(Some(d)) => d.apply(&mut adapter, &mut s.core.lock()),
@@ -3743,6 +3776,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                             let _ = sink.send((s.id.clone(), u)).await;
                         }
                     }
+                    Command::OwnEdits { client, by } => s.core.lock().ask_own(client, &by),
                     // Another harness's model: the session goes on in it, now.
                     Command::SetModel { model, kind: Some(to) } if to != kind.id => {
                         if let Some(sw) = wanted(&s, kind, &to, model) {
@@ -3857,7 +3891,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     if !left.is_empty() {
                         let _ = crate::rt::blocking(move || left.iter().for_each(super::survivors::stop_tree)).await;
                     }
-                    if let Some(g) = crate::os::contain::Group::existing(&s.id) {
+                    // Gone on elsewhere without its harness ever running here (it couldn't start),
+                    // it has no group here: one under its id is the machine's it went on to, when
+                    // both kiln processes share a cgroup (a test's server and its runners), its
+                    // harness starting there, and isn't ended from here.
+                    if let Some(g) = crate::os::contain::Group::existing(&s.id).filter(|_| ran_here || !matches!(ctl, Some(Ctl::LetGo))) {
                         end_group(g, Duration::ZERO);
                     }
                     if matches!(ctl, Some(Ctl::LetGo)) {

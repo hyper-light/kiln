@@ -57,8 +57,7 @@
   min-width: 0;
 }
 .ship-main:focus-visible,
-.ship-go:focus-visible,
-.ship-fold:focus-visible {
+.ship-go:focus-visible {
   outline: 2px solid #a6c4ed;
   outline-offset: 2px;
   border-radius: 6px;
@@ -184,42 +183,6 @@
 .ship-go[aria-expanded="true"] svg {
   transform: rotate(180deg);
 }
-.ship-fold {
-  all: unset;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  box-sizing: border-box;
-  width: 100%;
-  padding: 10px 4px 10px 34px;
-  color: #8b8e96;
-  font-size: 12.5px;
-  border-top: 1px solid var(--k-line-2, #1f2125);
-  background: rgba(226, 207, 174, 0.02);
-}
-.ship-fold__sha {
-  font-family: var(--font-mono, ui-monospace, monospace);
-  font-size: 11px;
-}
-.ship-fold:hover {
-  color: #e4e5e7;
-}
-.ship-riders {
-  list-style: none;
-  margin: 0;
-  padding: 0 4px 8px 34px;
-  display: grid;
-  gap: 6px;
-}
-.ship-rider {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
-  gap: 12px;
-  align-items: baseline;
-  font-size: 12.5px;
-  color: #a1a4ad;
-}
 .ship-sha {
   font-family: var(--mono, ui-monospace, monospace);
   font-size: 11px;
@@ -340,12 +303,6 @@
   .ship-line > .ship-text {
     max-width: 100%;
   }
-  .ship-rider {
-    grid-template-columns: minmax(0, 1fr) auto;
-  }
-  .ship-rider .ship-text {
-    display: none;
-  }
 }
 
 /* Ship's three views: its commits, and the runs and deployments it took the place of in the nav. */
@@ -464,135 +421,219 @@
   color: #bfdccf;
 }
 
-/* An opened commit's job cards (opened-commit plan, step 1): as many to a view as fit, the cards and
-   their gaps together exactly the lanes card's width, a view at a time. The view's cards alone are
-   drawn (jobs.tsx), so nothing scrolls sideways (W21-AC01). */
-.ship-jobs {
-  container-type: inline-size;
-}
-.ship-jobs__track {
-  --n: 1;
-  --gap: 0.75rem;
+/* An opened commit's jobs as one pane (docs/ci.md W26-R23, Ada's approved stills of 2026-10-30): the
+   strip, the jobs by stage, the picked job's output beside them (under its line on a phone). Flat:
+   no box around any of it, hairlines between; a picked line a square tint, the one shown with a
+   straight 2px edge. Every height is held, so nothing moves as you pick, act or the jobs go on. */
+.jp {
   display: grid;
-  grid-template-columns: repeat(var(--n), minmax(0, 1fr));
-  gap: var(--gap);
-  margin: 0;
-  padding: 0;
-  list-style: none;
+  gap: 10px;
 }
-@container (min-width: 420px) {
-  .ship-jobs__track {
-    --n: 2;
-  }
-}
-@container (min-width: 620px) {
-  .ship-jobs__track {
-    --n: 3;
-  }
-}
-@container (min-width: 820px) {
-  .ship-jobs__track {
-    --n: 4;
-  }
-}
-@container (min-width: 1100px) {
-  .ship-jobs__track {
-    --n: 6;
-  }
-}
-/* A stage's card in an opened commit, f-ship's station (plan 01a1856fe81375b1bd1d1d86f270a45b,
-   step 8): its head (glyph, name, how many done or how it stands) over every job it has, each its
-   glyph, name and time. One height whatever it holds, so nothing grows as jobs begin; a long list
-   scrolls inside it. Its edge takes its stage's tone. */
-.ship-stn {
+.jp-strip {
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
-  height: 15rem;
-  min-width: 0;
-  border: 1px solid var(--k-line, #2a2c31);
-  border-radius: 10px;
-  background: #0d0e11;
-}
-.ship-stn[data-state="needs"] {
-  border-color: rgb(226 207 174 / 0.45);
-}
-.ship-stn[data-state="failed"],
-.ship-stn[data-state="partial"],
-.ship-stn[data-state="rolledback"] {
-  border-color: rgb(226 185 189 / 0.4);
-}
-.ship-stn[data-state="running"],
-.ship-stn[data-state="guard"],
-.ship-stn[data-state="replanting"],
-.ship-stn[data-state="soaking"] {
-  border-color: rgb(205 198 234 / 0.35);
-}
-.ship-stn__head {
-  display: flex;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
-  gap: 7px;
-  padding: 9px 10px;
+  gap: 8px 16px;
+  padding: 10px;
+  border-top: 1px solid var(--k-line-2, #1f2125);
   border-bottom: 1px solid var(--k-line-2, #1f2125);
-  color: #e4e5e7;
-  font-size: 12.5px;
 }
-.ship-stn__name {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.ship-stn__n {
-  margin-left: auto;
-  color: #8b8e96;
-  font-family: var(--font-mono, ui-monospace, monospace);
-  font-size: 10.5px;
-  white-space: nowrap;
-}
-.ship-stn__parts {
+.jp-say {
   display: grid;
-  align-content: start;
+  min-width: 0;
   gap: 2px;
-  margin: 0;
-  padding: 6px 4px 8px;
-  overflow-y: auto;
-  list-style: none;
+  color: #a1a4ad;
+  font-size: 12.5px;
+  line-height: 18px;
 }
-/* A job: picks what Output shows; the picked one lit. */
-.ship-part {
-  all: unset;
-  box-sizing: border-box;
-  display: grid;
-  width: 100%;
-  grid-template-columns: 14px minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 7px;
-  padding: 3px 6px;
-  border-radius: 6px;
-  color: #b9bbc2;
+/* Two lines at the most, always two lines high: what an action did never pushes the jobs down. */
+.jp-said {
+  display: -webkit-box;
+  height: 36px;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  align-content: center;
+}
+.jp-said b {
+  color: #e4e5e7;
+  font-weight: 400;
+}
+.jp-say[data-tone="warn"] .jp-said {
+  color: #e2b9bd;
+}
+.jp-q {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  color: #6d7078;
   font-size: 12px;
+}
+.jp-q button {
+  all: unset;
+  color: #8b8e96;
   cursor: pointer;
 }
-.ship-part:hover {
-  background: rgb(255 255 255 / 0.04);
+.jp-q button[aria-pressed="true"] {
+  color: #e4e5e7;
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
-.ship-part[aria-pressed="true"] {
+.jp-q button:focus-visible {
+  outline: 2px solid #a6c4ed;
+  outline-offset: 2px;
+}
+.jp-verbs {
+  display: grid;
+  grid-template-columns: repeat(3, 80px);
+  gap: 6px;
+}
+.jp-verbs button {
+  all: unset;
+  box-sizing: border-box;
+  display: inline-grid;
+  height: 32px;
+  place-items: center;
+  border: 1px solid rgb(255 255 255 / 0.14);
+  border-radius: 999px;
+  color: #e4e5e9;
+  font-size: 13px;
+  cursor: pointer;
+}
+.jp-verbs button:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+.jp-verbs button:focus-visible {
+  outline: 2px solid #a6c4ed;
+  outline-offset: 2px;
+}
+.jp-verbs button[data-keep] {
+  border-color: transparent;
+  background: rgb(255 255 255 / 0.9);
+  color: #0b0c0e;
+}
+.jp-verbs button[data-go] {
+  grid-column: span 2;
+  border-color: #e2b9bd;
+  background: #e2b9bd;
+  color: #16090b;
+  font-weight: 500;
+}
+.jp-body {
+  display: grid;
+  grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.3fr);
+  align-items: start;
+}
+.jp-side {
+  min-height: 100%;
+  padding-left: 14px;
+  border-left: 1px solid var(--k-line-2, #1f2125);
+}
+.jp-list {
+  margin: 0;
+  padding: 0 0 8px;
+  list-style: none;
+}
+.jp-g {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 8px 4px;
+  color: #97999f;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+.jp-g span:last-child {
+  color: #8b8e96;
+  font-size: 10.5px;
+  letter-spacing: 0;
+  text-transform: none;
+  white-space: nowrap;
+}
+/* A job's line: its glyph adds it to the pick or takes it out; the rest picks it alone. */
+.jp-j {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  align-items: center;
+  height: 30px;
+  color: #b9bbc2;
+  font-size: 12.5px;
+}
+.jp-j[data-sel] {
   background: rgb(205 198 234 / 0.1);
   color: #e4e5e7;
 }
-.ship-part:focus-visible {
+.jp-j[data-at] {
+  box-shadow: inset 2px 0 0 #cdc6ea;
+}
+.jp-glyph,
+.jp-line {
+  all: unset;
+  box-sizing: border-box;
+  height: 100%;
+  cursor: pointer;
+}
+.jp-glyph {
+  display: grid;
+  place-items: center;
+  padding-left: 4px;
+}
+.jp-line {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 0 8px 0 4px;
+}
+.jp-glyph:focus-visible,
+.jp-line:focus-visible {
   outline: 2px solid #a6c4ed;
   outline-offset: -2px;
 }
-.ship-part__name {
+.jp-j:not([data-sel]):hover {
+  background: rgb(255 255 255 / 0.03);
+}
+.jp-j .n {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.ship-part__v {
+/* A line's value, one width as it turns ("running" to "1m 05s"), read from its start: Chromium counts
+   end-aligned text that changes length as moved, so neither the value nor its words move. */
+.jp-j .v {
+  min-width: 7ch;
   color: #8b8e96;
   font-family: var(--font-mono, ui-monospace, monospace);
   font-size: 10.5px;
+  text-align: start;
   white-space: nowrap;
+}
+/* On a phone: under the picked line, the strip again and the job's output. */
+.jp-detail {
+  display: grid;
+  gap: 8px;
+  padding: 0 0 8px;
+  border-bottom: 1px solid var(--k-line-2, #1f2125);
+}
+/* The output in the pane: flat, its own dark ground. */
+.jp .ship-output {
+  border: 0;
+  border-radius: 0;
+  background: #08090a;
+}
+@media (max-width: 700px) {
+  .jp-strip {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .jp-verbs {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+  .jp-body {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 .ship-job {
   display: flex;
@@ -614,40 +655,6 @@
 .ship-job__state {
   color: #a3a5ad;
   font-size: 0.8125rem;
-}
-.ship-jobs__page {
-  display: inline-grid;
-  width: 2rem;
-  height: 2rem;
-  place-items: center;
-  border: 1px solid rgb(255 255 255 / 0.12);
-  border-radius: 999px;
-  color: #e4e5e9;
-}
-.ship-jobs__page:disabled {
-  opacity: 0.35;
-}
-
-/* A card picks its job (opened commit's Output, step 2): the whole card is the button; the picked
-   one is lit. */
-.ship-job__pick {
-  display: flex;
-  width: 100%;
-  height: 100%;
-  flex-direction: column;
-  gap: 0.35rem;
-  padding: 0;
-  border: 0;
-  background: none;
-  color: inherit;
-  font: inherit;
-  text-align: start;
-  cursor: pointer;
-}
-.ship-job__pick:focus-visible {
-  outline: 2px solid #a6c4ed;
-  outline-offset: 6px;
-  border-radius: 0.5rem;
 }
 .ship-job[data-picked] {
   border-color: rgb(255 255 255 / 0.42);
@@ -870,4 +877,473 @@
 .ship-commit__server {
   margin: 0 0 8px;
   overflow-wrap: anywhere;
+}
+
+/* Ship's Deploys (docs/ci.md W26-R24, Ada's approved stills of 2026-10-30, v5 and v6): apps as Ship's
+   rows by project, each project's heading saying what it needs; an opened app the jobs pane's
+   anatomy. Flat: no box around any of it, hairlines between; every height held. */
+.dp-proj {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 4px 6px;
+  color: #e4e5e7;
+  font-size: 12.5px;
+  list-style: none;
+}
+.dp-proj span:last-child {
+  color: #8b8e96;
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.dp-proj span[data-needs] {
+  color: #e2cfae;
+}
+/* No buttons on a row: its track is held, so its columns line up with the commits'. */
+.dp-row .ship-acts {
+  visibility: hidden;
+}
+.dp-open {
+  padding: 6px 4px 14px 16px;
+}
+.dp-slot {
+  min-height: 640px;
+}
+.dp .ship-sech__ctl {
+  min-width: 0;
+  overflow: hidden;
+  color: #8b8e96;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dp-verbs {
+  grid-template-columns: repeat(4, 80px);
+}
+/* What answers an ask spans as it says (Refresh's two side by side). */
+.dp-verbs button[data-go] {
+  grid-column: auto;
+}
+.dp-verbs button[data-go="ask"] {
+  border-color: #e2cfae;
+  background: #e2cfae;
+  color: #171107;
+}
+.jp-say[data-tone="ask"] .jp-said {
+  color: #e2b9bd;
+}
+/* The one picked object's own word lights as a picked word does. */
+.dp .jp-q button[aria-pressed="mixed"] {
+  color: #e4e5e7;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.jp-q button:disabled {
+  cursor: default;
+}
+/* The list and the picked one's detail at one height, each scrolling inside itself. */
+.dp-body {
+  height: 556px;
+}
+.dp .jp-list {
+  height: 100%;
+  overflow: auto;
+}
+.dp-side {
+  height: 100%;
+  overflow: auto;
+}
+.jp-j .n em {
+  margin-right: 6px;
+  color: #8b8e96;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10px;
+  font-style: normal;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.jp-j .n s {
+  margin-right: 6px;
+  color: #a6c4ed;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11px;
+  text-decoration: none;
+}
+.jp-j[data-dim] {
+  color: #6d7078;
+}
+.jp-j[data-dim] .n s {
+  color: #6f86a6;
+}
+/* A workload's head picks the workload: the group's words, a line of its own. */
+.jp-g.dp-head {
+  padding: 0;
+}
+.dp-head .jp-line {
+  display: flex;
+  width: 100%;
+  justify-content: space-between;
+  padding: 9px 8px 4px;
+}
+.jp-g[data-sel] {
+  background: rgb(205 198 234 / 0.1);
+}
+.jp-g[data-at] {
+  box-shadow: inset 2px 0 0 #cdc6ea;
+}
+/* The picked object's detail: the commits' Output's frame, its views where its streams were. */
+.dp-w {
+  display: inline-flex;
+  gap: 10px;
+  margin-left: auto;
+  color: #6d7078;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+.dp-w button {
+  all: unset;
+  cursor: pointer;
+}
+.dp-w button[aria-pressed="true"] {
+  color: #e4e5e7;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.dp-w button:focus-visible {
+  outline: 2px solid #a6c4ed;
+  outline-offset: 2px;
+}
+.dp-op {
+  box-sizing: border-box;
+  height: 500px;
+  margin: 0;
+  overflow: auto;
+  padding: 8px 4px 8px 12px;
+  background: #08090a;
+  color: #c9cbd1;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
+  line-height: 1.18;
+  /* A long line goes on under itself, as the approved stills draw it: nothing scrolls sideways. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  overflow-x: hidden;
+}
+.dp-op i {
+  color: #6d7078;
+  font-style: normal;
+}
+.dp-op .rm {
+  color: #e2b9bd;
+}
+.dp-op .ad {
+  color: #bfdccf;
+}
+.dp-op .wn {
+  color: #e2cfae;
+}
+/* A commit, a rollout or a setting picked: what it is, flat. */
+.jp-cm {
+  display: grid;
+  align-content: start;
+  gap: 8px;
+  padding: 10px;
+  color: #c9cbd1;
+  font-size: 12.5px;
+}
+.jp-cm h4 {
+  margin: 0;
+  color: #97999f;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10px;
+  font-weight: 400;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+.jp-cm .dim {
+  color: #8b8e96;
+}
+.jp-cm ul {
+  display: grid;
+  gap: 3px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.jp-cm .row {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+}
+@media (max-width: 700px) {
+  .dp-open {
+    padding: 6px 0 14px;
+  }
+  .dp .ship-sech {
+    padding-left: 8px;
+  }
+  .dp .ship-sech__ctl {
+    display: none;
+  }
+  .dp-verbs {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+  .dp-body {
+    height: auto;
+  }
+  .dp .jp-list {
+    height: auto;
+    overflow: visible;
+  }
+  .dp-op {
+    height: 230px;
+  }
+}
+/* An app's who and when, as the stills draw them: the who whole, the when after it where the column has room. */
+.ship-metas > .dp-by {
+  display: flex;
+  gap: 0.6ch;
+  align-items: center;
+  overflow: hidden;
+}
+.dp-by > * {
+  flex: none;
+}
+.dp-ago {
+  min-width: 4ch;
+  font-variant-numeric: tabular-nums;
+  text-align: end;
+}
+/* An app a link opened the page on comes into view below the page's sticky header. */
+.dp-row {
+  scroll-margin-top: calc(var(--header-h, 64px) + 12px);
+}
+/* Where the words don't apply (a question, a setting, a commit, a step), what's said has their room too, as the
+   approved stills draw it: the strip keeps its height. */
+.jp-say[data-room] {
+  grid-template-rows: 36px auto;
+}
+/* Both in its one column: what's said over the words' row, not beside it. */
+.jp-say[data-room] .jp-said {
+  grid-column: 1;
+  grid-row: 1 / span 2;
+  align-self: center;
+  height: auto;
+  max-height: 100%;
+  -webkit-line-clamp: 3;
+}
+.jp-say[data-room] .jp-q {
+  grid-column: 1;
+  grid-row: 2;
+  visibility: hidden;
+}
+
+/* A repository's commits (docs/ci.md W26-R29; Ada, 2026-11-01): the first section of its opened row,
+   a line each with Runs' columns, a page held at its height whatever it holds, and a hairline under
+   it before the picked commit's Files (Ada: "some sort of divider between the commit section and
+   the files below"). A picked line is the jobs pane's: a square tint and a straight 2px edge. */
+.ship-open .ship-commits {
+  padding-bottom: 12px;
+  margin-bottom: 16px;
+  border-bottom: 1px solid var(--k-line, #2a2c31);
+}
+.sc-per {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: #6d7078;
+  font-size: 12px;
+}
+.sc-per button {
+  all: unset;
+  cursor: pointer;
+  padding: 0 2px;
+  color: #8b8e96;
+}
+.sc-per button[aria-pressed="true"] {
+  color: #e4e5e7;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.sc-h,
+.sc-b {
+  display: grid;
+  grid-template-columns: 24px 64px minmax(0, 1fr) 128px 150px 72px 64px;
+  align-items: center;
+  column-gap: 10px;
+}
+.sc-h {
+  height: 26px;
+  padding: 0 8px 0 10px;
+  border-top: 1px solid var(--k-line-2, #1f2125);
+  border-bottom: 1px solid var(--k-line-2, #1f2125);
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: #6d7078;
+}
+.sc-h > :nth-child(6),
+.sc-h > :nth-child(7) {
+  text-align: right;
+}
+.sc-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  min-height: calc(var(--sc-per, 10) * 30px);
+}
+/* The stand-in's one line: the loader at the list's top, the list's height its own. */
+.sc-wait {
+  padding: 12px 0;
+}
+.sc-b {
+  all: unset;
+  box-sizing: border-box;
+  display: grid;
+  grid-template-columns: 24px 64px minmax(0, 1fr) 128px 150px 72px 64px;
+  align-items: center;
+  column-gap: 10px;
+  width: 100%;
+  height: 30px;
+  padding: 0 8px 0 10px;
+  cursor: pointer;
+  color: #b9bbc2;
+  font-size: 12.5px;
+}
+.sc-b > * {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sc-c:not([data-sel]) .sc-b:hover {
+  background: rgb(255 255 255 / 0.03);
+}
+.sc-c[data-sel] .sc-b {
+  background: rgb(205 198 234 / 0.1);
+  color: #e4e5e7;
+  box-shadow: inset 2px 0 0 #cdc6ea;
+}
+.sc-b:focus-visible,
+.sc-per button:focus-visible,
+.sc-pager button:focus-visible {
+  outline: 2px solid #a6c4ed;
+  outline-offset: -2px;
+}
+.sc-sha {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 11px;
+  color: #a6b2c6;
+}
+.sc-who,
+.sc-on {
+  color: #8c8f98;
+  font-size: 12px;
+}
+.sc-on {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 11px;
+}
+.sc-took,
+.sc-ago {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: #a1a4ad;
+  font-size: 12px;
+}
+.sc-ago {
+  color: #7b7e88;
+}
+.sc-l2 {
+  display: none;
+}
+.sc-pager {
+  display: grid;
+  grid-template-columns: 72px 96px 72px;
+  justify-content: end;
+  align-items: center;
+  gap: 6px;
+  padding-top: 8px;
+}
+.sc-pager button {
+  all: unset;
+  box-sizing: border-box;
+  height: 28px;
+  display: inline-grid;
+  place-items: center;
+  border: 1px solid rgb(255 255 255 / 0.14);
+  color: #c9cbd1;
+  font-size: 12px;
+  cursor: pointer;
+}
+.sc-pager button:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+.sc-pager span {
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  color: #a1a4ad;
+  font-size: 12px;
+}
+/* Where Runs' columns don't fit (a phone, a narrow window), each commit takes two lines: its glyph,
+   its message and when; under them its sha, author, machine and run time. */
+@media (max-width: 900px) {
+  .sc-h {
+    display: none;
+  }
+  /* A line's two rows at a height of their own, so a page's height is known before it comes: its
+     stand-in is as tall, and nothing under it moves. */
+  .sc-list {
+    min-height: calc(var(--sc-per, 10) * 52px);
+  }
+  .sc-b {
+    height: 52px;
+    grid-template-columns: 20px minmax(0, 1fr) auto;
+    grid-template-rows: auto auto;
+    align-content: center;
+    row-gap: 2px;
+    padding: 0 8px 0 10px;
+  }
+  .sc-b > .sg {
+    grid-row: 1 / 3;
+    align-self: start;
+    margin-top: 2px;
+  }
+  .sc-b > .sc-sha,
+  .sc-b > .sc-who,
+  .sc-b > .sc-on,
+  .sc-b > .sc-took {
+    display: none;
+  }
+  .sc-b > .sc-msg {
+    grid-column: 2;
+    grid-row: 1;
+  }
+  .sc-b > .sc-ago {
+    grid-column: 3;
+    grid-row: 1;
+  }
+  .sc-l2 {
+    display: block;
+    grid-column: 2 / 4;
+    grid-row: 2;
+    color: #7b7e88;
+    font-size: 11.5px;
+    /* A run still going ticks at its end: its digits keep their width, so nothing after them moves. */
+    font-variant-numeric: tabular-nums;
+  }
+  .sc-l2 b {
+    font-family: var(--mono, ui-monospace, monospace);
+    font-weight: 400;
+    font-size: 10.5px;
+    color: #a6b2c6;
+  }
+  .sc-pager {
+    grid-template-columns: 1fr 96px 1fr;
+  }
 }

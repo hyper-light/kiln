@@ -118,6 +118,23 @@ fn mid_turn(s: &common::Server, id: &str, lines: u64) -> anyhow::Result<usize> {
     }
 }
 
+/// Waits until a runner's record of its sessions (`harness.json` in its `state`) holds session
+/// `id`: what it goes on with when it starts again. The record is written a moment after a change
+/// (`SAVE_AFTER`, later on a loaded machine), and a runner killed before that had nothing to go on
+/// with: the session stood disconnected, its turn never finished (3 of 7 gates, 11 of 24 runs six
+/// at a time).
+fn recorded(state: &std::path::Path, id: &str) -> anyhow::Result<()> {
+    let file = state.join("harness.json");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if std::fs::read_to_string(&file).is_ok_and(|text| text.contains(id)) {
+            return Ok(());
+        }
+        anyhow::ensure!(Instant::now() < deadline, "{} never held session {id}", file.display());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[test]
 fn a_runner_that_starts_again_sends_only_what_the_server_lacks() -> anyhow::Result<()> {
     const LINES: u64 = 150;
@@ -130,8 +147,10 @@ fn a_runner_that_starts_again_sends_only_what_the_server_lacks() -> anyhow::Resu
     agents::connected(s.port, &s.admin, "restart-runner", &log, Duration::from_secs(120))?;
     let id = agents::open_session(s.port, &s.admin, "restart-runner", &work, Duration::from_secs(60))?;
 
-    // Killed mid-turn, as a crash would: its session's copy holds part of the turn.
+    // Killed mid-turn, as a crash would: its session's copy holds part of the turn, and its record
+    // the session.
     let had = mid_turn(&s, &id, LINES)?;
+    recorded(&dir.path().join("restart-runner-state"), &id)?;
     first.0.kill()?;
     first.0.wait()?;
     let runner_log = || std::fs::read_to_string(&log).unwrap_or_default();

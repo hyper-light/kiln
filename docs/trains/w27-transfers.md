@@ -52,9 +52,10 @@ reaching a process it isn't for.
     then `Custody`;
   - `ServerMsg`: `Headroom`, `Unread`, `ReachRefused`, then `SignAsLeg`, then `Custody`.
   Then update `proto::w27_r08_custody_is_appended_after_headroom` to name the new indices. The
-  capability bits don't collide: 41 is main's `CAP_UNREAD`; 42, 43 and 44 are `CAP_AGENT_GIT`,
-  `CAP_LEG_SIGNS` and `CAP_CUSTODY`. Diff the tails against production's commit again before the
-  runners take it.
+  capability bits: 41 to 43 are main's (`CAP_UNREAD`, `CAP_WORKSPACE_COMMITS`,
+  `CAP_WORKSPACE_COMPARE`, the last two from the Changes tab, which landed first); 44, 45 and 46
+  are `CAP_AGENT_GIT`, `CAP_LEG_SIGNS` and `CAP_CUSTODY`. Diff the tails against production's
+  commit again before the runners take it.
 - **Order.** The server first, then the runners. A runner from before signs nothing, and its
   hand-overs are recorded as unsigned, naming which side is from before. A server from before
   announces no `CAP_CUSTODY`, so runners send it nothing signed.

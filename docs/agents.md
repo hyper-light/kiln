@@ -621,6 +621,9 @@ code-mode function (`kiln.agents.start`) and, from a kiln shell, a CLI command.
 | `agents.change` | `POST /api/harness/agents/:id/change` | `{title?, body?, draft?, trunk?, fix_checks?}` → `{change_request: Change}`: opens its change request from its work, or pushes a new version ("Change requests from agents", below) |
 | `agents.changes` | `GET /api/harness/changes` | `agent?` → `{changes: [Change]}`, newest first |
 | `agents.workspace` | `GET /api/harness/agents/:id/workspace` | → `{workspace: {kind, over, sub, volume, mount} \| null, drift: [path]}` ("Workspaces of their own", below) |
+| `agents.commits` | `GET /api/harness/agents/:id/commits?picks=&branch=&trunk=` | → `{log: {top, head, branch, trunk, base, dirty: {files, added, removed} \| null, commits: [{sha, parents, subject, author, at, files, added, removed, session}], more, told, branches, listed}, picked: {from, files: [FileChange], needs: {pick, commit, subject}} \| null}` ("Commits", below) |
+| `agents.refs` | `GET /api/harness/agents/:id/refs` | → `{refs: {branches, tags, commits: [{sha, subject, at, ...}], trunk}}` ("Compare", below) |
+| `agents.compare` | `GET /api/harness/agents/:id/compare?from=&to=&split=&path=` | → `{compared: {files: [FileChange], counts_only, split, changed_by: {path: [who]}}}`; a point is `now`, `began`, `agent:<who>` or a branch, tag or commit ("Compare", below) |
 | `agents.land` | `POST /api/harness/agents/:id/land` | `{}` → `{plan, excludes, can_write, why_not?}`; `{manifest}` (that plan's; a person only) → `{landed}`, or `{changed, plan, …}` with nothing written when the plan isn't that one any more |
 | `agents.credential` | `POST /api/harness/agents/:id/credential` | → `{token, expires_at}`: the agent's own token for git, for a day, so its pushes to kiln's repositories go as the agent, for its person (ci.md W27-R03). Only that very agent is given it, as its runner asks when its git needs it: never a person or another agent, and it's no tool of an agent's |
 
@@ -835,6 +838,124 @@ composer → More options → Workspace → Own volume; `agents.start` with `wor
   runner's state directory) and a mount it can make: FUSE through `fusermount3` on Linux, NFS on
   loopback on macOS. `GET /api/harness/workspaces` says which machines can, and why each other
   can't. kiln keeps one Slates instance, `kiln`, per machine (two shards).
+
+## The Changes tab
+
+An agent's Changes tab shows what it changed, its change request above (see "Change requests from
+agents"). Its head says what's shown, a row each, each choice in a menu:
+
+- **Session**: the files it changed since it began, each against how it was before.
+- **Commits**: its branch's commits, and what the picked ones change together (see "Commits").
+- **Compare**: what changes from one point to another (see "Compare").
+- **Scope**: Project at first, then User, then All (see "Who changed a file, and whose it is"). The
+  browser keeps the choice.
+- **By**: everyone, the agent itself, or one of its harness's subagents, each with how many of the
+  files at that scope it changed. Narrowed to one, a file someone else changed too shows only their
+  part and says who else changed it (see "One subagent's own edits"). Under their own heading, the
+  agents it started through kiln (`agents.start`, its goals' and plan steps'): each a session of its
+  own, maybe on another machine, so picking one shows that agent's own changes, read from its own
+  session, at the same scope.
+
+The head's last row carries what's shown in all (`+added −removed`), and Sort (by path, latest change,
+most changed, new, changed or deleted, or who changed it) sits at its right. Its files are a flat
+list, each saying on the line under it who changed it, and which worktree it's in when that isn't its
+folder's; the person's files elsewhere and the agents' own are under bands of their own. A file picked
+shows its diff alone; picked again, every file's. The tab's count is the files its scope shows.
+
+## Commits
+
+The Changes tab's Commits lists its branch's commits since its trunk (its remote's default branch,
+else `main` or `master`), newest first along its first parents, at most 200; a branch with none of
+its own since lists its latest 50. What isn't committed yet (as `git add -A` would take it, new files
+included) is on top. Its machine answers, in the working tree its work is in (`agents.commits`):
+
+- **This session's.** A session keeps the commit its folder had checked out as it began (its state's
+  `started_head`); the commits after it are its own, under a band of their own, and picked at first.
+  A session from before kiln kept it, or whose branch was rewritten since, tells its own by when they
+  were made.
+- **What's shown.** The picked commits' change, together. A run of them is one diff, from the first
+  one's parent to the last. With gaps, each picked commit is applied in order onto the first one's
+  parent in a scratch index beside the folder (its branch, index and working tree untouched); one
+  that doesn't go without a commit left out says which.
+- **Picking.** As Mission control picks agents: a tap shows one commit alone; press and hold picks
+  it, or unpicks it if it was picked, and dragging on takes each commit passed the same way, the
+  list not scrolling under the finger; with a mouse, Shift picks a run and ⌘/Ctrl adds or takes away
+  one. The This session band's ring picks all of the session's, with a dash when only some are.
+- **On** picks the branch: the one checked out, or another of its repository's (the latest dozen).
+
+A runner answers only with `CAP_WORKSPACE_COMMITS` (docs/wire.md). Without it, or in a folder that
+isn't a repository, Commits is turned off, saying why.
+
+## Compare
+
+The Changes tab's Compare shows what changes from one point to another, From and To each picked in
+place from a list that filters as you type:
+
+- **This session:** Now (the folder as it is, untracked files too, as `git add -A` would take it,
+  in a scratch index beside the folder), Before it began (the commit it began at, `started_head`),
+  and each agent's version: the agent itself or one of its subagents, its files as it left them
+  (see "One subagent's own edits") over how the folder was as the session began. Only its machine
+  knows how they left them, so the server's own agents' versions are refused, saying so.
+- **Elsewhere:** its repository's branches (its own, then its remote's), tags and latest commits
+  (`agents.refs`).
+- **Between commits**, "Only what To adds since they split" (git's three-dot diff) is on at first;
+  it sits in the head's menu with Swap. Two agents' versions compare plainly, From → To, each
+  file's line naming who of them changed it, or saying both did.
+- **Large compares** (past 300 files or 20,000 lines) come as counts first, and a file's lines once
+  it's opened (`agents.compare` with `path`).
+
+From is its trunk at first, To is Now. A runner answers only with `CAP_WORKSPACE_COMPARE`
+(docs/wire.md); without it, or in a folder that isn't a repository, Compare is turned off, saying
+why.
+
+## Who changed a file, and whose it is
+
+Each file of a session's changeset (`changes {files}`, `agents.result`'s `changes.files`) says who
+changed it and whose it is, for the Changes tab's By and Scope:
+
+- **`by`**: who changed it, in the order they first did. `main` is the agent itself; anything else is
+  a subagent run of its harness, by the id of the call that spawned it (as its events' `parent` says):
+  Claude Code's Agent tool, Codex's subagent threads. Every harness's subagents' edits count, in the
+  session's changeset and so in what a change request takes.
+- **`place`**: whose it is.
+  - `project`: in a folder the session has worked in (where it started, and each it moved to), or in a
+    working tree of one of their repositories, wherever that is: a worktree under `~/.cache` is. The
+    home folder, or a folder above it, is no project's: a session started there has the repositories it
+    works in.
+  - `agent`: an agent's own. In a harness's home (`~/.claude` or `CLAUDE_CONFIG_DIR`, `~/.codex` or
+    `CODEX_HOME`, `~/.gemini`, Antigravity's, Goose's), but for what a person keeps there to tell it what
+    to do; in kiln's own folders (a runner's state); in the machine's cache (`XDG_CACHE_HOME`, else
+    `~/.cache`, macOS's `~/Library/Caches`) and temporary folders.
+  - `user`: anything else it changed for the person: another repository, their home folder's files,
+    and what they keep in a harness's home: its instructions (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`),
+    its settings (`settings.json`, `config.toml`...) and its `skills`, `commands`, `agents`, `prompts`.
+
+A file with neither (from a runner older than these) is read as this project's. The state's
+`files_changed`, `lines_added` and `lines_removed` (the tab's count, Mission control's) count this
+project's files only; the rest stay in the changeset, for the scope that shows them.
+
+## One subagent's own edits
+
+Narrowed to one who changed its files (By), the Changes tab shows each file as they changed it alone.
+A file only they changed shows the session's change to it. A file someone else changed too shows
+their part, and the line under it names who else changed it:
+
+- **What's kept.** The session's core keeps, for each file, who changed it in turn, and how the file
+  was as each turn began: the session's baseline for the first, then how the next one found it, as
+  its harness said before its edit (Claude Code's `originalFile`; Codex's patch, undone from the
+  file by its change job; an ACP agent's old text). One's part is each of their turns, from how they
+  found the file to how the next one did, or to how it is now for the latest. Taken in turns, one
+  after another, that's their edits alone; one who came back to it after another shows each of their
+  turns, edit by edit. An in-place upgrade keeps it all (`Frozen`).
+- **How it's asked for.** The panel asks on the session's stream (`own_edits {client, by}`) and the
+  session answers that client alone (`reply`), as file suggestions are answered, so the stream itself
+  doesn't grow: `{by, files: [{path, tree, kept: true, edits: [one FileChange a turn]}]}`, worked out
+  off the event loop. Sessions whose features have `own_edits` answer, whatever their harness.
+- **The cap.** The session keeps 64 MiB of files as turns began at them at most (the baselines
+  aside), and 256 turns a file. Past it, or where its harness didn't say how it found a file (a shell
+  command changed it), or where the runner started again since, a file's answer is `kept: false` with
+  why (`cap`, `unknown`): the panel then shows their edits one by one from the conversation's events,
+  and says so under them. It does the same for a runner that doesn't answer, saying that.
 
 ## Change requests from agents
 
@@ -1372,7 +1493,8 @@ messages and follow-up work. Read-only `thread/read` and `thread/turns/list` req
 status, latest 100 turns, elapsed time and result; live child notifications update that same
 view. Tracking never starts, resumes or attaches another executor to the child (it may interrupt
 one working with other permissions than the session's: see permission modes above). Its messages,
-commands, usage and edits stay separate from the parent's turn and changeset. A spawn call
+commands and usage stay separate from the parent's turn; its edits join the session's changeset,
+credited to its spawning call (see "Who changed a file, and whose it is"). A spawn call
 finishing does not mean the child has finished, and unavailable child history does not end the
 parent. As in Codex's own TUI, a message to a child (`send_message`, `followup_task`) doesn't
 change whether it runs: a message queued for an idle child starts no turn, and a follow-up's turn

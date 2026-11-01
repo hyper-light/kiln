@@ -26,10 +26,11 @@ import { useAgentActions } from "./actions";
 import { MoveDialog, movable } from "./move";
 import { SettingsSheet, useAttachments, type Attachments } from "./controls";
 import { agentLabel, changesetOf, editsOf, useSameList } from "./derive";
+import { inScope, useScope, type Sub } from "./changes";
 import { useListener } from "./dom";
 import { FindBar, findIn, type FindNow } from "./find";
 import { EarlierMatches } from "./said";
-import { AgentHeader, useTurnState, type BorderState } from "./head";
+import { AgentHeader } from "./head";
 import { Inspector, type InspectorTab } from "./inspector";
 import { DesktopLayout, INSPECTOR_COLLAPSED } from "./desktop";
 import { AskedLine } from "./asked";
@@ -108,8 +109,8 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
   // The subagents kiln started for its goals or plan steps: its, as its harness's own are.
   const everyone = useRes(harnessSessionsRes).data;
   const kiln = React.useMemo(() => kilnSubagentsOf(everyone, id), [everyone, id]);
-  // The head's pause button's state: the composer's border wears it, whichever thread it writes to.
-  const turn = useTurnState(store, kiln);
+  // Every agent it started through kiln (its goals' and plan steps' too): the Changes tab's By lists them.
+  const started = React.useMemo(() => everyone.filter((a) => a.parent === id).map((a): Sub => ({ id: a.id, label: a.name, kind: a.target.replace(/^agent:/, "") })), [everyone, id]);
   // One of those, its thread shown here: a session of its own.
   const sub = taskId ? (kiln.find((a) => a.id === taskId) ?? null) : null;
   // Mission Control links by the stable task id; the timeline groups its events by spawn call.
@@ -325,7 +326,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
       )}
       {sub ? (
         <React.Suspense fallback={<LoadingMark />}>
-          <KilnThread key={sub.id} id={sub.id} onTerminal={openBeside} find={find} turn={turn} />
+          <KilnThread key={sub.id} id={sub.id} onTerminal={openBeside} find={find} />
         </React.Suspense>
       ) : (
         <>
@@ -359,7 +360,6 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
             toMain={task !== null}
             task={task}
             kiln={kiln}
-            turn={turn}
             onView={openView}
             onTerminal={openBeside}
             onOpenTask={openTask}
@@ -416,7 +416,20 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
           onCollapsed={setTrayCollapsed}
           side={(actions) => (
             <AboutContext.Provider value={about}>
-              <Inspector tab={tab} onTab={setTab} store={store} cwd={cwd} onOpenTask={openTask} agentId={id} harness={info?.kind_name} send={send} kiln={kiln} className="hx-side" actions={actions} />
+              <Inspector
+                tab={tab}
+                onTab={setTab}
+                store={store}
+                cwd={cwd}
+                onOpenTask={openTask}
+                agentId={id}
+                harness={info?.kind_name}
+                send={send}
+                kiln={kiln}
+                started={started}
+                className="hx-side"
+                actions={actions}
+              />
             </AboutContext.Provider>
           )}
         >
@@ -439,6 +452,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
                 harness={info?.kind_name}
                 send={send}
                 kiln={kiln}
+                started={started}
                 hideTabs
                 className="hx-side hx-side-phone"
               />
@@ -523,18 +537,7 @@ function Head({ store, cwd, send, onUsage, onSettings, onFind }: { store: Sessio
  * thread where the conversation is, what it asks you answered there, and the composer writing to
  * it. What's only on its page of its own (its settings, its own subagents' threads) opens there.
  */
-function KilnThread({
-  id,
-  onTerminal,
-  find,
-  turn,
-}: {
-  id: string;
-  onTerminal: (o: { what: "shell" | "screen"; command?: string }) => void;
-  find?: { q: string; now: FindNow | null };
-  /** The agent's pause button's state, on the composer's border. */
-  turn: BorderState;
-}) {
+function KilnThread({ id, onTerminal, find }: { id: string; onTerminal: (o: { what: "shell" | "screen"; command?: string }) => void; find?: { q: string; now: FindNow | null } }) {
   const store = sessionStore(id);
   useSessionReady(store);
   const navigate = useNavigate();
@@ -576,7 +579,6 @@ function KilnThread({
         attachments={attachments}
         toMain={false}
         task={null}
-        turn={turn}
         onView={() => ownPage()}
         onTerminal={onTerminal}
         onOpenTask={ownPage}
@@ -597,7 +599,6 @@ function Dock({
   toMain,
   task,
   kiln,
-  turn,
   onView,
   onTerminal,
   onOpenTask,
@@ -614,8 +615,6 @@ function Dock({
   task: string | null;
   /** The subagents kiln started for its goals or plan steps, beside its harness's own. */
   kiln?: readonly AgentInfo[];
-  /** The agent's pause button's state, on the composer's border. */
-  turn: BorderState;
   onView: (view: string) => void;
   onTerminal: (o: { what: "shell" | "screen"; command?: string }) => void;
   onOpenTask: (toolId: string) => void;
@@ -634,7 +633,7 @@ function Dock({
   const harnessSession = useSession(store, (s) => s.state?.harness_session ?? s.info?.harness_session);
   const [moving, setMoving] = React.useState(false);
   return (
-    <div className="hx-dock" onPointerDown={keepTyping} onMouseDown={keepTyping}>
+    <div className="hx-dock" ref={liftNotices} onPointerDown={keepTyping} onMouseDown={keepTyping}>
       <ActivityLine store={store} onOpenTask={onOpenTask} kiln={kiln} inThread={task} />
       {status === "exited" && exit?.error && empty ? (
         <div className="hx-startfail" role="alert">
@@ -670,7 +669,7 @@ function Dock({
       ) : null}
       <PausedLine store={store} send={send} onLogin={() => onView("login")} />
       <AskedLine store={store} />
-      <Composer store={store} agent={id} attachments={attachments} toMain={toMain} task={task} turn={turn} onView={onView} onTerminal={onTerminal} replyTo={reply} onClearReply={onClearReply} />
+      <Composer store={store} agent={id} attachments={attachments} toMain={toMain} task={task} onView={onView} onTerminal={onTerminal} replyTo={reply} onClearReply={onClearReply} />
     </div>
   );
 }
@@ -684,6 +683,34 @@ function keepTyping(e: React.PointerEvent | React.MouseEvent) {
   if (document.activeElement?.classList.contains("hx-compose-input") && t.closest("button") && !t.closest("input, textarea, select")) e.preventDefault();
 }
 
+/** kiln's notifications at the window's bottom right (toasts, and the cards of other agents waiting
+ *  on you) sit above the dock wherever they'd cover it, not over the message box: at a phone's or a
+ *  tablet's width, or a desktop's with the inspector put away (W21-R13). The dock's height lifts
+ *  them (`--dock-height`, index.css). */
+function liftNotices(dock: HTMLElement | null) {
+  if (!dock) return;
+  const root = document.documentElement;
+  const measure = () => {
+    // Their column: the shell's toast stack's, which has its width even when it's empty.
+    const column = document.querySelector(".toast-viewport")?.getBoundingClientRect();
+    const box = dock.getBoundingClientRect();
+    const style = getComputedStyle(dock);
+    const covers = !!column && column.left < box.right - parseFloat(style.paddingRight) && box.left + parseFloat(style.paddingLeft) < column.right;
+    if (covers) root.style.setProperty("--dock-height", `${Math.round(box.height)}px`);
+    else root.style.removeProperty("--dock-height");
+  };
+  measure();
+  // Its border box: the side tray put away widens the dock but not its column, which its padding keeps.
+  const observer = new ResizeObserver(measure);
+  observer.observe(dock, { box: "border-box" });
+  window.addEventListener("resize", measure);
+  return () => {
+    observer.disconnect();
+    window.removeEventListener("resize", measure);
+    root.style.removeProperty("--dock-height");
+  };
+}
+
 /** A phone's tabs, with what each holds. */
 function PhoneTabs({ store, tab, onTab }: { store: SessionStore; tab: PhoneTab; onTab: (t: PhoneTab) => void }) {
   const asked = useSession(store, (s) => s.state?.approvals);
@@ -693,7 +720,9 @@ function PhoneTabs({ store, tab, onTab }: { store: SessionStore; tab: PhoneTab; 
   // Counted from the conversation's edits only when the server sends no changeset.
   const events = useSession(store, (s) => (s.changes ? NO_EVENTS : s.events));
   const edits = useSameList(React.useMemo(() => editsOf(events), [events]));
-  const fileCount = React.useMemo(() => (changes ? changes.length : changesetOf(edits).length), [changes, edits]);
+  // What the Changes tab counts is what its scope shows: this project's files at first.
+  const [scope] = useScope();
+  const fileCount = React.useMemo(() => (changes ? changes.filter((f) => inScope(f, scope)).length : changesetOf(edits).length), [changes, edits, scope]);
   const todos = useSession(store, (s) => s.state?.todos ?? NO_TODOS);
   const todosDone = todos.filter((t) => t.status === "completed").length;
   // A plan waiting on your review: its tab says so (review.tsx).
@@ -752,7 +781,7 @@ function AgentLoading({ id }: { id: string }) {
         <LoadingMark />
         <PrismLabel live>Loading conversation</PrismLabel>
       </div>
-      <div className="hx-dock">
+      <div className="hx-dock" ref={liftNotices}>
         <div className="hx-composer cp">
           <div className="hx-compose-box">
             <div className="cp-field">

@@ -7,6 +7,7 @@
  * shipped one's, at 1280 and 390 px; the window tall enough that the whole open row is on screen.
  */
 import { expect, test, type Page } from "@playwright/test";
+import { pickCommit } from "./ship-pick";
 
 const REAL = !!process.env.E2E_BASE_URL;
 test.skip(REAL, "drives the mock's commits");
@@ -64,9 +65,8 @@ for (const width of [1280, 390])
       try {
         await page.setViewportSize({ width, height: 2400 });
         await page.goto("/ship");
-        const it = page.locator(".ship-list > li.ship-row").filter({ hasText: row.name }).first();
-        await expect(it).toBeVisible({ timeout: 15_000 });
-        await it.locator(".ship-go").click();
+        // Ship's rows are repositories (W26-R29): kiln's, opened, the commit picked.
+        const it = await pickCommit(page, row.name);
         await expect(it.locator(row.loaded).first()).toBeVisible({ timeout: 15_000 });
         await it.scrollIntoViewIfNeeded();
         // The pointer away from the page's controls, resting; opened, the list holds by itself.

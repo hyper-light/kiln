@@ -543,6 +543,18 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let repo = format!("{owner}/{name}");
             boxed(|| crate::ci::diffs::ship_commit_blob(&hub, &repo, sha, &q, &caller)).await.map_err(|(c, m)| err(c, m))
         }
+        // A commit's jobs run again, paused, resumed or cancelled together (W26-R21, R22).
+        (&Method::POST, ["api", "ship", "jobs"]) => {
+            let body: serde_json::Value = boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+            boxed(|| crate::ship::jobs(&hub, &caller, &body)).await.map_err(|(c, m)| err(c, m))
+        }
+        // Ship's Deploys: every app by project, an app's pane, and the strip's verbs (W26-R24).
+        (&Method::GET, ["api", "ship", "deploys"]) => boxed(|| crate::ship::deploys::list(&hub, &q, &caller)).await.map_err(|(c, m)| err(c, m)),
+        (&Method::GET, ["api", "ship", "deploys", project, name]) => boxed(|| crate::ship::deploys::get(&hub, project, name, &caller)).await.map_err(|(c, m)| err(c, m)),
+        (&Method::POST, ["api", "ship", "deploys"]) => {
+            let body: serde_json::Value = boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+            boxed(|| crate::ship::deploys::act(&hub, &caller, &body)).await.map_err(|(c, m)| err(c, m))
+        }
         // A row's Hand off: what the commit has open, to the agent that takes it (W26-R18).
         (&Method::POST, ["api", "ship", "hand-off"]) => {
             let body: serde_json::Value = boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -645,10 +657,17 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         }
         (&Method::GET, ["api", "runs"]) => boxed(|| runs(&hub, &q, &caller)).await,
         (&Method::GET, ["api", "runs", id]) => boxed(|| run(&hub, id, &q)).await,
-        (&Method::POST, ["api", "runs", id, "cancel"]) => boxed(|| cancel(&hub, id)).await,
+        (&Method::POST, ["api", "runs", id, "cancel"]) => {
+            let id = (*id).to_owned();
+            boxed(|| cancel(&hub, &id, req)).await
+        }
         (&Method::POST, ["api", "runs", id, "retry"]) => {
             let id = (*id).to_owned();
             boxed(|| retry(&hub, &id, req)).await
+        }
+        (&Method::POST, ["api", "runs", id, verb @ ("pause" | "resume")]) => {
+            let (id, paused) = ((*id).to_owned(), *verb == "pause");
+            boxed(|| pause(&hub, &id, req, paused)).await
         }
         (&Method::GET, ["api", "jobs", id]) => boxed(|| job(&hub, id)).await,
         // What a job lacks, and an agent to install it (crate::toolfix).
@@ -1102,6 +1121,14 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         }
         (&Method::GET, ["api", "harness", "changes"]) => boxed(|| own_op(&hub, &caller, "agents.changes", query_value(&q))).await,
         (&Method::GET, ["api", "harness", "agents", id, "workspace"]) => boxed(|| own_op(&hub, &caller, "agents.workspace", json!({ "agent": id }))).await,
+        (&Method::GET, ["api", "harness", "agents", id, what @ ("commits" | "refs" | "compare")]) => {
+            let mut v = query_value(&q);
+            if let Some(o) = v.as_object_mut() {
+                o.insert("agent".into(), json!(id));
+            }
+            let op = format!("agents.{what}");
+            boxed(|| own_op(&hub, &caller, &op, v)).await
+        }
         (&Method::POST, ["api", "harness", "agents", id, what @ ("send" | "interrupt" | "stop" | "change" | "land" | "about" | "credential")]) => {
             let (id, name) = ((*id).to_owned(), format!("agents.{what}"));
             // A send's idempotency key may come as the standard header (CP-T3.2).
@@ -1407,10 +1434,34 @@ fn page_ancestors(hub: &Hub) -> String {
     format!("frame-ancestors {}", if origins.is_empty() { "'none'".to_owned() } else { origins.join(" ") })
 }
 
-/// Headers every answer of a page's carries: its sandbox, no referrer (its address is its key), and
-/// to any origin (the page's own is opaque), for fonts and modules.
-fn page_headers(hub: &Hub, h: &mut header::HeaderMap) {
-    let policy = format!("{PAGE_POLICY}; {}", page_ancestors(hub));
+/// Page `id`'s own files and kiln's fonts by the address `req` reached them at, for its policy to
+/// name beside `'self'`: in a document its frame sandboxes (the conversation's frame does), WebKit,
+/// every browser on iOS, matches `'self'` with nothing, and phones were refused the page's own
+/// scripts, pictures and fonts. Only a name and a port make one (no header adds to the policy).
+fn page_sources(hub: &Hub, req: &Request, id: &str) -> String {
+    let asked = req.uri().authority().map(|a| a.as_str().to_owned()).or_else(|| srv::header_str(req, &header::HOST).map(str::to_owned)).unwrap_or_default();
+    named_sources(&asked, is_secure(hub, req), id)
+}
+
+/// [`page_sources`] for a page reached at `asked` (its `Host`), over HTTPS when `secure`.
+fn named_sources(asked: &str, secure: bool, id: &str) -> String {
+    let asked = asked.to_ascii_lowercase();
+    if asked.is_empty() || !asked.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':')) {
+        return String::new();
+    }
+    let scheme = if secure { "https" } else { "http" };
+    format!(" {scheme}://{asked}/v/{id}/ {scheme}://{asked}/v/_/fonts/")
+}
+
+/// [`PAGE_POLICY`] with `sources` beside each `'self'`, then who may frame it.
+fn page_policy(sources: &str, ancestors: &str) -> String {
+    format!("{}; {ancestors}", PAGE_POLICY.replace("'self'", &format!("'self'{sources}")))
+}
+
+/// Headers every answer of page `id`'s carries: its sandbox, no referrer (its address is its key),
+/// and to any origin (the page's own is opaque), for fonts and modules.
+fn page_headers(hub: &Hub, req: &Request, id: &str, h: &mut header::HeaderMap) {
+    let policy = page_policy(&page_sources(hub, req, id), &page_ancestors(hub));
     if let Ok(v) = header::HeaderValue::from_str(&policy) {
         h.insert(header::CONTENT_SECURITY_POLICY, v);
     }
@@ -1435,7 +1486,7 @@ async fn page(hub: &Arc<Hub>, id: &str, req: &Request) -> R {
         if let Ok(to) = header::HeaderValue::from_str(&format!("/v/{}{}", v.id, crate::harness::visuals::url_path(&v.entry))) {
             r.headers_mut().insert(header::LOCATION, to);
         }
-        page_headers(hub, r.headers_mut());
+        page_headers(hub, req, &v.id, r.headers_mut());
         return Ok(r);
     }
     let at = srv::decode(rest);
@@ -1446,7 +1497,7 @@ async fn page(hub: &Arc<Hub>, id: &str, req: &Request) -> R {
     let meta = crate::harness::files::Meta { size, mtime: 0, mime: used.mime.clone(), width: None, height: None };
     let etag = format!("\"{}\"", used.sha);
     if let Some(mut r) = unchanged(req, &etag, true) {
-        page_headers(hub, r.headers_mut());
+        page_headers(hub, req, &v.id, r.headers_mut());
         return Ok(r);
     }
     let Ok(range) = byte_range(req, size) else { return Ok(unsatisfiable(size)) };
@@ -1478,7 +1529,7 @@ async fn page(hub: &Arc<Hub>, id: &str, req: &Request) -> R {
     let name = used.path.rsplit('/').next().unwrap_or("file").to_owned();
     let mut r = file_response(&meta, &name, &etag, true, range, srv::channel_body(rx));
     // The page's own policy, for it and for every file of it (a script or a style is the page's).
-    page_headers(hub, r.headers_mut());
+    page_headers(hub, req, &v.id, r.headers_mut());
     Ok(r)
 }
 
@@ -2845,16 +2896,45 @@ async fn run(hub: &Hub, id: &str, q: &HashMap<String, String>) -> R {
     Ok(srv::json(StatusCode::OK, &run))
 }
 
-async fn cancel(hub: &Hub, id: &str) -> R {
+/// `POST /api/runs/:id/cancel`: the run; with `{ jobs: [ids] }` (docs/ci.md W26-R21), just those
+/// of its jobs, the run going on, each answering what became of it.
+async fn cancel(hub: &Hub, id: &str, req: Request) -> R {
+    let by = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "admin".to_owned(), |c| c.name.clone());
+    let jobs = srv::body_json::<SetReq>(req.into_body(), JSON_LIMIT).await.ok().and_then(|b| b.jobs).filter(|j| !j.is_empty());
+    if let Some(jobs) = jobs {
+        let v = crate::ci::retry::cancel_set(hub, id, jobs, &by).await.map_err(|(c, m)| err(c, m))?;
+        return Ok(srv::json(StatusCode::OK, &v));
+    }
     hub.cancel_run(id, "cancelled by user").await?;
     hub.store.audit("admin".into(), "run.cancel".into(), id.to_owned()).await;
     Ok(srv::status(StatusCode::NO_CONTENT))
+}
+
+/// `POST /api/runs/:id/pause` and `/resume` with `{ jobs: [ids] }` (docs/ci.md W26-R22): those of
+/// the run's jobs, either engine's, paused (frozen where they run, or held before they start) or
+/// resumed, each answering what became of it.
+async fn pause(hub: &Hub, id: &str, req: Request, paused: bool) -> R {
+    let by = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "admin".to_owned(), |c| c.name.clone());
+    let jobs = srv::body_json::<SetReq>(req.into_body(), JSON_LIMIT).await.ok().and_then(|b| b.jobs).filter(|j| !j.is_empty());
+    let Some(jobs) = jobs else { return Err(err(StatusCode::BAD_REQUEST, "name the jobs: { jobs: [ids] }")) };
+    let v = crate::ci::retry::pause_set(hub, id, jobs, paused, &by).await.map_err(|(c, m)| err(c, m))?;
+    Ok(srv::json(StatusCode::OK, &v))
 }
 
 #[derive(Deserialize)]
 struct RetryReq {
     #[serde(default = "yes")]
     only_failed: bool,
+    /// Just these jobs (docs/ci.md W26-R21), passed ones too.
+    #[serde(default)]
+    jobs: Option<Vec<String>>,
+}
+
+/// A body naming some of a run's jobs (docs/ci.md W26-R21).
+#[derive(Deserialize)]
+struct SetReq {
+    #[serde(default)]
+    jobs: Option<Vec<String>>,
 }
 
 fn yes() -> bool {
@@ -2862,7 +2942,13 @@ fn yes() -> bool {
 }
 
 async fn retry(hub: &Hub, id: &str, req: Request) -> R {
-    let only_failed = srv::body_json::<RetryReq>(req.into_body(), JSON_LIMIT).await.map(|r| r.only_failed).unwrap_or(true);
+    let by = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "admin".to_owned(), |c| c.name.clone());
+    let body = srv::body_json::<RetryReq>(req.into_body(), JSON_LIMIT).await.ok();
+    if let Some(jobs) = body.as_ref().and_then(|b| b.jobs.clone()).filter(|j| !j.is_empty()) {
+        let v = crate::ci::retry::retry_set(hub, id, &jobs, &by).await.map_err(|(c, m)| err(c, m))?;
+        return Ok(srv::json(StatusCode::OK, &v));
+    }
+    let only_failed = body.is_none_or(|r| r.only_failed);
     let n = hub.store.retry_run(id.to_owned(), only_failed).await?;
     hub.emit_run(id).await;
     hub.wake.notify();
@@ -6103,5 +6189,26 @@ mod tests {
         let ps1 = include_str!("../assets/install-agent.ps1");
         assert!(ps1.contains("[switch]$Outpost"));
         assert!(ps1.contains("@('outpost', '--server', $Server, '--state-dir', $dir)"));
+    }
+
+    /// docs/previews.md, "Sandboxed": a shown page's policy names its own folder and kiln's fonts at
+    /// the address it was reached at, beside `'self'`, which WebKit (every browser on iOS) matches
+    /// with nothing in the conversation's sandboxed frame: phones were refused a page's own scripts,
+    /// pictures and fonts. A `Host` that isn't a name and a port adds nothing to it.
+    #[test]
+    fn a_page_s_policy_names_its_own_files_where_it_was_reached() {
+        let id = "0582dcb7c0e9dbd3a891b242896e61c8";
+        let phone = named_sources("Kiln.dev", true, id);
+        assert_eq!(phone, format!(" https://kiln.dev/v/{id}/ https://kiln.dev/v/_/fonts/"));
+        assert_eq!(named_sources("192.168.1.77:7070", false, id), format!(" http://192.168.1.77:7070/v/{id}/ http://192.168.1.77:7070/v/_/fonts/"));
+        for odd in ["", "kiln.dev; script-src *", "kiln.dev https://elsewhere.example", "kiln.dev,evil", "u@kiln.dev", "[fd7a::1]:443"] {
+            assert_eq!(named_sources(odd, true, id), "", "{odd:?}");
+        }
+        let policy = page_policy(&phone, "frame-ancestors 'self'");
+        for d in ["default-src", "script-src", "style-src", "img-src", "media-src", "font-src", "connect-src", "worker-src", "frame-src"] {
+            assert!(policy.contains(&format!("{d} 'self' https://kiln.dev/v/{id}/ https://kiln.dev/v/_/fonts/ ")), "{d}: {policy}");
+        }
+        assert!(policy.starts_with("sandbox allow-scripts ") && policy.ends_with("; frame-ancestors 'self'"), "{policy}");
+        assert_eq!(page_policy("", "frame-ancestors 'self'"), format!("{PAGE_POLICY}; frame-ancestors 'self'"), "none named: the policy as it was");
     }
 }

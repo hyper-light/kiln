@@ -17,6 +17,12 @@ pub const MAX_MESSAGE: usize = 4 << 20;
 /// Output a run may have sent and not yet had acknowledged.
 pub const WINDOW: u64 = 4 << 20;
 
+/// [`RunSpec::linger_ms`] of a run its asker may never come back for (`kiln run --detach`,
+/// docs/reach.md §4.2): it's never stopped for want of its asker, and its output, held unread,
+/// gives way oldest first rather than make it wait (`node::BUFFER`). A runner from before takes it
+/// as a linger longer than any run.
+pub const DETACHED: u64 = u64::MAX;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Ask {
     /// First on every link: which session this is (the same across links) and, for each run the
@@ -135,7 +141,8 @@ pub struct RunSpec {
     /// Ended (and reported as such) after this long.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
-    /// How long it may wait for its asker once no link is up before it is stopped.
+    /// How long it may wait for its asker once no link is up before it is stopped ([`DETACHED`]:
+    /// for ever).
     #[serde(default)]
     pub linger_ms: Option<u64>,
     /// A named shell whose working folder and exported variables carry from one run to the next.
