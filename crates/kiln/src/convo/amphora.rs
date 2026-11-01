@@ -26,6 +26,31 @@ struct LegacyPage {
 }
 
 const LEGACY_TABLES: &[&str] = &["sessions","events","records","drops","peers","copied","meta"];
+/// The import ledger's row that holds a completed source's files as they were ([`source_files`]).
+const FILES: &str = "__files__";
+
+/// A legacy source's files as they stand: the database's and its log's size and last write, and
+/// on unix which file each is. The same again, nothing has written either since.
+fn source_files(path: &std::path::Path) -> anyhow::Result<String> {
+    let mut log = path.as_os_str().to_os_string();
+    log.push("-wal");
+    let mut files = Vec::new();
+    for file in [path.to_path_buf(), std::path::PathBuf::from(log)] {
+        match std::fs::metadata(&file) {
+            Ok(meta) => {
+                let written = meta.modified()?.duration_since(std::time::UNIX_EPOCH)?;
+                #[cfg(unix)]
+                let which = { use std::os::unix::fs::MetadataExt as _; (meta.dev(), meta.ino()) };
+                #[cfg(not(unix))]
+                let which = (0u64, 0u64);
+                files.push(Some((meta.len(), written.as_secs(), written.subsec_nanos(), which)));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => files.push(None),
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(serde_json::to_string(&files)?)
+}
 const SEGMENT: usize = 512 << 10;
 const TRANSCRIPT_MAX: usize = segments::LINE_MAX;
 // Leave room for SQL, parameters and owned-value overhead below the product's request bound.
@@ -984,6 +1009,18 @@ impl Amphora {
             None=>canonical.to_owned(),
         };
         anyhow::ensure!(source.len()<=256<<10,"legacy conversation source identity exceeds bound");
+        // A completed import whose source's files are as they were when it was taken isn't read
+        // again: hashing a host's whole retained history (11 GB on the server, 2026-11-01) held
+        // every start for minutes. Files changed in any way are hashed and compared as before.
+        let files=source_files(&canonical_path)?;
+        let (source0,files0)=(source.clone(),files.clone());
+        let unchanged=self.database.call(until(),move |c| {
+            let row=|table:&str|match c.query_row("SELECT done,fingerprint FROM convo_import WHERE source=?1 AND table_name=?2",vec![txt(&source0),txt(table)],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?))) {
+                Ok(row)=>Ok(Some(row)),Err(amphora_api::sql::Error::QueryReturnedNoRows)=>Ok(None),Err(e)=>Err(anyhow::Error::from(e)),
+            };
+            Ok(matches!((row("__source__")?,row("__history_v1__")?,row(FILES)?),(Some((1,_)),Some((1,_)),Some((1,seen))) if seen==files0))
+        })?;
+        if unchanged { return Ok(()); }
         // Resolve the identity before opening its snapshot: a retargeted caller symlink
         // must not bind an already-open input to a different canonical path.
         let old=Legacy::open(&canonical_path)?;
@@ -1019,7 +1056,7 @@ impl Amphora {
                 Err(e)=>Err(e.into()),
             }
         })?;
-        if done { return Ok(()); }
+        if done { return self.note_files(&source,&files,&canonical_path); }
         for &table in LEGACY_TABLES {
             if !old.has(table)? { continue; }
             let (source0,table0)=(source.clone(),table.to_owned());
@@ -1041,7 +1078,7 @@ impl Amphora {
             }
         }
         self.validate_source(&source,&fingerprint)?;
-        let (source0,fingerprint0)=(source,fingerprint);
+        let (source0,fingerprint0)=(source.clone(),fingerprint);
         self.call(move |s| {
             let identity=s.conn.query_row("SELECT fingerprint FROM convo_import WHERE source=?1 AND table_name='__source__'",vec![txt(&source0)],|r|r.get::<_,String>(0))?;
             anyhow::ensure!(identity==fingerprint0,"conversation import source identity changed before publication");
@@ -1049,6 +1086,17 @@ impl Amphora {
             anyhow::ensure!(incomplete==0,"conversation import has incomplete table cursors");
             for q in sql::REV_MAX { s.rev=s.rev.max(s.one_int(q,&[])?.and_then(|n|u64::try_from(n).ok()).unwrap_or(0)); }
             s.conn.execute("UPDATE convo_import SET done=1 WHERE source=?1 AND table_name='__source__'",vec![txt(&source0)])?;
+            Ok(())
+        })?;
+        self.note_files(&source,&files,&canonical_path)
+    }
+    /// Notes a completed import's source files as they were before it was read
+    /// ([`source_files`]), once they still are: a start that finds them so reads none of it.
+    fn note_files(&mut self,source:&str,files:&str,path:&std::path::Path)->anyhow::Result<()> {
+        if source_files(path)?!=files { return Ok(()); }
+        let (source,files)=(source.to_owned(),files.to_owned());
+        self.database.call(until(),move |c| {
+            c.execute("INSERT INTO convo_import(source,table_name,cursor,done,fingerprint) VALUES (?1,?2,0,1,?3) ON CONFLICT(source,table_name) DO UPDATE SET done=1,fingerprint=excluded.fingerprint",vec![txt(&source),txt(FILES),txt(&files)])?;
             Ok(())
         })?;
         Ok(())
@@ -1386,6 +1434,28 @@ mod tests {
         assert_eq!(engine.top(),imported_top);
         engine.apply(&[transcript(2,"after import".into())])?;
         assert_eq!(engine.top(),imported_top.saturating_add(1));
+        Ok(())
+    }
+    /// U15: a start doesn't read a completed import's source again while its files are as they
+    /// were (here it couldn't: nothing may read them); changed, it's read, and the change refused.
+    #[cfg(unix)]
+    #[test]
+    fn u15_a_completed_import_is_not_read_again_until_its_source_changes() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir=tempfile::tempdir()?;
+        let legacy=dir.path().join("conversations.db");
+        super::super::turso::Turso::open(&legacy)?.apply(&[transcript(0,"first".into())])?;
+        let mut engine=Amphora::from_database(Database::open(&dir.path().join("host.amphora"),until())?)?;
+        engine.import_legacy(&legacy)?;
+        let top=engine.top();
+        let readable=std::fs::metadata(&legacy)?.permissions();
+        std::fs::set_permissions(&legacy,std::fs::Permissions::from_mode(0o000))?;
+        let again=engine.import_legacy(&legacy);
+        std::fs::set_permissions(&legacy,readable)?;
+        again?;
+        assert_eq!(engine.top(),top);
+        super::super::turso::Turso::open(&legacy)?.apply(&[transcript(1,"second".into())])?;
+        assert!(engine.import_legacy(&legacy).is_err(),"a changed source was taken for the one imported");
         Ok(())
     }
 }
