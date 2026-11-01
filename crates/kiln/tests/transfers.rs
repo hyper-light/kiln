@@ -1673,7 +1673,7 @@ fn w27_r08_relays_that_drop_swap_or_alter_a_reach_links_frames_are_caught() -> a
 /// has handed everything over go on to the new build, each with the old build's record of passing
 /// the sender's act on (following kiln's record of it), numbered on its stream to the new build,
 /// which checks the act and every record before its session takes the words, and signs its
-/// receipt. In a test build the runner tells kiln everything two seconds late (`delay`), so kiln
+/// receipt. In a test build the runner tells kiln everything three seconds late (`delay`), so kiln
 /// goes on sending the words to the old build a while after it hands the session over, whatever the
 /// timing. Every frame of signed words forwarded has its record, none missing, each answered. With
 /// the old build faulty (a test build's `relay_forward`: every second such frame dropped,
@@ -1693,24 +1693,29 @@ fn w27_r08_relays_blue_greens_forwarder() -> anyhow::Result<()> {
         bytes.push(0);
         std::fs::write(&before_build, bytes)?;
         std::fs::set_permissions(&before_build, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
-        let spec = [cfg!(feature = "chaos").then_some("delay=2s"), *fault].into_iter().flatten().collect::<Vec<_>>().join(",");
+        let spec = [cfg!(feature = "chaos").then_some("delay=3s"), *fault].into_iter().flatten().collect::<Vec<_>>().join(",");
         let env: Vec<(&str, &str)> = (!spec.is_empty()).then_some(("KILN_CHAOS", spec.as_str())).into_iter().collect();
         let (_box_a, log) = supervised(dir.path(), port, "box-a", &before_build, &env)?;
         agents::connected(port, admin, "box-a", &log, Duration::from_secs(60))?;
         let a = agents::open_session(port, admin, "box-a", &dir.path().join("work-here"), Duration::from_secs(60))?;
         first_epoch(port, admin, &a)?;
         let (_box_b, b) = signing_session(dir.path(), port, admin, "box-b", None)?;
-        // b's words to a, every tenth of a second, while a's runner is upgraded.
+        // b's words to a, from eight senders at once (each waits for kiln to deliver its words), every
+        // tenth of a second, while a's runner is upgraded.
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (sending, home, (to, from)) = (std::sync::Arc::clone(&stop), dir.path().to_path_buf(), (a.clone(), b.clone()));
-        let words = std::thread::spawn(move || {
-            let mut n = 0u32;
-            while !sending.load(std::sync::atomic::Ordering::Relaxed) {
-                n += 1;
-                let _ = ask_as(&home, "box-b", &from, "agents.send", json!({"agent": to, "text": format!("message {n} as its runner is upgraded")}));
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        });
+        let words: Vec<_> = (0..8u32)
+            .map(|t| {
+                let (sending, home, (to, from)) = (std::sync::Arc::clone(&stop), dir.path().to_path_buf(), (a.clone(), b.clone()));
+                std::thread::spawn(move || {
+                    let mut n = 0u32;
+                    while !sending.load(std::sync::atomic::Ordering::Relaxed) {
+                        n += 1;
+                        let _ = ask_as(&home, "box-b", &from, "agents.send", json!({"agent": to, "text": format!("message {t}.{n} as its runner is upgraded")}));
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                })
+            })
+            .collect();
         let (st, body) = http(port, "POST", "/api/updates/runners/box-a", admin, None)?;
         anyhow::ensure!(st == 202, "{st} {body}");
         let job = serde_json::from_str::<Value>(&body)?.get("id").and_then(Value::as_str).unwrap_or_default().to_owned();
@@ -1721,7 +1726,9 @@ fn w27_r08_relays_blue_greens_forwarder() -> anyhow::Result<()> {
         });
         std::thread::sleep(Duration::from_secs(5));
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        let _ = words.join();
+        for w in words {
+            let _ = w.join();
+        }
         done.map_err(|e| anyhow::anyhow!("{fault:?}: the upgrade: {e}"))?;
         let blue = "/machine/box-a/instance/main";
         let v = until(Duration::from_secs(90), || {
