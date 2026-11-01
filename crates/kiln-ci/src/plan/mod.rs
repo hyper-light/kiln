@@ -809,6 +809,27 @@ impl RunPlan {
         out
     }
 
+    /// Legs cancelled by their keys, the run going on (docs/ci.md W26-R21): each that hasn't
+    /// finished stops as a cancelled run's legs do, the jobs that need theirs go as GitHub has it
+    /// (`success()` no longer holds: skipped, unless their `if` says otherwise), and the run's
+    /// other legs go on.
+    pub fn on_cancel_legs(&mut self, keys: &[String], reason: &str, src: &dyn PlanSource) -> Vec<PlanAction> {
+        let mut out = Vec::new();
+        if self.cancelled || self.finished.is_some() {
+            return out;
+        }
+        for n in 0..self.nodes.len() {
+            let count = self.nodes.get(n).map_or(0, |x| x.legs.len());
+            for l in 0..count {
+                if self.leg(n, l).is_some_and(|leg| keys.contains(&leg.spec.key)) {
+                    self.cancel_leg(n, l, reason, false, &mut out);
+                }
+            }
+        }
+        self.advance(src, &mut out);
+        out
+    }
+
     fn leg(&self, n: usize, l: usize) -> Option<&Leg> {
         self.nodes.get(n).and_then(|x| x.legs.get(l))
     }

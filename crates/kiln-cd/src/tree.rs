@@ -466,6 +466,10 @@ fn describe(n: &mut Node, o: &Value) {
             if let (Some(s), Some(e)) = (str_at(o, &["status", "startTime"]), str_at(o, &["status", "completionTime"])) {
                 info(n, "Duration", duration(s, e).unwrap_or_default());
             }
+            // When it completed: what Ship's line for it says (`completed 12h ago`).
+            if let Some(e) = str_at(o, &["status", "completionTime"]) {
+                info(n, "Completed", e);
+            }
             template(n, o);
         }
         ("batch", "CronJob") => {

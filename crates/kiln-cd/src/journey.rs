@@ -294,6 +294,10 @@ pub enum Glyph {
     Fixing,
     Conflict,
     Approved,
+    /// A deploy's app, or one of its objects, unwell (`kiln_cd::stands`).
+    Degraded,
+    /// Suspended, until something lets it go on.
+    Waiting,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

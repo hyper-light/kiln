@@ -4,7 +4,8 @@
 //! queued reader could deadlock a child blocked on a full pipe. Exits are a 50 ms `try_wait`
 //! poll (non-blocking). Every child runs in its own job object (`command-group`) created with
 //! `KILL_ON_JOB_CLOSE`: a kill terminates the whole tree, and if the agent dies the OS closes the
-//! job and takes its children with it.
+//! job and takes its children with it. A step's job is kiln's own (`crate::os::contain::Tree`), so
+//! a paused job's steps can be suspended where they run (docs/ci.md W26-R22).
 
 use std::io::{self, Read};
 use std::process::{Command, ExitStatus, Output, Stdio};
@@ -86,9 +87,9 @@ async fn wait_child(child: &mut GroupChild) -> io::Result<ExitStatus> {
     }
 }
 
-async fn wait_shared(child: &Mutex<GroupChild>) -> io::Result<ExitStatus> {
+async fn wait_step(step: &Mutex<Step>) -> io::Result<ExitStatus> {
     loop {
-        if let Some(status) = child.lock().try_wait()? {
+        if let Some(status) = step.lock().child.try_wait()? {
             return Ok(status);
         }
         crate::rt::sleep(POLL).await;
@@ -170,6 +171,13 @@ pub fn stdout_stream(mut cmd: Command) -> anyhow::Result<async_channel::Receiver
     Ok(rx)
 }
 
+/// A step's process, and the job of its own it was put in before it ran anything: everything it
+/// starts is in the job too.
+struct Step {
+    child: std::process::Child,
+    tree: crate::os::contain::Tree,
+}
+
 /// A running child in its own job object, stdout+stderr merged into one ordered-per-pipe stream
 /// of chunks, with its exit status delivered asynchronously.
 pub struct Running {
@@ -179,13 +187,18 @@ pub struct Running {
     pub output: async_channel::Receiver<Vec<u8>>,
     /// Resolves with the exit code once the child is reaped.
     pub exit: oneshot::Receiver<Option<i32>>,
-    job: Arc<Mutex<GroupChild>>,
+    job: Arc<Mutex<Step>>,
 }
 
 impl Running {
     /// Kill everything left in the child's job (best effort).
     pub fn kill_group(&self) {
-        let _ = self.job.lock().kill();
+        self.job.lock().tree.kill();
+    }
+
+    /// Its job: every process the step started, however that's parented (docs/ci.md W26-R22).
+    pub fn tree(&self) -> crate::os::contain::Tree {
+        self.job.lock().tree.clone()
     }
 
     /// The exit code (`None` when the wait failed).
@@ -194,14 +207,24 @@ impl Running {
     }
 }
 
-/// Spawn `cmd` in a new job object with piped output.
+/// Spawn `cmd` in a new job object with piped output: created suspended, put in a job of its own,
+/// then let run, so nothing it starts is outside the job.
 pub fn spawn_group(mut cmd: Command) -> anyhow::Result<Running> {
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = spawn_job(&mut cmd, true).with_context(|| format!("spawn {:?}", cmd.get_program()))?;
+    use std::os::windows::io::AsRawHandle as _;
+    use std::os::windows::process::CommandExt as _;
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED);
+    let tree = crate::os::contain::Tree::new().ok_or_else(|| anyhow::anyhow!("spawn {:?}: no job object to hold it", cmd.get_program()))?;
+    let mut child = cmd.spawn().with_context(|| format!("spawn {:?}", cmd.get_program()))?;
+    if !tree.assign(child.as_raw_handle()) {
+        let _ = child.kill();
+        let _ = child.wait();
+        anyhow::bail!("spawn {:?}: it couldn't be put in its job", cmd.get_program());
+    }
+    crate::os::contain::resume(child.id());
     let pgid = i32::try_from(child.id()).unwrap_or(0);
     let (tx, rx) = async_channel::bounded::<Vec<u8>>(64);
-    let out = child.inner().stdout.take();
-    let err = child.inner().stderr.take();
+    let out = child.stdout.take();
+    let err = child.stderr.take();
     if let Some(p) = out {
         let tx = tx.clone();
         pump("kiln-step-out", p, move |c| tx.send_blocking(c.to_vec()).is_ok())?;
@@ -211,11 +234,11 @@ pub fn spawn_group(mut cmd: Command) -> anyhow::Result<Running> {
         pump("kiln-step-err", p, move |c| tx.send_blocking(c.to_vec()).is_ok())?;
     }
     drop(tx);
-    let job = Arc::new(Mutex::new(child));
+    let job = Arc::new(Mutex::new(Step { child, tree }));
     let (exit_tx, exit_rx) = oneshot::channel();
     let waiter = Arc::clone(&job);
     crate::rt::spawn(async move {
-        let code = wait_shared(&waiter).await.ok().and_then(|s| s.code());
+        let code = wait_step(&waiter).await.ok().and_then(|s| s.code());
         let _ = exit_tx.send(code);
     });
     Ok(Running { pgid, output: rx, exit: exit_rx, job })

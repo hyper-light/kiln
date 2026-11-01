@@ -2442,10 +2442,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     let work = if o.outpost { 0 } else { proto::CAP_WORK };
                     let headroom_cap = if headroom.is_some() { proto::CAP_HEADROOM } else { 0 };
                     let limit = if harness.is_some() { proto::CAP_AGENT_LIMIT } else { 0 };
+                    // Pause and Resume freeze a job in place (W26-R22): its processes stopped on Unix,
+                    // suspended on Windows.
+                    let freeze = if cfg!(any(unix, windows)) { proto::CAP_FREEZE } else { 0 };
                     // Running agents, it answers what their branches' commits are and compares two points
                     // of their repositories (the Changes tab's Commits and Compare).
                     let commits = if harness.is_some() { proto::CAP_WORKSPACE_COMMITS | proto::CAP_WORKSPACE_COMPARE } else { 0 };
-                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit | proto::CAP_IDENTITY | headroom_cap | proto::CAP_UNREAD | commits }) {
+                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit | proto::CAP_IDENTITY | headroom_cap | proto::CAP_UNREAD | freeze | commits }) {
                         net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                     }
                 }
@@ -3341,6 +3344,19 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             refuse(&mut answer_after, crate::wire::channel::Refusal::Unknown, format!("no job {job} runs here"));
                         }
                     }
+                    // Pause and Resume (docs/ci.md W26-R22): the job stops where it runs, keeping
+                    // this runner, or goes on from where it was. Answered once done.
+                    ServerMsg::Freeze { job, frozen } => match (jobs.contains_key(&job), crate::runner::freeze::of(&job)) {
+                        (false, _) => refuse(&mut answer_after, crate::wire::channel::Refusal::Unknown, format!("no job {job} runs here")),
+                        (true, None) => refuse(&mut answer_after, crate::wire::channel::Refusal::Unsupported, "nothing of it runs here that could be frozen in place yet: it's starting, or runs in a microVM of its own"),
+                        (true, Some(f)) => match f.freeze(frozen).await {
+                            Ok(()) => tracing::info!(%job, frozen, "a job frozen in place, or let go on"),
+                            Err(why) => {
+                                tracing::warn!(%job, frozen, %why, "a job couldn't be frozen in place, or let go on");
+                                refuse(&mut answer_after, crate::wire::channel::Refusal::Refused, why);
+                            }
+                        },
+                    },
                     ServerMsg::Drain => draining = true,
                     ServerMsg::Retire { instance } => {
                         // An older runner process of this machine holds nothing any more: stop

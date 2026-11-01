@@ -293,12 +293,37 @@ export function moves(state: GlyphState): boolean {
 
 export const STAGES = ["review", "land", "checks", "build", "staging", "production", "replant"] as const;
 export type Stage = (typeof STAGES)[number];
-export const STAGE_WORD: Record<Stage, string> = { review: "Review", land: "Land", checks: "Checks", build: "Build", staging: "Staging", production: "Production", replant: "Replant" };
+/** A deploy's three stages, as Ship's Deploys draws an app's latest (docs/ci.md W26-R24). */
+export const DEPLOY_STAGES = ["sync", "health", "soak"] as const;
+export type DeployStage = (typeof DEPLOY_STAGES)[number];
+export const STAGE_WORD: Record<Stage | DeployStage, string> = {
+  review: "Review",
+  land: "Land",
+  checks: "Checks",
+  build: "Build",
+  staging: "Staging",
+  production: "Production",
+  replant: "Replant",
+  sync: "Sync",
+  health: "Health",
+  soak: "Soak",
+};
 /** The shorter word under a pip, where room is tight. */
-export const STAGE_SHORT: Record<Stage, string> = { review: "Review", land: "Land", checks: "Checks", build: "Build", staging: "Staging", production: "Prod", replant: "Replant" };
+export const STAGE_SHORT: Record<Stage | DeployStage, string> = {
+  review: "Review",
+  land: "Land",
+  checks: "Checks",
+  build: "Build",
+  staging: "Staging",
+  production: "Prod",
+  replant: "Replant",
+  sync: "Sync",
+  health: "Health",
+  soak: "Soak",
+};
 
 export interface Pip {
-  stage: Stage;
+  stage: Stage | DeployStage;
   state: GlyphState;
   /** How far a wait has come (soaking, guard, waiting), 0 to 1. */
   p?: number;
