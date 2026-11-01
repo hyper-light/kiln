@@ -202,7 +202,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 39 of 57 runnable starter workflows green, the other 18 failing the same way on GitHub, every miss explained; AC02: 48 of F-21's 50 green, four of them needing accounts and passing in dry configurations against stand-ins (AWS's two, Google's, Codecov's); azure/login waits for a tenant, and attest-build-provenance for GitHub's Sigstore; AC04 (fault injection: drops, delays, OOM kills, full disks and corrupted uploads, each recovered from as specified); AC07 (the security suite: token scope on every route, secrets in no log, API, event or database file, YAML bombs, SSRF guards, archive traversal); AC06 (the UI suite in kiln's own CI: `ci/ui/run-all.sh` in `.kiln/ci.yaml`'s `ui-checks`); AC08 (`kiln ci bench`, every §1.5 target it measures met, regressions gated in kiln's own CI); AC09 (a runner from before the CI work beside this version's) |
 | W23 | CI providers: KilnCI, GitHub Actions, GitLab CI/CD, Bitbucket Pipelines | W03, W14, deploy-api.md §7 | in progress | the git-host interface (kiln, GitHub, GitLab, Bitbucket); the provider core; GitHub Actions, GitLab CI/CD and Bitbucket Pipelines behind one contract (runs, jobs, logs, rerun, cancel, dispatch, artifacts, approvals, environments, checks, lint, webhooks; AC01); the hosts' pull requests through one API (R06); events for agents; SSO with GitHub, GitLab and Bitbucket, and acting on the host as the person |
 | W24 | Incremental CI: fingerprints, reuse, warm state, shared caches | W04, W05, W06, W08, W13, W18 | ready | specified (2026-10-24): R01–R31, AC01–AC15; milestones M0–M7 and M1e are kiln goals with plans |
-| W26 | Review in Ship: changes as Ship items, each owning its review | W14, W23, W27, Ship (the CI/CD Integration plan) | in progress | R06–R15 built: each item's dropdown owns its review (Files and the Conversation, search on vorpal, kinds and the gate, suggestions and conflicts as revisions, the Review lanes), unsigned until W27-R03; AC06 in Chromium, not yet WebKit; specified (2026-10-25): R01–R20, AC01–AC11; plan `01a175b7d5e1772f8d3c7cb28e50ab2b` |
+| W26 | Review in Ship: changes as Ship items, each owning its review | W14, W23, W27, Ship (the CI/CD Integration plan) | in progress | R06–R15 built: each item's dropdown owns its review (Files and the Conversation, search on vorpal, kinds and the gate, suggestions and conflicts as revisions, the Review lanes), unsigned until W27-R03; AC06 in Chromium, not yet WebKit; R18 built (agents in review: their words signed, the switch, review agents, Hand off thread by thread, drafts on every host; AC10); specified (2026-10-25): R01–R20, AC01–AC11; plan `01a175b7d5e1772f8d3c7cb28e50ab2b` |
 | W27 | Attested end to end: identities, signatures, hand-offs, the trail | W10, W18, W26 | in progress | specified (2026-10-25): R01–R12, AC01–AC08; research `01a175c54441773fa28bf1488b82e6aa`; identities built (R01, R02, R12; AC01, AC02): plan `01a17856b1b0712babf8dfd37ce48756`; hand-offs built (R08; AC05: the 14:18 drop and the twin played again, refused and recorded, and the transfers simulation): plan `01a17856b1b477eda14a574ae312a123` |
 
 ---
@@ -8649,6 +8649,8 @@ repository):
 agent, whose Ship it is). An item's diff is in one place, Files (the person's decision,
 2026-10-27): Ship's Diff button opens the row and brings Files into view, focused. AC02 and AC05
 hold; AC03 and AC04 hold but for their signatures; AC06 holds in Chromium, not yet in WebKit (below).
+R18, agents in review, is built (Review plan step 12, kiln plan
+`01a17856b1df75a7aa92eb3e452fcfa2`), and AC10 holds (its tests below).
 
 Not yet: signatures. Nothing R06 to R15 records is signed: the revision an Apply or a conflict's
 resolution makes, a comment, a resolution, an approval and each mark of the Review lanes carry
@@ -8712,16 +8714,47 @@ resolution makes, a comment, a resolution, an approval and each mark of the Revi
   references. Drafts live in the browser's drafts store, which live updates never touch;
   mutations are React Actions with optimistic state; there are no effects; an open item holds
   still and is patched in place.
-- *R18*, Hand off (`crates/kiln/src/ship.rs`'s `hand_off`, `POST /api/ship/hand-off`, migration
-  `20261029-0100_w26_handoffs`). A row's Hand off names one endpoint, and the server decides
-  where it goes. While the change's author's agent runs, it gets the conflicts, open threads and
-  failed checks in one message, the way its comments reach it (docs/agentic.md C3). A failure
-  with no agent of its own goes to the agent attached to what failed, as the failure itself
-  wakes it (W20-R08: the same incident, never a second one). Each hand-off is kept, so the row
-  says who is on it. A person's failure reads "<who> fixing · …" and needs no one; a change
-  reads its agent fixing, with no Hand off and Review pair, until a new revision. With nothing
-  open, or no agent to take it, Hand off says why. Not yet: the switch that lets agents fix from
-  agents' feedback, and "Fixed in" once the fix lands.
+- *R18*, agents in review (the Review plan's step 12, kiln plan `01a17856b1df75a7aa92eb3e452fcfa2`):
+  - **Words, signed and read.** An agent's comment, suggestion, reply and verdict are taken as a
+    person's are, signed as the agent for its person (W27). Each comment reads back with `by`
+    (`kiln_ci::review::byline`: kind, name, and the person an agent is for) and `signed` (who, and
+    when kiln took it). Its line in Ship says "<agent> for <person>" with a seal saying who signed
+    (`review/threads.tsx`'s `CommentWho`). On a host's pull request, an agent's words end with a
+    line naming it and its person (`githost/pulls.rs`).
+  - **A person's words reach the agent** (`workspace/follow.rs`). A new thread or a reply on an
+    agent's change reaches its session with the thread's id, its file and lines, the version and
+    commit they're on, who wrote it (and whether that's its own person) and the words quoted, on a
+    change request, a stacked diff and a draft alike.
+  - **The switch** (migration `20261031-2000_w26_agent_fixes`, `ci/agent_fixes.rs`, `GET` and `PUT
+    /api/repos/:repo/agent-fixes`). Off until someone who can land the repository's changes
+    (`diffs.land`) turns it on in its Review section in Repos (`ui/src/views/repos/review.tsx`); kept
+    with who set it and when, and audited. Ship's Conversation head reads it, as a link to that
+    section (`review/files.tsx`'s `AgentFixes`).
+  - **Agents' feedback** (`kiln_ci::review::agents::route`, pure). An agent's comment on an agent's
+    change reaches the change's agent only with the switch on, saying why, and kiln hands it off so
+    Ship reads the agent fixing. Agents start at most three fixes in a thread until a person speaks
+    there; an ended agent is sent nothing, and the item says the fix waits for a person.
+    `agents.change`'s `answers` makes the version an agent's fix of those threads, and each thread
+    says which version fixed it.
+  - **Review agents** (`ci/attach.rs`'s `review` wake). A push asking `reviewer=agent:<name>` wakes
+    the repository's agent of that name, read-only, with the change to review; it joins the turn,
+    on a draft once the draft is marked ready. An ask with no such agent attached says why.
+  - **Hand off** (`ship.rs`'s `hand_off`, `POST /api/ship/hand-off`, migration
+    `20261029-0100_w26_handoffs`). A row's Hand off names one endpoint, and the server decides
+    where it goes. While the change's author's agent runs, it gets the conflicts, each open thread
+    (its id, place and version, an agent's marked) and the failed checks in one message, the way its
+    comments reach it (docs/agentic.md C3). A failure with no agent of its own goes to the agent
+    attached to what failed, as the failure itself wakes it (W20-R08: the same incident, never a
+    second one). Each hand-off is kept, so the row says who is on it: a person's failure reads
+    "<who> fixing · …"; a change reads its agent fixing, with no Hand off and Review pair, and once
+    the agent's fix comes, the handed revision reads "Fixed in vN" (kiln-cd's journey). With
+    nothing open, or no agent to take it, Hand off says why.
+  - **Drafts on every host** (the person's, 2026-11-01; on W29-R11 and R12's GitHost). An agent's
+    change opened with `draft` is a draft on kiln, GitHub (REST's flag), GitLab (its title) and
+    Bitbucket (its flag), and a new version leaves it one. `ready` marks it ready for review; with
+    no edit since the last version, nothing is pushed. The agent's change says whether it's a
+    draft (`draft`, read again from kiln's state or the host's mirrored pull request). Ship's Ready
+    (`POST /api/ship/ready`) marks an agent's draft ready for its person, or for one who can land.
 - *Tests.*
   - kiln-ci: `review.rs` (`w26_r11_*`, `w26_r12_a_resolved_conflict_waits_on_its_commit`),
     `suggest.rs` (`w26_r10_*`), `conflicts.rs` (`w26_r12_*`). The Search suite on its simulator
@@ -8736,14 +8769,36 @@ resolution makes, a comment, a resolution, an approval and each mark of the Revi
     `ship.rs` (`w26_r14_a_commit_with_no_change_carries_its_push`, and R18's
     `w26_r18_what_was_handed_off_says_who_is_on_it`,
     `w26_r18_hand_off_gives_a_failure_to_the_agent_attached_to_it`,
-    `w26_r18_hand_off_gives_a_changes_threads_to_its_authors_agent`).
+    `w26_r18_hand_off_gives_a_changes_threads_to_its_authors_agent`,
+    `w26_r18_hand_off_names_each_thread_marks_agents_and_says_fixed_in`,
+    `w26_r18_an_agents_draft_is_marked_ready_from_ship_by_its_person`,
+    `w26_ac10_agents_feedback_kiln_held_says_why_and_kilns_hand_off_reads_fixing`).
+  - R18 and AC10, end to end with kiln's fake harness: `tests/agents_review.rs`
+    (`w26_r18_agents_words_are_signed_as_the_agent`,
+    `w26_r18_agents_fix_from_agents_feedback_only_where_turned_on`,
+    `w26_r18_a_review_agent_asked_onto_a_change`, `w26_r18_an_agents_draft_stays_one_until_it_says_ready`,
+    and AC10's `w26_ac10_the_switch_off_starts_nothing`, `w26_ac10_comment_fix_answer_resolve`,
+    `w26_ac10_a_draft_stays_a_draft_through_the_fix`, `w26_ac10_agents_fix_one_thread_at_most_three_times`,
+    `w26_ac10_an_ended_agent_is_sent_nothing`, `w26_ac10_the_same_on_a_stacked_diff`); against
+    the hosts' fakes, `tests/providers.rs` (`w26_r18_an_agents_words_on_a_host_name_it`,
+    `w26_r18_an_agents_draft_on_each_host_until_it_says_ready`); `workspace/follow.rs`
+    (`w26_r18_a_persons_reply_reaches_the_agent_with_its_place` and its neighbours,
+    `w26_ac10_agents_feedback_starts_a_fix_only_where_the_switch_is_on`); kiln-ci's
+    `review/agents.rs` (`w26_r18_*`, `w26_ac10_*`), `review.rs`
+    (`w26_r18_a_byline_names_an_agent_for_its_person`, `w26_r18_a_push_names_the_threads_it_answers`)
+    and `turn.rs` (`w26_r18_an_asked_review_agent_joins_the_turn_hands_it_back_and_has_it_after_a_push`,
+    `w26_r18_a_review_agent_asked_onto_a_draft_joins_the_turn_once_it_is_ready`); kiln-cd's
+    `journey.rs` (`w26_r18_a_handed_off_revision_says_which_version_fixed_it`).
   - UI, in Chromium and WebKit at desktop and phone widths: `e2e/ship-review.spec.ts` (open, reply,
     resolve, change a kind, delete, apply a suggestion, the whole file, search, every way to resolve
     a conflict and commit it), `ship-lanes.spec.ts` (the sections' order on four kinds of item, and
     D41's Review lanes), `ship-diff.spec.ts` (the Diff button), `ship-hand-off.spec.ts` (R18),
     `ship-perf.spec.ts` (AC06: no
-    layout shift through 30 s of live updates; a keystroke renders its composer alone); unit tests
-    `comment-markdown.test.ts` and `review-composer.test.ts`.
+    layout shift through 30 s of live updates; a keystroke renders its composer alone); R18's
+    `repos-review.spec.ts` (the switch), `ship-agent-fixes.spec.ts` (Ship's read of it),
+    `ship-ready.spec.ts` (Ready on a kiln draft and a GitHub one) and `ship-hand-off.spec.ts`'s
+    fixed in v2; unit tests `comment-markdown.test.ts`, `review-composer.test.ts`,
+    `review-byline.test.ts` and `review-thread-fix.test.ts`.
   - AC06 against a real server (`ci/ui/ship_ac06.mjs` on `ci/ui/review_setup.py`'s 10,000-line
     change, 2026-10-27): Chromium's median frame scrolling the whole file in an open item is 16.7
     ms at 1280 and at 390, and a keystroke takes 1 ms. WebKit's is 46 ms and 49 ms: every line of
