@@ -9154,13 +9154,18 @@ delegation of it.
 - *Its results* (`application/vnd.kiln.ci.results+json`): one statement, numbered 1 on its
   `results` stream. Its body is each step's end and the leg's conclusion; its subjects are its logs
   and reports.
+- *Its identity first*: the runner asks for the leg's identity as it takes the leg, and holds the
+  leg's first step until kiln has answered, certifying it or saying why not, 2 s at most
+  (`runner::signed::identity_first`, for a server announcing `CAP_LEG_SIGNS`): a leg of one quick
+  step ended before kiln's answer otherwise, its records unsigned. kiln answers once it has signed
+  the leg's delegation, and hands the leg's inputs on right after, in a task of their own
+  (`identities::answer`). With no answer by then, the leg runs, its runner saying so, and its
+  records are signed only if the identity comes before its end. Else they go unsigned, and
+  `GET /api/ci/legs/:id/signed` says kiln certified its identity only after the leg had ended.
 - *Signed at its end*, in `Ev::Done`, with the leg's key before letting go of it. What the leg
   sent before it ended goes first, however far its runner is behind: an end that comes while its
   last log chunks or step ends still wait on the runner's uplink waits behind them, so its records
-  cover all it sent. A leg that ends before kiln has certified its identity (a step of a few
-  milliseconds, while kiln signs its delegation and inputs) waits for kiln's answer, up to 30 s,
-  and then signs; with no identity by then, or one kiln refused, its records go unsigned, saying
-  why. `AgentMsg::LegResults` carries them all. It goes before `JobFinished`, and
+  cover all it sent. `AgentMsg::LegResults` carries them all. It goes before `JobFinished`, and
   again with it until it's received (`CAP_LEG_SIGNS`, docs/wire.md). A `k8s` pool's pod's leg
   signs too: its runner says nothing of itself past `Build`'s caps, so it says so of the leg as it
   asks for the leg's identity (`IdentityAsk.signs`), and kiln asks the leg for provenance by that.
@@ -9200,14 +9205,20 @@ delegation of it.
     `w27_r05_a_legs_records_verify_under_the_servers_delegation`;
   - `runner::signed`'s `w27_r05_a_legs_results_are_signed_as_the_leg`,
     `w27_r05_a_legs_receipts_and_hand_ons_are_signed_as_the_leg`,
-    `w27_r05_a_legs_custody_is_judged_whole` and
+    `w27_r05_a_legs_custody_is_judged_whole`,
+    `w27_r05_a_legs_first_step_waits_for_its_identity` and
     `w27_r06_provenance_is_signed_as_the_leg_only_when_its_subjects_are_the_legs`;
+  - `runner::identity`'s `w27_r05_a_key_is_awaited_from_its_ask_until_kiln_answers_it`;
   - `proto`'s `w27_r05_leg_signing_is_appended_after_every_older_variant`;
   - integration: `identities`'s `w27_r05_a_legs_results_verify_as_the_leg`,
     `w27_r05_a_v1_jobs_results_verify_as_the_leg`,
+    `w27_r05_a_leg_of_one_trivial_step_signs_its_records`,
     `w27_r06_provenance_verifies_as_the_leg_that_built_it` and (with `chaos`)
-    `w27_r05_a_leg_on_an_older_runner_reads_unsigned_with_why` and
-    `w27_r05_a_runner_behind_its_legs_signs_all_they_sent`; `k8s_pool`'s
+    `w27_r05_a_leg_on_an_older_runner_reads_unsigned_with_why`,
+    `w27_r05_a_runner_behind_its_legs_signs_all_they_sent`,
+    `w27_r05_a_legs_identity_comes_before_its_first_step` and
+    `w27_r05_a_leg_whose_identity_is_held_back_runs_unsigned_saying_why` (the server's
+    `identity_late`, 500 ms and 6 s); `k8s_pool`'s
     `w27_r05_a_pods_leg_signs_its_records_as_the_leg`; `memo`'s `w24_r07` (a leg with reused steps).
 - *v1 jobs too*: a `.kiln/` workflow on v1, as production runs them, signs as the leg on its
   runner. Its runner asks for the job's identity as it takes it (`ServerMsg::Assign`), as a v2

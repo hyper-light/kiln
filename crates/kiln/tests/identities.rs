@@ -1117,7 +1117,13 @@ fn leg_on_a_test_runner(dir: &Path, workflow: &str, env: &[(&str, &str)]) -> any
 /// [`leg_on_a_test_runner`], the runner a test build with `chaos`'s faults (`old`: a runner from
 /// before what it can do past `Build`'s 32 bits).
 fn leg_on_a_test_runner_with(dir: &Path, workflow: &str, env: &[(&str, &str)], chaos: Option<&str>) -> anyhow::Result<LegRun> {
-    let s = start(dir, &Options { agent: false, ci: "kiln_workflows = true", extra: "" })?;
+    leg_on_a_test_runner_of(dir, workflow, env, chaos, &[])
+}
+
+/// [`leg_on_a_test_runner_with`], `server` in the server's environment (`KILN_CHAOS`: a test build's
+/// faults of the server's own).
+fn leg_on_a_test_runner_of(dir: &Path, workflow: &str, env: &[(&str, &str)], chaos: Option<&str>, server: &[(&str, &str)]) -> anyhow::Result<LegRun> {
+    let s = common::start_env(dir, &Options { agent: false, ci: "kiln_workflows = true", extra: "" }, false, server)?;
     let (runner, log) = agents::runner_with(dir, s.port, "fedora-2", chaos, TALK, env)?;
     agents::connected(s.port, &s.admin, "fedora-2", &log, Duration::from_secs(60))?;
     let sha = push_e2e(dir, &s, workflow)?;
@@ -1723,6 +1729,72 @@ fn w27_r05_a_leg_on_an_older_runner_reads_unsigned_with_why() -> anyhow::Result<
     let v: Value = serde_json::from_str(&body)?;
     assert_eq!(field(&v, "state"), "unsigned", "{v:#}");
     assert_eq!(field(&v, "why"), "kiln gave it no identity: its runner fedora-2 asked for none (a kiln from before them)", "{v:#}");
+    Ok(())
+}
+
+/// The test run's leg's signed records as kiln judges them (`GET /api/ci/legs/:id/signed`).
+fn signed_records(run: &LegRun, leg: &str) -> anyhow::Result<Value> {
+    let (st, body) = http(run.s.port, "GET", &format!("/api/ci/legs/{leg}/signed"), &run.s.admin, None)?;
+    anyhow::ensure!(st == 200, "{st} {body}\n{}", run.s.log());
+    Ok(serde_json::from_str(&body)?)
+}
+
+/// W27-R05: a leg of one trivial step signs its records. kiln answers a leg's identity once it has
+/// signed the leg's delegation, and such a leg ended before the answer came, its records unsigned
+/// (`w27_r07_a_land_is_signed_by_its_queue`'s gate, alone): its first step waits for it now.
+#[test]
+fn w27_r05_a_leg_of_one_trivial_step_signs_its_records() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let run = leg_on_a_test_runner(dir.path(), &legs_steps_workflow("      - run: 'true'\n"), &[])?;
+    let v = signed_records(&run, &the_leg(dir.path())?)?;
+    assert_eq!(field(&v, "state"), "verified", "{v:#}");
+    Ok(())
+}
+
+/// W27-R05: a leg's identity comes before its first step. kiln answers it 500 ms late (the
+/// server's `identity_late`, a test build's), and the leg's one step finds the leg's certificate
+/// already where its runner writes it, public; its records verify, and its runner says it waited.
+/// `cargo test -p kiln --features chaos --test identities w27_r05_a_legs_identity_comes_before_its_first_step`
+#[cfg(feature = "chaos")]
+#[test]
+fn w27_r05_a_legs_identity_comes_before_its_first_step() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let certificates = dir.path().join("fedora-2-state/identities");
+    let step = format!("      - run: ls '{}' | grep -q -- '-leg_'\n", certificates.display());
+    let run = leg_on_a_test_runner_of(dir.path(), &legs_steps_workflow(&step), &[], None, &[("KILN_CHAOS", "identity_late=500ms")])?;
+    let v = signed_records(&run, &the_leg(dir.path())?)?;
+    assert_eq!(field(&v, "state"), "verified", "{v:#}");
+    let said = std::fs::read_to_string(dir.path().join("fedora-2.log"))?;
+    assert!(said.contains("the leg's first step waited for kiln to answer its identity"), "{said}");
+    Ok(())
+}
+
+/// W27-R05: a leg whose identity kiln holds back past its first step's wait (6 s late, the server's
+/// `identity_late`) runs all the same, its runner saying why, and its records go unsigned: once
+/// kiln has answered, after the leg's end, the API says it certified the leg's identity only then.
+/// `cargo test -p kiln --features chaos --test identities w27_r05_a_leg_whose_identity_is_held_back_runs_unsigned_saying_why`
+#[cfg(feature = "chaos")]
+#[test]
+fn w27_r05_a_leg_whose_identity_is_held_back_runs_unsigned_saying_why() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    // Its output alone says "it ran": its command doesn't.
+    let run = leg_on_a_test_runner_of(dir.path(), &legs_steps_workflow("      - run: printf 'it %s\\n' ran\n"), &[], None, &[("KILN_CHAOS", "identity_late=6s")])?;
+    let leg = the_leg(dir.path())?;
+    let (_, logs) = http(run.s.port, "GET", &format!("/api/ci/legs/{leg}/logs"), &run.s.admin, None)?;
+    assert!(logs.contains("it ran"), "the leg ran: {logs}");
+    let said = std::fs::read_to_string(dir.path().join("fedora-2.log"))?;
+    assert!(said.contains("kiln hadn't answered the leg's identity in time"), "its runner says it ran without it: {said}");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let v = signed_records(&run, &leg)?;
+        assert_eq!(field(&v, "state"), "unsigned", "{v:#}");
+        if field(&v, "why").starts_with("kiln certified") {
+            assert_eq!(field(&v, "why"), "kiln certified its identity only after the leg had ended: its runner fedora-2 had none to sign its records with", "{v:#}");
+            break;
+        }
+        anyhow::ensure!(Instant::now() < deadline, "kiln never said its identity came late: {v:#}\n{}", run.s.log());
+        std::thread::sleep(Duration::from_millis(500));
+    }
     Ok(())
 }
 

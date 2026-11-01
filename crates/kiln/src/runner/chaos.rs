@@ -43,6 +43,9 @@
 //!   other than the one it counted as its holder, it also sends that one the words about a
 //!   hand-over it sent before transfers named the holder (hand it to the newest, it was taken), as
 //!   it did at 14:18 on 2026-10-25 (docs/ci.md W27-R08), so a test plays the drop again.
+//! - `identity_late=<duration>`: the server's: it answers each leg's identity that long late, as a
+//!   busy server does (docs/ci.md W27-R05), so a test sees the leg's first step wait for it, or,
+//!   past that wait's bound, run with its records unsigned.
 //! - `tarball_changed`: the server's: a commit's tarball it serves a leg has a byte changed after
 //!   kiln signed its hand-on of it, as a tarball changed in transit is (docs/ci.md W27-R08), so a
 //!   test sees the runner refuse it before the leg runs and kiln record the break.
@@ -115,6 +118,8 @@ pub struct Chaos {
     pub unsigned: bool,
     /// The server's: sends a session's former holder its stale hand-over words (`stale_words`).
     pub stale_words: bool,
+    /// The server's: answers each leg's identity this late (`identity_late=`).
+    pub identity_late: Option<Duration>,
     /// The server's: a tarball it serves a leg changes after kiln signed its hand-on of it
     /// (`tarball_changed`).
     pub tarball_changed: bool,
@@ -226,6 +231,7 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
             "old" => c.old = true,
             "unsigned" => c.unsigned = true,
             "stale_words" => c.stale_words = true,
+            "identity_late" => c.identity_late = Some(d()?),
             "tarball_changed" => c.tarball_changed = true,
             "no_git" => c.no_git = true,
             "peer_object_changed" => c.peer_object_changed = true,
@@ -254,7 +260,7 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
                 }
             }
             "seed" => c.seed = v.parse().map_err(|_| anyhow::anyhow!("chaos `seed` takes a number, not `{v}`"))?,
-            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, lag, oom, disk, corrupt, fetch, platform, rebuild, shed, twice, late, seed, fanout, old, unsigned, stale_words, tarball_changed, no_git, peer_object_changed, blob_changed, feed_changed, sync_file_changed, relay_calls, relay_forward, relay_words, relay_frames, copy or keys"),
+            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, lag, oom, disk, corrupt, fetch, platform, rebuild, shed, twice, late, seed, fanout, old, unsigned, stale_words, identity_late, tarball_changed, no_git, peer_object_changed, blob_changed, feed_changed, sync_file_changed, relay_calls, relay_forward, relay_words, relay_frames, copy or keys"),
         }
     }
     Ok(c)
@@ -486,6 +492,7 @@ mod tests {
                 old: false,
                 unsigned: false,
                 stale_words: false,
+                identity_late: None,
                 tarball_changed: false,
                 no_git: false,
                 peer_object_changed: false,
@@ -517,6 +524,8 @@ mod tests {
         assert!(parse("copy=").is_err() && parse("keys").is_err(), "each names its file");
         assert!(parse("drop=6s,old")?.old);
         assert!(parse("unsigned")?.unsigned && parse("stale_words")?.stale_words);
+        assert_eq!(parse("identity_late=6s")?.identity_late, Some(Duration::from_secs(6)));
+        assert!(parse("identity_late").is_err(), "it takes a duration");
         assert!(parse("fetch")?.fetch);
         assert_eq!(parse("rebuild=4s")?.rebuild_after, Some(Duration::from_secs(4)));
         assert_eq!(parse("drop=5s,down=30s")?.down_for, Some(Duration::from_secs(30)));

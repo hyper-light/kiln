@@ -20,7 +20,8 @@
 //! - `GET /api/ci/legs/:id/signed` says who signed and when kiln took it, the delegation they acted
 //!   under, each record (its bundle, to check apart from kiln) and each break (none: they hold). A
 //!   leg that sent none is `unsigned`, saying why: its runner signs no legs' records (a kiln from
-//!   before them), kiln gave it no identity (a v1 job's), or what it sent hasn't come.
+//!   before them), kiln gave it no identity (a v1 job's) or gave it only after the leg had ended,
+//!   or what it sent hasn't come.
 
 use http::StatusCode;
 use kiln_ci::attest::leg;
@@ -585,12 +586,27 @@ async fn unsigned(hub: &Hub, job: &str) -> anyhow::Result<Option<String>> {
     // itself, or of the leg as it asked for that identity).
     let delegated = !crate::identities::delegations_of(&hub.store, job).await?.is_empty();
     let signs = hub.runner_wide_caps(&a) & crate::proto::CAP_LEG_SIGNS != 0 || leg_signs(&hub.store, job).await?;
+    // Its first step waits for its identity a while, then runs without it (W27-R05).
+    let late = delegated && signs && certified_after_its_end(&hub.store, job).await?;
     Ok(Some(match (delegated, signs) {
+        (true, true) if late => format!("kiln certified its identity only after the leg had ended: its runner {a} had none to sign its records with"),
         (true, true) => format!("its runner {a} sent none: the leg hasn't ended, or what it sent was lost on the way"),
         (true, false) => format!("its runner {a} signs no legs' records: a kiln from before them"),
         (false, true) => format!("kiln gave it no identity: its runner {a} asked for none for it (a kiln from before v1 jobs signed theirs), or kiln couldn't give one"),
         (false, false) => format!("kiln gave it no identity: its runner {a} asked for none (a kiln from before them)"),
     }))
+}
+
+/// Whether kiln's latest delegation of leg `job` (as it certified its identity) came after the leg
+/// had ended: kiln answered too late for the leg to sign with it (docs/ci.md W27-R05).
+async fn certified_after_its_end(store: &crate::store::Store, job: &str) -> anyhow::Result<bool> {
+    let j = job.to_owned();
+    store
+        .call(move |c| {
+            let sql = "SELECT j.finished_at IS NOT NULL AND (SELECT MAX(d.taken_at) FROM ci_leg_delegations d WHERE d.job_id = j.id) > j.finished_at FROM jobs j WHERE j.id = ?1";
+            Ok(c.query_row(sql, [&j], |r| r.get::<_, Option<bool>>(0)).optional()?.flatten().unwrap_or(false))
+        })
+        .await
 }
 
 /// `GET /api/ci/legs/:id/signed`.

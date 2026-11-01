@@ -16,6 +16,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::LazyLock;
+use std::time::{Duration, Instant};
 
 use kiln_ci::attest::{Subject, leg};
 use kiln_ci::identity::chain::{Actor, Identity};
@@ -328,14 +329,40 @@ fn sign_provenance_with(job: &str, nonce: &str, payload_type: &str, payload: &[u
 }
 
 /// Where leg `job`'s key is held ([`crate::runner::identity`]).
-pub fn leg_slot(job: &str) -> String {
+fn leg_slot(job: &str) -> String {
     crate::runner::identity::slot("leg", Some(job), None)
 }
 
-/// Whether leg `job`'s identity was asked for and kiln hasn't certified it yet: a leg that ends
-/// first waits for it before it signs its records (docs/ci.md W27-R05).
-pub fn identity_awaited(job: &str) -> bool {
-    crate::runner::identity::awaited(&leg_slot(job))
+/// How long a leg's first step waits for kiln to answer its identity (docs/ci.md W27-R05). kiln
+/// answers in milliseconds; past this (a busy server, the network) the leg runs, and its records
+/// are signed only if the identity comes before its end.
+pub const IDENTITY_WAIT: Duration = Duration::from_secs(2);
+
+/// Holds leg `job`'s first step until kiln has answered its identity, certified or refused,
+/// [`IDENTITY_WAIT`] at most, so all the leg signs is signed as it: the provenance kiln asks of it
+/// as it goes, its records at its end. A leg of one quick step ended before kiln's answer otherwise,
+/// its records unsigned (docs/ci.md W27-R05). For a server announcing `CAP_LEG_SIGNS`. Logged when
+/// it waits.
+pub async fn identity_first(job: &str) {
+    first_waits(job, &leg_slot(job), IDENTITY_WAIT).await;
+}
+
+/// [`identity_first`] for the key held under `slot`, `bound` at most: whether kiln answered.
+async fn first_waits(job: &str, slot: &str, bound: Duration) -> bool {
+    if !crate::runner::identity::awaited(slot) {
+        return true;
+    }
+    let started = Instant::now();
+    let waited = || u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    while crate::runner::identity::awaited(slot) {
+        if started.elapsed() >= bound {
+            tracing::warn!(job, waited_ms = waited(), "kiln hadn't answered the leg's identity in time: the leg runs, its records signed only if the identity comes before its end");
+            return false;
+        }
+        crate::rt::sleep(Duration::from_millis(5)).await;
+    }
+    tracing::info!(job, waited_ms = waited(), "the leg's first step waited for kiln to answer its identity");
+    true
 }
 
 /// `payload` of `payload_type`, signed over its PAE with the key held under `slot`, in a bundle
@@ -573,6 +600,51 @@ mod tests {
         assert!(sign_provenance_with(job, "n1", kiln_ci::attest::PAYLOAD_TYPE, &built_from(serde_json::json!([source, later]))?, &slot).is_err_and(|e| e.contains("upload-artifact@v4 (gitCommit ea165f8d65b6) isn't among what the leg received")));
         forget(job);
         crate::runner::identity::forget(&slot);
+        Ok(())
+    }
+
+    /// W27-R05: a leg's first step waits for its identity: not at all with none asked for, until
+    /// kiln answers, certifying it or refusing it, and no longer than its bound, after which it runs.
+    /// Its keys are agents' slots, as [`held`]'s are.
+    #[test]
+    fn w27_r05_a_legs_first_step_waits_for_its_identity() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pki = crate::pki::Pki::open_scratch(&dir.path().join("pki"))?;
+        let (state, slot) = (dir.path().to_path_buf(), |job: &str| crate::runner::identity::slot("agent", Some(job), Some(1)));
+        let ask = |job: &str| -> anyhow::Result<crate::proto::IdentityAsk> { Ok(serde_json::from_str(&crate::runner::identity::ask("agent", Some(job), Some(1))?)?) };
+        let identity = Identity::new(pki.organization(), Actor::Leg { enrolled_by: "ada".into(), machine: "fedora-2".into(), instance: "01a174ed".into(), run: 812, attempt: 1, leg: "e2e".into() });
+        let asked = ask("w27-r05-certified")?;
+        let pem = pki.issue_identity(&asked.csr, &identity, &[], time::Duration::hours(1))?;
+        let certified = serde_json::to_string(&crate::proto::IdentityGiven { kind: asked.kind, of: asked.of, epoch: asked.epoch, uri: identity.uri()?, cert_pem: Some(pem), ..crate::proto::IdentityGiven::default() })?;
+        ask("w27-r05-refused")?;
+        let refused = serde_json::to_string(&crate::proto::IdentityGiven { kind: "agent".into(), of: Some("w27-r05-refused".into()), epoch: Some(1), error: Some("not now".into()), ..crate::proto::IdentityGiven::default() })?;
+        ask("w27-r05-unanswered")?;
+        let (certified_at, refused_at, unanswered_at) = (slot("w27-r05-certified"), slot("w27-r05-refused"), slot("w27-r05-unanswered"));
+        let (a, b, c) = (certified_at.clone(), refused_at.clone(), unanswered_at.clone());
+        crate::rt::block_on(async move {
+            let t = Instant::now();
+            assert!(first_waits("none", &slot("w27-r05-none"), Duration::from_secs(5)).await, "none asked for: nothing to wait for");
+            assert!(t.elapsed() < Duration::from_secs(1));
+            // Answered 100 ms after the leg's start, by kiln's certificate and by its refusal.
+            for (s, answer) in [(a, certified), (b, refused)] {
+                let st = state.clone();
+                crate::rt::spawn(async move {
+                    crate::rt::sleep(Duration::from_millis(100)).await;
+                    let _ = crate::runner::identity::given(&answer, &st, "main");
+                });
+                let t = Instant::now();
+                assert!(first_waits("e2e", &s, Duration::from_secs(5)).await, "{s}: answered");
+                assert!((Duration::from_millis(90)..Duration::from_secs(5)).contains(&t.elapsed()), "{s}: until the answer, {:?}", t.elapsed());
+            }
+            let t = Instant::now();
+            assert!(!first_waits("e2e", &c, Duration::from_millis(200)).await, "never answered");
+            assert!(t.elapsed() >= Duration::from_millis(200), "its bound: {:?}", t.elapsed());
+            Ok(())
+        })?;
+        assert!(crate::runner::identity::uri(&certified_at).is_some() && crate::runner::identity::uri(&refused_at).is_none());
+        for s in [certified_at, refused_at, unanswered_at] {
+            crate::runner::identity::forget(&s);
+        }
         Ok(())
     }
 }

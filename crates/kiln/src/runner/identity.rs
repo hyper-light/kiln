@@ -12,7 +12,7 @@
 //! ([`crate::os::private_memory`]). A certificate (public) is also written under
 //! `<state>/identities/`, for whoever wants to see it, while its key is held; the key never is.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -60,6 +60,9 @@ struct Held {
     /// What kiln said of each slot as it certified it: its identity's URI and, a leg's, the
     /// server's delegation of the leg by its digest, which its records act under.
     given: HashMap<String, Given>,
+    /// The slots kiln said why it doesn't certify, as it answered them: nothing waits for them until
+    /// they're asked for again.
+    refused: HashSet<String>,
 }
 
 struct Given {
@@ -78,6 +81,7 @@ impl Held {
         let legs = self.holds_a_leg();
         self.keys.retain(|s, _| !which(s));
         self.given.retain(|s, _| !which(s));
+        self.refused.retain(|s| !which(s));
         let gone: Vec<String> = self.certs.keys().filter(|s| which(s)).cloned().collect();
         for s in gone {
             if let Some((_, file)) = self.certs.remove(&s) {
@@ -131,6 +135,8 @@ pub fn request(kind: &str, of: Option<&str>, epoch: Option<u64>) -> anyhow::Resu
             crate::runner::chaos::made_key(&slot, || key.0.to_pkcs8v1().ok().and_then(|d| rcgen::KeyPair::try_from(d.as_ref()).ok()).map(|k| k.serialize_pem()));
             held.keys.insert(slot.clone(), key);
         }
+        // Asked again (a refused agent session's on the heartbeat): awaited until kiln answers.
+        held.refused.remove(&slot);
         let key = held.keys.get(&slot).ok_or_else(|| anyhow::anyhow!("no key for {slot}"))?;
         rcgen::CertificateParams::new(vec!["kiln-identity".to_owned()])?.serialize_request(key)?.pem()?
     };
@@ -147,6 +153,11 @@ pub fn given(json: &str, state_dir: &Path, label: &str) -> anyhow::Result<()> {
     let slot = slot(&g.kind, g.of.as_deref(), g.epoch);
     let Some(pem) = g.cert_pem else {
         tracing::warn!(identity = %slot, error = %g.error.unwrap_or_default(), "kiln issued no identity");
+        // Answered all the same: what waits for it goes on without it (a leg's first step, W27-R05).
+        let mut held = HELD.lock();
+        if held.keys.contains_key(&slot) {
+            held.refused.insert(slot);
+        }
         return Ok(());
     };
     let mut held = HELD.lock();
@@ -161,21 +172,16 @@ pub fn given(json: &str, state_dir: &Path, label: &str) -> anyhow::Result<()> {
     crate::util::write_secret(&path, pem.as_bytes(), 0o644)?;
     tracing::info!(identity = %g.uri, "identity certified");
     held.given.insert(slot.clone(), Given { uri: g.uri, under: g.delegation });
+    held.refused.remove(&slot);
     held.certs.insert(slot, (pem, path));
     Ok(())
 }
 
-/// Whether a key is held under `slot` that kiln hasn't certified yet: asked for, not given (a
-/// refusal leaves it so).
+/// Whether a key is held under `slot` that kiln hasn't answered yet: asked for, and since neither
+/// certified nor refused. What a leg's first step waits on (docs/ci.md W27-R05).
 pub fn awaited(slot: &str) -> bool {
     let held = HELD.lock();
-    held.keys.contains_key(slot) && !held.given.contains_key(slot)
-}
-
-/// The slot kiln's answer `json` (`ServerMsg::Identity`'s) is for, whether it gives a certificate or
-/// says why not.
-pub fn answers(json: &str) -> Option<String> {
-    serde_json::from_str::<IdentityGiven>(json).ok().map(|g| slot(&g.kind, g.of.as_deref(), g.epoch))
+    held.keys.contains_key(slot) && !held.given.contains_key(slot) && !held.refused.contains(slot)
 }
 
 /// Whether this runner's server issues identities (`CAP_IDENTITY`), so its sessions' git signs as
@@ -316,30 +322,28 @@ mod tests {
         Ok(())
     }
 
-    /// W27-R05: a key asked for is awaited until kiln certifies it (a refusal leaves it so), and an
-    /// answer says the slot it's for: what a leg that ended first waits on before it signs.
+    /// W27-R05: a key asked for is awaited until kiln answers it, certifying it or saying why not,
+    /// and again once it's asked for again: what a leg's first step waits on.
     #[test]
-    fn w27_r05_a_key_is_awaited_from_its_ask_until_kiln_certifies_it() -> anyhow::Result<()> {
+    fn w27_r05_a_key_is_awaited_from_its_ask_until_kiln_answers_it() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let pki = crate::pki::Pki::open_scratch(&dir.path().join("pki"))?;
         let s = slot("agent", Some("w27-r05-wait"), Some(1));
         assert!(!awaited(&s), "nothing asked");
-        let asked = ask("agent", Some("w27-r05-wait"), Some(1))?;
+        ask("agent", Some("w27-r05-wait"), Some(1))?;
         assert!(awaited(&s), "asked, not answered");
         let refused = serde_json::to_string(&IdentityGiven { kind: "agent".into(), of: Some("w27-r05-wait".into()), epoch: Some(1), error: Some("not now".into()), ..IdentityGiven::default() })?;
-        assert_eq!(answers(&refused).as_deref(), Some(s.as_str()));
         given(&refused, dir.path(), "main")?;
-        assert!(awaited(&s), "a refusal gives no certificate");
+        assert!(!awaited(&s) && uri(&s).is_none(), "refused: answered, with no certificate");
+        let asked = ask("agent", Some("w27-r05-wait"), Some(1))?;
+        assert!(awaited(&s), "asked again");
         let identity = Identity::new(pki.organization(), Actor::Agent { person: "sam".into(), agent: "w27-r05-wait".into(), epoch: 1, held_by: None });
-        let certified = answer(&pki, &asked, &identity)?;
-        assert_eq!(answers(&certified).as_deref(), Some(s.as_str()));
-        given(&certified, dir.path(), "main")?;
-        assert!(!awaited(&s), "certified");
-        let a_legs = serde_json::to_string(&IdentityGiven { kind: "leg".into(), of: Some("01a1-job".into()), ..IdentityGiven::default() })?;
-        assert_eq!(answers(&a_legs), Some(slot("leg", Some("01a1-job"), None)));
-        assert_eq!(answers("not an answer"), None);
+        given(&answer(&pki, &asked, &identity)?, dir.path(), "main")?;
+        assert!(!awaited(&s) && uri(&s).is_some(), "certified");
         forget(&s);
         assert!(!awaited(&s), "let go of");
+        given(&refused, dir.path(), "main")?;
+        assert!(!HELD.lock().refused.contains(&s), "a refusal for a key let go of is kept nowhere");
         Ok(())
     }
 

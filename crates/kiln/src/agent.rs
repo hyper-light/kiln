@@ -7,7 +7,7 @@
 //!   bounded uplink buffer and are delivered after reconnecting.
 //! * Serves PTY terminals so the UI can drive this machine.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -31,10 +31,6 @@ const UPLINK_BUFFER: usize = 128 << 20;
 /// How long a job's result is kept for a server that never says it has it: well past the grace a
 /// runner gets to reconnect, after which the server has given its legs up.
 const UNRECEIVED_FOR: Duration = Duration::from_secs(600);
-/// How long a leg that ended before kiln certified its identity waits for it, to sign its records
-/// (docs/ci.md W27-R05): kiln answers once it has signed the leg's delegation and inputs, which can
-/// be after a leg of one quick step ends, and a busy server or the network can delay it further.
-const LEG_IDENTITY_WAIT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct Opts {
@@ -1327,10 +1323,6 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // Each leg's signed results (`AgentMsg::LegResults`), encoded, by job: sent again with its
     // result, before it, until the server says it has that (docs/ci.md W27-R05).
     let mut signed_unreceived: HashMap<String, Vec<u8>> = HashMap::new();
-    // Legs that ended before kiln answered their identity, by job: each end waits for the answer,
-    // up to LEG_IDENTITY_WAIT, then goes on; and the ends let go of so, which don't wait again.
-    let mut legs_waiting: HashMap<String, (Instant, JobResult)> = HashMap::new();
-    let mut legs_waited: HashSet<String> = HashSet::new();
     // Each job's events (`AgentMsg::JobEvent`, numbered by their `seq`), encoded, until its result
     // is received, by job: sent again after a reconnect too, to a server that takes each once (it
     // said so: `receipts`). The count goes on after (a kept leg's step rerun, W17-R04).
@@ -2721,8 +2713,6 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             }
                         }
                         crate::runner::signed::forget(&id);
-                        legs_waiting.remove(&id);
-                        legs_waited.remove(&id);
                         let cancel = Shutdown::new();
                         hold_cpus(&id, holds);
                         jobs.insert(id.clone(), Running { cancel: cancel.clone(), pooled: false, holds });
@@ -2736,7 +2726,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             http: http.clone(),
                         };
                         let done = done_tx.clone();
+                        let first = server_signs;
                         crate::rt::spawn(async move {
+                            // Its first step waits for its identity, as a v2 leg's (docs/ci.md W27-R05).
+                            if first {
+                                crate::runner::signed::identity_first(&id).await;
+                            }
                             let result = match std::panic::AssertUnwindSafe(exec.run()).catch_unwind().await {
                                 Ok(r) => r,
                                 Err(p) => JobResult {
@@ -2995,17 +2990,6 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         let label = o.instance.clone().unwrap_or_else(|| crate::upgrade::MAIN.to_owned());
                         if let Err(e) = crate::runner::identity::given(&json, &o.state_dir, &label) {
                             tracing::warn!(error = %format!("{e:#}"), "an identity kiln sent couldn't be kept");
-                        }
-                        // A leg's end waiting for this answer goes on: its records signed, or, kiln
-                        // having given none, unsigned, as it said why.
-                        if let Some(slot) = crate::runner::identity::answers(&json) {
-                            let answered: Vec<String> = legs_waiting.keys().filter(|job| crate::runner::signed::leg_slot(job) == slot).cloned().collect();
-                            for job in answered {
-                                if let Some((_, r)) = legs_waiting.remove(&job) {
-                                    legs_waited.insert(job);
-                                    taken.push_back(Ev::Done(r));
-                                }
-                            }
                         }
                         // The runner role handed to this process, signed for once its own
                         // identity is (W27-R08), and what relays passed on to it.
@@ -3511,8 +3495,6 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         unreceived.remove(&id);
                         signed_unreceived.remove(&id);
                         crate::runner::signed::forget(&id);
-                        legs_waiting.remove(&id);
-                        legs_waited.remove(&id);
                         // What it was given, as it came: its receipt's (docs/ci.md W27-R05).
                         if server_identity {
                             crate::runner::signed::assigned(&id, &json);
@@ -3564,7 +3546,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // On the `firecracker` executor, in a microVM of its own (W13-R05).
                         #[cfg(target_os = "linux")]
                         let microvm = (leg.a.executor.kind == "firecracker").then(|| microvm_ca.clone());
+                        let first = server_signs.then_some(id);
                         crate::rt::spawn(async move {
+                            // Its first step waits for kiln to answer its identity, 2 s at most, so
+                            // all it signs is signed as the leg (docs/ci.md W27-R05).
+                            if let Some(job) = first {
+                                crate::runner::signed::identity_first(&job).await;
+                            }
                             #[cfg(target_os = "linux")]
                             let result = match microvm {
                                 Some(ca) => crate::runner::firecracker::run(leg, Some(ca)).await,
@@ -3928,15 +3916,6 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     taken.push_back(Ev::Done(r));
                     continue 'events;
                 }
-                // A leg that ended before kiln answered its identity (one quick step, kiln signing
-                // its delegation and inputs meanwhile) waits for the answer, up to
-                // LEG_IDENTITY_WAIT, so its records go signed (docs/ci.md W27-R05). The answer, or
-                // the wait's end, takes it on.
-                if server_signs && jobs.contains_key(&r.job) && !legs_waited.remove(&r.job) && crate::runner::signed::identity_awaited(&r.job) {
-                    tracing::info!(job = %r.job, "the leg ended before kiln certified its identity: its records wait for it, up to 30 s");
-                    legs_waiting.insert(r.job.clone(), (Instant::now() + LEG_IDENTITY_WAIT, r));
-                    continue 'events;
-                }
                 if retiring {
                     retire_at = Some(Instant::now() + Duration::from_secs(5)).max(retire_at);
                 }
@@ -3972,17 +3951,6 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
             }
             Ev::Heartbeat => {
-                // A leg's end that waited its while for an identity kiln didn't answer goes on: its
-                // records unsigned, saying why.
-                let now = Instant::now();
-                let late: Vec<String> = legs_waiting.iter().filter(|(_, (until, _))| *until <= now).map(|(job, _)| job.clone()).collect();
-                for job in late {
-                    if let Some((_, r)) = legs_waiting.remove(&job) {
-                        tracing::warn!(job = %job, "kiln didn't certify the leg's identity within 30 s: its records go unsigned");
-                        legs_waited.insert(job);
-                        taken.push_back(Ev::Done(r));
-                    }
-                }
                 // Custody records signed since (a session's hand-on or receipt, docs/ci.md W27-R08),
                 // with the receipts of work taken up before this process held the session's identity.
                 crate::runner::custody::take_up_due();

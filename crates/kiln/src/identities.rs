@@ -803,6 +803,18 @@ pub async fn on_ask(hub: &Arc<Hub>, peer: PeerId, machine: &str, json: &str) {
         Ok(a) => a,
         Err(e) => return tracing::debug!(agent = %machine, error = %e, "an unreadable identity request"),
     };
+    // A test build's `identity_late` (the server's): a leg's identity answered that long late, as a
+    // busy server's is, in a task of its own as below (docs/ci.md W27-R05).
+    if ask.kind == "leg"
+        && let Some(late) = crate::runner::chaos::get().and_then(|c| c.identity_late)
+    {
+        let (hub, machine) = (Arc::clone(hub), machine.to_owned());
+        crate::rt::spawn(async move {
+            crate::rt::sleep(late).await;
+            answer(&hub, peer, &machine, &ask).await;
+        });
+        return;
+    }
     let unopened = |hub: &Hub, ask: &IdentityAsk| ask.kind == "agent" && ask.of.as_deref().is_some_and(|s| hub.harness.info(s).is_none());
     if unopened(hub, &ask) {
         let (hub, machine) = (Arc::clone(hub), machine.to_owned());
@@ -818,14 +830,18 @@ pub async fn on_ask(hub: &Arc<Hub>, peer: PeerId, machine: &str, json: &str) {
     answer(hub, peer, machine, &ask).await;
 }
 
-/// The certificate `ask` is for, recorded, or why not, back to the runner process that asked.
-async fn answer(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) {
+/// The certificate `ask` is for, recorded, or why not, back to the runner process that asked. A
+/// leg's inputs follow it, handed on signed in a task of their own: the leg's first step waits for
+/// this answer (docs/ci.md W27-R05), not for them.
+async fn answer(hub: &Arc<Hub>, peer: PeerId, machine: &str, ask: &IdentityAsk) {
     let mut given = IdentityGiven { kind: ask.kind.clone(), of: ask.of.clone(), epoch: ask.epoch, ..IdentityGiven::default() };
+    let mut inputs = None;
     match issue(hub, peer, machine, ask).await {
-        Ok((uri, pem, delegation)) => {
+        Ok((uri, pem, delegation, leg)) => {
             given.uri = uri;
             given.cert_pem = Some(pem);
             given.delegation = delegation;
+            inputs = leg;
         }
         Err(e) => {
             tracing::warn!(agent = %machine, kind = %ask.kind, error = %format!("{e:#}"), "no identity issued");
@@ -835,6 +851,22 @@ async fn answer(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) {
     if let Ok(json) = serde_json::to_string(&given) {
         hub.send_peer(peer, &ServerMsg::Identity { json }).await;
     }
+    // And the leg's inputs handed to the runner process running it, signed (docs/ci.md W27-R08).
+    if let Some(LegInputs { job, attempt, uri, commit }) = inputs {
+        let hub = Arc::clone(hub);
+        crate::rt::spawn(async move {
+            Box::pin(crate::ci::signed::give_inputs(&hub, peer, &job, attempt, &uri, commit.as_deref())).await;
+        });
+    }
+}
+
+/// What kiln hands a leg it certified as `uri` once it has answered its runner process
+/// ([`crate::ci::signed::give_inputs`]): attempt `attempt` of leg `job`, at `commit`.
+struct LegInputs {
+    job: String,
+    attempt: u32,
+    uri: String,
+    commit: Option<String>,
 }
 
 /// Which of `machine`'s runner processes asked, as it said when it joined. One that isn't joined
@@ -845,9 +877,10 @@ fn asker(hub: &Hub, peer: PeerId, machine: &str) -> anyhow::Result<String> {
 }
 
 /// The identity `ask` asks for, certified and recorded: its URI and certificate, and for a leg the
-/// server's delegation of it, by digest ([`delegate_leg`]). A leg's identity comes with its
-/// delegation or not at all, since its records are taken only under it.
-async fn issue(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) -> anyhow::Result<(String, String, Option<String>)> {
+/// server's delegation of it, by digest ([`delegate_leg`]), and its inputs to hand on once it's
+/// answered. A leg's identity comes with its delegation or not at all, since its records are taken
+/// only under it.
+async fn issue(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) -> anyhow::Result<(String, String, Option<String>, Option<LegInputs>)> {
     let mut facts: Vec<(u64, String)> = Vec::new();
     let instance = asker(hub, peer, machine)?;
     let (identity, lifetime) = match ask.kind.as_str() {
@@ -873,11 +906,14 @@ async fn issue(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) -> any
         (Actor::Leg { attempt, .. }, Some(job)) => Some(delegate_leg(hub, job, *attempt, &uri, &pem, &facts, ask.signs).await.map_err(|e| e.context("the server's delegation of the leg wasn't signed"))?),
         _ => None,
     };
-    // And the leg's inputs handed to the runner process running it, signed (docs/ci.md W27-R08).
-    if let (Actor::Leg { attempt, .. }, Some(job)) = (&identity.actor, ask.of.as_deref()) {
-        let commit = facts.iter().find(|(m, _)| *m == kiln_ci::identity::chain::fulcio::SOURCE_REPOSITORY_DIGEST).map(|(_, c)| c.as_str());
-        Box::pin(crate::ci::signed::give_inputs(hub, peer, job, *attempt, &uri, commit)).await;
-    }
+    // And the leg's inputs, handed to the runner process running it once it's answered.
+    let inputs = match (&identity.actor, ask.of.as_deref()) {
+        (Actor::Leg { attempt, .. }, Some(job)) => {
+            let commit = facts.iter().find(|(m, _)| *m == kiln_ci::identity::chain::fulcio::SOURCE_REPOSITORY_DIGEST).map(|(_, c)| c.clone());
+            Some(LegInputs { job: job.to_owned(), attempt: *attempt, uri: uri.clone(), commit })
+        }
+        _ => None,
+    };
     let now = crate::util::now_unix();
     // A hand-over's (docs/ci.md W27-R08): its hand-on and the receipt for it kept first, so the
     // epoch rises with them; the key isn't certified without them.
@@ -936,7 +972,7 @@ async fn issue(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) -> any
     }
     record(&hub.store, &ask.kind, &uri, &pem).await?;
     tracing::info!(agent = %machine, identity = %identity, "issued an identity");
-    Ok((uri, pem, delegation))
+    Ok((uri, pem, delegation, inputs))
 }
 
 /// An agent session's identity at `epoch`, for the runner process of `machine` holding it
