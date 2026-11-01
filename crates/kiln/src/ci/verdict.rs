@@ -305,13 +305,16 @@ pub async fn wait(hub: &Hub, repo_key: &str, sha: &str, q: &HashMap<String, Stri
             let now = of_commit(hub, repo_key, sha, q).await?;
             return Ok(answer(now, true));
         }
-        // A verdict of this commit changed, a run ended, or 30 s went by: look again.
+        // A verdict of this commit changed, a run ended, or 30 s went by: look again. The nap is
+        // one timer for the whole pass: events of other things don't start it again, or a busy
+        // server's stream of them would keep the wait from ever running out.
         let nap = left.min(Duration::from_secs(30));
+        let mut napped = std::pin::pin!(crate::rt::sleep(nap).fuse());
         let mut heard = false;
         while !heard {
             futures::select_biased! {
                 () = hub.shutdown.cancelled().fuse() => return Ok(answer(first, true)),
-                () = crate::rt::sleep(nap).fuse() => break,
+                () = napped => break,
                 m = rx.recv().fuse() => match m {
                     Ok(text) => {
                         let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
