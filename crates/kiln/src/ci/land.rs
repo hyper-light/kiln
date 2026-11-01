@@ -3304,7 +3304,8 @@ mod tests {
 
     /// docs/ci.md W26-R19: a batch merges whole or not at all. Two entries tested as one candidate,
     /// the first's head moved on its host: the first is out, and the second goes back to the queue,
-    /// never merged onto a trunk without the first.
+    /// never merged onto a trunk without the first. Two more: the first merges whole, then its host
+    /// refuses the second's merge as moved. The first lands, and the second is out, never merged.
     #[test]
     fn w26_r19_a_batch_merges_whole_or_not_at_all() -> anyhow::Result<()> {
         crate::rt::block_on(async {
@@ -3327,6 +3328,24 @@ mod tests {
             assert_eq!(second.state, "queued");
             assert!(second.reason.as_deref().is_some_and(|w| w.contains("an entry beside it in its batch didn't merge")), "{:?}", second.reason);
             assert!(!lab.sim.contains(lab.name, seam::TRUNK, h2), "never merged without the first");
+
+            // The first merged whole, then the second's merge refused as moved.
+            let lab = merges_lab(&hub, "r-batch-moved", "acme/batch-moved", &["three", "four"]).await?;
+            let ([h3, h4], [p3, p4]) = (lab.heads.as_slice(), lab.pulls.as_slice()) else { anyhow::bail!("two changes") };
+            let (ec, ed) = (hand_over(&hub, &lab, &[p3]).await?, hand_over(&hub, &lab, &[p4]).await?);
+            step_until(&hub, &lab, &ec, &["testing"], 1).await?;
+            assert_eq!(entry_now(&hub, &ed).await?.state, "testing", "both built in one step, before either merges");
+            let ids = [ec.clone(), ed.clone()];
+            let (batch, path) = one_batch(&hub, &lab, &ids).await?;
+            let (refusing, policy) = (Slow { sim: lab.sim.clone(), slow: std::sync::atomic::AtomicBool::new(false), moved: std::sync::atomic::AtomicU64::new(p4.number) }, land::Policy::default());
+            let land_step = || host_land_step(&hub, &lab.r, &path, seam::TRUNK, &policy, &refusing, &batch, &ids);
+            land_step().await?;
+            land_step().await?;
+            let (c, d) = (entry_now(&hub, &ec).await?, entry_now(&hub, &ed).await?);
+            assert_eq!(c.state, "landed", "merged whole: landed, not queued again");
+            assert_eq!(d.state, "ejected");
+            assert!(d.reason.as_deref().is_some_and(|w| w.contains("moved on its host")), "{:?}", d.reason);
+            assert!(lab.sim.contains(lab.name, seam::TRUNK, h3) && !lab.sim.contains(lab.name, seam::TRUNK, h4));
             Ok(())
         })
     }
@@ -3360,11 +3379,13 @@ mod tests {
         })
     }
 
-    /// The forge seam's simulator, its background merges still under way while `slow` is set: a
-    /// host whose merges take a while.
+    /// The forge seam's simulator, its background merges still under way while `slow` is set, and its
+    /// merge of change `moved` refused as moved: a host whose merges take a while, or whose change
+    /// was pushed to between kiln's read of it and its merge.
     struct Slow {
         sim: seam::SimForge,
         slow: std::sync::atomic::AtomicBool,
+        moved: std::sync::atomic::AtomicU64,
     }
 
     type Fut<'a, T> = futures::future::BoxFuture<'a, Result<T, seam::Refusal>>;
@@ -3379,7 +3400,12 @@ mod tests {
         fn stack_add<'a>(&'a self, repo: &'a str, stack: u64, changes: Vec<u64>) -> Fut<'a, seam::Stack> { self.sim.stack_add(repo, stack, changes) }
         fn stack_of<'a>(&'a self, repo: &'a str, number: u64) -> Fut<'a, Option<seam::Stack>> { self.sim.stack_of(repo, number) }
         fn unstack<'a>(&'a self, repo: &'a str, stack: u64) -> Fut<'a, Option<seam::Stack>> { self.sim.unstack(repo, stack) }
-        fn merge<'a>(&'a self, repo: &'a str, number: u64, merge: seam::Merge) -> Fut<'a, seam::Merging> { self.sim.merge(repo, number, merge) }
+        fn merge<'a>(&'a self, repo: &'a str, number: u64, merge: seam::Merge) -> Fut<'a, seam::Merging> {
+            if self.moved.load(std::sync::atomic::Ordering::SeqCst) == number {
+                return Box::pin(async { Err(seam::Refusal::Moved { head: "f".repeat(40) }) });
+            }
+            self.sim.merge(repo, number, merge)
+        }
         fn merge_result<'a>(&'a self, repo: &'a str, number: u64, id: &'a str) -> Fut<'a, seam::MergeResult> {
             if self.slow.load(std::sync::atomic::Ordering::SeqCst) {
                 return Box::pin(async { Ok(seam::MergeResult::Pending) });
@@ -3434,7 +3460,7 @@ mod tests {
             assert_eq!(entry_now(&hub, &eb).await?.state, "testing", "both built in one step, before either merges");
             let ids = [ea.clone(), eb.clone()];
             let (batch, path) = one_batch(&hub, &lab, &ids).await?;
-            let (slow, policy) = (Slow { sim: lab.sim.clone(), slow: std::sync::atomic::AtomicBool::new(true) }, land::Policy::default());
+            let (slow, policy) = (Slow { sim: lab.sim.clone(), slow: std::sync::atomic::AtomicBool::new(true), moved: std::sync::atomic::AtomicU64::new(0) }, land::Policy::default());
             let land_step = || host_land_step(&hub, &lab.r, &path, seam::TRUNK, &policy, &slow, &batch, &ids);
             land_step().await?;
             lab.sim.push(lab.name, "two", "two", "two again")?;
