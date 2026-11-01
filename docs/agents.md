@@ -1402,6 +1402,67 @@ A tool call reads `pending` while it is asked about (an approval in `state.appro
 `tool_id`) or while it waits its turn behind one; `running` once it is under way. MCP calls name
 their `server` and `tool_short`; skill calls their `skill`.
 
+### What a person does with an agent's subagents
+
+An agent's subagents show as one tree: those kiln started for it (sessions of their own, `subagent`
+with it as `parent`, and theirs) and its harness's own (`subagents` in lists, nested by
+`parent_task`), each under what started it, in the order they started. Mission control's row of
+an agent with subagents has a toggle (the subagent mark and a chevron) that opens the tree under
+it in the row's own columns: each subagent's piece of the path (the lines of those it's under
+passing by, a curve into its own mark), its name, its word and what it's at, its machine, time and
+harness, its pause, and the way to its thread. One that needs you has its own piece of the path
+tan, and its request is answered there unless its agent's row already answers it. The line by the
+composer opens the same tree with a pick box each, a select-all where its mark was; the Plan tab
+shows each step's agent live under its step.
+
+With subagents picked, the composer's To line names them (two on a phone, four wider, then +N),
+and a message goes to each its own way: one of the agent's own harness's as a `send` with its
+`task` on the agent's socket, any other over HTTP to its session (with `task` for a harness's
+own). Each name then has its mark: delivered, waiting (queued, or its session paused), or not
+sent.
+
+A subagent's crumbs name its whole path from the agent at the top, each earlier name opening its
+own thread, with Pause, Branch and Permissions on that line. What its parent wrote it (its brief,
+what it sent it: in a harness's own subagent's thread, a message without a client id; in a
+session of its own, its first and those whose id is `from-agent-<parent>-…`) is under its
+parent's name, with the way back to its parent's thread. A person's message its agent passes on
+(`via: "parent"`) says so ("You · via …"). A finished one ends with its word, when, and the way
+back.
+
+**Pausing** (`pause`, `{on, task?}`). Without `task`, the session's processes stop where they are:
+its machine's pacer holds its group at share 0 (cgroup.freeze on Linux, SIGSTOP on macOS, every
+thread suspended on Windows) under the pacer's guard, which starts them again should the runner
+end (docs/headroom.md, "A person's pause"). `state.frozen` says since when; a runner that can't
+pause says why, and one that restarts holds a paused session again. The server sends the pause,
+and its end, to every subagent kiln started under it. With `task`, that subagent of its harness's
+own is held at its next tool call: kiln has a hook on every one of Claude Code's tool calls (a
+`PreToolUse` matcher for every tool, its answer awaited up to 7 days), and the call of a paused
+subagent, or of one under it, waits for its answer until it's resumed (`tasks[].paused_at`).
+`tasks[].pausable` says which can be held so: Claude Code's while they go; not Codex's, ACP
+agents' or Antigravity's. What a pause holds says Paused; the one paused offers Resume, and those
+under it wait for that.
+
+**What each may do** (`perms`, `{perms?, task?}`): Read, Edit, Run and Web, each `allow`, `ask` or
+`off`; a `folder` its file calls stay in; the most `minutes` and `tokens` it may use. Never more
+than what it's under: the server narrows a session's to its parent's, and the subagents kiln
+started under it to its own (narrowing one narrows those under it; widening it widens none);
+Claude Code's adapter narrows one of its own subagents' to its session's and the one it's under.
+They hold at each of Claude Code's tool calls, in the same hook: `off` refuses the call with the
+reason, `ask` makes it ask the person, a file outside its folder is refused (a command there asks),
+and past its minutes or tokens each call is refused and it's told to finish. The shield on the
+thread's crumbs opens the panel under them, every choice at its right edge; a session whose
+harness kiln doesn't answer that way (no `limits` in its `meta.features`) has it off.
+
+**Branching** (`branch`, `{words, top?, task?}`). The fork on a subagent's crumbs takes what
+changes, then a Variant or a New agent, and its runner makes the new session on its machine. A
+subagent kiln started branches from its own spec, so it lands beside it, under the same agent: its
+conversation forked where its harness can (`resume` in its features: its harness session, `fork`),
+the person's words its first message, and handed over in words where it can't. One of its
+harness's own is handed over in words (what it was asked, said and was told) as a subagent of its
+agent. A New agent (`top`) is an agent of its own. Each carries `variant_of`, and the tree marks
+it with the fork. A finished variant's thread ends with Keep, which tells its parent to use its
+result in place of the one it varied, and to read it whole with `agents_result`.
+
 ## Files in messages
 
 A file a message mentions shows in the conversation: what the agent or the person wrote, never
