@@ -497,3 +497,114 @@ fn w29_r10_drafts_in_ship() -> anyhow::Result<()> {
     until_list(&s, &s.admin, "the discarded draft's row gone", |l| !rows_of(l, "acme/app").iter().any(|r| r.pointer("/draft/id").and_then(Value::as_str) == Some(id.as_str())))?;
     Ok(())
 }
+
+/// A repository kiln hosts, cloned under `dir` (its `/` a `_`), its first commit (a README and
+/// `files`, tagged `tag`) pushed and polled.
+fn hosted(s: &Server, home: &Path, dir: &Path, name: &str, files: &[(&str, &str)], tag: Option<&str>) -> anyhow::Result<std::path::PathBuf> {
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": name, "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{name}: {st} {body}");
+    let leaf = name.replace('/', "_");
+    git(home, dir, &["clone", "-q", &format!("http://x:{}@127.0.0.1:{}/git/{name}.git", s.admin, s.port), &leaf])?;
+    let work = dir.join(&leaf);
+    let mut all: Vec<(&str, &str)> = vec![("README.md", "first\n")];
+    all.extend_from_slice(files);
+    for (path, text) in all {
+        let p = work.join(path);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(p, text)?;
+    }
+    git(home, &work, &["add", "."])?;
+    git(home, &work, &["commit", "-qm", "first"])?;
+    let mut refs = vec!["push", "-q", "origin", "main"];
+    if let Some(t) = tag {
+        git(home, &work, &["tag", t])?;
+        refs.push(t);
+    }
+    git(home, &work, &refs)?;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+        let list = v.as_array().cloned().or_else(|| v.get("repos").and_then(Value::as_array).cloned()).unwrap_or_default();
+        if list.iter().any(|r| field(r, "name") == name && r.get("last_polled_at").is_some_and(|t| !t.is_null())) {
+            return Ok(work);
+        }
+        anyhow::ensure!(Instant::now() < deadline, "{name} wasn't polled: {body}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// `repo`'s runs at `sha`, once `n` of them have finished.
+fn finished(s: &Server, repo: &str, sha: &str, n: usize) -> anyhow::Result<Vec<Value>> {
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        let (_, body) = http(s.port, "GET", &format!("/api/ci/runs?repo={repo}&limit=100"), &s.admin, None)?;
+        let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+        let all: Vec<Value> = v.get("runs").and_then(Value::as_array).into_iter().flatten().filter(|r| field(r, "sha") == sha).cloned().collect();
+        let done = all.iter().filter(|r| r.get("finished_at").is_some_and(|f| !f.is_null())).count();
+        if done >= n {
+            return Ok(all);
+        }
+        anyhow::ensure!(Instant::now() < deadline, "{repo} at {sha}: {done} of {n} runs finished: {all:?}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// W29-R17, R20 in Ship: a shared repository's list says its access, and its heading that it's
+/// shared; an action's pane lists the repositories whose runs used it, with the version, and its
+/// Access in Settings, and a reusable workflow's pane too. One that shares nothing says none.
+#[test]
+fn w29_r17_access_and_used_by_in_ship() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", extra: "" })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let setup = "name: setup\nruns:\n  using: composite\n  steps:\n    - run: echo set up\n      shell: bash\n";
+    let build = "name: build\non:\n  workflow_call:\njobs:\n  b:\n    runs-on: local\n    steps:\n      - run: echo built\n";
+    // acme/kit shares with acme's repositories, from its trunk's first commit, tagged v1.
+    hosted(&s, &home, dir.path(), "acme/kit", &[(".kiln/config.yaml", "share: owner\n"), (".github/actions/setup/action.yml", setup), (".github/workflows/build.yml", build)], Some("v1"))?;
+    let app = hosted(&s, &home, dir.path(), "acme/app", &[], None)?;
+    let step = "on: push\njobs:\n  a:\n    runs-on: local\n    steps:\n      - uses: kiln://acme/kit/.github/actions/setup@v1\n";
+    let call = "on: push\njobs:\n  c:\n    uses: kiln://acme/kit/.github/workflows/build.yml@v1\n";
+    for (path, text) in [(".kiln/step.yaml", step), (".kiln/call.yaml", call)] {
+        let p = app.join(path);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(p, text)?;
+    }
+    git(&home, &app, &["add", "."])?;
+    git(&home, &app, &["commit", "-qm", "uses acme/kit"])?;
+    git(&home, &app, &["push", "-q", "origin", "main"])?;
+    let sha = git(&home, &app, &["rev-parse", "HEAD"])?.trim().to_owned();
+    let runs = finished(&s, "acme/app", &sha, 2)?;
+    assert!(runs.iter().all(|r| field(r, "conclusion") == "success"), "{runs:?}\n{}", s.log());
+
+    // The list: acme/kit shared with its owner's repositories, acme/app not shared.
+    let list = pipelines(&s, &s.admin, "")?;
+    let head = |repo: &str| list.get("repos").and_then(Value::as_array).and_then(|r| r.iter().find(|r| field(r, "repo") == repo)).cloned().unwrap_or_default();
+    let (kit, mine) = (head("acme/kit"), head("acme/app"));
+    assert_eq!((field(&kit, "access"), field(&mine, "access")), ("owner", "none"), "{list}");
+    assert!(field(&kit, "say").starts_with("shared"), "{kit}");
+    assert!(!field(&mine, "say").contains("shared"), "{mine}");
+
+    // The action's pane: who used which version, and its Access.
+    let (st, action) = pane(&s, &s.admin, ".github/actions/setup/action.yml", None)?;
+    anyhow::ensure!(st == 200, "the action's pane: {st} {action}");
+    let used: Vec<(&str, &str)> = group(&action, "Used by").iter().map(|l| (field(l, "name"), field(l, "value"))).collect();
+    assert_eq!(used.len(), 1, "{action}");
+    assert!(used.first().is_some_and(|(repo, v)| *repo == "acme/app" && v.starts_with("v1 · ")), "{used:?}");
+    let access: Vec<(&str, &str, &str)> = group(&action, "Settings").iter().filter(|l| field(l, "key") == "settings.access").map(|l| (field(l, "name"), field(l, "value"), field(l, "state"))).collect();
+    assert_eq!(access, [("Access", "shared with acme's repositories", "owner")], "{action}");
+
+    // The reusable workflow's pane, likewise.
+    let (st, called) = pane(&s, &s.admin, ".github/workflows/build.yml", None)?;
+    anyhow::ensure!(st == 200, "the reusable workflow's pane: {st} {called}");
+    let names = group_names(&called);
+    assert_eq!(names.iter().rev().take(2).map(String::as_str).collect::<Vec<_>>(), ["Settings", "Used by"], "{names:?}");
+    assert_eq!(group(&called, "Used by").iter().map(|l| field(l, "name")).collect::<Vec<_>>(), ["acme/app"], "{called}");
+    assert!(group(&called, "Settings").iter().any(|l| field(l, "key") == "settings.access" && field(l, "state") == "owner"), "{called}");
+    Ok(())
+}

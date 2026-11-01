@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use crate::sharing::Access;
 use crate::wf::ir::Trigger;
 use crate::wf::{Action, Workflow};
 
@@ -561,18 +562,19 @@ pub struct Repo {
     pub digest: u64,
     /// Whose drafts in review it has: each of them sees it otherwise ([`Repo::seen_by`]).
     pub authors: Vec<String>,
+    /// Who may use its actions and reusable workflows (W29-R17).
+    pub access: Access,
 }
 
 impl Repo {
-    pub fn new(repo: String, branch: String, sha: String, mut rows: Vec<Row>) -> Repo {
+    pub fn new(repo: String, branch: String, sha: String, mut rows: Vec<Row>, access: Access) -> Repo {
         order_rows(&mut rows);
         let rendered: Vec<String> = rows.iter().map(|r| row_json(&repo, &branch, &sha, r).to_string()).collect();
-        // W29-R17's Access is the master plan's step 5: until then nothing is shared.
-        let (say, needs) = heading_of(rows.iter().map(|r| (&r.facts, &r.standing)), false);
+        let (say, needs) = heading_of(rows.iter().map(|r| (&r.facts, &r.standing)), access != Access::None);
         let mut authors: Vec<String> = rows.iter().filter_map(|r| r.draft.as_ref()).filter(|d| d.state == Draft::Review).map(|d| d.author.clone()).collect();
         authors.sort_unstable();
         authors.dedup();
-        let mut r = Repo { repo, branch, sha, rows, rendered, say, needs, whole: String::new(), digest: 0, authors };
+        let mut r = Repo { repo, branch, sha, rows, rendered, say, needs, whole: String::new(), digest: 0, authors, access };
         r.whole = r.text(r.rendered.iter().map(String::as_str));
         r.digest = fnv(FNV_START, r.whole.as_bytes());
         r
@@ -585,12 +587,12 @@ impl Repo {
             return None;
         }
         let rows = self.rows.iter().map(|r| r.seen_by(viewer).unwrap_or_else(|| r.clone())).collect();
-        Some(Repo::new(self.repo.clone(), self.branch.clone(), self.sha.clone(), rows))
+        Some(Repo::new(self.repo.clone(), self.branch.clone(), self.sha.clone(), rows, self.access))
     }
 
     /// Its JSON with these of its rows' JSON.
     fn text<'a>(&self, rows: impl Iterator<Item = &'a str>) -> String {
-        let head = json!({ "repo": self.repo, "say": self.say, "needs": self.needs, "access": "none", "ref": self.branch, "commit": self.sha }).to_string();
+        let head = json!({ "repo": self.repo, "say": self.say, "needs": self.needs, "access": self.access, "ref": self.branch, "commit": self.sha }).to_string();
         let mut out = String::with_capacity(head.len() + self.rendered.iter().map(String::len).sum::<usize>() + self.rendered.len() + 16);
         out.push_str(head.strip_suffix('}').unwrap_or(&head));
         out.push_str(",\"rows\":[");
@@ -857,8 +859,9 @@ fn outcome_glyph(outcome: Option<Outcome>, running: bool) -> &'static str {
 }
 
 /// A workflow's groups (W29-R04): Triggers, its stages, Uses, Secrets and variables (names only),
-/// Runs, Settings, and a reusable workflow's interface.
-pub fn workflow_groups(w: &Workflow, text: &str, runs: &[RunSeen], runs_here: bool, note: &str) -> Vec<PaneGroup> {
+/// Runs, Settings, and a reusable workflow's interface; with `sharing`, a reusable workflow's Used
+/// by and its Access in Settings (W29-R17, R20).
+pub fn workflow_groups(w: &Workflow, text: &str, runs: &[RunSeen], runs_here: bool, note: &str, sharing: Option<&Sharing<'_>>) -> Vec<PaneGroup> {
     let mut out = Vec::new();
     let triggers: Vec<Line> = w
         .on
@@ -935,13 +938,55 @@ pub fn workflow_groups(w: &Workflow, text: &str, runs: &[RunSeen], runs_here: bo
         })
         .collect();
     out.push(group("Runs", runs_lines));
+    let shared = sharing.filter(|_| w.trigger("workflow_call").is_some());
+    if let Some(s) = shared {
+        out.push(group("Used by", s.used_by_lines()));
+    }
     let mut settings = vec![if runs_here { Line::new("settings.on", "setting", "Turned on", "runs on its triggers") } else { Line::new("settings.on", "setting", "Not run here", note) }];
     settings.push(Line::new("settings.machines", "setting", "Machines", "bare metal unless a job says"));
     if let Some(c) = &w.concurrency {
         settings.push(Line::new("settings.concurrency", "setting", "Concurrency", c.group.src.clone()));
     }
+    settings.extend(shared.map(Sharing::access_line));
     out.push(group("Settings", settings));
     out
+}
+
+/// What sharing says in an action's or a reusable workflow's pane (W29-R17, R20): its repository's
+/// Access, and which repositories' runs pinned which of its versions.
+#[derive(Debug, Clone, Copy)]
+pub struct Sharing<'a> {
+    /// Its repository (`acme/kit`).
+    pub repo: &'a str,
+    pub access: Access,
+    pub used_by: &'a [crate::catalog::Consumer],
+}
+
+impl Sharing<'_> {
+    /// Used by's lines: each repository and version, newest first; a note when there's none.
+    fn used_by_lines(&self) -> Vec<Line> {
+        if self.used_by.is_empty() {
+            return vec![Line::new("used_by", "note", "Who uses it", "no other repository's runs have used it yet").state("none")];
+        }
+        self.used_by
+            .iter()
+            .map(|c| {
+                let runs = if c.runs == 1 { "1 run".to_owned() } else { format!("{} runs", c.runs) };
+                Line::new(format!("used_by.{}@{}", c.repo, c.git_ref), "consumer", c.repo.clone(), format!("{} · {} · {runs}", c.git_ref, c.sha.get(..12).unwrap_or(&c.sha)))
+            })
+            .collect()
+    }
+
+    /// Settings' Access line, its state the level (`none`, `owner`, `everyone`).
+    fn access_line(&self) -> Line {
+        let owner = self.repo.split('/').next().unwrap_or(self.repo);
+        let words = match self.access {
+            Access::None => "not shared: only its own workflows use it".to_owned(),
+            Access::Owner => format!("shared with {owner}'s repositories"),
+            Access::Everyone => "shared with everyone on this kiln".to_owned(),
+        };
+        Line::new("settings.access", "setting", "Access", words).state(self.access.as_str())
+    }
 }
 
 /// What a microVM action's `runs` says beyond what `wf::Action` reads (W29-R29, R30's `resources`
@@ -967,9 +1012,9 @@ fn yaml_scalar(v: &serde_yaml::Value) -> Option<String> {
 
 /// An action's groups (W29-R04): Inputs and Outputs, then its kind's own (a composite's steps, a
 /// JavaScript action's entry points, a Docker action's image, a microVM's image, resources and
-/// egress), its Versions (`tags`: newest first, each with its commit), and what comes with
-/// sharing (Used by, Access: W29-R17, R20).
-pub fn action_groups(a: &Action, kind: Kind, text: &str, head: &str, tags: &[(String, String)]) -> Vec<PaneGroup> {
+/// egress), its Versions (`tags`: newest first, each with its commit), and what sharing says:
+/// Used by, and its Access in Settings (W29-R17, R20).
+pub fn action_groups(a: &Action, kind: Kind, text: &str, head: &str, tags: &[(String, String)], sharing: &Sharing<'_>) -> Vec<PaneGroup> {
     let mut out = Vec::new();
     let inputs = a
         .inputs
@@ -1023,8 +1068,8 @@ pub fn action_groups(a: &Action, kind: Kind, text: &str, head: &str, tags: &[(St
     let mut versions = vec![Line::new("versions.head", "version", "the default branch's tip", head.get(..12).unwrap_or(head))];
     versions.extend(tags.iter().map(|(t, sha)| Line::new(format!("versions.{t}"), "version", t.clone(), sha.get(..12).unwrap_or(sha))));
     out.push(group("Versions", versions));
-    out.push(group("Used by", vec![Line::new("used_by", "note", "Who uses it", "comes with sharing (W29-R20)").state("none")]));
-    out.push(group("Settings", vec![Line::new("settings.access", "setting", "Access", "not shared: Access comes with sharing (W29-R17)").state("none")]));
+    out.push(group("Used by", sharing.used_by_lines()));
+    out.push(group("Settings", vec![sharing.access_line()]));
     out
 }
 
@@ -1256,7 +1301,7 @@ mod tests {
                 Row::new(facts, Some("kiln"), "push, pull request · 4 jobs".into(), Some("ada".into()), Some(1_700_000_000))
             })
             .collect();
-        Repo::new(format!("acme/r{n:03}"), "main".into(), "a3f2c1d4e5f60718293a4b5c6d7e8f9012345678".into(), rows)
+        Repo::new(format!("acme/r{n:03}"), "main".into(), "a3f2c1d4e5f60718293a4b5c6d7e8f9012345678".into(), rows, Access::None)
     }
 
     fn list(repos: &[Repo], only: Option<&[String]>, repo: Option<&str>, q: Option<&str>) -> Value {
@@ -1321,7 +1366,7 @@ mod tests {
         for (path, text, events) in [(".github/workflows/every.yml", EVERY_GITHUB_EVENT, GHA_EVENTS), (".kiln/every.yaml", EVERY_KILN_EVENT, KILN_EVENTS)] {
             let (_, w) = crate::wf::check_model(path, text, None);
             let w = w.unwrap_or_default();
-            let groups = workflow_groups(&w, text, &[], true, "");
+            let groups = workflow_groups(&w, text, &[], true, "", None);
             let triggers = groups.iter().find(|g| g.name == "Triggers").map(|g| g.lines.clone()).unwrap_or_default();
             for e in events {
                 // kiln's v1 forms are read as the events they are (W02-R06): `manual` is
@@ -1348,7 +1393,7 @@ mod tests {
         let (_, w) = crate::wf::check_model(".github/workflows/every.yml", EVERY_GITHUB_EVENT, None);
         let w = w.unwrap_or_default();
         let runs = [RunSeen { number: 12, event: "push".into(), outcome: Some(Outcome::Failed), running: false }, RunSeen { number: 13, event: "schedule".into(), outcome: None, running: true }];
-        let groups = workflow_groups(&w, EVERY_GITHUB_EVENT, &runs, true, "");
+        let groups = workflow_groups(&w, EVERY_GITHUB_EVENT, &runs, true, "", None);
         let names: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
         assert_eq!(names, ["Triggers", "Called with", "Stage 1", "Stage 2", "Uses", "Secrets and variables", "Runs", "Settings"]);
         let lines = |n: &str| groups.iter().find(|g| g.name == n).map(|g| g.lines.clone()).unwrap_or_default();
@@ -1364,7 +1409,7 @@ mod tests {
         assert!(groups.iter().flat_map(|g| &g.lines).all(|l| !l.value.contains("${{ secrets")), "names only, never a value");
         let runs: Vec<(String, Option<&str>)> = lines("Runs").iter().map(|l| (l.value.clone(), l.state)).collect();
         assert_eq!(runs, [("push · failed".to_owned(), Some("failed")), ("schedule · under way".into(), Some("running"))]);
-        let off = workflow_groups(&w, EVERY_GITHUB_EVENT, &[], false, "GitHub workflows not run: this commit has .kiln/ workflows");
+        let off = workflow_groups(&w, EVERY_GITHUB_EVENT, &[], false, "GitHub workflows not run: this commit has .kiln/ workflows", None);
         assert_eq!(off.iter().find(|g| g.name == "Settings").and_then(|g| g.lines.first()).map(|l| l.name.clone()), Some("Not run here".to_owned()));
     }
 
@@ -1382,7 +1427,7 @@ mod tests {
             let (a, _) = crate::wf::parse_action(text);
             let a = a.unwrap_or_default();
             assert_eq!(Kind::of_action(&a), kind, "{text}");
-            let groups = action_groups(&a, kind, text, "a3f2c1d4e5f60718", &tags);
+            let groups = action_groups(&a, kind, text, "a3f2c1d4e5f60718", &tags, &Sharing { repo: "acme/kit", access: Access::None, used_by: &[] });
             let names: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
             assert_eq!(names, ["Inputs", "Outputs", own, "Versions", "Used by", "Settings"], "{kind:?}");
             let lines: Vec<String> = groups.iter().find(|g| g.name == own).map(|g| g.lines.iter().map(|l| format!("{}: {}", l.name, l.value)).collect()).unwrap_or_default();
@@ -1391,9 +1436,47 @@ mod tests {
             assert_eq!(versions, ["the default branch's tip", "v2.4.0"]);
         }
         let (a, _) = crate::wf::parse_action(cases_text());
-        let groups = action_groups(&a.unwrap_or_default(), Kind::Composite, cases_text(), "a3f2", &[]);
+        let groups = action_groups(&a.unwrap_or_default(), Kind::Composite, cases_text(), "a3f2", &[], &Sharing { repo: "acme/kit", access: Access::None, used_by: &[] });
         let inputs: Vec<String> = groups.iter().find(|g| g.name == "Inputs").map(|g| g.lines.iter().map(|l| format!("{}: {}", l.name, l.value)).collect()).unwrap_or_default();
         assert_eq!(inputs, ["toolchain: required · Which toolchain", "cache: default true"]);
+    }
+
+    /// W29-R17, R20: a shared repository's head says its access and its heading says shared; an
+    /// action's pane and a reusable workflow's say who used which version and the Access, and a
+    /// workflow that isn't called has neither.
+    #[test]
+    fn w29_r17_access_and_used_by_in_panes() {
+        let used = [crate::catalog::Consumer { repo: "acme/app".into(), path: ".github/actions/setup".into(), kind: "action".into(), git_ref: "v1".into(), sha: "0123456789abcdef0123".into(), runs: 3, last_at: 9 }];
+        let sharing = Sharing { repo: "acme/kit", access: Access::Owner, used_by: &used };
+        let (a, _) = crate::wf::parse_action(cases_text());
+        let groups = action_groups(&a.unwrap_or_default(), Kind::Composite, cases_text(), "a3f2", &[], &sharing);
+        let lines = |groups: &[PaneGroup], n: &str| groups.iter().find(|g| g.name == n).map(|g| g.lines.clone()).unwrap_or_default();
+        let by: Vec<(String, String)> = lines(&groups, "Used by").iter().map(|l| (l.name.clone(), l.value.clone())).collect();
+        assert_eq!(by, [("acme/app".to_owned(), "v1 · 0123456789ab · 3 runs".to_owned())]);
+        let access = lines(&groups, "Settings").into_iter().find(|l| l.key == "settings.access").map(|l| (l.value, l.state));
+        assert_eq!(access, Some(("shared with acme's repositories".to_owned(), Some("owner"))));
+        let none = Sharing { repo: "acme/kit", access: Access::None, used_by: &[] };
+        let groups = action_groups(&Action::default(), Kind::Composite, "", "a3f2", &[], &none);
+        assert_eq!(lines(&groups, "Used by").first().map(|l| (l.kind, l.state)), Some(("note", Some("none"))));
+        assert_eq!(lines(&groups, "Settings").first().map(|l| l.state), Some(Some("none")));
+
+        let call = "on:\n  workflow_call:\njobs:\n  b:\n    runs-on: local\n    steps:\n      - run: echo\n";
+        let (_, w) = crate::wf::check_model(".github/workflows/build.yml", call, None);
+        let groups = workflow_groups(&w.unwrap_or_default(), call, &[], true, "", Some(&sharing));
+        let names: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names.iter().rev().take(2).copied().collect::<Vec<_>>(), ["Settings", "Used by"], "{names:?}");
+        assert!(lines(&groups, "Settings").iter().any(|l| l.key == "settings.access" && l.state == Some("owner")));
+        let push = "on: push\njobs:\n  b:\n    runs-on: local\n    steps:\n      - run: echo\n";
+        let (_, w) = crate::wf::check_model(".github/workflows/ci.yml", push, None);
+        let plain = workflow_groups(&w.unwrap_or_default(), push, &[], true, "", Some(&sharing));
+        assert!(!plain.iter().any(|g| g.name == "Used by"), "a workflow no one calls has no Used by");
+
+        let shared = Repo::new("acme/kit".into(), "main".into(), "a".repeat(40), vec![], Access::Owner);
+        let head: Value = serde_json::from_str(&shared.whole).unwrap_or_default();
+        assert_eq!(head.get("access"), Some(&json!("owner")), "{head}");
+        assert!(shared.say.starts_with("shared"), "{}", shared.say);
+        let mine = Repo::new("acme/app".into(), "main".into(), "a".repeat(40), vec![], Access::None);
+        assert!(!mine.say.contains("shared"), "{}", mine.say);
     }
 
     fn cases_text() -> &'static str {
@@ -1440,7 +1523,7 @@ mod tests {
     fn w29_r10_a_draft_in_review_is_its_authors() {
         let mk = |name: &str, kind: Kind| Row::new(Facts { name: name.into(), path: format!(".github/workflows/{name}.yml"), ..facts(kind) }, Some("gha"), String::new(), None, None);
         let review = mk("stress", Kind::Workflow).drafted(DraftOf { id: "d3".into(), state: Draft::Review, author: "ada".into(), change: Some(DraftChange { kind: "change", name: "#5".into(), url: Some("https://github.com/acme/app/pull/5".into()) }) });
-        let repo = Repo::new("acme/app".into(), "main".into(), "a".repeat(40), vec![mk("ci", Kind::Workflow), review]);
+        let repo = Repo::new("acme/app".into(), "main".into(), "a".repeat(40), vec![mk("ci", Kind::Workflow), review], Access::None);
         assert_eq!(repo.authors, ["ada"]);
         // Everyone else is asked to review it.
         let them = list(std::slice::from_ref(&repo), None, None, None);

@@ -315,7 +315,8 @@ async fn gather(hub: &Hub, repo: &Repo, env: &Env) -> anyhow::Result<Option<Held
     for d in crate::ci::pipeline_drafts::open_in(hub, &repo.name).await.unwrap_or_default() {
         rows.push(draft_row(hub, repo, &d, &ctx, env).await.0);
     }
-    let view = core::Repo::new(repo.name.clone(), branch, sha, rows);
+    let access = crate::ci::sharing::access_of(hub, repo).await;
+    let view = core::Repo::new(repo.name.clone(), branch, sha, rows, access);
     let digest = view.digest;
     Ok(Some(Held { view, at: Instant::now(), digest }))
 }
@@ -434,19 +435,36 @@ pub async fn get(hub: &Arc<Hub>, owner: &str, name: &str, q: &HashMap<String, St
         Some(l) => {
             let row = workflow_row(&repo, l, &ctx, &env, &commit.github_note);
             let runs = runs_list(hub, &repo, &branch, path).await.map_err(internal)?;
-            let groups = l.workflow.as_ref().map(|w| core::workflow_groups(w, &text, &runs, l.runs, &commit.github_note)).unwrap_or_default();
+            let (access, used) = used_by(hub, &repo, path, false).await;
+            let sharing = core::Sharing { repo: &repo.name, access, used_by: &used };
+            let groups = l.workflow.as_ref().map(|w| core::workflow_groups(w, &text, &runs, l.runs, &commit.github_note, Some(&sharing))).unwrap_or_default();
             (row, groups)
         }
         None => {
             let (action, diags) = wf::parse_action(&text);
             let row = action_row(path, action.as_ref(), &diags, &ctx, &env);
-            let groups = action.as_ref().map(|a| core::action_groups(a, row.facts.kind, &text, &sha, &ctx.versions)).unwrap_or_default();
+            let (access, used) = used_by(hub, &repo, path, true).await;
+            let sharing = core::Sharing { repo: &repo.name, access, used_by: &used };
+            let groups = action.as_ref().map(|a| core::action_groups(a, row.facts.kind, &text, &sha, &ctx.versions, &sharing)).unwrap_or_default();
             (row, groups)
         }
     };
     let by_hand = runs_by_hand(commit.workflows.iter().find(|l| l.path == path));
     let pane = core::pane_json(&core::Opened { repo: &full, row: &row, at: &at, sha: &sha, text: &text, viewer, by_hand }, &groups);
     Ok(srv::json(StatusCode::OK, &pane))
+}
+
+/// What sharing says of `path` in `repo`'s pane (W29-R17, R20): the repository's Access, and which
+/// repositories' runs pinned it (an action by its directory, as `uses:` names it; a workflow by
+/// its file).
+async fn used_by(hub: &Hub, repo: &Repo, path: &str, action: bool) -> (kiln_ci::sharing::Access, Vec<kiln_ci::catalog::Consumer>) {
+    let access = crate::ci::sharing::access_of(hub, repo).await;
+    let at = if action { path.rsplit_once('/').map_or("", |(dir, _)| dir) } else { path };
+    let used = crate::ci::catalog::consumers(hub, &repo.name, Some(at)).await.unwrap_or_else(|e| {
+        tracing::warn!(repo = %repo.name, %path, error = %format!("{e:#}"), "who uses it couldn't be read");
+        Vec::new()
+    });
+    (access, used)
 }
 
 /// Whether a workflow runs by hand: it has `workflow_dispatch` (kiln's `manual` reads as it).
@@ -465,11 +483,13 @@ async fn draft_pane(hub: &Hub, repo: &Repo, id: &str, path: &str, viewer: core::
     let env = Env::read(hub).await;
     let (row, read) = draft_row(hub, repo, &d, &ctx, &env).await;
     let (head, text, loaded) = read.ok_or_else(|| (StatusCode::BAD_GATEWAY, format!("kiln can't read the draft's head on {}'s host yet", repo.name)))?;
+    let (access, used) = used_by(hub, repo, path, loaded.is_none()).await;
+    let sharing = core::Sharing { repo: &repo.name, access, used_by: &used };
     let groups = match &loaded {
-        Some(l) => l.workflow.as_ref().map(|w| core::workflow_groups(w, &text, &[], true, "")).unwrap_or_default(),
+        Some(l) => l.workflow.as_ref().map(|w| core::workflow_groups(w, &text, &[], true, "", Some(&sharing))).unwrap_or_default(),
         None => {
             let (action, _) = wf::parse_action(&text);
-            action.as_ref().map(|a| core::action_groups(a, row.facts.kind, &text, &head, &ctx.versions)).unwrap_or_default()
+            action.as_ref().map(|a| core::action_groups(a, row.facts.kind, &text, &head, &ctx.versions, &sharing)).unwrap_or_default()
         }
     };
     let at = d.branch.clone().or_else(|| d.name.clone()).unwrap_or_else(|| head.clone());

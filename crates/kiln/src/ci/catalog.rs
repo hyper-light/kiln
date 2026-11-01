@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use http::StatusCode;
-use kiln_ci::catalog::{Entry, Filter};
+use kiln_ci::catalog::{Consumer, Entry, Filter};
 use kiln_ci::expr::Dialect;
 use kiln_ci::sharing::Access;
 use kiln_ci::wf::Workflow;
@@ -204,7 +204,7 @@ async fn checks_at(hub: &Hub, repo_id: &str, sha: &str) -> anyhow::Result<Vec<Va
 
 /// Which repositories' runs pinned which version of `full`'s `path` (any of its paths without
 /// one), most recent first.
-async fn consumers(hub: &Hub, full: &str, path: Option<&str>) -> anyhow::Result<Vec<Value>> {
+pub(crate) async fn consumers(hub: &Hub, full: &str, path: Option<&str>) -> anyhow::Result<Vec<Consumer>> {
     let (publisher, path) = (full.to_ascii_lowercase(), path.map(str::to_owned));
     hub.store
         .call(move |c| {
@@ -213,7 +213,7 @@ async fn consumers(hub: &Hub, full: &str, path: Option<&str>) -> anyhow::Result<
                  WHERE u.publisher = ?1 AND (?2 IS NULL OR u.path = ?2) GROUP BY u.repo_id, u.path, u.git_ref, u.sha ORDER BY MAX(u.at) DESC LIMIT 200",
             )?;
             let rows = st.query_map(params![publisher, path], |r| {
-                Ok(json!({ "repo": r.get::<_, String>(0)?, "path": r.get::<_, String>(1)?, "kind": r.get::<_, String>(2)?, "ref": r.get::<_, String>(3)?, "sha": r.get::<_, String>(4)?, "runs": r.get::<_, i64>(5)?, "last_at": r.get::<_, i64>(6)? }))
+                Ok(Consumer { repo: r.get(0)?, path: r.get(1)?, kind: r.get(2)?, git_ref: r.get(3)?, sha: r.get(4)?, runs: r.get(5)?, last_at: r.get(6)? })
             })?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
