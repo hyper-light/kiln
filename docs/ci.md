@@ -10249,6 +10249,8 @@ lockfile, which pins commit A. An attacker moves `v45` and `v45.0.7` to commit M
      warning on the run;
    - had it named `v45.0.7`, the run is refused before any job starts: the full version moved from
      the locked A.
+   - a `.kiln/` workflow, which GitHub's lockfile doesn't cover, is held the same way by
+     `.kiln/lock` (W29-R24); so is a reusable workflow from another repository that uses the action.
 3. Either way M never runs. If M is reachable only from a fork, or not from the tag's own history,
    even a lock naming M is refused (W29-R23).
 4. Without a lock, under `require_lock: enforce`, the run is refused before any job starts: the
