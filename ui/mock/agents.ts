@@ -1061,6 +1061,38 @@ function codexKids() {
   variantIn(m);
 }
 
+/**
+ * An Antigravity agent working through two subagents of its own (`POST /api/mock/agy-kids`), for the
+ * tests of holding an Antigravity subagent (kiln's hook in agy's hooks.json): its web search is held
+ * call by call, as its other tools are. Taken back with the variants.
+ */
+function agyKids() {
+  const t = Date.now() - 10 * 60_000;
+  const m = member("agy-kids", "codex", "local", "Cache audit", "running", "accept-edits", "Audit the cache layer.", "Two subagents are looking into it.", {
+    doing: "Waiting for its subagents",
+  });
+  m.info.kind = "antigravity";
+  m.info.kind_name = "Antigravity CLI";
+  m.info.created_at = t;
+  const kid = (id: string, description: string, started: number): Task => ({
+    ...defaultTask(),
+    id,
+    tool_id: `agy-cb7d060c-${id.slice(-1) === "a" ? 2 : 5}`,
+    description,
+    class: "agent",
+    kind: "self",
+    status: "running",
+    background: true,
+    started,
+    last_tool: "read_file",
+    pausable: true,
+    takes: ["steer"],
+  });
+  m.tasks = [kid("ag-a", "Codebase Researcher", t + 60_000), kid("ag-b", "Cache Inspector", t + 120_000)];
+  leaves(m);
+  variantIn(m);
+}
+
 /** What a person lets one of them do (`Command::Perms`), or one of its harness's own (`task`), as kiln keeps it. */
 function permsMember(m: Member, perms: Perms | undefined, task?: string) {
   if (task) {
@@ -2206,6 +2238,11 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
   }
   if (p === "/api/mock/codex-kids" && m === "POST") {
     codexKids();
+    json(res, 200, {});
+    return true;
+  }
+  if (p === "/api/mock/agy-kids" && m === "POST") {
+    agyKids();
     json(res, 200, {});
     return true;
   }
