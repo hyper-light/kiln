@@ -1613,6 +1613,15 @@ mod tests {
         Ok(())
     }
 
+    /// docs/sim.md's bug 17 (W05-R40, R02): the seed of E4.6's probe where a runner refused each
+    /// member of a gang in turn, still running what it had been told to stop, and the gang, kept
+    /// off it, had no place for good.
+    #[test]
+    fn the_seed_where_a_gang_was_kept_off_a_runner_that_refused_it_settles() -> Result<(), String> {
+        run(9610, 0).map_err(|why| format!("seed 9610: {why}"))?;
+        Ok(())
+    }
+
     /// docs/needs.md E1.6: a seed runs the same every time.
     #[test]
     fn a_sched_seed_replays_exactly() -> Result<(), String> {

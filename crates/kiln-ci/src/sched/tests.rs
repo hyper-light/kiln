@@ -3193,6 +3193,35 @@ fn w05_r40_a_member_lost_after_a_restart_its_mate_ended_before_is_not_tried_alon
     assert_eq!(s.check_grants(), Ok(()));
 }
 
+/// W05-R40, R02 (docs/sim.md's bug 17): a gang of two on two one-slot runners, each member refused
+/// by the same runner in turn (as one still running what it was told to stop refuses): kept off it,
+/// the gang has no place, and would wait for good. Its refusals are forgiven once it has no place
+/// without them, and it starts; while it has one, a refused member goes elsewhere.
+#[test]
+fn w05_r40_a_gang_kept_off_a_runner_that_refused_it_goes_back_when_it_has_no_place_without() {
+    let mut s = Scheduler::new(Config::default());
+    for r in ["a", "b"] {
+        s.handle(Input::RunnerUp(Box::new(linux(r, 1))), 0);
+    }
+    for m in ["m0", "m1"] {
+        s.handle(Input::LegQueued(Box::new(member(m, "pair", 2))), 1);
+    }
+    let on = |s: &Scheduler, runner: &str| ["m0", "m1"].into_iter().find_map(|m| s.grant(m).and_then(|g| g.1).filter(|(r, _)| *r == runner).map(|(_, f)| (m.to_owned(), f)));
+    // The member on a is refused there: the gang goes again once the lock-delay has passed, by
+    // which a has stopped its mate, the refused one on b now.
+    let (first, fence) = on(&s, "a").unwrap_or_default();
+    s.handle(Input::Rejected { leg: first.clone(), fence }, 2);
+    assert_eq!(assigned(&s.handle(Input::Tick, 15_003)).len(), 2, "granted again whole");
+    assert_eq!(on(&s, "b").map(|(m, _)| m), Some(first.clone()), "{first}, refused by a, goes to b");
+    // Its mate, on a now, is refused there too: kept off a, neither has a place; forgiven, the
+    // gang starts.
+    let (second, fence) = on(&s, "a").unwrap_or_default();
+    assert_ne!(second, first);
+    s.handle(Input::Rejected { leg: second, fence }, 20_000);
+    assert_eq!(assigned(&s.handle(Input::Tick, 35_001)).len(), 2, "granted again whole, its refusals forgiven");
+    assert_eq!(s.check_grants(), Ok(()));
+}
+
 /// W05-R39, R40 (docs/sim.md's bug 14): two whole gangs of a class, the second's room kept from
 /// when an exclusive leg ends, the first whole only after: when it ends, the first, with room by
 /// room alone, isn't the first of the class waiting for room, so the class's room is worked out

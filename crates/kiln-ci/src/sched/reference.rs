@@ -1177,7 +1177,7 @@ impl Reference {
         if !self.whole(g) {
             return false;
         }
-        let Some(plan) = self.gang_plan(g) else { return false };
+        let Some(plan) = self.gang_plan(g).or_else(|| self.forgiven_plan(g)) else { return false };
         if let Some(c) = self.gangs.get_mut(g) {
             c.ended = false;
         }
@@ -1186,6 +1186,29 @@ impl Reference {
             self.assign(&m, &r, now, None);
         }
         true
+    }
+
+    /// A whole gang with no place while its members stay off runners that refused them: its place
+    /// with those refusals forgiven, if it then has one.
+    fn forgiven_plan(&mut self, g: &str) -> Option<Vec<(String, String)>> {
+        let refused: Vec<(String, (String, Off))> = self.crew_queued(g).into_iter().filter_map(|m| self.legs.get(&m).and_then(|l| l.avoid.clone()).filter(|(_, off)| *off == Off::Refused).map(|a| (m, a))).collect();
+        if refused.is_empty() {
+            return None;
+        }
+        for (m, _) in &refused {
+            if let Some(l) = self.legs.get_mut(m) {
+                l.avoid = None;
+            }
+        }
+        let plan = self.gang_plan(g);
+        if plan.is_none() {
+            for (m, a) in refused {
+                if let Some(l) = self.legs.get_mut(&m) {
+                    l.avoid = Some(a);
+                }
+            }
+        }
+        plan
     }
 
     /// The grants of a gang's members other than `but`, refused, are taken back: each queued again

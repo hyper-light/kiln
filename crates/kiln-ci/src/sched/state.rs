@@ -3900,7 +3900,7 @@ impl Scheduler {
         if !self.whole(g) {
             return false;
         }
-        let Some(plan) = self.gang_plan(g) else { return false };
+        let Some(plan) = self.gang_plan(g).or_else(|| self.forgiven_plan(g)) else { return false };
         #[cfg(any(test, feature = "mutants"))]
         let plan = {
             let mut plan = plan;
@@ -3917,6 +3917,32 @@ impl Scheduler {
             self.assign(&m, &r, now, out);
         }
         true
+    }
+
+    /// Where a whole gang that can't start now while its members stay off the runners that refused
+    /// them (W05-R02) would start with those refusals forgiven, if it then can (W05-R40). A runner
+    /// refuses a member it has no room for, as one still running what was taken back, which the
+    /// lock-delay its gang waited has seen stopped; kept off it, a gang that needs it never starts
+    /// (found by docs/sim.md's model).
+    fn forgiven_plan(&mut self, g: &str) -> Option<Vec<(String, String)>> {
+        let refused: Vec<(String, (String, Off))> = self.crew_queued(g).into_iter().filter_map(|m| self.legs.get(&m).and_then(|l| l.avoid.clone()).filter(|(_, off)| *off == Off::Refused).map(|a| (m, a))).collect();
+        if refused.is_empty() {
+            return None;
+        }
+        for (m, _) in &refused {
+            if let Some(l) = self.legs.get_mut(m) {
+                l.avoid = None;
+            }
+        }
+        let plan = self.gang_plan(g);
+        if plan.is_none() {
+            for (m, a) in refused {
+                if let Some(l) = self.legs.get_mut(&m) {
+                    l.avoid = Some(a);
+                }
+            }
+        }
+        plan
     }
 
     /// A leg of a gang joins it (W05-R40): the gang is as big as its members say it is.
