@@ -10047,6 +10047,220 @@ endpoint, for a repository kiln hosts and for one on GitHub:
 | 8 | The row without DRAFT | R03 | the read model gathers again on the default branch's move; the `pipelines` event | the same |
 | — | Discard, at any step | R13 | `{verb: "discard"}` → `ci.diffs.abandon` | `{verb: "discard"}` → `close_change`, `delete_branch` |
 
+**Requirements: sharing, releases and updates**
+
+- **W29-R17 Access** (GitHub's model, in kiln's terms). Each repository says who may use its actions
+  and reusable workflows:
+  - **not shared**, the default, as GitHub's "Not accessible";
+  - **this owner's repositories**, as GitHub's "Accessible from repositories owned by" a user or
+    "in the organization": the owner is the name's first half;
+  - **everyone on this kiln**, as GitHub's enterprise level, or a public repository.
+
+  Where it's kept:
+  - A repository kiln hosts keeps it in `.kiln/config.yaml` on its default branch: `share: none |
+    owner | everyone`. It's read from trunk, as all policy is, and Pipelines' Settings writes it as
+    a draft (W29-R10, R11).
+  - For a repository on GitHub, kiln reads GitHub's own setting
+    (`GET /repos/{owner}/{repo}/actions/permissions/access`) when it holds a credential (W23-R10).
+    Without one it reads `.kiln/config.yaml`, and treats a public repository as everyone's.
+
+  A use the setting doesn't allow is refused when the run starts, naming the repository, its
+  setting and the caller. GitHub-exact for what GitHub's levels cover; "everyone on this kiln" is
+  kiln's.
+- **W29-R18 Plain names find kiln's own copy.** `uses: owner/repo[/path]@ref`, for an action or a
+  reusable workflow, resolves to the repository kiln hosts under that name when there is one.
+  Otherwise it comes from GitHub, or wherever `[[ci.actions.sources]]` says (W07-R02).
+  - So one file runs on kiln and on GitHub unchanged, wherever the repository lives.
+  - `kiln://owner/repo[/path]@ref` stays, to say kiln's own explicitly.
+  - Kiln-hosted first is kiln's addition. It's a deviation only where kiln hosts a repository
+    GitHub also has under the same name, and then it's the same repository.
+- **W29-R19 One owner check for actions and reusable workflows.** W29-R17's check runs on every
+  `uses:` a run can reach: steps, composite actions' own, and jobs' reusable workflows, nested.
+  - Today `reusable.rs` pins a reusable workflow (`actions::pin_ref`) without the check `kiln://`
+    actions get (`Remote::usable_by`). That's the audit's likely defect, and a test shows it first.
+  - A refused call fails the run at its start, GitHub-exact, with "`owner/repo/.github/workflows/x.yml`
+    isn't shared with `caller`".
+- **W29-R20 The catalog.** `GET /api/ci/actions?q=&kind=&owner=` (`ci.actions.list`, grown) lists:
+  - the built-ins and GitHub's mirrored actions, as today;
+  - the actions of every repository kiln hosts that the caller may use, in any path (`action.yml`
+    at the root, `.github/actions/**`, `.kiln/actions/**`);
+  - every reusable workflow (a workflow `on: workflow_call`), with its inputs, outputs and secrets.
+
+  `GET /api/ci/actions/:owner/:repo?path=` (`ci.actions.get`, new) gives one action or reusable
+  workflow:
+  - its versions: its tags, each with its commit and its own checks;
+  - its access (W29-R17);
+  - its consumers: which repositories use which version, from runs' pins (W07-R02) and consumers'
+    locks (W29-R23, R24).
+
+  It feeds the editor's completion (W21-R01, W07-R12) and the pane's Uses, Versions and Used by
+  groups (W29-R04). kiln's addition: GitHub's Marketplace lists public actions, not what an
+  organization's repositories share.
+- **W29-R21 Release by tag.** `POST /api/ship/pipelines { verb: "release", repo, sha, tag, major? }`
+  goes to `ci.releases.tag`, new.
+  - It's asked again in the strip (Keep · Release), saying what the release changes for consumers
+    (W29-R22).
+  - **A tag is the whole repository's**, as on GitHub: every action and reusable workflow in it
+    gets it.
+  - **What it makes:** an annotated tag at a commit whose own checks passed (otherwise it asks
+    again, saying which failed).
+    - In a repository kiln hosts, through its hosting (W14).
+    - On GitHub, a tag and a GitHub Release, immutable where the repository has GitHub's immutable
+      releases on.
+  - **Full versions** (`v2.4.1`) never move or go in a repository kiln hosts: its push policy
+    refuses a move or a delete, and the name can't be used again. That's kiln's addition, matching
+    GitHub's immutable releases.
+  - **Floating versions** (`v2`, `v2.4`) may move, and only by Release, which says so.
+- **W29-R22 Update drafts for consumers.** Opt-in per consumer, from its `.kiln/config.yaml`:
+  `updates: { actions: on, cooldown: 3d, group: weekly }`.
+  - When a new full version of something it uses is released, after the cooldown, kiln opens an
+    update draft (W29-R10) in that repository. It moves the `uses:` refs and regenerates its locks
+    (W29-R25).
+  - The draft's pane says what changes for that repository:
+    - inputs added, removed or newly required;
+    - secrets the action declares (W07-R11);
+    - permissions;
+    - egress (W29-R29);
+    - its plan's difference (W29-R07);
+    - the upstream code's diff between the two commits, read from kiln's mirror.
+  - Grouping puts several updates in one draft.
+  - GitHub's Dependabot does this on GitHub, and regenerates the lockfile in the same pull request.
+    A consumer on GitHub gets kiln's draft as a draft pull request of the same shape. kiln's
+    addition, in Dependabot's shape.
+  - A tag that moves is never a release: no update follows it (W29-R26).
+
+**Requirements: locks**
+
+- **W29-R23 GitHub's lockfile, honored exactly.** `.github/workflows/actions.lock` (GA 2026-10-28,
+  written by `gh actions-lock`). For each workflow onboarded to it:
+  - every action it depends on, transitive ones included, must be in the lock, or the run is
+    refused before any job starts;
+  - the locked commit is what runs, and what the action policy checks (W07-R04);
+  - that commit must be reachable from the recorded branch or tag in the action's own repository:
+    one only in a fork, or no longer reachable, is refused;
+  - the recorded `owner_id` and `repo_id` must still name that repository (GitHub's numeric ids,
+    read from GitHub's API by the mirror);
+  - a full version tag that moved is an error until relocked; a branch or partial version keeps
+    its locked commit, with a warning;
+  - locked entries satisfy `require_sha_pins` (KCI4021).
+
+  Like GitHub's, it doesn't lock reusable workflow calls or container images: W29-R24 does.
+  Repositories kiln hosts use kiln's own repository ids where GitHub's would be. `gh actions-lock`
+  stays usable, and kiln reads and writes its format. GitHub-exact.
+- **W29-R24 kiln's lock, for what GitHub's leaves out.** `.kiln/lock`: machine-written, sorted, never
+  edited by hand, and best under CODEOWNERS. It covers:
+  - cross-repository reusable workflows, with their own dependencies, seeded from the callee's lock
+    (the caller's lock wins);
+  - images by digest: `docker://` steps, `container:`, `services:`, Docker actions' `runs.image`
+    and their Dockerfiles' base images, and microVM actions' images (W29-R29, R30);
+  - the runtimes kiln provides: Node builds by SHA-256 (W07-R05) and executor images.
+
+  It reports, but doesn't lock, toolchains steps download (`setup-*`): those belong in projects'
+  own lockfiles. Where GitHub's lock and kiln's both cover a workflow they must agree, or the run
+  is refused with both entries shown. kiln's addition.
+- **W29-R25 kiln writes the locks.** Every draft kiln makes regenerates the lock entries of what it
+  touches, in the same draft: Save draft (W29-R11), New (W29-R08) and update drafts (W29-R22). So
+  nobody has to run `gh actions-lock`.
+  - The editor's "pin it" warning (KCI6002) offers "lock it".
+  - A lock never needs merging by hand. A conflict in a lock, on landing or on a replay (W26-R16),
+    is resolved by regenerating it from the merged workflows, as npm and pnpm do with theirs.
+  - `ci.locks.update` (new) regenerates a repository's locks into a draft. `ci.locks.verify` (new)
+    says whether they're stale, as `gh actions-lock --verify` does, so a required check can
+    verify them.
+  - A locked action's own update arrives only as a draft (W29-R22).
+  - "Rerun with fresh actions" (W07-R02) in a locked repository proposes a lock change rather than
+    going round the lock.
+  - kiln's addition: on GitHub, Dependabot regenerates the lockfile only for its own version updates.
+- **W29-R26 Requiring locks, and moved tags.** Opt-in, at the server (`[ci.locks] require`) and in a
+  repository's `.kiln/config.yaml` (`require_lock`):
+  - `report` annotates runs of workflows not locked or locked stale.
+  - `enforce` refuses them before any job starts. This is GitHub's "Require lockfile", with
+    report-only first, as GitHub's evaluate mode.
+
+  Apart from any lock, kiln keeps what every tag resolved to (W07-R04 audits each resolution). A
+  full version tag that now resolves to another commit is flagged:
+  - on the run;
+  - on the action's catalog entry (W29-R20);
+  - as a `tag_moved` notification (W19).
+
+  Under `enforce`, the run is refused even without a lock, as Go's checksum database refuses a
+  changed version. Accepting the new commit is a person's act, in a reviewed draft that shows the
+  code's diff. kiln's addition.
+
+**Requirements: code workflows**
+
+- **W29-R27 TypeScript workflows.** `.kiln/<name>.ts` is a new W02 file kind.
+  - It imports `@kiln/sdk`, whose types are generated from W02-R09's kiln-dialect JSON Schema and
+    served at `GET /api/ci/sdk/kiln.d.ts` for the editor.
+  - It's evaluated in the server's QuickJS sandbox, code mode's (`crates/kiln/src/mcp/code.rs`). It
+    has no I/O but the event and the tree's manifests, with bounded time and memory.
+  - Its default export is a kiln-dialect workflow as JSON, which W02 checks and W04 plans like any
+    `.kiln/*.yaml`. Diagnostics point at the TypeScript line.
+  - `POST /api/ci/plan-preview` takes its text, so the editor's Code view re-plans as you type
+    (W29-R07). "What it makes" shows the YAML it emits, which can be saved as a GitHub workflow for
+    repositories that also run on GitHub.
+  - kiln's addition: GitHub has no code workflows.
+- **W29-R28 Every other language.** A program in any language that prints kiln-dialect JSON (a
+  `.kiln/<name>.py`, `.go`, `.rs` …, or a manifest naming any program) runs in a plan leg:
+  - a no-network microVM or container, with the commit's tree read-only;
+  - `SOURCE_DATE_EPOCH` fixed, no secrets, bounded;
+  - keyed by its tree, its toolchain's digest and the event, so an unchanged program never plans
+    twice.
+
+  SDKs for each language are generated from the one schema and held to one conformance suite.
+  These are plan 01a174b2's steps 2 to 4. kiln's addition.
+
+**Requirements: microVM actions and templates**
+
+- **W29-R29 Firecracker actions.** `runs.using: firecracker` in `action.yml`, a kiln dialect key:
+  - `image` (a Dockerfile, or `docker://` an OCI image) is booted as a microVM of its own for each
+    call, on a runner with KVM (`executors has firecracker`, W13-R05);
+  - `resources: { cpus, memory }`;
+  - `egress: [hosts]`, through the leg's egress proxy, so nothing else leaves (W18);
+  - `args` and `entrypoint`;
+  - inputs as `INPUT_*`, outputs through `$GITHUB_OUTPUT`, the workspace mounted at
+    `/github/workspace`, as a Docker action's (W07-R06).
+
+  The editor warns when a workflow that also runs on GitHub uses one: GitHub's runner can't. kiln's
+  addition: GitHub's actions run only as JavaScript, Docker or composite.
+- **W29-R30 Shards actions.** `runs.using: shards`, the same contract on a shards microVM (an
+  Agentfile or an OCI image), on runners with `executors has shards`.
+  - Until Hex's shards executor is there (CP-T7.2), a plan refuses with "no machine runs shards
+    microVMs yet": the row's Can't run.
+  - Docker actions stay refused on shards legs (KCI4030, W07-R06).
+  - kiln's addition.
+- **W29-R31 Templates, settled.** W04-R25's job templates resolve as reusable workflows with kiln's
+  keys: `uses: ./templates/x.yaml` (in `.kiln/templates/`, which the loader now reads) and
+  `kiln://owner/repo/path@ref`, under W29-R17 and R19.
+  - A step's `uses:` of a template is refused (KCI4006), pointing to a composite action
+    (`.kiln/actions/<name>/action.yml`), which does the same.
+  - So the validator and the loader agree. kiln's dialect only, so kiln's addition.
+
+**The tj-actions replay, on paper.** This is W29's own test (scenario W29-S04). It shows that a
+moved tag never runs before a person accepts it.
+
+A consumer, `acme/app`, uses `tj-actions/changed-files@v45` in a workflow onboarded to GitHub's
+lockfile, which pins commit A. An attacker moves `v45` and `v45.0.7` to commit M (March 2025, CVE-2025-30066).
+
+1. kiln's mirror fetches the tags (W07-R03). The resolution record sees `v45.0.7` resolve to M where
+   it had resolved to A. It's flagged on the catalog entry, and `tag_moved` is sent (W29-R26, R20).
+2. A push to `acme/app` starts a run. The workflow is onboarded (W29-R23):
+   - its `uses:` names `v45`, a partial version, so the locked commit A runs, with a ref-moved
+     warning on the run;
+   - had it named `v45.0.7`, the run is refused before any job starts: the full version moved from
+     the locked A.
+3. Either way M never runs. If M is reachable only from a fork, or not from the tag's own history,
+   even a lock naming M is refused (W29-R23).
+4. Without a lock, under `require_lock: enforce`, the run is refused before any job starts: the
+   workflow isn't locked, and a full version's tag moved (W29-R26). Under `report`, the run is
+   annotated, and the moved full version is still refused by the opt-in moved-tag rule.
+5. kiln opens no update draft: a moved tag is not a release (W29-R22). Accepting M takes a person,
+   in a reviewed draft that shows the code's diff between A and M (W29-R25, R26).
+6. Had the attacker released a new tag, `v46` at M, consumers with updates on get a draft after the
+   cooldown. It shows M's diff, and nothing runs M until a person reviews and lands it (W29-R22).
+7. In a repository kiln hosts, moving `v45.0.7` is refused when it's pushed (W29-R21): the attack
+   can't begin there.
+
 **W29's routes, events and types**
 
 | Route or event | Operation | Gives |
@@ -10059,6 +10273,13 @@ endpoint, for a repository kiln hosts and for one on GitHub:
 | verb `discard` (W29-R13) | `ci.diffs.abandon`; `githost::close_change`, `delete_branch` | the change closed |
 | verb `run` (W29-R14) | `ci.runs.trigger`, grown: `sha`, `event`, `jobs` | the run |
 | verbs `turn_off`, `turn_on` (W29-R15) | `ci.workflows.disable`, `ci.workflows.enable`, new | the switch, who and why |
+| verb `settings` (W29-R16, R17, R22, R26) | `ci.workflows.edit`, grown to `.kiln/config.yaml`, as a draft | the draft |
+| verb `release` (W29-R21) | `ci.releases.tag`, new | the tag (and GitHub's release) |
+| `GET /api/ci/actions?q=&kind=&owner=` (W29-R20) | `ci.actions.list`, grown | actions and reusable workflows the caller may use |
+| `GET /api/ci/actions/:owner/:repo?path=` (W29-R20) | `ci.actions.get`, new | versions, access, consumers |
+| (W29-R25) | `ci.locks.update`, `ci.locks.verify`, new | a lock draft; whether locks are stale |
+| `GET /api/ci/sdk/kiln.d.ts` (W29-R27) | | the SDK's types for the editor |
+| notification `tag_moved` (W29-R26, W19) | | a full version that resolves to another commit |
 | event `pipelines { repo }` | | pages ask again |
 
 The TypeScript types (`ui/src/api/ship.ts`), each a Rust struct of `ship::pipelines`:
