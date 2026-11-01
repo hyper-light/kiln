@@ -68,7 +68,7 @@ const MIN = 12;
 export const GROW_MS = 600;
 
 const TAU = 2 * Math.PI;
-const smooth = (x: number) => (x <= 0 ? 0 : x >= 1 ? 1 : x * x * (3 - 2 * x));
+export const smooth = (x: number) => (x <= 0 ? 0 : x >= 1 ? 1 : x * x * (3 - 2 * x));
 const frac = (v: number) => v - Math.floor(v);
 export const easeOut = (x: number) => 1 - (1 - Math.min(1, Math.max(0, x))) ** 3;
 
@@ -127,7 +127,7 @@ export function cells(from: number, to: number, align: "start" | "end"): { was: 
   return [...b].map((now, i) => ({ was: (a[i] ?? " ").trim(), now: now.trim(), dir }));
 }
 
-const hash = (n: number) => {
+export const hash = (n: number) => {
   let x = Math.imul((n | 0) ^ 0x9e3779b9, 0x85ebca6b);
   x ^= x >>> 13;
   x = Math.imul(x, 0xc2b2ae35);
@@ -141,7 +141,7 @@ const noise = (seed: number, u: number) => {
   const k = g * g * g * (g * (g * 6 - 15) + 10);
   return 2 * (hash(seed + i) * (1 - k) + hash(seed + i + 1) * k) - 1;
 };
-const wander = (seed: number, u: number) => 0.7 * noise(seed, u) + 0.3 * noise(seed + 7777, 2.7 * u + 0.5);
+export const wander = (seed: number, u: number) => 0.7 * noise(seed, u) + 0.3 * noise(seed + 7777, 2.7 * u + 0.5);
 
 // ---- The string ---------------------------------------------------------------------------------
 
@@ -393,8 +393,8 @@ const LUTS = Object.fromEntries(
     return [stand, lut];
   }),
 ) as Record<Shown, Int32Array>;
-const mix = (c: number, r: number, g: number, b: number, k: number) => pack(((c >> 16) & 255) + (r - ((c >> 16) & 255)) * k, ((c >> 8) & 255) + (g - ((c >> 8) & 255)) * k, (c & 255) + (b - (c & 255)) * k);
-const dim = (c: number, k: number) => pack(((c >> 16) & 255) * k, ((c >> 8) & 255) * k, (c & 255) * k);
+export const mix = (c: number, r: number, g: number, b: number, k: number) => pack(((c >> 16) & 255) + (r - ((c >> 16) & 255)) * k, ((c >> 8) & 255) + (g - ((c >> 8) & 255)) * k, (c & 255) + (b - (c & 255)) * k);
+export const dim = (c: number, k: number) => pack(((c >> 16) & 255) * k, ((c >> 8) & 255) * k, (c & 255) * k);
 
 /** The ring's shimmer (console.css `ag-rim-shimmer`, played in reverse): three glints, unevenly spaced, passing at changing speeds and strengths. */
 const SHIMMER_O: readonly (readonly [number, number])[] = [[0, 0.45], [0.17, 1], [0.43, 0.3], [0.71, 0.8], [1, 0.45]];
@@ -417,12 +417,12 @@ const shimmer = (stand: Shown, t: number) => {
   return { o: keyed(SHIMMER_O, p) * RIM[stand].glint[3], rot: keyed(SHIMMER_R, p) };
 };
 /** A stretch's glints at a moment: how strong, and where round the ring each is. */
-type Shine = { o: number; at: readonly number[] };
-const shineOf = (stand: Shown, t: number): Shine => {
+export type Shine = { o: number; at: readonly number[] };
+export const shineOf = (stand: Shown, t: number): Shine => {
   const { o, rot } = shimmer(stand, t);
   return { o, at: GLINTS.map((g) => frac(g + rot)) };
 };
-function glintAt(sh: Shine, s: number) {
+export function glintAt(sh: Shine, s: number) {
   const c = frac(s / CYCLE);
   let best = 0;
   for (const g of sh.at) {
@@ -432,12 +432,12 @@ function glintAt(sh: Shine, s: number) {
   return smooth(best) * sh.o;
 }
 /** The ring's colour at `s` along a stretch at `t`, `grain` a particle's own lean round it, mixed toward the glint by `g`. */
-function colourAt(stand: Shown, s: number, t: number, grain: number, g: number) {
+export function colourAt(stand: Shown, s: number, t: number, grain: number, g: number) {
   const c = LUTS[stand][Math.floor(frac(s / CYCLE - t / RIM[stand].current + grain) * 255)] ?? 0;
   const [r, gg, b] = RIM[stand].glint;
   return g > 0 ? mix(c, r, gg, b, Math.min(1, g)) : c;
 }
-const glintColour = (stand: Shown) => pack(RIM[stand].glint[0], RIM[stand].glint[1], RIM[stand].glint[2]);
+export const glintColour = (stand: Shown) => pack(RIM[stand].glint[0], RIM[stand].glint[1], RIM[stand].glint[2]);
 
 // ---- Particles ----------------------------------------------------------------------------------
 
