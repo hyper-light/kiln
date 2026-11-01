@@ -277,6 +277,7 @@ classes! {
         ServerMsg::Observe { .. } => OBSERVE,
         ServerMsg::Unread { .. } => Class::Ack,
         ServerMsg::ReachRefused { .. } => REACH,
+        ServerMsg::Freeze { .. } => REFUSED,
     }
 }
 
@@ -322,6 +323,7 @@ classes! {
         Command::MaxSubagents { .. } => REFUSED,
         Command::MoveOnLimit { .. } => REFUSED,
         Command::LimitHold { .. } => REFUSED,
+        Command::OwnEdits { .. } => Class::Ask,
     }
 }
 

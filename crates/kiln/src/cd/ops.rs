@@ -123,6 +123,10 @@ pub fn ops() -> &'static [Op] {
                 input: crate::ops::Input::of::<input::CdAppsAutoRollback>(), run: auto_rollback),
             op!("cd.apps.set_auto_rollback", "Turn auto-rollback on or off for one app (`on`: true or false), or clear it (`on`: null) to follow its repository's, then its deploy file's. The app's word beats both.", ro: false, destructive: false,
                 input: crate::ops::Input::of::<input::CdAppsSetAutoRollback>(), run: set_auto_rollback),
+            op!("cd.apps.auto_sync", "Whether kiln syncs an app on its own whenever git changes what it renders, and whose word that is: `from` is `app` (a person set it) or `deploy-file` (its `sync.auto`). A person's word stands until the deploy file changes what it says (docs/ci.md W26-R27).", ro: true, destructive: false,
+                input: crate::ops::Input::of::<input::CdAppsAutoSync>(), run: auto_sync),
+            op!("cd.apps.set_auto_sync", "Turn auto-sync on or off for one app (`on`: true or false), or clear it (`on`: null) to follow its deploy file. It beats the deploy file until the file changes what it says; prune and self-heal keep their own settings.", ro: false, destructive: false,
+                input: crate::ops::Input::of::<input::CdAppsSetAutoSync>(), run: set_auto_sync),
             op!("cd.repos.auto_rollback", "Auto-rollback by repository: every repository apps deploy from and every one people set it for, each with its setting (null: not set) and how many apps follow it.", ro: true, destructive: false,
                 input: crate::ops::Input::of::<input::CdReposAutoRollback>(), run: repo_auto_rollbacks),
             op!("cd.repos.set_auto_rollback", "Turn auto-rollback on or off for every app a repository deploys (`on`: true or false), or clear it (`on`: null). An app's own setting beats its repository's. A person's to change.", ro: false, destructive: false,
@@ -515,6 +519,24 @@ pub mod input {
     pub struct CdAppsAutoRollback {
         /// The app's id, `project/name` (a bare name means the default project).
         pub app: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdAppsAutoSync {
+        /// The app's id, `project/name` (a bare name means the default project).
+        pub app: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdAppsSetAutoSync {
+        /// The app's id, `project/name` (a bare name means the default project).
+        pub app: String,
+        /// true, false, or null to clear.
+        #[serde(deserialize_with = "crate::ops::present")]
+        #[schemars(required, extend("type" = ["boolean", "null"]))]
+        pub on: Option<bool>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
@@ -918,7 +940,7 @@ async fn list(cx: Cx, q: Value) -> Out {
             next = last.cloned();
             break;
         }
-        items.push(app_row(e, statuses.get(id.as_str()), pins.get(id.as_str())));
+        items.push(app_row(e, statuses.get(id.as_str()), pins.get(id.as_str()), cx.cd.auto_sync_of(id, &e.def).on));
         last = Some(id);
     }
     Ok(json!({"apps": items, "next": next}))
@@ -941,13 +963,13 @@ async fn list_sorted(cx: Cx, q: Value, sort: String) -> Out {
     rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
     let after = str_in(&q, "cursor").and_then(|c| c.split_once('\t')).map(|(r, id)| (r.to_owned(), id.to_owned()));
     let start = after.map_or(0, |(r, id)| rows.partition_point(|x| (x.0.as_str(), x.1.as_str()) <= (r.as_str(), id.as_str())));
-    let page: Vec<Value> = rows.iter().skip(start).take(limit).map(|(_, id, e)| app_row(e, statuses.get(id.as_str()), pins.get(id.as_str()))).collect();
+    let page: Vec<Value> = rows.iter().skip(start).take(limit).map(|(_, id, e)| app_row(e, statuses.get(id.as_str()), pins.get(id.as_str()), cx.cd.auto_sync_of(id, &e.def).on)).collect();
     let next = (rows.len() > start + limit).then(|| rows.get(start + limit - 1).map(|(r, id, _)| format!("{r}\t{id}"))).flatten();
     Ok(json!({"apps": page, "next": next}))
 }
 
 /// An app as lists show it.
-pub fn app_row(e: &AppEntry, s: Option<&Summary>, pin: Option<&state::Pin>) -> Value {
+pub fn app_row(e: &AppEntry, s: Option<&Summary>, pin: Option<&state::Pin>, auto: bool) -> Value {
     let unknown = || json!({"sync": Sync::Unknown.as_str(), "health": Health::Unknown.as_str()});
     let mut row = s.map(super::summary_json).unwrap_or_else(unknown);
     if let Some(m) = row.as_object_mut() {
@@ -957,7 +979,8 @@ pub fn app_row(e: &AppEntry, s: Option<&Summary>, pin: Option<&state::Pin>) -> V
         m.insert("cluster".into(), json!(e.def.destination.cluster));
         m.insert("namespace".into(), json!(e.def.destination.namespace));
         m.insert("environment".into(), json!(e.def.environment));
-        m.insert("auto".into(), json!(e.def.sync.auto));
+        // Its auto-sync as it stands: a person's word, else its deploy file's (W26-R27).
+        m.insert("auto".into(), json!(auto));
         m.insert("labels".into(), json!(e.def.labels));
         m.insert("origin".into(), origin(&e.def.origin));
         m.insert("shadow".into(), json!(super::is_shadow(&e.def)));
@@ -986,7 +1009,7 @@ async fn get(cx: Cx, v: Value) -> Out {
         Some((url, sha)) => cx.cd.live.commit(&cx.cd, &url, &sha).await,
         None => None,
     };
-    let mut out = app_row(&entry, status.as_ref(), pin.as_ref());
+    let mut out = app_row(&entry, status.as_ref(), pin.as_ref(), cx.cd.auto_sync_of(&id, &entry.def).on);
     if let Some(m) = out.as_object_mut() {
         m.insert("definition".into(), serde_json::to_value(&entry.def).unwrap_or(Value::Null));
         m.insert("commits".into(), json!(entry.commits));
@@ -996,6 +1019,7 @@ async fn get(cx: Cx, v: Value) -> Out {
         let artifacts = entry.key.and_then(|k| entry.resolved.iter().find(|r| r.key == k)).map(|r| r.artifacts.clone()).unwrap_or_default();
         m.insert("artifacts".into(), json!(artifacts));
         m.insert("auto_rollback".into(), cx.cd.auto_rollback_of(&id, &entry.def).json());
+        m.insert("auto_sync".into(), cx.cd.auto_sync_json(&id, &entry.def));
     }
     Ok(out)
 }
@@ -1203,6 +1227,10 @@ async fn resource_logs(cx: Cx, v: Value) -> Out {
     let id = app_id(&v)?;
     exists(&cx.cd, &id)?;
     let k = res_key(&v)?;
+    // What a runner's job made (a Compose project, a host's service): read on its hosts (W26-R26).
+    if super::logs::on_runners(&k) {
+        return super::logs::read(&cx.hub, &cx.cd, &id, &k, &super::logs::ask_of(&v, false)).await;
+    }
     let (t, ids, all) = log_pods(&cx.cd, &id, &k, str_in(&v, "pod")).await?;
     let pods: Vec<&kiln_cd::tree::Node> = ids.iter().filter_map(|i| t.tree.nodes.iter().find(|n| n.id == *i)).collect();
     let q = super::live::LogQuery::from_json(&v);
@@ -1543,7 +1571,9 @@ async fn rollback(cx: Cx, v: Value) -> Out {
         (None, Some(r)) => format!(" ({})", r.get(..12).unwrap_or(r)),
         _ => String::new(),
     };
-    audit(&cx, "cd.rollback", format!("{id} to deployment {to}{what}")).await;
+    // A commit no deployment ran (W26-R25) is gone back to by its commit.
+    let to = if to == 0 { "a commit never deployed".to_owned() } else { format!("deployment {to}") };
+    audit(&cx, "cd.rollback", format!("{id} to {to}{what}")).await;
     Ok(out)
 }
 
@@ -1559,11 +1589,18 @@ pub(super) async fn roll_back(cd: &Arc<Cd>, id: &str, to: Option<u64>, revision:
     }
     not_syncing(cd, &id)?;
     let history = cd.store.read(|d| d.history.get(&id).cloned().unwrap_or_default());
-    let (n, tag) = super::rollback::target(cd, &id, &def, &history, to, revision).await?;
-    let target = history.iter().find(|d| d.id == n).ok_or_else(|| missing(format!("{id} has no deployment {n}")))?;
-    // Each source's commit; entries kept before kiln recorded them carry the revision only
-    // (`kiln_cd::rollback::renderable` let only a lone source's through).
-    let commits = if target.commits.is_empty() { vec![target.revision.clone()] } else { target.commits.clone() };
+    // A deployment of its history, or a commit none of them ran (docs/ci.md W26-R25): rendered
+    // anew, that source held at it and the others at their heads, its artifacts its own now.
+    let (target, commits, tag): (Option<&kiln_cd::state::Deployment>, Vec<Option<String>>, Option<String>) = match super::rollback::target(cd, &id, &def, &history, to, revision).await? {
+        super::rollback::Going::Deployment { id: n, tag } => {
+            let target = history.iter().find(|d| d.id == n).ok_or_else(|| missing(format!("{id} has no deployment {n}")))?;
+            // Each source's commit; entries kept before kiln recorded them carry the revision only
+            // (`kiln_cd::rollback::renderable` let only a lone source's through).
+            let commits = if target.commits.is_empty() { vec![target.revision.clone()] } else { target.commits.clone() };
+            (Some(target), commits, tag)
+        }
+        super::rollback::Going::Commit { source, commit, tag } => (None, kiln_cd::rollback::held_commits(def.sources.len(), source, &commit), tag),
+    };
     // A Kubernetes cluster's version and APIs shape the render; a target beyond Kubernetes has none.
     let (kube_version, api_versions) = if kiln_cd::providers::is_target(&def.destination.cluster) {
         (None, Vec::new())
@@ -1585,11 +1622,17 @@ pub(super) async fn roll_back(cd: &Arc<Cd>, id: &str, to: Option<u64>, revision:
     // The pin holds while git renders what it rendered: the head's content before its artifacts,
     // as the source poll compares it. A rollback never waits for the head's artifacts: the head
     // may be what broke, or its image still building. The deployment's are exactly as recorded.
-    let (a, p) = cd.recorded_artifacts(&def, target.artifacts.clone(), &back.revision).await.map_err(|e| bad(format!("{e:#}")))?;
+    // A commit none of them ran has no artifacts recorded: its own, now (an image CI hasn't built
+    // for it says so).
+    let (a, p) = cd.recorded_artifacts(&def, target.map(|t| t.artifacts.clone()).unwrap_or_default(), &back.revision).await.map_err(|e| bad(format!("{e:#}")))?;
     back.add_artifacts(a, p);
     // Its secrets as its definition pins them now: a rollback doesn't bring back older values.
     back.add_secrets(cd.app_secrets(&def).await.map_err(|e| bad(format!("{e:#}")))?);
-    let pin = state::Pin { to: target.id, revision: target.revision.clone(), commits, head: head.content, by: Some(by.to_owned()), at_ms: super::now_ms() };
+    // What a commit renders the same as, when a deployment rendered it.
+    let same = target.is_none().then(|| kiln_cd::rollback::same_as(&history, back.key).map(|d| d.id)).flatten();
+    let revision = target.map_or_else(|| Some(back.revision.clone()), |t| t.revision.clone());
+    // A pin to a commit no deployment ran holds no deployment (`to` 0).
+    let pin = state::Pin { to: target.map_or(0, |t| t.id), revision: revision.clone(), commits: commits.clone(), head: head.content, by: Some(by.to_owned()), at_ms: super::now_ms() };
     propose(cd, Command::Pin { app: id.clone(), pin: Some(Box::new(pin)) }).await?;
     // The held inputs and their sync as one step: nothing syncs the app in between.
     let request = SyncRequest { prune, by: Some(by.to_owned()), trigger: Some(Trigger::Rollback), ..SyncRequest::default() };
@@ -1598,7 +1641,10 @@ pub(super) async fn roll_back(cd: &Arc<Cd>, id: &str, to: Option<u64>, revision:
         cd.keep_inputs(&id, &back);
         cd.input(Input::SyncTo { app: id.as_str().into(), revision: back.revision.as_str().into(), key: back.key, content: back.content, request });
     }
-    Ok(json!({"rolling_back": id, "to": target.id, "revision": target.revision, "commits": target.commits, "tag": tag}))
+    Ok(match target {
+        Some(t) => json!({"rolling_back": id, "to": t.id, "revision": t.revision, "commits": t.commits, "tag": tag}),
+        None => json!({"rolling_back": id, "to": null, "commit": revision, "revision": revision, "commits": commits, "tag": tag, "same_as": same}),
+    })
 }
 
 /// What an app can be rolled back to, newest first (`kiln_cd::rollback::candidates`), and what
@@ -1616,8 +1662,35 @@ async fn rollback_targets(cx: Cx, v: Value) -> Out {
         targets.push(super::rollback::row(&cx.cd, &def, d).await);
     }
     let shadow = super::is_shadow(&def);
+    // Its source's newest commits beside them: any of them can be gone back to (docs/ci.md W26-R25).
+    let commits = super::rollback::commits(&cx.cd, &def, &history).await;
     // The store keeps at least one, whatever the definition says (`Command::Deployed`).
-    Ok(json!({"app": id, "current": current, "targets": targets, "kept": def.history_limit.max(1), "shadow": shadow}))
+    Ok(json!({"app": id, "current": current, "targets": targets, "commits": commits, "kept": def.history_limit.max(1), "shadow": shadow}))
+}
+
+/// An app's auto-sync: whether kiln syncs it on its own, and whose word that is (W26-R27).
+async fn auto_sync(cx: Cx, v: Value) -> Out {
+    let id = app_id(&v)?;
+    let def = cx.cd.apps.read().get(&id).map(|e| e.def.clone()).ok_or_else(|| missing(format!("no app {id}")))?;
+    Ok(cx.cd.auto_sync_json(&id, &def))
+}
+
+/// Auto-sync set for one app, or cleared: kept in the store's settings with what its deploy file
+/// said then (so the file's word stands again once it changes), audited, and given to the engine
+/// at once.
+async fn set_auto_sync(cx: Cx, v: Value) -> Out {
+    let id = app_id(&v)?;
+    let on = on_in(&v)?;
+    let def = cx.cd.apps.read().get(&id).map(|e| e.def.clone()).ok_or_else(|| missing(format!("no app {id}")))?;
+    if super::is_shadow(&def) {
+        return Err(bad(format!("kiln doesn't deploy {id} (it shadows Argo CD's): take it over first")));
+    }
+    agents_may(&cx, &id, "change the auto-sync of")?;
+    let value = on.map_or(Value::Null, |on| json!(kiln_cd::autosync::Setting { on, by: Some(cx.actor.clone()), at_ms: super::now_ms(), file: def.sync.auto }));
+    propose(&cx.cd, Command::PutSetting(kiln_cd::autosync::app_setting(&id), value)).await?;
+    cx.cd.register(def.clone());
+    audit(&cx, "cd.auto_sync", format!("{id}: {}", on.map_or("cleared", |on| if on { "on" } else { "off" }))).await;
+    Ok(cx.cd.auto_sync_json(&id, &def))
 }
 
 /// An app's auto-rollback: whether kiln goes back on its own after a failure, and who said so.

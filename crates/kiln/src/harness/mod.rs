@@ -71,4 +71,5 @@ pub mod transcript;
 pub mod visuals;
 pub mod wait;
 pub mod webrtc;
+pub mod whose;
 pub mod worktree;

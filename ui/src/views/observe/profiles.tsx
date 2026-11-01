@@ -12,6 +12,7 @@ import { PageIntro, SelectField } from "@/components/ui/misc";
 import { Segmented } from "@/components/ui/tabs";
 import { useRes, type Res } from "@/lib/data";
 import { formatBytes } from "@/lib/format";
+import { useFieldText } from "@/lib/hooks";
 import { useCanvas } from "./heatmap";
 import { ObserveNav, RANGES, RangePicker, compact, formatSeconds, pollFor, useParam, useParams, useRange, type Range } from "./parts";
 import { PIE_HUES } from "./widgets";
@@ -164,7 +165,7 @@ export default function Profiles() {
           ]}
         />
         <RangePicker value={range} onChange={setRange} />
-        <Search key={q} q={q} onQ={(v) => set({ q: v || null, id: null })} />
+        <Search q={q} onQ={(v) => set({ q: v || null, id: null })} />
       </div>
       <Loadable key={`${range}/${q}`} label="the profiles' tags" fallback={<div className="mb-4 h-9" />}>
         <Facets range={range} q={q} onQ={(v) => set({ q: v || null, id: null })} />
@@ -197,7 +198,7 @@ export default function Profiles() {
 }
 
 function Search({ q, onQ }: { q: string; onQ: (q: string) => void }) {
-  const [text, setText] = React.useState(q);
+  const [text, setText] = useFieldText(q);
   return (
     <form
       className="field w-full sm:ml-auto sm:w-96"
@@ -318,7 +319,7 @@ function FlameSection({
           className="min-w-[14rem]"
         />
         <SelectField label="Compare with" value={against ?? ""} onChange={(v) => onAgainst(isAgainst(v) ? v : "", bq || q)} options={AGAINST} className="min-w-[12rem]" />
-        {against === "search" && <BaseSearch key={bq} bq={bq} onBq={(v) => onAgainst("search", v)} />}
+        {against === "search" && <BaseSearch bq={bq} onBq={(v) => onAgainst("search", v)} />}
       </div>
       {against ? (
         <Loadable key={`${keyOf(chosen)}/${against}/${bq}`} label="the comparison">
@@ -334,7 +335,7 @@ function FlameSection({
 }
 
 function BaseSearch({ bq, onBq }: { bq: string; onBq: (bq: string) => void }) {
-  const [text, setText] = React.useState(bq);
+  const [text, setText] = useFieldText(bq);
   return (
     <form
       className="field w-full sm:w-80"

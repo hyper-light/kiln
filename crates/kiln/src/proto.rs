@@ -487,6 +487,26 @@ pub struct IdentityGiven {
 /// [`CAP_CHANGES_PATCH`].
 pub const CAP_UNREAD: u64 = 1 << 41;
 
+/// [`AgentMsg::Caps`] capability: the runner answers [`ServerMsg::Workspace`]'s `commits`
+/// (`crate::workspace::Ask::Commits`): a branch's commits since its trunk, its session's own
+/// marked, and what picked ones change together, for the Changes tab's Commits (docs/agents.md).
+/// A runner without it isn't asked, and Commits says why. Bit 41 is [`CAP_UNREAD`].
+pub const CAP_WORKSPACE_COMMITS: u64 = 1 << 42;
+
+/// [`AgentMsg::Caps`] capability: the runner answers [`ServerMsg::Workspace`]'s `refs` and `compare`
+/// (`crate::workspace::Ask::Refs`, `Ask::Compare`): a repository's branches, tags and latest
+/// commits, and what changes from one point to another (the folder now, as its session began, a
+/// branch, tag or commit, an agent's files as it left them), for the Changes tab's Compare
+/// (docs/agents.md). Bit 42 is [`CAP_WORKSPACE_COMMITS`].
+pub const CAP_WORKSPACE_COMPARE: u64 = 1 << 43;
+
+/// [`AgentMsg::Caps`] capability: the runner freezes a job it runs where it runs, and lets it go on
+/// (Pause and Resume, docs/ci.md W26-R22; [`ServerMsg::Freeze`]). Runners on Unix and Windows say
+/// it; a server sends `Freeze` to no other. Bits 44 to 52 are kept for lines on their way: W27's
+/// (`CAP_AGENT_GIT`, `CAP_LEG_SIGNS`, `CAP_CUSTODY`) and the unification's, which held bits from 42
+/// on their branches before the Changes tab took 42 and 43.
+pub const CAP_FREEZE: u64 = 1 << 53;
+
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InstanceHello {
@@ -758,6 +778,11 @@ pub enum ServerMsg {
     /// To runners announcing [`CAP_UNREAD`], in place of [`ServerMsg::Reach`]'s `close`. Appended
     /// last: postcard encodes variants by index.
     ReachRefused { from: String, link: String, code: crate::reach::relay::Refusal, why: String },
+    /// CI (docs/ci.md W26-R22): job `job`, running there, frozen where it runs (`frozen`: its
+    /// steps' processes stopped, its job container paused, its time limit stopped) or let go on.
+    /// Answered once done, or refused saying why. Only to runners announcing [`CAP_FREEZE`].
+    /// Appended last: postcard encodes variants by index.
+    Freeze { job: String, frozen: bool },
 }
 
 /// What the server's copy of one agent session has of its events, said in digests
@@ -1228,9 +1253,11 @@ mod tests {
         assert_eq!(encode(&down)?.first(), Some(&62));
         assert_eq!(decode::<AgentMsg>(&encode(&up)?)?, up);
         assert_eq!(decode::<ServerMsg>(&encode(&down)?)?, down);
-        // Step 5 appended `LinkUnread` (57) and `ReachRefused` (63) after them.
-        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (58, 64), "each table has every variant once");
+        // Step 5 appended `LinkUnread` (57) and `ReachRefused` (63) after them, and W26-R22 `Freeze` (64).
+        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (58, 65), "each table has every variant once");
         assert!(CAP_UNREAD.is_power_of_two() && CAP_UNREAD == 1 << 41 && CAP_UNREAD & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH) == 0);
+        assert!(CAP_WORKSPACE_COMMITS.is_power_of_two() && CAP_WORKSPACE_COMMITS == 1 << 42 && CAP_WORKSPACE_COMMITS & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD) == 0);
+        assert!(CAP_WORKSPACE_COMPARE.is_power_of_two() && CAP_WORKSPACE_COMPARE == 1 << 43 && CAP_WORKSPACE_COMPARE & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD | CAP_WORKSPACE_COMMITS) == 0);
         Ok(())
     }
 
@@ -1244,6 +1271,20 @@ mod tests {
         assert_eq!((encode(&up)?.first().copied(), encode(&down)?.first().copied()), (Some(57), Some(63)));
         assert_eq!(decode::<AgentMsg>(&encode(&up)?)?, up);
         assert_eq!(decode::<ServerMsg>(&encode(&down)?)?, down);
+        Ok(())
+    }
+
+    /// W26-R22: Pause's freezing is appended after every older variant, and its capability is a bit
+    /// of its own: a runner from before reads it as a variant it doesn't know, and is sent none.
+    #[test]
+    fn w26_r22_freeze_is_appended_after_every_older_variant() -> anyhow::Result<()> {
+        let down = ServerMsg::Freeze { job: "j".into(), frozen: true };
+        let refused = encode(&ServerMsg::ReachRefused { from: "a".into(), link: "L".into(), code: crate::reach::relay::Refusal::Taken, why: String::new() })?;
+        assert_eq!(encode(&down)?.first().copied(), refused.first().map(|i| i + 1), "Freeze comes right after ReachRefused");
+        assert_eq!(encode(&down)?.first(), Some(&64));
+        assert_eq!(decode::<ServerMsg>(&encode(&down)?)?, down);
+        let older = CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD | CAP_WORKSPACE_COMMITS | CAP_WORKSPACE_COMPARE;
+        assert!(CAP_FREEZE.is_power_of_two() && CAP_FREEZE & older == 0 && CAP_FREEZE & u64::from(u32::MAX) == 0);
         Ok(())
     }
 

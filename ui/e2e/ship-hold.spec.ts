@@ -16,7 +16,7 @@ test("rows hold while the pointer is on the list, and the new commit shows once 
   await page.request.post("/api/mock/ship/arrive?clear=1");
   try {
     await page.goto("/ship");
-    const list = page.getByRole("list", { name: "Commits", exact: true });
+    const list = page.getByRole("list", { name: "Repositories", exact: true });
     await expect(list.locator(":scope > li").first()).toBeVisible();
     const box = await list.boundingBox();
     if (!box) throw new Error("no list");
@@ -36,6 +36,8 @@ test("rows hold while the pointer is on the list, and the new commit shows once 
     await page.mouse.move(x + 2, y + 1);
     await page.waitForTimeout(300);
     expect(await tops(page)).toEqual(before);
+    // Its repository's row keeps the commit it shows: the new one waits too (docs/ci.md W26-R29).
+    await expect(list.locator(":scope > li").first()).not.toContainText("arrived 1");
     await page.mouse.move(box.x + box.width / 2, Math.max(1, box.y - 150));
     await expect(list.locator(":scope > li").first()).toContainText("arrived 1", { timeout: 15_000 });
   } finally {

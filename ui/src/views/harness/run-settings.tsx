@@ -24,6 +24,7 @@ import { useMotionPreference } from "@/components/shell/motion";
 import { cn } from "@/lib/utils";
 import { useListener } from "./dom";
 import { clocksAt, effortFrame, HEIGHT as LINE_HEIGHT, tickClocks, type Clocks } from "./effort-light";
+import { growFronts, permissionFrame, restFronts } from "./permission-light";
 import { boltLabel, boltState, lit, nextSpeed, speedName, type SpeedLine } from "./speed";
 import { easeOut, newFrame, paint, smooth } from "./stands-light";
 import "./run-settings.css";
@@ -281,11 +282,12 @@ export function WordRow({ label, words, value, onPick }: { label: string; words:
 /**
  * An ordered setting as one track: the choice's name and what it does above, the stops below.
  * Tap a stop or slide along the track (the name follows the finger; it applies where it's let go);
- * arrow keys, Home and End move a stop at a time. `live` (effort's): the track up to the knob is a
- * line of light whose particles swarm the more the further along it is (EffortLine), which draws
- * the stops too, each it has reached a bead of its light.
+ * arrow keys, Home and End move a stop at a time. `line`: the track up to the knob is lit, for
+ * effort a line of light whose particles swarm the more the further along it is (EffortLine), for
+ * permissions a bramble, the more grown and snarled the further along (PermissionLine); either
+ * draws the stops too, each it has reached a bead of its light.
  */
-export function Scale({ label, words, value, armed, onPick, live }: { label: string; words: Word[]; value: string; armed?: string; onPick: (w: Word) => void; live?: boolean }) {
+export function Scale({ label, words, value, armed, onPick, line }: { label: string; words: Word[]; value: string; armed?: string; onPick: (w: Word) => void; line?: "effort" | "permissions" }) {
   const rail = React.useRef<HTMLDivElement>(null);
   const [drag, setDrag] = React.useState<number | null>(null);
   const n = words.length;
@@ -348,14 +350,20 @@ export function Scale({ label, words, value, armed, onPick, live }: { label: str
           }}
         >
           <div ref={rail} className="rs-rail">
-            {live ? <EffortLine at={pct(shown)} level={n > 1 ? shown / (n - 1) : 1} stops={n} /> : <i className="rs-fill" style={{ width: `${pct(shown)}%` }} aria-hidden="true" />}
+            {line === "effort" ? (
+              <EffortLine at={pct(shown)} level={n > 1 ? shown / (n - 1) : 1} stops={n} />
+            ) : line === "permissions" ? (
+              <PermissionLine at={pct(shown)} stops={n} warns={words.map((x) => (x.dangerous ? "1" : "0")).join("")} />
+            ) : (
+              <i className="rs-fill" style={{ width: `${pct(shown)}%` }} aria-hidden="true" />
+            )}
             {words.map((x, i) => (
               <i
                 key={x.id}
                 className="rs-tick"
                 data-on={i <= shown ? "" : undefined}
                 data-warn={x.dangerous ? "" : undefined}
-                data-drawn={live ? "" : undefined}
+                data-drawn={line ? "" : undefined}
                 style={{ left: `${pct(i)}%` }}
                 aria-hidden="true"
               />
@@ -485,6 +493,101 @@ function EffortLine({ at, level, stops }: { at: number; level: number; stops: nu
       };
     },
     [at, level, stops, paused],
+  );
+  return <canvas ref={attach} className="rs-lit" aria-hidden="true" />;
+}
+
+/**
+ * Permissions' lit track (permission-light.ts): from the start to the knob (`at`, a percentage of
+ * the track), a bramble, the more grown and snarled the further along (the more the agent may do on
+ * its own), its runners creeping past the knob, with the track's `stops`, evenly spaced (`warns`:
+ * "1" for each that turns checks off, "0" for each other): grey past the knob, stirring the nearer
+ * it they are, and beads of its light where it has reached them.
+ * Drawn each frame (at most every 33 ms) while it's on screen and motion plays; still (Kiln's
+ * toggle, or reduced motion) it's drawn at rest. A change of stop moves its end with the knob, and
+ * its canes grow out to it or shrivel back from where they are.
+ */
+function PermissionLine({ at, stops, warns }: { at: number; stops: number; warns: string }) {
+  const { paused } = useMotionPreference();
+  const kept = React.useRef({
+    at: { from: at, to: at, since: -Infinity },
+    fronts: null as number[] | null,
+    track: 0,
+    then: 0,
+  });
+  const attach = React.useCallback(
+    (canvas: HTMLCanvasElement | null) => {
+      const ctx = canvas?.getContext("2d");
+      if (!canvas || !ctx) return;
+      const k = kept.current;
+      const begun = performance.now();
+      k.at = { from: easing(k.at, begun, FILL_MS), to: at, since: begun };
+      let raf = 0;
+      let last = -Infinity;
+      let visible = true;
+      // The track's width (the canvas's, less what it reaches past each end), and its stops along it.
+      let width = canvas.getBoundingClientRect().width - 2 * BLEED;
+      const marks: number[] = [];
+      const warn = [...warns].map((c) => c === "1");
+      const frame = newFrame();
+      const draw = (now: number) => {
+        if (width <= 0) return;
+        const dpr = Math.min(3, window.devicePixelRatio || 1);
+        const w = Math.round((width + 2 * BLEED) * dpr);
+        const h = Math.round(LINE_HEIGHT * dpr);
+        if (canvas.width !== w || canvas.height !== h) {
+          canvas.width = w;
+          canvas.height = h;
+        }
+        ctx.setTransform(dpr, 0, 0, dpr, BLEED * dpr, 0);
+        ctx.clearRect(-BLEED, 0, width + 2 * BLEED, LINE_HEIGHT);
+        marks.length = 0;
+        for (let i = 0; i < stops; i++) marks.push(stops > 1 ? (i / (stops - 1)) * width : 0);
+        const fill = (easing(k.at, now, FILL_MS) / 100) * width;
+        // Its canes grow out to the knob or shrivel back from where they stand (at rest when still);
+        // a new width carries them along with the track.
+        if (!k.fronts || paused) k.fronts = restFronts(fill, width);
+        else {
+          const by = k.track > 0 ? width / k.track : 1;
+          if (by !== 1) k.fronts = k.fronts.map((x) => x * by);
+          growFronts(k.fronts, fill, width, Math.min(0.1, Math.max(0, now - k.then) / 1000));
+        }
+        k.track = width;
+        k.then = now;
+        paint(ctx, permissionFrame(fill, paused ? STILL : now / 1000, { stops: marks, warn, fronts: k.fronts, into: frame }));
+      };
+      const tick = (now: number) => {
+        raf = 0;
+        if (!visible) return;
+        if (now - last >= 33) {
+          last = now;
+          draw(now);
+        }
+        if (!paused || now - k.at.since < FILL_MS) raf = requestAnimationFrame(tick);
+      };
+      const start = () => {
+        if (!raf) raf = requestAnimationFrame(tick);
+      };
+      const sized = new ResizeObserver((entries) => {
+        const box = entries[0]?.contentRect.width;
+        if (box !== undefined) width = box - 2 * BLEED;
+        draw(performance.now());
+      });
+      const seen = new IntersectionObserver((entries) => {
+        visible = entries.some((e) => e.isIntersecting);
+        if (visible) start();
+      });
+      sized.observe(canvas);
+      seen.observe(canvas);
+      draw(begun);
+      start();
+      return () => {
+        cancelAnimationFrame(raf);
+        sized.disconnect();
+        seen.disconnect();
+      };
+    },
+    [at, stops, warns, paused],
   );
   return <canvas ref={attach} className="rs-lit" aria-hidden="true" />;
 }
@@ -882,7 +985,7 @@ export function RunSettings({
     const current = k === "mode" && modeCanReapply && isPreset(shown(k)) ? s.words.find((x) => x.id === shown(k)) : undefined;
     return (
       <>
-        <Scale label={KEY[k]} words={s.words} value={shown(k)} armed={w?.id} onPick={pick} live={k === "effort"} />
+        <Scale label={KEY[k]} words={s.words} value={shown(k)} armed={w?.id} onPick={pick} line={k === "effort" ? "effort" : k === "mode" ? "permissions" : undefined} />
         {w && (
           <p className="rs-desc rs-confirm-line" data-tone="warn">
             {CONFIRM}{" "}

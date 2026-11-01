@@ -36,6 +36,8 @@ pub const CAPABILITIES: &[&str] = &[
     "runs.trigger",
     "runs.cancel",
     "runs.rerun",
+    // Pause and Resume a run's jobs (docs/ci.md W26-R22).
+    "runs.pause",
     "runs.debug",
     "runs.approve",
     "logs.read",
@@ -89,7 +91,7 @@ pub const SIGNED_IN: &str = "signed-in";
 /// variables; `admin` and `owner` have every capability.
 pub fn role(name: &str) -> Option<Vec<&'static str>> {
     const VIEWER: &[&str] = &["runs.read", "logs.read", "artifacts.read", "runners.read", "diffs.read", "observe.read"];
-    const DEVELOPER: &[&str] = &["runs.trigger", "runs.rerun", "runs.cancel", "artifacts.write", "caches.write", "workflows.edit", "diffs.submit", "diffs.review", "agents.run", "secrets.use", "observe.write"];
+    const DEVELOPER: &[&str] = &["runs.trigger", "runs.rerun", "runs.cancel", "runs.pause", "artifacts.write", "caches.write", "workflows.edit", "diffs.submit", "diffs.review", "agents.run", "secrets.use", "observe.write"];
     const MAINTAINER: &[&str] = &[
         "runs.debug",
         "runs.approve",
@@ -432,6 +434,8 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/runs/*", "runs.read", At::Run(2)),
     r("POST", "/api/runs/*/cancel", "runs.cancel", At::Run(2)),
     r("POST", "/api/runs/*/retry", "runs.rerun", At::Run(2)),
+    r("POST", "/api/runs/*/pause", "runs.pause", At::Run(2)),
+    r("POST", "/api/runs/*/resume", "runs.pause", At::Run(2)),
     r("GET", "/api/jobs/*", "runs.read", At::Job(2)),
     r("GET", "/api/jobs/*/tools", "runs.read", At::Job(2)),
     // The agent it starts is the asker's (`agents.start`), so at most their permissions.
@@ -597,6 +601,11 @@ pub static ROUTES: &[Rule] = &[
     // A Pipelines verb: the handler holds each to its own operation's right on the repository its
     // body names (docs/ci.md W29-R04, AC04).
     r("POST", "/api/ship/pipelines", "diffs.submit", At::Anywhere),
+    // Each verb's own right on the repository is asked inside (`ship::jobs`): retry, cancel, pause.
+    r("POST", "/api/ship/jobs", "runs.read", At::Anywhere),
+    // Each verb is its CD operation, asked inside as `/api/cd`'s route asks it (`ship::deploys::act`):
+    // `environments.deploy` on the whole server (W26-R24).
+    r("POST", "/api/ship/deploys", "runs.read", At::Anywhere),
     // Releases are a deployer's in their environment, or an owner team's where it lets owners.
     r("POST", "/api/deploy/releases", "environments.deploy", At::Deploy),
     r("POST", "/api/deploy/fleets", "environments.deploy", At::Anywhere),

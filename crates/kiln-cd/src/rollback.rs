@@ -7,6 +7,10 @@
 //!   deployment that succeeded can be gone back to, and only one kept with the commits a render
 //!   needs. [`candidates`] lists them as a person chooses among them: newest first, what runs now
 //!   left out, and one entry for each render.
+//! - **Any commit** (docs/ci.md W26-R25). A commit of one of the app's sources that no deployment
+//!   ran can be gone back to too, once the server has found it there: it's rendered and synced as
+//!   a deployment would be, that source held at it and the others at their heads ([`pick_any`],
+//!   [`held_commits`]). A commit that renders what a deployment rendered is named so ([`same_as`]).
 //! - **On its own.** After a failure (a rollout that aborted, kiln's own restart that didn't take,
 //!   a release that failed after its commit) kiln goes back by itself unless told not to. A person
 //!   says so for one app, or for every app of a repository; the app's word beats its
@@ -224,6 +228,43 @@ pub fn pick<'a>(app: &str, history: &'a VecDeque<Deployment>, ask: Ask<'_>, sour
     }
 }
 
+/// Where a rollback goes: a deployment of the app's history, or a commit of one of its sources
+/// that none of them ran, to be rendered and synced (docs/ci.md W26-R25).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Target<'a> {
+    Deployment(&'a Deployment),
+    /// Source `source`'s commit `commit` (whole), which no deployment that can be gone back to ran.
+    Commit { source: usize, commit: String },
+}
+
+/// The rollback `ask` goes to, as [`pick`] decides; and, where it names what no deployment that
+/// can be gone back to ran, the commit the server found it to be in one of the app's sources
+/// (`found`: the source, and the commit whole), rendered anew.
+pub fn pick_any<'a>(app: &str, history: &'a VecDeque<Deployment>, ask: Ask<'_>, sources: usize, found: Option<(usize, String)>) -> Result<Target<'a>, Refused> {
+    match (pick(app, history, ask, sources), ask, found) {
+        (Ok(d), _, _) => Ok(Target::Deployment(d)),
+        (Err(_), Ask::Revision(_), Some((source, commit))) if source < sources && commit_prefix(&commit).is_some() => Ok(Target::Commit { source, commit }),
+        (Err(r), _, _) => Err(r),
+    }
+}
+
+/// Each source's commit for a render of source `source` at `commit`: the others at their heads.
+pub fn held_commits(sources: usize, source: usize, commit: &str) -> Vec<Option<String>> {
+    (0..sources).map(|i| (i == source).then(|| commit.to_owned())).collect()
+}
+
+/// The newest deployment that succeeded and rendered what `key` addresses: one a commit renders
+/// the same as.
+pub fn same_as(history: &VecDeque<Deployment>, key: u64) -> Option<&Deployment> {
+    history.iter().rev().find(|d| d.succeeded && d.key == Some(key))
+}
+
+/// The newest deployment that ran `commit` (whole, or 7 or more of its first hex digits).
+pub fn ran_by<'a>(history: &'a VecDeque<Deployment>, commit: &str) -> Option<&'a Deployment> {
+    let prefix = commit_prefix(commit)?;
+    history.iter().rev().find(|d| ran(d, commit, Some(&prefix)))
+}
+
 /// The tags among `tags` (each a name and the commit it names) that name `commit`.
 pub fn tags_of<'a>(tags: &'a [(String, String)], commit: &str) -> Vec<&'a str> {
     tags.iter().filter(|(_, c)| c.eq_ignore_ascii_case(commit)).map(|(n, _)| n.as_str()).collect()
@@ -292,6 +333,33 @@ mod tests {
         assert!(matches!(pick("web", &h, Ask::Revision("bbbbbbb"), 1), Ok(d) if d.id == 3), "the newest that succeeded, past a failure of the same commit");
         let charts = history(vec![dep(1, "92.1.0", 10, true), dep(2, "92.2.0", 20, true)]);
         assert!(matches!(pick("prom", &charts, Ask::Revision("92.1.0"), 1), Ok(d) if d.id == 1), "a chart's version as recorded");
+    }
+
+    /// W26-R25: a commit no deployment ran can be gone back to once the server found it in a
+    /// source, that source held at it and the others at their heads; one a deployment ran goes to
+    /// that deployment still; and a commit that renders what a deployment rendered is named so.
+    #[test]
+    fn w26_r25_a_rollback_goes_to_any_commit_and_names_the_render_it_matches() {
+        let c = |n: u32| format!("{n:07}aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let h = history(vec![dep(1, &c(1), 10, true), dep(2, &c(2), 20, true), dep(3, &c(3), 30, true)]);
+        // A commit no deployment ran: the server found it in source 0.
+        assert_eq!(pick_any("default/web", &h, Ask::Revision(&c(7)[..9]), 1, Some((0, c(7)))), Ok(Target::Commit { source: 0, commit: c(7) }));
+        // Not found anywhere: refused, as before.
+        assert!(matches!(pick_any("default/web", &h, Ask::Revision(&c(7)), 1, None), Err(Refused::Missing(_))));
+        // One a deployment ran: that deployment, found or not.
+        assert!(matches!(pick_any("default/web", &h, Ask::Revision(&c(2)), 1, Some((0, c(2)))), Ok(Target::Deployment(d)) if d.id == 2));
+        // A source the app doesn't have, or what isn't a commit: refused.
+        assert!(pick_any("default/web", &h, Ask::Revision("v9"), 1, Some((3, c(7)))).is_err());
+        assert!(pick_any("default/web", &h, Ask::Revision("v9"), 1, Some((0, "v9".into()))).is_err());
+        // The previous and an id never take a commit.
+        assert!(matches!(pick_any("default/web", &h, Ask::Previous, 1, Some((0, c(7)))), Ok(Target::Deployment(d)) if d.id == 2));
+        // Held: that source at the commit, the others at their heads.
+        assert_eq!(held_commits(3, 1, &c(7)), vec![None, Some(c(7)), None]);
+        // Renders the same as deployment 2; ran by deployment 3.
+        assert_eq!(same_as(&h, 20).map(|d| d.id), Some(2));
+        assert_eq!(same_as(&h, 99), None);
+        assert_eq!(ran_by(&h, &c(3)[..8]).map(|d| d.id), Some(3));
+        assert_eq!(ran_by(&h, &c(7)), None);
     }
 
     #[test]

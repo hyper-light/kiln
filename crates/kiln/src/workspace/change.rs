@@ -128,8 +128,14 @@ fn fail(code: StatusCode, msg: impl Into<String>) -> Fail {
 pub async fn ask_machine(hub: &Hub, info: &Info, ask: &super::Ask) -> Result<Value, Fail> {
     let machine = crate::harness::wait::machine(&info.target).to_owned();
     let answer = if machine == "local" {
-        super::serve(std::path::Path::new(&info.cwd), std::path::Path::new(info.work_dir()), info.workspace.as_ref(), ask.clone()).await
+        // The server's own agents: their versions aren't kept here, so an agent's point is refused, saying so.
+        super::serve(std::path::Path::new(&info.cwd), std::path::Path::new(info.work_dir()), info.workspace.as_ref(), ask.clone(), &super::git::Versions::new()).await
     } else {
+        // A question only a newer runner answers isn't sent to one that can't.
+        let wide = ask.wide_cap();
+        if wide != 0 && hub.instances.lock().wide_caps_for(&machine, &crate::instances::Owned::Agent(info.id.clone())) & wide != wide {
+            return Err(fail(StatusCode::CONFLICT, format!("{machine}'s kiln is too old to do this: upgrade it (System → Updates)")));
+        }
         let json = serde_json::to_string(ask).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let id = info.id.clone();
         let got = hub
@@ -427,6 +433,18 @@ mod tests {
         assert_eq!(paths_in(&changes, Some("/w/repo/.claude/worktrees/f")), ["README.md", "notes.txt"]);
         assert_eq!(paths_in(&changes, Some("/w/repo")), ["src/old.rs"]);
         assert_eq!(paths_in(&changes, None), ["README.md", "notes.txt", "src/old.rs", "/tmp/scratch.txt"], "no working tree known: every file, as named");
+    }
+
+    /// A subagent's file in the working tree goes up with the change request, as the agent's own
+    /// do (docs/agents.md, "Who changed a file, and whose it is"); one outside it doesn't.
+    #[test]
+    fn a_subagents_file_goes_up_with_its_change_request() {
+        let changes = serde_json::json!([
+            {"path": "src/main.rs", "tree": "/w/repo", "by": ["main"], "place": "project"},
+            {"path": "src/parser.rs", "tree": "/w/repo", "by": ["spawn-kid"], "place": "project"},
+            {"path": "/h/.codex/memories/notes.md", "by": ["spawn-kid"], "place": "agent"}
+        ]);
+        assert_eq!(paths_in(&changes, Some("/w/repo")), ["src/main.rs", "src/parser.rs"]);
     }
 
     #[test]
