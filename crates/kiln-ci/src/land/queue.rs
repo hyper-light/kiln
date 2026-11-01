@@ -555,22 +555,18 @@ impl Route {
 pub enum HostMerge {
     /// Merge it on its host, at the head tested.
     Merge,
-    /// The trunk moved since the candidate was built on it: build it again, on the trunk as it is.
-    Rebuild { why: String },
-    /// Its head moved past the one tested (and Review cleared): out of the queue.
-    Out { why: String },
+    /// Its head moved past the one tested: content Review hasn't cleared, back to Review's gate at
+    /// its new head (W28-R105).
+    Back { why: String },
 }
 
 /// Whether kiln has its host merge a change its queue tested (docs/ci.md W26-R19): only at the head
-/// tested, onto the trunk the candidate was built on (`base`). A head that moved takes it out (its
-/// new head is Review's again); a trunk that moved builds the candidate again.
-pub fn host_merge(base: &str, trunk_now: &str, tested_head: &str, head_now: &str) -> HostMerge {
+/// tested. A head that moved goes back to Review. (Where the trunk is, R102 decides for the whole
+/// batch, as for kiln's own lands: never a build of kiln's own on the trunk's tip.)
+pub fn host_merge(tested_head: &str, head_now: &str) -> HostMerge {
     let short = |s: &str| s.get(..7).unwrap_or(s).to_owned();
     if head_now != tested_head {
-        return HostMerge::Out { why: format!("its head moved to {} after {} was tested, past what Review cleared", short(head_now), short(tested_head)) };
-    }
-    if trunk_now != base {
-        return HostMerge::Rebuild { why: format!("the trunk moved to {} since its candidate was built on {}: built again", short(trunk_now), short(base)) };
+        return HostMerge::Back { why: format!("its head moved to {} after {} was tested, past what Review cleared", short(head_now), short(tested_head)) };
     }
     HostMerge::Merge
 }

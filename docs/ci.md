@@ -8762,10 +8762,12 @@ resolution makes, a comment, a resolution, an approval and each mark of the Revi
       `w26_r19_a_stack_its_hosts_queue_merged_part_way_lands_what_merged`,
       `w26_r19_a_change_its_host_merged_while_held_lands_signed`, and
       `w26_r19_a_host_without_a_queue_lands_through_kilns` (a real mirror beside the simulator:
-      merged at the head tested, built again when the trunk moved before the merge, out when the
-      head moved). Batches: `w26_r19_a_batch_merges_whole_or_not_at_all`,
+      merged at the head tested; applied again when the trunk moved before the merge only for what
+      it shares nothing with; back with Review's gate when its head moved, then built and merged at
+      the new head once cleared). Side by side: `w26_r19_host_changes_land_side_by_side`. Batches:
+      `w26_r19_a_batch_merges_whole_or_not_at_all`,
       `w26_r19_a_stack_merged_part_way_lands_what_merged`,
-      `w26_r19_a_batch_stops_once_its_merges_are_done`,
+      `w26_r19_a_batch_stops_once_its_merges_are_done`, `w26_r19_a_resumed_batch_checks_the_trunk_again`,
       `w26_r19_what_kiln_lands_of_an_entry_is_signed_once` and
       `w26_r19_a_merge_its_host_wont_do_takes_its_entry_out`. Signed as tested:
       `w26_r19_a_host_merge_of_what_kiln_tested_is_signed_as_tested` (the host's merge a real commit
@@ -8775,15 +8777,31 @@ resolution makes, a comment, a resolution, an approval and each mark of the Revi
   - **Hosts without a queue** (Bitbucket; GitHub without one) land through W28's queue, built with
     the Merge Queues agent. The forge seam's `abilities(repo).queue` being none gives the route
     `kiln, merged on its host` (`queue::Route::HostMerges`).
+    - Host changes are the queue's entries like kiln's own, never landed one at a time (queues
+      aren't serial, the person's decision of 2026-11-01). A change's files, read in kiln's mirror
+      from where it left the trunk, put it in its component (W28-R30, R31). Independent changes
+      land side by side (R35), and one component's are tested together in its window (R36).
     - The entry goes through the queue's own `see` and `build_step` in kiln's mirror: each change's
       head is merged onto the trunk's tip there, and the candidate's workflows run as any
-      candidate's do, under `policy.land.checks`.
+      candidate's do, under the trunk's own gating checks (`.kiln/review.yaml`'s `land.checks`, as
+      its users define them).
     - Once it passes, the batch is decided whole before anything merges: each change is read on
       its host, Review's gate is asked again of those still open, and while nothing has merged,
       the mirror's trunk (fetched first; if the fetch fails, nothing merges that step) goes through
       `kiln_ci::land::queue::host_merge`.
-      - A trunk that moved builds the candidate again.
-      - A head that moved, or a change closed, takes its entry out (`INVALID_MERGE_COMMIT`).
+      - Host-merges entries land side by side under R102, as kiln's own do: just before anything
+        merges, R102 is asked again. A trunk that moved since the candidate was built only for
+        what the batch shares nothing with leaves its result standing (merged, applied again);
+        one that moved for what it meets is tested again. kiln never builds a candidate of its
+        own on the trunk's tip, and a batch whose merges began is finished as it was decided: its
+        own merges are no reason to test it again, so the plan sees it running, its component
+        busy, until it's done. Resumed, it's asked again before its next merge: what moved the
+        trunk since its last merge (another land among it) against what's still to merge, so
+        whichever lands second is checked against the first, both ways round.
+      - A head that moved after the test is content Review hasn't cleared (R105). Its entry goes
+        back to Review's gate at its new head, saying so, and enters again, built at that head,
+        once the gate clears it. It's never tested or merged at a head Review didn't clear.
+      - A change closed takes its entry out (`INVALID_MERGE_COMMIT`).
       - The rest of the batch goes back to the queue.
       - A batch stops only once none of its merges is under way: that merge's result says what
         merged.
@@ -8796,8 +8814,9 @@ resolution makes, a comment, a resolution, an approval and each mark of the Revi
       entry merged whole lands. One merged part-way goes out, held or back to the queue, and what
       kiln landed of it is signed once: its later land signs only what merged since, and its
       record names all it carries.
-    - Merged whole, each entry is checked against what kiln tested: the tip its merges went onto,
-      read in kiln's mirror, is the one before it; the batch's tree is the candidate's. The land
+    - Merged whole, each entry is checked against what kiln tested, read in kiln's mirror: the first
+      went onto the candidate's base (by its tree), each later one onto the one before, and each
+      one's tree is the candidate's after it (its applied commits). The land
       is recorded with the candidate's runs and signed with `via` naming the route. The statement's
       `to` is the host's merge commit and its `candidate` kiln's. Where the check fails, or kiln
       can't read the merge, it's signed as applied again (`rebased`, `from` the real tip).
@@ -8806,12 +8825,9 @@ resolution makes, a comment, a resolution, an approval and each mark of the Revi
     - Each entry goes by its own route, so a repository whose host gains a queue keeps landing
       what kiln's queue holds through kiln.
   - *Not yet:* thread kinds on a host's pull request aren't kept, so the gate counts its open
-    threads by the trunk's `resolve_threads`. A host change's files aren't read into the conflict
-    graph, so each host entry is a component of its own. That's safe, since `host_merge` builds a
-    candidate again on any moved trunk; it's only slower, as host repositories lose commuting
-    components. It's filed for later. A host's rebase or fast-forward merge is always signed as
-    applied again: its commits don't show kiln which tip they went onto. That's conservative, never
-    claiming as tested a land kiln can't show was.
+    threads by the trunk's `resolve_threads`. A host's rebase or fast-forward merge is always signed
+    as applied again: its commits don't show kiln which tip they went onto. That's conservative,
+    never claiming as tested a land kiln can't show was.
 - *Tests.*
   - kiln-ci: `review.rs` (`w26_r11_*`, `w26_r12_a_resolved_conflict_waits_on_its_commit`),
     `suggest.rs` (`w26_r10_*`), `conflicts.rs` (`w26_r12_*`). The Search suite on its simulator
