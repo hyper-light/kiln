@@ -9,7 +9,7 @@
  * along the track more canes sprout, thicker, writhing ever more erratically, kinked and jagged;
  * prickles hook back along them, denser and longer the further along; tendrils arch off the canes
  * and loop back through the tangle, forking near the end, where a cane now and then lashes and its
- * thorns' tips crackle. Its pace barely quickens: danger grows it rather than speeds it. The canes
+ * thorns' tips crackle. Past halfway it thins a little, so the end reads snarled rather than packed. Its pace barely quickens: danger grows it rather than speeds it. The canes
  * keep to a close core about the rail, the tendrils curling out of it, nothing further than LIMIT
  * from the rail, so the stops' names under the track stay clear.
  *
@@ -48,6 +48,9 @@ const MAX = 4096;
 const OFFSET = 37;
 /** How much less each stop past the knob stirs than the one before it, nearer the knob. */
 const FALLOFF = 0.6;
+/** Past halfway it thins a little toward the end, so Bypass reads snarled rather than packed: fewer tendrils, forks and prickles, and its canes no thicker, down to THIN as many at the end. */
+const THIN = 0.7;
+const thinning = (d: number) => 1 - (1 - THIN) * smooth((d - 0.55) / 0.45);
 /** How fast a cane's front grows out to the knob and shrivels back (points a second, at most; each cane at its own rate). */
 const GROW = 240;
 const SHRIVEL = 320;
@@ -278,7 +281,7 @@ function points(f: Frame, b: Body, l: Lot, t: number, sh: Shine, every: number, 
     const g = glintAt(sh, x + OFFSET) * (0.5 + 0.5 * d);
     const c0 = colourOf(x, t, (rnd(key + q * 3) - 0.5) * 0.24, g);
     const lit = (0.45 + 0.45 * near) * (0.6 + 0.4 * d);
-    const r0 = (0.2 + 0.3 * d) * l.thick * thin * (0.7 + 0.4 * near) * (0.4 + 0.6 * tip) * (1 + 0.5 * g);
+    const r0 = (0.2 + 0.3 * d * thinning(d)) * l.thick * thin * (0.7 + 0.4 * near) * (0.4 + 0.6 * tip) * (1 + 0.5 * g);
     const dx = (b.x[q + 1] ?? x) - x;
     const dy = (b.y[q + 1] ?? y) - y;
     for (let u = 0; u < every; u++, i++) {
@@ -304,14 +307,14 @@ function prickles(f: Frame, b: Body, l: Lot, t: number, sh: Shine, front: number
     const x0 = b.x[q] ?? 0;
     const y0 = b.y[q] ?? Y;
     const open = smooth((front - x0) / 12) * (1 - (b.w[q] ?? 0)) * smooth((b.s[q] ?? 0) / 5) * fade(q);
-    if (open > 0.05 && hash(seed) < (0.18 + 0.82 * d ** 1.1) * dense) {
+    if (open > 0.05 && hash(seed) < (0.18 + 0.82 * d ** 1.1) * dense * thinning(d)) {
       const side = hash(seed + 1) < 0.5 ? -1 : 1;
       const tangent = Math.atan2((b.y[q + 1] ?? y0) - y0, (b.x[q + 1] ?? x0) - x0);
       let dir = tangent + Math.PI - side * (0.55 + 0.6 * hash(seed + 3));
       const out = Math.sin(dir) * Math.sign(y0 - Y);
       let len = (1.2 + 5.2 * d ** 1.2) * scale * (0.5 + 0.7 * hash(seed + 2)) * open * size;
       if (out > 0) len = Math.min(len, Math.max(0, (LIMIT - Math.abs(y0 - Y)) / out));
-      const base = (0.2 + 0.3 * d) * l.thick * 1.05 * size;
+      const base = (0.2 + 0.3 * d * thinning(d)) * l.thick * 1.05 * size;
       const flash = d > 0.65 ? Math.max(0, Math.sin(t * (2.5 + 3 * hash(seed + 4)) + seed)) ** 40 * smooth((d - 0.65) / 0.25) : 0;
       const c0 = colourOf(x0, t, 0, glintAt(sh, x0 + OFFSET));
       let px = x0;
@@ -376,7 +379,7 @@ export function permissionFrame(fill: number, t: number, scene: Scene = {}): Fra
       const x0 = A.x[q] ?? 0;
       const y0 = A.y[q] ?? Y;
       const open = smooth((front - x0) / 16) * (1 - (A.w[q] ?? 0));
-      if (open > 0.05 && hash(seed) < smooth((d - 0.22) / 0.35) * 0.62) {
+      if (open > 0.05 && hash(seed) < smooth((d - 0.22) / 0.35) * 0.62 * thinning(d)) {
         const side = hash(seed + 1) < 0.5 ? -1 : 1;
         const tangent = Math.atan2((A.y[q + 1] ?? y0) - y0, (A.x[q + 1] ?? x0) - x0);
         const sub = tendrilLot(seed, 3);
@@ -384,7 +387,7 @@ export function permissionFrame(fill: number, t: number, scene: Scene = {}): Fra
         lay(B, sub, x0, y0 - Y, tangent + side * (0.6 + 0.5 * hash(seed + 3)), Infinity, len, g, { pull: 0.02, loops: d > 0.45, lash: null, size: TENDRIL, room: ROOM });
         points(f, B, sub, t, sh, 1, 0.85, ALL);
         prickles(f, B, sub, t, sh, Infinity, 0.75, 0.8, ALL, TENDRIL);
-        if (d > 0.7 && hash(seed + 9) < smooth((d - 0.7) / 0.25) * 0.45 && B.m > 8) {
+        if (d > 0.7 && hash(seed + 9) < smooth((d - 0.7) / 0.25) * 0.45 * thinning(d) && B.m > 8) {
           const j = Math.floor(B.m * (0.4 + 0.3 * hash(seed + 10)));
           const xj = B.x[j] ?? 0;
           const yj = B.y[j] ?? Y;
