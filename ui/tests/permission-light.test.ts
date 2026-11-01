@@ -49,10 +49,13 @@ test("it tapers out: from two fine canes at the start, each stretch further alon
   for (let i = 1; i < fifths.length; i++) {
     const [was, now] = [fifths[i - 1], fifths[i]];
     assert.ok(was && now);
-    assert.ok(now.count > 1.4 * was.count, `fifth ${i}: ${now.count} particles a frame, after ${was.count}`);
+    // More the further along, if a little less so towards the end (it thins there, snarled rather than packed).
+    assert.ok(now.count > 1.25 * was.count, `fifth ${i}: ${now.count} particles a frame, after ${was.count}`);
     assert.ok(now.spread > was.spread + 0.5, `fifth ${i}: nine in ten within ${now.spread} of the rail, after ${was.spread}`);
   }
   assert.ok((fifths[0]?.spread ?? Infinity) < 1, "at the start, fine canes lying taut along the rail");
+  const [before, last] = [fifths[3]?.count ?? 0, fifths[4]?.count ?? Infinity];
+  assert.ok(last < 1.5 * before, `at Bypass, snarled rather than packed: the last stretch ${last} particles a frame, the one before it ${before}`);
 });
 
 test("each stop up grows it more and more snarled at the knob", () => {
