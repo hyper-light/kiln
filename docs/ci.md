@@ -43,6 +43,7 @@
   - [W26 Review in Ship](#w26-review-in-ship-changes-as-ship-items-each-owning-its-review)
   - [W27 Attested end to end](#w27-attested-end-to-end-identities-signatures-hand-offs-and-the-trail)
   - [W28 Demand-driven CI](#w28-demand-driven-ci-adopt-cover-stagger-land-by-conflict-graph)
+  - [W29 Pipelines in Ship](#w29-pipelines-in-ship-author-run-share-and-lock-workflows-and-actions)
 - [4. API, events, CLI and MCP reference](#4-api-events-cli-and-mcp-reference)
 - [5. Milestones and the order of work](#5-milestones-and-the-order-of-work)
 - [Appendix A. GitHub Actions compatibility matrix](#appendix-a-github-actions-compatibility-matrix)
@@ -9651,6 +9652,110 @@ adacachy's load per CPU over CI hours (1.62 before, at most 1.0 asked) is measur
   reach's links nor the directory of which runner holds what.
 - **`kiln run --reuse`** (R24, `reach/reuse.rs`, docs/reach.md §5.1): an identical run's recorded
   success, from the ledger.
+
+### W29 Pipelines in Ship: author, run, share and lock workflows and actions
+
+**Scope.** Ship's third view, Pipelines, beside Commits and Deploys. People and agents use it to
+write, check, run, trigger, configure and share a repository's workflows and actions: in GitHub
+Actions' dialect or kiln's, and in code. A repository's workflows and actions are its own. It may
+share them with other repositories, which use them by tag. W29 builds on the engine (W01–W08), the
+editor and action builder (W21-R06, W21-R07), triggers (W03), hosting and review (W14), CI
+providers (W23) and Ship (W26). It runs on v2 CI alone.
+
+**Why.** As of 2026-10-31 (origin/main c305a41e1c; production on 15878aaf):
+- The engine runs GitHub's workflows and actions of every kind (W07), but production has it off
+  (`[ci] enabled`). So production runs only v1's `.kiln/` pipelines, and its action catalog holds
+  only kiln's 12 built-ins.
+- The editor at `/workflows` is reached only from an engine run's page. It offers only files that
+  already exist, and its plan preview and Try it refuse while the engine is off.
+- Sharing reaches as far as `owner/repo@ref` and same-owner `kiln://` actions. Nothing lists what
+  repositories share, nothing releases a version, and nothing locks one.
+
+The design was agreed on stills drawn into Ship's own build: `~/.cache/kiln-pipelines-design/stills/pl-*.png`
+on adacachy, 1 to 9, at 390 and 1280 px. The audit is `~/.cache/claude-ci-audit/audit.md`. The research
+is kiln research `01a1947b2b0270fa9d1e32d07aebaa7e` (44 findings, 37 sources) and
+`~/.cache/claude-ci-audit/research/lockfile.md`. The plan is kiln plan `01a19474452d7084bae269952cc6c26a`.
+
+**Decisions.** The person's, made on 2026-10-31, in her words:
+
+1. **Ship's third view.** "allow users and agents to design, write, specify, and manage our Kiln CI
+   pipelines via our own UI in the Ship UI"; "this would be the third "tab" in the … Ship UI's
+   selector - "Commits", "Deployments", "Pipelines"". It sits beside Commits and Deploys ("Yes on
+   sitting beside"). Deploys is the approved name of the view her "Deployments" means (W26-R24).
+2. **A repository's own, and shared.** "While workflows and actions should be isolated per
+   repo/specific to that repo I also want to implement the ability to share workflows and actions
+   across repos and allow users to design custom workflows *and* actions."
+3. **GitHub's sharing model.** "Which one allows for easier user adoption and use? I'd argue
+   GitHub's."
+4. **Versions are git tags.** "Versions as git tags. Commits and tags are our base units of
+   currency. Period."
+5. **Kinds of action.** "Composite, JS, and Docker. We'll also support Shards MicroVMs and
+   Firecracker MicroVMs"
+6. **Code workflows, now.** Asked whether workflows written as code (TypeScript, then other SDKs)
+   come now or later: "Now".
+7. **Drafts.** "Of course we want to support drafts. We should be supporting draft PRs anyway." On
+   the stills: "I would prefer the draft indicator next to the title for pipelines, clearly
+   indicating the written workflow or action is a *draft*." A draft "isn't published or
+   runnable/sharable". Most of that message she withdrew as she approved the stills, and in them a
+   draft's author can still run it by hand (Run, on pl-3).
+8. **Bare metal by default.** "New CI is going to be bare-metal by default with the ability to run
+   in docker/docker-compose/microvms/kubernetes."
+9. **Inline editing backed by tree-sitter.** "We should also facilitate inline tree-sitter backed
+   editing, etc."
+10. **Every kind of trigger.** "We should be able to specify more triggers that push/pull/manual
+    right? Aren't their other types? CRON? Etc.?"
+11. **The lockfile.** Asked whether kiln honors GitHub's lockfile first and adds its own: "Fine".
+12. **The engine on.** Asked which agent turns v2 on: "You can turn it on." That is the agent writing
+    W29.
+13. **The design.** "This looks great except for the draft label location." With the label moved
+    beside the title: "Visually this looks fine."
+14. **Working beside the others.** "We can implement and work together as to maximize work done
+    without waiting around and blocking." The others are Kiln PRs, CI/CD Integration (which owns
+    Ship's views) and Kiln CI -> GitHub (per-repository providers).
+
+**Vocabulary.**
+
+| Term | Meaning |
+| --- | --- |
+| **Pipeline** | A workflow or an action, as the Pipelines view lists them; also the older word for a workflow (§1.4). |
+| **Draft** | A workflow or action written and not yet published. It lives on a branch of its own, as a kiln draft diff or a host's draft pull or merge request. No trigger runs it and no other repository can use it. Its author can run it by hand to try it. Ship marks it DRAFT beside its title. |
+| **Publish** | A draft landing on its repository's default branch through review. From that commit its triggers run it, and, if its repository shares, other repositories can use it. |
+| **Release** | A git tag on a commit of a repository that shares. A tag is the whole repository's: every action and reusable workflow in it gets it. A full version (`v2.4.1`) never moves in a repository kiln hosts; a floating one (`v2`) may follow the newest release. |
+| **Access** | A repository's setting saying which repositories may use its actions and reusable workflows: not shared, its owner's repositories, or everyone on this kiln. These are GitHub's levels in kiln's terms. |
+| **Lock** | The record of the exact commit, and image digest, each reference of a workflow resolves to: GitHub's `.github/workflows/actions.lock`, and kiln's `.kiln/lock` for what GitHub's leaves out. A locked workflow runs what's locked, wherever its tags point. |
+| **Consumer** | A repository whose workflows use another repository's action or reusable workflow. |
+
+**What W29 builds on.**
+- W01–W08: expressions, both dialects, triggers, the planner with reusable workflows, the scheduler,
+  the step runtime, actions of every kind (pinned at run start and mirrored), and the runtime
+  services actions rely on.
+- W21-R06 and W21-R07: the workflow editor with its flow view and plan preview, and the action
+  builder with Try it. These are `ui/src/views/ci/workflows.tsx`, `flow-view.tsx` and
+  `action-view.tsx`, saving through `ci.workflows.edit`.
+- W03-R09 and W03-R10: kiln's own triggers, and its schedule options.
+- W13: Firecracker executors. Shards' are not yet built.
+- W14: kiln's own change requests, which already have drafts.
+- W23: CI providers and their hosts.
+- W26-R24: Ship's views.
+- `ui/src/lib/syntax`: kiln's tree-sitter highlighter, which Ship's Files use and whose colours the
+  editor shares.
+- `crates/kiln/src/mcp/code.rs`: code mode's QuickJS sandbox.
+
+**What's missing** (the audit of 2026-10-31):
+- The engine is off in production. Until it's on, previews, Try it and Run refuse there.
+- No view reaches the editor, and the editor can't make a new file. Its flow view covers jobs,
+  needs, `runs-on`, steps and the matrix only.
+- No catalog of what repositories share. The catalog lists GitHub mirrors' root `action.yml`
+  files and kiln's built-ins.
+- No way to share across owners. `kiln://` reusable workflows also skip the owner check that
+  `kiln://` actions get (likely; no test shows it yet).
+- No release, no update, no lock: pins are per run.
+- W04-R25's templates pass validation but are never loaded.
+- No drafts on GitHub, GitLab or Bitbucket: `githost::open_change` takes no draft flag.
+- Code workflows, Firecracker actions and Shards actions are not built.
+
+The plan's steps 2 to 4 add W29's requirements, and its step 5 adds the acceptance criteria and
+scenarios.
 
 ## 4. API, events, CLI and MCP reference
 
