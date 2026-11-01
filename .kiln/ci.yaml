@@ -16,6 +16,10 @@ jobs:
     name: rust lint + test
     runs-on: [k8s]
     toolchain: rust
+    # Debian 13's: kiln's conflict replays pass --merge-base to git merge-tree, which git gained in
+    # 2.40, and the preset's rust:1-bookworm carries git 2.39.5 (w26_ac04 and w26_r14 failed on it,
+    # run #1661); trixie's is 2.47.
+    image: docker.io/library/rust:1-trixie
     # Compiling kiln's own crate takes 7 GiB and more, and `cargo test` compiles it twice at once
     # (the library, and the library as its tests): 8Gi ran out, rustc killed. Cargo runs a rustc
     # per CPU the machine has, not per CPU asked for, unless told; line tables are the debug info
