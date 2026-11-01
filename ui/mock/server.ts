@@ -38,6 +38,7 @@ import { handlePush, pushHeard } from "./push.ts";
 import { handleReview } from "./review.ts";
 import { handleShip } from "./ship.ts";
 import { handleDeploys, setDeploysEmit } from "./deploys.ts";
+import { handlePipelines } from "./pipelines.ts";
 import { handleDoctor } from "./doctor.ts";
 import { handleStores } from "./stores.ts";
 import {
@@ -1521,6 +1522,7 @@ const server = http.createServer(async (req, res) => {
     // ---- agents that run agents ----
     // Ship's Deploys, and the CD routes its panes read for its apps (W26-R24), before the rest of CD's.
     if (await handleDeploys(req, res, url, { json })) return;
+    if (await handlePipelines(req, res, url, { json })) return;
     if (await handleShip(req, res, url, { json, liveJob, liveRun, push: () => void startRun(repos.find((r) => r.name === "hyper-light/kiln") ?? repos[0]!, { branch: "main", event: "push" }) })) return;
     if (await handleFamily(req, res, url, () => [longInfo(), ...fastInfos(), ...reviewInfos()])) return;
     // ---- harness accounts (and the demo agents to see them from) ----

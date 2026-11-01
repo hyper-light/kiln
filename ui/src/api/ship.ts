@@ -295,7 +295,7 @@ export interface ShipPipelinePane {
 export interface ShipPipelineAct {
   repo: string;
   path: string;
-  verb: "save_draft" | "ready" | "discard" | "run";
+  verb: "save_draft" | "ready" | "discard" | "run" | "release";
   content?: string;
   title?: string;
   event?: string;
@@ -303,6 +303,16 @@ export interface ShipPipelineAct {
   inputs?: Record<string, unknown>;
   ref?: string;
   sha?: string;
+  /** Release's (W29-R21): the full version to tag, whether its major's floating tag moves too, and that failing checks are known. */
+  tag?: string;
+  major?: boolean;
+  confirm?: boolean;
+  notes?: string;
+}
+
+/** Ship's Pipelines (W29-R03): the repositories the caller may read, each with its workflows and actions as rows. */
+export interface ShipPipelines {
+  repos: ShipPipelineRepo[];
 }
 
 export function shipSearch(q: ShipQuery): string {
@@ -330,6 +340,17 @@ export const shipApi = {
     request<CdPlan>("GET", apiPath(`/api/cd/plans?repo=${encodeURIComponent(repo)}&commit=${encodeURIComponent(commit)}&brief=true`), undefined, { signal }),
   /** One of the strip's verbs on an app, as its CD operation. */
   deployAct: (body: ShipDeployAct) => request<{ app: string; verb: ShipDeployVerb; op: string; done: unknown }>("POST", apiPath("/api/ship/deploys"), body),
+  /** Every workflow and action by repository, needs-someone first (docs/ci.md W29-R03); `q` finds by repository, name, path or kind. */
+  pipelines: (q: string, signal?: AbortSignal) => request<ShipPipelines>("GET", apiPath(`/api/ship/pipelines${q ? `?q=${encodeURIComponent(q)}` : ""}`), undefined, { signal }),
+  /** One workflow or action opened (W29-R04): `repo` is `owner/name`; at `ref` (a branch, tag or commit; its default branch's head without one), or a draft by its id (W29-R10). */
+  pipeline: (repo: string, path: string, at: { ref?: string | null; draft?: string | null }, signal?: AbortSignal) => {
+    const q = new URLSearchParams({ path });
+    if (at.ref) q.set("ref", at.ref);
+    if (at.draft) q.set("draft", at.draft);
+    return request<ShipPipelinePane>("GET", apiPath(`/api/ship/pipelines/${repo.split("/").map(encodeURIComponent).join("/")}?${q.toString()}`), undefined, { signal });
+  },
+  /** One of the strip's verbs on a workflow or action, as its CI operation (W29-R04). */
+  pipelinesAct: (body: ShipPipelineAct) => request<unknown>("POST", apiPath("/api/ship/pipelines"), body),
 };
 
 /**

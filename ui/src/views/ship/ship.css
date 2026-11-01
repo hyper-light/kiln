@@ -1343,3 +1343,82 @@
     grid-template-columns: 1fr 96px 1fr;
   }
 }
+
+/* Ship's Pipelines (docs/ci.md W29-R01 to R08, Ada's approved stills of 2026-10-31): workflows and
+   actions as Ship's rows by repository, DRAFT beside a draft's title; an opened row the jobs pane's
+   anatomy, as Deploys draws it. Flat: no box around any of it, hairlines between; every height held. */
+.ppl-name {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+.ppl-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ppl-draft {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  color: #8b8e96;
+}
+.ppl-draft svg {
+  align-self: center;
+}
+/* Where it is: its branch as a grey tab, a tag in the tag's colour with its mark; a change as Ship's. */
+.ppl-ref {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 5px;
+  height: 20px;
+  padding: 0 8px;
+  border-radius: 6px;
+  background: rgb(184 194 211 / 0.1);
+  color: #b8c2d3;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+.ppl-ref[data-ref="tag"] {
+  background: rgb(216 203 176 / 0.1);
+  color: #d8cbb0;
+}
+.ppl-ref[data-ref="change"] {
+  color: #cdc6ea;
+}
+.ppl-new .ship-name {
+  color: #b8bcc6;
+}
+.ppl-new .ship-name svg {
+  align-self: center;
+}
+/* An opened row's head: what it is on the left, where it is on the right. */
+.ppl-kicker {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 4px 16px;
+  padding: 8px 0 12px;
+  border-bottom: 1px solid var(--k-line, #2a2c31);
+  color: #8b8e96;
+  font-size: 11px;
+}
+.ppl-kicker > :first-child {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: #9a9da5;
+}
+.ppl-kicker > :last-child {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}

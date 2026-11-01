@@ -41,10 +41,10 @@ const pickLine = (pane: Locator, key: string) => line(pane, key).locator(".jp-li
 const sent = async (page: Page) => ((await (await page.request.get("/api/mock/ship/deploys")).json()) as { bodies: Record<string, unknown>[] }).bodies;
 const last = async (page: Page) => (await sent(page)).at(-1);
 
-test("Ship's tabs are Commits and Deploys; /runs lands on Ship, /deployments on Deploys", async ({ page }) => {
+test("Ship's tabs are Commits, Deploys and Pipelines; /runs lands on Ship, /deployments on Deploys", async ({ page }) => {
   await page.goto("/ship");
   const views = page.getByRole("navigation", { name: "Ship views" });
-  await expect(views.getByRole("link")).toHaveText(["Commits", "Deploys"]);
+  await expect(views.getByRole("link")).toHaveText(["Commits", "Deploys", "Pipelines"]);
   await expect(views.getByRole("link", { name: "Commits" })).toHaveClass(/is-current/);
   await page.goto("/runs");
   await expect(page).toHaveURL(/\/ship$/);
