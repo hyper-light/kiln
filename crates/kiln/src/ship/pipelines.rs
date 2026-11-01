@@ -557,7 +557,7 @@ pub async fn list(hub: &Arc<Hub>, q: &HashMap<String, String>, caller: &crate::a
     let repo = q.get("repo").map(String::as_str).filter(|r| !r.is_empty());
     let text = q.get("q").map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty());
     // Each repository's JSON was rendered when it was gathered: the list joins them.
-    let body = core::list_text(held.iter().map(|h| &h.view), only.as_deref(), repo, text.as_deref());
+    let body = core::list_text(held.iter().map(|h| &h.view), only.as_deref(), repo, text.as_deref(), Some(caller.name.as_str()));
     Ok(srv::response(StatusCode::OK, "application/json", srv::full(body)))
 }
 

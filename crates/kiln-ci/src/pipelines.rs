@@ -322,6 +322,25 @@ pub enum Draft {
     Update,
 }
 
+/// A row's draft as its row and its pane's head show it (W29-R10): how far it has come, whose it
+/// is, and the change it's saved as.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DraftOf {
+    pub state: Draft,
+    pub author: String,
+    pub change: Option<DraftChange>,
+}
+
+/// The change a draft is saved as (W29-R11): a kiln diff (`D12`), or a host's pull or merge
+/// request (`#5`, `!5`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DraftChange {
+    /// `diff` or `change`.
+    pub kind: &'static str,
+    pub name: String,
+    pub url: Option<String>,
+}
+
 /// What the server knows of a row, at its repository's default-branch head.
 #[derive(Debug, Clone, Default)]
 pub struct Facts {
@@ -495,12 +514,28 @@ pub struct Row {
     /// Who changed its file last, and when (seconds).
     pub who: Option<String>,
     pub when: Option<i64>,
+    pub draft: Option<DraftOf>,
 }
 
 impl Row {
     pub fn new(facts: Facts, dialect: Option<&'static str>, line: String, who: Option<String>, when: Option<i64>) -> Row {
         let standing = standing(&facts);
-        Row { facts, standing, dialect, line, who, when }
+        Row { facts, standing, dialect, line, who, when, draft: None }
+    }
+
+    /// The row of a draft (W29-R10): its facts take the draft's state, and its stand follows.
+    pub fn drafted(mut self, d: DraftOf) -> Row {
+        self.facts.draft = Some(d.state);
+        self.standing = standing(&self.facts);
+        self.draft = Some(d);
+        self
+    }
+
+    /// The row as `viewer` sees it, where that differs: W29-R10's Review is someone else's draft
+    /// waiting on you, so to its author a draft in review is still theirs, Unpublished.
+    pub fn seen_by(&self, viewer: &str) -> Option<Row> {
+        let d = self.draft.as_ref().filter(|d| d.state == Draft::Review && d.author == viewer)?;
+        Some(self.clone().drafted(DraftOf { state: Draft::Unpublished, ..d.clone() }))
     }
 }
 
@@ -522,6 +557,8 @@ pub struct Repo {
     pub whole: String,
     /// What it shows, hashed: a gather that changes it sends `pipelines`.
     pub digest: u64,
+    /// Whose drafts in review it has: each of them sees it otherwise ([`Repo::seen_by`]).
+    pub authors: Vec<String>,
 }
 
 impl Repo {
@@ -530,10 +567,23 @@ impl Repo {
         let rendered: Vec<String> = rows.iter().map(|r| row_json(&repo, &branch, &sha, r).to_string()).collect();
         // W29-R17's Access is the master plan's step 5: until then nothing is shared.
         let (say, needs) = heading_of(rows.iter().map(|r| (&r.facts, &r.standing)), false);
-        let mut r = Repo { repo, branch, sha, rows, rendered, say, needs, whole: String::new(), digest: 0 };
+        let mut authors: Vec<String> = rows.iter().filter_map(|r| r.draft.as_ref()).filter(|d| d.state == Draft::Review).map(|d| d.author.clone()).collect();
+        authors.sort_unstable();
+        authors.dedup();
+        let mut r = Repo { repo, branch, sha, rows, rendered, say, needs, whole: String::new(), digest: 0, authors };
         r.whole = r.text(r.rendered.iter().map(String::as_str));
         r.digest = fnv(FNV_START, r.whole.as_bytes());
         r
+    }
+
+    /// The repository as `viewer` sees it, where that differs from what everyone else sees: a
+    /// draft of theirs in review ([`Row::seen_by`]), with its order and heading.
+    pub fn seen_by(&self, viewer: &str) -> Option<Repo> {
+        if !self.authors.iter().any(|a| a == viewer) {
+            return None;
+        }
+        let rows = self.rows.iter().map(|r| r.seen_by(viewer).unwrap_or_else(|| r.clone())).collect();
+        Some(Repo::new(self.repo.clone(), self.branch.clone(), self.sha.clone(), rows))
     }
 
     /// Its JSON with these of its rows' JSON.
@@ -583,8 +633,7 @@ pub fn row_json(repo: &str, branch: &str, sha: &str, r: &Row) -> Value {
         "ref": branch,
         "commit": sha,
         "released": r.facts.released,
-        // W29-R10's draft: the master plan's step 4.
-        "draft": Value::Null,
+        "draft": serde_json::to_value(&r.draft).unwrap_or(Value::Null),
     });
     let h = fnv(FNV_START, v.to_string().as_bytes());
     if let Some(o) = v.as_object_mut() {
@@ -601,22 +650,22 @@ fn row_matches(r: &Row, q: &str) -> bool {
 /// The list's JSON (W29-R03, `{ repos: ShipPipelineRepo[] }`): the repositories the caller may read
 /// (`only`: their names, or `None` for every one), `repo` alone when it's given, and, with `q`
 /// (lowercased), the rows it asks for; those with rows needing someone first, then by name. What
-/// was rendered when the rows were gathered is joined as it is.
-pub fn list_text<'a>(repos: impl IntoIterator<Item = &'a Repo>, only: Option<&[String]>, repo: Option<&str>, q: Option<&str>) -> String {
+/// was rendered when the rows were gathered is joined as it is, but for a repository `viewer` sees
+/// otherwise ([`Repo::seen_by`]).
+pub fn list_text<'a>(repos: impl IntoIterator<Item = &'a Repo>, only: Option<&[String]>, repo: Option<&str>, q: Option<&str>, viewer: Option<&str>) -> String {
     let mut out: Vec<(bool, &str, std::borrow::Cow<'a, str>)> = Vec::new();
     for r in repos.into_iter().filter(|r| only.is_none_or(|names| names.iter().any(|n| n == &r.repo))).filter(|r| repo.is_none_or(|want| want == r.repo)) {
-        let text = match q {
-            None => std::borrow::Cow::Borrowed(r.whole.as_str()),
-            Some(q) if r.repo.to_lowercase().contains(q) => std::borrow::Cow::Borrowed(r.whole.as_str()),
-            Some(q) => {
-                let rows: Vec<&str> = r.rows.iter().zip(&r.rendered).filter(|(row, _)| row_matches(row, q)).map(|(_, j)| j.as_str()).collect();
-                if rows.is_empty() {
-                    continue;
-                }
-                std::borrow::Cow::Owned(r.text(rows.into_iter()))
-            }
+        let (needs, text) = match viewer.and_then(|v| r.seen_by(v)) {
+            Some(own) => match text_of(&own, q) {
+                Some(t) => (own.needs, std::borrow::Cow::Owned(t.into_owned())),
+                None => continue,
+            },
+            None => match text_of(r, q) {
+                Some(t) => (r.needs, t),
+                None => continue,
+            },
         };
-        out.push((r.needs > 0, r.repo.as_str(), text));
+        out.push((needs > 0, r.repo.as_str(), text));
     }
     out.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
     let mut body = String::with_capacity(out.iter().map(|(_, _, t)| t.len() + 1).sum::<usize>() + 16);
@@ -629,6 +678,18 @@ pub fn list_text<'a>(repos: impl IntoIterator<Item = &'a Repo>, only: Option<&[S
     }
     body.push_str("]}");
     body
+}
+
+/// A repository's JSON in the list: whole, or (`q`) with the rows it asks for, none if none does.
+fn text_of<'b>(r: &'b Repo, q: Option<&str>) -> Option<std::borrow::Cow<'b, str>> {
+    match q {
+        None => Some(std::borrow::Cow::Borrowed(r.whole.as_str())),
+        Some(q) if r.repo.to_lowercase().contains(q) => Some(std::borrow::Cow::Borrowed(r.whole.as_str())),
+        Some(q) => {
+            let rows: Vec<&str> = r.rows.iter().zip(&r.rendered).filter(|(row, _)| row_matches(row, q)).map(|(_, j)| j.as_str()).collect();
+            (!rows.is_empty()).then(|| std::borrow::Cow::Owned(r.text(rows.into_iter())))
+        }
+    }
 }
 
 /// The secrets and variables a workflow's or action's text names in its expressions
@@ -989,6 +1050,56 @@ pub fn verbs(kind: Kind) -> Vec<Verb> {
     out
 }
 
+/// Who looks at a pane, for its verbs: their name, and whether they may submit changes to its
+/// repository (`diffs.submit`).
+#[derive(Debug, Clone, Copy)]
+pub struct Viewer<'a> {
+    pub name: &'a str,
+    pub can_submit: bool,
+}
+
+/// The strip's verbs for `row` as `viewer` sees it, once drafts are built (W29-R04, R10 to R14),
+/// each there or dimmed with why:
+/// - Run: its author's draft, a workflow that runs by hand (`by_hand`: it has `workflow_dispatch`,
+///   or kiln's `manual`), or an action's Try it (W21-R07);
+/// - Save draft: whoever may submit;
+/// - Ready and Discard: the draft's own author;
+/// - Release, for what's shared: dimmed until releases are built (W29-R21).
+pub fn verbs_for(row: &Row, viewer: Viewer<'_>, by_hand: bool) -> Vec<Verb> {
+    let on = |verb: &'static str, label: &'static str| Verb { verb, label, enabled: true, why_not: None };
+    let dim = |verb: &'static str, label: &'static str, why: &'static str| Verb { verb, label, enabled: false, why_not: Some(why) };
+    let kind = row.facts.kind;
+    let draft = row.draft.as_ref();
+    let mine = draft.is_some_and(|d| d.author == viewer.name);
+    let update = draft.is_some_and(|d| d.state == Draft::Update);
+    let run = match draft {
+        Some(_) if mine => on("run", "Run"),
+        Some(_) => dim("run", "Run", "A draft runs only by its author's hand (W29-R14)"),
+        None if kind == Kind::Reusable => dim("run", "Run", "A reusable workflow runs where it's called (W29-R14)"),
+        None if kind == Kind::Workflow && !by_hand => dim("run", "Run", "It has no workflow_dispatch or manual trigger to run it by hand (W29-R14)"),
+        None => on("run", "Run"),
+    };
+    let save = if viewer.can_submit { on("save_draft", "Save draft") } else { dim("save_draft", "Save draft", "Saving a draft needs diffs.submit (W29-R11)") };
+    let ready = match draft {
+        None => dim("ready", "Ready", "Ready is for a draft (W29-R12)"),
+        Some(_) if update => dim("ready", "Ready", "kiln's update drafts come with releases (W29-R22)"),
+        Some(_) if !mine => dim("ready", "Ready", "Only its author marks it ready (W29-R12)"),
+        Some(d) if d.state == Draft::Review => dim("ready", "Ready", "It's in review already (W29-R12)"),
+        Some(_) => on("ready", "Ready"),
+    };
+    let discard = match draft {
+        None => dim("discard", "Discard", "Discard is for a draft (W29-R13)"),
+        Some(_) if update => dim("discard", "Discard", "kiln's update drafts come with releases (W29-R22)"),
+        Some(_) if !mine => dim("discard", "Discard", "Only its author discards it (W29-R13)"),
+        Some(_) => on("discard", "Discard"),
+    };
+    let mut out = vec![run, save, ready, discard];
+    if kind.is_action() || kind == Kind::Reusable {
+        out.push(dim("release", "Release", "Releases by tag come after sharing (W29-R21)"));
+    }
+    out
+}
+
 /// What the pane's head and detail say of the opened file (W29-R04).
 #[derive(Debug, Clone)]
 pub struct Opened<'a> {
@@ -1006,7 +1117,7 @@ pub fn pane_json(o: &Opened<'_>, groups: &[PaneGroup]) -> Value {
     json!({
         "head": {
             "title": f.name, "path": f.path, "kind": f.kind.as_str(), "dialect": o.row.dialect,
-            "ref": o.at, "commit": o.sha, "draft": Value::Null,
+            "ref": o.at, "commit": o.sha, "draft": serde_json::to_value(&o.row.draft).unwrap_or(Value::Null),
             "stand": o.row.standing.stand, "word": o.row.standing.word, "pips": o.row.standing.pips,
         },
         "strip": {
@@ -1154,7 +1265,7 @@ mod tests {
     }
 
     fn list(repos: &[Repo], only: Option<&[String]>, repo: Option<&str>, q: Option<&str>) -> Value {
-        serde_json::from_str(&list_text(repos, only, repo, q)).unwrap_or_default()
+        serde_json::from_str(&list_text(repos, only, repo, q, None)).unwrap_or_default()
     }
 
     #[test]
@@ -1191,7 +1302,7 @@ mod tests {
         let mut took: Vec<std::time::Duration> = Vec::new();
         for _ in 0..100 {
             let t = std::time::Instant::now();
-            let body = list_text(&all, Some(&only), None, None);
+            let body = list_text(&all, Some(&only), None, None, None);
             took.push(t.elapsed());
             assert!(body.len() > 100_000, "{}", body.len());
         }
@@ -1301,6 +1412,65 @@ mod tests {
         assert!(w.iter().all(|v| !v.enabled && v.why_not.is_some_and(|y| y.contains("W29-R"))), "{w:?}");
         assert_eq!(verbs(Kind::Composite).iter().map(|v| v.verb).collect::<Vec<_>>(), ["run", "save_draft", "ready", "discard", "release"]);
         assert!(verbs(Kind::Reusable).iter().any(|v| v.verb == "release"));
+    }
+
+    #[test]
+    fn w29_r04_verbs_by_draft_state() {
+        let ada = Viewer { name: "ada", can_submit: true };
+        let sam = Viewer { name: "sam", can_submit: true };
+        let reader = Viewer { name: "rae", can_submit: false };
+        let draft = |state| DraftOf { state, author: "ada".into(), change: Some(DraftChange { kind: "diff", name: "D12".into(), url: None }) };
+        let wf = Row::new(facts(Kind::Workflow), Some("gha"), String::new(), None, None);
+        let saved = wf.clone().drafted(draft(Draft::Unpublished));
+        let review = wf.clone().drafted(draft(Draft::Review));
+        let update = wf.clone().drafted(DraftOf { state: Draft::Update, author: "kiln".into(), change: None });
+        let said = |row: &Row, v: Viewer<'_>, by_hand: bool| -> Vec<(&'static str, bool, Option<&'static str>)> { verbs_for(row, v, by_hand).into_iter().map(|x| (x.verb, x.enabled, x.why_not)).collect() };
+        let on = |row: &Row, v: Viewer<'_>, by_hand: bool| -> Vec<&'static str> { verbs_for(row, v, by_hand).into_iter().filter(|x| x.enabled).map(|x| x.verb).collect() };
+        // The author's own draft: everything but Release, which isn't built yet.
+        assert_eq!(on(&saved, ada, false), ["run", "save_draft", "ready", "discard"]);
+        // In review: Ready is done; Run and Discard are still theirs.
+        assert_eq!(on(&review, ada, false), ["run", "save_draft", "discard"]);
+        // Someone else's: only Save draft (their own draft of it), the rest saying why.
+        assert_eq!(on(&review, sam, false), ["save_draft"]);
+        assert!(said(&review, sam, false).iter().any(|(v, _, why)| *v == "ready" && why.is_some_and(|w| w.contains("Only its author"))));
+        // A published workflow runs by hand only with workflow_dispatch or manual.
+        assert_eq!(on(&wf, sam, true), ["run", "save_draft"]);
+        assert_eq!(on(&wf, sam, false), ["save_draft"]);
+        assert_eq!(on(&wf, reader, true), ["run"], "reading isn't submitting");
+        // A reusable workflow runs where it's called; an action runs by Try it; kiln's update drafts wait.
+        let reusable = Row::new(facts(Kind::Reusable), Some("gha"), String::new(), None, None);
+        assert!(on(&reusable, ada, true).iter().all(|v| *v != "run"));
+        assert!(on(&Row::new(facts(Kind::Composite), None, String::new(), None, None), ada, false).contains(&"run"));
+        assert_eq!(on(&update, ada, false), ["save_draft"]);
+        // Never hidden: each verb is there, and each one off says why.
+        for (row, v) in [(&saved, ada), (&review, sam), (&wf, reader), (&update, sam), (&reusable, reader)] {
+            let all = said(row, v, false);
+            assert!(all.len() >= 4, "{all:?}");
+            assert!(all.iter().all(|(_, enabled, why)| *enabled || why.is_some_and(|w| w.contains("W29-R"))), "{all:?}");
+        }
+    }
+
+    #[test]
+    fn w29_r10_a_draft_in_review_is_its_authors() {
+        let mk = |name: &str, kind: Kind| Row::new(Facts { name: name.into(), path: format!(".github/workflows/{name}.yml"), ..facts(kind) }, Some("gha"), String::new(), None, None);
+        let review = mk("stress", Kind::Workflow).drafted(DraftOf { state: Draft::Review, author: "ada".into(), change: Some(DraftChange { kind: "change", name: "#5".into(), url: Some("https://github.com/acme/app/pull/5".into()) }) });
+        let repo = Repo::new("acme/app".into(), "main".into(), "a".repeat(40), vec![mk("ci", Kind::Workflow), review]);
+        assert_eq!(repo.authors, ["ada"]);
+        // Everyone else is asked to review it.
+        let them = list(std::slice::from_ref(&repo), None, None, None);
+        assert_eq!(them.pointer("/repos/0/rows/0/word").and_then(Value::as_str), Some("Review"), "{them}");
+        assert_eq!(them.pointer("/repos/0/say").and_then(Value::as_str), Some("2 workflows · 1 waits on you"), "{them}");
+        assert_eq!(them.pointer("/repos/0/rows/0/draft/change/name").and_then(Value::as_str), Some("#5"), "{them}");
+        assert_eq!(them.pointer("/repos/0/rows/0/draft/state").and_then(Value::as_str), Some("review"), "{them}");
+        // Its author waits on them: to her it's still hers, unpublished.
+        let her: Value = serde_json::from_str(&list_text(std::slice::from_ref(&repo), None, None, None, Some("ada"))).unwrap_or_default();
+        let row = her.pointer("/repos/0/rows").and_then(Value::as_array).and_then(|rows| rows.iter().find(|r| r.get("name").and_then(Value::as_str) == Some("stress")).cloned()).unwrap_or_default();
+        assert_eq!((row.get("word").and_then(Value::as_str), row.get("stand").and_then(Value::as_str)), (Some("Unpublished"), Some("waiting")), "{her}");
+        assert_eq!(her.pointer("/repos/0/say").and_then(Value::as_str), Some("2 workflows · 1 draft"), "{her}");
+        assert_eq!(her.pointer("/repos/0/needs").and_then(Value::as_u64), Some(0), "{her}");
+        // Someone with no draft there sees what everyone does, and a row without one says null.
+        assert_eq!(list_text(std::slice::from_ref(&repo), None, None, None, Some("sam")), list_text(std::slice::from_ref(&repo), None, None, None, None));
+        assert!(them.pointer("/repos/0/rows/1/draft").is_some_and(Value::is_null), "{them}");
     }
 
     #[test]
