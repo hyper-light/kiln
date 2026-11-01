@@ -205,7 +205,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W24 | Incremental CI: fingerprints, reuse, warm state, shared caches | W04, W05, W06, W08, W13, W18 | ready | specified (2026-10-24): R01–R31, AC01–AC15; milestones M0–M7 and M1e are kiln goals with plans |
 | W26 | Review in Ship: changes as Ship items, each owning its review | W14, W23, W27, Ship (the CI/CD Integration plan) | in progress | R06–R15 built: each item's dropdown owns its review (Files and the Conversation, search on vorpal, kinds and the gate, suggestions and conflicts as revisions, the Review lanes), unsigned until W27-R03; AC06 in Chromium, not yet WebKit; specified (2026-10-25): R01–R20, AC01–AC11; plan `01a175b7d5e1772f8d3c7cb28e50ab2b` |
 | W27 | Attested end to end: identities, signatures, hand-offs, the trail | W10, W18, W26 | in progress | specified (2026-10-25): R01–R12, AC01–AC08; research `01a175c54441773fa28bf1488b82e6aa`; identities built (R01, R02, R12; AC01, AC02): plan `01a17856b1b0712babf8dfd37ce48756` |
-| W29 | Pipelines in Ship: author, run, share and lock workflows and actions | W02, W03, W04, W07, W13, W14, W21, W23, W26 | in progress | specified (2026-10-31): R01–R31, AC01–AC29, S01–S17; the design approved on stills `pl-1` to `pl-9`; the read model and API built (R02, R03, R04's pane, R09's reads); drafts built (R10–R14); plan `01a19474452d7084bae269952cc6c26a` |
+| W29 | Pipelines in Ship: author, run, share and lock workflows and actions | W02, W03, W04, W07, W13, W14, W21, W23, W26 | in progress | specified (2026-10-31): R01–R31, AC01–AC29, S01–S17; the design approved on stills `pl-1` to `pl-9`; the read model and API built (R02, R03, R04's pane, R09's reads); drafts built (R10–R14); sharing built (R17–R20: Access, one check, the catalog, Access and Used by in Ship); plan `01a19474452d7084bae269952cc6c26a` |
 
 ---
 
@@ -2671,9 +2671,13 @@ Gives step execution for `uses:`. W29 grows resolution and the catalog: Access o
   it again as it arrives; entries that would land outside the destination are refused.
 - *Done.* R01's `kiln://owner/repo[/path]@ref` (`w07_r01_kiln_actions`): an action in one of
   kiln's own repositories, pinned at run start from kiln's own git, mirrored and served apart
-  from GitHub's of the same name (`/_kiln/actions/kiln/…`), run as GitHub's are. It's its owner's
+  from GitHub's of the same name (`/_kiln/actions/kiln/…`), run as GitHub's are. It was its owner's
   repositories' to use, as a private action on GitHub is its owner's: another owner's workflow
-  fails at the start, saying so, and a leg of another owner's can't download it.
+  failed at the start, saying so, and a leg of another owner's couldn't download it. W29-R17
+  changed that default on 2026-11-01. Now its repository's Access says who may use it, and it's
+  not shared until `share:` says so, as GitHub's "Not accessible" is the default. `share: owner`
+  is the old rule. A use the Access doesn't allow fails the run at its start (`KCI4022`, W29-R19),
+  and its leg can't download it.
 - *Done.* Tarballs in W08's store: each action's tarball (GitHub's, `kiln://` and `$/`), made
   once by `git archive`, is a store object (`ci_action_tarballs`), so an action's versions share
   their chunks, and the store's collection keeps them. One kept as a file under
@@ -10130,30 +10134,43 @@ endpoint, for a repository kiln hosts and for one on GitHub:
   It runs wherever a name leads to a repository kiln hosts: `kiln://`, or a plain name that a
   native source sends there (W29-R18).
   - `Remote::usable_by` (`crates/kiln/src/ci/actions.rs`) grows from "the same owner" to W29-R17's
-    three levels. `reusable::remote` calls it, as `actions::resolve` does.
-  - Today `reusable.rs` pins a reusable workflow (`actions::pin_ref`) without the check `kiln://`
-    actions get (`Remote::usable_by`). That's the audit's likely defect, and a test shows it first.
+    three levels. `reusable::files` calls it before it fetches a remote workflow
+    (`reusable::remote`), as `actions::resolve` does.
+  - Before W29, `reusable.rs` pinned a reusable workflow (`actions::pin_ref`) without the check
+    `kiln://` actions got (`Remote::usable_by`). That was the audit's defect;
+    `w29_r19_actions_and_reusable_workflows_alike` holds it fixed.
   - A refused call fails the run at its start (`KCI4022`), as GitHub fails it, with
-    "`owner/repo/.github/workflows/x.yml` isn't shared with `caller`".
+    "`kiln://acme/kit/.github/workflows/x.yml`: `acme/kit` isn't shared with `acme/app` (its
+    `share:` is `none`)", and the `share:` that would let it.
 
   GitHub-exact: GitHub checks a reusable workflow's access as it checks an action's. Nothing in
   this requirement is kiln's own.
-- **W29-R20 The catalog.** `GET /api/ci/actions?q=&kind=&owner=` (`ci.actions.list`, grown) lists:
+- **W29-R20 The catalog.** `GET /api/ci/actions?q=&kind=&owner=&repo=` (`ci.actions.list`,
+  grown) lists:
   - the built-ins and GitHub's mirrored actions, as today;
   - the actions of every repository kiln hosts that the caller may use, in any path (`action.yml`
     at the root, `.github/actions/**`, `.kiln/actions/**`);
   - every reusable workflow (a workflow `on: workflow_call`), with its inputs, outputs and secrets.
 
-  Each entry is `{ uses, kind, owner, repo, path, description, inputs, outputs, secrets, access }`.
-  `kind` is `javascript`, `composite`, `docker`, `firecracker`, `shards` or `workflow`, and `kind=`
-  filters by it. `uses` is what to write: the plain name, or `kiln://` (W29-R18).
+  The caller is a repository, as on GitHub: `repo=` names the one whose workflows would use what's
+  listed, and only what it may use is listed. Without it, every repository's are listed, each with
+  its access.
+
+  Each entry is `{ uses, kind, owner, repo, path, name, description, inputs, outputs, secrets,
+  access }`. `kind` is `javascript`, `composite`, `docker`, `firecracker`, `shards` or `workflow`,
+  and `kind=` filters by it. `uses` is what to write: the plain name, or `kiln://` (W29-R18). It's
+  written at the newest tag that has the file, else at the default branch's commit.
 
   `GET /api/ci/actions/:owner/:repo?path=` (`ci.actions.get`, new) gives one action or reusable
   workflow:
   - its versions: its tags, each with its commit and its own checks;
   - its access (W29-R17);
   - its consumers: which repositories use which version, from runs' pins (W07-R02) and consumers'
-    locks (W29-R23, R24).
+    locks (W29-R23, R24). Each run's start writes what it pinned of other repositories, actions
+    and remote reusable workflows alike, to `ci_uses`.
+
+  Without `path` it gives every one of the repository's, with consumers of any of them.
+  `ci.actions.get` takes the repository as `repo` (`owner/name`), as kiln's other operations do.
 
   It feeds the editor's completion (W21-R01, W07-R12) and the pane's Uses, Versions and Used by
   groups (W29-R04). Inputs, outputs and secrets are read as GitHub reads them, from `action.yml`
@@ -10510,7 +10527,7 @@ lockfile, which pins commit A. An attacker moves `v45` and `v45.0.7` to commit M
 | verbs `turn_off`, `turn_on` (W29-R15); `POST /api/ci/repos/:repo/workflows/:path/{disable,enable}` | `ci.workflows.disable`, `ci.workflows.enable`, new | the switch, who and why |
 | verb `settings` (W29-R16, R17, R22, R26) | `ci.workflows.edit`, grown to `.kiln/config.yaml`, as a draft | the draft |
 | verb `release` (W29-R21); `POST /api/ci/repos/:repo/releases { sha, tag, major? }` | `ci.releases.tag`, new | the tag (and GitHub's release) |
-| `GET /api/ci/actions?q=&kind=&owner=` (W29-R20) | `ci.actions.list`, grown | actions and reusable workflows the caller may use |
+| `GET /api/ci/actions?q=&kind=&owner=&repo=` (W29-R20) | `ci.actions.list`, grown | actions and reusable workflows the caller (`repo`) may use |
 | `GET /api/ci/actions/:owner/:repo?path=` (W29-R20) | `ci.actions.get`, new | versions, access, consumers |
 | `POST /api/ci/repos/:repo/locks { ref? }` (W29-R25) | `ci.locks.update`, new | a draft of the regenerated locks |
 | `GET /api/ci/repos/:repo/locks/verify?sha=` (W29-R25) | `ci.locks.verify`, new | `{ fresh, stale: [{ workflow, uses, locked, now }] }` |
@@ -10754,9 +10771,28 @@ Its step 4, drafts, is built (R10–R14, with R04's verbs and R09's `ship.pipeli
 - Ship shows each draft as a row of its own with DRAFT and its state's word, and opens its pane
   (`draft=`). Each pane's verbs are the viewer's (`verbs_for`).
 
+Its step 5, sharing, is built (R17–R20):
+- `kiln_ci::sharing` decides who may use what a repository shares: its Access (`none`, `owner`,
+  `everyone`), `share:`'s words and GitHub's levels, and KCI4022's refusal, which says what
+  `share:` would let it (R17).
+- `ci::sharing` reads each repository's Access: GitHub's own setting where kiln holds a
+  credential, asked again at most every 20 s, else `.kiln/config.yaml`'s `share:` on its trunk,
+  as `ci::repo_config` keeps it (20 s). A change to `share:` holds within 20 s.
+- One check (R19): `Remote::usable_by` runs on every `uses:` a run can reach that leads to a
+  repository kiln hosts, actions and reusable workflows alike. `reusable::files` doesn't fetch a
+  workflow the caller may not use, and the run fails at its start with KCI4022. A leg can't
+  download what its repository may not use. W07-R01's same-owner default is gone (see W07).
+- The catalog (R20): `ci.actions.list` lists what kiln's repositories share, with `repo=` as the
+  caller, and `ci.actions.get` gives one's tags, access and consumers (`ci_uses`).
+  `kiln_ci::catalog` makes the entries.
+- In Ship, each repository's head says its access, and a shared one's heading says so. An
+  action's pane and a reusable workflow's have Used by and the Access in Settings.
+
 Not built yet: New (R08); GitHub's own dispatch where GitHub is the provider (R14); turning a
-workflow off and on (R15). The Kiln PRs agent has the `githost` changes to answer. Next is sharing
-(R17–R20, the plan's step 5). The tab (R01) and editing (R05, R06) come with the plan's step 7.
+workflow off and on (R15). Two gaps found on the way come next: a draft-only commit pinned
+through a native source's plain name or by a reusable call (R10), and a kiln draft's own workflow
+starting when it's marked Ready (R12). Then releases and update drafts (R21, R22, the plan's step
+6). The tab (R01) and editing (R05, R06) come with the plan's step 7.
 
 ## 4. API, events, CLI and MCP reference
 
