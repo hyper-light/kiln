@@ -38,12 +38,12 @@ state: string,
 /**
  * The review state of a change kiln hosts (`needs-review`, `approved`, …).
  */
-review?: string,
+review?: string, 
 /**
  * Whether it's a draft, not ready for review yet (W26-R18), on kiln and on its host alike:
  * marked ready by `agents.change`'s `ready`, or by a person.
  */
-draft?: boolean,
+draft?: boolean, 
 /**
  * How its newest version's checks went (`passed`, `failed`, …), once kiln knows.
  */

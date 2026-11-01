@@ -294,10 +294,12 @@ pub async fn open(hub: &Arc<Hub>, actor: &str, info: &Info, want: Want) -> Resul
     let paths = paths_of(hub, &info.id);
     // In a workspace of its own, everything that changed there is its: its commands' changes too.
     let own = info.workspace.as_ref().is_some_and(|w| w.made.is_some());
-    // Nothing new to push: `ready` alone marks its draft ready where it is (W26-R18).
+    // Nothing new to push (no file changed, or no edit since its last version): `ready` alone
+    // marks its draft ready where it is (W26-R18).
+    let edited = edits_of(info);
+    let pushed_at = hub.store.kv_get(edits_key(&info.id)).await.ok().flatten().and_then(|v| v.parse::<u64>().ok());
     if want.ready
-        && paths.is_empty()
-        && !own
+        && ((paths.is_empty() && !own) || pushed_at == Some(edited))
         && let Some(r) = of(hub, &info.id).await
     {
         return ready_only(hub, actor, info, r).await;
@@ -447,12 +449,24 @@ pub async fn open(hub: &Arc<Hub>, actor: &str, info: &Info, want: Want) -> Resul
         stack: None,
     };
     save(hub, &record).await;
+    let _ = hub.store.kv_set(edits_key(&info.id), edited.to_string()).await;
     let what = record.change.clone().unwrap_or_else(|| format!("branch {branch}"));
     hub.store.audit(actor.to_owned(), "agent.change".into(), format!("{} ({}): {what} v{} into {trunk}", info.name, lineage_short(&info.id), record.version)).await;
     if let Some(why) = unready {
         return Err(fail(StatusCode::BAD_GATEWAY, format!("version {} is pushed, but {why}", record.version)));
     }
     Ok(record)
+}
+
+/// Where agent `agent`'s edits as of its last pushed version are kept (W26-R18): `ready` with no
+/// edit since pushes nothing.
+fn edits_key(agent: &str) -> String {
+    format!("agents/change-edits/{agent}")
+}
+
+/// How much agent `info` has edited so far: lines added and removed, as its changeset counts them.
+fn edits_of(info: &Info) -> u64 {
+    u64::from(info.lines_added) + u64::from(info.lines_removed)
 }
 
 /// The number of change `name` (`CR12`, `D7`, `#34`): 12, 7, 34.
