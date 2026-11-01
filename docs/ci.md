@@ -10042,8 +10042,8 @@ endpoint, for a repository kiln hosts and for one on GitHub:
 | 3 | Save draft | R11 | `{verb: "save_draft"}` → the diff's next version | `{verb: "save_draft"}` → a commit on the branch |
 | 4 | Run the draft | R14 | `{verb: "run", sha, event}` → `ci.runs.trigger` on kiln's engine; a draft's run | the same: kiln's engine, never GitHub's |
 | 5 | Ready | R12 | `{verb: "ready"}` → `ci.diffs.ready` | `{verb: "ready"}` → head without `[skip ci]`, then `markPullRequestReadyForReview` |
-| 6 | Review and checks | W14, W26 | the diff's review in Ship; its checks run | the pull request's review (W23, W26-R20); checks run on the new head |
-| 7 | Land: published | R10 | the land queue (W14) lands it on the default branch | the merge (W26-R19 through the merge queue) |
+| 6 | Review and checks | W14, W26 | `ci.diffs.review` in Ship's dropdown; its `diff` checks run | the pull request's review through W23-R06's one API for hosts' pull requests (`ci.change_requests.*`); `pull_request` checks run on the new head |
+| 7 | Land: published | R10 | `ci.diffs.land`: the land queue (W14) lands it on the default branch | the merge through GitHub's merge queue (`gh pr merge --auto`, W14-R11, W26-R19) |
 | 8 | The row without DRAFT | R03 | the read model gathers again on the default branch's move; the `pipelines` event | the same |
 | — | Discard, at any step | R13 | `{verb: "discard"}` → `ci.diffs.abandon` | `{verb: "discard"}` → `close_change`, `delete_branch` |
 
