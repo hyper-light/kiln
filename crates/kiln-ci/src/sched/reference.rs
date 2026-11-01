@@ -578,7 +578,12 @@ impl Reference {
             // it may run on, then the runner it left takes what fits it, then those its gang's other
             // members left, taken back with it (W05-R40).
             Step::Refused { leg, fence } => {
-                if self.legs.get(leg).is_some_and(|l| matches!(&l.at, At::On { fence: f, .. } if f == fence)) {
+                let live = self.legs.get(leg).is_some_and(|l| matches!(&l.at, At::On { fence: f, .. } if f == fence));
+                // A gang's member refused once one of its gang's attempts has ended ends failed.
+                let ended = self.legs.get(leg).and_then(|l| l.input.gang.as_ref()).is_some_and(|g| self.gangs.get(&g.id).is_some_and(|c| c.ended));
+                if live && ended {
+                    self.finished(leg, &Outcome::Failed(Failed { class: FailureClass::Infra, exit_code: None, log_hits: Vec::new() }), now);
+                } else if live {
                     let left = self.runner_of(leg);
                     self.release(leg, now);
                     let freed = self.take_back_gang(leg, now);

@@ -1622,6 +1622,17 @@ mod tests {
         Ok(())
     }
 
+    /// docs/sim.md's bug 18 (W05-R40, R02): the seeds of E4.6's million where a gang's member, its
+    /// grant heard late by its runner, was refused once its mates had run and ended, and queued again
+    /// to wait for good for a gang that couldn't be whole.
+    #[test]
+    fn the_seeds_where_a_member_refused_after_its_mates_ended_settle() -> Result<(), String> {
+        for seed in [133785, 649568] {
+            run(seed, 0).map_err(|why| format!("seed {seed}: {why}"))?;
+        }
+        Ok(())
+    }
+
     /// docs/needs.md E1.6: a seed runs the same every time.
     #[test]
     fn a_sched_seed_replays_exactly() -> Result<(), String> {

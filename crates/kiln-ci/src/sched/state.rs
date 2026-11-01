@@ -1395,7 +1395,9 @@ impl Scheduler {
             Input::LegGone { leg } => self.gone(&leg, now, &mut out),
             Input::AttemptFinished { leg, attempt, outcome } => self.finished(&leg, attempt, outcome, now, &mut out),
             Input::Rejected { leg, fence } => {
-                if self.live(&leg, fence)
+                if self.live(&leg, fence) && self.after_its_gang_ended(&leg) {
+                    self.ends_without_its_gang(&leg, now, &mut out);
+                } else if self.live(&leg, fence)
                     && let Some(runner) = self.release(&leg, now)
                 {
                     self.stopped(&leg);
@@ -1431,7 +1433,9 @@ impl Scheduler {
                 }
             }
             Input::Ungranted { leg, fence } => {
-                if self.live(&leg, fence)
+                if self.live(&leg, fence) && self.after_its_gang_ended(&leg) {
+                    self.ends_without_its_gang(&leg, now, &mut out);
+                } else if self.live(&leg, fence)
                     && let Some(runner) = self.release(&leg, now)
                 {
                     self.stopped(&leg);
@@ -3943,6 +3947,20 @@ impl Scheduler {
             }
         }
         plan
+    }
+
+    /// Whether a leg is a gang's member whose start has had an attempt end (W05-R40).
+    fn after_its_gang_ended(&self, id: &str) -> bool {
+        self.legs.get(id).and_then(|l| l.input.gang.as_ref()).is_some_and(|g| self.gangs.get(&g.id).is_some_and(Crew::one_ended))
+    }
+
+    /// A gang's member refused or not granted once one of its start's attempts has ended (W05-R40):
+    /// its gang can't go again whole, and it's never tried alone, so it ends failed, `infra` (it
+    /// couldn't start), the others running on. Its runner heard of it late, its mates done (found
+    /// by docs/sim.md's model).
+    fn ends_without_its_gang(&mut self, id: &str, now: i64, out: &mut Vec<Command>) {
+        let Some(attempt) = self.legs.get(id).map(|l| l.attempt) else { return };
+        self.finished(id, attempt, Outcome::Failed(Failed { class: FailureClass::Infra, exit_code: None, log_hits: Vec::new() }), now, out);
     }
 
     /// A leg of a gang joins it (W05-R40): the gang is as big as its members say it is.

@@ -3174,6 +3174,28 @@ fn w05_r40_a_restart_rebuilds_a_gang_as_it_ran() {
     assert_eq!(s.check_grants(), Ok(()));
 }
 
+/// W05-R40, R02, R05 (docs/sim.md's bug 18): a gang's member refused once another's attempt has
+/// ended (its runner heard of its grant late, its mates done meanwhile) can't go again with its
+/// gang, nor alone: it ends failed, infra, the others running on, rather than queued to wait for
+/// good for a gang that can't be whole; one not granted then likewise.
+#[test]
+fn w05_r40_a_member_refused_or_not_granted_after_another_ended_ends_failed() {
+    let (mut s, grants) = gang_of_three();
+    s.handle(Input::AttemptFinished { leg: "m0".into(), attempt: 1, outcome: Outcome::Success }, 2);
+    let infra = |c: &[Command], m: &str| c.iter().any(|x| matches!(x, Command::Settled { leg, outcome: Outcome::Failed(f), .. } if leg == m && f.class == FailureClass::Infra));
+    let (_, fence) = grants.get("m1").cloned().unwrap_or_default();
+    let c = s.handle(Input::Rejected { leg: "m1".into(), fence }, 3);
+    assert!(infra(&c, "m1"), "{c:?}");
+    assert!(taken_back(&c).is_empty(), "{c:?}");
+    assert!(s.grant("m2").and_then(|g| g.1).is_some(), "m2 runs on");
+    assert_eq!(s.check_grants(), Ok(()));
+    let (_, fence) = grants.get("m2").cloned().unwrap_or_default();
+    let c = s.handle(Input::Ungranted { leg: "m2".into(), fence }, 4);
+    assert!(infra(&c, "m2"), "{c:?}");
+    assert_eq!(s.grant("m2"), None);
+    assert_eq!(s.check_grants(), Ok(()));
+}
+
 /// W05-R40, R25 (docs/sim.md's bug 15): a gang of two whose one member settled before the server
 /// restarted: the rebuild brings back only the other, its start one ended already, so lost then it
 /// ends failed, runner-lost, as it would have without the restart, not tried again alone to wait
