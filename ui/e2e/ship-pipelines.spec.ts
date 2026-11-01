@@ -303,3 +303,48 @@ test("Run with inputs: the strip asks for them in place, each its default first;
   expect((await sentBodies(page)).at(-1)).toEqual({ repo: "hyper-light/kiln", path: ".kiln/ci.yaml", verb: "run" });
   expect(await sideways(page)).toBe(0);
 });
+
+test("New: seven kinds, the dialect a workflow's, where it starts; the files it makes edited in place; Create draft saves them as a draft", async ({ page, isMobile }) => {
+  await page.request.get("/api/mock/ship/pipelines?reset=1");
+  await atStillWidth(page, isMobile);
+  await page.goto("/ship/pipelines");
+  await notices(page);
+  const row = page.locator('.ppl-row[data-key="hyper-light/ci-kit:new"]');
+  await row.locator(".ship-main").click();
+  const pane = row.getByRole("region", { name: "New" });
+  await expect(pane.locator('.jp-j[data-key^="make."]')).toHaveCount(7);
+  await expect(pane.locator('.jp-j[data-key="lang.ts"]')).toHaveAttribute("data-dim", "true");
+  // A Firecracker action: its three files, its path under its name.
+  await pane.locator('.jp-j[data-key="make.firecracker"] .jp-line').click();
+  await expect(pane.locator(".jp-said")).toContainText("Firecracker action");
+  const tabs = pane.getByRole("tablist", { name: "Its files" }).getByRole("tab");
+  await expect(tabs).toHaveText(["action.yml", "Dockerfile", "run.sh"]);
+  const name = pane.getByLabel("Name", { exact: true });
+  await name.fill("fuzz-more");
+  await name.press("Enter");
+  await expect(pane.locator('li[data-field="path"] .v')).toHaveText(".github/actions/fuzz-more/action.yml");
+  // A dialect is a workflow's: dimmed for an action, saying why.
+  await pane.locator('.jp-j[data-key="lang.kiln"] .jp-line').click({ force: true });
+  await expect(pane.locator(".jp-said")).toContainText("An action is its action.yml");
+  // run.sh edited where it's shown, then saved with the rest.
+  await pane.getByRole("tablist", { name: "Its files" }).getByRole("tab", { name: "run.sh" }).click();
+  await pane.locator(".ppl-newcode .cm-line").last().click();
+  await page.keyboard.press("End");
+  await page.keyboard.insertText("\necho done");
+  await pane.locator(".ppl-verbs button", { hasText: "Create draft" }).click();
+  await expect(pane.locator(".jp-said")).toContainText("Saved fuzz-more as a draft");
+  const body = (await sentBodies(page)).at(-1) as { files?: { path: string; text: string }[] } & Record<string, unknown>;
+  expect(body).toMatchObject({ repo: "hyper-light/ci-kit", verb: "new", kind: "firecracker", name: "fuzz-more" });
+  expect(body.files?.map((f) => f.path)).toEqual([".github/actions/fuzz-more/action.yml", ".github/actions/fuzz-more/Dockerfile", ".github/actions/fuzz-more/run.sh"]);
+  expect(body.files?.find((f) => f.path.endsWith("run.sh"))?.text).toContain("echo done");
+  // Its row: DRAFT, Unpublished, in its repository.
+  const made = page.locator('.ppl-row[data-key^="hyper-light/ci-kit:.github/actions/fuzz-more/action.yml:draft:"]');
+  await expect(made.locator(".ship-r .ship-stand")).toHaveText("Unpublished");
+  await expect(made.locator(".ppl-draft")).toHaveText("DRAFT");
+  // A workflow in kiln's dialect: its path under .kiln/.
+  await pane.locator('.jp-j[data-key="make.workflow"] .jp-line').click();
+  await pane.locator('.jp-j[data-key="lang.kiln"] .jp-line').click();
+  await expect(pane.locator('li[data-field="path"] .v')).toHaveText(".kiln/new-workflow.yaml");
+  await expect(page.locator("[role=dialog], .cm-tooltip")).toHaveCount(0);
+  expect(await sideways(page)).toBe(0);
+});

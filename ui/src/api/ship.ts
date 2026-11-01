@@ -295,7 +295,7 @@ export interface ShipPipelinePane {
 export interface ShipPipelineAct {
   repo: string;
   path: string;
-  verb: "save_draft" | "ready" | "discard" | "run" | "release";
+  verb: "save_draft" | "ready" | "discard" | "run" | "release" | "new";
   content?: string;
   title?: string;
   event?: string;
@@ -308,6 +308,13 @@ export interface ShipPipelineAct {
   major?: boolean;
   confirm?: boolean;
   notes?: string;
+  /** New's (W29-R08): what to make, its name, its dialect (`gha`, `kiln`), where it starts, its files as edited; `dry` says them without saving. */
+  kind?: string;
+  name?: string;
+  language?: string;
+  from?: string | { starter: string } | { copy: string };
+  files?: { path: string; text: string }[];
+  dry?: boolean;
 }
 
 /** Ship's Pipelines (W29-R03): the repositories the caller may read, each with its workflows and actions as rows. */

@@ -1636,7 +1636,9 @@
 }
 /* W21's editor holds 420px at the least (index.css); here it's its frame's height. */
 .ppl-yaml .code-editor,
-.ppl-yaml .code-editor .cm-editor {
+.ppl-yaml .code-editor .cm-editor,
+.ppl-newcode .code-editor,
+.ppl-newcode .code-editor .cm-editor {
   min-height: 0;
   height: 100%;
 }
@@ -1758,4 +1760,14 @@
     min-height: 40px;
     align-content: flex-start;
   }
+}
+/* New (W29-R08): Create draft the wider verb; its files' tabs under its name and path. */
+.ppl-verbs .ppl-wide {
+  grid-column: span 2;
+}
+.ppl-files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  padding: 8px 8px 4px;
 }

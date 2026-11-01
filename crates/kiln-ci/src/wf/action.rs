@@ -141,6 +141,7 @@ fn read(fe: &mut Fe<'_>, root: &Node) -> Action {
 fn runs(fe: &mut Fe<'_>, n: &Node) -> ActionRuns {
     let mut r = ActionRuns::default();
     let mut steps_node = None;
+    let mut agentfile = false;
     for (k, v, _) in fe.entries(n, keys::ACTION_RUNS, "runs") {
         let at = format!("runs.{k}");
         match k.as_str() {
@@ -157,6 +158,7 @@ fn runs(fe: &mut Fe<'_>, n: &Node) -> ActionRuns {
             "args" => r.args = v.as_seq().map(|s| s.iter().filter_map(|x| fe.tpl(x, &at)).collect()).unwrap_or_default(),
             "env" => r.env = fe.str_map(v, &at),
             "steps" => steps_node = Some(v),
+            "agentfile" => agentfile = v.text().is_some(),
             _ => {}
         }
     }
@@ -188,8 +190,14 @@ fn runs(fe: &mut Fe<'_>, n: &Node) -> ActionRuns {
             }
             None => fe.diags.push(Diag::error("KCI1014", "a composite action needs `runs.steps`", n.range).at("runs.steps")),
         },
+        // kiln's microVM actions (W29-R29, R30): a Docker action's contract, booted as a microVM per call.
+        "firecracker" | "shards" => {
+            if r.image.is_none() && !(r.using == "shards" && agentfile) {
+                fe.diags.push(Diag::error("KCI1014", format!("a {} action needs `runs.image`{}", r.using, if r.using == "shards" { " or `runs.agentfile`" } else { "" }), n.range).at("runs.image"));
+            }
+        }
         "" => fe.diags.push(Diag::error("KCI1014", "an action needs `runs.using`", n.range).at("runs.using")),
-        other => fe.diags.push(Diag::error("KCI1015", format!("`runs.using` is node20, node24, composite or docker, not `{other}`"), n.range).at("runs.using")),
+        other => fe.diags.push(Diag::error("KCI1015", format!("`runs.using` is node20, node24, composite, docker, or kiln's firecracker or shards, not `{other}`"), n.range).at("runs.using")),
     }
     r
 }

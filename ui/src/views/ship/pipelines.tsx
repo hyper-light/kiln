@@ -272,15 +272,310 @@ function NewRow({ repo, open, onOpen }: { repo: ShipPipelineRepo; open: boolean;
       </div>
       {open ? (
         <div className="ship-open dp-open">
-          <div className="jp ppl-pane">
-            <div className="ppl-kicker">
-              <span>New in {repo.repo}</span>
-              <span>starts as a draft: unpublished until it lands</span>
-            </div>
-          </div>
+          <NewPane repo={repo} onClose={() => onOpen(false)} />
         </div>
       ) : null}
     </li>
+  );
+}
+
+/** New's seven kinds (W29-R08), as Make lists them: what each is, and what it runs on. */
+interface Make {
+  kind: string;
+  label: string;
+  say: string;
+  strip: string;
+}
+const MAKE_WORKFLOW: Make = { kind: "workflow", label: "Workflow", say: "jobs on triggers", strip: "jobs that run on its triggers, on bare metal unless a job says" };
+const MAKE: readonly Make[] = [
+  MAKE_WORKFLOW,
+  { kind: "reusable", label: "Reusable workflow", say: "jobs others call", strip: "jobs other workflows call, with inputs, secrets and outputs" },
+  { kind: "composite", label: "Composite action", say: "steps others use", strip: "steps other workflows use as one" },
+  { kind: "javascript", label: "JavaScript action", say: "node24, in TypeScript", strip: "a Node program, written in TypeScript and built to dist/index.js" },
+  { kind: "docker", label: "Docker action", say: "a container per call", strip: "a container per call, from the image its Dockerfile builds" },
+  { kind: "firecracker", label: "Firecracker action", say: "a microVM per call", strip: "a microVM per call, booted from the image its Dockerfile builds, on machines with KVM" },
+  { kind: "shards", label: "Shards action", say: "a Shards microVM per call", strip: "a Shards microVM per call, booted from the image its Dockerfile builds" },
+];
+/** Where New starts (W29-R08). */
+type From = "blank" | "recommended" | "starter" | "copy";
+
+/** A scaffold's file's language, for the editor's colours. */
+const syntaxOfFile = (path: string): string | undefined => (/action\.ya?ml$/.test(path) || /\.ya?ml$/.test(path) ? "workflow" : resolveLanguage(null, path)?.id);
+
+/** New, opened in place (W29-R08): what to make, in what, from where, its name; the files it makes, edited where they're shown; Create draft or Cancel. */
+function NewPane({ repo, onClose }: { repo: ShipPipelineRepo; onClose: () => void }) {
+  const [kind, setKind] = React.useState("workflow");
+  const [kiln, setKiln] = React.useState(false);
+  const [from, setFrom] = React.useState<From>("blank");
+  const [name, setName] = React.useState("new-workflow");
+  const [said, setSaid] = React.useState<{ text: React.ReactNode; refused: boolean } | null>(null);
+  const [busy, setBusy] = React.useState(false);
+  // The files as edited, by the dry run they came from: another kind, name or start makes them anew.
+  const [edited, setEdited] = React.useState<{ key: string; files: Record<string, string> }>({ key: "", files: {} });
+  const action = !["workflow", "reusable"].includes(kind);
+  const make = MAKE.find((m) => m.kind === kind) ?? MAKE_WORKFLOW;
+  const copyOf = repo.rows.find((r) => ["workflow", "reusable"].includes(r.kind) && !r.draft)?.path ?? null;
+  const ask: ShipPipelineAct = {
+    repo: repo.repo,
+    path: "",
+    verb: "new",
+    kind,
+    name,
+    language: kiln && !action ? "kiln" : "gha",
+    from: from === "starter" ? { starter: "rust" } : from === "copy" && copyOf ? { copy: copyOf } : from,
+  };
+  const key = JSON.stringify(ask);
+  const create = async (files: { path: string; text: string }[]) => {
+    setBusy(true);
+    try {
+      const out = (await shipApi.pipelinesAct({ ...ask, files: files.map((f) => ({ path: f.path, text: edited.key === key ? (edited.files[f.path] ?? f.text) : f.text })) })) as {
+        draft?: { name?: string | null };
+      } | null;
+      setSaid({
+        text: (
+          <>
+            Saved <b>{name}</b> as a draft{out?.draft?.name ? `, ${out.draft.name}` : ""}: unpublished until it lands.
+          </>
+        ),
+        refused: false,
+      });
+      invalidate("ship/pipelines");
+    } catch (e) {
+      setSaid({ text: errorMessage(e), refused: true });
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <section aria-label="New" className="ppl">
+      <div className="ppl-kicker">
+        <span>New in {repo.repo}</span>
+        <span>starts as a draft: unpublished until it lands</span>
+      </div>
+      <Loadable label="Making its files" fallback={<Loading label="Making its files" block className="ppl-slot" />}>
+        <NewBody
+          key={key}
+          ask={ask}
+          askKey={key}
+          make={make}
+          action={action}
+          from={from}
+          name={name}
+          said={said}
+          busy={busy}
+          edited={edited.key === key ? edited.files : {}}
+          copyOf={copyOf}
+          acts={{
+            onKind: (k: string) => {
+              setKind(k);
+              setName(["workflow", "reusable"].includes(k) ? `new-${k === "reusable" ? "reusable" : "workflow"}` : `new-${k}`);
+              setSaid(null);
+            },
+            onDialect: (k: boolean) => setKiln(k),
+            onFrom: (f: From) => setFrom(f),
+            onName: (n: string) => setName(n),
+            onEdit: (path: string, text: string) => setEdited((e) => ({ key, files: { ...(e.key === key ? e.files : {}), [path]: text } })),
+            onCreate: create,
+            onCancel: onClose,
+            onSay: (why: string) => setSaid({ text: why, refused: true }),
+            kiln,
+          }}
+        />
+      </Loadable>
+    </section>
+  );
+}
+
+interface NewActs {
+  onKind: (k: string) => void;
+  onDialect: (kiln: boolean) => void;
+  onFrom: (f: From) => void;
+  onName: (n: string) => void;
+  onEdit: (path: string, text: string) => void;
+  onCreate: (files: { path: string; text: string }[]) => void;
+  onCancel: () => void;
+  onSay: (why: string) => void;
+  kiln: boolean;
+}
+
+/** New's strip, its choices and its files: the files a dry run of New makes (the server's `kiln_ci::scaffold`). */
+function NewBody({
+  ask,
+  askKey,
+  make,
+  action,
+  from,
+  name,
+  said,
+  busy,
+  edited,
+  copyOf,
+  acts,
+}: {
+  ask: ShipPipelineAct;
+  askKey: string;
+  make: (typeof MAKE)[number];
+  action: boolean;
+  from: From;
+  name: string;
+  said: { text: React.ReactNode; refused: boolean } | null;
+  busy: boolean;
+  edited: Record<string, string>;
+  copyOf: string | null;
+  acts: NewActs;
+}) {
+  const dry = useSuspenseResource(`ship/pipelines/new/${askKey}`, () => shipApi.pipelinesAct({ ...ask, dry: true }) as Promise<{ path: string; files: { path: string; text: string }[] }>).data;
+  const [file, setFile] = React.useState(0);
+  const phone = useMediaQuery("(max-width: 700px)");
+  const files = dry.files;
+  const shown = files[Math.min(file, files.length - 1)];
+  // A file's tab: its path in the action's folder, or a workflow's own name.
+  const folder = action ? dry.path.replace(/[^/]+$/, "") : "";
+  const tab = (path: string) => (action ? path.slice(folder.length) : (path.split("/").pop() ?? path));
+  const starts: [From, string, string | null][] = [
+    ["blank", "blank", null],
+    ["recommended", `recommended for ${String(ask.repo).split("/").pop() ?? ""}`, action ? "an action starts blank: recommended is for workflows" : null],
+    ["starter", "a starter", action || acts.kiln || make.kind === "reusable" ? "GitHub's starter workflows are GitHub's dialect, run on push" : null],
+    ["copy", "a copy", copyOf ? null : "this repository has no workflow to copy yet"],
+  ];
+  const detail = (
+    <div className="ppl-detail">
+      <div className="ppl-dhead">
+        <span className="ppl-dname">
+          {name} · {files.length === 1 ? "1 file" : `${files.length} files`}
+        </span>
+      </div>
+      <ul className="ppl-lines ppl-fields" aria-label="Its name and path">
+        <li data-field="name">
+          <span className="n">Name</span>
+          <Field value={name} label="Name" onSet={(v) => acts.onName(v.trim())} />
+        </li>
+        <li data-field="path">
+          <span className="n">Path</span>
+          <span className="v">{dry.path}</span>
+        </li>
+      </ul>
+      <span className="dp-w ppl-views ppl-files" role="tablist" aria-label="Its files">
+        {files.map((f, i) => (
+          <button key={f.path} type="button" role="tab" aria-selected={f === shown} onClick={() => setFile(i)}>
+            {tab(f.path)}
+          </button>
+        ))}
+      </span>
+      <div className="ppl-dbody ppl-newcode" style={{ "--rows": phone ? 14 : 16 } as React.CSSProperties}>
+        {shown ? (
+          <CodeEditor
+            key={shown.path}
+            value={edited[shown.path] ?? shown.text}
+            onChange={(t) => acts.onEdit(shown.path, t)}
+            label={`${shown.path}, as New makes it`}
+            syntax={syntaxOfFile(shown.path)}
+            inline
+          />
+        ) : null}
+      </div>
+      <div className="jp-g">
+        <span>What happens</span>
+        <span />
+      </div>
+      <ul className="ppl-lines">
+        <li>
+          <StatusGlyph state="draft" size={12} />
+          <span className="n">Create draft keeps it unpublished on its own branch: no trigger runs it and nobody can use it</span>
+        </li>
+        <li>
+          <StatusGlyph state="tag" size={12} />
+          <span className="n">{action ? `others use it once a tag has it: uses: ${String(ask.repo)}/${dry.path.replace(/\/action\.ya?ml$/, "")}@<tag>` : "it runs on its triggers once it lands"}</span>
+        </li>
+      </ul>
+    </div>
+  );
+  return (
+    <div className="jp">
+      <div className="jp-strip">
+        <div className="jp-say" data-tone={said?.refused ? "warn" : undefined}>
+          <div className="jp-said" aria-live="polite">
+            {said ? (
+              said.text
+            ) : (
+              <>
+                <b>{make.label}</b> · {make.strip}
+              </>
+            )}
+          </div>
+          <div className="jp-q">
+            <span>start from:</span>
+            {starts.map(([f, label, why], i) => (
+              <React.Fragment key={f}>
+                {i ? <span aria-hidden>·</span> : null}
+                <button type="button" aria-pressed={from === f} aria-disabled={why ? true : undefined} onClick={() => (why ? acts.onSay(why) : acts.onFrom(f))}>
+                  {label}
+                </button>
+              </React.Fragment>
+            ))}
+          </div>
+        </div>
+        <div className="jp-verbs ppl-verbs">
+          <button type="button" className="ppl-wide" aria-disabled={busy || undefined} onClick={() => (busy ? undefined : acts.onCreate(files))}>
+            Create draft
+          </button>
+          <button type="button" onClick={acts.onCancel}>
+            Cancel
+          </button>
+        </div>
+      </div>
+      <div className="jp-body ppl-body">
+        <ol className="jp-list ppl-list" aria-label="What to make">
+          <li className="jp-g">
+            <span>Make</span>
+            <span />
+          </li>
+          {MAKE.map((m) => (
+            <li key={m.kind} className="jp-j" data-key={`make.${m.kind}`} data-sel={m === make || undefined} data-at={m === make || undefined}>
+              <span className="jp-glyph" aria-hidden="true">
+                <StatusGlyph state={m === make ? "passed" : "none"} size={12} />
+              </span>
+              <button type="button" className="jp-line" aria-current={m === make || undefined} onClick={() => acts.onKind(m.kind)}>
+                <span className="n">{m.label}</span>
+                <span className="v">{m.say}</span>
+              </button>
+            </li>
+          ))}
+          <li className="jp-g">
+            <span>Write it in</span>
+            <span>{action ? "an action is its action.yml" : "workflows"}</span>
+          </li>
+          {(
+            [
+              ["gha", "YAML, GitHub's dialect", ".github/workflows/"],
+              ["kiln", "YAML, kiln's dialect", ".kiln/"],
+              ["ts", "TypeScript", "or Python, Go, Rust …: with code workflows (W29-R27)"],
+            ] as const
+          ).map(([id, label, say]) => {
+            const on = !action && (id === "kiln") === acts.kiln && id !== "ts";
+            const dim = action || id === "ts";
+            return (
+              <li key={id} className="jp-j" data-key={`lang.${id}`} data-sel={on || undefined} data-dim={dim || undefined}>
+                <span className="jp-glyph" aria-hidden="true">
+                  <StatusGlyph state={on ? "passed" : "none"} size={12} />
+                </span>
+                <button
+                  type="button"
+                  className="jp-line"
+                  aria-disabled={dim || undefined}
+                  onClick={() => (dim ? acts.onSay(action ? "An action is its action.yml: a dialect is a workflow's" : "Workflows in code come with W29-R27") : acts.onDialect(id === "kiln"))}
+                >
+                  <span className="n">{label}</span>
+                  <span className="v">{say}</span>
+                </button>
+              </li>
+            );
+          })}
+          {phone ? <li className="jp-detail">{detail}</li> : null}
+        </ol>
+        {phone ? null : <div className="jp-side ppl-side">{detail}</div>}
+      </div>
+    </div>
   );
 }
 
@@ -1156,7 +1451,7 @@ function View({
 const syntaxOf = (h: ShipPipelinePane["head"]): string | undefined => (!["workflow", "reusable"].includes(h.kind) || /\.ya?ml$/i.test(h.path) ? "workflow" : resolveLanguage(null, h.path)?.id);
 
 /** The file a pane's path names, as the validator reads it: an action's action.yml. */
-const fileOf = (h: ShipPipelinePane["head"]) => (["workflow", "reusable"].includes(h.kind) ? h.path : `${h.path}/action.yml`);
+const fileOf = (h: ShipPipelinePane["head"]) => (["workflow", "reusable"].includes(h.kind) || /action\.ya?ml$/.test(h.path) ? h.path : `${h.path}/action.yml`);
 
 /** An offset of `text` at a line and column, both from 1. */
 function offsetOf(text: string, at: { line: number; col: number }): number {

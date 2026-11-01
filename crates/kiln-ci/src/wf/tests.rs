@@ -364,3 +364,16 @@ fn w03_r13_chain_depth() {
         assert!(d.iter().any(|x| x.code == "KCI1015" && x.message.contains("1 to 10")), "{bad}: {d:?}");
     }
 }
+
+#[test]
+fn w29_r29_r30_microvm_actions_read() {
+    let ok = |text: &str| super::parse_action(text).1.into_iter().filter(|d| d.is_error()).map(|d| d.message).collect::<Vec<_>>();
+    let fc = "name: fuzz\nruns:\n  using: firecracker\n  image: Dockerfile\n  resources: { cpus: 4, memory: 8Gi }\n  egress: [static.crates.io]\n  args: [--target, x]\n";
+    assert!(ok(fc).is_empty(), "{:?}", ok(fc));
+    assert_eq!(super::parse_action(fc).0.map(|a| a.runs.using), Some("firecracker".to_owned()));
+    assert!(ok("name: s\nruns:\n  using: shards\n  agentfile: Agentfile\n").is_empty());
+    // Each needs its image (Shards an Agentfile at the least); another `using` is said.
+    assert!(ok("name: f\nruns:\n  using: firecracker\n").iter().any(|m| m.contains("needs `runs.image`")));
+    assert!(ok("name: s\nruns:\n  using: shards\n").iter().any(|m| m.contains("`runs.agentfile`")));
+    assert!(ok("name: q\nruns:\n  using: qemu\n  image: x\n").iter().any(|m| m.contains("firecracker or shards")));
+}

@@ -668,3 +668,54 @@ fn w29_r14_run_chosen_jobs() -> anyhow::Result<()> {
     assert_eq!(st, 404, "{said}");
     Ok(())
 }
+
+/// W29-R08's New: a workflow's or action's first files as `kiln_ci::scaffold` makes them (or as
+/// the caller edited them), saved together as the caller's draft: on kiln one draft diff of them
+/// all, on GitHub one commit of them all on the draft's branch. A dry run says them and saves
+/// nothing; a name the trunk has already is refused; a new workflow's draft runs on no trigger.
+#[test]
+fn w29_r08_new_makes_a_draft() -> anyhow::Result<()> {
+    let (s, _dir) = kiln_with_ci()?;
+    let paths = |v: &Value| -> Vec<String> { v.get("files").and_then(Value::as_array).map(|a| a.iter().filter_map(|f| f.get("path").and_then(Value::as_str).or_else(|| f.as_str())).map(str::to_owned).collect()).unwrap_or_default() };
+    // A dry run: the three files a Firecracker action is, nothing saved.
+    let (st, dry) = act(&s, &json!({ "repo": "acme/app", "verb": "new", "kind": "firecracker", "name": "fuzz-target", "dry": true }))?;
+    assert_eq!(st, 200, "{dry}");
+    assert_eq!(paths(&dry), [".github/actions/fuzz-target/action.yml", ".github/actions/fuzz-target/Dockerfile", ".github/actions/fuzz-target/run.sh"]);
+    assert!(get(&s, "/api/repos/acme%2Fapp/diffs")?.to_string().matches("\"name\":\"D").count() == 0, "a dry run saves nothing");
+    // Saved as edited: one draft diff of the three.
+    let mut files = dry.get("files").cloned().unwrap_or_default();
+    if let Some(run) = files.as_array_mut().and_then(|a| a.get_mut(2)).and_then(Value::as_object_mut) {
+        run.insert("text".into(), json!("#!/bin/sh\necho fuzzing \"$1\"\n"));
+    }
+    let (st, saved) = act(&s, &json!({ "repo": "acme/app", "verb": "new", "kind": "firecracker", "name": "fuzz-target", "files": files, "title": "A fuzz action" }))?;
+    assert_eq!((st, at(&saved, "/draft/kind"), at(&saved, "/draft/state"), at(&saved, "/draft/path")), (200, "diff", "draft", ".github/actions/fuzz-target/action.yml"), "{saved}");
+    let changed = get(&s, &format!("/api/diffs/{}/versions/1/files", at(&saved, "/draft/name")))?.to_string();
+    for p in paths(&dry) {
+        assert!(changed.contains(&p), "{p} in the draft: {changed}");
+    }
+    // Its row: DRAFT, Unpublished, the action's.
+    let list = get(&s, "/api/ship/pipelines?repo=acme/app")?;
+    let rows: Vec<Value> = list.pointer("/repos/0/rows").and_then(Value::as_array).cloned().unwrap_or_default();
+    let row = rows.iter().find(|r| at(r, "/path") == ".github/actions/fuzz-target/action.yml").cloned().unwrap_or_default();
+    assert_eq!((at(&row, "/word"), at(&row, "/draft/state")), ("Unpublished", "unpublished"), "{list}");
+    // A name the trunk has: refused, saying so.
+    let (st, out) = act(&s, &json!({ "repo": "acme/app", "verb": "new", "kind": "workflow", "name": "ci" }))?;
+    assert_eq!(st, 409, "{out}");
+    // A workflow, recommended: its draft runs on no trigger.
+    let (st, wf) = act(&s, &json!({ "repo": "acme/app", "verb": "new", "kind": "workflow", "language": "kiln", "name": "nightly", "from": "recommended" }))?;
+    assert_eq!((st, at(&wf, "/path")), (200, ".kiln/nightly.yaml"), "{wf}");
+    exactly(&s, "acme/app", ".kiln/nightly.yaml", 0)?;
+
+    // On GitHub: one commit of an action's three files on the draft's branch, a draft pull request.
+    let g = on_github()?;
+    let (st, out) = act(&g.s, &json!({ "repo": "acme/app", "verb": "new", "kind": "docker", "name": "lint" }))?;
+    assert_eq!((st, at(&out, "/draft/kind")), (200, "change"), "{out}");
+    let trees = g.sent("POST", "/repos/acme/app/git/trees");
+    let tree = trees.first().map(ToString::to_string).unwrap_or_default();
+    for p in [".github/actions/lint/action.yml", ".github/actions/lint/Dockerfile", ".github/actions/lint/entrypoint.sh"] {
+        assert!(tree.contains(p), "{p} in the commit's tree: {trees:?}");
+    }
+    assert_eq!(g.sent("POST", "/repos/acme/app/git/commits").len(), 1, "one commit");
+    assert_eq!(g.sent("POST", "/repos/acme/app/pulls").first().and_then(|p| p.get("draft")), Some(&json!(true)));
+    Ok(())
+}

@@ -320,8 +320,12 @@ function heading(rows: readonly Seed[], shared: boolean): { say: string; needs: 
   return { say: parts.join(" · "), needs };
 }
 
-function repoOf(name: string): ShipPipelineRepo {
-  const seed = SEEDS[name] ?? { access: "none", rows: [] };
+/** The drafts New made, by the browser that made them (its user agent), each in its repository. */
+const madeBy = new Map<string, { repo: string; seed: Seed; files: { path: string; text: string }[] }[]>();
+
+function repoOf(name: string, ua = ""): ShipPipelineRepo {
+  const base = SEEDS[name] ?? { access: "none", rows: [] };
+  const seed = { ...base, rows: [...base.rows, ...(madeBy.get(ua) ?? []).filter((m) => m.repo === name).map((m) => m.seed)] };
   const sorted = [...seed.rows].sort((a, b) => {
     const [ra, na] = rank(a);
     const [rb, nb] = rank(b);
@@ -332,10 +336,10 @@ function repoOf(name: string): ShipPipelineRepo {
   return { repo: name, say, needs, access: seed.access, ref: head.ref, commit: head.commit, rows: sorted.map((s) => rowOf(name, s)) };
 }
 
-function list(q: string): ShipPipelines {
+function list(q: string, ua: string): ShipPipelines {
   const words = q.trim().toLowerCase();
   const repos = Object.keys(SEEDS)
-    .map(repoOf)
+    .map((r) => repoOf(r, ua))
     .map((r) => (words && !r.repo.toLowerCase().includes(words) ? { ...r, rows: r.rows.filter((x) => [x.name, x.path, x.kind, x.word].some((v) => v.toLowerCase().includes(words))) } : r))
     .filter((r) => r.rows.length > 0 || !words);
   repos.sort((a, b) => Number(b.needs > 0) - Number(a.needs > 0) || a.repo.localeCompare(b.repo));
@@ -794,6 +798,44 @@ function validate(body: Obj): unknown {
   return { kind: String(body.path ?? "").endsWith("action.yml") ? "action" : "workflow", dialect: String(body.path ?? "").startsWith(".kiln/") ? "kiln" : "gha", diagnostics, outline: null };
 }
 
+/** New's files as `kiln_ci::scaffold` makes them (the mock's stand-in): a workflow's file, or an action's action.yml and what it runs. */
+function scaffoldOf(body: Obj): { path: string; files: { path: string; text: string }[] } {
+  const kind = String(body.kind ?? "workflow");
+  const name = String(body.name ?? "new");
+  const kiln = body.language === "kiln";
+  if (["workflow", "reusable"].includes(kind)) {
+    const path = kiln ? `.kiln/${name}.yaml` : `.github/workflows/${name}.yml`;
+    const copy = obj(body.from).copy;
+    if (typeof copy === "string") return { path, files: [{ path, text: (FILES[`hyper-light/kiln:${copy}`] ?? "").replace(/^name: .*$/m, `name: ${name}`) }] };
+    const on = kind === "reusable" ? "on:\n  workflow_call:\n" : kiln ? "on:\n  push:\n    branches: [main]\n" : "on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n";
+    const steps = kiln ? "      - uses: kiln/checkout@v1\n" : "      - uses: actions/checkout@v4\n";
+    return { path, files: [{ path, text: `name: ${name}\n${on}jobs:\n  ${name}:\n    runs-on: ${kiln ? "[baremetal]" : "ubuntu-latest"}\n    steps:\n${steps}      - run: echo "it runs"\n` }] };
+  }
+  const dir = `.github/actions/${name}`;
+  const head = `name: ${name}\ndescription: What ${name} does\ninputs:\n  target:\n    description: what it works on\n    required: false\n    default: "."\n`;
+  const run = `#!/bin/sh\nset -eu\necho "${name}: $1"\n`;
+  const image = (script: string) => `FROM alpine:3.20\nCOPY ${script} /${script}\nRUN chmod +x /${script}\nENTRYPOINT ["/${script}"]\n`;
+  const files: Record<string, { path: string; text: string }[]> = {
+    composite: [{ path: `${dir}/action.yml`, text: `${head}runs:\n  using: composite\n  steps:\n    - run: echo "${name}"\n      shell: bash\n` }],
+    javascript: [
+      { path: `${dir}/action.yml`, text: `${head}runs:\n  using: node24\n  main: dist/index.js\n` },
+      { path: `${dir}/src/index.ts`, text: `console.log("${name}");\n` },
+      { path: `${dir}/package.json`, text: `{ "name": "${name}", "private": true }\n` },
+    ],
+    docker: [
+      { path: `${dir}/action.yml`, text: `${head}runs:\n  using: docker\n  image: Dockerfile\n` },
+      { path: `${dir}/Dockerfile`, text: image("entrypoint.sh") },
+      { path: `${dir}/entrypoint.sh`, text: run },
+    ],
+  };
+  const vm = (using: string) => [
+    { path: `${dir}/action.yml`, text: `${head}runs:\n  using: ${using}\n  image: Dockerfile\n  resources: { cpus: 2, memory: 4Gi }\n  egress: []\n` },
+    { path: `${dir}/Dockerfile`, text: image("run.sh") },
+    { path: `${dir}/run.sh`, text: run },
+  ];
+  return { path: `${dir}/action.yml`, files: files[kind] ?? vm(kind === "shards" ? "shards" : "firecracker") };
+}
+
 /** What each browser sent `POST /api/ship/pipelines`, by its user agent. */
 const sent = new Map<string, Record<string, unknown>[]>();
 const bodiesOf = (ua: string) => {
@@ -810,12 +852,15 @@ export async function handlePipelines(req: http.IncomingMessage, res: http.Serve
   const p = url.pathname;
   const m = req.method ?? "GET";
   if (p === "/api/mock/ship/pipelines") {
-    if (url.searchParams.get("reset")) sent.delete(ua);
+    if (url.searchParams.get("reset")) {
+      sent.delete(ua);
+      madeBy.delete(ua);
+    }
     ctx.json(res, 200, { bodies: bodiesOf(ua) });
     return true;
   }
   if (p === "/api/ship/pipelines" && m === "GET") {
-    ctx.json(res, 200, list(url.searchParams.get("q") ?? ""));
+    ctx.json(res, 200, list(url.searchParams.get("q") ?? "", ua));
     return true;
   }
   const one = m === "GET" ? p.match(/^\/api\/ship\/pipelines\/([^/]+)\/([^/]+)$/) : null;
@@ -824,7 +869,7 @@ export async function handlePipelines(req: http.IncomingMessage, res: http.Serve
     const path = url.searchParams.get("path") ?? "";
     const id = url.searchParams.get("draft");
     // A draft is opened by its id (the server's `draft_pane`); without one, the published file.
-    const row = repoOf(repo).rows.find((r) => r.path === path && (id ? r.draft?.id === id : !r.draft));
+    const row = repoOf(repo, ua).rows.find((r) => r.path === path && (id ? r.draft?.id === id : !r.draft));
     if (!SEEDS[repo] || !row) ctx.json(res, 404, { error: `no workflow or action ${path} in ${repo} you may read` });
     else ctx.json(res, 200, paneOf(repo, row));
     return true;
@@ -844,6 +889,34 @@ export async function handlePipelines(req: http.IncomingMessage, res: http.Serve
   }
   if (p === "/api/ship/pipelines" && m === "POST") {
     const body = await readJson(req);
+    if (body.verb === "new") {
+      const made = scaffoldOf(body);
+      if (body.dry === true) {
+        ctx.json(res, 200, made);
+        return true;
+      }
+      bodiesOf(ua).push(body);
+      const files = Array.isArray(body.files) ? (body.files as { path: string; text: string }[]) : made.files;
+      const id = `d-new-${(madeBy.get(ua)?.length ?? 0) + 1}`;
+      const action = !["workflow", "reusable"].includes(String(body.kind));
+      const seed: Seed = {
+        kind: String(body.kind),
+        dialect: action ? null : body.language === "kiln" ? "kiln" : "gha",
+        name: String(body.name),
+        path: made.path,
+        stand: "waiting",
+        word: "Unpublished",
+        line: `${String(body.kind)} · no trigger runs it and no repository can use it yet`,
+        pips: ["passed", "passed", "none"],
+        who: "ada",
+        when: Math.floor(Date.now() / 1000),
+        draft: draft(id, "unpublished", "ada", `#${18 + (madeBy.get(ua)?.length ?? 0)}`),
+      };
+      madeBy.set(ua, [...(madeBy.get(ua) ?? []), { repo: String(body.repo), seed, files }]);
+      FILES[`${String(body.repo)}:${made.path}:draft:${id}`] = files[0]?.text ?? "";
+      ctx.json(res, 200, { path: made.path, files: files.map((f) => f.path), draft: { id, name: seed.draft?.change?.name, kind: "change", state: "draft", path: made.path } });
+      return true;
+    }
     bodiesOf(ua).push(body);
     ctx.json(res, 200, { ok: true, verb: body.verb ?? null });
     return true;

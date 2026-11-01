@@ -752,7 +752,9 @@ pub async fn list(hub: &Arc<Hub>, q: &HashMap<String, String>, caller: &crate::a
 pub async fn act(hub: &Arc<Hub>, caller: &crate::authz::Caller, body: &Value) -> Result<Response, Fail> {
     let text = |k: &str| body.get(k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
     let need = |k: &str| text(k).ok_or_else(|| (StatusCode::BAD_REQUEST, format!("`{k}` is required")));
-    let (name, path, verb) = (need("repo")?, need("path")?, need("verb")?);
+    let (name, verb) = (need("repo")?, need("verb")?);
+    // New names no path: it makes one (W29-R08).
+    let path = if verb == "new" { text("path").unwrap_or_default() } else { need("path")? };
     let missing = || (StatusCode::NOT_FOUND, format!("no repository `{name}` you may read"));
     let repo = hub.store.repos().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?.into_iter().find(|r| r.name == name).ok_or_else(missing)?;
     let scope = crate::authz::Scope::Repo { repo: repo.name.clone() };
@@ -797,7 +799,14 @@ pub async fn act(hub: &Arc<Hub>, caller: &crate::authz::Caller, body: &Value) ->
             }
             crate::ci::releases::tag(hub, caller, &repo.name, body).await?
         }
-        other => return Err((StatusCode::BAD_REQUEST, format!("`verb` is save_draft, ready, discard, run or release, not `{other}`"))),
+        // New (W29-R08): a workflow's or action's first files, saved as the caller's draft; `dry` says them.
+        "new" => {
+            if body.get("dry").and_then(Value::as_bool) != Some(true) && !caller.can("diffs.submit", &scope) {
+                return Err((StatusCode::FORBIDDEN, format!("a new workflow or action in {} is saved as a draft, which needs `diffs.submit`", repo.name)));
+            }
+            crate::ci::workflows::new_draft(hub, caller, &repo.name, body).await?
+        }
+        other => return Err((StatusCode::BAD_REQUEST, format!("`verb` is save_draft, ready, discard, run, release or new, not `{other}`"))),
     };
     heard(&repo.name);
     Ok(srv::json(StatusCode::OK, &out))

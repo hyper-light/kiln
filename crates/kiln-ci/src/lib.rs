@@ -57,6 +57,7 @@ pub mod results;
 pub mod review;
 pub mod runner;
 pub mod sbom;
+pub mod scaffold;
 pub mod sched;
 pub mod secrets;
 pub mod sharing;
