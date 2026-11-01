@@ -31,7 +31,9 @@ jobs:
       CARGO_BUILD_JOBS: "4"
       RUST_TEST_THREADS: "4"
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
-    timeout-minutes: 45
+    # Clippy and the libraries' tests take about 8 minutes; every test binary took longer than the
+    # 37 minutes left of 45 (run #1661, cancelled in observe_replay with 84 binaries done).
+    timeout-minutes: 90
     steps:
       - name: toolchain
         run: rustup component add clippy && cargo --version
