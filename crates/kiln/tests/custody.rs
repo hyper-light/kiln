@@ -189,9 +189,9 @@ fn w27_r08_records_through_the_api_and_the_cli() -> anyhow::Result<()> {
 #[test]
 #[ignore = "needs a test cluster (KILN_CUSTODY_KUBECONFIG), and registry.k8s.io and docker.io"]
 fn w27_r08_custody_end_to_end() -> anyhow::Result<()> {
-    use common::production::{degraded, get, released, swapped, verified};
+    use common::production::{begins_at, built, degraded, get, released, swapped, verified};
     let r = released()?;
-    let (s, ns, commit) = (&r.s, r.cluster.namespace.as_str(), r.commit.as_str());
+    let (s, ns) = (&r.s, r.cluster.namespace.as_str());
     let custody = verified(s)?;
     let pod = custody.get("pods").and_then(Value::as_array).and_then(|p| p.first()).cloned().ok_or_else(|| anyhow::anyhow!("no pod: {custody:#}"))?;
     let record = field(&pod, "record").to_owned();
@@ -204,8 +204,8 @@ fn w27_r08_custody_end_to_end() -> anyhow::Result<()> {
     }
     let walk = get(s, &format!("/api/custody/walk?digest={record}"))?;
     let hops = walk.get("hops").and_then(Value::as_array).cloned().unwrap_or_default();
-    let began = |h: &&Value| h.get("began") == Some(&json!(true));
-    assert!(hops.iter().filter(began).any(|h| h.get("subject").and_then(Value::as_array).into_iter().flatten().any(|t| t.pointer("/digest/gitCommit") == Some(&json!(commit)))), "back to the commit: {walk:#}");
+    let commits = built(s)?;
+    assert!(begins_at(&walk, &commits), "back to a commit a run of acme/app built ({commits:?}; the last pushed {}): {walk:#}", r.commit);
 
     // A hop's record removed, then changed where kiln keeps it: the walk names each break.
     common::custody::walked_and_broken(s.port, &s.admin, &r.dir.path().join("data/kiln.db"), &record)?;

@@ -420,3 +420,22 @@ pub fn degraded(s: &Server, pod: &str) -> anyhow::Result<()> {
         Ok(if why.contains("requires a verified chain") && why.contains(pod) { Ok(()) } else { Err(reg.to_string()) })
     })
 }
+
+/// The commits of acme/app a run built, its conclusion success. An image's chain begins at the one
+/// whose leg pushed it first: the scenario's two pushes carry the same image, so either may be it.
+pub fn built(s: &Server) -> anyhow::Result<Vec<String>> {
+    let runs = get(s, "/api/ci/runs?repo=acme/app&limit=20")?;
+    Ok(runs.get("runs").and_then(Value::as_array).into_iter().flatten().filter(|r| text(r, "conclusion") == "success").map(|r| text(r, "sha").to_owned()).collect())
+}
+
+/// Whether `chain` begins at kiln's hand-on of one of `commits`, by its `gitCommit`.
+pub fn begins_at(chain: &Value, commits: &[String]) -> bool {
+    chain
+        .get("hops")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|h| h.get("began") == Some(&json!(true)))
+        .flat_map(|h| h.get("subject").and_then(Value::as_array).into_iter().flatten())
+        .any(|t| t.pointer("/digest/gitCommit").and_then(Value::as_str).is_some_and(|c| commits.iter().any(|x| x == c)))
+}

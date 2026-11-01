@@ -21,14 +21,15 @@
 
 mod common;
 
-use common::production::{degraded, get, hops, released, swapped, text, verified};
+use common::production::{begins_at, built, degraded, get, hops, released, swapped, text, verified};
 use serde_json::{Value, json};
 
 #[test]
 #[ignore = "needs a test cluster (KILN_CUSTODY_KUBECONFIG), and registry.k8s.io and docker.io"]
 fn w27_r08_custody_to_production() -> anyhow::Result<()> {
     let r = released()?;
-    let (s, ns, index, commit, dir) = (&r.s, r.cluster.namespace.as_str(), r.index.as_str(), r.commit.as_str(), r.dir.path());
+    let (s, ns, index, dir) = (&r.s, r.cluster.namespace.as_str(), r.index.as_str(), r.dir.path());
+    let commits = built(s)?;
     // Each pod's container runs what the deploy handed on, and its chain walks back to the commit.
     let custody = verified(s)?;
     let pods: Vec<Value> = custody.get("pods").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -64,9 +65,9 @@ fn w27_r08_custody_to_production() -> anyhow::Result<()> {
         let pulled = chain.get("hops").and_then(Value::as_array).into_iter().flatten().find(|x| text(x, "kind") == "received" && text(x, "taken_for") == node).cloned().unwrap_or_default();
         assert_eq!(pulled.pointer("/subject/0/digest/sha256").and_then(Value::as_str), Some(index), "the image the deploy named: {pulled:#}");
         assert_eq!(pulled.pointer("/subject/0/annotations/pulls").and_then(Value::as_str), Some(format!("sha256:{amd64}").as_str()), "{pulled:#}");
-        // Back to kiln's hand-on of the commit to fedora-2's runner, where the image's chain began.
-        let began: Vec<&Value> = chain.get("hops").and_then(Value::as_array).into_iter().flatten().filter(|x| x.get("began") == Some(&json!(true))).collect();
-        assert!(began.iter().any(|x| x.get("subject").and_then(Value::as_array).into_iter().flatten().any(|t| t.pointer("/digest/gitCommit") == Some(&json!(commit)))), "back to the commit: {chain:#}");
+        // Back to kiln's hand-on of the commit to fedora-2's runner, where the image's chain began: one
+        // a run of acme/app built (the scenario's two pushes carry the same image).
+        assert!(begins_at(&chain, &commits), "back to a commit a run of acme/app built ({commits:?}; the last pushed {}): {chain:#}", r.commit);
     }
 
     // Walked as `kiln custody walk` walks it (step 15): from a pod back to the commit, each hop in
