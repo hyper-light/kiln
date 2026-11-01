@@ -76,9 +76,10 @@ files = { "ld-musl-aarch64.so.1" = "/lib/ld-musl-aarch64.so.1", "libstdc++.so.6"
 [projects.quiver]
 kind = "git"
 repository = "https://github.com/hyper-light/quiver"
-commit = "4ead534eff0500bf5c33332961f4b07c8072d411"
+commit = "88409ddda5307abe166f310760bbe3bd51f27878"
 path = "vendor/quiver"
 exclude = ["vendor", "bench/records"]
+own = ["UPSTREAM.md"]
 
 # Focal's event bus, which Quiver is built on, at the commit Quiver takes (Quiver's
 # docs/design/focal-bus.md); its recorded change is Quiver's.
@@ -142,6 +143,7 @@ kind = "git"
 repository = "https://github.com/rust-lang/socket2"
 commit = "8b8b96fdaa1301698fd2b6f4de188635df4a8bd1"
 path = "vendor/socket2"
+own = ["UPSTREAM.md"]
 # vorpal, the search across a change (docs/ci.md W26-R07): its pattern engine (ast-grep's, with the
 # regex literal analysis and the trigram primitive), its outline (the definition each hit sits in),
 # its trigram store, and the tree-sitter runtime and grammars they parse with. Its release v0.10.2;

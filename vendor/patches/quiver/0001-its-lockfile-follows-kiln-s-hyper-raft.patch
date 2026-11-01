@@ -1,0 +1,15 @@
+Subject: Its lockfile follows kiln's hyper-raft
+Why: kiln vendors hyper-raft 4d72e19, whose hyper-transport depends on aws-lc-rs; Quiver's own lockfile names it there too, until Quiver re-vendors hyper-raft at 4d72e19 itself (the Quiver agent's commit on cp/t2.2-lab, asked for on 2026-11-01)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index c8035728b0297b507913fe16fd5a44763dd2a617..28353765f03269dc43244ffd90db5805871c301e 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -851,6 +851,7 @@ dependencies = [
+ name = "hyper-transport"
+ version = "0.1.0"
+ dependencies = [
++ "aws-lc-rs",
+  "bytes",
+  "crc-fast",
+  "hyper-quic",
