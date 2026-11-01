@@ -1,63 +1,83 @@
 # SQLite-to-Amphora format cutover
 
-This is an offline format boundary. Source review is not a cutover or a passing rollback drill.
-The person controls deployment and service changes; no agent restarts a runner as part of this
-implementation.
+The first start of a unified build that finds a SQLite-era `kiln.db` cuts it over itself. There is
+no command to run first, and no step for a person beyond the deploy.
 
-Before starting the new serving owner, disable **all old SQL, group/log, replica backup producers
-and their automatic restart**. Keep them disabled through any interruption until the directory
-fence is durable. Neither `--offline`, an absent process, a SQL/file lock, nor a missing old name
-proves that those producers cannot resume. Side-by-side old runner handover is not this boundary.
+## What a start does
 
-Provision the original 32-byte bootstrap master and its independently obtained SHA256 at
-`<data>/secrets/master.sha256` (64 lowercase hexadecimal digits, optional LF/CRLF). This sidecar
-needs no new TOML table in a configuration shared with an older parser. If a configured
-`[ci.secrets] trusted_master_sha256` also exists, they must agree. This preserves configuration
-parse compatibility; it does not authorize the older data writer after cutover.
+1. **Takes the file once nothing else has it.** SQLite can't leave WAL mode or begin an exclusive
+   transaction while another connection holds the database, so the start asks for both with no
+   wait. A process that still has it open (an older build not yet stopped) keeps it: this start
+   fails saying so, and the next one takes it. Leaving WAL folds the WAL into the file, and opening
+   it to write rolls back a hot journal, so the file alone is then the source.
+2. **Fences it.** The SQLite file and a retired cluster log (`cluster/cluster.log`) are kept by
+   same-filesystem links inside a directory at `kiln.db`, read-only, with `amphora-format.json`
+   naming them. The directory blocks old SQLite opens and old replica rename-over replacement.
+   Each step is flushed before the next (on Windows, NTFS journals directories and a read-only
+   link can't be flushed through, so only the writable files are). A start that stops part way
+   goes on from where it stopped.
+3. **Checks the retired cluster log (U15).** The old build wrote each change into `kiln.db` first,
+   numbered there (`cluster_state.seq`), then into its log, and made `kiln.db` durable at a log
+   index (`cluster_state.applied`) only on a compaction or a stop that got that far. So the log's
+   committed entries past `applied` are writes `kiln.db` holds already. Only a write the disk lost
+   from `kiln.db` and the log kept (numbered past `seq`) is refused, for the old build's offline
+   recovery; nothing is replayed into the import.
+4. **Imports it** into Amphora a page at a time (the restore's cursor commits with each page), and
+   then the conversation sources (`harness/conversations.db` and the local agent's), each page with
+   its cursor. A conversation source is hashed whole when its import starts, so a change under it
+   is refused; once its import has finished, a start that finds its files as they were (size, last
+   write and, on unix, which file) doesn't read it again.
 
-Run the unified local CLI with the exact directory, without contacting the running API:
+Fresh and Amphora-only hosts fence the old CREATE-on-open pathname too. Linux, macOS and Windows
+cut over alike.
 
-```sh
-kiln store cutover --data-dir /the/actual/data-directory --offline
-```
+## Rehearsed (2026-11-01)
 
-The command preserves SQL/WAL/SHM and any retired cluster log by verified same-filesystem links,
-removing write permissions while preserving existing read privacy. Every attempt first flushes
-the full canonical data-directory ancestor chain bottom-up, including newly created ancestors;
-existence after an earlier sync failure is never considered durability proof. It validates the pinned
-read-only snapshot/log, syncs the prepared inventory and source directories, removes only the
-verified original links, then publishes the prepared directory at `kiln.db` and syncs its parent.
-There is a recoverable non-atomic gap during that portable file-to-directory transition: the
-external prohibition on old processes/restart must persist across crashes. Ordinary startup
-refuses pending/unfenced state; resume this same explicit command rather than creating a fresh
-store. No writable SQLite fallback, extra database, source-copy fallback or source deletion is
-used. Any original or archived/pending rollback journal refuses unchanged before preparation
-or SQLite read: use the existing old OFFLINE recovery/checkpoint owner first, without guessing
-journal hotness. Unsupported durability/IO/source divergence refuses the transition. SQLite retains normal committed-WAL handling,
-not URI immutable mode (which can omit WAL). Before any SQLite read, the inputs must deny an
-actual nontruncating write-open by this process; elevated/ACL write authority refuses. An
-uncheckpointed WAL must include its read-only SHM source; otherwise use the existing old offline
-recovery owner to checkpoint a stopped snapshot. No migration source write is attempted.
+On copies, with the unified tree's test build (debug, lowest IO priority, adacachy at load ~120):
 
-The canonical Amphora restore is the one paged import owner. A completed receipt must match the
-preserved source identity. Any writes an older build accepted after an earlier import are
-explicit divergence requiring reconciliation; they are never silently overwritten or discarded.
-Fresh and Amphora-only hosts also fence the old CREATE-on-open pathname. The current Windows
-implementation refuses all disk-backed Store activation (fresh and Amphora-only included) before
-mutation because it lacks the required directory flush contract. In-memory operation is unchanged;
-durable Windows activation remains unsupported until that contract is implemented and validated.
+| Data | Source | Took | Result |
+|---|---|---|---|
+| Production (`kiln-data`) | `kiln.db` 122 MB (187,381 rows), log 65 MB, 13 committed writes past `applied` | 117 s | 230 tables, 187,415 rows (the new migrations' tables with them); all 13 writes held (`seq` 6,096,746 past the last, 6,091,779) |
+| adacachy's retired server (`~/.local/share/kiln`, Oct 22–26) | 4 KB file and 3.6 MB WAL; log durable at 0, writes 1 to 14 | 6.7 s | all 14 held (`seq` 14) |
+| jupiter's retired server (Windows) | `kiln.db` with WAL, log | 5.7 s | fenced, read-only source, imported |
 
-Start only the canonical serving owner after successful cutover. Replicated source/baseline
-selection remains explicit and startup validates the same fence and restore identity. The CLI
-does not install, deploy, start services, generate replacement masters or choose replica policy.
+Production's `harness/conversations.db` is 11 GB (443 sessions, 828,350 events, 4,430,759
+records). Its first import reads all of it twice (hash, then pages) before the hub serves. The
+rehearsal read it at 1 to 6 MB/s on a saturated disk and was stopped; at production's IO priority
+in a quiet window it's faster, but plan on tens of minutes.
 
-A SQLite-era binary cannot be an image-only rollback target after this transition. Keep the
-fence and preserved sources; roll forward to a compatible Amphora build. Removing the fence and
-restoring an old snapshot loses later accepted state and is not a supported rollback.
+## Deploying the first unified build
 
-The self-deploy guard runs the **previous** image. A fix in the new image cannot repair the
-already-old first-upgrade guard. Perform this first format transition under the supervised
-offline/no-image-only-rollback boundary (or a separately validated bridge rollout). Subsequent
-new guards hold on unknown schema requirements, changed non-image pod-template fields, or
-unproven external/volume/key-reference, image-pull-secret or declared service-account configuration. They patch only the exact container image;
-complete configuration/revision rollback needs its own proven owner.
+- **No guard for this one.** The self-deploy guard runs the *previous* image, whose guard puts the
+  previous image back when the new pods aren't available within 10 minutes; a SQLite-era image
+  can't open the fence, so that rollback can't start. Turn auto-rollback off for the app first
+  (`cd.apps.set_auto_rollback {app: "default/kiln-production", on: false}`), watch the start by
+  hand, and clear it (`on: null`) once kiln serves. Later unified guards hold on unknown schema
+  requirements, changed non-image pod-template fields, and unproven external configuration.
+- **Room for the first start.** Production's values give the start up to two hours
+  (`startupProbe` 3,600 × 2 s in `deploy/argocd/values/kiln.yaml`) before the kubelet restarts it.
+  Later starts take seconds; the liveness and readiness probes are unchanged.
+- **A quiet window.** The imports share adacachy's disk with production: deploy with no gate
+  running and the host's load down.
+- **The master key.** A host whose legacy data holds protected state (secret keys, CI secrets,
+  OIDC keys, the GitHub App, sealed tokens, hooks, chat integrations) needs the original master's
+  SHA256 at `<data>/secrets/master.sha256` (64 lowercase hexadecimal digits, optional line
+  ending), or `[ci.secrets] trusted_master_sha256`, before its first start; they must agree if both
+  are set. Production's data holds none, so its first start makes and binds a new master.
+- **Runners.** A runner's host database is `[server] data_dir/kiln.db` of the configuration it
+  reads, which on adacachy and jupiter is a retired server's data (rehearsed above).
+
+## Rollback
+
+A SQLite-era binary can't be a rollback target after this: it can't open the fence. Keep the
+fence and its preserved sources, and roll forward to a compatible Amphora build. Removing the
+fence and restoring an old snapshot loses later accepted state and isn't a supported rollback.
+
+## Open
+
+- Four U15 tests fail on Windows where they create a fixture log with the retired settings
+  ("a segment is a multiple of the alignment, four blocks at least", and "an acknowledged frame
+  does not verify" reading one): the fixtures, not the reader, which read jupiter's real log. The
+  gate runs tests on Linux.
+- The conversation store's upkeep (pruning, compaction) runs only while nothing is asked of it
+  for a couple of seconds, as on main: a store asked without pause never prunes.

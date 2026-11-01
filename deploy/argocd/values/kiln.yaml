@@ -35,6 +35,12 @@ resources:
   limits:
     memory: 16Gi
 
+# The first unified start cuts kiln.db over to Amphora and imports the conversation history (11 GB
+# on 2026-11-01) before it serves (docs/trains/unification-sql-cutover.md): two hours before the
+# kubelet restarts it. Later starts take seconds; liveness and readiness are the chart's.
+startupProbe:
+  failureThreshold: 3600
+
 # kiln's own repository is on GitHub: its CI follows it there, like every hyper-light repository's
 # (Argo CD still deploys from the in-cluster git server). Registered here because the repository
 # was first added pointing at the in-cluster server, and discovery leaves names it already has.
