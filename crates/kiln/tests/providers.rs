@@ -564,6 +564,64 @@ fn w23_r06_pulls() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// W26-R18: an agent's words on a host's pull request name the agent and its person. A host shows
+/// what kiln posts as the account it went through (here kiln's own, as no one signed in with it),
+/// so an agent's comment and review on a GitHub, GitLab and Bitbucket pull request end with a line
+/// saying which agent wrote them and for whom; the owner's words have none.
+#[test]
+fn w26_r18_an_agents_words_on_a_host_name_it() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let d = dir.path().display().to_string();
+    let kp = aws_lc_rs::rsa::KeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048).map_err(|_| anyhow::anyhow!("keygen"))?;
+    let der = aws_lc_rs::encoding::AsDer::<aws_lc_rs::encoding::Pkcs8V1Der>::as_der(&kp).map_err(|_| anyhow::anyhow!("der"))?;
+    std::fs::write(dir.path().join("app.pem"), format!("-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n", B64.encode(der.as_ref())))?;
+    for (f, v) in [("gl-token", "glpat-t"), ("bb-token", "bb-t")] {
+        std::fs::write(dir.path().join(f), format!("{v}\n"))?;
+    }
+    let (gh, gh_calls) = fake(github)?;
+    let (gl, gl_calls) = fake(gitlab)?;
+    let (bb, bb_calls) = fake(bitbucket)?;
+    let ci = format!("github = {{ app_id = 99, private_key_file = \"{d}/app.pem\", api_url = \"http://127.0.0.1:{gh}\", web_url = \"http://127.0.0.1:{gh}\" }}");
+    let extra = format!(
+        "[[ci.gitlab]]\nurl = \"http://127.0.0.1:{gl}\"\ntoken_file = \"{d}/gl-token\"\n\n[ci.bitbucket]\nweb_url = \"http://127.0.0.1:{bb}\"\napi_url = \"http://127.0.0.1:{bb}/2.0\"\ntoken_file = \"{d}/bb-token\"\n\n\
+         [[repos]]\nname = \"acme/gh\"\nclone_url = \"http://127.0.0.1:{gh}/acme/gh.git\"\n\n[[repos]]\nname = \"acme/gl\"\nclone_url = \"http://127.0.0.1:{gl}/acme/gl.git\"\n\n\
+         [[repos]]\nname = \"acme/bb\"\nclone_url = \"http://127.0.0.1:{bb}/acme/bb.git\"\n"
+    );
+    let srv = start(dir.path(), &Options { ci: &ci, extra: &extra, ..Options::default() })?;
+    let (port, admin) = (srv.port, srv.admin.as_str());
+    let (st, body) = http(port, "POST", "/api/users", admin, Some(&json!({ "name": "kim", "grants": ["developer"] })))?;
+    anyhow::ensure!((200..300).contains(&st), "kim: {st} {body}");
+    // An agent acting for kim, as an agent's token makes it.
+    let (st, body) = http(port, "POST", "/api/tokens", admin, Some(&json!({ "kind": "agent", "agent": "matrix", "user": "kim", "grants": ["owner"] })))?;
+    anyhow::ensure!((200..300).contains(&st), "the agent's token: {st} {body}");
+    let agent = serde_json::from_str::<Value>(&body)?.get("token").and_then(Value::as_str).map(str::to_owned).ok_or_else(|| anyhow::anyhow!("no token in {body}"))?;
+    const LINE: &str = "— agent matrix (an agent for kim), through kiln";
+
+    // A comment on a line, then a review with words: on each host, as the agent.
+    for (repo, n) in [("acme%2Fgh", 5), ("acme%2Fgl", 3), ("acme%2Fbb", 9)] {
+        let (st, v) = http(port, "POST", &format!("/api/ci/repos/{repo}/pulls/{n}/comments"), &agent, Some(&json!({ "body": "and here?", "path": "a.txt", "line": 1 })))?;
+        assert_eq!(st, 201, "{repo}: {v}");
+    }
+    let gh_said = s(&asked(&gh_calls, "POST", "/repos/acme/gh/pulls/5/comments").unwrap_or_default(), "/body").to_owned();
+    let gl_said = s(&asked(&gl_calls, "POST", "/api/v4/projects/acme%2Fgl/merge_requests/3/discussions").unwrap_or_default(), "/body").to_owned();
+    let bb_said = s(&asked(&bb_calls, "POST", "/2.0/repositories/acme/bb/pullrequests/9/comments").unwrap_or_default(), "/content/raw").to_owned();
+    for said in [&gh_said, &gl_said, &bb_said] {
+        assert_eq!(said.as_str(), format!("and here?\n\n{LINE}"), "the agent's comment names it");
+    }
+    let (st, v) = http(port, "POST", "/api/ci/repos/acme%2Fgh/pulls/5/reviews", &agent, Some(&json!({ "verdict": "comment", "body": "looks right" })))?;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(s(&asked(&gh_calls, "POST", "/repos/acme/gh/pulls/5/reviews").unwrap_or_default(), "/body"), format!("looks right\n\n{LINE}"), "the agent's review names it");
+    let (st, v) = http(port, "POST", "/api/ci/repos/acme%2Fbb/pulls/9/reviews", &agent, Some(&json!({ "verdict": "request_changes", "body": "" })))?;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(s(&asked(&bb_calls, "POST", "/2.0/repositories/acme/bb/pullrequests/9/comments").unwrap_or_default(), "/content/raw"), LINE, "a verdict without words still says whose it is");
+
+    // The owner's comment is theirs, as it was.
+    let (st, v) = http(port, "POST", "/api/ci/repos/acme%2Fgl/pulls/3/comments", admin, Some(&json!({ "body": "thanks", "path": "a.txt", "line": 1 })))?;
+    assert_eq!(st, 201, "{v}");
+    assert_eq!(s(&asked(&gl_calls, "POST", "/api/v4/projects/acme%2Fgl/merge_requests/3/discussions").unwrap_or_default(), "/body"), "thanks", "a person's words get no line");
+    Ok(())
+}
+
 /// A request as a browser makes it, with a session cookie: its status, headers and body.
 fn browse(port: u16, method: &str, path: &str, cookie: Option<&str>, body: Option<&Value>) -> anyhow::Result<(u16, String, String)> {
     let mut c = std::net::TcpStream::connect(("127.0.0.1", port))?;

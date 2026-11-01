@@ -489,6 +489,17 @@ interface MockComment {
   created_at: number;
   published: boolean;
   deleted?: boolean;
+  /** Who wrote it, in words, where it's an agent's (W26-R18); a person's is said from `author`. */
+  by?: { kind: "person" | "agent" | "job"; name: string; for?: string };
+  /** Its signature as kiln took it (W27-R04). */
+  signed?: { by: string; who: string; at: number };
+}
+
+/** A comment's author in words, as the server's byline says it (kiln_ci::review::byline). */
+function bylineOf(c: MockComment) {
+  if (c.by) return c.by;
+  if (c.author.startsWith("agent:")) return { kind: "agent" as const, name: `agent ${c.author.slice(6, 14)}` };
+  return { kind: "person" as const, name: c.author.startsWith("user:") ? c.author.slice(5) : c.author };
 }
 interface MockThread {
   id: string;
@@ -553,8 +564,19 @@ const threads: MockThread[] = [
         suggestion: null,
         created_at: now() - 3000,
         published: true,
+        signed: { by: "kiln://acme/person/kim", who: "kim", at: now() - 3000 },
       },
       { id: "c2", author: "user:sam", body: "It names the axis already; I'll add the job too.", suggestion: null, created_at: now() - 2400, published: true },
+      {
+        id: "c2a",
+        author: "agent:7c41aa02e9",
+        body: "`legged()` keeps the leg's name, so the job comes with it.",
+        suggestion: null,
+        created_at: now() - 2350,
+        published: true,
+        by: { kind: "agent", name: "Review agent", for: "kim" },
+        signed: { by: "kiln://acme/person/kim/agent/7c41aa02e9/epoch/1", who: "Review agent for kim", at: now() - 2350 },
+      },
       {
         id: "c2b",
         author: "user:kim",
@@ -737,6 +759,8 @@ function threadsOf(d: MockDiff) {
         .map((c) => ({
           id: c.id,
           author: c.author,
+          by: bylineOf(c),
+          signed: c.signed ?? null,
           body: c.deleted ? "deleted" : c.body,
           suggestion: c.suggestion,
           created_at: c.created_at,

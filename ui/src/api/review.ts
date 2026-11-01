@@ -133,6 +133,37 @@ export interface ThreadComment {
   deleted?: boolean;
   /** Its suggestions (W26-R10): its body's ```suggestion blocks, then its old `suggestion` field as one more. */
   suggestions?: Suggestion[];
+  /** Who wrote it, in words (W26-R18); a server from before sends `author` alone. */
+  by?: Byline;
+  /** Who signed it, or null while it's unsigned (W27-R04); a server from before sends neither. */
+  signed?: Signed | null;
+}
+
+/** Who wrote a comment, in words (W26-R18): a person by name, an agent by its session's name for the person it acts for, a CI job by its leg. */
+export interface Byline {
+  kind: "person" | "agent" | "job";
+  name: string;
+  /** The person an agent acts for, when kiln knows it. */
+  for?: string;
+}
+
+/** A comment's signature as kiln took it (W27-R04): its signer's identity, in words, and when. */
+export interface Signed {
+  /** The signer's identity (`kiln://<org>/person/kim/agent/<session>/epoch/<n>`). */
+  by: string;
+  who: string;
+  at: number;
+}
+
+/** A comment's author in words: its byline ("Matrix agent for kim"), else its principal's. */
+export function bylineOf(c: Pick<ThreadComment, "author" | "by">): string {
+  if (!c.by) return whoSaid(c.author);
+  return c.by.for ? `${c.by.name} for ${c.by.for}` : c.by.name;
+}
+
+/** What a comment's seal says: who signed it, or that it isn't signed. */
+export function sealOf(c: Pick<ThreadComment, "signed">): string {
+  return c.signed ? `signed by ${c.signed.who}` : "unsigned";
 }
 
 /** A comment's suggestion (W26-R10): the lines it puts where its thread's lines are (none: they go), and which revision applied it. */

@@ -31,6 +31,22 @@ test("Files and the Conversation are the dropdown's first sections", async ({ pa
   await expect(row.locator(".rv-thread .rv-m", { hasText: "can fail on a bad expression" })).toBeVisible();
 });
 
+test("an agent's reply reads as the agent for its person, and each seal says who signed it (W26-R18, W27-R04)", async ({ page }) => {
+  const row = await open(page, "pipeline: dynamic matrices");
+  const thread = row.locator(".rv-thread").first();
+  const agent = thread.locator(".rv-m", { hasText: "keeps the leg's name" });
+  await expect(agent.locator(".rv-by")).toContainText("Review agent");
+  await expect(agent.locator(".rv-for")).toHaveText("for kim");
+  await expect(agent.locator(".rv-seal")).toHaveAttribute("title", "signed by Review agent for kim");
+  await expect(thread.locator(".rv-m", { hasText: "can fail on a bad expression" }).locator(".rv-seal")).toHaveAttribute("title", "signed by kim");
+  const sam = thread.locator(".rv-m", { hasText: "It names the axis already" });
+  await expect(sam.locator(".rv-seal")).toHaveAttribute("title", "unsigned");
+  await expect(sam.locator(".rv-for")).toHaveCount(0);
+  // One shape: the agent's reply's line stands as a person's reply's does.
+  const [a, s] = [await agent.locator(".rv-meta").boundingBox(), await sam.locator(".rv-meta").boundingBox()];
+  expect(a?.height).toBe(s?.height);
+});
+
 test("nothing in Files or the Conversation scrolls sideways but a comment's code, which keeps each line on one line, at every width (W21-AC01)", async ({ page }) => {
   const row = await open(page, "pipeline: dynamic matrices");
   await expect(row.locator(".md-code-body").first()).toBeVisible();

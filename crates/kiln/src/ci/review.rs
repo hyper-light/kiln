@@ -99,6 +99,8 @@ pub async fn threads(hub: &Hub, d: &Diff, viewer: &str) -> Result<Vec<Value>, Fa
     let latest = versions.last().cloned();
     let path = super::diffs::home(hub, d).await.ok().map(|(_, p)| p);
     let applied = applied(hub, d).await?;
+    let signed = signatures(hub, d).await?;
+    let agents = agents_of(hub, comments.iter().map(|c| c.2.as_str())).await;
     let mut by: HashMap<String, Vec<Value>> = HashMap::new();
     for (cid, tid, author, body, suggestion, at, published, deleted) in comments {
         // Its suggestions (W26-R10): its body's blocks, then the old field, each saying which
@@ -108,7 +110,14 @@ pub async fn threads(hub: &Hub, d: &Diff, viewer: &str) -> Result<Vec<Value>, Fa
             .into_iter()
             .map(|s| json!({ "index": s.index, "lines": s.lines, "field": s.field, "applied": made.filter(|a| a.0 == s.index).map(|(_, n, by, at)| json!({ "version": n, "by": by, "at": at })) }))
             .collect();
-        by.entry(tid).or_default().push(json!({ "id": cid, "author": author, "body": body, "suggestion": suggestion, "created_at": at, "draft": !published, "deleted": deleted, "suggestions": suggests }));
+        // Who wrote it, in words, and who signed it (W26-R18, W27-R04): a comment is signed by
+        // whoever gave it, an agent as the agent for its person.
+        let signer = signed.get(&cid);
+        let identity = signer.and_then(|(uri, _)| kiln_ci::identity::chain::Identity::parse(uri).ok());
+        let (name, newest) = agents.get(author.split(' ').next().unwrap_or(&author)).cloned().unwrap_or_default();
+        let line = kiln_ci::review::byline(&author, name.as_deref(), identity.as_ref(), newest.as_ref());
+        let seal = signer.map(|(uri, taken)| json!({ "by": uri, "who": line.words(), "at": taken }));
+        by.entry(tid).or_default().push(json!({ "id": cid, "author": author, "by": line, "signed": seal, "body": body, "suggestion": suggestion, "created_at": at, "draft": !published, "deleted": deleted, "suggestions": suggests }));
     }
     let mut out = Vec::new();
     for ((tid, version, file, side, start, end, state, created_by, at), (kind, resolved_by, resolved_at, resolution)) in rows {
@@ -148,6 +157,38 @@ async fn applied(hub: &Hub, d: &Diff) -> Result<HashMap<String, (u32, u32, Strin
         })
         .await
         .map_err(fail)
+}
+
+/// The signatures kiln took for `d`'s comments (W27-R04), by comment: its signer's URI and when
+/// kiln took it. A comment edited unsigned has none.
+async fn signatures(hub: &Hub, d: &Diff) -> Result<HashMap<String, (String, i64)>, Fail> {
+    let id = d.id.clone();
+    hub.store
+        .call(move |c| {
+            let mut st = c.prepare("SELECT id, signer, taken_at FROM review_signatures WHERE kind = 'comment' AND diff_id = ?1")?;
+            let rows = st.query_map([&id], |r| Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?))))?;
+            Ok(rows.collect::<Result<HashMap<_, _>, _>>()?)
+        })
+        .await
+        .map_err(fail)
+}
+
+/// The agents among `authors` (`agent:<session>`), by principal: each one's session's name while
+/// kiln has the session, and its newest identity, whose path names the person it acts for
+/// (W27-R01).
+async fn agents_of<'a>(hub: &Hub, authors: impl Iterator<Item = &'a str>) -> HashMap<String, (Option<String>, Option<kiln_ci::identity::chain::Identity>)> {
+    let mut out = HashMap::new();
+    for author in authors {
+        let principal = author.split(' ').next().unwrap_or(author);
+        let Some(session) = principal.strip_prefix("agent:") else { continue };
+        if out.contains_key(principal) {
+            continue;
+        }
+        let name = hub.harness.info(session).map(|i| i.name).filter(|n| !n.trim().is_empty());
+        let newest = crate::identities::agent_uri(&hub.store, session).await.ok().flatten().and_then(|u| kiln_ci::identity::chain::Identity::parse(&u).ok());
+        out.insert(principal.to_owned(), (name, newest));
+    }
+    out
 }
 
 /// A diff's threads as the gate reads them (W26-R11): each one's kind and reviewer, where it

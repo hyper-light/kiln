@@ -880,11 +880,19 @@
   align-items: center;
   min-width: 0;
 }
-/* The signature's shield: dim while unsigned (comments are signed from W27-R03). */
+/* An agent's person, after its name: the agent for kim (W26-R18). */
+.rv-for {
+  color: var(--color-secondary);
+}
+/* The signature's shield: whole once signed (W27-R04), dim while unsigned; its title says who
+   signed it. */
 .rv-seal {
   display: inline-flex;
   color: #8fb5a6;
   opacity: 0.55;
+}
+.rv-seal[data-signed] {
+  opacity: 1;
 }
 /* The kind's chip in a comment's line: its icon alone. */
 .rv-k.rv-ki {
