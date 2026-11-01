@@ -92,8 +92,8 @@ fn w14_r02_native_repository() -> anyhow::Result<()> {
     // A branch is the developer's to push; a tag isn't.
     must(git(&home, &work, &["push", "-q", "origin", "HEAD:refs/heads/topic"]), "a branch")?;
     let second = must(git(&home, &work, &["rev-parse", "HEAD"]), "rev-parse")?.trim().to_owned();
-    must(git(&home, &work, &["tag", "v1"]), "tag")?;
-    let (ok, out) = git(&home, &work, &["push", "origin", "v1"])?;
+    must(git(&home, &work, &["tag", "v1.0.0"]), "tag")?;
+    let (ok, out) = git(&home, &work, &["push", "origin", "v1.0.0"])?;
     assert!(!ok && out.contains("diffs.land"), "{out}");
     // Nor are kiln's own refs, or diffs before W14-R03.
     let (ok, out) = git(&home, &work, &["push", "origin", "HEAD:refs/kiln/diffs/D1/v1"])?;
@@ -109,9 +109,9 @@ fn w14_r02_native_repository() -> anyhow::Result<()> {
     assert!(!ok && out.contains("diffs.submit"), "{out}");
 
     // The owner may write trunk directly.
-    must(git(&home, &work, &["push", "-q", &url(&s.admin), "HEAD:main", "v1"]), "the owner's push")?;
+    must(git(&home, &work, &["push", "-q", &url(&s.admin), "HEAD:main", "v1.0.0"]), "the owner's push")?;
     let refs = must(git(&home, dir.path(), &["ls-remote", &url(&viewer)]), "ls-remote")?;
-    for (r, sha) in [("refs/heads/main", &second), ("refs/heads/topic", &second), ("refs/tags/v1", &second)] {
+    for (r, sha) in [("refs/heads/main", &second), ("refs/heads/topic", &second), ("refs/tags/v1.0.0", &second)] {
         assert!(refs.lines().any(|l| l == format!("{sha}\t{r}")), "{r} at {sha}: {refs}");
     }
     assert!(!refs.contains("refs/heads/other") && !refs.contains("refs/kiln/"), "{refs}");
@@ -2262,8 +2262,8 @@ fn w07_r01_kiln_actions() -> anyhow::Result<()> {
         must(git(&home, &work, &["push", "-q", &url, "main", "--tags"]), "push")?;
         Ok(())
     };
-    push("acme/tools", &[("hello/action.yml", "name: hello\ninputs:\n  who: { required: true }\nruns:\n  using: composite\n  steps:\n    - shell: bash\n      run: echo \"hello from kiln tools to ${{ inputs.who }}\"\n"), (".kiln/config.yaml", "share: owner\n")], Some("v1"))?;
-    let using = "on: push\njobs:\n  j:\n    runs-on: local\n    steps:\n      - uses: kiln://acme/tools/hello@v1\n        with:\n          who: ${{ github.repository }}\n";
+    push("acme/tools", &[("hello/action.yml", "name: hello\ninputs:\n  who: { required: true }\nruns:\n  using: composite\n  steps:\n    - shell: bash\n      run: echo \"hello from kiln tools to ${{ inputs.who }}\"\n"), (".kiln/config.yaml", "share: owner\n")], Some("v1.0.0"))?;
+    let using = "on: push\njobs:\n  j:\n    runs-on: local\n    steps:\n      - uses: kiln://acme/tools/hello@v1.0.0\n        with:\n          who: ${{ github.repository }}\n";
     // The first push only records refs; the workflow comes with the second.
     for name in ["acme/app", "other/app"] {
         push(name, &[("README.md", "app\n")], None)?;

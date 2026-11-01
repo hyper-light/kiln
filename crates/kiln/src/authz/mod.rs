@@ -488,6 +488,8 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/ci/repos/*/**", "runs.read", At::Repo(3)),
     r("DELETE", "/api/ci/repos/*/caches/*", "caches.write", At::Repo(3)),
     r("POST", "/api/ci/repos/*/workflows/**/edit", "workflows.edit", At::Repo(3)),
+    // Release by tag lands a tag, as pushing one does (W29-R21).
+    r("POST", "/api/ci/repos/*/releases", "diffs.land", At::Repo(3)),
     r("POST", "/api/ci/repos/*/**", "runs.trigger", At::Repo(3)),
     // What notification rules sent (W19-R06), every repository's.
     r("GET", "/api/ci/notify/deliveries", "settings.manage", At::Server),

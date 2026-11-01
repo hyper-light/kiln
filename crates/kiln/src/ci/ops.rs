@@ -719,6 +719,10 @@ pub fn ops() -> &'static [Op] {
                 input: Input::of::<input::CiActionsList>(),
                 route: |v| Ok((Method::GET, path(&["actions"]), query(v, &["q", "kind", "owner", "repo"]))),
                 run: |cx: Cx, v: Value| async move { answer(super::actions::route(&cx.hub, &Method::GET, &[], &query(&v, &["q", "kind", "owner", "repo"]), Value::Null).await).await }),
+            op!("ci.releases.tag", "Release by tag (W29-R21): an annotated tag `tag`, a full version (vMAJOR.MINOR.PATCH, a pre-release after `-`), at the commit `sha` names, with the floating vMAJOR and vMAJOR.MINOR it's the newest release under moved there (`major: false` moves none); on GitHub, a release of it too. In a repository kiln hosts, a release's tag is never moved or deleted after. At a commit one of whose own checks didn't pass, it's refused naming them, unless `confirm`.", ro: false, destructive: false,
+                input: Input::of::<input::CiReleasesTag>(),
+                route: |v| Ok((Method::POST, path(&["repos", &text(v, "repo")?, "releases"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { super::releases::tag(&cx.hub, &cx.caller, &text(&v, "repo")?, &v).await }),
             op!("ci.actions.get", "One repository's actions and reusable workflows in the catalog (W29-R20), the one at `path` with it: its versions (its tags, each with its commit and its own runs' conclusions there), its access (who may use it), and its consumers (which repositories' runs pinned which version).", ro: true, destructive: false,
                 input: Input::of::<input::CiActionsGet>(),
                 route: |v| {
@@ -2164,6 +2168,24 @@ pub mod input {
 
     #[derive(Debug, Deserialize, JsonSchema)]
     #[serde(deny_unknown_fields)]
+    pub struct CiReleasesTag {
+        /// The repository (`acme/kit`).
+        pub repo: String,
+        /// The commit to release: its SHA, or a branch or tag naming it.
+        pub sha: String,
+        /// The release, a full version: `v1.2.0`, `v2.0.0-rc.1`.
+        pub tag: String,
+        /// Move the floating `vMAJOR` and `vMAJOR.MINOR` it's the newest release under (true unless
+        /// it's false).
+        pub major: Option<bool>,
+        /// Tag it though one of the commit's own checks didn't pass.
+        pub confirm: Option<bool>,
+        /// The release's notes.
+        pub notes: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
     pub struct CiActionsGet {
         /// The repository (`acme/kit`).
         pub repo: String,
@@ -2597,6 +2619,7 @@ pub mod input {
         Ready,
         Discard,
         Run,
+        Release,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
@@ -2619,8 +2642,16 @@ pub mod input {
         pub inputs: Option<serde_json::Map<String, serde_json::Value>>,
         /// Run's branch or tag, for a published workflow.
         pub r#ref: Option<String>,
-        /// Run's commit, standing for `ref`.
+        /// Run's commit, standing for `ref`; Release's commit.
         pub sha: Option<String>,
+        /// Release's tag, a full version (`v1.2.0`).
+        pub tag: Option<String>,
+        /// Release: move the floating `vMAJOR` and `vMAJOR.MINOR` (true unless it's false).
+        pub major: Option<bool>,
+        /// Release: tag it though one of the commit's own checks didn't pass.
+        pub confirm: Option<bool>,
+        /// Release's notes.
+        pub notes: Option<String>,
     }
 }
 

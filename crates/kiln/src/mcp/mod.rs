@@ -902,7 +902,6 @@ mod tests {
     const LEFT: &[&str] = &[
         "ci.locks.update",
         "ci.locks.verify",
-        "ci.releases.tag",
         "ci.work.gc",
         "ci.work.reap.run",
         "ci.work.status",

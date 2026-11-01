@@ -218,23 +218,23 @@ fn w29_r20_the_catalog() -> anyhow::Result<()> {
     std::fs::create_dir_all(&home)?;
     let hello = "name: Hello\ndescription: Says hello\ninputs:\n  who:\n    description: Whom to greet\n    required: true\noutputs:\n  said:\n    description: What it said\n    value: ${{ steps.s.outputs.said }}\nruns:\n  using: composite\n  steps:\n    - id: s\n      run: echo \"said=hello ${{ inputs.who }}\" >> \"$GITHUB_OUTPUT\"\n      shell: bash\n";
     let build = "name: build\non:\n  workflow_call:\n    inputs:\n      target:\n        type: string\n        required: true\n    outputs:\n      digest:\n        description: The image's digest\n        value: ${{ jobs.b.outputs.digest }}\n    secrets:\n      token:\n        required: true\njobs:\n  b:\n    runs-on: local\n    outputs:\n      digest: sha256:0\n    steps:\n      - run: echo built\n";
-    // acme/kit shares with acme's repositories, tagged v1; other/tools shares nothing, untagged.
+    // acme/kit shares with acme's repositories, tagged v1.0.0; other/tools shares nothing, untagged.
     let kit = hosted(&s, &home, dir.path(), "acme/kit", &[(".kiln/config.yaml", "share: owner\n"), (".github/actions/hello/action.yml", hello), (".github/workflows/build.yml", build)])?;
-    git(&home, &kit, &["tag", "v1"])?;
-    git(&home, &kit, &["push", "-q", "origin", "v1"])?;
-    let v1 = git(&home, &kit, &["rev-parse", "v1^{commit}"])?.trim().to_owned();
+    git(&home, &kit, &["tag", "v1.0.0"])?;
+    git(&home, &kit, &["push", "-q", "origin", "v1.0.0"])?;
+    let v1 = git(&home, &kit, &["rev-parse", "v1.0.0^{commit}"])?.trim().to_owned();
     let tools = hosted(&s, &home, dir.path(), "other/tools", &[(".github/actions/lint/action.yml", "name: Lint\nruns:\n  using: composite\n  steps:\n    - run: echo linted\n      shell: bash\n")])?;
     let tools_head = git(&home, &tools, &["rev-parse", "HEAD"])?.trim().to_owned();
 
     // What acme/app may use: acme/kit's action and reusable workflow, not other/tools' action.
     let mine = listed(&s, "/api/ci/actions?repo=acme/app")?;
     let entry = |list: &[Value], uses: &str| list.iter().find(|e| at(e, "/uses") == uses).cloned();
-    let action = entry(&mine, "acme/kit/.github/actions/hello@v1").unwrap_or_default();
+    let action = entry(&mine, "acme/kit/.github/actions/hello@v1.0.0").unwrap_or_default();
     assert_eq!((at(&action, "/kind"), at(&action, "/owner"), at(&action, "/repo"), at(&action, "/path"), at(&action, "/access")), ("composite", "acme", "kit", ".github/actions/hello", "owner"), "{mine:?}");
     assert_eq!(at(&action, "/description"), "Says hello");
     assert_eq!(action.pointer("/inputs/0"), Some(&json!({ "name": "who", "description": "Whom to greet", "required": true, "default": null, "type": null })), "{action}");
     assert_eq!(action.pointer("/outputs/0/name"), Some(&json!("said")), "{action}");
-    let workflow = entry(&mine, "acme/kit/.github/workflows/build.yml@v1").unwrap_or_default();
+    let workflow = entry(&mine, "acme/kit/.github/workflows/build.yml@v1.0.0").unwrap_or_default();
     assert_eq!((at(&workflow, "/kind"), at(&workflow, "/path"), at(&workflow, "/access")), ("workflow", ".github/workflows/build.yml", "owner"), "{mine:?}");
     assert_eq!(workflow.pointer("/inputs/0"), Some(&json!({ "name": "target", "description": null, "required": true, "default": null, "type": "string" })), "{workflow}");
     assert_eq!((workflow.pointer("/outputs/0/name"), workflow.pointer("/outputs/0/description")), (Some(&json!("digest")), Some(&json!("The image's digest"))), "{workflow}");
@@ -251,24 +251,24 @@ fn w29_r20_the_catalog() -> anyhow::Result<()> {
     assert_eq!((at(&lint, "/kind"), at(&lint, "/access")), ("composite", "none"), "{theirs:?}");
     // `kind=` and `owner=`.
     let workflows = listed(&s, "/api/ci/actions?repo=acme/app&kind=workflow")?;
-    assert_eq!(workflows.iter().map(|e| at(e, "/uses")).collect::<Vec<_>>(), ["acme/kit/.github/workflows/build.yml@v1"], "{workflows:?}");
+    assert_eq!(workflows.iter().map(|e| at(e, "/uses")).collect::<Vec<_>>(), ["acme/kit/.github/workflows/build.yml@v1.0.0"], "{workflows:?}");
     let others = listed(&s, "/api/ci/actions?owner=other")?;
     assert_eq!(others.iter().map(|e| at(e, "/uses").to_owned()).collect::<Vec<_>>(), [format!("kiln://other/tools/.github/actions/lint@{tools_head}")], "{others:?}");
 
     // acme/app runs acme/kit's action at v1: its consumers say so.
     let app = hosted(&s, &home, dir.path(), "acme/app", &[])?;
-    let greet = "on: push\njobs:\n  a:\n    runs-on: local\n    steps:\n      - uses: acme/kit/.github/actions/hello@v1\n        with:\n          who: acme/app\n";
+    let greet = "on: push\njobs:\n  a:\n    runs-on: local\n    steps:\n      - uses: acme/kit/.github/actions/hello@v1.0.0\n        with:\n          who: acme/app\n";
     let sha = push(&home, &app, "greets", &[(".kiln/greet.yaml", greet)])?;
     let runs = finished(&s, "acme/app", &sha, 1)?;
     assert_eq!(runs.iter().map(|r| at(r, "/conclusion")).collect::<Vec<_>>(), ["success"], "{runs:?}\n{}", s.log());
     let one = get(&s, "/api/ci/actions/acme/kit?path=.github/actions/hello")?;
     assert_eq!((one.get("hosted"), at(&one, "/access")), (Some(&json!(true)), "owner"), "{one}");
-    assert_eq!(one.pointer("/entries/0/uses"), Some(&json!("acme/kit/.github/actions/hello@v1")), "{one}");
+    assert_eq!(one.pointer("/entries/0/uses"), Some(&json!("acme/kit/.github/actions/hello@v1.0.0")), "{one}");
     let versions: Vec<(String, String)> = one.get("versions").and_then(Value::as_array).into_iter().flatten().map(|v| (at(v, "/ref").to_owned(), at(v, "/sha").to_owned())).collect();
-    assert_eq!(versions, [("v1".to_owned(), v1.clone())], "{one}");
+    assert_eq!(versions, [("v1.0.0".to_owned(), v1.clone())], "{one}");
     assert!(one.pointer("/versions/0/checks").is_some_and(Value::is_array), "{one}");
     let consumers: Vec<(String, String, String, String)> = one.get("consumers").and_then(Value::as_array).into_iter().flatten().map(|c| (at(c, "/repo").to_owned(), at(c, "/kind").to_owned(), at(c, "/ref").to_owned(), at(c, "/sha").to_owned())).collect();
-    assert_eq!(consumers, [("acme/app".to_owned(), "action".to_owned(), "v1".to_owned(), v1.clone())], "{one}");
+    assert_eq!(consumers, [("acme/app".to_owned(), "action".to_owned(), "v1.0.0".to_owned(), v1.clone())], "{one}");
     // The repository as a whole: both of its, and no one consumes its reusable workflow yet.
     let whole = get(&s, "/api/ci/actions/acme/kit")?;
     assert_eq!(whole.get("entries").and_then(Value::as_array).map(Vec::len), Some(2), "{whole}");

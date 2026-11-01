@@ -43,6 +43,27 @@ pub fn floating_of(tag: &str) -> Vec<String> {
     vec![format!("{v}{major}"), format!("{v}{major}.{minor}")]
 }
 
+/// The floating tags a release moves to its commit (W29-R21): each of [`floating_of`] that it's
+/// the newest stable release under, among `others` (the repository's other tags). An older
+/// patch released after a newer minor moves its `vMAJOR.MINOR`, not its `vMAJOR`.
+pub fn floating_moved(tag: &str, others: &[&str]) -> Vec<String> {
+    let Some((major, minor, _, None)) = full_version(tag) else { return Vec::new() };
+    let newest = |under_minor: bool| {
+        let mut all: Vec<&str> = others.iter().copied().filter(|t| matches!(full_version(t), Some((a, b, _, None)) if a == major && (!under_minor || b == minor))).collect();
+        all.push(tag);
+        crate::pipelines::newest_release(all) == Some(tag)
+    };
+    let v = if tag.starts_with('v') { "v" } else { "" };
+    let mut out = Vec::new();
+    if newest(false) {
+        out.push(format!("{v}{major}"));
+    }
+    if newest(true) {
+        out.push(format!("{v}{major}.{minor}"));
+    }
+    out
+}
+
 /// Whether a push may do this to `tag` (without `refs/tags/`) in a repository kiln hosts: create
 /// it, delete it, or else move it. `released` says the repository has had a release of that name;
 /// `by_release`, that kiln's Release is pushing. The refusal says why, in W29-R21's words.
@@ -73,6 +94,12 @@ mod tests {
         assert_eq!(floating_of("2.4.1"), ["2", "2.4"]);
         assert!(floating_of("v2.0.0-rc.1").is_empty(), "a pre-release moves nothing");
         assert!(floating_of("v2").is_empty() && floating_of("nightly").is_empty());
+        // Only where it's the newest stable release.
+        assert_eq!(floating_moved("v1.2.0", &["v1.1.0", "v1", "v1.1"]), ["v1", "v1.2"]);
+        assert_eq!(floating_moved("v1.1.1", &["v1.1.0", "v1.2.0", "v1", "v1.1", "v1.2"]), ["v1.1"], "an older patch moves its minor only");
+        assert_eq!(floating_moved("v1.0.1", &["v1.1.0", "v1.0.0-rc.1"]), ["v1.0"]);
+        assert_eq!(floating_moved("v2.0.0", &["v1.9.0", "v3.0.0-rc.1"]), ["v2", "v2.0"], "a pre-release doesn't count");
+        assert!(floating_moved("v2.0.0-rc.1", &[]).is_empty());
     }
 
     #[test]

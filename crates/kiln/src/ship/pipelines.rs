@@ -413,7 +413,8 @@ pub async fn get(hub: &Arc<Hub>, owner: &str, name: &str, q: &HashMap<String, St
     let path = q.get("path").map(String::as_str).filter(|p| !p.is_empty()).ok_or_else(|| (StatusCode::BAD_REQUEST, "`path` names the workflow or action to open".to_owned()))?;
     let repo = hub.store.repos().await.map_err(internal)?.into_iter().find(|r| r.name == full).ok_or_else(missing)?;
     let (me, _) = crate::ci::diffs::author_of(&caller.name, Some(caller.kind));
-    let viewer = core::Viewer { name: &me, can_submit: caller.can("diffs.submit", &crate::authz::Scope::Repo { repo: repo.name.clone() }) };
+    let scope = crate::authz::Scope::Repo { repo: repo.name.clone() };
+    let viewer = core::Viewer { name: &me, can_submit: caller.can("diffs.submit", &scope), can_land: caller.can("diffs.land", &scope) };
     if let Some(id) = q.get("draft").filter(|d| !d.is_empty()) {
         return draft_pane(hub, &repo, id, path, viewer).await;
     }
@@ -724,7 +725,14 @@ pub async fn act(hub: &Arc<Hub>, caller: &crate::authz::Caller, body: &Value) ->
             }
             crate::ci::events::by_hand(hub, caller, &repo, &ask).await?
         }
-        other => return Err((StatusCode::BAD_REQUEST, format!("`verb` is save_draft, ready, discard or run, not `{other}`"))),
+        // Release by tag (W29-R21), as `ci.releases.tag`: `sha`, `tag`, `major`, `confirm`.
+        "release" => {
+            if !caller.can("diffs.land", &scope) {
+                return Err((StatusCode::FORBIDDEN, format!("releasing {} needs `diffs.land`, as pushing a tag does (W29-R21)", repo.name)));
+            }
+            crate::ci::releases::tag(hub, caller, &repo.name, body).await?
+        }
+        other => return Err((StatusCode::BAD_REQUEST, format!("`verb` is save_draft, ready, discard, run or release, not `{other}`"))),
     };
     heard(&repo.name);
     Ok(srv::json(StatusCode::OK, &out))

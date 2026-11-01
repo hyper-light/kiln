@@ -7,9 +7,10 @@ mod common;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use common::{Options, Server, http, start};
-use serde_json::json;
+use serde_json::{Value, json};
 
 /// `git` with no configuration but this test's, in `dir`: its output, or why it failed.
 fn git(home: &Path, dir: &Path, args: &[&str]) -> Result<String, String> {
@@ -88,5 +89,99 @@ fn w29_r21_released_tags_dont_move() -> anyhow::Result<()> {
     must(&home, &work, &["push", "-q", "origin", "nightly"])?;
     must(&home, &work, &["tag", "-f", "nightly", "HEAD~1"])?;
     must(&home, &work, &["push", "-q", "--force", "origin", "nightly"])?;
+    Ok(())
+}
+
+fn at<'a>(v: &'a Value, pointer: &str) -> &'a str {
+    v.pointer(pointer).and_then(Value::as_str).unwrap_or_default()
+}
+
+/// The conclusion of `repo`'s run at `sha` once it has finished.
+fn concluded(s: &Server, repo: &str, sha: &str) -> anyhow::Result<String> {
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        let (_, body) = http(s.port, "GET", &format!("/api/ci/runs?repo={repo}&limit=50"), &s.admin, None)?;
+        let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+        let run = v.get("runs").and_then(Value::as_array).into_iter().flatten().find(|r| at(r, "/sha") == sha && r.get("finished_at").is_some_and(|f| !f.is_null())).cloned();
+        if let Some(r) = run {
+            return Ok(at(&r, "/conclusion").to_owned());
+        }
+        anyhow::ensure!(Instant::now() < deadline, "no finished run of {repo} at {sha}: {v}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// Code mode's answer to `program`, as the admin.
+fn code(s: &Server, program: &str) -> anyhow::Result<Value> {
+    let (st, body) = http(s.port, "POST", "/api/mcp", &s.admin, Some(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "code_run", "arguments": { "program": program } } })))?;
+    anyhow::ensure!(st == 200, "code_run: {st} {body}");
+    let v: Value = serde_json::from_str(&body)?;
+    let text = v.pointer("/result/content/0/text").and_then(Value::as_str).unwrap_or_default();
+    anyhow::ensure!(v.pointer("/result/isError") == Some(&json!(false)), "{program}: {text}");
+    Ok(serde_json::from_str::<Value>(text)?.get("result").cloned().unwrap_or_default())
+}
+
+/// What `refs/tags/<tag>` names on the server, peeled to its commit.
+fn tagged(home: &Path, work: &Path, tag: &str) -> anyhow::Result<String> {
+    let out = must(home, work, &["ls-remote", "origin", &format!("refs/tags/{tag}"), &format!("refs/tags/{tag}^{{}}")])?;
+    let lines: Vec<(&str, &str)> = out.lines().filter_map(|l| l.split_once('\t')).collect();
+    let peeled = lines.iter().find(|(_, r)| r.ends_with("^{}")).or_else(|| lines.first()).map(|(sha, _)| (*sha).to_owned());
+    peeled.ok_or_else(|| anyhow::anyhow!("no refs/tags/{tag}: {out}"))
+}
+
+/// W29-R21: Release by tag on a repository kiln hosts. At a commit whose checks passed it makes the
+/// annotated tag and moves `v1` and `v1.1` there; the same name again is refused; at a commit with
+/// a failed check it's refused, naming it, unless confirmed; an older patch moves only its minor.
+/// Code mode releases as the route does.
+#[test]
+fn w29_r21_release_by_tag() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "", extra: "" })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let work = hosted(&s, &home, dir.path(), "acme/kit")?;
+    std::fs::create_dir_all(work.join(".github/workflows"))?;
+    std::fs::write(work.join(".github/workflows/check.yml"), "name: check\non: push\njobs:\n  c:\n    runs-on: local\n    steps:\n      - run: echo checked\n")?;
+    must(&home, &work, &["add", "."])?;
+    must(&home, &work, &["commit", "-qm", "a check"])?;
+    must(&home, &work, &["push", "-q", "origin", "main"])?;
+    let a = must(&home, &work, &["rev-parse", "HEAD"])?.trim().to_owned();
+    assert_eq!(concluded(&s, "acme/kit", &a)?, "success");
+
+    let release = |body: Value| -> anyhow::Result<(u16, Value)> {
+        let (st, text) = http(s.port, "POST", "/api/ci/repos/acme%2Fkit/releases", &s.admin, Some(&body))?;
+        Ok((st, serde_json::from_str(&text).unwrap_or(Value::Null)))
+    };
+    let (st, out) = release(json!({ "sha": a, "tag": "v1.1.0" }))?;
+    assert_eq!(st, 200, "{out}");
+    assert_eq!(out.get("moved"), Some(&json!(["v1", "v1.1"])), "{out}");
+    for tag in ["v1.1.0", "v1", "v1.1"] {
+        assert_eq!(tagged(&home, &work, tag)?, a, "{tag}");
+    }
+    let annotated = must(&home, &work, &["ls-remote", "origin", "refs/tags/v1.1.0"])?;
+    assert!(!annotated.starts_with(&a), "an annotated tag: its own object: {annotated}");
+    let (st, again) = release(json!({ "sha": a, "tag": "v1.1.0" }))?;
+    assert_eq!(st, 409, "{again}");
+
+    // A commit with a failed check asks again, naming it.
+    std::fs::write(work.join(".github/workflows/check.yml"), "name: check\non: push\njobs:\n  c:\n    runs-on: local\n    steps:\n      - run: exit 1\n")?;
+    must(&home, &work, &["add", "."])?;
+    must(&home, &work, &["commit", "-qm", "breaks the check"])?;
+    must(&home, &work, &["push", "-q", "origin", "main"])?;
+    let b = must(&home, &work, &["rev-parse", "HEAD"])?.trim().to_owned();
+    assert_eq!(concluded(&s, "acme/kit", &b)?, "failure");
+    let (st, asked) = release(json!({ "sha": b, "tag": "v1.2.0" }))?;
+    assert_eq!(st, 409, "{asked}");
+    assert!(asked.to_string().contains(".github/workflows/check.yml"), "it names the failed check: {asked}");
+    let (st, out) = release(json!({ "sha": b, "tag": "v1.2.0", "confirm": true }))?;
+    assert_eq!((st, out.get("moved")), (200, Some(&json!(["v1", "v1.2"]))), "{out}");
+    assert_eq!(tagged(&home, &work, "v1")?, b);
+
+    // An older patch moves its minor, not its major; code mode releases as the route does.
+    let (st, out) = release(json!({ "sha": a, "tag": "v1.1.1" }))?;
+    assert_eq!((st, out.get("moved")), (200, Some(&json!(["v1.1"]))), "{out}");
+    assert_eq!(tagged(&home, &work, "v1")?, b, "v1 stays at the newest release");
+    let by_code = code(&s, &format!("return await kiln.ci.releases.tag({{ repo: 'acme/kit', sha: '{a}', tag: 'v1.1.2' }})"))?;
+    assert_eq!((at(&by_code, "/tag"), at(&by_code, "/sha"), by_code.get("moved")), ("v1.1.2", a.as_str(), Some(&json!(["v1.1"]))), "{by_code}");
     Ok(())
 }

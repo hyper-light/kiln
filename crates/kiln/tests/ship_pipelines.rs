@@ -346,13 +346,13 @@ fn w29_r04_the_pane() -> anyhow::Result<()> {
     assert_eq!(names, ["TOKEN", "REGION"]);
     assert!(gha.get("groups").is_some_and(|g| !g.to_string().contains("${{ secrets")), "no value of a secret, or its expression, in the groups");
     // Every verb is there, and each one off says why (W29-R04): a reusable workflow runs where it's
-    // called, there's no draft to make ready or discard, and releases come later; the admin may
-    // save a draft.
+    // called, and there's no draft to make ready or discard; the admin may save a draft, and
+    // Release (W29-R21).
     let verbs = gha.pointer("/strip/verbs").and_then(Value::as_array).cloned().unwrap_or_default();
     assert_eq!(verbs.iter().map(|v| field(v, "verb")).collect::<Vec<_>>(), ["run", "save_draft", "ready", "discard", "release"]);
     assert!(verbs.iter().all(|v| v.get("enabled") == Some(&Value::Bool(true)) || !field(v, "why_not").is_empty()), "{verbs:?}");
     let on: Vec<&str> = verbs.iter().filter(|v| v.get("enabled") == Some(&Value::Bool(true))).map(|v| field(v, "verb")).collect();
-    assert_eq!(on, ["save_draft"], "{verbs:?}");
+    assert_eq!(on, ["save_draft", "release"], "{verbs:?}");
 
     // Each action kind's own groups, and its versions.
     for (path, own) in [(".github/actions/setup/action.yml", "Steps"), (".github/actions/comment/action.yml", "Runs on Node (node24)"), (".github/actions/image/action.yml", "Image"), (".kiln/actions/fuzz/action.yml", "Firecracker microVM"), (".kiln/actions/sandbox/action.yml", "Shards microVM")] {
@@ -563,11 +563,11 @@ fn w29_r17_access_and_used_by_in_ship() -> anyhow::Result<()> {
     std::fs::create_dir_all(&home)?;
     let setup = "name: setup\nruns:\n  using: composite\n  steps:\n    - run: echo set up\n      shell: bash\n";
     let build = "name: build\non:\n  workflow_call:\njobs:\n  b:\n    runs-on: local\n    steps:\n      - run: echo built\n";
-    // acme/kit shares with acme's repositories, from its trunk's first commit, tagged v1.
-    hosted(&s, &home, dir.path(), "acme/kit", &[(".kiln/config.yaml", "share: owner\n"), (".github/actions/setup/action.yml", setup), (".github/workflows/build.yml", build)], Some("v1"))?;
+    // acme/kit shares with acme's repositories, from its trunk's first commit, tagged v1.0.0.
+    hosted(&s, &home, dir.path(), "acme/kit", &[(".kiln/config.yaml", "share: owner\n"), (".github/actions/setup/action.yml", setup), (".github/workflows/build.yml", build)], Some("v1.0.0"))?;
     let app = hosted(&s, &home, dir.path(), "acme/app", &[], None)?;
-    let step = "on: push\njobs:\n  a:\n    runs-on: local\n    steps:\n      - uses: kiln://acme/kit/.github/actions/setup@v1\n";
-    let call = "on: push\njobs:\n  c:\n    uses: kiln://acme/kit/.github/workflows/build.yml@v1\n";
+    let step = "on: push\njobs:\n  a:\n    runs-on: local\n    steps:\n      - uses: kiln://acme/kit/.github/actions/setup@v1.0.0\n";
+    let call = "on: push\njobs:\n  c:\n    uses: kiln://acme/kit/.github/workflows/build.yml@v1.0.0\n";
     for (path, text) in [(".kiln/step.yaml", step), (".kiln/call.yaml", call)] {
         let p = app.join(path);
         if let Some(parent) = p.parent() {
@@ -595,7 +595,7 @@ fn w29_r17_access_and_used_by_in_ship() -> anyhow::Result<()> {
     anyhow::ensure!(st == 200, "the action's pane: {st} {action}");
     let used: Vec<(&str, &str)> = group(&action, "Used by").iter().map(|l| (field(l, "name"), field(l, "value"))).collect();
     assert_eq!(used.len(), 1, "{action}");
-    assert!(used.first().is_some_and(|(repo, v)| *repo == "acme/app" && v.starts_with("v1 · ")), "{used:?}");
+    assert!(used.first().is_some_and(|(repo, v)| *repo == "acme/app" && v.starts_with("v1.0.0 · ")), "{used:?}");
     let access: Vec<(&str, &str, &str)> = group(&action, "Settings").iter().filter(|l| field(l, "key") == "settings.access").map(|l| (field(l, "name"), field(l, "value"), field(l, "state"))).collect();
     assert_eq!(access, [("Access", "shared with acme's repositories", "owner")], "{action}");
 

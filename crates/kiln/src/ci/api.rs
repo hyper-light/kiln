@@ -138,6 +138,7 @@ fn reaches_out(method: &Method, rest: &[&str]) -> bool {
             | (&Method::GET, ["repos", _, "commits", _, "checks"])
             | (_, ["repos", _, "pulls", ..])
             | (&Method::POST, ["repos", _, "workflows", .., "dispatches" | "edit"])
+            | (&Method::POST, ["repos", _, "releases"])
             | (&Method::GET, ["runs", _, "pending" | "artifacts"])
             | (&Method::GET, ["runs", _, "artifacts", _, "download"])
             | (&Method::POST, ["runs", _, "cancel" | "rerun" | "approve"])
@@ -184,6 +185,11 @@ async fn outside(hub: &Arc<Hub>, method: &Method, rest: &[&str], q: &HashMap<Str
         (&Method::POST, ["repos", repo, "workflows", path @ .., "edit"]) => {
             let caller = caller.cloned().unwrap_or_else(crate::authz::Caller::owner);
             Ok(ok(&super::workflows::edit(hub, &caller, repo, &path.join("/"), &body).await?))
+        }
+        // W29-R21: Release by tag, on kiln or on GitHub.
+        (&Method::POST, ["repos", repo, "releases"]) => {
+            let caller = caller.cloned().unwrap_or_else(crate::authz::Caller::owner);
+            Ok(ok(&super::releases::tag(hub, &caller, repo, &body).await?))
         }
         // W23: what a repository's CI runs on, and the rest of the providers' contract (R01).
         (&Method::GET, ["repos", repo, "providers"]) => Ok(ok(&super::providers::show(hub, repo).await?)),

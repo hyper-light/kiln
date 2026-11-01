@@ -1090,6 +1090,8 @@ pub struct Verb {
 pub struct Viewer<'a> {
     pub name: &'a str,
     pub can_submit: bool,
+    /// May land on the repository: push a tag, or Release one (W29-R21).
+    pub can_land: bool,
 }
 
 /// The strip's verbs for `row` as `viewer` sees it, once drafts are built (W29-R04, R10 to R14),
@@ -1129,7 +1131,11 @@ pub fn verbs_for(row: &Row, viewer: Viewer<'_>, by_hand: bool) -> Vec<Verb> {
     };
     let mut out = vec![run, save, ready, discard];
     if kind.is_action() || kind == Kind::Reusable {
-        out.push(dim("release", "Release", "Releases by tag come after sharing (W29-R21)"));
+        out.push(match draft {
+            Some(_) => dim("release", "Release", "A draft is released once it's published (W29-R21)"),
+            None if !viewer.can_land => dim("release", "Release", "Releasing needs diffs.land, as pushing a tag does (W29-R21)"),
+            None => on("release", "Release"),
+        });
     }
     out
 }
@@ -1485,9 +1491,9 @@ mod tests {
 
     #[test]
     fn w29_r04_verbs_by_draft_state() {
-        let ada = Viewer { name: "ada", can_submit: true };
-        let sam = Viewer { name: "sam", can_submit: true };
-        let reader = Viewer { name: "rae", can_submit: false };
+        let ada = Viewer { name: "ada", can_submit: true, can_land: true };
+        let sam = Viewer { name: "sam", can_submit: true, can_land: false };
+        let reader = Viewer { name: "rae", can_submit: false, can_land: false };
         let draft = |state| DraftOf { id: "d1".into(), state, author: "ada".into(), change: Some(DraftChange { kind: "diff", name: "D12".into(), url: None }) };
         let wf = Row::new(facts(Kind::Workflow), Some("gha"), String::new(), None, None);
         let saved = wf.clone().drafted(draft(Draft::Unpublished));
@@ -1495,7 +1501,7 @@ mod tests {
         let update = wf.clone().drafted(DraftOf { id: "d2".into(), state: Draft::Update, author: "kiln".into(), change: None });
         let said = |row: &Row, v: Viewer<'_>, by_hand: bool| -> Vec<(&'static str, bool, Option<&'static str>)> { verbs_for(row, v, by_hand).into_iter().map(|x| (x.verb, x.enabled, x.why_not)).collect() };
         let on = |row: &Row, v: Viewer<'_>, by_hand: bool| -> Vec<&'static str> { verbs_for(row, v, by_hand).into_iter().filter(|x| x.enabled).map(|x| x.verb).collect() };
-        // The author's own draft: everything but Release, which isn't built yet.
+        // The author's own draft: everything but Release, which is for what's published.
         assert_eq!(on(&saved, ada, false), ["run", "save_draft", "ready", "discard"]);
         // In review: Ready is done; Run and Discard are still theirs.
         assert_eq!(on(&review, ada, false), ["run", "save_draft", "discard"]);
@@ -1509,6 +1515,9 @@ mod tests {
         // A reusable workflow runs where it's called; an action runs by Try it; kiln's update drafts wait.
         let reusable = Row::new(facts(Kind::Reusable), Some("gha"), String::new(), None, None);
         assert!(on(&reusable, ada, true).iter().all(|v| *v != "run"));
+        // Release, for one who may land on it (W29-R21).
+        assert!(on(&reusable, ada, false).contains(&"release"));
+        assert!(said(&reusable, sam, false).iter().any(|(v, enabled, why)| *v == "release" && !enabled && why.is_some_and(|w| w.contains("diffs.land"))));
         assert!(on(&Row::new(facts(Kind::Composite), None, String::new(), None, None), ada, false).contains(&"run"));
         assert_eq!(on(&update, ada, false), ["save_draft"]);
         // Never hidden: each verb is there, and each one off says why.
