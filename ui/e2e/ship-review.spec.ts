@@ -109,8 +109,9 @@ test("reply, resolve, change a kind, delete", async ({ page }) => {
 });
 
 test("apply a suggestion makes a revision", async ({ page }) => {
-  // The mock keeps what each project writes, so the suggestion this applies is its own.
-  const tag = test.info().project.name;
+  // The mock keeps what each run writes, so the suggestion this applies is its own: its tag names the project and the run (a --repeat-each pass, a retry).
+  const { project, repeatEachIndex, retry } = test.info();
+  const tag = `${project.name} ${repeatEachIndex}.${retry}`;
   const row = await open(page, "pipeline: dynamic matrices");
   const thread = row.locator(".rv-thread").first();
   await thread.locator(".rv-btn", { hasText: "Reply" }).click();
