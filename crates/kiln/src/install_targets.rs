@@ -314,10 +314,7 @@ async fn fetch_linux_kiln(a: &InstallArgs, arch: &str, dir: &Path) -> anyhow::Re
         anyhow::ensure!(resp.is_success(), "{url} answered {}: give --image, or --server (a kiln that has its {target} build)", resp.status());
         let path = dir.join("kiln");
         let mut file = std::fs::File::create(&path)?;
-        let mut got = 0usize;
         while let Some(chunk) = resp.chunk().await? {
-            got += chunk.len();
-            anyhow::ensure!(got <= crate::updates::MAX_BINARY, "{url} sent more than a kiln binary's {} MiB", crate::updates::MAX_BINARY >> 20);
             file.write_all(&chunk)?;
         }
         file.sync_all()?;
