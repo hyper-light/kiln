@@ -557,6 +557,30 @@ fn comment_fix_answer_resolve(draft: bool) -> anyhow::Result<()> {
     comment_fix_answer_resolve_on(&w, &cr, draft)
 }
 
+/// W26-R18, drafts (Ada, 2026-11-01), on kiln: the Matrix agent's draft change request stays a draft
+/// through a new version, and its answers and agents.changes say so; `agents.change`'s `ready` with
+/// nothing new marks it ready for review, pushing nothing; asked again, it says it's ready already.
+#[test]
+fn w26_r18_an_agents_draft_stays_one_until_it_says_ready() -> anyhow::Result<()> {
+    let w = Ac10::new(false)?;
+    let cr = w.open(true)?;
+    let draft = |r: &Value| r.pointer("/change_request/draft").cloned().unwrap_or_default();
+    let before = w.lines_added()?;
+    w.send(&w.matrix, "edit second")?;
+    w.until_edited(before)?;
+    let v2 = w.run(&w.matrix, "again", "return await kiln.agents.change({});")?;
+    let (_, state, _) = w.change(&cr)?;
+    anyhow::ensure!(v2.pointer("/change_request/version") == Some(&serde_json::json!(2)) && draft(&v2) == serde_json::json!(true) && state == "draft", "a new version leaves {cr} a draft: {state}: {v2}");
+    let listed = w.run(&w.matrix, "listed", "return await kiln.agents.changes({});")?;
+    anyhow::ensure!(listed.to_string().contains("\"draft\":true"), "agents.changes says {cr} is a draft: {listed}");
+    let ready = w.run(&w.matrix, "ready", "return await kiln.agents.change({ready: true});")?;
+    let (versions, state, _) = w.change(&cr)?;
+    anyhow::ensure!(draft(&ready) == serde_json::json!(false) && state == "needs-review" && versions.len() == 2, "ready alone marks {cr} ready, pushing nothing: {state}, {} versions: {ready}", versions.len());
+    let again = w.run(&w.matrix, "ready-again", "try { return JSON.stringify(await kiln.agents.change({ready: true})); } catch (e) { return String((e && e.message) || e); }")?;
+    anyhow::ensure!(again.as_str().is_some_and(|t| t.contains("isn't a draft: it's ready for review already")), "asked again, it says so: {again}");
+    Ok(())
+}
+
 /// W26-AC10's flow on the Matrix agent's change `cr`, the switch on: comment, fix, answer, resolve.
 fn comment_fix_answer_resolve_on(w: &Ac10, cr: &str, draft: bool) -> anyhow::Result<()> {
     let cr = cr.to_owned();

@@ -65,6 +65,11 @@ pub struct Record {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub review: Option<String>,
+    /// Whether it's a draft, not ready for review yet (W26-R18), on kiln and on its host alike:
+    /// marked ready by `agents.change`'s `ready`, or by a person.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub draft: Option<bool>,
     /// How its newest version's checks went (`passed`, `failed`, …), once kiln knows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
@@ -100,16 +105,21 @@ pub struct Want {
     pub fix_checks: Option<bool>,
     /// The threads of its change a new version answers (W26-R18): an agent's fix of theirs.
     pub answers: Option<Vec<String>>,
+    /// Its draft marked ready for review (W26-R18): with a new version, or with nothing new.
+    pub ready: bool,
 }
 
 impl Want {
     /// The push options a new version in kiln's own review carries, after `%` in its ref (none:
-    /// no `%`): `draft`, and `answer=<thread>` for each thread it answers. A thread is named by its
-    /// id: letters, digits, `-` and `_`.
+    /// no `%`): `draft` or `ready`, and `answer=<thread>` for each thread it answers. A thread is
+    /// named by its id: letters, digits, `-` and `_`.
     pub fn ref_options(&self) -> Result<String, Fail> {
         let mut opts: Vec<String> = Vec::new();
-        if self.draft {
-            opts.push("draft".to_owned());
+        match (self.draft, self.ready) {
+            (true, true) => return Err(fail(StatusCode::BAD_REQUEST, "`draft` and `ready` together: a change is one or the other")),
+            (true, false) => opts.push("draft".to_owned()),
+            (false, true) => opts.push("ready".to_owned()),
+            (false, false) => {}
         }
         for t in self.answers.iter().flatten().map(|t| t.trim()).filter(|t| !t.is_empty()) {
             if !t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
@@ -281,15 +291,23 @@ fn title_of(info: &Info, want: &Want) -> String {
 /// Opens agent `info`'s change request from its work, or pushes a new version of the one it has.
 /// `actor` is who asked, as the audit trail names them.
 pub async fn open(hub: &Arc<Hub>, actor: &str, info: &Info, want: Want) -> Result<Record, Fail> {
+    let paths = paths_of(hub, &info.id);
+    // In a workspace of its own, everything that changed there is its: its commands' changes too.
+    let own = info.workspace.as_ref().is_some_and(|w| w.made.is_some());
+    // Nothing new to push: `ready` alone marks its draft ready where it is (W26-R18).
+    if want.ready
+        && paths.is_empty()
+        && !own
+        && let Some(r) = of(hub, &info.id).await
+    {
+        return ready_only(hub, actor, info, r).await;
+    }
     // A plan step's agent: its work is its step's in the run's stack.
     if let Some(run) = info.plan_run.as_deref().filter(|r| !r.is_empty())
         && let Some(r) = crate::plans::stack::amend(hub, actor, info, &want, run).await?
     {
         return Ok(r);
     }
-    let paths = paths_of(hub, &info.id);
-    // In a workspace of its own, everything that changed there is its: its commands' changes too.
-    let own = info.workspace.as_ref().is_some_and(|w| w.made.is_some());
     if paths.is_empty() && !own {
         return Err(fail(StatusCode::CONFLICT, format!("{} hasn't changed any files yet", info.name)));
     }
@@ -362,6 +380,9 @@ pub async fn open(hub: &Arc<Hub>, actor: &str, info: &Info, want: Want) -> Resul
     // The change itself.
     let remote_url = found.as_ref().map_or_else(|| facts.remotes.iter().find(|r| r.name == to).map(|r| r.url.clone()).unwrap_or_default(), |(r, _)| r.clone_url.clone());
     let mut version = previous.as_ref().map_or(1, |p| p.version.saturating_add(1));
+    // Whether it's a draft on its host (W26-R18), and why a draft wasn't marked ready when asked.
+    let mut draft = previous.as_ref().and_then(|p| p.draft);
+    let mut unready: Option<String> = None;
     let (change, url, review) = match (&host, &found) {
         (Some(crate::githost::GitHost::Kiln), Some((repo, _))) => match crate::ci::cr::open_of(hub, &repo.id, &trunk, &branch).await {
             Ok(Some((id, number))) => {
@@ -375,10 +396,22 @@ pub async fn open(hub: &Arc<Hub>, actor: &str, info: &Info, want: Want) -> Resul
             _ => return Err(fail(StatusCode::BAD_GATEWAY, format!("the push went through but no change request came of it: {}", said.trim()))),
         },
         (Some(h), Some((repo, _))) => match previous.as_ref().and_then(|p| p.change.clone()) {
-            // A new version of a pull request is its branch's new commit: nothing to open.
-            Some(c) => (Some(c), previous.as_ref().map(|p| p.url.clone()).unwrap_or_default(), None),
-            None => match h.open_change(hub, repo, &branch, &trunk, &title, want.body.as_deref().unwrap_or_default(), false).await {
-                Ok(c) => (Some(format!("#{}", c.number)), c.url, None),
+            // A new version of a pull request is its branch's new commit: nothing to open, and a
+            // draft stays one until it's marked ready.
+            Some(c) => {
+                if want.ready {
+                    match ready_where_it_is(hub, repo, h, &c).await {
+                        Ok(()) => draft = Some(false),
+                        Err((_, why)) => unready = Some(why),
+                    }
+                }
+                (Some(c), previous.as_ref().map(|p| p.url.clone()).unwrap_or_default(), None)
+            }
+            None => match h.open_change(hub, repo, &branch, &trunk, &title, want.body.as_deref().unwrap_or_default(), want.draft).await {
+                Ok(c) => {
+                    draft = Some(want.draft);
+                    (Some(format!("#{}", c.number)), c.url, None)
+                }
                 Err(e) => {
                     tracing::info!(agent = %info.id, error = %format!("{e:#}"), "a pull request didn't open: the branch is pushed");
                     (None, compare_url(&remote_url, &trunk, &branch).unwrap_or_default(), None)
@@ -387,6 +420,10 @@ pub async fn open(hub: &Arc<Hub>, actor: &str, info: &Info, want: Want) -> Resul
         },
         _ => (None, compare_url(&remote_url, &trunk, &branch).unwrap_or_default(), None),
     };
+    // kiln's own change is a draft by its state.
+    if let Some(state) = &review {
+        draft = Some(state == "draft");
+    }
     let now = crate::util::now_unix();
     let record = Record {
         agent: info.id.clone(),
@@ -402,6 +439,7 @@ pub async fn open(hub: &Arc<Hub>, actor: &str, info: &Info, want: Want) -> Resul
         title,
         state: "open".to_owned(),
         review,
+        draft,
         checks: None,
         fix_checks: want.fix_checks.or(previous.as_ref().map(|p| p.fix_checks)).unwrap_or(true),
         opened_at: previous.as_ref().map_or(now, |p| p.opened_at),
@@ -411,7 +449,91 @@ pub async fn open(hub: &Arc<Hub>, actor: &str, info: &Info, want: Want) -> Resul
     save(hub, &record).await;
     let what = record.change.clone().unwrap_or_else(|| format!("branch {branch}"));
     hub.store.audit(actor.to_owned(), "agent.change".into(), format!("{} ({}): {what} v{} into {trunk}", info.name, lineage_short(&info.id), record.version)).await;
+    if let Some(why) = unready {
+        return Err(fail(StatusCode::BAD_GATEWAY, format!("version {} is pushed, but {why}", record.version)));
+    }
     Ok(record)
+}
+
+/// The number of change `name` (`CR12`, `D7`, `#34`): 12, 7, 34.
+fn number_of(name: &str) -> Option<u64> {
+    name.trim_start_matches(|c: char| !c.is_ascii_digit()).parse().ok()
+}
+
+/// Marks change `name` of `repo` (on host `h`) ready for review where it is (W26-R18): kiln's own
+/// as kiln, which asks only for an agent's own draft or a person who may; a host's through its API
+/// (`GitHost::ready_change`, docs/ci.md W29-R12), its mirrored state then ready too, so Ship and the
+/// agent's record read it so before the host's next word. One that's ready already stays so.
+pub async fn ready_where_it_is(hub: &Arc<Hub>, repo: &Repo, h: &crate::githost::GitHost, name: &str) -> Result<(), Fail> {
+    if matches!(h, crate::githost::GitHost::Kiln) {
+        let d = crate::ci::diffs::find(hub, name).await.map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?.ok_or_else(|| fail(StatusCode::NOT_FOUND, format!("no change {name}")))?;
+        if d.state == "draft" {
+            crate::ci::diffs::ready_as(hub, &d, &crate::authz::Caller::owner()).await?;
+        }
+        return Ok(());
+    }
+    let n = number_of(name).ok_or_else(|| fail(StatusCode::CONFLICT, format!("{name} isn't a change kiln can name on its host")))?;
+    h.ready_change(hub, repo, n).await.map_err(|e| fail(StatusCode::BAD_GATEWAY, format!("{name} wasn't marked ready: {e:#}")))?;
+    let (id, host, num) = (repo.id.clone(), provider_of(Some(h)).to_owned(), i64::try_from(n).unwrap_or(i64::MAX));
+    let _ = hub.store.call(move |c| Ok(c.execute("UPDATE host_pulls SET state = 'open' WHERE repo_id = ?1 AND host = ?2 AND number = ?3 AND state = 'draft'", rusqlite::params![id, host, num])?)).await;
+    Ok(())
+}
+
+/// Agent `info`'s draft `r` marked ready for review with nothing new to push (W26-R18).
+async fn ready_only(hub: &Arc<Hub>, actor: &str, info: &Info, r: Record) -> Result<Record, Fail> {
+    let Some(name) = r.change.clone() else {
+        return Err(fail(StatusCode::CONFLICT, format!("{}'s branch {} is pushed, but no change was opened of it: nothing to mark ready", info.name, r.branch)));
+    };
+    let mut r = fresh(hub, r).await;
+    if r.draft != Some(true) {
+        return Err(fail(StatusCode::CONFLICT, format!("{name} isn't a draft: it's ready for review already")));
+    }
+    let repos = hub.store.repos().await.map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let repo = r.repo.as_deref().and_then(|n| repos.iter().find(|x| x.name == n)).ok_or_else(|| fail(StatusCode::CONFLICT, format!("{name}'s repository isn't one kiln knows")))?;
+    let h = crate::githost::for_repo(hub, repo).await.ok_or_else(|| fail(StatusCode::CONFLICT, format!("kiln can't reach {}'s host to mark {name} ready", repo.name)))?;
+    ready_where_it_is(hub, repo, &h, &name).await?;
+    if matches!(h, crate::githost::GitHost::Kiln) {
+        r.review = Some("needs-review".to_owned());
+    }
+    r.draft = Some(false);
+    r.updated_at = crate::util::now_unix();
+    save(hub, &r).await;
+    hub.store.audit(actor.to_owned(), "agent.change".into(), format!("{} ({}): {name} marked ready for review", info.name, lineage_short(&info.id))).await;
+    Ok(r)
+}
+
+/// `r` with whether it's a draft read again where kiln keeps it (W26-R18): kiln's own change's
+/// state, and a host's pull request's as kiln's mirror last read it (a person may mark it ready on
+/// the host). Nothing is saved.
+pub async fn fresh(hub: &Hub, mut r: Record) -> Record {
+    let Some(name) = r.change.clone() else { return r };
+    match r.provider.as_str() {
+        "kiln" => {
+            if let Ok(Some(d)) = crate::ci::diffs::find(hub, &name).await {
+                r.draft = Some(d.state == "draft");
+                r.review = Some(d.state);
+            }
+        }
+        "github" | "gitlab" | "bitbucket" => {
+            if let (Some(repo), Some(n)) = (r.repo.clone(), number_of(&name).and_then(|n| i64::try_from(n).ok())) {
+                let host = r.provider.clone();
+                let state: Option<String> = hub
+                    .store
+                    .call(move |c| {
+                        use rusqlite::OptionalExtension as _;
+                        Ok(c.query_row("SELECT p.state FROM host_pulls p JOIN repos x ON x.id = p.repo_id WHERE x.name = ?1 AND p.host = ?2 AND p.number = ?3", rusqlite::params![repo, host, n], |row| row.get(0)).optional()?)
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                if let Some(s) = state.filter(|s| s == "draft" || s == "open") {
+                    r.draft = Some(s == "draft");
+                }
+            }
+        }
+        _ => {}
+    }
+    r
 }
 
 fn lineage_short(id: &str) -> &str {

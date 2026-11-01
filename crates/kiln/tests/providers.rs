@@ -167,6 +167,9 @@ fn github(req: &Req, port: u16) -> Answer {
         ("POST", "/repos/acme/gh/pulls/5/comments") if token => (201, json!({ "id": 23 }), None),
         ("POST", "/repos/acme/gh/pulls/5/reviews") if token => (200, json!({ "id": 31 }), None),
         ("PUT", "/repos/acme/gh/pulls/5/merge") if token => (200, json!({ "sha": "f".repeat(40), "merged": true }), None),
+        // An agent's change opened, a draft, then marked ready (W26-R18, through W29-R11, R12).
+        ("POST", "/repos/acme/gh/pulls") if token => (201, json!({ "number": 21, "html_url": format!("http://127.0.0.1:{port}/acme/gh/pull/21") }), None),
+        ("GET", "/repos/acme/gh/pulls/21") if token => (200, json!({ "number": 21, "state": "open", "draft": true, "node_id": "PR_kwDOdraft21" }), None),
         _ => (404, json!({ "message": "Not Found" }), None),
     }
 }
@@ -225,6 +228,10 @@ fn gitlab(req: &Req, port: u16) -> Answer {
         ("POST", "/merge_requests/3/discussions") => (201, json!({ "id": "d3" }), None),
         ("POST", "/merge_requests/3/approve") => (201, json!({}), None),
         ("PUT", "/merge_requests/3/merge") => (200, json!({ "state": "merged", "merge_commit_sha": null, "squash_commit_sha": "e".repeat(40) }), None),
+        // An agent's change opened, a draft by its title, then marked ready (W26-R18).
+        ("POST", "/merge_requests") => (201, json!({ "iid": 21, "web_url": format!("{web}/acme/gl/-/merge_requests/21"), "title": req.body.get("title").cloned().unwrap_or_default() }), None),
+        ("GET", "/merge_requests/21") => (200, json!({ "iid": 21, "state": "opened", "title": "Draft: cap the expansion" }), None),
+        ("PUT", "/merge_requests/21") => (200, json!({ "iid": 21 }), None),
         _ => (404, json!({ "message": "404 Not Found" }), None),
     }
 }
@@ -279,6 +286,10 @@ fn bitbucket(req: &Req, port: u16) -> Answer {
         ("POST", "/pullrequests/9/request-changes") => (200, json!({}), None),
         ("POST", "/pullrequests/9/comments") => (201, json!({ "id": 53 }), None),
         ("POST", "/pullrequests/9/merge") => (200, json!({ "state": "MERGED", "merge_commit": { "hash": "abcdef123456" } }), None),
+        // An agent's change opened, a draft, then marked ready (W26-R18).
+        ("POST", "/pullrequests") => (201, json!({ "id": 21, "links": { "html": { "href": "u21" } } }), None),
+        ("GET", "/pullrequests/21") => (200, json!({ "id": 21, "state": "OPEN", "draft": true, "title": "cap the expansion" }), None),
+        ("PUT", "/pullrequests/21") => (200, json!({ "id": 21 }), None),
         _ => (404, json!({ "type": "error", "error": { "message": "Not found" } }), None),
     }
 }
@@ -619,6 +630,129 @@ fn w26_r18_an_agents_words_on_a_host_name_it() -> anyhow::Result<()> {
     let (st, v) = http(port, "POST", "/api/ci/repos/acme%2Fgl/pulls/3/comments", admin, Some(&json!({ "body": "thanks", "path": "a.txt", "line": 1 })))?;
     assert_eq!(st, 201, "{v}");
     assert_eq!(s(&asked(&gl_calls, "POST", "/api/v4/projects/acme%2Fgl/merge_requests/3/discussions").unwrap_or_default(), "/body"), "thanks", "a person's words get no line");
+    Ok(())
+}
+
+/// What kiln's fake harness does for an agent (`FAKE_CLAUDE_ACT`): told "edit <words>", it adds a
+/// line to a.py and says so as an edit, as an agent's Edit tool would.
+fn edit_act(dir: &std::path::Path) -> anyhow::Result<String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path = dir.join("act-edit.sh");
+    let script = "#!/bin/sh\ntext=$(cat)\ncase \"$text\" in\n  \"edit \"*)\n    mkdir -p .fake-claude-before\n    cp a.py .fake-claude-before/a.py\n    printf '%s\\n' \"# ${text#edit }\" >> a.py\n    echo a.py > .fake-claude-edited\n    ;;\nesac\n";
+    std::fs::write(&path, script)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// git in `at`, as ada, with `home` for its own folder.
+fn git(home: &std::path::Path, at: &std::path::Path, args: &[&str]) -> anyhow::Result<()> {
+    let o = std::process::Command::new("git")
+        .args(["-c", "user.name=ada", "-c", "user.email=ada@example.com", "-c", "init.defaultBranch=main"])
+        .args(args)
+        .current_dir(at)
+        .env("HOME", home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()?;
+    anyhow::ensure!(o.status.success(), "git {args:?}: {}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    Ok(())
+}
+
+/// W26-R18, drafts on every host (Ada, 2026-11-01), through Configurable CI's GitHost (W29-R11,
+/// R12): an agent's change opened with `draft` is a draft on GitHub (REST's flag), GitLab (its title)
+/// and Bitbucket (its flag); a new version opens nothing and leaves it one; `agents.change`'s `ready`
+/// with nothing new marks it ready there (GitHub's GraphQL by its node, GitLab's title without the
+/// prefix, Bitbucket's `draft: false`); and each answer says whether it's a draft.
+#[test]
+fn w26_r18_an_agents_draft_on_each_host_until_it_says_ready() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let d = dir.path().display().to_string();
+    let kp = aws_lc_rs::rsa::KeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048).map_err(|_| anyhow::anyhow!("keygen"))?;
+    let der = aws_lc_rs::encoding::AsDer::<aws_lc_rs::encoding::Pkcs8V1Der>::as_der(&kp).map_err(|_| anyhow::anyhow!("der"))?;
+    std::fs::write(dir.path().join("app.pem"), format!("-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n", B64.encode(der.as_ref())))?;
+    for (f, v) in [("gl-token", "glpat-t"), ("bb-token", "bb-t")] {
+        std::fs::write(dir.path().join(f), format!("{v}\n"))?;
+    }
+    let (gh, gh_calls) = fake(github)?;
+    let (gl, gl_calls) = fake(gitlab)?;
+    let (bb, bb_calls) = fake(bitbucket)?;
+    let ci = format!("github = {{ app_id = 99, private_key_file = \"{d}/app.pem\", api_url = \"http://127.0.0.1:{gh}\", web_url = \"http://127.0.0.1:{gh}\" }}");
+    let extra = format!(
+        "[[ci.gitlab]]\nurl = \"http://127.0.0.1:{gl}\"\ntoken_file = \"{d}/gl-token\"\n\n[ci.bitbucket]\nweb_url = \"http://127.0.0.1:{bb}\"\napi_url = \"http://127.0.0.1:{bb}/2.0\"\ntoken_file = \"{d}/bb-token\"\n\n\
+         [[repos]]\nname = \"acme/gh\"\nclone_url = \"http://127.0.0.1:{gh}/acme/gh.git\"\n\n[[repos]]\nname = \"acme/gl\"\nclone_url = \"http://127.0.0.1:{gl}/acme/gl.git\"\n\n\
+         [[repos]]\nname = \"acme/bb\"\nclone_url = \"http://127.0.0.1:{bb}/acme/bb.git\"\n"
+    );
+    let srv = start(dir.path(), &Options { ci: &ci, extra: &extra, ..Options::default() })?;
+    let (port, admin) = (srv.port, srv.admin.as_str());
+    let act = edit_act(dir.path())?;
+    let (_runner, log) = common::agents::runner_with(dir.path(), port, "box-a", None, common::agents::Talk { lines: 1, every_ms: 10 }, &[("FAKE_CLAUDE_ACT", &act)])?;
+    common::agents::connected(port, admin, "box-a", &log, Duration::from_secs(60))?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let calls = |c: &Calls, method: &str, path: &str| c.lock().map(|l| l.iter().filter(|(m, p, ..)| m == method && p.split('?').next() == Some(path)).map(|(_, _, b, _)| b.clone()).collect::<Vec<_>>()).unwrap_or_default();
+
+    for (host, at, c, opened) in [
+        ("gh", gh, &gh_calls, "/repos/acme/gh/pulls"),
+        ("gl", gl, &gl_calls, "/api/v4/projects/acme%2Fgl/merge_requests"),
+        ("bb", bb, &bb_calls, "/2.0/repositories/acme/bb/pullrequests"),
+    ] {
+        // The agent's clone fetches from the host and pushes to a bare repository here: the fakes
+        // take no git, and kiln knows the repository by its fetch URL.
+        let bare = dir.path().join(format!("{host}.git"));
+        let work = dir.path().join(format!("{host}-agent"));
+        let (bare_s, work_s) = (bare.to_string_lossy().into_owned(), work.to_string_lossy().into_owned());
+        git(&home, dir.path(), &["init", "-q", "--bare", &bare_s])?;
+        git(&home, dir.path(), &["clone", "-q", &bare_s, &work_s])?;
+        std::fs::write(work.join("a.py"), "def legs(matrix):\n    return [1]\n")?;
+        git(&home, &work, &["add", "."])?;
+        git(&home, &work, &["commit", "-qm", "legs"])?;
+        git(&home, &work, &["push", "-q", "origin", "main"])?;
+        git(&home, &work, &["remote", "set-url", "origin", &format!("http://127.0.0.1:{at}/acme/{host}.git")])?;
+        git(&home, &work, &["remote", "set-url", "--push", "origin", &bare_s])?;
+        let id = common::agents::open_session(port, admin, "box-a", &work, Duration::from_secs(60))?;
+        let lines = || -> anyhow::Result<u64> {
+            let (st, body) = http(port, "GET", &format!("/api/harness/sessions/{id}"), admin, None)?;
+            anyhow::ensure!(st == 200, "the session: {st} {body}");
+            Ok(serde_json::from_str::<Value>(&body)?.get("lines_added").and_then(Value::as_u64).unwrap_or_default())
+        };
+        let edit = |n: usize| -> anyhow::Result<()> {
+            let before = lines()?;
+            let (st, body) = http(port, "POST", &format!("/api/harness/sessions/{id}/command"), admin, Some(&json!({ "type": "send", "id": format!("{host}-edit-{n}"), "text": format!("edit {n}") })))?;
+            anyhow::ensure!((200..300).contains(&st), "edit {n}: {st} {body}");
+            until(60, &format!("{host}'s edit {n} counted"), || Ok((lines()? <= before).then(|| "not yet".to_owned())))
+        };
+        let change = |ask: Value| -> anyhow::Result<Value> {
+            let (st, body) = http(port, "POST", &format!("/api/harness/agents/{id}/change"), admin, Some(&ask))?;
+            anyhow::ensure!(st == 200, "{host}: agents.change {ask}: {st} {body}");
+            Ok(serde_json::from_str::<Value>(&body)?.get("change_request").cloned().unwrap_or_default())
+        };
+
+        edit(1)?;
+        let r = change(json!({ "title": "cap the expansion", "draft": true }))?;
+        assert_eq!((s(&r, "/change"), r.get("draft")), ("#21", Some(&json!(true))), "{host}: opened, a draft: {r}");
+        let sent = calls(c, "POST", opened);
+        match host {
+            "gl" => assert_eq!(sent.first().map(|b| s(b, "/title")), Some("Draft: cap the expansion"), "GitLab's draft is its title: {sent:?}"),
+            _ => assert_eq!(sent.first().and_then(|b| b.get("draft")), Some(&json!(true)), "{host}'s draft flag: {sent:?}"),
+        }
+
+        edit(2)?;
+        let r = change(json!({}))?;
+        assert_eq!((r.get("version"), r.get("draft")), (Some(&json!(2)), Some(&json!(true))), "{host}: a new version leaves it a draft: {r}");
+        assert_eq!(calls(c, "POST", opened).len(), 1, "{host}: a new version opens nothing");
+
+        let r = change(json!({ "ready": true }))?;
+        assert_eq!((r.get("version"), r.get("draft")), (Some(&json!(2)), Some(&json!(false))), "{host}: ready, with nothing new pushed: {r}");
+        match host {
+            "gh" => {
+                let asked = calls(c, "POST", "/graphql");
+                let ready = asked.iter().find(|b| s(b, "/query").contains("markPullRequestReadyForReview"));
+                assert_eq!(ready.and_then(|b| b.pointer("/variables/id")), Some(&json!("PR_kwDOdraft21")), "GitHub's GraphQL by the pull request's node: {asked:?}");
+            }
+            "gl" => assert_eq!(calls(c, "PUT", "/api/v4/projects/acme%2Fgl/merge_requests/21").first().map(|b| s(b, "/title")), Some("cap the expansion"), "GitLab's title without the prefix"),
+            _ => assert_eq!(calls(c, "PUT", "/2.0/repositories/acme/bb/pullrequests/21").first().and_then(|b| b.get("draft")), Some(&json!(false)), "Bitbucket's draft: false"),
+        }
+    }
     Ok(())
 }
 

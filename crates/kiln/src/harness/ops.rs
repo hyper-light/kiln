@@ -412,7 +412,10 @@ async fn result(cx: Cx, v: Value) -> Out {
     let (_, reply, changes) = cx.hub.harness.conclusion(&id).unwrap_or_default();
     // Its last words, from its timeline; else as lists keep them (shortened).
     let reply = reply.as_ref().and_then(reply_of).unwrap_or_else(|| json!({"text": info.summary, "shortened": true}));
-    let record = crate::workspace::change::of(&cx.hub, &id).await;
+    let record = match crate::workspace::change::of(&cx.hub, &id).await {
+        Some(r) => Some(crate::workspace::change::fresh(&cx.hub, r).await),
+        None => None,
+    };
     let files: Vec<Value> = changes
         .as_array()
         .into_iter()
@@ -529,13 +532,16 @@ async fn changes(cx: Cx, v: Value) -> Out {
             if cx.hub.harness.info(&id).is_some() {
                 lineage::may_see(&cx.hub, &cx.caller, &id).await?;
             }
-            crate::workspace::change::of(&cx.hub, &id).await.iter().map(crate::workspace::change::shown).collect()
+            match crate::workspace::change::of(&cx.hub, &id).await {
+                Some(r) => vec![crate::workspace::change::shown(&crate::workspace::change::fresh(&cx.hub, r).await)],
+                None => Vec::new(),
+            }
         }
         None => {
             let mut out = Vec::new();
             for r in crate::workspace::change::all(&cx.hub).await {
                 if cx.hub.harness.info(&r.agent).is_none() || lineage::may_see(&cx.hub, &cx.caller, &r.agent).await.is_ok() {
-                    out.push(crate::workspace::change::shown(&r));
+                    out.push(crate::workspace::change::shown(&crate::workspace::change::fresh(&cx.hub, r).await));
                 }
             }
             out
@@ -704,7 +710,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "agents.change",
-            summary: "Open a change request from an agent's work (yours, or an agent's you started), or push a new version of the one it has: the files it changed, committed on its folder's last commit as `agents/<what it's about>-<id>` (the folder's branch, index and working tree untouched) and pushed for review, its author the agent, for its person. Into kiln's own review for a repository kiln hosts; as a pull request for one on GitHub, GitLab or Bitbucket (the branch pushed, and the request opened when kiln has an integration there, else a link to open it). Comments, requested changes, failing checks (with `fix_checks`) and the land queue then come back to the agent as messages. `title` (else what the agent is about), `body`, `draft`, `trunk` (else the repository's default), `answers` (the threads a new version answers, in kiln's own review).",
+            summary: "Open a change request from an agent's work (yours, or an agent's you started), or push a new version of the one it has: the files it changed, committed on its folder's last commit as `agents/<what it's about>-<id>` (the folder's branch, index and working tree untouched) and pushed for review, its author the agent, for its person. Into kiln's own review for a repository kiln hosts; as a pull request for one on GitHub, GitLab or Bitbucket (the branch pushed, and the request opened when kiln has an integration there, else a link to open it). Comments, requested changes, failing checks (with `fix_checks`) and the land queue then come back to the agent as messages. `title` (else what the agent is about), `body`, `draft` (a draft on every host, new versions staying one), `ready` (its draft marked ready for review, with a new version or nothing new), `trunk` (else the repository's default), `answers` (the threads a new version answers, in kiln's own review). Its answer says whether it's a `draft`.",
             read_only: false,
             destructive: false,
             input: Input::of::<input::AgentsChange>(),
@@ -964,7 +970,8 @@ pub mod input {
         pub title: Option<String>,
         /// What it changes and why, for reviewers.
         pub body: Option<String>,
-        /// Not ready for review yet (kiln's own review).
+        /// Opened as a draft, not ready for review yet, on kiln, GitHub, GitLab and Bitbucket alike;
+        /// its new versions stay a draft until `ready`.
         pub draft: Option<bool>,
         /// The branch it goes into.
         pub trunk: Option<String>,
@@ -973,6 +980,8 @@ pub mod input {
         /// The threads of its change this new version answers (kiln's own review, by their ids):
         /// the version is an agent's fix of theirs, and each says which version fixed it.
         pub answers: Option<Vec<String>>,
+        /// Marks its draft ready for review, with a new version or with nothing new to push.
+        pub ready: Option<bool>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
