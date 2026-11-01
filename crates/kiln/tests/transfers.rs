@@ -1673,10 +1673,10 @@ fn w27_r08_relays_that_drop_swap_or_alter_a_reach_links_frames_are_caught() -> a
 /// has handed everything over go on to the new build, each with the old build's record of passing
 /// the sender's act on (following kiln's record of it), numbered on its stream to the new build,
 /// which checks the act and every record before its session takes the words, and signs its
-/// receipt. In a test build kiln also sends the old build the words about each of its sessions'
-/// hand-over as it certifies the new build's (the server's `stale_words`), which it forwards too:
-/// three sessions, three such statements at least, whatever the timing. Every frame of signed
-/// statements forwarded has its record, none missing, each answered. With the old build faulty (a test build's `relay_forward`: every second such frame dropped,
+/// receipt. In a test build the runner tells kiln everything two seconds late (`delay`), so kiln
+/// goes on sending the words to the old build a while after it hands the session over, whatever the
+/// timing. Every frame of signed words forwarded has its record, none missing, each answered. With
+/// the old build faulty (a test build's `relay_forward`: every second such frame dropped,
 /// swapped for the one before, or altered), the new build refuses each not as recorded, and sees
 /// the gap a dropped one leaves; kiln records each break naming the old build.
 #[test]
@@ -1685,7 +1685,7 @@ fn w27_r08_relays_blue_greens_forwarder() -> anyhow::Result<()> {
     let faults: &[Option<&str>] = if cfg!(feature = "chaos") { &[None, Some("relay_forward=alter"), Some("relay_forward=swap"), Some("relay_forward=drop")] } else { &[None] };
     for fault in faults {
         let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))?;
-        let s = if cfg!(feature = "chaos") { common::start_env(dir.path(), &Options::default(), false, &[("KILN_CHAOS", "stale_words")])? } else { start(dir.path(), &Options::default())? };
+        let s = start(dir.path(), &Options::default())?;
         let (port, admin) = (s.port, s.admin.as_str());
         let _harnesses = Harnesses::new(&dir.path().join("work-here"), &dir.path().join("home"))?;
         let before_build = dir.path().join("kiln-before");
@@ -1693,15 +1693,12 @@ fn w27_r08_relays_blue_greens_forwarder() -> anyhow::Result<()> {
         bytes.push(0);
         std::fs::write(&before_build, bytes)?;
         std::fs::set_permissions(&before_build, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
-        let env: Vec<(&str, &str)> = fault.map(|f| ("KILN_CHAOS", f)).into_iter().collect();
+        let spec = [cfg!(feature = "chaos").then_some("delay=2s"), *fault].into_iter().flatten().collect::<Vec<_>>().join(",");
+        let env: Vec<(&str, &str)> = (!spec.is_empty()).then_some(("KILN_CHAOS", spec.as_str())).into_iter().collect();
         let (_box_a, log) = supervised(dir.path(), port, "box-a", &before_build, &env)?;
         agents::connected(port, admin, "box-a", &log, Duration::from_secs(60))?;
         let a = agents::open_session(port, admin, "box-a", &dir.path().join("work-here"), Duration::from_secs(60))?;
         first_epoch(port, admin, &a)?;
-        for _ in 0..2 {
-            let more = agents::open_session(port, admin, "box-a", &dir.path().join("work-here"), Duration::from_secs(60))?;
-            first_epoch(port, admin, &more)?;
-        }
         let (_box_b, b) = signing_session(dir.path(), port, admin, "box-b", None)?;
         // b's words to a, every tenth of a second, while a's runner is upgraded.
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
