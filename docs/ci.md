@@ -9331,8 +9331,8 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
   can't take (its signer's identity revoked, as a copy left behind's is) is refused and recorded
   with its signer and envelope; both are audited (what an API caller sent, once, as their request). `POST /api/custody`, `GET /api/custody?digest=`
   or `?name=` (a thing's newest chain: who holds it, an offer no one took lapsing after 10
-  minutes), `/api/custody/breaks`, `/api/transfers/refused` and `/api/transfers/unsigned`;
-  `kiln custody show|breaks`, `kiln transfers refused|unsigned`.
+  minutes), `/api/custody/walk?digest=` (below), `/api/custody/breaks`, `/api/transfers/refused`
+  and `/api/transfers/unsigned`; `kiln custody show|walk|breaks`, `kiln transfers refused|unsigned`.
 - *Sessions handed over.* What a session's hand-over is about is its timeline at the epoch it
   leaves ("session <id> at epoch <n>", `kiln-timeline-v1`: its id, the epoch and each event's
   digest), which both sides work out alike. The runner process handing it on (to another
@@ -9570,6 +9570,16 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
   environment's deploy, so its chain walks back through what was deployed there. kiln-ci's custody
   takes a thing by its name and a digest both records agree on first: a leg's hand-on names an
   image's index and each platform's manifest by one name.
+- *Walking a chain* (step 15): `kiln custody walk <digest>` (`GET /api/custody/walk?digest=`, or
+  `?name=`) walks a thing's chain back from where it's used (a record's digest, or a thing's: an
+  image, an artifact, a commit) to where it was made, hop by hop: each record signed by a custodian
+  entitled to it, each digest the last one's, no gap in a custodian's numbers. It says each hop in
+  words ("the runner on fedora-2 received commit 4c1e2a from kiln"), or names the first break: the
+  record it's at, its kind and why. A record kiln keeps that no longer checks as kiln took it
+  (changed where it's kept, or another record's envelope in its place) is a break at that record
+  (`unreadable`), not one missing. `--export <file>` (`&export=true`) writes the walk with every
+  record it read as signed, kiln's CA certificate and its revocations: what an auditor checks each
+  signature with, and walks again, without kiln. kiln verify (W27-R10) builds on it.
 - *A resume from the server's store* is kiln's take: signed with the server's own key for the
   identity kiln last certified the session as at that epoch (`identities::holder_at`), to the next,
   saying when kiln last heard from the machine; kiln keeps it at once, the package carries it, and
@@ -9680,7 +9690,18 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
   `w27_ac05_the_transfers_model_finds_each_planted_bug` (an act check by machine, a word passed on
   applied unchecked, a resume that keeps the epoch it leaves, a release only on the copy's own
   announcement, no addressee check: each found by a seed that passes without it) and
-  `w27_ac05_a_transfers_seed_replays_exactly`. Simulation (the Transfers plan's step 15, W27-R08):
+  `w27_ac05_a_transfers_seed_replays_exactly`. The walk (step 15):
+  `custody::w27_r08_a_walk_says_each_hop_and_exports_what_it_read` (from an image back to kiln's
+  hand-on of the commit it was made from, each hop in words; exported, each record checking
+  against kiln's CA certificate alone; a hop's record removed, its payload changed, or another
+  record's envelope in its place where kiln keeps it: each a break named at that hop) and, with
+  `chaos`, `identities`'s `w27_r08_custody_walk` (steps 11 and 12's chains, an image a leg made
+  back to the landed commit and a binary through kiln's store of bytes: each unbroken and said hop
+  by hop, its export checking against kiln's CA certificate alone, and each with one hop's record
+  removed, then changed where kiln keeps it, naming its break at that hop; step 13's chains join it
+  as they land), and on a test cluster `custody_production`'s `w27_r08_custody_to_production` walks
+  a pod's chain back to the commit the same way. Simulation
+  (the Transfers plan's step 15, W27-R08):
   `sim::custody::tests::w27_r08_no_broken_chain_walks_as_unbroken` (docs/sim.md's custody model:
   things handed on directly and through one or two relays, under kiln-sim's nemesis, the relays
   dropping, changing, swapping and replaying what they carry and losing their own records, each

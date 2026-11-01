@@ -775,6 +775,21 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let by = caller_of(&hub, req.headers()).await.map_or_else(|| "admin".to_owned(), |c| c.name);
             boxed(|| custody_take(&hub, req, &by)).await
         }
+        // Walked for whoever audits it: each hop in words; `export=true`, every record it read as
+        // signed, kiln's CA certificate and its revocations (the Transfers plan's step 15).
+        (&Method::GET, ["api", "custody", "walk"]) => {
+            let mut q = srv::query(&req);
+            let (digest, name, export) = (q.remove("digest").unwrap_or_default(), q.remove("name"), q.remove("export").is_some_and(|e| e == "true" || e == "1"));
+            boxed(|| async {
+                let digest = match name {
+                    Some(n) => crate::custody::head_named(&hub.store, &n).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?.unwrap_or(n),
+                    None => digest,
+                };
+                let walked = crate::custody::walk(&hub.store, &hub.pki, &digest, crate::util::now_unix(), export).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+                walked.map(|v| srv::json(StatusCode::OK, &v)).ok_or_else(|| err(StatusCode::NOT_FOUND, format!("kiln has no custody record of {digest:?}")))
+            })
+            .await
+        }
         (&Method::GET, ["api", "custody", "breaks"]) => boxed(|| async {
             let breaks = crate::custody::breaks(&hub.store, crate::custody::LIST_MAX).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
             Ok(srv::json(StatusCode::OK, &json!({ "breaks": breaks })))

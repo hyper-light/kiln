@@ -2216,6 +2216,49 @@ fn kilns_chain(s: &Server, digest: &str) -> anyhow::Result<Value> {
     }
 }
 
+/// W27-R08 (the Transfers plan's step 15): the chains of steps 11 and 12 walked by `kiln custody
+/// walk`. An image a leg made (D1 landed, main's run on fedora-2 pushing it to kiln's registry),
+/// from kiln's receipt of it back to kiln's hand-on of the landed commit; and a binary put in
+/// kiln's store of bytes and read back, from kiln's receipt of what it read back to the put. Each
+/// is unbroken, said hop by hop, its export checking against kiln's CA certificate alone; and each
+/// with one hop's record removed, then changed where kiln keeps it, names its break at that hop.
+#[cfg(feature = "chaos")]
+#[test]
+fn w27_r08_custody_walk() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (s, _fedora, tip) = landed_build(dir.path(), &[])?;
+    let run = ended_run_at(&s, &tip)?;
+    anyhow::ensure!(field(&run, "conclusion") == "success", "the build failed: {run}\n{}", s.log());
+    let db = dir.path().join("data/kiln.db");
+    let image: String = rusqlite::Connection::open(&db)?.query_row("SELECT digest FROM ci_leg_pushed WHERE repo = 'acme/app/app' ORDER BY pushed_at DESC LIMIT 1", [], |r| r.get(0))?;
+    kilns_chain(&s, &image)?;
+    let v = common::custody::walked_and_broken(s.port, &s.admin, &db, &image)?;
+    let words: Vec<&str> = v.get("hops").and_then(Value::as_array).into_iter().flatten().map(|h| field(h, "words")).collect();
+    // From kiln's receipt of what the leg made, through fedora-2's runner, to kiln's hand-on of the
+    // leg's inputs, where the chain begins.
+    assert!(words.first().is_some_and(|w| w.starts_with("kiln received ") && w.ends_with("'s leg build on fedora-2")), "{words:#?}");
+    assert!(words.iter().any(|w| w.starts_with("the runner on fedora-2 received ") && w.ends_with(" from kiln")), "{words:#?}");
+    assert!(words.iter().any(|w| w.starts_with("kiln handed on ") && w.contains("commit") && w.ends_with(" to the runner on fedora-2, where the chain begins")), "{words:#?}");
+    // kiln's store of bytes (step 12): a binary put and read back whole.
+    let mut binary = b"\x7fELF".to_vec();
+    binary.extend((0..(1u32 << 20)).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8));
+    let headers = format!("Authorization: Bearer {}\r\nContent-Type: application/octet-stream\r\n", s.admin);
+    let (st, body) = common::raw(s.port, "POST", "/api/updates/binaries?target=aarch64-apple-darwin", &headers, &binary)?;
+    anyhow::ensure!(st == 200, "the upload: {st} {}", String::from_utf8_lossy(&body));
+    let (st, got) = common::raw(s.port, "GET", "/dl/kiln/aarch64-apple-darwin", "", b"")?;
+    anyhow::ensure!(st == 200 && got == binary, "the download: {st}, {} bytes", got.len());
+    let kept = format!("sha256:{}", kiln::util::sha256_hex(&binary));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while http(s.port, "GET", &format!("/api/custody/walk?digest={kept}"), &s.admin, None).ok().and_then(|(_, b)| serde_json::from_str::<Value>(&b).ok()).and_then(|v| v.get("hops").and_then(Value::as_array).map(Vec::len)) != Some(4) {
+        anyhow::ensure!(Instant::now() < deadline, "no chain of four hops for the binary: {:?}", http(s.port, "GET", &format!("/api/custody/walk?digest={kept}"), &s.admin, None));
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let v = common::custody::walked_and_broken(s.port, &s.admin, &db, &kept)?;
+    let words: Vec<&str> = v.get("hops").and_then(Value::as_array).into_iter().flatten().map(|h| field(h, "words")).collect();
+    assert!(words.iter().all(|w| w.contains("binaries/kiln-aarch64-apple-darwin")) && words.iter().any(|w| w.contains("kiln's store of bytes")), "{words:#?}");
+    Ok(())
+}
+
 /// W27-R08 (the Transfers plan's step 11): custody from the land to what a leg made. D1 lands
 /// through main's queue, and main's push runs leg `build` on fedora-2, which checks the landed
 /// commit out from kiln's tarball (as with no git), stores artifact `app` and pushes an image to

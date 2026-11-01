@@ -419,6 +419,16 @@ fn w27_r08_custody_to_production() -> anyhow::Result<()> {
         assert!(began.iter().any(|x| x.get("subject").and_then(Value::as_array).into_iter().flatten().any(|t| t.pointer("/digest/gitCommit") == Some(&json!(commit)))), "back to the commit: {chain:#}");
     }
 
+    // Walked as `kiln custody walk` walks it (step 15): from a pod back to the commit, each hop in
+    // words; and with one hop's record removed, then changed where kiln keeps it, the break named
+    // at that hop.
+    let first = pods.first().map(|p| text(p, "record").to_owned()).unwrap_or_default();
+    let walked = common::custody::walked_and_broken(s.port, &s.admin, &dir.path().join("data/kiln.db"), &first)?;
+    let words: Vec<&str> = walked.get("hops").and_then(Value::as_array).into_iter().flatten().map(|h| text(h, "words")).collect();
+    assert!(words.first().is_some_and(|w| w.starts_with(&format!("kiln for pod {ns}/")) && w.contains(" from node ")), "{words:#?}");
+    assert!(words.iter().any(|w| w.starts_with("kiln's CD handed ")), "{words:#?}");
+    assert!(words.iter().any(|w| w.contains("'s leg build on fedora-2")), "{words:#?}");
+
     // Production requires a verified chain now; one pod's image is swapped under it.
     let mut env = get(&s, "/api/deploy/environments/production")?;
     if let Some(g) = env.get_mut("gates").and_then(Value::as_object_mut) {

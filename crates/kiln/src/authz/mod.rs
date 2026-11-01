@@ -651,6 +651,7 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/verify/vsa", "audit.read", At::Server),
     r("POST", "/api/custody", SIGNED_IN, At::Server),
     r("GET", "/api/custody/breaks", "audit.read", At::Server),
+    r("GET", "/api/custody/walk", "audit.read", At::Server),
     r("GET", "/api/custody", "audit.read", At::Server),
     r("GET", "/api/transfers/refused", "audit.read", At::Server),
     r("GET", "/api/transfers/unsigned", "audit.read", At::Server),
