@@ -726,7 +726,13 @@ struct Node {
 impl Node {
     async fn on(&mut self, m: In) {
         match m {
-            In::Frame { from, link, open, data, close } => self.on_frame(from, link, open, data, close).await,
+            In::Frame { from, link, open, data, close } => {
+                // Each frame kiln's relay passed on, once, as it came: its run's record is answered
+                // with it (docs/ci.md W27-R08's relays). Not in on_frame: a link's first frames go
+                // through it again as it's accepted.
+                crate::runner::custody::reach_frame(&link, &data);
+                self.on_frame(from, link, open, data, close).await;
+            }
             In::Answer { req, json } => self.on_answer(req, &json).await,
             In::Server(up) => {
                 self.server = up;
@@ -941,9 +947,6 @@ impl Node {
     }
 
     async fn on_frame(&mut self, from: String, link: String, open: bool, data: Vec<u8>, close: Option<String>) {
-        // Each frame kiln's relay passed on, as it came: its run's record is answered with it
-        // (docs/ci.md W27-R08's relays).
-        crate::runner::custody::reach_frame(&link, &data);
         if open && !self.links.contains_key(&link) {
             if !self.cfg.accept {
                 let msg = AgentMsg::Reach { to: from.clone(), link, open: false, data: Vec::new(), close: Some(format!("{} does not accept commands from other runners", self.cfg.name)) };
