@@ -91,6 +91,25 @@ pub fn moved_uses(text: &str, publisher: &str, to: &str) -> (String, Vec<String>
     (out, moved)
 }
 
+/// The `uses:` an update moved, between a file `before` and `after` it: each name (without its
+/// ref), its ref before and after, in the file's order.
+pub fn moved_between(before: &str, after: &str) -> Vec<(String, String, String)> {
+    let uses = |text: &str| -> Vec<(String, String)> {
+        text.lines()
+            .filter_map(|l| l.find("uses:").map(|at| l.get(at + 5..).unwrap_or_default().trim().trim_matches(['"', '\'']).split_whitespace().next().unwrap_or_default().to_owned()))
+            .filter_map(|u| u.rsplit_once('@').map(|(n, r)| (n.to_owned(), r.to_owned())))
+            .collect()
+    };
+    // An update moves refs, never lines: the uses pair up in order.
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    for ((was, old), (name, now)) in uses(before).into_iter().zip(uses(after)) {
+        if was == name && old != now && !out.iter().any(|(n, ..)| *n == name) {
+            out.push((name, old, now));
+        }
+    }
+    out
+}
+
 fn moved_line(line: &str, publisher: &str, to: &str, moved: &mut Vec<String>) -> String {
     let Some(at) = line.find("uses:") else { return line.to_owned() };
     let value = line.get(at + 5..).unwrap_or_default().trim().trim_matches(['"', '\'']);
@@ -141,5 +160,7 @@ mod tests {
             assert!(out.contains(kept), "{kept}: {out}");
         }
         assert_eq!(moved_uses(text, "acme/tools", "v9.0.0").1, Vec::<String>::new());
+        let between = moved_between(text, &out);
+        assert_eq!(between, [("kiln://acme/kit/.github/actions/x".to_owned(), "v1.0.0".to_owned(), "v1.1.0".to_owned()), ("acme/kit/.github/actions/y".into(), "v1.0.0".into(), "v1.1.0".into()), ("acme/kit/.github/workflows/build.yml".into(), "v1.0.0".into(), "v1.1.0".into())]);
     }
 }

@@ -608,3 +608,76 @@ fn w29_r17_access_and_used_by_in_ship() -> anyhow::Result<()> {
     assert!(group(&called, "Settings").iter().any(|l| field(l, "key") == "settings.access" && field(l, "state") == "owner"), "{called}");
     Ok(())
 }
+
+/// W29-R21, R22 in Ship: an action's Release asks Keep · Release, saying what releasing its head
+/// changes for the workflows that use it. Once it's released, a consumer that asked for updates
+/// has an update draft: an Update row whose pane says what changes for it and what changed
+/// upstream.
+#[test]
+fn w29_r21_r22_release_and_updates_in_ship() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ci: "", extra: "" })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let v1 = "name: setup\ninputs:\n  who:\n    required: true\nruns:\n  using: composite\n  steps:\n    - run: echo set up\n      shell: bash\n";
+    let kit = hosted(&s, &home, dir.path(), "acme/kit", &[(".kiln/config.yaml", "share: owner\n"), (".github/actions/setup/action.yml", v1)], None)?;
+    let release = |sha: &str, tag: &str| -> anyhow::Result<()> {
+        let (st, out) = http(s.port, "POST", "/api/ci/repos/acme%2Fkit/releases", &s.admin, Some(&json!({ "sha": sha, "tag": tag })))?;
+        anyhow::ensure!(st == 200, "{tag}: {st} {out}");
+        Ok(())
+    };
+    release(git(&home, &kit, &["rev-parse", "HEAD"])?.trim(), "v1.0.0")?;
+    let app = hosted(&s, &home, dir.path(), "acme/app", &[(".kiln/config.yaml", "updates:\n  actions: on\n  cooldown: 0\n")], None)?;
+    let ci = "name: ci\non: push\njobs:\n  a:\n    runs-on: local\n    steps:\n      - uses: kiln://acme/kit/.github/actions/setup@v1.0.0\n        with:\n          who: me\n";
+    std::fs::create_dir_all(app.join(".github/workflows"))?;
+    std::fs::write(app.join(".github/workflows/ci.yml"), ci)?;
+    git(&home, &app, &["add", "."])?;
+    git(&home, &app, &["commit", "-qm", "uses acme/kit"])?;
+    git(&home, &app, &["push", "-q", "origin", "main"])?;
+    let sha = git(&home, &app, &["rev-parse", "HEAD"])?.trim().to_owned();
+    let runs = finished(&s, "acme/app", &sha, 1)?;
+    assert!(runs.iter().all(|r| field(r, "conclusion") == "success"), "{runs:?}\n{}", s.log());
+
+    // The head asks for a new input: Release says so before it releases.
+    let v2 = v1.replace("inputs:\n", "inputs:\n  where:\n    required: true\n");
+    std::fs::write(kit.join(".github/actions/setup/action.yml"), &v2)?;
+    git(&home, &kit, &["commit", "-qam", "where"])?;
+    git(&home, &kit, &["push", "-q", "origin", "main"])?;
+    let head = git(&home, &kit, &["rev-parse", "HEAD"])?.trim().to_owned();
+    // The pane reads the repository as kiln's mirror of it has it: until it has the push.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let p = loop {
+        let (st, p) = pane(&s, &s.admin, ".github/actions/setup/action.yml", None)?;
+        anyhow::ensure!(st == 200, "the action's pane: {st} {p}");
+        if at(&p, "/head/commit") == head {
+            break p;
+        }
+        anyhow::ensure!(Instant::now() < deadline, "the pane never read {head}: {p}");
+        std::thread::sleep(Duration::from_millis(300));
+    };
+    let verbs = p.pointer("/strip/verbs").and_then(Value::as_array).cloned().unwrap_or_default();
+    let asks = verbs.iter().find(|v| field(v, "verb") == "release").map(|v| field(v, "asks").to_owned()).unwrap_or_default();
+    assert!(asks.starts_with("Keep · Release") && asks.contains("input `where` added, required"), "{asks:?} in {verbs:?}");
+
+    // Released, acme/app's update draft says what changes for it.
+    release(git(&home, &kit, &["rev-parse", "HEAD"])?.trim(), "v1.1.0")?;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let id = loop {
+        let list = pipelines(&s, &s.admin, "?repo=acme/app")?;
+        let rows = rows_of(&list, "acme/app");
+        if let Some(r) = rows.iter().find(|r| field(r, "path") == ".github/workflows/ci.yml" && at(r, "/draft/author").starts_with("kiln-updates:")) {
+            break at(r, "/draft/id").to_owned();
+        }
+        anyhow::ensure!(Instant::now() < deadline, "no update draft in acme/app: {list}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    let (st, body) = http(s.port, "GET", &format!("/api/ship/pipelines/acme/app?path=.github/workflows/ci.yml&draft={id}"), &s.admin, None)?;
+    anyhow::ensure!(st == 200, "the update draft's pane: {st} {body}");
+    let p: Value = serde_json::from_str(&body)?;
+    let changes: Vec<(&str, &str)> = group(&p, "What changes for it").iter().map(|l| (field(l, "name"), field(l, "value"))).collect();
+    assert_eq!(changes, [("input where", "added · required")], "{p}");
+    let upstream: Vec<&str> = group(&p, "Upstream").iter().map(|l| field(l, "name")).collect();
+    assert_eq!(upstream, ["acme/kit/.github/actions/setup v1.0.0 → v1.1.0"], "{p}");
+    assert!(at(&p, "/detail/text").contains("setup@v1.1.0"), "{p}");
+    Ok(())
+}

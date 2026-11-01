@@ -327,7 +327,13 @@ async fn gather(hub: &Hub, repo: &Repo, env: &Env) -> anyhow::Result<Option<Held
 async fn draft_row(hub: &Hub, repo: &Repo, d: &crate::ci::pipeline_drafts::Draft, ctx: &Ctx, env: &Env) -> (Row, Option<(String, String, Option<crate::ci::load::Loaded>)>) {
     let mark = core::DraftOf {
         id: d.id.clone(),
-        state: if d.state == "review" { core::Draft::Review } else { core::Draft::Unpublished },
+        state: if d.state == "review" {
+            core::Draft::Review
+        } else if d.author.starts_with(kiln_ci::updates::AUTHOR) {
+            core::Draft::Update
+        } else {
+            core::Draft::Unpublished
+        },
         author: d.author.clone(),
         change: d.name.clone().map(|name| core::DraftChange { kind: if d.kind == "diff" { "diff" } else { "change" }, name, url: d.url.clone() }),
     };
@@ -451,8 +457,62 @@ pub async fn get(hub: &Arc<Hub>, owner: &str, name: &str, q: &HashMap<String, St
         }
     };
     let by_hand = runs_by_hand(commit.workflows.iter().find(|l| l.path == path));
-    let pane = core::pane_json(&core::Opened { repo: &full, row: &row, at: &at, sha: &sha, text: &text, viewer, by_hand }, &groups);
+    let changes = if row.facts.kind.is_action() || row.facts.kind == Kind::Reusable { Some(since_release(hub, &repo, path, &text, &ctx.versions).await) } else { None };
+    let pane = core::pane_json(&core::Opened { repo: &full, row: &row, at: &at, sha: &sha, text: &text, viewer, by_hand, changes: changes.as_deref() }, &groups);
     Ok(srv::json(StatusCode::OK, &pane))
+}
+
+/// What releasing `text` (the file at `path` now) changes for the workflows that use it, since
+/// the newest of `versions` (W29-R21, R22): nothing where it was never released.
+async fn since_release(hub: &Hub, repo: &Repo, path: &str, text: &str, versions: &[(String, String)]) -> Vec<kiln_ci::wf::diff::Change> {
+    let Some(newest) = kiln_ci::pipelines::newest_release(versions.iter().map(|(t, _)| t.as_str())) else { return Vec::new() };
+    // By its tag's name: an annotated tag's own object isn't a commit to read a file at.
+    let dir = crate::ci::hosting::native_path(hub, repo).unwrap_or_else(|| crate::gitops::mirror_path(hub, &repo.name)).to_string_lossy().into_owned();
+    let old = git(hub, &dir, &["show", &format!("refs/tags/{newest}:{path}")]).await;
+    if old.is_empty() {
+        return Vec::new();
+    }
+    diff_of(path, &old, text)
+}
+
+/// [`kiln_ci::wf::action_diff`] of a file's two texts, an action's or a reusable workflow's.
+fn diff_of(path: &str, old: &str, new: &str) -> Vec<kiln_ci::wf::diff::Change> {
+    use kiln_ci::wf::diff::Version;
+    if path.ends_with("action.yml") || path.ends_with("action.yaml") {
+        let (a, b) = (wf::parse_action(old).0.unwrap_or_default(), wf::parse_action(new).0.unwrap_or_default());
+        return kiln_ci::wf::action_diff(Version::Action(&a, old), Version::Action(&b, new));
+    }
+    let parse = |t: &str| wf::parse_workflow(path, t, kiln_ci::expr::Dialect::Gha).0.unwrap_or_default();
+    let (a, b) = (parse(old), parse(new));
+    kiln_ci::wf::action_diff(Version::Workflow(&a), Version::Workflow(&b))
+}
+
+/// What an update draft changes for its consumer (W29-R22): for each `uses:` it moves (the
+/// consumer's file on its trunk, against the draft's head), what the used action or reusable
+/// workflow changes between the two versions, read from kiln's copy of it, and how much of its
+/// file changed upstream.
+async fn update_changes(hub: &Hub, repo: &Repo, path: &str, trunk: &str, text: &str) -> (Vec<kiln_ci::wf::diff::Change>, Vec<(String, String)>) {
+    let before = crate::ci::load::blob(hub, repo, trunk, path).await.unwrap_or_default();
+    let mut changes = Vec::new();
+    let mut upstream = Vec::new();
+    for (name, old, new) in kiln_ci::updates::moved_between(&before, text) {
+        let Some(r) = crate::ci::actions::Remote::parse(&format!("{name}@{new}")) else { continue };
+        let full = format!("{}/{}", r.owner, r.repo);
+        let dir = crate::ci::hosting::path_of(hub, &full).filter(|d| d.join("HEAD").exists()).unwrap_or_else(|| r.mirror(hub)).to_string_lossy().into_owned();
+        let file = if r.path.ends_with(".yml") || r.path.ends_with(".yaml") {
+            r.path.clone()
+        } else {
+            let base = if r.path.is_empty() { String::new() } else { format!("{}/", r.path) };
+            let yml = format!("{base}action.yml");
+            // `rev-parse` names the file's blob where it's there, and nothing where it isn't.
+            if git(hub, &dir, &["rev-parse", "--verify", "--quiet", &format!("{new}:{yml}")]).await.trim().is_empty() { format!("{base}action.yaml") } else { yml }
+        };
+        let (a, b) = (git(hub, &dir, &["show", &format!("{old}:{file}")]).await, git(hub, &dir, &["show", &format!("{new}:{file}")]).await);
+        changes.extend(diff_of(&file, &a, &b));
+        let stat = git(hub, &dir, &["diff", "--shortstat", &old, &new, "--", r.path.as_str()]).await;
+        upstream.push((format!("{full}/{} {old} → {new}", r.path), stat.trim().to_owned()));
+    }
+    (changes, upstream)
 }
 
 /// What sharing says of `path` in `repo`'s pane (W29-R17, R20): the repository's Access, and which
@@ -486,15 +546,20 @@ async fn draft_pane(hub: &Hub, repo: &Repo, id: &str, path: &str, viewer: core::
     let (head, text, loaded) = read.ok_or_else(|| (StatusCode::BAD_GATEWAY, format!("kiln can't read the draft's head on {}'s host yet", repo.name)))?;
     let (access, used) = used_by(hub, repo, path, loaded.is_none()).await;
     let sharing = core::Sharing { repo: &repo.name, access, used_by: &used };
-    let groups = match &loaded {
+    let mut groups = match &loaded {
         Some(l) => l.workflow.as_ref().map(|w| core::workflow_groups(w, &text, &[], true, "", Some(&sharing))).unwrap_or_default(),
         None => {
             let (action, _) = wf::parse_action(&text);
             action.as_ref().map(|a| core::action_groups(a, row.facts.kind, &text, &head, &ctx.versions, &sharing)).unwrap_or_default()
         }
     };
+    if d.author.starts_with(kiln_ci::updates::AUTHOR) {
+        let (changes, upstream) = update_changes(hub, repo, path, &tip, &text).await;
+        groups.insert(0, core::PaneGroup { name: "What changes for it".into(), lines: core::change_lines(&changes) });
+        groups.insert(1, core::PaneGroup { name: "Upstream".into(), lines: core::upstream_lines(&upstream) });
+    }
     let at = d.branch.clone().or_else(|| d.name.clone()).unwrap_or_else(|| head.clone());
-    let pane = core::pane_json(&core::Opened { repo: &repo.name, row: &row, at: &at, sha: &head, text: &text, viewer, by_hand: runs_by_hand(loaded.as_ref()) }, &groups);
+    let pane = core::pane_json(&core::Opened { repo: &repo.name, row: &row, at: &at, sha: &head, text: &text, viewer, by_hand: runs_by_hand(loaded.as_ref()), changes: None }, &groups);
     Ok(srv::json(StatusCode::OK, &pane))
 }
 

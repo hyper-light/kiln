@@ -1082,6 +1082,9 @@ pub struct Verb {
     pub enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub why_not: Option<&'static str>,
+    /// What it asks before it acts (Release's Keep · Release, W29-R21): what it changes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asks: Option<String>,
 }
 
 /// Who looks at a pane, for its verbs: their name, and whether they may submit changes to its
@@ -1102,8 +1105,8 @@ pub struct Viewer<'a> {
 /// - Ready and Discard: the draft's own author;
 /// - Release, for what's shared: dimmed until releases are built (W29-R21).
 pub fn verbs_for(row: &Row, viewer: Viewer<'_>, by_hand: bool) -> Vec<Verb> {
-    let on = |verb: &'static str, label: &'static str| Verb { verb, label, enabled: true, why_not: None };
-    let dim = |verb: &'static str, label: &'static str, why: &'static str| Verb { verb, label, enabled: false, why_not: Some(why) };
+    let on = |verb: &'static str, label: &'static str| Verb { verb, label, enabled: true, why_not: None, asks: None };
+    let dim = |verb: &'static str, label: &'static str, why: &'static str| Verb { verb, label, enabled: false, why_not: Some(why), asks: None };
     let kind = row.facts.kind;
     let draft = row.draft.as_ref();
     let mine = draft.is_some_and(|d| d.author == viewer.name);
@@ -1118,14 +1121,14 @@ pub fn verbs_for(row: &Row, viewer: Viewer<'_>, by_hand: bool) -> Vec<Verb> {
     let save = if viewer.can_submit { on("save_draft", "Save draft") } else { dim("save_draft", "Save draft", "Saving a draft needs diffs.submit (W29-R11)") };
     let ready = match draft {
         None => dim("ready", "Ready", "Ready is for a draft (W29-R12)"),
-        Some(_) if update => dim("ready", "Ready", "kiln's update drafts come with releases (W29-R22)"),
+        Some(_) if update => dim("ready", "Ready", "kiln's update drafts are reviewed as their change (W29-R22)"),
         Some(_) if !mine => dim("ready", "Ready", "Only its author marks it ready (W29-R12)"),
         Some(d) if d.state == Draft::Review => dim("ready", "Ready", "It's in review already (W29-R12)"),
         Some(_) => on("ready", "Ready"),
     };
     let discard = match draft {
         None => dim("discard", "Discard", "Discard is for a draft (W29-R13)"),
-        Some(_) if update => dim("discard", "Discard", "kiln's update drafts come with releases (W29-R22)"),
+        Some(_) if update => dim("discard", "Discard", "kiln's update drafts are reviewed as their change (W29-R22)"),
         Some(_) if !mine => dim("discard", "Discard", "Only its author discards it (W29-R13)"),
         Some(_) => on("discard", "Discard"),
     };
@@ -1152,6 +1155,38 @@ pub struct Opened<'a> {
     pub viewer: Viewer<'a>,
     /// A workflow that runs by hand: it has `workflow_dispatch` (kiln's `manual` reads as it).
     pub by_hand: bool,
+    /// What its next release changes for its consumers, since its newest (W29-R21, R22).
+    pub changes: Option<&'a [crate::wf::diff::Change]>,
+}
+
+/// Release's Keep · Release words: what releasing the head changes for its consumers (W29-R21).
+pub fn release_asks(changes: &[crate::wf::diff::Change]) -> String {
+    if changes.is_empty() {
+        return "Keep · Release: nothing changes for the workflows that use it".to_owned();
+    }
+    let said: Vec<String> = changes.iter().map(change_words).collect();
+    format!("Keep · Release: for the workflows that use it, {}", said.join("; "))
+}
+
+fn change_words(c: &crate::wf::diff::Change) -> String {
+    match &c.detail {
+        Some(d) => format!("{} `{}` {}, {d}", c.kind, c.name, c.what),
+        None => format!("{} `{}` {}", c.kind, c.name, c.what),
+    }
+}
+
+/// An update's upstream, as its pane's lines (W29-R22): each used file between its two versions,
+/// and how much of it changed.
+pub fn upstream_lines(upstream: &[(String, String)]) -> Vec<Line> {
+    upstream.iter().map(|(name, stat)| Line::new(format!("upstream.{name}"), "upstream", name.clone(), if stat.is_empty() { "no change to its files".to_owned() } else { stat.clone() })).collect()
+}
+
+/// What an update changes for its consumer, as its pane's lines (W29-R22).
+pub fn change_lines(changes: &[crate::wf::diff::Change]) -> Vec<Line> {
+    if changes.is_empty() {
+        return vec![Line::new("changes", "note", "What changes", "nothing its workflows meet").state("none")];
+    }
+    changes.iter().map(|c| Line::new(format!("changes.{}.{}", c.kind, c.name), "change", format!("{} {}", c.kind, c.name), c.detail.as_ref().map_or_else(|| c.what.to_owned(), |d| format!("{} · {d}", c.what)))).collect()
 }
 
 /// An opened row's pane (W29-R04's `ShipPipelinePane { head, strip, groups, detail }`).
@@ -1169,7 +1204,12 @@ pub fn pane_json(o: &Opened<'_>, groups: &[PaneGroup]) -> Value {
         "strip": {
             "said": [format!("{} · {}", f.kind.words(), row.line)],
             "pick": ["all"],
-            "verbs": verbs_for(row, o.viewer, o.by_hand),
+            "verbs": verbs_for(row, o.viewer, o.by_hand).into_iter().map(|mut v| {
+                if v.verb == "release" && v.enabled {
+                    v.asks = o.changes.map(release_asks);
+                }
+                v
+            }).collect::<Vec<_>>(),
         },
         "groups": groups,
         "detail": { "name": f.path, "views": views, "text": o.text },
