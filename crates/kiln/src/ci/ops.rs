@@ -1615,6 +1615,10 @@ pub mod input {
         pub suggestion: Option<String>,
         pub version: Option<i64>,
         pub publish: Option<bool>,
+        /// Its giver's signature (W27-R04): `ci.diffs.statement`'s statement signed where their key
+        /// is, as a Sigstore bundle. An agent's MCP server signs its verdicts and comments through
+        /// its runner by itself.
+        pub signed: Option<serde_json::Value>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]

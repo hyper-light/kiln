@@ -847,18 +847,19 @@ impl Server {
     }
 }
 
-/// A verdict or comment the session gives (`ci.diffs.review`, `ci.diffs.comment`), signed as the
-/// agent before it goes (docs/ci.md W27-R04): kiln says what to sign (`ci.diffs.statement`), and
-/// once it says what's given, the runner holding the session's key signs it, as it signs the
-/// session's commits. Where the repository doesn't require it, what can't be signed goes unsigned.
+/// A verdict, comment or reply the session gives (`ci.diffs.review`, `ci.diffs.comment`,
+/// `ci.diffs.reply`), signed as the agent before it goes (docs/ci.md W27-R04): kiln says what to
+/// sign (`ci.diffs.statement`, asked with what a statement reads of it), and once it says what's
+/// given, the runner holding the session's key signs it, as it signs the session's commits. Where
+/// the repository doesn't require it, what can't be signed goes unsigned.
 fn signed_by_the_agent(server: &Server, name: &str, mut input: Value) -> Result<Value, Value> {
     let kind = if name == "ci.diffs.review" { "verdict" } else { "comment" };
     let text = |k: &str| input.get(k).and_then(Value::as_str).map(str::to_owned);
     let (words, action, suggestion) = (text("body").unwrap_or_default(), text("action").unwrap_or_default(), text("suggestion"));
-    let mut ask = input.clone();
-    if let Some(o) = ask.as_object_mut() {
-        o.insert("kind".into(), json!(kind));
-    }
+    // What it says, not where (its lines, its thread) nor whether it's published now.
+    let mut ask: serde_json::Map<String, Value> = ["diff", "action", "body", "suggestion", "version"].into_iter().filter_map(|k| input.get(k).map(|v| (k.to_owned(), v.clone()))).collect();
+    ask.insert("kind".into(), json!(kind));
+    let ask = Value::Object(ask);
     let to_sign = server.ask(json!({"op": "call", "name": "ci.diffs.statement", "input": ask})).map_err(|e| json!({"error": format!("{e:#}")}))?;
     let Some(t) = to_sign.get("ok") else { return Err(to_sign) };
     let meant = crate::ci::verdicts::Meant { kind, action: if kind == "verdict" { &action } else { "" }, words: words.trim(), suggestion: suggestion.as_deref() };
@@ -939,7 +940,7 @@ impl code::Host for Program {
                 if let Some(why) = &self.unavailable {
                     return Err(err(format!("kiln's own operations can't be called from here: {why}")));
                 }
-                let input = if matches!(name, "ci.diffs.review" | "ci.diffs.comment") { signed_by_the_agent(&self.server, name, input)? } else { input };
+                let input = if matches!(name, "ci.diffs.review" | "ci.diffs.comment" | "ci.diffs.reply") { signed_by_the_agent(&self.server, name, input)? } else { input };
                 let a = self.server.ask(json!({"op": "call", "name": name, "input": input})).map_err(|e| err(format!("{e:#}")))?;
                 match a.get("ok") {
                     Some(v) => Ok(v.clone()),
