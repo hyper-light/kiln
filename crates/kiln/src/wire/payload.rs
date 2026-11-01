@@ -299,8 +299,9 @@ pub enum FromRunner {
     JobEvent { job: String, event: Box<crate::proto::JobEvent> },
     Facts(Box<kiln_ci::facts::RunnerFacts>),
     ReachHello(crate::reach::relay::Announce),
-    /// `ReachAsk`: a question for the server.
-    ReachAsk { req: u64, ask: Box<crate::reach::Question> },
+    /// `ReachAsk`: a question for the server; and the question as it came, which an agent's act is
+    /// checked against (signed over its bytes, docs/ci.md W27-R08).
+    ReachAsk { req: u64, ask: Box<crate::reach::Question>, raw: Value },
     Convo { msg: Box<crate::convo::feed::Msg>, data: Vec<u8> },
     Power(crate::os::battery::Battery),
     HarnessFileData { req: u64, answer: crate::harness::files::Answer, data: Vec<u8> },
@@ -323,6 +324,15 @@ pub enum FromRunner {
     /// `HeadroomStatus`: how its machine's headroom does (docs/headroom.md), kept and shown as it
     /// came: of it, the server reads only the fingerprint of the settings in use.
     HeadroomStatus(Value),
+    /// `LegResults`: a leg's records, signed as the leg at its end (docs/ci.md W27-R05): Sigstore
+    /// bundles, each checked as it's taken.
+    LegResults { job: String, bundles: Vec<Value> },
+    /// `LegSignature`: the provenance kiln wrote of what a leg built, signed as the leg (a Sigstore
+    /// bundle), or why not (docs/ci.md W27-R06).
+    LegSignature { job: String, nonce: String, bundle: Option<Value>, error: Option<String> },
+    /// `Custody`: a custody record or delegation a runner process or a session it holds signed, or
+    /// carried (a Sigstore bundle, docs/ci.md W27-R08).
+    Custody(Value),
 }
 
 impl Carries for AgentMsg {
@@ -347,7 +357,10 @@ impl Carries for AgentMsg {
             AgentMsg::JobEvent { job, json } => FromRunner::JobEvent { job, event: payload(W, "JobEvent", &json)? },
             AgentMsg::Facts { json } => FromRunner::Facts(payload(W, "Facts", &json)?),
             AgentMsg::ReachHello { json } => FromRunner::ReachHello(payload(W, "ReachHello", &json)?),
-            AgentMsg::ReachAsk { req, json } => FromRunner::ReachAsk { req, ask: payload(W, "ReachAsk", &json).map_err(|e| e.waits(Waits::Asking(req)))? },
+            AgentMsg::ReachAsk { req, json } => {
+                let ask = payload(W, "ReachAsk", &json).map_err(|e| e.waits(Waits::Asking(req)))?;
+                FromRunner::ReachAsk { req, ask, raw: serde_json::from_str(&json).unwrap_or_default() }
+            }
             AgentMsg::Convo { json, data } => FromRunner::Convo { msg: payload(W, "Convo", &json)?, data },
             AgentMsg::Power { json } => FromRunner::Power(payload(W, "Power", &json)?),
             AgentMsg::Answer { req, json } => FromRunner::Answer(Answer { of: "Answer", req, json }),
@@ -361,6 +374,15 @@ impl Carries for AgentMsg {
             AgentMsg::Identity { json } => FromRunner::Identity(payload(W, "Identity", &json)?),
             AgentMsg::Observe { json, bytes } => FromRunner::Observe { msg: payload(W, "Observe", &json)?, bytes },
             AgentMsg::HeadroomStatus { json } => FromRunner::HeadroomStatus(payload(W, "HeadroomStatus", &json)?),
+            AgentMsg::LegResults { job, bundles } => FromRunner::LegResults { job, bundles: payload(W, "LegResults", &bundles)? },
+            AgentMsg::LegSignature { job, nonce, bundle, error } => {
+                let bundle = match bundle {
+                    Some(b) => Some(payload(W, "LegSignature", &b)?),
+                    None => None,
+                };
+                FromRunner::LegSignature { job, nonce, bundle, error }
+            }
+            AgentMsg::Custody { json } => FromRunner::Custody(payload(W, "Custody", &json)?),
             m @ (AgentMsg::Hello(_)
             | AgentMsg::Heartbeat { .. }
             | AgentMsg::Sample(_)
@@ -431,6 +453,9 @@ pub enum FromServer {
     Observe { msg: Box<crate::observe::wire::Msg>, bytes: Vec<u8> },
     /// `Headroom`: this machine's headroom settings (docs/headroom.md).
     Headroom(Box<crate::headroom::Push>),
+    /// `Custody`: work kiln's server handed one of the runner's agent sessions, `{session, hand_on}`
+    /// (docs/ci.md W27-R08).
+    Custody(Value),
 }
 
 impl Carries for ServerMsg {
@@ -488,6 +513,7 @@ impl Carries for ServerMsg {
             ServerMsg::Identity { json } => FromServer::Identity(payload(W, "Identity", &json)?),
             ServerMsg::Observe { json, bytes } => FromServer::Observe { msg: payload(W, "Observe", &json)?, bytes },
             ServerMsg::Headroom { json } => FromServer::Headroom(payload(W, "Headroom", &json)?),
+            ServerMsg::Custody { json } => FromServer::Custody(payload(W, "Custody", &json)?),
             m @ (ServerMsg::Welcome { .. }
             | ServerMsg::Refused { .. }
             | ServerMsg::Assign(_)
@@ -531,7 +557,8 @@ impl Carries for ServerMsg {
             | ServerMsg::Kept { .. }
             | ServerMsg::Unread { .. }
             | ServerMsg::ReachRefused { .. }
-            | ServerMsg::Freeze { .. }) => return Ok(Carried::Nothing(m)),
+            | ServerMsg::Freeze { .. }
+            | ServerMsg::SignAsLeg { .. }) => return Ok(Carried::Nothing(m)),
         };
         Ok(Carried::Read(read))
     }

@@ -331,7 +331,10 @@ enum Bg {
     Fetched { job: String, exe: PathBuf, build: String },
     /// The new build's runner is connected and ready: hand it everything.
     #[cfg(unix)]
-    Ready { job: String, conn: Arc<crate::bluegreen::Conn>, stores: bool },
+    /// `custody`: the new build takes sessions signed for (docs/ci.md W27-R08); `role`: its instance,
+    /// when it takes the machine's runner role signed for too; `stores`: it takes blue's
+    /// conversation stores over too.
+    Ready { job: String, conn: Arc<crate::bluegreen::Conn>, custody: bool, role: Option<String>, stores: bool },
     /// Everything was sent: what the new build said of each, in order (`broke`: the connection
     /// failed part-way), and where it set aside each conversation store that wouldn't open there
     /// (`aside`, as [`Given::aside`]).
@@ -990,12 +993,13 @@ async fn gone_within(pid: u32, patience: Duration) -> bool {
 /// taken on this runner's loop (`tx`), which also hears once everything is in. `takes_stores`: it
 /// waits for that runner's conversation stores (it keeps conversations).
 #[cfg(unix)]
-async fn take_over_from(path: PathBuf, harness: Option<Arc<crate::harness::host::Host>>, tx: async_channel::Sender<Bg>, me: String, takes_stores: bool) -> anyhow::Result<()> {
+async fn take_over_from(path: PathBuf, harness: Option<Arc<crate::harness::host::Host>>, tx: async_channel::Sender<Bg>, me: Me, takes_stores: bool) -> anyhow::Result<()> {
     use crate::bluegreen::Frame;
     use base64::Engine as _;
     let conn = Arc::new(crate::rt::blocking(move || crate::bluegreen::connect(&path)).await??);
     let c = Arc::clone(&conn);
-    crate::rt::blocking(move || c.send(&Frame::Ready { pid: std::process::id(), instance: me, stores: takes_stores }, &[])).await??;
+    let (custody, instance) = (crate::runner::custody::signs(), me.instance.clone());
+    crate::rt::blocking(move || c.send(&Frame::Ready { pid: std::process::id(), instance, custody, role: custody, stores: takes_stores }, &[])).await??;
     tracing::info!(upgrade = %std::env::var("KILN_UPGRADE_ID").unwrap_or_default(), "connected to the runner being upgraded: taking over");
     // Read on a thread of its own: once everything is in, the connection stays open (idle) until
     // the old runner ends.
@@ -1045,8 +1049,8 @@ async fn take_over_from(path: PathBuf, harness: Option<Arc<crate::harness::host:
             }
         }
         let (id, r) = match frame {
-            Frame::Session { id, record, handed } => {
-                let r = take_session(harness.as_ref(), &id, *record, handed, fds).await;
+            Frame::Session { id, record, handed, hand_on } => {
+                let r = take_session(harness.as_ref(), &id, *record, handed, hand_on, fds).await;
                 if r.is_ok() {
                     sessions += 1;
                 }
@@ -1080,10 +1084,16 @@ async fn take_over_from(path: PathBuf, harness: Option<Arc<crate::harness::host:
                 continue;
             }
             Frame::Forward { data } => {
-                if let Ok(d) = base64::engine::general_purpose::STANDARD.decode(data.as_bytes()) {
+                if let Some(d) = passed_on(&data, &me) {
                     let _ = tx.send(Bg::Forwarded(d)).await;
                 }
                 continue;
+            }
+            // The machine's runner role: this process's receipt, signed once its own identity is
+            // certified, goes to the server with blue's hand-on (docs/ci.md W27-R08).
+            Frame::Role { hand_on } => {
+                crate::runner::custody::role_taken(&hand_on);
+                ("runner role".to_owned(), Ok(()))
             }
             Frame::Ready { .. } | Frame::Ack { .. } | Frame::Stores { .. } | Frame::StoresTaken { .. } => continue,
         };
@@ -1097,24 +1107,95 @@ async fn take_over_from(path: PathBuf, harness: Option<Arc<crate::harness::host:
     Ok(())
 }
 
+/// This runner process, as a hand-over's word names the process it's for (docs/ci.md W27-R08): its
+/// machine and instance, and kiln's root, which the server's signature on a word chains to.
+#[cfg(unix)]
+struct Me {
+    machine: String,
+    instance: String,
+    root: Vec<u8>,
+}
+
+/// The session a server frame is a hand-over's word about (a local MoveTo, a HandedOver: about the
+/// hold of the process it's sent to, never another's).
+#[cfg(unix)]
+fn hand_overs_word(msg: &ServerMsg) -> Option<&str> {
+    let ServerMsg::HarnessCmd { session, json } = msg else { return None };
+    crate::runner::custody::hand_overs_word(json).then_some(session.as_str())
+}
+
+/// (The runner being upgraded, blue/green.) Whether a server frame goes on to the new build: what
+/// it's about, when that was handed there, or is new while this runner hands everything over or
+/// retires (`leaving`); else nothing, and this runner takes it. A hand-over's word stays here
+/// ([`hand_overs_word`]): about a session handed over, it was meant for this runner's hold.
+#[cfg(unix)]
+fn goes_on(msg: &ServerMsg, moved: &std::collections::HashSet<crate::instances::Owned>, leaving: bool) -> Option<crate::instances::Owned> {
+    if hand_overs_word(msg).is_some() {
+        return None;
+    }
+    let opens = leaving && matches!(msg, ServerMsg::TermOpen { .. } | ServerMsg::HarnessOpen { .. });
+    crate::instances::Owned::of(msg).filter(|w| opens || moved.contains(w))
+}
+
+/// (The new build's runner.) A server frame the runner being upgraded passed on: its bytes, taken
+/// as the server's own. Not a hand-over's word ([`hand_overs_word`]), which was meant for that
+/// runner (one from before this build passes those on too): refused, and kiln told whom it was for.
+#[cfg(unix)]
+fn passed_on(data: &str, me: &Me) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    let d = base64::engine::general_purpose::STANDARD.decode(data.as_bytes()).ok()?;
+    if let Ok(m) = proto::read_server(&d)
+        && let Some(session) = hand_overs_word(&m)
+        && let ServerMsg::HarnessCmd { json, .. } = &m
+    {
+        if crate::runner::custody::word_for_me(session, json, true, &me.root, &me.machine, &me.instance, None).is_ok() {
+            crate::runner::custody::refused_word(session, None, "a hand-over's word passed on by the runner this one took over from: that runner's, not this one's");
+        }
+        return None;
+    }
+    Some(d)
+}
+
+/// Whether an agent session this runner doesn't hold is gone, as it says when asked about it: not
+/// one it handed to its new build (blue/green), which runs it now.
+#[cfg(unix)]
+fn gone_here(session: &str, moved: &std::collections::HashSet<crate::instances::Owned>) -> bool {
+    !moved.contains(&crate::instances::Owned::Agent(session.to_owned()))
+}
+
 /// (The new build's runner.) An agent session handed over: with its harness process, whose pipes
 /// came as `fds` (stdin, stdout, stderr); else started again from its record. When its process
 /// can't go on here it is stopped and the session starts again from its record (an error, saying so).
 #[cfg(unix)]
-async fn take_session(h: Option<&Arc<crate::harness::host::Host>>, id: &str, rec: crate::harness::host::Saved, handed: Option<Box<crate::harness::session::Handed>>, fds: Vec<std::os::fd::OwnedFd>) -> Result<(), String> {
+async fn take_session(h: Option<&Arc<crate::harness::host::Host>>, id: &str, rec: crate::harness::host::Saved, handed: Option<Box<crate::harness::session::Handed>>, hand_on: Option<String>, fds: Vec<std::os::fd::OwnedFd>) -> Result<(), String> {
     use std::os::fd::IntoRawFd as _;
     let Some(h) = h else { return Err("this runner runs no agent sessions".to_owned()) };
     if h.get(id).is_some() {
         return Ok(());
     }
+    // Signed for by the runner it came from, or by none (one from before): it goes on at its epoch
+    // until this runner is promoted, its receipt waiting till then (docs/ci.md W27-R08).
+    let given = hand_on.as_deref().and_then(crate::runner::custody::bundle_of);
+    let taken = |r: Result<(), String>| {
+        if r.is_ok()
+            && let Some(s) = h.get(id)
+        {
+            let (epoch, events) = {
+                let core = s.core.lock();
+                (core.state.epoch, core.events().cloned().collect::<Vec<_>>())
+            };
+            crate::runner::custody::took_blue_green(id, epoch, &events, given.as_ref());
+        }
+        r
+    };
     let Some(mut hd) = handed else {
-        return h.move_in(rec, None).map_err(|e| format!("{e:#}"));
+        return taken(h.move_in(rec, None).map_err(|e| format!("{e:#}")));
     };
     let pid = hd.process.pid;
     let mut fds = fds.into_iter();
     let (Some(i), Some(o), Some(e)) = (fds.next(), fds.next(), fds.next()) else {
         let _ = crate::rt::blocking(move || crate::harness::host::stop_process(pid)).await;
-        let again = h.move_in(rec, None).map_err(|e| format!("{e:#}"));
+        let again = taken(h.move_in(rec, None).map_err(|e| format!("{e:#}")));
         return Err(format!("its pipes didn't come with it, so its process was stopped{}", again.err().map_or_else(|| ": it started again from its record".to_owned(), |e| format!(", and it couldn't start again: {e}"))));
     };
     hd.process.stdin = i.into_raw_fd();
@@ -1123,14 +1204,14 @@ async fn take_session(h: Option<&Arc<crate::harness::host::Host>>, id: &str, rec
     hd.process.foreign = true;
     let raw = [hd.process.stdin, hd.process.stdout, hd.process.stderr];
     match h.move_in(rec.clone(), Some(hd)) {
-        Ok(()) => Ok(()),
+        Ok(()) => taken(Ok(())),
         // Refused before its pipes were taken: they close, its process is stopped.
         Err(e) => {
             for r in raw {
                 drop(crate::os::reclaim_fd(r));
             }
             let _ = crate::rt::blocking(move || crate::harness::host::stop_process(pid)).await;
-            let again = h.move_in(rec, None).map_err(|e| format!("{e:#}"));
+            let again = taken(h.move_in(rec, None).map_err(|e| format!("{e:#}")));
             Err(format!("{e:#}; its process was stopped{}", again.err().map_or_else(|| ", and it started again from its record".to_owned(), |e| format!(", and it couldn't start again: {e}"))))
         }
     }
@@ -1147,6 +1228,14 @@ async fn headroom_changed(h: Option<&crate::headroom::Handle>) {
 async fn front_door_changed(fd: Option<&crate::frontdoor::runner::Handle>) {
     match fd {
         Some(h) => h.changed().await,
+        None => futures::future::pending().await,
+    }
+}
+
+/// The next event taken ahead of its turn, or never when there's none.
+async fn next_taken(taken: &mut VecDeque<Ev>) -> Ev {
+    match taken.pop_front() {
+        Some(ev) => ev,
         None => futures::future::pending().await,
     }
 }
@@ -1218,6 +1307,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // A microVM's leg reaches the server as this runner does, so it trusts the same CA (W13-R05).
     #[cfg(target_os = "linux")]
     let microvm_ca = ca.clone();
+    // kiln's root, which a hand-over's word the server signs chains to (docs/ci.md W27-R08).
+    let root = ca.clone();
     // This machine's front door (DNS, HTTPS, a .local name), when the server gives it one. It runs
     // from the settings it stored at once, and keeps running while the server is away.
     let front_door = (!o.ephemeral && !o.outpost).then(|| {
@@ -1395,6 +1486,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // Jobs' results the server hasn't said it has (`ServerMsg::Received`), each encoded, by job:
     // sent again after a reconnect, so one sent as the connection dropped isn't lost.
     let mut unreceived: HashMap<String, (Instant, Vec<u8>)> = HashMap::new();
+    // Each leg's signed results (`AgentMsg::LegResults`), encoded, by job: sent again with its
+    // result, before it, until the server says it has that (docs/ci.md W27-R05).
+    let mut signed_unreceived: HashMap<String, Vec<u8>> = HashMap::new();
     // Each job's events (`AgentMsg::JobEvent`, numbered by their `seq`), encoded, until its result
     // is received, by job: sent again after a reconnect too, to a server that takes each once (it
     // said so: `receipts`). The count goes on after (a kept leg's step rerun, W17-R04).
@@ -1485,6 +1579,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // The server issues identities (docs/ci.md W27-R01): this process's sessions' epochs, and
     // when each identity was last asked for and how long until it's asked for again.
     let mut server_identity = false;
+    // And takes what legs sign as themselves of what they hand on (docs/ci.md W27-R05, R06).
+    let mut server_signs = false;
+    // The server takes custody records (docs/ci.md W27-R08).
+    let mut server_custody = false;
     let mut session_epochs: HashMap<String, u64> = HashMap::new();
     let mut identity_asked: HashMap<String, (Instant, Duration)> = HashMap::new();
     // The server takes word that a frame of its couldn't be read here (`AgentMsg::Unread`): of each
@@ -1587,6 +1685,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         h.restore_from(convo.as_ref());
         h
     });
+    // Which of the machine's processes are its agent sessions' own: a run they ask for elsewhere
+    // is their act (docs/ci.md W27-R08).
+    if let Some(h) = &harness {
+        let h = Arc::clone(h);
+        crate::runner::custody::set_sessions(move || h.harness_pids());
+    }
     // The harnesses its user's login shell finds are this machine's too
     // (`crate::harness::kinds::search_path`): that shell is asked now, and every ten minutes.
     if harness.is_some() {
@@ -1666,6 +1770,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         running,
         terminal: o.terminal,
     };
+    // Events taken off their channels ahead of their turn: each goes before anything else but
+    // what the network says (a job's end waits behind what its job sent before it, `Ev::Done`).
+    let mut taken: VecDeque<Ev> = VecDeque::new();
 
     'events: loop {
         if let Some((stream, seq, refusal)) = answer_after.take() {
@@ -1708,9 +1815,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             crate::browser::driven::stop_all().await;
             return Ok(());
         }
+        // Whether this turn's event comes off its own channel (none was taken ahead of its turn): a
+        // job's end that does waits behind what its job sent (`Ev::Done`).
+        let in_turn = taken.is_empty();
         let ev = futures::select_biased! {
             () = shutdown_or_tick(&shutdown, lingering.is_some()).fuse() => Ev::Shutdown,
             ev = events.recv().fuse() => Ev::Net(ev.ok()),
+            e = next_taken(&mut taken).fuse() => e,
             r = done_rx.recv().fuse() => match r { Ok(r) => Ev::Done(r), Err(_) => Ev::Watchdog },
             () = heartbeat.tick().fuse() => Ev::Heartbeat,
             () = sample_tick.tick().fuse() => Ev::Sample,
@@ -1812,7 +1923,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 let (tx, j) = (bg_tx.clone(), job.clone());
                                 let waited = std::thread::Builder::new().name("kiln-upgrade".into()).spawn(move || {
                                     let _ = match listener.ready(green.pid, Instant::now() + crate::bluegreen::READY_WITHIN) {
-                                        Ok((conn, _, stores)) => tx.send_blocking(Bg::Ready { job: j, conn: Arc::new(conn), stores }),
+                                        Ok((conn, instance, custody, role, stores)) => tx.send_blocking(Bg::Ready { job: j, conn: Arc::new(conn), custody, role: role.then_some(instance), stores }),
                                         Err(e) => tx.send_blocking(Bg::Failed { job: j, why: format!("{e:#}") }),
                                     };
                                 });
@@ -1833,7 +1944,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             }
                         }
                     }
-                    Bg::Ready { job, conn, stores } => {
+                    Bg::Ready { job, conn, custody, role, stores } => {
                         let Some(mv) = moving.as_mut() else { continue };
                         if let Some(h) = mv.healthy.take() {
                             h.record("result", "ok");
@@ -1862,7 +1973,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             }
                         }
                         if let Some(h) = &harness {
-                            for (rec, handed) in h.move_out().await {
+                            for (rec, handed, hand_on) in h.move_out_signing(custody).await {
                                 let id = rec.id().to_owned();
                                 let mut handed = handed;
                                 let kept = match handed.as_ref() {
@@ -1880,10 +1991,20 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                     let _ = crate::rt::blocking(move || crate::harness::host::stop_process(pid)).await;
                                 }
                                 let fds = kept.as_ref().map(|(_, p)| p.iter().map(|f| f.as_raw_fd()).collect()).unwrap_or_default();
-                                frames.push((Frame::Session { id: id.clone(), record: Box::new(rec.clone()), handed }, fds));
+                                // Signed for as it goes, to a new build that takes it so (docs/ci.md W27-R08).
+                                let hand_on = hand_on.map(|b| b.to_string());
+                                frames.push((Frame::Session { id: id.clone(), record: Box::new(rec.clone()), handed, hand_on }, fds));
                                 moved.insert(crate::instances::Owned::Agent(id));
                                 mv.items.push(Item::Session { record: Box::new(rec), kept });
                             }
+                        }
+                        // The machine's runner role, last, signed for as it goes to a new build that
+                        // takes it so (docs/ci.md W27-R08; the Transfers plan's step 8). Its answer
+                        // comes after every item's, so it pairs with none of them.
+                        if let Some(to) = role.as_deref()
+                            && let Some(hand_on) = crate::runner::custody::role_hand_on(to)
+                        {
+                            frames.push((Frame::Role { hand_on }, Vec::new()));
                         }
                         let (sessions, terminals) = (mv.items.iter().filter(|i| matches!(i, Item::Session { .. })).count(), mv.items.iter().filter(|i| matches!(i, Item::Terminal { .. })).count());
                         let line = format!("the new build is connected to the server: handing it {sessions} agent session(s) and {terminals} terminal(s), their processes running on");
@@ -2216,9 +2337,15 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     Bg::Promoted => {
                         // Joined ranked oldest (new work stayed with the old runner): the newest now.
                         tracing::info!("promoted: this runner is the machine's newest; new work comes here");
-                        // Its sessions are its own for good: it takes their messages.
+                        // Its sessions are its own for good: it takes their messages, and each it
+                        // was handed signed for asks for its next epoch now (docs/ci.md W27-R08).
                         if let Some(h) = &harness {
                             h.hold(false);
+                        }
+                        if server_identity && connected {
+                            for (session, epoch) in crate::runner::custody::promoted() {
+                                ask_agent_identity(&uplink, &mut identity_asked, &session, epoch).await;
+                            }
                         }
                         instance_hello.created_at = real_created_at;
                         draining = false;
@@ -2405,6 +2532,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 // again below. A server that never says (one older than receipts) has them for a
                 // while only.
                 unreceived.retain(|_, (at, _)| at.elapsed() < UNRECEIVED_FOR);
+                signed_unreceived.retain(|job, _| unreceived.contains_key(job));
                 let mut running: Vec<String> = jobs.keys().cloned().collect();
                 running.extend(unreceived.keys().filter(|j| !jobs.contains_key(*j)).cloned());
                 let msg = AgentMsg::Hello(hello(running));
@@ -2445,10 +2573,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     // Pause and Resume freeze a job in place (W26-R22): its processes stopped on Unix,
                     // suspended on Windows.
                     let freeze = if cfg!(any(unix, windows)) { proto::CAP_FREEZE } else { 0 };
+                    let custody = if crate::runner::custody::signs() { proto::CAP_CUSTODY } else { 0 };
                     // Running agents, it answers what their branches' commits are and compares two points
                     // of their repositories (the Changes tab's Commits and Compare).
                     let commits = if harness.is_some() { proto::CAP_WORKSPACE_COMMITS | proto::CAP_WORKSPACE_COMPARE } else { 0 };
-                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit | proto::CAP_IDENTITY | headroom_cap | proto::CAP_UNREAD | freeze | commits }) {
+                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit | proto::CAP_IDENTITY | proto::CAP_LEG_SIGNS | headroom_cap | proto::CAP_UNREAD | freeze | custody | commits }) {
                         net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                     }
                 }
@@ -2537,6 +2666,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 server_work = false;
                 work_said = None;
                 server_identity = false;
+                server_signs = false;
                 server_limit = false;
                 limit_said = None;
                 if let Some(s) = &sync {
@@ -2621,9 +2751,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 // About something handed to the new build (blue/green), or new while this runner
                 // hands everything over or retires: it goes there.
                 #[cfg(unix)]
-                let opens = matches!(msg, ServerMsg::TermOpen { .. } | ServerMsg::HarnessOpen { .. }) && (retiring || moving.as_ref().is_some_and(|m| m.handing));
-                #[cfg(unix)]
-                if let Some(what) = crate::instances::Owned::of(&msg).filter(|w| moved.contains(w) || opens) {
+                if let Some(what) = goes_on(&msg, &moved, retiring || moving.as_ref().is_some_and(|m| m.handing)) {
                     moved.insert(what.clone());
                     match (&forward, moving.as_mut()) {
                         (Some(f), _) => {
@@ -2638,6 +2766,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 // can't be read"). What can't be read is refused: a command on the channel is NACKed
                 // saying why, the server hears of it (`Unread`) either way (of a kind its newer build
                 // sends, once a connection), and what waits on it is told why too.
+                // What's signed is checked over the bytes the server sent: a hand-over's word, and an
+                // assignment a leg signs its receipt of (docs/ci.md W27-R05, R08).
+                let raw = match &msg {
+                    ServerMsg::HarnessCmd { json, .. } | ServerMsg::AssignV2 { json } => Some(json.clone()),
+                    _ => None,
+                };
                 let msg = match crate::wire::payload_of(msg) {
                     Ok(read) => read,
                     Err(e) => {
@@ -2705,7 +2839,29 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     Carried::Read(FromServer::HarnessCmd { session, command }) => {
                         use crate::wire::channel::Refusal;
                         let known = harness.as_ref().is_some_and(|h| h.get(&session).is_some());
+                        // A hand-over's word (docs/ci.md W27-R08): applied only by the process it's
+                        // for, at the epoch it holds the session at here; refused otherwise, and
+                        // kiln told.
+                        let json = raw.as_deref().unwrap_or_default();
+                        let epoch_here = harness.as_ref().and_then(|h| h.get(&session)).map(|s| s.epoch());
+                        let for_me = crate::runner::custody::word_for_me(&session, json, server_custody, &root, &o.name, &instance_id, epoch_here);
+                        // One about a session this runner handed to its new build (blue/green): that
+                        // build's now, whoever kiln still counts.
+                        #[cfg(unix)]
+                        let for_me = for_me.and_then(|()| {
+                            if !crate::runner::custody::hand_overs_word(json) || gone_here(&session, &moved) {
+                                return Ok(());
+                            }
+                            let why = "it's about a session this runner handed to its machine's new build, which holds it now".to_owned();
+                            let word = crate::runner::custody::word_in(json);
+                            crate::runner::custody::refused_word(&session, word.as_deref(), &why);
+                            Err(why)
+                        });
                         match *command {
+                            _ if for_me.is_err() => {
+                                let why = for_me.as_ref().err().map(String::as_str).unwrap_or_default();
+                                refuse(&mut answer_after, Refusal::Refused, format!("a hand-over's word not for this process: {why}"));
+                            }
                             // The server's word on a hand-over to this machine's newer runner
                             // process: never "gone here", even once this process has let go.
                             crate::harness::model::Command::HandedOver { error, unsure, by_newest, none_newer } => {
@@ -2724,8 +2880,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             }
                             _ => {
                                 refuse(&mut answer_after, Refusal::Unknown, format!("no session {session} here"));
+                                #[cfg(unix)]
+                                let gone = gone_here(&session, &moved);
+                                #[cfg(not(unix))]
+                                let gone = true;
                                 // Gone here (e.g. stopped while the server was away): say so.
-                                if let Ok(json) = serde_json::to_string(&crate::harness::core::Update::Closed) {
+                                if gone && let Ok(json) = serde_json::to_string(&crate::harness::core::Update::Closed) {
                                     uplink.0.send(Up::Term(AgentMsg::Harness { session, json })).await.ok();
                                 }
                             }
@@ -2779,9 +2939,33 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     // A certificate for a key this process holds (docs/ci.md W27-R01).
                     Carried::Read(FromServer::Identity(given)) => {
                         let label = o.instance.clone().unwrap_or_else(|| crate::upgrade::MAIN.to_owned());
+                        let taken_over = (given.kind == "agent" && given.cert_pem.is_some()).then(|| (given.of.clone(), given.epoch));
                         if let Err(e) = crate::runner::identity::given(given, &o.state_dir, &label) {
                             tracing::warn!(error = %format!("{e:#}"), "an identity kiln sent couldn't be kept");
                         }
+                        // The runner role handed to this process, signed for once its own
+                        // identity is (W27-R08).
+                        crate::runner::custody::role_due();
+                        // A session's identity at an epoch it was taken over at: its receipt went
+                        // with the ask, and kiln recorded it. Taken over blue/green, it goes on at
+                        // that epoch now.
+                        if let Some((Some(session), Some(epoch))) = taken_over
+                            && crate::runner::custody::certified(&session, epoch)
+                            && let Some(s) = harness.as_ref().and_then(|h| h.get(&session))
+                        {
+                            s.go_on_at(epoch);
+                        }
+                        if server_custody {
+                            for json in crate::runner::custody::drain() {
+                                uplink.0.send(Up::Term(AgentMsg::Custody { json })).await.ok();
+                            }
+                        }
+                        continue;
+                    }
+                    // Work kiln handed one of its agent sessions: its receipt is signed as the
+                    // session takes it up, at its next turn (docs/ci.md W27-R08).
+                    Carried::Read(FromServer::Custody(handed)) => {
+                        crate::runner::custody::handed(&handed);
                         continue;
                     }
                     Carried::Read(FromServer::Cluster { msg, raft }) => {
@@ -2904,9 +3088,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // About one of this machine's agents' folders: the session says which, so
                         // a question can only be about a folder an agent here works in.
                         let up = uplink.0.clone();
+                        // What it commits of the agent's work is signed as the agent, with the
+                        // key this process holds for its session at its epoch (W27-R03).
                         let found = harness.as_ref().and_then(|h| h.get(&session)).map(|s| {
                             let ws = s.spec.lock().workspace.clone();
                             let info = s.info();
+                            let sign = crate::runner::identity::enabled().then(|| crate::runner::identity::slot("agent", Some(&session), Some(info.epoch)));
                             // A compare of an agent's point: how it left its files, as its session keeps them.
                             let mut versions = crate::workspace::git::Versions::new();
                             if let crate::workspace::Ask::Compare { from, to, .. } = ask.as_ref() {
@@ -2917,12 +3104,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                     }
                                 }
                             }
-                            (std::path::PathBuf::from(&info.cwd), std::path::PathBuf::from(info.work_dir()), ws, versions)
+                            (std::path::PathBuf::from(&info.cwd), std::path::PathBuf::from(info.work_dir()), ws, versions, sign)
                         });
                         crate::rt::spawn(async move {
                             let answer = match found {
                                 None => serde_json::json!({"error": "no such agent on this machine"}),
-                                Some((cwd, work, ws, versions)) => crate::workspace::serve(&cwd, &work, ws.as_ref(), *ask, &versions).await,
+                                Some((cwd, work, ws, versions, sign)) => crate::workspace::serve(&cwd, &work, ws.as_ref(), *ask, &versions, sign.as_deref()).await,
                             };
                             let _ = up.send(Up::Term(AgentMsg::Answer { req, json: Some(answer.to_string()) })).await;
                         });
@@ -2984,6 +3171,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // A new attempt: its events count from one.
                         journal.remove(&id);
                         unreceived.remove(&id);
+                        signed_unreceived.remove(&id);
+                        crate::runner::signed::forget(&id);
+                        // What it was given, as it came: its receipt's (docs/ci.md W27-R05).
+                        if server_identity && let Some(json) = raw.as_deref() {
+                            crate::runner::signed::assigned(&id, json);
+                        }
                         // Server-relative URLs go through the address this runner reached the server
                         // at (NAT, NodePorts and cluster DNS all differ).
                         let base = o.server_url.trim_end_matches('/').to_owned();
@@ -3085,8 +3278,41 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     }
                     ServerMsg::Caps { caps } => {
                         // An identity of this process's own, for a key it made and keeps, certified
-                        // on each connection (docs/ci.md W27-R01).
-                        server_identity = caps & proto::CAP_IDENTITY != 0 && !o.ephemeral;
+                        // on each connection (docs/ci.md W27-R01); an ephemeral runner's too (a `k8s`
+                        // pool's pod, a v1 job's), enrolled by kiln, so its leg signs as the leg.
+                        server_identity = caps & proto::CAP_IDENTITY != 0;
+                        server_signs = server_identity && caps & proto::CAP_LEG_SIGNS != 0;
+                        crate::runner::identity::set_enabled(server_identity);
+                        // Its sessions' git pushes to kiln as their agents (W27-R03), where the
+                        // server gives them a credential of their own: at the URL this runner
+                        // reaches it at, and where it says it's reached (`/api/me`).
+                        let git = caps & proto::CAP_AGENT_GIT != 0;
+                        crate::runner::identity::set_kiln_git(if git { vec![o.server_url.clone()] } else { Vec::new() });
+                        if git {
+                            let (http, base) = (Arc::clone(&http), o.server_url.trim_end_matches('/').to_owned());
+                            crate::rt::spawn(async move {
+                                let me = async {
+                                    let v: serde_json::Value = http.get(&format!("{base}/api/me")).timeout(std::time::Duration::from_secs(10)).send().await?.json(1 << 20).await?;
+                                    anyhow::Ok(v)
+                                };
+                                match me.await {
+                                    Ok(v) => {
+                                        let public = v.get("public_url").and_then(serde_json::Value::as_str).map(str::to_owned);
+                                        let doors = v.get("origins").and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(|o| o.as_str().map(str::to_owned));
+                                        crate::runner::identity::also_kiln_git(public.into_iter().chain(doors).collect());
+                                    }
+                                    Err(e) => tracing::debug!(error = %format!("{e:#}"), "where the server is reached wasn't said: agents' git takes their credential at this runner's URL alone"),
+                                }
+                            });
+                        }
+                        // Custody records sent before go again: the server takes each once.
+                        server_custody = caps & proto::CAP_CUSTODY != 0 && !o.ephemeral;
+                        crate::runner::custody::server_checks(server_custody);
+                        if server_custody {
+                            for json in crate::runner::custody::sent() {
+                                uplink.0.send(Up::Term(AgentMsg::Custody { json })).await.ok();
+                            }
+                        }
                         if server_identity {
                             match crate::runner::identity::ask("runner", None, None) {
                                 Ok(json) => {
@@ -3176,6 +3402,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 }
                             }
                         }
+                        for data in signed_unreceived.values() {
+                            net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, data.clone()).await;
+                        }
                         for (_, data) in unreceived.values() {
                             net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, data.clone()).await;
                         }
@@ -3251,7 +3480,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // connected and welcomed, it says it's ready, and takes everything.
                         #[cfg(unix)]
                         if let Some(path) = take_over.take() {
-                            let (h, tx, me, takes) = (harness.clone(), bg_tx.clone(), instance_id.clone(), stores_wait);
+                            let (h, tx, me, takes) = (harness.clone(), bg_tx.clone(), Me { machine: o.name.clone(), instance: instance_id.clone(), root: root.clone() }, stores_wait);
                             crate::rt::spawn(async move {
                                 if let Err(e) = take_over_from(path, h, tx.clone(), me, takes).await {
                                     tracing::warn!(error = %format!("{e:#}"), "couldn't take over from the runner being upgraded");
@@ -3298,6 +3527,16 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         if o.dedicated_job.as_deref() == Some(id.as_str()) {
                             served_dedicated = true;
                         }
+                        // Its own identity, as a leg's: a key made here, outside anything its steps
+                        // can reach, that signs what it sent at its end, as a v2 leg's does
+                        // (docs/ci.md W27-R01, R05).
+                        if server_identity {
+                            match crate::runner::identity::ask("leg", Some(&id), None) {
+                                Ok(json) => uplink.msg(AgentMsg::Identity { json }).await,
+                                Err(e) => tracing::warn!(job = %id, error = %format!("{e:#}"), "no identity asked for"),
+                            }
+                        }
+                        crate::runner::signed::forget(&id);
                         let cancel = Shutdown::new();
                         hold_cpus(&id, holds);
                         jobs.insert(id.clone(), Running { cancel: cancel.clone(), pooled: false, holds });
@@ -3466,6 +3705,15 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             uplink.0.send(Up::Term(AgentMsg::AiTranscript { req, json: None })).await.ok();
                         }
                     },
+                    // The provenance kiln wrote of what a leg built, signed as the leg when it's of
+                    // what the leg reported (docs/ci.md W27-R06).
+                    ServerMsg::SignAsLeg { job, nonce, payload_type, payload } => {
+                        let (bundle, error) = match crate::runner::signed::sign_provenance(&job, &nonce, &payload_type, &payload) {
+                            Ok(b) => (Some(b), None),
+                            Err(e) => (None, Some(e)),
+                        };
+                        uplink.msg(AgentMsg::LegSignature { job, nonce, bundle, error }).await;
+                    }
                     ServerMsg::AiView { req, pid } => match &ai {
                         Some(ai) => ai.view(req, pid, uplink.0.clone()),
                         None => {
@@ -3775,6 +4023,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     ServerMsg::Received { job } if job.is_empty() => receipts = true,
                     ServerMsg::Received { job } => {
                         unreceived.remove(&job);
+                        signed_unreceived.remove(&job);
                         if let Some((_, _, events)) = journal.get_mut(&job) {
                             events.clear();
                         }
@@ -3791,6 +4040,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     }
                     // What carries JSON came read (`wire::payload_of`), above.
                     ServerMsg::HarnessOpen { .. }
+                    | ServerMsg::Custody { .. }
                     | ServerMsg::Identity { .. }
                     | ServerMsg::Observe { .. }
                     | ServerMsg::Headroom { .. }
@@ -3871,6 +4121,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
             }
             Ev::Up(mut up) => {
+                // A test build's runner behind its jobs (`lag=`): what they send, taken late.
+                if let Some(lag) = chaos.and_then(|c| c.lag)
+                    && matches!(up, Up::Log(_) | Up::Msg(AgentMsg::JobEvent { .. } | AgentMsg::StepFinished { .. }))
+                {
+                    crate::rt::sleep(lag).await;
+                }
                 // A job's event: numbered, and kept until the job's result is received.
                 let mut journaled = None;
                 if let Up::Msg(AgentMsg::JobEvent { job, json }) = &mut up {
@@ -3881,6 +4137,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         *json = format!("{{\"seq\":{seq}{}{rest}", if rest.trim_start().starts_with('}') { "" } else { "," });
                     }
                     journaled = Some(job.clone());
+                }
+                // What a leg hands on, folded in as it's sent, for it to sign at its end (docs/ci.md
+                // W27-R05, R06): its logs' chunks, its steps' ends, its attest steps' subjects.
+                match &up {
+                    Up::Log(c) => crate::runner::signed::log(&c.job, c.idx, &c.data),
+                    Up::Msg(AgentMsg::StepFinished { job, idx, status, exit_code }) => crate::runner::signed::step(job, *idx, *status, *exit_code),
+                    Up::Msg(AgentMsg::JobEvent { job, json }) if json.contains("\"t\":\"attest\"") || json.contains("\"t\":\"step_finished\"") => crate::runner::signed::event(job, json),
+                    _ => {}
                 }
                 let (lane, kind, data) = match &up {
                     Up::Msg(m) => (LANE_CONTROL, Kind::Control, proto::encode(m)),
@@ -3927,15 +4191,30 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 note_announced(&mut announced, &session, &u);
                 // Each session this process holds has an identity at its epoch, asked for until it
                 // has one; one that closed lets go of its keys (docs/ci.md W27-R01).
+                let mut took_up = false;
                 match &u {
                     crate::harness::core::Update::Open { info, .. } => {
                         session_epochs.insert(session.clone(), info.epoch);
                     }
+                    // It went on at a later epoch (a blue/green take-over, once recorded). A turn
+                    // starting takes up the work kiln handed it, signed for (W27-R08).
+                    crate::harness::core::Update::State { state } => {
+                        if let Some(e) = session_epochs.get_mut(&session) {
+                            *e = (*e).max(state.epoch);
+                        }
+                        took_up = crate::runner::custody::status(&session, &state.status);
+                    }
                     crate::harness::core::Update::Closed => {
                         session_epochs.remove(&session);
                         crate::runner::identity::forget_prefix(&format!("agent/{session}/"));
+                        crate::runner::custody::closed(&session);
                     }
                     _ => {}
+                }
+                if took_up && server_custody && connected {
+                    for json in crate::runner::custody::drain() {
+                        uplink.0.send(Up::Term(AgentMsg::Custody { json })).await.ok();
+                    }
                 }
                 if server_identity
                     && connected
@@ -3983,11 +4262,38 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
             }
             Ev::Done(r) => {
+                // What its job sent before it ended (its log's last chunks, its last step's end)
+                // may still wait on their own channel, this loop behind its jobs: they go first, so
+                // the leg signs all it sent (docs/ci.md W27-R05), then its end.
+                if in_turn && !up_rx.is_empty() {
+                    for _ in 0..up_rx.len() {
+                        let Ok(up) = up_rx.try_recv() else { break };
+                        taken.push_back(Ev::Up(up));
+                    }
+                    taken.push_back(Ev::Done(r));
+                    continue 'events;
+                }
                 if retiring {
                     retire_at = Some(Instant::now() + Duration::from_secs(5)).max(retire_at);
                 }
                 if jobs.remove(&r.job).is_some() {
                     crate::runner::cpus::pins().release(&r.job);
+                    // The leg signs what it received and hands on while it still holds its key
+                    // (docs/ci.md W27-R05): its records go before its result, and again with it.
+                    if server_signs {
+                        match crate::runner::signed::sign_records(&r.job, &r) {
+                            Ok(bundles) => {
+                                let signed = AgentMsg::LegResults { job: r.job.clone(), bundles };
+                                if let Ok(b) = proto::encode(&signed) {
+                                    signed_unreceived.insert(r.job.clone(), b);
+                                }
+                                uplink.msg(signed).await;
+                            }
+                            Err(e) => tracing::warn!(job = %r.job, error = %format!("{e:#}"), "the leg's records couldn't be signed"),
+                        }
+                    } else {
+                        crate::runner::signed::forget(&r.job);
+                    }
                     // The leg's key goes with it (docs/ci.md W27-R01).
                     crate::runner::identity::forget(&crate::runner::identity::slot("leg", Some(&r.job), None));
                     tracing::info!(job = %r.job, status = r.status.as_str(), "job finished");
@@ -4002,6 +4308,15 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
             }
             Ev::Heartbeat => {
+                // Custody records signed since (a session's hand-on or receipt, docs/ci.md W27-R08),
+                // with the receipts of work taken up before this process held the session's identity.
+                crate::runner::custody::take_up_due();
+                crate::runner::custody::role_due();
+                if server_custody && connected {
+                    for json in crate::runner::custody::drain() {
+                        uplink.0.send(Up::Term(AgentMsg::Custody { json })).await.ok();
+                    }
+                }
                 // Each agent session it holds and has no identity for yet, asked for again: a quiet
                 // one's first ask may have come before the server had its Open, and was refused.
                 if server_identity && connected {
@@ -4387,13 +4702,17 @@ const AGENT_IDENTITY_MOST: Duration = Duration::from_secs(600);
 /// hasn't heard of yet is refused (the ask can come before its Open, which rides the channel), and
 /// asked for again as it goes on and on the heartbeat, so one that goes quiet gets it too.
 async fn ask_agent_identity(uplink: &Uplink, asked: &mut HashMap<String, (Instant, Duration)>, session: &str, epoch: u64) {
+    // Taken over blue/green: its next epoch's, once this runner is promoted (docs/ci.md W27-R08).
+    let Some(epoch) = crate::runner::custody::to_ask(session, epoch) else { return };
     let slot = crate::runner::identity::slot("agent", Some(session), Some(epoch));
     if crate::runner::identity::cert(&slot).is_some() || asked.get(&slot).is_some_and(|(at, wait)| at.elapsed() < *wait) {
         return;
     }
     let wait = asked.get(&slot).map_or(AGENT_IDENTITY_AGAIN, |(_, wait)| wait.saturating_mul(2).min(AGENT_IDENTITY_MOST));
     asked.insert(slot, (Instant::now(), wait));
-    match crate::runner::identity::ask("agent", Some(session), Some(epoch)) {
+    // With the hand-on it was taken over with, and this process's receipt (docs/ci.md W27-R08).
+    let ask = crate::runner::identity::request("agent", Some(session), Some(epoch)).and_then(|a| Ok(serde_json::to_string(&crate::runner::custody::carrying(session, epoch, a))?));
+    match ask {
         Ok(json) => {
             uplink.0.send(Up::Term(AgentMsg::Identity { json })).await.ok();
         }
@@ -5070,6 +5389,68 @@ mod tests {
             anyhow::ensure!(none.is_none() && matches!(whole.get(1), Some(Update::Reset { .. })) && whole.len() == 6);
             Ok(())
         })
+    }
+
+    /// fedora, 2026-10-25 14:18 (W27-R08; the Transfers plan's step 4, which this fix's
+    /// fix/upgrade-keeps-agents 7940fcafec, unsigned, came before): a blue/green upgrade's new build
+    /// let go of six agent sessions it had just taken over. The server, still counting the old
+    /// runner as their holder, asked it to hand them to the newest (a local MoveTo), then told it
+    /// to let go (HandedOver); it passed both on, and the new build did as they said with its own
+    /// copy. A hand-over's word is for the process it's sent to: it stays with the old runner, and
+    /// the new build refuses one passed on anyway (the next upgrade's old runner may run a build
+    /// from before this). Everything else about a session handed over goes on.
+    #[cfg(unix)]
+    #[test]
+    fn w27_ac05_a_hand_overs_word_for_the_runner_being_upgraded_never_reaches_the_new_build() -> anyhow::Result<()> {
+        use crate::handovers::Word;
+        use crate::harness::model::{Command, SendMode};
+        use crate::instances::Owned;
+        use base64::Engine as _;
+        let cmd = |c: &Command| -> anyhow::Result<ServerMsg> { Ok(ServerMsg::HarnessCmd { session: "s1".into(), json: serde_json::to_string(c)? }) };
+        let send = Command::Send { id: "m1".into(), text: "go on".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None };
+        let moved: std::collections::HashSet<Owned> = [Owned::Agent("s1".into())].into_iter().collect();
+        let me = Me { machine: "box".into(), instance: "01a17502".into(), root: Vec::new() };
+        let mut words = vec![("a local MoveTo".to_owned(), cmd(&Command::MoveTo { to: "box".into(), cwd: String::new(), note: None, now: false, kind: None, model: None, local: true })?)];
+        for w in [Word::Taken, Word::Refused("no room".into()), Word::NotPassed("x".into()), Word::Unsure("x".into()), Word::NoneNewer("x".into())] {
+            words.push((format!("HandedOver ({w:?})"), cmd(&w.command())?));
+        }
+        let on = [
+            ("a person's message", cmd(&send)?),
+            ("a message for its epoch", ServerMsg::HarnessSend { session: "s1".into(), epoch: 2, json: serde_json::to_string(&send)? }),
+            ("an interrupt", cmd(&Command::Interrupt)?),
+            ("a move to another machine", cmd(&Command::MoveTo { to: "other".into(), cwd: "~/w".into(), note: None, now: false, kind: None, model: None, local: false })?),
+            ("a close", ServerMsg::HarnessClose { session: "s1".into() }),
+        ];
+        let b64 = |m: &ServerMsg| -> anyhow::Result<String> { Ok(base64::engine::general_purpose::STANDARD.encode(proto::encode(m)?)) };
+        let mut wrong = vec![];
+        for (what, m) in &words {
+            if [false, true].into_iter().any(|leaving| goes_on(m, &moved, leaving).is_some()) {
+                wrong.push(format!("{what} went on to the new build"));
+            }
+            if passed_on(&b64(m)?, &me).is_some() {
+                wrong.push(format!("the new build took {what} passed on"));
+            }
+        }
+        for (what, m) in &on {
+            if goes_on(m, &moved, false) != Some(Owned::Agent("s1".into())) {
+                wrong.push(format!("{what} stayed with the runner being upgraded"));
+            }
+            if passed_on(&b64(m)?, &me) != Some(proto::encode(m)?) {
+                wrong.push(format!("the new build dropped {what} passed on"));
+            }
+        }
+        anyhow::ensure!(wrong.is_empty(), "{}", wrong.join("; "));
+        // Asked to hand over a session it handed to the new build, the old runner refuses: it
+        // doesn't say the session closed, as it would of one gone here.
+        anyhow::ensure!(!gone_here("s1", &moved), "a hand-over's word for a session handed to the new build said it closed");
+        anyhow::ensure!(gone_here("s2", &moved));
+        // As before: a frame about something this runner kept stays, and a session opened while it
+        // hands everything over goes on.
+        let open = ServerMsg::HarnessOpen { session: "s2".into(), json: "{}".into() };
+        anyhow::ensure!(goes_on(&ServerMsg::HarnessClose { session: "s2".into() }, &moved, true).is_none() && goes_on(&open, &moved, false).is_none());
+        anyhow::ensure!(goes_on(&open, &moved, true) == Some(Owned::Agent("s2".into())));
+        anyhow::ensure!(passed_on("not base64!", &me).is_none());
+        Ok(())
     }
 
     fn said(id: usize, text: String) -> Event {

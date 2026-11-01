@@ -774,7 +774,39 @@ pub fn list_ops() -> Vec<Op> {
             route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "stop"]))),
             run: |cx, v| Box::pin(stop(cx, v)),
         },
+        Op {
+            name: "agents.credential",
+            summary: "An agent's own credential for git, for a day: its pushes to kiln's repositories go as the agent, for whom it acts. Only the agent itself is given one, which its runner asks for as its git needs it.",
+            read_only: false,
+            destructive: false,
+            input: Input::of::<input::AgentsCredential>(),
+            route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "credential"]))),
+            run: |cx, v| Box::pin(credential(cx, v)),
+        },
     ]
+}
+
+/// An agent's own token for git (docs/ci.md W27-R03): its pushes to kiln's repositories go as the
+/// agent, for whom it acts, never as them. Only the agent itself is given one (its runner asks as
+/// it, telling it by its processes): for a day, to fetch, push and submit as git does, and no more
+/// than its person may (nor, started for an attachment, than the attachment's capabilities give).
+async fn credential(cx: Cx, v: Value) -> Out {
+    let info = known(&cx, &agent_of(&v)?)?;
+    if cx.caller.agent.as_deref() != Some(info.id.as_str()) {
+        return Err((StatusCode::FORBIDDEN, format!("{}'s credential for git is its own: only it is given one, through its runner", info.name)));
+    }
+    let Some(opener) = crate::mcp::acts_for(&cx.hub, &info.id).await else {
+        return Err((StatusCode::FORBIDDEN, format!("kiln doesn't know whom {} acts for", info.name)));
+    };
+    let grants: Vec<String> = match crate::ci::attach::limit_for(&cx.hub, &info.id).await {
+        Some(limit) => limit.grants.iter().map(crate::authz::Grant::text).collect(),
+        None => ["git.read", "diffs.submit", "diffs.land"].map(str::to_owned).to_vec(),
+    };
+    let grants: Vec<&str> = grants.iter().map(String::as_str).collect();
+    let (_, token) = crate::authz::tokens::mint_agent(&cx.hub, &info.id, &opener, &grants, Some(1), &format!("{}'s git", info.name))
+        .await
+        .map_err(|e| (StatusCode::FORBIDDEN, format!("a credential for {}: {e:#}", info.name)))?;
+    Ok(json!({"token": token, "expires_at": crate::util::now_unix() + 86_400}))
 }
 
 /// What each of these operations takes (`crate::ops::Input`): its JSON Schema is generated from
@@ -1010,6 +1042,13 @@ pub mod input {
         pub agent: String,
         /// End the agents it started (and theirs) too.
         pub children: Option<bool>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentsCredential {
+        /// The agent's id (as agents.list gives it).
+        pub agent: String,
     }
 }
 

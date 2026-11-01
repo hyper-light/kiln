@@ -44,6 +44,24 @@ pub enum Question {
         name: String,
         #[serde(default)]
         input: serde_json::Value,
+        /// Signed as the session (docs/ci.md W27-R08), as [`Question::Act`]'s is.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        act: Option<String>,
+        /// A task the agent hands on, signed, to the subagents `agents.start` starts (W27-R08).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hand_on: Option<String>,
+    },
+    /// An act an agent session's runner asks kiln to take before it does it (a run on another
+    /// machine): it counts only from the session's holder now (docs/ci.md W27-R08).
+    Act {
+        #[serde(default)]
+        session: String,
+        #[serde(default)]
+        name: String,
+        /// The act signed as the session (a Sigstore bundle, as JSON), over the ask without it
+        /// (`crate::custody::act_counts`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        act: Option<String>,
     },
     /// A page an agent session shows in its conversation (`crate::harness::visuals::ask`): what
     /// it asks, kept as it came.

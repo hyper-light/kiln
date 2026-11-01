@@ -274,6 +274,22 @@ pub enum AgentMsg {
     /// notes it against `from`, on this runner's page too. Only to a server announcing
     /// [`CAP_UNREAD`]. Appended last: postcard encodes variants by index.
     LinkUnread { from: String, link: String, what: String, code: crate::wire::unread::Code, why: String },
+    /// A leg's records, signed as the leg on its runner at its end under the server's delegation of
+    /// it (docs/ci.md W27-R05): a JSON array of Sigstore bundles, its results (kiln's statement of
+    /// them, `kiln_ci::attest::leg`) and its custody records (a receipt of each thing it received,
+    /// then its hand-on of what it made). Sent before its [`AgentMsg::JobFinished`] and again with
+    /// it until the server says it's received. Only to a server announcing [`CAP_LEG_SIGNS`].
+    /// Appended last, after `Unread` and `LinkUnread`: postcard encodes variants by index.
+    LegResults { job: String, bundles: String },
+    /// A leg's answer to [`ServerMsg::SignAsLeg`]: the provenance kiln wrote of what it built, signed
+    /// as the leg (a Sigstore bundle), or why it isn't (docs/ci.md W27-R06). Appended last: postcard
+    /// encodes variants by index.
+    LegSignature { job: String, nonce: String, bundle: Option<String>, error: Option<String> },
+    /// Custody (docs/ci.md W27-R08, `crate::custody`): a signed custody record or delegation, its
+    /// Sigstore bundle as JSON, that this runner process or a session it holds signed, or carried
+    /// (a giver's hand-on, from the package it took). Only to a server announcing [`CAP_CUSTODY`].
+    /// Appended last: postcard encodes variants by index.
+    Custody { json: String },
 }
 
 /// A leg's event as a runner sends it ([`AgentMsg::JobEvent`]'s JSON): the event, and its place in
@@ -453,6 +469,25 @@ pub const CAP_HEADROOM: u64 = 1 << 39;
 /// an agent touched rather than the whole changeset each time. Without it, a runner sends it whole.
 pub const CAP_CHANGES_PATCH: u64 = 1 << 40;
 
+/// [`ServerMsg::Caps`] capability: the server gives an agent session its own git credential for
+/// kiln's repositories (the operation `agents.credential`, docs/ci.md W27-R03), so a runner sets its
+/// sessions' git to push as the agent. Without it, a runner leaves their pushes as they were.
+/// (Bits 41 to 43 are main's `CAP_UNREAD`, `CAP_WORKSPACE_COMMITS` and `CAP_WORKSPACE_COMPARE`.)
+pub const CAP_AGENT_GIT: u64 = 1 << 44;
+
+/// [`AgentMsg::Caps`] and [`ServerMsg::Caps`] capability: a leg signs as itself what it hands on
+/// (docs/ci.md W27-R05, R06). A runner that says its legs sign their results at their end
+/// ([`AgentMsg::LegResults`]) and the provenance kiln writes of what they built when asked
+/// ([`ServerMsg::SignAsLeg`]); a server that says it takes them. (Bits 41 to 43 are main's, 44
+/// `CAP_AGENT_GIT`.)
+pub const CAP_LEG_SIGNS: u64 = 1 << 45;
+
+/// [`AgentMsg::Caps`] and [`ServerMsg::Caps`] capability: custody (docs/ci.md W27-R08). A runner
+/// that says it signs its agent sessions' hand-overs (a hand-on as it lets one go, a receipt as it
+/// takes one) and sends them ([`AgentMsg::Custody`]); a server that says it takes them
+/// (`crate::custody::take`). (Bits 41 to 43 are main's, 44 `CAP_AGENT_GIT`, 45 `CAP_LEG_SIGNS`.)
+pub const CAP_CUSTODY: u64 = 1 << 46;
+
 /// What an [`AgentMsg::Identity`] asks for: a certificate for the key of `csr`, as `kind` says.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -464,6 +499,32 @@ pub struct IdentityAsk {
     pub of: Option<String>,
     /// `agent`: the epoch the key is for.
     pub epoch: Option<u64>,
+    /// `agent`, at the epoch a hand-over raised it to (docs/ci.md W27-R08): the hand-on its package
+    /// carried (a Sigstore bundle, as JSON), signed by the session at the epoch it left. kiln
+    /// records it before the epoch rises, and certifies the key only then. None: no hand-on
+    /// signed (a runner from before custody), or not a hand-over.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hand_on: Option<String>,
+    /// With `hand_on`: this process's receipt for it, signed with the key of `csr`, which kiln
+    /// bundles with the certificate it issues and records with the hand-on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<Unbundled>,
+    /// `leg`: the leg signs its records at its end and, asked ([`ServerMsg::SignAsLeg`]), the
+    /// provenance kiln writes of what it built (docs/ci.md W27-R05, R06). Said of the leg, since
+    /// an ephemeral runner (a `k8s` pool's pod) says nothing of itself past `Build`'s caps; an
+    /// older runner says nothing, and is asked nothing.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub signs: bool,
+}
+
+/// A statement signed with a key kiln hasn't certified yet ([`IdentityAsk::receipt`]): its DSSE
+/// payload type, payload and signature (base64), bundled once kiln has certified the key.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Unbundled {
+    pub payload_type: String,
+    pub payload: String,
+    pub signature: String,
 }
 
 /// The answer to an [`IdentityAsk`]: its kind and subject, and the certificate (PEM) or why not.
@@ -477,6 +538,10 @@ pub struct IdentityGiven {
     pub uri: String,
     pub cert_pem: Option<String>,
     pub error: Option<String>,
+    /// A leg's: the server's delegation of the leg to it, by its digest, for its records to name
+    /// in `under` (docs/ci.md W27-R05, R06). Older servers send none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<String>,
 }
 
 /// [`AgentMsg::Caps`] and [`ServerMsg::Caps`] capability: the peer takes word that a frame of its
@@ -783,6 +848,19 @@ pub enum ServerMsg {
     /// Answered once done, or refused saying why. Only to runners announcing [`CAP_FREEZE`].
     /// Appended last: postcard encodes variants by index.
     Freeze { job: String, frozen: bool },
+    /// The provenance kiln wrote of what leg `job` built for its attest step's report `nonce`
+    /// (`payload` of `payload_type`, an in-toto statement), for the leg to sign as itself when it's
+    /// of what the leg reported (docs/ci.md W27-R06); it answers [`AgentMsg::LegSignature`]. Only to
+    /// runners announcing [`CAP_LEG_SIGNS`]. Appended last: postcard encodes variants by index.
+    SignAsLeg { job: String, nonce: String, payload_type: String, payload: Vec<u8> },
+    /// Work kiln's server handed one of the runner's agent sessions (docs/ci.md W27-R08; the
+    /// Transfers plan's step 6): `{session, hand_on}`, the hand-on (a Sigstore bundle, as JSON) of a
+    /// plan's step, a subagent's task or what a person handed off, whose receipt the runner
+    /// process holding the session signs as the session's next turn starts (it takes the work up
+    /// then) and sends ([`AgentMsg::Custody`]). Only to runners announcing [`CAP_CUSTODY`].
+    /// Appended last, after main's `Freeze` (W26-R22, on main first): postcard encodes variants by
+    /// index.
+    Custody { json: String },
 }
 
 /// What the server's copy of one agent session has of its events, said in digests
@@ -1114,6 +1192,30 @@ mod tests {
         Ok(())
     }
 
+    /// W27-R05, R06: a leg's signed results and its signature of provenance come after every
+    /// older variant, and the server's ask after its own; an older peer never gets them (they go
+    /// only to one announcing CAP_LEG_SIGNS).
+    #[test]
+    fn w27_r05_leg_signing_is_appended_after_every_older_variant() -> anyhow::Result<()> {
+        let last = encode(&AgentMsg::LinkUnread { from: "mac".into(), link: "L1".into(), what: String::new(), code: crate::wire::unread::Code::Unknown, why: String::new() })?;
+        let results = AgentMsg::LegResults { job: "j".into(), bundles: "[]".into() };
+        let signature = AgentMsg::LegSignature { job: "j".into(), nonce: "n".into(), bundle: None, error: Some("no attest report".into()) };
+        for (m, after) in [(results, 1u8), (signature, 2)] {
+            let b = encode(&m)?;
+            assert_eq!(b.first().copied(), last.first().map(|i| i + after), "{m:?}");
+            assert_eq!(decode::<AgentMsg>(&b)?, m);
+        }
+        let freeze = encode(&ServerMsg::Freeze { job: "j".into(), frozen: true })?;
+        let ask = ServerMsg::SignAsLeg { job: "j".into(), nonce: "n".into(), payload_type: kiln_ci::attest::PAYLOAD_TYPE.into(), payload: b"{}".to_vec() };
+        let b = encode(&ask)?;
+        assert_eq!(b.first().copied(), freeze.first().map(|i| i + 1));
+        assert_eq!(decode::<ServerMsg>(&b)?, ask);
+        assert_eq!((last.first(), b.first()), (Some(&57), Some(&65)), "after main's LinkUnread (57), ReachRefused (63) and Freeze (64)");
+        assert!(CAP_LEG_SIGNS.is_power_of_two() && CAP_LEG_SIGNS > CAP_AGENT_GIT && CAP_LEG_SIGNS > CAP_CHANGES_PATCH && CAP_LEG_SIGNS & (CAP_UNREAD | CAP_WORKSPACE_COMMITS | CAP_WORKSPACE_COMPARE | CAP_FREEZE) == 0);
+        assert!(CAP_AGENT_GIT.is_power_of_two() && CAP_AGENT_GIT & (CAP_UNREAD | CAP_WORKSPACE_COMMITS | CAP_WORKSPACE_COMPARE | CAP_FREEZE) == 0, "W27's bits are none of main's");
+        Ok(())
+    }
+
     #[test]
     fn the_channel_is_appended_after_every_older_variant() -> anyhow::Result<()> {
         use crate::wire::channel::{Frame, Has, Nack, Refusal};
@@ -1237,6 +1339,27 @@ mod tests {
         assert!(CAP_CHANGES_PATCH.is_power_of_two() && CAP_CHANGES_PATCH == 1 << 40 && CAP_CHANGES_PATCH & before == 0);
     }
 
+    /// W27-R08: custody records come after every older variant (the legs' signing, W27-R05, last
+    /// before them), and their bit is a new one: past main's `CAP_UNREAD`, `CAP_WORKSPACE_COMMITS`
+    /// and `CAP_WORKSPACE_COMPARE` (41 to 43), `CAP_AGENT_GIT` (44) and `CAP_LEG_SIGNS` (45).
+    #[test]
+    fn w27_r08_custody_is_appended_after_headroom() -> anyhow::Result<()> {
+        let legs = encode(&AgentMsg::LegSignature { job: "j".into(), nonce: "n".into(), bundle: None, error: None })?;
+        let custody = AgentMsg::Custody { json: "{}".into() };
+        let b = encode(&custody)?;
+        assert_eq!(b.first().copied(), legs.first().map(|i| i + 1), "AgentMsg::Custody comes right after LegSignature");
+        assert_eq!(decode::<AgentMsg>(&b)?, custody);
+        let before = CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD | CAP_WORKSPACE_COMMITS | CAP_WORKSPACE_COMPARE | CAP_AGENT_GIT | CAP_LEG_SIGNS;
+        assert!(CAP_CUSTODY.is_power_of_two() && CAP_CUSTODY == 1 << 46 && CAP_CUSTODY & before == 0);
+        // The server's ask for a receipt of work handed (step 6), after the legs' SignAsLeg.
+        let sign_as_leg = encode(&ServerMsg::SignAsLeg { job: "j".into(), nonce: "n".into(), payload_type: String::new(), payload: Vec::new() })?;
+        let asked = ServerMsg::Custody { json: "{}".into() };
+        let b = encode(&asked)?;
+        assert_eq!(b.first().copied(), sign_as_leg.first().map(|i| i + 1), "ServerMsg::Custody comes right after SignAsLeg");
+        assert_eq!(decode::<ServerMsg>(&b)?, asked);
+        Ok(())
+    }
+
     /// Typed messages, step 3: word that a frame couldn't be read is appended last in both, after
     /// the hand-overs', T3's, W24's, the agent limit's, identities', observe's and headroom's, behind
     /// a bit of its own.
@@ -1253,8 +1376,9 @@ mod tests {
         assert_eq!(encode(&down)?.first(), Some(&62));
         assert_eq!(decode::<AgentMsg>(&encode(&up)?)?, up);
         assert_eq!(decode::<ServerMsg>(&encode(&down)?)?, down);
-        // Step 5 appended `LinkUnread` (57) and `ReachRefused` (63) after them, and W26-R22 `Freeze` (64).
-        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (58, 65), "each table has every variant once");
+        // Step 5 appended `LinkUnread` (57) and `ReachRefused` (63) after them, W26-R22 `Freeze` (64),
+        // and W27 its legs' signing and custody (58 to 60, 65 and 66).
+        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (61, 67), "each table has every variant once");
         assert!(CAP_UNREAD.is_power_of_two() && CAP_UNREAD == 1 << 41 && CAP_UNREAD & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH) == 0);
         assert!(CAP_WORKSPACE_COMMITS.is_power_of_two() && CAP_WORKSPACE_COMMITS == 1 << 42 && CAP_WORKSPACE_COMMITS & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD) == 0);
         assert!(CAP_WORKSPACE_COMPARE.is_power_of_two() && CAP_WORKSPACE_COMPARE == 1 << 43 && CAP_WORKSPACE_COMPARE & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD | CAP_WORKSPACE_COMMITS) == 0);

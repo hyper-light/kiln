@@ -130,6 +130,16 @@ pub async fn clone(args: CloneArgs, cfg: &Config) -> Result<()> {
     run(&["clone", "-c", &helper, &url, &dir])?;
     let hook = install_hook(Some(&dir))?;
     eprintln!("[kiln] {dir}: commits get a Kiln-Change ({}); `kiln submit` sends them for review", hook.display());
+    // Commits signed as this device's person (W27-R03), with `kiln login`'s key, which stays here.
+    if crate::identities::device_dir().join("identity.pem").exists() {
+        let program = crate::gitsign::installed()?;
+        for (k, v) in crate::gitsign::git_config(&program, crate::gitsign::DEVICE_KEY) {
+            run(&["-C", &dir, "config", "--local", k, &v])?;
+        }
+        eprintln!("[kiln] {dir}: commits are signed as you, with this device's identity (`kiln login`'s key)");
+    } else {
+        eprintln!("[kiln] {dir}: commits aren't signed: `kiln login` gives this device an identity, then `kiln clone` again");
+    }
     Ok(())
 }
 
@@ -857,7 +867,24 @@ pub async fn review(args: ReviewArgs, cfg: &Config) -> Result<()> {
         None
     };
     if let Some(a) = action {
-        let v = api.call_api(Method::Post, &format!("/api/diffs/{id}/review"), Some(serde_json::json!({ "action": a, "body": args.message.clone().unwrap_or_default() }))).await?;
+        let words = args.message.clone().unwrap_or_default();
+        let mut body = serde_json::json!({ "action": a, "body": words });
+        // Signed by whoever gives it (W27-R04): in an agent's session by its runner, else with
+        // `kiln login`'s key on this device. kiln says what to sign, and whether it must be.
+        let meant = super::verdicts::Meant { kind: "verdict", action: a, words: words.trim(), suggestion: None };
+        let in_session = std::env::var_os("KILN_HARNESS_SOCK").is_some();
+        let asked = api.call_api(Method::Post, &format!("/api/diffs/{id}/statement"), Some(serde_json::json!({ "kind": "verdict", "action": a, "body": words }))).await;
+        let required = asked.as_ref().is_ok_and(|t| t.get("required").and_then(Value::as_bool) == Some(true));
+        match asked.and_then(|t| super::verdicts::sign(&t, meant, in_session)) {
+            Ok(bundle) => {
+                if let Some(o) = body.as_object_mut() {
+                    o.insert("signed".into(), bundle);
+                }
+            }
+            Err(e) if required => return Err(e.context(format!("{}'s repository requires a signed verdict", args.diff))),
+            Err(e) => eprintln!("kiln: warning: the verdict goes unsigned ({e:#})"),
+        }
+        let v = api.call_api(Method::Post, &format!("/api/diffs/{id}/review"), Some(body)).await?;
         println!("{} v{}: {} ({} draft comment{} published); it is {}", args.diff, v.get("version").and_then(Value::as_u64).unwrap_or(0), a, v.get("published").and_then(Value::as_u64).unwrap_or(0), if v.get("published").and_then(Value::as_u64) == Some(1) { "" } else { "s" }, v.get("state").and_then(Value::as_str).unwrap_or_default());
         return Ok(());
     }

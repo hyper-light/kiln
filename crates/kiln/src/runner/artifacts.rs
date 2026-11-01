@@ -194,6 +194,10 @@ pub async fn upload(svc: &Service<'_>, workspace: &Path, temp: &Path, u: &Upload
     sent?;
     let done = svc.call("FinalizeArtifact", json!({ "name": u.name, "size": size.to_string(), "hash": format!("sha256:{digest}") })).await?;
     let id = done.get("artifact_id").and_then(|v| v.as_str().map(str::to_owned).or_else(|| v.as_i64().map(|n| n.to_string()))).unwrap_or_default();
+    // Handed on by the leg, by its digest (docs/ci.md W27-R05).
+    let mut what = crate::runner::signed::thing(format!("artifact/{}", u.name), [("sha256", digest.clone())]);
+    what.size = Some(size);
+    crate::runner::signed::handed_on(svc.job, what);
     Ok(Some(Uploaded { id, digest, files: found.len(), size }))
 }
 
@@ -278,6 +282,9 @@ pub async fn download(svc: &Service<'_>, temp: &Path, d: &Download) -> anyhow::R
             let _ = std::fs::remove_file(&file);
             anyhow::bail!("{name} arrived as sha256:{digest}, not the sha256:{want} it was uploaded as");
         }
+        // Received by the leg, by the digest it computed as it came (docs/ci.md W27-R05).
+        let what = crate::runner::signed::thing(format!("artifact/{name}"), [("sha256", digest.clone())]);
+        crate::runner::signed::received(svc.job, what, crate::runner::signed::Giver::Server, &format!("its input artifact {name}"));
         let dest = if one || d.merge { d.path.clone() } else { d.path.join(&name) };
         let (f, to) = (file.clone(), dest.clone());
         let unzipped = crate::rt::blocking(move || unzip(&f, &to)).await?;

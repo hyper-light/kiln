@@ -582,9 +582,18 @@ pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req:
         Pusher::Job(_) => None,
     };
     keep_pushers(hub, repo, &updates, started_by.as_ref()).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("who pushed couldn't be kept, so the push isn't taken: {e:#}")))?;
+    // Its commits' signatures are checked by kiln's hook, once git has them and before any ref
+    // moves (W27-R03), as the trunk's `signatures:` says; an agent's, knowing whom it acts for.
+    let agent_for = match &who {
+        Pusher::Caller(c) if c.kind == crate::authz::gate::Kind::Agent => c.name.rsplit_once(" for ").map(|(_, w)| w.strip_prefix("user:").unwrap_or(w).to_owned()),
+        _ => None,
+    };
+    let checked = super::pushsig::prepare(hub, &repo.id, &review.signatures, agent_for).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("its commits' signatures couldn't be readied for checking, so the push isn't taken: {e:#}")))?;
+    let hooks = checked.config();
     // git takes the push; its answer (a report, and its progress) is read before it's passed on,
     // so kiln can say what the push made.
     let mut configs: Vec<&str> = cgi.configs.to_vec();
+    configs.push(&hooks);
     if !guarded.is_empty() {
         configs.push("receive.denyNonFastForwards=true");
     }
@@ -601,6 +610,19 @@ pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req:
     let band = band_of(&caps);
     let mut report = read_report(&raw, band.is_some());
     let mut said: Vec<String> = Vec::new();
+    // What kiln's hook found of each ref's commits' signatures: its words in place of git's "hook
+    // declined", and its warnings.
+    let verdicts = checked.verdicts();
+    for v in &verdicts {
+        if let Some(why) = &v.refused {
+            let declined = format!("ng {} ", v.refname);
+            if let Some(l) = report.lines.iter_mut().find(|l| l.starts_with(&declined)) {
+                *l = format!("ng {} {}", v.refname, why.replace('\n', "; "));
+            }
+            hub.store.audit(user.clone(), "repo.push".into(), format!("{} refused: {}: {why}", repo.name, v.refname)).await;
+        }
+        said.extend(v.warnings.iter().cloned());
+    }
     let author = match &who {
         Pusher::Caller(c) => super::diffs::author_of(&c.name, Some(c.kind)),
         Pusher::Job(j) => super::diffs::author_of(&format!("job:{}", j.leg), None),
@@ -612,6 +634,27 @@ pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req:
     }
     // What git took (`ok <ref>`), before kiln says more.
     let took: HashSet<String> = report.lines.iter().filter_map(|l| l.strip_prefix("ok ")).map(|r| r.split_whitespace().next().unwrap_or(r).to_owned()).collect();
+    // The signatures of the commits each ref git took brought, as kiln checked them: in the trail
+    // as its word for what it found (W27-R09).
+    let found: Vec<(String, super::pushsig::Found)> = verdicts.into_iter().filter(|v| took.contains(&v.refname)).flat_map(|v| v.commits.into_iter().map(move |c| (v.refname.clone(), c))).collect();
+    if !found.is_empty() {
+        let (name, at) = (repo.name.clone(), crate::util::now_unix());
+        let kept = hub
+            .store
+            .call(move |c| {
+                let tx = crate::store::tx(c)?;
+                for (refname, f) in &found {
+                    let said = kiln_ci::identity::trail::checked_commit(&name, refname, &f.sha, f.signature.as_deref(), &f.seen, f.words.as_deref());
+                    crate::trail::own(&tx, kiln_ci::identity::trail::PAYLOAD_CHECKED, &said, at)?;
+                }
+                tx.commit()?;
+                Ok(())
+            })
+            .await;
+        if let Err(e) = kept {
+            tracing::error!(repo = %repo.name, error = %format!("{e:#}"), "what kiln found of a push's signatures isn't in the trail");
+        }
+    }
     // The first branch pushed to an empty repository is its default, as on GitHub, when the one
     // it was made on (its HEAD) isn't among those pushed.
     if empty

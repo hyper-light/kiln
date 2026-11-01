@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """A stand-in for Claude Code's stream-json mode, for kiln's tests (crates/kiln/tests/wire_updates.rs).
 
+It runs, as its own children, the commands a test puts in `.fake-claude-acts-<its pid>` in its
+folder (an agent acting through its tools), writing each to `.fake-claude-acted`.
+
 It answers kiln's control requests with success, and writes each one, a line of JSON, to
 `.fake-claude-controls` in its folder when that file is there (and each user message it's sent to
 `.fake-claude-messages`, likewise, with this process's pid and the message's uuid). Each user message it's sent gets a turn of
@@ -12,11 +15,14 @@ then a result, said started and completed as Claude Code says it (`command_lifec
 user message's uuid), so kiln sends the next. As Claude Code does, it answers control requests as
 they come, a turn under way or not; user messages wait their turn. Each message's id is its own (this process's, this turn's, its line's), as Claude
 Code's are, so a second turn's lines are new events, not the first's again. It calls no model and
-reads no account.
+reads no account. With FAKE_CLAUDE_ACT set, each user message's text is given to that program (on
+its stdin, in the session's folder) before the turn's lines, as an agent would act on it (the
+conflict ladder's tests, docs/ci.md W26-R17).
 """
 import json
 import os
 import queue
+import subprocess
 import sys
 import threading
 import time
@@ -66,7 +72,29 @@ def record(session, rec):
         f.write(json.dumps(rec) + "\n")
 
 
+def acts():
+    """What an agent does through its tools, as this process's own children: the commands in
+    `.fake-claude-acts-<its pid>` in its folder, a line each, once a test puts the file there (a copy
+    of a session left behind acting on its own, W27-R08). Each is written to `.fake-claude-acted`
+    with its exit code and output."""
+    path = os.path.join(os.getcwd(), f".fake-claude-acts-{os.getpid()}")
+    done = os.path.join(os.getcwd(), ".fake-claude-acted")
+    while True:
+        time.sleep(0.2)
+        try:
+            with open(path) as f:
+                lines = [line.strip() for line in f if line.strip()]
+            os.remove(path)
+        except OSError:
+            continue
+        for line in lines:
+            r = subprocess.run(line, shell=True, capture_output=True, text=True)
+            with open(done, "a") as f:
+                f.write(json.dumps({"cmd": line, "code": r.returncode, "out": r.stdout, "err": r.stderr, "pid": os.getpid()}) + "\n")
+
+
 def main():
+    threading.Thread(target=acts, daemon=True).start()
     args = sys.argv[1:]
     if "--version" in args:
         print(f"{VERSION} (Claude Code)")
@@ -103,6 +131,12 @@ def main():
         if os.path.exists(said):
             with open(said, "a") as f:
                 f.write(json.dumps({"pid": os.getpid(), "uuid": m.get("uuid"), "message": m.get("message")}) + "\n")
+        act = os.environ.get("FAKE_CLAUDE_ACT")
+        if act:
+            content = (m.get("message") or {}).get("content")
+            text = content if isinstance(content, str) else "\n".join(b.get("text", "") for b in content or [] if isinstance(b, dict))
+            import subprocess
+            subprocess.run([act], input=text.encode(), cwd=os.getcwd())
         command = m.get("uuid")
         if command is not None:
             out({"type": "command_lifecycle", "command_uuid": command, "state": "started", "uuid": str(uuid.uuid4()), "session_id": session})

@@ -20,6 +20,7 @@ import {
   pullSearchRes,
   reviewApi,
   searchRes,
+  verdictsRes,
   whoSaid,
   type HostPullDetail,
   type Thread,
@@ -67,7 +68,7 @@ const pullNumber = (name: string) => Number(name.replace(/\D/g, ""));
  */
 export function warmReview(item: ShipCommit) {
   const ch = item.change;
-  if (ch && ch.host === "kiln") warm(inboxRes, diffRes(ch.name), commentsRes(ch.name), filesRes(ch.name, ch.revision), conflictsRes(ch.name));
+  if (ch && ch.host === "kiln") warm(inboxRes, diffRes(ch.name), commentsRes(ch.name), filesRes(ch.name, ch.revision), conflictsRes(ch.name), verdictsRes(ch.name));
   else if (ch && ch.host) warm(inboxRes, hostPullRes(item.repo, pullNumber(ch.name)));
   else warm(inboxRes, commitFilesRes(item.repo, item.sha));
 }

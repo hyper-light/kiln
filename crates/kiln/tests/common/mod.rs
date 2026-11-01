@@ -7,6 +7,8 @@
 #[cfg(unix)]
 pub mod agents;
 #[cfg(unix)]
+pub mod custody;
+#[cfg(unix)]
 pub mod lab;
 
 use std::collections::BTreeMap;
@@ -48,6 +50,8 @@ pub const NOT_INHERITED: &[&str] = &[
     "KILN_UPGRADE_ID",
     "KILN_REACH_SOCK",
     "KILN_REACH_FROM",
+    // An agent session's runner, which would sign for a test run in that session (W27-R04).
+    "KILN_HARNESS_SOCK",
     "KILN_CONFIG",
     "KILN_URL",
     "KILN_ADMIN_TOKEN",
@@ -1125,7 +1129,7 @@ tailscale = false
 
 {cd}
 [ci]
-{ci}
+{signatures}{ci}
 
 {extra}
 "#,
@@ -1135,6 +1139,9 @@ tailscale = false
         agent = o.agent,
         // The engine on, unless the test turns it off (`enabled = false`).
         ci = if o.ci.contains("enabled = false") { o.ci.to_owned() } else { format!("enabled = true\n{}", o.ci) },
+        // New repositories here warn of unsigned commits rather than refuse them (docs/ci.md
+        // W27-R03), unless the test says otherwise: tests push with plain git.
+        signatures = if o.ci.contains("signatures") { "" } else { "signatures = \"warn\"\n" },
         extra = extra,
         // CD stays off unless the test asks for it (`start_cd`) or has a `[cd]` of its own.
         cd = if o.extra.contains("[cd]") {

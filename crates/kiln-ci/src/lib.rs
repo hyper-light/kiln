@@ -16,6 +16,7 @@
 //! - [`compare`]: what differs between two runs or legs (W19).
 //! - [`sbom`]: SBOMs from lockfiles, SPDX and CycloneDX (W18).
 //! - [`attest`]: provenance statements, DSSE envelopes and Sigstore bundles (W18).
+//! - [`logs`]: a step's log by digest, its chunks' chain against what kiln keeps of it (W27).
 //! - [`trust`]: which untrusted runs wait for approval, and where legs may connect (W18).
 //! - [`turn`]: whose turn it is on a change under review (W26).
 //! - [`suggest`]: a comment's suggestion blocks, and what applying one does to a file (W26).
@@ -45,6 +46,7 @@ pub mod headroom;
 pub mod identity;
 pub mod insights;
 pub mod land;
+pub mod logs;
 pub mod mirror;
 pub mod oidc;
 pub mod plan;

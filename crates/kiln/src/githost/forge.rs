@@ -6,7 +6,10 @@
 //! merge trains; a stale change is updated by GitHub's update-branch against its expected head,
 //! GitLab's rebase, or a commit kiln replayed, pushed with a lease; reviews are batched in GitHub's
 //! pending review, GitLab's draft notes, or held by kiln for Bitbucket ([`Held`]); GitHub merges in
-//! the background (its asynchronous merge, polled).
+//! the background (its asynchronous merge, polled). What a host verified of a change's commits'
+//! signatures (docs/ci.md W27-R03) is GitHub's `verification` on each of a pull request's commits,
+//! GitLab's signature of each commit (asked once a commit: a signature's verdict is kept from when
+//! kiln first asked), and on Bitbucket, which verifies none, Unknown.
 //!
 //! Within the hosts' rate limits: every read is conditional (an `If-None-Match` with the ETag the
 //! caller holds; GitHub doesn't count a 304), the limit is read from each answer's rate-limit
@@ -33,6 +36,10 @@ const GITHUB_API_VERSION: &str = "2026-03-10";
 const MERGES_KEPT: usize = 10_000;
 /// Default branches remembered, by repository.
 const TRUNKS_KEPT: usize = 1000;
+/// GitLab's verdicts on commits' signatures remembered, by commit.
+const SIGNATURES_KEPT: usize = 10_000;
+/// Most pages of a change's commits read (GitLab and Bitbucket list them newest first, 100 a page).
+const COMMIT_PAGES_MOST: usize = 100;
 /// What kiln does where a repository has no queue of its host's.
 const KILN_QUEUE: &str = "lands it through kiln's merge queue (W28)";
 /// What kiln does where a host can't update a change.
@@ -165,6 +172,8 @@ struct St {
     trunks: BTreeMap<String, String>,
     merges: BTreeMap<String, Vec<u64>>,
     merge_order: VecDeque<String>,
+    /// GitLab's verdicts, by repository and commit.
+    signatures: BTreeMap<(String, String), Verification>,
 }
 
 /// One host's answer.
@@ -217,6 +226,53 @@ fn check_body(body: &str) -> Result<(), Refusal> {
 
 fn unsupported(what: &'static str, does: &str) -> Refusal {
     Refusal::Unsupported { what, kiln_does: does.to_owned() }
+}
+
+/// What GitHub verified of one of a pull request's commits (its `commit.verification`; the signer
+/// is the login the committer's email is verified for, whose key it is).
+pub(crate) fn github_verification(c: &Value) -> Verification {
+    let sha = s(c, "/sha");
+    let Some(v) = c.pointer("/commit/verification").filter(|v| v.is_object()) else {
+        return Verification { sha, state: Signature::Unknown, reason: "GitHub said nothing of its signature".into(), signer: None, verified_at: None };
+    };
+    let verified = v.get("verified").and_then(Value::as_bool) == Some(true);
+    let reason = Some(s(v, "/reason")).filter(|r| !r.is_empty()).unwrap_or_else(|| if verified { "valid".into() } else { "unsigned".into() });
+    let state = match (verified, reason.as_str()) {
+        (true, _) => Signature::Verified,
+        (false, "unsigned") => Signature::Unsigned,
+        (false, _) => Signature::Unverified,
+    };
+    let signer = Some(s(c, "/committer/login")).filter(|l| verified && !l.is_empty());
+    let verified_at = if verified { crate::ci::providers::unix(v.get("verified_at")) } else { None };
+    Verification { sha, state, reason, signer, verified_at }
+}
+
+/// What GitLab verified of commit `sha`'s signature (`repository/commits/:sha/signature`): a PGP
+/// key's or an X.509 certificate's email as its signer (GitLab names an SSH key, not whose it is).
+pub(crate) fn gitlab_verification(sha: &str, v: &Value) -> Verification {
+    let status = s(v, "/verification_status");
+    let state = match status.as_str() {
+        "verified" | "verified_system" | "verified_ca" => Signature::Verified,
+        "" => Signature::Unknown,
+        _ => Signature::Unverified,
+    };
+    let signer = match s(v, "/signature_type").as_str() {
+        "PGP" => s(v, "/gpg_key_user_email"),
+        "X509" => s(v, "/x509_certificate/email"),
+        _ => String::new(),
+    };
+    let reason = if status.is_empty() { "GitLab said nothing of its signature".to_owned() } else { status };
+    Verification { sha: sha.to_owned(), state, reason, signer: Some(signer).filter(|e| state == Signature::Verified && !e.is_empty()), verified_at: None }
+}
+
+/// What GitLab's answer of a commit's signature says, `status` and `body` as it answered: a 404 of
+/// the signature (not of the commit) is its unsigned. None: it said neither.
+pub(crate) fn gitlab_signature_of(sha: &str, status: u16, body: &Value) -> Option<Verification> {
+    match status {
+        200 => Some(gitlab_verification(sha, body)),
+        404 if gitlab::said(body).contains("Signature") => Some(Verification { sha: sha.to_owned(), state: Signature::Unsigned, reason: "unsigned".into(), signer: None, verified_at: None }),
+        _ => None,
+    }
 }
 
 impl HostForge {
@@ -341,6 +397,49 @@ impl HostForge {
             Host::Gitlab => format!("/projects/{}/merge_requests/{number}", gitlab::id(repo)),
             Host::Bitbucket => format!("/repositories/{repo}/pullrequests/{number}"),
         }
+    }
+
+    /// Change `number`'s commits, oldest first, from GitLab's or Bitbucket's list of them (newest
+    /// first, 100 a page): their shas. Past [`COMMIT_PAGES_MOST`] pages, the oldest of those read.
+    async fn listed_commits(&self, repo: &str, number: u64) -> Result<Vec<String>, Refusal> {
+        let mut out = Vec::new();
+        let mut next = Some(match self.host {
+            Host::Bitbucket => format!("{}/commits?pagelen=100", self.pull(repo, number)),
+            _ => format!("{}/commits?per_page=100&page=1", self.pull(repo, number)),
+        });
+        for page in 1..=COMMIT_PAGES_MOST {
+            let Some(path) = next.take() else { break };
+            let r = self.get(repo, None, &path).await?;
+            let v = self.ok("the change's commits", r, &[200])?.body;
+            let (items, sha) = match self.host {
+                Host::Bitbucket => (arr(&v, "/values").collect::<Vec<_>>(), "/hash"),
+                _ => (v.as_array().into_iter().flatten().collect(), "/id"),
+            };
+            let full = items.len() >= 100;
+            out.extend(items.into_iter().map(|c| s(c, sha)));
+            next = match self.host {
+                Host::Bitbucket => Some(s(&v, "/next")).filter(|n| !n.is_empty()),
+                _ => full.then(|| format!("{}/commits?per_page=100&page={}", self.pull(repo, number), page.saturating_add(1))),
+            };
+        }
+        out.reverse();
+        Ok(out)
+    }
+
+    /// What GitLab verified of commit `sha`: asked once, then as it said.
+    async fn gitlab_signature(&self, repo: &str, sha: &str) -> Result<Verification, Refusal> {
+        let key = (repo.to_owned(), sha.to_owned());
+        if let Some(v) = self.st.lock().signatures.get(&key) {
+            return Ok(v.clone());
+        }
+        let r = self.get(repo, None, &format!("{}/repository/commits/{sha}/signature", self.base(repo))).await?;
+        let Some(v) = gitlab_signature_of(sha, r.status, &r.body) else { return Err(self.refusal(&format!("commit {sha}'s signature"), &r)) };
+        let mut st = self.st.lock();
+        if st.signatures.len() >= SIGNATURES_KEPT {
+            st.signatures.clear();
+        }
+        st.signatures.insert(key, v.clone());
+        Ok(v)
     }
 
     // ------------------------------------------------------------------------- changes' shapes
@@ -731,6 +830,7 @@ impl Forge for HostForge {
                         review: Batched::PendingReview,
                         merge_async: true,
                         methods,
+                        verifies: true,
                     }
                 }
                 Host::Gitlab => Abilities {
@@ -741,6 +841,7 @@ impl Forge for HostForge {
                     review: Batched::DraftNotes,
                     merge_async: false,
                     methods: vec![Method::Merge, Method::Squash, Method::FastForward],
+                    verifies: true,
                 },
                 Host::Bitbucket => Abilities {
                     host: Host::Bitbucket,
@@ -750,6 +851,7 @@ impl Forge for HostForge {
                     review: Batched::Held,
                     merge_async: false,
                     methods: vec![Method::Merge, Method::Squash, Method::FastForward],
+                    verifies: false,
                 },
             })
         })
@@ -1323,6 +1425,41 @@ impl Forge for HostForge {
             self.ok("the repository", r, &[200])?;
             let now = (self.now)();
             Ok(self.st.lock().rate.unwrap_or(Rate { limit: u32::MAX, remaining: u32::MAX, resets_at: now.saturating_add(3600) }))
+        })
+    }
+
+    fn verifications<'a>(&'a self, repo: &'a str, number: u64) -> BoxFuture<'a, Result<Vec<Verification>, Refusal>> {
+        Box::pin(async move {
+            match self.host {
+                Host::Github => {
+                    let mut out = Vec::new();
+                    for page in 1..=COMMITS_MOST.div_ceil(100) {
+                        let r = self.get(repo, None, &format!("{}/commits?per_page=100&page={page}", self.pull(repo, number))).await?;
+                        let v = self.ok("the change's commits", r, &[200])?.body;
+                        let items = v.as_array().map_or(&[][..], Vec::as_slice);
+                        out.extend(items.iter().map(github_verification));
+                        if items.len() < 100 {
+                            break;
+                        }
+                    }
+                    out.truncate(COMMITS_MOST);
+                    Ok(out)
+                }
+                Host::Gitlab => {
+                    let mut out = Vec::new();
+                    for sha in self.listed_commits(repo, number).await?.into_iter().take(COMMITS_MOST) {
+                        out.push(self.gitlab_signature(repo, &sha).await?);
+                    }
+                    Ok(out)
+                }
+                Host::Bitbucket => Ok(self
+                    .listed_commits(repo, number)
+                    .await?
+                    .into_iter()
+                    .take(COMMITS_MOST)
+                    .map(|sha| Verification { sha, state: Signature::Unknown, reason: BITBUCKET_UNVERIFIED.to_owned(), signer: None, verified_at: None })
+                    .collect()),
+            }
         })
     }
 }

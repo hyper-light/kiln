@@ -115,6 +115,10 @@ pub struct Job {
     blue_green: bool,
     #[serde(skip)]
     handed_over: bool,
+    /// A blue/green upgrade's: the agent sessions its machine held as it began, which its replant's
+    /// record lists the transfers of (docs/ci.md W27-R08).
+    #[serde(skip)]
+    sessions: Vec<String>,
 }
 
 /// A binary kiln can hand out for a platform.
@@ -1059,6 +1063,12 @@ impl Updates {
         self.jobs.lock().iter().find(|j| j.id == id).cloned()
     }
 
+    /// A blue/green runner upgrade's replant (docs/ci.md W27-R08): its machine, when it began, and
+    /// the agent sessions the machine held then. None for another job.
+    pub fn replant(j: &Job) -> Option<(String, i64, Vec<String>)> {
+        (j.kind == "runner" && j.blue_green).then(|| (j.target.clone(), j.started_at, j.sessions.clone()))
+    }
+
     pub(crate) fn running(&self, id: &str) -> bool {
         self.jobs.lock().iter().any(|j| j.id == id && j.state == JobState::Running)
     }
@@ -1299,6 +1309,7 @@ pub(crate) fn new_job(kind: &'static str, target: &str, method: &'static str, fr
         progress: false,
         blue_green: false,
         handed_over: false,
+        sessions: Vec::new(),
     }
 }
 
@@ -1771,7 +1782,11 @@ async fn native(hub: &Arc<Hub>, id: &str, machine: &str, b: &Binary) {
         let inst = hub.instances.lock();
         inst.newest(machine).and_then(|p| inst.get(p)).is_some_and(|i| i.caps & crate::proto::CAP_BLUE_GREEN != 0)
     };
-    u.update(hub, id, |j| j.blue_green = blue_green);
+    let held: Vec<String> = if blue_green { hub.harness.list().into_iter().filter(|i| i.target == format!("agent:{machine}")).map(|i| i.id).collect() } else { Vec::new() };
+    u.update(hub, id, |j| {
+        j.blue_green = blue_green;
+        j.sessions = held;
+    });
     u.say(hub, id, if blue_green { "asked the runner to upgrade itself: the new build starts beside it and takes over" } else { "asked the runner to upgrade itself" });
     let since = Instant::now();
     // The runner switches once its running jobs are done: that wait is theirs, not the upgrade's,

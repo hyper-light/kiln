@@ -86,6 +86,11 @@ impl Room {
 pub struct Inventory {
     pub sessions: Vec<String>,
     pub kinds: Vec<KindInfo>,
+    /// Each session's epoch here: what tells a copy left behind (the server has its session at a
+    /// later epoch) from a session just arriving (docs/ci.md W27-R08). A runner from before sends
+    /// none.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub epochs: std::collections::BTreeMap<String, u64>,
 }
 
 /// A session as kept on disk, and as it goes to another runner process of this machine when its
@@ -799,7 +804,8 @@ impl Host {
     }
 
     pub fn inventory(&self) -> Inventory {
-        Inventory { sessions: self.sessions.lock().keys().cloned().collect(), kinds: super::kinds::offered() }
+        let sessions: Vec<(String, Arc<Session>)> = self.sessions.lock().iter().map(|(id, s)| (id.clone(), Arc::clone(s))).collect();
+        Inventory { epochs: sessions.iter().map(|(id, s)| (id.clone(), s.epoch())).collect(), sessions: sessions.into_iter().map(|(id, _)| id).collect(), kinds: super::kinds::offered() }
     }
 
     /// Sessions still working on something (an upgrade waits for these).
@@ -976,6 +982,11 @@ impl Host {
         // One this machine ran already (its older runner process handed it over) isn't new here:
         // it's never refused for the machine's limits.
         let new = !pkg.handover;
+        // Its giver's signed hand-on goes on to the server, and this process's receipt waits for
+        // its identity at the epoch it goes on at (docs/ci.md W27-R08).
+        if let Some(h) = &pkg.hand_on {
+            crate::runner::custody::took(&pkg.id, epoch, &pkg.events, h);
+        }
         let seed = session::Seed { events: pkg.events, state: pkg.state, items, from: pkg.from, from_cwd: pkg.from_cwd, picks_up: pkg.picks_up, note, restored: false, synced: pkg.synced, local: pkg.handover };
         // Taken over, written so before anything of it runs here: no other process of the machine
         // takes this try over, and the one that handed it over doesn't go on with it.
@@ -1461,6 +1472,13 @@ impl Host {
     /// it couldn't be handed over, was stopped, and starts again there from its spec). They are no
     /// longer this runner's.
     pub async fn move_out(&self) -> Vec<(Saved, Option<Box<session::Handed>>)> {
+        self.move_out_signing(false).await.into_iter().map(|(rec, handed, _)| (rec, handed)).collect()
+    }
+
+    /// [`Host::move_out`], each session signed for as it goes when `sign` (the new build takes
+    /// sessions so, docs/ci.md W27-R08): its hand-on, at the epoch it has, of its timeline as it's
+    /// handed over, if this process holds its key at that epoch.
+    pub async fn move_out_signing(&self, sign: bool) -> Vec<(Saved, Option<Box<session::Handed>>, Option<serde_json::Value>)> {
         let sessions: Vec<Arc<Session>> = self.sessions.lock().values().cloned().collect();
         // They take no messages as they're handed over: sent again, those go where they went.
         for s in &sessions {
@@ -1508,7 +1526,12 @@ impl Host {
             // A handover's fence: started again with its session (the handover never finished),
             // this runner goes on with it.
             self.end_lane(&s.id, Lane::Fence { epoch: s.epoch(), handover: true });
-            out.push((rec, h));
+            let signed = sign.then(|| {
+                let core = s.core.lock();
+                (core.state.epoch, core.events().cloned().collect::<Vec<_>>())
+            });
+            let hand_on = signed.and_then(|(epoch, events)| crate::runner::custody::hand_on(&s.id, epoch, &events, "handed to this machine's new build (blue/green)"));
+            out.push((rec, h, hand_on));
         }
         self.mark_dirty();
         out

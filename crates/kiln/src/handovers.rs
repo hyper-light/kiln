@@ -251,9 +251,30 @@ impl Hub {
         }
         for (name, peer, id) in asks {
             let c = Command::MoveTo { to: name.clone(), cwd: String::new(), note: None, now: false, kind: None, model: None, local: true };
-            let Ok(json) = serde_json::to_string(&c) else { continue };
+            let Some(json) = self.worded(&name, peer, &id, &c).await else { continue };
             tracing::info!(agent = %name, peer, session = %id, "an older runner process of this machine hands this agent session to the newest once its turn is over");
             self.command_peers(&name, vec![peer], &ServerMsg::HarnessCmd { session: id, json }).await.log_when_answered(LOG_WITHIN);
+        }
+    }
+
+    /// Hand-over's word `c` about session `session`, as the server sends it to runner process
+    /// `peer` of `agent`: signed and addressed to that process at the epoch kiln last certified it
+    /// at for the session (docs/ci.md W27-R08), when the process checks words (`CAP_CUSTODY`);
+    /// else as before. Any other process refuses it.
+    pub(crate) async fn worded(&self, agent: &str, peer: PeerId, session: &str, c: &Command) -> Option<String> {
+        let json = serde_json::to_string(c).ok()?;
+        let known = self.instances.lock().get(peer).map(|i| (i.label(), u64::from(i.caps) | i.wide));
+        let Some((instance, _)) = known.filter(|(_, caps)| caps & crate::proto::CAP_CUSTODY != 0) else { return Some(json) };
+        let epoch = match crate::identities::epoch_held(&self.store, session, agent, &instance).await {
+            Ok(Some(e)) => e,
+            _ => self.harness.epoch_of(session),
+        };
+        match crate::custody::word(&self.pki, session, &json, agent, &instance, epoch) {
+            Ok(worded) => Some(worded),
+            Err(e) => {
+                tracing::warn!(target: "kiln.custody", %session, %agent, %instance, error = %format!("{e:#}"), "a hand-over's word couldn't be signed: the process it's for refuses it unsigned");
+                Some(json)
+            }
         }
     }
 
@@ -380,7 +401,7 @@ impl Hub {
     }
 
     async fn handed_over(&self, agent: &str, to: PeerId, session: &str, word: Word) {
-        let Ok(json) = serde_json::to_string(&word.command()) else { return };
+        let Some(json) = self.worded(agent, to, session, &word.command()).await else { return };
         self.command_peers(agent, vec![to], &ServerMsg::HarnessCmd { session: session.to_owned(), json }).await.log_when_answered(LOG_WITHIN);
     }
 }

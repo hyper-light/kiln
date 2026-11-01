@@ -481,6 +481,11 @@ impl Leg {
         st.memo.upstream.insert(format!("step.{idx}"), replay.digest());
         st.memo.earlier.push(memo::Earlier { key: weak, outputs: m.outputs.clone(), digest: replay.digest() });
         st.memo.outputs.extend(m.outputs.iter().cloned());
+        // Received by the leg from the server, by its replay's digest (docs/ci.md W27-R05): W24's
+        // own scheme over its outputs and files, so not filed as a SHA-256 of bytes.
+        let mut what = crate::runner::signed::thing(format!("reused/{idx}"), [("kiln-replay-v1", replay.digest())]);
+        what.annotations.insert("key".into(), key.clone().into());
+        crate::runner::signed::received(&self.a.job_id, what, crate::runner::signed::Giver::Server, &format!("step {idx}'s result, reused from {from}"));
         let runner = Some(text("runner")).filter(|r| !r.is_empty()).map(|r| format!(" on {r}")).unwrap_or_default();
         let took = source.get("ms").and_then(Value::as_u64).map(|ms| format!(", in {:.1} s", ms as f64 / 1000.0)).unwrap_or_default();
         let files = if replay.files.is_some() { "; its files are put in place when a later step runs" } else { "" };

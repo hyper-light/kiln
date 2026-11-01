@@ -6,8 +6,10 @@
 //! |---|---|
 //! | [`sync`] | a synced repo's copies and the server's member: `sync::Copy`, `Feed`, `Index`, `take_steps`, hyper-durable replicas, the runner's and server's shells |
 //! | [`moves`] | the same, with an agent session moving between the machines: `sync::runner`'s `look_now_at`, `left_at` and `arrived`, as `harness::session` moves one |
+//! | [`transfers`] | agent sessions changing hands between machines' runner processes and kiln's server (moves, resumes from the server's store, take-overs, blue/green upgrades and rollbacks), with copies left behind still acting: the server's act check, its signed words and the runner's check of them, the custody chain's hop and walk (W27-AC05) |
 //! | `goals::sim` | the goal driver: `goals`' `adopt` and `step` on the seeded scheduler (beside the driver, whose private parts it runs) |
 
 pub mod fs;
 pub mod moves;
 pub mod sync;
+pub mod transfers;

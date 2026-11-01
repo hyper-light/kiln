@@ -251,6 +251,7 @@ mod tests {
             agents: Default::default(),
             argocd: ArgoSettings { applications },
             owners: Default::default(),
+            production: false,
         };
         assert_eq!(integration_of(&env("argocd/prod", false)), Some("prod"));
         assert_eq!(integration_of(&env("argocd/prod", true)), None, "kiln writes its Applications");
