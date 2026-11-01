@@ -110,13 +110,19 @@ const runs: Run[] = []; // newest first
 const jobsByRun = new Map<string, SimJob[]>();
 const jobsById = new Map<string, SimJob>();
 /** The run Ship's fixed rows stream, kept while it has jobs to go: the first running job's run
- * changes each time one run's job ends before its next starts, and the lanes jumped run to run. */
+ * changes each time one run's job ends before its next starts, and the lanes jumped run to run. One
+ * none of whose jobs will fail where there is one: a fixed row that failed has its own failed leg
+ * (ship.ts), and the rest show no failure they don't have. */
 let liveRunId: string | null = null;
 /** A job for Ship's fixed rows to stream (ship.ts): the live run's running one, else its first. */
 function liveJob() {
   const all = [...jobsById.values()];
   const going = (j: SimJob) => j.job.run_id === liveRunId && ["pending", "queued", "running"].includes(j.job.status);
-  if (liveRunId === null || !all.some(going)) liveRunId = all.find((j) => j.job.status === "running")?.job.run_id ?? null;
+  if (liveRunId === null || !all.some(going)) {
+    const clean = (run: string) => (jobsByRun.get(run) ?? []).every((j) => j.failStep === null && j.job.status !== "failed");
+    const running = all.filter((j) => j.job.status === "running");
+    liveRunId = (running.find((j) => clean(j.job.run_id)) ?? running[0])?.job.run_id ?? null;
+  }
   const its = all.filter((j) => j.job.run_id === liveRunId);
   const sj = its.find((j) => j.job.status === "running") ?? its[0] ?? all[0];
   return sj ? { run: sj.job.run_id, job: sj.job.id, name: sj.job.display || sj.job.key, state: sj.job.status } : null;
