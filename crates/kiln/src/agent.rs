@@ -1844,7 +1844,7 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
     #[cfg_attr(not(unix), allow(unused_variables))]
     let convo_held: Option<crate::convo::store::Held> = None;
     // A new build taking over doesn't know yet which store it goes on with: its feed starts then.
-    #[cfg_attr(not(unix), allow(unused_mut))]
+    #[cfg_attr(not(unix), allow(unused_mut, unused_variables))]
     let mut stores_wait = false;
     // How many agent sessions it has at work at once (docs/agents.md, "How many agents a machine
     // runs"): what was set for this machine from the server (kept here for its restarts), else its
