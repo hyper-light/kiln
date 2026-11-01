@@ -306,5 +306,12 @@ fn w29_r22_update_drafts() -> anyhow::Result<()> {
         std::thread::sleep(Duration::from_millis(500));
     }
     assert_eq!(update_drafts(&s, "acme/app", ".github/workflows/ci.yml", 1)?.len(), 1, "acme/app doesn't use acme/tools");
+
+    // kiln's update draft is the repository's (pl-7): whoever may submit to it discards it, by its id.
+    let id = app.first().map(|(id, _)| id.clone()).unwrap_or_default();
+    let (st, out) = http(s.port, "POST", "/api/ship/pipelines", &s.admin, Some(&json!({ "repo": "acme/app", "path": ".github/workflows/ci.yml", "verb": "discard", "draft": id })))?;
+    assert_eq!(st, 200, "{out}");
+    let out: Value = serde_json::from_str(&out).unwrap_or(Value::Null);
+    assert_eq!(at(&out, "/draft/state"), "discarded", "{out}");
     Ok(())
 }

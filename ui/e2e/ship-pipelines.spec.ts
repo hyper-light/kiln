@@ -92,7 +92,7 @@ async function openPane(page: Page, isMobile: boolean, repo: string, path: strin
 
 test("an opened workflow is the jobs pane's anatomy: the strip, its groups, the picked line's detail beside them or under its line", async ({ page, isMobile }) => {
   const pane = await openPane(page, isMobile, "hyper-light/kiln", ".kiln/ci.yaml");
-  await expect(pane.locator(".jp-g > span:first-child")).toHaveText(["Triggers", "Stage 1", "Stage 2", "Uses", "Secrets and variables", "Runs", "Settings"]);
+  await expect(pane.locator(".ppl-list > .jp-g > span:first-child")).toHaveText(["Triggers", "Stage 1", "Stage 2", "Uses", "Secrets and variables", "Runs", "Settings"]);
   await expect(pane.locator('.jp-g[data-group="Stage 1"] > span:last-child')).toHaveText("3 jobs at once");
   await expect(pane.locator('.jp-g[data-group="Stage 2"] > span:last-child')).toHaveText("after rust and ui");
   // The first job is picked: YAML · Plan · Last run, its lines tinted in the code.
@@ -127,7 +127,7 @@ test("an opened workflow is the jobs pane's anatomy: the strip, its groups, the 
 
 test("an action's pane: its inputs, steps, versions, who uses it and its access; Changes · YAML · Try it; Release among its verbs", async ({ page, isMobile }) => {
   const pane = await openPane(page, isMobile, "hyper-light/ci-kit", ".github/actions/setup-rust");
-  await expect(pane.locator(".jp-g > span:first-child")).toHaveText(["Inputs", "Outputs", "Steps", "Versions", "Used by", "Settings"]);
+  await expect(pane.locator(".ppl-list > .jp-g > span:first-child")).toHaveText(["Inputs", "Outputs", "Steps", "Versions", "Used by", "Settings"]);
   await expect(pane.locator(".jp-j[data-at]")).toHaveAttribute("data-key", "versions.head");
   await expect(pane.locator(".ppl-detail").getByRole("tab")).toHaveText(["Changes", "YAML", "Try it"]);
   await expect(pane.locator('.jp-g[data-group="Used by"] > span:last-child')).toHaveText("3 repositories");
@@ -346,5 +346,56 @@ test("New: seven kinds, the dialect a workflow's, where it starts; the files it 
   await pane.locator('.jp-j[data-key="lang.kiln"] .jp-line').click();
   await expect(pane.locator('li[data-field="path"] .v')).toHaveText(".kiln/new-workflow.yaml");
   await expect(page.locator("[role=dialog], .cm-tooltip")).toHaveCount(0);
+  expect(await sideways(page)).toBe(0);
+});
+
+test("Release asked in the strip: the version what it changes calls for, the others beside it; Keep sends nothing; a refusal over checks asks Release anyway", async ({ page, isMobile }) => {
+  await page.request.get("/api/mock/ship/pipelines?reset=1");
+  const pane = await openPane(page, isMobile, "hyper-light/ci-kit", ".github/actions/setup-rust");
+  // Its Changes: the commits since its newest tag, and what releasing changes for those who use it.
+  const changes = pane.locator(".ppl-detail");
+  await expect(changes.getByLabel("Commits since v2.4.0").locator("li")).toHaveCount(3);
+  await expect(changes).toContainText("What v2.5.0 changes for those who use it");
+  const release = () => pane.locator(".ppl-verbs button", { hasText: /^Release/ });
+  await release().click();
+  await expect(pane.locator(".jp-said")).toContainText("Release v2.5.0 at e41a9c2, main's tip? The tag is ci-kit's: its 5 actions and its workflow all get v2.5.0.");
+  const as = pane.locator(".jp-q");
+  await expect(as.locator("button")).toHaveText(["v2.5.0", "v2.4.1", "v3.0.0"]);
+  await expect(pane.locator(".ppl-verbs button")).toHaveText(["Keep", "Release"]);
+  // Keep: back, nothing sent.
+  await pane.locator(".ppl-verbs button", { hasText: "Keep" }).click();
+  await expect(pane.locator(".ppl-verbs button")).toHaveText(["Run", "Save draft", "Ready", "Discard", "Release"]);
+  expect(await sentBodies(page)).toEqual([]);
+  // Another version picked, released: its major's floating tag moves too.
+  await release().click();
+  await as.getByRole("button", { name: "v2.4.1" }).click();
+  await expect(pane.locator(".jp-said")).toContainText("Release v2.4.1 at e41a9c2");
+  await release().click();
+  await expect(pane.locator(".jp-said")).toContainText("Released v2.4.1 at e41a9c2");
+  expect((await sentBodies(page)).at(-1)).toMatchObject({ verb: "release", path: ".github/actions/setup-rust", tag: "v2.4.1", major: true, sha: "e41a9c2b7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f21" });
+  // cache-cargo's checks failed: the refusal says why, and asks Release anyway.
+  const cargo = await openPane(page, isMobile, "hyper-light/ci-kit", ".github/actions/cache-cargo");
+  await cargo.locator(".ppl-verbs button", { hasText: /^Release/ }).click();
+  await cargo.locator(".ppl-verbs button", { hasText: /^Release/ }).click();
+  await expect(cargo.locator(".jp-said")).toContainText("ci-kit's checks failed on e41a9c2: rust-check · clippy. Release v2.5.0 anyway?");
+  await expect(cargo.locator(".ppl-verbs button")).toHaveText(["Keep", "Release anyway"]);
+  await cargo.locator(".ppl-verbs button", { hasText: "Release anyway" }).click();
+  await expect(cargo.locator(".jp-said")).toContainText("Released v2.5.0");
+  expect((await sentBodies(page)).at(-1)).toMatchObject({ verb: "release", tag: "v2.5.0", confirm: true });
+  await expect(page.locator("[role=dialog]")).toHaveCount(0);
+  expect(await sideways(page)).toBe(0);
+});
+
+test("kiln's update draft: its lines against what's published, what it changes for its repository; Run, Ready and Discard name it by its id", async ({ page, isMobile }) => {
+  await page.request.get("/api/mock/ship/pipelines?reset=1");
+  const pane = await openPane(page, isMobile, "hyper-light/quiver", ".github/workflows/ci.yml", "d-update-88");
+  const diff = pane.getByLabel("Its lines against what's published");
+  await expect(diff.locator('li[data-kind="del"]')).toContainText("rust-check.yml@v2.3.0");
+  await expect(diff.locator('li[data-kind="add"]')).toContainText("rust-check.yml@v2.4.0");
+  await expect(pane.locator(".ppl-detail")).toContainText("What it changes for quiver");
+  await expect(pane.locator(".ppl-verbs button[data-dim]")).toHaveText(["Save draft"]);
+  await pane.locator(".ppl-verbs button", { hasText: "Ready" }).click();
+  await expect(pane.locator(".jp-said")).toContainText("Asked for ci's review");
+  expect((await sentBodies(page)).at(-1)).toEqual({ repo: "hyper-light/quiver", path: ".github/workflows/ci.yml", verb: "ready", draft: "d-update-88" });
   expect(await sideways(page)).toBe(0);
 });

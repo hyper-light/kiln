@@ -458,7 +458,15 @@ pub async fn get(hub: &Arc<Hub>, owner: &str, name: &str, q: &HashMap<String, St
     };
     let by_hand = runs_by_hand(commit.workflows.iter().find(|l| l.path == path));
     let changes = if row.facts.kind.is_action() || row.facts.kind == Kind::Reusable { Some(since_release(hub, &repo, path, &text, &ctx.versions).await) } else { None };
-    let pane = core::pane_json(&core::Opened { repo: &full, row: &row, at: &at, sha: &sha, text: &text, viewer, by_hand, changes: changes.as_deref() }, &groups);
+    // What Release would tag: the commits to its files since its newest release (pl-5).
+    let released = row.facts.kind.is_action() || row.facts.kind == Kind::Reusable;
+    let newest = kiln_ci::pipelines::newest_release(ctx.versions.iter().map(|(t, _)| t.as_str())).filter(|_| released).map(str::to_owned);
+    let commits = match &newest {
+        Some(tag) => commits_since(hub, &repo, tag, &sha, path).await,
+        None => Vec::new(),
+    };
+    let since = newest.as_deref().map(|tag| core::Since { tag, commits: &commits });
+    let pane = core::pane_json(&core::Opened { repo: &full, row: &row, at: &at, sha: &sha, text: &text, viewer, by_hand, changes: changes.as_deref(), since }, &groups);
     Ok(srv::json(StatusCode::OK, &pane))
 }
 
@@ -473,6 +481,29 @@ async fn since_release(hub: &Hub, repo: &Repo, path: &str, text: &str, versions:
         return Vec::new();
     }
     diff_of(path, &old, text)
+}
+
+/// kiln's update draft a verb names by its id (`draft`), of `path` in `repo`: the repository's,
+/// not an author's (W29-R22). None when the body names none, or a draft that isn't kiln's update.
+async fn update_draft(hub: &Hub, repo: &str, path: &str, body: &Value) -> Result<Option<crate::ci::pipeline_drafts::Draft>, Fail> {
+    let Some(id) = body.get("draft").and_then(Value::as_str).filter(|d| !d.is_empty()) else { return Ok(None) };
+    let d = crate::ci::pipeline_drafts::get(hub, id).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    Ok(d.filter(|d| d.repo == repo && d.path == path && d.author.starts_with(kiln_ci::updates::AUTHOR)))
+}
+
+/// The commits to an action's folder (or a reusable workflow's file) between release `tag` and
+/// `sha`, newest first, as pl-5's Changes view lists them.
+async fn commits_since(hub: &Hub, repo: &Repo, tag: &str, sha: &str, path: &str) -> Vec<core::SinceCommit> {
+    let dir = crate::ci::hosting::native_path(hub, repo).unwrap_or_else(|| crate::gitops::mirror_path(hub, &repo.name)).to_string_lossy().into_owned();
+    let what = if path.ends_with("action.yml") || path.ends_with("action.yaml") { path.rsplit_once('/').map_or(path, |(d, _)| d) } else { path };
+    let log = git(hub, &dir, &["log", "--max-count=50", "--format=%h%x00%s%x00%an%x00%at", &format!("refs/tags/{tag}..{sha}"), "--", what]).await;
+    log.lines()
+        .filter_map(|l| {
+            let mut f = l.split('\0');
+            let (sha, subject, author, at) = (f.next()?, f.next()?, f.next()?, f.next()?);
+            Some(core::SinceCommit { sha: sha.to_owned(), subject: subject.to_owned(), author: author.to_owned(), at: at.parse().unwrap_or_default() })
+        })
+        .collect()
 }
 
 /// [`kiln_ci::wf::action_diff`] of a file's two texts, an action's or a reusable workflow's.
@@ -559,7 +590,7 @@ async fn draft_pane(hub: &Hub, repo: &Repo, id: &str, path: &str, viewer: core::
         groups.insert(1, core::PaneGroup { name: "Upstream".into(), lines: core::upstream_lines(&upstream) });
     }
     let at = d.branch.clone().or_else(|| d.name.clone()).unwrap_or_else(|| head.clone());
-    let pane = core::pane_json(&core::Opened { repo: &repo.name, row: &row, at: &at, sha: &head, text: &text, viewer, by_hand: runs_by_hand(loaded.as_ref()), changes: None }, &groups);
+    let pane = core::pane_json(&core::Opened { repo: &repo.name, row: &row, at: &at, sha: &head, text: &text, viewer, by_hand: runs_by_hand(loaded.as_ref()), changes: None, since: None }, &groups);
     Ok(srv::json(StatusCode::OK, &pane))
 }
 
@@ -773,14 +804,27 @@ pub async fn act(hub: &Arc<Hub>, caller: &crate::authz::Caller, body: &Value) ->
             if !caller.can("diffs.submit", &scope) {
                 return Err((StatusCode::FORBIDDEN, format!("a draft of {} is its author's to {verb}, with `diffs.submit`", repo.name)));
             }
-            let (author, _) = crate::ci::diffs::author_of(&caller.name, Some(caller.kind));
-            let mut d = crate::ci::pipeline_drafts::open_for(hub, &repo.name, path, &author)
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
-                .ok_or_else(|| (StatusCode::NOT_FOUND, format!("you have no draft of {path} in {}", repo.name)))?;
+            let mut d = update_draft(hub, &repo.name, path, body).await?;
+            if d.is_none() {
+                let (author, _) = crate::ci::diffs::author_of(&caller.name, Some(caller.kind));
+                d = crate::ci::pipeline_drafts::open_for(hub, &repo.name, path, &author).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+            }
+            let mut d = d.ok_or_else(|| (StatusCode::NOT_FOUND, format!("you have no draft of {path} in {}", repo.name)))?;
             if verb == "ready" { crate::ci::pipeline_drafts::ready(hub, caller, &repo, &mut d).await? } else { crate::ci::pipeline_drafts::discard(hub, caller, &repo, &mut d).await? }
         }
         "run" => {
+            // kiln's update draft runs by the hand of whoever may submit to its repository (pl-7).
+            if let Some(d) = update_draft(hub, &repo.name, path, body).await? {
+                if !caller.can("diffs.submit", &scope) {
+                    return Err((StatusCode::FORBIDDEN, format!("running kiln's update draft of {path} needs `diffs.submit` on {}", repo.name)));
+                }
+                let jobs: Vec<String> = body.get("jobs").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default();
+                let inputs = body.get("inputs").and_then(Value::as_object).cloned().unwrap_or_default();
+                let event = text("event").unwrap_or("push");
+                let out = crate::ci::uploads::draft_run(hub, &repo, &d, caller, event, &jobs, inputs).await?;
+                heard(&repo.name);
+                return Ok(srv::json(StatusCode::OK, &out));
+            }
             // The caller's draft of the file runs as their test; else the published workflow, by
             // hand (W29-R14).
             let (author, _) = crate::ci::diffs::author_of(&caller.name, Some(caller.kind));

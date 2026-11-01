@@ -10,6 +10,7 @@
 import * as React from "react";
 import { ChevronDown, FileText, Minus, Plus, Tag } from "lucide-react";
 import { ci, type CiDiagnostic, type CiPreview, type CiSchedule } from "@/api/ci";
+import { ApiError } from "@/api/client";
 import { shipApi, type ShipPipelineAct, type ShipPipelineGroup, type ShipPipelineLine, type ShipPipelinePane, type ShipPipelineRepo, type ShipPipelineRow, type ShipPipelineVerb } from "@/api/ship";
 import type { Diagnostic } from "@/components/code/editor";
 import { Toks } from "@/components/code/highlighted";
@@ -19,6 +20,7 @@ import { EmptyState, PageIntro } from "@/components/ui/misc";
 import { JourneyStrip, StatusGlyph } from "@/components/ui/status-glyph";
 import { GLYPHS, PIPELINE_STAGES, type GlyphState, type Pip } from "@/components/ui/status-glyph-spec";
 import { errorMessage, useMediaQuery } from "@/lib/hooks";
+import { lineDiff } from "@/lib/line-diff";
 import { jobsOf, planLines, whereWords, type PlanJob, type PlanLine } from "@/lib/plan-diff";
 import { manualInputs, spotOf, type ManualInput, type Spot } from "@/lib/pipeline-spot";
 import { TRIGGER_GROUPS, TRIGGER_KINDS, triggerKeys, triggerLines, type TriggerKind } from "@/lib/triggers";
@@ -749,7 +751,8 @@ function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: S
   const phone = useMediaQuery("(max-width: 700px)");
   const [picked, setPicked] = React.useState<Key | null>(null);
   const [said, setSaid] = React.useState<{ text: React.ReactNode; refused: boolean } | null>(null);
-  const [armed, setArmed] = React.useState<ShipPipelineVerb | null>(null);
+  // Release asked again in the strip (W29-R21): the tag picked, and, after a refusal, its why and Release anyway.
+  const [release, setRelease] = React.useState<{ verb: ShipPipelineVerb; tag: string; confirm: boolean; why: string | null } | null>(null);
   const [busy, setBusy] = React.useState(false);
   // Run's inputs as they're asked in the strip (W29-R14): each by its name, as typed or picked.
   const [asking, setAsking] = React.useState<Record<string, string> | null>(null);
@@ -796,10 +799,18 @@ function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: S
     words: triggers.find((t) => eventKey(t) === event) ? eventWords(triggers.find((t) => eventKey(t) === event) as ShipPipelineLine) : null,
     base: draft ? (published?.detail.text ?? null) : changed ? p.detail.text : null,
   };
+  // Who gets a tag: a tag is the whole repository's (W29-R21).
+  const sharing = (() => {
+    const published = repo.rows.filter((r) => !r.draft);
+    const actions = published.filter((r) => !["workflow", "reusable"].includes(r.kind)).length;
+    const calls = published.filter((r) => r.kind === "reusable").length;
+    const n = (k: number, one: string, many: string) => `${k === 1 ? "its" : `its ${k}`} ${k === 1 ? one : many}`;
+    return [actions ? n(actions, "action", "actions") : "", calls ? n(calls, "workflow", "workflows") : ""].filter(Boolean).join(" and ") || "its files";
+  })();
   const where = [h.path, h.dialect ? `${DIALECT_WORD[h.dialect] ?? h.dialect} dialect` : `${KIND_WORD[h.kind] ?? h.kind} action`, h.ref, h.commit.slice(0, 7)].filter(Boolean).join(" · ");
   const act = async (body: Omit<ShipPipelineAct, "repo" | "path">, done: React.ReactNode): Promise<boolean> => {
     setBusy(true);
-    setArmed(null);
+    setRelease(null);
     try {
       await shipApi.pipelinesAct({ repo: repo.repo, path: h.path, ...body });
       setSaid({ text: done, refused: false });
@@ -807,6 +818,45 @@ function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: S
     } catch (e) {
       setSaid({ text: errorMessage(e), refused: true });
       return false;
+    } finally {
+      setBusy(false);
+      pane.reload();
+      invalidate("ship/pipelines");
+    }
+  };
+  // A draft's verbs name it by its id: kiln's update draft is the repository's, not an author's (W29-R22).
+  const draftId = h.draft ? { draft: h.draft.id } : {};
+  // Release: its tag, moving its major's floating tag where the repository has one (W29-R21); a
+  // refusal over failing checks asks again, as Release anyway.
+  const floating = (tag: string) => p.groups.find((g) => g.name === "Versions")?.lines.some((l) => l.key === `versions.${tag.split(".")[0] ?? ""}`) ?? false;
+  const releaseNow = async () => {
+    if (!release) return;
+    setBusy(true);
+    try {
+      await shipApi.pipelinesAct({
+        repo: repo.repo,
+        path: h.path,
+        verb: "release",
+        sha: h.commit,
+        tag: release.tag,
+        ...(floating(release.tag) ? { major: true } : {}),
+        ...(release.confirm ? { confirm: true } : {}),
+      });
+      setRelease(null);
+      setSaid({
+        text: (
+          <>
+            Released <b>{release.tag}</b> at {h.commit.slice(0, 7)}: {sharing} have it.
+          </>
+        ),
+        refused: false,
+      });
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 409 && !release.confirm) setRelease({ ...release, confirm: true, why: e.message });
+      else {
+        setRelease(null);
+        setSaid({ text: errorMessage(e), refused: true });
+      }
     } finally {
       setBusy(false);
       pane.reload();
@@ -824,7 +874,7 @@ function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: S
     );
     setAsking(null);
     void act(
-      { verb: "run", ...(h.draft && event ? { event } : {}), ...(runInputs.length ? { inputs } : {}) },
+      { verb: "run", ...draftId, ...(h.draft && event ? { event } : {}), ...(runInputs.length ? { inputs } : {}) },
       <>
         Running <b>{h.title}</b> by hand{runInputs.length ? ` with ${runInputs.map((i) => `${i.name} ${String(inputs[i.name])}`).join(", ")}` : ""}:{" "}
         <Link to={`/ship/${repo.repo}/${h.commit}`}>its jobs</Link> show as it starts.
@@ -846,28 +896,38 @@ function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: S
         ).then((ok) => ok && edit(p.detail.text));
       case "ready":
         return void act(
-          { verb: "ready" },
+          { verb: "ready", ...draftId },
           <>
             Asked for <b>{h.title}</b>&apos;s review.
           </>,
         );
       case "discard":
         return void act(
-          { verb: "discard" },
+          { verb: "discard", ...draftId },
           <>
             Discarded the draft of <b>{h.title}</b>.
           </>,
         );
+      case "release":
+        return setRelease({ verb: v, tag: v.tags?.[0] ?? "", confirm: false, why: null });
       default:
-        return setArmed(v);
+        return setSaid({ text: `${v.label} isn't one this page knows yet`, refused: true });
     }
   };
   const say: React.ReactNode = asking ? (
     <>
       Run <b>{h.title}</b> by hand, with its inputs:
     </>
-  ) : armed ? (
-    (armed.asks ?? `${armed.label}?`)
+  ) : release ? (
+    release.why ? (
+      <>
+        {release.why} Release <b>{release.tag}</b> anyway?
+      </>
+    ) : (
+      <>
+        Release <b>{release.tag}</b> at {h.commit.slice(0, 7)}, {h.ref}&apos;s tip? The tag is {repo.repo.split("/").pop()}&apos;s: {sharing} all get {release.tag}.
+      </>
+    )
   ) : said ? (
     said.text
   ) : line?.kind === "add" ? (
@@ -892,16 +952,10 @@ function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: S
         { key: "keep", label: "Keep", enabled: true, keep: true, run: () => setAsking(null) },
         { key: "run", label: "Run", enabled: !busy, go: true, run: () => runNow(asking) },
       ]
-    : armed
+    : release
       ? [
-          { key: "keep", label: "Keep", enabled: true, keep: true, run: () => setArmed(null) },
-          {
-            key: armed.verb,
-            label: armed.label,
-            enabled: !busy,
-            go: true,
-            run: () => void act({ verb: armed.verb as ShipPipelineAct["verb"], sha: h.commit }, <>{armed.label}: asked of the server.</>),
-          },
+          { key: "keep", label: "Keep", enabled: true, keep: true, run: () => setRelease(null) },
+          { key: "release", label: release.confirm ? "Release anyway" : "Release", enabled: !busy && Boolean(release.tag), go: true, run: () => void releaseNow() },
         ]
       : p.strip.verbs.map((v) => {
           const why = whyNot(v);
@@ -910,7 +964,7 @@ function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: S
   const pick = (k: Key) => {
     setPicked(k);
     setSaid(null);
-    setArmed(null);
+    setRelease(null);
     setAsking(null);
   };
   // What the detail edits the file with: a change made (or refused, saying why), a kind added and picked.
@@ -950,11 +1004,23 @@ function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: S
       </div>
       <div className="jp">
         <div className="jp-strip">
-          <div className="jp-say" data-tone={armed ? "ask" : said?.refused ? "warn" : undefined}>
+          <div className="jp-say" data-tone={release ? "ask" : said?.refused ? "warn" : undefined}>
             <div className="jp-said" aria-live="polite">
               {say}
             </div>
-            {asking ? (
+            {release ? (
+              <div className="jp-q">
+                <span>as:</span>
+                {(release.verb.tags ?? []).map((t, i) => (
+                  <React.Fragment key={t}>
+                    {i ? <span aria-hidden>·</span> : null}
+                    <button type="button" aria-pressed={release.tag === t} onClick={() => setRelease({ ...release, tag: t, confirm: false, why: null })}>
+                      {t}
+                    </button>
+                  </React.Fragment>
+                ))}
+              </div>
+            ) : asking ? (
               <RunInputs inputs={runInputs} values={asking} onSet={(name, v) => setAsking({ ...asking, [name]: v })} />
             ) : line?.kind === "add" ? (
               <div className="jp-q">
@@ -994,7 +1060,7 @@ function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: S
               </div>
             )}
           </div>
-          <div className="jp-verbs ppl-verbs" data-armed={armed ? true : undefined}>
+          <div className="jp-verbs ppl-verbs" data-armed={release ? true : undefined}>
             {verbs.map((v) => (
               <button key={v.key} type="button" aria-disabled={!v.enabled || undefined} data-dim={v.dim || undefined} data-keep={v.keep || undefined} data-go={v.go || undefined} onClick={v.run}>
                 {v.label}
@@ -1441,7 +1507,7 @@ function View({
     case "Use":
       return line ? <UseView line={line} /> : null;
     case "Changes":
-      return <Lines lines={pane.groups.filter((g) => ["What changes for it", "Upstream", "Versions"].includes(g.name)).flatMap((g) => g.lines)} empty="Nothing has changed since its newest tag." />;
+      return <ChangesView pane={pane} text={text} ask={ask} />;
     default:
       return null;
   }
@@ -1571,6 +1637,81 @@ function YamlView({ pane, line, text, onText, ask }: { pane: ShipPipelinePane; l
       </div>
     </div>
   );
+}
+
+/**
+ * What changed (pl-5, pl-7): an action's commits since its newest release, and what releasing its
+ * head changes for those who use it; a draft's lines against what's published, and what it changes
+ * for its repository.
+ */
+function ChangesView({ pane, text, ask }: { pane: ShipPipelinePane; text: string; ask: PlanAsk }) {
+  const d = pane.detail;
+  const next = pane.strip.verbs.find((v) => v.verb === "release")?.tags?.[0];
+  if (d.since) {
+    const n = d.since.commits.length;
+    return (
+      <div className="ppl-changes">
+        <div className="jp-g">
+          <span>{n ? `${n === 1 ? "1 commit" : `${n} commits`} since ${d.since.tag}` : `nothing since ${d.since.tag}`}</span>
+          <span />
+        </div>
+        <ul className="ppl-lines" aria-label={`Commits since ${d.since.tag}`}>
+          {d.since.commits.map((c) => (
+            <li key={c.sha}>
+              <span className="ppl-sha">{c.sha}</span>
+              <span className="n">{c.subject}</span>
+              <span className="v">
+                {c.author} · {since(c.at)}
+              </span>
+            </li>
+          ))}
+        </ul>
+        {d.changes ? (
+          <>
+            <div className="jp-g">
+              <span>What {next ?? "a release"} changes for those who use it</span>
+              <span />
+            </div>
+            <Lines lines={d.changes} empty="Nothing they pass changes." />
+          </>
+        ) : null}
+      </div>
+    );
+  }
+  const what = pane.groups.filter((g) => ["What changes for it", "Upstream"].includes(g.name)).flatMap((g) => g.lines);
+  if (ask.base !== null) {
+    return (
+      <div className="ppl-changes">
+        <ol className="ppl-code ppl-diff" aria-label="Its lines against what's published">
+          {lineDiff(ask.base, text, 1).map((l, i) =>
+            l.kind === "gap" ? (
+              <li key={i} data-kind="gap">
+                <span className="ppl-ln" aria-hidden="true">
+                  ⋯
+                </span>
+                <code />
+              </li>
+            ) : (
+              <li key={i} data-kind={l.kind}>
+                <span className="ppl-ln">{l.now ?? l.old}</span>
+                <code>{l.text || " "}</code>
+              </li>
+            ),
+          )}
+        </ol>
+        {what.length ? (
+          <>
+            <div className="jp-g">
+              <span>What it changes for {pane.repo.split("/").pop()}</span>
+              <span />
+            </div>
+            <Lines lines={what} empty="" />
+          </>
+        ) : null}
+      </div>
+    );
+  }
+  return <Lines lines={pane.groups.filter((g) => ["What changes for it", "Upstream", "Versions"].includes(g.name)).flatMap((g) => g.lines)} empty="Nothing has changed since its newest tag." />;
 }
 
 /** Lines as the detail lists them: a glyph, the words, a value. */

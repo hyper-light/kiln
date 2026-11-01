@@ -78,6 +78,29 @@ pub fn tag_push(tag: &str, creates: bool, deletes: bool, released: bool, by_rele
     }
 }
 
+/// The versions Release offers after `newest` (W29-R21), the one what it changes calls for first:
+/// a major when it breaks what a consumer passes (an input removed, now required or new and
+/// required; a new secret; more permissions or egress), a minor when it adds (an input, an
+/// output), else a patch; then the other two, lowest first. With no release yet, `v0.1.0` then
+/// `v1.0.0`.
+pub fn next_versions(newest: Option<&str>, changes: &[crate::wf::diff::Change]) -> Vec<String> {
+    let Some((major, minor, patch, _)) = newest.and_then(full_version) else { return vec!["v0.1.0".to_owned(), "v1.0.0".to_owned()] };
+    let v = if newest.is_some_and(|t| t.starts_with('v')) { "v" } else { "" };
+    let breaks = changes.iter().any(|c| match (c.kind, c.what) {
+        ("input", "removed" | "now required") => true,
+        ("input", "added") => c.detail.as_deref() == Some("required"),
+        ("secret", "added") | ("permission", "added" | "changed") | ("egress", "added") => true,
+        _ => false,
+    });
+    let adds = changes.iter().any(|c| c.what == "added");
+    let (pat, min, maj) = (format!("{v}{major}.{minor}.{}", patch + 1), format!("{v}{major}.{}.0", minor + 1), format!("{v}{}.0.0", major + 1));
+    match (breaks, adds) {
+        (true, _) => vec![maj, pat, min],
+        (false, true) => vec![min, pat, maj],
+        (false, false) => vec![pat, min, maj],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,5 +146,17 @@ mod tests {
         for (creates, deletes) in [(true, false), (false, false), (false, true)] {
             assert_eq!(tag_push("nightly", creates, deletes, false, false), Ok(()));
         }
+    }
+
+    #[test]
+    fn w29_r21_the_next_version_is_what_it_changes_calls_for() {
+        use crate::wf::diff::Change;
+        let c = |kind: &'static str, what: &'static str, detail: Option<&str>| Change { kind, name: "x".into(), what, detail: detail.map(str::to_owned) };
+        assert_eq!(next_versions(Some("v2.4.0"), &[]), ["v2.4.1", "v2.5.0", "v3.0.0"]);
+        assert_eq!(next_versions(Some("v2.4.0"), &[c("input", "added", None)]), ["v2.5.0", "v2.4.1", "v3.0.0"]);
+        assert_eq!(next_versions(Some("v2.4.0"), &[c("input", "added", Some("required"))]), ["v3.0.0", "v2.4.1", "v2.5.0"]);
+        assert_eq!(next_versions(Some("2.4.0"), &[c("input", "removed", None)]), ["3.0.0", "2.4.1", "2.5.0"]);
+        assert_eq!(next_versions(Some("v1.0.0"), &[c("permission", "changed", Some("read → write"))]), ["v2.0.0", "v1.0.1", "v1.1.0"]);
+        assert_eq!(next_versions(None, &[]), ["v0.1.0", "v1.0.0"]);
     }
 }

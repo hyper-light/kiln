@@ -1771,3 +1771,26 @@
   gap: 4px 14px;
   padding: 8px 8px 4px;
 }
+/* What changed (pl-5, pl-7): commits since a release by their short hashes; a draft's lines against what's published, taken out struck through. */
+.ppl-sha {
+  flex: none;
+  color: #a6c4ed;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11px;
+}
+.ppl-diff {
+  height: auto;
+}
+.ppl-diff li[data-kind="del"] {
+  background: rgb(226 185 189 / 0.07);
+}
+.ppl-diff li[data-kind="del"] code {
+  color: #b38b8f;
+  text-decoration: line-through;
+}
+.ppl-diff li[data-kind="add"] {
+  background: rgb(191 220 207 / 0.07);
+}
+.ppl-diff li[data-kind="gap"] .ppl-ln {
+  color: #4f545e;
+}

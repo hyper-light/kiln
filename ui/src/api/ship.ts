@@ -252,6 +252,8 @@ export interface ShipPipelineVerb {
   why_not?: string;
   /** What it asks before it acts: Release's Keep · Release, saying what it changes (W29-R21). */
   asks?: string;
+  /** Release's versions, the one what it changes calls for first (W29-R21). */
+  tags?: string[];
 }
 
 export interface ShipPipelineStrip {
@@ -265,6 +267,10 @@ export interface ShipPipelineDetail {
   name: string;
   views: string[];
   text: string;
+  /** An action's or reusable workflow's newest release and the commits to it since (pl-5's Changes). */
+  since?: { tag: string; commits: { sha: string; subject: string; author: string; at: number }[] } | null;
+  /** What releasing its head changes for those who use it (W29-R21). */
+  changes?: ShipPipelineLine[] | null;
 }
 
 /** A workflow or action opened (W29-R04): `GET /api/ship/pipelines/{owner}/{name}?path=&ref=`. */
@@ -315,6 +321,8 @@ export interface ShipPipelineAct {
   from?: string | { starter: string } | { copy: string };
   files?: { path: string; text: string }[];
   dry?: boolean;
+  /** A draft by its id: kiln's update draft, the repository's (W29-R22). */
+  draft?: string;
 }
 
 /** Ship's Pipelines (W29-R03): the repositories the caller may read, each with its workflows and actions as rows. */

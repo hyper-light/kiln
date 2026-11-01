@@ -605,7 +605,7 @@ function verbsOf(row: ShipPipelineRow, byHand: boolean): ShipPipelineVerb[] {
   const update = d?.state === "update";
   const action = !["workflow", "reusable"].includes(row.kind);
   const run = d
-    ? mine
+    ? mine || update
       ? on("run", "Run")
       : dim("run", "Run", "A draft runs only by its author's hand (W29-R14)")
     : row.kind === "reusable"
@@ -616,7 +616,7 @@ function verbsOf(row: ShipPipelineRow, byHand: boolean): ShipPipelineVerb[] {
   const ready = !d
     ? dim("ready", "Ready", "Ready is for a draft (W29-R12)")
     : update
-      ? dim("ready", "Ready", "kiln's update drafts are reviewed as their change (W29-R22)")
+      ? on("ready", "Ready")
       : !mine
         ? dim("ready", "Ready", "Only its author marks it ready (W29-R12)")
         : d.state === "review"
@@ -625,7 +625,7 @@ function verbsOf(row: ShipPipelineRow, byHand: boolean): ShipPipelineVerb[] {
   const discard = !d
     ? dim("discard", "Discard", "Discard is for a draft (W29-R13)")
     : update
-      ? dim("discard", "Discard", "kiln's update drafts are reviewed as their change (W29-R22)")
+      ? on("discard", "Discard")
       : !mine
         ? dim("discard", "Discard", "Only its author discards it (W29-R13)")
         : on("discard", "Discard");
@@ -634,10 +634,29 @@ function verbsOf(row: ShipPipelineRow, byHand: boolean): ShipPipelineVerb[] {
     out.push(
       d
         ? dim("release", "Release", "A draft is released once it's published (W29-R21)")
-        : { ...on("release", "Release"), asks: "Keep · Release: for the workflows that use it, input `targets` added, optional" },
+        : {
+            ...on("release", "Release"),
+            asks: "Keep · Release: for the workflows that use it, input `targets` added, optional",
+            tags: row.released ? nextVersions(row.released) : ["v0.1.0", "v1.0.0"],
+          },
     );
   return out;
 }
+
+/** The versions Release offers after `tag`, as `kiln_ci::releases::next_versions` does for an optional input added: the minor first. */
+function nextVersions(tag: string): string[] {
+  const [maj, min, pat] = tag.replace(/^v/, "").split(".").map(Number);
+  return [`v${maj}.${(min ?? 0) + 1}.0`, `v${maj}.${min}.${(pat ?? 0) + 1}`, `v${(maj ?? 0) + 1}.0.0`];
+}
+
+/** An action's commits since its newest release, as the server's pane says them (pl-5). */
+const SINCE: Record<string, { sha: string; subject: string; author: string; at: number }[]> = {
+  "hyper-light/ci-kit:.github/actions/setup-rust": [
+    { sha: "e41a9c2", subject: "setup-rust: a targets input, for cross builds", author: "ada", at: ago(2 * H) },
+    { sha: "b07d1e9", subject: "setup-rust: cache the registry by Cargo.lock", author: "agent:01a19350 for ada", at: ago(D) },
+    { sha: "94c2f60", subject: "rust-check: clippy's warnings as annotations", author: "ada", at: ago(2 * D) },
+  ],
+};
 
 const KIND_WORDS: Record<string, string> = {
   workflow: "workflow",
@@ -667,7 +686,17 @@ function paneOf(repo: string, row: ShipPipelineRow): ShipPipelinePane {
     head: { title: row.name, path: row.path, kind: row.kind, dialect: row.dialect, ref: row.ref, commit: row.commit, draft: row.draft, stand: row.stand, word: row.word, pips: row.pips },
     strip: { said: [`${KIND_WORDS[row.kind] ?? row.kind} · ${row.line}`], pick: ["all"], verbs: verbsOf(row, byHand) },
     groups,
-    detail: { name: row.path, views: action ? ["Changes", "YAML", "Try it"] : ["YAML", "Flow", "Plan"], text },
+    detail: {
+      name: row.path,
+      views: action ? ["Changes", "YAML", "Try it"] : ["YAML", "Flow", "Plan"],
+      text,
+      ...(row.released && !row.draft && (action || row.kind === "reusable")
+        ? {
+            since: { tag: row.released, commits: SINCE[key] ?? [] },
+            changes: SINCE[key] ? [{ key: "changes.input.targets", kind: "change", name: "input targets", value: "added · optional: nothing they pass changes" }] : [],
+          }
+        : {}),
+    },
     repo,
   };
 }
@@ -918,6 +947,11 @@ export async function handlePipelines(req: http.IncomingMessage, res: http.Serve
       return true;
     }
     bodiesOf(ua).push(body);
+    // cache-cargo's checks failed at its head: Release says so, unless it's asked anyway (W29-R21).
+    if (body.verb === "release" && String(body.path).endsWith("cache-cargo") && body.confirm !== true) {
+      ctx.json(res, 409, { error: "ci-kit's checks failed on e41a9c2: rust-check · clippy." });
+      return true;
+    }
     ctx.json(res, 200, { ok: true, verb: body.verb ?? null });
     return true;
   }

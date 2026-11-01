@@ -1085,6 +1085,9 @@ pub struct Verb {
     /// What it asks before it acts (Release's Keep · Release, W29-R21): what it changes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub asks: Option<String>,
+    /// Release's versions, the one what it changes calls for first ([`crate::releases::next_versions`]).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 /// Who looks at a pane, for its verbs: their name, and whether they may submit changes to its
@@ -1105,14 +1108,16 @@ pub struct Viewer<'a> {
 /// - Ready and Discard: the draft's own author;
 /// - Release, for what's shared: dimmed until releases are built (W29-R21).
 pub fn verbs_for(row: &Row, viewer: Viewer<'_>, by_hand: bool) -> Vec<Verb> {
-    let on = |verb: &'static str, label: &'static str| Verb { verb, label, enabled: true, why_not: None, asks: None };
-    let dim = |verb: &'static str, label: &'static str, why: &'static str| Verb { verb, label, enabled: false, why_not: Some(why), asks: None };
+    let on = |verb: &'static str, label: &'static str| Verb { verb, label, enabled: true, why_not: None, asks: None, tags: Vec::new() };
+    let dim = |verb: &'static str, label: &'static str, why: &'static str| Verb { verb, label, enabled: false, why_not: Some(why), asks: None, tags: Vec::new() };
     let kind = row.facts.kind;
     let draft = row.draft.as_ref();
     let mine = draft.is_some_and(|d| d.author == viewer.name);
     let update = draft.is_some_and(|d| d.state == Draft::Update);
     let run = match draft {
         Some(_) if mine => on("run", "Run"),
+        // kiln's update drafts are the repository's: whoever may submit to it runs them (pl-7).
+        Some(_) if update && viewer.can_submit => on("run", "Run"),
         Some(_) => dim("run", "Run", "A draft runs only by its author's hand (W29-R14)"),
         None if kind == Kind::Reusable => dim("run", "Run", "A reusable workflow runs where it's called (W29-R14)"),
         None if kind == Kind::Workflow && !by_hand => dim("run", "Run", "It has no workflow_dispatch or manual trigger to run it by hand (W29-R14)"),
@@ -1121,14 +1126,16 @@ pub fn verbs_for(row: &Row, viewer: Viewer<'_>, by_hand: bool) -> Vec<Verb> {
     let save = if viewer.can_submit { on("save_draft", "Save draft") } else { dim("save_draft", "Save draft", "Saving a draft needs diffs.submit (W29-R11)") };
     let ready = match draft {
         None => dim("ready", "Ready", "Ready is for a draft (W29-R12)"),
-        Some(_) if update => dim("ready", "Ready", "kiln's update drafts are reviewed as their change (W29-R22)"),
+        Some(_) if update && viewer.can_submit => on("ready", "Ready"),
+        Some(_) if update => dim("ready", "Ready", "Marking kiln's update draft ready needs diffs.submit (W29-R22)"),
         Some(_) if !mine => dim("ready", "Ready", "Only its author marks it ready (W29-R12)"),
         Some(d) if d.state == Draft::Review => dim("ready", "Ready", "It's in review already (W29-R12)"),
         Some(_) => on("ready", "Ready"),
     };
     let discard = match draft {
         None => dim("discard", "Discard", "Discard is for a draft (W29-R13)"),
-        Some(_) if update => dim("discard", "Discard", "kiln's update drafts are reviewed as their change (W29-R22)"),
+        Some(_) if update && viewer.can_submit => on("discard", "Discard"),
+        Some(_) if update => dim("discard", "Discard", "Discarding kiln's update draft needs diffs.submit (W29-R22)"),
         Some(_) if !mine => dim("discard", "Discard", "Only its author discards it (W29-R13)"),
         Some(_) => on("discard", "Discard"),
     };
@@ -1157,6 +1164,25 @@ pub struct Opened<'a> {
     pub by_hand: bool,
     /// What its next release changes for its consumers, since its newest (W29-R21, R22).
     pub changes: Option<&'a [crate::wf::diff::Change]>,
+    /// Its newest release and the commits to its files since (pl-5's Changes view).
+    pub since: Option<Since<'a>>,
+}
+
+/// An action's or reusable workflow's commits since its newest release (W29-R21): what Release
+/// would tag.
+#[derive(Debug, Clone, Copy)]
+pub struct Since<'a> {
+    pub tag: &'a str,
+    pub commits: &'a [SinceCommit],
+}
+
+/// One commit since a release: its short hash, subject, author and time (seconds).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SinceCommit {
+    pub sha: String,
+    pub subject: String,
+    pub author: String,
+    pub at: i64,
 }
 
 /// Release's Keep · Release words: what releasing the head changes for its consumers (W29-R21).
@@ -1207,12 +1233,17 @@ pub fn pane_json(o: &Opened<'_>, groups: &[PaneGroup]) -> Value {
             "verbs": verbs_for(row, o.viewer, o.by_hand).into_iter().map(|mut v| {
                 if v.verb == "release" && v.enabled {
                     v.asks = o.changes.map(release_asks);
+                    v.tags = crate::releases::next_versions(f.released.as_deref(), o.changes.unwrap_or_default());
                 }
                 v
             }).collect::<Vec<_>>(),
         },
         "groups": groups,
-        "detail": { "name": f.path, "views": views, "text": o.text },
+        "detail": {
+            "name": f.path, "views": views, "text": o.text,
+            "since": o.since.map(|s| json!({ "tag": s.tag, "commits": s.commits })),
+            "changes": o.changes.filter(|_| o.since.is_some()).map(change_lines),
+        },
         "repo": o.repo,
     })
 }
@@ -1552,14 +1583,16 @@ mod tests {
         assert_eq!(on(&wf, sam, true), ["run", "save_draft"]);
         assert_eq!(on(&wf, sam, false), ["save_draft"]);
         assert_eq!(on(&wf, reader, true), ["run"], "reading isn't submitting");
-        // A reusable workflow runs where it's called; an action runs by Try it; kiln's update drafts wait.
+        // A reusable workflow runs where it's called; an action runs by Try it.
         let reusable = Row::new(facts(Kind::Reusable), Some("gha"), String::new(), None, None);
         assert!(on(&reusable, ada, true).iter().all(|v| *v != "run"));
         // Release, for one who may land on it (W29-R21).
         assert!(on(&reusable, ada, false).contains(&"release"));
         assert!(said(&reusable, sam, false).iter().any(|(v, enabled, why)| *v == "release" && !enabled && why.is_some_and(|w| w.contains("diffs.land"))));
         assert!(on(&Row::new(facts(Kind::Composite), None, String::new(), None, None), ada, false).contains(&"run"));
-        assert_eq!(on(&update, ada, false), ["save_draft"]);
+        // kiln's update drafts are the repository's (pl-7): whoever may submit runs, readies or discards them.
+        assert_eq!(on(&update, ada, false), ["run", "save_draft", "ready", "discard"]);
+        assert!(on(&update, reader, false).is_empty());
         // Never hidden: each verb is there, and each one off says why.
         for (row, v) in [(&saved, ada), (&review, sam), (&wf, reader), (&update, sam), (&reusable, reader)] {
             let all = said(row, v, false);
