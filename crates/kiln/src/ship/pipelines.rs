@@ -1,7 +1,8 @@
 //! Ship's Pipelines (docs/ci.md W29-R01 to R03): every workflow, reusable workflow and action at
 //! each repository's default-branch head, as Ship's rows by repository, what needs someone first.
 //! Where each row stands is `kiln_ci::pipelines`'s to say: this gathers what it decides from (the
-//! head's files, their runs on that branch, the runners, the tags) and shapes the JSON.
+//! head's files, their runs on that branch, the runners, the tags), and `kiln_ci::pipelines`
+//! shapes the JSON too.
 //!
 //! The rows are held in memory, as Ship's commits are. A repository's are gathered again once a run
 //! or a job of it is heard on the events socket, or a push to it ([`heard`]), and at most
@@ -14,10 +15,10 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use http::StatusCode;
-use kiln_ci::pipelines::{self as core, Facts, Kind, Outcome, Standing};
+use kiln_ci::pipelines::{self as core, Facts, Kind, Outcome, Row};
 use kiln_ci::wf;
 use parking_lot::Mutex;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use super::Fail;
 use crate::http::server::{self as srv, Response};
@@ -33,25 +34,10 @@ const LOG_LOOK: &str = "400";
 /// How long after something is heard its repository is gathered again, so a burst gathers once.
 const SETTLE: Duration = Duration::from_millis(500);
 
-/// A row as gathered: what `kiln_ci::pipelines` decides from, and what the row shows besides.
-#[derive(Debug, Clone)]
-struct Row {
-    facts: Facts,
-    /// A workflow's dialect: `gha` or `kiln`.
-    dialect: Option<&'static str>,
-    line: String,
-    /// Who changed its file last, and when (seconds).
-    who: Option<String>,
-    when: Option<i64>,
-}
-
 /// A repository's rows as last gathered, at its default branch's head.
 #[derive(Debug, Clone)]
 struct Held {
-    repo: String,
-    branch: String,
-    sha: String,
-    rows: Vec<(Row, Standing)>,
+    view: core::Repo,
     at: Instant,
     /// What its rows show, hashed: a gather that changes it sends `pipelines`.
     digest: u64,
@@ -264,7 +250,7 @@ async fn gather(hub: &Hub, repo: &Repo, env: &Env) -> anyhow::Result<Option<Held
         };
         let line = workflow_line(l, kind, &commit.github_note);
         let (who, when) = changes.get(&l.path).cloned().map_or((None, None), |(w, t)| (Some(w), Some(t)));
-        rows.push(Row { facts, dialect: Some(if l.dialect == kiln_ci::expr::Dialect::Kiln { "kiln" } else { "gha" }), line, who, when });
+        rows.push(Row::new(facts, Some(if l.dialect == kiln_ci::expr::Dialect::Kiln { "kiln" } else { "gha" }), line, who, when));
     }
     for path in &commit.actions {
         let text = crate::ci::load::blob(hub, repo, &sha, path).await.unwrap_or_default();
@@ -292,18 +278,11 @@ async fn gather(hub: &Hub, repo: &Repo, env: &Env) -> anyhow::Result<Option<Held
         let line = action_line(kind, action.as_ref(), errors, routable, released.as_deref());
         // An action is its folder: a change to any of its files is a change to it.
         let (who, when) = changes.get_folder(folder).map_or((None, None), |(w, t)| (Some(w), Some(t)));
-        rows.push(Row { facts, dialect: None, line, who, when });
+        rows.push(Row::new(facts, None, line, who, when));
     }
-    let mut rows: Vec<(Row, Standing)> = rows
-        .into_iter()
-        .map(|r| {
-            let s = core::standing(&r.facts);
-            (r, s)
-        })
-        .collect();
-    order(&mut rows);
-    let digest = digest_of(&rows_json(&repo.name, &branch, &sha, &rows));
-    Ok(Some(Held { repo: repo.name.clone(), branch, sha, rows, at: Instant::now(), digest }))
+    let view = core::Repo::new(repo.name.clone(), branch, sha, rows);
+    let digest = view.digest;
+    Ok(Some(Held { view, at: Instant::now(), digest }))
 }
 
 /// What `git -C dir <args>` prints, or nothing when it fails: what it reads is the repository's
@@ -314,13 +293,6 @@ async fn git(hub: &Hub, dir: &str, args: &[&str]) -> String {
     crate::gitops::run_git(hub, &a, crate::gitops::LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).into_owned()).unwrap_or_default()
 }
 
-/// The rows in W29-R02's order, as `kiln_ci::pipelines::order` puts them.
-fn order(rows: &mut Vec<(Row, Standing)>) {
-    let mut pairs: Vec<(Facts, Standing)> = rows.iter().map(|(r, s)| (r.facts.clone(), *s)).collect();
-    core::order(&mut pairs);
-    let mut by_path: HashMap<String, (Row, Standing)> = rows.drain(..).map(|(r, s)| (r.facts.path.clone(), (r, s))).collect();
-    rows.extend(pairs.iter().filter_map(|(f, _)| by_path.remove(&f.path)));
-}
 
 /// A file's name without its folder and extension: `.kiln/ci.yaml` is `ci`.
 fn stem_of(path: &str) -> String {
@@ -475,82 +447,6 @@ fn action_line(kind: Kind, action: Option<&wf::Action>, errors: usize, routable:
     parts.join(" · ")
 }
 
-fn rows_json(repo: &str, branch: &str, sha: &str, rows: &[(Row, Standing)]) -> Vec<Value> {
-    rows.iter()
-        .map(|(r, s)| {
-            super::with_version(json!({
-                "key": format!("{repo}:{}", r.facts.path),
-                "kind": r.facts.kind,
-                "dialect": r.dialect,
-                "name": r.facts.name,
-                "path": r.facts.path,
-                "stand": s.stand,
-                "word": s.word,
-                "line": r.line,
-                "pips": s.pips,
-                "who": r.who,
-                "when": r.when,
-                "ref": branch,
-                "commit": sha,
-                "released": r.facts.released,
-                // W29-R10's draft, the master plan's step 4.
-                "draft": Value::Null,
-            }))
-        })
-        .collect()
-}
-
-/// FNV-1a over the rows' JSON, as Ship's rows' `v` is made.
-fn digest_of(rows: &[Value]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for r in rows {
-        for b in r.to_string().as_bytes() {
-            h ^= u64::from(*b);
-            h = h.wrapping_mul(0x0100_0000_01b3);
-        }
-    }
-    h
-}
-
-/// Whether a row is one `q` asks for: its name, path, kind or word has it, any case.
-fn matches(r: &Row, s: &Standing, q: &str) -> bool {
-    let kind = serde_json::to_value(r.facts.kind).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default();
-    [r.facts.name.as_str(), r.facts.path.as_str(), kind.as_str(), s.word].iter().any(|v| v.to_lowercase().contains(q))
-}
-
-/// A repository as the list shows it, or `None` when `q` leaves it no rows.
-fn repo_json(h: &Held, q: Option<&str>) -> Option<Value> {
-    let rows: Vec<(Row, Standing)> = h.rows.iter().filter(|(r, s)| q.is_none_or(|q| matches(r, s, q) || h.repo.to_lowercase().contains(q))).cloned().collect();
-    if rows.is_empty() && q.is_some() {
-        return None;
-    }
-    let pairs: Vec<(Facts, Standing)> = h.rows.iter().map(|(r, s)| (r.facts.clone(), *s)).collect();
-    // W29-R17's Access is the master plan's step 5: until then nothing is shared.
-    let (say, needs) = core::heading(&pairs, false);
-    Some(json!({
-        "repo": h.repo,
-        "say": say,
-        "needs": needs,
-        "access": "none",
-        "ref": h.branch,
-        "commit": h.sha,
-        "rows": rows_json(&h.repo, &h.branch, &h.sha, &rows),
-    }))
-}
-
-/// The list's JSON from held rows: the repositories the caller may read (`only`: their names, or
-/// `None` for every one), `repo` alone when it's given, those with rows needing someone first.
-fn list_json(held: &[Arc<Held>], only: Option<&[String]>, repo: Option<&str>, q: Option<&str>) -> Value {
-    let mut repos: Vec<(u32, String, Value)> = held
-        .iter()
-        .filter(|h| only.is_none_or(|names| names.iter().any(|n| n == &h.repo)))
-        .filter(|h| repo.is_none_or(|r| r == h.repo))
-        .filter_map(|h| repo_json(h, q).map(|v| (v.get("needs").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()).unwrap_or(0), h.repo.clone(), v)))
-        .collect();
-    repos.sort_by(|a, b| (b.0 > 0).cmp(&(a.0 > 0)).then_with(|| a.1.cmp(&b.1)));
-    json!({ "repos": repos.into_iter().map(|(_, _, v)| v).collect::<Vec<_>>() })
-}
-
 /// `GET /api/ship/pipelines?q=&repo=` (W29-R03): the repositories the caller may read
 /// (`runs.read`), each with its heading's words and its rows, from memory.
 pub async fn list(hub: &Arc<Hub>, q: &HashMap<String, String>, caller: &crate::authz::Caller) -> Result<Response, Fail> {
@@ -560,7 +456,9 @@ pub async fn list(hub: &Arc<Hub>, q: &HashMap<String, String>, caller: &crate::a
     let held = m.fresh(hub).await;
     let repo = q.get("repo").map(String::as_str).filter(|r| !r.is_empty());
     let text = q.get("q").map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty());
-    Ok(srv::json(StatusCode::OK, &list_json(&held, only.as_deref(), repo, text.as_deref())))
+    // Each repository's JSON was rendered when it was gathered: the list joins them.
+    let body = core::list_text(held.iter().map(|h| &h.view), only.as_deref(), repo, text.as_deref());
+    Ok(srv::response(StatusCode::OK, "application/json", srv::full(body)))
 }
 
 #[cfg(test)]
@@ -588,39 +486,5 @@ mod tests {
         assert_eq!(together(&["succeeded".into(), "failed".into()]), (Some(Outcome::Failed), false));
         assert_eq!(together(&["succeeded".into(), "queued".into()]), (Some(Outcome::Passed), true));
         assert_eq!(together(&[]), (None, false));
-    }
-
-    fn held(repo: usize, rows: usize) -> Arc<Held> {
-        let name = format!("acme/r{repo:03}");
-        let rows: Vec<(Row, Standing)> = (0..rows)
-            .map(|i| {
-                let facts = Facts { kind: if i % 3 == 0 { Kind::Composite } else { Kind::Workflow }, name: format!("w{i}"), path: format!(".kiln/w{i}.yaml"), runs: true, routable: Some(true), latest: Some(if i % 7 == 0 { Outcome::Failed } else { Outcome::Passed }), ..Facts::default() };
-                let s = core::standing(&facts);
-                (Row { facts, dialect: Some("kiln"), line: "push, pull request · 4 jobs".into(), who: Some("ada".into()), when: Some(1_700_000_000) }, s)
-            })
-            .collect();
-        Arc::new(Held { repo: name, branch: "main".into(), sha: "a3f2c1d4e5f60718293a4b5c6d7e8f9012345678".into(), rows, at: Instant::now(), digest: 0 })
-    }
-
-    /// W29-AC03: the list answered from memory, 200 repositories and 2,000 rows, within 50 ms at
-    /// p99 in a release build. A debug build measures and says what it found, without the bound.
-    #[test]
-    fn w29_ac03_the_list_from_memory() {
-        let all: Vec<Arc<Held>> = (0..200).map(|r| held(r, 10)).collect();
-        let only: Vec<String> = all.iter().map(|h| h.repo.clone()).collect();
-        let mut took: Vec<Duration> = Vec::new();
-        for _ in 0..100 {
-            let t = Instant::now();
-            let v = list_json(&all, Some(&only), None, None);
-            let body = v.to_string();
-            took.push(t.elapsed());
-            assert!(body.len() > 100_000, "{}", body.len());
-        }
-        took.sort();
-        let p99 = took.get(98).copied().unwrap_or_default();
-        println!("W29-AC03: list from memory, 200 repositories, 2,000 rows: p99 {p99:?}");
-        if !cfg!(debug_assertions) {
-            assert!(p99 <= Duration::from_millis(50), "p99 {p99:?}");
-        }
     }
 }

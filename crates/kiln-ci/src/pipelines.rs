@@ -1,12 +1,14 @@
 //! Ship's Pipelines (docs/ci.md W29-R02 to R04): what each workflow, reusable workflow and action
-//! is, where it stands, its three pips and its place among its repository's rows; and, for an
-//! opened row's pane, each trigger's group and words and each job's stage. Decided from what the
-//! server gathers and passes in (`crates/kiln/src/ship/pipelines.rs`): nothing here reads a clock,
-//! a disk or the network.
+//! is, where it stands, its three pips and its place among its repository's rows, and the list's
+//! JSON; and, for an opened row's pane, each trigger's group and words and each job's stage. Decided
+//! from what the server gathers and passes in (`crates/kiln/src/ship/pipelines.rs`): nothing here
+//! reads a clock, a disk or the network.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use serde::Serialize;
+use serde_json::{Value, json};
 
 use crate::wf::ir::Trigger;
 use crate::wf::{Action, Workflow};
@@ -52,6 +54,20 @@ impl Kind {
 
     pub fn is_action(self) -> bool {
         !matches!(self, Kind::Workflow | Kind::Reusable)
+    }
+
+    /// Its name in the JSON, as it serializes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Kind::Workflow => "workflow",
+            Kind::Reusable => "reusable",
+            Kind::Composite => "composite",
+            Kind::Javascript => "javascript",
+            Kind::Docker => "docker",
+            Kind::Firecracker => "firecracker",
+            Kind::Shards => "shards",
+            Kind::Unknown => "unknown",
+        }
     }
 
     /// What a row's line calls it.
@@ -405,34 +421,41 @@ pub fn newest_release<'a>(tags: impl IntoIterator<Item = &'a str>) -> Option<&'a
         .map(|(_, t)| t)
 }
 
-/// A repository's rows in W29-R02's order: what needs someone first (Review, then Failing, then
-/// Can't run), then drafts, then the rest; each by name (any case), then by path.
-pub fn order(rows: &mut [(Facts, Standing)]) {
+/// Which of two rows comes first in W29-R02's order: what needs someone first (Review, then
+/// Failing, then Can't run), then drafts, then the rest; each by name (any case), then by path.
+fn before(fa: &Facts, sa: &Standing, fb: &Facts, sb: &Standing) -> Ordering {
     let need = |s: &Standing| match s.word {
         "Review" => 0,
         "Failing" => 1,
         "Can't run" => 2,
         _ => 3,
     };
-    rows.sort_by(|(fa, sa), (fb, sb)| {
-        sa.rank.cmp(&sb.rank).then_with(|| need(sa).cmp(&need(sb))).then_with(|| fa.name.to_lowercase().cmp(&fb.name.to_lowercase())).then_with(|| fa.path.cmp(&fb.path))
-    });
+    sa.rank.cmp(&sb.rank).then_with(|| need(sa).cmp(&need(sb))).then_with(|| fa.name.to_lowercase().cmp(&fb.name.to_lowercase())).then_with(|| fa.path.cmp(&fb.path))
+}
+
+/// A repository's rows in W29-R02's order.
+pub fn order(rows: &mut [(Facts, Standing)]) {
+    rows.sort_by(|(fa, sa), (fb, sb)| before(fa, sa, fb, sb));
 }
 
 /// A repository's heading words (W29-R02): `7 workflows · 1 failing · 1 waits on you`,
 /// `shared · 6 actions · 1 workflow · 1 draft`, or `3 workflows · ci-kit v2.4.0 is out` (an update
 /// draft's); and how many of its rows need someone.
 pub fn heading(rows: &[(Facts, Standing)], shared: bool) -> (String, u32) {
-    let count = |p: &dyn Fn(&(Facts, Standing)) -> bool| rows.iter().filter(|r| p(r)).count();
-    let workflows = count(&|(f, _)| !f.kind.is_action());
-    let actions = count(&|(f, _)| f.kind.is_action());
-    let drafts = count(&|(f, _)| matches!(f.draft, Some(Draft::NotSaved | Draft::Unpublished)));
-    let mut out: Vec<&str> = rows.iter().filter(|(f, _)| f.draft == Some(Draft::Update)).filter_map(|(f, _)| f.update.as_deref()).collect();
+    heading_of(rows.iter().map(|(f, s)| (f, s)), shared)
+}
+
+fn heading_of<'a>(rows: impl Iterator<Item = (&'a Facts, &'a Standing)> + Clone, shared: bool) -> (String, u32) {
+    let count = |p: &dyn Fn(&Facts, &Standing) -> bool| rows.clone().filter(|(f, s)| p(f, s)).count();
+    let workflows = count(&|f, _| !f.kind.is_action());
+    let actions = count(&|f, _| f.kind.is_action());
+    let drafts = count(&|f, _| matches!(f.draft, Some(Draft::NotSaved | Draft::Unpublished)));
+    let mut out: Vec<&str> = rows.clone().filter(|(f, _)| f.draft == Some(Draft::Update)).filter_map(|(f, _)| f.update.as_deref()).collect();
     out.sort_unstable();
     out.dedup();
-    let failing = count(&|(_, s)| s.stand == "failing");
-    let waits = count(&|(f, _)| f.draft == Some(Draft::Review));
-    let needs = count(&|(_, s)| s.rank == 0);
+    let failing = count(&|_, s| s.stand == "failing");
+    let waits = count(&|f, _| f.draft == Some(Draft::Review));
+    let needs = count(&|_, s| s.rank == 0);
     let n = |k: usize, one: &str, many: &str| format!("{k} {}", if k == 1 { one } else { many });
     let mut parts: Vec<String> = Vec::new();
     if shared {
@@ -455,6 +478,153 @@ pub fn heading(rows: &[(Facts, Standing)], shared: bool) -> (String, u32) {
         parts.push(n(waits, "waits on you", "wait on you"));
     }
     (parts.join(" · "), u32::try_from(needs).unwrap_or(u32::MAX))
+}
+
+/// A row as the list shows it: its facts and where it stands, and what the server read besides.
+#[derive(Debug, Clone)]
+pub struct Row {
+    pub facts: Facts,
+    pub standing: Standing,
+    /// A workflow's dialect: `gha` or `kiln`.
+    pub dialect: Option<&'static str>,
+    pub line: String,
+    /// Who changed its file last, and when (seconds).
+    pub who: Option<String>,
+    pub when: Option<i64>,
+}
+
+impl Row {
+    pub fn new(facts: Facts, dialect: Option<&'static str>, line: String, who: Option<String>, when: Option<i64>) -> Row {
+        let standing = standing(&facts);
+        Row { facts, standing, dialect, line, who, when }
+    }
+}
+
+/// A repository's rows at its default branch's head, as gathered: each row's JSON and the
+/// repository's whole are rendered once here, so the list answers from memory by joining them.
+#[derive(Debug, Clone)]
+pub struct Repo {
+    pub repo: String,
+    pub branch: String,
+    pub sha: String,
+    /// In W29-R02's order.
+    pub rows: Vec<Row>,
+    /// Each row's JSON, in the same order.
+    pub rendered: Vec<String>,
+    /// Its heading's words, and how many of its rows need someone.
+    pub say: String,
+    pub needs: u32,
+    /// Its JSON with every row (W29-R03's `ShipPipelineRepo`).
+    pub whole: String,
+    /// What it shows, hashed: a gather that changes it sends `pipelines`.
+    pub digest: u64,
+}
+
+impl Repo {
+    pub fn new(repo: String, branch: String, sha: String, mut rows: Vec<Row>) -> Repo {
+        order_rows(&mut rows);
+        let rendered: Vec<String> = rows.iter().map(|r| row_json(&repo, &branch, &sha, r).to_string()).collect();
+        // W29-R17's Access is the master plan's step 5: until then nothing is shared.
+        let (say, needs) = heading_of(rows.iter().map(|r| (&r.facts, &r.standing)), false);
+        let mut r = Repo { repo, branch, sha, rows, rendered, say, needs, whole: String::new(), digest: 0 };
+        r.whole = r.text(r.rendered.iter().map(String::as_str));
+        r.digest = fnv(FNV_START, r.whole.as_bytes());
+        r
+    }
+
+    /// Its JSON with these of its rows' JSON.
+    fn text<'a>(&self, rows: impl Iterator<Item = &'a str>) -> String {
+        let head = json!({ "repo": self.repo, "say": self.say, "needs": self.needs, "access": "none", "ref": self.branch, "commit": self.sha }).to_string();
+        let mut out = String::with_capacity(head.len() + self.rendered.iter().map(String::len).sum::<usize>() + self.rendered.len() + 16);
+        out.push_str(head.strip_suffix('}').unwrap_or(&head));
+        out.push_str(",\"rows\":[");
+        for (i, r) in rows.enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(r);
+        }
+        out.push_str("]}");
+        out
+    }
+}
+
+/// Rows in W29-R02's order.
+pub fn order_rows(rows: &mut [Row]) {
+    rows.sort_by(|a, b| before(&a.facts, &a.standing, &b.facts, &b.standing));
+}
+
+/// FNV-1a, 64 bits, over `bytes`, as Ship's rows' `v` is made.
+fn fnv(h: u64, bytes: &[u8]) -> u64 {
+    bytes.iter().fold(h, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3))
+}
+
+const FNV_START: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// A row's JSON, with `v`: a hash of what it shows, so the page can keep a row that hasn't changed
+/// as it is (W26-R06's).
+pub fn row_json(repo: &str, branch: &str, sha: &str, r: &Row) -> Value {
+    let mut v = json!({
+        "key": format!("{repo}:{}", r.facts.path),
+        "kind": r.facts.kind.as_str(),
+        "dialect": r.dialect,
+        "name": r.facts.name,
+        "path": r.facts.path,
+        "stand": r.standing.stand,
+        "word": r.standing.word,
+        "line": r.line,
+        "pips": r.standing.pips,
+        "who": r.who,
+        "when": r.when,
+        "ref": branch,
+        "commit": sha,
+        "released": r.facts.released,
+        // W29-R10's draft: the master plan's step 4.
+        "draft": Value::Null,
+    });
+    let h = fnv(FNV_START, v.to_string().as_bytes());
+    if let Some(o) = v.as_object_mut() {
+        o.insert("v".into(), json!(format!("{h:016x}")));
+    }
+    v
+}
+
+/// Whether a row is one `q` (lowercased) asks for: its name, path, kind or word has it, any case.
+fn row_matches(r: &Row, q: &str) -> bool {
+    [r.facts.name.as_str(), r.facts.path.as_str(), r.facts.kind.as_str(), r.standing.word].iter().any(|v| v.to_lowercase().contains(q))
+}
+
+/// The list's JSON (W29-R03, `{ repos: ShipPipelineRepo[] }`): the repositories the caller may read
+/// (`only`: their names, or `None` for every one), `repo` alone when it's given, and, with `q`
+/// (lowercased), the rows it asks for; those with rows needing someone first, then by name. What
+/// was rendered when the rows were gathered is joined as it is.
+pub fn list_text<'a>(repos: impl IntoIterator<Item = &'a Repo>, only: Option<&[String]>, repo: Option<&str>, q: Option<&str>) -> String {
+    let mut out: Vec<(bool, &str, std::borrow::Cow<'a, str>)> = Vec::new();
+    for r in repos.into_iter().filter(|r| only.is_none_or(|names| names.iter().any(|n| n == &r.repo))).filter(|r| repo.is_none_or(|want| want == r.repo)) {
+        let text = match q {
+            None => std::borrow::Cow::Borrowed(r.whole.as_str()),
+            Some(q) if r.repo.to_lowercase().contains(q) => std::borrow::Cow::Borrowed(r.whole.as_str()),
+            Some(q) => {
+                let rows: Vec<&str> = r.rows.iter().zip(&r.rendered).filter(|(row, _)| row_matches(row, q)).map(|(_, j)| j.as_str()).collect();
+                if rows.is_empty() {
+                    continue;
+                }
+                std::borrow::Cow::Owned(r.text(rows.into_iter()))
+            }
+        };
+        out.push((r.needs > 0, r.repo.as_str(), text));
+    }
+    out.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+    let mut body = String::with_capacity(out.iter().map(|(_, _, t)| t.len() + 1).sum::<usize>() + 16);
+    body.push_str("{\"repos\":[");
+    for (i, (_, _, t)) in out.iter().enumerate() {
+        if i > 0 {
+            body.push(',');
+        }
+        body.push_str(t);
+    }
+    body.push_str("]}");
+    body
 }
 
 #[cfg(test)]
@@ -578,6 +748,66 @@ mod tests {
             row("rust-check", Facts { released: Some("v2.4.0".into()), ..facts(Kind::Reusable) }),
         ];
         assert_eq!(heading(&lib, true), ("shared · 3 actions · 1 workflow · 1 draft".to_owned(), 0));
+    }
+
+    fn list_repo(n: usize, rows: usize) -> Repo {
+        let rows: Vec<Row> = (0..rows)
+            .map(|i| {
+                let facts = Facts { kind: if i % 3 == 0 { Kind::Composite } else { Kind::Workflow }, name: format!("w{i}"), path: format!(".kiln/w{i}.yaml"), runs: true, routable: Some(true), latest: Some(if i % 7 == 0 { Outcome::Failed } else { Outcome::Passed }), ..Facts::default() };
+                Row::new(facts, Some("kiln"), "push, pull request · 4 jobs".into(), Some("ada".into()), Some(1_700_000_000))
+            })
+            .collect();
+        Repo::new(format!("acme/r{n:03}"), "main".into(), "a3f2c1d4e5f60718293a4b5c6d7e8f9012345678".into(), rows)
+    }
+
+    fn list(repos: &[Repo], only: Option<&[String]>, repo: Option<&str>, q: Option<&str>) -> Value {
+        serde_json::from_str(&list_text(repos, only, repo, q)).unwrap_or_default()
+    }
+
+    #[test]
+    fn w29_r03_the_list_and_what_it_shows() {
+        let repos = vec![list_repo(1, 3), list_repo(0, 7)];
+        let only = vec!["acme/r000".to_owned()];
+        let v = list(&repos, Some(&only), None, None);
+        let names: Vec<&str> = v.pointer("/repos").and_then(Value::as_array).map(|a| a.iter().filter_map(|r| r.get("repo").and_then(Value::as_str)).collect()).unwrap_or_default();
+        assert_eq!(names, ["acme/r000"], "only what the caller may read");
+        let r = v.pointer("/repos/0").cloned().unwrap_or_default();
+        assert_eq!(r.get("say").and_then(Value::as_str), Some("4 workflows · 3 actions · 1 failing"), "{r}");
+        assert_eq!(r.pointer("/rows/0/word").and_then(Value::as_str), Some("Failing"), "needs someone first: {r}");
+        for key in ["key", "kind", "dialect", "name", "path", "stand", "word", "line", "pips", "who", "when", "ref", "commit", "draft", "v"] {
+            assert!(r.pointer("/rows/0").and_then(|row| row.get(key)).is_some(), "{key}: {r}");
+        }
+        let both = list(&repos, None, None, None);
+        let first: Vec<&str> = both.pointer("/repos").and_then(Value::as_array).map(|a| a.iter().filter_map(|r| r.get("repo").and_then(Value::as_str)).collect()).unwrap_or_default();
+        assert_eq!(first, ["acme/r000", "acme/r001"], "the one needing someone first, then by name");
+        assert_eq!(list(&repos, None, Some("acme/r001"), None).pointer("/repos").and_then(Value::as_array).map(Vec::len), Some(1));
+        let asked = list(&repos, None, None, Some("w2"));
+        assert_eq!(asked.pointer("/repos/0/rows").and_then(Value::as_array).map(Vec::len), Some(1), "{asked}");
+        assert_eq!(list(&repos, None, None, Some("nothing")).pointer("/repos").and_then(Value::as_array).map(Vec::len), Some(0));
+        assert_eq!(list_repo(1, 3).digest, list_repo(1, 3).digest, "the same rows, the same digest");
+        assert_ne!(list_repo(1, 3).digest, list_repo(1, 4).digest, "a row more is another digest");
+    }
+
+    /// W29-AC03: the list answered from memory, 200 repositories and 2,000 rows, within 50 ms at p99
+    /// in a release build (`cargo test --release -p kiln-ci --lib pipelines`). A debug build measures
+    /// and says what it found, without the bound.
+    #[test]
+    fn w29_ac03_the_list_from_memory() {
+        let all: Vec<Repo> = (0..200).map(|r| list_repo(r, 10)).collect();
+        let only: Vec<String> = all.iter().map(|r| r.repo.clone()).collect();
+        let mut took: Vec<std::time::Duration> = Vec::new();
+        for _ in 0..100 {
+            let t = std::time::Instant::now();
+            let body = list_text(&all, Some(&only), None, None);
+            took.push(t.elapsed());
+            assert!(body.len() > 100_000, "{}", body.len());
+        }
+        took.sort();
+        let p99 = took.get(98).copied().unwrap_or_default();
+        println!("W29-AC03: the list from memory, 200 repositories, 2,000 rows: p99 {p99:?}");
+        if !cfg!(debug_assertions) {
+            assert!(p99 <= std::time::Duration::from_millis(50), "p99 {p99:?}");
+        }
     }
 
     #[test]
